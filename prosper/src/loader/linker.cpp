@@ -29,6 +29,30 @@ ExportCollision find_export_collision(
     return {};
 }
 
+// How much of `m` an already-linked module already provides. The skip rule exists for two BUILDS of
+// one library (Evergate ships libfmod.prx beside libfmodL.prx, exporting the same set), where
+// linking both would run two init_arrays and make dlsym answer differently per handle. It was
+// written as "any collision at all", which also drops two DIFFERENT libraries that happen to share a
+// symbol -- and with them every export only one of them provides.
+//
+// Measured across the local corpus (#3497), claimed/total for every module the old rule skipped:
+//     Evergate   libfmodstudioL.prx    357/357   100.0%   duplicate build
+//     Evergate   libfmodL.prx         1090/1093   99.7%   duplicate build
+//     Darksiders steam_api_ps5.prx     230/1199   19.2%   different library, 969 unique exports
+//     BlazBlue   cri_lips_unity.prx      2/527     0.4%   different library, 525 unique exports
+// The two populations are 80 percentage points apart, so the threshold is not a delicate judgement;
+// anything from roughly a half to 0.95 partitions this corpus identically.
+ExportSubsumption measure_export_subsumption(
+    const Module& m, const std::unordered_map<std::string, std::string>& claimed) {
+    ExportSubsumption r{};
+    for (const auto& s : m.symbols) {
+        if (!is_exported_symbol(s)) continue;
+        ++r.exported;
+        if (claimed.count(s.nid)) ++r.already_claimed;
+    }
+    return r;
+}
+
 bool link_program(const std::vector<LinkInput>& inputs, uint64_t stub_base,
                   Program& out, std::string* err) {
     auto fail = [&](const std::string& s) { if (err) *err = s; return false; };
@@ -47,8 +71,19 @@ bool link_program(const std::vector<LinkInput>& inputs, uint64_t stub_base,
         if (in.skip_on_export_collision) {
             const ExportCollision hit = find_export_collision(*mo, nid_owner);
             if (!hit.nid.empty()) {
-                out.skipped_modules.push_back({ in.path, hit.nid, hit.owner_path });
-                continue;
+                const ExportSubsumption sub = measure_export_subsumption(*mo, nid_owner);
+                if (sub.subsumed()) {
+                    out.skipped_modules.push_back({ in.path, hit.nid, hit.owner_path });
+                    continue;
+                }
+                // Not a duplicate build: link it. The colliding NIDs still resolve to whoever
+                // claimed them first -- first-wins is unchanged -- but this module's own exports
+                // become available instead of being lost with it.
+                //
+                // This does NOT make the aliasing silent: the export-table build below records every
+                // duplicate in `aliased_exports`, which is the mechanism that already reports the
+                // same situation for modules linked by name (#1635). Dropping the module was only
+                // ever one way to avoid an unreported alias, and it was the expensive one.
             }
         }
         for (const auto& s : mo->symbols)

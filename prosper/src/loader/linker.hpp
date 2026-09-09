@@ -120,6 +120,20 @@ struct ExportCollision { std::string nid, owner_path; };
 ExportCollision find_export_collision(
     const Module& m, const std::unordered_map<std::string, std::string>& claimed);
 
+// How much of a candidate module an already-linked module already exports. `subsumed()` is the test
+// that separates two BUILDS of one library (which must not both link) from two DIFFERENT libraries
+// that share a symbol (which must). See the measured corpus at measure_export_subsumption().
+struct ExportSubsumption {
+    size_t exported = 0;
+    size_t already_claimed = 0;
+    // 0.90: the corpus splits 99.7-100% (duplicate builds) against 0.4-19.2% (distinct libraries),
+    // so this sits in an 80-point empty band rather than near any observed value.
+    static constexpr double kSubsumedFraction = 0.90;
+    bool subsumed() const {
+        return exported != 0 && (double)already_claimed / (double)exported >= kSubsumedFraction;
+    }
+};
+
 // Link the given modules (the first is the main executable). Applies relocations.
 // Returns false with *err on failure.
 bool link_program(const std::vector<LinkInput>& inputs, uint64_t stub_base,

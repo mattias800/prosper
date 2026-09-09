@@ -199,8 +199,12 @@ std::string resolve_host_path_case(const std::string& want);
 // progress with no diagnostic at all. Tales of Graces f Remastered (PPSA19991) loses three of the
 // thirty singletons its boot state machine awaits that way and then renders an empty scene forever.
 //
-// `<dump_root>/Media/Plugins/*.prx` is the engine's own plugin directory, so its contents are exactly
-// the set the guest may ask for. Returns the paths of the entries whose basename does not
+// TWO locations are scanned (#3497): `<dump_root>/Media/Plugins/*.prx`, the engine's own plugin
+// directory, and `<dump_root>/*.prx`, where some titles put their native middleware instead
+// (Darksiders II ships four modules beside eboot.bin). The root is NOT a blanket widening --
+// `module_path_policy` refuses a platform module there exactly as it does under `Media/`, and only
+// `.prx` is a candidate, so eboot.bin and loose data files never are. Returns the paths of the
+// entries whose basename does not
 // case-insensitively match any of `listed_basenames`, ordered so that the caller (which appends them
 // to a link list whose init functions run in reverse order) initializes them in ascending
 // case-insensitive name order. A missing directory yields an empty vector; never throws.

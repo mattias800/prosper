@@ -110,8 +110,40 @@ ModulePathDecision classify_module_path(const std::string& dump_root, const std:
                 return d;
             }
         }
+        // A title's OWN native middleware may sit directly in the dump root rather than under
+        // `Media/` -- Darksiders II (PPSA23806) ships four such modules there (#3497). Refusing them
+        // left the guest's real implementations unlinked with prosper's return-0 stub answering in
+        // their place.
+        //
+        // The Sony rule is applied here EXACTLY as it is to the Media directories, and for a
+        // stronger version of the same reason: the root is now auto-scanned wholesale, so without
+        // this a dump could substitute any Sony library by dropping it beside eboot.bin -- an easier
+        // bypass than the Media/Plugins one that rule already exists to close, and one that would
+        // also sidestep the `fakelib/` rejection by a single move.
+        const std::string root_name = lower(parts[0]);
+        auto refused_platform_name = [&]() -> const char* {
+            if (root_name.rfind(kSonyLibraryPrefix, 0) == 0) return kSonyLibraryPrefix;
+            for (const char* p : kRootRefusedPlatformPrefixes)
+                if (root_name.rfind(p, 0) == 0) return p;
+            return nullptr;
+        };
+        if (const char* matched = refused_platform_name()) {
+            d.verdict = ModulePathVerdict::SonyLibraryOutsideSceModule;
+            d.reason = std::string("a platform module in the dump root (matches `") + matched +
+                       "`), which prosper auto-scans; platform libraries are linked only from the "
+                       "dump's own `sce_module/` directory";
+            return d;
+        }
+        // Only module files. `eboot.bin` is handled above; anything else in the root is data.
+        const std::string ln = lower(parts[0]);
+        const bool is_module = (ln.size() > 4 && ln.compare(ln.size() - 4, 4, ".prx") == 0) ||
+                               (ln.size() > 5 && ln.compare(ln.size() - 5, 5, ".sprx") == 0);
+        if (is_module) {
+            d.verdict = ModulePathVerdict::Permitted;
+            return d;
+        }
         d.verdict = ModulePathVerdict::DirectoryNotPermitted;
-        d.reason = "in the dump root, which holds no linkable module other than eboot.bin";
+        d.reason = "in the dump root and not a linkable module";
         return d;
     }
 
