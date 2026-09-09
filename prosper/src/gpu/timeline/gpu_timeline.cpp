@@ -2240,8 +2240,13 @@ void InteractiveFrameBundle::run_writer() {
         else
             std::fprintf(stderr, "[grab] frame-bundle write failed: %s\n",
                          work.outcome.error.c_str());
-        std::fprintf(stderr, "[grab] frame-bundle owned writer finished in %.3f ms\n",
-                     std::chrono::duration<double, std::milli>(
+        // Microseconds as an INTEGER, deliberately. A "%.3f" here deadlocked the process at
+        // exit on Windows: MinGW's float formatting lazily registers an atexit handler the first
+        // time __gdtoa allocates, which takes the CRT's onexit-table critical section -- and the
+        // thread joining this one holds exactly that lock while walking the same table from a
+        // static destructor. Integer conversion never reaches __gdtoa (#3470).
+        std::fprintf(stderr, "[grab] frame-bundle owned writer finished in %lld us\n",
+                     (long long)std::chrono::duration_cast<std::chrono::microseconds>(
                          std::chrono::steady_clock::now() - start).count());
         {
             std::lock_guard lock(mx);
@@ -2255,23 +2260,42 @@ void InteractiveFrameBundle::run_writer() {
 void InteractiveFrameBundle::shutdown() {
     // Serializes joiners without holding the state mutex while the writer publishes its result.
     std::lock_guard shutdown_lock(shutdown_mx);
+    GpuCaptureBundle abandoned;                // released after `mx` is dropped; see below
     {
         std::lock_guard lock(mx);
         stopping = true;
+        // A cancelled window is reported HERE rather than handed to the writer as a job. Nothing
+        // is written for it -- the error is preset, so write_gpu_capture_bundle was never reached
+        // -- so the only thing the writer did with it was log and publish, and doing that on the
+        // writer while this thread waits inside a static destructor is half of the exit deadlock
+        // in #3470. Reporting it inline leaves the writer with nothing to do but return.
         if (capturing || !armed_path.empty()) {
-            WriteJob cancelled;
-            cancelled.bundle = std::move(bundle);
-            cancelled.outcome.bundle_path = capturing ? current_path : armed_path;
-            cancelled.outcome.max_unique_bytes = max_unique_bytes;
-            cancelled.outcome.error = "capture window cancelled at shutdown";
-            job = std::move(cancelled);
-            writing = true;
+            // Detached under the lock, released outside it. This can be gigabytes, and on the
+            // destructor path the thread running it is inside the CRT's exit lock -- the old code
+            // freed the payload on the WRITER, outside `mx`, and that property is worth keeping.
+            abandoned = std::move(bundle);
+            bundle = {};
+            InteractiveGrabOutcome cancelled;
+            cancelled.bundle_path = capturing ? current_path : armed_path;
+            cancelled.max_unique_bytes = max_unique_bytes;
+            cancelled.error = "capture window cancelled at shutdown";
+            std::fprintf(stderr, "[grab] frame-bundle write failed: %s\n", cancelled.error.c_str());
+            outcome = std::move(cancelled);
+            outcome_pending = true;
+            // `writing` is deliberately NOT touched. This block is reachable only with it already
+            // false -- a request is refused while writing (see request_interactive_capture_bundle),
+            // and the present handler sets it only while clearing `capturing` and `armed_path`, so
+            // a genuinely mid-write window takes neither branch and is joined below exactly as
+            // before. Clearing it here would be dead on every real path and would release the busy
+            // flag mid-write on any path that ever reached it, letting a new capture race the
+            // outcome slot.
             capturing = false;
             armed_path.clear(); current_path.clear();
         }
         g_interactive_frame_active.store(false, std::memory_order_release);
         wake.notify_one();
     }
+    abandoned = {};                            // outside `mx`, before the join
     if (writer.joinable()) writer.join();
 }
 
