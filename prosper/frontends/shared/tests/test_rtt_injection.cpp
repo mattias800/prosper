@@ -13,7 +13,86 @@ static int failures = 0;
 #define CHECK(cond) do { if (!(cond)) { \
     std::fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); ++failures; } } while (0)
 
+static void check_scale(uint32_t src_w, uint32_t src_h, uint32_t dst_w, uint32_t dst_h,
+                        uint32_t bpp) {
+    std::vector<uint8_t> source(static_cast<size_t>(src_w) * src_h * bpp);
+    // Mix every coordinate and channel, including the high x bits in the wide-row cases.
+    uint32_t state = 0x73a921e5u;
+    for (auto& byte : source) {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        byte = static_cast<uint8_t>(state);
+    }
+    const auto original_source = source;
+    std::vector<uint8_t> actual(7, 0xcd);
+    CHECK(inject_rtt_pixels(actual, dst_w, dst_h, source, src_w, src_h, bpp));
+    std::vector<uint8_t> expected(static_cast<size_t>(dst_w) * dst_h * bpp);
+    // Independent byte oracle: direct division for each coordinate, including repeated rows.
+    // Do not share the production quotient/remainder recurrence or pixel-copy specializations.
+    for (uint32_t y = 0; y < dst_h; ++y) {
+        for (uint32_t x = 0; x < dst_w; ++x) {
+            const uint64_t sy = uint64_t{y} * src_h / dst_h;
+            const uint64_t sx = uint64_t{x} * src_w / dst_w;
+            for (uint32_t c = 0; c < bpp; ++c)
+                expected[(static_cast<size_t>(y) * dst_w + x) * bpp + c] =
+                    source[(static_cast<size_t>(sy) * src_w + sx) * bpp + c];
+        }
+    }
+    if (actual != expected) {
+        std::fprintf(stderr, "scale mismatch: %ux%u -> %ux%u, %u bytes/pixel\n",
+                     src_w, src_h, dst_w, dst_h, bpp);
+        ++failures;
+    }
+    CHECK(source == original_source);
+}
+
+static void check_scaling_shapes() {
+    for (uint32_t bpp : {1u, 2u, 3u, 4u, 8u, 16u}) {
+        // Exact/integer/noninteger and up/down scaling in both axes; 3-byte pixels exercise the
+        // variable-width fallback beside every specialized width. Alternation also catches state
+        // accidentally retained between calls with different ratios.
+        for (uint32_t sw = 1; sw <= 17; ++sw)
+            for (uint32_t dw = 1; dw <= 17; ++dw)
+                for (uint32_t sh = 1; sh <= 9; ++sh)
+                    for (uint32_t dh = 1; dh <= 9; ++dh)
+                        check_scale(sw, sh, dw, dh, bpp);
+        for (uint32_t width : {32u, 64u, 128u, 256u, 1024u}) {
+            check_scale(width - 1, 7, width + 1, 11, bpp);
+            check_scale(width + 1, 11, width - 1, 7, bpp);
+        }
+        // Near-coprime large widths cross the 32-bit x*src_w boundary without huge buffers.
+        check_scale(65537, 1, 65539, 1, bpp);
+        check_scale(65539, 1, 65537, 1, bpp);
+    }
+}
+
+static void check_scaling_rejections() {
+    const std::vector<uint8_t> source(2 * 3 * 4, 0x57);
+    const std::vector<uint8_t> fallback = {0xa1, 0xb2, 0xc3};
+    auto reject = [&](uint32_t dw, uint32_t dh, uint32_t sw, uint32_t sh, uint32_t bpp,
+                      const std::vector<uint8_t>& input) {
+        auto output = fallback;
+        CHECK(!inject_rtt_pixels(output, dw, dh, input, sw, sh, bpp));
+        CHECK(output == fallback);
+    };
+    reject(0, 5, 2, 3, 4, source);
+    reject(5, 0, 2, 3, 4, source);
+    reject(5, 5, 0, 3, 4, source);
+    reject(5, 5, 2, 0, 4, source);
+    reject(5, 5, 2, 3, 0, source);
+    reject(5, 5, 2, 3, 4, {});
+    reject(5, 5, 2, 3, 4, std::vector<uint8_t>(source.size() - 1));
+    reject(5, 5, 2, 3, 4, std::vector<uint8_t>(source.size() + 1));
+    // Each byte-size product overflows size_t on both supported 32- and 64-bit hosts. These must
+    // fail before resizing or reading, independently for the source and destination dimensions.
+    reject(UINT32_MAX, UINT32_MAX, 2, 3, 4, source);
+    reject(5, 5, UINT32_MAX, UINT32_MAX, 4, source);
+}
+
 int main() {
+    check_scaling_shapes();
+    check_scaling_rejections();
     const uint8_t rgba_pixel[] = {0x12, 0x34, 0x56, 0x78};
     std::vector<uint8_t> repeated_rgba(5 * sizeof(rgba_pixel));
     CHECK(fill_repeating_pixel(
