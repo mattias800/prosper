@@ -38,6 +38,9 @@
 #include <deque>
 #include <functional>
 #include <mutex>
+#include <memory>
+#include <list>
+#include <iterator>
 #include <span>
 #include <string>
 #include <unordered_map>
@@ -667,6 +670,13 @@ struct BackendResourceReuseStats {
     // a number. These two make the conclusion readable instead of derivable (#2245 review).
     uint64_t buffer_skipped_large_dwords = 0;   // payload that bypasses content dedup by size
     uint64_t buffer_upload_bytes = 0;           // bytes actually memcpy'd into mapped staging
+    uint64_t buffer_resident_hits = 0;
+    uint64_t buffer_resident_compared_bytes = 0; // requested comparison spans, not bytes read
+    uint64_t buffer_resident_reused_bytes = 0;
+    uint64_t buffer_resident_admitted_bytes = 0;
+    uint64_t buffer_resident_refreshed_bytes = 0;
+    uint64_t buffer_resident_declined_bytes = 0;
+    uint64_t buffer_resident_ineligible_bytes = 0;
 };
 
 inline BackendResourceReuseStats& backend_resource_reuse_stats_storage() {
@@ -1080,6 +1090,7 @@ struct BackendRenderTimingStats {
     // of looking finished (#2245).
     double res_buffer_acquire_ms = 0;
     double res_buffer_copy_ms = 0;
+    double res_buffer_resident_ms = 0;
     // vkCreateBuffer + vkAllocateMemory + the copy performed inside
     // create_transient_storage_buffer_upload — the fallback taken when a payload gets neither an
     // arena slice nor a pooled buffer. Timed by neither acquire nor copy before this.
@@ -1101,7 +1112,7 @@ struct BackendRenderTimingStats {
     // counting or a re-entered scope) and a large positive one means a branch is still unmeasured.
     // Clamping this to zero would make a broken instrument print identically to a correct one.
     double res_buffer_other_ms() const {
-        return res_buffer_ms - res_buffer_acquire_ms - res_buffer_copy_ms - res_buffer_create_ms -
+        return res_buffer_ms - res_buffer_acquire_ms - res_buffer_copy_ms - res_buffer_resident_ms - res_buffer_create_ms -
                res_buffer_index_find_ms - res_buffer_index_insert_ms - res_buffer_hash_ms;
     }
 
@@ -3044,6 +3055,136 @@ inline void release_render_host_buffer(VkDevice device, RenderHostBuffer buffer)
     }
     for (RenderHostBuffer& old : evicted) destroy_render_host_buffer(device, old);
     if (buffer.buffer) destroy_render_host_buffer(device, buffer);
+}
+
+// Immutable storage uploads are independent of the guest mapping after preparation. The cache
+// owns whole allocations, never arena slices. A submission's shared owner survives eviction and
+// source replacement; its allocation charge remains until the last completion lease is released.
+struct ResidentRenderBuffer {
+    ResidentRenderBuffer() = default;
+    ResidentRenderBuffer(const ResidentRenderBuffer&) = delete;
+    ResidentRenderBuffer& operator=(const ResidentRenderBuffer&) = delete;
+    VkDevice device = VK_NULL_HANDLE;
+    RenderHostBuffer storage;
+    std::shared_ptr<std::atomic<uint64_t>> charged_bytes;
+    ~ResidentRenderBuffer() {
+        const auto bytes = storage.allocation_bytes;
+        destroy_render_host_buffer(device, storage);
+        if (charged_bytes) charged_bytes->fetch_sub(bytes, std::memory_order_relaxed);
+    }
+};
+
+struct ResidentRenderBufferKey {
+    uint64_t identity;
+    VkDeviceSize bytes;
+    bool operator==(const ResidentRenderBufferKey&) const = default;
+};
+struct ResidentRenderBufferKeyHash {
+    size_t operator()(const ResidentRenderBufferKey& key) const {
+        return static_cast<size_t>(key.identity ^ (key.bytes * 0x9e3779b97f4a7c15ull));
+    }
+};
+struct ResidentRenderBufferCache {
+    ResidentRenderBufferCache() = default;
+    ResidentRenderBufferCache(const ResidentRenderBufferCache&) = delete;
+    ResidentRenderBufferCache& operator=(const ResidentRenderBufferCache&) = delete;
+    using Owner = std::shared_ptr<ResidentRenderBuffer>;
+    struct Entry { ResidentRenderBufferKey key; Owner owner; };
+    std::list<Entry> lru;
+    std::unordered_map<ResidentRenderBufferKey, std::list<Entry>::iterator,
+                       ResidentRenderBufferKeyHash> index;
+    std::shared_ptr<std::atomic<uint64_t>> charged_bytes =
+        std::make_shared<std::atomic<uint64_t>>(0);
+
+    // Called under BackendPersistentResourceGuard; cleanup only destroys independent owners.
+    Owner find(VkDevice device, ResidentRenderBufferKey key, const void* source,
+               BackendResourceReuseStats& stats) {
+        auto found = index.find(key);
+        if (found == index.end()) return {};
+        auto entry = found->second;
+        if (entry->owner->device == device) {
+            stats.buffer_resident_compared_bytes += key.bytes;
+            if (std::memcmp(entry->owner->storage.mapped, source, key.bytes) == 0) {
+                lru.splice(lru.end(), lru, entry);
+                ++stats.buffer_resident_hits;
+                stats.buffer_resident_reused_bytes += key.bytes;
+                return entry->owner;
+            }
+            if (entry->owner.use_count() == 1) {
+                // No recorded/in-flight use remains: refresh the complete logical span without
+                // reallocating dynamic buffers every call. The next upload acquires a new pin.
+                std::memcpy(entry->owner->storage.mapped, source, key.bytes);
+                stats.buffer_upload_bytes += key.bytes;
+                stats.buffer_resident_refreshed_bytes += key.bytes;
+                lru.splice(lru.end(), lru, entry);
+                return entry->owner;
+            }
+        }
+        // Changed current bytes never overwrite an older recorded or in-flight upload.
+        lru.erase(entry);
+        index.erase(found);
+        return {};
+    }
+    bool can_reclaim(VkDeviceSize bytes, VkDeviceSize limit) const {
+        if (bytes > limit) return false;
+        const auto charged = charged_bytes->load(std::memory_order_relaxed);
+        if (charged <= limit - bytes && index.size() < 4096) return true;
+        // Prove enough idle storage exists before evicting anything. Pending owners whose keys
+        // were replaced remain charged but cannot be reclaimed by scanning this index.
+        uint64_t reclaimable = 0;
+        size_t idle_entries = 0;
+        for (const auto& entry : lru) {
+            if (entry.owner.use_count() != 1) continue;
+            reclaimable += entry.owner->storage.allocation_bytes;
+            ++idle_entries;
+        }
+        return charged - reclaimable <= limit - bytes &&
+               (index.size() < 4096 || idle_entries);
+    }
+    bool reclaim(VkDeviceSize bytes, VkDeviceSize limit) {
+        if (!can_reclaim(bytes, limit)) return false;
+        for (auto it = lru.begin(); it != lru.end() &&
+             (charged_bytes->load(std::memory_order_relaxed) > limit - bytes ||
+              index.size() >= 4096); ) {
+            if (it->owner.use_count() != 1) { ++it; continue; }
+            index.erase(it->key);
+            it = lru.erase(it);
+        }
+        return charged_bytes->load(std::memory_order_relaxed) <= limit - bytes &&
+               index.size() < 4096;
+    }
+    Owner admit(const RenderVkCtx& ctx, ResidentRenderBufferKey key, const void* source,
+                VkDeviceSize limit, BackendResourceReuseStats& stats) {
+        if (index.contains(key) || !can_reclaim(key.bytes, limit)) return {};
+        Owner owner;
+        try { owner = std::make_shared<ResidentRenderBuffer>(); }
+        catch (const std::bad_alloc&) { return {}; }
+        owner->device = ctx.dev;
+        owner->storage = acquire_render_host_buffer(ctx, key.bytes);
+        if (!owner->storage.mapped || !reclaim(owner->storage.allocation_bytes, limit))
+            return {};
+        owner->charged_bytes = charged_bytes;
+        charged_bytes->fetch_add(owner->storage.allocation_bytes, std::memory_order_relaxed);
+        std::memcpy(owner->storage.mapped, source, key.bytes);
+        stats.buffer_upload_bytes += key.bytes;
+        try {
+            lru.push_back({key, owner});
+            try { index.emplace(key, std::prev(lru.end())); }
+            catch (...) { lru.pop_back(); throw; }
+        } catch (const std::bad_alloc&) { return {}; }
+        stats.buffer_resident_admitted_bytes += key.bytes;
+        return owner;
+    }
+};
+inline ResidentRenderBufferCache& resident_render_buffer_cache() {
+    static ResidentRenderBufferCache cache;
+    return cache;
+}
+inline VkDeviceSize resident_render_buffer_limit() {
+    static const auto limit = prosper::diag::env_u64_or_default_capped(
+        "PROSPER_BACKEND_BUFFER_RESIDENCY_MB", getenv("PROSPER_BACKEND_BUFFER_RESIDENCY_MB"),
+        256, 2048, "MiB");
+    return limit * 1024ull * 1024ull;
 }
 
 // Deterministic one-shot injection for the fresh storage-buffer upload regression checks. The
@@ -5216,6 +5357,38 @@ inline bool fragment_uses_internal_gds_memoized(uint64_t fs_identity,
     return uses;
 }
 
+// Admission is deliberately whole-pass: any storage writer or incomplete pointer provenance
+// declines persistence for every buffer. Thus a later draw/stage cannot obtain an immutable
+// resident allocation through the existing call-local alias memo. Shared words are immutable and
+// weakly identified by the memo; expired owners cannot authorize a recycled pointer. Raw
+// test/replay/override words are reflected afresh, never keyed by a pointer.
+inline bool backend_module_has_readonly_buffers(const std::vector<uint32_t>& words,
+                                                const prosper::gpu::SharedShaderWords& owner = {}) {
+    if (words.empty()) return false;
+    const bool owned_words = owner && owner.get() == &words;
+    static std::unordered_map<const std::vector<uint32_t>*,
+        std::pair<std::weak_ptr<const std::vector<uint32_t>>, bool>> memo;
+    if (owned_words) {
+        auto found = memo.find(owner.get());
+        if (found != memo.end()) {
+            if (!found->second.first.expired()) return found->second.second;
+            memo.erase(found);
+        }
+    }
+    const auto report = prosper::gpu::validate_spirv_descriptor_interface(
+        words, nullptr, 0, prosper::gpu::SpirvShaderStage::Unknown, false);
+    bool readonly = prosper::gpu::spirv_descriptor_reflection_complete(report) &&
+                    report.storage_buffer_writes_complete;
+    for (const auto& descriptor : report.descriptors)
+        if (descriptor.kind == prosper::gpu::SpirvDescriptorKind::StorageBuffer &&
+            (descriptor.writable || descriptor.atomic_access)) readonly = false;
+    if (owned_words) {
+        if (memo.size() >= 4096) memo.clear();
+        memo.emplace(owner.get(), std::make_pair(owner, readonly));
+    }
+    return readonly;
+}
+
 // `submission_batch` is an explicit live-renderer ownership scope. Calls with no requested CPU
 // readback may return after recording; `flush_submission_batch` submits every accumulated command
 // buffer in order, waits once, and releases all retained resources. Omitting the batch preserves the
@@ -6572,6 +6745,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         VkDeviceSize allocation_bytes = 0;
         bool pooled = false;
         bool arena = false;
+        std::shared_ptr<ResidentRenderBuffer> resident;
     };
     struct SharedBufferArena {
         RenderHostBuffer buffer;
@@ -6781,6 +6955,19 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             effective_resources[i] = &draws[i].R;
         }
     }
+    bool readonly_buffer_pass = share_backend_resources && reuse_host_buffers &&
+        !buffer_verify_enabled && getenv("PROSPER_NO_BACKEND_BUFFER_RESIDENCY") == nullptr;
+    if (readonly_buffer_pass) {
+        for (const auto& draw : draws) {
+            if (!backend_module_has_readonly_buffers(draw.vs_words(), draw.vs_shared) ||
+                !backend_module_has_readonly_buffers(draw.fs_words(), draw.fs_shared) ||
+                (!draw.gs_words().empty() &&
+                 !backend_module_has_readonly_buffers(draw.gs_words()))) {
+                readonly_buffer_pass = false;
+                break;
+            }
+        }
+    }
     std::vector<SharedTextureUpload> texture_uploads;
     texture_uploads.reserve(std::min<size_t>(draws.size() * 2, 1024));
     std::unordered_map<TextureUploadKey, size_t, TextureUploadKeyHash> texture_upload_indices;
@@ -6809,6 +6996,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     // the original two, and why the remainder is reported signed.
     double res_buffer_acquire_ms = 0.0;
     double res_buffer_copy_ms = 0.0;
+    double res_buffer_resident_ms = 0.0;
     double res_buffer_create_ms = 0.0;
     double res_buffer_index_find_ms = 0.0;
     double res_buffer_index_insert_ms = 0.0;
@@ -7735,12 +7923,31 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                     buffer_index = shared_buffers.size();
                     SharedBufferUpload upload;
                     const VkDeviceSize bytes = static_cast<VkDeviceSize>(word_count) * 4;
-                    if (use_buffer_arena) {
+                    // Small uniforms keep the existing arena/hash route. The exact current
+                    // materialized span is authoritative, including hosted sources and padded tails.
+                    if (shareable && bytes >= 4096 && !readonly_buffer_pass)
+                        resource_reuse_stats.buffer_resident_ineligible_bytes += bytes;
+                    if (shareable && bytes >= 4096 && readonly_buffer_pass) {
+                        const ResourcePhaseTimer phase_resident(timing_enabled, &res_buffer_resident_ms);
+                        auto& cache = resident_render_buffer_cache();
+                        const ResidentRenderBufferKey key{identity, bytes};
+                        upload.resident = cache.find(ctx.dev, key, words, resource_reuse_stats);
+                        if (!upload.resident)
+                            upload.resident = cache.admit(ctx, key, words,
+                                resident_render_buffer_limit(), resource_reuse_stats);
+                        if (upload.resident) {
+                            const auto& retained = upload.resident->storage;
+                            upload.buffer = retained.buffer;
+                            upload.mapped = retained.mapped;
+                            upload.range = bytes;
+                        } else resource_reuse_stats.buffer_resident_declined_bytes += bytes;
+                    }
+                    if (!upload.resident && use_buffer_arena) {
                         const ResourcePhaseTimer phase_acquire(timing_enabled,
                                                                &res_buffer_acquire_ms);
                         acquire_buffer_arena_slice(bytes, upload);
                     }
-                    if (!upload.arena && reuse_host_buffers) {
+                    if (!upload.resident && !upload.arena && reuse_host_buffers) {
                         const ResourcePhaseTimer phase_acquire(timing_enabled,
                                                                &res_buffer_acquire_ms);
                         RenderHostBuffer pooled = acquire_render_host_buffer(ctx, bytes);
@@ -7751,7 +7958,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                         upload.allocation_bytes = pooled.allocation_bytes;
                         upload.pooled = upload.buffer && upload.memory && upload.mapped;
                     }
-                    if (!upload.arena && !upload.pooled) {
+                    if (!upload.resident && !upload.arena && !upload.pooled) {
                         // create+allocate+map+copy, all of it. Neither `acquire` nor `copy` saw
                         // this branch, so a payload that misses both the arena and the pool cost
                         // a full Vulkan allocation that read as free.
@@ -7784,11 +7991,13 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                 return false;   // caller breaks its loop; see the call site
                             }
                             upload.range = sizeof(zero_buffer_word);
+                            resource_reuse_stats.buffer_upload_bytes += sizeof(zero_buffer_word);
                             ++resource_reuse_stats.buffer_upload_fallbacks;
                         } else {
                             upload.range = bytes;
+                            resource_reuse_stats.buffer_upload_bytes += bytes;
                         }
-                    } else {
+                    } else if (!upload.resident) {
                         const ResourcePhaseTimer phase_copy(timing_enabled,
                                                             &res_buffer_copy_ms);
                         resource_reuse_stats.buffer_upload_bytes += static_cast<uint64_t>(bytes);
@@ -11104,7 +11313,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 }
             }
             for (const SharedBufferUpload& upload : shared_buffers) {
-                if (upload.arena) {
+                if (upload.arena || upload.resident) {
                     continue;
                 } else if (upload.pooled) {
                     release_render_host_buffer(
@@ -11214,6 +11423,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         call_timing.res_buffer_ms = res_buffer_ms;
         call_timing.res_buffer_acquire_ms = res_buffer_acquire_ms;
         call_timing.res_buffer_copy_ms = res_buffer_copy_ms;
+        call_timing.res_buffer_resident_ms = res_buffer_resident_ms;
         call_timing.res_buffer_create_ms = res_buffer_create_ms;
         call_timing.res_buffer_index_find_ms = res_buffer_index_find_ms;
         call_timing.res_buffer_index_insert_ms = res_buffer_index_insert_ms;
@@ -11600,6 +11810,13 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         PROSPER_SUM_RESOURCE_STAT(buffer_ref_memo_hits);
         PROSPER_SUM_RESOURCE_STAT(buffer_skipped_large_dwords);
         PROSPER_SUM_RESOURCE_STAT(buffer_upload_bytes);
+        PROSPER_SUM_RESOURCE_STAT(buffer_resident_hits);
+        PROSPER_SUM_RESOURCE_STAT(buffer_resident_compared_bytes);
+        PROSPER_SUM_RESOURCE_STAT(buffer_resident_reused_bytes);
+        PROSPER_SUM_RESOURCE_STAT(buffer_resident_admitted_bytes);
+        PROSPER_SUM_RESOURCE_STAT(buffer_resident_refreshed_bytes);
+        PROSPER_SUM_RESOURCE_STAT(buffer_resident_declined_bytes);
+        PROSPER_SUM_RESOURCE_STAT(buffer_resident_ineligible_bytes);
 #undef PROSPER_SUM_RESOURCE_STAT
         aggregate_resources.persistent_pipeline_layout_entries =
             resources.persistent_pipeline_layout_entries;
@@ -11652,6 +11869,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
             PROSPER_SUM_TIMING_STAT(res_buffer_ms);
             PROSPER_SUM_TIMING_STAT(res_buffer_acquire_ms);
             PROSPER_SUM_TIMING_STAT(res_buffer_copy_ms);
+            PROSPER_SUM_TIMING_STAT(res_buffer_resident_ms);
             PROSPER_SUM_TIMING_STAT(res_buffer_create_ms);
             PROSPER_SUM_TIMING_STAT(res_buffer_index_find_ms);
             PROSPER_SUM_TIMING_STAT(res_buffer_index_insert_ms);

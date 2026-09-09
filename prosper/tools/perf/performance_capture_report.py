@@ -188,6 +188,17 @@ def _resource_breakdown(renderer):
         # the field: under-counted, and indistinguishable from a real measurement. all() reports
         # UNAVAILABLE instead. Fail closed, which is this whole function's thesis.
         breakdown["buffer_leaves_available"] = all("res_buffer_create_ms" in r for r in renderer)
+        residency_fields = ("buffer_upload_bytes", "buffer_resident_hits",
+                            "buffer_resident_compared_bytes", "buffer_resident_reused_bytes",
+                            "buffer_resident_admitted_bytes", "buffer_resident_refreshed_bytes",
+                            "buffer_resident_declined_bytes",
+                            "buffer_resident_ineligible_bytes", "res_buffer_resident_ms")
+        breakdown["buffer_residency_available"] = all(
+            field in row for row in renderer for field in residency_fields)
+        if breakdown["buffer_residency_available"]:
+            breakdown["buffer_residency"] = {
+                field: sum(row[field] for row in renderer) for field in residency_fields}
+
         # The same signed-remainder argument, one level down. res_buffer_ms had NO exhaustive
         # partition until now -- only `copy` and (in the stderr window) `acquire`, two candidate
         # mechanisms out of an unknown number. An unmeasured region does not read as unmeasured; it
@@ -206,6 +217,9 @@ def _resource_breakdown(renderer):
                 - breakdown["res_buffer_create"] - breakdown["res_buffer_index_find"]
                 - breakdown["res_buffer_index_insert"]
                 - breakdown["res_buffer_hash"])
+            if breakdown["buffer_residency_available"]:
+                breakdown["res_buffer_other"] -= breakdown["buffer_residency"]["res_buffer_resident_ms"]
+
         # The remainder is reported as TWO numbers, and this is not fussiness -- it is this file's own
         # argument applied to sign instead of presence.
         #
@@ -776,7 +790,9 @@ def print_summary(summary):
                      f" index_find={breakdown['res_buffer_index_find']:.1f}"
                      f" index_insert={breakdown['res_buffer_index_insert']:.1f}"
                      f" hash={breakdown['res_buffer_hash']:.1f}"
-                     f" other={breakdown['res_buffer_other']:+.1f}"
+                     + (f" resident={breakdown['buffer_residency']['res_buffer_resident_ms']:.1f}"
+                        if breakdown["buffer_residency_available"] else " resident=UNAVAILABLE")
+                     + f" other={breakdown['res_buffer_other']:+.1f}"
                      if breakdown["buffer_leaves_available"]
                      else f"copy={breakdown['res_buffer_copy']:.1f};"
                           " create/index_find/index_insert/hash UNAVAILABLE") + ")"

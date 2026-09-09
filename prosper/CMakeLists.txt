@@ -3487,6 +3487,14 @@ if(TARGET prosper_core)
 endif()
 
 if(TARGET prosper_core AND TARGET Vulkan::Vulkan)
+  add_executable(test_render_buffer_residency tests/gpu/state/test_render_buffer_residency.cpp)
+  target_include_directories(test_render_buffer_residency PRIVATE tests frontends)
+  target_link_libraries(test_render_buffer_residency PRIVATE prosper_core Vulkan::Vulkan)
+  add_test(NAME render_buffer_residency COMMAND ${CMAKE_COMMAND} -E env
+    --unset=PROSPER_BACKEND_BUFFER_RESIDENCY_MB --unset=PROSPER_NO_BACKEND_RESOURCE_SHARE
+    --unset=PROSPER_NO_BACKEND_BUFFER_POOL --unset=PROSPER_BUFVERIFY
+    $<TARGET_FILE:test_render_buffer_residency>)
+
   add_executable(test_gpu_detile tests/gpu/execute/test_gpu_detile.cpp)
   target_include_directories(test_gpu_detile PRIVATE tests)
   target_link_libraries(test_gpu_detile PRIVATE prosper_core Vulkan::Vulkan)

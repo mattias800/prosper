@@ -1093,6 +1093,10 @@ struct DescriptorValidationReport {
     // Every image write must resolve to a storage descriptor; texel pointers conservatively veto
     // the proof because their atomic/pointer provenance is not fully tracked by this reflector.
     bool storage_image_writes_complete = false;
+    // Negative-write proof for immutable buffer uploads. Every possible buffer write must resolve
+    // to a reflected writable descriptor; unknown pointer/extended instruction effects veto it.
+    // Combine with per-binding/alias access flags, never with descriptor class alone.
+    bool storage_buffer_writes_complete = false;
     bool ok() const;
 };
 

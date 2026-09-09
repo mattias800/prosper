@@ -351,6 +351,14 @@ void InteractivePerformanceCapture::publish_completed(std::unique_ptr<PendingCap
                 << ",\"callbacks\":" << record.callbacks << ",\"draws\":" << record.draws
                 << ",\"texture_bytes\":" << record.texture_bytes
                 << ",\"buffer_bytes\":" << record.buffer_bytes
+                << ",\"buffer_upload_bytes\":" << record.buffer_upload_bytes
+                << ",\"buffer_resident_hits\":" << record.buffer_resident_hits
+                << ",\"buffer_resident_compared_bytes\":" << record.buffer_resident_compared_bytes
+                << ",\"buffer_resident_reused_bytes\":" << record.buffer_resident_reused_bytes
+                << ",\"buffer_resident_admitted_bytes\":" << record.buffer_resident_admitted_bytes
+                << ",\"buffer_resident_refreshed_bytes\":" << record.buffer_resident_refreshed_bytes
+                << ",\"buffer_resident_declined_bytes\":" << record.buffer_resident_declined_bytes
+                << ",\"buffer_resident_ineligible_bytes\":" << record.buffer_resident_ineligible_bytes
                 << ",\"total_ms\":" << record.total_ms
                 << ",\"prelude_ms\":" << record.prelude_ms
                 << ",\"pass_ms\":" << record.pass_ms
@@ -437,6 +445,7 @@ void InteractivePerformanceCapture::publish_completed(std::unique_ptr<PendingCap
                 << ",\"res_texture_ms\":" << record.res_texture_ms
                 << ",\"res_buffer_ms\":" << record.res_buffer_ms
                 << ",\"res_buffer_copy_ms\":" << record.res_buffer_copy_ms
+                << ",\"res_buffer_resident_ms\":" << record.res_buffer_resident_ms
                 << ",\"res_buffer_create_ms\":" << record.res_buffer_create_ms
                 << ",\"res_buffer_index_find_ms\":" << record.res_buffer_index_find_ms
                 << ",\"res_buffer_index_insert_ms\":" << record.res_buffer_index_insert_ms
