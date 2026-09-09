@@ -130,6 +130,7 @@ enum class ComputeImageBorrowOutcome : uint8_t {
     NoImage,             // entry without a VkImage (allocation released)
     AuthorityChanged,    // published, but no proof says guest memory still matches it
     Hit,
+    MetadataUnproven,    // pixel authority passed; current compression metadata did not
     Count,
 };
 
@@ -142,6 +143,7 @@ constexpr const char* compute_image_borrow_outcome_name(ComputeImageBorrowOutcom
     case ComputeImageBorrowOutcome::NoImage:             return "no_image";
     case ComputeImageBorrowOutcome::AuthorityChanged:    return "authority_changed";
     case ComputeImageBorrowOutcome::Hit:                 return "hit";
+    case ComputeImageBorrowOutcome::MetadataUnproven:    return "metadata_unproven";
     case ComputeImageBorrowOutcome::Count:               break;
     }
     return "?";
@@ -505,7 +507,7 @@ private:
 // a saturated census fits, so the marker should never fire -- but a marker that never fires is
 // cheap and a missing line that reads as a zero is not.
 // Worst case, measured by the saturation arm in the test rather than estimated: eleven decline
-// buckets, six outcome buckets, seven publish buckets, twenty-three key-field names and twenty-two
+// buckets, seven outcome buckets, seven publish buckets, twenty-three key-field names and twenty-two
 // scalars, every one of them a twenty-digit u64. 4 KiB clears it with room to spare.
 inline constexpr size_t compute_image_borrow_census_report_bytes = 4096;
 
