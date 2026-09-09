@@ -116,6 +116,27 @@ int main() {
     refuse(R, "/dumps/PPSA00000-app0/libSceNpEntitlementAccess.sprx",
            ModulePathVerdict::SonyLibraryOutsideSceModule,
            "...nor does .sprx instead of .prx");
+    // RESTORED, and strengthened. The pre-#3497 suite pinned a root `libc.prx` as refused; the first
+    // draft of this widening deleted that arm and replaced it with nothing, leaving a root libc.prx
+    // Permitted and unloaded only by an incidental dedup in the discovery code -- which is precisely
+    // the emergent-property reliance the policy header forbids. Raised in review of #3508.
+    //
+    // `libSce*` is not sufficient cover for the root: 21 of 275 modules in the 3.20 reference do not
+    // carry that prefix, and linker.cpp's "a cross-module export beats a stub slot" rule means one of
+    // those in the root would silently displace prosper's own HLE.
+    refuse(R, "/dumps/PPSA00000-app0/libc.prx", ModulePathVerdict::SonyLibraryOutsideSceModule,
+           "a root libc.prx is refused even though it is not named libSce*");
+    refuse(R, "/dumps/PPSA00000-app0/libkernel.prx", ModulePathVerdict::SonyLibraryOutsideSceModule,
+           "...and so is libkernel.prx");
+    refuse(R, "/dumps/PPSA00000-app0/libkernel_sys.sprx",
+           ModulePathVerdict::SonyLibraryOutsideSceModule, "...and its _sys variant");
+    // The other half of that rule, and the reason it is a prefix LIST rather than "anything starting
+    // lib". These are third-party libraries Sony also ships; a title may legitimately ship its own
+    // build, and refusing them would break the case this widening exists to serve. Kills: widening
+    // the refusal to a bare `libc` prefix, which would swallow both of these.
+    permit(R, "/dumps/PPSA00000-app0/libcurl.prx",
+           "a title's own libcurl in the root is NOT a platform module");
+    permit(R, "/dumps/PPSA00000-app0/libcairo.prx", "...nor is libcairo");
     // Kills: treating every root file as a module. Data beside the eboot is not linkable, and a
     // permissive extension check would drag it in.
     refuse(R, "/dumps/PPSA00000-app0/param.json", ModulePathVerdict::DirectoryNotPermitted,
@@ -173,6 +194,14 @@ int main() {
         write_file(root / "Media" / "Plugins" / "RealPlugin.prx", "not-a-real-image");
         write_file(root / "Media" / "Plugins" / "libSceNpEntitlementAccess.prx", "not-a-real-image");
         write_file(root / "fakelib" / "libSceAppContent.sprx", "not-a-real-image");
+        // #3497 opened the dump ROOT to a title's own middleware. Per src/host/image/AGENTS.md, a
+        // discovery widening must extend the guard test WITH it -- and specifically here, at the
+        // end-to-end layer: the unit arms above judge strings, while this one runs the real
+        // discovery->policy chain, which is the only place a scan that finds a file the policy would
+        // refuse can actually be caught.
+        write_file(root / "RootMiddleware.prx", "not-a-real-image");
+        write_file(root / "libSceAppContent.prx", "not-a-real-image");
+        write_file(root / "libc.prx", "not-a-real-image");
 
         const std::vector<LinkInput> in = boot_link_inputs(root.string(), /*verbose=*/false);
 
@@ -181,6 +210,17 @@ int main() {
         // removed. Verified by doing exactly that before trusting it.
         CHECK(!linked(in, "libSceNpEntitlementAccess"),
               "a Sony library dropped into the auto-linked plugin directory is NOT linked");
+
+        // The same three questions for the ROOT, end to end. The middle one is the guard: the root
+        // is auto-scanned wholesale, so a platform module dropped beside eboot.bin must be refused
+        // by the POLICY rather than merely not found. Kills: opening the root without applying the
+        // platform-name rule to it, which leaves both refusals below linked.
+        CHECK(linked(in, "RootMiddleware.prx"),
+              "a title's own middleware in the dump root IS discovered and linked");
+        CHECK(!linked(in, "libSceAppContent.prx"),
+              "a Sony library dropped in the dump root is NOT linked");
+        CHECK(!linked(in, "/libc.prx") || linked(in, "sce_module"),
+              "a platform module in the root is NOT linked from there");
 
         // Positive control for the arm above: the guard must not have simply disabled auto-linking.
         // Without this, deleting the whole #1609 block would also make the arm pass.

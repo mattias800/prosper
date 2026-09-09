@@ -182,6 +182,31 @@ int main() {
               "import census: two resolved cross-module, one stubbed");
     }
 
+    // ---- Arm 0: the threshold itself -------------------------------------------------------------
+    // The link fixtures below are 100% and 50% subsumed, so ANY threshold in (0.5, 1.0] leaves them
+    // both green -- they exercise the two sides but pin no boundary. Raised in review of #3508.
+    // These do, directly, and they are the only thing that would notice 0.90 being edited.
+    {
+        // A helper rather than a braced literal: `CHECK(ExportSubsumption{100, 90}...)` splits on the
+        // comma at preprocessor level and is read as three macro arguments. Function-call parens
+        // protect it.
+        auto sub = [](size_t exported, size_t claimed) {
+            ExportSubsumption s; s.exported = exported; s.already_claimed = claimed;
+            return s.subsumed();
+        };
+        CHECK(sub(100, 90), "threshold: exactly 90% counts as subsumed");
+        CHECK(!sub(100, 89), "threshold: 89% does not");
+        // The corpus this was set from: duplicate builds at 99.7-100%, distinct libraries at
+        // 0.4-19.2%. Both ends must land on the correct side, with the real measured numbers.
+        CHECK(sub(357, 357),   "corpus: Evergate libfmodstudioL (100.0%) is subsumed");
+        CHECK(sub(1093, 1090), "corpus: Evergate libfmodL (99.7%) is subsumed");
+        CHECK(!sub(1199, 230), "corpus: Darksiders steam_api_ps5 (19.2%) is NOT");
+        CHECK(!sub(527, 2),    "corpus: BlazBlue cri_lips_unity (0.4%) is NOT");
+        // A module with no exports cannot be subsumed by anything -- guards a divide-by-zero and the
+        // reading that "0 of 0 claimed" is 100%.
+        CHECK(!sub(0, 0), "an exportless module is never subsumed");
+    }
+
     // ---- Arm 2a: the guard fires on a DUPLICATE BUILD -------------------------------------------
     // Every export of `subsumed` is already provided, so linking it would duplicate a library
     // wholesale. This is the case the flag was written for and it must keep being skipped.
@@ -203,8 +228,12 @@ int main() {
             CHECK(sk.nid == kShared, "duplicate build: the skip record carries the exact colliding NID");
         }
         CHECK(p.aliased_exports.empty(), "duplicate build: a skipped module contributes no aliases");
-        CHECK(p.slots.empty(),
-              "duplicate build: a skipped module's unsatisfied import creates no stub slot");
+        // NOTE: `subsumed_spec` declares no imports, so a "no stub slot" assertion here would pass
+        // against any implementation and is deliberately not made. The equivalent claim with teeth is
+        // that the skipped module contributed no EXPORTS, which is what actually distinguishes a
+        // skip from a link. Raised in review of #3508.
+        CHECK(export_of(p, kOnlyA) == kBase1 + kExp1,
+              "duplicate build: kOnlyA resolves to the module that WON, not the skipped one");
     }
 
     // ---- Arm 2b: the guard does NOT fire on two DIFFERENT libraries ------------------------------

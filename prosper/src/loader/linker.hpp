@@ -124,8 +124,9 @@ struct ExportSubsumption {
     size_t already_claimed = 0;
     // 0.90: the corpus splits 99.7-100% (duplicate builds) against 0.4-19.2% (distinct libraries),
     // so this sits in an 80-point empty band rather than near any observed value.
+    static constexpr double kSubsumedFraction = 0.90;
     bool subsumed() const {
-        return exported != 0 && (double)already_claimed / (double)exported >= 0.90;
+        return exported != 0 && (double)already_claimed / (double)exported >= kSubsumedFraction;
     }
 };
 

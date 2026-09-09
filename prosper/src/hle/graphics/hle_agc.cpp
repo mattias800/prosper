@@ -3057,8 +3057,16 @@ HLE(agc_driver_register_resource) {
 //     Init (a0=0x2080000000, a1=0x61b500, a2=0x60, a3=0xffffffffffffffff, ...)
 // a1 is exactly Query's answer, so a1 is the block SIZE in bytes; a2 is exactly Query's owner
 // count. The resource capacity is not passed -- it is implied by the size, and re-deriving it
-// reproduces the request: (0x61b500 - 0x100 - 96*0x20) / 0x40 = 100008 against a request of
-// 100000, whose unrounded requirement 0x61b4c0 aligns up to 0x61b500 under the same kAlignment.
+// returns the request exactly: (0x61b500 - 0x100 - 96*0x20) / 0x40 = 100000. (An earlier version of
+// this comment said 100008 and invented an intermediate 0x61b4c0; 0x100 + 100000*0x40 + 96*0x20 is
+// 0x61b500 already, and 0x40-aligned, so no rounding occurs. Corrected in review of #3508.)
+//
+// HOW MUCH THAT CROSS-CHECK IS WORTH, stated honestly because the first draft overstated it: the
+// `required` value came from prosper's OWN Query handler, so the guest passing it back confirms it
+// echoes what we told it -- not that a1 is a size according to Sony. What it does establish is that
+// a1 carries the byte count prosper handed out and a2 the owner count it was asked with, which is
+// what this handler needs in order to validate rather than to lay anything out. The independent
+// part of the evidence is the register capture itself, not the arithmetic.
 // a3 is an all-ones sentinel, not a count. a4 DIFFERED between two runs of the same route
 // (...68e3 vs ...69a3), so it is caller-indeterminate scratch and is deliberately not read -- the
 // same trap sceKernelMapFlexibleMemory's a4 carries.

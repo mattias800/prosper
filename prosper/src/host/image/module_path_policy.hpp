@@ -1,9 +1,13 @@
 #pragma once
 // module_path_policy — which files inside a game dump prosper is willing to link as a guest module.
 //
-// REJECT BY DEFAULT. `kPermittedModuleDirs` below is the COMPLETE set of dump-relative locations a
-// module may be linked from; anything else is refused and reported, whatever the file is called and
-// whatever produced it.
+// REJECT BY DEFAULT. A module may be linked from `kPermittedModuleDirs` below, or from the dump ROOT
+// subject to the platform-name and extension rules further down (#3497). Together those are the
+// COMPLETE set of dump-relative locations; anything else is refused and reported, whatever the file
+// is called and whatever produced it.
+//
+// The root is the loosest of them and the one to read carefully: it is auto-scanned wholesale, and
+// it is not a directory a title owns by convention -- `eboot.bin` and `sce_module/` live there too.
 //
 // Why this is an enforced policy and not merely a property of how boot_link_inputs happens to be
 // written today: some dumps in circulation ship a `fakelib/` directory of replacement Sony
@@ -43,7 +47,10 @@ inline constexpr const char* kPermittedModuleDirs[] = {
     "sce_module",
 };
 
-// Files permitted directly in the dump root.
+// Files permitted directly in the dump root REGARDLESS of extension. Module files in the root are
+// handled separately (see the platform-prefix rules below): a title's own native middleware may sit
+// beside eboot.bin -- Darksiders II ships four such modules there -- so the root is not the
+// eboot-only location this list alone would suggest.
 inline constexpr const char* kPermittedRootFiles[] = {
     "eboot.bin",
 };
@@ -57,16 +64,48 @@ inline constexpr const char* kPermittedRootFiles[] = {
 //
 // CONFIDENCE: HIGH for the corpus — measured across all 50 local dumps, zero ship a `libSce*` under
 // `Media/Plugins` or `Media/Modules`, while three ship exactly such files under `fakelib/`. MED as a
-// universal claim about PS5 titles. If a real title ever does need one, the refusal is loud and
+// universal claim about PS5 titles.
+//
+// That measurement covers the two Media directories and was NOT re-run for the dump root when the
+// root was opened (#3497). What the root measurement does say: of 60 local dumps, exactly two ship a
+// root-level module at all — PPSA23806 (four, its own middleware) and PPSA16901 (one) — and neither
+// is a platform name. So the root rule is unexercised as a refusal across the corpus, which is a
+// weaker statement than the Media one and is why the platform-prefix list below exists rather than
+// relying on `libSce*` alone. If a real title ever does need one, the refusal is loud and
 // names the file, and widening the rule is a reviewed source change — which is the right direction
 // for the error to point, because the alternative failure is silent.
 inline constexpr const char* kSonyLibraryPrefix = "libsce";  // compared lowercased
+
+// The dump ROOT is auto-scanned wholesale (#3497), and unlike `Media/*` it is not a directory a
+// title owns by convention -- `eboot.bin` and `sce_module/` live there too. `libSce*` alone is NOT
+// sufficient cover for it: measured against the 3.20 reference, 21 of 275 system modules do not
+// carry that prefix, and `linker.cpp`'s "a cross-module export beats a stub slot" rule means a root
+// module shadowing one of those would silently displace prosper's own HLE.
+//
+// So the root additionally refuses the PLATFORM modules prosper itself provides or implements.
+// Deliberately NOT the whole non-`libSce` list: most of it is third-party (`libcurl`, `libpng16`,
+// `libfreetype`, `libicu`, `libharfbuzz`) and a title may legitimately ship its own build of those
+// -- refusing them would break exactly the case this widening exists to serve.
+//
+// HONEST LIMIT, because the previous version of this comment overstated it and was corrected in
+// review: this is a name heuristic over the platform surface, not a proof about every Sony-authored
+// module. What actually makes the root safe is the pair -- this list plus the extension gate plus
+// the fact that `fakelib/` and every other directory remain refused outright. A dump that ships a
+// platform replacement under a name matched by neither rule would still be linked, and the defence
+// against that is `dump_hygiene.py` and the link-time HLE ownership, not this function.
+inline constexpr const char* kRootRefusedPlatformPrefixes[] = {
+    "libkernel",   // libkernel, libkernel_sys, libkernel_web
+    "libc.",       // libc.prx exactly -- NOT libcairo/libcurl, which a title may ship
+    "libc_",
+    "libmdbg",     // libmdbg_syscore
+    "gaikai",      // gaikai-player
+};
 
 enum class ModulePathVerdict {
     Permitted,
     OutsideDumpRoot,             // not under the dump root at all, or escapes it via `..`
     DirectoryNotPermitted,       // inside the dump, in a directory prosper never links from
-    SonyLibraryOutsideSceModule, // a libSce* module in an auto-linked Media directory
+    SonyLibraryOutsideSceModule, // a platform module in an auto-linked location (Media/* or the root)
 };
 
 struct ModulePathDecision {
