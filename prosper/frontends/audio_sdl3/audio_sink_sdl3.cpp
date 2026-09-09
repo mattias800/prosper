@@ -707,6 +707,22 @@ public:
         for (int i = 0; i < kMaxPorts; ++i) apply_amplifier_locked(i);
     }
 
+    // Reads SDL back rather than reporting what we asked for. A gain nobody reads back is exactly
+    // how "[app] audio volume 0%" came to be printed by a process that kept making noise.
+    bool port_gains(int port, float* channel, float* amplifier) {
+        if (port < 1 || port > kMaxPorts) return false;
+        std::lock_guard<std::mutex> lk(mx_);
+        SDL_AudioStream* stream = slots_[port - 1].stream;
+        if (!stream) return false;
+        if (channel) *channel = SDL_GetAudioStreamGain(stream);
+        if (amplifier) {
+            const SDL_AudioDeviceID device = SDL_GetAudioStreamDevice(stream);
+            if (!device) return false;
+            *amplifier = SDL_GetAudioDeviceGain(device);
+        }
+        return true;
+    }
+
     void set_paused(bool paused) {
         std::lock_guard<std::mutex> lk(mx_);
         if (paused_ == paused) return;
@@ -849,6 +865,10 @@ bool sdl3_audio_demand_snapshot(int port, Sdl3AudioDemandSnapshot& snapshot) {
 void set_sdl3_audio_gain(float gain) {
     if (gain < 0.0f) gain = 0.0f;
     g_sink.set_gain(gain);   // safe before install: the value is remembered and applied on open
+}
+
+bool sdl3_audio_port_gains_for_test(int port, float* channel, float* amplifier) {
+    return g_sink.port_gains(port, channel, amplifier);
 }
 
 void set_sdl3_audio_paused(bool paused) {

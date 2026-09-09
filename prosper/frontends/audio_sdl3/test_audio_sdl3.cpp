@@ -51,8 +51,34 @@ int main() {
         for (size_t i = 0; i < pcm.size(); i++) pcm[i] = (int16_t)(i * 131 - 4000);
         CHECK(call("sceAudioOutOutput", (uint64_t)h, PTR(pcm.data())) == 256);
 
+        // The host's amplifier and the guest's channel gain are different knobs, and the whole
+        // defect in #3489 was that they were the same one: `--volume 0` held only until the title
+        // first called sceAudioOutSetVolume, which every title does seconds into its boot. So the
+        // assertion is not "the host gain was accepted" -- it is "the guest could not move it".
+        // Read back from SDL rather than from what we asked for, because a gain nobody reads back
+        // is how "[app] audio volume 0%" came to be printed by a process that kept talking.
+        float channel = -1.0f, amplifier = -1.0f;
+        set_sdl3_audio_gain(0.0f);                       // the host, as `--volume 0` does
+        CHECK(sdl3_audio_port_gains_for_test(1, &channel, &amplifier));
+        CHECK(amplifier == 0.0f);
+        CHECK(channel == 1.0f);                          // no guest volume yet
+
         int vols[2] = { 20000, 20000 };
         CHECK(call("sceAudioOutSetVolume", (uint64_t)h, 0x3, PTR(vols)) == 0);
+        channel = amplifier = -1.0f;
+        CHECK(sdl3_audio_port_gains_for_test(1, &channel, &amplifier));
+        CHECK(channel > 0.0f);                           // the guest set ITS knob...
+        CHECK(amplifier == 0.0f);                        // ...and did not touch the host's
+
+        // And the reverse: a later host change must not discard the guest's mix.
+        const float guest_gain = channel;
+        set_sdl3_audio_gain(0.5f);
+        channel = amplifier = -1.0f;
+        CHECK(sdl3_audio_port_gains_for_test(1, &channel, &amplifier));
+        CHECK(amplifier == 0.5f);
+        CHECK(channel == guest_gain);
+        set_sdl3_audio_gain(1.0f);                       // leave the rest of the test unattenuated
+
         CHECK(call("sceAudioOutClose", (uint64_t)h) == 0);
 
         // A host pause freezes the device and blocks producers before they can fill its queue.

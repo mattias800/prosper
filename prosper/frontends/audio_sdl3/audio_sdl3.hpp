@@ -34,14 +34,23 @@ bool install_sdl3_audio_sink();
 // No-op when the SDL3 sink is not installed.
 void set_sdl3_audio_paused(bool paused);
 
-// Set the playback gain applied to every stream, as a linear multiplier (1.0 = unchanged).
-// Applied via SDL_SetAudioStreamGain, so no sample data is copied or clipped by prosper.
-// Takes effect immediately on open streams and is remembered for streams opened later.
+// Set the HOST's playback gain -- an amplifier after the guest's own mixer, as a linear multiplier
+// (1.0 = unchanged). Applied via SDL_SetAudioStreamGain on the logical DEVICE each port feeds, so
+// no sample data is copied or clipped by prosper and the guest's per-port channel gain (which it
+// sets through sceAudioOutSetVolume) is left entirely alone. Deliberately a different knob: the two
+// used to write the same one, so the guest silently undid `--volume` seconds into every boot
+// (#3489). Takes effect immediately on open streams and is remembered for streams opened later.
 //
 // prosper-app defaults this to 1.0 -- the title's own mix, unedited, which is the only output a
 // compatibility layer can call correct. Attenuate a bring-up run with `--volume N` rather than
 // changing the default; see kDefaultVolumePercent in prosper-app/main.cpp.
 void set_sdl3_audio_gain(float gain);
+
+// Read back what SDL actually holds for a port: `channel` is the guest's own per-stream gain and
+// `amplifier` the host's device gain. False when the port has no stream. For tests -- the whole
+// point of the split is that the guest cannot move the host's setting, and an assertion has to be
+// able to observe BOTH to say so.
+bool sdl3_audio_port_gains_for_test(int port, float* channel, float* amplifier);
 
 // Uninstall the SDL3 sink (restores the default), joining diagnostics and closing streams.
 // Call after guest audio producers stop, BEFORE SDL_Quit/SDL_QuitSubSystem(AUDIO).
