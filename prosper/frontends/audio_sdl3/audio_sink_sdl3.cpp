@@ -294,7 +294,8 @@ public:
                 SDL_Log("[audio-demand-error] port=%d callback unavailable: %s", port, SDL_GetError());
         }
         s.next = {};   // (re)start the per-grain pacing clock on the first output()
-        SDL_SetAudioStreamGain(s.stream, gain_);
+        SDL_SetAudioStreamGain(s.stream, 1.0f);   // no guest volume on a freshly opened port
+        apply_amplifier_locked(port - 1);         // remembered host setting, whenever it was made
         const bool stream_ready = paused_ ? SDL_PauseAudioStreamDevice(s.stream)
                                           : SDL_ResumeAudioStreamDevice(s.stream);
         if (!stream_ready) {
@@ -651,9 +652,11 @@ public:
         if (port < 1 || port > kMaxPorts || !vols) return;
         // Approximate the PS5 per-channel volumes as a single stream gain (0..1) from the loudest set channel.
         int maxv = audio_peak_channel_volume(mask, vols);
-        float gain = maxv / 32768.0f;                     // SCE_AUDIO_VOLUME_0DB == 32768
+        const float guest = maxv / 32768.0f;              // SCE_AUDIO_VOLUME_0DB == 32768
         std::lock_guard<std::mutex> lk(mx_);
-        if (SDL_AudioStream* st = slots_[port - 1].stream) SDL_SetAudioStreamGain(st, gain);
+        // The guest's own mixer channel. The host's amplifier lives on the device this stream
+        // feeds, so setting this cannot disturb it -- which it did, until #3489.
+        if (SDL_AudioStream* st = slots_[port - 1].stream) SDL_SetAudioStreamGain(st, guest);
     }
 
     void close(int port) override {
@@ -671,10 +674,37 @@ public:
 
     // whether it is set before or after the guest creates its ports.
 
+    // The host's amplifier, on the DEVICE the port's stream feeds -- deliberately not the stream's
+    // own gain, which belongs to the guest. `sceAudioOutSetVolume` is the title setting a channel on
+    // its virtual PS5 mixer; `--volume` is what that mixer is plugged into. They are different
+    // points in the signal chain and SDL has both, so nothing here has to multiply them and no
+    // future caller can reintroduce the overwrite this replaced: the guest path never names a
+    // device. Takes an index rather than a Slot& so its signature does not mention a type declared
+    // further down the class.
+    void apply_amplifier_locked(int index) {
+        SDL_AudioStream* stream = slots_[index].stream;
+        if (!stream) return;
+        const SDL_AudioDeviceID device = SDL_GetAudioStreamDevice(stream);
+        // Reported rather than assumed. SDL refuses this on a PHYSICAL device and only accepts it
+        // on a logical one; SDL_OpenAudioDeviceStream gives us a logical device, so a false here
+        // means something about that changed. Silence about it is how `--volume 0` came to print
+        // "audio volume 0%" while the title kept talking.
+        if (!device || !SDL_SetAudioDeviceGain(device, amplifier_)) {
+            SDL_Log("prosper-audio: port %d could not apply --volume gain %.2f: %s",
+                    index + 1, amplifier_, SDL_GetError());
+            return;
+        }
+        // Read back what the device actually holds, so the log states an OBSERVED gain rather than
+        // an intended one. `[app] audio volume 0%` was true about the intent and false about the
+        // output for the whole life of the flag; a number nobody read back is how that survived.
+        SDL_Log("prosper-audio: port %d amplifier gain set %.2f, device reports %.2f",
+                index + 1, amplifier_, SDL_GetAudioDeviceGain(device));
+    }
+
     void set_gain(float g) {
         std::lock_guard<std::mutex> lk(mx_);
-        gain_ = g;
-        for (auto& s : slots_) if (s.stream) SDL_SetAudioStreamGain(s.stream, gain_);
+        amplifier_ = g;
+        for (int i = 0; i < kMaxPorts; ++i) apply_amplifier_locked(i);
     }
 
     void set_paused(bool paused) {
@@ -792,7 +822,10 @@ private:
     std::atomic<bool> timeline_running_{false};
     std::thread       timeline_thread_;
     bool paused_ = false;
-    float gain_ = 1.0f;   // linear playback gain, applied via SDL_SetAudioStreamGain
+    // The host's amplifier, applied via SDL_SetAudioDeviceGain AFTER the guest's own per-port
+    // channel gain. Remembered here so it survives ports opening and closing, and so a setting made
+    // before the guest creates any port still reaches every port it later opens.
+    float amplifier_ = 1.0f;
 };
 
 Sdl3AudioSink g_sink;
