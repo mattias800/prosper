@@ -34,6 +34,15 @@ constexpr const char* kNpTrophy2GetTrophyInfoArray = "y3zHpdZO6ME"; // already r
 constexpr const char* kSaveDataTransferringMount    = "WAzWTZm1H+I";
 constexpr const char* kSaveDataTransferringMountPs4 = "RjMlsR8EXrw";
 constexpr const char* kSaveDataDirNameSearchPs4     = "X4MYzukPc3g";
+// #3502 -- the memory-pool family and the flexible-memory size pair. All five resolved against the
+// PS5 3.20 export tables and cross-checked against the live import list of the titles that call
+// them (PPSA25258, PPSA21783).
+constexpr const char* kMemoryPoolExpand            = "qCSfqDILlns";
+constexpr const char* kMemoryPoolReserve           = "pU-QydtGcGY";
+constexpr const char* kMemoryPoolCommit            = "Vzl66WmfLvk";
+constexpr const char* kConfiguredFlexibleMemorySize = "n1-v6FgU7MQ";
+constexpr const char* kAvailableFlexibleMemorySize  = "aNz11fnnzi4";
+constexpr const char* kGetPageTableStats            = "tZ2yplY8MBY";
 
 bool all_bytes_equal(const unsigned char* p, size_t n, unsigned char v) {
     for (size_t i = 0; i < n; ++i) if (p[i] != v) return false;
@@ -322,6 +331,95 @@ void test_http_ids() {
 
 } // namespace
 
+void test_kernel_memory_pool() {
+    printf("-- libkernel memory pool + flexible-memory sizes (#3502) --\n");
+    // Unregistered, these answered the dispatcher's 0 = SCE_OK and wrote no out-parameter, so the
+    // guest read its own uninitialised stack as an address or a size. NINJA GAIDEN 4 (PPSA25258)
+    // took Reserve's unwritten result straight into Commit and dereferenced null at +0x118.
+    //
+    // Boots cannot police this. The one title observed calling GetPageTableStats (PPSA21783) still
+    // aborts for an unrelated reason with or without a correct answer, so every assertion about it
+    // has to live here or nowhere.
+
+    // ---- the flexible-memory size pair ----
+    HleFn cfg   = Hle::lookup(kConfiguredFlexibleMemorySize);
+    HleFn avail = Hle::lookup(kAvailableFlexibleMemorySize);
+    CHECK(cfg != nullptr,   "sceKernelConfiguredFlexibleMemorySize is registered");
+    CHECK(avail != nullptr, "sceKernelAvailableFlexibleMemorySize is registered");
+    if (cfg && avail) {
+        uint64_t configured = 0x5A5A5A5A5A5A5A5Aull;
+        uint64_t available  = 0x5A5A5A5A5A5A5A5Aull;
+        CHECK(cfg((uint64_t)(uintptr_t)&configured, 0, 0, 0, 0, 0) == 0,
+              "Configured returns SCE_OK");
+        // Kills: registering it to a `return 0` no-op. That passes a ret==0 assertion while
+        // leaving the poison in place -- the exact stub this change removes.
+        CHECK(configured != 0x5A5A5A5A5A5A5A5Aull, "Configured writes its out-parameter");
+        CHECK(configured != 0, "Configured does not report a zero budget");
+        CHECK(avail((uint64_t)(uintptr_t)&available, 0, 0, 0, 0, 0) == 0,
+              "Available returns SCE_OK");
+        // Kills: re-introducing a second literal instead of the shared kFlexibleMemoryPoolBytes,
+        // which is how the pair silently drifts apart.
+        CHECK(configured == available,
+              "Configured and Available answer from ONE constant");
+        // Kills: dropping the null guard. Without it this call dereferences 0 instead of
+        // returning EINVAL, so the arm below is a crash test as much as a value test.
+        CHECK(cfg(0, 0, 0, 0, 0, 0) != 0, "Configured rejects a null out-parameter");
+    }
+
+    // ---- sceKernelGetPageTableStats: FOUR 32-bit out-parameters ----
+    HleFn pts = Hle::lookup(kGetPageTableStats);
+    CHECK(pts != nullptr, "sceKernelGetPageTableStats is registered");
+    if (pts) {
+        // Eight bytes of poison per slot; the contract writes only the low four. The width claim
+        // rests on live probe evidence (four consecutive stack addresses four bytes apart), and
+        // this is the only thing that holds it.
+        uint64_t slot[4];
+        memset(slot, 0x5A, sizeof(slot));
+        CHECK(pts((uint64_t)(uintptr_t)&slot[0], (uint64_t)(uintptr_t)&slot[1],
+                  (uint64_t)(uintptr_t)&slot[2], (uint64_t)(uintptr_t)&slot[3], 0, 0) == 0,
+              "GetPageTableStats returns SCE_OK");
+        for (int i = 0; i < 4; ++i) {
+            char msg[160];
+            snprintf(msg, sizeof(msg), "GetPageTableStats writes out%d", i);
+            CHECK((uint32_t)(slot[i] & 0xffffffffull) == 0u, msg);
+            // Kills: widening the store to uint64_t. That corrupts four bytes of guest stack
+            // beyond the contract at every slot -- sixteen bytes in total -- and NO boot can see
+            // it, because the only title observed calling this aborts either way.
+            snprintf(msg, sizeof(msg), "GetPageTableStats leaves the upper 4 bytes of out%d alone", i);
+            CHECK((uint32_t)(slot[i] >> 32) == 0x5A5A5A5Au, msg);
+        }
+        // Kills: dropping the null guards on the second, third or fourth pointer -- a plausible
+        // edit, since only the first is obviously an out-parameter at a glance.
+        uint64_t one = 0;
+        CHECK(pts((uint64_t)(uintptr_t)&one, 0, 0, 0, 0, 0) != 0,
+              "GetPageTableStats rejects a null in ANY of its four slots");
+    }
+
+    // ---- sceKernelMemoryPoolReserve: the call whose unwritten output crashed PPSA25258 ----
+    HleFn reserve = Hle::lookup(kMemoryPoolReserve);
+    CHECK(reserve != nullptr, "sceKernelMemoryPoolReserve is registered");
+    CHECK(Hle::lookup(kMemoryPoolExpand) != nullptr, "sceKernelMemoryPoolExpand is registered");
+    CHECK(Hle::lookup(kMemoryPoolCommit) != nullptr, "sceKernelMemoryPoolCommit is registered");
+    if (reserve) {
+        constexpr uint64_t kLen = 0x10000;   // small: this arm really does reserve address space
+        uint64_t out = 0x5A5A5A5A5A5A5A5Aull;
+        const uint64_t rc = reserve(0 /*no hint*/, kLen, kLen /*align*/, 0 /*flags*/,
+                                    (uint64_t)(uintptr_t)&out, 0);
+        CHECK(rc == 0, "Reserve succeeds for an unhinted 64 KiB range");
+        // Kills: the return-0-writes-nothing stub. This is NINJA GAIDEN 4's actual bug -- the
+        // guest passed this untouched value to Commit as an address.
+        CHECK(out != 0x5A5A5A5A5A5A5A5Aull, "Reserve writes its addrOut");
+        CHECK(out != 0, "Reserve does not hand back a null address");
+        CHECK((out & (kLen - 1)) == 0, "Reserve honours the requested alignment");
+        // Kills: dropping the addrOut null guard, which would fault rather than return EINVAL.
+        CHECK(reserve(0, kLen, kLen, 0, 0, 0) != 0, "Reserve rejects a null addrOut");
+    }
+    // Expand and Commit are deliberately exercised only for registration here: Expand consumes the
+    // direct-memory arena and Commit maps pages, and a unit test that quietly did either would be
+    // making the suite's later arms depend on how much arena it had left. Their behaviour is
+    // covered by the live-boot evidence on #3500.
+}
+
 int main() {
     printf("== test_false_success_nids ==\n");
     register_builtin_hle();
@@ -329,6 +427,7 @@ int main() {
     test_nptrophy2_info_queries();
     test_savedata_transferring_mount();
     test_http_ids();
+    test_kernel_memory_pool();
     if (fails) { printf("== FAIL: %d check(s) failed ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;

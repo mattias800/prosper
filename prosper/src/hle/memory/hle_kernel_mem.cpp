@@ -1721,8 +1721,17 @@ HLE(k_avail_flexible) { if (!a0) return 0x80020016ull; *(uint64_t*)(uintptr_t)a0
 // sceKernelMemoryPoolExpand(off_t searchStart, off_t searchEnd, size_t len, size_t align,
 //                           off_t* physAddrOut)
 HLE(k_pool_expand) {
-    if (!a4) return 0x80020016ull;                                  // SCE_KERNEL_ERROR_EINVAL
-    if (!a2 || (a3 && (a3 & (a3 - 1)))) return 0x80020016ull;        // len 0, or non-power-of-two align
+    // Every rejection below happens BEFORE dmem_take. Validating after it would consume arena on a
+    // call that then faults writing the result -- the allocation is unrecoverable because nothing
+    // has the offset yet. Raised in review of #3505.
+    if (a3 && (a3 & (a3 - 1))) return 0x80020016ull;   // non-power-of-two alignment breaks the
+                                                       // & ~(align-1) rounding below
+    // Length, 16 KiB granularity, and physAddrOut plausibility all come from the sibling
+    // allocator's own validator rather than being re-checked here. Its comment records why the
+    // pointer test belongs before the take: the old code allocated first and skipped the guarded
+    // write, giving false success plus leaked physical capacity. Answering the pool API more
+    // permissively than the arena underneath it is how the two drift apart.
+    if (!valid_dmem_allocation(a2, a3, 0, a4)) return 0x80020016ull;   // SCE_KERNEL_ERROR_EINVAL
     const uint64_t align = a3 ? a3 : 0x4000;
     uint64_t off = 0;
     if (!dmem_take(a2, align, 0, off, a0, a1 ? a1 : ~0ull)) {
@@ -6597,8 +6606,17 @@ HLE(k_avail_flexible) { if (!a0) return 0x80020016ull; *(uint64_t*)(uintptr_t)a0
 // sceKernelMemoryPoolExpand(off_t searchStart, off_t searchEnd, size_t len, size_t align,
 //                           off_t* physAddrOut)
 HLE(k_pool_expand) {
-    if (!a4) return 0x80020016ull;                                  // SCE_KERNEL_ERROR_EINVAL
-    if (!a2 || (a3 && (a3 & (a3 - 1)))) return 0x80020016ull;        // len 0, or non-power-of-two align
+    // Every rejection below happens BEFORE dmem_take. Validating after it would consume arena on a
+    // call that then faults writing the result -- the allocation is unrecoverable because nothing
+    // has the offset yet. Raised in review of #3505.
+    if (a3 && (a3 & (a3 - 1))) return 0x80020016ull;   // non-power-of-two alignment breaks the
+                                                       // & ~(align-1) rounding below
+    // Length, 16 KiB granularity, and physAddrOut plausibility all come from the sibling
+    // allocator's own validator rather than being re-checked here. Its comment records why the
+    // pointer test belongs before the take: the old code allocated first and skipped the guarded
+    // write, giving false success plus leaked physical capacity. Answering the pool API more
+    // permissively than the arena underneath it is how the two drift apart.
+    if (!valid_dmem_allocation(a2, a3, 0, a4)) return 0x80020016ull;   // SCE_KERNEL_ERROR_EINVAL
     const uint64_t align = a3 ? a3 : 0x4000;
     uint64_t off = 0;
     if (!dmem_take(a2, align, 0, off, a0, a1 ? a1 : ~0ull)) {
