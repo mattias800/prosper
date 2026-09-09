@@ -51,8 +51,48 @@ int main() {
         for (size_t i = 0; i < pcm.size(); i++) pcm[i] = (int16_t)(i * 131 - 4000);
         CHECK(call("sceAudioOutOutput", (uint64_t)h, PTR(pcm.data())) == 256);
 
+        // The host's amplifier and the guest's channel gain are different knobs, and the whole
+        // defect in #3489 was that they were the same one: `--volume 0` held only until the title
+        // first called sceAudioOutSetVolume, which every title does seconds into its boot. So the
+        // assertion is not "the host gain was accepted" -- it is "the guest could not move it".
+        // Read back from SDL rather than from what we asked for, because a gain nobody reads back
+        // is how "[app] audio volume 0%" came to be printed by a process that kept talking.
+        float channel = -1.0f, amplifier = -1.0f;
+        set_sdl3_audio_gain(0.0f);                       // the host, as `--volume 0` does
+        CHECK(sdl3_audio_port_gains_for_test(1, &channel, &amplifier));
+        CHECK(amplifier == 0.0f);
+        CHECK(channel == 1.0f);                          // no guest volume yet
+
         int vols[2] = { 20000, 20000 };
         CHECK(call("sceAudioOutSetVolume", (uint64_t)h, 0x3, PTR(vols)) == 0);
+        channel = amplifier = -1.0f;
+        CHECK(sdl3_audio_port_gains_for_test(1, &channel, &amplifier));
+        CHECK(channel > 0.0f);                           // the guest set ITS knob...
+        CHECK(amplifier == 0.0f);                        // ...and did not touch the host's
+
+        // And the reverse: a later host change must not discard the guest's mix.
+        const float guest_gain = channel;
+        set_sdl3_audio_gain(0.5f);
+        channel = amplifier = -1.0f;
+        CHECK(sdl3_audio_port_gains_for_test(1, &channel, &amplifier));
+        CHECK(amplifier == 0.5f);
+        CHECK(channel == guest_gain);
+
+        // A port opened AFTER the host set its gain -- which is the ordering every real run takes.
+        // prosper-app applies --volume before the guest opens anything (main.cpp), so production
+        // never reaches the device through set_gain() sweeping open slots; it reaches it only
+        // through the apply at stream open. Asserting only on the already-open port left that call
+        // untested, and deleting it kept this test green -- a change that breaks --volume for every
+        // user would have passed.
+        int64_t late = call("sceAudioOutOpen", 1, 0, 0, 256, 48000, 1);
+        CHECK(late >= 1);
+        channel = amplifier = -1.0f;
+        CHECK(sdl3_audio_port_gains_for_test(2, &channel, &amplifier));
+        CHECK(amplifier == 0.5f);                        // the remembered host setting reached it
+        CHECK(channel == 1.0f);                          // and the guest has not spoken for it yet
+        CHECK(call("sceAudioOutClose", (uint64_t)late) == 0);
+
+        set_sdl3_audio_gain(1.0f);                       // leave the rest of the test unattenuated
         CHECK(call("sceAudioOutClose", (uint64_t)h) == 0);
 
         // A host pause freezes the device and blocks producers before they can fill its queue.
