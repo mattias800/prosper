@@ -177,6 +177,15 @@ public:
                 pad_script_empty_route_warning(source_, script_.empty());
             if (!warning.empty()) fprintf(stderr, "%s\n", warning.c_str());
         }
+        // The POSITIVE half, and it is the one an automated consumer needs. Everything above
+        // reports a route DYING; a reader can then only check that no death was reported, and
+        // absence is exactly what it also gets when the emulator never looked -- when the variable
+        // was spelled differently, when a harness resolved the path against the wrong directory, or
+        // when some future change stops emitting the errors. A corpus survey checked for absence
+        // that way and recorded three routes' worth of title screens as though they were gameplay
+        // (instrument trap 274). This line lets it require that the route ran instead.
+        fprintf(stderr, "[pad] PROSPER_PAD_SCRIPT loaded %zu entries from %s\n",
+                script_.size(), source_[0] == '@' ? path_.string().c_str() : "<inline>");
     }
 
     bool configured() const { return !source_.empty(); }

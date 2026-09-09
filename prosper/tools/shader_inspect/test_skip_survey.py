@@ -190,7 +190,7 @@ def main() -> int:
     # is checked too -- and a row that never got its route must not be usable as a baseline or as a
     # comparison, which is exactly what `unjudgeable` decides.
     good = {"exited_early": False, "frames": 900, "device": "some GPU", "elapsed": 150.0,
-            "returncode": 0, "pad_failed": ""}
+            "returncode": 0, "pad_failed": "", "routed": True, "pad_entries": 12}
     check("a healthy routed row is judgeable", not skip_survey.unjudgeable(good))
     lost = dict(good, pad_failed="scripts/blasphemous2/reach-first-gameplay.pad")
     why = skip_survey.unjudgeable(lost)
@@ -200,6 +200,29 @@ def main() -> int:
     check("PAD_FAILED matches the emulator's own wording",
           skip_survey.PAD_FAILED.search(
               "[pad] PROSPER_PAD_SCRIPT: cannot open route file: scripts/x/y.pad") is not None)
+
+    # The POSITIVE requirement. Checking only for the absence of an error is what let trap 274
+    # through, because absence is also what a run produces when the emulator never looked at the
+    # variable at all -- so a routed row must SHOW that its route loaded, not merely fail to show
+    # that it did not.
+    silent = dict(good, pad_entries=-1)
+    why = skip_survey.unjudgeable(silent)
+    check("a routed row whose log never reports a loaded route is NOT judgeable", bool(why), why)
+    inert = dict(good, pad_entries=0)
+    check("a routed row whose route parsed to zero entries is NOT judgeable",
+          bool(skip_survey.unjudgeable(inert)))
+    check("an UNROUTED row is unaffected by that requirement",
+          not skip_survey.unjudgeable(dict(good, routed=False, pad_entries=-1)))
+
+    # And the line has to be the one the emulator actually prints -- trap 272's rule, since a
+    # requirement pinned to a format string nobody emits disqualifies every run forever.
+    hle_pad = (REPO / "prosper" / "src" / "hle" / "input" / "hle_pad.cpp").read_text(
+        encoding="utf-8", errors="replace")
+    check("the emulator still emits the loaded-route line the survey requires",
+          '"[pad] PROSPER_PAD_SCRIPT loaded %zu entries from %s' in hle_pad)
+    check("PAD_LOADED matches that emitter's wording",
+          skip_survey.PAD_LOADED.search(
+              "[pad] PROSPER_PAD_SCRIPT loaded 42 entries from C:/x/y.pad") is not None)
 
     print("\n%d checks failed" % len(failures) if failures else "\nall checks passed")
     return 1 if failures else 0

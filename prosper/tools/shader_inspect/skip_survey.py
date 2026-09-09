@@ -95,6 +95,10 @@ FPS = re.compile(r"\[app\] [\d.]+ fps \((\d+) frames")
 # that exists at check time can still fail to open. A route that delivered no input measured a boot
 # screen, so its count is not evidence of anything.
 PAD_FAILED = re.compile(r"\[pad\][^\n]*cannot open route file: ([^\n]*)")
+# The positive signal, which is what a routed row is actually required to show. Checking only for
+# the absence of an error is what let trap 274 through: absence is also what a run produces when the
+# emulator never looked at the variable at all.
+PAD_LOADED = re.compile(r"\[pad\] PROSPER_PAD_SCRIPT loaded (\d+) entries")
 # The counts are host-dependent in the extreme: on an AMD host wave64 is native, nothing is refused,
 # and every count is legitimately 0. A baseline recorded on one GPU and compared against another
 # would report every shader as fixed and go green, so the device is recorded and checked.
@@ -158,11 +162,13 @@ def survey(app, dump, seconds, out_dir, route=None):
     frames = max([int(m) for m in FPS.findall(text)] or [0])
     device = DEVICE.search(text)
     pad_failed = PAD_FAILED.search(text)
+    pad_loaded = PAD_LOADED.search(text)
     return {
         "title": title,
         "route": route["name"] if route else "",
         "routed": bool(route and route.get("pad_script")),
         "pad_failed": pad_failed.group(1).strip() if pad_failed else "",
+        "pad_entries": int(pad_loaded.group(1)) if pad_loaded else -1,
         "device": device.group(1).strip() if device else "",
         "frames": frames,
         "elapsed": round(elapsed, 1),
@@ -250,6 +256,12 @@ def unjudgeable(row):
     if row.get("pad_failed"):
         return ("never loaded its route file (%s), so it measured a boot screen rather than the "
                 "route" % row["pad_failed"])
+    if row.get("routed") and row.get("pad_entries", -1) <= 0:
+        # Required rather than merely reported: a routed row whose log never says the route loaded
+        # has not shown that it drove the title anywhere. See trap 274.
+        return ("is a routed run whose log never reports a loaded route (%s), so nothing shows it "
+                "drove the title anywhere"
+                % ("0 entries" if row.get("pad_entries") == 0 else "no [pad] loaded line"))
     if row["exited_early"]:
         return "exited early after %.0fs (rc=%s)" % (row["elapsed"], row["returncode"])
     if not row["frames"]:
