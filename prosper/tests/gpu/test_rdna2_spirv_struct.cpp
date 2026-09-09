@@ -6846,6 +6846,44 @@ int main() {
             return b;
         };
 
+        // The vote reaches an OpSwitch SELECTOR and each case stores a different constant. Modelling
+        // only a switch's successors and not its selector left this with no control dependence at
+        // all -- nothing in it is an OpBranchConditional, so the whole construct was invisible. The
+        // CFG emitter builds a switch on the guest PC, so the shape is not theoretical.
+        std::vector<uint32_t> vote_to_switch = preamble(kInput);
+        ins(vote_to_switch, 248, {20}); ins(vote_to_switch, 61, {1, 9, 8});
+        ins(vote_to_switch, 335, {1, 10, 6, 9});
+        ins(vote_to_switch, 169, {2, 25, 10, 11, 6});      // OpSelect -> selector from the vote
+        ins(vote_to_switch, 247, {28, 0});
+        ins(vote_to_switch, 251, {25, 26, 0, 27});         // OpSwitch
+        ins(vote_to_switch, 248, {26}); ins(vote_to_switch, 62, {5, 11});
+        ins(vote_to_switch, 249, {28});
+        ins(vote_to_switch, 248, {27}); ins(vote_to_switch, 62, {5, 6});
+        ins(vote_to_switch, 249, {28});
+        ins(vote_to_switch, 248, {28}); ins(vote_to_switch, 253, {});
+
+        // A vote-tainted value stored into a local through ONE access chain and read back through
+        // ANOTHER into the same slot. Keying taint by pointer id lost the dependence, and the
+        // emitter mints a fresh chain per guest-scratch access, so one slot really is reached
+        // through several ids. `stored` is the whole experiment: the vote, or a constant.
+        auto two_chains = [&](uint32_t stored) {
+            std::vector<uint32_t> b = preamble(kInput);
+            ins(b, 21, {30, 32, 0}); ins(b, 43, {30, 31, 4});
+            ins(b, 28, {32, 1, 31});
+            ins(b, 32, {33, kFunction, 32});
+            ins(b, 59, {33, 34, kFunction});
+            ins(b, 32, {35, kFunction, 1});
+            ins(b, 248, {20}); ins(b, 61, {1, 9, 8});
+            ins(b, 335, {1, 10, 6, 9});
+            ins(b, 65, {35, 36, 34, 31});                  // chain A
+            ins(b, 62, {36, stored});
+            ins(b, 65, {35, 37, 34, 31});                  // chain B, same slot
+            ins(b, 61, {1, 38, 37});
+            ins(b, 62, {5, 38});
+            ins(b, 253, {});
+            return b;
+        };
+
         std::vector<uint32_t> no_votes = preamble(kInput);
         ins(no_votes, 248, {20}); ins(no_votes, 62, {5, 11}); ins(no_votes, 253, {});
 
@@ -6869,6 +6907,12 @@ int main() {
              vote_over_chain(kFunction), false},
             {"a vote over a constant buffer read through an access chain",
              vote_over_chain(kStorageBuffer), true},
+            {"a vote reaching an OpSwitch selector whose cases store different constants",
+             vote_to_switch, false},
+            {"a vote stored and reloaded through TWO chains into one local slot",
+             two_chains(10), false},
+            {"two chains into one slot carrying a value the vote never touched",
+             two_chains(11), true},
             {"a UNIFORM vote guarding a store to the colour output",
              branch_only(kStorageBuffer), true},
             {"a UNIFORM vote whose arms merge in a phi that reaches the output",

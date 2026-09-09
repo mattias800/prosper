@@ -116,6 +116,28 @@ class Module:
                 self.ballots.add(w[2])
 
         self._build_cfg()
+        self._build_pointer_roots()
+
+    def _build_pointer_roots(self):
+        """The variable a pointer roots in. Taint through memory is keyed on the SLOT, not on the
+        pointer id: the emitter mints a fresh access chain per scratch access, so a
+        read-modify-write of one slot uses two ids and an id-keyed store/load pair loses the
+        dependence between them."""
+        self.pointer_root = {w[2]: w[2] for op, w in self.insts
+                             if op == OP_VARIABLE and len(w) >= 3}
+        changed = True
+        while changed:
+            changed = False
+            for op, w in self.insts:
+                if op != OP_ACCESS_CHAIN or len(w) < 4:
+                    continue
+                base = self.pointer_root.get(w[3])
+                if base is not None and w[2] not in self.pointer_root:
+                    self.pointer_root[w[2]] = base
+                    changed = True
+
+    def root_of(self, ptr):
+        return self.pointer_root.get(ptr, ptr)
 
     def _build_cfg(self):
         self.blocks, self.succ, self.merge_of, self.branch_cond = {}, {}, {}, {}
@@ -136,6 +158,8 @@ class Module:
                 self.branch_cond[current] = w[1]
                 self.succ[current] = [w[2], w[3]]
             elif op == OP_SWITCH and len(w) >= 3:
+                # The SELECTOR is a branch condition too -- see the C++ twin.
+                self.branch_cond[current] = w[1]
                 self.succ[current] = [w[2]] + [w[i] for i in range(4, len(w), 2)]
 
     # -- arm (a) -----------------------------------------------------------------------------
@@ -233,12 +257,13 @@ class Module:
             changed = False
             for op, w in self.insts:
                 if op == OP_STORE and len(w) >= 3:
-                    if w[2] in tainted and w[1] in self.locals and w[1] not in tainted_ptrs:
-                        tainted_ptrs.add(w[1])
+                    slot = self.root_of(w[1])
+                    if w[2] in tainted and slot in self.locals and slot not in tainted_ptrs:
+                        tainted_ptrs.add(slot)
                         changed = True
                     continue
                 if op == OP_LOAD and len(w) >= 4:
-                    if w[3] in tainted_ptrs and w[2] not in tainted:
+                    if self.root_of(w[3]) in tainted_ptrs and w[2] not in tainted:
                         tainted.add(w[2])
                         changed = True
                     continue
@@ -294,9 +319,9 @@ class Module:
                             return True
                         # A store into a local inside the region is control-dependent too: whether
                         # it happened at all is the vote's answer.
-                        if op == OP_STORE and len(w) >= 3 and w[1] in self.locals \
-                                and w[1] not in tainted_ptrs:
-                            tainted_ptrs.add(w[1])
+                        slot = self.root_of(w[1]) if op == OP_STORE and len(w) >= 3 else None
+                        if slot is not None and slot in self.locals and slot not in tainted_ptrs:
+                            tainted_ptrs.add(slot)
                             grew = True
                 for op, w in self.blocks.get(merge, []):
                     if op != OP_PHI or len(w) < 5 or w[2] in tainted:

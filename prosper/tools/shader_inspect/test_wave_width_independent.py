@@ -65,8 +65,14 @@ def preamble(source_storage):
             + inst(43, 2, 6, 3)               # OpConstant (used as the scope literal)
             + inst(43, 2, 11, 1)              # OpConstant (the value a taken block stores)
             + inst(32, 7, 1, source_storage)  # OpTypePointer <storage> bool
-            + inst(59, 7, 8, source_storage)  # OpVariable <storage>
-            + inst(61, 1, 9, 8))              # OpLoad -> %9, the vote's predicate
+            + inst(59, 7, 8, source_storage))  # OpVariable <storage>
+
+
+# The entry block. The divergent load lives INSIDE it: a review noted that emitting it before the
+# first OpLabel put it in no block at all, so the region machinery could not see anything that
+# depended on it -- which quietly weakens every fixture whose point is control flow.
+def entry():
+    return inst(248, 20) + inst(61, 1, 9, 8)   # OpLabel, then OpLoad -> %9
 
 
 PRE_IDS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 11]
@@ -76,7 +82,7 @@ def mod_branch_only(storage):
     """any(P) guards a block that stores a constant into the colour output."""
     b = (preamble(storage)
          + inst(335, 1, 10, 6, 9)                       # OpGroupNonUniformAny -> %10
-         + inst(248, 20)                                # OpLabel (entry)
+         + entry()
          + inst(247, 22, 0)                             # OpSelectionMerge %22
          + inst(250, 10, 21, 22)                        # OpBranchConditional on the vote
          + inst(248, 21) + inst(62, 5, 11) + inst(249, 22)   # then: OpStore out, const
@@ -88,7 +94,7 @@ def mod_phi_of_constants(storage):
     """The reviewer's second shape: the two arms merge in a phi that then reaches the output."""
     b = (preamble(storage)
          + inst(335, 1, 10, 6, 9)
-         + inst(248, 20)
+         + entry()
          + inst(247, 23, 0)
          + inst(250, 10, 21, 22)
          + inst(248, 21) + inst(249, 23)
@@ -104,7 +110,7 @@ def mod_value_to_output(storage):
     """The one case the predecessor DID catch: the vote's value itself is stored."""
     b = (preamble(storage)
          + inst(335, 1, 10, 6, 9)
-         + inst(248, 20) + inst(62, 5, 10) + inst(253))
+         + entry() + inst(62, 5, 10) + inst(253))
     return module(PRE_IDS + [10, 20], b)
 
 
@@ -118,7 +124,7 @@ def mod_guards_storage_buffer_write():
          + inst(32, 40, 2, SC_STORAGE_BUFFER)          # OpTypePointer StorageBuffer float
          + inst(59, 40, 41, SC_STORAGE_BUFFER)         # OpVariable StorageBuffer
          + inst(335, 1, 10, 6, 9)
-         + inst(248, 20)
+         + entry()
          + inst(247, 22, 0)
          + inst(250, 10, 21, 22)
          + inst(248, 21) + inst(62, 41, 11) + inst(249, 22)   # then: store into the buffer
@@ -139,7 +145,7 @@ def mod_uniform_source_but_shader_writes_memory():
          + inst(32, 40, 2, SC_STORAGE_BUFFER)
          + inst(59, 40, 41, SC_STORAGE_BUFFER)
          + inst(335, 1, 10, 6, 9)
-         + inst(248, 20)
+         + entry()
          + inst(62, 41, 11)                            # the extra instruction: a UAV write
          + inst(247, 22, 0)
          + inst(250, 10, 21, 22)
@@ -152,7 +158,7 @@ def mod_guards_discard():
     """The region discards the pixel. Whether the fragment survives is the vote's answer."""
     b = (preamble(SC_INPUT)
          + inst(335, 1, 10, 6, 9)
-         + inst(248, 20)
+         + entry()
          + inst(247, 22, 0)
          + inst(250, 10, 21, 22)
          + inst(248, 21) + inst(252)                   # then: OpKill
@@ -173,7 +179,7 @@ def mod_phi_before_vote(identical):
     """
     lower_value = 11 if identical else 6
     b = (preamble(SC_INPUT)                            # %9 is a per-pixel load: divergent
-         + inst(248, 20)
+         + entry()
          + inst(247, 23, 0)
          + inst(250, 9, 21, 22)                        # branch on the DIVERGENT value itself
          + inst(248, 21) + inst(249, 23)
@@ -207,7 +213,7 @@ def mod_vote_over_a_local(storage):
          + inst(44, 32, 34, 11, 11, 11, 11)            # OpConstantComposite arr (uniform)
          + inst(59, 33, 35, storage, 34)               # OpVariable <storage> WITH initializer
          + inst(32, 36, storage, 1)                    # OpTypePointer <storage> bool
-         + inst(248, 20)
+         + entry()
          + inst(65, 36, 37, 35, 31)                    # OpAccessChain var[4]
          + ([] if storage != SC_FUNCTION else inst(62, 37, 9))   # store the DIVERGENT value
          + inst(61, 1, 38, 37)                         # read it back through the chain
@@ -217,11 +223,56 @@ def mod_vote_over_a_local(storage):
     return module(PRE_IDS + [10, 20, 30, 31, 32, 33, 34, 35, 36, 37, 38], b)
 
 
+def mod_vote_reaches_a_switch():
+    """The vote reaches an OpSwitch SELECTOR, and each case stores a different constant.
+
+    Modelling only a switch's successors and not its selector left this with no control dependence
+    at all: nothing in it is an OpBranchConditional, so the whole construct was invisible. The CFG
+    emitter really does build a switch on the guest PC, so this is not a theoretical shape.
+    """
+    b = (preamble(SC_INPUT) + entry()
+         + inst(335, 1, 10, 6, 9)                       # vote over the divergent load
+         + inst(169, 2, 25, 10, 11, 6)                  # OpSelect -> a selector derived from it
+         + inst(247, 28, 0)                             # OpSelectionMerge %28
+         + inst(251, 25, 26, 0, 27)                     # OpSwitch %25 default %26, case 0 -> %27
+         + inst(248, 26) + inst(62, 5, 11) + inst(249, 28)
+         + inst(248, 27) + inst(62, 5, 6) + inst(249, 28)
+         + inst(248, 28) + inst(253))
+    return module(PRE_IDS + [10, 20, 25, 26, 27, 28], b)
+
+
+def mod_taint_through_two_chains(same_value):
+    """A vote-tainted value is stored into a local through ONE access chain and read back through
+    ANOTHER into the same slot.
+
+    Keying the taint by pointer id lost the dependence, because the two chains are different ids --
+    and the emitter mints a fresh chain per guest-scratch access, so one slot really is reached
+    through several. `same_value=False` stores the vote; True stores a constant, and then there is
+    genuinely nothing to carry.
+    """
+    stored = 10 if not same_value else 11
+    b = (preamble(SC_INPUT)
+         + inst(21, 30, 32, 0) + inst(43, 30, 31, 4)
+         + inst(28, 32, 1, 31)                          # OpTypeArray bool 4
+         + inst(32, 33, SC_FUNCTION, 32)
+         + inst(59, 33, 34, SC_FUNCTION)                # a Function local array
+         + inst(32, 35, SC_FUNCTION, 1)
+         + entry()
+         + inst(335, 1, 10, 6, 9)                       # the vote
+         + inst(65, 35, 36, 34, 31)                     # chain A into slot 4
+         + inst(62, 36, stored)                         # ...store through A
+         + inst(65, 35, 37, 34, 31)                     # chain B into the SAME slot
+         + inst(61, 1, 38, 37)                          # ...read back through B
+         + inst(62, 5, 38)                              # ...to the colour output
+         + inst(253))
+    return module(PRE_IDS + [10, 20, 30, 31, 32, 33, 34, 35, 36, 37, 38], b)
+
+
 def mod_dead_vote():
     """A divergent vote whose region has no observable effect and whose merge carries nothing."""
     b = (preamble(SC_INPUT)
          + inst(335, 1, 10, 6, 9)
-         + inst(248, 20)
+         + entry()
          + inst(247, 22, 0)
          + inst(250, 10, 21, 22)
          + inst(248, 21) + inst(129, 2, 25, 11, 11) + inst(249, 22)   # then: an unused OpFAdd
@@ -233,7 +284,7 @@ def mod_unstructured():
     """A vote-conditioned branch with no merge instruction: the region has no bound to trust."""
     b = (preamble(SC_INPUT)
          + inst(335, 1, 10, 6, 9)
-         + inst(248, 20)
+         + entry()
          + inst(250, 10, 21, 22)
          + inst(248, 21) + inst(249, 22)
          + inst(248, 22) + inst(253))
@@ -247,7 +298,7 @@ def mod_uniform_ballot():
          + inst(21, 30, 32, 0)                         # OpTypeInt 32 unsigned
          + inst(23, 31, 30, 4)                         # OpTypeVector uint 4
          + inst(339, 31, 10, 6, 9)                     # OpGroupNonUniformBallot -> %10
-         + inst(248, 20)
+         + entry()
          + inst(81, 30, 32, 10, 0)                     # OpCompositeExtract .x
          + inst(62, 5, 32)
          + inst(253))
@@ -255,7 +306,7 @@ def mod_uniform_ballot():
 
 
 def mod_no_votes():
-    b = preamble(SC_INPUT) + inst(248, 20) + inst(62, 5, 11) + inst(253)
+    b = preamble(SC_INPUT) + entry() + inst(62, 5, 11) + inst(253)
     return module(PRE_IDS + [20], b)
 
 
@@ -296,6 +347,10 @@ def main() -> int:
                    mod_phi_before_vote(identical=False))
     expect_refused("a vote over a LOCAL written per lane and read back through an access chain",
                    mod_vote_over_a_local(SC_FUNCTION))
+    expect_refused("a vote reaching an OpSwitch selector whose cases store different constants",
+                   mod_vote_reaches_a_switch())
+    expect_refused("a vote stored and reloaded through TWO chains into one local slot",
+                   mod_taint_through_two_chains(same_value=False))
 
     # --- the cases that must be admitted, each for a DIFFERENT reason ----------------------------
     # Arm (a). Same three shapes, same analysis, one word changed: the predicate now comes from a
@@ -315,6 +370,8 @@ def main() -> int:
                     mod_phi_before_vote(identical=True))
     expect_admitted("a vote over a constant buffer read through an access chain",
                     mod_vote_over_a_local(SC_STORAGE_BUFFER))
+    expect_admitted("two chains into one slot carrying a value the vote never touched",
+                    mod_taint_through_two_chains(same_value=True))
 
     # A module the tool cannot parse must never be counted as proven.
     with tempfile.TemporaryDirectory() as tmp:

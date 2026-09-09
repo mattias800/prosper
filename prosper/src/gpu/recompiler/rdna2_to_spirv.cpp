@@ -3397,6 +3397,27 @@ bool fragment_spirv_wave_width_independent(const std::vector<uint32_t>& spirv) {
         }
     }
 
+    // The VARIABLE a pointer roots in. Taint through memory has to be keyed on the slot, not on the
+    // pointer id: the emitter mints a fresh OpAccessChain per guest-scratch access, so a
+    // read-modify-write of one slot goes through two different ids and a store/load pair keyed by id
+    // drops the dependence between them entirely.
+    std::unordered_map<uint32_t, uint32_t> pointer_root;
+    for (const SpirvInst& in : insts)
+        if (in.op == Op_Variable && in.len >= 3) pointer_root[spirv[in.at + 2]] = spirv[in.at + 2];
+    for (bool changed = true; changed;) {
+        changed = false;
+        for (const SpirvInst& in : insts) {
+            if (in.op != Op_AccessChain || in.len < 4) continue;
+            const auto base = pointer_root.find(spirv[in.at + 3]);
+            if (base == pointer_root.end()) continue;
+            if (pointer_root.emplace(spirv[in.at + 2], base->second).second) changed = true;
+        }
+    }
+    const auto root_of = [&](uint32_t ptr) {
+        const auto it = pointer_root.find(ptr);
+        return it == pointer_root.end() ? ptr : it->second;
+    };
+
     // What counts as leaving the shader. A store through anything that is not a Function-storage
     // pointer is observable -- a colour attachment, a storage buffer, an image. Restricting this to
     // Output would make a UAV write invisible to the analysis, which is the same shape of blind spot
@@ -3549,6 +3570,10 @@ bool fragment_spirv_wave_width_independent(const std::vector<uint32_t>& spirv) {
             branch_cond[current] = spirv[in.at + 1];
             succ[current] = {spirv[in.at + 2], spirv[in.at + 3]};
         } else if (in.op == Op_Switch && in.len >= 3) {
+            // The SELECTOR is a branch condition too. Modelling only the successors left a
+            // vote-tainted switch with no control dependence at all, and the CFG emitter really
+            // does build one -- on the guest PC (rdna2_emit_cfg.cpp's dispatcher).
+            branch_cond[current] = spirv[in.at + 1];
             std::vector<uint32_t> targets{spirv[in.at + 2]};
             for (uint32_t i = 4; i < in.len; i += 2) targets.push_back(spirv[in.at + i]);
             succ[current] = targets;
@@ -3574,14 +3599,14 @@ bool fragment_spirv_wave_width_independent(const std::vector<uint32_t>& spirv) {
                 changed = false;
                 for (const SpirvInst& in : insts) {
                     if (in.op == Op_Store && in.len >= 3) {
-                        const uint32_t ptr = spirv[in.at + 1], val = spirv[in.at + 2];
+                        const uint32_t ptr = root_of(spirv[in.at + 1]), val = spirv[in.at + 2];
                         if (tainted.count(val) && locals.count(ptr) &&
                             tainted_ptrs.insert(ptr).second)
                             changed = true;
                         continue;
                     }
                     if (in.op == Op_Load && in.len >= 4) {
-                        if (tainted_ptrs.count(spirv[in.at + 3]) &&
+                        if (tainted_ptrs.count(root_of(spirv[in.at + 3])) &&
                             tainted.insert(spirv[in.at + 2]).second)
                             changed = true;
                         continue;
@@ -3637,8 +3662,9 @@ bool fragment_spirv_wave_width_independent(const std::vector<uint32_t>& spirv) {
                         // A store into a local inside the region is control-dependent too: whether
                         // it happened at all is the vote's answer, so every later load of that
                         // local carries the vote.
-                        if (in.op == Op_Store && in.len >= 3 && locals.count(spirv[in.at + 1]) &&
-                            tainted_ptrs.insert(spirv[in.at + 1]).second)
+                        if (in.op == Op_Store && in.len >= 3 &&
+                            locals.count(root_of(spirv[in.at + 1])) &&
+                            tainted_ptrs.insert(root_of(spirv[in.at + 1])).second)
                             grew = true;
                     }
                 }
