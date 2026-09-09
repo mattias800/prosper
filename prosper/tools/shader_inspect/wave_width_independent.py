@@ -193,11 +193,19 @@ class Module:
         and keep their uniformity regardless.
         """
         for op, w in self.insts:
-            if op == OP_IMAGE_WRITE or op in ATOMIC_OPS:
-                return True
-            if op == OP_STORE and len(w) >= 3 and w[1] not in self.locals \
-                    and w[1] not in self.outputs:
-                return True
+            if not self._observable(op, w):
+                continue
+            # Observable and yet writing NOTHING a later load could read back: ending the
+            # invocation, or ordering other threads' accesses. Measured -- folding these in
+            # cost Evergate 10 of its 11 provable modules, because any module containing a
+            # barrier stopped being able to treat a constant buffer as uniform.
+            if op in (OP_KILL, 4416, 5380, 224, 225):
+                continue
+            # A store to a colour output is observable but is not memory this shader reads back.
+            if op in (OP_STORE, OP_COPY_MEMORY, OP_COPY_MEMORY_SIZED) and len(w) >= 2 \
+                    and w[1] in self.outputs:
+                continue
+            return True
         return False
 
     def _uniform_storage(self, sc):

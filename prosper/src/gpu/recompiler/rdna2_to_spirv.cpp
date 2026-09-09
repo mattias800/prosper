@@ -3483,12 +3483,32 @@ bool fragment_spirv_wave_width_independent(const std::vector<uint32_t>& spirv) {
     // shader also WRITES does not -- one invocation's store changes what another's load returns --
     // so when the module writes buffer or image memory at all, StorageBuffer loads stop counting.
     // Measured, 0 of the 49 corpus modules write any, so the guard costs nothing today.
+    // Defined in terms of is_observable_effect rather than as its own list. These are the same
+    // question at two scopes -- "can the rest of the draw see this?" versus "can this shader read it
+    // back?" -- and keeping them as separate lists let them drift twice: this one kept the
+    // `227..242` atomic window after the other moved to a named set, and never learned about
+    // OpCopyMemory at all. A write to memory is an observable effect that is not a store to a colour
+    // output, which nothing reads back.
     bool writes_memory = false;
     for (const SpirvInst& in : insts) {
-        if (in.op == Op_ImageWrite ||
-            (in.op >= Op_AtomicLoad && in.op <= Op_AtomicXor)) { writes_memory = true; break; }
-        if (in.op == Op_Store && in.len >= 3 && !locals.count(spirv[in.at + 1]) &&
-            !outputs.count(spirv[in.at + 1])) { writes_memory = true; break; }
+        if (!is_observable_effect(in)) continue;
+        // Observable and yet writes NOTHING a later load could read back: ending the invocation,
+        // or ordering other threads' accesses. Measured -- folding these in cost Evergate 10 of its
+        // 11 provable modules, because a module containing a barrier stopped being able to treat
+        // any constant buffer as uniform.
+        switch (in.op) {
+            case Op_Kill: case 4416 /*OpTerminateInvocation*/:
+            case 5380 /*OpDemoteToHelperInvocation*/:
+            case Op_ControlBarrier: case Op_MemoryBarrier:
+                continue;
+            default: break;
+        }
+        // A store to a colour output is observable but is not memory this shader reads back.
+        if ((in.op == Op_Store || in.op == 63 /*OpCopyMemory*/ || in.op == 64) &&
+            in.len >= 2 && outputs.count(spirv[in.at + 1]))
+            continue;
+        writes_memory = true;
+        break;
     }
     // Pointers that root in a read-only uniform storage class, and the access chains over them.
     // Kept SEPARATE from the value set on purpose: a pointer's uniformity says something about

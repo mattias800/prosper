@@ -6978,6 +6978,35 @@ int main() {
             return b;
         };
 
+        // A vote over a storage-buffer load in a shader whose only memory write is `op`.
+        // `writes_memory` gates the uniform arm -- a buffer this shader writes cannot lend
+        // uniformity -- and it was the THIRD place spelling out which opcodes write memory. It kept
+        // the 227..242 window after the others moved to a named set, so OpAtomicFAddEXT (6035)
+        // counted as no write while the identical module with OpAtomicIAdd (234) counted; op 0 is
+        // OpCopyMemory into the buffer, which that predicate had never heard of.
+        auto buffer_written_by = [&](uint32_t op) {
+            std::vector<uint32_t> b = preamble(kStorageBuffer);
+            ins(b, 21, {30, 32, 0}); ins(b, 43, {30, 31, 4});
+            ins(b, 32, {33, kStorageBuffer, 30}); ins(b, 59, {33, 34, kStorageBuffer});
+            ins(b, 248, {20}); ins(b, 61, {1, 9, 8});
+            if (op == 0) ins(b, 63, {34, 8});                 // OpCopyMemory into the buffer
+            else ins(b, op, {30, 39, 34, 6, 6, 31});          // ...or an atomic on it
+            ins(b, 335, {1, 10, 6, 9});
+            ins(b, 62, {5, 10});
+            ins(b, 253, {});
+            return b;
+        };
+
+        // Observable and yet writing nothing a later load can read back. `writes_memory` is defined
+        // in terms of the observable-effect predicate, and folding barriers in without excluding
+        // them cost Evergate 10 of its 11 provable modules -- any module containing one stopped
+        // being able to treat a constant buffer as uniform.
+        std::vector<uint32_t> barrier_only = preamble(kStorageBuffer);
+        ins(barrier_only, 248, {20}); ins(barrier_only, 61, {1, 9, 8});
+        ins(barrier_only, 224, {6, 6, 6});                    // OpControlBarrier
+        ins(barrier_only, 335, {1, 10, 6, 9});
+        ins(barrier_only, 62, {5, 10}); ins(barrier_only, 253, {});
+
         std::vector<uint32_t> no_votes = preamble(kInput);
         ins(no_votes, 248, {20}); ins(no_votes, 62, {5, 11}); ins(no_votes, 253, {});
 
@@ -7024,6 +7053,13 @@ int main() {
              copy_memory_out(true), false},
             {"...and the same module written as a load and a store",
              copy_memory_out(false), false},
+            {"a vote over a buffer this shader writes with a FLOAT atomic",
+             buffer_written_by(6035), false},
+            {"...and with an integer atomic, which the old window did catch",
+             buffer_written_by(234), false},
+            {"a vote over a buffer this shader writes with OpCopyMemory",
+             buffer_written_by(0), false},
+            {"a barrier is observable but is not a memory write", barrier_only, true},
             {"a UNIFORM vote guarding a store to the colour output",
              branch_only(kStorageBuffer), true},
             {"a UNIFORM vote whose arms merge in a phi that reaches the output",

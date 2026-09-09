@@ -374,6 +374,43 @@ def mod_copy_memory_carries_taint(via_copy):
     return module(PRE_IDS + [10, 20, 30, 31, 32], b)
 
 
+def mod_uniform_source_written_by(op):
+    """A vote over a storage-buffer load, in a shader whose only memory write is `op`.
+
+    `writes_memory` gates the uniform arm: a buffer this shader writes cannot lend uniformity. It was
+    the third place spelling out "which opcodes write memory" and kept the `227..242` window after
+    the others moved on, so an OpAtomicFAddEXT (6035) counted as no write at all while the identical
+    module using OpAtomicIAdd (234) counted. `op` 0 means OpCopyMemory into the buffer, which the
+    same predicate had never heard of.
+    """
+    b = (preamble(SC_STORAGE_BUFFER)
+         + inst(21, 30, 32, 0) + inst(43, 30, 31, 4)
+         + inst(32, 33, SC_STORAGE_BUFFER, 30) + inst(59, 33, 34, SC_STORAGE_BUFFER)
+         + entry()
+         + (inst(63, 34, 8) if op == 0                  # OpCopyMemory into the buffer
+            else inst(op, 30, 39, 34, 6, 6, 31))        # ...or an atomic on it
+         + inst(335, 1, 10, 6, 9)                       # vote over the buffer-derived load
+         + inst(62, 5, 10)
+         + inst(253))
+    return module(PRE_IDS + [10, 20, 30, 31, 33, 34, 39], b)
+
+
+def mod_barrier_is_not_a_write():
+    """A module whose only observable effect writes NOTHING a later load can read back.
+
+    `writes_memory` is defined in terms of the observable-effect predicate, and a barrier is
+    observable. Folding it in without this exclusion cost Evergate 10 of its 11 provable modules,
+    because any module containing one stopped being able to treat a constant buffer as uniform.
+    """
+    b = (preamble(SC_STORAGE_BUFFER)
+         + entry()
+         + inst(224, 6, 6, 6)                           # OpControlBarrier
+         + inst(335, 1, 10, 6, 9)
+         + inst(62, 5, 10)
+         + inst(253))
+    return module(PRE_IDS + [10, 20], b)
+
+
 def mod_dead_vote():
     """A divergent vote whose region has no observable effect and whose merge carries nothing."""
     b = (preamble(SC_INPUT)
@@ -473,6 +510,12 @@ def main() -> int:
                    mod_copy_memory_carries_taint(via_copy=True))
     expect_refused("...and the same module written as a load and a store",
                    mod_copy_memory_carries_taint(via_copy=False))
+    expect_refused("a vote over a buffer this shader writes with a FLOAT atomic",
+                   mod_uniform_source_written_by(6035))
+    expect_refused("...and with an integer atomic, which the old window did catch",
+                   mod_uniform_source_written_by(234))
+    expect_refused("a vote over a buffer this shader writes with OpCopyMemory",
+                   mod_uniform_source_written_by(0))
 
     # --- the cases that must be admitted, each for a DIFFERENT reason ----------------------------
     # Arm (a). Same three shapes, same analysis, one word changed: the predicate now comes from a
@@ -496,6 +539,8 @@ def main() -> int:
                     mod_taint_through_two_chains(same_value=True))
     expect_admitted("a chain and an OpCopyObject carrying a value the vote never touched",
                     mod_slot_through_copyobject(tainted_store=False))
+    expect_admitted("a barrier is observable but is not a memory write",
+                    mod_barrier_is_not_a_write())
 
     # A module the tool cannot parse must never be counted as proven.
     with tempfile.TemporaryDirectory() as tmp:
