@@ -39,6 +39,15 @@ public:
         // The caller protects stream lifetime. This lock makes the set of atomic
         // counters consistent; the callback never acquires the outer sink lock.
         if (!SDL_LockAudioStream(stream)) return false;
+        snapshot_quiesced(out);
+        SDL_UnlockAudioStream(stream);
+        return true;
+    }
+
+    // Caller must hold the stream lock OR have destroyed the stream while excluding all
+    // external users. In the latter case SDL callbacks have ended and userdata remains owned;
+    // this is an exact final set, not a pre-destroy snapshot that may miss a racing callback.
+    void snapshot_quiesced(Sdl3AudioDemandSnapshot& out) const {
         for (unsigned i = 0; i < counts_.size(); ++i) {
             const auto& c = counts_[i];
             out.phases[i] = {c.calls.load(std::memory_order_relaxed),
@@ -46,8 +55,6 @@ public:
                 c.additional.load(std::memory_order_relaxed), c.first.load(std::memory_order_relaxed),
                 c.last.load(std::memory_order_relaxed)};
         }
-        SDL_UnlockAudioStream(stream);
-        return true;
     }
 private:
     struct Counts {
