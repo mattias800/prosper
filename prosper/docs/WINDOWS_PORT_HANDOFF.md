@@ -260,6 +260,28 @@ that thread waits on becomes the focus, so matching signals from other threads a
 
 ## Gotchas learned (so the next agent doesn't relearn them)
 
+- **A thread joined from a static destructor can deadlock against the CRT's own exit table, and the
+  usual suspects are the wrong ones.** `main` was red on Windows MinGW for a day with
+  `capture_tunables (Timeout)` — a hang with no assertion output. The recorded hypothesis was the
+  natural one, and it was **falsified**: the writer thread was neither unjoined nor waiting on a
+  signal that never arrived. `gdb` on the hung process put it inside `fprintf`:
+
+  ```
+  Thread 1 (main)    _execute_onexit_table -> ~InteractiveFrameBundle -> std::thread::join
+  Thread 2 (writer)  __pformat_float -> __gdtoa -> __Balloc_D2A -> dtoa_lock -> atexit
+                     -> _register_onexit_function -> RtlEnterCriticalSection   [blocked]
+  ```
+
+  MinGW's float formatting lazily registers an `atexit` handler the first time `__gdtoa` allocates,
+  taking the CRT onexit-table critical section — the lock the exiting main thread already holds
+  while walking that table. Linux never sees it: the mechanism is MinGW's `gdtoa`.
+
+  **The general rule: a thread still doing work while another thread runs static destructors must
+  not touch anything that can lazily initialise CRT state.** `%f` is the one that bit us; any first
+  use of a facility that registers cleanup would do. Prefer integer formatting on such a thread, and
+  prefer draining worker threads explicitly before `main` returns over relying on a destructor to
+  join them. Fixed in #3470 / PR #3492.
+
 - Windows resets the user `%fs` base to 0 on every kernel transition; guest TLS survives only via the
   VEH `wrfsbase` re-apply (`hle_kernel_mem.cpp`/`guest_tls.cpp`). Native FSGSBASE (`rd/wrfsbase`,
   `WaitOnAddress`, `WakeByAddress*`) works and needs `-lsynchronization` (linked into `prosper_core`).

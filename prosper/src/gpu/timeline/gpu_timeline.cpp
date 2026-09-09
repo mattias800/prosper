@@ -2260,6 +2260,7 @@ void InteractiveFrameBundle::run_writer() {
 void InteractiveFrameBundle::shutdown() {
     // Serializes joiners without holding the state mutex while the writer publishes its result.
     std::lock_guard shutdown_lock(shutdown_mx);
+    GpuCaptureBundle abandoned;                // released after `mx` is dropped; see below
     {
         std::lock_guard lock(mx);
         stopping = true;
@@ -2269,7 +2270,11 @@ void InteractiveFrameBundle::shutdown() {
         // writer while this thread waits inside a static destructor is half of the exit deadlock
         // in #3470. Reporting it inline leaves the writer with nothing to do but return.
         if (capturing || !armed_path.empty()) {
-            bundle = {};                       // free the payload; nobody will write it
+            // Detached under the lock, released outside it. This can be gigabytes, and on the
+            // destructor path the thread running it is inside the CRT's exit lock -- the old code
+            // freed the payload on the WRITER, outside `mx`, and that property is worth keeping.
+            abandoned = std::move(bundle);
+            bundle = {};
             InteractiveGrabOutcome cancelled;
             cancelled.bundle_path = capturing ? current_path : armed_path;
             cancelled.max_unique_bytes = max_unique_bytes;
@@ -2277,13 +2282,20 @@ void InteractiveFrameBundle::shutdown() {
             std::fprintf(stderr, "[grab] frame-bundle write failed: %s\n", cancelled.error.c_str());
             outcome = std::move(cancelled);
             outcome_pending = true;
-            writing = false;
+            // `writing` is deliberately NOT touched. This block is reachable only with it already
+            // false -- a request is refused while writing (see request_interactive_capture_bundle),
+            // and the present handler sets it only while clearing `capturing` and `armed_path`, so
+            // a genuinely mid-write window takes neither branch and is joined below exactly as
+            // before. Clearing it here would be dead on every real path and would release the busy
+            // flag mid-write on any path that ever reached it, letting a new capture race the
+            // outcome slot.
             capturing = false;
             armed_path.clear(); current_path.clear();
         }
         g_interactive_frame_active.store(false, std::memory_order_release);
         wake.notify_one();
     }
+    abandoned = {};                            // outside `mx`, before the join
     if (writer.joinable()) writer.join();
 }
 
