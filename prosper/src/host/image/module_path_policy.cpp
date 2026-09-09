@@ -110,8 +110,32 @@ ModulePathDecision classify_module_path(const std::string& dump_root, const std:
                 return d;
             }
         }
+        // A title's OWN native middleware may sit directly in the dump root rather than under
+        // `Media/` -- Darksiders II (PPSA23806) ships four such modules there (#3497). Refusing them
+        // left the guest's real implementations unlinked with prosper's return-0 stub answering in
+        // their place.
+        //
+        // The Sony rule is applied here EXACTLY as it is to the Media directories, and for a
+        // stronger version of the same reason: the root is now auto-scanned wholesale, so without
+        // this a dump could substitute any Sony library by dropping it beside eboot.bin -- an easier
+        // bypass than the Media/Plugins one that rule already exists to close, and one that would
+        // also sidestep the `fakelib/` rejection by a single move.
+        if (lower(parts[0]).rfind(kSonyLibraryPrefix, 0) == 0) {
+            d.verdict = ModulePathVerdict::SonyLibraryOutsideSceModule;
+            d.reason = "a Sony-named library in the dump root, which prosper auto-scans; Sony "
+                       "libraries are linked only from the dump's own `sce_module/` directory";
+            return d;
+        }
+        // Only module files. `eboot.bin` is handled above; anything else in the root is data.
+        const std::string ln = lower(parts[0]);
+        const bool is_module = (ln.size() > 4 && ln.compare(ln.size() - 4, 4, ".prx") == 0) ||
+                               (ln.size() > 5 && ln.compare(ln.size() - 5, 5, ".sprx") == 0);
+        if (is_module) {
+            d.verdict = ModulePathVerdict::Permitted;
+            return d;
+        }
         d.verdict = ModulePathVerdict::DirectoryNotPermitted;
-        d.reason = "in the dump root, which holds no linkable module other than eboot.bin";
+        d.reason = "in the dump root and not a linkable module";
         return d;
     }
 

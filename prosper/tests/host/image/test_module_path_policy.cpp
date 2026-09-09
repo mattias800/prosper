@@ -96,8 +96,30 @@ int main() {
            ModulePathVerdict::DirectoryNotPermitted, "...and renaming the directory's case does not help");
     refuse(R, "/dumps/PPSA00000-app0/prx/anything.prx", ModulePathVerdict::DirectoryNotPermitted,
            "a `prx/` directory some dumps ship is still not on the allowlist");
-    refuse(R, "/dumps/PPSA00000-app0/libc.prx", ModulePathVerdict::DirectoryNotPermitted,
-           "the dump root holds no linkable module but eboot.bin");
+    // #3497 widened the root case: a title's OWN native middleware may live beside eboot.bin.
+    // Darksiders II (PPSA23806) ships four such modules there, and refusing them left the guest's
+    // real implementations unlinked while a return-0 stub answered in their place.
+    permit(R, "/dumps/PPSA00000-app0/steam_api_ps5.prx",
+           "a title's own middleware in the dump root IS linkable");
+    permit(R, "/dumps/PPSA00000-app0/THQGDSCore_Prospero_Release.prx",
+           "...whatever the vendor called it");
+    // THE GUARD. The root is auto-scanned wholesale, so this is the arm that stops the widening
+    // from becoming a bypass: dropping a Sony library beside eboot.bin must be refused exactly as
+    // dropping it in Media/Plugins is, and refused with the SONY verdict rather than a generic one
+    // so the reason names the actual rule. Kills: permitting the root by extension alone.
+    refuse(R, "/dumps/PPSA00000-app0/libSceAppContent.prx",
+           ModulePathVerdict::SonyLibraryOutsideSceModule,
+           "a Sony library in the dump root is refused, not linked");
+    refuse(R, "/dumps/PPSA00000-app0/LIBSCEAMPR.PRX",
+           ModulePathVerdict::SonyLibraryOutsideSceModule,
+           "...and changing its case does not help");
+    refuse(R, "/dumps/PPSA00000-app0/libSceNpEntitlementAccess.sprx",
+           ModulePathVerdict::SonyLibraryOutsideSceModule,
+           "...nor does .sprx instead of .prx");
+    // Kills: treating every root file as a module. Data beside the eboot is not linkable, and a
+    // permissive extension check would drag it in.
+    refuse(R, "/dumps/PPSA00000-app0/param.json", ModulePathVerdict::DirectoryNotPermitted,
+           "a non-module file in the dump root is still refused");
     refuse(R, "/dumps/PPSA00000-app0/Media/Plugins/sub/deep.prx",
            ModulePathVerdict::DirectoryNotPermitted,
            "a SUBdirectory of a permitted directory is not itself permitted");
