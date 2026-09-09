@@ -60,6 +60,7 @@ POINTER_DERIVING_OPS = {
 # outside it, so a vote-guarded OpAtomicFAddEXT admitted while the same module using OpAtomicIAdd
 # refused. One opcode number was the whole difference.
 ATOMIC_OPS = set(range(227, 243)) | {318, 319, 5614, 5615, 6035}
+OP_COPY_MEMORY, OP_COPY_MEMORY_SIZED = 63, 64
 
 STORAGE_UNIFORM_CONSTANT, STORAGE_INPUT, STORAGE_UNIFORM = 0, 1, 2
 STORAGE_OUTPUT, STORAGE_FUNCTION, STORAGE_PUSH, STORAGE_SB = 3, 7, 9, 12
@@ -108,7 +109,7 @@ class Module:
         while changed:
             changed = False
             for op, w in self.insts:
-                if op != OP_ACCESS_CHAIN or len(w) < 4:
+                if op not in POINTER_DERIVING_OPS or len(w) < 4:
                     continue
                 if w[3] in self.outputs and w[2] not in self.outputs:
                     self.outputs.add(w[2])
@@ -289,6 +290,22 @@ class Module:
                                 tainted_ptrs.add(slot)
                                 changed = True
                     continue
+                if op in (OP_COPY_MEMORY, OP_COPY_MEMORY_SIZED) and len(w) >= 3:
+                    # Target <- Source, both pointers, with no OpLoad/OpStore pair for the closure
+                    # to see. See the C++ twin.
+                    src_tainted = (self.root_of(w[2]) in tainted_ptrs
+                                   if self.pointer_is_known(w[2]) else bool(tainted_ptrs))
+                    if src_tainted:
+                        if not self.pointer_is_known(w[1]):
+                            if not self.locals <= tainted_ptrs:
+                                tainted_ptrs |= self.locals
+                                changed = True
+                        else:
+                            dst = self.root_of(w[1])
+                            if dst in self.locals and dst not in tainted_ptrs:
+                                tainted_ptrs.add(dst)
+                                changed = True
+                    continue
                 if op == OP_LOAD and len(w) >= 4:
                     reads_tainted = (self.root_of(w[3]) in tainted_ptrs
                                      if self.pointer_is_known(w[3]) else bool(tainted_ptrs))
@@ -333,8 +350,19 @@ class Module:
                     return True
                 if op == OP_IMAGE_WRITE and len(w) >= 4 and (w[2] in tainted or w[3] in tainted):
                     return True
-                if op in ATOMIC_OPS and len(w) >= 4 and w[3] in tainted:
+                # EVERY id operand, not word 3 -- word 3 is an atomic's POINTER and the value it
+                # writes is further along, its index differing by opcode. See the C++ twin.
+                if op in ATOMIC_OPS and any(w[i] in tainted for i in range(3, len(w))):
                     return True
+                # The SOURCE is a pointer, so its taint lives in tainted_ptrs, not in tainted --
+                # a slot is tainted, not a value id. Testing the wrong set made this arm inert,
+                # which is what its own fixture caught.
+                if op in (OP_COPY_MEMORY, OP_COPY_MEMORY_SIZED) and len(w) >= 3 \
+                        and w[1] not in self.locals:
+                    src_tainted = (self.root_of(w[2]) in tainted_ptrs
+                                   if self.pointer_is_known(w[2]) else bool(tainted_ptrs))
+                    if src_tainted:
+                        return True
             grew = False
             for head, cond in self.branch_cond.items():
                 if cond not in tainted:

@@ -6943,6 +6943,41 @@ int main() {
             ins(b, 253, {});
         }
 
+        // A vote-derived value written to a UAV by an atomic, in straight-line code. The
+        // leaving-scan tested word 3 -- an atomic's POINTER -- while the value it writes is further
+        // along, so the scan fired and read the wrong word. The swapped form was already refused,
+        // which is what proved the scan ran at all; the pair separates "fires" from "reads right".
+        auto atomic_writes_vote = [&](bool swap) {
+            const uint32_t ptr = swap ? 10u : 34u, val = swap ? 34u : 10u;
+            std::vector<uint32_t> b = preamble(kInput);
+            ins(b, 21, {30, 32, 0}); ins(b, 43, {30, 31, 4});
+            ins(b, 32, {33, kStorageBuffer, 30}); ins(b, 59, {33, 34, kStorageBuffer});
+            ins(b, 248, {20}); ins(b, 61, {1, 9, 8});
+            ins(b, 335, {1, 10, 6, 9});
+            ins(b, 234, {30, 39, ptr, 6, 6, val});         // OpAtomicIAdd
+            ins(b, 62, {5, 11});
+            ins(b, 253, {});
+            return b;
+        };
+
+        // A tainted local moved to the colour output. OpCopyMemory moves a value with no
+        // OpLoad/OpStore pair for the closure to follow; the `false` spelling is the same module
+        // written as a load and a store, which was always refused.
+        auto copy_memory_out = [&](bool via_copy) {
+            std::vector<uint32_t> b = preamble(kInput);
+            ins(b, 32, {30, kFunction, 1}); ins(b, 59, {30, 31, kFunction});
+            ins(b, 248, {20}); ins(b, 61, {1, 9, 8});
+            ins(b, 335, {1, 10, 6, 9});
+            ins(b, 62, {31, 10});                          // store the vote into a local
+            if (via_copy) {
+                ins(b, 63, {5, 31});                       // OpCopyMemory out
+            } else {
+                ins(b, 61, {1, 32, 31}); ins(b, 62, {5, 32});
+            }
+            ins(b, 253, {});
+            return b;
+        };
+
         std::vector<uint32_t> no_votes = preamble(kInput);
         ins(no_votes, 248, {20}); ins(no_votes, 62, {5, 11}); ins(no_votes, 253, {});
 
@@ -6981,6 +7016,14 @@ int main() {
              region_atomic(6035), false},
             {"a vote-guarded region whose store is read back through a second chain",
              region_second_chain, false},
+            {"a vote-derived value written to a UAV by an atomic",
+             atomic_writes_vote(false), false},
+            {"...and with the atomic's pointer and value exchanged",
+             atomic_writes_vote(true), false},
+            {"a tainted local moved to the colour output by OpCopyMemory",
+             copy_memory_out(true), false},
+            {"...and the same module written as a load and a store",
+             copy_memory_out(false), false},
             {"a UNIFORM vote guarding a store to the colour output",
              branch_only(kStorageBuffer), true},
             {"a UNIFORM vote whose arms merge in a phi that reaches the output",

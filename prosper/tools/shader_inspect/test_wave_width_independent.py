@@ -337,6 +337,43 @@ def mod_region_stores_through_second_chain():
     return module(PRE_IDS + [10, 20, 21, 22, 30, 31, 32, 33, 34, 35, 36, 37, 38], b)
 
 
+def mod_atomic_writes_the_vote(swap):
+    """A vote-derived value written to a UAV by an atomic, in straight-line code.
+
+    The leaving-scan tested word 3 -- an atomic's POINTER -- while the value it writes is further
+    along, so the scan fired and read the wrong word. `swap` exchanges pointer and value: the swapped
+    form was already refused, which is what proved the scan ran at all.
+    """
+    ptr, val = (34, 10) if not swap else (10, 34)
+    b = (preamble(SC_INPUT)
+         + inst(21, 30, 32, 0) + inst(43, 30, 31, 4)
+         + inst(32, 33, SC_STORAGE_BUFFER, 30) + inst(59, 33, 34, SC_STORAGE_BUFFER)
+         + entry()
+         + inst(335, 1, 10, 6, 9)
+         + inst(234, 30, 39, ptr, 6, 6, val)           # OpAtomicIAdd
+         + inst(62, 5, 11)
+         + inst(253))
+    return module(PRE_IDS + [10, 20, 30, 31, 33, 34, 39], b)
+
+
+def mod_copy_memory_carries_taint(via_copy):
+    """A tainted local moved to the colour output.
+
+    `via_copy` selects OpCopyMemory, which moves a value with no OpLoad/OpStore pair for the closure
+    to follow; False is the same module written as a load and a store, which was always refused. The
+    pair is the experiment.
+    """
+    b = (preamble(SC_INPUT)
+         + inst(32, 30, SC_FUNCTION, 1) + inst(59, 30, 31, SC_FUNCTION)
+         + entry()
+         + inst(335, 1, 10, 6, 9)
+         + inst(62, 31, 10)                            # store the vote into a local
+         + (inst(63, 5, 31) if via_copy                # OpCopyMemory out
+            else inst(61, 1, 32, 31) + inst(62, 5, 32))
+         + inst(253))
+    return module(PRE_IDS + [10, 20, 30, 31, 32], b)
+
+
 def mod_dead_vote():
     """A divergent vote whose region has no observable effect and whose merge carries nothing."""
     b = (preamble(SC_INPUT)
@@ -428,6 +465,14 @@ def main() -> int:
                    mod_region_performs_atomic(6035))
     expect_refused("a vote-guarded region whose store is read back through a second chain",
                    mod_region_stores_through_second_chain())
+    expect_refused("a vote-derived value written to a UAV by an atomic",
+                   mod_atomic_writes_the_vote(swap=False))
+    expect_refused("...and with the atomic's pointer and value exchanged",
+                   mod_atomic_writes_the_vote(swap=True))
+    expect_refused("a tainted local moved to the colour output by OpCopyMemory",
+                   mod_copy_memory_carries_taint(via_copy=True))
+    expect_refused("...and the same module written as a load and a store",
+                   mod_copy_memory_carries_taint(via_copy=False))
 
     # --- the cases that must be admitted, each for a DIFFERENT reason ----------------------------
     # Arm (a). Same three shapes, same analysis, one word changed: the predicate now comes from a

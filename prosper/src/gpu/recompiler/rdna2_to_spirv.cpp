@@ -3341,6 +3341,24 @@ bool spirv_op_is_constant(uint32_t op) {
     }
 }
 
+// Atomics, named rather than taken as the numeric window `227..242`: the float and flag forms sit
+// outside it. ONE predicate, because the observable check and the leaving-scan were two spellings of
+// this set and had already drifted apart once.
+bool spirv_op_is_atomic(uint32_t op) {
+    return (op >= Op_AtomicLoad && op <= Op_AtomicXor) ||
+           op == 318 /*OpAtomicFlagTestAndSet*/ || op == 319 /*OpAtomicFlagClear*/ ||
+           op == 5614 /*OpAtomicFMinEXT*/ || op == 5615 /*OpAtomicFMaxEXT*/ ||
+           op == 6035 /*OpAtomicFAddEXT*/;
+}
+
+// Every way one pointer is derived from another. Missing one splits a single slot into two, which
+// loses the dependence between a store through one id and a load through another.
+bool spirv_op_derives_pointer(uint32_t op) {
+    return op == Op_AccessChain || op == 66 /*OpInBoundsAccessChain*/ ||
+           op == 67 /*OpPtrAccessChain*/ || op == 70 /*OpInBoundsPtrAccessChain*/ ||
+           op == 83 /*OpCopyObject*/;
+}
+
 bool spirv_storage_is_uniform(uint32_t sc, bool module_writes_memory) {
     if (sc == SC_StorageBuffer) return !module_writes_memory;   // a UAV this draw writes is not
     return sc == 2 /*Uniform*/ || sc == SC_PushConstant || sc == SC_UniformConstant;
@@ -3390,7 +3408,7 @@ bool fragment_spirv_wave_width_independent(const std::vector<uint32_t>& spirv) {
     for (bool changed = true; changed;) {
         changed = false;
         for (const SpirvInst& in : insts) {
-            if (in.op != Op_AccessChain || in.len < 4) continue;
+            if (!spirv_op_derives_pointer(in.op) || in.len < 4) continue;
             const uint32_t base = spirv[in.at + 3], result = spirv[in.at + 2];
             if (outputs.count(base) && outputs.insert(result).second) changed = true;
             if (locals.count(base) && locals.insert(result).second) changed = true;
@@ -3406,15 +3424,10 @@ bool fragment_spirv_wave_width_independent(const std::vector<uint32_t>& spirv) {
         if (in.op == Op_Variable && in.len >= 3) pointer_root[spirv[in.at + 2]] = spirv[in.at + 2];
     // Every way one pointer is derived from another. OpCopyObject and the InBounds/Ptr chain forms
     // each split one slot into two if they are not followed.
-    const auto derives_pointer = [](uint32_t op) {
-        return op == Op_AccessChain || op == 66 /*OpInBoundsAccessChain*/ ||
-               op == 67 /*OpPtrAccessChain*/ || op == 70 /*OpInBoundsPtrAccessChain*/ ||
-               op == 83 /*OpCopyObject*/;
-    };
     for (bool changed = true; changed;) {
         changed = false;
         for (const SpirvInst& in : insts) {
-            if (!derives_pointer(in.op) || in.len < 4) continue;
+            if (!spirv_op_derives_pointer(in.op) || in.len < 4) continue;
             const auto base = pointer_root.find(spirv[in.at + 3]);
             if (base == pointer_root.end()) continue;
             if (pointer_root.emplace(spirv[in.at + 2], base->second).second) changed = true;
@@ -3452,12 +3465,8 @@ bool fragment_spirv_wave_width_independent(const std::vector<uint32_t>& spirv) {
             // rather than as the numeric window `227..242`: the float and flag atomics sit outside
             // it, so a vote-guarded OpAtomicFAddEXT admitted while the byte-identical module using
             // OpAtomicIAdd refused. One opcode number was the whole difference.
-            case 318 /*OpAtomicFlagTestAndSet*/: case 319 /*OpAtomicFlagClear*/:
-            case 5614 /*OpAtomicFMinEXT*/: case 5615 /*OpAtomicFMaxEXT*/:
-            case 6035 /*OpAtomicFAddEXT*/:
-                return true;
             default:
-                return in.op >= Op_AtomicLoad && in.op <= Op_AtomicXor;
+                return spirv_op_is_atomic(in.op);
         }
     };
 
@@ -3632,6 +3641,26 @@ bool fragment_spirv_wave_width_independent(const std::vector<uint32_t>& spirv) {
                         }
                         continue;
                     }
+                    if ((in.op == 63 /*OpCopyMemory*/ || in.op == 64 /*OpCopyMemorySized*/) &&
+                        in.len >= 3) {
+                        // Target <- Source, both pointers. A tainted source slot makes the target
+                        // slot tainted; no OpLoad/OpStore pair appears, which is why the closure
+                        // could not see it.
+                        const uint32_t dst = spirv[in.at + 1], src = spirv[in.at + 2];
+                        const bool src_tainted = pointer_is_known(src)
+                            ? tainted_ptrs.count(root_of(src)) != 0
+                            : !tainted_ptrs.empty();
+                        if (src_tainted) {
+                            if (!pointer_is_known(dst)) {
+                                for (uint32_t local : locals)
+                                    if (tainted_ptrs.insert(local).second) changed = true;
+                            } else if (locals.count(root_of(dst)) &&
+                                       tainted_ptrs.insert(root_of(dst)).second) {
+                                changed = true;
+                            }
+                        }
+                        continue;
+                    }
                     if (in.op == Op_Load && in.len >= 4) {
                         const uint32_t raw = spirv[in.at + 3];
                         const bool reads_tainted = pointer_is_known(raw)
@@ -3662,9 +3691,29 @@ bool fragment_spirv_wave_width_independent(const std::vector<uint32_t>& spirv) {
                 if (in.op == Op_ImageWrite && in.len >= 4 &&
                     (tainted.count(spirv[in.at + 2]) || tainted.count(spirv[in.at + 3])))
                     return true;
-                if (in.op >= Op_AtomicLoad && in.op <= Op_AtomicXor && in.len >= 4 &&
-                    tainted.count(spirv[in.at + 3]))
-                    return true;
+                // EVERY id operand, not word 3. Word 3 is an atomic's POINTER; the value it
+                // writes is further along and its index differs by opcode, so checking one word
+                // let a vote-derived value be atomically written to a UAV in straight-line code --
+                // the scan fired and read the wrong word. Testing all of them needs no per-opcode
+                // value index and cannot drift as opcodes are added.
+                if (spirv_op_is_atomic(in.op)) {
+                    for (uint32_t i = 3; i < in.len; ++i)
+                        if (tainted.count(spirv[in.at + i])) return true;
+                }
+                // OpCopyMemory moves a value without an OpLoad/OpStore pair, so a tainted local
+                // copied straight out was invisible here even though is_observable_effect knew the
+                // opcode. Source is word 2; a tainted SOURCE leaving through a non-local target is
+                // the same event as a tainted store.
+                if ((in.op == 63 /*OpCopyMemory*/ || in.op == 64 /*OpCopyMemorySized*/) &&
+                    in.len >= 3 && !locals.count(spirv[in.at + 1])) {
+                    // The SOURCE is a POINTER, so its taint lives in tainted_ptrs -- a slot is
+                    // tainted, not a value id. Testing `tainted` here made the arm inert, which is
+                    // what its own fixture caught.
+                    const uint32_t src = spirv[in.at + 2];
+                    if (pointer_is_known(src) ? tainted_ptrs.count(root_of(src)) != 0
+                                              : !tainted_ptrs.empty())
+                        return true;
+                }
             }
 
             bool grew = false;                               // then control dependence
