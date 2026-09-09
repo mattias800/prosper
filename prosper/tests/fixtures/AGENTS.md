@@ -91,7 +91,7 @@ Vulkan allocation and CPU snapshot bytes until the final owner releases them, in
 the existing free host-buffer pool budget.
 
 Admission currently requires every final shader in the pass to have complete buffer-write
-provenance and no storage-buffer writer or atomic access. This whole-pass rule preserves the old
+provenance and no storage-buffer writer, including atomic writes. This whole-pass rule preserves the old
 within-call alias memo: a writable later draw cannot reach retained input through a previous binding.
 Small inputs, descriptor-table entries, GDS, zero identities and diagnostic mutation retain their
 existing routes. Reflection observes writes; absence of a writable flag alone is not proof.
@@ -111,3 +111,11 @@ never own or extend guest mapping lifetime; recorded GPU snapshots remain indepe
 `PROSPER_NO_BACKEND_BUFFER_WRITE_WATCH` disables only watch validation, preserving residency for
 comparable exact-validation controls. Watched bytes are a subset of reused bytes; watch time is
 already included in resident time.
+
+The combined residency budget defaults to 256 MiB on Linux and zero elsewhere, where production
+guest write watches are unavailable. An explicit `PROSPER_BACKEND_BUFFER_RESIDENCY_MB` override
+enables exact snapshot residency on any platform, capped at 2048 MiB. Zero bypasses both admission
+and the pass's additional write-proof reflection. Linux inputs whose watches fail or are disabled
+still use exact comparison; this fallback is correct but can cost more than ordinary uploads.
+Runtime cache fixtures explicitly select a nonzero budget so unsupported platforms exercise the
+portable ownership and comparison contract too.

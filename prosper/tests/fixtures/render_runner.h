@@ -3286,9 +3286,16 @@ inline ResidentRenderBufferCache& resident_render_buffer_cache() {
     return cache;
 }
 inline VkDeviceSize resident_render_buffer_limit() {
+#if defined(__linux__)
+    constexpr uint64_t default_mib = 256;
+#else
+    // Production guest write watches currently require Linux. Exact snapshot comparison remains
+    // available by explicit override, but has not earned a default-on performance policy elsewhere.
+    constexpr uint64_t default_mib = 0;
+#endif
     static const auto limit = prosper::diag::env_u64_or_default_capped(
         "PROSPER_BACKEND_BUFFER_RESIDENCY_MB", getenv("PROSPER_BACKEND_BUFFER_RESIDENCY_MB"),
-        256, 2048, "MiB");
+        default_mib, 2048, "MiB");
     return limit * 1024ull * 1024ull;
 }
 
@@ -7061,7 +7068,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         }
     }
     bool readonly_buffer_pass = share_backend_resources && reuse_host_buffers &&
-        !buffer_verify_enabled && getenv("PROSPER_NO_BACKEND_BUFFER_RESIDENCY") == nullptr;
+        !buffer_verify_enabled && getenv("PROSPER_NO_BACKEND_BUFFER_RESIDENCY") == nullptr &&
+        resident_render_buffer_limit() != 0;
     const bool readonly_buffer_watch =
         getenv("PROSPER_NO_BACKEND_BUFFER_WRITE_WATCH") == nullptr;
     if (readonly_buffer_pass) {
