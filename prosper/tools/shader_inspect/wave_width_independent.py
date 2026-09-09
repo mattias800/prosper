@@ -160,11 +160,14 @@ class Module:
         return sc in (STORAGE_UNIFORM, STORAGE_PUSH, STORAGE_UNIFORM_CONSTANT)
 
     def uniform_values(self):
+        # Uniform POINTERS are tracked apart from uniform VALUES. A Function local's pointer is
+        # perfectly uniform while what it holds is whatever was last stored into it, so letting a
+        # pointer lend its uniformity to a load admits a per-lane value. See the C++ twin.
+        self.uniform_ptrs = {w[2] for op, w in self.insts
+                             if op == OP_VARIABLE and len(w) >= 4 and self._uniform_storage(w[3])}
         uni = set()
         for op, w in self.insts:
             if op in CONSTANT_OPS and len(w) >= 3:
-                uni.add(w[2])
-            if op == OP_VARIABLE and len(w) >= 4 and self._uniform_storage(w[3]):
                 uni.add(w[2])
         changed = True
         while changed:
@@ -183,14 +186,18 @@ class Module:
                 if op in DIVERGENT_OPS:
                     continue
                 if op == OP_LOAD:
-                    if len(w) >= 4:
-                        ptr = w[3]
-                        sc = self.var_storage.get(ptr)
-                        if (sc is not None and self._uniform_storage(sc)) \
-                                or (ptr in uni and sc is None):
-                            uni.add(w[ri])
-                            changed = True
+                    if len(w) >= 4 and w[3] in self.uniform_ptrs:
+                        uni.add(w[ri])
+                        changed = True
                     continue
+                if op == OP_ACCESS_CHAIN:
+                    if len(w) >= 4 and w[3] in self.uniform_ptrs and w[2] not in self.uniform_ptrs \
+                            and all(w[i] in uni for i in range(4, len(w))):
+                        self.uniform_ptrs.add(w[2])
+                        changed = True
+                    continue
+                if op == OP_VARIABLE:
+                    continue                       # a pointer, never a value; see uniform_ptrs
                 if op == OP_PHI:
                     # IDENTICAL incoming values, not merely uniform ones -- a phi chooses between
                     # its edges, so uniform values say nothing when the branch choosing is

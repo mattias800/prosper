@@ -3439,13 +3439,21 @@ bool fragment_spirv_wave_width_independent(const std::vector<uint32_t>& spirv) {
         if (in.op == Op_Store && in.len >= 3 && !locals.count(spirv[in.at + 1]) &&
             !outputs.count(spirv[in.at + 1])) { writes_memory = true; break; }
     }
-    std::unordered_set<uint32_t> uniform;
-    for (const SpirvInst& in : insts) {
-        if (spirv_op_is_constant(in.op) && in.len >= 3) uniform.insert(spirv[in.at + 2]);
+    // Pointers that root in a read-only uniform storage class, and the access chains over them.
+    // Kept SEPARATE from the value set on purpose: a pointer's uniformity says something about
+    // where it points, and a load's uniformity is about what is stored there. Conflating the two
+    // made a Function local with a uniform initializer -- an initializer is an id operand, so the
+    // generic rule marked the variable uniform -- lend that uniformity to values written into it
+    // per lane. Constructed by hand; the corpus has no instance, which is exactly why.
+    std::unordered_set<uint32_t> uniform_ptrs;
+    for (const SpirvInst& in : insts)
         if (in.op == Op_Variable && in.len >= 4 &&
             spirv_storage_is_uniform(spirv[in.at + 3], writes_memory))
-            uniform.insert(spirv[in.at + 2]);
-    }
+            uniform_ptrs.insert(spirv[in.at + 2]);
+
+    std::unordered_set<uint32_t> uniform;
+    for (const SpirvInst& in : insts)
+        if (spirv_op_is_constant(in.op) && in.len >= 3) uniform.insert(spirv[in.at + 2]);
     for (bool changed = true; changed;) {
         changed = false;
         for (const SpirvInst& in : insts) {
@@ -3465,21 +3473,28 @@ bool fragment_spirv_wave_width_independent(const std::vector<uint32_t>& spirv) {
             }
             if (spirv_op_is_divergent_source(in.op)) continue;
             if (in.op == Op_Load) {
-                // Uniform when it reads a uniform-class variable, or a pointer already proven
-                // uniform -- an access chain with uniform indices into such a variable.
-                if (in.len >= 4) {
-                    const uint32_t ptr = spirv[in.at + 3];
-                    const auto sc = var_storage.find(ptr);
-                    const bool from_uniform_var =
-                        sc != var_storage.end() &&
-                        spirv_storage_is_uniform(sc->second, writes_memory);
-                    if (from_uniform_var || (uniform.count(ptr) && sc == var_storage.end())) {
-                        uniform.insert(result);
-                        changed = true;
-                    }
+                // ONLY from a pointer that roots in a read-only uniform class. Never from "this
+                // pointer value is uniform": a Function local's pointer is perfectly uniform and
+                // what it holds is whatever was last stored into it, which may be per lane.
+                if (in.len >= 4 && uniform_ptrs.count(spirv[in.at + 3])) {
+                    uniform.insert(result);
+                    changed = true;
                 }
                 continue;
             }
+            if (in.op == Op_AccessChain) {
+                // A chain inherits its base's class, and is a uniform POINTER only when every
+                // index is uniform too -- a per-lane index selects a different element per lane.
+                if (in.len >= 4 && uniform_ptrs.count(spirv[in.at + 3]) &&
+                    !uniform_ptrs.count(result)) {
+                    bool indices_uniform = true;
+                    for (uint32_t i = 4; i < in.len; ++i)
+                        if (!uniform.count(spirv[in.at + i])) { indices_uniform = false; break; }
+                    if (indices_uniform) { uniform_ptrs.insert(result); changed = true; }
+                }
+                continue;
+            }
+            if (in.op == Op_Variable) continue;   // a pointer, never a value; see uniform_ptrs
             if (in.op == Op_Phi) {
                 // IDENTICAL incoming values, not merely uniform ones. A phi's whole job is to
                 // choose between its edges, so "every value is uniform" says nothing about the

@@ -6687,7 +6687,7 @@ int main() {
         };
         // ids: 1 bool, 2 float, 3 vec4, 4 ptr_out, 5 out_var, 6 scope const, 7 ptr_src,
         //      8 src_var, 9 the vote's predicate, 10 the vote, 11 a constant, 20.. labels
-        const uint32_t kInput = 1, kOutput = 3, kStorageBuffer = 12;
+        const uint32_t kInput = 1, kOutput = 3, kFunction = 7, kStorageBuffer = 12;
         auto preamble = [&](uint32_t storage) {
             std::vector<uint32_t> b{0x07230203u, 0x00010300u, 0, 64, 0};
             ins(b, 20, {1});                    // OpTypeBool
@@ -6820,6 +6820,32 @@ int main() {
             return b;
         };
 
+        // A vote over a value read back through an ACCESS CHAIN. As a Function local the array is
+        // per-invocation: a divergent value is written into it and read back, so the vote is
+        // divergent however uniform the POINTER is. A Function variable with a uniform initializer
+        // used to inherit that uniformity, the chain inherited it from the variable and the load
+        // from the chain, so the vote cleared on where it pointed rather than on what was there.
+        // The StorageBuffer spelling is the same module with one word changed, and must still be
+        // admitted -- otherwise the fix is "stop trusting access chains" rather than a fix.
+        auto vote_over_chain = [&](uint32_t storage) {
+            std::vector<uint32_t> b = preamble(kInput);
+            ins(b, 21, {30, 32, 0});
+            ins(b, 43, {30, 31, 4});
+            ins(b, 28, {32, 1, 31});
+            ins(b, 32, {33, storage, 32});
+            ins(b, 44, {32, 34, 11, 11, 11, 11});
+            ins(b, 59, {33, 35, storage, 34});
+            ins(b, 32, {36, storage, 1});
+            ins(b, 248, {20});
+            ins(b, 65, {36, 37, 35, 31});
+            if (storage == kFunction) ins(b, 62, {37, 9});   // store the DIVERGENT value
+            ins(b, 61, {1, 38, 37});
+            ins(b, 335, {1, 10, 6, 38});
+            ins(b, 62, {5, 10});
+            ins(b, 253, {});
+            return b;
+        };
+
         std::vector<uint32_t> no_votes = preamble(kInput);
         ins(no_votes, 248, {20}); ins(no_votes, 62, {5, 11}); ins(no_votes, 253, {});
 
@@ -6839,6 +6865,10 @@ int main() {
              phi_before_vote(6), false},
             {"a vote over a phi whose edges all carry the SAME value",
              phi_before_vote(11), true},
+            {"a vote over a LOCAL written per lane and read back through an access chain",
+             vote_over_chain(kFunction), false},
+            {"a vote over a constant buffer read through an access chain",
+             vote_over_chain(kStorageBuffer), true},
             {"a UNIFORM vote guarding a store to the colour output",
              branch_only(kStorageBuffer), true},
             {"a UNIFORM vote whose arms merge in a phi that reaches the output",

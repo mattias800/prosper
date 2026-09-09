@@ -186,6 +186,37 @@ def mod_phi_before_vote(identical):
     return module(PRE_IDS + [10, 20, 21, 22, 23, 24], b)
 
 
+def mod_vote_over_a_local(storage):
+    """A vote over a value read back through an ACCESS CHAIN.
+
+    With `storage` Function, the array is a per-invocation local: the module writes a divergent
+    value into it and reads it back, so the vote is divergent however uniform the *pointer* is. A
+    Function variable with a uniform initializer used to inherit that initializer's uniformity, the
+    chain inherited it from the variable, and the load inherited it from the chain -- so the vote
+    cleared on a property of where it pointed rather than of what was there.
+
+    With `storage` StorageBuffer, the same chain reads a constant buffer and the vote really is
+    uniform. The pair differs by one storage-class word, so a rule that stopped trusting chains
+    altogether fails just as loudly as the one that trusted them too far.
+    """
+    b = (preamble(SC_INPUT)                            # %9 is a per-pixel load: divergent
+         + inst(21, 30, 32, 0)                         # OpTypeInt 32 unsigned
+         + inst(43, 30, 31, 4)                         # OpConstant uint 4 -- a uniform index
+         + inst(28, 32, 1, 31)                         # OpTypeArray bool 4
+         + inst(32, 33, storage, 32)                   # OpTypePointer <storage> arr
+         + inst(44, 32, 34, 11, 11, 11, 11)            # OpConstantComposite arr (uniform)
+         + inst(59, 33, 35, storage, 34)               # OpVariable <storage> WITH initializer
+         + inst(32, 36, storage, 1)                    # OpTypePointer <storage> bool
+         + inst(248, 20)
+         + inst(65, 36, 37, 35, 31)                    # OpAccessChain var[4]
+         + ([] if storage != SC_FUNCTION else inst(62, 37, 9))   # store the DIVERGENT value
+         + inst(61, 1, 38, 37)                         # read it back through the chain
+         + inst(335, 1, 10, 6, 38)                     # vote over what was read
+         + inst(62, 5, 10)
+         + inst(253))
+    return module(PRE_IDS + [10, 20, 30, 31, 32, 33, 34, 35, 36, 37, 38], b)
+
+
 def mod_dead_vote():
     """A divergent vote whose region has no observable effect and whose merge carries nothing."""
     b = (preamble(SC_INPUT)
@@ -263,6 +294,8 @@ def main() -> int:
                    mod_uniform_source_but_shader_writes_memory())
     expect_refused("a vote over a phi whose DIVERGENT branch chose between uniform constants",
                    mod_phi_before_vote(identical=False))
+    expect_refused("a vote over a LOCAL written per lane and read back through an access chain",
+                   mod_vote_over_a_local(SC_FUNCTION))
 
     # --- the cases that must be admitted, each for a DIFFERENT reason ----------------------------
     # Arm (a). Same three shapes, same analysis, one word changed: the predicate now comes from a
@@ -280,6 +313,8 @@ def main() -> int:
     expect_admitted("a module with no wave vote at all", mod_no_votes())
     expect_admitted("a vote over a phi whose edges all carry the SAME value",
                     mod_phi_before_vote(identical=True))
+    expect_admitted("a vote over a constant buffer read through an access chain",
+                    mod_vote_over_a_local(SC_STORAGE_BUFFER))
 
     # A module the tool cannot parse must never be counted as proven.
     with tempfile.TemporaryDirectory() as tmp:
