@@ -53,6 +53,20 @@ class PerformanceCaptureReportTests(unittest.TestCase):
         self.assertTrue(full["buffer_residency_available"])
         self.assertEqual(full["res_buffer_other"], 10)
         self.assertEqual(full["buffer_residency"]["buffer_upload_bytes"], 2**41 + 14)
+        self.assertFalse(full["buffer_watch_available"])
+        watched_row = dict(row, buffer_resident_watched_bytes=2**40 + 9, res_buffer_watch_ms=3)
+        watched = summarize(capture(SAMPLES, renderer=[watched_row, watched_row]))["resource_breakdown"]
+        self.assertTrue(watched["buffer_watch_available"])
+        self.assertEqual(watched["buffer_watch"]["buffer_resident_watched_bytes"], 2**41 + 18)
+        self.assertEqual(watched["buffer_watch"]["res_buffer_watch_ms"], 6)
+        self.assertEqual(watched["res_buffer_other"], 10)  # watch time is already inside resident
+        partial_watch = dict(watched_row)
+        del partial_watch["res_buffer_watch_ms"]
+        mixed_watch = summarize(capture(SAMPLES, renderer=[watched_row, partial_watch]))["resource_breakdown"]
+        self.assertTrue(mixed_watch["buffer_residency_available"])
+        self.assertFalse(mixed_watch["buffer_watch_available"])
+        self.assertNotIn("buffer_watch", mixed_watch)
+        self.assertEqual(mixed_watch["res_buffer_other"], 10)
         # One missing field cannot silently become zero, or grant a partial subtraction.
         missing = dict(row)
         del missing["buffer_resident_hits"]

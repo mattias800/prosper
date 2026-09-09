@@ -1918,12 +1918,14 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 double backend_res_texture_bind_ms = 0, backend_res_buffer_ms = 0;
                 double backend_res_buffer_acquire_ms = 0, backend_res_buffer_copy_ms = 0;
                 double backend_res_buffer_resident_ms = 0;
+                double backend_res_buffer_watch_ms = 0;
                 uint64_t buffer_upload_bytes = 0;
                 uint64_t buffer_resident_hits = 0;
                 uint64_t buffer_resident_compared_bytes = 0;
                 uint64_t buffer_resident_reused_bytes = 0;
                 uint64_t buffer_resident_admitted_bytes = 0;
                 uint64_t buffer_resident_refreshed_bytes = 0;
+                uint64_t buffer_resident_watched_bytes = 0;
                 uint64_t buffer_resident_declined_bytes = 0;
                 uint64_t buffer_resident_ineligible_bytes = 0;
                 double backend_res_buffer_create_ms = 0;
@@ -2155,12 +2157,14 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 pending_timing.backend_res_buffer_acquire_ms += backend.res_buffer_acquire_ms;
                 pending_timing.backend_res_buffer_copy_ms += backend.res_buffer_copy_ms;
                 pending_timing.backend_res_buffer_resident_ms += backend.res_buffer_resident_ms;
+                pending_timing.backend_res_buffer_watch_ms += backend.res_buffer_watch_ms;
                 pending_timing.buffer_upload_bytes += reuse.buffer_upload_bytes;
                 pending_timing.buffer_resident_hits += reuse.buffer_resident_hits;
                 pending_timing.buffer_resident_compared_bytes += reuse.buffer_resident_compared_bytes;
                 pending_timing.buffer_resident_reused_bytes += reuse.buffer_resident_reused_bytes;
                 pending_timing.buffer_resident_admitted_bytes += reuse.buffer_resident_admitted_bytes;
                 pending_timing.buffer_resident_refreshed_bytes += reuse.buffer_resident_refreshed_bytes;
+                pending_timing.buffer_resident_watched_bytes += reuse.buffer_resident_watched_bytes;
                 pending_timing.buffer_resident_declined_bytes += reuse.buffer_resident_declined_bytes;
                 pending_timing.buffer_resident_ineligible_bytes += reuse.buffer_resident_ineligible_bytes;
                 pending_timing.backend_res_buffer_create_ms += backend.res_buffer_create_ms;
@@ -7140,6 +7144,11 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             if (const uint8_t* source = direct_resource(r.gpu_addr, nb)) {
                                 fr.dwords_view = reinterpret_cast<const uint32_t*>(source);
                                 fr.dwords_view_count = nb / sizeof(uint32_t);
+                                // Hosted/capture views can advertise the same guest identity while
+                                // supplying different bytes. Only this actual guest mapping may
+                                // authorize write-watch validation in the retained-upload backend.
+                                if (!r.host_data && reinterpret_cast<uintptr_t>(source) == r.gpu_addr)
+                                    fr.direct_guest_buffer_addr = r.gpu_addr;
                                 resource_buffer_view = true;
                             }
                             if (timing_enabled)
@@ -10442,12 +10451,14 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     record.res_buffer_ms = pending_timing.backend_res_buffer_ms;
                     record.res_buffer_copy_ms = pending_timing.backend_res_buffer_copy_ms;
                     record.res_buffer_resident_ms = pending_timing.backend_res_buffer_resident_ms;
+                    record.res_buffer_watch_ms = pending_timing.backend_res_buffer_watch_ms;
                     record.buffer_upload_bytes = pending_timing.buffer_upload_bytes;
                     record.buffer_resident_hits = pending_timing.buffer_resident_hits;
                     record.buffer_resident_compared_bytes = pending_timing.buffer_resident_compared_bytes;
                     record.buffer_resident_reused_bytes = pending_timing.buffer_resident_reused_bytes;
                     record.buffer_resident_admitted_bytes = pending_timing.buffer_resident_admitted_bytes;
                     record.buffer_resident_refreshed_bytes = pending_timing.buffer_resident_refreshed_bytes;
+                    record.buffer_resident_watched_bytes = pending_timing.buffer_resident_watched_bytes;
                     record.buffer_resident_declined_bytes = pending_timing.buffer_resident_declined_bytes;
                     record.buffer_resident_ineligible_bytes = pending_timing.buffer_resident_ineligible_bytes;
                     record.res_buffer_create_ms = pending_timing.backend_res_buffer_create_ms;
@@ -10495,12 +10506,14 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     double backend_res_texture_bind_ms = 0, backend_res_buffer_ms = 0;
                     double backend_res_buffer_acquire_ms = 0, backend_res_buffer_copy_ms = 0;
                     double backend_res_buffer_resident_ms = 0;
+                    double backend_res_buffer_watch_ms = 0;
                     uint64_t buffer_upload_bytes = 0;
                     uint64_t buffer_resident_hits = 0;
                     uint64_t buffer_resident_compared_bytes = 0;
                     uint64_t buffer_resident_reused_bytes = 0;
                     uint64_t buffer_resident_admitted_bytes = 0;
                     uint64_t buffer_resident_refreshed_bytes = 0;
+                    uint64_t buffer_resident_watched_bytes = 0;
                     uint64_t buffer_resident_declined_bytes = 0;
                     uint64_t buffer_resident_ineligible_bytes = 0;
                     double backend_res_buffer_create_ms = 0;
@@ -10613,12 +10626,14 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     timing.backend_res_buffer_acquire_ms += pending_timing.backend_res_buffer_acquire_ms;
                     timing.backend_res_buffer_copy_ms += pending_timing.backend_res_buffer_copy_ms;
                     timing.backend_res_buffer_resident_ms += pending_timing.backend_res_buffer_resident_ms;
+                    timing.backend_res_buffer_watch_ms += pending_timing.backend_res_buffer_watch_ms;
                     timing.buffer_upload_bytes += pending_timing.buffer_upload_bytes;
                     timing.buffer_resident_hits += pending_timing.buffer_resident_hits;
                     timing.buffer_resident_compared_bytes += pending_timing.buffer_resident_compared_bytes;
                     timing.buffer_resident_reused_bytes += pending_timing.buffer_resident_reused_bytes;
                     timing.buffer_resident_admitted_bytes += pending_timing.buffer_resident_admitted_bytes;
                     timing.buffer_resident_refreshed_bytes += pending_timing.buffer_resident_refreshed_bytes;
+                    timing.buffer_resident_watched_bytes += pending_timing.buffer_resident_watched_bytes;
                     timing.buffer_resident_declined_bytes += pending_timing.buffer_resident_declined_bytes;
                     timing.buffer_resident_ineligible_bytes += pending_timing.buffer_resident_ineligible_bytes;
                     timing.backend_res_buffer_create_ms += pending_timing.backend_res_buffer_create_ms;

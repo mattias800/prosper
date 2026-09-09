@@ -46,6 +46,8 @@ struct RendererTimingRecord {
     uint64_t buffer_resident_reused_bytes = 0;
     uint64_t buffer_resident_admitted_bytes = 0;
     uint64_t buffer_resident_refreshed_bytes = 0;
+    // Subset of reused bytes proved unchanged by a complete direct-source write watch.
+    uint64_t buffer_resident_watched_bytes = 0;
     uint64_t buffer_resident_declined_bytes = 0;
     uint64_t buffer_resident_ineligible_bytes = 0;
     double total_ms = 0;
@@ -152,6 +154,8 @@ struct RendererTimingRecord {
     // Resident lookup/validation and admission allocation/copy, nested in res_buffer_ms.
     // Ordinary arena/pool copies remain in res_buffer_copy_ms; these leaves do not overlap.
     double res_buffer_resident_ms = 0;
+    // Child of res_buffer_resident_ms: do not add/subtract it again in the buffer partition.
+    double res_buffer_watch_ms = 0;
     double res_buffer_create_ms = 0;
     double res_buffer_index_find_ms = 0;
     double res_buffer_index_insert_ms = 0;

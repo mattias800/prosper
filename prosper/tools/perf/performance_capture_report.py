@@ -198,6 +198,14 @@ def _resource_breakdown(renderer):
         if breakdown["buffer_residency_available"]:
             breakdown["buffer_residency"] = {
                 field: sum(row[field] for row in renderer) for field in residency_fields}
+        watch_fields = ("buffer_resident_watched_bytes", "res_buffer_watch_ms")
+        breakdown["buffer_watch_available"] = breakdown["buffer_residency_available"] and all(
+            field in row for row in renderer for field in watch_fields)
+        if breakdown["buffer_watch_available"]:
+            # Both are subsets of residency. In particular, never subtract this child timer
+            # from the buffer residual after resident time has already been subtracted.
+            breakdown["buffer_watch"] = {
+                field: sum(row[field] for row in renderer) for field in watch_fields}
 
         # The same signed-remainder argument, one level down. res_buffer_ms had NO exhaustive
         # partition until now -- only `copy` and (in the stderr window) `acquire`, two candidate
@@ -798,6 +806,12 @@ def print_summary(summary):
                           " create/index_find/index_insert/hash UNAVAILABLE") + ")"
                   f" descriptor={breakdown['res_descriptor']:.1f}"
                   f" other={breakdown['res_other']:.1f}]")
+            if breakdown["buffer_watch_available"]:
+                watch = breakdown["buffer_watch"]
+                print(f"    included in resident: watch={watch['res_buffer_watch_ms']:.1f}ms"
+                      f" watched_reuse={watch['buffer_resident_watched_bytes'] / (1024*1024):.1f}MiB")
+            elif breakdown["buffer_residency_available"]:
+                print("    resident write-watch breakdown: UNAVAILABLE")
             # Loud, and only when it is genuinely non-zero. A sub-bucket total exceeding its parent
             # is an instrument defect, and the breakdown above is untrustworthy while it holds.
             if breakdown["res_over_attributed"] > 0.05:

@@ -19,3 +19,8 @@ admission and refresh time is separate from ordinary arena/pool copy time; trans
 within creation time. Live callbacks accumulate backend-call records
 across ordered graphics spans before publishing one semantic-submit record; CPU serialization tests
 here cannot substitute for a real backend-to-recorder integration guard in the live test family.
+
+Direct-source write-watch reuse is a subset of total resident reuse. Watched bytes exclude exact
+comparison spans; unknown or unsupported coverage retains comparison. The watch timer is a child
+of resident time and must not be added to the buffer partition a second time. CPU snapshot
+maintenance remains within resident time but is not another Vulkan upload-byte count.

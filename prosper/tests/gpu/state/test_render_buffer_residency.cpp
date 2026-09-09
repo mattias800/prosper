@@ -1,7 +1,8 @@
 // Immutable renderer uploads: real vertex fetches distinguish stale contents from valid reuse.
-// No guest mapping/watch is simulated here: FrameResource's current materialized bytes are the
-// authority. Distinct host vectors deliberately advertise one guest identity. A queued pass must
-// retain its own upload even after that identity changes or cache pressure removes the entry.
+// Hosted cases use FrameResource's current materialized bytes as authority; the Linux section
+// below additionally exercises actual registered guest mappings and the production fault handler.
+// Distinct host vectors deliberately advertise one guest identity. A queued pass must retain its
+// own upload even after that identity changes or cache pressure removes the entry.
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/resources/shader_resources.hpp"
 #include "gpu/state/render_state.hpp"
@@ -16,6 +17,15 @@
 #include <memory>
 #include <string>
 #include <vector>
+#ifdef __linux__
+#include "host/image/exec_image.hpp"
+#include "host/memory/guest_memory_map.hpp"
+#include "host/memory/guest_write_watch.hpp"
+#include <csignal>
+#include <cstring>
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 using namespace prosper::gpu;
 using namespace prosper::test;
@@ -160,6 +170,222 @@ std::vector<uint32_t> atomic_fragment(std::vector<uint32_t> input, bool copy_poi
     return added_annotations && added_declarations && added_code ? result : std::vector<uint32_t>{};
 }
 }
+
+
+namespace {
+#ifdef __linux__
+// Same memfd/MAP_SHARED + production SA_ONSTACK path as test_guest_write_watch. The extra
+// readable-map notifications model the public mapping contract used by actual direct resources.
+struct GuestBufferAliases {
+    int fd = -1, replacement_fd = -1;
+    size_t mapped_size = 0;
+    uint32_t* a = nullptr;
+    uint32_t* b = nullptr;
+    static constexpr uint64_t Physical = 0x734890000ull;
+    static void add(uint32_t* p, size_t bytes, uint64_t physical) {
+        prosper::host::notify_guest_mapping_added(reinterpret_cast<uint64_t>(p), bytes, true);
+        prosper::host::guest_write_watch_notify_direct_mapping_added(
+            reinterpret_cast<uint64_t>(p), bytes, physical, 3); // CPU_READ | CPU_WRITE
+    }
+    static void remove(uint32_t* p, size_t bytes) {
+        prosper::host::guest_write_watch_notify_direct_mapping_removed(
+            reinterpret_cast<uint64_t>(p), bytes);
+        prosper::host::notify_guest_mapping_removed(reinterpret_cast<uint64_t>(p), bytes);
+    }
+    bool initialize(const std::vector<uint32_t>& initial) {
+        const long page = sysconf(_SC_PAGESIZE);
+        if (page <= 0) return false;
+        mapped_size = ((Bytes + size_t(page) - 1) / size_t(page)) * size_t(page);
+        fd = memfd_create("renderer-buffer-watch", 0);
+        if (fd < 0 || ftruncate(fd, static_cast<off_t>(mapped_size))) return false;
+        auto map = [&] {
+            void* p = mmap(nullptr, mapped_size, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
+            return p == MAP_FAILED ? nullptr : static_cast<uint32_t*>(p);
+        };
+        a = map(); b = map();
+        if (!a || !b) return false;
+        std::memcpy(a, initial.data(), Bytes);
+        add(a, mapped_size, Physical); add(b, mapped_size, Physical);
+        return true;
+    }
+    bool replace_primary(const std::vector<uint32_t>& replacement) {
+        replacement_fd = memfd_create("renderer-buffer-watch-replacement", 0);
+        if (replacement_fd < 0 || ftruncate(replacement_fd, static_cast<off_t>(mapped_size)) ||
+            pwrite(replacement_fd, replacement.data(), Bytes, 0) != ssize_t(Bytes)) return false;
+        uint32_t* old = a;
+        remove(old, mapped_size);
+        // Atomically replace the exact still-owned range. Never expose an unmapped address gap
+        // which an unrelated Vulkan/host thread could acquire before MAP_FIXED executes.
+        void* next = mmap(old, mapped_size, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_FIXED,
+                          replacement_fd, 0);
+        if (next == MAP_FAILED) {
+            munmap(old, mapped_size);
+            a = nullptr;
+            return false;
+        }
+        a = static_cast<uint32_t*>(next);
+        add(a, mapped_size, Physical + 2*mapped_size);
+        return a == old;
+    }
+    ~GuestBufferAliases() {
+        if (a) { remove(a, mapped_size); munmap(a, mapped_size); }
+        if (b) { remove(b, mapped_size); munmap(b, mapped_size); }
+        if (replacement_fd >= 0) close(replacement_fd);
+        if (fd >= 0) close(fd);
+    }
+};
+
+void guest_buffer_watch(const Fixture& f) {
+    using namespace prosper::host;
+    CHECK(unsetenv("PROSPER_FAULT_NO_ONSTACK") == 0,
+          "real renderer write-watch uses the production alternate-stack signal handler");
+    prosper::install_trap_handler();
+    struct sigaction action{};
+    stack_t stack{};
+    const bool signal_ready = sigaction(SIGSEGV, nullptr, &action) == 0 &&
+        (action.sa_flags & SA_ONSTACK) && sigaltstack(nullptr, &stack) == 0 &&
+        !(stack.ss_flags & SS_DISABLE);
+    CHECK(signal_ready, "actual SIGSEGV handler and current thread alternate stack are installed");
+    if (!signal_ready) return;
+    auto& cache = resident_render_buffer_cache();
+    { BackendPersistentResourceGuard guard; cache.index.clear(); cache.lru.clear(); }
+    GuestBufferAliases mapping;
+    auto visible = payload();
+    CHECK(mapping.initialize(visible), "real guest buffer and second physical alias are mapped");
+    if (!mapping.a || !mapping.b) return;
+    const uint64_t identity = reinterpret_cast<uint64_t>(mapping.a);
+    auto direct_draw = [&] {
+        auto d = f.draw(visible, identity);
+        d.R[0].dwords_view = mapping.a;
+        d.R[0].direct_guest_buffer_addr = identity;
+        return d;
+    };
+    auto render = [&] { return render_draws_rgba({direct_draw()}, W,H,nullptr,Clear); };
+    auto warm = [&](bool green) {
+        // Cold admission / changed refresh does not itself prove stable source contents. Two real
+        // equal validations establish stability; the third arms before one final exact comparison.
+        // Only the following draw can rely on that established protected baseline.
+        for (unsigned i=0; i<3; ++i) {
+            CHECK(solid(render(),green), "equal validation preserves every guest-buffer GPU pixel");
+            CHECK(backend_resource_reuse_stats().buffer_resident_compared_bytes == Bytes,
+                  "promotion and protected baseline require actual full comparison spans");
+        }
+        CHECK(solid(render(),green), "watched warm guest buffer preserves every GPU pixel");
+        CHECK(backend_resource_reuse_stats().buffer_resident_watched_bytes == Bytes &&
+                  backend_resource_reuse_stats().buffer_resident_compared_bytes == 0 &&
+                  backend_resource_reuse_stats().buffer_upload_bytes == 0,
+              "clean registered source uses write-watch proof without comparison or upload");
+    };
+    auto fresh_watch = [&](bool green) {
+        // Two dirty queries deliberately disable further watch attempts on an entry. Give each
+        // invalidation mechanism a fresh retained entry so none is tested only via that fallback.
+        { BackendPersistentResourceGuard guard; cache.index.clear(); cache.lru.clear(); }
+        CHECK(solid(render(),green), "fresh actual guest source starts from correct cold pixels");
+        CHECK(backend_resource_reuse_stats().buffer_resident_admitted_bytes == Bytes,
+              "each independent invalidation arm begins with a fresh retained entry");
+        warm(green);
+    };
+    auto store_positions = [&](uint32_t* destination, bool green) {
+        auto changed = visible; quad(changed,0,green);
+        auto* out = reinterpret_cast<volatile uint32_t*>(destination);
+        for (size_t i=0; i<8; ++i) out[i] = changed[i];
+    };
+    auto dirty_result = [&](bool green) {
+        CHECK(solid(render(),green), "invalidated guest source changes every GPU pixel correctly");
+        CHECK(backend_resource_reuse_stats().buffer_resident_watched_bytes == 0 &&
+                  backend_resource_reuse_stats().buffer_resident_compared_bytes == Bytes &&
+                  backend_resource_reuse_stats().buffer_upload_bytes == Bytes,
+              "dirty proof requires exact comparison and a complete changed upload");
+    };
+    CHECK(solid(render(),true), "cold registered guest buffer renders green");
+    CHECK(backend_resource_reuse_stats().buffer_resident_admitted_bytes == Bytes,
+          "cold actual guest source is admitted before any watch proof");
+    warm(true);
+    auto faults = guest_write_watch_stats().faults;
+    store_positions(mapping.a,false);
+    CHECK(guest_write_watch_stats().faults > faults,
+          "actual CPU store through original VA reaches the production fault handler");
+    dirty_result(false); fresh_watch(false);
+    faults = guest_write_watch_stats().faults;
+    store_positions(mapping.b,true);
+    CHECK(guest_write_watch_stats().faults > faults && mapping.a[0] == mapping.b[0],
+          "actual CPU store through physical alias faults and updates the original mapping");
+    dirty_result(true); fresh_watch(true);
+
+    guest_write_watch_notify_host_write(identity, 8*sizeof(uint32_t));
+    store_positions(mapping.a,false);
+    guest_write_watch_notify_host_write_done(identity, 8*sizeof(uint32_t));
+    dirty_result(false); fresh_watch(false);
+    // pwrite changes the shared physical backing without a CPU store through a protected alias.
+    // The explicit device-write notification, rather than an accidental SIGSEGV, must invalidate.
+    faults = guest_write_watch_stats().faults;
+    guest_write_watch_notify_gpu_write(identity, 8*sizeof(uint32_t));
+    CHECK(pwrite(mapping.fd, visible.data(), 8*sizeof(uint32_t), 0) == 8*ssize_t(sizeof(uint32_t)),
+          "device-style notified producer updates the real shared backing");
+    CHECK(guest_write_watch_stats().faults == faults,
+          "device-write invalidation is exercised without a substitute CPU protection fault");
+    dirty_result(true); fresh_watch(true);
+
+    // Hosted materialization may reuse the same identity while its bytes have independent
+    // authority. It must not inherit the direct source's still-clean page watch.
+    auto hosted = visible; quad(hosted,0,false);
+    CHECK(solid(f.render(hosted,identity),false),
+          "hosted bytes with same identity override clean watched guest bytes");
+    CHECK(backend_resource_reuse_stats().buffer_resident_watched_bytes == 0 &&
+              backend_resource_reuse_stats().buffer_resident_compared_bytes == Bytes,
+          "hosted replacement refuses direct guest watch authority");
+    CHECK(solid(f.render(hosted,identity),false) &&
+              backend_resource_reuse_stats().buffer_resident_watched_bytes == 0 &&
+              backend_resource_reuse_stats().buffer_resident_compared_bytes == Bytes,
+          "unchanged hosted materialization remains exact-comparison validated");
+    dirty_result(true); fresh_watch(true);
+
+    auto remapped = visible; quad(remapped,0,false);
+    CHECK(mapping.replace_primary(remapped), "same guest VA is replaced with a new physical mapping");
+    if (!mapping.a) return;
+    dirty_result(false); fresh_watch(false);
+    CHECK(mapping.b[0] == visible[0] && mapping.a[0] == remapped[0],
+          "old physical alias and replacement VA now contain independent bytes");
+
+    // Even a watched cache hit acquires a separate recorded GPU owner. A later dirty source
+    // must detach, not rewrite that earlier version before the pending commands consume it.
+    BackendColorTarget old_target{0x3489ee01ull,false,false};
+    BackendColorTarget new_target{0x3489ee02ull,false,false};
+    BackendSubmissionBatch batch;
+    (void)render_draws_rgba({direct_draw()},W,H,nullptr,Clear,false,&old_target,
+                           nullptr,nullptr,nullptr,&batch,false,nullptr,false);
+    CHECK(batch.pending() && backend_resource_reuse_stats().buffer_resident_watched_bytes == Bytes,
+          "queued old draw acquires the clean watched version");
+    store_positions(mapping.a,true);
+    (void)render_draws_rgba({direct_draw()},W,H,nullptr,Clear,false,&new_target,
+                           nullptr,nullptr,nullptr,&batch,false,nullptr,false);
+    CHECK(backend_resource_reuse_stats().buffer_resident_watched_bytes == 0 &&
+              backend_resource_reuse_stats().buffer_upload_bytes == Bytes,
+          "dirty source recorded while old owner is pending uploads a separate version");
+    const auto& ctx = render_vk_ctx();
+    BackendSubmissionBatchResult submitted;
+    { BackendPersistentResourceGuard guard;
+      submitted = batch.submit_and_wait(ctx.dev,ctx.queue,false);
+      if (submitted.submit_result == VK_SUCCESS && submitted.wait_result == VK_SUCCESS)
+          batch.complete(); }
+    CHECK(submitted.submit_result == VK_SUCCESS && submitted.wait_result == VK_SUCCESS &&
+              submitted.command_buffers == 2,
+          "both watched pending-version passes submit and complete successfully");
+    if (submitted.submit_result != VK_SUCCESS || submitted.wait_result != VK_SUCCESS) return;
+    std::vector<uint8_t> before, after; std::string error;
+    CHECK(readback_persistent_color_target(old_target.persistent_id,W,H,VK_FORMAT_UNDEFINED,before,error) &&
+              solid(before,false), "queued watched old version keeps its original blue result");
+    CHECK(readback_persistent_color_target(new_target.persistent_id,W,H,VK_FORMAT_UNDEFINED,after,error) &&
+              solid(after,true), "queued replacement independently produces the new green result");
+    { BackendPersistentResourceGuard guard; cache.index.clear(); cache.lru.clear(); }
+    // Destroy every cache watch before the actual mapping RAII cleanup publishes unmap events.
+}
+#else
+void guest_buffer_watch(const Fixture&) {
+    std::printf("[UNSUPPORTED] Linux direct-memory write-watch runtime arm; hosted cases remain covered\n");
+}
+#endif
+} // namespace
 
 int main(int argc, char** argv) {
     std::printf("== renderer buffer residency ==\n");
@@ -509,6 +735,7 @@ int main(int argc, char** argv) {
     CHECK(solid(f.render(rounded_source, RekeyIdentity+4),false),
           "rounded rekey uploads the changed bytes to the actual GPU draw");
     disabled(false);
+    guest_buffer_watch(f);
     std::printf("== %s (%d failures) ==\n",failures?"FAIL":"PASS",failures);
     return failures?1:0;
 }

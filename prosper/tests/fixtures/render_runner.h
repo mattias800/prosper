@@ -150,6 +150,9 @@ struct FrameResource {
     // within one synchronous call only when both this identity and the complete captured bytes match;
     // zero keeps synthetic/replay resources conservatively distinct.
     uint64_t buffer_identity = 0;
+    // Explicit live-producer proof: this complete unmaterialized input is the direct guest VA.
+    // Hosted/capture/owned/padded inputs leave zero; numeric identity alone never grants a watch.
+    uint64_t direct_guest_buffer_addr = 0;
     // Backend-owned PS5 GDS storage. Unlike guest/capture buffers this is one persistent,
     // zero-initialized 64 KiB allocation shared across ordered render calls.
     bool is_internal_gds = false;
@@ -675,6 +678,7 @@ struct BackendResourceReuseStats {
     uint64_t buffer_resident_reused_bytes = 0;
     uint64_t buffer_resident_admitted_bytes = 0;
     uint64_t buffer_resident_refreshed_bytes = 0;
+    uint64_t buffer_resident_watched_bytes = 0;
     uint64_t buffer_resident_declined_bytes = 0;
     uint64_t buffer_resident_ineligible_bytes = 0;
 };
@@ -1091,6 +1095,7 @@ struct BackendRenderTimingStats {
     double res_buffer_acquire_ms = 0;
     double res_buffer_copy_ms = 0;
     double res_buffer_resident_ms = 0;
+    double res_buffer_watch_ms = 0; // nested in resident time: setup/query/rearm, not additive
     // vkCreateBuffer + vkAllocateMemory + the copy performed inside
     // create_transient_storage_buffer_upload — the fallback taken when a payload gets neither an
     // arena slice nor a pooled buffer. Timed by neither acquire nor copy before this.
@@ -3099,7 +3104,77 @@ struct ResidentRenderBufferCache {
     ResidentRenderBufferCache(const ResidentRenderBufferCache&) = delete;
     ResidentRenderBufferCache& operator=(const ResidentRenderBufferCache&) = delete;
     using Owner = std::shared_ptr<ResidentRenderBuffer>;
-    struct Entry { ResidentRenderBufferKey key; Owner owner; };
+    struct Entry {
+        ResidentRenderBufferKey key;
+        Owner owner;
+        prosper::host::GuestWriteWatch watch;
+        uint64_t direct_guest_addr = 0;
+        uint8_t equal_validations = 0;
+        uint8_t dirty_queries = 0;
+        bool watch_disabled = false;
+        Entry(ResidentRenderBufferKey k, Owner o, uint64_t addr = 0)
+            : key(k), owner(std::move(o)), direct_guest_addr(addr) {}
+
+        struct WatchTimer {
+            double* milliseconds;
+            std::chrono::steady_clock::time_point start;
+            explicit WatchTimer(double* out) : milliseconds(out),
+                start(out ? std::chrono::steady_clock::now() :
+                            std::chrono::steady_clock::time_point{}) {}
+            ~WatchTimer() {
+                if (milliseconds)
+                    *milliseconds += std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - start).count();
+            }
+        };
+        static uint64_t eligible_address(ResidentRenderBufferKey key, const void* source,
+                                         uint64_t direct_addr) {
+            return direct_addr && reinterpret_cast<uintptr_t>(source) == direct_addr &&
+                   key.bytes && key.bytes <= UINT64_MAX - direct_addr ? direct_addr : 0;
+        }
+        void reset_source(uint64_t addr, double* watch_ms) {
+            const WatchTimer timer(watch_ms);
+            watch.reset();
+            direct_guest_addr = addr;
+            equal_validations = dirty_queries = 0;
+            watch_disabled = false;
+        }
+        bool unchanged_before_exact(const void* source, uint64_t direct_addr, double* watch_ms) {
+            const uint64_t addr = eligible_address(key, source, direct_addr);
+            if (addr != direct_guest_addr) reset_source(addr, watch_ms);
+            if (!addr || watch_disabled) return false;
+            const WatchTimer timer(watch_ms);
+            try {
+                if (watch) {
+                    const auto query = watch.query();
+                    if (query == prosper::host::GuestWriteWatchQuery::Unchanged) return true;
+                    if (query == prosper::host::GuestWriteWatchQuery::Unknown ||
+                        ++dirty_queries >= 2) {
+                        watch.reset();
+                        watch_disabled = true;
+                        return false;
+                    }
+                    // Rearm before comparing/copying. A removed/remapped original mapping cannot
+                    // be retargeted by rearm: discard it and establish fresh coverage instead.
+                    if (watch.rearm()) return false;
+                    watch.reset();
+                    watch = prosper::host::GuestWriteWatch::create(addr, key.bytes);
+                    watch_disabled = !watch;
+                    return false;
+                }
+                // Two earlier full equality validations are required. Even after successful
+                // creation this call still compares: no compare-to-arm gap can bless stale bytes.
+                if (equal_validations >= 2) {
+                    watch = prosper::host::GuestWriteWatch::create(addr, key.bytes);
+                    watch_disabled = !watch; // unsupported/failed registration is attempted once
+                }
+            } catch (const std::bad_alloc&) {
+                watch.reset();
+                watch_disabled = true;
+            }
+            return false;
+        }
+    };
     std::list<Entry> lru;
     std::unordered_map<ResidentRenderBufferKey, std::list<Entry>::iterator,
                        ResidentRenderBufferKeyHash> index;
@@ -3108,18 +3183,23 @@ struct ResidentRenderBufferCache {
 
     // Called under BackendPersistentResourceGuard; cleanup only destroys independent owners.
     Owner find(VkDevice device, ResidentRenderBufferKey key, const void* source,
-               BackendResourceReuseStats& stats) {
+               BackendResourceReuseStats& stats, uint64_t direct_guest_addr = 0,
+               double* watch_ms = nullptr) {
         auto found = index.find(key);
         if (found == index.end()) return {};
         auto entry = found->second;
         if (entry->owner->device == device) {
-            stats.buffer_resident_compared_bytes += key.bytes;
-            if (std::memcmp(entry->owner->snapshot.get(), source, key.bytes) == 0) {
+            const bool watched = entry->unchanged_before_exact(source, direct_guest_addr, watch_ms);
+            if (!watched) stats.buffer_resident_compared_bytes += key.bytes;
+            if (watched || std::memcmp(entry->owner->snapshot.get(), source, key.bytes) == 0) {
+                if (watched) stats.buffer_resident_watched_bytes += key.bytes;
+                else if (entry->equal_validations < 2) ++entry->equal_validations;
                 lru.splice(lru.end(), lru, entry);
                 ++stats.buffer_resident_hits;
                 stats.buffer_resident_reused_bytes += key.bytes;
                 return entry->owner;
             }
+            entry->equal_validations = 0;
             if (entry->owner.use_count() == 1) {
                 // No recorded/in-flight use remains: refresh the complete logical span without
                 // reallocating dynamic buffers every call. The next upload acquires a new pin.
@@ -3137,7 +3217,9 @@ struct ResidentRenderBufferCache {
         return {};
     }
     Owner admit(const RenderVkCtx& ctx, ResidentRenderBufferKey key, const void* source,
-                VkDeviceSize limit, BackendResourceReuseStats& stats) {
+                VkDeviceSize limit, BackendResourceReuseStats& stats,
+                uint64_t direct_guest_addr = 0, double* watch_ms = nullptr) {
+        const uint64_t source_addr = Entry::eligible_address(key, source, direct_guest_addr);
         if (index.contains(key) || key.bytes > limit / 2) return {};
         const auto capacity = render_host_buffer_capacity(key.bytes);
         if (capacity > limit - key.bytes) return {};
@@ -3161,6 +3243,7 @@ struct ResidentRenderBufferCache {
                 node.key() = key;
                 index.insert(std::move(node));
                 entry->key = key;
+                entry->reset_source(source_addr, watch_ms);
                 std::memcpy(entry->owner->snapshot.get(), source, key.bytes);
                 std::memcpy(entry->owner->storage.mapped, entry->owner->snapshot.get(), key.bytes);
                 stats.buffer_upload_bytes += key.bytes;
@@ -3190,7 +3273,7 @@ struct ResidentRenderBufferCache {
         std::memcpy(owner->storage.mapped, owner->snapshot.get(), key.bytes);
         stats.buffer_upload_bytes += key.bytes;
         try {
-            lru.push_back({key, owner});
+            lru.emplace_back(key, owner, source_addr);
             try { index.emplace(key, std::prev(lru.end())); }
             catch (...) { lru.pop_back(); throw; }
         } catch (const std::bad_alloc&) { return {}; }
@@ -6979,6 +7062,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     }
     bool readonly_buffer_pass = share_backend_resources && reuse_host_buffers &&
         !buffer_verify_enabled && getenv("PROSPER_NO_BACKEND_BUFFER_RESIDENCY") == nullptr;
+    const bool readonly_buffer_watch =
+        getenv("PROSPER_NO_BACKEND_BUFFER_WRITE_WATCH") == nullptr;
     if (readonly_buffer_pass) {
         for (const auto& draw : draws) {
             if (!backend_module_has_readonly_buffers(draw.vs_words(), draw.vs_shared) ||
@@ -7019,6 +7104,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     double res_buffer_acquire_ms = 0.0;
     double res_buffer_copy_ms = 0.0;
     double res_buffer_resident_ms = 0.0;
+    double res_buffer_watch_ms = 0.0;
     double res_buffer_create_ms = 0.0;
     double res_buffer_index_find_ms = 0.0;
     double res_buffer_index_insert_ms = 0.0;
@@ -7837,7 +7923,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 // so the body no longer reaches for the enclosing resource.
                 auto resolve_buffer_upload =
                     [&](const uint32_t* words, size_t word_count, uint64_t identity,
-                        uint32_t set, uint32_t binding, size_t& buffer_index_out) -> bool {
+                        uint64_t direct_guest_addr, uint32_t set, uint32_t binding, size_t& buffer_index_out) -> bool {
                 if (!words || !word_count) {
                     words = &zero_buffer_word;
                     word_count = 1;
@@ -7953,10 +8039,14 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                         const ResourcePhaseTimer phase_resident(timing_enabled, &res_buffer_resident_ms);
                         auto& cache = resident_render_buffer_cache();
                         const ResidentRenderBufferKey key{identity, bytes};
-                        upload.resident = cache.find(ctx.dev, key, words, resource_reuse_stats);
+                        upload.resident = cache.find(ctx.dev, key, words, resource_reuse_stats,
+                            readonly_buffer_watch ? direct_guest_addr : 0,
+                            timing_enabled ? &res_buffer_watch_ms : nullptr);
                         if (!upload.resident)
                             upload.resident = cache.admit(ctx, key, words,
-                                resident_render_buffer_limit(), resource_reuse_stats);
+                                resident_render_buffer_limit(), resource_reuse_stats,
+                                readonly_buffer_watch ? direct_guest_addr : 0,
+                                timing_enabled ? &res_buffer_watch_ms : nullptr);
                         if (upload.resident) {
                             const auto& retained = upload.resident->storage;
                             upload.buffer = retained.buffer;
@@ -8877,8 +8967,9 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                         size_t entry_index = SIZE_MAX;
                         // False is the fatal upload path: the zero-word fallback itself failed, so this
                         // draw cannot be bound. Same effect as the `break` this replaced.
-                        if (!resolve_buffer_upload(entry_words, entry_count, entry_identity, r.set,
-                                                  r.binding, entry_index)) {
+                        if (!resolve_buffer_upload(entry_words, entry_count, entry_identity,
+                                                  r.table_entries.empty() ? r.direct_guest_buffer_addr : 0,
+                                                  r.set, r.binding, entry_index)) {
                             entries_ready = false;
                             break;
                         }
@@ -11446,6 +11537,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         call_timing.res_buffer_acquire_ms = res_buffer_acquire_ms;
         call_timing.res_buffer_copy_ms = res_buffer_copy_ms;
         call_timing.res_buffer_resident_ms = res_buffer_resident_ms;
+        call_timing.res_buffer_watch_ms = res_buffer_watch_ms;
         call_timing.res_buffer_create_ms = res_buffer_create_ms;
         call_timing.res_buffer_index_find_ms = res_buffer_index_find_ms;
         call_timing.res_buffer_index_insert_ms = res_buffer_index_insert_ms;
@@ -11837,6 +11929,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         PROSPER_SUM_RESOURCE_STAT(buffer_resident_reused_bytes);
         PROSPER_SUM_RESOURCE_STAT(buffer_resident_admitted_bytes);
         PROSPER_SUM_RESOURCE_STAT(buffer_resident_refreshed_bytes);
+        PROSPER_SUM_RESOURCE_STAT(buffer_resident_watched_bytes);
         PROSPER_SUM_RESOURCE_STAT(buffer_resident_declined_bytes);
         PROSPER_SUM_RESOURCE_STAT(buffer_resident_ineligible_bytes);
 #undef PROSPER_SUM_RESOURCE_STAT
@@ -11892,6 +11985,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
             PROSPER_SUM_TIMING_STAT(res_buffer_acquire_ms);
             PROSPER_SUM_TIMING_STAT(res_buffer_copy_ms);
             PROSPER_SUM_TIMING_STAT(res_buffer_resident_ms);
+            PROSPER_SUM_TIMING_STAT(res_buffer_watch_ms);
             PROSPER_SUM_TIMING_STAT(res_buffer_create_ms);
             PROSPER_SUM_TIMING_STAT(res_buffer_index_find_ms);
             PROSPER_SUM_TIMING_STAT(res_buffer_index_insert_ms);

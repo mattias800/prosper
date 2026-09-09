@@ -102,3 +102,12 @@ known capacity pressure does not evict unrelated entries or allocate new storage
 the pool capacity class plus snapshot size; actual driver allocation requirements are checked
 after allocation and may still decline admission. Admitted-byte counters mean
 new key payloads, including rekeyed allocations, and are not Vulkan allocation-byte counters.
+
+Only explicit direct guest views may use a cache-entry write watch; hosted, copied, padded and
+descriptor-table data retain full comparison. Two exact equal validations precede promotion; arm
+before the next authoritative comparison. Unknown or failed coverage falls back, and two dirty
+queries disable watching for that entry until its source changes or it is rekeyed. Entry watches
+never own or extend guest mapping lifetime; recorded GPU snapshots remain independent.
+`PROSPER_NO_BACKEND_BUFFER_WRITE_WATCH` disables only watch validation, preserving residency for
+comparable exact-validation controls. Watched bytes are a subset of reused bytes; watch time is
+already included in resident time.

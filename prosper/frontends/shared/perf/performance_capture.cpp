@@ -357,6 +357,7 @@ void InteractivePerformanceCapture::publish_completed(std::unique_ptr<PendingCap
                 << ",\"buffer_resident_reused_bytes\":" << record.buffer_resident_reused_bytes
                 << ",\"buffer_resident_admitted_bytes\":" << record.buffer_resident_admitted_bytes
                 << ",\"buffer_resident_refreshed_bytes\":" << record.buffer_resident_refreshed_bytes
+                << ",\"buffer_resident_watched_bytes\":" << record.buffer_resident_watched_bytes
                 << ",\"buffer_resident_declined_bytes\":" << record.buffer_resident_declined_bytes
                 << ",\"buffer_resident_ineligible_bytes\":" << record.buffer_resident_ineligible_bytes
                 << ",\"total_ms\":" << record.total_ms
@@ -446,6 +447,7 @@ void InteractivePerformanceCapture::publish_completed(std::unique_ptr<PendingCap
                 << ",\"res_buffer_ms\":" << record.res_buffer_ms
                 << ",\"res_buffer_copy_ms\":" << record.res_buffer_copy_ms
                 << ",\"res_buffer_resident_ms\":" << record.res_buffer_resident_ms
+                << ",\"res_buffer_watch_ms\":" << record.res_buffer_watch_ms
                 << ",\"res_buffer_create_ms\":" << record.res_buffer_create_ms
                 << ",\"res_buffer_index_find_ms\":" << record.res_buffer_index_find_ms
                 << ",\"res_buffer_index_insert_ms\":" << record.res_buffer_index_insert_ms
