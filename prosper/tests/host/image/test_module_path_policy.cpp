@@ -201,7 +201,13 @@ int main() {
         // refuse can actually be caught.
         write_file(root / "RootMiddleware.prx", "not-a-real-image");
         write_file(root / "libSceAppContent.prx", "not-a-real-image");
-        write_file(root / "libc.prx", "not-a-real-image");
+        // libkernel.prx, NOT libc.prx. `sce_module/libc.prx` is in boot_link_inputs' fixed list
+        // (boot_program.cpp:243) and discovery skips any basename already listed, so a root
+        // libc.prx is never discovered with OR without the platform-prefix rule -- an arm using it
+        // passes against a tree with that rule deleted, which is no arm at all. libkernel is in no
+        // fixed list, so it reaches the policy and the assertion below has teeth. Raised in the
+        // re-review of #3508.
+        write_file(root / "libkernel.prx", "not-a-real-image");
 
         const std::vector<LinkInput> in = boot_link_inputs(root.string(), /*verbose=*/false);
 
@@ -219,8 +225,10 @@ int main() {
               "a title's own middleware in the dump root IS discovered and linked");
         CHECK(!linked(in, "libSceAppContent.prx"),
               "a Sony library dropped in the dump root is NOT linked");
-        CHECK(!linked(in, "/libc.prx") || linked(in, "sce_module"),
-              "a platform module in the root is NOT linked from there");
+        // No disjunct: `|| linked(in, "sce_module")` would be an assertion with a built-in off
+        // switch, green whenever the second half happens to hold.
+        CHECK(!linked(in, "libkernel.prx"),
+              "a non-libSce platform module in the root is NOT linked");
 
         // Positive control for the arm above: the guard must not have simply disabled auto-linking.
         // Without this, deleting the whole #1609 block would also make the arm pass.

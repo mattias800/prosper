@@ -108,6 +108,9 @@ int main() {
     // handle. Distinct from the `logging` module above, which shares ONE export and provides one of
     // its own; that is two different libraries, not two builds of one (#3497).
     SynthModuleSpec subsumed_spec; subsumed_spec.exports = { kShared, kOnlyA };
+    // An import nothing satisfies, so "a skipped module contributes no stub slot" is a claim
+    // with something to be wrong about. Without it that assertion held vacuously.
+                                   subsumed_spec.imports = { kMissing };
 
     SynthModuleSpec valueless_spec; valueless_spec.exports = { kShared };
                                     valueless_spec.zero_value_exports = true;
@@ -228,12 +231,12 @@ int main() {
             CHECK(sk.nid == kShared, "duplicate build: the skip record carries the exact colliding NID");
         }
         CHECK(p.aliased_exports.empty(), "duplicate build: a skipped module contributes no aliases");
-        // NOTE: `subsumed_spec` declares no imports, so a "no stub slot" assertion here would pass
-        // against any implementation and is deliberately not made. The equivalent claim with teeth is
-        // that the skipped module contributed no EXPORTS, which is what actually distinguishes a
-        // skip from a link. Raised in review of #3508.
-        CHECK(export_of(p, kOnlyA) == kBase1 + kExp1,
-              "duplicate build: kOnlyA resolves to the module that WON, not the skipped one");
+        // `subsumed_spec` imports kMissing, which nothing exports. A LINKED module would produce a
+        // stub slot for it; a skipped one contributes nothing at all. That is the difference this
+        // asserts. (The first version of this arm checked kOnlyA's address instead, which a fully
+        // subsumed module can never win either way -- toothless. Re-review of #3508.)
+        CHECK(p.slots.empty(),
+              "duplicate build: a skipped module's unsatisfied import creates no stub slot");
     }
 
     // ---- Arm 2b: the guard does NOT fire on two DIFFERENT libraries ------------------------------

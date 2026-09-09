@@ -116,6 +116,10 @@ std::vector<std::string> module_export_nids(const Module& m);
 
 // First NID of `m` already present in `claimed` (NID -> owning module path), or an empty `nid` when
 // there is no collision. Deterministic: `m`'s symbols are scanned in file order.
+struct ExportCollision { std::string nid, owner_path; };
+ExportCollision find_export_collision(
+    const Module& m, const std::unordered_map<std::string, std::string>& claimed);
+
 // How much of a candidate module an already-linked module already exports. `subsumed()` is the test
 // that separates two BUILDS of one library (which must not both link) from two DIFFERENT libraries
 // that share a symbol (which must). See the measured corpus at measure_export_subsumption().
@@ -129,10 +133,6 @@ struct ExportSubsumption {
         return exported != 0 && (double)already_claimed / (double)exported >= kSubsumedFraction;
     }
 };
-
-struct ExportCollision { std::string nid, owner_path; };
-ExportCollision find_export_collision(
-    const Module& m, const std::unordered_map<std::string, std::string>& claimed);
 
 // Link the given modules (the first is the main executable). Applies relocations.
 // Returns false with *err on failure.

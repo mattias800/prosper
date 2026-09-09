@@ -78,9 +78,16 @@ inline constexpr const char* kSonyLibraryPrefix = "libsce";  // compared lowerca
 
 // The dump ROOT is auto-scanned wholesale (#3497), and unlike `Media/*` it is not a directory a
 // title owns by convention -- `eboot.bin` and `sce_module/` live there too. `libSce*` alone is NOT
-// sufficient cover for it: measured against the 3.20 reference, 21 of 275 system modules do not
-// carry that prefix, and `linker.cpp`'s "a cross-module export beats a stub slot" rule means a root
-// module shadowing one of those would silently displace prosper's own HLE.
+// sufficient cover for it: at least 23 system modules do not carry that prefix -- 21 of the 275 in
+// the 3.20 reference, plus `libwvoec.sprx` and `ulobjmgr.sprx`, which are on-disk firmware and absent
+// from that reference (so 23 is a floor, not a count). `linker.cpp`'s "a cross-module export beats a
+// stub slot" rule means a root module shadowing one of those would silently displace prosper's HLE.
+//
+// WHICH of them matter is the narrower and more useful question: a module can only shadow prosper
+// where prosper registers the NID, and `src/hle/` implements exactly two non-`libSce` surfaces --
+// `kernel/` and `libc/`. The list below therefore covers the whole shadowing-relevant surface, and
+// the other non-`libSce` names (`libwvoec`, `ulobjmgr`, `libcurl`, `libpng16`, …) are inert here
+// because prosper implements none of them.
 //
 // So the root additionally refuses the PLATFORM modules prosper itself provides or implements.
 // Deliberately NOT the whole non-`libSce` list: most of it is third-party (`libcurl`, `libpng16`,
@@ -92,7 +99,12 @@ inline constexpr const char* kSonyLibraryPrefix = "libsce";  // compared lowerca
 // module. What actually makes the root safe is the pair -- this list plus the extension gate plus
 // the fact that `fakelib/` and every other directory remain refused outright. A dump that ships a
 // platform replacement under a name matched by neither rule would still be linked, and the defence
-// against that is `dump_hygiene.py` and the link-time HLE ownership, not this function.
+// against that is the link-time HLE ownership, not this function.
+//
+// `dump_hygiene.py` mirrors this list (`PLATFORM_ROOT_PREFIXES` there) so the tool and the loader
+// agree on what the root refuses. They are two implementations of one rule and can drift; if you
+// add a prefix here, add it there. Before the re-review of #3508 they HAD drifted -- this header
+// cited the tool as a backstop for names `libSce*` misses, while the tool matched `libsce` only.
 inline constexpr const char* kRootRefusedPlatformPrefixes[] = {
     "libkernel",   // libkernel, libkernel_sys, libkernel_web
     "libc.",       // libc.prx exactly -- NOT libcairo/libcurl, which a title may ship
