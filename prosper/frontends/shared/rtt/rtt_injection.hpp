@@ -56,6 +56,8 @@ inline void inject_scaled_rtt_rows(uint8_t* dst, uint32_t dst_w, uint32_t dst_h,
     // millions of tiny variable-sized memcpy calls and integer divisions in the old per-texel loop.
     const uint32_t integer_x_scale = dst_w >= src_w && dst_w % src_w == 0
         ? dst_w / src_w : 0;
+    const uint32_t step = src_w == dst_w || integer_x_scale ? 0 : src_w / dst_w;
+    const uint32_t remainder = src_w == dst_w || integer_x_scale ? 0 : src_w % dst_w;
     for (uint32_t y = 0; y < dst_h; ++y) {
         const uint32_t sy = static_cast<uint32_t>(static_cast<uint64_t>(y) * src_h / dst_h);
         uint8_t* dst_row = dst + static_cast<size_t>(y) * dst_row_bytes;
@@ -77,15 +79,21 @@ inline void inject_scaled_rtt_rows(uint8_t* dst, uint32_t dst_w, uint32_t dst_h,
                                 pixel, BytesPerPixel);
             }
         } else {
-            // Precomputing x offsets once would require a scratch allocation. The uncommon
-            // non-integer path instead uses a division per output texel, but still specializes the
-            // copy width so the compiler emits a scalar load/store rather than a libc call.
+            // At each copy, sx=floor(x*src_w/dst_w) and error=(x*src_w)%dst_w.
+            // Carrying the remainder once advances exactly, without a per-pixel divide or scratch
+            // allocation. The sum stays below 2*dst_w, so use 64 bits even for 32-bit dimensions.
+            uint32_t sx = 0;
+            uint64_t error = 0;
             for (uint32_t x = 0; x < dst_w; ++x) {
-                const uint32_t sx = static_cast<uint32_t>(
-                    static_cast<uint64_t>(x) * src_w / dst_w);
                 std::memcpy(dst_row + static_cast<size_t>(x) * BytesPerPixel,
                             src_row + static_cast<size_t>(sx) * BytesPerPixel,
                             BytesPerPixel);
+                sx += step;
+                error += remainder;
+                if (error >= dst_w) {
+                    error -= dst_w;
+                    ++sx;
+                }
             }
         }
         previous_sy = sy;
