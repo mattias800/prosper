@@ -2952,12 +2952,16 @@ inline void destroy_render_host_buffer(VkDevice device, RenderHostBuffer& buffer
     buffer = {};
 }
 
+inline VkDeviceSize render_host_buffer_capacity(VkDeviceSize bytes) {
+    VkDeviceSize capacity = 4;
+    while (capacity < bytes && capacity <= UINT64_MAX / 2) capacity *= 2;
+    return capacity < bytes ? bytes : capacity;
+}
+
 inline RenderHostBuffer acquire_render_host_buffer(const RenderVkCtx& ctx,
                                                    VkDeviceSize bytes) {
     if (!bytes) return {};
-    VkDeviceSize capacity = 4;
-    while (capacity < bytes && capacity <= UINT64_MAX / 2) capacity *= 2;
-    if (capacity < bytes) capacity = bytes;
+    const VkDeviceSize capacity = render_host_buffer_capacity(bytes);
     RenderHostBufferPool& pool = render_host_buffer_pool();
     auto found = pool.available.find(capacity);
     if (found != pool.available.end() && !found->second.empty()) {
@@ -3066,9 +3070,15 @@ struct ResidentRenderBuffer {
     ResidentRenderBuffer& operator=(const ResidentRenderBuffer&) = delete;
     VkDevice device = VK_NULL_HANDLE;
     RenderHostBuffer storage;
+    // HOST_COHERENT does not imply HOST_CACHED. Reading the upload mapping for equality can
+    // dominate a frame on discrete and integrated GPUs. Compare ordinary CPU memory instead;
+    // the immutable snapshot is also the exact source used to populate the device allocation.
+    std::unique_ptr<std::byte[]> snapshot;
+    VkDeviceSize snapshot_bytes = 0;
+    VkDeviceSize retained_bytes() const { return storage.allocation_bytes + snapshot_bytes; }
     std::shared_ptr<std::atomic<uint64_t>> charged_bytes;
     ~ResidentRenderBuffer() {
-        const auto bytes = storage.allocation_bytes;
+        const auto bytes = retained_bytes();
         destroy_render_host_buffer(device, storage);
         if (charged_bytes) charged_bytes->fetch_sub(bytes, std::memory_order_relaxed);
     }
@@ -3104,7 +3114,7 @@ struct ResidentRenderBufferCache {
         auto entry = found->second;
         if (entry->owner->device == device) {
             stats.buffer_resident_compared_bytes += key.bytes;
-            if (std::memcmp(entry->owner->storage.mapped, source, key.bytes) == 0) {
+            if (std::memcmp(entry->owner->snapshot.get(), source, key.bytes) == 0) {
                 lru.splice(lru.end(), lru, entry);
                 ++stats.buffer_resident_hits;
                 stats.buffer_resident_reused_bytes += key.bytes;
@@ -3113,7 +3123,8 @@ struct ResidentRenderBufferCache {
             if (entry->owner.use_count() == 1) {
                 // No recorded/in-flight use remains: refresh the complete logical span without
                 // reallocating dynamic buffers every call. The next upload acquires a new pin.
-                std::memcpy(entry->owner->storage.mapped, source, key.bytes);
+                std::memcpy(entry->owner->snapshot.get(), source, key.bytes);
+                std::memcpy(entry->owner->storage.mapped, entry->owner->snapshot.get(), key.bytes);
                 stats.buffer_upload_bytes += key.bytes;
                 stats.buffer_resident_refreshed_bytes += key.bytes;
                 lru.splice(lru.end(), lru, entry);
@@ -3125,47 +3136,58 @@ struct ResidentRenderBufferCache {
         index.erase(found);
         return {};
     }
-    bool can_reclaim(VkDeviceSize bytes, VkDeviceSize limit) const {
-        if (bytes > limit) return false;
-        const auto charged = charged_bytes->load(std::memory_order_relaxed);
-        if (charged <= limit - bytes && index.size() < 4096) return true;
-        // Prove enough idle storage exists before evicting anything. Pending owners whose keys
-        // were replaced remain charged but cannot be reclaimed by scanning this index.
-        uint64_t reclaimable = 0;
-        size_t idle_entries = 0;
-        for (const auto& entry : lru) {
-            if (entry.owner.use_count() != 1) continue;
-            reclaimable += entry.owner->storage.allocation_bytes;
-            ++idle_entries;
-        }
-        return charged - reclaimable <= limit - bytes &&
-               (index.size() < 4096 || idle_entries);
-    }
-    bool reclaim(VkDeviceSize bytes, VkDeviceSize limit) {
-        if (!can_reclaim(bytes, limit)) return false;
-        for (auto it = lru.begin(); it != lru.end() &&
-             (charged_bytes->load(std::memory_order_relaxed) > limit - bytes ||
-              index.size() >= 4096); ) {
-            if (it->owner.use_count() != 1) { ++it; continue; }
-            index.erase(it->key);
-            it = lru.erase(it);
-        }
-        return charged_bytes->load(std::memory_order_relaxed) <= limit - bytes &&
-               index.size() < 4096;
-    }
     Owner admit(const RenderVkCtx& ctx, ResidentRenderBufferKey key, const void* source,
                 VkDeviceSize limit, BackendResourceReuseStats& stats) {
-        if (index.contains(key) || !can_reclaim(key.bytes, limit)) return {};
+        if (index.contains(key) || key.bytes > limit / 2) return {};
+        const auto capacity = render_host_buffer_capacity(key.bytes);
+        if (capacity > limit - key.bytes) return {};
+        const auto minimum_charge = capacity + key.bytes;
+        const auto charged = charged_bytes->load(std::memory_order_relaxed);
+        if (charged > limit) return {};
+        if (charged > limit - minimum_charge || index.size() >= 4096) {
+            // A streaming working set can exceed residency without changing its allocation
+            // shapes. Rekey an idle exact-size upload instead of freeing it and allocating the
+            // same Vulkan buffer again. Pending versions remain ineligible and retain their charge.
+            size_t inspected = 0;
+            for (auto entry = lru.begin(); entry != lru.end() && inspected < 32;
+                 ++entry, ++inspected) {
+                if (entry->key.bytes != key.bytes || entry->owner.use_count() != 1 ||
+                    entry->owner->device != ctx.dev ||
+                    entry->owner->snapshot_bytes != key.bytes)
+                    continue;
+                // The node and list element already exist; replacing one key leaves the map's
+                // population unchanged and needs no rehash. Hash/equality are scalar operations.
+                auto node = index.extract(index.find(entry->key));
+                node.key() = key;
+                index.insert(std::move(node));
+                entry->key = key;
+                std::memcpy(entry->owner->snapshot.get(), source, key.bytes);
+                std::memcpy(entry->owner->storage.mapped, entry->owner->snapshot.get(), key.bytes);
+                stats.buffer_upload_bytes += key.bytes;
+                stats.buffer_resident_admitted_bytes += key.bytes;
+                lru.splice(lru.end(), lru, entry);
+                return entry->owner;
+            }
+            // Do not churn unrelated allocations or repeatedly scan a full pinned cache. A miss
+            // outside this bounded compatible set keeps the existing ordinary upload route.
+            return {};
+        }
         Owner owner;
-        try { owner = std::make_shared<ResidentRenderBuffer>(); }
+        try {
+            owner = std::make_shared<ResidentRenderBuffer>();
+            owner->snapshot = std::make_unique_for_overwrite<std::byte[]>(key.bytes);
+            owner->snapshot_bytes = key.bytes;
+        }
         catch (const std::bad_alloc&) { return {}; }
         owner->device = ctx.dev;
         owner->storage = acquire_render_host_buffer(ctx, key.bytes);
-        if (!owner->storage.mapped || !reclaim(owner->storage.allocation_bytes, limit))
+        if (!owner->storage.mapped || owner->retained_bytes() > limit ||
+            charged_bytes->load(std::memory_order_relaxed) > limit - owner->retained_bytes())
             return {};
         owner->charged_bytes = charged_bytes;
-        charged_bytes->fetch_add(owner->storage.allocation_bytes, std::memory_order_relaxed);
-        std::memcpy(owner->storage.mapped, source, key.bytes);
+        charged_bytes->fetch_add(owner->retained_bytes(), std::memory_order_relaxed);
+        std::memcpy(owner->snapshot.get(), source, key.bytes);
+        std::memcpy(owner->storage.mapped, owner->snapshot.get(), key.bytes);
         stats.buffer_upload_bytes += key.bytes;
         try {
             lru.push_back({key, owner});

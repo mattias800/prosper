@@ -83,10 +83,11 @@ diverge. Fixtures that only one test uses belong beside that test, not here.
 ## Retained buffer inputs
 
 Cross-call storage uploads own whole Vulkan buffers; they never retain a guest pointer or an arena
-slice. Reuse compares the complete current materialized input. Refresh in place is permitted only
+slice. Reuse compares the complete current materialized input against an owned CPU snapshot, never the
+potentially uncached Vulkan mapping. The snapshot also supplies the exact device upload bytes. Refresh in place is permitted only
 when the cache is the sole owner; recorded and in-flight passes hold shared completion leases,
 including the existing indeterminate-completion retention path. The separate residency cap counts
-allocation bytes until the final owner releases them, including detached older versions. It adds to
+Vulkan allocation and CPU snapshot bytes until the final owner releases them, including detached older versions. It adds to
 the existing free host-buffer pool budget.
 
 Admission currently requires every final shader in the pass to have complete buffer-write
@@ -94,3 +95,10 @@ provenance and no storage-buffer writer or atomic access. This whole-pass rule p
 within-call alias memo: a writable later draw cannot reach retained input through a previous binding.
 Small inputs, descriptor-table entries, GDS, zero identities and diagnostic mutation retain their
 existing routes. Reflection observes writes; absence of a writable flag alone is not proof.
+
+At capacity, new identities may rekey one of at most 32 old entries only when its device and exact
+size match and no submission owns it. Otherwise the ordinary upload route handles the miss;
+known capacity pressure does not evict unrelated entries or allocate new storage. Preflight uses
+the pool capacity class plus snapshot size; actual driver allocation requirements are checked
+after allocation and may still decline admission. Admitted-byte counters mean
+new key payloads, including rekeyed allocations, and are not Vulkan allocation-byte counters.

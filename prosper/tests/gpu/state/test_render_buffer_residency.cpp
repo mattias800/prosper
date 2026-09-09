@@ -215,6 +215,21 @@ int main(int argc, char** argv) {
             completed_buffer=found->second->owner->storage.buffer;
             CHECK(found->second->owner.use_count()==1,
                   "completed upload has no outstanding submission owner before refresh");
+            CHECK(found->second->owner->snapshot_bytes == Bytes &&
+                      found->second->owner->retained_bytes() ==
+                          found->second->owner->storage.allocation_bytes + Bytes,
+                  "residency budget includes the exact CPU comparison snapshot and Vulkan allocation");
+            // No queued commands use this completed upload. Make its mapping unreadable to this
+            // lookup without changing the real Vulkan allocation: an equal hit must only inspect
+            // ordinary CPU snapshot memory. A mapped-memory comparison would fault here.
+            auto& owner = found->second->owner;
+            void* mapping = owner->storage.mapped;
+            owner->storage.mapped = nullptr;
+            BackendResourceReuseStats observed;
+            auto hit = cache.find(owner->device, {Identity,Bytes}, current.data(), observed);
+            owner->storage.mapped = mapping;
+            CHECK(hit == owner && observed.buffer_resident_hits == 1,
+                  "equal lookup does not read the potentially uncached Vulkan mapping");
         }
     }
     for (auto first:Quads) {
@@ -265,7 +280,7 @@ int main(int argc, char** argv) {
         auto found=cache.index.find({PendingIdentity,Bytes});
         CHECK(found!=cache.index.end(),"pending source has a resident allocation");
         if (found!=cache.index.end()) {
-            old=found->second->owner; old_charge=found->second->owner->storage.allocation_bytes;
+            old=found->second->owner; old_charge=found->second->owner->retained_bytes();
         }
     }
     quad(pending,Quads.back(),false);
@@ -283,7 +298,10 @@ int main(int argc, char** argv) {
         std::weak_ptr<ResidentRenderBuffer> idle_owner;
         if (idle!=cache.index.end()) idle_owner=idle->second->owner;
         const auto before=cache.charged_bytes->load();
-        CHECK(!cache.reclaim(1,old_charge),"pinned versions cannot be reclaimed to fake available budget");
+        BackendResourceReuseStats declined;
+        CHECK(!cache.admit(render_vk_ctx(), {PendingIdentity+100,Bytes}, current.data(),
+                           old_charge, declined),
+              "pinned versions cannot be reclaimed to fake available budget");
         CHECK(!idle_owner.expired() && cache.index.find({Identity,Bytes})!=cache.index.end() &&
                   cache.charged_bytes->load()==before,
               "some idle bytes cannot satisfy admission: preserve that unrelated cache entry");
@@ -335,7 +353,7 @@ int main(int argc, char** argv) {
         const auto found=cache.index.find({DiscardIdentity,Bytes});
         CHECK(found!=cache.index.end(),"discard control records a resident source");
         if (found!=cache.index.end()) {
-            detached=found->second->owner; detached_charge=found->second->owner->storage.allocation_bytes;
+            detached=found->second->owner; detached_charge=found->second->owner->retained_bytes();
         }
     }
     quad(discard_source,0,false);
@@ -422,6 +440,74 @@ int main(int argc, char** argv) {
         temporary.reset();
         CHECK(observed.expired(),"proof memo does not keep an otherwise dead shader owner alive");
     }
+    // A working set larger than residency must not allocate/free Vulkan objects on each scan.
+    // All previous submissions completed. Exercise pressured rekeying in the actual global cache,
+    // then use a real draw to prove its replacement mapping contains the new snapshot bytes.
+    {
+        BackendPersistentResourceGuard guard;
+        cache.index.clear();
+        cache.lru.clear();
+        CHECK(cache.charged_bytes->load() == 0, "completed residency releases both memory charges");
+    }
+    constexpr uint64_t RekeyIdentity = 0x348900100ull;
+    CHECK(f.render(current, RekeyIdentity) == green, "rekey control starts from a real green upload");
+    auto replacement = current;
+    quad(replacement, 0, false);
+    {
+        BackendPersistentResourceGuard guard;
+        const auto before = cache.charged_bytes->load();
+        const auto found = cache.index.find({RekeyIdentity, Bytes});
+        CHECK(found != cache.index.end(), "rekey control has one retained allocation");
+        if (found != cache.index.end()) {
+            const VkBuffer original_buffer = found->second->owner->storage.buffer;
+            auto pin = found->second->owner;
+            BackendResourceReuseStats stats;
+            CHECK(!cache.admit(ctx, {RekeyIdentity+1,Bytes}, replacement.data(), before, stats),
+                  "full pinned cache declines replacement without overwriting its recorded owner");
+            pin.reset();
+            auto incompatible = current; incompatible.resize(Words*2);
+            CHECK(!cache.admit(ctx, {RekeyIdentity+2,Bytes*2}, incompatible.data(), before, stats) &&
+                      cache.index.contains({RekeyIdentity,Bytes}) &&
+                      cache.charged_bytes->load() == before,
+                  "full incompatible cache declines without eviction or extra allocation");
+            auto reused = cache.admit(ctx, {RekeyIdentity+1,Bytes}, replacement.data(), before, stats);
+            CHECK(reused && reused->storage.buffer == original_buffer &&
+                      cache.charged_bytes->load() == before &&
+                      !cache.index.contains({RekeyIdentity,Bytes}) &&
+                      cache.index.contains({RekeyIdentity+1,Bytes}),
+                  "pressured equal-size admission rekeys an idle Vulkan allocation at constant charge");
+            CHECK(reused && stats.buffer_resident_admitted_bytes == Bytes &&
+                      stats.buffer_resident_hits == 0 && stats.buffer_upload_bytes == Bytes,
+                  "rekey is a new copied admission, never an unchanged source hit");
+        }
+    }
+    CHECK(solid(f.render(replacement, RekeyIdentity+1), false),
+          "actual rekeyed GPU upload draws the changed blue result rather than stale green geometry");
+    // A non-power-of-two payload needs a rounded Vulkan allocation AND an exact CPU snapshot.
+    // 13 KiB spare fits twice a 6 KiB payload, but cannot fit its 8+6 KiB resident allocation.
+    auto rounded_source = current;
+    rounded_source.resize(1536);
+    constexpr VkDeviceSize RoundedBytes = 6144;
+    CHECK(f.render(rounded_source, RekeyIdentity+3) == green,
+          "non-power-of-two control uploads real six-KiB vertex data");
+    quad(rounded_source,0,false);
+    {
+        BackendPersistentResourceGuard guard;
+        const auto before = cache.charged_bytes->load();
+        const auto found = cache.index.find({RekeyIdentity+3,RoundedBytes});
+        CHECK(found != cache.index.end(), "rounded control owns the six-KiB upload");
+        if (found != cache.index.end()) {
+            const auto original_buffer = found->second->owner->storage.buffer;
+            BackendResourceReuseStats stats;
+            auto rekeyed = cache.admit(ctx, {RekeyIdentity+4,RoundedBytes}, rounded_source.data(),
+                                      before + 13*1024, stats);
+            CHECK(rekeyed && rekeyed->storage.buffer == original_buffer &&
+                      cache.charged_bytes->load() == before,
+                  "rounded allocation pressure rekeys instead of allocating and rejecting repeatedly");
+        }
+    }
+    CHECK(solid(f.render(rounded_source, RekeyIdentity+4),false),
+          "rounded rekey uploads the changed bytes to the actual GPU draw");
     disabled(false);
     std::printf("== %s (%d failures) ==\n",failures?"FAIL":"PASS",failures);
     return failures?1:0;

@@ -3507,6 +3507,14 @@ if(TARGET prosper_core AND TARGET Vulkan::Vulkan)
 endif()
 
 if(TARGET prosper_live_renderer AND TARGET Vulkan::Vulkan)
+  add_executable(test_render_buffer_capture tests/shared/live/test_render_buffer_capture.cpp)
+  target_include_directories(test_render_buffer_capture PRIVATE frontends)
+  target_link_libraries(test_render_buffer_capture PRIVATE prosper_live_renderer
+                                                         prosper_performance_capture Vulkan::Vulkan)
+  add_test(NAME render_buffer_capture COMMAND test_render_buffer_capture)
+  set_tests_properties(render_buffer_capture PROPERTIES
+    ENVIRONMENT "PROSPER_NO_LIVE_PERSISTENT_COLOR_TARGETS=1" TIMEOUT 120)
+
   add_executable(test_gpu_retile tests/gpu/execute/test_gpu_retile.cpp)
   target_include_directories(test_gpu_retile PRIVATE tests frontends)
   target_link_libraries(test_gpu_retile PRIVATE prosper_live_renderer Vulkan::Vulkan)
