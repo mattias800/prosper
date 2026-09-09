@@ -24,6 +24,7 @@
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <new>
 #include <set>
 #include <thread>
 #include <vector>
@@ -1812,7 +1813,16 @@ HLE(audio2_ctx_destroy) {
     // Keep diagnostic snapshots off the guest thread's stack, including when disabled. Reserve
     // once before taking the sink/state locks; no allocation is needed while retiring ports.
     std::vector<A2LifecyclePort> retired;
-    if (lifecycle) retired.reserve(kA2MaxPorts);
+    bool snapshots_unavailable = false;
+    if (lifecycle) {
+        try {
+            retired.reserve(kA2MaxPorts);
+        } catch (const std::bad_alloc&) {
+            // Diagnostic memory pressure must not prevent guest state and sink teardown.
+            snapshots_unavailable = true;
+        }
+    }
+    size_t implicit_ports = 0;
     std::unique_lock<std::mutex> sink_lk(g_a2_sink_mx[context_slot]);
     bool close_sink = false;
     uint64_t cleared_ns = 0;
@@ -1826,7 +1836,9 @@ HLE(audio2_ctx_destroy) {
         for (uint32_t i = 0; i < kA2MaxPorts; ++i) {
             auto& port = g_a2_port_state[i];
             if (port.used && port.context == a0) {
-                if (lifecycle) retired.push_back(audio_lifecycle_port(port, i, cleared_ns));
+                ++implicit_ports;
+                if (lifecycle && !snapshots_unavailable)
+                    retired.push_back(audio_lifecycle_port(port, i, cleared_ns));
                 audio2_clear_slot(port);
             }
         }
@@ -1839,10 +1851,11 @@ HLE(audio2_ctx_destroy) {
     if (lifecycle) {
         std::fprintf(stderr, "[audio-lifecycle-context] event=destroy context=0x%llx "
             "generation=%u sink=%u entered_ns=%llu cleared_ns=%llu close_return_ns=%llu "
-            "sink_was_open=%u implicit_ports=%zu\n", (unsigned long long)a0,
+            "sink_was_open=%u implicit_ports=%zu snapshots_unavailable=%u\n", (unsigned long long)a0,
             uint32_t(a0 >> 16), unsigned(kA2SinkPortBase + context_slot),
             (unsigned long long)entered_ns, (unsigned long long)cleared_ns,
-            (unsigned long long)closed_ns, unsigned(close_sink), retired.size());
+            (unsigned long long)closed_ns, unsigned(close_sink), implicit_ports,
+            unsigned(snapshots_unavailable));
         for (const auto& port : retired) audio_lifecycle_emit(port, "context-destroy");
     }
     return 0;

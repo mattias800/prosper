@@ -14,11 +14,36 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
+#include <new>
 #include <thread>
 #include <vector>
+
+// Confined fixture injection: arm only around one already-resolved HLE handler on this thread.
+// Other threads and all ordinary fixture operations retain normal allocation behavior. This
+// observes the real diagnostic vector reserve without a production test hook or mirrored size.
+namespace {
+thread_local bool fail_next_audio_allocation = false;
+thread_local size_t failed_audio_allocation_bytes = 0;
+}
+void* operator new(size_t bytes) {
+    if (fail_next_audio_allocation) {
+        fail_next_audio_allocation = false;
+        failed_audio_allocation_bytes = bytes;
+        throw std::bad_alloc();
+    }
+    void* p = std::malloc(bytes ? bytes : 1);
+    if (!p) throw std::bad_alloc();
+    return p;
+}
+void* operator new[](size_t bytes) { return ::operator new(bytes); }
+void operator delete(void* p) noexcept { std::free(p); }
+void operator delete(void* p, size_t) noexcept { std::free(p); }
+void operator delete[](void* p) noexcept { std::free(p); }
+void operator delete[](void* p, size_t) noexcept { std::free(p); }
 
 using namespace prosper;
 
@@ -550,7 +575,7 @@ static int test_flow_publication() {
 
 // The Python driver checks actual lifecycle records in enabled/disabled processes. PCM remains
 // independently checked here: scratch reuse after publication must not alter the supplied grain.
-static int test_lifecycle_publication() {
+static int test_lifecycle_publication(bool fail_reserve = false) {
     audio_reset();
     CapturingSink sink;
     audio_set_sink(&sink);
@@ -595,7 +620,33 @@ static int test_lifecycle_publication() {
     param.type = 1; // implicit auxiliary retirement must remain distinguishable from MAIN
     CHECK(call("sceAudioOut2PortCreate", context, PTR(&param), PTR(&aux)) == 0);
     CHECK(call("sceAudioOut2PortSetAttributes", aux, PTR(&attr), 1) == 0);
-    CHECK(call("sceAudioOut2ContextDestroy", context) == 0);
+    if (fail_reserve) {
+        // Avoid lookup/sink-recording allocations in the fault scope. The first allocation is
+        // the production lifecycle snapshot reserve; teardown itself must still close this sink.
+        HleFn destroy = FN("sceAudioOut2ContextDestroy");
+        CHECK(destroy != nullptr);
+        sink.closes.reserve(1);
+        failed_audio_allocation_bytes = 0;
+        fail_next_audio_allocation = true;
+        bool threw = false;
+        int64_t result = -1;
+        try {
+            if (destroy) result = (int64_t)destroy(context, 0, 0, 0, 0, 0);
+        } catch (const std::bad_alloc&) {
+            threw = true;
+        }
+        const bool consumed = !fail_next_audio_allocation;
+        fail_next_audio_allocation = false;
+        CHECK(consumed && failed_audio_allocation_bytes > 0);
+        CHECK(!threw && result == 0);
+        // Old uncaught-reserve code fails above; clean up so later ownership checks still run.
+        if (threw) CHECK(call("sceAudioOut2ContextDestroy", context) == 0);
+        CHECK(call("sceAudioOut2PortDestroy", new_port) < 0);
+        CHECK(call("sceAudioOut2PortDestroy", aux) < 0);
+        CHECK(call("sceAudioOut2ContextDestroy", context) < 0);
+    } else {
+        CHECK(call("sceAudioOut2ContextDestroy", context) == 0);
+    }
     CHECK(sink.closes.size() == 1 && sink.closes[0] == 17);
     CHECK(call("sceAudioOut2ContextCreate", PTR(context_param), 0, 0, PTR(&next_context)) == 0);
     CHECK((next_context & 0xffff) == (context & 0xffff) && next_context != context);
@@ -604,9 +655,9 @@ static int test_lifecycle_publication() {
     CHECK(call("sceAudioOut2ContextDestroy", next_context) == 0);
     CHECK(sink.closes.size() == 1 && sink.outs.size() == 2); // diagnostics cannot synthesize output
     std::printf("[lifecycle-fixture] context=0x%llx old=0x%llx new=0x%llx aux=0x%llx "
-                "next_context=0x%llx next_port=0x%llx\n", (unsigned long long)context,
+                "next_context=0x%llx next_port=0x%llx reserve_fault=%u\n", (unsigned long long)context,
                 (unsigned long long)old_port, (unsigned long long)new_port, (unsigned long long)aux,
-                (unsigned long long)next_context, (unsigned long long)next_port);
+                (unsigned long long)next_context, (unsigned long long)next_port, unsigned(fail_reserve));
     audio_reset();
     return fails ? 1 : 0;
 }
@@ -618,6 +669,8 @@ int main(int argc, char** argv) {
         return test_flow_publication();
     if (argc == 2 && std::strcmp(argv[1], "--lifecycle-publication") == 0)
         return test_lifecycle_publication();
+    if (argc == 2 && std::strcmp(argv[1], "--lifecycle-publication-failalloc") == 0)
+        return test_lifecycle_publication(true);
     test_signal_stats();
     test_stereo_downmix();
     test_stamped_grain_verdicts();
