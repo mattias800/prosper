@@ -2,6 +2,7 @@
 #pragma once
 #include "gpu/recompiler/spirv_builder.hpp"
 #include "gpu/texture/tile.hpp"
+#include "gpu/resources/shader_resources.hpp"
 #include "gpu/execute/host_read_barrier.hpp"
 #include <vulkan/vulkan.h>
 #include <array>
@@ -20,11 +21,27 @@ inline std::atomic<bool>& gpu_retile_poison_output_for_test() {
     return enabled;
 }
 
+// Descriptor-only admission for the paired array path. Dimensionality, selected-layer offset,
+// exact backend representation and byte/stride bounds are checked by the caller.
+// Keep this separate from layout math: a valid base-level fallback does not prove
+// that the descriptor declares only that level or sample.
+inline bool gpu_retile_paired16_descriptor_supported(const prosper::gpu::ShaderResource& resource,
+                                                     uint32_t bpe, uint32_t materialized_mip_levels) {
+    return !(bpe != 2 || resource.sample_count != 1 || resource.declared_mip_levels != 1 ||
+        materialized_mip_levels != 1 || resource.mip_chain_base_level || resource.mip_chain_max_level ||
+        resource.linear_row_pitch_bytes || resource.mip_tail_offset || resource.mip_tail_bytes ||
+        resource.mip_tail_x || resource.mip_tail_y || resource.compression_enabled ||
+        resource.write_compress_enabled || resource.metadata_addr || resource.dcc_metadata_host_data ||
+        (resource.mip_chain_element_width && resource.mip_chain_element_width != resource.width) ||
+        (resource.mip_chain_element_height && resource.mip_chain_element_height != resource.height) ||
+        (resource.mip_chain_bytes_per_block && resource.mip_chain_bytes_per_block != bpe));
+}
+
 struct GpuRetileParameters {
     std::array<uint32_t, 26> words{};
     uint64_t linear_bytes = 0, tiled_bytes = 0;
     uint32_t groups_x = 0, groups_y = 0, groups_z = 1;
-    bool volume = false;
+    prosper::gpu::RetileShaderKind kind = prosper::gpu::RetileShaderKind::Words2D;
 
     bool initialize(uint32_t width, uint32_t height, uint32_t bpe, uint32_t mode,
                     const VkPhysicalDeviceLimits& limits) {
@@ -61,6 +78,38 @@ struct GpuRetileParameters {
         groups_y = uint32_t(padded_height);
         return true;
     }
+    bool initialize_paired16_array(uint32_t width, uint32_t height, uint32_t layers,
+                                   uint32_t mode, const VkPhysicalDeviceLimits& limits) {
+        *this = {};
+        std::array<uint32_t, 16> equation{};
+        uint32_t bw = 0, bh = 0;
+        if (!width || (width & 1) || !height || !layers ||
+            !prosper::gpu::tile64_paired16_equation(mode, equation, bw, bh)) return false;
+        const uint64_t row_words = width / 2;
+        const uint64_t bx = (uint64_t(width) + bw - 1) / bw;
+        const uint64_t by = (uint64_t(height) + bh - 1) / bh;
+        // Bound each product before multiplication, including every array layer.
+        // Conservative byte bounds also keep all shader word indices representable.
+        if (row_words > UINT32_MAX / 4u / uint64_t(height) ||
+            row_words * height > UINT32_MAX / 4u / uint64_t(layers) ||
+            bx > UINT32_MAX / 65536u / by ||
+            bx * by > UINT32_MAX / 65536u / uint64_t(layers)) return false;
+        const uint64_t linear_words = row_words * height, tiled_words = bx * by * 16384;
+        linear_bytes = linear_words * layers * 4; tiled_bytes = tiled_words * layers * 4;
+        const uint64_t gx = (bx * (bw / 2) + 127) / 128, gy = by * bh;
+        if (linear_bytes > limits.maxStorageBufferRange || tiled_bytes > limits.maxStorageBufferRange ||
+            limits.maxComputeWorkGroupSize[0] < 128 || limits.maxComputeWorkGroupInvocations < 128 ||
+            limits.maxPushConstantsSize < sizeof(words) || gx > limits.maxComputeWorkGroupCount[0] ||
+            gy > limits.maxComputeWorkGroupCount[1] || layers > limits.maxComputeWorkGroupCount[2])
+            return false;
+        words[0] = width; words[1] = height;
+        words[3] = std::countr_zero(bw); words[4] = std::countr_zero(bh); words[5] = uint32_t(bx);
+        std::copy(equation.begin(), equation.end(), words.begin() + 6);
+        words[22] = layers; words[23] = uint32_t(linear_words); words[24] = uint32_t(tiled_words);
+        groups_x = uint32_t(gx); groups_y = uint32_t(gy); groups_z = layers;
+        kind = prosper::gpu::RetileShaderKind::Paired16Array;
+        return true;
+    }
     bool initialize_volume(uint32_t width, uint32_t height, uint32_t depth,
                            uint32_t bpe, uint32_t mode, const VkPhysicalDeviceLimits& limits) {
         *this = {};
@@ -95,7 +144,7 @@ struct GpuRetileParameters {
         words[22] = depth; words[23] = std::countr_zero(bd); words[24] = uint32_t(by);
         words[25] = bits - 2; // Word offset of a whole block.
         groups_x = uint32_t(gx); groups_y = uint32_t(gy); groups_z = uint32_t(gz);
-        volume = true;
+        kind = prosper::gpu::RetileShaderKind::Volume3D;
         return true;
     }
 };
@@ -115,7 +164,8 @@ struct GpuRetilePipeline {
         if (descriptors) vkDestroyDescriptorSetLayout(device, descriptors, nullptr);
         pipeline = VK_NULL_HANDLE; layout = VK_NULL_HANDLE; descriptors = VK_NULL_HANDLE;
     }
-    VkResult initialize(VkDevice dev, VkPipelineCache cache, bool volume = false) {
+    VkResult initialize(VkDevice dev, VkPipelineCache cache,
+                        prosper::gpu::RetileShaderKind kind = prosper::gpu::RetileShaderKind::Words2D) {
         if (attempted) return setup_result;
         attempted = true; device = dev;
         const VkDescriptorSetLayoutBinding bindings[]{
@@ -131,7 +181,7 @@ struct GpuRetilePipeline {
         lci.pushConstantRangeCount = 1; lci.pPushConstantRanges = &push;
         setup_result = vkCreatePipelineLayout(device, &lci, nullptr, &layout);
         if (setup_result != VK_SUCCESS) { destroy(); return setup_result; }
-        const auto words = prosper::gpu::build_compute_retile_words(volume);
+        const auto words = prosper::gpu::build_compute_retile_words(kind);
         VkShaderModuleCreateInfo sci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         sci.codeSize = words.size() * sizeof(uint32_t); sci.pCode = words.data();
         VkShaderModule shader = VK_NULL_HANDLE;

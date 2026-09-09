@@ -3517,10 +3517,20 @@ if(TARGET prosper_live_renderer AND TARGET Vulkan::Vulkan)
   add_test(NAME gpu_retile_volume_cpu COMMAND test_gpu_retile --volume-cpu)
   add_test(NAME gpu_retile_volume_allocation_fallback COMMAND test_gpu_retile --volume-alloc-oom)
   add_test(NAME gpu_retile_volume_mapping_loss COMMAND test_gpu_retile --volume-map-loss)
+  add_test(NAME gpu_retile_array16 COMMAND test_gpu_retile --array16)
+  add_test(NAME gpu_retile_array16_shape_refusal COMMAND test_gpu_retile --array16-shape-refusal)
+  add_test(NAME gpu_retile_array16_cpu COMMAND test_gpu_retile --array16-cpu)
+  add_test(NAME gpu_retile_array16_allocation_fallback COMMAND test_gpu_retile --array16-alloc-oom)
+  add_test(NAME gpu_retile_array16_mapping_fallback COMMAND test_gpu_retile --array16-map-oom)
+  add_test(NAME gpu_retile_array16_allocation_loss COMMAND test_gpu_retile --array16-alloc-loss)
+  add_test(NAME gpu_retile_array16_mapping_loss COMMAND test_gpu_retile --array16-map-loss)
+  set_tests_properties(gpu_retile_array16 gpu_retile_array16_cpu gpu_retile_array16_shape_refusal
+      gpu_retile_array16_allocation_fallback gpu_retile_array16_mapping_fallback
+      gpu_retile_array16_allocation_loss gpu_retile_array16_mapping_loss PROPERTIES TIMEOUT 120)
   set_tests_properties(gpu_retile_mixed gpu_retile_volume gpu_retile_volume_cpu
                        gpu_retile_volume_allocation_fallback gpu_retile_volume_mapping_loss
                        PROPERTIES TIMEOUT 120)
-  set_tests_properties(gpu_retile_cpu gpu_retile_volume_cpu
+  set_tests_properties(gpu_retile_cpu gpu_retile_volume_cpu gpu_retile_array16_cpu
                        PROPERTIES ENVIRONMENT "PROSPER_NO_GPU_RETILE=1")
   add_executable(test_gpu_detile_render tests/gpu/execute/test_gpu_detile_render.cpp)
   target_include_directories(test_gpu_detile_render PRIVATE tests frontends)

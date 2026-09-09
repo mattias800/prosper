@@ -16,7 +16,12 @@ found Vulkan.
   memory, dispatched, and written back into guest memory synchronously.
 - `gpu_retile.hpp` — exact 2D and standard 3D storage-image writeback layout conversion in the
   guest compute submission. 3D SW_4KB_S/SW_64KB_S uses a separate pipeline variant and checks
-  padded XYZ dispatch limits; unsupported layouts or sub-word texels retain CPU conversion. Keeps linear comparison baselines separate from the tiled host-read buffer.
+  padded XYZ dispatch limits. A separate mode-24 variant packs even-x native two-byte texels
+  into ordinary 32-bit stores across independent 2D array layers; no 16-bit storage feature is
+  required. Current multi-layer codegen exposes native Uint16; RG8/R16F arrays retain raw
+  interchange storage and CPU conversion. Odd widths, ambiguous strides/mips and other sub-word
+  layouts also retain CPU conversion. Keeps linear comparison baselines separate from the tiled
+  host-read buffer.
 - `packed_rtt_conversion.hpp` — device-owned RGBA8→packed-10-bit sampled conversion.
   Records transfers and conversion into the guest compute submission; setup failures retain their
   `VkResult` so optional fallback cannot hide device loss.

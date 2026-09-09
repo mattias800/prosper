@@ -762,7 +762,9 @@ int main(int argc, char** argv) {
          "build_compute_detile_rgba16f");
     dump(dir, "builder_retile_words", build_compute_retile_words(),
          "build_compute_retile_words");
-    dump(dir, "builder_retile_volume_words", build_compute_retile_words(true),
+    dump(dir, "builder_retile_paired16_array", build_compute_retile_words(RetileShaderKind::Paired16Array),
+         "build_compute_retile_words");
+    dump(dir, "builder_retile_volume_words", build_compute_retile_words(RetileShaderKind::Volume3D),
          "build_compute_retile_words");
     dump(dir, "builder_rgba8_to_packed10", build_compute_rgba8_to_packed10(),
          "build_compute_rgba8_to_packed10");

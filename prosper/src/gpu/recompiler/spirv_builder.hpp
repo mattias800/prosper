@@ -42,6 +42,9 @@ std::vector<uint32_t> build_compute_rgba8_to_packed10();
 // blocks/row, then 16 packed x/y (or x/y/z) equation masks. Volume words 22..25:
 // depth, log2(block depth), block rows/plane, log2(words/block). Dispatch the full
 // padded rectangle/volume; out-of-image texels write zero without reading the source.
-std::vector<uint32_t> build_compute_retile_words(bool volume = false);
+// Paired16Array uses width/2 input words per row; words 22..24 are layer count,
+// linear words/layer and tiled words/layer. Each layer is an ordinary 2D tile plane.
+enum class RetileShaderKind { Words2D, Volume3D, Paired16Array };
+std::vector<uint32_t> build_compute_retile_words(RetileShaderKind kind = RetileShaderKind::Words2D);
 
 } // namespace prosper::gpu
