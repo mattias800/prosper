@@ -3045,6 +3045,39 @@ HLE(agc_driver_register_resource) {
     return 0;
 }
 
+// sceAgcDriverInitResourceRegistration(void* userMemory, size_t userMemoryBytes,
+//                                      uint32_t ownerCapacity, ...)
+// The one member of the registration family above that was never registered, and the one
+// QueryResourceRegistrationUserMemoryRequirements names as the consumer of the block it sizes.
+// Darksiders II (PPSA23806) calls it during startup; unregistered, it fell to the dispatcher's 0.
+//
+// The argument layout is LIVE-CAPTURED (PPSA23806, 2026-09-09) and cross-checked against the Query
+// call that sized the block in the SAME run, which is what pins it rather than a guess:
+//     Query(resources=100000, owners=96) -> required=0x61b500
+//     Init (a0=0x2080000000, a1=0x61b500, a2=0x60, a3=0xffffffffffffffff, ...)
+// a1 is exactly Query's answer, so a1 is the block SIZE in bytes; a2 is exactly Query's owner
+// count. The resource capacity is not passed -- it is implied by the size, and re-deriving it
+// reproduces the request: (0x61b500 - 0x100 - 96*0x20) / 0x40 = 100008 against a request of
+// 100000, whose unrounded requirement 0x61b4c0 aligns up to 0x61b500 under the same kAlignment.
+// a3 is an all-ones sentinel, not a count. a4 DIFFERED between two runs of the same route
+// (...68e3 vs ...69a3), so it is caller-indeterminate scratch and is deliberately not read -- the
+// same trap sceKernelMapFlexibleMemory's a4 carries.
+//
+// prosper keeps the registry on the HOST: the Query comment above states the guest block is never
+// consumed, and RegisterOwner/RegisterResource hand out host-side counter handles. So this call
+// validates its inputs and succeeds; it lays nothing out in guest memory, because there is no
+// guest-visible layout to honour.
+// CONFIDENCE: HIGH on a0/a1/a2 (captured, and cross-checked against Query in the same run).
+// CONFIDENCE: LOW on a3 and on the error code, which is inherited from the siblings above.
+HLE(agc_driver_init_resource_registration) {
+    if (!a0) return (uint64_t)(int64_t)(int32_t)0x80D19005u;
+    // A block too small to hold even the header the sizing call accounts for cannot be the block
+    // Query described. Nothing stricter is enforced: prosper does not lay the block out, so a
+    // tighter bound would reject valid callers on behalf of a layout it does not implement.
+    if (a1 < 0x100) return (uint64_t)(int64_t)(int32_t)0x80D19005u;
+    return 0;
+}
+
 // sceAgcCbDispatch (NID k3GhuSNmBLU) — compute dispatch.
 // The authoritative PS5 3.20 export name is sceAgcCbDispatch. Arguments a1-a3 are dispatch
 // dimensions and a4 is ShaderDispatchModifier. Modifier.USE_THREAD_DIMENSIONS (bit 5) defines the
@@ -3414,6 +3447,7 @@ void register_agc_hle() {
     RN("uJziRsODk1c", agc_driver_get_resource_registration_max_name_length);
     RN("X-Nm5KLREeg", agc_driver_register_owner);
     RN("W5z4eZrjEas", agc_driver_register_resource);
+    RN("F0Y42t-3e18", agc_driver_init_resource_registration);
     RN("V++UgBtQhn0", agc_get_data_packet_payload);          // data packet -> register-bank payload
     RN("n2fD4A+pb+g", agc_cb_set_sh_register_range_direct);  // SET_SH_REG range packet
     RN("UZbQjYAwwXM", agc_cb_set_sh_registers_direct);       // non-contiguous SET_SH_REG packets
