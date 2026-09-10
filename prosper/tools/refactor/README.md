@@ -12,6 +12,7 @@ each one does a transformation whose correctness can be *checked*, not merely re
 | `split_file.py` | splits one translation unit into several along a region partition |
 | `classify_tests.py` | proposes a folder for each test from its own includes |
 | `check_include_paths.py` | finds targets that reach a project include they cannot resolve |
+| `survey_sizes.py` | ranks every large file by WHICH of these tools can act on it |
 
 Run every tool's `--selftest` first; `split_file.py` and `promote_internal.py` run theirs
 automatically before doing anything.
@@ -113,6 +114,42 @@ caveats found by trying it:
 
 It stays incremental work regardless: a few extractions at a time, verified, by whoever is already
 changing that code.
+
+## Which files are in which state -- measured, 2026-09-10
+
+The table above was written from a handful of files looked at by hand, and it left the impression
+that the giant functions are mostly beyond tooling. **They are not.** `survey_sizes.py` measures the
+lambda share of every dominant function in the tree, which is the datum that decides it, and across
+28 files at or above 2,500 lines the split is:
+
+| verdict | files | meaning |
+| --- | --- | --- |
+| `SPLIT` | 13 | no dominant region -- `split_file.py` applies today |
+| `EXTRACT` | 13 | one dominant region, but lambda-light -- clangd's ExtractFunction can act |
+| `HAND` | **1** | dominant AND mostly lambda -- clangd refuses, no tool can help |
+
+Exactly one file is in the untouchable state: `frontends/shared/live/live_renderer.cpp`, whose
+`register_live_renderer` is 10,244 lines at **99% lambda**. Everything else has a route.
+
+The measurement moved three specific beliefs:
+
+* **`rdna2_emit_alu.cpp`'s 8,186-line `emit_alu` is only 11% lambda**, so it is `EXTRACT`, not hand
+  work. So are the giant test `main`s -- `test_rdna2_to_spirv.cpp` at **3%**,
+  `test_dynfetch_fold.cpp` at 6%, `test_recompile_coverage.cpp` at 2%. The per-block assertion-delta
+  invariant recorded at the end of this file is exactly the tool for those.
+* **The two largest source files are plain `SPLIT` work** -- `gpu_executor.cpp` (12,058 lines,
+  biggest region 23%) and `hle_kernel_mem.cpp` (7,637 lines, biggest region **2%**, #3503).
+* **A file of many small functions is the EASIEST split, and the first version of this tool called it
+  `OK`.** It required two regions of >=200 lines before offering `SPLIT`, which ranked
+  `hle_kernel_mem.cpp` as nothing-to-do. Region COUNT is what a seam needs; region SIZE is not.
+  Fixed, and pinned by a selftest case carrying that file's real shape.
+
+`survey_sizes.py` reports a file whose parse emitted errors as `PARSE-FAIL` and gives it **no
+verdict**, because a libclang parse driven from a g++ database fails softly -- a partial AST looks
+like a small, uninteresting file. In a survey that is the worst place for it to hide, since the file
+would be ranked as needing no work. One file is currently in that state:
+`frontends/prosper-app/main.cpp`, which has no compile command unless the app is configured
+(`-DPROSPER_APP=ON`); configure with it to bring that file into the survey.
 **The invariant that makes incremental extraction safe is worth copying.** When a block was extracted
 out of `test_rdna2_to_spirv.cpp`'s `main`, the thing that made it checkable was a count of assertions
 *executed*, asserted as a per-block delta:

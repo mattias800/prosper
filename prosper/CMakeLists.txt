@@ -169,6 +169,13 @@ if(Python3_Interpreter_FOUND)
                    "$<TARGET_FILE:self_dump>")
   add_test(NAME re_xref_decoder
            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/re/test_xref.py")
+  # survey_sizes.py's classifier decides which refactoring tool can act on a file, and it has been
+  # wrong twice: once on the lambda boundary, once by calling a file of many small functions
+  # "nothing to do". Its selftest is pure arithmetic and resolves libclang lazily, so it runs here
+  # even though the surveying itself needs a libclang the runner does not have.
+  add_test(NAME refactor_survey_classifier
+           COMMAND "${Python3_EXECUTABLE}"
+                   "${CMAKE_SOURCE_DIR}/tools/refactor/survey_sizes.py" --selftest)
   if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_test(NAME profiling_access
              COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/profiling_access/test_access.py")
