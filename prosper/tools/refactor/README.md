@@ -262,10 +262,13 @@ python3 prosper/tools/refactor/survey_sizes.py --min-lines 2500     # needs libc
 python3 prosper/tools/refactor/survey_sizes.py --selftest           # no libclang needed
 ```
 
-`--selftest` runs the classifier's arithmetic cases always, and the four `testdata/` measurement
-checks **only where libclang is importable** -- saying so explicitly, and naming them, when it skips
-them. Those are the checks covering how the classifier's INPUTS are measured, and every defect this
-tool shipped lived there rather than in the arithmetic. The registered ctest case
+`--selftest` runs the classifier's arithmetic cases always, and the four measurement checks **only
+where libclang is importable** -- three of them score committed fixtures under `testdata/`, while the
+fourth builds a hard link in a temporary directory, because the property it needs (two paths naming
+one file that `resolve()` reports as different) cannot be committed as a fixture. `--selftest` says
+so explicitly, and names them, when it skips them. Those are the checks covering how the
+classifier's INPUTS are measured, and every defect this tool shipped lived there rather than in the
+arithmetic. The registered ctest case
 (`refactor_survey_classifier`) therefore gates the arithmetic everywhere and the measurement locally.
 
 **The invariant that makes incremental extraction safe is worth copying.** When a block was extracted

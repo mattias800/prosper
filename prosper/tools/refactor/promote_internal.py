@@ -205,12 +205,14 @@ def canonical_include(source_rel: str, header_name: str) -> str:
 
 def preprocessor_depth_after(text: str) -> int:
     """Net `#if` nesting left open by TEXT. Zero means the text is balanced on its own."""
+    # COND_OPEN/COND_CLOSE, not str.startswith: `#  if` with spaces after the hash is legal and is
+    # spelled that way in this tree (src/hle/libc/hle_libc.cpp:20). Re-implementing the match more
+    # weakly here would make this helper disagree with conditional_depth() a few lines above it.
     depth = 0
     for raw in text.splitlines():
-        d = raw.strip()
-        if d.startswith("#if"):
+        if COND_OPEN.match(raw):
             depth += 1
-        elif d.startswith("#endif"):
+        elif COND_CLOSE.match(raw):
             depth = max(0, depth - 1)
     return depth
 
@@ -293,7 +295,17 @@ def build(map_data: dict, original: str, promote: list[int], header_rel: str,
     for i in drop:
         r = regions[i]
         del out_lines[r["start"] - 1:r["end"]]
+    # The include must land at conditional depth ZERO. The last preamble line can sit INSIDE a
+    # conditional the preamble leaves open -- on gpu_capture.cpp the preamble ends at line 46 and
+    # the matching `#endif` is line 47 -- so inserting there puts the internal header behind
+    # `#if defined(__linux__) || defined(__APPLE__)` while the promoted definitions are deleted
+    # UNCONDITIONALLY. The result compiles on Linux and fails on Windows with every promoted name
+    # undeclared: measured on this file, g++ 0 errors and x86_64-w64-mingw32-g++ 245. That is worse
+    # than the bug this tool had, because it is invisible to the platform the work is done on.
+    src_depth = conditional_depth(lines)
     last_pre = max(r["end"] for r in preamble)
+    while last_pre < len(lines) and src_depth[last_pre + 1] != 0:
+        last_pre += 1                             # walk out to the close of the open conditional
     insert_at = last_pre
     for i in sorted(promote):
         if regions[i]["start"] - 1 < insert_at:
@@ -392,6 +404,38 @@ SELF_MAP = {
 }
 
 
+# A preamble that ENDS INSIDE a conditional the source closes on the next line -- gpu_capture.cpp's
+# exact shape, and the one that made this tool emit a header and a source that disagree about which
+# platform they are for.
+PLACE_SRC = """#include <a>
+#if defined(X)
+#endif
+namespace ns {
+namespace {
+int helper() { return 1; }
+}  // namespace
+void user() { helper(); }
+}  // namespace ns
+"""
+
+PLACE_MAP = {
+    "file": "p.cpp", "total_lines": 9, "sha256": "",
+    "regions": [
+        {"index": 0, "start": 1, "end": 2, "role": "preamble", "name": "<a>",
+         "kind": "INCLUSION_DIRECTIVE"},
+        {"index": 1, "start": 3, "end": 4, "role": "open", "name": "ns"},
+        {"index": 2, "start": 5, "end": 5, "role": "open", "name": "<anonymous>"},
+        {"index": 3, "start": 6, "end": 6, "role": "body", "name": "helper",
+         "kind": "FUNCTION_DECL", "is_definition": True, "decl_line": 6},
+        {"index": 4, "start": 7, "end": 7, "role": "close", "name": "<anonymous>"},
+        {"index": 5, "start": 8, "end": 8, "role": "body", "name": "user",
+         "kind": "FUNCTION_DECL", "is_definition": True, "decl_line": 8},
+        {"index": 6, "start": 9, "end": 9, "role": "close", "name": "ns"},
+    ],
+    "edges": {},
+}
+
+
 def selftest() -> int:
     bad = 0
 
@@ -456,12 +500,23 @@ def selftest() -> int:
           "an unclosed `#if` in the copied preamble is detected")
     check(preprocessor_depth_after("#if defined(X)\n#include <b>\n#endif\n") == 0,
           "a balanced preamble is left alone")
-    unbal_map = {**SELF_MAP, "regions": [dict(r) for r in SELF_MAP["regions"]]}
-    unbal_src = "#include <a>\n#if defined(X)\n" + SELF_SRC.split("\n", 2)[2]
-    h_unbal, _, _ = build(unbal_map, unbal_src, [3, 4], "s_internal.hpp", "ns", "// n\n",
-                          "s_internal.hpp")
-    check(preprocessor_depth_after(h_unbal) == 0,
+    h_place, s_place, _ = build(PLACE_MAP, PLACE_SRC, [3], "p_internal.hpp", "ns", "// n\n",
+                                "p_internal.hpp")
+    check(preprocessor_depth_after(h_place) == 0,
           "the emitted header is preprocessor-balanced even when the preamble is not")
+    # PLACEMENT, which balance does not imply and which the balance arm above cannot see. The
+    # source's own include has to land at conditional depth ZERO: at the last preamble line it
+    # would sit inside `#if defined(X)`, so the header is included only on that platform while the
+    # promoted definitions are deleted unconditionally -- a source that compiles where the tool was
+    # run and fails everywhere else. Measured on gpu_capture.cpp before this was fixed: g++ 0
+    # errors, x86_64-w64-mingw32-g++ 245.
+    place_lines = s_place.splitlines(keepends=True)
+    inc_idx = next(i for i, l in enumerate(place_lines) if "p_internal.hpp" in l)
+    check(conditional_depth(place_lines)[inc_idx + 1] == 0,
+          "the include added to the SOURCE lands outside any preprocessor conditional")
+    # ... and it must still precede everything promoted code needs, so it cannot simply be appended.
+    check(any("namespace ns" in l for l in place_lines[inc_idx + 1:]),
+          "and still precedes the namespace it was lifted out of")
 
     # prototype_of is pure and therefore reachable from here, unlike the fixes that live in main().
     # The fixture's default argument CONTAINS PARENTHESES, which is the shape that breaks the
@@ -724,20 +779,31 @@ def main() -> int:
     # The promote set has to be closed under "what does this call that is still internal", and the
     # caller cannot be expected to derive that by hand from a 6,000-line file -- so print the exact
     # argument to re-run with.
-    unbreakable = [i for i in wanted if anon.get(i)]
+    # `not externally_linked(...)`, not `anon.get(...)`. This file documents at :139-151 why the
+    # anonymous-namespace walk alone is the wrong linkage test -- a `static` free function has
+    # internal linkage while sitting outside any anonymous namespace -- and the refusal below is a
+    # statement about linkage, so it has to use the predicate that knows that. Using the weaker one
+    # here would let a `static` callee through, and `prototype_of` would then emit `static ... f();`
+    # into the header, which is the ODR hazard the comment at :146 was written about.
+    unbreakable = [i for i in wanted if not externally_linked(i)]
     if unbreakable:
         # Report the FIXED POINT, not one step of it. Each added region brings its own callees, so
         # a single step just makes the caller run this again -- measured on gpu_capture.cpp, the
         # first suggestion needed a second round and the second a third. Iterating here turns N
         # rounds of copy-paste into one answer.
+        # Honour --exclude, or the suggestion is unusable: a region the caller deliberately kept
+        # back would be re-proposed every round, so the printed re-run reproduces the identical
+        # refusal. Excluding it is a real answer -- it means "stop calling this from promoted
+        # code" -- and the message says so.
         closure = set(promote)
         while True:
             grown = closure | {i for i in declarations_needed(sorted(closure), edges_all, regions)
-                               if anon.get(i)}
+                               if not externally_linked(i) and i not in excluded}
             if grown == closure:
                 break
             closure = grown
         closure = sorted(closure)
+        stuck = sorted(i for i in unbreakable if i in excluded)
         names = ", ".join(regions[i]["name"] for i in unbreakable[:6])
         more = f" and {len(unbreakable) - 6} more" if len(unbreakable) > 6 else ""
         sys.exit(
@@ -747,7 +813,10 @@ def main() -> int:
             f"  {names}{more}\n\n"
             f"The promote set must be closed under what it calls. Re-run with:\n"
             f"  --regions {','.join(str(i) for i in closure)}\n\n"
-            f"(or add them to --exclude if they should stay, and stop calling them from promoted code)")
+            + (f"\n{len(stuck)} of them are in --exclude and so are NOT in that list; those calls\n"
+               f"have to be removed from the promoted code instead: "
+               f"{', '.join(regions[i]['name'] for i in stuck[:4])}\n" if stuck else "")
+            + "\n(or add more to --exclude, and stop calling them from promoted code)")
     src_lines = original.splitlines(keepends=True)
     protos = []
     for i in sorted(wanted):

@@ -94,7 +94,12 @@ def _need_clang() -> None:
     global MS, ci, _SKIPPED_RANGES, _DISPOSE_RANGES
     if MS is not None:
         return
-    MS = _load_map_symbols()
+    # `MS` is this function's own re-entry guard, so it is assigned LAST. Assigned first, a second
+    # caller arriving mid-initialisation takes the early return above and then uses `ci` while it is
+    # still None. Unreachable from main(), which initialises before starting the pool -- and exactly
+    # reachable from any caller that uses survey_one/measure from a worker without doing that, which
+    # is how a module like this gets used.
+    mod = _load_map_symbols()
     import clang.cindex as _ci
     ci = _ci
     # Built here, not at module scope: the `ranges` member is an array of cindex's own SourceRange,
@@ -118,6 +123,7 @@ def _need_clang() -> None:
                  "and will not guess. Upgrade libclang (present since clang 3.7).")
     _SKIPPED_RANGES = lib.clang_getSkippedRanges
     _DISPOSE_RANGES = lib.clang_disposeSourceRangeList
+    MS = mod                                      # last: this is the guard other callers test
 
 
 # A region must reach this share of the file before the file counts as dominated by it. Below it,
@@ -391,8 +397,13 @@ def measure(path: pathlib.Path, flags: list[str], parse_target: pathlib.Path) ->
         "file": rel, "lines": total, "regions": len(sized),
         "biggest": big["name"], "biggest_lines": big_len,
         "biggest_share": round(big_len / total, 3),
-        "lambda_lines": lam,
-        "lambda_share_of_biggest": round(lam / big_len, 3) if big_len else 0.0,
+        # Only present when it was actually COMPUTED. The share is measured only for a dominated
+        # file, so emitting 0.0 for the rest publishes an unmeasured value in the same shape as a
+        # measured one -- a SPLIT file's "0%" and test_rdna2_to_spirv.cpp's real 3% would read as
+        # the same kind of fact. Absent means "not asked", which is the truth.
+        **({"lambda_lines": lam,
+            "lambda_share_of_biggest": round(lam / big_len, 3) if big_len else 0.0}
+           if big_len / total >= DOMINANT_SHARE else {}),
         "regions_over_%d" % SPLITTABLE_REGION_LINES:
             sum(1 for n, _ in sized if n >= SPLITTABLE_REGION_LINES),
         "unparsed_lines": unparsed,
@@ -631,8 +642,10 @@ def main() -> int:
                   f"{'':>44}  {why[:90]}")
             continue
         unp = r.get("unparsed_lines", 0) / max(r.get("lines", 1), 1)
+        lam = (f"{r['lambda_share_of_biggest']:>6.0%}" if "lambda_share_of_biggest" in r
+               else f"{'--':>6}")      # never computed: see measure()
         print(f"{r['verdict']:<11}{r['lines']:>7}{r.get('biggest_lines', 0):>7}"
-              f"{r.get('biggest_share', 0):>7.0%}{r.get('lambda_share_of_biggest', 0):>6.0%}"
+              f"{r.get('biggest_share', 0):>7.0%}{lam}"
               f"{unp:>6.0%}  {rel}\n{'':>44}  {r.get('biggest', '')}")
 
     counts: dict[str, int] = {}
@@ -640,8 +653,15 @@ def main() -> int:
         counts[r["verdict"]] = counts.get(r["verdict"], 0) + 1
     print("\n[survey] " + ", ".join(f"{k}={v}" for k, v in sorted(counts.items())))
     if args.json:
-        args.json.write_text(json.dumps(rows, indent=2))
-        print(f"[survey] wrote {args.json}")
+        # Repo-relative, like the printed table. This repository is public and a survey JSON is
+        # exactly the kind of artifact that gets pasted into an issue; the absolute form published
+        # the developer's account name and directory layout. Paths are relative to the repository
+        # root, which is where the tool is run from, so a consumer resolves them the same way the
+        # compile database's own entries are resolved.
+        rel_rows = [{**r, "file": str(pathlib.Path(r["file"]).relative_to(root))
+                     if str(r["file"]).startswith(str(root)) else r["file"]} for r in rows]
+        args.json.write_text(json.dumps(rel_rows, indent=2))
+        print(f"[survey] wrote {args.json} ({len(rel_rows)} row(s), paths relative to the repo root)")
     return 0
 
 
