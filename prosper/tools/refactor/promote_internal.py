@@ -203,6 +203,34 @@ def canonical_include(source_rel: str, header_name: str) -> str:
     return header_name
 
 
+def preprocessor_depth_after(text: str) -> int:
+    """Net `#if` nesting left open by TEXT. Zero means the text is balanced on its own."""
+    depth = 0
+    for raw in text.splitlines():
+        d = raw.strip()
+        if d.startswith("#if"):
+            depth += 1
+        elif d.startswith("#endif"):
+            depth = max(0, depth - 1)
+    return depth
+
+
+def declarations_needed(promote, edges, regions) -> list[int]:
+    """Regions the PROMOTED code calls that are staying behind, so the header must declare them.
+
+    Every such destination, not merely the ones referenced from outside the file. That narrower
+    rule is what this replaced, and it is a different set: an ordinary internal helper called only
+    from within this file was never "public", so no declaration was emitted for it, the header used
+    it above its definition, and the build failed with `not declared in this scope` -- for
+    `checked_mul`, `resource_footprint_impl`, `blob_max_bytes_from_env` and two others in one run.
+    The `[warn] no declaration could be derived` branch could not fire for them either, because
+    they never reached it.
+    """
+    kept = set(promote)
+    return sorted({d for i in promote for d in edges.get(i, set())
+                   if d not in kept and d in regions and regions[d].get("role") == "body"})
+
+
 def build(map_data: dict, original: str, promote: list[int], header_rel: str,
           namespace: str, guard_note: str, include_spelling: str = "",
           forward_decls: list[str] | None = None) -> tuple[str, str, list[str]]:
@@ -216,7 +244,21 @@ def build(map_data: dict, original: str, promote: list[int], header_rel: str,
 
     preamble = [r for r in map_data["regions"] if r.get("role") == "preamble"]
     head = ["#pragma once\n", "\n", guard_note, "\n"]
-    head += ["".join(lines[r["start"] - 1:r["end"]]) for r in preamble]
+    pre_text = "".join("".join(lines[r["start"] - 1:r["end"]]) for r in preamble)
+    head.append(pre_text)
+    # The preamble is COPIED, and a copy can end inside a conditional the original closes later.
+    # gpu_capture.cpp opens `#if defined(__linux__) || defined(__APPLE__)` among its includes and
+    # closes it far below, outside any preamble region -- so the verbatim copy shipped 3 `#if`
+    # against 2 `#endif` and the header failed with "unterminated #if". The tool already models
+    # preprocessor depth for the regions it PROMOTES; this applies the same care to the part it
+    # replicates. Closing here is safe in a way that dropping would not be: every directive copied
+    # is an include-guard-style condition around includes, and leaving its body active in the
+    # header would change which declarations the header sees.
+    open_depth = preprocessor_depth_after(pre_text)
+    if open_depth > 0:
+        head.append(f"\n// Closing {open_depth} conditional(s) the copied preamble left open; the\n"
+                    "// original closes them further down, outside any preamble region.\n")
+        head += ["#endif\n"] * open_depth
     head += ["\n", f"namespace {namespace} {{\n", "\n"]
     if forward_decls:
         head.append("// Declared here, DEFINED in the .cpp this header was lifted out of: other\n"
@@ -391,6 +433,35 @@ def selftest() -> int:
     check("void user()" in src, "unpromoted code stays put")
     check(not verify(SELF_SRC, SELF_MAP, [3, 4], hdr, src, "s_internal.hpp"),
           "verification passes on a correct promotion")
+
+    # DECLARATIONS THE HEADER OWES. Extracted out of main() specifically so it is reachable here:
+    # the rule it implements was wrong for as long as it was unreachable, and the comment above it
+    # already stated the correct rule while the code did something narrower.
+    # `helper` (region 4) is called by `user` (6) and is NOT referenced outside the file, so it is
+    # not "public" -- the exact shape that produced an uncompilable header. Promote `user` and the
+    # header must be told about `helper`.
+    edges_fix = {6: {3, 4}}
+    regs_fix = {r["index"]: r for r in SELF_MAP["regions"]}
+    check(declarations_needed([6], edges_fix, regs_fix) == [3, 4],
+          "a promoted region's callees that stay behind are ALL declared, public or not")
+    check(declarations_needed([3, 4, 6], edges_fix, regs_fix) == [],
+          "nothing is owed when the callees were promoted too")
+    check(declarations_needed([6], {6: {1, 5}}, regs_fix) == [],
+          "namespace open/close regions are never declarations")
+
+    # PREAMBLE BALANCE. A copied preamble can end inside a conditional the original closes later,
+    # which shipped an unterminated `#if` in a real run. Both arms matter: the second is what
+    # separates "closes what it opened" from "always appends an #endif".
+    check(preprocessor_depth_after("#include <a>\n#if defined(X)\n#include <b>\n") == 1,
+          "an unclosed `#if` in the copied preamble is detected")
+    check(preprocessor_depth_after("#if defined(X)\n#include <b>\n#endif\n") == 0,
+          "a balanced preamble is left alone")
+    unbal_map = {**SELF_MAP, "regions": [dict(r) for r in SELF_MAP["regions"]]}
+    unbal_src = "#include <a>\n#if defined(X)\n" + SELF_SRC.split("\n", 2)[2]
+    h_unbal, _, _ = build(unbal_map, unbal_src, [3, 4], "s_internal.hpp", "ns", "// n\n",
+                          "s_internal.hpp")
+    check(preprocessor_depth_after(h_unbal) == 0,
+          "the emitted header is preprocessor-balanced even when the preamble is not")
 
     # prototype_of is pure and therefore reachable from here, unlike the fixes that live in main().
     # The fixture's default argument CONTAINS PARENTHESES, which is the shape that breaks the
@@ -641,7 +712,42 @@ def main() -> int:
 
     # Anything promoted code CALLS but that stayed behind needs a declaration in the header.
     edges_all = {int(k): {int(t) for t in v} for k, v in map_data.get("edges", {}).items()}
-    wanted = {d for i in promote for d in edges_all.get(i, set()) if d in set(public)}
+    wanted = declarations_needed(promote, edges_all, regions)
+    # A definition still inside `namespace { }` CANNOT be forward-declared from the header. The
+    # declaration would name `prosper::gpu::f` while the definition is `prosper::gpu::{anon}::f` --
+    # two different entities, both visible in the .cpp, so every call becomes ambiguous rather than
+    # resolving to the one that exists. Measured on gpu_capture.cpp: 18 such declarations turned
+    # "not declared in this scope" into "call of overloaded ... is ambiguous", which is the same
+    # broken header wearing a different error.
+    #
+    # There is no header this tool can write that fixes that, so it refuses and names the closure.
+    # The promote set has to be closed under "what does this call that is still internal", and the
+    # caller cannot be expected to derive that by hand from a 6,000-line file -- so print the exact
+    # argument to re-run with.
+    unbreakable = [i for i in wanted if anon.get(i)]
+    if unbreakable:
+        # Report the FIXED POINT, not one step of it. Each added region brings its own callees, so
+        # a single step just makes the caller run this again -- measured on gpu_capture.cpp, the
+        # first suggestion needed a second round and the second a third. Iterating here turns N
+        # rounds of copy-paste into one answer.
+        closure = set(promote)
+        while True:
+            grown = closure | {i for i in declarations_needed(sorted(closure), edges_all, regions)
+                               if anon.get(i)}
+            if grown == closure:
+                break
+            closure = grown
+        closure = sorted(closure)
+        names = ", ".join(regions[i]["name"] for i in unbreakable[:6])
+        more = f" and {len(unbreakable) - 6} more" if len(unbreakable) > 6 else ""
+        sys.exit(
+            f"refused: {len(unbreakable)} definition(s) the promoted code calls are still inside an\n"
+            f"anonymous namespace, and a header cannot declare those -- the declaration would name a\n"
+            f"DIFFERENT entity than the definition and make every call ambiguous:\n"
+            f"  {names}{more}\n\n"
+            f"The promote set must be closed under what it calls. Re-run with:\n"
+            f"  --regions {','.join(str(i) for i in closure)}\n\n"
+            f"(or add them to --exclude if they should stay, and stop calling them from promoted code)")
     src_lines = original.splitlines(keepends=True)
     protos = []
     for i in sorted(wanted):
