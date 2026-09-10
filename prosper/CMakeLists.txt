@@ -170,9 +170,10 @@ if(Python3_Interpreter_FOUND)
   add_test(NAME re_xref_decoder
            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/re/test_xref.py")
   # survey_sizes.py's classifier decides which refactoring tool can act on a file, and it has been
-  # wrong four times: on the lambda boundary, by calling a file of many small functions "nothing to
-  # do", by measuring the lambda share over the enclosing namespace, and by inferring unparsed lines
-  # from region kinds (which cannot see a mid-file #if). The last two were in how the classifier's
+  # wrong five times: on the lambda boundary, by calling a file of many small functions "nothing to
+  # do", by measuring the lambda share over the enclosing namespace, by inferring unparsed lines
+  # from region kinds (which cannot see a mid-file #if), and by not mirroring regions_of's descent
+  # rule. The last three were in how the classifier's
   # INPUTS are measured, so no arithmetic case could have caught them; they are pinned by fixtures
   # under tools/refactor/testdata/ that the selftest scores ONLY where libclang is importable, and
   # it says loudly when it skips them. libclang resolves lazily, so the arithmetic half runs here
@@ -180,6 +181,14 @@ if(Python3_Interpreter_FOUND)
   add_test(NAME refactor_survey_classifier
            COMMAND "${Python3_EXECUTABLE}"
                    "${CMAKE_SOURCE_DIR}/tools/refactor/survey_sizes.py" --selftest)
+  # The measurement fixtures are a SEPARATE case so that a runner without libclang reports them as
+  # Skipped rather than folding them into a green Passed. A pass whose domain is smaller than the
+  # local one, with nothing in the report saying so, is the hazard this project records for its GPU
+  # tests under CI's software rasteriser.
+  add_test(NAME refactor_survey_measurement
+           COMMAND "${Python3_EXECUTABLE}"
+                   "${CMAKE_SOURCE_DIR}/tools/refactor/survey_sizes.py" --selftest-parse)
+  set_tests_properties(refactor_survey_measurement PROPERTIES SKIP_RETURN_CODE 77)
   if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_test(NAME profiling_access
              COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/profiling_access/test_access.py")

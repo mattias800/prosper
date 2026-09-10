@@ -146,24 +146,41 @@ The measurement moved three specific beliefs:
   `hle_kernel_mem.cpp` as nothing-to-do. Region COUNT is what a seam needs; region SIZE is not.
   Fixed, and pinned by a selftest case carrying that file's real shape.
 
-### Two ways this survey measured the wrong thing, and both failed silently
+### Three ways this survey measured the wrong thing, and all of them failed silently
 
 Neither produced an error or an odd-looking row. Each produced a confident verdict about a file
 other than the one asked about, which is why they are recorded here rather than in a commit message.
-Both are now pinned by fixtures under `testdata/`, and each fixture is built so the defective
+All three are now pinned by fixtures under `testdata/`, and each fixture is built so the defective
 measurement yields a **different verdict**, not merely a different number -- verified by re-running
-the pre-fix code against them (`dominant_no_lambda` -> `HAND`; `midfile_inactive_arm` -> `EXTRACT`,
-0 unparsed).
+each pre-fix version against all of them, where every mutation reddens its own fixture and leaves
+the others green (`dominant_no_lambda` -> `HAND` at a 0.729 share for a function with no lambda;
+`midfile_inactive_arm` -> `EXTRACT` with 0 unparsed, naming the include directive that swallowed the
+arm; `namespace_without_children` -> `NO-CURSOR`).
 
 **The lambda share was measured over the enclosing namespace.** Nearly every file here is one
 `namespace prosper { ... }`, so a file's only *top-level* cursor is the namespace -- and a namespace
 answers `is_definition()` with True. Walking top-level cursors to find the dominant region's cursor
 therefore always found the namespace, and unioned every lambda in the whole file into the dominant
-function's share. Measured across the tree: **6 of 22 scored files carried an inflated share**, worst
-`rdna2_emit_cfg.cpp` at 0.428 against a true **0.258**. **No verdict actually changed** -- in a
+function's share. Measured across the tree: **6 of the 14 files that have a lambda share at all carried an inflated
+one**, worst `rdna2_emit_cfg.cpp` at 0.428 against a true **0.258**. Fourteen is the honest
+denominator, and it is not the number of scored files: the share is computed only for a file a single
+region dominates, so the 9 `SPLIT` files could never have been inflated, and `live_renderer.cpp` --
+which was -- is neither `SPLIT` nor `EXTRACT`. So the error rate among files where the question is
+asked is 43%, not the 27% a count against all scored files suggests. **No verdict actually changed** -- in a
 dominated file the namespace is nearly the dominant function, so the error stayed under the 0.50
 threshold everywhere. That is luck, not design: 0.428 is one small edit from flipping a file to
 "no tool can act on this". The fix descends to the region's own cursor (`region_cursor`).
+
+**`region_cursor` did not mirror `regions_of`'s descent rule.** `emit()` descends into a namespace
+only when it HAS in-target children (`map_symbols.py:174`); the first version of `region_cursor`
+descended on `depth < max_depth` alone. A namespace with no in-target children is emitted as a plain
+`body` region by the kids-empty fallthrough, so it can BE a file's dominant region -- and the lookup
+walked straight past it and reported `NO-CURSOR`, refusing to score a file whose answer was not in
+doubt. Reachable with nothing exotic: a namespace whose body is all comments
+(`testdata/namespace_without_children.cpp`, 98.9% of its file). No file in the tree currently hits
+it, so this cost nothing -- it was found by constructing the case rather than by observing one, and
+it is recorded because `NO-CURSOR` firing on a false alarm would have read as a tool limitation
+rather than a tool bug.
 
 **Unparsed lines were inferred from region kinds, which cannot see a mid-file `#if`.** `map_symbols`
 tiles a file by cursor, so an inactive arm is never a region of its own -- it is folded into whichever
@@ -185,9 +202,22 @@ trailing-span heuristic did, taking `UNPARSED` from 1 to 4 --
 | `src/hle/fs/hle_file.cpp` | 4,560 | **21%** | SPLIT |
 | `src/host/memory/guest_write_watch.cpp` | 2,513 | **20%** | SPLIT |
 
--- and it fails **closed**: if `clang_getSkippedRanges` is missing the tool exits rather than
-reporting zero, because reporting "no unparsed lines" when the question cannot be asked is exactly
-the silent under-report above.
+-- and it fails **closed** everywhere the question cannot be answered, because "no unparsed lines"
+and "I could not ask" must never be the same output. A missing `clang_getSkippedRanges` exits; a file
+absent from its own TU, or a NULL range list, scores `NO-PREPROC` rather than 0.
+
+The subtlest of those was a path comparison. The clip that keeps other files' skipped include guards
+out of the count originally compared `resolve()`d paths -- and this repository is reachable under two
+spellings that resolve **differently** and name one file, the container's `/home/<user>/...` bind
+mount and the host's `/var/home/<user>/...`. Under the alias spelling every span was discarded and
+`hle_file.cpp` reported **0** skipped lines instead of 963, which would have scored it `SPLIT`. The
+comparison is by **inode** now (`os.path.samefile`), and where even that errors it counts the span
+rather than dropping it: an over-count raises `UNPARSED`, which someone sees, and an under-count is
+the silent wrong answer. Measured both spellings: 963 and 963.
+
+Span line numbers include the `#if` and `#endif` directives themselves, because that is what libclang
+reports and they are lines the AST produced nothing for. Anyone reconstructing these figures as
+"lines of skipped CODE" will get about two fewer per span.
 
 `UNPARSED_SHARE` (0.15) is a **convention, not a measurement**. The tree has four files above it, the
 lowest at 20%, and nothing here pins where in the gap below that the line belongs.

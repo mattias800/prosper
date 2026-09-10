@@ -31,8 +31,8 @@ measurements below are taken the way they are rather than the obvious way:
     region's cursor therefore always found the NAMESPACE, and unioned every lambda in the whole file
     into the dominant function's share. `testdata/dominant_no_lambda.cpp` is the hand-built instance:
     a dominant function containing no lambda at all, beside a small all-lambda sibling, which the
-    old code reported at a 0.63 lambda share -- HAND, "no tool can act", for a function clangd
-    extracts from happily. Descend to the region's OWN cursor (`region_cursor`).
+    old code reports at a 0.729 lambda share (43 lambda lines against the 59-line region) -- HAND,
+    "no tool can act", for a function clangd extracts from happily. Descend to the region's OWN cursor (`region_cursor`).
 
   * INFER UNPARSED LINES FROM REGION KINDS. `map_symbols` tiles a file by cursor, so an inactive
     `#if` arm is not a region of its own: it is folded into whichever region follows it and wears
@@ -63,6 +63,7 @@ import concurrent.futures
 import ctypes
 import importlib.util
 import json
+import os
 import pathlib
 import sys
 
@@ -86,10 +87,11 @@ def _load_map_symbols():
 MS = None
 ci = None
 _SKIPPED_RANGES = None
+_DISPOSE_RANGES = None
 
 
 def _need_clang() -> None:
-    global MS, ci, _SKIPPED_RANGES
+    global MS, ci, _SKIPPED_RANGES, _DISPOSE_RANGES
     if MS is not None:
         return
     MS = _load_map_symbols()
@@ -108,12 +110,14 @@ def _need_clang() -> None:
     # them as c_void_p instead would bypass that. Only restype needs stating.
     try:
         lib.clang_getSkippedRanges.restype = ctypes.POINTER(_CXSourceRangeList)
+        lib.clang_disposeSourceRangeList.argtypes = [ctypes.POINTER(_CXSourceRangeList)]
     except AttributeError:
         # Fail CLOSED. Reporting 0 unparsed lines when the question cannot be asked is precisely the
         # silent-under-report this tool exists to avoid, and it would land as a confident verdict.
         sys.exit("libclang here has no clang_getSkippedRanges; cannot measure unparsed spans "
                  "and will not guess. Upgrade libclang (present since clang 3.7).")
     _SKIPPED_RANGES = lib.clang_getSkippedRanges
+    _DISPOSE_RANGES = lib.clang_disposeSourceRangeList
 
 
 # A region must reach this share of the file before the file counts as dominated by it. Below it,
@@ -123,9 +127,11 @@ DOMINANT_SHARE = 0.40
 # what actually blocks extraction, rather than an incidental detail.
 LAMBDA_SHARE = 0.50
 # Skipped-arm lines this share of a file mean the AST is blind to a substantial part of it, and every
-# AST-driven verdict is then answering about the other part only. A CONVENTION, not a measurement:
-# the tree has two files above it (guest_write_watch.cpp at 19.7%, hle_kernel_mem.cpp at 52.1%) and
-# the next is far below, so the band is wide and nothing here pins where in it the line belongs.
+# AST-driven verdict is then answering about the other part only. The VALUE is a convention, but the
+# PARTITION it produces is not sensitive to it: measured over the tree, the highest share among files
+# it does not catch is 4.34% (exec_image_linux.cpp) and the lowest among the four it does is 19.70%
+# (guest_write_watch.cpp). Any threshold in (4.34%, 19.70%] yields exactly the same four files, so
+# 0.15 is a point in a wide empty band rather than a line drawn through the data.
 UNPARSED_SHARE = 0.15
 # A file needs this many movable regions before a split has anywhere to cut. Deliberately small,
 # and the first draft got this wrong in a way the tree caught: it demanded two regions of >=200 lines
@@ -137,6 +143,26 @@ SPLITTABLE_REGIONS = 4
 # Still reported, because a file whose regions are all tiny may want grouping by role rather than a
 # straight cut -- but it no longer gates the verdict.
 SPLITTABLE_REGION_LINES = 200
+
+
+class SkippedRangesUnavailable(RuntimeError):
+    """The skipped-arm question could not be asked. Never answered as zero -- see skipped_lines."""
+
+
+def _same_file(a: str, b: pathlib.Path) -> bool:
+    """Same file on disk, compared by INODE rather than by spelling.
+
+    `resolve()` is not enough here. This repository is reached under two spellings that resolve
+    differently and name one file -- the container's `/home/<user>/...` bind mount and the host's
+    `/var/home/<user>/...` -- and a mismatch made the old clip discard every span and report a file
+    with 963 skipped lines as having none. Falling back to True on an OS error keeps that failure in
+    the loud direction: an over-count raises UNPARSED, which is visible, where an under-count is the
+    silent wrong answer.
+    """
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return True
 
 
 def merge_spans(spans: list[tuple[int, int]]) -> int:
@@ -161,18 +187,27 @@ def skipped_lines(tu, path: pathlib.Path) -> int:   # requires _need_clang()
     """
     f = ci.File.from_name(tu, str(path))
     if f is None:
-        return 0
+        # Never 0. "The file is not in its own translation unit" is not "this file skips nothing";
+        # answering 0 here is the same silent under-report this function exists to end.
+        raise SkippedRangesUnavailable(f"{path} is not a file of its own translation unit")
     rl = _SKIPPED_RANGES(tu, f)
     if not rl:
-        return 0
-    spans: list[tuple[int, int]] = []
-    for i in range(rl.contents.count):
-        r = rl.contents.ranges[i]
-        s, e = r.start, r.end
-        if s.file is None or pathlib.Path(s.file.name).resolve() != path.resolve():
-            continue
-        spans.append((s.line, e.line))
-    return merge_spans(spans)
+        raise SkippedRangesUnavailable(f"clang_getSkippedRanges returned NULL for {path}")
+    try:
+        spans: list[tuple[int, int]] = []
+        for i in range(rl.contents.count):
+            r = rl.contents.ranges[i]
+            s, e = r.start, r.end
+            if s.file is not None and not _same_file(s.file.name, path):
+                continue
+            # A span's line numbers include the `#if` and `#endif` directives themselves, because
+            # that is what libclang reports. Counted as given: they are lines of the file the AST
+            # produced nothing for, which is the quantity here. Worth two lines per span if anyone
+            # reconstructs this figure as "lines of skipped CODE" and finds it slightly smaller.
+            spans.append((s.line, e.line))
+        return merge_spans(spans)
+    finally:
+        _DISPOSE_RANGES(rl)
 
 
 def lambda_lines(cursor) -> int:   # requires _need_clang()
@@ -216,7 +251,18 @@ def region_cursor(tu, path: pathlib.Path, region: dict, max_depth: int = 3):
                 continue
             if pathlib.Path(k.location.file.name).resolve() != path.resolve():
                 continue
-            if k.kind == ci.CursorKind.NAMESPACE and depth < max_depth:
+            # Mirror emit()'s descent condition EXACTLY, kids-check included. Descending on
+            # `depth < max_depth` alone is not the same rule: a namespace with no in-target children
+            # is emitted by regions_of as a plain `body` region (the kids-empty fallthrough at
+            # map_symbols.py:174), so it can BE the dominant region -- and descending past it
+            # without testing it reports NO-CURSOR for a file that has a perfectly good answer.
+            # `testdata/namespace_without_children.cpp` is that case, reachable with nothing more
+            # exotic than a namespace whose body is all comments.
+            kids = [k2 for k2 in k.get_children()
+                    if k2.location.file is not None
+                    and pathlib.Path(k2.location.file.name).resolve() == path.resolve()] \
+                if k.kind == ci.CursorKind.NAMESPACE else []
+            if kids and depth < max_depth:
                 walk(k, depth + 1)
                 continue
             if k.extent.start.line == want_start and k.extent.end.line == want_end:
@@ -264,7 +310,10 @@ def measure(path: pathlib.Path, flags: list[str], parse_target: pathlib.Path) ->
         return {"file": rel, "lines": total, "verdict": "PARSE-FAIL",
                 "why": f"{len(errs)} parse error(s); first: {errs[0].spelling}"}
 
-    unparsed = skipped_lines(tu, path)
+    try:
+        unparsed = skipped_lines(tu, path)
+    except SkippedRangesUnavailable as exc:
+        return {"file": rel, "lines": total, "verdict": "NO-PREPROC", "why": str(exc)}
     regions = MS.regions_of(tu, path, total)
     # Movable regions only. An `open`/`close` is replicated into every output part, so it is not a
     # place a split can cut and must not count toward the file having a seam.
@@ -400,6 +449,16 @@ def _parse_selftest() -> int:
         print(f"        full row: {r}")
     bad += not ok
 
+    c = _TESTDATA / "namespace_without_children.cpp"
+    r = measure(c, flags, c)
+    ok = r["verdict"] == "EXTRACT" and r.get("biggest") == "commentary"
+    print(f"  [{'ok' if ok else 'FAIL'}] {c.name}: verdict={r['verdict']} "
+          f"biggest={r.get('biggest')!r} "
+          f"(want EXTRACT/'commentary' -- descending on depth alone gives NO-CURSOR)")
+    if not ok:
+        print(f"        full row: {r}")
+    bad += not ok
+
     b = _TESTDATA / "midfile_inactive_arm.cpp"
     r = measure(b, flags, b)
     share = r.get("unparsed_share", 0.0)
@@ -411,6 +470,26 @@ def _parse_selftest() -> int:
         print(f"        full row: {r}")
     bad += not ok
     return bad
+
+
+def selftest_parse_only() -> int:
+    """The measurement fixtures alone, reporting SKIP (77) where libclang is absent.
+
+    Registered as its own ctest case so the smaller domain is VISIBLE. Folded into `--selftest` the
+    parse checks simply do not run on a runner without libclang, and ctest prints `Passed` -- a green
+    result whose domain is strictly smaller than the local one, with nothing in the report saying so.
+    This project has that exact hazard recorded for its GPU tests on CI's software rasteriser; a
+    `Skipped` row is the honest form of the same situation.
+    """
+    try:
+        import clang.cindex  # noqa: F401
+    except ImportError:
+        print("SKIP: no libclang here, so the measurement fixtures cannot run.")
+        print("      The arithmetic classifier is covered by refactor_survey_classifier.")
+        return 77
+    bad = _parse_selftest()
+    print("== PASS ==" if not bad else f"== FAIL: {bad} ==")
+    return 1 if bad else 0
 
 
 def selftest() -> int:
@@ -440,7 +519,11 @@ def main() -> int:
     ap.add_argument("--json", type=pathlib.Path)
     ap.add_argument("--jobs", type=int, default=6)
     ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--selftest-parse", action="store_true",
+                    help="only the measurement fixtures; exit 77 (ctest SKIP) without libclang")
     args = ap.parse_args()
+    if args.selftest_parse:
+        return selftest_parse_only()
     if args.selftest:
         return selftest()
 
@@ -473,16 +556,20 @@ def main() -> int:
             rows.append(res)
 
     order = {"SPLIT": 0, "EXTRACT": 1, "UNPARSED": 2, "HAND": 3,
-             "NO-CURSOR": 4, "PARSE-FAIL": 5, "OK": 6}
+             "NO-CURSOR": 4, "NO-PREPROC": 5, "PARSE-FAIL": 6, "OK": 7}
     print(f"{'verdict':<11}{'lines':>7}{'big':>7}{'share':>7}{'lam%':>6}{'unp%':>6}"
           f"  file / dominant symbol")
     print("-" * 104)
     for r in sorted(rows, key=lambda r: (order.get(r["verdict"], 9), -r.get("lines", 0))):
-        if r["verdict"] in ("PARSE-FAIL", "NO-CURSOR"):
-            print(f"{r['verdict']:<11}{r['lines']:>7}{'':>7}{'':>7}{'':>6}{'':>6}  {r['file']}\n"
-                  f"{'':>44}  {r['why'][:90]}")
-            continue
+        # Strip to a repo-relative path on EVERY branch. This repository is public and an absolute
+        # path publishes the developer's account name and directory layout; the strip used to be on
+        # the scored branch only, so exactly the rows that name a problem leaked one.
         rel = r["file"].split("prosper/", 1)[-1]
+        if r["verdict"] in ("PARSE-FAIL", "NO-CURSOR", "NO-PREPROC"):
+            why = r["why"].replace(str(root) + "/", "").replace(str(root), "")
+            print(f"{r['verdict']:<11}{r['lines']:>7}{'':>7}{'':>7}{'':>6}{'':>6}  {rel}\n"
+                  f"{'':>44}  {why[:90]}")
+            continue
         unp = r.get("unparsed_lines", 0) / max(r.get("lines", 1), 1)
         print(f"{r['verdict']:<11}{r['lines']:>7}{r.get('biggest_lines', 0):>7}"
               f"{r.get('biggest_share', 0):>7.0%}{r.get('lambda_share_of_biggest', 0):>6.0%}"
