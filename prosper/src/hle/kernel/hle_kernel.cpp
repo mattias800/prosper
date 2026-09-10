@@ -3481,7 +3481,35 @@ HLE(k_ef_wait)    { // (ef, pattern, waitMode, resultPat*, SceKernelUseconds* ti
             interruptible_cond_wait(&e->c, &e->m, GuestWaitKind::EventFlag, (uintptr_t)e);
     }
     bool deleted = e->deleted;                     // deleted under us -> EACCES (Kyty EventFlag.cpp)
+    // Cancelled under us. Reporting 0 here would be the same class of lie the unregistered NID told:
+    // the guest would read `res` as a pattern that MATCHED when nothing matched, and the CLEAR_ALL /
+    // CLEAR_PAT step below would then clear the very bits the cancel had just set for other threads.
+    // Setting `ret` suppresses that step, and it overrides the timed arm's ETIMEDOUT, which is set
+    // from "no match" and cannot tell a cancel from an expiry.
+    //
+    // CONFIDENCE: HIGH on the value, MED on this path as a whole, and the split matters because the
+    // two rest on different evidence.
+    //
+    // The VALUE is derived twice by independent routes, so it is not a guess: prosper's own table
+    // gives 0x80020000 | FreeBsd ECanceled(85) = 0x80020055 (sce_errno.hpp:112), and a secondary
+    // implementation independently reports the same constant for a cancelled event-flag wait (Kyty
+    // eventFlag.cpp / errno.h -- the same source this file's ETIMEDOUT and EACCES notes already cite).
+    //
+    // The PATH is not measured. The census that found the defect saw 0 parked waiters across 3000
+    // calls, so no local title reaches this line at all; what IS measured is that returning 0 is
+    // wrong, since the guest would then read a pattern that never matched. Two further details --
+    // that a cancelled waiter still receives the result pattern, and that it performs no CLEAR -- have
+    // no local evidence either way and follow the secondary implementation alone. That is a
+    // cross-check, not an authority: it is a work in progress like this one, so treat those two as the
+    // weakest claims here and re-derive them against a title that actually parks a waiter.
+    // The set-pattern is better supported: every observed call passes 0, where assigning and OR-ing
+    // differ (assign clears the flag, OR leaves it), and assigning is what carries PPSA29714 forward.
+    //
+    // prosper reaches all of this differently in any case -- a generation counter, so nothing
+    // busy-waits and a thread that parks after the cancel is not released by it.
+    const bool cancelled = e->cancel_gen != entry_cancel_gen;
     if (deleted) ret = 0x8002000Dull;
+    else if (cancelled) ret = 0x80020055ull;       // SCE_KERNEL_ERROR_ECANCELED
     uint64_t res = e->bits;
     if (!ret) { if (a2 & 0x10) e->bits = 0; else if (a2 & 0x20) e->bits &= ~a1; }  // CLEAR_ALL / CLEAR_PAT
     bool last = (--e->waiters == 0) && deleted;    // last waiter out of a deleted flag frees it
