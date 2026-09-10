@@ -173,10 +173,20 @@ int main() {
 #ifdef _WIN32
     const uint64_t invalid_start = base + len - page / 2; // crosses the reserved allocation boundary
 #else
-    const uint64_t invalid_start = base + 1;              // POSIX mprotect requires page alignment
+    // #3498: this used to be `base + 1`, chosen only because POSIX mprotect(2) rejected an
+    // unaligned base -- the comment said so. That was a way of PROVOKING a host failure, not a
+    // claim that the console refuses unaligned input, and sceKernelMprotect now rounds to the
+    // containing pages the way its sceKernelMtypeprotect sibling always has (a shipping title,
+    // PPSA21783, calls it with an unaligned base and length). The property #387 F3 protects is
+    // unchanged and is what this arm still tests: when the HOST call fails, the failure must reach
+    // the guest and must not retag the tracked reservation. So provoke it with an address that
+    // cannot be protected for a reason alignment has nothing to do with -- one page above the top
+    // of the user address space, which is page-aligned and can never be mapped.
+    const uint64_t invalid_start = 0x0000800000000000ull;
 #endif
-    CHECK((uint32_t)protect(invalid_start, page, 0x2, 0, 0, 0) == 0x80020016u,
-          "mprotect maps an invalid host span to SCE_KERNEL_ERROR_EINVAL");
+    const uint32_t invalid_rc = (uint32_t)protect(invalid_start, page, 0x2, 0, 0, 0);
+    CHECK(invalid_rc == 0x80020016u || invalid_rc == 0x8002000cu,
+          "mprotect reports a host protection failure to the guest as an SCE error");
     uint8_t failed_info[0x48]{};
     CHECK(query(base + len - page / 4, 0, (uint64_t)(uintptr_t)failed_info,
                 sizeof(failed_info), 0, 0) == 0 &&

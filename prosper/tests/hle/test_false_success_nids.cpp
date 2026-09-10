@@ -433,6 +433,62 @@ void test_kernel_memory_pool() {
     // covered by the live-boot evidence on #3500.
 }
 
+// sceKernelAprSubmitCommandBufferAndGetId (qvMUCyyaCSI) — the third member of the APR submit
+// family, and the one that was missing (#3498).
+//
+// The dispatcher's return-0 default is a false success in TWO ways here, and only one of them is
+// about the id. The obvious one: 0 is the answer for a contract whose return value IS the id the
+// guest then waits on. The one that actually stalls a title: the submit never runs, so the command
+// buffer's cursor is never released and the guest's append loop — which polls GetSize minus GetUsed
+// — has no room to encode its next command.
+//
+// THE CURSOR ARM NEEDS SOMETHING ON THE CURSOR TO BE MEANINGFUL. Written without the append below
+// it reads "the cursor is 0 after submit" on a buffer whose cursor was already 0, and passes
+// against a handler that invents an id and never submits — verified by that exact mutation, which
+// is how this arm's first draft was caught. The append is therefore checked too: it is the arm's
+// own positive control, and if it ever stops moving the cursor the reset check goes back to being
+// vacuous silently.
+void test_apr_submit_and_get_id() {
+    HleFn submit_id   = Hle::lookup("qvMUCyyaCSI");
+    HleFn set_buffer  = Hle::lookup("N-FSPA4S3nI");
+    HleFn get_offset  = Hle::lookup("GnxKOHEawhk");
+    HleFn append_320  = Hle::lookup("o67gODLFpls");   // appends a 0x20-byte completion command
+    HleFn construct   = Hle::lookup("8aI7R7WaOlc");   // sceAmprCommandBufferConstructor
+    CHECK(submit_id != nullptr,
+          "sceKernelAprSubmitCommandBufferAndGetId is registered (unregistered, its id is 0)");
+    if (!submit_id || !set_buffer || !get_offset || !append_320 || !construct) return;
+
+    // An unbound command buffer: no equeue, so the submit hands out prosper's own per-ring token
+    // rather than echoing a guest tag. Addresses are the same private shape the AMM test uses.
+    // CONSTRUCT before SetBuffer: the cursor is only tracked for a buffer that has been constructed
+    // with a capacity, which is the guest's own order and is why an attach-only fixture reports a
+    // cursor of 0 forever.
+    constexpr uint64_t kCb   = 0x7f0000110000ull;
+    constexpr uint64_t kBuf  = 0x7f0000120000ull;
+    constexpr uint64_t kSize = 0x40000ull;
+    // a2 carries the capacity in the shape that makes the constructor TRACK the cursor
+    // (ampr_cb_tracks_offset_arg); a1 = 0 leaves the request-shaped path alone.
+    construct(kCb, /*a1=*/0, /*a2=capacity=*/0x1000, 0, 0, 0);
+    set_buffer(kCb, kBuf, kSize, kBuf, 0, 3);
+
+    // Put a command on the buffer. eq = 0 keeps the binding unbound, which is the state this arm
+    // wants and also keeps the append from posting anything.
+    append_320(kCb, /*eq=*/0, /*id=*/0, /*tag=*/0, 0, 0);
+    const uint64_t appended = get_offset(kCb, 0, 0, 0, 0, 0);
+    CHECK(appended != 0,
+          "positive control: the append MOVED the command-buffer cursor (without this the reset "
+          "check below cannot fail)");
+
+    const uint64_t first = submit_id(kCb, /*ring_1based=*/6, 0, 0, 0, 0);
+    CHECK(first != 0, "the returned id is NOT zero -- zero is what the missing handler answered");
+    CHECK(get_offset(kCb, 0, 0, 0, 0, 0) == 0,
+          "the submit RESET the command-buffer cursor (the half that stalls an append loop)");
+
+    append_320(kCb, 0, 0, 0, 0, 0);
+    const uint64_t second = submit_id(kCb, /*ring_1based=*/6, 0, 0, 0, 0);
+    CHECK(second != first, "a second submit gets a DIFFERENT id (ids name submits, not the buffer)");
+}
+
 int main() {
     printf("== test_false_success_nids ==\n");
     register_builtin_hle();
@@ -440,6 +496,7 @@ int main() {
     test_nptrophy2_info_queries();
     test_savedata_transferring_mount();
     test_http_ids();
+    test_apr_submit_and_get_id();
     test_kernel_memory_pool();
     if (fails) { printf("== FAIL: %d check(s) failed ==\n", fails); return 1; }
     printf("== PASS ==\n");
