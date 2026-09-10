@@ -274,6 +274,15 @@ def cross_refs(tu, target: pathlib.Path, regions: list[dict]) -> dict[int, dict[
             ref = ch.referenced
             if ref is None:
                 continue
+            # A NAMESPACE cursor is not a reference to anything a split has to keep together. Every
+            # re-opening `namespace {` and `namespace prosper {` resolves `.referenced` to the
+            # namespace declaration, so the brace itself became an edge -- attributed to whichever
+            # body region happened to hold the first cursor carrying that USR. Measured on
+            # hle_kernel.cpp: 19 of 19 edges whose source is a replicated region were this, 13 of
+            # them pointing at `fbsd_errno`, and acting on them refused every legal two-part plan
+            # for the file. They are noise in every consumer, not only the splitter.
+            if ch.kind == ci.CursorKind.NAMESPACE or ref.kind == ci.CursorKind.NAMESPACE:
+                continue
             usr = ref.get_usr()
             if usr not in owner:
                 continue

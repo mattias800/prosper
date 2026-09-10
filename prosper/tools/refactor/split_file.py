@@ -185,11 +185,15 @@ def unresolved_across_parts(map_data: dict, plan: dict[str, list[int]]) -> dict[
     anon = anon_map(map_data["regions"])
     edges = {int(a): {int(b) for b in d} for a, d in map_data.get("edges", {}).items()}
     owner = {i: out for out, idxs in plan.items() for i in idxs}
-    # A REPLICATED region is copied into every output, so a reference FROM one is satisfied
-    # everywhere -- but a reference from it TO an internal definition in one part only is not.
-    # Dropping these edges wholesale (they have no owner) discarded 18 of them on one real map.
-    replicated = [r["index"] for r in map_data["regions"]
-                  if r.get("role") in ("preamble", "open", "close")]
+    # A PREAMBLE is copied into every output, so a reference from it to an internal definition in
+    # one part only is unsatisfied in the others. Restricted to `preamble` deliberately: an
+    # `open`/`close` region holds only the text clang gave no top-level cursor, since real code
+    # there would be its own body region, so that class is empty by construction -- and counting it
+    # was a live false-positive source. Every such edge measured on hle_kernel.cpp was a namespace
+    # re-opening brace whose `.referenced` resolved to the namespace decl, and acting on them
+    # refused every legal two-part plan for that file. `cross_refs` no longer emits them, and this
+    # is the second guard rather than the only one.
+    replicated = {r["index"] for r in map_data["regions"] if r.get("role") == "preamble"}
     missing: dict[int, set[str]] = {}
     for src, dests in edges.items():
         for dest in dests:
@@ -440,12 +444,20 @@ def selftest() -> int:
     check(set(unresolved_across_parts(anon_case, {"a.cpp": [1], "b.cpp": [2]})) == {1},
           "...and as INTERNAL when the scope walk says it is in an anonymous namespace")
 
-    # A REPLICATED region is copied into every output, so its references have to resolve in every
-    # output. Dropping those edges for want of an owner discarded 18 on a real map.
+    # A PREAMBLE is copied into every output, so its references have to resolve in every output.
     rep = {**xref_map, "regions": [dict(r) for r in xref_map["regions"]],
-           "edges": {"0": {"1": 1}}}                          # region 0 is the namespace `open`
+           "edges": {"0": {"1": 1}}}
+    rep["regions"][0] = {**rep["regions"][0], "role": "preamble"}
     check(set(unresolved_across_parts(rep, {"a.cpp": [1], "b.cpp": [2]})) == {1},
-          "a replicated region's reference to an internal definition is caught in the other part")
+          "a preamble's reference to an internal definition is caught in the other part")
+    # ...and an `open`/`close` source is NOT counted. That class is empty by construction -- real
+    # code there would be its own body region -- and counting it produced live false refusals: every
+    # such edge on hle_kernel.cpp was a namespace re-opening brace whose `.referenced` resolved to
+    # the namespace decl, which refused every legal two-part plan for that file.
+    ns_src = {**xref_map, "regions": [dict(r) for r in xref_map["regions"]],
+              "edges": {"0": {"1": 1}}}                       # region 0 stays the namespace `open`
+    check(not unresolved_across_parts(ns_src, {"a.cpp": [1], "b.cpp": [2]}),
+          "a namespace open/close is NOT treated as a replicated reference source")
 
     # THE GATE IS LAST, and it has to be: it used to sit in the middle of this function, so every
     # arm added after it printed [FAIL] and returned 0 anyway. Three mutations that disabled the
@@ -494,6 +506,18 @@ def main() -> int:
     print(f"  [ok]   map matches the file on disk (sha256 {actual[:12]})")
 
     plan = parse_plan(args.plan)
+    # BEFORE split() prints anything. A degraded parse degrades the TILING too, silently --
+    # regions_of pads the remainder with a TRAILER, so check_structure and reconstruction both pass
+    # on a map that does not describe the code. Two greens followed by "the map is unusable" reads
+    # as though the first two meant something.
+    if map_data.get("parse_errors"):
+        print(f"  [FAIL] the map records {map_data['parse_errors']} parse error(s); its region and "
+              f"reference data describe an incomplete AST.")
+        print("         Fix the parse and re-run map_symbols before splitting on it.")
+        return 1
+    if "parse_errors" not in map_data:
+        print("  [warn] this map predates parse-error recording; re-run map_symbols to have the "
+              "cross-reference check gated on a clean parse")
     outputs, problems = split(map_data, plan, original)
     if problems:
         for p in problems:
@@ -506,18 +530,6 @@ def main() -> int:
     # was lost, never that a line can still be USED where it ended up. Splitting gpu_capture.cpp's
     # serialize/deserialize into their own file passed all of them and then failed to compile with
     # 25 undeclared names, because internal-linkage definitions stayed in the other part.
-    # A map built on a partial AST describes a different file. The cross-reference check below is
-    # only as complete as the edges it reads, so a degraded parse would let it print [ok] having
-    # examined half of them -- the reassuring-silence failure this whole check exists to end.
-    if map_data.get("parse_errors"):
-        print(f"  [FAIL] the map records {map_data['parse_errors']} parse error(s); its region and "
-              f"reference data describe an incomplete AST.")
-        print("         Fix the parse and re-run map_symbols before splitting on it.")
-        return 1
-    if "parse_errors" not in map_data:
-        print("  [warn] this map predates parse-error recording; re-run map_symbols to have the "
-              "cross-reference check gated on a clean parse")
-
     stranded = unresolved_across_parts(map_data, plan)
     if stranded:
         regions = {r["index"]: r for r in map_data["regions"]}

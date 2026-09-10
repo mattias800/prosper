@@ -313,7 +313,13 @@ The reference matrix that answers it was already in the map. `split_file` reads 
 naming the definitions and printing the `promote_internal` command that fixes them. Measured against
 the compiler on that split: **23 names flagged, 25 reported by g++, and the two it did not name are
 `r` and `w`** -- local variables in cascading errors from `Reader r;` and `Writer w;`. No false
-positives.
+positives on that file.
+
+**The check cannot see inactive `#if` arms**, and that limit is not small: libclang parses one arm,
+so a map made on Linux carries no references from the 52% of `hle_kernel_mem.cpp` or the 30% of
+`hle_kernel.cpp` that sit behind a platform conditional. A split validated here can still strand a
+definition the other platform's arm uses. `survey_sizes.py` reports that share per file as
+`UNPARSED`; treat a clean result on such a file as a statement about the active arm only.
 
 `promote_internal` has the mirror of the same check, for the same reason.
 
