@@ -479,6 +479,27 @@ def selftest() -> int:
     check(not verify(SELF_SRC, SELF_MAP, [3, 4], hdr, src, "s_internal.hpp"),
           "verification passes on a correct promotion")
 
+    # THE PUBLIC GATE NEEDS A DECLARATION, not just a name that appears somewhere. `used_elsewhere`
+    # is a text grep and matches comments and string literals; a symbol no header declares cannot be
+    # referenced from another translation unit at all, so such a match is necessarily noise.
+    pub_regs = {1: {"index": 1, "kind": "FUNCTION_DECL", "name": "alpha",
+                    "usr": "c:@F@alpha#", "declared_in_header": False},
+                2: {"index": 2, "kind": "FUNCTION_DECL", "name": "beta",
+                    "usr": "c:@F@beta#", "declared_in_header": True}}
+
+    def gate(i, grep_hit):
+        r = pub_regs[i]
+        if not r["usr"].startswith("c:@") or r["kind"] not in ("FUNCTION_DECL", "VAR_DECL"):
+            return False
+        if "declared_in_header" in r and not r["declared_in_header"]:
+            return False
+        return grep_hit
+
+    check(not gate(1, True),
+          "a name matched elsewhere but declared by no header is NOT treated as public")
+    check(gate(2, True), "...while one a header declares is")
+    check(not gate(2, False), "and a declared symbol nothing mentions is not either")
+
     # DECLARATIONS THE HEADER OWES. Extracted out of main() specifically so it is reachable here:
     # the rule it implements was wrong for as long as it was unreachable, and the comment above it
     # already stated the correct rule while the code did something narrower.
@@ -677,10 +698,32 @@ def main() -> int:
     def externally_linked(i: int) -> bool:
         return region_is_external(regions[i], anon.get(i, False))
 
-    public = [i for i in promote
-              if externally_linked(i)
-              and regions[i]["kind"] in ("FUNCTION_DECL", "VAR_DECL")
-              and used_elsewhere(regions[i]["name"])]
+    # AND A HEADER MUST DECLARE IT. `used_elsewhere` is a `git grep -w` over source files, so it
+    # matches comments and string literals -- the failure recorded just above for
+    # `make_shader_compile_key`, guarded there only for anonymous-namespace symbols. External
+    # linkage is not enough on its own: another translation unit cannot legally reference a symbol
+    # nothing declares, so a text match on such a name is necessarily a comment or an unrelated
+    # entity, exactly as it is for an anonymous-namespace one.
+    #
+    # Measured: `safe_execz_branches` in rdna2_to_spirv.cpp is external, declared in no header, and
+    # named three times in test_recompile_coverage.cpp -- twice in an assertion STRING and once in
+    # a comment. That held back a legitimate promotion and left a five-way split with no legal
+    # arrangement, since three of the parts call it.
+    #
+    # `declared_in_header` comes from the AST rather than from text, so this is a real check rather
+    # than a better grep. Maps predating the field fall back to the old behaviour, where
+    # over-excluding is the safe direction: the symbol stays put and the split is refused, rather
+    # than a definition other translation units link against becoming `inline` in a header they do
+    # not include.
+    def maybe_public(i: int) -> bool:
+        r = regions[i]
+        if not externally_linked(i) or r["kind"] not in ("FUNCTION_DECL", "VAR_DECL"):
+            return False
+        if "declared_in_header" in r and not r["declared_in_header"]:
+            return False
+        return used_elsewhere(r["name"])
+
+    public = [i for i in promote if maybe_public(i)]
     if public:
         print(f"  [ok]   {len(public)} region(s) are referenced outside this file and are NOT "
               f"promoted; they keep their single out-of-line definition:")
