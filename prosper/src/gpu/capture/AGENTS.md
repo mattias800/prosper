@@ -3,8 +3,10 @@
 Serializes a live frame — commands, shaders, resources, and the renderer-owned targets it samples —
 into a `.prgbundle` / `.prgcap` that `tools/gpu_replay` can reproduce offline and deterministically.
 
-- `gpu_capture` — collecting a frame: intervals, tables, submit items, and the entry points
-  that begin, finish and materialize a capture.
+- `gpu_capture` — the capture lifecycle: begin, finish, materialize, and the pending-capture
+  plumbing behind the F9 grab and the scheduled triggers.
+- `capture_collect` — gathering a frame's contents: intervals, tables, submit items, raw shader
+  versions, failure diagnostics.
 - `serialize/` — the file format, in its own folder: byte cursors, per-field codecs, and the two
   entry points. See its `AGENTS.md`; the boundary against this folder is the version contract.
 - `gpu_capture_internal` — the vocabulary those two share: magic/version/limits, footprint
