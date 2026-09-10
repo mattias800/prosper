@@ -178,6 +178,19 @@ if(Python3_Interpreter_FOUND)
   # under tools/refactor/testdata/ that the selftest scores ONLY where libclang is importable, and
   # it says loudly when it skips them. libclang resolves lazily, so the arithmetic half runs here
   # even though the surveying itself needs a libclang the runner does not have.
+  # map_symbols' clustering decides where a split cuts, and its failure mode is a confident wrong
+  # proposal rather than a crash -- one draft collapsed a 6,515-line file into a single 6,374-line
+  # "part" and reported a 0% cut. Pure arithmetic over the reference matrix, and libclang resolves
+  # lazily there now, so this runs on a runner that has none.
+  # split_file.py was in NO ctest case at all, so a "3/3 refactor tests pass" said nothing about
+  # the splitter -- including a cross-reference check whose arms could not fail. Both gaps found in
+  # the same review.
+  add_test(NAME refactor_split_file
+           COMMAND "${Python3_EXECUTABLE}"
+                   "${CMAKE_SOURCE_DIR}/tools/refactor/split_file.py" --selftest)
+  add_test(NAME refactor_map_symbols_clusters
+           COMMAND "${Python3_EXECUTABLE}"
+                   "${CMAKE_SOURCE_DIR}/tools/refactor/map_symbols.py" --selftest)
   add_test(NAME refactor_survey_classifier
            COMMAND "${Python3_EXECUTABLE}"
                    "${CMAKE_SOURCE_DIR}/tools/refactor/survey_sizes.py" --selftest)

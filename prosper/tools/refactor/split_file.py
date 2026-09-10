@@ -133,6 +133,94 @@ def check_structure(regions: list[dict], total_lines: int) -> list[str]:
     return problems
 
 
+def anon_map(regions: list[dict]) -> dict[int, bool]:
+    """Which regions sit inside an anonymous namespace, from the open/close markers in the map."""
+    stack: list[str] = []
+    out: dict[int, bool] = {}
+    for r in regions:
+        if r.get("role") == "open":
+            stack.append(r["name"])
+        out[r["index"]] = "<anonymous>" in stack
+        if r.get("role") == "close" and stack:
+            stack.pop()
+    return out
+
+
+def region_is_external(region: dict, in_anon_namespace: bool = False) -> bool:
+    """External linkage, from the USR clang recorded, falling back to the scope walk.
+
+    Same rule as promote_internal's: an external entity's USR starts `c:@`, an internal one is
+    file-prefixed. A `static` free function is internal WITHOUT being in an anonymous namespace, so
+    the scope walk alone gets it wrong -- which is why the USR is preferred.
+
+    THE FALLBACK MATTERS AND THE FIRST VERSION HAD IT INVERTED. With no USR this returned False,
+    i.e. "internal", and the regions that actually lack one are `LINKAGE_SPEC` -- `extern "C"`, the
+    least internal thing in the language -- plus `INCLUSION_DIRECTIVE`. Measured: 0 of 155 body
+    regions in gpu_capture.cpp, but 7 of 333 in hle_kernel.cpp, four of them LINKAGE_SPEC. The one
+    reachable case happened to be a declaration, so the answer was right for the wrong reason, while
+    `extern "C" __attribute__((weak))` DEFINITIONS in the same file would have been refused
+    falsely. The scope walk is the honest fallback and the map already carries what it needs.
+    """
+    usr = region.get("usr") or ""
+    if usr:
+        return usr.startswith("c:@")
+    return not in_anon_namespace
+
+
+def unresolved_across_parts(map_data: dict, plan: dict[str, list[int]]) -> dict[int, set[str]]:
+    """Regions each output part references that live in ANOTHER part and cannot be seen from it.
+
+    This is the check that was missing, and its absence is not theoretical: splitting
+    gpu_capture.cpp's serialize/deserialize into their own file passed every existing check --
+    tiling, partition, byte-for-byte reconstruction -- and then failed to compile with 25 distinct
+    undeclared names (`Writer`, `Reader`, `kMagic`, `read_table`, ...), because those definitions
+    have internal linkage and stayed behind in the other part.
+
+    Every existing check here is byte accounting: it establishes that no LINE was lost. None of them
+    can see that a line ended up somewhere it cannot be used from. The reference matrix that answers
+    it is already in the map, put there by map_symbols precisely because "a split that separates an
+    internal-linkage helper from its callers does not fail at review, it fails at link".
+    """
+    regions = {r["index"]: r for r in map_data["regions"]}
+    anon = anon_map(map_data["regions"])
+    edges = {int(a): {int(b) for b in d} for a, d in map_data.get("edges", {}).items()}
+    owner = {i: out for out, idxs in plan.items() for i in idxs}
+    # A PREAMBLE is copied into every output, so a reference from it to an internal definition in
+    # one part only is unsatisfied in the others. NO SUCH EDGE HAS BEEN OBSERVED -- 0 on both real
+    # maps -- so this guards a class that is unobserved rather than impossible, and the distinction
+    # is deliberate: the `open`/`close` exclusion below IS airtight (a tiling fact -- real code
+    # between those braces would be its own body region), while "a preamble references nothing"
+    # rests on a C++ ordering argument, and map_symbols.py:211-215 says in its own words that a
+    # stray declaration above the first namespace lands in the preamble ON PURPOSE. Restricted to
+    # `preamble` because counting open/close was a live false-positive source. Every such edge measured on hle_kernel.cpp was a namespace
+    # re-opening brace whose `.referenced` resolved to the namespace decl, and acting on them
+    # refused every legal two-part plan for that file. `cross_refs` no longer emits them, and this
+    # is the second guard rather than the only one.
+    replicated = {r["index"] for r in map_data["regions"] if r.get("role") == "preamble"}
+    missing: dict[int, set[str]] = {}
+    for src, dests in edges.items():
+        for dest in dests:
+            if dest not in owner:
+                continue
+            r = regions.get(dest, {})
+            if r.get("role") != "body" or region_is_external(r, anon.get(dest, False)):
+                continue                      # visible across translation units; nothing to do
+            if src in owner:
+                if owner[dest] == owner[src]:
+                    continue
+                users = {owner[src]}
+            elif src in replicated:
+                # Copied into EVERY output, so it needs the definition in every output that is not
+                # the one holding it.
+                users = {o for o in plan if o != owner[dest]}
+                if not users:
+                    continue
+            else:
+                continue
+            missing.setdefault(dest, set()).update(users)
+    return missing
+
+
 def split(map_data: dict, plan: dict[str, list[int]], source_text: str,
           preamble_note: str = "") -> tuple[dict[str, str], list[str]]:
     """Pure: returns (outfile -> text, problems). Drives both the real run and --selftest."""
@@ -327,10 +415,64 @@ def selftest() -> int:
     check(verify_reconstruction(SAMPLE_MAP, {"a.cpp": [1], "b.cpp": [2]}, tampered, SAMPLE),
           "reconstruction check FAILS when an output is altered")
 
+    # REFERENCES ACROSS THE CUT. Byte accounting cannot see this: the split below is a perfect
+    # partition with perfect reconstruction, and does not compile. `beta` calls `alpha`, `alpha` has
+    # internal linkage (a file-prefixed USR), and the plan puts them in different files.
+    xref_map = {**SAMPLE_MAP, "regions": [dict(r) for r in SAMPLE_MAP["regions"]],
+                "edges": {"2": {"1": 3}}}
+    xref_map["regions"][1]["usr"] = "c:s.cpp@F@alpha#"        # internal linkage
+    xref_map["regions"][2]["usr"] = "c:s.cpp@F@beta#"
+    stranded = unresolved_across_parts(xref_map, {"a.cpp": [1], "b.cpp": [2]})
+    check(set(stranded) == {1},
+          f"an internal-linkage definition called from the other part is caught (got {stranded})")
+    check(not unresolved_across_parts(xref_map, {"a.cpp": [1, 2]}),
+          "and nothing is flagged when the caller and callee land in the same file")
+    # The linkage test is the discriminator, not the edge: an EXTERNAL definition is visible from
+    # the other translation unit, so splitting across it is legal and must not be refused. Without
+    # this arm the check could refuse every cross-part edge and still look correct above.
+    ext_map = {**xref_map, "regions": [dict(r) for r in xref_map["regions"]]}
+    ext_map["regions"][1]["usr"] = "c:@F@alpha#"              # external linkage
+    check(not unresolved_across_parts(ext_map, {"a.cpp": [1], "b.cpp": [2]}),
+          "an EXTERNAL definition called across the cut is not flagged")
+
+    # NO USR: the fallback is the scope walk, not a constant. An `extern "C"` definition records
+    # no USR and is EXTERNAL, so a bare `return False` refused it as internal -- the inverted
+    # default this replaced.
+    nousr = {**xref_map, "regions": [dict(r) for r in xref_map["regions"]]}
+    nousr["regions"][1]["usr"] = ""
+    check(not unresolved_across_parts(nousr, {"a.cpp": [1], "b.cpp": [2]}),
+          "a definition with no USR outside an anonymous namespace is treated as EXTERNAL")
+    anon_case = {**nousr, "regions": [dict(r) for r in nousr["regions"]]}
+    anon_case["regions"][0]["name"] = "<anonymous>"           # the open marker now names it
+    check(set(unresolved_across_parts(anon_case, {"a.cpp": [1], "b.cpp": [2]})) == {1},
+          "...and as INTERNAL when the scope walk says it is in an anonymous namespace")
+
+    # A PREAMBLE is copied into every output, so its references have to resolve in every output.
+    rep = {**xref_map, "regions": [dict(r) for r in xref_map["regions"]],
+           "edges": {"0": {"1": 1}}}
+    rep["regions"][0] = {**rep["regions"][0], "role": "preamble"}
+    check(set(unresolved_across_parts(rep, {"a.cpp": [1], "b.cpp": [2]})) == {1},
+          "a preamble's reference to an internal definition is caught in the other part")
+    # ...and an `open`/`close` source is NOT counted. That class is empty by construction -- real
+    # code there would be its own body region -- and counting it produced live false refusals: every
+    # such edge on hle_kernel.cpp was a namespace re-opening brace whose `.referenced` resolved to
+    # the namespace decl, which refused every legal two-part plan for that file.
+    ns_src = {**xref_map, "regions": [dict(r) for r in xref_map["regions"]],
+              "edges": {"0": {"1": 1}}}                       # region 0 stays the namespace `open`
+    check(not unresolved_across_parts(ns_src, {"a.cpp": [1], "b.cpp": [2]}),
+          "a namespace open/close is NOT treated as a replicated reference source")
+
+    # THE GATE IS LAST, and it has to be: it used to sit in the middle of this function, so every
+    # arm added after it printed [FAIL] and returned 0 anyway. Three mutations that disabled the
+    # cross-reference check each printed a failure line and exited clean, and `main()`'s own
+    # `if selftest(): return 1` guard was defeated with it -- the tool would have run on a
+    # selftest it had already failed. Checking a mutation by reading the printed line rather than
+    # the exit status is what hid it; the two disagreed.
     if bad:
         print("  the splitter's own guarantees are broken; it must not be run")
         return 1
-    print("  [ok]   splitter self-test: replication, partition, tiling, #if, reconstruction")
+    print("  [ok]   splitter self-test: replication, partition, tiling, #if, reconstruction, "
+          "cross-part references")
     return 0
 
 
@@ -367,6 +509,18 @@ def main() -> int:
     print(f"  [ok]   map matches the file on disk (sha256 {actual[:12]})")
 
     plan = parse_plan(args.plan)
+    # BEFORE split() prints anything. A degraded parse degrades the TILING too, silently --
+    # regions_of pads the remainder with a TRAILER, so check_structure and reconstruction both pass
+    # on a map that does not describe the code. Two greens followed by "the map is unusable" reads
+    # as though the first two meant something.
+    if map_data.get("parse_errors"):
+        print(f"  [FAIL] the map records {map_data['parse_errors']} parse error(s); its region and "
+              f"reference data describe an incomplete AST.")
+        print("         Fix the parse and re-run map_symbols before splitting on it.")
+        return 1
+    if "parse_errors" not in map_data:
+        print("  [warn] this map predates parse-error recording; re-run map_symbols to have the "
+              "cross-reference check gated on a clean parse")
     outputs, problems = split(map_data, plan, original)
     if problems:
         for p in problems:
@@ -374,6 +528,31 @@ def main() -> int:
         return 1
     print(f"  [ok]   partition: {sum(len(v) for v in plan.values())} body region(s) -> "
           f"{len(plan)} file(s); namespace open/close replicated into each")
+
+    # REFERENCES ACROSS THE CUT. Every check above is byte accounting -- it establishes that no line
+    # was lost, never that a line can still be USED where it ended up. Splitting gpu_capture.cpp's
+    # serialize/deserialize into their own file passed all of them and then failed to compile with
+    # 25 undeclared names, because internal-linkage definitions stayed in the other part.
+    stranded = unresolved_across_parts(map_data, plan)
+    if stranded:
+        regions = {r["index"]: r for r in map_data["regions"]}
+        print(f"  [FAIL] {len(stranded)} definition(s) with internal linkage are referenced from a "
+              f"part they are not in:")
+        for i in sorted(stranded)[:10]:
+            users = ", ".join(sorted(stranded[i]))
+            print(f"           {regions[i].get('name', '?')}  (in "
+                  f"{[o for o, v in plan.items() if i in v][0]}, needed by {users})")
+        if len(stranded) > 10:
+            print(f"           ... and {len(stranded) - 10} more")
+        promote = ",".join(str(i) for i in sorted(stranded))
+        print("         These have to be visible from both sides before the cut. Promote them "
+              "first:")
+        print(f"           promote_internal.py --map <this map> --regions {promote} \\")
+        print("               --header <name>_internal.hpp --namespace prosper::gpu")
+        print("         then re-run map_symbols (the promotion changes every region index) and "
+              "re-plan.")
+        return 1
+    print(f"  [ok]   no internal-linkage definition is referenced from a part it is not in")
 
     if args.dry_run:
         for out, text in sorted(outputs.items()):

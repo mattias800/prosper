@@ -255,6 +255,74 @@ would be ranked as needing no work. One file is currently in that state:
 `frontends/prosper-app/main.cpp`, which has no compile command unless the app is configured
 (`-DPROSPER_APP=ON`); configure with it to bring that file into the survey.
 
+### Choosing where to cut
+
+`map_symbols.py --clusters [N]` groups the file's regions by what they actually reference, and
+reports the cost of the seam it proposes:
+
+```
+== proposed seams: 9 group(s), target ~2149 lines each == -- you asked for 3, and the reference
+   structure plus that size cap do not permit fewer
+   252 of 2927 references cross a boundary (9%) -- that is the promote-to-header list
+   83 merge(s) the references wanted were refused by the size cap; a group AT the cap is the cap
+   talking, not a seam
+```
+
+The cross-boundary count is the number that matters, because those are the internal-linkage edges
+the REFERENCES section warns about -- a split that separates a `static` helper from its callers
+*"does not fail at review, it fails at link"*. Having the list up front turns `promote_internal.py`
+into a decision instead of a compile-error hunt.
+
+**Two things it says about itself, and both are load-bearing.** A group sitting exactly AT the size
+cap is the cap talking, not a structural seam -- it stopped there because it was told to. And the
+part count is what the references and the cap allow, not what you asked for; the tool says so rather
+than forcing the number. Grouping by NAME finds none of this: on `gpu_executor.cpp` a name-prefix
+pass put 183 of 273 regions in "other".
+
+**A 0% cut is a tell, not a success.** An early draft let attachment ignore the cap, which funnelled
+every group into the largest connected component -- one 6,374-line "part" out of 6,515 lines,
+reported as a perfect zero-cut split. That is pinned by a selftest arm now, with the fixture built so
+the defect changes the group COUNT rather than merely a number.
+
+### The three tools are a chain, and each one checks the step before it
+
+`map_symbols` proposes a seam, `promote_internal` makes the shared vocabulary visible, `split_file`
+cuts. The middle step is not always needed -- 42 of `gpu_capture.cpp`'s 155 body regions are already
+external, and a seam that only crosses those needs no promotion at all. What the order buys is that
+**whether you need it is now decidable before the cut** rather than at build time:
+
+```bash
+map_symbols.py  --file <f> --clusters 3 --json ~/work/f.json   # where to cut, and what it costs
+split_file.py   --map ~/work/f.json --plan <plan> --dry-run    # refuses, naming what to promote
+promote_internal.py --map ~/work/f.json --regions <closure> --header <f>_internal.hpp
+map_symbols.py  --file <f> --json ~/work/f2.json               # promotion changes every index
+split_file.py   --map ~/work/f2.json --plan <plan> --dry-run
+```
+
+(Maps go under `$HOME`, not `/tmp`: that is a RAM-backed tmpfs here with a quota shared by every
+concurrent agent.)
+
+**Both closure checks exist because their absence was measured, not imagined.** Splitting
+`gpu_capture.cpp`'s serialize/deserialize into their own file satisfied every check `split_file`
+*then had* -- exact tiling, a clean partition, byte-for-byte reconstruction -- and failed to compile
+with **25 undeclared names**, because `Writer`, `Reader`, `kMagic`, `read_table` and twenty others have
+internal linkage and stayed in the other part. Every one of those checks is byte accounting: they
+establish that no LINE was lost, never that a line can still be used where it ended up.
+
+The reference matrix that answers it was already in the map. `split_file` reads it now and refuses,
+naming the definitions and printing the `promote_internal` command that fixes them. Measured against
+the compiler on that split: **23 names flagged, 25 reported by g++, and the two it did not name are
+`r` and `w`** -- local variables in cascading errors from `Reader r;` and `Writer w;`. No false
+positives on that file.
+
+**The check cannot see inactive `#if` arms**, and that limit is not small: libclang parses one arm,
+so a map made on Linux carries no references from the 52% of `hle_kernel_mem.cpp` or the 30% of
+`hle_kernel.cpp` that sit behind a platform conditional. A split validated here can still strand a
+definition the other platform's arm uses. `survey_sizes.py` reports that share per file as
+`UNPARSED`; treat a clean result on such a file as a statement about the active arm only.
+
+`promote_internal` has the mirror of the same check, for the same reason.
+
 ### Running it
 
 ```bash
@@ -262,10 +330,13 @@ python3 prosper/tools/refactor/survey_sizes.py --min-lines 2500     # needs libc
 python3 prosper/tools/refactor/survey_sizes.py --selftest           # no libclang needed
 ```
 
-`--selftest` runs the classifier's arithmetic cases always, and the four `testdata/` measurement
-checks **only where libclang is importable** -- saying so explicitly, and naming them, when it skips
-them. Those are the checks covering how the classifier's INPUTS are measured, and every defect this
-tool shipped lived there rather than in the arithmetic. The registered ctest case
+`--selftest` runs the classifier's arithmetic cases always, and the four measurement checks **only
+where libclang is importable** -- three of them score committed fixtures under `testdata/`, while the
+fourth builds a hard link in a temporary directory, because the property it needs (two paths naming
+one file that `resolve()` reports as different) cannot be committed as a fixture. `--selftest` says
+so explicitly, and names them, when it skips them. Those are the checks covering how the
+classifier's INPUTS are measured, and every defect this tool shipped lived there rather than in the
+arithmetic. The registered ctest case
 (`refactor_survey_classifier`) therefore gates the arithmetic everywhere and the measurement locally.
 
 **The invariant that makes incremental extraction safe is worth copying.** When a block was extracted

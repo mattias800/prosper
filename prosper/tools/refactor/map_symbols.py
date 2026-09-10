@@ -24,7 +24,8 @@ This reports two things about a file, both from clang's own AST:
 
 Usage:
   python3 prosper/tools/refactor/map_symbols.py --file prosper/src/gpu/recompiler/rdna2_to_spirv.cpp
-  ... --clusters      # suggest seams: greedily group regions that reference each other
+  ... --clusters [N]  # suggest seams: greedily group regions that reference each other
+                      #   into N parts (default 6), reporting the cut cost
   ... --json out.json # machine-readable, for split_file.py
 
 Flags come from the build's compile_commands.json, so the parse sees exactly what the compiler sees.
@@ -40,14 +41,27 @@ import subprocess
 import sys
 from collections import defaultdict
 
-import clang.cindex as ci
+# libclang is imported LAZILY. Everything that parses needs it, and `propose_clusters` -- which
+# decides where a split should cut -- does not: it is arithmetic over the reference matrix. Keeping
+# the import out of module scope is what lets `--selftest` pin that arithmetic on a machine with no
+# libclang, which is the shape of this project's CI. `survey_sizes.py` resolves it the same way and
+# for the same reason.
+ci = None
 
-# The bindings look for a bare `libclang.so`, which the runtime package does not ship; the versioned
-# soname is what is actually installed. Fail loudly rather than letting a later call die obscurely.
-for cand in ("/usr/lib64/libclang.so.22.1", "/usr/lib64/libclang.so"):
-    if pathlib.Path(cand).exists():
-        ci.Config.set_library_file(cand)
-        break
+
+def _need_clang() -> None:
+    global ci
+    if ci is not None:
+        return
+    import clang.cindex as _ci
+    # The bindings look for a bare `libclang.so`, which the runtime package does not ship; the
+    # versioned soname is what is actually installed. Fail loudly rather than letting a later call
+    # die obscurely.
+    for cand in ("/usr/lib64/libclang.so.22.1", "/usr/lib64/libclang.so"):
+        if pathlib.Path(cand).exists():
+            _ci.Config.set_library_file(cand)
+            break
+    ci = _ci                              # last: this is the guard the early return above tests
 
 
 def repo_root() -> pathlib.Path:
@@ -260,6 +274,15 @@ def cross_refs(tu, target: pathlib.Path, regions: list[dict]) -> dict[int, dict[
             ref = ch.referenced
             if ref is None:
                 continue
+            # A NAMESPACE cursor is not a reference to anything a split has to keep together. Every
+            # re-opening `namespace {` and `namespace prosper {` resolves `.referenced` to the
+            # namespace declaration, so the brace itself became an edge -- attributed to whichever
+            # body region happened to hold the first cursor carrying that USR. Measured on
+            # hle_kernel.cpp: 19 of 19 edges whose source is a replicated region were this, 13 of
+            # them pointing at `fbsd_errno`, and acting on them refused every legal two-part plan
+            # for the file. They are noise in every consumer, not only the splitter.
+            if ch.kind == ci.CursorKind.NAMESPACE or ref.kind == ci.CursorKind.NAMESPACE:
+                continue
             usr = ref.get_usr()
             if usr not in owner:
                 continue
@@ -292,16 +315,216 @@ def cross_refs(tu, target: pathlib.Path, regions: list[dict]) -> dict[int, dict[
     return {k: dict(v) for k, v in edges.items()}
 
 
+def propose_clusters(regions, edges, parts: int) -> tuple[list[list[int]], dict]:
+    """Group body regions into PARTS candidate output files, cutting where the references are thin.
+
+    Greedy agglomeration over the reference matrix, heaviest edge first, which is what the file's
+    REFERENCES section is for: an internal-linkage helper separated from its callers does not fail
+    at review, it fails at link. Grouping on that matrix puts them on the same side by construction.
+
+    The size cap is reported rather than hidden, because it is the part that lies. Two groups landing
+    on the same line count means the CAP stopped the merge, not that a seam is there -- so the
+    summary marks which boundaries are structural and which are the cap talking. Grouping by NAME
+    does not find these: on gpu_executor.cpp a name-prefix pass put 183 of 273 regions in "other".
+    """
+    body = {r["index"]: r for r in regions if r["role"] == "body"}
+    size = {i: r["end"] - r["start"] + 1 for i, r in body.items()}
+    total = sum(size.values())
+    cap = max(1, total // max(1, parts))
+
+    w: dict[tuple[int, int], int] = {}
+    for a, ds in edges.items():
+        for b, n in ds.items():
+            if a in body and b in body and a != b:
+                key = (min(a, b), max(a, b))
+                w[key] = w.get(key, 0) + n
+
+    parent = {i: i for i in body}
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+    csize = dict(size)
+    capped = 0
+    for (a, b), _ in sorted(w.items(), key=lambda kv: -kv[1]):
+        ra, rb = find(a), find(b)
+        if ra == rb:
+            continue
+        if csize[ra] + csize[rb] > cap:
+            capped += 1               # a merge the references wanted and the cap refused
+            continue
+        parent[rb] = ra
+        csize[ra] += csize[rb]
+
+    groups: dict[int, list[int]] = {}
+    for i in body:
+        groups.setdefault(find(i), []).append(i)
+
+    # SECOND PASS: attach the tail. A cap-driven greedy leaves a long run of singletons -- 30 of 41
+    # on gpu_capture.cpp -- and a proposal the caller then has to place by hand is not a proposal.
+    # Merge the smallest group into whichever group it references most, ignoring the cap, until the
+    # requested part count is reached. A region with no cross-references at all has nothing to
+    # attach to and stays where it is; that is information, not a failure.
+    def edge_between(g1, g2):
+        return sum(w.get((min(a, b), max(a, b)), 0) for a in g1 for b in g2)
+
+    # The cap binds here too, and that is the whole difference between a proposal and a lie. Without
+    # it, "attach the smallest to whatever it references most" funnels every group into the largest
+    # connected component: on this file it produced ONE 6,374-line group out of 6,515 and reported a
+    # 0% cut -- a split that is not a split, wearing a perfect score. A 0% cut is a tell.
+    # So attachment stops at the cap, the part count is whatever the structure and the cap allow,
+    # and the caller is told when that is more than they asked for.
+    while True:
+        keys = sorted(groups, key=lambda k: sum(size[i] for i in groups[k]))
+        if len(keys) <= parts:
+            break
+        moved = False
+        for k in keys:
+            ksz = sum(size[i] for i in groups[k])
+            best, best_w = None, 0
+            for other in keys:
+                if other == k or sum(size[i] for i in groups[other]) + ksz > cap:
+                    continue
+                ww = edge_between(groups[k], groups[other])
+                if ww > best_w:
+                    best, best_w = other, ww
+            if best is not None:
+                groups[best] += groups[k]
+                del groups[k]
+                moved = True
+                break
+        if not moved:
+            break            # nothing can grow without breaching the cap; report what there is
+
+    out = sorted(groups.values(), key=lambda g: -sum(size[i] for i in g))
+    gid = {i: n for n, g in enumerate(out) for i in g}
+    cut = sum(n for (a, b), n in w.items() if gid[a] != gid[b])
+    stats = {"cut": cut, "total_refs": sum(w.values()), "cap": cap, "capped_merges": capped,
+             "singletons": sum(1 for g in out if len(g) == 1), "asked": parts}
+    return out, stats
+
+
+def print_clusters(regions, edges, parts: int) -> None:
+    body = {r["index"]: r for r in regions if r["role"] == "body"}
+    size = {i: r["end"] - r["start"] + 1 for i, r in body.items()}
+    groups, st = propose_clusters(regions, edges, parts)
+    share = st["cut"] / st["total_refs"] if st["total_refs"] else 0.0
+    over = (f" -- you asked for {st['asked']}, and the reference structure plus that size cap do "
+            f"not permit fewer" if len(groups) > st["asked"] else "")
+    print(f"\n== proposed seams: {len(groups)} group(s), target ~{st['cap']} lines each =={over}")
+    print(f"   {st['cut']} of {st['total_refs']} references cross a boundary ({share:.0%}) -- that "
+          f"is the promote-to-header list")
+    print(f"   {st['capped_merges']} merge(s) the references wanted were refused by the size cap; "
+          f"a group AT the cap is the cap talking, not a seam")
+    print(f"   {st['singletons']} group(s) of one region\n")
+    for n, g in enumerate(groups):
+        lines = sum(size[i] for i in g)
+        at_cap = " <- at the cap" if lines >= st["cap"] else ""
+        tops = sorted(g, key=lambda i: -size[i])[:3]
+        names = ", ".join(f"{body[i]['name']}({size[i]})" for i in tops)
+        print(f"  [{n}] {len(g):>4} region(s) {lines:>6}L{at_cap}")
+        print(f"       {names[:96]}")
+        plan = " ".join(str(i) for i in sorted(g))
+        # NOT truncated. This line exists to be copy-pasted into split_file.py; a silent cut at 300
+        # characters drops every region past about the hundredth and yields a plan that is a valid
+        # prefix of the right answer, which is the worst failure available here. split_file.py
+        # catches an incomplete partition, but only after the caller has run it.
+        print(f"       plan: {plan}")
+
+
+def selftest() -> int:
+    """Pin propose_clusters. Pure arithmetic over the reference matrix, so it runs without libclang.
+
+    The clustering is the part that decides where a split cuts, and its failure mode is not a crash:
+    it is a confident proposal that is wrong. Both arms below were live defects during development.
+    """
+    bad = 0
+
+    def check(cond, label):
+        nonlocal bad
+        if not cond:
+            print(f"  [FAIL] {label}")
+            bad += 1
+
+    # Two tight clusters, 100 lines each, joined by ONE weak edge. The seam is obvious by
+    # construction, which is what makes it a usable oracle.
+    regions = [{"index": 0, "start": 1, "end": 1, "role": "open", "name": "ns"}]
+    line = 2
+    for i in range(1, 5):
+        regions.append({"index": i, "start": line, "end": line + 24, "role": "body",
+                        "name": f"a{i}"})
+        line += 25
+    for i in range(5, 9):
+        regions.append({"index": i, "start": line, "end": line + 24, "role": "body",
+                        "name": f"b{i}"})
+        line += 25
+    edges = {1: {2: 50, 3: 50, 4: 50}, 2: {3: 50, 4: 50}, 3: {4: 50},
+             5: {6: 50, 7: 50, 8: 50}, 6: {7: 50, 8: 50}, 7: {8: 50},
+             4: {5: 1}}
+    groups, st = propose_clusters(regions, edges, 2)
+    check(len(groups) == 2, f"two clusters joined by one weak edge split in two (got {len(groups)})")
+    check(all(len(g) == 4 for g in groups), f"and evenly (got {[len(g) for g in groups]})")
+    check(st["cut"] == 1, f"cutting exactly the weak edge (got {st['cut']})")
+
+    # THE CAP MUST BIND DURING ATTACHMENT. Without it, "attach the smallest group to whatever it
+    # references most" funnels everything into the largest connected component: measured on
+    # gpu_capture.cpp it produced ONE 6,374-line group out of 6,515 and reported a 0% cut -- a
+    # split that is not a split, wearing a perfect score. A 0% cut over a non-trivial graph is a
+    # tell, not a success, so it is asserted against directly.
+    cap = st["cap"]
+    check(all(sum(regions[i]["end"] - regions[i]["start"] + 1 for i in g) <= cap * 1.5
+              for g in groups),
+          "no group runs away past the size cap")
+    # The fixture has to make the FIRST pass leave more groups than asked for, or the attachment
+    # loop never runs and the arm certifies nothing -- checked by mutation, not assumed. Six regions
+    # of 100 lines with parts=4 gives a cap of 150, so no two can merge (200 > 150): the greedy
+    # leaves six, attachment is entered, and the cap is the only thing standing between six groups
+    # and one.
+    big = [{"index": 0, "start": 1, "end": 1, "role": "open", "name": "ns"}]
+    ln = 2
+    for i in range(1, 7):
+        big.append({"index": i, "start": ln, "end": ln + 99, "role": "body", "name": f"c{i}"})
+        ln += 100
+    dense = {i: {j: 10 for j in range(1, 7) if j != i} for i in range(1, 7)}
+    dgroups, dst = propose_clusters(big, dense, 4)
+    check(len(dgroups) == 6,
+          f"the size cap holds during attachment; without it everything funnels into the largest "
+          f"connected component (got {len(dgroups)} group(s))")
+    check(dst["cut"] > 0, "and a 0% cut is not manufactured by merging everything")
+
+    # A region nothing references has nothing to attach to; it must survive rather than vanish.
+    lone, _ = propose_clusters(regions, {1: {2: 5}}, 2)
+    seen = [i for g in lone for i in g]
+    # The SET and the COUNT, not just the count: a total of 8 is equally consistent with one region
+    # duplicated and another dropped, which is precisely what a bad merge produces.
+    check(sorted(seen) == list(range(1, 9)) and len(seen) == 8,
+          f"every body region appears in exactly one group (got {sorted(seen)})")
+
+    print("== PASS ==" if not bad else f"== FAIL: {bad} ==")
+    return 1 if bad else 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--file", required=True, type=pathlib.Path)
+    ap.add_argument("--file", type=pathlib.Path)
+    ap.add_argument("--selftest", action="store_true",
+                    help="pin the clustering arithmetic; needs no libclang and no build")
     ap.add_argument("--build", default="prosper/build-linux")
     ap.add_argument("--json", type=pathlib.Path)
+    ap.add_argument("--clusters", nargs="?", type=int, const=6, default=None,
+                    metavar="PARTS",
+                    help="suggest seams: group regions that reference each other (default 6 parts)")
     ap.add_argument("--min-lines", type=int, default=0,
                     help="only print regions at least this many lines long")
     args = ap.parse_args()
+    if args.selftest:
+        return selftest()
+    if not args.file:
+        sys.exit("--file is required")
 
+    _need_clang()
     root = repo_root()
     target = (root / args.file) if not args.file.is_absolute() else args.file
     if not target.exists():
@@ -340,15 +563,23 @@ def main() -> int:
         print(f"  [{r['index']:4d}] {r['start']:6d}-{r['end']:<6d} {span:6d}L  "
               f"out={out:<4d} in={inn:<4d} {r['role']:<9s} {r['kind']:<22s} {r['name'][:52]}")
 
+    if args.clusters is not None:
+        print_clusters(regions, edges, args.clusters)
+
     if args.json:
         # The digest is what lets split_file.py prove the map still describes the file. Without it
         # the only available check compares two values derived from the same read, which can only
         # fail if the file GREW -- an assertion that cannot fail on an edit is not a check.
         import hashlib
         digest = hashlib.sha256(target.read_bytes()).hexdigest()
+        # RECORD THE PARSE ERRORS IN THE MAP. The warning above goes to a terminal nobody keeps,
+        # and the map outlives it -- so a consumer reading this file has no way to tell a complete
+        # map from one built on a partial AST, and prints its own reassuring [ok] either way. A
+        # libclang parse driven from a g++ database fails softly, so this is not a rare case.
         args.json.write_text(json.dumps({"file": str(target.relative_to(root)),
                                          "sha256": digest,
                                          "total_lines": total_lines,
+                                         "parse_errors": len(fatal),
                                          "regions": regions,
                                          "edges": {str(k): v for k, v in edges.items()}}, indent=1))
         print(f"  wrote {args.json}")
