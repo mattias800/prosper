@@ -42,10 +42,13 @@ static int fails = 0;
 // discriminator too: it is different for every candidate corner rule, so a stage that completes the
 // rectangle geometrically but carries the wrong varying still fails.
 //
-// Assembled from SPIR-V assembly with spirv-as; the source is kept beside this array in
-// tests/gpu/recompiler/rect_synthesis_vs.spvasm so it can be regenerated and re-read.
+// Assembled with `spirv-as --target-env vulkan1.1` from rect_synthesis_vs.spvasm, kept beside
+// this array so the module can be re-read and regenerated. Vulkan 1.1 (SPIR-V 1.3) on purpose:
+// it is prosper's floor, and it is the version the generated geometry stage declares, so this
+// shader is held to the same rule it is here to check -- an OpSelect with a vec4 result needs a
+// bvec4 condition, which a 1.6 module would have let slide.
 static const uint32_t kRectCornerVs[] = {
-        0x07230203u, 0x00010600u, 0x00070000u, 0x00000027u, 0x00000000u, 0x00020011u,
+        0x07230203u, 0x00010300u, 0x00070000u, 0x0000002au, 0x00000000u, 0x00020011u,
         0x00000001u, 0x0006000bu, 0x00000001u, 0x4c534c47u, 0x6474732eu, 0x3035342eu,
         0x00000000u, 0x0003000eu, 0x00000000u, 0x00000001u, 0x0008000fu, 0x00000000u,
         0x00000002u, 0x6e69616du, 0x00000000u, 0x00000003u, 0x00000004u, 0x00000005u,
@@ -54,33 +57,36 @@ static const uint32_t kRectCornerVs[] = {
         0x00040047u, 0x00000005u, 0x0000001eu, 0x00000000u, 0x00020013u, 0x00000007u,
         0x00030021u, 0x00000008u, 0x00000007u, 0x00030016u, 0x00000009u, 0x00000020u,
         0x00040017u, 0x0000000au, 0x00000009u, 0x00000004u, 0x00040015u, 0x0000000bu,
-        0x00000020u, 0x00000001u, 0x00020014u, 0x0000000cu, 0x00040020u, 0x0000000du,
-        0x00000001u, 0x0000000bu, 0x0004003bu, 0x0000000du, 0x00000003u, 0x00000001u,
-        0x0003001eu, 0x00000006u, 0x0000000au, 0x00040020u, 0x0000000eu, 0x00000003u,
-        0x00000006u, 0x0004003bu, 0x0000000eu, 0x00000004u, 0x00000003u, 0x00040020u,
-        0x0000000fu, 0x00000003u, 0x0000000au, 0x0004003bu, 0x0000000fu, 0x00000005u,
-        0x00000003u, 0x0004002bu, 0x0000000bu, 0x00000010u, 0x00000000u, 0x0004002bu,
-        0x0000000bu, 0x00000011u, 0x00000001u, 0x0004002bu, 0x00000009u, 0x00000012u,
-        0x00000000u, 0x0004002bu, 0x00000009u, 0x00000013u, 0x3f800000u, 0x0004002bu,
-        0x00000009u, 0x00000014u, 0xbf800000u, 0x0004002bu, 0x00000009u, 0x00000015u,
-        0x3e4ccccdu, 0x0004002bu, 0x00000009u, 0x00000016u, 0x3f000000u, 0x0004002bu,
-        0x00000009u, 0x00000017u, 0x3f333333u, 0x0007002cu, 0x0000000au, 0x00000018u,
-        0x00000014u, 0x00000014u, 0x00000012u, 0x00000013u, 0x0007002cu, 0x0000000au,
-        0x00000019u, 0x00000013u, 0x00000014u, 0x00000012u, 0x00000013u, 0x0007002cu,
-        0x0000000au, 0x0000001au, 0x00000014u, 0x00000013u, 0x00000012u, 0x00000013u,
-        0x0007002cu, 0x0000000au, 0x0000001bu, 0x00000015u, 0x00000012u, 0x00000012u,
-        0x00000013u, 0x0007002cu, 0x0000000au, 0x0000001cu, 0x00000016u, 0x00000012u,
-        0x00000012u, 0x00000013u, 0x0007002cu, 0x0000000au, 0x0000001du, 0x00000017u,
-        0x00000012u, 0x00000012u, 0x00000013u, 0x00050036u, 0x00000007u, 0x00000002u,
-        0x00000000u, 0x00000008u, 0x000200f8u, 0x0000001eu, 0x0004003du, 0x0000000bu,
-        0x0000001fu, 0x00000003u, 0x000500aau, 0x0000000cu, 0x00000020u, 0x0000001fu,
-        0x00000010u, 0x000500aau, 0x0000000cu, 0x00000021u, 0x0000001fu, 0x00000011u,
-        0x000600a9u, 0x0000000au, 0x00000022u, 0x00000021u, 0x00000019u, 0x0000001au,
-        0x000600a9u, 0x0000000au, 0x00000023u, 0x00000020u, 0x00000018u, 0x00000022u,
-        0x000600a9u, 0x0000000au, 0x00000024u, 0x00000021u, 0x0000001cu, 0x0000001du,
-        0x000600a9u, 0x0000000au, 0x00000025u, 0x00000020u, 0x0000001bu, 0x00000024u,
-        0x00050041u, 0x0000000fu, 0x00000026u, 0x00000004u, 0x00000010u, 0x0003003eu,
-        0x00000026u, 0x00000023u, 0x0003003eu, 0x00000005u, 0x00000025u, 0x000100fdu,
+        0x00000020u, 0x00000001u, 0x00020014u, 0x0000000cu, 0x00040017u, 0x0000000du,
+        0x0000000cu, 0x00000004u, 0x00040020u, 0x0000000eu, 0x00000001u, 0x0000000bu,
+        0x0004003bu, 0x0000000eu, 0x00000003u, 0x00000001u, 0x0003001eu, 0x00000006u,
+        0x0000000au, 0x00040020u, 0x0000000fu, 0x00000003u, 0x00000006u, 0x0004003bu,
+        0x0000000fu, 0x00000004u, 0x00000003u, 0x00040020u, 0x00000010u, 0x00000003u,
+        0x0000000au, 0x0004003bu, 0x00000010u, 0x00000005u, 0x00000003u, 0x0004002bu,
+        0x0000000bu, 0x00000011u, 0x00000000u, 0x0004002bu, 0x0000000bu, 0x00000012u,
+        0x00000001u, 0x0004002bu, 0x00000009u, 0x00000013u, 0x00000000u, 0x0004002bu,
+        0x00000009u, 0x00000014u, 0x3f800000u, 0x0004002bu, 0x00000009u, 0x00000015u,
+        0xbf800000u, 0x0004002bu, 0x00000009u, 0x00000016u, 0x3e4ccccdu, 0x0004002bu,
+        0x00000009u, 0x00000017u, 0x3f000000u, 0x0004002bu, 0x00000009u, 0x00000018u,
+        0x3f333333u, 0x0007002cu, 0x0000000au, 0x00000019u, 0x00000015u, 0x00000015u,
+        0x00000013u, 0x00000014u, 0x0007002cu, 0x0000000au, 0x0000001au, 0x00000014u,
+        0x00000015u, 0x00000013u, 0x00000014u, 0x0007002cu, 0x0000000au, 0x0000001bu,
+        0x00000015u, 0x00000014u, 0x00000013u, 0x00000014u, 0x0007002cu, 0x0000000au,
+        0x0000001cu, 0x00000016u, 0x00000013u, 0x00000013u, 0x00000014u, 0x0007002cu,
+        0x0000000au, 0x0000001du, 0x00000017u, 0x00000013u, 0x00000013u, 0x00000014u,
+        0x0007002cu, 0x0000000au, 0x0000001eu, 0x00000018u, 0x00000013u, 0x00000013u,
+        0x00000014u, 0x00050036u, 0x00000007u, 0x00000002u, 0x00000000u, 0x00000008u,
+        0x000200f8u, 0x0000001fu, 0x0004003du, 0x0000000bu, 0x00000020u, 0x00000003u,
+        0x000500aau, 0x0000000cu, 0x00000021u, 0x00000020u, 0x00000011u, 0x000500aau,
+        0x0000000cu, 0x00000022u, 0x00000020u, 0x00000012u, 0x00070050u, 0x0000000du,
+        0x00000023u, 0x00000021u, 0x00000021u, 0x00000021u, 0x00000021u, 0x00070050u,
+        0x0000000du, 0x00000024u, 0x00000022u, 0x00000022u, 0x00000022u, 0x00000022u,
+        0x000600a9u, 0x0000000au, 0x00000025u, 0x00000024u, 0x0000001au, 0x0000001bu,
+        0x000600a9u, 0x0000000au, 0x00000026u, 0x00000023u, 0x00000019u, 0x00000025u,
+        0x000600a9u, 0x0000000au, 0x00000027u, 0x00000024u, 0x0000001du, 0x0000001eu,
+        0x000600a9u, 0x0000000au, 0x00000028u, 0x00000023u, 0x0000001cu, 0x00000027u,
+        0x00050041u, 0x00000010u, 0x00000029u, 0x00000004u, 0x00000011u, 0x0003003eu,
+        0x00000029u, 0x00000026u, 0x0003003eu, 0x00000005u, 0x00000028u, 0x000100fdu,
         0x00010038u,
 };
 
@@ -112,16 +118,34 @@ int main() {
         {"bottom-right", W - 5,  H - 5,  1.0},   // the SYNTHESIZED corner
     };
 
-    struct Arm { const char* name; std::vector<uint32_t> indices; };
+    // `odd_permutation` is a property of the ARM, not of the geometry stage: an index buffer that
+    // reorders the supplied triple by an odd permutation hands the stage a triangle whose winding is
+    // already reversed. The stage must PRESERVE whatever facing it was given, so under back-face
+    // culling exactly the odd arms survive -- see the culling pass below.
+    struct Arm { const char* name; std::vector<uint32_t> indices; bool odd_permutation; };
     const Arm arms[] = {
-        {"shared corner at slot 0 (positive control -- the case the old rule got right)", {0, 1, 2}},
-        {"shared corner at slot 1", {1, 0, 2}},
-        {"shared corner at slot 2 (Darksiders II's video blit)", {1, 2, 0}},
+        {"shared corner at slot 0 (positive control -- the case the old rule got right)",
+         {0, 1, 2}, false},
+        {"shared corner at slot 1", {1, 0, 2}, true},
+        {"shared corner at slot 2 (Darksiders II's video blit)", {1, 2, 0}, false},
     };
 
+    // Run every arm twice: once with culling off, and once with BACK-face culling on. The second
+    // pass is what pins the emission ORDER. A strip's facing is its first triangle's, so reordering
+    // the supplied triple by an odd permutation reverses it and a culled draw renders nothing at all
+    // -- invisible to a coverage check with culling disabled. Emitting `shared, then the other two in
+    // ascending order` is exactly that odd permutation when the shared corner is v1.
+    struct Cull { const char* name; uint32_t mode; };
+    const Cull culls[] = {
+        {"cull off", 0u},   // VK_CULL_MODE_NONE
+        {"back-face culling on", 2u},   // VK_CULL_MODE_BACK_BIT
+    };
+
+    for (const Cull& cull : culls)
     for (const Arm& arm : arms) {
         ResolvedPipelineState state;
         state.topology = 3;   // VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST -- one triangle in, a strip out
+        state.cull_mode = cull.mode;
         prosper::test::BackendDraw draw;
         draw.vs.assign(std::begin(kRectCornerVs), std::end(kRectCornerVs));
         draw.gs = geom;
@@ -133,7 +157,7 @@ int main() {
         draws.push_back(std::move(draw));
         const std::vector<uint8_t> px = prosper::test::render_draws_rgba(draws, W, H);
         if (px.size() != (size_t)W * H * 4) {
-            printf("  [FAIL] %s: render produced no image\n", arm.name);
+            printf("  [FAIL] %s (%s): render produced no image\n", arm.name, cull.name);
             fails++;
             continue;
         }
@@ -148,11 +172,25 @@ int main() {
             const uint8_t red = red_at(x, y);
             if (red >= 30) { ++covered; weakest = std::min(weakest, red); }
         }
-        printf("  %s: covered %u/%u, weakest covered red %u\n",
-               arm.name, covered, sampled, weakest);
+        printf("  [%s] %s: covered %u/%u, weakest covered red %u\n",
+               cull.name, arm.name, covered, sampled, weakest);
+
+        // Under back-face culling the stage must preserve the facing it was handed, so an arm renders
+        // in full exactly when its own index permutation reversed the winding -- all of it or none of
+        // it, never half. This is what pins the emission ORDER: the order must be a ROTATION of the
+        // supplied triple. "Shared first, then the other two ascending" also puts the diagonal in the
+        // middle and passes every check with culling off, but for shared == v1 it is the odd
+        // permutation, and this arm then renders 0 instead of the full rectangle.
+        const bool expect_drawn = cull.mode == 0u || arm.odd_permutation;
+        if (!expect_drawn) {
+            CHECK(covered == 0,
+                  (std::string("facing is preserved, so this arm is culled entirely -- ") +
+                   arm.name + ", " + cull.name).c_str());
+            continue;
+        }
         CHECK(covered == sampled,
               (std::string("the synthesized corner completes the rectangle -- full coverage, ") +
-               arm.name).c_str());
+               arm.name + ", " + cull.name).c_str());
 
         for (const Corner& corner : corners) {
             const double got = red_at(corner.x, corner.y) / 255.0;
@@ -161,7 +199,7 @@ int main() {
                 printf("    %s corner: varying %.3f, expected %.3f\n",
                        corner.name, got, corner.expect);
             CHECK(ok, (std::string("varying is carried to the ") + corner.name + " corner, " +
-                       arm.name).c_str());
+                       arm.name + ", " + cull.name).c_str());
         }
     }
 

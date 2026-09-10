@@ -12,6 +12,7 @@
     %v4float = OpTypeVector %float 4
         %int = OpTypeInt 32 1
        %bool = OpTypeBool
+     %v4bool = OpTypeVector %bool 4
  %ptr_in_int = OpTypePointer Input %int
        %vidx = OpVariable %ptr_in_int Input
   %PerVertex = OpTypeStruct %v4float
@@ -38,10 +39,12 @@
          %iv = OpLoad %int %vidx
         %is0 = OpIEqual %bool %iv %int_0
         %is1 = OpIEqual %bool %iv %int_1
-      %posBC = OpSelect %v4float %is1 %posB %posC
-        %pos = OpSelect %v4float %is0 %posA %posBC
-       %uvBC = OpSelect %v4float %is1 %uvB %uvC
-         %uv = OpSelect %v4float %is0 %uvA %uvBC
+       %was0 = OpCompositeConstruct %v4bool %is0 %is0 %is0 %is0
+       %was1 = OpCompositeConstruct %v4bool %is1 %is1 %is1 %is1
+      %posBC = OpSelect %v4float %was1 %posB %posC
+        %pos = OpSelect %v4float %was0 %posA %posBC
+       %uvBC = OpSelect %v4float %was1 %uvB %uvC
+         %uv = OpSelect %v4float %was0 %uvA %uvBC
      %posptr = OpAccessChain %ptr_out_v4 %pervertex %int_0
                OpStore %posptr %pos
                OpStore %attr0 %uv

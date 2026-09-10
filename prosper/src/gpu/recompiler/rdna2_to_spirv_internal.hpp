@@ -4282,14 +4282,31 @@ struct SpirvCompute {
     // the shared corner it selects `P1 + P2 - P0` -- so no draw that renders correctly today changes.
     // Every varying and the explicit-parameter barycentrics follow the same selected index.
     //
+    // CONFIDENCE: MED on the choice of discriminator, HIGH that it beats the fixed index it replaces.
+    // "Longest separation is the diagonal" is exact for a rectangle and for any parallelogram whose
+    // shared corner is not acute enough to make a side exceed a diagonal; a sufficiently SHEARED
+    // parallelogram breaks it, and the rule would then complete the wrong corner. Every RectList
+    // observed so far is an axis-aligned screen-space rectangle, where it cannot happen. Separation is
+    // measured on the full 4-component clip position, which is exact when w is constant across the
+    // three vertices -- true of every screen-space blit, and the same assumption the hardware's own
+    // affine completion makes. A title that submits a genuinely sheared or perspective-divided
+    // RectList would need the real hardware rule, which needs a title to demonstrate it.
+    //
     // The EMISSION ORDER is the other half, and getting only the corner right is not enough. A strip's
-    // two triangles share its middle edge (P1,P2), so that edge must be the rectangle's DIAGONAL --
-    // vertices go out as `shared, diagonal_a, diagonal_b, synthesized`. Emitting the supplied order
-    // when the shared corner is not v0 gives two triangles that share a SIDE instead: they overlap on
-    // one half and leave the wedge between the two diagonals uncovered, which on Darksiders II's blit
-    // is a black triangle with its apex at the screen centre. When the shared corner is v0 this order
-    // is the supplied one, so again nothing that renders correctly today changes. Vulkan flips the
-    // winding test on a strip's odd triangle, so both halves keep the same facing under culling.
+    // two triangles share its middle edge, so that edge must be the rectangle's DIAGONAL -- the shared
+    // corner leads and the synthesized one comes last. Emitting the supplied order when the shared
+    // corner is not v0 gives two triangles that share a SIDE instead: they overlap on one half and
+    // leave the wedge between the two diagonals uncovered, which on Darksiders II's blit is a black
+    // triangle with its apex at the screen centre.
+    //
+    // The order is a ROTATION of the supplied triple -- supplied[(shared + slot) % 3] -- and it has to
+    // be, because a strip's facing is its FIRST triangle's and the guest's cull state is passed
+    // straight through (`render_state.cpp`, no RectList exemption). "Shared first, then the other two
+    // in ascending order" also puts the diagonal in the middle, but for shared == v1 it is the odd
+    // permutation (v1,v0,v2): it reverses the facing, so a culled draw would render NOTHING where it
+    // previously rendered half. Rotations are even, so facing is preserved for all three. When the
+    // shared corner is v0 the rotation is the identity, so nothing that renders correctly today
+    // changes. Vulkan flips the winding test on a strip's odd triangle, so both halves agree.
     std::vector<uint32_t> build_interpolation_geometry(
             const FragmentInterpolationLayout& layout, bool capture_geometry_position,
             bool synthesize_rect = false) {
@@ -4297,6 +4314,14 @@ struct SpirvCompute {
 
         t_void = id(); t_fn = id(); t_f32 = id(); t_u32 = id(); t_i32 = id(); t_bool = id();
         t_v4f = id();
+        // This module declares SPIR-V 1.3 (see finish()), where an OpSelect with a VECTOR result needs
+        // a vector condition of the same width -- a scalar condition is only legal from 1.4. The rect
+        // path is the only place here selecting between vec4s, so the bvec4 is allocated and declared
+        // only for it, and the non-synthesis module gains no instruction and no type from it.
+        // (That module is NOT byte-identical to before this change: loading the positions earlier
+        // renumbers the ids after it, and the `consumes_parameters` guard below elides a composite
+        // that nothing consumed. Both are semantically inert; ids are module-internal.)
+        const uint32_t t_v4bool = synthesize_rect ? id() : 0;
         const uint32_t t_input_per_vertex = id(), t_output_per_vertex = id();
         const uint32_t c_three = id();
         const uint32_t t_input_positions = id(), t_input_varyings = id();
@@ -4379,6 +4404,7 @@ struct SpirvCompute {
         put(types, Op_TypeInt, {t_i32, 32, 1});
         put(types, Op_TypeBool, {t_bool});
         put(types, Op_TypeVector, {t_v4f, t_f32, 4});
+        if (synthesize_rect) put(types, Op_TypeVector, {t_v4bool, t_bool, 4});
         put(types, Op_TypeStruct, {t_input_per_vertex, t_v4f});
         put(types, Op_TypeStruct, {t_output_per_vertex, t_v4f});
         put(types, Op_Constant, {t_u32, c_three, 3});
@@ -4427,6 +4453,8 @@ struct SpirvCompute {
         // `rect_shared_is_v0` / `rect_shared_is_v1` name the supplied vertex adjacent to both others
         // (neither true => it is v2). Compared as squared separations, so no square root is needed.
         uint32_t rect_shared_is_v0 = 0, rect_shared_is_v1 = 0;
+        // The same two selectors widened to bvec4, for the vec4 selects (see the t_v4bool note).
+        uint32_t rect_shared_is_v0_wide = 0, rect_shared_is_v1_wide = 0;
         if (synthesize_rect) {
             auto squared_separation = [&](uint32_t a, uint32_t b) {
                 const uint32_t delta = id();
@@ -4446,6 +4474,14 @@ struct SpirvCompute {
             // Only consulted when v0 is not the shared corner, so d02 vs d01 settles it.
             rect_shared_is_v1 = id();
             put(code, Op_FOrdGreaterThanEqual, {t_bool, rect_shared_is_v1, d02, d01});
+            auto broadcast = [&](uint32_t condition) {
+                const uint32_t wide = id();
+                putv(code, Op_CompositeConstruct,
+                     {t_v4bool, wide, condition, condition, condition, condition});
+                return wide;
+            };
+            rect_shared_is_v0_wide = broadcast(rect_shared_is_v0);
+            rect_shared_is_v1_wide = broadcast(rect_shared_is_v1);
         }
         // The fourth value of any per-vertex quantity, under the selected shared corner.
         auto synthesize_fourth = [&](uint32_t v0, uint32_t v1, uint32_t v2) {
@@ -4460,9 +4496,9 @@ struct SpirvCompute {
             const uint32_t shared_v1 = complete(v0, v2, v1);
             const uint32_t shared_v2 = complete(v0, v1, v2);
             const uint32_t not_v0 = id();
-            put(code, Op_Select, {t_v4f, not_v0, rect_shared_is_v1, shared_v1, shared_v2});
+            put(code, Op_Select, {t_v4f, not_v0, rect_shared_is_v1_wide, shared_v1, shared_v2});
             const uint32_t chosen = id();
-            put(code, Op_Select, {t_v4f, chosen, rect_shared_is_v0, shared_v0, not_v0});
+            put(code, Op_Select, {t_v4f, chosen, rect_shared_is_v0_wide, shared_v0, not_v0});
             return chosen;
         };
 
@@ -4494,23 +4530,20 @@ struct SpirvCompute {
 
         // Value emitted in strip slot `slot`, under the selected shared corner. Without rect
         // synthesis this is the identity, so the plain interpolation-geometry path is unchanged.
+        // Value emitted in strip slot `slot`. The supplied triple is ROTATED so the shared corner
+        // leads: slot k carries supplied[(shared + k) % 3], then the synthesized corner last.
         auto slot_of = [&](uint32_t slot, const std::array<uint32_t, 3>& supplied,
                            uint32_t synthesized) -> uint32_t {
             if (!synthesize_rect) return supplied[slot];
             if (slot == 3) return synthesized;
-            uint32_t chosen = id();
-            if (slot == 0) {                       // the shared corner itself
-                const uint32_t not_v0 = id();
-                put(code, Op_Select, {t_v4f, not_v0, rect_shared_is_v1, supplied[1], supplied[2]});
-                put(code, Op_Select, {t_v4f, chosen, rect_shared_is_v0, supplied[0], not_v0});
-            } else if (slot == 1) {                // first of the diagonal pair
-                put(code, Op_Select, {t_v4f, chosen, rect_shared_is_v0, supplied[1], supplied[0]});
-            } else {                               // second of the diagonal pair
-                const uint32_t shared_v0_or_v1 = id();
-                put(code, Op_LogicalOr,
-                    {t_bool, shared_v0_or_v1, rect_shared_is_v0, rect_shared_is_v1});
-                put(code, Op_Select, {t_v4f, chosen, shared_v0_or_v1, supplied[2], supplied[1]});
-            }
+            // supplied[(shared + slot) % 3] -- a ROTATION, chosen at runtime.
+            const uint32_t if_v0 = supplied[(0 + slot) % 3];
+            const uint32_t if_v1 = supplied[(1 + slot) % 3];
+            const uint32_t if_v2 = supplied[(2 + slot) % 3];
+            const uint32_t not_v0 = id();
+            put(code, Op_Select, {t_v4f, not_v0, rect_shared_is_v1_wide, if_v1, if_v2});
+            const uint32_t chosen = id();
+            put(code, Op_Select, {t_v4f, chosen, rect_shared_is_v0_wide, if_v0, not_v0});
             return chosen;
         };
         // A float chosen by the shared corner: `if_v0` / `if_v1` / `if_v2`.
@@ -4552,8 +4585,10 @@ struct SpirvCompute {
                 // shared corner's opposite, so its coordinates negate the shared axis.
                 uint32_t bary_i, bary_j;
                 if (synthesize_rect) {
+                    // [slot][shared corner]. Slot k carries supplied[(shared + k) % 3], whose
+                    // coordinates are v0=(0,0), v1=(1,0), v2=(0,1); slot 3 is the synthesized corner.
                     static constexpr float kI[4][3] = {{0, 1, 0}, {1, 0, 0}, {0, 0, 1}, {1, -1, 1}};
-                    static constexpr float kJ[4][3] = {{0, 0, 1}, {0, 0, 0}, {1, 1, 0}, {1, 1, -1}};
+                    static constexpr float kJ[4][3] = {{0, 0, 1}, {0, 1, 0}, {1, 0, 0}, {1, 1, -1}};
                     bary_i = by_shared_corner(kI[vertex][0], kI[vertex][1], kI[vertex][2]);
                     bary_j = by_shared_corner(kJ[vertex][0], kJ[vertex][1], kJ[vertex][2]);
                 } else {
