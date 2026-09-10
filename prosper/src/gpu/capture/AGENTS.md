@@ -3,7 +3,12 @@
 Serializes a live frame — commands, shaders, resources, and the renderer-owned targets it samples —
 into a `.prgbundle` / `.prgcap` that `tools/gpu_replay` can reproduce offline and deterministically.
 
-- `gpu_capture` — the capture itself.
+- `gpu_capture` — collecting a frame: intervals, tables, submit items, and the entry points
+  that begin, finish and materialize a capture.
+- `gpu_capture_serialize` — the file format: the byte cursors, the per-field codecs, and
+  `serialize_gpu_capture` / `deserialize_gpu_capture`.
+- `gpu_capture_internal` — the vocabulary those two share: magic/version/limits, footprint
+  and blob-size helpers, and the validators. Internal to this folder; not a public header.
 - `gpu_capture_bundle` — bundle format and manifest.
 - `capture_compute_policy` — the policy governing compute capture.
 - `writer_provenance` — which pass wrote a given range, so a replay can attribute a pixel.
