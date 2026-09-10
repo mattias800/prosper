@@ -255,6 +255,35 @@ would be ranked as needing no work. One file is currently in that state:
 `frontends/prosper-app/main.cpp`, which has no compile command unless the app is configured
 (`-DPROSPER_APP=ON`); configure with it to bring that file into the survey.
 
+### Choosing where to cut
+
+`map_symbols.py --clusters [N]` groups the file's regions by what they actually reference, and
+reports the cost of the seam it proposes:
+
+```
+== proposed seams: 9 group(s), target ~2149 lines each == -- you asked for 3, and the reference
+   structure plus that size cap do not permit fewer
+   252 of 2927 references cross a boundary (9%) -- that is the promote-to-header list
+   83 merge(s) the references wanted were refused by the size cap; a group AT the cap is the cap
+   talking, not a seam
+```
+
+The cross-boundary count is the number that matters, because those are the internal-linkage edges
+the REFERENCES section warns about -- a split that separates a `static` helper from its callers
+*"does not fail at review, it fails at link"*. Having the list up front turns `promote_internal.py`
+into a decision instead of a compile-error hunt.
+
+**Two things it says about itself, and both are load-bearing.** A group sitting exactly AT the size
+cap is the cap talking, not a structural seam -- it stopped there because it was told to. And the
+part count is what the references and the cap allow, not what you asked for; the tool says so rather
+than forcing the number. Grouping by NAME finds none of this: on `gpu_executor.cpp` a name-prefix
+pass put 183 of 273 regions in "other".
+
+**A 0% cut is a tell, not a success.** An early draft let attachment ignore the cap, which funnelled
+every group into the largest connected component -- one 6,374-line "part" out of 6,515 lines,
+reported as a perfect zero-cut split. That is pinned by a selftest arm now, with the fixture built so
+the defect changes the group COUNT rather than merely a number.
+
 ### Running it
 
 ```bash

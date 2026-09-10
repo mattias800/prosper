@@ -100,6 +100,9 @@ def _need_clang() -> None:
     # reachable from any caller that uses survey_one/measure from a worker without doing that, which
     # is how a module like this gets used.
     mod = _load_map_symbols()
+    # map_symbols resolves libclang lazily too (so ITS selftest runs without one), so its own `ci`
+    # is still None here -- and `regions_of` dereferences it. Initialising ours is not enough.
+    mod._need_clang()
     import clang.cindex as _ci
     ci = _ci
     # Built here, not at module scope: the `ranges` member is an array of cindex's own SourceRange,
