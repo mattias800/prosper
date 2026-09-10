@@ -170,8 +170,12 @@ if(Python3_Interpreter_FOUND)
   add_test(NAME re_xref_decoder
            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/re/test_xref.py")
   # survey_sizes.py's classifier decides which refactoring tool can act on a file, and it has been
-  # wrong twice: once on the lambda boundary, once by calling a file of many small functions
-  # "nothing to do". Its selftest is pure arithmetic and resolves libclang lazily, so it runs here
+  # wrong four times: on the lambda boundary, by calling a file of many small functions "nothing to
+  # do", by measuring the lambda share over the enclosing namespace, and by inferring unparsed lines
+  # from region kinds (which cannot see a mid-file #if). The last two were in how the classifier's
+  # INPUTS are measured, so no arithmetic case could have caught them; they are pinned by fixtures
+  # under tools/refactor/testdata/ that the selftest scores ONLY where libclang is importable, and
+  # it says loudly when it skips them. libclang resolves lazily, so the arithmetic half runs here
   # even though the surveying itself needs a libclang the runner does not have.
   add_test(NAME refactor_survey_classifier
            COMMAND "${Python3_EXECUTABLE}"
