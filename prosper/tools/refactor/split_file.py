@@ -186,10 +186,13 @@ def unresolved_across_parts(map_data: dict, plan: dict[str, list[int]]) -> dict[
     edges = {int(a): {int(b) for b in d} for a, d in map_data.get("edges", {}).items()}
     owner = {i: out for out, idxs in plan.items() for i in idxs}
     # A PREAMBLE is copied into every output, so a reference from it to an internal definition in
-    # one part only is unsatisfied in the others. Restricted to `preamble` deliberately: an
-    # `open`/`close` region holds only the text clang gave no top-level cursor, since real code
-    # there would be its own body region, so that class is empty by construction -- and counting it
-    # was a live false-positive source. Every such edge measured on hle_kernel.cpp was a namespace
+    # one part only is unsatisfied in the others. NO SUCH EDGE HAS BEEN OBSERVED -- 0 on both real
+    # maps -- so this guards a class that is unobserved rather than impossible, and the distinction
+    # is deliberate: the `open`/`close` exclusion below IS airtight (a tiling fact -- real code
+    # between those braces would be its own body region), while "a preamble references nothing"
+    # rests on a C++ ordering argument, and map_symbols.py:211-215 says in its own words that a
+    # stray declaration above the first namespace lands in the preamble ON PURPOSE. Restricted to
+    # `preamble` because counting open/close was a live false-positive source. Every such edge measured on hle_kernel.cpp was a namespace
     # re-opening brace whose `.referenced` resolved to the namespace decl, and acting on them
     # refused every legal two-part plan for that file. `cross_refs` no longer emits them, and this
     # is the second guard rather than the only one.
