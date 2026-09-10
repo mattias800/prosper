@@ -26,6 +26,7 @@
 #include "host/x86/x86_read_decode.hpp"
 #include "hle/dispatch/nid.hpp"
 #include "hle/dispatch/dispatch.hpp"
+#include "hle/dispatch/import_data_seed.hpp"   // #3529: initial value of an unresolved DATA import
 #include "host/abi/sysv_ms_bridge.hpp"    // #2955: signature-driven SysV->MS x64 import bridge
 #include "host/image/boot_program.hpp"   // #1659: shared guest-module labelling (BOOT_* bases)
 #include "host/symbols/il2cpp_symbols.hpp" // #2551: name the C# method containing an IL2CPP address
@@ -177,6 +178,8 @@ using GuestInitFn = PROSPER_SYSV_ABI void (*)(uint64_t argc, uint64_t argp);
 
 namespace {
     uint64_t g_base = 0, g_stub_base = 0, g_stub_size = 0, g_nstubs = 0;
+    // Import-DATA aperture (#3529): base, per-slot stride and how many slots are committed.
+    uint64_t g_data_base = 0, g_data_stride = 0, g_ndata = 0;
     uint64_t g_image_end = 0;   // g_base + max_vaddr: end of the guest module's mapped range
     // PROSPER_NULL_PAGE: back low-address null-field READS with zero (parity with the Linux SIGSEGV
     // handler). Windows reserves the bottom 64 KiB [0,0x10000) as the null dead-zone and VirtualAlloc
@@ -1291,6 +1294,75 @@ bool append_stubs(const std::vector<ImportSlot>& slots, size_t first_new, std::s
                     slots[i].nid.c_str(), nm.c_str());
         }
     return true;
+}
+
+// --- import-DATA aperture (#3529) ------------------------------------------------------------
+//
+// One zero-filled READWRITE (never EXECUTE) slot per unresolved STT_OBJECT import, so a guest read
+// of an unimplemented Sony variable sees zero and a guest write cannot reach the executable stub
+// table. Reserve/commit is split exactly as install_stubs does it, and for the same reason: a
+// 64 KiB-granular reservation made later at this one's 4 KiB-aligned end would round back into it.
+bool install_import_data(const std::vector<ImportSlot>& slots, uint64_t data_base,
+                         uint64_t stride, std::string* err) {
+    auto fail = [&](const char* s){ if (err) *err = s; return false; };
+    if (!data_base) return fail("import-data base is 0");
+    if (!stride) return fail("import-data stride is 0");
+    const uint64_t n = slots.size();
+    if (!VirtualAlloc((void*)(uintptr_t)data_base, kImportDataApertureBytes, MEM_RESERVE,
+                      PAGE_NOACCESS))
+        return fail("VirtualAlloc import-data aperture reservation failed");
+    if (n == 0) { g_data_base = data_base; g_data_stride = stride; g_ndata = 0; return true; }
+    const uint64_t region = page_up(n * stride);
+    if (region > kImportDataApertureBytes) return fail("import data table exceeds its aperture");
+    void* got = VirtualAlloc((void*)(uintptr_t)data_base, region, MEM_COMMIT, PAGE_READWRITE);
+    if (!got || got != (void*)(uintptr_t)data_base) return fail("VirtualAlloc import data failed");
+    // Freshly committed pages are zero-filled. Zero is the value for everything prosper cannot
+    // answer honestly; the few Sony variables it CAN answer are written here (import_data_seed.hpp).
+    for (uint64_t i = 0; i < n; i++)
+        seed_import_data(slots[i].nid, (uint8_t*)got + i * stride, (size_t)stride);
+    g_data_base = data_base; g_data_stride = stride; g_ndata = n;
+    if (getenv("PROSPER_STUBDUMP"))
+        for (uint64_t i = 0; i < n; i++) {
+            const std::string& nm = g_nid_db ? g_nid_db->resolve(slots[i].nid) : std::string();
+            fprintf(stderr, "[import-data] #%llu at 0x%llx %s::%s %s\n", (unsigned long long)i,
+                    (unsigned long long)(data_base + i * stride), slots[i].lib.c_str(),
+                    slots[i].nid.c_str(), nm.c_str());
+        }
+    return true;
+}
+
+bool append_import_data(const std::vector<ImportSlot>& slots, size_t first_new, std::string* err) {
+    auto fail = [&](const char* s){ if (err) *err = s; return false; };
+    if (!g_data_stride) return fail("append_import_data before install_import_data");
+    const uint64_t n = slots.size();
+    if (first_new > n || first_new != g_ndata)
+        return fail("append_import_data: slot table is not an extension");
+    if (first_new == n) return true;
+    const uint64_t mapped_end = page_up(g_ndata * g_data_stride);
+    const uint64_t need_end   = page_up(n * g_data_stride);
+    if (need_end > kImportDataApertureBytes) return fail("import data table exceeds its aperture");
+    if (need_end > mapped_end) {
+        void* want = (void*)(uintptr_t)(g_data_base + mapped_end);
+        void* got = VirtualAlloc(want, need_end - mapped_end, MEM_COMMIT, PAGE_READWRITE);
+        if (!got || got != want) return fail("VirtualAlloc import data extension failed");
+    }
+    for (uint64_t i = first_new; i < n; i++)
+        seed_import_data(slots[i].nid,
+                         (uint8_t*)(uintptr_t)(g_data_base + i * g_data_stride),
+                         (size_t)g_data_stride);
+    g_ndata = n;
+    if (getenv("PROSPER_STUBDUMP"))
+        for (uint64_t i = first_new; i < n; i++) {
+            const std::string& nm = g_nid_db ? g_nid_db->resolve(slots[i].nid) : std::string();
+            fprintf(stderr, "[import-data] +#%llu at 0x%llx %s::%s %s\n", (unsigned long long)i,
+                    (unsigned long long)(g_data_base + i * g_data_stride), slots[i].lib.c_str(),
+                    slots[i].nid.c_str(), nm.c_str());
+        }
+    return true;
+}
+
+uint64_t import_data_addr(uint64_t idx) {
+    return g_data_stride ? g_data_base + idx * g_data_stride : 0;
 }
 
 void install_sigaltstack() {}   // Windows delivers exceptions on the runtime's own guard stack

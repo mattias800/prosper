@@ -671,6 +671,11 @@ if(TARGET prosper_core)
              COMMAND test_nid "${GAME_DUMP}/eboot.bin")
   endif()
 
+  # #3529: the initial value of an unresolved DATA import. Pure -- no dump, no mapping.
+  add_executable(test_import_data_seed tests/hle/dispatch/test_import_data_seed.cpp)
+  target_link_libraries(test_import_data_seed PRIVATE prosper_core)
+  add_test(NAME import_data_seed COMMAND test_import_data_seed)
+
   add_executable(test_hle_registered tests/hle/test_hle_registered.cpp)
   target_link_libraries(test_hle_registered PRIVATE prosper_core)
   add_test(NAME hle_functions_registered COMMAND test_hle_registered)

@@ -53,11 +53,16 @@ ExportSubsumption measure_export_subsumption(
     return r;
 }
 
-bool link_program(const std::vector<LinkInput>& inputs, uint64_t stub_base,
+bool link_program(const std::vector<LinkInput>& inputs, uint64_t stub_base, uint64_t data_base,
                   Program& out, std::string* err) {
     auto fail = [&](const std::string& s) { if (err) *err = s; return false; };
     if (inputs.empty()) return fail("no modules to link");
+    // Neither aperture may be absent. A zero data_base would put an unresolved variable at a low
+    // address the guest then dereferences, and reusing stub_base for both is exactly #3529.
+    if (!stub_base || !data_base) return fail("link_program: stub_base and data_base are required");
+    if (stub_base == data_base) return fail("link_program: stub and data apertures must differ");
     out.stub_base = stub_base;
+    out.data_base = data_base;
 
     // --- Pass 1: load every module and build its image at its base. ---
     // NID -> path of the accepted module that exports it, in list order. Mirrors the
@@ -141,8 +146,21 @@ bool link_program(const std::vector<LinkInput>& inputs, uint64_t stub_base,
         out.mod_exports.push_back(std::move(me));
     }
 
-    // --- Pass 2: resolve every import. Cross-module export beats a stub slot. ---
-    std::unordered_map<std::string, uint32_t> nid_to_slot;   // dedupe stub slots by NID
+    // --- Pass 2: resolve every import. Cross-module export beats a local slot. ---
+    //
+    // An import that nothing exports is bound to one of TWO apertures, chosen by the symbol's ELF
+    // type. A function goes to an executable stub that calls its handler; a variable (STT_OBJECT)
+    // goes to a writable, non-executable, zero-filled data slot, because the guest will dereference
+    // it and may store through it. See Program::data_slots for what binding a variable to a
+    // trampoline did (#3529).
+    //
+    // Only STT_OBJECT is diverted. STT_NOTYPE, STT_FUNC and everything else keep the stub they have
+    // always had: NOTYPE is genuinely ambiguous and is overwhelmingly a function in practice, and a
+    // stub is the answer that at least runs. The two apertures dedupe INDEPENDENTLY, so the same NID
+    // imported as a function by one module and as an object by another gets one of each -- each
+    // module then reads the binding its own symbol table asked for.
+    std::unordered_map<std::string, uint32_t> nid_to_slot;        // dedupe code stubs by NID
+    std::unordered_map<std::string, uint32_t> nid_to_data_slot;   // dedupe data slots by NID
     for (size_t i = 0; i < out.mods.size(); i++) {
         const Module& m = *out.mods[i];
         LoadedImage& img = out.imgs[i];
@@ -152,6 +170,19 @@ bool link_program(const std::vector<LinkInput>& inputs, uint64_t stub_base,
             if (ex != exports.end()) {
                 img.import_addr[imp.sym_index] = ex->second;     // real cross-module target
                 out.resolved_cross_module++;
+                continue;
+            }
+            if (imp.elf_type == STT_OBJECT) {
+                auto it = nid_to_data_slot.find(imp.nid);
+                uint32_t slot;
+                if (it != nid_to_data_slot.end()) slot = it->second;
+                else {
+                    slot = (uint32_t)out.data_slots.size();
+                    out.data_slots.push_back({ imp.lib_name, imp.nid });
+                    nid_to_data_slot.emplace(imp.nid, slot);
+                }
+                img.import_addr[imp.sym_index] = out.data_base + (uint64_t)slot * out.data_stride;
+                out.bound_data++;
                 continue;
             }
             auto it = nid_to_slot.find(imp.nid);

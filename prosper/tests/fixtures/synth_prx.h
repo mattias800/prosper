@@ -82,8 +82,18 @@ struct SynthModuleSpec {
     // Exported NIDs, in symbol-table order. Export `i` is defined at `synth_export_va(i)`.
     std::vector<std::string> exports;
     // Imported NIDs, in symbol-table order. Import `i`'s GOT slot is at `synth_got_va(i)` and is
-    // filled by an R_X86_64_JUMP_SLOT relocation.
+    // filled by an R_X86_64_JUMP_SLOT relocation. These carry STT_FUNC.
     std::vector<std::string> imports;
+    // DATA imports (#3529). Emitted after `imports` in symbol-table order, with STT_OBJECT instead
+    // of STT_FUNC and an R_X86_64_GLOB_DAT relocation rather than a JUMP_SLOT -- which is how a real
+    // module references an imported variable. Their GOT slots continue the same array, so data
+    // import `j` is at `synth_got_va(imports.size() + j)`.
+    //
+    // A separate vector rather than a type field on `imports` so a test can hold everything else
+    // fixed and move ONE NID between the two lists: that pair is the mutation that shows the
+    // linker's aperture choice is driven by the symbol type and not by the NID, the library, or the
+    // position.
+    std::vector<std::string> data_imports;
     // Emit DT_INIT / DT_INIT_ARRAY (with the RELATIVE relocation that fills the array's one entry).
     bool init = true;
 
@@ -119,8 +129,9 @@ inline std::vector<uint8_t> synth_prx_bytes(const SynthModuleSpec& spec, std::st
     using namespace detail;
     auto fail = [&](const char* m) { if (err) *err = m; return std::vector<uint8_t>(); };
     if (spec.exports.size() > kSynthMaxExports) return fail("too many exports for the fixture layout");
-    if (spec.imports.size() > kSynthMaxImports) return fail("too many imports for the fixture layout");
-    if (1 + spec.exports.size() + spec.imports.size() > kSynthMaxSymbols)
+    const size_t nimp = spec.imports.size() + spec.data_imports.size();
+    if (nimp > kSynthMaxImports) return fail("too many imports for the fixture layout");
+    if (1 + spec.exports.size() + nimp > kSynthMaxSymbols)
         return fail("too many symbols for the fixture layout");
 
     std::vector<uint8_t> f(kSynthFileSize, 0);
@@ -169,13 +180,16 @@ inline std::vector<uint8_t> synth_prx_bytes(const SynthModuleSpec& spec, std::st
     };
     for (const auto& nid : spec.exports) if (!add_name(nid)) return fail("strtab overflow");
     for (const auto& nid : spec.imports) if (!add_name(nid)) return fail("strtab overflow");
+    for (const auto& nid : spec.data_imports) if (!add_name(nid)) return fail("strtab overflow");
     const uint64_t strsz = so - kSynthStrtab;
 
     // --- dynamic symbol table. Index 0 is the null symbol and is never an export.
-    auto sym = [&](size_t i, uint64_t off, uint16_t shndx, uint64_t value) {
+    // `info` is st_info: (STB_GLOBAL << 4) | ELF64_ST_TYPE. Callers pass 0x12 (FUNC) or 0x11
+    // (OBJECT); the type is what linker.cpp reads to choose an import's aperture (#3529).
+    auto sym = [&](size_t i, uint64_t off, uint16_t shndx, uint64_t value, uint8_t info = 0x12) {
         const uint64_t p = kSynthSymtab + (uint64_t)i * 24;
         sput32(f, p + 0, (uint32_t)off);
-        f[p + 4] = 0x12;                              // STB_GLOBAL | STT_FUNC
+        f[p + 4] = info;
         sput16(f, p + 6, shndx);
         sput64(f, p + 8, value);
         sput64(f, p + 16, 8);                         // st_size
@@ -190,6 +204,11 @@ inline std::vector<uint8_t> synth_prx_bytes(const SynthModuleSpec& spec, std::st
     const size_t first_import_sym = si;
     for (size_t i = 0; i < spec.imports.size(); i++, si++)
         sym(si, name_off[spec.exports.size() + i], 0, 0);   // undefined + value 0 == a Sony import
+    // Data imports are undefined and valueless in exactly the same way -- st_info is the ONLY field
+    // that differs, which is precisely why the linker had nothing to branch on before #3529. Note
+    // st_size stays 8 here as it does for functions; real dumps carry 0 for both.
+    for (size_t i = 0; i < spec.data_imports.size(); i++, si++)
+        sym(si, name_off[spec.exports.size() + spec.imports.size() + i], 0, 0, 0x11);
     const uint64_t nsym = si;
 
     // --- relocations ---
@@ -207,7 +226,15 @@ inline std::vector<uint8_t> synth_prx_bytes(const SynthModuleSpec& spec, std::st
     for (size_t i = 0; i < spec.imports.size(); i++)
         rela(kSynthJmprel + (uint64_t)i * 24, synth_got_va(i), prosper::R_X86_64_JUMP_SLOT,
              (uint32_t)(first_import_sym + i), 0);
-    const uint64_t jmprel_sz = (uint64_t)spec.imports.size() * 24;
+    // GLOB_DAT, not JUMP_SLOT: a data reference goes through the GOT rather than the PLT. Both land
+    // in the same DT_JMPREL table here, which the loader accepts -- what it reads is the relocation
+    // TYPE, and both are handled identically (module.cpp writes sym_addr into the slot).
+    for (size_t i = 0; i < spec.data_imports.size(); i++) {
+        const size_t k = spec.imports.size() + i;
+        rela(kSynthJmprel + (uint64_t)k * 24, synth_got_va(k), prosper::R_X86_64_GLOB_DAT,
+             (uint32_t)(first_import_sym + k), 0);
+    }
+    const uint64_t jmprel_sz = (uint64_t)nimp * 24;
 
     // --- dynamic tags. DT_SCE_SYMTABSZ goes FIRST so module.cpp's "is this really a PS5 .dynamic"
     // --- run check sees an SCE tag inside its 8-entry window (module.cpp: dyn_run_ok).

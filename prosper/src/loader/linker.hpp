@@ -58,11 +58,36 @@ struct LinkInput {
 struct Program {
     std::vector<std::unique_ptr<Module>> mods;   // unique_ptr: stable addresses for imports[]
     std::vector<LoadedImage>             imgs;    // parallel to mods
-    std::vector<ImportSlot>              slots;   // unresolved imports -> stub slots
+    std::vector<ImportSlot>              slots;   // unresolved FUNCTION imports -> code stub slots
     std::vector<uint64_t>                init_fns; // dependent-module init fns, in call order
     std::vector<TlsModuleDesc>           tls_templates; // indexed by module TLS id (0 = unused)
     uint64_t entry = 0;                            // main module entry
     uint64_t stub_base = 0, stub_size = 96;   // 96 contains the largest guest-%fs swap stub (94 bytes)
+
+    // Unresolved DATA imports (ELF STT_OBJECT) -> slots in a separate, writable, NON-executable,
+    // zero-initialised aperture. A data import names a VARIABLE, not an entry point: the guest
+    // dereferences it, and it may STORE through it (libc initialises `__stack_chk_guard` that way).
+    //
+    // Before #3529 these shared the code-stub aperture with function imports, which produced two
+    // distinct defects. A read returned the first bytes of an emitted trampoline -- on NINJA GAIDEN
+    // 4 (PPSA25258) the stack canary read 0x000000bf, the `mov edi, 0` that opens `emit_unimpl` --
+    // so every `-fstack-protector` epilogue compared a machine-code word against a saved 0 and
+    // called `__stack_chk_fail`. And a WRITE landed on prosper's own executable pages, silently
+    // rewriting whichever stub occupied the slot, after which that import jumped into altered code
+    // at an arbitrarily later moment.
+    //
+    // The population is not exotic: 60 of the 62 local dumps import at least one STT_OBJECT symbol
+    // and `__stack_chk_guard` alone appears in 596 shipped modules (tools/nid_census --data-only).
+    // Whether a given one reaches a stub depends on the title's own libc: an import a sibling module
+    // defines is bound to that definition and never comes here.
+    std::vector<ImportSlot> data_slots;
+    uint64_t data_base = 0;
+    // One page per data object. The size of an imported variable is NOT knowable here -- an
+    // undefined symbol carries st_size 0 throughout this corpus -- so the stride is chosen to be
+    // larger than any plausible scalar or small struct rather than derived. Untouched pages cost no
+    // physical memory, so a generous stride is close to free and keeps an over-long store inside its
+    // own slot instead of on its neighbour's.
+    uint64_t data_stride = 4096;
 
     // Global export table: NID -> absolute guest address (first definition wins). Retained so the
     // HLE can serve sceKernelDlsym by name (nid_hash(name)) against loaded modules — e.g. resolve
@@ -104,8 +129,9 @@ struct Program {
     struct AliasedExport { std::string nid, winner_path, loser_path; uint64_t winner, loser; };
     std::vector<AliasedExport> aliased_exports;
 
-    // Stats for reporting.
-    size_t total_imports = 0, resolved_cross_module = 0, stubbed = 0;
+    // Stats for reporting. Every import lands in exactly one bucket:
+    // total_imports == resolved_cross_module + stubbed + bound_data.
+    size_t total_imports = 0, resolved_cross_module = 0, stubbed = 0, bound_data = 0;
 };
 
 // The exported NIDs a module contributes to the global export table: defined (non-import),
@@ -136,7 +162,13 @@ struct ExportSubsumption {
 
 // Link the given modules (the first is the main executable). Applies relocations.
 // Returns false with *err on failure.
-bool link_program(const std::vector<LinkInput>& inputs, uint64_t stub_base,
+//
+// `stub_base` roots the executable import-stub aperture and `data_base` the writable import-DATA
+// aperture; the two must not overlap and neither may be 0. `data_base` is a required argument rather
+// than a defaulted one on purpose: there is no safe fallback for a data import (binding it into the
+// code aperture is the defect #3529 records, and binding it near address 0 is worse), so a caller
+// that has not mapped an aperture must be a compile error rather than a silent regression.
+bool link_program(const std::vector<LinkInput>& inputs, uint64_t stub_base, uint64_t data_base,
                   Program& out, std::string* err);
 
 } // namespace prosper
