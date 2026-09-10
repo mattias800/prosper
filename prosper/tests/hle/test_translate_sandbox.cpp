@@ -76,6 +76,13 @@ int main() {
               "the subpath under /download0 survives translation");
         CHECK(resolve_guest_path("/download0/../etc/passwd").rfind("/prosper-denied", 0) == 0,
               "/download0 traversal out of its mount is denied like every other mount");
+        // A traversal that RE-ENTERS a mount is allowed and mapped, unlike one that leaves the
+        // sandbox. This is what the `reenters_mount` clause is for, and the deny case above cannot
+        // cover it: "/download0/../etc/passwd" normalises to "/etc/passwd" and is refused whether or
+        // not /download0 is listed there. Only a path normalising back INTO /download0 tells them
+        // apart -- without this, deleting /download0 from that clause reddens nothing.
+        CHECK(resolve_guest_path("/app0/../download0/patch.pkg") == download0,
+              "a traversal re-entering /download0 is mapped, not denied");
     }
     fs::create_directories(root / "saves");
     CHECK(savedata0_mount("slot", SaveDataMountPolicy::OpenOrCreate) == SaveDataMountOutcome::Created,

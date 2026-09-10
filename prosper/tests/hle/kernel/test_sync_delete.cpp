@@ -183,7 +183,11 @@ int main() {
     {
         CHECK(ef_cancel != nullptr, "sceKernelCancelEventFlag is registered");
         void* ef = nullptr;
-        ef_create((uint64_t)(uintptr_t)&ef, 0, 0, 0 /*initPattern*/, 0, 0);
+        // Distinct init and set patterns on purpose. With both 0 the flag reads 0 whether the cancel
+        // ASSIGNS the pattern or ORs it in, so the test could not tell them apart -- and assign-vs-OR
+        // is the one part of this contract with no live evidence either way. 0x80 in, 0x40 cancelled:
+        // assign leaves 0x40, OR would leave 0xc0.
+        ef_create((uint64_t)(uintptr_t)&ef, 0, 0, 0x80 /*initPattern*/, 0, 0);
         CHECK(ef != nullptr, "event flag created for the cancel case");
 
         std::atomic<uint64_t> wret{~0ull}; std::atomic<bool> done{false};
@@ -199,7 +203,7 @@ int main() {
         // The out-parameter the unregistered stub never wrote. Poisoned first, so "untouched" and
         // "written as 0" cannot be confused — the defect was that the guest read stack residue.
         int32_t num_wait_threads = -12345;
-        const uint64_t crc = ef_cancel((uint64_t)(uintptr_t)ef, 0 /*setPattern*/,
+        const uint64_t crc = ef_cancel((uint64_t)(uintptr_t)ef, 0x40 /*setPattern*/,
                                        (uint64_t)(uintptr_t)&num_wait_threads, 0, 0, 0);
         CHECK(crc == 0, "CancelEventFlag reported success");
         CHECK(num_wait_threads == 1,
@@ -210,13 +214,15 @@ int main() {
         if (done.load()) t.join(); else t.detach();
         CHECK((uint32_t)wret.load() == kECANCELED,
               "cancelled event-flag waiter returned ECANCELED, not success");
-        CHECK(observed == 0, "cancelled waiter still received the result pattern");
+        CHECK(observed == 0x40,
+              "the cancel ASSIGNS its set-pattern (0x40) rather than OR-ing it into 0x80 (-> 0xc0), "
+              "and the cancelled waiter still receives that pattern");
 
         // A thread that parks AFTER the cancel must not be released by it — this is what makes
         // cancel_gen a generation rather than a sticky flag.
-        std::atomic<bool> done2{false};
+        std::atomic<bool> done2{false}; std::atomic<uint64_t> wret2{~0ull};
         std::thread t2([&]{
-            ef_wait((uint64_t)(uintptr_t)ef, 0x1, 0, 0, 0 /*infinite*/, 0);
+            wret2.store(ef_wait((uint64_t)(uintptr_t)ef, 0x1, 0, 0, 0 /*infinite*/, 0));
             done2.store(true);
         });
         std::this_thread::sleep_for(std::chrono::milliseconds(40));
@@ -225,11 +231,23 @@ int main() {
         for (int i = 0; i < 200 && !done2.load(); i++) std::this_thread::sleep_for(std::chrono::milliseconds(5));
         CHECK(done2.load(), "that waiter still wakes on a genuine set");
         if (done2.load()) t2.join(); else t2.detach();
+        // The timing check above is a real discriminator only if t2 actually reached the wait inside
+        // those 40 ms; if the scheduler starved it, `!done2` would hold for the wrong reason and the
+        // arm would pass vacuously. The RETURN CODE settles it either way: a generation captured after
+        // the cancel yields a genuine set (0), while a sticky cancel yields ECANCELED no matter when
+        // t2 was scheduled.
+        CHECK(wret2.load() == 0,
+              "that waiter returned success from the set, not ECANCELED from the earlier cancel");
 
         // A null handle answers like every other member of the family.
-        int32_t untouched = -999;
-        CHECK(ef_cancel(0, 0, (uint64_t)(uintptr_t)&untouched, 0, 0, 0) == 0 && untouched == -999,
-              "CancelEventFlag on a null handle matches the family's 0 and writes nothing");
+        // A null handle answers like the family (0) AND still defines the out-parameter. Returning
+        // SCE_OK over an untouched slot is the same false-success shape this call was registered to
+        // remove; nothing was cancelled, so the honest count is 0.
+        int32_t poisoned = -999;
+        CHECK(ef_cancel(0, 0, (uint64_t)(uintptr_t)&poisoned, 0, 0, 0) == 0,
+              "CancelEventFlag on a null handle matches the family's 0");
+        CHECK(poisoned == 0,
+              "CancelEventFlag on a null handle still writes a defined count, not stack residue");
 
         ef_delete((uint64_t)(uintptr_t)ef, 0, 0, 0, 0, 0);
     }

@@ -2952,7 +2952,13 @@ HLE(k_ef_cancel)  {
     // answer (no title passes a null handle), and a secondary implementation offers a third one
     // (ESRCH), so the tiebreak is consistency: if this convention is wrong it should be corrected for
     // the whole family, with evidence, rather than diverged from in one place.
-    if (!e) return 0;
+    if (!e) {
+        // Still define the out-parameter. Returning SCE_OK while leaving it untouched is exactly the
+        // false-success-with-unwritten-out-param shape this registration exists to remove, reached by
+        // another door: nothing was cancelled, so the honest count is 0.
+        if (a2 && gpu::guest_writable(a2, sizeof(int32_t))) *(int32_t*)(uintptr_t)a2 = 0;
+        return 0;
+    }
     interruptible_mutex_lock(&e->m);
     const int parked = e->waiters;
     e->bits = a1;                   // the flag is SET to the pattern, not OR'd into it
@@ -2964,8 +2970,21 @@ HLE(k_ef_cancel)  {
     // out-pointer (#1963): the pointer comes from the guest, and an unwritable one is a guest-side
     // null/uninitialised object, not a reason to fault prosper. Unlike the create path this does not
     // fail the call -- the cancel has already happened and reporting failure would be a second lie.
-    if (a2 && gpu::guest_writable(a2, sizeof(int32_t)))
+    if (a2 && gpu::guest_writable(a2, sizeof(int32_t))) {
         *(int32_t*)(uintptr_t)a2 = parked;
+    } else if (a2) {
+        // Loud, rate-limited, like sceKernelCreateEventFlag's refusal (#1963). Skipping the store
+        // silently would leave the guest holding SCE_OK over an unwritten slot -- this call's original
+        // defect, through a second door -- so the one case prosper cannot answer says so.
+        static std::atomic<uint32_t> refused{0};
+        const uint32_t n = refused.fetch_add(1, std::memory_order_relaxed);
+        if (n < 8)
+            fprintf(stderr,
+                    "[libkernel] sceKernelCancelEventFlag: REFUSED unwritable numWaitThreads pointer "
+                    "0x%llx; the cancel took effect and returns SCE_OK, but the guest's count is "
+                    "UNWRITTEN (#3496; %u so far%s)\n",
+                    (unsigned long long)a2, n + 1, n == 7 ? ", further reports suppressed" : "");
+    }
     if (sclog()) fprintf(stderr, "[sync2] T%" PRIu64 " EF.cancel    ef=0x%llx bits=0x%llx parked=%d\n",
                          sctid(), (unsigned long long)a0, (unsigned long long)a1, parked);
     return 0;
