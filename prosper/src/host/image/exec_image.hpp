@@ -86,6 +86,43 @@ struct BootResult {
 // the half that decides whether a fault is the title's bug or ours.
 std::string describe_code_address(uint64_t address);
 
+// Name the GUEST frames on the calling thread's stack, for a handler that must say WHO called it.
+//
+// `rbp_seed` is the frame-pointer value captured by PROSPER_CAPTURE_RBP at the top of the calling
+// HLE handler (host/fault/guest_caller.hpp). Both possible values work and neither needs to be
+// distinguished: with a frame pointer, rbp is the handler's own frame whose saved-rbp slot links to
+// the guest's; without one, rbp still HOLDS the guest's, because rbp is callee-saved and no import
+// stub writes it. Host frames encountered on the way are readable and increasing, so the walk
+// crosses them; they are then dropped by the guest-module filter rather than being reported as
+// guest code.
+//
+// Writes up to `max` GUEST return addresses into `out`, newest first, and returns how many. A
+// return of 0 means no guest frame was recoverable -- report that as such, never as "no caller":
+// this is a frame-pointer walk, and a caller compiled without a prologue is skipped silently
+// (instrument traps 114 and 217). It is a lead to confirm by disassembling the named call site,
+// not an authority.
+int guest_frames_from_rbp(uint64_t rbp_seed, uint64_t* out, int max);
+
+// The same question asked without frame pointers: SCAN the calling thread's stack for guest return
+// addresses instead of following a chain.
+//
+// This exists because the chain walk above is not merely incomplete on optimised titles, it is
+// often EMPTY -- FINAL FANTASY TACTICS' fatal raise recovers exactly one frame, the module entry
+// point, because every guest frame between omitted its prologue. A scan has no such dependency: a
+// return address pushed by `call` is on the stack whether or not the callee kept a frame pointer.
+//
+// The cost of a scan is false positives, so each candidate is CONFIRMED at the call site: a real
+// return address has a `call` instruction ending immediately before it, and the encodings are
+// checked here (`call rel32` and the register/memory-indirect forms). A stale value left in a dead
+// stack slot almost never satisfies that, which is what makes the output readable rather than a wall
+// of plausible-looking numbers. Order is stack order -- innermost first -- not a proven call order:
+// a scan cannot tell a live frame from a dead one that still validates.
+//
+// `rsp_seed` is the stack pointer captured by PROSPER_CAPTURE_RSP at the top of the calling handler.
+// Scanning is bounded by the guest thread's registered stack when one is known, and by a fixed
+// window otherwise. Returns how many addresses were written.
+int guest_frames_on_stack(uint64_t rsp_seed, uint64_t* out, int max);
+
 // Register the stack a guest thread runs on (main thread + workers we spawn), keyed by
 // its pthread id, so GC/thread code gets accurate bounds without pthread_getattr_np.
 void register_thread_stack(uint64_t tid, void* base, uint64_t size);

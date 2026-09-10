@@ -1700,6 +1700,10 @@ if(TARGET prosper_core)
   target_link_libraries(test_ampr_amm PRIVATE prosper_core)
   add_test(NAME ampr_amm COMMAND test_ampr_amm)
 
+  add_executable(test_mprotect_unaligned tests/hle/memory/test_mprotect_unaligned.cpp)
+  target_link_libraries(test_mprotect_unaligned PRIVATE prosper_core)
+  add_test(NAME mprotect_unaligned COMMAND test_mprotect_unaligned)
+
   # #2908: a refused Ampr map must hand its direct-memory claim back. POSIX-only because the
   # mapping primitives it exercises are — on Windows sceAmprCommandBufferSetBuffer is still the
   # do-nothing stub, which cannot leak and cannot demonstrate the lever either.

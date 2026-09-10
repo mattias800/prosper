@@ -2220,11 +2220,47 @@ static uint64_t sce_mprotect_error(int error) {
         default:     return 0x80020016ull;
     }
 }
+// sceKernelMprotect(addr, len, prot).
+//
+// The range is NORMALIZED to guest pages before anything is applied, exactly as k_mtypeprotect
+// below already does. Protection is a page-granular property on every platform prosper targets, so
+// a sub-page request can only ever mean "the pages containing this span" -- and the two functions
+// answering the same question differently is the divergence the charter's one-derivation rule
+// exists to prevent.
+//
+// This is not a tolerance, it is the console's contract, and a shipping title is the evidence.
+// FINAL FANTASY TACTICS - The Ivalice Chronicles (#3498) calls
+// sceKernelMprotect(eboot+0xf999e0, 0x1da20, 0xc3) during its allocator init -- an address that is
+// not 16 KiB aligned and a length that is not a multiple of it. Passed through verbatim, host
+// mprotect(2) rejects the unaligned base with EINVAL, and the title reads that as fatal: it
+// abandons the init, returns -1 up four frames, its framework constructor yields NULL, main()
+// returns, and the CRT raises sceKernelDebugRaiseExceptionOnReleaseMode(0xa0020001) about a second
+// into the boot. A title that ships and runs on hardware is proof the console accepted the call.
+//
+// It is also the SECOND time a refused mprotect has cost a title its whole init path: #2101 is The
+// Messenger losing its AGC register-offset table the same way. That fix, and the bounded REFUSED
+// log it added, landed on the Windows half only -- which is why this one had to be found by
+// disassembling the guest instead of by reading a log. The log is mirrored here for that reason.
+//
+// CONFIDENCE: HIGH. The failing call is live-captured, the EINVAL is observed at the guest's own
+// test instruction (eboot+0x9779), and the normalization matches the sibling entry point.
 HLE(k_mprotect) {
     if (!a0) return 0x80020016ull;
+    uint64_t base = 0, len = 0;
+    if (!normalize_guest_page_range(a0, a1, base, len)) return 0x80020016ull;
+    if (!len) return 0;                       // an empty span is a no-op, not an error
     const int prot = host_prot(a2);
-    if (mprotect((void*)a0, a1, prot) != 0) return sce_mprotect_error(errno);
-    retrack_prot(a0, a1, prot, static_cast<uint32_t>(a2), "mprotect");
+    if (mprotect((void*)base, len, prot) != 0) {
+        const int failure = errno;
+        static std::atomic<int> n{0};
+        if (n.fetch_add(1) < 24)
+            fprintf(stderr, "[memhle] sceKernelMprotect REFUSED addr=0x%llx len=0x%llx prot=0x%llx "
+                            "(pages [0x%llx,0x%llx)) errno=%d\n",
+                    (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2,
+                    (unsigned long long)base, (unsigned long long)(base + len), failure);
+        return sce_mprotect_error(failure);
+    }
+    retrack_prot(base, len, prot, static_cast<uint32_t>(a2), "mprotect");
     return 0;
 }
 
@@ -6818,11 +6854,38 @@ static uint64_t sce_win_mprotect_error(DWORD error) {
         default:                      return 0x80020016ull;
     }
 }
+// sceKernelMprotect(addr, len, prot).
+//
+// The range is NORMALIZED to guest pages before anything is applied, exactly as k_mtypeprotect
+// below already does. Protection is a page-granular property on every platform prosper targets, so
+// a sub-page request can only ever mean "the pages containing this span" -- and the two functions
+// answering the same question differently is the divergence the charter's one-derivation rule
+// exists to prevent.
+//
+// This is not a tolerance, it is the console's contract, and a shipping title is the evidence.
+// FINAL FANTASY TACTICS - The Ivalice Chronicles (#3498) calls
+// sceKernelMprotect(eboot+0xf999e0, 0x1da20, 0xc3) during its allocator init -- an address that is
+// not 16 KiB aligned and a length that is not a multiple of it. Passed through verbatim, host
+// mprotect(2) rejects the unaligned base with EINVAL, and the title reads that as fatal: it
+// abandons the init, returns -1 up four frames, its framework constructor yields NULL, main()
+// returns, and the CRT raises sceKernelDebugRaiseExceptionOnReleaseMode(0xa0020001) about a second
+// into the boot. A title that ships and runs on hardware is proof the console accepted the call.
+//
+// It is also the SECOND time a refused mprotect has cost a title its whole init path: #2101 is The
+// Messenger losing its AGC register-offset table the same way. That fix, and the bounded REFUSED
+// log it added, landed on the Windows half only -- which is why this one had to be found by
+// disassembling the guest instead of by reading a log. The log is mirrored here for that reason.
+//
+// CONFIDENCE: HIGH. The failing call is live-captured, the EINVAL is observed at the guest's own
+// test instruction (eboot+0x9779), and the normalization matches the sibling entry point.
 HLE(k_mprotect) {
     if (!a0) return 0x80020016ull;
+    uint64_t base = 0, len = 0;
+    if (!normalize_guest_page_range(a0, a1, base, len)) return 0x80020016ull;
+    if (!len) return 0;
     const int prot = host_prot(a2);
     DWORD error = ERROR_SUCCESS;
-    if (!win_protect(a0, a1, prot, &error)) {
+    if (!win_protect(base, len, prot, &error)) {
         // #2101: a refused mprotect is silent, and a guest that treats it as fatal then abandons a
         // whole init path with no other symptom. Report the span, the requested Sony protection and
         // the Win32 reason, bounded.
@@ -6834,7 +6897,7 @@ HLE(k_mprotect) {
                     (unsigned long)error);
         return sce_win_mprotect_error(error);
     }
-    retrack_prot(a0, a1, prot, static_cast<uint32_t>(a2), "mprotect");
+    retrack_prot(base, len, prot, static_cast<uint32_t>(a2), "mprotect");
     return 0;
 }
 HLE(k_mtypeprotect) {
