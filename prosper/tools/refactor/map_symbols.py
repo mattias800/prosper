@@ -416,7 +416,12 @@ def print_clusters(regions, edges, parts: int) -> None:
         names = ", ".join(f"{body[i]['name']}({size[i]})" for i in tops)
         print(f"  [{n}] {len(g):>4} region(s) {lines:>6}L{at_cap}")
         print(f"       {names[:96]}")
-        print(f"       plan: {' '.join(str(i) for i in sorted(g))}"[:300])
+        plan = " ".join(str(i) for i in sorted(g))
+        # NOT truncated. This line exists to be copy-pasted into split_file.py; a silent cut at 300
+        # characters drops every region past about the hundredth and yields a plan that is a valid
+        # prefix of the right answer, which is the worst failure available here. split_file.py
+        # catches an incomplete partition, but only after the caller has run it.
+        print(f"       plan: {plan}")
 
 
 def selftest() -> int:
@@ -481,7 +486,11 @@ def selftest() -> int:
 
     # A region nothing references has nothing to attach to; it must survive rather than vanish.
     lone, _ = propose_clusters(regions, {1: {2: 5}}, 2)
-    check(sum(len(g) for g in lone) == 8, "every body region appears in exactly one group")
+    seen = [i for g in lone for i in g]
+    # The SET and the COUNT, not just the count: a total of 8 is equally consistent with one region
+    # duplicated and another dropped, which is precisely what a bad merge produces.
+    check(sorted(seen) == list(range(1, 9)) and len(seen) == 8,
+          f"every body region appears in exactly one group (got {sorted(seen)})")
 
     print("== PASS ==" if not bad else f"== FAIL: {bad} ==")
     return 1 if bad else 0

@@ -250,7 +250,8 @@ def build(map_data: dict, original: str, promote: list[int], header_rel: str,
     head.append(pre_text)
     # The preamble is COPIED, and a copy can end inside a conditional the original closes later.
     # gpu_capture.cpp opens `#if defined(__linux__) || defined(__APPLE__)` among its includes and
-    # closes it far below, outside any preamble region -- so the verbatim copy shipped 3 `#if`
+    # closes it on the very next line, outside any preamble region -- so the verbatim copy
+    # shipped 3 `#if`
     # against 2 `#endif` and the header failed with "unterminated #if". The tool already models
     # preprocessor depth for the regions it PROMOTES; this applies the same care to the part it
     # replicates. Closing here is safe in a way that dropping would not be: every directive copied
@@ -779,7 +780,7 @@ def main() -> int:
     # The promote set has to be closed under "what does this call that is still internal", and the
     # caller cannot be expected to derive that by hand from a 6,000-line file -- so print the exact
     # argument to re-run with.
-    # `not externally_linked(...)`, not `anon.get(...)`. This file documents at :139-151 why the
+    # `not externally_linked(...)`, not `anon.get(...)`. This file documents at :129-134 why the
     # anonymous-namespace walk alone is the wrong linkage test -- a `static` free function has
     # internal linkage while sitting outside any anonymous namespace -- and the refusal below is a
     # statement about linkage, so it has to use the predicate that knows that. Using the weaker one
@@ -811,8 +812,11 @@ def main() -> int:
             f"anonymous namespace, and a header cannot declare those -- the declaration would name a\n"
             f"DIFFERENT entity than the definition and make every call ambiguous:\n"
             f"  {names}{more}\n\n"
-            f"The promote set must be closed under what it calls. Re-run with:\n"
-            f"  --regions {','.join(str(i) for i in closure)}\n\n"
+            + (f"The promote set must be closed under what it calls. Re-run with:\n"
+               f"  --regions {','.join(str(i) for i in closure)}\n\n"
+               if closure != sorted(promote) else
+               "Every callee that could close this set is already in --exclude, so there is no\n"
+               "--regions list that fixes it -- printing the one you typed would be a no-op.\n\n")
             + (f"\n{len(stuck)} of them are in --exclude and so are NOT in that list; those calls\n"
                f"have to be removed from the promoted code instead: "
                f"{', '.join(regions[i]['name'] for i in stuck[:4])}\n" if stuck else "")

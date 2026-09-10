@@ -370,7 +370,8 @@ def measure(path: pathlib.Path, flags: list[str], parse_target: pathlib.Path) ->
                 "unparsed_lines": unparsed, "unparsed_share": round(unparsed / total, 3),
                 "biggest": "<%d line(s) behind an inactive #if>" % unparsed,
                 "biggest_lines": unparsed, "biggest_share": round(unparsed / total, 3),
-                "lambda_lines": 0, "lambda_share_of_biggest": 0.0,
+                # No lambda share: it is not computed on this path either, and emitting 0.0 here
+                # was the same unmeasured-value-in-a-measured-shape the scored path was fixed for.
                 "verdict": "UNPARSED"}
     if not sized:
         return {"file": rel, "lines": total, "verdict": "OK", "regions": 0,
@@ -661,8 +662,19 @@ def main() -> int:
         # the developer's account name and directory layout. Paths are relative to the repository
         # root, which is where the tool is run from, so a consumer resolves them the same way the
         # compile database's own entries are resolved.
-        rel_rows = [{**r, "file": str(pathlib.Path(r["file"]).relative_to(root))
-                     if str(r["file"]).startswith(str(root)) else r["file"]} for r in rows]
+        # BOTH fields. The printed table strips `file` and `why`; the first version of this
+        # stripped only `file`, so the JSON went on publishing the absolute path in exactly the
+        # rows that name a problem -- the case the comment above was written about.
+        def _rel(row: dict) -> dict:
+            out = dict(row)
+            f = str(row.get("file", ""))
+            if f.startswith(str(root)):
+                out["file"] = str(pathlib.Path(f).relative_to(root))
+            if "why" in out:
+                out["why"] = out["why"].replace(str(root) + "/", "").replace(str(root), "")
+            return out
+
+        rel_rows = [_rel(r) for r in rows]
         args.json.write_text(json.dumps(rel_rows, indent=2))
         print(f"[survey] wrote {args.json} ({len(rel_rows)} row(s), paths relative to the repo root)")
     return 0
