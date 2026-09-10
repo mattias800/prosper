@@ -148,7 +148,7 @@ The measurement moved three specific beliefs:
 
 ### Three ways this survey measured the wrong thing, and all of them failed silently
 
-Neither produced an error or an odd-looking row. Each produced a confident verdict about a file
+None of them produced an error or an odd-looking row. Each produced a confident verdict about a file
 other than the one asked about, which is why they are recorded here rather than in a commit message.
 All three are now pinned by fixtures under `testdata/`, and each fixture is built so the defective
 measurement yields a **different verdict**, not merely a different number -- verified by re-running
@@ -262,10 +262,10 @@ python3 prosper/tools/refactor/survey_sizes.py --min-lines 2500     # needs libc
 python3 prosper/tools/refactor/survey_sizes.py --selftest           # no libclang needed
 ```
 
-`--selftest` runs the classifier's arithmetic cases always, and the two `testdata/` measurement
-fixtures **only where libclang is importable** -- saying so explicitly when it skips them, because
-those two are the checks that cover how the classifier's inputs are measured, and both shipped
-defects lived there rather than in the arithmetic. The registered ctest case
+`--selftest` runs the classifier's arithmetic cases always, and the four `testdata/` measurement
+checks **only where libclang is importable** -- saying so explicitly, and naming them, when it skips
+them. Those are the checks covering how the classifier's INPUTS are measured, and every defect this
+tool shipped lived there rather than in the arithmetic. The registered ctest case
 (`refactor_survey_classifier`) therefore gates the arithmetic everywhere and the measurement locally.
 
 **The invariant that makes incremental extraction safe is worth copying.** When a block was extracted

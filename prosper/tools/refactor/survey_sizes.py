@@ -158,30 +158,36 @@ def _file_in_tu(tu, path: pathlib.Path) -> bool:
     that assumption into a check.
     """
     try:
-        if _same_file(tu.spelling, path):
+        if _same_file(tu.spelling, path, on_error=False):
             return True
-    except (OSError, TypeError):
+    except TypeError:                             # no tu.spelling; the include scan still runs
         pass
     for inc in tu.get_includes():
-        if inc.include is not None and _same_file(inc.include.name, path):
+        if inc.include is not None and _same_file(inc.include.name, path, on_error=False):
             return True
     return False
 
 
-def _same_file(a: str, b: pathlib.Path) -> bool:
+def _same_file(a: str, b: pathlib.Path, on_error: bool = True) -> bool:
     """Same file on disk, compared by INODE rather than by spelling.
 
     `resolve()` is not enough here. This repository is reached under two spellings that resolve
     differently and name one file -- the container's `/home/<user>/...` bind mount and the host's
     `/var/home/<user>/...` -- and a mismatch made the old clip discard every span and report a file
-    with 963 skipped lines as having none. Falling back to True on an OS error keeps that failure in
-    the loud direction: an over-count raises UNPARSED, which is visible, where an under-count is the
-    silent wrong answer.
+    with 963 skipped lines as having none.
+
+    ON_ERROR is which way to fail when the stat itself fails, and the two callers want OPPOSITE
+    directions -- so it is a parameter rather than a fixed policy. For the span clip, True: an
+    over-count raises UNPARSED, which someone sees, where an under-count is the silent wrong
+    answer. For the membership test in `_file_in_tu`, False: a failed stat is not evidence the
+    translation unit read the file, and answering True would assert membership on no information
+    and hand the caller a confident 0. The same "fail toward the visible outcome" rule lands on
+    different booleans because the visible outcome differs.
     """
     try:
         return os.path.samefile(a, b)
     except OSError:
-        return True
+        return on_error
 
 
 def merge_spans(spans: list[tuple[int, int]]) -> int:
@@ -460,7 +466,7 @@ def _arithmetic_selftest() -> int:
 
 
 def _parse_selftest() -> int:
-    """Score the two fixtures, whose answers are known by construction.
+    """Score the measurement fixtures, whose answers are known by construction.
 
     These are the cases the arithmetic above CANNOT reach: both past defects were in how the inputs
     to classify() were measured, not in classify() itself, so every arithmetic case passed happily
