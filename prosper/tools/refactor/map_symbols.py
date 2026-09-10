@@ -220,6 +220,40 @@ def regions_of(tu, target: pathlib.Path, total_lines: int, max_depth: int = 3) -
     return regions
 
 
+def usrs_declared_outside(tu, target: pathlib.Path) -> set[str]:
+    """USRs that some OTHER file in this translation unit also declares -- i.e. that a header
+    carries.
+
+    This is the difference between "links" and "compiles", and it is not the same question as
+    linkage. A function defined in a .cpp inside `namespace prosper::gpu`, never declared in a
+    header, has EXTERNAL linkage: clang's USR starts `c:@`, and the symbol is visible to the
+    linker. Move its callers to a second .cpp and the program still links -- and does not compile,
+    because no declaration is in scope.
+
+    Measured: splitting rdna2_to_spirv.cpp per shader stage passed a linkage-based cross-part check
+    and then failed on `safe_execz_branches` in three of the five outputs. Its sibling
+    `safe_execz_branches_for_test` IS declared in rdna2_to_spirv.hpp; it is not. Nothing about the
+    linkage of the two differs.
+
+    So a definition may be left in another part only if some header declares it, which is exactly
+    "this USR appears in a file other than the one being split".
+    """
+    out: set[str] = set()
+    tgt = target.resolve()
+
+    def walk(c) -> None:
+        f = c.location.file
+        if f is not None and pathlib.Path(f.name).resolve() != tgt:
+            u = c.get_usr()
+            if u:
+                out.add(u)
+        for k in c.get_children():
+            walk(k)
+
+    walk(tu.cursor)
+    return out
+
+
 def cross_refs(tu, target: pathlib.Path, regions: list[dict]) -> dict[int, dict[int, int]]:
     """region -> {other region: reference count}, for symbols defined in this same file."""
     # Own every declaration whose LOCATION falls inside a region, not just the region's own cursor.
@@ -548,6 +582,11 @@ def main() -> int:
 
     regions = regions_of(tu, target, total_lines)
     edges = cross_refs(tu, target, regions)
+    # Whether a header also declares each region's symbol. See usrs_declared_outside: this is what
+    # decides if a definition can be left in another part, and linkage is not a substitute for it.
+    declared = usrs_declared_outside(tu, target)
+    for r in regions:
+        r["declared_in_header"] = bool(r.get("usr") and r["usr"] in declared)
 
     bodies = [r for r in regions if r["role"] == "body"]
     print(f"== {target.relative_to(root)}: {total_lines} lines, {len(regions)} region(s) "

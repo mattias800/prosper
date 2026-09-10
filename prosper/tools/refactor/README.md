@@ -315,6 +315,16 @@ the compiler on that split: **23 names flagged, 25 reported by g++, and the two 
 `r` and `w`** -- local variables in cascading errors from `Reader r;` and `Writer w;`. No false
 positives on that file.
 
+**Linkage is not the test; a visible declaration is.** The first version of this check skipped any
+definition with external linkage, on the reasoning that another translation unit can name it. That
+is true of the *linker* and says nothing about the *compiler*: a function defined in a .cpp inside a
+named namespace and never declared in a header has external linkage and no declaration in scope
+anywhere else, so a split moves its callers into a file that links and does not compile. Splitting
+`rdna2_to_spirv.cpp` per shader stage passed the linkage-only check and failed on
+`safe_execz_branches` in three of five outputs -- while its sibling `safe_execz_branches_for_test`,
+identical in linkage, was fine because `rdna2_to_spirv.hpp` declares it. `map_symbols` records
+`declared_in_header` per region now, and that is what the check keys on.
+
 **The check cannot see inactive `#if` arms**, and that limit is not small: libclang parses one arm,
 so a map made on Linux carries no references from the 52% of `hle_kernel_mem.cpp` or the 30% of
 `hle_kernel.cpp` that sit behind a platform conditional. A split validated here can still strand a
