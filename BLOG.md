@@ -19,6 +19,25 @@ from the tracker issues, and still gated, because it is a projection of state ra
 > title's current state — for that, read the tracker. Nothing is ever removed when a title moves on,
 > because the point of a blog is that it records *when* things happened.
 
+## 2026-09-10
+
+### Darksiders II's intro movie was being cut in half down the diagonal
+
+The PS5 draws a full-screen rectangle by handing the GPU only **three** of its corners and letting
+the hardware work out the fourth. Vulkan has no such primitive, so prosper derives that corner
+itself — and it assumed the three always arrive in the same order. Darksiders II's video blit sends
+them in a different one, so the corner prosper computed landed off-screen and half the movie was
+never drawn. The corner is now identified from the geometry instead of from a fixed position, which
+is the same answer wherever the old assumption held.
+
+![Darksiders II's intro movie before the fix: the picture is cut corner to corner, everything below the diagonal black](assets/screenshots/darksiders2-intro-fmv-rectlist-half.webp)
+
+![The same moment of the same movie now: the whole cliff, the tree trunks, the cloaked figure and the lantern glow all present](assets/screenshots/darksiders2-intro-fmv-complete.webp)
+
+![Darksiders II's legal and title screen at 3840x2160, logo and licensing text complete](assets/screenshots/darksiders2-legal-screen.webp)
+
+[#3507](https://github.com/mattias800/prosper/issues/3507).
+
 ## 2026-09-09
 
 ### Two title screens NVIDIA was throwing away, and the proof that lets us keep them

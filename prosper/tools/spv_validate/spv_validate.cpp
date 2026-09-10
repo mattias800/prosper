@@ -822,6 +822,15 @@ int main(int argc, char** argv) {
       const FragmentInterpolationLayout layout =
           fragment_interpolation_layout(ps, sizeof(ps)/4, &perspective_center);
       dump(dir, "geometry_interpolation", recompile_interpolation_geometry(layout),
+           "recompile_interpolation_geometry");
+      // The rect-synthesis variant is a DIFFERENT module -- extra types, a bvec4, and a dozen selects
+      // the plain form never emits -- so validating only the form above validates none of it. That
+      // gap is how an OpSelect with a vec4 result and a scalar condition (legal only from SPIR-V 1.4,
+      // and this emitter stamps 1.3) reached CI in #3511; spirv-val rejects it outright. One emitter,
+      // two shapes, so both are dumped.
+      dump(dir, "geometry_interpolation_rect",
+           recompile_interpolation_geometry(layout, /*capture_position=*/false,
+                                            /*synthesize_rect=*/true),
            "recompile_interpolation_geometry"); }
 
     fails += check_emitter_coverage(src_root);

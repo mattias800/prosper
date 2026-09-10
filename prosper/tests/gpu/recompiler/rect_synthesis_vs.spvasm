@@ -1,0 +1,52 @@
+               OpCapability Shader
+          %1 = OpExtInstImport "GLSL.std.450"
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint Vertex %main "main" %vidx %pervertex %attr0
+               OpDecorate %vidx BuiltIn VertexIndex
+               OpMemberDecorate %PerVertex 0 BuiltIn Position
+               OpDecorate %PerVertex Block
+               OpDecorate %attr0 Location 0
+       %void = OpTypeVoid
+       %fnty = OpTypeFunction %void
+      %float = OpTypeFloat 32
+    %v4float = OpTypeVector %float 4
+        %int = OpTypeInt 32 1
+       %bool = OpTypeBool
+     %v4bool = OpTypeVector %bool 4
+ %ptr_in_int = OpTypePointer Input %int
+       %vidx = OpVariable %ptr_in_int Input
+  %PerVertex = OpTypeStruct %v4float
+ %ptr_out_pv = OpTypePointer Output %PerVertex
+  %pervertex = OpVariable %ptr_out_pv Output
+ %ptr_out_v4 = OpTypePointer Output %v4float
+      %attr0 = OpVariable %ptr_out_v4 Output
+      %int_0 = OpConstant %int 0
+      %int_1 = OpConstant %int 1
+        %f_0 = OpConstant %float 0
+        %f_1 = OpConstant %float 1
+       %f_m1 = OpConstant %float -1
+        %f_a = OpConstant %float 0.2
+        %f_b = OpConstant %float 0.5
+        %f_c = OpConstant %float 0.7
+       %posA = OpConstantComposite %v4float %f_m1 %f_m1 %f_0 %f_1
+       %posB = OpConstantComposite %v4float %f_1 %f_m1 %f_0 %f_1
+       %posC = OpConstantComposite %v4float %f_m1 %f_1 %f_0 %f_1
+        %uvA = OpConstantComposite %v4float %f_a %f_0 %f_0 %f_1
+        %uvB = OpConstantComposite %v4float %f_b %f_0 %f_0 %f_1
+        %uvC = OpConstantComposite %v4float %f_c %f_0 %f_0 %f_1
+       %main = OpFunction %void None %fnty
+      %entry = OpLabel
+         %iv = OpLoad %int %vidx
+        %is0 = OpIEqual %bool %iv %int_0
+        %is1 = OpIEqual %bool %iv %int_1
+       %was0 = OpCompositeConstruct %v4bool %is0 %is0 %is0 %is0
+       %was1 = OpCompositeConstruct %v4bool %is1 %is1 %is1 %is1
+      %posBC = OpSelect %v4float %was1 %posB %posC
+        %pos = OpSelect %v4float %was0 %posA %posBC
+       %uvBC = OpSelect %v4float %was1 %uvB %uvC
+         %uv = OpSelect %v4float %was0 %uvA %uvBC
+     %posptr = OpAccessChain %ptr_out_v4 %pervertex %int_0
+               OpStore %posptr %pos
+               OpStore %attr0 %uv
+               OpReturn
+               OpFunctionEnd

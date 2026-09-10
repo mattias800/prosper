@@ -188,6 +188,7 @@ enum : uint32_t {
     Op_Capability=17, Op_TypeVoid=19, Op_TypeBool=20, Op_TypeInt=21, Op_TypeFloat=22, Op_TypeVector=23,
     Op_TypeRuntimeArray=29, Op_TypeStruct=30, Op_TypePointer=32, Op_TypeFunction=33,
     Op_ConstantTrue=41, Op_ConstantFalse=42, Op_Constant=43, Op_Function=54, Op_FunctionEnd=56, Op_Variable=59,
+    Op_Dot=148,
     Op_LogicalOr=166, Op_LogicalAnd=167, Op_LogicalNot=168, Op_Select=169, Op_FOrdEqual=180, Op_FOrdNotEqual=182, Op_FOrdLessThan=184, Op_FOrdGreaterThan=186,
     Op_FOrdLessThanEqual=188, Op_FOrdGreaterThanEqual=190,
     Op_FUnordEqual=181, Op_FUnordNotEqual=183, Op_FUnordLessThan=185, Op_FUnordGreaterThan=187,   // NaN-inclusive ("n"-prefix) compares
@@ -4263,8 +4264,49 @@ struct SpirvCompute {
     // extension. Input assembly has already decomposed lists/strips/fans into triangles here. A
     // three-vertex PS5 RectList whose attributes come from a vertex buffer also comes through this
     // stage: GFX10 synthesizes its fourth corner after vertex shading, while Vulkan has no RectList
-    // topology. The missing post-VS position and every consumed varying are the affine fourth
-    // corner P1 + P2 - P0; emitting P0,P1,P2,P3 as a strip preserves the hardware rectangle.
+    // topology. Emitting P0,P1,P2,P3 as a strip preserves the hardware rectangle.
+    //
+    // WHICH corner is missing is decided per draw, not by a fixed index. Three supplied corners of a
+    // rectangle are one SHARED corner (adjacent to both others) plus that corner's diagonal pair; the
+    // synthesized vertex is the shared corner's opposite, `diag_a + diag_b - shared`. This used to be
+    // hardcoded to `P1 + P2 - P0`, i.e. "the shared corner is always P0". Darksiders II's video blit
+    // supplies its rectangle in the other order -- P0=bottom-right, P1=top-left, P2=top-right, so the
+    // shared corner is P2 and the missing one is bottom-left. Under the hardcoded rule that draw
+    // synthesized (-1,3) instead of (-1,-1): off-screen, so its half of the strip never rasterized and
+    // the FMV rendered as the single upper-right triangle of #3507.
+    //
+    // The shared corner is identified geometrically, from the shaded positions: of the three pairwise
+    // separations the largest is the diagonal, and the vertex not on it is the shared corner. For a
+    // rectangle this is exact (the diagonal strictly exceeds either side), it needs no convention
+    // guess, and it AGREES with the old formula precisely when the old formula was right -- when P0 is
+    // the shared corner it selects `P1 + P2 - P0` -- so no draw that renders correctly today changes.
+    // Every varying and the explicit-parameter barycentrics follow the same selected index.
+    //
+    // CONFIDENCE: MED on the choice of discriminator, HIGH that it beats the fixed index it replaces.
+    // "Longest separation is the diagonal" is exact for a rectangle and for any parallelogram whose
+    // shared corner is not acute enough to make a side exceed a diagonal; a sufficiently SHEARED
+    // parallelogram breaks it, and the rule would then complete the wrong corner. Every RectList
+    // observed so far is an axis-aligned screen-space rectangle, where it cannot happen. Separation is
+    // measured on the full 4-component clip position, which is exact when w is constant across the
+    // three vertices -- true of every screen-space blit, and the same assumption the hardware's own
+    // affine completion makes. A title that submits a genuinely sheared or perspective-divided
+    // RectList would need the real hardware rule, which needs a title to demonstrate it.
+    //
+    // The EMISSION ORDER is the other half, and getting only the corner right is not enough. A strip's
+    // two triangles share its middle edge, so that edge must be the rectangle's DIAGONAL -- the shared
+    // corner leads and the synthesized one comes last. Emitting the supplied order when the shared
+    // corner is not v0 gives two triangles that share a SIDE instead: they overlap on one half and
+    // leave the wedge between the two diagonals uncovered, which on Darksiders II's blit is a black
+    // triangle with its apex at the screen centre.
+    //
+    // The order is a ROTATION of the supplied triple -- supplied[(shared + slot) % 3] -- and it has to
+    // be, because a strip's facing is its FIRST triangle's and the guest's cull state is passed
+    // straight through (`render_state.cpp`, no RectList exemption). "Shared first, then the other two
+    // in ascending order" also puts the diagonal in the middle, but for shared == v1 it is the odd
+    // permutation (v1,v0,v2): it reverses the facing, so a culled draw would render NOTHING where it
+    // previously rendered half. Rotations are even, so facing is preserved for all three. When the
+    // shared corner is v0 the rotation is the identity, so nothing that renders correctly today
+    // changes. Vulkan flips the winding test on a strip's odd triangle, so both halves agree.
     std::vector<uint32_t> build_interpolation_geometry(
             const FragmentInterpolationLayout& layout, bool capture_geometry_position,
             bool synthesize_rect = false) {
@@ -4272,6 +4314,14 @@ struct SpirvCompute {
 
         t_void = id(); t_fn = id(); t_f32 = id(); t_u32 = id(); t_i32 = id(); t_bool = id();
         t_v4f = id();
+        // This module declares SPIR-V 1.3 (see finish()), where an OpSelect with a VECTOR result needs
+        // a vector condition of the same width -- a scalar condition is only legal from 1.4. The rect
+        // path is the only place here selecting between vec4s, so the bvec4 is allocated and declared
+        // only for it, and the non-synthesis module gains no instruction and no type from it.
+        // (That module is NOT byte-identical to before this change: loading the positions earlier
+        // renumbers the ids after it, and the `consumes_parameters` guard below elides a composite
+        // that nothing consumed. Both are semantically inert; ids are module-internal.)
+        const uint32_t t_v4bool = synthesize_rect ? id() : 0;
         const uint32_t t_input_per_vertex = id(), t_output_per_vertex = id();
         const uint32_t c_three = id();
         const uint32_t t_input_positions = id(), t_input_varyings = id();
@@ -4354,6 +4404,7 @@ struct SpirvCompute {
         put(types, Op_TypeInt, {t_i32, 32, 1});
         put(types, Op_TypeBool, {t_bool});
         put(types, Op_TypeVector, {t_v4f, t_f32, 4});
+        if (synthesize_rect) put(types, Op_TypeVector, {t_v4bool, t_bool, 4});
         put(types, Op_TypeStruct, {t_input_per_vertex, t_v4f});
         put(types, Op_TypeStruct, {t_output_per_vertex, t_v4f});
         put(types, Op_Constant, {t_u32, c_three, 3});
@@ -4390,6 +4441,67 @@ struct SpirvCompute {
                 put(code, Op_Load, {t_v4f, attribute_values[attr][vertex], pointer});
             }
         }
+        std::array<uint32_t, 3> positions{};
+        for (uint32_t vertex = 0; vertex < 3; ++vertex) {
+            const uint32_t input_pointer = id();
+            put(code, Op_AccessChain,
+                {ptr_in_v4f, input_pointer, input_position, uconst(vertex), uconst(0)});
+            positions[vertex] = id();
+            put(code, Op_Load, {t_v4f, positions[vertex], input_pointer});
+        }
+
+        // `rect_shared_is_v0` / `rect_shared_is_v1` name the supplied vertex adjacent to both others
+        // (neither true => it is v2). Compared as squared separations, so no square root is needed.
+        uint32_t rect_shared_is_v0 = 0, rect_shared_is_v1 = 0;
+        // The same two selectors widened to bvec4, for the vec4 selects (see the t_v4bool note).
+        uint32_t rect_shared_is_v0_wide = 0, rect_shared_is_v1_wide = 0;
+        if (synthesize_rect) {
+            auto squared_separation = [&](uint32_t a, uint32_t b) {
+                const uint32_t delta = id();
+                put(code, Op_FSub, {t_v4f, delta, a, b});
+                const uint32_t squared = id();
+                put(code, Op_Dot, {t_f32, squared, delta, delta});
+                return squared;
+            };
+            const uint32_t d01 = squared_separation(positions[0], positions[1]);
+            const uint32_t d02 = squared_separation(positions[0], positions[2]);
+            const uint32_t d12 = squared_separation(positions[1], positions[2]);
+            const uint32_t d12_ge_d01 = id(), d12_ge_d02 = id();
+            put(code, Op_FOrdGreaterThanEqual, {t_bool, d12_ge_d01, d12, d01});
+            put(code, Op_FOrdGreaterThanEqual, {t_bool, d12_ge_d02, d12, d02});
+            rect_shared_is_v0 = id();
+            put(code, Op_LogicalAnd, {t_bool, rect_shared_is_v0, d12_ge_d01, d12_ge_d02});
+            // Only consulted when v0 is not the shared corner, so d02 vs d01 settles it.
+            rect_shared_is_v1 = id();
+            put(code, Op_FOrdGreaterThanEqual, {t_bool, rect_shared_is_v1, d02, d01});
+            auto broadcast = [&](uint32_t condition) {
+                const uint32_t wide = id();
+                putv(code, Op_CompositeConstruct,
+                     {t_v4bool, wide, condition, condition, condition, condition});
+                return wide;
+            };
+            rect_shared_is_v0_wide = broadcast(rect_shared_is_v0);
+            rect_shared_is_v1_wide = broadcast(rect_shared_is_v1);
+        }
+        // The fourth value of any per-vertex quantity, under the selected shared corner.
+        auto synthesize_fourth = [&](uint32_t v0, uint32_t v1, uint32_t v2) {
+            auto complete = [&](uint32_t diag_a, uint32_t diag_b, uint32_t shared) {
+                const uint32_t sum = id();
+                put(code, Op_FAdd, {t_v4f, sum, diag_a, diag_b});
+                const uint32_t corner = id();
+                put(code, Op_FSub, {t_v4f, corner, sum, shared});
+                return corner;
+            };
+            const uint32_t shared_v0 = complete(v1, v2, v0);
+            const uint32_t shared_v1 = complete(v0, v2, v1);
+            const uint32_t shared_v2 = complete(v0, v1, v2);
+            const uint32_t not_v0 = id();
+            put(code, Op_Select, {t_v4f, not_v0, rect_shared_is_v1_wide, shared_v1, shared_v2});
+            const uint32_t chosen = id();
+            put(code, Op_Select, {t_v4f, chosen, rect_shared_is_v0_wide, shared_v0, not_v0});
+            return chosen;
+        };
+
         std::array<std::array<uint32_t, 3>, 32> parameters{};
         std::array<uint32_t, 32> rect_attribute_values{};
         for (uint32_t attr = 0; attr < 32; ++attr) {
@@ -4406,35 +4518,46 @@ struct SpirvCompute {
                 put(code, Op_FSub, {t_v4f, parameters[attr][1],
                                     attribute_values[attr][2], attribute_values[attr][0]});
             }
-            if (synthesize_rect) {
-                const uint32_t sum = id();
-                put(code, Op_FAdd, {t_v4f, sum,
-                                    attribute_values[attr][1], attribute_values[attr][2]});
-                rect_attribute_values[attr] = id();
-                put(code, Op_FSub, {t_v4f, rect_attribute_values[attr],
-                                    sum, attribute_values[attr][0]});
-            }
+            if (synthesize_rect)
+                rect_attribute_values[attr] = synthesize_fourth(attribute_values[attr][0],
+                                                                attribute_values[attr][1],
+                                                                attribute_values[attr][2]);
         }
 
-        std::array<uint32_t, 3> positions{};
-        for (uint32_t vertex = 0; vertex < 3; ++vertex) {
-            const uint32_t input_pointer = id();
-            put(code, Op_AccessChain,
-                {ptr_in_v4f, input_pointer, input_position, uconst(vertex), uconst(0)});
-            positions[vertex] = id();
-            put(code, Op_Load, {t_v4f, positions[vertex], input_pointer});
-        }
         uint32_t rect_position = 0;
-        if (synthesize_rect) {
-            const uint32_t sum = id();
-            put(code, Op_FAdd, {t_v4f, sum, positions[1], positions[2]});
-            rect_position = id();
-            put(code, Op_FSub, {t_v4f, rect_position, sum, positions[0]});
-        }
+        if (synthesize_rect)
+            rect_position = synthesize_fourth(positions[0], positions[1], positions[2]);
+
+        // Value emitted in strip slot `slot`. The supplied triple is ROTATED so the shared corner
+        // leads -- slot k carries supplied[(shared + k) % 3] -- then the synthesized corner last.
+        // Without rect synthesis this is the identity, so the plain path is unchanged.
+        auto slot_of = [&](uint32_t slot, const std::array<uint32_t, 3>& supplied,
+                           uint32_t synthesized) -> uint32_t {
+            if (!synthesize_rect) return supplied[slot];
+            if (slot == 3) return synthesized;
+            // supplied[(shared + slot) % 3] -- a ROTATION, chosen at runtime.
+            const uint32_t if_v0 = supplied[(0 + slot) % 3];
+            const uint32_t if_v1 = supplied[(1 + slot) % 3];
+            const uint32_t if_v2 = supplied[(2 + slot) % 3];
+            const uint32_t not_v0 = id();
+            put(code, Op_Select, {t_v4f, not_v0, rect_shared_is_v1_wide, if_v1, if_v2});
+            const uint32_t chosen = id();
+            put(code, Op_Select, {t_v4f, chosen, rect_shared_is_v0_wide, if_v0, not_v0});
+            return chosen;
+        };
+        // A float chosen by the shared corner: `if_v0` / `if_v1` / `if_v2`.
+        auto by_shared_corner = [&](float if_v0, float if_v1, float if_v2) {
+            const uint32_t not_v0 = id();
+            put(code, Op_Select,
+                {t_f32, not_v0, rect_shared_is_v1, fconstf(if_v1), fconstf(if_v2)});
+            const uint32_t chosen = id();
+            put(code, Op_Select, {t_f32, chosen, rect_shared_is_v0, fconstf(if_v0), not_v0});
+            return chosen;
+        };
 
         const uint32_t output_vertices = synthesize_rect ? 4u : 3u;
         for (uint32_t vertex = 0; vertex < output_vertices; ++vertex) {
-            const uint32_t position = vertex < 3 ? positions[vertex] : rect_position;
+            const uint32_t position = slot_of(vertex, positions, rect_position);
             uint32_t output_pointer = id();
             put(code, Op_AccessChain,
                 {ptr_out_v4f, output_pointer, output_position, uconst(0)});
@@ -4443,20 +4566,40 @@ struct SpirvCompute {
             for (uint32_t attr = 0; attr < 32; ++attr) {
                 if (attribute_outputs[attr])
                     put(code, Op_Store,
-                        {attribute_outputs[attr], vertex < 3
-                            ? attribute_values[attr][vertex] : rect_attribute_values[attr]});
+                        {attribute_outputs[attr],
+                         slot_of(vertex, attribute_values[attr], rect_attribute_values[attr])});
                 for (uint32_t selector = 0; selector < 3; ++selector)
                     if (parameter_outputs[attr][selector])
                         put(code, Op_Store,
                             {parameter_outputs[attr][selector], parameters[attr][selector]});
             }
-            const float i = vertex == 1 || vertex == 3 ? 1.0f : 0.0f;
-            const float j = vertex == 2 || vertex == 3 ? 1.0f : 0.0f;
-            const uint32_t barycentric = id();
-            putv(code, Op_CompositeConstruct,
-                 {t_v4f, barycentric, fconstf(i), fconstf(j), fconstf(1.0f), fconstf(1.0f)});
-            for (uint32_t variable : system_outputs)
-                if (variable) put(code, Op_Store, {variable, barycentric});
+            // The explicit-parameter basis is P0=A0, P10=A1-A0, P20=A2-A0, so a vertex's (i,j) are
+            // its coordinates in it. The synthesized corner's depend on which vertex was shared:
+            // shared v0 -> A1+A2-A0 = (1,1); shared v1 -> A0+A2-A1 = (-1,1); shared v2 -> (1,-1).
+            const bool consumes_parameters =
+                std::any_of(system_outputs.begin(), system_outputs.end(),
+                            [](uint32_t variable) { return variable != 0; });
+            if (consumes_parameters) {
+                // Supplied v0/v1/v2 sit at (0,0), (1,0), (0,1); the synthesized corner is the
+                // shared corner's opposite, so its coordinates negate the shared axis.
+                uint32_t bary_i, bary_j;
+                if (synthesize_rect) {
+                    // [slot][shared corner]. Slot k carries supplied[(shared + k) % 3], whose
+                    // coordinates are v0=(0,0), v1=(1,0), v2=(0,1); slot 3 is the synthesized corner.
+                    static constexpr float kI[4][3] = {{0, 1, 0}, {1, 0, 0}, {0, 0, 1}, {1, -1, 1}};
+                    static constexpr float kJ[4][3] = {{0, 0, 1}, {0, 1, 0}, {1, 0, 0}, {1, 1, -1}};
+                    bary_i = by_shared_corner(kI[vertex][0], kI[vertex][1], kI[vertex][2]);
+                    bary_j = by_shared_corner(kJ[vertex][0], kJ[vertex][1], kJ[vertex][2]);
+                } else {
+                    bary_i = fconstf(vertex == 1 ? 1.0f : 0.0f);
+                    bary_j = fconstf(vertex == 2 ? 1.0f : 0.0f);
+                }
+                const uint32_t barycentric = id();
+                putv(code, Op_CompositeConstruct,
+                     {t_v4f, barycentric, bary_i, bary_j, fconstf(1.0f), fconstf(1.0f)});
+                for (uint32_t variable : system_outputs)
+                    if (variable) put(code, Op_Store, {variable, barycentric});
+            }
             put(code, Op_EmitVertex, {});
         }
         put(code, Op_EndPrimitive, {});
