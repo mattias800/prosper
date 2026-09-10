@@ -2942,10 +2942,17 @@ HLE(k_ef_clear)   { auto* e = (EventFlag*)(uintptr_t)a0; if (!e) return 0; inter
 // rather than on it is the recurring failure this file's own comments describe.
 //
 // CONFIDENCE: HIGH on the argument layout (live-captured) and on the three effects being the whole
-// contract. CONFIDENCE: MED on the error code for a null handle, inherited from the siblings above.
+// contract.
 HLE(k_ef_cancel)  {
     auto* e = (EventFlag*)(uintptr_t)a0;
-    if (!e) return 0x80020016ull;   // SCE_KERNEL_ERROR_EINVAL
+    // A null handle returns 0, matching every other member of this family -- k_ef_delete/set/clear/
+    // wait/poll and all four semaphore entry points do the same. An earlier revision returned EINVAL
+    // here and said it was "inherited from the siblings above"; it was inherited from nothing, and it
+    // made this the ONE call in the family that reports failure. There is no local evidence for any
+    // answer (no title passes a null handle), and a secondary implementation offers a third one
+    // (ESRCH), so the tiebreak is consistency: if this convention is wrong it should be corrected for
+    // the whole family, with evidence, rather than diverged from in one place.
+    if (!e) return 0;
     interruptible_mutex_lock(&e->m);
     const int parked = e->waiters;
     e->bits = a1;                   // the flag is SET to the pattern, not OR'd into it
@@ -2953,8 +2960,12 @@ HLE(k_ef_cancel)  {
     interruptible_cond_broadcast(&e->c);
     pthread_mutex_unlock(&e->m);
     // The out-parameter the stub never wrote. A guest that branches on "how many did I just
-    // cancel?" was reading stack residue.
-    if (a2) *(int32_t*)(uintptr_t)a2 = parked;
+    // cancel?" was reading stack residue. Validated before storing, like sceKernelCreateEventFlag's
+    // out-pointer (#1963): the pointer comes from the guest, and an unwritable one is a guest-side
+    // null/uninitialised object, not a reason to fault prosper. Unlike the create path this does not
+    // fail the call -- the cancel has already happened and reporting failure would be a second lie.
+    if (a2 && gpu::guest_writable(a2, sizeof(int32_t)))
+        *(int32_t*)(uintptr_t)a2 = parked;
     if (sclog()) fprintf(stderr, "[sync2] T%" PRIu64 " EF.cancel    ef=0x%llx bits=0x%llx parked=%d\n",
                          sctid(), (unsigned long long)a0, (unsigned long long)a1, parked);
     return 0;
@@ -3502,8 +3513,11 @@ HLE(k_ef_wait)    { // (ef, pattern, waitMode, resultPat*, SceKernelUseconds* ti
     // no local evidence either way and follow the secondary implementation alone. That is a
     // cross-check, not an authority: it is a work in progress like this one, so treat those two as the
     // weakest claims here and re-derive them against a title that actually parks a waiter.
-    // The set-pattern is better supported: every observed call passes 0, where assigning and OR-ing
-    // differ (assign clears the flag, OR leaves it), and assigning is what carries PPSA29714 forward.
+    // Assign-vs-OR for the set-pattern is in the same class, and an earlier revision of this comment
+    // claimed the title's progress supported assigning. It does not: #3496 records "measured after:
+    // unchanged" for this whole call, and the title is unblocked by the /download0 mount instead. With
+    // every observed setPattern == 0 and no waiter ever parked, the two are indistinguishable here.
+    // Assigning is a contract claim, not a measured one.
     //
     // prosper reaches all of this differently in any case -- a generation counter, so nothing
     // busy-waits and a thread that parks after the cancel is not released by it.

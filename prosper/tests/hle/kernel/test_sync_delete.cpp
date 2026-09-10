@@ -32,6 +32,7 @@ static int fails = 0;
 
 static constexpr uint32_t kEACCES = 0x8002000Du;
 static constexpr uint32_t kEBUSY = 0x80020010u;
+static constexpr uint32_t kECANCELED = 0x80020055u;   // 0x80020000 | FreeBsd ECanceled(85)
 static constexpr uint32_t kETIMEDOUT = 0x8002003Cu;
 
 static bool set_test_env(const char* name, const char* value) {
@@ -107,6 +108,8 @@ int main() {
     auto ef_poll   = Hle::lookup(nid_hash("sceKernelPollEventFlag"));
     auto ef_wait   = Hle::lookup(nid_hash("sceKernelWaitEventFlag"));
     auto ef_delete = Hle::lookup(nid_hash("sceKernelDeleteEventFlag"));
+    auto ef_cancel = Hle::lookup(nid_hash("sceKernelCancelEventFlag"));
+    auto ef_set    = Hle::lookup(nid_hash("sceKernelSetEventFlag"));
     auto se_create = Hle::lookup(nid_hash("sceKernelCreateSema"));
     auto se_wait   = Hle::lookup(nid_hash("sceKernelWaitSema"));
     auto se_delete = Hle::lookup(nid_hash("sceKernelDeleteSema"));
@@ -170,6 +173,65 @@ int main() {
         CHECK(done.load(), "DeleteEventFlag woke the parked waiter (no hang)");
         if (done.load()) t.join(); else { t.detach(); }
         CHECK((uint32_t)wret.load() == kEACCES, "woken event-flag waiter returned EACCES");
+    }
+
+    // --- EventFlag: park a thread, then CANCEL rather than delete (#3496). Every claim the cancel
+    //     implementation rests on is checked here, because no local title reaches any of them: the
+    //     census that found the defect saw 0 parked waiters across 3000 calls. That is a fact about
+    //     the corpus, not about what a test can construct by hand — which is exactly when CLAUDE.md
+    //     says to build the positive instance yourself.
+    {
+        CHECK(ef_cancel != nullptr, "sceKernelCancelEventFlag is registered");
+        void* ef = nullptr;
+        ef_create((uint64_t)(uintptr_t)&ef, 0, 0, 0 /*initPattern*/, 0, 0);
+        CHECK(ef != nullptr, "event flag created for the cancel case");
+
+        std::atomic<uint64_t> wret{~0ull}; std::atomic<bool> done{false};
+        uint64_t observed = ~0ull;
+        std::thread t([&]{
+            uint64_t r = ef_wait((uint64_t)(uintptr_t)ef, 0x1 /*pattern*/, 0 /*mode OR*/,
+                                 (uint64_t)(uintptr_t)&observed, 0 /*infinite*/, 0);
+            wret.store(r); done.store(true);
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));   // let it block in the wait
+        CHECK(!done.load(), "event-flag waiter is parked before cancel");
+
+        // The out-parameter the unregistered stub never wrote. Poisoned first, so "untouched" and
+        // "written as 0" cannot be confused — the defect was that the guest read stack residue.
+        int32_t num_wait_threads = -12345;
+        const uint64_t crc = ef_cancel((uint64_t)(uintptr_t)ef, 0 /*setPattern*/,
+                                       (uint64_t)(uintptr_t)&num_wait_threads, 0, 0, 0);
+        CHECK(crc == 0, "CancelEventFlag reported success");
+        CHECK(num_wait_threads == 1,
+              "CancelEventFlag wrote the parked-waiter count through its out-pointer");
+
+        for (int i = 0; i < 200 && !done.load(); i++) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        CHECK(done.load(), "CancelEventFlag woke the parked waiter (no hang)");
+        if (done.load()) t.join(); else t.detach();
+        CHECK((uint32_t)wret.load() == kECANCELED,
+              "cancelled event-flag waiter returned ECANCELED, not success");
+        CHECK(observed == 0, "cancelled waiter still received the result pattern");
+
+        // A thread that parks AFTER the cancel must not be released by it — this is what makes
+        // cancel_gen a generation rather than a sticky flag.
+        std::atomic<bool> done2{false};
+        std::thread t2([&]{
+            ef_wait((uint64_t)(uintptr_t)ef, 0x1, 0, 0, 0 /*infinite*/, 0);
+            done2.store(true);
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(40));
+        CHECK(!done2.load(), "a waiter parking after the cancel is NOT released by it");
+        ef_set((uint64_t)(uintptr_t)ef, 0x1, 0, 0, 0, 0);   // release it for real
+        for (int i = 0; i < 200 && !done2.load(); i++) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        CHECK(done2.load(), "that waiter still wakes on a genuine set");
+        if (done2.load()) t2.join(); else t2.detach();
+
+        // A null handle answers like every other member of the family.
+        int32_t untouched = -999;
+        CHECK(ef_cancel(0, 0, (uint64_t)(uintptr_t)&untouched, 0, 0, 0) == 0 && untouched == -999,
+              "CancelEventFlag on a null handle matches the family's 0 and writes nothing");
+
+        ef_delete((uint64_t)(uintptr_t)ef, 0, 0, 0, 0, 0);
     }
 
     // --- Semaphore: same shape — park on a count that never arrives, delete, expect EACCES wake. ---

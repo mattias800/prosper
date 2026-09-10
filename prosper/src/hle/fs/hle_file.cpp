@@ -560,16 +560,19 @@ namespace {
     // inventory in hle_addcontent.cpp and are not affected by this.
     // Override with PROSPER_DOWNLOAD0.
     std::string download0_root() {
-        static std::string root;
-        if (root.empty()) {
+        // Magic-static, like virtual_root_dir() above and unlike temp0_root()'s older lazy `if
+        // (root.empty())` -- titles do file I/O from several threads, and two of them racing that
+        // check both assign the string. A new mount does not need to inherit the older race.
+        static const std::string root = [] {
             const char* e = getenv("PROSPER_DOWNLOAD0");
-            root = e ? e : "/tmp/prosper-download0";
+            std::string d = e ? e : "/tmp/prosper-download0";
 #ifdef _WIN32
-            _mkdir(root.c_str());
+            _mkdir(d.c_str());
 #else
-            ::mkdir(root.c_str(), 0777);
+            ::mkdir(d.c_str(), 0777);
 #endif
-        }
+            return d;
+        }();
         return root;
     }
     // #1234: the jailed title's virtual ROOT ("/app0/..") as a real, readable host directory.
