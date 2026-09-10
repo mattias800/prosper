@@ -284,6 +284,34 @@ every group into the largest connected component -- one 6,374-line "part" out of
 reported as a perfect zero-cut split. That is pinned by a selftest arm now, with the fixture built so
 the defect changes the group COUNT rather than merely a number.
 
+### The three tools are a chain, and each one checks the step before it
+
+`map_symbols` proposes a seam, `promote_internal` makes the shared vocabulary visible, `split_file`
+cuts. The order is forced, and the reason is worth stating because skipping a step produces a result
+that passes every check and does not compile:
+
+```bash
+map_symbols.py  --file <f> --clusters 3 --json /tmp/f.json   # where to cut, and what it costs
+promote_internal.py --map /tmp/f.json --regions <closure> --header <f>_internal.hpp
+map_symbols.py  --file <f> --json /tmp/f2.json               # promotion changes every index
+split_file.py   --map /tmp/f2.json --plan <plan> --dry-run
+```
+
+**Both closure checks exist because their absence was measured, not imagined.** Splitting
+`gpu_capture.cpp`'s serialize/deserialize into their own file satisfied every check `split_file` had
+-- exact tiling, a clean partition, byte-for-byte reconstruction -- and then failed to compile with
+**25 undeclared names**, because `Writer`, `Reader`, `kMagic`, `read_table` and twenty others have
+internal linkage and stayed in the other part. Every one of those checks is byte accounting: they
+establish that no LINE was lost, never that a line can still be used where it ended up.
+
+The reference matrix that answers it was already in the map. `split_file` reads it now and refuses,
+naming the definitions and printing the `promote_internal` command that fixes them. Measured against
+the compiler on that split: **23 names flagged, 25 reported by g++, and the two it did not name are
+`r` and `w`** -- local variables in cascading errors from `Reader r;` and `Writer w;`. No false
+positives.
+
+`promote_internal` has the mirror of the same check, for the same reason.
+
 ### Running it
 
 ```bash

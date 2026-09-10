@@ -133,6 +133,48 @@ def check_structure(regions: list[dict], total_lines: int) -> list[str]:
     return problems
 
 
+def region_is_external(region: dict) -> bool:
+    """External linkage, from the USR clang recorded.
+
+    Same rule as promote_internal's: an external entity's USR starts `c:@`, an internal one is
+    file-prefixed. A `static` free function is internal WITHOUT being in an anonymous namespace, so
+    a scope walk alone gets it wrong.
+    """
+    usr = region.get("usr") or ""
+    return usr.startswith("c:@") if usr else False
+
+
+def unresolved_across_parts(map_data: dict, plan: dict[str, list[int]]) -> dict[int, set[str]]:
+    """Regions each output part references that live in ANOTHER part and cannot be seen from it.
+
+    This is the check that was missing, and its absence is not theoretical: splitting
+    gpu_capture.cpp's serialize/deserialize into their own file passed every existing check --
+    tiling, partition, byte-for-byte reconstruction -- and then failed to compile with 25 distinct
+    undeclared names (`Writer`, `Reader`, `kMagic`, `read_table`, ...), because those definitions
+    have internal linkage and stayed behind in the other part.
+
+    Every existing check here is byte accounting: it establishes that no LINE was lost. None of them
+    can see that a line ended up somewhere it cannot be used from. The reference matrix that answers
+    it is already in the map, put there by map_symbols precisely because "a split that separates an
+    internal-linkage helper from its callers does not fail at review, it fails at link".
+    """
+    regions = {r["index"]: r for r in map_data["regions"]}
+    edges = {int(a): {int(b) for b in d} for a, d in map_data.get("edges", {}).items()}
+    owner = {i: out for out, idxs in plan.items() for i in idxs}
+    missing: dict[int, set[str]] = {}
+    for src, dests in edges.items():
+        if src not in owner:
+            continue
+        for dest in dests:
+            if dest not in owner or owner[dest] == owner[src]:
+                continue
+            r = regions.get(dest, {})
+            if r.get("role") != "body" or region_is_external(r):
+                continue                      # visible across translation units; nothing to do
+            missing.setdefault(dest, set()).add(owner[src])
+    return missing
+
+
 def split(map_data: dict, plan: dict[str, list[int]], source_text: str,
           preamble_note: str = "") -> tuple[dict[str, str], list[str]]:
     """Pure: returns (outfile -> text, problems). Drives both the real run and --selftest."""
@@ -330,6 +372,26 @@ def selftest() -> int:
     if bad:
         print("  the splitter's own guarantees are broken; it must not be run")
         return 1
+    # REFERENCES ACROSS THE CUT. Byte accounting cannot see this: the split below is a perfect
+    # partition with perfect reconstruction, and does not compile. `beta` calls `alpha`, `alpha` has
+    # internal linkage (a file-prefixed USR), and the plan puts them in different files.
+    xref_map = {**SAMPLE_MAP, "regions": [dict(r) for r in SAMPLE_MAP["regions"]],
+                "edges": {"2": {"1": 3}}}
+    xref_map["regions"][1]["usr"] = "c:s.cpp@F@alpha#"        # internal linkage
+    xref_map["regions"][2]["usr"] = "c:s.cpp@F@beta#"
+    stranded = unresolved_across_parts(xref_map, {"a.cpp": [1], "b.cpp": [2]})
+    check(set(stranded) == {1},
+          f"an internal-linkage definition called from the other part is caught (got {stranded})")
+    check(not unresolved_across_parts(xref_map, {"a.cpp": [1, 2]}),
+          "and nothing is flagged when the caller and callee land in the same file")
+    # The linkage test is the discriminator, not the edge: an EXTERNAL definition is visible from
+    # the other translation unit, so splitting across it is legal and must not be refused. Without
+    # this arm the check could refuse every cross-part edge and still look correct above.
+    ext_map = {**xref_map, "regions": [dict(r) for r in xref_map["regions"]]}
+    ext_map["regions"][1]["usr"] = "c:@F@alpha#"              # external linkage
+    check(not unresolved_across_parts(ext_map, {"a.cpp": [1], "b.cpp": [2]}),
+          "an EXTERNAL definition called across the cut is not flagged")
+
     print("  [ok]   splitter self-test: replication, partition, tiling, #if, reconstruction")
     return 0
 
@@ -374,6 +436,31 @@ def main() -> int:
         return 1
     print(f"  [ok]   partition: {sum(len(v) for v in plan.values())} body region(s) -> "
           f"{len(plan)} file(s); namespace open/close replicated into each")
+
+    # REFERENCES ACROSS THE CUT. Every check above is byte accounting -- it establishes that no line
+    # was lost, never that a line can still be USED where it ended up. Splitting gpu_capture.cpp's
+    # serialize/deserialize into their own file passed all of them and then failed to compile with
+    # 25 undeclared names, because internal-linkage definitions stayed in the other part.
+    stranded = unresolved_across_parts(map_data, plan)
+    if stranded:
+        regions = {r["index"]: r for r in map_data["regions"]}
+        print(f"  [FAIL] {len(stranded)} definition(s) with internal linkage are referenced from a "
+              f"part they are not in:")
+        for i in sorted(stranded)[:10]:
+            users = ", ".join(sorted(stranded[i]))
+            print(f"           {regions[i].get('name', '?')}  (in "
+                  f"{[o for o, v in plan.items() if i in v][0]}, needed by {users})")
+        if len(stranded) > 10:
+            print(f"           ... and {len(stranded) - 10} more")
+        promote = ",".join(str(i) for i in sorted(stranded))
+        print("         These have to be visible from both sides before the cut. Promote them "
+              "first:")
+        print(f"           promote_internal.py --map <this map> --regions {promote} \\")
+        print("               --header <name>_internal.hpp --namespace prosper::gpu")
+        print("         then re-run map_symbols (the promotion changes every region index) and "
+              "re-plan.")
+        return 1
+    print(f"  [ok]   no internal-linkage definition is referenced from a part it is not in")
 
     if args.dry_run:
         for out, text in sorted(outputs.items()):
