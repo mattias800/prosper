@@ -220,26 +220,34 @@ int main() {
 
         // A thread that parks AFTER the cancel must not be released by it — this is what makes
         // cancel_gen a generation rather than a sticky flag.
+        //
+        // A SECOND cancel is what checks it, rather than a sleep plus "t2 hasn't finished". Its
+        // waiter count OBSERVES t2 parked at that instant instead of inferring it from the absence of
+        // a result, so the arm cannot pass vacuously when a loaded scheduler simply has not run t2:
+        // under a sticky cancel_gen t2 would have fallen straight through the first one and the count
+        // reads 0, and if t2 never reached the wait it also reads 0. Either way this reddens rather
+        // than passing quietly. (An earlier revision asserted t2's RETURN CODE instead and claimed it
+        // discriminated under every scheduling order. It does not: a loop-guard-only sticky mutation
+        // leaves the post-loop verdict `cancel_gen != entry_cancel_gen` false, so that waiter still
+        // returns 0 and the check passes on a broken build. Caught in review of #3512.)
         std::atomic<bool> done2{false}; std::atomic<uint64_t> wret2{~0ull};
         std::thread t2([&]{
             wret2.store(ef_wait((uint64_t)(uintptr_t)ef, 0x1, 0, 0, 0 /*infinite*/, 0));
             done2.store(true);
         });
-        std::this_thread::sleep_for(std::chrono::milliseconds(40));
+        std::this_thread::sleep_for(std::chrono::milliseconds(60));   // let t2 reach the wait
         CHECK(!done2.load(), "a waiter parking after the cancel is NOT released by it");
-        ef_set((uint64_t)(uintptr_t)ef, 0x1, 0, 0, 0, 0);   // release it for real
+        int32_t parked2 = -4242;
+        ef_cancel((uint64_t)(uintptr_t)ef, 0x2, (uint64_t)(uintptr_t)&parked2, 0, 0, 0);
+        CHECK(parked2 == 1,
+              "the second cancel OBSERVES that waiter still parked -- the first cancel did not "
+              "release it, and it did reach the wait");
         for (int i = 0; i < 200 && !done2.load(); i++) std::this_thread::sleep_for(std::chrono::milliseconds(5));
-        CHECK(done2.load(), "that waiter still wakes on a genuine set");
+        CHECK(done2.load(), "the second cancel woke it");
         if (done2.load()) t2.join(); else t2.detach();
-        // The timing check above is a real discriminator only if t2 actually reached the wait inside
-        // those 40 ms; if the scheduler starved it, `!done2` would hold for the wrong reason and the
-        // arm would pass vacuously. The RETURN CODE settles it either way: a generation captured after
-        // the cancel yields a genuine set (0), while a sticky cancel yields ECANCELED no matter when
-        // t2 was scheduled.
-        CHECK(wret2.load() == 0,
-              "that waiter returned success from the set, not ECANCELED from the earlier cancel");
+        CHECK((uint32_t)wret2.load() == kECANCELED,
+              "it reports ECANCELED from the cancel that actually released it");
 
-        // A null handle answers like every other member of the family.
         // A null handle answers like the family (0) AND still defines the out-parameter. Returning
         // SCE_OK over an untouched slot is the same false-success shape this call was registered to
         // remove; nothing was cancelled, so the honest count is 0.
