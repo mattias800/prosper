@@ -154,8 +154,11 @@ All three are now pinned by fixtures under `testdata/`, and each fixture is buil
 measurement yields a **different verdict**, not merely a different number -- verified by re-running
 each pre-fix version against all of them, where every mutation reddens its own fixture and leaves
 the others green (`dominant_no_lambda` -> `HAND` at a 0.729 share for a function with no lambda;
-`midfile_inactive_arm` -> `EXTRACT` with 0 unparsed, naming the include directive that swallowed the
-arm; `namespace_without_children` -> `NO-CURSOR`).
+`midfile_inactive_arm` -> `EXTRACT` with 0 unparsed, naming `posix_only_1` -- the first declaration
+after the skipped arm, whose region had absorbed it; `namespace_without_children` -> `NO-CURSOR`).
+The same absorption in the tree names an `#include` rather than a function (`guest_write_watch.cpp`'s
+`sched.h`); which declaration a swallowed arm ends up attributed to is simply whichever cursor
+follows it.
 
 **The lambda share was measured over the enclosing namespace.** Nearly every file here is one
 `namespace prosper { ... }`, so a file's only *top-level* cursor is the namespace -- and a namespace
@@ -177,7 +180,7 @@ descended on `depth < max_depth` alone. A namespace with no in-target children i
 `body` region by the kids-empty fallthrough, so it can BE a file's dominant region -- and the lookup
 walked straight past it and reported `NO-CURSOR`, refusing to score a file whose answer was not in
 doubt. Reachable with nothing exotic: a namespace whose body is all comments
-(`testdata/namespace_without_children.cpp`, 98.9% of its file). No file in the tree currently hits
+(`testdata/namespace_without_children.cpp`, whose `commentary` region is 93 of 110 lines, 84.5%). No file in the tree currently hits
 it, so this cost nothing -- it was found by constructing the case rather than by observing one, and
 it is recorded because `NO-CURSOR` firing on a false alarm would have read as a tool limitation
 rather than a tool bug.
@@ -204,7 +207,17 @@ trailing-span heuristic did, taking `UNPARSED` from 1 to 4 --
 
 -- and it fails **closed** everywhere the question cannot be answered, because "no unparsed lines"
 and "I could not ask" must never be the same output. A missing `clang_getSkippedRanges` exits; a file
-absent from its own TU, or a NULL range list, scores `NO-PREPROC` rather than 0.
+the translation unit never read, or a NULL range list, scores `NO-PREPROC` rather than 0.
+
+That second guard was itself dead when first written, which is worth recording because it is this
+PR's own defect class appearing inside the fix for it. The check was `if File.from_name(...) is
+None` -- and it never is. `clang_getFile` resolves through the file manager, so it answers for any
+file that exists on disk whether or not the TU read it, and cindex asserts the handle is non-NULL
+besides. A foreign file therefore came back with a valid handle, an empty skipped-range list, and a
+confident **0**, behind a guard that could not fire. Membership is tested against the TU's own
+inclusion record now (`_file_in_tu`), which also turns an existing assumption into a check: a header
+has no compile command, so `flags_for` parses the first TU whose *text* mentions it, without
+confirming the include sits on an active branch.
 
 The subtlest of those was a path comparison. The clip that keeps other files' skipped include guards
 out of the count originally compared `resolve()`d paths -- and this repository is reachable under two

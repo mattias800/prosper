@@ -1,11 +1,21 @@
 // Fixture for survey_sizes.py --selftest. NOT built: nothing globs tools/refactor/testdata.
 //
-// The discriminator for "does region_cursor mirror regions_of's descent rule". This
-// namespace holds no declarations, only comments, so it has no in-target children -- and
-// regions_of therefore emits it as a plain `body` region rather than an open/close pair,
-// which lets it be the file's dominant region. A region_cursor that descends into every
-// namespace on depth alone walks straight past it and reports NO-CURSOR, refusing to score a
-// file whose answer is not in doubt.
+// The discriminator for "does region_cursor mirror regions_of's descent rule". The
+// `commentary` namespace below holds no declarations, only comments, so it has no in-target
+// children -- and regions_of therefore emits it as a plain `body` region rather than an
+// open/close pair, which lets it be the file's dominant region. A region_cursor that descends
+// into every namespace on depth alone walks straight past it and reports NO-CURSOR, refusing
+// to score a file whose answer is not in doubt.
+//
+// `prosper` is deliberately FIRST. Put it last and the commentary namespace lands before the
+// first namespace opener, which regions_of relabels as `preamble` -- and this fixture would
+// then be pinning a preamble region by accident, so a later change to how preambles are
+// counted would redden it for a reason that has nothing to do with namespace descent.
+namespace prosper {
+int a() { return 1; }
+int b() { return 2; }
+}  // namespace prosper
+
 namespace commentary {
 // note line 1: no declaration here, so this namespace has no in-target children
 // note line 2: no declaration here, so this namespace has no in-target children
@@ -98,8 +108,3 @@ namespace commentary {
 // note line 89: no declaration here, so this namespace has no in-target children
 // note line 90: no declaration here, so this namespace has no in-target children
 }  // namespace commentary
-
-namespace prosper {
-int a() { return 1; }
-int b() { return 2; }
-}  // namespace prosper

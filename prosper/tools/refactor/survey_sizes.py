@@ -149,6 +149,25 @@ class SkippedRangesUnavailable(RuntimeError):
     """The skipped-arm question could not be asked. Never answered as zero -- see skipped_lines."""
 
 
+def _file_in_tu(tu, path: pathlib.Path) -> bool:
+    """Did this translation unit actually READ this file?
+
+    Either it is the TU's main file, or it appears in the TU's inclusion record. Both matter: a
+    header has no compile command of its own, so `flags_for` parses the first TU whose text mentions
+    it -- a match that does not check the include is on an ACTIVE preprocessor branch. This turns
+    that assumption into a check.
+    """
+    try:
+        if _same_file(tu.spelling, path):
+            return True
+    except (OSError, TypeError):
+        pass
+    for inc in tu.get_includes():
+        if inc.include is not None and _same_file(inc.include.name, path):
+            return True
+    return False
+
+
 def _same_file(a: str, b: pathlib.Path) -> bool:
     """Same file on disk, compared by INODE rather than by spelling.
 
@@ -185,11 +204,20 @@ def skipped_lines(tu, path: pathlib.Path) -> int:   # requires _need_clang()
     Summed over every arm, and clipped to this file: a TU pulls in hundreds of headers whose own
     include guards skip, and those say nothing about the file being surveyed.
     """
-    f = ci.File.from_name(tu, str(path))
-    if f is None:
-        # Never 0. "The file is not in its own translation unit" is not "this file skips nothing";
-        # answering 0 here is the same silent under-report this function exists to end.
-        raise SkippedRangesUnavailable(f"{path} is not a file of its own translation unit")
+    # Membership is tested against the TU's own inclusion record, NOT by asking whether
+    # `File.from_name` came back empty. It never does: `clang_getFile` resolves through the file
+    # manager, so it answers for any file that exists on disk whether or not this TU ever read it,
+    # and cindex asserts the handle is non-NULL besides (cindex.py's ClangObject). A file outside
+    # the TU therefore yields a valid handle, an empty skipped-range list, and a confident 0 --
+    # exactly the silent zero this function exists to end, wearing a guard that cannot fire.
+    if not _file_in_tu(tu, path):
+        raise SkippedRangesUnavailable(
+            f"{path.name} is not part of the translation unit that was parsed "
+            f"({pathlib.Path(tu.spelling).name}); its skipped arms cannot be measured from it")
+    try:
+        f = ci.File.from_name(tu, str(path))
+    except Exception as exc:                      # noqa: BLE001 - cindex asserts on a bad handle
+        raise SkippedRangesUnavailable(f"no file handle for {path.name}: {exc!r}") from exc
     rl = _SKIPPED_RANGES(tu, f)
     if not rl:
         raise SkippedRangesUnavailable(f"clang_getSkippedRanges returned NULL for {path}")
@@ -315,8 +343,12 @@ def measure(path: pathlib.Path, flags: list[str], parse_target: pathlib.Path) ->
     except SkippedRangesUnavailable as exc:
         return {"file": rel, "lines": total, "verdict": "NO-PREPROC", "why": str(exc)}
     regions = MS.regions_of(tu, path, total)
-    # Movable regions only. An `open`/`close` is replicated into every output part, so it is not a
-    # place a split can cut and must not count toward the file having a seam.
+    # Drop the regions a split replicates rather than relocates: an `open`/`close` is copied into
+    # every output part, so it is not a place a split can cut and must not count toward the file
+    # having a seam. Note this is REPLICATED, which is `open`/`close` only -- `preamble` regions stay
+    # in, even though map_symbols' own docstring describes the preamble as replicated too. Left as
+    # it is deliberately: changing it would move a published count, and the two tools disagreeing
+    # about whether a preamble is movable is map_symbols' question to settle, not this survey's.
     sized = [(r["end"] - r["start"] + 1, r) for r in regions if r.get("role") not in MS.REPLICATED]
     if unparsed / max(total, 1) >= UNPARSED_SHARE:
         return {"file": rel, "lines": total, "regions": len(sized),
@@ -459,6 +491,27 @@ def _parse_selftest() -> int:
         print(f"        full row: {r}")
     bad += not ok
 
+    # The inode comparison had no arm at all until review pointed it out: every fixture uses one
+    # spelling, so reverting `_same_file` to a `resolve()` comparison left them all green. A HARD
+    # LINK reproduces the property the bind-mount alias has and nothing else here does -- two paths
+    # that name one file and that `resolve()` reports as different, since neither is a symlink.
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        one = pathlib.Path(td) / "one.cpp"
+        one.write_text("int x;\n")
+        two = pathlib.Path(td) / "two.cpp"
+        try:
+            os.link(one, two)
+            distinct = one.resolve() != two.resolve()
+            ok = distinct and _same_file(str(two), one)
+            print(f"  [{'ok' if ok else 'FAIL'}] hard-linked paths: resolve() differs={distinct}, "
+                  f"_same_file={_same_file(str(two), one)} "
+                  f"(want both True -- a resolve() comparison drops every span under an alias)")
+            bad += not ok
+        except OSError as exc:
+            print(f"  [FAIL] could not hard-link to test the alias case: {exc}")
+            bad += 1
+
     b = _TESTDATA / "midfile_inactive_arm.cpp"
     r = measure(b, flags, b)
     share = r.get("unparsed_share", 0.0)
@@ -505,8 +558,9 @@ def selftest() -> int:
     else:
         # Say so rather than reporting a quieter PASS. These two checks are the ones that cover how
         # the classifier's INPUTS are measured, and both shipped defects lived there.
-        print("  -- parse fixtures SKIPPED: no libclang here, so the two measurement checks")
-        print("     (dominant-cursor, mid-file inactive arm) did NOT run. Arithmetic only.")
+        print("  -- parse fixtures SKIPPED: no libclang here, so the four measurement checks")
+        print("     (dominant-cursor, namespace descent, mid-file inactive arm, inode alias)")
+        print("     did NOT run. Arithmetic only.")
     print("== PASS ==" if not bad else f"== FAIL: {bad} ==")
     return 1 if bad else 0
 
