@@ -124,8 +124,9 @@ lambda share of every dominant function in the tree, which is the datum that dec
 
 | verdict | files | meaning |
 | --- | --- | --- |
-| `SPLIT` | 13 | no dominant region -- `split_file.py` applies today |
+| `SPLIT` | 12 | no dominant region -- `split_file.py` applies today |
 | `EXTRACT` | 13 | one dominant region, but lambda-light -- clangd's ExtractFunction can act |
+| `UNPARSED` | 1 | a large span the AST never saw -- see below; no AST tool can act until it is split |
 | `HAND` | **1** | dominant AND mostly lambda -- clangd refuses, no tool can help |
 
 Exactly one file is in the untouchable state: `frontends/shared/live/live_renderer.cpp`, whose
@@ -143,6 +144,24 @@ The measurement moved three specific beliefs:
   `OK`.** It required two regions of >=200 lines before offering `SPLIT`, which ranked
   `hle_kernel_mem.cpp` as nothing-to-do. Region COUNT is what a seam needs; region SIZE is not.
   Fixed, and pinned by a selftest case carrying that file's real shape.
+
+### The AST cannot see the inactive side of an `#if`, and that is its own state
+
+`hle_kernel_mem.cpp` is 7,637 lines of which the Windows arm is **3,909 -- 51% of the file** -- behind
+an `#if defined(__linux__) || defined(__APPLE__)`. Parsed on Linux, clang never sees it: the region
+map runs out at line 3720 and the whole Windows arm arrives as a single `TRAILER`.
+
+This is worth its own verdict rather than a footnote, because **every AST-driven statement about such
+a file is answering about the other half**. The first version of this tool scored the file `SPLIT`
+from the 49% it could see -- and worse, it discarded the trailer as scaffolding first, because
+`map_symbols` gives the outermost namespace's trailing text the `close` role and this tool filtered
+`open`/`close` out. 3,909 lines vanished from the accounting silently. Caught by cross-checking the
+survey's own numbers against `map_symbols.py` on the same file; nothing in the survey's output looked
+wrong on its own, which is the point.
+
+The practical consequence for #3503: **that split cannot be driven by `split_file.py`**, because the
+tool is blind to the arm being moved. A platform-arm split is a textual line-range move at the
+`#if`/`#else`/`#endif` boundaries -- provable by concatenation, and needing no AST at all.
 
 `survey_sizes.py` reports a file whose parse emitted errors as `PARSE-FAIL` and gives it **no
 verdict**, because a libclang parse driven from a g++ database fails softly -- a partial AST looks

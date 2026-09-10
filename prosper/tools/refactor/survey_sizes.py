@@ -76,6 +76,11 @@ DOMINANT_SHARE = 0.40
 # ... and a dominant region must be at least this much of a lambda nest before clangd's refusal is
 # what actually blocks extraction, rather than an incidental detail.
 LAMBDA_SHARE = 0.50
+# A text region this large means the parser never saw that code -- almost always the inactive side of
+# an `#if defined(_WIN32)` platform arm. Below this it is ordinary scaffolding (includes, a namespace
+# close); at or above it, the AST is blind to a substantial part of the file and every AST-driven
+# verdict about that file is answering about the other part only.
+UNPARSED_SHARE = 0.15
 # A file needs this many top-level regions before a split has anywhere to cut. Deliberately small,
 # and the first draft got this wrong in a way the tree caught: it demanded two regions of >=200 lines
 # each, which classified `hle_kernel_mem.cpp` -- 7,637 lines whose biggest region is 180 (2%) -- as
@@ -118,13 +123,17 @@ def lambda_lines(cursor) -> int:   # requires _need_clang()
     return sum(e - s + 1 for s, e in merged)
 
 
-def classify(total: int, biggest: int, lam: int, regions: int) -> str:
+def classify(total: int, biggest: int, lam: int, regions: int, unparsed: int = 0) -> str:
     """The verdict, kept pure so --selftest can pin it without parsing anything.
 
     REGIONS is the file's top-level region count, not a count of large ones -- see SPLITTABLE_REGIONS.
+    UNPARSED is lines the AST never saw, and it is checked FIRST: a verdict computed from half a file
+    is not a weaker verdict, it is a statement about a different file.
     """
     if total <= 0:
         return "OK"
+    if unparsed / total >= UNPARSED_SHARE:
+        return "UNPARSED"
     share = biggest / total
     if share >= DOMINANT_SHARE:
         return "HAND" if biggest > 0 and lam / biggest >= LAMBDA_SHARE else "EXTRACT"
@@ -152,9 +161,24 @@ def survey_one(path: pathlib.Path, db: pathlib.Path) -> dict:
                 "why": f"{len(errs)} parse error(s); first: {errs[0].spelling}"}
 
     regions = MS.regions_of(tu, path, total)
+    # Regions the parser contributed no declaration to. `map_symbols` gives the outermost namespace's
+    # trailing text the `close` role, so on a file whose second half sits behind an inactive `#if`
+    # the ENTIRE unparsed arm arrives as one `close`/TRAILER region -- and this filter used to drop
+    # it as scaffolding. On hle_kernel_mem.cpp that silently hid 3,909 lines, 51% of the file, and
+    # scored what remained as though it were the whole thing.
+    unparsed = sum(r["end"] - r["start"] + 1 for r in regions
+                   if r.get("kind") in ("TEXT", "TRAILER")
+                   and (r["end"] - r["start"] + 1) / max(total, 1) >= UNPARSED_SHARE)
     sized = [(r["end"] - r["start"] + 1, r) for r in regions if r.get("role") not in MS.REPLICATED]
     if not sized:
         return {"file": rel, "lines": total, "verdict": "OK", "regions": 0}
+    if unparsed / max(total, 1) >= UNPARSED_SHARE:
+        return {"file": rel, "lines": total, "regions": len(regions),
+                "unparsed_lines": unparsed, "unparsed_share": round(unparsed / total, 3),
+                "biggest": "<unparsed span>", "biggest_lines": unparsed,
+                "biggest_share": round(unparsed / total, 3),
+                "lambda_lines": 0, "lambda_share_of_biggest": 0.0,
+                "verdict": "UNPARSED"}
     sized.sort(key=lambda t: -t[0])
     big_len, big = sized[0]
 
@@ -177,7 +201,8 @@ def survey_one(path: pathlib.Path, db: pathlib.Path) -> dict:
         "lambda_lines": lam,
         "lambda_share_of_biggest": round(lam / big_len, 3) if big_len else 0.0,
         "regions_over_%d" % SPLITTABLE_REGION_LINES: big_regions,
-        "verdict": classify(total, big_len, lam, len(regions)),
+        "unparsed_lines": unparsed,
+        "verdict": classify(total, big_len, lam, len(regions), unparsed),
     }
 
 
@@ -188,13 +213,23 @@ def selftest() -> int:
         (10000, 9000, 8900, 1, "HAND"),      # live_renderer shape: one function, nearly all lambda
         (10000, 9000,   10, 1, "EXTRACT"),   # one function, lambda-free -> clangd can act
         (10000, 1000,    0, 8, "SPLIT"),     # many mid-sized regions -> split_file.py
-        ( 7637,  180,    0, 96, "SPLIT"),    # hle_kernel_mem shape: huge, all small regions.
-                                             # The first classifier called this OK, which was wrong:
-                                             # many small functions is the EASIEST split.
+        (10000, 1000,    0, 96, "SPLIT"),   # huge, all small regions -- the EASIEST split there is.
+                                            # An earlier classifier called this OK, which was wrong.
         (10000,  300,    0, 2, "OK"),        # large-ish but only two regions -- no real seam
         (10000, 4000, 1999, 3, "EXTRACT"),   # just BELOW the lambda boundary
         (10000, 4000, 2000, 3, "HAND"),      # exactly AT it -- `>=` puts the boundary in HAND
         (   0,    0,    0, 0, "OK"),         # empty file must not divide by zero
+    ]
+    # UNPARSED cases carry the fifth argument, so they are listed separately.
+    unparsed_cases = [
+        # (total, biggest, lambda, regions, unparsed, expected)
+        (7637,  180, 0, 246, 3909, "UNPARSED"),   # hle_kernel_mem's REAL shape: 51% behind an #if.
+                                                  # Scored SPLIT before the unparsed span was
+                                                  # counted, from the 49% the parser could see.
+        (10000, 1000, 0,  96, 1499, "SPLIT"),     # just below 15% -- ordinary scaffolding
+        (10000, 1000, 0,  96, 1500, "UNPARSED"),  # exactly at it
+        (10000, 9000, 8900, 1, 1600, "UNPARSED"), # unparsed WINS over HAND: a verdict from half a
+                                                  # file is about a different file
     ]
     bad = 0
     for total, big, lam, nreg, want in cases:
@@ -213,6 +248,12 @@ def selftest() -> int:
     if classify(10000, 4000, 1999, 3) != "EXTRACT":
         print("  [FAIL] a lambda share just BELOW the threshold must stay EXTRACT")
         bad += 1
+    for total, big, lam, nreg, unp, want in unparsed_cases:
+        got = classify(total, big, lam, nreg, unp)
+        ok = got == want
+        print(f"  [{'ok' if ok else 'FAIL'}] classify({total},{big},{lam},{nreg},unparsed={unp}) = {got}"
+              f"{'' if ok else f' (want {want})'}")
+        bad += not ok
     print("== PASS ==" if not bad else f"== FAIL: {bad} ==")
     return 1 if bad else 0
 
@@ -255,7 +296,7 @@ def main() -> int:
             rows.append(res)
 
     rows.sort(key=lambda r: -r.get("lines", 0))
-    order = {"SPLIT": 0, "EXTRACT": 1, "HAND": 2, "PARSE-FAIL": 3, "OK": 4}
+    order = {"SPLIT": 0, "EXTRACT": 1, "UNPARSED": 2, "HAND": 3, "PARSE-FAIL": 4, "OK": 5}
     print(f"{'verdict':<11}{'lines':>7}{'big':>7}{'share':>7}{'lam%':>6}  file / dominant symbol")
     print("-" * 100)
     for r in sorted(rows, key=lambda r: (order.get(r["verdict"], 9), -r.get("lines", 0))):
