@@ -4528,10 +4528,9 @@ struct SpirvCompute {
         if (synthesize_rect)
             rect_position = synthesize_fourth(positions[0], positions[1], positions[2]);
 
-        // Value emitted in strip slot `slot`, under the selected shared corner. Without rect
-        // synthesis this is the identity, so the plain interpolation-geometry path is unchanged.
         // Value emitted in strip slot `slot`. The supplied triple is ROTATED so the shared corner
-        // leads: slot k carries supplied[(shared + k) % 3], then the synthesized corner last.
+        // leads -- slot k carries supplied[(shared + k) % 3] -- then the synthesized corner last.
+        // Without rect synthesis this is the identity, so the plain path is unchanged.
         auto slot_of = [&](uint32_t slot, const std::array<uint32_t, 3>& supplied,
                            uint32_t synthesized) -> uint32_t {
             if (!synthesize_rect) return supplied[slot];

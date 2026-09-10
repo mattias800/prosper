@@ -122,6 +122,42 @@ int main() {
     // reorders the supplied triple by an odd permutation hands the stage a triangle whose winding is
     // already reversed. The stage must PRESERVE whatever facing it was given, so under back-face
     // culling exactly the odd arms survive -- see the culling pass below.
+    // Second pair: AMD's explicit-parameter form, which reconstructs the same value as
+    //   Final = P0 + P10*I + P20*J.
+    // The generated stage publishes P0/P10/P20 plus perspective-center I/J, and the (I,J) it gives
+    // each emitted vertex comes from the kI/kJ table -- including the synthesized corner, whose
+    // coordinates negate the shared axis. Nothing else here reads that table, so without this pair a
+    // wrong entry is silent: the smooth path below carries the varying directly and never consults it.
+    const uint32_t explicit_ps[] = {
+        0xc80e0000u, 0xc8120001u, 0xc8160002u,       // v3=P10, v4=P20, v5=P0, attr0.x
+        0xd54b0003u, 0x04160103u,                    // v3 = P10*I + P0
+        0xd54b0003u, 0x040e0304u,                    // v3 = P20*J + v3
+        0x7e080280u, 0x7e0a0280u, 0x7e0c02f2u,       // G=B=0, A=1
+        0xf800000fu, 0x06050403u, 0xbf810000u,
+    };
+    PixelSystemInputMapping perspective_center{1u << 1, 1u << 1};
+    const FragmentInterpolationLayout explicit_layout = fragment_interpolation_layout(
+        explicit_ps, std::size(explicit_ps), &perspective_center);
+    const std::vector<uint32_t> explicit_frag = recompile_fragment(
+        explicit_ps, std::size(explicit_ps), nullptr, &perspective_center,
+        UINT32_MAX, &explicit_layout);
+    const std::vector<uint32_t> explicit_geom =
+        recompile_interpolation_geometry(explicit_layout, /*capture_position=*/false,
+                                         /*synthesize_rect=*/true);
+    CHECK(explicit_layout.valid && explicit_layout.requires_geometry &&
+          !explicit_frag.empty() && !explicit_geom.empty(),
+          "the explicit-parameter pixel shader asks the stage for P0/P10/P20 and I/J");
+
+    struct Stage {
+        const char* name;
+        const std::vector<uint32_t>* geom;
+        const std::vector<uint32_t>* frag;
+    };
+    const Stage stages[] = {
+        {"smooth varying", &geom, &frag},
+        {"explicit P0/P10/P20 (exercises the barycentric table)", &explicit_geom, &explicit_frag},
+    };
+
     struct Arm { const char* name; std::vector<uint32_t> indices; bool odd_permutation; };
     const Arm arms[] = {
         {"shared corner at slot 0 (positive control -- the case the old rule got right)",
@@ -141,6 +177,7 @@ int main() {
         {"back-face culling on", 2u},   // VK_CULL_MODE_BACK_BIT
     };
 
+    for (const Stage& stage : stages)
     for (const Cull& cull : culls)
     for (const Arm& arm : arms) {
         ResolvedPipelineState state;
@@ -148,8 +185,8 @@ int main() {
         state.cull_mode = cull.mode;
         prosper::test::BackendDraw draw;
         draw.vs.assign(std::begin(kRectCornerVs), std::end(kRectCornerVs));
-        draw.gs = geom;
-        draw.fs = frag;
+        draw.gs = *stage.geom;
+        draw.fs = *stage.frag;
         draw.ps = &state;
         draw.vcount = 3;
         draw.indices = arm.indices;
@@ -157,7 +194,7 @@ int main() {
         draws.push_back(std::move(draw));
         const std::vector<uint8_t> px = prosper::test::render_draws_rgba(draws, W, H);
         if (px.size() != (size_t)W * H * 4) {
-            printf("  [FAIL] %s (%s): render produced no image\n", arm.name, cull.name);
+            printf("  [FAIL] %s (%s, %s): render produced no image\n", arm.name, cull.name, stage.name);
             fails++;
             continue;
         }
@@ -172,8 +209,8 @@ int main() {
             const uint8_t red = red_at(x, y);
             if (red >= 30) { ++covered; weakest = std::min(weakest, red); }
         }
-        printf("  [%s] %s: covered %u/%u, weakest covered red %u\n",
-               cull.name, arm.name, covered, sampled, weakest);
+        printf("  [%s / %s] %s: covered %u/%u, weakest covered red %u\n",
+               stage.name, cull.name, arm.name, covered, sampled, weakest);
 
         // Under back-face culling the stage must preserve the facing it was handed, so an arm renders
         // in full exactly when its own index permutation reversed the winding -- all of it or none of
@@ -185,12 +222,12 @@ int main() {
         if (!expect_drawn) {
             CHECK(covered == 0,
                   (std::string("facing is preserved, so this arm is culled entirely -- ") +
-                   arm.name + ", " + cull.name).c_str());
+                   arm.name + ", " + cull.name + ", " + stage.name).c_str());
             continue;
         }
         CHECK(covered == sampled,
               (std::string("the synthesized corner completes the rectangle -- full coverage, ") +
-               arm.name + ", " + cull.name).c_str());
+               arm.name + ", " + cull.name + ", " + stage.name).c_str());
 
         for (const Corner& corner : corners) {
             const double got = red_at(corner.x, corner.y) / 255.0;
@@ -199,7 +236,7 @@ int main() {
                 printf("    %s corner: varying %.3f, expected %.3f\n",
                        corner.name, got, corner.expect);
             CHECK(ok, (std::string("varying is carried to the ") + corner.name + " corner, " +
-                       arm.name + ", " + cull.name).c_str());
+                       arm.name + ", " + cull.name + ", " + stage.name).c_str());
         }
     }
 
