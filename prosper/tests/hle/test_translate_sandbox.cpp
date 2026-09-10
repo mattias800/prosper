@@ -59,6 +59,31 @@ int main() {
           "sibling prefix '/app0evil' is not mapped into /app0");
     CHECK(resolve_guest_path("/temp00/file") == "/temp00/file",
           "sibling prefix '/temp00' is not mapped into /temp0");
+    // /download0 is a mount like the others (#3496), so it needs the same component-boundary guard.
+    // Its name is also exactly as long as "/savedata0", and both slice with vlen = 10 -- so the
+    // if/else arm order in resolve_guest_path is load-bearing, not cosmetic.
+    CHECK(resolve_guest_path("/download00/file") == "/download00/file",
+          "sibling prefix '/download00' is not mapped into /download0");
+    {
+        const std::string download0 = resolve_guest_path("/download0/patch.pkg");
+        CHECK(download0 != "/download0/patch.pkg",
+              "/download0 is MAPPED to a host directory, not passed through as a literal host path");
+        CHECK(download0.find("/download0/patch.pkg") == std::string::npos ||
+                  download0.rfind("/download0/patch.pkg", 0) != 0,
+              "/download0 does not resolve to the real host root");
+        CHECK(download0.size() > std::string("/patch.pkg").size() &&
+                  download0.compare(download0.size() - 10, 10, "/patch.pkg") == 0,
+              "the subpath under /download0 survives translation");
+        CHECK(resolve_guest_path("/download0/../etc/passwd").rfind("/prosper-denied", 0) == 0,
+              "/download0 traversal out of its mount is denied like every other mount");
+        // A traversal that RE-ENTERS a mount is allowed and mapped, unlike one that leaves the
+        // sandbox. This is what the `reenters_mount` clause is for, and the deny case above cannot
+        // cover it: "/download0/../etc/passwd" normalises to "/etc/passwd" and is refused whether or
+        // not /download0 is listed there. Only a path normalising back INTO /download0 tells them
+        // apart -- without this, deleting /download0 from that clause reddens nothing.
+        CHECK(resolve_guest_path("/app0/../download0/patch.pkg") == download0,
+              "a traversal re-entering /download0 is mapped, not denied");
+    }
     fs::create_directories(root / "saves");
     CHECK(savedata0_mount("slot", SaveDataMountPolicy::OpenOrCreate) == SaveDataMountOutcome::Created,
           "test save directory mounts");

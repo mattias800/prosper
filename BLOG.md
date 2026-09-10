@@ -21,6 +21,19 @@ from the tracker issues, and still gated, because it is a projection of state ra
 
 ## 2026-09-10
 
+### BlazBlue Entropy Effect X was stuck on its publisher logos because one mount point did not exist
+
+The PS5 gives every game four places to read and write: `/app0`, `/temp0`, `/savedata0` and
+`/download0`. prosper mapped the first three and quietly let the fourth through unmapped, so a guest
+opening it got a host path that does not exist and every access failed. This title opens it ten times
+while starting up; *The Messenger*, which reaches gameplay, never opens it at all — which is what
+made the difference findable. It is served empty, which is the honest answer: no downloaded content
+is present, and that is true of every local dump.
+
+![BlazBlue Entropy Effect X title screen at 1920x1080, the game logo inside its cyan ring with CONTINUE and SETTINGS](assets/screenshots/blazblue-entropy-effect-x-title.webp)
+
+[#3496](https://github.com/mattias800/prosper/issues/3496).
+
 ### Darksiders II's intro movie was being cut in half down the diagonal
 
 The PS5 draws a full-screen rectangle by handing the GPU only **three** of its corners and letting

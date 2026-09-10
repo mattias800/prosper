@@ -546,6 +546,35 @@ namespace {
         }
         return root;
     }
+    // Host directory backing guest "/download0" — the download-data mount. Real hardware always has
+    // it; prosper mapped /app0, /temp0 and /savedata0 and passed this one through UNMAPPED, so a
+    // guest open resolved to a literal host "/download0" that does not exist and every access failed.
+    //
+    // BlazBlue Entropy Effect X (PPSA29714) opens it 10 times during startup and holds on its
+    // publisher logos; The Messenger, which reaches gameplay, opens it 0 times — the difference that
+    // located this (#3496).
+    //
+    // Served EMPTY, and that is the honest answer rather than a placeholder: an empty download-data
+    // area means "no downloaded content is present", which is true of every local dump. It provides
+    // the mount point, never content. Add-content ownership questions are answered from local
+    // inventory in hle_addcontent.cpp and are not affected by this.
+    // Override with PROSPER_DOWNLOAD0.
+    std::string download0_root() {
+        // Magic-static, like virtual_root_dir() above and unlike temp0_root()'s older lazy `if
+        // (root.empty())` -- titles do file I/O from several threads, and two of them racing that
+        // check both assign the string. A new mount does not need to inherit the older race.
+        static const std::string root = [] {
+            const char* e = getenv("PROSPER_DOWNLOAD0");
+            std::string d = e ? e : "/tmp/prosper-download0";
+#ifdef _WIN32
+            _mkdir(d.c_str());
+#else
+            ::mkdir(d.c_str(), 0777);
+#endif
+            return d;
+        }();
+        return root;
+    }
     // #1234: the jailed title's virtual ROOT ("/app0/..") as a real, readable host directory.
     // Real hardware jails the title with its mounts as the only root entries; a title that
     // opendir/stats its root (ArcRunner does during boot) must succeed. Lazily created under
@@ -565,11 +594,13 @@ namespace {
             _mkdir((d + "/app0").c_str());
             _mkdir((d + "/temp0").c_str());
             _mkdir((d + "/savedata0").c_str());
+            _mkdir((d + "/download0").c_str());
 #else
             ::mkdir(d.c_str(), 0777);
             ::mkdir((d + "/app0").c_str(), 0777);
             ::mkdir((d + "/temp0").c_str(), 0777);
             ::mkdir((d + "/savedata0").c_str(), 0777);
+            ::mkdir((d + "/download0").c_str(), 0777);
 #endif
             return d;
         }();
@@ -718,7 +749,8 @@ namespace {
             const std::string normalized = "/" + clamp_normalize_relative(p);
             const bool reenters_mount = mount_path_matches(normalized, "/app0") ||
                                         mount_path_matches(normalized, "/temp0") ||
-                                        mount_path_matches(normalized, "/savedata0");
+                                        mount_path_matches(normalized, "/savedata0") ||
+                                        mount_path_matches(normalized, "/download0");
             if (normalized == "/") {
                 const std::string vroot = virtual_root_dir();
                 if (filelog())
@@ -752,6 +784,7 @@ namespace {
         std::string root; size_t vlen = 0;
         if      (mount_path_matches(p, "/app0"))  { root = g_app0;       vlen = 5;  }
         else if (mount_path_matches(p, "/temp0")) { root = temp0_root(); vlen = 6;  }
+        else if (mount_path_matches(p, "/download0")) { root = download0_root(); vlen = 10; }
         else if (!save0.empty())            { root = save0;        vlen = 10; }
         else {
             if (filelog()) fprintf(stderr, "[file] open '%s' -> '%s'\n", guest, p.c_str());

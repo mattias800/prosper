@@ -2854,7 +2854,12 @@ namespace {
     // the flag, wakes everyone, and defers destroy+free to the last waiter leaving (or frees now if
     // none are parked). Freeing under a live pthread_cond_wait is a UAF — destroying a condvar with
     // waiters is explicitly UB.
-    struct EventFlag { pthread_mutex_t m; pthread_cond_t c; uint64_t bits; bool deleted; int waiters; };
+    // `cancel_gen` is bumped by sceKernelCancelEventFlag. A waiter captures it on entry and leaves
+    // when it changes, so a cancel releases exactly the threads parked at the time -- distinct from
+    // `deleted`, which also destroys the object. A generation rather than a flag, so a thread that
+    // parks AFTER a cancel is not spuriously released by it.
+    struct EventFlag { pthread_mutex_t m; pthread_cond_t c; uint64_t bits; bool deleted; int waiters;
+                       uint64_t cancel_gen; };
     bool evf_match(uint64_t bits, uint64_t pat, uint32_t mode) {
         return (mode & 0x1) ? ((bits & pat) == pat) : ((bits & pat) != 0);  // AND vs OR
     }
@@ -2918,6 +2923,72 @@ HLE(k_ef_delete)  {
 }
 HLE(k_ef_set)     { auto* e = (EventFlag*)(uintptr_t)a0; if (!e) return 0; if (sclog()) fprintf(stderr, "[sync2] T%" PRIu64 " EF.set       ef=0x%llx bits|=0x%llx\n", sctid(), (unsigned long long)a0, (unsigned long long)a1); interruptible_mutex_lock(&e->m); e->bits |= a1; interruptible_cond_broadcast(&e->c); pthread_mutex_unlock(&e->m); return 0; }
 HLE(k_ef_clear)   { auto* e = (EventFlag*)(uintptr_t)a0; if (!e) return 0; interruptible_mutex_lock(&e->m); e->bits &= a1; pthread_mutex_unlock(&e->m); return 0; }
+
+// sceKernelCancelEventFlag(ef, setPattern, int* numWaitThreads) -- the last member of the event-flag
+// family prosper did not register. Unregistered it answered the dispatcher's 0 == SCE_OK while doing
+// nothing at all: no waiter released, the bits left stale, and `numWaitThreads` never written, so the
+// guest read its own uninitialised stack as the count of threads it had just cancelled.
+//
+// Found by differential rather than by guessing: normalising a full boot log of BlazBlue Entropy
+// Effect X (PPSA29714, holds on its publisher logos) against The Messenger (PPSA24651, a Unity title
+// that reaches gameplay) leaves exactly ONE prosper-level line that differs -- this NID.
+//
+// ABI captured live (PPSA29714): a0 is the EventFlag, a1 the set pattern (0 observed), a2 a stack
+// out-pointer; a3-a5 are scratch and are not read.
+//
+// Note what the earlier census did NOT establish. It measured `waiters` at each call and found 0 of
+// 3000, which rules out "releasing parked threads is what matters here" -- and says nothing about the
+// out-parameter or the bits, which are the other two things this call does. Testing beside the gap
+// rather than on it is the recurring failure this file's own comments describe.
+//
+// CONFIDENCE: HIGH on the argument layout (live-captured) and on the three effects being the whole
+// contract.
+HLE(k_ef_cancel)  {
+    auto* e = (EventFlag*)(uintptr_t)a0;
+    // A null handle returns 0, matching every other member of this family -- k_ef_delete/set/clear/
+    // wait/poll and all four semaphore entry points do the same. An earlier revision returned EINVAL
+    // here and said it was "inherited from the siblings above"; it was inherited from nothing, and it
+    // made this the ONE call in the family that reports failure. There is no local evidence for any
+    // answer (no title passes a null handle), and a secondary implementation offers a third one
+    // (ESRCH), so the tiebreak is consistency: if this convention is wrong it should be corrected for
+    // the whole family, with evidence, rather than diverged from in one place.
+    if (!e) {
+        // Still define the out-parameter. Returning SCE_OK while leaving it untouched is exactly the
+        // false-success-with-unwritten-out-param shape this registration exists to remove, reached by
+        // another door: nothing was cancelled, so the honest count is 0.
+        if (a2 && gpu::guest_writable(a2, sizeof(int32_t))) *(int32_t*)(uintptr_t)a2 = 0;
+        return 0;
+    }
+    interruptible_mutex_lock(&e->m);
+    const int parked = e->waiters;
+    e->bits = a1;                   // the flag is SET to the pattern, not OR'd into it
+    ++e->cancel_gen;                // release the threads parked right now, and only those
+    interruptible_cond_broadcast(&e->c);
+    pthread_mutex_unlock(&e->m);
+    // The out-parameter the stub never wrote. A guest that branches on "how many did I just
+    // cancel?" was reading stack residue. Validated before storing, like sceKernelCreateEventFlag's
+    // out-pointer (#1963): the pointer comes from the guest, and an unwritable one is a guest-side
+    // null/uninitialised object, not a reason to fault prosper. Unlike the create path this does not
+    // fail the call -- the cancel has already happened and reporting failure would be a second lie.
+    if (a2 && gpu::guest_writable(a2, sizeof(int32_t))) {
+        *(int32_t*)(uintptr_t)a2 = parked;
+    } else if (a2) {
+        // Loud, rate-limited, like sceKernelCreateEventFlag's refusal (#1963). Skipping the store
+        // silently would leave the guest holding SCE_OK over an unwritten slot -- this call's original
+        // defect, through a second door -- so the one case prosper cannot answer says so.
+        static std::atomic<uint32_t> refused{0};
+        const uint32_t n = refused.fetch_add(1, std::memory_order_relaxed);
+        if (n < 8)
+            fprintf(stderr,
+                    "[libkernel] sceKernelCancelEventFlag: REFUSED unwritable numWaitThreads pointer "
+                    "0x%llx; the cancel took effect and returns SCE_OK, but the guest's count is "
+                    "UNWRITTEN (#3496; %u so far%s)\n",
+                    (unsigned long long)a2, n + 1, n == 7 ? ", further reports suppressed" : "");
+    }
+    if (sclog()) fprintf(stderr, "[sync2] T%" PRIu64 " EF.cancel    ef=0x%llx bits=0x%llx parked=%d\n",
+                         sctid(), (unsigned long long)a0, (unsigned long long)a1, parked);
+    return 0;
+}
 // A guest RELATIVE microsecond timeout as an absolute CLOCK_REALTIME deadline, for the host
 // primitives that take one (pthread_mutex_timedlock, pthread_rwlock_timed*, sem_timedwait).
 //
@@ -3418,12 +3489,14 @@ HLE(k_ef_wait)    { // (ef, pattern, waitMode, resultPat*, SceKernelUseconds* ti
                          (unsigned long long)e->bits);
     interruptible_mutex_lock(&e->m);
     e->waiters++;
+    const uint64_t entry_cancel_gen = e->cancel_gen;
     if (a4) {
         uint32_t usec = *(uint32_t*)(uintptr_t)a4;
         timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0);
         timespec dl = abs_deadline_us(usec);
         int rc = 0;
-        while (!evf_match(e->bits, a1, (uint32_t)a2) && rc != ETIMEDOUT && !e->deleted)
+        while (!evf_match(e->bits, a1, (uint32_t)a2) && rc != ETIMEDOUT && !e->deleted &&
+               e->cancel_gen == entry_cancel_gen)
             rc = interruptible_cond_timedwait(&e->c, &e->m, &dl,
                                               GuestWaitKind::EventFlag, (uintptr_t)e);
         timespec t1; clock_gettime(CLOCK_MONOTONIC, &t1);
@@ -3433,11 +3506,43 @@ HLE(k_ef_wait)    { // (ef, pattern, waitMode, resultPat*, SceKernelUseconds* ti
         *(uint32_t*)(uintptr_t)a4 = spent >= usec ? 0u : (uint32_t)(usec - spent);
         if (!e->deleted && !evf_match(e->bits, a1, (uint32_t)a2)) ret = 0x8002003Cull;  // ETIMEDOUT
     } else {
-        while (!evf_match(e->bits, a1, (uint32_t)a2) && !e->deleted)
+        while (!evf_match(e->bits, a1, (uint32_t)a2) && !e->deleted &&
+               e->cancel_gen == entry_cancel_gen)
             interruptible_cond_wait(&e->c, &e->m, GuestWaitKind::EventFlag, (uintptr_t)e);
     }
     bool deleted = e->deleted;                     // deleted under us -> EACCES (Kyty EventFlag.cpp)
+    // Cancelled under us. Reporting 0 here would be the same class of lie the unregistered NID told:
+    // the guest would read `res` as a pattern that MATCHED when nothing matched, and the CLEAR_ALL /
+    // CLEAR_PAT step below would then clear the very bits the cancel had just set for other threads.
+    // Setting `ret` suppresses that step, and it overrides the timed arm's ETIMEDOUT, which is set
+    // from "no match" and cannot tell a cancel from an expiry.
+    //
+    // CONFIDENCE: HIGH on the value, MED on this path as a whole, and the split matters because the
+    // two rest on different evidence.
+    //
+    // The VALUE is derived twice by independent routes, so it is not a guess: prosper's own table
+    // gives 0x80020000 | FreeBsd ECanceled(85) = 0x80020055 (sce_errno.hpp:112), and a secondary
+    // implementation independently reports the same constant for a cancelled event-flag wait (Kyty
+    // eventFlag.cpp / errno.h -- the same source this file's ETIMEDOUT and EACCES notes already cite).
+    //
+    // The PATH is not measured. The census that found the defect saw 0 parked waiters across 3000
+    // calls, so no local title reaches this line at all; what IS measured is that returning 0 is
+    // wrong, since the guest would then read a pattern that never matched. Two further details --
+    // that a cancelled waiter still receives the result pattern, and that it performs no CLEAR -- have
+    // no local evidence either way and follow the secondary implementation alone. That is a
+    // cross-check, not an authority: it is a work in progress like this one, so treat those two as the
+    // weakest claims here and re-derive them against a title that actually parks a waiter.
+    // Assign-vs-OR for the set-pattern is in the same class, and an earlier revision of this comment
+    // claimed the title's progress supported assigning. It does not: #3496 records "measured after:
+    // unchanged" for this whole call, and the title is unblocked by the /download0 mount instead. With
+    // every observed setPattern == 0 and no waiter ever parked, the two are indistinguishable here.
+    // Assigning is a contract claim, not a measured one.
+    //
+    // prosper reaches all of this differently in any case -- a generation counter, so nothing
+    // busy-waits and a thread that parks after the cancel is not released by it.
+    const bool cancelled = e->cancel_gen != entry_cancel_gen;
     if (deleted) ret = 0x8002000Dull;
+    else if (cancelled) ret = 0x80020055ull;       // SCE_KERNEL_ERROR_ECANCELED
     uint64_t res = e->bits;
     if (!ret) { if (a2 & 0x10) e->bits = 0; else if (a2 & 0x20) e->bits &= ~a1; }  // CLEAR_ALL / CLEAR_PAT
     bool last = (--e->waiters == 0) && deleted;    // last waiter out of a deleted flag frees it
@@ -5244,6 +5349,7 @@ void register_kernel_hle() {
     R("sceKernelCreateEventFlag", k_ef_create); R("sceKernelDeleteEventFlag", k_ef_delete);
     R("sceKernelSetEventFlag", k_ef_set);       R("sceKernelClearEventFlag", k_ef_clear);
     R("sceKernelWaitEventFlag", k_ef_wait);     R("sceKernelPollEventFlag", k_ef_poll);
+    R("sceKernelCancelEventFlag", k_ef_cancel);
     R("sceKernelCreateSema", k_sema_create);    R("sceKernelDeleteSema", k_sema_delete);
     R("sceKernelWaitSema", k_sema_wait);        R("sceKernelSignalSema", k_sema_signal);
     R("sceKernelPollSema", k_sema_poll);
