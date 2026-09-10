@@ -170,6 +170,10 @@ def region_is_external(region: dict, in_anon_namespace: bool = False) -> bool:
 def unresolved_across_parts(map_data: dict, plan: dict[str, list[int]]) -> dict[int, set[str]]:
     """Regions each output part references that live in ANOTHER part and cannot be seen from it.
 
+    Two ways a definition is unreachable, and only the first is about linkage: it has INTERNAL
+    linkage, so another translation unit cannot name it at all; or it has external linkage and NO
+    HEADER DECLARES IT, so the call links but does not compile.
+
     This is the check that was missing, and its absence is not theoretical: splitting
     gpu_capture.cpp's serialize/deserialize into their own file passed every existing check --
     tiling, partition, byte-for-byte reconstruction -- and then failed to compile with 25 distinct
@@ -203,8 +207,28 @@ def unresolved_across_parts(map_data: dict, plan: dict[str, list[int]]) -> dict[
             if dest not in owner:
                 continue
             r = regions.get(dest, {})
-            if r.get("role") != "body" or region_is_external(r, anon.get(dest, False)):
-                continue                      # visible across translation units; nothing to do
+            if r.get("role") != "body":
+                continue
+            # A DECLARATION has to be in scope, which external linkage does not provide. A function
+            # defined in this .cpp inside a named namespace and never declared in a header has
+            # external linkage -- the symbol links -- and still fails to compile from a second .cpp,
+            # because nothing declares it there. Splitting rdna2_to_spirv.cpp per shader stage
+            # passed the linkage-only version of this check and then failed on `safe_execz_branches`
+            # in three of five outputs; its sibling `safe_execz_branches_for_test` is declared in
+            # the header and it is not, with no difference in linkage between them.
+            #
+            # `declared_in_header` is the right question and the map now carries it. Linkage is
+            # still consulted for maps that predate the field, where it is the best available
+            # approximation -- and an over-refusal there is the safe direction.
+            # ORDER MATTERS. Internal linkage is decisive on its own: a `static` or
+            # anonymous-namespace definition cannot be used from another translation unit however
+            # it is declared, because a declaration elsewhere names a DIFFERENT entity. Only once
+            # linkage is external does the declaration question arise.
+            if not region_is_external(r, anon.get(dest, False)):
+                pass                          # internal: unreachable from another part, always
+            elif r.get("declared_in_header", True):
+                continue                      # external AND declared: either part can call it
+            # else: external but nothing declares it -- links, does not compile. Caught.
             if src in owner:
                 if owner[dest] == owner[src]:
                     continue
@@ -435,6 +459,23 @@ def selftest() -> int:
     check(not unresolved_across_parts(ext_map, {"a.cpp": [1], "b.cpp": [2]}),
           "an EXTERNAL definition called across the cut is not flagged")
 
+    # DECLARED IN A HEADER beats linkage, because they answer different questions: linkage says
+    # the symbol resolves at link time, a declaration says the call compiles at all. A definition
+    # with EXTERNAL linkage and no header declaration must still be promoted.
+    decl = {**xref_map, "regions": [dict(r) for r in xref_map["regions"]]}
+    decl["regions"][1]["usr"] = "c:@F@alpha#"                 # external linkage...
+    decl["regions"][1]["declared_in_header"] = False          # ...but nothing declares it
+    check(set(unresolved_across_parts(decl, {"a.cpp": [1], "b.cpp": [2]})) == {1},
+          "an EXTERNAL definition that no header declares is still caught")
+    decl["regions"][1]["declared_in_header"] = True
+    check(not unresolved_across_parts(decl, {"a.cpp": [1], "b.cpp": [2]}),
+          "...and is not caught once a header declares it")
+    # An INTERNAL definition is unreachable from another part however it is declared.
+    decl["regions"][1]["usr"] = "c:s.cpp@F@alpha#"
+    decl["regions"][1]["declared_in_header"] = True
+    check(set(unresolved_across_parts(decl, {"a.cpp": [1], "b.cpp": [2]})) == {1},
+          "an INTERNAL-linkage definition is caught even if something declares it")
+
     # NO USR: the fallback is the scope walk, not a constant. An `extern "C"` definition records
     # no USR and is EXTERNAL, so a bare `return False` refused it as internal -- the inverted
     # default this replaced.
@@ -536,8 +577,8 @@ def main() -> int:
     stranded = unresolved_across_parts(map_data, plan)
     if stranded:
         regions = {r["index"]: r for r in map_data["regions"]}
-        print(f"  [FAIL] {len(stranded)} definition(s) with internal linkage are referenced from a "
-              f"part they are not in:")
+        print(f"  [FAIL] {len(stranded)} definition(s) cannot be reached from a part that "
+              f"references them:")
         for i in sorted(stranded)[:10]:
             users = ", ".join(sorted(stranded[i]))
             print(f"           {regions[i].get('name', '?')}  (in "
@@ -552,7 +593,8 @@ def main() -> int:
         print("         then re-run map_symbols (the promotion changes every region index) and "
               "re-plan.")
         return 1
-    print(f"  [ok]   no internal-linkage definition is referenced from a part it is not in")
+    print("  [ok]   every cross-part reference resolves: internal-linkage definitions stay with "
+          "their callers, and external ones are declared in a header")
 
     if args.dry_run:
         for out, text in sorted(outputs.items()):
