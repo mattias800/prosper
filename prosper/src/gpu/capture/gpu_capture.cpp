@@ -47,50 +47,16 @@
 #endif
 #include "gpu/capture/gpu_capture_internal.hpp"
 #include "gpu/capture/gpu_capture_internal.hpp"
+#include "gpu/capture/gpu_capture_internal.hpp"
+#include "gpu/capture/gpu_capture_internal.hpp"
 
 namespace prosper::gpu {
 namespace {
 
-constexpr uint64_t kDefaultResourceCaptureBytes = 512ull << 20;
 CaptureRttSeedSnapshotReader g_rtt_seed_snapshot_reader;
 ReplayRttSeedWriter g_rtt_seed_writer;
 CaptureDsSeedSnapshotReader g_ds_seed_snapshot_reader;
 ReplayDsSeedWriter g_ds_seed_writer;
-
-struct Interval {
-    uint64_t begin = 0;
-    uint64_t end = 0;
-    uint32_t blob_index = 0xFFFFFFFFu;
-};
-
-bool capture_authority_requires_backing(const ShaderResourceTable* table,
-                                        const ShaderResource& resource) {
-    if (is_capture_authority_resource(resource)) return true;
-    if (!table || !resource.gpu_addr) return false;
-    const uint64_t footprint = resource_footprint(resource);
-    return footprint && std::any_of(
-        table->resources.begin(), table->resources.end(),
-        [&](const ShaderResource& candidate) {
-            return is_capture_authority_resource(candidate) &&
-                   candidate.gpu_addr == resource.gpu_addr &&
-                   resource_footprint(candidate) == footprint;
-        });
-}
-
-bool capture_reflected_bindings(const std::vector<uint32_t>& spirv,
-                                const ShaderResourceTable* table,
-                                uint32_t expected_set,
-                                SpirvShaderStage expected_stage,
-                                std::set<uint32_t>& bindings) {
-    bindings.clear();
-    if (spirv.empty()) return false;
-    const DescriptorValidationReport reflected = validate_spirv_descriptor_interface(
-        spirv, table, expected_set, expected_stage, false);
-    if (!spirv_descriptor_reflection_complete(reflected)) return false;
-    for (const SpirvDescriptorBinding& descriptor : reflected.descriptors)
-        bindings.insert(descriptor.binding);
-    return true;
-}
 
 // `own_mip_chain_allocations` extends a materializable mip chain's range to the WHOLE guest
 // allocation (#3202). A tiled chain stores level zero last, so the other levels sit BELOW the
@@ -258,18 +224,6 @@ bool collect_intervals(const std::vector<DrawItem>& draws,
     intervals = std::move(merged); return true;
 }
 
-bool assign_blob_range(const std::vector<Interval>& intervals, uint64_t addr, uint64_t bytes,
-                       uint32_t& index, uint64_t& offset, const char* missing,
-                       std::string& error) {
-    auto it = std::find_if(intervals.begin(), intervals.end(), [&](auto x) {
-        return x.begin <= addr && addr <= x.end && bytes <= x.end - addr;
-    });
-    if (it == intervals.end()) { error = missing; return false; }
-    index = it->blob_index;
-    offset = addr - it->begin;
-    return true;
-}
-
 bool capture_table(const ShaderResourceTable* src, const std::vector<Interval>& intervals,
                    bool include_resource_data, bool allow_packed_pointer,
                    GpuCapturedTable& dst, std::string& error,
@@ -367,33 +321,6 @@ bool capture_table(const ShaderResourceTable* src, const std::vector<Interval>& 
 }
 
 const char* env_or_empty(const char* name) { const char* v = std::getenv(name); return v ? v : ""; }
-
-bool env_enabled(const char* name) {
-    const char* value = std::getenv(name);
-    return value && *value && std::strcmp(value, "0") && std::strcmp(value, "off");
-}
-
-bool capture_resource_limit(uint64_t& bytes, std::string& error, uint64_t override_bytes = 0) {
-    if (override_bytes) {
-        if (override_bytes > kMaxTotalBlobBytes) {
-            error = "capture resource limit exceeds 3 GiB";
-            return false;
-        }
-        bytes = override_bytes;
-        return true;
-    }
-    bytes = kDefaultResourceCaptureBytes;
-    const char* value = std::getenv("PROSPER_GPU_CAPTURE_MAX_MB");
-    if (!value || !*value) return true;
-    char* end = nullptr;
-    const uint64_t mib = std::strtoull(value, &end, 0);
-    if (!end || *end || mib < 1 || mib > (kMaxTotalBlobBytes >> 20)) {
-        error = "PROSPER_GPU_CAPTURE_MAX_MB must be between 1 and 3072";
-        return false;
-    }
-    bytes = mib << 20;
-    return true;
-}
 
 using OperationIdentity = std::tuple<uint8_t, uint64_t, uint64_t>;
 
