@@ -133,15 +133,38 @@ def check_structure(regions: list[dict], total_lines: int) -> list[str]:
     return problems
 
 
-def region_is_external(region: dict) -> bool:
-    """External linkage, from the USR clang recorded.
+def anon_map(regions: list[dict]) -> dict[int, bool]:
+    """Which regions sit inside an anonymous namespace, from the open/close markers in the map."""
+    stack: list[str] = []
+    out: dict[int, bool] = {}
+    for r in regions:
+        if r.get("role") == "open":
+            stack.append(r["name"])
+        out[r["index"]] = "<anonymous>" in stack
+        if r.get("role") == "close" and stack:
+            stack.pop()
+    return out
+
+
+def region_is_external(region: dict, in_anon_namespace: bool = False) -> bool:
+    """External linkage, from the USR clang recorded, falling back to the scope walk.
 
     Same rule as promote_internal's: an external entity's USR starts `c:@`, an internal one is
     file-prefixed. A `static` free function is internal WITHOUT being in an anonymous namespace, so
-    a scope walk alone gets it wrong.
+    the scope walk alone gets it wrong -- which is why the USR is preferred.
+
+    THE FALLBACK MATTERS AND THE FIRST VERSION HAD IT INVERTED. With no USR this returned False,
+    i.e. "internal", and the regions that actually lack one are `LINKAGE_SPEC` -- `extern "C"`, the
+    least internal thing in the language -- plus `INCLUSION_DIRECTIVE`. Measured: 0 of 155 body
+    regions in gpu_capture.cpp, but 7 of 333 in hle_kernel.cpp, four of them LINKAGE_SPEC. The one
+    reachable case happened to be a declaration, so the answer was right for the wrong reason, while
+    `extern "C" __attribute__((weak))` DEFINITIONS in the same file would have been refused
+    falsely. The scope walk is the honest fallback and the map already carries what it needs.
     """
     usr = region.get("usr") or ""
-    return usr.startswith("c:@") if usr else False
+    if usr:
+        return usr.startswith("c:@")
+    return not in_anon_namespace
 
 
 def unresolved_across_parts(map_data: dict, plan: dict[str, list[int]]) -> dict[int, set[str]]:
@@ -159,19 +182,35 @@ def unresolved_across_parts(map_data: dict, plan: dict[str, list[int]]) -> dict[
     internal-linkage helper from its callers does not fail at review, it fails at link".
     """
     regions = {r["index"]: r for r in map_data["regions"]}
+    anon = anon_map(map_data["regions"])
     edges = {int(a): {int(b) for b in d} for a, d in map_data.get("edges", {}).items()}
     owner = {i: out for out, idxs in plan.items() for i in idxs}
+    # A REPLICATED region is copied into every output, so a reference FROM one is satisfied
+    # everywhere -- but a reference from it TO an internal definition in one part only is not.
+    # Dropping these edges wholesale (they have no owner) discarded 18 of them on one real map.
+    replicated = [r["index"] for r in map_data["regions"]
+                  if r.get("role") in ("preamble", "open", "close")]
     missing: dict[int, set[str]] = {}
     for src, dests in edges.items():
-        if src not in owner:
-            continue
         for dest in dests:
-            if dest not in owner or owner[dest] == owner[src]:
+            if dest not in owner:
                 continue
             r = regions.get(dest, {})
-            if r.get("role") != "body" or region_is_external(r):
+            if r.get("role") != "body" or region_is_external(r, anon.get(dest, False)):
                 continue                      # visible across translation units; nothing to do
-            missing.setdefault(dest, set()).add(owner[src])
+            if src in owner:
+                if owner[dest] == owner[src]:
+                    continue
+                users = {owner[src]}
+            elif src in replicated:
+                # Copied into EVERY output, so it needs the definition in every output that is not
+                # the one holding it.
+                users = {o for o in plan if o != owner[dest]}
+                if not users:
+                    continue
+            else:
+                continue
+            missing.setdefault(dest, set()).update(users)
     return missing
 
 
@@ -369,9 +408,6 @@ def selftest() -> int:
     check(verify_reconstruction(SAMPLE_MAP, {"a.cpp": [1], "b.cpp": [2]}, tampered, SAMPLE),
           "reconstruction check FAILS when an output is altered")
 
-    if bad:
-        print("  the splitter's own guarantees are broken; it must not be run")
-        return 1
     # REFERENCES ACROSS THE CUT. Byte accounting cannot see this: the split below is a perfect
     # partition with perfect reconstruction, and does not compile. `beta` calls `alpha`, `alpha` has
     # internal linkage (a file-prefixed USR), and the plan puts them in different files.
@@ -392,7 +428,36 @@ def selftest() -> int:
     check(not unresolved_across_parts(ext_map, {"a.cpp": [1], "b.cpp": [2]}),
           "an EXTERNAL definition called across the cut is not flagged")
 
-    print("  [ok]   splitter self-test: replication, partition, tiling, #if, reconstruction")
+    # NO USR: the fallback is the scope walk, not a constant. An `extern "C"` definition records
+    # no USR and is EXTERNAL, so a bare `return False` refused it as internal -- the inverted
+    # default this replaced.
+    nousr = {**xref_map, "regions": [dict(r) for r in xref_map["regions"]]}
+    nousr["regions"][1]["usr"] = ""
+    check(not unresolved_across_parts(nousr, {"a.cpp": [1], "b.cpp": [2]}),
+          "a definition with no USR outside an anonymous namespace is treated as EXTERNAL")
+    anon_case = {**nousr, "regions": [dict(r) for r in nousr["regions"]]}
+    anon_case["regions"][0]["name"] = "<anonymous>"           # the open marker now names it
+    check(set(unresolved_across_parts(anon_case, {"a.cpp": [1], "b.cpp": [2]})) == {1},
+          "...and as INTERNAL when the scope walk says it is in an anonymous namespace")
+
+    # A REPLICATED region is copied into every output, so its references have to resolve in every
+    # output. Dropping those edges for want of an owner discarded 18 on a real map.
+    rep = {**xref_map, "regions": [dict(r) for r in xref_map["regions"]],
+           "edges": {"0": {"1": 1}}}                          # region 0 is the namespace `open`
+    check(set(unresolved_across_parts(rep, {"a.cpp": [1], "b.cpp": [2]})) == {1},
+          "a replicated region's reference to an internal definition is caught in the other part")
+
+    # THE GATE IS LAST, and it has to be: it used to sit in the middle of this function, so every
+    # arm added after it printed [FAIL] and returned 0 anyway. Three mutations that disabled the
+    # cross-reference check each printed a failure line and exited clean, and `main()`'s own
+    # `if selftest(): return 1` guard was defeated with it -- the tool would have run on a
+    # selftest it had already failed. Checking a mutation by reading the printed line rather than
+    # the exit status is what hid it; the two disagreed.
+    if bad:
+        print("  the splitter's own guarantees are broken; it must not be run")
+        return 1
+    print("  [ok]   splitter self-test: replication, partition, tiling, #if, reconstruction, "
+          "cross-part references")
     return 0
 
 
@@ -441,6 +506,18 @@ def main() -> int:
     # was lost, never that a line can still be USED where it ended up. Splitting gpu_capture.cpp's
     # serialize/deserialize into their own file passed all of them and then failed to compile with
     # 25 undeclared names, because internal-linkage definitions stayed in the other part.
+    # A map built on a partial AST describes a different file. The cross-reference check below is
+    # only as complete as the edges it reads, so a degraded parse would let it print [ok] having
+    # examined half of them -- the reassuring-silence failure this whole check exists to end.
+    if map_data.get("parse_errors"):
+        print(f"  [FAIL] the map records {map_data['parse_errors']} parse error(s); its region and "
+              f"reference data describe an incomplete AST.")
+        print("         Fix the parse and re-run map_symbols before splitting on it.")
+        return 1
+    if "parse_errors" not in map_data:
+        print("  [warn] this map predates parse-error recording; re-run map_symbols to have the "
+              "cross-reference check gated on a clean parse")
+
     stranded = unresolved_across_parts(map_data, plan)
     if stranded:
         regions = {r["index"]: r for r in map_data["regions"]}

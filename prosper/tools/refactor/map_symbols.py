@@ -563,9 +563,14 @@ def main() -> int:
         # fail if the file GREW -- an assertion that cannot fail on an edit is not a check.
         import hashlib
         digest = hashlib.sha256(target.read_bytes()).hexdigest()
+        # RECORD THE PARSE ERRORS IN THE MAP. The warning above goes to a terminal nobody keeps,
+        # and the map outlives it -- so a consumer reading this file has no way to tell a complete
+        # map from one built on a partial AST, and prints its own reassuring [ok] either way. A
+        # libclang parse driven from a g++ database fails softly, so this is not a rare case.
         args.json.write_text(json.dumps({"file": str(target.relative_to(root)),
                                          "sha256": digest,
                                          "total_lines": total_lines,
+                                         "parse_errors": len(fatal),
                                          "regions": regions,
                                          "edges": {str(k): v for k, v in edges.items()}}, indent=1))
         print(f"  wrote {args.json}")

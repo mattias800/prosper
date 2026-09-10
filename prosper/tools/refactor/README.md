@@ -287,20 +287,25 @@ the defect changes the group COUNT rather than merely a number.
 ### The three tools are a chain, and each one checks the step before it
 
 `map_symbols` proposes a seam, `promote_internal` makes the shared vocabulary visible, `split_file`
-cuts. The order is forced, and the reason is worth stating because skipping a step produces a result
-that passes every check and does not compile:
+cuts. The middle step is not always needed -- 42 of `gpu_capture.cpp`'s 155 body regions are already
+external, and a seam that only crosses those needs no promotion at all. What the order buys is that
+**whether you need it is now decidable before the cut** rather than at build time:
 
 ```bash
-map_symbols.py  --file <f> --clusters 3 --json /tmp/f.json   # where to cut, and what it costs
-promote_internal.py --map /tmp/f.json --regions <closure> --header <f>_internal.hpp
-map_symbols.py  --file <f> --json /tmp/f2.json               # promotion changes every index
-split_file.py   --map /tmp/f2.json --plan <plan> --dry-run
+map_symbols.py  --file <f> --clusters 3 --json ~/work/f.json   # where to cut, and what it costs
+split_file.py   --map ~/work/f.json --plan <plan> --dry-run    # refuses, naming what to promote
+promote_internal.py --map ~/work/f.json --regions <closure> --header <f>_internal.hpp
+map_symbols.py  --file <f> --json ~/work/f2.json               # promotion changes every index
+split_file.py   --map ~/work/f2.json --plan <plan> --dry-run
 ```
 
+(Maps go under `$HOME`, not `/tmp`: that is a RAM-backed tmpfs here with a quota shared by every
+concurrent agent.)
+
 **Both closure checks exist because their absence was measured, not imagined.** Splitting
-`gpu_capture.cpp`'s serialize/deserialize into their own file satisfied every check `split_file` had
--- exact tiling, a clean partition, byte-for-byte reconstruction -- and then failed to compile with
-**25 undeclared names**, because `Writer`, `Reader`, `kMagic`, `read_table` and twenty others have
+`gpu_capture.cpp`'s serialize/deserialize into their own file satisfied every check `split_file`
+*then had* -- exact tiling, a clean partition, byte-for-byte reconstruction -- and failed to compile
+with **25 undeclared names**, because `Writer`, `Reader`, `kMagic`, `read_table` and twenty others have
 internal linkage and stayed in the other part. Every one of those checks is byte accounting: they
 establish that no LINE was lost, never that a line can still be used where it ended up.
 
