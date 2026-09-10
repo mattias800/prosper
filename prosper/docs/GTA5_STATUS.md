@@ -23,9 +23,26 @@ pointer here and in `CLAUDE.md` said #2481 long after it closed). Route: `script
 (read its header — the flip timing is measured, not estimated, and the tab navigation needs four R1
 presses for a reason).
 
-**Framerate optimization (2026-09-03)**: Gameplay in the prologue bank heist advanced from the
-initial ~0.6–0.8 FPS slide-show baseline to **21.0–21.3 FPS (46.99 ms average frame interval)** in native 4K Performance mode,
-an overall **~34x speedup** (measured across 106 rendered frames in 4.90 s; Run 6 milestone reached 15.2–15.4 FPS; Run 7 reached 21.0–21.3 FPS; see breakdown below).
+**Framerate (2026-09-10): the world runs at 7–8 FPS on Linux/RADV**, observed on screen by the
+project owner on a routed `reach-performance-story.pad` run with the bank interior rendering, at
+`ab80a2d69`. That is the number to quote.
+
+> **The "21.0–21.3 FPS / ~34x speedup" this line used to claim was never a measurement of the
+> rendered world** (#3446). The three captures behind it contain **zero compute groups** and
+> `compute=0.0 ms`; a GTA V world frame runs dozens of compute programs, so those captures are a
+> different phase — a loading screen, not the bank. Three further defects in the same record: the
+> quoted figure is the **guest flip rate**, not a frame rate (`rendered` is `unavailable` under GPU
+> present, and the Run 7 capture's own host-presented rate is 11.62/s against the 21.00 quoted); the
+> capture's recorded revision is not an ancestor of the commit that claims it; and the reproduction
+> recipe's wall-clock trigger now fires before the world loads.
+>
+> **The relationship runs the other way on this title, which is why the number was believable.**
+> Across all 43 `PPSA04263` captures on the Linux box, compute-group count correlates with flip rate
+> at **−0.581**: captures with >100 groups (real world work) sit at a median 2.25 flips/s, those with
+> ≤40 groups at 6.38, and the highest rate anywhere in the corpus is 7.58. A high number on this
+> title means *less* world being drawn, not faster drawing — so quoted as a speedup it points
+> backwards. The per-run table below is kept as the record of what was optimised; read its rates as
+> flip rates of an unverified phase, not as gameplay framerates.
 
 Historical design note for the descriptor work: `docs/FLAT_LOAD_DESIGN.md`. Do not start from it; the
 descriptor-array lift it describes is complete.
@@ -115,16 +132,16 @@ unchanged. Focused tests cover multiple images, invalid-but-resident content, bo
 paths and view/sampler failures before and after eviction. Native comparison evidence and
 the still-open broader resource-preparation budget remain in #3065.
 
-## Gameplay framerate optimization: reaching 21+ FPS (2026-09-03)
+## Gameplay framerate optimization (2026-09-03) — rates in this section are NOT world framerates
 
 **Platform**: Measured on **Windows 11 / Intel Core i9 (24 physical cores) / discrete NVIDIA GeForce RTX 4090 (24 GB VRAM, Vulkan 1.4)**.
 
 > [!NOTE]
 > Several transfer-reduction mechanisms below (§2, §3, §4) explicitly address host staging bloat and discrete PCIe bus transfers between system RAM and dedicated VRAM. On unified-memory APU/iGPU architectures (such as Linux / Radeon 8060S), host memory and device memory share the same physical address space, so PCIe-specific bus bottlenecks do not exist there in the same form.
 
-Overnight profiling and optimization of the native-4K Performance story route (`scripts/gta5/reach-performance-story.pad`, prologue bank heist) raised gameplay throughput from **0.6–0.8 FPS (1,600+ ms/frame) to 21.0–21.3 FPS (46.99 ms/frame)** on host hardware.
+Overnight profiling and optimization of the native-4K Performance story route (`scripts/gta5/reach-performance-story.pad`, prologue bank heist). **The rates below are guest flip rates measured on captures with zero compute work, so they do not describe the rendered world** (#3446) — the optimisations they document are real and were kept, but the throughput figures are not gameplay framerates. The measured world rate is 7–8 FPS on Linux/RADV (2026-09-10).
 
-This represents a **~34x speedup**. The primary bottlenecks identified and resolved are detailed below.
+The primary bottlenecks identified and resolved are detailed below; they are genuine, and were verified individually. It is the end-to-end **speedup ratio** that does not survive, because its endpoints measure different phases.
 
 ### 1. MRT Flush Breaking Backend Submission Batching (~560 ms/frame reduction)
 
@@ -176,6 +193,12 @@ This represents a **~34x speedup**. The primary bottlenecks identified and resol
   **Impact**: Eliminated thread serialization; wall time between submissions dropped from 43.9 ms to 12.3 ms.
 
 ### 6. Summary of Progression & Verification
+
+> **Every rate in the table below is a guest flip rate on a capture with no compute work in it**
+> (#3446). The optimisations above are real, were verified individually, and were kept. What does
+> not survive is the end-to-end progression: its endpoints are different phases, so the ratio
+> between them measures nothing. The world's measured rate is **7–8 FPS** (Linux/RADV, 2026-09-10,
+> owner-observed on the routed Performance run).
 
 | Milestone | Configuration / Fixes | Frame Time (avg) | FPS | Key Gain |
 | :--- | :--- | :--- | :--- | :--- |
