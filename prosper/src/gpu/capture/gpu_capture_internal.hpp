@@ -50,10 +50,8 @@
 #include <sys/uio.h>
 #include <unistd.h>
 #include "host/platform/posix_shim.hpp"
-
-// Closing 1 conditional(s) the copied preamble left open; the
-// original closes them further down, outside any preamble region.
 #endif
+#include "gpu/capture/gpu_capture_internal.hpp"
 
 namespace prosper::gpu {
 
@@ -1394,6 +1392,68 @@ inline bool validate_failure_diagnostics(const GpuCaptureFile& capture, std::str
         return false;
     }
     return true;
+}
+
+// ---- appended by a later promotion out of the same source ----
+inline CaptureRttSeedReader g_rtt_seed_reader;
+
+inline size_t read_capture_guest_memory(uint64_t addr, uint8_t* dst, size_t bytes) {
+#if defined(__linux__) || defined(__APPLE__)
+    size_t done = 0;
+    while (done < bytes) {
+        iovec local{dst + done, bytes - done};
+        iovec remote{reinterpret_cast<void*>(static_cast<uintptr_t>(addr + done)), bytes - done};
+        const ssize_t read = process_vm_readv(getpid(), &local, 1, &remote, 1, 0);
+        if (read < 0 && errno == EINTR) continue;
+        if (read <= 0) break;
+        done += static_cast<size_t>(read);
+    }
+    return done;
+#else
+    size_t done = 0;
+    constexpr size_t chunk_max = 0x10000;
+    while (done < bytes) {
+        const size_t n = std::min(bytes - done, chunk_max);
+        if (!guest_readable(addr + done, static_cast<uint32_t>(n))) break;
+        std::memcpy(dst + done, reinterpret_cast<const void*>(static_cast<uintptr_t>(addr + done)), n);
+        done += n;
+    }
+    return done;
+#endif
+}
+
+inline bool is_capture_authority_resource(const ShaderResource& resource) {
+    return is_compute_internal_gds(resource) ||
+           is_gta5_packed_pointer_marker_candidate(resource) ||
+           is_indirect_pointer_relocation_marker_candidate(resource) ||
+           is_nullable_raw_buffer_marker_candidate(resource) ||
+           is_gta5_selected_sbuffer_marker_candidate(resource) ||
+           is_gta5_cf9200_no_backing_marker_candidate(resource);
+}
+
+inline CaptureMemoryReader ordered_gpustate_capture_reader(const GpuState& state) {
+    return [&state](uint64_t addr, uint8_t* destination, size_t bytes) -> size_t {
+        size_t copied = read_capture_guest_memory(addr, destination, bytes);
+        if (!bytes || addr > std::numeric_limits<uint64_t>::max() - bytes) return copied;
+        const uint64_t end = addr + bytes;
+        for (const auto& copy : state.dma_copies) {
+            std::vector<uint8_t> source;
+            if (read_live_render_target_bytes(copy.src, copy.bytes, source) !=
+                    LiveTargetByteReadResult::Success || source.size() != copy.bytes)
+                continue;
+            const uint64_t copy_end = copy.src + copy.bytes;
+            const uint64_t overlap_begin = std::max(addr, copy.src);
+            const uint64_t overlap_end = std::min(end, copy_end);
+            if (overlap_begin >= overlap_end) continue;
+            const size_t destination_offset = static_cast<size_t>(overlap_begin - addr);
+            const size_t source_offset = static_cast<size_t>(overlap_begin - copy.src);
+            const size_t overlap_bytes = static_cast<size_t>(overlap_end - overlap_begin);
+            std::memcpy(destination + destination_offset, source.data() + source_offset,
+                        overlap_bytes);
+            copied = std::max(copied, destination_offset + overlap_bytes);
+        }
+        return copied;
+    };
 }
 
 }  // namespace prosper::gpu
