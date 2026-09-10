@@ -5,8 +5,8 @@ into a `.prgbundle` / `.prgcap` that `tools/gpu_replay` can reproduce offline an
 
 - `gpu_capture` — collecting a frame: intervals, tables, submit items, and the entry points
   that begin, finish and materialize a capture.
-- `gpu_capture_serialize` — the file format: the byte cursors, the per-field codecs, and
-  `serialize_gpu_capture` / `deserialize_gpu_capture`.
+- `serialize/` — the file format, in its own folder: byte cursors, per-field codecs, and the two
+  entry points. See its `AGENTS.md`; the boundary against this folder is the version contract.
 - `gpu_capture_internal` — the vocabulary those two share: magic/version/limits, footprint
   and blob-size helpers, and the validators. Internal to this folder; not a public header.
 - `gpu_capture_bundle` — bundle format and manifest.
