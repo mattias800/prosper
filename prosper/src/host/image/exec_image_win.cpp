@@ -18,6 +18,8 @@
 #endif
 
 #include "host/image/exec_image.hpp"
+#include "host/fault/rbp_chain.hpp"   // guest_frames_from_rbp: the shared frame-pointer walk
+#include "host/fault/guest_stack_scan.hpp"   // the scan-based sibling, shared by both platforms
 #include "host/platform/immortal.hpp"   // #2613: registries a guest thread can reach after exit()
 #include "host/memory/guest_write_watch.hpp"
 #include "host/x86/sse4a.hpp"
@@ -1356,6 +1358,57 @@ uint64_t invoke_stub(uint64_t idx) {
 
 // MinGW/MSVC both provide the linker-synthesised image base, so this needs no psapi dependency.
 extern "C" IMAGE_DOS_HEADER __ImageBase;
+
+namespace {
+// The guest-code filter both recoverers share. guest_module_name is the same classifier
+// describe_code_address uses, so a frame reported here and a frame in a fault backtrace can never
+// disagree about what is guest code. STUB addresses are dropped too: an import stub is prosper's own
+// synthesized trampoline, and naming it as the caller answers the question with the mechanism
+// instead of the call site.
+bool is_guest_call_site(uint64_t a) {
+    const char* module = prosper::guest_module_name(a);
+    return std::strcmp(module, "mapped/host") != 0 && std::strcmp(module, "STUB") != 0;
+}
+}  // namespace
+
+int guest_frames_on_stack(uint64_t rsp_seed, uint64_t* out, int max) {
+    if (!out || max <= 0 || rsp_seed <= 0x10000) return 0;
+
+    // Bound the scan by the guest thread's own registered stack when it has one, so the walk stops
+    // at the real top rather than at an arbitrary window. Without a registration -- the main thread
+    // before it is registered, or a thread the guest created behind our back -- fall back to a fixed
+    // window, which is why the cap is applied in both branches.
+    constexpr uint64_t kWindow = 64 * 1024;
+    uint64_t limit = rsp_seed + kWindow;
+    void* stack_base = nullptr;
+    size_t stack_size = 0;
+    if (guest_stack_for_current_thread(&stack_base, &stack_size) && stack_size) {
+        const uint64_t top = (uint64_t)(uintptr_t)stack_base + stack_size;
+        if (top > rsp_seed && top < limit) limit = top;
+    }
+    return prosper::host::scan_stack_for_returns(rsp_seed, limit, out, max,
+                                                 &addr_readable, &is_guest_call_site);
+}
+
+int guest_frames_from_rbp(uint64_t rbp_seed, uint64_t* out, int max) {
+    if (!out || max <= 0 || rbp_seed <= 0x10000) return 0;
+    // Sibling of the Linux implementation; same walker, same classifier, different readable probe
+    // (VirtualQuery here, a pipe write there). Keeping both on host/fault/rbp_chain.hpp is what stops
+    // the two platforms' answers to "who called this?" from drifting.
+    uint64_t frames[64];
+    const int cap = max < 64 ? max * 4 : 64;
+    const int walked = prosper::host::walk_rbp_chain(rbp_seed, frames,
+                                                     cap > 64 ? 64 : cap, &addr_readable);
+    int kept = 0;
+    for (int i = 0; i < walked && kept < max; ++i) {
+        if (!is_guest_call_site(frames[i])) continue;
+        bool duplicate = false;
+        for (int j = 0; j < kept; ++j) duplicate |= out[j] == frames[i];
+        if (duplicate) continue;
+        out[kept++] = frames[i];
+    }
+    return kept;
+}
 
 std::string describe_code_address(uint64_t address) {
     char text[160];

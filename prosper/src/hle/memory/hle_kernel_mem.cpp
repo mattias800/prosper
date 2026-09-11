@@ -550,7 +550,7 @@ static uint64_t apr_cb_set_equeue(uint64_t command_size, bool eager_completion,
 }
 
 static uint64_t apr_submit_common(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
-                                  bool write_result_outputs) {
+                                  bool write_result_outputs, uint64_t* token_out = nullptr) {
     unsigned ring = a1 ? (unsigned)(a1 - 1) & 0x3f : 0;
     // Completion-token contract (issues #180/#208 — guest submit path eboot+0x22a02b0, handler
     // +0x229dcb0, listener +0x22740b0, listener-ctx ctor +0x22a0670; full write-up in
@@ -620,6 +620,7 @@ static uint64_t apr_submit_common(uint64_t a0, uint64_t a1, uint64_t a2, uint64_
                            (unsigned long long)a0, (unsigned long long)a1,
                            (unsigned long long)a2, (unsigned long long)a3, (unsigned long long)token,
                            bound ? " (bound)" : "", apr_req_eventful(a0) ? " (arg8-async)" : "");
+    if (token_out) *token_out = token;
     if (tag_echo && should_post)
         prosper_eq_post_apr_token(bc.eq, bc.eq_identity, bc.id, bc.tag);
     // Submit consumes the encoded commands. Pathless reuses completed pool buffers without calling
@@ -1787,6 +1788,139 @@ HLE(k_pool_commit) {
     return rc;
 }
 
+
+// The committed sub-ranges of [base, base+len) that THIS FILE recorded, clipped to it.
+//
+// The guard for sceKernelMemoryPoolDecommit, and the reason it is a CLIP rather than a yes/no test
+// is measured. Decommit's hazard runs the opposite way to the rest of this family: its failure mode
+// is unmapping a range the guest did not ask about, which is silent and takes whatever else lived
+// there with it (#3506). So nothing outside prosper's own committed mappings is ever touched.
+//
+// The first version of this asked "is EVERY byte committed?" and refused otherwise. That is the
+// wrong question, and NINJA GAIDEN 4 answered it immediately: it decommits whole 4 MiB pool spans
+// of which only part is committed at the time (`pool_decommit addr=0x1001000000 len=0x400000`
+// against 64 KiB commits), which is ordinary allocator behaviour -- "release this span, whatever is
+// live in it". Refusing produced 8.1 million refusals in a 240 s run as the guest retried. Releasing
+// the committed part and succeeding is both correct and still safe: the clip is what keeps the
+// unmap inside what prosper owns.
+//
+// g_maps is kept in base order by insert_mapping_by_base, so the result comes out in address order.
+std::vector<std::pair<uint64_t, uint64_t>> committed_parts_in(uint64_t base, uint64_t len) {
+    std::vector<std::pair<uint64_t, uint64_t>> parts;
+    if (!len || base > UINT64_MAX - len) return parts;
+    const uint64_t end = base + len;
+    std::lock_guard<std::mutex> lk(g_mx);
+    for (const auto& m : g_maps) {
+        if (!m.committed) continue;
+        const uint64_t lo = m.base > base ? m.base : base;
+        const uint64_t hi = (m.base + m.size) < end ? (m.base + m.size) : end;
+        if (lo < hi) parts.emplace_back(lo, hi - lo);
+    }
+    return parts;
+}
+
+// sceKernelMemoryPoolDecommit(void* addr, size_t len, int flags) -- the fourth member of the pool
+// family, and the one #3502 deliberately left out because no title had reached it yet. NINJA GAIDEN 4
+// (#3500) reaches it now, precisely BECAUSE that fix let it get further (#3506).
+//
+// A family with Commit and no Decommit is worse than a family with neither. The title commits its
+// arena in 64 KiB steps and, unregistered, every release it believes succeeded left the mapping in
+// place -- so its allocator's picture of free memory and prosper's diverge monotonically, and the
+// guest is told "released" about memory it can never get back.
+//
+// THE RISK PROFILE IS INVERTED relative to the rest of this family, and that is what shapes the
+// code. Decommit has no out-parameter, so the hazard that made #3502 probe before implementing --
+// writing through a wrongly positioned argument -- does not apply. The opposite one does: unmapping
+// a range the guest did not name, which is silent and corrupts whatever else lived there. Hence
+// committed_parts_in above: nothing is touched unless prosper itself recorded it as a
+// committed mapping.
+//
+// THE RESERVATION SURVIVES. That is the whole point of the reserve/commit split -- releasing the VA
+// would let a later Commit at the same address fail, or worse succeed against a different mapping.
+// On POSIX that needs an explicit PROT_NONE anonymous MAP_FIXED over the range, because munmap
+// releases the VA outright; the replacement is exactly what k_reserve_vrange installs for a fresh
+// reservation, so the range goes back to being reservation-shaped rather than merely empty.
+//
+// CONFIDENCE: HIGH on refusing what is not ours and on keeping the reservation. CONFIDENCE: MED on
+// the argument layout: the 3.20 database gives the name and not the signature, and the (addr, len,
+// flags) shape is the family's and not a capture. a2..a5 are therefore logged and not used, and the
+// log is what settles it -- if a run ever shows a2 carrying something that is not a small flag
+// word, this reading is wrong.
+HLE(k_pool_decommit) {
+    if (!a0 || !a1) return 0x80020016ull;                            // SCE_KERNEL_ERROR_EINVAL
+    // 64 KiB granularity, rounded INWARD -- and both halves of that are load-bearing.
+    //
+    // INWARD, because this call destroys guest memory. Every other rounding in this file widens a
+    // range, which for a protection change is harmless; widening a RELEASE would unmap bytes the
+    // guest did not name, and its sibling k_munmap refuses an unaligned request outright rather than
+    // take that risk. Rounding in can only ever release less than asked, never more.
+    //
+    // 64 KiB rather than the 16 KiB guest page, because of what happens to the hole afterwards. A
+    // decommitted range goes back to being a tracked reservation, and the first guest touch of a
+    // tracked reservation is served by the lazy-commit fault handler
+    // (exec_image_linux.cpp, `prosper_reserved_range_state(a) == 1`), which maps
+    // `mmap(page & ~0xffff, 0x10000, MAP_FIXED)` -- a whole 64 KiB granule. A hole smaller than
+    // that, or not aligned to it, would therefore be re-backed by an mmap that also replaces the
+    // still-live neighbours sharing its granule with fresh zeroed pages. Releasing only whole
+    // granules makes that unreachable by construction. Raised in review of #3530.
+    //
+    // NINJA GAIDEN 4 loses nothing to this: its observed decommits are already 64 KiB-aligned with
+    // 64 KiB-multiple lengths (`addr=0x1001010000 len=0x3f0000`, `addr=0x1000ee0000 len=0x10000`).
+    constexpr uint64_t kCommitGranule = 0x10000ull;
+    // Overflow first, and BOTH ends of it. The replaced code used normalize_guest_page_range, which
+    // checks its own round-up; rounding by hand dropped that, and the omission is not benign here --
+    // `sceKernelMemoryPoolDecommit(-16, 8, 0)` wraps `base` to 0 and yields a length of nearly 2^64,
+    // at which point committed_parts_in returns EVERY committed mapping and the loop below unmaps
+    // the whole process while answering SCE_OK. Raised in review of #3530.
+    if (a1 > UINT64_MAX - a0) return 0x80020016ull;                  // the span itself wraps
+    if (a0 > UINT64_MAX - (kCommitGranule - 1)) return 0x80020016ull; // rounding the base up wraps
+    const uint64_t base = (a0 + kCommitGranule - 1) & ~(kCommitGranule - 1);
+    const uint64_t end  = (a0 + a1) & ~(kCommitGranule - 1);
+    if (end <= base) {
+        // Nothing to do, and SAY SO. A release that releases nothing answering SCE_OK in silence is
+        // the shape this file spends most of its comments warning about; bounded so a guest looping
+        // on it cannot turn the diagnostic into the problem.
+        static std::atomic<int> narrowed{0};
+        if (narrowed.fetch_add(1) < 8)
+            fprintf(stderr, "[memhle] sceKernelMemoryPoolDecommit(0x%llx, 0x%llx) spans no whole "
+                            "64 KiB granule -- nothing released (reported %d of at most 8 times)\n",
+                    (unsigned long long)a0, (unsigned long long)a1, narrowed.load());
+        return 0;
+    }
+    const uint64_t len = end - base;
+    uint64_t released = 0;
+    for (const auto& part : committed_parts_in(base, len)) {
+        // Retire any texture write-watch over this VA before the backing disappears, exactly as
+        // k_munmap does -- the pages are about to stop being what the watch believes they are.
+        host::guest_write_watch_notify_direct_mapping_removed(part.first, part.second);
+        void* p = mmap((void*)part.first, part.second, PROT_NONE,
+                       MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (p == MAP_FAILED) {
+            MLOG("pool_decommit [0x%llx,0x%llx) FAILED to re-reserve (errno=%d)\n",
+                 (unsigned long long)part.first,
+                 (unsigned long long)(part.first + part.second), errno);
+            return 0x80020016ull;
+        }
+        untrack(part.first, part.second);
+        track(part.first, part.second, 0, 0, false, "reserved");
+        released += part.second;
+    }
+    if (released < a1) {
+        static std::atomic<int> partial{0};
+        if (partial.fetch_add(1) < 8)
+            fprintf(stderr, "[memhle] sceKernelMemoryPoolDecommit(0x%llx, 0x%llx) released 0x%llx: "
+                            "the rest was not committed, or fell outside a whole 64 KiB granule "
+                            "(reported %d of at most 8 times)\n",
+                    (unsigned long long)a0, (unsigned long long)a1,
+                    (unsigned long long)released, partial.load());
+    }
+    MLOG("pool_decommit addr=0x%llx len=0x%llx flags=0x%llx -> released 0x%llx of [0x%llx,0x%llx), "
+         "reservation kept\n",
+         (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2,
+         (unsigned long long)released, (unsigned long long)base, (unsigned long long)(base + len));
+    return 0;
+}
+
 // sceKernelConfiguredFlexibleMemorySize(size_t* sizeOut): the flexible budget this process was
 // CONFIGURED with, as distinct from what remains Available above. FF Tactics (#3498) reads it during
 // startup and raises sceKernelDebugRaiseExceptionOnReleaseMode two calls later when it comes back
@@ -2220,11 +2354,57 @@ static uint64_t sce_mprotect_error(int error) {
         default:     return 0x80020016ull;
     }
 }
+// sceKernelMprotect(addr, len, prot).
+//
+// The range is NORMALIZED to guest pages before anything is applied, exactly as k_mtypeprotect
+// below already does. Protection is a page-granular property on every platform prosper targets, so
+// a sub-page request can only ever mean "the pages containing this span" -- and the two functions
+// answering the same question differently is the divergence the charter's one-derivation rule
+// exists to prevent.
+//
+// This is not a tolerance, it is the console's contract, and the primary evidence is the KERNEL this
+// one is derived from. FreeBSD's kern_mprotect does exactly this rounding -- it takes
+// `pageoff = addr & PAGE_MASK`, subtracts it from the address, adds it to the size and rounds the
+// size up -- and the PS5 kernel is FreeBSD-derived. That is a positive statement about WHICH
+// rounding the platform performs, including its direction, where "a shipping title calls it and
+// works" establishes only that hardware did not fail the call. It also settles the corner this
+// introduces: `sceKernelMprotect(unaligned, 0, prot)` now protects one whole page while an aligned
+// address with length 0 stays a no-op, which looks inconsistent inside prosper and is precisely what
+// FreeBSD does. Raised in review of #3530.
+//
+// The title is the corroborating evidence, and it is how the defect was found.
+// FINAL FANTASY TACTICS - The Ivalice Chronicles (#3498) calls
+// sceKernelMprotect(eboot+0xf999e0, 0x1da20, 0xc3) during its allocator init -- an address that is
+// not 16 KiB aligned and a length that is not a multiple of it. Passed through verbatim, host
+// mprotect(2) rejects the unaligned base with EINVAL, and the title reads that as fatal: it
+// abandons the init, returns -1 up four frames, its framework constructor yields NULL, main()
+// returns, and the CRT raises sceKernelDebugRaiseExceptionOnReleaseMode(0xa0020001) about a second
+// into the boot. A title that ships and runs on hardware is proof the console accepted the call.
+//
+// It is also the SECOND time a refused mprotect has cost a title its whole init path: #2101 is The
+// Messenger losing its AGC register-offset table the same way. That fix, and the bounded REFUSED
+// log it added, landed on the Windows half only -- which is why this one had to be found by
+// disassembling the guest instead of by reading a log. The log is mirrored here for that reason.
+//
+// CONFIDENCE: HIGH. The failing call is live-captured, the EINVAL is observed at the guest's own
+// test instruction (eboot+0x9779), and the normalization matches the sibling entry point.
 HLE(k_mprotect) {
     if (!a0) return 0x80020016ull;
+    uint64_t base = 0, len = 0;
+    if (!normalize_guest_page_range(a0, a1, base, len)) return 0x80020016ull;
+    if (!len) return 0;                       // an empty span is a no-op, not an error
     const int prot = host_prot(a2);
-    if (mprotect((void*)a0, a1, prot) != 0) return sce_mprotect_error(errno);
-    retrack_prot(a0, a1, prot, static_cast<uint32_t>(a2), "mprotect");
+    if (mprotect((void*)base, len, prot) != 0) {
+        const int failure = errno;
+        static std::atomic<int> n{0};
+        if (n.fetch_add(1) < 24)
+            fprintf(stderr, "[memhle] sceKernelMprotect REFUSED addr=0x%llx len=0x%llx prot=0x%llx "
+                            "(pages [0x%llx,0x%llx)) errno=%d\n",
+                    (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2,
+                    (unsigned long long)base, (unsigned long long)(base + len), failure);
+        return sce_mprotect_error(failure);
+    }
+    retrack_prot(base, len, prot, static_cast<uint32_t>(a2), "mprotect");
     return 0;
 }
 
@@ -2493,6 +2673,51 @@ HLE(k_apr_cb_set_equeue_320) {   // o67gODLFpls: PS5 3.20 0x20-byte completion c
 // documents that a nonzero value landing in a request's completion record marks the read FAILED
 // (eboot+0x22738a5). That is why the plain variant is a separate entry rather than an alias.
 
+// sceKernelAprSubmitCommandBufferAndGetId(cb, ring_1based) -> id.
+//
+// The THIRD member of the submit family, and the one this file did not have. Same submit as its two
+// siblings; only how the completion token reaches the caller differs -- AndGetResult writes it
+// through two out-parameters, the plain form does not return it at all, and this one returns it in
+// rax. There are therefore no out-parameters to position wrongly, which is the hazard that made
+// #3502 probe before implementing. The token is the same prosper_apr_next_token(ring) value the
+// AndGetResult path already hands out, so the three entry points cannot disagree about which id
+// names a submit.
+//
+// Leaving it unregistered was NOT neutral, and the damage is the SUBMIT rather than the id. The
+// dispatcher's `return 0` skipped ampr_cb_reset, so the command buffer's cursor was never released:
+// the guest's append loop polls GetSize - GetUsed and appends only when the difference is large
+// enough, which is exactly the spin k_ampr_init's comment records parking an IoStore thread. No
+// completion event was posted either. FINAL FANTASY TACTICS - The Ivalice Chronicles (PPSA21783)
+// streams its assets through this entry point (#3498).
+//
+// CONFIDENCE: HIGH on the submit (shared body with both siblings). CONFIDENCE: MED on the arity --
+// the 3.20 database gives this entry point's name and not its signature, so a2..a5 are logged
+// rather than used, on the same reasoning the plain form states for its own discarded pair. If they
+// ever read as consistently valid, aligned guest pointers across a run, this entry has
+// out-parameters after all and this handler is wrong.
+HLE(k_apr_submit_and_get_id) {
+    uint64_t token = 0;
+    const uint64_t rc = apr_submit_common(a0, a1, /*out1=*/0, /*out2=*/0,
+                                          /*write_result_outputs=*/false, &token);
+    if (amprlog())
+        fprintf(stderr, "[amprlog] AprSubmitAndGetId qvMUCyyaCSI cb=0x%llx ring1b=%llu -> id=0x%llx "
+                        "(rc=0x%llx; unused a2=0x%llx a3=0x%llx a4=0x%llx a5=0x%llx)\n",
+                (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)token,
+                (unsigned long long)rc, (unsigned long long)a2, (unsigned long long)a3,
+                (unsigned long long)a4, (unsigned long long)a5);
+    // A failed submit must not hand back an id the guest would then wait on.
+    if (rc != 0) return rc;
+    // The token is whatever the family computed, INCLUDING 0. An earlier revision substituted this
+    // ring's own counter when the token came back 0, on the reasoning that 0 is the value the missing
+    // handler returned. That is reachable only for a cb BOUND with a zero tag -- and for a bound cb
+    // this file's own contract (see apr_submit_common) is that the token IS the binding tag, which
+    // the guest chose. Handing back the unbound counter dialect instead would answer a bound
+    // buffer in a dialect it never asked for, and would advance ring state as a side effect of a
+    // read. CRI ADX2 is the known zero-tag binder and its waiter tests the event IDENT, never the
+    // tag, so 0 is a legitimate payload there rather than an ambiguous one. Reverted in review of
+    // #3530; no title is known to bind with a zero tag AND use this entry point.
+    return token;
+}
 HLE(k_apr_submit) {   // sceKernelAprSubmitCommandBufferAndGetResult (cb, ring_1based, out1, out2)
     return apr_submit_common(a0, a1, a2, a3, /*write_result_outputs=*/true);
 }
@@ -3611,6 +3836,7 @@ void register_kernel_mem_hle() {
     Hle::register_fn("qCSfqDILlns", (HleFn)k_pool_expand,        "sceKernelMemoryPoolExpand");
     Hle::register_fn("pU-QydtGcGY", (HleFn)k_pool_reserve,       "sceKernelMemoryPoolReserve");
     Hle::register_fn("Vzl66WmfLvk", (HleFn)k_pool_commit,        "sceKernelMemoryPoolCommit");
+    Hle::register_fn("LXo1tpFqJGs", (HleFn)k_pool_decommit,      "sceKernelMemoryPoolDecommit");
     Hle::register_fn("n1-v6FgU7MQ", (HleFn)k_configured_flexible, "sceKernelConfiguredFlexibleMemorySize");
     Hle::register_fn("tZ2yplY8MBY", (HleFn)k_pagetable_stats,    "sceKernelGetPageTableStats");
     R("sceKernelAllocateDirectMemory", k_alloc_dmem);
@@ -3682,6 +3908,8 @@ void register_kernel_mem_hle() {
                      "sceKernelAprSubmitCommandBufferAndGetResult");
     Hle::register_fn("eE4Szl8sil8", (HleFn)k_apr_submit_plain,
                      "sceKernelAprSubmitCommandBuffer");
+    Hle::register_fn("qvMUCyyaCSI", (HleFn)k_apr_submit_and_get_id,
+                     "sceKernelAprSubmitCommandBufferAndGetId");
     Hle::register_fn("GnxKOHEawhk", (HleFn)k_ampr_get_current_offset,
                      "sceAmprCommandBufferGetCurrentOffset");
     Hle::register_fn("4fgtGfXDrFc", (HleFn)k_ampr_measure_write_address,
@@ -6672,6 +6900,139 @@ HLE(k_pool_commit) {
     return rc;
 }
 
+
+// The committed sub-ranges of [base, base+len) that THIS FILE recorded, clipped to it.
+//
+// The guard for sceKernelMemoryPoolDecommit, and the reason it is a CLIP rather than a yes/no test
+// is measured. Decommit's hazard runs the opposite way to the rest of this family: its failure mode
+// is unmapping a range the guest did not ask about, which is silent and takes whatever else lived
+// there with it (#3506). So nothing outside prosper's own committed mappings is ever touched.
+//
+// The first version of this asked "is EVERY byte committed?" and refused otherwise. That is the
+// wrong question, and NINJA GAIDEN 4 answered it immediately: it decommits whole 4 MiB pool spans
+// of which only part is committed at the time (`pool_decommit addr=0x1001000000 len=0x400000`
+// against 64 KiB commits), which is ordinary allocator behaviour -- "release this span, whatever is
+// live in it". Refusing produced 8.1 million refusals in a 240 s run as the guest retried. Releasing
+// the committed part and succeeding is both correct and still safe: the clip is what keeps the
+// unmap inside what prosper owns.
+//
+// g_maps is kept in base order by insert_mapping_by_base, so the result comes out in address order.
+std::vector<std::pair<uint64_t, uint64_t>> committed_parts_in(uint64_t base, uint64_t len) {
+    std::vector<std::pair<uint64_t, uint64_t>> parts;
+    if (!len || base > UINT64_MAX - len) return parts;
+    const uint64_t end = base + len;
+    std::lock_guard<std::mutex> lk(g_mx);
+    for (const auto& m : g_maps) {
+        if (!m.committed) continue;
+        const uint64_t lo = m.base > base ? m.base : base;
+        const uint64_t hi = (m.base + m.size) < end ? (m.base + m.size) : end;
+        if (lo < hi) parts.emplace_back(lo, hi - lo);
+    }
+    return parts;
+}
+
+// sceKernelMemoryPoolDecommit(void* addr, size_t len, int flags) -- the fourth member of the pool
+// family, and the one #3502 deliberately left out because no title had reached it yet. NINJA GAIDEN 4
+// (#3500) reaches it now, precisely BECAUSE that fix let it get further (#3506).
+//
+// A family with Commit and no Decommit is worse than a family with neither. The title commits its
+// arena in 64 KiB steps and, unregistered, every release it believes succeeded left the mapping in
+// place -- so its allocator's picture of free memory and prosper's diverge monotonically, and the
+// guest is told "released" about memory it can never get back.
+//
+// THE RISK PROFILE IS INVERTED relative to the rest of this family, and that is what shapes the
+// code. Decommit has no out-parameter, so the hazard that made #3502 probe before implementing --
+// writing through a wrongly positioned argument -- does not apply. The opposite one does: unmapping
+// a range the guest did not name, which is silent and corrupts whatever else lived there. Hence
+// committed_parts_in above: nothing is touched unless prosper itself recorded it as a
+// committed mapping.
+//
+// THE RESERVATION SURVIVES. That is the whole point of the reserve/commit split -- releasing the VA
+// would let a later Commit at the same address fail, or worse succeed against a different mapping.
+// On POSIX that needs an explicit PROT_NONE anonymous MAP_FIXED over the range, because munmap
+// releases the VA outright; the replacement is exactly what k_reserve_vrange installs for a fresh
+// reservation, so the range goes back to being reservation-shaped rather than merely empty.
+//
+// CONFIDENCE: HIGH on refusing what is not ours and on keeping the reservation. CONFIDENCE: MED on
+// the argument layout: the 3.20 database gives the name and not the signature, and the (addr, len,
+// flags) shape is the family's and not a capture. a2..a5 are therefore logged and not used, and the
+// log is what settles it -- if a run ever shows a2 carrying something that is not a small flag
+// word, this reading is wrong.
+HLE(k_pool_decommit) {
+    if (!a0 || !a1) return 0x80020016ull;                            // SCE_KERNEL_ERROR_EINVAL
+    // 64 KiB granularity, rounded INWARD -- and both halves of that are load-bearing.
+    //
+    // INWARD, because this call destroys guest memory. Every other rounding in this file widens a
+    // range, which for a protection change is harmless; widening a RELEASE would unmap bytes the
+    // guest did not name, and its sibling k_munmap refuses an unaligned request outright rather than
+    // take that risk. Rounding in can only ever release less than asked, never more.
+    //
+    // 64 KiB rather than the 16 KiB guest page, because of what happens to the hole afterwards. A
+    // decommitted range goes back to being a tracked reservation, and the first guest touch of a
+    // tracked reservation is served by the lazy-commit fault handler
+    // (exec_image_linux.cpp, `prosper_reserved_range_state(a) == 1`), which maps
+    // `mmap(page & ~0xffff, 0x10000, MAP_FIXED)` -- a whole 64 KiB granule. A hole smaller than
+    // that, or not aligned to it, would therefore be re-backed by an mmap that also replaces the
+    // still-live neighbours sharing its granule with fresh zeroed pages. Releasing only whole
+    // granules makes that unreachable by construction. Raised in review of #3530.
+    //
+    // NINJA GAIDEN 4 loses nothing to this: its observed decommits are already 64 KiB-aligned with
+    // 64 KiB-multiple lengths (`addr=0x1001010000 len=0x3f0000`, `addr=0x1000ee0000 len=0x10000`).
+    constexpr uint64_t kCommitGranule = 0x10000ull;
+    // THE GRANULE RATIONALE ABOVE IS THE LINUX ONE, and this half's number is not the same: Windows'
+    // lazy-commit path works in 16 KiB, not 64 KiB (exec_image_win.cpp). 64 KiB is kept here anyway
+    // because it is a SUPERSET -- a 64 KiB-aligned inward-rounded span is also 16 KiB-aligned, so the
+    // hazard is covered either way, and one granule keeps the two halves answering the same question
+    // identically. The cost is that Windows releases slightly less than a 16 KiB-granular caller
+    // asks for. Stated here, before the text it corrects, because a reader meets that text first.
+    // Raised in review of #3530.
+    // Overflow first, and BOTH ends of it. The replaced code used normalize_guest_page_range, which
+    // checks its own round-up; rounding by hand dropped that, and the omission is not benign here --
+    // `sceKernelMemoryPoolDecommit(-16, 8, 0)` wraps `base` to 0 and yields a length of nearly 2^64,
+    // at which point committed_parts_in returns EVERY committed mapping and the loop below unmaps
+    // the whole process while answering SCE_OK. Raised in review of #3530.
+    if (a1 > UINT64_MAX - a0) return 0x80020016ull;                  // the span itself wraps
+    if (a0 > UINT64_MAX - (kCommitGranule - 1)) return 0x80020016ull; // rounding the base up wraps
+    const uint64_t base = (a0 + kCommitGranule - 1) & ~(kCommitGranule - 1);
+    const uint64_t end  = (a0 + a1) & ~(kCommitGranule - 1);
+    if (end <= base) {
+        // Nothing to do, and SAY SO. A release that releases nothing answering SCE_OK in silence is
+        // the shape this file spends most of its comments warning about; bounded so a guest looping
+        // on it cannot turn the diagnostic into the problem.
+        static std::atomic<int> narrowed{0};
+        if (narrowed.fetch_add(1) < 8)
+            fprintf(stderr, "[memhle] sceKernelMemoryPoolDecommit(0x%llx, 0x%llx) spans no whole "
+                            "64 KiB granule -- nothing released (reported %d of at most 8 times)\n",
+                    (unsigned long long)a0, (unsigned long long)a1, narrowed.load());
+        return 0;
+    }
+    const uint64_t len = end - base;
+    uint64_t released = 0;
+    for (const auto& part : committed_parts_in(base, len)) {
+    // win_unmap restores the Windows PLACEHOLDER it cut the view out of, so the address space
+        // stays claimed here without the explicit re-reservation the POSIX arm needs. Recorded
+        // because the two halves therefore look different while implementing the same contract.
+        if (!win_unmap(part.first, part.second)) return 0x80020016ull;
+        untrack(part.first, part.second);
+        track(part.first, part.second, 0, 0, false, "reserved");
+        released += part.second;
+    }
+    if (released < a1) {
+        static std::atomic<int> partial{0};
+        if (partial.fetch_add(1) < 8)
+            fprintf(stderr, "[memhle] sceKernelMemoryPoolDecommit(0x%llx, 0x%llx) released 0x%llx: "
+                            "the rest was not committed, or fell outside a whole 64 KiB granule "
+                            "(reported %d of at most 8 times)\n",
+                    (unsigned long long)a0, (unsigned long long)a1,
+                    (unsigned long long)released, partial.load());
+    }
+    MLOG("pool_decommit addr=0x%llx len=0x%llx flags=0x%llx -> released 0x%llx of [0x%llx,0x%llx), "
+         "placeholder kept\n",
+         (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2,
+         (unsigned long long)released, (unsigned long long)base, (unsigned long long)(base + len));
+    return 0;
+}
+
 // sceKernelConfiguredFlexibleMemorySize(size_t* sizeOut): the flexible budget this process was
 // CONFIGURED with, as distinct from what remains Available above. FF Tactics (#3498) reads it during
 // startup and raises sceKernelDebugRaiseExceptionOnReleaseMode two calls later when it comes back
@@ -6818,11 +7179,48 @@ static uint64_t sce_win_mprotect_error(DWORD error) {
         default:                      return 0x80020016ull;
     }
 }
+// sceKernelMprotect(addr, len, prot).
+//
+// The range is NORMALIZED to guest pages before anything is applied, exactly as k_mtypeprotect
+// below already does. Protection is a page-granular property on every platform prosper targets, so
+// a sub-page request can only ever mean "the pages containing this span" -- and the two functions
+// answering the same question differently is the divergence the charter's one-derivation rule
+// exists to prevent.
+//
+// This is not a tolerance, it is the console's contract, and the primary evidence is the KERNEL this
+// one is derived from. FreeBSD's kern_mprotect does exactly this rounding -- it takes
+// `pageoff = addr & PAGE_MASK`, subtracts it from the address, adds it to the size and rounds the
+// size up -- and the PS5 kernel is FreeBSD-derived. That is a positive statement about WHICH
+// rounding the platform performs, including its direction, where "a shipping title calls it and
+// works" establishes only that hardware did not fail the call. It also settles the corner this
+// introduces: `sceKernelMprotect(unaligned, 0, prot)` now protects one whole page while an aligned
+// address with length 0 stays a no-op, which looks inconsistent inside prosper and is precisely what
+// FreeBSD does. Raised in review of #3530.
+//
+// The title is the corroborating evidence, and it is how the defect was found.
+// FINAL FANTASY TACTICS - The Ivalice Chronicles (#3498) calls
+// sceKernelMprotect(eboot+0xf999e0, 0x1da20, 0xc3) during its allocator init -- an address that is
+// not 16 KiB aligned and a length that is not a multiple of it. Passed through verbatim, host
+// mprotect(2) rejects the unaligned base with EINVAL, and the title reads that as fatal: it
+// abandons the init, returns -1 up four frames, its framework constructor yields NULL, main()
+// returns, and the CRT raises sceKernelDebugRaiseExceptionOnReleaseMode(0xa0020001) about a second
+// into the boot. A title that ships and runs on hardware is proof the console accepted the call.
+//
+// It is also the SECOND time a refused mprotect has cost a title its whole init path: #2101 is The
+// Messenger losing its AGC register-offset table the same way. That fix, and the bounded REFUSED
+// log it added, landed on the Windows half only -- which is why this one had to be found by
+// disassembling the guest instead of by reading a log. The log is mirrored here for that reason.
+//
+// CONFIDENCE: HIGH. The failing call is live-captured, the EINVAL is observed at the guest's own
+// test instruction (eboot+0x9779), and the normalization matches the sibling entry point.
 HLE(k_mprotect) {
     if (!a0) return 0x80020016ull;
+    uint64_t base = 0, len = 0;
+    if (!normalize_guest_page_range(a0, a1, base, len)) return 0x80020016ull;
+    if (!len) return 0;
     const int prot = host_prot(a2);
     DWORD error = ERROR_SUCCESS;
-    if (!win_protect(a0, a1, prot, &error)) {
+    if (!win_protect(base, len, prot, &error)) {
         // #2101: a refused mprotect is silent, and a guest that treats it as fatal then abandons a
         // whole init path with no other symptom. Report the span, the requested Sony protection and
         // the Win32 reason, bounded.
@@ -6834,7 +7232,7 @@ HLE(k_mprotect) {
                     (unsigned long)error);
         return sce_win_mprotect_error(error);
     }
-    retrack_prot(a0, a1, prot, static_cast<uint32_t>(a2), "mprotect");
+    retrack_prot(base, len, prot, static_cast<uint32_t>(a2), "mprotect");
     return 0;
 }
 HLE(k_mtypeprotect) {
@@ -7219,6 +7617,51 @@ HLE(k_ampr_append_equeue_legacy) {   // H896Pt-yB4I: legacy eager path keeps zer
 HLE(k_ampr_append_equeue_320) {      // o67gODLFpls: PS5 3.20 0x20-byte completion command
     return apr_cb_set_equeue(0x20, true, a0, a1, a2, a3, a4, a5);
 }
+// sceKernelAprSubmitCommandBufferAndGetId(cb, ring_1based) -> id.
+//
+// The THIRD member of the submit family, and the one this file did not have. Same submit as its two
+// siblings; only how the completion token reaches the caller differs -- AndGetResult writes it
+// through two out-parameters, the plain form does not return it at all, and this one returns it in
+// rax. There are therefore no out-parameters to position wrongly, which is the hazard that made
+// #3502 probe before implementing. The token is the same prosper_apr_next_token(ring) value the
+// AndGetResult path already hands out, so the three entry points cannot disagree about which id
+// names a submit.
+//
+// Leaving it unregistered was NOT neutral, and the damage is the SUBMIT rather than the id. The
+// dispatcher's `return 0` skipped ampr_cb_reset, so the command buffer's cursor was never released:
+// the guest's append loop polls GetSize - GetUsed and appends only when the difference is large
+// enough, which is exactly the spin k_ampr_init's comment records parking an IoStore thread. No
+// completion event was posted either. FINAL FANTASY TACTICS - The Ivalice Chronicles (PPSA21783)
+// streams its assets through this entry point (#3498).
+//
+// CONFIDENCE: HIGH on the submit (shared body with both siblings). CONFIDENCE: MED on the arity --
+// the 3.20 database gives this entry point's name and not its signature, so a2..a5 are logged
+// rather than used, on the same reasoning the plain form states for its own discarded pair. If they
+// ever read as consistently valid, aligned guest pointers across a run, this entry has
+// out-parameters after all and this handler is wrong.
+HLE(k_ampr_submit_and_get_id) {
+    uint64_t token = 0;
+    const uint64_t rc = apr_submit_common(a0, a1, /*out1=*/0, /*out2=*/0,
+                                          /*write_result_outputs=*/false, &token);
+    if (amprlog())
+        fprintf(stderr, "[amprlog] AprSubmitAndGetId qvMUCyyaCSI cb=0x%llx ring1b=%llu -> id=0x%llx "
+                        "(rc=0x%llx; unused a2=0x%llx a3=0x%llx a4=0x%llx a5=0x%llx)\n",
+                (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)token,
+                (unsigned long long)rc, (unsigned long long)a2, (unsigned long long)a3,
+                (unsigned long long)a4, (unsigned long long)a5);
+    // A failed submit must not hand back an id the guest would then wait on.
+    if (rc != 0) return rc;
+    // The token is whatever the family computed, INCLUDING 0. An earlier revision substituted this
+    // ring's own counter when the token came back 0, on the reasoning that 0 is the value the missing
+    // handler returned. That is reachable only for a cb BOUND with a zero tag -- and for a bound cb
+    // this file's own contract (see apr_submit_common) is that the token IS the binding tag, which
+    // the guest chose. Handing back the unbound counter dialect instead would answer a bound
+    // buffer in a dialect it never asked for, and would advance ring state as a side effect of a
+    // read. CRI ADX2 is the known zero-tag binder and its waiter tests the event IDENT, never the
+    // tag, so 0 is a legitimate payload there rather than an ambiguous one. Reverted in review of
+    // #3530; no title is known to bind with a zero tag AND use this entry point.
+    return token;
+}
 HLE(k_ampr_submit) {                 // ASoW5WE-UPo: …AndGetResult — writes the result slots
     return apr_submit_common(a0, a1, a2, a3, /*write_result_outputs=*/true);
 }
@@ -7565,6 +8008,7 @@ void register_kernel_mem_hle() {
     Hle::register_fn("qCSfqDILlns", (HleFn)k_pool_expand,        "sceKernelMemoryPoolExpand");
     Hle::register_fn("pU-QydtGcGY", (HleFn)k_pool_reserve,       "sceKernelMemoryPoolReserve");
     Hle::register_fn("Vzl66WmfLvk", (HleFn)k_pool_commit,        "sceKernelMemoryPoolCommit");
+    Hle::register_fn("LXo1tpFqJGs", (HleFn)k_pool_decommit,      "sceKernelMemoryPoolDecommit");
     Hle::register_fn("n1-v6FgU7MQ", (HleFn)k_configured_flexible, "sceKernelConfiguredFlexibleMemorySize");
     Hle::register_fn("tZ2yplY8MBY", (HleFn)k_pagetable_stats,    "sceKernelGetPageTableStats");
     R("sceKernelAllocateDirectMemory", k_alloc_dmem);
@@ -7619,6 +8063,8 @@ void register_kernel_mem_hle() {
     // publishing a token. Pre-existing, not widened by this change, and tracked as #1657.
     // The _TEST-suffixed NIDs are deliberately left unimplemented — see the POSIX block for why.
     Hle::register_fn("eE4Szl8sil8", (HleFn)k_ampr_submit_plain, "sceKernelAprSubmitCommandBuffer");
+    Hle::register_fn("qvMUCyyaCSI", (HleFn)k_ampr_submit_and_get_id,
+                     "sceKernelAprSubmitCommandBufferAndGetId");
     Hle::register_fn("GnxKOHEawhk", (HleFn)k_ampr_get_current_offset,
                      "sceAmprCommandBufferGetCurrentOffset");
     Hle::register_fn("4fgtGfXDrFc", (HleFn)k_ampr_measure_write_address,

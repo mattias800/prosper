@@ -4,6 +4,8 @@
 #include "hle/dispatch/nid.hpp"
 #include "hle/kernel/hle_kernel_time.hpp"
 #include "host/image/boot_program.hpp"   // #1659: shared guest-module labelling
+#include "host/image/exec_image.hpp"      // guest_frames_from_rbp / describe_code_address
+#include "host/fault/guest_caller.hpp"    // PROSPER_CAPTURE_RBP at a fatal handler's entry
 #include "host/platform/posix_shim.hpp"     // PROSPER_ASM_TRAMPOLINE (pass entry %rsp as 7th arg)
 #include "host/platform/precise_sleep.hpp"   // guest sleeps must not inherit the winpthreads tick (#3013)
 #include "hle/kernel/timedwait_census.hpp"   // PROSPER_TIMEDWAIT_CENSUS: which primitive a title paces on
@@ -867,10 +869,53 @@ HLE(k_load_start_mod) {   // Windows/MinGW: no import-boundary %fs swap -> guest
 }
 #endif
 
+// Name the guest call site that reached one of the fatal exits below.
+//
+// A title that terminates ITSELF is the hardest kind of boot failure to diagnose, because there is
+// no fault, no unimplemented NID and no host stack worth reading -- the guest ran a check, disliked
+// the answer prosper gave it, and left. What the reader needs is the one thing the log did not have:
+// WHERE. FINAL FANTASY TACTICS (#3498) raises 0xa0020001 with a completely clean log above it, and
+// the only way to progress it is to disassemble the caller.
+//
+// Printed unconditionally rather than behind an env switch: this runs exactly once, on a path that
+// is already terminating the process, so there is no cost to weigh against it -- and a diagnostic
+// that must be enabled is one nobody has enabled on the run that mattered.
+//
+// The chain is a FRAME-POINTER walk, so say what it is. A caller compiled without a prologue is
+// skipped silently (instrument traps 114, 217), which makes a short chain and a shallow stack look
+// identical; confirm a link by disassembling the named site before building on it.
+void report_guest_fatal_caller(uint64_t entry_rbp, uint64_t entry_rsp) {
+    // Both instruments, always, because which one works is a property of how the TITLE was compiled
+    // and is not knowable here. The chain is precise and often empty; the scan is noisy and almost
+    // never empty. Printing only the chain is what left FINAL FANTASY TACTICS' raise reported as a
+    // single frame at the module entry point -- technically true, and useless.
+    uint64_t frames[8];
+    const int chained = guest_frames_from_rbp(entry_rbp, frames, 8);
+    for (int i = 0; i < chained; ++i)
+        fprintf(stderr, "[prosper] guest caller (rbp chain) #%d: 0x%llx (%s)\n", i,
+                (unsigned long long)frames[i], describe_code_address(frames[i]).c_str());
+    if (chained <= 0)
+        fprintf(stderr, "[prosper] guest caller (rbp chain): none -- this title omits frame pointers\n");
+
+    uint64_t scanned[12];
+    const int found = guest_frames_on_stack(entry_rsp, scanned, 12);
+    for (int i = 0; i < found; ++i)
+        fprintf(stderr, "[prosper] guest caller (stack scan) #%d: 0x%llx (%s)\n", i,
+                (unsigned long long)scanned[i], describe_code_address(scanned[i]).c_str());
+    if (found <= 0)
+        fprintf(stderr, "[prosper] guest caller (stack scan): none\n");
+    else
+        fprintf(stderr, "[prosper] guest caller: stack-scan entries are call-site-validated but "
+                        "unordered by liveness -- disassemble before building on one\n");
+}
+
 // _exit(status): terminate the process. Previously an unimplemented stub RETURNED 0, so libc's
 // exit path fell through into its deliberate ud2 (SIGILL) — terminate for real, loudly.
 HLE(k_exit) {
+    PROSPER_CAPTURE_RBP(entry_rbp);
+    PROSPER_CAPTURE_RSP(entry_rsp);
     fprintf(stderr, "[prosper] guest _exit(%d) -- terminating\n", (int)a0);
+    report_guest_fatal_caller(entry_rbp, entry_rsp);
     host::guest_dmem_write_trace_report();
     fflush(nullptr);
     _Exit((int)a0);
@@ -879,8 +924,14 @@ HLE(k_exit) {
 // it from failed check()s in shipping builds). Report and terminate rather than "return 0" and
 // let the guest run on in an undefined state.
 HLE(k_debug_raise_release) {
+    // Capture rbp FIRST, before this frame does anything that could overwrite it. Everything below
+    // is ordinary reporting; the one thing that must happen at the top is preserving the link back
+    // into the guest's stack (host/fault/guest_caller.hpp).
+    PROSPER_CAPTURE_RBP(entry_rbp);
+    PROSPER_CAPTURE_RSP(entry_rsp);
     fprintf(stderr, "[prosper] guest sceKernelDebugRaiseExceptionOnReleaseMode(code=0x%llx, arg=0x%llx) -- terminating\n",
             (unsigned long long)a0, (unsigned long long)a1);
+    report_guest_fatal_caller(entry_rbp, entry_rsp);
     host::guest_dmem_write_trace_report();
     fflush(nullptr);
     _Exit(0x66);

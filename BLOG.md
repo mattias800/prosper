@@ -19,6 +19,21 @@ from the tracker issues, and still gated, because it is a projection of state ra
 > title's current state — for that, read the tracker. Nothing is ever removed when a title moves on,
 > because the point of a blog is that it records *when* things happened.
 
+## 2026-09-11
+
+### Two titles that could not boot at all now boot, and neither needed a renderer change
+
+*FINAL FANTASY TACTICS – The Ivalice Chronicles* killed itself about a second into every launch. It
+was one call: `sceKernelMprotect` with an address that is not 16 KiB aligned, which prosper handed
+to the host verbatim and the host refused. The title reads that refusal as fatal and walks all the
+way back out of `main`. It now runs, streams its own textures and plays audio — no picture yet, and
+that is the next thing.
+
+*NINJA GAIDEN 4* went from a crash nine log lines in to printing its own `Runtime as started` and
+bringing up video-out at 1920x1080. It needed the last missing member of the PS5 memory-pool API, and
+then told us something worth knowing: it reads its stack canary through a variable prosper had bound
+to a block of prosper's own machine code.
+
 ## 2026-09-10
 
 ### BlazBlue Entropy Effect X was stuck on its publisher logos because one mount point did not exist
