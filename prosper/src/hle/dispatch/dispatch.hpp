@@ -259,6 +259,9 @@ size_t savedata_tx_resource_live_count();
 void register_service_hle();
 // libSceHttp local URI helpers; called by register_builtin_hle().
 void register_http_hle();
+// libSceHttp2: local id lifecycle, recorded settings, and an honest offline failure on the
+// request/response path; called by register_builtin_hle().
+void register_http2_hle();
 // libSceFont/libSceFontFt opaque lifecycle and deterministic metrics; called by register_builtin_hle().
 void register_font_hle();
 // libSceFiber cooperative guest-stack switching; called by register_builtin_hle().

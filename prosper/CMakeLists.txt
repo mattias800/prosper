@@ -1081,6 +1081,12 @@ if(TARGET prosper_core)
   target_link_libraries(test_http PRIVATE prosper_core)
   add_test(NAME http_hle COMMAND test_http)
 
+  # #2894: libSceHttp2 was unregistered, so a request nobody sent reported SCE_OK and its response
+  # getters handed the guest untouched out-parameters.
+  add_executable(test_http2 tests/hle/net/test_http2.cpp)
+  target_link_libraries(test_http2 PRIVATE prosper_core)
+  add_test(NAME http2_hle COMMAND test_http2)
+
   add_executable(test_guard_recursion tests/hle/test_guard_recursion.cpp)
   target_link_libraries(test_guard_recursion PRIVATE prosper_core Threads::Threads)
   add_test(NAME guard_recursion COMMAND test_guard_recursion)
