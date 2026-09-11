@@ -17,6 +17,7 @@
 #include "gpu/present/videoout_present.hpp"   // present_acquire_rendered_frame / present_write_frame
 #include "gpu/execute/gpu_execute.hpp"         // shared_vulkan_context / gpu-present activation (#1270)
 #include "gpu/capture/gpu_capture.hpp"         // request_interactive_gpu_capture (F9 frame grab)
+#include "gpu/diagnostics/gpu_memory_budget_vk.hpp"  // #3533: count what we hold on each heap
 #include "gpu/timeline/gpu_timeline.hpp"        // request_interactive_capture_bundle (F9 whole-frame grab)
 #include "capture_schedule.hpp"        // exact host-frame screenshot calibration trigger
 #include "shared/present/present_blit.hpp"           // GPU scanout handoff: acquire/release the renderer's front image
@@ -294,6 +295,16 @@ bool pick_device(Vk& vk) {
     VKCHECK(vkCreateDevice(vk.phys, &di, nullptr, &vk.device), "vkCreateDevice");
     vkGetDeviceQueue(vk.device, vk.qfamily, 0, &vk.queue);
 
+    // #3533: the app's own VkDevice needs the budget's heap layout too. Without it every allocation
+    // below is unresolvable and the counter DROPS it -- the app's launcher art, staging buffers and
+    // cover images would then be missing from a figure that claims to be prosper's footprint. The
+    // physical device is the same one the renderer registers, so the layout matches and the
+    // first-wins rule in set_device_heaps accepts it.
+    {
+        VkPhysicalDeviceMemoryProperties heap_properties{};
+        vkGetPhysicalDeviceMemoryProperties(vk.phys, &heap_properties);
+        prosper::gpu::set_device_heaps(heap_properties);
+    }
     VkPhysicalDeviceProperties pp; vkGetPhysicalDeviceProperties(vk.phys, &pp);
     fprintf(stderr, "[app] Vulkan device: %s\n", pp.deviceName);
     prosper::frontend::log_vulkan_runtime_device("app", vk.phys, pp);
@@ -363,8 +374,8 @@ bool ensure_stage(Vk& vk, uint32_t w, uint32_t h) {
     // returns before it. Reachable whenever the source dimensions change — a guest that
     // reconfigures VideoOut, or the idle window handing over to a booted game (#1469).
     if (vk.stageBuf || vk.stageImg) vkWaitForFences(vk.device, 1, &vk.inFlight, VK_TRUE, UINT64_MAX);
-    if (vk.stageBuf)   { vkDestroyBuffer(vk.device, vk.stageBuf, nullptr); vkFreeMemory(vk.device, vk.stageMem, nullptr); }
-    if (vk.stageImg)   { vkDestroyImage(vk.device, vk.stageImg, nullptr);  vkFreeMemory(vk.device, vk.stageImgMem, nullptr); }
+    if (vk.stageBuf)   { vkDestroyBuffer(vk.device, vk.stageBuf, nullptr); prosper::gpu::free_device_memory(vk.device, vk.stageMem); }
+    if (vk.stageImg)   { vkDestroyImage(vk.device, vk.stageImg, nullptr);  prosper::gpu::free_device_memory(vk.device, vk.stageImgMem); }
     vk.stageBuf = VK_NULL_HANDLE; vk.stageImg = VK_NULL_HANDLE; vk.stageMapped = nullptr;
     vk.stageW = w; vk.stageH = h; vk.stageCap = (VkDeviceSize)w * h * 4;
 
@@ -377,7 +388,7 @@ bool ensure_stage(Vk& vk, uint32_t w, uint32_t h) {
     VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     ai.allocationSize = mr.size;
     ai.memoryTypeIndex = find_mem(vk.phys, mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    VKCHECK(vkAllocateMemory(vk.device, &ai, nullptr, &vk.stageMem), "stage buffer mem");
+    VKCHECK(prosper::gpu::allocate_device_memory(vk.device, &ai, &vk.stageMem), "stage buffer mem");
     vkBindBufferMemory(vk.device, vk.stageBuf, vk.stageMem, 0);
     vkMapMemory(vk.device, vk.stageMem, 0, vk.stageCap, 0, &vk.stageMapped);
 
@@ -390,7 +401,7 @@ bool ensure_stage(Vk& vk, uint32_t w, uint32_t h) {
     VKCHECK(vkCreateImage(vk.device, &ii, nullptr, &vk.stageImg), "stage image");
     vkGetImageMemoryRequirements(vk.device, vk.stageImg, &mr);
     ai.allocationSize = mr.size; ai.memoryTypeIndex = find_mem(vk.phys, mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    VKCHECK(vkAllocateMemory(vk.device, &ai, nullptr, &vk.stageImgMem), "stage image mem");
+    VKCHECK(prosper::gpu::allocate_device_memory(vk.device, &ai, &vk.stageImgMem), "stage image mem");
     vkBindImageMemory(vk.device, vk.stageImg, vk.stageImgMem, 0);
     return true;
 }
@@ -422,7 +433,7 @@ bool ensure_fps_sample(Vk& vk) {
     ai.allocationSize = mr.size;
     ai.memoryTypeIndex = find_mem(vk.phys, mr.memoryTypeBits,
                                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    if (vkAllocateMemory(vk.device, &ai, nullptr, &vk.sampleMem) != VK_SUCCESS) goto fail;
+    if (prosper::gpu::allocate_device_memory(vk.device, &ai, &vk.sampleMem) != VK_SUCCESS) goto fail;
     vkBindBufferMemory(vk.device, vk.sampleBuf, vk.sampleMem, 0);
     if (vkMapMemory(vk.device, vk.sampleMem, 0, kFpsSampleBytes, 0, &vk.sampleMapped) != VK_SUCCESS)
         goto fail;
@@ -440,7 +451,7 @@ bool ensure_fps_sample(Vk& vk) {
         VkMemoryAllocateInfo iai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         iai.allocationSize = imr.size;
         iai.memoryTypeIndex = find_mem(vk.phys, imr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        if (vkAllocateMemory(vk.device, &iai, nullptr, &vk.sampleImgMem) != VK_SUCCESS) goto fail;
+        if (prosper::gpu::allocate_device_memory(vk.device, &iai, &vk.sampleImgMem) != VK_SUCCESS) goto fail;
         vkBindImageMemory(vk.device, vk.sampleImg, vk.sampleImgMem, 0);
     }
     return true;
@@ -449,9 +460,9 @@ fail:
     fprintf(stderr, "[fps] content sampling unavailable; the HUD will report the presented rate only\n");
     if (vk.sampleMapped) { vkUnmapMemory(vk.device, vk.sampleMem); vk.sampleMapped = nullptr; }
     if (vk.sampleImg)    { vkDestroyImage(vk.device, vk.sampleImg, nullptr); vk.sampleImg = VK_NULL_HANDLE; }
-    if (vk.sampleImgMem) { vkFreeMemory(vk.device, vk.sampleImgMem, nullptr); vk.sampleImgMem = VK_NULL_HANDLE; }
+    if (vk.sampleImgMem) { prosper::gpu::free_device_memory(vk.device, vk.sampleImgMem); vk.sampleImgMem = VK_NULL_HANDLE; }
     if (vk.sampleBuf)    { vkDestroyBuffer(vk.device, vk.sampleBuf, nullptr); vk.sampleBuf = VK_NULL_HANDLE; }
-    if (vk.sampleMem)    { vkFreeMemory(vk.device, vk.sampleMem, nullptr); vk.sampleMem = VK_NULL_HANDLE; }
+    if (vk.sampleMem)    { prosper::gpu::free_device_memory(vk.device, vk.sampleMem); vk.sampleMem = VK_NULL_HANDLE; }
     return false;
 }
 
@@ -3287,9 +3298,9 @@ int main(int argc, char** argv) {
     // released once no submit can still be reading them (#3010).
     if (vk.sampleMapped) vkUnmapMemory(vk.device, vk.sampleMem);
     if (vk.sampleImg)    vkDestroyImage(vk.device, vk.sampleImg, nullptr);
-    if (vk.sampleImgMem) vkFreeMemory(vk.device, vk.sampleImgMem, nullptr);
+    if (vk.sampleImgMem) prosper::gpu::free_device_memory(vk.device, vk.sampleImgMem);
     if (vk.sampleBuf)    vkDestroyBuffer(vk.device, vk.sampleBuf, nullptr);
-    if (vk.sampleMem)    vkFreeMemory(vk.device, vk.sampleMem, nullptr);
+    if (vk.sampleMem)    prosper::gpu::free_device_memory(vk.device, vk.sampleMem);
 
 #ifdef PROSPER_AUDIO_SDL3
     shutdown_sdl3_audio_sink(); // join diagnostics and destroy streams while SDL is alive

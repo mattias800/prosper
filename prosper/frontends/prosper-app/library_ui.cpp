@@ -2,6 +2,7 @@
 // Vulkan device, and decodes cover art with stb_image (#1471).
 #include "library_ui.hpp"
 #include "library_nav.hpp"
+#include "gpu/diagnostics/gpu_memory_budget_vk.hpp"  // #3533: count what we hold on each heap
 
 #include "imgui.h"
 #include "imgui_impl_sdl3.h"
@@ -314,7 +315,7 @@ void LibraryUi::destroy_covers() {
                             [](VkDescriptorSet s) { ImGui_ImplVulkan_RemoveTexture(s); });
         if (c.view)   vkDestroyImageView(device_, c.view, nullptr);
         if (c.image)  vkDestroyImage(device_, c.image, nullptr);
-        if (c.memory) vkFreeMemory(device_, c.memory, nullptr);
+        if (c.memory) prosper::gpu::free_device_memory(device_, c.memory);
     }
     covers_.clear();
 }
@@ -443,7 +444,7 @@ VkDescriptorSet LibraryUi::cover_for(const GameEntry& game) {
         ai.allocationSize = mr.size;
         ai.memoryTypeIndex = find_memory_type(phys_, mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         ok = ai.memoryTypeIndex != UINT32_MAX &&
-             vkAllocateMemory(device_, &ai, nullptr, &cover.memory) == VK_SUCCESS &&
+             prosper::gpu::allocate_device_memory(device_, &ai, &cover.memory) == VK_SUCCESS &&
              vkBindImageMemory(device_, cover.image, cover.memory, 0) == VK_SUCCESS;
     }
     if (ok) {
@@ -461,7 +462,7 @@ VkDescriptorSet LibraryUi::cover_for(const GameEntry& game) {
                                                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                                                   VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
             ok = ai.memoryTypeIndex != UINT32_MAX &&
-                 vkAllocateMemory(device_, &ai, nullptr, &stagingMem) == VK_SUCCESS &&
+                 prosper::gpu::allocate_device_memory(device_, &ai, &stagingMem) == VK_SUCCESS &&
                  vkBindBufferMemory(device_, staging, stagingMem, 0) == VK_SUCCESS;
         }
         if (ok) {
@@ -513,7 +514,7 @@ VkDescriptorSet LibraryUi::cover_for(const GameEntry& game) {
         }
     }
     if (staging)    vkDestroyBuffer(device_, staging, nullptr);
-    if (stagingMem) vkFreeMemory(device_, stagingMem, nullptr);
+    if (stagingMem) prosper::gpu::free_device_memory(device_, stagingMem);
 
     if (ok) {
         VkImageViewCreateInfo ivi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
@@ -550,7 +551,7 @@ VkDescriptorSet LibraryUi::cover_for(const GameEntry& game) {
         }
         if (cover.view)   { vkDestroyImageView(device_, cover.view, nullptr); cover.view = VK_NULL_HANDLE; }
         if (cover.image)  { vkDestroyImage(device_, cover.image, nullptr);    cover.image = VK_NULL_HANDLE; }
-        if (cover.memory) { vkFreeMemory(device_, cover.memory, nullptr);     cover.memory = VK_NULL_HANDLE; }
+        if (cover.memory) { prosper::gpu::free_device_memory(device_, cover.memory);     cover.memory = VK_NULL_HANDLE; }
         cover.set = VK_NULL_HANDLE;
     }
     return cover.set;
