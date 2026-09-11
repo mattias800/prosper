@@ -10,8 +10,10 @@ capture/replay without requiring an importable system Python module.
 
 - **`session_start.py`** — read-only checkout/instruction freshness signal for #2710. See
   [Session startup](../docs/SESSION_START.md). Its hook mode must deliver failures as visible
-  SessionStart context; an unavailable remote must never be reported as current. The regression
-  executes the configured hook argv against both current and stale temporary repositories.
+  SessionStart context; an unavailable remote must never be reported as current, and a host that
+  cannot start any of the interpreters the hook tries must say so rather than exit into silence.
+  The regression executes the hook exactly as configured, in whichever form it is configured,
+  against both current and stale temporary repositories.
 
 - **`evidence/prerender_check.py`** - **run this before publishing a progression screenshot.** It
   answers whether the frame is the game's own PRE-RENDERED picture rather than something prosper
