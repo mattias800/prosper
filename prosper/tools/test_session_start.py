@@ -19,6 +19,49 @@ PROBE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(PROBE)
 
 
+def hook_command(project):
+    """The configured hook, ready to run, with the documented project-dir substitution.
+
+    Both hook forms are accepted so this keeps exercising whatever is configured rather than a
+    remembered shape. Exec form (``command`` plus ``args``) is a real argv and involves no shell.
+    Shell form (``command`` alone) is one string handed to the platform shell -- cmd.exe on
+    Windows, ``sh`` elsewhere -- which is what lets a single committed string try more than one
+    interpreter name, since no name exists on every platform (#3540). Quoted paths keep a project
+    directory containing spaces in one argument under either form.
+    """
+    substitute = lambda text: text.replace("${CLAUDE_PROJECT_DIR}", project)
+    if "args" in HOOK:
+        return [substitute(HOOK["command"])] + [substitute(x) for x in HOOK["args"]], False
+    return substitute(HOOK["command"]), True
+
+
+def interpreters(command):
+    """The interpreter names the configured hook tries, in the order it tries them."""
+    names = []
+    text = command if isinstance(command, str) else " ".join(command)
+    for segment in text.split("||"):
+        head = segment.strip().split(maxsplit=1)
+        if head and head[0] != "echo" and head[0] not in names:
+            names.append(head[0])
+    return names
+
+
+def diagnosis(command, proc):
+    """Say which interpreter could not be started, not merely that a number was not zero."""
+    tried = ", ".join(name + " -> " + (shutil.which(name) or "NOT FOUND")
+                      for name in interpreters(command))
+    return ("The SessionStart hook configured in .claude/settings.json exited "
+            + str(proc.returncode) + " and produced no session context." + chr(10)
+            + "  configured: "
+            + (command if isinstance(command, str) else " ".join(command)) + chr(10)
+            + "  interpreters this host resolves: " + tried + chr(10)
+            + "  hook stderr: " + (proc.stderr.strip() or "(none)") + chr(10)
+            + "A stock python.org install on Windows provides python.exe only, and the name "
+            "python3 there resolves to the Microsoft Store App Execution Alias stub, which exits "
+            "9009 without running anything (#3540). A failure here is a hook configuration "
+            "problem on this host, not a logic failure in session_start.py.")
+
+
 class StartupTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix="session start ")
@@ -56,13 +99,12 @@ class StartupTest(unittest.TestCase):
         return proc.stdout
 
     def hook(self, repo=None):
-        # Execute the actual exec-form hook argv, with the documented project-dir substitution.
-        # No shell is involved: project paths containing spaces stay one argument.
-        project = str(repo or self.repo)
-        argv = [HOOK["command"]] + [x.replace("${CLAUDE_PROJECT_DIR}", project) for x in HOOK["args"]]
-        proc = subprocess.run(argv, input="{}", capture_output=True, text=True,
+        # Execute what Claude Code executes: the command exactly as configured, in the form it is
+        # configured in, with the documented project-dir substitution.
+        command, shell = hook_command(str(repo or self.repo))
+        proc = subprocess.run(command, shell=shell, input="{}", capture_output=True, text=True,
                               timeout=HOOK["timeout"])
-        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.returncode, 0, diagnosis(command, proc))
         output = json.loads(proc.stdout)["hookSpecificOutput"]
         self.assertEqual(output["hookEventName"], "SessionStart")
         return output["additionalContext"]
@@ -180,6 +222,29 @@ class StartupTest(unittest.TestCase):
         self.assertEqual(status, 0, report)
         self.assertIn("OK:", report)
         self.assertEqual(consulted, [], "the worktree root must not come from git path output")
+
+    def test_hook_without_any_interpreter_still_reports_that_it_did_not_run(self):
+        # Discoverability is the point of the hook, not a nicety: its job is to tell a session that
+        # the charter it just loaded may be stale, so a hook that cannot start its interpreter has
+        # to say so in session context. Measured on Windows 2026-09-11 with the previous exec-form
+        # `python3` configuration: the session carried no session-start line and no error of any
+        # kind -- an unarmed instrument reading as a confident silence (#3540).
+        #
+        # PATH is emptied rather than an interpreter renamed. The case under test is a host that
+        # has none of the configured names, and a control built from the interpreters this host
+        # does have could not express it.
+        bare = Path(self.tmp.name) / "no interpreters here"
+        bare.mkdir()
+        command, shell = hook_command(str(self.repo))
+        proc = subprocess.run(command, shell=shell, input="{}", capture_output=True, text=True,
+                              timeout=HOOK["timeout"], env=dict(os.environ, PATH=str(bare)))
+        # Not an assertion about the exit status: the contract is that something reaches stdout,
+        # which is what SessionStart turns into context.
+        self.assertIn("session-start", proc.stdout, proc.stderr)
+        self.assertIn("UNVERIFIED", proc.stdout, proc.stderr)
+        # Self-invalidating control: an interpreter reached despite the emptied PATH would make
+        # this arm vacuous, and reporting the real check's verdict is how that shows up.
+        self.assertNotIn("OK:", proc.stdout)
 
     def test_root_is_found_from_a_subdirectory(self):
         # The relative derivation that replaced --show-toplevel still has to climb: this is the
