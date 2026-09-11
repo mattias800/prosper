@@ -4393,6 +4393,75 @@ int main() {
     printf("  kernel24 mismatches=%u (out[5]=%g expect=%g)\n", bad24, got24.size()==N?got24[5]:-1, got24.size()==N?exp24[5]:-1);
     CHECK(got24.size()==N && bad24==0, "recompiled kernel 24 (unorm8x4 -> 4 normalized floats) correct");
 
+    // Kernel 24sel (#2869): the SAME instruction and the SAME buffer bytes, read through a V# whose
+    // DST_SEL is NOT identity. RDNA2 ISA (document 70648) Table 31 gives BUFFER_LOAD_FORMAT_* a
+    // "DST SEL = resource", so the descriptor -- not the stored order -- decides which component
+    // lands in each returned channel, and SQ_SEL_0 / SQ_SEL_1 name constants rather than components.
+    // Every arm below reuses kernel 24's weighted sum (v1 + 2*v2 + 3*v3 + 4*v4), whose distinct
+    // weights are what make a permutation observable at all: with equal weights a reversal would be
+    // invisible. Before this landed the recompiler read the descriptor's routing nowhere, so all
+    // three arms returned kernel 24's identity answer.
+    auto swizzled_vb = [&](uint32_t s0, uint32_t s1, uint32_t s2, uint32_t s3) {
+        ShaderResource vb{};
+        vb.cls = ResourceClass::VertexBuffer; vb.format = DataFormat::Unorm8;
+        vb.num_components = 4; vb.binding = 3; vb.stride = 4; vb.sgpr_base = 8;
+        vb.swizzle[0] = s0; vb.swizzle[1] = s1; vb.swizzle[2] = s2; vb.swizzle[3] = s3;
+        return vb;
+    };
+    auto run24_swizzled = [&](const ShaderResource& vb, const std::vector<float>& expect,
+                              const char* what) {
+        ShaderResourceTable rt; rt.resources.push_back(vb);
+        const std::vector<uint32_t> spv = recompile_valu(
+            code24, sizeof(code24) / sizeof(code24[0]), 1, /*out_vgpr*/1, &rt);
+        const std::vector<float> got = spv.empty()
+            ? std::vector<float>{}
+            : prosper::test::run_compute(spv, in24, N, N, {}, vbuf24);
+        uint32_t bad = 0;
+        for (uint32_t i = 0; i < N && got.size() == N; ++i)
+            if (std::fabs(got[i] - expect[i]) > 2e-3f) ++bad;
+        CHECK(!spv.empty() && got.size() == N && bad == 0, what);
+    };
+    {
+        // B,G,R,1 -- a full reversal of the three colour channels plus a constant-one alpha
+        // (SQ_SEL_1 -> float 1.0 for a UNORM format, the same "one" the absent-component default
+        // uses). Expected = (b + 2*g + 3*r)/255 + 4*1.0.
+        std::vector<float> expect(N);
+        for (uint32_t i = 0; i < N; ++i) {
+            const float r = (float)(i & 0xFF), g = (float)((i * 3) & 0xFF);
+            const float bl = (float)((i * 5) & 0xFF);
+            expect[i] = (bl + 2.0f * g + 3.0f * r) / 255.0f + 4.0f;
+        }
+        run24_swizzled(swizzled_vb(6, 5, 4, 1), expect,
+                       "MUBUF format load routes B,G,R,SQ_SEL_1 through the V# DST_SEL");
+    }
+    {
+        // Identity colour channels with a constant-ZERO alpha. SQ_SEL_0 must read no memory at all,
+        // so the stored alpha byte is discarded rather than scaled. Expected = (r + 2g + 3b)/255.
+        std::vector<float> expect(N);
+        for (uint32_t i = 0; i < N; ++i) {
+            const float r = (float)(i & 0xFF), g = (float)((i * 3) & 0xFF);
+            const float bl = (float)((i * 5) & 0xFF);
+            expect[i] = (r + 2.0f * g + 3.0f * bl) / 255.0f;
+        }
+        run24_swizzled(swizzled_vb(4, 5, 6, 0), expect,
+                       "MUBUF format load returns constant zero for an SQ_SEL_0 channel");
+    }
+    {
+        // A selector may repeat a component; nothing requires a permutation. All four channels take
+        // stored G. Expected = 10*g/255.
+        std::vector<float> expect(N);
+        for (uint32_t i = 0; i < N; ++i)
+            expect[i] = 10.0f * (float)((i * 3) & 0xFF) / 255.0f;
+        run24_swizzled(swizzled_vb(5, 5, 5, 5), expect,
+                       "MUBUF format load admits a repeated DST_SEL component");
+    }
+    {
+        // SQ_SEL 2 and 3 are reserved: fail visible rather than invent a meaning.
+        ShaderResourceTable rt; rt.resources.push_back(swizzled_vb(4, 5, 2, 7));
+        CHECK(recompile_valu(code24, sizeof(code24) / sizeof(code24[0]), 1, 1, &rt).empty(),
+              "MUBUF format load rejects a reserved DST_SEL selector instead of guessing");
+    }
+
     // The same packed conversion through MTBUF: opcode XYZW and combined format 56 are both carried
     // by the instruction. Resource metadata is intentionally Float32x1 to catch accidental reuse.
     const uint32_t code24mt[] = {
@@ -4413,6 +4482,26 @@ int main() {
         if (std::fabs(got24mt[i] - exp24[i]) > 2e-3f) ++bad24mt;
     CHECK(!spv24mt.empty() && got24mt.size() == N && bad24mt == 0,
           "MTBUF 8_8_8_8_UNORM load applies the instruction's packed conversion");
+
+    // The negative half of #2869, and the arm that keeps the fix from over-reaching: RDNA2 ISA
+    // Table 31 gives TBUFFER_LOAD_FORMAT_* a "DST SEL = identity", so an MTBUF fetch must IGNORE the
+    // descriptor's routing entirely. Same instruction, same bytes, and a V# carrying the reversed
+    // B,G,R,1 selector that visibly moves the MUBUF answer above -- the result must stay identical
+    // to the unrouted MTBUF answer. Without this arm, applying DST_SEL to every format op would look
+    // like a strictly better fix and pass every other test here.
+    ShaderResourceTable rt24mt_sel = rt24mt;
+    rt24mt_sel.resources[0].swizzle[0] = 6; rt24mt_sel.resources[0].swizzle[1] = 5;
+    rt24mt_sel.resources[0].swizzle[2] = 4; rt24mt_sel.resources[0].swizzle[3] = 1;
+    const std::vector<uint32_t> spv24mt_sel = recompile_valu(
+        code24mt, sizeof(code24mt) / sizeof(code24mt[0]), 1, 1, &rt24mt_sel);
+    const std::vector<float> got24mt_sel = spv24mt_sel.empty()
+        ? std::vector<float>{}
+        : prosper::test::run_compute(spv24mt_sel, in24, N, N, {}, vbuf24);
+    uint32_t bad24mt_sel = 0;
+    for (uint32_t i = 0; i < N && got24mt_sel.size() == N; ++i)
+        if (std::fabs(got24mt_sel[i] - exp24[i]) > 2e-3f) ++bad24mt_sel;
+    CHECK(!spv24mt_sel.empty() && got24mt_sel.size() == N && bad24mt_sel == 0,
+          "MTBUF format load ignores the V# DST_SEL and keeps identity routing");
 
     // Store the same constant normalized vector to every lane through MTBUF. Round-to-even maps
     // 0.5*255 to 128, so each destination dword is RGBA = {0,128,255,255}.
@@ -7582,6 +7671,18 @@ int main() {
         for (int c = 0; c < 4; c++) { int got = (st33_out[i] >> (c*8)) & 0xFF; if (std::abs(got - (int)expB[c]) > 1) bad33++; }
     printf("  kernel33 mismatches=%u (buf[0]=0x%08x expect~0xff804000)\n", bad33, st33_out.size()==N?st33_out[0]:0);
     CHECK(st33_out.size() == N && bad33 == 0, "recompiled kernel 33 (unorm8x4 store packs to (0,64,128,255)) correct");
+
+    // Kernel 33sel (#2869): the same store through a ROUTED V#. RDNA2 ISA Table 31 does give
+    // BUFFER_STORE_FORMAT_* a "DST SEL = resource", so this is a gap rather than a settled contract
+    // -- the document does not state which VDATA channel supplies each stored component, nor what a
+    // constant selector means on the way out. A store that ignored the field would put the
+    // components in the wrong order into guest memory with nothing downstream able to notice, so the
+    // lowering fails visibly instead.
+    ShaderResourceTable rt33sel = rt33;
+    rt33sel.resources[0].swizzle[0] = 6; rt33sel.resources[0].swizzle[1] = 5;
+    rt33sel.resources[0].swizzle[2] = 4; rt33sel.resources[0].swizzle[3] = 7;
+    CHECK(recompile_valu(code33, sizeof(code33) / sizeof(code33[0]), 1, 0, &rt33sel).empty(),
+          "MUBUF format store through a routed V# fails visibly instead of storing a wrong order");
 
     // Kernel 34: signed scalar ALU + bitfield mask (SOP2 s_add_i32 0x02 / s_sub_i32 0x03 / s_bfm_b32 0x24).
     //   s0=20 s1=7 | s2=s0+s1=27 | s3=s0-s1=13 | s4=s_bfm(3,2)=((1<<3)-1)<<2=28 |

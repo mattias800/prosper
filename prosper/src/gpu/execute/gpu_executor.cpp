@@ -6594,6 +6594,7 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
         }
         ShaderResource r;
         r.cls = ResourceClass::ConstantBuffer;
+        apply_buffer_descriptor_swizzle(r, d);   // V# DST_SEL routing (#2869)
         if (u.instruction_format != UINT32_MAX) {
             rdna2_buffer_format(u.instruction_format, &r.format, &r.num_components);
             if (r.format == DataFormat::Unknown || r.num_components == 0) continue;
@@ -7280,6 +7281,7 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
             // computed VADDR/stride address; labeling it VertexBuffer makes the recompiler take
             // the gl_VertexIndex shortcut and rejects valid stride-2 uint16 tables (#719).
             r.cls           = is_ps ? ResourceClass::ConstantBuffer : ResourceClass::VertexBuffer;
+            apply_buffer_descriptor_swizzle(r, d);   // V# DST_SEL routing (#2869)
             if (kv.instruction_format != UINT32_MAX) {
                 rdna2_buffer_format(kv.instruction_format, &r.format, &r.num_components);
                 if (r.format == DataFormat::Unknown || r.num_components == 0) continue;
@@ -7418,6 +7420,7 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                     }
                     ShaderResource r;
                     r.cls = ResourceClass::ConstantBuffer;
+                    apply_buffer_descriptor_swizzle(r, d);   // V# DST_SEL routing (#2869)
                     if (u.instruction_format != UINT32_MAX) {
                         rdna2_buffer_format(u.instruction_format, &r.format, &r.num_components);
                         if (r.format == DataFormat::Unknown || r.num_components == 0) continue;
