@@ -80,8 +80,12 @@ python3 tools/pixel_history/pixel_history.py "$run_dir"/frame_frame*.rdc \
 ```
 
 It reports `NOTHING_DREW`, `ALL_REJECTED` (naming the test that rejected), `SHADER_WROTE_BLACK`,
-`STORE_LOST_IT`, `PIXEL_WAS_WRITTEN`, `CLEARED_AFTER_DRAW`, `OUTPUT_UNTRUSTED` or `VALUE_UNKNOWN`,
-with the per-event detail behind it, and defaults to the brightest pixel rather than the centre.
+`STORE_LOST_IT`, `PIXEL_WAS_WRITTEN`, `CLEARED_AFTER_DRAW`, `OUTPUT_UNTRUSTED`, `VALUE_UNKNOWN` or
+`TRANSFER_WROTE_PIXEL`, with the per-event detail behind it, and defaults to the brightest pixel
+rather than the centre. `TRANSFER_WROTE_PIXEL` means a copy, blit, resolve or mip generation wrote
+the pixel and names which — the value came from that operation's *source*, so the investigation
+belongs wherever the source was produced and not in a shader (instrument trap 279). A compute
+shader writing a storage image is **not** in that set and still reports as shader work.
 `VALUE_UNKNOWN` is a refusal, not a failure: RenderDoc marks a value it has no data for with a
 `0xdeadbeef` sentinel, that sentinel used to arrive as a colour whose `max(rgb)` is exactly `0.0`,
 and an absence of information was therefore reported as a measured black (instrument trap 278).

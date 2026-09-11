@@ -20,6 +20,20 @@
  *               through a colorWriteMask=0
  *               pipeline                   -> STORE_LOST_IT, final BLACK
  *   E  (48,48)  one draw, discarded        -> ALL_REJECTED (with the clear present)
+ *   F  (54, 4)  a BLIT landing black over
+ *               B's black draw            -> TRANSFER_WROTE_PIXEL
+ *   F' (61, 4)  the same blit's other half,
+ *               landing ORANGE            -> TRANSFER_WROTE_PIXEL, and it is what proves
+ *                                            the blit ran at all
+ *
+ * Region F is the third KIND of event, and it is why F' has to exist. RenderDoc pushes a
+ * copy/blit/resolve into the pixel history through the same "passed, no test evaluated"
+ * branch as a clear, so a blit landing black over a black draw was reported as
+ * SHADER_WROTE_BLACK -- a pixel no shader wrote, sent to resource binding and shaders. But
+ * black over black is invisible to a self-check that only reads pixels: the region looks
+ * identical whether the blit happened or not. So the blit's source is TWO-COLOURED, and
+ * F' reads the half that can only be orange if the blit really landed -- the same trick
+ * A' plays for A's first arm. A control that cannot see its own arm guards nothing.
  *
  * Region A's arms, in submission order, at (16,16):
  *
@@ -43,6 +57,11 @@
  * per-event outcome list, and it is the check that fails if a rejection is misattributed.
  * Do not read a green self-check as validating the tool.
  *
+ * The RW-resource half of RenderDoc's IsDirectWrite is deliberately NOT built here, and
+ * must not be added: a compute shader writing a storage image IS shader work, and the tool
+ * is required to keep sending the reader to the shader for it. The distinction under test
+ * is fixed-function transfer versus programmable write.
+ *
  * NOTHING_DREW is not constructed here. Every scissored draw still produces a pixel-history
  * entry at pixels outside its rectangle, so no pixel of this target has an empty history.
  * That verdict is exercised separately, against a capture whose geometry misses the pixel.
@@ -61,6 +80,12 @@
 #define DIM      64u
 #define PROBE_X  32u
 #define PROBE_Y  32u
+/* Region F: a 12-row band at the top right, blitted from a SRC_DIM square whose left half
+ * is black and right half orange. It sits inside region B and clear of B's own probe at
+ * (48,16), so it adds a verdict without taking one away. */
+#define SRC_DIM  16u
+#define F_X0     52u
+#define F_H      12u
 
 static const uint32_t kVertSpv[] = {
 #include "control_vert_spv.h"
@@ -186,7 +211,12 @@ int main(void)
     ii.mipLevels = 1; ii.arrayLayers = 1;
     ii.samples = VK_SAMPLE_COUNT_1_BIT;
     ii.tiling = VK_IMAGE_TILING_OPTIMAL;
-    ii.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    /* TRANSFER_DST is needed by the blit that builds region F -- and was needed all
+     * along: vkCmdClearColorImage below already required it
+     * (VUID-vkCmdClearColorImage-image-00002) and no validation layer is enabled here to
+     * say so. */
+    ii.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+               VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     r = vkCreateImage(g_dev, &ii, NULL, &color_img);
     if (r) die("vkCreateImage(color)", r);
@@ -197,6 +227,21 @@ int main(void)
     r = vkCreateImage(g_dev, &di, NULL, &depth_img);
     if (r) die("vkCreateImage(depth)", r);
 
+    /* ---- the blit source: two colours, so F' can prove the blit landed -------------- */
+    VkFormatProperties fp;
+    vkGetPhysicalDeviceFormatProperties(g_pd, VK_FORMAT_R8G8B8A8_UNORM, &fp);
+    require((fp.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT) &&
+            (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT),
+            "R8G8B8A8_UNORM cannot be blitted on this device; region F cannot be built");
+
+    VkImage blit_src;
+    VkDeviceMemory blit_mem;
+    VkImageCreateInfo bi = ii;
+    bi.extent.width = SRC_DIM; bi.extent.height = SRC_DIM;
+    bi.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    r = vkCreateImage(g_dev, &bi, NULL, &blit_src);
+    if (r) die("vkCreateImage(blit source)", r);
+
     VkMemoryRequirements mr;
     VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     vkGetImageMemoryRequirements(g_dev, color_img, &mr);
@@ -206,6 +251,14 @@ int main(void)
     r = vkAllocateMemory(g_dev, &ai, NULL, &color_mem);
     if (r) die("vkAllocateMemory(color)", r);
     vkBindImageMemory(g_dev, color_img, color_mem, 0);
+
+    vkGetImageMemoryRequirements(g_dev, blit_src, &mr);
+    ai.allocationSize = mr.size;
+    ai.memoryTypeIndex = memory_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    require(ai.memoryTypeIndex != UINT32_MAX, "no device-local memory type (blit source)");
+    r = vkAllocateMemory(g_dev, &ai, NULL, &blit_mem);
+    if (r) die("vkAllocateMemory(blit source)", r);
+    vkBindImageMemory(g_dev, blit_src, blit_mem, 0);
 
     vkGetImageMemoryRequirements(g_dev, depth_img, &mr);
     ai.allocationSize = mr.size;
@@ -387,6 +440,39 @@ int main(void)
     if (r) die("vkAllocateMemory(readback)", r);
     vkBindBufferMemory(g_dev, readback, readback_mem, 0);
 
+    /* The source content: left half BLACK, right half ORANGE. Black is the half that
+     * reproduces the defect (a blit landing black, read as a shader computing black);
+     * orange is the half that proves the blit happened, since black over black is
+     * indistinguishable from no blit at all. */
+    VkBufferCreateInfo sbi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    sbi.size = (VkDeviceSize)SRC_DIM * SRC_DIM * 4;
+    sbi.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    VkBuffer staging;
+    r = vkCreateBuffer(g_dev, &sbi, NULL, &staging);
+    if (r) die("vkCreateBuffer(staging)", r);
+    vkGetBufferMemoryRequirements(g_dev, staging, &mr);
+    ai.allocationSize = mr.size;
+    ai.memoryTypeIndex = memory_type(mr.memoryTypeBits,
+                                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                     VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    require(ai.memoryTypeIndex != UINT32_MAX, "no host-visible memory type (staging)");
+    VkDeviceMemory staging_mem;
+    r = vkAllocateMemory(g_dev, &ai, NULL, &staging_mem);
+    if (r) die("vkAllocateMemory(staging)", r);
+    vkBindBufferMemory(g_dev, staging, staging_mem, 0);
+    void *src_pixels = NULL;
+    r = vkMapMemory(g_dev, staging_mem, 0, VK_WHOLE_SIZE, 0, &src_pixels);
+    if (r) die("vkMapMemory(staging)", r);
+    for (uint32_t y = 0; y < SRC_DIM; ++y)
+        for (uint32_t x = 0; x < SRC_DIM; ++x) {
+            unsigned char *px = (unsigned char *)src_pixels + (y * SRC_DIM + x) * 4;
+            px[0] = x < SRC_DIM / 2 ? 0 : 255;
+            px[1] = x < SRC_DIM / 2 ? 0 : 128;
+            px[2] = 0;
+            px[3] = 255;
+        }
+    vkUnmapMemory(g_dev, staging_mem);
+
     /* ---- the regions ---------------------------------------------------------------- */
     const VkRect2D A      = {{0, 0}, {32, 32}};    /* the sequence                        */
     const VkRect2D A_wide = {{0, 0}, {32, 40}};    /* A plus the strip only arm 1 paints  */
@@ -407,13 +493,16 @@ int main(void)
     };
 
     /* What each region must look like afterwards, and the verdict it exists to construct. */
-    const struct probe probes[5] = {
+    const struct probe probes[] = {
         {"A  sequence",   16, 16, {255, 255,   0, 255}, "PIXEL_WAS_WRITTEN"},
         {"A' arm-1 only", 16, 36, {  0, 255,   0, 255}, "(proves arm 1 rendered)"},
         {"B  black draw", 48, 16, {  0,   0,   0, 255}, "SHADER_WROTE_BLACK"},
         {"C  no write",   16, 48, {  0,   0,   0, 255}, "STORE_LOST_IT"},
         {"E  all killed", 48, 48, {  0,   0,   0, 255}, "ALL_REJECTED"},
+        {"F  blit black", 54,  4, {  0,   0,   0, 255}, "TRANSFER_WROTE_PIXEL"},
+        {"F' blit orange", 61, 4, {255, 128,   0, 255}, "(proves the blit landed)"},
     };
+    const int nprobes = (int)(sizeof(probes) / sizeof(probes[0]));
 
     VkCommandPoolCreateInfo cpi = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     cpi.queueFamilyIndex = g_queue_family;
@@ -465,6 +554,31 @@ int main(void)
     VkClearColorValue black = {{0.25f, 0.0f, 0.0f, 1.0f}};
     vkCmdClearColorImage(cmd, color_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black,
                          1, &pre.subresourceRange);
+    /* Fill the blit source in the same submit. It is a different resource, so it adds
+     * nothing to the colour target's own usage list. */
+    VkImageMemoryBarrier sb = pre;
+    sb.image = blit_src;
+    sb.srcAccessMask = 0;
+    sb.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    sb.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    sb.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &sb);
+    VkBufferImageCopy upload = {0};
+    upload.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    upload.imageSubresource.layerCount = 1;
+    upload.imageExtent.width = SRC_DIM;
+    upload.imageExtent.height = SRC_DIM;
+    upload.imageExtent.depth = 1;
+    vkCmdCopyBufferToImage(cmd, staging, blit_src, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                           1, &upload);
+    sb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    sb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    sb.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    sb.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &sb);
+
     pre.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     pre.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
                         VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
@@ -508,9 +622,9 @@ int main(void)
 
     VkImageMemoryBarrier imb = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
     imb.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-    imb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    imb.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     imb.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-    imb.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    imb.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     imb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     imb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     imb.image = color_img;
@@ -518,6 +632,33 @@ int main(void)
     imb.subresourceRange.levelCount = 1;
     imb.subresourceRange.layerCount = 1;
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &imb);
+
+    /* REGION F: a blit into the finished target, AFTER every draw. This is the event the
+     * tool used to call a draw. It lands over region B, whose own draw computed black, so
+     * a tool that misreads it reports SHADER_WROTE_BLACK -- the exact wrong answer, for a
+     * pixel no shader wrote. NEAREST so each destination texel is one source texel and the
+     * two halves stay exactly black and exactly orange. */
+    VkImageBlit blit = {0};
+    blit.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    blit.srcSubresource.layerCount = 1;
+    blit.srcOffsets[1].x = SRC_DIM; blit.srcOffsets[1].y = SRC_DIM;
+    blit.srcOffsets[1].z = 1;
+    blit.dstSubresource = blit.srcSubresource;
+    blit.dstOffsets[0].x = (int32_t)F_X0;
+    blit.dstOffsets[0].y = 0;
+    blit.dstOffsets[1].x = (int32_t)DIM;
+    blit.dstOffsets[1].y = (int32_t)F_H;
+    blit.dstOffsets[1].z = 1;
+    vkCmdBlitImage(cmd, blit_src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                   color_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
+                   VK_FILTER_NEAREST);
+
+    imb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    imb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    imb.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    imb.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
                          VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &imb);
 
     VkBufferImageCopy region = {0};
@@ -542,7 +683,7 @@ int main(void)
     r = vkMapMemory(g_dev, readback_mem, 0, VK_WHOLE_SIZE, 0, &mapped);
     if (r) die("vkMapMemory", r);
     int ok = 1;
-    for (int i = 0; i < 5; ++i) {
+    for (int i = 0; i < nprobes; ++i) {
         const unsigned char *px =
             (const unsigned char *)mapped + (probes[i].y * DIM + probes[i].x) * 4;
         int good = memcmp(px, probes[i].want, 4) == 0;
