@@ -94,8 +94,9 @@ void usage(const char* argv0) {
                  "                                      --dump-realized-shader)\n"
                  "  --dump-compute N PATH               recompiled SPIR-V for dispatch N\n"
                  "  --dump-compute-raw N PATH           the guest's raw RDNA2 for dispatch N\n"
-                 "\nPROSPER_SHADER_DUMP_SUCCESS is a live-renderer variable and does NOTHING\n"
-                 "here; use the per-draw flags above.\n");
+                 "\nPROSPER_SHADER_DUMP_SUCCESS is honoured only in the modes that RECOMPILE\n"
+                 "(--recompile-raw, --retry-failed-*); a plain replay runs stored SPIR-V and\n"
+                 "writes nothing for it. Use the per-draw flags above.\n");
 }
 
 std::vector<uint8_t> inspect_rtt_seed(const prosper::gpu::GpuCaptureRttSeed& seed) {
@@ -2166,17 +2167,6 @@ static bool clear_environment(const char* name) {
 }
 
 int main(int argc, char** argv) {
-    // #3372: every caller of maybe_dump_successful_shader() lives in the live executor
-    // (src/gpu/execute/gpu_executor.cpp); the replay path never reaches one. Saying so is not
-    // cosmetic -- an empty dump directory reads as "that program never compiled", which is
-    // exactly the trap src/gpu/diagnostics/AGENTS.md warns about.
-    if (std::getenv("PROSPER_SHADER_DUMP_SUCCESS"))
-        std::fprintf(stderr,
-                     "[gpureplay] PROSPER_SHADER_DUMP_SUCCESS is set but does NOTHING here: it is a\n"
-                     "            live-renderer variable, and gpu_replay does not reach its\n"
-                     "            hook. No file will be written for it. Use --dump-shader\n"
-                     "            DRAW:vs|fs (recompiled SPIR-V) or --dump-shader-raw\n"
-                     "            DRAW:vs|vs-main|fs (guest RDNA2) instead.\n");
     bool inspect = false, inspect_only = false, validate_only = false, allow_mismatch = false;
     bool recompile_raw = false;
     bool graph_only = false, bundle_zero_boundary = false, bundle_ds_summary = false;
@@ -2449,6 +2439,26 @@ int main(int argc, char** argv) {
     }
     if (legacy_htile_before_stencil)
         set_environment("PROSPER_GPU_REPLAY_LEGACY_HTILE_BEFORE_STENCIL", "1");
+    // #3372, corrected in review: whether gpu_replay reaches maybe_dump_successful_shader()
+    // depends on the MODE, and the first version of this notice asserted it never does.
+    // A plain replay executes the capsule's STORED SPIR-V and recompiles nothing, so the hook
+    // is never called and the directory stays empty -- which reads as "that program never
+    // compiled", the trap src/gpu/diagnostics/AGENTS.md warns about. But --recompile-raw and
+    // --retry-failed-* DO recompile, through tools/gpu_replay/compute_recompile.hpp ->
+    // gpu::recompile_compute_shader_cached (gpu_executor.cpp), which calls the hook on every
+    // exit path -- so under those modes the variable works. Warn only when this invocation
+    // genuinely will not reach it; a notice that is wrong in one mode is the same defect at the
+    // point of use that this change exists to remove.
+    const bool replay_recompiles = recompile_raw || !retry_failed_chain_spec.empty() ||
+                                   !retry_failed_stage_spec.empty();
+    if (std::getenv("PROSPER_SHADER_DUMP_SUCCESS") && !replay_recompiles)
+        std::fprintf(stderr,
+                     "[gpureplay] PROSPER_SHADER_DUMP_SUCCESS is set, but a plain replay runs the\n"
+                     "            capsule's STORED SPIR-V and recompiles nothing, so no file\n"
+                     "            will be written for it. --recompile-raw and --retry-failed-*\n"
+                     "            DO recompile and DO honour it. For one shader by draw, use\n"
+                     "            --dump-shader DRAW:vs|fs (recompiled SPIR-V) or\n"
+                     "            --dump-shader-raw DRAW:vs|vs-main|fs (guest RDNA2).\n");
     // An argument that silently does nothing is the class this PR spent three rounds removing.
     if (resource_override_submit_no && !resource_override_requested) {
         std::fprintf(stderr,

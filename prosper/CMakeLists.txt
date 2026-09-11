@@ -4034,18 +4034,6 @@ if(TARGET prosper_live_renderer AND TARGET prosper_core)
   add_test(NAME present_blit COMMAND test_present_blit)
 endif()
 
-# ---------------------------------------------------------------------------
-# Per-case scratch directory for every registered test (#1613).
-#
-# Tests that must touch the real filesystem take their paths from
-# tests/fixtures/test_scratch.h, which reads PROSPER_TEST_SCRATCH_DIR. Giving each ctest
-# *case* its own root is what makes `ctest -j` safe: one test binary is
-# sometimes registered as several cases (game_compute_exec and
-# game_compute_exec_no_adaptive_storage_result are the same executable), so
-# per-binary uniqueness is not enough. The helper adds a pid component
-# underneath, which separates concurrent ctest invocations from different
-# worktrees. The root is inside the build directory, never /tmp — see the
-# header for why that matters on this machine.
 # #3372: gpu_replay's two graphics shader dumps produce OPPOSITE things -- --dump-shader writes
 # prosper's recompiled SPIR-V, --dump-shader-raw writes the guest RDNA2 that fed it -- and the
 # flag names alone do not say which way round. An investigation read the RDNA2 out of the flag
@@ -4063,6 +4051,19 @@ if(TARGET gpu_replay AND Python3_Interpreter_FOUND)
     "PROSPER_GPU_REPLAY_BIN=$<TARGET_FILE:gpu_replay>")
 endif()
 
+
+# ---------------------------------------------------------------------------
+# Per-case scratch directory for every registered test (#1613).
+#
+# Tests that must touch the real filesystem take their paths from
+# tests/fixtures/test_scratch.h, which reads PROSPER_TEST_SCRATCH_DIR. Giving each ctest
+# *case* its own root is what makes `ctest -j` safe: one test binary is
+# sometimes registered as several cases (game_compute_exec and
+# game_compute_exec_no_adaptive_storage_result are the same executable), so
+# per-binary uniqueness is not enough. The helper adds a pid component
+# underneath, which separates concurrent ctest invocations from different
+# worktrees. The root is inside the build directory, never /tmp — see the
+# header for why that matters on this machine.
 #
 # This must stay at the very end of the file: it snapshots the DIRECTORY TESTS
 # property, so any add_test() below it would not be covered. A test that did get

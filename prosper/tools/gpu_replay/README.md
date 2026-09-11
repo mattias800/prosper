@@ -626,10 +626,14 @@ The VS/FS streams use the same content-addressed 64 KiB-per-stage,
 64 MiB-total store as failed-shader diagnostics. Captures v1-v18 remain readable; because they did not retain
 realized-stage source identities, this command reports the raw stream as unavailable instead of guessing.
 
-`PROSPER_SHADER_DUMP_SUCCESS=DIR` does **not** work under `gpu_replay` — every caller of its
-hook is in the live executor, which the replay path never reaches. `gpu_replay` now says so on
-startup when the variable is set, because an empty directory otherwise reads as “that program
-never compiled”. Use the per-draw flags above instead.
+`PROSPER_SHADER_DUMP_SUCCESS=DIR` is honoured **only in the modes that recompile**. A plain replay
+runs the capsule's stored SPIR-V and recompiles nothing, so nothing calls the hook and the
+directory stays empty — which reads as “that program never compiled”, the trap
+`src/gpu/diagnostics/AGENTS.md` warns about. `--recompile-raw` and `--retry-failed-*` **do**
+recompile, through `compute_recompile.hpp` → `gpu::recompile_compute_shader_cached`, which
+calls the hook on every exit path, so the variable works under those. `gpu_replay` warns on
+startup when the variable is set and the invocation will not reach it. For one shader by draw, use
+the per-draw flags above.
 
 Selected draw ranges and ordered prefixes write the BMP at the final selected draw target's extent when
 the returned RGBA byte count confirms that native size. Presentation-scaled replays retain the capsule's

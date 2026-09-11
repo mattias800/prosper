@@ -79,16 +79,58 @@ check("alias" in raw_block and "--dump-realized-shader" in raw_block,
 compute_raw = legend_line("--dump-compute-raw")
 check("RDNA2" in compute_raw, "--dump-compute-raw is described as producing the guest RDNA2")
 
+# The legend must not restate the absolute claim the notice used to make.
+check("only in the modes that RECOMPILE" in usage,
+      "the usage legend scopes PROSPER_SHADER_DUMP_SUCCESS to the recompiling modes")
+
 # An armed-but-inert diagnostic must announce itself. An empty output directory otherwise reads as
 # "that program never compiled" -- the trap src/gpu/diagnostics/AGENTS.md warns about.
-armed = run([], {"PROSPER_SHADER_DUMP_SUCCESS": "ignored-by-this-tool"})
-check("PROSPER_SHADER_DUMP_SUCCESS" in armed,
-      "gpu_replay says PROSPER_SHADER_DUMP_SUCCESS is set when it is")
-check("NOTHING" in armed or "does not" in armed or "no file" in armed.lower(),
-      "gpu_replay says the variable will produce no file here")
+#
+# But it is inert only in SOME modes, and the first version of this notice claimed it was inert
+# in all of them. --recompile-raw and --retry-failed-* recompile through compute_recompile.hpp ->
+# gpu::recompile_compute_shader_cached, which calls maybe_dump_successful_shader on every exit
+# path, so the variable genuinely works there. A notice that is wrong in one mode is the same
+# wrong-text-at-the-point-of-use defect this whole file exists to guard, one level up -- so both
+# directions are pinned below, not just the warning.
+
+def notice_block(text):
+    """Just the PROSPER_SHADER_DUMP_SUCCESS notice, never the usage synopsis.
+
+    Measured necessity, not caution: searching the whole output for '--recompile-raw' PASSES
+    against the pre-fix binary, because the synopsis lists the flag. Two of these arms were
+    green in both directions until this helper existed -- the same defect they are guarding.
+    """
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if "PROSPER_SHADER_DUMP_SUCCESS" in line and line.lstrip().startswith("[gpureplay]"):
+            block = [lines[i]]
+            for cont in lines[i + 1:]:
+                if not cont.startswith("            "):
+                    break
+                block.append(cont)
+            return " ".join(block)
+    return ""
+
+
+armed_all = run([], {"PROSPER_SHADER_DUMP_SUCCESS": "ignored-on-this-path"})
+armed = notice_block(armed_all)
+check(armed != "",
+      "a plain replay says PROSPER_SHADER_DUMP_SUCCESS is set when it is")
+check("no file" in armed.lower() or "NOTHING" in armed,
+      "...and says no file will be written for it on that path")
+check("--recompile-raw" in armed,
+      "...and names a mode that DOES honour it, rather than implying it never works")
+
+# The other direction. A capture path that does not exist is fine: the notice is emitted after
+# argument parsing and before the capture is opened, so if it were unconditional it would still
+# appear here. It must not.
+recompiling = run(["--recompile-raw", "no-such-capture.prgcap"],
+                  {"PROSPER_SHADER_DUMP_SUCCESS": "honoured-on-this-path"})
+check(notice_block(recompiling) == "",
+      "--recompile-raw does NOT claim the variable is inert -- it honours it")
 
 quiet = run([])
-check("is set but does NOTHING here" not in quiet,
+check(notice_block(quiet) == "",
       "the notice stays silent when the variable is unset")
 
 print("%d failure(s)" % len(failures))
