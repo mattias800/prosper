@@ -241,6 +241,11 @@ enum class SaveDataMountOutcome { NotFound, Exists, Opened, Created };
 bool savedata_dirname_ok(const std::string& dirname);
 SaveDataMountOutcome savedata0_mount(const char* dirname, SaveDataMountPolicy policy);
 bool savedata0_umount();
+// The host directory the guest's "/savedata0" currently resolves to, or "" when nothing is mounted.
+// The save's parameter block (sceSaveDataSetParam/GetParam, #2786) is stored inside that directory,
+// so it needs the same answer the file mount gives rather than recomposing the path from a dirName
+// the caller would have to keep its own copy of.
+std::string savedata0_mounted_dir();
 std::vector<std::string> savedata0_list_dirs();   // existing save dirs under the host save root (#299)
 // Read a virtual save slot's param.sfo modification time (or directory time if absent). Rejects names
 // that are not a single guest directory component; used only for SaveDataDialog date-focus ordering.

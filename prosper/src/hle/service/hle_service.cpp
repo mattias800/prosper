@@ -6,6 +6,7 @@
 #include "hle/dispatch/dispatch.hpp"
 #include "hle/service/hle_addcontent.hpp"
 #include "hle/fs/save_paths.hpp"   // per-title save roots (#2734)
+#include "hle/fs/save_param.hpp"   // the save's parameter block (#2786)
 #include "hle/util/hle_json2.hpp"
 #include "hle/dispatch/nid.hpp"
 #include "hle/kernel/sce_errno.hpp"   // libkernel error encoding (libSceRandom reject arms)
@@ -4659,6 +4660,185 @@ HLE(s_savedata_mountinfo) {
     *(uint64_t*)(i + 0) = 0x40000; *(uint64_t*)(i + 8) = 0x40000;   // blocks / freeBlocks
     return 0;
 }
+// --- sceSaveDataSetParam / sceSaveDataGetParam (#2786) -----------------------------------------
+// Both were unregistered, so both reached the dispatcher's `return 0` -- and 0 is SCE_OK here. A
+// title was told its save metadata had been written when nothing was, and read back a zeroed block
+// it could not tell apart from what it had set. Observed on Sonic Frontiers (PPSA03831) as the only
+// unimplemented NID on a route that reaches GameModeStage; called once per boot.
+//
+// ABI (PS4-inherited; the NIDs are the ones libSceSaveData / libSceSaveData_native export on 3.20):
+//   sceSaveDataSetParam(const SceSaveDataMountPoint* mp, SceSaveDataParamType type,
+//                       const void* buf, size_t bufSize)
+//   sceSaveDataGetParam(const SceSaveDataMountPoint* mp, SceSaveDataParamType type,
+//                       void* buf, size_t bufSize, size_t* gotSize)
+// SceSaveDataParam, the TYPE_ALL block, is 1328 bytes: title[128], subTitle[128], detail[1024],
+// userParam u32, pad u32, mtime (time_t), reserved[32].
+// CONFIDENCE: HIGH on the NIDs (PS5 3.20 export table) and on the two signatures' argument order;
+// MED on the exact SceSaveDataParam field offsets, which come from the published PS4 ABI rather
+// than from a live capture of a PS5 title reading one. Every offset is a named constant asserted in
+// tests/hle/test_savedata_param.cpp, so a future capture that contradicts one changes a constant
+// and reddens a named arm rather than silently disagreeing with the guest.
+enum : uint32_t {
+    SAVE_DATA_PARAM_TYPE_ALL = 0,
+    SAVE_DATA_PARAM_TYPE_TITLE = 1,
+    SAVE_DATA_PARAM_TYPE_SUB_TITLE = 2,
+    SAVE_DATA_PARAM_TYPE_DETAIL = 3,
+    SAVE_DATA_PARAM_TYPE_USER_PARAM = 4,
+    SAVE_DATA_PARAM_TYPE_MTIME = 5,
+};
+constexpr size_t SAVE_DATA_TITLE_MAXSIZE = 128;
+constexpr size_t SAVE_DATA_SUBTITLE_MAXSIZE = 128;
+constexpr size_t SAVE_DATA_DETAIL_MAXSIZE = 1024;
+constexpr size_t SAVE_DATA_PARAM_ALL_SIZE = 1328;
+constexpr size_t SAVE_DATA_PARAM_OFF_TITLE = 0;
+constexpr size_t SAVE_DATA_PARAM_OFF_SUBTITLE = 128;
+constexpr size_t SAVE_DATA_PARAM_OFF_DETAIL = 256;
+constexpr size_t SAVE_DATA_PARAM_OFF_USER_PARAM = 1280;
+constexpr size_t SAVE_DATA_PARAM_OFF_MTIME = 1288;
+// From the same published table this file's other savedata codes come from. Spelled out rather than
+// folded into a near-miss: "no save is mounted" and "the host write failed" are different facts, and
+// answering either with PARAMETER would send a title looking at its own arguments.
+// CONFIDENCE: MED on both numeric values; HIGH on the polarity, which is what a title branches on.
+constexpr uint64_t SAVE_DATA_ERR_NOT_MOUNTED = 0x809F0004ull;
+constexpr uint64_t SAVE_DATA_ERR_INTERNAL    = 0x809F000Bull;
+
+// The byte count TYPE_<x> transfers. 0 means "not a type this can answer", which is refused rather
+// than guessed: answering an unknown type with silent success is exactly what #2786 was.
+static size_t savedata_param_type_size(uint32_t type) {
+    switch (type) {
+        case SAVE_DATA_PARAM_TYPE_ALL:        return SAVE_DATA_PARAM_ALL_SIZE;
+        case SAVE_DATA_PARAM_TYPE_TITLE:      return SAVE_DATA_TITLE_MAXSIZE;
+        case SAVE_DATA_PARAM_TYPE_SUB_TITLE:  return SAVE_DATA_SUBTITLE_MAXSIZE;
+        case SAVE_DATA_PARAM_TYPE_DETAIL:     return SAVE_DATA_DETAIL_MAXSIZE;
+        case SAVE_DATA_PARAM_TYPE_USER_PARAM: return sizeof(uint32_t);
+        case SAVE_DATA_PARAM_TYPE_MTIME:      return sizeof(int64_t);
+        default:                              return 0;
+    }
+}
+// A guest string field is a fixed-size char array that may be exactly full, i.e. unterminated.
+static std::string savedata_param_text(const uint8_t* field, size_t capacity) {
+    size_t n = 0;
+    while (n < capacity && field[n]) n++;
+    return std::string((const char*)field, n);
+}
+static void savedata_param_write_text(uint8_t* field, size_t capacity, const std::string& value) {
+    memset(field, 0, capacity);
+    const size_t n = value.size() < capacity - 1 ? value.size() : capacity - 1;
+    memcpy(field, value.data(), n);
+}
+// The mount-point argument is SceSaveDataMountPoint { char data[16] }. Accept only the mount this
+// build serves, so a title passing a different one is refused instead of having its parameter block
+// applied to whatever happens to be mounted.
+static bool savedata_mount_point_ok(uint64_t mount_point_va) {
+    if (!mount_point_va) return false;
+    const char* mp = (const char*)PW(mount_point_va);
+    return strncmp(mp, "/savedata0", 16) == 0;
+}
+
+HLE(s_savedata_setparam) {
+    svc_log("sceSaveDataSetParam", a0,a1,a2,a3,a4,a5);
+    const uint32_t type = (uint32_t)a1;
+    const size_t need = savedata_param_type_size(type);
+    if (!savedata_mount_point_ok(a0) || !a2 || !need || a3 < need) return SAVE_DATA_ERR_PARAMETER;
+    const std::string dir = savedata0_mounted_dir();
+    if (dir.empty()) return SAVE_DATA_ERR_NOT_MOUNTED;
+
+    // Read-modify-write: a title sets TITLE and SUBTITLE in separate calls, so setting one field
+    // must not erase the others. An absent block starts empty rather than from a guess.
+    SaveDataParam param;
+    save_param_load(dir, param);
+    const uint8_t* buf = (const uint8_t*)PW(a2);
+    bool mtime_from_guest = false;
+    switch (type) {
+        case SAVE_DATA_PARAM_TYPE_ALL: {
+            param.title = savedata_param_text(buf + SAVE_DATA_PARAM_OFF_TITLE,
+                                              SAVE_DATA_TITLE_MAXSIZE);
+            param.sub_title = savedata_param_text(buf + SAVE_DATA_PARAM_OFF_SUBTITLE,
+                                                  SAVE_DATA_SUBTITLE_MAXSIZE);
+            param.detail = savedata_param_text(buf + SAVE_DATA_PARAM_OFF_DETAIL,
+                                               SAVE_DATA_DETAIL_MAXSIZE);
+            memcpy(&param.user_param, buf + SAVE_DATA_PARAM_OFF_USER_PARAM, sizeof(uint32_t));
+            int64_t mtime = 0;
+            memcpy(&mtime, buf + SAVE_DATA_PARAM_OFF_MTIME, sizeof(int64_t));
+            // A zeroed mtime in an otherwise filled-in block means "you time-stamp it", which is
+            // what the console does on write.
+            if (mtime > 0) { param.mtime = mtime; mtime_from_guest = true; }
+            break;
+        }
+        case SAVE_DATA_PARAM_TYPE_TITLE:
+            param.title = savedata_param_text(buf, SAVE_DATA_TITLE_MAXSIZE); break;
+        case SAVE_DATA_PARAM_TYPE_SUB_TITLE:
+            param.sub_title = savedata_param_text(buf, SAVE_DATA_SUBTITLE_MAXSIZE); break;
+        case SAVE_DATA_PARAM_TYPE_DETAIL:
+            param.detail = savedata_param_text(buf, SAVE_DATA_DETAIL_MAXSIZE); break;
+        case SAVE_DATA_PARAM_TYPE_USER_PARAM:
+            memcpy(&param.user_param, buf, sizeof(uint32_t)); break;
+        case SAVE_DATA_PARAM_TYPE_MTIME:
+            memcpy(&param.mtime, buf, sizeof(int64_t)); mtime_from_guest = true; break;
+        default: return SAVE_DATA_ERR_PARAMETER;
+    }
+    if (!mtime_from_guest) param.mtime = (int64_t)time(nullptr);
+    if (!save_param_store(dir, param, app_param_declaration().title_id,
+                          std::filesystem::path(dir).filename().string())) {
+        // Loud, and an error rather than SCE_OK: the entire point of #2786 is that this call must
+        // never report a write it did not perform.
+        fprintf(stderr, "[svc] sceSaveDataSetParam: could not write the save parameter block to "
+                        "\"%s\"\n", save_param_path(dir).c_str());
+        return SAVE_DATA_ERR_INTERNAL;
+    }
+    if (svclog())
+        fprintf(stderr, "[svc]   SetParam type=%u title=\"%s\" sub=\"%s\" userParam=%u -> stored\n",
+                type, param.title.c_str(), param.sub_title.c_str(), param.user_param);
+    return 0;
+}
+
+HLE(s_savedata_getparam) {
+    svc_log("sceSaveDataGetParam", a0,a1,a2,a3,a4,a5);
+    const uint32_t type = (uint32_t)a1;
+    const size_t need = savedata_param_type_size(type);
+    if (!savedata_mount_point_ok(a0) || !a2 || !need || a3 < need) return SAVE_DATA_ERR_PARAMETER;
+    const std::string dir = savedata0_mounted_dir();
+    if (dir.empty()) return SAVE_DATA_ERR_NOT_MOUNTED;
+
+    // A save whose title has never set a parameter block genuinely has none, and an empty block
+    // with a real byte count is the honest report of that. It is still not the pre-fix behaviour,
+    // which wrote NOTHING into the caller's buffer and reported SCE_OK, so the title read back
+    // whatever its own stack happened to hold.
+    SaveDataParam param;
+    save_param_load(dir, param);
+    uint8_t* out = (uint8_t*)PW(a2);
+    switch (type) {
+        case SAVE_DATA_PARAM_TYPE_ALL:
+            memset(out, 0, SAVE_DATA_PARAM_ALL_SIZE);
+            savedata_param_write_text(out + SAVE_DATA_PARAM_OFF_TITLE, SAVE_DATA_TITLE_MAXSIZE,
+                                      param.title);
+            savedata_param_write_text(out + SAVE_DATA_PARAM_OFF_SUBTITLE,
+                                      SAVE_DATA_SUBTITLE_MAXSIZE, param.sub_title);
+            savedata_param_write_text(out + SAVE_DATA_PARAM_OFF_DETAIL, SAVE_DATA_DETAIL_MAXSIZE,
+                                      param.detail);
+            memcpy(out + SAVE_DATA_PARAM_OFF_USER_PARAM, &param.user_param, sizeof(uint32_t));
+            memcpy(out + SAVE_DATA_PARAM_OFF_MTIME, &param.mtime, sizeof(int64_t));
+            break;
+        case SAVE_DATA_PARAM_TYPE_TITLE:
+            savedata_param_write_text(out, SAVE_DATA_TITLE_MAXSIZE, param.title); break;
+        case SAVE_DATA_PARAM_TYPE_SUB_TITLE:
+            savedata_param_write_text(out, SAVE_DATA_SUBTITLE_MAXSIZE, param.sub_title); break;
+        case SAVE_DATA_PARAM_TYPE_DETAIL:
+            savedata_param_write_text(out, SAVE_DATA_DETAIL_MAXSIZE, param.detail); break;
+        case SAVE_DATA_PARAM_TYPE_USER_PARAM:
+            memcpy(out, &param.user_param, sizeof(uint32_t)); break;
+        case SAVE_DATA_PARAM_TYPE_MTIME:
+            memcpy(out, &param.mtime, sizeof(int64_t)); break;
+        default: return SAVE_DATA_ERR_PARAMETER;
+    }
+    // gotSize is optional on this contract; write it only when the caller asked for one.
+    if (a4) { const uint64_t got = need; memcpy(PW(a4), &got, sizeof(uint64_t)); }
+    if (svclog())
+        fprintf(stderr, "[svc]   GetParam type=%u -> %zu bytes (title=\"%s\" userParam=%u)\n",
+                type, need, param.title.c_str(), param.user_param);
+    return 0;
+}
+
 HLE(s_savedata_prepare) { svc_log("sceSaveDataPrepare", a0,a1,a2,a3,a4,a5); return 0; }
 HLE(s_savedata_commit)  { svc_log("sceSaveDataCommit", a0,a1,a2,a3,a4,a5); return 0; }
 // sceSaveDataGetEventResult(eventParam, event): PS4 and PS5 share this NID and two-argument shape.
@@ -5697,6 +5877,9 @@ void register_service_hle() {
     Hle::register_fn("uW4vfTwMQVo", (HleFn)s_savedata_umount2,   "sceSaveDataUmount2");
     Hle::register_fn("sDCBrmc61XU", (HleFn)s_savedata_prepare,   "sceSaveDataPrepare");
     Hle::register_fn("ie7qhZ4X0Cc", (HleFn)s_savedata_commit,    "sceSaveDataCommit");
+    // #2786: both were unregistered, so both answered SCE_OK while storing and reading nothing.
+    Hle::register_fn("85zul--eGXs", (HleFn)s_savedata_setparam,  "sceSaveDataSetParam");
+    Hle::register_fn("XgvSuIdnMlw", (HleFn)s_savedata_getparam,  "sceSaveDataGetParam");
     Hle::register_fn("dyIhnXq-0SM", (HleFn)s_savedata_dirsearch, "sceSaveDataDirNameSearch");
     Hle::register_fn("65VH0Qaaz6s", (HleFn)s_savedata_mountinfo, "sceSaveDataGetMountInfo");  // was MISSING -> garbage free-space
     Hle::register_fn("j8xKtiFj0SY", (HleFn)s_savedata_get_event, "sceSaveDataGetEventResult");
