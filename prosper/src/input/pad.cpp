@@ -233,6 +233,10 @@ std::vector<PadScriptEntry> parse_pad_script(const std::string& spec) {
         bool read_anchored = (!head.empty() && (head[0] == 'p' || head[0] == 'P'));
         std::string window = (frame_anchored || read_anchored) ? head.substr(1) : head;
         size_t dash = window.find('-', 1);
+        // '+' spells a HOLD rather than an end, and the hold names its own unit (#3449). Both
+        // separators at once is a contradiction, not a shorthand, so it is rejected outright.
+        const size_t plus = window.find('+', 1);
+        if (dash != std::string::npos && plus != std::string::npos) continue;
         auto parse_number = [](const std::string& text, double& out) {
             char* end = nullptr;
             const double value = strtod(text.c_str(), &end);
@@ -260,9 +264,37 @@ std::vector<PadScriptEntry> parse_pad_script(const std::string& spec) {
             return count_anchored ? parse_count(text, out) : parse_number(text, out);
         };
         double start = 0.0, end = 0.0;
-        if (!parse_anchor(trim(window.substr(0, dash)), start)) continue;
+        PadScriptHoldUnit hold_unit = PadScriptHoldUnit::none;
+        double hold_amount = 0.0;
+        const size_t head_end = dash != std::string::npos ? dash : plus;
+        if (!parse_anchor(trim(window.substr(0, head_end)), start)) continue;
         if (dash != std::string::npos) {
             if (!parse_anchor(trim(window.substr(dash + 1)), end) || end <= start) continue;
+        } else if (plus != std::string::npos) {
+            std::string hold = trim(window.substr(plus + 1));
+            // A bare number is SECONDS -- the same default the start anchor uses when it carries no
+            // prefix, so one rule covers both halves of an entry.
+            PadScriptHoldUnit unit = PadScriptHoldUnit::seconds;
+            if (!hold.empty() && (hold[0] == 'f' || hold[0] == 'F')) {
+                unit = PadScriptHoldUnit::flips;
+                hold.erase(0, 1);
+            } else if (!hold.empty() && (hold[0] == 'p' || hold[0] == 'P')) {
+                unit = PadScriptHoldUnit::reads;
+                hold.erase(0, 1);
+            }
+            const bool ok = unit == PadScriptHoldUnit::seconds ? parse_number(hold, hold_amount)
+                                                              : parse_count(hold, hold_amount);
+            // A zero hold is a press nothing can observe, which is #3267's failure wearing new
+            // syntax: the route delivers nothing and looks like a progression wall.
+            if (!ok || !(hold_amount > 0.0)) continue;
+            const bool same_unit =
+                (unit == PadScriptHoldUnit::flips   && frame_anchored) ||
+                (unit == PadScriptHoldUnit::reads   && read_anchored) ||
+                (unit == PadScriptHoldUnit::seconds && !frame_anchored && !read_anchored);
+            // A hold in the start's OWN unit is just an explicit range spelled relatively, so fold
+            // it there and keep the latching path for entries that genuinely need it.
+            if (same_unit) end = start + hold_amount;
+            else           hold_unit = unit;
         }
         std::string btns = tok.substr(colon + 1);
         uint32_t mask = 0;
@@ -289,6 +321,8 @@ std::vector<PadScriptEntry> parse_pad_script(const std::string& spec) {
             entry.left_x = direction(left_x); entry.left_y = direction(left_y);
             entry.right_x = direction(right_x); entry.right_y = direction(right_y);
             entry.axis_mask = axis_mask;
+            entry.hold_unit = hold_unit;
+            entry.hold_amount = hold_unit == PadScriptHoldUnit::none ? 0.0 : hold_amount;
             v.push_back(entry);
         }
     }
@@ -329,9 +363,38 @@ std::string pad_script_empty_route_warning(const std::string& source, bool parse
     return out;
 }
 
-PadScriptState pad_script_state_at(const std::vector<PadScriptEntry>& script, double elapsed_secs,
-                                   double hold_secs, int64_t frame_count, int64_t frame_hold,
-                                   int64_t read_count, int64_t read_hold) {
+namespace {
+
+// Has this entry's START anchor been reached? Cross-unit entries have no `end` in their start's
+// unit, so the start test is separated from the window test the same-unit path uses.
+bool cross_unit_started(const PadScriptEntry& entry, double elapsed_secs, int64_t frame_count,
+                        int64_t read_count) {
+    if (entry.frame_anchored) return frame_count >= 0 && frame_count >= (int64_t)entry.t_secs;
+    if (entry.read_anchored)  return read_count  >= 0 && read_count  >= (int64_t)entry.t_secs;
+    return elapsed_secs >= entry.t_secs;
+}
+
+// Is the latched hold still running? Measured from whichever counter the HOLD is expressed in, which
+// is the entire point: the start says WHERE in the guest's sequence, the hold says HOW LONG.
+bool cross_unit_holding(const PadScriptEntry& entry, const PadScriptLatch& latch,
+                        double elapsed_secs, int64_t frame_count, int64_t read_count) {
+    switch (entry.hold_unit) {
+        case PadScriptHoldUnit::seconds: return elapsed_secs < latch.elapsed + entry.hold_amount;
+        case PadScriptHoldUnit::flips:
+            // An unavailable counter cannot advance, so a hold measured in it would never end. Treat
+            // it as already over rather than latching a press on forever.
+            return frame_count >= 0 && (double)(frame_count - latch.frame) < entry.hold_amount;
+        case PadScriptHoldUnit::reads:
+            return read_count >= 0 && (double)(read_count - latch.read) < entry.hold_amount;
+        case PadScriptHoldUnit::none: break;
+    }
+    return false;
+}
+
+PadScriptState evaluate_script(const std::vector<PadScriptEntry>& script, double elapsed_secs,
+                               double hold_secs, int64_t frame_count, int64_t frame_hold,
+                               int64_t read_count, int64_t read_hold,
+                               std::vector<PadScriptLatch>* latches) {
     PadScriptState state;
     int left_x = 0, left_y = 0, right_x = 0, right_y = 0;
     const auto count_active = [](const PadScriptEntry& entry, int64_t count, int64_t hold) {
@@ -347,9 +410,27 @@ PadScriptState pad_script_state_at(const std::vector<PadScriptEntry>& script, do
         }
         return count >= start && count < end;
     };
-    for (const auto& e : script) {
+    for (size_t i = 0; i < script.size(); ++i) {
+        const auto& e = script[i];
         bool active = false;
-        if (e.read_anchored) {
+        if (e.hold_unit != PadScriptHoldUnit::none) {
+            // Without a latch vector this is undecidable, so report it inactive. pad_script_state_at
+            // documents that; pad_script_needs_runner() lets a caller detect the case.
+            if (latches && i < latches->size()) {
+                PadScriptLatch& latch = (*latches)[i];
+                if (!latch.armed && !latch.expired &&
+                    cross_unit_started(e, elapsed_secs, frame_count, read_count)) {
+                    latch.armed = true;
+                    latch.elapsed = elapsed_secs;
+                    latch.frame = frame_count;
+                    latch.read = read_count;
+                }
+                if (latch.armed && !latch.expired) {
+                    active = cross_unit_holding(e, latch, elapsed_secs, frame_count, read_count);
+                    if (!active) { latch.expired = true; latch.armed = false; }
+                }
+            }
+        } else if (e.read_anchored) {
             active = count_active(e, read_count, read_hold);
         } else if (e.frame_anchored) {
             active = count_active(e, frame_count, frame_hold);
@@ -367,6 +448,31 @@ PadScriptState pad_script_state_at(const std::vector<PadScriptEntry>& script, do
     state.left_x = direction(left_x); state.left_y = direction(left_y);
     state.right_x = direction(right_x); state.right_y = direction(right_y);
     return state;
+}
+
+}  // namespace
+
+PadScriptState pad_script_state_at(const std::vector<PadScriptEntry>& script, double elapsed_secs,
+                                   double hold_secs, int64_t frame_count, int64_t frame_hold,
+                                   int64_t read_count, int64_t read_hold) {
+    return evaluate_script(script, elapsed_secs, hold_secs, frame_count, frame_hold, read_count,
+                           read_hold, nullptr);
+}
+
+bool pad_script_needs_runner(const std::vector<PadScriptEntry>& script) {
+    for (const auto& e : script)
+        if (e.hold_unit != PadScriptHoldUnit::none) return true;
+    return false;
+}
+
+PadScriptState PadScriptRunner::state_at(const std::vector<PadScriptEntry>& script,
+                                         double elapsed_secs, double hold_secs,
+                                         int64_t frame_count, int64_t frame_hold,
+                                         int64_t read_count, int64_t read_hold) {
+    // resize() keeps the common prefix, which is exactly the live-reload append contract.
+    if (latches_.size() != script.size()) latches_.resize(script.size());
+    return evaluate_script(script, elapsed_secs, hold_secs, frame_count, frame_hold, read_count,
+                           read_hold, &latches_);
 }
 
 void pad_apply_script_state(HostPadState& target, const PadScriptState& scripted) {

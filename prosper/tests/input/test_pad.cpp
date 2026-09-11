@@ -629,6 +629,111 @@ int main() {
         CHECK(missing.empty() && !route_error.empty(), "route: missing @path reports an error");
     }
 
+    // ---- Cross-unit holds: start in flips, hold in wall time (#3449) -----------------------
+    //
+    // The defect this pins is not a crash and not a wrong pixel -- it is a route that quietly runs
+    // a DIFFERENT run. A flip window encodes a duration only at the flip rate it was tuned on, so
+    // `f2272-2284` meant 0.15 s at 80 flips/s and 0.737 s at 16, guest key repeat walked the menu
+    // several extra rows, and GTA V measured a whole session in the wrong graphics mode while being
+    // reported as a Performance run.
+    {
+        const double hold = 0.30;
+        const int64_t fhold = 8, rhold = 8;
+
+        auto cross = parse_pad_script("f2272+0.15:down");
+        CHECK(cross.size() == 1 && cross[0].frame_anchored && cross[0].t_secs == 2272.0 &&
+              cross[0].hold_unit == PadScriptHoldUnit::seconds && cross[0].hold_amount == 0.15 &&
+              cross[0].end == 0.0,
+              "hold: flip start with a seconds hold parses as a cross-unit entry");
+        CHECK(pad_script_needs_runner(cross), "hold: a cross-unit entry needs the stateful runner");
+
+        // A hold in the START's own unit is an explicit range spelled relatively -- no latch, and
+        // no behaviour change for anything already written as a range.
+        auto same_unit = parse_pad_script("f100+f12:down;3+0.5:cross;p40+p10:circle");
+        CHECK(same_unit.size() == 3 && !pad_script_needs_runner(same_unit),
+              "hold: same-unit holds need no runner");
+        CHECK(same_unit[0].end == 112.0 && same_unit[1].end == 3.5 && same_unit[2].end == 50.0,
+              "hold: a same-unit hold folds into the exclusive end");
+
+        // THE REGRESSION. Two hosts, same route, same start flip; only the flip RATE differs. A
+        // frame window holds for a different wall-clock duration on each; the cross-unit entry holds
+        // for the same 0.15 s on both. Without the fix `f2272+0.15` fails to parse and delivers
+        // nothing, so `pressed_secs` is 0.0 in both arms and the equality below passes vacuously --
+        // which is why the arm also requires the duration to be the intended one.
+        auto window = parse_pad_script("f2272-2284:down");
+        const auto sweep = [&](const std::vector<PadScriptEntry>& script, double flips_per_sec) {
+            PadScriptRunner runner;
+            double first = -1.0, last = -1.0;
+            // 1 ms steps over 10 s of guest time, flips accumulating at the host's rate. Long
+            // enough that even the 16 flips/s arm reaches flip 2272 (4.5 s) and leaves it again.
+            for (int step = 0; step <= 10000; ++step) {
+                const double elapsed = 150.0 + step / 1000.0;
+                const int64_t frame = 2200 + (int64_t)((step / 1000.0) * flips_per_sec);
+                const int64_t read = 13000 + (int64_t)((step / 1000.0) * 90.0);
+                const auto state = runner.state_at(script, elapsed, hold, frame, fhold, read, rhold);
+                if (state.button_mask & SCE_PAD_BUTTON_DOWN) {
+                    if (first < 0.0) first = elapsed;
+                    last = elapsed;
+                }
+            }
+            return first < 0.0 ? 0.0 : last - first + 0.001;
+        };
+        const double window_slow = sweep(window, 16.0), window_fast = sweep(window, 80.0);
+        const double cross_slow = sweep(cross, 16.0), cross_fast = sweep(cross, 80.0);
+        CHECK(window_slow > 0.6 && window_fast < 0.2,
+              "hold: a frame window's duration tracks the flip rate (the defect, reproduced)");
+        CHECK(cross_slow > 0.14 && cross_slow < 0.17 && cross_fast > 0.14 && cross_fast < 0.17,
+              "hold: a seconds hold from a flip start lasts 0.15 s at BOTH flip rates");
+
+        // Latching: armed when the start flip is crossed, released by wall time, never re-armed.
+        PadScriptRunner runner;
+        CHECK(runner.state_at(cross, 10.0, hold, 2271, fhold, 0, rhold).button_mask == 0,
+              "hold: before the start flip nothing is pressed");
+        CHECK(runner.state_at(cross, 10.1, hold, 2272, fhold, 0, rhold).button_mask ==
+              SCE_PAD_BUTTON_DOWN, "hold: the start flip arms and presses in the same sample");
+        CHECK(runner.state_at(cross, 10.2, hold, 9999, fhold, 0, rhold).button_mask ==
+              SCE_PAD_BUTTON_DOWN, "hold: still held while wall time is inside the hold");
+        CHECK(runner.state_at(cross, 10.25, hold, 9999, fhold, 0, rhold).button_mask == 0,
+              "hold: released once the wall-clock hold expires, whatever the flip count");
+        CHECK(runner.state_at(cross, 10.26, hold, 2272, fhold, 0, rhold).button_mask == 0,
+              "hold: an expired latch never re-arms");
+
+        // A hold in pad reads from a flip start: the guarantee is 'the guest observes N reads of
+        // this press', which wall time cannot promise when polling stalls.
+        auto by_reads = parse_pad_script("f2272+p10:down");
+        CHECK(by_reads.size() == 1 && by_reads[0].hold_unit == PadScriptHoldUnit::reads &&
+              by_reads[0].hold_amount == 10.0, "hold: 'p' names a hold in pad reads");
+        PadScriptRunner read_runner;
+        CHECK(read_runner.state_at(by_reads, 99.0, hold, 2272, fhold, 500, rhold).button_mask ==
+              SCE_PAD_BUTTON_DOWN, "hold: read hold arms at the start flip");
+        CHECK(read_runner.state_at(by_reads, 900.0, hold, 2272, fhold, 509, rhold).button_mask ==
+              SCE_PAD_BUTTON_DOWN, "hold: read hold ignores wall time entirely");
+        CHECK(read_runner.state_at(by_reads, 900.1, hold, 2272, fhold, 510, rhold).button_mask == 0,
+              "hold: read hold ends after exactly N reads");
+
+        // The pure evaluator cannot decide a cross-unit entry and says so by reporting it inactive,
+        // rather than guessing a window. Production goes through PadScriptRunner (hle_pad.cpp).
+        CHECK(pad_script_buttons_at(cross, 10.1, hold, 2272, fhold) == 0,
+              "hold: the pure evaluator reports cross-unit entries inactive");
+
+        // Malformed holds are dropped, and each of these was a plausible spelling somebody types.
+        auto bad = parse_pad_script(
+            "f100+0:down;f100-200+5:down;f100+x:down;f100+p1.5:down;f100+f0:down;f100+:down;"
+            "f900+0.2:circle");
+        CHECK(bad.size() == 1 && bad[0].button_mask == SCE_PAD_BUTTON_CIRCLE,
+              "hold: zero, non-numeric, fractional-count, empty and dash+plus holds are rejected");
+
+        // Sticks carry a cross-unit hold too -- the Left that changes a setting value is an axis
+        // press on some routes and a d-pad press on others.
+        auto stick = parse_pad_script("f50+0.1:left-stick-left");
+        PadScriptRunner stick_runner;
+        const auto stick_state = stick_runner.state_at(stick, 5.0, hold, 50, fhold, 0, rhold);
+        CHECK((stick_state.axis_mask & PAD_SCRIPT_LEFT_X) && stick_state.left_x == -1,
+              "hold: a cross-unit hold drives stick axes as well as buttons");
+        CHECK(stick_runner.state_at(stick, 5.2, hold, 50, fhold, 0, rhold).axis_mask == 0,
+              "hold: the stick axis releases when the wall-clock hold expires");
+    }
+
     // ---- Recording analog sticks as directions --------------------------------------------
     // Previously the recorder took buttons only, so a stick-driven route replayed as standing
     // still: silent, total, and indistinguishable from the game ignoring input.
