@@ -1832,7 +1832,7 @@ std::vector<std::pair<uint64_t, uint64_t>> committed_parts_in(uint64_t base, uin
 // code. Decommit has no out-parameter, so the hazard that made #3502 probe before implementing --
 // writing through a wrongly positioned argument -- does not apply. The opposite one does: unmapping
 // a range the guest did not name, which is silent and corrupts whatever else lived there. Hence
-// tracked_committed_covers above: nothing is touched unless prosper itself recorded it as a
+// committed_parts_in above: nothing is touched unless prosper itself recorded it as a
 // committed mapping.
 //
 // THE RESERVATION SURVIVES. That is the whole point of the reserve/commit split -- releasing the VA
@@ -1848,9 +1848,40 @@ std::vector<std::pair<uint64_t, uint64_t>> committed_parts_in(uint64_t base, uin
 // word, this reading is wrong.
 HLE(k_pool_decommit) {
     if (!a0 || !a1) return 0x80020016ull;                            // SCE_KERNEL_ERROR_EINVAL
-    uint64_t base = 0, len = 0;
-    if (!normalize_guest_page_range(a0, a1, base, len)) return 0x80020016ull;
-    if (!len) return 0;
+    // 64 KiB granularity, rounded INWARD -- and both halves of that are load-bearing.
+    //
+    // INWARD, because this call destroys guest memory. Every other rounding in this file widens a
+    // range, which for a protection change is harmless; widening a RELEASE would unmap bytes the
+    // guest did not name, and its sibling k_munmap refuses an unaligned request outright rather than
+    // take that risk. Rounding in can only ever release less than asked, never more.
+    //
+    // 64 KiB rather than the 16 KiB guest page, because of what happens to the hole afterwards. A
+    // decommitted range goes back to being a tracked reservation, and the first guest touch of a
+    // tracked reservation is served by the lazy-commit fault handler
+    // (exec_image_linux.cpp, `prosper_reserved_range_state(a) == 1`), which maps
+    // `mmap(page & ~0xffff, 0x10000, MAP_FIXED)` -- a whole 64 KiB granule. A hole smaller than
+    // that, or not aligned to it, would therefore be re-backed by an mmap that also replaces the
+    // still-live neighbours sharing its granule with fresh zeroed pages. Releasing only whole
+    // granules makes that unreachable by construction. Raised in review of #3530.
+    //
+    // NINJA GAIDEN 4 loses nothing to this: its observed decommits are already 64 KiB-aligned with
+    // 64 KiB-multiple lengths (`addr=0x1001010000 len=0x3f0000`, `addr=0x1000ee0000 len=0x10000`).
+    constexpr uint64_t kCommitGranule = 0x10000ull;
+    if (a1 > UINT64_MAX - a0) return 0x80020016ull;
+    const uint64_t base = (a0 + kCommitGranule - 1) & ~(kCommitGranule - 1);
+    const uint64_t end  = (a0 + a1) & ~(kCommitGranule - 1);
+    if (end <= base) {
+        // Nothing to do, and SAY SO. A release that releases nothing answering SCE_OK in silence is
+        // the shape this file spends most of its comments warning about; bounded so a guest looping
+        // on it cannot turn the diagnostic into the problem.
+        static std::atomic<int> narrowed{0};
+        if (narrowed.fetch_add(1) < 8)
+            fprintf(stderr, "[memhle] sceKernelMemoryPoolDecommit(0x%llx, 0x%llx) spans no whole "
+                            "64 KiB granule -- nothing released (reported %d of at most 8 times)\n",
+                    (unsigned long long)a0, (unsigned long long)a1, narrowed.load());
+        return 0;
+    }
+    const uint64_t len = end - base;
     uint64_t released = 0;
     for (const auto& part : committed_parts_in(base, len)) {
         // Retire any texture write-watch over this VA before the backing disappears, exactly as
@@ -1867,6 +1898,15 @@ HLE(k_pool_decommit) {
         untrack(part.first, part.second);
         track(part.first, part.second, 0, 0, false, "reserved");
         released += part.second;
+    }
+    if (released < a1) {
+        static std::atomic<int> partial{0};
+        if (partial.fetch_add(1) < 8)
+            fprintf(stderr, "[memhle] sceKernelMemoryPoolDecommit(0x%llx, 0x%llx) released 0x%llx: "
+                            "the rest was not committed, or fell outside a whole 64 KiB granule "
+                            "(reported %d of at most 8 times)\n",
+                    (unsigned long long)a0, (unsigned long long)a1,
+                    (unsigned long long)released, partial.load());
     }
     MLOG("pool_decommit addr=0x%llx len=0x%llx flags=0x%llx -> released 0x%llx of [0x%llx,0x%llx), "
          "reservation kept\n",
@@ -2316,7 +2356,17 @@ static uint64_t sce_mprotect_error(int error) {
 // answering the same question differently is the divergence the charter's one-derivation rule
 // exists to prevent.
 //
-// This is not a tolerance, it is the console's contract, and a shipping title is the evidence.
+// This is not a tolerance, it is the console's contract, and the primary evidence is the KERNEL this
+// one is derived from. FreeBSD's kern_mprotect does exactly this rounding -- it takes
+// `pageoff = addr & PAGE_MASK`, subtracts it from the address, adds it to the size and rounds the
+// size up -- and the PS5 kernel is FreeBSD-derived. That is a positive statement about WHICH
+// rounding the platform performs, including its direction, where "a shipping title calls it and
+// works" establishes only that hardware did not fail the call. It also settles the corner this
+// introduces: `sceKernelMprotect(unaligned, 0, prot)` now protects one whole page while an aligned
+// address with length 0 stays a no-op, which looks inconsistent inside prosper and is precisely what
+// FreeBSD does. Raised in review of #3530.
+//
+// The title is the corroborating evidence, and it is how the defect was found.
 // FINAL FANTASY TACTICS - The Ivalice Chronicles (#3498) calls
 // sceKernelMprotect(eboot+0xf999e0, 0x1da20, 0xc3) during its allocator init -- an address that is
 // not 16 KiB aligned and a length that is not a multiple of it. Passed through verbatim, host
@@ -2650,7 +2700,14 @@ HLE(k_apr_submit_and_get_id) {
                 (unsigned long long)rc, (unsigned long long)a2, (unsigned long long)a3,
                 (unsigned long long)a4, (unsigned long long)a5);
     // A failed submit must not hand back an id the guest would then wait on.
-    return rc == 0 ? token : rc;
+    if (rc != 0) return rc;
+    // Nor may a SUCCESSFUL one return 0, which is precisely the value the missing handler returned
+    // and therefore the one a caller cannot distinguish from "unimplemented". The token normally
+    // comes from prosper_apr_next_token and is never 0, but a command buffer BOUND with a zero tag
+    // echoes that tag -- and this file documents a real title that binds with a literal `xor ecx,ecx`
+    // (CRI ADX2, in the apr_submit_common comment). Fall back to this ring's own counter there.
+    // Raised in review of #3530.
+    return token ? token : prosper_apr_next_token(a1 ? (unsigned)(a1 - 1) & 0x3f : 0);
 }
 HLE(k_apr_submit) {   // sceKernelAprSubmitCommandBufferAndGetResult (cb, ring_1based, out1, out2)
     return apr_submit_common(a0, a1, a2, a3, /*write_result_outputs=*/true);
@@ -6878,7 +6935,7 @@ std::vector<std::pair<uint64_t, uint64_t>> committed_parts_in(uint64_t base, uin
 // code. Decommit has no out-parameter, so the hazard that made #3502 probe before implementing --
 // writing through a wrongly positioned argument -- does not apply. The opposite one does: unmapping
 // a range the guest did not name, which is silent and corrupts whatever else lived there. Hence
-// tracked_committed_covers above: nothing is touched unless prosper itself recorded it as a
+// committed_parts_in above: nothing is touched unless prosper itself recorded it as a
 // committed mapping.
 //
 // THE RESERVATION SURVIVES. That is the whole point of the reserve/commit split -- releasing the VA
@@ -6894,9 +6951,40 @@ std::vector<std::pair<uint64_t, uint64_t>> committed_parts_in(uint64_t base, uin
 // word, this reading is wrong.
 HLE(k_pool_decommit) {
     if (!a0 || !a1) return 0x80020016ull;                            // SCE_KERNEL_ERROR_EINVAL
-    uint64_t base = 0, len = 0;
-    if (!normalize_guest_page_range(a0, a1, base, len)) return 0x80020016ull;
-    if (!len) return 0;
+    // 64 KiB granularity, rounded INWARD -- and both halves of that are load-bearing.
+    //
+    // INWARD, because this call destroys guest memory. Every other rounding in this file widens a
+    // range, which for a protection change is harmless; widening a RELEASE would unmap bytes the
+    // guest did not name, and its sibling k_munmap refuses an unaligned request outright rather than
+    // take that risk. Rounding in can only ever release less than asked, never more.
+    //
+    // 64 KiB rather than the 16 KiB guest page, because of what happens to the hole afterwards. A
+    // decommitted range goes back to being a tracked reservation, and the first guest touch of a
+    // tracked reservation is served by the lazy-commit fault handler
+    // (exec_image_linux.cpp, `prosper_reserved_range_state(a) == 1`), which maps
+    // `mmap(page & ~0xffff, 0x10000, MAP_FIXED)` -- a whole 64 KiB granule. A hole smaller than
+    // that, or not aligned to it, would therefore be re-backed by an mmap that also replaces the
+    // still-live neighbours sharing its granule with fresh zeroed pages. Releasing only whole
+    // granules makes that unreachable by construction. Raised in review of #3530.
+    //
+    // NINJA GAIDEN 4 loses nothing to this: its observed decommits are already 64 KiB-aligned with
+    // 64 KiB-multiple lengths (`addr=0x1001010000 len=0x3f0000`, `addr=0x1000ee0000 len=0x10000`).
+    constexpr uint64_t kCommitGranule = 0x10000ull;
+    if (a1 > UINT64_MAX - a0) return 0x80020016ull;
+    const uint64_t base = (a0 + kCommitGranule - 1) & ~(kCommitGranule - 1);
+    const uint64_t end  = (a0 + a1) & ~(kCommitGranule - 1);
+    if (end <= base) {
+        // Nothing to do, and SAY SO. A release that releases nothing answering SCE_OK in silence is
+        // the shape this file spends most of its comments warning about; bounded so a guest looping
+        // on it cannot turn the diagnostic into the problem.
+        static std::atomic<int> narrowed{0};
+        if (narrowed.fetch_add(1) < 8)
+            fprintf(stderr, "[memhle] sceKernelMemoryPoolDecommit(0x%llx, 0x%llx) spans no whole "
+                            "64 KiB granule -- nothing released (reported %d of at most 8 times)\n",
+                    (unsigned long long)a0, (unsigned long long)a1, narrowed.load());
+        return 0;
+    }
+    const uint64_t len = end - base;
     uint64_t released = 0;
     for (const auto& part : committed_parts_in(base, len)) {
         // win_unmap restores the Windows PLACEHOLDER it cut the view out of, so the address space
@@ -6906,6 +6994,15 @@ HLE(k_pool_decommit) {
         untrack(part.first, part.second);
         track(part.first, part.second, 0, 0, false, "reserved");
         released += part.second;
+    }
+    if (released < a1) {
+        static std::atomic<int> partial{0};
+        if (partial.fetch_add(1) < 8)
+            fprintf(stderr, "[memhle] sceKernelMemoryPoolDecommit(0x%llx, 0x%llx) released 0x%llx: "
+                            "the rest was not committed, or fell outside a whole 64 KiB granule "
+                            "(reported %d of at most 8 times)\n",
+                    (unsigned long long)a0, (unsigned long long)a1,
+                    (unsigned long long)released, partial.load());
     }
     MLOG("pool_decommit addr=0x%llx len=0x%llx flags=0x%llx -> released 0x%llx of [0x%llx,0x%llx), "
          "placeholder kept\n",
@@ -7068,7 +7165,17 @@ static uint64_t sce_win_mprotect_error(DWORD error) {
 // answering the same question differently is the divergence the charter's one-derivation rule
 // exists to prevent.
 //
-// This is not a tolerance, it is the console's contract, and a shipping title is the evidence.
+// This is not a tolerance, it is the console's contract, and the primary evidence is the KERNEL this
+// one is derived from. FreeBSD's kern_mprotect does exactly this rounding -- it takes
+// `pageoff = addr & PAGE_MASK`, subtracts it from the address, adds it to the size and rounds the
+// size up -- and the PS5 kernel is FreeBSD-derived. That is a positive statement about WHICH
+// rounding the platform performs, including its direction, where "a shipping title calls it and
+// works" establishes only that hardware did not fail the call. It also settles the corner this
+// introduces: `sceKernelMprotect(unaligned, 0, prot)` now protects one whole page while an aligned
+// address with length 0 stays a no-op, which looks inconsistent inside prosper and is precisely what
+// FreeBSD does. Raised in review of #3530.
+//
+// The title is the corroborating evidence, and it is how the defect was found.
 // FINAL FANTASY TACTICS - The Ivalice Chronicles (#3498) calls
 // sceKernelMprotect(eboot+0xf999e0, 0x1da20, 0xc3) during its allocator init -- an address that is
 // not 16 KiB aligned and a length that is not a multiple of it. Passed through verbatim, host
@@ -7521,7 +7628,14 @@ HLE(k_ampr_submit_and_get_id) {
                 (unsigned long long)rc, (unsigned long long)a2, (unsigned long long)a3,
                 (unsigned long long)a4, (unsigned long long)a5);
     // A failed submit must not hand back an id the guest would then wait on.
-    return rc == 0 ? token : rc;
+    if (rc != 0) return rc;
+    // Nor may a SUCCESSFUL one return 0, which is precisely the value the missing handler returned
+    // and therefore the one a caller cannot distinguish from "unimplemented". The token normally
+    // comes from prosper_apr_next_token and is never 0, but a command buffer BOUND with a zero tag
+    // echoes that tag -- and this file documents a real title that binds with a literal `xor ecx,ecx`
+    // (CRI ADX2, in the apr_submit_common comment). Fall back to this ring's own counter there.
+    // Raised in review of #3530.
+    return token ? token : prosper_apr_next_token(a1 ? (unsigned)(a1 - 1) & 0x3f : 0);
 }
 HLE(k_ampr_submit) {                 // ASoW5WE-UPo: …AndGetResult — writes the result slots
     return apr_submit_common(a0, a1, a2, a3, /*write_result_outputs=*/true);

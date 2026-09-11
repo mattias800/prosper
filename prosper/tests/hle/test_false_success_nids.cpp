@@ -10,12 +10,19 @@
 // passes for the wrong reason is the recurring failure in this project: a `CHECK(ret == 0)` on a
 // fill contract passes against the very stub the change exists to remove.
 #include "hle/dispatch/dispatch.hpp"
+#if !defined(_WIN32)
+#include <sys/mman.h>   // the untracked host mapping test_pool_decommit must be left alone
+#endif
 #include "hle/dispatch/nid.hpp"
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 
 using namespace prosper;
+
+static constexpr uint64_t kEinvalPool = 0x80020016ull;   // SCE_KERNEL_ERROR_EINVAL
+
+extern "C" int prosper_reserved_range_state(uint64_t addr);
 
 static int fails = 0;
 #define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
@@ -489,6 +496,94 @@ void test_apr_submit_and_get_id() {
     CHECK(second != first, "a second submit gets a DIFFERENT id (ids name submits, not the buffer)");
 }
 
+// sceKernelMemoryPoolDecommit (LXo1tpFqJGs) — the fourth member of the pool family (#3506).
+//
+// This is the only handler in its change that DESTROYS guest memory, so the arms are about what it
+// must not do as much as what it must. #3506 asks for exactly this by name, and warns that "a
+// Decommit arm that passes against 'unmap unconditionally' would be worse than none" — so each arm
+// below names the mutation it exists to catch.
+//
+// The fixture is a real reserve + commit through the pool API, not a synthetic mapping, because the
+// property under test is agreement between prosper's tracker and its own mappings.
+void test_pool_decommit() {
+    HleFn reserve  = Hle::lookup("pU-QydtGcGY");   // sceKernelMemoryPoolReserve
+    HleFn commit   = Hle::lookup("Vzl66WmfLvk");   // sceKernelMemoryPoolCommit
+    HleFn decommit = Hle::lookup("LXo1tpFqJGs");   // sceKernelMemoryPoolDecommit
+    CHECK(decommit != nullptr,
+          "sceKernelMemoryPoolDecommit is registered (unregistered, Commit had no inverse)");
+    if (!reserve || !commit || !decommit) return;
+
+    constexpr uint64_t kGranule = 0x10000ull;      // the lazy-commit granule decommit works in
+    constexpr uint64_t kSpan    = kGranule * 4;
+
+    uint64_t base = 0;
+    CHECK(reserve(0, kSpan, kGranule, 0, (uint64_t)(uintptr_t)&base, 0) == 0 && base,
+          "fixture: reserved four 64 KiB granules");
+    if (!base) return;
+    // Commit only the FIRST TWO granules. The gap is the point: NINJA GAIDEN 4 decommits whole pool
+    // spans of which only part is committed, and refusing that produced 8.1 million refusals.
+    CHECK(commit(base, kGranule * 2, 0xc, 0x3, 0, 0) == 0, "fixture: committed the first two granules");
+    // prosper_reserved_range_state: 0 = untracked, 1 = tracked reservation, 2 = committed,
+    // 4 = the AMM no-lazy-commit window. The positive control asserts 2 rather than "not 1",
+    // because the arm below turns it back into 1 and a "not 1" control would pass on an untracked
+    // range too -- which is the state a fixture that silently failed to commit would be in.
+    CHECK(prosper_reserved_range_state(base) == 2,
+          "fixture positive control: the committed range reads as COMMITTED");
+
+    *(volatile uint32_t*)(uintptr_t)base = 0xA5A5A5A5u;   // faults if the commit did not back it
+
+    // Decommit the WHOLE four-granule span, two of which were never committed.
+    CHECK(decommit(base, kSpan, 0, 0, 0, 0) == 0,
+          "a decommit spanning committed and uncommitted granules SUCCEEDS "
+          "(mutation: refuse unless fully committed -> this fails)");
+
+    // The reservation must survive. Without it a later Commit at the same address can land
+    // elsewhere, or fail. This is the arm that catches "decommit = munmap".
+    CHECK(prosper_reserved_range_state(base) == 1,
+          "the RESERVATION survives the release (mutation: plain munmap -> this fails)");
+
+    uint64_t recommitted = base;
+    CHECK(commit(base, kGranule, 0xc, 0x3, 0, 0) == 0,
+          "the released range can be committed again");
+    CHECK(recommitted == base, "re-commit lands at the SAME address the reservation held");
+    *(volatile uint32_t*)(uintptr_t)base = 0x5A5A5A5Au;   // faults if the re-commit did not back it
+    CHECK(*(volatile uint32_t*)(uintptr_t)base == 0x5A5A5A5Au,
+          "the re-committed page is writable and reads back");
+
+    // Refusal direction: a range prosper never tracked at all must touch nothing. `bad` is a live
+    // host mapping this test owns, so "touches nothing" is checkable rather than assumed — an
+    // unconditional unmap would make the read below fault.
+    void* foreign = mmap(nullptr, (size_t)kGranule, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    CHECK(foreign != MAP_FAILED, "fixture: a host mapping prosper never tracked");
+    if (foreign != MAP_FAILED) {
+        *(volatile uint32_t*)foreign = 0xC3C3C3C3u;
+        decommit((uint64_t)(uintptr_t)foreign, kGranule, 0, 0, 0, 0);
+        CHECK(*(volatile uint32_t*)foreign == 0xC3C3C3C3u,
+              "decommit leaves memory prosper never committed ALONE "
+              "(mutation: unmap unconditionally -> this faults or reads back changed)");
+        munmap(foreign, (size_t)kGranule);
+    }
+
+    // Sub-granule requests release NOTHING rather than rounding outward. Rounding a destructive
+    // range out would unmap bytes the guest did not name, and a hole smaller than the lazy-commit
+    // granule would later be re-backed by an mmap that also replaces its live neighbours.
+    uint64_t base2 = 0;
+    if (reserve(0, kSpan, kGranule, 0, (uint64_t)(uintptr_t)&base2, 0) == 0 && base2 &&
+        commit(base2, kSpan, 0xc, 0x3, 0, 0) == 0) {
+        *(volatile uint32_t*)(uintptr_t)base2 = 0x11223344u;
+        CHECK(decommit(base2 + 0x100, 0x200, 0, 0, 0, 0) == 0,
+              "a sub-granule decommit succeeds without releasing anything");
+        CHECK(*(volatile uint32_t*)(uintptr_t)base2 == 0x11223344u,
+              "a sub-granule decommit does not release the granule containing it "
+              "(mutation: round outward -> this faults)");
+        decommit(base2, kSpan, 0, 0, 0, 0);
+    }
+
+    CHECK(decommit(0, kGranule, 0, 0, 0, 0) == kEinvalPool, "a null address is EINVAL");
+    CHECK(decommit(base, 0, 0, 0, 0, 0) == kEinvalPool, "a zero length is EINVAL");
+}
+
 int main() {
     printf("== test_false_success_nids ==\n");
     register_builtin_hle();
@@ -497,6 +592,7 @@ int main() {
     test_savedata_transferring_mount();
     test_http_ids();
     test_apr_submit_and_get_id();
+    test_pool_decommit();
     test_kernel_memory_pool();
     if (fails) { printf("== FAIL: %d check(s) failed ==\n", fails); return 1; }
     printf("== PASS ==\n");

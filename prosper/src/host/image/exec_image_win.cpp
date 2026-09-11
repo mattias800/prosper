@@ -19,6 +19,7 @@
 
 #include "host/image/exec_image.hpp"
 #include "host/fault/rbp_chain.hpp"   // guest_frames_from_rbp: the shared frame-pointer walk
+#include "host/fault/guest_stack_scan.hpp"   // the scan-based sibling, shared by both platforms
 #include "host/platform/immortal.hpp"   // #2613: registries a guest thread can reach after exit()
 #include "host/memory/guest_write_watch.hpp"
 #include "host/x86/sse4a.hpp"
@@ -1359,34 +1360,20 @@ uint64_t invoke_stub(uint64_t idx) {
 extern "C" IMAGE_DOS_HEADER __ImageBase;
 
 namespace {
-// Does a `call` instruction end at `ret`? A return address is always the byte after the call that
-// pushed it, so this is the strongest cheap test that a stack word is a real frame and not residue.
-//
-// Encodings accepted, all the forms a compiler emits for a direct or indirect call:
-//   E8 rel32                    -- 5 bytes, `call rel32`
-//   FF /2 with any ModRM/SIB/disp -- `call r/m64`, 2 to 7 bytes, optionally REX-prefixed
-// The FF forms are matched by looking for FF at each plausible start with reg field 2, which admits
-// a byte sequence that merely looks like one; the E8 form is near-conclusive. Both are far better
-// than accepting every readable guest address, which is the alternative.
-bool call_precedes(uint64_t ret, bool (*readable)(uint64_t)) {
-    if (ret < 16 || !readable(ret - 16)) return false;
-    const uint8_t* p = (const uint8_t*)(uintptr_t)ret;
-    if (p[-5] == 0xE8) return true;                     // call rel32
-    for (int len = 2; len <= 7; ++len) {
-        const uint8_t* c = p - len;
-        int i = 0;
-        if ((c[0] & 0xF0) == 0x40) i = 1;               // REX prefix
-        if (c[i] != 0xFF) continue;
-        if (i + 1 >= len) continue;
-        if (((c[i + 1] >> 3) & 0x7) == 2) return true;  // /2 == call r/m
-    }
-    return false;
+// The guest-code filter both recoverers share. guest_module_name is the same classifier
+// describe_code_address uses, so a frame reported here and a frame in a fault backtrace can never
+// disagree about what is guest code. STUB addresses are dropped too: an import stub is prosper's own
+// synthesized trampoline, and naming it as the caller answers the question with the mechanism
+// instead of the call site.
+bool is_guest_call_site(uint64_t a) {
+    const char* module = prosper::guest_module_name(a);
+    return std::strcmp(module, "mapped/host") != 0 && std::strcmp(module, "STUB") != 0;
 }
 }  // namespace
 
 int guest_frames_on_stack(uint64_t rsp_seed, uint64_t* out, int max) {
     if (!out || max <= 0 || rsp_seed <= 0x10000) return 0;
-    
+
     // Bound the scan by the guest thread's own registered stack when it has one, so the walk stops
     // at the real top rather than at an arbitrary window. Without a registration -- the main thread
     // before it is registered, or a thread the guest created behind our back -- fall back to a fixed
@@ -1399,21 +1386,8 @@ int guest_frames_on_stack(uint64_t rsp_seed, uint64_t* out, int max) {
         const uint64_t top = (uint64_t)(uintptr_t)stack_base + stack_size;
         if (top > rsp_seed && top < limit) limit = top;
     }
-    int kept = 0;
-    for (uint64_t a = rsp_seed & ~7ull; a + 8 <= limit && kept < max; a += 8) {
-        if (!addr_readable(a)) break;   // ran off the mapped stack: stop, do not skip
-        const uint64_t candidate = *(const uint64_t*)(uintptr_t)a;
-        if (candidate <= 0x10000) continue;
-        const char* module = prosper::guest_module_name(candidate);
-        if (std::strcmp(module, "mapped/host") == 0 || std::strcmp(module, "STUB") == 0) continue;
-        if (!addr_readable(candidate - 16)) continue;
-        if (!call_precedes(candidate, &addr_readable)) continue;
-        bool duplicate = false;
-        for (int j = 0; j < kept; ++j) duplicate |= out[j] == candidate;
-        if (duplicate) continue;
-        out[kept++] = candidate;
-    }
-    return kept;
+    return prosper::host::scan_stack_for_returns(rsp_seed, limit, out, max,
+                                                 &addr_readable, &is_guest_call_site);
 }
 
 int guest_frames_from_rbp(uint64_t rbp_seed, uint64_t* out, int max) {
@@ -1427,8 +1401,7 @@ int guest_frames_from_rbp(uint64_t rbp_seed, uint64_t* out, int max) {
                                                      cap > 64 ? 64 : cap, &addr_readable);
     int kept = 0;
     for (int i = 0; i < walked && kept < max; ++i) {
-        const char* module = prosper::guest_module_name(frames[i]);
-        if (std::strcmp(module, "mapped/host") == 0 || std::strcmp(module, "STUB") == 0) continue;
+        if (!is_guest_call_site(frames[i])) continue;
         bool duplicate = false;
         for (int j = 0; j < kept; ++j) duplicate |= out[j] == frames[i];
         if (duplicate) continue;
