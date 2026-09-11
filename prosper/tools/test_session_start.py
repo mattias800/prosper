@@ -50,16 +50,17 @@ def diagnosis(command, proc):
     """Say which interpreter could not be started, not merely that a number was not zero."""
     tried = ", ".join(name + " -> " + (shutil.which(name) or "NOT FOUND")
                       for name in interpreters(command))
-    return ("The SessionStart hook configured in .claude/settings.json exited "
-            + str(proc.returncode) + " and produced no session context." + chr(10)
-            + "  configured: "
-            + (command if isinstance(command, str) else " ".join(command)) + chr(10)
-            + "  interpreters this host resolves: " + tried + chr(10)
-            + "  hook stderr: " + (proc.stderr.strip() or "(none)") + chr(10)
-            + "A stock python.org install on Windows provides python.exe only, and the name "
-            "python3 there resolves to the Microsoft Store App Execution Alias stub, which exits "
-            "9009 without running anything (#3540). A failure here is a hook configuration "
-            "problem on this host, not a logic failure in session_start.py.")
+    return "\n".join([
+        "The SessionStart hook configured in .claude/settings.json exited "
+        + str(proc.returncode) + " and produced no session context.",
+        "  configured: " + (command if isinstance(command, str) else " ".join(command)),
+        "  interpreters this host resolves: " + tried,
+        "  hook stderr: " + (proc.stderr.strip() or "(none)"),
+        "A stock python.org install on Windows provides python.exe only, and the name python3 "
+        "there resolves to the Microsoft Store App Execution Alias stub, which exits 9009 without "
+        "running anything (#3540). A failure here is a hook configuration problem on this host, "
+        "not a logic failure in session_start.py.",
+    ])
 
 
 class StartupTest(unittest.TestCase):
