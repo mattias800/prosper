@@ -5,10 +5,11 @@ this project's black-render investigations actually turn on: **a pixel is the wr
 colour — did anything draw there at all, was it drawn and thrown away, did the shader run
 and compute black, or did the shader compute a colour that the store then lost?**
 
-Those answers send you to different files. Two more exist for cases that would otherwise be
-misreported: `CLEARED_AFTER_DRAW` (a later clear wiped surviving draws) and
+Those answers send you to different files. Three more exist for cases that would otherwise be
+misreported: `CLEARED_AFTER_DRAW` (a later clear wiped surviving draws),
 `OUTPUT_UNTRUSTED` (the explaining event has an unbound pixel shader, so its output is
-undefined and the tool refuses to guess). Telling them apart by inference —
+undefined and the tool refuses to guess), and `VALUE_UNKNOWN` (RenderDoc recorded no value
+for the event that would explain the pixel, so no colour can be read off it). Telling them apart by inference —
 draw censuses, disabling passes, bisecting state — is what has historically cost this
 project hours per defect, and the census route has produced retracted issues. RenderDoc
 answers it directly, per event, and `pixel_history.py` turns that into one call with one
@@ -30,12 +31,16 @@ What lives here:
   `pixel_history.py --expect-control` against its capture on any new driver before trusting the
   tool there; it checks every region's verdict *and* every rejection reason, which is the part a
   final picture cannot see.
-- `test_pixel_history.py` — the verdict logic, which is the part CI can reach.
+- `test_pixel_history.py` — the verdict logic, which is the part CI can reach. It also owns the
+  cases no capture can contain on demand: `FakeModification` stands in for RenderDoc's
+  `PixelModification` so a "RenderDoc has no value for this" event can be constructed by hand and
+  run through `modification_event()`, the same builder the replay path uses.
 
 ## The control is not ceremony
 
 It has earned itself **three times**, every time against an assumption that looked safe — and
-each one was written down as a confident comment before it was measured.
+each one was written down as a confident comment before it was measured. The fourth entry below
+is the one the control could **not** reach, which is why the list is not the whole guard.
 
 1. **RenderDoc populates `shaderOut` for events whose fragment shader never ran** — a scissored
    draw reports the *previous* draw's colour. On a game capture that is invisible: the number
@@ -51,6 +56,16 @@ each one was written down as a confident comment before it was measured.
    `ActionFlags::Clear`. The control could not see it, because it built only the flagged form:
    **it was validating the path the code handled.** It now builds both, and the check fails if
    either detection path is lost. Instrument trap 269.
+
+4. **An absence of data arrives as a number, and that number is black.** RenderDoc marks a value
+   it has nothing to report for by stamping a `0xdeadbeef` sentinel into it, which is read back
+   through the same float union as a real colour: word 0 becomes about `-6.26e18` and the rest stay
+   zero, so `max(rgb)` is **exactly 0.0** and the verdict came back `SHADER_WROTE_BLACK` — a
+   confident answer derived from a value whose whole meaning is "I do not know", on exactly the
+   black-pixel investigations people bring here. The control cannot construct this one: nothing a
+   Vulkan program does makes RenderDoc have no data. So the sentinel is built **by hand** in
+   `test_pixel_history.py`, in both of the shapes `SetInvalid()` might leave, and the verdict is now
+   `VALUE_UNKNOWN`. Instrument trap 278, #3404.
 
 Generalise: **a tool that reads a value cannot tell you the value is meaningful.** Only a
 construction whose answer you already know can — and only if that construction contains the hard

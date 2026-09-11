@@ -43,6 +43,26 @@ After, same machine, same route:
 <p align="center"><img src="assets/screenshots/alex-kidd-inf-preserve.webp" alt="Alex Kidd in Miracle World DX — Mt. Eternal rendering in full colour at 1920x1080"></p>
 
 
+### GTA V's Performance-mode route had been choosing a different setting entirely
+
+![GTA V Settings, old route: the Controls pane, with Show Controls For changed to In Aircraft](assets/screenshots/gta5-route-wrong-pane-controls-aircraft.webp)
+
+![GTA V Settings, fixed route: Display highlighted, Graphics Mode set to Performance](assets/screenshots/gta5-route-display-graphics-mode-performance.webp)
+
+Both pictures are the same route at the same point of the same build, minutes apart: the first is
+what it actually did on this machine, the second is what it was supposed to do. The route spelled
+each press as a window of display flips, which only states a duration at the flip rate it was tuned
+on -- and the menu ran at a third of that rate here, so presses meant to last 0.15 s lasted up to
+0.84 s, the title's key repeat walked the highlight past Display, and a Left meant for Graphics Mode
+changed a controls setting instead. Nothing errored; GTA V simply ran in Fidelity with ray tracing
+while the session was recorded as a Performance run. Presses can now say "hold 0.15 seconds from
+flip 2272" and mean it on any host.
+### Our own frame-pacing instrument was understating the frame rate by up to 40%
+
+The flip-pacing report's headline fps was a mean over intervals it had silently filtered, and
+the filtered fraction differs from run to run: on the #3379 A/B it read 44.1 vs 59.2 fps where
+the truth was 57.8 vs 97.9, which made the pacing fix below -- in fact holding 96% of its
+target -- look like it had missed by a quarter. It now counts flips over the wall clock.
 
 ### Games were running up to three times too fast, and it was the monitor's fault
 
@@ -50,6 +70,15 @@ prosper completed a game's page flip the instant it was ready instead of holding
 game asked for, so on a high-refresh monitor the game simply simulated faster -- 3x on a 180 Hz
 panel. It now holds each flip to the rate the title itself requested. No picture: this one you can
 only see by watching something move at the right speed.
+
+### The pixel-history tool could tell you a shader wrote black when it knew nothing at all
+
+No picture for this one. `pixel_history.py` is what we reach for when a pixel is the wrong colour,
+and RenderDoc marks a value it has no data for by stamping `0xdeadbeef` into it — which decodes,
+through the float view, to a colour whose brightest channel is exactly `0.0`. So "I have no
+information" was being reported as `SHADER_WROTE_BLACK`, sending the reader to resource binding and
+shaders over a pixel the instrument could not read. It now says `VALUE_UNKNOWN` and names what it is
+missing.
 
 ### One of the five “sheared triangle” titles renders perfectly
 

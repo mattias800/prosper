@@ -108,11 +108,27 @@ def main():
         failures.append(f"case 7: emitter source not found at {emitter}")
     else:
         text = emitter.read_text(encoding="utf-8", errors="replace")
-        flip_lines = [line for line in text.splitlines() if "[ev] GpuFlip" in line]
-        if not flip_lines:
-            failures.append("case 7: no [ev] GpuFlip emitter found in hle_graphics.cpp")
-        elif not any("t=%" in line for line in flip_lines):
-            failures.append("case 7: the [ev] GpuFlip emitter writes no t= timestamp, so every real log is unpaceable (#3452): " + flip_lines[0].strip())
+        # BOTH flip emitters, not just the one this parser reads. They are ALTERNATIVES: the
+        # in-stream GPU flip (`prosper_vo_flip_from_gpu`) and the API flip
+        # (`sceVideoOutSubmitFlip`) each advance the flip state on their own, so a title using
+        # the API path produces SubmitFlip lines and no GpuFlip lines at all. Greping only
+        # GpuFlip left the `t=` added to SubmitFlip in the same PR removable with nothing going
+        # red -- and it is the only timing this tool's successor would have for that class of
+        # title (#3462, the residual noted on #3453's review).
+        # The consequence differs per emitter, so say which one it is rather than pasting
+        # #3452's sentence over both -- the second is not the failure #3452 was.
+        for tag, consequence in (
+                ("[ev] GpuFlip",
+                 "so every log this parser reads is unpaceable (#3452)"),
+                ("[ev] SubmitFlip",
+                 "so a title that flips through the API path rather than the in-stream GPU"
+                 " packet records no flip timing at all (#3462)")):
+            flip_lines = [line for line in text.splitlines() if tag in line]
+            if not flip_lines:
+                failures.append(f"case 7: no {tag} emitter found in hle_graphics.cpp")
+            elif not any("t=%" in line for line in flip_lines):
+                failures.append(f"case 7: the {tag} emitter writes no t= timestamp, {consequence}: "
+                                + flip_lines[0].strip())
 
     # 8. A PARTIALLY readable log must say so. Reporting only when NOTHING parsed left the
     #    real hazard open: a handful of timestamped flips among thousands of untimed ones
@@ -166,6 +182,14 @@ def main():
     out, _ = run("\n".join(joined) + "\n")
     if "step backwards" not in out:
         failures.append(f"case 10: concatenated runs went undetected: {out!r}")
+    # ...and the HEADLINE must be marked void with it. Deriving the rate from the wall-clock span
+    # (#3560) is right for one run and meaningless for several: sorted, the span covers roughly
+    # one run's timeline while the flips come from all of them, so the rate over-counts by about
+    # the number of runs. Saying the intervals are not real while printing a confident rate above
+    # them would be the corrected instrument lying in a new place.
+    if "NOT meaningful" not in out:
+        failures.append(f"case 10: the rate over a concatenated span was printed without a"
+                        f" caveat, so the restart warning and the headline disagree: {out!r}")
 
     # ...and a single clean run must stay silent, or the warning becomes noise nobody reads.
     single = []
@@ -176,6 +200,9 @@ def main():
     out, _ = run("\n".join(single) + "\n")
     if "step backwards" in out:
         failures.append(f"case 10: a single monotonic run was flagged as concatenated: {out!r}")
+    if "NOT meaningful" in out:
+        failures.append(f"case 10: a single clean run's rate was voided, so the caveat is"
+                        f" automatic and carries no information: {out!r}")
 
     # 11. #3454: the tick-aligned share is meaningless without its null. The band is +/-BAND of
     #     the tick, so it covers 2*BAND of every tick period and an interval unrelated to the
@@ -381,6 +408,226 @@ def main():
             failures.append(f"case 19: full power must divide by CHANCE exactly, got {ratio}")
     except TypeError as exc:
         failures.append(f"case 19: no power term to scale the null with ({exc})")
+
+    # ---------------------------------------------------------------- #3560
+    # A HELPER FOR THE ARMS BELOW. Builds a timeline holding exactly `n_long` long intervals and
+    # `n_burst` sub-0.5 ms ones, spread evenly, over exactly `span_s` seconds -- so the run's TRUE
+    # rate is (n_long + n_burst) / span_s, computed here from the construction and never from the
+    # tool. The burst fraction is the free variable, which is the point: it is what the tool was
+    # silently filtering out of its own headline.
+    def burst_log(n_long, n_burst, span_s, burst_ms=0.2, t0=1.0):
+        long_ms = (span_s * 1000.0 - n_burst * burst_ms) / n_long
+        ivals = []
+        for i in range(n_long):
+            ivals.append(long_ms)
+            if n_burst and (i * n_burst) // n_long != ((i + 1) * n_burst) // n_long:
+                ivals.append(burst_ms)
+        t = t0
+        rows = [f"[ev] GpuFlip t={t:.6f} handle=0x1002 bufidx=0 mode=0x1 fliparg=0x0"]
+        for ms in ivals:
+            t += ms / 1000.0
+            rows.append(f"[ev] GpuFlip t={t:.6f} handle=0x1002 bufidx=0 mode=0x1 fliparg=0x0")
+        return "\n".join(rows) + "\n"
+
+    def headline(out):
+        m = re.search(r"-> ([0-9.]+) fps average", out)
+        return None if m is None else float(m.group(1))
+
+    # 20. THE ARM FOR #3560. The headline rate was 1000/mean of the RETAINED intervals, and the
+    #     retained fraction varies per run -- so two runs' headline figures were means over
+    #     different populations while reading as the runs' rates. Measured on the #3379 A/B: 44.1
+    #     vs 59.2 fps reported against a wall-clock truth of 57.8 vs 97.9, a 1.34x ratio where the
+    #     truth is 1.65x, which made a working pacing fix look like it had missed by a quarter.
+    #
+    #     So the arm is NOT 'a rate is printed' -- that passes either way. Two runs with the SAME
+    #     true rate and DIFFERENT burst fractions must report the same figure. Both carry 1200
+    #     intervals over 20.000 s, i.e. 60.0 flips/s by construction; one drops 10% of them to the
+    #     filter and the other 50%. Pre-fix they report 54.1 and 30.2.
+    sparse = burst_log(n_long=1080, n_burst=120, span_s=20.0)   # 10% burst
+    dense = burst_log(n_long=600, n_burst=600, span_s=20.0)     # 50% burst
+    out_sparse, _ = run(sparse)
+    out_dense, _ = run(dense)
+    r_sparse, r_dense = headline(out_sparse), headline(out_dense)
+    if r_sparse is None or r_dense is None:
+        failures.append(f"case 20: no headline rate in one of the reports: "
+                        f"{out_sparse!r} / {out_dense!r}")
+    else:
+        for name, rate in (("10%-burst", r_sparse), ("50%-burst", r_dense)):
+            if abs(rate - 60.0) > 0.6:
+                failures.append(
+                    f"case 20: the {name} run is 1200 flips over 20.000 s = 60.0 flips/s by"
+                    f" construction, and the report says {rate} fps -- the headline is a mean over"
+                    f" the filtered population, not the run's rate (#3560)")
+        if abs(r_sparse - r_dense) > 0.5:
+            failures.append(
+                f"case 20: two runs at the same true rate reported {r_sparse} and {r_dense} fps"
+                f" because they retained different fractions of their intervals, so the figures"
+                f" this tool exists to compare are not comparable (#3560)")
+
+    # 21. ...and the filtered population must be STATED wherever it is used, or the mean printed
+    #     beside the headline silently describes a different population from the headline itself.
+    #     The retention is a fraction, not just a count: `intervals=12318` next to `flips=16028`
+    #     never told anyone the two lines disagreed on purpose.
+    expect(out_dense, "600 of 1200 retained", "case 21 the retained count is related to the total")
+    expect(out_dense, "50.0%", "case 21 the retention is stated as a fraction")
+    if "NOT the run's period" not in out_dense:
+        failures.append(f"case 21: the retained mean is printed without saying it is not the run's"
+                        f" period, so 1000/mean still reads as the rate: {out_dense!r}")
+
+    # 22. THE SAME DEFECT ONE LEVEL DOWN, which is where this file's history says a correction
+    #     tends to leave it (instrument trap 275: three corrections each carried the previous
+    #     defect forward in a narrower form). Every window row printed 1000/mean of its own
+    #     retained subset, so a bursty phase and a genuinely slower phase produced identical rows;
+    #     and the windows were cut over the FILTERED list while their ordinals were labelled
+    #     'flips'. This run holds two 10 s phases, both at 60 flips/s: one clean, one paired. All
+    #     four windows must read ~60 fps. Pre-fix they read 60.0, 60.0, 45.1, 30.2.
+    clean = burst_log(n_long=600, n_burst=0, span_s=10.0, t0=1.0)
+    paired = burst_log(n_long=300, n_burst=300, span_s=10.0, t0=11.0)
+    # Drop `paired`'s first line: it would duplicate the seam rather than continue the timeline.
+    two_phase = clean + "\n".join(paired.strip().splitlines()[1:]) + "\n"
+    out, _ = run(two_phase, ["--window-s", "5"])
+    rows = re.findall(r"flips\s+(\d+)-\s*(\d+):\s+([0-9.]+) fps", out)
+    if len(rows) < 4:
+        failures.append(f"case 22: expected four window rows, got {rows!r}: {out!r}")
+    else:
+        for start, end, fps in rows:
+            if abs(float(fps) - 60.0) > 3.0:
+                failures.append(
+                    f"case 22: window {start}-{end} holds 5 s of a 60 flips/s phase and reports"
+                    f" {fps} fps -- the window rate is 1000/mean of its retained subset (#3560)")
+        # The ordinals say 'flips', so the last one must reach the last interval. Cut over the
+        # filtered list it stops at the retained count, which on this run is 900 of 1200.
+        if int(rows[-1][1]) != 1200:
+            failures.append(
+                f"case 22: the window ordinals are labelled 'flips' but the last one ends at"
+                f" {rows[-1][1]} of 1200 intervals, so they index the filtered list (#3560)")
+
+    # 23. Degenerate spans, now that a rate is computed from one.
+    #     (a) An all-burst run has no distribution to report and a perfectly well-defined rate:
+    #         199 intervals of 0.1 ms is 10000 flips/s. Pre-fix it printed 'no usable intervals'
+    #         and no rate at all, which is the filter deciding the run did not happen.
+    all_burst = burst_log(n_long=199, n_burst=0, span_s=0.0199)
+    out, code = run(all_burst)
+    rate = headline(out)
+    if rate is None or abs(rate - 10000.0) > 100.0:
+        failures.append(f"case 23a: an all-burst run reported no usable rate ({rate}): {out!r}")
+    if "no population" not in out:
+        failures.append(f"case 23a: the empty distribution population went unnamed: {out!r}")
+    #     (b) ...and a timeline with no extent must refuse rather than divide by its own zero.
+    #         NOTE this half passes in BOTH directions -- the pre-fix tool never divided, because
+    #         it never computed a span. It is a guard against the fix, not a discriminator, and is
+    #         counted as neither.
+    out, code = run("[ev] GpuFlip t=1.000000\n" * 5)
+    if code != 0 or "Traceback" in out:
+        failures.append(f"case 23b: identical timestamps crashed the report (rc={code}): {out!r}")
+    if headline(out) is not None:
+        failures.append(f"case 23b: a rate was printed for a timeline with no extent: {out!r}")
+    # ---------------------------------------------------------------- #3462
+    # 24. A RACE IS NOT A RESTART, and the detector printed the same sentence for both. The
+    #     backwards-step detector (#3453) has no magnitude threshold, so a sub-microsecond
+    #     interleave between two emitting threads -- `evlog_seconds()` is evaluated as a function
+    #     argument and the stream lock is taken afterwards -- asserted "this input holds more than
+    #     one run", which is a different fact with a different remedy (fix the emitter's ordering
+    #     versus pass the runs separately). Two lines emitted 50 us out of order in an otherwise
+    #     monotonic 60 Hz run.
+    rows, t = [], 1.0
+    for i in range(300):
+        if i in (100, 200):
+            # The thread that read the clock LATER reached the stream first.
+            rows.append(f"[ev] GpuFlip t={t + 0.000050:.6f} handle=0x1002 bufidx=0 mode=0x1 fliparg=0x0")
+        rows.append(f"[ev] GpuFlip t={t:.6f} handle=0x1002 bufidx=0 mode=0x1 fliparg=0x0")
+        t += 1.0 / 60.0
+    rows_race = list(rows)
+    out, _ = run("\n".join(rows) + "\n")
+    expect(out, "step backwards 2 time(s)", "case 24 the backwards steps are still detected")
+    expect(out, "0.050 ms", "case 24 the magnitude of the largest step is stated")
+    if "more than one run" in out:
+        failures.append(f"case 24: a 50 us emission race was reported as a second run, which it"
+                        f" cannot be -- a restart steps back by a whole run (#3462): {out!r}")
+    if "EMISSION" not in out:
+        failures.append(f"case 24: the out-of-order emission was never named, so the remedy the"
+                        f" message implies is the wrong one (#3462): {out!r}")
+
+    # 25. ...and the real restart must keep its verdict AND gain the magnitude that justifies it,
+    #     or this becomes a blanket loosening rather than a distinction. Two 60 Hz runs
+    #     concatenated, so the seam steps back by the first run's whole elapsed time.
+    rows, stamps = [], []
+    for _ in range(2):
+        t = 1.0
+        for _ in range(200):
+            stamps.append(t)
+            rows.append(f"[ev] GpuFlip t={t:.6f} handle=0x1002 bufidx=0 mode=0x1 fliparg=0x0")
+            t += 1.0 / 60.0
+    out, _ = run("\n".join(rows) + "\n")
+    # Derived from the construction rather than restated: the seam steps back from the first
+    # run's last stamp to the second run's first, which is 199 frames at 60 Hz, not 200.
+    seam_s = stamps[199] - stamps[200]
+    expect(out, "more than one run", "case 25 a real restart is still called a restart")
+    expect(out, f"{seam_s:.3f} s",
+           "case 25 the restart states the magnitude that justifies the verdict")
+    if "EMISSION" in out:
+        failures.append(f"case 25: a 3.3 s run boundary was reported as emission jitter: {out!r}")
+
+    # 25b. #3560 AND #3462 MEET HERE, and the textual merge of them was clean and broken.
+    #      #3560 added a "<-- NOT meaningful" marker on the headline rate, keyed on the
+    #      `restarts` parameter; #3462 renamed that parameter to `backsteps`. The merge left a
+    #      line naming a variable that no longer exists -- a NameError on every input reaching
+    #      it -- and no arm noticed, because each branch's own suite passed on its own base.
+    #      So the marker is pinned here to the CLASSIFICATION, in BOTH directions:
+    #
+    #        * a RESTART voids the rate: several runs have no single span to divide by.
+    #        * a RACE does NOT: the input is ONE run whose emission interleaved, its span is
+    #          real, and voiding it would be a fresh false negative -- the opposite failure
+    #          to the one #3560 exists to fix, arrived at from the other side.
+    #
+    #      Case 25's `out` (a restart) is reused and case 24's rows are re-run, so this arm
+    #      cannot drift from the constructions it judges.
+    if "Traceback" in out:
+        failures.append(f"case 25b: the restart report crashed: {out!r}")
+    if "NOT meaningful" not in out:
+        failures.append(f"case 25b: a concatenated input's headline rate was printed with no"
+                        f" caveat -- there is no single span to divide by (#3560): {out!r}")
+    out_race, _ = run("\n".join(rows_race) + "\n")
+    if "Traceback" in out_race:
+        failures.append(f"case 25b: the race report crashed -- the #3560 marker is reading a"
+                        f" parameter #3462 renamed: {out_race!r}")
+    if "NOT meaningful" in out_race:
+        failures.append(f"case 25b: a 50 us emission race voided the headline rate, but the"
+                        f" input is ONE run and its wall-clock span is real (#3462):"
+                        f" {out_race!r}")
+
+    # 26. The classifier asserted directly, so a wording change in the printer cannot move a
+    #     boundary, and so the MIDDLE band is pinned: a step too large for a scheduler quantum
+    #     and too small for a run is neither, and saying so is the point of the fix. A single
+    #     threshold would only move the boundary and go on printing one of the two sentences.
+    #     Wrapped because a tool with no classifier at all is the PRE-FIX state, and it must
+    #     produce named failures rather than an AttributeError that aborts the run.
+    describe = getattr(FPR, "describe_backsteps", None)
+    if describe is None:
+        failures.append("case 26: flip_pacing_report exposes no describe_backsteps, so the"
+                        " backwards-step magnitude is never classified at all (#3462)")
+    else:
+        race_ms = getattr(FPR, "RACE_MS", None)
+        restart_ms = getattr(FPR, "RESTART_MS", None)
+        if race_ms is None or restart_ms is None:
+            failures.append("case 26: no RACE_MS/RESTART_MS thresholds are stated (#3462)")
+        else:
+            checks = [
+                ([], None, "no backwards step is no verdict"),
+                ([race_ms], "race", "a step at the jitter ceiling is emission, not a restart"),
+                ([restart_ms], "restart", "a step at a whole second is a run boundary"),
+                ([(race_ms + restart_ms) / 2.0], "unclear",
+                 "a step between the two is named as unclassifiable, not guessed"),
+                ([0.05, 5.0 * restart_ms], "restart",
+                 "the LARGEST step decides: jitter beside a restart is still a restart"),
+            ]
+            for steps, want, what in checks:
+                kind, sentence = describe(steps)
+                if kind != want:
+                    failures.append(f"case 26: {what} -- describe_backsteps({steps}) said"
+                                    f" {kind!r}, expected {want!r}")
+                if want == "unclear" and "more than one run" in sentence:
+                    failures.append("case 26: the unclassifiable band still asserts a second run")
 
     if failures:
         print("FAILURES:")
