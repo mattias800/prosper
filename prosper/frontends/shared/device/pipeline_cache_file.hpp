@@ -47,13 +47,17 @@ struct PipelineCacheFile {
             read_le(blob.data() + 12, 4) == device.deviceID &&
             std::memcmp(blob.data() + 16, device.pipelineCacheUUID, VK_UUID_SIZE) == 0;
     }
-    static PipelineCacheFile graphics(const VkPhysicalDeviceProperties& properties) {
+    // `stage_prefix` separates the graphics and compute blobs: a VkPipelineCache is per-device, not
+    // per-stage, but the two live on different VkDevices whenever compute runs on its own device,
+    // and mixing them would make one context's save clobber the other's.
+    static PipelineCacheFile for_stage(const VkPhysicalDeviceProperties& properties,
+                                       const char* stage_prefix, const char* explicit_path_env) {
         PipelineCacheFile file;
         file.device = properties;
         if (std::getenv("PROSPER_NO_DISK_PIPELINE_CACHE")) return file;
         // Explicit paths also count as opt-in, matching the existing compute policy. This is
         // deliberately not default-on: identity checks do not cure the NVIDIA blob-load crash.
-        if (const char* p = std::getenv("PROSPER_GRAPHICS_PIPELINE_CACHE_PATH")) {
+        if (const char* p = std::getenv(explicit_path_env)) {
             file.path = p;
             return file;
         }
@@ -72,15 +76,28 @@ struct PipelineCacheFile {
             directory = std::filesystem::path(base) / ".cache";
         }
 #endif
-        char name[160];
-        std::snprintf(name, sizeof(name), "graphics-vkcache-v1-%08x-%08x-%08x-",
-                      properties.vendorID, properties.deviceID, properties.driverVersion);
+        char name[192];
+        if (std::snprintf(name, sizeof(name), "%s-%08x-%08x-%08x-", stage_prefix,
+                          properties.vendorID, properties.deviceID,
+                          properties.driverVersion) >= int(sizeof(name)))
+            return file;
         std::string identity(name);
         for (uint8_t b : properties.pipelineCacheUUID) {
             char hex[3]; std::snprintf(hex, sizeof(hex), "%02x", b); identity += hex;
         }
         file.path = directory / "prosper" / identity;
         return file;
+    }
+    static PipelineCacheFile graphics(const VkPhysicalDeviceProperties& properties) {
+        return for_stage(properties, "graphics-vkcache-v1",
+                         "PROSPER_GRAPHICS_PIPELINE_CACHE_PATH");
+    }
+    // v2, not v1: the compute backend used to write the driver blob to this directory RAW, with no
+    // envelope, so a header check alone could not tell a truncated file from a good one (#3425). A
+    // separate identity means an older build's v1 file and this one never overwrite each other.
+    static PipelineCacheFile compute(const VkPhysicalDeviceProperties& properties) {
+        return for_stage(properties, "compute-vkcache-v2",
+                         "PROSPER_COMPUTE_PIPELINE_CACHE_PATH");
     }
     std::vector<uint8_t> load() const {
         if (path.empty()) return {};

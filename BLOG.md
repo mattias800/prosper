@@ -44,6 +44,24 @@ After, same machine, same route:
 
 
 
+### Games were running up to three times too fast, and it was the monitor's fault
+
+prosper completed a game's page flip the instant it was ready instead of holding it to the 60 Hz the
+game asked for, so on a high-refresh monitor the game simply simulated faster -- 3x on a 180 Hz
+panel. It now holds each flip to the rate the title itself requested. No picture: this one you can
+only see by watching something move at the right speed.
+
+### One of the five “sheared triangle” titles renders perfectly
+
+![Evergate title screen, Windows/NVIDIA, native 1920x1080](assets/screenshots/evergate-title-screen-windows-nvidia.webp)
+
+Evergate is the worst case on #3374's list of five rung-6 Unity titles that draw their correct art
+through huge sheared triangles — reported there as a whole frame of white and orange shear with the
+backdrop showing underneath, frozen. On Windows/NVIDIA it is the picture above, animating, across 130
+samples. Two candidate causes died on the way: the capture harness, and the RectList fourth-corner fix
+that landed after the measurement — reverting that one changes nothing, so it is not what fixed this.
+The remaining suspect is Linux/AMD, which this machine has no GPU to test.
+
 ### Two titles that could not boot at all now boot, and neither needed a renderer change
 
 *FINAL FANTASY TACTICS – The Ivalice Chronicles* killed itself about a second into every launch. It

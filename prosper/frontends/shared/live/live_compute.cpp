@@ -13,6 +13,7 @@
 #include "shared/live/gpu_retile.hpp"
 #include "shared/rtt/rtt_scale.hpp"
 #include "shared/rtt/rtt_authority.hpp"
+#include "shared/device/pipeline_cache_file.hpp"  // #3425: one checked envelope for both stages
 #include "shared/device/vulkan_device_select.hpp"
 #include "shared/device/image_robustness.hpp"  // #3531: the recompiler's OOB image-read contract
 #include "shared/texture/write_watch_census.hpp"
@@ -80,20 +81,14 @@ bool compute_pipeline_cache_blob_compatible(
     const uint8_t* pipeline_cache_uuid, size_t uuid_bytes) {
     // VkPipelineCacheHeaderVersionOne is a serialized five-field prefix. Avoid casting untrusted
     // file bytes to the structure so short and unaligned files are rejected before any read.
-    constexpr size_t scalar_bytes = 4u * sizeof(uint32_t);
-    constexpr size_t prefix_bytes = scalar_bytes + VK_UUID_SIZE;
-    if (!blob || !pipeline_cache_uuid || uuid_bytes != VK_UUID_SIZE ||
-        blob_bytes < prefix_bytes)
-        return false;
-    uint32_t header_size = 0, header_version = 0, cached_vendor = 0, cached_device = 0;
-    std::memcpy(&header_size, blob + 0u * sizeof(uint32_t), sizeof(uint32_t));
-    std::memcpy(&header_version, blob + 1u * sizeof(uint32_t), sizeof(uint32_t));
-    std::memcpy(&cached_vendor, blob + 2u * sizeof(uint32_t), sizeof(uint32_t));
-    std::memcpy(&cached_device, blob + 3u * sizeof(uint32_t), sizeof(uint32_t));
-    return header_size >= prefix_bytes && header_size <= blob_bytes &&
-           header_version == VK_PIPELINE_CACHE_HEADER_VERSION_ONE &&
-           cached_vendor == vendor_id && cached_device == device_id &&
-           std::memcmp(blob + scalar_bytes, pipeline_cache_uuid, VK_UUID_SIZE) == 0;
+    // The decode itself lives in PipelineCacheFile so the graphics and compute paths cannot drift
+    // apart; this wrapper keeps the exported name and its own regression coverage.
+    if (!blob || !pipeline_cache_uuid || uuid_bytes != VK_UUID_SIZE) return false;
+    PipelineCacheFile identity;
+    identity.device.vendorID = vendor_id;
+    identity.device.deviceID = device_id;
+    std::memcpy(identity.device.pipelineCacheUUID, pipeline_cache_uuid, VK_UUID_SIZE);
+    return identity.compatible(std::span<const uint8_t>(blob, blob_bytes));
 }
 
 LiveComputeBufferDescriptorPlan plan_live_compute_buffer_descriptors(
@@ -1437,8 +1432,14 @@ struct VulkanComputeContext {
     VkDevice device = VK_NULL_HANDLE;
     VkQueue queue = VK_NULL_HANDLE;
     VkPipelineCache pipeline_cache = VK_NULL_HANDLE;
-    std::filesystem::path pipeline_cache_path;
-    std::mutex pipeline_cache_mutex;
+    PipelineCacheFile pipeline_cache_file;
+    // Bytes the driver ACCEPTED from disk when this device's cache was created; 0 means the run
+    // started cold. Written once during init, before any other thread can observe the context.
+    uint64_t pipeline_cache_loaded_bytes = 0;
+    // Timed, not plain: the shutdown snapshot runs on the main thread while a detached guest thread
+    // may still be inside vkCreateComputePipelines, and a driver compile that never returns must
+    // cost a missed save rather than an app that will not close (#3425).
+    std::timed_mutex pipeline_cache_mutex;
     VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
     // #3157: the GPU result-comparison pool, owned by the context so it is reset rather than
     // recreated per dispatch. It contributed about 144 vkCreateDescriptorPool + 144 vkDestroy per
@@ -1537,77 +1538,27 @@ struct VulkanComputeContext {
     // VK_ERROR_DEVICE_LOST is permanent for a VkDevice. Keep the first failure latched so later
     // PM4 dispatches cannot spend minutes rebuilding resources and submitting work that Vulkan is
     // required to reject. AGC submit execution serializes access to this context.
-    bool device_lost = false;
+    std::atomic<bool> device_lost{false};
     // A queue API was entered and no fence or queue-idle result proved completion. The current item
     // and this context then retain objects that Vulkan may still own; neither may be destroyed.
-    bool completion_unproven = false;
+    std::atomic<bool> completion_unproven{false};
 
-    std::filesystem::path persistent_pipeline_cache_path() const {
-        if (std::getenv("PROSPER_NO_DISK_PIPELINE_CACHE")) return {};
-        if (const char* explicit_path = std::getenv("PROSPER_COMPUTE_PIPELINE_CACHE_PATH")) {
-            if (*explicit_path) return std::filesystem::path(explicit_path);
-            return {};
-        }
+    bool create_pipeline_cache() {
+        VkPhysicalDeviceProperties properties{};
+        vkGetPhysicalDeviceProperties(physical, &properties);
         // Loading a driver-produced cache blob is not yet a safe default. Repeated GTA V runs on
         // NVIDIA reproduced an nvoglv64.dll crash only on the cache-load route; UUID/header
         // validation proves device compatibility, not that the vendor blob itself is robust. Keep
         // persistence available for controlled measurements, but require an explicit opt-in until
-        // that driver failure has a guarded reproducer.
-        if (!std::getenv("PROSPER_DISK_PIPELINE_CACHE")) return {};
-        const char* base = nullptr;
-        [[maybe_unused]] bool base_is_home = false;
-#ifdef _WIN32
-        base = std::getenv("LOCALAPPDATA");
-#else
-        base = std::getenv("XDG_CACHE_HOME");
-        if (!base || !*base) {
-            base = std::getenv("HOME");
-            base_is_home = true;
-        }
-#endif
-        if (!base || !*base) return {};
-        VkPhysicalDeviceProperties properties{};
-        vkGetPhysicalDeviceProperties(physical, &properties);
-        char identity[160]{};
-        char* out = identity;
-        const size_t remaining = sizeof(identity);
-        const int prefix = std::snprintf(
-            out, remaining, "compute-vkcache-v1-%08x-%08x-",
-            properties.vendorID, properties.deviceID);
-        if (prefix < 0 || static_cast<size_t>(prefix) >= remaining) return {};
-        out += prefix;
-        for (uint8_t byte : properties.pipelineCacheUUID) {
-            const int written = std::snprintf(out,
-                static_cast<size_t>(identity + sizeof(identity) - out), "%02x", byte);
-            if (written != 2) return {};
-            out += 2;
-        }
-        std::filesystem::path directory(base);
-#ifndef _WIN32
-        if (base_is_home) directory /= ".cache";
-#endif
-        return directory / "prosper" / identity;
-    }
-
-    bool create_pipeline_cache() {
-        pipeline_cache_path = persistent_pipeline_cache_path();
+        // that driver failure has a guarded reproducer. PipelineCacheFile owns that policy for
+        // both stages, so graphics and compute cannot drift apart on it.
         std::vector<uint8_t> initial;
-        VkPhysicalDeviceProperties properties{};
-        vkGetPhysicalDeviceProperties(physical, &properties);
-        if (!pipeline_cache_path.empty()) {
-            std::error_code ec;
-            const uintmax_t bytes = std::filesystem::file_size(pipeline_cache_path, ec);
-            constexpr uintmax_t max_cache_bytes = 256ull * 1024ull * 1024ull;
-            if (!ec && bytes && bytes <= max_cache_bytes) {
-                initial.resize(static_cast<size_t>(bytes));
-                std::ifstream input(pipeline_cache_path, std::ios::binary);
-                input.read(reinterpret_cast<char*>(initial.data()),
-                           static_cast<std::streamsize>(initial.size()));
-                if (!input || !compute_pipeline_cache_blob_compatible(
-                        initial.data(), initial.size(), properties.vendorID,
-                        properties.deviceID, properties.pipelineCacheUUID, VK_UUID_SIZE))
-                    initial.clear();
-            }
+        try {
+            pipeline_cache_file = PipelineCacheFile::compute(properties);
+            initial = pipeline_cache_file.load();
+        } catch (const std::exception&) {
+            std::fprintf(stderr, "[compute] disk pipeline cache unavailable; starting empty\n");
+            initial.clear();
         }
         VkPipelineCacheCreateInfo pcci{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
         pcci.initialDataSize = initial.size();
@@ -1622,66 +1573,61 @@ struct VulkanComputeContext {
             initial.clear();
         }
         if (result != VK_SUCCESS) return false;
-        if (!pipeline_cache_path.empty())
+        pipeline_cache_loaded_bytes = initial.size();
+        if (!pipeline_cache_file.path.empty())
             std::fprintf(stderr, "[compute] disk pipeline cache %s: %s (%zu bytes)\n",
                          initial.empty() ? "cold" : "loaded",
-                         pipeline_cache_path.string().c_str(), initial.size());
+                         pipeline_cache_file.path.string().c_str(), initial.size());
         return true;
     }
 
-    void persist_pipeline_cache() {
-        if (!pipeline_cache || pipeline_cache_path.empty() || device_lost ||
-            completion_unproven)
-            return;
-        // VkPipelineCache is externally synchronized. The frontend's _Exit flush can overlap the
-        // last guest dispatch even after a cooperative-stop request, so serialize it against every
-        // vkCreateComputePipelines call that mutates the cache.
-        std::lock_guard<std::mutex> cache_lock(pipeline_cache_mutex);
-        size_t bytes = 0;
-        if (vkGetPipelineCacheData(device, pipeline_cache, &bytes, nullptr) != VK_SUCCESS ||
-            !bytes || bytes > 256ull * 1024ull * 1024ull)
-            return;
-        std::vector<uint8_t> blob(bytes);
-        if (vkGetPipelineCacheData(device, pipeline_cache, &bytes, blob.data()) != VK_SUCCESS)
-            return;
-        blob.resize(bytes);
-        VkPhysicalDeviceProperties properties{};
-        vkGetPhysicalDeviceProperties(physical, &properties);
-        if (!compute_pipeline_cache_blob_compatible(
-                blob.data(), blob.size(), properties.vendorID, properties.deviceID,
-                properties.pipelineCacheUUID, VK_UUID_SIZE))
-            return;
-        std::error_code ec;
-        std::filesystem::create_directories(pipeline_cache_path.parent_path(), ec);
-        if (ec) return;
-        const auto nonce = std::chrono::steady_clock::now().time_since_epoch().count();
-        std::filesystem::path temporary = pipeline_cache_path;
-        temporary += ".tmp-" + std::to_string(nonce);
-        {
-            std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
-            output.write(reinterpret_cast<const char*>(blob.data()),
-                         static_cast<std::streamsize>(blob.size()));
-            output.flush();
-            if (!output) {
-                output.close();
-                std::filesystem::remove(temporary, ec);
-                return;
+    // Snapshot the driver cache WITHOUT tearing the context down, so a frontend that leaves through
+    // _Exit still persists what this run compiled (#3425). Returns whether the file was written, so
+    // a caller and a test can tell "nothing to save" from "the save was declined".
+    //
+    // `lock_budget` bounds the wait deliberately: on the shutdown path a detached guest thread may
+    // still be inside vkCreateComputePipelines, and a compile that never returns must cost a missed
+    // cache rather than an app that cannot close.
+    bool persist_pipeline_cache(
+            std::chrono::milliseconds lock_budget = std::chrono::milliseconds(1000)) {
+        if (!pipeline_cache || pipeline_cache_file.path.empty()) return false;
+        // Read once, and read the atomics: this runs on the main thread while the guest thread may
+        // still be writing them. A lost device or an unproven completion means Vulkan may still own
+        // objects here, so touching the cache handle at all is unsafe.
+        if (device_lost.load(std::memory_order_acquire) ||
+            completion_unproven.load(std::memory_order_acquire)) {
+            std::fprintf(stderr, "[compute] disk pipeline cache save skipped: device state unproven\n");
+            return false;
+        }
+        try {
+            std::vector<uint8_t> blob;
+            {
+                // VkPipelineCache is externally synchronized: serialize against every
+                // vkCreateComputePipelines call that mutates it.
+                std::unique_lock<std::timed_mutex> lock(pipeline_cache_mutex, std::defer_lock);
+                if (!lock.try_lock_for(lock_budget)) {
+                    std::fprintf(stderr,
+                                 "[compute] disk pipeline cache save skipped: compilation busy\n");
+                    return false;
+                }
+                size_t bytes = 0;
+                if (vkGetPipelineCacheData(device, pipeline_cache, &bytes, nullptr) != VK_SUCCESS ||
+                    !bytes || bytes > PipelineCacheFile::max_bytes)
+                    return false;
+                blob.resize(bytes);
+                if (vkGetPipelineCacheData(device, pipeline_cache, &bytes, blob.data()) != VK_SUCCESS)
+                    return false;
+                blob.resize(bytes);
             }
+            const bool saved = pipeline_cache_file.save(blob);
+            std::fprintf(stderr, "[compute] disk pipeline cache %s: %s (%zu bytes)\n",
+                         saved ? "saved" : "save failed",
+                         pipeline_cache_file.path.string().c_str(), blob.size());
+            return saved;
+        } catch (const std::exception&) {
+            std::fprintf(stderr, "[compute] disk pipeline cache save failed\n");
+            return false;
         }
-        std::filesystem::rename(temporary, pipeline_cache_path, ec);
-        if (ec) {
-            ec.clear();
-            std::filesystem::remove(pipeline_cache_path, ec);
-            ec.clear();
-            std::filesystem::rename(temporary, pipeline_cache_path, ec);
-        }
-        if (ec) {
-            ec.clear();
-            std::filesystem::remove(temporary, ec);
-            return;
-        }
-        std::fprintf(stderr, "[compute] disk pipeline cache saved: %s (%zu bytes)\n",
-                     pipeline_cache_path.string().c_str(), blob.size());
     }
 
     ~VulkanComputeContext() {
@@ -3255,7 +3201,7 @@ struct VulkanComputeContext {
         cpci.stage.module = compare_shader;
         cpci.stage.pName = "main";
         cpci.layout = compare_pipeline_layout;
-        std::lock_guard<std::mutex> cache_lock(pipeline_cache_mutex);
+        std::lock_guard<std::timed_mutex> cache_lock(pipeline_cache_mutex);
         return vkCreateComputePipelines(device, pipeline_cache, 1, &cpci, nullptr,
                                         &compare_pipeline) == VK_SUCCESS;
     }
@@ -3530,7 +3476,9 @@ struct VulkanComputeContext {
 
 };
 
-VulkanComputeContext* g_live_compute_context = nullptr;
+// Published with release / read with acquire: prosper-app's shutdown snapshot reads this from
+// the MAIN thread while the guest thread is still dispatching (#3425).
+std::atomic<VulkanComputeContext*> g_live_compute_context{nullptr};
 std::atomic<uint64_t> g_sampled_image_upload_skips{0};
 std::atomic<uint64_t> g_cpu_fill_dispatches{0};
 
@@ -7464,7 +7412,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         image_descriptors[i].sampled_float &&
                         std::getenv("PROSPER_NO_GPU_PACKED_RTT") == nullptr;
                     if (packed10_copy) {
-                        std::lock_guard<std::mutex> cache_lock(ctx.pipeline_cache_mutex);
+                        std::lock_guard<std::timed_mutex> cache_lock(ctx.pipeline_cache_mutex);
                         auto& conversion = ctx.packed_rtt_conversion;
                         const VkResult injected = g_next_packed_rtt_setup_result_for_test.exchange(
                             VK_SUCCESS, std::memory_order_acq_rel);
@@ -9700,8 +9648,19 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 auto& retile = array ? ctx.paired16_retile_pipeline :
                     volume ? ctx.volume_retile_pipeline : ctx.retile_pipeline;
                 auto prepare = [&] {
-                    if (!vk_soft_ok(retile.initialize(ctx.device, ctx.pipeline_cache, bi.retile_parameters.kind),
-                                    "retile-pipeline")) return false;
+                    // #3425: this creates a compute pipeline INTO the shared VkPipelineCache, which
+                    // Vulkan externally synchronizes. Every other creator here already takes this
+                    // lock (the packed-RTT conversion above, and the two dispatch pipelines); this
+                    // one did not, and the shutdown snapshot is now a real concurrent reader of the
+                    // same handle rather than only a destructor that runs when nothing else can.
+                    bool retile_ready = false;
+                    {
+                        std::lock_guard<std::timed_mutex> cache_lock(ctx.pipeline_cache_mutex);
+                        retile_ready = vk_soft_ok(
+                            retile.initialize(ctx.device, ctx.pipeline_cache,
+                                              bi.retile_parameters.kind), "retile-pipeline");
+                    }
+                    if (!retile_ready) return false;
                     VkBufferCreateInfo ci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
                     ci.size = bi.retile_parameters.tiled_bytes;
                     ci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
@@ -9961,7 +9920,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                               low_latency_compile ? "disabled-for-cold-latency" : "driver-default");
             VkResult pipeline_result = VK_SUCCESS;
             {
-                std::lock_guard<std::mutex> cache_lock(ctx.pipeline_cache_mutex);
+                std::lock_guard<std::timed_mutex> cache_lock(ctx.pipeline_cache_mutex);
                 pipeline_result = vkCreateComputePipelines(
                     ctx.device, ctx.pipeline_cache, 1, &cpci, nullptr, &pipeline);
             }
@@ -12237,16 +12196,27 @@ void report_live_compute_timing_selector_summary() {
     runtime_compute_authority_census().report_summary();
 }
 
-void flush_live_compute_pipeline_cache() {
-    VulkanComputeContext* context = g_live_compute_context;
-    if (context) context->persist_pipeline_cache();
+bool flush_live_compute_pipeline_cache(std::chrono::milliseconds lock_budget) {
+    VulkanComputeContext* context = g_live_compute_context.load(std::memory_order_acquire);
+    return context && context->persist_pipeline_cache(lock_budget);
+}
+
+LiveComputePipelineCacheStatus live_compute_pipeline_cache_status() {
+    LiveComputePipelineCacheStatus status;
+    const VulkanComputeContext* context =
+        g_live_compute_context.load(std::memory_order_acquire);
+    if (!context) return status;
+    status.context_live = true;
+    status.persistence_configured = !context->pipeline_cache_file.path.empty();
+    status.loaded_bytes = context->pipeline_cache_loaded_bytes;
+    return status;
 }
 
 bool import_live_compute_storage_image(const prosper::gpu::ShaderResource& sampled_resource,
                                        uint64_t guest_bytes,
                                        LiveComputeImageImport& import) {
     import = {};
-    VulkanComputeContext* context = g_live_compute_context;
+    VulkanComputeContext* context = g_live_compute_context.load(std::memory_order_acquire);
     const bool ordinary_shape =
         ((sampled_resource.img_dim == 1 || sampled_resource.img_dim == 5) &&
          sampled_resource.depth == 1) ||
@@ -12437,7 +12407,7 @@ bool live_compute_native_storage_3d_supported(prosper::gpu::DataFormat format,
                                               uint32_t components,
                                               uint32_t width, uint32_t height,
                                               uint32_t depth) {
-    VulkanComputeContext* context = g_live_compute_context;
+    VulkanComputeContext* context = g_live_compute_context.load(std::memory_order_acquire);
     if (!context || !context->physical) return false;
     const VkFormat native_format = native_storage_vk_format(format, components);
     return native_storage_image_create_supported(
@@ -12450,11 +12420,13 @@ uint64_t live_compute_cpu_fill_dispatches() {
 }
 
 uint64_t live_compute_storage_result_snapshot_bytes() {
-    return g_live_compute_context ? g_live_compute_context->storage_result_snapshot_bytes : 0;
+    const VulkanComputeContext* context = g_live_compute_context.load(std::memory_order_acquire);
+    return context ? context->storage_result_snapshot_bytes : 0;
 }
 
 uint64_t live_compute_image_result_snapshot_bytes() {
-    return g_live_compute_context ? g_live_compute_context->image_result_snapshot_bytes : 0;
+    const VulkanComputeContext* context = g_live_compute_context.load(std::memory_order_acquire);
+    return context ? context->image_result_snapshot_bytes : 0;
 }
 
 bool cold_storage_result_snapshot_can_defer(bool host_data, bool full_overwrite,
@@ -12718,7 +12690,7 @@ bool execute_live_compute_items(const std::vector<prosper::gpu::ComputeItem>& it
         if (std::atexit([] {
                 VulkanComputeContext* doomed = context_ptr;
                 context_ptr = nullptr;
-                g_live_compute_context = nullptr;
+                g_live_compute_context.store(nullptr, std::memory_order_release);
                 // Returning early from ~VulkanComputeContext would still destroy all of its member
                 // caches after the destructor body. When a lost-device submission has no completion
                 // proof, retain the object itself so no GPU-facing member ownership is released.
@@ -12748,7 +12720,7 @@ bool execute_live_compute_items(const std::vector<prosper::gpu::ComputeItem>& it
         return fail_closed_items();
     }
     VulkanComputeContext& context = *live_context;
-    g_live_compute_context = &context;
+    g_live_compute_context.store(&context, std::memory_order_release);
     if (context.device_lost) return fail_closed_items();
     const bool perf_capture_timing =
         prosper::perf::interactive_performance_capture().detailed_timing_active();

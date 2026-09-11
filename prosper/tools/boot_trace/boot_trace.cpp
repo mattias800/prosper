@@ -90,7 +90,16 @@ using namespace prosper;
 static const char* cls(uint64_t a) { return prosper::guest_module_name(a); }
 static uint64_t    bof(uint64_t a) { return prosper::guest_module_offset(a); }
 
+// #3379: guest flips are paced at the cadence the title asked for by DEFAULT, because our
+// present is synchronous and an unpaced flip completes as fast as the host can render one --
+// on a 180 Hz panel that simulates the game at 3x speed. This tool is a MEASUREMENT harness,
+// not a console: its pad routes are wall-clock anchored against free-running flips, and the
+// snapshot tool sets PROSPER_FLIP_PACE_FPS explicitly on both of its halves. So opt out of the
+// console cadence and keep this tool free-running; an explicit PROSPER_FLIP_PACE_FPS still wins.
+extern "C" void prosper_vo_set_flip_pacing_unpaced_default();
+
 int main(int argc, char** argv) {
+    prosper_vo_set_flip_pacing_unpaced_default();   // #3379: a capture sweep is not a console
     // --- Parse --capture-first-frame option BEFORE boot ---
     std::string capture_first_frame_path;  // Non-empty = capture mode enabled
     double capture_timeout = 30.0;         // Default timeout for frame capture

@@ -2564,6 +2564,16 @@ if(TARGET prosper_core)
   target_link_libraries(test_display_mode PRIVATE prosper_core)
   add_test(NAME display_mode_derivation COMMAND test_display_mode)
 
+  # #3379: guest flips are paced at the cadence the TITLE asked for by default. Its own executable
+  # rather than an arm of test_videoout, for the same reason test_display_mode above is: the
+  # advertised display mode resolves once per process, and these arms read the derived period
+  # against the untouched `legacy` default. CROSS-PLATFORM like both of those -- HLE registry plus
+  # a sleep, no display access. Includes one deliberately one-sided timing arm (a lower bound on a
+  # sleep cannot flake).
+  add_executable(test_flip_pacing tests/host/platform/test_flip_pacing.cpp)
+  target_link_libraries(test_flip_pacing PRIVATE prosper_core)
+  add_test(NAME flip_pacing_defaults COMMAND test_flip_pacing)
+
   # precise_sleep's deadline post-condition (#3074): every sleep_until_steady_ns() backend must
   # never return before now_ns() >= deadline_ns. Win32SleepFallback did not re-check after its one
   # OS sleep call, unlike the sibling high-resolution-timer path. CROSS-PLATFORM like test_videoout
@@ -2645,6 +2655,22 @@ if(TARGET prosper_core)
       add_test(NAME game_compute_exec_scratch_poison COMMAND test_game_compute)
       set_tests_properties(game_compute_exec_scratch_poison PROPERTIES
         ENVIRONMENT "PROSPER_DECODE_SCRATCH_POISON=1")
+
+      # #3425: registered on Windows as well as in the UNIX block below, deliberately. This
+      # defect is about the WINDOWS/NVIDIA frontend's _Exit path and the cost it recovers was
+      # measured there (#3450), so a Linux-only guard would test the fix everywhere except
+      # where it was found. Both registrations run the same fixture and driver script.
+      if(Python3_Interpreter_FOUND)
+        add_executable(test_compute_cache_persistence tests/gpu/execute/test_compute_cache_persistence.cpp)
+        target_include_directories(test_compute_cache_persistence PRIVATE tests frontends)
+        target_link_libraries(test_compute_cache_persistence PRIVATE prosper_live_renderer)
+        add_test(NAME compute_cache_persistence
+                 COMMAND "${Python3_EXECUTABLE}"
+                         "${CMAKE_CURRENT_SOURCE_DIR}/tests/gpu/execute/test_compute_cache_persistence.py"
+                         $<TARGET_FILE:test_compute_cache_persistence>
+                         "${CMAKE_CURRENT_SOURCE_DIR}/frontends/prosper-app/main.cpp")
+        set_tests_properties(compute_cache_persistence PROPERTIES TIMEOUT 300)
+      endif()
 
       # Local-only realized-submit replayer (#514), on Windows since #2331. Same target as the UNIX
       # block below, including the -Werror=switch gate: gpu_replay maps LiveTargetPixelFormat itself
@@ -3397,6 +3423,20 @@ if(TARGET prosper_core)
                          "${CMAKE_SOURCE_DIR}/tools/perf/test_compute_buffer_timing_runtime.py"
                          $<TARGET_FILE:test_compute_buffer_timing>)
         set_tests_properties(compute_buffer_timing_runtime PROPERTIES TIMEOUT 180)
+        # #3425: the compute driver pipeline cache is written on the frontend's _Exit path, not by a
+        # destructor. Separate processes are required -- a single process could pass while writing
+        # nothing -- and the driver also asserts prosper-app still names the flush.
+        add_executable(test_compute_cache_persistence tests/gpu/execute/test_compute_cache_persistence.cpp)
+        target_include_directories(test_compute_cache_persistence PRIVATE tests frontends)
+        target_link_libraries(test_compute_cache_persistence PRIVATE
+                             prosper_live_renderer prosper_core Vulkan::Vulkan)
+        add_test(NAME compute_cache_persistence
+                 COMMAND "${Python3_EXECUTABLE}"
+                         "${CMAKE_CURRENT_SOURCE_DIR}/tests/gpu/execute/test_compute_cache_persistence.py"
+                         $<TARGET_FILE:test_compute_cache_persistence>
+                         "${CMAKE_CURRENT_SOURCE_DIR}/frontends/prosper-app/main.cpp")
+        set_tests_properties(compute_cache_persistence PROPERTIES TIMEOUT 300)
+
         add_executable(test_compute_buffer_residency tests/gpu/execute/test_compute_buffer_residency.cpp)
         target_include_directories(test_compute_buffer_residency PRIVATE tests frontends)
         target_link_libraries(test_compute_buffer_residency PRIVATE
