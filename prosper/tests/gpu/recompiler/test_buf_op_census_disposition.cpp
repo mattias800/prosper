@@ -1,0 +1,149 @@
+// test_buf_op_census_disposition — a REFUSED buffer instruction must not print the same `how=` word
+// as an emitted one.
+//
+// Why this exists (#3579). The `[buf-op]` census exists to separate three outcomes that are
+// indistinguishable in the emitted SPIR-V: an op folded away against an empty descriptor, an op that
+// never reached the emitter, and an op that reached it and was REFUSED. `buf_op.how` was set to the
+// optimistic word `"resolved"` the moment a V# resolved — before the format decode runs — and several
+// later reject paths returned without touching it. Those refusals printed `resolved`, i.e. the census
+// reported failures as successes on exactly the distinction it exists to make.
+//
+// The word is now `descriptor-resolved`, which is what that early assignment actually establishes, and
+// each reject names itself. The arms below drive one shader per refusal through the real diagnostic
+// path and read the line off stderr.
+//
+// THE POSITIVE CONTROL IS LOAD-BEARING: without an arm proving that a healthy op still reaches
+// `descriptor-resolved` and prints no `reject-` string at all, every assertion here would also pass
+// against an emitter that refused everything.
+#include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include "gpu/resources/shader_resources.hpp"
+#include <cstdio>
+#include <cstdint>
+#include <cstdlib>
+#include <string>
+#include <vector>
+
+using namespace prosper::gpu;
+
+static int fails = 0;
+#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
+                         else       { printf("  [ok]   %s\n", m); } } while (0)
+
+static void set_test_env(const char* name, const char* value) {
+#ifdef _WIN32
+    _putenv_s(name, value ? value : "");
+#else
+    if (value) setenv(name, value, 1); else unsetenv(name);
+#endif
+}
+
+static std::string recompile_capturing_stderr(const uint32_t* code, size_t dwords,
+                                              const ShaderResourceTable* rt,
+                                              const char* scratch) {
+    std::fflush(stderr);
+    if (!std::freopen(scratch, "w+", stderr)) { printf("  [FAIL] cannot redirect stderr\n"); fails++; return {}; }
+    (void)recompile_compute(code, dwords, rt, ComputeShaderConfig{});
+    std::fflush(stderr);
+    std::string text;
+    if (FILE* f = std::fopen(scratch, "rb")) {
+        char buf[4096];
+        size_t n;
+        while ((n = std::fread(buf, 1, sizeof buf, f)) > 0) text.append(buf, n);
+        std::fclose(f);
+    }
+    std::remove(scratch);
+    return text;
+}
+
+static bool has(const std::string& h, const char* n) { return h.find(n) != std::string::npos; }
+
+// One resource at s[8:11], whose FORMAT is the variable each arm changes. A MUBUF format op takes its
+// type from the resolved V#, so the descriptor is how a test selects which decode path runs.
+static ShaderResourceTable table_with_format(DataFormat fmt, uint32_t ncomp) {
+    ShaderResourceTable rt;
+    ShaderResource r{};
+    r.cls = ResourceClass::VertexBuffer;
+    r.format = fmt;
+    r.num_components = ncomp;
+    r.binding = 2;
+    r.gpu_addr = 0x10000;
+    r.size = 4096;
+    r.stride = 16;
+    r.sgpr_base = 8;
+    rt.resources.push_back(r);
+    return rt;
+}
+
+int main() {
+    printf("== test_buf_op_census_disposition ==\n");
+    set_test_env("PROSPER_DBG", "1");
+
+    // buffer_load_format_xyzw v[0:3], v0, s[8:11], 0 idxen   (gfx1030 llvm-mc)
+    const uint32_t load_xyzw[] = { 0xE00C2000u, 0x80020000u, 0xBF810000u };
+    // buffer_store_format_xyzw v[0:3], v0, s[8:11], 0 idxen  — opcode 3 -> 7 in d0[24:18].
+    const uint32_t store_xyzw[] = { 0xE01C2000u, 0x80020000u, 0xBF810000u };
+    // The same store with inst_offset:1, so the packed components are not dword-aligned.
+    const uint32_t store_xyzw_unaligned[] = { 0xE01C2001u, 0x80020000u, 0xBF810000u };
+
+    // --- Positive control, first: a healthy Float32x4 fetch -------------------------------------
+    // If this arm does not reach `descriptor-resolved` with no reject string, nothing below means
+    // anything: the assertions would be satisfied by an emitter that refused every buffer op.
+    {
+        ShaderResourceTable rt = table_with_format(DataFormat::Float32, 4);
+        const std::string log = recompile_capturing_stderr(
+            load_xyzw, std::size(load_xyzw), &rt, "buf_op_census_control.log");
+        CHECK(has(log, "[buf-op]"), "control: the census line is emitted at all under PROSPER_DBG");
+        CHECK(has(log, "descriptor-resolved"),
+              "control: a healthy Float32x4 format load reports descriptor-resolved");
+        CHECK(!has(log, "reject-"),
+              "CONTROL: a healthy format load prints NO reject- string "
+              "(without this, every arm below would pass against a refuse-everything emitter)");
+    }
+
+    // --- Arm 1: a V# whose FORMAT does not decode ------------------------------------------------
+    {
+        ShaderResourceTable rt = table_with_format(DataFormat::Unknown, 4);
+        const std::string log = recompile_capturing_stderr(
+            load_xyzw, std::size(load_xyzw), &rt, "buf_op_census_unknown.log");
+        CHECK(has(log, "reject-unknown-format"),
+              "#3579: an undecodable buffer FORMAT names itself (was: resolved)");
+        CHECK(!has(log, " descriptor-resolved"),
+              "#3579: ...and does not also print the optimistic word");
+    }
+
+    // --- Arm 2: a format with a size but no conversion (USCALED is a dead enumerator) ------------
+    // Uscaled8 reports 1 byte per component, so `packed` is true, but it is not half, not integer and
+    // has no normalization divisor -- the `[mubuf-badfmt]` shape.
+    {
+        ShaderResourceTable rt = table_with_format(DataFormat::Uscaled8, 4);
+        const std::string log = recompile_capturing_stderr(
+            load_xyzw, std::size(load_xyzw), &rt, "buf_op_census_badfmt.log");
+        CHECK(has(log, "reject-badfmt"),
+              "#3579: the [mubuf-badfmt] refusal names itself in the census");
+    }
+
+    // --- Arm 3: a packed store whose components are not dword-aligned ---------------------------
+    {
+        ShaderResourceTable rt = table_with_format(DataFormat::Unorm8, 4);
+        const std::string log = recompile_capturing_stderr(
+            store_xyzw_unaligned, std::size(store_xyzw_unaligned), &rt,
+            "buf_op_census_unaligned.log");
+        CHECK(has(log, "reject-unaligned"),
+              "#3579: the [mubuf-unaligned] refusal names itself in the census");
+    }
+
+    // --- Arm 4: the packed-word typed store (#3575's subject) ------------------------------------
+    {
+        ShaderResourceTable rt = table_with_format(DataFormat::Float10_11_11, 3);
+        const std::string log = recompile_capturing_stderr(
+            store_xyzw, std::size(store_xyzw), &rt, "buf_op_census_packedword.log");
+        CHECK(has(log, "reject-packed-word-store"),
+              "#3579: the packed-word store refusal names itself, separately from the sub-dword "
+              "integer refusal beside it (#3575 removes only this one)");
+    }
+
+    set_test_env("PROSPER_DBG", nullptr);
+    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
+    printf("== PASS ==\n");
+    return 0;
+}

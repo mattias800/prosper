@@ -5825,6 +5825,15 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // recompile_coverage() translates on a table-less compute shell, so every buffer op it
             // sees takes a no-table path and prints `unclassified` for a reason that has nothing to
             // do with coverage. `rt=0` marks those. A hole is `rt=1 ... unclassified`.
+            // `descriptor-resolved` IS NOT A SUCCESS CLAIM, and the name is the fix. It is set the
+            // moment a V# resolves -- before the format decode runs -- and it reaches the line only
+            // when no later path classified the outcome. It used to read `resolved`, and four reject
+            // paths returned past it without touching it, so a refused buffer instruction printed the
+            // same word as an emitted one (#3579). That is the one distinction this census exists to
+            // make, inverted. The four are named now (`reject-unknown-format`, `reject-badfmt`,
+            // `reject-unaligned`, `reject-packed-word-store` / `reject-subword-int-store`), and the
+            // word stays deliberately narrow so a FIFTH reject path added later degrades to something
+            // TRUE -- "a descriptor was resolved for this op" -- instead of to a false success.
             struct BufOpDisposition {
                 bool on;
                 const SpirvCompute& b;
@@ -6078,7 +6087,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     buf_op.how = "zero-record";
                     return true;
                 }
-                buf_op.how = "resolved";
+                buf_op.how = "descriptor-resolved";
                 resolved_buffer = res;
                 binding = res->binding;
                 stride = res->stride;
@@ -6294,7 +6303,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     }
                     gta5_selected_sbuffer_consumer = true;
                 }
-                buf_op.how = "resolved";
+                buf_op.how = "descriptor-resolved";
                 resolved_buffer = res;
                 binding = res->binding;
                 stride  = res->stride;
@@ -6343,7 +6352,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 fmt == DataFormat::Uint2_10_10_10  || fmt == DataFormat::Sint2_10_10_10;
             const bool packed_word = packed_10_11_11 || packed_2_10_10_10;
             const uint32_t comp_bytes = data_format_bytes(fmt);
-            if (!packed_word && comp_bytes == 0) { ok = false; return true; } // unknown / unsupported
+            if (!packed_word && comp_bytes == 0) {                            // unknown / unsupported
+                buf_op.how = "reject-unknown-format"; ok = false; return true;
+            }
             // Per-component decode. 4-byte formats (Float32/Uint32/Sint32) are a raw dword load — no
             // conversion in our bit model. Sub-dword formats are unpacked: UNORM/SNORM normalize an
             // integer field, Float16 unpacks a packed half. num_components components pack tightly.
@@ -6460,6 +6471,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 if (getenv("PROSPER_DBG"))
                     fprintf(stderr, "[mubuf-badfmt] pc=%u fmt=%u comp_bytes=%u stride=%u n=%u\n",
                             in.pc, (unsigned)fmt, comp_bytes, stride, n);
+                buf_op.how = "reject-badfmt";
                 ok = false; return true;
             }
             // Most packed (sub-dword) components below use static fields relative to a DWORD-ALIGNED
@@ -6520,6 +6532,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         if (getenv("PROSPER_DBG"))
                             fprintf(stderr, "[mubuf-unaligned] pc=%u fmt=%u off=%u offen=%d idxen=%d stride=%u\n",
                                     in.pc, (unsigned)fmt, offset, (int)offen, (int)idxen, stride);
+                        buf_op.how = "reject-unaligned";
                         ok = false; return true;
                     }
                 }
@@ -6677,7 +6690,14 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // Store the VDATA VGPRs (in.dst..+n-1). Integer sub-dword formats reach the atomic path
                 // above when in-dword-provable; anything else that can't pack (packed_word, or an
                 // integer field that could straddle) rejects rather than mis-store.
-                if (packed_word || (packed && (is_uint || is_sint))) { ok = false; return true; }
+                // Named as TWO refusals, not one, because they have different futures: the
+                // packed-word half is what #3575 implements, while a sub-dword integer field that
+                // could straddle a dword boundary stays deferred. A census that merged them could
+                // not show the first one going away.
+                if (packed_word) { buf_op.how = "reject-packed-word-store"; ok = false; return true; }
+                if (packed && (is_uint || is_sint)) {
+                    buf_op.how = "reject-subword-int-store"; ok = false; return true;
+                }
                 // MTBUF's instruction format owns the physical component COUNT, and a wider opcode
                 // still writes only those components (for example XY00), so Z/W must not spill into
                 // adjacent memory. This line is about the COUNT, but the identity claim it makes is
