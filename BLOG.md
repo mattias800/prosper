@@ -21,6 +21,20 @@ from the tracker issues, and still gated, because it is a projection of state ra
 
 ## 2026-09-11
 
+### GTA V's Performance-mode route had been choosing a different setting entirely
+
+![GTA V Settings, old route: the Controls pane, with Show Controls For changed to In Aircraft](assets/screenshots/gta5-route-wrong-pane-controls-aircraft.webp)
+
+![GTA V Settings, fixed route: Display highlighted, Graphics Mode set to Performance](assets/screenshots/gta5-route-display-graphics-mode-performance.webp)
+
+Both pictures are the same route at the same point of the same build, minutes apart: the first is
+what it actually did on this machine, the second is what it was supposed to do. The route spelled
+each press as a window of display flips, which only states a duration at the flip rate it was tuned
+on -- and the menu ran at a third of that rate here, so presses meant to last 0.15 s lasted up to
+0.84 s, the title's key repeat walked the highlight past Display, and a Left meant for Graphics Mode
+changed a controls setting instead. Nothing errored; GTA V simply ran in Fidelity with ray tracing
+while the session was recorded as a Performance run. Presses can now say "hold 0.15 seconds from
+flip 2272" and mean it on any host.
 ### Our own frame-pacing instrument was understating the frame rate by up to 40%
 
 The flip-pacing report's headline fps was a mean over intervals it had silently filtered, and

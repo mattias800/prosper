@@ -158,6 +158,29 @@ uint32_t pad_trigger_buttons(uint8_t l2, uint8_t r2);
 // t_secs holds wall-clock seconds by default, a flip number when frame_anchored, or a pad-read number
 // when read_anchored. `p300:cross` is independent of wall time and presentation rate, which keeps a
 // route usable when synchronous rendering changes both. See #302.
+//
+// START AND HOLD ARE SEPARATE QUESTIONS, and #3449 is what happens when one unit answers both. A
+// route wants its POSITION in flips, because a flip ordinal names the same moment in the guest's own
+// sequence on every host. It wants its DURATION in wall-clock seconds, because guest key repeat is
+// wall-clock: hold a menu Down long enough and the title walks several rows. A flip WINDOW encodes a
+// duration only at the flip rate it was tuned on. `reach-performance-story.pad` was tuned at ~80
+// flips/s and its menu ran at 15-33 flips/s on another host, so a press meant to last 0.15 s lasted
+// 0.737 s, three Downs walked seven rows, and GTA V spent a whole measurement session in the wrong
+// graphics mode while being reported as a Performance run.
+//
+// So an entry may anchor its start in one unit and its hold in another: `f2272+0.15:down` starts at
+// flip 2272 and is held 0.15 SECONDS, whatever the flip rate turns out to be. hold_unit records
+// which unit `hold_amount` is in; hold_unit == none means the entry uses `end` or the per-axis
+// default, exactly as before. Flip pacing (#3379) narrows the spread but cannot close it: pacing
+// only sleeps when a host is running FAST, and the rates that caused this were far below the paced
+// cadence, where pacing is inert by construction.
+enum class PadScriptHoldUnit : uint8_t {
+    none = 0,   // no cross-unit hold: `end`, or the configured default for this entry's axis
+    seconds,
+    flips,
+    reads,
+};
+
 struct PadScriptEntry {
     double t_secs;
     uint32_t button_mask;
@@ -169,6 +192,11 @@ struct PadScriptEntry {
     int8_t right_x = 0;
     int8_t right_y = 0;
     uint8_t axis_mask = 0;  // distinguishes an explicitly centered opposing pair from no axis input
+    // A hold expressed in a unit OTHER than the start anchor's. Same-unit spellings ("f100+f12")
+    // are folded into `end` at parse time, so these two fields are set only when the entry
+    // genuinely cannot be decided from the current counters alone.
+    PadScriptHoldUnit hold_unit = PadScriptHoldUnit::none;
+    double hold_amount = 0.0;
 };
 
 enum PadScriptAxis : uint8_t {
@@ -277,6 +305,16 @@ private:
 // ("3-4.5:cross", "f300-340:cross",
 // "p1200-1240:cross"); '#' starts a comment. Malformed entries and entries with no recognized action
 // are dropped.
+//
+// A '+' in the anchor gives a HOLD instead of an end, and the hold names its unit with the SAME
+// rule the start anchor uses: a bare number is seconds, 'f' is flips, 'p' is pad reads. So
+// "f2272+0.15:down" starts at flip 2272 and is held 0.15 s, "f2272+p12:down" holds it for 12 guest
+// pad reads -- and "f100+12" is twelve SECONDS from flip 100, not twelve flips, because the rule
+// does not change halfway through an entry. A hold in the START's own unit ("f100+f12") is folded
+// straight into an explicit range and needs no runner state. A hold of
+// zero, a non-integer flip/read count, and an anchor carrying BOTH '-' and '+' are all rejected --
+// a press nothing observes is #3267's failure, and a route that half-parses is #2439's.
+// The '+' before the ':' is unambiguous against the '+' that joins actions after it.
 std::vector<PadScriptEntry> parse_pad_script(const std::string& spec);
 
 // Parse an inline script, or load and parse one from disk when `source` starts with '@'. Relative
@@ -296,9 +334,51 @@ std::string pad_script_empty_route_warning(const std::string& source, bool parse
 
 // Full scripted controller state now. Active entries combine buttons and full-deflection stick
 // directions; opposing directions on one axis cancel to an explicitly centered axis.
+//
+// PURE, and therefore BLIND to cross-unit holds: "hold 0.15 s from flip 2272" cannot be decided
+// from the current counters, because nothing here knows when flip 2272 happened. Such entries are
+// reported inactive. Use PadScriptRunner for any script that may contain them -- which is every
+// script a route file can express. This overload remains for the same-unit entry kinds and for the
+// tests that pin their exact window arithmetic.
 PadScriptState pad_script_state_at(const std::vector<PadScriptEntry>& script, double elapsed_secs,
                                    double hold_secs, int64_t frame_count = -1, int64_t frame_hold = 8,
                                    int64_t read_count = -1, int64_t read_hold = 8);
+
+// True if `script` contains at least one entry whose hold is in a different unit from its start, so
+// a caller can tell "this needs the stateful runner" from "the pure function is enough".
+bool pad_script_needs_runner(const std::vector<PadScriptEntry>& script);
+
+// What a cross-unit entry latched when its start anchor was crossed. One per script entry.
+struct PadScriptLatch {
+    bool armed = false;      // the start anchor has been crossed; the counters below are valid
+    bool expired = false;    // the hold has run out. Never re-arms: counters are monotone, and a
+                             // press that came back to life after its window would be a new press.
+    double elapsed = 0.0;
+    int64_t frame = 0;
+    int64_t read = 0;
+};
+
+// Evaluates a script INCLUDING cross-unit holds.
+//
+// Stateful for exactly one reason: to hold a press for 0.15 s starting at flip 2272 you must record
+// the clock at the moment flip 2272 arrives, and the current counters do not carry that. The latch
+// is the whole of the state; every other entry kind still goes through the pure evaluation above.
+//
+// Latches are addressed by the entry's INDEX. PROSPER_PAD_SCRIPT_RELOAD is documented as appending
+// future windows to a live route, and an append leaves every existing index where it was, so the
+// vector is simply resized and the common prefix keeps its latches. Reordering or deleting entries
+// mid-run moves a latch onto a different press; that is outside the append contract and is called
+// out here rather than guarded against, because guarding would mean identifying entries that a
+// route is free to spell identically.
+class PadScriptRunner {
+public:
+    PadScriptState state_at(const std::vector<PadScriptEntry>& script, double elapsed_secs,
+                            double hold_secs, int64_t frame_count = -1, int64_t frame_hold = 8,
+                            int64_t read_count = -1, int64_t read_hold = 8);
+
+private:
+    std::vector<PadScriptLatch> latches_;
+};
 
 // Overlay a scripted state onto a host snapshot. Buttons combine with the backend; only explicitly
 // active script axes replace their host values.
