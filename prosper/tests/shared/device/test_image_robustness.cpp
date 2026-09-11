@@ -33,6 +33,7 @@
 #include "gpu/execute/gpu_execute.hpp"
 
 #include <cstdio>
+#include <cstring>
 #include <vector>
 
 static int fails = 0;
@@ -43,6 +44,10 @@ static int checks = 0;
 using prosper::frontend::storage_image_device_features;
 
 int main() {
+    // Unbuffered: a crash must not swallow the arms that already reported. Without this a fault
+    // anywhere below turns a run that had printed twelve [ok] lines into a run that printed none,
+    // which reads as "the test never started".
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
     std::printf("== test_image_robustness ==\n");
 
     // --- 1. The pure decision, hand-built ------------------------------------------------------
@@ -137,19 +142,29 @@ int main() {
                 CHECK(acquired.robust_image_access == supported,
                       "the helper reports exactly what the physical device advertises");
 
+                // Walk the chain by COPYING each node's header out rather than reading the node
+                // through a VkBaseInStructure lvalue. Reading one struct type through a pointer to
+                // an unrelated one is a strict-aliasing violation even when the two share an initial
+                // sequence, and it is not theoretical here: the first draft of this arm did the
+                // obvious reinterpret walk and GCC 15 at -O2 turned the without-fix run into a
+                // SIGSEGV instead of the clean failure the arm is supposed to produce -- adding an
+                // unrelated fprintf made the fault vanish. memcpy is always defined, and a regression
+                // arm that can crash instead of failing is not one you can read.
                 bool chained = false, incumbent_survived = false;
-                for (const VkBaseInStructure* s =
-                         static_cast<const VkBaseInStructure*>(dci.pNext);
-                     s; s = s->pNext) {
-                    if (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_ROBUSTNESS_FEATURES) {
+                for (const void* node = dci.pNext; node;) {
+                    VkBaseInStructure header{};
+                    std::memcpy(&header, node, sizeof header);
+                    if (header.sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_ROBUSTNESS_FEATURES) {
                         chained = true;
-                        CHECK(reinterpret_cast<const VkPhysicalDeviceImageRobustnessFeatures*>(s)
-                                      ->robustImageAccess == VK_TRUE,
+                        VkPhysicalDeviceImageRobustnessFeatures requested{};
+                        std::memcpy(&requested, node, sizeof requested);
+                        CHECK(requested.robustImageAccess == VK_TRUE,
                               "the chained struct REQUESTS robustImageAccess (not merely present)");
                     }
-                    if (s->sType ==
+                    if (header.sType ==
                         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES)
                         incumbent_survived = true;
+                    node = header.pNext;
                 }
                 CHECK(chained == supported,
                       supported ? "VkPhysicalDeviceImageRobustnessFeatures reaches the "
