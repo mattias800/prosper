@@ -550,20 +550,33 @@ void test_pool_decommit() {
     CHECK(*(volatile uint32_t*)(uintptr_t)base == 0x5A5A5A5Au,
           "the re-committed page is writable and reads back");
 
-    // Refusal direction: a range prosper never tracked at all must touch nothing. `bad` is a live
-    // host mapping this test owns, so "touches nothing" is checkable rather than assumed — an
+#if !defined(_WIN32)
+    // Refusal direction: a range prosper never tracked at all must touch nothing. This is a live
+    // host mapping the test owns, so "touches nothing" is checkable rather than assumed — an
     // unconditional unmap would make the read below fault.
-    void* foreign = mmap(nullptr, (size_t)kGranule, PROT_READ | PROT_WRITE,
-                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    CHECK(foreign != MAP_FAILED, "fixture: a host mapping prosper never tracked");
-    if (foreign != MAP_FAILED) {
-        *(volatile uint32_t*)foreign = 0xC3C3C3C3u;
-        decommit((uint64_t)(uintptr_t)foreign, kGranule, 0, 0, 0, 0);
-        CHECK(*(volatile uint32_t*)foreign == 0xC3C3C3C3u,
+    //
+    // The mapping is over-allocated and aligned UP to a whole granule. mmap guarantees PAGE
+    // alignment (4 KiB), not granule alignment, so an unaligned base would leave the request with no
+    // whole 64 KiB granule inside it — the inward rounding would then decline it before reaching the
+    // tracker at all, and the arm would pass without ever exercising the refusal it names. Raised in
+    // review of #3530: the arm was INTERMITTENTLY vacuous, which is worse than reliably so.
+    void* foreign_raw = mmap(nullptr, (size_t)kGranule * 3, PROT_READ | PROT_WRITE,
+                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    CHECK(foreign_raw != MAP_FAILED, "fixture: a host mapping prosper never tracked");
+    if (foreign_raw != MAP_FAILED) {
+        const uint64_t foreign =
+            ((uint64_t)(uintptr_t)foreign_raw + kGranule - 1) & ~(kGranule - 1);
+        CHECK((foreign & (kGranule - 1)) == 0,
+              "fixture positive control: the untracked mapping is granule-aligned, so the request "
+              "really reaches the tracker");
+        *(volatile uint32_t*)(uintptr_t)foreign = 0xC3C3C3C3u;
+        decommit(foreign, kGranule, 0, 0, 0, 0);
+        CHECK(*(volatile uint32_t*)(uintptr_t)foreign == 0xC3C3C3C3u,
               "decommit leaves memory prosper never committed ALONE "
               "(mutation: unmap unconditionally -> this faults or reads back changed)");
-        munmap(foreign, (size_t)kGranule);
+        munmap(foreign_raw, (size_t)kGranule * 3);
     }
+#endif
 
     // Sub-granule requests release NOTHING rather than rounding outward. Rounding a destructive
     // range out would unmap bytes the guest did not name, and a hole smaller than the lazy-commit
@@ -582,6 +595,30 @@ void test_pool_decommit() {
 
     CHECK(decommit(0, kGranule, 0, 0, 0, 0) == kEinvalPool, "a null address is EINVAL");
     CHECK(decommit(base, 0, 0, 0, 0, 0) == kEinvalPool, "a zero length is EINVAL");
+
+    // Overflow, and this arm is here because the bug was real rather than theoretical. Rounding the
+    // base UP to a granule can wrap on its own, independently of whether the span wraps: with only
+    // the span checked, `(-16, 8)` wraps `base` to 0 and yields a length of nearly 2^64, at which
+    // point the clip returns EVERY committed mapping and the handler unmaps the whole process while
+    // answering SCE_OK. Found in review of #3530.
+    //
+    // Both arms must be here. A span that wraps and a base whose ROUND-UP wraps are different
+    // predicates, and the first version of the guard had only the first — so an arm testing just
+    // `(-1, 2)` would have passed against the broken code.
+    //
+    // WHAT THE MUTATION LOOKS LIKE, so nobody reads a crash as a broken test: dropping the round-up
+    // guard does not print `[FAIL]`, it kills the process with SIGSEGV (measured: exit 139). That is
+    // the arm working — the handler unmaps the pages the test itself is running on. ctest scores it
+    // as a failure either way; the distinction is only for whoever runs the mutation by hand.
+    CHECK(decommit(~0ull - 15, 8, 0, 0, 0, 0) == kEinvalPool,
+          "an address whose granule ROUND-UP overflows is EINVAL, not a whole-process unmap "
+          "(mutation: drop the round-up guard -> this returns 0)");
+    CHECK(decommit(~0ull - 1, 4, 0, 0, 0, 0) == kEinvalPool,
+          "a span that itself overflows is EINVAL");
+    // The process is still alive and the re-committed page above still readable — which is the
+    // consequence the overflow arms exist to prevent, checked rather than assumed.
+    CHECK(*(volatile uint32_t*)(uintptr_t)base == 0x5A5A5A5Au,
+          "an overflowing decommit released NOTHING (mutation: drop the guard -> this faults)");
 }
 
 int main() {

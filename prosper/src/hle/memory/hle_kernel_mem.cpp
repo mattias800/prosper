@@ -1867,7 +1867,13 @@ HLE(k_pool_decommit) {
     // NINJA GAIDEN 4 loses nothing to this: its observed decommits are already 64 KiB-aligned with
     // 64 KiB-multiple lengths (`addr=0x1001010000 len=0x3f0000`, `addr=0x1000ee0000 len=0x10000`).
     constexpr uint64_t kCommitGranule = 0x10000ull;
-    if (a1 > UINT64_MAX - a0) return 0x80020016ull;
+    // Overflow first, and BOTH ends of it. The replaced code used normalize_guest_page_range, which
+    // checks its own round-up; rounding by hand dropped that, and the omission is not benign here --
+    // `sceKernelMemoryPoolDecommit(-16, 8, 0)` wraps `base` to 0 and yields a length of nearly 2^64,
+    // at which point committed_parts_in returns EVERY committed mapping and the loop below unmaps
+    // the whole process while answering SCE_OK. Raised in review of #3530.
+    if (a1 > UINT64_MAX - a0) return 0x80020016ull;                  // the span itself wraps
+    if (a0 > UINT64_MAX - (kCommitGranule - 1)) return 0x80020016ull; // rounding the base up wraps
     const uint64_t base = (a0 + kCommitGranule - 1) & ~(kCommitGranule - 1);
     const uint64_t end  = (a0 + a1) & ~(kCommitGranule - 1);
     if (end <= base) {
@@ -2701,13 +2707,16 @@ HLE(k_apr_submit_and_get_id) {
                 (unsigned long long)a4, (unsigned long long)a5);
     // A failed submit must not hand back an id the guest would then wait on.
     if (rc != 0) return rc;
-    // Nor may a SUCCESSFUL one return 0, which is precisely the value the missing handler returned
-    // and therefore the one a caller cannot distinguish from "unimplemented". The token normally
-    // comes from prosper_apr_next_token and is never 0, but a command buffer BOUND with a zero tag
-    // echoes that tag -- and this file documents a real title that binds with a literal `xor ecx,ecx`
-    // (CRI ADX2, in the apr_submit_common comment). Fall back to this ring's own counter there.
-    // Raised in review of #3530.
-    return token ? token : prosper_apr_next_token(a1 ? (unsigned)(a1 - 1) & 0x3f : 0);
+    // The token is whatever the family computed, INCLUDING 0. An earlier revision substituted this
+    // ring's own counter when the token came back 0, on the reasoning that 0 is the value the missing
+    // handler returned. That is reachable only for a cb BOUND with a zero tag -- and for a bound cb
+    // this file's own contract (see apr_submit_common) is that the token IS the binding tag, which
+    // the guest chose. Handing back the unbound counter dialect instead would answer a bound
+    // buffer in a dialect it never asked for, and would advance ring state as a side effect of a
+    // read. CRI ADX2 is the known zero-tag binder and its waiter tests the event IDENT, never the
+    // tag, so 0 is a legitimate payload there rather than an ambiguous one. Reverted in review of
+    // #3530; no title is known to bind with a zero tag AND use this entry point.
+    return token;
 }
 HLE(k_apr_submit) {   // sceKernelAprSubmitCommandBufferAndGetResult (cb, ring_1based, out1, out2)
     return apr_submit_common(a0, a1, a2, a3, /*write_result_outputs=*/true);
@@ -6970,7 +6979,13 @@ HLE(k_pool_decommit) {
     // NINJA GAIDEN 4 loses nothing to this: its observed decommits are already 64 KiB-aligned with
     // 64 KiB-multiple lengths (`addr=0x1001010000 len=0x3f0000`, `addr=0x1000ee0000 len=0x10000`).
     constexpr uint64_t kCommitGranule = 0x10000ull;
-    if (a1 > UINT64_MAX - a0) return 0x80020016ull;
+    // Overflow first, and BOTH ends of it. The replaced code used normalize_guest_page_range, which
+    // checks its own round-up; rounding by hand dropped that, and the omission is not benign here --
+    // `sceKernelMemoryPoolDecommit(-16, 8, 0)` wraps `base` to 0 and yields a length of nearly 2^64,
+    // at which point committed_parts_in returns EVERY committed mapping and the loop below unmaps
+    // the whole process while answering SCE_OK. Raised in review of #3530.
+    if (a1 > UINT64_MAX - a0) return 0x80020016ull;                  // the span itself wraps
+    if (a0 > UINT64_MAX - (kCommitGranule - 1)) return 0x80020016ull; // rounding the base up wraps
     const uint64_t base = (a0 + kCommitGranule - 1) & ~(kCommitGranule - 1);
     const uint64_t end  = (a0 + a1) & ~(kCommitGranule - 1);
     if (end <= base) {
@@ -6987,7 +7002,13 @@ HLE(k_pool_decommit) {
     const uint64_t len = end - base;
     uint64_t released = 0;
     for (const auto& part : committed_parts_in(base, len)) {
-        // win_unmap restores the Windows PLACEHOLDER it cut the view out of, so the address space
+        // NOTE ON THE GRANULE, because the rationale above is the LINUX one and this half's is not the
+    // same number: Windows' lazy-commit path works in 16 KiB, not 64 KiB (exec_image_win.cpp). 64 KiB
+    // is kept here anyway because it is a SUPERSET -- a 64 KiB-aligned inward-rounded span is also
+    // 16 KiB-aligned, so the hazard is covered either way, and one granule keeps the two halves
+    // answering the same question identically. The cost is that Windows releases slightly less than
+    // it could for a 16 KiB-granular caller. Raised in review of #3530.
+    // win_unmap restores the Windows PLACEHOLDER it cut the view out of, so the address space
         // stays claimed here without the explicit re-reservation the POSIX arm needs. Recorded
         // because the two halves therefore look different while implementing the same contract.
         if (!win_unmap(part.first, part.second)) return 0x80020016ull;
@@ -7629,13 +7650,16 @@ HLE(k_ampr_submit_and_get_id) {
                 (unsigned long long)a4, (unsigned long long)a5);
     // A failed submit must not hand back an id the guest would then wait on.
     if (rc != 0) return rc;
-    // Nor may a SUCCESSFUL one return 0, which is precisely the value the missing handler returned
-    // and therefore the one a caller cannot distinguish from "unimplemented". The token normally
-    // comes from prosper_apr_next_token and is never 0, but a command buffer BOUND with a zero tag
-    // echoes that tag -- and this file documents a real title that binds with a literal `xor ecx,ecx`
-    // (CRI ADX2, in the apr_submit_common comment). Fall back to this ring's own counter there.
-    // Raised in review of #3530.
-    return token ? token : prosper_apr_next_token(a1 ? (unsigned)(a1 - 1) & 0x3f : 0);
+    // The token is whatever the family computed, INCLUDING 0. An earlier revision substituted this
+    // ring's own counter when the token came back 0, on the reasoning that 0 is the value the missing
+    // handler returned. That is reachable only for a cb BOUND with a zero tag -- and for a bound cb
+    // this file's own contract (see apr_submit_common) is that the token IS the binding tag, which
+    // the guest chose. Handing back the unbound counter dialect instead would answer a bound
+    // buffer in a dialect it never asked for, and would advance ring state as a side effect of a
+    // read. CRI ADX2 is the known zero-tag binder and its waiter tests the event IDENT, never the
+    // tag, so 0 is a legitimate payload there rather than an ambiguous one. Reverted in review of
+    // #3530; no title is known to bind with a zero tag AND use this entry point.
+    return token;
 }
 HLE(k_ampr_submit) {                 // ASoW5WE-UPo: …AndGetResult — writes the result slots
     return apr_submit_common(a0, a1, a2, a3, /*write_result_outputs=*/true);
