@@ -16,6 +16,28 @@ before the world loads (the default is Fidelity). That is a route property, not 
 a run started straight into Story on Fidelity shows the HUD over a dark scene and looks exactly like
 a renderer regression.
 
+> **Until 2026-09-11 the route that selects it did not reliably select it, and the failure was
+> silent (#3449).** `reach-performance-story.pad` spelled every press as a window of display flips,
+> which states a duration only at the flip rate it was tuned on (~80 flips/s on the authoring host)
+> — while the title's key repeat is wall-clock. Measured on Windows/NVIDIA with the same file, the
+> settings menu ran at **14-28 flips/s**, so the three Down presses were held **0.835 s / 0.186 s /
+> 0.477 s** instead of 0.15 s. Key repeat then walked the highlight a different number of rows in
+> each run: the reporter's run landed on `Motion Sensor Function` and set `Aircraft = On`, and the
+> reproduction run landed back on `Controls` and set `Show Controls For = In Aircraft (First
+> Person)`. **Graphics Mode was never touched in either**, so both sessions ran in the default
+> **Fidelity with ray tracing** while being recorded as Performance-mode runs.
+>
+> **Any framerate, capture or draw census taken on this route before 2026-09-11 may therefore be a
+> Fidelity+RT measurement.** Check the session's own evidence for a screenshot of
+> `Display -> Graphics Mode: Performance` before quoting it; a run whose only evidence of its
+> graphics mode is the route file has none.
+>
+> The route now anchors each press's START in flips and its HOLD in seconds (`f2272+0.15:down`),
+> which is rate-independent; verified by screenshot on Windows/NVIDIA reaching `Display` ->
+> `Graphics Mode: < Performance >` and then `Entering Story Mode`. Guest flip pacing (#3379) does
+> not substitute for it: pacing only sleeps when a host runs FAST, so at 14-28 flips/s it is inert
+> by construction.
+
 Tracker: **#1873**. Active frontier: **#2542** and **#2690** — #2542 names ONE hanging compute
 program and its title still calls it "the sole remaining cause"; there are at least three (#2690).
 (#2481 is CLOSED and superseded by #2542; the
@@ -221,9 +243,9 @@ The primary bottlenecks identified and resolved are detailed below; they are gen
 
 To reproduce the benchmark capture on Windows:
 ```powershell
-$env:PROSPER_PAD_SCRIPT = "@C:/Users/matti/repos/ps5ys/prosper/scripts/gta5/reach-performance-story.pad"
+$env:PROSPER_PAD_SCRIPT = "@<REPO_ROOT>/prosper/scripts/gta5/reach-performance-story.pad"
 $env:PROSPER_PAD_SCRIPT_LOG = "1"
-$env:PROSPER_CAPTURE_DIR = "C:/Users/matti/repos/ps5ys/tmp/captures"
+$env:PROSPER_CAPTURE_DIR = "<REPO_ROOT>/tmp/captures"
 $env:PROSPER_PERF_CAPTURE_AFTER_MS = "270000"
 $env:PROSPER_RENDER = "1"
 $env:PROSPER_MAX_GPU_COMPARE_IMAGE_MB = "2"
