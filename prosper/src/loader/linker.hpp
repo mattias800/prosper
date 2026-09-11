@@ -76,8 +76,16 @@ struct Program {
     // rewriting whichever stub occupied the slot, after which that import jumped into altered code
     // at an arbitrarily later moment.
     //
-    // The population is not exotic: 60 of the 62 local dumps import at least one STT_OBJECT symbol
-    // and `__stack_chk_guard` alone appears in 596 shipped modules (tools/nid_census --data-only).
+    // The population is not exotic: across the 60 local dumps, ALL 60 import `__stack_chk_guard`,
+    // and 53 import an unnamed libSceLibcInternal object. Over the set the loader actually LINKS
+    // that is 417 unresolved OBJECT bindings spanning exactly four distinct NIDs.
+    //
+    // Quote link-set figures, not disk figures. An earlier revision of this comment said "596
+    // shipped modules", which came from a RECURSIVE scan of every module present in every dump --
+    // 808 of them. `boot_link_inputs` links about 303, so that number described a population the
+    // linker never sees and overstated the bindings by roughly 2.4x. The TITLE counts were right
+    // either way, which is exactly what made the binding count easy to miss. Corrected in review of
+    // #3541.
     // Whether a given one reaches a stub depends on the title's own libc: an import a sibling module
     // defines is bound to that definition and never comes here.
     std::vector<ImportSlot> data_slots;

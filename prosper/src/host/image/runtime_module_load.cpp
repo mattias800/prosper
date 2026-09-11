@@ -202,10 +202,17 @@ uint64_t runtime_load_start_module(const char* guest_path, uint64_t args, uint64
             g_prog->tls_templates.resize(tls_templates_before);
             set_tls_modules(g_prog->tls_templates.data(), g_prog->tls_templates.size());
         }
-        if (!data_appended && g_prog->data_slots.size() > data_slots_before)
+        // The slot table and its NID map roll back TOGETHER or not at all. Erasing the NIDs while
+        // keeping the slots -- which is what happened on the two abandon() paths reached after
+        // data_appended became true -- leaves a slot nothing can find, so the next module importing
+        // the same variable allocates a SECOND one and two modules see one guest variable at two
+        // addresses. That is precisely the condition this file's own comment above forbids. Raised
+        // in review of #3541.
+        if (!data_appended && g_prog->data_slots.size() > data_slots_before) {
             g_prog->data_slots.resize(data_slots_before);
+            for (const auto& nid : claimed_data_nids) g_nid_to_data_slot.erase(nid);
+        }
         for (const auto& nid : claimed_nids) g_nid_to_slot.erase(nid);
-        for (const auto& nid : claimed_data_nids) g_nid_to_data_slot.erase(nid);
         return err;
     };
 

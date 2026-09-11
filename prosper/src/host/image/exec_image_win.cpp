@@ -1333,8 +1333,15 @@ bool install_import_data(const std::vector<ImportSlot>& slots, uint64_t data_bas
 
 bool append_import_data(const std::vector<ImportSlot>& slots, size_t first_new, std::string* err) {
     auto fail = [&](const char* s){ if (err) *err = s; return false; };
-    if (!g_data_stride) return fail("append_import_data before install_import_data");
     const uint64_t n = slots.size();
+    // NOTHING TO APPEND IS SUCCESS, and this test must come BEFORE the aperture requirement below.
+    // runtime_load_start_module calls this unconditionally, and an embedder that only ever called
+    // install_stubs has no data aperture at all -- which described every runtime PRX load, including
+    // the hermetic `runtime_prx_load` test, until this order was fixed. Requiring an aperture in
+    // order to append zero slots to it made the aperture a hard prerequisite of ALL runtime module
+    // loading. Raised in review of #3541.
+    if (first_new == n && first_new == g_ndata) return true;
+    if (!g_data_stride) return fail("append_import_data before install_import_data");
     if (first_new > n || first_new != g_ndata)
         return fail("append_import_data: slot table is not an extension");
     if (first_new == n) return true;

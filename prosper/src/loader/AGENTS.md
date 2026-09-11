@@ -22,11 +22,17 @@ half, made a guest store rewrite an executable stub, silently and with arbitrary
 `Symbol`/`Import` carry `elf_type` at all: nothing else in an undefined symbol entry distinguishes
 the two cases (shndx 0, value 0 and size 0 for both).
 
-The distinction is not a corner case. 60 of the 62 local dumps import at least one `STT_OBJECT`
-symbol; the population is dominated by C++ ABI objects (`__cxxabiv1` vtables, `_ZTV*`/`_ZTI*`) plus
-`__stack_chk_guard`, which alone appears in 596 shipped modules. Most of them resolve cross-module
-against the title's own `libc.prx` and never reach an aperture — `tools/nid_census --data-only`
-reports which do, over the loader's real link set.
+The distinction is not a corner case. Across the 60 local dumps, **all 60** import
+`__stack_chk_guard` and 53 import an unnamed `libSceLibcInternal` object; over the set the loader
+actually links that is **417 unresolved OBJECT bindings across exactly four distinct NIDs**. Most
+data imports resolve cross-module and never reach a slot at all — these four are the ones that do.
+
+**Quote link-set figures here, not disk figures.** An earlier version of this paragraph said
+`__stack_chk_guard` "appears in 596 shipped modules", taken from a recursive scan of every module
+file present in every dump (808 modules). `boot_link_inputs` links roughly 303 of them, so that
+figure described a population the linker never sees and overstated the bindings by about 2.4x. The
+per-title counts were correct in both scopes, which is what made the binding count easy to repeat
+unchecked.
 
 Two properties of the link that surprise people, both load-bearing:
 
