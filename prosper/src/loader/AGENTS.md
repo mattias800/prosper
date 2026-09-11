@@ -41,7 +41,9 @@ that do, and every title in the corpus has at least two.
 
 **Quote link-set figures, not disk figures, and take them from the tool.** Two earlier revisions of
 this paragraph got it wrong the same way, the second while correcting the first. "596 shipped
-modules" came from passing *module paths* to `nid_census` individually, where each `.prx` becomes its
+modules" came from passing *module paths* to `nid_census` individually — that scan sees 808
+modules with 728 importing the guard, so the mechanism is verified, though the exact figure 596 has
+not been reproduced — where each `.prx` becomes its
 own "title" and cross-module exclusion degenerates — a recursive population of 808 modules the linker
 never links. The replacement then called the link set "roughly 303 modules", which is a **binding**
 count written where a module count goes. Both times the per-title counts were right, which is

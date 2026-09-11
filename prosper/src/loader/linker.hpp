@@ -90,7 +90,9 @@ struct Program {
     //
     // QUOTE LINK-SET FIGURES, NOT DISK FIGURES, and take them from the tool. Two earlier revisions
     // of this comment got it wrong in the same way and the second was written while correcting the
-    // first: "596 shipped modules" came from passing MODULE PATHS to nid_census individually, where
+    // first: "596 shipped modules" came from passing MODULE PATHS to nid_census individually (the
+    // mechanism is verified -- that scan sees 808 modules, 728 importing the guard -- though the
+    // exact figure 596 has not been reproduced), where
     // each .prx becomes its own "title" and cross-module exclusion degenerates -- a recursive
     // population of 808 modules the linker never links. The replacement then said the link set is
     // "roughly 303 modules", which is a BINDING count written where a module count goes. The
