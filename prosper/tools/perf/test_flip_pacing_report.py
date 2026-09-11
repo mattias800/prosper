@@ -8,6 +8,9 @@ distribution. Each case is a regime the report must classify, plus the trap: a p
 Run: python3 tools/perf/test_flip_pacing_report.py
 """
 
+import importlib.util
+import random
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -173,6 +176,122 @@ def main():
     out, _ = run("\n".join(single) + "\n")
     if "step backwards" in out:
         failures.append(f"case 10: a single monotonic run was flagged as concatenated: {out!r}")
+
+    # 11. #3454: the tick-aligned share is meaningless without its null. The band is +/-BAND of
+    #     the tick, so it covers 2*BAND of every tick period and an interval unrelated to the
+    #     tick lands in it that often anyway. The report must PRINT that baseline, and the
+    #     printed band must be derived from BAND rather than restated as a literal -- the tool
+    #     previously said '15%' in one place and tested `0.15` in another.
+    spec = importlib.util.spec_from_file_location('flip_pacing_report', str(TOOL))
+    FPR = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(FPR)
+    # Read the constants defensively. A tool with no baseline at all is the PRE-FIX state, and
+    # it must produce one named failure per arm rather than an AttributeError that aborts the
+    # run before cases 12-15 execute -- otherwise the without-fix arm proves only that case 11
+    # discriminates, and says nothing about the other four.
+    BAND = getattr(FPR, 'BAND', None)
+    CHANCE = getattr(FPR, 'CHANCE', None)
+    verdict_of = getattr(FPR, 'alignment_verdict', None)
+    if BAND is None or CHANCE is None or verdict_of is None:
+        failures.append('case 11: flip_pacing_report exposes no BAND/CHANCE/alignment_verdict,'
+                        ' so the tick-aligned share has no stated null at all (#3454)')
+        BAND, CHANCE = 0.15, 0.30   # what the report is expected to use, so the arms below
+                                    # still discriminate instead of crashing
+
+    stamps = []
+    t = 1.0
+    for i in range(600):
+        t += 0.015625
+        stamps.append(t)
+    log = "".join(f"[ev] GpuFlip t={t:.6f}\n" for t in stamps)
+    out, _ = run(log)
+    expect(out, f"chance baseline {100 * CHANCE:.1f}%", "case 11 baseline is printed")
+    expect(out, f"+/-{BAND * 100:.0f}%", "case 11 printed band is derived from BAND")
+    expect(out, "well above chance", "case 11 a perfectly tick-locked run is a strong finding")
+
+    # 12. THE POSITIVE CONTROL FOR THE NULL ITSELF, and the reason this case exists: asserting
+    #     '2*BAND = 30%' in a test would only restate the arithmetic the code already performs.
+    #     So the null is measured instead, from a generator built OUTSIDE the tool and bearing no
+    #     relationship to the tick -- uniform intervals over [20, 120] ms.
+    #
+    #     Its EXACT expected coverage is derivable, and is not 30%: the tick multiples falling
+    #     wholly inside [20, 120] are k=2..7 (31.25 .. 109.375 ms), six bands of 2*0.15*15.625 =
+    #     4.6875 ms, so 28.125 of 100 ms = 28.1%. k=1 and k=8 lie outside the range and
+    #     contribute nothing. Measured across three seeds: 27.2%, 28.3%, 29.3%.
+    #
+    #     That gap between the exact 28.1% and the printed asymptotic 30.0% is the honest
+    #     limitation of a flat null, and it is why this asserts a BAND rather than a point. What
+    #     must hold is the verdict: a run with no tick relationship must not read as a finding.
+    rng = random.Random(20260911)
+    stamps = []
+    t = 1.0
+    for _ in range(4000):
+        t += rng.uniform(0.020, 0.120)
+        stamps.append(t)
+    log = "".join(f"[ev] GpuFlip t={t:.6f}\n" for t in stamps)
+    out, _ = run(log)
+    share_line = next((l for l in out.splitlines() if "tick-aligned intervals" in l), "")
+    match = re.search(r'[(]([0-9.]+)%[)]', share_line)
+    if not match:
+        failures.append(f"case 12: no tick-aligned share line: {out!r}")
+    else:
+        observed = float(match.group(1))
+        if not 22.0 <= observed <= 34.0:
+            failures.append(
+                f"case 12: intervals unrelated to the tick scored {observed}%, outside the"
+                f" 22-34% window the flat null predicts -- the baseline claim is wrong")
+    expect(out, "at chance", "case 12 an unrelated run must read as no evidence, not a finding")
+
+    # 13. A BELOW-baseline run carries information -- production is actively anti-aligned, which
+    #     is evidence AGAINST a tick-bound wait. It previously read as a weak positive, so the
+    #     9.3% window in #3450 was discarded as 'no finding'. Intervals parked on half-tick
+    #     offsets are as far from every multiple as it is possible to be.
+    rng = random.Random(4242)
+    stamps = []
+    t = 1.0
+    for _ in range(1200):
+        t += (15.625 * rng.choice([1, 2]) + 15.625 * 0.5 + rng.gauss(0, 0.3)) / 1000.0
+        stamps.append(t)
+    log = "".join(f"[ev] GpuFlip t={t:.6f}\n" for t in stamps)
+    out, _ = run(log)
+    expect(out, "BELOW chance", "case 13 anti-aligned production is named as such")
+    expect(out, "evidence AGAINST", "case 13 says what a sub-chance share means")
+
+    # 14. The whole-run share is an average over windows. When those windows disagree the
+    #     summary reintroduces exactly the smearing the windowed view exists to prevent, so it
+    #     must say so. One tick-locked phase followed by one anti-aligned phase.
+    rng = random.Random(99)
+    stamps = []
+    t = 1.0
+    for _ in range(900):
+        t += (15.625 + rng.gauss(0, 0.3)) / 1000.0
+        stamps.append(t)
+    for _ in range(900):
+        t += (15.625 * 1.5 + rng.gauss(0, 0.3)) / 1000.0
+        stamps.append(t)
+    log = "".join(f"[ev] GpuFlip t={t:.6f}\n" for t in stamps)
+    out, _ = run(log, ["--window-s", "4"])
+    expect(out, "windows disagree", "case 14 a two-regime run flags its own summary as an average")
+
+    # 15. The verdict thresholds themselves, asserted directly rather than through the report, so
+    #     a wording change in the printer cannot silently move a boundary.
+    if verdict_of is None:
+        failures.append('case 15: no alignment_verdict to assert thresholds against')
+        verdict_of = lambda share, chance=None: (None, '')
+    ratio, verdict = verdict_of(CHANCE)
+    if ratio is None or abs(ratio - 1.0) > 1e-9 or 'at chance' not in verdict:
+        failures.append(f"case 15: a share exactly at chance must read as at-chance: {verdict!r}")
+    _, verdict = verdict_of(CHANCE * 0.3)
+    if 'BELOW chance' not in verdict:
+        failures.append(f"case 15: a third of chance must read as below: {verdict!r}")
+    _, verdict = verdict_of(CHANCE * 3.0)
+    if 'well above chance' not in verdict:
+        failures.append(f"case 15: three times chance must read as a real finding: {verdict!r}")
+    # A band whose acceptance region covers the whole line has no discriminating power left;
+    # the helper must not divide by a zero or negative baseline.
+    ratio, verdict = verdict_of(0.5, chance=0.0)
+    if ratio is not None:
+        failures.append("case 15: a zero baseline must yield no ratio rather than a division")
 
     if failures:
         print("FAILURES:")

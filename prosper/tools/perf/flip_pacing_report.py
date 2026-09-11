@@ -8,8 +8,11 @@ Guest frame-rate hunts on Windows dev boxes have been fps-counter-driven: an ave
 cadence directly, and the INTERVAL DISTRIBUTION names the limiter class:
 
   * a tight spike at one period -- a hard pacer (a vsync, a fixed timer);
-  * clustering at timer-tick multiples (~15.6/31.25 ms on Windows) -- a wait in the
-    production path resolving on the OS tick, regardless of the requested timeout;
+  * clustering at timer-tick multiples (~15.6/31.25 ms on Windows) WELL ABOVE the chance
+    baseline -- a wait in the production path resolving on the OS tick, regardless of the
+    requested timeout. Read the excess over chance, never the raw share: the acceptance
+    band covers 30% of the real line, so intervals with no relationship to the tick score
+    30% and a reported 50% is 1.7x chance, not 'half the frames are tick-bound' (#3454);
   * a wide spread -- work-bound production (profile the fold, don't hunt waits).
 
 The report also splits the timeline into windows so a cinematic-to-gameplay phase change
@@ -36,6 +39,20 @@ FLIP = re.compile(r"\[ev\] GpuFlip\b.*?\bt=([0-9.]+)")
 FLIP_TAG = re.compile(r"\[ev\] GpuFlip\b")
 # The Win32 timer tick on dev boxes is 15.625 ms; quantized waits land on its multiples.
 TICK_MS = 15.625
+
+# Half-width of the acceptance band around each tick multiple, as a fraction of the tick.
+# It was a bare 0.15 inside classify() while the report's own sentence said '15%' in a
+# separate literal -- two places to change and one of them silent. Named here so the
+# predicate, the printed band and the chance baseline below cannot drift apart.
+BAND = 0.15
+
+# THE NULL. The band spans +/-BAND of every tick, i.e. 2*BAND of each tick period, so an
+# interval bearing no relationship to the tick still lands inside it 2*BAND of the time --
+# 30.0% at BAND=0.15. Without this printed next to the share, the figure is uninterpretable:
+# one GTA V run (#3450) produced windows at 96.5%, 60.5%, 50.1% and 9.3%, and only the first
+# is a strong finding while the LAST is evidence AGAINST tick-bound production -- which read
+# as 'no finding' rather than as the signal it is (#3454).
+CHANCE = min(1.0, 2.0 * BAND)
 
 
 def parse_flips(paths):
@@ -83,13 +100,33 @@ def parse_flips(paths):
     return timelines
 
 
-def classify(ms, tick):
+def classify(ms, tick, band=BAND):
     """Name the bucket an interval falls into, for the quantization verdict."""
     nearest = max(1, round(ms / tick))
     error = abs(ms - nearest * tick)
-    if error <= 0.15 * tick:
+    if error <= band * tick:
         return f"{nearest} tick(s)"
     return "between ticks"
+
+
+def alignment_verdict(share, chance=None):
+    """Turn an observed tick-aligned SHARE (0..1) into a ratio against chance and a verdict.
+
+    Separate from the printing so the thresholds can be asserted directly. The bands are
+    deliberately coarse -- this answers 'is the tick implicated at all', and a sharper claim
+    than that is not available from a share against a flat null.
+    """
+    chance = CHANCE if chance is None else chance
+    if chance <= 0:
+        return None, 'no chance baseline is defined for this band'
+    ratio = share / chance
+    if ratio < 0.75:
+        return ratio, ('BELOW chance -- production here is anti-aligned, which is evidence AGAINST a tick-bound wait, not an absence of evidence')
+    if ratio < 1.25:
+        return ratio, 'at chance -- no evidence of tick quantisation'
+    if ratio < 2.0:
+        return ratio, 'modestly above chance -- weak, do not call this tick-bound on its own'
+    return ratio, 'well above chance -- real quantisation'
 
 
 def report(stamps, window_s, tick, untimed=0, restarts=0):
@@ -128,8 +165,11 @@ def report(stamps, window_s, tick, untimed=0, restarts=0):
           f"-> {overall:.1f} fps average")
 
     quantized = sum(1 for ms in intervals if classify(ms, tick) != "between ticks")
-    print(f"tick-aligned intervals (within 15% of a {tick:.3f} ms tick multiple): "
-          f"{quantized} ({100 * quantized / len(intervals):.1f}%)")
+    overall_share = quantized / len(intervals)
+    ratio, verdict = alignment_verdict(overall_share)
+    print(f"tick-aligned intervals (within +/-{BAND * 100:.0f}% of a {tick:.3f} ms tick "
+          f"multiple): {quantized} ({100 * overall_share:.1f}%)")
+    print(f"  chance baseline {100 * CHANCE:.1f}% -- {ratio:.2f}x chance: {verdict}")
 
     hist = collections.Counter(round(ms) for ms in intervals)
     print("interval histogram (ms: count, top buckets):")
@@ -141,14 +181,31 @@ def report(stamps, window_s, tick, untimed=0, restarts=0):
     window_flips = max(1, int(window_s * (1000.0 / statistics.mean(intervals))))
     print(f"windows of ~{window_flips} flips:")
     start = 0
+    window_shares = []
     while start < len(intervals):
         chunk = intervals[start:start + window_flips]
         mean_ms = statistics.mean(chunk)
         quantized = sum(1 for ms in chunk if classify(ms, tick) != "between ticks")
+        share = quantized / len(chunk)
+        window_shares.append(share)
+        w_ratio, _ = alignment_verdict(share)
+        # Mark the sub-chance windows explicitly. A low share reading as 'no finding' is
+        # exactly how the 9.3% window's information was thrown away (#3454).
+        note = "BELOW chance" if w_ratio is not None and w_ratio < 0.75 else ""
         print(f"  flips {start:5d}-{start + len(chunk):5d}: "
               f"{1000.0 / mean_ms:6.1f} fps  mean {mean_ms:6.2f} ms  "
-              f"tick-aligned {100 * quantized / len(chunk):5.1f}%")
+              f"tick-aligned {100 * share:5.1f}% ({w_ratio:.2f}x chance) {note}")
         start += window_flips
+
+    # The whole-run share is a mean over windows that can disagree by an order of magnitude,
+    # which is the very smearing the windowed view exists to prevent -- so say so rather than
+    # letting the summary line quietly reintroduce it (#3454).
+    if len(window_shares) >= 2:
+        lo, hi = min(window_shares), max(window_shares)
+        if hi - lo >= 0.25:
+            print(f"  NOTE: windows disagree by {100 * lo:.1f}%..{100 * hi:.1f}% tick-aligned,"
+                  f" so the whole-run {100 * overall_share:.1f}% above is an average over"
+                  f" regimes that differ. Read the windows, not the summary.")
 
     slowest = sorted(range(len(intervals)), key=lambda i: -intervals[i])[:5]
     print("slowest intervals (ms):",
