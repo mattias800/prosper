@@ -35,6 +35,15 @@ game asked for, so on a high-refresh monitor the game simply simulated faster --
 panel. It now holds each flip to the rate the title itself requested. No picture: this one you can
 only see by watching something move at the right speed.
 
+### The pixel-history tool could tell you a shader wrote black when it knew nothing at all
+
+No picture for this one. `pixel_history.py` is what we reach for when a pixel is the wrong colour,
+and RenderDoc marks a value it has no data for by stamping `0xdeadbeef` into it — which decodes,
+through the float view, to a colour whose brightest channel is exactly `0.0`. So "I have no
+information" was being reported as `SHADER_WROTE_BLACK`, sending the reader to resource binding and
+shaders over a pixel the instrument could not read. It now says `VALUE_UNKNOWN` and names what it is
+missing.
+
 ### One of the five “sheared triangle” titles renders perfectly
 
 ![Evergate title screen, Windows/NVIDIA, native 1920x1080](assets/screenshots/evergate-title-screen-windows-nvidia.webp)

@@ -80,8 +80,12 @@ python3 tools/pixel_history/pixel_history.py "$run_dir"/frame_frame*.rdc \
 ```
 
 It reports `NOTHING_DREW`, `ALL_REJECTED` (naming the test that rejected), `SHADER_WROTE_BLACK`,
-`STORE_LOST_IT`, `PIXEL_WAS_WRITTEN`, `CLEARED_AFTER_DRAW` or `OUTPUT_UNTRUSTED`, with the per-event
-detail behind it, and defaults to the brightest pixel rather than the centre. Clears are reported but
+`STORE_LOST_IT`, `PIXEL_WAS_WRITTEN`, `CLEARED_AFTER_DRAW`, `OUTPUT_UNTRUSTED` or `VALUE_UNKNOWN`,
+with the per-event detail behind it, and defaults to the brightest pixel rather than the centre.
+`VALUE_UNKNOWN` is a refusal, not a failure: RenderDoc marks a value it has no data for with a
+`0xdeadbeef` sentinel, that sentinel used to arrive as a colour whose `max(rgb)` is exactly `0.0`,
+and an absence of information was therefore reported as a measured black (instrument trap 278).
+Read it as "ask this question of another pixel, or open that event yourself". Clears are reported but
 are never the subject of a verdict — on a cleared target "the last passing event computed black"
 would otherwise be the clear, and blame a shader that never ran (instrument trap 269). On a driver you have not used it on before, run `--expect-control` against
 `pixel_history_control` first; see [its AGENTS.md](../tools/pixel_history/AGENTS.md) for why that is
