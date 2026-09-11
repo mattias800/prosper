@@ -49,3 +49,30 @@ divergence, stale/missing remote refs, unreachable remotes, offline checks, link
 detached HEAD, feature branches, Windows line endings and paths containing spaces. It is registered
 as the `session_start` CTest case. The contribution-shape gate allows only `.claude/settings.json`,
 keeping private settings and agent worktree contents outside the exception.
+
+## Two ways this check has failed on Windows
+
+Both were quiet, and they are told apart by where the failure is raised. Read the symptom before
+reaching for either explanation: they share a platform and nothing else.
+
+The **interpreter never starts**. On a stock Windows install the name `python3` is the Microsoft
+Store App Execution Alias stub, so the hook exits 9009 having run nothing, stdout is empty, and the
+session receives no session-start context of any kind (#3540). The interpreter chain described
+above, and its closing `echo`, are what keep that visible.
+
+**Git answers a path query in a flavour the caller cannot read.** The Windows MinGW CI job pairs an
+MSYS2 git with a native Windows Python, and `rev-parse --show-toplevel` there replies in POSIX form
+(`/c/Users/...`), which native Python reads back as the drive-relative `\c\Users\...`. Every later
+`-C` then missed the repository, so eight cases reported `[session-start] UNVERIFIED: Git could not
+verify rev-parse` and exit 2 where 0 or 1 was expected (#3426, diagnosed in #3443, fixed in #3444 by
+deriving the root from the relative `--show-cdup`, which never changes flavour). Linux never saw it
+because POSIX Python and POSIX git agree, and a local Windows checkout never saw it because
+Git-for-Windows answers `C:/...`, which round-trips.
+
+So: empty stdout and no report means the interpreter; a `[session-start] UNVERIFIED:` report means
+the check ran and git could not be trusted. Verified 2026-09-11 on `main` at `31d8ec34`: the Windows
+MinGW job runs `session_start` and passes (304 of 304 tests), and the pre-fix module reproduces
+#3426's exact string against a hand-built POSIX answer while the current one returns 0. The standing
+guard is `test_git_path_output_is_never_used_as_a_filesystem_path`, whose poisoned answer is built by
+hand rather than taken from the git on the host running it -- a control drawn from that git would
+inherit the flavour that host already survives, and so could not express the case at all.
