@@ -21,6 +21,15 @@ from the tracker issues, and still gated, because it is a projection of state ra
 
 ## 2026-09-11
 
+### Games were running up to three times too fast, and it was the monitor's fault
+
+prosper completed a game's page flip the instant it was ready instead of holding it to the 60 Hz the
+game asked for, so on a high-refresh monitor the game simply simulated faster -- 3x on a 180 Hz
+panel. It now holds each flip to the rate the title itself requested. No picture: this one you can
+only see by watching something move at the right speed.
+
+## 2026-09-11
+
 ### Two titles that could not boot at all now boot, and neither needed a renderer change
 
 *FINAL FANTASY TACTICS – The Ivalice Chronicles* killed itself about a second into every launch. It

@@ -2557,6 +2557,16 @@ if(TARGET prosper_core)
   target_link_libraries(test_display_mode PRIVATE prosper_core)
   add_test(NAME display_mode_derivation COMMAND test_display_mode)
 
+  # #3379: guest flips are paced at the cadence the TITLE asked for by default. Its own executable
+  # rather than an arm of test_videoout, for the same reason test_display_mode above is: the
+  # advertised display mode resolves once per process, and these arms read the derived period
+  # against the untouched `legacy` default. CROSS-PLATFORM like both of those -- HLE registry plus
+  # a sleep, no display access. Includes one deliberately one-sided timing arm (a lower bound on a
+  # sleep cannot flake).
+  add_executable(test_flip_pacing tests/host/platform/test_flip_pacing.cpp)
+  target_link_libraries(test_flip_pacing PRIVATE prosper_core)
+  add_test(NAME flip_pacing_defaults COMMAND test_flip_pacing)
+
   # precise_sleep's deadline post-condition (#3074): every sleep_until_steady_ns() backend must
   # never return before now_ns() >= deadline_ns. Win32SleepFallback did not re-check after its one
   # OS sleep call, unlike the sibling high-resolution-timer path. CROSS-PLATFORM like test_videoout

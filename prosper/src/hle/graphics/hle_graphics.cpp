@@ -20,6 +20,7 @@
 #include "host/memory/guest_memory_map.hpp" // guest_readable_mapping_containing (real over-read proof)
 #include "host/platform/precise_sleep.hpp"   // #1765: a vblank wait whose resolution is not the Win32 tick
 #include "hle/graphics/display_mode.hpp"      // #3017: the one derived answer for "which display is this?"
+#include "diagnostics/env_numeric.hpp"  // #3379: a typo must not silently unpace the guest
 #include <cstdlib>
 #include <cstring>
 #include <cerrno>
@@ -242,13 +243,39 @@ namespace {
 extern "C" uint64_t prosper_vo_flip_count() { std::lock_guard<std::mutex> lk(g_flip_mx); return g_flip_count; }
 extern "C" int prosper_vo_flip_rate() { std::lock_guard<std::mutex> lk(g_flip_mx); return g_flip_rate; }
 
-// Hold the GUEST flip rate at PROSPER_FLIP_PACE_FPS, sleeping in the flip path when we are ahead.
+// Hold the GUEST flip rate at the cadence the title asked for, sleeping in the flip path when we
+// are ahead.
+//
+// WHAT PACES A FLIP, AND WHERE THE PERIOD COMES FROM. A flip completes at a vblank of the display
+// the guest was told it is attached to, and sceVideoOutSetFlipRate is the title's own statement of
+// how many vblanks apart consecutive flips may be (selector 0/1/2 = every 1st/2nd/3rd). So the
+// period is `vblank_period_ns() * (flip_rate + 1)`, read off the SAME resolved display object that
+// sceVideoOutGetResolutionStatus reports and that the vblank grid below is built on (#3017) --
+// 16683350 ns under the default `legacy` policy, i.e. 59.94 Hz, not a hardcoded 60. A title that
+// opted into PROSPER_DISPLAY_MODE=host on a 180 Hz panel is told 180 Hz and paced at 180, because
+// that is the display it is pacing ITSELF to; the derivation stays self-consistent either way
+// rather than picking a target rate of its own.
+//
+// WHY IT IS ON BY DEFAULT (#3379). Our present is synchronous, so with no pacing a guest flip
+// completes as fast as the host can render one, and a title whose frame loop is gated on flip
+// completion simulates at host speed: New Joe & Mac ran at 180.0 fps and visibly ~3x too fast on a
+// 180 Hz panel, and PROSPER_FLIP_PACE_FPS=60 on an otherwise identical relaunch took it to 60.0 fps
+// and correct speed (project owner, 2026-09-05, RADV). On a 60 Hz host the swapchain supplied the
+// right cadence by accident, which is why this stayed hidden.
+//
+// THE RATE IS RE-READ ON EVERY FLIP. A title may call sceVideoOutSetFlipRate at any point -- a
+// 30 Hz cutscene inside a 60 Hz game is ordinary -- and the previous function-local `static` cache
+// would have pinned the period to whatever was selected before the first flip, forever.
+//
+// PROSPER_FLIP_PACE_FPS still names an explicit rate, and `0` is an explicit "do not pace". A
+// MALFORMED value keeps the derived default rather than selecting the OFF arm: a typo must not
+// silently hand back the 3x speed-up this exists to remove (#3538).
 //
 // Snapshot routes are FLIP-anchored ("press Cross at flip 1200"), so "the same flip" only means "the
 // same moment in the game" if flips happen at a fixed RATE. That correspondence is what this
-// provides, and the snapshot tool sets it on BOTH sides -- while a person authors, and again when a
-// check replays. If only one side paces, the route does not merely drift, it DIVERGES: a press lands
-// at a different guest time and can be swallowed entirely.
+// provides, and the snapshot tool sets PROSPER_FLIP_PACE_FPS on BOTH sides -- while a person
+// authors, and again when a check replays. If only one side paces, the route does not merely drift,
+// it DIVERGES: a press lands at a different guest time and can be swallowed entirely.
 //
 // It also fixes a second problem when PROSPER_DET_CLOCK is on. That clock advances guest time by
 // 1/DET_FPS per flip, so guest time then runs at host_fps/DET_FPS: an Alex Kidd splash screen
@@ -258,32 +285,64 @@ extern "C" int prosper_vo_flip_rate() { std::lock_guard<std::mutex> lk(g_flip_mx
 //
 // LIMIT: this can only slow a fast host DOWN. flip_pace_wait() sleeps when ahead and re-anchors when
 // behind, so on any title/host that cannot sustain the requested rate it is inert and the anchors
-// drift again. That is the case scan-mode snaps exist for.
+// drift again. That is the case scan-mode snaps exist for. It is therefore not a throughput change
+// on any title already measured below its own requested rate.
 //
-// Off by default; the snapshot tool opts in on both sides.
+// NOT GRID-SNAPPED, deliberately. host::next_grid_deadline_ns() would put every flip on the vblank
+// grid in PHASE as well as in period, which is what a VSYNC-mode flip does on hardware -- and it
+// also turns a frame that overruns its period by a millisecond into a full extra period of wait
+// (59.94 -> 29.97 Hz). prosper sits far enough below PS5 throughput that most titles would live on
+// that edge, and the rate-holding form below is both what the owner's A/B verified and what every
+// stored snapshot set was authored against. So the period SOURCE changes here and the algorithm
+// does not. Revisit only with evidence about the guest's flip queue depth and flip mode; the only
+// mode seen in this project's logs so far is 0x1.
 //
 // Deliberately a sleep in the flip path rather than a frame limiter in the frontend: the guest's
 // flip count is what the clock and the anchors are defined against, and the host's swapchain
-// presents are a different quantity that the guest can outrun.
+// presents are a different quantity that the guest can outrun. The host swapchain stays uncapped.
 namespace {
+uint64_t vblank_period_ns();   // defined with the vblank grid below -- one origin for both (#3017)
+
 std::atomic<uint64_t> g_flip_pace_next_ns{0};
 
-uint32_t flip_pace_fps() {
-    static const uint32_t fps = [] {
-        const char* value = getenv("PROSPER_FLIP_PACE_FPS");
-        if (!value || !*value) return 0u;
-        char* end = nullptr;
-        const unsigned long parsed = std::strtoul(value, &end, 10);
-        // A malformed value disables pacing rather than picking a rate nobody asked for.
-        return end != value && *end == '\0' && parsed > 0 && parsed <= 1000 ? (uint32_t)parsed : 0u;
-    }();
-    return fps;
+// "Nobody named a rate -- derive it from the guest's own request." Distinct from 0, which is a
+// request to run free.
+constexpr uint32_t kFlipPaceDerive = UINT32_MAX;
+
+// The process default, which a measurement harness may turn off. See
+// prosper_vo_set_flip_pacing_unpaced_default().
+std::atomic<uint32_t> g_flip_pace_default{kFlipPaceDerive};
+
+// PROSPER_FLIP_PACE_FPS, read LIVE rather than cached in a static: a cached read is what made the
+// old selector unable to see a mid-run SetFlipRate, and a getenv per flip at 60 Hz is free.
+uint32_t flip_pace_override_fps() {
+    const char* text = getenv("PROSPER_FLIP_PACE_FPS");
+    if (!text || !*text) return kFlipPaceDerive;
+    uint64_t parsed = 0;
+    if (prosper::diag::parse_u64_strict(text, &parsed) && parsed <= 1000)
+        return (uint32_t)parsed;                 // 0 included: an explicit, deliberate "run free"
+    static std::atomic<bool> reported{false};    // once: this is read on every flip
+    if (!reported.exchange(true))
+        fprintf(stderr, "[env] PROSPER_FLIP_PACE_FPS='%s' is not a plain flip rate in 0..1000 -- "
+                        "keeping the default (the rate the guest asked for) and changing NOTHING\n",
+                text);
+    return kFlipPaceDerive;
+}
+
+// Nanoseconds to hold between guest flip completions; 0 means "do not pace".
+uint64_t flip_pace_period_ns() {
+    uint32_t fps = flip_pace_override_fps();
+    if (fps == kFlipPaceDerive) fps = g_flip_pace_default.load(std::memory_order_relaxed);
+    if (fps == 0) return 0;
+    if (fps != kFlipPaceDerive) return 1000000000ull / fps;
+    const int rate = prosper_vo_flip_rate();     // 0/1/2 -> flip on every 1st/2nd/3rd vblank
+    const uint64_t vblanks = (rate >= 0 && rate <= 2) ? (uint64_t)rate + 1u : 1u;
+    return vblank_period_ns() * vblanks;
 }
 
 void flip_pace_wait() {
-    const uint32_t fps = flip_pace_fps();
-    if (!fps) return;
-    const uint64_t period = 1000000000ull / fps;
+    const uint64_t period = flip_pace_period_ns();
+    if (!period) return;
     const uint64_t now = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
     uint64_t next = g_flip_pace_next_ns.load(std::memory_order_relaxed);
@@ -294,11 +353,29 @@ void flip_pace_wait() {
         g_flip_pace_next_ns.store(now + period, std::memory_order_relaxed);
         return;
     }
-    if (now < next)
-        std::this_thread::sleep_for(std::chrono::nanoseconds(next - now));
+    // NOT std::this_thread::sleep_for: on Windows that is one ::Sleep(ms), quantized to the ~15.6 ms
+    // system timer period, so a 59.94 Hz hold would overshoot every frame and pace the guest SLOWER
+    // than it asked for -- the same defect #1765 fixed for the vblank wait, and newly reachable here
+    // now that pacing is on by default.
+    if (now < next) host::sleep_until_steady_ns(next);
     g_flip_pace_next_ns.store(next + period, std::memory_order_relaxed);
 }
 }  // namespace
+
+// The period the NEXT guest flip will be held to, in nanoseconds; 0 = not paced. Published so a
+// test can assert the POLICY (which display, which divisor, which override wins) without measuring
+// wall-clock time, which is a flake by construction on a loaded host.
+extern "C" uint64_t prosper_vo_flip_pace_period_ns() { return flip_pace_period_ns(); }
+
+// Opt this process out of the guest-rate default, leaving flips free-running unless
+// PROSPER_FLIP_PACE_FPS names a rate. Installed by the headless MEASUREMENT harnesses
+// (tools/screenshot, tools/boot_trace): their pad routes are wall-clock anchored against
+// free-running flips, and the snapshot tool sets PROSPER_FLIP_PACE_FPS explicitly on both of its
+// halves, so neither should inherit a console cadence and become 3x slower. An interactive
+// frontend IS the console and does not call this.
+extern "C" void prosper_vo_set_flip_pacing_unpaced_default() {
+    g_flip_pace_default.store(0, std::memory_order_relaxed);
+}
 extern "C" int prosper_vo_buffer_count() {
     std::lock_guard<std::mutex> lk(g_display_mx); return g_display.buffer_num;
 }
