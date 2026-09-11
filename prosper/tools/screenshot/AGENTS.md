@@ -48,3 +48,7 @@ which owns the reviewed baselines.
    `--max-stale-seconds` and `--max-pixel-stale-seconds`, and a shortened run can only make a floor
    harder to satisfy while making a maximum easier. That asymmetry is why the staleness bounds veto
    the early stop rather than coexisting with it (`early_stop_armed`).
+
+## Flip pacing is OFF here, and that is deliberate
+
+prosper paces the guest's flips to the cadence the title asked for by default (#3379), because an unpaced flip completes as fast as the host can render one and a flip-gated title then simulates at host speed. This tool opts out, in `main()`, before boot: its pad routes are wall-clock anchored against free-running flips, and a console cadence would move every input to a different guest moment and make a capture sweep several times slower. The snapshot tool sets `PROSPER_FLIP_PACE_FPS` explicitly on both of its halves, so it is unaffected either way; an explicit `PROSPER_FLIP_PACE_FPS` always wins over the opt-out. A consequence worth remembering when reading a rate: **a flips/s figure from this tool and one from `prosper-app` are not comparable.**
