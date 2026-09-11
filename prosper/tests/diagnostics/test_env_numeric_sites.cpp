@@ -149,6 +149,26 @@ static uint64_t dmem_old(const char* t) {
     return 16ull * 1024 * 1024 * 1024;
 }
 
+// --- src/hle/graphics/hle_agc.cpp : PROSPER_RENDER_EVERY / PROSPER_PRESENT_EVERY (#2847) -------
+// Both are DIVISORS on the GPU submit path, so 0 is not "off" -- it is `% 0`, i.e. SIGFPE on the
+// first draw submit. The old spelling guarded `v > 0` on a `long` and then narrowed to `unsigned`,
+// which the guard cannot see: every multiple of 2^32 is positive as a long and 0 as an unsigned.
+// The cap below the narrowing is what makes that unreachable; the `v ? v : 1` floor is the site's
+// pre-existing refusal of a literal `=0` and is kept.
+static uint64_t every_new(const char* n, const char* t) {
+    const uint64_t v = env_u64_or_default_capped(n, t, 1ull, UINT32_MAX, "draw submits");
+    return v ? (unsigned)v : 1u;
+}
+static uint64_t every_old(const char* t) {
+    // `long long` rather than the site's `long` deliberately: the narrowing the site suffered from
+    // only exists where `long` is 64 bits (LP64 -- Linux and macOS, where every one of this knob's
+    // routes runs). On LLP64 Windows `long` is already 32 bits, `atol` saturates to LONG_MAX and
+    // the cast narrows nothing, so mirroring `atol` literally would make the discriminator below
+    // pass on one platform and fail on the other for reasons that have nothing to do with the fix.
+    long long v = t ? std::atoll(t) : 1;
+    return v > 0 ? (unsigned)v : 1u;   // (unsigned)4294967296 == 0
+}
+
 // --- src/gpu/execute/gpu_executor.cpp : PROSPER_MAX_DISPATCH_GROUPS ----------------------------
 // Unset is 0 = "no cap", which is the right default and the wrong answer to a typo: the knob is
 // only ever set in order to impose a cap.
@@ -319,6 +339,15 @@ static const Site kSites[] = {
     {"hle_kernel_mem.cpp PROSPER_DMEM_BUDGET_MB", "PROSPER_DMEM_BUDGET_MB",
      dmem_new, dmem_old, "-1", 16ull * kGiB, "8192", 8192ull * kMiB},
 
+    // #2847. A malformed cadence keeps 1 -- i.e. renders/publishes everything, the pre-existing
+    // default -- rather than a plausible prefix. The SATURATING half of this site is not expressible
+    // in this table (2^32 is WELL-FORMED, so nothing is refused and the answer is the cap rather
+    // than the fallback); it is asserted directly in main() below.
+    {"hle_agc.cpp PROSPER_RENDER_EVERY", "PROSPER_RENDER_EVERY",
+     every_new, every_old, "500submits", 1ull, "500", 500ull},
+    {"hle_agc.cpp PROSPER_PRESENT_EVERY", "PROSPER_PRESENT_EVERY",
+     every_new, every_old, "30 submits", 1ull, "30", 30ull},
+
     {"gpu_executor.cpp PROSPER_MAX_DISPATCH_GROUPS", "PROSPER_MAX_DISPATCH_GROUPS",
      dispatch_cap_new, dispatch_cap_old,
      "750,000", 0ull /* refused: no cap, but the refusal SAYS so instead of capping at 750 */,
@@ -421,6 +450,25 @@ int main() {
                       s.good);
         check(good == s.good_expected, msg);
     }
+
+    // #2847: the cadence divisor is never 0, for ANY input. The table above cannot say this --
+    // `4294967296` is a well-formed decimal, so it is not refused and the fallback is not what
+    // answers it; the CAP below the narrowing is. The old spelling guarded `v > 0` on the `long`
+    // before narrowing, so every multiple of 2^32 passed the guard and became 0, and the submit
+    // path's `draw_submits++ % cadence` was then an integer division by zero (SIGFPE on x86-64).
+    static const char* const kCadenceInputs[] = {
+        "4294967296", "8589934592", "18446744073709551616", "0", "-1", "1e3", "", "1",
+    };
+    bool never_zero = true, old_hit_zero = false;
+    for (const char* input : kCadenceInputs) {
+        if (every_new("PROSPER_RENDER_EVERY", input) == 0) never_zero = false;
+        if (every_old(input) == 0) old_hit_zero = true;
+    }
+    check(never_zero, "hle_agc.cpp cadence: no input makes the divisor 0");
+    check(old_hit_zero,
+          "hle_agc.cpp cadence: ...and the old spelling DID reach 0 (the divide-by-zero)");
+    check(every_new("PROSPER_RENDER_EVERY", "4294967296") == 4294967295ull,
+          "hle_agc.cpp cadence: a value above the narrowing saturates to UINT32_MAX, not to 0");
 
     // Two properties of the shared grammar that every arm above depends on, asserted once here so a
     // failure points at the helper rather than at twenty sites.
