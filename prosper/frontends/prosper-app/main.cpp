@@ -3251,7 +3251,19 @@ int main(int argc, char** argv) {
         // _Exit skips RuntimeComputeTimingSelector's destructor. Publish its validity verdict here;
         // the report is idempotent so a future cooperative teardown cannot duplicate it.
         prosper::frontend::report_live_compute_timing_selector_summary();
+        // Both driver pipeline caches, for the same reason: _Exit runs no destructor, so the
+        // compute context's own teardown save never happens on this path (#3425). Compute is the
+        // one that had no caller at all -- every run paid first-use shader compilation forever,
+        // measured at 821 ms across 14 compilations in one 5 s GTA V world window (#3450).
+        //
+        // Placed AFTER the drain and vkDeviceWaitIdle above: those are what make it safe to read a
+        // cache the guest thread was still mutating. Both calls are bounded and both decline
+        // loudly rather than blocking the close.
+        //
+        // This covers the frontend's own exit only. A guest-thread _Exit (#3324) is exit_group()
+        // from a thread this code never reaches, so neither cache is saved on that path.
         prosper::frontend::flush_live_graphics_pipeline_cache();
+        prosper::frontend::flush_live_compute_pipeline_cache();
 #endif
         // The bounded dmem writer trace also has a destructor/atexit fallback, which _Exit skips.
         prosper::host::guest_dmem_write_trace_report();

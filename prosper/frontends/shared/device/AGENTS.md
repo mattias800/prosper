@@ -4,6 +4,11 @@ Loader/device requirements and selection shared by live frontends and execution 
 Pipeline-cache files belong here: they store opaque driver data, not guest shaders or game assets.
 Cache compatibility checks reject damaged or mismatched files; they cannot guarantee a driver
 accepts its own data safely. Keep disk loading opt-in while the recorded NVIDIA failure remains.
+`PipelineCacheFile` serves BOTH stages -- `graphics()` and `compute()` differ only in the
+filename and the explicit-path variable -- so a policy change cannot land on one and miss the other,
+which is how the compute path ended up writing a bare driver blob with no truncation guard (#3425).
+Note where the file is written from: a frontend that leaves through `_Exit` runs no destructor, so
+persistence is an explicit call on the shutdown path, not a teardown side effect.
 
 Feature acquisition that more than one device path needs belongs here rather than beside whichever
 device was written first: the renderer's device, the compute backend's own device and the adopt path
