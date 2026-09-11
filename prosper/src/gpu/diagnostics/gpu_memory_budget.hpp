@@ -87,8 +87,9 @@ void report_allocation_failure(int result, uint64_t bytes, uint32_t memory_type)
 // then held steady goes quiet -- and a host that locks up an hour later leaves a log whose last
 // memory figure is an hour stale. It also only ever fires at a step boundary, so everything below
 // one step is invisible: on The Messenger at a 32 MiB step the growth line reported 64 MiB on one
-// heap and NOTHING on the other, where the true standing was 81 MiB and 16 MiB. A figure read off
-// the growth line is a floor rounded down to a step, and it was published as a footprint once.
+// heap and NOTHING on the other, where the true standing AT THAT MOMENT was 81 MiB and 16 MiB (it
+// settles higher, around 86 and 20). A figure read off the growth line is a floor rounded down to a
+// step, and it was published as a footprint once.
 //
 // It is driven by ACTIVITY rather than by a clock, and the activity has to include submits, not just
 // allocations. An earlier version of this comment argued allocations were enough because "a device
@@ -100,6 +101,9 @@ void report_allocation_failure(int result, uint64_t bytes, uint32_t memory_type)
 // misses the one this cadence exists for.
 //
 // So it is called from the renderer's submit funnel as well as from the two allocation wrappers.
+// That funnel is the GRAPHICS one: compute submits, the present blit and the app's own submits do
+// not call it, so a title whose activity is entirely on those paths reports only when it allocates.
+// Said plainly here because the alternative is somebody debugging the silence.
 // A process that neither allocates nor submits still leaves no fresh line; that is a real limit, and
 // deliberately not a background thread, whose shutdown ordering would put stderr and a mutex in the
 // path of static destruction for a diagnostic.

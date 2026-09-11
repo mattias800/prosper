@@ -1855,13 +1855,18 @@ inline bool flush_graphics_pipeline_cache(
 // VK_ERROR_DEVICE_LOST is the honest result: the device really is going away, and every caller
 // here already treats a failed submit as "not submitted" and cleans up accordingly.
 inline VkResult render_locked_queue_submit(VkQueue q, uint32_t n, const VkSubmitInfo* s, VkFence f) {
-    prosper::GpuSubmitRegion gate;
-    if (!gate.admitted()) return VK_ERROR_DEVICE_LOST;
     // #3533: the memory standing, on a cadence, from the path where the failure actually happens --
     // "Not enough memory for command submission" is a SUBMIT-time validation over the resident BO
-    // set, which a process with a steady footprint can hit having allocated nothing. Called before
-    // the present lock below so the report never prints inside that critical section.
+    // set, which a process holding a steady footprint can hit having allocated nothing.
+    //
+    // ABOVE the submit region and the present lock, deliberately. `fprintf` can block indefinitely
+    // on a stalled stderr pipe, and inside the region that wait would be one `gpu_submit_gate_drain`
+    // is waiting on -- an unbounded wait there is what this file's own comments call the freeze it
+    // exists to avoid, and a diagnostic about lockups must not be able to cause one. Hoisting it
+    // also keeps the cadence reporting during shutdown, where the gate below returns early.
     prosper::gpu::report_device_memory_periodically();
+    prosper::GpuSubmitRegion gate;
+    if (!gate.admitted()) return VK_ERROR_DEVICE_LOST;
     if (prosper::gpu::shared_present_active()) {
         std::lock_guard<std::mutex> lk(prosper::gpu::shared_present_submit_mutex());
         return vkQueueSubmit(q, n, s, f);

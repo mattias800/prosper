@@ -105,12 +105,19 @@ def resolve(target: str, including: Path, root: Path, roots):
 def reachable_files(root: Path, dropped=None):
     """Every file the shipped translation units can reach through quoted includes.
 
+    `root` is resolved first, because every candidate below is resolved and the two must be in the
+    same form or `relative_to` raises for every file. That is not hypothetical: on macOS a temporary
+    directory is handed out as `/var/folders/...` while `.resolve()` yields `/private/var/folders/...`,
+    so the self-test scanned nothing and -- correctly -- refused to answer. It cost a red CI job and
+    no wrong answer, which is the trade this checker is built for.
+
     `dropped` collects includes that did not resolve but whose basename exists somewhere in the tree.
     Those are edges this walk could not follow, and each one is a subtree it may never have opened --
     so they are reported and the checker refuses to answer, rather than calling a tree clean on the
     strength of a graph it knows is incomplete. This is the backstop that makes the root list above
     non-load-bearing: if the list is ever wrong, this says so instead of hiding it.
     """
+    root = root.resolve()
     roots = include_roots(root)
     in_tree = {}
     for path in root.rglob("*"):
@@ -160,6 +167,7 @@ def relative_or_name(path: Path, root: Path) -> str:
 
 def scan(root: Path, dropped=None):
     """Yield (relative path, line number, symbol) for every raw call in reachable code."""
+    root = root.resolve()
     for path in sorted(reachable_files(root, dropped)):
         try:
             relative = path.relative_to(root).as_posix()
@@ -197,7 +205,7 @@ def self_test() -> str:
     """
     import tempfile
     with tempfile.TemporaryDirectory() as directory:
-        fake = Path(directory)
+        fake = Path(directory).resolve()
         for name in ("src", "frontends", "elsewhere", "vendor_root"):
             (fake / name).mkdir()
         (fake / "CMakeLists.txt").write_text(
@@ -258,6 +266,27 @@ def self_test() -> str:
             return ("an include that could not be followed was dropped in silence; a clean result "
                     "would then be a statement about a graph known to be incomplete")
 
+        # 3b. the same tree reached through a SYMLINK. macOS hands out `/var/folders/...` for a
+        # temporary directory while `.resolve()` yields `/private/var/folders/...`, and mixing the
+        # two forms makes `relative_to` raise for every file -- so the walk scanned nothing and this
+        # function correctly refused to answer. It cost a red CI job and no wrong answer, but Linux
+        # cannot see it without this, because /tmp there is not a symlink.
+        (fake / "src" / "middle.h").write_text(
+            '#include "../elsewhere/deep.h"\n#include "only_via_root.h"\n'
+            '#include "../tests/shipped_fixture.h"\n#include "../third_party/vendored.h"\n')
+        linked = fake.parent / (fake.name + "-symlink")
+        try:
+            linked.symlink_to(fake)
+        except OSError:
+            linked = None                  # no symlink support (Windows without privilege): skip
+        if linked is not None:
+            through_link = [name for name, _, _ in scan(linked)]
+            if not any(n.endswith("deep.h") for n in through_link):
+                linked.unlink()
+                return ("the walk found nothing when the tree was reached through a symlink; a "
+                        "resolved candidate was compared against an unresolved root")
+            linked.unlink()
+
         # 4. the negative half. EVERY raw call in the fake tree must be wired for this to mean
         # anything -- an earlier version left the frontend probe raw, so this arm reported a bypass
         # that was really its own leftover and the control failed on correct code.
@@ -294,10 +323,13 @@ def main() -> int:
         # Print whatever WAS found first. Returning early on an incomplete graph would suppress real
         # bypasses behind a tooling problem -- the finding is still true, it is only the "and there
         # are no others" that the drop invalidates.
-        for relative, number, symbol in findings:
-            fix = "allocate_device_memory" if symbol == "vkAllocateMemory" else "free_device_memory"
-            print(f"  {relative}:{number}: {symbol} -> use prosper::gpu::{fix}")
         if findings:
+            print("vkmem_coverage: these bypass the GPU memory budget:\n", file=sys.stderr)
+            for relative, number, symbol in findings:
+                fix = ("allocate_device_memory" if symbol == "vkAllocateMemory"
+                       else "free_device_memory")
+                print(f"  {relative}:{number}: {symbol} -> use prosper::gpu::{fix}",
+                      file=sys.stderr)
             print("", file=sys.stderr)
         print("vkmem_coverage: could not follow these includes, so the graph is incomplete and "
               "even a clean result would not mean anything:\n", file=sys.stderr)
