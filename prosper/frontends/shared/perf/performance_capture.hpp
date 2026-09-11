@@ -19,6 +19,14 @@ struct ProcessSample {
     uint64_t monotonic_ns = 0;
     std::optional<uint64_t> process_cpu_ns;
     std::optional<uint64_t> rss_bytes;
+    // Private/committed bytes, where the host counts them separately from the resident set. The two
+    // diverge materially under prosper's host-side caches: on Windows the working set counts only
+    // pages resident right now and shares image pages with every other process, and it understated
+    // this process by ~5 GB against the commit charge in #3448's measured GTA V run -- so the
+    // resident set alone cannot answer the cache-pressure question this field exists for.
+    // Empty where the platform exposes no equivalent counter, and empty when the query fails: a zero
+    // would assert a process holding no committed memory, which is never what "unavailable" means.
+    std::optional<uint64_t> private_bytes;
     uint64_t guest_presents = 0;
     // The CPU handoff path exposes present_frame_seq(). The shared-device GPU-present path skips
     // that handoff, so its production counter is unavailable rather than zero.
