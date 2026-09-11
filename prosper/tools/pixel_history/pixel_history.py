@@ -22,9 +22,9 @@ Verdicts, each steering a different investigation:
   VALUE_UNKNOWN       RenderDoc records NO VALUE for the event that would explain the pixel
                       (its 0xdeadbeef "no information" sentinel, or nothing at all), so no
                       colour can be read off it -- the tool names no cause it cannot establish
-  TRANSFER_WROTE_PIXEL  a copy, blit, resolve or mip generation wrote this pixel, not a
-                      shader -- the value came from that operation's SOURCE, so the
-                      investigation belongs wherever the source was produced
+  TRANSFER_WROTE_PIXEL  a copy, blit, resolve or mip generation DEMONSTRABLY changed this
+                      pixel, not a shader -- the value came from that operation's SOURCE, so
+                      the investigation belongs wherever the source was produced
 
 An event is one of three kinds, not two. Clears pass and evaluate no test, so they are
 never the subject of a verdict -- only the ground one is stated against (trap 269). Nor are
@@ -34,6 +34,14 @@ read as "the shader computed black" (trap 279). A compute shader writing a stora
 NOT in that set and must not be: that genuinely is shader work, and the reader should be
 sent to the shader for it. The distinction is fixed-function transfer versus programmable
 write, never "direct" versus "not".
+
+A transfer's PRESENCE in a history is not evidence that it wrote THIS pixel. RenderDoc lists
+every copy/blit/resolve on a resource in the pixel history of EVERY pixel of that resource:
+the event list is filtered by usage KIND only (replay_controller.cpp:1493-1563) and the
+occlusion query that asks "did this event reach this pixel" runs only in the draw branch
+(vk_pixelhistory.cpp:4646-4665). So the verdict is graded on the evidence: a transfer that
+changed the pixel takes it, one whose values are not recorded produces VALUE_UNKNOWN, and one
+that left the pixel alone is NAMED in the reason but never takes the verdict from the draw.
 
 Run against `pixel_history_control` first on any new driver: `--expect-control` checks
 this tool's own reading against a construction with a known answer.
@@ -87,9 +95,11 @@ BLACK = 1.0 / 255.0
 # answer derived from a value whose whole meaning is "I do not know". #3404, and trap 268
 # one field over: a plausible, well-formed number that means something else.
 # The ResourceUsage values that mean "a fixed-function transfer WROTE this target". This is
-# RenderDoc's IsDirectWrite set minus the RW-resource (shader storage) usages, and minus the
-# read halves: CopySrc and ResolveSrc are this target being READ and explain nothing about
-# its own contents. Dropping the RW usages is deliberate and is the point of the split -- a
+# RenderDoc's IsDirectWrite set (vk_pixelhistory.cpp:110-116) minus the RW-resource (shader
+# storage) usages. CopySrc and ResolveSrc are NOT in IsDirectWrite and so are not subtracted
+# here: they are this target being READ, and the replay controller drops them a layer earlier
+# in its `// read-only` arm (replay_controller.cpp:1493-1563), so they never reach a pixel
+# history at all. Dropping the RW usages is deliberate and is the point of the split -- a
 # compute shader writing a storage image is shader work, and a reader told "a copy did this"
 # about a dispatch would be steered away from the file that holds the answer. Names rather
 # than values, resolved with getattr, so a RenderDoc build missing one is harmless. #3403.
@@ -206,14 +216,32 @@ def modification_event(m, kind, usage=None):
 def explaining_touch(events, after_eid):
     """The newest passing clear/transfer after `after_eid` that can explain the pixel.
 
-    Newest first, because the last thing to write a pixel is what the reader is looking at.
-    A clear that provably changed nothing is stepped over -- blaming it would move the
-    reader off the event that did write -- while a transfer is never stepped over: it is by
-    construction the last writer of its destination region, and a copy that lands the same
-    value it found is still where that value came from.
+    Returns `(touch, unchanged)`. `touch` is that event, or None when nothing later than
+    `after_eid` explains the pixel; `unchanged` is the newest TRANSFER in the same window
+    that demonstrably left the pixel alone, so a caller can NAME it without blaming it.
+    `after_eid` None means "over the whole history".
 
-    `after_eid` None means "over the whole history". Returns None when nothing later than
-    `after_eid` explains the pixel.
+    Newest first, because the last thing to write a pixel is what the reader is looking at.
+    An event that provably changed nothing is stepped over -- blaming it would move the
+    reader off the event that did write -- and that applies to a TRANSFER exactly as it does
+    to a clear. A copy is by construction the last writer of its DESTINATION RECTANGLE, and
+    the inference from that to "it wrote this pixel" does not hold, because RenderDoc does
+    not filter the history by that rectangle: the event list is built from GetUsage() and
+    filtered by usage KIND only (replay_controller.cpp:1493-1563), and the occlusion query
+    that asks "did this event reach this pixel" runs only in the `else` branch, for ordinary
+    draws (vk_pixelhistory.cpp:4646-4665). One vkCmdBlitImage anywhere on a target therefore
+    appears in the history of EVERY pixel of that target -- and prosper's composited targets
+    are the normal shape, not a corner case. So presence is graded into three answers:
+
+      preMod != postMod   it changed this pixel: it is the explaining touch.
+      values not recorded it cannot be shown to have changed the pixel OR not to have:
+                          returned, and the caller must refuse rather than name a cause.
+      preMod == postMod   it left this pixel alone. Returned as `unchanged` instead, so the
+                          draw-based verdict stands WITH the copy named -- it may simply not
+                          have covered this pixel, and if it did, it wrote what was already
+                          there. Blaming it made SHADER_WROTE_BLACK, STORE_LOST_IT,
+                          CLEARED_AFTER_DRAW and PIXEL_WAS_WRITTEN unreachable on any target
+                          that receives a copy (#3403, trap 279).
 
     **PRESENCE INSIDE A WINDOW IS NOT THE SAME AS BEING THE LAST WRITER, and every site that
     reasons about a transfer must ask this function rather than filter a list.** That rule
@@ -232,17 +260,36 @@ def explaining_touch(events, after_eid):
     the `if moved` guard below, and check_control()'s checks that the CONSTRUCTION
     contains a transfer -- which exist precisely to catch the detection being lost.
     """
+    unchanged = None
     for e in sorted((x for x in events
                      if x["passed"] and x["kind"] in ("clear", "transfer")
                      and (after_eid is None or x["eventId"] > after_eid)),
                     key=lambda x: x["eventId"], reverse=True):
-        if e["kind"] == "transfer":
-            return e
         if e["preMod"] is None or e["postMod"] is None:
-            return e            # a clear whose effect cannot be established
+            return e, unchanged     # an event whose effect cannot be established either way
         if e["preMod"][:3] != e["postMod"][:3]:
-            return e            # a clear that demonstrably changed the pixel
-    return None
+            return e, unchanged     # an event that demonstrably changed the pixel
+        if e["kind"] == "transfer" and unchanged is None:
+            unchanged = e           # newest copy that provably left this pixel alone
+    return None, unchanged
+
+
+def copy_note(unchanged):
+    """The sentence that names a copy which is in this history and changed nothing.
+
+    Named, never blamed. A copy that left the pixel as it found it is consistent with two
+    different worlds -- it covered the pixel and wrote the same value, or RenderDoc listed it
+    here although its destination rectangle is somewhere else entirely (see
+    explaining_touch()) -- and nothing in a pixel history separates them. Saying nothing at
+    all is the wrong answer too: on a composited target the copy is very often the thing the
+    reader needs to go and look at, and the pre-#3403 tool was silent about it.
+    """
+    if unchanged is None:
+        return ""
+    return (f" A copy at event {unchanged['eventId']} "
+            f"({unchanged['usage'] or 'a transfer'}) is also in this history and left this "
+            f"pixel unchanged; RenderDoc lists copies with no coverage test, so it may not "
+            f"have covered this pixel -- if it did, the value came from its SOURCE.")
 
 
 def classify(events):
@@ -260,27 +307,41 @@ def classify(events):
         # A target whose whole content arrived by copy is not a target nothing touched, and
         # saying "only clear events touched this pixel" about one is a plain falsehood --
         # prosper's own renderer composites and blits, so this is reachable. But the copy is
-        # only the answer if nothing cleared over it afterwards, which is why this walks the
-        # history instead of taking the newest transfer: the latter reported "a copy wrote
-        # this" about a pixel a later clear had wiped, reintroducing -- with no draw in
-        # sight -- exactly the confident misattribution this file exists to prevent.
-        last = explaining_touch(events, None) if moved else None
+        # only the answer if it can be SHOWN to be, which is why this walks the history
+        # instead of taking the newest transfer: taking it reported "a copy wrote this"
+        # about a pixel a later clear had wiped, and about pixels the copy never covered.
+        # With no draw in sight, both are the confident misattribution this file exists to
+        # prevent.
+        last, unchanged = explaining_touch(events, None) if moved else (None, None)
+        note = copy_note(unchanged)
+        if last is not None and (last["preMod"] is None or last["postMod"] is None):
+            did = "cleared" if last["kind"] == "clear" else "wrote"
+            return "VALUE_UNKNOWN", (
+                f"no draw touched this pixel and event {last['eventId']} "
+                f"({last['usage'] or last['kind']}) {did} this target with no value "
+                f"recorded -- what it left here cannot be established, so no cause is "
+                f"being named. Inspect that event directly." + note)
         if last is not None and last["kind"] == "transfer":
             return "TRANSFER_WROTE_PIXEL", (
                 f"no draw touched this pixel; event {last['eventId']} "
-                f"({last['usage'] or 'a transfer'}) wrote it. What you see is that "
+                f"({last['usage'] or 'a transfer'}) changed it. What you see is that "
                 f"operation's SOURCE -- look at how the source was produced, not at a "
-                f"shader that never ran here.")
-        if last is not None and (last["preMod"] is None or last["postMod"] is None):
-            return "VALUE_UNKNOWN", (
-                f"no draw touched this pixel and a copy wrote it, then event "
-                f"{last['eventId']} cleared this target with no value recorded -- whether "
-                f"the clear wiped the copy cannot be established.")
+                f"shader that never ran here." + note)
         if last is not None:
+            # Deliberately NOT "cleared over the copy afterwards": a copy that changed
+            # nothing is now stepped over, so the clear returned here may well PRECEDE it,
+            # and asserting an order this function never established is the trap 279 shape
+            # one statement along.
             return "NOTHING_DREW", (
-                f"no draw touched this pixel: a copy wrote it and event "
-                f"{last['eventId']} cleared over the copy afterwards, so what you see is "
-                f"the clear.")
+                f"no draw touched this pixel: event {last['eventId']} cleared this target "
+                f"and is the newest event that demonstrably changed it, so what you see is "
+                f"the clear." + note)
+        if moved:
+            # A copy is the only thing that wrote here and it changed nothing -- so it is
+            # named, and no cause is asserted. "Only clear events touched this pixel" would
+            # be a plain falsehood, which is the pre-#3403 answer on this history.
+            return "NOTHING_DREW", (
+                "no draw touched this pixel and no clear demonstrably changed it." + note)
         cleared = "; the pixel holds its clear value" if events else ""
         return "NOTHING_DREW", f"only clear events touched this pixel{cleared}."
     # By eventId, not by list position: explaining_touch() below orders the same question
@@ -297,12 +358,13 @@ def classify(events):
         # to be the LAST touch, not merely present: a copy that PRECEDED the draws, or one a
         # later clear wiped, is not what the reader is looking at, and calling either "a
         # later transfer [that] then wrote this pixel" is a plain falsehood.
-        after = explaining_touch(events, max(e["eventId"] for e in drawn))
+        after, unchanged = explaining_touch(events, max(e["eventId"] for e in drawn))
         copied = (f" A later transfer ({after['usage'] or 'copy'}, event "
                   f"{after['eventId']}) then wrote this pixel."
                   if after is not None and after["kind"] == "transfer" else "")
         return "ALL_REJECTED", (f"{len(drawn)} draw(s) reached the pixel, none survived: "
-                                f"{named or 'no reason flagged'}.{copied}")
+                                f"{named or 'no reason flagged'}.{copied}"
+                                + copy_note(unchanged))
 
     # Everything that touched this pixel AFTER the last surviving draw, newest first: the
     # first one that can explain the pixel wins. Blaming the shader for a pixel a later
@@ -313,21 +375,18 @@ def classify(events):
     # eventId ordering is RenderDoc's own submission order and is what PixelModification
     # sorts by; it is not meaningful ACROSS queues, a limitation this inherits from pixel
     # history rather than introduces.
-    e = explaining_touch(events, passed[-1]["eventId"])
-    # A transfer is blamed without asking whether it changed the pixel, and a clear is not.
-    # The asymmetry is deliberate and lives in explaining_touch(): every frame clears its
-    # targets, so a ubiquitous no-op clear must not take the blame from the draw, while a
-    # copy is occasional and IS the thing that last wrote its destination region.
-    if e is not None and e["kind"] == "transfer":
-        return "TRANSFER_WROTE_PIXEL", (
-            f"{len(passed)} draw(s) passed, then event {e['eventId']} "
-            f"({e['usage'] or 'a transfer'}) copied over them -- the pixel you see was "
-            f"written by that operation, not computed by a shader here. Look at how "
-            f"its SOURCE was produced.")
-    # A late clear whose values RenderDoc did not record cannot be shown to have changed
+    e, unchanged = explaining_touch(events, passed[-1]["eventId"])
+    # A copy that changed nothing does not take the verdict -- it is named by this note and
+    # the draw-based answer below stands. RenderDoc lists a copy in every pixel's history
+    # whether or not its destination rectangle covers the pixel (explaining_touch()), so
+    # blaming one on presence alone made four verdicts unreachable on any composited target.
+    note = copy_note(unchanged)
+    # A late event whose values RenderDoc did not record cannot be shown to have changed
     # this pixel -- and cannot be shown not to have. Falling through would name the draw
     # below it, which is the misattribution this section exists to prevent, arrived at by
-    # an absence of evidence instead of by evidence.
+    # an absence of evidence instead of by evidence. Checked BEFORE the transfer branch:
+    # an unrecorded copy is no more readable than an unrecorded clear, and calling it "the
+    # operation that wrote the pixel you see" would name a value nobody measured.
     if e is not None and (e["preMod"] is None or e["postMod"] is None):
         # Name the OTHER live possibility, which is not the draw. If the clear turns out to
         # have changed nothing, the explaining event is whatever wrote last underneath it --
@@ -338,19 +397,29 @@ def classify(events):
         # clear is only the alternative if nothing between them already explains the pixel:
         # a clear at 25 that demonstrably wiped a copy at 20 means 25, not 20, is what you
         # are looking at if 30 turns out to have changed nothing.
-        under = explaining_touch([x for x in events if x["eventId"] < e["eventId"]],
-                                 passed[-1]["eventId"])
+        under, _ = explaining_touch([x for x in events if x["eventId"] < e["eventId"]],
+                                    passed[-1]["eventId"])
         alt = (f" If it did not, event {under['eventId']} "
                f"({under['usage'] or 'a transfer'}) is what you are looking at, not the "
                f"draw." if under is not None and under["kind"] == "transfer" else "")
+        did = "cleared" if e["kind"] == "clear" else "wrote"
         return "VALUE_UNKNOWN", (
-            f"event {e['eventId']} cleared this target after the last surviving draw "
-            f"and RenderDoc records no value for it, so whether it wiped this pixel "
-            f"cannot be established -- inspect that event directly.{alt}")
+            f"event {e['eventId']} ({e['usage'] or e['kind']}) {did} this target after "
+            f"the last surviving draw and RenderDoc records no value for it, so whether "
+            f"it changed this pixel cannot be established -- inspect that event "
+            f"directly.{alt}" + note)
+    # A transfer that DEMONSTRABLY changed the pixel is the thing the reader is looking at,
+    # and the place to look is its source, not a shader.
+    if e is not None and e["kind"] == "transfer":
+        return "TRANSFER_WROTE_PIXEL", (
+            f"{len(passed)} draw(s) passed, then event {e['eventId']} "
+            f"({e['usage'] or 'a transfer'}) copied over them -- the pixel you see was "
+            f"written by that operation, not computed by a shader here. Look at how "
+            f"its SOURCE was produced." + note)
     if e is not None:
         return "CLEARED_AFTER_DRAW", (
             f"{len(passed)} draw(s) passed, then event {e['eventId']} cleared the "
-            f"target over them -- the pixel you see is the clear, not the shading.")
+            f"target over them -- the pixel you see is the clear, not the shading." + note)
 
     # Only the LAST passing draw can explain the pixel's final state. An earlier bright
     # writer that was legitimately overdrawn -- a white sky behind a black object -- is not
@@ -364,29 +433,32 @@ def classify(events):
         return "VALUE_UNKNOWN", (
             f"the last passing event ({final['eventId']}) carries no recorded value for "
             f"this pixel, so the colour it left cannot be read and no cause is being "
-            f"named -- inspect that event directly, or pick another pixel.")
+            f"named -- inspect that event directly, or pick another pixel." + note)
     lit = max(final["postMod"][:3])
     if lit > BLACK:
-        return "PIXEL_WAS_WRITTEN", f"{len(passed)} of {len(events)} events passed; final colour is not black."
+        return "PIXEL_WAS_WRITTEN", (f"{len(passed)} of {len(events)} events passed; "
+                                    f"final colour is not black." + note)
     if final["shader_output_suppressed"]:
         named = ", ".join(final["rejected_by"]) or "unknown"
         return "OUTPUT_UNTRUSTED", (
             f"the last passing event ({named}) has no trustworthy shader output, so "
             f"'computed black' and 'store lost it' cannot be separated here -- pick "
-            f"another pixel, or inspect that event directly.")
+            f"another pixel, or inspect that event directly." + note)
     # Suppression returned above, so a missing output here means RenderDoc recorded none.
     if final["shaderOut"] is None:
         return "VALUE_UNKNOWN", (
             f"the pixel is black and the last passing event ({final['eventId']}) has no "
             f"recorded shader output, so 'the shader computed black' and 'the store lost "
-            f"it' cannot be separated -- which is the whole distinction this tool is for.")
+            f"it' cannot be separated -- which is the whole distinction this tool is for."
+            + note)
     if max(final["shaderOut"][:3]) > BLACK:
         return "STORE_LOST_IT", (
             "the last passing event computed a non-black colour and the target is black "
-            "anyway -- blend state, write mask, or a later event that is not in this list.")
+            "anyway -- blend state, write mask, or a later event that is not in this list."
+            + note)
     return "SHADER_WROTE_BLACK", (
         f"{len(passed)} event(s) passed every test and the last one computed black -- "
-        f"resource binding, textures, uniforms or the shader itself.")
+        f"resource binding, textures, uniforms or the shader itself." + note)
 
 
 def embedded():
@@ -519,11 +591,15 @@ def embedded():
 
         control = {}
         if req.get("expect_control"):
-            for name, (cx, cy), _ in CONTROL_REGIONS:
+            for name, (cx, cy), _, _ in CONTROL_REGIONS:
                 ch = ctl.PixelHistory(tex.resourceId, cx, cy, rd.Subresource(0, 0, 0),
                                       rd.CompType.Typeless)
                 ce = [modification_event(m, *kind_of(m.eventId)) for m in ch]
-                control[name] = {"verdict": classify(ce)[0], "events": ce}
+                # The REASON is recorded, not only the verdict: region F's whole job is now
+                # that the blit is NAMED while the draw keeps the verdict, and a check that
+                # sees only the verdict cannot tell that apart from the blit going unnoticed.
+                cv, cr = classify(ce)
+                control[name] = {"verdict": cv, "reason": cr, "events": ce}
 
         result = {"status": "REPLAYED", "verdict": verdict, "reason": reason,
                   "control_regions": control,
@@ -548,17 +624,24 @@ def embedded():
     os._exit(0 if result["status"] == "REPLAYED" else 1)
 
 
-# The control's five regions, restated here independently of the C source that builds them.
+# The control's regions, restated here independently of the C source that builds them.
 # Each exists to construct ONE verdict: a control that only ever produces one tests the
 # machinery and not the distinctions the tool is for.
+#
+# The fourth field is whether the F blit's DESTINATION RECTANGLE covers this probe -- a fact
+# about the construction, declared rather than inferred. It used to be inferred from the
+# expected verdict ("the blitted regions are the ones expecting TRANSFER_WROTE_PIXEL"), and
+# that coupling broke the moment F stopped expecting that verdict: F is a black blit over a
+# black draw, so it changes nothing and the draw keeps the verdict while the copy is named.
+# F' is the half that lands orange, which is the only half that can demonstrate a change.
 CONTROL_REGIONS = [
-    ("A  sequence", (16, 16), "PIXEL_WAS_WRITTEN"),
-    ("A' arm-1 only", (16, 36), "PIXEL_WAS_WRITTEN"),
-    ("B  black draw", (48, 16), "SHADER_WROTE_BLACK"),
-    ("C  no write", (16, 48), "STORE_LOST_IT"),
-    ("E  all killed", (48, 48), "ALL_REJECTED"),
-    ("F  blit black", (54, 4), "TRANSFER_WROTE_PIXEL"),
-    ("F' blit orange", (61, 4), "TRANSFER_WROTE_PIXEL"),
+    ("A  sequence", (16, 16), "PIXEL_WAS_WRITTEN", False),
+    ("A' arm-1 only", (16, 36), "PIXEL_WAS_WRITTEN", False),
+    ("B  black draw", (48, 16), "SHADER_WROTE_BLACK", False),
+    ("C  no write", (16, 48), "STORE_LOST_IT", False),
+    ("E  all killed", (48, 48), "ALL_REJECTED", False),
+    ("F  blit black", (54, 4), "SHADER_WROTE_BLACK", True),
+    ("F' blit orange", (61, 4), "TRANSFER_WROTE_PIXEL", True),
 ]
 
 
@@ -568,7 +651,7 @@ def check_control(regions):
     `regions` maps region name -> {"verdict": str, "events": [...]}.
     """
     problems = []
-    for name, _, want in CONTROL_REGIONS:
+    for name, _, want, _ in CONTROL_REGIONS:
         got = regions.get(name)
         if got is None:
             problems.append(f"{name}: region missing from the reading")
@@ -622,14 +705,17 @@ def check_control(regions):
                             f"transfer clear and the renderpass loadOp clear). One detection "
                             f"path is broken; loadOp clears are the common form and carry "
                             f"ResourceUsage::Clear but NOT ActionFlags::Clear")
-    # The blit regions, derived from CONTROL_REGIONS rather than restated: a renamed region
-    # must not silently drop out of the checks below, which are what stands in for a live
-    # --expect-control run this machine cannot perform.
-    blitted = [name for name, _, want in CONTROL_REGIONS if want == "TRANSFER_WROTE_PIXEL"]
-    # F is the trap-279 guard. Its verdict alone is not enough: a tool that lost the
-    # transfer detection would call F's blit a draw and report SHADER_WROTE_BLACK over the
-    # black half and PIXEL_WAS_WRITTEN over the orange half, so both halves are required to
-    # name the transfer AND to contain one, as the last passing event in the history.
+    # The blit regions, DECLARED by CONTROL_REGIONS rather than inferred from the verdict
+    # they expect: a renamed or re-verdicted region must not silently drop out of the checks
+    # below, which are what stands in for a live --expect-control run this machine cannot
+    # perform.
+    blitted = [name for name, _, _, blit in CONTROL_REGIONS if blit]
+    # F and F' are the trap-279 guards, and neither one's verdict is enough on its own.
+    # F is a black blit over a black draw, so it changes nothing and the DRAW keeps the
+    # verdict -- which is byte-identical to a tool that never noticed the blit at all. The
+    # three things that are not identical are checked here: the blit is recognised as a
+    # transfer, it is the last passing event, and the reason NAMES it. Drop any one of them
+    # and the region is a guard that passes vacuously.
     for name in blitted:
         got = regions.get(name)
         if got is None:
@@ -645,23 +731,39 @@ def check_control(regions):
             problems.append(f"{name}: the blit is not the last passing event "
                             f"(last is {passing[-1]['kind']} {passing[-1]['eventId']}), so "
                             f"the construction did not land where it was aimed")
-    # The assumption the whole transfer channel rests on, made self-detecting: that a copy
-    # appears only in the history of pixels its DESTINATION RECTANGLE covers. Nobody can
-    # check that without RenderDoc, so the control is arranged to answer it -- F's blit
-    # covers a band no other probe is inside, and if non-covering direct writes are listed
-    # anyway, every region below acquires a transfer event and flips to
-    # TRANSFER_WROTE_PIXEL. Reported as one named hypothesis rather than as three verdicts
-    # the reader has to notice changed.
-    for name in [n for n, _, want in CONTROL_REGIONS
-                 if want != "TRANSFER_WROTE_PIXEL"]:
+        if f"event {moved[-1]['eventId']}" not in (got.get("reason") or ""):
+            problems.append(f"{name}: the reason does not name event "
+                            f"{moved[-1]['eventId']}, the blit that landed here -- a copy "
+                            f"the reader is never told about is the #3403 defect in its "
+                            f"quiet form, whichever verdict the region ends up with")
+    # The assumption the transfer channel used to rest on, kept as the only empirical probe
+    # of it available here: does a copy appear in the history of pixels its DESTINATION
+    # RECTANGLE does not cover? F's blit covers a band no other probe is inside, so every
+    # region below answers it. RenderDoc's own source says it does -- the event list is
+    # filtered by usage kind only and the coverage query runs for draws alone -- which is
+    # why the verdict is now graded on preMod != postMod and a bare presence is no longer a
+    # verdict. So this is REPORTED by coverage_reading() rather than failed here.
+    #
+    # What IS a failure is either half of that grading going wrong out here: a copy that
+    # changed a pixel its rectangle cannot cover (no reading of RenderDoc explains that),
+    # or a copy present and NOT named, which leaves the reader with a verdict that quietly
+    # omits the one event they may need to go and look at.
+    for name in [n for n, _, _, blit in CONTROL_REGIONS if not blit]:
         got = regions.get(name)
-        if got and any(e["kind"] == "transfer" for e in got["events"]):
-            problems.append(f"{name}: a transfer event appears in a region OUTSIDE the blit "
-                            f"rectangle, so RenderDoc lists direct writes that do not cover "
-                            f"the pixel -- this tool blames the last transfer without asking "
-                            f"whether it covered anything, which would make SHADER_WROTE_BLACK "
-                            f"unreachable on any composited target. Do not trust a "
-                            f"TRANSFER_WROTE_PIXEL verdict on this build until it is fixed")
+        if not got:
+            continue
+        for e in [x for x in got["events"] if x["kind"] == "transfer"]:
+            if (e["preMod"] is not None and e["postMod"] is not None
+                    and e["preMod"][:3] != e["postMod"][:3]):
+                problems.append(f"{name}: transfer event {e['eventId']} reports a CHANGED "
+                                f"pixel outside the blit rectangle (preMod != postMod) -- "
+                                f"it cannot have written here, so either the construction "
+                                f"moved or this reading is not of the pixel it claims")
+            elif f"event {e['eventId']}" not in (got.get("reason") or ""):
+                problems.append(f"{name}: transfer event {e['eventId']} is in this region's "
+                                f"history and the reason never mentions it -- a copy that "
+                                f"changed nothing must still be named, because the reader "
+                                f"cannot see the event list from the verdict")
 
     black, orange = ((regions.get(blitted[0]), regions.get(blitted[1]))
                      if len(blitted) == 2 else (None, None))
@@ -676,6 +778,37 @@ def check_control(regions):
             problems.append("F/F': the two halves name different transfer events; they are "
                             "one blit of a two-colour source and must name the same one")
     return problems
+
+
+def coverage_reading(regions):
+    """What this build did with a copy that does NOT cover the pixel -- reported either way.
+
+    This is the only empirical probe of that question anyone has: F's blit covers a band no
+    other probe is inside, so whether A/A'/B/C/E carry that transfer event says which regime
+    this RenderDoc build is in. RenderDoc's source says they will -- the event list is built
+    from GetUsage() and filtered by usage KIND only (replay_controller.cpp:1493-1563), and
+    the occlusion query that asks "did this reach this pixel" runs only for draws
+    (vk_pixelhistory.cpp:4646-4665) -- which is why a transfer's presence no longer carries
+    a verdict. It is NOT a control failure, because it is the predicted behaviour and the
+    grading already accounts for it; a control that fails by design is a control nobody runs.
+
+    Printed in BOTH directions on purpose: a probe that says nothing when it does not fire
+    is indistinguishable from a probe nobody ran.
+    """
+    outside = [n for n, _, _, blit in CONTROL_REGIONS if not blit]
+    seen = sorted(n for n in outside
+                  if any(e["kind"] == "transfer"
+                         for e in (regions.get(n) or {}).get("events", [])))
+    if seen:
+        return (f"COVERAGE READING: the F blit is listed in {seen}, which its destination "
+                f"rectangle does not cover -- this build lists direct writes with no "
+                f"coverage test, as RenderDoc's source says it does. A transfer's PRESENCE "
+                f"is therefore not evidence it wrote the pixel, and this tool grades on "
+                f"preMod != postMod instead (#3403, trap 279)")
+    return (f"COVERAGE READING: the F blit is listed in NONE of {outside}, so this build "
+            f"restricts pixel history to a copy's destination rectangle -- the opposite of "
+            f"what RenderDoc's source predicts. Record it: grading on preMod != postMod is "
+            f"then conservative rather than necessary (#3403, trap 279)")
 
 
 def main():
@@ -733,17 +866,19 @@ def main():
     if args.expect_control:
         regions = data.get("control_regions") or {}
         problems = check_control(regions)
-        for name, _, _ in CONTROL_REGIONS:
+        for name, _, _, _ in CONTROL_REGIONS:
             got = regions.get(name)
             print(f"  {name:<16} {got['verdict'] if got else 'MISSING'}")
+        print(f"  {coverage_reading(regions)}")
         for problem in problems:
             print(f"CONTROL FAILED: {problem}", file=sys.stderr)
         if problems:
             return 1
         print(f"CONTROL VERIFIED: {len(CONTROL_REGIONS)} regions, each constructed verdict "
-              f"read back correctly, plus A's depth/discard/scissor arms in order and E's "
-              f"own discard and clear. Rejection reasons are checked in A and E, not in "
-              f"every region.")
+              f"read back correctly, plus A's depth/discard/scissor arms in order, E's own "
+              f"discard and clear, and F's blit recognised as a transfer AND named in the "
+              f"reason even though it changed nothing and the draw kept the verdict. "
+              f"Rejection reasons are checked in A and E, not in every region.")
 
     print(f"{data['verdict']}: {data['reason']}")
     print(f"  pixel {tuple(data['pixel'])} of {data['target']['width']}x"

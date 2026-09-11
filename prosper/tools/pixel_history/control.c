@@ -21,7 +21,10 @@
  *               pipeline                   -> STORE_LOST_IT, final BLACK
  *   E  (48,48)  one draw, discarded        -> ALL_REJECTED (with the clear present)
  *   F  (54, 4)  a BLIT landing black over
- *               B's black draw            -> TRANSFER_WROTE_PIXEL
+ *               B's black draw            -> SHADER_WROTE_BLACK, with the BLIT NAMED in the
+ *                                            reason -- it changed nothing, so it does not
+ *                                            take the verdict, and being named is the only
+ *                                            thing that distinguishes this from the defect
  *   F' (61, 4)  the same blit's other half,
  *               landing ORANGE            -> TRANSFER_WROTE_PIXEL, and it is what proves
  *                                            the blit ran at all
@@ -29,11 +32,21 @@
  * Region F is the third KIND of event, and it is why F' has to exist. RenderDoc pushes a
  * copy/blit/resolve into the pixel history through the same "passed, no test evaluated"
  * branch as a clear, so a blit landing black over a black draw was reported as
- * SHADER_WROTE_BLACK -- a pixel no shader wrote, sent to resource binding and shaders. But
- * black over black is invisible to a self-check that only reads pixels: the region looks
- * identical whether the blit happened or not. So the blit's source is TWO-COLOURED, and
- * F' reads the half that can only be orange if the blit really landed -- the same trick
- * A' plays for A's first arm. A control that cannot see its own arm guards nothing.
+ * SHADER_WROTE_BLACK with no mention of the blit anywhere -- a pixel no shader wrote, sent
+ * to resource binding and shaders. But black over black is invisible to a self-check that
+ * only reads pixels: the region looks identical whether the blit happened or not. So the
+ * blit's source is TWO-COLOURED, and F' reads the half that can only be orange if the blit
+ * really landed -- the same trick A' plays for A's first arm. A control that cannot see its
+ * own arm guards nothing.
+ *
+ * F and F' probe DIFFERENT halves of the tool's rule, which is why both are needed and why
+ * F's expected verdict is a draw verdict. RenderDoc lists a copy in the pixel history of
+ * every pixel of the target whether or not the copy's destination rectangle covers that
+ * pixel -- the event list is filtered by usage kind only -- so presence alone cannot be a
+ * verdict, or SHADER_WROTE_BLACK would be unreachable on any composited target. Only a
+ * CHANGE demonstrates the copy wrote here, which F' has and F does not. F therefore keeps
+ * the draw's verdict while the tool NAMES the blit, and `check_control` requires that name:
+ * without it F is byte-identical to a tool that never noticed the blit at all.
  *
  * Region A's arms, in submission order, at (16,16):
  *
@@ -499,7 +512,7 @@ int main(void)
         {"B  black draw", 48, 16, {  0,   0,   0, 255}, "SHADER_WROTE_BLACK"},
         {"C  no write",   16, 48, {  0,   0,   0, 255}, "STORE_LOST_IT"},
         {"E  all killed", 48, 48, {  0,   0,   0, 255}, "ALL_REJECTED"},
-        {"F  blit black", 54,  4, {  0,   0,   0, 255}, "TRANSFER_WROTE_PIXEL"},
+        {"F  blit black", 54,  4, {  0,   0,   0, 255}, "SHADER_WROTE_BLACK+named"},
         {"F' blit orange", 61, 4, {255, 128,   0, 255}, "(proves the blit landed)"},
     };
     const int nprobes = (int)(sizeof(probes) / sizeof(probes[0]));
@@ -636,9 +649,10 @@ int main(void)
 
     /* REGION F: a blit into the finished target, AFTER every draw. This is the event the
      * tool used to call a draw. It lands over region B, whose own draw computed black, so
-     * a tool that misreads it reports SHADER_WROTE_BLACK -- the exact wrong answer, for a
-     * pixel no shader wrote. NEAREST so each destination texel is one source texel and the
-     * two halves stay exactly black and exactly orange. */
+     * a tool that misreads it reports SHADER_WROTE_BLACK with no mention of the blit -- the
+     * exact wrong answer, for a pixel no shader wrote. NEAREST so each destination texel is
+     * one source texel and the two halves stay exactly black and exactly orange: F changes
+     * nothing and must be NAMED, F' changes the pixel and must take the verdict. */
     VkImageBlit blit = {0};
     blit.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     blit.srcSubresource.layerCount = 1;

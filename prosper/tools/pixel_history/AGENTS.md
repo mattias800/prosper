@@ -10,8 +10,8 @@ misreported: `CLEARED_AFTER_DRAW` (a later clear wiped surviving draws),
 `OUTPUT_UNTRUSTED` (the explaining event has an unbound pixel shader, so its output is
 undefined and the tool refuses to guess), `VALUE_UNKNOWN` (RenderDoc recorded no value
 for the event that would explain the pixel, so no colour can be read off it), and
-`TRANSFER_WROTE_PIXEL` (a copy, blit, resolve or mip generation wrote it — no shader was
-involved, and the value came from that operation's source). Telling them apart by inference —
+`TRANSFER_WROTE_PIXEL` (a copy, blit, resolve or mip generation demonstrably changed it — no
+shader was involved, and the value came from that operation's source). Telling them apart by inference —
 draw censuses, disabling passes, bisecting state — is what has historically cost this
 project hours per defect, and the census route has produced retracted issues. RenderDoc
 answers it directly, per event, and `pixel_history.py` turns that into one call with one
@@ -38,12 +38,17 @@ What lives here:
   the misattribution being guarded — and black over black is *invisible* to a self-check that only
   reads pixels. F' reads the half that can only be orange if the blit really landed. A control that
   cannot see its own arm guards nothing, the same way A' exists to prove A's first arm ran.
-  F's blit also sits in a band **no other probe is inside**, which makes the control answer the one
-  question about this channel nobody could check without RenderDoc: whether a copy appears in the
-  history of pixels its destination rectangle does not cover. If it does, A/A'/B/C/E acquire a
-  transfer event and `check_control` says so by name — because the tool blames the last transfer
-  without asking whether it covered anything, and if non-covering copies are listed that would make
-  `SHADER_WROTE_BLACK` unreachable on exactly the composited targets this tool exists for.
+  The two halves probe **different halves of the rule**, which is why F's expected verdict is
+  `SHADER_WROTE_BLACK` and not a transfer verdict: F changed nothing, so the draw keeps the verdict
+  and the blit is *named* in the reason — and `check_control` requires that name, because without it
+  F is byte-identical to a tool that never noticed the blit. F' changed the pixel, so it takes
+  `TRANSFER_WROTE_PIXEL`.
+  F's blit also sits in a band **no other probe is inside**, which is the only empirical probe
+  available of whether a copy appears in the history of pixels its destination rectangle does not
+  cover. RenderDoc's source says it does, so `--expect-control` **reports** which regime the build is
+  in (`COVERAGE READING:`, printed in both directions) rather than failing: a control that fails by
+  design is one nobody runs. What still fails out there is a copy reporting a *changed* pixel it
+  cannot have covered, or a copy present and never named.
 - `test_pixel_history.py` — the verdict logic, which is the part CI can reach. It also owns the
   cases no capture can contain on demand: `FakeModification` stands in for RenderDoc's
   `PixelModification` so a "RenderDoc has no value for this" event can be constructed by hand and
@@ -75,11 +80,18 @@ is the one the control could **not** reach, which is why the list is not the who
    `clear || directWrite` branch as a clear — passed, no test evaluated — so a blit landing black
    was the last "passing draw" and read `SHADER_WROTE_BLACK`, sending the reader to resource
    binding and shaders for a pixel no shader wrote. The kind now comes from `GetUsage()`, and
-   region F builds the case — though **that region has not yet been read back through RenderDoc**,
-   which is not installed on the machine this was written on, so the transfer channel is verified by
-   unit arms and by the control's rendered pixels and not by a live `--expect-control` run. Run one
-   before trusting a `TRANSFER_WROTE_PIXEL` verdict on a new build; `check_control` is arranged to
-   answer the open question in one line (see the control bullet above). Note what it is **not**: RenderDoc's `IsDirectWrite` also covers the
+   region F builds the case. **The second half is the one to carry away, and it was settled from
+   RenderDoc's own source in review rather than left as a hypothesis: a copy in a pixel's history
+   is not evidence the copy covered that pixel.** The event list is built from `GetUsage()` and
+   filtered by usage *kind* only (`replay_controller.cpp:1493-1563`), and the occlusion query that
+   asks "did this event reach this pixel" runs only in the draw branch
+   (`vk_pixelhistory.cpp:4646-4665`) — so one `vkCmdBlitImage` anywhere on a target appears in the
+   history of **every pixel of that target**. Blaming the last transfer on presence therefore made
+   `SHADER_WROTE_BLACK`, `STORE_LOST_IT`, `CLEARED_AFTER_DRAW` and `PIXEL_WAS_WRITTEN` unreachable
+   on exactly the composited targets this tool exists for. The obvious repair is wrong too: a pure
+   `preMod != postMod` test loses region F, which is black-over-black by construction. So the
+   verdict is **graded** — changed takes it, unrecorded refuses it, unchanged is *named* and the
+   draw keeps it. Note also what the set is **not**: RenderDoc's `IsDirectWrite` also covers the
    RW-resource usages, and a compute shader writing a storage image genuinely *is* shader work —
    excluding "direct writes" wholesale would silently reclassify every compute write as a copy.
    The line is fixed-function transfer versus programmable write. Instrument trap 279, #3403.

@@ -13,14 +13,30 @@ def clear(post=(0.0, 0.0, 0.0, 1.0), eid=0, pre=(0.5, 0.5, 0.5, 1.0)):
     return ev(True, post=post, eid=eid, kind="clear", usage="Clear", pre=pre)
 
 
-def transfer(post=(0.0, 0.0, 0.0, 1.0), eid=20, usage="CopyDst", pre=(0.0, 0.0, 0.0, 1.0)):
-    """A copy, blit, resolve or mip generation landing on the pixel.
+def transfer(post=(0.0, 0.0, 0.0, 1.0), eid=20, usage="CopyDst", pre=(0.5, 0.5, 0.5, 1.0)):
+    """A copy, blit, resolve or mip generation that DEMONSTRABLY changed this pixel.
 
     It arrives from RenderDoc exactly as a clear does -- passed, no test evaluated, and no
     fragment shader anywhere near it -- which is why it must be told apart by what the API
     says it did to the resource rather than by anything on the event.
+
+    `pre` differs from `post` by default, the same convention as clear(), and for the same
+    reason: RenderDoc lists a copy in the history of every pixel of the target whether or
+    not its destination rectangle covers the pixel, so only a CHANGE demonstrates that this
+    copy wrote here. Use idle_transfer() for the other case.
     """
     return ev(True, post=post, eid=eid, kind="transfer", usage=usage, pre=pre)
+
+
+def idle_transfer(eid=20, colour=(0.0, 0.0, 0.0, 1.0), usage="CopyDst"):
+    """A copy that left this pixel exactly as it found it.
+
+    Two different worlds produce this and a pixel history cannot separate them: the copy
+    covered the pixel and wrote the value already there (control region F, a black blit over
+    a black draw), or RenderDoc listed a copy whose destination rectangle is somewhere else
+    entirely. So it must be NAMED and must not take the verdict.
+    """
+    return ev(True, post=colour, pre=colour, eid=eid, kind="transfer", usage=usage)
 
 
 def ev(passed, rejected=(), shader=None, post=(0.0, 0.0, 0.0, 1.0), eid=1, suppressed=None,
@@ -206,19 +222,27 @@ class ControlCheckTests(unittest.TestCase):
                ev(False, ["scissorClipped"], eid=9)]   # a later region's draw
         killed = [clear(eid=0), clear(eid=3), ev(False, ["scissorClipped"], eid=4),
                   ev(False, ["shaderDiscarded"], shader=(0, 0, 0, 0), eid=8)]
+        # F and F' are the one blit of a two-colour source, over region B's black draw.
+        # The black half changes nothing, so the draw keeps the verdict and the copy is
+        # named; the orange half is the only one that can demonstrate the blit landed.
         blit = [clear(eid=0), clear(eid=3),
                 ev(True, shader=(0, 0, 0, 1), post=(0, 0, 0, 1), eid=9),
-                transfer(eid=40)]
+                idle_transfer(eid=40)]
         bright = [clear(eid=0), clear(eid=3),
                   ev(True, shader=(0, 0, 0, 1), post=(0, 0, 0, 1), eid=9),
-                  transfer(eid=40, post=(1, 0.5, 0, 1))]
-        return {"A  sequence": {"verdict": "PIXEL_WAS_WRITTEN", "events": seq},
-                "A' arm-1 only": {"verdict": "PIXEL_WAS_WRITTEN", "events": []},
-                "B  black draw": {"verdict": "SHADER_WROTE_BLACK", "events": []},
-                "C  no write": {"verdict": "STORE_LOST_IT", "events": []},
-                "E  all killed": {"verdict": "ALL_REJECTED", "events": killed},
-                "F  blit black": {"verdict": "TRANSFER_WROTE_PIXEL", "events": blit},
-                "F' blit orange": {"verdict": "TRANSFER_WROTE_PIXEL", "events": bright}}
+                  transfer(eid=40, pre=(0, 0, 0, 1), post=(1, 0.5, 0, 1))]
+        # Verdict AND reason come from the real classify() for these two, so the fixture
+        # cannot assert a reading the tool does not actually produce -- which is what the
+        # CONTROL_REGIONS verdict check then compares against.
+        return {"A  sequence": {"verdict": "PIXEL_WAS_WRITTEN", "reason": "", "events": seq},
+                "A' arm-1 only": {"verdict": "PIXEL_WAS_WRITTEN", "reason": "", "events": []},
+                "B  black draw": {"verdict": "SHADER_WROTE_BLACK", "reason": "", "events": []},
+                "C  no write": {"verdict": "STORE_LOST_IT", "reason": "", "events": []},
+                "E  all killed": {"verdict": "ALL_REJECTED", "reason": "", "events": killed},
+                "F  blit black": dict(zip(("verdict", "reason"), ph.classify(blit)),
+                                      events=blit),
+                "F' blit orange": dict(zip(("verdict", "reason"), ph.classify(bright)),
+                                       events=bright)}
 
     def test_As_own_scissor_arm_must_precede_its_last_surviving_draw(self):
         # Deleting arm 2 leaves a later region's scissorClipped in A's history, so a check
@@ -474,8 +498,9 @@ class TransferTests(unittest.TestCase):
         # the blit was the last "passing draw" and its black postMod produced
         # SHADER_WROTE_BLACK -- resource binding, textures, uniforms -- for a pixel no
         # shader wrote.
-        drawn = ev(True, shader=(0, 0, 0, 1), post=(0, 0, 0, 1), eid=10)
-        v, why = ph.classify([drawn, transfer(eid=20)])
+        drawn = ev(True, shader=(1, 1, 1, 1), post=(1, 1, 1, 1), eid=10)
+        v, why = ph.classify([drawn, transfer(eid=20, pre=(1, 1, 1, 1),
+                                              post=(0, 0, 0, 1))])
         self.assertNotEqual(v, "SHADER_WROTE_BLACK")
         self.assertEqual(v, "TRANSFER_WROTE_PIXEL")
         self.assertIn("CopyDst", why)
@@ -684,6 +709,120 @@ class TransferTests(unittest.TestCase):
             self.assertIn(write, ph.TRANSFER_USAGES, write)
 
 
+class TransferCoverageTests(unittest.TestCase):
+    """A copy in the history is not evidence it covered THIS pixel.
+
+    RenderDoc lists every copy/blit/resolve on a resource in the pixel history of EVERY
+    pixel of that resource: replay_controller.cpp:1493-1563 builds the event list from
+    GetUsage() and filters it by usage KIND only, and vk_pixelhistory.cpp:4646-4665 pushes
+    every `clear || directWrite` event straight into modEvents -- the occlusion query that
+    asks "did this event reach this pixel" runs only in the `else` branch, for draws. So one
+    vkCmdBlitImage anywhere on a composited target appears in the history of every pixel of
+    it, and blaming the last transfer on PRESENCE made SHADER_WROTE_BLACK, STORE_LOST_IT,
+    CLEARED_AFTER_DRAW and PIXEL_WAS_WRITTEN unreachable on exactly the targets this tool
+    exists for.
+
+    The verdict is therefore graded on the evidence, and the hard part is that a pure change
+    test is ALSO wrong: control region F is a black blit over a black draw, so pre == post by
+    construction, and a tool that only asked "did it change" would go back to reporting
+    SHADER_WROTE_BLACK with no mention of the blit -- the #3403 defect. Hence: changed takes
+    the verdict, unrecorded refuses one, unchanged is NAMED and the draw keeps the verdict.
+    """
+
+    def black_draw(self, eid=10):
+        return ev(True, shader=(0, 0, 0, 1), post=(0, 0, 0, 1), eid=eid)
+
+    def test_a_copy_that_changed_nothing_does_not_take_the_verdict(self):
+        # The blocking finding. A blit landing elsewhere on the target puts a transfer in
+        # this pixel's history with pre == post, and it used to take the verdict and send
+        # the reader to "how its SOURCE was produced" -- a different region of a different
+        # image.
+        v, _ = ph.classify([self.black_draw(), idle_transfer(eid=20)])
+        self.assertEqual(v, "SHADER_WROTE_BLACK")
+
+    def test_a_copy_that_changed_nothing_is_still_named(self):
+        # And the other half, which is why a pure change test is not the repair: control
+        # region F is exactly this history, and reverting to silence about the copy is the
+        # #3403 defect. The verdict goes to the draw; the copy is named.
+        v, why = ph.classify([self.black_draw(), idle_transfer(eid=20)])
+        self.assertEqual(v, "SHADER_WROTE_BLACK")
+        self.assertIn("event 20", why)
+        self.assertIn("CopyDst", why)
+        self.assertIn("may not have covered this pixel", why)
+
+    def test_a_copy_that_changed_nothing_does_not_hide_a_lost_store(self):
+        drawn = ev(True, shader=(1, 1, 1, 1), post=(0, 0, 0, 1), eid=10)
+        v, why = ph.classify([drawn, idle_transfer(eid=20)])
+        self.assertEqual(v, "STORE_LOST_IT")
+        self.assertIn("event 20", why)
+
+    def test_a_copy_that_changed_nothing_does_not_retire_a_written_pixel(self):
+        drawn = ev(True, shader=(1, 1, 1, 1), post=(1, 1, 1, 1), eid=10)
+        v, why = ph.classify([drawn, idle_transfer(eid=20, colour=(1, 1, 1, 1))])
+        self.assertEqual(v, "PIXEL_WAS_WRITTEN")
+        self.assertIn("event 20", why)
+
+    def test_a_copy_that_changed_nothing_does_not_hide_a_late_clear(self):
+        # The copy is NEWER than the clear here, which is only reachable because an
+        # unchanged copy is now stepped over. The clear is still what the reader is looking
+        # at, and the copy is still worth naming.
+        drawn = ev(True, shader=(1, 1, 1, 1), post=(1, 1, 1, 1), eid=10)
+        v, why = ph.classify([drawn, clear(eid=20, pre=(1, 1, 1, 1), post=(0, 0, 0, 1)),
+                              idle_transfer(eid=25)])
+        self.assertEqual(v, "CLEARED_AFTER_DRAW")
+        self.assertIn("event 25", why)
+
+    def test_a_copy_whose_values_are_not_recorded_names_no_cause(self):
+        # Neither "it changed the pixel" nor "it did not" can be established, which is the
+        # same finding as an unrecorded clear and gets the same refusal -- not a confident
+        # TRANSFER_WROTE_PIXEL derived from an absence of evidence.
+        blind = ph.modification_event(
+            FakeModification(eid=20, pre=no_information(), post=no_information()),
+            "transfer", "CopyDst")
+        v, why = ph.classify([self.black_draw(), blind])
+        self.assertEqual(v, "VALUE_UNKNOWN")
+        self.assertIn("20", why)
+        self.assertIn("CopyDst", why)
+
+    def test_the_rejected_note_does_not_announce_a_copy_that_changed_nothing(self):
+        # B2's error graded: the note asserts "a later transfer THEN WROTE this pixel", and
+        # a copy that changed nothing has not been shown to have written anything here.
+        v, why = ph.classify([ev(False, ["depthTestFailed"], eid=10), idle_transfer(eid=20)])
+        self.assertEqual(v, "ALL_REJECTED")
+        self.assertNotIn("later transfer", why)
+        self.assertIn("event 20", why)
+
+    def test_a_copy_only_target_whose_copy_changed_nothing_names_the_copy(self):
+        # No draw at all, and NOTHING in the history demonstrably changed the pixel: a
+        # target cleared black and then copied over with black. "Only clear events touched
+        # this pixel" is the pre-#3403 answer here and it is false -- a copy touched it --
+        # so the copy is named and no cause is asserted.
+        v, why = ph.classify([clear(eid=0, pre=(0, 0, 0, 1), post=(0, 0, 0, 1)),
+                              idle_transfer(eid=20)])
+        self.assertEqual(v, "NOTHING_DREW")
+        self.assertNotIn("only clear", why)
+        self.assertIn("event 20", why)
+
+    def test_a_clear_before_an_unchanging_copy_is_not_called_later_than_it(self):
+        # Newly reachable, and it is trap 279's own shape one statement along: stepping over
+        # an unchanged copy lets the walk return a clear that PRECEDES it, so the old text
+        # "event N cleared over the copy afterwards" became a false claim about ordering.
+        v, why = ph.classify([clear(eid=5, pre=(1, 1, 1, 1), post=(0, 0, 0, 1)),
+                              idle_transfer(eid=20)])
+        self.assertEqual(v, "NOTHING_DREW")
+        self.assertNotIn("afterwards", why)
+        self.assertIn("event 20", why)
+
+    def test_a_copy_that_demonstrably_changed_the_pixel_still_takes_the_verdict(self):
+        # The domain control for every arm above. Without it the repair could be "never
+        # blame a transfer", which would put #3403 straight back.
+        drawn = ev(True, shader=(0, 0, 0, 1), post=(0, 0, 0, 1), eid=10)
+        v, why = ph.classify([drawn, transfer(eid=20, pre=(0, 0, 0, 1),
+                                              post=(1, 0.5, 0, 1))])
+        self.assertEqual(v, "TRANSFER_WROTE_PIXEL")
+        self.assertIn("SOURCE", why)
+
+
 class TransferControlCheckTests(unittest.TestCase):
     """The control's F region is the trap-279 guard; check_control must see it fail."""
 
@@ -707,17 +846,56 @@ class TransferControlCheckTests(unittest.TestCase):
             ev(True, shader=(0, 0, 0, 1), post=(0, 0, 0, 1), eid=99))
         self.assertIn("not the last passing event", " ".join(ph.check_control(bad)))
 
-    def test_a_transfer_appearing_in_a_region_the_blit_misses_is_caught(self):
-        # The assumption this whole channel rests on and that nobody here can test, since
-        # RenderDoc is not installed: that a copy appears ONLY in the history of pixels its
-        # destination rectangle covers. F's blit covers x in [52,64), y in [0,12), which no
-        # other probe is inside -- so if RenderDoc lists non-covering direct writes, B, C
-        # and E acquire a transfer event and every one of them flips to
-        # TRANSFER_WROTE_PIXEL. The control now says so in one line instead of the reader
-        # having to notice three verdicts changed.
+    def test_a_copy_outside_the_blit_rectangle_that_changed_a_pixel_is_caught(self):
+        # RenderDoc DOES list copies in the history of pixels they do not cover -- the event
+        # list is filtered by usage kind only -- so a transfer appearing in B, C or E is
+        # expected and is reported by coverage_reading(), not failed. What no reading of
+        # RenderDoc explains is a copy reporting a CHANGED pixel out here: its destination
+        # rectangle cannot reach this probe, so either the construction moved or the reading
+        # is not of the pixel it claims.
         bad = self.regions()
-        bad["B  black draw"]["events"] = [transfer(eid=40)]
-        self.assertIn("OUTSIDE the blit", " ".join(ph.check_control(bad)))
+        bad["B  black draw"]["events"] = [transfer(eid=40, pre=(0, 0, 0, 1),
+                                                   post=(1, 0.5, 0, 1))]
+        self.assertIn("CHANGED", " ".join(ph.check_control(bad)))
+
+    def test_a_copy_outside_the_blit_rectangle_must_still_be_named(self):
+        # The half that stays a failure in the predicted regime: a copy the verdict never
+        # mentions. The reader cannot see the event list from the verdict line, so an
+        # unnamed copy is the #3403 defect in its quiet form -- the tool knowing about an
+        # operation that may be the answer and not saying so.
+        bad = self.regions()
+        bad["B  black draw"]["events"] = [idle_transfer(eid=40)]
+        bad["B  black draw"]["reason"] = "1 event(s) passed every test and computed black"
+        self.assertIn("never mentions it", " ".join(ph.check_control(bad)))
+
+    def test_a_named_copy_outside_the_blit_rectangle_is_not_a_failure(self):
+        # The domain control for both arms above, and the reason the guard was downgraded
+        # from a failure to a reading: on a build that behaves as RenderDoc's source says,
+        # EVERY region acquires F's blit, and a control that fails by design is one nobody
+        # runs.
+        ok = self.regions()
+        ok["B  black draw"]["events"] = [idle_transfer(eid=40)]
+        ok["B  black draw"]["reason"] = "computed black. A copy at event 40 (CopyDst) ..."
+        self.assertEqual(ph.check_control(ok), [])
+
+    def test_the_coverage_reading_reports_both_regimes(self):
+        # A probe that prints nothing when it does not fire is indistinguishable from a
+        # probe nobody ran, so it must say which regime it measured either way.
+        quiet = self.regions()
+        self.assertIn("NONE of", ph.coverage_reading(quiet))
+        loud = self.regions()
+        loud["B  black draw"]["events"] = [idle_transfer(eid=40)]
+        self.assertIn("B  black draw", ph.coverage_reading(loud))
+        self.assertIn("no coverage test", ph.coverage_reading(loud))
+
+    def test_F_must_name_the_blit_even_though_the_draw_keeps_the_verdict(self):
+        # F is a black blit over a black draw: it changes nothing, so SHADER_WROTE_BLACK is
+        # the right verdict and is byte-identical to the pre-#3403 reading in which the blit
+        # was never noticed. The only thing that separates them is the blit being NAMED, so
+        # that is what the region has to check -- otherwise F guards nothing at all.
+        bad = self.regions()
+        bad["F  blit black"]["reason"] = "1 event(s) passed every test and computed black."
+        self.assertIn("does not name event 40", " ".join(ph.check_control(bad)))
 
     def test_the_two_halves_must_name_the_same_blit(self):
         bad = self.regions()
