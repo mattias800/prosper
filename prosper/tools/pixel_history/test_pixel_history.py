@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """The verdict must not soften: a black frame has four causes and they are not interchangeable."""
+import struct
 import unittest
 import pixel_history as ph
 
@@ -16,11 +17,66 @@ def ev(passed, rejected=(), shader=None, post=(0.0, 0.0, 0.0, 1.0), eid=1, suppr
        is_clear=False, pre=None):
     if suppressed is None:
         suppressed = ph.suppress_shader_output(rejected)
+    out = None if suppressed else (None if shader is None else list(shader))
+    before, after = list(pre if pre is not None else post), list(post)
+    no_value = [n for n, v in (("preMod", before), ("postMod", after)) if v is None]
+    if not suppressed and out is None:
+        no_value.append("shaderOut")
     return {"eventId": eid, "passed": passed, "rejected_by": list(rejected),
-            "is_clear": is_clear, "preMod": list(pre if pre is not None else post),
-            "shaderOut": None if suppressed else (None if shader is None else list(shader)),
-            "shader_output_suppressed": suppressed,
-            "postMod": list(post)}
+            "is_clear": is_clear, "preMod": before, "shaderOut": out,
+            "shader_output_suppressed": suppressed, "postMod": after,
+            "no_value": no_value}
+
+
+class FakePixelValue:
+    """RenderDoc's PixelValue is a union: one set of four words, several views of it."""
+
+    def __init__(self, floats=None, uints=None):
+        if floats is not None:
+            self.floatValue = list(floats)
+        if uints is not None:
+            self.uintValue = list(uints)
+
+
+class FakeModification:
+    """A stand-in for RenderDoc's PixelModification, shaped like the real one.
+
+    It exists because the case it carries cannot be captured on demand: the sentinel below
+    appears exactly where RenderDoc has nothing to report, and no control program can make
+    that happen. Waiting for a capture that happened to contain one would mean trusting a
+    null produced by the same machinery the null is about.
+    """
+
+    def __init__(self, eid=1, passed=True, pre=None, post=None, shader=None, rejected=()):
+        self.eventId = eid
+        self._passed = passed
+        self.preMod = pre if pre is not None else post
+        self.postMod = post
+        self.shaderOut = shader if shader is not None else post
+        for flag in rejected:
+            setattr(self, flag, True)
+
+    def Passed(self):
+        return self._passed
+
+
+def real(rgba):
+    """A ModificationValue holding a colour RenderDoc actually measured."""
+    return type("MV", (), {"col": FakePixelValue(floats=list(rgba), uints=[0, 0, 0, 0])})()
+
+
+def no_information(shape="stamped_first"):
+    """What RenderDoc leaves behind for "I have no data" (ModificationValue::SetInvalid).
+
+    Two shapes, because which words the sentinel is stamped into is a property of a
+    RenderDoc version rather than of this tool. The measured one (#3404) stamps word 0 and
+    leaves the rest zero, which is what made `max(rgb)` come out as exactly 0.0 and read as
+    a black pixel; the all-four form must be caught as well.
+    """
+    words = ([ph.NO_INFORMATION, 0, 0, 0] if shape == "stamped_first"
+             else [ph.NO_INFORMATION] * 4)
+    floats = [struct.unpack("<f", struct.pack("<I", w))[0] for w in words]
+    return type("MV", (), {"col": FakePixelValue(floats=floats, uints=words)})()
 
 
 class ClassifyTests(unittest.TestCase):
@@ -227,6 +283,165 @@ class SuppressionTests(unittest.TestCase):
 
     def test_mixed_rejection_suppresses(self):
         self.assertTrue(ph.suppress_shader_output(["depthTestFailed", "scissorClipped"]))
+
+class NoInformationTests(unittest.TestCase):
+    """#3404: a sentinel meaning "I do not know" was being consumed as the colour black.
+
+    Every arm builds the sentinel BY HAND rather than looking for one in a capture, for the
+    reason FakeModification gives.
+    """
+
+    def test_the_sentinel_constant_really_is_the_bit_pattern(self):
+        # Not a fixture assertion: if the float form stopped being the reinterpretation of
+        # 0xdeadbeef, the fallback detection route would silently match nothing.
+        self.assertEqual(struct.pack("<f", ph.NO_INFORMATION_AS_FLOAT),
+                         struct.pack("<I", 0xdeadbeef))
+        self.assertLess(ph.NO_INFORMATION_AS_FLOAT, 0.0)
+
+    def test_no_information_is_not_a_colour(self):
+        for shape in ("stamped_first", "stamped_all"):
+            self.assertTrue(ph.carries_no_information(no_information(shape)), shape)
+            self.assertIsNone(ph.colour_values(no_information(shape)), shape)
+
+    def test_a_real_colour_is_still_a_colour(self):
+        # The discriminator has to reject the sentinel and nothing else: a detector that
+        # answered "no information" to everything would satisfy every arm above.
+        self.assertFalse(ph.carries_no_information(real((0.0, 0.0, 0.0, 1.0))))
+        self.assertEqual(ph.colour_values(real((0.0, 0.0, 0.0, 1.0))), [0, 0, 0, 1])
+        self.assertEqual(ph.colour_values(real((0.7, 0.2, 0.1, 1.0))), [0.7, 0.2, 0.1, 1.0])
+
+    def test_the_float_view_alone_is_enough_to_detect_it(self):
+        # The Python binding is not guaranteed to expose the integer view of the union.
+        floats = [ph.NO_INFORMATION_AS_FLOAT, 0.0, 0.0, 0.0]
+        self.assertIsNone(ph.colour_values(
+            type("MV", (), {"col": FakePixelValue(floats=floats)})()))
+
+    def test_the_integer_view_alone_is_enough_to_detect_it(self):
+        # And the other way round: 0xdeadbeef is an INTEGER sentinel, so the integer view
+        # is the direct reading of it and the float view is the reinterpretation. Either
+        # route alone must catch it, since which the binding exposes is not our choice.
+        only_ints = type("MV", (), {"col": FakePixelValue(uints=[ph.NO_INFORMATION] * 4)})()
+        self.assertTrue(ph.carries_no_information(only_ints))
+        self.assertIsNone(ph.colour_values(only_ints))
+
+    def test_renderdocs_own_IsValid_is_enough_on_its_own(self):
+        # A value whose bits say nothing and whose IsValid() says "no data": detected on
+        # that route alone, since the bit patterns here are a perfectly ordinary black.
+        invalid = type("MV", (), {"col": FakePixelValue(floats=[0.0] * 4),
+                                  "IsValid": lambda self: False})()
+        valid = type("MV", (), {"col": FakePixelValue(floats=[0.0, 0.0, 0.0, 1.0]),
+                                "IsValid": lambda self: True})()
+        self.assertIsNone(ph.colour_values(invalid))
+        self.assertEqual(ph.colour_values(valid), [0, 0, 0, 1])
+
+    def test_IsValid_cannot_overrule_the_sentinel_bits(self):
+        # The three routes are a UNION, not a precedence. IsValid() is the one route nobody
+        # here can run against a real binding, so letting it short-circuit past the bit
+        # patterns would make it the only thing able to re-open #3404 -- a value whose
+        # word 0 IS the sentinel is no-information whatever IsValid() claims.
+        w = [ph.NO_INFORMATION, 0, 0, 0]
+        f = [struct.unpack("<f", struct.pack("<I", x))[0] for x in w]
+        lying = type("MV", (), {"col": FakePixelValue(floats=f, uints=w),
+                                "IsValid": lambda self: True})()
+        self.assertTrue(ph.carries_no_information(lying))
+        self.assertIsNone(ph.colour_values(lying))
+
+    def test_a_binding_whose_IsValid_raises_falls_through_to_the_bits(self):
+        def boom(self):
+            raise RuntimeError("no such method on this build")
+        w = [ph.NO_INFORMATION, 0, 0, 0]
+        f = [struct.unpack("<f", struct.pack("<I", x))[0] for x in w]
+        odd = type("MV", (), {"col": FakePixelValue(floats=f, uints=w), "IsValid": boom})()
+        self.assertTrue(ph.carries_no_information(odd))
+
+    def test_a_pixel_with_no_recorded_value_is_not_reported_as_shader_wrote_black(self):
+        # THE headline case, end to end through the builder the replay path itself uses.
+        # Before the fix this returned SHADER_WROTE_BLACK -- max() over the float view of
+        # the sentinel is exactly 0.0, so an absence of data was reported as a measured
+        # black and the reader was sent to resource binding and shaders.
+        for shape in ("stamped_first", "stamped_all"):
+            e = ph.modification_event(FakeModification(eid=7, post=no_information(shape)),
+                                      is_clear=False)
+            # The VERDICT first, deliberately: this arm has to distinguish "the tool said
+            # something" from "the tool said the right thing about a pixel it cannot read",
+            # so the assertion that goes red without the fix must be the verdict itself.
+            verdict, why = ph.classify([e])
+            self.assertNotEqual(verdict, "SHADER_WROTE_BLACK", shape)
+            self.assertEqual(verdict, "VALUE_UNKNOWN", shape)
+            self.assertIn("7", why)
+            self.assertIsNone(e["postMod"], shape)
+            self.assertIn("postMod", e["no_value"], shape)
+
+    def test_a_pixel_with_no_recorded_value_is_not_a_lost_store_either(self):
+        # The other direction of the same absence, and the arm that makes the postMod
+        # branch load-bearing on its own: RenderDoc records a real bright shader output
+        # and NO final value. Reading the missing value as 0.0 makes that STORE_LOST_IT --
+        # blend state, write masks -- which is a second confident answer from no data.
+        e = ph.modification_event(
+            FakeModification(eid=13, post=no_information(), shader=real((0.7, 0.2, 0.1, 1))),
+            is_clear=False)
+        v, _ = ph.classify([e])
+        self.assertNotIn(v, ("STORE_LOST_IT", "SHADER_WROTE_BLACK"))
+        self.assertEqual(v, "VALUE_UNKNOWN")
+
+    def test_a_measured_black_pixel_still_reads_shader_wrote_black(self):
+        # The domain control for the arm above: the refusal must not have swallowed the
+        # verdict standing next to it. Same construction path, a real value instead.
+        e = ph.modification_event(FakeModification(eid=7, post=real((0, 0, 0, 1))),
+                                  is_clear=False)
+        self.assertEqual(e["postMod"], [0, 0, 0, 1])
+        self.assertEqual(e["no_value"], [])
+        self.assertEqual(ph.classify([e])[0], "SHADER_WROTE_BLACK")
+
+    def test_a_shader_output_with_no_recorded_value_cannot_settle_the_question(self):
+        # postMod is a measured black, so the pixel really is black -- but with no shader
+        # output there is nothing to separate "computed black" from "the store lost it",
+        # which is the entire distinction this tool exists to make.
+        e = ph.modification_event(
+            FakeModification(eid=11, post=real((0, 0, 0, 1)), shader=no_information()),
+            is_clear=False)
+        self.assertIsNone(e["shaderOut"])
+        self.assertIn("shaderOut", e["no_value"])
+        v, why = ph.classify([e])
+        self.assertEqual(v, "VALUE_UNKNOWN")
+        self.assertIn("store lost", why)
+
+    def test_a_suppressed_shader_output_is_still_reported_as_suppressed(self):
+        # "No fragment ran" and "RenderDoc recorded nothing" are different findings, and
+        # must not collapse into each other now that both arrive as None.
+        e = ph.modification_event(
+            FakeModification(eid=3, passed=False, post=real((0, 0, 0, 1)),
+                             rejected=["scissorClipped"]), is_clear=False)
+        self.assertTrue(e["shader_output_suppressed"])
+        self.assertNotIn("shaderOut", e["no_value"])
+
+    def test_a_late_clear_with_no_recorded_value_does_not_blame_the_draw(self):
+        # SetInvalid stamps preMod and postMod alike, so "did this clear change the pixel"
+        # is unanswerable -- and answering it by falling through names the draw underneath,
+        # which is the misattribution CLEARED_AFTER_DRAW exists to prevent.
+        drawn = ev(True, shader=(0, 0, 0, 1), post=(0, 0, 0, 1), eid=5)
+        blind = ph.modification_event(
+            FakeModification(eid=9, pre=no_information(), post=no_information()),
+            is_clear=True)
+        v, why = ph.classify([drawn, blind])
+        self.assertEqual(v, "VALUE_UNKNOWN")
+        self.assertIn("9", why)
+
+    def test_a_late_clear_with_real_values_still_fires(self):
+        # The domain control for the arm above.
+        drawn = ev(True, shader=(0, 0, 0, 1), post=(0, 0, 0, 1), eid=5)
+        wiped = ph.modification_event(
+            FakeModification(eid=9, pre=real((1, 1, 1, 1)), post=real((0, 0, 0, 1))),
+            is_clear=True)
+        self.assertEqual(ph.classify([drawn, wiped])[0], "CLEARED_AFTER_DRAW")
+
+    def test_the_replay_record_and_the_fixtures_have_the_same_shape(self):
+        # These two descriptions of an event used to be written out twice by hand, and
+        # everything CI can reach reads the fixture rather than the record.
+        built = ph.modification_event(FakeModification(post=real((0, 0, 0, 1))),
+                                      is_clear=False)
+        self.assertEqual(sorted(built), sorted(ev(True, shader=(0, 0, 0, 1))))
+
 
 if __name__ == "__main__":
     unittest.main()
