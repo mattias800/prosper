@@ -244,6 +244,186 @@ int main() {
         term(ctx_b, 0, 0, 0, 0, 0);
     }
 
+    // ---- the request path (#2930) --------------------------------------------------------
+    // Everything from sceHttpCreateConnection onwards used to fall to the dispatcher's `return 0`.
+    // Two different wrongs come out of that one default, and the arms below are written to kill
+    // each separately: an id-returning call answering 0 hands the guest a handle nobody allocated,
+    // and a response getter answering SCE_OK with its out-parameters untouched hands the guest
+    // back whatever was already in its buffer. So every id arm demands a POSITIVE id for a good
+    // call and a NEGATIVE one for a bad call -- 0 satisfies neither -- and every response arm
+    // pre-fills its out-parameters with a sentinel and requires the sentinel to SURVIVE next to a
+    // non-zero return.
+    std::printf("-- request path --\n");
+    {
+        // init / create_tmpl / term are the handles the context block above already looked up.
+        HleFn create_conn = Hle::lookup("Kiwv9r4IZCc");
+        HleFn create_conn_url = Hle::lookup("qgxDBjorUxs");
+        HleFn del_conn = Hle::lookup("P6A3ytpsiYc");
+        HleFn create_req = Hle::lookup("tsGVru3hCe8");
+        HleFn create_req2 = Hle::lookup("rGNm+FjIXKk");
+        HleFn del_req = Hle::lookup("qe7oZ+v4PWA");
+        HleFn add_header = Hle::lookup("EY28T2bkN7k");
+        HleFn send = Hle::lookup("1e2BNwI-XzE");
+        HleFn read_data = Hle::lookup("P5pdoykPYTk");
+        HleFn get_headers = Hle::lookup("aCYPMSUIaP8");
+        HleFn get_status = Hle::lookup("0a2TBNfE3BU");
+        HleFn get_length = Hle::lookup("yuO2H2Uvnos");
+        HleFn last_errno = Hle::lookup("0onIrKx9NIE");
+
+        // Kills: the whole bug for this half of the library -- these NIDs were unregistered, so
+        // the dispatcher answered every one of them with 0 = SCE_OK.
+        CHECK(create_conn && create_conn_url && del_conn && create_req && create_req2 && del_req &&
+              add_header && send && read_data && get_headers && get_status && get_length &&
+              last_errno,
+              "the libSceHttp request path is registered");
+        // A registration under the wrong name is a NID typo, which at run time is indistinguishable
+        // from leaving the function unregistered.
+        CHECK(Hle::name_of("1e2BNwI-XzE") &&
+              std::strcmp(Hle::name_of("1e2BNwI-XzE"), "sceHttpSendRequest") == 0 &&
+              Hle::name_of("aCYPMSUIaP8") &&
+              std::strcmp(Hle::name_of("aCYPMSUIaP8"), "sceHttpGetAllResponseHeaders") == 0,
+              "the send path and the header getter carry their PS5 3.20 names");
+
+        // Guarded only so a missing registration cannot segfault this process before it prints the
+        // failure above: every handle dereferenced below is in the condition, and the arm that
+        // actually reports the regression is the registration CHECK, not this `if`.
+        if (init && create_tmpl && term && create_conn && create_conn_url && del_conn &&
+            create_req && create_req2 && del_req && add_header && send && read_data &&
+            get_headers && get_status && get_length && last_errno) {
+            const uint64_t ctx = init(0, 0, 0, 0, 0, 0);
+            const uint64_t tmpl = create_tmpl(ctx, 0, 0, 0, 0, 0);
+            const char* host = "example.invalid";
+            const char* url = "https://example.invalid/api/submit";
+
+            // Kills: accepting any id at all. Id 0 is exactly what the OLD default handed the
+            // guest, so a create path that accepts it takes the bug's own output as valid input.
+            CHECK((int32_t)create_conn(0, (uint64_t)(uintptr_t)host, 0, 443, 1, 0) ==
+                      (int32_t)http::kErrorInvalidId,
+                  "CreateConnection on id 0 answers INVALID_ID, not a connection id");
+            CHECK((int64_t)create_conn(999, (uint64_t)(uintptr_t)host, 0, 443, 1, 0) < 0,
+                  "CreateConnection on an id nobody allocated answers a negative error");
+
+            const uint64_t conn = create_conn(tmpl, (uint64_t)(uintptr_t)host, 0, 443, 1, 0);
+            CHECK((int64_t)conn > 0 && conn != tmpl && conn != ctx,
+                  "CreateConnection returns a positive id, distinct from its template and context");
+            const uint64_t conn2 = create_conn_url(tmpl, (uint64_t)(uintptr_t)url, 1, 0, 0, 0);
+            CHECK((int64_t)conn2 > 0 && conn2 != conn,
+                  "CreateConnectionWithURL returns a second, distinct connection id");
+
+            CHECK((int64_t)create_req(0, 0, (uint64_t)(uintptr_t)url, 0, 0, 0) < 0,
+                  "CreateRequest on id 0 answers a negative error");
+            CHECK((int64_t)create_req(conn, 0, 0, 0, 0, 0) < 0,
+                  "CreateRequest with a null path answers a negative error");
+            const uint64_t req = create_req(conn, 1, (uint64_t)(uintptr_t)url, 0, 0, 0);
+            CHECK((int64_t)req > 0 && req != conn,
+                  "CreateRequest returns a positive id, distinct from its connection");
+            const uint64_t req2 =
+                create_req2(conn, (uint64_t)(uintptr_t)"POST", (uint64_t)(uintptr_t)url, 7, 0, 0);
+            CHECK((int64_t)req2 > 0 && req2 != req,
+                  "CreateRequest2 (string method) returns a further distinct request id");
+
+            // Kills: "return SCE_OK unconditionally", which is what the old default did for every
+            // setter too. This arm cannot be satisfied by that default, because it demands the
+            // BAD id be refused.
+            CHECK(add_header(req, (uint64_t)(uintptr_t)"X-Prosper", (uint64_t)(uintptr_t)"1", 0,
+                             0, 0) == 0,
+                  "AddRequestHeader on a live request succeeds");
+            CHECK(add_header(0, (uint64_t)(uintptr_t)"X-Prosper", (uint64_t)(uintptr_t)"1", 0,
+                             0, 0) == http::kErrorInvalidId,
+                  "AddRequestHeader on id 0 answers INVALID_ID");
+
+            // Before any send there is still no response, and the getter must say so in a way that
+            // writes nothing.
+            uint64_t out_ptr = 0xDEADBEEFCAFEF00Dull, out_len = 0xDEADBEEFCAFEF00Dull;
+            CHECK(get_headers(req, (uint64_t)(uintptr_t)&out_ptr, (uint64_t)(uintptr_t)&out_len,
+                              0, 0, 0) != 0,
+                  "GetAllResponseHeaders fails before anything was sent");
+            CHECK(out_ptr == 0xDEADBEEFCAFEF00Dull && out_len == 0xDEADBEEFCAFEF00Dull,
+                  "...and writes neither out-parameter");
+
+            const uint64_t sent = send(req, 0, 0, 0, 0, 0);
+            // Kills: THE BUG. The dispatcher answered 0 = SCE_OK for a request never sent.
+            CHECK(sent != 0,
+                  "SendRequest does NOT report success for a request prosper never sent");
+            // Kills: an arbitrary non-zero. The offline answer is the libSceNet error an
+            // unreachable network produces, which is the family this library propagates.
+            CHECK(sent == http::kNetErrorNetUnreach,
+                  "SendRequest reports SCE_NET_ERROR_ENETUNREACH (0x80410133)");
+            CHECK((sent & 0x80000000u) != 0, "...and it is error-shaped, with the top bit set");
+            CHECK(send(0, 0, 0, 0, 0, 0) == http::kErrorInvalidId,
+                  "SendRequest on id 0 answers INVALID_ID, not the network error");
+
+            out_ptr = out_len = 0xDEADBEEFCAFEF00Dull;
+            CHECK(get_headers(req, (uint64_t)(uintptr_t)&out_ptr, (uint64_t)(uintptr_t)&out_len,
+                              0, 0, 0) == sent,
+                  "GetAllResponseHeaders reports the same failure the send did");
+            CHECK(out_ptr == 0xDEADBEEFCAFEF00Dull && out_len == 0xDEADBEEFCAFEF00Dull,
+                  "...and leaves the caller's header pointer and length untouched");
+
+            int32_t status = (int32_t)0xA5A5A5A5;
+            CHECK(get_status(req, (uint64_t)(uintptr_t)&status, 0, 0, 0, 0) != 0 &&
+                      status == (int32_t)0xA5A5A5A5,
+                  "GetStatusCode fails and writes no status code");
+            uint64_t length = 0xDEADBEEFCAFEF00Dull;
+            CHECK(get_length(req, (uint64_t)(uintptr_t)&length, 0, 0, 0, 0) != 0 &&
+                      length == 0xDEADBEEFCAFEF00Dull,
+                  "GetResponseContentLength fails and writes no length");
+            unsigned char body[16];
+            std::memset(body, 0x5A, sizeof(body));
+            bool body_untouched = true;
+            const uint64_t read_rc = read_data(req, (uint64_t)(uintptr_t)body, sizeof(body), 0, 0, 0);
+            for (unsigned char c : body) body_untouched &= (c == 0x5A);
+            CHECK(read_rc != 0 && body_untouched, "ReadData fails and writes no body bytes");
+
+            // The one getter that IS answerable from local state: prosper's own send recorded why
+            // it failed. Kills a "fail everything" implementation as well as the old silent zero,
+            // because it demands the specific errno the send reported AND a fresh request reporting
+            // none.
+            int32_t probe[3] = {(int32_t)0xA5A5A5A5, (int32_t)0xA5A5A5A5, (int32_t)0xA5A5A5A5};
+            CHECK(last_errno(req, (uint64_t)(uintptr_t)&probe[1], 0, 0, 0, 0) == 0 &&
+                      probe[1] == http::kNetErrnoNetUnreach,
+                  "GetLastErrno reports the errno the failed send recorded");
+            CHECK(probe[0] == (int32_t)0xA5A5A5A5 && probe[2] == (int32_t)0xA5A5A5A5,
+                  "...writing exactly its own 32-bit slot, not its neighbours");
+            probe[1] = (int32_t)0xA5A5A5A5;
+            CHECK(last_errno(req2, (uint64_t)(uintptr_t)&probe[1], 0, 0, 0, 0) == 0 &&
+                      probe[1] == 0,
+                  "a request that was never sent reports no errno");
+
+            // Teardown is a tree, one level deeper than the context/template arm above.
+            CHECK(del_req(req, 0, 0, 0, 0, 0) == 0, "DeleteRequest accepts its own request id");
+            CHECK(del_req(req, 0, 0, 0, 0, 0) == http::kErrorInvalidId,
+                  "...and the request id is dead afterwards");
+            CHECK(del_conn(conn, 0, 0, 0, 0, 0) == 0, "DeleteConnection accepts its connection");
+            CHECK(send(req2, 0, 0, 0, 0, 0) == http::kErrorInvalidId,
+                  "DeleteConnection took its outstanding request with it");
+
+            // The leak control, at request depth. A loop that terminates contexts holding NOTHING
+            // cannot express the leak it claims to guard -- the vacuity #3295 had to fix one level
+            // up -- so this fills the table with a connection-and-request tree under one context
+            // before terminating it, and requires a fresh context to reach the same depth.
+            CHECK(term(ctx, 0, 0, 0, 0, 0) == 0, "the context holding the tree terminates");
+            int depth[2] = {0, 0};
+            bool init_ok = true;
+            for (int pass = 0; pass < 2; pass++) {
+                const uint64_t c = init(0, 0, 0, 0, 0, 0);
+                if ((int64_t)c <= 0) { init_ok = false; break; }
+                while (true) {
+                    const uint64_t t = create_tmpl(c, 0, 0, 0, 0, 0);
+                    if ((int64_t)t <= 0) break;
+                    depth[pass]++;
+                    const uint64_t cn = create_conn(t, (uint64_t)(uintptr_t)host, 0, 443, 1, 0);
+                    if ((int64_t)cn > 0) create_req(cn, 0, (uint64_t)(uintptr_t)url, 0, 0, 0);
+                }
+                term(c, 0, 0, 0, 0, 0);
+            }
+            CHECK(init_ok && depth[0] > 0,
+                  "the table really was filled with a connection/request tree");
+            CHECK(depth[1] == depth[0],
+                  "sceHttpTerm reclaims connections and requests too, not just templates");
+        }
+    }
+
     if (fails) { std::printf("== FAIL: %d ==\n", fails); return 1; }
     std::printf("== PASS ==\n");
     return 0;

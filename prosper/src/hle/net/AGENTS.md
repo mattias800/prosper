@@ -1,7 +1,9 @@
 # `src/hle/net` — Sony networking libraries
 
 Reimplementations of the PS5 networking libraries that prosper answers itself. Today that is
-**libSceHttp** (`hle_http.cpp`): the URI helper family and the library/template id lifecycle.
+**libSceHttp** (`hle_http.cpp`): the URI helper family, the local object graph (library contexts,
+templates, connections, requests) and the request path — split between what is answerable offline
+and what has to fail honestly, per the policy below.
 
 ## The policy this folder exists to hold
 
