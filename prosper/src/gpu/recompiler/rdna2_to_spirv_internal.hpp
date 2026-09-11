@@ -244,8 +244,8 @@ enum : uint32_t {
     // one of them is a GroupNonUniform op, which reads exactly like descriptor indexing is already
     // supported. It was not.
     Cap_ShaderNonUniform=5301,
-    // SPV_KHR_float_controls. Declared by declare_float_controls() for every guest module;
-    // see the comment there for why this is not optional (#3479).
+    // SPV_KHR_float_controls. Declared by declare_float_controls() for every guest module, on a
+    // device that has been MEASURED to accept it; see the comment there (#3479, gated in #3561).
     // The five capabilities of that extension are CONSECUTIVE and easy to take one off by:
     // 4464 DenormPreserve, 4465 DenormFlushToZero, 4466 SignedZeroInfNanPreserve,
     // 4467 RoundingModeRTE, 4468 RoundingModeRTZ. The first draft of this line said 4467, and
@@ -416,14 +416,21 @@ struct SpirvCompute {
     // black -- while the UI, composited after the grade, stays pixel-perfect. RADV preserves Inf,
     // which is why the same build renders the same frame correctly on Linux/AMD. A vendor split, not
     // a title quirk, and invisible to any test whose only device preserves Inf anyway.
-    // Declared for EVERY guest module, not only ones observed to need it: a driver may exploit the
-    // assumption at any float op, so "which shaders touch Inf" is not a property this emitter can
-    // decide. shaderSignedZeroInfNanPreserveFloat32 is VK_TRUE on every implementation this project
-    // runs on -- NVIDIA, RADV, and the Mesa lavapipe CI uses -- so no device gate is plumbed; if one
-    // ever reports VK_FALSE, pipeline creation fails loudly rather than silently mis-evaluating.
+    // Declared for EVERY guest module the device can take it on, not only ones observed to need it:
+    // a driver may exploit the assumption at any float op, so "which shaders touch Inf" is not a
+    // property this emitter can decide.
+    // DEVICE-GATED, and the gate is not optional. An earlier revision of this comment asserted that
+    // shaderSignedZeroInfNanPreserveFloat32 is VK_TRUE everywhere prosper runs, so no gate was
+    // needed, "and if one ever reports VK_FALSE, pipeline creation fails loudly". Both halves were
+    // false: CI's Vulkan validation scan reported VUID-...-08740 and -08742 x475 across four
+    // binaries WHILE ALL 464 TESTS PASSED -- an invalid module a driver honoured anyway, which is an
+    // undefined contract rather than a loud failure (#3561). The device-side query and the whole
+    // contract live at rdna2_to_spirv.hpp's publish_float_controls_support(); this call site only
+    // reads the answer, and reads it as "no" until some device owner has measured a device.
     bool float_controls_declared = false;
     void declare_float_controls(uint32_t entry) {
         if (float_controls_declared) return;
+        if (!signed_zero_inf_nan_preserve_declared()) return;
         float_controls_declared = true;
         put(caps, Op_Capability, {Cap_SignedZeroInfNanPreserve});
         std::vector<uint32_t> o; pstr(o, "SPV_KHR_float_controls");

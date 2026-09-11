@@ -26,6 +26,7 @@
 #include "gpu/capture/gpu_capture.hpp"
 #include "gpu/execute/gpu_execute.hpp"
 #include "gpu/execute/host_read_barrier.hpp"  // #3249: a host read of a dispatch result needs an availability op
+#include "gpu/execute/float_controls_probe.hpp"  // #3479: the device gate on SignedZeroInfNanPreserve
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_cf9200_contract.hpp"
 #include "gpu/resources/shader_resources.hpp"
@@ -3303,6 +3304,16 @@ struct VulkanComputeContext {
                 std::fprintf(stderr, "[compute] storage-buffer int64 atomics %s "
                                      "(inherited from the adopted device)\n",
                              shared.storage_buffer_int64_atomics ? "ENABLED" : "unavailable");
+                // Read, never re-measured: the renderer that owns this device already published
+                // its float contract to the recompiler, and a second publisher of the same device
+                // could only repeat it. Printed anyway, because this backend's own log is where a
+                // reader looks to find out whether a black graded frame is the device's doing
+                // (#3479), and a capability visible only in another component's log is the shape
+                // #2458 shipped.
+                std::fprintf(stderr, "[compute] SignedZeroInfNanPreserve %s "
+                                     "(inherited from the adopted device)\n",
+                             prosper::gpu::signed_zero_inf_nan_preserve_declared()
+                                 ? "ENABLED" : "unavailable");
                 // Same both-directions rule for the OOB image contract (#3531). "unavailable" here
                 // means every storage-image dispatch will be declined, which is a large behavioural
                 // difference that must be readable from the log rather than inferred from a black
@@ -3453,6 +3464,13 @@ struct VulkanComputeContext {
         dci.enabledExtensionCount = (uint32_t)dev_exts.size();
         dci.ppEnabledExtensionNames = dev_exts.empty() ? nullptr : dev_exts.data();
         if (vkCreateDevice(physical, &dci, nullptr, &device) != VK_SUCCESS) return false;
+        // Same measurement the renderer makes, for the same reason image robustness is acquired
+        // here through a shared helper (#3531): this device executes the SAME recompiled modules,
+        // and a module declaring a capability only one of the two devices can take is invalid on
+        // the other. Publishers are ANDed, so whichever device is weaker decides (#3479).
+        prosper::gpu::publish_device_float_controls(
+            "compute", physical, kVulkanRuntimeVersion,
+            /*float_controls_extension_enabled=*/false);
         vkGetDeviceQueue(device, queue_family, 0, &queue);
         if (!create_pipeline_cache())
             return false;

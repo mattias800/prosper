@@ -22,7 +22,10 @@
 > colour-grading LUT builder therefore wrote an all-black 1024x32 LUT that blacked out every graded
 > pixel. The UI is composited AFTER the grade, which is why it survived. See `## Ruled out` below for
 > everything that was falsified on the way, and note the shape: **four separate layers of this title
-> looked guilty and none of them were.**
+> looked guilty and none of them were.** The declaration is DEVICE-GATED (#3561): a device that does
+> not report `shaderSignedZeroInfNanPreserveFloat32`, or cannot name the extension at all, still
+> renders this title's grade black, and prosper now says so in one log line instead of emitting a
+> module that device may not legally compile.
 
 **Status:** DRAFT for review (multiple agents). Tracks #755; investigates #320. No writer instrumentation
 is proposed as ready; the watchpoint material is a **conditional toolbox appendix** (§5), not an
