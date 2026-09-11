@@ -47,7 +47,10 @@ class FakeGh:
     whole subject -- a fake that tied them together could not express the bug.
     """
 
-    def __init__(self, body="", write_rc=0, applies=True, read_rc=0, write_err=""):
+    def __init__(self, body="", write_rc=0, applies=True, read_rc=0, write_err="",
+                 repo_name="owner/canonical", repo_rc=0):
+        self.repo_name = repo_name
+        self.repo_rc = repo_rc
         self.body = body
         self.write_rc = write_rc
         self.applies = applies
@@ -57,6 +60,11 @@ class FakeGh:
 
     def __call__(self, cmd, cwd=None, stdin=None):
         self.calls.append((list(cmd), stdin))
+        if "repo" in cmd and "view" in cmd:
+            return self.repo_rc, self.repo_name + "\n", "" if self.repo_rc == 0 else "no remote"
+        # Every other call must already be addressed at the resolved name, never at the
+        # placeholders: `{owner}/{repo}` is what 307s on a renamed repository.
+        assert not any("{owner}" in a for a in cmd), "endpoint still uses {owner}/{repo}: %r" % (cmd,)
         if "-X" in cmd and "PATCH" in cmd:
             if self.applies:
                 self.body = json.loads(stdin)["body"]
@@ -169,7 +177,8 @@ fake = FakeGh(body="stale")
 drive(fake, ["set", "42", "--body", BODY])
 patch = [(c, s) for c, s in fake.calls if "PATCH" in c][0]
 case("uses gh api", patch[0][:2], ["gh", "api"])
-case("targets the REST pulls endpoint", patch[0][2], "repos/{owner}/{repo}/pulls/42")
+case("targets the REST pulls endpoint at the RESOLVED name, not the placeholders",
+     patch[0][2], "repos/owner/canonical/pulls/42")
 case("sends the body as JSON on stdin", json.loads(patch[1]), {"body": BODY})
 case("never invokes `gh pr edit`",
      any("pr" in c and "edit" in c for c, _ in fake.calls), False)
@@ -276,6 +285,27 @@ except UnicodeEncodeError as exc:
     written = b"<raised %s>" % str(exc).encode("ascii", "replace")
 case("`get` writes UTF-8 bytes, bypassing the console codepage",
      written, "a body with \u2260 and \u2014\n".encode("utf-8"))
+
+print("\n-- the endpoint is built from the CANONICAL repo name, not from the git remote")
+# `gh api` expands {owner}/{repo} from the remote, and a RENAMED repository answers there by
+# redirect: GitHub returns HTTP 307 to a PATCH and `gh api` does not follow it, so the write does
+# nothing. This tool's first live `set` hit exactly that -- remote `ps5ys`, canonical `prosper` --
+# and only the read-back noticed. The FakeGh above asserts no call carries the placeholders, so
+# reverting resolve_repo() reddens every arm rather than only this one.
+fake = FakeGh(body="stale", repo_name="someone/renamed")
+drive(fake, ["set", "42", "--body", BODY])
+case("the repo was resolved before any endpoint was built",
+     [c for c, _ in fake.calls][0][:3], ["gh", "repo", "view"])
+case("and the resolved name is what the endpoint uses",
+     [c[2] for c, _ in fake.calls if len(c) > 2 and c[2].startswith("repos/")][0],
+     "repos/someone/renamed/pulls/42")
+
+# An unresolvable repository is COULD NOT VERIFY, never a mismatch: without a name there is no
+# endpoint to ask, so the tool knows nothing about the live body.
+rc, out, err = drive(FakeGh(body=BODY, repo_rc=1), ["verify", "42", "--body", BODY])
+case("an unresolvable repo exits 2", rc, 2)
+case("and says the repository could not be resolved", "could not resolve the repository" in err,
+     True)
 
 print()
 if FAILURES:

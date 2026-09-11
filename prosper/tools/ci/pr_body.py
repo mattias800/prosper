@@ -128,8 +128,31 @@ def compare(intended: str, live: str) -> tuple[bool, str]:
                    % (min(len(alines), len(blines)), len(alines), len(blines)))
 
 
+def resolve_repo(repo_dir: str = ".") -> str:
+    """The repository's CANONICAL `owner/name`, which is not always what the remote says.
+
+    `gh api` expands the `{owner}`/`{repo}` placeholders from the git remote, and a repository
+    that has been RENAMED keeps answering on its old name by redirect. GitHub replies **HTTP 307**
+    to a `PATCH` there, and `gh api` does not follow it -- so the write silently does nothing while
+    reporting a failure the caller may well shrug at as transport noise.
+
+    That is not hypothetical and was not predicted: this tool's very first live `set`, run against
+    its own pull request, hit exactly that -- remote `.../ps5ys.git`, canonical `mattias800/prosper`,
+    `gh: HTTP 307`, body unchanged. The read-back is what caught it, which is the argument for the
+    whole design in one line. `gh repo view` resolves the redirect and reports the current name, so
+    every endpoint below is built from that rather than from the placeholders.
+    """
+    rc, out, err = run(["gh", "repo", "view", "--json", "nameWithOwner",
+                        "-q", ".nameWithOwner"], cwd=repo_dir)
+    name = out.strip()
+    if rc != 0 or "/" not in name:
+        raise BodyError("could not resolve the repository (gh repo view exited %d): %s"
+                        % (rc, (err.strip() or name)[:200]))
+    return name
+
+
 def _api(pr: int, repo_dir: str, extra: list[str], stdin: str | None = None):
-    cmd = ["gh", "api", "repos/{owner}/{repo}/pulls/%d" % pr] + extra
+    cmd = ["gh", "api", "repos/%s/pulls/%d" % (resolve_repo(repo_dir), pr)] + extra
     return run(cmd, cwd=repo_dir, stdin=stdin)
 
 
