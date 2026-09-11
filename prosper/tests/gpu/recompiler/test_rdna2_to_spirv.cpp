@@ -4461,6 +4461,25 @@ int main() {
         CHECK(recompile_valu(code24, sizeof(code24) / sizeof(code24[0]), 1, 1, &rt).empty(),
               "MUBUF format load rejects a reserved DST_SEL selector instead of guessing");
     }
+    {
+        // The CANONICAL three-component selector X/Y/Z/1 (0x3AC) -- what every driver emits for a
+        // format with no alpha, and the shape GTA V's tables carry (#2481). Its SQ_SEL_1 names no
+        // stored component, so it must produce exactly what the identity lowering produced before
+        // #2869: W = 1.0 from the absent-component default. This is the invariance arm; without it
+        // "honour the descriptor" and "change what ordinary descriptors return" are indistinguishable.
+        std::vector<float> expect(N);
+        for (uint32_t i = 0; i < N; ++i) {
+            const float r = (float)(i & 0xFF), g = (float)((i * 3) & 0xFF);
+            const float bl = (float)((i * 5) & 0xFF);
+            expect[i] = (r + 2.0f * g + 3.0f * bl) / 255.0f + 4.0f;
+        }
+        ShaderResource three = swizzled_vb(4, 5, 6, 7); three.num_components = 3;
+        run24_swizzled(three, expect,
+                       "three-component identity V# keeps the absent-W default of one");
+        ShaderResource canonical = swizzled_vb(4, 5, 6, 1); canonical.num_components = 3;
+        run24_swizzled(canonical, expect,
+                       "canonical X/Y/Z/SQ_SEL_1 three-component V# returns the same vector");
+    }
 
     // The same packed conversion through MTBUF: opcode XYZW and combined format 56 are both carried
     // by the instruction. Resource metadata is intentionally Float32x1 to catch accidental reuse.
@@ -7683,6 +7702,18 @@ int main() {
     rt33sel.resources[0].swizzle[2] = 4; rt33sel.resources[0].swizzle[3] = 7;
     CHECK(recompile_valu(code33, sizeof(code33) / sizeof(code33[0]), 1, 0, &rt33sel).empty(),
           "MUBUF format store through a routed V# fails visibly instead of storing a wrong order");
+
+    // ...but ONLY when the routing touches a component that physically exists. A three-component
+    // descriptor's canonical X/Y/Z/1 selector routes nothing -- SQ_SEL_1 sits in a slot the format
+    // has no component for -- and rejecting it would have dropped every buffer_store_format_xyzw
+    // through an ordinary alpha-less descriptor. That regression would have looked like a
+    // conservative fail-visible guard rather than the draw loss it is, which is why it has its own
+    // arm rather than riding on the reject arm above.
+    ShaderResourceTable rt33canon = rt33;
+    rt33canon.resources[0].num_components = 3;
+    rt33canon.resources[0].swizzle[3] = 1;
+    CHECK(!recompile_valu(code33, sizeof(code33) / sizeof(code33[0]), 1, 0, &rt33canon).empty(),
+          "MUBUF format store keeps compiling through a canonical X/Y/Z/SQ_SEL_1 descriptor");
 
     // Kernel 34: signed scalar ALU + bitfield mask (SOP2 s_add_i32 0x02 / s_sub_i32 0x03 / s_bfm_b32 0x24).
     //   s0=20 s1=7 | s2=s0+s1=27 | s3=s0-s1=13 | s4=s_bfm(3,2)=((1<<3)-1)<<2=28 |

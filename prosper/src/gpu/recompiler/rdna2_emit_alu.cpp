@@ -5834,13 +5834,22 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 const bool& is_atomic;
                 const ShaderResourceTable* rt;
                 const char* how = "unclassified";
+                // The resolved descriptor's DST_SEL word, or UINT32_MAX when this op never reached a
+                // resolved V# (#2869). It is on this line rather than behind its own switch so a
+                // census of routed descriptors carries its own denominator: every MUBUF FORMAT fetch
+                // that resolves prints a selector, so "no title routes a channel" is distinguishable
+                // from "the instrument never ran", which a log of the non-identity case alone is not.
+                uint32_t dst_sel_word = 0xFFFFFFFFu;
                 ~BufOpDisposition() {
                     if (!on) return;
+                    char sel[16] = "none";
+                    if (dst_sel_word != 0xFFFFFFFFu)
+                        std::snprintf(sel, sizeof(sel), "0x%03x", dst_sel_word & 0xfffu);
                     std::fprintf(stderr,
-                                 "[buf-op] program=0x%llx pc=%u %s op=0x%x n=%u store=%d atomic=%d rt=%d %s\n",
+                                 "[buf-op] program=0x%llx pc=%u %s op=0x%x n=%u store=%d atomic=%d rt=%d dstsel=%s %s\n",
                                  (unsigned long long)b.diagnostic.program_address, in.pc,
                                  in.fmt == Rdna2Format::MUBUF ? "MUBUF" : "MTBUF", in.opcode, n,
-                                 (int)is_store, (int)is_atomic, (int)(rt != nullptr), how);
+                                 (int)is_store, (int)is_atomic, (int)(rt != nullptr), sel, how);
                 }
             } buf_op{std::getenv("PROSPER_DBG") != nullptr, b, in, n, is_store, is_atomic, rt};
             uint32_t offset = in.literal & 0xFFFu;
@@ -6403,6 +6412,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 for (uint32_t k = 0; k < 4u; ++k) dst_sel[k] = resolved_buffer->swizzle[k];
                 for (uint32_t k = 0; k < n && k < 4u; ++k)
                     if (dst_sel[k] != k + 4u) dst_sel_routed = true;
+                buf_op.dst_sel_word = (dst_sel[0] & 7u) | ((dst_sel[1] & 7u) << 3) |
+                                      ((dst_sel[2] & 7u) << 6) | ((dst_sel[3] & 7u) << 9);
             }
             if (dst_sel_routed) {
                 // SQ_SEL 2 and 3 are reserved. Fail visible rather than guess a meaning for them.
@@ -6411,17 +6422,30 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         buf_op.how = "reject-dst-sel-reserved";
                         ok = false; return true;
                     }
+                // Table 31 says BUFFER_STORE_FORMAT_* takes DST SEL from the resource too, so the
+                // reject below is a known GAP rather than a settled contract -- it is the DIRECTION
+                // the document does not spell out that stops it. For a store the mapping runs the
+                // other way (which VDATA channel supplies each stored component), and a constant
+                // selector has no stated meaning on the way OUT at all. Rejecting drops the store
+                // visibly; applying the load's mapping unchanged would write components in the wrong
+                // order into guest memory, which nothing downstream could detect (#3549).
+                // CONFIDENCE: LOW on store routing.
+                //
+                // It is narrower than `dst_sel_routed` on purpose, and the difference is the common
+                // case rather than a corner: only a selector among components that PHYSICALLY EXIST
+                // can change the stored bytes. A three-component format's canonical selector is
+                // X/Y/Z/1 (0x3AC) -- the routine encoding every driver emits, and the shape GTA V's
+                // tables carry (#2481) -- whose SQ_SEL_1 in the W slot names no stored component at
+                // all. Gating the store on `dst_sel_routed` would have rejected every
+                // buffer_store_format_xyzw through an ordinary three-component descriptor, turning
+                // this fix into a draw-dropping regression wearing a fail-visible label.
                 if (is_store) {
-                    // Table 31 says BUFFER_STORE_FORMAT_* takes DST SEL from the resource too, so this
-                    // reject is a known GAP rather than a settled contract -- it is the direction the
-                    // document does not spell out that stops it here. For a store the mapping runs the
-                    // other way (which VDATA channel supplies each stored component), and a constant
-                    // selector has no stated meaning on the way OUT at all. Rejecting drops the store
-                    // visibly; applying the load's mapping unchanged would write components in the
-                    // wrong order into guest memory, which nothing downstream could detect.
-                    // CONFIDENCE: LOW on store routing -- tracked separately.
-                    buf_op.how = "reject-dst-sel-store";
-                    ok = false; return true;
+                    const uint32_t stored = fmt_ncomp < n ? fmt_ncomp : n;
+                    for (uint32_t k = 0; k < stored && k < 4u; ++k)
+                        if (dst_sel[k] != k + 4u) {
+                            buf_op.how = "reject-dst-sel-store";
+                            ok = false; return true;
+                        }
                 }
             }
             float norm = 0.0f;
