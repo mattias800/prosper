@@ -4046,6 +4046,23 @@ endif()
 # underneath, which separates concurrent ctest invocations from different
 # worktrees. The root is inside the build directory, never /tmp — see the
 # header for why that matters on this machine.
+# #3372: gpu_replay's two graphics shader dumps produce OPPOSITE things -- --dump-shader writes
+# prosper's recompiled SPIR-V, --dump-shader-raw writes the guest RDNA2 that fed it -- and the
+# flag names alone do not say which way round. An investigation read the RDNA2 out of the flag
+# whose name suggested SPIR-V and lost a session to it. The usage legend is the fix, so something
+# has to fail when the legend is dropped; nothing else in the tree can. Behavioural rather than a
+# source grep: it runs the real binary and reads what an operator would actually see.
+if(TARGET gpu_replay AND Python3_Interpreter_FOUND)
+  add_test(NAME gpu_replay_cli_contract
+           COMMAND "${Python3_EXECUTABLE}"
+                   "${CMAKE_SOURCE_DIR}/tools/gpu_replay/test_cli_contract.py")
+  # SKIP_RETURN_CODE so "gpu_replay was not built" reports as (Skipped) by name rather than as a
+  # pass -- the tool needs Vulkan and is genuinely absent in some environments.
+  set_tests_properties(gpu_replay_cli_contract PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+  set_property(TEST gpu_replay_cli_contract APPEND PROPERTY ENVIRONMENT
+    "PROSPER_GPU_REPLAY_BIN=$<TARGET_FILE:gpu_replay>")
+endif()
+
 #
 # This must stay at the very end of the file: it snapshots the DIRECTORY TESTS
 # property, so any add_test() below it would not be covered. A test that did get

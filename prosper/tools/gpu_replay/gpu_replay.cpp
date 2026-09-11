@@ -71,7 +71,7 @@ void usage(const char* argv0) {
                          "[--dump-rtt-seed ADDR PATH] "
                          "[--dump-shader DRAW:vs|fs PATH] [--dump-compute N PATH] "
                          "[--dump-compute-raw N PATH] "
-                         "[--dump-realized-shader DRAW:vs|vs-main|fs PATH] "
+                         "[--dump-shader-raw DRAW:vs|vs-main|fs PATH] "
                          "[--override-compute-spv N PATH] "
                          "[--dump-failed-shader FAILURE:STAGE PATH] "
                          "[--retry-failed-chain FAILURE] "
@@ -82,6 +82,20 @@ void usage(const char* argv0) {
                          "[--require-post-change] [--expect-post-hash HASH] "
                          "[--legacy-htile-before-stencil] "
                          "<capture.prgcap> [output.bmp]\n", argv0);
+    // #3372: these four flags dump two DIFFERENT things, and the names alone do not say
+    // which. Reading the guest RDNA2 out of a flag whose name suggested SPIR-V cost one
+    // investigation a session, so the synopsis above is not left to speak for itself.
+    std::fprintf(stderr,
+                 "\nshader dumps -- what each one WRITES:\n"
+                 "  --dump-shader DRAW:vs|fs PATH       prosper's recompiled SPIR-V\n"
+                 "  --dump-shader-raw DRAW:vs|vs-main|fs PATH\n"
+                 "                                      the guest's raw RDNA2 words that\n"
+                 "                                      fed it (accepted alias:\n"
+                 "                                      --dump-realized-shader)\n"
+                 "  --dump-compute N PATH               recompiled SPIR-V for dispatch N\n"
+                 "  --dump-compute-raw N PATH           the guest's raw RDNA2 for dispatch N\n"
+                 "\nPROSPER_SHADER_DUMP_SUCCESS is a live-renderer variable and does NOTHING\n"
+                 "here; use the per-draw flags above.\n");
 }
 
 std::vector<uint8_t> inspect_rtt_seed(const prosper::gpu::GpuCaptureRttSeed& seed) {
@@ -2152,6 +2166,17 @@ static bool clear_environment(const char* name) {
 }
 
 int main(int argc, char** argv) {
+    // #3372: every caller of maybe_dump_successful_shader() lives in the live executor
+    // (src/gpu/execute/gpu_executor.cpp); the replay path never reaches one. Saying so is not
+    // cosmetic -- an empty dump directory reads as "that program never compiled", which is
+    // exactly the trap src/gpu/diagnostics/AGENTS.md warns about.
+    if (std::getenv("PROSPER_SHADER_DUMP_SUCCESS"))
+        std::fprintf(stderr,
+                     "[gpureplay] PROSPER_SHADER_DUMP_SUCCESS is set but does NOTHING here: it is a\n"
+                     "            live-renderer variable, and gpu_replay does not reach its\n"
+                     "            hook. No file will be written for it. Use --dump-shader\n"
+                     "            DRAW:vs|fs (recompiled SPIR-V) or --dump-shader-raw\n"
+                     "            DRAW:vs|vs-main|fs (guest RDNA2) instead.\n");
     bool inspect = false, inspect_only = false, validate_only = false, allow_mismatch = false;
     bool recompile_raw = false;
     bool graph_only = false, bundle_zero_boundary = false, bundle_ds_summary = false;
@@ -2342,7 +2367,11 @@ int main(int argc, char** argv) {
         else if (std::string(argv[i]) == "--dump-shader" && i + 2 < argc) {
             shader_spec = argv[++i]; shader_path = argv[++i];
         }
-        else if (std::string(argv[i]) == "--dump-realized-shader" && i + 2 < argc) {
+        // #3372: --dump-shader-raw is the spelling that matches the --dump-compute /
+        // --dump-compute-raw pair, where -raw already means "the guest RDNA2 that fed it".
+        // --dump-realized-shader keeps working: it is cited in docs/ and in existing scripts.
+        else if ((std::string(argv[i]) == "--dump-shader-raw" ||
+                  std::string(argv[i]) == "--dump-realized-shader") && i + 2 < argc) {
             realized_shader_spec = argv[++i]; realized_shader_path = argv[++i];
         }
         else if (std::string(argv[i]) == "--dump-compute" && i + 2 < argc) {
