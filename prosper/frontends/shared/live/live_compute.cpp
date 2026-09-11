@@ -14,6 +14,7 @@
 #include "shared/rtt/rtt_scale.hpp"
 #include "shared/rtt/rtt_authority.hpp"
 #include "shared/device/vulkan_device_select.hpp"
+#include "shared/device/image_robustness.hpp"  // #3531: the recompiler's OOB image-read contract
 #include "shared/texture/write_watch_census.hpp"
 #include "shared/texture/write_watch_policy.hpp"
 #include "diagnostics/env_numeric.hpp"   // #3253: a typo must not select a different setting
@@ -1420,6 +1421,16 @@ VkDeviceSize compute_memory_pool_limit() {
     return limit;
 }
 
+// What the compute device this process runs on offers the recompiled storage-image path (#3531).
+// Written once by VulkanComputeContext::init(), on whichever of the two device paths it took, and
+// read by live_compute_storage_image_device(). A record rather than a member because the context is
+// constructed lazily at the first dispatch: a caller asking "did the shipped init acquire image
+// robustness?" must not be the thing that decides whether init has happened.
+LiveComputeStorageImageDevice& mutable_storage_image_device() {
+    static LiveComputeStorageImageDevice record;
+    return record;
+}
+
 struct VulkanComputeContext {
     VkInstance instance = VK_NULL_HANDLE;
     VkPhysicalDevice physical = VK_NULL_HANDLE;
@@ -1494,7 +1505,18 @@ struct VulkanComputeContext {
     // StorageImageRead/WriteWithoutFormat capabilities (raw uvec4 texel model — see
     // tests/fixtures/image_compute_runner.h, the exec-diff harness for that contract). When the device lacks
     // the features, image-binding dispatches are skipped loudly instead of creating an invalid device.
+    // Since #3531 it also requires image robustness: the recompiled read is issued for EXEC-inactive
+    // lanes whose coordinate may be out of range, which is defined only when the device enables
+    // robustImageAccess. `image_support` is assigned from `storage_image_features` and from nowhere
+    // else, on BOTH device paths, so the capability and the feature acquisition cannot drift apart.
     bool image_support = false;
+    // What the device this backend runs on actually offers the storage-image path. Written only by
+    // init(), from prosper::frontend::acquire_storage_image_device_features() on the own-device path
+    // and from the adopted device's published capabilities on the shared path. Exposed through
+    // live_compute_storage_image_device_features() so a test can assert the SHIPPED init acquired
+    // the feature, rather than asserting that some copy of the code would have.
+    prosper::frontend::StorageImageDeviceFeatures storage_image_features{};
+    bool storage_image_device_adopted = false;
     // Stage 1 of the descriptor lift (#2412): true when this compute device can express an indexed
     // descriptor array. Assigned on the own-device path below, and inherited from SharedVulkanContext on
     // the adopt path -- both are real assignments. An earlier revision of this comment claimed the
@@ -3292,7 +3314,19 @@ struct VulkanComputeContext {
             queue = static_cast<VkQueue>(shared.queue);
             queue_family = shared.queue_family;
             borrowed = true;
-            image_support = true;
+            // Storage-image capability is INHERITED, never assumed (#3531). The adopt condition above
+            // already required the two format-free features; image robustness is the third term of the
+            // same contract, and the renderer publishes whether it enabled it. Adoption itself still
+            // proceeds — a second private device would be no more robust than the first, and sharing
+            // is what lets a dispatch bind a renderer-owned image at all — but the storage-image path
+            // is declined loudly instead of executing the recompiler's deliberate out-of-range reads
+            // against a device where they are undefined.
+            storage_image_features = prosper::frontend::storage_image_device_features(
+                shared.image_robustness, shared.storage_image_read_without_format,
+                shared.storage_image_write_without_format);
+            storage_image_device_adopted = true;
+            image_support = storage_image_features.storage_image_capable();
+            mutable_storage_image_device() = {storage_image_features, true, true};
             // Inherit the descriptor-indexing capability from the device being adopted. Its absence was
             // the blocking review finding on #2458: the flag stayed false on the shared path -- which is
             // the normal path whenever a renderer exists -- even though the adopted device had the
@@ -3323,6 +3357,14 @@ struct VulkanComputeContext {
                 std::fprintf(stderr, "[compute] storage-buffer int64 atomics %s "
                                      "(inherited from the adopted device)\n",
                              shared.storage_buffer_int64_atomics ? "ENABLED" : "unavailable");
+                // Same both-directions rule for the OOB image contract (#3531). "unavailable" here
+                // means every storage-image dispatch will be declined, which is a large behavioural
+                // difference that must be readable from the log rather than inferred from a black
+                // frame.
+                std::fprintf(stderr, "[compute] image robustness %s -> recompiled storage-image "
+                                     "dispatches %s (inherited from the adopted device)\n",
+                             storage_image_features.robust_image_access ? "ENABLED" : "unavailable",
+                             image_support ? "enabled" : "DECLINED");
                 // Same both-directions rule, one field over -- and this one decides whether a whole
                 // class of kernel can compile at all. A shader that reads VCC or EXEC as scalar DATA
                 // is materialised from subgroupBallot, and only when the native subgroup IS the guest
@@ -3348,6 +3390,7 @@ struct VulkanComputeContext {
             instance = VK_NULL_HANDLE; physical = VK_NULL_HANDLE;
             device = VK_NULL_HANDLE; queue = VK_NULL_HANDLE;
             queue_family = UINT32_MAX; borrowed = false; image_support = false;
+            storage_image_features = {}; storage_image_device_adopted = false;
             native_subgroup_contract = false;
             min_native_subgroup_size = max_native_subgroup_size = 0;
             pipeline_cache = VK_NULL_HANDLE;
@@ -3392,10 +3435,12 @@ struct VulkanComputeContext {
         enabled.shaderInt64 = supported.shaderInt64;
         // The standalone device must enable the same gather capability as the shared renderer.
         enabled.shaderImageGatherExtended = supported.shaderImageGatherExtended;
-        // Image bindings (#590): enable the format-free storage-image features when available.
-        image_support = supported.shaderStorageImageReadWithoutFormat &&
-                        supported.shaderStorageImageWriteWithoutFormat;
-        if (image_support) {
+        // Image bindings (#590): enable the format-free storage-image features when available. The
+        // third term of the contract -- image robustness -- is acquired below, once the
+        // VkDeviceCreateInfo exists to chain it into.
+        const bool format_free_storage_images = supported.shaderStorageImageReadWithoutFormat &&
+                                                supported.shaderStorageImageWriteWithoutFormat;
+        if (format_free_storage_images) {
             enabled.shaderStorageImageReadWithoutFormat = VK_TRUE;
             enabled.shaderStorageImageWriteWithoutFormat = VK_TRUE;
         }
@@ -3437,6 +3482,20 @@ struct VulkanComputeContext {
         // allows replaying modules compiled against a known feature contract.
         std::fprintf(stderr, "[compute] storage-buffer int64 atomics %s (own device, core feature)\n",
                      private_storage_buffer_int64_atomics ? "ENABLED" : "unavailable");
+        // Image robustness (#3531). This device executes the SAME recompiled kernels as the
+        // renderer's, and those kernels read out of range from EXEC-inactive lanes by construction;
+        // the renderer chained this feature and this path did not, so every storage-image dispatch on
+        // a run with no live renderer -- boot_trace registers compute unconditionally, and one such
+        // run executed ~135,000 dispatches -- was undefined behaviour. Chained last so it extends
+        // whatever pNext chain the features above built, and declared here so it outlives
+        // vkCreateDevice.
+        VkPhysicalDeviceImageRobustnessFeatures image_robustness_features{};
+        storage_image_features = prosper::frontend::acquire_storage_image_device_features(
+            "compute", physical, format_free_storage_images, format_free_storage_images,
+            image_robustness_features, dci);
+        storage_image_device_adopted = false;
+        image_support = storage_image_features.storage_image_capable();
+        mutable_storage_image_device() = {storage_image_features, false, true};
 #ifdef __APPLE__
         // Spec-mandated on MoltenVK: enable VK_KHR_portability_subset when advertised (always is).
         { uint32_t ne = 0; vkEnumerateDeviceExtensionProperties(physical, nullptr, &ne, nullptr);
@@ -6384,11 +6443,24 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         return true;
     }
     if (has_storage_images && !ctx.image_support) {
+        // Name which term of the contract is missing. The two causes need different actions -- a
+        // device without the format-free features cannot express the texel model at all, while one
+        // without image robustness could execute the kernel and would be undefined doing it (#3531) --
+        // and a message naming only the first sent a reader looking at the wrong feature.
+        const bool robustness_only = ctx.storage_image_features.read_without_format &&
+                                     ctx.storage_image_features.write_without_format &&
+                                     !ctx.storage_image_features.robust_image_access;
         static bool warned = false;
         if (!warned) { warned = true;
-            std::fprintf(stderr, "[compute] device lacks shaderStorageImageRead/WriteWithoutFormat; "
-                                 "image-binding dispatches are skipped\n"); }
-        return decline("device-lacks-storage-image");
+            if (robustness_only)
+                std::fprintf(stderr, "[compute] device lacks robustImageAccess; image-binding "
+                                     "dispatches are skipped rather than executing the "
+                                     "recompiler's out-of-range reads undefined (#3531)\n");
+            else
+                std::fprintf(stderr, "[compute] device lacks shaderStorageImageRead/WriteWithoutFormat; "
+                                     "image-binding dispatches are skipped\n"); }
+        return decline(robustness_only ? "device-lacks-image-robustness"
+                                       : "device-lacks-storage-image");
     }
     std::sort(descriptors.begin(), descriptors.end(), [](const auto& a, const auto& b) {
         return a.binding < b.binding;
@@ -12335,6 +12407,10 @@ uint64_t live_compute_buffer_gpu_result_skips() {
 
 WriteWatchCensusSnapshot live_compute_write_watch_census() {
     return g_write_watch_census.snapshot();
+}
+
+LiveComputeStorageImageDevice live_compute_storage_image_device() {
+    return mutable_storage_image_device();
 }
 
 uint64_t live_compute_sampled_image_upload_skips() {

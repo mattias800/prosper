@@ -5834,13 +5834,22 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 const bool& is_atomic;
                 const ShaderResourceTable* rt;
                 const char* how = "unclassified";
+                // The resolved descriptor's DST_SEL word, or UINT32_MAX when this op never reached a
+                // resolved V# (#2869). It is on this line rather than behind its own switch so a
+                // census of routed descriptors carries its own denominator: every MUBUF FORMAT fetch
+                // that resolves prints a selector, so "no title routes a channel" is distinguishable
+                // from "the instrument never ran", which a log of the non-identity case alone is not.
+                uint32_t dst_sel_word = 0xFFFFFFFFu;
                 ~BufOpDisposition() {
                     if (!on) return;
+                    char sel[16] = "none";
+                    if (dst_sel_word != 0xFFFFFFFFu)
+                        std::snprintf(sel, sizeof(sel), "0x%03x", dst_sel_word & 0xfffu);
                     std::fprintf(stderr,
-                                 "[buf-op] program=0x%llx pc=%u %s op=0x%x n=%u store=%d atomic=%d rt=%d %s\n",
+                                 "[buf-op] program=0x%llx pc=%u %s op=0x%x n=%u store=%d atomic=%d rt=%d dstsel=%s %s\n",
                                  (unsigned long long)b.diagnostic.program_address, in.pc,
                                  in.fmt == Rdna2Format::MUBUF ? "MUBUF" : "MTBUF", in.opcode, n,
-                                 (int)is_store, (int)is_atomic, (int)(rt != nullptr), how);
+                                 (int)is_store, (int)is_atomic, (int)(rt != nullptr), sel, how);
                 }
             } buf_op{std::getenv("PROSPER_DBG") != nullptr, b, in, n, is_store, is_atomic, rt};
             uint32_t offset = in.literal & 0xFFFu;
@@ -6379,6 +6388,66 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 resolved_buffer->num_components == 1u && resolved_buffer->stride == 2u &&
                 resolved_buffer->size == 2u && idxen && !offen && offset == 0u && zero_soffset &&
                 !folded_vfetch && in.src[0].kind == OperandKind::VGPR;
+            // V# DST_SEL channel routing (#2869). The descriptor names, per RETURNED channel, which
+            // STORED component it takes -- SQ_SEL 4/5/6/7 = R/G/B/A -- or that the channel is the
+            // constant 0 (SQ_SEL_0) or the constant 1 (SQ_SEL_1); 2 and 3 are reserved. WHICH ops
+            // apply it is not a matter of inference: RDNA2 ISA (document 70648) sec. 8.1.4 "Buffer
+            // Data" states "Dst_sel comes from the resource, but is ignored for many operations", and
+            // its Table 31 "Buffer Instructions" gives the whole partition in one column --
+            //
+            //     BUFFER_LOAD_FORMAT_* / BUFFER_STORE_FORMAT_*  ->  DST SEL = resource
+            //     TBUFFER_LOAD_FORMAT_* / TBUFFER_STORE_FORMAT_* -> DST SEL = identity
+            //     BUFFER_LOAD_<type> / BUFFER_STORE_<type> / BUFFER_ATOMIC_* -> DST SEL = identity
+            //
+            // -- where the same table defines identity as "X000, XY00, XYZ0, or XYZW" by the data
+            // format's component count. So MTBUF is genuinely exempt, which is why this is gated on
+            // MUBUF and not merely on `is_format`, and a raw load ignores the field entirely. That
+            // also reconciles the two comments #2869 was filed over: both were true, of different
+            // instruction families. Until this landed no format lowering consulted `res->swizzle` at
+            // all (and no V# ever populated it), so a routed MUBUF descriptor returned the STORED
+            // order -- a plausible wrong picture, with no reject and no diagnostic.
+            uint32_t dst_sel[4] = {4u, 5u, 6u, 7u};
+            bool dst_sel_routed = false;   // some requested channel is not its identity source
+            if (is_format && in.fmt == Rdna2Format::MUBUF && resolved_buffer) {
+                for (uint32_t k = 0; k < 4u; ++k) dst_sel[k] = resolved_buffer->swizzle[k];
+                for (uint32_t k = 0; k < n && k < 4u; ++k)
+                    if (dst_sel[k] != k + 4u) dst_sel_routed = true;
+                buf_op.dst_sel_word = (dst_sel[0] & 7u) | ((dst_sel[1] & 7u) << 3) |
+                                      ((dst_sel[2] & 7u) << 6) | ((dst_sel[3] & 7u) << 9);
+            }
+            if (dst_sel_routed) {
+                // SQ_SEL 2 and 3 are reserved. Fail visible rather than guess a meaning for them.
+                for (uint32_t k = 0; k < n && k < 4u; ++k)
+                    if (dst_sel[k] == 2u || dst_sel[k] == 3u) {
+                        buf_op.how = "reject-dst-sel-reserved";
+                        ok = false; return true;
+                    }
+                // Table 31 says BUFFER_STORE_FORMAT_* takes DST SEL from the resource too, so the
+                // reject below is a known GAP rather than a settled contract -- it is the DIRECTION
+                // the document does not spell out that stops it. For a store the mapping runs the
+                // other way (which VDATA channel supplies each stored component), and a constant
+                // selector has no stated meaning on the way OUT at all. Rejecting drops the store
+                // visibly; applying the load's mapping unchanged would write components in the wrong
+                // order into guest memory, which nothing downstream could detect (#3549).
+                // CONFIDENCE: LOW on store routing.
+                //
+                // It is narrower than `dst_sel_routed` on purpose, and the difference is the common
+                // case rather than a corner: only a selector among components that PHYSICALLY EXIST
+                // can change the stored bytes. A three-component format's canonical selector is
+                // X/Y/Z/1 (0x3AC) -- the routine encoding every driver emits, and the shape GTA V's
+                // tables carry (#2481) -- whose SQ_SEL_1 in the W slot names no stored component at
+                // all. Gating the store on `dst_sel_routed` would have rejected every
+                // buffer_store_format_xyzw through an ordinary three-component descriptor, turning
+                // this fix into a draw-dropping regression wearing a fail-visible label.
+                if (is_store) {
+                    const uint32_t stored = fmt_ncomp < n ? fmt_ncomp : n;
+                    for (uint32_t k = 0; k < stored && k < 4u; ++k)
+                        if (dst_sel[k] != k + 4u) {
+                            buf_op.how = "reject-dst-sel-store";
+                            ok = false; return true;
+                        }
+                }
+            }
             float norm = 0.0f;
             switch (fmt) {
                 case DataFormat::Unorm8:  norm = 255.0f;   break;
@@ -6609,13 +6678,13 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // above when in-dword-provable; anything else that can't pack (packed_word, or an
                 // integer field that could straddle) rejects rather than mis-store.
                 if (packed_word || (packed && (is_uint || is_sint))) { ok = false; return true; }
-                // MTBUF's instruction format owns the physical component count. A wider opcode still
-                // reads only those components (for example XY00), so Z/W must not spill into adjacent
-                // memory. NOTE (#2869): "selection" here is the COMPONENT COUNT, not the descriptor's
-                // DST_SEL channel routing -- those are separate V# fields, and MTBUF overriding the
-                // format field says nothing about the selector one. `shader_resources.cpp:210` calls
-                // DST_SEL "a FORMAT-fetch control" and binds it on possibly-typed consumers; no format
-                // lowering here consults it at all. Do not read this line as settling that.
+                // MTBUF's instruction format owns the physical component COUNT, and a wider opcode
+                // still writes only those components (for example XY00), so Z/W must not spill into
+                // adjacent memory. This line is about the COUNT, but the identity claim it makes is
+                // now settled rather than assumed: RDNA2 ISA Table 31 gives TBUFFER_STORE_FORMAT_* a
+                // DST SEL of "identity", so an MTBUF store really does ignore the descriptor's
+                // routing, while BUFFER_STORE_FORMAT_* does not and reaches `reject-dst-sel-store`
+                // above when routed (#2869). Everything below is therefore identity routing.
                 const uint32_t store_n = in.fmt == Rdna2Format::MTBUF && fmt_ncomp < n
                                            ? fmt_ncomp : n;
                 if (!packed) {
@@ -6653,16 +6722,32 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 int d = in.dst.value + (int)k;
                 uint32_t old = vreg_old(b, rs, d);
                 uint32_t value;
+                // DST_SEL (#2869): `sk` is the STORED component this RETURNED channel k takes. Every
+                // branch below addresses memory by `sk` and writes VGPR `d`, which stays keyed on k,
+                // so a permutation costs nothing but an index substitution. `sel_const` is SQ_SEL_0 /
+                // SQ_SEL_1, which name a constant instead of a component and read no memory at all.
+                // `dst_sel_routed` is false for MTBUF and for every raw op, so `sk == k` there and
+                // this whole mechanism is inert -- see the Table 31 partition above.
+                const uint32_t sel = dst_sel_routed && k < 4u ? dst_sel[k] : k + 4u;
+                const bool sel_const = sel < 4u;
+                const uint32_t sk = sel_const ? k : sel - 4u;
                 // Format default-fill (#368): a requested component beyond the format's component
                 // count is not read from adjacent memory. MUBUF takes the ABSENT-component default
                 // from the V# contract (0 for G/B/Z, 1 for A/W). MTBUF's instruction format names the
                 // present components directly (X000/XY00/XYZ0/XYZW), so every absent one is zero.
                 // NOTE (#2869): this is about which components EXIST, not about how the descriptor
-                // routes the ones that do -- DST_SEL is a separate field and no format lowering in
-                // this file reads it. Not a statement that a typed fetch ignores DST_SEL.
-                if (is_format && fmt_ncomp && k >= fmt_ncomp) {
+                // routes the ones that do -- DST_SEL is a separate field, applied just above. The
+                // absent-component test therefore asks about the ROUTED source `sk`, not about k.
+                // MUBUF's absent-W default of 1 predates DST_SEL support (#368) and is kept: a real
+                // three-component descriptor spells that with SQ_SEL_1 and now takes the `sel_const`
+                // branch instead, while a descriptor prosper could not recover falls back here.
+                if (sel_const) {
+                    // SQ_SEL_0 -> 0; SQ_SEL_1 -> the format's own one, exactly as the absent-component
+                    // default below spells it: integer 1 for an integer format, float 1.0 otherwise.
+                    value = b.uconst(sel == 1u ? (fmt_is_int ? 1u : 0x3f800000u) : 0u);
+                } else if (is_format && fmt_ncomp && sk >= fmt_ncomp) {
                     uint32_t one = fmt_is_int ? 1u : 0x3f800000u;   // integer 1 vs float 1.0 (raw bits)
-                    value = b.uconst(in.fmt != Rdna2Format::MTBUF && k == 3 ? one : 0u);
+                    value = b.uconst(in.fmt != Rdna2Format::MTBUF && sk == 3 ? one : 0u);
                 } else if (one_record_16bit_tail) {
                     const uint32_t packed_value = b.cbuf_load_zero_padded_tail(
                         binding, one_record_tail_semantic, coherent_load);
@@ -6696,16 +6781,16 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         ? b.bfe_s(joined, b.uconst(0), b.uconst(raw_bits))
                         : b.bfe_u(joined, b.uconst(0), b.uconst(raw_bits));
                 } else if (!packed) {
-                    uint32_t kidx = k ? b.ibin(Op_IAdd, idx, b.uconst(k)) : idx;
+                    uint32_t kidx = sk ? b.ibin(Op_IAdd, idx, b.uconst(sk)) : idx;
                     value = load_dword(kidx);  // raw 32-bit component
                 } else if (packed_word) {
                     // All requested components share one packed dword. GFX10 names layouts from high
                     // field to low field, so 2_10_10_10 is logical R/G/B in bits 0/10/20 and A in 30;
                     // 10_11_11 is R/G/B in bits 0/11/22 with widths 11/11/10.
                     uint32_t dw = load_dword(idx);
-                    uint32_t boff = packed_10_11_11 ? (k == 0 ? 0u : k == 1 ? 11u : 22u)
-                                                    : (k == 0 ? 0u : k == 1 ? 10u : k == 2 ? 20u : 30u);
-                    uint32_t bits = packed_10_11_11 ? (k < 2 ? 11u : 10u) : (k < 3 ? 10u : 2u);
+                    uint32_t boff = packed_10_11_11 ? (sk == 0 ? 0u : sk == 1 ? 11u : 22u)
+                                                    : (sk == 0 ? 0u : sk == 1 ? 10u : sk == 2 ? 20u : 30u);
+                    uint32_t bits = packed_10_11_11 ? (sk < 2 ? 11u : 10u) : (sk < 3 ? 10u : 2u);
                     if (packed_10_11_11) {
                         value = b.unpack_ufloat(dw, boff, bits);
                     } else if (is_uint) {
@@ -6721,7 +6806,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     // Float16 component k at byte address addr+k*2. Join the following dword when
                     // the field begins at byte 3; masking the inverse shift avoids SPIR-V's undefined
                     // shift-by-32 case, and the select discards that word when shift==0.
-                    const uint32_t caddr = k ? b.ibin(Op_IAdd, addr, b.uconst(k * 2)) : addr;
+                    const uint32_t caddr = sk ? b.ibin(Op_IAdd, addr, b.uconst(sk * 2)) : addr;
                     const uint32_t cidx  = b.ibin(Op_ShiftRightLogical, caddr, b.uconst(2));
                     const uint32_t shift = b.ibin(Op_ShiftLeftLogical,
                                                   b.ibin(Op_BitwiseAnd, caddr, b.uconst(3)), b.uconst(3));
@@ -6741,7 +6826,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     // shift the loaded dword right by (byteaddr&3)*8, join the next dword when a 16-bit
                     // field straddles the boundary, then extend or normalize the low field. Mirrors the
                     // raw_subword path but per packed component (stride-1 Uint8, unaligned u16/SNORM16).
-                    const uint32_t caddr = k ? b.ibin(Op_IAdd, addr, b.uconst(k * comp_bytes)) : addr;
+                    const uint32_t caddr = sk ? b.ibin(Op_IAdd, addr, b.uconst(sk * comp_bytes)) : addr;
                     const uint32_t cidx  = b.ibin(Op_ShiftRightLogical, caddr, b.uconst(2));
                     const uint32_t shift = b.ibin(Op_ShiftLeftLogical,
                                                   b.ibin(Op_BitwiseAnd, caddr, b.uconst(3)), b.uconst(3));
@@ -6761,8 +6846,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         : is_sint ? b.bfe_s(joined, b.uconst(0), b.uconst(comp_bytes * 8))
                                   : b.bfe_u(joined, b.uconst(0), b.uconst(comp_bytes * 8));
                 } else {
-                    // Component k lives at byte k*comp_bytes within the element: pick its dword + field.
-                    uint32_t byte_off = k * comp_bytes;
+                    // Source component sk lives at byte sk*comp_bytes within the element: pick its
+                    // dword + field.
+                    uint32_t byte_off = sk * comp_bytes;
                     uint32_t drel = byte_off / 4, boff = (byte_off % 4) * 8;
                     uint32_t did = drel ? b.ibin(Op_IAdd, idx, b.uconst(drel)) : idx;
                     uint32_t dw  = load_dword(did);

@@ -207,7 +207,10 @@ bool valid_shader_buffer_table_contract(const ShaderResource& resource) {
             return false;
     }
 
-    // DST_SEL is a FORMAT-fetch control: it names which component each returned channel takes. The
+    // DST_SEL is a FORMAT-fetch control: it names which component each returned channel takes. That
+    // reading is confirmed rather than assumed — RDNA2 ISA (document 70648) Table 31 gives
+    // BUFFER_LOAD_FORMAT_* / BUFFER_STORE_FORMAT_* a DST SEL of "resource", and everything else
+    // (TBUFFER_*, raw loads/stores, atomics) "identity" (#2869). The
     // dynamic-scalar-offset selection is admitted for untyped loads only — the emitter rejects a
     // typed fetch, store or atomic through a selected descriptor — and an untyped load moves raw
     // dwords regardless of the descriptor's declared swizzle. So for that mode the swizzle cannot

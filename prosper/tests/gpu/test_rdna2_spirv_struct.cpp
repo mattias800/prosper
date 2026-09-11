@@ -6915,7 +6915,11 @@ int main() {
             ins(b, 335, {1, 10, 6, 9});
             ins(b, 247, {22, 0});
             ins(b, 250, {10, 21, 22});
-            ins(b, 248, {21}); ins(b, atomic_op, {30, 39, 34, 6, 6, 31}); ins(b, 249, {22});
+            ins(b, 248, {21});
+            // OpAtomicLoad takes no Value operand, so its region form is five words.
+            if (atomic_op == 227) ins(b, 227, {30, 39, 34, 6, 6});
+            else ins(b, atomic_op, {30, 39, 34, 6, 6, 31});
+            ins(b, 249, {22});
             ins(b, 248, {22}); ins(b, 62, {5, 11}); ins(b, 253, {});
             return b;
         };
@@ -6990,6 +6994,12 @@ int main() {
             ins(b, 32, {33, kStorageBuffer, 30}); ins(b, 59, {33, 34, kStorageBuffer});
             ins(b, 248, {20}); ins(b, 61, {1, 9, 8});
             if (op == 0) ins(b, 63, {34, 8});                 // OpCopyMemory into the buffer
+            // OpAtomicLoad is the one atomic with NO Value operand -- five words where every
+            // other atomic has six. That absence is the argument in one line: an instruction
+            // carrying no value cannot store one, so this module writes nothing and its storage
+            // buffer stays uniform. Its control is the six-word `op` below, reached with 234:
+            // the same module, one opcode away, and it must still be refused.
+            else if (op == 227) ins(b, 227, {30, 39, 34, 6, 6});   // OpAtomicLoad: a pure read
             else ins(b, op, {30, 39, 34, 6, 6, 31});          // ...or an atomic on it
             ins(b, 335, {1, 10, 6, 9});
             ins(b, 62, {5, 10});
@@ -7043,6 +7053,13 @@ int main() {
             {"a vote-guarded region performing an INTEGER atomic", region_atomic(234), false},
             {"a vote-guarded region performing a FLOAT atomic outside the old range",
              region_atomic(6035), false},
+            // ...and the half that must NOT move. An atomic load writes nothing, but whether it
+            // RUNS is still the vote's answer, and it still participates in the draw's memory
+            // ordering -- so it stays an observable effect and the region stays refused. If this
+            // flipped with the row above, the exclusion had been put in the observable predicate
+            // instead of in the writes-memory subtraction, which is the permissive mistake.
+            {"a vote-guarded region performing an atomic LOAD, which writes nothing",
+             region_atomic(227), false},
             {"a vote-guarded region whose store is read back through a second chain",
              region_second_chain, false},
             {"a vote-derived value written to a UAV by an atomic",
@@ -7059,6 +7076,13 @@ int main() {
              buffer_written_by(234), false},
             {"a vote over a buffer this shader writes with OpCopyMemory",
              buffer_written_by(0), false},
+            // The loosening direction, and its own control. An atomic LOAD writes nothing, so
+            // the buffer it reads is still a constant as far as this draw is concerned and the
+            // vote clears on arm (a). The refusing twin two rows up is the same module with one
+            // opcode changed; without both, "admits the load" and "admits every atomic" are the
+            // same observation.
+            {"a vote over a buffer this shader only ATOMICALLY LOADS",
+             buffer_written_by(227), true},
             {"a barrier is observable but is not a memory write", barrier_only, true},
             {"a UNIFORM vote guarding a store to the colour output",
              branch_only(kStorageBuffer), true},

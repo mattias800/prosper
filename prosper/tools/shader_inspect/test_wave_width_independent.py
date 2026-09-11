@@ -299,6 +299,11 @@ def mod_region_performs_atomic(op):
     `op` is the whole experiment: `OpAtomicIAdd` (234) sits inside the numeric window the observable
     check used, `OpAtomicFAddEXT` (6035) does not, and the modules are otherwise identical -- so a
     membership test written as a range admitted one and refused the other.
+
+    `OpAtomicLoad` (227) writes nothing and must STILL be refused here: whether it runs is the
+    vote's answer and it participates in the draw's memory ordering, so it stays an observable
+    effect. If that row flips, the exclusion went into the observable predicate instead of into
+    the writes-memory subtraction. It takes no Value operand, so its form is one word shorter.
     """
     b = (preamble(SC_INPUT)
          + inst(21, 30, 32, 0) + inst(43, 30, 31, 4)
@@ -307,7 +312,10 @@ def mod_region_performs_atomic(op):
          + inst(335, 1, 10, 6, 9)
          + inst(247, 22, 0)
          + inst(250, 10, 21, 22)
-         + inst(248, 21) + inst(op, 30, 39, 34, 6, 6, 31) + inst(249, 22)
+         + inst(248, 21)
+         + (inst(227, 30, 39, 34, 6, 6) if op == 227
+            else inst(op, 30, 39, 34, 6, 6, 31))
+         + inst(249, 22)
          + inst(248, 22) + inst(62, 5, 11) + inst(253))
     return module(PRE_IDS + [10, 20, 21, 22, 30, 31, 33, 34, 39], b)
 
@@ -382,12 +390,19 @@ def mod_uniform_source_written_by(op):
     the others moved on, so an OpAtomicFAddEXT (6035) counted as no write at all while the identical
     module using OpAtomicIAdd (234) counted. `op` 0 means OpCopyMemory into the buffer, which the
     same predicate had never heard of.
+
+    `op` 227 is OpAtomicLoad, the one atomic that only reads -- five words, because it is the one
+    atomic with no Value operand at all. This module writes nothing, so its buffer is still a
+    constant as far as the draw is concerned and the vote must be ADMITTED. The 234 spelling is
+    the same module one opcode away and must stay refused; without the pair, "admits the load"
+    and "admits every atomic" are the same observation.
     """
     b = (preamble(SC_STORAGE_BUFFER)
          + inst(21, 30, 32, 0) + inst(43, 30, 31, 4)
          + inst(32, 33, SC_STORAGE_BUFFER, 30) + inst(59, 33, 34, SC_STORAGE_BUFFER)
          + entry()
          + (inst(63, 34, 8) if op == 0                  # OpCopyMemory into the buffer
+            else inst(227, 30, 39, 34, 6, 6) if op == 227   # ...a pure atomic READ, five words
             else inst(op, 30, 39, 34, 6, 6, 31))        # ...or an atomic on it
          + inst(335, 1, 10, 6, 9)                       # vote over the buffer-derived load
          + inst(62, 5, 10)
@@ -500,6 +515,8 @@ def main() -> int:
                    mod_region_performs_atomic(234))
     expect_refused("a vote-guarded region performing a FLOAT atomic (outside the old range)",
                    mod_region_performs_atomic(6035))
+    expect_refused("a vote-guarded region performing an atomic LOAD, which writes nothing",
+                   mod_region_performs_atomic(227))
     expect_refused("a vote-guarded region whose store is read back through a second chain",
                    mod_region_stores_through_second_chain())
     expect_refused("a vote-derived value written to a UAV by an atomic",
@@ -541,6 +558,11 @@ def main() -> int:
                     mod_slot_through_copyobject(tainted_store=False))
     expect_admitted("a barrier is observable but is not a memory write",
                     mod_barrier_is_not_a_write())
+    # The same shape one opcode over, and the loosening direction of this whole predicate. The
+    # refusing twin is mod_uniform_source_written_by(234) above; the region twin is
+    # mod_region_performs_atomic(227), which must STAY refused.
+    expect_admitted("an atomic LOAD is observable but is not a memory write",
+                    mod_uniform_source_written_by(227))
 
     # A module the tool cannot parse must never be counted as proven.
     with tempfile.TemporaryDirectory() as tmp:

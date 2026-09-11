@@ -73,6 +73,12 @@ def armed_callee(name: str) -> bool:
 ENV_READERS = frozenset((
     "getenv", "std_getenv",
     "env_u64_or_default", "env_u64_or_default_capped",
+    # The rest of env_numeric.hpp's entry points, on the same argument: each takes the variable's
+    # NAME as a literal first argument purely so a refusal can name it. The first four were listed
+    # when they were the only ones; the _auto family, env_u64_or_report and env_tristate_or_unset
+    # (#3304) were not, and the heuristic above counts any callee containing "env" as a WRITE.
+    "env_u64_or_default_auto", "env_u64_or_default_auto_capped",
+    "env_u64_or_report", "env_tristate_or_unset",
 ))
 
 SCAN_DIRS = ("src", "frontends", "tools", "tests")

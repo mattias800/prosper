@@ -1,6 +1,7 @@
 #pragma once
 #include "gpu/execute/gpu_execute.hpp"
 #include "shared/compute/compute_image_borrow_census.hpp"
+#include "shared/device/storage_image_contract.hpp"  // #3531: the OOB image-read contract
 #include "shared/texture/write_watch_census.hpp"
 
 #include <cstddef>
@@ -311,6 +312,22 @@ void live_compute_record_image_borrow_renderer_verdict(bool accepted);
 // Monotonic diagnostic count of retained sampled-image hits whose validated source omitted upload.
 // Capture/replay tests use this to prove residency without relying on timing-sensitive assertions.
 uint64_t live_compute_sampled_image_upload_skips();
+// What the compute backend's Vulkan device actually offers the recompiled storage-image path
+// (#3531), as acquired by its init: `adopted` distinguishes the renderer's shared device from this
+// backend's own. `features.storage_image_capable()` is the exact predicate every storage-image
+// dispatch is gated on, and `robust_image_access` is the term that was silently missing on the
+// own-device path -- the recompiler reads out of range from EXEC-inactive lanes by design, which is
+// defined only when the device enabled robustness.
+//
+// Exposed so a test can assert the SHIPPED init acquired the feature on the device the run really
+// uses, rather than asserting that a harness's copy of the device-creation code would have. Returns
+// a default-constructed (all false) record when the backend has not initialized a device.
+struct LiveComputeStorageImageDevice {
+    StorageImageDeviceFeatures features{};
+    bool adopted = false;
+    bool initialized = false;
+};
+LiveComputeStorageImageDevice live_compute_storage_image_device();
 // True only when an ordinary guest-backed 2D sampled image uses the same native Vulkan texel
 // representation as its typed storage counterpart. This is the format half of the retained-image
 // transfer contract; resource identity and write authority are checked separately at runtime.

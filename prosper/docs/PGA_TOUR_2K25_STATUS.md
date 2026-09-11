@@ -84,6 +84,16 @@ modules), so the range selects the real `module_start` and never a C++ static co
 
 ## The current blocker
 
+> **Updated 2026-09-11 (#2894).** The libSceHttp2 false success described below is **fixed**:
+> `src/hle/net/hle_http2.cpp` now implements the library — real ids for the local objects, recorded
+> state for the setters, and a libSceNet `ENETUNREACH` from `sceHttp2SendRequest` with every
+> response getter failing and leaving its out-parameters untouched. **What that does NOT establish
+> is where this title now stops.** The change was written and tested on a machine with no
+> `PPSA17952` dump and no PS5, so no boot was run for it and the fault at `eboot+0x142d5e0` is
+> *predicted* to be gone rather than *observed* to be gone. The rung stays 0 until somebody with
+> the dump re-runs the route in `## Reproduction route` and records what they see. Everything below
+> is the pre-fix record of how the fault was reached, and is left as written.
+
 With the handshake fixed the title runs ~6x longer and reaches GPU submission, then dies on a
 **worker thread named `Background Job.`**:
 

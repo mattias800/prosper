@@ -2945,7 +2945,6 @@ HLE(s_np_check_avail) { svc_log("sceNpCheckNpAvailability", a0,a1,a2,a3,a4,a5); 
 namespace {
 std::atomic<int32_t> g_net_pool_id{1};
 std::atomic<int32_t> g_ssl_context_id{1};
-std::atomic<int32_t> g_http2_context_id{1};
 std::atomic<int32_t> g_npweb_context_id{1};
 std::atomic<int32_t> g_npweb_user_context_id{1001};
 }
@@ -2958,10 +2957,6 @@ HLE(s_ssl_init) {
     svc_log("sceSslInit", a0,a1,a2,a3,a4,a5);
     if (!a0) return 0x8094000cull; // SCE_SSL_ERROR_OUT_OF_SIZE
     return (uint64_t)(uint32_t)g_ssl_context_id.fetch_add(1);
-}
-HLE(s_http2_init) {
-    svc_log("sceHttp2Init", a0,a1,a2,a3,a4,a5);
-    return (uint64_t)(uint32_t)g_http2_context_id.fetch_add(1);
 }
 HLE(s_npweb_init) {
     svc_log("sceNpWebApi2Initialize", a0,a1,a2,a3,a4,a5);
@@ -5626,7 +5621,8 @@ void register_service_hle() {
     Hle::register_fn("0cBgduPRR+M", (HleFn)s_netctl_getresult, "sceNetCtlGetResult");
     Hle::register_fn("dgJBaeJnGpo", (HleFn)s_net_pool_create, "sceNetPoolCreate");
     Hle::register_fn("hdpVEUDFW3s", (HleFn)s_ssl_init, "sceSslInit");
-    Hle::register_fn("3JCe3lCbQ8A", (HleFn)s_http2_init, "sceHttp2Init");
+    // libSceHttp2 lives in src/hle/net/hle_http2.cpp now, sceHttp2Init with it (#2894): the
+    // context it returns is a slot that library's own create path validates against.
     Hle::register_fn("+o9816YQhqQ", (HleFn)s_npweb_init, "sceNpWebApi2Initialize");
     Hle::register_fn("sk54bi6FtYM", (HleFn)s_npweb_create_user_context,
                      "sceNpWebApi2CreateUserContext");
