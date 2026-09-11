@@ -6979,6 +6979,13 @@ HLE(k_pool_decommit) {
     // NINJA GAIDEN 4 loses nothing to this: its observed decommits are already 64 KiB-aligned with
     // 64 KiB-multiple lengths (`addr=0x1001010000 len=0x3f0000`, `addr=0x1000ee0000 len=0x10000`).
     constexpr uint64_t kCommitGranule = 0x10000ull;
+    // THE GRANULE RATIONALE ABOVE IS THE LINUX ONE, and this half's number is not the same: Windows'
+    // lazy-commit path works in 16 KiB, not 64 KiB (exec_image_win.cpp). 64 KiB is kept here anyway
+    // because it is a SUPERSET -- a 64 KiB-aligned inward-rounded span is also 16 KiB-aligned, so the
+    // hazard is covered either way, and one granule keeps the two halves answering the same question
+    // identically. The cost is that Windows releases slightly less than a 16 KiB-granular caller
+    // asks for. Stated here, before the text it corrects, because a reader meets that text first.
+    // Raised in review of #3530.
     // Overflow first, and BOTH ends of it. The replaced code used normalize_guest_page_range, which
     // checks its own round-up; rounding by hand dropped that, and the omission is not benign here --
     // `sceKernelMemoryPoolDecommit(-16, 8, 0)` wraps `base` to 0 and yields a length of nearly 2^64,
@@ -7002,12 +7009,6 @@ HLE(k_pool_decommit) {
     const uint64_t len = end - base;
     uint64_t released = 0;
     for (const auto& part : committed_parts_in(base, len)) {
-        // NOTE ON THE GRANULE, because the rationale above is the LINUX one and this half's is not the
-    // same number: Windows' lazy-commit path works in 16 KiB, not 64 KiB (exec_image_win.cpp). 64 KiB
-    // is kept here anyway because it is a SUPERSET -- a 64 KiB-aligned inward-rounded span is also
-    // 16 KiB-aligned, so the hazard is covered either way, and one granule keeps the two halves
-    // answering the same question identically. The cost is that Windows releases slightly less than
-    // it could for a 16 KiB-granular caller. Raised in review of #3530.
     // win_unmap restores the Windows PLACEHOLDER it cut the view out of, so the address space
         // stays claimed here without the explicit re-reservation the POSIX arm needs. Recorded
         // because the two halves therefore look different while implementing the same contract.

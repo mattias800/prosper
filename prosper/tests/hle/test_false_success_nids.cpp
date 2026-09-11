@@ -566,9 +566,11 @@ void test_pool_decommit() {
     if (foreign_raw != MAP_FAILED) {
         const uint64_t foreign =
             ((uint64_t)(uintptr_t)foreign_raw + kGranule - 1) & ~(kGranule - 1);
-        CHECK((foreign & (kGranule - 1)) == 0,
-              "fixture positive control: the untracked mapping is granule-aligned, so the request "
-              "really reaches the tracker");
+        // No CHECK on the alignment: `foreign` is produced by `& ~(kGranule - 1)` on the line above,
+        // so an assertion on it cannot fail for any input — including MAP_FAILED. It would read as a
+        // positive control and be a tautology, which is worse than having none because it launders
+        // the arm below. Alignment is guaranteed by CONSTRUCTION here, and the ×3 over-allocation is
+        // what makes `foreign + kGranule` always fall inside the mapping. Raised in review of #3530.
         *(volatile uint32_t*)(uintptr_t)foreign = 0xC3C3C3C3u;
         decommit(foreign, kGranule, 0, 0, 0, 0);
         CHECK(*(volatile uint32_t*)(uintptr_t)foreign == 0xC3C3C3C3u,
@@ -605,20 +607,23 @@ void test_pool_decommit() {
     // Both arms must be here. A span that wraps and a base whose ROUND-UP wraps are different
     // predicates, and the first version of the guard had only the first — so an arm testing just
     // `(-1, 2)` would have passed against the broken code.
-    //
-    // WHAT THE MUTATION LOOKS LIKE, so nobody reads a crash as a broken test: dropping the round-up
-    // guard does not print `[FAIL]`, it kills the process with SIGSEGV (measured: exit 139). That is
-    // the arm working — the handler unmaps the pages the test itself is running on. ctest scores it
-    // as a failure either way; the distinction is only for whoever runs the mutation by hand.
+
     CHECK(decommit(~0ull - 15, 8, 0, 0, 0, 0) == kEinvalPool,
           "an address whose granule ROUND-UP overflows is EINVAL, not a whole-process unmap "
           "(mutation: drop the round-up guard -> this returns 0)");
-    CHECK(decommit(~0ull - 1, 4, 0, 0, 0, 0) == kEinvalPool,
-          "a span that itself overflows is EINVAL");
-    // The process is still alive and the re-committed page above still readable — which is the
-    // consequence the overflow arms exist to prevent, checked rather than assumed.
-    CHECK(*(volatile uint32_t*)(uintptr_t)base == 0x5A5A5A5Au,
-          "an overflowing decommit released NOTHING (mutation: drop the guard -> this faults)");
+    // Isolating the SPAN guard needs a base the round-up guard admits, or the round-up guard
+    // subsumes it and deleting the span check leaves the suite green — which is what `(-2, 4)` did.
+    CHECK(decommit(kGranule, ~0ull, 0, 0, 0, 0) == kEinvalPool,
+          "a span that itself overflows is EINVAL, on a base the round-up guard accepts "
+          "(mutation: drop the span guard -> this returns 0)");
+    // The consequence the overflow arms exist to prevent, checked rather than assumed — and checked
+    // through the TRACKER rather than by dereferencing the page. Both detect the mutation, but a
+    // dereference detects it by SIGSEGV, and stdout is fully buffered under ctest's pipe, so the
+    // crash discards the [FAIL] lines already printed and exit 139 cannot say WHICH property broke.
+    // The probe reads 2 (committed) here and 1 (reservation) once an overflowing decommit has
+    // wrongly released it. Raised in review of #3530.
+    CHECK(prosper_reserved_range_state(base) == 2,
+          "an overflowing decommit released NOTHING (mutation: drop a guard -> this reads 1)");
 }
 
 int main() {
