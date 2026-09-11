@@ -424,6 +424,17 @@ if(Python3_Interpreter_FOUND)
   # guards a state this repository produces routinely, since every lane pushes after CI starts.
   add_test(NAME pr_merge_gate
            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/ci/test_pr_merge_gate.py")
+  # pr_body.py answers "is the PR body actually what I published?" (#2918). `gh pr edit --body-file`
+  # was observed returning rc=1 on a GraphQL projects-deprecation error WITHOUT applying the edit,
+  # leaving a stale body the author believed was corrected -- and a PR body is where reviewers and
+  # the merge step take the author's account of the change.
+  #
+  # Every arm is hermetic: `pr_body.run` is replaced by a fake, so a write that reports success
+  # while changing nothing is reachable on demand rather than by waiting for GitHub to misbehave.
+  # That arm is the one that matters -- an implementation trusting the write's exit code passes
+  # every other arm in the file. Platform-independent: nothing here reads /proc or shells out.
+  add_test(NAME pr_body_readback
+           COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/ci/test_pr_body.py")
   add_test(NAME session_start
            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/test_session_start.py")
   # PROSPER_ENV_ON/_VALUE sample getenv once and return it forever. Applied to a name a TEST arms at
@@ -1085,6 +1096,12 @@ if(TARGET prosper_core)
   add_executable(test_http tests/hle/net/test_http.cpp)
   target_link_libraries(test_http PRIVATE prosper_core)
   add_test(NAME http_hle COMMAND test_http)
+
+  # #2894: libSceHttp2 was unregistered, so a request nobody sent reported SCE_OK and its response
+  # getters handed the guest untouched out-parameters.
+  add_executable(test_http2 tests/hle/net/test_http2.cpp)
+  target_link_libraries(test_http2 PRIVATE prosper_core)
+  add_test(NAME http2_hle COMMAND test_http2)
 
   add_executable(test_guard_recursion tests/hle/test_guard_recursion.cpp)
   target_link_libraries(test_guard_recursion PRIVATE prosper_core Threads::Threads)
@@ -4004,6 +4021,20 @@ if(TARGET prosper-app AND TARGET prosper_video_vaapi)
   target_link_libraries(prosper-app PRIVATE prosper_video_vaapi)
   target_compile_definitions(prosper-app PRIVATE PROSPER_VIDEO_VAAPI=1)
   message(STATUS "prosper-app: FFmpeg/VA-API video enabled")
+endif()
+
+# Image robustness (#3531): the device-side half of the recompiler's out-of-bounds image-read
+# contract, and the refusal that replaces executing it undefined. Registered OUTSIDE the per-platform
+# blocks because the contract is not platform-specific and the bug it guards was a divergence between
+# two device paths -- a guard built on only one host would have the same blind spot. Queries a
+# physical device but creates none, so it runs wherever an ICD exists and reports a skip (never a
+# silent pass) where one does not.
+if(TARGET Vulkan::Vulkan AND TARGET prosper_core)
+  add_executable(test_image_robustness tests/shared/device/test_image_robustness.cpp)
+  # Spells `shared/...` and `gpu/...` includes, which resolve from `frontends` and `src`.
+  target_include_directories(test_image_robustness PRIVATE frontends src)
+  target_link_libraries(test_image_robustness PRIVATE prosper_core Vulkan::Vulkan)
+  add_test(NAME image_robustness COMMAND test_image_robustness)
 endif()
 
 # Shared-device adoption guard (#1091). prosper_live_renderer only exists in frontend-enabled

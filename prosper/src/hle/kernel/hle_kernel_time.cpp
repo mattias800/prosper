@@ -17,6 +17,7 @@
 #include "hle/sync/pthread_slot.hpp"   // #2596: resolve a guest sync slot the way libkernel does
 #include "hle/sync/sync_futex.hpp"
 #include "hle/sync/sync_retire.hpp"   // #2042: a destroyed guest sync object's storage is retired, not freed
+#include "diagnostics/env_numeric.hpp"   // #3304: a mistyped PROSPER_WAITCAP must not remove the cap
 #include <pthread.h>
 #include <chrono>
 #if defined(__linux__)
@@ -1659,7 +1660,14 @@ HLE(k_eq_wait)   {   // (eq, SceKernelEvent* ev, int num, int* out, SceKernelUse
         if (a4) {
             uint64_t us = *(uint32_t*)P(a4);
             static const uint64_t cap = [] {   // parsed once (cf. punch_secs in hle_kernel_mem.cpp)
-                const char* e = getenv("PROSPER_WAITCAP"); return e ? (uint64_t)atoll(e) : 0; }();
+                // #3304: `atoll("-1")` is UINT64_MAX, which is NON-ZERO, so it passed the `cap &&`
+                // guard below and then `us > cap` could never be true -- an operator who armed a
+                // wait cap silently got none. `=5ms` was a 5 us cap and `=fast` was 0, i.e. off
+                // while looking set. Refuse loudly instead; 0 (no cap) stays the default.
+                return prosper::diag::env_u64_or_default(
+                    "PROSPER_WAITCAP", getenv("PROSPER_WAITCAP"), 0ull, "us",
+                    "0 = no cap: a timed wait runs for as long as the guest asked");
+            }();
             if (cap && us > cap) us = cap;
             if (evlog()) fprintf(stderr, "[ev]   WAIT.empty req=%lluus\n", (unsigned long long)us);
             s->cv.wait_for(lk, std::chrono::microseconds(us), pred);

@@ -340,10 +340,16 @@ bool fragment_spirv_wave_width_independent(const std::vector<uint32_t>& spirv) {
             case 4416 /*OpTerminateInvocation*/: case 5380 /*OpDemoteToHelperInvocation*/:
             case Op_ControlBarrier: case Op_MemoryBarrier:
                 return true;
-            // Atomics both read and write memory the rest of the draw can see. Named explicitly
-            // rather than as the numeric window `227..242`: the float and flag atomics sit outside
-            // it, so a vote-guarded OpAtomicFAddEXT admitted while the byte-identical module using
-            // OpAtomicIAdd refused. One opcode number was the whole difference.
+            // Every atomic TOUCHES memory the rest of the draw can see -- and touching, not
+            // writing, is the question this predicate asks. Its other caller is arm (b), which
+            // uses it to decide whether a vote-guarded region did anything at all; an access that
+            // participates in the draw's memory ordering did. So OpAtomicLoad belongs in this set
+            // even though it stores nothing, and is subtracted again in `writes_memory` below,
+            // where the question really is about writing.
+            // Named explicitly rather than as the numeric window `227..242`: the float and flag
+            // atomics sit outside it, so a vote-guarded OpAtomicFAddEXT admitted while the
+            // byte-identical module using OpAtomicIAdd refused. One opcode number was the whole
+            // difference.
             default:
                 return spirv_op_is_atomic(in.op);
         }
@@ -379,6 +385,15 @@ bool fragment_spirv_wave_width_independent(const std::vector<uint32_t>& spirv) {
             case Op_Kill: case 4416 /*OpTerminateInvocation*/:
             case 5380 /*OpDemoteToHelperInvocation*/:
             case Op_ControlBarrier: case Op_MemoryBarrier:
+            // ...and an atomic LOAD, which reads. It is the one atomic with no Value operand at
+            // all -- SPIR-V's unified grammar gives it `IdResultType IdResult Pointer Memory
+            // Semantics` and nothing else -- and the spec forbids Release/AcquireRelease on it
+            // while forbidding Acquire/AcquireRelease on OpAtomicStore: Release is the
+            // publishing half, and it is only meaningful on a write. So a module whose only
+            // atomic is a load cannot change what another invocation's load returns, and its
+            // storage buffers keep their uniformity. It stays OBSERVABLE above, so a
+            // vote-guarded region containing one is still refused; this loosens arm (a) alone.
+            case Op_AtomicLoad:
                 continue;
             default: break;
         }

@@ -18,6 +18,10 @@ usage, whether a PR is safe to merge.
   `print(__doc__)` prints the literal `None` and the caller is told nothing.
 - **`pr_merge_gate.py`** — is this PR safe to merge right now? Counts checks by bucket from
   `gh --json` and refuses when the PR's recorded head is no longer the branch tip.
+- **`pr_body.py`** — set a PR body and PROVE it took, or read one back and prove it matches a file.
+  `gh pr edit --body-file` has been seen returning rc=1 on a GraphQL projects-deprecation error
+  *without applying the edit* (#2918), so `set` writes over REST and then re-reads the live body;
+  the verdict is always the read-back, never the write's exit code.
 
 ## The property they share, and why it dictates how they are tested
 
@@ -32,6 +36,24 @@ the arm that would redden if its matcher quietly widened. `test_pr_merge_gate.py
 harder half for a boolean gate: because nearly every arm is a refusal, and a gate that refuses
 *everything* satisfies all of them, it leads with a positive control and asserts on the refusal
 *reason* rather than on the boolean.
+
+## Reading back is the only proof a remote write happened
+
+`pr_body.py` is in this folder rather than beside the other `gh` helpers because it is the same
+species as the checks above: the thing it guards against is a *reassuring answer*. `gh pr edit`
+exiting 0 is what everybody reads, and on #2910 it was wrong while the corrected body — four
+blocking review findings, all prose — sat unpublished.
+
+Two rules generalise past this one tool.
+
+**A remote write is not verified by its own exit code.** That applies to `gh pr edit`, and equally
+to the `--delete-branch` flag the charter already tells you to confirm with `git ls-remote`. Where
+a write matters, read the state back through a different call than the one that wrote it.
+
+**Do not fail on a non-zero exit code that the read-back contradicts.** `pr_body.py` exits 0 when
+the write errored and the body is nonetheless correct, because a gate that cries wolf on GraphQL
+noise is a gate people learn to pass with `|| true`. The verdict has to be about the live state,
+in both directions.
 
 ## A note on gates that decide something irreversible
 

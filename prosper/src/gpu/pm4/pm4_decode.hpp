@@ -55,6 +55,12 @@ enum : uint32_t {
     // different operation from R_DISPATCH_INDIRECT and gets its own encoding rather than sharing
     // one whose payload cannot hold an address.
     R_DISPATCH_INDIRECT_ADDR = 0x24,
+    // sceAgcDcbDrawIndirect (#2929) — the NON-indexed indirect draw. It is a different operation
+    // from R_DRAW_INDEX_INDIRECT, not a flag on it: the argument buffer it points at holds FOUR
+    // dwords (vertexCount, instanceCount, startVertex, startInstance) where the indexed form holds
+    // five, and no index buffer participates. Sharing the indexed sub-op would make the executor
+    // read a fifth dword the guest never wrote and demand an index base that does not exist.
+    R_DRAW_INDIRECT = 0x25,
     R_NUM = 0x40,
 };
 
@@ -70,7 +76,8 @@ struct Pm4Command {
         SetNumInstances,
         DrawIndex, DrawIndexAuto, EventWrite, AcquireMem, WriteData, WaitRegMem, Flip, ReleaseMem,
         DispatchDirect, SetIndexBase, SetIndexCount, DrawIndexOffset, Jump, SetPredication,
-        SetBaseIndirectArgs, StallCommandBufferParser, DrawIndexIndirect, DispatchIndirect,
+        SetBaseIndirectArgs, StallCommandBufferParser, DrawIndexIndirect, DrawIndirect,
+        DispatchIndirect,
         DmaData, Unknown,
     } kind = Kind::Unknown;
 
