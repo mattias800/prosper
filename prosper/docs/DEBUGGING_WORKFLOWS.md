@@ -80,8 +80,12 @@ python3 tools/pixel_history/pixel_history.py "$run_dir"/frame_frame*.rdc \
 ```
 
 It reports `NOTHING_DREW`, `ALL_REJECTED` (naming the test that rejected), `SHADER_WROTE_BLACK`,
-`STORE_LOST_IT`, `PIXEL_WAS_WRITTEN`, `CLEARED_AFTER_DRAW` or `OUTPUT_UNTRUSTED`, with the per-event
-detail behind it, and defaults to the brightest pixel rather than the centre. Clears are reported but
+`STORE_LOST_IT`, `PIXEL_WAS_WRITTEN`, `CLEARED_AFTER_DRAW`, `OUTPUT_UNTRUSTED` or `VALUE_UNKNOWN`,
+with the per-event detail behind it, and defaults to the brightest pixel rather than the centre.
+`VALUE_UNKNOWN` is a refusal, not a failure: RenderDoc marks a value it has no data for with a
+`0xdeadbeef` sentinel, that sentinel used to arrive as a colour whose `max(rgb)` is exactly `0.0`,
+and an absence of information was therefore reported as a measured black (instrument trap 278).
+Read it as "ask this question of another pixel, or open that event yourself". Clears are reported but
 are never the subject of a verdict — on a cleared target "the last passing event computed black"
 would otherwise be the clear, and blame a shader that never ran (instrument trap 269). On a driver you have not used it on before, run `--expect-control` against
 `pixel_history_control` first; see [its AGENTS.md](../tools/pixel_history/AGENTS.md) for why that is
@@ -319,7 +323,10 @@ Report per-run median/p95/p99 **frame intervals**, sample count and interval pop
 the distribution of run results rather than pooling all frames as independent trials. Keep
 guest flips, distinct rendered content and host publications separate. F8's 4 Hz rate samples
 cannot supply per-frame percentiles. `flip_pacing_report.py` is a guest-flip diagnostic and filters
-very short intervals; it does not establish distinct-image or host-present frame-time tails.
+very short intervals OUT OF ITS DISTRIBUTION STATISTICS ONLY -- its headline rate is flips
+over the wall-clock span and is unfiltered, because the retained fraction varies per run and
+a rate derived from it is not comparable between arms (#3560). It does not establish
+distinct-image or host-present frame-time tails.
 
 **A guest-flip rate now has a CEILING, and it is not the same in every harness (#3379).** Guest
 flips are paced to the cadence the title asked for -- `sceVideoOutSetFlipRate`'s divisor over the

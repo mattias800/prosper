@@ -19,6 +19,9 @@ Verdicts, each steering a different investigation:
                       clear, not the shading
   OUTPUT_UNTRUSTED    the explaining event's shader output is undefined (an unbound pixel
                       shader), so "computed black" and "store lost it" cannot be separated
+  VALUE_UNKNOWN       RenderDoc records NO VALUE for the event that would explain the pixel
+                      (its 0xdeadbeef "no information" sentinel, or nothing at all), so no
+                      colour can be read off it -- the tool names no cause it cannot establish
 
 Clears pass and evaluate no test, so they are never the subject of a verdict -- only the
 ground one is stated against. See instrument trap 269.
@@ -33,6 +36,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import struct
 import subprocess
 import sys
 import traceback
@@ -64,6 +68,17 @@ REJECTIONS = PRE_FRAGMENT + POST_FRAGMENT + ("shaderDiscarded",) + UNDEFINED_OUT
 # sample mask is the output-merger mask applied AFTER the shader. This tool reads prosper's
 # Vulkan captures; a D3D11 capture would need sampleMasked moved out of PRE_FRAGMENT.
 BLACK = 1.0 / 255.0
+# RenderDoc marks a ModificationValue it has no data for by stamping a 0xdeadbeef sentinel
+# into it (ModificationValue::SetInvalid()), not with a null, a flag or an exception -- and
+# that value is read back through the same float union as a real colour. So "I have no
+# information" arrives as four well-formed floats: the first is the sentinel's bit pattern
+# (about -6.26e18) and the rest are zero, which makes max(rgb) exactly 0.0. That is
+# byte-identical to a shader that computed black, and black is the value people bring to
+# this tool -- so an absence of data was being reported as SHADER_WROTE_BLACK, a confident
+# answer derived from a value whose whole meaning is "I do not know". #3404, and trap 268
+# one field over: a plausible, well-formed number that means something else.
+NO_INFORMATION = 0xdeadbeef
+NO_INFORMATION_AS_FLOAT = struct.unpack("<f", struct.pack("<I", NO_INFORMATION))[0]
 
 
 def suppress_shader_output(rejected_by):
@@ -75,6 +90,93 @@ def suppress_shader_output(rejected_by):
     this draw's shader output -- measured, not hypothetical.
     """
     return any(f in PRE_FRAGMENT or f in UNDEFINED_OUTPUT for f in rejected_by)
+
+
+def carries_no_information(mv):
+    """Is this ModificationValue the sentinel rather than a colour?
+
+    Three routes, ANY of which is enough, because what the Python binding exposes is not
+    guaranteed across RenderDoc builds: RenderDoc's own IsValid() if there is one, the
+    integer view of the union, and the float view. A colour whose first component is exactly
+    the sentinel's bit pattern is not one any render target can hold, so the float route is
+    a sound test rather than a heuristic.
+
+    Deliberately a UNION and not a precedence. An earlier draft let IsValid() returning True
+    short-circuit past the bit-pattern routes, which made the one route nobody here can run
+    against a real binding -- RenderDoc is not installed on this machine -- the only one
+    able to re-open #3404. Every route can now only ever ADD a detection, so being wrong
+    about any of them costs a detection rather than restoring the defect.
+    """
+    if mv is None:
+        return True
+    is_valid = getattr(mv, "IsValid", None)
+    if callable(is_valid):
+        try:
+            if not bool(is_valid()):
+                return True
+        except Exception:
+            pass
+    col = getattr(mv, "col", None)
+    if col is None:
+        return True
+    ints = list(getattr(col, "uintValue", None) or [])
+    if ints and int(ints[0]) == NO_INFORMATION:
+        return True
+    floats = list(getattr(col, "floatValue", None) or [])
+    if floats and float(floats[0]) == NO_INFORMATION_AS_FLOAT:
+        return True
+    return False
+
+
+def colour_values(mv):
+    """This event's RGBA, or None when the API carries no value for it.
+
+    None is the whole point, and it is why every consumer below tests for it instead of
+    indexing: "the value was black" and "there is no value" send a reader to different
+    files, so the second must be representable rather than encoded as a number something
+    downstream will read as data. An empty value is the same finding as the sentinel.
+    """
+    if carries_no_information(mv):
+        return None
+    col = getattr(mv, "col", None)
+    return [float(x) for x in (list(getattr(col, "floatValue", None) or []))][:4] or None
+
+
+def rejection_reasons(m):
+    """Which of the rejection flags this PixelModification carries."""
+    return [f for f in REJECTIONS if getattr(m, f, False)]
+
+
+def modification_event(m, is_clear):
+    """One event record from a RenderDoc PixelModification.
+
+    Module level, and used by BOTH the analysed pixel and the control regions, for the
+    reason suppress_shader_output() gives: the replay path needs RenderDoc and a GPU, so
+    nothing in CI can reach it, and two hand-copied copies of this dict drift apart. It
+    also lets a test build a stand-in `m` -- which is the only way to exercise the
+    no-information sentinel, since no control program can make RenderDoc have no data.
+    """
+    rejected = rejection_reasons(m)
+    suppressed = suppress_shader_output(rejected)
+    pre, post = colour_values(m.preMod), colour_values(m.postMod)
+    # Suppressed rather than reported as zero: "the shader ran and produced nothing" and
+    # "the shader never ran" are different findings.
+    shader = None if suppressed else colour_values(m.shaderOut)
+    no_value = [n for n, v in (("preMod", pre), ("postMod", post)) if v is None]
+    if not suppressed and shader is None:
+        no_value.append("shaderOut")
+    return {"eventId": int(m.eventId),
+            "is_clear": bool(is_clear),
+            "passed": bool(m.Passed()),
+            "rejected_by": rejected,
+            "shaderOut": shader,
+            "shader_output_suppressed": suppressed,
+            "preMod": pre,
+            "postMod": post,
+            # Named, not merely absent: a reader of the report has to be able to tell a
+            # suppressed shader output ("no fragment ran") from a value RenderDoc simply
+            # never recorded, and a verdict may rest on which one it was.
+            "no_value": no_value}
 
 
 def classify(events):
@@ -108,19 +210,38 @@ def classify(events):
     # what PixelModification sorts by; it is not meaningful ACROSS queues, a limitation this
     # inherits from pixel history rather than introduces.
     late = [e for e in events if e["is_clear"] and e["passed"]
-            and e["eventId"] > passed[-1]["eventId"]
-            and e["preMod"][:3] != e["postMod"][:3]]
-    if late:
+            and e["eventId"] > passed[-1]["eventId"]]
+    known = [e for e in late if e["preMod"] is not None and e["postMod"] is not None]
+    changed = [e for e in known if e["preMod"][:3] != e["postMod"][:3]]
+    if changed:
         return "CLEARED_AFTER_DRAW", (
-            f"{len(passed)} draw(s) passed, then event {late[-1]['eventId']} cleared the "
+            f"{len(passed)} draw(s) passed, then event {changed[-1]['eventId']} cleared the "
             f"target over them -- the pixel you see is the clear, not the shading.")
+    # A late clear whose values RenderDoc did not record cannot be shown to have changed
+    # this pixel -- and cannot be shown not to have. Falling through would name the draw
+    # below it, which is the same misattribution CLEARED_AFTER_DRAW exists to prevent,
+    # arrived at by an absence of evidence instead of by evidence.
+    unknown_late = [e for e in late if e["preMod"] is None or e["postMod"] is None]
+    if unknown_late:
+        return "VALUE_UNKNOWN", (
+            f"event {unknown_late[-1]['eventId']} cleared this target after the last "
+            f"surviving draw and RenderDoc records no value for it, so whether it wiped "
+            f"this pixel cannot be established -- inspect that event directly.")
 
     # Only the LAST passing draw can explain the pixel's final state. An earlier bright
     # writer that was legitimately overdrawn -- a white sky behind a black object -- is not
     # evidence of a lost store, and reading it as one made SHADER_WROTE_BLACK unreachable
     # on any pixel with history, which is most of a real frame.
     final = passed[-1]
-    lit = max(final["postMod"][:3]) if final["postMod"] else 0.0
+    # The headline of #3404: this is where the sentinel used to become a colour. max() over
+    # a value that means "no information" is arithmetic on a non-number, and it produced
+    # exactly 0.0 -- the answer the reader was already afraid of.
+    if final["postMod"] is None:
+        return "VALUE_UNKNOWN", (
+            f"the last passing event ({final['eventId']}) carries no recorded value for "
+            f"this pixel, so the colour it left cannot be read and no cause is being "
+            f"named -- inspect that event directly, or pick another pixel.")
+    lit = max(final["postMod"][:3])
     if lit > BLACK:
         return "PIXEL_WAS_WRITTEN", f"{len(passed)} of {len(events)} events passed; final colour is not black."
     if final["shader_output_suppressed"]:
@@ -129,7 +250,13 @@ def classify(events):
             f"the last passing event ({named}) has no trustworthy shader output, so "
             f"'computed black' and 'store lost it' cannot be separated here -- pick "
             f"another pixel, or inspect that event directly.")
-    if final["shaderOut"] and max(final["shaderOut"][:3]) > BLACK:
+    # Suppression returned above, so a missing output here means RenderDoc recorded none.
+    if final["shaderOut"] is None:
+        return "VALUE_UNKNOWN", (
+            f"the pixel is black and the last passing event ({final['eventId']}) has no "
+            f"recorded shader output, so 'the shader computed black' and 'the store lost "
+            f"it' cannot be separated -- which is the whole distinction this tool is for.")
+    if max(final["shaderOut"][:3]) > BLACK:
         return "STORE_LOST_IT", (
             "the last passing event computed a non-black colour and the target is black "
             "anyway -- blend state, write mask, or a later event that is not in this list.")
@@ -144,11 +271,6 @@ def embedded():
     result = {"status": "FAILED"}
     try:
         import renderdoc as rd
-
-        def values(mv):
-            col = getattr(mv, "col", None)
-            v = list(getattr(col, "floatValue", []) or []) if col is not None else []
-            return [float(x) for x in v][:4]
 
         cap = rd.OpenCaptureFile()
         if cap.OpenFile(req["capture"], "", None) != rd.ResultCode.Succeeded:
@@ -249,22 +371,7 @@ def embedded():
                 f"out-of-bounds history is empty and would read as NOTHING_DREW")
         hist = ctl.PixelHistory(tex.resourceId, pixel[0], pixel[1],
                                 rd.Subresource(0, 0, 0), rd.CompType.Typeless)
-        events = []
-        for m in hist:
-            rejected = [f for f in REJECTIONS if getattr(m, f, False)]
-            pre = suppress_shader_output(rejected)
-            events.append({
-                "eventId": int(m.eventId),
-                "is_clear": int(m.eventId) in clear_eids,
-                "passed": bool(m.Passed()),
-                "rejected_by": rejected,
-                # Suppressed rather than reported as zero: "the shader ran and produced
-                # nothing" and "the shader never ran" are different findings.
-                "shaderOut": None if pre else values(m.shaderOut),
-                "shader_output_suppressed": pre,
-                "preMod": values(m.preMod),
-                "postMod": values(m.postMod),
-            })
+        events = [modification_event(m, int(m.eventId) in clear_eids) for m in hist]
         verdict, reason = classify(events)
 
         control = {}
@@ -272,17 +379,7 @@ def embedded():
             for name, (cx, cy), _ in CONTROL_REGIONS:
                 ch = ctl.PixelHistory(tex.resourceId, cx, cy, rd.Subresource(0, 0, 0),
                                       rd.CompType.Typeless)
-                ce = []
-                for m in ch:
-                    rej = [f for f in REJECTIONS if getattr(m, f, False)]
-                    pre = suppress_shader_output(rej)
-                    ce.append({"eventId": int(m.eventId), "passed": bool(m.Passed()),
-                               "is_clear": int(m.eventId) in clear_eids,
-                               "rejected_by": rej,
-                               "shaderOut": None if pre else values(m.shaderOut),
-                               "shader_output_suppressed": pre,
-                               "preMod": values(m.preMod),
-                               "postMod": values(m.postMod)})
+                ce = [modification_event(m, int(m.eventId) in clear_eids) for m in ch]
                 control[name] = {"verdict": classify(ce)[0], "events": ce}
 
         result = {"status": "REPLAYED", "verdict": verdict, "reason": reason,
@@ -451,9 +548,13 @@ def main():
           f"from {data['target']['chosen_from']}")
     print(f"  {data['draw_count']} draws in frame, {len(data['events'])} touched this pixel")
     for e in data["events"]:
+        # Three different absences, printed differently on purpose. "-" used to cover all
+        # of them, which is how a value meaning "no information" reached a reader looking
+        # like a measurement.
         out = ("suppressed (no fragment ran)" if e["shader_output_suppressed"]
                else ("[" + ", ".join(f"{v:.3f}" for v in e["shaderOut"]) + "]"
-                     if e["shaderOut"] else "-"))
+                     if e["shaderOut"] else "no value recorded"))
+        gaps = [n for n in e.get("no_value", []) if n != "shaderOut"]
         # Passed() ignores unboundPS, so an event with no bound pixel shader arrives as a
         # pass. Printing a bare "PASS" would hide the one fact that matters about it.
         undefined = [f for f in e["rejected_by"] if f in UNDEFINED_OUTPUT]
@@ -461,7 +562,8 @@ def main():
                  else ("PASS!" + ",".join(undefined)) if e["passed"] and undefined
                  else "PASS" if e["passed"]
                  else ",".join(e["rejected_by"]) or "rejected")
-        print(f"    eid {e['eventId']:>6}  {state:<20} shaderOut {out}")
+        print(f"    eid {e['eventId']:>6}  {state:<20} shaderOut {out}"
+              + (f"  (no value recorded: {', '.join(gaps)})" if gaps else ""))
     print(f"  evidence: {args.output}")
     return 0
 
