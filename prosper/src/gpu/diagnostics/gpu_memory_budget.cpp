@@ -189,9 +189,14 @@ void report_device_memory_periodically() {
     static const uint64_t interval_s = [] () -> uint64_t {
         const char* v = std::getenv("PROSPER_GPU_MEM_REPORT_S");
         const long long seconds = v ? std::atoll(v) : 0;
-        if (v && (seconds < 0 || seconds > 86400))
-            std::fprintf(stderr, "[gpu-mem] PROSPER_GPU_MEM_REPORT_S=%s is out of range; using 30\n", v);
-        return (seconds > 0 && seconds <= 86400) ? (uint64_t)seconds : 30ull;
+        const bool usable = seconds > 0 && seconds <= 86400;
+        // Say so rather than falling back in silence -- a typo that selects a different setting is
+        // the failure class, not just an out-of-range value. atoll("abc") is 0, so a misspelling
+        // lands here too.
+        if (v && !usable)
+            std::fprintf(stderr, "[gpu-mem] PROSPER_GPU_MEM_REPORT_S=%s is not a usable interval; "
+                                 "using 30 s\n", v);
+        return usable ? (uint64_t)seconds : 30ull;
     }();
     using clock = std::chrono::steady_clock;
     static std::atomic<uint64_t> next_report{0};

@@ -90,10 +90,19 @@ void report_allocation_failure(int result, uint64_t bytes, uint32_t memory_type)
 // heap and NOTHING on the other, where the true standing was 81 MiB and 16 MiB. A figure read off
 // the growth line is a floor rounded down to a step, and it was published as a footprint once.
 //
-// LIMIT, because it is driven by allocation activity rather than by a clock: a process that stops
-// allocating entirely stops reporting. That is the right trade for what this exists for -- a device
-// running out of memory is allocating by definition -- but it does mean a quiescent process leaves
-// no fresh line, and it is not a substitute for a periodic sampler if that is what you need.
+// It is driven by ACTIVITY rather than by a clock, and the activity has to include submits, not just
+// allocations. An earlier version of this comment argued allocations were enough because "a device
+// running out of memory is allocating by definition". That is wrong, and wrong in the direction that
+// matters: #3533's signature is `amdgpu_vm_validate() failed` alongside "Not enough memory for
+// command submission", which is a SUBMIT-time validation over the resident BO set. A process holding
+// a perfectly steady footprint can hit it having allocated nothing at all -- so the allocation-time
+// argument covers the `vkAllocateMemory` failure that report_allocation_failure already handles, and
+// misses the one this cadence exists for.
+//
+// So it is called from the renderer's submit funnel as well as from the two allocation wrappers.
+// A process that neither allocates nor submits still leaves no fresh line; that is a real limit, and
+// deliberately not a background thread, whose shutdown ordering would put stderr and a mutex in the
+// path of static destruction for a diagnostic.
 void report_device_memory_periodically();
 
 }  // namespace prosper::gpu

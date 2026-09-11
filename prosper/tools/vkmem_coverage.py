@@ -209,12 +209,25 @@ def self_test() -> str:
         (fake / "elsewhere" / "frontend_only.h").write_text(
             "void h() { vkFreeMemory(d, m, nullptr); }\n")
         (fake / "src" / "middle.h").write_text(
-            '#include "../elsewhere/deep.h"\n#include "only_via_root.h"\n')
+            '#include "../elsewhere/deep.h"\n#include "only_via_root.h"\n'
+            '#include "../tests/shipped_fixture.h"\n#include "../third_party/vendored.h"\n')
         (fake / "elsewhere" / "deep.h").write_text("void f() { vkFreeMemory(d, m, nullptr); }\n")
         # Reachable ONLY through the CMake-declared `vendor_root`: not beside its includer, and not
         # under any fallback root.
         (fake / "vendor_root" / "only_via_root.h").write_text(
             "void g() { vkAllocateMemory(d, &i, nullptr, &o); }\n")
+        # The EXEMPT_PREFIXES list is the third hand-maintained list this checker has had, after the
+        # file list and the root list, and both of those were wrong. Constrain it here: a raw call
+        # under `tests/` MUST be reported, because the shipped renderer backend lives there, and a
+        # raw call under `third_party/` must NOT be, because the charter requires those vendored
+        # verbatim. Widening the exemption to `tests/` un-polices more than half the real call sites
+        # and used to pass every arm in this function.
+        (fake / "tests").mkdir()
+        (fake / "third_party").mkdir()
+        (fake / "tests" / "shipped_fixture.h").write_text(
+            "void t() { vkFreeMemory(d, m, nullptr); }\n")
+        (fake / "third_party" / "vendored.h").write_text(
+            "void v() { vkFreeMemory(d, m, nullptr); }\n")
 
         dropped = set()
         found = list(scan(fake, dropped))
@@ -230,6 +243,12 @@ def self_test() -> str:
         if not any(n.endswith("frontend_only.h") for n in names):
             return ("the walk did not start from every shipped root, so a whole tree of translation "
                     "units is unscanned")
+        if not any(n.endswith("shipped_fixture.h") for n in names):
+            return ("a raw call under tests/ was not reported; the shipped renderer backend lives "
+                    "there, so exempting it un-polices most of the real call sites")
+        if any(n.endswith("vendored.h") for n in names):
+            return ("a raw call under third_party/ was reported; that code is vendored verbatim by "
+                    "charter and cannot be rewritten, so the gate would be permanently red")
 
         # 3. an unfollowable include, whose basename DOES exist in the tree, must be announced.
         (fake / "src" / "middle.h").write_text('#include "deep.h"\n#include "only_via_root.h"\n')
@@ -247,6 +266,8 @@ def self_test() -> str:
             "void f() { prosper::gpu::free_device_memory(d, m); }\n")
         (fake / "elsewhere" / "frontend_only.h").write_text(
             "void h() { prosper::gpu::free_device_memory(d, m); }\n")
+        (fake / "tests" / "shipped_fixture.h").write_text(
+            "void t() { prosper::gpu::free_device_memory(d, m); }\n")
         dropped = set()
         if list(scan(fake, dropped)):
             return "a correctly wired call was reported as a bypass"
@@ -270,8 +291,16 @@ def main() -> int:
         return 2
 
     if dropped:
-        print("vkmem_coverage: could not follow these includes, so the graph is incomplete and a "
-              "clean result would not mean anything:\n", file=sys.stderr)
+        # Print whatever WAS found first. Returning early on an incomplete graph would suppress real
+        # bypasses behind a tooling problem -- the finding is still true, it is only the "and there
+        # are no others" that the drop invalidates.
+        for relative, number, symbol in findings:
+            fix = "allocate_device_memory" if symbol == "vkAllocateMemory" else "free_device_memory"
+            print(f"  {relative}:{number}: {symbol} -> use prosper::gpu::{fix}")
+        if findings:
+            print("", file=sys.stderr)
+        print("vkmem_coverage: could not follow these includes, so the graph is incomplete and "
+              "even a clean result would not mean anything:\n", file=sys.stderr)
         for where, spelled in sorted(dropped):
             print(f"  {where}: #include \"{spelled}\"", file=sys.stderr)
         print("\nAdd the directory to a target_include_directories line, or teach resolve() the "

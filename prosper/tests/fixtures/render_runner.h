@@ -1857,6 +1857,11 @@ inline bool flush_graphics_pipeline_cache(
 inline VkResult render_locked_queue_submit(VkQueue q, uint32_t n, const VkSubmitInfo* s, VkFence f) {
     prosper::GpuSubmitRegion gate;
     if (!gate.admitted()) return VK_ERROR_DEVICE_LOST;
+    // #3533: the memory standing, on a cadence, from the path where the failure actually happens --
+    // "Not enough memory for command submission" is a SUBMIT-time validation over the resident BO
+    // set, which a process with a steady footprint can hit having allocated nothing. Called before
+    // the present lock below so the report never prints inside that critical section.
+    prosper::gpu::report_device_memory_periodically();
     if (prosper::gpu::shared_present_active()) {
         std::lock_guard<std::mutex> lk(prosper::gpu::shared_present_submit_mutex());
         return vkQueueSubmit(q, n, s, f);

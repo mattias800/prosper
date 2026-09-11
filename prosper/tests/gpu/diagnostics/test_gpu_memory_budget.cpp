@@ -19,6 +19,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <chrono>
 #include <thread>
 #include <vector>
 
@@ -61,8 +62,10 @@ int main() {
     const char* const capture_path = capture_file.c_str();
 #if defined(_WIN32)
     _putenv_s("PROSPER_GPU_MEM_LOG_MIB", "1");
+    _putenv_s("PROSPER_GPU_MEM_REPORT_S", "1");
 #else
     setenv("PROSPER_GPU_MEM_LOG_MIB", "1", 1);
+    setenv("PROSPER_GPU_MEM_REPORT_S", "1", 1);   // the shortest interval the knob accepts
 #endif
     const bool captured = std::freopen(capture_path, "w+", stderr) != nullptr;
 
@@ -215,6 +218,15 @@ int main() {
     note_device_free(0xb000);
     note_device_alloc(0xb100, 1, 26 * kMiB);   // same size again, below the mark: must stay silent
 
+    // The cadence report. It is the newest emitter, and trap 280 is about exactly this: a emitter
+    // with correct arithmetic and no assertion that it ever speaks. The first call only ARMS the
+    // timer -- asserting on that call would pass whether or not the report works -- so this waits
+    // out one interval and calls again. One second is the shortest the knob accepts; that is the
+    // price of pinning a time-based emitter, and it is cheaper than trap 280 recurring.
+    report_device_memory_periodically();                       // arms, prints nothing
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    report_device_memory_periodically();                       // due: must print
+
     // A report of the LOADED state. The report above ran before these allocations, so it could not
     // carry a pressure label; without this one, deleting the label from report_device_memory passes
     // every assertion in the file because only the growth line exercises it.
@@ -244,6 +256,14 @@ int main() {
         CHECK(output.find("loaded: heap 3 is 64 MiB; prosper holds 45 MiB (peak 45 MiB)  "
                           "(over 70% of the heap)") != std::string::npos,
               "report_device_memory carries the pressure label too, not just the growth line");
+        CHECK(output.find("[gpu-mem] periodic:") != std::string::npos,
+              "the cadence report actually PRINTS once its interval has elapsed");
+        // ...and the arming call must not print, or the cadence is just "report on every call".
+        size_t seen = 0, from = 0;
+        while ((from = output.find("[gpu-mem] periodic: heap 0", from)) != std::string::npos) {
+            seen++; from += 26;
+        }
+        CHECK(seen == 1, "the arming call does not report; only the one that is due");
         CHECK(output.find("*** OVER 90% OF THE HEAP ***") != std::string::npos,
               "a heap past 90% is shouted rather than mentioned");
         // The ratchet: exactly one line for heap 1 at 30 MiB, not a second one when the same 26 MiB
