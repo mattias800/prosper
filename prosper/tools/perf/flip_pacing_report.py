@@ -149,12 +149,20 @@ def alignment_verdict(share, chance=None, power=1.0):
         # Unreachable from report() -- CHANCE is a positive constant -- but exercised directly by
         # the self-test, and the guard is what stops a future caller dividing by a widened band.
         return None, 'no chance baseline is defined for this band'
-    ratio = share / chance
     if power < 0.5:
-        return ratio, ('NO POWER -- %.0f%% of intervals are shorter than the band around one '
-                       'tick, where alignment is arithmetically impossible, so this share is a '
-                       'property of the frame rate rather than evidence about the tick'
-                       % (100.0 * (1.0 - power)))
+        return share / chance, (
+            'NO POWER -- %.0f%% of intervals are shorter than the band around one tick, where '
+            'alignment is arithmetically impossible, so this share is a property of the frame '
+            'rate rather than evidence about the tick' % (100.0 * (1.0 - power)))
+    # THE NULL SCALES WITH POWER, and the first version of this gate missed that. Only `power`
+    # of the population can score aligned at all; the rest contribute a structural zero. So the
+    # expected share for a tick-unrelated run is power * CHANCE, not CHANCE. Measuring a mixed-
+    # rate run against the full 30% understates its ratio by 1/power -- up to 2x at the gate --
+    # and can print 'BELOW chance / evidence AGAINST' on a share that is in fact above its own
+    # null. That is the same fabricated negative the power term was added to remove, surviving
+    # in the partial case; and a mixed-rate run is precisely the phase change the windowed view
+    # exists for, so it is the common case rather than a corner. Found in re-review of #3454.
+    ratio = share / (chance * power)
     if ratio < 0.75:
         return ratio, ('BELOW chance -- production here is anti-aligned, which is evidence AGAINST a tick-bound wait, not an absence of evidence')
     if ratio < 1.25:
@@ -205,7 +213,11 @@ def report(stamps, window_s, tick, untimed=0, restarts=0):
     ratio, verdict = alignment_verdict(overall_share, power=power)
     print(f"tick-aligned intervals (within +/-{BAND * 100:.0f}% of a {tick:.3f} ms tick "
           f"multiple): {quantized} ({100 * overall_share:.1f}%)")
-    print(f"  chance baseline {100 * CHANCE:.1f}% -- {ratio:.2f}x chance: {verdict}")
+    # Name the baseline actually used. Printing 30.0% beside a ratio computed against a
+    # power-scaled null would be a third way for this line to mislead.
+    effective = CHANCE * power if power >= 0.5 else CHANCE
+    scaled = "" if power >= 0.999 else f" (scaled by {100 * power:.0f}% reachable)"
+    print(f"  chance baseline {100 * effective:.1f}%{scaled} -- {ratio:.2f}x chance: {verdict}")
 
     hist = collections.Counter(round(ms) for ms in intervals)
     print("interval histogram (ms: count, top buckets):")

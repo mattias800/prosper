@@ -360,6 +360,28 @@ def main():
     except TypeError as exc:
         failures.append(f"case 18: alignment_verdict takes no power term at all ({exc})")
 
+    # 19. Re-review residual: PARTIAL power. Only `power` of the population can score at all, so
+    #     the null for the whole-population share is power * CHANCE. Measuring against the full
+    #     30% understates the ratio by 1/power and can call a share BELOW chance when it is above
+    #     its own null -- the same fabricated negative, surviving in the partial case. A
+    #     mixed-rate run is the phase change the windowed view exists for, so this is the common
+    #     case. share=0.20 at power=0.6: 0.20/0.30 = 0.67x (BELOW) against the flat null, but
+    #     0.20/(0.30*0.6) = 1.11x (at chance) against the real one.
+    try:
+        ratio, verdict = verdict_of(0.20, power=0.6)
+        if 'BELOW chance' in verdict:
+            failures.append(
+                f"case 19: a share above its own power-scaled null was called BELOW chance ({verdict!r})")
+        if ratio is None or abs(ratio - 0.20 / (FPR.CHANCE * 0.6)) > 1e-9:
+            failures.append(f"case 19: ratio {ratio} is not against the power-scaled null")
+        # ...and full power must leave the flat null untouched, or this becomes a blanket
+        # loosening rather than a correction.
+        ratio, _ = verdict_of(0.20, power=1.0)
+        if ratio is None or abs(ratio - 0.20 / FPR.CHANCE) > 1e-9:
+            failures.append(f"case 19: full power must divide by CHANCE exactly, got {ratio}")
+    except TypeError as exc:
+        failures.append(f"case 19: no power term to scale the null with ({exc})")
+
     if failures:
         print("FAILURES:")
         for failure in failures:
