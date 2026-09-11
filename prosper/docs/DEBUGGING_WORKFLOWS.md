@@ -320,6 +320,18 @@ the distribution of run results rather than pooling all frames as independent tr
 guest flips, distinct rendered content and host publications separate. F8's 4 Hz rate samples
 cannot supply per-frame percentiles. `flip_pacing_report.py` is a guest-flip diagnostic and filters
 very short intervals; it does not establish distinct-image or host-present frame-time tails.
+
+**A guest-flip rate now has a CEILING, and it is not the same in every harness (#3379).** Guest
+flips are paced to the cadence the title asked for -- `sceVideoOutSetFlipRate`'s divisor over the
+advertised display's vblank period, 59.94 Hz under the default `legacy` display policy -- so a
+flips/s figure from `prosper-app` is bounded above by that and says nothing about how much faster
+the renderer could have gone. `tools/screenshot` and `tools/boot_trace` opt OUT and stay
+free-running, so **their flip rates and an interactive run's are not comparable**, and a
+harness-to-harness comparison that ignores this reads a policy as a regression. To measure
+throughput rather than cadence, set `PROSPER_FLIP_PACE_FPS=0` explicitly and say that you did.
+Measured on one binary, one title (`PPSA24651`), one host, `--frames 5400` on both arms: the paced
+default holds 57.4-58.4 guest flips/s while `PROSPER_FLIP_PACE_FPS=0` gives 96-99 -- the same run
+1.65x too fast.
 Include CPU/RSS and the correctness evidence. A faster run with missing geometry is a regression.
 
 Measure profiler overhead with the same route both with and without that profiler; no universal
