@@ -263,6 +263,30 @@ static uint64_t image_cache_old(const char* t) {
     return mib * 1024ull * 1024ull;
 }
 
+// --- src/hle/kernel/hle_kernel_time.cpp : PROSPER_WAITCAP (#3304) ------------------------------
+// A diagnostic bound on a TIMED equeue wait, in microseconds; 0 means "no cap". The old spelling
+// was `(uint64_t)atoll(e)`, so `-1` became UINT64_MAX -- non-zero, therefore PAST the `cap &&`
+// guard, and then `us > cap` could never be true. An operator who armed a cap silently got none,
+// which is the exact inversion of what they asked for and is invisible in the log.
+static uint64_t waitcap_new(const char* n, const char* t) {
+    return env_u64_or_default(n, t, 0ull, "us",
+                              "0 = no cap: a timed wait runs for as long as the guest asked");
+}
+static uint64_t waitcap_old(const char* t) { return t ? (uint64_t)std::atoll(t) : 0ull; }
+
+// --- src/gpu/pm4/command_processor.cpp : PROSPER_POST_SUBMIT_VISIBILITY (#3304) ----------------
+// The one TRI-STATE in the converted set: -1 unset (follow the SDK version), 1 forced on, 0 forced
+// off. `strtol` answers 0 for text it cannot parse, so every word spelling selected the FORCED-OFF
+// arm of a live experiment and announced it as deliberate. kTriStateUnset carries the -1 through
+// this file's uint64_t table.
+static const uint64_t kTriStateUnset = (uint64_t)(int64_t)-1;
+static uint64_t psv_new(const char* n, const char* t) {
+    return (uint64_t)(int64_t)prosper::diag::env_tristate_or_unset(n, t);
+}
+static uint64_t psv_old(const char* t) {
+    return t ? (uint64_t)(int64_t)(int)std::strtol(t, nullptr, 0) : kTriStateUnset;
+}
+
 static const uint64_t kMiB = 1024ull * 1024ull;
 static const uint64_t kGiB = 1024ull * kMiB;
 
@@ -400,6 +424,24 @@ static const Site kSites[] = {
      "64 MB", 16ull * kMiB, "64", 64ull * kMiB},
     {"live_compute.cpp PROSPER_MAX_GPU_COMPARE_IMAGE_MB", "PROSPER_MAX_GPU_COMPARE_IMAGE_MB",
      mib_cap_size_new<2>, mib_cap_old<2>, "32mb", 2ull * kMiB, "8", 8ull * kMiB},
+
+    // #3304. WAITCAP's malformed answers are the two ends of its own policy: `-1` used to REMOVE
+    // the cap (UINT64_MAX passes the `cap &&` guard and no wait can exceed it) and `5ms` used to
+    // impose a 5 us one. Both now keep 0, and the refusal says that 0 means no cap so an operator
+    // is not told "keeping the default" and left believing they still have a bound.
+    {"hle_kernel_time.cpp PROSPER_WAITCAP (cap removed)", "PROSPER_WAITCAP",
+     waitcap_new, waitcap_old, "-1", 0ull, "5000", 5000ull},
+    {"hle_kernel_time.cpp PROSPER_WAITCAP (unit suffix)", "PROSPER_WAITCAP",
+     waitcap_new, waitcap_old, "5ms", 0ull, "250", 250ull},
+
+    // #3304. The tri-state. `2` is the sharpest row: strtol answered 2, which the site read as
+    // `forced != 0`, i.e. FORCED ON -- and unlike 0 and 1 it printed NOTHING, so the run was armed
+    // and silent. The word spellings are asserted in main() below, where the accepted set can be
+    // stated directly rather than one row at a time.
+    {"command_processor.cpp PROSPER_POST_SUBMIT_VISIBILITY (neither 0 nor 1)",
+     "PROSPER_POST_SUBMIT_VISIBILITY", psv_new, psv_old, "2", kTriStateUnset, "1", 1ull},
+    {"command_processor.cpp PROSPER_POST_SUBMIT_VISIBILITY (near-miss word)",
+     "PROSPER_POST_SUBMIT_VISIBILITY", psv_new, psv_old, "enable", kTriStateUnset, "0", 0ull},
 };
 int main() {
     char msg[512];
@@ -421,6 +463,33 @@ int main() {
                       s.good);
         check(good == s.good_expected, msg);
     }
+
+    // #3304: the spellings an operator actually types. Every one of these used to reach strtol,
+    // which answers 0 for all of them -- so `=on` and `=true` ran the FORCED-OFF arm of an open
+    // experiment (#2217/#2219/#2223) and printed "FORCED OFF" as though that had been asked for.
+    // The second loop is the discriminator: it requires the old spelling to have answered OFF for
+    // each word, so these arms cannot pass vacuously on a site that never had the defect.
+    static const char* const kOnWords[] = {"on", "ON", "On", "true", "TRUE", "yes", "enabled"};
+    static const char* const kOffWords[] = {"off", "OFF", "false", "no", "disabled"};
+    bool on_words_on = true, on_words_were_off = true, off_words_off = true;
+    for (const char* word : kOnWords) {
+        if (psv_new("PROSPER_POST_SUBMIT_VISIBILITY", word) != 1) on_words_on = false;
+        if (psv_old(word) != 0) on_words_were_off = false;
+    }
+    for (const char* word : kOffWords)
+        if (psv_new("PROSPER_POST_SUBMIT_VISIBILITY", word) != 0) off_words_off = false;
+    check(on_words_on, "PROSPER_POST_SUBMIT_VISIBILITY: on/true/yes/enabled select the ON arm");
+    check(on_words_were_off,
+          "PROSPER_POST_SUBMIT_VISIBILITY: ...and every one of them used to select FORCED OFF");
+    check(off_words_off, "PROSPER_POST_SUBMIT_VISIBILITY: off/false/no/disabled select the OFF arm");
+    check(psv_new("PROSPER_POST_SUBMIT_VISIBILITY", "1") == 1 &&
+          psv_new("PROSPER_POST_SUBMIT_VISIBILITY", "0") == 0 &&
+          psv_new("PROSPER_POST_SUBMIT_VISIBILITY", "0x1") == 1 &&
+          psv_new("PROSPER_POST_SUBMIT_VISIBILITY", "0x0") == 0,
+          "PROSPER_POST_SUBMIT_VISIBILITY: the numeric spellings the site already accepted still work");
+    check(psv_new("PROSPER_POST_SUBMIT_VISIBILITY", nullptr) == kTriStateUnset &&
+          psv_new("PROSPER_POST_SUBMIT_VISIBILITY", "") == kTriStateUnset,
+          "PROSPER_POST_SUBMIT_VISIBILITY: unset and empty stay UNSET, and follow the SDK version");
 
     // Two properties of the shared grammar that every arm above depends on, asserted once here so a
     // failure points at the helper rather than at twenty sites.

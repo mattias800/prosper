@@ -2927,7 +2927,10 @@ std::atomic<bool> g_post_submit_visibility{false};
 
 // #1226 (arc7) A/B lever, default OFF and log-only in the sense that it changes nothing unless
 // set: `PROSPER_POST_SUBMIT_VISIBILITY=1` forces this model on regardless of the SDK version the
-// guest asked for, `=0` forces it off. It exists because the per-fold census (see
+// guest asked for, `=0` forces it off. (`on`/`true`/`yes`/`enabled` and `off`/`false`/`no`/
+// `disabled` work too, in either case; anything ELSE -- including a number that is neither 0 nor 1
+// -- is treated as unset and says so, because a typo must not pick an arm of a live experiment.
+// #3304.) It exists because the per-fold census (see
 // `ARCRUNNER_STATUS.md` § arc7) localised ArcRunner's corruption to the guest's builder thread
 // being released MID-FOLD by completion writes prosper applies while it is still executing the rest
 // of the same command buffer — and ArcRunner requests SDK version 10, so the post-submit contract
@@ -2935,8 +2938,13 @@ std::atomic<bool> g_post_submit_visibility{false};
 // pre-13 title is a separate question this lever does not answer; it makes the experiment runnable.
 bool post_submit_visibility_enabled() {
     static const int forced = [] {
-        const char* e = getenv("PROSPER_POST_SUBMIT_VISIBILITY");
-        const int v = e ? (int)strtol(e, nullptr, 0) : -1;
+        // #3304: the tri-state is right and the PARSE was not. `strtol` answers 0 for text it
+        // cannot read, so `=on`, `=true`, `=yes` and `=enabled` all landed on the FORCED-OFF arm
+        // and printed the line below as though that had been asked for -- a confidently mislabelled
+        // result on a lever whose verdict is open (#2217/#2219/#2223). A value that is neither on
+        // nor off is now UNSET (follow the SDK version) and says so; it is never a silent third arm.
+        const int v = prosper::diag::env_tristate_or_unset("PROSPER_POST_SUBMIT_VISIBILITY",
+                                                           getenv("PROSPER_POST_SUBMIT_VISIBILITY"));
         if (v == 1)
             fprintf(stderr, "[agc] POST-SUBMIT-VISIBILITY FORCED ON (#1226 A/B) — completion writes "
                             "stay private until the submit scope closes, regardless of SDK version\n");
