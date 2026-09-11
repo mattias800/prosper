@@ -21,6 +21,8 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+// GetProcessMemoryInfo + PROCESS_MEMORY_COUNTERS_EX. psapi.h must follow windows.h.
+#include <psapi.h>
 #include <fcntl.h>
 #include <io.h>
 #include <sys/stat.h>
@@ -31,6 +33,10 @@
 
 #if defined(__linux__)
 #include <unistd.h>
+#endif
+
+#if defined(__APPLE__)
+#include <mach/mach.h>
 #endif
 
 namespace prosper::perf {
@@ -306,16 +312,18 @@ void InteractivePerformanceCapture::publish_completed(std::unique_ptr<PendingCap
     if (!out) {
         result.error = "could not open the reserved temporary capture for writing";
     } else {
-        const bool cpu_available = std::any_of(
-            capture->pre_samples.begin(), capture->pre_samples.end(),
-            [](const ProcessSample& sample) { return sample.process_cpu_ns.has_value(); }) ||
-            std::any_of(capture->post_samples.begin(), capture->post_samples.end(),
-            [](const ProcessSample& sample) { return sample.process_cpu_ns.has_value(); });
-        const bool rss_available = std::any_of(
-            capture->pre_samples.begin(), capture->pre_samples.end(),
-            [](const ProcessSample& sample) { return sample.rss_bytes.has_value(); }) ||
-            std::any_of(capture->post_samples.begin(), capture->post_samples.end(),
-            [](const ProcessSample& sample) { return sample.rss_bytes.has_value(); });
+        // One predicate for every optional process field, so a newly added field cannot get an
+        // availability flag whose "any sample carried it" rule quietly differs from its neighbours'.
+        const auto any_sample_has = [&capture](std::optional<uint64_t> ProcessSample::*field) {
+            const auto carried = [field](const ProcessSample& sample) {
+                return (sample.*field).has_value();
+            };
+            return std::any_of(capture->pre_samples.begin(), capture->pre_samples.end(), carried) ||
+                   std::any_of(capture->post_samples.begin(), capture->post_samples.end(), carried);
+        };
+        const bool cpu_available = any_sample_has(&ProcessSample::process_cpu_ns);
+        const bool rss_available = any_sample_has(&ProcessSample::rss_bytes);
+        const bool private_available = any_sample_has(&ProcessSample::private_bytes);
         out << std::setprecision(10);
         out << "{\"type\":\"header\",\"format\":\"prosper-performance-capture\","
                "\"version\":1,\"title_id\":" << json_string(capture->title_id)
@@ -328,7 +336,11 @@ void InteractivePerformanceCapture::publish_completed(std::unique_ptr<PendingCap
             << ",\"sample_interval_ns\":" << config_.sample_interval_ns
             << ",\"logical_cpus\":" << std::thread::hardware_concurrency()
             << ",\"process_cpu_available\":" << (cpu_available ? "true" : "false")
-            << ",\"rss_available\":" << (rss_available ? "true" : "false") << "}\n";
+            << ",\"rss_available\":" << (rss_available ? "true" : "false")
+            // Additive within format version 1: readers select every field by name, so a reader
+            // that predates this flag ignores it and a reader that expects it reads an older
+            // capture as "unavailable", which is exactly what an older capture knew.
+            << ",\"private_bytes_available\":" << (private_available ? "true" : "false") << "}\n";
 
         const auto write_sample = [&](const ProcessSample& sample, const char* phase) {
             out << "{\"type\":\"sample\",\"phase\":\"" << phase << "\",\"t_ns\":"
@@ -337,6 +349,8 @@ void InteractivePerformanceCapture::publish_completed(std::unique_ptr<PendingCap
             write_optional(out, sample.process_cpu_ns);
             out << ",\"rss_bytes\":";
             write_optional(out, sample.rss_bytes);
+            out << ",\"private_bytes\":";
+            write_optional(out, sample.private_bytes);
             out << ",\"guest_presents\":" << sample.guest_presents
                 << ",\"rendered_frames\":";
             write_optional(out, sample.rendered_frames);
@@ -568,6 +582,35 @@ ProcessSample collect_process_sample(uint64_t monotonic_ns, uint64_t guest_prese
         if (page_size > 0 && resident_pages <= UINT64_MAX / static_cast<uint64_t>(page_size))
             sample.rss_bytes = resident_pages * static_cast<uint64_t>(page_size);
     }
+    // Linux reports no committed-bytes counterpart to Windows' commit charge, so private_bytes stays
+    // empty here rather than being filled with a near-synonym of the resident set.
+#elif defined(_WIN32)
+    // Windows has no /proc/self/statm, which is why every .prperf taken here reported "RSS:
+    // unavailable on this platform/run" (#3448). GetProcessMemoryInfo carries both figures in one
+    // call: WorkingSetSize is the resident set -- the direct analogue of the Linux number -- and
+    // PrivateUsage is the commit charge, which is what actually grows with prosper's host-side
+    // caches. Both are recorded only when the query succeeds; a failed query leaves both empty so
+    // the header's availability flags stay truthful.
+    PROCESS_MEMORY_COUNTERS_EX counters{};
+    counters.cb = sizeof(counters);
+    if (::GetProcessMemoryInfo(::GetCurrentProcess(),
+                               reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters),
+                               sizeof(counters))) {
+        sample.rss_bytes = static_cast<uint64_t>(counters.WorkingSetSize);
+        sample.private_bytes = static_cast<uint64_t>(counters.PrivateUsage);
+    }
+#elif defined(__APPLE__)
+    // CONFIDENCE: LOW. Written from the documented mach interface. CI's macOS jobs compile it and
+    // run this file's test against it, but the change that added it was authored and measured on
+    // Windows and Linux only. MACH_TASK_BASIC_INFO is the 64-bit-safe flavor: TASK_BASIC_INFO's
+    // resident_size saturates at 4 GiB, which is below the working sets this capture is for.
+    // macOS's private footprint lives behind a different call (task_vm_info's phys_footprint), so
+    // private_bytes is left empty here rather than guessed at from a counter that does not mean it.
+    mach_task_basic_info_data_t info{};
+    mach_msg_type_number_t info_count = MACH_TASK_BASIC_INFO_COUNT;
+    if (::task_info(mach_task_self(), MACH_TASK_BASIC_INFO,
+                    reinterpret_cast<task_info_t>(&info), &info_count) == KERN_SUCCESS)
+        sample.rss_bytes = static_cast<uint64_t>(info.resident_size);
 #endif
     return sample;
 }

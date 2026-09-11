@@ -365,6 +365,41 @@ class PerformanceCaptureReportTests(unittest.TestCase):
         self.assertIsNone(summary["rates"]["rendered_fps"])
         self.assertIsNone(summary["pacing_note"])
 
+    def _printed(self, summary):
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            print_summary(summary)
+        return buffer.getvalue()
+
+    def test_committed_bytes_are_reported_when_the_capture_carries_them(self):
+        # Windows records the commit charge alongside the working set (#3448), because the two
+        # diverge by gigabytes under prosper's host-side caches and only the second one tracks them.
+        samples = [dict(sample, private_bytes=value)
+                   for sample, value in zip(SAMPLES, (3 * 2**20, 5 * 2**20))]
+        summary = summarize(capture(samples))
+        self.assertEqual((summary["private_min"], summary["private_max"]),
+                         (3 * 2**20, 5 * 2**20))
+        self.assertIn("private/committed: 3.0..5.0 MiB", self._printed(summary))
+
+    def test_capture_without_committed_bytes_still_reads_cleanly(self):
+        # The backward-compatibility arm. SAMPLES carries no `private_bytes` key at all, which is
+        # the exact shape of every .prperf written before the field existed: it must validate, it
+        # must summarize, and it must say unavailable rather than inventing a number.
+        records = capture(SAMPLES)
+        validate_capture(records)
+        summary = summarize(records)
+        self.assertIsNone(summary["private_min"])
+        self.assertIsNone(summary["private_max"])
+        self.assertIn("private/committed: unavailable on this platform/run",
+                      self._printed(summary))
+
+    def test_zero_committed_bytes_is_a_measurement_not_an_absence(self):
+        # A zero and an absence are different claims, and a truth test on the population would
+        # merge them -- reporting a measured zero as "unavailable on this platform/run".
+        summary = summarize(capture([dict(sample, private_bytes=0) for sample in SAMPLES]))
+        self.assertEqual(summary["private_min"], 0)
+        self.assertIn("private/committed: 0.0..0.0 MiB", self._printed(summary))
+
     def test_dropped_counts_are_reported_not_added_to_population(self):
         summary = summarize(capture(SAMPLES, renderer=[{"total_ms": 1}], dropped=(7, 9)))
         self.assertEqual(summary["counts"]["renderer"], 1)

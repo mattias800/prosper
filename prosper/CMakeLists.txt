@@ -127,6 +127,11 @@ endif()
 add_library(prosper_performance_capture STATIC frontends/shared/perf/performance_capture.cpp)
 target_include_directories(prosper_performance_capture PUBLIC frontends)
 target_link_libraries(prosper_performance_capture PRIVATE prosper_build_revision)
+# Windows: the process memory sample (working set + commit charge) calls GetProcessMemoryInfo, which
+# lives in the PSAPI import library rather than the kernel32 set every target links by default.
+if(WIN32)
+  target_link_libraries(prosper_performance_capture PRIVATE psapi)
+endif()
 
 # --- tests (agentic-first: self-checking, exit-code = truth) -------------
 enable_testing()

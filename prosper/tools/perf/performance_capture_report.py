@@ -423,6 +423,10 @@ def summarize(records):
         "host_fps": _counter_rate(post, "host_presented_frames", seconds or 0) if seconds else None,
     }
     rss = [record.get("rss_bytes") for record in post if record.get("rss_bytes") is not None]
+    # Additive field: captures written before it, and hosts with no committed-bytes counter, simply
+    # carry no value. `is not None` rather than a truth test, so a real zero stays a measurement.
+    private = [record.get("private_bytes") for record in post
+               if record.get("private_bytes") is not None]
 
     graphics_total = _total(renderer, "total_ms")
     compute_total = _total(compute, "total_ms")
@@ -559,6 +563,8 @@ def summarize(records):
         "cpu_cores": cpu_cores,
         "rss_min": min(rss) if rss else None,
         "rss_max": max(rss) if rss else None,
+        "private_min": min(private) if private else None,
+        "private_max": max(private) if private else None,
         "rates": rates,
         "graphics_total_ms": graphics_total,
         "compute_total_ms": compute_total,
@@ -661,6 +667,11 @@ def print_summary(summary):
         print("RSS: unavailable on this platform/run")
     else:
         print(f"RSS: {summary['rss_min'] / 2**20:.1f}..{summary['rss_max'] / 2**20:.1f} MiB")
+    if summary["private_min"] is None:
+        print("private/committed: unavailable on this platform/run")
+    else:
+        print(f"private/committed: {summary['private_min'] / 2**20:.1f}.."
+              f"{summary['private_max'] / 2**20:.1f} MiB")
     rates = summary["rates"]
     print(f"rates: guest flips={_fmt_rate(rates['guest_fps'])} "
           f"rendered={_fmt_rate(rates['rendered_fps'])} host-presented={_fmt_rate(rates['host_fps'])}")

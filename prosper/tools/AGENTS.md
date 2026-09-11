@@ -723,6 +723,14 @@ capture/replay without requiring an importable system Python module.
   total/mean/max time, and bounded address list. Mixed batches and older v1 captures report their
   compute time as explicitly unknown identity rather than inventing a program attribution.
 
+  The memory axis is two fields, not one, and both are per-platform. `rss_bytes` is the resident
+  set: `/proc/self/statm` on Linux, `WorkingSetSize` on Windows, `MACH_TASK_BASIC_INFO`'s
+  `resident_size` on macOS. `private_bytes` is the commit charge and exists only on Windows
+  (`PrivateUsage`), where it is the figure that tracks prosper's host-side caches -- the working set
+  understated one measured GTA V run by ~5 GB (#3448). Either field is reported as **unavailable**
+  rather than zero when the host has no such counter or the query failed, and captures written
+  before a field existed simply read as unavailable; both are additive within format version 1.
+
   For unattended agent runs, set `PROSPER_PERF_CAPTURE_AFTER_MS=N` to make one automatic arm
   attempt after `N` milliseconds from entry into the app loop. This uses the exact F8 artifact path
   and five-second pre/post windows without desktop focus, synthetic input, screenshots, frame dumps,

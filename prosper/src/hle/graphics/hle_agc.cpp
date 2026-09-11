@@ -19,6 +19,7 @@
 #include "gpu/present/videoout_present.hpp"
 #include "gpu/execute/mb3_freelist.hpp"   // #1226: per-submit POOLSHIFT window probe
 #include "hle/graphics/render_cadence.hpp"  // #2837: is a requested render cadence actually sparse?
+#include "diagnostics/env_numeric.hpp"   // #2847: a mistyped cadence must not become 0
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -1936,10 +1937,15 @@ static bool execute_submit_work(gpu::GpuState& st, uint64_t submit_no, unsigned&
         ? UINT64_MAX : flip_delta * period_ns;
     // A bounded sparse phase accelerates long intros, then cadence=1 rebuilds any temporal render
     // targets before a visual checkpoint. Screenshot exposes these as --render-every/--render-every-for-seconds.
+    // The cadence is a DIVISOR, so 0 is not "off" here -- it is a SIGFPE on the first draw submit.
+    // `atol` into a `long` could reach it two ways: `=0` directly, and any multiple of 2^32 (which
+    // is > 0 as a long and 0 once narrowed to unsigned), so the `v > 0` guard checked the wrong
+    // type. Parse strictly, cap below the narrowing, and keep the 0 -> 1 floor (#2847, #3267).
     static const unsigned render_every = [] {
-        const char* e = getenv("PROSPER_RENDER_EVERY");
-        long v = e ? atol(e) : 1;
-        return v > 0 ? (unsigned)v : 1u;
+        const uint64_t v = prosper::diag::env_u64_or_default_capped(
+            "PROSPER_RENDER_EVERY", getenv("PROSPER_RENDER_EVERY"), 1ull, UINT32_MAX,
+            "draw submits");
+        return v ? (unsigned)v : 1u;
     }();
     static const uint64_t render_every_for_ms = [] {
         const char* e = getenv("PROSPER_RENDER_EVERY_FOR_MS");
@@ -2000,9 +2006,11 @@ static bool execute_submit_work(gpu::GpuState& st, uint64_t submit_no, unsigned&
     // graphics/compute operation still executes and persistent targets advance on every submit.
     // Publish the first eligible frame, then one in every N so a consumer gets an image promptly.
     static const unsigned present_every = [] {
-        const char* e = getenv("PROSPER_PRESENT_EVERY");
-        long v = e ? atol(e) : 1;
-        return v > 0 ? (unsigned)v : 1u;
+        // Same divisor, same two routes to 0, same floor (#2847).
+        const uint64_t v = prosper::diag::env_u64_or_default_capped(
+            "PROSPER_PRESENT_EVERY", getenv("PROSPER_PRESENT_EVERY"), 1ull, UINT32_MAX,
+            "publication candidates");
+        return v ? (unsigned)v : 1u;
     }();
     static uint64_t publication_candidates = 0;
     const bool publish = (publication_candidates++ % present_every) == 0;
