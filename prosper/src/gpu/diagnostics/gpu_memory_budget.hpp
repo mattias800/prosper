@@ -1,0 +1,71 @@
+// gpu_memory_budget.hpp — how much device memory has prosper allocated, against how much exists?
+//
+// prosper answered that question nowhere, and the cost of not answering it is measured rather than
+// hypothetical. On 2026-09-11 this project's development machine hard-froze FIVE times under
+// ordinary prosper GPU work, every time with the kernel reporting
+//
+//     amdgpu: [drm] *ERROR* Not enough memory for command submission!
+//     amdgpu: [drm] *ERROR* amdgpu_vm_validate() failed.
+//
+// and THREE separate root causes were published and retracted before anyone asked the simplest
+// question in the list. Each retraction came from reading a kernel trace as confirmation of a story
+// rather than as a new sample (#3533). A log line saying "prosper holds N MiB of an M MiB heap"
+// would have settled it on the first freeze; there was no such line, so five freezes produced three
+// wrong answers instead of one right one.
+//
+// WHAT THIS MEASURES, AND WHAT IT DOES NOT. It counts the bytes prosper itself passes to
+// vkAllocateMemory, per heap, and compares them against that heap's `VkMemoryHeap::size`. It does
+// NOT see any other process, the compositor, or the driver's own overhead — on an integrated GPU the
+// desktop shares these heaps, so prosper holding well under the heap size is not on its own proof
+// that the heap has room. Reading this as a whole-system budget is the obvious misuse and it is why
+// the printed line names prosper explicitly.
+//
+// The honest upgrade is `VK_EXT_memory_budget`, whose `heapUsage` is process-wide and whose
+// `heapBudget` is what the driver will actually grant. That extension is not enabled on the device
+// today; enabling it is a separate change and this header is deliberately independent of it, so the
+// instrument exists now rather than after that plumbing lands.
+//
+// ON BY DEFAULT, which is the point. `PROSPER_GPU_MEM_LOG=0` silences it and
+// `PROSPER_GPU_MEM_LOG_MIB=<n>` changes the growth step. A diagnostic that must be switched on is
+// one nobody had switched on for the run that mattered — which is exactly what happened here.
+#pragma once
+#include <cstdint>
+
+namespace prosper::gpu {
+
+// Record the device's heap layout, ONCE, before anything is allocated. `type_heap_index[i]` is
+// `memoryTypes[i].heapIndex` and `heap_sizes[j]` is `memoryHeaps[j].size`, copied out of
+// VkPhysicalDeviceMemoryProperties by the caller so this header needs no Vulkan types and can be
+// included anywhere. Storing it here is what lets every allocation site pass only a memory type
+// index -- no call site needs the properties struct in scope, which is what makes wiring the
+// renderer's thirty-odd sites a mechanical change rather than a judgement call at each one.
+//
+// The FIRST layout wins. A second, different layout means two physical devices are in play and the
+// per-heap totals would be mixing them, so it warns once and keeps the first rather than silently
+// renumbering the heaps under a running count.
+void set_device_heaps(const uint32_t* type_heap_index, uint32_t type_count,
+                      const uint64_t* heap_sizes, uint32_t heap_count);
+
+// Record a real vkAllocateMemory / vkFreeMemory. Keyed by the VkDeviceMemory handle (as a bare
+// uint64_t), because the free sites hold only the handle -- they do not know the allocation's size
+// or its heap, and making each one carry them would be dozens of places to get wrong instead of one.
+//
+// POOLED REUSE MUST NOT BE COUNTED. prosper recycles device allocations through its own pools, so
+// only call these where the DRIVER is really allocating or really freeing. Counting a pool hit would
+// measure prosper's churn rather than its footprint, which is the opposite of the question.
+void note_device_alloc(uint64_t handle, uint32_t memory_type, uint64_t bytes);
+void note_device_free(uint64_t handle);
+
+// Bytes prosper currently holds on `heap`, for a caller that wants the number rather than the line.
+uint64_t device_bytes_held(uint32_t heap);
+
+// The high-water mark on `heap`. This is the number that explains a submission failure AFTER the
+// fact: a run that demanded 3 GiB and gave it back holds nothing by the time anyone looks, and the
+// held figure alone would say the heap was never under pressure.
+uint64_t device_peak_bytes(uint32_t heap);
+
+// Print the current per-heap standing immediately, whatever the step counter says. `why` names the
+// occasion ("startup", "allocation failed", ...) so a line in a log can be attributed.
+void report_device_memory(const char* why);
+
+}  // namespace prosper::gpu
