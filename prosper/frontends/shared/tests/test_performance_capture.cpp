@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -35,6 +36,7 @@ prosper::perf::ProcessSample sample(uint64_t at, uint64_t counter) {
     out.monotonic_ns = at;
     out.process_cpu_ns = counter * 70;
     out.rss_bytes = 4096 + counter;
+    out.private_bytes = 8192 + counter;
     out.guest_presents = counter * 3;
     out.rendered_frames = counter * 2;
     out.host_presented_frames = counter;
@@ -161,7 +163,12 @@ int main() {
         capture.record_compute(record);
     }
 
-    capture.observe_sample(sample(600, 6));
+    // A host that counts no committed bytes separately from its resident set reports the field as
+    // unavailable, not as zero, and the artifact has to keep those apart -- so one post sample omits
+    // it while every other sample carries one.
+    auto unavailable_private_bytes = sample(600, 6);
+    unavailable_private_bytes.private_bytes.reset();
+    capture.observe_sample(unavailable_private_bytes);
     auto unavailable_render_count = sample(700, 7);
     unavailable_render_count.rendered_frames.reset();
     capture.observe_sample(unavailable_render_count);
@@ -195,6 +202,10 @@ int main() {
           "serialized artifact contains the exact post-trigger population");
     check(count_text(text, "\"rendered_frames\":null") == 1,
           "an unavailable rendered-frame population serializes as JSON null");
+    check(count_text(text, "\"private_bytes\":null") == 1,
+          "an unavailable committed-bytes population serializes as JSON null, never as zero");
+    check(text.find("\"rss_available\":true,\"private_bytes_available\":true") != std::string::npos,
+          "the header states availability for each memory field the samples carried");
     check(count_text(text, "\"type\":\"renderer\"") == 2 &&
           count_text(text, "\"type\":\"compute\"") == 1,
           "serialized detail counts match the bounded retained records");
@@ -244,6 +255,31 @@ int main() {
     for (const auto& entry : fs::directory_iterator(dir))
         part_files += entry.path().extension() == ".part";
     check(part_files == 0, "graceful cancellation removes the unfinished private part");
+
+    // The live host sampler, on whatever platform this test is running. Every check above feeds the
+    // ring synthetic samples, so the suite stayed green for as long as the real sampler returned an
+    // empty resident set on every platform but Linux (#3448). The bounds are deliberately wide: the
+    // claim is that a real counter was read, not what this process happens to weigh.
+    const prosper::perf::ProcessSample live = prosper::perf::collect_process_sample(
+        prosper::perf::monotonic_now_ns(), 0, std::nullopt, 0);
+    const auto shown = [](const std::optional<uint64_t>& value) {
+        return value ? std::to_string(*value) : std::string("unavailable");
+    };
+    std::cout << "host process sample: rss=" << shown(live.rss_bytes)
+              << " private=" << shown(live.private_bytes) << '\n';
+    const auto plausible = [](const std::optional<uint64_t>& value) {
+        return value && *value >= 64 * 1024 && *value < (1ull << 44);
+    };
+    check(live.rss_bytes.has_value(), "the host process sampler reports a resident set size");
+    check(plausible(live.rss_bytes), "the reported resident set is a plausible process footprint");
+#if defined(_WIN32)
+    check(live.private_bytes.has_value(),
+          "Windows reports the commit charge alongside the working set");
+    check(plausible(live.private_bytes), "the reported commit charge is a plausible footprint");
+#else
+    check(!live.private_bytes.has_value(),
+          "a host with no separate committed-bytes counter leaves the field unavailable, not zero");
+#endif
 
     fs::remove_all(dir, ec);
     std::cout << (failures ? "FAIL" : "PASS") << ": " << checks << " checks, "
