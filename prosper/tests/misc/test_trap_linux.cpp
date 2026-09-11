@@ -70,7 +70,8 @@ int main(int argc, char** argv) {
     //
     //   1. The eboot really imports at least one STT_OBJECT symbol. Without this the case below
     //      passes vacuously on any dump -- the exact failure mode the charter's positive-control
-    //      rule names. This eboot's data imports are `__stack_chk_guard` plus three C++ ABI objects.
+    //      rule names. PPSA24651's eboot declares four STT_OBJECT imports, one of which is
+    //      `__stack_chk_guard`; the NID-keyed case further down names that one explicitly.
     //   2. Every data-slot address lies in the data aperture and outside the whole stub aperture.
     //      Checked against the aperture, not against the slots emitted so far, because the stub
     //      table can still grow at runtime (append_stubs, #639) and an address that is merely past

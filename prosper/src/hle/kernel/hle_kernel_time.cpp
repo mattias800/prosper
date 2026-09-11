@@ -1735,9 +1735,15 @@ HLE(k_eq_getcount){
 // individually. See the discrimination comment in prosper_eq_post_apr_token below.
 // CONFIDENCE: HIGH — ctor seeding, walk bounds, unconditional last:=cnt store, handler match/hash/
 // null-entry paths all from static disassembly; tag-echo event consumption live-verified (#180).
+uint64_t prosper_eq_apr_udata(uint64_t eq, int64_t id);   // defined below, with the registry
+
 namespace {
     constexpr int16_t EVFILT_AMPR_MODELED = -24;   // guest never reads filter; distinct on purpose
-    struct AprEqReg { uint64_t eq; int64_t id; };
+    // udata is the guest's own pointer, handed to sceKernelAddAmprEvent and handed BACK on every
+    // completion event through sceKernelGetEventUserData. It is not decoration: NINJA GAIDEN 4's
+    // Wwise I/O hook dereferences it directly (`call sceKernelGetEventUserData; mov edi,[rax]` at
+    // eboot+0x28c319c), so dropping it is a null pointer handed to the guest (#3500).
+    struct AprEqReg { uint64_t eq; int64_t id; uint64_t udata = 0; };
     // Own mutex (NOT g_eq_mx): the post path calls eq_post/eq_find, which lock g_eq_mx themselves.
     // Detached APR delivery threads can outlive main, so the mutex and every container they touch
     // are one intentionally immortal heap object. Heap placement also keeps the hot mutex out of
@@ -1756,9 +1762,9 @@ namespace {
         return (eq_identity << 6) | (ring & 0x3f);
     }
     void apr_post(uint64_t eq, uint64_t eq_identity, int64_t id,
-                  unsigned ring, uint64_t token, bool coalesce) {   // no APR lock held
+                  unsigned ring, uint64_t token, bool coalesce, uint64_t udata) {   // no APR lock held
         SceKEvent e{}; e.ident = id + (int64_t)ring; e.filter = EVFILT_AMPR_MODELED;
-        e.data = (int64_t)token; e.udata = 0;
+        e.data = (int64_t)token; e.udata = udata;
         eq_post(eq, e, coalesce, eq_identity);
     }
 }
@@ -1820,6 +1826,9 @@ void prosper_eq_post_apr_token(uint64_t eq, uint64_t eq_identity,
                 nanosleep(&ts, nullptr);
                 for (auto& p : batch) {
                     SceKEvent e{}; e.ident = 0; e.filter = EVFILT_AMPR_MODELED; e.data = (int64_t)p.token;
+                    // Both dialects hand the udata back; the guest reads it through the same
+                    // accessor regardless of which one delivered the event.
+                    e.udata = prosper_eq_apr_udata(p.eq, 0);
                     eq_post(p.eq, e, /*coalesce=*/false, p.eq_identity);
                 }
                 lk.lock();
@@ -1887,7 +1896,9 @@ void prosper_eq_post_apr_token(uint64_t eq, uint64_t eq_identity,
             std::lock_guard lk(state.mx);
             hwm = state.tag_hwm[hwm_key];
         }
-        apr_post(eq, eq_identity, id, ring, ((uint64_t)ring << 58) | hwm, counter_dialect);
+        // Resolved BEFORE the post, not inside it: apr_post runs with no APR lock held on purpose.
+        apr_post(eq, eq_identity, id, ring, ((uint64_t)ring << 58) | hwm, counter_dialect,
+                 prosper_eq_apr_udata(eq, id));
     }).detach();
 }
 // Assign the next completion token for `ring` (0-based, 6 bits) — for UNBOUND submits only, whose
@@ -1905,15 +1916,33 @@ uint64_t prosper_apr_next_token(unsigned ring) {
 // by the guest via record polling, and replaying invented counters would regress the listener's
 // ctor-seeded per-ring last-processed (see the block comment above; the pre-#208 replay was the
 // root cause of the #180 range-walk fault).
-void prosper_eq_add_apr(uint64_t eq, int64_t id) {
+void prosper_eq_add_apr(uint64_t eq, int64_t id, uint64_t udata) {
     AprTokenState& state = apr_token_state();
     std::lock_guard lk(state.mx);
     for (auto& r : state.eq_regs)
-        if (r.eq == eq && r.id == id) return;   // idempotent
-    state.eq_regs.push_back({ eq, id });
+        if (r.eq == eq && r.id == id) {
+            // Idempotent, but UPGRADING: several paths register the same (eq, id) and only
+            // sceKernelAddAmprEvent carries the guest's udata — the command-buffer binding and the
+            // measure-sizing compatibility call both pass 0. A plain early return would keep
+            // whichever arrived first, so a real pointer would be lost whenever one of those ran
+            // before AddAmprEvent. Never overwrite a real udata with 0.
+            if (udata && !r.udata) r.udata = udata;
+            return;
+        }
+    state.eq_regs.push_back({ eq, id, udata });
+}
+
+// The udata registered for this (eq, id), or 0 if none. Separate from the post path because that
+// path runs with no APR lock held and must not take one -- it calls eq_post, which locks g_eq_mx.
+uint64_t prosper_eq_apr_udata(uint64_t eq, int64_t id) {
+    AprTokenState& state = apr_token_state();
+    std::lock_guard lk(state.mx);
+    for (const auto& r : state.eq_regs)
+        if (r.eq == eq && r.id == id) return r.udata;
+    return 0;
 }
 HLE(k_add_ampr_event) {   // sceKernelAddAmprEvent(eq, id, udata)
-    if (a0) prosper_eq_add_apr(a0, (int64_t)a1);
+    if (a0) prosper_eq_add_apr(a0, (int64_t)a1, a2);
     if (evlog()) fprintf(stderr, "[ev] AddAmprEvent eq=0x%llx id=%lld udata=0x%llx\n",
         (unsigned long long)a0, (long long)a1, (unsigned long long)a2);
     return 0;
