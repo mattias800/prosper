@@ -78,7 +78,7 @@ constexpr uint32_t R_DRAW_INDEX = 0x03, R_DRAW_INDEX_AUTO = 0x04, R_DRAW_RESET =
                    R_JUMP = 0x1e, R_SET_PRED = 0x1f,
                    R_SET_BASE_INDIRECT_ARGS = 0x20, R_STALL_COMMAND_BUFFER_PARSER = 0x21,
                    R_DRAW_INDEX_INDIRECT = 0x22, R_DISPATCH_INDIRECT = 0x23,
-                   R_DISPATCH_INDIRECT_ADDR = 0x24;
+                   R_DISPATCH_INDIRECT_ADDR = 0x24, R_DRAW_INDIRECT = 0x25;
 constexpr uint32_t R_NUM = 0x40;
 
 // --- Packet sizes, in DWORDS, shared by each builder and its sceAgc*GetSize (#1143, #1748, #1756) ---
@@ -99,6 +99,24 @@ constexpr uint32_t kDwDrawIndex          = 7;
 constexpr uint32_t kDwDrawIndexAuto      = 7;
 constexpr uint32_t kDwDrawIndexOffset    = 3;
 constexpr uint32_t kDwDrawIndexIndirect  = 4;
+// sceAgcDcbDrawIndirect (#2929) — the non-indexed sibling, and deliberately the SAME 4 dwords as the
+// indexed one rather than a count copied from it by assumption. Two independent arguments, both for
+// the safe direction:
+//   * prosper's payload is its own encoding and carries exactly what the API call carries: the
+//     32-bit byte offset into the graphics argument base plus the 64-bit ShaderDrawModifier. There
+//     is no fourth operand for the non-indexed form to drop, so it cannot be smaller than this.
+//   * The hardware packet this stands for, PM4 `DRAW_INDIRECT`, spends header + DATA_OFFSET +
+//     BASE_VTX_LOC + START_INST_LOC + DRAW_INITIATOR = 5 dwords — the same field list as
+//     `DRAW_INDEX_INDIRECT`. So 4 is at or below the real library's reservation on the published
+//     layout, which is the only direction that matters: emitting FEWER than the real AGC function
+//     wastes reserved space, emitting MORE overruns a reservation the guest made in good faith
+//     (#1748). See docs/AGC_PACKET_SIZES.md.
+// prosper also answers sceAgcDcbDrawIndirectGetSize (cxPZ4Wgvdj8) from this same constant, so a
+// guest that ASKS reserves exactly what is written here and is self-consistent regardless.
+// CONFIDENCE: MED — no local dump was observed inlining the real size, so the equality with the real
+// AGC packet is inferred from the published PM4 layout rather than measured from a guest reservation.
+// CONFIDENCE: HIGH that 4 is not an overrun, which is the property #1748 makes load-bearing.
+constexpr uint32_t kDwDrawIndirect       = 4;
 constexpr uint32_t kDwDispatch           = 6;
 constexpr uint32_t kDwDispatchIndirect   = 4;
 // The ACB form is one dword larger because it carries a whole 64-bit address where the DCB form
@@ -336,6 +354,7 @@ const char* dcb_subop_name(uint32_t r) {
         case R_SET_BASE_INDIRECT_ARGS:     return "SetBaseIndirectArgs";
         case R_STALL_COMMAND_BUFFER_PARSER: return "StallCommandBufferParser";
         case R_DRAW_INDEX_INDIRECT:        return "DrawIndexIndirect";
+        case R_DRAW_INDIRECT:              return "DrawIndirect";
         case R_DISPATCH_INDIRECT:          return "DispatchIndirect";
         case R_DISPATCH_INDIRECT_ADDR:     return "AcbDispatchIndirect";
         // A raw allocate_dw with no sub-op (CbNop's 1-dword form, the type-2 filler). Without its own
@@ -2689,6 +2708,7 @@ HLE(agc_driver_submit_dcb) {  // (const Packet* packet)
                 case K::SetBaseIndirectArgs: return "SetBaseIndirectArgs";
                 case K::StallCommandBufferParser: return "StallCommandBufferParser";
                 case K::DrawIndexIndirect: return "DrawIndexIndirect";
+                case K::DrawIndirect:     return "DrawIndirect";
                 case K::DispatchIndirect: return "DispatchIndirect";
                 case K::DmaData:         return "DmaData";
                 case K::Unknown:         return "Unknown";
@@ -3130,6 +3150,30 @@ HLE(agc_dcb_draw_index_indirect) {
     cmd[3] = static_cast<uint32_t>(a2 >> 32u);
     return reinterpret_cast<uint64_t>(cmd);
 }
+// sceAgcDcbDrawIndirect (NID 1q1titRBL6o) — the NON-indexed indirect draw, and the sibling that had
+// no handler at all until #2929. The dispatcher's default answered 0, which the AGC builders read as
+// "no packet was appended" and which nothing downstream reports: the draw left the command stream
+// with no reject line, no `[compute] skip`, and only a single one-shot `[prosper] unimplemented:`
+// line naming the NID. 49 of the 54 corpus dumps carry the import; Little Nightmares II (PPSA02154)
+// and Sifu (PPSA03001) are confirmed live callers.
+//
+// Same ABI as the indexed sibling — (dcb, byteOffset, shaderDrawModifier), the offset being relative
+// to the graphics argument base a preceding sceAgcDcbSetBaseIndirectArgs(dcb, 0, addr) selected — so
+// the payload is identical. What differs is at the far end of the pointer: the argument buffer holds
+// the four-dword non-indexed form (vertexCount, instanceCount, startVertex, startInstance), not the
+// five-dword indexed one, and no index buffer participates. That is why this gets its own sub-op
+// instead of a flag on R_DRAW_INDEX_INDIRECT: reusing the indexed decode would read a fifth dword
+// the guest never wrote and then reject the draw for having no index base.
+// CONFIDENCE: HIGH on the signature (identical operand list to the indexed sibling, whose ABI Astro
+// Bot's live callsites pin) and on the argument-buffer layout (the published non-indexed indirect
+// argument structure, identical across GCN/RDNA and every graphics API that exposes it).
+HLE(agc_dcb_draw_indirect) {
+    uint32_t* cmd; if (!begin_packet(a0, kDwDrawIndirect, IT_NOP, R_DRAW_INDIRECT, &cmd)) return 0;
+    cmd[1] = static_cast<uint32_t>(a1);
+    cmd[2] = static_cast<uint32_t>(a2);
+    cmd[3] = static_cast<uint32_t>(a2 >> 32u);
+    return reinterpret_cast<uint64_t>(cmd);
+}
 HLE(agc_dcb_dispatch_indirect) {
     uint32_t* cmd; if (!begin_packet(a0, kDwDispatchIndirect, IT_NOP, R_DISPATCH_INDIRECT, &cmd)) return 0;
     cmd[1] = static_cast<uint32_t>(a1);
@@ -3201,6 +3245,7 @@ HLE(agc_draw_index_get_size)          { (void)a0; return kDwDrawIndex * 4u; }
 HLE(agc_draw_index_auto_get_size)     { (void)a0; return kDwDrawIndexAuto * 4u; }
 HLE(agc_draw_index_offset_get_size)   { (void)a0; return kDwDrawIndexOffset * 4u; }
 HLE(agc_draw_index_indirect_get_size) { (void)a0; return kDwDrawIndexIndirect * 4u; }
+HLE(agc_draw_indirect_get_size)       { (void)a0; return kDwDrawIndirect * 4u; }
 HLE(agc_dispatch_get_size)            { (void)a0; return kDwDispatch * 4u; }
 
 // sceAgcQueueEndOfPipeActionPatchData (MlEw1feXcjg) — the DATA half of the ReleaseMem patch pair.
@@ -3425,6 +3470,7 @@ void register_agc_hle() {
     RN("WrdP9Zxx3lQ", agc_draw_index_auto_get_size);     // sceAgcDcbDrawIndexAutoGetSize
     RN("qMlfB1ZhMDc", agc_draw_index_offset_get_size);   // sceAgcDcbDrawIndexOffsetGetSize
     RN("mStuvI0zOtc", agc_draw_index_indirect_get_size); // sceAgcDcbDrawIndexIndirectGetSize
+    RN("cxPZ4Wgvdj8", agc_draw_indirect_get_size);       // sceAgcDcbDrawIndirectGetSize (#2929)
     RN("Abendgtz+3o", agc_dispatch_get_size);            // sceAgcCbDispatchGetSize
     RN("MlEw1feXcjg", agc_patch_release_mem_data);      // ReleaseMem packet: set the data payload
     RN("Ikfdt-rIqCE", agc_jump_patch_target);            // Jump packet: fill in target + dword count (#2711 Q5)
@@ -3538,6 +3584,7 @@ void register_agc_hle() {
     RN("RmaJwLtc8rY", agc_dcb_set_base_indirect_args);       // graphics/compute indirect base
     RN("u2T2DiA5hRI", agc_dcb_stall_command_buffer_parser); // parser visibility barrier
     RN("t1vNu082-jM", agc_dcb_draw_index_indirect);         // indexed indirect draw
+    RN("1q1titRBL6o", agc_dcb_draw_indirect);               // sceAgcDcbDrawIndirect (#2929)
     RN("CtB+A9-VxO0", agc_dcb_dispatch_indirect);           // sceAgcDcbDispatchIndirect (offset)
     RN("j3EtxFkSIhQ", agc_acb_dispatch_indirect);           // sceAgcAcbDispatchIndirect (address)
     RN("WmAc2MEj6Io", agc_dcb_dma_data);        // sceAgcDcbDmaData — append DMA_DATA packet (#117/#312)

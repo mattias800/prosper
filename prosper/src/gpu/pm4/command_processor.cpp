@@ -4631,7 +4631,8 @@ void GpuState::apply(const Pm4Command& c) {
             draws.back().command_order = command_order;
             break;
         }
-        case K::DrawIndexIndirect: {
+        case K::DrawIndexIndirect:
+        case K::DrawIndirect: {
             // #305: bind-vs-work sequence in stream order. Cached — this runs per draw/dispatch,
             // and a per-item environ scan is measurable at this title's ~876k items per route.
             // The three graphics arms emit "DRAW"; the two compute arms below emit "DISPATCH", so
@@ -4653,9 +4654,13 @@ void GpuState::apply(const Pm4Command& c) {
             refresh_state_snapshot();
             Draw d;
             d.state = last_snapshot_;
-            d.indexed = true;
+            // sceAgcDcbDrawIndirect (#2929) is the same packet shape with no index buffer. The
+            // `indexed` flag is what tells the executor which argument-buffer layout to read at the
+            // far end of `indirect_args_addr` — five dwords with an index base, or four without —
+            // so it must carry the packet's own identity rather than a constant.
+            d.indexed = (c.kind == K::DrawIndexIndirect);
             d.modifier = c.di_modifier;
-            d.index_base = index_base;
+            if (d.indexed) d.index_base = index_base;
             d.indirect = true;
             if (indirect_graphics_base <= UINT64_MAX - c.indirect_offset)
                 d.indirect_args_addr = indirect_graphics_base + c.indirect_offset;
@@ -5253,7 +5258,8 @@ size_t run_command_buffer(const uint32_t* buf, size_t dwords, GpuState& st,
                     c.reg_offset + c.reg_count > prosper::agc::Pm4::SPI_SHADER_PGM_LO_ES)
                     ++pgm_writes;
             } else if (c.kind == K::DrawIndex || c.kind == K::DrawIndexAuto ||
-                       c.kind == K::DrawIndexOffset || c.kind == K::DrawIndexIndirect) {
+                       c.kind == K::DrawIndexOffset || c.kind == K::DrawIndexIndirect ||
+                       c.kind == K::DrawIndirect) {
                 ++draws;
             }
         }
