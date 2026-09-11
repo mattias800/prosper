@@ -419,6 +419,17 @@ if(Python3_Interpreter_FOUND)
   # guards a state this repository produces routinely, since every lane pushes after CI starts.
   add_test(NAME pr_merge_gate
            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/ci/test_pr_merge_gate.py")
+  # pr_body.py answers "is the PR body actually what I published?" (#2918). `gh pr edit --body-file`
+  # was observed returning rc=1 on a GraphQL projects-deprecation error WITHOUT applying the edit,
+  # leaving a stale body the author believed was corrected -- and a PR body is where reviewers and
+  # the merge step take the author's account of the change.
+  #
+  # Every arm is hermetic: `pr_body.run` is replaced by a fake, so a write that reports success
+  # while changing nothing is reachable on demand rather than by waiting for GitHub to misbehave.
+  # That arm is the one that matters -- an implementation trusting the write's exit code passes
+  # every other arm in the file. Platform-independent: nothing here reads /proc or shells out.
+  add_test(NAME pr_body_readback
+           COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/ci/test_pr_body.py")
   add_test(NAME session_start
            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/test_session_start.py")
   # PROSPER_ENV_ON/_VALUE sample getenv once and return it forever. Applied to a name a TEST arms at
