@@ -77,6 +77,9 @@ int main() {
         { "DrawIndexAuto",      "WrdP9Zxx3lQ", "Yw0jKSqop+E", 7, 0, 0, 0, 0, 0 },
         { "DrawIndexOffset",    "qMlfB1ZhMDc", "B+aG9DUnTKA", 3, 0, 0, 0, 0, 0 },
         { "DrawIndexIndirect",  "mStuvI0zOtc", "t1vNu082-jM", 4, 0, 0, 0, 0, 0 },
+        // #2929: the NON-indexed sibling. Registered late, so this row is also the guard that the
+        // pair exists at all — Hle::lookup of either NID returning null fails the first CHECK.
+        { "DrawIndirect",       "cxPZ4Wgvdj8", "1q1titRBL6o", 4, 0, 0, 0, 0, 0 },
         { "Dispatch",           "Abendgtz+3o", "k3GhuSNmBLU", 6, 0, 0, 0, 0, 0 },
         { "DispatchIndirect/D", "w8HVkEeXPv8", "CtB+A9-VxO0", 4, 0, 0, 0, 0, 0 },
         // The ACB form is 5, not 4: it carries a whole 64-bit argument address where the DCB form
