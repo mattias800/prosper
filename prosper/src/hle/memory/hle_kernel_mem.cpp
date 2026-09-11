@@ -353,7 +353,7 @@ static uint64_t ampr_arglog(const char* tag, uint64_t a0, uint64_t a1, uint64_t 
 }
 
 uint64_t prosper_apr_next_token(unsigned ring);                          // hle_kernel_time.cpp
-void prosper_eq_add_apr(uint64_t eq, int64_t id);                        // "
+void prosper_eq_add_apr(uint64_t eq, int64_t id, uint64_t udata);        // "
 uint64_t prosper_eq_identity(uint64_t eq);                               // " (lifetime guard)
 void prosper_eq_post_apr_token(uint64_t eq, uint64_t eq_identity,
                                int64_t id, uint64_t token);              // " (tag echo, #208)
@@ -506,7 +506,7 @@ static uint64_t apr_cb_set_equeue(uint64_t command_size, bool eager_completion,
                                  uint64_t a0, uint64_t a1, uint64_t a2,
                                  uint64_t a3, uint64_t a4, uint64_t a5) {
     ampr_arglog("H896Pt-yB4I(CbSetEqueue)", a0, a1, a2, a3, a4, a5);
-    if (a1) prosper_eq_add_apr(a1, (int64_t)a2);
+    if (a1) prosper_eq_add_apr(a1, (int64_t)a2, 0);   // binding call carries no udata
     bool start_worker = false;
     if (a0) {
         AprBoundState& state = apr_bound_state();
@@ -2643,7 +2643,7 @@ HLE(k_ampr_measure_write_equeue) { // sSAUCCU1dv4 = sceAmprMeasureCommandSizeWri
     // DOLL's older SDK wrapper passes the live event queue and APR id here while constructing its
     // listener. Until prosper executes the encoded command itself, preserve that registration as
     // a compatibility side effect. Sonic's sizing call passes a null queue and remains pure.
-    if (a0) prosper_eq_add_apr(a0, (int64_t)a1);
+    if (a0) prosper_eq_add_apr(a0, (int64_t)a1, 0);   // sizing call carries no udata
     return 20;
 }
 HLE(k_ampr_destruct_320) {

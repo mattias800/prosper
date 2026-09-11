@@ -36,6 +36,34 @@ bool install_stubs(const std::vector<ImportSlot>& slots, uint64_t stub_base,
 // Publishes the grown table to the dispatcher after the last new stub is written.
 bool append_stubs(const std::vector<ImportSlot>& slots, size_t first_new, std::string* err);
 
+// The aperture the import-DATA table lives in, sized like the stub aperture. install_import_data
+// claims exactly this much from `data_base`; for the production base it is
+// [BOOT_IMPORT_DATA, BOOT_IMPORT_DATA_END).
+inline constexpr uint64_t kImportDataApertureBytes = 0x10000000ull;   // 256 MiB
+
+// Create the import-DATA region at `data_base`: one `stride`-byte, zero-filled, READ|WRITE (never
+// EXEC) slot per unresolved STT_OBJECT import (#3529).
+//
+// Reads of an unresolved variable then see an honest zero, and a write lands on a page that holds
+// nothing but that variable — instead of on the executable stub table, where it silently rewrote a
+// trampoline. Non-executable is the second half of that: a control transfer to a data import now
+// faults where it is raised rather than executing whatever bytes are there.
+//
+// No initial values are supplied. prosper does not know what an unimplemented Sony variable
+// contains, and zero is the one answer that is at least self-consistent — a guest that stores its
+// own value reads that value back, and one that never stores reads the same zero every time.
+bool install_import_data(const std::vector<ImportSlot>& slots, uint64_t data_base,
+                         uint64_t stride, std::string* err);
+
+// Extend the import-DATA region for slots appended after install_import_data ran, mirroring
+// append_stubs (a runtime sceKernelLoadStartModule can import a variable too). Already-mapped pages
+// are never remapped: relocated guest code holds addresses inside them and a MAP_FIXED would
+// discard whatever the guest has already written there.
+bool append_import_data(const std::vector<ImportSlot>& slots, size_t first_new, std::string* err);
+
+// Address of the idx-th import-data slot (for tests/bring-up). 0 when none is installed.
+uint64_t import_data_addr(uint64_t idx);
+
 // Install the fault handler for genuine guest faults during a run.
 void install_trap_handler();
 

@@ -323,7 +323,7 @@ bool boot_program(const std::string& d, Program& p, std::string* err,
     std::vector<LinkInput> in = boot_link_inputs(d);
 
     std::string e;
-    if (!link_program(in, BOOT_STUB, p, &e)) return fail("link failed: " + e);
+    if (!link_program(in, BOOT_STUB, BOOT_IMPORT_DATA, p, &e)) return fail("link failed: " + e);
     // Loud, self-describing report of every auto-linked plugin the linker refused: which module was
     // dropped, the exact NID that collided, and which already-linked module owns it.
     for (const auto& s : p.skipped_modules)
@@ -345,10 +345,10 @@ bool boot_program(const std::string& d, Program& p, std::string* err,
         if (p.aliased_exports.size() > shown)
             printf("export alias: ... and %zu more\n", p.aliased_exports.size() - shown);
     }
-    printf("linked %zu modules; %zu imports (%zu cross-module, %zu stub slots); %zu init fns; "
-           "%zu aliased exports\n",
+    printf("linked %zu modules; %zu imports (%zu cross-module, %zu stub slots, %zu data slots); "
+           "%zu init fns; %zu aliased exports\n",
            p.mods.size(), p.total_imports, p.resolved_cross_module, p.slots.size(),
-           p.init_fns.size(), p.aliased_exports.size());
+           p.data_slots.size(), p.init_fns.size(), p.aliased_exports.size());
 
     // Diagnostics: linking complete.
     diagnostics::record_boot_phase(diagnostics::BootPhase::LINKING);
@@ -400,6 +400,12 @@ bool boot_program(const std::string& d, Program& p, std::string* err,
     // is synchronised either way (dispatch_append_slots), this just avoids the copy.
     p.slots.reserve(p.slots.size() + 1024);
     if (!install_stubs(p.slots, p.stub_base, p.stub_size, &e)) return fail("stubs failed: " + e);
+    // The writable aperture behind every unresolved DATA import (#3529). Installed here rather than
+    // lazily: the guest reaches a data import during the very first init_array below (libc's own
+    // startup writes __stack_chk_guard), so the pages must exist before run_guest_inits runs.
+    p.data_slots.reserve(p.data_slots.size() + 128);
+    if (!install_import_data(p.data_slots, p.data_base, p.data_stride, &e))
+        return fail("import data failed: " + e);
     install_trap_handler();
 
     // Diagnostics: stubs and trap handler installed.

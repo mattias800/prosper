@@ -48,6 +48,7 @@ static int fails = 0;
 static constexpr uint64_t kBase0    = 0x400000000ull;
 static constexpr uint64_t kBase1    = 0x500000000ull;
 static constexpr uint64_t kStubBase = 0x700000000ull;
+static constexpr uint64_t kDataBase = 0x7c0000000ull;   // import-DATA aperture (#3529)
 
 static bool contains(const std::string& hay, const std::string& needle) {
     return hay.find(needle) != std::string::npos;
@@ -81,7 +82,7 @@ int main() {
     auto link_error = [&](const std::string& path) {
         const std::vector<LinkInput> inputs = { { good_path, kBase0 }, { path, kBase1 } };
         Program p; std::string err;
-        return link_program(inputs, kStubBase, p, &err) ? std::string() : err;
+        return link_program(inputs, kStubBase, kDataBase, p, &err) ? std::string() : err;
     };
 
     // ---- module-level rejections. Each spec differs from `good_spec` in exactly one field. -------
@@ -251,7 +252,7 @@ int main() {
         auto init_fns_of = [&](const std::string& path) {
             const std::vector<LinkInput> inputs = { { good_path, kBase0 }, { path, kBase1 } };
             Program p; std::string err;
-            if (!link_program(inputs, kStubBase, p, &err)) return std::vector<uint64_t>{ 0xbad };
+            if (!link_program(inputs, kStubBase, kDataBase, p, &err)) return std::vector<uint64_t>{ 0xbad };
             return p.init_fns;
         };
         const std::vector<uint64_t> ctl_fns = init_fns_of(ctl_path);

@@ -29,12 +29,15 @@ int main(int argc, char** argv) {
         { dump + "/Media/Modules/PS5Util.prx",    0x4c0000000ull },
     };
     const uint64_t STUB_BASE = 0x600000000ull;
+    const uint64_t DATA_BASE = 0x7c0000000ull;   // import-DATA aperture (#3529)
 
     Program prog;
     std::string err;
-    if (!link_program(inputs, STUB_BASE, prog, &err)) { printf("  [FAIL] link: %s\n", err.c_str()); return 1; }
-    printf("  linked %zu modules: %zu imports (%zu cross-module, %zu stubbed / %zu slots)\n",
-           prog.mods.size(), prog.total_imports, prog.resolved_cross_module, prog.stubbed, prog.slots.size());
+    if (!link_program(inputs, STUB_BASE, DATA_BASE, prog, &err)) { printf("  [FAIL] link: %s\n", err.c_str()); return 1; }
+    printf("  linked %zu modules: %zu imports (%zu cross-module, %zu stubbed / %zu slots, "
+           "%zu data / %zu data slots)\n",
+           prog.mods.size(), prog.total_imports, prog.resolved_cross_module, prog.stubbed,
+           prog.slots.size(), prog.bound_data, prog.data_slots.size());
 
     // Register the linked module set so sceKernelLoadStartModule resolves the game's OWN runtime
     // PRX loads to real handles (#146/#147) — the guest LoadStartModule's its preloaded Il2Cpp/
@@ -49,6 +52,8 @@ int main(int argc, char** argv) {
     for (auto& img : prog.imgs)
         if (!map_image(img, &err)) { printf("  [FAIL] map: %s\n", err.c_str()); return 1; }
     if (!install_stubs(prog.slots, prog.stub_base, prog.stub_size, &err)) { printf("  [FAIL] stubs: %s\n", err.c_str()); return 1; }
+    if (!install_import_data(prog.data_slots, prog.data_base, prog.data_stride, &err)) {
+        printf("  [FAIL] import data: %s\n", err.c_str()); return 1; }
     install_trap_handler();
 
     volatile int* p = (volatile int*)mmap(nullptr, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);

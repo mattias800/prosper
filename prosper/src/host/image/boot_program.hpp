@@ -51,6 +51,15 @@ inline constexpr uint64_t BOOT_STUB     = 0x600000000ull;
 // (Kept clear of the ad-hoc stub bases a few unit tests pass to install_stubs — 0x680000000,
 // 0x710000000, 0x720000000, 0x730000000 — so a future test that boots a program and loads a module
 // in one process cannot alias them.)
+// The import-DATA aperture (#3529): one writable, non-executable, zero-filled page per unresolved
+// STT_OBJECT import. Deliberately OUTSIDE [0x600000000, 0x700000000) -- callback_fs.hpp reads any
+// return address in that window as an import-stub frame, and exec_image.hpp's comment above
+// kStubApertureBytes says nothing else may be mapped in it. Also clear of the ad-hoc stub bases a
+// few unit tests pass to install_stubs (0x680000000, 0x710000000-0x730000000) and of the runtime
+// PRX pool below.
+inline constexpr uint64_t BOOT_IMPORT_DATA     = 0x7c0000000ull;
+inline constexpr uint64_t BOOT_IMPORT_DATA_END = 0x7d0000000ull;   // 256 MiB, as for the stubs
+
 inline constexpr uint64_t BOOT_RUNTIME_MODULE_BASE   = 0x800000000ull;
 inline constexpr uint64_t BOOT_RUNTIME_MODULE_STRIDE = 0x8000000ull;   // 128 MiB
 inline constexpr unsigned BOOT_RUNTIME_MODULE_SLOTS  = 48;
@@ -98,6 +107,11 @@ inline const char* guest_module_name(uint64_t a) {
     // which slot holds which module is a run-local fact, so the offset is reported modulo the
     // stride and the exact module comes from the loader's own [loadmod] line.
     if (a >= BOOT_RUNTIME_MODULE_BASE && a < BOOT_RUNTIME_MODULE_END) return "runtime-prx";
+    // Deliberately labelled but NOT added to guest_va_in_module below: the label makes a fault
+    // report say which unresolved variable was touched, while guest_va_in_module feeds
+    // guest_va_in_module_code, and this aperture is data. A stack scan must not mistake it for a
+    // guest return address.
+    if (a >= BOOT_IMPORT_DATA && a < BOOT_IMPORT_DATA_END) return "import-data";
     return "mapped/host";
 }
 inline uint64_t guest_module_offset(uint64_t a) {
@@ -121,6 +135,7 @@ inline uint64_t guest_module_offset(uint64_t a) {
     if (a >= BOOT_STUB          && a < 0x610000000ull)     return a - BOOT_STUB;
     if (a >= BOOT_RUNTIME_MODULE_BASE && a < BOOT_RUNTIME_MODULE_END)
         return (a - BOOT_RUNTIME_MODULE_BASE) % BOOT_RUNTIME_MODULE_STRIDE;
+    if (a >= BOOT_IMPORT_DATA && a < BOOT_IMPORT_DATA_END) return a - BOOT_IMPORT_DATA;
     return a;
 }
 // End of the import-stub aperture. install_stubs reserves this whole window (never more), so a stub

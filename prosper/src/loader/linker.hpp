@@ -58,11 +58,56 @@ struct LinkInput {
 struct Program {
     std::vector<std::unique_ptr<Module>> mods;   // unique_ptr: stable addresses for imports[]
     std::vector<LoadedImage>             imgs;    // parallel to mods
-    std::vector<ImportSlot>              slots;   // unresolved imports -> stub slots
+    std::vector<ImportSlot>              slots;   // unresolved FUNCTION imports -> code stub slots
     std::vector<uint64_t>                init_fns; // dependent-module init fns, in call order
     std::vector<TlsModuleDesc>           tls_templates; // indexed by module TLS id (0 = unused)
     uint64_t entry = 0;                            // main module entry
     uint64_t stub_base = 0, stub_size = 96;   // 96 contains the largest guest-%fs swap stub (94 bytes)
+
+    // Unresolved DATA imports (ELF STT_OBJECT) -> slots in a separate, writable, NON-executable,
+    // zero-initialised aperture. A data import names a VARIABLE, not an entry point: the guest
+    // dereferences it, and it may STORE through it (libc initialises `__stack_chk_guard` that way).
+    //
+    // Before #3529 these shared the code-stub aperture with function imports, which produced two
+    // distinct defects. A read returned the first bytes of an emitted trampoline -- on NINJA GAIDEN
+    // 4 (PPSA25258) the stack canary read 0x000000bf, the `mov edi, 0` that opens `emit_unimpl` --
+    // so every `-fstack-protector` epilogue compared a machine-code word against a saved 0 and
+    // called `__stack_chk_fail`. And a WRITE landed on prosper's own executable pages, silently
+    // rewriting whichever stub occupied the slot, after which that import jumped into altered code
+    // at an arbitrarily later moment.
+    //
+    // The population is not exotic, and these figures are the TOOL'S OWN -- `nid_census --data-only`
+    // over the 60 local dump roots, whose default scope is already the loader's link set:
+    //
+    //   scope: 2284 distinct imported NIDs over 338 module(s) read, 0 unreadable
+    //   424 DATA binding(s) unresolved by any sibling module, over 60 of 60 input(s);
+    //   a further 1566 were satisfied cross-module
+    //
+    //   f7uOxY9mM1U  __stack_chk_guard   libkernel            60 of 60 titles
+    //   djxxOmW6-aw  __progname          libkernel            60 of 60 titles
+    //   ZT4ODD2Ts9o  (unnamed)           libSceLibcInternal   51 titles
+    //   GAtITrgxKDE  (unnamed)           libSceNet             1 title
+    //
+    // QUOTE LINK-SET FIGURES, NOT DISK FIGURES, and take them from the tool. Two earlier revisions
+    // of this comment got it wrong in the same way and the second was written while correcting the
+    // first: "596 shipped modules" came from passing MODULE PATHS to nid_census individually (the
+    // mechanism is verified -- that scan sees 808 modules, 728 importing the guard -- though the
+    // exact figure 596 has not been reproduced), where
+    // each .prx becomes its own "title" and cross-module exclusion degenerates -- a recursive
+    // population of 808 modules the linker never links. The replacement then said the link set is
+    // "roughly 303 modules", which is a BINDING count written where a module count goes. The
+    // per-title counts survived both errors intact, which is exactly what made the numbers under
+    // them easy to repeat unchecked. Corrected in review of #3541.
+    // Whether a given one reaches a stub depends on the title's own libc: an import a sibling module
+    // defines is bound to that definition and never comes here.
+    std::vector<ImportSlot> data_slots;
+    uint64_t data_base = 0;
+    // One page per data object. The size of an imported variable is NOT knowable here -- an
+    // undefined symbol carries st_size 0 throughout this corpus -- so the stride is chosen to be
+    // larger than any plausible scalar or small struct rather than derived. Untouched pages cost no
+    // physical memory, so a generous stride is close to free and keeps an over-long store inside its
+    // own slot instead of on its neighbour's.
+    uint64_t data_stride = 4096;
 
     // Global export table: NID -> absolute guest address (first definition wins). Retained so the
     // HLE can serve sceKernelDlsym by name (nid_hash(name)) against loaded modules — e.g. resolve
@@ -104,8 +149,9 @@ struct Program {
     struct AliasedExport { std::string nid, winner_path, loser_path; uint64_t winner, loser; };
     std::vector<AliasedExport> aliased_exports;
 
-    // Stats for reporting.
-    size_t total_imports = 0, resolved_cross_module = 0, stubbed = 0;
+    // Stats for reporting. Every import lands in exactly one bucket:
+    // total_imports == resolved_cross_module + stubbed + bound_data.
+    size_t total_imports = 0, resolved_cross_module = 0, stubbed = 0, bound_data = 0;
 };
 
 // The exported NIDs a module contributes to the global export table: defined (non-import),
@@ -136,7 +182,13 @@ struct ExportSubsumption {
 
 // Link the given modules (the first is the main executable). Applies relocations.
 // Returns false with *err on failure.
-bool link_program(const std::vector<LinkInput>& inputs, uint64_t stub_base,
+//
+// `stub_base` roots the executable import-stub aperture and `data_base` the writable import-DATA
+// aperture; the two must not overlap and neither may be 0. `data_base` is a required argument rather
+// than a defaulted one on purpose: there is no safe fallback for a data import (binding it into the
+// code aperture is the defect #3529 records, and binding it near address 0 is worse), so a caller
+// that has not mapped an aperture must be a compile error rather than a silent regression.
+bool link_program(const std::vector<LinkInput>& inputs, uint64_t stub_base, uint64_t data_base,
                   Program& out, std::string* err);
 
 } // namespace prosper

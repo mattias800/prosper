@@ -51,6 +51,7 @@ static constexpr uint64_t kBase0    = 0x400000000ull;
 static constexpr uint64_t kBase1    = 0x500000000ull;
 static constexpr uint64_t kBase2    = 0x600000000ull;
 static constexpr uint64_t kStubBase = 0x700000000ull;
+static constexpr uint64_t kDataBase = 0x7c0000000ull;   // import-DATA aperture (#3529)
 
 // The 8 bytes at `rel_va` inside linked module `mod_index`, or a sentinel the tests cannot mistake
 // for a real address when the read is out of range.
@@ -81,6 +82,9 @@ int main() {
     const std::string kHandA    = nid_hash("prosperHandmadeExportA");
     const std::string kHandB    = nid_hash("prosperHandmadeExportB");
     const std::string kHandImp  = nid_hash("prosperHandmadeImport");
+    // #3529: one NID moved between the FUNC and DATA import lists is the whole discriminator.
+    const std::string kVar      = nid_hash("prosperSynthUnsatisfiedVariable");
+    const std::string kVarDefined = nid_hash("prosperSynthDefinedVariable");
 
     const std::string dir = prosper_test::test_scratch_dir().string();
     auto emit = [&](const char* name, const SynthModuleSpec& spec) {
@@ -136,7 +140,7 @@ int main() {
             { main_path, kBase0 }, { release_path, kBase1 }, { logging_path, kBase2 },
         };
         Program p; std::string err;
-        const bool ok = link_program(inputs, kStubBase, p, &err);
+        const bool ok = link_program(inputs, kStubBase, kDataBase, p, &err);
         CHECK(ok, "control: link_program succeeds on three synthetic modules");
         if (!ok) { printf("  link error: %s\n", err.c_str()); printf("FAILED\n"); return 1; }
 
@@ -219,7 +223,7 @@ int main() {
         };
         inputs[2].skip_on_export_collision = true;
         Program p; std::string err;
-        const bool ok = link_program(inputs, kStubBase, p, &err);
+        const bool ok = link_program(inputs, kStubBase, kDataBase, p, &err);
         CHECK(ok, "duplicate build: link_program succeeds");
         CHECK(p.skipped_modules.size() == 1, "duplicate build: the subsumed module is skipped");
         CHECK(p.mods.size() == 2, "duplicate build: only the two other modules are linked");
@@ -254,7 +258,7 @@ int main() {
         };
         inputs[2].skip_on_export_collision = true;
         Program p; std::string err;
-        const bool ok = link_program(inputs, kStubBase, p, &err);
+        const bool ok = link_program(inputs, kStubBase, kDataBase, p, &err);
         CHECK(ok, "distinct library: link_program succeeds");
         CHECK(p.skipped_modules.empty(), "distinct library: the module is NOT skipped");
         CHECK(p.mods.size() == 3, "distinct library: all three modules are linked");
@@ -276,7 +280,7 @@ int main() {
         };
         inputs[2].skip_on_export_collision = true;
         Program p; std::string err;
-        const bool ok = link_program(inputs, kStubBase, p, &err);
+        const bool ok = link_program(inputs, kStubBase, kDataBase, p, &err);
         CHECK(ok, "mutation: link_program succeeds");
         CHECK(p.skipped_modules.empty(),
               "mutation: a flagged module whose exports are all distinct is NOT skipped");
@@ -292,7 +296,7 @@ int main() {
         };
         inputs[2].skip_on_export_collision = true;
         Program p; std::string err;
-        const bool ok = link_program(inputs, kStubBase, p, &err);
+        const bool ok = link_program(inputs, kStubBase, kDataBase, p, &err);
         CHECK(ok, "valueless: link_program succeeds");
         CHECK(p.skipped_modules.empty(),
               "valueless: a defined symbol with st_value 0 does not collide (it is not an export)");
@@ -309,7 +313,7 @@ int main() {
     {
         const std::vector<LinkInput> inputs = { { main_path, kBase0 }, { alt_path, kBase2 } };
         Program p; std::string err;
-        const bool ok = link_program(inputs, kStubBase, p, &err);
+        const bool ok = link_program(inputs, kStubBase, kDataBase, p, &err);
         CHECK(ok, "no-exporter: link_program succeeds");
         CHECK(p.slots.size() == 3, "no-exporter: all three imports now need stub slots");
         CHECK(p.slots.size() == 3 && p.slots[0].nid == kShared && p.slots[1].nid == kOnlyA &&
@@ -337,7 +341,7 @@ int main() {
 
             const std::vector<LinkInput> inputs = { { importer_path, kBase0 }, { hand_path, kBase1 } };
             Program p;
-            const bool ok = link_program(inputs, kStubBase, p, &err);
+            const bool ok = link_program(inputs, kStubBase, kDataBase, p, &err);
             CHECK(ok, "handmade: link_program accepts a module laid out by hand");
             if (!ok) printf("  link error: %s\n", err.c_str());
 
@@ -362,12 +366,93 @@ int main() {
             std::vector<LinkInput> guarded = { { hand_path, kBase1 }, { clash_path, kBase2 } };
             guarded[1].skip_on_export_collision = true;
             Program g;
-            const bool okg = link_program(guarded, kStubBase, g, &err);
+            const bool okg = link_program(guarded, kStubBase, kDataBase, g, &err);
             CHECK(okg, "handmade: the guarded link succeeds");
             CHECK(g.skipped_modules.size() == 1 && g.skipped_modules[0].owner_path == hand_path &&
                   g.skipped_modules[0].nid == kHandA,
                   "handmade: the collision guard fires with the hand-built module as the owner");
         }
+    }
+
+    // ---- Arm 7: a DATA import must not be bound into the executable stub aperture (#3529) -------
+    //
+    // The two link inputs below differ in how ONE symbol is DECLARED and in nothing else that the
+    // linker reads: `data_arm` declares kVar as STT_OBJECT referenced by an R_X86_64_GLOB_DAT,
+    // `func_arm` declares the SAME NID, at the same symbol index, from the same library, at the same
+    // GOT offset, as STT_FUNC referenced by an R_X86_64_JUMP_SLOT -- the two ways a real module
+    // spells "variable" and "function". Of that pair only `st_info` reaches pass 2 (module.cpp
+    // handles GLOB_DAT and JUMP_SLOT identically), so the arm isolates the type.
+    //
+    // The pair therefore does not merely assert that a data import lands somewhere; it shows that
+    // moving the DECLARATION moves the binding, which is what distinguishes this from a test that
+    // would also pass against the old linker.
+    //
+    // Before #3529, `data_arm` produced exactly what `func_arm` produces: two stub slots and no data
+    // slot. That is the mutation -- delete the STT_OBJECT branch in linker.cpp pass 2 and this arm
+    // fails on its first four assertions.
+    {
+        SynthModuleSpec data_arm;
+        data_arm.imports      = { kMissing };
+        data_arm.data_imports = { kVar };
+        SynthModuleSpec func_arm;
+        func_arm.imports = { kMissing, kVar };     // same two NIDs, both as functions
+
+        const std::string data_path = emit("synth_dataimp.prx", data_arm);
+        const std::string func_path = emit("synth_funcimp.prx", func_arm);
+
+        Program pd; std::string err;
+        CHECK(link_program({ { data_path, kBase0 } }, kStubBase, kDataBase, pd, &err),
+              "data import: link_program succeeds");
+        Program pf;
+        CHECK(link_program({ { func_path, kBase0 } }, kStubBase, kDataBase, pf, &err),
+              "func control: link_program succeeds");
+
+        // The control first: with both imports typed FUNC nothing reaches the data aperture. If this
+        // failed, the assertions below would be measuring something other than the symbol type.
+        CHECK(pf.stubbed == 2 && pf.bound_data == 0 && pf.data_slots.empty(),
+              "func control: two FUNC imports -> two stub slots, no data slot");
+        CHECK(pd.stubbed == 1 && pd.bound_data == 1,
+              "data import: one FUNC + one OBJECT -> one stub slot and one data slot");
+        CHECK(pd.data_slots.size() == 1 && pd.data_slots[0].nid == kVar,
+              "data import: the data slot names the OBJECT symbol's NID");
+        CHECK(pd.total_imports == pd.resolved_cross_module + pd.stubbed + pd.bound_data,
+              "data import: import accounting closes over three buckets");
+
+        // What the guest actually dereferences: the relocated GOT slot, not the linker's bookkeeping.
+        // Import 0 is the FUNC (GOT 0), import 1 is the OBJECT (GOT 1) -- the fixture appends
+        // data_imports after imports.
+        const uint64_t got_func = image_u64(pd, 0, prosper_test::synth_got_va(0));
+        const uint64_t got_data = image_u64(pd, 0, prosper_test::synth_got_va(1));
+        CHECK(got_func == kStubBase, "data import: the FUNC import's GOT slot still points at stub 0");
+        CHECK(got_data == kDataBase,
+              "data import: the OBJECT import's GOT slot points at data slot 0");
+        CHECK(got_data < kStubBase || got_data >= kStubBase + 0x10000000ull,
+              "data import: the OBJECT import's GOT slot is OUTSIDE the executable stub aperture");
+        // And the same NID typed FUNC does land on a stub -- so the NID itself is not what decides.
+        CHECK(image_u64(pf, 0, prosper_test::synth_got_va(1)) == kStubBase + pf.stub_size,
+              "func control: the SAME NID typed FUNC lands on stub 1");
+    }
+
+    // ---- Arm 8: a DATA import a sibling module DEFINES still resolves cross-module ---------------
+    //
+    // The aperture is the fallback, not the rule. If the STT_OBJECT branch were placed before the
+    // export lookup, every title whose own libc.prx defines the variable would silently stop seeing
+    // the real definition and start reading a zero page instead -- a regression invisible to arm 7,
+    // which has no exporter at all. This is the arm that pins the ordering.
+    {
+        SynthModuleSpec provider; provider.exports = { kVarDefined };
+        SynthModuleSpec consumer; consumer.data_imports = { kVarDefined };
+        const std::string prov_path = emit("synth_varprov.prx", provider);
+        const std::string cons_path = emit("synth_varcons.prx", consumer);
+
+        Program p; std::string err;
+        CHECK(link_program({ { cons_path, kBase0 }, { prov_path, kBase1 } },
+                           kStubBase, kDataBase, p, &err),
+              "defined variable: link_program succeeds");
+        CHECK(p.resolved_cross_module == 1 && p.bound_data == 0 && p.data_slots.empty(),
+              "defined variable: an OBJECT import a sibling exports consumes no data slot");
+        CHECK(image_u64(p, 0, prosper_test::synth_got_va(0)) == kBase1 + kExp0,
+              "defined variable: the GOT slot points at the provider's definition");
     }
 
     printf(fails ? "FAILED (%d)\n" : "PASSED\n", fails);
