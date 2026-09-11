@@ -372,7 +372,7 @@ render-state resolve, executor ordering, detile) — it is the right guard for c
 ./build-linux/gpu_replay --dump-rtt-seed 0x7f9f504b0000 /tmp/history.bmp \
   --inspect-only /tmp/submit.prgcap
 ./build-linux/gpu_replay --dump-shader 18:fs /tmp/fragment.spv /tmp/submit.prgcap
-./build-linux/gpu_replay --dump-realized-shader 18:fs /tmp/fragment-rdna2.bin /tmp/submit.prgcap
+./build-linux/gpu_replay --dump-shader-raw 18:fs /tmp/fragment-rdna2.bin /tmp/submit.prgcap
 ./build-linux/gpu_replay --dump-compute 0 /tmp/compute.spv /tmp/submit.prgcap
 ./build-linux/gpu_replay --dump-compute-raw 0 /tmp/compute-rdna2.bin --inspect-only /tmp/submit.prgcap
 ./build-linux/gpu_replay --compute-only 0 /tmp/submit.prgcap
@@ -504,7 +504,7 @@ prints). The recompiler snapshots that instruction's destination VGPR (and the n
 the vertex-position export to it, so the geometry-probe capture reads the value back per vertex. Output shows
 both float and raw hex (intermediate values are frequently integers/bitfields — read the hex for those).
 
-Workflow: `shader_inspect` the draw's VS (`--dump-realized-shader N:vs`) to find the PC whose value you want,
+Workflow: `shader_inspect` the draw's VS (`--dump-shader-raw N:vs`) to find the PC whose value you want,
 then `PROSPER_SHADER_TAP=<pc> PROSPER_GEOM_PROBE=N`. This answers "is prosper fetching the right vertex data /
 computing the right intermediate?" without an oracle — it revealed GTA V #1163's mask draws fetch plausible
 large-integer control coordinates (so the off-screen result is data-driven, not garbage). Vertex stage only; the
@@ -543,7 +543,7 @@ PROSPER_FS_TAP=6:27 ./build-linux/gpu_replay /tmp/submit.prgcap /tmp/out.bmp
 The fragment-stage sibling of `PROSPER_SHADER_TAP`, for "why is this **pixel** the wrong colour?" — capture a
 fragment shader's intermediate at instruction `PC` (the same PC `shader_inspect` prints) and **redirect the
 MRT0 colour export to it**, so semantic draw `DRAW`'s pixels in the rendered frame *are* the value visualised. Unlike the
-VS tap it needs no separate capture — the output BMP is the readout. Point `--dump-realized-shader DRAW:fs` +
+VS tap it needs no separate capture — the output BMP is the readout. Point `--dump-shader-raw DRAW:fs` +
 `shader_inspect` at the FS to find the PC (an `image_sample`/MIMG result, a UV, a pre-blend colour), then
 `PROSPER_FS_TAP=DRAW:PC`. gpu_replay re-recompiles only that draw's FS (needs a v19+ capsule with the raw FS
 stream); the rest of the frame renders normally, so read the tapped draw's region.
@@ -614,12 +614,26 @@ before recompiling; a plain replay of stored SPIR-V uses the modules exactly as 
 the point of a plain replay. If you are comparing a replay's vertex interface against the live
 renderer's, use one of the two that re-derive.
 
-`--dump-shader DRAW:vs|fs PATH` writes the recompiled SPIR-V. `DRAW` is the semantic ID printed by
-`--inspect-only`, as it is for the probes above. Capture v19 adds
-`--dump-realized-shader DRAW:vs|vs-main|fs PATH` for the exact bounded raw RDNA2 stream that produced that realized
-draw stage, suitable for `shader_inspect`. The VS/FS streams use the same content-addressed 64 KiB-per-stage,
+**The two graphics shader dumps produce opposite things, and the flag names have misled an
+investigation before (#3372).** `--dump-shader DRAW:vs|fs PATH` writes **prosper's recompiled
+SPIR-V**; `--dump-shader-raw DRAW:vs|vs-main|fs PATH` (capture v19+) writes **the guest's raw
+RDNA2 words** that fed it, suitable for `shader_inspect`. The `-raw` suffix means the same thing
+it does in the `--dump-compute` / `--dump-compute-raw` pair: the recompiler's input rather than
+its output. `--dump-realized-shader` remains accepted as an alias for `--dump-shader-raw`.
+`DRAW` is the semantic ID printed by `--inspect-only`, as it is for the probes above.
+
+The VS/FS streams use the same content-addressed 64 KiB-per-stage,
 64 MiB-total store as failed-shader diagnostics. Captures v1-v18 remain readable; because they did not retain
 realized-stage source identities, this command reports the raw stream as unavailable instead of guessing.
+
+`PROSPER_SHADER_DUMP_SUCCESS=DIR` is honoured **only in the modes that recompile**. A plain replay
+runs the capsule's stored SPIR-V and recompiles nothing, so nothing calls the hook and the
+directory stays empty — which reads as “that program never compiled”, the trap
+`src/gpu/diagnostics/AGENTS.md` warns about. `--recompile-raw` and `--retry-failed-*` **do**
+recompile, through `compute_recompile.hpp` → `gpu::recompile_compute_shader_cached`, which
+calls the hook on every exit path, so the variable works under those. `gpu_replay` warns on
+startup when the variable is set and the invocation will not reach it. For one shader by draw, use
+the per-draw flags above.
 
 Selected draw ranges and ordered prefixes write the BMP at the final selected draw target's extent when
 the returned RGBA byte count confirms that native size. Presentation-scaled replays retain the capsule's
@@ -723,7 +737,7 @@ These environment variables are localization probes, not fixes, and their output
 regression oracle.
 
 Every user-facing `DRAW` selector (`--draw`, `--dump-resource`, `--dump-shader`,
-`--override-resource`, `--dump-realized-shader`, `PROSPER_GEOM_PROBE`, and `PROSPER_FS_TAP`) uses
+`--override-resource`, `--dump-shader-raw`, `PROSPER_GEOM_PROBE`, and `PROSPER_FS_TAP`) uses
 the stable semantic draw ID
 printed as `draw[ID]` by `--inspect-only`. The adjacent `item=I` is only the compact realized-vector offset;
 it can differ after an unrealized draw and is never a selector. Mixed `operation[N]` ordinals remain a separate,
