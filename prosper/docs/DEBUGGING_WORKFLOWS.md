@@ -323,7 +323,10 @@ Report per-run median/p95/p99 **frame intervals**, sample count and interval pop
 the distribution of run results rather than pooling all frames as independent trials. Keep
 guest flips, distinct rendered content and host publications separate. F8's 4 Hz rate samples
 cannot supply per-frame percentiles. `flip_pacing_report.py` is a guest-flip diagnostic and filters
-very short intervals; it does not establish distinct-image or host-present frame-time tails.
+very short intervals OUT OF ITS DISTRIBUTION STATISTICS ONLY -- its headline rate is flips
+over the wall-clock span and is unfiltered, because the retained fraction varies per run and
+a rate derived from it is not comparable between arms (#3560). It does not establish
+distinct-image or host-present frame-time tails.
 
 **A guest-flip rate now has a CEILING, and it is not the same in every harness (#3379).** Guest
 flips are paced to the cadence the title asked for -- `sceVideoOutSetFlipRate`'s divisor over the

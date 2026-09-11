@@ -21,6 +21,13 @@ from the tracker issues, and still gated, because it is a projection of state ra
 
 ## 2026-09-11
 
+### Our own frame-pacing instrument was understating the frame rate by up to 40%
+
+The flip-pacing report's headline fps was a mean over intervals it had silently filtered, and
+the filtered fraction differs from run to run: on the #3379 A/B it read 44.1 vs 59.2 fps where
+the truth was 57.8 vs 97.9, which made the pacing fix below -- in fact holding 96% of its
+target -- look like it had missed by a quarter. It now counts flips over the wall clock.
+
 ### Games were running up to three times too fast, and it was the monitor's fault
 
 prosper completed a game's page flip the instant it was ready instead of holding it to the 60 Hz the
