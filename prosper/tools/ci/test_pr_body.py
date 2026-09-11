@@ -242,6 +242,41 @@ rc, out, err = pr_body.run(
     stdin=EM_DASH)
 case("UTF-8 stdin survives the round trip", out, EM_DASH)
 
+print("\n-- reporting a non-ASCII body must not CRASH on a narrow console codepage")
+# Found by dogfooding: `get` against a real PR raised UnicodeEncodeError on a cp1252 stdout for a
+# body containing U+2260, and main()'s catch-all turned that into "COULD NOT VERIFY" -- the tool
+# answering "I cannot tell" purely because it could not print the answer. The fixture is a real
+# cp1252 text stream, so the arm reproduces it on every platform rather than only on Windows.
+def cp1252_stream():
+    return io.TextIOWrapper(io.BytesIO(), encoding="cp1252", errors="strict", newline="")
+
+
+s = cp1252_stream()
+try:
+    pr_body.emit(s, "line 1 differs: \u2260 and \u2014")   # raised, before the fix
+    s.flush()
+    got = s.buffer.getvalue().decode("cp1252")
+except UnicodeEncodeError as exc:
+    # Reported as a named failure rather than allowed to escape: an uncaught traceback is a red
+    # suite too, but it stops every later arm and says nothing about what was being asserted.
+    got = ""
+    case("emit does not raise on a narrow codepage", "raised %s" % exc, "no exception")
+case("a report line survives an encoding the body does not fit", got.startswith("line 1 differs:"),
+     True)
+case("and the unencodable characters are substituted, not dropped", "?" in got, True)
+
+# ...but CONTENT is byte-exact, because `get > file` must round-trip. A substituted character here
+# would silently corrupt the body, and feeding it back to `verify` would report a mismatch the PR
+# does not have.
+s = cp1252_stream()
+try:
+    pr_body.write_body_out(s, "a body with \u2260 and \u2014")
+    written = s.buffer.getvalue()
+except UnicodeEncodeError as exc:
+    written = b"<raised %s>" % str(exc).encode("ascii", "replace")
+case("`get` writes UTF-8 bytes, bypassing the console codepage",
+     written, "a body with \u2260 and \u2014\n".encode("utf-8"))
+
 print()
 if FAILURES:
     print("FAILED (%d):" % len(FAILURES))

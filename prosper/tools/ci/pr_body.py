@@ -181,6 +181,44 @@ def set_and_verify(pr: int, body: str, repo_dir: str = ".") -> tuple[bool, list[
     return ok, notes
 
 
+def emit(stream, text: str) -> None:
+    """Write one line of REPORT text, degrading characters the stream cannot encode.
+
+    A console codepage narrower than the body is not hypothetical: on a Windows host `sys.stdout`
+    is cp1252, and printing a body containing an em dash or a not-equal sign raises
+    UnicodeEncodeError. That crash is caught by main()'s catch-all and reported as
+    "COULD NOT VERIFY" -- so a tool whose entire job is to tell you whether the live text is right
+    would answer "I cannot tell" for the sole reason that it could not PRINT the answer. Found by
+    running `get` against a real PR.
+
+    Degrading rather than raising is correct for a report: the verdict and the line number are the
+    payload, and a substituted glyph in a quoted line does not change either. `write_body_out`
+    below is the opposite case and stays byte-exact.
+    """
+    enc = getattr(stream, "encoding", None)
+    if enc:
+        text = text.encode(enc, "replace").decode(enc, "replace")
+    stream.write(text + "\n")
+
+
+def write_body_out(stream, body: str) -> None:
+    """Write a body to stdout BYTE-EXACTLY, so `pr_body.py get <N> > file` round-trips.
+
+    The opposite choice from `emit`: this is content, not a report, and a substituted character
+    here would silently corrupt whatever the caller does with it next -- including feeding it back
+    to `verify`, which would then report a mismatch the body does not have. So it goes out as UTF-8
+    bytes through the binary buffer, bypassing the console codepage entirely. Falls back to a plain
+    write for streams that have no buffer (a StringIO under test).
+    """
+    buf = getattr(stream, "buffer", None)
+    if buf is None:
+        stream.write(body + "\n")
+        return
+    stream.flush()
+    buf.write(body.encode("utf-8") + b"\n")
+    buf.flush()
+
+
 def _read_intended(args) -> str:
     if args.body is not None:
         return args.body
@@ -227,7 +265,7 @@ def main(argv=None) -> int:
                 print("PR #%d body -> %s (%d chars)" % (args.pr, args.out, len(body)),
                       file=sys.stderr)
             else:
-                print(body)
+                write_body_out(sys.stdout, body)
             return 0
 
         intended = _read_intended(args)
@@ -245,9 +283,9 @@ def main(argv=None) -> int:
         return 2
 
     stream = sys.stdout if ok else sys.stderr
-    print("PR #%d: %s" % (args.pr, "BODY VERIFIED" if ok else "BODY MISMATCH"), file=stream)
+    emit(stream, "PR #%d: %s" % (args.pr, "BODY VERIFIED" if ok else "BODY MISMATCH"))
     for n in notes:
-        print("  " + n, file=stream)
+        emit(stream, "  " + n)
     return 0 if ok else 1
 
 
