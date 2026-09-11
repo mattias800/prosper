@@ -4,6 +4,7 @@
 #include "shared/device/storage_image_contract.hpp"  // #3531: the OOB image-read contract
 #include "shared/texture/write_watch_census.hpp"
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -421,7 +422,23 @@ void report_live_compute_timing_selector_summary();
 
 // Persist the driver pipeline cache without tearing the compute context down. prosper-app cannot
 // run C++/Vulkan destructors while its guest thread is detached, so its deliberate _Exit path calls
-// this explicitly after requesting the guest stop.
-void flush_live_compute_pipeline_cache();
+// this explicitly after requesting the guest stop (frontends/prosper-app/main.cpp). Returns whether
+// a file was actually written, so "nothing to save" is distinguishable from "the save declined".
+//
+// It is idempotent and safe to call with no compute context, a lost device, or persistence disabled.
+// `lock_budget` bounds the wait for an in-flight driver compilation: exceeding it costs this run's
+// cache, never the ability to exit. What it does NOT cover is a guest-thread _Exit (#3324) -- that
+// is exit_group() from another thread and no frontend finalize step runs at all.
+bool flush_live_compute_pipeline_cache(
+    std::chrono::milliseconds lock_budget = std::chrono::milliseconds(1000));
+
+// What the disk compute pipeline cache actually did on this launch. Reported as state rather than
+// as a log line so a separate-launch regression test can assert it (#3425).
+struct LiveComputePipelineCacheStatus {
+    bool context_live = false;           // a compute context exists at all
+    bool persistence_configured = false; // a cache path is set, i.e. the opt-in was satisfied
+    uint64_t loaded_bytes = 0;           // bytes the driver ACCEPTED from disk; 0 means cold
+};
+LiveComputePipelineCacheStatus live_compute_pipeline_cache_status();
 
 } // namespace prosper::frontend

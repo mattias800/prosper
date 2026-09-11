@@ -2639,6 +2639,22 @@ if(TARGET prosper_core)
       set_tests_properties(game_compute_exec_scratch_poison PROPERTIES
         ENVIRONMENT "PROSPER_DECODE_SCRATCH_POISON=1")
 
+      # #3425: registered on Windows as well as in the UNIX block below, deliberately. This
+      # defect is about the WINDOWS/NVIDIA frontend's _Exit path and the cost it recovers was
+      # measured there (#3450), so a Linux-only guard would test the fix everywhere except
+      # where it was found. Both registrations run the same fixture and driver script.
+      if(Python3_Interpreter_FOUND)
+        add_executable(test_compute_cache_persistence tests/gpu/execute/test_compute_cache_persistence.cpp)
+        target_include_directories(test_compute_cache_persistence PRIVATE tests frontends)
+        target_link_libraries(test_compute_cache_persistence PRIVATE prosper_live_renderer)
+        add_test(NAME compute_cache_persistence
+                 COMMAND "${Python3_EXECUTABLE}"
+                         "${CMAKE_CURRENT_SOURCE_DIR}/tests/gpu/execute/test_compute_cache_persistence.py"
+                         $<TARGET_FILE:test_compute_cache_persistence>
+                         "${CMAKE_CURRENT_SOURCE_DIR}/frontends/prosper-app/main.cpp")
+        set_tests_properties(compute_cache_persistence PROPERTIES TIMEOUT 300)
+      endif()
+
       # Local-only realized-submit replayer (#514), on Windows since #2331. Same target as the UNIX
       # block below, including the -Werror=switch gate: gpu_replay maps LiveTargetPixelFormat itself
       # in inspect_live_target, and an unhandled member there falls through to the seed's Rgba8Unorm
@@ -3390,6 +3406,20 @@ if(TARGET prosper_core)
                          "${CMAKE_SOURCE_DIR}/tools/perf/test_compute_buffer_timing_runtime.py"
                          $<TARGET_FILE:test_compute_buffer_timing>)
         set_tests_properties(compute_buffer_timing_runtime PROPERTIES TIMEOUT 180)
+        # #3425: the compute driver pipeline cache is written on the frontend's _Exit path, not by a
+        # destructor. Separate processes are required -- a single process could pass while writing
+        # nothing -- and the driver also asserts prosper-app still names the flush.
+        add_executable(test_compute_cache_persistence tests/gpu/execute/test_compute_cache_persistence.cpp)
+        target_include_directories(test_compute_cache_persistence PRIVATE tests frontends)
+        target_link_libraries(test_compute_cache_persistence PRIVATE
+                             prosper_live_renderer prosper_core Vulkan::Vulkan)
+        add_test(NAME compute_cache_persistence
+                 COMMAND "${Python3_EXECUTABLE}"
+                         "${CMAKE_CURRENT_SOURCE_DIR}/tests/gpu/execute/test_compute_cache_persistence.py"
+                         $<TARGET_FILE:test_compute_cache_persistence>
+                         "${CMAKE_CURRENT_SOURCE_DIR}/frontends/prosper-app/main.cpp")
+        set_tests_properties(compute_cache_persistence PROPERTIES TIMEOUT 300)
+
         add_executable(test_compute_buffer_residency tests/gpu/execute/test_compute_buffer_residency.cpp)
         target_include_directories(test_compute_buffer_residency PRIVATE tests frontends)
         target_link_libraries(test_compute_buffer_residency PRIVATE
