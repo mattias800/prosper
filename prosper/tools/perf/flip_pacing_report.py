@@ -40,6 +40,27 @@ FLIP_TAG = re.compile(r"\[ev\] GpuFlip\b")
 # The Win32 timer tick on dev boxes is 15.625 ms; quantized waits land on its multiples.
 TICK_MS = 15.625
 
+# WHERE A BACKWARDS STEP STOPS BEING EMISSION JITTER AND STARTS BEING A RUN BOUNDARY.
+# The detector below counts timestamps that step backwards in file order. Two very different
+# facts produce one, and the report used to print the same sentence -- "this input holds more
+# than one run" -- for both (#3462):
+#
+#   * a RESTART. `evlog_seconds()` (hle_graphics.cpp) is a function-local static initialised on
+#     its own first call, and the only callers are the two flip emitters, so every run's first
+#     flip line is t~=0.000000 and a second run in the same stream steps back by roughly the
+#     FIRST run's whole elapsed time -- seconds to minutes for anything worth pacing.
+#   * a RACE. `evlog_seconds()` is evaluated as an argument and the stream lock is taken
+#     afterwards, so two emitting threads can interleave. That window is the gap between reading
+#     the clock and taking the lock inside one fprintf: microseconds, and at most one scheduler
+#     quantum if the emitting thread is preempted inside it.
+#
+# TICK_MS is a generous ceiling for the second (a preemption cannot resolve faster than the
+# timer tick it waits on) and one second is far below the first. BETWEEN them this tool says it
+# cannot tell -- because it cannot, and a single threshold would only move the boundary and go
+# on printing one of the two sentences for a fact that is neither.
+RACE_MS = TICK_MS
+RESTART_MS = 1000.0
+
 # Half-width of the acceptance band around each tick multiple, as a fraction of the tick.
 # It was a bare 0.15 inside classify() while the report's own sentence said '15%' in a
 # separate literal -- two places to change and one of them silent. Named here so the
@@ -94,9 +115,11 @@ def parse_flips(paths):
         # the epoch is per process, so a second run restarts near zero and steps BACKWARDS in
         # file order. Sorted, that is indistinguishable from one slow run, which is the
         # fabricated distribution this tool must never produce.
-        restarts = sum(1 for a, b in zip(stamps, stamps[1:]) if b < a)
+        # Keep the MAGNITUDES, not just how many. A sub-microsecond race and a 100-second run
+        # boundary are different facts, and a count cannot tell them apart (#3462).
+        backsteps = [(a - b) * 1000.0 for a, b in zip(stamps, stamps[1:]) if b < a]
         stamps.sort()
-        timelines.append((path, stamps, untimed, restarts))
+        timelines.append((path, stamps, untimed, backsteps))
     return timelines
 
 
@@ -172,14 +195,50 @@ def alignment_verdict(share, chance=None, power=1.0):
     return ratio, 'well above chance -- real quantisation'
 
 
-def report(stamps, window_s, tick, untimed=0, restarts=0):
+def describe_backsteps(backsteps):
+    """Name what a set of backwards timestamp steps IS, from the largest one's magnitude.
+
+    Separate from the printing so the classification can be asserted directly, and returned as
+    (kind, sentence) so a caller can branch on the kind rather than on the prose.
+
+    The detector is near-total for its intended case -- concatenating any two real logs always
+    produces a backwards step at the seam, because every run's first flip is t~=0 -- so the
+    question was never whether it fires but what it means when it does. See RACE_MS/RESTART_MS
+    for where the two thresholds come from and why the middle band is left unnamed (#3462).
+    """
+    if not backsteps:
+        return None, ""
+    worst = max(backsteps)
+    count = len(backsteps)
+    if worst >= RESTART_MS:
+        return "restart", (
+            f"WARNING: the timestamps step backwards {count} time(s), the largest by"
+            f" {worst / 1000.0:.3f} s, so this input holds more than one run (the epoch is per"
+            f" process, so a second run restarts near zero). Intervals across a restart are not"
+            f" real. Pass each run as its own argument instead of concatenating them.")
+    if worst <= RACE_MS:
+        return "race", (
+            f"WARNING: the timestamps step backwards {count} time(s), the largest by only"
+            f" {worst:.3f} ms. That is FAR too small to be a run boundary -- a second run steps"
+            f" back by the first run's whole duration -- so it is out-of-order EMISSION: the"
+            f" clock is read before the stream lock is taken, so two emitting threads can"
+            f" interleave. The input is one run; {count} interval(s) below are not real. The"
+            f" remedy is the emitter's ordering, not splitting the input.")
+    return "unclear", (
+        f"WARNING: the timestamps step backwards {count} time(s), the largest by {worst:.1f} ms."
+        f" That is too large for emission jitter (at most one scheduler quantum, ~{RACE_MS:.3f} ms)"
+        f" and too small for a run boundary (a whole run's duration, at least"
+        f" {RESTART_MS / 1000.0:.0f} s), so this tool cannot say which it is. Read the log around"
+        f" the step before trusting any interval that crosses it.")
+
+
+def report(stamps, window_s, tick, untimed=0, backsteps=()):
     # Report the unreadable population WHENEVER it exists, not only when nothing parsed. Two
     # readable flips among thousands of unreadable ones produced a confident distribution over
     # 0.06% of the data and said nothing about the rest -- #3452's own failure, one branch lower.
-    if restarts:
-        print(f"WARNING: the timestamps step backwards {restarts} time(s), so this input holds"
-              f" more than one run (the epoch is per process). Intervals across a restart are not"
-              f" real. Pass each run as its own argument instead of concatenating them.")
+    _, sentence = describe_backsteps(backsteps)
+    if sentence:
+        print(sentence)
     if untimed and stamps:
         share = 100.0 * untimed / (untimed + len(stamps))
         print(f"WARNING: {untimed} of {untimed + len(stamps)} flip line(s) ({share:.1f}%) carried"
@@ -286,12 +345,12 @@ def main():
     # One report per source. Several logs are several runs, each with its own epoch, so they
     # are never merged -- see parse_flips. A header only when there is more than one, so the
     # single-log output a reader already knows is unchanged.
-    for index, (path, stamps, untimed, restarts) in enumerate(timelines):
+    for index, (path, stamps, untimed, backsteps) in enumerate(timelines):
         if len(timelines) > 1:
             if index:
                 print("")
             print(f"=== {path} ===")
-        report(stamps, args.window_s, args.tick_ms, untimed, restarts)
+        report(stamps, args.window_s, args.tick_ms, untimed, backsteps)
     return 0
 
 

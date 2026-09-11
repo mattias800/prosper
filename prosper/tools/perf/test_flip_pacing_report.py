@@ -108,11 +108,27 @@ def main():
         failures.append(f"case 7: emitter source not found at {emitter}")
     else:
         text = emitter.read_text(encoding="utf-8", errors="replace")
-        flip_lines = [line for line in text.splitlines() if "[ev] GpuFlip" in line]
-        if not flip_lines:
-            failures.append("case 7: no [ev] GpuFlip emitter found in hle_graphics.cpp")
-        elif not any("t=%" in line for line in flip_lines):
-            failures.append("case 7: the [ev] GpuFlip emitter writes no t= timestamp, so every real log is unpaceable (#3452): " + flip_lines[0].strip())
+        # BOTH flip emitters, not just the one this parser reads. They are ALTERNATIVES: the
+        # in-stream GPU flip (`prosper_vo_flip_from_gpu`) and the API flip
+        # (`sceVideoOutSubmitFlip`) each advance the flip state on their own, so a title using
+        # the API path produces SubmitFlip lines and no GpuFlip lines at all. Greping only
+        # GpuFlip left the `t=` added to SubmitFlip in the same PR removable with nothing going
+        # red -- and it is the only timing this tool's successor would have for that class of
+        # title (#3462, the residual noted on #3453's review).
+        # The consequence differs per emitter, so say which one it is rather than pasting
+        # #3452's sentence over both -- the second is not the failure #3452 was.
+        for tag, consequence in (
+                ("[ev] GpuFlip",
+                 "so every log this parser reads is unpaceable (#3452)"),
+                ("[ev] SubmitFlip",
+                 "so a title that flips through the API path rather than the in-stream GPU"
+                 " packet records no flip timing at all (#3462)")):
+            flip_lines = [line for line in text.splitlines() if tag in line]
+            if not flip_lines:
+                failures.append(f"case 7: no {tag} emitter found in hle_graphics.cpp")
+            elif not any("t=%" in line for line in flip_lines):
+                failures.append(f"case 7: the {tag} emitter writes no t= timestamp, {consequence}: "
+                                + flip_lines[0].strip())
 
     # 8. A PARTIALLY readable log must say so. Reporting only when NOTHING parsed left the
     #    real hazard open: a handful of timestamped flips among thousands of untimed ones
@@ -381,6 +397,84 @@ def main():
             failures.append(f"case 19: full power must divide by CHANCE exactly, got {ratio}")
     except TypeError as exc:
         failures.append(f"case 19: no power term to scale the null with ({exc})")
+
+    # ---------------------------------------------------------------- #3462
+    # 24. A RACE IS NOT A RESTART, and the detector printed the same sentence for both. The
+    #     backwards-step detector (#3453) has no magnitude threshold, so a sub-microsecond
+    #     interleave between two emitting threads -- `evlog_seconds()` is evaluated as a function
+    #     argument and the stream lock is taken afterwards -- asserted "this input holds more than
+    #     one run", which is a different fact with a different remedy (fix the emitter's ordering
+    #     versus pass the runs separately). Two lines emitted 50 us out of order in an otherwise
+    #     monotonic 60 Hz run.
+    rows, t = [], 1.0
+    for i in range(300):
+        if i in (100, 200):
+            # The thread that read the clock LATER reached the stream first.
+            rows.append(f"[ev] GpuFlip t={t + 0.000050:.6f} handle=0x1002 bufidx=0 mode=0x1 fliparg=0x0")
+        rows.append(f"[ev] GpuFlip t={t:.6f} handle=0x1002 bufidx=0 mode=0x1 fliparg=0x0")
+        t += 1.0 / 60.0
+    out, _ = run("\n".join(rows) + "\n")
+    expect(out, "step backwards 2 time(s)", "case 24 the backwards steps are still detected")
+    expect(out, "0.050 ms", "case 24 the magnitude of the largest step is stated")
+    if "more than one run" in out:
+        failures.append(f"case 24: a 50 us emission race was reported as a second run, which it"
+                        f" cannot be -- a restart steps back by a whole run (#3462): {out!r}")
+    if "EMISSION" not in out:
+        failures.append(f"case 24: the out-of-order emission was never named, so the remedy the"
+                        f" message implies is the wrong one (#3462): {out!r}")
+
+    # 25. ...and the real restart must keep its verdict AND gain the magnitude that justifies it,
+    #     or this becomes a blanket loosening rather than a distinction. Two 60 Hz runs
+    #     concatenated, so the seam steps back by the first run's whole elapsed time.
+    rows, stamps = [], []
+    for _ in range(2):
+        t = 1.0
+        for _ in range(200):
+            stamps.append(t)
+            rows.append(f"[ev] GpuFlip t={t:.6f} handle=0x1002 bufidx=0 mode=0x1 fliparg=0x0")
+            t += 1.0 / 60.0
+    out, _ = run("\n".join(rows) + "\n")
+    # Derived from the construction rather than restated: the seam steps back from the first
+    # run's last stamp to the second run's first, which is 199 frames at 60 Hz, not 200.
+    seam_s = stamps[199] - stamps[200]
+    expect(out, "more than one run", "case 25 a real restart is still called a restart")
+    expect(out, f"{seam_s:.3f} s",
+           "case 25 the restart states the magnitude that justifies the verdict")
+    if "EMISSION" in out:
+        failures.append(f"case 25: a 3.3 s run boundary was reported as emission jitter: {out!r}")
+
+    # 26. The classifier asserted directly, so a wording change in the printer cannot move a
+    #     boundary, and so the MIDDLE band is pinned: a step too large for a scheduler quantum
+    #     and too small for a run is neither, and saying so is the point of the fix. A single
+    #     threshold would only move the boundary and go on printing one of the two sentences.
+    #     Wrapped because a tool with no classifier at all is the PRE-FIX state, and it must
+    #     produce named failures rather than an AttributeError that aborts the run.
+    describe = getattr(FPR, "describe_backsteps", None)
+    if describe is None:
+        failures.append("case 26: flip_pacing_report exposes no describe_backsteps, so the"
+                        " backwards-step magnitude is never classified at all (#3462)")
+    else:
+        race_ms = getattr(FPR, "RACE_MS", None)
+        restart_ms = getattr(FPR, "RESTART_MS", None)
+        if race_ms is None or restart_ms is None:
+            failures.append("case 26: no RACE_MS/RESTART_MS thresholds are stated (#3462)")
+        else:
+            checks = [
+                ([], None, "no backwards step is no verdict"),
+                ([race_ms], "race", "a step at the jitter ceiling is emission, not a restart"),
+                ([restart_ms], "restart", "a step at a whole second is a run boundary"),
+                ([(race_ms + restart_ms) / 2.0], "unclear",
+                 "a step between the two is named as unclassifiable, not guessed"),
+                ([0.05, 5.0 * restart_ms], "restart",
+                 "the LARGEST step decides: jitter beside a restart is still a restart"),
+            ]
+            for steps, want, what in checks:
+                kind, sentence = describe(steps)
+                if kind != want:
+                    failures.append(f"case 26: {what} -- describe_backsteps({steps}) said"
+                                    f" {kind!r}, expected {want!r}")
+                if want == "unclear" and "more than one run" in sentence:
+                    failures.append("case 26: the unclassifiable band still asserts a second run")
 
     if failures:
         print("FAILURES:")
