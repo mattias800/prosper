@@ -244,10 +244,19 @@ enum : uint32_t {
     // one of them is a GroupNonUniform op, which reads exactly like descriptor indexing is already
     // supported. It was not.
     Cap_ShaderNonUniform=5301,
+    // SPV_KHR_float_controls. Declared by declare_float_controls() for every guest module;
+    // see the comment there for why this is not optional (#3479).
+    // The five capabilities of that extension are CONSECUTIVE and easy to take one off by:
+    // 4464 DenormPreserve, 4465 DenormFlushToZero, 4466 SignedZeroInfNanPreserve,
+    // 4467 RoundingModeRTE, 4468 RoundingModeRTZ. The first draft of this line said 4467, and
+    // NVIDIA honoured the execution mode anyway while emitting an invalid module -- only
+    // `spv_validate` (spirv-val, an instrument that does not share this header) reported it.
+    Cap_SignedZeroInfNanPreserve=4466,
     Cap_StorageBufferArrayNonUniformIndexing=5308,
     Addr_Logical=0, Mem_GLSL450=1, Exec_Vertex=0, Exec_Geometry=3, Exec_Fragment=4, Exec_GLCompute=5,
     EM_OriginUpperLeft=7, EM_DepthReplacing=12, EM_LocalSize=17, EM_Triangles=22,
     EM_OutputVertices=26, EM_OutputTriangleStrip=29, EM_Xfb=11,   // transform-feedback execution mode
+    EM_SignedZeroInfNanPreserve=4461,
     SC_Input=1, SC_UniformConstant=0, SC_Output=3, SC_Function=7, SC_PushConstant=9,
     SC_Image=11, SC_StorageBuffer=12, FC_None=0,
     Dim_1D=0, Dim_2D=1, Dim_3D=2,   // SPIR-V Dim. (2D coincides with the SQ_RSRC 2D dim value, but distinct.)
@@ -395,6 +404,31 @@ struct SpirvCompute {
         put(caps, Op_Capability, {Cap_StorageBufferArrayNonUniformIndexing});
         std::vector<uint32_t> o; pstr(o, "SPV_EXT_descriptor_indexing");
         putv(exts, Op_Extension, o);
+    }
+    // GUEST FLOAT SEMANTICS ARE INF/NAN-EXACT; VULKAN'S DEFAULT IS NOT (#3479).
+    // RDNA2 VALU arithmetic defines Inf, NaN and signed zero exactly, and real guest programs rely
+    // on it. Worked example, the one that found this: Unity's `sign()` idiom synthesises +Inf with
+    // integer shifts (((1<<8)-1) << 23 == 0x7F800000), multiplies the operand by it, then clamps to
+    // [0,1] and truncates. A module that does not declare SignedZeroInfNanPreserve leaves the host
+    // driver free to compile under no-Inf/no-NaN assumptions. Measured on Windows/NVIDIA: that
+    // multiply yields 0 rather than +Inf, so sign() answers 0 everywhere, PPSA02664's colour-grading
+    // LUT builder writes an all-black 1024x32 LUT, and every graded pixel of the scene composites to
+    // black -- while the UI, composited after the grade, stays pixel-perfect. RADV preserves Inf,
+    // which is why the same build renders the same frame correctly on Linux/AMD. A vendor split, not
+    // a title quirk, and invisible to any test whose only device preserves Inf anyway.
+    // Declared for EVERY guest module, not only ones observed to need it: a driver may exploit the
+    // assumption at any float op, so "which shaders touch Inf" is not a property this emitter can
+    // decide. shaderSignedZeroInfNanPreserveFloat32 is VK_TRUE on every implementation this project
+    // runs on -- NVIDIA, RADV, and the Mesa lavapipe CI uses -- so no device gate is plumbed; if one
+    // ever reports VK_FALSE, pipeline creation fails loudly rather than silently mis-evaluating.
+    bool float_controls_declared = false;
+    void declare_float_controls(uint32_t entry) {
+        if (float_controls_declared) return;
+        float_controls_declared = true;
+        put(caps, Op_Capability, {Cap_SignedZeroInfNanPreserve});
+        std::vector<uint32_t> o; pstr(o, "SPV_KHR_float_controls");
+        putv(exts, Op_Extension, o);
+        put(exec, Op_ExecutionMode, {entry, EM_SignedZeroInfNanPreserve, 32});
     }
     std::unordered_map<uint32_t, uint32_t> fconst_cache, uconst_cache;
     uint32_t next_id = 1;
@@ -3804,6 +3838,7 @@ struct SpirvCompute {
         f_main = id(); uint32_t lbl = id(); glsl = id();
 
         put(caps, Op_Capability, {Cap_Shader});
+        declare_float_controls(f_main);
         { std::vector<uint32_t> o{glsl}; pstr(o, "GLSL.std.450"); putv(extimp, Op_ExtInstImport, o); }
         put(mem, Op_MemoryModel, {Addr_Logical, Mem_GLSL450});
         is_compute = true;
@@ -3947,6 +3982,7 @@ struct SpirvCompute {
             if (color_mask & (1u << mrt)) v_color[mrt] = id();
         f_main = id(); uint32_t lbl = id(); glsl = id();
         put(caps, Op_Capability, {Cap_Shader});
+        declare_float_controls(f_main);
         { std::vector<uint32_t> o{glsl}; pstr(o, "GLSL.std.450"); putv(extimp, Op_ExtInstImport, o); }
         put(mem, Op_MemoryModel, {Addr_Logical, Mem_GLSL450});
         is_fragment = true;
@@ -4026,6 +4062,7 @@ struct SpirvCompute {
         uint32_t t_pv = id(), t_ptr_out_pv = id(); v_pos = id(); t_ptr_out_v4f = id();
         f_main = id(); uint32_t lbl = id(); glsl = id();
         put(caps, Op_Capability, {Cap_Shader});
+        declare_float_controls(f_main);
         { std::vector<uint32_t> o{glsl}; pstr(o, "GLSL.std.450"); putv(extimp, Op_ExtInstImport, o); }
         put(mem, Op_MemoryModel, {Addr_Logical, Mem_GLSL450});
         is_vertex = true;
@@ -4351,6 +4388,7 @@ struct SpirvCompute {
                 system_outputs[field] = id();
 
         put(caps, Op_Capability, {Cap_Shader});
+        declare_float_controls(f_main);
         put(caps, Op_Capability, {Cap_Geometry});
         if (capture_geometry_position) put(caps, Op_Capability, {Cap_TransformFeedback});
         { std::vector<uint32_t> operands{glsl}; pstr(operands, "GLSL.std.450");

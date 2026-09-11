@@ -2033,6 +2033,13 @@ if(TARGET prosper_core)
   target_link_libraries(test_vertex_fetch_reject_diagnostic PRIVATE prosper_core)
   add_test(NAME vertex_fetch_reject_diagnostic COMMAND test_vertex_fetch_reject_diagnostic)
 
+  # #3479: every recompiled guest module must declare SignedZeroInfNanPreserve, or a driver is
+  # free to compile it under no-Inf/no-NaN assumptions and silently answer a guest sign() idiom
+  # with 0. Structural on purpose -- an execution arm cannot go red where CI runs. See the test.
+  add_executable(test_float_controls tests/gpu/recompiler/test_float_controls.cpp)
+  target_link_libraries(test_float_controls PRIVATE prosper_core)
+  add_test(NAME float_controls COMMAND test_float_controls)
+
   # CPU-only streaming shader properties: exact legacy semantics without per-query vectors.
   add_executable(test_shader_property_scans tests/gpu/recompiler/test_shader_property_scans.cpp)
   target_link_libraries(test_shader_property_scans PRIVATE prosper_core)

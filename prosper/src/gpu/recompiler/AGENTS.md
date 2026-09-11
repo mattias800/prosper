@@ -20,6 +20,23 @@ backstop for genuinely unknown encodings — mark `CONFIDENCE: LOW`, log loudly,
 exact opcode — but every one hit on a live boot is the next thing to implement. A silently skipped
 instruction drops real rendered content and reads as "handled".
 
+## Every emitted module declares `SignedZeroInfNanPreserve`, and that is a correctness contract
+
+RDNA2 float arithmetic defines Inf, NaN and signed zero exactly. Vulkan does **not** promise that by
+default: without `SPV_KHR_float_controls`' execution mode a driver may compile the module assuming
+those values never occur. Guest shaders do rely on them — a compiler-generated `sign()` idiom
+synthesises `+Inf` with integer shifts and multiplies by it — and on NVIDIA that multiply returned 0,
+which blacked out a whole title's world while its UI stayed perfect (#3479). RADV preserves Inf, so
+the same build was correct on Linux and the defect looked like a title quirk.
+
+`declare_float_controls()` in `rdna2_to_spirv_internal.hpp` emits it from every `begin*()`. Two
+things follow. **Do not add a new stage entry point without calling it** — `tests/gpu/recompiler/
+test_float_controls.cpp` asserts the declaration for each stage and is the cheapest place to notice.
+And **an execution test cannot guard this**: an `Inf * x` kernel passes on RADV and on the lavapipe
+CI runs whether or not the mode is declared, because those implementations preserve Inf anyway, so
+the guard is structural on purpose. The hand-built modules in `spirv_builder` are prosper's own code
+rather than translated guest code and are deliberately outside this contract.
+
 ## `PROSPER_CFG_TRIP_BOUND` — is this a non-terminating loop?
 
 A guest program whose control flow neither structured emitter accepts is lowered by
