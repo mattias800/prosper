@@ -216,7 +216,11 @@ def report(stamps, window_s, tick, untimed=0, restarts=0):
     # Name the baseline actually used. Printing 30.0% beside a ratio computed against a
     # power-scaled null would be a third way for this line to mislead.
     effective = CHANCE * power if power >= 0.5 else CHANCE
-    scaled = "" if power >= 0.999 else f" (scaled by {100 * power:.0f}% reachable)"
+    # Below the gate the baseline is deliberately NOT scaled, so the parenthetical must not claim
+    # it was -- the numbers were consistent, only the words were wrong, which is this line's own
+    # failure mode one more time (re-review of #3454).
+    scaled = ("" if power >= 0.999 or power < 0.5
+              else f" (scaled by {100 * power:.0f}% reachable)")
     print(f"  chance baseline {100 * effective:.1f}%{scaled} -- {ratio:.2f}x chance: {verdict}")
 
     hist = collections.Counter(round(ms) for ms in intervals)
