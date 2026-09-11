@@ -60,6 +60,10 @@ POINTER_DERIVING_OPS = {
 # outside it, so a vote-guarded OpAtomicFAddEXT admitted while the same module using OpAtomicIAdd
 # refused. One opcode number was the whole difference.
 ATOMIC_OPS = set(range(227, 243)) | {318, 319, 5614, 5615, 6035}
+# The one atomic that only READS: no Value operand in the grammar at all, and the spec forbids
+# Release/AcquireRelease on it while forbidding Acquire/AcquireRelease on OpAtomicStore. See the
+# C++ twin for the whole argument.
+OP_ATOMIC_LOAD = 227
 OP_COPY_MEMORY, OP_COPY_MEMORY_SIZED = 63, 64
 
 STORAGE_UNIFORM_CONSTANT, STORAGE_INPUT, STORAGE_UNIFORM = 0, 1, 2
@@ -196,10 +200,12 @@ class Module:
             if not self._observable(op, w):
                 continue
             # Observable and yet writing NOTHING a later load could read back: ending the
-            # invocation, or ordering other threads' accesses. Measured -- folding these in
-            # cost Evergate 10 of its 11 provable modules, because any module containing a
-            # barrier stopped being able to treat a constant buffer as uniform.
-            if op in (OP_KILL, 4416, 5380, 224, 225):
+            # invocation, ordering other threads' accesses, or -- OpAtomicLoad -- reading.
+            # Measured -- folding the barriers in without this exclusion cost Evergate 10 of its
+            # 11 provable modules, because any module containing one stopped being able to treat
+            # a constant buffer as uniform. OpAtomicLoad stays OBSERVABLE, so a vote-guarded
+            # region containing one is still refused; only arm (a) is loosened.
+            if op in (OP_KILL, 4416, 5380, 224, 225, OP_ATOMIC_LOAD):
                 continue
             # A store to a colour output is observable but is not memory this shader reads back.
             if op in (OP_STORE, OP_COPY_MEMORY, OP_COPY_MEMORY_SIZED) and len(w) >= 2 \
@@ -334,6 +340,10 @@ class Module:
         A store through anything that is not a Function-storage pointer -- a colour attachment, a
         storage buffer, an image. Restricting this to Output would make a UAV write invisible to the
         analysis, the same shape of blind spot as the control-dependence one, one level down.
+
+        TOUCHING memory, not writing it: the other caller is the control-dependence scan, which
+        asks whether a vote-guarded region did anything at all. An atomic load participates in the
+        draw's memory ordering, so it answers yes here and is subtracted again in _writes_memory.
         """
         if op == OP_STORE:
             return len(w) >= 3 and w[1] not in self.locals
