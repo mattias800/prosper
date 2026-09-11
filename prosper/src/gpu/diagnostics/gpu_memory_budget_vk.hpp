@@ -31,11 +31,23 @@ inline void set_device_heaps(const VkPhysicalDeviceMemoryProperties& props) {
 }
 
 // vkAllocateMemory, counted. Only a VK_SUCCESS is counted, and `out` is whatever the driver wrote.
+//
+// A FAILURE reports the budget from here, which is the only place that sees every failure. It was
+// once wired at a single call site instead, and that made a property of the instrument out of a
+// property of one of its twenty-one sites: a renderer allocation could fail and still print no
+// number, which is precisely the #3533 scenario the whole thing exists for.
 inline VkResult allocate_device_memory(VkDevice device, const VkMemoryAllocateInfo* info,
                                        VkDeviceMemory* out) {
     const VkResult status = vkAllocateMemory(device, info, nullptr, out);
-    if (status == VK_SUCCESS && info)
-        note_device_alloc((uint64_t)*out, info->memoryTypeIndex, (uint64_t)info->allocationSize);
+    if (status == VK_SUCCESS) {
+        if (info)
+            note_device_alloc((uint64_t)*out, info->memoryTypeIndex,
+                              (uint64_t)info->allocationSize);
+        return status;
+    }
+    report_allocation_failure(static_cast<int>(status),
+                              info ? (uint64_t)info->allocationSize : 0,
+                              info ? info->memoryTypeIndex : 0);
     return status;
 }
 

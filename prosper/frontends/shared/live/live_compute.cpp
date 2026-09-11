@@ -1905,24 +1905,9 @@ struct VulkanComputeContext {
             }
         }
         if (setup_status) *setup_status = allocation_result;
-        if (allocation_result != VK_SUCCESS) {
-            // The one moment this instrument exists for (#3533). A failed device allocation is
-            // exactly when "how much of the heap were we holding?" decides whether the answer is
-            // prosper's own footprint or something outside the process -- and prosper printed
-            // nothing here, so five host lockups produced three wrong published root causes.
-            //
-            // Bounded, because a device under real pressure fails in bursts and an unbounded report
-            // would push the FIRST and most informative one out of a scrolling log.
-            static std::atomic<int> reported{0};
-            if (reported.fetch_add(1, std::memory_order_relaxed) < 4) {
-                fprintf(stderr,
-                        "[compute] device memory allocation failed (%d) for %llu MiB of memory "
-                        "type %u\n", static_cast<int>(allocation_result),
-                        (unsigned long long)(bytes >> 20), memory_type);
-                prosper::gpu::report_device_memory("allocation failed");
-            }
-            return VK_NULL_HANDLE;
-        }
+        // The budget reports the failure from inside allocate_device_memory, which is the only
+        // place that sees every one of them (#3533).
+        if (allocation_result != VK_SUCCESS) return VK_NULL_HANDLE;
         if (compute_memory_pool_enabled()) {
             std::lock_guard<std::mutex> lock(memory_pool.mutex);
             memory_pool.active.emplace(result, key);

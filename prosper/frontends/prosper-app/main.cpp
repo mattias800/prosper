@@ -295,6 +295,16 @@ bool pick_device(Vk& vk) {
     VKCHECK(vkCreateDevice(vk.phys, &di, nullptr, &vk.device), "vkCreateDevice");
     vkGetDeviceQueue(vk.device, vk.qfamily, 0, &vk.queue);
 
+    // #3533: the app's own VkDevice needs the budget's heap layout too. Without it every allocation
+    // below is unresolvable and the counter DROPS it -- the app's launcher art, staging buffers and
+    // cover images would then be missing from a figure that claims to be prosper's footprint. The
+    // physical device is the same one the renderer registers, so the layout matches and the
+    // first-wins rule in set_device_heaps accepts it.
+    {
+        VkPhysicalDeviceMemoryProperties heap_properties{};
+        vkGetPhysicalDeviceMemoryProperties(vk.phys, &heap_properties);
+        prosper::gpu::set_device_heaps(heap_properties);
+    }
     VkPhysicalDeviceProperties pp; vkGetPhysicalDeviceProperties(vk.phys, &pp);
     fprintf(stderr, "[app] Vulkan device: %s\n", pp.deviceName);
     prosper::frontend::log_vulkan_runtime_device("app", vk.phys, pp);

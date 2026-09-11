@@ -2005,6 +2005,7 @@ if(TARGET prosper_core)
   add_test(NAME shader_dump_filter COMMAND test_shader_dump_filter)
 
   add_executable(test_gpu_memory_budget tests/gpu/diagnostics/test_gpu_memory_budget.cpp)
+  target_include_directories(test_gpu_memory_budget PRIVATE tests)   # fixtures/test_scratch.h
   target_link_libraries(test_gpu_memory_budget PRIVATE prosper_core)
   add_test(NAME gpu_memory_budget COMMAND test_gpu_memory_budget)
 

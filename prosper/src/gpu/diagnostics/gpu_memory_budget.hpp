@@ -25,6 +25,12 @@
 // today; enabling it is a separate change and this header is deliberately independent of it, so the
 // instrument exists now rather than after that plumbing lands.
 //
+// THE GROWTH LINE REPORTS A HIGH-WATER MARK, NOT CURRENT GROWTH. Each heap's step threshold only
+// ever ratchets up, so a workload that climbs to 3 GiB, frees it, and climbs to 3 GiB again prints
+// once, not twice. That bounds the output of a cycling workload, and it is the right default for
+// the question this exists to answer -- but do not read the absence of a line as "prosper stopped
+// allocating". `report_device_memory` prints the standing on demand and is not subject to it.
+//
 // ON BY DEFAULT, which is the point. `PROSPER_GPU_MEM_LOG=0` silences it and
 // `PROSPER_GPU_MEM_LOG_MIB=<n>` changes the growth step. A diagnostic that must be switched on is
 // one nobody had switched on for the run that mattered — which is exactly what happened here.
@@ -67,5 +73,10 @@ uint64_t device_peak_bytes(uint32_t heap);
 // Print the current per-heap standing immediately, whatever the step counter says. `why` names the
 // occasion ("startup", "allocation failed", ...) so a line in a log can be attributed.
 void report_device_memory(const char* why);
+
+// A device allocation just failed: say what was asked for and print the standing. BOUNDED to the
+// first few, because a device under real pressure fails in bursts and an unbounded report would push
+// the first -- and most informative -- one out of a scrolling log.
+void report_allocation_failure(int result, uint64_t bytes, uint32_t memory_type);
 
 }  // namespace prosper::gpu

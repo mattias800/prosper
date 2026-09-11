@@ -12,6 +12,8 @@
 // would be trusted to get right.
 #include "gpu/diagnostics/gpu_memory_budget.hpp"
 
+#include "fixtures/test_scratch.h"
+
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -49,7 +51,14 @@ int main() {
     // A 1 MiB step so the ordinary test sizes below cross it, and stderr into a file so the crossings
     // can be asserted rather than assumed. Both must happen before any other call: the step is read
     // from the environment once, lazily, on the first allocation.
-    const char* const capture_path = "gpu_memory_budget_stderr.tmp";
+    // A per-process scratch path, never a fixed name in the CWD. ctest runs cases under -j, several
+    // worktrees on this box run ctest at once, and a shared path would make two processes fight over
+    // one file -- whose symptom is a CONTENT assertion failing on correct code, the failure most
+    // likely to send a reader hunting a defect that does not exist. test_scratch.h exists for
+    // exactly this and its header records the four issues it came from; an earlier version of this
+    // test walked straight back into it.
+    const std::string capture_file = prosper_test::test_scratch_file("gpu_memory_budget_stderr.txt");
+    const char* const capture_path = capture_file.c_str();
 #if defined(_WIN32)
     _putenv_s("PROSPER_GPU_MEM_LOG_MIB", "1");
 #else
@@ -191,6 +200,21 @@ int main() {
     CHECK(device_bytes_held(1) == 4 * kMiB && device_peak_bytes(1) == 4 * kMiB,
           "a second device's layout did not renumber the heaps");
 
+    // Pressure labels. heap 3 is 64 MiB and holds 3 MiB of deliberate residue from the overwrite
+    // case above, so 42 MiB more puts it at 70%; heap 1 is 32 MiB holding 4 MiB, so 26 MiB more puts
+    // it past 90%. Both thresholds are asserted on the EMITTED text further down rather than on a
+    // return value, because the label exists only to be read in a log.
+    note_device_alloc(0xa000, 3, 42 * kMiB);
+    note_device_alloc(0xb000, 1, 26 * kMiB);
+
+    // The step is a RATCHET: once a heap has printed at 13 MiB it stays quiet below 13 MiB forever,
+    // even after falling back to zero and climbing again. That is deliberate -- it bounds the output
+    // of a workload that cycles -- but it means the line reports a new HIGH-WATER MARK, not current
+    // growth, and a reader watching for "prosper is allocating again" will not see it. Pinned here
+    // so the behaviour is a decision rather than an accident, and stated in the header.
+    note_device_free(0xb000);
+    note_device_alloc(0xb100, 1, 26 * kMiB);   // same size again, below the mark: must stay silent
+
     // Everything above is about counters. THIS is about output, and it is the arm that catches a
     // dead instrument whose arithmetic is perfect.
     if (!captured) {
@@ -207,6 +231,16 @@ int main() {
         CHECK(output.find("not other processes, the compositor, or driver overhead") !=
                   std::string::npos,
               "every report carries the caveat about what it does NOT count");
+        CHECK(output.find("(over 70% of the heap)") != std::string::npos,
+              "a heap past 70% says so on the line");
+        CHECK(output.find("*** OVER 90% OF THE HEAP ***") != std::string::npos,
+              "a heap past 90% is shouted rather than mentioned");
+        // The ratchet: exactly one line for heap 1 at 30 MiB, not a second one when the same 26 MiB
+        // is freed and re-allocated. Counting occurrences is the only way to see a duplicate.
+        size_t at = 0, repeats = 0;
+        const std::string mark = "holds 30 MiB on heap 1";
+        while ((at = output.find(mark, at)) != std::string::npos) { repeats++; at += mark.size(); }
+        CHECK(repeats == 1, "re-reaching a mark already printed does not print it again");
         std::remove(capture_path);
     }
 
