@@ -15,6 +15,12 @@ cadence directly, and the INTERVAL DISTRIBUTION names the limiter class:
     30% and a reported 50% is 1.7x chance, not 'half the frames are tick-bound' (#3454);
   * a wide spread -- work-bound production (profile the fold, don't hunt waits).
 
+THE HEADLINE RATE IS FLIPS OVER THE WALL-CLOCK SPAN, and is deliberately NOT the reciprocal
+of the mean interval. The distribution statistics below it drop sub-0.5 ms intervals (a burst
+pair is not a pacing decision), and the fraction dropped varies per run -- so a rate derived
+from the retained set is a mean over a population that differs between the two arms of the
+very A/B this tool exists to serve (#3560).
+
 The report also splits the timeline into windows so a cinematic-to-gameplay phase change
 does not smear one phase's numbers over another.
 
@@ -196,16 +202,48 @@ def report(stamps, window_s, tick, untimed=0, restarts=0):
             return
         print("fewer than 2 flips recorded -- nothing to pace")
         return
-    intervals = [ms for ms in ((b - a) * 1000.0 for a, b in zip(stamps, stamps[1:]))
-                 if ms > 0.5]
+    # THE RUN'S RATE, over the wall clock, computed BEFORE any filtering. The headline used to be
+    # 1000/mean(retained intervals) -- which reads as the run's rate and is not one, because the
+    # sub-0.5 ms filter below drops a fraction that VARIES PER RUN. Measured on the #3379 A/B, one
+    # binary and one title: the tool said 44.1 fps paced vs 59.2 unpaced where the wall-clock truth
+    # was 57.8 vs 97.9, understated by 24% and 40% because the arms retained 77% and 61% of their
+    # intervals, implying a 1.34x ratio where the truth is 1.65x. The harm was a WRONG VERDICT, not
+    # a wrong number: the paced arm was holding ~96% of its requested 59.94 Hz, and this instrument
+    # made the pacing fix look like it had missed by a quarter (#3560).
+    raw = [(b - a) * 1000.0 for a, b in zip(stamps, stamps[1:])]
+    span_ms = (stamps[-1] - stamps[0]) * 1000.0
+    if span_ms <= 0.0:
+        # Every flip sharing one timestamp is reachable at coarse clock resolution, and a rate of
+        # infinity is not the thing to print about it.
+        print(f"flips={len(stamps)} but the first and last carry the same timestamp, so this"
+              f" timeline has no extent and no rate is defined.")
+        return
+    # len(raw) periods elapse between len(stamps) flips, and the span is bounded BY two flips, so
+    # the rate over the observed window is intervals/span. (flips/span overstates it by 1/n.)
+    overall = 1000.0 * len(raw) / span_ms
+    print(f"flips={len(stamps)} over {span_ms / 1000.0:.3f} s "
+          f"-> {overall:.1f} fps average (flips / wall-clock span)")
+
+    intervals = [ms for ms in raw if ms > 0.5]
+    # The filter stays -- a burst pair is not a pacing decision and must not vote in the tick
+    # statistics -- but the population it leaves behind is now STATED. A filtered population that
+    # is never related to the number derived from it is the whole of #3560.
     if not intervals:
-        print("no usable intervals")
+        print(f"  all {len(raw)} interval(s) are at or below 0.5 ms, so the distribution"
+              f" statistics have no population. The rate above still stands: this is pure burst.")
         return
 
-    overall = 1000.0 / statistics.mean(intervals)
-    print(f"flips={len(stamps)} intervals={len(intervals)} "
-          f"mean period {statistics.mean(intervals):.2f} ms "
-          f"-> {overall:.1f} fps average")
+    mean_ms = statistics.mean(intervals)
+    dropped = len(raw) - len(intervals)
+    if dropped:
+        print(f"intervals: {len(intervals)} of {len(raw)} retained"
+              f" ({100.0 * len(intervals) / len(raw):.1f}%), {dropped} at or below 0.5 ms dropped;"
+              f" mean of the retained set {mean_ms:.2f} ms")
+        print(f"  that mean is NOT the run's period -- 1000/mean reads {1000.0 / mean_ms:.1f}"
+              f" against the {overall:.1f} above -- and the retained fraction varies per run, so"
+              f" it is not comparable ACROSS runs. Quote the headline rate (#3560).")
+    else:
+        print(f"intervals={len(intervals)} mean period {mean_ms:.2f} ms (none dropped)")
 
     quantized = sum(1 for ms in intervals if classify(ms, tick) != "between ticks")
     overall_share = quantized / len(intervals)
@@ -230,12 +268,26 @@ def report(stamps, window_s, tick, untimed=0, restarts=0):
             print(f"  {bucket:4d} ms x{count}")
 
     # Windowed view: a phase change (cinematic -> gameplay) must not smear two regimes.
-    window_flips = max(1, int(window_s * (1000.0 / statistics.mean(intervals))))
+    # Windows are cut over the RAW timeline and each row's rate is its own flips over its own
+    # span -- the same correction as the headline, one level down. Cutting them over the FILTERED
+    # list instead left every row printing 1000/mean of its retained subset, so a bursty phase and
+    # a slow phase produced the same row; and the row ordinals, labelled 'flips', indexed the
+    # filtered list rather than the flips (#3560).
+    window_flips = max(1, int(window_s * 1000.0 * len(raw) / span_ms))
     print(f"windows of ~{window_flips} flips:")
     start = 0
-    window_sizes = []   # (share, interval count) -- the count decides if it may vote below
-    while start < len(intervals):
-        chunk = intervals[start:start + window_flips]
+    window_sizes = []   # (share, retained interval count) -- the count decides if it may vote
+    while start < len(raw):
+        chunk_raw = raw[start:start + window_flips]
+        end = start + len(chunk_raw)
+        w_span = sum(chunk_raw)
+        chunk = [ms for ms in chunk_raw if ms > 0.5]
+        if not chunk or w_span <= 0.0:
+            print(f"  flips {start:5d}-{end:5d}: all {len(chunk_raw)} interval(s) at or below"
+                  f" 0.5 ms -- no tick statistic for this window")
+            start += window_flips
+            continue
+        w_fps = 1000.0 * len(chunk_raw) / w_span
         mean_ms = statistics.mean(chunk)
         quantized = sum(1 for ms in chunk if classify(ms, tick) != "between ticks")
         share = quantized / len(chunk)
@@ -247,9 +299,12 @@ def report(stamps, window_s, tick, untimed=0, restarts=0):
         # where the window could have scored otherwise, or the mark is automatic.
         note = "no power" if w_power < 0.5 else (
             "BELOW chance" if w_ratio is not None and w_ratio < 0.75 else "")
-        print(f"  flips {start:5d}-{start + len(chunk):5d}: "
-              f"{1000.0 / mean_ms:6.1f} fps  mean {mean_ms:6.2f} ms  "
-              f"tick-aligned {100 * share:5.1f}% ({w_ratio:.2f}x chance) {note}")
+        # Say so whenever the row's rate and its mean describe different populations.
+        retained = ("" if len(chunk) == len(chunk_raw)
+                    else f" [mean over {len(chunk)}/{len(chunk_raw)}]")
+        print(f"  flips {start:5d}-{end:5d}: "
+              f"{w_fps:6.1f} fps  mean {mean_ms:6.2f} ms  "
+              f"tick-aligned {100 * share:5.1f}% ({w_ratio:.2f}x chance) {note}{retained}")
         start += window_flips
 
     # The whole-run share is a mean over windows that can disagree by an order of magnitude,
@@ -258,7 +313,11 @@ def report(stamps, window_s, tick, untimed=0, restarts=0):
     # A trailing window can hold a handful of intervals, whose share is quantised into
     # huge steps -- 3 intervals can only score 0/33/67/100%. Comparing that against a full
     # window manufactures a disagreement, so short windows do not vote (#3454 review).
-    full = [share for share, n in window_sizes if n >= max(8, window_flips // 4)]
+    # The bar is a quarter of the LARGEST window's retained count, not a quarter of
+    # window_flips: those are the same number only when nothing was dropped, and gating a
+    # retained count against a raw one silenced this note entirely on a heavily bursty run.
+    cap = max((n for _, n in window_sizes), default=0)
+    full = [share for share, n in window_sizes if n >= max(8, cap // 4)]
     if len(full) >= 2:
         lo, hi = min(full), max(full)
         if hi - lo >= 0.25:
@@ -266,9 +325,10 @@ def report(stamps, window_s, tick, untimed=0, restarts=0):
                   f" so the whole-run {100 * overall_share:.1f}% above is an average over"
                   f" regimes that differ. Read the windows, not the summary.")
 
-    slowest = sorted(range(len(intervals)), key=lambda i: -intervals[i])[:5]
+    # Over the RAW list, so `flip i` is a flip ordinal rather than an index into a filtered list.
+    slowest = sorted(range(len(raw)), key=lambda i: -raw[i])[:5]
     print("slowest intervals (ms):",
-          ", ".join(f"{intervals[i]:.1f} @ flip {i}" for i in slowest))
+          ", ".join(f"{raw[i]:.1f} @ flip {i}" for i in slowest))
 
 
 def main():

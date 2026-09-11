@@ -382,6 +382,120 @@ def main():
     except TypeError as exc:
         failures.append(f"case 19: no power term to scale the null with ({exc})")
 
+    # ---------------------------------------------------------------- #3560
+    # A HELPER FOR THE ARMS BELOW. Builds a timeline holding exactly `n_long` long intervals and
+    # `n_burst` sub-0.5 ms ones, spread evenly, over exactly `span_s` seconds -- so the run's TRUE
+    # rate is (n_long + n_burst) / span_s, computed here from the construction and never from the
+    # tool. The burst fraction is the free variable, which is the point: it is what the tool was
+    # silently filtering out of its own headline.
+    def burst_log(n_long, n_burst, span_s, burst_ms=0.2, t0=1.0):
+        long_ms = (span_s * 1000.0 - n_burst * burst_ms) / n_long
+        ivals = []
+        for i in range(n_long):
+            ivals.append(long_ms)
+            if n_burst and (i * n_burst) // n_long != ((i + 1) * n_burst) // n_long:
+                ivals.append(burst_ms)
+        t = t0
+        rows = [f"[ev] GpuFlip t={t:.6f} handle=0x1002 bufidx=0 mode=0x1 fliparg=0x0"]
+        for ms in ivals:
+            t += ms / 1000.0
+            rows.append(f"[ev] GpuFlip t={t:.6f} handle=0x1002 bufidx=0 mode=0x1 fliparg=0x0")
+        return "\n".join(rows) + "\n"
+
+    def headline(out):
+        m = re.search(r"-> ([0-9.]+) fps average", out)
+        return None if m is None else float(m.group(1))
+
+    # 20. THE ARM FOR #3560. The headline rate was 1000/mean of the RETAINED intervals, and the
+    #     retained fraction varies per run -- so two runs' headline figures were means over
+    #     different populations while reading as the runs' rates. Measured on the #3379 A/B: 44.1
+    #     vs 59.2 fps reported against a wall-clock truth of 57.8 vs 97.9, a 1.34x ratio where the
+    #     truth is 1.65x, which made a working pacing fix look like it had missed by a quarter.
+    #
+    #     So the arm is NOT 'a rate is printed' -- that passes either way. Two runs with the SAME
+    #     true rate and DIFFERENT burst fractions must report the same figure. Both carry 1200
+    #     intervals over 20.000 s, i.e. 60.0 flips/s by construction; one drops 10% of them to the
+    #     filter and the other 50%. Pre-fix they report 54.1 and 30.2.
+    sparse = burst_log(n_long=1080, n_burst=120, span_s=20.0)   # 10% burst
+    dense = burst_log(n_long=600, n_burst=600, span_s=20.0)     # 50% burst
+    out_sparse, _ = run(sparse)
+    out_dense, _ = run(dense)
+    r_sparse, r_dense = headline(out_sparse), headline(out_dense)
+    if r_sparse is None or r_dense is None:
+        failures.append(f"case 20: no headline rate in one of the reports: "
+                        f"{out_sparse!r} / {out_dense!r}")
+    else:
+        for name, rate in (("10%-burst", r_sparse), ("50%-burst", r_dense)):
+            if abs(rate - 60.0) > 0.6:
+                failures.append(
+                    f"case 20: the {name} run is 1200 flips over 20.000 s = 60.0 flips/s by"
+                    f" construction, and the report says {rate} fps -- the headline is a mean over"
+                    f" the filtered population, not the run's rate (#3560)")
+        if abs(r_sparse - r_dense) > 0.5:
+            failures.append(
+                f"case 20: two runs at the same true rate reported {r_sparse} and {r_dense} fps"
+                f" because they retained different fractions of their intervals, so the figures"
+                f" this tool exists to compare are not comparable (#3560)")
+
+    # 21. ...and the filtered population must be STATED wherever it is used, or the mean printed
+    #     beside the headline silently describes a different population from the headline itself.
+    #     The retention is a fraction, not just a count: `intervals=12318` next to `flips=16028`
+    #     never told anyone the two lines disagreed on purpose.
+    expect(out_dense, "600 of 1200 retained", "case 21 the retained count is related to the total")
+    expect(out_dense, "50.0%", "case 21 the retention is stated as a fraction")
+    if "NOT the run's period" not in out_dense:
+        failures.append(f"case 21: the retained mean is printed without saying it is not the run's"
+                        f" period, so 1000/mean still reads as the rate: {out_dense!r}")
+
+    # 22. THE SAME DEFECT ONE LEVEL DOWN, which is where this file's history says a correction
+    #     tends to leave it (instrument trap 275: three corrections each carried the previous
+    #     defect forward in a narrower form). Every window row printed 1000/mean of its own
+    #     retained subset, so a bursty phase and a genuinely slower phase produced identical rows;
+    #     and the windows were cut over the FILTERED list while their ordinals were labelled
+    #     'flips'. This run holds two 10 s phases, both at 60 flips/s: one clean, one paired. All
+    #     four windows must read ~60 fps. Pre-fix they read 60.0, 60.0, 45.1, 30.2.
+    clean = burst_log(n_long=600, n_burst=0, span_s=10.0, t0=1.0)
+    paired = burst_log(n_long=300, n_burst=300, span_s=10.0, t0=11.0)
+    # Drop `paired`'s first line: it would duplicate the seam rather than continue the timeline.
+    two_phase = clean + "\n".join(paired.strip().splitlines()[1:]) + "\n"
+    out, _ = run(two_phase, ["--window-s", "5"])
+    rows = re.findall(r"flips\s+(\d+)-\s*(\d+):\s+([0-9.]+) fps", out)
+    if len(rows) < 4:
+        failures.append(f"case 22: expected four window rows, got {rows!r}: {out!r}")
+    else:
+        for start, end, fps in rows:
+            if abs(float(fps) - 60.0) > 3.0:
+                failures.append(
+                    f"case 22: window {start}-{end} holds 5 s of a 60 flips/s phase and reports"
+                    f" {fps} fps -- the window rate is 1000/mean of its retained subset (#3560)")
+        # The ordinals say 'flips', so the last one must reach the last interval. Cut over the
+        # filtered list it stops at the retained count, which on this run is 900 of 1200.
+        if int(rows[-1][1]) != 1200:
+            failures.append(
+                f"case 22: the window ordinals are labelled 'flips' but the last one ends at"
+                f" {rows[-1][1]} of 1200 intervals, so they index the filtered list (#3560)")
+
+    # 23. Degenerate spans, now that a rate is computed from one.
+    #     (a) An all-burst run has no distribution to report and a perfectly well-defined rate:
+    #         199 intervals of 0.1 ms is 10000 flips/s. Pre-fix it printed 'no usable intervals'
+    #         and no rate at all, which is the filter deciding the run did not happen.
+    all_burst = burst_log(n_long=199, n_burst=0, span_s=0.0199)
+    out, code = run(all_burst)
+    rate = headline(out)
+    if rate is None or abs(rate - 10000.0) > 100.0:
+        failures.append(f"case 23a: an all-burst run reported no usable rate ({rate}): {out!r}")
+    if "no population" not in out:
+        failures.append(f"case 23a: the empty distribution population went unnamed: {out!r}")
+    #     (b) ...and a timeline with no extent must refuse rather than divide by its own zero.
+    #         NOTE this half passes in BOTH directions -- the pre-fix tool never divided, because
+    #         it never computed a span. It is a guard against the fix, not a discriminator, and is
+    #         counted as neither.
+    out, code = run("[ev] GpuFlip t=1.000000\n" * 5)
+    if code != 0 or "Traceback" in out:
+        failures.append(f"case 23b: identical timestamps crashed the report (rc={code}): {out!r}")
+    if headline(out) is not None:
+        failures.append(f"case 23b: a rate was printed for a timeline with no extent: {out!r}")
+
     if failures:
         print("FAILURES:")
         for failure in failures:
