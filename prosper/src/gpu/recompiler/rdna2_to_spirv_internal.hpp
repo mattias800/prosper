@@ -2368,8 +2368,11 @@ struct SpirvCompute {
     // bounds check narrowed EXEC). The loaded value for such a lane is discarded by write-back predication
     // (predicate_write) at the call site, so it is harmless — PROVIDED the device enables IMAGE ROBUSTNESS
     // (robustImageAccess / VK_EXT_image_robustness: OOB image reads return 0), the image analogue of the
-    // robustBufferAccess this recompiler already depends on for buffer loads. The runtime must enable it
-    // (the test harness does). The store side is instead EXEC-predicated (no robust "harmless" OOB write).
+    // robustBufferAccess this recompiler already depends on for buffer loads. Every device prosper
+    // executes this on acquires it through frontends/shared/device/image_robustness.hpp, and a device
+    // that CANNOT declines the storage-image path rather than running it undefined (#3531 -- until
+    // then the compute backend's own device silently did neither). The store side is instead
+    // EXEC-predicated (no robust "harmless" OOB write).
     void image_read(uint32_t binding, uint32_t dim, bool arrayed, uint32_t ncoord, const uint32_t* coords,
                     uint32_t out[4], bool ms = false, uint32_t sample = 0) {
         if (stg_img_format[binding] == ImgFmt_Unknown && !declared_read_wo_fmt) {

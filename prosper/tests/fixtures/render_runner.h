@@ -22,6 +22,7 @@
 #include "shared/rtt/rtt_scale.hpp"
 #include "shared/device/vulkan_device_select.hpp"
 #include "shared/device/pipeline_cache_file.hpp"
+#include "shared/device/image_robustness.hpp"  // #3531: the recompiler's OOB image-read contract
 #include "shared/perf/performance_timing_gate.hpp"
 #include "shared/perf/performance_timing_policy.hpp"
 #include "shared/present/readback_policy.hpp"
@@ -1192,6 +1193,10 @@ struct RenderVkCtx {
     // wave-uniform, and a driver waterfall over the distinct values present converges in one iteration.
     bool descriptor_indexing = false;
     bool storage_buffer_int64_atomics = false;
+    // What this device offers the recompiled storage-image path (#3531): acquired by the same
+    // shared helper the compute backend's own device uses, and published to SharedVulkanContext so
+    // an adopting consumer inherits the verdict instead of assuming it.
+    prosper::frontend::StorageImageDeviceFeatures storage_image_features{};
     bool compute_full_subgroups = false;
     uint32_t min_subgroup_size = 0, max_subgroup_size = 0;
     uint32_t max_compute_workgroup_subgroups = 0;
@@ -1486,7 +1491,7 @@ inline const RenderVkCtx& render_vk_ctx() {
         // OpImageRead OOB must return zero (#131); enable robustImageAccess when supported.
         // Only features not promoted to core still require extension names below.
         std::vector<const char*> dev_exts;
-        VkPhysicalDeviceImageRobustnessFeatures irf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_ROBUSTNESS_FEATURES};
+        VkPhysicalDeviceImageRobustnessFeatures irf{};
         VkPhysicalDeviceSubgroupSizeControlFeatures subgroup_features{
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES};
         VkPhysicalDeviceSubgroupSizeControlProperties subgroup_properties{
@@ -1501,14 +1506,14 @@ inline const RenderVkCtx& render_vk_ctx() {
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_INT64_FEATURES};
         // These features are core in Vulkan 1.2/1.3. Query the feature bits directly;
         // promoted extensions need not still be advertised by a Vulkan 1.4 device.
-        {
-            VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
-            f2.pNext = &irf; vkGetPhysicalDeviceFeatures2(r.phys, &f2);
-            if (irf.robustImageAccess) {
-                irf.pNext = const_cast<void*>(dci.pNext);
-                dci.pNext = &irf;
-            }
-        }
+        //
+        // Image robustness goes through the shared helper (#3531) rather than an inline query: this
+        // device and the compute backend's own device execute the SAME recompiled kernels, and the
+        // bug that helper exists to prevent was exactly the two paths diverging -- this one chained
+        // the feature and the other silently did not.
+        r.storage_image_features = prosper::frontend::acquire_storage_image_device_features(
+            "vk", r.phys, feats.shaderStorageImageReadWithoutFormat == VK_TRUE,
+            feats.shaderStorageImageWriteWithoutFormat == VK_TRUE, irf, dci);
 
         // Runtime-selected storage buffers use bounded fixed arrays. Request only the one
         // descriptor-indexing feature their non-uniform access chains require.
@@ -1692,6 +1697,10 @@ inline const RenderVkCtx& render_vk_ctx() {
             // declaring a capability the device never enabled.
             shared.storage_image_read_without_format = feats.shaderStorageImageReadWithoutFormat;
             shared.storage_image_write_without_format = feats.shaderStorageImageWriteWithoutFormat;
+            // Publish the third term of the storage-image contract (#3531). Same rule as the two
+            // above: this is what device creation REQUESTED, so an adopting consumer can refuse the
+            // recompiled storage-image path rather than execute out-of-range reads undefined.
+            shared.image_robustness = r.storage_image_features.robust_image_access;
             shared.compute_subgroup_size_control = r.subgroup_size_control &&
                 (r.required_subgroup_size_stages & VK_SHADER_STAGE_COMPUTE_BIT) &&
                 (r.subgroup_stages & VK_SHADER_STAGE_COMPUTE_BIT);

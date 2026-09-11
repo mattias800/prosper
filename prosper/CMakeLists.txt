@@ -4017,6 +4017,20 @@ if(TARGET prosper-app AND TARGET prosper_video_vaapi)
   message(STATUS "prosper-app: FFmpeg/VA-API video enabled")
 endif()
 
+# Image robustness (#3531): the device-side half of the recompiler's out-of-bounds image-read
+# contract, and the refusal that replaces executing it undefined. Registered OUTSIDE the per-platform
+# blocks because the contract is not platform-specific and the bug it guards was a divergence between
+# two device paths -- a guard built on only one host would have the same blind spot. Queries a
+# physical device but creates none, so it runs wherever an ICD exists and reports a skip (never a
+# silent pass) where one does not.
+if(TARGET Vulkan::Vulkan AND TARGET prosper_core)
+  add_executable(test_image_robustness tests/shared/device/test_image_robustness.cpp)
+  # Spells `shared/...` and `gpu/...` includes, which resolve from `frontends` and `src`.
+  target_include_directories(test_image_robustness PRIVATE frontends src)
+  target_link_libraries(test_image_robustness PRIVATE prosper_core Vulkan::Vulkan)
+  add_test(NAME image_robustness COMMAND test_image_robustness)
+endif()
+
 # Shared-device adoption guard (#1091). prosper_live_renderer only exists in frontend-enabled
 # configurations and is defined later in this file than the core test block, so register this
 # after the fact and only when the target is actually present.
