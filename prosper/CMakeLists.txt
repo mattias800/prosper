@@ -1180,6 +1180,14 @@ if(TARGET prosper_core)
   target_link_libraries(test_savedata_ime PRIVATE prosper_core)
   add_test(NAME savedata_ime COMMAND test_savedata_ime)
 
+  # The save's parameter block (#2786): sceSaveDataSetParam/GetParam were unregistered, so both
+  # answered SCE_OK while storing and reading nothing. Drives the real NIDs, including a mutation arm
+  # (a different block must read back differently) and a persistence arm (it must come off disk).
+  add_executable(test_savedata_param tests/hle/test_savedata_param.cpp)
+  target_include_directories(test_savedata_param PRIVATE tests)
+  target_link_libraries(test_savedata_param PRIVATE prosper_core)
+  add_test(NAME savedata_param COMMAND test_savedata_param)
+
   # Save data is namespaced by title id (#2734): two titles that pick the same guest save name --
   # `OptionSettings`, or SaveDataMemory's (user 1, slot 0) -- must not share one host save. Runs two
   # application roots over one guest name, because a single-title round trip passes on the broken code.

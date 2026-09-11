@@ -989,6 +989,10 @@ SaveDataMountOutcome savedata0_mount(const char* dirname, SaveDataMountPolicy po
     g_save0 = d;
     return created ? SaveDataMountOutcome::Created : SaveDataMountOutcome::Opened;
 }
+std::string savedata0_mounted_dir() {
+    std::lock_guard<std::mutex> lk(g_save0_mx);
+    return g_save0;
+}
 bool savedata0_umount() {
     std::lock_guard<std::mutex> lk(g_save0_mx);
     const bool was_mounted = !g_save0.empty();
