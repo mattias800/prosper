@@ -57,8 +57,10 @@ We already have the seed: **`PROSPER_PAD_SCRIPT` (#202)** — a scripted `PadBac
   ran a whole measurement session in Fidelity+RT while being reported as a Performance run. Guest
   flip pacing (#3379) does not remove the need: pacing only sleeps when a host runs FAST, so at the
   rates that caused this it is inert by construction.
-  **A route that navigates a menu should also be verified by screenshot on the platform it runs on**;
-  a wrong selection is silent by nature.
+  **A route that navigates a menu must also be verified by screenshot on the platform it runs on**,
+  because a wrong selection is silent by nature and nothing in the harness can currently catch it
+  (#3567). Two instances on the same GTA V route reached different wrong settings (#3449, #3301),
+  and a third turned up when #3449 was reproduced -- same file, same build, same host, two runs.
 - Actions are button names or full-deflection `left-stick-{left,right,up,down}` and
   `right-stick-{left,right,up,down}` directions. Seconds points use `PROSPER_PAD_HOLD` ms
   (default 300); flip/read points use their count-axis holds above. Explicit ranges always use their

@@ -652,7 +652,10 @@ int main() {
         auto same_unit = parse_pad_script("f100+f12:down;3+0.5:cross;p40+p10:circle");
         CHECK(same_unit.size() == 3 && !pad_script_needs_runner(same_unit),
               "hold: same-unit holds need no runner");
-        CHECK(same_unit[0].end == 112.0 && same_unit[1].end == 3.5 && same_unit[2].end == 50.0,
+        // size-guarded: a parser that drops these entries must FAIL this arm, not index past the
+        // end of an empty vector -- a crash reports nothing about which assertion was violated.
+        CHECK(same_unit.size() == 3 && same_unit[0].end == 112.0 && same_unit[1].end == 3.5 &&
+              same_unit[2].end == 50.0,
               "hold: a same-unit hold folds into the exclusive end");
 
         // THE REGRESSION. Two hosts, same route, same start flip; only the flip RATE differs. A
