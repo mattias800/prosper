@@ -76,16 +76,26 @@ struct Program {
     // rewriting whichever stub occupied the slot, after which that import jumped into altered code
     // at an arbitrarily later moment.
     //
-    // The population is not exotic: across the 60 local dumps, ALL 60 import `__stack_chk_guard`,
-    // and 53 import an unnamed libSceLibcInternal object. Over the set the loader actually LINKS
-    // that is 417 unresolved OBJECT bindings spanning exactly four distinct NIDs.
+    // The population is not exotic, and these figures are the TOOL'S OWN -- `nid_census --data-only`
+    // over the 60 local dump roots, whose default scope is already the loader's link set:
     //
-    // Quote link-set figures, not disk figures. An earlier revision of this comment said "596
-    // shipped modules", which came from a RECURSIVE scan of every module present in every dump --
-    // 808 of them. `boot_link_inputs` links about 303, so that number described a population the
-    // linker never sees and overstated the bindings by roughly 2.4x. The TITLE counts were right
-    // either way, which is exactly what made the binding count easy to miss. Corrected in review of
-    // #3541.
+    //   scope: 2284 distinct imported NIDs over 338 module(s) read, 0 unreadable
+    //   424 DATA binding(s) unresolved by any sibling module, over 60 of 60 input(s);
+    //   a further 1566 were satisfied cross-module
+    //
+    //   f7uOxY9mM1U  __stack_chk_guard   libkernel            60 of 60 titles
+    //   djxxOmW6-aw  __progname          libkernel            60 of 60 titles
+    //   ZT4ODD2Ts9o  (unnamed)           libSceLibcInternal   51 titles
+    //   GAtITrgxKDE  (unnamed)           libSceNet             1 title
+    //
+    // QUOTE LINK-SET FIGURES, NOT DISK FIGURES, and take them from the tool. Two earlier revisions
+    // of this comment got it wrong in the same way and the second was written while correcting the
+    // first: "596 shipped modules" came from passing MODULE PATHS to nid_census individually, where
+    // each .prx becomes its own "title" and cross-module exclusion degenerates -- a recursive
+    // population of 808 modules the linker never links. The replacement then said the link set is
+    // "roughly 303 modules", which is a BINDING count written where a module count goes. The
+    // per-title counts survived both errors intact, which is exactly what made the numbers under
+    // them easy to repeat unchecked. Corrected in review of #3541.
     // Whether a given one reaches a stub depends on the title's own libc: an import a sibling module
     // defines is bound to that definition and never comes here.
     std::vector<ImportSlot> data_slots;

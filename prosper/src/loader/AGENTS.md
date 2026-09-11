@@ -22,17 +22,30 @@ half, made a guest store rewrite an executable stub, silently and with arbitrary
 `Symbol`/`Import` carry `elf_type` at all: nothing else in an undefined symbol entry distinguishes
 the two cases (shndx 0, value 0 and size 0 for both).
 
-The distinction is not a corner case. Across the 60 local dumps, **all 60** import
-`__stack_chk_guard` and 53 import an unnamed `libSceLibcInternal` object; over the set the loader
-actually links that is **417 unresolved OBJECT bindings across exactly four distinct NIDs**. Most
-data imports resolve cross-module and never reach a slot at all — these four are the ones that do.
+The distinction is not a corner case, and these figures are the tool's own — `nid_census
+--data-only` over the 60 local dump roots, whose default scope is already the loader's link set:
 
-**Quote link-set figures here, not disk figures.** An earlier version of this paragraph said
-`__stack_chk_guard` "appears in 596 shipped modules", taken from a recursive scan of every module
-file present in every dump (808 modules). `boot_link_inputs` links roughly 303 of them, so that
-figure described a population the linker never sees and overstated the bindings by about 2.4x. The
-per-title counts were correct in both scopes, which is what made the binding count easy to repeat
-unchecked.
+```text
+scope: 2284 distinct imported NIDs over 338 module(s) read, 0 unreadable
+424 DATA binding(s) (ELF STT_OBJECT) unresolved by any sibling module, over 60 of 60 input(s);
+a further 1566 were satisfied cross-module
+
+f7uOxY9mM1U  __stack_chk_guard   libkernel            60 of 60 titles
+djxxOmW6-aw  __progname          libkernel            60 of 60 titles
+ZT4ODD2Ts9o  (unnamed)           libSceLibcInternal   51 titles
+GAtITrgxKDE  (unnamed)           libSceNet             1 title
+```
+
+Most data imports resolve cross-module and never reach a slot — 1566 of them. These four are the ones
+that do, and every title in the corpus has at least two.
+
+**Quote link-set figures, not disk figures, and take them from the tool.** Two earlier revisions of
+this paragraph got it wrong the same way, the second while correcting the first. "596 shipped
+modules" came from passing *module paths* to `nid_census` individually, where each `.prx` becomes its
+own "title" and cross-module exclusion degenerates — a recursive population of 808 modules the linker
+never links. The replacement then called the link set "roughly 303 modules", which is a **binding**
+count written where a module count goes. Both times the per-title counts were right, which is
+precisely what let the number underneath them travel unchecked.
 
 Two properties of the link that surprise people, both load-bearing:
 
