@@ -1,7 +1,10 @@
 # `src/hle/net` — Sony networking libraries
 
 Reimplementations of the PS5 networking libraries that prosper answers itself. Today that is
-**libSceHttp** (`hle_http.cpp`): the URI helper family and the library/template id lifecycle.
+**libSceHttp** (`hle_http.cpp`): the URI helper family and the library/template id lifecycle; and
+**libSceHttp2** (`hle_http2.cpp`): the whole v2 library, split between a local object graph
+(contexts, templates, requests, cookie boxes, and the settings recorded on them) and an honest
+offline failure on everything from `sceHttp2SendRequest` onwards.
 
 ## The policy this folder exists to hold
 
@@ -41,9 +44,10 @@ library propagates the **raw libSceNet error**, encoded `0x80410100 | BSD errno`
 This folder is smaller than "prosper's networking" — several networking surfaces are answered
 elsewhere, and looking for them here is the mistake to avoid:
 
-- **`sceHttp2Init`, `sceNetCtlGetState` and the NetCtl/NP service surface live in
-  `../service/hle_service.cpp`**, not here. That is why `libSceHttp2` looks absent from this folder
-  while one of its entry points is already registered.
+- **`sceNetCtlGetState`, `sceNetPoolCreate`, `sceSslInit` and the rest of the NetCtl/NP service
+  surface live in `../service/hle_service.cpp`**, not here. `sceHttp2Init` used to be on that list
+  and is not any more (#2894): it moved into `hle_http2.cpp` with the rest of its library, because
+  the context id it returns has to be a slot that `sceHttp2CreateTemplate` can validate against.
 - Answers must not contradict each other across that boundary. prosper already tells the guest it
   is offline there — `sceNetCtlGetState` writes `SCE_NET_CTL_STATE_DISCONNECTED` and
   `sceNetCtlGetInfo` returns `SCE_NET_CTL_ERROR_NOT_CONNECTED` (`hle_service.cpp:4795`, `:4830`) —

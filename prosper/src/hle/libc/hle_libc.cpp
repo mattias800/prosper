@@ -1070,6 +1070,7 @@ void register_builtin_hle() {
     register_file_hle();     // file I/O (stdio + POSIX, /app0 translation)
     register_service_hle();  // PS5 system services (user/NP/mouse/appcontent/dialog)
     register_http_hle();     // libSceHttp local URI parsing
+    register_http2_hle();    // libSceHttp2 local ids + honest offline request failure
     register_font_hle();     // libSceFont opaque handles + deterministic text/metric fallback
     register_fiber_hle();    // libSceFiber cooperative guest-stack execution
     register_ult_hle();      // libSceUlt: NOT implemented — fail-visible counted stubs (#1603)
