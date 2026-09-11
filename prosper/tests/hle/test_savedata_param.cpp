@@ -41,6 +41,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -108,6 +109,16 @@ uint64_t set_text(const MountPoint& mp, uint32_t type, size_t capacity, const st
     memcpy(field.data(), value.data(), value.size() < capacity ? value.size() : capacity - 1);
     return set_param(mp, type, field.data(), capacity);
 }
+// Read a fixed-width field out of a TYPE_ALL block WITHOUT trusting it to be terminated. The
+// obvious std::string(ptr + offset) walks off the end when the call left the buffer untouched,
+// which is exactly the case these arms exist to catch: an arm that segfaults on the broken build
+// instead of failing cleanly cannot be read.
+std::string field_text(const std::vector<uint8_t>& block, size_t offset, size_t capacity) {
+    size_t n = 0;
+    while (n < capacity && offset + n < block.size() && block[offset + n]) n++;
+    return std::string((const char*)block.data() + offset, n);
+}
+
 std::string get_text(const MountPoint& mp, uint32_t type, size_t capacity, uint64_t& rc) {
     std::vector<char> field(capacity, 0x7f);   // poisoned: an untouched buffer must not read empty
     uint64_t got = 0;
@@ -226,15 +237,19 @@ int main() {
         uint64_t got = 0;
         CHECK(get_param(mp, TYPE_ALL, all.data(), all.size(), &got) == 0 && got == ALL_SIZE,
               "GetParam ALL fills the whole 1328-byte block");
-        CHECK(std::string((const char*)all.data() + OFF_TITLE) == title_b &&
-                  std::string((const char*)all.data() + OFF_SUBTITLE) == sub_a &&
-                  std::string((const char*)all.data() + OFF_DETAIL) == detail_a,
+        CHECK(field_text(all, OFF_TITLE, TITLE_MAX) == title_b &&
+                  field_text(all, OFF_SUBTITLE, SUBTITLE_MAX) == sub_a &&
+                  field_text(all, OFF_DETAIL, DETAIL_MAX) == detail_a,
               "ALL agrees with the per-field reads");
         uint32_t user = 0; int64_t mtime = 0;
         memcpy(&user, all.data() + OFF_USER_PARAM, sizeof user);
         memcpy(&mtime, all.data() + OFF_MTIME, sizeof mtime);
         CHECK(user == user_b, "ALL carries the user param at its ABI offset");
-        CHECK(mtime > 0, "ALL carries a real modification time, not a zero");
+        // Bounded on both sides, because the read buffer is poisoned with 0x7f: a call that wrote
+        // nothing leaves a huge positive value there, so "> 0" alone would pass on the broken build.
+        const int64_t now = (int64_t)time(nullptr);
+        CHECK(mtime > 1600000000 && mtime <= now + 86400,
+              "ALL carries a plausible modification time, not a zero and not an untouched buffer");
 
         // ...and the other direction: a whole block written at once must be readable per field.
         std::vector<uint8_t> write(ALL_SIZE, 0);
@@ -302,16 +317,26 @@ int main() {
                   decoded.detail == "DETAIL-C" && decoded.user_param == 0x11223344u,
               "and it decodes back to exactly what was set");
 
-        // A damaged file must look ABSENT rather than look like a stored-but-empty block: the two
-        // mean different things to a title, and a partially applied parse is the worse of them.
-        for (size_t truncated : {size_t{0}, size_t{4}, size_t{19}, bytes.size() / 2}) {
+    }
+    {
+        // Damaged input must look ABSENT rather than like a stored-but-empty block: the two mean
+        // different things to a title, and a partially applied parse is the worse of them. Built
+        // from a freshly encoded block rather than from the file on disk, so this arm still runs --
+        // and still means something -- on a build where nothing was written to disk at all.
+        SaveDataParam source;
+        source.title = "T";
+        source.sub_title = "S";
+        source.detail = "D";
+        source.user_param = 7;
+        const std::vector<uint8_t> good = encode_param_sfo(source, "PPSA00042", "SlotA");
+        for (size_t truncated : {size_t{0}, size_t{4}, size_t{19}, good.size() / 2}) {
             SaveDataParam poisoned;
             poisoned.title = "untouched";
-            const bool ok = decode_param_sfo(bytes.data(), truncated, poisoned);
+            const bool ok = decode_param_sfo(good.data(), truncated, poisoned);
             CHECK(!ok && poisoned.title == "untouched",
                   "a truncated param.sfo is rejected without partially overwriting the caller");
         }
-        std::vector<uint8_t> wrong_magic = bytes;
+        std::vector<uint8_t> wrong_magic = good;
         wrong_magic[0] = 0xff;
         SaveDataParam ignored;
         CHECK(!decode_param_sfo(wrong_magic.data(), wrong_magic.size(), ignored),
