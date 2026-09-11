@@ -46,9 +46,35 @@ ROOT_DIRS = ["src", "frontends"]
 ROOT_SUFFIXES = {".cpp", ".cc", ".cxx"}
 HEADER_SUFFIXES = {".hpp", ".h", ".hxx", ".inl"}
 
-# Where a quoted #include is resolved from, after the including file's own directory. These mirror
-# the target_include_directories in CMakeLists.txt.
-INCLUDE_ROOTS = ["src", "frontends", "tests", "."]
+# Where a quoted #include is resolved from, after the including file's own directory.
+#
+# These are READ OUT OF CMakeLists.txt rather than listed here. A hand-written list is the thing this
+# checker already got wrong once, and a list of include roots fails the same way a list of files did:
+# it looks right, it is never re-checked, and what it omits is dropped in silence. Reading the build
+# file means adding a root to a target adds it here too.
+#
+# The fallbacks are only for a tree where that parse finds nothing.
+FALLBACK_INCLUDE_ROOTS = ["src", "frontends", "tests", "."]
+
+
+def include_roots(root: Path):
+    """Every directory a target_include_directories line names, plus the repository root."""
+    found = []
+    build_file = root / "CMakeLists.txt"
+    text = build_file.read_text(errors="replace") if build_file.is_file() else ""
+    for match in re.finditer(r"target_include_directories\s*\(([^)]*)\)", text, re.S):
+        for token in match.group(1).split():
+            if token in ("PRIVATE", "PUBLIC", "INTERFACE", "SYSTEM", "BEFORE"):
+                continue
+            if token.startswith("$") or token.startswith("#"):
+                continue
+            candidate = token.strip('"')
+            if (root / candidate).is_dir() and candidate not in found:
+                found.append(candidate)
+    for fallback in FALLBACK_INCLUDE_ROOTS:
+        if fallback not in found and (root / fallback).is_dir():
+            found.append(fallback)
+    return found
 
 # The wrappers themselves are the one place the raw calls belong.
 ALLOWED = {"src/gpu/diagnostics/gpu_memory_budget_vk.hpp"}
@@ -64,20 +90,32 @@ RAW = re.compile(r"(?<![A-Za-z0-9_:])(vkAllocateMemory|vkFreeMemory)\s*\(")
 QUOTED_INCLUDE = re.compile(r'^\s*#\s*include\s*"([^"]+)"')
 
 
-def resolve(target: str, including: Path, root: Path):
+def resolve(target: str, including: Path, root: Path, roots):
     """Resolve a quoted #include the way the compiler would, or None if it is not ours."""
     candidate = (including.parent / target).resolve()
     if candidate.is_file():
         return candidate
-    for base in INCLUDE_ROOTS:
+    for base in roots:
         candidate = (root / base / target).resolve()
         if candidate.is_file():
             return candidate
     return None
 
 
-def reachable_files(root: Path):
-    """Every file the shipped translation units can reach through quoted includes."""
+def reachable_files(root: Path, dropped=None):
+    """Every file the shipped translation units can reach through quoted includes.
+
+    `dropped` collects includes that did not resolve but whose basename exists somewhere in the tree.
+    Those are edges this walk could not follow, and each one is a subtree it may never have opened --
+    so they are reported and the checker refuses to answer, rather than calling a tree clean on the
+    strength of a graph it knows is incomplete. This is the backstop that makes the root list above
+    non-load-bearing: if the list is ever wrong, this says so instead of hiding it.
+    """
+    roots = include_roots(root)
+    in_tree = {}
+    for path in root.rglob("*"):
+        if path.suffix in (HEADER_SUFFIXES | ROOT_SUFFIXES | {".inc"}):
+            in_tree.setdefault(path.name, path)
     queue = []
     for name in ROOT_DIRS:
         directory = root / name
@@ -102,15 +140,27 @@ def reachable_files(root: Path):
             match = QUOTED_INCLUDE.match(line)
             if not match:
                 continue
-            target = resolve(match.group(1), resolved, root)
-            if target and target.suffix in (HEADER_SUFFIXES | ROOT_SUFFIXES):
+            spelled = match.group(1)
+            target = resolve(spelled, resolved, root, roots)
+            if target is None:
+                if dropped is not None and Path(spelled).name in in_tree:
+                    dropped.add((relative_or_name(resolved, root), spelled))
+                continue
+            if target.suffix in (HEADER_SUFFIXES | ROOT_SUFFIXES | {".inc"}):
                 queue.append(target)
     return seen
 
 
-def scan(root: Path):
+def relative_or_name(path: Path, root: Path) -> str:
+    try:
+        return path.relative_to(root).as_posix()
+    except ValueError:
+        return path.name
+
+
+def scan(root: Path, dropped=None):
     """Yield (relative path, line number, symbol) for every raw call in reachable code."""
-    for path in sorted(reachable_files(root)):
+    for path in sorted(reachable_files(root, dropped)):
         try:
             relative = path.relative_to(root).as_posix()
         except ValueError:
@@ -128,52 +178,104 @@ def scan(root: Path):
 
 
 def self_test() -> str:
-    """Prove the walk reaches a header only a TRANSITIVE include can reach. Returns "" when sound.
+    """Prove the walk does what the answer depends on. Returns "" when sound.
 
-    This is the control the first version of this checker did not have. That one planted its probe
-    under `src/`, inside the roots it already scanned, so it could only ever confirm that the scanner
-    fires -- the charter's rule that a control drawn from the same source tests the DISCRIMINATOR and
-    never the DOMAIN. It certified a hand-written file list that was missing two shipped headers.
+    Four properties, one per way this has actually been wrong or could be:
 
-    So the probe here sits three includes deep, in a directory that is NOT a scanned root, reachable
-    only by following the graph: shipped .cpp -> a header -> a nested header. If the walk ever stops
-    being transitive, this fails and the checker reports that it could not evaluate -- rather than
-    reporting a clean tree it did not actually look at.
+      1. it follows a TRANSITIVE chain, not just a shipped file's direct includes;
+      2. it resolves an include that only a `target_include_directories` root can reach, which is the
+         branch the previous control never executed at all -- its probe resolved through the
+         including file's own directory every time, so dropping the entire root list still passed it;
+      3. it REFUSES, rather than answering, when an include cannot be followed;
+      4. it does not report a correctly wired call, because a gate that cries wolf gets ignored and
+         that is the same outcome as having no gate.
+
+    The first control this checker had tested none of these. It planted its probe under `src/`,
+    inside the roots already scanned, so it could only confirm that the scanner fires -- the
+    charter's rule that a control drawn from the same source tests the DISCRIMINATOR, never the
+    DOMAIN. It certified a file list that was missing two shipped headers.
     """
     import tempfile
     with tempfile.TemporaryDirectory() as directory:
         fake = Path(directory)
-        (fake / "src").mkdir()
-        (fake / "frontends").mkdir()
-        (fake / "elsewhere").mkdir()
+        for name in ("src", "frontends", "elsewhere", "vendor_root"):
+            (fake / name).mkdir()
+        (fake / "CMakeLists.txt").write_text(
+            "target_include_directories(thing PRIVATE src vendor_root)\n")
         (fake / "src" / "ship.cpp").write_text('#include "middle.h"\n')
-        (fake / "src" / "middle.h").write_text('#include "../elsewhere/deep.h"\n')
+        # A second shipped root, so dropping one from ROOT_DIRS fails here instead of silently
+        # halving the scan. The reviewer of #3565 noted the previous control could not see that.
+        (fake / "frontends" / "ship2.cpp").write_text('#include "../elsewhere/frontend_only.h"\n')
+        (fake / "elsewhere" / "frontend_only.h").write_text(
+            "void h() { vkFreeMemory(d, m, nullptr); }\n")
+        (fake / "src" / "middle.h").write_text(
+            '#include "../elsewhere/deep.h"\n#include "only_via_root.h"\n')
         (fake / "elsewhere" / "deep.h").write_text("void f() { vkFreeMemory(d, m, nullptr); }\n")
-        found = list(scan(fake))
-        if not any(name.endswith("deep.h") for name, _, _ in found):
-            return ("the include walk did not reach a header three levels deep, so a clean result "
-                    "would be a statement about files it never opened")
+        # Reachable ONLY through the CMake-declared `vendor_root`: not beside its includer, and not
+        # under any fallback root.
+        (fake / "vendor_root" / "only_via_root.h").write_text(
+            "void g() { vkAllocateMemory(d, &i, nullptr, &o); }\n")
 
-        # ...and the negative half: a wired call must NOT be reported, or the gate cries wolf and
-        # gets ignored, which is the same outcome as not having it.
+        dropped = set()
+        found = list(scan(fake, dropped))
+        names = [name for name, _, _ in found]
+        if dropped:
+            return f"the walk could not follow an include it should have: {sorted(dropped)}"
+        if not any(n.endswith("deep.h") for n in names):
+            return ("the walk did not reach a header three levels deep, so a clean result would be "
+                    "a statement about files it never opened")
+        if not any(n.endswith("only_via_root.h") for n in names):
+            return ("the walk did not resolve an include through a target_include_directories root, "
+                    "so any header reachable only that way is invisible to it")
+        if not any(n.endswith("frontend_only.h") for n in names):
+            return ("the walk did not start from every shipped root, so a whole tree of translation "
+                    "units is unscanned")
+
+        # 3. an unfollowable include, whose basename DOES exist in the tree, must be announced.
+        (fake / "src" / "middle.h").write_text('#include "deep.h"\n#include "only_via_root.h"\n')
+        dropped = set()
+        list(scan(fake, dropped))
+        if not dropped:
+            return ("an include that could not be followed was dropped in silence; a clean result "
+                    "would then be a statement about a graph known to be incomplete")
+
+        # 4. the negative half. EVERY raw call in the fake tree must be wired for this to mean
+        # anything -- an earlier version left the frontend probe raw, so this arm reported a bypass
+        # that was really its own leftover and the control failed on correct code.
+        (fake / "src" / "middle.h").write_text('#include "../elsewhere/deep.h"\n')
         (fake / "elsewhere" / "deep.h").write_text(
             "void f() { prosper::gpu::free_device_memory(d, m); }\n")
-        if list(scan(fake)):
+        (fake / "elsewhere" / "frontend_only.h").write_text(
+            "void h() { prosper::gpu::free_device_memory(d, m); }\n")
+        dropped = set()
+        if list(scan(fake, dropped)):
             return "a correctly wired call was reported as a bypass"
     return ""
 
 
 def main() -> int:
     root = Path(__file__).resolve().parent.parent      # .../prosper
-    broken = self_test()
-    if broken:
-        print(f"vkmem_coverage: the checker itself is not sound: {broken}", file=sys.stderr)
-        return 2
+    dropped = set()
     try:
-        findings = list(scan(root))
+        # The checker proves itself before it is believed -- and inside the same guard, so a crash in
+        # the control is "could not evaluate" rather than a traceback that reads as a tool bug.
+        broken = self_test()
+        if broken:
+            print(f"vkmem_coverage: the checker itself is not sound: {broken}", file=sys.stderr)
+            return 2
+        findings = list(scan(root, dropped))
         reached = len(reachable_files(root))
     except Exception as error:                          # noqa: BLE001 - report, do not mask
         print(f"vkmem_coverage: could not run: {error}", file=sys.stderr)
+        return 2
+
+    if dropped:
+        print("vkmem_coverage: could not follow these includes, so the graph is incomplete and a "
+              "clean result would not mean anything:\n", file=sys.stderr)
+        for where, spelled in sorted(dropped):
+            print(f"  {where}: #include \"{spelled}\"", file=sys.stderr)
+        print("\nAdd the directory to a target_include_directories line, or teach resolve() the "
+              "form -- do not silence this.", file=sys.stderr)
         return 2
 
     if not findings:

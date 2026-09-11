@@ -79,4 +79,21 @@ void report_device_memory(const char* why);
 // the first -- and most informative -- one out of a scrolling log.
 void report_allocation_failure(int result, uint64_t bytes, uint32_t memory_type);
 
+// Print the standing if it has been more than PROSPER_GPU_MEM_REPORT_S seconds (default 30) since
+// the last report. Cheap enough to call on every allocation and free.
+//
+// This is what puts a RECENT and UNQUANTISED number in the log of a run that never exits. The growth
+// line alone cannot do either. It ratchets, so a process that reached its high-water mark early and
+// then held steady goes quiet -- and a host that locks up an hour later leaves a log whose last
+// memory figure is an hour stale. It also only ever fires at a step boundary, so everything below
+// one step is invisible: on The Messenger at a 32 MiB step the growth line reported 64 MiB on one
+// heap and NOTHING on the other, where the true standing was 81 MiB and 16 MiB. A figure read off
+// the growth line is a floor rounded down to a step, and it was published as a footprint once.
+//
+// LIMIT, because it is driven by allocation activity rather than by a clock: a process that stops
+// allocating entirely stops reporting. That is the right trade for what this exists for -- a device
+// running out of memory is allocating by definition -- but it does mean a quiescent process leaves
+// no fresh line, and it is not a substitute for a periodic sampler if that is what you need.
+void report_device_memory_periodically();
+
 }  // namespace prosper::gpu

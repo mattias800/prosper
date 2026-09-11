@@ -215,6 +215,11 @@ int main() {
     note_device_free(0xb000);
     note_device_alloc(0xb100, 1, 26 * kMiB);   // same size again, below the mark: must stay silent
 
+    // A report of the LOADED state. The report above ran before these allocations, so it could not
+    // carry a pressure label; without this one, deleting the label from report_device_memory passes
+    // every assertion in the file because only the growth line exercises it.
+    report_device_memory("loaded");
+
     // Everything above is about counters. THIS is about output, and it is the arm that catches a
     // dead instrument whose arithmetic is perfect.
     if (!captured) {
@@ -233,6 +238,12 @@ int main() {
               "every report carries the caveat about what it does NOT count");
         CHECK(output.find("(over 70% of the heap)") != std::string::npos,
               "a heap past 70% says so on the line");
+        // ...and on the REPORT line specifically, which is a different call site. Deleting the
+        // label from report_device_memory used to pass every assertion in this file, because the
+        // growth line alone carried it.
+        CHECK(output.find("loaded: heap 3 is 64 MiB; prosper holds 45 MiB (peak 45 MiB)  "
+                          "(over 70% of the heap)") != std::string::npos,
+              "report_device_memory carries the pressure label too, not just the growth line");
         CHECK(output.find("*** OVER 90% OF THE HEAP ***") != std::string::npos,
               "a heap past 90% is shouted rather than mentioned");
         // The ratchet: exactly one line for heap 1 at 30 MiB, not a second one when the same 26 MiB

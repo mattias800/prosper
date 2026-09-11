@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
+#include <chrono>
 #include <mutex>
 #include <unordered_map>
 
@@ -50,8 +51,11 @@ uint64_t step_bytes() {
         // Clamp before multiplying. A value near 2^44 would overflow the shift to exactly zero, and
         // `held / step` below would then divide by zero on the first allocation -- a crash in a
         // diagnostic, triggered by a typo in its own environment variable.
-        const uint64_t clamped = (mib > 0 && mib < (1ll << 32)) ? (uint64_t)mib : 256ull;
-        return clamped * 1024ull * 1024ull;
+        const bool usable = mib > 0 && mib < (1ll << 32);
+        if (v && !usable)
+            std::fprintf(stderr, "[gpu-mem] PROSPER_GPU_MEM_LOG_MIB=%s is not a usable size; "
+                                 "using 256 MiB\n", v);
+        return (usable ? (uint64_t)mib : 256ull) * 1024ull * 1024ull;
     }();
     return step;
 }
@@ -180,13 +184,44 @@ uint64_t device_peak_bytes(uint32_t heap) {
     return heap < kMaxHeaps ? g_peak[heap].load(std::memory_order_relaxed) : 0;
 }
 
+void report_device_memory_periodically() {
+    if (!logging_enabled()) return;
+    static const uint64_t interval_s = [] () -> uint64_t {
+        const char* v = std::getenv("PROSPER_GPU_MEM_REPORT_S");
+        const long long seconds = v ? std::atoll(v) : 0;
+        if (v && (seconds < 0 || seconds > 86400))
+            std::fprintf(stderr, "[gpu-mem] PROSPER_GPU_MEM_REPORT_S=%s is out of range; using 30\n", v);
+        return (seconds > 0 && seconds <= 86400) ? (uint64_t)seconds : 30ull;
+    }();
+    using clock = std::chrono::steady_clock;
+    static std::atomic<uint64_t> next_report{0};
+    const uint64_t now = (uint64_t)std::chrono::duration_cast<std::chrono::seconds>(
+        clock::now().time_since_epoch()).count();
+    uint64_t due = next_report.load(std::memory_order_relaxed);
+    if (due == 0) {                          // first call arms the timer; it does not report
+        next_report.compare_exchange_strong(due, now + interval_s, std::memory_order_relaxed);
+        return;
+    }
+    if (now < due) return;
+    if (!next_report.compare_exchange_strong(due, now + interval_s, std::memory_order_relaxed))
+        return;                              // another thread is printing this one
+    report_device_memory("periodic");
+}
+
 void report_allocation_failure(int result, uint64_t bytes, uint32_t memory_type) {
     if (!logging_enabled()) return;
     static std::atomic<int> reported{0};
     if (reported.fetch_add(1, std::memory_order_relaxed) >= 4) return;
-    std::fprintf(stderr,
-                 "[gpu-mem] a device allocation FAILED (%d): asked for %llu MiB of memory type %u\n",
-                 result, (unsigned long long)(bytes >> 20), memory_type);
+    // Sub-MiB in KiB: a failure asking for 512 KiB printed "0 MiB", which reads as a bug in the
+    // reporter rather than as the small allocation that actually failed.
+    if (bytes >= (1ull << 20))
+        std::fprintf(stderr,
+                     "[gpu-mem] a device allocation FAILED (%d): asked for %llu MiB of memory "
+                     "type %u\n", result, (unsigned long long)(bytes >> 20), memory_type);
+    else
+        std::fprintf(stderr,
+                     "[gpu-mem] a device allocation FAILED (%d): asked for %llu KiB of memory "
+                     "type %u\n", result, (unsigned long long)(bytes >> 10), memory_type);
     report_device_memory("allocation failed");
 }
 

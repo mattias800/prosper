@@ -34,7 +34,7 @@ inline void set_device_heaps(const VkPhysicalDeviceMemoryProperties& props) {
 //
 // A FAILURE reports the budget from here, which is the only place that sees every failure. It was
 // once wired at a single call site instead, and that made a property of the instrument out of a
-// property of one of its twenty-one sites: a renderer allocation could fail and still print no
+// property of one of its many sites: a renderer allocation could fail and still print no
 // number, which is precisely the #3533 scenario the whole thing exists for.
 inline VkResult allocate_device_memory(VkDevice device, const VkMemoryAllocateInfo* info,
                                        VkDeviceMemory* out) {
@@ -43,6 +43,7 @@ inline VkResult allocate_device_memory(VkDevice device, const VkMemoryAllocateIn
         if (info)
             note_device_alloc((uint64_t)*out, info->memoryTypeIndex,
                               (uint64_t)info->allocationSize);
+        report_device_memory_periodically();
         return status;
     }
     report_allocation_failure(static_cast<int>(status),
@@ -54,6 +55,7 @@ inline VkResult allocate_device_memory(VkDevice device, const VkMemoryAllocateIn
 // vkFreeMemory, counted. VK_NULL_HANDLE is a legal no-op for both the driver and the counter.
 inline void free_device_memory(VkDevice device, VkDeviceMemory memory) {
     note_device_free((uint64_t)memory);
+    report_device_memory_periodically();
     vkFreeMemory(device, memory, nullptr);
 }
 
