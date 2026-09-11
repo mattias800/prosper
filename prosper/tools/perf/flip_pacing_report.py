@@ -221,8 +221,14 @@ def report(stamps, window_s, tick, untimed=0, restarts=0):
     # len(raw) periods elapse between len(stamps) flips, and the span is bounded BY two flips, so
     # the rate over the observed window is intervals/span. (flips/span overstates it by 1/n.)
     overall = 1000.0 * len(raw) / span_ms
+    # A CONCATENATED INPUT HAS NO SINGLE SPAN, and deriving the rate from one is a new way for
+    # this line to be wrong that the old mean-of-intervals did not have: sorted, max-min covers
+    # roughly ONE run's timeline while the flips come from several, so the rate over-counts by
+    # about the number of runs. The warning above already says the intervals are not real; it
+    # must say it of the rate too, now that the rate comes from the span instead (#3560).
+    void = "" if not restarts else "  <-- NOT meaningful: see the restart warning above"
     print(f"flips={len(stamps)} over {span_ms / 1000.0:.3f} s "
-          f"-> {overall:.1f} fps average (flips / wall-clock span)")
+          f"-> {overall:.1f} fps average (flips / wall-clock span){void}")
 
     intervals = [ms for ms in raw if ms > 0.5]
     # The filter stays -- a burst pair is not a pacing decision and must not vote in the tick

@@ -166,6 +166,14 @@ def main():
     out, _ = run("\n".join(joined) + "\n")
     if "step backwards" not in out:
         failures.append(f"case 10: concatenated runs went undetected: {out!r}")
+    # ...and the HEADLINE must be marked void with it. Deriving the rate from the wall-clock span
+    # (#3560) is right for one run and meaningless for several: sorted, the span covers roughly
+    # one run's timeline while the flips come from all of them, so the rate over-counts by about
+    # the number of runs. Saying the intervals are not real while printing a confident rate above
+    # them would be the corrected instrument lying in a new place.
+    if "NOT meaningful" not in out:
+        failures.append(f"case 10: the rate over a concatenated span was printed without a"
+                        f" caveat, so the restart warning and the headline disagree: {out!r}")
 
     # ...and a single clean run must stay silent, or the warning becomes noise nobody reads.
     single = []
@@ -176,6 +184,9 @@ def main():
     out, _ = run("\n".join(single) + "\n")
     if "step backwards" in out:
         failures.append(f"case 10: a single monotonic run was flagged as concatenated: {out!r}")
+    if "NOT meaningful" in out:
+        failures.append(f"case 10: a single clean run's rate was voided, so the caveat is"
+                        f" automatic and carries no information: {out!r}")
 
     # 11. #3454: the tick-aligned share is meaningless without its null. The band is +/-BAND of
     #     the tick, so it covers 2*BAND of every tick period and an interval unrelated to the
