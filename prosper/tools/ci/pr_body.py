@@ -131,16 +131,25 @@ def compare(intended: str, live: str) -> tuple[bool, str]:
 def resolve_repo(repo_dir: str = ".") -> str:
     """The repository's CANONICAL `owner/name`, which is not always what the remote says.
 
-    `gh api` expands the `{owner}`/`{repo}` placeholders from the git remote, and a repository
-    that has been RENAMED keeps answering on its old name by redirect. GitHub replies **HTTP 307**
-    to a `PATCH` there, and `gh api` does not follow it -- so the write silently does nothing while
-    reporting a failure the caller may well shrug at as transport noise.
+    `gh api` expands the `{owner}`/`{repo}` placeholders from the git remote, and this checkout's
+    remote spells the repository `ps5ys` while its canonical name is `mattias800/prosper`.
+    Addressing the canonical name directly removes a whole class of question about how a rename is
+    followed, and costs one cached subprocess -- so it is worth doing on its own merits.
 
-    That is not hypothetical and was not predicted: this tool's very first live `set`, run against
-    its own pull request, hit exactly that -- remote `.../ps5ys.git`, canonical `mattias800/prosper`,
-    `gh: HTTP 307`, body unchanged. The read-back is what caught it, which is the argument for the
-    whole design in one line. `gh repo view` resolves the redirect and reports the current name, so
-    every endpoint below is built from that rather than from the placeholders.
+    A SINGLE OBSERVATION, AND WHAT IT DOES AND DOES NOT ESTABLISH. This tool's first live `set`,
+    run against its own pull request, reported `gh: HTTP 307` and left the body unchanged. It was
+    originally recorded here as a mechanism -- that GitHub answers a renamed repository's `PATCH`
+    with a 307 which `gh api` declines to follow. **That mechanism does not reproduce.** Measured
+    the same day, same `gh` 2.93.0, same checkout: `PATCH` through the `{owner}/{repo}`
+    placeholders succeeds on both the issue-comments and pulls endpoints, and a `PATCH` addressed
+    to the renamed-away spelling `mattias800/ps5ys` not only returns 0 but **actually writes** --
+    verified with a marker appended to a live PR body, read back, and removed again. If the rename
+    were the cause, that arm could not have written.
+
+    So the honest state is: a write silently failed once, the cause is unidentified, and the
+    read-back below is what caught it. That is the argument for the design and it does not depend
+    on knowing the mechanism -- which is the point. A verification that only defends against the
+    failure you already understand is not verification. See #2918.
     """
     rc, out, err = run(["gh", "repo", "view", "--json", "nameWithOwner",
                         "-q", ".nameWithOwner"], cwd=repo_dir)

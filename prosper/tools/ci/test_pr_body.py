@@ -63,7 +63,8 @@ class FakeGh:
         if "repo" in cmd and "view" in cmd:
             return self.repo_rc, self.repo_name + "\n", "" if self.repo_rc == 0 else "no remote"
         # Every other call must already be addressed at the resolved name, never at the
-        # placeholders: `{owner}/{repo}` is what 307s on a renamed repository.
+        # placeholders. This is a design invariant -- one place decides what repository we are
+        # talking to -- and it holds independently of how `gh` happens to follow a rename today.
         assert not any("{owner}" in a for a in cmd), "endpoint still uses {owner}/{repo}: %r" % (cmd,)
         if "-X" in cmd and "PATCH" in cmd:
             if self.applies:
@@ -287,11 +288,16 @@ case("`get` writes UTF-8 bytes, bypassing the console codepage",
      written, "a body with \u2260 and \u2014\n".encode("utf-8"))
 
 print("\n-- the endpoint is built from the CANONICAL repo name, not from the git remote")
-# `gh api` expands {owner}/{repo} from the remote, and a RENAMED repository answers there by
-# redirect: GitHub returns HTTP 307 to a PATCH and `gh api` does not follow it, so the write does
-# nothing. This tool's first live `set` hit exactly that -- remote `ps5ys`, canonical `prosper` --
-# and only the read-back noticed. The FakeGh above asserts no call carries the placeholders, so
-# reverting resolve_repo() reddens every arm rather than only this one.
+# `gh api` expands {owner}/{repo} from the git remote, and this checkout's remote spells the
+# repository `ps5ys` while its canonical name is `prosper`. Resolving it once and addressing that
+# name directly means a single place decides what we are talking to.
+#
+# The original comment here asserted a mechanism -- that GitHub answers a renamed repository's
+# PATCH with an unfollowed HTTP 307. That was inferred from ONE observed `gh: HTTP 307` and it
+# does NOT reproduce: a PATCH addressed to the renamed-away spelling writes successfully (see
+# resolve_repo's docstring for the arms). The write that failed is real; its cause is not known.
+# The invariant below stands on its own regardless, and the FakeGh above asserts no call carries
+# the placeholders, so reverting resolve_repo() reddens every arm rather than only this one.
 fake = FakeGh(body="stale", repo_name="someone/renamed")
 drive(fake, ["set", "42", "--body", BODY])
 case("the repo was resolved before any endpoint was built",
