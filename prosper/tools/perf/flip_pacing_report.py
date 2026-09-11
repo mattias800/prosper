@@ -109,17 +109,52 @@ def classify(ms, tick, band=BAND):
     return "between ticks"
 
 
-def alignment_verdict(share, chance=None):
+def alignment_power(intervals, tick, band=BAND):
+    """The fraction of intervals for which "aligned" is arithmetically REACHABLE.
+
+    classify() computes nearest = max(1, round(ms / tick)), so an interval shorter than the
+    bottom edge of the k=1 band -- (1 - band) * tick, 13.28 ms at the defaults -- is measured
+    against ONE tick however small it is, and its error can never fall inside the band. Such an
+    interval scores 'between ticks' by construction, not by evidence.
+
+    That matters because the sub-chance verdict below reads as a finding. Without this term a
+    run at 156 fps (6.4 ms intervals) scores 0.0% and gets told it is ANTI-aligned -- a
+    confident negative on a population where no other answer was arithmetically possible, which
+    is a new instrument lie in the fix for an old one. Caught in review of #3454; the GTA V run
+    that motivated the issue is unaffected (its windows mean 24-134 ms, all above the floor).
+    """
+    if not intervals:
+        return 0.0
+    floor = (1.0 - band) * tick
+    return sum(1 for ms in intervals if ms >= floor) / len(intervals)
+
+
+def alignment_verdict(share, chance=None, power=1.0):
     """Turn an observed tick-aligned SHARE (0..1) into a ratio against chance and a verdict.
 
-    Separate from the printing so the thresholds can be asserted directly. The bands are
-    deliberately coarse -- this answers 'is the tick implicated at all', and a sharper claim
-    than that is not available from a share against a flat null.
+    Separate from the printing so the thresholds can be asserted directly.
+
+    THE THRESHOLDS BELOW ARE A JUDGEMENT CALL, NOT A DERIVED RESULT -- 0.75 / 1.25 / 2.0 are
+    round numbers chosen to be coarse, because a share against a flat null does not support a
+    sharper claim. They are stated here rather than left to look principled. A real test would
+    need the sample size too: distinguishing 1.25x from chance at n intervals needs roughly
+    n > 150 before the binomial spread is narrower than the gap. Reported as a ratio precisely
+    so a reader can apply their own bar.
+
+    `power` is the fraction of the population for which alignment is REACHABLE at all (see
+    alignment_power). Below half, no verdict about the tick is honest and none is given.
     """
     chance = CHANCE if chance is None else chance
     if chance <= 0:
+        # Unreachable from report() -- CHANCE is a positive constant -- but exercised directly by
+        # the self-test, and the guard is what stops a future caller dividing by a widened band.
         return None, 'no chance baseline is defined for this band'
     ratio = share / chance
+    if power < 0.5:
+        return ratio, ('NO POWER -- %.0f%% of intervals are shorter than the band around one '
+                       'tick, where alignment is arithmetically impossible, so this share is a '
+                       'property of the frame rate rather than evidence about the tick'
+                       % (100.0 * (1.0 - power)))
     if ratio < 0.75:
         return ratio, ('BELOW chance -- production here is anti-aligned, which is evidence AGAINST a tick-bound wait, not an absence of evidence')
     if ratio < 1.25:
@@ -166,7 +201,8 @@ def report(stamps, window_s, tick, untimed=0, restarts=0):
 
     quantized = sum(1 for ms in intervals if classify(ms, tick) != "between ticks")
     overall_share = quantized / len(intervals)
-    ratio, verdict = alignment_verdict(overall_share)
+    power = alignment_power(intervals, tick)
+    ratio, verdict = alignment_verdict(overall_share, power=power)
     print(f"tick-aligned intervals (within +/-{BAND * 100:.0f}% of a {tick:.3f} ms tick "
           f"multiple): {quantized} ({100 * overall_share:.1f}%)")
     print(f"  chance baseline {100 * CHANCE:.1f}% -- {ratio:.2f}x chance: {verdict}")
@@ -181,17 +217,20 @@ def report(stamps, window_s, tick, untimed=0, restarts=0):
     window_flips = max(1, int(window_s * (1000.0 / statistics.mean(intervals))))
     print(f"windows of ~{window_flips} flips:")
     start = 0
-    window_shares = []
+    window_sizes = []   # (share, interval count) -- the count decides if it may vote below
     while start < len(intervals):
         chunk = intervals[start:start + window_flips]
         mean_ms = statistics.mean(chunk)
         quantized = sum(1 for ms in chunk if classify(ms, tick) != "between ticks")
         share = quantized / len(chunk)
-        window_shares.append(share)
-        w_ratio, _ = alignment_verdict(share)
+        window_sizes.append((share, len(chunk)))
+        w_power = alignment_power(chunk, tick)
+        w_ratio, _ = alignment_verdict(share, power=w_power)
         # Mark the sub-chance windows explicitly. A low share reading as 'no finding' is
-        # exactly how the 9.3% window's information was thrown away (#3454).
-        note = "BELOW chance" if w_ratio is not None and w_ratio < 0.75 else ""
+        # exactly how the 9.3% window's information was thrown away (#3454) -- but only
+        # where the window could have scored otherwise, or the mark is automatic.
+        note = "no power" if w_power < 0.5 else (
+            "BELOW chance" if w_ratio is not None and w_ratio < 0.75 else "")
         print(f"  flips {start:5d}-{start + len(chunk):5d}: "
               f"{1000.0 / mean_ms:6.1f} fps  mean {mean_ms:6.2f} ms  "
               f"tick-aligned {100 * share:5.1f}% ({w_ratio:.2f}x chance) {note}")
@@ -200,8 +239,12 @@ def report(stamps, window_s, tick, untimed=0, restarts=0):
     # The whole-run share is a mean over windows that can disagree by an order of magnitude,
     # which is the very smearing the windowed view exists to prevent -- so say so rather than
     # letting the summary line quietly reintroduce it (#3454).
-    if len(window_shares) >= 2:
-        lo, hi = min(window_shares), max(window_shares)
+    # A trailing window can hold a handful of intervals, whose share is quantised into
+    # huge steps -- 3 intervals can only score 0/33/67/100%. Comparing that against a full
+    # window manufactures a disagreement, so short windows do not vote (#3454 review).
+    full = [share for share, n in window_sizes if n >= max(8, window_flips // 4)]
+    if len(full) >= 2:
+        lo, hi = min(full), max(full)
         if hi - lo >= 0.25:
             print(f"  NOTE: windows disagree by {100 * lo:.1f}%..{100 * hi:.1f}% tick-aligned,"
                   f" so the whole-run {100 * overall_share:.1f}% above is an average over"

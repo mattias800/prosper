@@ -235,11 +235,30 @@ def main():
     if not match:
         failures.append(f"case 12: no tick-aligned share line: {out!r}")
     else:
-        observed = float(match.group(1))
-        if not 22.0 <= observed <= 34.0:
+        observed = float(match.group(1)) / 100.0
+        # Derive the expected coverage for THIS generator's support FROM BAND, rather than
+        # hard-coding a window. A fixed 22-34% band tolerated BAND anywhere in 0.118..0.181 and
+        # was blind to CHANCE entirely -- it guarded neither of the two things the PR claimed
+        # (found in review). Deriving it means a predicate that stops using BAND is caught even
+        # though the observation moves with it.
+        tick = FPR.TICK_MS
+        half = BAND * tick
+        covered, k = 0.0, 1
+        while k * tick - half < 120.0:
+            a, b = max(20.0, k * tick - half), min(120.0, k * tick + half)
+            if b > a:
+                covered += b - a
+            k += 1
+        expected = covered / 100.0
+        if abs(observed - expected) > 0.03:
             failures.append(
-                f"case 12: intervals unrelated to the tick scored {observed}%, outside the"
-                f" 22-34% window the flat null predicts -- the baseline claim is wrong")
+                f"case 12: unrelated intervals scored {100 * observed:.1f}%, but the band derived"
+                f" from BAND={BAND} predicts {100 * expected:.1f}% -- classify() and BAND have drifted")
+    # The other half the old window could not see: CHANCE must stay tied to BAND, and the
+    # printed baseline must be CHANCE rather than a separately-maintained literal.
+    if abs(CHANCE - 2.0 * BAND) > 1e-12:
+        failures.append(f"case 12: CHANCE ({CHANCE}) is not 2*BAND ({2 * BAND})")
+    expect(out, f"chance baseline {100 * CHANCE:.1f}%", "case 12 printed baseline is CHANCE")
     expect(out, "at chance", "case 12 an unrelated run must read as no evidence, not a finding")
 
     # 13. A BELOW-baseline run carries information -- production is actively anti-aligned, which
@@ -292,6 +311,54 @@ def main():
     ratio, verdict = verdict_of(0.5, chance=0.0)
     if ratio is not None:
         failures.append("case 15: a zero baseline must yield no ratio rather than a division")
+
+    # 16. #3454 review: a run FASTER than the first band cannot score aligned at all, because
+    #     classify() forces nearest >= 1 -- so every interval shorter than (1-BAND)*tick is
+    #     'between ticks' by construction. Without a power term the sub-chance verdict then told
+    #     a 156 fps run it was 'actively anti-aligned, evidence AGAINST a tick-bound wait', which
+    #     is a confident negative on a population where no other answer was possible -- a new
+    #     instrument lie introduced by the fix for an old one.
+    stamps = []
+    t = 1.0
+    for _ in range(1500):
+        t += 1.0 / 156.0
+        stamps.append(t)
+    log = "".join(f"[ev] GpuFlip t={t:.6f}\n" for t in stamps)
+    out, _ = run(log)
+    expect(out, "NO POWER", "case 16 a run below the first band reports no power")
+    if "evidence AGAINST" in out:
+        failures.append("case 16: a 156 fps run was called anti-aligned, which it cannot be")
+
+    # 17. ...and the power term must NOT silence a real negative. Case 13's anti-aligned run
+    #     sits at 1-2 ticks, well inside the reachable range, so it must still say so. Without
+    #     this arm, 'always report NO POWER' would pass case 16. NOTE it passes in BOTH
+    #     directions -- the pre-fix tool also reports this correctly, because it has no power
+    #     term to over-apply. It is an over-suppression control, not a discriminator, and is
+    #     counted as neither.
+    rng = random.Random(4242)
+    stamps = []
+    t = 1.0
+    for _ in range(1200):
+        t += (15.625 * rng.choice([1, 2]) + 15.625 * 0.5 + rng.gauss(0, 0.3)) / 1000.0
+        stamps.append(t)
+    log = "".join(f"[ev] GpuFlip t={t:.6f}\n" for t in stamps)
+    out, _ = run(log)
+    expect(out, "BELOW chance", "case 17 a reachable anti-aligned run still reports the negative")
+    if "NO POWER" in out:
+        failures.append("case 17: a run at 1-2 ticks was wrongly reported as having no power")
+
+    # 18. The verdict helper's power gate, asserted directly. Wrapped because a helper that has
+    #     no `power` parameter at all is the PRE-FIX state, and it must produce a NAMED failure
+    #     rather than a TypeError that aborts before cases 16 and 17 are reported.
+    try:
+        _, verdict = verdict_of(0.0, power=0.0)
+        if 'NO POWER' not in verdict:
+            failures.append(f"case 18: zero power must suppress the verdict: {verdict!r}")
+        _, verdict = verdict_of(0.0, power=1.0)
+        if 'BELOW chance' not in verdict:
+            failures.append(f"case 18: full power must still allow a negative: {verdict!r}")
+    except TypeError as exc:
+        failures.append(f"case 18: alignment_verdict takes no power term at all ({exc})")
 
     if failures:
         print("FAILURES:")
