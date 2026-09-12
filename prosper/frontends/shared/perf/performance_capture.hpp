@@ -115,6 +115,11 @@ struct RendererTimingRecord {
     // working and the content really is new" call for opposite work, and a single `other` bucket
     // cannot tell them apart -- which is exactly how Stray's title screen hid 930 of 1110 ms.
     double frontend_tex_persist_invalid_ms = 0;
+    // CPU snapshot ownership handoff, nested in frontend_texture_ms. These byte counts exclude
+    // the authoritative guest read and describe admitted entries, not Vulkan uploads or occupancy.
+    double frontend_tex_source_snapshot_handoff_ms = 0;
+    uint64_t frontend_tex_source_snapshot_copied_bytes = 0;
+    uint64_t frontend_tex_source_snapshot_transferred_bytes = 0;
     uint64_t frontend_tex_persist_invalid_n = 0;
     // References that reached NONE of the named classes. A count, not a duration: paired with the
     // signed millisecond residual the report derives, the two disagree only if the classification

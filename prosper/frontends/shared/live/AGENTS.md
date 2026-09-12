@@ -42,6 +42,14 @@ found Vulkan.
   instead: it fills every lease before handing it out, so nothing can quietly inherit the zeros a
   fresh mmap used to supply.
 
+`texture_source_snapshot.hpp` owns the encoded validation snapshot handoff at persistent texture
+cache admission. Guest reads, admission/accounting, write watches and decoded pixel retirement
+stay in the renderer. Oversized global scratch retains the copy path rather than increasing an
+entry's capacity beyond its outgoing allocation or exact readable prefix. The same-binary
+`PROSPER_NO_TEXTURE_SOURCE_SNAPSHOT_MOVE` control restores copying independently of prefix
+allocation inheritance. F8 handoff time is nested in frontend texture time; copied/transferred
+bytes describe actual admitted snapshots and exclude the guest read and GPU uploads.
+
 ## The boundary that is easy to get wrong
 
 The compute backend is where *guest memory* and *device memory* meet twice per dispatch — an upload

@@ -424,6 +424,9 @@ void InteractivePerformanceCapture::publish_completed(std::unique_ptr<PendingCap
                 << ",\"frontend_tex_persist_miss_ms\":" << record.frontend_tex_persist_miss_ms
                 << ",\"frontend_tex_persist_invalid_ms\":"
                 << record.frontend_tex_persist_invalid_ms
+                << ",\"frontend_tex_source_snapshot_handoff_ms\":" << record.frontend_tex_source_snapshot_handoff_ms
+                << ",\"frontend_tex_source_snapshot_copied_bytes\":" << record.frontend_tex_source_snapshot_copied_bytes
+                << ",\"frontend_tex_source_snapshot_transferred_bytes\":" << record.frontend_tex_source_snapshot_transferred_bytes
                 << ",\"frontend_tex_persist_invalid_n\":"
                 << record.frontend_tex_persist_invalid_n
                 << ",\"frontend_tex_other_n\":" << record.frontend_tex_other_n

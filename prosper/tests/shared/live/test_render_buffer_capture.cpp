@@ -82,6 +82,34 @@ bool solid(const std::vector<uint8_t>& rgba, bool green) {
     return true;
 }
 
+void sample_packed_texture(DrawItem& draw, uint64_t address) {
+    const uint32_t fragment[]{
+        0x7e0002ffu, 0x3e800000u, 0x7e0202ffu, 0x3e800000u, 0xf0800f08u, 0x00820000u,
+        0xf800000fu, 0x03020100u, 0xbf810000u};
+    ShaderResource texture{};
+    texture.cls = ResourceClass::Texture;
+    texture.format = DataFormat::Unorm2_10_10_10;
+    texture.num_components = 4;
+    texture.binding = 4;
+    texture.sgpr_base = 8;
+    texture.img_dim = 1;
+    texture.width = texture.height = 2;
+    texture.depth = 1;
+    texture.size = 16;
+    texture.gpu_addr = address;
+    draw.prt = std::make_shared<ShaderResourceTable>();
+    draw.prt->resources.push_back(texture);
+    draw.fs = recompile_fragment(fragment, std::size(fragment), draw.prt.get());
+}
+
+bool solid_red(const std::vector<uint8_t>& rgba) {
+    if (rgba.size() != Width * Height * 4u) return false;
+    for (size_t i = 0; i < rgba.size(); i += 4)
+        if (rgba[i] < 247 || rgba[i + 1] > 8 || rgba[i + 2] > 8 || rgba[i + 3] < 247)
+            return false;
+    return true;
+}
+
 uint64_t integer(const std::string& row, const char* field) {
     const std::string key = std::string("\"") + field + "\":";
     const size_t at = row.find(key);
@@ -114,9 +142,13 @@ double milliseconds(const std::string& row, const char* field) {
 }
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     using namespace prosper::gpu;
     namespace fs = std::filesystem;
+    const bool expect_snapshot_move = argc == 2 &&
+        std::strcmp(argv[1], "--source-snapshot-expect-move") == 0;
+    const bool source_snapshot = expect_snapshot_move ||
+        (argc == 2 && std::strcmp(argv[1], "--source-snapshot") == 0);
     // This is the real live renderer with CPU color readback, as in draw_program_skip_render.
     // Only color-target retention is disabled; immutable buffer residency must remain enabled.
     const char* no_targets = std::getenv("PROSPER_NO_LIVE_PERSISTENT_COLOR_TARGETS");
@@ -152,10 +184,27 @@ int main() {
     std::vector<uint8_t> target(Width * Height * 4u, 0);
     positions(source, true);
     DrawItem draw = make_draw(source, target);
+    uint64_t texture_address = 0;
+    auto unmap = prosper::Hle::lookup(prosper::nid_hash("sceKernelMunmap"));
+    if (source_snapshot) {
+        auto map = prosper::Hle::lookup(prosper::nid_hash("sceKernelMapNamedFlexibleMemory"));
+        check(map && unmap &&
+                  map(reinterpret_cast<uint64_t>(&texture_address), 0x10000, 0x2, 0,
+                      reinterpret_cast<uint64_t>("snapshot-capture-test"), 0) == 0 && texture_address,
+              "snapshot capture maps real guest-readable encoded texture sources");
+        if (!texture_address) return 1;
+        // Two independent encoded sources establish two actual handoffs across ordered spans.
+        // Host-backed replay inputs are deliberately absent: they cannot enter this guest cache.
+        std::fill_n(reinterpret_cast<uint32_t*>(texture_address), 8, 0xc00ffc00u);
+        sample_packed_texture(draw, texture_address);
+    }
     check(!draw.vs.empty() && !draw.fs.empty(), "real readonly vertex-fetch shaders compile");
     if (failures) return 1;
 
-    const fs::path directory = "render_buffer_capture_test";
+    const fs::path directory = source_snapshot
+        ? (std::getenv("PROSPER_NO_TEXTURE_SOURCE_SNAPSHOT_MOVE")
+            ? "render_source_snapshot_copy_capture_test" : "render_source_snapshot_move_capture_test")
+        : "render_buffer_capture_test";
     std::error_code ec;
     fs::remove_all(directory, ec);
     fs::create_directories(directory, ec);
@@ -186,6 +235,7 @@ int main() {
         {SubmitOperationKind::Draw,1,30}};
     DrawItem second_draw = draw;
     second_draw.draw_index = 1; // Ordered operations resolve by guest draw index, not vector position.
+    if (source_snapshot) sample_packed_texture(second_draw, texture_address + 16);
     const auto split = execute_ordered_items(operations, {draw,second_draw}, {ComputeItem{}},
                                             live, separator, Width, Height);
     check(separators == 1 && split.render_spans == 2 && observed_phases.size() == 2 &&
@@ -193,14 +243,19 @@ int main() {
               !observed_phases[1].first_span && observed_phases[1].final_span,
           "actual ordered executor brackets two renderer calls into one semantic record");
     check(solid(split.frame.bytes(), true), "cold and unchanged spans actually draw the green quad");
-    positions(source, false); // Same source/identity/extent, changed guest-visible vertex positions.
+    if (source_snapshot)
+        std::fill_n(reinterpret_cast<uint32_t*>(texture_address), 4, 0xc00003ffu);
+    else
+        positions(source, false); // Same source/identity/extent, changed guest-visible vertex positions.
     // A fresh colour destination starts from the blue clear. Reusing the previous destination
     // would correctly seed its prior green image, so offscreen geometry would leave green pixels.
     std::vector<uint8_t> changed_target(Width * Height * 4u, 0);
     draw.color0_base = reinterpret_cast<uintptr_t>(changed_target.data());
-    check(solid(render_submit_items({draw}, Width, Height), false),
-          "changed input actually moves the geometry and exposes the blue clear");
-    check(solid(render_submit_items({draw}, Width, Height), false),
+    const auto changed = render_submit_items({draw}, Width, Height);
+    check(source_snapshot ? solid_red(changed) : solid(changed, false),
+          "changed guest input actually changes the rendered pixels");
+    const auto unchanged = render_submit_items({draw}, Width, Height);
+    check(source_snapshot ? solid_red(unchanged) : solid(unchanged, false),
           "unchanged refreshed input still draws the correct result");
 
     // Drive only the process-sampler clock; never sleep or assert a speed threshold. Detailed
@@ -216,7 +271,27 @@ int main() {
     for (std::string line; std::getline(input, line);)
         if (line.find("\"type\":\"renderer\"") != std::string::npos) records.push_back(line);
     check(records.size() == 3, "the published capture contains the actual three renderer records");
-    if (records.size() == 3) {
+    if (records.size() == 3 && source_snapshot) {
+        constexpr std::array<uint64_t,3> snapshot_bytes{32,16,0};
+        // The explicit negative-control arm keeps move expectations even when the runtime
+        // switch restores copying. Pixel checks still run normally and must remain correct.
+        const bool copy = !expect_snapshot_move &&
+            std::getenv("PROSPER_NO_TEXTURE_SOURCE_SNAPSHOT_MOVE") != nullptr;
+        for (size_t i = 0; i < records.size(); ++i) {
+            const auto& r = records[i];
+            check(integer(r, "callbacks") == (i == 0 ? 2u : 1u),
+                  "snapshot counters aggregate two callbacks once and reset at the next submit");
+            check(integer(r, "frontend_tex_source_snapshot_copied_bytes") ==
+                      (copy ? snapshot_bytes[i] : 0),
+                  "F8 records exact admitted snapshot copy bytes, including the copy control");
+            check(integer(r, "frontend_tex_source_snapshot_transferred_bytes") ==
+                      (copy ? 0 : snapshot_bytes[i]),
+                  "F8 records exact admitted snapshot owner transfers and no work on cache hits");
+            const double handoff_ms = milliseconds(r, "frontend_tex_source_snapshot_handoff_ms");
+            check(i == 2 ? handoff_ms == 0 : handoff_ms > 0,
+                  "real handoff timing reaches F8 and resets for the unchanged cached submit");
+        }
+    } else if (records.size() == 3) {
         constexpr std::array<uint64_t,3> copied{Bytes,Bytes,0};
         constexpr std::array<uint64_t,3> hits{1,0,1};
         constexpr std::array<uint64_t,3> admitted{Bytes,0,0};
@@ -241,6 +316,7 @@ int main() {
     capture.cancel();
     set_submit_renderer({});
     present_reset();
+    if (texture_address) unmap(texture_address, 0x10000, 0, 0, 0, 0);
     fs::remove_all(directory, ec);
     return failures ? 1 : 0;
 }
