@@ -8458,6 +8458,28 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                     const VkFormat view_format = upload.borrowed_ds
                         ? upload.ds_format
                         : backend_color_format(r.texture_format);
+                    // SQ_SEL: 0/1 are the constants, 4/5/6/7 the stored R/G/B/A component. 2 and 3
+                    // are RESERVED, and everything above 7 is unrepresentable in the three-bit field
+                    // a descriptor decode produces. Both used to fall into a silent `default:`
+                    // returning IDENTITY -- i.e. the selector for whichever position the value sat
+                    // in -- so an undecodable routing became a plausible wrong picture with no
+                    // diagnostic anywhere (#3587).
+                    //
+                    // A reserved selector can no longer reach here FROM A DESCRIPTOR:
+                    // `image_descriptor_reject_reason` now refuses such a T# as `dst-sel-reserved`
+                    // before it becomes a ShaderResource. This warning is therefore not that path's
+                    // backstop, and it is not dead code either -- `FrameResource::swizzle` has two
+                    // other sources that never meet that predicate: a `.prgbundle`/`.prgcap`
+                    // deserialized verbatim by `capture_codecs.hpp` (including one recorded before
+                    // the reject existed), and FrameResources the live renderer and tests construct
+                    // directly.
+                    //
+                    // It warns rather than dropping the view on purpose. Replay's job is to
+                    // reproduce the frame that was captured, so failing a bundle closed here would
+                    // remove the one tool that can show what the descriptor actually said; the
+                    // identity fallback keeps replay byte-identical to its previous behaviour and
+                    // the message is what makes the value visible. Live guest descriptors are
+                    // rejected upstream, which is where a drop belongs.
                     auto vkswz = [](uint32_t s) -> VkComponentSwizzle {
                         switch (s) {
                             case 0:  return VK_COMPONENT_SWIZZLE_ZERO;
@@ -8466,7 +8488,23 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                             case 5:  return VK_COMPONENT_SWIZZLE_G;
                             case 6:  return VK_COMPONENT_SWIZZLE_B;
                             case 7:  return VK_COMPONENT_SWIZZLE_A;
-                            default: return VK_COMPONENT_SWIZZLE_IDENTITY;
+                            default: {
+                                static std::once_flag warned;
+                                std::call_once(warned, [s] {
+                                    std::fprintf(stderr,
+                                                 "[render] UNDECODABLE DST_SEL selector %u on a "
+                                                 "sampled view (SQ_SEL 2/3 are reserved; >7 cannot "
+                                                 "come from a descriptor decode). Falling back to "
+                                                 "IDENTITY, so this channel reads its own position "
+                                                 "rather than what the resource asked for. A live "
+                                                 "guest T# carrying this is refused upstream as "
+                                                 "dst-sel-reserved -- reaching here means the "
+                                                 "resource came from a capture or was built "
+                                                 "directly. See #3587.\n",
+                                                 s);
+                                });
+                                return VK_COMPONENT_SWIZZLE_IDENTITY;
+                            }
                         }
                     };
                     VkComponentMapping components{
