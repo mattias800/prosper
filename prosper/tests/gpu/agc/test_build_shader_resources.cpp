@@ -417,6 +417,140 @@ int main() {
         CHECK(image_descriptor_reject_reason(dinv) != nullptr &&
                   strcmp(image_descriptor_reject_reason(dinv), "inverted-array-range") == 0,
               "an inverted LAST_ARRAY/BASE_ARRAY range is rejected as inverted-array-range");
+
+        // #3587: SQ_SEL 2 and 3 are RESERVED encodings, and the image path used to let them through.
+        // All four T# selectors flow verbatim into ShaderResource::swizzle, and the backend's `vkswz`
+        // maps anything outside {0,1,4,5,6,7} to VK_COMPONENT_SWIZZLE_IDENTITY -- so a reserved
+        // selector silently became the IDENTITY selector for its own position: a wrong channel
+        // routing with no reject and no diagnostic. The buffer lowering has always refused the same
+        // encoding (`reject-dst-sel-reserved`, rdna2_emit_alu.cpp); this is the image path catching up.
+        //
+        // Swept over all four positions and both reserved values. A screen written for DST_SEL_X
+        // alone -- the shape the first draft of this fix could plausibly have taken -- passes a
+        // single-channel arm and reddens here.
+        for (uint32_t channel = 0; channel < 4u; ++channel) {
+            for (uint32_t reserved = 2u; reserved <= 3u; ++reserved) {
+                uint32_t bad_sel[8]; memcpy(bad_sel, good, sizeof good);
+                bad_sel[3] = (bad_sel[3] & ~(0x7u << (channel * 3u))) | (reserved << (channel * 3u));
+                const DecodedImageDescriptor dbad = decode_image_descriptor(bad_sel);
+                const char* why = image_descriptor_reject_reason(dbad);
+                char msg[160];
+                snprintf(msg, sizeof msg,
+                         "DST_SEL_%c = %u (reserved) is rejected as dst-sel-reserved, not materialized",
+                         "XYZW"[channel], reserved);
+                CHECK(dbad.dst_sel[channel] == reserved && why != nullptr &&
+                          strcmp(why, "dst-sel-reserved") == 0, msg);
+            }
+        }
+
+        // The discriminator, and the arm that says what the screen is actually about. It gates the
+        // ENCODING, never the routing: a T# may name any permutation of the six DEFINED selectors,
+        // constants included, and `docs/RESOURCE_BINDING.md` § Ruled out records the falsification
+        // (#2731) of the opposite claim -- a one-component surface declaring identity (R,G,B,A) is an
+        // ordinary descriptor, and rejecting shapes on semantic grounds broke live video planes.
+        // An implementation that refused "non-identity DST_SEL", or keyed on WORD3's low twelve bits
+        // being non-zero, passes every arm above and reddens here.
+        {
+            static const uint32_t defined_selectors[6] = {0u, 1u, 4u, 5u, 6u, 7u};
+            uint32_t bad_channel = 0xFFFFFFFFu, bad_value = 0;
+            const char* bad_reason = nullptr;
+            for (uint32_t channel = 0; channel < 4u && bad_channel == 0xFFFFFFFFu; ++channel)
+                for (uint32_t i = 0; i < 6u; ++i) {
+                    uint32_t sel[8]; memcpy(sel, good, sizeof good);
+                    sel[3] = (sel[3] & ~(0x7u << (channel * 3u))) |
+                             (defined_selectors[i] << (channel * 3u));
+                    const char* why = image_descriptor_reject_reason(decode_image_descriptor(sel));
+                    if (why) { bad_channel = channel; bad_value = defined_selectors[i];
+                               bad_reason = why; break; }
+                }
+            char msg[192];
+            if (bad_channel == 0xFFFFFFFFu)
+                snprintf(msg, sizeof msg,
+                         "all six DEFINED selectors (0,1,4,5,6,7) still bind in every DST_SEL "
+                         "position (the reserved ENCODING is what was rejected)");
+            else
+                snprintf(msg, sizeof msg,
+                         "defined selector %u in DST_SEL_%c was refused as %s -- the screen has "
+                         "become a routing gate, not an encoding gate",
+                         bad_value, "XYZW"[bad_channel], bad_reason);
+            CHECK(bad_channel == 0xFFFFFFFFu, msg);
+        }
+
+        // Ordering guard. `base-zero` must keep winning over the new verdict, because the
+        // explicit-null-image path (gpu_executor.cpp) publishes a null binding only when the reason
+        // is exactly "base-zero" AND all eight dwords are zero. An all-zero T# decodes every selector
+        // as 0 -- SQ_SEL_0, a DEFINED constant, so the two verdicts do not collide today; this pins
+        // that neither predicate may be reordered into changing the string that path reads.
+        {
+            const uint32_t all_zero[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+            const DecodedImageDescriptor dnull = decode_image_descriptor(all_zero);
+            const char* why = image_descriptor_reject_reason(dnull);
+            CHECK(dnull.dst_sel[0] == 0 && dnull.dst_sel[1] == 0 && dnull.dst_sel[2] == 0 &&
+                      dnull.dst_sel[3] == 0 && why != nullptr && strcmp(why, "base-zero") == 0,
+                  "an exactly all-zero T# still reports base-zero (the explicit-null path keys on it)");
+        }
+    }
+
+    // #3587 end to end: the reject has to remove the descriptor from the table the recompiler and
+    // the backend consume, not merely name a reason. A "binds nothing" arm is worthless on its own --
+    // it passes just as well when the fixture never bound for an unrelated reason -- so it is paired
+    // with a routed-but-DEFINED control on the SAME descriptor, one field apart.
+    //
+    // The fixture is deliberately the one the BASE_ARRAY block above already proves binds: that arm
+    // is green on every CI platform, so the control here cannot be the thing that is fragile. An
+    // earlier draft used a plain 2D SW_64KB_R_X 256x256 RGBA16F T# instead, which binds on Linux and
+    // on MinGW and did NOT bind on macOS/Rosetta -- leaving the reserved arm beside it passing
+    // vacuously on that platform (#3608). Pick a control with cross-platform evidence behind it.
+    {
+        AgcShaderSharp sharp[1]; sharp[0].bits = 0;
+        AgcShaderUserData ud{};
+        ud.sharp_resource_offset[0] = sharp;
+        ud.sharp_resource_count[0] = 1;
+        AgcShaderHeader sh{};
+        sh.file_header = 0x34333231u; sh.version = 0x18; sh.type = 1; sh.user_data = &ud;
+
+        // Control: BGRA routing (B,G,R,A) -- non-identity, every selector defined. Must still bind,
+        // and must carry the descriptor's routing through to ShaderResource::swizzle unchanged.
+        uint32_t sg_bgra[8];
+        make_tsharp(sg_bgra, 0x31465d0000ull, 256, 256, /*RGBA16F*/71,
+                    /*SW_64KB_R_X*/27, /*2D array*/13, /*layers*/6, /*base array*/1);
+        sg_bgra[3] |= (1u << 12) | (1u << 16);
+        sg_bgra[5] |= 8u << 4;
+        sg_bgra[3] |= 6u | (5u << 3) | (4u << 6) | (7u << 9);   // DST_SEL = B,G,R,A
+        const ShaderResourceTable bgra_table = build_shader_resources(sh, sg_bgra, 8);
+        const ShaderResource* bgra = bgra_table.by_sgpr_base(0);
+        const bool control_bound = bgra && bgra->swizzle[0] == 6 && bgra->swizzle[1] == 5 &&
+                                   bgra->swizzle[2] == 4 && bgra->swizzle[3] == 7;
+        // Self-describing on failure: the arm's whole job is to be attributable, and "it did not
+        // bind" says nothing about which of the texture loop's ten `continue`s took it.
+        if (!control_bound) {
+            const DecodedImageDescriptor dc = decode_image_descriptor(sg_bgra);
+            const char* why = image_descriptor_reject_reason(dc);
+            Gen5ImageFormatInfo cfi{};
+            const bool mapped = gen5_image_format(dc.format, &cfi);
+            printf("  [diag] control: reject=%s fmt-mapped=%d view-supported=%d resources=%zu "
+                   "dst_sel=%u,%u,%u,%u bound=%d\n",
+                   why ? why : "none", (int)mapped,
+                   (int)(mapped && image_base_level_view(dc, cfi).supported),
+                   bgra_table.resources.size(),
+                   dc.dst_sel[0], dc.dst_sel[1], dc.dst_sel[2], dc.dst_sel[3], (int)(bgra != nullptr));
+        }
+        CHECK(control_bound,
+              "a BGRA-routed T# binds and carries its DST_SEL into the resource table");
+
+        // One field changed: DST_SEL_Z becomes the reserved encoding 2. Without the screen this
+        // materializes, and the backend's identity fallback turns that channel into B -- a wrong
+        // picture nothing downstream can detect.
+        uint32_t sg_reserved[8]; memcpy(sg_reserved, sg_bgra, sizeof sg_bgra);
+        sg_reserved[3] = (sg_reserved[3] & ~(0x7u << 6)) | (2u << 6);
+        CHECK(decode_image_descriptor(sg_reserved).dst_sel[2] == 2,
+              "the reserved-selector fixture really does decode DST_SEL_Z as 2");
+        // Conjoined with the control ON PURPOSE. `== nullptr` alone is satisfied by a platform where
+        // the descriptor never bound at all, which is exactly how the earlier draft passed vacuously
+        // on macOS; requiring the control in the same predicate makes the arm say "this pair differs
+        // by one reserved selector, and only the reserved one was dropped".
+        CHECK(control_bound && build_shader_resources(sh, sg_reserved, 8).by_sgpr_base(0) == nullptr,
+              "the same T# with one reserved DST_SEL binds nothing while the control does");
     }
 
     // The runtime resource preserves the guest sample count, exposes one host mip, and bounds the
