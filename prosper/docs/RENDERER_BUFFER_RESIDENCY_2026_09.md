@@ -1,7 +1,8 @@
 # Retained renderer buffer inputs (September 2026)
 
 Tracking: [#3407](https://github.com/mattias800/prosper/issues/3407).
-The implementation is under evaluation. A larger automatic budget has not been accepted.
+Retention is opt-in on every platform. The measured cross-title results do not justify a default
+policy; further tuning of this standalone-allocation approach is deferred.
 
 ## Ownership and validation
 
@@ -34,7 +35,7 @@ host/GPU notifications and remapping invalidate watch authority. Failed coverage
 comparison; repeatedly dirty entries stop watching until their source changes or they are rekeyed.
 GPU owners never retain a guest pointer or a guest mapping lease.
 
-The current byte budget is 256 MiB on Linux and zero on platforms without production write watches.
+The default byte budget is zero on every platform, including Linux with production write watches.
 `PROSPER_BACKEND_BUFFER_RESIDENCY_MB` explicitly selects 0–2048 MiB on any platform. Zero bypasses
 additional pass write-proof work. `PROSPER_NO_BACKEND_BUFFER_RESIDENCY=1` disables retention;
 `PROSPER_NO_BACKEND_BUFFER_WRITE_WATCH=1` keeps exact-comparison retention but disables these watches.
@@ -109,6 +110,10 @@ tail, and startup/intro-output shortages must not be mixed with steady gameplay 
 
 ## Regression guards
 
+`render_buffer_residency_default` unsets the budget and disable switches, renders the actual
+vertex-fetch pixel witness, and asserts ordinary uploads with no retained owners or byte charge.
+The opt-in fixtures separately pin their budget so they continue exercising retention on all platforms.
+
 `render_buffer_residency` uses actual Vulkan vertex fetches to distinguish stale data from valid reuse,
 including hosted replacement, direct-memory aliases, host/GPU write notifications, same-address remaps,
 queued old/new versions, rounded allocation pressure, discard and idle rekey. Small synthetic allocation
@@ -128,3 +133,54 @@ python3 prosper/tools/vkval/vk_validation_scan.py --build-dir <BUILD> \
   --ctest-arg=-R '--ctest-arg=^(render_buffer_residency|render_buffer_capture)$' \
   --ctest-arg=--no-tests=error
 ```
+
+## Bounded owner-population evaluation (September 12)
+
+After incorporating main through `c7ecd2ad7031`, source `b785d0cd35dc2129775ae50a5fcb8173320d1bec`
+was built and passed 485 tests plus 24 strict core/synchronization checks with zero validation messages.
+Executable SHA-256: `abd1f53aa82cd6ad06d6b90afe33c49889fe1cd4c45c6a27d39243e63a1c675b`.
+These captures precede the final default-off policy change; all enabled arms explicitly select their
+budget. Main's pacing and gamepad-duration changes require these fresh controls rather than treating
+the earlier measurements as current-main baselines.
+
+All three GTA Performance-route arms use that binary, a 2048 MiB explicit budget, the same
+route and capture inputs, fresh saves/caches, and the timing protocol above. The disabled arm sets
+`PROSPER_NO_BACKEND_BUFFER_RESIDENCY=1`; the enabled arms set
+`PROSPER_BACKEND_BUFFER_RESIDENCY_OWNERS` to 4096 or 256. Independent process censuses are clean,
+both profilers finish before F8, and actual review of all three later F9 images shows the same intact
+lit bank composition with character-pose variation.
+
+| GTA arm | Presentations / measured seconds | Presentations/s | Renderer records | Residency ms | Cleanup ms | GPU wait ms | Last live owners / charged bytes |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
+| Disabled | 31 / 5.018502270 | 6.177 | 771 | 0 | 139.782 | 511.276 | 0 / 0 |
+| 4096 owners | 26 / approximately 5.021 | 5.178 | 656 | 118.402 | 260.198 | 579.010 | 4096 / 309,927,488 |
+| 256 owners | 30 / approximately 5.019 | 5.977 | 746 | 34.391 | 147.024 | 510.956 | 256 / 24,158,528 |
+
+The 4096-owner run reuses only 3,294,720 bytes while declining 5,931,985,052 repeated input-span
+bytes. The 256-owner run has zero hits/reused bytes, admits 3,284,992 bytes through copying, and
+declines 6,760,842,468 repeated input-span bytes. Reducing the owner population removes most of the
+observed penalty, but does not establish a useful cache benefit. The one-presentation difference
+between disabled and 256 is not a statistically established 3.23% regression; neither is it evidence
+for enabling the cache. Owner policy changes reuse opportunities and memory population together,
+so this does not prove a specific driver-internal allocation cost. Last occupancy is sampled after
+the timing window, not a transactional F8 snapshot. Fresh rendered-frame counts remain unknown.
+
+The original disabled-run validator rejected 19 pre-trigger history samples instead of its hardcoded
+20, despite all 21 post-trigger samples and complete renderer/compute records. Offline revalidation
+preserves that original rejection and checks actual count consistency, sample continuity and measured
+span instead. The measured rate uses the post-trigger endpoints. A known capture contaminated by
+another worktree's builds/tests remains rejected by the revised validator. That earlier contaminated
+`05ffda25` run is diagnostic evidence only, not an accepted timing comparison.
+
+Decision: keep the tested retention mechanism and its counters available by explicit opt-in, preserve
+the normal upload path by default, and stop speculative tuning of this cache. The earlier Blue Prince
+benefit remains scoped evidence, not a library-wide recommendation. Remaining #3407 conversion and
+writeback work should be prioritized by enclosing costs. This change does not claim an audio fix.
+
+The independent audio audit keeps each sink and measurement interval separate. All three quiet/F8
+windows have zero observed shortages. The main sink has one initial shortage in each of the disabled
+and 256-owner runs; the 4096-owner run has two later shortages before F9 was requested, so they cannot
+be attributed to that request. Its writer-plus-15-second interval is not fully observed. The intro
+sink stops receiving deliveries around 15.18 seconds in all three runs and has no later output
+coverage. These observations neither establish a hardware XRUN count nor explain the intro sink's
+guest-production stop; that investigation remains under #3435.

@@ -3380,16 +3380,11 @@ inline ResidentRenderBufferCache& resident_render_buffer_cache() {
     return cache;
 }
 inline VkDeviceSize resident_render_buffer_limit() {
-#if defined(__linux__)
-    constexpr uint64_t default_mib = 256;
-#else
-    // Production guest write watches currently require Linux. Exact snapshot comparison remains
-    // available by explicit override, but has not earned a default-on performance policy elsewhere.
-    constexpr uint64_t default_mib = 0;
-#endif
+    // Retention can reduce copying while increasing enclosing frame costs, including on Linux
+    // with working guest write watches. Keep it opt-in until a general policy earns its cost.
     static const auto limit = prosper::diag::env_u64_or_default_capped(
         "PROSPER_BACKEND_BUFFER_RESIDENCY_MB", getenv("PROSPER_BACKEND_BUFFER_RESIDENCY_MB"),
-        default_mib, 2048, "MiB");
+        0, 2048, "MiB");
     return limit * 1024ull * 1024ull;
 }
 

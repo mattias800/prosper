@@ -115,7 +115,7 @@ static uint64_t copy_threads_old(const char* t) {
 
 // --- tests/fixtures/render_runner.h : PROSPER_BACKEND_BUFFER_RESIDENCY_MB ----------------------
 // New strict-only knob: the permissive spelling below is a counterexample, not shipped history.
-// Exercise both platform defaults: Linux 256 MiB, unsupported write-watch platforms 0 MiB.
+// All platforms default to zero; explicit overrides exercise the optional retention path.
 template <uint64_t Default>
 static uint64_t buffer_residency_new(const char* n, const char* t) {
     return env_u64_or_default_capped(n, t, Default, 2048, "MiB") * 1024ull * 1024ull;
@@ -339,16 +339,13 @@ static const Site kSites[] = {
     {"render_runner.h PROSPER_BACKEND_BUFFER_RESIDENCY_OWNERS (zero)",
      "PROSPER_BACKEND_BUFFER_RESIDENCY_OWNERS", buffer_owners_new,
      buffer_owners_permissive, "none", 4096, "0", 0},
-    {"render_runner.h PROSPER_BACKEND_BUFFER_RESIDENCY_MB (Linux zero)",
-     "PROSPER_BACKEND_BUFFER_RESIDENCY_MB", buffer_residency_new<256>,
-     buffer_residency_permissive<256>, "-1", 256ull * kMiB, "0", 0},
-    {"render_runner.h PROSPER_BACKEND_BUFFER_RESIDENCY_MB (Linux cap)",
-     "PROSPER_BACKEND_BUFFER_RESIDENCY_MB", buffer_residency_new<256>,
-     buffer_residency_permissive<256>, "64MiB", 256ull * kMiB, "4096", 2048ull * kMiB},
-    {"render_runner.h PROSPER_BACKEND_BUFFER_RESIDENCY_MB (unsupported opt-in)",
+    {"render_runner.h PROSPER_BACKEND_BUFFER_RESIDENCY_MB (zero)",
+     "PROSPER_BACKEND_BUFFER_RESIDENCY_MB", buffer_residency_new<0>,
+     buffer_residency_permissive<0>, "-1", 0, "0", 0},
+    {"render_runner.h PROSPER_BACKEND_BUFFER_RESIDENCY_MB (opt-in)",
      "PROSPER_BACKEND_BUFFER_RESIDENCY_MB", buffer_residency_new<0>,
      buffer_residency_permissive<0>, "-1", 0, "256", 256ull * kMiB},
-    {"render_runner.h PROSPER_BACKEND_BUFFER_RESIDENCY_MB (unsupported cap)",
+    {"render_runner.h PROSPER_BACKEND_BUFFER_RESIDENCY_MB (cap)",
      "PROSPER_BACKEND_BUFFER_RESIDENCY_MB", buffer_residency_new<0>,
      buffer_residency_permissive<0>, "64MiB", 0, "4096", 2048ull * kMiB},
     // A malformed value used to make the cap 1024x TIGHTER than asked for -- which on this knob

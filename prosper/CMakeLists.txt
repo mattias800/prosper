@@ -3680,6 +3680,13 @@ if(TARGET prosper_core AND TARGET Vulkan::Vulkan)
       PROSPER_BACKEND_BUFFER_RESIDENCY_OWNERS=${owner_limit}
       $<TARGET_FILE:test_render_buffer_residency> --configured-owner-limit ${owner_limit})
   endforeach()
+  add_test(NAME render_buffer_residency_default COMMAND ${CMAKE_COMMAND} -E env
+    --unset=PROSPER_BACKEND_BUFFER_RESIDENCY_MB
+    --unset=PROSPER_NO_BACKEND_BUFFER_RESIDENCY
+    --unset=PROSPER_BACKEND_BUFFER_RESIDENCY_OWNERS
+    --unset=PROSPER_NO_BACKEND_RESOURCE_SHARE
+    --unset=PROSPER_NO_BACKEND_BUFFER_POOL --unset=PROSPER_BUFVERIFY
+    $<TARGET_FILE:test_render_buffer_residency> --default-disabled)
 
   add_executable(test_gpu_detile tests/gpu/execute/test_gpu_detile.cpp)
   target_include_directories(test_gpu_detile PRIVATE tests)

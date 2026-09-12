@@ -503,6 +503,21 @@ int main(int argc, char** argv) {
     Fixture f;
     CHECK(!f.vs.empty() && !f.fs.empty(), "real vertex-fetch and green fragment shaders compile");
     if (f.vs.empty() || f.fs.empty()) return 1;
+    if (argc == 2 && std::string(argv[1]) == "--default-disabled") {
+        CHECK(resident_render_buffer_limit() == 0,
+              "unconfigured residency has zero budget on every platform");
+        CHECK(solid(f.render(payload(), 0x348900001ull), true),
+              "default ordinary upload renders the actual green vertex-fetch witness");
+        const auto stats = backend_resource_reuse_stats();
+        CHECK(stats.buffer_upload_bytes >= Bytes && stats.buffer_resident_admitted_bytes == 0 &&
+                  stats.buffer_resident_hits == 0 && stats.buffer_resident_reused_bytes == 0,
+              "default path uploads current bytes without retention");
+        const auto snapshot = resident_render_buffer_cache_snapshot();
+        CHECK(snapshot.available && snapshot.indexed_entries == 0 && snapshot.live_owners == 0 &&
+                  snapshot.charged_bytes == 0 && snapshot.byte_limit == 0,
+              "default draw leaves no retained buffer population or byte charge");
+        return failures ? 1 : 0;
+    }
     if (argc != 1) {
         if (argc != 3 || std::string(argv[1]) != "--dump-spv") return 2;
         const std::filesystem::path directory(argv[2]);
