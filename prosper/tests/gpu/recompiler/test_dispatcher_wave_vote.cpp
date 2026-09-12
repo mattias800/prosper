@@ -111,11 +111,18 @@ int main() {
     // and the cost is real: the vote pins an exact 64-lane subgroup, and a device that cannot honour
     // that SKIPS THE DRAW. The escape must therefore fire when it legitimately can.
     //
-    // It needs BOTH halves of prosper's proof: the static scan, AND `emit_alu`'s live marker, which is
-    // only set for a compare that ran with EXEC not narrowed. RDNA2 ISA 3.9 defines a compare as
+    // It is guarded by a static scan of the instruction stream AND by `emit_alu`'s live marker, which
+    // is only set for a compare that ran with EXEC not narrowed. RDNA2 ISA 3.9 defines a compare as
     // `VCC[n] = EXEC[n] & (test passed)`, so under a narrowed EXEC the result is `P ? EXEC : 0` -- it
     // takes EXEC's shape and is not wave-uniform even when P is. The static half alone would be
     // unsound.
+    //
+    // This used to say the escape "needs BOTH halves of prosper's proof", which overstates it (#3595).
+    // On the operands they BOTH judge, the live marker is the stronger test, so the scan is a redundant
+    // narrowing there rather than a soundness requirement. What the scan adds is a question the marker
+    // cannot ask at all: the marker describes whichever compare last EXECUTED, while the scan asks
+    // whether the instruction stream lets us identify that compare in the first place. The third arm
+    // below is built on exactly that gap.
     //
     // WHAT MAKES THESE TWO ARMS DISCRIMINATE, and the reason the first draft of this test did not:
     // `load_state` stamps `exec_narrowed = true` at case ENTRY, so a case that never restores EXEC
@@ -189,6 +196,62 @@ int main() {
                       count_opcode(restored, kOpGroupNonUniformAny),
                   "#3573: the two variants differ ONLY in the EXEC restore, and they disagree about "
                   "the vote -- so this pair detects the escape rather than the routing");
+        }
+    }
+
+    // --- #3595: an arm for the STATIC SCAN conjunct, isolated from the live marker ----------------
+    // `vcc_exit_is_wave_uniform(ins, terminator->pc)` could be deleted with the whole suite staying
+    // green. The two arms above cannot see it: they vary EXEC, which moves the LIVE MARKER, and on
+    // the operands both tests judge the marker is the stronger one -- so it fails first and the scan
+    // never decides anything.
+    //
+    // To reach the scan alone, vary something the marker cannot see. The scan walks BACKWARD from the
+    // branch for the nearest VOPC and reasons about ITS operands -- and it takes that VOPC whatever
+    // scalar destination it wrote. A `v_cmp_*_e64` with an ordinary SGPR destination is therefore
+    // picked up as "the compare that set VCC" while writing no VCC at all.
+    //
+    // That is what this program does: the real uniform compare still sets VCC and the marker, and a
+    // decoy compare into s10 sits between it and the branch. The emitter's VCC state is untouched, so
+    // `state.vcc != 0` and `state.vcc == state.vcc_wave_uniform` both still hold -- and only the scan
+    // can refuse. It refuses because the decoy's operands are plain VGPRs with no uniform writer.
+    //
+    // The behaviour being pinned is that the escape FAILS CLOSED when the stream does not let prosper
+    // identify VCC's producer: it votes. That is conservative rather than precise -- a scan that
+    // skipped non-VCC destinations could still escape here -- and the arm is written to pin the safe
+    // direction, not to bless the imprecision.
+    {
+        const uint32_t decoy_sdst_cmp_ps[] = {
+            0xBE800380u,              // pc0  s_mov_b32 s0, 0
+            0xBE810380u,              // pc1  s_mov_b32 s1, 0
+            0xBEFE04C1u,              // pc2  s_mov_b64 exec, -1
+            0xD4C2006Au, 0x00000200u, // pc3  v_cmp_eq_u32_e64 vcc, s0, s1   <- sets VCC + the marker
+            0xD4C2000Au, 0x00020300u, // pc5  v_cmp_eq_u32_e64 s10, v0, v1   <- decoy: writes s10, NOT vcc
+            0xBF860004u,              // pc7  s_cbranch_vccz -> pc12
+            0xBF068004u,              // pc8  s_cmp_eq_u32 s4, 0
+            0xBF840004u,              // pc9  s_cbranch_scc0 -> pc14
+            0xBE800385u,              // pc10 s_mov_b32 s0, 5
+            0xBF820002u,              // pc11 s_branch -> pc14
+            0xBE800387u,              // pc12 s_mov_b32 s0, 7
+            0xBF82FFFAu,              // pc13 s_branch -> pc8   (back-edge)
+            0x7E0202F2u, 0x7E040280u, 0x7E0602F2u,
+            0xF800180Fu, 0x03020100u, 0xBF810000u,
+        };
+        const std::vector<uint32_t> decoy =
+            recompile_fragment(decoy_sdst_cmp_ps, std::size(decoy_sdst_cmp_ps));
+        CHECK(!decoy.empty(), "the decoy-destination variant recompiles");
+        if (!decoy.empty()) {
+            CHECK(count_opcode(decoy, kOpSwitch) >= 1,
+                  "CONTROL: the decoy variant lowers through the CFG dispatcher too");
+            // The two scan results are the discriminator for this arm. The restored program (asserted
+            // TRUE by the control above) and this one differ only by the inserted decoy, so a FALSE
+            // here is the scan changing its mind -- not a different program shape.
+            CHECK(!fragment_vcc_branch_is_wave_uniform_for_test(
+                      decoy_sdst_cmp_ps, std::size(decoy_sdst_cmp_ps), 7),
+                  "CONTROL: the STATIC scan refuses this program, where it accepted the same program "
+                  "without the decoy -- so this arm varies the scan and nothing else");
+            CHECK(count_opcode(decoy, kOpGroupNonUniformAny) >= 1,
+                  "#3595: a decoy VOPC writing a non-VCC scalar destination blocks the escape, so the "
+                  "vote is taken -- the scan fails closed when it cannot identify VCC's producer");
         }
     }
 
