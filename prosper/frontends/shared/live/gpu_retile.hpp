@@ -22,13 +22,13 @@ inline std::atomic<bool>& gpu_retile_poison_output_for_test() {
     return enabled;
 }
 
-// Descriptor-only admission for the paired array path. Dimensionality, selected-layer offset,
+// Descriptor-only admission for packed byte/halfword planes. Dimensionality, selected-layer offset,
 // exact backend representation and byte/stride bounds are checked by the caller.
 // Keep this separate from layout math: a valid base-level fallback does not prove
 // that the descriptor declares only that level or sample.
-inline bool gpu_retile_paired16_descriptor_supported(const prosper::gpu::ShaderResource& resource,
+inline bool gpu_retile_packed_descriptor_supported(const prosper::gpu::ShaderResource& resource,
                                                      uint32_t bpe, uint32_t materialized_mip_levels) {
-    return !(bpe != 2 || resource.sample_count != 1 || resource.declared_mip_levels != 1 ||
+    return !((bpe != 1 && bpe != 2) || resource.sample_count != 1 || resource.declared_mip_levels != 1 ||
         materialized_mip_levels != 1 || resource.mip_chain_base_level || resource.mip_chain_max_level ||
         resource.linear_row_pitch_bytes || resource.mip_tail_offset || resource.mip_tail_bytes ||
         resource.mip_tail_x || resource.mip_tail_y || resource.compression_enabled ||
@@ -79,14 +79,15 @@ struct GpuRetileParameters {
         groups_y = uint32_t(padded_height);
         return true;
     }
-    bool initialize_paired16_array(uint32_t width, uint32_t height, uint32_t layers,
-                                   uint32_t mode, const VkPhysicalDeviceLimits& limits) {
+    bool initialize_packed_array(uint32_t width, uint32_t height, uint32_t layers,
+                                   uint32_t bpe, uint32_t mode, const VkPhysicalDeviceLimits& limits) {
         *this = {};
         std::array<uint32_t, 16> equation{};
         uint32_t bw = 0, bh = 0;
-        if (!width || (width & 1) || !height || !layers ||
-            !prosper::gpu::tile64_paired16_equation(mode, equation, bw, bh)) return false;
-        const uint64_t row_words = width / 2;
+        if ((bpe != 1 && bpe != 2) || !width || (width % (4 / bpe)) || !height || !layers ||
+            !prosper::gpu::tile64_packed_equation(mode, bpe, equation, bw, bh)) return false;
+        const uint32_t packed_shift = std::countr_zero(4 / bpe);
+        const uint64_t row_words = width >> packed_shift;
         const uint64_t bx = (uint64_t(width) + bw - 1) / bw;
         const uint64_t by = (uint64_t(height) + bh - 1) / bh;
         // Bound each product before multiplication, including every array layer.
@@ -97,18 +98,18 @@ struct GpuRetileParameters {
             bx * by > UINT32_MAX / 65536u / uint64_t(layers)) return false;
         const uint64_t linear_words = row_words * height, tiled_words = bx * by * 16384;
         linear_bytes = linear_words * layers * 4; tiled_bytes = tiled_words * layers * 4;
-        const uint64_t gx = (bx * (bw / 2) + 127) / 128, gy = by * bh;
+        const uint64_t gx = (bx * (bw >> packed_shift) + 127) / 128, gy = by * bh;
         if (linear_bytes > limits.maxStorageBufferRange || tiled_bytes > limits.maxStorageBufferRange ||
             limits.maxComputeWorkGroupSize[0] < 128 || limits.maxComputeWorkGroupInvocations < 128 ||
             limits.maxPushConstantsSize < sizeof(words) || gx > limits.maxComputeWorkGroupCount[0] ||
             gy > limits.maxComputeWorkGroupCount[1] || layers > limits.maxComputeWorkGroupCount[2])
             return false;
-        words[0] = width; words[1] = height;
+        words[0] = width; words[1] = height; words[2] = packed_shift;
         words[3] = std::countr_zero(bw); words[4] = std::countr_zero(bh); words[5] = uint32_t(bx);
         std::copy(equation.begin(), equation.end(), words.begin() + 6);
         words[22] = layers; words[23] = uint32_t(linear_words); words[24] = uint32_t(tiled_words);
         groups_x = uint32_t(gx); groups_y = uint32_t(gy); groups_z = layers;
-        kind = prosper::gpu::RetileShaderKind::Paired16Array;
+        kind = prosper::gpu::RetileShaderKind::PackedSubwordArray;
         return true;
     }
     bool initialize_volume(uint32_t width, uint32_t height, uint32_t depth,

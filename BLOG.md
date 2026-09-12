@@ -19,6 +19,23 @@ from the tracker issues, and still gated, because it is a projection of state ra
 > title's current state — for that, read the tracker. Nothing is ever removed when a title moves on,
 > because the point of a blog is that it records *when* things happened.
 
+## 2026-09-12
+
+### GTA's bank scene survives another small texture-conversion saving
+
+GTA V shows the same bank scene before and after packed GPU retile; Sonic still shows its known
+black world with a visible HUD ([measurements and limits](prosper/docs/GPU_RETILE_PACKED_2026_09.md)).
+
+*Linux `prosper-app`, GTA Performance Story gamepad route: extension off, then on.*
+
+![GTA bank scene with the packed extension disabled](assets/screenshots/3407-packed-off-gta.webp)
+![GTA bank scene with the packed extension enabled](assets/screenshots/3407-packed-on-gta.webp)
+
+*Linux `prosper-app`, Sonic gameplay gamepad route: extension off, then on; neither captures correct world rendering.*
+
+![Sonic black world and HUD with the packed extension disabled](assets/screenshots/3407-packed-off-sonic.webp)
+![Sonic black world and HUD with the packed extension enabled](assets/screenshots/3407-packed-on-sonic.webp)
+
 ## 2026-09-11
 
 ### Alex Kidd's world had no colour on Windows, and the reason was one missing line of SPIR-V

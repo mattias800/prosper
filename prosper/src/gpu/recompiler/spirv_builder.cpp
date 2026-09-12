@@ -435,7 +435,7 @@ std::vector<uint32_t> build_compute_detile_rgba16f() {
 
 std::vector<uint32_t> build_compute_retile_words(RetileShaderKind kind) {
     const bool volume = kind == RetileShaderKind::Volume3D;
-    const bool paired = kind == RetileShaderKind::Paired16Array;
+    const bool paired = kind == RetileShaderKind::PackedSubwordArray;
     Emitter e;
     const auto void_t = e.id(), fn_t = e.id(), bool_t = e.id(), uint_t = e.id();
     const auto v3_t = e.id(), input_ptr = e.id(), gid = e.id();
@@ -520,10 +520,10 @@ std::vector<uint32_t> build_compute_retile_words(RetileShaderKind kind) {
         z = e.id();
         Emitter::put(e.code, Op_CompositeExtract, {uint_t, z, id3, 2});
     }
-    const auto row_words = paired ? binary(Op_ShiftRightLogical, params[0], constant(1))
+    const auto row_words = paired ? binary(Op_ShiftRightLogical, params[0], params[2])
         : binary(Op_ShiftLeftLogical, params[0], params[2]);
     const auto padded_row_words = binary(Op_ShiftLeftLogical, params[5],
-        paired ? binary(Op_ISub, params[3], constant(1))
+        paired ? binary(Op_ISub, params[3], params[2])
                : binary(Op_IAdd, params[3], params[2]));
     const auto height_mask = binary(Op_ISub,
         binary(Op_ShiftLeftLogical, constant(1), params[4]), constant(1));
@@ -542,7 +542,7 @@ std::vector<uint32_t> build_compute_retile_words(RetileShaderKind kind) {
     Emitter::put(e.code, Op_SelectionMerge, {done, 0});
     Emitter::put(e.code, Op_BranchConditional, {in_bounds, body, done});
     Emitter::put(e.code, Op_Label, {body});
-    const auto x = paired ? binary(Op_ShiftLeftLogical, word_x, constant(1))
+    const auto x = paired ? binary(Op_ShiftLeftLogical, word_x, params[2])
                           : binary(Op_ShiftRightLogical, word_x, params[2]);
     const auto component_mask = binary(Op_ISub,
         binary(Op_ShiftLeftLogical, constant(1), params[2]), constant(1));
