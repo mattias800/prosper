@@ -2877,6 +2877,11 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // integer-divide reciprocal in the game's shaders). Writes an SGPR, not a VGPR.
                 rs.sreg[in.dst.value] = a;
                 rs.sreg_srt.erase(in.dst.value);
+                // #3596: record that this scalar is NOT wave-uniform. The value above is one lane's,
+                // so any later proof that reasons "it is in an SGPR, therefore it broadcasts" is
+                // wrong about it. Tainting the SSA value rather than the register makes the taint
+                // survive scalar copies for free.
+                rs.lane_local_scalars.insert(a);
                 return true;
             }
             if (in.opcode == kVop1OpcodeMovreldB32) { // VGPR[VDST + M0] = SRC0
@@ -3613,11 +3618,17 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     case OperandKind::Literal:
                         return true;
                     case OperandKind::SGPR:
+                        // #3596: "lives in a scalar register" is not the same as "is wave-uniform".
+                        // A `v_readfirstlane_b32` result is one lane's value in an SGPR, and a VCC
+                        // derived from it must NOT satisfy the wave-uniformity proof -- otherwise a
+                        // fragment vccz branch skips its wave vote and takes the lane's own bit.
+                        if (scalar_is_lane_local(rs, source.value)) return false;
                         return rs.sreg.contains(source.value) ||
                             rs.sreg_input.contains(source.value);
                     case OperandKind::Special:
                         if (source.value == 125) return true; // SGPR_NULL
                         if (source.value == 253) return rs.scc != 0;
+                        if (scalar_is_lane_local(rs, source.value)) return false;   // #3596
                         return source.value >= 106 && source.value <= 124 &&
                             rs.sreg.contains(source.value);
                     default:
