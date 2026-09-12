@@ -5151,6 +5151,38 @@ void GpuState::apply(const Pm4Command& c) {
             uint64_t cond = 0;
             if (c.jump_pred && pred_cond_addr && !(pred_cond_addr & 7) &&
                 guest_readable(pred_cond_addr, 8)) {
+                // #3574: THIS READ HAPPENS WHILE THE STREAM IS STILL BEING FOLDED, so it cannot see
+                // anything a COMPUTE DISPATCH in this same submit produces -- compute runs at ordered
+                // realization, downstream of here. The staleness guard above covers retained DMA
+                // copies and retained ordered memory effects, and structurally cannot cover a
+                // dispatch: there is nothing to overlap against yet. `gpu_executor.cpp` says the same
+                // thing about its own similarly-named packet trace.
+                //
+                // So a title doing `compute writes a visibility word -> predicated jump over the draws
+                // that word guards`, in one submit, reads the PREVIOUS FRAME's word. The failure is
+                // silent and drops the entire jump segment.
+                //
+                // This is the cheap instrument #3574 asks for before anyone builds the deferral, and
+                // it is deliberately NOT the fix. What it reports is the HAZARD SHAPE -- a predicated
+                // jump folded while this submit already carries compute dispatches that have not run
+                // -- not a proven overlap: a dispatch's write ranges are not known at fold time
+                // without building its resource table, which is exactly the work the fold has not
+                // done yet. So read a line here as "this submit can exhibit #3574", and the absence of
+                // lines over a route as "this title never presents the shape", which is the question
+                // worth answering first.
+                if (!dispatches.empty()) {
+                    static std::atomic<uint64_t> pred_compute_races{0};
+                    const uint64_t ord = pred_compute_races.fetch_add(1) + 1;
+                    if (ord <= 24 || (ord & (ord - 1)) == 0)
+                        fprintf(stderr,
+                                "[agc] predicated jump #%llu reads cond=0x%llx at FOLD time with %zu "
+                                "compute dispatch(es) pending in this submit -- a same-submit compute "
+                                "producer is invisible to the staleness guard (#3574); "
+                                "target=0x%llx order=%llu\n",
+                                (unsigned long long)ord, (unsigned long long)pred_cond_addr,
+                                dispatches.size(), (unsigned long long)c.jump_addr,
+                                (unsigned long long)command_order);
+                }
                 memcpy(&cond, (const void*)(uintptr_t)pred_cond_addr, sizeof cond);
                 skip = (cond != 0);
             }
