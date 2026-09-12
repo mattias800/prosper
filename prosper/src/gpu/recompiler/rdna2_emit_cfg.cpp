@@ -5070,9 +5070,38 @@ bool emit_cfg_state_machine(
             } else if (graphics) {
                 const uint32_t lane_condition =
                     terminator->opcode <= 0x07 ? state.vcc : state.exec;
+                // #3573. s_cbranch_execz/execnz/vccz/vccnz are SCALAR branches: the condition is
+                // "is the whole wave's 64-bit mask zero", not "is this lane's bit set". Taking the
+                // lane bit is observably wrong as soon as the guarded block writes emulated scalar
+                // state read past the merge -- on hardware every lane of the wave sees that write,
+                // here only the entering invocations do. That mechanism is not speculative: it is
+                // recorded in RECOMPILER_REMAINING.md's Ruled out section as DOLL's FXAA (#273),
+                // where a guard-only predicate was falsified, and the wave64 relaxation has been
+                // attempted and rejected four times.
+                //
+                // The FRAGMENT stage takes the vote here, because until now the SAME fragment shader
+                // was lowered two different ways depending on which route its CFG took -- a wave vote
+                // when `detect_forward_ifs` structured it, a lane-local bit when it fell through to
+                // this dispatcher. Two lowerings of one instruction is the sharpest evidence that one
+                // of them is wrong, independent of any argument about which; they now agree.
+                //
+                // The VERTEX stage deliberately still takes the lane bit, and this is a known gap
+                // rather than an oversight. None of the three existing wave reductions can serve it:
+                // `guest_wave_any` declares SC_Workgroup scratch, indexes linear_localid and executes
+                // two workgroup barriers (compute-only); `native_wave_any` is gated on
+                // `native_subgroup_size`, which is set ONLY by rdna2_recompile_compute.cpp and is
+                // zero for every graphics stage; and `fragment_wave_any` pins
+                // `fragment_required_subgroup_size`, which is a fragment-stage backend contract.
+                // A vertex vote needs its own required-subgroup-size declaration plus backend
+                // enforcement, and widening admission that way wants the wave-any census (#3464)
+                // first -- an exact-width requirement that cannot be met makes the backend SKIP the
+                // draw, so the cost is dropped geometry rather than a compile error.
+                const uint32_t voted =
+                    b.is_fragment ? b.fragment_wave_any(lane_condition) : 0;
+                const uint32_t condition_source = voted ? voted : lane_condition;
                 const uint32_t branch_condition =
                     terminator->opcode == 0x06 || terminator->opcode == 0x08
-                        ? b.logical_not(lane_condition) : lane_condition;
+                        ? b.logical_not(condition_source) : condition_source;
                 route(branch_condition);
             } else if (b.native_subgroup_size) {
                 const uint32_t wave_any = b.native_wave_any(
