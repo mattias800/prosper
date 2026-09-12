@@ -2882,6 +2882,109 @@ int main() {
               all_null_resource->table_entries.empty(),
           "a table in which NOTHING decodes is declined, not bound as five null slots");
 
+    // #3576: the THIRD classification, which is neither of the two above and must not be confused
+    // with either. A slot that DECODES as a plausible descriptor but carries a CONTROL the normalized
+    // entry cannot reproduce -- swizzled addressing, INDEX_STRIDE, ADD_TID, RESOURCE_LEVEL,
+    // OOB_SELECT, TYPE -- declines the WHOLE table. It is NOT bound null.
+    //
+    // This arm exists because #3576 proposed the opposite: classify such a slot as
+    // not-a-descriptor and null it, keeping the array's other slots. That would hand an IN-RANGE
+    // guest index a confident zero read, which is precisely the fail-visible-to-silent-zero trade the
+    // null/decline split above refuses for every other unsupported record. The RDNA2 out-of-range
+    // rule does not cover it either: an in-range index into a descriptor prosper declined to
+    // reproduce is not out of range.
+    //
+    // The bit set is the lowest of the unretained-control mask (0xfff80000) rather than a named one:
+    // this asserts the CLASSIFICATION, and naming a specific control would be a claim about the
+    // GFX10 bit layout that nothing here establishes.
+    auto selected_table_with_control_bit = [&](uint32_t entry_index,
+                                               const ShaderResource** out_resource,
+                                               std::vector<uint32_t>* out_spirv) {
+        static uint32_t records[5][30]{};
+        static ShaderResourceTable rt;
+        rt = ShaderResourceTable{};
+        std::memcpy(records, selected_table_records, sizeof(selected_table_records));
+        records[entry_index][5] |= 0x00080000u;   // lowest bit of the unretained-control mask
+        const uint64_t base = reinterpret_cast<uint64_t>(records);
+        static uint32_t seed[16]{};
+        std::memcpy(seed, selected_table_seed, sizeof(selected_table_seed));
+        seed[0] = static_cast<uint32_t>(base);
+        seed[1] = (static_cast<uint32_t>(base >> 32) & 0xffffu) | (120u << 16);
+        add_compute_buffer_resources(rt, selected_table_shader.data(),
+                                     selected_table_shader.size(), seed, std::size(seed));
+        assign_convention_bindings(rt, 2);
+        ComputeShaderConfig config;
+        config.user_sgprs.assign(seed, seed + std::size(seed));
+        config.local_x = config.local_y = config.local_z = 1;
+        *out_spirv = recompile_compute(selected_table_shader.data(),
+                                       selected_table_shader.size(), &rt, config);
+        *out_resource = rt.by_fetch_pc(5u);
+    };
+
+    const ShaderResource* control_bit_resource = nullptr;
+    std::vector<uint32_t> control_bit_spirv;
+    selected_table_with_control_bit(3u, &control_bit_resource, &control_bit_spirv);
+    CHECK(control_bit_resource == nullptr ||
+              control_bit_resource->table_index_count == 0u ||
+              control_bit_resource->table_entries.empty(),
+          "#3576: a slot carrying an unretained descriptor CONTROL declines the whole table");
+    // The discriminating half. Without this, the arm above would also pass if the slot had been
+    // classified not-a-descriptor and nulled -- because a nulled slot still leaves four resolved
+    // slots and could publish a table. Assert that no table was published carrying that slot as a
+    // null, which is the outcome #3576 proposed and this rejects.
+    bool nulled_instead = control_bit_resource &&
+        control_bit_resource->table_entries.size() == 5u &&
+        control_bit_resource->table_entries[3].gpu_addr == 0u &&
+        control_bit_resource->table_entries[3].size == 0u;
+    CHECK(!nulled_instead,
+          "#3576: ...and is NOT bound as a null slot with the rest of the array kept "
+          "(that would turn an unsupported access into a confident zero read)");
+    // Both arms above pin behaviour that was ALREADY correct -- the contract check declined such a
+    // table before this change too -- so neither of them discriminates it. They are a regression
+    // guard against the null-binding #3576 proposed, which is worth having and is not the same claim.
+    //
+    // THIS arm is the one that discriminates. The refusal used to surface only as the contract
+    // check's "REJECTED contract stride=.. fmt=.. comps=..", which names no slot and no offending
+    // bits, so an investigator could not tell which of five records killed the table or why. The
+    // per-slot screen now says both.
+    {
+        const char* prev = getenv("PROSPER_SRTTABLE_LOG");
+        const std::string saved = prev ? prev : "";
+#ifdef _WIN32
+        _putenv_s("PROSPER_SRTTABLE_LOG", "1");
+#else
+        setenv("PROSPER_SRTTABLE_LOG", "1", 1);
+#endif
+        std::fflush(stderr);
+        const char* scratch = "dynfetch_control_bit_diag.log";
+        FILE* redirected = std::freopen(scratch, "w+", stderr);
+        const ShaderResource* diag_resource = nullptr;
+        std::vector<uint32_t> diag_spirv;
+        selected_table_with_control_bit(3u, &diag_resource, &diag_spirv);
+        std::fflush(stderr);
+        std::string text;
+        if (redirected) {
+            if (FILE* f = std::fopen(scratch, "rb")) {
+                char buf[4096];
+                size_t n;
+                while ((n = std::fread(buf, 1, sizeof buf, f)) > 0) text.append(buf, n);
+                std::fclose(f);
+            }
+        }
+        std::remove(scratch);
+#ifdef _WIN32
+        _putenv_s("PROSPER_SRTTABLE_LOG", saved.c_str());
+#else
+        if (prev) setenv("PROSPER_SRTTABLE_LOG", saved.c_str(), 1);
+        else unsetenv("PROSPER_SRTTABLE_LOG");
+#endif
+        const bool named = text.find("REJECTED unretained-control") != std::string::npos &&
+                           text.find("index=3") != std::string::npos;
+        CHECK(named,
+              "#3576: the refusal NAMES the offending slot and its control bits "
+              "(it used to surface as a bare contract failure with no index)");
+    }
+
     // GTA V's 0x413ce6000/0x413ce6d00 programs load a four-dword V# through an S_BUFFER_LOAD whose
     // VCC-derived SOFFSET is intentionally unknown to this CPU fold. The outer V# is fully known and
     // has NUM_RECORDS=0, while the positive immediate begins beyond its effective scalar bound: publish
