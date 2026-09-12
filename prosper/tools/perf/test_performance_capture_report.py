@@ -39,6 +39,42 @@ SAMPLES = [
 
 
 class PerformanceCaptureReportTests(unittest.TestCase):
+    def test_resident_buffer_partition_and_partial_population(self):
+        row = {"res_texture_ms": 0, "res_buffer_ms": 20, "res_descriptor_ms": 0,
+               "res_buffer_copy_ms": 2, "res_buffer_create_ms": 1,
+               "res_buffer_index_find_ms": 1, "res_buffer_index_insert_ms": 1,
+               "res_buffer_hash_ms": 1, "res_buffer_resident_ms": 9,
+               "buffer_upload_bytes": 2**40 + 7, "buffer_resident_hits": 3,
+               "buffer_resident_compared_bytes": 8192, "buffer_resident_reused_bytes": 4096,
+               "buffer_resident_admitted_bytes": 4096, "buffer_resident_refreshed_bytes": 8192,
+               "buffer_resident_declined_bytes": 0,
+               "buffer_resident_ineligible_bytes": 0}
+        full = summarize(capture(SAMPLES, renderer=[row, row]))["resource_breakdown"]
+        self.assertTrue(full["buffer_residency_available"])
+        self.assertEqual(full["res_buffer_other"], 10)
+        self.assertEqual(full["buffer_residency"]["buffer_upload_bytes"], 2**41 + 14)
+        self.assertFalse(full["buffer_watch_available"])
+        watched_row = dict(row, buffer_resident_watched_bytes=2**40 + 9, res_buffer_watch_ms=3)
+        watched = summarize(capture(SAMPLES, renderer=[watched_row, watched_row]))["resource_breakdown"]
+        self.assertTrue(watched["buffer_watch_available"])
+        self.assertEqual(watched["buffer_watch"]["buffer_resident_watched_bytes"], 2**41 + 18)
+        self.assertEqual(watched["buffer_watch"]["res_buffer_watch_ms"], 6)
+        self.assertEqual(watched["res_buffer_other"], 10)  # watch time is already inside resident
+        partial_watch = dict(watched_row)
+        del partial_watch["res_buffer_watch_ms"]
+        mixed_watch = summarize(capture(SAMPLES, renderer=[watched_row, partial_watch]))["resource_breakdown"]
+        self.assertTrue(mixed_watch["buffer_residency_available"])
+        self.assertFalse(mixed_watch["buffer_watch_available"])
+        self.assertNotIn("buffer_watch", mixed_watch)
+        self.assertEqual(mixed_watch["res_buffer_other"], 10)
+        # One missing field cannot silently become zero, or grant a partial subtraction.
+        missing = dict(row)
+        del missing["buffer_resident_hits"]
+        mixed = summarize(capture(SAMPLES, renderer=[row, missing]))["resource_breakdown"]
+        self.assertFalse(mixed["buffer_residency_available"])
+        self.assertNotIn("buffer_residency", mixed)
+        self.assertEqual(mixed["res_buffer_other"], 28)
+
     def test_gpu_device_classification(self):
         summary = summarize(capture(SAMPLES, renderer=[{
             "total_ms": 100, "gpu_device_ms": 60, "gpu_wait_ms": 65,

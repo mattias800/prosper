@@ -3666,6 +3666,28 @@ if(TARGET prosper_core)
 endif()
 
 if(TARGET prosper_core AND TARGET Vulkan::Vulkan)
+  add_executable(test_render_buffer_residency tests/gpu/state/test_render_buffer_residency.cpp)
+  target_include_directories(test_render_buffer_residency PRIVATE tests frontends)
+  target_link_libraries(test_render_buffer_residency PRIVATE prosper_core Vulkan::Vulkan)
+  add_test(NAME render_buffer_residency COMMAND ${CMAKE_COMMAND} -E env
+    --unset=PROSPER_NO_BACKEND_RESOURCE_SHARE
+    --unset=PROSPER_NO_BACKEND_BUFFER_POOL --unset=PROSPER_BUFVERIFY
+    PROSPER_BACKEND_BUFFER_RESIDENCY_MB=256
+    PROSPER_BACKEND_BUFFER_RESIDENCY_OWNERS=4096
+    $<TARGET_FILE:test_render_buffer_residency>)
+  foreach(owner_limit IN ITEMS 0 256)
+    add_test(NAME render_buffer_owner_limit_${owner_limit} COMMAND ${CMAKE_COMMAND} -E env
+      PROSPER_BACKEND_BUFFER_RESIDENCY_OWNERS=${owner_limit}
+      $<TARGET_FILE:test_render_buffer_residency> --configured-owner-limit ${owner_limit})
+  endforeach()
+  add_test(NAME render_buffer_residency_default COMMAND ${CMAKE_COMMAND} -E env
+    --unset=PROSPER_BACKEND_BUFFER_RESIDENCY_MB
+    --unset=PROSPER_NO_BACKEND_BUFFER_RESIDENCY
+    --unset=PROSPER_BACKEND_BUFFER_RESIDENCY_OWNERS
+    --unset=PROSPER_NO_BACKEND_RESOURCE_SHARE
+    --unset=PROSPER_NO_BACKEND_BUFFER_POOL --unset=PROSPER_BUFVERIFY
+    $<TARGET_FILE:test_render_buffer_residency> --default-disabled)
+
   add_executable(test_gpu_detile tests/gpu/execute/test_gpu_detile.cpp)
   target_include_directories(test_gpu_detile PRIVATE tests)
   target_link_libraries(test_gpu_detile PRIVATE prosper_core Vulkan::Vulkan)
@@ -3678,6 +3700,14 @@ if(TARGET prosper_core AND TARGET Vulkan::Vulkan)
 endif()
 
 if(TARGET prosper_live_renderer AND TARGET Vulkan::Vulkan)
+  add_executable(test_render_buffer_capture tests/shared/live/test_render_buffer_capture.cpp)
+  target_include_directories(test_render_buffer_capture PRIVATE frontends)
+  target_link_libraries(test_render_buffer_capture PRIVATE prosper_live_renderer
+                                                         prosper_performance_capture Vulkan::Vulkan)
+  add_test(NAME render_buffer_capture COMMAND test_render_buffer_capture)
+  set_tests_properties(render_buffer_capture PROPERTIES
+    ENVIRONMENT "PROSPER_NO_LIVE_PERSISTENT_COLOR_TARGETS=1;PROSPER_BACKEND_BUFFER_RESIDENCY_MB=256;PROSPER_BACKEND_BUFFER_RESIDENCY_OWNERS=4096" TIMEOUT 120)
+
   add_executable(test_gpu_retile tests/gpu/execute/test_gpu_retile.cpp)
   target_include_directories(test_gpu_retile PRIVATE tests frontends)
   target_link_libraries(test_gpu_retile PRIVATE prosper_live_renderer Vulkan::Vulkan)

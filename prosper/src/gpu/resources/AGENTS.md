@@ -42,3 +42,9 @@ storage descriptor and vetoes every `OpImageTexelPointer`. Consumers may omit ou
 that module-wide proof plus the whole alias group's read-only access. Copied or otherwise untracked
 image objects must not turn a missed store into read-only authority. Cache the proof with the exact
 module report; do not derive it from descriptor decorations alone.
+
+Storage-buffer negative-write proof is separate: `storage_buffer_writes_complete` requires known
+pointer destinations for stores, copies and atomics. Unknown pointer or extended-instruction effects
+decline the proof. Known GLSL arithmetic has no writes; Modf and Frexp output pointers must resolve.
+A complete report still requires consumers to combine every alias/stage's writable and atomic flags
+before treating an upload as read-only. Unresolved writes must not silently become cache authority.
