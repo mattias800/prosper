@@ -4121,6 +4121,35 @@ inline size_t invalidate_persistent_ds_guest_write(uint64_t addr, uint64_t size)
                     (unsigned long long)learned, (unsigned long long)slice_depth_bytes,
                     (unsigned long long)stencil_size, (unsigned long long)htile_size,
                     (long long)((key.sr ? key.sr : key.sw) - (key.dr ? key.dr : key.dw)));
+        // ============================================================================================
+        // CURRENT RULE, stated first because everything below it is stratified history and the last
+        // layer used to contradict the code it annotates (#3580).
+        //
+        // An HTILE write invalidates the retained depth/stencil UNLESS the write is
+        // `gpu-preserving` AND the retained depth was written by the renderer during the CURRENT
+        // presented frame. That is the `(!byte_preserving || !current_frame_depth)` term at the
+        // bottom of this block, and the discriminator that makes it sound is the PRESENTATION EPOCH
+        // (#3281) -- not byte equality and not uniformity, both of which are dead (see below).
+        //
+        //   between frames -- prior-frame depth is stale        -> invalidate  (Blue Prince, #3264)
+        //   within a frame -- geometry just rendered this frame -> preserve    (GTA V, #3121)
+        //
+        // Two ways this block has misled readers, both worth knowing before editing it:
+        //
+        //   * The #3264 layer below opens by saying the `!byte_preserving` term is "REMOVED, not
+        //     weakened" and argues that keying on that origin is unsound. That was true when written
+        //     on 2026-09-03 and was SUPERSEDED THE SAME DAY by #3281, which reinstated the term
+        //     NARROWED by the epoch test above. The sentence is kept as the record of why the
+        //     UNCONDITIONAL form was wrong; it no longer describes the code beneath it.
+        //   * The invalidation is therefore NOT unconditional, though #3580 summarised it as such
+        //     while quoting the conditional line -- which is what a stale leading comment does to a
+        //     reader who trusts it.
+        //
+        // Still open: decoding HTILE to tell a fast CLEAR from a HiZ REFRESH. Uniformity was
+        // hypothesised as that discriminator and MEASURED FALSE before it shipped -- see the layer
+        // below and GTA5_STATUS.md's Ruled out table. Do not re-derive it.
+        // ============================================================================================
+        //
         // PROSPER_DS_HTILE_INVALIDATE=0 -- experiment arm, default ON (historical behaviour).
         //
         // The retained depth image is a Vulkan image; guest memory does not back it. So a guest
@@ -4231,6 +4260,11 @@ inline size_t invalidate_persistent_ds_guest_write(uint64_t addr, uint64_t size)
         // 49,152 words, i.e. resolution). A "uniform plane means a fast clear" discriminator was
         // hypothesised and MEASURED FALSE before it was written; PROSPER_HTILE_UNIFORMLOG below is
         // the instrument that killed it.
+        // #3264 (SUPERSEDED SAME-DAY BY #3281 -- read the CURRENT RULE at the top of this block).
+        // This layer records why the UNCONDITIONAL byte-preserving suppression was wrong; the term it
+        // says is "REMOVED" was reinstated hours later, narrowed by the presentation-epoch test, and
+        // that narrowed form is what the code below actually does.
+        //
         // #3264: the `!byte_preserving` term is REMOVED, not weakened. It suppressed the
         // invalidation whenever the write carried the `gpu-preserving` origin, and that is unsound
         // for the reason GTA5_STATUS.md's own Ruled out section recorded on 2026-08-28 (#3089), one
