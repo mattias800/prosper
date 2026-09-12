@@ -1251,19 +1251,28 @@ std::array<uint32_t, 16> tile27_rgba16f_equation() {
     return result;
 }
 
-bool tile64_paired16_equation(uint32_t mode, std::array<uint32_t, 16>& equation,
-                              uint32_t& block_width, uint32_t& block_height) {
-    if (mode != uint32_t(TileMode::Sw64KbZX)) return false;
-    const auto* pattern = sw64kb_pattern(mode, 1);
-    if (pattern[0].x || pattern[0].y || pattern[1].x != 1 || pattern[1].y)
-        return false;
+bool tile64_packed_equation(uint32_t mode, uint32_t bpe,
+                             std::array<uint32_t, 16>& equation,
+                             uint32_t& block_width, uint32_t& block_height) {
+    if ((mode != uint32_t(TileMode::Sw64KbZX) && mode != uint32_t(TileMode::Sw64KbRX)) ||
+        (bpe != 1 && bpe != 2)) return false;
+    const uint32_t element_bits = std::countr_zero(bpe);
+    const uint32_t packed_x_mask = 4 / bpe - 1;
+    const auto* pattern = sw64kb_pattern(mode, element_bits);
+    // Adjacent horizontal texels must occupy one complete aligned output word.
+    // Prove this for the selected pipe equation instead of assuming every swizzle preserves it.
+    for (uint32_t bit = 0; bit < 2; ++bit) {
+        const uint32_t expected_x = bit < element_bits ? 0u : 1u << (bit - element_bits);
+        if (pattern[bit].x != expected_x || pattern[bit].y) return false;
+    }
     for (size_t bit = 2; bit < equation.size(); ++bit)
-        if (pattern[bit].x & 1) return false;
-    sw64kb_dims(1, block_width, block_height);
+        if (pattern[bit].x & packed_x_mask) return false;
+    sw64kb_dims(element_bits, block_width, block_height);
     for (size_t bit = 0; bit < equation.size(); ++bit)
         equation[bit] = uint32_t(pattern[bit].x) | (uint32_t(pattern[bit].y) << 16);
     return true;
 }
+
 
 bool tile64_word_equation(uint32_t mode, uint32_t bpe,
                           std::array<uint32_t, 16>& equation,
