@@ -4551,6 +4551,9 @@ void GpuState::apply(const Pm4Command& c) {
             break;
         case K::StallCommandBufferParser:
             parser_stalls.push_back({command_order});
+            last_cp_sync_order = command_order;   // #3574
+            ++parser_stalls_seen;
+            ++cp_sync_packets_seen;
             break;
         case K::DrawIndexOffset: {
             // Gen5 indexed draw (issue #232). Uses the bound index base + count; DrawIndexOffset's own
@@ -4677,6 +4680,7 @@ void GpuState::apply(const Pm4Command& c) {
             break;
         }
         case K::ReleaseMem:
+            last_cp_sync_order = command_order; ++cp_sync_packets_seen;   // #3574
             // EOP completion label write. While the queue is paused (this fold hit an unsatisfied
             // wait, or an earlier submit's gated tail is still pending), the write queues behind
             // the barrier IN RING ORDER (see the #312 block above) — completing a fence early is
@@ -4698,6 +4702,7 @@ void GpuState::apply(const Pm4Command& c) {
             if (eop_write_sync()) honor_write_data(c); else pend_enqueue(c);
             break;
         case K::EventWrite:
+            last_cp_sync_order = command_order; ++cp_sync_packets_seen;   // #3574
             if (defer_gate(c)) { defer_push(c); break; }
             if (!dma_copies.empty()) {
                 ordered_memory_effects.emplace_back(c, command_order);
@@ -4770,6 +4775,7 @@ void GpuState::apply(const Pm4Command& c) {
             if (eop_write_sync()) honor_dma_data(c); else pend_enqueue(c);
             break;
         case K::WaitRegMem: {
+            last_cp_sync_order = command_order; ++cp_sync_packets_seen;   // #3574
             const bool wait_overlaps_dma = !dma_copies.empty() && c.wm_valid && c.wm_addr &&
                 !(c.wm_addr & 3) &&
                 retained_dma_destination_overlaps(dma_copies, c.wm_addr, 8);
@@ -5187,9 +5193,15 @@ void GpuState::apply(const Pm4Command& c) {
                 // count overstates it; an earlier revision of this instrument did exactly that.
                 if (!dispatches.empty()) {
                     const uint64_t last_dispatch_order = dispatches.back().command_order;
-                    bool armed = false;
-                    for (const auto& stall : parser_stalls)
-                        if (stall.command_order > last_dispatch_order) { armed = true; break; }
+                    // ARMED widened beyond the parser stall. StallCommandBufferParser is the PFP/ME
+                    // parser sync -- the boundary the executor uses for INDIRECT ARGUMENTS -- and it
+                    // does not wait for a shader. The packets that actually order a compute shader's
+                    // writes before a CP read are the EOP/event release and the register-memory wait,
+                    // all of which prosper decodes and all of which are handled at fold time with the
+                    // same missing-compute hole. Keying only on the parser stall would report a clean
+                    // zero for a title using the canonical mechanism -- a false negative on exactly
+                    // the case this instrument exists to find.
+                    const bool armed = last_cp_sync_order > last_dispatch_order;
                     static std::atomic<uint64_t> pred_pending{0}, pred_armed{0};
                     const uint64_t ord = pred_pending.fetch_add(1) + 1;
                     const uint64_t armed_ord = armed ? pred_armed.fetch_add(1) + 1 : 0;
@@ -5201,11 +5213,23 @@ void GpuState::apply(const Pm4Command& c) {
                                 "(pending=%zu armed=%llu of pending#%llu) target=0x%llx order=%llu "
                                 "(#3574)\n",
                                 (unsigned long long)pred_cond_addr,
-                                armed ? "ARMED: a parser stall follows the last dispatch"
-                                      : "pending compute only, no stall after it",
+                                armed ? "ARMED: a CP sync packet follows the last dispatch"
+                                      : "pending compute only, no CP sync after it",
                                 dispatches.size(), (unsigned long long)pred_armed.load(),
                                 (unsigned long long)ord, (unsigned long long)c.jump_addr,
                                 (unsigned long long)command_order);
+                    // THE POSITIVE CONTROL. Without these counts, "ARMED = 0" and "this title emits
+                    // no synchronisation packets at all" are the same output -- an uncontrolled zero,
+                    // which this project has been burned by before. Printed on the same cadence so a
+                    // reader always has the denominator beside the numerator.
+                    if (say)
+                        fprintf(stderr,
+                                "[agc]   control: cp_sync_packets_seen=%llu parser_stalls_seen=%llu "
+                                "last_cp_sync_order=%llu last_dispatch_order=%llu\n",
+                                (unsigned long long)cp_sync_packets_seen,
+                                (unsigned long long)parser_stalls_seen,
+                                (unsigned long long)last_cp_sync_order,
+                                (unsigned long long)last_dispatch_order);
                 }
                 memcpy(&cond, (const void*)(uintptr_t)pred_cond_addr, sizeof cond);
                 skip = (cond != 0);

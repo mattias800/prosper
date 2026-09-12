@@ -106,69 +106,90 @@ int main() {
           "#3573: ...and the module declares the exact 64-lane subgroup that vote requires, "
           "so the backend enforces it or skips the draw rather than voting over half a wave");
 
-    // --- Why the wave-uniformity escape does NOT apply on this route -----------------------------
-    // The three structured-route sites skip the vote when the guest's VCC is provably wave-uniform:
-    // `any(P)` is `P` when P does not vary. That escape is deliberately absent here, and this arm
-    // pins the REASON so nobody re-adds it as dead code (I did, first; it never changed a lowering).
+    // --- The wave-uniformity escape --------------------------------------------------------------
+    // `any(P)` is `P` when P does not vary, so a vote over a provably wave-uniform VCC is pure cost --
+    // and the cost is real: the vote pins an exact 64-lane subgroup, and a device that cannot honour
+    // that SKIPS THE DRAW. The escape must therefore fire when it legitimately can.
     //
-    // It needs both halves of prosper's proof. The static scan accepts this shader -- asserted below.
-    // The live marker does not, because `load_state` stamps `exec_narrowed = true` on every dispatch
-    // case entry, and `emit_alu` only sets the uniformity marker for a compare that ran with EXEC not
-    // narrowed. That refusal is correct rather than over-strict: under a narrowed EXEC the compare
-    // writes VCC only for active lanes, so inactive lanes keep stale bits and VCC as a whole is not
-    // uniform even when the compare's inputs are.
+    // It needs BOTH halves of prosper's proof: the static scan, AND `emit_alu`'s live marker, which is
+    // only set for a compare that ran with EXEC not narrowed. RDNA2 ISA 3.9 defines a compare as
+    // `VCC[n] = EXEC[n] & (test passed)`, so under a narrowed EXEC the result is `P ? EXEC : 0` -- it
+    // takes EXEC's shape and is not wave-uniform even when P is. The static half alone would be
+    // unsound.
     //
-    // Same CFG as above, so the dispatcher route is unchanged; only the COMPARE differs.
-    //
-    // The compare MUST be the e64 (VOP3) encoding, and that is not a detail. The escape needs both
-    // halves of prosper's proof to agree, and they demand different things:
-    //
-    //   * the static scan requires the producing compare to be VOPC-classified;
-    //   * `emit_alu`'s live marker requires BOTH data operands to be scalar.
-    //
-    // The plain VOPC encoding cannot satisfy the second: its `vsrc1` field is architecturally a VGPR,
-    // so one operand is always vector and the marker never sets. The e64 compare takes two SGPRs and
-    // is still classified VOPC by the decoder (the VOPC-as-VOP3 reclassification), so it is the only
-    // encoding that can satisfy both. A test written with a plain VOPC compare would conclude the
-    // escape is dead; it is not, it is encoding-specific.
-    const uint32_t irreducible_uniform_vccz_ps[] = {
-        0xBE800380u,              // pc0  s_mov_b32 s0, 0
-        0xBE810380u,              // pc1  s_mov_b32 s1, 0
-        0xD4C2006Au, 0x00000200u, // pc2  v_cmp_eq_u32_e64 vcc, s0, s1   (both sources scalar)
-        0xBF860004u,              // pc4  s_cbranch_vccz -> pc9
-        0xBF068004u,              // pc5  s_cmp_eq_u32 s4, 0
-        0xBF840004u,              // pc6  s_cbranch_scc0 -> pc11
-        0xBE800385u,              // pc7  s_mov_b32 s0, 5
-        0xBF820002u,              // pc8  s_branch -> pc11
-        0xBE800387u,              // pc9  s_mov_b32 s0, 7
-        0xBF82FFFAu,              // pc10 s_branch -> pc5   (back-edge)
-        0x7E0202F2u, 0x7E040280u, 0x7E0602F2u,
-        0xF800180Fu, 0x03020100u, 0xBF810000u,
-    };
-    // Isolate the STATIC half of the proof first. The escape needs two things: this static scan over
-    // the instruction stream, and a live match between the branch's VCC value and the one emit_alu
-    // marked uniform. Asserting the static half separately means a failure below tells you WHICH
-    // half is responsible instead of only that the escape did not fire.
-    CHECK(fragment_vcc_branch_is_wave_uniform_for_test(
-              irreducible_uniform_vccz_ps, std::size(irreducible_uniform_vccz_ps), 4),
-          "#3573: the STATIC half of the proof accepts the e64 compare's wave-uniform VCC");
+    // WHAT MAKES THESE TWO ARMS DISCRIMINATE, and the reason the first draft of this test did not:
+    // `load_state` stamps `exec_narrowed = true` at case ENTRY, so a case that never restores EXEC
+    // keeps voting no matter how uniform its compare is. The two programs below are IDENTICAL except
+    // that the second restores EXEC with `s_mov_b64 exec, -1` before the compare -- the ordinary
+    // restore after a divergent region. An arm that only asserted "a vote happened" could not tell the
+    // escape's presence from its absence, because on the un-restored program it never fires either way.
+    {
+        // Narrowed EXEC at case entry, never restored -> the marker is withheld -> vote, and pinned.
+        const uint32_t narrowed_entry_ps[] = {
+            0xBE800380u,              // pc0  s_mov_b32 s0, 0
+            0xBE810380u,              // pc1  s_mov_b32 s1, 0
+            0xD4C2006Au, 0x00000200u, // pc2  v_cmp_eq_u32_e64 vcc, s0, s1
+            0xBF860004u,              // pc4  s_cbranch_vccz -> pc9
+            0xBF068004u,              // pc5  s_cmp_eq_u32 s4, 0
+            0xBF840004u,              // pc6  s_cbranch_scc0 -> pc11
+            0xBE800385u,              // pc7  s_mov_b32 s0, 5
+            0xBF820002u,              // pc8  s_branch -> pc11
+            0xBE800387u,              // pc9  s_mov_b32 s0, 7
+            0xBF82FFFAu,              // pc10 s_branch -> pc5   (back-edge)
+            0x7E0202F2u, 0x7E040280u, 0x7E0602F2u,
+            0xF800180Fu, 0x03020100u, 0xBF810000u,
+        };
+        // The same program with EXEC restored before the compare. `s_mov_b64 exec, -1` clears
+        // `exec_narrowed`, so the compare's result is the bare predicate and the marker is set.
+        const uint32_t exec_restored_ps[] = {
+            0xBE800380u,              // pc0  s_mov_b32 s0, 0
+            0xBE810380u,              // pc1  s_mov_b32 s1, 0
+            0xBEFE04C1u,              // pc2  s_mov_b64 exec, -1     <- the only difference
+            0xD4C2006Au, 0x00000200u, // pc3  v_cmp_eq_u32_e64 vcc, s0, s1
+            0xBF860004u,              // pc5  s_cbranch_vccz -> pc10
+            0xBF068004u,              // pc6  s_cmp_eq_u32 s4, 0
+            0xBF840004u,              // pc7  s_cbranch_scc0 -> pc12
+            0xBE800385u,              // pc8  s_mov_b32 s0, 5
+            0xBF820002u,              // pc9  s_branch -> pc12
+            0xBE800387u,              // pc10 s_mov_b32 s0, 7
+            0xBF82FFFAu,              // pc11 s_branch -> pc6   (back-edge)
+            0x7E0202F2u, 0x7E040280u, 0x7E0602F2u,
+            0xF800180Fu, 0x03020100u, 0xBF810000u,
+        };
 
-    const std::vector<uint32_t> uni =
-        recompile_fragment(irreducible_uniform_vccz_ps, std::size(irreducible_uniform_vccz_ps));
-    CHECK(!uni.empty(), "the wave-uniform vccz fragment recompiles");
-    if (!uni.empty()) {
-        // CONTROL again: without this, "no vote" could simply mean "no dispatcher", and the arm
-        // would pass against a shader that never reached the code under test.
-        CHECK(count_opcode(uni, kOpSwitch) >= 1,
-              "CONTROL: the wave-uniform arm ALSO lowers through the dispatcher, so the two arms "
-              "differ only in the compare's operands");
-        CHECK(count_opcode(uni, kOpGroupNonUniformAny) >= 1,
-              "#3573: the dispatcher votes even for a statically wave-uniform VCC, because a "
-              "dispatch case always enters on a narrowed EXEC and the live uniformity marker is "
-              "(correctly) withheld there -- the escape is unavailable on this route, not missing");
-        CHECK(fragment_spirv_required_subgroup_size(uni) == 64u,
-              "#3573: ...so this shader is pinned to an exact 64-lane subgroup too. That is the "
-              "standing cost of the dispatcher route, and the thing to measure before widening it");
+        const std::vector<uint32_t> narrowed =
+            recompile_fragment(narrowed_entry_ps, std::size(narrowed_entry_ps));
+        const std::vector<uint32_t> restored =
+            recompile_fragment(exec_restored_ps, std::size(exec_restored_ps));
+        CHECK(!narrowed.empty() && !restored.empty(),
+              "both wave-uniform variants recompile");
+
+        if (!narrowed.empty() && !restored.empty()) {
+            // CONTROLS: both must reach the dispatcher, or the comparison is about routing rather
+            // than about the escape.
+            CHECK(count_opcode(narrowed, kOpSwitch) >= 1 && count_opcode(restored, kOpSwitch) >= 1,
+                  "CONTROL: both variants lower through the CFG dispatcher");
+            CHECK(fragment_vcc_branch_is_wave_uniform_for_test(
+                      exec_restored_ps, std::size(exec_restored_ps), 5),
+                  "CONTROL: the STATIC half accepts the restored variant's compare, so any difference "
+                  "below comes from the LIVE marker and not from the scan");
+
+            CHECK(count_opcode(narrowed, kOpGroupNonUniformAny) >= 1,
+                  "#3573: a case that never restores EXEC still votes -- under a narrowed EXEC the "
+                  "compare yields P ? EXEC : 0, which is not wave-uniform even when P is");
+            CHECK(count_opcode(restored, kOpGroupNonUniformAny) == 0,
+                  "#3573: restoring EXEC before the compare makes VCC provably wave-uniform, and the "
+                  "escape then skips the vote entirely");
+            CHECK(fragment_spirv_required_subgroup_size(restored) != 64u,
+                  "#3573: ...so that shader is NOT pinned to an exact 64-lane subgroup, which is the "
+                  "whole point -- a pinned shader can have its draw skipped by the backend");
+            // The pair is the discriminator. Without this, either arm alone could be satisfied by a
+            // build that always votes or one that never does.
+            CHECK(count_opcode(narrowed, kOpGroupNonUniformAny) >
+                      count_opcode(restored, kOpGroupNonUniformAny),
+                  "#3573: the two variants differ ONLY in the EXEC restore, and they disagree about "
+                  "the vote -- so this pair detects the escape rather than the routing");
+        }
     }
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
