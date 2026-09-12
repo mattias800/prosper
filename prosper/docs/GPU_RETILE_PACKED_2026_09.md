@@ -104,7 +104,7 @@ do not supply individual frame-time percentiles. Nested CPU/GPU intervals must n
 
 ### GTA target result
 
-All three ordinary-image targets appear **32 times in each arm**, with identical bytes and shader
+All three ordinary-image targets appear **32 times in each arm**, with identical byte counts and shader
 identities. Each changes from 0/32 to 32/32 GPU-retiled writebacks. Historical multilayer R16 images
 are excluded from these target counts.
 
