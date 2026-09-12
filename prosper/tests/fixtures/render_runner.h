@@ -14,6 +14,7 @@
 #include "gpu/execute/host_read_barrier.hpp"   // the availability half of a readback (#2944/#3249)
 #include "gpu/diagnostics/diagnostic_selectors.hpp"
 #include "gpu/diagnostics/geometry_probe_arming.hpp"
+#include "gpu/diagnostics/vk_object_names.hpp"   // #3578: name guest shaders for RenderDoc/RGP
 #include "diagnostics/env_cache.hpp"       // PROSPER_ENV_ON / _VALUE: cached reads on per-draw paths
 #include "diagnostics/env_numeric.hpp"     // #3267: a typo must not silently re-size a cache
 #include "gpu/state/render_state.hpp"
@@ -1279,6 +1280,21 @@ inline const RenderVkCtx& render_vk_ctx() {
                 ici.ppEnabledExtensionNames = inst_exts.data();
             }
         }
+        // VK_EXT_debug_utils, requested UNCONDITIONALLY (#3578) rather than only when validation is
+        // on. Object naming rides on this extension, and the run people actually capture in RenderDoc
+        // or RGP is an ORDINARY run with no validation layer -- so requesting it inside the validation
+        // branch, as this did, would have left every name silently doing nothing in exactly the case
+        // the names exist for. It is an instance extension with no runtime cost when nothing is
+        // listening, and "add-if-available" keeps the #1270 contract above: an unadvertised push fails
+        // the whole vkCreateInstance and would take the WSI extensions down with it.
+        bool have_debug_utils_ext = false;
+        for (const auto& e : avail)
+            if (!strcmp(e.extensionName, "VK_EXT_debug_utils")) have_debug_utils_ext = true;
+        if (have_debug_utils_ext) {
+            inst_exts.push_back("VK_EXT_debug_utils");
+            ici.enabledExtensionCount = (uint32_t)inst_exts.size();
+            ici.ppEnabledExtensionNames = inst_exts.data();
+        }
         // PROSPER_VK_VALIDATION=1: enable the Khronos validation layer and register a messenger.
         //
         // This does NOT make validation newly possible -- `tools/vkval/vk_validation_scan.py`
@@ -1316,14 +1332,9 @@ inline const RenderVkCtx& render_vk_ctx() {
                 inst_layers.push_back(kValidationLayer);
                 ici.enabledLayerCount = (uint32_t)inst_layers.size();
                 ici.ppEnabledLayerNames = inst_layers.data();
-                bool have_debug_utils = false;
-                for (const auto& e : avail)
-                    if (!strcmp(e.extensionName, "VK_EXT_debug_utils")) have_debug_utils = true;
-                if (have_debug_utils) {
-                    inst_exts.push_back("VK_EXT_debug_utils");
-                    ici.enabledExtensionCount = (uint32_t)inst_exts.size();
-                    ici.ppEnabledExtensionNames = inst_exts.data();
-                } else {
+                // Already requested unconditionally above (#3578); do NOT push it again -- a
+                // duplicate entry in ppEnabledExtensionNames is a spec violation.
+                if (!have_debug_utils_ext) {
                     fprintf(stderr, "[vk-validation] VK_EXT_debug_utils is not advertised; the layer "
                                     "will run with its DEFAULT stdout/stderr action and this process "
                                     "will not rate-limit or tag its output\n");
@@ -6353,13 +6364,25 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         return out;
     }
 
-    auto mkmod = [&](const std::vector<uint32_t>& c) -> VkShaderModule {
+    // `stage` and `identity` are per-module, not per-draw: naming a vertex module with the
+    // fragment identity would be worse than not naming it, because a wrong name in a capture reads
+    // as a fact. The geometry stage carries no identity counter of its own, so it names itself by
+    // digest alone rather than borrowing a neighbour's.
+    auto mkmod = [&](const std::vector<uint32_t>& c, const char* stage,
+                     uint64_t identity) -> VkShaderModule {
         VkShaderModuleCreateInfo s{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         s.codeSize = c.size() * 4; s.pCode = c.data(); VkShaderModule m = VK_NULL_HANDLE;
         // #3210 case 3, the mild one: the result was discarded, but `m` is initialized above and
         // the caller already skips the draw on `!v.vs || !v.fs`. Only the report is new -- the
         // control flow is deliberately unchanged.
         create_render_shader_module_checked(dev, s, &m);
+        // #3578. Once per module at creation, never in the draw hot path, and a no-op when
+        // VK_EXT_debug_utils is absent.
+        if (m)
+            prosper::gpu::vk_name_objectf(
+                dev, VK_OBJECT_TYPE_SHADER_MODULE, (uint64_t)m,
+                "guest %s id=%llu spv=%016llx", stage, (unsigned long long)identity,
+                (unsigned long long)prosper::gpu::vk_name_spirv_digest(c.data(), c.size()));
         return m; };
     // Per-draw Vulkan objects stay alive until the call or explicit submission batch completes.
     const auto timing_target_ready = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
@@ -9078,8 +9101,9 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 fprintf(stderr, "[backend-trace] draw=%zu create-shaders begin\n", di);
                 fflush(stderr);
             }
-            v.vs = mkmod(bd_vs); v.gs = bd_gs.empty() ? VK_NULL_HANDLE : mkmod(bd_gs);
-            v.fs = mkmod(bd_fs);
+            v.vs = mkmod(bd_vs, "vs", bd.vs_identity);
+            v.gs = bd_gs.empty() ? VK_NULL_HANDLE : mkmod(bd_gs, "gs", 0);
+            v.fs = mkmod(bd_fs, "fs", bd.fs_identity);
             if (backend_trace) {
                 fprintf(stderr,
                         "[backend-trace] draw=%zu create-shaders end vs=%p gs=%p fs=%p\n",

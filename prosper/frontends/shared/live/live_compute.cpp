@@ -23,6 +23,7 @@
 #include "shared/perf/performance_timing_policy.hpp" // F8 measures without enabling verbose timing logs
 
 #include "gpu/texture/bc_decode.hpp"
+#include "gpu/diagnostics/vk_object_names.hpp"   // #3578
 #include "gpu/capture/gpu_capture.hpp"
 #include "gpu/execute/gpu_execute.hpp"
 #include "gpu/execute/host_read_barrier.hpp"  // #3249: a host read of a dispatch result needs an availability op
@@ -3184,6 +3185,10 @@ struct VulkanComputeContext {
         smci.pCode = spirv.data();
         if (vkCreateShaderModule(device, &smci, nullptr, &compare_shader) != VK_SUCCESS)
             return false;
+        // #3578: prosper's OWN helper kernels get names too. In a capture these sit among the guest's
+        // dispatches and are the ones most easily mistaken for game work.
+        prosper::gpu::vk_name_object(device, VK_OBJECT_TYPE_SHADER_MODULE, (uint64_t)compare_shader,
+                                     "prosper compare_uvec4");
         VkPushConstantRange push{};
         push.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
         push.size = sizeof(uint32_t);
@@ -9879,6 +9884,13 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             }
             if (!vk_ok(vkCreateShaderModule(ctx.device, &smci, nullptr, &shader), "shader-module"))
                 break;
+            // #3578: the guest compute program's own address is the identity every other diagnostic
+            // in this file already prints (`[compute] ... code_addr=`), so a capture and a log now
+            // use the same word for the same object. No-op without VK_EXT_debug_utils.
+            prosper::gpu::vk_name_objectf(
+                ctx.device, VK_OBJECT_TYPE_SHADER_MODULE, (uint64_t)shader,
+                "guest cs 0x%llx spv=%016llx", (unsigned long long)item.code_addr,
+                (unsigned long long)prosper::gpu::vk_name_spirv_digest(spirv.data(), spirv.size()));
             VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
             plci.setLayoutCount = 1;
             plci.pSetLayouts = &descriptor_layout;

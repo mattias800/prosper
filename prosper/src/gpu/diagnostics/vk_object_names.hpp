@@ -70,4 +70,27 @@ inline void vk_name_objectf(VkDevice device, VkObjectType type, uint64_t handle,
     vk_name_object(device, type, handle, buf);
 }
 
+// A content digest of a SPIR-V module, FOR NAMING ONLY -- never an identity anything depends on.
+//
+// It is here because the identities prosper already carries are not sufficient on their own.
+// `DrawItem::vs_identity`/`fs_identity` are a monotonic counter from the exact shader-recompile cache
+// (`gpu_executor.cpp`, `cache.next_identity++`): process-unique and never reused, which is exactly
+// what a memo key needs, but it is NOT a content hash and NOT the guest code address. Two
+// consequences for a name. It differs between two runs of the same title, so it cannot correlate a
+// capture taken today against a log taken yesterday; and it is documented as **zero** for the
+// external/replay paths -- `gpu_execute.hpp:83-85` -- which is precisely how `gpu_replay` opens the
+// bundles this naming exists to make readable. A name carrying only the counter would read `id=0` for
+// every module in a replay.
+//
+// So a name carries both: the counter, which ties a capture to the same run's `PROSPER_DBG` lines,
+// and this digest, which is stable across runs and still identifies the module when the counter is 0.
+inline uint64_t vk_name_spirv_digest(const uint32_t* words, size_t count) {
+    uint64_t h = 1469598103934665603ull;                 // FNV-1a 64 offset basis
+    for (size_t i = 0; i < count; ++i) {
+        h ^= words[i];
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
 }  // namespace prosper::gpu
