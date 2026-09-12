@@ -21,6 +21,14 @@ a verdict, or reordering the predicate so a descriptor reports a different one f
 change that no compiler will catch. Add a new screen at the END unless you mean to change which
 verdict an already-refused descriptor reports, and pin the ordering with an arm.
 
+**And the ordering arm has to trip BOTH predicates, or it pins nothing.** This is easy to get wrong,
+and it was: the first version of the #3587 ordering guard used an exactly all-zero T#, which trips
+`base-zero` alone — its selectors decode as four SQ_SEL_0, a *defined* encoding — so it reported the
+same string whichever predicate ran first and stayed green when the screen was hoisted to the top of
+the function. A fixture that sets base to zero **and** a reserved `DST_SEL` is the one that fails under
+a reorder. Pair it with a control asserting the fixture really does trip both, because an arm whose
+fixture has silently stopped straddling the two verdicts is indistinguishable from a passing one.
+
 **Know what your fixture actually encodes.** `make_tsharp` (in `test_build_shader_resources.cpp`)
 zeroes the whole descriptor and then sets only base/extent/format/tile/type/array, which leaves
 WORD3\[11:0\] at zero — so every T# it builds decodes `DST_SEL` as four SQ_SEL_0 constants, *not* as

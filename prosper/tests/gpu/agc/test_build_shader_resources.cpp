@@ -478,10 +478,31 @@ int main() {
 
         // Ordering guard. `base-zero` must keep winning over the new verdict, because the
         // explicit-null-image path (gpu_executor.cpp) publishes a null binding only when the reason
-        // is exactly "base-zero" AND all eight dwords are zero. An all-zero T# decodes every selector
-        // as 0 -- SQ_SEL_0, a DEFINED constant, so the two verdicts do not collide today; this pins
-        // that neither predicate may be reordered into changing the string that path reads.
+        // is exactly "base-zero" AND all eight dwords are zero.
+        //
+        // THE FIXTURE HAS TO TRIP BOTH PREDICATES OR IT PINS NOTHING. An exactly all-zero T# decodes
+        // every selector as 0 -- SQ_SEL_0, a DEFINED constant -- so it trips `base-zero` alone and
+        // reports the same string whichever predicate runs first. An arm built on it passes under a
+        // reorder, which is how the first version of this guard was written and why it is called out
+        // here: a guard that cannot fail is worse than no guard, because it reads as coverage.
+        //
+        // So: base zero AND a reserved DST_SEL_X together. Only the ordering decides the answer.
         {
+            uint32_t both[8]; memcpy(both, good, sizeof good);
+            both[0] = 0; both[1] &= ~0xFFFFu;                 // base -> 0
+            both[3] = (both[3] & ~0x7u) | 2u;                 // DST_SEL_X -> reserved encoding 2
+            const DecodedImageDescriptor dboth = decode_image_descriptor(both);
+            const char* why = image_descriptor_reject_reason(dboth);
+            CHECK(dboth.base == 0 && dboth.dst_sel[0] == 2u,
+                  "CONTROL: the ordering fixture really does trip BOTH predicates "
+                  "(base 0 and a reserved DST_SEL_X) -- without this the arm below proves nothing");
+            CHECK(why != nullptr && strcmp(why, "base-zero") == 0,
+                  "#3587: base-zero still wins over dst-sel-reserved, so the explicit-null path "
+                  "(which keys on that exact string) keeps publishing its null binding");
+        }
+        {
+            // The all-zero shape the explicit-null path actually sees, kept as its own arm: it says
+            // the common case is unchanged, which is a different claim from the ordering above.
             const uint32_t all_zero[8] = {0, 0, 0, 0, 0, 0, 0, 0};
             const DecodedImageDescriptor dnull = decode_image_descriptor(all_zero);
             const char* why = image_descriptor_reject_reason(dnull);
