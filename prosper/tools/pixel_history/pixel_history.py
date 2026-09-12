@@ -43,6 +43,22 @@ occlusion query that asks "did this event reach this pixel" runs only in the dra
 changed the pixel takes it, one whose values are not recorded produces VALUE_UNKNOWN, and one
 that left the pixel alone is NAMED in the reason but never takes the verdict from the draw.
 
+WHERE THOSE TWO CITATIONS COME FROM, because every RenderDoc line number in this file is a
+claim about SOMEBODY ELSE'S tree and nothing here can check one. They were read from
+github.com/baldurk/renderdoc, branch `v1.x`, fetched 2026-09-12 -- not from a local install:
+RenderDoc is NOT installed on the machine this was written on, and its source is not present
+there either (searched; no qrenderdoc, no renderdoccmd, no replay headers). So the line
+numbers are a SNAPSHOT and will drift as that tree moves; re-read by symbol -- IsDirectWrite,
+ReplayController::PixelHistory's usage switch -- rather than by line, and do not treat a
+mismatch as evidence the claim is wrong.
+
+It is stated this loudly because of what the claim now carries: the graded verdict above rests
+entirely on it, and a citation reads as already-verified, which is exactly how an unchecked
+assertion travels furthest. The one LOCAL instrument that could confirm it empirically is the
+control's F region -- on a machine that has RenderDoc, a copy appearing in the history of a
+probe OUTSIDE the blit rectangle is the observation, and check_control() reports it in both
+directions rather than only on failure.
+
 Run against `pixel_history_control` first on any new driver: `--expect-control` checks
 this tool's own reading against a construction with a known answer.
 
