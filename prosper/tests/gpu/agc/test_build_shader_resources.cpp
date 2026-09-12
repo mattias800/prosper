@@ -492,8 +492,15 @@ int main() {
     }
 
     // #3587 end to end: the reject has to remove the descriptor from the table the recompiler and
-    // the backend consume, not merely name a reason. Paired with a routed-but-DEFINED control on the
-    // same fixture, so a table that bound nothing for an unrelated reason cannot pass as the fix.
+    // the backend consume, not merely name a reason. A "binds nothing" arm is worthless on its own --
+    // it passes just as well when the fixture never bound for an unrelated reason -- so it is paired
+    // with a routed-but-DEFINED control on the SAME descriptor, one field apart.
+    //
+    // The fixture is deliberately the one the BASE_ARRAY block above already proves binds: that arm
+    // is green on every CI platform, so the control here cannot be the thing that is fragile. An
+    // earlier draft used a plain 2D SW_64KB_R_X 256x256 RGBA16F T# instead, which binds on Linux and
+    // on MinGW and did NOT bind on macOS/Rosetta -- leaving the reserved arm beside it passing
+    // vacuously on that platform (#3608). Pick a control with cross-platform evidence behind it.
     {
         AgcShaderSharp sharp[1]; sharp[0].bits = 0;
         AgcShaderUserData ud{};
@@ -505,11 +512,30 @@ int main() {
         // Control: BGRA routing (B,G,R,A) -- non-identity, every selector defined. Must still bind,
         // and must carry the descriptor's routing through to ShaderResource::swizzle unchanged.
         uint32_t sg_bgra[8];
-        make_tsharp(sg_bgra, 0x31465d0000ull, 256, 256, /*RGBA16F*/71, /*SW_64KB_R_X*/27, /*2D*/9);
-        sg_bgra[3] |= 6u | (5u << 3) | (4u << 6) | (7u << 9);
-        const ShaderResource* bgra = build_shader_resources(sh, sg_bgra, 8).by_sgpr_base(0);
-        CHECK(bgra && bgra->swizzle[0] == 6 && bgra->swizzle[1] == 5 &&
-                  bgra->swizzle[2] == 4 && bgra->swizzle[3] == 7,
+        make_tsharp(sg_bgra, 0x31465d0000ull, 256, 256, /*RGBA16F*/71,
+                    /*SW_64KB_R_X*/27, /*2D array*/13, /*layers*/6, /*base array*/1);
+        sg_bgra[3] |= (1u << 12) | (1u << 16);
+        sg_bgra[5] |= 8u << 4;
+        sg_bgra[3] |= 6u | (5u << 3) | (4u << 6) | (7u << 9);   // DST_SEL = B,G,R,A
+        const ShaderResourceTable bgra_table = build_shader_resources(sh, sg_bgra, 8);
+        const ShaderResource* bgra = bgra_table.by_sgpr_base(0);
+        const bool control_bound = bgra && bgra->swizzle[0] == 6 && bgra->swizzle[1] == 5 &&
+                                   bgra->swizzle[2] == 4 && bgra->swizzle[3] == 7;
+        // Self-describing on failure: the arm's whole job is to be attributable, and "it did not
+        // bind" says nothing about which of the texture loop's ten `continue`s took it.
+        if (!control_bound) {
+            const DecodedImageDescriptor dc = decode_image_descriptor(sg_bgra);
+            const char* why = image_descriptor_reject_reason(dc);
+            Gen5ImageFormatInfo cfi{};
+            const bool mapped = gen5_image_format(dc.format, &cfi);
+            printf("  [diag] control: reject=%s fmt-mapped=%d view-supported=%d resources=%zu "
+                   "dst_sel=%u,%u,%u,%u bound=%d\n",
+                   why ? why : "none", (int)mapped,
+                   (int)(mapped && image_base_level_view(dc, cfi).supported),
+                   bgra_table.resources.size(),
+                   dc.dst_sel[0], dc.dst_sel[1], dc.dst_sel[2], dc.dst_sel[3], (int)(bgra != nullptr));
+        }
+        CHECK(control_bound,
               "a BGRA-routed T# binds and carries its DST_SEL into the resource table");
 
         // One field changed: DST_SEL_Z becomes the reserved encoding 2. Without the screen this
@@ -519,8 +545,12 @@ int main() {
         sg_reserved[3] = (sg_reserved[3] & ~(0x7u << 6)) | (2u << 6);
         CHECK(decode_image_descriptor(sg_reserved).dst_sel[2] == 2,
               "the reserved-selector fixture really does decode DST_SEL_Z as 2");
-        CHECK(build_shader_resources(sh, sg_reserved, 8).by_sgpr_base(0) == nullptr,
-              "a T# carrying a reserved DST_SEL binds nothing (visibly dropped, not mis-routed)");
+        // Conjoined with the control ON PURPOSE. `== nullptr` alone is satisfied by a platform where
+        // the descriptor never bound at all, which is exactly how the earlier draft passed vacuously
+        // on macOS; requiring the control in the same predicate makes the arm say "this pair differs
+        // by one reserved selector, and only the reserved one was dropped".
+        CHECK(control_bound && build_shader_resources(sh, sg_reserved, 8).by_sgpr_base(0) == nullptr,
+              "the same T# with one reserved DST_SEL binds nothing while the control does");
     }
 
     // The runtime resource preserves the guest sample count, exposes one host mip, and bounds the
