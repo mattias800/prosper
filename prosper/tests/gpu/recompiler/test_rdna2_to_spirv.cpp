@@ -7725,8 +7725,11 @@ int main() {
     //   0.0*1023 = 0      0.25*1023 = 255.75 -> 256      0.5*1023 = 511.5 -> 512 (even)
     //   1.0*3    = 3
     //   packed = 256<<10 | 512<<20 | 3<<30 = 0xE0040000
-    // 511.5 rounding to 512 rather than 511 is the point of picking 0.5: it is the one value in this
-    // vector that a truncating packer would get wrong, so the arm discriminates rounding mode.
+    // 511.5 rounding to 512 rather than 511 is the point of picking 0.5: a TRUNCATING packer gets it
+    // wrong. Be precise about what that does and does not establish -- it separates round-to-nearest
+    // from truncation, but NOT round-half-even from round-half-away, since both give 512. 0.25*1023 =
+    // 255.75 does the same work. Nothing here pins the tie-break rule; if that ever matters, it needs
+    // a value whose fractional part is exactly .5 with an ODD integer part.
     ShaderResourceTable rt33u;
     { ShaderResource vb{}; vb.cls = ResourceClass::VertexBuffer; vb.format = DataFormat::Unorm2_10_10_10;
       vb.num_components = 4; vb.binding = 3; vb.stride = 4; vb.sgpr_base = 8; rt33u.resources.push_back(vb); }

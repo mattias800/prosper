@@ -6730,6 +6730,15 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     // buffer_store_format_xyzw through a 3-component 10_11_11 must not write a fourth
                     // field, which at k=3 would land back on top of B. Same hazard the MTBUF count
                     // clamp above addresses, one level down.
+                    // `packed_10_11_11` and `packed_2_10_10_10` name a BIT LAYOUT, not a channel
+                    // count. GFX10 names packed formats from the HIGH field down, so 10_11_11 puts
+                    // 11 bits at [10:0] and 10 at [31:22] -- while 11_11_10 and 10_10_10_2, which
+                    // `rdna2_buffer_format` does not decode today, are DIFFERENT layouts with the
+                    // narrow field at the opposite end. prosper's COLOUR-buffer enum canonicalises
+                    // those pairs as aliases; that is a different register enum and must not be
+                    // carried over here. Aliasing them into these predicates would make this store
+                    // pack fields in the wrong order and write a plausible wrong dword -- turning
+                    // today's fail-visible reject into a silent one.
                     const uint32_t packed_word_ncomp = packed_10_11_11 ? 3u : 4u;
                     // A PARTIAL packed-word store stays refused, and this is a deliberate stop rather
                     // than an oversight. Every field shares one dword, so writing a subset is a

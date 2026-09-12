@@ -5170,17 +5170,41 @@ void GpuState::apply(const Pm4Command& c) {
                 // done yet. So read a line here as "this submit can exhibit #3574", and the absence of
                 // lines over a route as "this title never presents the shape", which is the question
                 // worth answering first.
+                // Two populations, deliberately counted apart, because conflating them is how a
+                // hazard census becomes a number nobody can act on.
+                //
+                //   PENDING -- a dispatch has been folded and has not run. Broad: the command
+                //   processor cannot observe a shader's writes at all without a guest-inserted
+                //   synchronisation, so most of these are not hazards.
+                //
+                //   ARMED -- a dispatch is pending AND the guest placed a StallCommandBufferParser
+                //   AFTER it and before this jump. That stall is the guest saying "the parser must
+                //   not run ahead of what I just produced", which is exactly the case where the
+                //   predicate is meant to be read after the dispatch. The executor already treats the
+                //   same packet as a producer-epoch boundary.
+                //
+                // Only ARMED is a claim about a likely wrong answer. Quoting PENDING as the hazard
+                // count overstates it; an earlier revision of this instrument did exactly that.
                 if (!dispatches.empty()) {
-                    static std::atomic<uint64_t> pred_compute_races{0};
-                    const uint64_t ord = pred_compute_races.fetch_add(1) + 1;
-                    if (ord <= 24 || (ord & (ord - 1)) == 0)
+                    const uint64_t last_dispatch_order = dispatches.back().command_order;
+                    bool armed = false;
+                    for (const auto& stall : parser_stalls)
+                        if (stall.command_order > last_dispatch_order) { armed = true; break; }
+                    static std::atomic<uint64_t> pred_pending{0}, pred_armed{0};
+                    const uint64_t ord = pred_pending.fetch_add(1) + 1;
+                    const uint64_t armed_ord = armed ? pred_armed.fetch_add(1) + 1 : 0;
+                    const bool say = armed ? (armed_ord <= 24 || (armed_ord & (armed_ord - 1)) == 0)
+                                           : (ord <= 8 || (ord & (ord - 1)) == 0);
+                    if (say)
                         fprintf(stderr,
-                                "[agc] predicated jump #%llu reads cond=0x%llx at FOLD time with %zu "
-                                "compute dispatch(es) pending in this submit -- a same-submit compute "
-                                "producer is invisible to the staleness guard (#3574); "
-                                "target=0x%llx order=%llu\n",
-                                (unsigned long long)ord, (unsigned long long)pred_cond_addr,
-                                dispatches.size(), (unsigned long long)c.jump_addr,
+                                "[agc] predicated jump reads cond=0x%llx at FOLD time -- %s "
+                                "(pending=%zu armed=%llu of pending#%llu) target=0x%llx order=%llu "
+                                "(#3574)\n",
+                                (unsigned long long)pred_cond_addr,
+                                armed ? "ARMED: a parser stall follows the last dispatch"
+                                      : "pending compute only, no stall after it",
+                                dispatches.size(), (unsigned long long)pred_armed.load(),
+                                (unsigned long long)ord, (unsigned long long)c.jump_addr,
                                 (unsigned long long)command_order);
                 }
                 memcpy(&cond, (const void*)(uintptr_t)pred_cond_addr, sizeof cond);
@@ -5207,6 +5231,22 @@ void GpuState::apply(const Pm4Command& c) {
                             (unsigned long long)skipped.load());
             }
             if (skip) break;
+            // The same staleness applies to the jump's TARGET, and with a larger blast radius: the
+            // segment below is read out of guest memory at fold time, so a command stream a
+            // same-submit dispatch generated is read before that dispatch has run. The retained-DMA /
+            // ordered-effect guard above already tests BOTH the target and the predicate; the compute
+            // hole affects both too. Instrumenting only the predicate understated this axis.
+            if (!dispatches.empty()) {
+                static std::atomic<uint64_t> target_pending{0};
+                const uint64_t ord = target_pending.fetch_add(1) + 1;
+                if (ord <= 8 || (ord & (ord - 1)) == 0)
+                    fprintf(stderr,
+                            "[agc] jump TARGET segment read at FOLD time with %zu compute "
+                            "dispatch(es) pending #%llu target=0x%llx dwords=%u order=%llu (#3574)\n",
+                            dispatches.size(), (unsigned long long)ord,
+                            (unsigned long long)c.jump_addr, c.jump_dwords,
+                            (unsigned long long)command_order);
+            }
             if (!guest_readable(c.jump_addr, c.jump_dwords * 4)) break;   // whole segment must be mapped
             jump_depth++;
             run_command_buffer((const uint32_t*)(uintptr_t)c.jump_addr, c.jump_dwords, *this);

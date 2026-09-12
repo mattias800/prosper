@@ -5085,8 +5085,17 @@ bool emit_cfg_state_machine(
                 // this dispatcher. Two lowerings of one instruction is the sharpest evidence that one
                 // of them is wrong, independent of any argument about which; they now agree.
                 //
-                // The VERTEX stage deliberately still takes the lane bit, and this is a known gap
-                // rather than an oversight. None of the three existing wave reductions can serve it:
+                // The VERTEX stage deliberately still takes the lane bit. The REASON is that an
+                // ordinary VS has no proven lane identity: `rdna2_alu_support.hpp`'s
+                // `inline_int_mask_bit` refuses the vertex case outright with exactly that argument,
+                // and `recompile_vertex`'s own contract says the portable vertex shell represents ONE
+                // live guest lane. Without a set of host invocations that IS the guest wave, a vertex
+                // `any()` would answer a well-formed question about the wrong group -- so adding a
+                // marker and a backend gate would not fix it, it would only make the wrong answer
+                // exact-width. That is the blocker, not the absence of a helper.
+                //
+                // The helper survey below is secondary, and is recorded only so nobody spends time
+                // re-checking it: none of the three existing reductions can serve the stage either.
                 // `guest_wave_any` declares SC_Workgroup scratch, indexes linear_localid and executes
                 // two workgroup barriers (compute-only); `native_wave_any` is gated on
                 // `native_subgroup_size`, which is set ONLY by rdna2_recompile_compute.cpp and is
@@ -5096,6 +5105,42 @@ bool emit_cfg_state_machine(
                 // enforcement, and widening admission that way wants the wave-any census (#3464)
                 // first -- an exact-width requirement that cannot be met makes the backend SKIP the
                 // draw, so the cost is dropped geometry rather than a compile error.
+                // NO WAVE-UNIFORMITY ESCAPE HERE, and that is a property of this route rather
+                // than an omission. The three structured-route sites skip the vote when the guest's
+                // VCC is provably identical in every lane -- `any(P)` is `P` when P does not vary, so
+                // the reduction is pure cost, and the cost is real because `fragment_wave_any` pins
+                // `fragment_required_subgroup_size` and a device that cannot honour an exact 64-lane
+                // subgroup SKIPS THE DRAW.
+                //
+                // That escape cannot transfer. It requires BOTH halves of prosper's proof: the static
+                // scan (`vcc_exit_is_wave_uniform`) AND `emit_alu`'s live marker
+                // `rs.vcc == rs.vcc_wave_uniform`. The marker is only set when the producing compare
+                // ran with `!rs.exec_narrowed` (`rdna2_emit_alu.cpp`, `compare_wave_uniform`) -- and
+                // `load_state` stamps `exec_narrowed = true` on EVERY dispatch case entry, because a
+                // state-machine join may arrive on a narrowed EXEC edge. So inside a dispatcher case
+                // the marker is always 0 and the escape can never fire.
+                //
+                // The marker's condition is correct, not over-strict: under a narrowed EXEC the
+                // compare writes VCC bits only for active lanes, so the inactive lanes keep stale
+                // bits and VCC as a whole is NOT uniform even when the compare's inputs are. Using
+                // the static half alone would therefore be unsound, not merely optimistic.
+                //
+                // Measured before this comment was written: with the escape implemented here, a
+                // fragment CFG whose `v_cmp_eq_u32_e64 vcc, s0, s1` is wave-uniform by construction
+                // still reports `vcc_wave_uniform = 0` and `exec_narrowed = 1` at the terminator, so
+                // the added predicate never changed a single lowering. Do not re-add it without
+                // first changing what `load_state` can prove about EXEC.
+                // The premise this vote rests on, stated so it can be falsified rather than
+                // rediscovered: `OpGroupNonUniformAny` reduces over the invocations DYNAMICALLY
+                // ACTIVE at the instruction, which here are the ones whose `pc_var` selected this
+                // dispatch case -- not the guest wave, unless the dispatcher is in lockstep. This
+                // change increases lockstep rather than reducing it (the branch condition becomes
+                // wave-uniform, so invocations compute the same next PC together), and ended lanes
+                // sit in `fallback` contributing nothing, which equals contributing 0 to an `any()`.
+                // The compute arm below has had the identical shape since before this change. The
+                // portable-compute path does NOT rely on lockstep -- it defers through
+                // `vote_pending_var` and reduces from LDS -- which is the model to copy if this
+                // premise ever fails.
                 const uint32_t voted =
                     b.is_fragment ? b.fragment_wave_any(lane_condition) : 0;
                 const uint32_t condition_source = voted ? voted : lane_condition;
