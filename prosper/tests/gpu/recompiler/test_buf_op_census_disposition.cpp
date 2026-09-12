@@ -107,8 +107,12 @@ int main() {
             load_xyzw, std::size(load_xyzw), &rt, "buf_op_census_unknown.log");
         CHECK(has(log, "reject-unknown-format"),
               "#3579: an undecodable buffer FORMAT names itself (was: resolved)");
-        CHECK(!has(log, " descriptor-resolved"),
-              "#3579: ...and does not also print the optimistic word");
+        // The DISCRIMINATING half. `how` is the last field on the line, so " resolved\n" is exactly
+        // what this op used to print -- a bare success word for a refused instruction. Asserting the
+        // absence of the reject string alone would pass against the unfixed emitter too, since the
+        // word `descriptor-resolved` simply did not exist there.
+        CHECK(!has(log, " resolved\n"),
+              "#3579: ...and no longer reports the refusal with a bare success word");
     }
 
     // --- Arm 2: a format with a size but no conversion (USCALED is a dead enumerator) ------------

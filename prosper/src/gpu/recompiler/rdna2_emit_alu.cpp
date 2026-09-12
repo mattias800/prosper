@@ -6096,6 +6096,12 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     // the same combined 7-bit BUF_FMT table as Gen5 V# descriptors.
                     rdna2_buffer_format(in.mtbuf_format, &fmt, &fmt_ncomp);
                     if (fmt == DataFormat::Unknown || fmt_ncomp == 0) {
+                        // Named separately from the MUBUF `reject-unknown-format` beside it: the two
+                        // read the format from different places -- this one from the INSTRUCTION's
+                        // 7-bit BUF_FMT, that one from the resolved descriptor -- so a census that
+                        // merged them could not say which source was undecodable. Reached by every
+                        // USCALED/SSCALED code, none of which `rdna2_buffer_format` has a case for.
+                        buf_op.how = "reject-mtbuf-unknown-format";
                         ok = false; return true;
                     }
                 } else {

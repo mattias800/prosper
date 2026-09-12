@@ -2033,6 +2033,7 @@ if(TARGET prosper_core)
   target_link_libraries(test_vertex_fetch_reject_diagnostic PRIVATE prosper_core)
   add_test(NAME vertex_fetch_reject_diagnostic COMMAND test_vertex_fetch_reject_diagnostic)
 
+  # #3579: a refused buffer instruction must not print the same census word as an emitted one.
   add_executable(test_buf_op_census_disposition
                  tests/gpu/recompiler/test_buf_op_census_disposition.cpp)
   target_link_libraries(test_buf_op_census_disposition PRIVATE prosper_core)
