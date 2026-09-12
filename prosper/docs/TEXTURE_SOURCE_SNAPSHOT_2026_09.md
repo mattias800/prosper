@@ -112,12 +112,12 @@ periods for GTA; 10.81%/10.50% for Sonic). Those stacks contain many call sites 
 snapshot copy. Average coarse GPU utilization is 11.5%/14.5% for GTA and 21.0%/17.5% for Sonic during
 those earlier 20-second windows (`radeontop -t10`); these are not F8 device-time measurements.
 
-Every process exited 0 after completed F8/F9 output and with no observed foreign workload. Both Sonic
+Every process exited 0 after completed F8/F9 output and with no observed foreign workload. All four
 runs logged one graphics submit=-4 **after** the frontend's shutdown message, consistent with the
 existing submit gate's intentional shutdown refusal; it is not a new measured gameplay failure.
-The two logs do not independently identify whether the gate or driver supplied that return code.
+The logs do not independently identify whether the gate or driver supplied that return code.
 
-Main audio-output demand counters did not advance in any F8 window. Sonic on records two additional
+Main audio-output shortfall counters did not advance in any F8 window. Sonic on records two additional
 shortfall callbacks around 333.37 seconds, after the scheduled F9 trigger; GTA's auxiliary output
 remains a separate observed population. These are application demand shortages, not physical device
 XRUN measurements, and no audio improvement is claimed.
