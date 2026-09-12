@@ -7,6 +7,10 @@
 #include <cstdio>
 #include <cstring>
 #include <vector>
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#endif
 
 using namespace prosper::gpu;
 static int failures = 0;
@@ -18,6 +22,9 @@ static void emit(const std::vector<uint8_t>& bytes) {
 
 int main(int argc, char** argv) {
     emit_enabled = !(argc > 1 && std::strcmp(argv[1], "--check") == 0);
+#ifdef _WIN32
+    if (emit_enabled) _setmode(_fileno(stdout), _O_BINARY);
+#endif
     const bool bench = argc > 1 && std::strcmp(argv[1], "--bench") == 0;
     const bool corrupt = argc > 1 && std::strcmp(argv[1], "--corrupt-oracle") == 0;
     if (bench) {
