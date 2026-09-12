@@ -2044,6 +2044,22 @@ if(TARGET prosper_core)
   target_link_libraries(test_vertex_fetch_reject_diagnostic PRIVATE prosper_core)
   add_test(NAME vertex_fetch_reject_diagnostic COMMAND test_vertex_fetch_reject_diagnostic)
 
+  # #3573: the CFG dispatcher must lower a fragment exec/vcc branch as a wave vote.
+  add_executable(test_dispatcher_wave_vote tests/gpu/recompiler/test_dispatcher_wave_vote.cpp)
+  target_link_libraries(test_dispatcher_wave_vote PRIVATE prosper_core)
+  add_test(NAME dispatcher_wave_vote COMMAND test_dispatcher_wave_vote)
+
+  # #3577: a null image descriptor must carry the shape the shader declares.
+  add_executable(test_null_image_shape tests/gpu/execute/test_null_image_shape.cpp)
+  target_link_libraries(test_null_image_shape PRIVATE prosper_core)
+  add_test(NAME null_image_shape COMMAND test_null_image_shape)
+
+  # #3579: a refused buffer instruction must not print the same census word as an emitted one.
+  add_executable(test_buf_op_census_disposition
+                 tests/gpu/recompiler/test_buf_op_census_disposition.cpp)
+  target_link_libraries(test_buf_op_census_disposition PRIVATE prosper_core)
+  add_test(NAME buf_op_census_disposition COMMAND test_buf_op_census_disposition)
+
   # #3479: a recompiled guest module must declare SignedZeroInfNanPreserve, or a driver is free to
   # compile it under no-Inf/no-NaN assumptions and silently answer a guest sign() idiom with 0 --
   # and must NOT declare it on a device that cannot execute it, which is invalid rather than merely

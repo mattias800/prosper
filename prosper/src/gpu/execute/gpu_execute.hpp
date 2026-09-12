@@ -295,6 +295,13 @@ struct SrtUse {
     // an image atomic such as IMAGE_ATOMIC_SWAP 0x0f), not a sampled texture. Only meaningful for
     // kind 0.
     bool is_storage_image = false;
+    // SQ_RSRC dim of the CONSUMING MIMG instruction (#3577). This is the authority for the image
+    // SHAPE the recompiled SPIR-V will declare -- `rdna2_emit_alu.cpp` switches `OpTypeImage`'s Dim,
+    // Arrayed and MS straight off `in.mimg_dim`, and never consults the descriptor for it. So a null
+    // T# gets its dimension from here rather than from the (all-zero) descriptor words, and
+    // `ShaderResource::img_dim` uses this same encoding (`image_type_to_dim` is `type - 8`).
+    // 0xFFFFFFFF = not a MIMG use.
+    uint32_t mimg_dim = 0xFFFFFFFFu;
     // IMAGE_LOAD_MIP / IMAGE_STORE_MIP have one more address operand than their base-level
     // siblings. The current Vulkan compute backend materializes one mip only, so the fold may
     // specialize that operand away only after proving its exact VGPR was written in the same basic

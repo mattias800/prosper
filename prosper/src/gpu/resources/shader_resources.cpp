@@ -1480,6 +1480,53 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
                 report.issues.push_back({DescriptorIssueCode::InvalidImageMetadata, false, d.set,
                                          d.binding, d.kind, actual});
         }
+        // #3577: a NULL image descriptor is exempt from the extent/format/size checks above -- it
+        // legitimately has none -- but it is NOT exempt from having the right SHAPE. Dimension is not
+        // metadata about the resource; it is a property of the shader's own declaration, and binding a
+        // VK_IMAGE_VIEW_TYPE_2D dummy to an `OpTypeImage ... Dim=3D` is undefined behaviour whether or
+        // not the resource behind it is null. The `## Ruled out` row for #2422 is the reason to care
+        // rather than shrug: RADV happened to return the expected pixel under exactly such an
+        // undefined contract, so "it works here" is not evidence.
+        //
+        // Only the 2D-vs-3D axis is checked. A guest DIM=5 may deliberately compile either as the
+        // historical base-slice 2D fallback or as a real 2D-array image (see SpirvDescriptorUse's
+        // image_dim comment), so equality across the whole encoding would false-positive on shapes
+        // that are correct by design. 3D and 2D view types are never interchangeable.
+        //
+        // Reported, not fatal. The synthesis site now sets the null descriptor's shape from the
+        // consuming MIMG, so this should not fire; it is here so a regression is VISIBLE rather than
+        // silent, and it stays non-fatal until someone has measured how often other paths can produce
+        // a null whose shape the shader disagrees with. Turning a silent mismatch into a dropped draw
+        // is a tightening that wants a corpus census first.
+        // Deliberately NOT restricted to null descriptors. The mismatch class is wider than the
+        // null path: the 3D sampled lowering declares `Dim_3D` from the CONSUMING INSTRUCTION's dim
+        // field and never consults `img_dim`, while the graphics backend picks the view type FROM
+        // `img_dim` -- so any T# whose TYPE says 2D, consumed by a `dim:3D` MIMG, produces the same
+        // undefined pairing a null did, with nothing reporting it. Guest-authored state we do not
+        // control can present that, so it is reachable. Reported, never fatal, so the census this
+        // collects covers the whole corpus rather than only the synthesized nulls.
+        if (d.image_dim != UINT32_MAX &&
+            (d.kind == SpirvDescriptorKind::CombinedImageSampler ||
+             d.kind == SpirvDescriptorKind::StorageImage)) {
+            const bool declares_3d = d.image_dim == 2u;   // SPIR-V Dim_3D
+            const bool resource_3d = r.img_dim == 2u;     // SQ_RSRC dim 2 -> the backend builds a 3D view
+            if (declares_3d != resource_3d)
+                report.issues.push_back({DescriptorIssueCode::InvalidImageMetadata, false, d.set,
+                                         d.binding, d.kind, actual});
+            // A 3D resource needs a non-zero DEPTH even when it is null. This is not the extent check
+            // the null exemption covers: the backend builds a real VK_IMAGE_TYPE_3D whose
+            // `extent.depth` comes straight from this field, and a zero there fails `vkCreateImage`,
+            // after which the draw is silently skipped by the create-failure guard.
+            //
+            // What this does NOT guard is the null-synthesis site's `rn.depth = 1`, which merely
+            // restates the struct default and is a no-op. No production path currently reaches this
+            // term at all -- it exists for OTHER producers of a zero-depth 3D resource (a decoded
+            // descriptor, a future change to that default), and it is deliberately cheap enough to
+            // keep on that basis. Do not describe it as covering the synthesis line.
+            else if (resource_3d && r.depth == 0u)
+                report.issues.push_back({DescriptorIssueCode::InvalidImageMetadata, false, d.set,
+                                         d.binding, d.kind, actual});
+        }
     }
 
     if (report_unused && runtime) {

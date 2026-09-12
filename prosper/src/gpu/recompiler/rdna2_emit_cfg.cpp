@@ -5070,9 +5070,90 @@ bool emit_cfg_state_machine(
             } else if (graphics) {
                 const uint32_t lane_condition =
                     terminator->opcode <= 0x07 ? state.vcc : state.exec;
+                // #3573. s_cbranch_execz/execnz/vccz/vccnz are SCALAR branches: the condition is
+                // "is the whole wave's 64-bit mask zero", not "is this lane's bit set". Taking the
+                // lane bit is observably wrong as soon as the guarded block writes emulated scalar
+                // state read past the merge -- on hardware every lane of the wave sees that write,
+                // here only the entering invocations do. That mechanism is not speculative: it is
+                // recorded in RECOMPILER_REMAINING.md's Ruled out section as DOLL's FXAA (#273),
+                // where a guard-only predicate was falsified, and the wave64 relaxation has been
+                // attempted and rejected four times.
+                //
+                // The FRAGMENT stage takes the vote here, because until now the SAME fragment shader
+                // was lowered two different ways depending on which route its CFG took -- a wave vote
+                // when `detect_forward_ifs` structured it, a lane-local bit when it fell through to
+                // this dispatcher. Two lowerings of one instruction is the sharpest evidence that one
+                // of them is wrong, independent of any argument about which; they now agree.
+                //
+                // The VERTEX stage deliberately still takes the lane bit. The REASON is that an
+                // ordinary VS has no proven lane identity: `rdna2_alu_support.hpp`'s
+                // `inline_int_mask_bit` refuses the vertex case outright with exactly that argument,
+                // and `recompile_vertex`'s own contract says the portable vertex shell represents ONE
+                // live guest lane. Without a set of host invocations that IS the guest wave, a vertex
+                // `any()` would answer a well-formed question about the wrong group -- so adding a
+                // marker and a backend gate would not fix it, it would only make the wrong answer
+                // exact-width. That is the blocker, not the absence of a helper.
+                //
+                // The helper survey below is secondary, and is recorded only so nobody spends time
+                // re-checking it: none of the three existing reductions can serve the stage either.
+                // `guest_wave_any` declares SC_Workgroup scratch, indexes linear_localid and executes
+                // two workgroup barriers (compute-only); `native_wave_any` is gated on
+                // `native_subgroup_size`, which is set ONLY by rdna2_recompile_compute.cpp and is
+                // zero for every graphics stage; and `fragment_wave_any` pins
+                // `fragment_required_subgroup_size`, which is a fragment-stage backend contract.
+                // A vertex vote needs its own required-subgroup-size declaration plus backend
+                // enforcement, and widening admission that way wants the wave-any census (#3464)
+                // first -- an exact-width requirement that cannot be met makes the backend SKIP the
+                // draw, so the cost is dropped geometry rather than a compile error.
+                // Skip the vote when the guest's VCC is PROVABLY identical in every lane: `any(P)`
+                // is `P` when P does not vary, so the reduction is pure cost -- and the cost is real,
+                // because `fragment_wave_any` pins `fragment_required_subgroup_size` and a device that
+                // cannot honour an exact 64-lane subgroup SKIPS THE DRAW. The three structured-route
+                // sites apply the same escape; without it here the two routes would agree on WHETHER
+                // to vote and disagree on when it can be skipped.
+                //
+                // WHY THE LIVE MARKER IS REQUIRED, and not just the static scan. RDNA2 ISA 3.9 defines
+                // a compare as `VCC[n] = EXEC[n] & (test passed for thread n)` -- prosper implements
+                // exactly that (`rdna2_emit_alu.cpp`, the `masked` term). So under a NARROWED EXEC the
+                // result is `P ? EXEC : 0`: it takes EXEC's shape, and is therefore NOT wave-uniform
+                // even when P is. Inactive lanes are forced to 0 rather than keeping stale bits --
+                // the distinction matters because the stale-bit story would make this a data hazard,
+                // whereas the real reason is simply that a narrowed EXEC is itself the non-uniformity.
+                // Either way the static half alone would be unsound, which is why both are required.
+                //
+                // `emit_alu` sets the marker only for a compare that ran with EXEC not narrowed, so
+                // the escape fires inside a dispatch case exactly when the guest has RESTORED EXEC
+                // first -- `s_mov_b64 exec, -1`, the ordinary restore after a divergent region, which
+                // clears `exec_narrowed`. `load_state` stamps `exec_narrowed = true` at case ENTRY
+                // (a state-machine join may arrive on a narrowed edge), so a case that never restores
+                // EXEC keeps voting. That is the conservative direction and it is the common one; the
+                // escape is an optimisation for the restored case, not the default.
+                //
+                // `state.vcc != 0` is an extra term the structured sites do not carry, and it is
+                // load-bearing HERE: `load_state` does not restore `vcc_wave_uniform`, so both sides
+                // would read 0 for a case that never emitted its own compare -- and `0 == 0` would
+                // silently skip the vote on a VCC this block knows nothing about. Requiring a live
+                // VCC makes that miss fail CLOSED.
+                const bool vcc_branch = terminator->opcode <= 0x07;
+                const bool wave_uniform_vcc =
+                    vcc_branch && state.vcc != 0 &&
+                    state.vcc == state.vcc_wave_uniform &&
+                    vcc_exit_is_wave_uniform(ins, terminator->pc);
+                // The premise the vote rests on, stated so it can be falsified rather than
+                // rediscovered: `OpGroupNonUniformAny` reduces over the invocations DYNAMICALLY ACTIVE
+                // at the instruction -- here, the ones whose `pc_var` selected this dispatch case --
+                // which equals the guest wave only while the dispatcher stays in lockstep. This change
+                // increases lockstep rather than reducing it, and ended lanes sit in `fallback`
+                // contributing nothing, which equals contributing 0 to an `any()`. The compute arm
+                // below has had the identical shape since before this change; the portable-compute
+                // path, which does NOT assume lockstep, defers through `vote_pending_var` and reduces
+                // from LDS, and is the model to copy if this premise ever fails.
+                const uint32_t voted = (b.is_fragment && !wave_uniform_vcc)
+                    ? b.fragment_wave_any(lane_condition) : 0;
+                const uint32_t condition_source = voted ? voted : lane_condition;
                 const uint32_t branch_condition =
                     terminator->opcode == 0x06 || terminator->opcode == 0x08
-                        ? b.logical_not(lane_condition) : lane_condition;
+                        ? b.logical_not(condition_source) : condition_source;
                 route(branch_condition);
             } else if (b.native_subgroup_size) {
                 const uint32_t wave_any = b.native_wave_any(

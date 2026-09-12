@@ -75,3 +75,11 @@ Two standing cautions, both learned expensively:
 - **A count is only as good as its population.** Know whether a diagnostic fires per dispatch, once
   per program, or only on some sub-population — several published figures were off by two orders of
   magnitude because the answer was assumed rather than read.
+
+`vk_object_names.hpp` is the odd one out here and worth a line: it is not a census or a trace but a
+naming shim, giving guest shader modules a `vkSetDebugUtilsObjectNameEXT` name so an external tool —
+RenderDoc, RGP, the validation layer — identifies them by something a reader recognises instead of a
+per-run handle. It lives in this folder because its audience is the same (somebody diagnosing a frame),
+and it obeys the same two cautions: it resolves its entry point once, no-ops when the extension is
+absent, and never propagates a failure, because a run that died for want of a debug name would be a
+worse instrument than no names at all.

@@ -496,6 +496,20 @@ int main(int argc, char** argv) {
       ShaderResourceTable rt; ShaderResource vb{}; vb.cls=ResourceClass::VertexBuffer; vb.format=DataFormat::Float32;
       vb.num_components=1; vb.binding=3; vb.stride=4; vb.sgpr_base=8; rt.resources.push_back(vb);
       dump(dir, "compute_store", recompile_valu(c, sizeof(c)/4, 1, 0, &rt)); }
+    // Compute MUBUF PACKED-WORD store (#3575). The module above stores a raw dword and therefore
+    // exercises none of this: pack_ufloat alone emits a nest of OpSelect over exponent/mantissa
+    // extraction and a round-to-even shift, which is exactly the shape strict validation catches and
+    // llvmpipe accepts. Two arms, because the float and the normalized halves reach different
+    // converters (pack_ufloat vs pack_norm) and only the format differs between them.
+    { const uint32_t c[] = {0x7e140f00u, 0x7e020280u, 0x7e0402ffu, 0x3e800000u, 0x7e0602f0u,
+                            0x7e0802f2u, 0xe01c2000u, 0x8002010au, 0xbf810000u};
+      ShaderResourceTable rt; ShaderResource vb{}; vb.cls=ResourceClass::VertexBuffer;
+      vb.format=DataFormat::Float10_11_11; vb.num_components=3; vb.binding=3; vb.stride=4;
+      vb.sgpr_base=8; rt.resources.push_back(vb);
+      dump(dir, "compute_store_packed_10_11_11", recompile_valu(c, sizeof(c)/4, 1, 0, &rt));
+      ShaderResourceTable rtn; ShaderResource vn = vb; vn.format=DataFormat::Unorm2_10_10_10;
+      vn.num_components=4; rtn.resources.push_back(vn);
+      dump(dir, "compute_store_packed_2_10_10_10", recompile_valu(c, sizeof(c)/4, 1, 0, &rtn)); }
     // GTA V's cross-workgroup scan publication shape: distinct descriptor variables alias one guest
     // allocation, a GLC store is released by vscnt(0), and a GLC+DLC load polls through the alias.
     // This representative module strictly validates Aliased/Coherent decorations, per-access

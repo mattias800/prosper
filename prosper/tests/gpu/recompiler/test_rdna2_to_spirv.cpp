@@ -7691,6 +7691,76 @@ int main() {
     printf("  kernel33 mismatches=%u (buf[0]=0x%08x expect~0xff804000)\n", bad33, st33_out.size()==N?st33_out[0]:0);
     CHECK(st33_out.size() == N && bad33 == 0, "recompiled kernel 33 (unorm8x4 store packs to (0,64,128,255)) correct");
 
+    // Kernel 33f (#3575): the SAME store instruction through a 10_11_11 descriptor. Until this
+    // landed, a packed-word typed store rejected the whole shader, so every draw or dispatch using
+    // it was dropped.
+    //
+    // The expected word is derived from the FORMAT DEFINITION, by hand, not from prosper's own
+    // packer -- otherwise this asserts only that the emitter agrees with itself. 10_11_11 puts R/G/B
+    // at bits 0/11/22 with widths 11/11/10, each a float with 5 exponent bits and bias 15:
+    //   R = 0.0                                     -> 0
+    //   G = 0.25 = 2^-2 -> exp 13, mantissa 0, 6 mantissa bits -> 13<<6  = 832   (<<11)
+    //   B = 0.5  = 2^-1 -> exp 14, mantissa 0, 5 mantissa bits -> 14<<5  = 448   (<<22)
+    //   packed = 832<<11 | 448<<22 = 0x701A0000
+    ShaderResourceTable rt33f;
+    { ShaderResource vb{}; vb.cls = ResourceClass::VertexBuffer; vb.format = DataFormat::Float10_11_11;
+      vb.num_components = 3; vb.binding = 3; vb.stride = 4; vb.sgpr_base = 8; rt33f.resources.push_back(vb); }
+    std::vector<uint32_t> spv33f = recompile_valu(code33, sizeof(code33)/sizeof(code33[0]), 1, 0, &rt33f);
+    CHECK(!spv33f.empty(), "#3575: buffer_store_format_xyzw through a 10_11_11 V# recompiles (was: rejected)");
+    if (!spv33f.empty()) {
+        std::vector<float> in33f(N); for (uint32_t i = 0; i < N; i++) in33f[i] = (float)i;
+        std::vector<uint32_t> st33f(N, 0), st33f_out;
+        prosper::test::run_compute(spv33f, in33f, N, N, /*cbuf0*/{}, /*cbuf1*/st33f, &st33f_out);
+        uint32_t bad33f = 0;
+        for (uint32_t i = 0; i < N && st33f_out.size() == N; i++)
+            if (st33f_out[i] != 0x701A0000u) bad33f++;
+        printf("  kernel33f mismatches=%u (buf[0]=0x%08x expect 0x701a0000)\n",
+               bad33f, st33f_out.size()==N ? st33f_out[0] : 0);
+        CHECK(st33f_out.size() == N && bad33f == 0,
+              "#3575: 10_11_11 store packs (0,0.25,0.5) to 0x701A0000 on the GPU");
+    }
+
+    // Kernel 33u (#3575): 2_10_10_10 UNORM through the same instruction. R/G/B/A at bits
+    // 0/10/20/30, widths 10/10/10/2, norms 1023 and 3, round-half-to-even:
+    //   0.0*1023 = 0      0.25*1023 = 255.75 -> 256      0.5*1023 = 511.5 -> 512 (even)
+    //   1.0*3    = 3
+    //   packed = 256<<10 | 512<<20 | 3<<30 = 0xE0040000
+    // 511.5 rounding to 512 rather than 511 is the point of picking 0.5: a TRUNCATING packer gets it
+    // wrong. Be precise about what that does and does not establish -- it separates round-to-nearest
+    // from truncation, but NOT round-half-even from round-half-away, since both give 512. 0.25*1023 =
+    // 255.75 does the same work. Nothing here pins the tie-break rule; if that ever matters, it needs
+    // a value whose fractional part is exactly .5 with an ODD integer part.
+    ShaderResourceTable rt33u;
+    { ShaderResource vb{}; vb.cls = ResourceClass::VertexBuffer; vb.format = DataFormat::Unorm2_10_10_10;
+      vb.num_components = 4; vb.binding = 3; vb.stride = 4; vb.sgpr_base = 8; rt33u.resources.push_back(vb); }
+    std::vector<uint32_t> spv33u = recompile_valu(code33, sizeof(code33)/sizeof(code33[0]), 1, 0, &rt33u);
+    CHECK(!spv33u.empty(), "#3575: buffer_store_format_xyzw through a 2_10_10_10 UNORM V# recompiles");
+    if (!spv33u.empty()) {
+        std::vector<float> in33u(N); for (uint32_t i = 0; i < N; i++) in33u[i] = (float)i;
+        std::vector<uint32_t> st33u(N, 0), st33u_out;
+        prosper::test::run_compute(spv33u, in33u, N, N, /*cbuf0*/{}, /*cbuf1*/st33u, &st33u_out);
+        uint32_t bad33u = 0;
+        for (uint32_t i = 0; i < N && st33u_out.size() == N; i++)
+            if (st33u_out[i] != 0xE0040000u) bad33u++;
+        printf("  kernel33u mismatches=%u (buf[0]=0x%08x expect 0xe0040000)\n",
+               bad33u, st33u_out.size()==N ? st33u_out[0] : 0);
+        CHECK(st33u_out.size() == N && bad33u == 0,
+              "#3575: 2_10_10_10 UNORM store packs (0,0.25,0.5,1.0) to 0xE0040000 on the GPU");
+    }
+
+    // Kernel 33p (#3575): a PARTIAL packed-word store must still fail visibly. buffer_store_format_xy
+    // writes two of the three 10_11_11 fields, and all three share one dword -- so whether the
+    // hardware preserves the untouched field or zeroes the whole word is a read-modify-write question
+    // the ISA document does not settle. Emitting the obvious thing would zero a neighbouring channel
+    // silently. This arm is what stops the implementation above from quietly widening to a shape it
+    // has no evidence for.
+    const uint32_t code33p[] = {
+        0x7e140f00u, 0x7e020280u, 0x7e0402ffu, 0x3e800000u, 0x7e0602f0u, 0x7e0802f2u,
+        0xe0142000u, 0x8002010au, 0xbf810000u,
+    };
+    CHECK(recompile_valu(code33p, sizeof(code33p)/sizeof(code33p[0]), 1, 0, &rt33f).empty(),
+          "#3575: a PARTIAL packed-word store (xy through 10_11_11) still fails visibly");
+
     // Kernel 33sel (#2869): the same store through a ROUTED V#. RDNA2 ISA Table 31 does give
     // BUFFER_STORE_FORMAT_* a "DST SEL = resource", so this is a gap rather than a settled contract
     // -- the document does not state which VDATA channel supplies each stored component, nor what a

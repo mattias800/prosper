@@ -16,6 +16,7 @@
 #include "gpu/execute/float_controls_probe.hpp" // #3479: the device gate on SignedZeroInfNanPreserve
 #include "gpu/diagnostics/diagnostic_selectors.hpp"
 #include "gpu/diagnostics/geometry_probe_arming.hpp"
+#include "gpu/diagnostics/vk_object_names.hpp"   // #3578: name guest shaders for RenderDoc/RGP
 #include "diagnostics/env_cache.hpp"       // PROSPER_ENV_ON / _VALUE: cached reads on per-draw paths
 #include "diagnostics/env_numeric.hpp"     // #3267: a typo must not silently re-size a cache
 #include "gpu/state/render_state.hpp"
@@ -1281,6 +1282,21 @@ inline const RenderVkCtx& render_vk_ctx() {
                 ici.ppEnabledExtensionNames = inst_exts.data();
             }
         }
+        // VK_EXT_debug_utils, requested UNCONDITIONALLY (#3578) rather than only when validation is
+        // on. Object naming rides on this extension, and the run people actually capture in RenderDoc
+        // or RGP is an ORDINARY run with no validation layer -- so requesting it inside the validation
+        // branch, as this did, would have left every name silently doing nothing in exactly the case
+        // the names exist for. It is an instance extension with no runtime cost when nothing is
+        // listening, and "add-if-available" keeps the #1270 contract above: an unadvertised push fails
+        // the whole vkCreateInstance and would take the WSI extensions down with it.
+        bool have_debug_utils_ext = false;
+        for (const auto& e : avail)
+            if (!strcmp(e.extensionName, "VK_EXT_debug_utils")) have_debug_utils_ext = true;
+        if (have_debug_utils_ext) {
+            inst_exts.push_back("VK_EXT_debug_utils");
+            ici.enabledExtensionCount = (uint32_t)inst_exts.size();
+            ici.ppEnabledExtensionNames = inst_exts.data();
+        }
         // PROSPER_VK_VALIDATION=1: enable the Khronos validation layer and register a messenger.
         //
         // This does NOT make validation newly possible -- `tools/vkval/vk_validation_scan.py`
@@ -1318,14 +1334,9 @@ inline const RenderVkCtx& render_vk_ctx() {
                 inst_layers.push_back(kValidationLayer);
                 ici.enabledLayerCount = (uint32_t)inst_layers.size();
                 ici.ppEnabledLayerNames = inst_layers.data();
-                bool have_debug_utils = false;
-                for (const auto& e : avail)
-                    if (!strcmp(e.extensionName, "VK_EXT_debug_utils")) have_debug_utils = true;
-                if (have_debug_utils) {
-                    inst_exts.push_back("VK_EXT_debug_utils");
-                    ici.enabledExtensionCount = (uint32_t)inst_exts.size();
-                    ici.ppEnabledExtensionNames = inst_exts.data();
-                } else {
+                // Already requested unconditionally above (#3578); do NOT push it again -- a
+                // duplicate entry in ppEnabledExtensionNames is a spec violation.
+                if (!have_debug_utils_ext) {
                     fprintf(stderr, "[vk-validation] VK_EXT_debug_utils is not advertised; the layer "
                                     "will run with its DEFAULT stdout/stderr action and this process "
                                     "will not rate-limit or tag its output\n");
@@ -4142,6 +4153,35 @@ inline size_t invalidate_persistent_ds_guest_write(uint64_t addr, uint64_t size)
                     (unsigned long long)learned, (unsigned long long)slice_depth_bytes,
                     (unsigned long long)stencil_size, (unsigned long long)htile_size,
                     (long long)((key.sr ? key.sr : key.sw) - (key.dr ? key.dr : key.dw)));
+        // ============================================================================================
+        // CURRENT RULE, stated first because everything below it is stratified history and the last
+        // layer used to contradict the code it annotates (#3580).
+        //
+        // An HTILE write invalidates the retained depth/stencil UNLESS the write is
+        // `gpu-preserving` AND the retained depth was written by the renderer during the CURRENT
+        // presented frame. That is the `(!byte_preserving || !current_frame_depth)` term at the
+        // bottom of this block, and the discriminator that makes it sound is the PRESENTATION EPOCH
+        // (#3281) -- not byte equality and not uniformity, both of which are dead (see below).
+        //
+        //   between frames -- prior-frame depth is stale        -> invalidate  (Blue Prince, #3264)
+        //   within a frame -- geometry just rendered this frame -> preserve    (GTA V, #3121)
+        //
+        // Two ways this block has misled readers, both worth knowing before editing it:
+        //
+        //   * The #3264 layer below opens by saying the `!byte_preserving` term is "REMOVED, not
+        //     weakened" and argues that keying on that origin is unsound. That was true when written
+        //     on 2026-09-03 and was SUPERSEDED THE SAME DAY by #3281, which reinstated the term
+        //     NARROWED by the epoch test above. The sentence is kept as the record of why the
+        //     UNCONDITIONAL form was wrong; it no longer describes the code beneath it.
+        //   * The invalidation is therefore NOT unconditional, though #3580 summarised it as such
+        //     while quoting the conditional line -- which is what a stale leading comment does to a
+        //     reader who trusts it.
+        //
+        // Still open: decoding HTILE to tell a fast CLEAR from a HiZ REFRESH. Uniformity was
+        // hypothesised as that discriminator and MEASURED FALSE before it shipped -- see the layer
+        // below and GTA5_STATUS.md's Ruled out table. Do not re-derive it.
+        // ============================================================================================
+        //
         // PROSPER_DS_HTILE_INVALIDATE=0 -- experiment arm, default ON (historical behaviour).
         //
         // The retained depth image is a Vulkan image; guest memory does not back it. So a guest
@@ -4252,6 +4292,11 @@ inline size_t invalidate_persistent_ds_guest_write(uint64_t addr, uint64_t size)
         // 49,152 words, i.e. resolution). A "uniform plane means a fast clear" discriminator was
         // hypothesised and MEASURED FALSE before it was written; PROSPER_HTILE_UNIFORMLOG below is
         // the instrument that killed it.
+        // #3264 (SUPERSEDED SAME-DAY BY #3281 -- read the CURRENT RULE at the top of this block).
+        // This layer records why the UNCONDITIONAL byte-preserving suppression was wrong; the term it
+        // says is "REMOVED" was reinstated hours later, narrowed by the presentation-epoch test, and
+        // that narrowed form is what the code below actually does.
+        //
         // #3264: the `!byte_preserving` term is REMOVED, not weakened. It suppressed the
         // invalidation whenever the write carried the `gpu-preserving` origin, and that is unsound
         // for the reason GTA5_STATUS.md's own Ruled out section recorded on 2026-08-28 (#3089), one
@@ -6385,13 +6430,25 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         return out;
     }
 
-    auto mkmod = [&](const std::vector<uint32_t>& c) -> VkShaderModule {
+    // `stage` and `identity` are per-module, not per-draw: naming a vertex module with the
+    // fragment identity would be worse than not naming it, because a wrong name in a capture reads
+    // as a fact. The geometry stage carries no identity counter of its own, so it names itself by
+    // digest alone rather than borrowing a neighbour's.
+    auto mkmod = [&](const std::vector<uint32_t>& c, const char* stage,
+                     uint64_t identity) -> VkShaderModule {
         VkShaderModuleCreateInfo s{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         s.codeSize = c.size() * 4; s.pCode = c.data(); VkShaderModule m = VK_NULL_HANDLE;
         // #3210 case 3, the mild one: the result was discarded, but `m` is initialized above and
         // the caller already skips the draw on `!v.vs || !v.fs`. Only the report is new -- the
         // control flow is deliberately unchanged.
         create_render_shader_module_checked(dev, s, &m);
+        // #3578. Once per module at creation, never in the draw hot path, and a no-op when
+        // VK_EXT_debug_utils is absent.
+        if (m)
+            prosper::gpu::vk_name_objectf(
+                dev, VK_OBJECT_TYPE_SHADER_MODULE, (uint64_t)m,
+                "guest %s id=%llu spv=%016llx", stage, (unsigned long long)identity,
+                (unsigned long long)prosper::gpu::vk_name_spirv_digest(c.data(), c.size()));
         return m; };
     // Per-draw Vulkan objects stay alive until the call or explicit submission batch completes.
     const auto timing_target_ready = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
@@ -9110,8 +9167,9 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 fprintf(stderr, "[backend-trace] draw=%zu create-shaders begin\n", di);
                 fflush(stderr);
             }
-            v.vs = mkmod(bd_vs); v.gs = bd_gs.empty() ? VK_NULL_HANDLE : mkmod(bd_gs);
-            v.fs = mkmod(bd_fs);
+            v.vs = mkmod(bd_vs, "vs", bd.vs_identity);
+            v.gs = bd_gs.empty() ? VK_NULL_HANDLE : mkmod(bd_gs, "gs", 0);
+            v.fs = mkmod(bd_fs, "fs", bd.fs_identity);
             if (backend_trace) {
                 fprintf(stderr,
                         "[backend-trace] draw=%zu create-shaders end vs=%p gs=%p fs=%p\n",

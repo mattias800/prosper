@@ -5248,6 +5248,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         u.is_storage_image = in.opcode == 0x08 || in.opcode == 0x09 ||
                                              in.opcode == 0x0f ||
                                              (in.opcode >= 0x11 && in.opcode <= 0x1a && in.opcode != 0x13);
+                        u.mimg_dim = in.mimg_dim;   // #3577: the shape the SPIR-V will declare
                         u.proven_zero_mip = proven_zero_mip_at_use;
                         u.is_depth_compare = (in.opcode >= 0x28 && in.opcode <= 0x2f) ||
                                              (in.opcode >= 0x38 && in.opcode <= 0x3f) ||
@@ -6283,9 +6284,36 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
                 // the existing coverage in `test_dynfetch_fold.cpp` builds its garbage with `base = 0`,
                 // so a residency term can be deleted with the whole suite still green (#2481).
                 const bool not_a_descriptor = entry.base <= 0x10000u || entry.size_bytes == 0u;
+                // #3576: a slot carrying a descriptor CONTROL that the normalized entry does not
+                // retain -- swizzled addressing, INDEX_STRIDE, ADD_TID, RESOURCE_LEVEL, OOB_SELECT or
+                // TYPE. `valid_shader_buffer_table_contract` already refuses such a table, so the
+                // VERDICT here is unchanged; what is new is that the refusal names the slot and the
+                // words. Reaching it through the contract check instead surfaced as a bare
+                // "REJECTED contract stride=.. fmt=.. comps=.." with no index and no offending bits,
+                // which is the diagnosis half of #3576.
+                //
+                // Deliberately NOT a not-a-descriptor condition, and this is the whole disagreement
+                // with #3576's proposed fix. These bits are NAMED CONTROLS, not merely reserved: a
+                // slot with ADD_TID_ENABLE is a perfectly valid descriptor that prosper cannot
+                // reproduce, not a stale arena record. Binding it NULL would hand an in-range guest
+                // index a confident zero read -- exactly the fail-visible-to-silent-zero trade the
+                // comment above refuses for every other unsupported record.
+                const uint32_t unretained_swizzle = words[1] & 0xc0000000u;
+                const uint32_t unretained_controls = words[3] & 0xfff80000u;
+                const bool unretained_control =
+                    !not_a_descriptor && (unretained_swizzle || unretained_controls);
                 const bool unsupported_descriptor = !not_a_descriptor &&
-                    (entry.size_bytes > 0x10000000u || entry.forbid_unknown_fallback);
+                    (entry.size_bytes > 0x10000000u || entry.forbid_unknown_fallback ||
+                     unretained_control);
                 if (unsupported_descriptor) {
+                    if (table_log && unretained_control)
+                        std::fprintf(stderr,
+                                     "[srt] selected-table pc=%u REJECTED unretained-control "
+                                     "index=%u swizzle=0x%08x controls=0x%08x "
+                                     "(INDEX_STRIDE/ADD_TID/RESOURCE_LEVEL/OOB_SELECT/TYPE) "
+                                     "words=%08x:%08x:%08x:%08x\n",
+                                     u.use_pc, index, unretained_swizzle, unretained_controls,
+                                     words[0], words[1], words[2], words[3]);
                     // Decline the WHOLE table, as before this change. A >256 MiB buffer or an
                     // unrepresentable DST_SEL / USCALED-SSCALED 2_10_10_10 is a descriptor the guest
                     // may well select.
@@ -7476,6 +7504,31 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                         rn.fetch_pc = u.use_pc;     // exact-PC provenance: only THIS use resolves to it
                         rn.srt_offset = 0xFFFFFFFFu;
                         rn.sgpr_base  = 0xFFFFFFFFu;
+                        // #3577: the dummy's SHAPE must match what the shader declares, or the view
+                        // type disagrees with the OpTypeImage it is bound to -- undefined behaviour,
+                        // and the kind that "works on RADV" (see #2422's Ruled out row, where RADV
+                        // happened to return the expected pixel under exactly such a contract).
+                        //
+                        // The descriptor cannot answer this: every word of it is zero by definition
+                        // here. The CONSUMING INSTRUCTION can, and is the same source the recompiler
+                        // uses -- `rdna2_emit_alu.cpp` derives Dim/Arrayed/MS from `in.mimg_dim` and
+                        // never reads the T# for shape. Same encoding as `img_dim`
+                        // (`image_type_to_dim` is `type - 8`), so this is a direct carry, not a
+                        // mapping that could drift.
+                        //
+                        // Left at the struct default when the use carries no MIMG dim, which keeps
+                        // the previous behaviour for anything that is not a MIMG consumer.
+                        if (u.mimg_dim != 0xFFFFFFFFu) {
+                            rn.img_dim = u.mimg_dim;
+                            // Restating the struct default (`ShaderResource::depth = 1`), NOT setting
+                            // it: `rn` is default-constructed, so this assignment is a no-op today and
+                            // removing it changes nothing. It is kept only so a future change to that
+                            // default cannot silently give a 3D null a zero extent depth, which
+                            // `vkCreateImage` rejects and the create-failure guard then turns into a
+                            // skipped draw. Do not describe it as load-bearing -- an earlier revision
+                            // of this branch did, and claimed a test guarded it; neither was true.
+                            rn.depth = 1;
+                        }
                         // Gated on PROSPER_DBG, not PROSPER_GFXLOG: GFXLOG must not be added to the
                         // timing-dependent GTA V route without re-establishing its baseline, so an
                         // instrument only visible under it cannot be read in the run being measured.
