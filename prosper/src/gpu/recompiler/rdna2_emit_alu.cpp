@@ -5830,8 +5830,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // when no later path classified the outcome. It used to read `resolved`, and four reject
             // paths returned past it without touching it, so a refused buffer instruction printed the
             // same word as an emitted one (#3579). That is the one distinction this census exists to
-            // make, inverted. The four are named now (`reject-unknown-format`, `reject-badfmt`,
-            // `reject-unaligned`, `reject-packed-word-store` / `reject-subword-int-store`), and the
+            // make, inverted. They are named now (`reject-unknown-format`, `reject-badfmt`,
+            // `reject-unaligned`, `reject-subword-int-store`, `reject-mtbuf-unknown-format`), and the
             // word stays deliberately narrow so a FIFTH reject path added later degrades to something
             // TRUE -- "a descriptor was resolved for this op" -- instead of to a false success.
             struct BufOpDisposition {
@@ -6694,14 +6694,10 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     return true;
                 }
                 // Store the VDATA VGPRs (in.dst..+n-1). Integer sub-dword formats reach the atomic path
-                // above when in-dword-provable; anything else that can't pack (packed_word, or an
-                // integer field that could straddle) rejects rather than mis-store.
-                // Named as TWO refusals, not one, because they have different futures: the
-                // packed-word half is what #3575 implements, while a sub-dword integer field that
-                // could straddle a dword boundary stays deferred. A census that merged them could
-                // not show the first one going away.
-                if (packed_word) { buf_op.how = "reject-packed-word-store"; ok = false; return true; }
-                if (packed && (is_uint || is_sint)) {
+                // above when in-dword-provable; a sub-dword integer field that could STRADDLE a dword
+                // boundary still rejects rather than mis-store. The packed-word formats are
+                // implemented below (#3575).
+                if (packed && !packed_word && (is_uint || is_sint)) {
                     buf_op.how = "reject-subword-int-store"; ok = false; return true;
                 }
                 // MTBUF's instruction format owns the physical component COUNT, and a wider opcode
@@ -6719,6 +6715,66 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         uint32_t kidx = k ? b.ibin(Op_IAdd, idx, b.uconst(k)) : idx;
                         store_dword(kidx, vread(in.dst.value + (int)k));
                     }
+                } else if (packed_word) {
+                    // #3575: every component shares ONE dword. This is the exact inverse of the
+                    // packed_word LOAD above and deliberately reads its field table rather than
+                    // restating one -- same offsets, same widths, same per-field norms. A store whose
+                    // layout disagreed with the load would round-trip wrongly through prosper's own
+                    // reload, which is the cheapest way for this to be wrong and go unnoticed.
+                    //
+                    // `comp_bytes` is 0 for these formats (data_format_bytes has no case for them),
+                    // so the generic packed loop below would compute dwords=0 and silently write
+                    // NOTHING. That is why this is its own branch rather than a wider `comp_bytes`.
+                    //
+                    // The component count comes from the FORMAT, not from the opcode: a
+                    // buffer_store_format_xyzw through a 3-component 10_11_11 must not write a fourth
+                    // field, which at k=3 would land back on top of B. Same hazard the MTBUF count
+                    // clamp above addresses, one level down.
+                    const uint32_t packed_word_ncomp = packed_10_11_11 ? 3u : 4u;
+                    // A PARTIAL packed-word store stays refused, and this is a deliberate stop rather
+                    // than an oversight. Every field shares one dword, so writing a subset is a
+                    // read-modify-write of the fields NOT being written -- and whether the hardware
+                    // preserves those fields or zeroes the whole dword is not something the RDNA2 ISA
+                    // document settles, nor something any title evidence here establishes. Guessing
+                    // costs the neighbouring channel silently: the store would succeed and the
+                    // untouched field would come back zero. A wider opcode than the format (xyzw
+                    // through a 3-component 10_11_11) is NOT this case -- the fourth component does
+                    // not exist in the format, so clamping it writes every field that does.
+                    // CONFIDENCE: HIGH that refusing is right; the semantics are what is unknown.
+                    if (store_n < packed_word_ncomp) {
+                        buf_op.how = "reject-packed-word-partial-store";
+                        ok = false; return true;
+                    }
+                    uint32_t acc = b.uconst(0);
+                    for (uint32_t k = 0; k < store_n && k < packed_word_ncomp; k++) {
+                        const uint32_t boff = packed_10_11_11
+                            ? (k == 0 ? 0u : k == 1 ? 11u : 22u)
+                            : (k == 0 ? 0u : k == 1 ? 10u : k == 2 ? 20u : 30u);
+                        const uint32_t bits = packed_10_11_11 ? (k < 2 ? 11u : 10u)
+                                                              : (k < 3 ? 10u : 2u);
+                        uint32_t field;
+                        if (packed_10_11_11) {
+                            // pack_ufloat's argument is MANTISSA bits, not the field width: an 11-bit
+                            // field is 5 exponent + 6 mantissa, a 10-bit field 5 + 5. The same
+                            // routine already packs an R11G11B10 texel on the storage-image write
+                            // path (image_write), so this is the established conversion reached
+                            // through the buffer descriptor instead of the image one.
+                            field = b.pack_ufloat(vread(in.dst.value + (int)k), bits - 5u);
+                        } else if (is_uint || is_sint) {
+                            // The raw integer field, truncated to its width. Signed values keep
+                            // two's complement in `bits` bits, which is what bfe_s reads back.
+                            field = b.ibin(Op_BitwiseAnd, vread(in.dst.value + (int)k),
+                                           b.uconst((1u << bits) - 1u));
+                        } else {
+                            const float field_norm = is_snorm ? (bits == 2 ? 1.0f : 511.0f)
+                                                              : (bits == 2 ? 3.0f : 1023.0f);
+                            field = b.pack_norm(vread(in.dst.value + (int)k), bits, is_snorm,
+                                                field_norm);
+                        }
+                        if (boff) field = b.ibin(Op_ShiftLeftLogical, field, b.uconst(boff));
+                        acc = b.ibin(Op_BitwiseOr, acc, field);
+                    }
+                    store_dword(idx, acc);
                 } else {
                     // Packed UNORM/SNORM/Float16: pack the components tightly into ceil(n*bytes/4) dwords
                     // (inverse of the packed load). Each dword ORs together the fields that land in it.

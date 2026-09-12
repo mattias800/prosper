@@ -136,14 +136,18 @@ int main() {
               "#3579: the [mubuf-unaligned] refusal names itself in the census");
     }
 
-    // --- Arm 4: the packed-word typed store (#3575's subject) ------------------------------------
+    // --- Arm 4: the packed-word typed store is now EMITTED, not refused (#3575) -------------------
+    // This arm deliberately asserts the opposite of what it would have a commit ago. The refusal it
+    // used to pin is gone because the store is implemented, and a census arm that preserved an
+    // obsolete refusal expectation would be pinning the emitter's past rather than its behaviour.
     {
         ShaderResourceTable rt = table_with_format(DataFormat::Float10_11_11, 3);
         const std::string log = recompile_capturing_stderr(
             store_xyzw, std::size(store_xyzw), &rt, "buf_op_census_packedword.log");
-        CHECK(has(log, "reject-packed-word-store"),
-              "#3579: the packed-word store refusal names itself, separately from the sub-dword "
-              "integer refusal beside it (#3575 removes only this one)");
+        CHECK(!has(log, "reject-"),
+              "#3575: a 10_11_11 typed store is emitted, not refused");
+        CHECK(has(log, "descriptor-resolved"),
+              "#3575: ...and the census says so");
     }
 
     set_test_env("PROSPER_DBG", nullptr);
