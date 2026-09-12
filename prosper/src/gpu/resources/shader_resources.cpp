@@ -1480,6 +1480,33 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
                 report.issues.push_back({DescriptorIssueCode::InvalidImageMetadata, false, d.set,
                                          d.binding, d.kind, actual});
         }
+        // #3577: a NULL image descriptor is exempt from the extent/format/size checks above -- it
+        // legitimately has none -- but it is NOT exempt from having the right SHAPE. Dimension is not
+        // metadata about the resource; it is a property of the shader's own declaration, and binding a
+        // VK_IMAGE_VIEW_TYPE_2D dummy to an `OpTypeImage ... Dim=3D` is undefined behaviour whether or
+        // not the resource behind it is null. The `## Ruled out` row for #2422 is the reason to care
+        // rather than shrug: RADV happened to return the expected pixel under exactly such an
+        // undefined contract, so "it works here" is not evidence.
+        //
+        // Only the 2D-vs-3D axis is checked. A guest DIM=5 may deliberately compile either as the
+        // historical base-slice 2D fallback or as a real 2D-array image (see SpirvDescriptorUse's
+        // image_dim comment), so equality across the whole encoding would false-positive on shapes
+        // that are correct by design. 3D and 2D view types are never interchangeable.
+        //
+        // Reported, not fatal. The synthesis site now sets the null descriptor's shape from the
+        // consuming MIMG, so this should not fire; it is here so a regression is VISIBLE rather than
+        // silent, and it stays non-fatal until someone has measured how often other paths can produce
+        // a null whose shape the shader disagrees with. Turning a silent mismatch into a dropped draw
+        // is a tightening that wants a corpus census first.
+        if (null_descriptor && d.image_dim != UINT32_MAX &&
+            (d.kind == SpirvDescriptorKind::CombinedImageSampler ||
+             d.kind == SpirvDescriptorKind::StorageImage)) {
+            const bool declares_3d = d.image_dim == 2u;   // SPIR-V Dim_3D
+            const bool resource_3d = r.img_dim == 2u;     // SQ_RSRC dim 2 -> the backend builds a 3D view
+            if (declares_3d != resource_3d)
+                report.issues.push_back({DescriptorIssueCode::InvalidImageMetadata, false, d.set,
+                                         d.binding, d.kind, actual});
+        }
     }
 
     if (report_unused && runtime) {

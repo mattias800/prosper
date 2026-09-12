@@ -5248,6 +5248,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         u.is_storage_image = in.opcode == 0x08 || in.opcode == 0x09 ||
                                              in.opcode == 0x0f ||
                                              (in.opcode >= 0x11 && in.opcode <= 0x1a && in.opcode != 0x13);
+                        u.mimg_dim = in.mimg_dim;   // #3577: the shape the SPIR-V will declare
                         u.proven_zero_mip = proven_zero_mip_at_use;
                         u.is_depth_compare = (in.opcode >= 0x28 && in.opcode <= 0x2f) ||
                                              (in.opcode >= 0x38 && in.opcode <= 0x3f) ||
@@ -7476,6 +7477,26 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                         rn.fetch_pc = u.use_pc;     // exact-PC provenance: only THIS use resolves to it
                         rn.srt_offset = 0xFFFFFFFFu;
                         rn.sgpr_base  = 0xFFFFFFFFu;
+                        // #3577: the dummy's SHAPE must match what the shader declares, or the view
+                        // type disagrees with the OpTypeImage it is bound to -- undefined behaviour,
+                        // and the kind that "works on RADV" (see #2422's Ruled out row, where RADV
+                        // happened to return the expected pixel under exactly such a contract).
+                        //
+                        // The descriptor cannot answer this: every word of it is zero by definition
+                        // here. The CONSUMING INSTRUCTION can, and is the same source the recompiler
+                        // uses -- `rdna2_emit_alu.cpp` derives Dim/Arrayed/MS from `in.mimg_dim` and
+                        // never reads the T# for shape. Same encoding as `img_dim`
+                        // (`image_type_to_dim` is `type - 8`), so this is a direct carry, not a
+                        // mapping that could drift.
+                        //
+                        // Left at the struct default when the use carries no MIMG dim, which keeps
+                        // the previous behaviour for anything that is not a MIMG consumer.
+                        if (u.mimg_dim != 0xFFFFFFFFu) {
+                            rn.img_dim = u.mimg_dim;
+                            // A 3D dummy needs a non-zero depth for its substituted extent; the
+                            // width/height substitution lives in the renderer (live_renderer.cpp).
+                            rn.depth = 1;
+                        }
                         // Gated on PROSPER_DBG, not PROSPER_GFXLOG: GFXLOG must not be added to the
                         // timing-dependent GTA V route without re-establishing its baseline, so an
                         // instrument only visible under it cannot be read in the run being measured.
