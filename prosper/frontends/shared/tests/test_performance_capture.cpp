@@ -148,6 +148,19 @@ int main() {
         record.frontend_tex_other_compute_candidate = true;
         record.resolve_read_count = 3 + i;
         record.setup_resources_ms = 10 + i;
+        // Distinct counters above 32 bits catch omitted/swapped/narrowed serialization without
+        // pretending this CPU recorder test establishes actual backend copy or cache decisions.
+        record.buffer_upload_bytes = 4'294'967'296ull + 0 + i;
+        record.buffer_resident_hits = 4'294'967'296ull + 100 + i;
+        record.buffer_resident_compared_bytes = 4'294'967'296ull + 200 + i;
+        record.buffer_resident_reused_bytes = 4'294'967'296ull + 300 + i;
+        record.buffer_resident_admitted_bytes = 4'294'967'296ull + 400 + i;
+        record.buffer_resident_declined_bytes = 4'294'967'296ull + 500 + i;
+        record.buffer_resident_ineligible_bytes = 4'294'967'296ull + 600 + i;
+        record.buffer_resident_refreshed_bytes = 4'294'967'296ull + 700 + i;
+        record.buffer_resident_watched_bytes = 4'294'967'296ull + 800 + i;
+        record.res_buffer_resident_ms = 0.125 + i;
+        record.res_buffer_watch_ms = 0.0625 + i;
         record.gpu_timestamp_samples = 2 + i;
         capture.record_renderer(record);
     }
@@ -192,6 +205,61 @@ int main() {
     std::ostringstream bytes;
     bytes << input.rdbuf();
     const std::string text = bytes.str();
+    check(count_text(text, "\"buffer_upload_bytes\":") == 2 &&
+              text.find("\"buffer_upload_bytes\":4294967296,") != std::string::npos &&
+              text.find("\"buffer_upload_bytes\":4294967297,") != std::string::npos &&
+              text.find("\"buffer_upload_bytes\":4294967298,") == std::string::npos,
+          "buffer_upload_bytes preserves exact 64-bit values and the renderer cap");
+    check(count_text(text, "\"buffer_resident_hits\":") == 2 &&
+              text.find("\"buffer_resident_hits\":4294967396,") != std::string::npos &&
+              text.find("\"buffer_resident_hits\":4294967397,") != std::string::npos &&
+              text.find("\"buffer_resident_hits\":4294967398,") == std::string::npos,
+          "buffer_resident_hits preserves exact 64-bit values and the renderer cap");
+    check(count_text(text, "\"buffer_resident_compared_bytes\":") == 2 &&
+              text.find("\"buffer_resident_compared_bytes\":4294967496,") != std::string::npos &&
+              text.find("\"buffer_resident_compared_bytes\":4294967497,") != std::string::npos &&
+              text.find("\"buffer_resident_compared_bytes\":4294967498,") == std::string::npos,
+          "buffer_resident_compared_bytes preserves exact 64-bit values and the renderer cap");
+    check(count_text(text, "\"buffer_resident_reused_bytes\":") == 2 &&
+              text.find("\"buffer_resident_reused_bytes\":4294967596,") != std::string::npos &&
+              text.find("\"buffer_resident_reused_bytes\":4294967597,") != std::string::npos &&
+              text.find("\"buffer_resident_reused_bytes\":4294967598,") == std::string::npos,
+          "buffer_resident_reused_bytes preserves exact 64-bit values and the renderer cap");
+    check(count_text(text, "\"buffer_resident_admitted_bytes\":") == 2 &&
+              text.find("\"buffer_resident_admitted_bytes\":4294967696,") != std::string::npos &&
+              text.find("\"buffer_resident_admitted_bytes\":4294967697,") != std::string::npos &&
+              text.find("\"buffer_resident_admitted_bytes\":4294967698,") == std::string::npos,
+          "buffer_resident_admitted_bytes preserves exact 64-bit values and the renderer cap");
+    check(count_text(text, "\"buffer_resident_declined_bytes\":") == 2 &&
+              text.find("\"buffer_resident_declined_bytes\":4294967796,") != std::string::npos &&
+              text.find("\"buffer_resident_declined_bytes\":4294967797,") != std::string::npos &&
+              text.find("\"buffer_resident_declined_bytes\":4294967798,") == std::string::npos,
+          "buffer_resident_declined_bytes preserves exact 64-bit values and the renderer cap");
+    check(count_text(text, "\"buffer_resident_ineligible_bytes\":") == 2 &&
+              text.find("\"buffer_resident_ineligible_bytes\":4294967896,") != std::string::npos &&
+              text.find("\"buffer_resident_ineligible_bytes\":4294967897,") != std::string::npos &&
+              text.find("\"buffer_resident_ineligible_bytes\":4294967898,") == std::string::npos,
+          "buffer_resident_ineligible_bytes preserves exact 64-bit values and the renderer cap");
+    check(count_text(text, "\"buffer_resident_refreshed_bytes\":") == 2 &&
+              text.find("\"buffer_resident_refreshed_bytes\":4294967996,") != std::string::npos &&
+              text.find("\"buffer_resident_refreshed_bytes\":4294967997,") != std::string::npos &&
+              text.find("\"buffer_resident_refreshed_bytes\":4294967998,") == std::string::npos,
+          "buffer_resident_refreshed_bytes preserves exact 64-bit values and the renderer cap");
+    check(count_text(text, "\"buffer_resident_watched_bytes\":") == 2 &&
+              text.find("\"buffer_resident_watched_bytes\":4294968096,") != std::string::npos &&
+              text.find("\"buffer_resident_watched_bytes\":4294968097,") != std::string::npos &&
+              text.find("\"buffer_resident_watched_bytes\":4294968098,") == std::string::npos,
+          "watch-proven reuse preserves exact 64-bit values and the renderer cap");
+    check(count_text(text, "\"res_buffer_watch_ms\":") == 2 &&
+              text.find("\"res_buffer_watch_ms\":0.0625,") != std::string::npos &&
+              text.find("\"res_buffer_watch_ms\":1.0625,") != std::string::npos &&
+              text.find("\"res_buffer_watch_ms\":2.0625,") == std::string::npos,
+          "watch query and registration child timer survives serialization and the renderer cap");
+    check(count_text(text, "\"res_buffer_resident_ms\":") == 2 &&
+              text.find("\"res_buffer_resident_ms\":0.125,") != std::string::npos &&
+              text.find("\"res_buffer_resident_ms\":1.125,") != std::string::npos &&
+              text.find("\"res_buffer_resident_ms\":2.125,") == std::string::npos,
+          "resident setup time is serialized separately and respects the renderer cap");
     check(text.find("\"format\":\"prosper-performance-capture\",\"version\":1") != std::string::npos,
           "capture identifies its format and version");
     check(text.find("Syberia \\\"Remastered\\\"") != std::string::npos,

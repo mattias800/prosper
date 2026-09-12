@@ -79,3 +79,57 @@ Consequences for anything you change in it:
 Prefer extending an existing harness over a second one that does nearly the same thing; the tests
 that share `render_runner.h` share its device, caches and statistics, and a parallel copy would
 diverge. Fixtures that only one test uses belong beside that test, not here.
+
+## Retained buffer inputs
+
+The [measurement and contract notes](../../docs/RENDERER_BUFFER_RESIDENCY_2026_09.md) retain
+accepted mechanism evidence, adverse game comparisons and their limits.
+
+Cross-call storage uploads own whole Vulkan buffers; they never retain a guest pointer or an arena
+slice. Reuse compares the complete current materialized input against an owned CPU snapshot, never the
+potentially uncached Vulkan mapping. The snapshot also supplies the exact device upload bytes. Refresh in place is permitted only
+when the cache is the sole owner; recorded and in-flight passes hold shared completion leases,
+including the existing indeterminate-completion retention path. The separate residency cap counts
+Vulkan allocation and CPU snapshot bytes until the final owner releases them, including detached older versions. It adds to
+the existing free host-buffer pool budget.
+
+Admission currently requires every final shader in the pass to have complete buffer-write
+provenance and no storage-buffer writer, including atomic writes. This whole-pass rule preserves the old
+within-call alias memo: a writable later draw cannot reach retained input through a previous binding.
+Small inputs, descriptor-table entries, GDS, zero identities and diagnostic mutation retain their
+existing routes. Reflection observes writes; absence of a writable flag alone is not proof.
+
+At capacity, new identities may rekey one of at most 32 inspected entries only when its device and exact
+size match and no submission owns it. Otherwise the ordinary upload route handles the miss;
+known capacity pressure does not evict unrelated entries or allocate new storage. Preflight uses
+the pool capacity class plus snapshot size; actual driver allocation requirements are checked
+after allocation and may still decline admission. Admitted-byte counters mean
+new key payloads, including rekeyed allocations, and are not Vulkan allocation-byte counters.
+The bounded search resumes from its previous cursor, so an incompatible old prefix cannot hide
+later reusable entries forever. Inspection does not change LRU recency; the cursor is a key that
+can safely disappear through rekey, source replacement or cache clearing.
+
+In addition to bytes, admission limits all live retained owners to the smaller of 4096 and one
+sixteenth of the device's advertised memory-allocation limit. Detached submission owners remain
+counted until their actual Vulkan allocation is freed; explicit byte overrides retain this bound.
+This limits the cache's added allocation population, not the whole device's independent allocators.
+Timing logs report sampled entry, owner and byte occupancy. Cleanup can change the two atomic
+lifetime gauges between reads, so they are not a transactional accounting snapshot. Reading these
+statistics never initializes Vulkan.
+
+Only explicit direct guest views may use a cache-entry write watch; hosted, copied, padded and
+descriptor-table data retain full comparison. Two exact equal validations precede promotion; arm
+before the next authoritative comparison. Unknown or failed coverage falls back, and two dirty
+queries disable watching for that entry until its source changes or it is rekeyed. Entry watches
+never own or extend guest mapping lifetime; recorded GPU snapshots remain independent.
+`PROSPER_NO_BACKEND_BUFFER_WRITE_WATCH` disables only watch validation, preserving residency for
+comparable exact-validation controls. Watched bytes are a subset of reused bytes; watch time is
+already included in resident time.
+
+The combined residency budget defaults to 256 MiB on Linux and zero elsewhere, where production
+guest write watches are unavailable. An explicit `PROSPER_BACKEND_BUFFER_RESIDENCY_MB` override
+enables exact snapshot residency on any platform, capped at 2048 MiB. Zero bypasses both admission
+and the pass's additional write-proof reflection. Linux inputs whose watches fail or are disabled
+still use exact comparison; this fallback is correct but can cost more than ordinary uploads.
+Runtime cache fixtures explicitly select a nonzero budget so unsupported platforms exercise the
+portable ownership and comparison contract too.

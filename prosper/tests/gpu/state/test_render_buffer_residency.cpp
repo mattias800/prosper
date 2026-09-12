@@ -1,0 +1,844 @@
+// Immutable renderer uploads: real vertex fetches distinguish stale contents from valid reuse.
+// Hosted cases use FrameResource's current materialized bytes as authority; the Linux section
+// below additionally exercises actual registered guest mappings and the production fault handler.
+// Distinct host vectors deliberately advertise one guest identity. A queued pass must retain its
+// own upload even after that identity changes or cache pressure removes the entry.
+#include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include "gpu/resources/shader_resources.hpp"
+#include "gpu/state/render_state.hpp"
+#include "fixtures/render_runner.h"
+#include <algorithm>
+#include <array>
+#include <bit>
+#include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <memory>
+#include <string>
+#include <vector>
+#ifdef __linux__
+#include "host/image/exec_image.hpp"
+#include "host/memory/guest_memory_map.hpp"
+#include "host/memory/guest_write_watch.hpp"
+#include <csignal>
+#include <cstring>
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
+
+using namespace prosper::gpu;
+using namespace prosper::test;
+namespace {
+int failures = 0;
+#define CHECK(c, m) do { if (!(c)) { std::printf("[FAIL] %s\n", m); ++failures; } \
+                        else std::printf("[ok] %s\n", m); } while (0)
+constexpr uint32_t W = 32, H = 32;
+constexpr size_t Words = 2048, Bytes = Words * sizeof(uint32_t);
+constexpr std::array<uint32_t, 3> Quads{0, 508, 1020};
+constexpr float Clear[4]{0, 0, 1, 1};
+void disabled(bool value) {
+#ifdef _WIN32
+    _putenv_s("PROSPER_NO_BACKEND_BUFFER_RESIDENCY", value ? "1" : "");
+#else
+    if (value) setenv("PROSPER_NO_BACKEND_BUFFER_RESIDENCY", "1", 1);
+    else unsetenv("PROSPER_NO_BACKEND_BUFFER_RESIDENCY");
+#endif
+}
+void quad(std::vector<uint32_t>& words, uint32_t first, bool visible) {
+    const float bias = visible ? 0.f : 10.f;
+    const float positions[]{-1,-1, -1,1, 1,1, 1,-1};
+    for (size_t i = 0; i < 8; ++i)
+        words[first * 2 + i] = std::bit_cast<uint32_t>(positions[i] + bias);
+}
+std::vector<uint32_t> payload() {
+    std::vector<uint32_t> result(Words, 0);
+    for (auto first : Quads) quad(result, first, true);
+    return result;
+}
+bool solid(const std::vector<uint8_t>& image, bool green) {
+    if (image.size() != W * H * 4) return false;
+    for (size_t i = 0; i < image.size(); i += 4)
+        if (image[i] > 8 || image[i + (green ? 1 : 2)] < 247 ||
+            image[i + (green ? 2 : 1)] > 8 || image[i + 3] < 247) return false;
+    return true;
+}
+struct Fixture {
+    ResolvedPipelineState state;
+    std::vector<uint32_t> vs, fs;
+    Fixture() {
+        const uint32_t vertex[]{0x7e060280u,0x7e0802f2u,0xe0042000u,0x80020100u,
+                                0xf80008cfu,0x04030201u,0xbf810000u};
+        const uint32_t fragment[]{0x7e000280u,0x7e0202f2u,0x7e040280u,0x7e0602f2u,
+                                  0xf800180fu,0x03020100u,0xbf810000u};
+        ShaderResourceTable table;
+        ShaderResource buffer{};
+        buffer.cls = ResourceClass::VertexBuffer; buffer.format = DataFormat::Float32;
+        buffer.num_components = 2; buffer.binding = 3; buffer.stride = 8; buffer.sgpr_base = 8;
+        table.resources.push_back(buffer);
+        vs = recompile_vertex(vertex, std::size(vertex), &table);
+        fs = recompile_fragment(fragment, std::size(fragment));
+        state.topology = 3;
+    }
+    BackendDraw draw(const std::vector<uint32_t>& source, uint64_t identity,
+                     uint32_t first = 0) const {
+        BackendDraw d; d.vs = vs; d.fs = fs; d.ps = &state;
+        d.vcount = static_cast<uint32_t>(source.size() / 2);
+        d.indices = {first,first+1,first+2, first+2,first+3,first};
+        FrameResource r; r.binding = 3; r.set = 0; r.buffer_identity = identity;
+        r.dwords_view = source.data(); r.dwords_view_count = source.size();
+        d.R.push_back(std::move(r)); return d;
+    }
+    std::vector<uint8_t> render(const std::vector<uint32_t>& source, uint64_t identity,
+                                uint32_t first = 0) const {
+        return render_draws_rgba({draw(source, identity, first)}, W, H, nullptr, Clear);
+    }
+};
+// Add a real atomic SSBO access to an otherwise green fragment shader. Atomic OR zero at a zero
+// payload word is deterministic even when many fragments address it. The SSBO has the same exact
+// source/identity as the VS buffer but another stage/binding: whole-pass writer exclusion matters.
+std::vector<uint32_t> atomic_fragment(std::vector<uint32_t> input, bool copy_pointer=false) {
+    if (input.size()<5 || input[0]!=0x07230203u) return {};
+    // SPIR-V forbids duplicate non-aggregate type declarations. The actual recompiled FS already
+    // declares uint even when its visible output only uses float. Reuse that scalar and an existing
+    // StorageBuffer pointer to it; the new aggregate block has its own distinct pointee identity.
+    uint32_t existing_uint=0, existing_uint_pointer=0;
+    for (size_t at=5; at<input.size();) {
+        const uint32_t count=input[at]>>16, op=input[at]&0xffffu;
+        if (!count || at+count>input.size()) return {};
+        if (op==21 && count==4 && input[at+2]==32 && input[at+3]==0)
+            existing_uint=input[at+1];
+        at+=count;
+    }
+    if (existing_uint) {
+        for (size_t at=5; at<input.size();) {
+            const uint32_t count=input[at]>>16, op=input[at]&0xffffu;
+            if (op==32 && count==4 && input[at+2]==12 && input[at+3]==existing_uint)
+                existing_uint_pointer=input[at+1];
+            at+=count; // The complete instruction stream was validated above.
+        }
+    }
+    auto next = input[3];
+    auto id = [&] { return next++; };
+    const uint32_t u=existing_uint ? existing_uint : id();
+    const uint32_t arr=id(), block=id(), pb=id();
+    const uint32_t pu=existing_uint_pointer ? existing_uint_pointer : id();
+    const uint32_t zero=id(), index=id(), scope=id(), variable=id(), pointer=id(), value=id();
+    const uint32_t atomic_pointer=copy_pointer ? id() : pointer;
+    auto emit=[](std::vector<uint32_t>& out,uint32_t op,std::initializer_list<uint32_t> args) {
+        out.push_back((uint32_t(args.size()+1)<<16)|op); out.insert(out.end(),args);
+    };
+    std::vector<uint32_t> annotations, declarations, code;
+    emit(annotations,71,{arr,6,4}); emit(annotations,71,{block,2});
+    emit(annotations,72,{block,0,35,0});
+    emit(annotations,71,{variable,34,1}); emit(annotations,71,{variable,33,4});
+    if (!existing_uint) emit(declarations,21,{u,32,0});
+    emit(declarations,29,{arr,u});
+    emit(declarations,30,{block,arr}); emit(declarations,32,{pb,12,block});
+    if (!existing_uint_pointer) emit(declarations,32,{pu,12,u});
+    emit(declarations,43,{u,zero,0});
+    emit(declarations,43,{u,index,16}); emit(declarations,43,{u,scope,1});
+    emit(declarations,59,{pb,variable,12});
+    emit(code,65,{pu,pointer,variable,zero,index});
+    // A legal pointer copy deliberately exceeds the reflector's direct-root attribution. The
+    // whole-module incomplete-write proof must therefore veto immutable residency, even though
+    // the ordinary descriptor declarations and Vulkan shader remain valid.
+    if (copy_pointer) emit(code,83,{pu,atomic_pointer,pointer}); // OpCopyObject
+    emit(code,241,{u,value,atomic_pointer,scope,zero,zero}); // OpAtomicOr, Device, Relaxed, 0
+    std::vector<uint32_t> result(input.begin(), input.begin()+5);
+    bool added_annotations=false, added_declarations=false, added_code=false;
+    for (size_t at=5; at<input.size();) {
+        const uint32_t count=input[at]>>16, op=input[at]&0xffffu;
+        if (!count || at+count>input.size()) return {};
+        if (!added_annotations && op>=19 && op<=39) {
+            result.insert(result.end(),annotations.begin(),annotations.end()); added_annotations=true;
+        }
+        if (!added_declarations && op==54) {
+            result.insert(result.end(),declarations.begin(),declarations.end()); added_declarations=true;
+        }
+        if (op==253) {
+            result.insert(result.end(),code.begin(),code.end()); added_code=true;
+        }
+        const size_t start=result.size();
+        result.insert(result.end(),input.begin()+at,input.begin()+at+count);
+        if (op==15 && input[1]>=0x00010400u) {
+            result[start]+=1u<<16; result.push_back(variable);
+        }
+        at+=count;
+    }
+    result[3]=next;
+    return added_annotations && added_declarations && added_code ? result : std::vector<uint32_t>{};
+}
+}
+
+
+namespace {
+#ifdef __linux__
+// Same memfd/MAP_SHARED + production SA_ONSTACK path as test_guest_write_watch. The extra
+// readable-map notifications model the public mapping contract used by actual direct resources.
+struct GuestBufferAliases {
+    int fd = -1, replacement_fd = -1;
+    size_t mapped_size = 0;
+    uint32_t* a = nullptr;
+    uint32_t* b = nullptr;
+    static constexpr uint64_t Physical = 0x734890000ull;
+    static void add(uint32_t* p, size_t bytes, uint64_t physical) {
+        prosper::host::notify_guest_mapping_added(reinterpret_cast<uint64_t>(p), bytes, true);
+        prosper::host::guest_write_watch_notify_direct_mapping_added(
+            reinterpret_cast<uint64_t>(p), bytes, physical, 3); // CPU_READ | CPU_WRITE
+    }
+    static void remove(uint32_t* p, size_t bytes) {
+        prosper::host::guest_write_watch_notify_direct_mapping_removed(
+            reinterpret_cast<uint64_t>(p), bytes);
+        prosper::host::notify_guest_mapping_removed(reinterpret_cast<uint64_t>(p), bytes);
+    }
+    bool initialize(const std::vector<uint32_t>& initial) {
+        const long page = sysconf(_SC_PAGESIZE);
+        if (page <= 0) return false;
+        mapped_size = ((Bytes + size_t(page) - 1) / size_t(page)) * size_t(page);
+        fd = memfd_create("renderer-buffer-watch", 0);
+        if (fd < 0 || ftruncate(fd, static_cast<off_t>(mapped_size))) return false;
+        auto map = [&] {
+            void* p = mmap(nullptr, mapped_size, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
+            return p == MAP_FAILED ? nullptr : static_cast<uint32_t*>(p);
+        };
+        a = map(); b = map();
+        if (!a || !b) return false;
+        std::memcpy(a, initial.data(), Bytes);
+        add(a, mapped_size, Physical); add(b, mapped_size, Physical);
+        return true;
+    }
+    bool replace_primary(const std::vector<uint32_t>& replacement) {
+        replacement_fd = memfd_create("renderer-buffer-watch-replacement", 0);
+        if (replacement_fd < 0 || ftruncate(replacement_fd, static_cast<off_t>(mapped_size)) ||
+            pwrite(replacement_fd, replacement.data(), Bytes, 0) != ssize_t(Bytes)) return false;
+        uint32_t* old = a;
+        remove(old, mapped_size);
+        // Atomically replace the exact still-owned range. Never expose an unmapped address gap
+        // which an unrelated Vulkan/host thread could acquire before MAP_FIXED executes.
+        void* next = mmap(old, mapped_size, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_FIXED,
+                          replacement_fd, 0);
+        if (next == MAP_FAILED) {
+            munmap(old, mapped_size);
+            a = nullptr;
+            return false;
+        }
+        a = static_cast<uint32_t*>(next);
+        add(a, mapped_size, Physical + 2*mapped_size);
+        return a == old;
+    }
+    ~GuestBufferAliases() {
+        if (a) { remove(a, mapped_size); munmap(a, mapped_size); }
+        if (b) { remove(b, mapped_size); munmap(b, mapped_size); }
+        if (replacement_fd >= 0) close(replacement_fd);
+        if (fd >= 0) close(fd);
+    }
+};
+
+void guest_buffer_watch(const Fixture& f) {
+    using namespace prosper::host;
+    CHECK(unsetenv("PROSPER_FAULT_NO_ONSTACK") == 0,
+          "real renderer write-watch uses the production alternate-stack signal handler");
+    prosper::install_trap_handler();
+    struct sigaction action{};
+    stack_t stack{};
+    const bool signal_ready = sigaction(SIGSEGV, nullptr, &action) == 0 &&
+        (action.sa_flags & SA_ONSTACK) && sigaltstack(nullptr, &stack) == 0 &&
+        !(stack.ss_flags & SS_DISABLE);
+    CHECK(signal_ready, "actual SIGSEGV handler and current thread alternate stack are installed");
+    if (!signal_ready) return;
+    auto& cache = resident_render_buffer_cache();
+    { BackendPersistentResourceGuard guard; cache.index.clear(); cache.lru.clear(); }
+    GuestBufferAliases mapping;
+    auto visible = payload();
+    CHECK(mapping.initialize(visible), "real guest buffer and second physical alias are mapped");
+    if (!mapping.a || !mapping.b) return;
+    const uint64_t identity = reinterpret_cast<uint64_t>(mapping.a);
+    auto direct_draw = [&] {
+        auto d = f.draw(visible, identity);
+        d.R[0].dwords_view = mapping.a;
+        d.R[0].direct_guest_buffer_addr = identity;
+        return d;
+    };
+    auto render = [&] { return render_draws_rgba({direct_draw()}, W,H,nullptr,Clear); };
+    auto warm = [&](bool green) {
+        // Cold admission / changed refresh does not itself prove stable source contents. Two real
+        // equal validations establish stability; the third arms before one final exact comparison.
+        // Only the following draw can rely on that established protected baseline.
+        for (unsigned i=0; i<3; ++i) {
+            CHECK(solid(render(),green), "equal validation preserves every guest-buffer GPU pixel");
+            CHECK(backend_resource_reuse_stats().buffer_resident_compared_bytes == Bytes,
+                  "promotion and protected baseline require actual full comparison spans");
+        }
+        CHECK(solid(render(),green), "watched warm guest buffer preserves every GPU pixel");
+        CHECK(backend_resource_reuse_stats().buffer_resident_watched_bytes == Bytes &&
+                  backend_resource_reuse_stats().buffer_resident_compared_bytes == 0 &&
+                  backend_resource_reuse_stats().buffer_upload_bytes == 0,
+              "clean registered source uses write-watch proof without comparison or upload");
+    };
+    auto fresh_watch = [&](bool green) {
+        // Two dirty queries deliberately disable further watch attempts on an entry. Give each
+        // invalidation mechanism a fresh retained entry so none is tested only via that fallback.
+        { BackendPersistentResourceGuard guard; cache.index.clear(); cache.lru.clear(); }
+        CHECK(solid(render(),green), "fresh actual guest source starts from correct cold pixels");
+        CHECK(backend_resource_reuse_stats().buffer_resident_admitted_bytes == Bytes,
+              "each independent invalidation arm begins with a fresh retained entry");
+        warm(green);
+    };
+    auto store_positions = [&](uint32_t* destination, bool green) {
+        auto changed = visible; quad(changed,0,green);
+        auto* out = reinterpret_cast<volatile uint32_t*>(destination);
+        for (size_t i=0; i<8; ++i) out[i] = changed[i];
+    };
+    auto dirty_result = [&](bool green) {
+        CHECK(solid(render(),green), "invalidated guest source changes every GPU pixel correctly");
+        CHECK(backend_resource_reuse_stats().buffer_resident_watched_bytes == 0 &&
+                  backend_resource_reuse_stats().buffer_resident_compared_bytes == Bytes &&
+                  backend_resource_reuse_stats().buffer_upload_bytes == Bytes,
+              "dirty proof requires exact comparison and a complete changed upload");
+    };
+    CHECK(solid(render(),true), "cold registered guest buffer renders green");
+    CHECK(backend_resource_reuse_stats().buffer_resident_admitted_bytes == Bytes,
+          "cold actual guest source is admitted before any watch proof");
+    warm(true);
+    auto faults = guest_write_watch_stats().faults;
+    store_positions(mapping.a,false);
+    CHECK(guest_write_watch_stats().faults > faults,
+          "actual CPU store through original VA reaches the production fault handler");
+    dirty_result(false); fresh_watch(false);
+    faults = guest_write_watch_stats().faults;
+    store_positions(mapping.b,true);
+    CHECK(guest_write_watch_stats().faults > faults && mapping.a[0] == mapping.b[0],
+          "actual CPU store through physical alias faults and updates the original mapping");
+    dirty_result(true); fresh_watch(true);
+
+    guest_write_watch_notify_host_write(identity, 8*sizeof(uint32_t));
+    store_positions(mapping.a,false);
+    guest_write_watch_notify_host_write_done(identity, 8*sizeof(uint32_t));
+    dirty_result(false); fresh_watch(false);
+    // pwrite changes the shared physical backing without a CPU store through a protected alias.
+    // The explicit device-write notification, rather than an accidental SIGSEGV, must invalidate.
+    faults = guest_write_watch_stats().faults;
+    guest_write_watch_notify_gpu_write(identity, 8*sizeof(uint32_t));
+    CHECK(pwrite(mapping.fd, visible.data(), 8*sizeof(uint32_t), 0) == 8*ssize_t(sizeof(uint32_t)),
+          "device-style notified producer updates the real shared backing");
+    CHECK(guest_write_watch_stats().faults == faults,
+          "device-write invalidation is exercised without a substitute CPU protection fault");
+    dirty_result(true); fresh_watch(true);
+
+    // Hosted materialization may reuse the same identity while its bytes have independent
+    // authority. It must not inherit the direct source's still-clean page watch.
+    auto hosted = visible; quad(hosted,0,false);
+    CHECK(solid(f.render(hosted,identity),false),
+          "hosted bytes with same identity override clean watched guest bytes");
+    CHECK(backend_resource_reuse_stats().buffer_resident_watched_bytes == 0 &&
+              backend_resource_reuse_stats().buffer_resident_compared_bytes == Bytes,
+          "hosted replacement refuses direct guest watch authority");
+    CHECK(solid(f.render(hosted,identity),false) &&
+              backend_resource_reuse_stats().buffer_resident_watched_bytes == 0 &&
+              backend_resource_reuse_stats().buffer_resident_compared_bytes == Bytes,
+          "unchanged hosted materialization remains exact-comparison validated");
+    dirty_result(true); fresh_watch(true);
+
+    auto remapped = visible; quad(remapped,0,false);
+    CHECK(mapping.replace_primary(remapped), "same guest VA is replaced with a new physical mapping");
+    if (!mapping.a) return;
+    dirty_result(false); fresh_watch(false);
+    CHECK(mapping.b[0] == visible[0] && mapping.a[0] == remapped[0],
+          "old physical alias and replacement VA now contain independent bytes");
+
+    // Even a watched cache hit acquires a separate recorded GPU owner. A later dirty source
+    // must detach, not rewrite that earlier version before the pending commands consume it.
+    BackendColorTarget old_target{0x3489ee01ull,false,false};
+    BackendColorTarget new_target{0x3489ee02ull,false,false};
+    BackendSubmissionBatch batch;
+    (void)render_draws_rgba({direct_draw()},W,H,nullptr,Clear,false,&old_target,
+                           nullptr,nullptr,nullptr,&batch,false,nullptr,false);
+    CHECK(batch.pending() && backend_resource_reuse_stats().buffer_resident_watched_bytes == Bytes,
+          "queued old draw acquires the clean watched version");
+    store_positions(mapping.a,true);
+    (void)render_draws_rgba({direct_draw()},W,H,nullptr,Clear,false,&new_target,
+                           nullptr,nullptr,nullptr,&batch,false,nullptr,false);
+    CHECK(backend_resource_reuse_stats().buffer_resident_watched_bytes == 0 &&
+              backend_resource_reuse_stats().buffer_upload_bytes == Bytes,
+          "dirty source recorded while old owner is pending uploads a separate version");
+    const auto& ctx = render_vk_ctx();
+    BackendSubmissionBatchResult submitted;
+    { BackendPersistentResourceGuard guard;
+      submitted = batch.submit_and_wait(ctx.dev,ctx.queue,false);
+      if (submitted.submit_result == VK_SUCCESS && submitted.wait_result == VK_SUCCESS)
+          batch.complete(); }
+    CHECK(submitted.submit_result == VK_SUCCESS && submitted.wait_result == VK_SUCCESS &&
+              submitted.command_buffers == 2,
+          "both watched pending-version passes submit and complete successfully");
+    if (submitted.submit_result != VK_SUCCESS || submitted.wait_result != VK_SUCCESS) return;
+    std::vector<uint8_t> before, after; std::string error;
+    CHECK(readback_persistent_color_target(old_target.persistent_id,W,H,VK_FORMAT_UNDEFINED,before,error) &&
+              solid(before,false), "queued watched old version keeps its original blue result");
+    CHECK(readback_persistent_color_target(new_target.persistent_id,W,H,VK_FORMAT_UNDEFINED,after,error) &&
+              solid(after,true), "queued replacement independently produces the new green result");
+    { BackendPersistentResourceGuard guard; cache.index.clear(); cache.lru.clear(); }
+    // Destroy every cache watch before the actual mapping RAII cleanup publishes unmap events.
+}
+#else
+void guest_buffer_watch(const Fixture&) {
+    std::printf("[UNSUPPORTED] Linux direct-memory write-watch runtime arm; hosted cases remain covered\n");
+}
+#endif
+} // namespace
+
+namespace {
+void resident_owner_limits() {
+    CHECK(resident_render_buffer_owner_limit(0) == 0 &&
+              resident_render_buffer_owner_limit(15) == 0 &&
+              resident_render_buffer_owner_limit(16) == 1 &&
+              resident_render_buffer_owner_limit(4096) == 256 &&
+              resident_render_buffer_owner_limit(UINT32_MAX) == 4096,
+          "resident owner allowance is a bounded fraction of the device allocation limit");
+    BackendPersistentResourceGuard guard;
+    const auto& ctx = render_vk_ctx();
+    CHECK(ctx.ok, "allocation-count controls have a real Vulkan device");
+    if (!ctx.ok) return;
+    auto constrained = ctx;
+    constrained.detile_limits.maxMemoryAllocationCount = 0;
+    ResidentRenderBufferCache cache;
+    auto source = payload();
+    constexpr VkDeviceSize Limit = 64ull * 1024 * 1024;
+    constexpr uint64_t Identity = 0x3489e0000ull;
+    BackendResourceReuseStats stats;
+    auto& pool = render_host_buffer_pool();
+    auto acquisitions = [&] { return pool.hits + pool.misses; };
+    const auto before_zero = acquisitions();
+    CHECK(!cache.admit(constrained, {Identity, Bytes}, source.data(), Limit, stats) &&
+              acquisitions() == before_zero && cache.charged_owners->load() == 0,
+          "zero owner allowance declines before acquiring any Vulkan buffer");
+    constrained.detile_limits.maxMemoryAllocationCount = 16; // One local owner, not driver stress.
+    auto pin = cache.admit(constrained, {Identity, Bytes}, source.data(), Limit, stats);
+    CHECK(pin && cache.charged_owners->load() == 1,
+          "a successful retained allocation consumes one owner allowance");
+    if (!pin) return;
+    source[0] ^= 1;
+    CHECK(!cache.find(ctx.dev, {Identity, Bytes}, source.data(), stats) &&
+              cache.index.empty() && cache.charged_owners->load() == 1,
+          "detached pinned allocation remains counted after its index entry disappears");
+    const auto before_pinned = acquisitions();
+    CHECK(!cache.admit(constrained, {Identity+1, Bytes}, source.data(), Limit, stats) &&
+              acquisitions() == before_pinned && cache.charged_owners->load() == 1,
+          "ample byte budget cannot bypass the detached owner's allocation allowance");
+    pin.reset();
+    CHECK(cache.charged_owners->load() == 0 && cache.charged_bytes->load() == 0,
+          "final detached owner releases its allocation and byte charges");
+
+    // Populate 32 incompatible old sizes before one compatible idle tail. Byte space remains
+    // plentiful; only the injected 33-owner limit forces the bounded rekey path.
+    constrained.detile_limits.maxMemoryAllocationCount = 33 * 16;
+    for (uint64_t i = 0; i < 32; ++i) {
+        auto prefix = cache.admit(constrained, {Identity+10+i, Bytes/2},
+                                  source.data(), Limit, stats);
+        CHECK(bool(prefix), "incompatible prefix owns a real four-KiB Vulkan upload");
+    }
+    auto tail = cache.admit(constrained, {Identity+50, Bytes}, source.data(), Limit, stats);
+    CHECK(tail && cache.charged_owners->load() == 33 && cache.charged_bytes->load() < Limit/2,
+          "compatible tail reaches owner pressure with ample byte headroom");
+    if (!tail) return;
+    const auto tail_buffer = tail->storage.buffer;
+    tail.reset();
+    const auto before_scan = acquisitions();
+    const auto bytes_before_scan = cache.charged_bytes->load();
+    CHECK(!cache.admit(constrained, {Identity+51, Bytes}, source.data(), Limit, stats) &&
+              acquisitions() == before_scan && cache.lru.front().key.identity == Identity+10,
+          "first 32-entry scan is bounded and does not alter LRU recency or allocate");
+    auto reached = cache.admit(constrained, {Identity+51, Bytes}, source.data(), Limit, stats);
+    CHECK(reached && reached->storage.buffer == tail_buffer &&
+              cache.charged_owners->load() == 33 && acquisitions() == before_scan &&
+              cache.charged_bytes->load() == bytes_before_scan &&
+              !cache.index.contains({Identity+50, Bytes}) &&
+              cache.index.at({Identity+51, Bytes})->owner == reached,
+          "next bounded scan reaches the compatible tail and rekeys the same Vulkan buffer");
+    if (!reached) return;
+    auto changed = source;
+    changed[0] ^= 1;
+    CHECK(!cache.admit(constrained, {Identity+52, Bytes}, changed.data(), Limit, stats) &&
+              !cache.admit(constrained, {Identity+52, Bytes}, changed.data(), Limit, stats) &&
+              acquisitions() == before_scan && cache.index.contains({Identity+51, Bytes}) &&
+              std::memcmp(reached->snapshot.get(), source.data(), Bytes) == 0,
+          "rotating scan cannot overwrite a pinned tail or exceed the owner allowance");
+    const auto ledger = cache.charged_owners;
+    cache.index.clear();
+    cache.lru.clear();
+    CHECK(ledger->load() == 1, "explicit cache clear leaves the surviving pin counted");
+    reached.reset();
+    CHECK(ledger->load() == 0, "last pin releases the final counted allocation after clear");
+    constrained.detile_limits.maxMemoryAllocationCount = 16;
+    auto fresh = cache.admit(constrained, {Identity+60, Bytes}, source.data(), Limit, stats);
+    CHECK(bool(fresh), "cache can admit after an explicit clear with an old cursor key");
+    fresh.reset();
+    CHECK(bool(cache.admit(constrained, {Identity+61, Bytes}, source.data(), Limit, stats)),
+          "missing old cursor safely resumes at the remaining singleton");
+}
+} // namespace
+
+int main(int argc, char** argv) {
+    std::printf("== renderer buffer residency ==\n");
+    CHECK(published_render_cache_context().load(std::memory_order_acquire) == nullptr,
+          "cold diagnostic control starts before Vulkan context publication");
+    CHECK(!resident_render_buffer_cache_snapshot().available &&
+              published_render_cache_context().load(std::memory_order_acquire) == nullptr,
+          "unavailable residency statistics do not initialize Vulkan");
+    Fixture f;
+    CHECK(!f.vs.empty() && !f.fs.empty(), "real vertex-fetch and green fragment shaders compile");
+    if (f.vs.empty() || f.fs.empty()) return 1;
+    if (argc != 1) {
+        if (argc != 3 || std::string(argv[1]) != "--dump-spv") return 2;
+        const std::filesystem::path directory(argv[2]);
+        std::error_code error;
+        std::filesystem::create_directories(directory, error);
+        if (error) return 2;
+        const auto atomic = atomic_fragment(f.fs);
+        const auto unresolved = atomic_fragment(f.fs,true);
+        if (atomic.empty() || unresolved.empty()) return 1;
+        const auto save = [&](const char* name, const std::vector<uint32_t>& words) {
+            const auto path = directory / name;
+            if (std::filesystem::exists(path)) return false;
+            std::ofstream stream(path, std::ios::binary);
+            stream.write(reinterpret_cast<const char*>(words.data()),
+                         static_cast<std::streamsize>(words.size() * sizeof(uint32_t)));
+            stream.close();
+            return !stream.fail();
+        };
+        CHECK(save("vertex.spv", f.vs), "export actual vertex-fetch module");
+        CHECK(save("fragment.spv", f.fs), "export actual green fragment module");
+        CHECK(save("fragment-atomic.spv", atomic), "export actual alias-writer module");
+        CHECK(save("fragment-unresolved.spv", unresolved), "export actual copied-pointer atomic module");
+        return failures ? 1 : 0; // Export requires no Vulkan device or runtime execution.
+    }
+    CHECK(backend_module_has_readonly_buffers(f.vs) && backend_module_has_readonly_buffers(f.fs),
+          "final shaders have complete read-only storage-buffer proof");
+    auto current=payload();
+    constexpr uint64_t Identity=0x348900001ull;
+    disabled(true);
+    auto green=f.render(current, Identity);
+    CHECK(solid(green,true), "CPU-upload control covers every pixel green");
+    CHECK(backend_resource_reuse_stats().buffer_resident_hits==0,
+          "explicit disabled control does not borrow resident input");
+    disabled(false);
+    CHECK(f.render(current,Identity)==green,"cold retained upload matches control pixels");
+    CHECK(backend_resource_reuse_stats().buffer_resident_admitted_bytes==Bytes,
+          "one complete current source is admitted");
+    auto& cache=resident_render_buffer_cache();
+    std::weak_ptr<ResidentRenderBuffer> completed_owner;
+    VkBuffer completed_buffer=VK_NULL_HANDLE;
+    {
+        BackendPersistentResourceGuard guard;
+        const auto found=cache.index.find({Identity,Bytes});
+        CHECK(found!=cache.index.end(),"completed cold upload remains resident");
+        if (found!=cache.index.end()) {
+            completed_owner=found->second->owner;
+            completed_buffer=found->second->owner->storage.buffer;
+            CHECK(found->second->owner.use_count()==1,
+                  "completed upload has no outstanding submission owner before refresh");
+            CHECK(found->second->owner->snapshot_bytes == Bytes &&
+                      found->second->owner->retained_bytes() ==
+                          found->second->owner->storage.allocation_bytes + Bytes,
+                  "residency budget includes the exact CPU comparison snapshot and Vulkan allocation");
+            // No queued commands use this completed upload. Make its mapping unreadable to this
+            // lookup without changing the real Vulkan allocation: an equal hit must only inspect
+            // ordinary CPU snapshot memory. A mapped-memory comparison would fault here.
+            auto& owner = found->second->owner;
+            void* mapping = owner->storage.mapped;
+            owner->storage.mapped = nullptr;
+            BackendResourceReuseStats observed;
+            auto hit = cache.find(owner->device, {Identity,Bytes}, current.data(), observed);
+            owner->storage.mapped = mapping;
+            CHECK(hit == owner && observed.buffer_resident_hits == 1,
+                  "equal lookup does not read the potentially uncached Vulkan mapping");
+        }
+    }
+    for (auto first:Quads) {
+        CHECK(f.render(current,Identity,first)==green,
+              "unchanged first/middle/last vertex fetch sees the retained complete payload");
+        CHECK(backend_resource_reuse_stats().buffer_resident_hits==1 &&
+              backend_resource_reuse_stats().buffer_resident_reused_bytes==Bytes,
+              "unchanged renderer call reuses the complete immutable upload");
+        quad(current,first,false);
+        CHECK(solid(f.render(current,Identity,first),false),
+              "changed first/middle/last source region produces the actual clear-blue frame");
+        const auto refreshed=backend_resource_reuse_stats();
+        CHECK(refreshed.buffer_resident_hits==0 && refreshed.buffer_resident_reused_bytes==0 &&
+                  refreshed.buffer_resident_refreshed_bytes==Bytes &&
+                  refreshed.buffer_resident_admitted_bytes==0,
+              "changed completed source performs a full refresh, not an unchanged hit or allocation");
+        {
+            BackendPersistentResourceGuard guard;
+            const auto found=cache.index.find({Identity,Bytes});
+            const auto original=completed_owner.lock();
+            CHECK(original && found!=cache.index.end() && found->second->owner==original &&
+                      original->storage.buffer==completed_buffer,
+                  "idle exact-key refresh preserves the same owner and actual Vulkan buffer");
+        }
+        quad(current,first,true);
+        CHECK(f.render(current,Identity,first)==green,"restored source repairs stale retained bytes");
+    }
+    auto hosted=payload(); quad(hosted,Quads.back(),false);
+    CHECK(hosted.data()!=current.data(),"replacement host backing is simultaneously distinct");
+    CHECK(solid(f.render(hosted,Identity,Quads.back()),false),
+          "same guest identity with replacement host bytes does not reuse stale pixels");
+    CHECK(f.render(current,Identity,Quads.back())==green,
+          "switching back to original host backing restores correct pixels");
+
+    // Cold versions recorded before either submission completes. Inspect existing owner handles
+    // only to prove lifetime/budget; both independent images are the content oracle.
+    constexpr uint64_t PendingIdentity=0x348900002ull;
+    BackendColorTarget target_a{0x3489a001ull,false,false}, target_b{0x3489b001ull,false,true};
+    BackendSubmissionBatch batch;
+    auto pending=payload();
+    auto no_pixels=render_draws_rgba({f.draw(pending,PendingIdentity,Quads.back())},W,H,
+        nullptr,Clear,false,&target_a,nullptr,nullptr,nullptr,&batch,false,nullptr,false);
+    CHECK(no_pixels.empty() && batch.pending(),"first real render retains an unsubmitted upload");
+    std::weak_ptr<ResidentRenderBuffer> old;
+    uint64_t old_charge=0;
+    {
+        BackendPersistentResourceGuard guard;
+        auto found=cache.index.find({PendingIdentity,Bytes});
+        CHECK(found!=cache.index.end(),"pending source has a resident allocation");
+        if (found!=cache.index.end()) {
+            old=found->second->owner; old_charge=found->second->owner->retained_bytes();
+        }
+    }
+    quad(pending,Quads.back(),false);
+    auto b=render_draws_rgba({f.draw(pending,PendingIdentity,Quads.back())},W,H,
+        nullptr,Clear,false,&target_b,nullptr,nullptr,nullptr,&batch,false,nullptr,false);
+    CHECK(b.empty() && batch.pending() && !old.expired(),
+          "changed source leaves the older recorded allocation alive until completion");
+    {
+        BackendPersistentResourceGuard guard;
+        CHECK(cache.charged_bytes->load()>=2*old_charge && old_charge!=0,
+              "detached recorded version remains charged alongside its replacement");
+        const auto idle = cache.index.find({Identity,Bytes});
+        CHECK(idle!=cache.index.end() && idle->second->owner.use_count()==1,
+              "an independent completed upload is idle and available for reclamation");
+        std::weak_ptr<ResidentRenderBuffer> idle_owner;
+        if (idle!=cache.index.end()) idle_owner=idle->second->owner;
+        const auto before=cache.charged_bytes->load();
+        BackendResourceReuseStats declined;
+        CHECK(!cache.admit(render_vk_ctx(), {PendingIdentity+100,Bytes}, current.data(),
+                           old_charge, declined),
+              "pinned versions cannot be reclaimed to fake available budget");
+        CHECK(!idle_owner.expired() && cache.index.find({Identity,Bytes})!=cache.index.end() &&
+                  cache.charged_bytes->load()==before,
+              "some idle bytes cannot satisfy admission: preserve that unrelated cache entry");
+    }
+    const auto& ctx=render_vk_ctx();
+    BackendSubmissionBatchResult submitted;
+    const auto owners_before_completion = cache.charged_owners->load();
+    {
+        BackendPersistentResourceGuard guard;
+        submitted=batch.submit_and_wait(ctx.dev,ctx.queue,false);
+        if (submitted.submit_result==VK_SUCCESS && submitted.wait_result==VK_SUCCESS) batch.complete();
+    }
+    CHECK(submitted.submit_result==VK_SUCCESS && submitted.wait_result==VK_SUCCESS &&
+              submitted.command_buffers==2, "both recorded passes complete successfully");
+    if (submitted.submit_result!=VK_SUCCESS || submitted.wait_result!=VK_SUCCESS) return 1;
+    CHECK(!batch.pending() && old.expired(),"completed cleanup releases the detached old version");
+    CHECK(cache.charged_owners->load() + 1 == owners_before_completion,
+          "actual submission completion releases exactly the detached owner allowance");
+    std::vector<uint8_t> a_pixels,b_pixels; std::string error;
+    CHECK(readback_persistent_color_target(target_a.persistent_id,W,H,VK_FORMAT_UNDEFINED,a_pixels,error) &&
+              a_pixels==green,"earlier queued draw reads original bytes after later source mutation");
+    CHECK(readback_persistent_color_target(target_b.persistent_id,W,H,VK_FORMAT_UNDEFINED,b_pixels,error) &&
+              solid(b_pixels,false),"later queued draw independently reads replacement bytes");
+
+    // A different exact range is a different upload, even when the entire old prefix matches.
+    auto larger=current; larger.resize(Words*2,0);
+    const uint32_t new_tail=static_cast<uint32_t>(larger.size()/2-4);
+    quad(larger,new_tail,true);
+    CHECK(f.render(larger,Identity,new_tail)==green,
+          "larger same-identity range reads newly added tail vertices correctly");
+    CHECK(backend_resource_reuse_stats().buffer_resident_hits==0 &&
+              backend_resource_reuse_stats().buffer_resident_admitted_bytes==larger.size()*4,
+          "changed extent cannot borrow the previous shorter descriptor range");
+    CHECK(f.render(current,Identity)==green && backend_resource_reuse_stats().buffer_resident_hits==1,
+          "original exact-size entry remains independently reusable");
+    quad(larger,new_tail,false);
+    CHECK(solid(f.render(larger,Identity,new_tail),false),
+          "mutation beyond the original range changes the real rendered result");
+
+    // Discard is a never-submitted path. Its normal complete() releases recorded resource closures;
+    // cached latest versions remain owned, but a detached older version must not leak its charge.
+    constexpr uint64_t DiscardIdentity=0x348900004ull;
+    BackendColorTarget discard_a{0x3489c001ull,false,false}, discard_b{0x3489d001ull,false,false};
+    BackendSubmissionBatch discarded;
+    auto discard_source=payload();
+    (void)render_draws_rgba({f.draw(discard_source,DiscardIdentity)},W,H,nullptr,Clear,false,
+        &discard_a,nullptr,nullptr,nullptr,&discarded,false,nullptr,false);
+    std::weak_ptr<ResidentRenderBuffer> detached;
+    uint64_t detached_charge=0;
+    {
+        BackendPersistentResourceGuard guard;
+        const auto found=cache.index.find({DiscardIdentity,Bytes});
+        CHECK(found!=cache.index.end(),"discard control records a resident source");
+        if (found!=cache.index.end()) {
+            detached=found->second->owner; detached_charge=found->second->owner->retained_bytes();
+        }
+    }
+    quad(discard_source,0,false);
+    (void)render_draws_rgba({f.draw(discard_source,DiscardIdentity)},W,H,nullptr,Clear,false,
+        &discard_b,nullptr,nullptr,nullptr,&discarded,false,nullptr,false);
+    CHECK(discarded.pending() && !detached.expired(),
+          "discard control has an old detached version retained by unsubmitted commands");
+    {
+        BackendPersistentResourceGuard guard;
+        const auto before=cache.charged_bytes->load();
+        const auto owners_before_discard = cache.charged_owners->load();
+        discarded.discard();
+        discarded.complete();
+        CHECK(!discarded.pending() && detached.expired() && detached_charge!=0 &&
+                  cache.charged_bytes->load()==before-detached_charge,
+              "never-submitted discard cleanup releases exactly the detached version charge");
+        CHECK(cache.charged_owners->load() + 1 == owners_before_discard,
+              "never-submitted discard releases exactly the detached owner allowance");
+    }
+    CHECK(solid(f.render(discard_source,DiscardIdentity),false) &&
+              backend_resource_reuse_stats().buffer_resident_hits==1,
+          "discarded commands leave the immutable current host-upload snapshot reusable");
+
+    auto small=current; small.resize(16);
+    CHECK(solid(f.render(small,0x348900003ull),true),"small source retains correct ordinary upload");
+    CHECK(backend_resource_reuse_stats().buffer_resident_admitted_bytes==0,
+          "small sources remain outside residency admission");
+    CHECK(f.render(current,0)==green,"zero-identity input remains a valid rendering source");
+    CHECK(backend_resource_reuse_stats().buffer_resident_admitted_bytes==0,
+          "zero identity is not upgraded to persistent guest authority");
+
+    if (ctx.fragment_stores_atomics) {
+        auto shared_reader=f.draw(current,Identity);
+        shared_reader.vs_shared=std::make_shared<const std::vector<uint32_t>>(f.vs);
+        shared_reader.fs_shared=std::make_shared<const std::vector<uint32_t>>(f.fs);
+        shared_reader.vs.clear();
+        // Raw words deliberately disagree: shared words are the effective shader until set_fs.
+        shared_reader.fs=atomic_fragment(f.fs);
+        shared_reader.fs_identity=0x3489f001ull;
+        CHECK(!shared_reader.fs.empty() && shared_reader.fs_words()==f.fs,
+              "shared fragment words take precedence over a raw writer decoy");
+        CHECK(render_draws_rgba({shared_reader},W,H,nullptr,Clear)==green &&
+                  backend_resource_reuse_stats().buffer_resident_hits==1,
+              "actual shared-module read-only pass warms its proof and reuses resident input");
+        CHECK(render_draws_rgba({shared_reader},W,H,nullptr,Clear)==green &&
+                  backend_resource_reuse_stats().buffer_resident_hits==1,
+              "the same live shared owners remain eligible on a repeated pass");
+        auto writer=shared_reader;
+        writer.set_fs(atomic_fragment(f.fs));
+        CHECK(!writer.fs_shared && writer.fs_identity==0,
+              "set_fs replaces shared fragment authority and clears the old pipeline identity");
+        CHECK(!writer.fs.empty() && !backend_module_has_readonly_buffers(writer.fs),
+              "actual fragment atomic prevents whole-pass immutable admission");
+        FrameResource alias=writer.R[0]; alias.set=1; alias.binding=4;
+        writer.R.push_back(alias);
+        auto output=render_draws_rgba({shared_reader,writer},W,H,nullptr,Clear);
+        CHECK(output==green,"reader plus atomic alias writer renders correctly through ordinary uploads");
+        CHECK(backend_resource_reuse_stats().buffer_resident_hits==0 &&
+              backend_resource_reuse_stats().buffer_resident_admitted_bytes==0,
+              "later fragment writer excludes resident input for the entire multi-draw pass");
+        auto unresolved_writer=shared_reader;
+        unresolved_writer.set_fs(atomic_fragment(f.fs,true));
+        CHECK(!unresolved_writer.fs.empty(), "copied-pointer atomic module is constructed");
+        if (!unresolved_writer.fs.empty()) {
+            const auto report=validate_spirv_descriptor_interface(
+                unresolved_writer.fs,nullptr,0,SpirvShaderStage::Fragment,false);
+            CHECK(!report.storage_buffer_writes_complete &&
+                      !backend_module_has_readonly_buffers(unresolved_writer.fs),
+                  "unresolved atomic pointer fails the complete negative-write proof");
+            unresolved_writer.R.push_back(alias);
+            auto unresolved_pixels=render_draws_rgba(
+                {shared_reader,unresolved_writer},W,H,nullptr,Clear);
+            CHECK(unresolved_pixels==green,
+                  "valid copied-pointer atomic executes with correct pixels using ordinary uploads");
+            CHECK(backend_resource_reuse_stats().buffer_resident_hits==0 &&
+                      backend_resource_reuse_stats().buffer_resident_admitted_bytes==0 &&
+                      backend_resource_reuse_stats().buffer_resident_refreshed_bytes==0,
+                  "incomplete write attribution excludes resident inputs for the whole actual pass");
+        }
+    } else std::printf("[UNSUPPORTED] fragment atomics; writer runtime arm not exercised\n");
+    {
+        BackendPersistentResourceGuard guard;
+        auto temporary=std::make_shared<const std::vector<uint32_t>>(f.fs);
+        std::weak_ptr<const std::vector<uint32_t>> observed=temporary;
+        CHECK(backend_module_has_readonly_buffers(*temporary,temporary),
+              "an independently owned shared module can populate the proof memo");
+        temporary.reset();
+        CHECK(observed.expired(),"proof memo does not keep an otherwise dead shader owner alive");
+    }
+    // A working set larger than residency must not allocate/free Vulkan objects on each scan.
+    // All previous submissions completed. Exercise pressured rekeying in the actual global cache,
+    // then use a real draw to prove its replacement mapping contains the new snapshot bytes.
+    {
+        BackendPersistentResourceGuard guard;
+        cache.index.clear();
+        cache.lru.clear();
+        CHECK(cache.charged_bytes->load() == 0, "completed residency releases both memory charges");
+    }
+    constexpr uint64_t RekeyIdentity = 0x348900100ull;
+    CHECK(f.render(current, RekeyIdentity) == green, "rekey control starts from a real green upload");
+    auto replacement = current;
+    quad(replacement, 0, false);
+    {
+        BackendPersistentResourceGuard guard;
+        const auto before = cache.charged_bytes->load();
+        const auto found = cache.index.find({RekeyIdentity, Bytes});
+        CHECK(found != cache.index.end(), "rekey control has one retained allocation");
+        if (found != cache.index.end()) {
+            const VkBuffer original_buffer = found->second->owner->storage.buffer;
+            auto pin = found->second->owner;
+            BackendResourceReuseStats stats;
+            CHECK(!cache.admit(ctx, {RekeyIdentity+1,Bytes}, replacement.data(), before, stats),
+                  "full pinned cache declines replacement without overwriting its recorded owner");
+            pin.reset();
+            auto incompatible = current; incompatible.resize(Words*2);
+            CHECK(!cache.admit(ctx, {RekeyIdentity+2,Bytes*2}, incompatible.data(), before, stats) &&
+                      cache.index.contains({RekeyIdentity,Bytes}) &&
+                      cache.charged_bytes->load() == before,
+                  "full incompatible cache declines without eviction or extra allocation");
+            auto reused = cache.admit(ctx, {RekeyIdentity+1,Bytes}, replacement.data(), before, stats);
+            CHECK(reused && reused->storage.buffer == original_buffer &&
+                      cache.charged_bytes->load() == before &&
+                      !cache.index.contains({RekeyIdentity,Bytes}) &&
+                      cache.index.contains({RekeyIdentity+1,Bytes}),
+                  "pressured equal-size admission rekeys an idle Vulkan allocation at constant charge");
+            CHECK(reused && stats.buffer_resident_admitted_bytes == Bytes &&
+                      stats.buffer_resident_hits == 0 && stats.buffer_upload_bytes == Bytes,
+                  "rekey is a new copied admission, never an unchanged source hit");
+        }
+    }
+    CHECK(solid(f.render(replacement, RekeyIdentity+1), false),
+          "actual rekeyed GPU upload draws the changed blue result rather than stale green geometry");
+    // A non-power-of-two payload needs a rounded Vulkan allocation AND an exact CPU snapshot.
+    // 13 KiB spare fits twice a 6 KiB payload, but cannot fit its 8+6 KiB resident allocation.
+    auto rounded_source = current;
+    rounded_source.resize(1536);
+    constexpr VkDeviceSize RoundedBytes = 6144;
+    CHECK(f.render(rounded_source, RekeyIdentity+3) == green,
+          "non-power-of-two control uploads real six-KiB vertex data");
+    quad(rounded_source,0,false);
+    {
+        BackendPersistentResourceGuard guard;
+        const auto before = cache.charged_bytes->load();
+        const auto found = cache.index.find({RekeyIdentity+3,RoundedBytes});
+        CHECK(found != cache.index.end(), "rounded control owns the six-KiB upload");
+        if (found != cache.index.end()) {
+            const auto original_buffer = found->second->owner->storage.buffer;
+            BackendResourceReuseStats stats;
+            auto rekeyed = cache.admit(ctx, {RekeyIdentity+4,RoundedBytes}, rounded_source.data(),
+                                      before + 13*1024, stats);
+            CHECK(rekeyed && rekeyed->storage.buffer == original_buffer &&
+                      cache.charged_bytes->load() == before,
+                  "rounded allocation pressure rekeys instead of allocating and rejecting repeatedly");
+        }
+    }
+    CHECK(solid(f.render(rounded_source, RekeyIdentity+4),false),
+          "rounded rekey uploads the changed bytes to the actual GPU draw");
+    disabled(false);
+    guest_buffer_watch(f);
+    resident_owner_limits();
+    std::printf("== %s (%d failures) ==\n",failures?"FAIL":"PASS",failures);
+    return failures?1:0;
+}

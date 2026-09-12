@@ -88,6 +88,109 @@ static std::vector<uint32_t> descriptor_test_spirv() {
     return s;
 }
 
+static void append_extended_import(std::vector<uint32_t>& s, uint32_t id, const char* name) {
+    const size_t offset = s.size();
+    emit_string(s, 11, name);
+    s[offset] += 1u << 16;
+    s.insert(s.begin() + offset + 1, id);
+}
+
+static void check_buffer_write_completeness() {
+    // Like descriptor_test_spirv these are instruction-level reflection fixtures, not executable
+    // modules. The direct read stays present in every arm: a missed indirect store otherwise makes
+    // this SAME binding look read-only. No Vulkan/validator claim follows from parsing these words.
+    const auto reflect = [](const std::vector<uint32_t>& s) {
+        return validate_spirv_descriptor_interface(s, nullptr, 0, SpirvShaderStage::Vertex);
+    };
+    const auto base = descriptor_test_spirv();
+    const auto plain = reflect(base);
+    CHECK(plain.storage_buffer_writes_complete && plain.descriptors.size() == 1 &&
+              plain.descriptors[0].readable && !plain.descriptors[0].writable,
+          "direct buffer read has a complete negative-write proof");
+    auto direct = base;
+    emit(direct, 62, {9, 6});
+    const auto direct_report = reflect(direct);
+    CHECK(direct_report.storage_buffer_writes_complete &&
+              direct_report.descriptors[0].readable && direct_report.descriptors[0].writable,
+          "resolved buffer store retains completeness and marks the read binding writable");
+    for (uint16_t alias_op : {uint16_t{83}, uint16_t{169}, uint16_t{245}, uint16_t{55}}) {
+        auto indirect = base;
+        if (alias_op == 83) emit(indirect, alias_op, {5, 30, 9});  // CopyObject
+        if (alias_op == 169) {
+            emit(indirect, 20, {28}); emit(indirect, 41, {28, 29});
+            emit(indirect, alias_op, {5, 30, 29, 9, 9});         // Select
+        }
+        if (alias_op == 245) emit(indirect, alias_op, {5, 30, 9, 26, 9, 27}); // Phi
+        if (alias_op == 55) emit(indirect, alias_op, {5, 30});  // FunctionParameter
+        for (uint16_t write_op : {uint16_t{62}, uint16_t{63}, uint16_t{64},
+                                  uint16_t{228}, uint16_t{234}, uint16_t{319}}) {
+            auto modified = indirect;
+            if (write_op == 62) emit(modified, write_op, {30, 6});
+            if (write_op == 63) emit(modified, write_op, {30, 9});
+            if (write_op == 64) emit(modified, write_op, {30, 9, 7});
+            if (write_op == 228) emit(modified, write_op, {30, 6, 6, 6});
+            if (write_op == 234) emit(modified, write_op, {1, 31, 30, 6, 6, 6});
+            if (write_op == 319) emit(modified, write_op, {30, 6, 6});
+            const auto result = reflect(modified);
+            CHECK(result.descriptors.size() == 1 && result.descriptors[0].readable &&
+                      !result.descriptors[0].writable && !result.storage_buffer_writes_complete,
+                  "unresolved alias store/copy/atomic vetoes false read-only authority");
+            CHECK(result.storage_image_writes_complete == plain.storage_image_writes_complete,
+                  "buffer completeness refusal leaves existing image proof unchanged");
+            CHECK(!reflect(modified).storage_buffer_writes_complete,
+                  "cached exact-module reflection preserves incomplete buffer-write proof");
+        }
+    }
+    for (uint16_t copy_op : {uint16_t{63}, uint16_t{64}}) {
+        auto copied = base;
+        if (copy_op == 63) emit(copied, copy_op, {9, 9});
+        else emit(copied, copy_op, {9, 9, 7});
+        const auto result = reflect(copied);
+        CHECK(result.storage_buffer_writes_complete && result.descriptors[0].writable,
+              "resolved memory-copy destination cannot remain read-only");
+    }
+    for (uint32_t storage : {3u, 4u, 6u, 7u}) {
+        auto local = base;
+        emit(local, 32, {28, storage, 1}); emit(local, 59, {28, 29, storage});
+        emit(local, 62, {29, 6});
+        const auto result = reflect(local);
+        CHECK(result.storage_buffer_writes_complete && !result.descriptors[0].writable,
+              "known output/workgroup/private/function store is not a descriptor write");
+    }
+    for (uint32_t operation : {38u, 35u, 51u, 82u}) {
+        auto extended = base;
+        append_extended_import(extended, 28, "GLSL.std.450");
+        emit(extended, 12, {1, 29, 28, operation, 10, operation == 38u ? 6u : 9u});
+        const auto result = reflect(extended);
+        CHECK(result.storage_buffer_writes_complete == (operation != 82u) &&
+                  result.descriptors[0].writable == (operation == 35u || operation == 51u),
+              "known GLSL value op and Modf/Frexp output pointers have distinct write contracts");
+        if (operation == 35u || operation == 51u) {
+            extended = base;
+            append_extended_import(extended, 28, "GLSL.std.450");
+            emit(extended, 83, {5, 30, 9});
+            emit(extended, 12, {1, 29, 28, operation, 10, 30});
+            CHECK(!reflect(extended).storage_buffer_writes_complete,
+                  "GLSL out parameter through unresolved pointer vetoes completeness");
+        }
+    }
+    auto unknown = base;
+    append_extended_import(unknown, 28, "Unknown.memory.effects");
+    emit(unknown, 12, {1, 29, 28, 38, 10, 6});
+    CHECK(!reflect(unknown).storage_buffer_writes_complete,
+          "unknown extended import cannot supply a negative buffer-write proof");
+    auto vendor = base;
+    emit(vendor, 6035, {1, 29, 9, 6, 6, 6});
+    CHECK(!reflect(vendor).storage_buffer_writes_complete,
+          "unmodelled extended atomic operation vetoes completeness");
+    auto truncated = base;
+    emit(truncated, 62, {9});
+    CHECK(!reflect(truncated).storage_buffer_writes_complete,
+          "truncated write operands cannot establish completeness");
+    CHECK(!reflect({}).storage_buffer_writes_complete,
+          "invalid module starts with no negative-write authority");
+}
+
 // An ARRAY of eight storage-buffer descriptors at one binding (#2412 stage 4). Same shape as
 // descriptor_test_spirv, with the variable's pointee wrapped in `OpTypeArray %Block %8` so the binding
 // declares eight descriptors rather than one, and the access chain carrying the extra leading index that
@@ -635,6 +738,7 @@ int main() {
           "packed R10G10B10A2 fields normalize and round independently");
 
     const std::vector<uint32_t> spv = descriptor_test_spirv();
+    check_buffer_write_completeness();
     ShaderResource good{}; good.cls = ResourceClass::VertexBuffer; good.binding = 9;
     good.size = 20; good.gpu_addr = 0x12340000; good.stride = 4;
     ShaderResourceTable valid; valid.resources.push_back(good);

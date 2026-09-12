@@ -113,6 +113,19 @@ static uint64_t copy_threads_old(const char* t) {
     return parsed > 32ul ? 32ull : static_cast<uint64_t>(parsed);
 }
 
+// --- tests/fixtures/render_runner.h : PROSPER_BACKEND_BUFFER_RESIDENCY_MB ----------------------
+// New strict-only knob: the permissive spelling below is a counterexample, not shipped history.
+// Exercise both platform defaults: Linux 256 MiB, unsupported write-watch platforms 0 MiB.
+template <uint64_t Default>
+static uint64_t buffer_residency_new(const char* n, const char* t) {
+    return env_u64_or_default_capped(n, t, Default, 2048, "MiB") * 1024ull * 1024ull;
+}
+template <uint64_t Default>
+static uint64_t buffer_residency_permissive(const char* t) {
+    const uint64_t mib = t ? std::strtoull(t, nullptr, 10) : Default;
+    return (mib > 2048 ? 2048 : mib) * 1024ull * 1024ull;
+}
+
 // --- tests/fixtures/render_runner.h : PROSPER_BACKEND_BUFFER_ARENA_KB --------------------------
 static uint64_t arena_new(const char* n, const char* t) {
     const uint64_t kib = env_u64_or_default_capped(n, t, 1024ull, UINT64_MAX / 1024ull, "KiB");
@@ -311,6 +324,18 @@ static const uint64_t kMiB = 1024ull * 1024ull;
 static const uint64_t kGiB = 1024ull * kMiB;
 
 static const Site kSites[] = {
+    {"render_runner.h PROSPER_BACKEND_BUFFER_RESIDENCY_MB (Linux zero)",
+     "PROSPER_BACKEND_BUFFER_RESIDENCY_MB", buffer_residency_new<256>,
+     buffer_residency_permissive<256>, "-1", 256ull * kMiB, "0", 0},
+    {"render_runner.h PROSPER_BACKEND_BUFFER_RESIDENCY_MB (Linux cap)",
+     "PROSPER_BACKEND_BUFFER_RESIDENCY_MB", buffer_residency_new<256>,
+     buffer_residency_permissive<256>, "64MiB", 256ull * kMiB, "4096", 2048ull * kMiB},
+    {"render_runner.h PROSPER_BACKEND_BUFFER_RESIDENCY_MB (unsupported opt-in)",
+     "PROSPER_BACKEND_BUFFER_RESIDENCY_MB", buffer_residency_new<0>,
+     buffer_residency_permissive<0>, "-1", 0, "256", 256ull * kMiB},
+    {"render_runner.h PROSPER_BACKEND_BUFFER_RESIDENCY_MB (unsupported cap)",
+     "PROSPER_BACKEND_BUFFER_RESIDENCY_MB", buffer_residency_new<0>,
+     buffer_residency_permissive<0>, "64MiB", 0, "4096", 2048ull * kMiB},
     // A malformed value used to make the cap 1024x TIGHTER than asked for -- which on this knob
     // means "watch essentially nothing", since every range above 8 KiB is then refused a watch.
     // TWO malformed inputs are deliberately absent, for the same reason: `-1` saturates and is then
