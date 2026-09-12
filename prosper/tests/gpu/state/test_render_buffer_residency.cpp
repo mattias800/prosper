@@ -484,6 +484,16 @@ void resident_owner_limits() {
 } // namespace
 
 int main(int argc, char** argv) {
+    if (argc == 3 && std::string(argv[1]) == "--configured-owner-limit") {
+        const uint64_t expected = std::stoull(argv[2]);
+        CHECK(resident_render_buffer_configured_owner_limit(UINT32_MAX) == expected,
+              "production configuration applies the requested owner population");
+        CHECK(resident_render_buffer_configured_owner_limit(16) == std::min<uint64_t>(1, expected),
+              "configured allowance preserves the smaller device limit");
+        CHECK(published_render_cache_context().load(std::memory_order_acquire) == nullptr,
+              "reading owner policy does not initialize Vulkan");
+        return failures ? 1 : 0;
+    }
     std::printf("== renderer buffer residency ==\n");
     CHECK(published_render_cache_context().load(std::memory_order_acquire) == nullptr,
           "cold diagnostic control starts before Vulkan context publication");

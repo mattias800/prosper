@@ -3675,6 +3675,11 @@ if(TARGET prosper_core AND TARGET Vulkan::Vulkan)
     PROSPER_BACKEND_BUFFER_RESIDENCY_MB=256
     PROSPER_BACKEND_BUFFER_RESIDENCY_OWNERS=4096
     $<TARGET_FILE:test_render_buffer_residency>)
+  foreach(owner_limit IN ITEMS 0 256)
+    add_test(NAME render_buffer_owner_limit_${owner_limit} COMMAND ${CMAKE_COMMAND} -E env
+      PROSPER_BACKEND_BUFFER_RESIDENCY_OWNERS=${owner_limit}
+      $<TARGET_FILE:test_render_buffer_residency> --configured-owner-limit ${owner_limit})
+  endforeach()
 
   add_executable(test_gpu_detile tests/gpu/execute/test_gpu_detile.cpp)
   target_include_directories(test_gpu_detile PRIVATE tests)
