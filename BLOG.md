@@ -71,6 +71,16 @@ game asked for, so on a high-refresh monitor the game simply simulated faster --
 panel. It now holds each flip to the rate the title itself requested. No picture: this one you can
 only see by watching something move at the right speed.
 
+### And it could blame a shader for a pixel that arrived by copy
+
+Same tool, adjacent defect, different cause. A copy, blit or resolve reaches RenderDoc's pixel
+history the same way a clear does — it passes, and no test was evaluated — so a blit landing black
+was the last "passing draw" and came back as `SHADER_WROTE_BLACK`. It now names the copy instead —
+but only when the copy can be shown to have changed the pixel, because RenderDoc lists every copy
+on a target in the history of *every* pixel of that target, covered or not. The known-answer control
+now blits into its own finished target, from a two-colour source, because black over black is
+invisible to a self-check that only reads pixels.
+
 ### The pixel-history tool could tell you a shader wrote black when it knew nothing at all
 
 No picture for this one. `pixel_history.py` is what we reach for when a pixel is the wrong colour,

@@ -174,6 +174,12 @@ if(Python3_Interpreter_FOUND)
                    "$<TARGET_FILE:self_dump>")
   add_test(NAME re_xref_decoder
            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/re/test_xref.py")
+  # The GPU memory budget's answer is only as complete as its wiring, and nothing in the compiler
+  # enforces that wiring: a new vkAllocateMemory beside an existing one compiles, links, runs, and is
+  # simply absent from the count. An unwired FREE is the worse half -- those bytes are never given
+  # back, so the figure climbs and reads as a leak that is not there (#3533).
+  add_test(NAME vkmem_coverage
+           COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/vkmem_coverage.py")
   # survey_sizes.py's classifier decides which refactoring tool can act on a file, and it has been
   # wrong five times: on the lambda boundary, by calling a file of many small functions "nothing to
   # do", by measuring the lambda share over the enclosing namespace, by inferring unparsed lines
@@ -1997,6 +2003,11 @@ if(TARGET prosper_core)
   add_executable(test_shader_dump_filter tests/gpu/diagnostics/test_shader_dump_filter.cpp)
   target_link_libraries(test_shader_dump_filter PRIVATE prosper_core)
   add_test(NAME shader_dump_filter COMMAND test_shader_dump_filter)
+
+  add_executable(test_gpu_memory_budget tests/gpu/diagnostics/test_gpu_memory_budget.cpp)
+  target_include_directories(test_gpu_memory_budget PRIVATE tests)   # fixtures/test_scratch.h
+  target_link_libraries(test_gpu_memory_budget PRIVATE prosper_core)
+  add_test(NAME gpu_memory_budget COMMAND test_gpu_memory_budget)
 
   add_executable(test_rdna2_decode tests/gpu/recompiler/test_rdna2_decode.cpp)
   target_link_libraries(test_rdna2_decode PRIVATE prosper_core)
