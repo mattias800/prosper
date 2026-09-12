@@ -1516,9 +1516,13 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
             // A 3D resource needs a non-zero DEPTH even when it is null. This is not the extent check
             // the null exemption covers: the backend builds a real VK_IMAGE_TYPE_3D whose
             // `extent.depth` comes straight from this field, and a zero there fails `vkCreateImage`,
-            // after which the draw is silently skipped by the create-failure guard. The synthesis
-            // site sets `depth = 1` for exactly this reason; without this term nothing goes red if
-            // that line is removed.
+            // after which the draw is silently skipped by the create-failure guard.
+            //
+            // What this does NOT guard is the null-synthesis site's `rn.depth = 1`, which merely
+            // restates the struct default and is a no-op. No production path currently reaches this
+            // term at all -- it exists for OTHER producers of a zero-depth 3D resource (a decoded
+            // descriptor, a future change to that default), and it is deliberately cheap enough to
+            // keep on that basis. Do not describe it as covering the synthesis line.
             else if (resource_3d && r.depth == 0u)
                 report.issues.push_back({DescriptorIssueCode::InvalidImageMetadata, false, d.set,
                                          d.binding, d.kind, actual});
