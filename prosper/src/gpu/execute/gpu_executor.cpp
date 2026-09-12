@@ -7520,8 +7520,13 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                         // the previous behaviour for anything that is not a MIMG consumer.
                         if (u.mimg_dim != 0xFFFFFFFFu) {
                             rn.img_dim = u.mimg_dim;
-                            // A 3D dummy needs a non-zero depth for its substituted extent; the
-                            // width/height substitution lives in the renderer (live_renderer.cpp).
+                            // Restating the struct default (`ShaderResource::depth = 1`), NOT setting
+                            // it: `rn` is default-constructed, so this assignment is a no-op today and
+                            // removing it changes nothing. It is kept only so a future change to that
+                            // default cannot silently give a 3D null a zero extent depth, which
+                            // `vkCreateImage` rejects and the create-failure guard then turns into a
+                            // skipped draw. Do not describe it as load-bearing -- an earlier revision
+                            // of this branch did, and claimed a test guarded it; neither was true.
                             rn.depth = 1;
                         }
                         // Gated on PROSPER_DBG, not PROSPER_GFXLOG: GFXLOG must not be added to the

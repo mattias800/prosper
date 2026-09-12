@@ -5153,6 +5153,12 @@ void GpuState::apply(const Pm4Command& c) {
             constexpr uint32_t kMaxJumpDwords = 0x40000;   // 1 MiB of dwords — far past any real segment
             constexpr uint32_t kMaxJumpDepth  = 8;
             if (c.jump_dwords > kMaxJumpDwords || jump_depth >= kMaxJumpDepth) break;
+            // #3574 instruments below are GATED. `GpuState::apply` runs on every folded PM4 command
+            // of every submit and `!dispatches.empty()` is the ordinary case, so an ungated line here
+            // emits on a DEFAULT run -- ~90 lines on the measured title. These are instruments, not
+            // fail-visible rejects, and they share the switch with the sibling predication log below
+            // rather than inventing another.
+            static const bool predlog = getenv("PROSPER_PREDLOG") != nullptr;
             bool skip = false;
             uint64_t cond = 0;
             if (c.jump_pred && pred_cond_addr && !(pred_cond_addr & 7) &&
@@ -5191,7 +5197,7 @@ void GpuState::apply(const Pm4Command& c) {
                 //
                 // Only ARMED is a claim about a likely wrong answer. Quoting PENDING as the hazard
                 // count overstates it; an earlier revision of this instrument did exactly that.
-                if (!dispatches.empty()) {
+                if (predlog && !dispatches.empty()) {
                     const uint64_t last_dispatch_order = dispatches.back().command_order;
                     // ARMED widened beyond the parser stall. StallCommandBufferParser is the PFP/ME
                     // parser sync -- the boundary the executor uses for INDIRECT ARGUMENTS -- and it
@@ -5260,7 +5266,7 @@ void GpuState::apply(const Pm4Command& c) {
             // same-submit dispatch generated is read before that dispatch has run. The retained-DMA /
             // ordered-effect guard above already tests BOTH the target and the predicate; the compute
             // hole affects both too. Instrumenting only the predicate understated this axis.
-            if (!dispatches.empty()) {
+            if (predlog && !dispatches.empty()) {
                 static std::atomic<uint64_t> target_pending{0};
                 const uint64_t ord = target_pending.fetch_add(1) + 1;
                 if (ord <= 8 || (ord & (ord - 1)) == 0)

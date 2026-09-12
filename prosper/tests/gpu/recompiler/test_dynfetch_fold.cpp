@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdio>
+#include <cstring>
 #ifndef _WIN32
 #include <unistd.h>
 #endif
@@ -593,6 +594,39 @@ int main() {
     CHECK(samp_ok,   "kernel 5 paired SSAMP S# resolved alongside the T#");
     CHECK(have_cbuf, "kernel 5 s_buffer_load reports a ConstantBuffer table-use keyed by the V# load imm");
     CHECK(cbuf_ok,   "kernel 5 V# dwords match the table as loaded");
+
+    // #3577: the CONSUMING MIMG's dim must reach the SrtUse, because that is the only authority for
+    // the shape a null T# should take. `rdna2_emit_alu` derives OpTypeImage's Dim from the
+    // instruction and never reads the descriptor, so an all-zero T# has nothing that could agree with
+    // the shader's declaration -- the instruction has to carry it.
+    //
+    // This is the arm that reaches the PRODUCTION path. The validator arms in test_null_image_shape
+    // hand-build their tables and so never touch the synthesis or this resolver; measured, they stay
+    // green with the whole executor half reverted. Removing `u.mimg_dim = in.mimg_dim` reds the pair
+    // below.
+    //
+    // The same kernel with only the image_sample's dim field changed: bits [5:3] of word0,
+    // 0x08 -> 2D (1), 0x10 -> 3D (2). Everything else is byte-identical, so the pair isolates the
+    // carry rather than the resolver.
+    {
+        uint32_t k5_3d[std::size(k5)];
+        std::memcpy(k5_3d, k5, sizeof k5);
+        k5_3d[4] = 0xF0800F10u;   // image_sample ... dim:3D
+        std::vector<SrtUse> uses_2d, uses_3d;
+        resolve_dynamic_fetch(k5, std::size(k5), seed5, 2, 8, &uses_2d);
+        resolve_dynamic_fetch(k5_3d, std::size(k5_3d), seed5, 2, 8, &uses_3d);
+        uint32_t dim_2d = 0xFFFFFFFFu, dim_3d = 0xFFFFFFFFu;
+        for (const auto& u : uses_2d) if (u.kind == 0 && u.key == 0x40) dim_2d = u.mimg_dim;
+        for (const auto& u : uses_3d) if (u.kind == 0 && u.key == 0x40) dim_3d = u.mimg_dim;
+        CHECK(dim_2d == 1u,
+              "#3577: a dim:2D image_sample carries SQ_RSRC dim 1 into its SrtUse");
+        CHECK(dim_3d == 2u,
+              "#3577: a dim:3D image_sample carries SQ_RSRC dim 2 -- the authority a null T# needs, "
+              "since an all-zero descriptor cannot supply a shape");
+        CHECK(dim_2d != dim_3d,
+              "#3577: the two differ ONLY in the instruction's dim field and the carried value "
+              "follows it, so this pair tests the carry rather than the resolver");
+    }
 
     // A fused NGG back shader receives a driver stage-data pointer in system s[0:1], before user
     // data begins at s8. Its prologue loads the live V# from that table into s[8:11]. Preserve those

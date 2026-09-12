@@ -98,10 +98,12 @@ int main() {
     CHECK(rt_correct.resources[0].width == 0 && rt_correct.resources[0].height == 0 && probe.ok(),
           "#3577: a null descriptor is still exempt from the extent/format/size checks");
 
-    // Arm 4 — the synthesized record's `depth = 1` is load-bearing and had no guard. The backend
-    // builds a real VK_IMAGE_TYPE_3D for a 3D null and takes `extent.depth` from this field; a zero
-    // fails vkCreateImage and the draw is then silently skipped. Deleting `rn.depth = 1` at the
-    // synthesis site used to break nothing in the suite.
+    // Arm 4 — the VALIDATOR's 3D-depth term. Be exact about what this does and does not cover: the
+    // synthesis site's `rn.depth = 1` merely restates the struct default and is a no-op, so this arm
+    // does NOT guard that line and nothing could. What it guards is any OTHER producer of a 3D
+    // resource with zero depth -- a decoded descriptor, a future default change -- for which the
+    // backend would build a VK_IMAGE_TYPE_3D with `extent.depth = 0`, fail `vkCreateImage`, and lose
+    // the draw to the create-failure guard.
     ShaderResourceTable rt_flat = null_texture(2);
     rt_flat.resources[0].depth = 0;
     DescriptorValidationReport flat = validate_spirv_descriptor_interface(
