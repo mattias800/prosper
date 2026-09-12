@@ -19,6 +19,23 @@ from the tracker issues, and still gated, because it is a projection of state ra
 > title's current state — for that, read the tracker. Nothing is ever removed when a title moves on,
 > because the point of a blog is that it records *when* things happened.
 
+## 2026-09-13
+
+### Less CPU work for shared mip tails
+
+Sonic's affected compute dispatch falls from 4.06 to 2.21 ms while its known black world remains;
+GTA retains the bank scene ([measurements and limits](prosper/docs/MIP_TAIL_LAYOUT_2026_09.md)).
+
+*Linux Sonic gameplay route, scalar then separable mip layout; the missing world is not fixed.*
+
+![Sonic black world and HUD with scalar mip-tail layout](assets/screenshots/3407-tail-off-sonic.webp)
+![Sonic black world and HUD with separable mip-tail layout](assets/screenshots/3407-tail-on-sonic.webp)
+
+*Linux GTA Performance Story route, scalar then separable layout; presentation rate is unchanged.*
+
+![GTA bank scene with scalar mip-tail layout](assets/screenshots/3407-tail-off-gta.webp)
+![GTA bank scene with separable mip-tail layout](assets/screenshots/3407-tail-on-gta.webp)
+
 ## 2026-09-12
 
 ### Keeping texture snapshots without another copy

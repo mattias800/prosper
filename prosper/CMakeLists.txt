@@ -1513,6 +1513,18 @@ if(TARGET prosper_core)
   add_executable(test_tile tests/gpu/texture/test_tile.cpp)
   target_link_libraries(test_tile PRIVATE prosper_core)
   add_test(NAME gpu_surface_detile COMMAND test_tile)
+  add_executable(test_mip_tail tests/gpu/texture/test_mip_tail.cpp)
+  target_link_libraries(test_mip_tail PRIVATE prosper_core)
+  add_test(NAME gpu_mip_tail_oracle COMMAND test_mip_tail --check)
+  set_tests_properties(gpu_mip_tail_oracle PROPERTIES TIMEOUT 60)
+  if(Python3_Interpreter_FOUND)
+    foreach(pipes 1 2 4 8 16 32 64)
+      add_test(NAME gpu_mip_tail_pipes_${pipes} COMMAND ${CMAKE_COMMAND} -E env
+        PROSPER_RX_PIPES=${pipes} ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/gpu/texture/test_mip_tail.py $<TARGET_FILE:test_mip_tail>)
+      set_tests_properties(gpu_mip_tail_pipes_${pipes} PROPERTIES TIMEOUT 150)
+    endforeach()
+  endif()
   # Run the same byte-identity suite through the row-parallel detile path (#1177), forcing threads so
   # it is exercised even on a low-core CI. Passing here + in gpu_surface_detile (single-threaded control
   # via the < 2-thread gate / PROSPER_DETILE_SINGLE_THREADED) proves threaded == single byte-for-byte.
