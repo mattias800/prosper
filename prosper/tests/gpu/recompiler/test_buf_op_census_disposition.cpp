@@ -150,6 +150,46 @@ int main() {
               "#3575: ...and the census says so");
     }
 
+    // --- Arm 5: the FIFTH reject path, which was the headline of #3579 and had no arm ------------
+    // An MTBUF whose 7-bit BUF_FMT does not decode returns four lines below the optimistic
+    // assignment, inside the same `if (res)` block, and printed the bare success word exactly like
+    // the other four. It is named separately from the MUBUF case because the two read the format from
+    // different places -- instruction vs descriptor -- and a census that merged them could not say
+    // which source was undecodable.
+    //
+    // tbuffer_load_format_xyzw v[32:35], v8, s[8:11], 0 idxen format:3 (a USCALED code, which
+    // `rdna2_buffer_format` has no case for -- see #3585/#3586). Opcode 3 in d0[18:16], format 3 in
+    // d0[25:19].
+    {
+        const uint32_t mtbuf_bad_fmt[] = { 0xE81B2000u, 0x80020008u, 0xBF810000u };
+        // MTBUF resolves its SRSRC through the EXACT per-fetch entry rather than the SGPR base, so
+        // the resource needs this instruction's own pc as provenance; without it the op rejects
+        // upstream as `mubuf-unresolved` and never reaches the format decode under test.
+        ShaderResourceTable rt = table_with_format(DataFormat::Float32, 4);
+        rt.resources[0].fetch_pc = 0;
+        const std::string log = recompile_capturing_stderr(
+            mtbuf_bad_fmt, std::size(mtbuf_bad_fmt), &rt, "buf_op_census_mtbuf.log");
+        CHECK(has(log, "reject-mtbuf-unknown-format"),
+              "#3579: an MTBUF whose instruction-supplied BUF_FMT does not decode names ITSELF, "
+              "separately from the descriptor-supplied MUBUF case");
+        CHECK(!has(log, " resolved\n"),
+              "#3579: ...and does not report that refusal with a bare success word");
+    }
+
+    // --- Arm 6: the partial packed-word store refusal (#3594) --------------------------------------
+    // All fields share one dword, so writing a subset is a read-modify-write whose semantics are not
+    // established. This arm exists so the refusal cannot be quietly widened away: the implementation
+    // that landed in #3575 is one predicate change from emitting it.
+    {
+        // buffer_store_format_xy through a 3-component 10_11_11 -- two of three fields.
+        const uint32_t store_xy[] = { 0xE0142000u, 0x80020000u, 0xBF810000u };
+        ShaderResourceTable rt = table_with_format(DataFormat::Float10_11_11, 3);
+        const std::string log = recompile_capturing_stderr(
+            store_xy, std::size(store_xy), &rt, "buf_op_census_partial.log");
+        CHECK(has(log, "reject-packed-word-partial-store"),
+              "#3575/#3594: a PARTIAL packed-word store still refuses, and names the refusal");
+    }
+
     set_test_env("PROSPER_DBG", nullptr);
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");

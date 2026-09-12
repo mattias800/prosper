@@ -18,6 +18,9 @@
 #include <algorithm>
 #include <array>
 #include <cstdio>
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 #include <cstdlib>
 #include <vector>
 
@@ -2955,7 +2958,11 @@ int main() {
 #else
         setenv("PROSPER_SRTTABLE_LOG", "1", 1);
 #endif
+        // Save the real stderr so it can be RESTORED below. Without this the remaining ~3,000 lines
+        // of this test run with stderr pointing at a file that is then unlinked, so any later
+        // diagnostic -- including a crash message -- goes nowhere.
         std::fflush(stderr);
+        const int saved_stderr = dup(fileno(stderr));
         const char* scratch = "dynfetch_control_bit_diag.log";
         FILE* redirected = std::freopen(scratch, "w+", stderr);
         const ShaderResource* diag_resource = nullptr;
@@ -2972,6 +2979,11 @@ int main() {
             }
         }
         std::remove(scratch);
+        if (saved_stderr >= 0) {                      // put stderr back where it was
+            std::fflush(stderr);
+            dup2(saved_stderr, fileno(stderr));
+            close(saved_stderr);
+        }
 #ifdef _WIN32
         _putenv_s("PROSPER_SRTTABLE_LOG", saved.c_str());
 #else

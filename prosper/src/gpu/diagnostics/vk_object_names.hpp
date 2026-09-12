@@ -21,6 +21,7 @@
 //     call through a null pointer is a no-op, and no result code is propagated anywhere. An object
 //     name is a convenience, and a run that died because it could not name a shader module would be
 //     a worse tool than no names at all.
+#include <atomic>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
@@ -32,15 +33,24 @@ namespace prosper::gpu {
 // VK_EXT_debug_utils, which is the ordinary case on a driver or loader that does not offer it --
 // not an error, and deliberately not logged on every call.
 inline PFN_vkSetDebugUtilsObjectNameEXT vk_object_name_fn(VkDevice device) {
-    static VkDevice cached_device = VK_NULL_HANDLE;
-    static PFN_vkSetDebugUtilsObjectNameEXT cached_fn = nullptr;
-    if (device != cached_device) {
-        cached_device = device;
-        cached_fn = device ? (PFN_vkSetDebugUtilsObjectNameEXT)vkGetDeviceProcAddr(
-                                 device, "vkSetDebugUtilsObjectNameEXT")
-                           : nullptr;
+    // Atomic because prosper runs two guest submit threads and this is an inline function shared
+    // across translation units, so the cache is genuinely reachable concurrently. The worst outcome
+    // of a race here would be a missed name rather than a crash -- but this file's contract is that
+    // naming must NEVER fail a run, and "probably benign" is not that. Resolution is idempotent, so
+    // two threads racing to resolve simply store the same pointer; relaxed ordering is enough because
+    // neither value guards any other memory.
+    static std::atomic<VkDevice> cached_device{VK_NULL_HANDLE};
+    static std::atomic<PFN_vkSetDebugUtilsObjectNameEXT> cached_fn{nullptr};
+    if (device != cached_device.load(std::memory_order_relaxed)) {
+        const PFN_vkSetDebugUtilsObjectNameEXT resolved =
+            device ? (PFN_vkSetDebugUtilsObjectNameEXT)vkGetDeviceProcAddr(
+                         device, "vkSetDebugUtilsObjectNameEXT")
+                   : nullptr;
+        cached_fn.store(resolved, std::memory_order_relaxed);
+        cached_device.store(device, std::memory_order_relaxed);
+        return resolved;
     }
-    return cached_fn;
+    return cached_fn.load(std::memory_order_relaxed);
 }
 
 // Name one object. Silently does nothing when the extension is absent.
