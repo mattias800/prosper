@@ -6717,10 +6717,12 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     }
                 } else if (packed_word) {
                     // #3575: every component shares ONE dword. This is the exact inverse of the
-                    // packed_word LOAD above and deliberately reads its field table rather than
-                    // restating one -- same offsets, same widths, same per-field norms. A store whose
-                    // layout disagreed with the load would round-trip wrongly through prosper's own
-                    // reload, which is the cheapest way for this to be wrong and go unnoticed.
+                    // packed_word LOAD, which lives BELOW in this same function -- search
+                    // `packed_10_11_11 ? (sk == 0 ...` -- and the two field tables are RESTATED
+                    // independently rather than shared (#3600). They must be kept in step by hand:
+                    // a store whose layout disagreed with the load would round-trip wrongly through
+                    // prosper's own reload, which is the cheapest way for this to be wrong and go
+                    // unnoticed. If you edit either table, edit both.
                     //
                     // `comp_bytes` is 0 for these formats (data_format_bytes has no case for them),
                     // so the generic packed loop below would compute dwords=0 and silently write
@@ -6878,6 +6880,10 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     // All requested components share one packed dword. GFX10 names layouts from high
                     // field to low field, so 2_10_10_10 is logical R/G/B in bits 0/10/20 and A in 30;
                     // 10_11_11 is R/G/B in bits 0/11/22 with widths 11/11/10.
+                    //
+                    // This table is RESTATED, not shared, by the packed-word STORE above (#3600) --
+                    // search `packed_word_ncomp`. The two must agree or a store will not round-trip
+                    // through this load. If you edit this table, edit that one.
                     uint32_t dw = load_dword(idx);
                     uint32_t boff = packed_10_11_11 ? (sk == 0 ? 0u : sk == 1 ? 11u : 22u)
                                                     : (sk == 0 ? 0u : sk == 1 ? 10u : sk == 2 ? 20u : 30u);
