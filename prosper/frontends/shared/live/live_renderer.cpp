@@ -17,6 +17,7 @@
 #include "shared/diagnostics/capture_renderer_policy.hpp"
 #include "shared/texture/write_watch_policy.hpp"
 #include "shared/live/live_compute.hpp"
+#include "shared/live/texture_source_snapshot.hpp"
 #include "shared/live/decode_scratch.hpp"     // pooled full-surface decode intermediates
 #include "shared/live/live_target_format.hpp"       // the one LiveTargetPixelFormat mapping (exhaustive)
 #include "shared/perf/performance_capture.hpp"      // bounded F8 post-trigger renderer timing
@@ -2033,6 +2034,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 // title screen 930.78 of the texture leaf's 1110.10 ms landed in that undivided
                 // residual, and naming this half is what identified the two 63.75 MiB RGBA16F HDR
                 // intermediates that re-decode every frame (#3149 measured the splash, not this).
+                // Snapshot handoff is nested inside frontend texture materialization.
+                double tex_source_snapshot_handoff_ms = 0;
+                uint64_t tex_source_snapshot_copied_bytes = 0;
+                uint64_t tex_source_snapshot_transferred_bytes = 0;
                 double tex_persist_invalid_ms = 0;
                 uint64_t tex_persist_invalid_n = 0;
                 uint64_t tex_other_n = 0;
@@ -6679,8 +6684,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     persistent_source_size);
                             }
                             auto old = persistent_decoded_textures.find(decode_key);
-                            // PROSPER_NO_TEXTURE_PREFIX_INHERIT restores the `assign()` spelling:
-                            // free the outgoing buffer, allocate a new one. It exists because
+                            // PROSPER_NO_TEXTURE_PREFIX_INHERIT prevents reusing the outgoing
+                            // allocation. Together with PROSPER_NO_TEXTURE_SOURCE_SNAPSHOT_MOVE it
+                            // restores the `assign()` spelling: free the old buffer, allocate anew.
+                            // It exists because
                             // WITHOUT it this optimisation has no off-switch, and a discriminator
                             // that cannot disable everything the change does is not a
                             // discriminator -- it silently under-reports the change it is
@@ -6764,20 +6771,28 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 cached.source_prefix_size = source_prefix_size;
                                 cached.source_matches_pixels = persistent_source_matches_pixels;
                                 if (!persistent_source_matches_pixels) {
-                                    // Byte-for-byte what `assign(scratch.begin(),
-                                    // scratch.begin() + source_prefix_size)` produced. `resize`
-                                    // before the copy so a SHORT read stores exactly the prefix it
-                                    // read -- `source_prefix.size()` is compared against
-                                    // `persistent_source_size` on the validation path, so growing
-                                    // it to the inherited buffer's extent would silently change
-                                    // which entries revalidate. Shrinking keeps the capacity, which
-                                    // is the whole point.
-                                    cached.source_prefix = std::move(inherited_source_prefix);
-                                    cached.source_prefix.resize(source_prefix_size);
-                                    if (source_prefix_size)
-                                        std::memcpy(cached.source_prefix.data(),
-                                                    persistent_validation_scratch.data(),
-                                                    source_prefix_size);
+                                    static const bool transfer_source_snapshot =
+                                        PROSPER_ENV_VALUE("PROSPER_NO_TEXTURE_SOURCE_SNAPSHOT_MOVE") == nullptr;
+                                    const auto handoff_start = timing_enabled
+                                        ? RenderClock::now() : RenderClock::time_point{};
+                                    auto snapshot = take_texture_source_snapshot(
+                                        persistent_validation_scratch, inherited_source_prefix,
+                                        source_prefix_size, transfer_source_snapshot);
+                                    const bool transferred = snapshot.transferred;
+                                    cached.source_prefix = std::move(snapshot.bytes);
+                                    if (transferred)
+                                        g_texture_decode_scope.source_snapshot_transferred_bytes += source_prefix_size;
+                                    else
+                                        g_texture_decode_scope.source_snapshot_copied_bytes += source_prefix_size;
+                                    if (timing_enabled) {
+                                        pending_timing.tex_source_snapshot_handoff_ms +=
+                                            std::chrono::duration<double, std::milli>(
+                                                RenderClock::now() - handoff_start).count();
+                                        if (transferred)
+                                            pending_timing.tex_source_snapshot_transferred_bytes += source_prefix_size;
+                                        else
+                                            pending_timing.tex_source_snapshot_copied_bytes += source_prefix_size;
+                                    }
                                 }
                                 cached.pixels = std::make_shared<const std::vector<uint8_t>>(
                                     std::move(texture_pixels));
@@ -10457,6 +10472,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     record.frontend_tex_persist_hit_ms = pending_timing.tex_persist_hit_ms;
                     record.frontend_tex_persist_reuse_ms = pending_timing.tex_persist_reuse_ms;
                     record.frontend_tex_persist_miss_ms = pending_timing.tex_persist_miss_ms;
+                    record.frontend_tex_source_snapshot_handoff_ms = pending_timing.tex_source_snapshot_handoff_ms;
+                    record.frontend_tex_source_snapshot_copied_bytes = pending_timing.tex_source_snapshot_copied_bytes;
+                    record.frontend_tex_source_snapshot_transferred_bytes = pending_timing.tex_source_snapshot_transferred_bytes;
                     record.frontend_tex_persist_invalid_ms = pending_timing.tex_persist_invalid_ms;
                     record.frontend_tex_persist_invalid_n = pending_timing.tex_persist_invalid_n;
                     record.frontend_tex_other_n = pending_timing.tex_other_n;

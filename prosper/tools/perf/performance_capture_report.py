@@ -124,6 +124,17 @@ def _resource_breakdown(renderer):
         "setup_resources": _total(renderer, "setup_resources_ms"),
         "backend_available": have_backend,
     }
+    # An admitted encoded CPU snapshot either copies or transfers its owner. Require the
+    # complete population: a missing field in one row cannot silently contribute a zero.
+    # Handoff is already inside frontend texture time and its cache-outcome buckets.
+    snapshot_fields = ("copied_bytes", "transferred_bytes", "handoff_ms")
+    breakdown["texture_source_snapshot_available"] = all(
+        f"frontend_tex_source_snapshot_{field}" in row
+        for row in renderer for field in snapshot_fields)
+    if breakdown["texture_source_snapshot_available"]:
+        breakdown["texture_source_snapshot"] = {
+            field: sum(row[f"frontend_tex_source_snapshot_{field}"] for row in renderer)
+            for field in snapshot_fields}
     # The frontend texture leaf's OWN classes. The renderer has recorded these since #2250 and this
     # report never printed them, so every capture taken since has carried the answer to "which cache
     # outcome is the texture time in?" and no reader could see it. On Stray's title screen the leaf
@@ -764,6 +775,15 @@ def print_summary(summary):
         print("  build_resources (frontend materializer): "
               f"{breakdown['build_resources']:.1f}ms"
               f"  [texture={breakdown['frontend_texture']:.1f} buffer={breakdown['frontend_buffer']:.1f}]")
+        if breakdown["texture_source_snapshot_available"]:
+            snapshot = breakdown["texture_source_snapshot"]
+            print("    texture source snapshot (included in frontend texture): "
+                  f"handoff={snapshot['handoff_ms']:.3f}ms"
+                  f" copied={snapshot['copied_bytes']}B"
+                  f" transferred={snapshot['transferred_bytes']}B"
+                  " (admitted CPU snapshots; excludes guest reads and GPU uploads)")
+        else:
+            print("    texture source snapshot: UNAVAILABLE")
         if breakdown["tex_classes_available"]:
             invalid = (f"persist_invalid={breakdown['tex_persist_invalid']:.1f}"
                        if breakdown["tex_invalid_available"] else "persist_invalid=UNAVAILABLE")

@@ -1305,6 +1305,10 @@ if(TARGET prosper_core)
 
   # F8's pre-trigger ring and post-trigger timing artifact: pure state machine + filesystem test,
   # including bounded overflow accounting and temporary-to-final atomic publication.
+  add_executable(test_texture_source_snapshot frontends/shared/tests/test_texture_source_snapshot.cpp)
+  target_include_directories(test_texture_source_snapshot PRIVATE frontends)
+  add_test(NAME texture_source_snapshot COMMAND test_texture_source_snapshot)
+
   add_executable(test_performance_capture frontends/shared/tests/test_performance_capture.cpp)
   target_link_libraries(test_performance_capture PRIVATE prosper_performance_capture)
   add_test(NAME performance_capture COMMAND test_performance_capture)
@@ -3019,6 +3023,9 @@ if(TARGET prosper_core)
       target_include_directories(test_gpu_capture_render PRIVATE src tests tools/boot_trace)
       target_link_libraries(test_gpu_capture_render PRIVATE prosper_core prosper_live_renderer Vulkan::Vulkan)
       add_test(NAME gpu_capture_render_replay COMMAND test_gpu_capture_render)
+      add_test(NAME gpu_capture_render_snapshot_copy COMMAND test_gpu_capture_render --expect-source-snapshot-copy)
+      set_tests_properties(gpu_capture_render_snapshot_copy PROPERTIES
+        ENVIRONMENT "PROSPER_NO_TEXTURE_SOURCE_SNAPSHOT_MOVE=1")
 
       # PROSPER_SKIP_DRAW_PROGRAM through the REAL live renderer: an unnamed program renders, the
       # named one is withheld, and a mixed submit loses only the named draw. Needs the live renderer
@@ -3705,6 +3712,12 @@ if(TARGET prosper_live_renderer AND TARGET Vulkan::Vulkan)
   target_link_libraries(test_render_buffer_capture PRIVATE prosper_live_renderer
                                                          prosper_performance_capture Vulkan::Vulkan)
   add_test(NAME render_buffer_capture COMMAND test_render_buffer_capture)
+  add_test(NAME render_texture_snapshot_capture COMMAND test_render_buffer_capture --source-snapshot)
+  add_test(NAME render_texture_snapshot_capture_copy COMMAND test_render_buffer_capture --source-snapshot)
+  set_tests_properties(render_texture_snapshot_capture PROPERTIES
+    ENVIRONMENT "PROSPER_NO_LIVE_PERSISTENT_COLOR_TARGETS=1;PROSPER_BACKEND_BUFFER_RESIDENCY_MB=256;PROSPER_BACKEND_BUFFER_RESIDENCY_OWNERS=4096" TIMEOUT 120)
+  set_tests_properties(render_texture_snapshot_capture_copy PROPERTIES
+    ENVIRONMENT "PROSPER_NO_LIVE_PERSISTENT_COLOR_TARGETS=1;PROSPER_BACKEND_BUFFER_RESIDENCY_MB=256;PROSPER_BACKEND_BUFFER_RESIDENCY_OWNERS=4096;PROSPER_NO_TEXTURE_SOURCE_SNAPSHOT_MOVE=1" TIMEOUT 120)
   set_tests_properties(render_buffer_capture PROPERTIES
     ENVIRONMENT "PROSPER_NO_LIVE_PERSISTENT_COLOR_TARGETS=1;PROSPER_BACKEND_BUFFER_RESIDENCY_MB=256;PROSPER_BACKEND_BUFFER_RESIDENCY_OWNERS=4096" TIMEOUT 120)
 

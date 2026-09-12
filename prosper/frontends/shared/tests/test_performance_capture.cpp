@@ -136,6 +136,9 @@ int main() {
         record.frontend_tex_persist_miss_ms = 2 + i;
         record.frontend_tex_persist_invalid_ms = 4 + i;
         record.frontend_tex_persist_invalid_n = 5 + i;
+        record.frontend_tex_source_snapshot_handoff_ms = 0.5 + i;
+        record.frontend_tex_source_snapshot_copied_bytes = 123 + i;
+        record.frontend_tex_source_snapshot_transferred_bytes = 456 + i;
         record.frontend_tex_other_n = 6 + i;
         record.frontend_tex_other_slowest_ms = 1.5 + i;
         record.frontend_tex_other_addr = 0x2046960000ull + i * 0x1000;
@@ -291,6 +294,10 @@ int main() {
           text.find("\"frontend_tex_other_compute_candidate\":true") != std::string::npos &&
           text.find("\"resolve_read_count\":3") != std::string::npos,
           "renderer records serialize the frontend phase, cache-class, residual witness, and resolve diagnostics");
+    check(text.find("\"frontend_tex_source_snapshot_handoff_ms\":0.5") != std::string::npos &&
+          text.find("\"frontend_tex_source_snapshot_copied_bytes\":123") != std::string::npos &&
+          text.find("\"frontend_tex_source_snapshot_transferred_bytes\":456") != std::string::npos,
+          "snapshot handoff timing and actual copied/transferred bytes survive serialization");
     check(text.find("\"program_addr\":78187493376") != std::string::npos &&
           text.find("\"program_hash\":18364758544493064720") != std::string::npos,
           "compute records serialize the bounded program identity");

@@ -21,6 +21,22 @@ from the tracker issues, and still gated, because it is a projection of state ra
 
 ## 2026-09-12
 
+### Keeping texture snapshots without another copy
+
+GTA retains its bank scene while a bounded ownership transfer removes most snapshot-copy work;
+Sonic retains its known black world and HUD ([measurements and limits](prosper/docs/TEXTURE_SOURCE_SNAPSHOT_2026_09.md)).
+
+*Linux `prosper-app`, GTA Performance Story route: snapshot transfer off, then on.*
+
+![GTA bank scene with snapshot transfers disabled](assets/screenshots/3407-snapshot-off-gta.webp)
+![GTA bank scene with snapshot transfers enabled](assets/screenshots/3407-snapshot-on-gta.webp)
+
+*Linux `prosper-app`, Sonic gameplay route: transfer off, then on; neither captures correct world rendering.*
+
+![Sonic black world and HUD with snapshot transfers disabled](assets/screenshots/3407-snapshot-off-sonic.webp)
+![Sonic black world and HUD with snapshot transfers enabled](assets/screenshots/3407-snapshot-on-sonic.webp)
+
+
 ### GTA's bank scene survives another small texture-conversion saving
 
 GTA V shows the same bank scene before and after packed GPU retile; Sonic still shows its known
