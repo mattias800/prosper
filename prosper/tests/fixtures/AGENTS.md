@@ -113,6 +113,9 @@ In addition to bytes, admission limits all live retained owners to the smaller o
 sixteenth of the device's advertised memory-allocation limit. Detached submission owners remain
 counted until their actual Vulkan allocation is freed; explicit byte overrides retain this bound.
 This limits the cache's added allocation population, not the whole device's independent allocators.
+`PROSPER_BACKEND_BUFFER_RESIDENCY_OWNERS` can lower the allowance (0–4096, default 4096)
+without relaxing the device fraction. Zero also bypasses the additional pass write proof;
+nonzero controls retain it. Fixtures pin 4096 to isolate their synthetic device-limit tests.
 Timing logs report sampled entry, owner and byte occupancy. Cleanup can change the two atomic
 lifetime gauges between reads, so they are not a transactional accounting snapshot. Reading these
 statistics never initializes Vulkan.

@@ -40,6 +40,13 @@ additional pass write-proof work. `PROSPER_NO_BACKEND_BUFFER_RESIDENCY=1` disabl
 `PROSPER_NO_BACKEND_BUFFER_WRITE_WATCH=1` keeps exact-comparison retention but disables these watches.
 No GPU vendor, title identity or experimental driver flag selects admission.
 
+`PROSPER_BACKEND_BUFFER_RESIDENCY_OWNERS` selects a lower owner allowance (0–4096,
+default 4096), still bounded by one sixteenth of the device allocation limit. It permits
+comparing allocation populations at the same byte budget. Zero disables retention and
+its additional pass write proof; use nonzero allowances to compare populations while
+keeping that proof active. Changing this allowance also changes reuse opportunities,
+so it does not isolate driver allocation costs by itself.
+
 ## Measurements and their limits
 
 These same-binary captures use `ae90fca570e3d08e8b0076d5a3c6ded3f815ded5`, before the live-owner
@@ -67,7 +74,7 @@ Its F9 retains the previously documented black-world gameplay HUD at different s
 
 Launches use fresh saves and shader caches, native resolution, normal full cadence and immediate
 presentation. GTA uses `scripts/gta5/reach-performance-story.pad`; Sonic uses
-`scripts/sonic-frontiers-PPSA03831/reach-gameplay.pad`; Blue Prince uses its automatic opening route.
+`scripts/sonic-frontiers-PPSA03831/reach-gameplay.pad`; Blue Prince uses IME auto-key with no pad script.
 Set `PROSPER_PERF_CAPTURE_AFTER_MS=300000`; F9 uses `PROSPER_GRAB_BUNDLE_AFTER_MS=310000` for GTA
 and `330000` for Sonic/Blue Prince. Capture durations are 360/380/420 seconds respectively. Separate
 199 Hz CPU and coarse GPU sampling runs before F8, around 250–270 seconds. F9 is later than F8 and

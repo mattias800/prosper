@@ -3161,8 +3161,17 @@ struct ResidentRenderBufferKeyHash {
 };
 // Bound this cache's additional standalone allocations, including detached submission owners.
 // Other pools and images consume allocation slots too; this is not device-wide accounting.
-inline uint64_t resident_render_buffer_owner_limit(uint32_t device_allocation_limit) {
-    return std::min<uint64_t>(4096, device_allocation_limit / 16u);
+inline uint64_t resident_render_buffer_owner_limit(uint32_t device_allocation_limit,
+                                                  uint64_t requested = 4096) {
+    return std::min({uint64_t{4096}, uint64_t{device_allocation_limit / 16u}, requested});
+}
+inline uint64_t resident_render_buffer_configured_owner_limit(uint32_t device_allocation_limit) {
+    // A lower owner allowance measures allocation population separately from byte pressure.
+    // It never relaxes the device-derived bound, including on an explicit byte-budget override.
+    static const auto requested = prosper::diag::env_u64_or_default_capped(
+        "PROSPER_BACKEND_BUFFER_RESIDENCY_OWNERS",
+        getenv("PROSPER_BACKEND_BUFFER_RESIDENCY_OWNERS"), 4096, 4096, "owners");
+    return resident_render_buffer_owner_limit(device_allocation_limit, requested);
 }
 struct ResidentRenderBufferCache {
     ResidentRenderBufferCache() = default;
@@ -3290,7 +3299,7 @@ struct ResidentRenderBufferCache {
                 VkDeviceSize limit, BackendResourceReuseStats& stats,
                 uint64_t direct_guest_addr = 0, double* watch_ms = nullptr) {
         const uint64_t source_addr = Entry::eligible_address(key, source, direct_guest_addr);
-        const auto owner_limit = resident_render_buffer_owner_limit(
+        const auto owner_limit = resident_render_buffer_configured_owner_limit(
             ctx.detile_limits.maxMemoryAllocationCount);
         if (!owner_limit) return {};
         if (index.contains(key) || key.bytes > limit / 2) return {};
@@ -3399,7 +3408,7 @@ inline ResidentRenderBufferCacheSnapshot resident_render_buffer_cache_snapshot()
     const auto& cache = resident_render_buffer_cache();
     return {true, cache.index.size(), cache.charged_owners->load(std::memory_order_relaxed),
             cache.charged_bytes->load(std::memory_order_relaxed),
-            resident_render_buffer_owner_limit(ctx->detile_limits.maxMemoryAllocationCount),
+            resident_render_buffer_configured_owner_limit(ctx->detile_limits.maxMemoryAllocationCount),
             resident_render_buffer_limit()};
 }
 
@@ -7220,7 +7229,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     bool readonly_buffer_pass = share_backend_resources && reuse_host_buffers &&
         !buffer_verify_enabled && getenv("PROSPER_NO_BACKEND_BUFFER_RESIDENCY") == nullptr &&
         resident_render_buffer_limit() != 0 &&
-        resident_render_buffer_owner_limit(ctx.detile_limits.maxMemoryAllocationCount) != 0;
+        resident_render_buffer_configured_owner_limit(ctx.detile_limits.maxMemoryAllocationCount) != 0;
     const bool readonly_buffer_watch =
         getenv("PROSPER_NO_BACKEND_BUFFER_WRITE_WATCH") == nullptr;
     if (readonly_buffer_pass) {

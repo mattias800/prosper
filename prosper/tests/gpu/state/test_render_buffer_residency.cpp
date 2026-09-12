@@ -395,6 +395,11 @@ void resident_owner_limits() {
               resident_render_buffer_owner_limit(4096) == 256 &&
               resident_render_buffer_owner_limit(UINT32_MAX) == 4096,
           "resident owner allowance is a bounded fraction of the device allocation limit");
+    CHECK(resident_render_buffer_owner_limit(UINT32_MAX, 256) == 256 &&
+              resident_render_buffer_owner_limit(16, 256) == 1 &&
+              resident_render_buffer_owner_limit(UINT32_MAX, 0) == 0 &&
+              resident_render_buffer_owner_limit(UINT32_MAX, UINT64_MAX) == 4096,
+          "explicit owner allowance can tighten but never relax either safety bound");
     BackendPersistentResourceGuard guard;
     const auto& ctx = render_vk_ctx();
     CHECK(ctx.ok, "allocation-count controls have a real Vulkan device");

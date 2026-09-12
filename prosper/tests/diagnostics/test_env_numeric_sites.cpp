@@ -126,6 +126,15 @@ static uint64_t buffer_residency_permissive(const char* t) {
     return (mib > 2048 ? 2048 : mib) * 1024ull * 1024ull;
 }
 
+// Explicit lower owner allowance; permissive spelling is a counterexample, not shipped history.
+static uint64_t buffer_owners_new(const char* n, const char* t) {
+    return env_u64_or_default_capped(n, t, 4096, 4096, "owners");
+}
+static uint64_t buffer_owners_permissive(const char* t) {
+    const uint64_t owners = t ? std::strtoull(t, nullptr, 10) : 4096;
+    return owners > 4096 ? 4096 : owners;
+}
+
 // --- tests/fixtures/render_runner.h : PROSPER_BACKEND_BUFFER_ARENA_KB --------------------------
 static uint64_t arena_new(const char* n, const char* t) {
     const uint64_t kib = env_u64_or_default_capped(n, t, 1024ull, UINT64_MAX / 1024ull, "KiB");
@@ -324,6 +333,12 @@ static const uint64_t kMiB = 1024ull * 1024ull;
 static const uint64_t kGiB = 1024ull * kMiB;
 
 static const Site kSites[] = {
+    {"render_runner.h PROSPER_BACKEND_BUFFER_RESIDENCY_OWNERS (lower cap)",
+     "PROSPER_BACKEND_BUFFER_RESIDENCY_OWNERS", buffer_owners_new,
+     buffer_owners_permissive, "256owners", 4096, "256", 256},
+    {"render_runner.h PROSPER_BACKEND_BUFFER_RESIDENCY_OWNERS (zero)",
+     "PROSPER_BACKEND_BUFFER_RESIDENCY_OWNERS", buffer_owners_new,
+     buffer_owners_permissive, "none", 4096, "0", 0},
     {"render_runner.h PROSPER_BACKEND_BUFFER_RESIDENCY_MB (Linux zero)",
      "PROSPER_BACKEND_BUFFER_RESIDENCY_MB", buffer_residency_new<256>,
      buffer_residency_permissive<256>, "-1", 256ull * kMiB, "0", 0},
