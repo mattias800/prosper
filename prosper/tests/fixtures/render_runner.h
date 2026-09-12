@@ -13,6 +13,7 @@
 #include "gpu/capture/gpu_capture.hpp"
 #include "gpu/diagnostics/gpu_memory_budget_vk.hpp"  // #3533: count what we hold on each heap
 #include "gpu/execute/host_read_barrier.hpp"   // the availability half of a readback (#2944/#3249)
+#include "gpu/execute/float_controls_probe.hpp" // #3479: the device gate on SignedZeroInfNanPreserve
 #include "gpu/diagnostics/diagnostic_selectors.hpp"
 #include "gpu/diagnostics/geometry_probe_arming.hpp"
 #include "diagnostics/env_cache.hpp"       // PROSPER_ENV_ON / _VALUE: cached reads on per-draw paths
@@ -1639,6 +1640,16 @@ inline const RenderVkCtx& render_vk_ctx() {
             vkGetPhysicalDeviceMemoryProperties(r.phys, &heap_properties);
             prosper::gpu::set_device_heaps(heap_properties);
         }
+        // Measure the float contract this device offers and publish it to the recompiler (#3479).
+        // Here rather than earlier because a device that failed to create must not contribute a
+        // verdict -- every publisher is ANDed, so a stillborn device would otherwise be able to veto
+        // the guarantee for the device that follows it. No extension is requested: the property is
+        // core from Vulkan 1.2 and kVulkanRuntimeVersion is 1.4, so the -08742 half is satisfied by
+        // version, and asking for a promoted extension name a 1.4 device need not still advertise is
+        // exactly the mistake image_robustness.hpp's comment records.
+        prosper::gpu::publish_device_float_controls(
+            "render", r.phys, prosper::frontend::kVulkanRuntimeVersion,
+            /*float_controls_extension_enabled=*/false);
         VkPipelineCacheCreateInfo cache_info{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
         std::vector<uint8_t> initial_cache;
         try {

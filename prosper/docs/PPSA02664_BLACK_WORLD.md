@@ -13,6 +13,20 @@
 > [`../../COMPATIBILITY.md`](../../COMPATIBILITY.md). Read `## Ruled out` below (after the frozen 2026-07-15 front matter) before reviving any
 > hypothesis from the plan that follows.
 
+> **A SECOND, UNRELATED black world was reported on 2026-09-08 and resolved on 2026-09-11 (#3479).**
+> It looked like this one and was not: on Windows/NVIDIA the world composited to black while the UI
+> stayed pixel-perfect, and the same build rendered the same frame correctly on Linux/AMD. The cause
+> is not in this title at all — recompiled SPIR-V modules did not declare `SignedZeroInfNanPreserve`,
+> so NVIDIA's compiler was free to assume no Inf; the guest's `sign()` idiom multiplies by a `+Inf`
+> constant it synthesises with integer shifts (`((1<<8)-1) << 23`), that multiply returned 0, and the
+> colour-grading LUT builder therefore wrote an all-black 1024x32 LUT that blacked out every graded
+> pixel. The UI is composited AFTER the grade, which is why it survived. See `## Ruled out` below for
+> everything that was falsified on the way, and note the shape: **four separate layers of this title
+> looked guilty and none of them were.** The declaration is DEVICE-GATED (#3561): a device that does
+> not report `shaderSignedZeroInfNanPreserveFloat32`, or cannot name the extension at all, still
+> renders this title's grade black, and prosper now says so in one log line instead of emitting a
+> module that device may not legally compile.
+
 **Status:** DRAFT for review (multiple agents). Tracks #755; investigates #320. No writer instrumentation
 is proposed as ready; the watchpoint material is a **conditional toolbox appendix** (§5), not an
 evidence-selected Phase 1. Revised after review by Mira Voss (2026-07-15), whose Phase-0A discipline
@@ -38,6 +52,11 @@ One line per dead hypothesis, the evidence that killed it, and where that eviden
 | A run-local submit ordinal, draw count, or shader hash identifies the gameplay scene | **Falsified by the same episode.** Those are run-local *selectors*, not scene identity; violating that is exactly how the narration capsule was mistaken for gameplay. Establish scene identity from rendered semantic content first (the governing invariant below). | §1 |
 | The world draws are missing, mis-transformed, or never submitted | **Falsified.** The world renders correctly and is then painted over by a full-frame mask fill. | #1578 |
 | A writer-tracing / empty-RTT-producer investigation is the next step | **Not needed.** The cause was upstream of composition entirely, in shared 4 KiB-tile mip-tail addressing. The watchpoint toolbox in §5 was never evidence-selected and was not required. | #1578 |
+| (#3479) The #3464 native-Wave32 fragment-vote allowance is what loses the world colour | **Falsified, and the issue's own clearing evidence was void — both halves are worth keeping.** The LUT builder that actually goes black (`draw[25]`) declares **no** subgroup requirement at all, so the allowance cannot reach it. The three modules that do require Wave64 take their vote from a `v_cmp` whose only operands are SGPRs and an inline constant (`shader_inspect --wave-reasons` reports `wave-width-independent=1`), so `Any()` is the identity at any subgroup width. Separately, the offline A/B quoted in #3479 could not have differed: `gpu_replay` passes no `title_id`, so the allowance never fires there — instrument trap 276. | #3479 |
+| (#3479) The world draws are missing, or the scene composite never runs | **Falsified.** `gpu_replay --draw-steps --draw-steps-every 1` paints the scene target through operations 30-55 and the composite (`draw[75]`) executes. Substituting a module that differs from the real one ONLY in its `Prosper.FragmentSubgroupSize` marker forces the composite to run offline; it still writes pure black over the whole frame (`--through-operation 78` → extrema (0,0,0)). | #3479 |
+| (#3479) The 128x1 R16 tone-curve textures the LUT builder samples are de-tiled wrongly | **Falsified.** `PROSPER_DUMP_ATLAS=1` writes prosper's decoded copies: the master curve comes out as the exact identity ramp `0, 2, 4, … 254` and the neutral curves as a flat 128, matching a hand de-tile of the captured bytes under the documented SW_4KB_S 2-byte order (x bits at element-index bits 0,1,2,6,8,10). **Note the near-miss:** overriding any one curve with a constant DOES light the LUT up, which reads as "the texture was the problem" — it is not a discriminator, because a constant texture also makes the (wrong, ~0) sample coordinate irrelevant. | #3479 |
+| (#3479) The LUT builder produces NaN, which writes as black | **Falsified.** An `OpIsNan` probe spliced into the module and substituted through `PROSPER_FS_SPV`/`PROSPER_FS_SPV_MATCH` reports **false for all 32,768 texels**. The output is a genuine zero. | #3479 |
+| (#3479) The LUT builder's input grid coordinate (its interpolant) is wrong | **Falsified.** Probing `_170.xy` straight to MRT0 shows a clean `0 → 1` u ramp across x and `1 → 0` v down y, and the linear RGB three quarters of the way down the shader still carries 32,768 distinct values. The collapse is at one instruction: the `Inf * abs(x)` multiply of the `sign()` idiom, which the `--through-operation` probe shows returning 0 instead of `+Inf`. | #3479 |
 
 ## Governing invariant (adopt this first)
 

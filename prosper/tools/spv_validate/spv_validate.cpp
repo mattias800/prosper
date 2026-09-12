@@ -288,6 +288,17 @@ int main(int argc, char** argv) {
     }
     const std::string src_root = argv[2];
 
+    // Validate the DECLARED form of every module (#3479/#3561). The SignedZeroInfNanPreserve
+    // declaration is device-gated, and this tool owns no Vulkan device, so without this line it
+    // would validate only the neutral form and the declaration would have no spirv-val coverage at
+    // all. That coverage is not theoretical: spirv-val is the instrument that caught the emitter
+    // naming capability 4467 (RoundingModeRTE) while the execution mode named 4461 -- a mismatch no
+    // assertion sharing the emitter's own constants can see. Asserted true here for the same reason
+    // the rest of this tool synthesizes inputs: it is validating what the emitter can produce, not
+    // what this host happens to run.
+    prosper::gpu::publish_float_controls_support(/*signed_zero_inf_nan_preserve_float32=*/true,
+                                                 /*declaration_permitted_by_api=*/true);
+
     // Ask the directory directly rather than inferring writability from whether the validator probe
     // left anything behind: a spirv-val that exists but exits non-zero while printing nothing would
     // otherwise be diagnosed as an unwritable directory, sending the reader to the wrong place.
