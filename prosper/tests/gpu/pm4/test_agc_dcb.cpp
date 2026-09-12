@@ -34,7 +34,8 @@ constexpr uint32_t IT_NOP = 0x10, IT_NUM_INSTANCES = 0x2F, IT_SET_CONTEXT_REG = 
                    IT_SET_SH_REG = 0x76, IT_SET_UCONFIG_REG = 0x79,
                    R_DRAW_RESET = 0x05, R_PUSH_MARKER = 0x0b, R_POP_MARKER = 0x0c,
                    R_SH_REGS_INDIRECT = 0x11, R_CX_REGS_INDIRECT = 0x12,
-                   R_UC_REGS_INDIRECT = 0x13, R_DMA_DATA = 0x19, R_JUMP = 0x1e;
+                   R_UC_REGS_INDIRECT = 0x13, R_DMA_DATA = 0x19, R_JUMP = 0x1e,
+                   R_DRAW_INDEX_INDIRECT = 0x22, R_DRAW_INDIRECT = 0x25;
 
 struct ShaderRegister { uint32_t offset, value; };
 
@@ -777,6 +778,59 @@ int main() {
             jpatch((uint64_t)(uintptr_t)decoy, 2, 0x0000002040290080ull, 359, 0, 0);
             CHECK(memcmp(decoy, decoy_before, sizeof decoy) == 0,
                   "JumpPatchTarget refuses a non-Jump packet without modifying a single dword");
+        }
+    }
+
+    // ---- #2929: sceAgcDcbDrawIndirect must build a real packet, byte for byte.
+    //
+    // The defect this pins was the quietest possible one: the NID had no handler, so the call fell
+    // to the dispatcher default, returned 0, and appended NOTHING. Every non-indexed indirect draw
+    // left the command stream with no reject line anywhere -- only a one-shot
+    // `[prosper] unimplemented: libSceAgc::1q1titRBL6o`. So the assertion has to be on the EMITTED
+    // DWORDS and on the cursor advance; "the call returned something" is exactly what the broken
+    // version also did.
+    //
+    // The dword count is an ABI contract with the guest's own reservation (docs/AGC_PACKET_SIZES.md):
+    // the packet is 4 dwords, and sceAgcDcbDrawIndirectGetSize must answer 16 bytes for the same
+    // reason -- a guest that asks reserves exactly this.
+    {
+        auto draw_ind = Hle::lookup("1q1titRBL6o");       // sceAgcDcbDrawIndirect
+        auto draw_idx_ind = Hle::lookup("t1vNu082-jM");   // sceAgcDcbDrawIndexIndirect
+        auto draw_ind_size = Hle::lookup("cxPZ4Wgvdj8");  // sceAgcDcbDrawIndirectGetSize
+        CHECK(draw_ind && draw_idx_ind && draw_ind_size,
+              "#2929: sceAgcDcbDrawIndirect + its GetSize are registered beside the indexed sibling");
+        if (draw_ind && draw_idx_ind && draw_ind_size) {
+            uint32_t ring[16];
+            memset(ring, 0xEE, sizeof ring);
+            Dcb rd{};
+            rd.bottom = ring; rd.top = ring + 16; rd.cursor_up = ring; rd.cursor_down = ring + 16;
+            const uint64_t RD = (uint64_t)(uintptr_t)&rd;
+
+            const uint64_t pkt = draw_ind(RD, /*byte offset*/ 0x140,
+                                          /*ShaderDrawModifier*/ 0x0123456789ABCDEFull, 0, 0, 0);
+            CHECK(pkt == (uint64_t)(uintptr_t)ring, "#2929: the builder returned the packet it wrote");
+            CHECK(rd.cursor_up - ring == 4, "#2929: the packet is exactly 4 dwords (the reservation)");
+            CHECK(ring[0] == PM4(4, IT_NOP, R_DRAW_INDIRECT),
+                  "#2929: header is a 4-dword IT_NOP carrying the DrawIndirect sub-op");
+            CHECK(ring[1] == 0x140u, "#2929: cmd[1] = the byte offset into the graphics argument base");
+            CHECK(ring[2] == 0x89ABCDEFu && ring[3] == 0x01234567u,
+                  "#2929: cmd[2..3] = the 64-bit ShaderDrawModifier, low dword first");
+            CHECK(draw_ind_size(0, 0, 0, 0, 0, 0) == 4u * 4u,
+                  "#2929: GetSize answers the 16 bytes the builder writes");
+
+            // The sub-op must DIFFER from the indexed sibling's. They carry identical payloads, so a
+            // shared sub-op would decode and build identically and every assertion above would still
+            // pass -- while the executor read a fifth argument dword the guest never wrote and then
+            // rejected the draw for having no index base. This is the one comparison that sees it.
+            uint32_t iring[16];
+            memset(iring, 0xEE, sizeof iring);
+            Dcb id{};
+            id.bottom = iring; id.top = iring + 16; id.cursor_up = iring; id.cursor_down = iring + 16;
+            draw_idx_ind((uint64_t)(uintptr_t)&id, 0x140, 0x0123456789ABCDEFull, 0, 0, 0);
+            CHECK(iring[0] == PM4(4, IT_NOP, R_DRAW_INDEX_INDIRECT) && iring[0] != ring[0],
+                  "#2929: the indexed and non-indexed indirect draws are distinct sub-ops");
+            CHECK(memcmp(&iring[1], &ring[1], 3 * sizeof(uint32_t)) == 0,
+                  "#2929: ... with identical (offset, modifier) payloads");
         }
     }
 

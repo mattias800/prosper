@@ -29,7 +29,7 @@ a zero means only "none in the surveyed window". Measured on this tool's first r
 
 **(2) Admission.** On a title covered by the native-wave32 allowlist, a fragment shader whose reason
 set is exactly `wave-any` is ADMITTED rather than skipped -- `render_runner.h:7140-7155` sets
-`fragment_subgroup_skip = false` and logs `[render] GTA V native-width fragment vote:` INSTEAD of the
+`fragment_subgroup_skip = false` and logs `[render] native-width fragment vote:` INSTEAD of the
 skip line. So on `PPSA04263` that class never appears in the REFUSED column at any route or window,
 and wave-any is exactly the class every hit in the corpus belongs to. It is not invisible: it is
 counted separately, as `admitted`. An earlier version of this file said "invisible at any route",
@@ -63,12 +63,16 @@ ROUTE_GATED = {
     "PPSA04263": "world is behind the Story/Performance menu route; a default boot surveys menus",
 }
 
-# Titles on the renderer's native-wave32 allowlist (live_renderer.cpp:1216 -> render_runner.h:7140).
-# On these, a fragment shader whose reason set is exactly wave-any is ADMITTED and logs the admit
-# line rather than the skip line, so it never appears in the REFUSED column here -- not with a
-# longer window and not with a route. It is counted, in the ADMITTED column. Kept in step with
-# capture_wave_census.py's NATIVE_VOTE_ALLOWLIST and pinned by test_skip_survey.py.
-NATIVE_VOTE_ALLOWLIST = ("PPSA04263",)
+# Titles the renderer admits the wave-any class on (live_renderer.cpp's kNativeFragmentVoteTitles).
+# On these, a fragment shader whose reason set is exactly wave-any is ADMITTED rather than skipped:
+# the renderer logs the admit line instead of the skip line, so that class never appears in the
+# REFUSED column for them -- not with a longer window, not with a route. It is counted, in the
+# ADMITTED column. On every OTHER title the same shader is still refused.
+#
+# Pinned by test_skip_survey.py against the renderer's own list, in whatever form it takes. It has
+# been a single id, then absent, then this array; a pin anchored to any one of those shapes missed
+# the change to the next.
+NATIVE_VOTE_ALLOWLIST = ("PPSA01885", "PPSA02664", "PPSA04263", "PPSA13579", "PPSA25009")
 
 # Both patterns are pinned to the emitter's format strings by test_skip_survey.py, which greps the
 # producing source. A regex that silently stops matching would make every title report zero -- the
@@ -77,25 +81,47 @@ NATIVE_VOTE_ALLOWLIST = ("PPSA04263",)
 # "[render] skip draw=N fs=HASH: fragment shader requires subgroup size 64 (... why=0x2 wave-any)"
 SKIP = re.compile(r"\[render\] skip draw=\d+ fs=([0-9a-f]+): fragment shader requires subgroup "
                   r"size (\d+) .*?why=(\S+)([^)]*)\)")
-# "[render] GTA V native-width fragment vote: subgroup 64 -> 32 (why=0x2)" -- the ADMIT line. It is
+# "[render] native-width fragment vote: subgroup 64 -> 32 (why=0x2)" -- the ADMIT line. It is
 # emitted INSTEAD of a skip line, so without counting it an allowlisted title reports a zero that no
 # route or window can correct.
-ADMIT = re.compile(r"\[render\] GTA V native-width fragment vote: subgroup (\d+) -> (\d+) "
-                   r"\(why=(\S+)\)")
+# Trailing fields are tolerated deliberately. This regex broke once already: the emitter
+# gained an `fs=` field and a pattern anchored on `\(why=...\)` silently matched nothing,
+# reporting admitted=0 across a whole corpus while 43 admit lines sat in the logs.
+ADMIT = re.compile(r"\[render\] native-width fragment vote: subgroup (\d+) -> (\d+) "
+                   r"\(why=(\S+?)[ )]")
 FPS = re.compile(r"\[app\] [\d.]+ fps \((\d+) frames")
+# Belt and braces against the failure that invalidated every routed run before it was noticed: the
+# path is checked before the corpus starts, and the log is checked after each boot, because a file
+# that exists at check time can still fail to open. A route that delivered no input measured a boot
+# screen, so its count is not evidence of anything.
+PAD_FAILED = re.compile(r"\[pad\][^\n]*cannot open route file: ([^\n]*)")
+# The positive signal, which is what a routed row is actually required to show. Checking only for
+# the absence of an error is what let trap 274 through: absence is also what a run produces when the
+# emulator never looked at the variable at all.
+PAD_LOADED = re.compile(r"\[pad\] PROSPER_PAD_SCRIPT loaded (\d+) entries")
 # The counts are host-dependent in the extreme: on an AMD host wave64 is native, nothing is refused,
 # and every count is legitimately 0. A baseline recorded on one GPU and compared against another
 # would report every shader as fixed and go green, so the device is recorded and checked.
 DEVICE = re.compile(r"\[render\] Vulkan device: (.+)")
 
 
-def survey(app, dump, seconds, out_dir):
+def survey(app, dump, seconds, out_dir, route=None):
+    """One boot. `route` is an optional {pad_script, env, name} from a snapshot entry.
+
+    The route's env is applied VERBATIM, acceleration included -- see the module docstring for why
+    dropping it would desync the route and why keeping it makes the counts undercounts.
+    """
     title = Path(dump).name.replace("-app0", "")
-    log = Path(out_dir) / ("skip_%s.log" % title)
+    suffix = ("_" + route["name"]) if route else ""
+    log = Path(out_dir) / ("skip_%s%s.log" % (title, suffix))
     env_line = {
         "PROSPER_RENDER": "1",
         "PROSPER_GUEST_ARGS": "-force-gfx-direct",
     }
+    if route:
+        if route.get("pad_script"):
+            env_line["PROSPER_PAD_SCRIPT"] = "@" + route["pad_script"]
+        env_line.update({k: str(v) for k, v in (route.get("env") or {}).items()})
     import os
     env = dict(os.environ)
     env.update(env_line)
@@ -135,8 +161,14 @@ def survey(app, dump, seconds, out_dir):
     # reported for context and never used to suppress a count.
     frames = max([int(m) for m in FPS.findall(text)] or [0])
     device = DEVICE.search(text)
+    pad_failed = PAD_FAILED.search(text)
+    pad_loaded = PAD_LOADED.search(text)
     return {
         "title": title,
+        "route": route["name"] if route else "",
+        "routed": bool(route and route.get("pad_script")),
+        "pad_failed": pad_failed.group(1).strip() if pad_failed else "",
+        "pad_entries": int(pad_loaded.group(1)) if pad_loaded else -1,
         "device": device.group(1).strip() if device else "",
         "frames": frames,
         "elapsed": round(elapsed, 1),
@@ -148,6 +180,60 @@ def survey(app, dump, seconds, out_dir):
         "widths": sorted({s for s, _, _ in shaders.values()}),
         "log": str(log),
     }
+
+
+def resolve_pad_script(pad_script, snapshots_path):
+    """An ABSOLUTE path to the route file, or raise.
+
+    `snapshots.json` stores `pad_script` relative to the `prosper/` directory, and the emulator
+    resolves it against ITS OWN working directory -- which is wherever the survey was launched from.
+    Passing the stored string through therefore produced
+
+        [pad] PROSPER_PAD_SCRIPT: cannot open route file: scripts/blasphemous2/reach-first-gameplay.pad
+
+    and the title booted with NO INPUT AT ALL, sat on its title screen for the whole route, and
+    returned a shader count that looked entirely reasonable. Every routed survey run before this fix
+    measured a boot screen, including the one that recorded `skip_baseline.json`.
+
+    Raising rather than warning is the point: a route that cannot route must not return a number.
+    """
+    root = Path(snapshots_path).resolve().parent.parent.parent   # tools/snapshot/x.json -> prosper/
+    for candidate in (root / pad_script, Path(pad_script)):
+        if candidate.is_file():
+            return str(candidate.resolve())
+    raise FileNotFoundError(
+        "route file %r does not exist (looked in %s and in the working directory). A route that "
+        "cannot deliver input measures a boot screen, so this aborts rather than surveying one."
+        % (pad_script, root))
+
+
+def snapshot_routes(path, titles=None):
+    """Reviewed routes from tools/snapshot/snapshots.json, keyed by the dump they drive.
+
+    Reuses what the project already agreed is worth guarding rather than inventing new sequences, and
+    reaches the same state every run -- which the human-played baseline could not.
+
+    Every declared route file is resolved and checked HERE, before any title boots, so a broken
+    path costs a second rather than a corpus run. See `resolve_pad_script`.
+    """
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    entries = data if isinstance(data, list) else data.get("snapshots", data.get("entries", []))
+    out = []
+    for e in entries:
+        dump = str(e.get("dump", ""))
+        title = dump.replace("-app0", "")
+        if titles and title not in titles:
+            continue
+        pad = e.get("pad_script") or ""
+        out.append({
+            "name": e.get("name", "?"),
+            "title": title,
+            "dump": dump,
+            "pad_script": resolve_pad_script(pad, path) if pad else "",
+            "env": e.get("env") or {},
+            "seconds": int(e.get("timeout") or 150),
+        })
+    return out
 
 
 def unjudgeable(row):
@@ -167,6 +253,15 @@ def unjudgeable(row):
     Two contract facts both callers rely on: the returned reason is never falsy when there is one
     (they test `if why`), and it reads as a fragment following a title id (they format `"%s %s"`).
     """
+    if row.get("pad_failed"):
+        return ("never loaded its route file (%s), so it measured a boot screen rather than the "
+                "route" % row["pad_failed"])
+    if row.get("routed") and row.get("pad_entries", -1) <= 0:
+        # Required rather than merely reported: a routed row whose log never says the route loaded
+        # has not shown that it drove the title anywhere. See trap 274.
+        return ("is a routed run whose log never reports a loaded route (%s), so nothing shows it "
+                "drove the title anywhere"
+                % ("0 entries" if row.get("pad_entries") == 0 else "no [pad] loaded line"))
     if row["exited_early"]:
         return "exited early after %.0fs (rc=%s)" % (row["elapsed"], row["returncode"])
     if not row["frames"]:
@@ -300,6 +395,13 @@ def main() -> int:
     ap.add_argument("--out", default=".", help="where per-title logs are written")
     ap.add_argument("--only", help="comma-separated title ids to survey")
     ap.add_argument("--json", help="also write the results here")
+    ap.add_argument("--from-snapshots", metavar="SNAPSHOTS_JSON",
+                    help="drive each title with the reviewed routes from tools/snapshot/"
+                         "snapshots.json instead of a bare timed boot. Each route's env is "
+                         "applied VERBATIM, snapshot acceleration included -- see the module "
+                         "docstring: the counts become undercounts, which is sound for a "
+                         "before/after because both arms carry the same bias, and dropping it "
+                         "would desync routes that were timed with it.")
     ap.add_argument("--baseline",
                     help="compare against this baseline; exit 1 on a regression, on a run "
                          "that cannot be judged, or on a different GPU")
@@ -318,9 +420,22 @@ def main() -> int:
         return 2
 
     results = []
-    for dump in dumps:
-        print("... %s (%ds)" % (dump.name, args.seconds), flush=True)
-        results.append(survey(app, str(dump), args.seconds, args.out))
+    if args.from_snapshots:
+        wanted = {d.name.replace("-app0", "") for d in dumps}
+        routes = snapshot_routes(args.from_snapshots, wanted)
+        if not routes:
+            print("no snapshot routes for %s" % ", ".join(sorted(wanted)), file=sys.stderr)
+            return 2
+        by_title = {d.name.replace("-app0", ""): d for d in dumps}
+        for r in routes:
+            print("... %s via %s (%ds)%s"
+                  % (r["title"], r["name"], r["seconds"],
+                     "" if r["pad_script"] else "  [no pad script -- boot only]"), flush=True)
+            results.append(survey(app, str(by_title[r["title"]]), r["seconds"], args.out, r))
+    else:
+        for dump in dumps:
+            print("... %s (%ds)" % (dump.name, args.seconds), flush=True)
+            results.append(survey(app, str(dump), args.seconds, args.out))
 
     print("\n%-12s %7s %6s %8s %8s  %s"
           % ("title", "sec", "frames", "refused", "admitted", "reasons (distinct shaders)"))
@@ -333,14 +448,21 @@ def main() -> int:
             # Never "clean". A zero is scoped to the window AND, on an allowlisted title, to a class
             # this tool structurally cannot see.
             notes.append("none in window")
-        if r["title"] in NATIVE_VOTE_ALLOWLIST:
-            notes.append("ALLOWLISTED: wave-any is ADMITTED here, not skipped -- it is in the "
-                         "admitted column, never the refused one, at any route")
+        # Per-title again since PR #3480, so the note must name WHICH titles rather than claim all
+        # of them. Saying "every title" while the renderer admits three would hide refusals on the
+        # rest behind a reassuring sentence.
+        if r["admitted_shaders"]:
+            notes.append("ALLOWLISTED: wave-any is ADMITTED here (not skipped) -- those %d are in "
+                         "the admitted column, never the refused one" % r["admitted_shaders"])
+        elif r["title"] in NATIVE_VOTE_ALLOWLIST:
+            notes.append("allowlisted for wave-any, but none was admitted in this window")
         if r["title"] in ROUTE_GATED:
             notes.append(ROUTE_GATED[r["title"]])
         if r["exited_early"]:
             notes.append("EXITED EARLY after %.0fs (rc=%s) -- window not completed"
                          % (r["elapsed"], r["returncode"]))
+        if r.get("route"):
+            notes.insert(0, "route=%s%s" % (r["route"], "" if r.get("routed") else " (boot only)"))
         print("%-12s %7.0f %6d %8d %8d  %s"
               % (r["title"], r["elapsed"], r["frames"], r["refused_shaders"],
                  r["admitted_shaders"], "; ".join(notes)))
@@ -353,10 +475,11 @@ def main() -> int:
     print("")
     print("A zero is NOT a clean bill of health, for two reasons. (1) A title refuses nothing until")
     print("it renders the thing that would have been refused -- GTA V reported 0 over 5160 frames")
-    print("while its world refuses 21 (#3464), because the window reached only its menus. (2) On an")
-    print("ALLOWLISTED title a wave-any shader is admitted and logs the admit line instead of a skip")
-    print("line, so it is counted in the ADMITTED column and never the refused one, at any route")
-    print("and any window -- and wave-any is the class every hit in this corpus belongs to.")
+    print("while its world refuses 21 (#3464), because the window reached only its menus. (2) Since")
+    print("PR #3480 a wave-any shader is ADMITTED on ALLOWLISTED TITLES ONLY and logs the admit line")
+    print("instead of a skip line, so on those titles that class is counted in the ADMITTED column")
+    print("and never the refused one. On every other title it is still refused -- and wave-any was")
+    print("the class every hit in this corpus belonged to.")
     print("Counts are SHADERS, never draws -- the renderer's message is inside a "
           "shader-identity")
     print("dedupe guard and the draw drop is outside it. They are UPPER BOUNDS on distinct "

@@ -16,6 +16,28 @@ before the world loads (the default is Fidelity). That is a route property, not 
 a run started straight into Story on Fidelity shows the HUD over a dark scene and looks exactly like
 a renderer regression.
 
+> **Until 2026-09-11 the route that selects it did not reliably select it, and the failure was
+> silent (#3449).** `reach-performance-story.pad` spelled every press as a window of display flips,
+> which states a duration only at the flip rate it was tuned on (~80 flips/s on the authoring host)
+> — while the title's key repeat is wall-clock. Measured on Windows/NVIDIA with the same file, the
+> settings menu ran at **14-28 flips/s**, so the three Down presses were held **0.835 s / 0.186 s /
+> 0.477 s** instead of 0.15 s. Key repeat then walked the highlight a different number of rows in
+> each run: the reporter's run landed on `Motion Sensor Function` and set `Aircraft = On`, and the
+> reproduction run landed back on `Controls` and set `Show Controls For = In Aircraft (First
+> Person)`. **Graphics Mode was never touched in either**, so both sessions ran in the default
+> **Fidelity with ray tracing** while being recorded as Performance-mode runs.
+>
+> **Any framerate, capture or draw census taken on this route before 2026-09-11 may therefore be a
+> Fidelity+RT measurement.** Check the session's own evidence for a screenshot of
+> `Display -> Graphics Mode: Performance` before quoting it; a run whose only evidence of its
+> graphics mode is the route file has none.
+>
+> The route now anchors each press's START in flips and its HOLD in seconds (`f2272+0.15:down`),
+> which is rate-independent; verified by screenshot on Windows/NVIDIA reaching `Display` ->
+> `Graphics Mode: < Performance >` and then `Entering Story Mode`. Guest flip pacing (#3379) does
+> not substitute for it: pacing only sleeps when a host runs FAST, so at 14-28 flips/s it is inert
+> by construction.
+
 Tracker: **#1873**. Active frontier: **#2542** and **#2690** — #2542 names ONE hanging compute
 program and its title still calls it "the sole remaining cause"; there are at least three (#2690).
 (#2481 is CLOSED and superseded by #2542; the
@@ -23,9 +45,26 @@ pointer here and in `CLAUDE.md` said #2481 long after it closed). Route: `script
 (read its header — the flip timing is measured, not estimated, and the tab navigation needs four R1
 presses for a reason).
 
-**Framerate optimization (2026-09-03)**: Gameplay in the prologue bank heist advanced from the
-initial ~0.6–0.8 FPS slide-show baseline to **21.0–21.3 FPS (46.99 ms average frame interval)** in native 4K Performance mode,
-an overall **~34x speedup** (measured across 106 rendered frames in 4.90 s; Run 6 milestone reached 15.2–15.4 FPS; Run 7 reached 21.0–21.3 FPS; see breakdown below).
+**Framerate (2026-09-10): the world runs at 7–8 FPS on Linux/RADV**, observed on screen by the
+project owner on a routed `reach-performance-story.pad` run with the bank interior rendering, at
+`ab80a2d69`. That is the number to quote.
+
+> **The "21.0–21.3 FPS / ~34x speedup" this line used to claim was never a measurement of the
+> rendered world** (#3446). The three captures behind it contain **zero compute groups** and
+> `compute=0.0 ms`; a GTA V world frame runs dozens of compute programs, so those captures are a
+> different phase — a loading screen, not the bank. Three further defects in the same record: the
+> quoted figure is the **guest flip rate**, not a frame rate (`rendered` is `unavailable` under GPU
+> present, and the Run 7 capture's own host-presented rate is 11.62/s against the 21.00 quoted); the
+> capture's recorded revision is not an ancestor of the commit that claims it; and the reproduction
+> recipe's wall-clock trigger now fires before the world loads.
+>
+> **The relationship runs the other way on this title, which is why the number was believable.**
+> Across all 43 `PPSA04263` captures on the Linux box, compute-group count correlates with flip rate
+> at **−0.581**: captures with >100 groups (real world work) sit at a median 2.25 flips/s, those with
+> ≤40 groups at 6.38, and the highest rate anywhere in the corpus is 7.58. A high number on this
+> title means *less* world being drawn, not faster drawing — so quoted as a speedup it points
+> backwards. The per-run table below is kept as the record of what was optimised; read its rates as
+> flip rates of an unverified phase, not as gameplay framerates.
 
 Historical design note for the descriptor work: `docs/FLAT_LOAD_DESIGN.md`. Do not start from it; the
 descriptor-array lift it describes is complete.
@@ -115,16 +154,16 @@ unchanged. Focused tests cover multiple images, invalid-but-resident content, bo
 paths and view/sampler failures before and after eviction. Native comparison evidence and
 the still-open broader resource-preparation budget remain in #3065.
 
-## Gameplay framerate optimization: reaching 21+ FPS (2026-09-03)
+## Gameplay framerate optimization (2026-09-03) — rates in this section are NOT world framerates
 
 **Platform**: Measured on **Windows 11 / Intel Core i9 (24 physical cores) / discrete NVIDIA GeForce RTX 4090 (24 GB VRAM, Vulkan 1.4)**.
 
 > [!NOTE]
 > Several transfer-reduction mechanisms below (§2, §3, §4) explicitly address host staging bloat and discrete PCIe bus transfers between system RAM and dedicated VRAM. On unified-memory APU/iGPU architectures (such as Linux / Radeon 8060S), host memory and device memory share the same physical address space, so PCIe-specific bus bottlenecks do not exist there in the same form.
 
-Overnight profiling and optimization of the native-4K Performance story route (`scripts/gta5/reach-performance-story.pad`, prologue bank heist) raised gameplay throughput from **0.6–0.8 FPS (1,600+ ms/frame) to 21.0–21.3 FPS (46.99 ms/frame)** on host hardware.
+Overnight profiling and optimization of the native-4K Performance story route (`scripts/gta5/reach-performance-story.pad`, prologue bank heist). **The rates below are guest flip rates measured on captures with zero compute work, so they do not describe the rendered world** (#3446) — the optimisations they document are real and were kept, but the throughput figures are not gameplay framerates. The measured world rate is 7–8 FPS on Linux/RADV (2026-09-10).
 
-This represents a **~34x speedup**. The primary bottlenecks identified and resolved are detailed below.
+The primary bottlenecks identified and resolved are detailed below; they are genuine, and were verified individually. It is the end-to-end **speedup ratio** that does not survive, because its endpoints measure different phases.
 
 ### 1. MRT Flush Breaking Backend Submission Batching (~560 ms/frame reduction)
 
@@ -177,6 +216,12 @@ This represents a **~34x speedup**. The primary bottlenecks identified and resol
 
 ### 6. Summary of Progression & Verification
 
+> **Every rate in the table below is a guest flip rate on a capture with no compute work in it**
+> (#3446). The optimisations above are real, were verified individually, and were kept. What does
+> not survive is the end-to-end progression: its endpoints are different phases, so the ratio
+> between them measures nothing. The world's measured rate is **7–8 FPS** (Linux/RADV, 2026-09-10,
+> owner-observed on the routed Performance run).
+
 | Milestone | Configuration / Fixes | Frame Time (avg) | FPS | Key Gain |
 | :--- | :--- | :--- | :--- | :--- |
 | **Baseline** | Default launch | ~1,600 ms | ~0.6–0.8 FPS | Initial state |
@@ -198,9 +243,9 @@ This represents a **~34x speedup**. The primary bottlenecks identified and resol
 
 To reproduce the benchmark capture on Windows:
 ```powershell
-$env:PROSPER_PAD_SCRIPT = "@C:/Users/matti/repos/ps5ys/prosper/scripts/gta5/reach-performance-story.pad"
+$env:PROSPER_PAD_SCRIPT = "@<REPO_ROOT>/prosper/scripts/gta5/reach-performance-story.pad"
 $env:PROSPER_PAD_SCRIPT_LOG = "1"
-$env:PROSPER_CAPTURE_DIR = "C:/Users/matti/repos/ps5ys/tmp/captures"
+$env:PROSPER_CAPTURE_DIR = "<REPO_ROOT>/tmp/captures"
 $env:PROSPER_PERF_CAPTURE_AFTER_MS = "270000"
 $env:PROSPER_RENDER = "1"
 $env:PROSPER_MAX_GPU_COMPARE_IMAGE_MB = "2"
@@ -267,10 +312,12 @@ dispatch was skipped. A zero-width probe silently meaning "unsupported" is a tra
   `DIM=2D_ARRAY`, while the later graphics `T#` names the byte-identical allocation as `DIM=CUBE`, and
   graphics lowers cube sampling to a vertical 2D stack.
 - **#2402** — the YUV composite draw skipped on NVIDIA because its fragment shader requires subgroup
-  size 64 on a 32-wide device. The series runs Wave64 fragment programs at native Wave32 **for this
-  title only**, and only for the narrow class whose sole remaining width reason is a control-flow
-  `WaveAny`; ballots, lane identity and scalar reductions stay exact, and every other title keeps
-  master's fail-visible exact-width contract.
+  size 64 on a 32-wide device. The series runs Wave64 fragment programs at native Wave32 for the
+  narrow class whose sole remaining width reason is a control-flow `WaveAny`; ballots, lane identity
+  and scalar reductions stay exact. **This was "for this title only" until #3480**, which replaced the
+  single title id with an allowlist of titles that have a before/after survey on a reviewed route --
+  the classifier was never the limit, the evidence was. A title not on that list still keeps the
+  fail-visible exact-width contract.
 
 ### Wave-vote exactness — and what it means for the hang investigation
 
@@ -448,6 +495,7 @@ conclusion; it sharpens what "essentially all black" looks like.
 | Removing the byte-preserving HTILE suppression is safe for GTA V, because peak colour coverage is 99.78% in both arms (#3093's own clearing check) | **False, and the check is the reason it passed.** `3f5460d0` cost GTA its deferred lighting for a day: the world still covered the frame, drawn with no illumination and a grid artifact from depth-dependent sampling. Peak coverage cannot see a wrongly-lit but fully-covered frame. Bisected from a user report over 52 commits, 4 builds, with 30-frame contact sheets reviewed by eye at each step. | #3121 |
 | A *uniform* HTILE plane means a fast clear, so uniformity can discriminate a clear from a HiZ refresh where byte equality cannot | **Measured false BEFORE it was implemented.** `PROSPER_HTILE_UNIFORMLOG` over both titles: GTA **6,500/6,500 writes uniform, zero transitions, first word 0x00000000**; Blue Prince **62,000/62,000 uniform, zero transitions, first word 0x00000000**. The two titles are indistinguishable at this site on every available signal, differing only in plane size (73,728 vs 49,152 words = resolution). A discriminator built on uniformity would have been built on a difference that does not exist. | #3121 |
 | Restoring the suppression re-breaks Blue Prince, so the two titles are in tension | **False.** One binary, one environment variable, measured the same day: Blue Prince reaches `max_nonblack` **0.2085 in BOTH arms** — the same "~21%" #3093 called its restored healthy value — while GTA is broken in one and correct in the other. There is no trade. | #3121 |
+| The HTILE write path invalidates depth and stencil *unconditionally*, so the fix is to build a discriminator from scratch | **False on current `main`, and the source comment is why the reading is easy to reach.** `htile_kill` is gated on `(!byte_preserving \|\| !current_frame_depth)`: #3281 reinstated the byte-preserving term the same day #3264 removed it, narrowed by a PRESENTATION-EPOCH test (`last_depth_present == present_count()`). Prior-frame depth is invalidated, in-flight geometry depth is preserved. The #3264 comment layer still opened "the `!byte_preserving` term is REMOVED, not weakened" directly above the line that keys on it, so the last comment before the code contradicted the code — which is how #3580 came to summarise the behaviour as unconditional *while quoting the conditional line*. The block now states the current rule first and marks the superseded layers. | #3580 |
 
 **Still open, and not to be mistaken for solved:** *why* two byte-identical, uniform, all-zero HTILE
 writes need opposite handling in the two titles. The restored exception is behaviour measured

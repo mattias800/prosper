@@ -13,11 +13,13 @@
 #include "host/symbols/il2cpp_symbols.hpp" // #2551: name the C# method containing an IL2CPP address
 #include "hle/dispatch/nid.hpp"
 #include "hle/dispatch/dispatch.hpp"
+#include "hle/dispatch/import_data_seed.hpp"   // #3529: initial value of an unresolved DATA import
 
 #if defined(__linux__) || defined(__APPLE__)
 #include "host/platform/posix_shim.hpp"
 #include "host/fault/fault_context.hpp"   // #2018: one fault's own registers, snapshotted from ITS ucontext
 #include "host/fault/rbp_chain.hpp"      // PROSPER_HWBP_STACK: who called this breakpoint
+#include "host/fault/guest_stack_scan.hpp"   // the scan-based sibling, shared by both platforms
 #include <sys/mman.h>
 #include <signal.h>
 #include <setjmp.h>
@@ -85,6 +87,8 @@ namespace {
     ExecImageDestructionCanary g_exec_image_destruction_canary;
 
     uint64_t g_base = 0, g_stub_base = 0, g_stub_size = 0, g_nstubs = 0;
+    // Import-DATA aperture (#3529): base, per-slot stride and how many slots are mapped.
+    uint64_t g_data_base = 0, g_data_stride = 0, g_ndata = 0;
     // #1659: label guest addresses through the shared, module-aware helpers instead of subtracting a
     // literal base. These sites hard-coded 0x400000000 — the eboot's address BEFORE #825 relocated it
     // to 0x410000000 — so every printed offset was 0x10000000 too high and did not round-trip through
@@ -3197,6 +3201,87 @@ bool append_stubs(const std::vector<ImportSlot>& slots, size_t first_new, std::s
     return true;
 }
 
+// --- import-DATA aperture (#3529) ------------------------------------------------------------
+//
+// One zero-filled READ|WRITE page-multiple per unresolved STT_OBJECT import. Never PROT_EXEC: the
+// defect this replaces let a guest STORE rewrite executable stub bytes, and refusing execute here
+// means a control transfer into a data import faults at the transfer instead of running whatever
+// the guest last wrote.
+bool install_import_data(const std::vector<ImportSlot>& slots, uint64_t data_base,
+                         uint64_t stride, std::string* err) {
+    auto fail = [&](const char* s){ if (err) *err = s; return false; };
+    if (!data_base) return fail("import-data base is 0");
+    if (!stride) return fail("import-data stride is 0");
+    const uint64_t n = slots.size();
+    // A title whose every data import resolved cross-module (or that has none) maps nothing: a
+    // 0-byte mmap fails with EINVAL. Record the empty table and succeed, as install_stubs does.
+    if (n == 0) { g_data_base = data_base; g_data_stride = stride; g_ndata = 0; return true; }
+    const uint64_t region = page_up(n * stride);
+    if (region > kImportDataApertureBytes) return fail("import data table exceeds its aperture");
+    void* want = (void*)data_base;
+    void* got = prosper_mmap_noreplace(want, region, PROT_READ | PROT_WRITE,
+                                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (got == MAP_FAILED || got != want) return fail("mmap import data region failed");
+    // MAP_ANONYMOUS is already zero-filled. Zero is the value for everything prosper cannot answer
+    // honestly; the few Sony variables it CAN answer are written here (import_data_seed.hpp).
+    for (uint64_t i = 0; i < n; i++)
+        seed_import_data(slots[i].nid, (uint8_t*)got + i * stride, (size_t)stride);
+    g_data_base = data_base; g_data_stride = stride; g_ndata = n;
+    if (getenv("PROSPER_STUBDUMP")) {
+        for (uint64_t i = 0; i < n; i++) {
+            const std::string& nm = g_nid_db ? g_nid_db->resolve(slots[i].nid) : std::string();
+            fprintf(stderr, "[import-data] #%llu at 0x%llx %s::%s %s\n", (unsigned long long)i,
+                    (unsigned long long)(data_base + i * stride), slots[i].lib.c_str(),
+                    slots[i].nid.c_str(), nm.c_str());
+        }
+    }
+    return true;
+}
+
+bool append_import_data(const std::vector<ImportSlot>& slots, size_t first_new, std::string* err) {
+    auto fail = [&](const char* s){ if (err) *err = s; return false; };
+    const uint64_t n = slots.size();
+    // NOTHING TO APPEND IS SUCCESS, and this test must come BEFORE the aperture requirement below.
+    // runtime_load_start_module calls this unconditionally, and an embedder that only ever called
+    // install_stubs has no data aperture at all -- which described every runtime PRX load, including
+    // the hermetic `runtime_prx_load` test, until this order was fixed. Requiring an aperture in
+    // order to append zero slots to it made the aperture a hard prerequisite of ALL runtime module
+    // loading. Raised in review of #3541.
+    if (first_new == n && first_new == g_ndata) return true;
+    if (!g_data_stride) return fail("append_import_data before install_import_data");
+    if (first_new > n || first_new != g_ndata)
+        return fail("append_import_data: slot table is not an extension");
+    if (first_new == n) return true;
+    // Grow by the pages the new slots need only. The mapped pages are NEVER remapped: guest code is
+    // already relocated against them and they hold whatever the guest has stored so far.
+    const uint64_t mapped_end = page_up(g_ndata * g_data_stride);
+    const uint64_t need_end   = page_up(n * g_data_stride);
+    if (need_end > kImportDataApertureBytes) return fail("import data table exceeds its aperture");
+    if (need_end > mapped_end) {
+        void* want = (void*)(g_data_base + mapped_end);
+        void* got = prosper_mmap_noreplace(want, need_end - mapped_end, PROT_READ | PROT_WRITE,
+                                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (got == MAP_FAILED || got != want) return fail("mmap import data extension failed");
+    }
+    for (uint64_t i = first_new; i < n; i++)
+        seed_import_data(slots[i].nid,
+                         (uint8_t*)(uintptr_t)(g_data_base + i * g_data_stride),
+                         (size_t)g_data_stride);
+    g_ndata = n;
+    if (getenv("PROSPER_STUBDUMP"))
+        for (uint64_t i = first_new; i < n; i++) {
+            const std::string& nm = g_nid_db ? g_nid_db->resolve(slots[i].nid) : std::string();
+            fprintf(stderr, "[import-data] +#%llu at 0x%llx %s::%s %s\n", (unsigned long long)i,
+                    (unsigned long long)(g_data_base + i * g_data_stride), slots[i].lib.c_str(),
+                    slots[i].nid.c_str(), nm.c_str());
+        }
+    return true;
+}
+
+uint64_t import_data_addr(uint64_t idx) {
+    return g_data_stride ? g_data_base + idx * g_data_stride : 0;
+}
+
 // #312 label-slot write watch (PROSPER_WATCH_LABEL=1): called by the AGC fence builder with the
 // first heap-resident value-1 fence label address; protects the label's page and logs every write
 // into the label's block with the writer's rip (guest allocator free-path vs prosper fence write),
@@ -3726,6 +3811,61 @@ std::string describe_code_address(uint64_t address) {
     }
     std::snprintf(text, sizeof text, "host:0x%llx", (unsigned long long)address);
     return text;
+}
+
+namespace {
+// The guest-code filter both recoverers share. guest_module_name is the same classifier
+// describe_code_address uses, so a frame reported here and a frame in a fault backtrace can never
+// disagree about what is guest code. STUB addresses are dropped too: an import stub is prosper's own
+// synthesized trampoline, and naming it as the caller answers the question with the mechanism
+// instead of the call site.
+bool is_guest_call_site(uint64_t a) {
+    const char* module = prosper::guest_module_name(a);
+    return std::strcmp(module, "mapped/host") != 0 && std::strcmp(module, "STUB") != 0;
+}
+}  // namespace
+
+int guest_frames_on_stack(uint64_t rsp_seed, uint64_t* out, int max) {
+    if (!out || max <= 0 || rsp_seed <= 0x10000) return 0;
+    ensure_probe_pipe();
+    // Bound the scan by the guest thread's own registered stack when it has one, so the walk stops
+    // at the real top rather than at an arbitrary window. Without a registration -- the main thread
+    // before it is registered, or a thread the guest created behind our back -- fall back to a fixed
+    // window, which is why the cap is applied in both branches.
+    constexpr uint64_t kWindow = 64 * 1024;
+    uint64_t limit = rsp_seed + kWindow;
+    void* stack_base = nullptr;
+    size_t stack_size = 0;
+    if (guest_stack_for_current_thread(&stack_base, &stack_size) && stack_size) {
+        const uint64_t top = (uint64_t)(uintptr_t)stack_base + stack_size;
+        if (top > rsp_seed && top < limit) limit = top;
+    }
+    return prosper::host::scan_stack_for_returns(rsp_seed, limit, out, max,
+                                                 &probe_readable, &is_guest_call_site);
+}
+
+int guest_frames_from_rbp(uint64_t rbp_seed, uint64_t* out, int max) {
+    if (!out || max <= 0 || rbp_seed <= 0x10000) return 0;
+    // The probe pipe is created lazily by the fault-handler install path, and a handler asking who
+    // called it may run before that. Creating it here is safe -- ensure_probe_pipe is a magic static
+    // and this is an ordinary handler thread, not a signal context.
+    ensure_probe_pipe();
+    // Walk deeper than the caller asked: host frames between the handler and the guest are dropped
+    // by the filter below, and a chain that started inside prosper would otherwise spend the whole
+    // budget before reaching guest code.
+    uint64_t frames[64];
+    const int cap = max < 64 ? max * 4 : 64;
+    const int walked = prosper::host::walk_rbp_chain(rbp_seed, frames,
+                                                     cap > 64 ? 64 : cap, &probe_readable);
+    int kept = 0;
+    for (int i = 0; i < walked && kept < max; ++i) {
+        if (!is_guest_call_site(frames[i])) continue;
+        bool duplicate = false;
+        for (int j = 0; j < kept; ++j) duplicate |= out[j] == frames[i];
+        if (duplicate) continue;
+        out[kept++] = frames[i];
+    }
+    return kept;
 }
 
 bool exec_image_statics_destroyed() {   // #2613, see the canary at the top of this file

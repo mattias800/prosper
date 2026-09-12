@@ -50,6 +50,29 @@ class ClassifierAgreesWithTheLoader(unittest.TestCase):
                          "dump_hygiene.PERMITTED_MODULE_DIRS has drifted from "
                          "module_path_policy.hpp's kPermittedModuleDirs")
 
+    def test_platform_root_prefixes_match_the_cpp_header(self):
+        """Same rule, same reason: two implementations of one policy must not drift.
+
+        The neighbouring allowlist is asserted by a test "rather than trusting this comment", and
+        PLATFORM_ROOT_PREFIXES arrived guarded by exactly the comment its neighbour declines to
+        trust (#3508 re-review). Parsed, not duplicated.
+
+        Note the entries carry trailing `//` comments, which the sibling parser's `.strip('",')`
+        would leave intact -- `libkernel",  // libkernel, ...` compares as garbage and the test
+        would "pass" while checking nothing. Strip the comment first.
+        """
+        text = HEADER.read_text()
+        start = text.index("kRootRefusedPlatformPrefixes[] = {")
+        body = text[start:text.index("};", start)]
+        from_cpp = tuple(
+            line.split("//")[0].strip().strip('",')
+            for line in body.splitlines()[1:]
+            if '"' in line.split("//")[0]
+        )
+        self.assertEqual(from_cpp, dh.PLATFORM_ROOT_PREFIXES,
+                         "dump_hygiene.PLATFORM_ROOT_PREFIXES has drifted from "
+                         "module_path_policy.hpp's kRootRefusedPlatformPrefixes")
+
 
 class FindsTheRealThing(unittest.TestCase):
     def test_fakelib_modules_are_refused(self):

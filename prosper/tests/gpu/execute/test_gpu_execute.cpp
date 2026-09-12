@@ -1220,6 +1220,52 @@ int main() {
         std::filesystem::remove(capture_path, capture_filesystem_error);
     }
 
+    // #2929: the NON-indexed indirect draw (sceAgcDcbDrawIndirect) resolves from the FOUR-dword
+    // argument form — (vertexCount, instanceCount, startVertex, startInstance) — and reaches the
+    // backend as a real draw. The indexed path above reads five dwords and requires an index base;
+    // running this draw through it produces no draw at all, which is the silent disappearance the
+    // missing registration caused in the first place.
+    //
+    // The arm that makes this discriminating is the FOURTH dword. It is `startInstance` here and
+    // `baseVertex` in the indexed form, so a five-dword read of this buffer would take args[3] = 0
+    // as the vertex offset and args[4] — past the end of what the guest wrote — as the first
+    // instance. Setting startVertex to 9 and leaving startInstance 0 makes the two readings give
+    // different, checkable answers: vertex_offset 9 (correct) versus 0 (indexed misreading).
+    {
+        alignas(4) uint32_t nonindexed_args[4] = {3, 2, 9, 0};
+        GpuState nonindexed = st;
+        nonindexed.draws.clear();
+        nonindexed.dispatches.clear();
+        nonindexed.dma_copies.clear();
+        nonindexed.ordered_memory_effects.clear();
+        GpuState::Draw draw;
+        draw.indexed = false;
+        draw.indirect = true;
+        draw.indirect_args_addr = reinterpret_cast<uint64_t>(nonindexed_args);
+        draw.command_order = 300;
+        nonindexed.draws.push_back(draw);
+        bool submitted = false;
+        uint32_t submitted_raw_count = 0;
+        uint32_t submitted_instances = 0;
+        int32_t submitted_vertex_offset = 0;
+        bool submitted_indexed = true;
+        set_submit_renderer([&](const std::vector<DrawItem>& items, uint32_t, uint32_t) {
+            if (!items.empty()) {
+                submitted = true;
+                submitted_raw_count = items.front().raw_draw_count;
+                submitted_instances = items.front().instance_count;
+                submitted_vertex_offset = items.front().vertex_offset;
+                submitted_indexed = items.front().raw_indexed;
+            }
+            return RenderedFrame{};
+        });
+        execute_ordered_and_present(nonindexed, W, H, 79, /*publish=*/false);
+        set_submit_renderer({});
+        CHECK(submitted && submitted_raw_count == 3 && submitted_instances == 2 &&
+              submitted_vertex_offset == 9 && !submitted_indexed,
+              "#2929: non-indexed indirect arguments resolve to a real non-indexed draw");
+    }
+
     // A parser stall makes later indirect packets depend on every producer in the preceding epoch.
     // Valid stale argument bytes must never leak through when that producer failed: doing so can
     // turn last frame's plausible counts into a real backend draw.

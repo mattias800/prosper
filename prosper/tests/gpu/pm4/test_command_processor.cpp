@@ -466,6 +466,42 @@ int main() {
         }
     }
 
+    // #2929: the NON-indexed indirect draw must survive the same fold, and must NOT arrive claiming
+    // to be indexed. `indexed` is what selects the argument-buffer layout the executor reads at the
+    // far end of `indirect_args_addr` — five dwords plus an index base, or four without one — so a
+    // shared arm that hard-coded `indexed = true` would send the executor to read a fifth dword the
+    // guest never wrote and then reject the draw for having no index base. An index buffer IS bound
+    // here, deliberately: the draw must still refuse to inherit it.
+    {
+        auto set_index_buffer = Hle::lookup("l4fM9K-Lyks");
+        auto set_indirect_base = Hle::lookup("RmaJwLtc8rY");
+        auto draw_nonindexed_indirect = Hle::lookup("1q1titRBL6o");
+        CHECK(set_index_buffer && set_indirect_base && draw_nonindexed_indirect,
+              "#2929: sceAgcDcbDrawIndirect is registered alongside the indirect base builder");
+        if (set_index_buffer && set_indirect_base && draw_nonindexed_indirect) {
+            alignas(4) uint32_t graphics_args[8] = {};
+            alignas(4) uint16_t indices[16] = {};
+            uint32_t buf[64] = {};
+            Dcb dcb2{};
+            dcb2.bottom = buf; dcb2.top = buf + 64;
+            dcb2.cursor_up = buf; dcb2.cursor_down = buf + 64;
+            const uint64_t D2 = reinterpret_cast<uint64_t>(&dcb2);
+            idx(D2, /*16-bit*/ 0, 0, 0, 0, 0);
+            set_index_buffer(D2, reinterpret_cast<uint64_t>(indices), 0, 0, 0, 0);
+            set_indirect_base(D2, /*graphics*/ 0, reinterpret_cast<uint64_t>(graphics_args), 0, 0, 0);
+            draw_nonindexed_indirect(D2, /*byte offset*/ 16, 0x90000000ull, 0, 0, 0);
+            GpuState st2;
+            run_cb(buf, 64, st2);
+            CHECK(st2.draws.size() == 1 && st2.draws[0].indirect &&
+                  st2.draws[0].indirect_args_addr ==
+                      reinterpret_cast<uint64_t>(graphics_args) + 16 &&
+                  st2.draws[0].modifier == 0x90000000ull,
+                  "#2929: non-indexed indirect draw retains the graphics base + offset and modifier");
+            CHECK(st2.draws.size() == 1 && !st2.draws[0].indexed && st2.draws[0].index_base == 0,
+                  "#2929: ... and is NOT indexed, even with an index buffer bound");
+        }
+    }
+
     // sceAgcAcbDispatchIndirect carries a WHOLE 64-bit argument address, not a byte offset from a
     // base, because the async-compute ring has no base to offset from: libSceAgc 3.20 exports 36
     // sceAgcAcb* entry points and not one of them sets an indirect-argument base. Sharing the DCB

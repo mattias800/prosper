@@ -22,6 +22,7 @@
 #include <cstdio>
 #include <cstdint>
 #include <vector>
+#include <cstring>
 #include <string>
 
 using namespace prosper::gpu;
@@ -49,13 +50,21 @@ static bool has_capability(const std::vector<uint32_t>& m, uint32_t cap) {
     for (auto& e : walk(m)) if (e.first == 17u && m[e.second + 1] == cap) return true;   // OpCapability
     return false;
 }
-static std::string extension_name(const std::vector<uint32_t>& m) {
+// NAMED, and over EVERY OpExtension rather than the first one. This used to return the first
+// extension in the module and the arms compared it for equality -- which was true only while
+// descriptor indexing was the sole extension prosper ever emitted. #3479 made every guest module
+// declare SPV_KHR_float_controls, and both arms went red without a word of the CONTRACT being
+// wrong: the ordinary-resource control asserted "no OpExtension at all", and the positive arm
+// asserted "the first extension is descriptor indexing". Neither is the property under test.
+// Naming the extension keeps every bit of the discriminating power and loses the coupling to
+// how many unrelated extensions happen to be declared.
+static bool has_extension(const std::vector<uint32_t>& m, const char* name) {
     for (auto& e : walk(m)) {
         if (e.first != 10u) continue;                                                     // OpExtension
         const char* p = reinterpret_cast<const char*>(&m[e.second + 1]);
-        return std::string(p);
+        if (std::strcmp(p, name) == 0) return true;
     }
-    return {};
+    return false;
 }
 // Index of the first instruction with `op`, or SIZE_MAX.
 static size_t first_index_of(const std::vector<uint32_t>& m, uint32_t op) {
@@ -122,7 +131,8 @@ int main() {
     std::vector<uint32_t> m_plain = recompile(plain);
     CHECK(!m_plain.empty(), "control: ordinary resource still recompiles");
     if (m_plain.empty()) { printf("== FAIL ==\n"); return 1; }
-    CHECK(!has_op(m_plain, 10u), "control: an ordinary resource emits NO OpExtension");
+    CHECK(!has_extension(m_plain, "SPV_EXT_descriptor_indexing"),
+          "control: an ordinary resource does NOT declare SPV_EXT_descriptor_indexing");
     CHECK(!has_capability(m_plain, 5301u) && !has_capability(m_plain, 5302u) &&
               !has_capability(m_plain, 5308u),
           "control: an ordinary resource declares NO descriptor-indexing capability");
@@ -140,7 +150,7 @@ int main() {
           "same selector-site mutation: an SGPR outside the compute push constants rejects");
 
     CHECK(m_arr[1] == 0x00010300u, "the module is SPIR-V 1.3, which is why the extension is required");
-    CHECK(extension_name(m_arr) == "SPV_EXT_descriptor_indexing",
+    CHECK(has_extension(m_arr, "SPV_EXT_descriptor_indexing"),
           "OpExtension SPV_EXT_descriptor_indexing is emitted");
     CHECK(has_capability(m_arr, 5301u), "ShaderNonUniform capability declared");
     CHECK(!has_capability(m_arr, 5302u),

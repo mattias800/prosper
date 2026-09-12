@@ -295,6 +295,13 @@ struct SrtUse {
     // an image atomic such as IMAGE_ATOMIC_SWAP 0x0f), not a sampled texture. Only meaningful for
     // kind 0.
     bool is_storage_image = false;
+    // SQ_RSRC dim of the CONSUMING MIMG instruction (#3577). This is the authority for the image
+    // SHAPE the recompiled SPIR-V will declare -- `rdna2_emit_alu.cpp` switches `OpTypeImage`'s Dim,
+    // Arrayed and MS straight off `in.mimg_dim`, and never consults the descriptor for it. So a null
+    // T# gets its dimension from here rather than from the (all-zero) descriptor words, and
+    // `ShaderResource::img_dim` uses this same encoding (`image_type_to_dim` is `type - 8`).
+    // 0xFFFFFFFF = not a MIMG use.
+    uint32_t mimg_dim = 0xFFFFFFFFu;
     // IMAGE_LOAD_MIP / IMAGE_STORE_MIP have one more address operand than their base-level
     // siblings. The current Vulkan compute backend materializes one mip only, so the fold may
     // specialize that operand away only after proving its exact VGPR was written in the same basic
@@ -1160,6 +1167,13 @@ struct SharedVulkanContext {
     // Features the compute backend requires; when false it must decline the shared device.
     bool storage_image_read_without_format = false;
     bool storage_image_write_without_format = false;
+    // VkPhysicalDeviceImageRobustnessFeatures::robustImageAccess, ENABLED on the published device
+    // (#3531). Same contract as every other field here: it reports what device creation requested,
+    // never what the physical device merely supports. A recompiled storage-image kernel reads out of
+    // range from EXEC-inactive lanes on purpose and relies on robustness to make that return zero,
+    // so a consumer that adopts this device must refuse storage-image work when this is false rather
+    // than execute undefined behaviour.
+    bool image_robustness = false;
     // Exact compute-wave acceleration. These describe features ENABLED on the borrowed device, not
     // merely physical support. The recompiler opts in only when the requested guest wave is inside
     // this range, full compute subgroups can be required, and both vote and arithmetic subgroup

@@ -4,6 +4,8 @@
 #include "hle/dispatch/nid.hpp"
 #include "hle/kernel/hle_kernel_time.hpp"
 #include "host/image/boot_program.hpp"   // #1659: shared guest-module labelling
+#include "host/image/exec_image.hpp"      // guest_frames_from_rbp / describe_code_address
+#include "host/fault/guest_caller.hpp"    // PROSPER_CAPTURE_RBP at a fatal handler's entry
 #include "host/platform/posix_shim.hpp"     // PROSPER_ASM_TRAMPOLINE (pass entry %rsp as 7th arg)
 #include "host/platform/precise_sleep.hpp"   // guest sleeps must not inherit the winpthreads tick (#3013)
 #include "hle/kernel/timedwait_census.hpp"   // PROSPER_TIMEDWAIT_CENSUS: which primitive a title paces on
@@ -15,6 +17,7 @@
 #include "hle/sync/pthread_slot.hpp"   // #2596: resolve a guest sync slot the way libkernel does
 #include "hle/sync/sync_futex.hpp"
 #include "hle/sync/sync_retire.hpp"   // #2042: a destroyed guest sync object's storage is retired, not freed
+#include "diagnostics/env_numeric.hpp"   // #3304: a mistyped PROSPER_WAITCAP must not remove the cap
 #include <pthread.h>
 #include <chrono>
 #if defined(__linux__)
@@ -867,10 +870,53 @@ HLE(k_load_start_mod) {   // Windows/MinGW: no import-boundary %fs swap -> guest
 }
 #endif
 
+// Name the guest call site that reached one of the fatal exits below.
+//
+// A title that terminates ITSELF is the hardest kind of boot failure to diagnose, because there is
+// no fault, no unimplemented NID and no host stack worth reading -- the guest ran a check, disliked
+// the answer prosper gave it, and left. What the reader needs is the one thing the log did not have:
+// WHERE. FINAL FANTASY TACTICS (#3498) raises 0xa0020001 with a completely clean log above it, and
+// the only way to progress it is to disassemble the caller.
+//
+// Printed unconditionally rather than behind an env switch: this runs exactly once, on a path that
+// is already terminating the process, so there is no cost to weigh against it -- and a diagnostic
+// that must be enabled is one nobody has enabled on the run that mattered.
+//
+// The chain is a FRAME-POINTER walk, so say what it is. A caller compiled without a prologue is
+// skipped silently (instrument traps 114, 217), which makes a short chain and a shallow stack look
+// identical; confirm a link by disassembling the named site before building on it.
+void report_guest_fatal_caller(uint64_t entry_rbp, uint64_t entry_rsp) {
+    // Both instruments, always, because which one works is a property of how the TITLE was compiled
+    // and is not knowable here. The chain is precise and often empty; the scan is noisy and almost
+    // never empty. Printing only the chain is what left FINAL FANTASY TACTICS' raise reported as a
+    // single frame at the module entry point -- technically true, and useless.
+    uint64_t frames[8];
+    const int chained = guest_frames_from_rbp(entry_rbp, frames, 8);
+    for (int i = 0; i < chained; ++i)
+        fprintf(stderr, "[prosper] guest caller (rbp chain) #%d: 0x%llx (%s)\n", i,
+                (unsigned long long)frames[i], describe_code_address(frames[i]).c_str());
+    if (chained <= 0)
+        fprintf(stderr, "[prosper] guest caller (rbp chain): none -- this title omits frame pointers\n");
+
+    uint64_t scanned[12];
+    const int found = guest_frames_on_stack(entry_rsp, scanned, 12);
+    for (int i = 0; i < found; ++i)
+        fprintf(stderr, "[prosper] guest caller (stack scan) #%d: 0x%llx (%s)\n", i,
+                (unsigned long long)scanned[i], describe_code_address(scanned[i]).c_str());
+    if (found <= 0)
+        fprintf(stderr, "[prosper] guest caller (stack scan): none\n");
+    else
+        fprintf(stderr, "[prosper] guest caller: stack-scan entries are call-site-validated but "
+                        "unordered by liveness -- disassemble before building on one\n");
+}
+
 // _exit(status): terminate the process. Previously an unimplemented stub RETURNED 0, so libc's
 // exit path fell through into its deliberate ud2 (SIGILL) — terminate for real, loudly.
 HLE(k_exit) {
+    PROSPER_CAPTURE_RBP(entry_rbp);
+    PROSPER_CAPTURE_RSP(entry_rsp);
     fprintf(stderr, "[prosper] guest _exit(%d) -- terminating\n", (int)a0);
+    report_guest_fatal_caller(entry_rbp, entry_rsp);
     host::guest_dmem_write_trace_report();
     fflush(nullptr);
     _Exit((int)a0);
@@ -879,8 +925,14 @@ HLE(k_exit) {
 // it from failed check()s in shipping builds). Report and terminate rather than "return 0" and
 // let the guest run on in an undefined state.
 HLE(k_debug_raise_release) {
+    // Capture rbp FIRST, before this frame does anything that could overwrite it. Everything below
+    // is ordinary reporting; the one thing that must happen at the top is preserving the link back
+    // into the guest's stack (host/fault/guest_caller.hpp).
+    PROSPER_CAPTURE_RBP(entry_rbp);
+    PROSPER_CAPTURE_RSP(entry_rsp);
     fprintf(stderr, "[prosper] guest sceKernelDebugRaiseExceptionOnReleaseMode(code=0x%llx, arg=0x%llx) -- terminating\n",
             (unsigned long long)a0, (unsigned long long)a1);
+    report_guest_fatal_caller(entry_rbp, entry_rsp);
     host::guest_dmem_write_trace_report();
     fflush(nullptr);
     _Exit(0x66);
@@ -1608,7 +1660,14 @@ HLE(k_eq_wait)   {   // (eq, SceKernelEvent* ev, int num, int* out, SceKernelUse
         if (a4) {
             uint64_t us = *(uint32_t*)P(a4);
             static const uint64_t cap = [] {   // parsed once (cf. punch_secs in hle_kernel_mem.cpp)
-                const char* e = getenv("PROSPER_WAITCAP"); return e ? (uint64_t)atoll(e) : 0; }();
+                // #3304: `atoll("-1")` is UINT64_MAX, which is NON-ZERO, so it passed the `cap &&`
+                // guard below and then `us > cap` could never be true -- an operator who armed a
+                // wait cap silently got none. `=5ms` was a 5 us cap and `=fast` was 0, i.e. off
+                // while looking set. Refuse loudly instead; 0 (no cap) stays the default.
+                return prosper::diag::env_u64_or_default(
+                    "PROSPER_WAITCAP", getenv("PROSPER_WAITCAP"), 0ull, "us",
+                    "0 = no cap: a timed wait runs for as long as the guest asked");
+            }();
             if (cap && us > cap) us = cap;
             if (evlog()) fprintf(stderr, "[ev]   WAIT.empty req=%lluus\n", (unsigned long long)us);
             s->cv.wait_for(lk, std::chrono::microseconds(us), pred);
@@ -1684,9 +1743,15 @@ HLE(k_eq_getcount){
 // individually. See the discrimination comment in prosper_eq_post_apr_token below.
 // CONFIDENCE: HIGH — ctor seeding, walk bounds, unconditional last:=cnt store, handler match/hash/
 // null-entry paths all from static disassembly; tag-echo event consumption live-verified (#180).
+uint64_t prosper_eq_apr_udata(uint64_t eq, int64_t id);   // defined below, with the registry
+
 namespace {
     constexpr int16_t EVFILT_AMPR_MODELED = -24;   // guest never reads filter; distinct on purpose
-    struct AprEqReg { uint64_t eq; int64_t id; };
+    // udata is the guest's own pointer, handed to sceKernelAddAmprEvent and handed BACK on every
+    // completion event through sceKernelGetEventUserData. It is not decoration: NINJA GAIDEN 4's
+    // Wwise I/O hook dereferences it directly (`call sceKernelGetEventUserData; mov edi,[rax]` at
+    // eboot+0x28c319c), so dropping it is a null pointer handed to the guest (#3500).
+    struct AprEqReg { uint64_t eq; int64_t id; uint64_t udata = 0; };
     // Own mutex (NOT g_eq_mx): the post path calls eq_post/eq_find, which lock g_eq_mx themselves.
     // Detached APR delivery threads can outlive main, so the mutex and every container they touch
     // are one intentionally immortal heap object. Heap placement also keeps the hot mutex out of
@@ -1705,9 +1770,9 @@ namespace {
         return (eq_identity << 6) | (ring & 0x3f);
     }
     void apr_post(uint64_t eq, uint64_t eq_identity, int64_t id,
-                  unsigned ring, uint64_t token, bool coalesce) {   // no APR lock held
+                  unsigned ring, uint64_t token, bool coalesce, uint64_t udata) {   // no APR lock held
         SceKEvent e{}; e.ident = id + (int64_t)ring; e.filter = EVFILT_AMPR_MODELED;
-        e.data = (int64_t)token; e.udata = 0;
+        e.data = (int64_t)token; e.udata = udata;
         eq_post(eq, e, coalesce, eq_identity);
     }
 }
@@ -1769,6 +1834,9 @@ void prosper_eq_post_apr_token(uint64_t eq, uint64_t eq_identity,
                 nanosleep(&ts, nullptr);
                 for (auto& p : batch) {
                     SceKEvent e{}; e.ident = 0; e.filter = EVFILT_AMPR_MODELED; e.data = (int64_t)p.token;
+                    // Both dialects hand the udata back; the guest reads it through the same
+                    // accessor regardless of which one delivered the event.
+                    e.udata = prosper_eq_apr_udata(p.eq, 0);
                     eq_post(p.eq, e, /*coalesce=*/false, p.eq_identity);
                 }
                 lk.lock();
@@ -1836,7 +1904,9 @@ void prosper_eq_post_apr_token(uint64_t eq, uint64_t eq_identity,
             std::lock_guard lk(state.mx);
             hwm = state.tag_hwm[hwm_key];
         }
-        apr_post(eq, eq_identity, id, ring, ((uint64_t)ring << 58) | hwm, counter_dialect);
+        // Resolved BEFORE the post, not inside it: apr_post runs with no APR lock held on purpose.
+        apr_post(eq, eq_identity, id, ring, ((uint64_t)ring << 58) | hwm, counter_dialect,
+                 prosper_eq_apr_udata(eq, id));
     }).detach();
 }
 // Assign the next completion token for `ring` (0-based, 6 bits) — for UNBOUND submits only, whose
@@ -1854,15 +1924,33 @@ uint64_t prosper_apr_next_token(unsigned ring) {
 // by the guest via record polling, and replaying invented counters would regress the listener's
 // ctor-seeded per-ring last-processed (see the block comment above; the pre-#208 replay was the
 // root cause of the #180 range-walk fault).
-void prosper_eq_add_apr(uint64_t eq, int64_t id) {
+void prosper_eq_add_apr(uint64_t eq, int64_t id, uint64_t udata) {
     AprTokenState& state = apr_token_state();
     std::lock_guard lk(state.mx);
     for (auto& r : state.eq_regs)
-        if (r.eq == eq && r.id == id) return;   // idempotent
-    state.eq_regs.push_back({ eq, id });
+        if (r.eq == eq && r.id == id) {
+            // Idempotent, but UPGRADING: several paths register the same (eq, id) and only
+            // sceKernelAddAmprEvent carries the guest's udata — the command-buffer binding and the
+            // measure-sizing compatibility call both pass 0. A plain early return would keep
+            // whichever arrived first, so a real pointer would be lost whenever one of those ran
+            // before AddAmprEvent. Never overwrite a real udata with 0.
+            if (udata && !r.udata) r.udata = udata;
+            return;
+        }
+    state.eq_regs.push_back({ eq, id, udata });
+}
+
+// The udata registered for this (eq, id), or 0 if none. Separate from the post path because that
+// path runs with no APR lock held and must not take one -- it calls eq_post, which locks g_eq_mx.
+uint64_t prosper_eq_apr_udata(uint64_t eq, int64_t id) {
+    AprTokenState& state = apr_token_state();
+    std::lock_guard lk(state.mx);
+    for (const auto& r : state.eq_regs)
+        if (r.eq == eq && r.id == id) return r.udata;
+    return 0;
 }
 HLE(k_add_ampr_event) {   // sceKernelAddAmprEvent(eq, id, udata)
-    if (a0) prosper_eq_add_apr(a0, (int64_t)a1);
+    if (a0) prosper_eq_add_apr(a0, (int64_t)a1, a2);
     if (evlog()) fprintf(stderr, "[ev] AddAmprEvent eq=0x%llx id=%lld udata=0x%llx\n",
         (unsigned long long)a0, (long long)a1, (unsigned long long)a2);
     return 0;

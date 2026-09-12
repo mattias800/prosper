@@ -47,6 +47,7 @@ std::recursive_mutex g_mx;       // serialises the whole load; also guards every
 Program* g_prog = nullptr;
 std::deque<RuntimeModule> g_loaded;
 std::unordered_map<std::string, uint32_t> g_nid_to_slot;   // NID -> import stub-slot index
+std::unordered_map<std::string, uint32_t> g_nid_to_data_slot;   // NID -> import-DATA slot index (#3529)
 TlsSymbolMap g_tls_symbols;      // exported TLS symbol NID -> {defining module id, in-block offset}
 unsigned g_next_base_slot = 0;
 
@@ -95,12 +96,18 @@ void runtime_module_loader_init(Program* p) {
     g_loaded.clear();
     g_next_base_slot = 0;
     g_nid_to_slot.clear();
+    g_nid_to_data_slot.clear();
     g_tls_symbols.clear();
     if (!p) return;
     // The linker deduped stub slots by NID but kept that map local to link_program. Rebuild it so a
     // runtime module's import of an already-stubbed NID reuses the SAME slot: a second slot for the
     // same NID would double-count it in the unimplemented-call census and emit a duplicate stub.
     for (size_t i = 0; i < p->slots.size(); i++) g_nid_to_slot.emplace(p->slots[i].nid, (uint32_t)i);
+    // Same reconstruction for the data aperture: a runtime module importing a variable an already
+    // linked module also imports must land on the SAME slot, or the two modules would read and
+    // write different copies of what the guest believes is one object (#3529).
+    for (size_t i = 0; i < p->data_slots.size(); i++)
+        g_nid_to_data_slot.emplace(p->data_slots[i].nid, (uint32_t)i);
     // Cross-module general-dynamic TLS: same construction as link_program's, so a runtime module's
     // DTPMOD64/DTPOFF64 pair against a pre-linked module resolves through one record.
     for (size_t i = 0; i < p->mods.size() && i < p->imgs.size(); i++) {
@@ -180,12 +187,30 @@ uint64_t runtime_load_start_module(const char* guest_path, uint64_t args, uint64
     // pop the module, drop any TLS template it appended (re-publishing the shorter list is safe —
     // nothing was relocated against that module id), and forget any NID it claimed a stub slot for.
     const size_t tls_templates_before = g_prog->tls_templates.size();
-    std::vector<std::string> claimed_nids;
+    // The data-slot table is appended to DIRECTLY (unlike the stub table, which is staged in a local
+    // vector and published in one synchronised append), so a failure between the import loop and
+    // append_import_data would otherwise leave entries in it that no mapping backs -- and the next
+    // load's `first_new != g_ndata` extension check would then refuse forever. Once
+    // append_import_data has succeeded the entries are real and are LEFT in place, exactly as the
+    // stub table's are: relocated guest code may already address them.
+    const size_t data_slots_before = g_prog->data_slots.size();
+    bool data_appended = false;
+    std::vector<std::string> claimed_nids, claimed_data_nids;
     auto abandon = [&](uint64_t err) {
         g_loaded.pop_back();
         if (g_prog->tls_templates.size() > tls_templates_before) {
             g_prog->tls_templates.resize(tls_templates_before);
             set_tls_modules(g_prog->tls_templates.data(), g_prog->tls_templates.size());
+        }
+        // The slot table and its NID map roll back TOGETHER or not at all. Erasing the NIDs while
+        // keeping the slots -- which is what happened on the two abandon() paths reached after
+        // data_appended became true -- leaves a slot nothing can find, so the next module importing
+        // the same variable allocates a SECOND one and two modules see one guest variable at two
+        // addresses. That is precisely the condition this file's own comment above forbids. Raised
+        // in review of #3541.
+        if (!data_appended && g_prog->data_slots.size() > data_slots_before) {
+            g_prog->data_slots.resize(data_slots_before);
+            for (const auto& nid : claimed_data_nids) g_nid_to_data_slot.erase(nid);
         }
         for (const auto& nid : claimed_nids) g_nid_to_slot.erase(nid);
         return err;
@@ -235,8 +260,11 @@ uint64_t runtime_load_start_module(const char* guest_path, uint64_t args, uint64
 
     // --- Imports: an export of an already-loaded module beats a stub slot, exactly as at boot. ---
     const size_t first_new_slot = g_prog->slots.size();
+    // The data-slot append boundary is `data_slots_before`, captured above with the rollback state
+    // rather than here: one value, so a rollback cannot restore to a different point than the
+    // append started from.
     std::vector<ImportSlot> new_slots;
-    size_t cross = 0, stubbed = 0;
+    size_t cross = 0, stubbed = 0, bound_data = 0;
     for (const auto& imp : rm.mod->imports) {
         auto ex = g_prog->exports.find(imp.nid);
         if (ex != g_prog->exports.end()) { img.import_addr[imp.sym_index] = ex->second; cross++; continue; }
@@ -249,6 +277,21 @@ uint64_t runtime_load_start_module(const char* guest_path, uint64_t args, uint64
             }
         }
         if (from_runtime) continue;
+        // A DATA import goes to the writable aperture, never to an executable stub (#3529) --
+        // the same rule link_program applies at boot, applied to a module loaded later.
+        if (imp.elf_type == STT_OBJECT) {
+            auto dslot = g_nid_to_data_slot.find(imp.nid);
+            if (dslot == g_nid_to_data_slot.end()) {
+                const uint32_t idx = (uint32_t)g_prog->data_slots.size();
+                g_prog->data_slots.push_back({ imp.lib_name, imp.nid });
+                dslot = g_nid_to_data_slot.emplace(imp.nid, idx).first;
+                claimed_data_nids.push_back(imp.nid);   // rolled back by abandon()
+            }
+            img.import_addr[imp.sym_index] =
+                g_prog->data_base + (uint64_t)dslot->second * g_prog->data_stride;
+            bound_data++;
+            continue;
+        }
         auto slot = g_nid_to_slot.find(imp.nid);
         if (slot == g_nid_to_slot.end()) {
             // Slot indices are assigned now and the vector is grown in ONE synchronised append
@@ -271,6 +314,14 @@ uint64_t runtime_load_start_module(const char* guest_path, uint64_t args, uint64
         fprintf(stderr, "[loadmod] '%s': %s -> ENOMEM\n", guest_path, e.c_str());
         return abandon(kEnomem);
     }
+    // Same ordering rule for the data aperture: the pages must exist before apply_relocations
+    // points guest code at them. Unlike the stub table this appends directly to g_prog->data_slots
+    // (nothing indexes it from another thread), so the vector is already grown here.
+    if (!append_import_data(g_prog->data_slots, data_slots_before, &e)) {
+        fprintf(stderr, "[loadmod] '%s': %s -> ENOMEM\n", guest_path, e.c_str());
+        return abandon(kEnomem);   // abandon() rolls the unbacked entries back
+    }
+    data_appended = true;
 
     apply_relocations(*rm.mod, img, &g_tls_symbols, nullptr);
 
@@ -312,10 +363,10 @@ uint64_t runtime_load_start_module(const char* guest_path, uint64_t args, uint64
 
     fprintf(stderr,
             "[loadmod] loaded '%s' -> %s @ 0x%llx (%zu exports, %zu imports: %zu cross-module, "
-            "%zu stubbed, %zu new slots) handle=0x%llx\n",
+            "%zu stubbed, %zu data, %zu new slots) handle=0x%llx\n",
             guest_path, rm.name.c_str(), (unsigned long long)base, rm.nids.size(),
-            rm.mod->imports.size(), cross, stubbed, g_prog->slots.size() - first_new_slot,
-            (unsigned long long)rm.handle);
+            rm.mod->imports.size(), cross, stubbed, bound_data,
+            g_prog->slots.size() - first_new_slot, (unsigned long long)rm.handle);
 
     // --- Start it. DT_INIT (module_start) first, then DT_INIT_ARRAY, matching the order
     // link_program + run_guest_inits use for a pre-linked dependent module. The init_array entries

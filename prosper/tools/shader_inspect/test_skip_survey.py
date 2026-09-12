@@ -68,8 +68,16 @@ def main() -> int:
 
     # ---- the ADMIT line, which is the whole of finding B1 ---------------------------------------
     check("the native-width admit emitter still exists",
-          '"[render] GTA V native-width fragment vote: subgroup %u -> %u "' in rr,
+          '"[render] native-width fragment vote: subgroup %u -> %u "' in rr,
           "-- an allowlisted title's wave-any shaders would become invisible with no admitted count")
+    # Every field the ADMIT regex depends on, not just the prefix. The prefix arm above stayed green
+    # while the emitter gained an `fs=` field and the regex -- anchored on `(why=...)` -- silently
+    # matched nothing, reporting admitted=0 for a whole corpus. A pin that only checks the start of a
+    # line cannot see a change at the end of it.
+    check("the admit emitter still carries why= and fs= in the order the regex reads them",
+          '"(why=0x%x fs=%016llx)' in rr,
+          "-- the ADMIT regex reads why= then fs=; reordering or dropping either silently zeroes "
+          "the admitted column")
 
     # ---- the fps emitter -------------------------------------------------------------------------
     check("the fps emitter still prints '<n> fps (<m> frames'",
@@ -91,7 +99,10 @@ def main() -> int:
     check("SKIP survives a reason set with no named bits",
           len(skip_survey.SKIP.findall(none_line)) == 1)
 
-    admit_line = "[render] GTA V native-width fragment vote: subgroup 64 -> 32 (why=0x2)"
+    # The emitter's REAL shape, fs= included. Written by hand once and left stale is how
+    # the previous version of this arm passed while the regex matched nothing.
+    admit_line = ("[render] native-width fragment vote: subgroup 64 -> 32 "
+                  "(why=0x2 fs=00000000000000a2)")
     check("ADMIT extracts the widths and reason from a real admit line",
           skip_survey.ADMIT.findall(admit_line) == [("64", "32", "0x2")])
 
@@ -107,16 +118,33 @@ def main() -> int:
     # It is a copy of a title id that lives in live_renderer.cpp; if that gains a title and this does
     # not, the survey reports a structural zero as a real one.
     live = source(REPO / "prosper" / "frontends" / "shared" / "live" / "live_renderer.cpp")
-    # Anchored on the ASSIGNMENT, not on any `title_id ==` in the file. A bare match would
-    # redden on an unrelated per-title switch, and the natural repair -- adding that title
-    # to NATIVE_VOTE_ALLOWLIST -- would make the survey report "wave-any is admitted here"
-    # for a title where it is not.
-    ids = set(re.findall(r'gta5_native_fragment_vote\s*=\s*([^;]+);', live))
-    ids = set(re.findall(r'"([A-Z]{4}\d{5})"', " ".join(ids)))
-    check("skip_survey's allowlist matches live_renderer's title gate",
+    # W5 removed the per-title gate, so this now asserts its ABSENCE. Anchored on the assignment
+    # rather than on any `title_id ==` in the file: a bare match would redden on an unrelated
+    # per-title switch, and the natural repair -- adding that title to NATIVE_VOTE_ALLOWLIST --
+    # would make the survey claim wave-any is specially handled for a title where it is not.
+    #
+    # If a title gate is ever reintroduced, this reddens and the survey's universal caveat has to be
+    # narrowed again. That is the point: the tools describe the renderer, not the other way round.
+    # Collected from the whole gate REGION rather than from one syntactic form. This arm has been
+    # anchored on a single `title_id ==`, then on the assignment expression, and each time the thing
+    # moved: to an assignment, then to a `kNativeFragmentVoteTitles` array the assignment merely
+    # references. The array version passed an "is not title-scoped" assertion while the gate was
+    # fully title-scoped, because no PPSA literal appeared in the assignment any more.
+    #
+    # So: find the ids wherever they live between the allowlist declaration and the gate, and assert
+    # the tools EQUAL the renderer. That is the property that matters -- a survey claiming a title is
+    # allowlisted when it is not hides real refusals behind a reassuring note.
+    start = live.find("kNativeFragmentVoteTitles")
+    end = live.find("native_fragment_vote_width", start if start >= 0 else 0)
+    region = live[start:end + 400] if start >= 0 else live
+    ids = set(re.findall(r'"([A-Z]{4}\d{5})"', region))
+    check("skip_survey's allowlist matches the renderer's, exactly",
           ids == set(skip_survey.NATIVE_VOTE_ALLOWLIST),
-          "-- renderer has %s, survey has %s" % (sorted(ids),
-                                                 sorted(skip_survey.NATIVE_VOTE_ALLOWLIST)))
+          "-- renderer admits %s, survey has %s" % (sorted(ids) or "no title",
+                                                    sorted(skip_survey.NATIVE_VOTE_ALLOWLIST)))
+    check("the renderer's allowlist is non-empty and was actually found",
+          bool(ids),
+          "-- found no title ids near the gate; the pin may be looking at the wrong place again")
 
     # N7: `admitted` is a shader count only because the emitter dedupes on shader identity
     # before printing. Nothing else pins that, so a refactor dropping the guard would turn
@@ -125,6 +153,76 @@ def main() -> int:
     check("the admit emitter still dedupes on shader identity",
           "native_width_logged.insert(shader_key).second" in rr,
           "-- admitted would become a DRAW count while still labelled shaders")
+
+    # --- the route actually reaches the title -------------------------------------------------
+    # `snapshots.json` stores `pad_script` relative to `prosper/`, and the emulator resolves it
+    # against ITS OWN working directory. Passing the stored string through made every routed run
+    # print one line -- "[pad] ... cannot open route file: scripts/.../x.pad" -- and then boot with
+    # NO INPUT AT ALL, sit on the title screen for the whole route, and return a plausible shader
+    # count. Three routes and the committed baseline were recorded that way before a human noticed
+    # the game was still on its title screen.
+    #
+    # These arms check the two things that failed: that the resolved path EXISTS on disk (the pad
+    # file is the survey's actual instrument, so a stale name is a dead instrument), and that a run
+    # whose log reports the failure cannot be used as evidence.
+    snapshots = REPO / "prosper" / "tools" / "snapshot" / "snapshots.json"
+    if snapshots.is_file():
+        routes = skip_survey.snapshot_routes(str(snapshots))
+        routed = [r for r in routes if r["pad_script"]]
+        check("some reviewed routes declare a pad script at all", bool(routed),
+              "%d routes, none routed -- the arms below would pass vacuously" % len(routes))
+        missing = [r["name"] for r in routed if not Path(r["pad_script"]).is_file()]
+        check("every reviewed route's pad script resolves to a file that exists",
+              not missing, "missing: %s" % ", ".join(missing))
+        absolute = [r["name"] for r in routed if not Path(r["pad_script"]).is_absolute()]
+        check("every reviewed route's pad script is made ABSOLUTE before it is handed to the app",
+              not absolute,
+              "relative, so the app resolves it against its own cwd: %s" % ", ".join(absolute))
+
+    try:
+        skip_survey.resolve_pad_script("scripts/nothing/here.pad", str(snapshots))
+        raised = False
+    except FileNotFoundError:
+        raised = True
+    check("a route file that does not exist RAISES rather than surveying a boot screen", raised)
+
+    # The runtime half. A path can exist when the corpus starts and still fail to open, so the log
+    # is checked too -- and a row that never got its route must not be usable as a baseline or as a
+    # comparison, which is exactly what `unjudgeable` decides.
+    good = {"exited_early": False, "frames": 900, "device": "some GPU", "elapsed": 150.0,
+            "returncode": 0, "pad_failed": "", "routed": True, "pad_entries": 12}
+    check("a healthy routed row is judgeable", not skip_survey.unjudgeable(good))
+    lost = dict(good, pad_failed="scripts/blasphemous2/reach-first-gameplay.pad")
+    why = skip_survey.unjudgeable(lost)
+    check("a row whose route file never loaded is NOT judgeable", bool(why), why)
+    check("...and says so in terms of the route rather than of frames",
+          "route" in why, why)
+    check("PAD_FAILED matches the emulator's own wording",
+          skip_survey.PAD_FAILED.search(
+              "[pad] PROSPER_PAD_SCRIPT: cannot open route file: scripts/x/y.pad") is not None)
+
+    # The POSITIVE requirement. Checking only for the absence of an error is what let trap 274
+    # through, because absence is also what a run produces when the emulator never looked at the
+    # variable at all -- so a routed row must SHOW that its route loaded, not merely fail to show
+    # that it did not.
+    silent = dict(good, pad_entries=-1)
+    why = skip_survey.unjudgeable(silent)
+    check("a routed row whose log never reports a loaded route is NOT judgeable", bool(why), why)
+    inert = dict(good, pad_entries=0)
+    check("a routed row whose route parsed to zero entries is NOT judgeable",
+          bool(skip_survey.unjudgeable(inert)))
+    check("an UNROUTED row is unaffected by that requirement",
+          not skip_survey.unjudgeable(dict(good, routed=False, pad_entries=-1)))
+
+    # And the line has to be the one the emulator actually prints -- trap 272's rule, since a
+    # requirement pinned to a format string nobody emits disqualifies every run forever.
+    hle_pad = (REPO / "prosper" / "src" / "hle" / "input" / "hle_pad.cpp").read_text(
+        encoding="utf-8", errors="replace")
+    check("the emulator still emits the loaded-route line the survey requires",
+          '"[pad] PROSPER_PAD_SCRIPT loaded %zu entries from %s' in hle_pad)
+    check("PAD_LOADED matches that emitter's wording",
+          skip_survey.PAD_LOADED.search(
+              "[pad] PROSPER_PAD_SCRIPT loaded 42 entries from C:/x/y.pad") is not None)
 
     print("\n%d checks failed" % len(failures) if failures else "\nall checks passed")
     return 1 if failures else 0

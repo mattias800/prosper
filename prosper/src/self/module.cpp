@@ -215,10 +215,15 @@ std::optional<Module> Module::load(const std::string& path, std::string* err) {
         // A real Sony import is an undefined (shndx 0, value 0) NID-encoded symbol.
         // The null symbol (index 0) and any non-NID undefined symbols are not imports.
         sym.is_import = (s.st_shndx == 0 && s.st_value == 0 && h1 != std::string::npos);
+        // ELF64_ST_TYPE(st_info). Carried through so the linker can tell a data import from a
+        // function import (#3529) -- nothing else in the entry does: an undefined symbol has
+        // shndx 0, value 0 and, in this corpus, size 0 whether it is a variable or a function.
+        sym.elf_type = (uint8_t)(s.st_info & 0xf);
         auto it = m.import_libs.find(sym.lib_id);
         sym.lib_name = (it != m.import_libs.end()) ? it->second : (sym.lib_id >= 0 ? "lib#" + std::to_string(sym.lib_id) : "");
         m.symbols.push_back(sym);
-        if (sym.is_import) m.imports.push_back({ sym.nid, sym.lib_name, (uint32_t)i });
+        if (sym.is_import)
+            m.imports.push_back({ sym.nid, sym.lib_name, (uint32_t)i, sym.elf_type });
     }
     // relocations: RELA + JMPREL
     auto read_relocs = [&](uint64_t va, uint64_t sz, bool plt) {
@@ -377,7 +382,7 @@ size_t apply_relocations(const Module& m, LoadedImage& img,
     };
     auto sym_addr = [&](uint32_t sym) -> uint64_t {
         auto it = img.import_addr.find(sym);
-        if (it != img.import_addr.end()) return it->second;          // import -> stub
+        if (it != img.import_addr.end()) return it->second;   // import -> stub or data slot
         if (sym < m.symbols.size()) return img.base + m.symbols[sym].value; // internal def
         return 0;
     };

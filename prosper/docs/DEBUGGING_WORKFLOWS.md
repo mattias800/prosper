@@ -80,8 +80,19 @@ python3 tools/pixel_history/pixel_history.py "$run_dir"/frame_frame*.rdc \
 ```
 
 It reports `NOTHING_DREW`, `ALL_REJECTED` (naming the test that rejected), `SHADER_WROTE_BLACK`,
-`STORE_LOST_IT`, `PIXEL_WAS_WRITTEN`, `CLEARED_AFTER_DRAW` or `OUTPUT_UNTRUSTED`, with the per-event
-detail behind it, and defaults to the brightest pixel rather than the centre. Clears are reported but
+`STORE_LOST_IT`, `PIXEL_WAS_WRITTEN`, `CLEARED_AFTER_DRAW`, `OUTPUT_UNTRUSTED`, `VALUE_UNKNOWN` or
+`TRANSFER_WROTE_PIXEL`, with the per-event detail behind it, and defaults to the brightest pixel
+rather than the centre. `TRANSFER_WROTE_PIXEL` means a copy, blit, resolve or mip generation
+**demonstrably changed** the pixel and names which — the value came from that operation's *source*,
+so the investigation belongs wherever the source was produced and not in a shader (instrument trap
+279). A compute shader writing a storage image is **not** in that set and still reports as shader
+work. A copy that appears in the history and left the pixel *unchanged* is **named in the reason
+and does not take the verdict**: RenderDoc lists every copy on a resource in the history of every
+pixel of it, with no coverage test, so presence is not evidence that the copy wrote this pixel.
+`VALUE_UNKNOWN` is a refusal, not a failure: RenderDoc marks a value it has no data for with a
+`0xdeadbeef` sentinel, that sentinel used to arrive as a colour whose `max(rgb)` is exactly `0.0`,
+and an absence of information was therefore reported as a measured black (instrument trap 278).
+Read it as "ask this question of another pixel, or open that event yourself". Clears are reported but
 are never the subject of a verdict — on a cleared target "the last passing event computed black"
 would otherwise be the clear, and blame a shader that never ran (instrument trap 269). On a driver you have not used it on before, run `--expect-control` against
 `pixel_history_control` first; see [its AGENTS.md](../tools/pixel_history/AGENTS.md) for why that is
@@ -319,7 +330,22 @@ Report per-run median/p95/p99 **frame intervals**, sample count and interval pop
 the distribution of run results rather than pooling all frames as independent trials. Keep
 guest flips, distinct rendered content and host publications separate. F8's 4 Hz rate samples
 cannot supply per-frame percentiles. `flip_pacing_report.py` is a guest-flip diagnostic and filters
-very short intervals; it does not establish distinct-image or host-present frame-time tails.
+very short intervals OUT OF ITS DISTRIBUTION STATISTICS ONLY -- its headline rate is flips
+over the wall-clock span and is unfiltered, because the retained fraction varies per run and
+a rate derived from it is not comparable between arms (#3560). It does not establish
+distinct-image or host-present frame-time tails.
+
+**A guest-flip rate now has a CEILING, and it is not the same in every harness (#3379).** Guest
+flips are paced to the cadence the title asked for -- `sceVideoOutSetFlipRate`'s divisor over the
+advertised display's vblank period, 59.94 Hz under the default `legacy` display policy -- so a
+flips/s figure from `prosper-app` is bounded above by that and says nothing about how much faster
+the renderer could have gone. `tools/screenshot` and `tools/boot_trace` opt OUT and stay
+free-running, so **their flip rates and an interactive run's are not comparable**, and a
+harness-to-harness comparison that ignores this reads a policy as a regression. To measure
+throughput rather than cadence, set `PROSPER_FLIP_PACE_FPS=0` explicitly and say that you did.
+Measured on one binary, one title (`PPSA24651`), one host, `--frames 5400` on both arms: the paced
+default holds 57.4-58.4 guest flips/s while `PROSPER_FLIP_PACE_FPS=0` gives 96-99 -- the same run
+1.65x too fast.
 Include CPU/RSS and the correctness evidence. A faster run with missing geometry is a regression.
 
 Measure profiler overhead with the same route both with and without that profiler; no universal

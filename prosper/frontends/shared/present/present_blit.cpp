@@ -7,6 +7,7 @@
 #include <mutex>
 #include <cstdio>
 #include <cstring>
+#include "gpu/diagnostics/gpu_memory_budget_vk.hpp"  // #3533: count what we hold on each heap
 
 namespace prosper::frontend {
 namespace {
@@ -77,7 +78,7 @@ void image_barrier(VkCommandBuffer cb, VkImage img, VkImageLayout from, VkImageL
 
 void destroy_slot_image(PresentBlitState& s, Slot& sl) {
     if (sl.image)  vkDestroyImage(s.dev, sl.image, nullptr);
-    if (sl.memory) vkFreeMemory(s.dev, sl.memory, nullptr);
+    if (sl.memory) prosper::gpu::free_device_memory(s.dev, sl.memory);
     sl.image = VK_NULL_HANDLE; sl.memory = VK_NULL_HANDLE; sl.w = sl.h = 0;
 }
 
@@ -104,7 +105,7 @@ bool ensure_slot_image(PresentBlitState& s, Slot& sl, uint32_t w, uint32_t h) {
     if (mt == UINT32_MAX) { destroy_slot_image(s, sl); return false; }
     VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     mai.allocationSize = req.size; mai.memoryTypeIndex = mt;
-    if (vkAllocateMemory(s.dev, &mai, nullptr, &sl.memory) != VK_SUCCESS) { destroy_slot_image(s, sl); return false; }
+    if (prosper::gpu::allocate_device_memory(s.dev, &mai, &sl.memory) != VK_SUCCESS) { destroy_slot_image(s, sl); return false; }
     if (vkBindImageMemory(s.dev, sl.image, sl.memory, 0) != VK_SUCCESS) { destroy_slot_image(s, sl); return false; }
     sl.w = w; sl.h = h;
     return true;

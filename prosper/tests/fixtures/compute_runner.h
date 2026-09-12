@@ -11,6 +11,24 @@
 
 namespace prosper::test {
 
+// FLOAT CONTROLS: this fixture deliberately does NOT publish a SignedZeroInfNanPreserve verdict to
+// the recompiler (#3479/#3561), so modules run here carry the neutral, undeclared form. The device
+// below is created on a Vulkan 1.1 instance, and VUID-VkShaderModuleCreateInfo-pCode-08742 requires
+// 1.2 or VK_KHR_shader_float_controls before the extension may be declared at all -- declaring it
+// here is what produced 2 VUIDs x475 across four binaries in CI while every test passed. Publishing
+// nothing is not an oversight to repair: it is the fail-safe state, and the property this fixture's
+// tests assert (RDNA2 numeric results) does not depend on the declaration, because every device CI
+// and this project run on preserves Inf regardless of whether it was asked to. The declaration's
+// own guard is the structural `float_controls` ctest plus spirv-val in `tools/spv_validate`.
+//
+// The hazard this creates, named so it is not discovered the hard way: if a future test process
+// creates BOTH one of these 1.1 devices and a 1.2+ device that DOES publish, the published verdict
+// is process-wide and the modules that 1.1 device compiles would carry the declaration again.
+// Measured today, no test file includes both this fixture and `render_runner.h`. If one ever does,
+// make this fixture publish `false` explicitly (publishers are ANDed, so the weaker device wins) --
+// and note the failure is loud rather than silent: the validation scan reports it immediately, at
+// x475 messages, which is exactly how it was found the first time.
+
 struct ComputeSubgroupProperties {
     uint32_t size = 0;
     VkShaderStageFlags stages = 0;

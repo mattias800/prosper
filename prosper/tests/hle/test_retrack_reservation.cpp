@@ -9,6 +9,8 @@
 #include <cstring>
 #ifdef _WIN32
 #include <windows.h>
+#else
+#include <sys/mman.h>   // the host hole this test punches to provoke a protection failure
 #endif
 
 using namespace prosper;
@@ -172,11 +174,41 @@ int main() {
     // host protection changed. Use a span the platform cannot protect as one reservation.
 #ifdef _WIN32
     const uint64_t invalid_start = base + len - page / 2; // crosses the reserved allocation boundary
+    const uint64_t invalid_len = page;
 #else
-    const uint64_t invalid_start = base + 1;              // POSIX mprotect requires page alignment
+    // #3498: this used to be `base + 1`, chosen only because POSIX mprotect(2) rejected an unaligned
+    // base -- the comment said so. That was a way of PROVOKING a host failure, not a claim that the
+    // console refuses unaligned input, and sceKernelMprotect now rounds to the containing pages the
+    // way its sceKernelMtypeprotect sibling always has.
+    //
+    // THE FAILING RANGE MUST STILL OVERLAP THE TRACKED RESERVATION. #387 F3 has two halves -- the
+    // failure must reach the guest, AND it must not retag the tracking -- and only the first is
+    // testable with a range that lies elsewhere: `retrack_prot` over a non-overlapping address takes
+    // its `retagged.empty()` branch and inserts a separate mapping, leaving `[base, base+len)`
+    // intact, so the query below passes whether or not the retag was suppressed. A first attempt at
+    // this edit did exactly that and made the retag half vacuous on POSIX; caught in review of
+    // #3530.
+    //
+    // So punch a host hole INSIDE the reservation instead. The tracker still records one mapping
+    // over `[base, base+len)`, the host cannot protect across the hole, and the failing range
+    // overlaps -- which is what makes the query at the end of this block a discriminator again. The
+    // provocation no longer depends on alignment in any way.
+    // The hole goes in the LAST of the three reserved pages, not the middle one: the arms further
+    // down protect `middle = base + page` and expect it to SUCCEED, so punching there makes a later
+    // legitimate call fail and reads as a regression in the code under test.
+    CHECK(munmap((void*)(uintptr_t)(base + 2 * page), (size_t)page) == 0,
+          "test fixture: punched a host hole inside the tracked reservation");
+    // A STRICT SUB-RANGE of the reservation, and that is the load-bearing part. The retag this arm
+    // exists to catch splits the tracked mapping at the requested bounds, and a split is only
+    // observable when the request covers LESS than the whole reservation -- retagging [base, base+len)
+    // with the same bounds it already had produces a region the query cannot distinguish from the
+    // untouched one. A first attempt used the whole span and was vacuous: the mutation passed.
+    const uint64_t invalid_start = base + 2 * page;   // the page the hole was punched in
+    const uint64_t invalid_len = page;
 #endif
-    CHECK((uint32_t)protect(invalid_start, page, 0x2, 0, 0, 0) == 0x80020016u,
-          "mprotect maps an invalid host span to SCE_KERNEL_ERROR_EINVAL");
+    const uint32_t invalid_rc = (uint32_t)protect(invalid_start, invalid_len, 0x2, 0, 0, 0);
+    CHECK(invalid_rc == 0x80020016u || invalid_rc == 0x8002000cu,
+          "mprotect reports a host protection failure to the guest as an SCE error");
     uint8_t failed_info[0x48]{};
     CHECK(query(base + len - page / 4, 0, (uint64_t)(uintptr_t)failed_info,
                 sizeof(failed_info), 0, 0) == 0 &&
@@ -184,6 +216,18 @@ int main() {
               *(uint64_t*)(failed_info + 0x08) == base + len &&
               failed_info[0x20] == 0,
           "failed mprotect leaves reservation tracking unchanged");
+
+#ifndef _WIN32
+    // Restore the page the hole was punched in. The arms below use ALL THREE reserved pages -- they
+    // protect the middle one and then a range spanning the whole reservation -- so leaving the hole
+    // makes two later LEGITIMATE calls fail, which reads as a regression in the code under test
+    // rather than as a fixture that overstayed. Punch, provoke, verify, restore: the fixture is
+    // local to the one arm it serves.
+    CHECK(mmap((void*)(uintptr_t)(base + 2 * page), (size_t)page, PROT_NONE,
+               MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) ==
+              (void*)(uintptr_t)(base + 2 * page),
+          "test fixture: restored the reserved page the hole was punched in");
+#endif
 
 #ifdef _WIN32
     // #926: MEM_COMMIT says that a host allocation exists, not that it belongs to the guest. Keep

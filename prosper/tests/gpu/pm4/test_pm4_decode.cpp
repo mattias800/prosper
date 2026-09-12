@@ -49,14 +49,15 @@ int main() {
     auto set_indirect_base = Hle::lookup("RmaJwLtc8rY"); // SetBaseIndirectArgs
     auto stall_parser = Hle::lookup("u2T2DiA5hRI");      // StallCommandBufferParser
     auto draw_indirect = Hle::lookup("t1vNu082-jM");     // DrawIndexIndirect
+    auto draw_nonindexed_indirect = Hle::lookup("1q1titRBL6o"); // DrawIndirect (#2929)
     auto dispatch_indirect = Hle::lookup("CtB+A9-VxO0"); // DispatchIndirect
     CHECK(reset && idx && setcx && p_add && p_adr && draw && drawi && evt && push && pop && instances &&
           setcx_direct && setsh_direct && setuc_direct && set_indirect_base && stall_parser &&
-          draw_indirect && dispatch_indirect,
+          draw_indirect && dispatch_indirect && draw_nonindexed_indirect,
           "AGC Dcb builders registered");
     if (!(reset && idx && setcx && p_add && p_adr && draw && drawi && evt && push && pop && instances &&
           setcx_direct && setsh_direct && setuc_direct && set_indirect_base && stall_parser &&
-          draw_indirect && dispatch_indirect)) {
+          draw_indirect && dispatch_indirect && draw_nonindexed_indirect)) {
         printf("== FAIL ==\n"); return 1;
     }
 
@@ -87,6 +88,10 @@ int main() {
     set_indirect_base(D, /*graphics*/ 0, 0x123456789ABC0000ull, 0, 0, 0);
     stall_parser(D, 0, 0, 0, 0, 0);
     draw_indirect(D, /*byte_offset*/ 0x40, /*modifier*/ 0x80000000ull, 0, 0, 0);
+    // #2929: the non-indexed sibling shares the graphics argument base selected above and
+    // carries the same (offset, modifier) operands; only the sub-op and the four-dword argument
+    // layout at the far end differ, so it must decode to its OWN kind.
+    draw_nonindexed_indirect(D, /*byte_offset*/ 0x60, /*modifier*/ 0x90000000ull, 0, 0, 0);
     set_indirect_base(D, /*compute*/ 1, 0xFEDCBA9876540000ull, 0, 0, 0);
     dispatch_indirect(D, /*byte_offset*/ 0x80, /*modifier*/ 1, 0, 0, 0);
     pop(D, 0, 0, 0, 0, 0);
@@ -97,8 +102,8 @@ int main() {
     std::vector<Pm4Command> ops;
     size_t consumed = decode_pm4(buffer, 256, ops);   // pass full buffer; decoder stops at the zero tail
     CHECK(consumed == used_dw, "decoder consumed exactly the built dwords (stops at zero pad)");
-    CHECK(ops.size() == 17, "decoded 17 packets");
-    if (ops.size() != 17) { printf("== FAIL: got %zu packets ==\n", ops.size()); return 1; }
+    CHECK(ops.size() == 18, "decoded 18 packets");
+    if (ops.size() != 18) { printf("== FAIL: got %zu packets ==\n", ops.size()); return 1; }
 
     using K = Pm4Command::Kind;
     CHECK(ops[0].kind == K::PushMarker && ops[0].marker_label &&
@@ -149,13 +154,19 @@ int main() {
     CHECK(ops[13].kind == K::DrawIndexIndirect && ops[13].indirect_offset == 0x40 &&
           ops[13].di_modifier == 0x80000000ull,
           "op13 = indexed indirect draw offset/modifier");
-    CHECK(ops[14].kind == K::SetBaseIndirectArgs && ops[14].indirect_shader_type == 1 &&
-          ops[14].indirect_base == 0xFEDCBA9876540000ull,
-          "op14 = compute indirect argument base");
-    CHECK(ops[15].kind == K::DispatchIndirect && ops[15].indirect_offset == 0x80 &&
-          ops[15].dispatch_modifier == 1,
-          "op15 = indirect dispatch offset/modifier");
-    CHECK(ops[16].kind == K::PopMarker, "op16 = PopMarker");
+    // #2929: a distinct kind, not DrawIndexIndirect with a flag. Before the fix this packet did
+    // not exist -- sceAgcDcbDrawIndirect had no handler, the builder call returned 0 having
+    // written nothing, and the stream simply had one fewer draw in it.
+    CHECK(ops[14].kind == K::DrawIndirect && ops[14].indirect_offset == 0x60 &&
+          ops[14].di_modifier == 0x90000000ull,
+          "op14 = non-indexed indirect draw offset/modifier");
+    CHECK(ops[15].kind == K::SetBaseIndirectArgs && ops[15].indirect_shader_type == 1 &&
+          ops[15].indirect_base == 0xFEDCBA9876540000ull,
+          "op15 = compute indirect argument base");
+    CHECK(ops[16].kind == K::DispatchIndirect && ops[16].indirect_offset == 0x80 &&
+          ops[16].dispatch_modifier == 1,
+          "op16 = indirect dispatch offset/modifier");
+    CHECK(ops[17].kind == K::PopMarker, "op17 = PopMarker");
 
     // Every decoded packet's len must match its header, and the payload pointer must be in-buffer.
     bool spans_ok = true;

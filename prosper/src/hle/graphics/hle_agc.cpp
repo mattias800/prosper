@@ -19,6 +19,7 @@
 #include "gpu/present/videoout_present.hpp"
 #include "gpu/execute/mb3_freelist.hpp"   // #1226: per-submit POOLSHIFT window probe
 #include "hle/graphics/render_cadence.hpp"  // #2837: is a requested render cadence actually sparse?
+#include "diagnostics/env_numeric.hpp"   // #2847: a mistyped cadence must not become 0
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -78,7 +79,7 @@ constexpr uint32_t R_DRAW_INDEX = 0x03, R_DRAW_INDEX_AUTO = 0x04, R_DRAW_RESET =
                    R_JUMP = 0x1e, R_SET_PRED = 0x1f,
                    R_SET_BASE_INDIRECT_ARGS = 0x20, R_STALL_COMMAND_BUFFER_PARSER = 0x21,
                    R_DRAW_INDEX_INDIRECT = 0x22, R_DISPATCH_INDIRECT = 0x23,
-                   R_DISPATCH_INDIRECT_ADDR = 0x24;
+                   R_DISPATCH_INDIRECT_ADDR = 0x24, R_DRAW_INDIRECT = 0x25;
 constexpr uint32_t R_NUM = 0x40;
 
 // --- Packet sizes, in DWORDS, shared by each builder and its sceAgc*GetSize (#1143, #1748, #1756) ---
@@ -99,6 +100,24 @@ constexpr uint32_t kDwDrawIndex          = 7;
 constexpr uint32_t kDwDrawIndexAuto      = 7;
 constexpr uint32_t kDwDrawIndexOffset    = 3;
 constexpr uint32_t kDwDrawIndexIndirect  = 4;
+// sceAgcDcbDrawIndirect (#2929) — the non-indexed sibling, and deliberately the SAME 4 dwords as the
+// indexed one rather than a count copied from it by assumption. Two independent arguments, both for
+// the safe direction:
+//   * prosper's payload is its own encoding and carries exactly what the API call carries: the
+//     32-bit byte offset into the graphics argument base plus the 64-bit ShaderDrawModifier. There
+//     is no fourth operand for the non-indexed form to drop, so it cannot be smaller than this.
+//   * The hardware packet this stands for, PM4 `DRAW_INDIRECT`, spends header + DATA_OFFSET +
+//     BASE_VTX_LOC + START_INST_LOC + DRAW_INITIATOR = 5 dwords — the same field list as
+//     `DRAW_INDEX_INDIRECT`. So 4 is at or below the real library's reservation on the published
+//     layout, which is the only direction that matters: emitting FEWER than the real AGC function
+//     wastes reserved space, emitting MORE overruns a reservation the guest made in good faith
+//     (#1748). See docs/AGC_PACKET_SIZES.md.
+// prosper also answers sceAgcDcbDrawIndirectGetSize (cxPZ4Wgvdj8) from this same constant, so a
+// guest that ASKS reserves exactly what is written here and is self-consistent regardless.
+// CONFIDENCE: MED — no local dump was observed inlining the real size, so the equality with the real
+// AGC packet is inferred from the published PM4 layout rather than measured from a guest reservation.
+// CONFIDENCE: HIGH that 4 is not an overrun, which is the property #1748 makes load-bearing.
+constexpr uint32_t kDwDrawIndirect       = 4;
 constexpr uint32_t kDwDispatch           = 6;
 constexpr uint32_t kDwDispatchIndirect   = 4;
 // The ACB form is one dword larger because it carries a whole 64-bit address where the DCB form
@@ -336,6 +355,7 @@ const char* dcb_subop_name(uint32_t r) {
         case R_SET_BASE_INDIRECT_ARGS:     return "SetBaseIndirectArgs";
         case R_STALL_COMMAND_BUFFER_PARSER: return "StallCommandBufferParser";
         case R_DRAW_INDEX_INDIRECT:        return "DrawIndexIndirect";
+        case R_DRAW_INDIRECT:              return "DrawIndirect";
         case R_DISPATCH_INDIRECT:          return "DispatchIndirect";
         case R_DISPATCH_INDIRECT_ADDR:     return "AcbDispatchIndirect";
         // A raw allocate_dw with no sub-op (CbNop's 1-dword form, the type-2 filler). Without its own
@@ -1936,10 +1956,15 @@ static bool execute_submit_work(gpu::GpuState& st, uint64_t submit_no, unsigned&
         ? UINT64_MAX : flip_delta * period_ns;
     // A bounded sparse phase accelerates long intros, then cadence=1 rebuilds any temporal render
     // targets before a visual checkpoint. Screenshot exposes these as --render-every/--render-every-for-seconds.
+    // The cadence is a DIVISOR, so 0 is not "off" here -- it is a SIGFPE on the first draw submit.
+    // `atol` into a `long` could reach it two ways: `=0` directly, and any multiple of 2^32 (which
+    // is > 0 as a long and 0 once narrowed to unsigned), so the `v > 0` guard checked the wrong
+    // type. Parse strictly, cap below the narrowing, and keep the 0 -> 1 floor (#2847, #3267).
     static const unsigned render_every = [] {
-        const char* e = getenv("PROSPER_RENDER_EVERY");
-        long v = e ? atol(e) : 1;
-        return v > 0 ? (unsigned)v : 1u;
+        const uint64_t v = prosper::diag::env_u64_or_default_capped(
+            "PROSPER_RENDER_EVERY", getenv("PROSPER_RENDER_EVERY"), 1ull, UINT32_MAX,
+            "draw submits");
+        return v ? (unsigned)v : 1u;
     }();
     static const uint64_t render_every_for_ms = [] {
         const char* e = getenv("PROSPER_RENDER_EVERY_FOR_MS");
@@ -2000,9 +2025,11 @@ static bool execute_submit_work(gpu::GpuState& st, uint64_t submit_no, unsigned&
     // graphics/compute operation still executes and persistent targets advance on every submit.
     // Publish the first eligible frame, then one in every N so a consumer gets an image promptly.
     static const unsigned present_every = [] {
-        const char* e = getenv("PROSPER_PRESENT_EVERY");
-        long v = e ? atol(e) : 1;
-        return v > 0 ? (unsigned)v : 1u;
+        // Same divisor, same two routes to 0, same floor (#2847).
+        const uint64_t v = prosper::diag::env_u64_or_default_capped(
+            "PROSPER_PRESENT_EVERY", getenv("PROSPER_PRESENT_EVERY"), 1ull, UINT32_MAX,
+            "publication candidates");
+        return v ? (unsigned)v : 1u;
     }();
     static uint64_t publication_candidates = 0;
     const bool publish = (publication_candidates++ % present_every) == 0;
@@ -2689,6 +2716,7 @@ HLE(agc_driver_submit_dcb) {  // (const Packet* packet)
                 case K::SetBaseIndirectArgs: return "SetBaseIndirectArgs";
                 case K::StallCommandBufferParser: return "StallCommandBufferParser";
                 case K::DrawIndexIndirect: return "DrawIndexIndirect";
+                case K::DrawIndirect:     return "DrawIndirect";
                 case K::DispatchIndirect: return "DispatchIndirect";
                 case K::DmaData:         return "DmaData";
                 case K::Unknown:         return "Unknown";
@@ -3045,6 +3073,47 @@ HLE(agc_driver_register_resource) {
     return 0;
 }
 
+// sceAgcDriverInitResourceRegistration(void* userMemory, size_t userMemoryBytes,
+//                                      uint32_t ownerCapacity, ...)
+// The one member of the registration family above that was never registered, and the one
+// QueryResourceRegistrationUserMemoryRequirements names as the consumer of the block it sizes.
+// Darksiders II (PPSA23806) calls it during startup; unregistered, it fell to the dispatcher's 0.
+//
+// The argument layout is LIVE-CAPTURED (PPSA23806, 2026-09-09) and cross-checked against the Query
+// call that sized the block in the SAME run, which is what pins it rather than a guess:
+//     Query(resources=100000, owners=96) -> required=0x61b500
+//     Init (a0=0x2080000000, a1=0x61b500, a2=0x60, a3=0xffffffffffffffff, ...)
+// a1 is exactly Query's answer, so a1 is the block SIZE in bytes; a2 is exactly Query's owner
+// count. The resource capacity is not passed -- it is implied by the size, and re-deriving it
+// returns the request exactly: (0x61b500 - 0x100 - 96*0x20) / 0x40 = 100000. (An earlier version of
+// this comment said 100008 and invented an intermediate 0x61b4c0; 0x100 + 100000*0x40 + 96*0x20 is
+// 0x61b500 already, and 0x40-aligned, so no rounding occurs. Corrected in review of #3508.)
+//
+// HOW MUCH THAT CROSS-CHECK IS WORTH, stated honestly because the first draft overstated it: the
+// `required` value came from prosper's OWN Query handler, so the guest passing it back confirms it
+// echoes what we told it -- not that a1 is a size according to Sony. What it does establish is that
+// a1 carries the byte count prosper handed out and a2 the owner count it was asked with, which is
+// what this handler needs in order to validate rather than to lay anything out. The independent
+// part of the evidence is the register capture itself, not the arithmetic.
+// a3 is an all-ones sentinel, not a count. a4 DIFFERED between two runs of the same route
+// (...68e3 vs ...69a3), so it is caller-indeterminate scratch and is deliberately not read -- the
+// same trap sceKernelMapFlexibleMemory's a4 carries.
+//
+// prosper keeps the registry on the HOST: the Query comment above states the guest block is never
+// consumed, and RegisterOwner/RegisterResource hand out host-side counter handles. So this call
+// validates its inputs and succeeds; it lays nothing out in guest memory, because there is no
+// guest-visible layout to honour.
+// CONFIDENCE: HIGH on a0/a1/a2 (captured, and cross-checked against Query in the same run).
+// CONFIDENCE: LOW on a3 and on the error code, which is inherited from the siblings above.
+HLE(agc_driver_init_resource_registration) {
+    if (!a0) return (uint64_t)(int64_t)(int32_t)0x80D19005u;
+    // A block too small to hold even the header the sizing call accounts for cannot be the block
+    // Query described. Nothing stricter is enforced: prosper does not lay the block out, so a
+    // tighter bound would reject valid callers on behalf of a layout it does not implement.
+    if (a1 < 0x100) return (uint64_t)(int64_t)(int32_t)0x80D19005u;
+    return 0;
+}
+
 // sceAgcCbDispatch (NID k3GhuSNmBLU) — compute dispatch.
 // The authoritative PS5 3.20 export name is sceAgcCbDispatch. Arguments a1-a3 are dispatch
 // dimensions and a4 is ShaderDispatchModifier. Modifier.USE_THREAD_DIMENSIONS (bit 5) defines the
@@ -3084,6 +3153,30 @@ HLE(agc_dcb_stall_command_buffer_parser) {
 }
 HLE(agc_dcb_draw_index_indirect) {
     uint32_t* cmd; if (!begin_packet(a0, kDwDrawIndexIndirect, IT_NOP, R_DRAW_INDEX_INDIRECT, &cmd)) return 0;
+    cmd[1] = static_cast<uint32_t>(a1);
+    cmd[2] = static_cast<uint32_t>(a2);
+    cmd[3] = static_cast<uint32_t>(a2 >> 32u);
+    return reinterpret_cast<uint64_t>(cmd);
+}
+// sceAgcDcbDrawIndirect (NID 1q1titRBL6o) — the NON-indexed indirect draw, and the sibling that had
+// no handler at all until #2929. The dispatcher's default answered 0, which the AGC builders read as
+// "no packet was appended" and which nothing downstream reports: the draw left the command stream
+// with no reject line, no `[compute] skip`, and only a single one-shot `[prosper] unimplemented:`
+// line naming the NID. 49 of the 54 corpus dumps carry the import; Little Nightmares II (PPSA02154)
+// and Sifu (PPSA03001) are confirmed live callers.
+//
+// Same ABI as the indexed sibling — (dcb, byteOffset, shaderDrawModifier), the offset being relative
+// to the graphics argument base a preceding sceAgcDcbSetBaseIndirectArgs(dcb, 0, addr) selected — so
+// the payload is identical. What differs is at the far end of the pointer: the argument buffer holds
+// the four-dword non-indexed form (vertexCount, instanceCount, startVertex, startInstance), not the
+// five-dword indexed one, and no index buffer participates. That is why this gets its own sub-op
+// instead of a flag on R_DRAW_INDEX_INDIRECT: reusing the indexed decode would read a fifth dword
+// the guest never wrote and then reject the draw for having no index base.
+// CONFIDENCE: HIGH on the signature (identical operand list to the indexed sibling, whose ABI Astro
+// Bot's live callsites pin) and on the argument-buffer layout (the published non-indexed indirect
+// argument structure, identical across GCN/RDNA and every graphics API that exposes it).
+HLE(agc_dcb_draw_indirect) {
+    uint32_t* cmd; if (!begin_packet(a0, kDwDrawIndirect, IT_NOP, R_DRAW_INDIRECT, &cmd)) return 0;
     cmd[1] = static_cast<uint32_t>(a1);
     cmd[2] = static_cast<uint32_t>(a2);
     cmd[3] = static_cast<uint32_t>(a2 >> 32u);
@@ -3160,6 +3253,7 @@ HLE(agc_draw_index_get_size)          { (void)a0; return kDwDrawIndex * 4u; }
 HLE(agc_draw_index_auto_get_size)     { (void)a0; return kDwDrawIndexAuto * 4u; }
 HLE(agc_draw_index_offset_get_size)   { (void)a0; return kDwDrawIndexOffset * 4u; }
 HLE(agc_draw_index_indirect_get_size) { (void)a0; return kDwDrawIndexIndirect * 4u; }
+HLE(agc_draw_indirect_get_size)       { (void)a0; return kDwDrawIndirect * 4u; }
 HLE(agc_dispatch_get_size)            { (void)a0; return kDwDispatch * 4u; }
 
 // sceAgcQueueEndOfPipeActionPatchData (MlEw1feXcjg) — the DATA half of the ReleaseMem patch pair.
@@ -3384,6 +3478,7 @@ void register_agc_hle() {
     RN("WrdP9Zxx3lQ", agc_draw_index_auto_get_size);     // sceAgcDcbDrawIndexAutoGetSize
     RN("qMlfB1ZhMDc", agc_draw_index_offset_get_size);   // sceAgcDcbDrawIndexOffsetGetSize
     RN("mStuvI0zOtc", agc_draw_index_indirect_get_size); // sceAgcDcbDrawIndexIndirectGetSize
+    RN("cxPZ4Wgvdj8", agc_draw_indirect_get_size);       // sceAgcDcbDrawIndirectGetSize (#2929)
     RN("Abendgtz+3o", agc_dispatch_get_size);            // sceAgcCbDispatchGetSize
     RN("MlEw1feXcjg", agc_patch_release_mem_data);      // ReleaseMem packet: set the data payload
     RN("Ikfdt-rIqCE", agc_jump_patch_target);            // Jump packet: fill in target + dword count (#2711 Q5)
@@ -3414,6 +3509,7 @@ void register_agc_hle() {
     RN("uJziRsODk1c", agc_driver_get_resource_registration_max_name_length);
     RN("X-Nm5KLREeg", agc_driver_register_owner);
     RN("W5z4eZrjEas", agc_driver_register_resource);
+    RN("F0Y42t-3e18", agc_driver_init_resource_registration);
     RN("V++UgBtQhn0", agc_get_data_packet_payload);          // data packet -> register-bank payload
     RN("n2fD4A+pb+g", agc_cb_set_sh_register_range_direct);  // SET_SH_REG range packet
     RN("UZbQjYAwwXM", agc_cb_set_sh_registers_direct);       // non-contiguous SET_SH_REG packets
@@ -3496,6 +3592,7 @@ void register_agc_hle() {
     RN("RmaJwLtc8rY", agc_dcb_set_base_indirect_args);       // graphics/compute indirect base
     RN("u2T2DiA5hRI", agc_dcb_stall_command_buffer_parser); // parser visibility barrier
     RN("t1vNu082-jM", agc_dcb_draw_index_indirect);         // indexed indirect draw
+    RN("1q1titRBL6o", agc_dcb_draw_indirect);               // sceAgcDcbDrawIndirect (#2929)
     RN("CtB+A9-VxO0", agc_dcb_dispatch_indirect);           // sceAgcDcbDispatchIndirect (offset)
     RN("j3EtxFkSIhQ", agc_acb_dispatch_indirect);           // sceAgcAcbDispatchIndirect (address)
     RN("WmAc2MEj6Io", agc_dcb_dma_data);        // sceAgcDcbDmaData — append DMA_DATA packet (#117/#312)

@@ -176,6 +176,15 @@ size_t decode_pm4(const uint32_t* buf, size_t dwords, std::vector<Pm4Command>& o
                     if (npl >= 1) c.indirect_offset = pl[0];
                     if (npl >= 3) c.di_modifier = lo_hi(pl + 1);
                     break;
+                case R_DRAW_INDIRECT:
+                    // sceAgcDcbDrawIndirect (#2929). Same payload shape as the indexed sibling —
+                    // [0] = byte offset into the graphics argument base, [1..2] = the 64-bit
+                    // ShaderDrawModifier — but a distinct kind, because the arguments it points at
+                    // are the four-dword non-indexed form and no index buffer is bound.
+                    c.kind = K::DrawIndirect;
+                    if (npl >= 1) c.indirect_offset = pl[0];
+                    if (npl >= 3) c.di_modifier = lo_hi(pl + 1);
+                    break;
                 case R_DISPATCH_INDIRECT:
                     c.kind = K::DispatchIndirect;
                     if (npl >= 1) c.indirect_offset = pl[0];

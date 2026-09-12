@@ -15,6 +15,8 @@ Run directly, or via ctest as worktree_reclaim_tool.
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import subprocess
@@ -530,7 +532,7 @@ def test_removal_rechecks_state_rather_than_trusting_the_census() -> None:
         try:
             time.sleep(0.4)
             removed = W.recheck_and_remove(str(repo), trees["racy"], "origin/main", 12.0,
-                                           False, False, False, 0, False)
+                                           False, False, False, 0, False, say=print)
             check("recheck refuses", removed, False)
             check("tree still on disk", wt.is_dir(), True)
         finally:
@@ -642,6 +644,136 @@ def test_fd_and_map_references_are_holders() -> None:
         check("removable once the mapping is gone", trees["fdheld"].state, "REMOVABLE")
 
 
+def _parses(text: str) -> bool:
+    try:
+        json.loads(text)
+        return True
+    except ValueError:
+        return False
+
+
+def test_json_stdout_carries_only_the_census() -> None:
+    """`--json` stdout must be ONE parseable document, removals included (#3397).
+
+    The defect this pins was not a failed removal: `--json --remove --yes --only <tree>` removed
+    the tree and exited 0, then appended a `  REMOVED ...` prose line after the JSON on stdout,
+    so the caller's `jq` failed on a run that had done exactly what was asked. A consumer cannot
+    tell that from a broken tool, and the natural reactions -- re-run it, or stop trusting the
+    guards -- are both worse than the bug.
+
+    Removal is MOCKED here, and not merely for speed. This suite runs on machines where other
+    lanes hold live worktrees, and removing a tree a shell sits in wedges that shell
+    irrecoverably. Intercepting the single `git worktree remove` argv exercises the success AND
+    the failure branch with nothing deleted -- and the failure branch has no other route at all,
+    since provoking a real `git worktree remove` failure means first building a tree that every
+    guard above it already refuses.
+
+    Every arm asserts WHICH STREAM a line landed on, never merely that the text exists. Sending
+    the census to stderr too would satisfy "no prose on stdout" while destroying the tool, and
+    silencing the status lines would satisfy it while leaving an interactive removal with no
+    record of what it deleted -- so the complete census and the human-mode control are both
+    pinned below.
+    """
+    print("\n[--json stdout is exactly one document]")
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        repo = build_repo(root)
+        safe = add_wt(repo, "safe", "feat/safe")
+        age(safe, admin_of(repo, "safe"))
+
+        real_run = W.run
+        removals: list[list[str]] = []
+
+        def make_run(rc: int, err: str):
+            def fake_run(cmd, cwd=None, timeout=W.GIT_TIMEOUT):
+                if "worktree" in cmd and "remove" in cmd:
+                    removals.append(list(cmd))
+                    return rc, "", err
+                return real_run(cmd, cwd=cwd, timeout=timeout)
+            return fake_run
+
+        def run_main(argv: list[str], rc: int = 0, err: str = "") -> tuple[str, str, int]:
+            out, errs = io.StringIO(), io.StringIO()
+            W.run = make_run(rc, err)
+            try:
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(errs):
+                    code = W.main(argv)
+            finally:
+                W.run = real_run
+            return out.getvalue(), errs.getvalue(), code
+
+        def call_recheck(tree) -> tuple[bool, str, str]:
+            out, errs = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(errs):
+                removed = W.recheck_and_remove(
+                    str(repo), tree, "origin/main", 12.0, False, False, False, 0, False,
+                    say=lambda *a: print(*a, file=sys.stderr))
+            return removed, out.getvalue(), errs.getvalue()
+
+        base = ["--repo", str(repo), "--no-github", "--no-fds", "--no-maps", "--json"]
+
+        # --- the reported case: an ACTUAL removal, in --json mode -------------------------
+        out, errs, code = run_main(base + ["--remove", "--yes"])
+        check("removal run exits 0", code, 0)
+        check("removal really was attempted", len(removals), 1, str(removals))
+        check("but nothing was deleted (mocked)", safe.is_dir(), True)
+        check("stdout parses as one JSON document", _parses(out), True,
+              f"tail={out.strip().splitlines()[-1][:120] if out.strip() else out!r}")
+        if _parses(out):
+            doc = json.loads(out)
+            check("stdout census still lists every tree",
+                  sorted(Path(w["path"]).name for w in doc["worktrees"]),
+                  sorted([repo.name, "safe"]))
+            check("stdout census still marks the candidate removable",
+                  [w["removable"] for w in doc["worktrees"] if w["path"].endswith("safe")], [True])
+        check("REMOVED went to stderr", "REMOVED" in errs, True, errs[-200:])
+        check("REMOVED did NOT go to stdout", "REMOVED" in out, False)
+        check("the run summary went to stderr", "removed 1 of 1" in errs, True, errs[-200:])
+
+        # --- the failure branch: git refusing must not pollute stdout either --------------
+        removals.clear()
+        out, errs, code = run_main(base + ["--remove", "--yes"], rc=1,
+                                   err="fatal: validation failed, cannot remove working tree")
+        check("failed removal still exits 0", code, 0)
+        check("failed-removal stdout parses", _parses(out), True, out.strip()[-120:])
+        check("FAILED went to stderr", "FAILED" in errs, True, errs[-200:])
+        check("FAILED did NOT go to stdout", "FAILED" in out, False)
+        check("summary reports nothing removed", "removed 0 of 1" in errs, True, errs[-200:])
+
+        # --- the refusal branch, via a guard that fires only at RE-CHECK time -------------
+        # The census is taken before the tree is dirtied, so this candidate is refused inside
+        # the removal loop rather than by the census -- the one path whose REFUSE line the
+        # census can never emit on its behalf.
+        census, _ = survey(repo)
+        check("census says removable before the edit", census["safe"].state, "REMOVABLE")
+        (safe / "file.txt").write_text("an agent edited this after the census\n")
+        try:
+            removed, out, errs = call_recheck(census["safe"])
+            check("recheck refused the dirtied tree", removed, False)
+            check("REFUSE went to stderr", "REFUSE" in errs, True, errs[-200:])
+            check("recheck wrote nothing to stdout", out, "")
+        finally:
+            (safe / "file.txt").write_text("base\n")
+
+        # --- and the SKIP branch, for a tree that vanished between census and removal -----
+        gone = W.Worktree(path=str(root / "vanished"), real=str(root / "vanished"))
+        removed, out, errs = call_recheck(gone)
+        check("unregistered tree is skipped", removed, False)
+        check("SKIP went to stderr", "SKIP" in errs, True, errs[-200:])
+        check("SKIP wrote nothing to stdout", out, "")
+
+        # --- control: WITHOUT --json the same lines must still reach stdout ---------------
+        # Re-age first: restoring file.txt above set its mtime, which legitimately trips the
+        # `recent` guard and would otherwise leave this control asserting on a run with no
+        # candidates -- i.e. passing vacuously in the one direction it exists to rule out.
+        age(safe, admin_of(repo, "safe"))
+        removals.clear()
+        out, errs, code = run_main(["--repo", str(repo), "--no-github", "--no-fds", "--no-maps",
+                                    "--remove", "--yes"])
+        check("human mode still attempted the removal", len(removals), 1, str(removals))
+        check("human mode prints REMOVED on stdout", "REMOVED" in out, True, out[-200:])
+
+
 def main() -> int:
     for fn in (
         test_positive_and_mutations,
@@ -657,6 +789,7 @@ def main() -> int:
         test_removal_rechecks_state_rather_than_trusting_the_census,
         test_holder_matching_survives_path_aliasing,
         test_fd_and_map_references_are_holders,
+        test_json_stdout_carries_only_the_census,
     ):
         fn()
     print()

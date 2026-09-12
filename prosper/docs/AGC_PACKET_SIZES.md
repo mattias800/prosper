@@ -125,6 +125,7 @@ alone** — that is how a working title gets broken to satisfy a table. Only a g
 | `DcbDrawIndexAuto` | 7 | `DRAW_INDEX_AUTO` | 3 | LOW | same modifier; not a bare PM4 draw |
 | `DcbDrawIndexOffset` | 3 | `DRAW_INDEX_OFFSET_2` | 5 | LOW | prosper emits **fewer** — safe direction |
 | `DcbDrawIndexIndirect` | 4 | `DRAW_INDEX_INDIRECT` | 6 | LOW | fewer — safe direction |
+| `DcbDrawIndirect` | 4 | `DRAW_INDIRECT` | 5 | MED | **new (#2929)**, and the count is derived rather than copied from the indexed row. prosper's payload is the API's own operand list — 32-bit byte offset + 64-bit `ShaderDrawModifier` — so it cannot be smaller; the hardware packet spends header + `DATA_OFFSET` + `BASE_VTX_LOC` + `START_INST_LOC` + `DRAW_INITIATOR`, the same field list as the indexed form. No dump was observed inlining the real size, so the equality is inferred, not measured; only the **upper** bound is load-bearing and 4 ≤ 5 settles it. prosper answers `sceAgcDcbDrawIndirectGetSize` (`cxPZ4Wgvdj8`) from the same constant |
 | `CbDispatch` | 6 | `DISPATCH_DIRECT` | 5 | LOW | no title evidence |
 | `DcbDispatchIndirect` | 4 | `DISPATCH_INDIRECT` | 3–4 | LOW | no title evidence |
 | `AcbDispatchIndirect` | **5** | `DISPATCH_INDIRECT` (MEC, address form) | 4 | MED | **one dword LARGER than the Dcb form, deliberately** (#3218). The ACB carries a whole 64-bit argument address, not an offset: libSceAgc 3.20 has 36 `sceAgcAcb*` exports and no SetBase among them, so nothing on that ring defines a base. Astro Bot's async-compute stream is the live half — its packets carried exactly the low 32 bits of the argument allocations its Dcb announces at full width in the same run. prosper answers `sceAgcAcbDispatchIndirectGetSize` too, so the guest reserves 5 |
@@ -397,4 +398,8 @@ happened to ask, and each time fixed for that title's NIDs alone.
   "final buffer" submit variant (#232), derived from live disassembly and load-bearing. `CbBranch`
   also has a `GetSize`, which implies it is a *builder*. Recorded, not changed — a title calling it
   as a branch would currently reach the submit path instead.
+* `DcbDrawIndirect`'s 4 dwords are an inference from the published `DRAW_INDIRECT` field list,
+  not a measurement of a guest reservation (#2929). The direction that matters is proven — 4 is at or
+  below the reference, so it cannot overrun — but a `PROSPER_DCBWIN` window over a live caller
+  (Little Nightmares II `PPSA02154`, Sifu `PPSA03001`) would settle the exact value cheaply.
 * The three excluded size-carrying `GetSize` functions.

@@ -12,6 +12,7 @@ each one does a transformation whose correctness can be *checked*, not merely re
 | `split_file.py` | splits one translation unit into several along a region partition |
 | `classify_tests.py` | proposes a folder for each test from its own includes |
 | `check_include_paths.py` | finds targets that reach a project include they cannot resolve |
+| `survey_sizes.py` | ranks every large file by WHICH of these tools can act on it |
 
 Run every tool's `--selftest` first; `split_file.py` and `promote_internal.py` run theirs
 automatically before doing anything.
@@ -82,7 +83,7 @@ caveats found by trying it:
   functions.** From `clang-tools-extra/clangd/refactor/tweaks/ExtractFunction.cpp`, the tweak
   returns `nullptr` when a `LambdaExpr` is found — the comment is literally *"Don't extract from
   lambdas"*. `register_live_renderer` spans 8,221 lines of which **98.5%** is inside lambdas (8,101 of 8,221, from the AST — 89% is the
-  file-share figure in the table above, a different number) passed to registration calls, so every candidate worth extracting is in refused territory.
+  file-share figure in the table above, a different number) passed to registration calls, so every candidate worth extracting is in refused territory. (Those counts are from an earlier commit and the file has grown since; `survey_sizes.py` measures the same function at 10,244 lines and 98% lambda on 2026-09-10. The conclusion is unchanged, and the two figures are kept distinct rather than reconciled because they were taken at different heads.)
   `extract_function.py --probe` reports 0 of 10 accepted at its default bounds, and that is correct
   behaviour, not a bug. **That figure alone does not establish it**: a hand-built lambda-free
   25-line function also probes 0 of 1, while the same clangd session returns
@@ -113,6 +114,241 @@ caveats found by trying it:
 
 It stays incremental work regardless: a few extractions at a time, verified, by whoever is already
 changing that code.
+
+## Which files are in which state -- measured, 2026-09-10
+
+The table above was written from a handful of files looked at by hand, and it left the impression
+that the giant functions are mostly beyond tooling. **They are not.** `survey_sizes.py` measures the
+lambda share of every dominant function in the tree, which is the datum that decides it, and across
+28 files at or above 2,500 lines the split is:
+
+| verdict | files | meaning |
+| --- | --- | --- |
+| `EXTRACT` | 13 | one dominant region, but lambda-light -- clangd's ExtractFunction can act |
+| `SPLIT` | 9 | no dominant region -- `split_file.py` applies today |
+| `UNPARSED` | 4 | a large span the AST never saw -- see below; no AST tool can act until it is split |
+| `HAND` | **1** | dominant AND mostly lambda -- clangd refuses, no tool can help |
+| `PARSE-FAIL` | 1 | not scored: `prosper-app/main.cpp` needs `-DPROSPER_APP=ON` to have a command |
+
+Exactly one file is in the untouchable state: `frontends/shared/live/live_renderer.cpp`, whose
+`register_live_renderer` is 10,244 lines at **98% lambda**. Everything else has a route.
+
+The measurement moved three specific beliefs:
+
+* **`rdna2_emit_alu.cpp`'s 8,186-line `emit_alu` is only 11% lambda**, so it is `EXTRACT`, not hand
+  work. So are the giant test `main`s -- `test_rdna2_to_spirv.cpp` at **3%**,
+  `test_dynfetch_fold.cpp` at 6%, `test_recompile_coverage.cpp` at 2%. The per-block assertion-delta
+  invariant recorded at the end of this file is exactly the tool for those.
+* **The largest source file is plain `SPLIT` work** -- `gpu_executor.cpp`, 12,058 lines, biggest
+  region 23%.
+* **A file of many small functions is the EASIEST split, and the first version of this tool called it
+  `OK`.** It required two regions of >=200 lines before offering `SPLIT`, which ranked
+  `hle_kernel_mem.cpp` as nothing-to-do. Region COUNT is what a seam needs; region SIZE is not.
+  Fixed, and pinned by a selftest case carrying that file's real shape.
+
+### Three ways this survey measured the wrong thing, and all of them failed silently
+
+None of them produced an error or an odd-looking row. Each produced a confident verdict about a file
+other than the one asked about, which is why they are recorded here rather than in a commit message.
+All three are now pinned by fixtures under `testdata/`, and each fixture is built so the defective
+measurement yields a **different verdict**, not merely a different number -- verified by re-running
+each pre-fix version against all of them, where every mutation reddens its own fixture and leaves
+the others green (`dominant_no_lambda` -> `HAND` at a 0.729 share for a function with no lambda;
+`midfile_inactive_arm` -> `EXTRACT` with 0 unparsed, naming `posix_only_1` -- the first declaration
+after the skipped arm, whose region had absorbed it; `namespace_without_children` -> `NO-CURSOR`).
+The same absorption in the tree names an `#include` rather than a function (`guest_write_watch.cpp`'s
+`sched.h`); which declaration a swallowed arm ends up attributed to is simply whichever cursor
+follows it.
+
+**The lambda share was measured over the enclosing namespace.** Nearly every file here is one
+`namespace prosper { ... }`, so a file's only *top-level* cursor is the namespace -- and a namespace
+answers `is_definition()` with True. Walking top-level cursors to find the dominant region's cursor
+therefore always found the namespace, and unioned every lambda in the whole file into the dominant
+function's share. Measured across the tree: **6 of the 14 files that have a lambda share at all carried an inflated
+one**, worst `rdna2_emit_cfg.cpp` at 0.428 against a true **0.258**. Fourteen is the honest
+denominator, and it is not the number of scored files: the share is computed only for a file a single
+region dominates, so the 9 `SPLIT` files could never have been inflated, and `live_renderer.cpp` --
+which was -- is neither `SPLIT` nor `EXTRACT`. So the error rate among files where the question is
+asked is 43%, not the 27% a count against all scored files suggests. **No verdict actually changed** -- in a
+dominated file the namespace is nearly the dominant function, so the error stayed under the 0.50
+threshold everywhere. That is luck, not design: 0.428 is one small edit from flipping a file to
+"no tool can act on this". The fix descends to the region's own cursor (`region_cursor`).
+
+**`region_cursor` did not mirror `regions_of`'s descent rule.** `emit()` descends into a namespace
+only when it HAS in-target children (`map_symbols.py:174`); the first version of `region_cursor`
+descended on `depth < max_depth` alone. A namespace with no in-target children is emitted as a plain
+`body` region by the kids-empty fallthrough, so it can BE a file's dominant region -- and the lookup
+walked straight past it and reported `NO-CURSOR`, refusing to score a file whose answer was not in
+doubt. Reachable with nothing exotic: a namespace whose body is all comments
+(`testdata/namespace_without_children.cpp`, whose `commentary` region is 93 of 110 lines, 84.5%). No file in the tree currently hits
+it, so this cost nothing -- it was found by constructing the case rather than by observing one, and
+it is recorded because `NO-CURSOR` firing on a false alarm would have read as a tool limitation
+rather than a tool bug.
+
+**Unparsed lines were inferred from region kinds, which cannot see a mid-file `#if`.** `map_symbols`
+tiles a file by cursor, so an inactive arm is never a region of its own -- it is folded into whichever
+region follows it and wears that region's kind. Keying on `TEXT`/`TRAILER` therefore saw an arm only
+when it ran to the END of the file. `src/host/memory/guest_write_watch.cpp` is the tree's own
+counter-instance: a 481-line `#ifdef _WIN32` arm at lines 71-551, 19% of the file, reported as **0**
+unparsed lines with a dominant "symbol" of `sched.h` -- the include directive whose region had
+absorbed the arm.
+
+The fix asks the preprocessor instead, through `clang_getSkippedRanges` (reached by ctypes; the
+Python bindings do not wrap it), and **sums every skipped arm** rather than counting only ones
+individually above the threshold. That matters twice over: it found three more files than the
+trailing-span heuristic did, taking `UNPARSED` from 1 to 4 --
+
+| file | lines | unparsed | was |
+| --- | --- | --- | --- |
+| `src/hle/memory/hle_kernel_mem.cpp` | 7,637 | **52%** (7 spans) | UNPARSED, at 51% from one span |
+| `src/hle/kernel/hle_kernel.cpp` | 5,395 | **30%** | SPLIT |
+| `src/hle/fs/hle_file.cpp` | 4,560 | **21%** | SPLIT |
+| `src/host/memory/guest_write_watch.cpp` | 2,513 | **20%** | SPLIT |
+
+-- and it fails **closed** everywhere the question cannot be answered, because "no unparsed lines"
+and "I could not ask" must never be the same output. A missing `clang_getSkippedRanges` exits; a file
+the translation unit never read, or a NULL range list, scores `NO-PREPROC` rather than 0.
+
+That second guard was itself dead when first written, which is worth recording because it is this
+PR's own defect class appearing inside the fix for it. The check was `if File.from_name(...) is
+None` -- and it never is. `clang_getFile` resolves through the file manager, so it answers for any
+file that exists on disk whether or not the TU read it, and cindex asserts the handle is non-NULL
+besides. A foreign file therefore came back with a valid handle, an empty skipped-range list, and a
+confident **0**, behind a guard that could not fire. Membership is tested against the TU's own
+inclusion record now (`_file_in_tu`), which also turns an existing assumption into a check: a header
+has no compile command, so `flags_for` parses the first TU whose *text* mentions it, without
+confirming the include sits on an active branch.
+
+The subtlest of those was a path comparison. The clip that keeps other files' skipped include guards
+out of the count originally compared `resolve()`d paths -- and this repository is reachable under two
+spellings that resolve **differently** and name one file, the container's `/home/<user>/...` bind
+mount and the host's `/var/home/<user>/...`. Under the alias spelling every span was discarded and
+`hle_file.cpp` reported **0** skipped lines instead of 963, which would have scored it `SPLIT`. The
+comparison is by **inode** now (`os.path.samefile`), and where even that errors it counts the span
+rather than dropping it: an over-count raises `UNPARSED`, which someone sees, and an under-count is
+the silent wrong answer. Measured both spellings: 963 and 963.
+
+Span line numbers include the `#if` and `#endif` directives themselves, because that is what libclang
+reports and they are lines the AST produced nothing for. Anyone reconstructing these figures as
+"lines of skipped CODE" will get about two fewer per span.
+
+`UNPARSED_SHARE` (0.15) is a **convention, not a measurement**. The tree has four files above it, the
+lowest at 20%, and nothing here pins where in the gap below that the line belongs.
+
+### Why `UNPARSED` is its own verdict rather than a footnote
+
+**Every AST-driven statement about such a file is answering about the other part.** The first version
+of this tool scored `hle_kernel_mem.cpp` as `SPLIT` from the 48% it could see -- and worse, discarded
+the trailing arm as scaffolding first, because `map_symbols` gives the outermost namespace's trailing
+text the `close` role and this tool filtered `open`/`close` out. 3,909 lines left the accounting
+silently. Caught by cross-checking the survey's own numbers against `map_symbols.py` on the same
+file; nothing in the survey's output looked wrong on its own, which is the point.
+
+The practical consequence for #3503: **that split cannot be driven by `split_file.py`**, because the
+tool is blind to the arm being moved. A platform-arm split is a textual line-range move at the
+`#if`/`#else`/`#endif` boundaries -- provable by concatenation, and needing no AST at all.
+
+`survey_sizes.py` reports a file whose parse emitted errors as `PARSE-FAIL` and gives it **no
+verdict**, because a libclang parse driven from a g++ database fails softly -- a partial AST looks
+like a small, uninteresting file. In a survey that is the worst place for it to hide, since the file
+would be ranked as needing no work. One file is currently in that state:
+`frontends/prosper-app/main.cpp`, which has no compile command unless the app is configured
+(`-DPROSPER_APP=ON`); configure with it to bring that file into the survey.
+
+### Choosing where to cut
+
+`map_symbols.py --clusters [N]` groups the file's regions by what they actually reference, and
+reports the cost of the seam it proposes:
+
+```
+== proposed seams: 9 group(s), target ~2149 lines each == -- you asked for 3, and the reference
+   structure plus that size cap do not permit fewer
+   252 of 2927 references cross a boundary (9%) -- that is the promote-to-header list
+   83 merge(s) the references wanted were refused by the size cap; a group AT the cap is the cap
+   talking, not a seam
+```
+
+The cross-boundary count is the number that matters, because those are the internal-linkage edges
+the REFERENCES section warns about -- a split that separates a `static` helper from its callers
+*"does not fail at review, it fails at link"*. Having the list up front turns `promote_internal.py`
+into a decision instead of a compile-error hunt.
+
+**Two things it says about itself, and both are load-bearing.** A group sitting exactly AT the size
+cap is the cap talking, not a structural seam -- it stopped there because it was told to. And the
+part count is what the references and the cap allow, not what you asked for; the tool says so rather
+than forcing the number. Grouping by NAME finds none of this: on `gpu_executor.cpp` a name-prefix
+pass put 183 of 273 regions in "other".
+
+**A 0% cut is a tell, not a success.** An early draft let attachment ignore the cap, which funnelled
+every group into the largest connected component -- one 6,374-line "part" out of 6,515 lines,
+reported as a perfect zero-cut split. That is pinned by a selftest arm now, with the fixture built so
+the defect changes the group COUNT rather than merely a number.
+
+### The three tools are a chain, and each one checks the step before it
+
+`map_symbols` proposes a seam, `promote_internal` makes the shared vocabulary visible, `split_file`
+cuts. The middle step is not always needed -- 42 of `gpu_capture.cpp`'s 155 body regions are already
+external, and a seam that only crosses those needs no promotion at all. What the order buys is that
+**whether you need it is now decidable before the cut** rather than at build time:
+
+```bash
+map_symbols.py  --file <f> --clusters 3 --json ~/work/f.json   # where to cut, and what it costs
+split_file.py   --map ~/work/f.json --plan <plan> --dry-run    # refuses, naming what to promote
+promote_internal.py --map ~/work/f.json --regions <closure> --header <f>_internal.hpp
+map_symbols.py  --file <f> --json ~/work/f2.json               # promotion changes every index
+split_file.py   --map ~/work/f2.json --plan <plan> --dry-run
+```
+
+(Maps go under `$HOME`, not `/tmp`: that is a RAM-backed tmpfs here with a quota shared by every
+concurrent agent.)
+
+**Both closure checks exist because their absence was measured, not imagined.** Splitting
+`gpu_capture.cpp`'s serialize/deserialize into their own file satisfied every check `split_file`
+*then had* -- exact tiling, a clean partition, byte-for-byte reconstruction -- and failed to compile
+with **25 undeclared names**, because `Writer`, `Reader`, `kMagic`, `read_table` and twenty others have
+internal linkage and stayed in the other part. Every one of those checks is byte accounting: they
+establish that no LINE was lost, never that a line can still be used where it ended up.
+
+The reference matrix that answers it was already in the map. `split_file` reads it now and refuses,
+naming the definitions and printing the `promote_internal` command that fixes them. Measured against
+the compiler on that split: **23 names flagged, 25 reported by g++, and the two it did not name are
+`r` and `w`** -- local variables in cascading errors from `Reader r;` and `Writer w;`. No false
+positives on that file.
+
+**Linkage is not the test; a visible declaration is.** The first version of this check skipped any
+definition with external linkage, on the reasoning that another translation unit can name it. That
+is true of the *linker* and says nothing about the *compiler*: a function defined in a .cpp inside a
+named namespace and never declared in a header has external linkage and no declaration in scope
+anywhere else, so a split moves its callers into a file that links and does not compile. Splitting
+`rdna2_to_spirv.cpp` per shader stage passed the linkage-only check and failed on
+`safe_execz_branches` in three of five outputs -- while its sibling `safe_execz_branches_for_test`,
+identical in linkage, was fine because `rdna2_to_spirv.hpp` declares it. `map_symbols` records
+`declared_in_header` per region now, and that is what the check keys on.
+
+**The check cannot see inactive `#if` arms**, and that limit is not small: libclang parses one arm,
+so a map made on Linux carries no references from the 52% of `hle_kernel_mem.cpp` or the 30% of
+`hle_kernel.cpp` that sit behind a platform conditional. A split validated here can still strand a
+definition the other platform's arm uses. `survey_sizes.py` reports that share per file as
+`UNPARSED`; treat a clean result on such a file as a statement about the active arm only.
+
+`promote_internal` has the mirror of the same check, for the same reason.
+
+### Running it
+
+```bash
+python3 prosper/tools/refactor/survey_sizes.py --min-lines 2500     # needs libclang + a build dir
+python3 prosper/tools/refactor/survey_sizes.py --selftest           # no libclang needed
+```
+
+`--selftest` runs the classifier's arithmetic cases always, and the four measurement checks **only
+where libclang is importable** -- three of them score committed fixtures under `testdata/`, while the
+fourth builds a hard link in a temporary directory, because the property it needs (two paths naming
+one file that `resolve()` reports as different) cannot be committed as a fixture. `--selftest` says
+so explicitly, and names them, when it skips them. Those are the checks covering how the
+classifier's INPUTS are measured, and every defect this tool shipped lived there rather than in the
+arithmetic. The registered ctest case
+(`refactor_survey_classifier`) therefore gates the arithmetic everywhere and the measurement locally.
+
 **The invariant that makes incremental extraction safe is worth copying.** When a block was extracted
 out of `test_rdna2_to_spirv.cpp`'s `main`, the thing that made it checkable was a count of assertions
 *executed*, asserted as a per-block delta:

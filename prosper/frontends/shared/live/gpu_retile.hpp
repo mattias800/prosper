@@ -1,6 +1,7 @@
 // Exact device-side guest tiling, recorded after a storage-image transfer.
 #pragma once
 #include "gpu/recompiler/spirv_builder.hpp"
+#include "gpu/diagnostics/vk_object_names.hpp"   // #3578
 #include "gpu/texture/tile.hpp"
 #include "gpu/resources/shader_resources.hpp"
 #include "gpu/execute/host_read_barrier.hpp"
@@ -186,6 +187,9 @@ struct GpuRetilePipeline {
         sci.codeSize = words.size() * sizeof(uint32_t); sci.pCode = words.data();
         VkShaderModule shader = VK_NULL_HANDLE;
         setup_result = vkCreateShaderModule(device, &sci, nullptr, &shader);
+        if (setup_result == VK_SUCCESS)   // #3578
+            prosper::gpu::vk_name_object(device, VK_OBJECT_TYPE_SHADER_MODULE, (uint64_t)shader,
+                                         "prosper gpu_retile");
         if (setup_result != VK_SUCCESS) { destroy(); return setup_result; }
         VkComputePipelineCreateInfo pci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
         pci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};

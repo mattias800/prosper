@@ -40,9 +40,10 @@ import sys
 import tempfile
 from pathlib import Path
 
-# The title whose reviewed route may run the narrow WaveAny class at native wave32. One string, in
-# one place, mirroring live_renderer.cpp:1216.
-NATIVE_VOTE_ALLOWLIST = ("PPSA04263",)
+# The titles the renderer admits the narrow WaveAny class on, mirroring live_renderer.cpp's
+# kNativeFragmentVoteTitles (PR #3480). Every entry has a before/after survey on a reviewed route;
+# joining the list is one run, so this is a queue rather than a wall.
+NATIVE_VOTE_ALLOWLIST = ("PPSA01885", "PPSA02664", "PPSA04263", "PPSA13579", "PPSA25009")
 
 DRAW = re.compile(r"^draw\[(\d+)\].*?\bfs=(\d+)/([0-9a-f]+)/", re.M)
 DS_SUBMIT = re.compile(r"\bfirst=(\d+) last=(\d+)")
@@ -143,7 +144,10 @@ def main() -> int:
         print("give exactly one of --capture or --bundle", file=sys.stderr)
         return 2
 
-    allowlisted = args.title in NATIVE_VOTE_ALLOWLIST
+    # W5 retired the per-title scope, so the WaveAny class is admissible everywhere. The
+    # variable stays because the OTHER conjuncts are still undecidable offline -- admission
+    # is an upper bound, not a certainty, whatever the title.
+    allowlisted = not NATIVE_VOTE_ALLOWLIST or args.title in NATIVE_VOTE_ALLOWLIST
 
     tmp = None
     if args.work:

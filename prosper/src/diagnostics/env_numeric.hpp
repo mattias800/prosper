@@ -144,6 +144,48 @@ inline uint64_t env_u64_or_default_auto_capped(const char* name, const char* tex
     return value < cap ? value : cap;
 }
 
+// --- for a knob whose three answers are ON, OFF and "not set at all" ------------------------------
+//
+// A tri-state A/B lever (`PROSPER_POST_SUBMIT_VISIBILITY`, #1226/#2217) has a deliberate third
+// answer: `1` forces the contract on, `0` forces it off, and UNSET means "follow the SDK version the
+// guest asked for". Read with `strtol(e, nullptr, 0)` that collapses, because strtol answers **0**
+// for text it cannot parse -- so `=on`, `=true`, `=yes` and `=enabled`, every spelling an operator
+// reaches for, select the FORCED-OFF arm, and the site then announces "FORCED OFF" as though it had
+// been asked for. On an ordinary switch that is a lost experiment. On a lever whose verdict is still
+// open it is a MISLABELLED measurement, which is worse than no measurement at all (#3304).
+//
+// So the grammar is: `1` / `on` / `true` / `yes` / `enabled` -> 1, `0` / `off` / `false` / `no` /
+// `disabled` -> 0, either case; `0x1` and `0x0` too, because the sites converted here read base 0
+// and refusing a spelling that used to work is this header changing a well-formed setting (the same
+// N1 rule the `_auto` family exists for). Anything else -- INCLUDING a number that is neither 0 nor
+// 1, which strtol used to turn into a silent forced-ON -- is **unset** (-1) with a line on stderr
+// naming the value. Never a silent third answer. Unset or empty is -1 in silence.
+inline bool env_word_matches_nocase(const char* text, const char* lower_word) {
+    for (;; ++text, ++lower_word) {
+        if (!*lower_word) return !*text;
+        char c = *text;
+        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+        if (c != *lower_word) return false;
+    }
+}
+
+inline int env_tristate_or_unset(const char* name, const char* text) {
+    if (!text || !*text) return -1;   // unset or empty: not a typo, and not a third arm
+    static const char* const kOn[] = {"on", "true", "yes", "enabled"};
+    static const char* const kOff[] = {"off", "false", "no", "disabled"};
+    for (const char* word : kOn)
+        if (env_word_matches_nocase(text, word)) return 1;
+    for (const char* word : kOff)
+        if (env_word_matches_nocase(text, word)) return 0;
+    uint64_t value = 0;
+    if (parse_u64_auto_base(text, &value) && value <= 1) return static_cast<int>(value);
+    std::fprintf(stderr,
+                 "[env] %s='%s' is neither on nor off -- treating it as UNSET and changing NOTHING. "
+                 "Accepted: 1/on/true/yes/enabled, 0/off/false/no/disabled (either case)\n",
+                 name, text);
+    return -1;
+}
+
 // --- for a knob whose "unset" answer is NOT a number ---------------------------------------------
 //
 // `PROSPER_COMPUTE_IMAGE_CACHE_MB` unset means "derive the budget from device memory", so there is

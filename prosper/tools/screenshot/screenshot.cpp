@@ -305,7 +305,16 @@ std::string route_label(const std::string& path) {
 
 } // namespace
 
+// #3379: guest flips are paced at the cadence the title asked for by DEFAULT, because our
+// present is synchronous and an unpaced flip completes as fast as the host can render one --
+// on a 180 Hz panel that simulates the game at 3x speed. This tool is a MEASUREMENT harness,
+// not a console: its pad routes are wall-clock anchored against free-running flips, and the
+// snapshot tool sets PROSPER_FLIP_PACE_FPS explicitly on both of its halves. So opt out of the
+// console cadence and keep this tool free-running; an explicit PROSPER_FLIP_PACE_FPS still wins.
+extern "C" void prosper_vo_set_flip_pacing_unpaced_default();
+
 int main(int argc, char** argv) {
+    prosper_vo_set_flip_pacing_unpaced_default();   // #3379: a capture sweep is not a console
     std::string dump, out = ".", manifest_path;
     int every = 60, count = 30, timeout = 900;
     double seconds = 0.0;   // >0 => capture every N wall-clock seconds instead of every N rendered frames

@@ -14,10 +14,25 @@
 #    it renders a correct circled X. That is a prosper glyph defect, and it is why the button had to
 #    be found by sweeping candidates.
 #
-# 2. PRESS DURATION IS LOAD-BEARING. The menu runs at ~80 flips/s since the rendering series, so a
-#    1-second hold triggers key repeat -- three Down presses walked SIX rows and landed on Rockstar
-#    Editor. Every menu press here is ~0.15 s (~12 flips). `strtod` parses the anchors, so
-#    fractional seconds work.
+# 2. PRESS DURATION IS LOAD-BEARING, AND IT IS NOT A FLIP COUNT. A ~1-second hold triggers the
+#    title's key repeat -- three Down presses walked SIX rows and landed on Rockstar Editor. Every
+#    menu press here must be ~0.15 s.
+#
+#    This file used to spell that as a flip WINDOW (`f2272-2284`), tuned at the ~80 flips/s this
+#    menu ran at on the authoring host. A flip window encodes a duration only at the rate it was
+#    tuned on, and key repeat is wall-clock. On a host whose settings menu ran at 15-33 flips/s the
+#    same windows measured 0.737 s / 0.123 s / 0.372 s instead of 0.15 s, the three Downs walked
+#    SEVEN rows, a screenshot at t=92 s showed `Motion Sensor Function` highlighted instead of
+#    `Display`, and the following Left set `Aircraft = On`. Graphics Mode was never touched, so the
+#    title ran the whole session in its default FIDELITY mode with ray tracing -- while every number
+#    from that session was recorded as a Performance-mode run. Nothing failed; a different run
+#    happened. See #3449.
+#
+#    So every press below is now `f<start>+0.15`: the START stays flip-anchored, because a flip
+#    ordinal names the same moment in the guest's sequence on every host, and the HOLD is in
+#    SECONDS, because that is the unit the title's key repeat is measured in. The start frames are
+#    unchanged from the version this replaces. Flip pacing (#3379) does not make the old form safe:
+#    pacing only sleeps when a host runs FAST, and these rates were far below the paced cadence.
 #
 # 3. The Settings category list is: Controls (selected on entry) | Audio | Camera | Display |
 #    Voice Chat | Notifications | Rockstar Editor | Motion Sensor Function. Display is THREE downs.
@@ -33,25 +48,25 @@
 # rendering series moved gameplay from ~0.3-2.2 to ~22, overlapping the menu range.
 
 # --- Boot -> title card -> main menu -------------------------------------------------------------
-f1121-1148:cross
-f1210-1212:cross
+f1121+0.15:cross
+f1210+0.15:cross
 
 # --- Settle on STORY tab (rightmost tab) ---------------------------------------------------------
-f1633-1651:r1
-f1782-1804:r1
+f1633+0.15:r1
+f1782+0.15:r1
 
 # --- Settings -> Display -------------------------------------------------------------------------
-f2109-2124:options
-f2272-2284:down
-f2407-2411:down
-f2518-2527:down
+f2109+0.15:options
+f2272+0.15:down
+f2407+0.15:down
+f2518+0.15:down
 
 # --- Into the pane, onto Graphics Mode, and switch to Performance (left) -------------------------
-f2675-2691:cross
-f2826-2830:left
+f2675+0.15:cross
+f2826+0.15:left
 
 # --- Back out to main menu and start Story Mode --------------------------------------------------
-f3102-3117:circle
-f3266-3284:circle
-f3606-3625:cross
+f3102+0.15:circle
+f3266+0.15:circle
+f3606+0.15:cross
 

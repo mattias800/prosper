@@ -21,7 +21,12 @@ what produces that set — it is where `<dump>/Media/Plugins/…` becomes a `Lin
   replacements of Sony libraries, and this is what keeps them from being linked and shadowing
   prosper's own implementations.
 - **`exec_image_{linux,win}.cpp`** behind `exec_image.hpp` — the per-platform mapping substrate.
-  Platform divergence belongs *here*, not in `boot_program.cpp`.
+  Platform divergence belongs *here*, not in `boot_program.cpp`. It owns **two** fixed apertures,
+  not one: the executable import-stub table at `BOOT_STUB` (`install_stubs`) and the writable,
+  never-executable import-DATA table at `BOOT_IMPORT_DATA` (`install_import_data`, #3529). They are
+  separate address windows on purpose — `callback_fs.hpp` reads any return address inside
+  `[0x600000000, 0x700000000)` as an import-stub frame, so nothing else may live there, and a guest
+  store to an unresolved variable must not be able to reach executable pages.
 - **`runtime_module_load.*`** — the guest asking for a module after boot, as opposed to the fixed
   preload list. True runtime PRX loading is not implemented (#639), which is why the preload list
   carries so many optional entries: they exist so a first P/Invoke resolves instead of hanging.

@@ -30,9 +30,16 @@
 // any module shipped with this title", per title, which is exactly the condition under which
 // `prosper_on_unimpl` runs.
 //
+// --data-only answers a different question with the same machinery (#3529): which imports are
+// DATA (ELF STT_OBJECT) rather than functions, and how many of those no sibling module defines.
+// Those are exactly the bindings the linker sends to the writable import-data aperture, where the
+// guest reads a zero it was never promised. It is the static counterpart of the runtime
+// `[import-data]` listing PROSPER_STUBDUMP prints. Registration is meaningless for a variable, so
+// that column is not a filter in this mode.
+//
 // Usage:
 //   nid_census <app0-dir|module> [more...] [--names <PS5-3.20_Libs-dir>]
-//              [--registered] [--tsv] [--lib <substr>] [--self-check]
+//              [--registered] [--tsv] [--lib <substr>] [--self-check] [--data-only]
 //
 // `<app0-dir>` is scanned recursively for eboot.bin and *.prx/*.sprx. Passing several titles ranks
 // each NID by how many of them import it, which is the reachability signal #2081 asks for: a NID
@@ -70,7 +77,31 @@ struct Row {
     std::set<std::string> libs;       // import library names as the module declares them
     std::set<std::string> titles;     // which inputs import it
     size_t modules = 0;               // how many modules import it
+    // ELF64_ST_TYPE values this NID was imported with. A set, not a scalar: nothing stops two
+    // modules from declaring the same NID with different types, and collapsing that to one value
+    // would hide it. STT_OBJECT here means the linker binds it to the import-data aperture (#3529).
+    std::set<unsigned> elf_types;
+    bool object() const { return elf_types.count(STT_OBJECT) != 0; }
 };
+
+// The ELF symbol types this corpus actually carries, spelled for a report.
+const char* sym_type_name(unsigned t) {
+    switch (t) {
+        case STT_NOTYPE:  return "NOTYPE";
+        case STT_OBJECT:  return "OBJECT";
+        case STT_FUNC:    return "FUNC";
+        case STT_SECTION: return "SECTION";
+        case STT_FILE:    return "FILE";
+        case STT_COMMON:  return "COMMON";
+        case STT_TLS:     return "TLS";
+        default:          return "?";
+    }
+}
+std::string sym_types_of(const Row& r) {
+    std::string out;
+    for (unsigned t : r.elf_types) { if (!out.empty()) out += "+"; out += sym_type_name(t); }
+    return out.empty() ? "-" : out;
+}
 
 // ---- the PS5 3.20 stub dump: authoritative <NID> <-> <funcName> pairs --------------------------
 // Each generated library has one loader line per export:
@@ -150,7 +181,10 @@ std::vector<fs::path> collect_modules(const std::string& input) {
 void print_scope(const char* prefix, size_t total, size_t modules_read, size_t modules_failed,
                  size_t unregistered, size_t shown, size_t shown_unregistered,
                  size_t satisfied_cross_module,
-                 size_t mismatches, const std::string& lib_filter, bool self_check) {
+                 const std::map<std::string, size_t>& data_bindings_by_title,
+                 size_t data_satisfied_cross_module,
+                 size_t mismatches, const std::string& lib_filter, bool self_check,
+                 bool data_only) {
     printf("%sscope: %zu distinct imported NIDs over %zu module(s) read, %zu unreadable\n",
            prefix, total, modules_read, modules_failed);
     printf("%sscope: %zu unregistered before filtering, %zu shown (%zu unregistered)%s%s\n",
@@ -158,6 +192,22 @@ void print_scope(const char* prefix, size_t total, size_t modules_read, size_t m
            lib_filter.empty() ? "" : ", --lib filter=", lib_filter.c_str());
     printf("%sscope: %zu binding(s) excluded as satisfied by a sibling module's export\n",
            prefix, satisfied_cross_module);
+    {
+        // #3529: what reaches the writable import-data aperture. A data import a sibling module
+        // DEFINES is bound to that definition and never comes here, which is why the exclusion
+        // count is reported beside it rather than left implicit.
+        size_t data_total = 0, titles_with_data = 0;
+        for (const auto& [t, n] : data_bindings_by_title) { data_total += n; if (n) titles_with_data++; }
+        printf("%sscope: %zu DATA binding(s) (ELF STT_OBJECT) unresolved by any sibling module, "
+               "over %zu of %zu input(s); a further %zu were satisfied cross-module\n",
+               prefix, data_total, titles_with_data, data_bindings_by_title.size(),
+               data_satisfied_cross_module);
+        // The per-title breakdown only in --data-only: over a whole-corpus run it is one line per
+        // dump, which would bury the default report's own scope block.
+        if (data_only)
+            for (const auto& [t, n] : data_bindings_by_title)
+                printf("%sdata: %-20s %zu\n", prefix, t.c_str(), n);
+    }
     if (self_check)
         printf("%sscope: name-table self-check %zu mismatch(es)\n", prefix, mismatches);
     if (modules_failed)
@@ -187,7 +237,9 @@ void usage(const char* argv0) {
             "  --registered   also list imports that DO have a handler (default: only unregistered)\n"
             "  --tsv          machine-readable output\n"
             "  --lib SUBSTR   only report NIDs whose import library contains SUBSTR\n"
-            "  --self-check   verify every dump NID against prosper's nid_hash()\n",
+            "  --self-check   verify every dump NID against prosper's nid_hash()\n"
+            "  --data-only    only DATA imports (ELF STT_OBJECT) -- what the linker binds to the\n"
+            "                 writable import-data aperture rather than to a code stub (#3529)\n",
             argv0);
 }
 
@@ -196,7 +248,7 @@ void usage(const char* argv0) {
 int main(int argc, char** argv) {
     std::vector<std::string> inputs;
     std::string names_dir, lib_filter;
-    bool show_registered = false, tsv = false, self_check = false;
+    bool show_registered = false, tsv = false, self_check = false, data_only = false;
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -205,6 +257,7 @@ int main(int argc, char** argv) {
         else if (a == "--registered") show_registered = true;
         else if (a == "--tsv") tsv = true;
         else if (a == "--self-check") self_check = true;
+        else if (a == "--data-only") data_only = true;
         else if (a == "-h" || a == "--help") { usage(argv[0]); return 0; }
         else if (!a.empty() && a[0] == '-') { usage(argv[0]); return 2; }
         else inputs.push_back(a);
@@ -227,6 +280,10 @@ int main(int argc, char** argv) {
 
     std::map<std::string, Row> rows;
     size_t modules_read = 0, modules_failed = 0, satisfied_cross_module = 0;
+    // Per-title DATA accounting (#3529), kept even when --data-only is off so the scope block can
+    // report it unconditionally: it costs two counters and it is the number the issue asked for.
+    std::map<std::string, size_t> data_bindings_by_title;   // unresolved STT_OBJECT bindings
+    size_t data_satisfied_cross_module = 0;
 
     for (const auto& input : inputs) {
         const std::string title = fs::path(input).filename().string();
@@ -254,14 +311,25 @@ int main(int argc, char** argv) {
 
         for (const auto& m : loaded) {
             for (const auto& im : m.imports) {
-                if (title_exports.count(im.nid)) { satisfied_cross_module++; continue; }
+                if (title_exports.count(im.nid)) {
+                    satisfied_cross_module++;
+                    if (im.elf_type == STT_OBJECT) data_satisfied_cross_module++;
+                    continue;
+                }
                 Row& r = rows[im.nid];
                 r.nid = im.nid;
                 if (!im.lib_name.empty()) r.libs.insert(im.lib_name);
                 r.titles.insert(title);
                 r.modules++;
+                r.elf_types.insert(im.elf_type);
+                // One binding per IMPORT, not per NID: two modules importing the same variable are
+                // two bindings that both land on the (one, deduped) data slot.
+                if (im.elf_type == STT_OBJECT) data_bindings_by_title[title]++;
             }
         }
+        // A title with zero unresolved data imports must still appear, or "how many titles are
+        // affected" would be read off a map that silently omits the answer "none".
+        data_bindings_by_title.emplace(title, 0);
     }
 
     // Classify against the live registry.
@@ -271,7 +339,10 @@ int main(int argc, char** argv) {
         total++;
         const bool registered = Hle::registered(nid);
         if (!registered) unregistered++;
-        if (registered && !show_registered) continue;
+        // A variable has no handler to register, so the registration filter would silently drop
+        // every row in this mode. --data-only selects on the symbol type instead.
+        if (data_only) { if (!r.object()) continue; }
+        else if (registered && !show_registered) continue;
         if (auto it = names.by_nid.find(nid); it != names.by_nid.end()) r.name = it->second;
         if (!lib_filter.empty()) {
             bool hit = false;
@@ -292,37 +363,41 @@ int main(int argc, char** argv) {
     });
 
     if (tsv) {
-        printf("nid\tname\tregistered\ttitles\tmodules\tlibs\ttitle_list\n");
+        printf("nid\tname\tsym_type\tregistered\ttitles\tmodules\tlibs\ttitle_list\n");
         for (const Row* r : selected) {
             std::string libs, tl;
             for (const auto& l : r->libs) { if (!libs.empty()) libs += ","; libs += l; }
             for (const auto& t : r->titles) { if (!tl.empty()) tl += ","; tl += t; }
-            printf("%s\t%s\t%d\t%zu\t%zu\t%s\t%s\n", r->nid.c_str(),
-                   r->name.empty() ? "?" : r->name.c_str(),
+            printf("%s\t%s\t%s\t%d\t%zu\t%zu\t%s\t%s\n", r->nid.c_str(),
+                   r->name.empty() ? "?" : r->name.c_str(), sym_types_of(*r).c_str(),
                    Hle::registered(r->nid) ? 1 : 0,
                    r->titles.size(), r->modules, libs.c_str(), tl.c_str());
         }
         print_scope("# ", total, modules_read, modules_failed, unregistered, selected.size(),
-                    shown_unregistered, satisfied_cross_module, names.mismatches,
-                    lib_filter, self_check);
+                    shown_unregistered, satisfied_cross_module, data_bindings_by_title,
+                    data_satisfied_cross_module, names.mismatches, lib_filter, self_check,
+                    data_only);
         return 0;
     }
 
-    printf("%s", show_registered
+    printf("%s", data_only
+        ? "\n== DATA imports (STT_OBJECT) no sibling module defines -> import-data aperture ==\n"
+        : show_registered
         ? "\n== imports (registered and unregistered) ==\n"
         : "\n== imports with NO registered handler -> dispatcher returns 0 ==\n");
-    printf("%-13s %-52s %10s %5s  %s\n",
-           "NID", "name", "registered", "#ttl", "import library");
+    printf("%-13s %-52s %-8s %10s %5s  %s\n",
+           "NID", "name", "sym type", "registered", "#ttl", "import library");
     for (const Row* r : selected) {
         std::string libs;
         for (const auto& l : r->libs) { if (!libs.empty()) libs += ","; libs += l; }
-        printf("%-13s %-52s %10s %5zu  %s\n", r->nid.c_str(),
-               r->name.empty() ? "?" : r->name.c_str(),
+        printf("%-13s %-52s %-8s %10s %5zu  %s\n", r->nid.c_str(),
+               r->name.empty() ? "?" : r->name.c_str(), sym_types_of(*r).c_str(),
                Hle::registered(r->nid) ? "yes" : "no", r->titles.size(), libs.c_str());
     }
     printf("\n");
     print_scope("", total, modules_read, modules_failed, unregistered, selected.size(),
-                shown_unregistered, satisfied_cross_module, names.mismatches,
-                lib_filter, self_check);
+                shown_unregistered, satisfied_cross_module, data_bindings_by_title,
+                data_satisfied_cross_module, names.mismatches, lib_filter, self_check,
+                data_only);
     return 0;
 }

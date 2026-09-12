@@ -8,6 +8,9 @@ distribution. Each case is a regime the report must classify, plus the trap: a p
 Run: python3 tools/perf/test_flip_pacing_report.py
 """
 
+import importlib.util
+import random
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -105,11 +108,27 @@ def main():
         failures.append(f"case 7: emitter source not found at {emitter}")
     else:
         text = emitter.read_text(encoding="utf-8", errors="replace")
-        flip_lines = [line for line in text.splitlines() if "[ev] GpuFlip" in line]
-        if not flip_lines:
-            failures.append("case 7: no [ev] GpuFlip emitter found in hle_graphics.cpp")
-        elif not any("t=%" in line for line in flip_lines):
-            failures.append("case 7: the [ev] GpuFlip emitter writes no t= timestamp, so every real log is unpaceable (#3452): " + flip_lines[0].strip())
+        # BOTH flip emitters, not just the one this parser reads. They are ALTERNATIVES: the
+        # in-stream GPU flip (`prosper_vo_flip_from_gpu`) and the API flip
+        # (`sceVideoOutSubmitFlip`) each advance the flip state on their own, so a title using
+        # the API path produces SubmitFlip lines and no GpuFlip lines at all. Greping only
+        # GpuFlip left the `t=` added to SubmitFlip in the same PR removable with nothing going
+        # red -- and it is the only timing this tool's successor would have for that class of
+        # title (#3462, the residual noted on #3453's review).
+        # The consequence differs per emitter, so say which one it is rather than pasting
+        # #3452's sentence over both -- the second is not the failure #3452 was.
+        for tag, consequence in (
+                ("[ev] GpuFlip",
+                 "so every log this parser reads is unpaceable (#3452)"),
+                ("[ev] SubmitFlip",
+                 "so a title that flips through the API path rather than the in-stream GPU"
+                 " packet records no flip timing at all (#3462)")):
+            flip_lines = [line for line in text.splitlines() if tag in line]
+            if not flip_lines:
+                failures.append(f"case 7: no {tag} emitter found in hle_graphics.cpp")
+            elif not any("t=%" in line for line in flip_lines):
+                failures.append(f"case 7: the {tag} emitter writes no t= timestamp, {consequence}: "
+                                + flip_lines[0].strip())
 
     # 8. A PARTIALLY readable log must say so. Reporting only when NOTHING parsed left the
     #    real hazard open: a handful of timestamped flips among thousands of untimed ones
@@ -163,6 +182,14 @@ def main():
     out, _ = run("\n".join(joined) + "\n")
     if "step backwards" not in out:
         failures.append(f"case 10: concatenated runs went undetected: {out!r}")
+    # ...and the HEADLINE must be marked void with it. Deriving the rate from the wall-clock span
+    # (#3560) is right for one run and meaningless for several: sorted, the span covers roughly
+    # one run's timeline while the flips come from all of them, so the rate over-counts by about
+    # the number of runs. Saying the intervals are not real while printing a confident rate above
+    # them would be the corrected instrument lying in a new place.
+    if "NOT meaningful" not in out:
+        failures.append(f"case 10: the rate over a concatenated span was printed without a"
+                        f" caveat, so the restart warning and the headline disagree: {out!r}")
 
     # ...and a single clean run must stay silent, or the warning becomes noise nobody reads.
     single = []
@@ -173,6 +200,434 @@ def main():
     out, _ = run("\n".join(single) + "\n")
     if "step backwards" in out:
         failures.append(f"case 10: a single monotonic run was flagged as concatenated: {out!r}")
+    if "NOT meaningful" in out:
+        failures.append(f"case 10: a single clean run's rate was voided, so the caveat is"
+                        f" automatic and carries no information: {out!r}")
+
+    # 11. #3454: the tick-aligned share is meaningless without its null. The band is +/-BAND of
+    #     the tick, so it covers 2*BAND of every tick period and an interval unrelated to the
+    #     tick lands in it that often anyway. The report must PRINT that baseline, and the
+    #     printed band must be derived from BAND rather than restated as a literal -- the tool
+    #     previously said '15%' in one place and tested `0.15` in another.
+    spec = importlib.util.spec_from_file_location('flip_pacing_report', str(TOOL))
+    FPR = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(FPR)
+    # Read the constants defensively. A tool with no baseline at all is the PRE-FIX state, and
+    # it must produce one named failure per arm rather than an AttributeError that aborts the
+    # run before cases 12-15 execute -- otherwise the without-fix arm proves only that case 11
+    # discriminates, and says nothing about the other four.
+    BAND = getattr(FPR, 'BAND', None)
+    CHANCE = getattr(FPR, 'CHANCE', None)
+    verdict_of = getattr(FPR, 'alignment_verdict', None)
+    if BAND is None or CHANCE is None or verdict_of is None:
+        failures.append('case 11: flip_pacing_report exposes no BAND/CHANCE/alignment_verdict,'
+                        ' so the tick-aligned share has no stated null at all (#3454)')
+        BAND, CHANCE = 0.15, 0.30   # what the report is expected to use, so the arms below
+                                    # still discriminate instead of crashing
+
+    stamps = []
+    t = 1.0
+    for i in range(600):
+        t += 0.015625
+        stamps.append(t)
+    log = "".join(f"[ev] GpuFlip t={t:.6f}\n" for t in stamps)
+    out, _ = run(log)
+    expect(out, f"chance baseline {100 * CHANCE:.1f}%", "case 11 baseline is printed")
+    expect(out, f"+/-{BAND * 100:.0f}%", "case 11 printed band is derived from BAND")
+    expect(out, "well above chance", "case 11 a perfectly tick-locked run is a strong finding")
+
+    # 12. THE POSITIVE CONTROL FOR THE NULL ITSELF, and the reason this case exists: asserting
+    #     '2*BAND = 30%' in a test would only restate the arithmetic the code already performs.
+    #     So the null is measured instead, from a generator built OUTSIDE the tool and bearing no
+    #     relationship to the tick -- uniform intervals over [20, 120] ms.
+    #
+    #     Its EXACT expected coverage is derivable, and is not 30%: the tick multiples falling
+    #     wholly inside [20, 120] are k=2..7 (31.25 .. 109.375 ms), six bands of 2*0.15*15.625 =
+    #     4.6875 ms, so 28.125 of 100 ms = 28.1%. k=1 and k=8 lie outside the range and
+    #     contribute nothing. Measured across three seeds: 27.2%, 28.3%, 29.3%.
+    #
+    #     That gap between the exact 28.1% and the printed asymptotic 30.0% is the honest
+    #     limitation of a flat null, and it is why this asserts a BAND rather than a point. What
+    #     must hold is the verdict: a run with no tick relationship must not read as a finding.
+    rng = random.Random(20260911)
+    stamps = []
+    t = 1.0
+    for _ in range(4000):
+        t += rng.uniform(0.020, 0.120)
+        stamps.append(t)
+    log = "".join(f"[ev] GpuFlip t={t:.6f}\n" for t in stamps)
+    out, _ = run(log)
+    share_line = next((l for l in out.splitlines() if "tick-aligned intervals" in l), "")
+    match = re.search(r'[(]([0-9.]+)%[)]', share_line)
+    if not match:
+        failures.append(f"case 12: no tick-aligned share line: {out!r}")
+    else:
+        observed = float(match.group(1)) / 100.0
+        # Derive the expected coverage for THIS generator's support FROM BAND, rather than
+        # hard-coding a window. A fixed 22-34% band tolerated BAND anywhere in 0.118..0.181 and
+        # was blind to CHANCE entirely -- it guarded neither of the two things the PR claimed
+        # (found in review). Deriving it means a predicate that stops using BAND is caught even
+        # though the observation moves with it.
+        tick = FPR.TICK_MS
+        half = BAND * tick
+        covered, k = 0.0, 1
+        while k * tick - half < 120.0:
+            a, b = max(20.0, k * tick - half), min(120.0, k * tick + half)
+            if b > a:
+                covered += b - a
+            k += 1
+        expected = covered / 100.0
+        if abs(observed - expected) > 0.03:
+            failures.append(
+                f"case 12: unrelated intervals scored {100 * observed:.1f}%, but the band derived"
+                f" from BAND={BAND} predicts {100 * expected:.1f}% -- classify() and BAND have drifted")
+    # The other half the old window could not see: CHANCE must stay tied to BAND, and the
+    # printed baseline must be CHANCE rather than a separately-maintained literal.
+    if abs(CHANCE - 2.0 * BAND) > 1e-12:
+        failures.append(f"case 12: CHANCE ({CHANCE}) is not 2*BAND ({2 * BAND})")
+    expect(out, f"chance baseline {100 * CHANCE:.1f}%", "case 12 printed baseline is CHANCE")
+    expect(out, "at chance", "case 12 an unrelated run must read as no evidence, not a finding")
+
+    # 13. A BELOW-baseline run carries information -- production is actively anti-aligned, which
+    #     is evidence AGAINST a tick-bound wait. It previously read as a weak positive, so the
+    #     9.3% window in #3450 was discarded as 'no finding'. Intervals parked on half-tick
+    #     offsets are as far from every multiple as it is possible to be.
+    rng = random.Random(4242)
+    stamps = []
+    t = 1.0
+    for _ in range(1200):
+        t += (15.625 * rng.choice([1, 2]) + 15.625 * 0.5 + rng.gauss(0, 0.3)) / 1000.0
+        stamps.append(t)
+    log = "".join(f"[ev] GpuFlip t={t:.6f}\n" for t in stamps)
+    out, _ = run(log)
+    expect(out, "BELOW chance", "case 13 anti-aligned production is named as such")
+    expect(out, "evidence AGAINST", "case 13 says what a sub-chance share means")
+
+    # 14. The whole-run share is an average over windows. When those windows disagree the
+    #     summary reintroduces exactly the smearing the windowed view exists to prevent, so it
+    #     must say so. One tick-locked phase followed by one anti-aligned phase.
+    rng = random.Random(99)
+    stamps = []
+    t = 1.0
+    for _ in range(900):
+        t += (15.625 + rng.gauss(0, 0.3)) / 1000.0
+        stamps.append(t)
+    for _ in range(900):
+        t += (15.625 * 1.5 + rng.gauss(0, 0.3)) / 1000.0
+        stamps.append(t)
+    log = "".join(f"[ev] GpuFlip t={t:.6f}\n" for t in stamps)
+    out, _ = run(log, ["--window-s", "4"])
+    expect(out, "windows disagree", "case 14 a two-regime run flags its own summary as an average")
+
+    # 15. The verdict thresholds themselves, asserted directly rather than through the report, so
+    #     a wording change in the printer cannot silently move a boundary.
+    if verdict_of is None:
+        failures.append('case 15: no alignment_verdict to assert thresholds against')
+        verdict_of = lambda share, chance=None: (None, '')
+    ratio, verdict = verdict_of(CHANCE)
+    if ratio is None or abs(ratio - 1.0) > 1e-9 or 'at chance' not in verdict:
+        failures.append(f"case 15: a share exactly at chance must read as at-chance: {verdict!r}")
+    _, verdict = verdict_of(CHANCE * 0.3)
+    if 'BELOW chance' not in verdict:
+        failures.append(f"case 15: a third of chance must read as below: {verdict!r}")
+    _, verdict = verdict_of(CHANCE * 3.0)
+    if 'well above chance' not in verdict:
+        failures.append(f"case 15: three times chance must read as a real finding: {verdict!r}")
+    # A band whose acceptance region covers the whole line has no discriminating power left;
+    # the helper must not divide by a zero or negative baseline.
+    ratio, verdict = verdict_of(0.5, chance=0.0)
+    if ratio is not None:
+        failures.append("case 15: a zero baseline must yield no ratio rather than a division")
+
+    # 16. #3454 review: a run FASTER than the first band cannot score aligned at all, because
+    #     classify() forces nearest >= 1 -- so every interval shorter than (1-BAND)*tick is
+    #     'between ticks' by construction. Without a power term the sub-chance verdict then told
+    #     a 156 fps run it was 'actively anti-aligned, evidence AGAINST a tick-bound wait', which
+    #     is a confident negative on a population where no other answer was possible -- a new
+    #     instrument lie introduced by the fix for an old one.
+    stamps = []
+    t = 1.0
+    for _ in range(1500):
+        t += 1.0 / 156.0
+        stamps.append(t)
+    log = "".join(f"[ev] GpuFlip t={t:.6f}\n" for t in stamps)
+    out, _ = run(log)
+    expect(out, "NO POWER", "case 16 a run below the first band reports no power")
+    if "evidence AGAINST" in out:
+        failures.append("case 16: a 156 fps run was called anti-aligned, which it cannot be")
+
+    # 17. ...and the power term must NOT silence a real negative. Case 13's anti-aligned run
+    #     sits at 1-2 ticks, well inside the reachable range, so it must still say so. Without
+    #     this arm, 'always report NO POWER' would pass case 16. NOTE it passes in BOTH
+    #     directions -- the pre-fix tool also reports this correctly, because it has no power
+    #     term to over-apply. It is an over-suppression control, not a discriminator, and is
+    #     counted as neither.
+    rng = random.Random(4242)
+    stamps = []
+    t = 1.0
+    for _ in range(1200):
+        t += (15.625 * rng.choice([1, 2]) + 15.625 * 0.5 + rng.gauss(0, 0.3)) / 1000.0
+        stamps.append(t)
+    log = "".join(f"[ev] GpuFlip t={t:.6f}\n" for t in stamps)
+    out, _ = run(log)
+    expect(out, "BELOW chance", "case 17 a reachable anti-aligned run still reports the negative")
+    if "NO POWER" in out:
+        failures.append("case 17: a run at 1-2 ticks was wrongly reported as having no power")
+
+    # 18. The verdict helper's power gate, asserted directly. Wrapped because a helper that has
+    #     no `power` parameter at all is the PRE-FIX state, and it must produce a NAMED failure
+    #     rather than a TypeError that aborts before cases 16 and 17 are reported.
+    try:
+        _, verdict = verdict_of(0.0, power=0.0)
+        if 'NO POWER' not in verdict:
+            failures.append(f"case 18: zero power must suppress the verdict: {verdict!r}")
+        _, verdict = verdict_of(0.0, power=1.0)
+        if 'BELOW chance' not in verdict:
+            failures.append(f"case 18: full power must still allow a negative: {verdict!r}")
+    except TypeError as exc:
+        failures.append(f"case 18: alignment_verdict takes no power term at all ({exc})")
+
+    # 19. Re-review residual: PARTIAL power. Only `power` of the population can score at all, so
+    #     the null for the whole-population share is power * CHANCE. Measuring against the full
+    #     30% understates the ratio by 1/power and can call a share BELOW chance when it is above
+    #     its own null -- the same fabricated negative, surviving in the partial case. A
+    #     mixed-rate run is the phase change the windowed view exists for, so this is the common
+    #     case. share=0.20 at power=0.6: 0.20/0.30 = 0.67x (BELOW) against the flat null, but
+    #     0.20/(0.30*0.6) = 1.11x (at chance) against the real one.
+    try:
+        ratio, verdict = verdict_of(0.20, power=0.6)
+        if 'BELOW chance' in verdict:
+            failures.append(
+                f"case 19: a share above its own power-scaled null was called BELOW chance ({verdict!r})")
+        if ratio is None or abs(ratio - 0.20 / (FPR.CHANCE * 0.6)) > 1e-9:
+            failures.append(f"case 19: ratio {ratio} is not against the power-scaled null")
+        # ...and full power must leave the flat null untouched, or this becomes a blanket
+        # loosening rather than a correction.
+        ratio, _ = verdict_of(0.20, power=1.0)
+        if ratio is None or abs(ratio - 0.20 / FPR.CHANCE) > 1e-9:
+            failures.append(f"case 19: full power must divide by CHANCE exactly, got {ratio}")
+    except TypeError as exc:
+        failures.append(f"case 19: no power term to scale the null with ({exc})")
+
+    # ---------------------------------------------------------------- #3560
+    # A HELPER FOR THE ARMS BELOW. Builds a timeline holding exactly `n_long` long intervals and
+    # `n_burst` sub-0.5 ms ones, spread evenly, over exactly `span_s` seconds -- so the run's TRUE
+    # rate is (n_long + n_burst) / span_s, computed here from the construction and never from the
+    # tool. The burst fraction is the free variable, which is the point: it is what the tool was
+    # silently filtering out of its own headline.
+    def burst_log(n_long, n_burst, span_s, burst_ms=0.2, t0=1.0):
+        long_ms = (span_s * 1000.0 - n_burst * burst_ms) / n_long
+        ivals = []
+        for i in range(n_long):
+            ivals.append(long_ms)
+            if n_burst and (i * n_burst) // n_long != ((i + 1) * n_burst) // n_long:
+                ivals.append(burst_ms)
+        t = t0
+        rows = [f"[ev] GpuFlip t={t:.6f} handle=0x1002 bufidx=0 mode=0x1 fliparg=0x0"]
+        for ms in ivals:
+            t += ms / 1000.0
+            rows.append(f"[ev] GpuFlip t={t:.6f} handle=0x1002 bufidx=0 mode=0x1 fliparg=0x0")
+        return "\n".join(rows) + "\n"
+
+    def headline(out):
+        m = re.search(r"-> ([0-9.]+) fps average", out)
+        return None if m is None else float(m.group(1))
+
+    # 20. THE ARM FOR #3560. The headline rate was 1000/mean of the RETAINED intervals, and the
+    #     retained fraction varies per run -- so two runs' headline figures were means over
+    #     different populations while reading as the runs' rates. Measured on the #3379 A/B: 44.1
+    #     vs 59.2 fps reported against a wall-clock truth of 57.8 vs 97.9, a 1.34x ratio where the
+    #     truth is 1.65x, which made a working pacing fix look like it had missed by a quarter.
+    #
+    #     So the arm is NOT 'a rate is printed' -- that passes either way. Two runs with the SAME
+    #     true rate and DIFFERENT burst fractions must report the same figure. Both carry 1200
+    #     intervals over 20.000 s, i.e. 60.0 flips/s by construction; one drops 10% of them to the
+    #     filter and the other 50%. Pre-fix they report 54.1 and 30.2.
+    sparse = burst_log(n_long=1080, n_burst=120, span_s=20.0)   # 10% burst
+    dense = burst_log(n_long=600, n_burst=600, span_s=20.0)     # 50% burst
+    out_sparse, _ = run(sparse)
+    out_dense, _ = run(dense)
+    r_sparse, r_dense = headline(out_sparse), headline(out_dense)
+    if r_sparse is None or r_dense is None:
+        failures.append(f"case 20: no headline rate in one of the reports: "
+                        f"{out_sparse!r} / {out_dense!r}")
+    else:
+        for name, rate in (("10%-burst", r_sparse), ("50%-burst", r_dense)):
+            if abs(rate - 60.0) > 0.6:
+                failures.append(
+                    f"case 20: the {name} run is 1200 flips over 20.000 s = 60.0 flips/s by"
+                    f" construction, and the report says {rate} fps -- the headline is a mean over"
+                    f" the filtered population, not the run's rate (#3560)")
+        if abs(r_sparse - r_dense) > 0.5:
+            failures.append(
+                f"case 20: two runs at the same true rate reported {r_sparse} and {r_dense} fps"
+                f" because they retained different fractions of their intervals, so the figures"
+                f" this tool exists to compare are not comparable (#3560)")
+
+    # 21. ...and the filtered population must be STATED wherever it is used, or the mean printed
+    #     beside the headline silently describes a different population from the headline itself.
+    #     The retention is a fraction, not just a count: `intervals=12318` next to `flips=16028`
+    #     never told anyone the two lines disagreed on purpose.
+    expect(out_dense, "600 of 1200 retained", "case 21 the retained count is related to the total")
+    expect(out_dense, "50.0%", "case 21 the retention is stated as a fraction")
+    if "NOT the run's period" not in out_dense:
+        failures.append(f"case 21: the retained mean is printed without saying it is not the run's"
+                        f" period, so 1000/mean still reads as the rate: {out_dense!r}")
+
+    # 22. THE SAME DEFECT ONE LEVEL DOWN, which is where this file's history says a correction
+    #     tends to leave it (instrument trap 275: three corrections each carried the previous
+    #     defect forward in a narrower form). Every window row printed 1000/mean of its own
+    #     retained subset, so a bursty phase and a genuinely slower phase produced identical rows;
+    #     and the windows were cut over the FILTERED list while their ordinals were labelled
+    #     'flips'. This run holds two 10 s phases, both at 60 flips/s: one clean, one paired. All
+    #     four windows must read ~60 fps. Pre-fix they read 60.0, 60.0, 45.1, 30.2.
+    clean = burst_log(n_long=600, n_burst=0, span_s=10.0, t0=1.0)
+    paired = burst_log(n_long=300, n_burst=300, span_s=10.0, t0=11.0)
+    # Drop `paired`'s first line: it would duplicate the seam rather than continue the timeline.
+    two_phase = clean + "\n".join(paired.strip().splitlines()[1:]) + "\n"
+    out, _ = run(two_phase, ["--window-s", "5"])
+    rows = re.findall(r"flips\s+(\d+)-\s*(\d+):\s+([0-9.]+) fps", out)
+    if len(rows) < 4:
+        failures.append(f"case 22: expected four window rows, got {rows!r}: {out!r}")
+    else:
+        for start, end, fps in rows:
+            if abs(float(fps) - 60.0) > 3.0:
+                failures.append(
+                    f"case 22: window {start}-{end} holds 5 s of a 60 flips/s phase and reports"
+                    f" {fps} fps -- the window rate is 1000/mean of its retained subset (#3560)")
+        # The ordinals say 'flips', so the last one must reach the last interval. Cut over the
+        # filtered list it stops at the retained count, which on this run is 900 of 1200.
+        if int(rows[-1][1]) != 1200:
+            failures.append(
+                f"case 22: the window ordinals are labelled 'flips' but the last one ends at"
+                f" {rows[-1][1]} of 1200 intervals, so they index the filtered list (#3560)")
+
+    # 23. Degenerate spans, now that a rate is computed from one.
+    #     (a) An all-burst run has no distribution to report and a perfectly well-defined rate:
+    #         199 intervals of 0.1 ms is 10000 flips/s. Pre-fix it printed 'no usable intervals'
+    #         and no rate at all, which is the filter deciding the run did not happen.
+    all_burst = burst_log(n_long=199, n_burst=0, span_s=0.0199)
+    out, code = run(all_burst)
+    rate = headline(out)
+    if rate is None or abs(rate - 10000.0) > 100.0:
+        failures.append(f"case 23a: an all-burst run reported no usable rate ({rate}): {out!r}")
+    if "no population" not in out:
+        failures.append(f"case 23a: the empty distribution population went unnamed: {out!r}")
+    #     (b) ...and a timeline with no extent must refuse rather than divide by its own zero.
+    #         NOTE this half passes in BOTH directions -- the pre-fix tool never divided, because
+    #         it never computed a span. It is a guard against the fix, not a discriminator, and is
+    #         counted as neither.
+    out, code = run("[ev] GpuFlip t=1.000000\n" * 5)
+    if code != 0 or "Traceback" in out:
+        failures.append(f"case 23b: identical timestamps crashed the report (rc={code}): {out!r}")
+    if headline(out) is not None:
+        failures.append(f"case 23b: a rate was printed for a timeline with no extent: {out!r}")
+    # ---------------------------------------------------------------- #3462
+    # 24. A RACE IS NOT A RESTART, and the detector printed the same sentence for both. The
+    #     backwards-step detector (#3453) has no magnitude threshold, so a sub-microsecond
+    #     interleave between two emitting threads -- `evlog_seconds()` is evaluated as a function
+    #     argument and the stream lock is taken afterwards -- asserted "this input holds more than
+    #     one run", which is a different fact with a different remedy (fix the emitter's ordering
+    #     versus pass the runs separately). Two lines emitted 50 us out of order in an otherwise
+    #     monotonic 60 Hz run.
+    rows, t = [], 1.0
+    for i in range(300):
+        if i in (100, 200):
+            # The thread that read the clock LATER reached the stream first.
+            rows.append(f"[ev] GpuFlip t={t + 0.000050:.6f} handle=0x1002 bufidx=0 mode=0x1 fliparg=0x0")
+        rows.append(f"[ev] GpuFlip t={t:.6f} handle=0x1002 bufidx=0 mode=0x1 fliparg=0x0")
+        t += 1.0 / 60.0
+    rows_race = list(rows)
+    out, _ = run("\n".join(rows) + "\n")
+    expect(out, "step backwards 2 time(s)", "case 24 the backwards steps are still detected")
+    expect(out, "0.050 ms", "case 24 the magnitude of the largest step is stated")
+    if "more than one run" in out:
+        failures.append(f"case 24: a 50 us emission race was reported as a second run, which it"
+                        f" cannot be -- a restart steps back by a whole run (#3462): {out!r}")
+    if "EMISSION" not in out:
+        failures.append(f"case 24: the out-of-order emission was never named, so the remedy the"
+                        f" message implies is the wrong one (#3462): {out!r}")
+
+    # 25. ...and the real restart must keep its verdict AND gain the magnitude that justifies it,
+    #     or this becomes a blanket loosening rather than a distinction. Two 60 Hz runs
+    #     concatenated, so the seam steps back by the first run's whole elapsed time.
+    rows, stamps = [], []
+    for _ in range(2):
+        t = 1.0
+        for _ in range(200):
+            stamps.append(t)
+            rows.append(f"[ev] GpuFlip t={t:.6f} handle=0x1002 bufidx=0 mode=0x1 fliparg=0x0")
+            t += 1.0 / 60.0
+    out, _ = run("\n".join(rows) + "\n")
+    # Derived from the construction rather than restated: the seam steps back from the first
+    # run's last stamp to the second run's first, which is 199 frames at 60 Hz, not 200.
+    seam_s = stamps[199] - stamps[200]
+    expect(out, "more than one run", "case 25 a real restart is still called a restart")
+    expect(out, f"{seam_s:.3f} s",
+           "case 25 the restart states the magnitude that justifies the verdict")
+    if "EMISSION" in out:
+        failures.append(f"case 25: a 3.3 s run boundary was reported as emission jitter: {out!r}")
+
+    # 25b. #3560 AND #3462 MEET HERE, and the textual merge of them was clean and broken.
+    #      #3560 added a "<-- NOT meaningful" marker on the headline rate, keyed on the
+    #      `restarts` parameter; #3462 renamed that parameter to `backsteps`. The merge left a
+    #      line naming a variable that no longer exists -- a NameError on every input reaching
+    #      it -- and no arm noticed, because each branch's own suite passed on its own base.
+    #      So the marker is pinned here to the CLASSIFICATION, in BOTH directions:
+    #
+    #        * a RESTART voids the rate: several runs have no single span to divide by.
+    #        * a RACE does NOT: the input is ONE run whose emission interleaved, its span is
+    #          real, and voiding it would be a fresh false negative -- the opposite failure
+    #          to the one #3560 exists to fix, arrived at from the other side.
+    #
+    #      Case 25's `out` (a restart) is reused and case 24's rows are re-run, so this arm
+    #      cannot drift from the constructions it judges.
+    if "Traceback" in out:
+        failures.append(f"case 25b: the restart report crashed: {out!r}")
+    if "NOT meaningful" not in out:
+        failures.append(f"case 25b: a concatenated input's headline rate was printed with no"
+                        f" caveat -- there is no single span to divide by (#3560): {out!r}")
+    out_race, _ = run("\n".join(rows_race) + "\n")
+    if "Traceback" in out_race:
+        failures.append(f"case 25b: the race report crashed -- the #3560 marker is reading a"
+                        f" parameter #3462 renamed: {out_race!r}")
+    if "NOT meaningful" in out_race:
+        failures.append(f"case 25b: a 50 us emission race voided the headline rate, but the"
+                        f" input is ONE run and its wall-clock span is real (#3462):"
+                        f" {out_race!r}")
+
+    # 26. The classifier asserted directly, so a wording change in the printer cannot move a
+    #     boundary, and so the MIDDLE band is pinned: a step too large for a scheduler quantum
+    #     and too small for a run is neither, and saying so is the point of the fix. A single
+    #     threshold would only move the boundary and go on printing one of the two sentences.
+    #     Wrapped because a tool with no classifier at all is the PRE-FIX state, and it must
+    #     produce named failures rather than an AttributeError that aborts the run.
+    describe = getattr(FPR, "describe_backsteps", None)
+    if describe is None:
+        failures.append("case 26: flip_pacing_report exposes no describe_backsteps, so the"
+                        " backwards-step magnitude is never classified at all (#3462)")
+    else:
+        race_ms = getattr(FPR, "RACE_MS", None)
+        restart_ms = getattr(FPR, "RESTART_MS", None)
+        if race_ms is None or restart_ms is None:
+            failures.append("case 26: no RACE_MS/RESTART_MS thresholds are stated (#3462)")
+        else:
+            checks = [
+                ([], None, "no backwards step is no verdict"),
+                ([race_ms], "race", "a step at the jitter ceiling is emission, not a restart"),
+                ([restart_ms], "restart", "a step at a whole second is a run boundary"),
+                ([(race_ms + restart_ms) / 2.0], "unclear",
+                 "a step between the two is named as unclassifiable, not guessed"),
+                ([0.05, 5.0 * restart_ms], "restart",
+                 "the LARGEST step decides: jitter beside a restart is still a restart"),
+            ]
+            for steps, want, what in checks:
+                kind, sentence = describe(steps)
+                if kind != want:
+                    failures.append(f"case 26: {what} -- describe_backsteps({steps}) said"
+                                    f" {kind!r}, expected {want!r}")
+                if want == "unclear" and "more than one run" in sentence:
+                    failures.append("case 26: the unclassifiable band still asserts a second run")
 
     if failures:
         print("FAILURES:")

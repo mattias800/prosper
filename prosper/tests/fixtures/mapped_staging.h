@@ -10,6 +10,7 @@
 #include <tuple>
 #include <unordered_map>
 #include <vector>
+#include "gpu/diagnostics/gpu_memory_budget_vk.hpp"  // #3533: count what we hold on each heap
 
 namespace prosper::test {
 // #3405: texture staging blocks cached together WITH their CPU mapping.
@@ -157,18 +158,18 @@ inline MappedStagingBlock acquire_mapped_staging(VkDevice device, VkDeviceSize b
     VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     allocation.allocationSize = requirements.size;
     allocation.memoryTypeIndex = type;
-    if (vkAllocateMemory(device, &allocation, nullptr, &block.memory) != VK_SUCCESS) {
+    if (prosper::gpu::allocate_device_memory(device, &allocation, &block.memory) != VK_SUCCESS) {
         vkDestroyBuffer(device, block.buffer, nullptr);
         return {};
     }
     if (vkBindBufferMemory(device, block.buffer, block.memory, 0) != VK_SUCCESS) {
         vkDestroyBuffer(device, block.buffer, nullptr);
-        vkFreeMemory(device, block.memory, nullptr);
+        prosper::gpu::free_device_memory(device, block.memory);
         return {};
     }
     if (vkMapMemory(device, block.memory, 0, VK_WHOLE_SIZE, 0, &block.mapped) != VK_SUCCESS ||
         !block.mapped) {
-        vkFreeMemory(device, block.memory, nullptr);
+        prosper::gpu::free_device_memory(device, block.memory);
         vkDestroyBuffer(device, block.buffer, nullptr);
         return {};
     }
@@ -214,7 +215,7 @@ inline bool make_mapped_staging_room(MappedStagingCache& cache, VkDevice device,
         trace_mapped_staging_event(cache, "evict-idle", key, block.memory);
         vkUnmapMemory(device, block.memory);
         vkDestroyBuffer(device, block.buffer, nullptr);
-        vkFreeMemory(device, block.memory, nullptr);
+        prosper::gpu::free_device_memory(device, block.memory);
     }
     return true;
 }
@@ -264,7 +265,7 @@ inline bool release_mapped_staging(VkDevice device, VkBuffer buffer, VkDeviceMem
         trace_mapped_staging_event(cache, discard, key, memory);
         vkUnmapMemory(device, memory);
         vkDestroyBuffer(device, buffer, nullptr);
-        vkFreeMemory(device, memory, nullptr);
+        prosper::gpu::free_device_memory(device, memory);
         return true;
     }
     auto idle = block;

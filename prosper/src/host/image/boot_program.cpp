@@ -73,16 +73,37 @@ std::vector<std::string> discover_extra_plugin_modules(
     for (const auto& b : listed_basenames) listed.push_back(lower(b));
 
     std::error_code ec;
-    const std::string dir = resolve_host_path_case(dump_root + "/Media/Plugins");
-    if (!fs::is_directory(fs::path(dir), ec)) return found;
-    for (const auto& e : fs::directory_iterator(dir, fs::directory_options::skip_permission_denied, ec)) {
-        if (!e.is_regular_file(ec)) continue;
-        const std::string name = e.path().filename().string();
-        const std::string lname = lower(name);
-        if (lname.size() < 5 || lname.compare(lname.size() - 4, 4, ".prx") != 0) continue;
-        bool already = false;
-        for (const auto& l : listed) if (l == lname) { already = true; break; }
-        if (!already) found.push_back(e.path().string());
+    // Two locations, because titles disagree about where their own native modules live. Unity puts
+    // them under `Media/Plugins`; Darksiders II (PPSA23806) ships steam_api_ps5.prx,
+    // THQGDSCore_Prospero_Release.prx, thqno_api_ps5.prx and psnwrapperreleaseprospero.prx directly
+    // beside eboot.bin. Scanning only the first left that title's OWN middleware unlinked while
+    // prosper's return-0 stub answered for it, and the guest nulled an object pointer on the back of
+    // that zero and dereferenced it (#3497).
+    //
+    // The dump root is NOT a blanket widening: `module_path_policy` still refuses a Sony-named
+    // module here exactly as it does under `Media/`, so a dump cannot substitute a Sony library by
+    // dropping it beside eboot.bin. Only `.prx` is taken, so eboot.bin and loose data files are not
+    // candidates in the first place.
+    const std::string dirs[] = {
+        resolve_host_path_case(dump_root + "/Media/Plugins"),
+        resolve_host_path_case(dump_root),
+    };
+    for (const std::string& dir : dirs) {
+        if (!fs::is_directory(fs::path(dir), ec)) continue;
+        for (const auto& e : fs::directory_iterator(dir, fs::directory_options::skip_permission_denied, ec)) {
+            if (!e.is_regular_file(ec)) continue;
+            const std::string name = e.path().filename().string();
+            const std::string lname = lower(name);
+            if (lname.size() < 5 || lname.compare(lname.size() - 4, 4, ".prx") != 0) continue;
+            bool already = false;
+            for (const auto& l : listed) if (l == lname) { already = true; break; }
+            // A file present in BOTH locations must be offered once. Compare by basename against
+            // what has already been found, not only against `listed`.
+            if (!already)
+                for (const auto& f : found)
+                    if (lower(fs::path(f).filename().string()) == lname) { already = true; break; }
+            if (!already) found.push_back(e.path().string());
+        }
     }
     // directory_iterator order is filesystem-defined; sort so a boot is reproducible. DESCENDING by
     // lowercased basename, because the caller appends this block to a link list whose init functions
@@ -302,7 +323,7 @@ bool boot_program(const std::string& d, Program& p, std::string* err,
     std::vector<LinkInput> in = boot_link_inputs(d);
 
     std::string e;
-    if (!link_program(in, BOOT_STUB, p, &e)) return fail("link failed: " + e);
+    if (!link_program(in, BOOT_STUB, BOOT_IMPORT_DATA, p, &e)) return fail("link failed: " + e);
     // Loud, self-describing report of every auto-linked plugin the linker refused: which module was
     // dropped, the exact NID that collided, and which already-linked module owns it.
     for (const auto& s : p.skipped_modules)
@@ -324,10 +345,10 @@ bool boot_program(const std::string& d, Program& p, std::string* err,
         if (p.aliased_exports.size() > shown)
             printf("export alias: ... and %zu more\n", p.aliased_exports.size() - shown);
     }
-    printf("linked %zu modules; %zu imports (%zu cross-module, %zu stub slots); %zu init fns; "
-           "%zu aliased exports\n",
+    printf("linked %zu modules; %zu imports (%zu cross-module, %zu stub slots, %zu data slots); "
+           "%zu init fns; %zu aliased exports\n",
            p.mods.size(), p.total_imports, p.resolved_cross_module, p.slots.size(),
-           p.init_fns.size(), p.aliased_exports.size());
+           p.data_slots.size(), p.init_fns.size(), p.aliased_exports.size());
 
     // Diagnostics: linking complete.
     diagnostics::record_boot_phase(diagnostics::BootPhase::LINKING);
@@ -379,6 +400,12 @@ bool boot_program(const std::string& d, Program& p, std::string* err,
     // is synchronised either way (dispatch_append_slots), this just avoids the copy.
     p.slots.reserve(p.slots.size() + 1024);
     if (!install_stubs(p.slots, p.stub_base, p.stub_size, &e)) return fail("stubs failed: " + e);
+    // The writable aperture behind every unresolved DATA import (#3529). Installed here rather than
+    // lazily: the guest reaches a data import during the very first init_array below (libc's own
+    // startup writes __stack_chk_guard), so the pages must exist before run_guest_inits runs.
+    p.data_slots.reserve(p.data_slots.size() + 128);
+    if (!install_import_data(p.data_slots, p.data_base, p.data_stride, &e))
+        return fail("import data failed: " + e);
     install_trap_handler();
 
     // Diagnostics: stubs and trap handler installed.

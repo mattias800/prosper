@@ -13,7 +13,9 @@
 #include "shared/live/gpu_retile.hpp"
 #include "shared/rtt/rtt_scale.hpp"
 #include "shared/rtt/rtt_authority.hpp"
+#include "shared/device/pipeline_cache_file.hpp"  // #3425: one checked envelope for both stages
 #include "shared/device/vulkan_device_select.hpp"
+#include "shared/device/image_robustness.hpp"  // #3531: the recompiler's OOB image-read contract
 #include "shared/texture/write_watch_census.hpp"
 #include "shared/texture/write_watch_policy.hpp"
 #include "diagnostics/env_numeric.hpp"   // #3253: a typo must not select a different setting
@@ -21,9 +23,12 @@
 #include "shared/perf/performance_timing_policy.hpp" // F8 measures without enabling verbose timing logs
 
 #include "gpu/texture/bc_decode.hpp"
+#include "gpu/diagnostics/vk_object_names.hpp"   // #3578
 #include "gpu/capture/gpu_capture.hpp"
+#include "gpu/diagnostics/gpu_memory_budget_vk.hpp"  // #3533: how much of the heap does prosper hold?
 #include "gpu/execute/gpu_execute.hpp"
 #include "gpu/execute/host_read_barrier.hpp"  // #3249: a host read of a dispatch result needs an availability op
+#include "gpu/execute/float_controls_probe.hpp"  // #3479: the device gate on SignedZeroInfNanPreserve
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_cf9200_contract.hpp"
 #include "gpu/resources/shader_resources.hpp"
@@ -79,20 +84,14 @@ bool compute_pipeline_cache_blob_compatible(
     const uint8_t* pipeline_cache_uuid, size_t uuid_bytes) {
     // VkPipelineCacheHeaderVersionOne is a serialized five-field prefix. Avoid casting untrusted
     // file bytes to the structure so short and unaligned files are rejected before any read.
-    constexpr size_t scalar_bytes = 4u * sizeof(uint32_t);
-    constexpr size_t prefix_bytes = scalar_bytes + VK_UUID_SIZE;
-    if (!blob || !pipeline_cache_uuid || uuid_bytes != VK_UUID_SIZE ||
-        blob_bytes < prefix_bytes)
-        return false;
-    uint32_t header_size = 0, header_version = 0, cached_vendor = 0, cached_device = 0;
-    std::memcpy(&header_size, blob + 0u * sizeof(uint32_t), sizeof(uint32_t));
-    std::memcpy(&header_version, blob + 1u * sizeof(uint32_t), sizeof(uint32_t));
-    std::memcpy(&cached_vendor, blob + 2u * sizeof(uint32_t), sizeof(uint32_t));
-    std::memcpy(&cached_device, blob + 3u * sizeof(uint32_t), sizeof(uint32_t));
-    return header_size >= prefix_bytes && header_size <= blob_bytes &&
-           header_version == VK_PIPELINE_CACHE_HEADER_VERSION_ONE &&
-           cached_vendor == vendor_id && cached_device == device_id &&
-           std::memcmp(blob + scalar_bytes, pipeline_cache_uuid, VK_UUID_SIZE) == 0;
+    // The decode itself lives in PipelineCacheFile so the graphics and compute paths cannot drift
+    // apart; this wrapper keeps the exported name and its own regression coverage.
+    if (!blob || !pipeline_cache_uuid || uuid_bytes != VK_UUID_SIZE) return false;
+    PipelineCacheFile identity;
+    identity.device.vendorID = vendor_id;
+    identity.device.deviceID = device_id;
+    std::memcpy(identity.device.pipelineCacheUUID, pipeline_cache_uuid, VK_UUID_SIZE);
+    return identity.compatible(std::span<const uint8_t>(blob, blob_bytes));
 }
 
 LiveComputeBufferDescriptorPlan plan_live_compute_buffer_descriptors(
@@ -1420,14 +1419,30 @@ VkDeviceSize compute_memory_pool_limit() {
     return limit;
 }
 
+// What the compute device this process runs on offers the recompiled storage-image path (#3531).
+// Written once by VulkanComputeContext::init(), on whichever of the two device paths it took, and
+// read by live_compute_storage_image_device(). A record rather than a member because the context is
+// constructed lazily at the first dispatch: a caller asking "did the shipped init acquire image
+// robustness?" must not be the thing that decides whether init has happened.
+LiveComputeStorageImageDevice& mutable_storage_image_device() {
+    static LiveComputeStorageImageDevice record;
+    return record;
+}
+
 struct VulkanComputeContext {
     VkInstance instance = VK_NULL_HANDLE;
     VkPhysicalDevice physical = VK_NULL_HANDLE;
     VkDevice device = VK_NULL_HANDLE;
     VkQueue queue = VK_NULL_HANDLE;
     VkPipelineCache pipeline_cache = VK_NULL_HANDLE;
-    std::filesystem::path pipeline_cache_path;
-    std::mutex pipeline_cache_mutex;
+    PipelineCacheFile pipeline_cache_file;
+    // Bytes the driver ACCEPTED from disk when this device's cache was created; 0 means the run
+    // started cold. Written once during init, before any other thread can observe the context.
+    uint64_t pipeline_cache_loaded_bytes = 0;
+    // Timed, not plain: the shutdown snapshot runs on the main thread while a detached guest thread
+    // may still be inside vkCreateComputePipelines, and a driver compile that never returns must
+    // cost a missed save rather than an app that will not close (#3425).
+    std::timed_mutex pipeline_cache_mutex;
     VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
     // #3157: the GPU result-comparison pool, owned by the context so it is reset rather than
     // recreated per dispatch. It contributed about 144 vkCreateDescriptorPool + 144 vkDestroy per
@@ -1494,7 +1509,18 @@ struct VulkanComputeContext {
     // StorageImageRead/WriteWithoutFormat capabilities (raw uvec4 texel model — see
     // tests/fixtures/image_compute_runner.h, the exec-diff harness for that contract). When the device lacks
     // the features, image-binding dispatches are skipped loudly instead of creating an invalid device.
+    // Since #3531 it also requires image robustness: the recompiled read is issued for EXEC-inactive
+    // lanes whose coordinate may be out of range, which is defined only when the device enables
+    // robustImageAccess. `image_support` is assigned from `storage_image_features` and from nowhere
+    // else, on BOTH device paths, so the capability and the feature acquisition cannot drift apart.
     bool image_support = false;
+    // What the device this backend runs on actually offers the storage-image path. Written only by
+    // init(), from prosper::frontend::acquire_storage_image_device_features() on the own-device path
+    // and from the adopted device's published capabilities on the shared path. Exposed through
+    // live_compute_storage_image_device_features() so a test can assert the SHIPPED init acquired
+    // the feature, rather than asserting that some copy of the code would have.
+    prosper::frontend::StorageImageDeviceFeatures storage_image_features{};
+    bool storage_image_device_adopted = false;
     // Stage 1 of the descriptor lift (#2412): true when this compute device can express an indexed
     // descriptor array. Assigned on the own-device path below, and inherited from SharedVulkanContext on
     // the adopt path -- both are real assignments. An earlier revision of this comment claimed the
@@ -1515,77 +1541,27 @@ struct VulkanComputeContext {
     // VK_ERROR_DEVICE_LOST is permanent for a VkDevice. Keep the first failure latched so later
     // PM4 dispatches cannot spend minutes rebuilding resources and submitting work that Vulkan is
     // required to reject. AGC submit execution serializes access to this context.
-    bool device_lost = false;
+    std::atomic<bool> device_lost{false};
     // A queue API was entered and no fence or queue-idle result proved completion. The current item
     // and this context then retain objects that Vulkan may still own; neither may be destroyed.
-    bool completion_unproven = false;
+    std::atomic<bool> completion_unproven{false};
 
-    std::filesystem::path persistent_pipeline_cache_path() const {
-        if (std::getenv("PROSPER_NO_DISK_PIPELINE_CACHE")) return {};
-        if (const char* explicit_path = std::getenv("PROSPER_COMPUTE_PIPELINE_CACHE_PATH")) {
-            if (*explicit_path) return std::filesystem::path(explicit_path);
-            return {};
-        }
+    bool create_pipeline_cache() {
+        VkPhysicalDeviceProperties properties{};
+        vkGetPhysicalDeviceProperties(physical, &properties);
         // Loading a driver-produced cache blob is not yet a safe default. Repeated GTA V runs on
         // NVIDIA reproduced an nvoglv64.dll crash only on the cache-load route; UUID/header
         // validation proves device compatibility, not that the vendor blob itself is robust. Keep
         // persistence available for controlled measurements, but require an explicit opt-in until
-        // that driver failure has a guarded reproducer.
-        if (!std::getenv("PROSPER_DISK_PIPELINE_CACHE")) return {};
-        const char* base = nullptr;
-        [[maybe_unused]] bool base_is_home = false;
-#ifdef _WIN32
-        base = std::getenv("LOCALAPPDATA");
-#else
-        base = std::getenv("XDG_CACHE_HOME");
-        if (!base || !*base) {
-            base = std::getenv("HOME");
-            base_is_home = true;
-        }
-#endif
-        if (!base || !*base) return {};
-        VkPhysicalDeviceProperties properties{};
-        vkGetPhysicalDeviceProperties(physical, &properties);
-        char identity[160]{};
-        char* out = identity;
-        const size_t remaining = sizeof(identity);
-        const int prefix = std::snprintf(
-            out, remaining, "compute-vkcache-v1-%08x-%08x-",
-            properties.vendorID, properties.deviceID);
-        if (prefix < 0 || static_cast<size_t>(prefix) >= remaining) return {};
-        out += prefix;
-        for (uint8_t byte : properties.pipelineCacheUUID) {
-            const int written = std::snprintf(out,
-                static_cast<size_t>(identity + sizeof(identity) - out), "%02x", byte);
-            if (written != 2) return {};
-            out += 2;
-        }
-        std::filesystem::path directory(base);
-#ifndef _WIN32
-        if (base_is_home) directory /= ".cache";
-#endif
-        return directory / "prosper" / identity;
-    }
-
-    bool create_pipeline_cache() {
-        pipeline_cache_path = persistent_pipeline_cache_path();
+        // that driver failure has a guarded reproducer. PipelineCacheFile owns that policy for
+        // both stages, so graphics and compute cannot drift apart on it.
         std::vector<uint8_t> initial;
-        VkPhysicalDeviceProperties properties{};
-        vkGetPhysicalDeviceProperties(physical, &properties);
-        if (!pipeline_cache_path.empty()) {
-            std::error_code ec;
-            const uintmax_t bytes = std::filesystem::file_size(pipeline_cache_path, ec);
-            constexpr uintmax_t max_cache_bytes = 256ull * 1024ull * 1024ull;
-            if (!ec && bytes && bytes <= max_cache_bytes) {
-                initial.resize(static_cast<size_t>(bytes));
-                std::ifstream input(pipeline_cache_path, std::ios::binary);
-                input.read(reinterpret_cast<char*>(initial.data()),
-                           static_cast<std::streamsize>(initial.size()));
-                if (!input || !compute_pipeline_cache_blob_compatible(
-                        initial.data(), initial.size(), properties.vendorID,
-                        properties.deviceID, properties.pipelineCacheUUID, VK_UUID_SIZE))
-                    initial.clear();
-            }
+        try {
+            pipeline_cache_file = PipelineCacheFile::compute(properties);
+            initial = pipeline_cache_file.load();
+        } catch (const std::exception&) {
+            std::fprintf(stderr, "[compute] disk pipeline cache unavailable; starting empty\n");
+            initial.clear();
         }
         VkPipelineCacheCreateInfo pcci{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
         pcci.initialDataSize = initial.size();
@@ -1600,66 +1576,61 @@ struct VulkanComputeContext {
             initial.clear();
         }
         if (result != VK_SUCCESS) return false;
-        if (!pipeline_cache_path.empty())
+        pipeline_cache_loaded_bytes = initial.size();
+        if (!pipeline_cache_file.path.empty())
             std::fprintf(stderr, "[compute] disk pipeline cache %s: %s (%zu bytes)\n",
                          initial.empty() ? "cold" : "loaded",
-                         pipeline_cache_path.string().c_str(), initial.size());
+                         pipeline_cache_file.path.string().c_str(), initial.size());
         return true;
     }
 
-    void persist_pipeline_cache() {
-        if (!pipeline_cache || pipeline_cache_path.empty() || device_lost ||
-            completion_unproven)
-            return;
-        // VkPipelineCache is externally synchronized. The frontend's _Exit flush can overlap the
-        // last guest dispatch even after a cooperative-stop request, so serialize it against every
-        // vkCreateComputePipelines call that mutates the cache.
-        std::lock_guard<std::mutex> cache_lock(pipeline_cache_mutex);
-        size_t bytes = 0;
-        if (vkGetPipelineCacheData(device, pipeline_cache, &bytes, nullptr) != VK_SUCCESS ||
-            !bytes || bytes > 256ull * 1024ull * 1024ull)
-            return;
-        std::vector<uint8_t> blob(bytes);
-        if (vkGetPipelineCacheData(device, pipeline_cache, &bytes, blob.data()) != VK_SUCCESS)
-            return;
-        blob.resize(bytes);
-        VkPhysicalDeviceProperties properties{};
-        vkGetPhysicalDeviceProperties(physical, &properties);
-        if (!compute_pipeline_cache_blob_compatible(
-                blob.data(), blob.size(), properties.vendorID, properties.deviceID,
-                properties.pipelineCacheUUID, VK_UUID_SIZE))
-            return;
-        std::error_code ec;
-        std::filesystem::create_directories(pipeline_cache_path.parent_path(), ec);
-        if (ec) return;
-        const auto nonce = std::chrono::steady_clock::now().time_since_epoch().count();
-        std::filesystem::path temporary = pipeline_cache_path;
-        temporary += ".tmp-" + std::to_string(nonce);
-        {
-            std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
-            output.write(reinterpret_cast<const char*>(blob.data()),
-                         static_cast<std::streamsize>(blob.size()));
-            output.flush();
-            if (!output) {
-                output.close();
-                std::filesystem::remove(temporary, ec);
-                return;
+    // Snapshot the driver cache WITHOUT tearing the context down, so a frontend that leaves through
+    // _Exit still persists what this run compiled (#3425). Returns whether the file was written, so
+    // a caller and a test can tell "nothing to save" from "the save was declined".
+    //
+    // `lock_budget` bounds the wait deliberately: on the shutdown path a detached guest thread may
+    // still be inside vkCreateComputePipelines, and a compile that never returns must cost a missed
+    // cache rather than an app that cannot close.
+    bool persist_pipeline_cache(
+            std::chrono::milliseconds lock_budget = std::chrono::milliseconds(1000)) {
+        if (!pipeline_cache || pipeline_cache_file.path.empty()) return false;
+        // Read once, and read the atomics: this runs on the main thread while the guest thread may
+        // still be writing them. A lost device or an unproven completion means Vulkan may still own
+        // objects here, so touching the cache handle at all is unsafe.
+        if (device_lost.load(std::memory_order_acquire) ||
+            completion_unproven.load(std::memory_order_acquire)) {
+            std::fprintf(stderr, "[compute] disk pipeline cache save skipped: device state unproven\n");
+            return false;
+        }
+        try {
+            std::vector<uint8_t> blob;
+            {
+                // VkPipelineCache is externally synchronized: serialize against every
+                // vkCreateComputePipelines call that mutates it.
+                std::unique_lock<std::timed_mutex> lock(pipeline_cache_mutex, std::defer_lock);
+                if (!lock.try_lock_for(lock_budget)) {
+                    std::fprintf(stderr,
+                                 "[compute] disk pipeline cache save skipped: compilation busy\n");
+                    return false;
+                }
+                size_t bytes = 0;
+                if (vkGetPipelineCacheData(device, pipeline_cache, &bytes, nullptr) != VK_SUCCESS ||
+                    !bytes || bytes > PipelineCacheFile::max_bytes)
+                    return false;
+                blob.resize(bytes);
+                if (vkGetPipelineCacheData(device, pipeline_cache, &bytes, blob.data()) != VK_SUCCESS)
+                    return false;
+                blob.resize(bytes);
             }
+            const bool saved = pipeline_cache_file.save(blob);
+            std::fprintf(stderr, "[compute] disk pipeline cache %s: %s (%zu bytes)\n",
+                         saved ? "saved" : "save failed",
+                         pipeline_cache_file.path.string().c_str(), blob.size());
+            return saved;
+        } catch (const std::exception&) {
+            std::fprintf(stderr, "[compute] disk pipeline cache save failed\n");
+            return false;
         }
-        std::filesystem::rename(temporary, pipeline_cache_path, ec);
-        if (ec) {
-            ec.clear();
-            std::filesystem::remove(pipeline_cache_path, ec);
-            ec.clear();
-            std::filesystem::rename(temporary, pipeline_cache_path, ec);
-        }
-        if (ec) {
-            ec.clear();
-            std::filesystem::remove(temporary, ec);
-            return;
-        }
-        std::fprintf(stderr, "[compute] disk pipeline cache saved: %s (%zu bytes)\n",
-                     pipeline_cache_path.string().c_str(), blob.size());
     }
 
     ~VulkanComputeContext() {
@@ -1834,7 +1805,7 @@ struct VulkanComputeContext {
             for (VkDeviceMemory allocation : allocations) {
                 if (memory_pool.persistent_mappings.erase(allocation))
                     vkUnmapMemory(device, allocation);
-                vkFreeMemory(device, allocation, nullptr);
+                prosper::gpu::free_device_memory(device, allocation);
                 ++released;
             }
         }
@@ -1858,7 +1829,11 @@ struct VulkanComputeContext {
         auto allocate = [&](const VkMemoryAllocateInfo& info, VkDeviceMemory* result) {
             const auto injected = setup_status ? g_next_retile_allocation_for_test.exchange(
                 VK_SUCCESS, std::memory_order_acq_rel) : VK_SUCCESS;
-            return injected != VK_SUCCESS ? injected : vkAllocateMemory(device, &info, nullptr, result);
+            if (injected != VK_SUCCESS) return injected;
+            // Counted HERE, at the one place a driver allocation really happens. The pool above
+            // recycles allocations, so counting in allocate_memory's body would measure prosper's
+            // churn rather than its footprint -- the opposite of the question (#3533).
+            return prosper::gpu::allocate_device_memory(device, &info, result);
         };
         auto map = [&](VkDeviceMemory allocation, VkDeviceSize size, void** mapping) {
             const auto injected = setup_status ? g_next_retile_mapping_for_test.exchange(
@@ -1932,6 +1907,8 @@ struct VulkanComputeContext {
             }
         }
         if (setup_status) *setup_status = allocation_result;
+        // The budget reports the failure from inside allocate_device_memory, which is the only
+        // place that sees every one of them (#3533).
         if (allocation_result != VK_SUCCESS) return VK_NULL_HANDLE;
         if (compute_memory_pool_enabled()) {
             std::lock_guard<std::mutex> lock(memory_pool.mutex);
@@ -1973,7 +1950,7 @@ struct VulkanComputeContext {
     void release_memory(VkDeviceMemory allocation) {
         if (!allocation) return;
         if (!compute_memory_pool_enabled()) {
-            vkFreeMemory(device, allocation, nullptr);
+            prosper::gpu::free_device_memory(device, allocation);
             return;
         }
         std::lock_guard<std::mutex> lock(memory_pool.mutex);
@@ -1981,7 +1958,7 @@ struct VulkanComputeContext {
         if (found == memory_pool.active.end()) {
             if (memory_pool.persistent_mappings.erase(allocation))
                 vkUnmapMemory(device, allocation);
-            vkFreeMemory(device, allocation, nullptr);
+            prosper::gpu::free_device_memory(device, allocation);
             return;
         }
         const ComputeMemoryKey key = found->second;
@@ -1994,7 +1971,7 @@ struct VulkanComputeContext {
             ++memory_pool.discarded;
             if (memory_pool.persistent_mappings.erase(allocation))
                 vkUnmapMemory(device, allocation);
-            vkFreeMemory(device, allocation, nullptr);
+            prosper::gpu::free_device_memory(device, allocation);
             return;
         }
         memory_pool.available[key].push_back(allocation);
@@ -2016,14 +1993,14 @@ struct VulkanComputeContext {
             for (VkDeviceMemory allocation : allocations) {
                 if (memory_pool.persistent_mappings.erase(allocation))
                     vkUnmapMemory(device, allocation);
-                vkFreeMemory(device, allocation, nullptr);
+                prosper::gpu::free_device_memory(device, allocation);
             }
         }
         for (const auto& [allocation, key] : memory_pool.active) {
             (void)key;
             if (memory_pool.persistent_mappings.erase(allocation))
                 vkUnmapMemory(device, allocation);
-            vkFreeMemory(device, allocation, nullptr);
+            prosper::gpu::free_device_memory(device, allocation);
         }
         memory_pool.available.clear();
         memory_pool.active.clear();
@@ -3216,6 +3193,10 @@ struct VulkanComputeContext {
         smci.pCode = spirv.data();
         if (vkCreateShaderModule(device, &smci, nullptr, &compare_shader) != VK_SUCCESS)
             return false;
+        // #3578: prosper's OWN helper kernels get names too. In a capture these sit among the guest's
+        // dispatches and are the ones most easily mistaken for game work.
+        prosper::gpu::vk_name_object(device, VK_OBJECT_TYPE_SHADER_MODULE, (uint64_t)compare_shader,
+                                     "prosper compare_uvec4");
         VkPushConstantRange push{};
         push.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
         push.size = sizeof(uint32_t);
@@ -3233,7 +3214,7 @@ struct VulkanComputeContext {
         cpci.stage.module = compare_shader;
         cpci.stage.pName = "main";
         cpci.layout = compare_pipeline_layout;
-        std::lock_guard<std::mutex> cache_lock(pipeline_cache_mutex);
+        std::lock_guard<std::timed_mutex> cache_lock(pipeline_cache_mutex);
         return vkCreateComputePipelines(device, pipeline_cache, 1, &cpci, nullptr,
                                         &compare_pipeline) == VK_SUCCESS;
     }
@@ -3292,7 +3273,19 @@ struct VulkanComputeContext {
             queue = static_cast<VkQueue>(shared.queue);
             queue_family = shared.queue_family;
             borrowed = true;
-            image_support = true;
+            // Storage-image capability is INHERITED, never assumed (#3531). The adopt condition above
+            // already required the two format-free features; image robustness is the third term of the
+            // same contract, and the renderer publishes whether it enabled it. Adoption itself still
+            // proceeds — a second private device would be no more robust than the first, and sharing
+            // is what lets a dispatch bind a renderer-owned image at all — but the storage-image path
+            // is declined loudly instead of executing the recompiler's deliberate out-of-range reads
+            // against a device where they are undefined.
+            storage_image_features = prosper::frontend::storage_image_device_features(
+                shared.image_robustness, shared.storage_image_read_without_format,
+                shared.storage_image_write_without_format);
+            storage_image_device_adopted = true;
+            image_support = storage_image_features.storage_image_capable();
+            mutable_storage_image_device() = {storage_image_features, true, true};
             // Inherit the descriptor-indexing capability from the device being adopted. Its absence was
             // the blocking review finding on #2458: the flag stayed false on the shared path -- which is
             // the normal path whenever a renderer exists -- even though the adopted device had the
@@ -3309,6 +3302,8 @@ struct VulkanComputeContext {
             max_native_subgroup_size = shared.max_compute_subgroup_size;
             if (create_pipeline_cache()) {
                 vkGetPhysicalDeviceMemoryProperties(physical, &memory);
+                prosper::gpu::set_device_heaps(memory);
+                prosper::gpu::report_device_memory("adopted device");
                 query_subgroup_support();
                 std::fprintf(stderr, "[compute] Vulkan device: adopted the renderer's device "
                                      "(shared, queue family %u)\n", queue_family);
@@ -3323,6 +3318,24 @@ struct VulkanComputeContext {
                 std::fprintf(stderr, "[compute] storage-buffer int64 atomics %s "
                                      "(inherited from the adopted device)\n",
                              shared.storage_buffer_int64_atomics ? "ENABLED" : "unavailable");
+                // Read, never re-measured: the renderer that owns this device already published
+                // its float contract to the recompiler, and a second publisher of the same device
+                // could only repeat it. Printed anyway, because this backend's own log is where a
+                // reader looks to find out whether a black graded frame is the device's doing
+                // (#3479), and a capability visible only in another component's log is the shape
+                // #2458 shipped.
+                std::fprintf(stderr, "[compute] SignedZeroInfNanPreserve %s "
+                                     "(inherited from the adopted device)\n",
+                             prosper::gpu::signed_zero_inf_nan_preserve_declared()
+                                 ? "ENABLED" : "unavailable");
+                // Same both-directions rule for the OOB image contract (#3531). "unavailable" here
+                // means every storage-image dispatch will be declined, which is a large behavioural
+                // difference that must be readable from the log rather than inferred from a black
+                // frame.
+                std::fprintf(stderr, "[compute] image robustness %s -> recompiled storage-image "
+                                     "dispatches %s (inherited from the adopted device)\n",
+                             storage_image_features.robust_image_access ? "ENABLED" : "unavailable",
+                             image_support ? "enabled" : "DECLINED");
                 // Same both-directions rule, one field over -- and this one decides whether a whole
                 // class of kernel can compile at all. A shader that reads VCC or EXEC as scalar DATA
                 // is materialised from subgroupBallot, and only when the native subgroup IS the guest
@@ -3348,6 +3361,7 @@ struct VulkanComputeContext {
             instance = VK_NULL_HANDLE; physical = VK_NULL_HANDLE;
             device = VK_NULL_HANDLE; queue = VK_NULL_HANDLE;
             queue_family = UINT32_MAX; borrowed = false; image_support = false;
+            storage_image_features = {}; storage_image_device_adopted = false;
             native_subgroup_contract = false;
             min_native_subgroup_size = max_native_subgroup_size = 0;
             pipeline_cache = VK_NULL_HANDLE;
@@ -3392,10 +3406,12 @@ struct VulkanComputeContext {
         enabled.shaderInt64 = supported.shaderInt64;
         // The standalone device must enable the same gather capability as the shared renderer.
         enabled.shaderImageGatherExtended = supported.shaderImageGatherExtended;
-        // Image bindings (#590): enable the format-free storage-image features when available.
-        image_support = supported.shaderStorageImageReadWithoutFormat &&
-                        supported.shaderStorageImageWriteWithoutFormat;
-        if (image_support) {
+        // Image bindings (#590): enable the format-free storage-image features when available. The
+        // third term of the contract -- image robustness -- is acquired below, once the
+        // VkDeviceCreateInfo exists to chain it into.
+        const bool format_free_storage_images = supported.shaderStorageImageReadWithoutFormat &&
+                                                supported.shaderStorageImageWriteWithoutFormat;
+        if (format_free_storage_images) {
             enabled.shaderStorageImageReadWithoutFormat = VK_TRUE;
             enabled.shaderStorageImageWriteWithoutFormat = VK_TRUE;
         }
@@ -3437,6 +3453,20 @@ struct VulkanComputeContext {
         // allows replaying modules compiled against a known feature contract.
         std::fprintf(stderr, "[compute] storage-buffer int64 atomics %s (own device, core feature)\n",
                      private_storage_buffer_int64_atomics ? "ENABLED" : "unavailable");
+        // Image robustness (#3531). This device executes the SAME recompiled kernels as the
+        // renderer's, and those kernels read out of range from EXEC-inactive lanes by construction;
+        // the renderer chained this feature and this path did not, so every storage-image dispatch on
+        // a run with no live renderer -- boot_trace registers compute unconditionally, and one such
+        // run executed ~135,000 dispatches -- was undefined behaviour. Chained last so it extends
+        // whatever pNext chain the features above built, and declared here so it outlives
+        // vkCreateDevice.
+        VkPhysicalDeviceImageRobustnessFeatures image_robustness_features{};
+        storage_image_features = prosper::frontend::acquire_storage_image_device_features(
+            "compute", physical, format_free_storage_images, format_free_storage_images,
+            image_robustness_features, dci);
+        storage_image_device_adopted = false;
+        image_support = storage_image_features.storage_image_capable();
+        mutable_storage_image_device() = {storage_image_features, false, true};
 #ifdef __APPLE__
         // Spec-mandated on MoltenVK: enable VK_KHR_portability_subset when advertised (always is).
         { uint32_t ne = 0; vkEnumerateDeviceExtensionProperties(physical, nullptr, &ne, nullptr);
@@ -3448,10 +3478,19 @@ struct VulkanComputeContext {
         dci.enabledExtensionCount = (uint32_t)dev_exts.size();
         dci.ppEnabledExtensionNames = dev_exts.empty() ? nullptr : dev_exts.data();
         if (vkCreateDevice(physical, &dci, nullptr, &device) != VK_SUCCESS) return false;
+        // Same measurement the renderer makes, for the same reason image robustness is acquired
+        // here through a shared helper (#3531): this device executes the SAME recompiled modules,
+        // and a module declaring a capability only one of the two devices can take is invalid on
+        // the other. Publishers are ANDed, so whichever device is weaker decides (#3479).
+        prosper::gpu::publish_device_float_controls(
+            "compute", physical, kVulkanRuntimeVersion,
+            /*float_controls_extension_enabled=*/false);
         vkGetDeviceQueue(device, queue_family, 0, &queue);
         if (!create_pipeline_cache())
             return false;
         vkGetPhysicalDeviceMemoryProperties(physical, &memory);
+        prosper::gpu::set_device_heaps(memory);
+        prosper::gpu::report_device_memory("own device");
         query_subgroup_support();
         return true;
     }
@@ -3471,7 +3510,9 @@ struct VulkanComputeContext {
 
 };
 
-VulkanComputeContext* g_live_compute_context = nullptr;
+// Published with release / read with acquire: prosper-app's shutdown snapshot reads this from
+// the MAIN thread while the guest thread is still dispatching (#3425).
+std::atomic<VulkanComputeContext*> g_live_compute_context{nullptr};
 std::atomic<uint64_t> g_sampled_image_upload_skips{0};
 std::atomic<uint64_t> g_cpu_fill_dispatches{0};
 
@@ -6384,11 +6425,24 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         return true;
     }
     if (has_storage_images && !ctx.image_support) {
+        // Name which term of the contract is missing. The two causes need different actions -- a
+        // device without the format-free features cannot express the texel model at all, while one
+        // without image robustness could execute the kernel and would be undefined doing it (#3531) --
+        // and a message naming only the first sent a reader looking at the wrong feature.
+        const bool robustness_only = ctx.storage_image_features.read_without_format &&
+                                     ctx.storage_image_features.write_without_format &&
+                                     !ctx.storage_image_features.robust_image_access;
         static bool warned = false;
         if (!warned) { warned = true;
-            std::fprintf(stderr, "[compute] device lacks shaderStorageImageRead/WriteWithoutFormat; "
-                                 "image-binding dispatches are skipped\n"); }
-        return decline("device-lacks-storage-image");
+            if (robustness_only)
+                std::fprintf(stderr, "[compute] device lacks robustImageAccess; image-binding "
+                                     "dispatches are skipped rather than executing the "
+                                     "recompiler's out-of-range reads undefined (#3531)\n");
+            else
+                std::fprintf(stderr, "[compute] device lacks shaderStorageImageRead/WriteWithoutFormat; "
+                                     "image-binding dispatches are skipped\n"); }
+        return decline(robustness_only ? "device-lacks-image-robustness"
+                                       : "device-lacks-storage-image");
     }
     std::sort(descriptors.begin(), descriptors.end(), [](const auto& a, const auto& b) {
         return a.binding < b.binding;
@@ -7392,7 +7446,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         image_descriptors[i].sampled_float &&
                         std::getenv("PROSPER_NO_GPU_PACKED_RTT") == nullptr;
                     if (packed10_copy) {
-                        std::lock_guard<std::mutex> cache_lock(ctx.pipeline_cache_mutex);
+                        std::lock_guard<std::timed_mutex> cache_lock(ctx.pipeline_cache_mutex);
                         auto& conversion = ctx.packed_rtt_conversion;
                         const VkResult injected = g_next_packed_rtt_setup_result_for_test.exchange(
                             VK_SUCCESS, std::memory_order_acq_rel);
@@ -9628,8 +9682,19 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 auto& retile = array ? ctx.paired16_retile_pipeline :
                     volume ? ctx.volume_retile_pipeline : ctx.retile_pipeline;
                 auto prepare = [&] {
-                    if (!vk_soft_ok(retile.initialize(ctx.device, ctx.pipeline_cache, bi.retile_parameters.kind),
-                                    "retile-pipeline")) return false;
+                    // #3425: this creates a compute pipeline INTO the shared VkPipelineCache, which
+                    // Vulkan externally synchronizes. Every other creator here already takes this
+                    // lock (the packed-RTT conversion above, and the two dispatch pipelines); this
+                    // one did not, and the shutdown snapshot is now a real concurrent reader of the
+                    // same handle rather than only a destructor that runs when nothing else can.
+                    bool retile_ready = false;
+                    {
+                        std::lock_guard<std::timed_mutex> cache_lock(ctx.pipeline_cache_mutex);
+                        retile_ready = vk_soft_ok(
+                            retile.initialize(ctx.device, ctx.pipeline_cache,
+                                              bi.retile_parameters.kind), "retile-pipeline");
+                    }
+                    if (!retile_ready) return false;
                     VkBufferCreateInfo ci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
                     ci.size = bi.retile_parameters.tiled_bytes;
                     ci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
@@ -9848,6 +9913,13 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             }
             if (!vk_ok(vkCreateShaderModule(ctx.device, &smci, nullptr, &shader), "shader-module"))
                 break;
+            // #3578: the guest compute program's own address is the identity every other diagnostic
+            // in this file already prints (`[compute] ... code_addr=`), so a capture and a log now
+            // use the same word for the same object. No-op without VK_EXT_debug_utils.
+            prosper::gpu::vk_name_objectf(
+                ctx.device, VK_OBJECT_TYPE_SHADER_MODULE, (uint64_t)shader,
+                "guest cs 0x%llx spv=%016llx", (unsigned long long)item.code_addr,
+                (unsigned long long)prosper::gpu::vk_name_spirv_digest(spirv.data(), spirv.size()));
             VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
             plci.setLayoutCount = 1;
             plci.pSetLayouts = &descriptor_layout;
@@ -9889,7 +9961,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                               low_latency_compile ? "disabled-for-cold-latency" : "driver-default");
             VkResult pipeline_result = VK_SUCCESS;
             {
-                std::lock_guard<std::mutex> cache_lock(ctx.pipeline_cache_mutex);
+                std::lock_guard<std::timed_mutex> cache_lock(ctx.pipeline_cache_mutex);
                 pipeline_result = vkCreateComputePipelines(
                     ctx.device, ctx.pipeline_cache, 1, &cpci, nullptr, &pipeline);
             }
@@ -12165,16 +12237,27 @@ void report_live_compute_timing_selector_summary() {
     runtime_compute_authority_census().report_summary();
 }
 
-void flush_live_compute_pipeline_cache() {
-    VulkanComputeContext* context = g_live_compute_context;
-    if (context) context->persist_pipeline_cache();
+bool flush_live_compute_pipeline_cache(std::chrono::milliseconds lock_budget) {
+    VulkanComputeContext* context = g_live_compute_context.load(std::memory_order_acquire);
+    return context && context->persist_pipeline_cache(lock_budget);
+}
+
+LiveComputePipelineCacheStatus live_compute_pipeline_cache_status() {
+    LiveComputePipelineCacheStatus status;
+    const VulkanComputeContext* context =
+        g_live_compute_context.load(std::memory_order_acquire);
+    if (!context) return status;
+    status.context_live = true;
+    status.persistence_configured = !context->pipeline_cache_file.path.empty();
+    status.loaded_bytes = context->pipeline_cache_loaded_bytes;
+    return status;
 }
 
 bool import_live_compute_storage_image(const prosper::gpu::ShaderResource& sampled_resource,
                                        uint64_t guest_bytes,
                                        LiveComputeImageImport& import) {
     import = {};
-    VulkanComputeContext* context = g_live_compute_context;
+    VulkanComputeContext* context = g_live_compute_context.load(std::memory_order_acquire);
     const bool ordinary_shape =
         ((sampled_resource.img_dim == 1 || sampled_resource.img_dim == 5) &&
          sampled_resource.depth == 1) ||
@@ -12337,6 +12420,10 @@ WriteWatchCensusSnapshot live_compute_write_watch_census() {
     return g_write_watch_census.snapshot();
 }
 
+LiveComputeStorageImageDevice live_compute_storage_image_device() {
+    return mutable_storage_image_device();
+}
+
 uint64_t live_compute_sampled_image_upload_skips() {
     return g_sampled_image_upload_skips.load(std::memory_order_relaxed);
 }
@@ -12361,7 +12448,7 @@ bool live_compute_native_storage_3d_supported(prosper::gpu::DataFormat format,
                                               uint32_t components,
                                               uint32_t width, uint32_t height,
                                               uint32_t depth) {
-    VulkanComputeContext* context = g_live_compute_context;
+    VulkanComputeContext* context = g_live_compute_context.load(std::memory_order_acquire);
     if (!context || !context->physical) return false;
     const VkFormat native_format = native_storage_vk_format(format, components);
     return native_storage_image_create_supported(
@@ -12374,11 +12461,13 @@ uint64_t live_compute_cpu_fill_dispatches() {
 }
 
 uint64_t live_compute_storage_result_snapshot_bytes() {
-    return g_live_compute_context ? g_live_compute_context->storage_result_snapshot_bytes : 0;
+    const VulkanComputeContext* context = g_live_compute_context.load(std::memory_order_acquire);
+    return context ? context->storage_result_snapshot_bytes : 0;
 }
 
 uint64_t live_compute_image_result_snapshot_bytes() {
-    return g_live_compute_context ? g_live_compute_context->image_result_snapshot_bytes : 0;
+    const VulkanComputeContext* context = g_live_compute_context.load(std::memory_order_acquire);
+    return context ? context->image_result_snapshot_bytes : 0;
 }
 
 bool cold_storage_result_snapshot_can_defer(bool host_data, bool full_overwrite,
@@ -12642,7 +12731,7 @@ bool execute_live_compute_items(const std::vector<prosper::gpu::ComputeItem>& it
         if (std::atexit([] {
                 VulkanComputeContext* doomed = context_ptr;
                 context_ptr = nullptr;
-                g_live_compute_context = nullptr;
+                g_live_compute_context.store(nullptr, std::memory_order_release);
                 // Returning early from ~VulkanComputeContext would still destroy all of its member
                 // caches after the destructor body. When a lost-device submission has no completion
                 // proof, retain the object itself so no GPU-facing member ownership is released.
@@ -12672,7 +12761,7 @@ bool execute_live_compute_items(const std::vector<prosper::gpu::ComputeItem>& it
         return fail_closed_items();
     }
     VulkanComputeContext& context = *live_context;
-    g_live_compute_context = &context;
+    g_live_compute_context.store(&context, std::memory_order_release);
     if (context.device_lost) return fail_closed_items();
     const bool perf_capture_timing =
         prosper::perf::interactive_performance_capture().detailed_timing_active();

@@ -174,8 +174,8 @@ int main(int argc, char** argv) {
 
             prosper::Program pc, pg;
             std::string lerr;
-            const bool okc = prosper::link_program(control, 0x600000000ull, pc, &lerr);
-            const bool okg = prosper::link_program(guarded, 0x600000000ull, pg, &lerr);
+            const bool okc = prosper::link_program(control, 0x600000000ull, 0x7c0000000ull, pc, &lerr);
+            const bool okg = prosper::link_program(guarded, 0x600000000ull, 0x7c0000000ull, pg, &lerr);
             CHECK(okc && okg, "both link runs succeed");
             CHECK(pc.skipped_modules.empty(), "control: an unflagged duplicate is still linked");
             CHECK(pc.mods.size() == 3, "control: three modules linked");

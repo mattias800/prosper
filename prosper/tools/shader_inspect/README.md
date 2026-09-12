@@ -120,24 +120,40 @@ dropped. On *Grand Theft Auto V* that removes most of the world's lighting (#346
 ```sh
 shader_inspect <raw-rdna2.bin> --wave-reasons
 wave-reasons required-subgroup-size=64 reasons=0x2 names=wave-any reason-set-admissible=1 \
-    internal-gds=0 subgroup-features=0x1
+    internal-gds=0 subgroup-features=0x1 wave-width-independent=1
 wave-reasons gate-undecided=title-allowlist,host-subgroup-size-control,host-subgroup-features ...
 wave-reasons-end file=... input=rdna2 dwords=12 recompiled=1 table_dependent=0 endpgm=1
 ```
 
 ### `reason-set-admissible` is NOT `admitted`, and the difference is most of the answer
 
-The renderer's gate is **five conjuncts** (`tests/fixtures/render_runner.h:7128-7133`). The
-reason-set equality at `:7140` -- the one this field mirrors -- is only the innermost. The
-decisive one is `bd.allow_native_fragment_vote_width`, which **defaults false** (`:565`) and is
-set in exactly one place, from `title_id == "PPSA04263"` (`live_renderer.cpp:1216`, assigned
-`:7591`). Its own comment says so: *"Tests, replay and all other titles leave this false."*
+The renderer's gate is **five conjuncts** (`tests/fixtures/render_runner.h`). The reason-set
+equality -- the one this field mirrors -- is only one of them, and it is not the one that decides
+correctness. `bd.allow_native_fragment_vote_width` defaults false and stages which titles are
+surveyed at all; `wave-width-independent` is the per-module proof that the draw may run at the
+host's narrower subgroup.
 
-**So outside GTA V, every shader requiring more than 32 lanes is dropped regardless of its
+**So a title not on that list drops every shader requiring more than 32 lanes regardless of its
 reason set.** An earlier version of this tool called the reason-set test `native-wave32-admitted`
 and was therefore wrong in the one direction that mattered: it under-reported the loss #3464
 exists to size. Its *Blasphemous 2* validation run reported `0 dropped` where the true answer
 was `2` -- and it went unquestioned because it agreed with the expectation.
+
+### `wave-width-independent` is the property the allowance actually needs
+
+Whether the module answers the same over two 32-lane groups as over one 64-lane wave, decided per
+module by `fragment_spirv_wave_width_independent` (`src/gpu/recompiler/rdna2_to_spirv.hpp`, which
+carries the argument). A vote clears when its operand is provably wave-uniform, or when its result
+cannot influence a colour output through data flow **or** control dependence.
+
+The reason set alone cannot answer this and neither can value reachability, which is the mistake
+this field replaced: a vote used only as a branch condition never flows into a store, yet it
+decides which store runs. Over 49 real fragment modules from four titles, value reachability
+cleared 49 while control dependence cleared 1; the shipped predicate clears 38. Both
+falsifications are in `RECOMPILER_REMAINING.md`'s *Ruled out* table.
+
+`wave_width_independent.py` answers the same question over a directory of `.spv` dumps, and the
+two implementations are cross-checked against each other on that corpus.
 
 The two conjuncts a module CAN decide are reported beside it (`internal-gds`,
 `subgroup-features`); the three it cannot are named on their own `gate-undecided=` line, every

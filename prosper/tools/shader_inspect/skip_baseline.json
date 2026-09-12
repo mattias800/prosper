@@ -1,8 +1,9 @@
 {
   "device": "NVIDIA GeForce RTX 4090 (discrete GPU)",
   "titles": {
-    "PPSA02664": 4,
+    "PPSA01885": 4,
+    "PPSA02664": 0,
     "PPSA13579": 8,
-    "PPSA24651": 0
+    "PPSA25009": 4
   }
 }

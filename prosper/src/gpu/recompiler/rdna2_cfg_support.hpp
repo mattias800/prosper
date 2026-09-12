@@ -1670,7 +1670,9 @@ inline bool rdna2_buffer_format_is_raw_dwords(uint32_t format, uint32_t componen
 // True when a V# word3's DST_SEL routes the first `components` channels straight through, so a
 // TYPED fetch returns the stored dwords in their stored order.
 //
-// This does not apply to the untyped fold: a raw `buffer_load_dword*` ignores DST_SEL entirely. A
+// This does not apply to the untyped fold: a raw `buffer_load_dword*` ignores DST_SEL entirely —
+// RDNA2 ISA Table 31 gives every non-FORMAT buffer op a DST SEL of "identity", and gives MTBUF
+// `tbuffer_*` the same, so only MUBUF `buffer_*_format_*` reads the field at all (#2869). A
 // FORMAT load does not, and getting it wrong is silent -- Sonic Frontiers' own embedded-table V#
 // carries word3 = 0x10005004, i.e. DST_SEL = (X, 0, 0, 0), so a four-component typed fetch through
 // that same descriptor would return the stored X and three CONSTANT ZEROES, not four dwords. Its

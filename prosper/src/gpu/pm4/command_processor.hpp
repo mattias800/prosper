@@ -252,6 +252,14 @@ struct GpuState {
         uint64_t command_order = 0;
     };
     std::vector<ParserStall> parser_stalls;
+    // #3574 instrument: the command_order of the most recent packet that orders GPU work against the
+    // COMMAND PROCESSOR's own reads -- a parser stall, an EOP/event release, or a register-memory
+    // wait. Kept as a scalar rather than scanned out of `parser_stalls`, because that vector is never
+    // cleared per submit and a linear scan would run on every predicated jump on a default path.
+    // Zero means no such packet has been folded.
+    uint64_t last_cp_sync_order = 0;
+    uint64_t cp_sync_packets_seen = 0;      // positive control: distinguishes "none armed" from
+    uint64_t parser_stalls_seen = 0;        // "the guest never emits these at all"
     // Some PM4 consumers (indirect register arrays, waits, and jump/predication memory) are still
     // folded eagerly. If one follows a retained DMA, or WAIT_DEFER owns either copy dependency,
     // executing the submit would consume stale bytes. Preserve the DMA record for diagnostics and

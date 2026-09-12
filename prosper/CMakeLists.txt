@@ -127,6 +127,11 @@ endif()
 add_library(prosper_performance_capture STATIC frontends/shared/perf/performance_capture.cpp)
 target_include_directories(prosper_performance_capture PUBLIC frontends)
 target_link_libraries(prosper_performance_capture PRIVATE prosper_build_revision)
+# Windows: the process memory sample (working set + commit charge) calls GetProcessMemoryInfo, which
+# lives in the PSAPI import library rather than the kernel32 set every target links by default.
+if(WIN32)
+  target_link_libraries(prosper_performance_capture PRIVATE psapi)
+endif()
 
 # --- tests (agentic-first: self-checking, exit-code = truth) -------------
 enable_testing()
@@ -169,6 +174,45 @@ if(Python3_Interpreter_FOUND)
                    "$<TARGET_FILE:self_dump>")
   add_test(NAME re_xref_decoder
            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/re/test_xref.py")
+  # The GPU memory budget's answer is only as complete as its wiring, and nothing in the compiler
+  # enforces that wiring: a new vkAllocateMemory beside an existing one compiles, links, runs, and is
+  # simply absent from the count. An unwired FREE is the worse half -- those bytes are never given
+  # back, so the figure climbs and reads as a leak that is not there (#3533).
+  add_test(NAME vkmem_coverage
+           COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/vkmem_coverage.py")
+  # survey_sizes.py's classifier decides which refactoring tool can act on a file, and it has been
+  # wrong five times: on the lambda boundary, by calling a file of many small functions "nothing to
+  # do", by measuring the lambda share over the enclosing namespace, by inferring unparsed lines
+  # from region kinds (which cannot see a mid-file #if), and by not mirroring regions_of's descent
+  # rule. The last three were in how the classifier's
+  # INPUTS are measured, so no arithmetic case could have caught them; they are pinned by fixtures
+  # under tools/refactor/testdata/ that the selftest scores ONLY where libclang is importable, and
+  # it says loudly when it skips them. libclang resolves lazily, so the arithmetic half runs here
+  # even though the surveying itself needs a libclang the runner does not have.
+  # map_symbols' clustering decides where a split cuts, and its failure mode is a confident wrong
+  # proposal rather than a crash -- one draft collapsed a 6,515-line file into a single 6,374-line
+  # "part" and reported a 0% cut. Pure arithmetic over the reference matrix, and libclang resolves
+  # lazily there now, so this runs on a runner that has none.
+  # split_file.py was in NO ctest case at all, so a "3/3 refactor tests pass" said nothing about
+  # the splitter -- including a cross-reference check whose arms could not fail. Both gaps found in
+  # the same review.
+  add_test(NAME refactor_split_file
+           COMMAND "${Python3_EXECUTABLE}"
+                   "${CMAKE_SOURCE_DIR}/tools/refactor/split_file.py" --selftest)
+  add_test(NAME refactor_map_symbols_clusters
+           COMMAND "${Python3_EXECUTABLE}"
+                   "${CMAKE_SOURCE_DIR}/tools/refactor/map_symbols.py" --selftest)
+  add_test(NAME refactor_survey_classifier
+           COMMAND "${Python3_EXECUTABLE}"
+                   "${CMAKE_SOURCE_DIR}/tools/refactor/survey_sizes.py" --selftest)
+  # The measurement fixtures are a SEPARATE case so that a runner without libclang reports them as
+  # Skipped rather than folding them into a green Passed. A pass whose domain is smaller than the
+  # local one, with nothing in the report saying so, is the hazard this project records for its GPU
+  # tests under CI's software rasteriser.
+  add_test(NAME refactor_survey_measurement
+           COMMAND "${Python3_EXECUTABLE}"
+                   "${CMAKE_SOURCE_DIR}/tools/refactor/survey_sizes.py" --selftest-parse)
+  set_tests_properties(refactor_survey_measurement PROPERTIES SKIP_RETURN_CODE 77)
   if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_test(NAME profiling_access
              COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/profiling_access/test_access.py")
@@ -386,6 +430,17 @@ if(Python3_Interpreter_FOUND)
   # guards a state this repository produces routinely, since every lane pushes after CI starts.
   add_test(NAME pr_merge_gate
            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/ci/test_pr_merge_gate.py")
+  # pr_body.py answers "is the PR body actually what I published?" (#2918). `gh pr edit --body-file`
+  # was observed returning rc=1 on a GraphQL projects-deprecation error WITHOUT applying the edit,
+  # leaving a stale body the author believed was corrected -- and a PR body is where reviewers and
+  # the merge step take the author's account of the change.
+  #
+  # Every arm is hermetic: `pr_body.run` is replaced by a fake, so a write that reports success
+  # while changing nothing is reachable on demand rather than by waiting for GitHub to misbehave.
+  # That arm is the one that matters -- an implementation trusting the write's exit code passes
+  # every other arm in the file. Platform-independent: nothing here reads /proc or shells out.
+  add_test(NAME pr_body_readback
+           COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/ci/test_pr_body.py")
   add_test(NAME session_start
            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/test_session_start.py")
   # PROSPER_ENV_ON/_VALUE sample getenv once and return it forever. Applied to a name a TEST arms at
@@ -637,6 +692,11 @@ if(TARGET prosper_core)
     add_test(NAME nid_hash_matches_imports
              COMMAND test_nid "${GAME_DUMP}/eboot.bin")
   endif()
+
+  # #3529: the initial value of an unresolved DATA import. Pure -- no dump, no mapping.
+  add_executable(test_import_data_seed tests/hle/dispatch/test_import_data_seed.cpp)
+  target_link_libraries(test_import_data_seed PRIVATE prosper_core)
+  add_test(NAME import_data_seed COMMAND test_import_data_seed)
 
   add_executable(test_hle_registered tests/hle/test_hle_registered.cpp)
   target_link_libraries(test_hle_registered PRIVATE prosper_core)
@@ -1048,6 +1108,12 @@ if(TARGET prosper_core)
   target_link_libraries(test_http PRIVATE prosper_core)
   add_test(NAME http_hle COMMAND test_http)
 
+  # #2894: libSceHttp2 was unregistered, so a request nobody sent reported SCE_OK and its response
+  # getters handed the guest untouched out-parameters.
+  add_executable(test_http2 tests/hle/net/test_http2.cpp)
+  target_link_libraries(test_http2 PRIVATE prosper_core)
+  add_test(NAME http2_hle COMMAND test_http2)
+
   add_executable(test_guard_recursion tests/hle/test_guard_recursion.cpp)
   target_link_libraries(test_guard_recursion PRIVATE prosper_core Threads::Threads)
   add_test(NAME guard_recursion COMMAND test_guard_recursion)
@@ -1124,6 +1190,14 @@ if(TARGET prosper_core)
   target_include_directories(test_savedata_ime PRIVATE tests)
   target_link_libraries(test_savedata_ime PRIVATE prosper_core)
   add_test(NAME savedata_ime COMMAND test_savedata_ime)
+
+  # The save's parameter block (#2786): sceSaveDataSetParam/GetParam were unregistered, so both
+  # answered SCE_OK while storing and reading nothing. Drives the real NIDs, including a mutation arm
+  # (a different block must read back differently) and a persistence arm (it must come off disk).
+  add_executable(test_savedata_param tests/hle/test_savedata_param.cpp)
+  target_include_directories(test_savedata_param PRIVATE tests)
+  target_link_libraries(test_savedata_param PRIVATE prosper_core)
+  add_test(NAME savedata_param COMMAND test_savedata_param)
 
   # Save data is namespaced by title id (#2734): two titles that pick the same guest save name --
   # `OptionSettings`, or SaveDataMemory's (user 1, slot 0) -- must not share one host save. Runs two
@@ -1667,6 +1741,10 @@ if(TARGET prosper_core)
   target_link_libraries(test_ampr_amm PRIVATE prosper_core)
   add_test(NAME ampr_amm COMMAND test_ampr_amm)
 
+  add_executable(test_mprotect_unaligned tests/hle/memory/test_mprotect_unaligned.cpp)
+  target_link_libraries(test_mprotect_unaligned PRIVATE prosper_core)
+  add_test(NAME mprotect_unaligned COMMAND test_mprotect_unaligned)
+
   # #2908: a refused Ampr map must hand its direct-memory claim back. POSIX-only because the
   # mapping primitives it exercises are — on Windows sceAmprCommandBufferSetBuffer is still the
   # do-nothing stub, which cannot leak and cannot demonstrate the lever either.
@@ -1926,6 +2004,11 @@ if(TARGET prosper_core)
   target_link_libraries(test_shader_dump_filter PRIVATE prosper_core)
   add_test(NAME shader_dump_filter COMMAND test_shader_dump_filter)
 
+  add_executable(test_gpu_memory_budget tests/gpu/diagnostics/test_gpu_memory_budget.cpp)
+  target_include_directories(test_gpu_memory_budget PRIVATE tests)   # fixtures/test_scratch.h
+  target_link_libraries(test_gpu_memory_budget PRIVATE prosper_core)
+  add_test(NAME gpu_memory_budget COMMAND test_gpu_memory_budget)
+
   add_executable(test_rdna2_decode tests/gpu/recompiler/test_rdna2_decode.cpp)
   target_link_libraries(test_rdna2_decode PRIVATE prosper_core)
   add_test(NAME rdna2_decode_walk COMMAND test_rdna2_decode)
@@ -1960,6 +2043,37 @@ if(TARGET prosper_core)
                  tests/gpu/recompiler/test_vertex_fetch_reject_diagnostic.cpp)
   target_link_libraries(test_vertex_fetch_reject_diagnostic PRIVATE prosper_core)
   add_test(NAME vertex_fetch_reject_diagnostic COMMAND test_vertex_fetch_reject_diagnostic)
+
+  # #3596: a lane-local scalar must not satisfy the wave-uniformity proof.
+  add_executable(test_readfirstlane_uniformity
+                 tests/gpu/recompiler/test_readfirstlane_uniformity.cpp)
+  target_link_libraries(test_readfirstlane_uniformity PRIVATE prosper_core)
+  add_test(NAME readfirstlane_uniformity COMMAND test_readfirstlane_uniformity)
+
+  # #3573: the CFG dispatcher must lower a fragment exec/vcc branch as a wave vote.
+  add_executable(test_dispatcher_wave_vote tests/gpu/recompiler/test_dispatcher_wave_vote.cpp)
+  target_link_libraries(test_dispatcher_wave_vote PRIVATE prosper_core)
+  add_test(NAME dispatcher_wave_vote COMMAND test_dispatcher_wave_vote)
+
+  # #3577: a null image descriptor must carry the shape the shader declares.
+  add_executable(test_null_image_shape tests/gpu/execute/test_null_image_shape.cpp)
+  target_link_libraries(test_null_image_shape PRIVATE prosper_core)
+  add_test(NAME null_image_shape COMMAND test_null_image_shape)
+
+  # #3579: a refused buffer instruction must not print the same census word as an emitted one.
+  add_executable(test_buf_op_census_disposition
+                 tests/gpu/recompiler/test_buf_op_census_disposition.cpp)
+  target_link_libraries(test_buf_op_census_disposition PRIVATE prosper_core)
+  add_test(NAME buf_op_census_disposition COMMAND test_buf_op_census_disposition)
+
+  # #3479: a recompiled guest module must declare SignedZeroInfNanPreserve, or a driver is free to
+  # compile it under no-Inf/no-NaN assumptions and silently answer a guest sign() idiom with 0 --
+  # and must NOT declare it on a device that cannot execute it, which is invalid rather than merely
+  # unoptimised (#3561). Both directions are asserted. Structural on purpose -- an execution arm
+  # cannot go red where CI runs. See the test.
+  add_executable(test_float_controls tests/gpu/recompiler/test_float_controls.cpp)
+  target_link_libraries(test_float_controls PRIVATE prosper_core)
+  add_test(NAME float_controls COMMAND test_float_controls)
 
   # CPU-only streaming shader properties: exact legacy semantics without per-query vectors.
   add_executable(test_shader_property_scans tests/gpu/recompiler/test_shader_property_scans.cpp)
@@ -2134,6 +2248,21 @@ if(TARGET prosper_core)
     add_test(NAME skip_baseline_refuses_what_it_cannot_compare
              COMMAND "${Python3_EXECUTABLE}"
                      "${CMAKE_CURRENT_SOURCE_DIR}/tools/shader_inspect/test_skip_baseline.py")
+  endif()
+
+  # Whether a fragment module answers the same over two 32-lane groups as over one 64-lane wave --
+  # the property the wave32 allowance actually needs, and NOT the one the shipping classifier tests
+  # (it tests the reason set, i.e. how the vote was produced). Its fixtures are hand-assembled
+  # SPIR-V, so each case exists independently of what the emitter happens to produce.
+  #
+  # Half the cases must be REFUSED, including the one that retired the earlier value-reachability
+  # predicate: a vote used only as a branch condition never flows into a store, yet it decides which
+  # store runs. The divergent and uniform arms are the same three shapes with one word changed, so
+  # a uniform arm that did nothing and one that did too much both fail rather than look perfect.
+  if(Python3_Interpreter_FOUND)
+    add_test(NAME wave_width_independence_refuses_the_class
+             COMMAND "${Python3_EXECUTABLE}"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/tools/shader_inspect/test_wave_width_independent.py")
   endif()
 
   # spv_validate: emit a module from EVERY SPIR-V-producing entry point and run spirv-val on each —
@@ -2470,6 +2599,16 @@ if(TARGET prosper_core)
   target_link_libraries(test_display_mode PRIVATE prosper_core)
   add_test(NAME display_mode_derivation COMMAND test_display_mode)
 
+  # #3379: guest flips are paced at the cadence the TITLE asked for by default. Its own executable
+  # rather than an arm of test_videoout, for the same reason test_display_mode above is: the
+  # advertised display mode resolves once per process, and these arms read the derived period
+  # against the untouched `legacy` default. CROSS-PLATFORM like both of those -- HLE registry plus
+  # a sleep, no display access. Includes one deliberately one-sided timing arm (a lower bound on a
+  # sleep cannot flake).
+  add_executable(test_flip_pacing tests/host/platform/test_flip_pacing.cpp)
+  target_link_libraries(test_flip_pacing PRIVATE prosper_core)
+  add_test(NAME flip_pacing_defaults COMMAND test_flip_pacing)
+
   # precise_sleep's deadline post-condition (#3074): every sleep_until_steady_ns() backend must
   # never return before now_ns() >= deadline_ns. Win32SleepFallback did not re-check after its one
   # OS sleep call, unlike the sibling high-resolution-timer path. CROSS-PLATFORM like test_videoout
@@ -2551,6 +2690,22 @@ if(TARGET prosper_core)
       add_test(NAME game_compute_exec_scratch_poison COMMAND test_game_compute)
       set_tests_properties(game_compute_exec_scratch_poison PROPERTIES
         ENVIRONMENT "PROSPER_DECODE_SCRATCH_POISON=1")
+
+      # #3425: registered on Windows as well as in the UNIX block below, deliberately. This
+      # defect is about the WINDOWS/NVIDIA frontend's _Exit path and the cost it recovers was
+      # measured there (#3450), so a Linux-only guard would test the fix everywhere except
+      # where it was found. Both registrations run the same fixture and driver script.
+      if(Python3_Interpreter_FOUND)
+        add_executable(test_compute_cache_persistence tests/gpu/execute/test_compute_cache_persistence.cpp)
+        target_include_directories(test_compute_cache_persistence PRIVATE tests frontends)
+        target_link_libraries(test_compute_cache_persistence PRIVATE prosper_live_renderer)
+        add_test(NAME compute_cache_persistence
+                 COMMAND "${Python3_EXECUTABLE}"
+                         "${CMAKE_CURRENT_SOURCE_DIR}/tests/gpu/execute/test_compute_cache_persistence.py"
+                         $<TARGET_FILE:test_compute_cache_persistence>
+                         "${CMAKE_CURRENT_SOURCE_DIR}/frontends/prosper-app/main.cpp")
+        set_tests_properties(compute_cache_persistence PROPERTIES TIMEOUT 300)
+      endif()
 
       # Local-only realized-submit replayer (#514), on Windows since #2331. Same target as the UNIX
       # block below, including the -Werror=switch gate: gpu_replay maps LiveTargetPixelFormat itself
@@ -2967,7 +3122,7 @@ if(TARGET prosper_core)
       target_link_libraries(test_rdna2_to_spirv PRIVATE prosper_core Vulkan::Vulkan)
       add_test(NAME rdna2_to_spirv_exec COMMAND test_rdna2_to_spirv)
       add_executable(test_descriptor_array_emit tests/gpu/test_descriptor_array_emit.cpp)
-      target_link_libraries(test_descriptor_array_emit PRIVATE PRIVATE prosper_core Vulkan::Vulkan)
+      target_link_libraries(test_descriptor_array_emit PRIVATE prosper_core Vulkan::Vulkan)
       add_test(NAME descriptor_array_emit COMMAND test_descriptor_array_emit)
 
 
@@ -3303,6 +3458,20 @@ if(TARGET prosper_core)
                          "${CMAKE_SOURCE_DIR}/tools/perf/test_compute_buffer_timing_runtime.py"
                          $<TARGET_FILE:test_compute_buffer_timing>)
         set_tests_properties(compute_buffer_timing_runtime PROPERTIES TIMEOUT 180)
+        # #3425: the compute driver pipeline cache is written on the frontend's _Exit path, not by a
+        # destructor. Separate processes are required -- a single process could pass while writing
+        # nothing -- and the driver also asserts prosper-app still names the flush.
+        add_executable(test_compute_cache_persistence tests/gpu/execute/test_compute_cache_persistence.cpp)
+        target_include_directories(test_compute_cache_persistence PRIVATE tests frontends)
+        target_link_libraries(test_compute_cache_persistence PRIVATE
+                             prosper_live_renderer prosper_core Vulkan::Vulkan)
+        add_test(NAME compute_cache_persistence
+                 COMMAND "${Python3_EXECUTABLE}"
+                         "${CMAKE_CURRENT_SOURCE_DIR}/tests/gpu/execute/test_compute_cache_persistence.py"
+                         $<TARGET_FILE:test_compute_cache_persistence>
+                         "${CMAKE_CURRENT_SOURCE_DIR}/frontends/prosper-app/main.cpp")
+        set_tests_properties(compute_cache_persistence PROPERTIES TIMEOUT 300)
+
         add_executable(test_compute_buffer_residency tests/gpu/execute/test_compute_buffer_residency.cpp)
         target_include_directories(test_compute_buffer_residency PRIVATE tests frontends)
         target_link_libraries(test_compute_buffer_residency PRIVATE
@@ -3368,6 +3537,16 @@ if(TARGET prosper_core)
       target_include_directories(test_interp_render PRIVATE frontends)
       target_link_libraries(test_interp_render PRIVATE prosper_core Vulkan::Vulkan)
       add_test(NAME interp_render COMMAND test_interp_render)
+
+      # RectList fourth-corner synthesis: the geometry stage must complete the rectangle whichever of
+      # the three supplied vertices is the shared corner (#3507).
+      add_executable(test_rect_synthesis_render tests/gpu/recompiler/test_rect_synthesis_render.cpp)
+      # Includes a shared fixture, which resolves from the `tests` root.
+      target_include_directories(test_rect_synthesis_render PRIVATE tests)
+      # Reaches `shared/...` through render_runner.h, which resolves from `frontends`.
+      target_include_directories(test_rect_synthesis_render PRIVATE frontends)
+      target_link_libraries(test_rect_synthesis_render PRIVATE prosper_core Vulkan::Vulkan)
+      add_test(NAME rect_synthesis_render COMMAND test_rect_synthesis_render)
 
       # Full textured-draw path: VS exports interpolated UVs, PS samples a texture at them (+screenshot).
       add_executable(test_textured_interp_render tests/gpu/test_textured_interp_render.cpp)
@@ -3956,6 +4135,20 @@ if(TARGET prosper-app AND TARGET prosper_video_vaapi)
   message(STATUS "prosper-app: FFmpeg/VA-API video enabled")
 endif()
 
+# Image robustness (#3531): the device-side half of the recompiler's out-of-bounds image-read
+# contract, and the refusal that replaces executing it undefined. Registered OUTSIDE the per-platform
+# blocks because the contract is not platform-specific and the bug it guards was a divergence between
+# two device paths -- a guard built on only one host would have the same blind spot. Queries a
+# physical device but creates none, so it runs wherever an ICD exists and reports a skip (never a
+# silent pass) where one does not.
+if(TARGET Vulkan::Vulkan AND TARGET prosper_core)
+  add_executable(test_image_robustness tests/shared/device/test_image_robustness.cpp)
+  # Spells `shared/...` and `gpu/...` includes, which resolve from `frontends` and `src`.
+  target_include_directories(test_image_robustness PRIVATE frontends src)
+  target_link_libraries(test_image_robustness PRIVATE prosper_core Vulkan::Vulkan)
+  add_test(NAME image_robustness COMMAND test_image_robustness)
+endif()
+
 # Shared-device adoption guard (#1091). prosper_live_renderer only exists in frontend-enabled
 # configurations and is defined later in this file than the core test block, so register this
 # after the fact and only when the target is actually present.
@@ -3988,6 +4181,24 @@ if(TARGET prosper_live_renderer AND TARGET prosper_core)
   target_link_libraries(test_present_blit PRIVATE prosper_live_renderer prosper_core Vulkan::Vulkan)
   add_test(NAME present_blit COMMAND test_present_blit)
 endif()
+
+# #3372: gpu_replay's two graphics shader dumps produce OPPOSITE things -- --dump-shader writes
+# prosper's recompiled SPIR-V, --dump-shader-raw writes the guest RDNA2 that fed it -- and the
+# flag names alone do not say which way round. An investigation read the RDNA2 out of the flag
+# whose name suggested SPIR-V and lost a session to it. The usage legend is the fix, so something
+# has to fail when the legend is dropped; nothing else in the tree can. Behavioural rather than a
+# source grep: it runs the real binary and reads what an operator would actually see.
+if(TARGET gpu_replay AND Python3_Interpreter_FOUND)
+  add_test(NAME gpu_replay_cli_contract
+           COMMAND "${Python3_EXECUTABLE}"
+                   "${CMAKE_SOURCE_DIR}/tools/gpu_replay/test_cli_contract.py")
+  # SKIP_RETURN_CODE so "gpu_replay was not built" reports as (Skipped) by name rather than as a
+  # pass -- the tool needs Vulkan and is genuinely absent in some environments.
+  set_tests_properties(gpu_replay_cli_contract PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+  set_property(TEST gpu_replay_cli_contract APPEND PROPERTY ENVIRONMENT
+    "PROSPER_GPU_REPLAY_BIN=$<TARGET_FILE:gpu_replay>")
+endif()
+
 
 # ---------------------------------------------------------------------------
 # Per-case scratch directory for every registered test (#1613).

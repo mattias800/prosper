@@ -112,6 +112,15 @@ struct DecodedBufferDescriptor {
     uint32_t   size_bytes = 0;
     DataFormat format = DataFormat::Float32;
     uint32_t   num_components = 1;
+    // DST_SEL_X/Y/Z/W channel routing (WORD3 [2:0]/[5:3]/[8:6]/[11:9]) — the same three-bit SQ_SEL
+    // enum the T# uses: 0 = constant 0, 1 = constant 1, 4/5/6/7 = the stored R/G/B/A component
+    // (2 and 3 reserved). Default = identity. This names which STORED component each RETURNED
+    // channel takes, and is a separate field from FORMAT, which names how many components exist and
+    // how they are encoded. Which instructions apply it is fixed by RDNA2 ISA (document 70648)
+    // Table 31: **only** MUBUF `buffer_load_format_*` / `buffer_store_format_*` take it from the
+    // resource. MTBUF `tbuffer_*` and every raw load/store/atomic use identity regardless of what
+    // the descriptor says, so decoding the field here is not permission to apply it anywhere (#2869).
+    uint8_t    dst_sel[4] = {4, 5, 6, 7};
     // True when the descriptor names a packed format whose exact semantics are known to be
     // unsupported (currently non-identity DST_SEL or scaled 2_10_10_10). Dynamic fetch recovery
     // must not reinterpret this deliberate rejection as the legacy unresolved-format Float32 fallback.
@@ -120,6 +129,16 @@ struct DecodedBufferDescriptor {
 
 // Decode a 4-dword V# (RDNA2/Gen5 buffer resource). Pure; exposed for reuse + testing.
 DecodedBufferDescriptor decode_buffer_descriptor(const uint32_t v[4]);
+
+// Carry a decoded V#'s DST_SEL into the ShaderResource the recompiler consumes. Every site that
+// builds a buffer-class ShaderResource from a V# must call this: `ShaderResource::swizzle` defaults
+// to identity, so omitting it does not fail loudly — it silently asserts a routing the descriptor
+// never claimed, which is the whole of #2869. The T# sites assign the same field directly because
+// their decoded struct has always carried it.
+inline void apply_buffer_descriptor_swizzle(ShaderResource& r, const DecodedBufferDescriptor& d) {
+    r.swizzle[0] = d.dst_sel[0]; r.swizzle[1] = d.dst_sel[1];
+    r.swizzle[2] = d.dst_sel[2]; r.swizzle[3] = d.dst_sel[3];
+}
 
 // A decoded GFX10 BVH resource descriptor (4 dwords). Unlike an image T#, IMAGE_BVH_INTERSECT_RAY
 // consumes a compact descriptor whose base is expressed in 256-byte units and whose size is a

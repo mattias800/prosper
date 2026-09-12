@@ -10,8 +10,10 @@ capture/replay without requiring an importable system Python module.
 
 - **`session_start.py`** — read-only checkout/instruction freshness signal for #2710. See
   [Session startup](../docs/SESSION_START.md). Its hook mode must deliver failures as visible
-  SessionStart context; an unavailable remote must never be reported as current. The regression
-  executes the configured hook argv against both current and stale temporary repositories.
+  SessionStart context; an unavailable remote must never be reported as current, and a host that
+  cannot start any of the interpreters the hook tries must say so rather than exit into silence.
+  The regression executes the hook exactly as configured, in whichever form it is configured,
+  against both current and stale temporary repositories.
 
 - **`evidence/prerender_check.py`** - **run this before publishing a progression screenshot.** It
   answers whether the frame is the game's own PRE-RENDERED picture rather than something prosper
@@ -723,6 +725,14 @@ capture/replay without requiring an importable system Python module.
   total/mean/max time, and bounded address list. Mixed batches and older v1 captures report their
   compute time as explicitly unknown identity rather than inventing a program attribution.
 
+  The memory axis is two fields, not one, and both are per-platform. `rss_bytes` is the resident
+  set: `/proc/self/statm` on Linux, `WorkingSetSize` on Windows, `MACH_TASK_BASIC_INFO`'s
+  `resident_size` on macOS. `private_bytes` is the commit charge and exists only on Windows
+  (`PrivateUsage`), where it is the figure that tracks prosper's host-side caches -- the working set
+  understated one measured GTA V run by ~5 GB (#3448). Either field is reported as **unavailable**
+  rather than zero when the host has no such counter or the query failed, and captures written
+  before a field existed simply read as unavailable; both are additive within format version 1.
+
   For unattended agent runs, set `PROSPER_PERF_CAPTURE_AFTER_MS=N` to make one automatic arm
   attempt after `N` milliseconds from entry into the app loop. This uses the exact F8 artifact path
   and five-second pre/post windows without desktop focus, synthetic input, screenshots, frame dumps,
@@ -1132,8 +1142,10 @@ composite/scanout draws; a single `--draw N` remains supported.
 `--dump-resource DRAW:vs|ps:BINDING PATH` writes one captured resource's exact backing bytes for
 external numeric/image inspection without dereferencing the original guest address.
 `--dump-shader DRAW:vs|fs PATH` writes the captured SPIR-V module for validation/disassembly.
-Capture v19+ also supports `--dump-realized-shader DRAW:vs|fs PATH`, which writes the exact bounded raw
-RDNA2 source for a successfully realized graphics stage; use that output with `shader_inspect`.
+Capture v19+ also supports `--dump-shader-raw DRAW:vs|fs PATH` (alias: `--dump-realized-shader`),
+which writes the exact bounded raw RDNA2 source for a successfully realized graphics stage; use that
+output with `shader_inspect`. Note the pairing: the plain flag gives prosper's SPIR-V, the `-raw`
+flag gives the guest's RDNA2 that produced it (#3372).
 `--dump-compute N PATH` writes one realized compute SPIR-V module, and
 `--dump-compute-resource N:BINDING PATH` writes its exact pre-dispatch storage-buffer bytes.
 `--dump-post-compute-resource N:BINDING PATH` is the execution-side counterpart for storage images: it

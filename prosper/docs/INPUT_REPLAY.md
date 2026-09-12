@@ -40,9 +40,27 @@ We already have the seed: **`PROSPER_PAD_SCRIPT` (#202)** — a scripted `PadBac
 
 ## What exists today (`PROSPER_PAD_SCRIPT`, #202)
 
-- Format: `;`- or newline-separated `<anchor>:<action>[+action…]`, where an anchor is seconds,
+- Format: `;`- or newline-separated `<anchor>:<action>[+action...]`, where an anchor is seconds,
   `fN`/`fA-B` display flips, or `pN`/`pA-B` pad reads. For example:
   `3:start;f300-340:cross;p1200-1240:left-stick-left+cross`.
+- **An anchor may give a HOLD with `+` instead of an end, and the hold names its own unit** --
+  `f2272+0.15:down` starts at flip 2272 and holds Down for 0.15 **seconds**; `f2272+p12:down` holds
+  it for 12 pad reads. The unit rule is the same one the start anchor uses: bare is seconds, `f` is
+  flips, `p` is reads. So `f100+12` is twelve seconds from flip 100, not twelve flips -- spell that
+  `f100+f12`, which is identical to the range `f100-112` and is folded into one at parse time.
+- **Use it for anything a menu selects, and it is not a style preference (#3449).** A `<start>-<end>`
+  window states a duration only at the flip rate it was tuned on, while guest key repeat is
+  wall-clock. `scripts/gta5/reach-performance-story.pad` was tuned where its settings menu ran at
+  ~80 flips/s; on a host where the same menu ran at 15-33 flips/s its 12-flip "0.15 s" press lasted
+  **0.737 s**, key repeat walked three Down presses through **seven** rows instead of three, and the
+  route changed a Motion Sensor setting instead of the graphics mode. Nothing errored -- GTA V simply
+  ran a whole measurement session in Fidelity+RT while being reported as a Performance run. Guest
+  flip pacing (#3379) does not remove the need: pacing only sleeps when a host runs FAST, so at the
+  rates that caused this it is inert by construction.
+  **A route that navigates a menu must also be verified by screenshot on the platform it runs on**,
+  because a wrong selection is silent by nature and nothing in the harness can currently catch it
+  (#3567). Two instances on the same GTA V route reached different wrong settings (#3449, #3301),
+  and a third turned up when #3449 was reproduced -- same file, same build, same host, two runs.
 - Actions are button names or full-deflection `left-stick-{left,right,up,down}` and
   `right-stick-{left,right,up,down}` directions. Seconds points use `PROSPER_PAD_HOLD` ms
   (default 300); flip/read points use their count-axis holds above. Explicit ranges always use their

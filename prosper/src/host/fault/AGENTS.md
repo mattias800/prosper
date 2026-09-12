@@ -49,3 +49,30 @@ the prologue is skipped silently, and a chain can therefore be missing a level r
 wrong. Every link is checkable, though, and cheaply — a return address must point immediately after
 a `call` to the frame below it, so one `objdump` at the named site confirms or kills a link. Confirm
 the links you are going to reason from; do not publish a chain you have only read.
+
+## The two recoverers, and why there are two
+
+`rbp_chain.hpp` and `guest_stack_scan.hpp` answer the same question — *which guest code called this?*
+— by opposite methods, and both are here because **which one works is a property of how the TITLE was
+compiled, not something the host can know.**
+
+- `rbp_chain.hpp` follows saved-`rbp` links. Precise, and **often empty** on an optimised title:
+  FINAL FANTASY TACTICS' fatal raise recovers exactly one frame, the module entry point, because
+  every guest frame between omitted its prologue.
+- `guest_stack_scan.hpp` scans the stack instead, so it does not depend on frame pointers at all. A
+  return address pushed by `call` is on the stack either way. It pays for that with false positives,
+  which it removes by **confirming a `call` instruction ends immediately before each candidate**.
+
+A caller that needs an answer should ask both and print both, rather than choosing — a short chain
+and a shallow stack look identical, so "the chain returned one frame" is not evidence about the
+stack.
+
+`guest_caller.hpp` is the other half of the same story: the `PROSPER_CAPTURE_RBP` / `_RSP` macros
+that snapshot an HLE handler's entry registers. They are macros rather than functions on purpose —
+a function would capture its OWN frame, one level too deep, and a build that inlined it would change
+the answer silently.
+
+**Both recoverers take the caller's `readable` probe as a parameter and dereference nothing without
+it.** That is not defensive style here: these run on paths that are already terminating the process,
+where a nested SIGSEGV would replace the diagnostic with a confusing fault report about the
+diagnostic itself.

@@ -196,15 +196,36 @@ DecodedBufferDescriptor decode_buffer_descriptor(const uint32_t v[4]) {
     d.num_records = v[2];
     const uint32_t raw_format = (v[3] >> 12) & 0x7Fu;
     rdna2_buffer_format(raw_format, &d.format, &d.num_components);
+    // DST_SEL_X/Y/Z/W (#2869). Decoded only when the descriptor actually DECLARES a format: a V#
+    // with FORMAT == 0 names no typed data, and prosper reaches such words through paths that
+    // FABRICATE a descriptor rather than recover one — the raw-pointer scalar consumer whose words
+    // 2/3 are zero because there is no descriptor (#2412), and the legacy Unknown -> Float32 vertex
+    // fallback. Reading DST_SEL out of those zero words would say "every channel is constant 0" on
+    // a descriptor the guest never wrote, turning a fallback that renders today into a silent black
+    // fetch. That is a deliberate conservatism about PROSPER's fallbacks, not a claim that hardware
+    // ignores DST_SEL when FORMAT is 0 — a format fetch through an unbound V# is undefined anyway,
+    // and prosper already leaves it unresolved.
+    if (raw_format != 0u) {
+        d.dst_sel[0] = (uint8_t)((v[3] >> 0) & 0x7u);   // DST_SEL_X (WORD3 [2:0])
+        d.dst_sel[1] = (uint8_t)((v[3] >> 3) & 0x7u);   // DST_SEL_Y ([5:3])
+        d.dst_sel[2] = (uint8_t)((v[3] >> 6) & 0x7u);   // DST_SEL_Z ([8:6])
+        d.dst_sel[3] = (uint8_t)((v[3] >> 9) & 0x7u);   // DST_SEL_W ([11:9])
+    }
     const bool packed_word =
         d.format == DataFormat::Float10_11_11 || d.format == DataFormat::Unorm2_10_10_10 ||
         d.format == DataFormat::Snorm2_10_10_10 || d.format == DataFormat::Uint2_10_10_10 ||
         d.format == DataFormat::Sint2_10_10_10;
-    // Packed loads currently lower physical fields directly, so accept only the exact selector shape
-    // represented by the recompiler: 2_10_10_10 uses X/Y/Z/W (0xFAC), while three-component
-    // 10_11_11_FLOAT uses X/Y/Z/1 (0x3AC), matching its W=1 default. Other permutations/constants
-    // remain fail-closed until ShaderResource carries arbitrary DST_SEL through to SPIR-V; accepting
-    // them here would turn the old rejected draw into a silently wrong vector (#370 review).
+    // Packed loads accept only the exact selector shape the recompiler was built around: 2_10_10_10
+    // uses X/Y/Z/W (0xFAC), while three-component 10_11_11_FLOAT uses X/Y/Z/1 (0x3AC), matching its
+    // W=1 default. Other permutations/constants remain fail-closed (#370 review).
+    // This used to say "until ShaderResource carries arbitrary DST_SEL through to SPIR-V", and since
+    // #2869 it does — the MUBUF format lowering now routes each returned channel through the
+    // descriptor's selector, packed fields included. The gate is nonetheless KEPT, because widening
+    // it would change what live titles render and no title in the corpus has been observed supplying
+    // a routed packed descriptor to justify the risk; relaxing it is follow-up work with its own
+    // evidence, not a free consequence of this one. Note MTBUF is unaffected either way: its
+    // consumers skip `forbid_unknown_fallback` (see `append_fetch`), and per RDNA2 ISA Table 31 a
+    // tbuffer op uses identity routing regardless of the descriptor.
     const uint32_t packed_selector = v[3] & 0xFFFu;
     const bool supported_packed_selector =
         d.format == DataFormat::Float10_11_11 ? packed_selector == 0x3ACu
@@ -719,6 +740,7 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
             r.cls            = ResourceClass::ConstantBuffer;
             r.format         = d.format;
             r.num_components  = d.num_components;
+            apply_buffer_descriptor_swizzle(r, d);   // V# DST_SEL routing (#2869)
             r.binding        = binding++;
             r.gpu_addr       = d.base;
             r.size           = d.size_bytes;
@@ -767,6 +789,7 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
             r.cls            = ResourceClass::ConstantBuffer;
             r.format         = d.format;
             r.num_components = d.num_components;
+            apply_buffer_descriptor_swizzle(r, d);   // V# DST_SEL routing (#2869)
             r.binding        = binding++;
             r.gpu_addr       = d.base;
             r.size           = d.size_bytes;
@@ -918,6 +941,7 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
             r.cls            = ResourceClass::ConstantBuffer;
             r.format         = d.format;
             r.num_components = d.num_components;
+            apply_buffer_descriptor_swizzle(r, d);   // V# DST_SEL routing (#2869)
             r.binding        = binding++;
             r.gpu_addr       = d.base;
             r.size           = d.size_bytes;
@@ -1367,6 +1391,7 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
             r.cls            = compute_buffer ? ResourceClass::ConstantBuffer : ResourceClass::VertexBuffer;
             r.format         = d.format;
             r.num_components  = d.num_components;
+            apply_buffer_descriptor_swizzle(r, d);   // V# DST_SEL routing (#2869)
             r.binding        = binding++;
             r.gpu_addr       = d.base;
             r.size           = d.size_bytes;

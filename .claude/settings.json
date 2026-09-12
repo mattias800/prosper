@@ -5,13 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3",
-            "args": [
-              "${CLAUDE_PROJECT_DIR}/prosper/tools/session_start.py",
-              "--repo",
-              "${CLAUDE_PROJECT_DIR}",
-              "--hook"
-            ],
+            "command": "python3 \"${CLAUDE_PROJECT_DIR}/prosper/tools/session_start.py\" --repo \"${CLAUDE_PROJECT_DIR}\" --hook || python \"${CLAUDE_PROJECT_DIR}/prosper/tools/session_start.py\" --repo \"${CLAUDE_PROJECT_DIR}\" --hook || py \"${CLAUDE_PROJECT_DIR}/prosper/tools/session_start.py\" --repo \"${CLAUDE_PROJECT_DIR}\" --hook || echo session-start UNVERIFIED: could not start python3, python or py - the checkout and instruction freshness check did not run. See prosper/docs/SESSION_START.md",
             "timeout": 20
           }
         ]

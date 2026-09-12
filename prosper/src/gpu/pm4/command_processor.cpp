@@ -2927,7 +2927,10 @@ std::atomic<bool> g_post_submit_visibility{false};
 
 // #1226 (arc7) A/B lever, default OFF and log-only in the sense that it changes nothing unless
 // set: `PROSPER_POST_SUBMIT_VISIBILITY=1` forces this model on regardless of the SDK version the
-// guest asked for, `=0` forces it off. It exists because the per-fold census (see
+// guest asked for, `=0` forces it off. (`on`/`true`/`yes`/`enabled` and `off`/`false`/`no`/
+// `disabled` work too, in either case; anything ELSE -- including a number that is neither 0 nor 1
+// -- is treated as unset and says so, because a typo must not pick an arm of a live experiment.
+// #3304.) It exists because the per-fold census (see
 // `ARCRUNNER_STATUS.md` § arc7) localised ArcRunner's corruption to the guest's builder thread
 // being released MID-FOLD by completion writes prosper applies while it is still executing the rest
 // of the same command buffer — and ArcRunner requests SDK version 10, so the post-submit contract
@@ -2935,8 +2938,13 @@ std::atomic<bool> g_post_submit_visibility{false};
 // pre-13 title is a separate question this lever does not answer; it makes the experiment runnable.
 bool post_submit_visibility_enabled() {
     static const int forced = [] {
-        const char* e = getenv("PROSPER_POST_SUBMIT_VISIBILITY");
-        const int v = e ? (int)strtol(e, nullptr, 0) : -1;
+        // #3304: the tri-state is right and the PARSE was not. `strtol` answers 0 for text it
+        // cannot read, so `=on`, `=true`, `=yes` and `=enabled` all landed on the FORCED-OFF arm
+        // and printed the line below as though that had been asked for -- a confidently mislabelled
+        // result on a lever whose verdict is open (#2217/#2219/#2223). A value that is neither on
+        // nor off is now UNSET (follow the SDK version) and says so; it is never a silent third arm.
+        const int v = prosper::diag::env_tristate_or_unset("PROSPER_POST_SUBMIT_VISIBILITY",
+                                                           getenv("PROSPER_POST_SUBMIT_VISIBILITY"));
         if (v == 1)
             fprintf(stderr, "[agc] POST-SUBMIT-VISIBILITY FORCED ON (#1226 A/B) — completion writes "
                             "stay private until the submit scope closes, regardless of SDK version\n");
@@ -4543,6 +4551,9 @@ void GpuState::apply(const Pm4Command& c) {
             break;
         case K::StallCommandBufferParser:
             parser_stalls.push_back({command_order});
+            last_cp_sync_order = command_order;   // #3574
+            ++parser_stalls_seen;
+            ++cp_sync_packets_seen;
             break;
         case K::DrawIndexOffset: {
             // Gen5 indexed draw (issue #232). Uses the bound index base + count; DrawIndexOffset's own
@@ -4631,7 +4642,8 @@ void GpuState::apply(const Pm4Command& c) {
             draws.back().command_order = command_order;
             break;
         }
-        case K::DrawIndexIndirect: {
+        case K::DrawIndexIndirect:
+        case K::DrawIndirect: {
             // #305: bind-vs-work sequence in stream order. Cached — this runs per draw/dispatch,
             // and a per-item environ scan is measurable at this title's ~876k items per route.
             // The three graphics arms emit "DRAW"; the two compute arms below emit "DISPATCH", so
@@ -4653,9 +4665,13 @@ void GpuState::apply(const Pm4Command& c) {
             refresh_state_snapshot();
             Draw d;
             d.state = last_snapshot_;
-            d.indexed = true;
+            // sceAgcDcbDrawIndirect (#2929) is the same packet shape with no index buffer. The
+            // `indexed` flag is what tells the executor which argument-buffer layout to read at the
+            // far end of `indirect_args_addr` — five dwords with an index base, or four without —
+            // so it must carry the packet's own identity rather than a constant.
+            d.indexed = (c.kind == K::DrawIndexIndirect);
             d.modifier = c.di_modifier;
-            d.index_base = index_base;
+            if (d.indexed) d.index_base = index_base;
             d.indirect = true;
             if (indirect_graphics_base <= UINT64_MAX - c.indirect_offset)
                 d.indirect_args_addr = indirect_graphics_base + c.indirect_offset;
@@ -4664,6 +4680,7 @@ void GpuState::apply(const Pm4Command& c) {
             break;
         }
         case K::ReleaseMem:
+            last_cp_sync_order = command_order; ++cp_sync_packets_seen;   // #3574
             // EOP completion label write. While the queue is paused (this fold hit an unsatisfied
             // wait, or an earlier submit's gated tail is still pending), the write queues behind
             // the barrier IN RING ORDER (see the #312 block above) — completing a fence early is
@@ -4685,6 +4702,7 @@ void GpuState::apply(const Pm4Command& c) {
             if (eop_write_sync()) honor_write_data(c); else pend_enqueue(c);
             break;
         case K::EventWrite:
+            last_cp_sync_order = command_order; ++cp_sync_packets_seen;   // #3574
             if (defer_gate(c)) { defer_push(c); break; }
             if (!dma_copies.empty()) {
                 ordered_memory_effects.emplace_back(c, command_order);
@@ -4757,6 +4775,7 @@ void GpuState::apply(const Pm4Command& c) {
             if (eop_write_sync()) honor_dma_data(c); else pend_enqueue(c);
             break;
         case K::WaitRegMem: {
+            last_cp_sync_order = command_order; ++cp_sync_packets_seen;   // #3574
             const bool wait_overlaps_dma = !dma_copies.empty() && c.wm_valid && c.wm_addr &&
                 !(c.wm_addr & 3) &&
                 retained_dma_destination_overlaps(dma_copies, c.wm_addr, 8);
@@ -5134,10 +5153,90 @@ void GpuState::apply(const Pm4Command& c) {
             constexpr uint32_t kMaxJumpDwords = 0x40000;   // 1 MiB of dwords — far past any real segment
             constexpr uint32_t kMaxJumpDepth  = 8;
             if (c.jump_dwords > kMaxJumpDwords || jump_depth >= kMaxJumpDepth) break;
+            // #3574 instruments below are GATED. `GpuState::apply` runs on every folded PM4 command
+            // of every submit and `!dispatches.empty()` is the ordinary case, so an ungated line here
+            // emits on a DEFAULT run -- ~90 lines on the measured title. These are instruments, not
+            // fail-visible rejects, and they share the switch with the sibling predication log below
+            // rather than inventing another.
+            static const bool predlog = getenv("PROSPER_PREDLOG") != nullptr;
             bool skip = false;
             uint64_t cond = 0;
             if (c.jump_pred && pred_cond_addr && !(pred_cond_addr & 7) &&
                 guest_readable(pred_cond_addr, 8)) {
+                // #3574: THIS READ HAPPENS WHILE THE STREAM IS STILL BEING FOLDED, so it cannot see
+                // anything a COMPUTE DISPATCH in this same submit produces -- compute runs at ordered
+                // realization, downstream of here. The staleness guard above covers retained DMA
+                // copies and retained ordered memory effects, and structurally cannot cover a
+                // dispatch: there is nothing to overlap against yet. `gpu_executor.cpp` says the same
+                // thing about its own similarly-named packet trace.
+                //
+                // So a title doing `compute writes a visibility word -> predicated jump over the draws
+                // that word guards`, in one submit, reads the PREVIOUS FRAME's word. The failure is
+                // silent and drops the entire jump segment.
+                //
+                // This is the cheap instrument #3574 asks for before anyone builds the deferral, and
+                // it is deliberately NOT the fix. What it reports is the HAZARD SHAPE -- a predicated
+                // jump folded while this submit already carries compute dispatches that have not run
+                // -- not a proven overlap: a dispatch's write ranges are not known at fold time
+                // without building its resource table, which is exactly the work the fold has not
+                // done yet. So read a line here as "this submit can exhibit #3574", and the absence of
+                // lines over a route as "this title never presents the shape", which is the question
+                // worth answering first.
+                // Two populations, deliberately counted apart, because conflating them is how a
+                // hazard census becomes a number nobody can act on.
+                //
+                //   PENDING -- a dispatch has been folded and has not run. Broad: the command
+                //   processor cannot observe a shader's writes at all without a guest-inserted
+                //   synchronisation, so most of these are not hazards.
+                //
+                //   ARMED -- a dispatch is pending AND the guest placed a StallCommandBufferParser
+                //   AFTER it and before this jump. That stall is the guest saying "the parser must
+                //   not run ahead of what I just produced", which is exactly the case where the
+                //   predicate is meant to be read after the dispatch. The executor already treats the
+                //   same packet as a producer-epoch boundary.
+                //
+                // Only ARMED is a claim about a likely wrong answer. Quoting PENDING as the hazard
+                // count overstates it; an earlier revision of this instrument did exactly that.
+                if (predlog && !dispatches.empty()) {
+                    const uint64_t last_dispatch_order = dispatches.back().command_order;
+                    // ARMED widened beyond the parser stall. StallCommandBufferParser is the PFP/ME
+                    // parser sync -- the boundary the executor uses for INDIRECT ARGUMENTS -- and it
+                    // does not wait for a shader. The packets that actually order a compute shader's
+                    // writes before a CP read are the EOP/event release and the register-memory wait,
+                    // all of which prosper decodes and all of which are handled at fold time with the
+                    // same missing-compute hole. Keying only on the parser stall would report a clean
+                    // zero for a title using the canonical mechanism -- a false negative on exactly
+                    // the case this instrument exists to find.
+                    const bool armed = last_cp_sync_order > last_dispatch_order;
+                    static std::atomic<uint64_t> pred_pending{0}, pred_armed{0};
+                    const uint64_t ord = pred_pending.fetch_add(1) + 1;
+                    const uint64_t armed_ord = armed ? pred_armed.fetch_add(1) + 1 : 0;
+                    const bool say = armed ? (armed_ord <= 24 || (armed_ord & (armed_ord - 1)) == 0)
+                                           : (ord <= 8 || (ord & (ord - 1)) == 0);
+                    if (say)
+                        fprintf(stderr,
+                                "[agc] predicated jump reads cond=0x%llx at FOLD time -- %s "
+                                "(pending=%zu armed=%llu of pending#%llu) target=0x%llx order=%llu "
+                                "(#3574)\n",
+                                (unsigned long long)pred_cond_addr,
+                                armed ? "ARMED: a CP sync packet follows the last dispatch"
+                                      : "pending compute only, no CP sync after it",
+                                dispatches.size(), (unsigned long long)pred_armed.load(),
+                                (unsigned long long)ord, (unsigned long long)c.jump_addr,
+                                (unsigned long long)command_order);
+                    // THE POSITIVE CONTROL. Without these counts, "ARMED = 0" and "this title emits
+                    // no synchronisation packets at all" are the same output -- an uncontrolled zero,
+                    // which this project has been burned by before. Printed on the same cadence so a
+                    // reader always has the denominator beside the numerator.
+                    if (say)
+                        fprintf(stderr,
+                                "[agc]   control: cp_sync_packets_seen=%llu parser_stalls_seen=%llu "
+                                "last_cp_sync_order=%llu last_dispatch_order=%llu\n",
+                                (unsigned long long)cp_sync_packets_seen,
+                                (unsigned long long)parser_stalls_seen,
+                                (unsigned long long)last_cp_sync_order,
+                                (unsigned long long)last_dispatch_order);
+                }
                 memcpy(&cond, (const void*)(uintptr_t)pred_cond_addr, sizeof cond);
                 skip = (cond != 0);
             }
@@ -5162,6 +5261,22 @@ void GpuState::apply(const Pm4Command& c) {
                             (unsigned long long)skipped.load());
             }
             if (skip) break;
+            // The same staleness applies to the jump's TARGET, and with a larger blast radius: the
+            // segment below is read out of guest memory at fold time, so a command stream a
+            // same-submit dispatch generated is read before that dispatch has run. The retained-DMA /
+            // ordered-effect guard above already tests BOTH the target and the predicate; the compute
+            // hole affects both too. Instrumenting only the predicate understated this axis.
+            if (predlog && !dispatches.empty()) {
+                static std::atomic<uint64_t> target_pending{0};
+                const uint64_t ord = target_pending.fetch_add(1) + 1;
+                if (ord <= 8 || (ord & (ord - 1)) == 0)
+                    fprintf(stderr,
+                            "[agc] jump TARGET segment read at FOLD time with %zu compute "
+                            "dispatch(es) pending #%llu target=0x%llx dwords=%u order=%llu (#3574)\n",
+                            dispatches.size(), (unsigned long long)ord,
+                            (unsigned long long)c.jump_addr, c.jump_dwords,
+                            (unsigned long long)command_order);
+            }
             if (!guest_readable(c.jump_addr, c.jump_dwords * 4)) break;   // whole segment must be mapped
             jump_depth++;
             run_command_buffer((const uint32_t*)(uintptr_t)c.jump_addr, c.jump_dwords, *this);
@@ -5253,7 +5368,8 @@ size_t run_command_buffer(const uint32_t* buf, size_t dwords, GpuState& st,
                     c.reg_offset + c.reg_count > prosper::agc::Pm4::SPI_SHADER_PGM_LO_ES)
                     ++pgm_writes;
             } else if (c.kind == K::DrawIndex || c.kind == K::DrawIndexAuto ||
-                       c.kind == K::DrawIndexOffset || c.kind == K::DrawIndexIndirect) {
+                       c.kind == K::DrawIndexOffset || c.kind == K::DrawIndexIndirect ||
+                       c.kind == K::DrawIndirect) {
                 ++draws;
             }
         }

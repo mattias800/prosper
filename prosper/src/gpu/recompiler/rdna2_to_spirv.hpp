@@ -25,6 +25,51 @@ constexpr uint32_t kDefaultComputePgmRsrc1 = 3u << 16;
 
 inline constexpr uint32_t kComputeInternalGdsBinding = 127;
 
+// SPV_KHR_float_controls / SignedZeroInfNanPreserve — a DEVICE-GATED declaration (#3479, #3561).
+//
+// WHY IT IS DECLARED AT ALL. RDNA2 VALU arithmetic defines Inf, NaN and signed zero exactly, and
+// guest programs rely on it: a compiler-generated `sign()` idiom synthesises +Inf with integer
+// shifts (((1<<8)-1) << 23 == 0x7F800000) and multiplies by it. Vulkan's default float contract does
+// not promise that, so a driver may compile the module assuming Inf never occurs. On Windows/NVIDIA
+// that multiply returned 0, PPSA02664's colour-grading LUT builder wrote an all-black 1024x32 LUT,
+// and every graded pixel composited to black while the UI — composited after the grade — stayed
+// pixel-perfect. RADV preserves Inf, so the identical build was correct on Linux/AMD.
+//
+// WHY IT IS GATED. An undeclarable capability makes the module INVALID; it is not silently ignored.
+// VUID-VkShaderModuleCreateInfo-pCode-08740 requires
+// VkPhysicalDeviceFloatControlsProperties::shaderSignedZeroInfNanPreserveFloat{16,32,64} == VK_TRUE,
+// and -08742 requires Vulkan 1.2 or VK_KHR_shader_float_controls. #3561 declared it unconditionally
+// on the strength of "shaderSignedZeroInfNanPreserveFloat32 is VK_TRUE on every implementation this
+// project runs on, and if one ever reports VK_FALSE pipeline creation fails loudly". BOTH halves
+// were false, and CI measured it on the first run: 2 VUIDs, x475 each, across four test binaries —
+// while all 464 tests PASSED. Nothing failed loudly, because a driver is free to honour an invalid
+// module. That is the undefined-contract case this repository already has a `Ruled out` row about
+// (#2422), not a loud failure. Do not restore an ungated declaration on the strength of a device
+// list; measure the device.
+//
+// THE CONTRACT OF THIS PAIR, and both halves chose their error direction:
+//   * Nothing is declared until a device owner publishes. The neutral state reproduces the
+//     pre-#3479 behaviour — legal on every device, Inf semantics unguaranteed — so a path that
+//     forgets to publish LOSES THE FIX rather than emitting a module no device may legally compile.
+//     Offline callers with no device at all (tools, CPU-only tests) sit here by construction.
+//   * Every publisher is ANDed in. A process may own more than one Vulkan device (the renderer's,
+//     and the compute backend's private one), and one emitted module has to be legal on all of
+//     them, so the weakest device decides.
+//
+// `declaration_permitted_by_api` is the -08742 half: the DEVICE's effective API version is at least
+// 1.2, or VK_KHR_shader_float_controls is ENABLED on it. Physical support for the extension is not
+// enough — the same rule as every other capability published through SharedVulkanContext.
+void publish_float_controls_support(bool signed_zero_inf_nan_preserve_float32,
+                                    bool declaration_permitted_by_api);
+
+// True when a guest module may declare SignedZeroInfNanPreserve: at least one device owner has
+// published, and every one of them can execute it legally.
+bool signed_zero_inf_nan_preserve_declared();
+
+// Restore the unpublished neutral state. Test hook only — it exists so the positive and negative
+// arms of `test_float_controls` can run in one process.
+void reset_float_controls_support_for_test();
+
 // PROSPER_CFG_TRIP_BOUND witness. When a dispatcher loop is bounded and the bound is REACHED, the
 // shader records what happened into the top of the internal GDS buffer, which is already host-backed
 // and read back after the dispatch. Arming a bound is not the same as hitting one, and until a run
@@ -550,6 +595,33 @@ inline constexpr uint32_t kFragmentWaveReasonScalarReduce = 1u << 7;
 
 // Reasons recorded by the emitter, or UINT32_MAX when the module carries no reason marker at
 // all (built, cached or captured before #2147). Absent must not read as none.
+// Whether this fragment module's wave votes answer the same at a narrower subgroup width.
+//
+// The native-wave32 allowance needs exactly this and nothing weaker. NVIDIA reports
+// minSubgroupSize == maxSubgroupSize == 32 for fragment, so a guest program that asked for a
+// 64-lane wave either runs over two independent 32-lane groups or does not run at all -- and the
+// only honest way to let it run is to prove the split cannot change a pixel.
+//
+// A vote clears on either of two independent grounds:
+//   (a) its operand is provably wave-uniform. Any(P) reduces P over whatever lanes the group holds,
+//       so when every invocation agrees on P the reduction IS P, at any width.
+//   (b) its result cannot influence a colour output -- through data flow OR through control
+//       dependence. A dead vote can be answered any way at all.
+//
+// Both halves of (b) are load-bearing, and the second one is the correction this replaced. Value
+// reachability alone says a vote used only as a branch condition is harmless, when in fact it
+// decides WHICH store runs: with the guest predicate true in the upper 32 lanes and false in the
+// lower, a 64-lane any() takes a branch that two 32-lane groups disagree about, and whatever the
+// taken block writes lands in one half only. Measured over 49 real fragment modules from four
+// titles, value reachability clears 49 of 49 while control dependence clears 1 -- so the weaker
+// question was not merely imprecise, it could not see the population at all. With arm (a) added,
+// 38 of the 49 clear.
+//
+// The error direction is chosen throughout: a module that cannot be parsed, a construct without a
+// merge, an opcode nobody classified -- each answers "not proven", costing a draw its native-width
+// fast path rather than shipping a wrong pixel.
+bool fragment_spirv_wave_width_independent(const std::vector<uint32_t>& spirv);
+
 uint32_t fragment_spirv_required_subgroup_reasons(const std::vector<uint32_t>& spirv);
 
 inline constexpr uint32_t kFragmentSubgroupVote = 1u << 0;

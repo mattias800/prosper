@@ -288,6 +288,17 @@ int main(int argc, char** argv) {
     }
     const std::string src_root = argv[2];
 
+    // Validate the DECLARED form of every module (#3479/#3561). The SignedZeroInfNanPreserve
+    // declaration is device-gated, and this tool owns no Vulkan device, so without this line it
+    // would validate only the neutral form and the declaration would have no spirv-val coverage at
+    // all. That coverage is not theoretical: spirv-val is the instrument that caught the emitter
+    // naming capability 4467 (RoundingModeRTE) while the execution mode named 4461 -- a mismatch no
+    // assertion sharing the emitter's own constants can see. Asserted true here for the same reason
+    // the rest of this tool synthesizes inputs: it is validating what the emitter can produce, not
+    // what this host happens to run.
+    prosper::gpu::publish_float_controls_support(/*signed_zero_inf_nan_preserve_float32=*/true,
+                                                 /*declaration_permitted_by_api=*/true);
+
     // Ask the directory directly rather than inferring writability from whether the validator probe
     // left anything behind: a spirv-val that exists but exits non-zero while printing nothing would
     // otherwise be diagnosed as an unwritable directory, sending the reader to the wrong place.
@@ -485,6 +496,20 @@ int main(int argc, char** argv) {
       ShaderResourceTable rt; ShaderResource vb{}; vb.cls=ResourceClass::VertexBuffer; vb.format=DataFormat::Float32;
       vb.num_components=1; vb.binding=3; vb.stride=4; vb.sgpr_base=8; rt.resources.push_back(vb);
       dump(dir, "compute_store", recompile_valu(c, sizeof(c)/4, 1, 0, &rt)); }
+    // Compute MUBUF PACKED-WORD store (#3575). The module above stores a raw dword and therefore
+    // exercises none of this: pack_ufloat alone emits a nest of OpSelect over exponent/mantissa
+    // extraction and a round-to-even shift, which is exactly the shape strict validation catches and
+    // llvmpipe accepts. Two arms, because the float and the normalized halves reach different
+    // converters (pack_ufloat vs pack_norm) and only the format differs between them.
+    { const uint32_t c[] = {0x7e140f00u, 0x7e020280u, 0x7e0402ffu, 0x3e800000u, 0x7e0602f0u,
+                            0x7e0802f2u, 0xe01c2000u, 0x8002010au, 0xbf810000u};
+      ShaderResourceTable rt; ShaderResource vb{}; vb.cls=ResourceClass::VertexBuffer;
+      vb.format=DataFormat::Float10_11_11; vb.num_components=3; vb.binding=3; vb.stride=4;
+      vb.sgpr_base=8; rt.resources.push_back(vb);
+      dump(dir, "compute_store_packed_10_11_11", recompile_valu(c, sizeof(c)/4, 1, 0, &rt));
+      ShaderResourceTable rtn; ShaderResource vn = vb; vn.format=DataFormat::Unorm2_10_10_10;
+      vn.num_components=4; rtn.resources.push_back(vn);
+      dump(dir, "compute_store_packed_2_10_10_10", recompile_valu(c, sizeof(c)/4, 1, 0, &rtn)); }
     // GTA V's cross-workgroup scan publication shape: distinct descriptor variables alias one guest
     // allocation, a GLC store is released by vscnt(0), and a GLC+DLC load polls through the alias.
     // This representative module strictly validates Aliased/Coherent decorations, per-access
@@ -822,6 +847,15 @@ int main(int argc, char** argv) {
       const FragmentInterpolationLayout layout =
           fragment_interpolation_layout(ps, sizeof(ps)/4, &perspective_center);
       dump(dir, "geometry_interpolation", recompile_interpolation_geometry(layout),
+           "recompile_interpolation_geometry");
+      // The rect-synthesis variant is a DIFFERENT module -- extra types, a bvec4, and a dozen selects
+      // the plain form never emits -- so validating only the form above validates none of it. That
+      // gap is how an OpSelect with a vec4 result and a scalar condition (legal only from SPIR-V 1.4,
+      // and this emitter stamps 1.3) reached CI in #3511; spirv-val rejects it outright. One emitter,
+      // two shapes, so both are dumped.
+      dump(dir, "geometry_interpolation_rect",
+           recompile_interpolation_geometry(layout, /*capture_position=*/false,
+                                            /*synthesize_rect=*/true),
            "recompile_interpolation_geometry"); }
 
     fails += check_emitter_coverage(src_root);

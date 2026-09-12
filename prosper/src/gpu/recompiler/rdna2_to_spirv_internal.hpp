@@ -188,6 +188,7 @@ enum : uint32_t {
     Op_Capability=17, Op_TypeVoid=19, Op_TypeBool=20, Op_TypeInt=21, Op_TypeFloat=22, Op_TypeVector=23,
     Op_TypeRuntimeArray=29, Op_TypeStruct=30, Op_TypePointer=32, Op_TypeFunction=33,
     Op_ConstantTrue=41, Op_ConstantFalse=42, Op_Constant=43, Op_Function=54, Op_FunctionEnd=56, Op_Variable=59,
+    Op_Dot=148,
     Op_LogicalOr=166, Op_LogicalAnd=167, Op_LogicalNot=168, Op_Select=169, Op_FOrdEqual=180, Op_FOrdNotEqual=182, Op_FOrdLessThan=184, Op_FOrdGreaterThan=186,
     Op_FOrdLessThanEqual=188, Op_FOrdGreaterThanEqual=190,
     Op_FUnordEqual=181, Op_FUnordNotEqual=183, Op_FUnordLessThan=185, Op_FUnordGreaterThan=187,   // NaN-inclusive ("n"-prefix) compares
@@ -243,10 +244,19 @@ enum : uint32_t {
     // one of them is a GroupNonUniform op, which reads exactly like descriptor indexing is already
     // supported. It was not.
     Cap_ShaderNonUniform=5301,
+    // SPV_KHR_float_controls. Declared by declare_float_controls() for every guest module, on a
+    // device that has been MEASURED to accept it; see the comment there (#3479, gated in #3561).
+    // The five capabilities of that extension are CONSECUTIVE and easy to take one off by:
+    // 4464 DenormPreserve, 4465 DenormFlushToZero, 4466 SignedZeroInfNanPreserve,
+    // 4467 RoundingModeRTE, 4468 RoundingModeRTZ. The first draft of this line said 4467, and
+    // NVIDIA honoured the execution mode anyway while emitting an invalid module -- only
+    // `spv_validate` (spirv-val, an instrument that does not share this header) reported it.
+    Cap_SignedZeroInfNanPreserve=4466,
     Cap_StorageBufferArrayNonUniformIndexing=5308,
     Addr_Logical=0, Mem_GLSL450=1, Exec_Vertex=0, Exec_Geometry=3, Exec_Fragment=4, Exec_GLCompute=5,
     EM_OriginUpperLeft=7, EM_DepthReplacing=12, EM_LocalSize=17, EM_Triangles=22,
     EM_OutputVertices=26, EM_OutputTriangleStrip=29, EM_Xfb=11,   // transform-feedback execution mode
+    EM_SignedZeroInfNanPreserve=4461,
     SC_Input=1, SC_UniformConstant=0, SC_Output=3, SC_Function=7, SC_PushConstant=9,
     SC_Image=11, SC_StorageBuffer=12, FC_None=0,
     Dim_1D=0, Dim_2D=1, Dim_3D=2,   // SPIR-V Dim. (2D coincides with the SQ_RSRC 2D dim value, but distinct.)
@@ -394,6 +404,38 @@ struct SpirvCompute {
         put(caps, Op_Capability, {Cap_StorageBufferArrayNonUniformIndexing});
         std::vector<uint32_t> o; pstr(o, "SPV_EXT_descriptor_indexing");
         putv(exts, Op_Extension, o);
+    }
+    // GUEST FLOAT SEMANTICS ARE INF/NAN-EXACT; VULKAN'S DEFAULT IS NOT (#3479).
+    // RDNA2 VALU arithmetic defines Inf, NaN and signed zero exactly, and real guest programs rely
+    // on it. Worked example, the one that found this: Unity's `sign()` idiom synthesises +Inf with
+    // integer shifts (((1<<8)-1) << 23 == 0x7F800000), multiplies the operand by it, then clamps to
+    // [0,1] and truncates. A module that does not declare SignedZeroInfNanPreserve leaves the host
+    // driver free to compile under no-Inf/no-NaN assumptions. Measured on Windows/NVIDIA: that
+    // multiply yields 0 rather than +Inf, so sign() answers 0 everywhere, PPSA02664's colour-grading
+    // LUT builder writes an all-black 1024x32 LUT, and every graded pixel of the scene composites to
+    // black -- while the UI, composited after the grade, stays pixel-perfect. RADV preserves Inf,
+    // which is why the same build renders the same frame correctly on Linux/AMD. A vendor split, not
+    // a title quirk, and invisible to any test whose only device preserves Inf anyway.
+    // Declared for EVERY guest module the device can take it on, not only ones observed to need it:
+    // a driver may exploit the assumption at any float op, so "which shaders touch Inf" is not a
+    // property this emitter can decide.
+    // DEVICE-GATED, and the gate is not optional. An earlier revision of this comment asserted that
+    // shaderSignedZeroInfNanPreserveFloat32 is VK_TRUE everywhere prosper runs, so no gate was
+    // needed, "and if one ever reports VK_FALSE, pipeline creation fails loudly". Both halves were
+    // false: CI's Vulkan validation scan reported VUID-...-08740 and -08742 x475 across four
+    // binaries WHILE ALL 464 TESTS PASSED -- an invalid module a driver honoured anyway, which is an
+    // undefined contract rather than a loud failure (#3561). The device-side query and the whole
+    // contract live at rdna2_to_spirv.hpp's publish_float_controls_support(); this call site only
+    // reads the answer, and reads it as "no" until some device owner has measured a device.
+    bool float_controls_declared = false;
+    void declare_float_controls(uint32_t entry) {
+        if (float_controls_declared) return;
+        if (!signed_zero_inf_nan_preserve_declared()) return;
+        float_controls_declared = true;
+        put(caps, Op_Capability, {Cap_SignedZeroInfNanPreserve});
+        std::vector<uint32_t> o; pstr(o, "SPV_KHR_float_controls");
+        putv(exts, Op_Extension, o);
+        put(exec, Op_ExecutionMode, {entry, EM_SignedZeroInfNanPreserve, 32});
     }
     std::unordered_map<uint32_t, uint32_t> fconst_cache, uconst_cache;
     uint32_t next_id = 1;
@@ -2367,8 +2409,11 @@ struct SpirvCompute {
     // bounds check narrowed EXEC). The loaded value for such a lane is discarded by write-back predication
     // (predicate_write) at the call site, so it is harmless — PROVIDED the device enables IMAGE ROBUSTNESS
     // (robustImageAccess / VK_EXT_image_robustness: OOB image reads return 0), the image analogue of the
-    // robustBufferAccess this recompiler already depends on for buffer loads. The runtime must enable it
-    // (the test harness does). The store side is instead EXEC-predicated (no robust "harmless" OOB write).
+    // robustBufferAccess this recompiler already depends on for buffer loads. Every device prosper
+    // executes this on acquires it through frontends/shared/device/image_robustness.hpp, and a device
+    // that CANNOT declines the storage-image path rather than running it undefined (#3531 -- until
+    // then the compute backend's own device silently did neither). The store side is instead
+    // EXEC-predicated (no robust "harmless" OOB write).
     void image_read(uint32_t binding, uint32_t dim, bool arrayed, uint32_t ncoord, const uint32_t* coords,
                     uint32_t out[4], bool ms = false, uint32_t sample = 0) {
         if (stg_img_format[binding] == ImgFmt_Unknown && !declared_read_wo_fmt) {
@@ -3800,6 +3845,7 @@ struct SpirvCompute {
         f_main = id(); uint32_t lbl = id(); glsl = id();
 
         put(caps, Op_Capability, {Cap_Shader});
+        declare_float_controls(f_main);
         { std::vector<uint32_t> o{glsl}; pstr(o, "GLSL.std.450"); putv(extimp, Op_ExtInstImport, o); }
         put(mem, Op_MemoryModel, {Addr_Logical, Mem_GLSL450});
         is_compute = true;
@@ -3943,6 +3989,7 @@ struct SpirvCompute {
             if (color_mask & (1u << mrt)) v_color[mrt] = id();
         f_main = id(); uint32_t lbl = id(); glsl = id();
         put(caps, Op_Capability, {Cap_Shader});
+        declare_float_controls(f_main);
         { std::vector<uint32_t> o{glsl}; pstr(o, "GLSL.std.450"); putv(extimp, Op_ExtInstImport, o); }
         put(mem, Op_MemoryModel, {Addr_Logical, Mem_GLSL450});
         is_fragment = true;
@@ -4022,6 +4069,7 @@ struct SpirvCompute {
         uint32_t t_pv = id(), t_ptr_out_pv = id(); v_pos = id(); t_ptr_out_v4f = id();
         f_main = id(); uint32_t lbl = id(); glsl = id();
         put(caps, Op_Capability, {Cap_Shader});
+        declare_float_controls(f_main);
         { std::vector<uint32_t> o{glsl}; pstr(o, "GLSL.std.450"); putv(extimp, Op_ExtInstImport, o); }
         put(mem, Op_MemoryModel, {Addr_Logical, Mem_GLSL450});
         is_vertex = true;
@@ -4263,8 +4311,49 @@ struct SpirvCompute {
     // extension. Input assembly has already decomposed lists/strips/fans into triangles here. A
     // three-vertex PS5 RectList whose attributes come from a vertex buffer also comes through this
     // stage: GFX10 synthesizes its fourth corner after vertex shading, while Vulkan has no RectList
-    // topology. The missing post-VS position and every consumed varying are the affine fourth
-    // corner P1 + P2 - P0; emitting P0,P1,P2,P3 as a strip preserves the hardware rectangle.
+    // topology. Emitting P0,P1,P2,P3 as a strip preserves the hardware rectangle.
+    //
+    // WHICH corner is missing is decided per draw, not by a fixed index. Three supplied corners of a
+    // rectangle are one SHARED corner (adjacent to both others) plus that corner's diagonal pair; the
+    // synthesized vertex is the shared corner's opposite, `diag_a + diag_b - shared`. This used to be
+    // hardcoded to `P1 + P2 - P0`, i.e. "the shared corner is always P0". Darksiders II's video blit
+    // supplies its rectangle in the other order -- P0=bottom-right, P1=top-left, P2=top-right, so the
+    // shared corner is P2 and the missing one is bottom-left. Under the hardcoded rule that draw
+    // synthesized (-1,3) instead of (-1,-1): off-screen, so its half of the strip never rasterized and
+    // the FMV rendered as the single upper-right triangle of #3507.
+    //
+    // The shared corner is identified geometrically, from the shaded positions: of the three pairwise
+    // separations the largest is the diagonal, and the vertex not on it is the shared corner. For a
+    // rectangle this is exact (the diagonal strictly exceeds either side), it needs no convention
+    // guess, and it AGREES with the old formula precisely when the old formula was right -- when P0 is
+    // the shared corner it selects `P1 + P2 - P0` -- so no draw that renders correctly today changes.
+    // Every varying and the explicit-parameter barycentrics follow the same selected index.
+    //
+    // CONFIDENCE: MED on the choice of discriminator, HIGH that it beats the fixed index it replaces.
+    // "Longest separation is the diagonal" is exact for a rectangle and for any parallelogram whose
+    // shared corner is not acute enough to make a side exceed a diagonal; a sufficiently SHEARED
+    // parallelogram breaks it, and the rule would then complete the wrong corner. Every RectList
+    // observed so far is an axis-aligned screen-space rectangle, where it cannot happen. Separation is
+    // measured on the full 4-component clip position, which is exact when w is constant across the
+    // three vertices -- true of every screen-space blit, and the same assumption the hardware's own
+    // affine completion makes. A title that submits a genuinely sheared or perspective-divided
+    // RectList would need the real hardware rule, which needs a title to demonstrate it.
+    //
+    // The EMISSION ORDER is the other half, and getting only the corner right is not enough. A strip's
+    // two triangles share its middle edge, so that edge must be the rectangle's DIAGONAL -- the shared
+    // corner leads and the synthesized one comes last. Emitting the supplied order when the shared
+    // corner is not v0 gives two triangles that share a SIDE instead: they overlap on one half and
+    // leave the wedge between the two diagonals uncovered, which on Darksiders II's blit is a black
+    // triangle with its apex at the screen centre.
+    //
+    // The order is a ROTATION of the supplied triple -- supplied[(shared + slot) % 3] -- and it has to
+    // be, because a strip's facing is its FIRST triangle's and the guest's cull state is passed
+    // straight through (`render_state.cpp`, no RectList exemption). "Shared first, then the other two
+    // in ascending order" also puts the diagonal in the middle, but for shared == v1 it is the odd
+    // permutation (v1,v0,v2): it reverses the facing, so a culled draw would render NOTHING where it
+    // previously rendered half. Rotations are even, so facing is preserved for all three. When the
+    // shared corner is v0 the rotation is the identity, so nothing that renders correctly today
+    // changes. Vulkan flips the winding test on a strip's odd triangle, so both halves agree.
     std::vector<uint32_t> build_interpolation_geometry(
             const FragmentInterpolationLayout& layout, bool capture_geometry_position,
             bool synthesize_rect = false) {
@@ -4272,6 +4361,14 @@ struct SpirvCompute {
 
         t_void = id(); t_fn = id(); t_f32 = id(); t_u32 = id(); t_i32 = id(); t_bool = id();
         t_v4f = id();
+        // This module declares SPIR-V 1.3 (see finish()), where an OpSelect with a VECTOR result needs
+        // a vector condition of the same width -- a scalar condition is only legal from 1.4. The rect
+        // path is the only place here selecting between vec4s, so the bvec4 is allocated and declared
+        // only for it, and the non-synthesis module gains no instruction and no type from it.
+        // (That module is NOT byte-identical to before this change: loading the positions earlier
+        // renumbers the ids after it, and the `consumes_parameters` guard below elides a composite
+        // that nothing consumed. Both are semantically inert; ids are module-internal.)
+        const uint32_t t_v4bool = synthesize_rect ? id() : 0;
         const uint32_t t_input_per_vertex = id(), t_output_per_vertex = id();
         const uint32_t c_three = id();
         const uint32_t t_input_positions = id(), t_input_varyings = id();
@@ -4298,6 +4395,7 @@ struct SpirvCompute {
                 system_outputs[field] = id();
 
         put(caps, Op_Capability, {Cap_Shader});
+        declare_float_controls(f_main);
         put(caps, Op_Capability, {Cap_Geometry});
         if (capture_geometry_position) put(caps, Op_Capability, {Cap_TransformFeedback});
         { std::vector<uint32_t> operands{glsl}; pstr(operands, "GLSL.std.450");
@@ -4354,6 +4452,7 @@ struct SpirvCompute {
         put(types, Op_TypeInt, {t_i32, 32, 1});
         put(types, Op_TypeBool, {t_bool});
         put(types, Op_TypeVector, {t_v4f, t_f32, 4});
+        if (synthesize_rect) put(types, Op_TypeVector, {t_v4bool, t_bool, 4});
         put(types, Op_TypeStruct, {t_input_per_vertex, t_v4f});
         put(types, Op_TypeStruct, {t_output_per_vertex, t_v4f});
         put(types, Op_Constant, {t_u32, c_three, 3});
@@ -4390,6 +4489,67 @@ struct SpirvCompute {
                 put(code, Op_Load, {t_v4f, attribute_values[attr][vertex], pointer});
             }
         }
+        std::array<uint32_t, 3> positions{};
+        for (uint32_t vertex = 0; vertex < 3; ++vertex) {
+            const uint32_t input_pointer = id();
+            put(code, Op_AccessChain,
+                {ptr_in_v4f, input_pointer, input_position, uconst(vertex), uconst(0)});
+            positions[vertex] = id();
+            put(code, Op_Load, {t_v4f, positions[vertex], input_pointer});
+        }
+
+        // `rect_shared_is_v0` / `rect_shared_is_v1` name the supplied vertex adjacent to both others
+        // (neither true => it is v2). Compared as squared separations, so no square root is needed.
+        uint32_t rect_shared_is_v0 = 0, rect_shared_is_v1 = 0;
+        // The same two selectors widened to bvec4, for the vec4 selects (see the t_v4bool note).
+        uint32_t rect_shared_is_v0_wide = 0, rect_shared_is_v1_wide = 0;
+        if (synthesize_rect) {
+            auto squared_separation = [&](uint32_t a, uint32_t b) {
+                const uint32_t delta = id();
+                put(code, Op_FSub, {t_v4f, delta, a, b});
+                const uint32_t squared = id();
+                put(code, Op_Dot, {t_f32, squared, delta, delta});
+                return squared;
+            };
+            const uint32_t d01 = squared_separation(positions[0], positions[1]);
+            const uint32_t d02 = squared_separation(positions[0], positions[2]);
+            const uint32_t d12 = squared_separation(positions[1], positions[2]);
+            const uint32_t d12_ge_d01 = id(), d12_ge_d02 = id();
+            put(code, Op_FOrdGreaterThanEqual, {t_bool, d12_ge_d01, d12, d01});
+            put(code, Op_FOrdGreaterThanEqual, {t_bool, d12_ge_d02, d12, d02});
+            rect_shared_is_v0 = id();
+            put(code, Op_LogicalAnd, {t_bool, rect_shared_is_v0, d12_ge_d01, d12_ge_d02});
+            // Only consulted when v0 is not the shared corner, so d02 vs d01 settles it.
+            rect_shared_is_v1 = id();
+            put(code, Op_FOrdGreaterThanEqual, {t_bool, rect_shared_is_v1, d02, d01});
+            auto broadcast = [&](uint32_t condition) {
+                const uint32_t wide = id();
+                putv(code, Op_CompositeConstruct,
+                     {t_v4bool, wide, condition, condition, condition, condition});
+                return wide;
+            };
+            rect_shared_is_v0_wide = broadcast(rect_shared_is_v0);
+            rect_shared_is_v1_wide = broadcast(rect_shared_is_v1);
+        }
+        // The fourth value of any per-vertex quantity, under the selected shared corner.
+        auto synthesize_fourth = [&](uint32_t v0, uint32_t v1, uint32_t v2) {
+            auto complete = [&](uint32_t diag_a, uint32_t diag_b, uint32_t shared) {
+                const uint32_t sum = id();
+                put(code, Op_FAdd, {t_v4f, sum, diag_a, diag_b});
+                const uint32_t corner = id();
+                put(code, Op_FSub, {t_v4f, corner, sum, shared});
+                return corner;
+            };
+            const uint32_t shared_v0 = complete(v1, v2, v0);
+            const uint32_t shared_v1 = complete(v0, v2, v1);
+            const uint32_t shared_v2 = complete(v0, v1, v2);
+            const uint32_t not_v0 = id();
+            put(code, Op_Select, {t_v4f, not_v0, rect_shared_is_v1_wide, shared_v1, shared_v2});
+            const uint32_t chosen = id();
+            put(code, Op_Select, {t_v4f, chosen, rect_shared_is_v0_wide, shared_v0, not_v0});
+            return chosen;
+        };
+
         std::array<std::array<uint32_t, 3>, 32> parameters{};
         std::array<uint32_t, 32> rect_attribute_values{};
         for (uint32_t attr = 0; attr < 32; ++attr) {
@@ -4406,35 +4566,46 @@ struct SpirvCompute {
                 put(code, Op_FSub, {t_v4f, parameters[attr][1],
                                     attribute_values[attr][2], attribute_values[attr][0]});
             }
-            if (synthesize_rect) {
-                const uint32_t sum = id();
-                put(code, Op_FAdd, {t_v4f, sum,
-                                    attribute_values[attr][1], attribute_values[attr][2]});
-                rect_attribute_values[attr] = id();
-                put(code, Op_FSub, {t_v4f, rect_attribute_values[attr],
-                                    sum, attribute_values[attr][0]});
-            }
+            if (synthesize_rect)
+                rect_attribute_values[attr] = synthesize_fourth(attribute_values[attr][0],
+                                                                attribute_values[attr][1],
+                                                                attribute_values[attr][2]);
         }
 
-        std::array<uint32_t, 3> positions{};
-        for (uint32_t vertex = 0; vertex < 3; ++vertex) {
-            const uint32_t input_pointer = id();
-            put(code, Op_AccessChain,
-                {ptr_in_v4f, input_pointer, input_position, uconst(vertex), uconst(0)});
-            positions[vertex] = id();
-            put(code, Op_Load, {t_v4f, positions[vertex], input_pointer});
-        }
         uint32_t rect_position = 0;
-        if (synthesize_rect) {
-            const uint32_t sum = id();
-            put(code, Op_FAdd, {t_v4f, sum, positions[1], positions[2]});
-            rect_position = id();
-            put(code, Op_FSub, {t_v4f, rect_position, sum, positions[0]});
-        }
+        if (synthesize_rect)
+            rect_position = synthesize_fourth(positions[0], positions[1], positions[2]);
+
+        // Value emitted in strip slot `slot`. The supplied triple is ROTATED so the shared corner
+        // leads -- slot k carries supplied[(shared + k) % 3] -- then the synthesized corner last.
+        // Without rect synthesis this is the identity, so the plain path is unchanged.
+        auto slot_of = [&](uint32_t slot, const std::array<uint32_t, 3>& supplied,
+                           uint32_t synthesized) -> uint32_t {
+            if (!synthesize_rect) return supplied[slot];
+            if (slot == 3) return synthesized;
+            // supplied[(shared + slot) % 3] -- a ROTATION, chosen at runtime.
+            const uint32_t if_v0 = supplied[(0 + slot) % 3];
+            const uint32_t if_v1 = supplied[(1 + slot) % 3];
+            const uint32_t if_v2 = supplied[(2 + slot) % 3];
+            const uint32_t not_v0 = id();
+            put(code, Op_Select, {t_v4f, not_v0, rect_shared_is_v1_wide, if_v1, if_v2});
+            const uint32_t chosen = id();
+            put(code, Op_Select, {t_v4f, chosen, rect_shared_is_v0_wide, if_v0, not_v0});
+            return chosen;
+        };
+        // A float chosen by the shared corner: `if_v0` / `if_v1` / `if_v2`.
+        auto by_shared_corner = [&](float if_v0, float if_v1, float if_v2) {
+            const uint32_t not_v0 = id();
+            put(code, Op_Select,
+                {t_f32, not_v0, rect_shared_is_v1, fconstf(if_v1), fconstf(if_v2)});
+            const uint32_t chosen = id();
+            put(code, Op_Select, {t_f32, chosen, rect_shared_is_v0, fconstf(if_v0), not_v0});
+            return chosen;
+        };
 
         const uint32_t output_vertices = synthesize_rect ? 4u : 3u;
         for (uint32_t vertex = 0; vertex < output_vertices; ++vertex) {
-            const uint32_t position = vertex < 3 ? positions[vertex] : rect_position;
+            const uint32_t position = slot_of(vertex, positions, rect_position);
             uint32_t output_pointer = id();
             put(code, Op_AccessChain,
                 {ptr_out_v4f, output_pointer, output_position, uconst(0)});
@@ -4443,20 +4614,40 @@ struct SpirvCompute {
             for (uint32_t attr = 0; attr < 32; ++attr) {
                 if (attribute_outputs[attr])
                     put(code, Op_Store,
-                        {attribute_outputs[attr], vertex < 3
-                            ? attribute_values[attr][vertex] : rect_attribute_values[attr]});
+                        {attribute_outputs[attr],
+                         slot_of(vertex, attribute_values[attr], rect_attribute_values[attr])});
                 for (uint32_t selector = 0; selector < 3; ++selector)
                     if (parameter_outputs[attr][selector])
                         put(code, Op_Store,
                             {parameter_outputs[attr][selector], parameters[attr][selector]});
             }
-            const float i = vertex == 1 || vertex == 3 ? 1.0f : 0.0f;
-            const float j = vertex == 2 || vertex == 3 ? 1.0f : 0.0f;
-            const uint32_t barycentric = id();
-            putv(code, Op_CompositeConstruct,
-                 {t_v4f, barycentric, fconstf(i), fconstf(j), fconstf(1.0f), fconstf(1.0f)});
-            for (uint32_t variable : system_outputs)
-                if (variable) put(code, Op_Store, {variable, barycentric});
+            // The explicit-parameter basis is P0=A0, P10=A1-A0, P20=A2-A0, so a vertex's (i,j) are
+            // its coordinates in it. The synthesized corner's depend on which vertex was shared:
+            // shared v0 -> A1+A2-A0 = (1,1); shared v1 -> A0+A2-A1 = (-1,1); shared v2 -> (1,-1).
+            const bool consumes_parameters =
+                std::any_of(system_outputs.begin(), system_outputs.end(),
+                            [](uint32_t variable) { return variable != 0; });
+            if (consumes_parameters) {
+                // Supplied v0/v1/v2 sit at (0,0), (1,0), (0,1); the synthesized corner is the
+                // shared corner's opposite, so its coordinates negate the shared axis.
+                uint32_t bary_i, bary_j;
+                if (synthesize_rect) {
+                    // [slot][shared corner]. Slot k carries supplied[(shared + k) % 3], whose
+                    // coordinates are v0=(0,0), v1=(1,0), v2=(0,1); slot 3 is the synthesized corner.
+                    static constexpr float kI[4][3] = {{0, 1, 0}, {1, 0, 0}, {0, 0, 1}, {1, -1, 1}};
+                    static constexpr float kJ[4][3] = {{0, 0, 1}, {0, 1, 0}, {1, 0, 0}, {1, 1, -1}};
+                    bary_i = by_shared_corner(kI[vertex][0], kI[vertex][1], kI[vertex][2]);
+                    bary_j = by_shared_corner(kJ[vertex][0], kJ[vertex][1], kJ[vertex][2]);
+                } else {
+                    bary_i = fconstf(vertex == 1 ? 1.0f : 0.0f);
+                    bary_j = fconstf(vertex == 2 ? 1.0f : 0.0f);
+                }
+                const uint32_t barycentric = id();
+                putv(code, Op_CompositeConstruct,
+                     {t_v4f, barycentric, bary_i, bary_j, fconstf(1.0f), fconstf(1.0f)});
+                for (uint32_t variable : system_outputs)
+                    if (variable) put(code, Op_Store, {variable, barycentric});
+            }
             put(code, Op_EmitVertex, {});
         }
         put(code, Op_EndPrimitive, {});
@@ -4521,12 +4712,40 @@ struct SpirvCompute {
 // Machine state during recompilation: the VGPR and SGPR files (VGPR/SGPR number -> current SSA bits
 // id) and VCC (current bool condition). VGPRs and SGPRs are separate register files; VALU/EXP source
 // operands may reference either (SGPR is a valid ALU operand), so both are resolved by operand_bits.
+// True when the scalar register currently holds a value prosper knows is NOT wave-uniform (#3596).
+// Defined beside RegState so every uniformity predicate can ask the same question the same way; the
+// lookup is on the register's CURRENT SSA value, so an overwrite clears it without bookkeeping.
+inline bool scalar_is_lane_local(const struct RegState& rs, int sgpr);
+
 struct RegState {
     std::unordered_map<int, uint32_t> vreg, sreg;
     // The latest VCC SSA value proved identical in every guest lane. A fragment VCCZ branch over
     // that exact value is already scalar and needs no subgroup vote. Tying the proof to the SSA id
     // makes an overwrite or control-flow merge invalidate it automatically.
     uint32_t vcc_wave_uniform = 0;
+    // SSA values that are NOT wave-uniform despite living in a scalar register (#3596).
+    //
+    // prosper models one guest lane per invocation and has no cross-lane reduction, so
+    // `v_readfirstlane_b32` is lowered as THIS lane's source value -- it is annotated
+    // SPECULATIVE(confidence: med) at that site for exactly this reason. The result lands in
+    // `sreg`, and every uniformity predicate downstream treats "it is in a scalar register" as
+    // "it broadcasts one value to the whole wave". For a readfirstlane result that is false.
+    //
+    // It matters because a fragment `s_cbranch_vccz` whose VCC derives from such a value would
+    // otherwise pass the wave-uniformity proof and SKIP its wave vote, branching on the lane's own
+    // bit -- wrong pixels, no reject, no diagnostic.
+    //
+    // Keyed on the SSA VALUE rather than the register number, which makes copy propagation free:
+    // `s_mov_b32` lowers as `d = a`, so a tainted value stays tainted through any number of scalar
+    // moves, and an overwrite installs a fresh id that is naturally clean.
+    //
+    // THE TAINT SURVIVES COPIES AND NOTHING ELSE, and the gap is wider than a round-trip through a
+    // dispatcher variable. Any scalar ALU that COMPUTES from a tainted value produces a fresh id that
+    // is clean: `s_add_u32 s3, s0, s5` launders it, and so does an `s_cselect_b32` on SCC. SCC itself
+    // is a third route -- a compare on tainted operands sets SCC, and SCC read as a VOPC source
+    // returns from `scalar_data_operand` one line BEFORE the lane-local check. So this closes the
+    // direct and copy-laundered shapes, not the class. #3606 carries the propagation work.
+    std::unordered_set<uint32_t> lane_local_scalars;
     // Before the first compact structured construct, map presence means that the scalar value
     // reaches this exact linear path. Branch/loop PHIs can synthesize zero for an absent SGPR and
     // clear this marker. The CFG dispatcher likewise allocates Function variables for every
@@ -4633,6 +4852,12 @@ struct RegState {
     // never-written slot rejects (fail-visible).
     std::unordered_map<uint64_t, uint32_t> lds_addtid;
 };
+
+inline bool scalar_is_lane_local(const RegState& rs, int sgpr) {
+    if (rs.lane_local_scalars.empty()) return false;
+    const auto it = rs.sreg.find(sgpr);
+    return it != rs.sreg.end() && rs.lane_local_scalars.count(it->second) != 0;
+}
 
 inline bool has_wave64_mask_half_pair(const RegState& rs, int base) {
     const auto low = rs.sreg_wave64_mask_half.find(base);

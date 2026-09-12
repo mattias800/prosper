@@ -241,6 +241,11 @@ enum class SaveDataMountOutcome { NotFound, Exists, Opened, Created };
 bool savedata_dirname_ok(const std::string& dirname);
 SaveDataMountOutcome savedata0_mount(const char* dirname, SaveDataMountPolicy policy);
 bool savedata0_umount();
+// The host directory the guest's "/savedata0" currently resolves to, or "" when nothing is mounted.
+// The save's parameter block (sceSaveDataSetParam/GetParam, #2786) is stored inside that directory,
+// so it needs the same answer the file mount gives rather than recomposing the path from a dirName
+// the caller would have to keep its own copy of.
+std::string savedata0_mounted_dir();
 std::vector<std::string> savedata0_list_dirs();   // existing save dirs under the host save root (#299)
 // Read a virtual save slot's param.sfo modification time (or directory time if absent). Rejects names
 // that are not a single guest directory component; used only for SaveDataDialog date-focus ordering.
@@ -259,6 +264,9 @@ size_t savedata_tx_resource_live_count();
 void register_service_hle();
 // libSceHttp local URI helpers; called by register_builtin_hle().
 void register_http_hle();
+// libSceHttp2: local id lifecycle, recorded settings, and an honest offline failure on the
+// request/response path; called by register_builtin_hle().
+void register_http2_hle();
 // libSceFont/libSceFontFt opaque lifecycle and deterministic metrics; called by register_builtin_hle().
 void register_font_hle();
 // libSceFiber cooperative guest-stack switching; called by register_builtin_hle().

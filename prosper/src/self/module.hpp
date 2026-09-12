@@ -60,6 +60,15 @@ struct Reloc {
     int64_t  addend = 0;
     bool     is_plt = false;
 };
+// ELF symbol types (the low nibble of st_info, i.e. ELF64_ST_TYPE). Retained on every parsed symbol
+// because a FUNCTION import and a DATA import must be bound to different things: a function import
+// is bound to an executable trampoline, while a data import names a VARIABLE the guest reads and
+// writes. Binding a variable to a trampoline makes the guest read prosper's machine code as its
+// value, and — the serious half — makes a guest store overwrite executable stub bytes (#3529). The
+// type is the only thing in the symbol table that distinguishes the two cases.
+enum : uint8_t { STT_NOTYPE = 0, STT_OBJECT = 1, STT_FUNC = 2, STT_SECTION = 3,
+                 STT_FILE = 4, STT_COMMON = 5, STT_TLS = 6 };
+
 struct Symbol {
     std::string raw;       // "NID#libId#modId" (or plain)
     std::string nid;       // the NID part
@@ -67,11 +76,13 @@ struct Symbol {
     uint16_t    shndx = 0;
     uint64_t    value = 0;
     bool        is_import = false; // undefined + value 0
+    uint8_t     elf_type = STT_NOTYPE;  // ELF64_ST_TYPE(st_info)
     std::string lib_name;  // resolved from lib_id
 };
 struct Import {            // one unresolved external symbol
     std::string nid, lib_name;
     uint32_t    sym_index = 0;
+    uint8_t     elf_type = STT_NOTYPE;  // ELF64_ST_TYPE(st_info) of the defining symbol entry
 };
 
 // Defining-module identity for a TLS export. DTPMOD64 and DTPOFF64 form one tls_index pair, so

@@ -1,8 +1,10 @@
 #pragma once
 #include "gpu/execute/gpu_execute.hpp"
 #include "shared/compute/compute_image_borrow_census.hpp"
+#include "shared/device/storage_image_contract.hpp"  // #3531: the OOB image-read contract
 #include "shared/texture/write_watch_census.hpp"
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -311,6 +313,22 @@ void live_compute_record_image_borrow_renderer_verdict(bool accepted);
 // Monotonic diagnostic count of retained sampled-image hits whose validated source omitted upload.
 // Capture/replay tests use this to prove residency without relying on timing-sensitive assertions.
 uint64_t live_compute_sampled_image_upload_skips();
+// What the compute backend's Vulkan device actually offers the recompiled storage-image path
+// (#3531), as acquired by its init: `adopted` distinguishes the renderer's shared device from this
+// backend's own. `features.storage_image_capable()` is the exact predicate every storage-image
+// dispatch is gated on, and `robust_image_access` is the term that was silently missing on the
+// own-device path -- the recompiler reads out of range from EXEC-inactive lanes by design, which is
+// defined only when the device enabled robustness.
+//
+// Exposed so a test can assert the SHIPPED init acquired the feature on the device the run really
+// uses, rather than asserting that a harness's copy of the device-creation code would have. Returns
+// a default-constructed (all false) record when the backend has not initialized a device.
+struct LiveComputeStorageImageDevice {
+    StorageImageDeviceFeatures features{};
+    bool adopted = false;
+    bool initialized = false;
+};
+LiveComputeStorageImageDevice live_compute_storage_image_device();
 // True only when an ordinary guest-backed 2D sampled image uses the same native Vulkan texel
 // representation as its typed storage counterpart. This is the format half of the retained-image
 // transfer contract; resource identity and write authority are checked separately at runtime.
@@ -404,7 +422,23 @@ void report_live_compute_timing_selector_summary();
 
 // Persist the driver pipeline cache without tearing the compute context down. prosper-app cannot
 // run C++/Vulkan destructors while its guest thread is detached, so its deliberate _Exit path calls
-// this explicitly after requesting the guest stop.
-void flush_live_compute_pipeline_cache();
+// this explicitly after requesting the guest stop (frontends/prosper-app/main.cpp). Returns whether
+// a file was actually written, so "nothing to save" is distinguishable from "the save declined".
+//
+// It is idempotent and safe to call with no compute context, a lost device, or persistence disabled.
+// `lock_budget` bounds the wait for an in-flight driver compilation: exceeding it costs this run's
+// cache, never the ability to exit. What it does NOT cover is a guest-thread _Exit (#3324) -- that
+// is exit_group() from another thread and no frontend finalize step runs at all.
+bool flush_live_compute_pipeline_cache(
+    std::chrono::milliseconds lock_budget = std::chrono::milliseconds(1000));
+
+// What the disk compute pipeline cache actually did on this launch. Reported as state rather than
+// as a log line so a separate-launch regression test can assert it (#3425).
+struct LiveComputePipelineCacheStatus {
+    bool context_live = false;           // a compute context exists at all
+    bool persistence_configured = false; // a cache path is set, i.e. the opt-in was satisfied
+    uint64_t loaded_bytes = 0;           // bytes the driver ACCEPTED from disk; 0 means cold
+};
+LiveComputePipelineCacheStatus live_compute_pipeline_cache_status();
 
 } // namespace prosper::frontend

@@ -19,6 +19,179 @@ from the tracker issues, and still gated, because it is a projection of state ra
 > title's current state — for that, read the tracker. Nothing is ever removed when a title moves on,
 > because the point of a blog is that it records *when* things happened.
 
+## 2026-09-11
+
+### Alex Kidd's world had no colour on Windows, and the reason was one missing line of SPIR-V
+
+This is the kind of fix worth a paragraph, because it moves every title and it was hiding behind a
+platform. *Alex Kidd in Miracle World DX* rendered its level in full colour on Linux and as a black
+field with a pixel-perfect HUD on Windows — the same build, the same route. Guest shaders are
+translated from AMD machine code, where `Inf` and `NaN` mean exactly what the hardware says they
+mean, but a Vulkan shader does not promise that unless it asks. AMD's driver preserved them anyway;
+NVIDIA's, free to assume they never happen, folded the game's own `sign()` helper — which multiplies
+by infinity on purpose — down to zero. That answer fed the colour-grading table the whole scene is
+graded through, the table came out black, and so did the world. The HUD is drawn after the grading
+step, which is why it survived and made the picture look like a compositing bug. Every recompiled
+shader now asks for the exact float semantics it was written against.
+
+Before, on Windows/NVIDIA:
+
+<p align="center"><img src="assets/screenshots/alex-kidd-black-world.webp" alt="Alex Kidd in Miracle World DX — the world composited to black behind a correct HUD and dialogue box"></p>
+
+After, same machine, same route:
+
+<p align="center"><img src="assets/screenshots/alex-kidd-inf-preserve.webp" alt="Alex Kidd in Miracle World DX — Mt. Eternal rendering in full colour at 1920x1080"></p>
+
+
+### GTA V's Performance-mode route had been choosing a different setting entirely
+
+![GTA V Settings, old route: the Controls pane, with Show Controls For changed to In Aircraft](assets/screenshots/gta5-route-wrong-pane-controls-aircraft.webp)
+
+![GTA V Settings, fixed route: Display highlighted, Graphics Mode set to Performance](assets/screenshots/gta5-route-display-graphics-mode-performance.webp)
+
+Both pictures are the same route at the same point of the same build, minutes apart: the first is
+what it actually did on this machine, the second is what it was supposed to do. The route spelled
+each press as a window of display flips, which only states a duration at the flip rate it was tuned
+on -- and the menu ran at a third of that rate here, so presses meant to last 0.15 s lasted up to
+0.84 s, the title's key repeat walked the highlight past Display, and a Left meant for Graphics Mode
+changed a controls setting instead. Nothing errored; GTA V simply ran in Fidelity with ray tracing
+while the session was recorded as a Performance run. Presses can now say "hold 0.15 seconds from
+flip 2272" and mean it on any host.
+### Our own frame-pacing instrument was understating the frame rate by up to 40%
+
+The flip-pacing report's headline fps was a mean over intervals it had silently filtered, and
+the filtered fraction differs from run to run: on the #3379 A/B it read 44.1 vs 59.2 fps where
+the truth was 57.8 vs 97.9, which made the pacing fix below -- in fact holding 96% of its
+target -- look like it had missed by a quarter. It now counts flips over the wall clock.
+
+### Games were running up to three times too fast, and it was the monitor's fault
+
+prosper completed a game's page flip the instant it was ready instead of holding it to the 60 Hz the
+game asked for, so on a high-refresh monitor the game simply simulated faster -- 3x on a 180 Hz
+panel. It now holds each flip to the rate the title itself requested. No picture: this one you can
+only see by watching something move at the right speed.
+
+### And it could blame a shader for a pixel that arrived by copy
+
+Same tool, adjacent defect, different cause. A copy, blit or resolve reaches RenderDoc's pixel
+history the same way a clear does — it passes, and no test was evaluated — so a blit landing black
+was the last "passing draw" and came back as `SHADER_WROTE_BLACK`. It now names the copy instead —
+but only when the copy can be shown to have changed the pixel, because RenderDoc lists every copy
+on a target in the history of *every* pixel of that target, covered or not. The known-answer control
+now blits into its own finished target, from a two-colour source, because black over black is
+invisible to a self-check that only reads pixels.
+
+### The pixel-history tool could tell you a shader wrote black when it knew nothing at all
+
+No picture for this one. `pixel_history.py` is what we reach for when a pixel is the wrong colour,
+and RenderDoc marks a value it has no data for by stamping `0xdeadbeef` into it — which decodes,
+through the float view, to a colour whose brightest channel is exactly `0.0`. So "I have no
+information" was being reported as `SHADER_WROTE_BLACK`, sending the reader to resource binding and
+shaders over a pixel the instrument could not read. It now says `VALUE_UNKNOWN` and names what it is
+missing.
+
+### One of the five “sheared triangle” titles renders perfectly
+
+![Evergate title screen, Windows/NVIDIA, native 1920x1080](assets/screenshots/evergate-title-screen-windows-nvidia.webp)
+
+Evergate is the worst case on #3374's list of five rung-6 Unity titles that draw their correct art
+through huge sheared triangles — reported there as a whole frame of white and orange shear with the
+backdrop showing underneath, frozen. On Windows/NVIDIA it is the picture above, animating, across 130
+samples. Two candidate causes died on the way: the capture harness, and the RectList fourth-corner fix
+that landed after the measurement — reverting that one changes nothing, so it is not what fixed this.
+The remaining suspect is Linux/AMD, which this machine has no GPU to test.
+
+### Two titles that could not boot at all now boot, and neither needed a renderer change
+
+*FINAL FANTASY TACTICS – The Ivalice Chronicles* killed itself about a second into every launch. It
+was one call: `sceKernelMprotect` with an address that is not 16 KiB aligned, which prosper handed
+to the host verbatim and the host refused. The title reads that refusal as fatal and walks all the
+way back out of `main`. It now runs, streams its own textures and plays audio — no picture yet, and
+that is the next thing.
+
+*NINJA GAIDEN 4* went from a crash nine log lines in to printing its own `Runtime as started` and
+bringing up video-out at 1920x1080. It needed the last missing member of the PS5 memory-pool API, and
+then told us something worth knowing: it reads its stack canary through a variable prosper had bound
+to a block of prosper's own machine code.
+
+## 2026-09-10
+
+### BlazBlue Entropy Effect X was stuck on its publisher logos because one mount point did not exist
+
+The PS5 gives every game four places to read and write: `/app0`, `/temp0`, `/savedata0` and
+`/download0`. prosper mapped the first three and quietly let the fourth through unmapped, so a guest
+opening it got a host path that does not exist and every access failed. This title opens it ten times
+while starting up; *The Messenger*, which reaches gameplay, never opens it at all — which is what
+made the difference findable. It is served empty, which is the honest answer: no downloaded content
+is present, and that is true of every local dump.
+
+![BlazBlue Entropy Effect X title screen at 1920x1080, the game logo inside its cyan ring with CONTINUE and SETTINGS](assets/screenshots/blazblue-entropy-effect-x-title.webp)
+
+[#3496](https://github.com/mattias800/prosper/issues/3496).
+
+### Darksiders II's intro movie was being cut in half down the diagonal
+
+The PS5 draws a full-screen rectangle by handing the GPU only **three** of its corners and letting
+the hardware work out the fourth. Vulkan has no such primitive, so prosper derives that corner
+itself — and it assumed the three always arrive in the same order. Darksiders II's video blit sends
+them in a different one, so the corner prosper computed landed off-screen and half the movie was
+never drawn. The corner is now identified from the geometry instead of from a fixed position, which
+is the same answer wherever the old assumption held.
+
+![Darksiders II's intro movie before the fix: the picture is cut corner to corner, everything below the diagonal black](assets/screenshots/darksiders2-intro-fmv-rectlist-half.webp)
+
+![The same moment of the same movie now: the whole cliff, the tree trunks, the cloaked figure and the lantern glow all present](assets/screenshots/darksiders2-intro-fmv-complete.webp)
+
+![Darksiders II's legal and title screen at 3840x2160, logo and licensing text complete](assets/screenshots/darksiders2-legal-screen.webp)
+
+[#3507](https://github.com/mattias800/prosper/issues/3507).
+
+## 2026-09-09
+
+### Two title screens NVIDIA was throwing away, and the proof that lets us keep them
+
+PS5 shaders often ask for a 64-lane wave. NVIDIA's fragment stage only offers 32 and no extension
+changes that, so prosper was dropping every shader that asked — and a dropped fragment shader takes
+its draws with it. That is why Evergate's title screen was a logo on an empty void and Alex Kidd's
+was menu text on bare wallpaper, on Windows, while both were fine on AMD.
+
+The fix is not a switch, it is a proof. For each shader prosper now works out whether answering its
+wave vote over two 32-lane groups instead of one 64-lane wave could change a single pixel. Usually it
+cannot — the guest is testing a constant-buffer scalar every pixel agrees on — and those shaders now
+run. The ones where it could still keep the strict contract and are still dropped.
+
+Each pair below is the same route and the same frame, with `PROSPER_STRICT_FRAGMENT_WAVE_WIDTH=1` the
+only difference.
+
+![Evergate's title screen with the strict wave contract: the logo, "Press any button" and the Stone Lantern mark floating on an empty purple void](assets/screenshots/evergate-title-wave64-strict.webp)
+
+![The same frame with the proof: the seed-pod tree on its cliff, the cloud bank, the beam and the standing stones all present](assets/screenshots/evergate-title-wave32-proved.webp)
+
+![Alex Kidd in Miracle World DX with the strict wave contract: the wallpaper pattern on black, no key art and no menu panel](assets/screenshots/alexkidd-title-wave64-strict.webp)
+
+![The same frame with the proof: Alex mid-punch, both dragons, the game logo and the full menu on its orange panel](assets/screenshots/alexkidd-title-wave32-proved.webp)
+
+Alex Kidd's *world* is still wrong on this machine, and it is a different defect — the wave width
+makes no measurable difference to it either way.
+[#3479](https://github.com/mattias800/prosper/issues/3479).
+### Five new games, and three of them died the same way
+
+Five titles were added to the library and booted for the first time. *Syberia - The World Before*
+got furthest by a distance — its title screen and main menu render, and the audio is clean from the
+first second, over a splash that is still black. Three of the other four never presented a frame,
+and all three died of one thing: a kernel call prosper had never registered, answering "success"
+while writing nothing, so the guest read its own uninitialised stack as an address.
+
+### The argument that proved it was in the guest's own registers
+
+*NINJA GAIDEN 4* asks the kernel to reserve address space, and prosper's unregistered stub told it
+that worked without ever handing back an address. Rather than assume the call's shape from a
+published signature, we registered it as a probe that logs and does nothing — and the next call in
+the log asks to commit memory at address zero. That zero is the reservation that never came back,
+and a few instructions later it is the null the title crashes on. The crash is gone; the title now
+runs for two minutes without faulting and still draws nothing, which is a different and later
+problem. [#3502](https://github.com/mattias800/prosper/issues/3502)
+
 ## 2026-09-06
 
 ### Thirty-one cores watched one core convert a 4K video frame

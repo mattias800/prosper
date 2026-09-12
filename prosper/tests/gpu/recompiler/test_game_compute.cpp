@@ -7472,6 +7472,29 @@ int main() {
               "device loss is unconditional and identifies the first observed guest dispatch");
     }
 
+    // #3531: the device THIS suite actually ran on must have acquired image robustness. Every
+    // storage-image kernel above reads out of range from EXEC-inactive lanes by construction, and
+    // that is defined only when the device enabled robustImageAccess -- so this is not a style
+    // assertion about device creation, it is the precondition the dispatches above depend on.
+    //
+    // The record comes from the shipped backend's own init (whichever device path it took), not from
+    // a copy of the device-creation code, which is the gap that let #3531 exist: the renderer's
+    // device chained the feature, this one did not, and every harness in the tree chained it so no
+    // test could see the difference. This suite runs with no live renderer, i.e. on exactly the
+    // path that was wrong.
+    {
+        const auto device = prosper::frontend::live_compute_storage_image_device();
+        CHECK(device.initialized,
+              "the compute backend published the storage-image device it initialized");
+        std::printf("[compute-device] adopted=%d robustImageAccess=%d storage_image_capable=%d\n",
+                    (int)device.adopted, (int)device.features.robust_image_access,
+                    (int)device.features.storage_image_capable());
+        CHECK(device.features.robust_image_access,
+              "the compute device acquired robustImageAccess for the recompiled OOB image reads");
+        CHECK(device.features.storage_image_capable(),
+              "the compute device may execute recompiled storage-image kernels");
+    }
+
     // #3155: report the write-watch census this run produced, and pin the structural identities
     // that make it readable. The numbers themselves are workload-dependent and are deliberately NOT
     // asserted -- this suite is not The Plucky Squire -- but a census whose buckets do not partition

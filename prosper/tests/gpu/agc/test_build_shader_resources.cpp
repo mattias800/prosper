@@ -570,6 +570,32 @@ int main() {
         d = decode_buffer_descriptor(v);
         CHECK(d.format == DataFormat::Float32 && d.num_components == 4 && !d.forbid_unknown_fallback,
               "non-packed V# selector behavior is unchanged");
+
+        // DST_SEL decode (#2869). WORD3 [11:0] is four three-bit SQ_SEL fields, X in the low bits.
+        // Before this landed the decoded struct carried no DST_SEL at all, so every buffer-class
+        // ShaderResource kept the identity default and a routed descriptor was silently ignored.
+        make_vsharp(v, 0x123456780ull, 16, 64, /*fmt*/77);
+        d = decode_buffer_descriptor(v);
+        CHECK(d.dst_sel[0] == 4 && d.dst_sel[1] == 5 && d.dst_sel[2] == 6 && d.dst_sel[3] == 7,
+              "identity DST_SEL 0xFAC decodes to X/Y/Z/W");
+        v[3] = (77u << 12) | 0x977u;   // W,Z,Y,X packed low-to-high: 7 | 6<<3 | 5<<6 | 4<<9
+        d = decode_buffer_descriptor(v);
+        CHECK(d.dst_sel[0] == 7 && d.dst_sel[1] == 6 && d.dst_sel[2] == 5 && d.dst_sel[3] == 4,
+              "reversed DST_SEL 0x977 decodes to W/Z/Y/X");
+        v[3] = (74u << 12) | 0x3ACu;   // X,Y,Z,1 : 4 | 5<<3 | 6<<6 | 1<<9
+        d = decode_buffer_descriptor(v);
+        CHECK(d.dst_sel[0] == 4 && d.dst_sel[1] == 5 && d.dst_sel[2] == 6 && d.dst_sel[3] == 1,
+              "constant-one DST_SEL selector decodes as SQ_SEL_1");
+        v[3] = (74u << 12) | 0x1ACu;   // X,Y,Z,0 : 4 | 5<<3 | 6<<6 | 0<<9
+        d = decode_buffer_descriptor(v);
+        CHECK(d.dst_sel[3] == 0, "constant-zero DST_SEL selector decodes as SQ_SEL_0");
+        // A descriptor that declares NO format is one prosper reaches only through paths that
+        // fabricate a V# (raw-pointer scalar consumers, the Unknown -> Float32 vertex fallback), so
+        // its zero WORD3 must not be read as "every channel is constant 0".
+        v[3] = 0u;
+        d = decode_buffer_descriptor(v);
+        CHECK(d.dst_sel[0] == 4 && d.dst_sel[1] == 5 && d.dst_sel[2] == 6 && d.dst_sel[3] == 7,
+              "a V# declaring no FORMAT keeps identity routing rather than all-constant-zero");
     }
     {   // RDNA2 combined-format decode coverage (the four game-observed anchors + a real V# regression).
         DataFormat f; uint32_t n;

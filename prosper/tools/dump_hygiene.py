@@ -60,6 +60,17 @@ MODULE_SUFFIXES = (".prx", ".sprx")
 # somewhere it could shadow prosper's own implementation of that same library.
 SONY_LIBRARY_PREFIX = "libsce"
 
+# Mirrors kRootRefusedPlatformPrefixes in src/host/image/module_path_policy.hpp. The loader refuses a
+# module with one of these names in the dump ROOT (#3497) because `src/hle/` implements exactly two
+# non-`libSce` surfaces -- kernel/ and libc/ -- and a root module exporting those NIDs would shadow
+# prosper's own HLE via linker.cpp's "a cross-module export beats a stub slot" rule.
+#
+# Two implementations of one rule, so they can drift: add a prefix here when you add one there. They
+# HAD drifted -- the policy header cited this tool as the backstop for names `libSce*` misses while
+# this file matched `libsce` alone, so the loader refused a root libkernel.prx and `--check` stayed
+# green. Caught in the re-review of #3508.
+PLATFORM_ROOT_PREFIXES = ("libkernel", "libc.", "libc_", "libmdbg", "gaikai")
+
 # Sony's own metadata directory. Authentic dump content, present in every dump including ones with
 # no third-party additions at all. prosper does not LINK from here -- `sce_sys/about/right.sprx` is
 # not a module the loader wants -- but "prosper does not link it" and "it does not belong in the
@@ -131,7 +142,8 @@ def classify(rel: str, is_dir: bool) -> tuple[str, str] | None:
 
     # A Sony-named module anywhere but sce_module/ is the thing worth finding: it can only either
     # shadow prosper's own implementation or sit there pretending to be a platform library.
-    if lname.startswith(SONY_LIBRARY_PREFIX) and directory.lower() != "sce_module":
+    is_platform_root = (directory == "" and lname.startswith(PLATFORM_ROOT_PREFIXES))
+    if (lname.startswith(SONY_LIBRARY_PREFIX) or is_platform_root) and directory.lower() != "sce_module":
         where = f"{directory}/" if directory else "the dump root"
         return (REFUSED, f"a Sony-named library in {where}; prosper implements the Sony libraries "
                          f"itself and links them only from sce_module/")

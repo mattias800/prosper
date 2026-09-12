@@ -24,6 +24,7 @@
 #include <filesystem>
 #include <string>
 #include <system_error>
+#include <thread>
 #include "fixtures/test_scratch.h"
 #ifdef _WIN32
 #include <io.h>
@@ -171,6 +172,40 @@ int main(int argc, char** argv) {
             begin_gpu_timeline_submit(n);
             record_gpu_timeline_submit(GpuState{}, n);
         }
+        return 0;
+    }
+    // Arms a real capture -- which starts the owned writer thread -- and then merely returns from
+    // main, leaving the whole teardown to static destruction. That is the shape #3470 deadlocked on:
+    // the destructor joins the writer while holding the CRT's onexit-table lock, and the writer
+    // needed that same lock to finish formatting its own completion log.
+    //
+    // The child bounds ITSELF rather than letting the parent wait. A hung exit would otherwise
+    // surface only as a ctest timeout, which produces no assertion output, says nothing about which
+    // case hung, and leaves a stuck process behind. _Exit is deliberate: it must not run the atexit
+    // table it is reporting on.
+    if (argc > 2 && std::strcmp(argv[1], "--child-arm-and-return") == 0) {
+        std::printf("  [child] started (arm and return)\n");
+        std::fflush(stdout);
+        const auto accepted = request_interactive_capture_bundle(argv[2], 64).accepted;
+        std::fprintf(stderr, "[child] armed=%d\n", accepted ? 1 : 0);
+        std::fflush(stderr);
+        std::thread([] {
+            std::this_thread::sleep_for(std::chrono::seconds(20));
+            // A RAW write, not stdio. The thread this is watching is stuck holding CRT locks, and a
+            // std::fprintf here queues behind the very deadlock the watchdog exists to report --
+            // measured: with the defect restored the watchdog never fired at all and the child had
+            // to be killed by the harness. write() takes no CRT lock and allocates nothing, and
+            // _Exit skips the atexit table under discussion.
+            static const char msg[] =
+                "[child] STILL RUNNING 20s after main returned: exit is stuck, which is #3470\n";
+#ifdef _WIN32
+            _write(2, msg, (unsigned)(sizeof msg - 1));
+#else
+            ssize_t ignored = write(2, msg, sizeof msg - 1);
+            (void)ignored;
+#endif
+            std::_Exit(3);
+        }).detach();
         return 0;
     }
     if (argc > 2 && std::strcmp(argv[1], "--child-bundle") == 0) {
@@ -545,6 +580,27 @@ int main(int argc, char** argv) {
               "the refusal reaches stderr of a process that never reached main");
         CHECK(!contains(child.stderr_text, "[child] reached main"),
               "the refusal happens at LOAD: the child never ran a line of its own");
+    }
+
+    {
+        // The exit path itself, as an ASSERTION rather than as a ctest wall clock (#3470). Before
+        // the fix this child never exited at all; its watchdog now reports status 3 in that case,
+        // so a regression costs 20 s and names itself instead of costing the job's whole timeout.
+        const std::filesystem::path armed = scratch / ("prosper-capture-tunables-armed-" +
+                                                       std::to_string(nonce) + ".prgbundle");
+        const ChildRun child =
+            run_child(argv[0], "--child-arm-and-return " + quoted(armed), child_err);
+        if (child.rc != 0)
+            std::printf("  [note] child rc=%d, stderr was: %s\n", child.rc,
+                        child.stderr_text.c_str());
+        CHECK(contains(child.stderr_text, "[child] armed=1"),
+              "the child really armed a capture, so the writer thread existed to be joined");
+        CHECK(child.rc == 0,
+              "a process that arms a capture and merely returns from main still EXITS");
+        CHECK(!contains(child.stderr_text, "STILL RUNNING"),
+              "...and exits without its watchdog having to kill it");
+        std::error_code armed_ec;
+        std::filesystem::remove(armed, armed_ec);
     }
 
     std::error_code ec;

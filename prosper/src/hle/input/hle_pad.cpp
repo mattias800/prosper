@@ -108,6 +108,11 @@ uint64_t now_us() {
 // script is set the pad reports
 // CONNECTED for the whole run (a menu that gates on a controller sees one).
 //
+// An anchor may also name a HOLD with '+' instead of an end: "f2272+0.15:down" starts at flip 2272
+// and holds Down for 0.15 SECONDS. That is the spelling a menu route should use, because a flip
+// window encodes a duration only at the flip rate it was tuned on and guest key repeat is measured
+// in wall time (#3449). "f2272+p12" holds for 12 pad reads instead.
+//
 // Timing is anchored to the FIRST pad poll, not process start: the game only polls once it reaches
 // the interactive menu, so t=0 == "menu appeared" — robust to how long asset loading takes.
 // CONFIDENCE: HIGH (mechanism); MED (that the game's submit maps to OPTIONS="Start" / CROSS).
@@ -177,15 +182,30 @@ public:
                 pad_script_empty_route_warning(source_, script_.empty());
             if (!warning.empty()) fprintf(stderr, "%s\n", warning.c_str());
         }
+        // The POSITIVE half, and it is the one an automated consumer needs. Everything above
+        // reports a route DYING; a reader can then only check that no death was reported, and
+        // absence is exactly what it also gets when the emulator never looked -- when the variable
+        // was spelled differently, when a harness resolved the path against the wrong directory, or
+        // when some future change stops emitting the errors. A corpus survey checked for absence
+        // that way and recorded three routes' worth of title screens as though they were gameplay
+        // (instrument trap 274). This line lets it require that the route ran instead.
+        fprintf(stderr, "[pad] PROSPER_PAD_SCRIPT loaded %zu entries from %s\n",
+                script_.size(), source_[0] == '@' ? path_.string().c_str() : "<inline>");
     }
 
     bool configured() const { return !source_.empty(); }
 
+    // PadScriptRunner, not the pure pad_script_state_at: a route may hold a press for a wall-clock
+    // duration from a FLIP start ("f2272+0.15:down", #3449), and that needs the clock latched at the
+    // moment the flip arrives. The pure function reports such entries inactive, so calling it here
+    // would silently drop every cross-unit press -- a route that delivers nothing, which is the
+    // failure #2439 exists to make visible. Readers serialize on mutex_, so the latches are guarded
+    // by the same lock as the script they index.
     PadScriptState state_at(double elapsed, int64_t frame, int64_t read) {
         std::lock_guard<std::mutex> lock(mutex_);
         refresh_locked();
-        return pad_script_state_at(script_, elapsed, pad_hold_secs(), frame, pad_frame_hold(),
-                                   read, pad_read_hold());
+        return runner_.state_at(script_, elapsed, pad_hold_secs(), frame, pad_frame_hold(),
+                                read, pad_read_hold());
     }
 
 private:
@@ -244,6 +264,7 @@ private:
     std::string source_;
     std::filesystem::path path_;
     std::vector<PadScriptEntry> script_;
+    PadScriptRunner runner_;
     bool live_reload_ = false;
     std::optional<PadScriptFileStamp> applied_stamp_;
     std::optional<PadScriptFileStamp> pending_stamp_;

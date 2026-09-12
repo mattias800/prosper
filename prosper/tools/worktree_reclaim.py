@@ -81,6 +81,7 @@ import os
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
@@ -804,8 +805,16 @@ def report(trees: list[Worktree], meta: dict, do_redact: bool, verbose: bool) ->
 
 def recheck_and_remove(repo: str, t: Worktree, base: str, min_idle_hours: float,
                        scan_fds: bool, scan_maps: bool, use_github: bool,
-                       gh_limit: int, do_redact: bool) -> bool:
+                       gh_limit: int, do_redact: bool, *,
+                       say: Callable[..., None]) -> bool:
     """Re-probe the local guards against fresh state, then remove. Returns True on removal.
+
+    `say` is the caller's status sink and is deliberately REQUIRED rather than defaulting to
+    `print`. Every SKIP/REFUSE/FAILED/REMOVED line below is human prose, and in `--json` mode
+    stdout is a machine-readable document that a trailing prose line makes unparseable (#3397).
+    A default would make the polluting case the one nobody has to think about, which is exactly
+    how the defect arrived: `main` moved its own messages to stderr and this function was left
+    printing to stdout.
 
     The census is deliberately not trusted for anything local. An agent can cd into a tree between
     the scan and the delete, and that race is the entire reason the scan exists, so the worktree
@@ -828,7 +837,7 @@ def recheck_and_remove(repo: str, t: Worktree, base: str, min_idle_hours: float,
     fresh = list_worktrees(repo)
     cur = next((w for w in fresh if w.real == t.real), None)
     if cur is None:
-        print(f"  SKIP {fmt(t.real)}: no longer registered")
+        say(f"  SKIP {fmt(t.real)}: no longer registered")
         return False
 
     probe_idle(cur)  # before probe_status, for the reason given in probe_idle
@@ -845,19 +854,19 @@ def recheck_and_remove(repo: str, t: Worktree, base: str, min_idle_hours: float,
              holder_scan_ok=holder_scan_ok)
 
     if not cur.removable:
-        print(f"  REFUSE {fmt(cur.real)}: {', '.join(cur.blockers) or 'no merge evidence'}")
+        say(f"  REFUSE {fmt(cur.real)}: {', '.join(cur.blockers) or 'no merge evidence'}")
         return False
     if cur.merged_by != t.merged_by:
-        print(f"  REFUSE {fmt(cur.real)}: merge evidence changed since census")
+        say(f"  REFUSE {fmt(cur.real)}: merge evidence changed since census")
         return False
 
     # No --force, ever: git's own dirty check is a second independent line of defence, and the
     # branch ref is deliberately left in place so no commit becomes unreachable.
     rc, _, err = run(["git", "-C", repo, "worktree", "remove", cur.real])
     if rc != 0:
-        print(f"  FAILED {fmt(cur.real)}: {err.strip()[:200]}")
+        say(f"  FAILED {fmt(cur.real)}: {err.strip()[:200]}")
         return False
-    print(f"  REMOVED {fmt(cur.real)}  ({cur.merged_by}, idle {cur.idle_hours:.1f}h)")
+    say(f"  REMOVED {fmt(cur.real)}  ({cur.merged_by}, idle {cur.idle_hours:.1f}h)")
     return True
 
 
@@ -941,6 +950,9 @@ def main(argv: list[str] | None = None) -> int:
         report(trees, meta, args.redact, args.verbose)
 
     # In --json mode every human line goes to stderr, so stdout stays a parseable document.
+    # This sink is threaded into recheck_and_remove as well: its per-tree status lines used to
+    # print straight to stdout, which left a successful `--json --remove --yes` run emitting a
+    # valid census followed by prose that `jq` then refused (#3397).
     say = (lambda *a: print(*a, file=sys.stderr)) if args.json else print
 
     if args.prune:
@@ -972,7 +984,7 @@ def main(argv: list[str] | None = None) -> int:
         1 for t in candidates
         if recheck_and_remove(repo, t, args.base, args.min_idle_hours,
                               not args.no_fds, not args.no_maps,
-                              not args.no_github, args.gh_limit, args.redact)
+                              not args.no_github, args.gh_limit, args.redact, say=say)
     )
     say(f"\nremoved {removed} of {len(candidates)} candidate(s)")
     return 0
