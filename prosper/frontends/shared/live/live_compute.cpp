@@ -3371,6 +3371,29 @@ struct VulkanComputeContext {
         app.apiVersion = kVulkanRuntimeVersion;
         VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
         ici.pApplicationInfo = &app;
+        // VK_EXT_debug_utils, add-if-available (#3597). Guest compute shader modules are named through
+        // `vk_object_name_fn`, which resolves per DEVICE -- but the entry point only exists when the
+        // INSTANCE enabled the extension. The renderer arms it; this private instance did not, so
+        // `guest cs 0x...` naming was silently inert whenever compute did not adopt the renderer's
+        // device, which is exactly the configuration a compute-only capture runs in.
+        //
+        // Probed rather than pushed blind: an unadvertised extension fails the whole vkCreateInstance,
+        // and losing the compute backend to a debug convenience would be a far worse trade than
+        // unnamed modules.
+        std::vector<const char*> compute_inst_exts;
+        {
+            uint32_t count = 0;
+            vkEnumerateInstanceExtensionProperties(nullptr, &count, nullptr);
+            std::vector<VkExtensionProperties> avail(count);
+            if (count) vkEnumerateInstanceExtensionProperties(nullptr, &count, avail.data());
+            for (const auto& e : avail)
+                if (!strcmp(e.extensionName, "VK_EXT_debug_utils"))
+                    compute_inst_exts.push_back("VK_EXT_debug_utils");
+        }
+        if (!compute_inst_exts.empty()) {
+            ici.enabledExtensionCount = (uint32_t)compute_inst_exts.size();
+            ici.ppEnabledExtensionNames = compute_inst_exts.data();
+        }
         if (vkCreateInstance(&ici, nullptr, &instance) != VK_SUCCESS) return false;
 
         uint32_t device_count = 0;
