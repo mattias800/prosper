@@ -5129,11 +5129,18 @@ bool emit_cfg_state_machine(
                 // EXEC keeps voting. That is the conservative direction and it is the common one; the
                 // escape is an optimisation for the restored case, not the default.
                 //
-                // `state.vcc != 0` is an extra term the structured sites do not carry, and it is
-                // load-bearing HERE: `load_state` does not restore `vcc_wave_uniform`, so both sides
-                // would read 0 for a case that never emitted its own compare -- and `0 == 0` would
-                // silently skip the vote on a VCC this block knows nothing about. Requiring a live
-                // VCC makes that miss fail CLOSED.
+                // `state.vcc != 0` is an extra term the structured sites do not carry. It guards a
+                // specific miss: `load_state` does not restore `vcc_wave_uniform`, so a case that
+                // never emitted its own compare would read 0 from BOTH sides, and `0 == 0` would skip
+                // the vote on a VCC the case knows nothing about.
+                //
+                // It is DEFENSIVE rather than demonstrably load-bearing, and the distinction is
+                // recorded because an earlier revision of this comment overstated it (#3595). Deleting
+                // the term leaves the suite green, and I could not construct a program where it
+                // changes the lowering: `load_state` sets `state.vcc = live_vcc ? load(vcc_var) : 0`,
+                // and a VCC branch is itself what makes VCC live -- so at a vccz terminator the value
+                // is a real SSA id and the `== vcc_wave_uniform` term already fails on its own. Keep
+                // the term (it costs nothing and fails closed), but do not describe it as proven.
                 const bool vcc_branch = terminator->opcode <= 0x07;
                 const bool wave_uniform_vcc =
                     vcc_branch && state.vcc != 0 &&
