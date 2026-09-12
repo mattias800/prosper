@@ -2044,6 +2044,12 @@ if(TARGET prosper_core)
   target_link_libraries(test_vertex_fetch_reject_diagnostic PRIVATE prosper_core)
   add_test(NAME vertex_fetch_reject_diagnostic COMMAND test_vertex_fetch_reject_diagnostic)
 
+  # #3596: a lane-local scalar must not satisfy the wave-uniformity proof.
+  add_executable(test_readfirstlane_uniformity
+                 tests/gpu/recompiler/test_readfirstlane_uniformity.cpp)
+  target_link_libraries(test_readfirstlane_uniformity PRIVATE prosper_core)
+  add_test(NAME readfirstlane_uniformity COMMAND test_readfirstlane_uniformity)
+
   # #3573: the CFG dispatcher must lower a fragment exec/vcc branch as a wave vote.
   add_executable(test_dispatcher_wave_vote tests/gpu/recompiler/test_dispatcher_wave_vote.cpp)
   target_link_libraries(test_dispatcher_wave_vote PRIVATE prosper_core)

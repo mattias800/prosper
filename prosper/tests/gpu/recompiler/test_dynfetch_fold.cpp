@@ -19,8 +19,19 @@
 #include <array>
 #include <cstdio>
 #include <cstring>
-#ifndef _WIN32
+// `dup`/`dup2`/`close`/`fileno` below are declared in <unistd.h>, and MinGW-w64 ships it -- so
+// guarding the include out on _WIN32 removed the declarations on the one platform that needed them
+// (#3602). MSVC is the case that genuinely lacks it, and there the POSIX names live in <io.h>.
+#if defined(_MSC_VER)
+#include <io.h>
+#define PROSPER_DUP   _dup
+#define PROSPER_DUP2  _dup2
+#define PROSPER_CLOSE _close
+#else
 #include <unistd.h>
+#define PROSPER_DUP   dup
+#define PROSPER_DUP2  dup2
+#define PROSPER_CLOSE close
 #endif
 #include <cstdlib>
 #include <vector>
@@ -2996,7 +3007,7 @@ int main() {
         // of this test run with stderr pointing at a file that is then unlinked, so any later
         // diagnostic -- including a crash message -- goes nowhere.
         std::fflush(stderr);
-        const int saved_stderr = dup(fileno(stderr));
+        const int saved_stderr = PROSPER_DUP(fileno(stderr));
         const char* scratch = "dynfetch_control_bit_diag.log";
         FILE* redirected = std::freopen(scratch, "w+", stderr);
         const ShaderResource* diag_resource = nullptr;
@@ -3015,8 +3026,8 @@ int main() {
         std::remove(scratch);
         if (saved_stderr >= 0) {                      // put stderr back where it was
             std::fflush(stderr);
-            dup2(saved_stderr, fileno(stderr));
-            close(saved_stderr);
+            PROSPER_DUP2(saved_stderr, fileno(stderr));
+            PROSPER_CLOSE(saved_stderr);
         }
 #ifdef _WIN32
         _putenv_s("PROSPER_SRTTABLE_LOG", saved.c_str());

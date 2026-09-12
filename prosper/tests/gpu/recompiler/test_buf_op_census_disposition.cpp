@@ -20,6 +20,17 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
+#if defined(_MSC_VER)
+#include <io.h>
+#define PROSPER_DUP   _dup
+#define PROSPER_DUP2  _dup2
+#define PROSPER_CLOSE _close
+#else
+#include <unistd.h>
+#define PROSPER_DUP   dup
+#define PROSPER_DUP2  dup2
+#define PROSPER_CLOSE close
+#endif
 #include <string>
 #include <vector>
 
@@ -37,11 +48,19 @@ static void set_test_env(const char* name, const char* value) {
 #endif
 }
 
+// Captures one recompile's stderr and PUTS STDERR BACK (#3598). Without the restore the file is
+// unlinked below and every later line of the test -- including a crash message -- writes to a
+// descriptor nobody can read, which is a silent loss precisely when something has gone wrong.
 static std::string recompile_capturing_stderr(const uint32_t* code, size_t dwords,
                                               const ShaderResourceTable* rt,
                                               const char* scratch) {
     std::fflush(stderr);
-    if (!std::freopen(scratch, "w+", stderr)) { printf("  [FAIL] cannot redirect stderr\n"); fails++; return {}; }
+    const int saved_stderr = PROSPER_DUP(fileno(stderr));
+    if (!std::freopen(scratch, "w+", stderr)) {
+        printf("  [FAIL] cannot redirect stderr\n"); fails++;
+        if (saved_stderr >= 0) PROSPER_CLOSE(saved_stderr);
+        return {};
+    }
     (void)recompile_compute(code, dwords, rt, ComputeShaderConfig{});
     std::fflush(stderr);
     std::string text;
@@ -52,6 +71,11 @@ static std::string recompile_capturing_stderr(const uint32_t* code, size_t dword
         std::fclose(f);
     }
     std::remove(scratch);
+    if (saved_stderr >= 0) {
+        std::fflush(stderr);
+        PROSPER_DUP2(saved_stderr, fileno(stderr));
+        PROSPER_CLOSE(saved_stderr);
+    }
     return text;
 }
 

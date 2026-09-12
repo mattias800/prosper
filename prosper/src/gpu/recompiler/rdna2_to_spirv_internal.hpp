@@ -4712,12 +4712,40 @@ struct SpirvCompute {
 // Machine state during recompilation: the VGPR and SGPR files (VGPR/SGPR number -> current SSA bits
 // id) and VCC (current bool condition). VGPRs and SGPRs are separate register files; VALU/EXP source
 // operands may reference either (SGPR is a valid ALU operand), so both are resolved by operand_bits.
+// True when the scalar register currently holds a value prosper knows is NOT wave-uniform (#3596).
+// Defined beside RegState so every uniformity predicate can ask the same question the same way; the
+// lookup is on the register's CURRENT SSA value, so an overwrite clears it without bookkeeping.
+inline bool scalar_is_lane_local(const struct RegState& rs, int sgpr);
+
 struct RegState {
     std::unordered_map<int, uint32_t> vreg, sreg;
     // The latest VCC SSA value proved identical in every guest lane. A fragment VCCZ branch over
     // that exact value is already scalar and needs no subgroup vote. Tying the proof to the SSA id
     // makes an overwrite or control-flow merge invalidate it automatically.
     uint32_t vcc_wave_uniform = 0;
+    // SSA values that are NOT wave-uniform despite living in a scalar register (#3596).
+    //
+    // prosper models one guest lane per invocation and has no cross-lane reduction, so
+    // `v_readfirstlane_b32` is lowered as THIS lane's source value -- it is annotated
+    // SPECULATIVE(confidence: med) at that site for exactly this reason. The result lands in
+    // `sreg`, and every uniformity predicate downstream treats "it is in a scalar register" as
+    // "it broadcasts one value to the whole wave". For a readfirstlane result that is false.
+    //
+    // It matters because a fragment `s_cbranch_vccz` whose VCC derives from such a value would
+    // otherwise pass the wave-uniformity proof and SKIP its wave vote, branching on the lane's own
+    // bit -- wrong pixels, no reject, no diagnostic.
+    //
+    // Keyed on the SSA VALUE rather than the register number, which makes copy propagation free:
+    // `s_mov_b32` lowers as `d = a`, so a tainted value stays tainted through any number of scalar
+    // moves, and an overwrite installs a fresh id that is naturally clean.
+    //
+    // THE TAINT SURVIVES COPIES AND NOTHING ELSE, and the gap is wider than a round-trip through a
+    // dispatcher variable. Any scalar ALU that COMPUTES from a tainted value produces a fresh id that
+    // is clean: `s_add_u32 s3, s0, s5` launders it, and so does an `s_cselect_b32` on SCC. SCC itself
+    // is a third route -- a compare on tainted operands sets SCC, and SCC read as a VOPC source
+    // returns from `scalar_data_operand` one line BEFORE the lane-local check. So this closes the
+    // direct and copy-laundered shapes, not the class. #3606 carries the propagation work.
+    std::unordered_set<uint32_t> lane_local_scalars;
     // Before the first compact structured construct, map presence means that the scalar value
     // reaches this exact linear path. Branch/loop PHIs can synthesize zero for an absent SGPR and
     // clear this marker. The CFG dispatcher likewise allocates Function variables for every
@@ -4824,6 +4852,12 @@ struct RegState {
     // never-written slot rejects (fail-visible).
     std::unordered_map<uint64_t, uint32_t> lds_addtid;
 };
+
+inline bool scalar_is_lane_local(const RegState& rs, int sgpr) {
+    if (rs.lane_local_scalars.empty()) return false;
+    const auto it = rs.sreg.find(sgpr);
+    return it != rs.sreg.end() && rs.lane_local_scalars.count(it->second) != 0;
+}
 
 inline bool has_wave64_mask_half_pair(const RegState& rs, int base) {
     const auto low = rs.sreg_wave64_mask_half.find(base);
