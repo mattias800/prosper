@@ -25,6 +25,51 @@ constexpr uint32_t kDefaultComputePgmRsrc1 = 3u << 16;
 
 inline constexpr uint32_t kComputeInternalGdsBinding = 127;
 
+// SPV_KHR_float_controls / SignedZeroInfNanPreserve — a DEVICE-GATED declaration (#3479, #3561).
+//
+// WHY IT IS DECLARED AT ALL. RDNA2 VALU arithmetic defines Inf, NaN and signed zero exactly, and
+// guest programs rely on it: a compiler-generated `sign()` idiom synthesises +Inf with integer
+// shifts (((1<<8)-1) << 23 == 0x7F800000) and multiplies by it. Vulkan's default float contract does
+// not promise that, so a driver may compile the module assuming Inf never occurs. On Windows/NVIDIA
+// that multiply returned 0, PPSA02664's colour-grading LUT builder wrote an all-black 1024x32 LUT,
+// and every graded pixel composited to black while the UI — composited after the grade — stayed
+// pixel-perfect. RADV preserves Inf, so the identical build was correct on Linux/AMD.
+//
+// WHY IT IS GATED. An undeclarable capability makes the module INVALID; it is not silently ignored.
+// VUID-VkShaderModuleCreateInfo-pCode-08740 requires
+// VkPhysicalDeviceFloatControlsProperties::shaderSignedZeroInfNanPreserveFloat{16,32,64} == VK_TRUE,
+// and -08742 requires Vulkan 1.2 or VK_KHR_shader_float_controls. #3561 declared it unconditionally
+// on the strength of "shaderSignedZeroInfNanPreserveFloat32 is VK_TRUE on every implementation this
+// project runs on, and if one ever reports VK_FALSE pipeline creation fails loudly". BOTH halves
+// were false, and CI measured it on the first run: 2 VUIDs, x475 each, across four test binaries —
+// while all 464 tests PASSED. Nothing failed loudly, because a driver is free to honour an invalid
+// module. That is the undefined-contract case this repository already has a `Ruled out` row about
+// (#2422), not a loud failure. Do not restore an ungated declaration on the strength of a device
+// list; measure the device.
+//
+// THE CONTRACT OF THIS PAIR, and both halves chose their error direction:
+//   * Nothing is declared until a device owner publishes. The neutral state reproduces the
+//     pre-#3479 behaviour — legal on every device, Inf semantics unguaranteed — so a path that
+//     forgets to publish LOSES THE FIX rather than emitting a module no device may legally compile.
+//     Offline callers with no device at all (tools, CPU-only tests) sit here by construction.
+//   * Every publisher is ANDed in. A process may own more than one Vulkan device (the renderer's,
+//     and the compute backend's private one), and one emitted module has to be legal on all of
+//     them, so the weakest device decides.
+//
+// `declaration_permitted_by_api` is the -08742 half: the DEVICE's effective API version is at least
+// 1.2, or VK_KHR_shader_float_controls is ENABLED on it. Physical support for the extension is not
+// enough — the same rule as every other capability published through SharedVulkanContext.
+void publish_float_controls_support(bool signed_zero_inf_nan_preserve_float32,
+                                    bool declaration_permitted_by_api);
+
+// True when a guest module may declare SignedZeroInfNanPreserve: at least one device owner has
+// published, and every one of them can execute it legally.
+bool signed_zero_inf_nan_preserve_declared();
+
+// Restore the unpublished neutral state. Test hook only — it exists so the positive and negative
+// arms of `test_float_controls` can run in one process.
+void reset_float_controls_support_for_test();
+
 // PROSPER_CFG_TRIP_BOUND witness. When a dispatcher loop is bounded and the bound is REACHED, the
 // shader records what happened into the top of the internal GDS buffer, which is already host-backed
 // and read back after the dispatch. Arming a bound is not the same as hitting one, and until a run

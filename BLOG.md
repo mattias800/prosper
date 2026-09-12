@@ -21,6 +21,28 @@ from the tracker issues, and still gated, because it is a projection of state ra
 
 ## 2026-09-11
 
+### Alex Kidd's world had no colour on Windows, and the reason was one missing line of SPIR-V
+
+This is the kind of fix worth a paragraph, because it moves every title and it was hiding behind a
+platform. *Alex Kidd in Miracle World DX* rendered its level in full colour on Linux and as a black
+field with a pixel-perfect HUD on Windows — the same build, the same route. Guest shaders are
+translated from AMD machine code, where `Inf` and `NaN` mean exactly what the hardware says they
+mean, but a Vulkan shader does not promise that unless it asks. AMD's driver preserved them anyway;
+NVIDIA's, free to assume they never happen, folded the game's own `sign()` helper — which multiplies
+by infinity on purpose — down to zero. That answer fed the colour-grading table the whole scene is
+graded through, the table came out black, and so did the world. The HUD is drawn after the grading
+step, which is why it survived and made the picture look like a compositing bug. Every recompiled
+shader now asks for the exact float semantics it was written against.
+
+Before, on Windows/NVIDIA:
+
+<p align="center"><img src="assets/screenshots/alex-kidd-black-world.webp" alt="Alex Kidd in Miracle World DX — the world composited to black behind a correct HUD and dialogue box"></p>
+
+After, same machine, same route:
+
+<p align="center"><img src="assets/screenshots/alex-kidd-inf-preserve.webp" alt="Alex Kidd in Miracle World DX — Mt. Eternal rendering in full colour at 1920x1080"></p>
+
+
 ### GTA V's Performance-mode route had been choosing a different setting entirely
 
 ![GTA V Settings, old route: the Controls pane, with Show Controls For changed to In Aircraft](assets/screenshots/gta5-route-wrong-pane-controls-aircraft.webp)

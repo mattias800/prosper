@@ -94,6 +94,59 @@ bool dead_varying_elimination_enabled() {
     return !disabled;
 }
 
+namespace {
+// Two flags rather than one tri-state, because "nobody asked yet" and "somebody asked and the
+// answer was no" must not be the same value: the first is the neutral offline state and the second
+// is a diagnosis worth printing. See rdna2_to_spirv.hpp for the whole contract.
+std::atomic<bool> g_float_controls_published{false};
+std::atomic<bool> g_float_controls_supported{true};
+
+// Each half of the gate says its own sentence once. A shared counter would let whichever device
+// published first silence the other's reason, and WHICH half failed is the actionable part: one is
+// "this driver cannot preserve Inf", the other is "this device is too old to be told to".
+void report_float_controls_shortfall(bool preserve_float32, bool permitted_by_api) {
+    static std::atomic<unsigned> said_api{0}, said_property{0};
+    if (!permitted_by_api && said_api.fetch_add(1) == 0)
+        std::fprintf(stderr,
+                     "[recompile] SignedZeroInfNanPreserve DISABLED: this Vulkan device offers "
+                     "neither API version 1.2 nor VK_KHR_shader_float_controls, so the execution "
+                     "mode cannot be declared on it. Recompiled guest modules therefore run under "
+                     "the driver's default float contract, and a driver that assumes no Inf answers "
+                     "the guest sign() idiom with 0 -- a colour-grading LUT built that way is all "
+                     "black and blacks out every graded pixel of the scene (#3479).\n");
+    if (permitted_by_api && !preserve_float32 && said_property.fetch_add(1) == 0)
+        std::fprintf(stderr,
+                     "[recompile] SignedZeroInfNanPreserve DISABLED: this device reports "
+                     "VkPhysicalDeviceFloatControlsProperties::shaderSignedZeroInfNanPreserveFloat32"
+                     " = VK_FALSE, so declaring the mode would make every guest module invalid on "
+                     "it. Guest float semantics are Inf/NaN-exact and this device will not preserve "
+                     "them: expect a guest sign() idiom to answer 0, and a colour-grading LUT built "
+                     "from one to come out all black, blacking out every graded pixel (#3479).\n");
+}
+} // namespace
+
+void publish_float_controls_support(bool signed_zero_inf_nan_preserve_float32,
+                                    bool declaration_permitted_by_api) {
+    const bool usable = signed_zero_inf_nan_preserve_float32 && declaration_permitted_by_api;
+    if (!usable) {
+        g_float_controls_supported.store(false, std::memory_order_relaxed);
+        report_float_controls_shortfall(signed_zero_inf_nan_preserve_float32,
+                                        declaration_permitted_by_api);
+    }
+    // Published LAST, so a reader that observes `published` also observes this publisher's verdict.
+    g_float_controls_published.store(true, std::memory_order_release);
+}
+
+bool signed_zero_inf_nan_preserve_declared() {
+    return g_float_controls_published.load(std::memory_order_acquire) &&
+           g_float_controls_supported.load(std::memory_order_relaxed);
+}
+
+void reset_float_controls_support_for_test() {
+    g_float_controls_supported.store(true, std::memory_order_relaxed);
+    g_float_controls_published.store(false, std::memory_order_release);
+}
+
 void apply_fragment_consumption(PixelInputMapping& mapping,
                                 const uint32_t* fragment_code, size_t dwords) {
     if (!dead_varying_elimination_enabled() || !mapping.valid_mask || !fragment_code || !dwords)

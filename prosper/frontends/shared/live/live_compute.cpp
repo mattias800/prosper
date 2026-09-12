@@ -25,8 +25,10 @@
 #include "gpu/texture/bc_decode.hpp"
 #include "gpu/diagnostics/vk_object_names.hpp"   // #3578
 #include "gpu/capture/gpu_capture.hpp"
+#include "gpu/diagnostics/gpu_memory_budget_vk.hpp"  // #3533: how much of the heap does prosper hold?
 #include "gpu/execute/gpu_execute.hpp"
 #include "gpu/execute/host_read_barrier.hpp"  // #3249: a host read of a dispatch result needs an availability op
+#include "gpu/execute/float_controls_probe.hpp"  // #3479: the device gate on SignedZeroInfNanPreserve
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_cf9200_contract.hpp"
 #include "gpu/resources/shader_resources.hpp"
@@ -1803,7 +1805,7 @@ struct VulkanComputeContext {
             for (VkDeviceMemory allocation : allocations) {
                 if (memory_pool.persistent_mappings.erase(allocation))
                     vkUnmapMemory(device, allocation);
-                vkFreeMemory(device, allocation, nullptr);
+                prosper::gpu::free_device_memory(device, allocation);
                 ++released;
             }
         }
@@ -1827,7 +1829,11 @@ struct VulkanComputeContext {
         auto allocate = [&](const VkMemoryAllocateInfo& info, VkDeviceMemory* result) {
             const auto injected = setup_status ? g_next_retile_allocation_for_test.exchange(
                 VK_SUCCESS, std::memory_order_acq_rel) : VK_SUCCESS;
-            return injected != VK_SUCCESS ? injected : vkAllocateMemory(device, &info, nullptr, result);
+            if (injected != VK_SUCCESS) return injected;
+            // Counted HERE, at the one place a driver allocation really happens. The pool above
+            // recycles allocations, so counting in allocate_memory's body would measure prosper's
+            // churn rather than its footprint -- the opposite of the question (#3533).
+            return prosper::gpu::allocate_device_memory(device, &info, result);
         };
         auto map = [&](VkDeviceMemory allocation, VkDeviceSize size, void** mapping) {
             const auto injected = setup_status ? g_next_retile_mapping_for_test.exchange(
@@ -1901,6 +1907,8 @@ struct VulkanComputeContext {
             }
         }
         if (setup_status) *setup_status = allocation_result;
+        // The budget reports the failure from inside allocate_device_memory, which is the only
+        // place that sees every one of them (#3533).
         if (allocation_result != VK_SUCCESS) return VK_NULL_HANDLE;
         if (compute_memory_pool_enabled()) {
             std::lock_guard<std::mutex> lock(memory_pool.mutex);
@@ -1942,7 +1950,7 @@ struct VulkanComputeContext {
     void release_memory(VkDeviceMemory allocation) {
         if (!allocation) return;
         if (!compute_memory_pool_enabled()) {
-            vkFreeMemory(device, allocation, nullptr);
+            prosper::gpu::free_device_memory(device, allocation);
             return;
         }
         std::lock_guard<std::mutex> lock(memory_pool.mutex);
@@ -1950,7 +1958,7 @@ struct VulkanComputeContext {
         if (found == memory_pool.active.end()) {
             if (memory_pool.persistent_mappings.erase(allocation))
                 vkUnmapMemory(device, allocation);
-            vkFreeMemory(device, allocation, nullptr);
+            prosper::gpu::free_device_memory(device, allocation);
             return;
         }
         const ComputeMemoryKey key = found->second;
@@ -1963,7 +1971,7 @@ struct VulkanComputeContext {
             ++memory_pool.discarded;
             if (memory_pool.persistent_mappings.erase(allocation))
                 vkUnmapMemory(device, allocation);
-            vkFreeMemory(device, allocation, nullptr);
+            prosper::gpu::free_device_memory(device, allocation);
             return;
         }
         memory_pool.available[key].push_back(allocation);
@@ -1985,14 +1993,14 @@ struct VulkanComputeContext {
             for (VkDeviceMemory allocation : allocations) {
                 if (memory_pool.persistent_mappings.erase(allocation))
                     vkUnmapMemory(device, allocation);
-                vkFreeMemory(device, allocation, nullptr);
+                prosper::gpu::free_device_memory(device, allocation);
             }
         }
         for (const auto& [allocation, key] : memory_pool.active) {
             (void)key;
             if (memory_pool.persistent_mappings.erase(allocation))
                 vkUnmapMemory(device, allocation);
-            vkFreeMemory(device, allocation, nullptr);
+            prosper::gpu::free_device_memory(device, allocation);
         }
         memory_pool.available.clear();
         memory_pool.active.clear();
@@ -3294,6 +3302,8 @@ struct VulkanComputeContext {
             max_native_subgroup_size = shared.max_compute_subgroup_size;
             if (create_pipeline_cache()) {
                 vkGetPhysicalDeviceMemoryProperties(physical, &memory);
+                prosper::gpu::set_device_heaps(memory);
+                prosper::gpu::report_device_memory("adopted device");
                 query_subgroup_support();
                 std::fprintf(stderr, "[compute] Vulkan device: adopted the renderer's device "
                                      "(shared, queue family %u)\n", queue_family);
@@ -3308,6 +3318,16 @@ struct VulkanComputeContext {
                 std::fprintf(stderr, "[compute] storage-buffer int64 atomics %s "
                                      "(inherited from the adopted device)\n",
                              shared.storage_buffer_int64_atomics ? "ENABLED" : "unavailable");
+                // Read, never re-measured: the renderer that owns this device already published
+                // its float contract to the recompiler, and a second publisher of the same device
+                // could only repeat it. Printed anyway, because this backend's own log is where a
+                // reader looks to find out whether a black graded frame is the device's doing
+                // (#3479), and a capability visible only in another component's log is the shape
+                // #2458 shipped.
+                std::fprintf(stderr, "[compute] SignedZeroInfNanPreserve %s "
+                                     "(inherited from the adopted device)\n",
+                             prosper::gpu::signed_zero_inf_nan_preserve_declared()
+                                 ? "ENABLED" : "unavailable");
                 // Same both-directions rule for the OOB image contract (#3531). "unavailable" here
                 // means every storage-image dispatch will be declined, which is a large behavioural
                 // difference that must be readable from the log rather than inferred from a black
@@ -3458,10 +3478,19 @@ struct VulkanComputeContext {
         dci.enabledExtensionCount = (uint32_t)dev_exts.size();
         dci.ppEnabledExtensionNames = dev_exts.empty() ? nullptr : dev_exts.data();
         if (vkCreateDevice(physical, &dci, nullptr, &device) != VK_SUCCESS) return false;
+        // Same measurement the renderer makes, for the same reason image robustness is acquired
+        // here through a shared helper (#3531): this device executes the SAME recompiled modules,
+        // and a module declaring a capability only one of the two devices can take is invalid on
+        // the other. Publishers are ANDed, so whichever device is weaker decides (#3479).
+        prosper::gpu::publish_device_float_controls(
+            "compute", physical, kVulkanRuntimeVersion,
+            /*float_controls_extension_enabled=*/false);
         vkGetDeviceQueue(device, queue_family, 0, &queue);
         if (!create_pipeline_cache())
             return false;
         vkGetPhysicalDeviceMemoryProperties(physical, &memory);
+        prosper::gpu::set_device_heaps(memory);
+        prosper::gpu::report_device_memory("own device");
         query_subgroup_support();
         return true;
     }

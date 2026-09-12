@@ -20,6 +20,35 @@ backstop for genuinely unknown encodings — mark `CONFIDENCE: LOW`, log loudly,
 exact opcode — but every one hit on a live boot is the next thing to implement. A silently skipped
 instruction drops real rendered content and reads as "handled".
 
+## `SignedZeroInfNanPreserve`: a correctness contract, and a device gate
+
+RDNA2 float arithmetic defines Inf, NaN and signed zero exactly. Vulkan does **not** promise that by
+default: without `SPV_KHR_float_controls`' execution mode a driver may compile the module assuming
+those values never occur. Guest shaders do rely on them — a compiler-generated `sign()` idiom
+synthesises `+Inf` with integer shifts and multiplies by it — and on NVIDIA that multiply returned 0,
+which blacked out a whole title's world while its UI stayed perfect (#3479). RADV preserves Inf, so
+the same build was correct on Linux and the defect looked like a title quirk.
+
+`declare_float_controls()` in `rdna2_to_spirv_internal.hpp` emits it from every `begin*()` — but only
+on a device that has been **measured** to accept it. Declaring a capability the device does not
+satisfy makes the module invalid rather than merely unoptimised, and a driver is free to honour an
+invalid module: the first revision declared it unconditionally and CI's Vulkan validation scan
+reported two VUIDs x475 across four binaries while every one of 464 tests passed (#3561). The verdict
+is published by whoever owns a Vulkan device, through
+`gpu/execute/float_controls_probe.hpp`; the emitter only reads it, and reads "no" until somebody has
+asked a real device. Publishers are ANDed, and nothing is declared until one publishes — an offline
+caller therefore emits the neutral form, which is legal everywhere.
+
+Three things follow. **Do not add a new stage entry point without calling it** —
+`tests/gpu/recompiler/test_float_controls.cpp` asserts the declaration for all four stages and is the
+cheapest place to notice. **Do not re-derive the gate away from a device list**: "every device we run
+on has the property" is the claim that failed, and no green test run can contradict a property
+nothing queries. And **an execution test cannot guard any of this**: an `Inf * x` kernel passes on
+RADV and on the lavapipe CI runs whether or not the mode is declared, because those implementations
+preserve Inf anyway, so the guard is structural on purpose. The hand-built modules in
+`spirv_builder` are prosper's own code rather than translated guest code and are deliberately outside
+this contract.
+
 ## `PROSPER_CFG_TRIP_BOUND` — is this a non-terminating loop?
 
 A guest program whose control flow neither structured emitter accepts is lowered by

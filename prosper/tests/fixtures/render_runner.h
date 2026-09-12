@@ -11,7 +11,9 @@
 #include "gpu_detile_upload.h"
 #include "mapped_staging.h"
 #include "gpu/capture/gpu_capture.hpp"
+#include "gpu/diagnostics/gpu_memory_budget_vk.hpp"  // #3533: count what we hold on each heap
 #include "gpu/execute/host_read_barrier.hpp"   // the availability half of a readback (#2944/#3249)
+#include "gpu/execute/float_controls_probe.hpp" // #3479: the device gate on SignedZeroInfNanPreserve
 #include "gpu/diagnostics/diagnostic_selectors.hpp"
 #include "gpu/diagnostics/geometry_probe_arming.hpp"
 #include "gpu/diagnostics/vk_object_names.hpp"   // #3578: name guest shaders for RenderDoc/RGP
@@ -1639,6 +1641,26 @@ inline const RenderVkCtx& render_vk_ctx() {
         dci.enabledExtensionCount = (uint32_t)dev_exts.size();
         dci.ppEnabledExtensionNames = dev_exts.empty() ? nullptr : dev_exts.data();
         if (vkCreateDevice(r.phys, &dci, nullptr, &r.dev) != VK_SUCCESS || !r.dev) return r;
+        // #3533: the heap layout the memory budget resolves every allocation against. It has to be
+        // HERE, at device creation, rather than beside the first render call: an allocation that
+        // arrives before the layout is known cannot be attributed to a heap, so the budget drops it,
+        // and dropping the renderer's allocations would leave the instrument reporting the compute
+        // path's few hundred MiB as though it were prosper's whole footprint.
+        {
+            VkPhysicalDeviceMemoryProperties heap_properties{};
+            vkGetPhysicalDeviceMemoryProperties(r.phys, &heap_properties);
+            prosper::gpu::set_device_heaps(heap_properties);
+        }
+        // Measure the float contract this device offers and publish it to the recompiler (#3479).
+        // Here rather than earlier because a device that failed to create must not contribute a
+        // verdict -- every publisher is ANDed, so a stillborn device would otherwise be able to veto
+        // the guarantee for the device that follows it. No extension is requested: the property is
+        // core from Vulkan 1.2 and kVulkanRuntimeVersion is 1.4, so the -08742 half is satisfied by
+        // version, and asking for a promoted extension name a 1.4 device need not still advertise is
+        // exactly the mistake image_robustness.hpp's comment records.
+        prosper::gpu::publish_device_float_controls(
+            "render", r.phys, prosper::frontend::kVulkanRuntimeVersion,
+            /*float_controls_extension_enabled=*/false);
         VkPipelineCacheCreateInfo cache_info{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
         std::vector<uint8_t> initial_cache;
         try {
@@ -1855,6 +1877,16 @@ inline bool flush_graphics_pipeline_cache(
 // VK_ERROR_DEVICE_LOST is the honest result: the device really is going away, and every caller
 // here already treats a failed submit as "not submitted" and cleans up accordingly.
 inline VkResult render_locked_queue_submit(VkQueue q, uint32_t n, const VkSubmitInfo* s, VkFence f) {
+    // #3533: the memory standing, on a cadence, from the path where the failure actually happens --
+    // "Not enough memory for command submission" is a SUBMIT-time validation over the resident BO
+    // set, which a process holding a steady footprint can hit having allocated nothing.
+    //
+    // ABOVE the submit region and the present lock, deliberately. `fprintf` can block indefinitely
+    // on a stalled stderr pipe, and inside the region that wait would be one `gpu_submit_gate_drain`
+    // is waiting on -- an unbounded wait there is what this file's own comments call the freeze it
+    // exists to avoid, and a diagnostic about lockups must not be able to cause one. Hoisting it
+    // also keeps the cadence reporting during shutdown, where the gate below returns early.
+    prosper::gpu::report_device_memory_periodically();
     prosper::GpuSubmitRegion gate;
     if (!gate.admitted()) return VK_ERROR_DEVICE_LOST;
     if (prosper::gpu::shared_present_active()) {
@@ -2557,7 +2589,7 @@ inline void destroy_persistent_color_target(const RenderVkCtx& ctx,
                                             PersistentColorTargetImage& target) {
     if (target.view) vkDestroyImageView(ctx.dev, target.view, nullptr);
     if (target.image) vkDestroyImage(ctx.dev, target.image, nullptr);
-    if (target.memory) vkFreeMemory(ctx.dev, target.memory, nullptr);
+    if (target.memory) prosper::gpu::free_device_memory(ctx.dev, target.memory);
     target = {};
 }
 
@@ -2759,7 +2791,7 @@ inline VkDeviceMemory allocate_transient_render_memory(VkDevice device, VkDevice
     allocation.allocationSize = bytes;
     allocation.memoryTypeIndex = memory_type;
     VkDeviceMemory memory = VK_NULL_HANDLE;
-    if (vkAllocateMemory(device, &allocation, nullptr, &memory) != VK_SUCCESS) return VK_NULL_HANDLE;
+    if (prosper::gpu::allocate_device_memory(device, &allocation, &memory) != VK_SUCCESS) return VK_NULL_HANDLE;
     if (render_memory_pool_enabled()) {
         RenderMemoryPool& pool = render_memory_pool();
         std::lock_guard<std::mutex> lock(pool.mutex);
@@ -2771,7 +2803,7 @@ inline VkDeviceMemory allocate_transient_render_memory(VkDevice device, VkDevice
 inline void release_transient_render_memory(VkDevice device, VkDeviceMemory memory) {
     if (!memory) return;
     if (!render_memory_pool_enabled()) {
-        vkFreeMemory(device, memory, nullptr);
+        prosper::gpu::free_device_memory(device, memory);
         return;
     }
 
@@ -2779,7 +2811,7 @@ inline void release_transient_render_memory(VkDevice device, VkDeviceMemory memo
     std::lock_guard<std::mutex> lock(pool.mutex);
     auto found = pool.active.find(memory);
     if (found == pool.active.end()) {
-        vkFreeMemory(device, memory, nullptr);
+        prosper::gpu::free_device_memory(device, memory);
         return;
     }
     const RenderMemoryKey key = found->second;
@@ -2790,7 +2822,7 @@ inline void release_transient_render_memory(VkDevice device, VkDeviceMemory memo
     if (pool.cached_allocations >= max_cached_allocations ||
         key.bytes > remaining) {
         ++pool.discarded;
-        vkFreeMemory(device, memory, nullptr);
+        prosper::gpu::free_device_memory(device, memory);
         return;
     }
     pool.available[key].push_back(memory);
@@ -2962,7 +2994,7 @@ inline VkDeviceSize render_host_buffer_arena_size() {
 inline void destroy_render_host_buffer(VkDevice device, RenderHostBuffer& buffer) {
     if (buffer.mapped) vkUnmapMemory(device, buffer.memory);
     if (buffer.buffer) vkDestroyBuffer(device, buffer.buffer, nullptr);
-    if (buffer.memory) vkFreeMemory(device, buffer.memory, nullptr);
+    if (buffer.memory) prosper::gpu::free_device_memory(device, buffer.memory);
     buffer = {};
 }
 
@@ -3021,7 +3053,7 @@ inline RenderHostBuffer acquire_render_host_buffer(const RenderVkCtx& ctx,
         ctx.phys, requirements.memoryTypeBits,
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     if (allocation.memoryTypeIndex == UINT32_MAX ||
-        vkAllocateMemory(ctx.dev, &allocation, nullptr, &buffer.memory) != VK_SUCCESS ||
+        prosper::gpu::allocate_device_memory(ctx.dev, &allocation, &buffer.memory) != VK_SUCCESS ||
         vkBindBufferMemory(ctx.dev, buffer.buffer, buffer.memory, 0) != VK_SUCCESS ||
         vkMapMemory(ctx.dev, buffer.memory, 0, VK_WHOLE_SIZE, 0, &buffer.mapped) != VK_SUCCESS) {
         destroy_render_host_buffer(ctx.dev, buffer);
@@ -4477,12 +4509,12 @@ inline bool persistent_ds_transfer_buffer(const RenderVkCtx& ctx, VkDeviceSize b
     auto try_allocate = [&](uint32_t type) {
         if (type == UINT32_MAX) return false;
         allocation.memoryTypeIndex = type;
-        if (vkAllocateMemory(ctx.dev, &allocation, nullptr, &memory) != VK_SUCCESS) {
+        if (prosper::gpu::allocate_device_memory(ctx.dev, &allocation, &memory) != VK_SUCCESS) {
             memory = VK_NULL_HANDLE;
             return false;
         }
         if (vkBindBufferMemory(ctx.dev, buffer, memory, 0) != VK_SUCCESS) {
-            vkFreeMemory(ctx.dev, memory, nullptr); memory = VK_NULL_HANDLE;
+            prosper::gpu::free_device_memory(ctx.dev, memory); memory = VK_NULL_HANDLE;
             return false;
         }
         return true;
@@ -4630,7 +4662,7 @@ inline bool readback_persistent_color_target(uint64_t id, uint32_t width, uint32
         if (fence) vkDestroyFence(ctx.dev, fence, nullptr);
         if (pool) vkDestroyCommandPool(ctx.dev, pool, nullptr);
         if (buffer) vkDestroyBuffer(ctx.dev, buffer, nullptr);
-        if (memory) vkFreeMemory(ctx.dev, memory, nullptr);
+        if (memory) prosper::gpu::free_device_memory(ctx.dev, memory);
     };
     VkCommandPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     pool_info.queueFamilyIndex = ctx.qfi;
@@ -4777,7 +4809,7 @@ inline bool copy_persistent_color_target(uint64_t src_id, uint64_t dst_id, uint3
         iai.memoryTypeIndex = render_memory_type(ctx.phys, ir.memoryTypeBits, 0);
         if (ir.size > limit || persistent_color_target_bytes() > limit - ir.size ||
             persistent_color_target_cache().size() > count_ceiling ||
-            vkAllocateMemory(ctx.dev, &iai, nullptr, &imem) != VK_SUCCESS || !imem) {
+            prosper::gpu::allocate_device_memory(ctx.dev, &iai, &imem) != VK_SUCCESS || !imem) {
             vkDestroyImage(ctx.dev, img, nullptr);
             persistent_color_target_cache().erase(dst_key);
             char buf[256];
@@ -4793,7 +4825,7 @@ inline bool copy_persistent_color_target(uint64_t src_id, uint64_t dst_id, uint3
         }
         if (vkBindImageMemory(ctx.dev, img, imem, 0) != VK_SUCCESS) {
             vkDestroyImage(ctx.dev, img, nullptr);
-            vkFreeMemory(ctx.dev, imem, nullptr);
+            prosper::gpu::free_device_memory(ctx.dev, imem);
             persistent_color_target_cache().erase(dst_key);
             error = "cannot bind resolve destination memory";
             return false;
@@ -4804,7 +4836,7 @@ inline bool copy_persistent_color_target(uint64_t src_id, uint64_t dst_id, uint3
         VkImageView view = VK_NULL_HANDLE;
         if (vkCreateImageView(ctx.dev, &ivci, nullptr, &view) != VK_SUCCESS || !view) {
             vkDestroyImage(ctx.dev, img, nullptr);
-            vkFreeMemory(ctx.dev, imem, nullptr);
+            prosper::gpu::free_device_memory(ctx.dev, imem);
             persistent_color_target_cache().erase(dst_key);
             error = "cannot create resolve destination view";
             return false;
@@ -4942,7 +4974,7 @@ inline bool read_persistent_ds_depth(PersistentDsImage& image, uint32_t width, u
     if (transfer != BackendSubmissionState::Complete) {
         if (transfer != BackendSubmissionState::Pending) {
             vkDestroyBuffer(ctx.dev, buffer, nullptr);
-            vkFreeMemory(ctx.dev, memory, nullptr);
+            prosper::gpu::free_device_memory(ctx.dev, memory);
         }
         if (error.empty()) error = "retained DS depth transfer did not complete";
         return false;
@@ -4956,14 +4988,14 @@ inline bool read_persistent_ds_depth(PersistentDsImage& image, uint32_t width, u
     void* mapped = nullptr;
     if (vkMapMemory(ctx.dev, memory, 0, mapping.map_size, 0, &mapped) != VK_SUCCESS || !mapped) {
         vkDestroyBuffer(ctx.dev, buffer, nullptr);
-        vkFreeMemory(ctx.dev, memory, nullptr);
+        prosper::gpu::free_device_memory(ctx.dev, memory);
         error = "cannot map retained DS depth readback";
         return false;
     }
     if (!invalidate_mapped_readback(ctx, memory, mapping)) {
         vkUnmapMemory(ctx.dev, memory);
         vkDestroyBuffer(ctx.dev, buffer, nullptr);
-        vkFreeMemory(ctx.dev, memory, nullptr);
+        prosper::gpu::free_device_memory(ctx.dev, memory);
         error = "cannot invalidate retained DS depth readback";
         return false;
     }
@@ -4971,7 +5003,7 @@ inline bool read_persistent_ds_depth(PersistentDsImage& image, uint32_t width, u
     std::memcpy(out.data(), mapped, depth_bytes);
     vkUnmapMemory(ctx.dev, memory);
     vkDestroyBuffer(ctx.dev, buffer, nullptr);
-    vkFreeMemory(ctx.dev, memory, nullptr);
+    prosper::gpu::free_device_memory(ctx.dev, memory);
     return true;
 }
 
@@ -5128,7 +5160,7 @@ inline bool snapshot_persistent_ds_images(std::vector<prosper::gpu::GpuCaptureDs
             // release because the helper has already released its command pool and fence.
             if (transfer != BackendSubmissionState::Pending) {
                 vkDestroyBuffer(ctx.dev, buffer, nullptr);
-                vkFreeMemory(ctx.dev, memory, nullptr);
+                prosper::gpu::free_device_memory(ctx.dev, memory);
             }
             return false;
         }
@@ -5145,7 +5177,7 @@ inline bool snapshot_persistent_ds_images(std::vector<prosper::gpu::GpuCaptureDs
             vkUnmapMemory(ctx.dev, memory);
         }
         if (mapped_ok && !invalidated) vkUnmapMemory(ctx.dev, memory);
-        vkDestroyBuffer(ctx.dev, buffer, nullptr); vkFreeMemory(ctx.dev, memory, nullptr);
+        vkDestroyBuffer(ctx.dev, buffer, nullptr); prosper::gpu::free_device_memory(ctx.dev, memory);
         if (!invalidated) {
             if (error.empty())
                 error = mapped_ok ? "cannot invalidate persistent DS readback"
@@ -5198,12 +5230,12 @@ inline bool restore_persistent_ds_image(const prosper::gpu::GpuCaptureDsSeed& se
         view_info.image = image.image; view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
         view_info.format = format; view_info.subresourceRange = {aspects, 0, 1, 0, 1};
         if (allocation.memoryTypeIndex == UINT32_MAX ||
-            vkAllocateMemory(ctx.dev, &allocation, nullptr, &image.memory) != VK_SUCCESS ||
+            prosper::gpu::allocate_device_memory(ctx.dev, &allocation, &image.memory) != VK_SUCCESS ||
             vkBindImageMemory(ctx.dev, image.image, image.memory, 0) != VK_SUCCESS ||
             vkCreateImageView(ctx.dev, &view_info, nullptr, &image.view) != VK_SUCCESS) {
             if (image.view) vkDestroyImageView(ctx.dev, image.view, nullptr);
             vkDestroyImage(ctx.dev, image.image, nullptr);
-            if (image.memory) vkFreeMemory(ctx.dev, image.memory, nullptr);
+            if (image.memory) prosper::gpu::free_device_memory(ctx.dev, image.memory);
             image = {};
             error = "cannot allocate restored persistent DS image"; return false;
         }
@@ -5214,7 +5246,7 @@ inline bool restore_persistent_ds_image(const prosper::gpu::GpuCaptureDsSeed& se
                                        buffer, memory, error)) return false;
     void* mapped = nullptr;
     if (vkMapMemory(ctx.dev, memory, 0, transfer_bytes, 0, &mapped) != VK_SUCCESS) {
-        vkDestroyBuffer(ctx.dev, buffer, nullptr); vkFreeMemory(ctx.dev, memory, nullptr);
+        vkDestroyBuffer(ctx.dev, buffer, nullptr); prosper::gpu::free_device_memory(ctx.dev, memory);
         error = "cannot map persistent DS upload"; return false;
     }
     if (!seed.depth.empty()) std::memcpy(mapped, seed.depth.data(), seed.depth.size());
@@ -5229,7 +5261,7 @@ inline bool restore_persistent_ds_image(const prosper::gpu::GpuCaptureDsSeed& se
         buffer, seed.width, seed.height, seed.depth_valid, seed.stencil_valid, true, error);
     if (transfer != BackendSubmissionState::Pending) {
         vkDestroyBuffer(ctx.dev, buffer, nullptr);
-        vkFreeMemory(ctx.dev, memory, nullptr);
+        prosper::gpu::free_device_memory(ctx.dev, memory);
     }
     if (transfer != BackendSubmissionState::Complete) return false;
     image.layout_initialized = true;
@@ -5870,7 +5902,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             if (ir.size <= limit && persistent_color_target_cache().size() <=
                     persistent_color_target_count_ceiling(avoid_cache_eviction) &&
                 persistent_color_target_bytes() <= limit - ir.size &&
-                vkAllocateMemory(dev, &iai, nullptr, &imem) == VK_SUCCESS) {
+                prosper::gpu::allocate_device_memory(dev, &iai, &imem) == VK_SUCCESS) {
                 cached_color->bytes = ir.size;
                 persistent_color_target_bytes() += ir.size;
             } else {
@@ -5904,7 +5936,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             vkDestroyImage(dev, img, nullptr);
             if (cached_color) {
                 if (cached_color->bytes) persistent_color_target_bytes() -= cached_color->bytes;
-                if (imem) vkFreeMemory(dev, imem, nullptr);
+                if (imem) prosper::gpu::free_device_memory(dev, imem);
                 persistent_color_target_cache().erase(color_key);
             } else if (imem) {
                 release_transient_render_memory(dev, imem);
@@ -5985,7 +6017,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 persistent_color_target_cache().size() <=
                     persistent_color_target_count_ceiling(avoid_cache_eviction) &&
                 persistent_color_target_bytes() <= limit - color1_requirements.size &&
-                vkAllocateMemory(dev, &color1_allocation, nullptr, &imem1) == VK_SUCCESS) {
+                prosper::gpu::allocate_device_memory(dev, &color1_allocation, &imem1) == VK_SUCCESS) {
                 cached_color1->bytes = color1_requirements.size;
                 persistent_color_target_bytes() += color1_requirements.size;
             } else {
@@ -6022,7 +6054,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             if (cached_color1) {
                 if (cached_color1->bytes)
                     persistent_color_target_bytes() -= cached_color1->bytes;
-                if (imem1) vkFreeMemory(dev, imem1, nullptr);
+                if (imem1) prosper::gpu::free_device_memory(dev, imem1);
                 persistent_color_target_cache().erase(color_key1);
             } else if (imem1) {
                 release_transient_render_memory(dev, imem1);
@@ -6094,7 +6126,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 persistent_color_target_cache().size() <=
                     persistent_color_target_count_ceiling(avoid_cache_eviction) &&
                 persistent_color_target_bytes() <= limit - requirements.size &&
-                vkAllocateMemory(dev, &allocation, nullptr, &extra_memories[slot]) == VK_SUCCESS) {
+                prosper::gpu::allocate_device_memory(dev, &allocation, &extra_memories[slot]) == VK_SUCCESS) {
                 cached_extra[slot]->bytes = requirements.size;
                 persistent_color_target_bytes() += requirements.size;
             } else {
@@ -6131,7 +6163,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             if (cached_extra[slot]) {
                 if (cached_extra[slot]->bytes)
                     persistent_color_target_bytes() -= cached_extra[slot]->bytes;
-                if (extra_memories[slot]) vkFreeMemory(dev, extra_memories[slot], nullptr);
+                if (extra_memories[slot]) prosper::gpu::free_device_memory(dev, extra_memories[slot]);
                 persistent_color_target_cache().erase(extra_keys[slot]);
             } else if (extra_memories[slot]) {
                 release_transient_render_memory(dev, extra_memories[slot]);
@@ -6201,7 +6233,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         VkMemoryRequirements dr; vkGetImageMemoryRequirements(dev, dimg, &dr);
         VkMemoryAllocateInfo dai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         dai.allocationSize = dr.size; dai.memoryTypeIndex = pick(dr.memoryTypeBits, 0);
-        if (cached_ds) vkAllocateMemory(dev, &dai, nullptr, &dmem);
+        if (cached_ds) prosper::gpu::allocate_device_memory(dev, &dai, &dmem);
         else dmem = allocate_transient_render_memory(dev, dai.allocationSize,
                                                       dai.memoryTypeIndex);
         vkBindImageMemory(dev, dimg, dmem, 0);
@@ -6219,7 +6251,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             vkDestroyImage(dev, dimg, nullptr);
             dimg = VK_NULL_HANDLE;
             if (cached_ds) {
-                if (dmem) vkFreeMemory(dev, dmem, nullptr);
+                if (dmem) prosper::gpu::free_device_memory(dev, dmem);
                 persistent_ds_cache().erase(ds_key);
             } else if (dmem) {
                 release_transient_render_memory(dev, dmem);
@@ -8226,7 +8258,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                 if (cached->second.image)
                                     vkDestroyImage(dev, cached->second.image, nullptr);
                                 if (cached->second.memory)
-                                    vkFreeMemory(dev, cached->second.memory, nullptr);
+                                    prosper::gpu::free_device_memory(dev, cached->second.memory);
                                 persistent_texture_bytes -= cached->second.bytes;
                                 persistent_texture_binding_entries -= cached->second.bindings.size();
                                 persistent_texture_images.erase(cached);
@@ -8321,7 +8353,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                     persistent_textures_enabled && upload.persistent_id &&
                                     tr.size <= persistent_texture_limit;
                                 if (retain &&
-                                    vkAllocateMemory(dev, &tai, nullptr, &upload.memory) ==
+                                    prosper::gpu::allocate_device_memory(dev, &tai, &upload.memory) ==
                                         VK_SUCCESS)
                                     upload.direct_memory = true;
                                 if (!upload.memory) {
@@ -9996,8 +10028,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             !persistent_ds_transfer_buffer(ds_ctx, 16,
                                            VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_COUNTER_BUFFER_BIT_EXT,
                                            geom_counter, geom_counter_mem, gerr)) {
-            if (geom_buf) { vkDestroyBuffer(dev, geom_buf, nullptr); vkFreeMemory(dev, geom_mem, nullptr); }
-            if (geom_counter) { vkDestroyBuffer(dev, geom_counter, nullptr); vkFreeMemory(dev, geom_counter_mem, nullptr); }
+            if (geom_buf) { vkDestroyBuffer(dev, geom_buf, nullptr); prosper::gpu::free_device_memory(dev, geom_mem); }
+            if (geom_counter) { vkDestroyBuffer(dev, geom_counter, nullptr); prosper::gpu::free_device_memory(dev, geom_counter_mem); }
             geom_buf = VK_NULL_HANDLE; geom_mem = VK_NULL_HANDLE;
             geom_counter = VK_NULL_HANDLE; geom_counter_mem = VK_NULL_HANDLE; geom_cap = 0;
         }
@@ -10217,7 +10249,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 ctx.phys, er.memoryTypeBits,
                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
             if (eai.memoryTypeIndex != UINT32_MAX &&
-                vkAllocateMemory(dev, &eai, nullptr, &echo_memory) == VK_SUCCESS &&
+                prosper::gpu::allocate_device_memory(dev, &eai, &echo_memory) == VK_SUCCESS &&
                 vkBindBufferMemory(dev, echo_buffer, echo_memory, 0) == VK_SUCCESS &&
                 vkMapMemory(dev, echo_memory, 0, VK_WHOLE_SIZE, 0, &echo_mapped) == VK_SUCCESS) {
                 std::memset(echo_mapped, 0xCD, static_cast<size_t>(kEchoStride * kEchoMax));
@@ -10602,7 +10634,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             if (binding.view) vkDestroyImageView(dev, binding.view, nullptr);
         }
         vkDestroyImage(dev, victim->second.image, nullptr);
-        vkFreeMemory(dev, victim->second.memory, nullptr);
+        prosper::gpu::free_device_memory(dev, victim->second.memory);
         persistent_texture_bytes -= victim->second.bytes;
         persistent_texture_binding_entries -= victim->second.bindings.size();
         persistent_texture_images.erase(victim);
@@ -10746,7 +10778,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         }
     }
     if (echo_mapped) vkUnmapMemory(dev, echo_memory);
-    if (echo_memory) vkFreeMemory(dev, echo_memory, nullptr);
+    if (echo_memory) prosper::gpu::free_device_memory(dev, echo_memory);
     if (echo_buffer) vkDestroyBuffer(dev, echo_buffer, nullptr);
     const auto timing_gpu_done = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
     const bool batch_completed = !flush_now ||
@@ -11180,9 +11212,9 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             if (ds_stats_pool) vkDestroyQueryPool(dev, ds_stats_pool, nullptr);
             if (ds_occ_pool) vkDestroyQueryPool(dev, ds_occ_pool, nullptr);
             if (geom_buf) vkDestroyBuffer(dev, geom_buf, nullptr);
-            if (geom_mem) vkFreeMemory(dev, geom_mem, nullptr);
+            if (geom_mem) prosper::gpu::free_device_memory(dev, geom_mem);
             if (geom_counter) vkDestroyBuffer(dev, geom_counter, nullptr);
-            if (geom_counter_mem) vkFreeMemory(dev, geom_counter_mem, nullptr);
+            if (geom_counter_mem) prosper::gpu::free_device_memory(dev, geom_counter_mem);
             for (auto& v : dv) {
                 if (v.pipe && !v.pipeline_cached) vkDestroyPipeline(dev, v.pipe, nullptr);
                 // An arena slice is owned by the arena and released with it; destroying the
@@ -11228,7 +11260,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                     !upload.borrowed_compute && !upload.borrowed_ds)
                     vkDestroyImage(dev, upload.image, nullptr);
                 if (upload.memory) {
-                    if (upload.direct_memory) vkFreeMemory(dev, upload.memory, nullptr);
+                    if (upload.direct_memory) prosper::gpu::free_device_memory(dev, upload.memory);
                     else release_transient_render_memory(dev, upload.memory);
                 }
                 // #3405: the cache owns its blocks and answers true even for a duplicate

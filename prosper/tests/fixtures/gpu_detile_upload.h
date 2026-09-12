@@ -12,6 +12,7 @@
 #include <functional>
 #include <memory>
 #include <vector>
+#include "gpu/diagnostics/gpu_memory_budget_vk.hpp"  // #3533: count what we hold on each heap
 
 namespace prosper::test {
 
@@ -89,10 +90,10 @@ struct GpuDetileUpload {
                 !PROSPER_ENV_ON("PROSPER_NO_GPU_DETILE_INPUT_REUSE"))) {
             if (input_mapped) vkUnmapMemory(device, input_memory);
             if (input) vkDestroyBuffer(device, input, nullptr);
-            if (input_memory) vkFreeMemory(device, input_memory, nullptr);
+            if (input_memory) prosper::gpu::free_device_memory(device, input_memory);
         }
         if (output) vkDestroyBuffer(device, output, nullptr);
-        if (output_memory) vkFreeMemory(device, output_memory, nullptr);
+        if (output_memory) prosper::gpu::free_device_memory(device, output_memory);
     }
     // Re-recording the same immutable snapshot is allowed across ordered render
     // passes. Order previous copies/dispatches before overwriting its output.
@@ -195,7 +196,7 @@ inline std::shared_ptr<GpuDetileUpload> prepare_gpu_detile_upload(
         if (type == memory.memoryTypeCount) return false;
         VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         ai.allocationSize = requirements.size; ai.memoryTypeIndex = type;
-        return vkAllocateMemory(program.device, &ai, nullptr, &mem) == VK_SUCCESS &&
+        return prosper::gpu::allocate_device_memory(program.device, &ai, &mem) == VK_SUCCESS &&
                vkBindBufferMemory(program.device, buf, mem, 0) == VK_SUCCESS;
     };
     const auto input = acquire_mapped_staging(program.device, upload->source_bytes,

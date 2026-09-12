@@ -3,6 +3,7 @@
 #include "library_media.hpp"
 
 #include "hle/audio/atrac9_decode.hpp"
+#include "gpu/diagnostics/gpu_memory_budget_vk.hpp"  // #3533: count what we hold on each heap
 
 #include "imgui.h"
 #include "imgui_impl_vulkan.h"
@@ -219,7 +220,7 @@ void LibraryMedia::release_backgrounds() {
     vkDeviceWaitIdle(device_);
     if (pending_.active) {
         if (pending_.staging)    vkDestroyBuffer(device_, pending_.staging, nullptr);
-        if (pending_.stagingMem) vkFreeMemory(device_, pending_.stagingMem, nullptr);
+        if (pending_.stagingMem) prosper::gpu::free_device_memory(device_, pending_.stagingMem);
         destroy_background(pending_.bg);
     }
     pending_ = PendingUpload{};
@@ -607,7 +608,7 @@ LibraryMedia::UploadStart LibraryMedia::begin_upload(LoadResult& res) {
     ai.allocationSize = mr.size;
     ai.memoryTypeIndex = find_memory_type(phys_, mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     if (ai.memoryTypeIndex == UINT32_MAX ||
-        vkAllocateMemory(device_, &ai, nullptr, &bg.memory) != VK_SUCCESS ||
+        prosper::gpu::allocate_device_memory(device_, &ai, &bg.memory) != VK_SUCCESS ||
         vkBindImageMemory(device_, bg.image, bg.memory, 0) != VK_SUCCESS) {
         destroy_background(bg);
         return UploadStart::failed;
@@ -629,7 +630,7 @@ LibraryMedia::UploadStart LibraryMedia::begin_upload(LoadResult& res) {
                                                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                                                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
         ok = bai.memoryTypeIndex != UINT32_MAX &&
-             vkAllocateMemory(device_, &bai, nullptr, &stagingMem) == VK_SUCCESS &&
+             prosper::gpu::allocate_device_memory(device_, &bai, &stagingMem) == VK_SUCCESS &&
              vkBindBufferMemory(device_, staging, stagingMem, 0) == VK_SUCCESS;
     }
     if (ok) {
@@ -676,7 +677,7 @@ LibraryMedia::UploadStart LibraryMedia::begin_upload(LoadResult& res) {
     }
     if (!ok) {
         if (staging)    vkDestroyBuffer(device_, staging, nullptr);
-        if (stagingMem) vkFreeMemory(device_, stagingMem, nullptr);
+        if (stagingMem) prosper::gpu::free_device_memory(device_, stagingMem);
         destroy_background(bg);
         return UploadStart::failed;
     }
@@ -694,7 +695,7 @@ void LibraryMedia::poll_upload(uint64_t now_ms) {
     if (vkGetFenceStatus(device_, uploadFence_) != VK_SUCCESS) return;   // still copying; try next frame
 
     if (pending_.staging)    vkDestroyBuffer(device_, pending_.staging, nullptr);
-    if (pending_.stagingMem) vkFreeMemory(device_, pending_.stagingMem, nullptr);
+    if (pending_.stagingMem) prosper::gpu::free_device_memory(device_, pending_.stagingMem);
     pending_.staging = VK_NULL_HANDLE;
     pending_.stagingMem = VK_NULL_HANDLE;
 
@@ -779,7 +780,7 @@ void LibraryMedia::destroy_background(Background& bg) {
     }
     if (bg.view)   vkDestroyImageView(device_, bg.view, nullptr);
     if (bg.image)  vkDestroyImage(device_, bg.image, nullptr);
-    if (bg.memory) vkFreeMemory(device_, bg.memory, nullptr);
+    if (bg.memory) prosper::gpu::free_device_memory(device_, bg.memory);
     bg = Background{};
 }
 

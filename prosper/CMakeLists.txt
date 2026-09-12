@@ -174,6 +174,12 @@ if(Python3_Interpreter_FOUND)
                    "$<TARGET_FILE:self_dump>")
   add_test(NAME re_xref_decoder
            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/re/test_xref.py")
+  # The GPU memory budget's answer is only as complete as its wiring, and nothing in the compiler
+  # enforces that wiring: a new vkAllocateMemory beside an existing one compiles, links, runs, and is
+  # simply absent from the count. An unwired FREE is the worse half -- those bytes are never given
+  # back, so the figure climbs and reads as a leak that is not there (#3533).
+  add_test(NAME vkmem_coverage
+           COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/vkmem_coverage.py")
   # survey_sizes.py's classifier decides which refactoring tool can act on a file, and it has been
   # wrong five times: on the lambda boundary, by calling a file of many small functions "nothing to
   # do", by measuring the lambda share over the enclosing namespace, by inferring unparsed lines
@@ -1998,6 +2004,11 @@ if(TARGET prosper_core)
   target_link_libraries(test_shader_dump_filter PRIVATE prosper_core)
   add_test(NAME shader_dump_filter COMMAND test_shader_dump_filter)
 
+  add_executable(test_gpu_memory_budget tests/gpu/diagnostics/test_gpu_memory_budget.cpp)
+  target_include_directories(test_gpu_memory_budget PRIVATE tests)   # fixtures/test_scratch.h
+  target_link_libraries(test_gpu_memory_budget PRIVATE prosper_core)
+  add_test(NAME gpu_memory_budget COMMAND test_gpu_memory_budget)
+
   add_executable(test_rdna2_decode tests/gpu/recompiler/test_rdna2_decode.cpp)
   target_link_libraries(test_rdna2_decode PRIVATE prosper_core)
   add_test(NAME rdna2_decode_walk COMMAND test_rdna2_decode)
@@ -2048,6 +2059,15 @@ if(TARGET prosper_core)
                  tests/gpu/recompiler/test_buf_op_census_disposition.cpp)
   target_link_libraries(test_buf_op_census_disposition PRIVATE prosper_core)
   add_test(NAME buf_op_census_disposition COMMAND test_buf_op_census_disposition)
+
+  # #3479: a recompiled guest module must declare SignedZeroInfNanPreserve, or a driver is free to
+  # compile it under no-Inf/no-NaN assumptions and silently answer a guest sign() idiom with 0 --
+  # and must NOT declare it on a device that cannot execute it, which is invalid rather than merely
+  # unoptimised (#3561). Both directions are asserted. Structural on purpose -- an execution arm
+  # cannot go red where CI runs. See the test.
+  add_executable(test_float_controls tests/gpu/recompiler/test_float_controls.cpp)
+  target_link_libraries(test_float_controls PRIVATE prosper_core)
+  add_test(NAME float_controls COMMAND test_float_controls)
 
   # CPU-only streaming shader properties: exact legacy semantics without per-query vectors.
   add_executable(test_shader_property_scans tests/gpu/recompiler/test_shader_property_scans.cpp)
@@ -3096,7 +3116,7 @@ if(TARGET prosper_core)
       target_link_libraries(test_rdna2_to_spirv PRIVATE prosper_core Vulkan::Vulkan)
       add_test(NAME rdna2_to_spirv_exec COMMAND test_rdna2_to_spirv)
       add_executable(test_descriptor_array_emit tests/gpu/test_descriptor_array_emit.cpp)
-      target_link_libraries(test_descriptor_array_emit PRIVATE PRIVATE prosper_core Vulkan::Vulkan)
+      target_link_libraries(test_descriptor_array_emit PRIVATE prosper_core Vulkan::Vulkan)
       add_test(NAME descriptor_array_emit COMMAND test_descriptor_array_emit)
 
 
