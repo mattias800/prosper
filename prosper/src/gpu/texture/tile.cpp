@@ -957,16 +957,36 @@ void sw64kb_level_copy(uint8_t* dst, const uint8_t* src, size_t tiled_bytes,
     uint32_t bw = 0, bh = 0;
     sw64kb_dims(el, bw, bh);
     const PatBit* pat = sw64kb_pattern(tile_mode, el);
+    // As in the full-surface walker, parity(x & mask) XOR parity(y & mask)
+    // separates exactly. Packed mip tails fit within a 64 KiB block (at most
+    // 256 columns); a bounded stack table avoids allocation/cache ownership here.
+    // Wider callers retain the scalar path, as does the same-binary control.
+    static const bool scalar = std::getenv("PROSPER_NO_SEPARABLE_MIP_TAIL") != nullptr;
+    std::array<uint16_t, 256> x_offsets;
+    const bool separable = !scalar && ew <= x_offsets.size();
+    if (separable) {
+        for (uint32_t x = 0; x < ew; ++x) {
+            uint32_t v = 0;
+            for (uint32_t i = el; i < 16; ++i)
+                v |= uint32_t(__builtin_popcount((tail_x + x) & pat[i].x) & 1) << i;
+            x_offsets[x] = static_cast<uint16_t>(v);
+        }
+    }
     for (uint32_t y = 0; y < eh; ++y) {
         const uint32_t gy = tail_y + y;
+        uint32_t y_offset = 0;
+        if (separable)
+            for (uint32_t i = el; i < 16; ++i)
+                y_offset |= uint32_t(__builtin_popcount(gy & pat[i].y) & 1) << i;
         for (uint32_t x = 0; x < ew; ++x) {
             const uint32_t gx = tail_x + x;
-            uint32_t within = 0;
-            for (uint32_t i = el; i < 16; ++i) {
-                const uint32_t bit = (__builtin_popcount(gx & pat[i].x) ^
-                                      __builtin_popcount(gy & pat[i].y)) & 1u;
-                within |= bit << i;
-            }
+            uint32_t within = separable ? x_offsets[x] ^ y_offset : 0;
+            if (!separable)
+                for (uint32_t i = el; i < 16; ++i) {
+                    const uint32_t bit = (__builtin_popcount(gx & pat[i].x) ^
+                                          __builtin_popcount(gy & pat[i].y)) & 1u;
+                    within |= bit << i;
+                }
             const size_t block = static_cast<size_t>(gy / bh) + gx / bw;
             const size_t tiled = block * 65536u + within;
             const size_t linear = (static_cast<size_t>(y) * ew + x) * bpe;

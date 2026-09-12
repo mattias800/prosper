@@ -11740,6 +11740,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                              "fmt=%u comps=%u tile=%u bytes=%zu cache-hit=%u write-only=%u "
                              "poison=%u gpu-retile=%u dim=%u layers=%u texel-depth=%u "
                              "renderer-result-retained=%u "
+                             "in-tail=%u tail-x=%u tail-y=%u tail-bytes=%llu "
                              "map_ms=%.3f prepare_ms=%.3f watch_ms=%.3f "
                              "pack_ms=%.3f layout_ms=%.3f notify_ms=%.3f cache_ms=%.3f "
                              "total_ms=%.3f\n",
@@ -11750,6 +11751,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                              bi.storage_write_only ? 1u : 0u, 0u, bi.retile_buffer ? 1u : 0u,
                              r->img_dim, bi.array_layers, bi.texel_depth,
                              renderer_result_retained ? 1u : 0u,
+                             r->in_mip_tail ? 1u : 0u, r->mip_tail_x, r->mip_tail_y,
+                             (unsigned long long)r->mip_tail_bytes,
                              image_milliseconds(map_start, map_done),
                              image_milliseconds(map_done, prepare_done),
                              image_milliseconds(prepare_done, watch_done),
