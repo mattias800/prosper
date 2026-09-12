@@ -575,7 +575,38 @@ inline bool vcc_exit_is_wave_uniform(const std::vector<Rdna2Inst>& ins, uint32_t
 
     std::function<bool(const Operand&, uint32_t)> uniform_operand_at;
     uniform_operand_at = [&](const Operand& operand, uint32_t use_pc) -> bool {
-        if (operand.kind == OperandKind::SGPR || operand.kind == OperandKind::Special ||
+        if (operand.kind == OperandKind::SGPR) {
+            // "Lives in a scalar register" is NOT the same as "is wave-uniform" (#3607).
+            // `v_readfirstlane_b32` writes an SGPR while producing THIS lane's value under prosper's
+            // per-lane model -- its lowering is annotated SPECULATIVE(confidence: med) in
+            // rdna2_emit_alu.cpp for exactly that reason -- so accepting the register unconditionally
+            // lets a lane-varying value satisfy a wave-uniformity proof.
+            //
+            // Refuse when any earlier instruction read this SGPR out of a lane that way. Two notes on
+            // the shape, both load-bearing:
+            //
+            //  - The match is on `dst.value`, NOT on `dst.kind`. The decoder builds every VOP1 dst as
+            //    `vgpr(w >> 17)` (rdna2_decode.cpp:269), so this instruction's dst reports kind VGPR
+            //    while its VALUE is the SGPR number -- which is what `rdna2_vgpr_write_count` returning
+            //    0 here and the emitter's `rs.sreg[in.dst.value]` both rely on.
+            //  - It does NOT stop at a later redefinition, so an SGPR that readfirstlane wrote and a
+            //    subsequent `s_mov_b32` made uniform again keeps being refused. That is deliberate:
+            //    the only way to stop at a redefinition is a "this instruction writes SGPR n"
+            //    predicate, which does not exist here and would have to enumerate every SGPR-writing
+            //    format by hand. A format missed by such a predicate would miss a *readfirstlane*
+            //    write and return true -- the unsafe direction. Over-refusal costs an optimisation and
+            //    cannot produce a wrong answer, because every caller treats false as "not proven
+            //    uniform" and falls back to the general path.
+            //
+            // Deliberately narrow otherwise: anything else keeps the previous answer. The wider
+            // question -- whether ANY scalar reached through arbitrary ALU is uniform -- is #3606.
+            for (const auto& prior : ins)
+                if (prior.pc < use_pc && prior.fmt == Rdna2Format::VOP1 && prior.opcode == 0x02u &&
+                    prior.dst.value == operand.value)
+                    return false;
+            return true;
+        }
+        if (operand.kind == OperandKind::Special ||
             operand.kind == OperandKind::InlineInt || operand.kind == OperandKind::InlineFloat ||
             operand.kind == OperandKind::Literal)
             return true; // scalar-register sources (including VCC halves) broadcast one wave value
