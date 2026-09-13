@@ -929,7 +929,44 @@ namespace {
 // `_Mtx_unlock` of a Sony-locked mutex left `owner` stale, refusing the next legitimate
 // `scePthreadMutexLock` forever. Sharing the body removes the divergence rather than duplicating
 // the three calls that fix it.
+
+    // #3623 -- CORRECT %fs FOR THE DURATION OF AN OWNERSHIP-SENSITIVE CALL.
+    //
+    // glibc does not resolve a mutex's owner from a syscall-derived thread id; it compares against the
+    // tid cached in the TCB that %fs points at. prosper's import stubs restore %fs from a stash held
+    // in the GUEST TCB, and that stash records the host %fs of whichever host thread first activated
+    // that TCB -- so an HLE reached after a guest TCB migrated between host threads runs on ANOTHER
+    // thread's host TCB, and glibc judges the caller to be a different thread. Measured on PPSA05684
+    // (#3615): identical tid, identical mutex, `owner` equal to the caller, and unlock still EPERM,
+    // with the two calls differing only in %fs.
+    //
+    // This also repairs prosper's OWN ownership map in the same stroke, because `pthread_self()` on
+    // glibc IS the TCB address -- so the map (guest_mutex_acquired and friends) was misreading the
+    // owner exactly as glibc was.
+    //
+    // Deliberately a SCOPE at the sync call sites, not a fix to the stub: repairing the stub is
+    // #3623, it sits on the hottest path in the emulator, and it needs its own design and cross-title
+    // validation. A no-op when guest TLS is off, when the thread never activated it, or when %fs is
+    // already this thread's own -- which is every call on every title that does not move a TCB.
+    struct HostTcbScope {
+        uint64_t prev = 0;
+#if defined(__linux__) && !defined(__APPLE__)
+        static uint64_t rd() { uint64_t v; __asm__ volatile("rdfsbase %0" : "=r"(v)); return v; }
+        static void     wr(uint64_t v) { __asm__ volatile("wrfsbase %0" : : "r"(v)); }
+        HostTcbScope() {
+            const uint64_t want = guest_tls_host_fs_for_current_thread();
+            if (!want) return;                       // guest TLS off, or thread never activated it
+            const uint64_t cur = rd();
+            if (cur && cur != want) { prev = cur; wr(want); }
+        }
+        ~HostTcbScope() { if (prev) wr(prev); }      // leave %fs exactly as the stub left it
+#endif
+        HostTcbScope(const HostTcbScope&) = delete;
+        HostTcbScope& operator=(const HostTcbScope&) = delete;
+    };
+
 uint64_t guest_mutex_lock_slot(uint64_t slot_addr) {
+    HostTcbScope host_tcb;                      // #3623
     auto* m = ensure_mutex(slot_addr); if (!m) return 0x16;
     if (guest_mutex_self_deadlock(m)) return mtx_report("lock", slot_addr, m, EDEADLK);
     mtx_waitlog_report_block(m, slot_addr);
@@ -952,6 +989,7 @@ uint64_t guest_mutex_lock_slot(uint64_t slot_addr) {
     return mtx_report("lock", slot_addr, m, result);
 }
 uint64_t guest_mutex_unlock_slot(uint64_t slot_addr) {
+    HostTcbScope host_tcb;                      // #3623
     auto* m = ensure_mutex(slot_addr); if (!m) return 0x16;
     // PROSPER_MUTEX_FAIR: glibc's futex handoff is not FIFO — an unlocker that re-locks in a tight
     // pump (Wwise's 187 Hz render loop vs its BankManager) can starve a woken waiter indefinitely,
@@ -1016,6 +1054,7 @@ uint64_t guest_mutex_unlock_slot(uint64_t slot_addr) {
 }
 HLE(k_mutex_lock)    { return guest_mutex_lock_slot(a0); }
 HLE(k_mutex_trylock) {
+    HostTcbScope host_tcb;                      // #3623
     auto* m = ensure_mutex(a0); if (!m) return 0x16;
     const int result = pthread_mutex_trylock(m);
     if (result == 0) { guest_mutex_acquired(m); mtx_waitlog_record(m); }

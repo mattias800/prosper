@@ -14,9 +14,12 @@
 #if defined(__linux__) || defined(__APPLE__)
 #include "hle/dispatch/dispatch.hpp"
 #include "loader/tls_layout.hpp"
+#include "host/platform/posix_shim.hpp"
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <unordered_map>
+#include <mutex>
 #include <vector>
 #include <sys/mman.h>
 
@@ -108,9 +111,34 @@ uint64_t guest_tls_activate_thread() {
     return tp;   // NB: hardware fs base stays 0; accesses are trapped+emulated (try_emulate_fs_access)
 }
 #else
+
+// #3623: the HOSTFS stash above is per-GUEST-TCB while the value it holds is per-HOST-THREAD, so a
+// guest TCB that migrates between host threads makes the import stub restore ANOTHER thread's host
+// TCB. This registry is the FS-independent answer to "what is THIS host thread's own host %fs?" --
+// recorded here, where `rd_fsbase()` is read before any guest TCB exists for the thread, and keyed by
+// `prosper_gettid()` (a raw syscall) because every TLS-derived id is exactly what goes wrong.
+//
+// Scoped deliberately: this does NOT repair the stub. It gives callers that must be right about
+// thread identity -- the guest-sync layer, whose ownership checks glibc resolves through the TCB --
+// a way to correct %fs for the duration of a call. The stub itself is #3623's own fix.
+namespace {
+    std::mutex g_host_fs_mx;
+    std::unordered_map<uint64_t, uint64_t> g_host_fs_by_tid;
+}
+void guest_tls_record_host_fs(uint64_t host_fs) {
+    if (!host_fs) return;
+    std::lock_guard<std::mutex> lk(g_host_fs_mx);
+    g_host_fs_by_tid[(uint64_t)prosper_gettid()] = host_fs;
+}
+uint64_t guest_tls_host_fs_for_current_thread() {
+    std::lock_guard<std::mutex> lk(g_host_fs_mx);
+    auto it = g_host_fs_by_tid.find((uint64_t)prosper_gettid());
+    return it == g_host_fs_by_tid.end() ? 0 : it->second;
+}
 uint64_t guest_tls_activate_thread() {
     if (!guest_tls_enabled()) return 0;
     uint64_t host_fs = rd_fsbase();
+    guest_tls_record_host_fs(host_fs);   // #3623: before any guest TCB exists for this thread
     size_t total = (size_t)g_total_below + TCB_SIZE;
     uint8_t* block = (uint8_t*)mmap(nullptr, total, PROT_READ | PROT_WRITE,
                                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);

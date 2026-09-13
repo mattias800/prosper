@@ -1490,6 +1490,10 @@ if(TARGET prosper_core)
   add_test(NAME sync_ring COMMAND test_sync_ring)
   set_tests_properties(sync_ring PROPERTIES ENVIRONMENT "PROSPER_SYNC_RING=64")
 
+  add_executable(test_mutex_host_tcb_identity tests/hle/sync/test_mutex_host_tcb_identity.cpp)
+  target_link_libraries(test_mutex_host_tcb_identity PRIVATE prosper_core)
+  add_test(NAME mutex_host_tcb_identity COMMAND test_mutex_host_tcb_identity)
+
   add_executable(test_cond_slot_identity tests/hle/sync/test_cond_slot_identity.cpp)
   target_link_libraries(test_cond_slot_identity PRIVATE prosper_core)
   add_test(NAME cond_slot_identity COMMAND test_cond_slot_identity)
