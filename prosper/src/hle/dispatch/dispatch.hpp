@@ -388,6 +388,11 @@ uint64_t guest_tls_activate_thread();   // per guest thread at entry; returns gu
 // to relocate a faulting guest `%fs:`-relative access to guest_TP + offset (Rosetta can't set fs base).
 uint64_t guest_tls_tp();
 void guest_fs_enter_host_for_signal();  // crash-signal-handler entry: swap guest %fs -> host %fs (no-op if not guest TCB)
+// #3623: this host thread's OWN host %fs, recorded at guest-TLS activation and keyed by the syscall
+// tid. 0 when unknown (thread never activated guest TLS, or guest TLS disabled). Use it to correct %fs
+// around host calls whose result depends on thread identity; see HostTcbScope in hle_kernel.cpp.
+uint64_t guest_tls_host_fs_for_current_thread();
+void     guest_tls_record_host_fs(uint64_t host_fs);   // #3623: record THIS thread's own host %fs
 uint64_t guest_fs_to_host_scoped();     // diagnostic handler (returns to guest): swap to host %fs, return prev fs
 void guest_fs_restore_scoped(uint64_t prev_fs);  // restore the fs returned by guest_fs_to_host_scoped
 // This thread's guest TP (0 if guest-fs not active on it). On Windows the fault handler queries this
