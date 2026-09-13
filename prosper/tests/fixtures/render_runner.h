@@ -3197,6 +3197,11 @@ inline uint64_t resident_render_buffer_configured_owner_limit(uint32_t device_al
         getenv("PROSPER_BACKEND_BUFFER_RESIDENCY_OWNERS"), 4096, 4096, "owners");
     return resident_render_buffer_owner_limit(device_allocation_limit, requested);
 }
+// One-shot test seam after the real upload, before cache indexing. No runtime environment switch.
+inline bool& resident_render_buffer_fail_index_once_for_test() {
+    static thread_local bool fail = false;
+    return fail;
+}
 struct ResidentRenderBufferCache {
     ResidentRenderBufferCache() = default;
     ResidentRenderBufferCache(const ResidentRenderBufferCache&) = delete;
@@ -3391,6 +3396,10 @@ struct ResidentRenderBufferCache {
         std::memcpy(owner->storage.mapped, owner->snapshot.get(), key.bytes);
         stats.buffer_upload_bytes += key.bytes;
         try {
+            if (resident_render_buffer_fail_index_once_for_test()) {
+                resident_render_buffer_fail_index_once_for_test() = false;
+                throw std::bad_alloc{};
+            }
             lru.emplace_back(key, owner, source_addr);
             try { index.emplace(key, std::prev(lru.end())); }
             catch (...) { lru.pop_back(); throw; }
@@ -8374,7 +8383,9 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                 }
                                 const uint64_t copied = resource_reuse_stats.buffer_upload_bytes - copied_before;
                                 if (copied) {
-                                    ++resource_reuse_stats.buffer_range_uploads;
+                                    // Failed cache indexing can follow a real upload, then arena
+                                    // fallback copies the complete union again. Account both copies.
+                                    resource_reuse_stats.buffer_range_uploads += copied / group.bytes;
                                     resource_reuse_stats.buffer_range_upload_bytes += copied;
                                 }
                             }

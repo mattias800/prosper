@@ -3728,7 +3728,7 @@ if(TARGET prosper_core AND TARGET Vulkan::Vulkan)
       ${range_environment} $<TARGET_FILE:test_render_buffer_residency>
       --range-sharing ${range_expected})
   endforeach()
-  foreach(range_retention IN ITEMS on off owners_off disabled combined budget)
+  foreach(range_retention IN ITEMS on off owners_off disabled combined budget failure)
     set(range_retention_environment PROSPER_BACKEND_BUFFER_RESIDENCY_MB=0
       PROSPER_BACKEND_BUFFER_RANGE_RESIDENCY_MB=256
       PROSPER_BACKEND_BUFFER_RESIDENCY_OWNERS=4096
@@ -3750,6 +3750,8 @@ if(TARGET prosper_core AND TARGET Vulkan::Vulkan)
     elseif(range_retention STREQUAL "budget")
       list(APPEND range_retention_environment PROSPER_BACKEND_BUFFER_RANGE_RESIDENCY_MB=1)
       set(range_retention_expected budget)
+    elseif(range_retention STREQUAL "failure")
+      set(range_retention_expected failure)
     endif()
     add_test(NAME render_buffer_range_residency_${range_retention} COMMAND ${CMAKE_COMMAND} -E env
       ${range_retention_environment} $<TARGET_FILE:test_render_buffer_residency>

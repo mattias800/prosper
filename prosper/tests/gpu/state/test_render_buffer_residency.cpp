@@ -482,7 +482,8 @@ void resident_owner_limits() {
           "missing old cursor safely resumes at the remaining singleton");
 }
 
-void range_residency(const Fixture& f, bool enabled, bool large = false) {
+void range_residency(const Fixture& f, bool enabled, bool large = false,
+                     bool fail_index = false) {
     const size_t range_words = large ? 256 * 1024 : Words;
     std::vector<uint32_t> source(range_words + 256, 0);
     quad(source, 0, false); quad(source, 128, true);
@@ -499,6 +500,29 @@ void range_residency(const Fixture& f, bool enabled, bool large = false) {
     };
     const uint64_t RangeBytes = range_words * 4;
     const uint64_t UnionBytes = RangeBytes + 1024;
+    if (fail_index) {
+        resident_render_buffer_fail_index_once_for_test() = true;
+        CHECK(solid(render_draws_rgba(draws(),W,H,nullptr,Clear),true),
+              "cache index failure after upload falls back to a correct arena slice");
+        const auto failed = backend_resource_reuse_stats();
+        const auto empty = resident_render_buffer_cache_snapshot();
+        CHECK(!resident_render_buffer_fail_index_once_for_test() &&
+              failed.buffer_upload_bytes == 2 * UnionBytes && failed.buffer_range_uploads == 2 &&
+              failed.buffer_range_upload_bytes == 2 * UnionBytes &&
+              failed.buffer_resident_declined_bytes == UnionBytes &&
+              failed.buffer_resident_admitted_bytes == 0,
+              "failed retained upload and successful arena fallback count two complete copies");
+        CHECK(empty.indexed_entries == 0 && empty.live_owners == 0 && empty.charged_bytes == 0,
+              "failed cache indexing releases all retained ownership and budget charges");
+        CHECK(solid(render_draws_rgba(draws(),W,H,nullptr,Clear),true) &&
+              backend_resource_reuse_stats().buffer_resident_admitted_bytes == UnionBytes,
+              "retry after failed indexing admits current complete contents");
+        CHECK(solid(render_draws_rgba(draws(),W,H,nullptr,Clear),true) &&
+              backend_resource_reuse_stats().buffer_upload_bytes == 0 &&
+              backend_resource_reuse_stats().buffer_resident_hits == 1,
+              "successful retry is reusable without another copy");
+        return;
+    }
     CHECK(solid(render_draws_rgba(draws(), W, H, nullptr, Clear), true),
           "cold retained union preserves shifted descriptor data");
     auto stats = backend_resource_reuse_stats();
@@ -673,7 +697,7 @@ int main(int argc, char** argv) {
     if (argc == 3 && std::string(argv[1]) == "--range-residency") {
         const std::string mode = argv[2];
         range_residency(f, mode == "on" || mode == "combined",
-                        mode == "combined" || mode == "budget");
+                        mode == "combined" || mode == "budget", mode == "failure");
         return failures ? 1 : 0;
     }
     if (argc == 3 && std::string(argv[1]) == "--range-sharing") {

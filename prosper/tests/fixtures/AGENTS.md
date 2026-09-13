@@ -170,3 +170,7 @@ Retained union comparison, snapshot copying and Vulkan-storage copying are timed
 cost, not the ordinary arena-copy timer; include that cost and enclosing setup in any comparison.
 Existing resident hit/reuse/watch counters count the union once, not each descriptor slice. Watches
 remain optional exact-validation accelerators and do not extend guest mapping lifetime.
+
+The one-shot cache-indexing failure fixture fires after the real retained storage upload. It must
+leave no indexed or charged owner, fall back to a correct arena upload, and permit a clean retry.
+Range-copy accounting includes both complete uploads when that failure precedes arena fallback.
