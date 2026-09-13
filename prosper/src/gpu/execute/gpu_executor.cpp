@@ -746,7 +746,19 @@ static uint64_t hash_shader_code(const std::vector<uint32_t>& code) {
 }
 
 struct ShaderCompileKeyHash {
-    static size_t compute(const ShaderCompileKey& key) {
+    template <bool WordHash>
+    static uint64_t mix(uint64_t hash, uint64_t value) {
+        if constexpr (!WordHash) return hash_mix(hash, value);
+        // In-process bucket selection only. Every semantic field and the full equality check
+        // remain authoritative; shader-code hashes and persisted identities are unchanged.
+        return hash ^ (value + 0x9e3779b97f4a7c15ull + (hash << 6) + (hash >> 2));
+    }
+
+    template <bool WordHash>
+    static size_t compute_impl(const ShaderCompileKey& key) {
+        constexpr auto hash_mix = [](uint64_t state, uint64_t value) {
+            return mix<WordHash>(state, value);
+        };
         uint64_t hash = 1469598103934665603ull;
         hash = hash_mix(hash, static_cast<uint32_t>(key.stage));
         hash = hash_mix(hash, key.trip_bound_program_address);
@@ -868,7 +880,21 @@ struct ShaderCompileKeyHash {
             hash = hash_mix(hash, resource.border_color_type);
             hash = hash_mix(hash, resource.normalize_unnormalized_coordinates);
         }
+        if constexpr (WordHash) {
+            // Avalanche once after the field walk, including upper bits in bucket selection.
+            hash ^= hash >> 33;
+            hash *= 0xff51afd7ed558ccdull;
+            hash ^= hash >> 33;
+            hash *= 0xc4ceb9fe1a85ec53ull;
+            hash ^= hash >> 33;
+        }
         return static_cast<size_t>(hash);
+    }
+
+    static size_t compute(const ShaderCompileKey& key) {
+        // A cache must use one hash policy throughout its lifetime, even if diagnostics change.
+        static const bool word_hash = std::getenv("PROSPER_NO_SHADER_KEY_WORD_HASH") == nullptr;
+        return word_hash ? compute_impl<true>(key) : compute_impl<false>(key);
     }
 
     size_t operator()(const ShaderCompileKey& key) const { return key.cached_hash; }
@@ -1470,6 +1496,54 @@ PcrelDispatchSelection select_pcrel_dispatch(const uint32_t* code, size_t dwords
     return selection;
 }
 
+// Reuse only allocation storage: all resource semantics are reconstructed on every lookup.
+// Moving the slot out gives each active call its own vector, including nested construction.
+// Cached keys never return storage here; their ownership remains with the cache.
+class ShaderKeyResourceScratch {
+public:
+    explicit ShaderKeyResourceScratch(ShaderCompileKey& key) : key_(key) {}
+    ShaderKeyResourceScratch(const ShaderKeyResourceScratch&) = delete;
+    ShaderKeyResourceScratch& operator=(const ShaderKeyResourceScratch&) = delete;
+    ~ShaderKeyResourceScratch() { recycle(key_.resources); }
+
+    static std::vector<ShaderResourceCompileKey> acquire() {
+        return enabled() ? std::move(slot()) : std::vector<ShaderResourceCompileKey>{};
+    }
+
+    void prepare_for_cache() {
+        // A smaller miss must not transfer an oversized scratch allocation into the cache,
+        // whose existing byte ledger charges resource elements, not spare scratch capacity.
+        // Do this potentially throwing allocation before any eviction/accounting mutation.
+        if (key_.resources.capacity() > key_.resources.size()) {
+            std::vector<ShaderResourceCompileKey> compact(key_.resources.begin(),
+                                                        key_.resources.end());
+            recycle(key_.resources);
+            key_.resources = std::move(compact);
+        }
+    }
+
+private:
+    static bool enabled() {
+        static const bool value = std::getenv("PROSPER_NO_SHADER_KEY_SCRATCH") == nullptr;
+        return value;
+    }
+    static std::vector<ShaderResourceCompileKey>& slot() {
+        thread_local std::vector<ShaderResourceCompileKey> storage;
+        return storage;
+    }
+    static void recycle(std::vector<ShaderResourceCompileKey>& resources) {
+        // Limit idle storage per thread, independently of cache and active-call allocations.
+        constexpr size_t max_capacity = 65536 / sizeof(ShaderResourceCompileKey);
+        if (!enabled() || resources.capacity() > max_capacity) return;
+        auto& storage = slot();
+        if (resources.capacity() > storage.capacity()) {
+            resources.clear();
+            storage = std::move(resources);
+        }
+    }
+    ShaderCompileKey& key_;
+};
+
 ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_t* code, size_t dwords,
                                          const ShaderResourceTable* resources,
                                          const PixelInputMapping* pixel_inputs,
@@ -1481,6 +1555,7 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
                                          bool fragment_wave32 = false,
                                          bool capture_position = false) {
     ShaderCompileKey key;
+    key.resources = ShaderKeyResourceScratch::acquire();
     key.stage = stage;
     key.vertex_lds_dwords = stage == ShaderProgramStage::Vertex
         ? std::min(vertex_lds_dwords, 16384u) : 0u;
@@ -1870,6 +1945,7 @@ SharedShaderWords cache_compiled_graphics_shader(ShaderProgramStage stage, Shade
                                                   uint64_t* cache_identity,
                                                   uint64_t program_address,
                                                   uint64_t chain_address) {
+    ShaderKeyResourceScratch scratch(key);
     if (cache_identity) *cache_identity = 0;
     if (getenv("PROSPER_NO_SHADER_CACHE")) {
         auto& cache = shader_cache();
@@ -1915,6 +1991,7 @@ SharedShaderWords cache_compiled_graphics_shader(ShaderProgramStage stage, Shade
     ++cache.stats.misses;
     cache.stats.compile_ms += std::chrono::duration<double, std::milli>(end - start).count();
 
+    scratch.prepare_for_cache();
     constexpr size_t max_entries = 4096;
     const uint64_t bytes = shader_cache_entry_bytes(key, *spirv);
     const uint64_t limit = shader_cache_limit_bytes();
@@ -2181,6 +2258,7 @@ std::vector<uint32_t> recompile_compute_shader_cached(
     ShaderCompileKey key = make_shader_compile_key(
         ShaderProgramStage::Compute, code, dwords, resources, nullptr, nullptr,
         nullptr, 0, 0, &config);
+    ShaderKeyResourceScratch scratch(key);
     // Only meaningful while the trip-bound diagnostic is armed; disarmed it leaves the key exactly as
     // it was. The program address is carried on the diagnostic context because nothing else in the
     // key identifies WHICH program these code bytes belong to, and that is precisely the distinction
@@ -2237,6 +2315,7 @@ std::vector<uint32_t> recompile_compute_shader_cached(
     ++cache.stats.misses;
     cache.stats.compile_ms += std::chrono::duration<double, std::milli>(end - start).count();
 
+    scratch.prepare_for_cache();
     constexpr size_t max_entries = 4096;
     const uint64_t bytes = shader_cache_entry_bytes(key, *spirv);
     const uint64_t limit = shader_cache_limit_bytes();
