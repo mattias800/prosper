@@ -58,8 +58,10 @@ int main(int argc, char** argv) {
         return 2;
     }
     const std::string mode = argv[1];
-    const bool large = mode == "requirements-large" || mode == "partial";
-    if (mode != "requirements" && mode != "cycle" && mode != "pinned" && !large) return 2;
+    const bool aged = mode == "aged" || mode == "aged-control";
+    const bool aged_partial = mode == "aged-partial";
+    const bool large = mode == "requirements-large" || mode == "partial" || aged_partial;
+    if (mode != "requirements" && mode != "cycle" && mode != "pinned" && !large && !aged) return 2;
     if (large != (argc == 4)) return 2;
     char* end = nullptr;
     const auto cap_mib = std::strtoull(argv[2], &end, 10);
@@ -75,6 +77,7 @@ int main(int argc, char** argv) {
     env("PROSPER_NO_PERSISTENT_COMPUTE_BUFFERS", nullptr);
     env("PROSPER_NO_PERSISTENT_COMPUTE_BUFFER_RESULTS", nullptr);
     env("PROSPER_COMPUTE_BUFFER_CACHE_MB", argv[2]);
+    env("PROSPER_NO_IDLE_COMPUTE_BUFFER_RECLAIM", mode == "aged-control" ? "1" : nullptr);
     env("PROSPER_COMPUTE_BUFFER_RESULT_MIN_MB", "1");
     env("PROSPER_COMPUTE_BUFFER_TIMING", "1");
     env("PROSPER_COMPUTE_TIMING_CAPTURE_ONLY", nullptr);
@@ -162,7 +165,22 @@ int main(int argc, char** argv) {
         run(index, {owner, owner, owner}, value);
     };
     single(1, mode == "requirements-large" ? 2 : 0);
-    if (mode == "partial") {
+    if (aged) {
+        single(2, 1);
+        single(3, 2);
+        for (unsigned index = 4; index <= 271; ++index)
+            single(index, (index & 1) ? 2 : 0);
+        single(272, 0);
+        single(273, 2);
+        // The retired owner must still rematerialize exact guest bytes when reused later.
+        buffers[1].data[0] ^= 0xffffffffu;
+        single(274, 1);
+    } else if (aged_partial) {
+        // One idle primary+baseline cannot make room for this larger baseline. Aging it must not
+        // turn a failed optional admission into partial destruction of reusable cache contents.
+        for (unsigned index = 2; index <= 270; ++index) single(index, 2);
+        single(271, 0);
+    } else if (mode == "partial") {
         single(2, 1);
         // A is pinned by the first two bindings. B remains idle and reclaimable, but its
         // entire primary+baseline is insufficient to admit C. Refusal must leave B intact.

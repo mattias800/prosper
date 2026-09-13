@@ -78,7 +78,10 @@ production backend without a frontend or a game dump.
 
 The persistent buffer budget charges primary allocations and optional exact-result baselines.
 Primary admission first proves that enough unpinned storage can be reclaimed, then drops unpinned
-baselines before evicting primary entries. Baseline admission uses spare capacity only. One owner
+baselines before evicting primary entries. Baseline admission uses spare capacity or owners that
+have been unused for at least 256 cache insertions/acquisitions; it proves enough eligible capacity
+exists before any reclamation. Recent and pinned owners remain protected. The diagnostic control
+`PROSPER_NO_IDLE_COMPUTE_BUFFER_RECLAIM=1` restores spare-capacity-only baseline admission. One owner
 pin protects both handles through completion; a failed submission without completion proof keeps
 that pin. Reclaiming a baseline preserves the primary's guest-content validation and write watches.
 Unchanged writeback preserves watch-promotion progress already earned by exact source validation;

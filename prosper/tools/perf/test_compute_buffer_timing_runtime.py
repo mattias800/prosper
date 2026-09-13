@@ -13,6 +13,8 @@ import subprocess
 import sys
 import tempfile
 
+from compute_buffer_cache_report import summarize
+
 
 PREFIX = "[compute-buffer-timing] "
 FIXTURE = "[buffer-timing-fixture] "
@@ -218,6 +220,64 @@ def check_census(lines, rows):
             last[address] = number(row, "last-use")
     require(all(a < b for a, b in zip(clocks, clocks[1:])), "cache clock did not advance")
     require(len(owners) == 10, "census owner population mismatch")
+    report = summarize(lines)
+    require(report["snapshots"] == 8 and len(report["owners"]) == 2,
+            "offline reader lost the known cache population")
+    observed = sorted(report["owners"], key=lambda r: r["pinned_snapshots"])
+    require(observed[0]["pinned_snapshots"] == 1 and
+            observed[0]["observed_last_use_values"] == 1 and
+            observed[1]["pinned_snapshots"] == 8 and
+            observed[1]["observed_last_use_values"] == 8,
+            "offline reader confuses an idle owner with an actively reused one")
+    # A same-address key in a different materialization domain is still a separate owner.
+    summary = summaries[0].copy()
+    summary.update(entries="2", emitted="2", bytes=str(number(summary, "bytes") * 2))
+    first = owners[0].copy()
+    alternate = dict(first, semantic=str(number(first, "semantic") + 1),
+                     **{"last-use": str(number(first, "last-use") + 1)})
+    summary["clock"] = alternate["last-use"]
+    def record(prefix, row):
+        return prefix + " " + " ".join(f"{k}={v}" for k, v in row.items())
+    pair = [record("[compute-buffer-cache]", summary),
+            record("[compute-buffer-cache-owner]", first),
+            record("[compute-buffer-cache-owner]", alternate)]
+    require(len(summarize(pair)["owners"]) == 2,
+            "offline reader collapsed a same-address materialization key")
+    # Independently corrupt real records: the reader must reject missing/truncated evidence,
+    # duplicate keys, broken accounting and resets rather than report a convincing partial census.
+    first_owner = next(line for line in lines if line.startswith("[compute-buffer-cache-owner] "))
+    first_summary = next(line for line in lines if line.startswith("[compute-buffer-cache] "))
+    mutants = [[], [line for line in lines if line != first_owner],
+               [*lines, first_owner],
+               [line.replace("complete=1", "complete=0") for line in lines],
+               [line.replace("last-use=1 ", "last-use=999999 ") for line in lines],
+               [line.replace("clock=1 ", "clock=999999 ") for line in lines],
+               [*lines, first_summary],
+               [first_owner],
+               [line.replace("ok=1 ", "ok=2 ") for line in lines],
+               [line.replace("content-valid=1", "content-valid=2") for line in lines]]
+    # Preserve row counts so these reach the accounting/key checks, not the count check.
+    bad_charge = first.copy()
+    bad_charge["primary-allocation-bytes"] = str(number(first, "primary-allocation-bytes") + 1)
+    mutants.append([pair[0], record("[compute-buffer-cache-owner]", bad_charge), pair[2]])
+    mutants.append([pair[0], pair[1], pair[1]])
+    over_budget = dict(summary, limit=str(number(summary, "bytes") - 1))
+    mutants.append([record("[compute-buffer-cache]", over_budget), *pair[1:]])
+    backwards = list(lines)
+    for index, line in enumerate(backwards):
+        if line.startswith("[compute-buffer-cache-owner] "):
+            row = fields(line, "[compute-buffer-cache-owner] ")
+            if number(row, "dispatch") == 8 and number(row, "pins") == 1:
+                row["last-use"] = "1"
+                backwards[index] = record("[compute-buffer-cache-owner]", row)
+    mutants.append(backwards)
+    for mutant in mutants:
+        try:
+            summarize(mutant)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("offline reader accepted corrupted/missing census")
 
 
 def run_fixture(binary, mode, directory):

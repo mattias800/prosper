@@ -46,7 +46,8 @@ def run(binary, mode, cap_mib, large_bytes=None):
     environment = {key: value for key, value in os.environ.items()
                    if not key.startswith("PROSPER_COMPUTE") and
                    key not in {"PROSPER_NO_PERSISTENT_COMPUTE_BUFFERS",
-                               "PROSPER_NO_PERSISTENT_COMPUTE_BUFFER_RESULTS"}}
+                               "PROSPER_NO_PERSISTENT_COMPUTE_BUFFER_RESULTS",
+                               "PROSPER_NO_IDLE_COMPUTE_BUFFER_RECLAIM"}}
     command = [str(binary), mode, str(cap_mib)]
     if large_bytes is not None:
         command.append(str(large_bytes))
@@ -70,7 +71,8 @@ def run(binary, mode, cap_mib, large_bytes=None):
         identity = (dispatch, number(row, "owner"))
         require(identity not in identities, f"duplicate unique owner {identity}")
         identities.add(identity)
-        large_owner = mode == "requirements-large" or (mode == "partial" and identity == (3, 2))
+        large_owner = (mode == "requirements-large" or (mode == "partial" and identity == (3, 2)) or
+                       (mode == "aged-partial" and 2 <= dispatch <= 270))
         owner_bytes = large_bytes if large_owner else BYTES
         expect(row, submit=4400 + dispatch, order=10 * dispatch, ok=1,
                code=number(witness, "code"), hash=number(witness, "hash"),
@@ -206,6 +208,50 @@ def partial_reclaim(binary, primary, baseline, cap_mib):
     return witness
 
 
+def aged_pressure(binary, primary, baseline, cap_mib):
+    for mode in ("aged", "aged-control"):
+        rows, _ = run(binary, mode, cap_mib)
+        require(len(rows) == 274, "aged pressure lost a dispatch")
+        grouped = {number(r, "dispatch"): r for r in rows}
+        require(set(grouped) == set(range(1, 275)), "aged dispatch coverage mismatch")
+        # The recent working set must remain cached throughout both arms.
+        for index in range(4, 274):
+            expect(grouped[index], cache="hit", persistent=1,
+                   primary_allocation_bytes=primary, guest_copied_bytes=0)
+        # The grace period cannot be bypassed merely because an entry is currently unpinned.
+        for index in range(4, 258):
+            expect(grouped[index], result_allocation_bytes=0, baseline="budget")
+        if mode == "aged":
+            expect(grouped[258], baseline="created", result_allocation_bytes=baseline)
+            expect(grouped[259], baseline="created", result_allocation_bytes=baseline)
+        for index in (272, 273):
+            if mode == "aged":
+                expect(grouped[index], result_allocation_bytes=baseline,
+                       gpu_compare="unchanged", writeback="gpu-unchanged", result_compared_bytes=0)
+            else:
+                expect(grouped[index], result_allocation_bytes=0,
+                       gpu_compare="ineligible", writeback="unchanged", result_compared_bytes=BYTES)
+        expect(grouped[274], cache="miss" if mode == "aged" else "hit",
+               writeback="changed", guest_copied_bytes=BYTES)
+
+    # Make the prospective baseline larger than the entire idle primary+baseline, while both
+    # primary owners still fit. Probe the actual driver's requirements instead of assuming them.
+    large_bytes = ((primary + baseline + 2 * MIB + 15) // 16) * 16
+    probe_rows, _ = run(binary, "requirements-large", 64, large_bytes)
+    large_primary = number(probe_rows[0], "primary-allocation-bytes")
+    large_baseline = number(probe_rows[0], "result-allocation-bytes")
+    partial_cap = (primary + baseline + large_primary + MIB - 1) // MIB
+    require(partial_cap * MIB < large_primary + large_baseline,
+            "driver shape cannot exercise all-or-nothing idle refusal")
+    rows, _ = run(binary, "aged-partial", partial_cap, large_bytes)
+    require(len(rows) == 271, "aged partial pressure lost a dispatch")
+    for row in rows[1:-1]:
+        expect(row, baseline="budget", result_allocation_bytes=0,
+               primary_allocation_bytes=large_primary)
+    expect(rows[-1], cache="hit", result_allocation_bytes=baseline,
+           gpu_compare="unchanged", writeback="gpu-unchanged", guest_copied_bytes=0)
+
+
 def main():
     if len(sys.argv) != 2:
         raise SystemExit("usage: test_compute_buffer_residency_runtime.py FIXTURE_EXECUTABLE")
@@ -224,6 +270,10 @@ def main():
         require(other["hash"] == witness["hash"], "partial-reclaim arm changed compiled shader")
     except AssertionError as error:
         errors.append(f"partial: {error}")
+    try:
+        aged_pressure(binary, primary, baseline, cap_mib)
+    except AssertionError as error:
+        errors.append(f"aged: {error}")
     require(not errors, "\n".join(errors))
     print("compute buffer residency: primary reuse, bounded charges and failed admission passed")
 
