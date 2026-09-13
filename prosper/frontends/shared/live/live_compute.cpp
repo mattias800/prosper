@@ -9589,20 +9589,23 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             return a < b + bn && b < a + an;
         };
         for (auto& buffer : buffers) {
-            if (!buffer.writable || buffer.alias_of != SIZE_MAX || !buffer.resource ||
-                !buffer.resource->gpu_addr) continue;
+            if (!buffer.writable || buffer.alias_of != SIZE_MAX || !buffer.resource) continue;
             const uint64_t guest = buffer.resource->gpu_addr;
             const uint64_t effective = reinterpret_cast<uintptr_t>(
                 resource_bytes_for(buffer.resource, buffer.guest_bytes));
             for (const auto& other : buffers) {
                 if (&other == &buffer) break;
                 if (!other.writable || other.alias_of != SIZE_MAX ||
-                    !other.resource || !other.resource->gpu_addr) continue;
+                    !other.resource) continue;
                 const uint64_t other_effective = reinterpret_cast<uintptr_t>(
                     resource_bytes_for(other.resource, other.guest_bytes));
-                if (ranges_conflict(guest, buffer.guest_bytes, other.resource->gpu_addr, other.guest_bytes) ||
-                    ranges_conflict(effective, buffer.guest_bytes, other.resource->gpu_addr, other.guest_bytes) ||
-                    ranges_conflict(guest, buffer.guest_bytes, other_effective, other.guest_bytes) ||
+                // An absent architectural address is not an unknown range: private/GDS backing
+                // has only its effective host range. That range can still overlap hosted output.
+                if ((guest && other.resource->gpu_addr &&
+                     ranges_conflict(guest, buffer.guest_bytes, other.resource->gpu_addr, other.guest_bytes)) ||
+                    (other.resource->gpu_addr &&
+                     ranges_conflict(effective, buffer.guest_bytes, other.resource->gpu_addr, other.guest_bytes)) ||
+                    (guest && ranges_conflict(guest, buffer.guest_bytes, other_effective, other.guest_bytes)) ||
                     ranges_conflict(effective, buffer.guest_bytes, other_effective, other.guest_bytes)) {
                     buffer.output_conflict = true;
                     break;
@@ -9650,9 +9653,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 }
             }
             for (const auto& buffer : buffers) {
-                if (!buffer.writable || buffer.alias_of != SIZE_MAX || !buffer.resource ||
-                    !buffer.resource->gpu_addr) continue;
-                if (conflicts(buffer.resource->gpu_addr, buffer.guest_bytes) ||
+                if (!buffer.writable || buffer.alias_of != SIZE_MAX || !buffer.resource) continue;
+                if ((buffer.resource->gpu_addr && conflicts(buffer.resource->gpu_addr, buffer.guest_bytes)) ||
                     conflicts(reinterpret_cast<uintptr_t>(resource_bytes_for(
                         buffer.resource, buffer.guest_bytes)), buffer.guest_bytes)) {
                     if (image.storage_writeback) image.prior_output_conflict = true;

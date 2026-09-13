@@ -21,6 +21,18 @@ from the tracker issues, and still gated, because it is a projection of state ra
 
 ## 2026-09-13
 
+### A correct comparison still needs correct write order
+
+An overlapping private output could make a later “unchanged” result skip a necessary write;
+new executed buffer/image guards expose the error and the shared planner now preserves the last
+writer. [Evidence and the unsuccessful comparison-policy trials](prosper/docs/COMPUTE_HOSTED_WRITEBACK_2026_09.md).
+Sonic before/after retains its known black world/HUD; GTA retains the lit Performance Story bank.
+No FPS or audio improvement is established.
+
+![Sonic before](assets/screenshots/3619-before-sonic.webp)
+![Sonic after](assets/screenshots/3619-after-sonic.webp)
+![GTA after](assets/screenshots/3619-after-gta.webp)
+
 ### Less CPU work for shared mip tails
 
 Sonic's affected compute dispatch falls from 4.06 to 2.21 ms while its known black world remains;

@@ -155,7 +155,10 @@ source/consumer authority before recording without releasing handles or pins. Fa
 skips cleanup. Earlier-only image conflicts keep their source proof; ordinary pre-submit export
 revocation and successful writeback govern their next publication. The final writer may retain its
 complete result. Buffer GPU comparisons require no earlier overlapping buffer; their CPU fallback
-checks current destination bytes.
+checks current destination bytes. Include effective hosted destinations even for zero-address
+private outputs; an absent architectural address contributes no architectural range. Private
+outputs still emit no guest notification. The same effective overlap vetoes a later storage image's
+unchanged-result skip; input-only image authority is a separate dependency contract.
 
 Input-only retention precedes guest writeback, so later pixel notifications invalidate its original
 snapshots naturally. Metadata-only writes require an explicit retention veto because pixel authority
