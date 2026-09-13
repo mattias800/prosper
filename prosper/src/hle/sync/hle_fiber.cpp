@@ -337,6 +337,43 @@ uint64_t fiber_initialize(GuestFiber* guest, const char* name, FiberEntry entry,
     return 0;
 }
 
+// sceFiberRename(fiber, name) -- a real implementation rather than the dispatcher's return-0
+// default, which answers SCE_OK while leaving the name untouched. prosper already carries the only
+// state involved: `GuestFiber::name` is the 32-byte field this file fills at initialize and prints
+// in its own `[fiber] init` diagnostic, so no struct layout has to be guessed.
+//
+// WHY IT IS HERE, stated precisely because an earlier version of this comment got it wrong.
+// PPSA05684 IMPORTS this NID -- but importing is not calling. `tools/re/nid_gate_scan.py` finds
+// ZERO call sites for `JzyT91ucGDc` in both `eboot.bin` and `tllr-boot.bin`, and that zero is
+// controlled rather than silent: the same tool on the same binaries reports call sites for the
+// sibling fiber NIDs (`hVYD7Ou2pCQ`, `a0LLrZWac0M`, `asjUJJ+aa8s`). The title links this function
+// and never calls it.
+//
+// So this is NOT justified as "the guest exercises it". It is justified as: the implementation is
+// complete, needs no reverse engineering, costs one bounded copy, and removes a silent-wrong answer
+// from a linked entry point. That reasoning would not support guessing at a struct layout, and it
+// deliberately does not.
+//
+// CONFIDENCE: HIGH on the copy itself (the field is prosper's own) and on the NID mapping
+// (`JzyT91ucGDc` is sceFiberRename, unique across the 3.20 firmware set).
+// CONFIDENCE: LOW on three semantics that are inferred rather than established, none of which any
+// corpus title can currently exercise:
+//   * whether a RUNNING fiber may be renamed. `fiber_finalize` refuses `kStateRun`; this does not,
+//     on the reading that a name is metadata rather than context. Unverified.
+//   * whether an over-long name truncates-and-succeeds (chosen here) or returns a range error.
+//   * the kErrInvalid/kErrNull split for a null fiber versus a null name, which mirrors
+//     `fiber_finalize` and `fiber_initialize` respectively rather than any measured contract.
+// A title that calls this and inspects the result is what would settle all three.
+uint64_t fiber_rename(GuestFiber* guest, const char* name) {
+    FiberRecord* fiber = find_fiber(guest);
+    if (!guest || !fiber) return kErrInvalid;
+    if (!name) return kErrNull;
+    std::snprintf(guest->name, sizeof(guest->name), "%s", name);
+    if (fiber_log())
+        std::fprintf(stderr, "[fiber] rename %p -> \"%s\"\n", (void*)guest, guest->name);
+    return 0;
+}
+
 uint64_t fiber_finalize(GuestFiber* guest) {
     FiberRecord* fiber = find_fiber(guest);
     if (!guest || !fiber) return kErrInvalid;
@@ -476,6 +513,7 @@ extern "C" void fiber_switch_entry();
 void register_fiber_hle() {
     Hle::register_fn("hVYD7Ou2pCQ", (HleFn)fiber_initialize, "_sceFiberInitializeImpl");
     Hle::register_fn("JeNX5F-NzQU", (HleFn)fiber_finalize, "sceFiberFinalize");
+    Hle::register_fn("JzyT91ucGDc", (HleFn)fiber_rename, "sceFiberRename");
 #ifndef _WIN32
     Hle::register_fn("a0LLrZWac0M", (HleFn)fiber_run_entry, "sceFiberRun");
     Hle::register_fn("PFT2S-tJ7Uk", (HleFn)fiber_switch_entry, "sceFiberSwitch");
