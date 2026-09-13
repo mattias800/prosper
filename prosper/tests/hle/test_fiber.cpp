@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #ifdef _WIN32
 #include <windows.h>
 #endif
@@ -95,6 +96,39 @@ int main() {
     CHECK(root_bounds_valid[0] && root_bounds_valid[1],
           "Windows TEB restores the native root stack after each fiber yield");
 #endif
+    // ---- sceFiberRename: a real implementation, not the dispatcher's return-0 default ----------
+    // The failure this pins is the quiet one. An unregistered NID answers SCE_OK and changes
+    // nothing, so a guest that renames a fiber is told it worked and then reads back the old name --
+    // the same "answered OK for work not done" divergence as #2951. PPSA05684 imports this NID.
+    {
+        // The name field's offset is asserted rather than hardcoded blind: `init` above stored
+        // "test" there, so if the layout ever moves, THIS control fails instead of the arms below
+        // silently reading the wrong bytes and passing.
+        const char* fiber_name = reinterpret_cast<const char*>(fiber + 40);
+        CHECK(std::strcmp(fiber_name, "test") == 0,
+              "CONTROL: GuestFiber::name really is at this offset -- initialize stored \"test\" in it");
+
+        using RenameFn = uint64_t (*)(void*, const char*);
+        auto rename_fn = reinterpret_cast<RenameFn>(Hle::lookup("JzyT91ucGDc"));
+        CHECK(rename_fn != nullptr,
+              "sceFiberRename is REGISTERED -- an unregistered NID falls to the return-0 default, "
+              "which reports success and renames nothing");
+        if (rename_fn) {
+            CHECK(rename_fn(fiber, "renamed") == 0 && std::strcmp(fiber_name, "renamed") == 0,
+                  "sceFiberRename actually renames the fiber, rather than answering SCE_OK and "
+                  "leaving the old name in place");
+            char long_name[64];
+            std::memset(long_name, 'x', sizeof long_name - 1);
+            long_name[sizeof long_name - 1] = '\0';
+            CHECK(rename_fn(fiber, long_name) == 0 && std::strlen(fiber_name) == 31 &&
+                      fiber_name[31] == '\0',
+                  "...and an over-long name is truncated INTO the 32-byte field and NUL-terminated, "
+                  "rather than running past it");
+            CHECK(rename_fn(nullptr, "x") != 0, "a null fiber is refused");
+            CHECK(rename_fn(fiber, nullptr) != 0, "a null name is refused");
+        }
+    }
+
     std::printf(fails ? "== FAIL: %d ==\n" : "== PASS ==\n", fails);
     return fails ? 1 : 0;
 }
