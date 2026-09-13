@@ -263,5 +263,70 @@ int main(int argc, char** argv) {
     check(live_fallback.size() == 16 * 16 * 4 && center(live_fallback) == expected_face(5) &&
               gpu_detile_recordings().load() == frontend_before + 1,
           "live frontend refusal allocates CPU fallback and preserves last-face pixels");
+    // Ordinary 2D admission uses the same immutable upload, without cube stacking.
+    // Captured backing deliberately excludes persistent CPU-cache eligibility.
+    const uint64_t two_dispatch = PROSPER_ENV_ON("PROSPER_NO_GPU_DETILE_2D") ? 0 : 1;
+    for (uint32_t components : {2u, 4u}) {
+        constexpr uint32_t w = 129, h = 129;
+        const size_t bytes = tiled_surface_bytes(w, h, 27, 0, components * 2);
+        std::vector<uint8_t> tiled(bytes, 0xa5), linear(size_t(w) * h * components * 2);
+        const uint64_t address = base + components * 0x1000000ull;
+        auto fill = [&](uint16_t red, uint16_t green) {
+            const uint16_t color[]{red, green, 0x3400, 0x3c00};
+            for (size_t pixel = 0; pixel < size_t(w) * h; ++pixel)
+                std::memcpy(linear.data() + pixel * components * 2, color, components * 2);
+            tile_surface(tiled.data(), linear.data(), w, h, 27, 0, components * 2);
+        };
+        fill(0x3800, 0x3c00);
+        ShaderResourceTable two_table;
+        auto two_source = texture;
+        two_source.img_dim = 1; two_source.depth = 1;
+        two_source.width = w; two_source.height = h; two_source.num_components = components;
+        two_source.gpu_addr = address; two_source.tile_mode = 27;
+        two_source.host_data = tiled.data(); two_source.host_data_size = bytes; two_source.size = bytes;
+        two_table.resources.push_back(two_source);
+        const uint32_t ps[]{0x7e0002ffu, 0x3e800000u, 0x7e0202ffu, 0x3e800000u,
+            0xf0800f08u, 0x00820000u, 0xf800080fu, 0x03020100u, 0xbf810000u};
+        DrawItem two_item = item;
+        two_item.fs = recompile_fragment(ps, std::size(ps), &two_table);
+        two_item.prt = std::make_shared<ShaderResourceTable>(two_table);
+        two_item.color0_base = 0x34080000u + components * 0x1000;
+        const auto begin = gpu_detile_recordings().load();
+        const std::array<uint8_t, 4> wanted{128, 255, uint8_t(components == 2 ? 0 : 64), 255};
+        const auto two_gpu = render_submit_items({two_item}, 16, 16);
+        check(center(two_gpu) == wanted && gpu_detile_recordings().load() == begin + two_dispatch,
+              "live 2D FP16 upload samples the selected component count and missing-channel defaults");
+        auto& backing = two_item.prt->resources[0];
+        backing.host_data_size = bytes - 1;
+        const auto two_cpu = render_submit_items({two_item}, 16, 16);
+        check(two_cpu == two_gpu && gpu_detile_recordings().load() == begin + two_dispatch,
+              "short 2D tile padding declines GPU preparation and allocates exact CPU fallback");
+        backing.host_data_size = bytes;
+        backing.layer_stride_bytes = bytes;
+        check(render_submit_items({two_item}, 16, 16) == two_gpu &&
+                  gpu_detile_recordings().load() == begin + two_dispatch,
+              "unsupported 2D layer layout keeps the established CPU conversion");
+        backing.layer_stride_bytes = 0;
+        fill(0x3c00, 0x3800);
+        auto mutated = wanted; mutated[0] = 255; mutated[1] = 128;
+        check(center(render_submit_items({two_item}, 16, 16)) == mutated &&
+                  gpu_detile_recordings().load() == begin + 2 * two_dispatch,
+              "2D source mutation at the same address uploads a fresh snapshot");
+
+        auto two_upload = prepare_render_gpu_detile(w, h, 1, address, 0, 0,
+            [&](uint8_t* dst, uint64_t addr, size_t size) -> size_t {
+                if (addr != address || size != bytes) return 0;
+                std::memcpy(dst, tiled.data(), size); return size;
+            }, components);
+        FrameResource plane;
+        plane.img_dim = 1; plane.tw = w; plane.th = h; plane.gpu_detile = two_upload;
+        check(two_upload && backend_texture_plane_span_valid(plane), "ordinary 2D GPU plane is admitted");
+        plane.img_dim = 3;
+        check(!backend_texture_plane_span_valid(plane), "one GPU plane cannot masquerade as a cube");
+        plane.img_dim = 1; plane.declared_mip_levels = 2;
+        check(!backend_texture_plane_span_valid(plane), "GPU plane cannot claim an unconverted mip chain");
+        plane.declared_mip_levels = 1; plane.persistent_render_target_id = 123;
+        check(!backend_texture_plane_span_valid(plane), "GPU plane refuses competing renderer ownership");
+    }
     return failures ? 1 : 0;
 }

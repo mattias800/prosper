@@ -508,10 +508,12 @@ inline bool backend_texture_plane_span_valid(const FrameResource& resource) {
         return !resource.tex_rgba && !resource.is_storage_image &&
                !resource.has_uniform_color && !resource.persistent_texture_id &&
                !resource.persistent_render_target_id && !resource.persistent_depth_target_id &&
-               !resource.borrowed_compute_image && resource.img_dim == 3 &&
+               !resource.borrowed_compute_image &&
+               ((resource.img_dim == 3 && upload.faces == 6) ||
+                (resource.img_dim == 1 && upload.faces == 1)) &&
                resource.sample_count == 1 && resource.td == 1 &&
-               resource.declared_mip_levels == 1 && upload.faces == 6 &&
-               resource.tw == upload.width && uint64_t(resource.th) == uint64_t(upload.height) * 6 &&
+               resource.declared_mip_levels == 1 &&
+               resource.tw == upload.width && uint64_t(resource.th) == uint64_t(upload.height) * upload.faces &&
                resource.texture_format == VK_FORMAT_R8G8B8A8_UNORM &&
                upload.program && upload.program->pipeline && upload.input && upload.output &&
                upload.descriptors;
@@ -1226,7 +1228,7 @@ struct RenderVkCtx {
     bool queue_supports_compute = false;
     // Same intentional process lifetime as the device; creation is protected by
     // BackendPersistentResourceGuard, including frontend preflight calls.
-    mutable GpuDetilePipeline* detile_pipeline = nullptr;
+    mutable std::array<GpuDetilePipeline*, 2> detile_pipelines{};
     VkShaderStageFlags required_subgroup_size_stages = 0;
     VkShaderStageFlags subgroup_stages = 0;
     VkSubgroupFeatureFlags subgroup_operations = 0;
@@ -1829,16 +1831,19 @@ inline const RenderVkCtx& render_vk_ctx() {
 inline std::shared_ptr<GpuDetileUpload> prepare_render_gpu_detile(
     uint32_t width, uint32_t height, uint32_t faces, uint64_t guest_base,
     uint64_t face_stride, uint64_t mip_offset,
-    const std::function<size_t(uint8_t*, uint64_t, size_t)>& copy_source) {
+    const std::function<size_t(uint8_t*, uint64_t, size_t)>& copy_source,
+    uint32_t components = 4) {
+    if (components != 2 && components != 4) return {};
     BackendPersistentResourceGuard guard;
     const auto& ctx = render_vk_ctx();
     if (!ctx.ok || !ctx.queue_supports_compute) return {};
-    if (!ctx.detile_pipeline) {
+    auto& pipeline = ctx.detile_pipelines[components == 2 ? 0 : 1];
+    if (!pipeline) {
         auto program = std::make_unique<GpuDetilePipeline>();
-        if (!program->initialize(ctx.dev)) return {};
-        ctx.detile_pipeline = program.release(); // lifetime matches the retained device
+        if (!program->initialize(ctx.dev, components)) return {};
+        pipeline = program.release(); // lifetime matches the retained device
     }
-    return prepare_gpu_detile_upload(*ctx.detile_pipeline, ctx.phys, ctx.detile_limits,
+    return prepare_gpu_detile_upload(*pipeline, ctx.phys, ctx.detile_limits,
                                      width, height, faces, guest_base, face_stride,
                                      mip_offset, copy_source);
 }

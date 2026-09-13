@@ -275,7 +275,8 @@ std::vector<uint32_t> build_compute_compare_uvec4() {
     return e.assemble();
 }
 
-std::vector<uint32_t> build_compute_detile_rgba16f() {
+std::vector<uint32_t> build_compute_detile_float16(uint32_t components) {
+  if (components != 2 && components != 4) return {};
   Emitter e;
   // Integer-only conversion: the source's half bits, including NaNs/subnormals,
   // are preserved by raw buffer loads rather than native float16 operations.
@@ -369,11 +370,11 @@ std::vector<uint32_t> build_compute_detile_rgba16f() {
       Op_ShiftRightLogical, binary(Op_IAdd, width, constant(127)), constant(7));
   const auto block =
       binary(Op_IAdd,
-             binary(Op_IMul, binary(Op_ShiftRightLogical, y, constant(6)),
+             binary(Op_IMul, binary(Op_ShiftRightLogical, y, constant(components == 2 ? 7 : 6)),
                     blocks_per_row),
              binary(Op_ShiftRightLogical, x, constant(7)));
   uint32_t byte_offset = constant(0);
-  for (uint32_t bit = 3; bit < 16; ++bit) {
+  for (uint32_t bit = components == 2 ? 2 : 3; bit < 16; ++bit) {
     const auto equation = load(source, constant(bit + 4));
     const auto xm = binary(Op_BitwiseAnd, equation, constant(65535));
     const auto ym = binary(Op_ShiftRightLogical, equation, constant(16));
@@ -392,10 +393,11 @@ std::vector<uint32_t> build_compute_detile_rgba16f() {
       binary(Op_IAdd, binary(Op_IMul, face, face_words),
              binary(Op_IAdd, binary(Op_ShiftLeftLogical, block, constant(14)),
                     binary(Op_ShiftRightLogical, byte_offset, constant(2)))));
-  const uint32_t raw[2] = {load(source, address),
-                           load(source, binary(Op_IAdd, address, constant(1)))};
-  uint32_t packed = constant(0);
-  for (uint32_t channel = 0; channel < 4; ++channel) {
+  const uint32_t raw[2] = {load(source, address), components == 4 ?
+      load(source, binary(Op_IAdd, address, constant(1))) : 0};
+  // Missing channels follow the CPU sampled conversion: B=0, A=1.
+  uint32_t packed = constant(components == 2 ? 0xff000000u : 0);
+  for (uint32_t channel = 0; channel < components; ++channel) {
     const auto half = binary(Op_BitwiseAnd,
                              binary(Op_ShiftRightLogical, raw[channel / 2],
                                     constant((channel % 2) * 16)),

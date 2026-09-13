@@ -1,4 +1,4 @@
-// Submission-owned tile27 RGBA16F -> RGBA8 upload. Used by the live render backend.
+// Submission-owned tile27 RG16F/RGBA16F -> RGBA8 upload. Used by the live render backend.
 #pragma once
 #include "gpu/recompiler/spirv_builder.hpp"
 #include "gpu/texture/tile.hpp"
@@ -29,12 +29,15 @@ struct GpuDetilePipeline {
     VkDescriptorSetLayout descriptors = VK_NULL_HANDLE;
     VkPipelineLayout layout = VK_NULL_HANDLE;
     VkPipeline pipeline = VK_NULL_HANDLE;
+    uint32_t components = 4;
     ~GpuDetilePipeline() {
         if (pipeline) vkDestroyPipeline(device, pipeline, nullptr);
         if (layout) vkDestroyPipelineLayout(device, layout, nullptr);
         if (descriptors) vkDestroyDescriptorSetLayout(device, descriptors, nullptr);
     }
-    bool initialize(VkDevice dev) {
+    bool initialize(VkDevice dev, uint32_t source_components = 4) {
+        if (source_components != 2 && source_components != 4) return false;
+        components = source_components;
         device = dev;
         const VkDescriptorSetLayoutBinding bindings[]{
             {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
@@ -48,7 +51,7 @@ struct GpuDetilePipeline {
         lci.setLayoutCount = 1;
         lci.pSetLayouts = &descriptors;
         if (vkCreatePipelineLayout(dev, &lci, nullptr, &layout) != VK_SUCCESS) return false;
-        const auto words = prosper::gpu::build_compute_detile_rgba16f();
+        const auto words = prosper::gpu::build_compute_detile_float16(components);
         VkShaderModuleCreateInfo sci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         sci.codeSize = words.size() * sizeof(uint32_t);
         sci.pCode = words.data();
@@ -150,9 +153,14 @@ inline std::shared_ptr<GpuDetileUpload> prepare_gpu_detile_upload(
         uint64_t(height) * faces > limits.maxImageDimension2D ||
         limits.maxComputeWorkGroupSize[0] < 128 || limits.maxComputeWorkGroupInvocations < 128)
         return {};
+    std::array<uint32_t, 16> equation{};
+    uint32_t block_width = 0, block_height = 0;
+    if ((program.components != 2 && program.components != 4) ||
+        !prosper::gpu::tile64_word_equation(27, program.components * 2, equation,
+                                           block_width, block_height)) return {};
     const uint64_t count = uint64_t(width) * height * faces;
-    const uint64_t face_bytes = ((uint64_t(width) + 127) / 128) *
-                               ((uint64_t(height) + 63) / 64) * 65536;
+    const uint64_t face_bytes = ((uint64_t(width) + block_width - 1) / block_width) *
+                               ((uint64_t(height) + block_height - 1) / block_height) * 65536;
     if (count > UINT32_MAX - 127u || (count + 127) / 128 > limits.maxComputeWorkGroupCount[0] ||
         face_bytes > UINT32_MAX || face_bytes > (UINT32_MAX - 80u) / faces ||
         count * 4 > limits.maxStorageBufferRange ||
@@ -220,7 +228,6 @@ inline std::shared_ptr<GpuDetileUpload> prepare_gpu_detile_upload(
     const uint32_t header[]{width, height, static_cast<uint32_t>(face_bytes / 4),
                             static_cast<uint32_t>(count)};
     std::memcpy(mapped, header, sizeof(header));
-    const auto equation = prosper::gpu::tile27_rgba16f_equation();
     std::memcpy(static_cast<uint8_t*>(mapped) + 16, equation.data(), sizeof(equation));
     bool copied = true;
     for (uint32_t face = 0; face < faces && copied; ++face)
