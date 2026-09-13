@@ -1,0 +1,753 @@
+{
+  "schema_version": 1,
+  "measurement_source": "68b8a96f5d8292f457541bda8f07aed6ea305dfe",
+  "measurement_base": "267406bcda792ea0b2966a10d6c131a26a926f54",
+  "device": "AMD Radeon 8060S Graphics (RADV STRIX_HALO), Vulkan 1.4.354",
+  "method": "One same-binary pair per title; controlled only PROSPER_NO_BACKEND_BUFFER_RANGE_SHARE; host presentations can repeat; newly rendered FPS unavailable. CPU/GPU sampled attribution is separate from F8. Audio counts are conservative active-output callback brackets, not device XRUNs.",
+  "runs": [
+    {
+      "seconds": 5.025010573,
+      "cpu_cores": 2.034661390552262,
+      "rates": {
+        "guest_fps": 11.343259714968164,
+        "rendered_fps": null,
+        "host_fps": 11.343259714968164
+      },
+      "counts": {
+        "pre": 20,
+        "post": 21,
+        "renderer": 58,
+        "compute": 1585
+      },
+      "graphics_total_ms": 3565.720149,
+      "compute_total_ms": 16.400991,
+      "components": {
+        "renderer-resource": 2293.1732469999997,
+        "gpu-wait": 213.298691,
+        "gpu-device": 97.675344362,
+        "gpu-wait-overhead": 115.62334663799999,
+        "readback": 0.196634,
+        "compute": 16.400991
+      },
+      "compute_cpu_phases": {
+        "setup_ms": 0.0,
+        "pipeline_ms": 0.0,
+        "dispatch_wait_ms": 0.0,
+        "writeback_ms": 0.0,
+        "cleanup_ms": 0.0
+      },
+      "compute_gpu_brackets": {
+        "gpu_pre_ms": 0.0,
+        "gpu_shader_ms": 0.0,
+        "gpu_storage_copy_ms": 0.0,
+        "gpu_compare_ms": 0.0,
+        "gpu_restore_ms": 0.0
+      },
+      "run": "range-control-r2-blue-prince",
+      "arm": "disabled",
+      "title": "blue-prince",
+      "head": "68b8a96f5d8292f457541bda8f07aed6ea305dfe",
+      "binary_sha256": "6d607cc7cafc97d8da0d3348af4503f5146b676181bca19565367aeddaa4bae2",
+      "resource": {
+        "build_resources": 682.179748,
+        "setup_resources": 1610.993499,
+        "frontend_buffer": 308.675646,
+        "res_buffer": 1394.595542,
+        "res_buffer_copy": 1112.933686,
+        "buffer_residency": {
+          "buffer_upload_bytes": 52875667520,
+          "buffer_resident_hits": 0,
+          "buffer_resident_compared_bytes": 0,
+          "buffer_resident_reused_bytes": 0,
+          "buffer_resident_admitted_bytes": 0,
+          "buffer_resident_refreshed_bytes": 0,
+          "buffer_resident_declined_bytes": 0,
+          "buffer_resident_ineligible_bytes": 52792826816,
+          "res_buffer_resident_ms": 0
+        },
+        "buffer_range_sharing": {
+          "buffer_range_uploads": 0,
+          "buffer_range_bindings": 0,
+          "buffer_range_upload_bytes": 0,
+          "buffer_range_bound_bytes": 0,
+          "res_buffer_range_plan_ms": 0.080045,
+          "avoided_copy_bytes": 0
+        }
+      },
+      "audio_callback_brackets": {
+        "1/1": {
+          "method": "strict monotonic clock anchors on both sides of each boundary callback",
+          "window_fully_bracketed": true,
+          "before_shortfall_calls": 0,
+          "after_shortfall_calls": 0,
+          "shortfall_delta": 0,
+          "callback_delta": 328,
+          "bracket_seconds_min": 6.006005818,
+          "bracket_seconds_max": 8.009978515
+        }
+      },
+      "cpu_profile": {
+        "total_weight": 103319188590,
+        "copy_leaf_weight": 16135005251,
+        "copy_leaf_percent": 15.61665889095229
+      },
+      "fixed_inputs_sha256": {
+        "runner": "5335555e3df54efa4d5487288608ce12f55090de87a3b87dc1e0080dd34877d7",
+        "helper": "17211beffedb3772cf7f6803b7aee116a85e60c1351d04aeaf0b6426d7c6adba",
+        "child": "d0c91076d1a76ad9037ebcd1ac5ff84e894348055a6d19ecce247b2500469069",
+        "report": "2835ae04746d5375defe53293d23759d907a7d6def5fc5c62b21660c09474782",
+        "route": null,
+        "binary": "6d607cc7cafc97d8da0d3348af4503f5146b676181bca19565367aeddaa4bae2"
+      },
+      "started_utc": "2026-09-13T18:49:23.133547+00:00",
+      "validation_complete": true,
+      "gpu_load_profile": {
+        "instrument": "radeontop -t 10 -d - -l 20",
+        "scope": "separate 250-second attribution window; not F8",
+        "samples": [
+          10.0,
+          10.0,
+          0.0,
+          0.0,
+          0.0,
+          20.0,
+          10.0,
+          20.0,
+          10.0,
+          10.0,
+          30.0,
+          0.0,
+          0.0,
+          10.0,
+          10.0,
+          10.0,
+          0.0,
+          10.0,
+          10.0,
+          0.0
+        ],
+        "mean_percent": 8.5
+      }
+    },
+    {
+      "seconds": 5.020564129,
+      "cpu_cores": 2.288751961881373,
+      "rates": {
+        "guest_fps": 14.73937949971757,
+        "rendered_fps": null,
+        "host_fps": 14.73937949971757
+      },
+      "counts": {
+        "pre": 20,
+        "post": 21,
+        "renderer": 76,
+        "compute": 2071
+      },
+      "graphics_total_ms": 3131.11932,
+      "compute_total_ms": 21.15317,
+      "components": {
+        "renderer-resource": 1698.660593,
+        "gpu-wait": 259.270542,
+        "gpu-device": 115.755296499,
+        "gpu-wait-overhead": 143.51524550099998,
+        "readback": 0.223283,
+        "compute": 21.15317
+      },
+      "compute_cpu_phases": {
+        "setup_ms": 0.0,
+        "pipeline_ms": 0.0,
+        "dispatch_wait_ms": 0.0,
+        "writeback_ms": 0.0,
+        "cleanup_ms": 0.0
+      },
+      "compute_gpu_brackets": {
+        "gpu_pre_ms": 0.0,
+        "gpu_shader_ms": 0.0,
+        "gpu_storage_copy_ms": 0.0,
+        "gpu_compare_ms": 0.0,
+        "gpu_restore_ms": 0.0
+      },
+      "run": "range-enabled-blue-prince",
+      "arm": "enabled",
+      "title": "blue-prince",
+      "head": "68b8a96f5d8292f457541bda8f07aed6ea305dfe",
+      "binary_sha256": "6d607cc7cafc97d8da0d3348af4503f5146b676181bca19565367aeddaa4bae2",
+      "resource": {
+        "build_resources": 869.68705,
+        "setup_resources": 828.973543,
+        "frontend_buffer": 395.088806,
+        "res_buffer": 559.160334,
+        "res_buffer_copy": 259.242637,
+        "buffer_residency": {
+          "buffer_upload_bytes": 7504111552,
+          "buffer_resident_hits": 0,
+          "buffer_resident_compared_bytes": 0,
+          "buffer_resident_reused_bytes": 0,
+          "buffer_resident_admitted_bytes": 0,
+          "buffer_resident_refreshed_bytes": 0,
+          "buffer_resident_declined_bytes": 0,
+          "buffer_resident_ineligible_bytes": 69176807552,
+          "res_buffer_resident_ms": 0
+        },
+        "buffer_range_sharing": {
+          "buffer_range_uploads": 29412,
+          "buffer_range_bindings": 188860,
+          "buffer_range_upload_bytes": 7348871680,
+          "buffer_range_bound_bytes": 69130125312,
+          "res_buffer_range_plan_ms": 53.013455,
+          "avoided_copy_bytes": 61781253632
+        }
+      },
+      "audio_callback_brackets": {
+        "1/1": {
+          "method": "strict monotonic clock anchors on both sides of each boundary callback",
+          "window_fully_bracketed": true,
+          "before_shortfall_calls": 1,
+          "after_shortfall_calls": 1,
+          "shortfall_delta": 0,
+          "callback_delta": 329,
+          "bracket_seconds_min": 6.007993921,
+          "bracket_seconds_max": 8.00801269
+        }
+      },
+      "cpu_profile": {
+        "total_weight": 165854067509,
+        "copy_leaf_weight": 7752979963,
+        "copy_leaf_percent": 4.674579333171487
+      },
+      "fixed_inputs_sha256": {
+        "runner": "5335555e3df54efa4d5487288608ce12f55090de87a3b87dc1e0080dd34877d7",
+        "helper": "17211beffedb3772cf7f6803b7aee116a85e60c1351d04aeaf0b6426d7c6adba",
+        "child": "d0c91076d1a76ad9037ebcd1ac5ff84e894348055a6d19ecce247b2500469069",
+        "report": "2835ae04746d5375defe53293d23759d907a7d6def5fc5c62b21660c09474782",
+        "route": null,
+        "binary": "6d607cc7cafc97d8da0d3348af4503f5146b676181bca19565367aeddaa4bae2"
+      },
+      "started_utc": "2026-09-13T18:57:18.408560+00:00",
+      "validation_complete": true,
+      "gpu_load_profile": {
+        "instrument": "radeontop -t 10 -d - -l 20",
+        "scope": "separate 250-second attribution window; not F8",
+        "samples": [
+          0.0,
+          0.0,
+          40.0,
+          20.0,
+          10.0,
+          0.0,
+          10.0,
+          30.0,
+          0.0,
+          10.0,
+          20.0,
+          10.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          30.0,
+          0.0,
+          0.0,
+          10.0
+        ],
+        "mean_percent": 9.5
+      }
+    },
+    {
+      "seconds": 5.020885849,
+      "cpu_cores": 1.431264365715716,
+      "rates": {
+        "guest_fps": 6.174209279458965,
+        "rendered_fps": null,
+        "host_fps": 6.174209279458965
+      },
+      "counts": {
+        "pre": 19,
+        "post": 21,
+        "renderer": 775,
+        "compute": 2080
+      },
+      "graphics_total_ms": 2534.452756,
+      "compute_total_ms": 1200.89214,
+      "components": {
+        "renderer-resource": 1354.745052,
+        "gpu-wait": 508.872523,
+        "gpu-device": 322.640621179056,
+        "gpu-wait-overhead": 186.23190182094402,
+        "readback": 43.699163,
+        "compute": 1200.89214
+      },
+      "compute_cpu_phases": {
+        "setup_ms": 211.831448,
+        "pipeline_ms": 13.110142,
+        "dispatch_wait_ms": 416.806399,
+        "writeback_ms": 385.175744,
+        "cleanup_ms": 13.215192
+      },
+      "compute_gpu_brackets": {
+        "gpu_pre_ms": 25.1626493450625,
+        "gpu_shader_ms": 188.922314738818,
+        "gpu_storage_copy_ms": 98.9369013377709,
+        "gpu_compare_ms": 1.89127344294084,
+        "gpu_restore_ms": 0.31191263788032
+      },
+      "run": "range-control-gta",
+      "arm": "disabled",
+      "title": "gta",
+      "head": "68b8a96f5d8292f457541bda8f07aed6ea305dfe",
+      "binary_sha256": "6d607cc7cafc97d8da0d3348af4503f5146b676181bca19565367aeddaa4bae2",
+      "resource": {
+        "build_resources": 877.117892,
+        "setup_resources": 477.62716,
+        "frontend_buffer": 130.63159,
+        "res_buffer": 295.789858,
+        "res_buffer_copy": 153.471546,
+        "buffer_residency": {
+          "buffer_upload_bytes": 7072349464,
+          "buffer_resident_hits": 0,
+          "buffer_resident_compared_bytes": 0,
+          "buffer_resident_reused_bytes": 0,
+          "buffer_resident_admitted_bytes": 0,
+          "buffer_resident_refreshed_bytes": 0,
+          "buffer_resident_declined_bytes": 0,
+          "buffer_resident_ineligible_bytes": 6991302892,
+          "res_buffer_resident_ms": 0
+        },
+        "buffer_range_sharing": {
+          "buffer_range_uploads": 0,
+          "buffer_range_bindings": 0,
+          "buffer_range_upload_bytes": 0,
+          "buffer_range_bound_bytes": 0,
+          "res_buffer_range_plan_ms": 0.132269,
+          "avoided_copy_bytes": 0
+        }
+      },
+      "audio_callback_brackets": {
+        "17/1": {
+          "method": "strict monotonic clock anchors on both sides of each boundary callback",
+          "window_fully_bracketed": true,
+          "before_shortfall_calls": 1,
+          "after_shortfall_calls": 1,
+          "shortfall_delta": 0,
+          "callback_delta": 329,
+          "bracket_seconds_min": 6.00401488,
+          "bracket_seconds_max": 8.005999206
+        }
+      },
+      "cpu_profile": {
+        "total_weight": 79721541248,
+        "copy_leaf_weight": 6600826348,
+        "copy_leaf_percent": 8.2798529038293
+      },
+      "fixed_inputs_sha256": {
+        "runner": "5335555e3df54efa4d5487288608ce12f55090de87a3b87dc1e0080dd34877d7",
+        "helper": "17211beffedb3772cf7f6803b7aee116a85e60c1351d04aeaf0b6426d7c6adba",
+        "child": "d0c91076d1a76ad9037ebcd1ac5ff84e894348055a6d19ecce247b2500469069",
+        "report": "2835ae04746d5375defe53293d23759d907a7d6def5fc5c62b21660c09474782",
+        "route": "683994c1b5e6fb14b07e90e7d07390d52a1ffb7ebbf1cc496d2b92489c81ed7a",
+        "binary": "6d607cc7cafc97d8da0d3348af4503f5146b676181bca19565367aeddaa4bae2"
+      },
+      "started_utc": "2026-09-13T19:11:42.356526+00:00",
+      "validation_complete": true,
+      "gpu_load_profile": {
+        "instrument": "radeontop -t 10 -d - -l 20",
+        "scope": "separate 250-second attribution window; not F8",
+        "samples": [
+          0.0,
+          0.0,
+          10.0,
+          10.0,
+          10.0,
+          0.0,
+          20.0,
+          0.0,
+          30.0,
+          30.0,
+          20.0,
+          20.0,
+          10.0,
+          20.0,
+          20.0,
+          0.0,
+          0.0,
+          10.0,
+          40.0,
+          10.0
+        ],
+        "mean_percent": 13.0
+      }
+    },
+    {
+      "seconds": 5.021150646,
+      "cpu_cores": 1.4386160681624767,
+      "rates": {
+        "guest_fps": 6.173883674391553,
+        "rendered_fps": null,
+        "host_fps": 6.173883674391553
+      },
+      "counts": {
+        "pre": 20,
+        "post": 21,
+        "renderer": 816,
+        "compute": 2182
+      },
+      "graphics_total_ms": 2588.416881,
+      "compute_total_ms": 1271.111318,
+      "components": {
+        "renderer-resource": 1367.1564680000001,
+        "gpu-wait": 516.199964,
+        "gpu-device": 322.553936475178,
+        "gpu-wait-overhead": 193.64602752482205,
+        "readback": 46.878947,
+        "compute": 1271.111318
+      },
+      "compute_cpu_phases": {
+        "setup_ms": 226.495767,
+        "pipeline_ms": 14.93264,
+        "dispatch_wait_ms": 452.389022,
+        "writeback_ms": 390.984728,
+        "cleanup_ms": 13.643992
+      },
+      "compute_gpu_brackets": {
+        "gpu_pre_ms": 25.7431523080311,
+        "gpu_shader_ms": 205.7900436240661,
+        "gpu_storage_copy_ms": 110.4171940355098,
+        "gpu_compare_ms": 2.04889292192311,
+        "gpu_restore_ms": 0.3616471340391
+      },
+      "run": "range-enabled-gta",
+      "arm": "enabled",
+      "title": "gta",
+      "head": "68b8a96f5d8292f457541bda8f07aed6ea305dfe",
+      "binary_sha256": "6d607cc7cafc97d8da0d3348af4503f5146b676181bca19565367aeddaa4bae2",
+      "resource": {
+        "build_resources": 944.750399,
+        "setup_resources": 422.406069,
+        "frontend_buffer": 135.876867,
+        "res_buffer": 205.317246,
+        "res_buffer_copy": 61.427244,
+        "buffer_residency": {
+          "buffer_upload_bytes": 1780585740,
+          "buffer_resident_hits": 0,
+          "buffer_resident_compared_bytes": 0,
+          "buffer_resident_reused_bytes": 0,
+          "buffer_resident_admitted_bytes": 0,
+          "buffer_resident_refreshed_bytes": 0,
+          "buffer_resident_declined_bytes": 0,
+          "buffer_resident_ineligible_bytes": 7352043816,
+          "res_buffer_resident_ms": 0
+        },
+        "buffer_range_sharing": {
+          "buffer_range_uploads": 15119,
+          "buffer_range_bindings": 83576,
+          "buffer_range_upload_bytes": 1602265780,
+          "buffer_range_bound_bytes": 7258904280,
+          "res_buffer_range_plan_ms": 17.466682,
+          "avoided_copy_bytes": 5656638500
+        }
+      },
+      "audio_callback_brackets": {
+        "17/1": {
+          "method": "strict monotonic clock anchors on both sides of each boundary callback",
+          "window_fully_bracketed": true,
+          "before_shortfall_calls": 2,
+          "after_shortfall_calls": 2,
+          "shortfall_delta": 0,
+          "callback_delta": 328,
+          "bracket_seconds_min": 6.007999784,
+          "bracket_seconds_max": 8.008001982
+        }
+      },
+      "cpu_profile": {
+        "total_weight": 79235060074,
+        "copy_leaf_weight": 5391588977,
+        "copy_leaf_percent": 6.804549617258614
+      },
+      "fixed_inputs_sha256": {
+        "runner": "5335555e3df54efa4d5487288608ce12f55090de87a3b87dc1e0080dd34877d7",
+        "helper": "17211beffedb3772cf7f6803b7aee116a85e60c1351d04aeaf0b6426d7c6adba",
+        "child": "d0c91076d1a76ad9037ebcd1ac5ff84e894348055a6d19ecce247b2500469069",
+        "report": "2835ae04746d5375defe53293d23759d907a7d6def5fc5c62b21660c09474782",
+        "route": "683994c1b5e6fb14b07e90e7d07390d52a1ffb7ebbf1cc496d2b92489c81ed7a",
+        "binary": "6d607cc7cafc97d8da0d3348af4503f5146b676181bca19565367aeddaa4bae2"
+      },
+      "started_utc": "2026-09-13T19:05:09.678722+00:00",
+      "validation_complete": true,
+      "gpu_load_profile": {
+        "instrument": "radeontop -t 10 -d - -l 20",
+        "scope": "separate 250-second attribution window; not F8",
+        "samples": [
+          30.0,
+          30.0,
+          10.0,
+          30.0,
+          0.0,
+          30.0,
+          20.0,
+          10.0,
+          20.0,
+          40.0,
+          10.0,
+          0.0,
+          10.0,
+          10.0,
+          0.0,
+          20.0,
+          10.0,
+          20.0,
+          20.0,
+          10.0
+        ],
+        "mean_percent": 16.5
+      }
+    },
+    {
+      "seconds": 5.016716127,
+      "cpu_cores": 1.2519568261391483,
+      "rates": {
+        "guest_fps": 7.774009733200119,
+        "rendered_fps": null,
+        "host_fps": 7.774009733200119
+      },
+      "counts": {
+        "pre": 20,
+        "post": 21,
+        "renderer": 638,
+        "compute": 1355
+      },
+      "graphics_total_ms": 2014.210401,
+      "compute_total_ms": 1568.123498,
+      "components": {
+        "renderer-resource": 770.0716070000001,
+        "gpu-wait": 656.071955,
+        "gpu-device": 537.647967799363,
+        "gpu-wait-overhead": 118.42398720063704,
+        "readback": 0.183842,
+        "compute": 1568.123498
+      },
+      "compute_cpu_phases": {
+        "setup_ms": 156.866791,
+        "pipeline_ms": 5.303125,
+        "dispatch_wait_ms": 628.892408,
+        "writeback_ms": 481.694715,
+        "cleanup_ms": 28.395311
+      },
+      "compute_gpu_brackets": {
+        "gpu_pre_ms": 96.1481626999135,
+        "gpu_shader_ms": 143.3715677561816,
+        "gpu_storage_copy_ms": 137.4596149711866,
+        "gpu_compare_ms": 98.6609770786872,
+        "gpu_restore_ms": 0.11630097328685
+      },
+      "run": "range-control-sonic",
+      "arm": "disabled",
+      "title": "sonic",
+      "head": "68b8a96f5d8292f457541bda8f07aed6ea305dfe",
+      "binary_sha256": "6d607cc7cafc97d8da0d3348af4503f5146b676181bca19565367aeddaa4bae2",
+      "resource": {
+        "build_resources": 412.919531,
+        "setup_resources": 357.152076,
+        "frontend_buffer": 39.535356,
+        "res_buffer": 285.931174,
+        "res_buffer_copy": 224.106339,
+        "buffer_residency": {
+          "buffer_upload_bytes": 10962042880,
+          "buffer_resident_hits": 0,
+          "buffer_resident_compared_bytes": 0,
+          "buffer_resident_reused_bytes": 0,
+          "buffer_resident_admitted_bytes": 0,
+          "buffer_resident_refreshed_bytes": 0,
+          "buffer_resident_declined_bytes": 0,
+          "buffer_resident_ineligible_bytes": 10937009476,
+          "res_buffer_resident_ms": 0
+        },
+        "buffer_range_sharing": {
+          "buffer_range_uploads": 0,
+          "buffer_range_bindings": 0,
+          "buffer_range_upload_bytes": 0,
+          "buffer_range_bound_bytes": 0,
+          "res_buffer_range_plan_ms": 0.117007,
+          "avoided_copy_bytes": 0
+        }
+      },
+      "audio_callback_brackets": {
+        "17/1": {
+          "method": "strict monotonic clock anchors on both sides of each boundary callback",
+          "window_fully_bracketed": true,
+          "before_shortfall_calls": 3,
+          "after_shortfall_calls": 3,
+          "shortfall_delta": 0,
+          "callback_delta": 329,
+          "bracket_seconds_min": 6.008000215,
+          "bracket_seconds_max": 8.01000053
+        }
+      },
+      "cpu_profile": {
+        "total_weight": 60673184246,
+        "copy_leaf_weight": 7703116759,
+        "copy_leaf_percent": 12.696081233791258
+      },
+      "fixed_inputs_sha256": {
+        "runner": "5335555e3df54efa4d5487288608ce12f55090de87a3b87dc1e0080dd34877d7",
+        "helper": "17211beffedb3772cf7f6803b7aee116a85e60c1351d04aeaf0b6426d7c6adba",
+        "child": "d0c91076d1a76ad9037ebcd1ac5ff84e894348055a6d19ecce247b2500469069",
+        "report": "2835ae04746d5375defe53293d23759d907a7d6def5fc5c62b21660c09474782",
+        "route": "1468421f7b87b21f07287af8b9e79fd0f0963811cfacdf3a69448dcef7f7decd",
+        "binary": "6d607cc7cafc97d8da0d3348af4503f5146b676181bca19565367aeddaa4bae2"
+      },
+      "started_utc": "2026-09-13T19:18:23.645556+00:00",
+      "validation_complete": true,
+      "gpu_load_profile": {
+        "instrument": "radeontop -t 10 -d - -l 20",
+        "scope": "separate 250-second attribution window; not F8",
+        "samples": [
+          20.0,
+          20.0,
+          30.0,
+          10.0,
+          10.0,
+          0.0,
+          0.0,
+          0.0,
+          20.0,
+          0.0,
+          30.0,
+          30.0,
+          10.0,
+          30.0,
+          0.0,
+          30.0,
+          10.0,
+          0.0,
+          10.0,
+          10.0
+        ],
+        "mean_percent": 13.5
+      }
+    },
+    {
+      "seconds": 5.02942732,
+      "cpu_cores": 1.2639256113159223,
+      "rates": {
+        "guest_fps": 8.152021570519484,
+        "rendered_fps": null,
+        "host_fps": 8.152021570519484
+      },
+      "counts": {
+        "pre": 20,
+        "post": 21,
+        "renderer": 668,
+        "compute": 1416
+      },
+      "graphics_total_ms": 1919.288012,
+      "compute_total_ms": 1587.685089,
+      "components": {
+        "renderer-resource": 659.944263,
+        "gpu-wait": 650.696138,
+        "gpu-device": 530.924994062178,
+        "gpu-wait-overhead": 119.77114393782199,
+        "readback": 0.185614,
+        "compute": 1587.685089
+      },
+      "compute_cpu_phases": {
+        "setup_ms": 159.866915,
+        "pipeline_ms": 5.341533,
+        "dispatch_wait_ms": 654.202161,
+        "writeback_ms": 477.883662,
+        "cleanup_ms": 26.314553
+      },
+      "compute_gpu_brackets": {
+        "gpu_pre_ms": 97.6232453748545,
+        "gpu_shader_ms": 144.1258008080659,
+        "gpu_storage_copy_ms": 141.286325768776,
+        "gpu_compare_ms": 103.31461905514843,
+        "gpu_restore_ms": 0.13096884242038
+      },
+      "run": "range-enabled-sonic",
+      "arm": "enabled",
+      "title": "sonic",
+      "head": "68b8a96f5d8292f457541bda8f07aed6ea305dfe",
+      "binary_sha256": "6d607cc7cafc97d8da0d3348af4503f5146b676181bca19565367aeddaa4bae2",
+      "resource": {
+        "build_resources": 428.337295,
+        "setup_resources": 231.606968,
+        "frontend_buffer": 42.036489,
+        "res_buffer": 150.48938,
+        "res_buffer_copy": 92.041479,
+        "buffer_residency": {
+          "buffer_upload_bytes": 3936652412,
+          "buffer_resident_hits": 0,
+          "buffer_resident_compared_bytes": 0,
+          "buffer_resident_reused_bytes": 0,
+          "buffer_resident_admitted_bytes": 0,
+          "buffer_resident_refreshed_bytes": 0,
+          "buffer_resident_declined_bytes": 0,
+          "buffer_resident_ineligible_bytes": 11491475900,
+          "res_buffer_resident_ms": 0
+        },
+        "buffer_range_sharing": {
+          "buffer_range_uploads": 4798,
+          "buffer_range_bindings": 55392,
+          "buffer_range_upload_bytes": 782963352,
+          "buffer_range_bound_bytes": 8364028108,
+          "res_buffer_range_plan_ms": 11.036991,
+          "avoided_copy_bytes": 7581064756
+        }
+      },
+      "audio_callback_brackets": {
+        "17/1": {
+          "method": "strict monotonic clock anchors on both sides of each boundary callback",
+          "window_fully_bracketed": true,
+          "before_shortfall_calls": 1,
+          "after_shortfall_calls": 1,
+          "shortfall_delta": 0,
+          "callback_delta": 329,
+          "bracket_seconds_min": 6.008002158,
+          "bracket_seconds_max": 8.011997987
+        }
+      },
+      "cpu_profile": {
+        "total_weight": 60572859741,
+        "copy_leaf_weight": 5710199868,
+        "copy_leaf_percent": 9.426994024082592
+      },
+      "fixed_inputs_sha256": {
+        "runner": "5335555e3df54efa4d5487288608ce12f55090de87a3b87dc1e0080dd34877d7",
+        "helper": "17211beffedb3772cf7f6803b7aee116a85e60c1351d04aeaf0b6426d7c6adba",
+        "child": "d0c91076d1a76ad9037ebcd1ac5ff84e894348055a6d19ecce247b2500469069",
+        "report": "2835ae04746d5375defe53293d23759d907a7d6def5fc5c62b21660c09474782",
+        "route": "1468421f7b87b21f07287af8b9e79fd0f0963811cfacdf3a69448dcef7f7decd",
+        "binary": "6d607cc7cafc97d8da0d3348af4503f5146b676181bca19565367aeddaa4bae2"
+      },
+      "started_utc": "2026-09-13T19:25:22.579691+00:00",
+      "validation_complete": true,
+      "gpu_load_profile": {
+        "instrument": "radeontop -t 10 -d - -l 20",
+        "scope": "separate 250-second attribution window; not F8",
+        "samples": [
+          10.0,
+          10.0,
+          20.0,
+          20.0,
+          10.0,
+          30.0,
+          0.0,
+          10.0,
+          20.0,
+          20.0,
+          20.0,
+          40.0,
+          10.0,
+          10.0,
+          20.0,
+          20.0,
+          30.0,
+          30.0,
+          10.0,
+          10.0
+        ],
+        "mean_percent": 17.5
+      }
+    }
+  ]
+}
