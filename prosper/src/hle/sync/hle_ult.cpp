@@ -101,6 +101,7 @@
 //   PROSPER_ULT_BLOCK_WARN_MS=N   watchdog threshold for a blocked mutex lock (default 5000).
 #include "hle/dispatch/dispatch.hpp"
 #include "hle/kernel/sce_errno.hpp"
+#include "hle/sync/host_tcb_scope.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -802,6 +803,7 @@ PROSPER_SYSV_ABI uint64_t ult_mutex_create(uint64_t a0, uint64_t a1, uint64_t a2
 }
 
 uint64_t mutex_lock_impl(UltObject* o, const char* fn) {
+    HostTcbScope host_tcb;                      // #3623: ULT mutexes are ERRORCHECK
     const uint64_t me = self_thread();
     o->lock_calls.fetch_add(1, std::memory_order_relaxed);
 
@@ -875,6 +877,7 @@ PROSPER_SYSV_ABI uint64_t ult_mutex_lock(uint64_t a0, uint64_t, uint64_t, uint64
 
 PROSPER_SYSV_ABI uint64_t ult_mutex_unlock(uint64_t a0, uint64_t, uint64_t, uint64_t, uint64_t,
                                            uint64_t) {
+    HostTcbScope host_tcb;                      // #3623: ULT mutexes are ERRORCHECK
     uint64_t out = 0;
     if (!implement(kIdxMutexUnlock, &out)) return out;
     UltObject* o = resolve(a0, UltType::Mutex, "sceUltMutexUnlock");
@@ -1276,6 +1279,7 @@ PROSPER_SYSV_ABI uint64_t ult_cond_create(uint64_t a0, uint64_t a1, uint64_t a2,
 
 PROSPER_SYSV_ABI uint64_t ult_cond_wait(uint64_t a0, uint64_t, uint64_t, uint64_t, uint64_t,
                                         uint64_t) {
+    HostTcbScope host_tcb;                      // #3623: ULT mutexes are ERRORCHECK
     uint64_t out = 0;
     if (!implement(kIdxCondWait, &out)) return out;
     UltObject* o = resolve(a0, UltType::Cond, "sceUltConditionVariableWait");

@@ -158,8 +158,19 @@ void guest_tls_record_host_fs(uint64_t host_fs) {
 }
 uint64_t guest_tls_host_fs_for_current_thread() {
     // Fast-out BEFORE the syscall and before the lock: on a title that never activates guest TLS the
-    // map stays empty forever, and this is on the guest-mutex path. The relaxed load is sound as a
-    // gate -- a thread that has an entry necessarily wrote it itself, earlier, on this same thread.
+    // map stays empty forever, and this is on the guest-mutex path.
+    //
+    // WHY A RELAXED LOAD IS SOUND HERE, stated because the invariant it rests on is load-bearing and
+    // a future change could break it silently. A thread with an entry necessarily wrote that entry
+    // ITSELF, earlier, on this same thread: sequenced-before implies happens-before, so this load
+    // takes its value either from that store or from one later in the counter's modification order,
+    // and every such store is `map.size()` taken under the lock while this thread's entry is present
+    // -- hence >= 1. The escape that usually defeats this reasoning is another thread removing the
+    // entry in between; that is closed because the ONLY erase is `host_fs_forget`, keyed by this
+    // thread's own `prosper_gettid()`, and there is no `clear()`. If a cross-thread eraser is ever
+    // added, this gate must become acquire/release or go away.
+    //
+    // It also fails SAFE: a wrong answer here skips a correction, it never installs a wrong TCB.
     if (g_host_fs_count.load(std::memory_order_relaxed) == 0) return 0;
     const uint64_t tid = (uint64_t)prosper_gettid();       // syscall OUTSIDE the lock (review B2)
     std::shared_lock<std::shared_mutex> lk(g_host_fs_mx);
