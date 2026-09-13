@@ -1598,10 +1598,41 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
             // consistent by construction and a stage-blind term would report every compute array as a
             // mismatch; only a graphics stage can disagree with itself.
             //
-            // Not a defect for synthesized nulls, checked rather than assumed: the null has depth 1
-            // and no format, so the predicate is false, and the three lowerings that could force
-            // `Arrayed` in the shader all additionally require `is_compute` while the only null
-            // synthesis site runs for VS and PS. Both sides read false and the term stays silent.
+            // Not a defect for synthesized nulls -- for ONE reason, which is upstream of everything
+            // this term looks at. The only site that manufactures a null IMAGE (`gpu_executor.cpp`'s
+            // `exact_null_t8`, :7575-7586 -- the word "image" is load-bearing, because :6587, :6618
+            // and :6650 also build resources satisfying the same gpu_addr/size null predicate, all of
+            // them ConstantBuffer and so outside this term entirely) requires `!u.is_storage_image` and sets
+            // `cls = ResourceClass::Texture`, while the emitter's storage-image lowering is gated on
+            // `res->cls == ResourceClass::StorageImage` (rdna2_emit_alu.cpp:7514). A null therefore
+            // never reaches that block at all -- not its loads, not its stores, not its atomics --
+            // and that block is the one place `Arrayed` is set straight from `mimg_dim` with no
+            // reference to the resource.
+            //
+            // TWO EARLIER VERSIONS OF THIS PARAGRAPH WERE WRONG, and the shape of the error is worth
+            // more than the conclusion. The first invented an `is_compute` gate that does not exist.
+            // The second called that switch the "image-atomic" path (it is the storage-image path;
+            // the atomic test at :7579 is `if (is_atomic && ...)`), and claimed the sampled path and
+            // this term evaluate "the same predicate". They do not: the declaration is
+            // `host_array || res_arrayed` (:8188-8190), and `host_array` includes `msaa_array_fetch`,
+            // which the `guest_texture_is_uploaded_array` half cannot see. (It is NOT unhandled: the
+            // `r.sample_count > 1u` clause below exists for exactly that case. The false claim was
+            // that one predicate covers both halves, not that MSAA arrays go
+            // unconsidered.) The comment a few lines down already says exactly this --
+            // MIRROR THE BACKEND'S WHOLE PREDICATE -- so the second version contradicted its own
+            // function.
+            //
+            // What is deliberately NOT claimed now: that this term can never fire on a null. It is
+            // reported-not-fatal, and "cannot happen" is the class of statement this paragraph has
+            // already got wrong twice.
+            //
+            // No claim is made here about how often it fires in practice. An earlier draft said
+            // "nothing in the corpus trips it", which is an empirical claim with no measurement
+            // behind it -- #3588 contains no such census, and the "Reported, not fatal"
+            // comment earlier in this function records that the neighbouring census has NOT been
+            // done. An unsourced frequency reads
+            // as measured to the next person and gets cited that way. The storage-path fact above is
+            // one step and checkable; that is the whole claim.
             const bool graphics_stage = d.stage == SpirvShaderStage::Vertex ||
                                         d.stage == SpirvShaderStage::Fragment;
             //

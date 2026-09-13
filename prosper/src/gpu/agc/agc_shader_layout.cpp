@@ -520,6 +520,38 @@ const char* image_descriptor_reject_reason(const DecodedImageDescriptor& d) {
     // -- it covers the titles that already boot far enough to capture -- so the residual risk is a
     // T# prosper today mis-binds as identity becoming a visible, named drop instead, which is the
     // direction this project prefers.
+    // WHY THIS IS UNCONDITIONAL WHERE THE BUFFER SCREEN NARROWS (#3610). The buffer precedent in
+    // `rdna2_emit_alu.cpp:6439-6453` gates the identical reserved-selector check on
+    // `dst_sel_routed && k < n`. The difference is the SITE, not the descriptor.
+    //
+    // That buffer check runs inside INSTRUCTION LOWERING, where a MUBUF instruction is in scope, and
+    // its `n` is that opcode's component count -- how many components the instruction actually moves.
+    // Narrowing to `k < n` there means "only the selectors this access uses". This screen runs in
+    // DESCRIPTOR VALIDATION, with no instruction in scope and therefore no `n` to narrow by: it is
+    // asked whether the descriptor itself is well-formed, before anything decides which components a
+    // given access will read.
+    //
+    // So the check here is about the ENCODING, not about consumption. SQ_SEL 2 and 3 name nothing at
+    // all; a descriptor carrying one is undecodable whoever later reads it, and the screen's job is
+    // to say so rather than to predict which selectors some future instruction will touch.
+    //
+    // Two things an earlier version claimed that are FALSE, recorded precisely so they are not
+    // re-derived -- and note what was wrong in each, because in the first it is the REASON and not
+    // the conclusion:
+    //
+    //  - It said the buffer narrows because a buffer's component count varies PER FORMAT. It does
+    //    not: `n` there is the MUBUF opcode's component count (rdna2_emit_alu.cpp:5743-5769), and a
+    //    V# carries the identical four 3-bit DST_SEL selectors in the same WORD3[11:0]
+    //    (agc_shader_layout.hpp:115-123). "There is no `n` HERE" was correct and this comment still
+    //    depends on it; the per-format explanation for WHY was not.
+    //  - It said all four image selectors always reach a view. `render_runner.h:8918` applies the
+    //    swizzle only when `!r.is_storage_image`, so for a storage image none of them do -- and this
+    //    screen judges 329 storage T#s in its own census above.
+    //
+    // Still open, and NOT settled by the census above: whether a DEFINED selector naming a channel
+    // the format does not carry (SQ_SEL_W on a one-channel R32) is architecturally meaningful. The
+    // census counted reserved selectors and does not pair selector words with formats, so it cannot
+    // speak to that question either way.
     for (uint32_t k = 0; k < 4u; ++k)
         if (d.dst_sel[k] == 2u || d.dst_sel[k] == 3u) return "dst-sel-reserved";
     return nullptr;
