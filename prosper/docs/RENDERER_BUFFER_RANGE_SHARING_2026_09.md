@@ -166,8 +166,8 @@ it does not reject compute-to-graphics ownership sharing in general.
 
 #3407 remains open. Large source copies, retained texture refresh/conversion, graphics result
 writeback and synchronous compute/writeback still need ownership work. GTA's larger compute
-and frontend resource scopes explain why removing this copy bucket alone need not change its
-presentation rate. Next, census index/indirect/prior-frame producer populations and stable
+and frontend resource scopes are consistent with its unchanged presentation throughput; these
+measurements do not establish critical-path causality. Next, census index/indirect/prior-frame producer populations and stable
 union reuse before choosing another cache. Union sharing reduces the number of distinct copied spans substantially
 in Blue Prince; this is not a measurement of allocation owners. Any cross-call retention must
 still demonstrate reuse, content invalidation,
