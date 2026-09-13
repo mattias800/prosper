@@ -783,8 +783,14 @@ int main(int argc, char** argv) {
          "build_compute_scale_bias");
     dump(dir, "builder_compare_uvec4", build_compute_compare_uvec4(),
          "build_compute_compare_uvec4");
-    dump(dir, "builder_detile_rgba16f", build_compute_detile_rgba16f(),
-         "build_compute_detile_rgba16f");
+    dump(dir, "builder_detile_rgba16f", build_compute_detile_float16(),
+         "build_compute_detile_float16");
+    dump(dir, "builder_detile_rg16f", build_compute_detile_float16(2),
+         "build_compute_detile_float16");
+    dump(dir, "builder_detile_raw_rg16f", build_compute_detile_float16(2, Float16DetileOutput::RawUvec4),
+         "build_compute_detile_float16");
+    dump(dir, "builder_detile_raw_rgba16f", build_compute_detile_float16(4, Float16DetileOutput::RawUvec4),
+         "build_compute_detile_float16");
     dump(dir, "builder_retile_words", build_compute_retile_words(),
          "build_compute_retile_words");
     dump(dir, "builder_retile_packed_subword_array", build_compute_retile_words(RetileShaderKind::PackedSubwordArray),

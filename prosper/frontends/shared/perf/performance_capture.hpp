@@ -41,6 +41,11 @@ struct RendererTimingRecord {
     uint64_t callbacks = 0;
     uint64_t draws = 0;
     uint64_t texture_bytes = 0;
+    // Successful frontend snapshots, not dispatches or completed/newly rendered frames.
+    // Source bytes include the padded input and its 80-byte shader header per snapshot.
+    uint64_t frontend_gpu_detile_preparations = 0;
+    uint64_t frontend_gpu_detile_2d_preparations = 0;
+    uint64_t frontend_gpu_detile_source_bytes = 0;
     uint64_t buffer_bytes = 0;
     // All actual backend CPU upload copy spans (arena/pool, transient and resident), including
     // copies whose later admission fails; separate from frontend materialized buffer_bytes.

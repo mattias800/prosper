@@ -3,6 +3,9 @@
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "shared/live/live_renderer.hpp"
 #include <bit>
+#include <filesystem>
+#include <fstream>
+#include "shared/perf/performance_capture.hpp"
 
 using namespace prosper::gpu;
 using namespace prosper::test;
@@ -263,5 +266,114 @@ int main(int argc, char** argv) {
     check(live_fallback.size() == 16 * 16 * 4 && center(live_fallback) == expected_face(5) &&
               gpu_detile_recordings().load() == frontend_before + 1,
           "live frontend refusal allocates CPU fallback and preserves last-face pixels");
+    // Ordinary 2D admission uses the same immutable upload, without cube stacking.
+    // Captured backing deliberately excludes persistent CPU-cache eligibility.
+    const uint64_t two_dispatch = PROSPER_ENV_ON("PROSPER_NO_GPU_DETILE_2D") ? 0 : 1;
+    const std::filesystem::path capture_directory = pressure ? "gpu_detile_capture_pressure"
+        : two_dispatch ? "gpu_detile_capture_2d" : "gpu_detile_capture_cpu";
+    std::error_code capture_error;
+    std::filesystem::remove_all(capture_directory, capture_error);
+    std::filesystem::create_directories(capture_directory);
+    auto& capture = prosper::perf::interactive_performance_capture();
+    capture.cancel();
+    const auto start = prosper::perf::monotonic_now_ns();
+    prosper::perf::ProcessSample sample;
+    sample.monotonic_ns = start; capture.observe_sample(sample);
+    const auto armed = capture.arm(capture_directory.string(), "TEST", "GPU detile snapshots",
+                                    "fixture", start, std::chrono::system_clock::now());
+    check(armed.ok, "actual F8 capture arms for live 2D conversion");
+    if (!armed.ok) return 1;
+    std::vector<uint64_t> expected_source_bytes;
+    for (uint32_t components : {2u, 4u}) {
+        constexpr uint32_t w = 129, h = 129;
+        const size_t bytes = tiled_surface_bytes(w, h, 27, 0, components * 2);
+        for (uint64_t count : {two_dispatch, uint64_t{0}, uint64_t{0}, two_dispatch})
+            expected_source_bytes.push_back(count * (bytes + 80));
+        std::vector<uint8_t> tiled(bytes, 0xa5), linear(size_t(w) * h * components * 2);
+        const uint64_t address = base + components * 0x1000000ull;
+        auto fill = [&](uint16_t red, uint16_t green) {
+            const uint16_t color[]{red, green, 0x3400, 0x3c00};
+            for (size_t pixel = 0; pixel < size_t(w) * h; ++pixel)
+                std::memcpy(linear.data() + pixel * components * 2, color, components * 2);
+            tile_surface(tiled.data(), linear.data(), w, h, 27, 0, components * 2);
+        };
+        fill(0x3800, 0x3c00);
+        ShaderResourceTable two_table;
+        auto two_source = texture;
+        two_source.img_dim = 1; two_source.depth = 1;
+        two_source.width = w; two_source.height = h; two_source.num_components = components;
+        two_source.gpu_addr = address; two_source.tile_mode = 27;
+        two_source.host_data = tiled.data(); two_source.host_data_size = bytes; two_source.size = bytes;
+        two_table.resources.push_back(two_source);
+        const uint32_t ps[]{0x7e0002ffu, 0x3e800000u, 0x7e0202ffu, 0x3e800000u,
+            0xf0800f08u, 0x00820000u, 0xf800080fu, 0x03020100u, 0xbf810000u};
+        DrawItem two_item = item;
+        two_item.fs = recompile_fragment(ps, std::size(ps), &two_table);
+        two_item.prt = std::make_shared<ShaderResourceTable>(two_table);
+        two_item.color0_base = 0x34080000u + components * 0x1000;
+        const auto begin = gpu_detile_recordings().load();
+        const std::array<uint8_t, 4> wanted{128, 255, uint8_t(components == 2 ? 0 : 64), 255};
+        const auto two_gpu = render_submit_items({two_item}, 16, 16);
+        check(center(two_gpu) == wanted && gpu_detile_recordings().load() == begin + two_dispatch,
+              "live 2D FP16 upload samples the selected component count and missing-channel defaults");
+        auto& backing = two_item.prt->resources[0];
+        backing.host_data_size = bytes - 1;
+        const auto two_cpu = render_submit_items({two_item}, 16, 16);
+        check(two_cpu == two_gpu && gpu_detile_recordings().load() == begin + two_dispatch,
+              "short 2D tile padding declines GPU preparation and allocates exact CPU fallback");
+        backing.host_data_size = bytes;
+        backing.layer_stride_bytes = bytes;
+        check(render_submit_items({two_item}, 16, 16) == two_gpu &&
+                  gpu_detile_recordings().load() == begin + two_dispatch,
+              "unsupported 2D layer layout keeps the established CPU conversion");
+        backing.layer_stride_bytes = 0;
+        fill(0x3c00, 0x3800);
+        auto mutated = wanted; mutated[0] = 255; mutated[1] = 128;
+        check(center(render_submit_items({two_item}, 16, 16)) == mutated &&
+                  gpu_detile_recordings().load() == begin + 2 * two_dispatch,
+              "2D source mutation at the same address uploads a fresh snapshot");
+
+        auto two_upload = prepare_render_gpu_detile(w, h, 1, address, 0, 0,
+            [&](uint8_t* dst, uint64_t addr, size_t size) -> size_t {
+                if (addr != address || size != bytes) return 0;
+                std::memcpy(dst, tiled.data(), size); return size;
+            }, components);
+        FrameResource plane;
+        plane.img_dim = 1; plane.tw = w; plane.th = h; plane.gpu_detile = two_upload;
+        check(two_upload && backend_texture_plane_span_valid(plane), "ordinary 2D GPU plane is admitted");
+        plane.img_dim = 3;
+        check(!backend_texture_plane_span_valid(plane), "one GPU plane cannot masquerade as a cube");
+        plane.img_dim = 1; plane.declared_mip_levels = 2;
+        check(!backend_texture_plane_span_valid(plane), "GPU plane cannot claim an unconverted mip chain");
+        plane.declared_mip_levels = 1; plane.persistent_render_target_id = 123;
+        check(!backend_texture_plane_span_valid(plane), "GPU plane refuses competing renderer ownership");
+    }
+    sample.monotonic_ns = std::max<uint64_t>(prosper::perf::monotonic_now_ns(), start + 5'000'000'000ull);
+    capture.observe_sample(sample);
+    prosper::perf::CaptureOutcome outcome;
+    check(capture.take_outcome(outcome) && outcome.ok && outcome.renderer_records == 8 &&
+              outcome.renderer_dropped == 0, "F8 records every actual 2D preparation and fallback submit");
+    std::ifstream input(outcome.path);
+    size_t record_index = 0;
+    for (std::string line; std::getline(input, line);) {
+        if (line.find("\"type\":\"renderer\"") == std::string::npos) continue;
+        auto integer = [&](const char* field) -> uint64_t {
+            const auto key = std::string("\"") + field + "\":";
+            const auto at = line.find(key);
+            check(at != std::string::npos, "F8 publishes the detile population field");
+            return at == std::string::npos ? UINT64_MAX : std::strtoull(line.c_str() + at + key.size(), nullptr, 10);
+        };
+        if (record_index < expected_source_bytes.size()) {
+            const uint64_t source_bytes = expected_source_bytes[record_index];
+            check(integer("frontend_gpu_detile_source_bytes") == source_bytes &&
+                      integer("frontend_gpu_detile_preparations") == uint64_t(source_bytes != 0) &&
+                      integer("frontend_gpu_detile_2d_preparations") == uint64_t(source_bytes != 0),
+                  "F8 counts successful live snapshots once, with exact padded input bytes; fallback is zero");
+        }
+        ++record_index;
+    }
+    check(record_index == expected_source_bytes.size(), "serialized F8 population covers all live 2D calls");
+    capture.cancel();
+    std::filesystem::remove_all(capture_directory, capture_error);
     return failures ? 1 : 0;
 }

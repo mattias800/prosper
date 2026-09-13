@@ -1,4 +1,4 @@
-// Submission-owned tile27 RGBA16F -> RGBA8 upload. Used by the live render backend.
+// Submission-owned tile27 FP16 -> sampled RGBA8 or raw storage float-bit upload.
 #pragma once
 #include "gpu/recompiler/spirv_builder.hpp"
 #include "gpu/texture/tile.hpp"
@@ -29,12 +29,27 @@ struct GpuDetilePipeline {
     VkDescriptorSetLayout descriptors = VK_NULL_HANDLE;
     VkPipelineLayout layout = VK_NULL_HANDLE;
     VkPipeline pipeline = VK_NULL_HANDLE;
+    uint32_t components = 4;
+    prosper::gpu::Float16DetileOutput output_kind = prosper::gpu::Float16DetileOutput::Rgba8;
+    VkFormat output_format() const {
+        return output_kind == prosper::gpu::Float16DetileOutput::RawUvec4
+            ? VK_FORMAT_R32G32B32A32_UINT : VK_FORMAT_R8G8B8A8_UNORM;
+    }
+    uint32_t output_texel_bytes() const {
+        return output_kind == prosper::gpu::Float16DetileOutput::RawUvec4 ? 16u : 4u;
+    }
     ~GpuDetilePipeline() {
         if (pipeline) vkDestroyPipeline(device, pipeline, nullptr);
         if (layout) vkDestroyPipelineLayout(device, layout, nullptr);
         if (descriptors) vkDestroyDescriptorSetLayout(device, descriptors, nullptr);
     }
-    bool initialize(VkDevice dev) {
+    bool initialize(VkDevice dev, uint32_t source_components = 4,
+                    prosper::gpu::Float16DetileOutput output = prosper::gpu::Float16DetileOutput::Rgba8) {
+        if ((source_components != 2 && source_components != 4) ||
+            (output != prosper::gpu::Float16DetileOutput::Rgba8 &&
+             output != prosper::gpu::Float16DetileOutput::RawUvec4)) return false;
+        components = source_components;
+        output_kind = output;
         device = dev;
         const VkDescriptorSetLayoutBinding bindings[]{
             {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
@@ -48,7 +63,7 @@ struct GpuDetilePipeline {
         lci.setLayoutCount = 1;
         lci.pSetLayouts = &descriptors;
         if (vkCreatePipelineLayout(dev, &lci, nullptr, &layout) != VK_SUCCESS) return false;
-        const auto words = prosper::gpu::build_compute_detile_rgba16f();
+        const auto words = prosper::gpu::build_compute_detile_float16(components, output_kind);
         VkShaderModuleCreateInfo sci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         sci.codeSize = words.size() * sizeof(uint32_t);
         sci.pCode = words.data();
@@ -78,6 +93,9 @@ struct GpuDetileUpload {
     void* input_mapped = nullptr;
     bool input_reused = false;
     uint64_t input_lease = 0;
+    // A writable storage consumer needs a separate completed-result mapping. It
+    // never overwrites the immutable input or aliases the device conversion output.
+    MappedStagingBlock readback{};
     VkDescriptorPool pool = VK_NULL_HANDLE;
     VkDescriptorSet descriptors = VK_NULL_HANDLE;
     uint32_t width = 0, height = 0, faces = 0, count = 0;
@@ -91,6 +109,12 @@ struct GpuDetileUpload {
             if (input_mapped) vkUnmapMemory(device, input_memory);
             if (input) vkDestroyBuffer(device, input, nullptr);
             if (input_memory) prosper::gpu::free_device_memory(device, input_memory);
+        }
+        if (readback.buffer && !release_mapped_staging(device, readback.buffer, readback.memory,
+                                                       readback.mapped, readback.lease)) {
+            if (readback.mapped) vkUnmapMemory(device, readback.memory);
+            vkDestroyBuffer(device, readback.buffer, nullptr);
+            if (readback.memory) prosper::gpu::free_device_memory(device, readback.memory);
         }
         if (output) vkDestroyBuffer(device, output, nullptr);
         if (output_memory) prosper::gpu::free_device_memory(device, output_memory);
@@ -145,17 +169,27 @@ inline std::shared_ptr<GpuDetileUpload> prepare_gpu_detile_upload(
     const GpuDetilePipeline& program, VkPhysicalDevice phys,
     const VkPhysicalDeviceLimits& limits, uint32_t width, uint32_t height,
     uint32_t faces, uint64_t guest_base, uint64_t face_stride, uint64_t mip_offset,
-    const std::function<size_t(uint8_t*, uint64_t, size_t)>& copy_source) {
+    const std::function<size_t(uint8_t*, uint64_t, size_t)>& copy_source,
+    bool writable = false) {
+    const bool raw = program.output_kind == prosper::gpu::Float16DetileOutput::RawUvec4;
+    // One immutable owner carries one mutable result mapping. The backend must
+    // share one writable image for that owner; its diagnostic unshared path keeps CPU uploads.
+    if (writable && (!raw || std::getenv("PROSPER_NO_BACKEND_TEXTURE_SHARE"))) return {};
     if (!width || !height || !faces || width > limits.maxImageDimension2D ||
         uint64_t(height) * faces > limits.maxImageDimension2D ||
         limits.maxComputeWorkGroupSize[0] < 128 || limits.maxComputeWorkGroupInvocations < 128)
         return {};
+    std::array<uint32_t, 16> equation{};
+    uint32_t block_width = 0, block_height = 0;
+    if ((program.components != 2 && program.components != 4) ||
+        !prosper::gpu::tile64_word_equation(27, program.components * 2, equation,
+                                           block_width, block_height)) return {};
     const uint64_t count = uint64_t(width) * height * faces;
-    const uint64_t face_bytes = ((uint64_t(width) + 127) / 128) *
-                               ((uint64_t(height) + 63) / 64) * 65536;
+    const uint64_t face_bytes = ((uint64_t(width) + block_width - 1) / block_width) *
+                               ((uint64_t(height) + block_height - 1) / block_height) * 65536;
     if (count > UINT32_MAX - 127u || (count + 127) / 128 > limits.maxComputeWorkGroupCount[0] ||
         face_bytes > UINT32_MAX || face_bytes > (UINT32_MAX - 80u) / faces ||
-        count * 4 > limits.maxStorageBufferRange ||
+        count * program.output_texel_bytes() > limits.maxStorageBufferRange ||
         80 + face_bytes * faces > limits.maxStorageBufferRange)
         return {};
     if (!face_stride) face_stride = face_bytes;
@@ -168,8 +202,9 @@ inline std::shared_ptr<GpuDetileUpload> prepare_gpu_detile_upload(
         return {};
     VkImageFormatProperties image_properties{};
     if (vkGetPhysicalDeviceImageFormatProperties(
-            phys, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL,
-            VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, 0,
+            phys, program.output_format(), VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL,
+            VK_IMAGE_USAGE_TRANSFER_DST_BIT | (raw ? VK_IMAGE_USAGE_STORAGE_BIT : VK_IMAGE_USAGE_SAMPLED_BIT) |
+                (raw ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT : 0u), 0,
             &image_properties) != VK_SUCCESS || width > image_properties.maxExtent.width ||
         uint64_t(height) * faces > image_properties.maxExtent.height)
         return {};
@@ -179,7 +214,7 @@ inline std::shared_ptr<GpuDetileUpload> prepare_gpu_detile_upload(
     upload->width = width; upload->height = height; upload->faces = faces;
     upload->count = static_cast<uint32_t>(count);
     upload->source_bytes = 80 + face_bytes * faces;
-    upload->output_bytes = count * 4;
+    upload->output_bytes = count * program.output_texel_bytes();
     VkPhysicalDeviceMemoryProperties memory{};
     vkGetPhysicalDeviceMemoryProperties(phys, &memory);
     auto buffer = [&](VkDeviceSize bytes, VkBufferUsageFlags usage,
@@ -216,11 +251,21 @@ inline std::shared_ptr<GpuDetileUpload> prepare_gpu_detile_upload(
                                       VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, upload->output, upload->output_memory))
         return {};
+    if (writable) {
+        upload->readback = acquire_mapped_staging(program.device, upload->output_bytes,
+            VK_BUFFER_USAGE_TRANSFER_DST_BIT, [&](uint32_t bits) {
+                constexpr auto required = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+                for (uint32_t type = 0; type < memory.memoryTypeCount; ++type)
+                    if ((bits & (1u << type)) &&
+                        (memory.memoryTypes[type].propertyFlags & required) == required) return type;
+                return UINT32_MAX;
+            });
+        if (!upload->readback.mapped) return {};
+    }
     void* mapped = input.mapped;
     const uint32_t header[]{width, height, static_cast<uint32_t>(face_bytes / 4),
                             static_cast<uint32_t>(count)};
     std::memcpy(mapped, header, sizeof(header));
-    const auto equation = prosper::gpu::tile27_rgba16f_equation();
     std::memcpy(static_cast<uint8_t*>(mapped) + 16, equation.data(), sizeof(equation));
     bool copied = true;
     for (uint32_t face = 0; face < faces && copied; ++face)

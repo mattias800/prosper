@@ -1963,6 +1963,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 double backend_res_buffer_acquire_ms = 0, backend_res_buffer_copy_ms = 0;
                 double backend_res_buffer_resident_ms = 0;
                 double backend_res_buffer_watch_ms = 0;
+                uint64_t gpu_detile_preparations = 0, gpu_detile_2d_preparations = 0;
+                uint64_t gpu_detile_source_bytes = 0;
                 uint64_t buffer_upload_bytes = 0;
                 uint64_t buffer_resident_hits = 0;
                 uint64_t buffer_resident_compared_bytes = 0;
@@ -4993,10 +4995,21 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 fflush(stderr);
                             }
                         }
-                        const bool gpu_detile_shape = is_cube && !fr.is_storage_image &&
+                        // Keep established persistent CPU decodes: replacing a cache miss with an
+                        // unretained GPU conversion would repeat that work on every later submit.
+                        const bool gpu_detile_2d_shape =
+                            ((r.cls == RC::Texture && !persistent_cache_eligible) ||
+                             (portable_raw_uvec4_storage && portable_storage_shape &&
+                              fr.storage_image_contract_valid)) && r.img_dim == 1u &&
+                            r.depth == 1u && r.declared_mip_levels == 1u &&
+                            !r.layer_stride_bytes && !r.layer_mip_offset_bytes &&
+                            !PROSPER_ENV_ON("PROSPER_NO_GPU_DETILE_2D");
+                        const bool gpu_detile_shape =
+                            ((is_cube && !fr.is_storage_image && r.num_components == 4) || gpu_detile_2d_shape) &&
                             !r.compression_enabled && !r.in_mip_tail && !r.depth_compare &&
                             r.format == prosper::gpu::DataFormat::Float16 &&
-                            r.num_components == 4 && sampled_source_bpt == 8 && r.tile_mode == 27 &&
+                            (r.num_components == 2 || r.num_components == 4) &&
+                            sampled_source_bpt == r.num_components * 2 && r.tile_mode == 27 &&
                             fr.sample_count == 1 && !cpu_rtt_copy_diagnostics &&
                             !PROSPER_ENV_VALUE("PROSPER_DUMP_RAWTILE") &&
                             !PROSPER_ENV_VALUE("PROSPER_SLICEMAP") &&
@@ -5006,7 +5019,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         // The intervening materializers can use CPU scratch for RTT or
                         // retained depth. Defer its allocation only when neither owns this
                         // address; failed GPU preflight allocates it at the fallback below.
-                        const bool defer_cube_pixels = gpu_detile_shape &&
+                        const bool defer_detile_pixels = gpu_detile_shape &&
                             !resource_compute_depth_hybrid && !resource_compute_image_hit &&
                             g_rtt.find(sampled_source_addr) == g_rtt.end() &&
                             !prosper::test::is_retained_ds_plane(r.gpu_addr);
@@ -5024,7 +5037,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         // is true a retained identity entry must pin `texture_slot`, or the next span
                         // would decode an unrelated texture into the very slot it points at.
                         bool decoded_pixels_in_texstore = false;
-                        if (retain_cpu_live_rtt || defer_cube_pixels) texture_pixels.clear();
+                        if (retain_cpu_live_rtt || defer_detile_pixels) texture_pixels.clear();
                         else texture_pixels.resize(nb);
                         auto copy_linear_padded_rows = [&](uint8_t* dst, size_t dst_row,
                                                            uint32_t rows) {
@@ -5674,25 +5687,37 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             }
                         }
                         // The existing authority checks above own renderer/compute-produced
-                        // data. Only an ordinary guest-backed FP16 cube reaches this conversion.
-                        // Keep the shader's established vertically stacked RGBA8 representation.
+                        // data. Only an ordinary guest-backed FP16 surface reaches this conversion.
+                        // Cubes keep the shader's established vertically stacked RGBA8 representation.
                         const bool gpu_detile_candidate = gpu_detile_shape && !rtt_hit &&
                             !dcc_fast_clear_done && !cube_depth_bridged &&
                             !resource_compute_depth_hybrid;
                         if (gpu_detile_candidate) {
                             fr.gpu_detile = prosper::test::prepare_render_gpu_detile(
-                                tw, th, 6, r.gpu_addr, r.layer_stride_bytes,
-                                r.layer_mip_offset_bytes, copy_resource);
+                                tw, th, is_cube ? 6u : 1u,
+                                is_cube ? r.gpu_addr : sampled_source_addr,
+                                r.layer_stride_bytes, r.layer_mip_offset_bytes, copy_resource,
+                                r.num_components,
+                                portable_raw_uvec4_storage ? prosper::gpu::Float16DetileOutput::RawUvec4
+                                                           : prosper::gpu::Float16DetileOutput::Rgba8,
+                                writable_storage_image);
                             if (fr.gpu_detile) {
-                                cube_done = true;
+                                if (timing_enabled) {
+                                    ++pending_timing.gpu_detile_preparations;
+                                    pending_timing.gpu_detile_2d_preparations += !is_cube;
+                                    pending_timing.gpu_detile_source_bytes += fr.gpu_detile->source_bytes;
+                                }
+                                cube_done = is_cube;
                                 texture_pixels.clear();
                                 fr.persistent_texture_id = 0;
                                 fr.persistent_texture_version = 0;
                             }
                         }
+                        // Short backing or unsupported device limits must restore CPU scratch
+                        // for both ordinary 2D and cube recovery before either writes pixels.
+                        if (defer_detile_pixels && !fr.gpu_detile) texture_pixels.resize(nb);
                         if ((is_cube || is_array) && !cube_done && !rtt_hit && !dcc_fast_clear_done &&
                             !cube_depth_bridged) {
-                            if (defer_cube_pixels) texture_pixels.resize(nb);
                             const uint32_t cb = prosper::gpu::bc_block_bytes(r.format);
                             const bool ctiled = prosper::gpu::tile_mode_is_tiled(r.tile_mode) &&
                                 !PROSPER_ENV_VALUE("PROSPER_NODETILE");
@@ -5993,9 +6018,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         // Block-compressed (BC1/2/3): read the (possibly tiled) compressed blocks, block-
                         // detile, and decode to RGBA8 in-place. The blocks are the tiled element (BC3 =
                         // 16 bytes -> SW_4KB_S 16x16-block micro-tiles). #121.
-                        const uint32_t bcb = (rtt_hit || cube_done || array_done || dcc_fast_clear_done)
+                        const uint32_t bcb = (rtt_hit || cube_done || array_done || dcc_fast_clear_done || fr.gpu_detile)
                             ? 0u : prosper::gpu::bc_block_bytes(r.format);
-                        if (rtt_hit || cube_done || array_done || dcc_fast_clear_done) { /* pixels already materialized */ }
+                        if (rtt_hit || cube_done || array_done || dcc_fast_clear_done || fr.gpu_detile) { /* pixels already materialized */ }
                         else if (portable_raw_uvec4_storage) {
                             // Storage-image tiling describes the compact guest texels, not the expanded
                             // 16-byte Vulkan representation. Detile at the real guest width first, then
@@ -6334,7 +6359,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         bool auto_tiled = prosper::gpu::tile_mode_is_tiled(r.tile_mode);
                         const char* dt = PROSPER_ENV_VALUE("PROSPER_DETILE");
                         // BC textures already block-detiled + decoded above; the 32-bpp detiler must not touch them.
-                        if (!rtt_hit && !cube_done && !array_done && !dcc_fast_clear_done && !bcb &&
+                        if (!rtt_hit && !cube_done && !array_done && !dcc_fast_clear_done && !fr.gpu_detile && !bcb &&
                             !narrow_decode_done &&
                             !f16_done && !f32_done && !portable_raw_uvec4_storage &&
                             !PROSPER_ENV_VALUE("PROSPER_NODETILE") &&
@@ -10508,6 +10533,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     record.frontend_reflect_ms = pending_timing.build_reflect_ms;
                     // These four DO decompose setup_resources_ms, so an offline report can attribute
                     // the largest bucket in the capture instead of leaving a plausible residue.
+                    record.frontend_gpu_detile_preparations = pending_timing.gpu_detile_preparations;
+                    record.frontend_gpu_detile_2d_preparations = pending_timing.gpu_detile_2d_preparations;
+                    record.frontend_gpu_detile_source_bytes = pending_timing.gpu_detile_source_bytes;
                     record.res_texture_ms = pending_timing.backend_res_texture_ms;
                     record.res_buffer_ms = pending_timing.backend_res_buffer_ms;
                     record.res_buffer_copy_ms = pending_timing.backend_res_buffer_copy_ms;

@@ -39,6 +39,33 @@ SAMPLES = [
 
 
 class PerformanceCaptureReportTests(unittest.TestCase):
+    def test_texture_witness_identity_tracks_selected_row_and_missing_metadata(self):
+        row = {"frontend_tex_rtt_ms": 0, "frontend_texture_ms": 2,
+               "frontend_tex_other_slowest_ms": 2, "frontend_tex_other_class": 4,
+               "frontend_tex_other_img_dim": 1, "frontend_tex_other_depth_compare": False,
+               "frontend_tex_other_host_backed": False}
+        smaller = dict(row, frontend_tex_other_slowest_ms=1, frontend_tex_other_class=2)
+        for selected, expected_class in [(row, 4),
+                                         (dict(row, frontend_tex_other_class=0), 0),
+                                         (dict(row, frontend_tex_other_class=999), 999),
+                                         ({k: v for k, v in row.items() if k not in
+                                           ('frontend_tex_other_class', 'frontend_tex_other_img_dim',
+                                            'frontend_tex_other_depth_compare',
+                                            'frontend_tex_other_host_backed')}, None)]:
+            with self.subTest(resource_class=expected_class):
+                summary = summarize(capture(SAMPLES, renderer=[smaller, selected]))
+                witness = summary['resource_breakdown']['tex_other_witness']
+                self.assertEqual(witness['resource_class'], expected_class)
+                self.assertEqual(witness['img_dim'], None if expected_class is None else 1)
+                self.assertEqual(witness['host_backed'], None if expected_class is None else False)
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    print_summary(summary)
+                label = {4: 'StorageImage', 0: 'ConstantBuffer', 999: '999', None: 'UNAVAILABLE'}[expected_class]
+                self.assertIn('class=' + label, output.getvalue())
+                self.assertIn('host_backed=' + ('UNAVAILABLE' if expected_class is None else '0'),
+                              output.getvalue())
+
     def test_resident_buffer_partition_and_partial_population(self):
         row = {"res_texture_ms": 0, "res_buffer_ms": 20, "res_descriptor_ms": 0,
                "res_buffer_copy_ms": 2, "res_buffer_create_ms": 1,
@@ -110,6 +137,28 @@ class PerformanceCaptureReportTests(unittest.TestCase):
         self.assertIn(f"copied={2**53 + 16}B", lines[0])
         self.assertIn("transferred=3072B", lines[0])
         self.assertIn("excludes guest reads and GPU uploads", lines[0])
+
+    def test_gpu_detile_population_preserves_missing_and_integer_bytes(self):
+        row = {"frontend_gpu_detile_preparations": 5,
+               "frontend_gpu_detile_2d_preparations": 3,
+               "frontend_gpu_detile_source_bytes": 2**53 + 17}
+        result = summarize(capture(SAMPLES, renderer=[row, row]))["resource_breakdown"]
+        self.assertTrue(result["gpu_detile_available"])
+        self.assertEqual(result["gpu_detile"], {
+            "preparations": 10, "2d_preparations": 6, "source_bytes": 2**54 + 34})
+        self.assertIsInstance(result["gpu_detile"]["source_bytes"], int)
+        zero = dict.fromkeys(row, 0)
+        result = summarize(capture(SAMPLES, renderer=[zero]))["resource_breakdown"]
+        self.assertTrue(result["gpu_detile_available"])
+        self.assertEqual(result["gpu_detile"]["preparations"], 0)
+        for missing in row:
+            partial = row.copy()
+            del partial[missing]
+            result = summarize(capture(SAMPLES, renderer=[row, partial]))["resource_breakdown"]
+            self.assertFalse(result["gpu_detile_available"])
+            self.assertNotIn("gpu_detile", result)
+        result = summarize(capture(SAMPLES, renderer=[{}]))["resource_breakdown"]
+        self.assertFalse(result["gpu_detile_available"])
 
     def test_texture_snapshot_zero_and_missing_population_are_distinct(self):
         fields = ("frontend_tex_source_snapshot_copied_bytes",
