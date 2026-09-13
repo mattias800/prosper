@@ -1504,7 +1504,7 @@ struct VulkanComputeContext {
     VkPipelineLayout compare_pipeline_layout = VK_NULL_HANDLE;
     VkPipeline compare_pipeline = VK_NULL_HANDLE;
     PackedRttConversion packed_rtt_conversion;
-    GpuRetilePipeline retile_pipeline, volume_retile_pipeline, paired16_retile_pipeline;
+    GpuRetilePipeline retile_pipeline, volume_retile_pipeline, packed_retile_pipeline;
     // Storage-image support (#590): the recompiler's storage path declares the
     // StorageImageRead/WriteWithoutFormat capabilities (raw uvec4 texel model — see
     // tests/fixtures/image_compute_runner.h, the exec-diff harness for that contract). When the device lacks
@@ -1646,7 +1646,7 @@ struct VulkanComputeContext {
         packed_rtt_conversion.destroy();
         retile_pipeline.destroy();
         volume_retile_pipeline.destroy();
-        paired16_retile_pipeline.destroy();
+        packed_retile_pipeline.destroy();
         if (compare_pipeline) vkDestroyPipeline(device, compare_pipeline, nullptr);
         if (compare_pipeline_layout)
             vkDestroyPipelineLayout(device, compare_pipeline_layout, nullptr);
@@ -9683,6 +9683,10 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         // the original linear result for cache comparison and publication; the
         // tiled result has its own allocation owned through completion.
         static const bool gpu_retile_disabled = std::getenv("PROSPER_NO_GPU_RETILE") != nullptr;
+        // Same-binary control for the packed extension; retain the previously shipped
+        // mode-24 two-byte multilayer path and all word/volume tiling.
+        static const bool packed_extension_disabled =
+            std::getenv("PROSPER_NO_GPU_RETILE_PACKED_EXTENSION") != nullptr;
         if (!gpu_retile_disabled) {
             VkPhysicalDeviceProperties properties{};
             vkGetPhysicalDeviceProperties(ctx.physical, &properties);
@@ -9704,13 +9708,17 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 const uint32_t bpe = r->format == DataFormat::Float10_11_11 ||
                     r->format == DataFormat::Unorm2_10_10_10 ? 4u :
                     data_format_bytes(r->format) * (r->num_components ? r->num_components : 1u);
-                // Paired halfwords require a tight, single-mip ordinary array. An
-                // ambiguous view/stride retains the established CPU layout path.
-                if (array && !gpu_retile_paired16_descriptor_supported(*r, bpe, bi.mip_levels))
+                // Packed byte/halfword words require tight, single-mip ordinary planes.
+                // Ambiguous views/strides retain the established CPU layout path.
+                const bool packed = !volume && bpe < 4;
+                if (packed && packed_extension_disabled &&
+                    !(array && bpe == 2 && r->tile_mode == 24)) continue;
+                if ((array && !packed) ||
+                    (packed && !gpu_retile_packed_descriptor_supported(*r, bpe, bi.mip_levels)))
                     continue;
-                const bool layout_ok = array
-                    ? bi.retile_parameters.initialize_paired16_array(r->width, r->height, r->depth,
-                        r->tile_mode, properties.limits)
+                const bool layout_ok = packed
+                    ? bi.retile_parameters.initialize_packed_array(r->width, r->height, array ? r->depth : 1u,
+                        bpe, r->tile_mode, properties.limits)
                     : volume
                     ? bi.retile_parameters.initialize_volume(r->width, r->height, r->depth,
                         bpe, r->tile_mode, properties.limits)
@@ -9721,7 +9729,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     bi.retile_parameters.linear_bytes != staging_bytes[i] ||
                     (array && r->layer_stride_bytes && r->layer_stride_bytes !=
                         bi.retile_parameters.tiled_bytes / r->depth)) continue;
-                auto& retile = array ? ctx.paired16_retile_pipeline :
+                auto& retile = packed ? ctx.packed_retile_pipeline :
                     volume ? ctx.volume_retile_pipeline : ctx.retile_pipeline;
                 auto prepare = [&] {
                     // #3425: this creates a compute pipeline INTO the shared VkPipelineCache, which
@@ -10617,7 +10625,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // buffer, and the source scope has to name the write that actually produced the bytes.
             prosper::gpu::record_host_read_barrier(command, staging[i]);
             if (bi.retile_buffer)
-                (bi.retile_parameters.kind == RetileShaderKind::Paired16Array ? ctx.paired16_retile_pipeline :
+                (bi.retile_parameters.kind == RetileShaderKind::PackedSubwordArray ? ctx.packed_retile_pipeline :
                  bi.retile_parameters.kind == RetileShaderKind::Volume3D ? ctx.volume_retile_pipeline : ctx.retile_pipeline)
                     .record(command, staging[i], bi.retile_buffer,
                             bi.retile_set, bi.retile_parameters);
@@ -11774,6 +11782,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                              "fmt=%u comps=%u tile=%u bytes=%zu cache-hit=%u write-only=%u "
                              "poison=%u gpu-retile=%u dim=%u layers=%u texel-depth=%u "
                              "renderer-result-retained=%u "
+                             "in-tail=%u tail-x=%u tail-y=%u tail-bytes=%llu "
                              "map_ms=%.3f prepare_ms=%.3f watch_ms=%.3f "
                              "pack_ms=%.3f layout_ms=%.3f notify_ms=%.3f cache_ms=%.3f "
                              "total_ms=%.3f\n",
@@ -11784,6 +11793,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                              bi.storage_write_only ? 1u : 0u, 0u, bi.retile_buffer ? 1u : 0u,
                              r->img_dim, bi.array_layers, bi.texel_depth,
                              renderer_result_retained ? 1u : 0u,
+                             r->in_mip_tail ? 1u : 0u, r->mip_tail_x, r->mip_tail_y,
+                             (unsigned long long)r->mip_tail_bytes,
                              image_milliseconds(map_start, map_done),
                              image_milliseconds(map_done, prepare_done),
                              image_milliseconds(prepare_done, watch_done),

@@ -957,16 +957,36 @@ void sw64kb_level_copy(uint8_t* dst, const uint8_t* src, size_t tiled_bytes,
     uint32_t bw = 0, bh = 0;
     sw64kb_dims(el, bw, bh);
     const PatBit* pat = sw64kb_pattern(tile_mode, el);
+    // As in the full-surface walker, parity(x & mask) XOR parity(y & mask)
+    // separates exactly. Packed mip tails fit within a 64 KiB block (at most
+    // 256 columns); a bounded stack table avoids allocation/cache ownership here.
+    // Wider callers retain the scalar path, as does the same-binary control.
+    static const bool scalar = std::getenv("PROSPER_NO_SEPARABLE_MIP_TAIL") != nullptr;
+    std::array<uint16_t, 256> x_offsets;
+    const bool separable = !scalar && ew <= x_offsets.size();
+    if (separable) {
+        for (uint32_t x = 0; x < ew; ++x) {
+            uint32_t v = 0;
+            for (uint32_t i = el; i < 16; ++i)
+                v |= uint32_t(__builtin_popcount((tail_x + x) & pat[i].x) & 1) << i;
+            x_offsets[x] = static_cast<uint16_t>(v);
+        }
+    }
     for (uint32_t y = 0; y < eh; ++y) {
         const uint32_t gy = tail_y + y;
+        uint32_t y_offset = 0;
+        if (separable)
+            for (uint32_t i = el; i < 16; ++i)
+                y_offset |= uint32_t(__builtin_popcount(gy & pat[i].y) & 1) << i;
         for (uint32_t x = 0; x < ew; ++x) {
             const uint32_t gx = tail_x + x;
-            uint32_t within = 0;
-            for (uint32_t i = el; i < 16; ++i) {
-                const uint32_t bit = (__builtin_popcount(gx & pat[i].x) ^
-                                      __builtin_popcount(gy & pat[i].y)) & 1u;
-                within |= bit << i;
-            }
+            uint32_t within = separable ? x_offsets[x] ^ y_offset : 0;
+            if (!separable)
+                for (uint32_t i = el; i < 16; ++i) {
+                    const uint32_t bit = (__builtin_popcount(gx & pat[i].x) ^
+                                          __builtin_popcount(gy & pat[i].y)) & 1u;
+                    within |= bit << i;
+                }
             const size_t block = static_cast<size_t>(gy / bh) + gx / bw;
             const size_t tiled = block * 65536u + within;
             const size_t linear = (static_cast<size_t>(y) * ew + x) * bpe;
@@ -1251,19 +1271,28 @@ std::array<uint32_t, 16> tile27_rgba16f_equation() {
     return result;
 }
 
-bool tile64_paired16_equation(uint32_t mode, std::array<uint32_t, 16>& equation,
-                              uint32_t& block_width, uint32_t& block_height) {
-    if (mode != uint32_t(TileMode::Sw64KbZX)) return false;
-    const auto* pattern = sw64kb_pattern(mode, 1);
-    if (pattern[0].x || pattern[0].y || pattern[1].x != 1 || pattern[1].y)
-        return false;
+bool tile64_packed_equation(uint32_t mode, uint32_t bpe,
+                             std::array<uint32_t, 16>& equation,
+                             uint32_t& block_width, uint32_t& block_height) {
+    if ((mode != uint32_t(TileMode::Sw64KbZX) && mode != uint32_t(TileMode::Sw64KbRX)) ||
+        (bpe != 1 && bpe != 2)) return false;
+    const uint32_t element_bits = std::countr_zero(bpe);
+    const uint32_t packed_x_mask = 4 / bpe - 1;
+    const auto* pattern = sw64kb_pattern(mode, element_bits);
+    // Adjacent horizontal texels must occupy one complete aligned output word.
+    // Prove this for the selected pipe equation instead of assuming every swizzle preserves it.
+    for (uint32_t bit = 0; bit < 2; ++bit) {
+        const uint32_t expected_x = bit < element_bits ? 0u : 1u << (bit - element_bits);
+        if (pattern[bit].x != expected_x || pattern[bit].y) return false;
+    }
     for (size_t bit = 2; bit < equation.size(); ++bit)
-        if (pattern[bit].x & 1) return false;
-    sw64kb_dims(1, block_width, block_height);
+        if (pattern[bit].x & packed_x_mask) return false;
+    sw64kb_dims(element_bits, block_width, block_height);
     for (size_t bit = 0; bit < equation.size(); ++bit)
         equation[bit] = uint32_t(pattern[bit].x) | (uint32_t(pattern[bit].y) << 16);
     return true;
 }
+
 
 bool tile64_word_equation(uint32_t mode, uint32_t bpe,
                           std::array<uint32_t, 16>& equation,

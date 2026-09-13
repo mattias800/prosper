@@ -19,6 +19,56 @@ from the tracker issues, and still gated, because it is a projection of state ra
 > title's current state — for that, read the tracker. Nothing is ever removed when a title moves on,
 > because the point of a blog is that it records *when* things happened.
 
+## 2026-09-13
+
+### Less CPU work for shared mip tails
+
+Sonic's affected compute dispatch falls from 4.06 to 2.21 ms while its known black world remains;
+GTA retains the bank scene ([measurements and limits](prosper/docs/MIP_TAIL_LAYOUT_2026_09.md)).
+
+*Linux Sonic gameplay route, scalar then separable mip layout; the missing world is not fixed.*
+
+![Sonic black world and HUD with scalar mip-tail layout](assets/screenshots/3407-tail-off-sonic.webp)
+![Sonic black world and HUD with separable mip-tail layout](assets/screenshots/3407-tail-on-sonic.webp)
+
+*Linux GTA Performance Story route, scalar then separable layout; presentation rate is unchanged.*
+
+![GTA bank scene with scalar mip-tail layout](assets/screenshots/3407-tail-off-gta.webp)
+![GTA bank scene with separable mip-tail layout](assets/screenshots/3407-tail-on-gta.webp)
+
+## 2026-09-12
+
+### Keeping texture snapshots without another copy
+
+GTA retains its bank scene while a bounded ownership transfer removes most snapshot-copy work;
+Sonic retains its known black world and HUD ([measurements and limits](prosper/docs/TEXTURE_SOURCE_SNAPSHOT_2026_09.md)).
+
+*Linux `prosper-app`, GTA Performance Story route: snapshot transfer off, then on.*
+
+![GTA bank scene with snapshot transfers disabled](assets/screenshots/3407-snapshot-off-gta.webp)
+![GTA bank scene with snapshot transfers enabled](assets/screenshots/3407-snapshot-on-gta.webp)
+
+*Linux `prosper-app`, Sonic gameplay route: transfer off, then on; neither captures correct world rendering.*
+
+![Sonic black world and HUD with snapshot transfers disabled](assets/screenshots/3407-snapshot-off-sonic.webp)
+![Sonic black world and HUD with snapshot transfers enabled](assets/screenshots/3407-snapshot-on-sonic.webp)
+
+
+### GTA's bank scene survives another small texture-conversion saving
+
+GTA V shows the same bank scene before and after packed GPU retile; Sonic still shows its known
+black world with a visible HUD ([measurements and limits](prosper/docs/GPU_RETILE_PACKED_2026_09.md)).
+
+*Linux `prosper-app`, GTA Performance Story gamepad route: extension off, then on.*
+
+![GTA bank scene with the packed extension disabled](assets/screenshots/3407-packed-off-gta.webp)
+![GTA bank scene with the packed extension enabled](assets/screenshots/3407-packed-on-gta.webp)
+
+*Linux `prosper-app`, Sonic gameplay gamepad route: extension off, then on; neither captures correct world rendering.*
+
+![Sonic black world and HUD with the packed extension disabled](assets/screenshots/3407-packed-off-sonic.webp)
+![Sonic black world and HUD with the packed extension enabled](assets/screenshots/3407-packed-on-sonic.webp)
+
 ## 2026-09-11
 
 ### Alex Kidd's world had no colour on Windows, and the reason was one missing line of SPIR-V

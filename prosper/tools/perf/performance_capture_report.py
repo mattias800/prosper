@@ -124,6 +124,17 @@ def _resource_breakdown(renderer):
         "setup_resources": _total(renderer, "setup_resources_ms"),
         "backend_available": have_backend,
     }
+    # An admitted encoded CPU snapshot either copies or transfers its owner. Require the
+    # complete population: a missing field in one row cannot silently contribute a zero.
+    # Handoff is already inside frontend texture time and its cache-outcome buckets.
+    snapshot_fields = ("copied_bytes", "transferred_bytes", "handoff_ms")
+    breakdown["texture_source_snapshot_available"] = all(
+        f"frontend_tex_source_snapshot_{field}" in row
+        for row in renderer for field in snapshot_fields)
+    if breakdown["texture_source_snapshot_available"]:
+        breakdown["texture_source_snapshot"] = {
+            field: sum(row[f"frontend_tex_source_snapshot_{field}"] for row in renderer)
+            for field in snapshot_fields}
     # The frontend texture leaf's OWN classes. The renderer has recorded these since #2250 and this
     # report never printed them, so every capture taken since has carried the answer to "which cache
     # outcome is the texture time in?" and no reader could see it. On Stray's title screen the leaf
@@ -188,6 +199,25 @@ def _resource_breakdown(renderer):
         # the field: under-counted, and indistinguishable from a real measurement. all() reports
         # UNAVAILABLE instead. Fail closed, which is this whole function's thesis.
         breakdown["buffer_leaves_available"] = all("res_buffer_create_ms" in r for r in renderer)
+        residency_fields = ("buffer_upload_bytes", "buffer_resident_hits",
+                            "buffer_resident_compared_bytes", "buffer_resident_reused_bytes",
+                            "buffer_resident_admitted_bytes", "buffer_resident_refreshed_bytes",
+                            "buffer_resident_declined_bytes",
+                            "buffer_resident_ineligible_bytes", "res_buffer_resident_ms")
+        breakdown["buffer_residency_available"] = all(
+            field in row for row in renderer for field in residency_fields)
+        if breakdown["buffer_residency_available"]:
+            breakdown["buffer_residency"] = {
+                field: sum(row[field] for row in renderer) for field in residency_fields}
+        watch_fields = ("buffer_resident_watched_bytes", "res_buffer_watch_ms")
+        breakdown["buffer_watch_available"] = breakdown["buffer_residency_available"] and all(
+            field in row for row in renderer for field in watch_fields)
+        if breakdown["buffer_watch_available"]:
+            # Both are subsets of residency. In particular, never subtract this child timer
+            # from the buffer residual after resident time has already been subtracted.
+            breakdown["buffer_watch"] = {
+                field: sum(row[field] for row in renderer) for field in watch_fields}
+
         # The same signed-remainder argument, one level down. res_buffer_ms had NO exhaustive
         # partition until now -- only `copy` and (in the stderr window) `acquire`, two candidate
         # mechanisms out of an unknown number. An unmeasured region does not read as unmeasured; it
@@ -206,6 +236,9 @@ def _resource_breakdown(renderer):
                 - breakdown["res_buffer_create"] - breakdown["res_buffer_index_find"]
                 - breakdown["res_buffer_index_insert"]
                 - breakdown["res_buffer_hash"])
+            if breakdown["buffer_residency_available"]:
+                breakdown["res_buffer_other"] -= breakdown["buffer_residency"]["res_buffer_resident_ms"]
+
         # The remainder is reported as TWO numbers, and this is not fussiness -- it is this file's own
         # argument applied to sign instead of presence.
         #
@@ -742,6 +775,15 @@ def print_summary(summary):
         print("  build_resources (frontend materializer): "
               f"{breakdown['build_resources']:.1f}ms"
               f"  [texture={breakdown['frontend_texture']:.1f} buffer={breakdown['frontend_buffer']:.1f}]")
+        if breakdown["texture_source_snapshot_available"]:
+            snapshot = breakdown["texture_source_snapshot"]
+            print("    texture source snapshot (included in frontend texture): "
+                  f"handoff={snapshot['handoff_ms']:.3f}ms"
+                  f" copied={snapshot['copied_bytes']}B"
+                  f" transferred={snapshot['transferred_bytes']}B"
+                  " (admitted CPU snapshots; excludes guest reads and GPU uploads)")
+        else:
+            print("    texture source snapshot: UNAVAILABLE")
         if breakdown["tex_classes_available"]:
             invalid = (f"persist_invalid={breakdown['tex_persist_invalid']:.1f}"
                        if breakdown["tex_invalid_available"] else "persist_invalid=UNAVAILABLE")
@@ -787,12 +829,20 @@ def print_summary(summary):
                      f" index_find={breakdown['res_buffer_index_find']:.1f}"
                      f" index_insert={breakdown['res_buffer_index_insert']:.1f}"
                      f" hash={breakdown['res_buffer_hash']:.1f}"
-                     f" other={breakdown['res_buffer_other']:+.1f}"
+                     + (f" resident={breakdown['buffer_residency']['res_buffer_resident_ms']:.1f}"
+                        if breakdown["buffer_residency_available"] else " resident=UNAVAILABLE")
+                     + f" other={breakdown['res_buffer_other']:+.1f}"
                      if breakdown["buffer_leaves_available"]
                      else f"copy={breakdown['res_buffer_copy']:.1f};"
                           " create/index_find/index_insert/hash UNAVAILABLE") + ")"
                   f" descriptor={breakdown['res_descriptor']:.1f}"
                   f" other={breakdown['res_other']:.1f}]")
+            if breakdown["buffer_watch_available"]:
+                watch = breakdown["buffer_watch"]
+                print(f"    included in resident: watch={watch['res_buffer_watch_ms']:.1f}ms"
+                      f" watched_reuse={watch['buffer_resident_watched_bytes'] / (1024*1024):.1f}MiB")
+            elif breakdown["buffer_residency_available"]:
+                print("    resident write-watch breakdown: UNAVAILABLE")
             # Loud, and only when it is genuinely non-zero. A sub-bucket total exceeding its parent
             # is an instrument defect, and the breakdown above is untrustworthy while it holds.
             if breakdown["res_over_attributed"] > 0.05:

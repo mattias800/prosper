@@ -39,6 +39,109 @@ SAMPLES = [
 
 
 class PerformanceCaptureReportTests(unittest.TestCase):
+    def test_resident_buffer_partition_and_partial_population(self):
+        row = {"res_texture_ms": 0, "res_buffer_ms": 20, "res_descriptor_ms": 0,
+               "res_buffer_copy_ms": 2, "res_buffer_create_ms": 1,
+               "res_buffer_index_find_ms": 1, "res_buffer_index_insert_ms": 1,
+               "res_buffer_hash_ms": 1, "res_buffer_resident_ms": 9,
+               "buffer_upload_bytes": 2**40 + 7, "buffer_resident_hits": 3,
+               "buffer_resident_compared_bytes": 8192, "buffer_resident_reused_bytes": 4096,
+               "buffer_resident_admitted_bytes": 4096, "buffer_resident_refreshed_bytes": 8192,
+               "buffer_resident_declined_bytes": 0,
+               "buffer_resident_ineligible_bytes": 0}
+        full = summarize(capture(SAMPLES, renderer=[row, row]))["resource_breakdown"]
+        self.assertTrue(full["buffer_residency_available"])
+        self.assertEqual(full["res_buffer_other"], 10)
+        self.assertEqual(full["buffer_residency"]["buffer_upload_bytes"], 2**41 + 14)
+        self.assertFalse(full["buffer_watch_available"])
+        watched_row = dict(row, buffer_resident_watched_bytes=2**40 + 9, res_buffer_watch_ms=3)
+        watched = summarize(capture(SAMPLES, renderer=[watched_row, watched_row]))["resource_breakdown"]
+        self.assertTrue(watched["buffer_watch_available"])
+        self.assertEqual(watched["buffer_watch"]["buffer_resident_watched_bytes"], 2**41 + 18)
+        self.assertEqual(watched["buffer_watch"]["res_buffer_watch_ms"], 6)
+        self.assertEqual(watched["res_buffer_other"], 10)  # watch time is already inside resident
+        partial_watch = dict(watched_row)
+        del partial_watch["res_buffer_watch_ms"]
+        mixed_watch = summarize(capture(SAMPLES, renderer=[watched_row, partial_watch]))["resource_breakdown"]
+        self.assertTrue(mixed_watch["buffer_residency_available"])
+        self.assertFalse(mixed_watch["buffer_watch_available"])
+        self.assertNotIn("buffer_watch", mixed_watch)
+        self.assertEqual(mixed_watch["res_buffer_other"], 10)
+        # One missing field cannot silently become zero, or grant a partial subtraction.
+        missing = dict(row)
+        del missing["buffer_resident_hits"]
+        mixed = summarize(capture(SAMPLES, renderer=[row, missing]))["resource_breakdown"]
+        self.assertFalse(mixed["buffer_residency_available"])
+        self.assertNotIn("buffer_residency", mixed)
+        self.assertEqual(mixed["res_buffer_other"], 28)
+
+    def test_texture_snapshot_totals_preserve_bytes_and_nested_timing(self):
+        row = {"total_ms": 100, "build_resources_ms": 80, "frontend_texture_ms": 60,
+               "frontend_tex_rtt_ms": 20, "frontend_tex_persist_invalid_ms": 30,
+               "frontend_tex_source_snapshot_copied_bytes": 2**53 + 7,
+               "frontend_tex_source_snapshot_transferred_bytes": 1024,
+               "frontend_tex_source_snapshot_handoff_ms": 1.25}
+        second = dict(row, frontend_tex_source_snapshot_copied_bytes=9,
+                      frontend_tex_source_snapshot_transferred_bytes=2048,
+                      frontend_tex_source_snapshot_handoff_ms=2.5)
+        summary = summarize(capture(SAMPLES, renderer=[row, second]))
+        breakdown = summary["resource_breakdown"]
+        self.assertTrue(breakdown["texture_source_snapshot_available"])
+        self.assertEqual(breakdown["texture_source_snapshot"], {
+            "copied_bytes": 2**53 + 16, "transferred_bytes": 3072, "handoff_ms": 3.75})
+        self.assertIsInstance(breakdown["texture_source_snapshot"]["copied_bytes"], int)
+        without = [{key: value for key, value in record.items()
+                    if not key.startswith("frontend_tex_source_snapshot_")}
+                   for record in (row, second)]
+        prior = summarize(capture(SAMPLES, renderer=without))
+        # The child must neither change classification nor be subtracted again from the residual.
+        self.assertEqual(summary["components"], prior["components"])
+        self.assertEqual(summary["classification"], prior["classification"])
+        self.assertEqual(breakdown["tex_other"], 20)
+        self.assertEqual(breakdown["tex_other"], prior["resource_breakdown"]["tex_other"])
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            print_summary(summary)
+        lines = [line for line in output.getvalue().splitlines()
+                 if "texture source snapshot" in line]
+        self.assertEqual(len(lines), 1)
+        self.assertIn("included in frontend texture", lines[0])
+        self.assertIn("handoff=3.750ms", lines[0])
+        self.assertIn(f"copied={2**53 + 16}B", lines[0])
+        self.assertIn("transferred=3072B", lines[0])
+        self.assertIn("excludes guest reads and GPU uploads", lines[0])
+
+    def test_texture_snapshot_zero_and_missing_population_are_distinct(self):
+        fields = ("frontend_tex_source_snapshot_copied_bytes",
+                  "frontend_tex_source_snapshot_transferred_bytes",
+                  "frontend_tex_source_snapshot_handoff_ms")
+        zero = dict.fromkeys(fields, 0)
+        summary = summarize(capture(SAMPLES, renderer=[zero, zero]))
+        self.assertTrue(summary["resource_breakdown"]["texture_source_snapshot_available"])
+        self.assertEqual(summary["resource_breakdown"]["texture_source_snapshot"], {
+            "copied_bytes": 0, "transferred_bytes": 0, "handoff_ms": 0})
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            print_summary(summary)
+        self.assertIn("handoff=0.000ms copied=0B transferred=0B", output.getvalue())
+        self.assertNotIn("texture source snapshot: UNAVAILABLE", output.getvalue())
+        for missing in fields:
+            with self.subTest(missing=missing):
+                partial = dict(zero)
+                del partial[missing]
+                mixed = summarize(capture(SAMPLES, renderer=[zero, partial]))
+                self.assertFalse(mixed["resource_breakdown"]["texture_source_snapshot_available"])
+                self.assertNotIn("texture_source_snapshot", mixed["resource_breakdown"])
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    print_summary(mixed)
+                self.assertIn("texture source snapshot: UNAVAILABLE", output.getvalue())
+                self.assertNotIn("handoff=", output.getvalue())
+        legacy = summarize(capture(SAMPLES, renderer=[{}]))["resource_breakdown"]
+        self.assertFalse(legacy["texture_source_snapshot_available"])
+        self.assertNotIn("texture_source_snapshot", legacy)
+        self.assertIsNone(summarize(capture(SAMPLES))["resource_breakdown"])
+
     def test_gpu_device_classification(self):
         summary = summarize(capture(SAMPLES, renderer=[{
             "total_ms": 100, "gpu_device_ms": 60, "gpu_wait_ms": 65,
