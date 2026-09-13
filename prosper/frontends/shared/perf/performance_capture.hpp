@@ -42,6 +42,22 @@ struct RendererTimingRecord {
     uint64_t draws = 0;
     uint64_t texture_bytes = 0;
     uint64_t buffer_bytes = 0;
+    // All actual backend CPU upload copy spans (arena/pool, transient and resident), including
+    // copies whose later admission fails; separate from frontend materialized buffer_bytes.
+    // Comparison bytes count requested spans; an early mismatch need not read every byte.
+    // Reused/admitted/refreshed/declined/ineligible count payload bytes, not live cache size.
+    // Refresh overwrites a changed entry only when the cache is its sole allocation owner.
+    // Ineligible covers the whole-pass gate (also explicit controls), not only shader proof.
+    uint64_t buffer_upload_bytes = 0;
+    uint64_t buffer_resident_hits = 0;
+    uint64_t buffer_resident_compared_bytes = 0;
+    uint64_t buffer_resident_reused_bytes = 0;
+    uint64_t buffer_resident_admitted_bytes = 0;
+    uint64_t buffer_resident_refreshed_bytes = 0;
+    // Subset of reused bytes proved unchanged by a complete direct-source write watch.
+    uint64_t buffer_resident_watched_bytes = 0;
+    uint64_t buffer_resident_declined_bytes = 0;
+    uint64_t buffer_resident_ineligible_bytes = 0;
     double total_ms = 0;
     double prelude_ms = 0;
     double pass_ms = 0;
@@ -99,6 +115,11 @@ struct RendererTimingRecord {
     // working and the content really is new" call for opposite work, and a single `other` bucket
     // cannot tell them apart -- which is exactly how Stray's title screen hid 930 of 1110 ms.
     double frontend_tex_persist_invalid_ms = 0;
+    // CPU snapshot ownership handoff, nested in frontend_texture_ms. These byte counts exclude
+    // the authoritative guest read and describe admitted entries, not Vulkan uploads or occupancy.
+    double frontend_tex_source_snapshot_handoff_ms = 0;
+    uint64_t frontend_tex_source_snapshot_copied_bytes = 0;
+    uint64_t frontend_tex_source_snapshot_transferred_bytes = 0;
     uint64_t frontend_tex_persist_invalid_n = 0;
     // References that reached NONE of the named classes. A count, not a duration: paired with the
     // signed millisecond residual the report derives, the two disagree only if the classification
@@ -143,6 +164,11 @@ struct RendererTimingRecord {
     // as above, but the report prints it SIGNED: a negative remainder is over-attribution, and
     // clamping it would make a broken partition look like a complete one (#2245).
     double res_buffer_copy_ms = 0;
+    // Resident lookup/validation and admission allocation/copy, nested in res_buffer_ms.
+    // Ordinary arena/pool copies remain in res_buffer_copy_ms; these leaves do not overlap.
+    double res_buffer_resident_ms = 0;
+    // Child of res_buffer_resident_ms: do not add/subtract it again in the buffer partition.
+    double res_buffer_watch_ms = 0;
     double res_buffer_create_ms = 0;
     double res_buffer_index_find_ms = 0;
     double res_buffer_index_insert_ms = 0;

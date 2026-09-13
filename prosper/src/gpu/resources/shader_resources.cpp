@@ -317,6 +317,8 @@ namespace {
 
 constexpr uint32_t kSpirvMagic = 0x07230203u;
 enum : uint32_t {
+    OpExtInstImport = 11,
+    OpExtInst = 12,
     OpEntryPoint = 15,
     OpTypeInt = 21,
     OpTypeFloat = 22,
@@ -332,6 +334,8 @@ enum : uint32_t {
     OpImageTexelPointer = 60,
     OpLoad = 61,
     OpStore = 62,
+    OpCopyMemory = 63,
+    OpCopyMemorySized = 64,
     OpAccessChain = 65,
     OpInBoundsAccessChain = 66,
     OpAtomicLoad = 227,
@@ -374,10 +378,10 @@ struct StorageBufferZeroPadMarker {
 };
 
 std::string instruction_string(const std::vector<uint32_t>& spirv,
-                               const Instruction& instruction) {
+                               const Instruction& instruction, uint32_t first_operand = 0) {
     std::string value;
     bool terminated = false;
-    for (uint32_t operand = 0; operand + 1u < instruction.words; ++operand) {
+    for (uint32_t operand = first_operand; operand + 1u < instruction.words; ++operand) {
         const uint32_t packed = spirv[instruction.offset + 1u + operand];
         for (uint32_t byte = 0; byte < 4; ++byte) {
             const char c = static_cast<char>(packed >> (byte * 8u));
@@ -876,11 +880,16 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
     std::unordered_map<uint32_t, uint64_t> array_strides;
     std::unordered_map<uint64_t, uint64_t> member_offsets;
     std::map<uint64_t, StorageBufferZeroPadMarker> zero_pad_markers;
+    std::set<uint32_t> glsl_std_450_imports;
     bool malformed_zero_pad_marker = false;
     auto word = [&](const Instruction& in, uint32_t operand) { return spirv[in.offset + 1u + operand]; };
     for (const Instruction& in : insts) {
         const uint32_t n = in.words - 1u;
         switch (in.opcode) {
+            case OpExtInstImport:
+                if (n >= 2 && instruction_string(spirv, in, 1) == "GLSL.std.450")
+                    glsl_std_450_imports.insert(word(in, 0));
+                break;
             case OpEntryPoint:
                 if (n >= 2 && stage == SpirvShaderStage::Unknown)
                     stage = static_cast<SpirvShaderStage>(word(in, 0));
@@ -1028,6 +1037,26 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
         const uint32_t root = pointer_root(pointer);
         if (root) mark(root, read, write);
     };
+    auto prove_buffer_write = [&](uint32_t pointer) {
+        uint32_t root = pointer_root(pointer);
+        if (!root && variables.count(pointer)) root = pointer;
+        const auto descriptor = descriptor_vars.find(root);
+        if (descriptor != descriptor_vars.end()) {
+            if (descriptor->second == SpirvDescriptorKind::StorageBuffer)
+                mark(root, false, true);
+            else if (descriptor->second != SpirvDescriptorKind::StorageImage)
+                report.storage_buffer_writes_complete = false;
+            return;
+        }
+        const auto variable = variables.find(root);
+        // Local/output/workgroup stores cannot mutate descriptor storage. Copied or otherwise
+        // unresolved pointers still decline: descriptor discovery is not a negative-write proof.
+        if (variable != variables.end()) {
+            const uint32_t storage = variable->second.storage;
+            if (storage == 3u || storage == 4u || storage == 6u || storage == 7u) return;
+        }
+        report.storage_buffer_writes_complete = false;
+    };
     auto mark_image = [&](uint32_t object, bool read, bool write) {
         auto origin = image_objects.find(object);
         if (origin != image_objects.end()) mark(origin->second, read, write);
@@ -1039,8 +1068,39 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
         else texel_access_vars.insert(origin->second);
     };
     report.storage_image_writes_complete = true;
+    report.storage_buffer_writes_complete = true;
     for (const Instruction& in : insts) {
         const uint32_t n = in.words - 1u;
+        const bool atomic_write_result =
+            (in.opcode >= OpAtomicExchange && in.opcode <= OpAtomicXor) ||
+            in.opcode == OpAtomicFlagTestAndSet;
+        if (in.opcode == OpStore || in.opcode == OpCopyMemory ||
+            in.opcode == OpCopyMemorySized || in.opcode == OpAtomicStore ||
+            in.opcode == OpAtomicFlagClear) {
+            const uint32_t minimum = in.opcode == OpCopyMemorySized ? 3u :
+                in.opcode == OpAtomicStore ? 4u : in.opcode == OpAtomicFlagClear ? 3u : 2u;
+            if (n < minimum) report.storage_buffer_writes_complete = false;
+            else prove_buffer_write(word(in, 0));
+            if ((in.opcode == OpCopyMemory || in.opcode == OpCopyMemorySized) && n >= 2)
+                mark_pointer(word(in, 1), true, false);
+        } else if (atomic_write_result) {
+            if (n < 5) report.storage_buffer_writes_complete = false;
+            else prove_buffer_write(word(in, 2));
+        } else if (in.opcode == OpExtInst) {
+            // Khronos GLSL.std.450 grammar v100 revision2: opcodes1..81 are value operations
+            // except Modf(35)/Frexp(51), whose second argument is an output pointer. Other imports
+            // and unknown extended opcodes cannot supply a negative memory-write proof.
+            if (n < 5 || !glsl_std_450_imports.count(word(in, 2)) ||
+                word(in, 3) < 1u || word(in, 3) > 81u) {
+                report.storage_buffer_writes_complete = false;
+            } else if (word(in, 3) == 35u || word(in, 3) == 51u) {
+                if (n < 6) report.storage_buffer_writes_complete = false;
+                else prove_buffer_write(word(in, 5));
+            }
+        } else if (in.opcode == 259u /* OpGroupAsyncCopy */ || in.opcode >= 4096u) {
+            // Unmodelled extended/cooperative memory operations retain ordinary upload behavior.
+            report.storage_buffer_writes_complete = false;
+        }
         // A missing writable flag is not proof of no stores: copied/selected/called image objects
         // can escape image_objects. Preserve normal reflection, but never omit output on that
         // evidence. Any texel pointer vetoes the optimization, covering all atomic pointer forms.
@@ -1254,6 +1314,8 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
         prior.atomic_access |= descriptor.atomic_access;
     }
     report.descriptors = std::move(coalesced);
+    if (!spirv_descriptor_reflection_complete(report))
+        report.storage_buffer_writes_complete = false;
 
     // Reflection depends only on immutable SPIR-V. Runtime addresses, sizes, metadata, and the
     // expected stage/set are validated below on every call. Keeping those out of this cache lets a

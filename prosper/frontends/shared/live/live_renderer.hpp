@@ -72,6 +72,9 @@ struct TextureDecodeScopeStats {
     // a test can otherwise pass while covering nothing, since an entry backed by persistent storage
     // survives a span boundary whether or not pinning works.
     uint64_t scratch_pins = 0;
+    // Encoded source bytes handed to admitted persistent entries; excludes guest reads.
+    uint64_t source_snapshot_copied_bytes = 0;
+    uint64_t source_snapshot_transferred_bytes = 0;
 };
 TextureDecodeScopeStats texture_decode_scope_stats();
 void reset_texture_decode_scope_stats();

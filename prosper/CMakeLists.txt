@@ -1305,6 +1305,10 @@ if(TARGET prosper_core)
 
   # F8's pre-trigger ring and post-trigger timing artifact: pure state machine + filesystem test,
   # including bounded overflow accounting and temporary-to-final atomic publication.
+  add_executable(test_texture_source_snapshot frontends/shared/tests/test_texture_source_snapshot.cpp)
+  target_include_directories(test_texture_source_snapshot PRIVATE frontends)
+  add_test(NAME texture_source_snapshot COMMAND test_texture_source_snapshot)
+
   add_executable(test_performance_capture frontends/shared/tests/test_performance_capture.cpp)
   target_link_libraries(test_performance_capture PRIVATE prosper_performance_capture)
   add_test(NAME performance_capture COMMAND test_performance_capture)
@@ -1509,6 +1513,18 @@ if(TARGET prosper_core)
   add_executable(test_tile tests/gpu/texture/test_tile.cpp)
   target_link_libraries(test_tile PRIVATE prosper_core)
   add_test(NAME gpu_surface_detile COMMAND test_tile)
+  add_executable(test_mip_tail tests/gpu/texture/test_mip_tail.cpp)
+  target_link_libraries(test_mip_tail PRIVATE prosper_core)
+  add_test(NAME gpu_mip_tail_oracle COMMAND test_mip_tail --check)
+  set_tests_properties(gpu_mip_tail_oracle PROPERTIES TIMEOUT 60)
+  if(Python3_Interpreter_FOUND)
+    foreach(pipes 1 2 4 8 16 32 64)
+      add_test(NAME gpu_mip_tail_pipes_${pipes} COMMAND ${CMAKE_COMMAND} -E env
+        PROSPER_RX_PIPES=${pipes} ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/gpu/texture/test_mip_tail.py $<TARGET_FILE:test_mip_tail>)
+      set_tests_properties(gpu_mip_tail_pipes_${pipes} PROPERTIES TIMEOUT 150)
+    endforeach()
+  endif()
   # Run the same byte-identity suite through the row-parallel detile path (#1177), forcing threads so
   # it is exercised even on a low-core CI. Passing here + in gpu_surface_detile (single-threaded control
   # via the < 2-thread gate / PROSPER_DETILE_SINGLE_THREADED) proves threaded == single byte-for-byte.
@@ -3019,6 +3035,9 @@ if(TARGET prosper_core)
       target_include_directories(test_gpu_capture_render PRIVATE src tests tools/boot_trace)
       target_link_libraries(test_gpu_capture_render PRIVATE prosper_core prosper_live_renderer Vulkan::Vulkan)
       add_test(NAME gpu_capture_render_replay COMMAND test_gpu_capture_render)
+      add_test(NAME gpu_capture_render_snapshot_copy COMMAND test_gpu_capture_render --expect-source-snapshot-copy)
+      set_tests_properties(gpu_capture_render_snapshot_copy PROPERTIES
+        ENVIRONMENT "PROSPER_NO_TEXTURE_SOURCE_SNAPSHOT_MOVE=1")
 
       # PROSPER_SKIP_DRAW_PROGRAM through the REAL live renderer: an unnamed program renders, the
       # named one is withheld, and a mixed submit loses only the named draw. Needs the live renderer
@@ -3666,6 +3685,28 @@ if(TARGET prosper_core)
 endif()
 
 if(TARGET prosper_core AND TARGET Vulkan::Vulkan)
+  add_executable(test_render_buffer_residency tests/gpu/state/test_render_buffer_residency.cpp)
+  target_include_directories(test_render_buffer_residency PRIVATE tests frontends)
+  target_link_libraries(test_render_buffer_residency PRIVATE prosper_core Vulkan::Vulkan)
+  add_test(NAME render_buffer_residency COMMAND ${CMAKE_COMMAND} -E env
+    --unset=PROSPER_NO_BACKEND_RESOURCE_SHARE
+    --unset=PROSPER_NO_BACKEND_BUFFER_POOL --unset=PROSPER_BUFVERIFY
+    PROSPER_BACKEND_BUFFER_RESIDENCY_MB=256
+    PROSPER_BACKEND_BUFFER_RESIDENCY_OWNERS=4096
+    $<TARGET_FILE:test_render_buffer_residency>)
+  foreach(owner_limit IN ITEMS 0 256)
+    add_test(NAME render_buffer_owner_limit_${owner_limit} COMMAND ${CMAKE_COMMAND} -E env
+      PROSPER_BACKEND_BUFFER_RESIDENCY_OWNERS=${owner_limit}
+      $<TARGET_FILE:test_render_buffer_residency> --configured-owner-limit ${owner_limit})
+  endforeach()
+  add_test(NAME render_buffer_residency_default COMMAND ${CMAKE_COMMAND} -E env
+    --unset=PROSPER_BACKEND_BUFFER_RESIDENCY_MB
+    --unset=PROSPER_NO_BACKEND_BUFFER_RESIDENCY
+    --unset=PROSPER_BACKEND_BUFFER_RESIDENCY_OWNERS
+    --unset=PROSPER_NO_BACKEND_RESOURCE_SHARE
+    --unset=PROSPER_NO_BACKEND_BUFFER_POOL --unset=PROSPER_BUFVERIFY
+    $<TARGET_FILE:test_render_buffer_residency> --default-disabled)
+
   add_executable(test_gpu_detile tests/gpu/execute/test_gpu_detile.cpp)
   target_include_directories(test_gpu_detile PRIVATE tests)
   target_link_libraries(test_gpu_detile PRIVATE prosper_core Vulkan::Vulkan)
@@ -3678,6 +3719,20 @@ if(TARGET prosper_core AND TARGET Vulkan::Vulkan)
 endif()
 
 if(TARGET prosper_live_renderer AND TARGET Vulkan::Vulkan)
+  add_executable(test_render_buffer_capture tests/shared/live/test_render_buffer_capture.cpp)
+  target_include_directories(test_render_buffer_capture PRIVATE frontends)
+  target_link_libraries(test_render_buffer_capture PRIVATE prosper_live_renderer
+                                                         prosper_performance_capture Vulkan::Vulkan)
+  add_test(NAME render_buffer_capture COMMAND test_render_buffer_capture)
+  add_test(NAME render_texture_snapshot_capture COMMAND test_render_buffer_capture --source-snapshot)
+  add_test(NAME render_texture_snapshot_capture_copy COMMAND test_render_buffer_capture --source-snapshot)
+  set_tests_properties(render_texture_snapshot_capture PROPERTIES
+    ENVIRONMENT "PROSPER_NO_LIVE_PERSISTENT_COLOR_TARGETS=1;PROSPER_BACKEND_BUFFER_RESIDENCY_MB=256;PROSPER_BACKEND_BUFFER_RESIDENCY_OWNERS=4096" TIMEOUT 120)
+  set_tests_properties(render_texture_snapshot_capture_copy PROPERTIES
+    ENVIRONMENT "PROSPER_NO_LIVE_PERSISTENT_COLOR_TARGETS=1;PROSPER_BACKEND_BUFFER_RESIDENCY_MB=256;PROSPER_BACKEND_BUFFER_RESIDENCY_OWNERS=4096;PROSPER_NO_TEXTURE_SOURCE_SNAPSHOT_MOVE=1" TIMEOUT 120)
+  set_tests_properties(render_buffer_capture PROPERTIES
+    ENVIRONMENT "PROSPER_NO_LIVE_PERSISTENT_COLOR_TARGETS=1;PROSPER_BACKEND_BUFFER_RESIDENCY_MB=256;PROSPER_BACKEND_BUFFER_RESIDENCY_OWNERS=4096" TIMEOUT 120)
+
   add_executable(test_gpu_retile tests/gpu/execute/test_gpu_retile.cpp)
   target_include_directories(test_gpu_retile PRIVATE tests frontends)
   target_link_libraries(test_gpu_retile PRIVATE prosper_live_renderer Vulkan::Vulkan)
@@ -3696,6 +3751,14 @@ if(TARGET prosper_live_renderer AND TARGET Vulkan::Vulkan)
   add_test(NAME gpu_retile_volume_cpu COMMAND test_gpu_retile --volume-cpu)
   add_test(NAME gpu_retile_volume_allocation_fallback COMMAND test_gpu_retile --volume-alloc-oom)
   add_test(NAME gpu_retile_volume_mapping_loss COMMAND test_gpu_retile --volume-map-loss)
+  foreach(pipes 1 2 4 8 16 32 64)
+    add_test(NAME gpu_retile_subword_pipes_${pipes} COMMAND ${CMAKE_COMMAND} -E env
+      PROSPER_RX_PIPES=${pipes} $<TARGET_FILE:test_gpu_retile> --subword)
+  endforeach()
+  add_test(NAME gpu_retile_subword_cpu COMMAND ${CMAKE_COMMAND} -E env
+    PROSPER_NO_GPU_RETILE=1 $<TARGET_FILE:test_gpu_retile> --subword-cpu)
+  add_test(NAME gpu_retile_subword_allocation_fallback COMMAND test_gpu_retile --subword-alloc-oom)
+  add_test(NAME gpu_retile_subword_mapping_loss COMMAND test_gpu_retile --subword-map-loss)
   add_test(NAME gpu_retile_array16 COMMAND test_gpu_retile --array16)
   add_test(NAME gpu_retile_array16_shape_refusal COMMAND test_gpu_retile --array16-shape-refusal)
   add_test(NAME gpu_retile_array16_cpu COMMAND test_gpu_retile --array16-cpu)

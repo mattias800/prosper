@@ -69,7 +69,9 @@ constexpr bool mapped_readback_plan_satisfies_vuid_01389(
            (plan.invalidate_size == allocation || plan.invalidate_size % atom == 0);
 }
 
-int main() {
+int main(int argc, char** argv) {
+    const bool expect_snapshot_copy = argc == 2 &&
+        std::strcmp(argv[1], "--expect-source-snapshot-copy") == 0;
     // buffer_upload_bytes caches this override on first use. Reset it before the renderer can build
     // any buffer resource so the test always exercises the production default ceiling.
     unset_env("PROSPER_MAX_BUFFER_UPLOAD_MB");
@@ -2112,6 +2114,40 @@ int main() {
                 {SubmitOperationKind::Dispatch, 0, 150},
                 {SubmitOperationKind::Draw, 1, 200},
             };
+
+            // Encoded packed10 snapshots cannot alias their RGBA8 decoded pixels. Replace one
+            // between graphics spans, then verify both retained targets and the actual handoff path.
+            const uint64_t packed_texture = guest_base + 0x9000;
+            const uint32_t packed_red[4] = {0xc00003ffu, 0xc00003ffu, 0xc00003ffu, 0xc00003ffu};
+            const uint32_t packed_green[4] = {0xc00ffc00u, 0xc00ffc00u, 0xc00ffc00u, 0xc00ffc00u};
+            std::vector<uint8_t> packed_green_bytes(sizeof(packed_green));
+            std::memcpy(packed_green_bytes.data(), packed_green, sizeof(packed_green));
+            std::memcpy(guest + 0x9000, packed_red, sizeof(packed_red));
+            auto packed_draw = [&](uint64_t index, uint64_t order) {
+                auto draw = texture_draw(packed_texture, 2, 2, 8, index, order);
+                auto table = std::make_shared<ShaderResourceTable>(*draw.prt);
+                table->resources[0].format = DataFormat::Unorm2_10_10_10;
+                draw.prt = std::move(table);
+                return draw;
+            };
+            dispatch_writes = packed_texture;
+            dispatch_bytes = &packed_green_bytes;
+            reset_texture_decode_scope_stats();
+            execute_ordered_items(two_spans, {packed_draw(0, 100), packed_draw(1, 200)},
+                                  dispatches, counting_render, interleaved_write, W, H);
+            const auto packed_stats = texture_decode_scope_stats();
+            CHECK(packed_stats.decodes == 2 && packed_stats.invalidations == 1,
+                  "encoded texture snapshot is admitted and replaced after an interleaved write");
+            CHECK(packed_stats.source_snapshot_copied_bytes +
+                      packed_stats.source_snapshot_transferred_bytes == 32u &&
+                      (!expect_snapshot_copy || packed_stats.source_snapshot_transferred_bytes == 0),
+                  "both snapshots are accounted for, with capacity fallback and the copy control");
+            std::vector<uint8_t> packed_before, packed_after;
+            const auto* packed_a = target_center(span_targets[0], packed_before);
+            const auto* packed_b = target_center(span_targets[1], packed_after);
+            CHECK(packed_a && packed_b && packed_a[0] > 240 && packed_a[1] < 8 &&
+                      packed_b[1] > 240 && packed_b[0] < 8,
+                  "snapshot replacement preserves earlier red pixels and later green pixels");
 
             // (1) CONTROL — the dispatch writes an unrelated range. Both spans sample the same
             // identity, so the submit-scoped map must serve the second one without decoding again.

@@ -17,6 +17,7 @@
 #include "shared/diagnostics/capture_renderer_policy.hpp"
 #include "shared/texture/write_watch_policy.hpp"
 #include "shared/live/live_compute.hpp"
+#include "shared/live/texture_source_snapshot.hpp"
 #include "shared/live/decode_scratch.hpp"     // pooled full-surface decode intermediates
 #include "shared/live/live_target_format.hpp"       // the one LiveTargetPixelFormat mapping (exhaustive)
 #include "shared/perf/performance_capture.hpp"      // bounded F8 post-trigger renderer timing
@@ -1960,6 +1961,17 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 double backend_res_texture_ms = 0, backend_res_texture_upload_ms = 0;
                 double backend_res_texture_bind_ms = 0, backend_res_buffer_ms = 0;
                 double backend_res_buffer_acquire_ms = 0, backend_res_buffer_copy_ms = 0;
+                double backend_res_buffer_resident_ms = 0;
+                double backend_res_buffer_watch_ms = 0;
+                uint64_t buffer_upload_bytes = 0;
+                uint64_t buffer_resident_hits = 0;
+                uint64_t buffer_resident_compared_bytes = 0;
+                uint64_t buffer_resident_reused_bytes = 0;
+                uint64_t buffer_resident_admitted_bytes = 0;
+                uint64_t buffer_resident_refreshed_bytes = 0;
+                uint64_t buffer_resident_watched_bytes = 0;
+                uint64_t buffer_resident_declined_bytes = 0;
+                uint64_t buffer_resident_ineligible_bytes = 0;
                 double backend_res_buffer_create_ms = 0;
                 double backend_res_buffer_index_find_ms = 0;
                 double backend_res_buffer_index_insert_ms = 0;
@@ -2022,6 +2034,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 // title screen 930.78 of the texture leaf's 1110.10 ms landed in that undivided
                 // residual, and naming this half is what identified the two 63.75 MiB RGBA16F HDR
                 // intermediates that re-decode every frame (#3149 measured the splash, not this).
+                // Snapshot handoff is nested inside frontend texture materialization.
+                double tex_source_snapshot_handoff_ms = 0;
+                uint64_t tex_source_snapshot_copied_bytes = 0;
+                uint64_t tex_source_snapshot_transferred_bytes = 0;
                 double tex_persist_invalid_ms = 0;
                 uint64_t tex_persist_invalid_n = 0;
                 uint64_t tex_other_n = 0;
@@ -2188,6 +2204,17 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 pending_timing.backend_res_buffer_ms += backend.res_buffer_ms;
                 pending_timing.backend_res_buffer_acquire_ms += backend.res_buffer_acquire_ms;
                 pending_timing.backend_res_buffer_copy_ms += backend.res_buffer_copy_ms;
+                pending_timing.backend_res_buffer_resident_ms += backend.res_buffer_resident_ms;
+                pending_timing.backend_res_buffer_watch_ms += backend.res_buffer_watch_ms;
+                pending_timing.buffer_upload_bytes += reuse.buffer_upload_bytes;
+                pending_timing.buffer_resident_hits += reuse.buffer_resident_hits;
+                pending_timing.buffer_resident_compared_bytes += reuse.buffer_resident_compared_bytes;
+                pending_timing.buffer_resident_reused_bytes += reuse.buffer_resident_reused_bytes;
+                pending_timing.buffer_resident_admitted_bytes += reuse.buffer_resident_admitted_bytes;
+                pending_timing.buffer_resident_refreshed_bytes += reuse.buffer_resident_refreshed_bytes;
+                pending_timing.buffer_resident_watched_bytes += reuse.buffer_resident_watched_bytes;
+                pending_timing.buffer_resident_declined_bytes += reuse.buffer_resident_declined_bytes;
+                pending_timing.buffer_resident_ineligible_bytes += reuse.buffer_resident_ineligible_bytes;
                 pending_timing.backend_res_buffer_create_ms += backend.res_buffer_create_ms;
                 pending_timing.backend_res_buffer_index_find_ms += backend.res_buffer_index_find_ms;
                 pending_timing.backend_res_buffer_index_insert_ms += backend.res_buffer_index_insert_ms;
@@ -6657,8 +6684,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     persistent_source_size);
                             }
                             auto old = persistent_decoded_textures.find(decode_key);
-                            // PROSPER_NO_TEXTURE_PREFIX_INHERIT restores the `assign()` spelling:
-                            // free the outgoing buffer, allocate a new one. It exists because
+                            // PROSPER_NO_TEXTURE_PREFIX_INHERIT prevents reusing the outgoing
+                            // allocation. Together with PROSPER_NO_TEXTURE_SOURCE_SNAPSHOT_MOVE it
+                            // restores the `assign()` spelling: free the old buffer, allocate anew.
+                            // It exists because
                             // WITHOUT it this optimisation has no off-switch, and a discriminator
                             // that cannot disable everything the change does is not a
                             // discriminator -- it silently under-reports the change it is
@@ -6742,20 +6771,28 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 cached.source_prefix_size = source_prefix_size;
                                 cached.source_matches_pixels = persistent_source_matches_pixels;
                                 if (!persistent_source_matches_pixels) {
-                                    // Byte-for-byte what `assign(scratch.begin(),
-                                    // scratch.begin() + source_prefix_size)` produced. `resize`
-                                    // before the copy so a SHORT read stores exactly the prefix it
-                                    // read -- `source_prefix.size()` is compared against
-                                    // `persistent_source_size` on the validation path, so growing
-                                    // it to the inherited buffer's extent would silently change
-                                    // which entries revalidate. Shrinking keeps the capacity, which
-                                    // is the whole point.
-                                    cached.source_prefix = std::move(inherited_source_prefix);
-                                    cached.source_prefix.resize(source_prefix_size);
-                                    if (source_prefix_size)
-                                        std::memcpy(cached.source_prefix.data(),
-                                                    persistent_validation_scratch.data(),
-                                                    source_prefix_size);
+                                    static const bool transfer_source_snapshot =
+                                        PROSPER_ENV_VALUE("PROSPER_NO_TEXTURE_SOURCE_SNAPSHOT_MOVE") == nullptr;
+                                    const auto handoff_start = timing_enabled
+                                        ? RenderClock::now() : RenderClock::time_point{};
+                                    auto snapshot = take_texture_source_snapshot(
+                                        persistent_validation_scratch, inherited_source_prefix,
+                                        source_prefix_size, transfer_source_snapshot);
+                                    const bool transferred = snapshot.transferred;
+                                    cached.source_prefix = std::move(snapshot.bytes);
+                                    if (transferred)
+                                        g_texture_decode_scope.source_snapshot_transferred_bytes += source_prefix_size;
+                                    else
+                                        g_texture_decode_scope.source_snapshot_copied_bytes += source_prefix_size;
+                                    if (timing_enabled) {
+                                        pending_timing.tex_source_snapshot_handoff_ms +=
+                                            std::chrono::duration<double, std::milli>(
+                                                RenderClock::now() - handoff_start).count();
+                                        if (transferred)
+                                            pending_timing.tex_source_snapshot_transferred_bytes += source_prefix_size;
+                                        else
+                                            pending_timing.tex_source_snapshot_copied_bytes += source_prefix_size;
+                                    }
                                 }
                                 cached.pixels = std::make_shared<const std::vector<uint8_t>>(
                                     std::move(texture_pixels));
@@ -7165,6 +7202,11 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             if (const uint8_t* source = direct_resource(r.gpu_addr, nb)) {
                                 fr.dwords_view = reinterpret_cast<const uint32_t*>(source);
                                 fr.dwords_view_count = nb / sizeof(uint32_t);
+                                // Hosted/capture views can advertise the same guest identity while
+                                // supplying different bytes. Only this actual guest mapping may
+                                // authorize write-watch validation in the retained-upload backend.
+                                if (!r.host_data && reinterpret_cast<uintptr_t>(source) == r.gpu_addr)
+                                    fr.direct_guest_buffer_addr = r.gpu_addr;
                                 resource_buffer_view = true;
                             }
                             if (timing_enabled)
@@ -10430,6 +10472,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     record.frontend_tex_persist_hit_ms = pending_timing.tex_persist_hit_ms;
                     record.frontend_tex_persist_reuse_ms = pending_timing.tex_persist_reuse_ms;
                     record.frontend_tex_persist_miss_ms = pending_timing.tex_persist_miss_ms;
+                    record.frontend_tex_source_snapshot_handoff_ms = pending_timing.tex_source_snapshot_handoff_ms;
+                    record.frontend_tex_source_snapshot_copied_bytes = pending_timing.tex_source_snapshot_copied_bytes;
+                    record.frontend_tex_source_snapshot_transferred_bytes = pending_timing.tex_source_snapshot_transferred_bytes;
                     record.frontend_tex_persist_invalid_ms = pending_timing.tex_persist_invalid_ms;
                     record.frontend_tex_persist_invalid_n = pending_timing.tex_persist_invalid_n;
                     record.frontend_tex_other_n = pending_timing.tex_other_n;
@@ -10466,6 +10511,17 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     record.res_texture_ms = pending_timing.backend_res_texture_ms;
                     record.res_buffer_ms = pending_timing.backend_res_buffer_ms;
                     record.res_buffer_copy_ms = pending_timing.backend_res_buffer_copy_ms;
+                    record.res_buffer_resident_ms = pending_timing.backend_res_buffer_resident_ms;
+                    record.res_buffer_watch_ms = pending_timing.backend_res_buffer_watch_ms;
+                    record.buffer_upload_bytes = pending_timing.buffer_upload_bytes;
+                    record.buffer_resident_hits = pending_timing.buffer_resident_hits;
+                    record.buffer_resident_compared_bytes = pending_timing.buffer_resident_compared_bytes;
+                    record.buffer_resident_reused_bytes = pending_timing.buffer_resident_reused_bytes;
+                    record.buffer_resident_admitted_bytes = pending_timing.buffer_resident_admitted_bytes;
+                    record.buffer_resident_refreshed_bytes = pending_timing.buffer_resident_refreshed_bytes;
+                    record.buffer_resident_watched_bytes = pending_timing.buffer_resident_watched_bytes;
+                    record.buffer_resident_declined_bytes = pending_timing.buffer_resident_declined_bytes;
+                    record.buffer_resident_ineligible_bytes = pending_timing.buffer_resident_ineligible_bytes;
                     record.res_buffer_create_ms = pending_timing.backend_res_buffer_create_ms;
                     record.res_buffer_index_find_ms = pending_timing.backend_res_buffer_index_find_ms;
                     record.res_buffer_index_insert_ms = pending_timing.backend_res_buffer_index_insert_ms;
@@ -10510,6 +10566,17 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     double backend_res_texture_ms = 0, backend_res_texture_upload_ms = 0;
                     double backend_res_texture_bind_ms = 0, backend_res_buffer_ms = 0;
                     double backend_res_buffer_acquire_ms = 0, backend_res_buffer_copy_ms = 0;
+                    double backend_res_buffer_resident_ms = 0;
+                    double backend_res_buffer_watch_ms = 0;
+                    uint64_t buffer_upload_bytes = 0;
+                    uint64_t buffer_resident_hits = 0;
+                    uint64_t buffer_resident_compared_bytes = 0;
+                    uint64_t buffer_resident_reused_bytes = 0;
+                    uint64_t buffer_resident_admitted_bytes = 0;
+                    uint64_t buffer_resident_refreshed_bytes = 0;
+                    uint64_t buffer_resident_watched_bytes = 0;
+                    uint64_t buffer_resident_declined_bytes = 0;
+                    uint64_t buffer_resident_ineligible_bytes = 0;
                     double backend_res_buffer_create_ms = 0;
                     double backend_res_buffer_index_find_ms = 0;
                     double backend_res_buffer_index_insert_ms = 0;
@@ -10619,6 +10686,17 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     timing.backend_res_buffer_ms += pending_timing.backend_res_buffer_ms;
                     timing.backend_res_buffer_acquire_ms += pending_timing.backend_res_buffer_acquire_ms;
                     timing.backend_res_buffer_copy_ms += pending_timing.backend_res_buffer_copy_ms;
+                    timing.backend_res_buffer_resident_ms += pending_timing.backend_res_buffer_resident_ms;
+                    timing.backend_res_buffer_watch_ms += pending_timing.backend_res_buffer_watch_ms;
+                    timing.buffer_upload_bytes += pending_timing.buffer_upload_bytes;
+                    timing.buffer_resident_hits += pending_timing.buffer_resident_hits;
+                    timing.buffer_resident_compared_bytes += pending_timing.buffer_resident_compared_bytes;
+                    timing.buffer_resident_reused_bytes += pending_timing.buffer_resident_reused_bytes;
+                    timing.buffer_resident_admitted_bytes += pending_timing.buffer_resident_admitted_bytes;
+                    timing.buffer_resident_refreshed_bytes += pending_timing.buffer_resident_refreshed_bytes;
+                    timing.buffer_resident_watched_bytes += pending_timing.buffer_resident_watched_bytes;
+                    timing.buffer_resident_declined_bytes += pending_timing.buffer_resident_declined_bytes;
+                    timing.buffer_resident_ineligible_bytes += pending_timing.buffer_resident_ineligible_bytes;
                     timing.backend_res_buffer_create_ms += pending_timing.backend_res_buffer_create_ms;
                     timing.backend_res_buffer_index_find_ms += pending_timing.backend_res_buffer_index_find_ms;
                     timing.backend_res_buffer_index_insert_ms += pending_timing.backend_res_buffer_index_insert_ms;
@@ -10916,6 +10994,17 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             backend_buffers.cached_buffers,
                             backend_buffers.cached_bytes / (1024.0 * 1024.0),
                             (unsigned long long)backend_buffers.evictions);
+                    // Sampled occupancy, not accumulated bytes or an upload working set.
+                    // Detached submission versions consume the owner/byte allowances too.
+                    const auto resident = prosper::test::resident_render_buffer_cache_snapshot();
+                    fprintf(stderr,
+                            "[render-timing] buffer_residency available=%u entries=%zu live_owners=%llu "
+                            "owner_limit=%llu charged_bytes=%llu byte_limit=%llu\n",
+                            unsigned(resident.available), resident.indexed_entries,
+                            (unsigned long long)resident.live_owners,
+                            (unsigned long long)resident.owner_limit,
+                            (unsigned long long)resident.charged_bytes,
+                            (unsigned long long)resident.byte_limit);
                     fprintf(stderr,
                             "[render-timing] publish_source selected=%llu fmt0=%llu unknown=%llu passes_fmt0=%llu\n",
                             (unsigned long long)totals.publish_selected,

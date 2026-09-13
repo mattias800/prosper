@@ -113,6 +113,28 @@ static uint64_t copy_threads_old(const char* t) {
     return parsed > 32ul ? 32ull : static_cast<uint64_t>(parsed);
 }
 
+// --- tests/fixtures/render_runner.h : PROSPER_BACKEND_BUFFER_RESIDENCY_MB ----------------------
+// New strict-only knob: the permissive spelling below is a counterexample, not shipped history.
+// All platforms default to zero; explicit overrides exercise the optional retention path.
+template <uint64_t Default>
+static uint64_t buffer_residency_new(const char* n, const char* t) {
+    return env_u64_or_default_capped(n, t, Default, 2048, "MiB") * 1024ull * 1024ull;
+}
+template <uint64_t Default>
+static uint64_t buffer_residency_permissive(const char* t) {
+    const uint64_t mib = t ? std::strtoull(t, nullptr, 10) : Default;
+    return (mib > 2048 ? 2048 : mib) * 1024ull * 1024ull;
+}
+
+// Explicit lower owner allowance; permissive spelling is a counterexample, not shipped history.
+static uint64_t buffer_owners_new(const char* n, const char* t) {
+    return env_u64_or_default_capped(n, t, 4096, 4096, "owners");
+}
+static uint64_t buffer_owners_permissive(const char* t) {
+    const uint64_t owners = t ? std::strtoull(t, nullptr, 10) : 4096;
+    return owners > 4096 ? 4096 : owners;
+}
+
 // --- tests/fixtures/render_runner.h : PROSPER_BACKEND_BUFFER_ARENA_KB --------------------------
 static uint64_t arena_new(const char* n, const char* t) {
     const uint64_t kib = env_u64_or_default_capped(n, t, 1024ull, UINT64_MAX / 1024ull, "KiB");
@@ -311,6 +333,21 @@ static const uint64_t kMiB = 1024ull * 1024ull;
 static const uint64_t kGiB = 1024ull * kMiB;
 
 static const Site kSites[] = {
+    {"render_runner.h PROSPER_BACKEND_BUFFER_RESIDENCY_OWNERS (lower cap)",
+     "PROSPER_BACKEND_BUFFER_RESIDENCY_OWNERS", buffer_owners_new,
+     buffer_owners_permissive, "256owners", 4096, "256", 256},
+    {"render_runner.h PROSPER_BACKEND_BUFFER_RESIDENCY_OWNERS (zero)",
+     "PROSPER_BACKEND_BUFFER_RESIDENCY_OWNERS", buffer_owners_new,
+     buffer_owners_permissive, "none", 4096, "0", 0},
+    {"render_runner.h PROSPER_BACKEND_BUFFER_RESIDENCY_MB (zero)",
+     "PROSPER_BACKEND_BUFFER_RESIDENCY_MB", buffer_residency_new<0>,
+     buffer_residency_permissive<0>, "-1", 0, "0", 0},
+    {"render_runner.h PROSPER_BACKEND_BUFFER_RESIDENCY_MB (opt-in)",
+     "PROSPER_BACKEND_BUFFER_RESIDENCY_MB", buffer_residency_new<0>,
+     buffer_residency_permissive<0>, "-1", 0, "256", 256ull * kMiB},
+    {"render_runner.h PROSPER_BACKEND_BUFFER_RESIDENCY_MB (cap)",
+     "PROSPER_BACKEND_BUFFER_RESIDENCY_MB", buffer_residency_new<0>,
+     buffer_residency_permissive<0>, "64MiB", 0, "4096", 2048ull * kMiB},
     // A malformed value used to make the cap 1024x TIGHTER than asked for -- which on this knob
     // means "watch essentially nothing", since every range above 8 KiB is then refused a watch.
     // TWO malformed inputs are deliberately absent, for the same reason: `-1` saturates and is then
