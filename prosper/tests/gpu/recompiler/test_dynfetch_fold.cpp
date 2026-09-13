@@ -827,6 +827,34 @@ int main() {
     CHECK(recycled_spill_uses.empty(),
           "kernel 5sr ordinary VGPR write invalidates scalar spill lanes");
 
+    // Warm a code address with spills in v36 and an unrelated write to v37. Then move the
+    // spills to v37 at the SAME address: cached code-only spill metadata must change too.
+    std::vector<uint32_t> changing_spill_code(std::begin(k5sr), std::end(k5sr));
+    changing_spill_code[8] = 0x7E4A02F2u; // v_mov_b32 v37, 1.0
+    // The readlane keeps v37's ordinary write in the compacted fold stream even though no
+    // writelane targets it, so this positive control actually takes the new erase-skip path.
+    changing_spill_code.insert(changing_spill_code.begin() + 9,
+                              {0xD760002Cu, 0x00010125u}); // v_readlane_b32 s44, v37, 0
+    std::vector<SrtUse> changing_spill_uses;
+    for (unsigned repeat = 0; repeat < 2; ++repeat) {
+        changing_spill_uses.clear();
+        resolve_dynamic_fetch(changing_spill_code.data(), changing_spill_code.size(),
+                              seed5n, 4, 72, &changing_spill_uses);
+        CHECK(std::any_of(changing_spill_uses.begin(), changing_spill_uses.end(), [&](const SrtUse& u) {
+                  return u.kind == 1 && u.key == UINT32_MAX && u.use_pc == 19 &&
+                      u.required_size == 16 && std::equal(u.v4.begin(), u.v4.end(), seed5n);
+              }), "an unrelated VGPR write preserves the exact spilled descriptor, including reuse");
+    }
+    for (size_t word : {0u, 2u, 4u, 6u})
+        changing_spill_code[word] = (changing_spill_code[word] & ~0xFFu) | 37u;
+    for (size_t word : {12u, 14u, 16u, 18u})
+        changing_spill_code[word] = (changing_spill_code[word] & ~0x1FFu) | (256u + 37u);
+    changing_spill_uses.clear();
+    resolve_dynamic_fetch(changing_spill_code.data(), changing_spill_code.size(),
+                          seed5n, 4, 72, &changing_spill_uses);
+    CHECK(changing_spill_uses.empty(),
+          "changed shader bytes replace the cached spill-register inventory");
+
     // Kernel 5d: direct T#/S# sharps already occupy the initial PS user SGPRs, so no s_load creates
     // descr8/descr snapshots. The MIMG use must still receive a pc-keyed texture and paired sampler.
     const uint32_t k5d[] = {

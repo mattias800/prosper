@@ -944,6 +944,8 @@ struct DecodedShader {
     std::vector<uint32_t> code;
     std::vector<Rdna2Inst> instructions;
     std::vector<Rdna2Inst> shader_constant_instructions;
+    // Full-stream inventory: specialization may remove a spill but cannot introduce one.
+    std::bitset<256> scalar_spill_written_vgprs;
     size_t source_dwords = 0;
     bool shader_constant_specialized = false;
     bool terminated = false;
@@ -1166,6 +1168,10 @@ std::shared_ptr<const DecodedShader> decode_shader_cached(const uint32_t* code, 
         std::set<int> fetch_vaddr_vgprs;
         std::set<int> zero_mip_vgprs;
         for (const Rdna2Inst& instruction : decoded) {
+            if (instruction.fmt == Rdna2Format::VOP3 && instruction.opcode == 0x361 &&
+                instruction.dst.value >= 0 && instruction.dst.value < 256)
+                result->scalar_spill_written_vgprs.set(
+                    static_cast<size_t>(instruction.dst.value));
             if ((instruction.fmt == Rdna2Format::MUBUF ||
                  instruction.fmt == Rdna2Format::MTBUF) &&
                 instruction.src[0].kind == OperandKind::VGPR)
@@ -1249,7 +1255,7 @@ std::shared_ptr<const DecodedShader> decode_shader_cached(const uint32_t* code, 
         result->bytes = static_cast<uint64_t>(result->code.size()) * sizeof(uint32_t) +
                         static_cast<uint64_t>(result->instructions.size() +
                                               result->shader_constant_instructions.size()) *
-                            sizeof(Rdna2Inst);
+                            sizeof(Rdna2Inst) + sizeof(result->scalar_spill_written_vgprs);
         return result;
     };
 
@@ -3940,8 +3946,14 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
         if (!scalar_spill && in.dst.kind == OperandKind::VGPR) {
             // Any ordinary write replaces the whole vector result. Drop scalar values previously
             // packed into that VGPR's lanes rather than restoring stale descriptor words later.
-            for (uint32_t lane = 0; lane < 64; ++lane)
-                scalar_spill_slots.erase(((uint32_t)in.dst.value << 6) | lane);
+            // Most destinations never hold a scalar spill. The code-only inventory covers all
+            // paths, including spills restored by a branch-state snapshot. Keep the historical
+            // invalidation for out-of-range decoded registers instead of narrowing that behavior.
+            if (in.dst.value < 0 || in.dst.value >= 256 ||
+                decoded->scalar_spill_written_vgprs.test(static_cast<size_t>(in.dst.value))) {
+                for (uint32_t lane = 0; lane < 64; ++lane)
+                    scalar_spill_slots.erase(((uint32_t)in.dst.value << 6) | lane);
+            }
             // Address selectors are scalar VGPR values; ordinary VALU writes replace their exact
             // destination. Multi-dword memory results are payload here, not later ABI selectors.
             if (explicit_ngg_index_provenance && !vector_select && in.dst.value >= 0 &&
