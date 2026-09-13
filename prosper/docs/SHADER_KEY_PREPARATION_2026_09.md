@@ -36,8 +36,8 @@ ordering are unchanged. This is a generic capacity change, with no game-name or 
 `compute_result_compare_group_count` checks the full byte extent against the device's
 `maxStorageBufferRange` and the required group count against `maxComputeWorkGroupCount[0]` before
 narrowing to Vulkan's 32-bit arguments. Both owned and adopted devices populate those limits.
-Unsupported image extents retain a current host snapshot; unsupported buffers keep exact CPU
-comparison. A 256 MiB extent needs 65,536 groups, beyond the conformant limit of 65,535 on some
+Otherwise eligible image extents rejected by this device-limit guard retain a current host
+snapshot; unsupported buffers keep exact CPU comparison. A 256 MiB extent needs 65,536 groups, beyond the conformant limit of 65,535 on some
 devices, so increasing retention without this guard would expose an invalid dispatch.
 
 The requested cache charge in Sonic rises from 255 to **510 MiB**. That is not physical GPU memory

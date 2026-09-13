@@ -89,7 +89,8 @@ Unchanged writeback preserves watch-promotion progress already earned by exact s
 it neither resets that progress nor counts it a second time. Changed content resets progress.
 `compute_result_compare_group_count()` checks the real device's storage-descriptor range and
 X-dispatch limit before GPU baseline retention or comparison. Unsupported extents keep exact CPU
-comparison; storage images retain the current host snapshot instead of transferring GPU ownership.
+comparison; otherwise eligible storage images rejected by the device-limit guard retain the
+current host snapshot instead of transferring GPU ownership.
 
 `PROSPER_COMPUTE_BUFFER_TIMING=1` emits `[compute-buffer-timing]` records after cleanup. Use
 `PROSPER_COMPUTE_TIMING_CODE` / `PROSPER_COMPUTE_TIMING_HASH` to select a program and
