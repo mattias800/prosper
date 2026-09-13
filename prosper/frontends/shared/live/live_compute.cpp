@@ -1184,7 +1184,7 @@ bool persistent_compute_buffer_result_enabled(uint32_t bytes) {
         std::getenv("PROSPER_NO_PERSISTENT_COMPUTE_BUFFER_RESULTS") == nullptr;
     static const uint64_t minimum = [] {
         const char* value = std::getenv("PROSPER_COMPUTE_BUFFER_RESULT_MIN_MB");
-        uint64_t mib = 16;
+        uint64_t mib = 8;
         if (value && *value) {
             char* end = nullptr;
             const uint64_t parsed = std::strtoull(value, &end, 10);
@@ -1193,9 +1193,9 @@ bool persistent_compute_buffer_result_enabled(uint32_t bytes) {
         return mib > UINT64_MAX / (1024ull * 1024ull)
             ? UINT64_MAX : mib * 1024ull * 1024ull;
     }();
-    // Below 16 MiB the extra GPU dispatch is neutral on the measured integrated device; the exact
-    // CPU comparison is cheaper and avoids doubling that cache entry's allocation. Keep the
-    // crossover configurable for discrete GPUs and for compact production-backend tests.
+    // Budgeted near-16 MiB owners benefit from exact GPU comparison once idle owners retire.
+    // Keep sub-8 MiB bindings on the CPU; the crossover remains configurable for other devices
+    // and compact production-backend tests.
     return enabled && bytes >= minimum;
 }
 
