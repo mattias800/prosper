@@ -1184,7 +1184,7 @@ bool persistent_compute_buffer_result_enabled(uint32_t bytes) {
         std::getenv("PROSPER_NO_PERSISTENT_COMPUTE_BUFFER_RESULTS") == nullptr;
     static const uint64_t minimum = [] {
         const char* value = std::getenv("PROSPER_COMPUTE_BUFFER_RESULT_MIN_MB");
-        uint64_t mib = 16;
+        uint64_t mib = 8;
         if (value && *value) {
             char* end = nullptr;
             const uint64_t parsed = std::strtoull(value, &end, 10);
@@ -1193,9 +1193,9 @@ bool persistent_compute_buffer_result_enabled(uint32_t bytes) {
         return mib > UINT64_MAX / (1024ull * 1024ull)
             ? UINT64_MAX : mib * 1024ull * 1024ull;
     }();
-    // Below 16 MiB the extra GPU dispatch is neutral on the measured integrated device; the exact
-    // CPU comparison is cheaper and avoids doubling that cache entry's allocation. Keep the
-    // crossover configurable for discrete GPUs and for compact production-backend tests.
+    // Budgeted near-16 MiB owners benefit from exact GPU comparison once idle owners retire.
+    // Keep sub-8 MiB bindings on the CPU; the crossover remains configurable for other devices
+    // and compact production-backend tests.
     return enabled && bytes >= minimum;
 }
 
@@ -2131,16 +2131,24 @@ struct VulkanComputeContext {
         snapshot_reason_rmw_bytes += copied;
     }
 
-    bool make_buffer_cache_room(VkDeviceSize bytes) {
+    bool make_buffer_cache_room(VkDeviceSize bytes, bool idle_only = false) {
         const VkDeviceSize limit = persistent_compute_buffer_limit();
         if (bytes > limit) return false;
         if (buffer_cache_bytes <= limit - bytes) return true;
         // A refusal must not destroy reusable entries first. Pins cover both the primary buffer
         // and any result-baseline handle borrowed by an in-flight BoundBuffer.
         const VkDeviceSize needed = buffer_cache_bytes - (limit - bytes);
+        // Optional result baselines may retire old owners, but must never compete with a recently
+        // accessed primary working set. This is a cache-access grace period, not elapsed time.
+        // Pins remain authoritative even after arbitrarily many accesses by other buffers.
+        auto can_reclaim = [&](const CachedComputeBuffer& cached) {
+            return !cached.pins && (!idle_only ||
+                (cached.last_use <= buffer_cache_clock &&
+                 buffer_cache_clock - cached.last_use >= 256));
+        };
         VkDeviceSize reclaimable = 0;
         for (const auto& [key, cached] : buffer_cache) {
-            if (cached.pins) continue;
+            if (!can_reclaim(cached)) continue;
             reclaimable += cached.allocation_bytes;
             if (reclaimable >= needed) break;
         }
@@ -2148,7 +2156,7 @@ struct VulkanComputeContext {
         while (buffer_cache_bytes > limit - bytes) {
             auto victim = buffer_cache.end();
             for (auto it = buffer_cache.begin(); it != buffer_cache.end(); ++it) {
-                if (it->second.pins) continue;
+                if (!can_reclaim(it->second)) continue;
                 // Optional comparisons must not displace the input/result allocation they exist
                 // to accelerate. Reclaim the oldest unpinned baseline before an entire primary.
                 const bool has_result = it->second.result_buffer != VK_NULL_HANDLE;
@@ -2412,10 +2420,16 @@ struct VulkanComputeContext {
         if (vkCreateBuffer(device, &bci, nullptr, &buffer) != VK_SUCCESS) return false;
         VkMemoryRequirements requirements{};
         vkGetBufferMemoryRequirements(device, buffer, &requirements);
-        // Baselines use spare residency only. Evicting another primary (or cycling its baseline)
-        // here can turn a fitting primary working set into a miss and full-copy loop.
+        // Keep the recent primary working set intact. A full-cache census found old owners can
+        // otherwise strand enough capacity for useful comparisons indefinitely. Admission proves
+        // the complete request fits before reclaiming anything; pinned and recent owners are excluded.
+        static const bool reclaim_idle =
+            std::getenv("PROSPER_NO_IDLE_COMPUTE_BUFFER_RECLAIM") == nullptr;
         const VkDeviceSize limit = persistent_compute_buffer_limit();
-        if (requirements.size > limit || buffer_cache_bytes > limit - requirements.size) {
+        const bool fits = requirements.size <= limit &&
+            (buffer_cache_bytes <= limit - requirements.size ||
+             (reclaim_idle && make_buffer_cache_room(requirements.size, true)));
+        if (!fits) {
             timing.baseline = "budget";
             vkDestroyBuffer(device, buffer, nullptr);
             return false;
@@ -11944,6 +11958,34 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     // cleanup() would destroy/recycle command resources and release borrowed renderer-image pins
     // that the GPU may still own. Deliberately retain this raw-handle closure; the sticky entry
     // check prevents reuse and the atexit handler retains the context itself.
+    // Diagnostic snapshots observe pins before cleanup releases this dispatch's owners. Copy only
+    // metadata, never resource contents, and emit after the phase clocks have stopped. The copy's
+    // cost remains in cleanup timing; census runs are observations, not uninstrumented throughput.
+    struct BufferCacheCensusRow {
+        ComputeBufferCacheKey key;
+        VkDeviceSize primary_bytes, result_bytes;
+        uint64_t last_use;
+        uint32_t pins;
+        bool content_valid;
+    };
+    std::vector<BufferCacheCensusRow> cache_census;
+    static const bool cache_census_enabled =
+        std::getenv("PROSPER_COMPUTE_BUFFER_CACHE_CENSUS") != nullptr;
+    const bool collect_cache_census = buffer_timing && cache_census_enabled;
+    const uint64_t cache_census_clock = ctx.buffer_cache_clock;
+    const size_t cache_census_entries = ctx.buffer_cache.size();
+    const VkDeviceSize cache_census_bytes = ctx.buffer_cache_bytes;
+    if (collect_cache_census) {
+        constexpr size_t max_rows = 256;
+        cache_census.reserve(std::min(ctx.buffer_cache.size(), max_rows));
+        for (const auto& [key, cached] : ctx.buffer_cache) {
+            if (cache_census.size() == max_rows) break;
+            cache_census.push_back({key,
+                cached.allocation_bytes - cached.result_allocation_bytes,
+                cached.result_allocation_bytes, cached.last_use, cached.pins,
+                cached.content_valid});
+        }
+    }
     if (!ctx.completion_unproven) cleanup();
     const auto phase_cleanup = ComputeClock::now();
     auto phase_milliseconds = [](auto begin, auto end) {
@@ -11979,6 +12021,38 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                      pack_ms, layout_ms, image_notify_ms, image_cache_ms,
                      phase_milliseconds(phase_writeback, phase_cleanup),
                      phase_milliseconds(phase_start, phase_cleanup), item.required_subgroup_size);
+    }
+    if (collect_cache_census) {
+        std::fprintf(stderr,
+            "[compute-buffer-cache] submit=%llu dispatch=%llu order=%llu "
+            "code=0x%llx hash=0x%016llx ok=%u phase=before-cleanup "
+            "clock=%llu entries=%zu emitted=%zu complete=%u bytes=%llu limit=%llu "
+            "completion-unproven=%u\n",
+            (unsigned long long)item.submit_no, (unsigned long long)item.dispatch_index,
+            (unsigned long long)item.command_order, (unsigned long long)item.code_addr,
+            (unsigned long long)timing_program_hash, ok ? 1u : 0u,
+            (unsigned long long)cache_census_clock, cache_census_entries, cache_census.size(),
+            cache_census.size() == cache_census_entries ? 1u : 0u,
+            (unsigned long long)cache_census_bytes,
+            (unsigned long long)persistent_compute_buffer_limit(),
+            ctx.completion_unproven ? 1u : 0u);
+        for (const auto& row : cache_census) {
+            std::fprintf(stderr,
+                "[compute-buffer-cache-owner] submit=%llu dispatch=%llu order=%llu "
+                "code=0x%llx hash=0x%016llx addr=0x%llx host-key=0x%llx bytes=%u "
+                "semantic=%u logical-bytes=%llu binding-bytes=%llu "
+                "primary-allocation-bytes=%llu result-allocation-bytes=%llu "
+                "last-use=%llu pins=%u content-valid=%u\n",
+                (unsigned long long)item.submit_no, (unsigned long long)item.dispatch_index,
+                (unsigned long long)item.command_order, (unsigned long long)item.code_addr,
+                (unsigned long long)timing_program_hash, (unsigned long long)row.key.gpu_addr,
+                (unsigned long long)row.key.host_data, row.key.bytes,
+                static_cast<unsigned>(row.key.materialization.semantic),
+                (unsigned long long)row.key.materialization.logical_bytes,
+                (unsigned long long)row.key.materialization.binding_bytes,
+                (unsigned long long)row.primary_bytes, (unsigned long long)row.result_bytes,
+                (unsigned long long)row.last_use, row.pins, row.content_valid ? 1u : 0u);
+        }
     }
     // Emit only after timers/cleanup. Resource descriptions belong to buffer_resources, whose
     // lifetime covers this report even though cleanup has released the device allocations.

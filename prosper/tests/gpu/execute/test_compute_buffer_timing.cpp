@@ -118,7 +118,7 @@ int main(int argc, char** argv) {
     const bool promotion = mode == "promotion" || mode == "promotion-cpu";
     const bool cpu_result = mode == "promotion-cpu";
     if (mode != "selected" && mode != "wrong-code" && mode != "wrong-hash" &&
-        mode != "disabled" && mode != "capture-idle" && mode != "capture-armed" &&
+        mode != "cache-census" && mode != "disabled" && mode != "capture-idle" && mode != "capture-armed" &&
         !promotion && !hosted_overlap) return 2;
     env("PROSPER_COMPUTELOG", nullptr);
     env("PROSPER_COMPUTELOG_CODE", nullptr);
@@ -328,6 +328,12 @@ int main(int argc, char** argv) {
     run(7);
     check(second.correct(), "separate second owner receives its own shader result");
     check(notifications == 8, "six alias dispatches plus two distinct owners publish once each");
+    if (mode == "cache-census") {
+        item.resources = resources;
+        run(8); // The second cached owner is resident but no longer pinned by this dispatch.
+        check(second.correct() && notifications == 9,
+              "unused resident owner is preserved while the first owner is reused");
+    }
     set_guest_gpu_write_observer({});
     capture.cancel();
     if (!failures) std::fprintf(stderr, "[buffer-timing-fixture] success mode=%s\n", mode.c_str());

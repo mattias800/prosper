@@ -78,7 +78,10 @@ production backend without a frontend or a game dump.
 
 The persistent buffer budget charges primary allocations and optional exact-result baselines.
 Primary admission first proves that enough unpinned storage can be reclaimed, then drops unpinned
-baselines before evicting primary entries. Baseline admission uses spare capacity only. One owner
+baselines before evicting primary entries. Baseline admission uses spare capacity or owners that
+have been unused for at least 256 cache insertions/acquisitions; it proves enough eligible capacity
+exists before any reclamation. Recent and pinned owners remain protected. The diagnostic control
+`PROSPER_NO_IDLE_COMPUTE_BUFFER_RECLAIM=1` restores spare-capacity-only baseline admission. One owner
 pin protects both handles through completion; a failed submission without completion proof keeps
 that pin. Reclaiming a baseline preserves the primary's guest-content validation and write watches.
 Unchanged writeback preserves watch-promotion progress already earned by exact source validation;
@@ -123,6 +126,15 @@ comparison, guest copy/layout, map, host-write-watch notification, baseline crea
 notification, source validation/watch rearming and provenance. Those last two have separate
 `source_validation_ms` and `provenance_ms` fields. Use the existing dispatch phase totals for the
 remaining setup checks and loop overhead; do not claim the sum of owner timers covers all setup.
+
+`PROSPER_COMPUTE_BUFFER_CACHE_CENSUS=1` additionally snapshots up to 256 complete cache keys
+when buffer timing is selected. `compute-buffer-cache` states total/emitted entry counts and
+whether the snapshot is complete; `compute-buffer-cache-owner` rows include separate primary and
+baseline charges, content validity, pins before cleanup, and the existing last-use cache clock.
+The clock counts primary insertions/acquisitions, including failed validations; it is neither time
+nor a completed-dispatch count. Compare full keys and last-use values across snapshots to observe
+reuse. Pins include this dispatch's owners and prohibit reclamation. Census collection adds work
+inside cleanup timing; use it to diagnose residency, disable it for throughput comparisons.
 
 ## Read-only storage images
 

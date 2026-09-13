@@ -51,6 +51,10 @@ passes **9/9 checks** with **zero messages**, after proving layer insertion and 
 
 ## Performance investigation: preserve the existing policy
 
+This section records the decision at #3621. The subsequent
+[complete-cache census and matched admission trials](COMPUTE_BUFFER_IDLE_RESIDENCY_2026_09.md)
+resolve the missing-population question and establish the current 8 MiB default.
+
 The older 16 MiB eligibility threshold came from neutral measurements at 8,355,840 bytes and
 beneficial larger buffers; it did not establish neutrality for every size below 16 MiB. A fresh
 Sonic run therefore tried the existing `PROSPER_COMPUTE_BUFFER_RESULT_MIN_MB=8` control while keeping
