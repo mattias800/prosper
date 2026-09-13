@@ -69,7 +69,7 @@ CPU time. Global allocation samples do not isolate the scratch optimization.
 ## Routed game measurements
 
 All captures use Linux `prosper-app`, AMD Radeon 8060S / RADV, native resolution and full cadence,
-normal windowed presentation, fresh save/cache directories and the committed gameplay routes.
+normal windowed immediate presentation with the FPS overlay, fresh save/cache directories and the committed gameplay routes.
 The machine was reserved for these runs; the known game/build/profiler census found no competing
 workloads. Capture inputs, source cleanliness, executable hashes and route hashes were checked
 before and after each run. F8 reports are complete, and every captured compute phase reports success.
@@ -214,7 +214,7 @@ PROSPER_AUDIO_FLOW=1 PROSPER_AUDIO_DEMAND=1 PROSPER_AUDIO_DUMP_WAV=<RUN>/audio.w
 PROSPER_GRAPHICS_PIPELINE_CACHE_PATH=<RUN>/graphics.bin \
 XDG_CACHE_HOME=<RUN>/cache MESA_SHADER_CACHE_DIR=<RUN>/mesa-cache \
 __GL_SHADER_DISK_CACHE_PATH=<RUN>/nvidia-cache TMPDIR=<RUN>/tmp \
-prosper/build-linux/prosper-app <DUMP_ROOT>/<TITLE_ID>-app0
+prosper/build-linux/prosper-app --dump <DUMP_ROOT>/<TITLE_ID>-app0 --fps --present-mode immediate
 ```
 
 F9 is 330000 ms for Sonic (380-second run) and 310000 ms for GTA (360-second run). Collect
