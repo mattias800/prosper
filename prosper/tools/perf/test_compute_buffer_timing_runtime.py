@@ -177,6 +177,49 @@ def check_promotion(rows, witness):
                 f"promotion arm collected no {timer}")
 
 
+def check_census(lines, rows):
+    summaries = [fields(line, "[compute-buffer-cache] ") for line in lines
+                 if line.startswith("[compute-buffer-cache] ")]
+    owners = [fields(line, "[compute-buffer-cache-owner] ") for line in lines
+              if line.startswith("[compute-buffer-cache-owner] ")]
+    require(len(summaries) == 8, "census must include all eight completed dispatches")
+    key_fields = ("addr", "host-key", "bytes", "semantic", "logical-bytes", "binding-bytes")
+    clocks = []
+    last = {}
+    for dispatch, summary in enumerate(summaries, 1):
+        group = [r for r in owners if number(r, "dispatch") == dispatch]
+        count = 1 if dispatch < 7 else 2
+        require(number(summary, "dispatch") == dispatch and
+                number(summary, "complete") == 1 and
+                number(summary, "entries") == count and number(summary, "emitted") == count and
+                number(summary, "ok") == 1 and number(summary, "completion-unproven") == 0 and
+                summary["phase"] == "before-cleanup", "wrong census summary")
+        require(len(group) == count, "census dropped or duplicated owners")
+        require(len({tuple(r[k] for k in key_fields) for r in group}) == count,
+                "census collapsed distinct keys")
+        require(sum(number(r, "primary-allocation-bytes") +
+                    number(r, "result-allocation-bytes") for r in group) ==
+                number(summary, "bytes"), "census charges do not sum to residency")
+        require(number(summary, "bytes") <= number(summary, "limit"), "cache exceeds cap")
+        clock = number(summary, "clock")
+        clocks.append(clock)
+        active = {number(r, "addr") for r in rows if number(r, "dispatch") == dispatch}
+        for row in group:
+            address = number(row, "addr")
+            require(number(row, "pins") == int(address in active), "wrong pre-cleanup pin count")
+            require(number(row, "primary-allocation-bytes") >= BYTES and
+                    number(row, "result-allocation-bytes") >= BYTES,
+                    "primary and baseline must be separately charged")
+            require(number(row, "last-use") <= clock, "owner access lies after snapshot")
+            if address not in active:
+                require(number(row, "last-use") == last[address], "idle owner falsely looks reused")
+            elif address in last:
+                require(number(row, "last-use") > last[address], "active owner lost reuse evidence")
+            last[address] = number(row, "last-use")
+    require(all(a < b for a, b in zip(clocks, clocks[1:])), "cache clock did not advance")
+    require(len(owners) == 10, "census owner population mismatch")
+
+
 def run_fixture(binary, mode, directory):
     # These tests intentionally control diagnostic/cache policy. Preserve driver/validation
     # settings so running the ctest under the validation-layer wrapper still validates Vulkan.
@@ -184,6 +227,8 @@ def run_fixture(binary, mode, directory):
                    if not key.startswith("PROSPER_COMPUTE") and
                    key not in {"PROSPER_NO_PERSISTENT_COMPUTE_BUFFERS",
                                "PROSPER_NO_PERSISTENT_COMPUTE_BUFFER_RESULTS"}}
+    if mode != "selected":
+        environment["PROSPER_COMPUTE_BUFFER_CACHE_CENSUS"] = "1"
     result = subprocess.run([str(binary), mode, str(directory)], env=environment,
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             text=True, timeout=120, check=False)
@@ -198,12 +243,18 @@ def run_fixture(binary, mode, directory):
     require(len(witnesses) == 1, f"{mode}: expected one fixture identity")
     require(witnesses[0]["mode"] == mode, "fixture mode mismatch")
     rows = [fields(line, PREFIX) for line in lines if line.startswith(PREFIX)]
-    if mode in ("selected", "capture-armed"):
+    census_lines = [line for line in lines if line.startswith("[compute-buffer-cache")]
+    if mode == "cache-census":
+        check_selected([r for r in rows if number(r, "dispatch") <= 7], witnesses[0])
+        check_census(lines, rows)
+    elif mode in ("selected", "capture-armed"):
         check_selected(rows, witnesses[0])
     elif mode in ("promotion", "promotion-cpu"):
         check_promotion(rows, witnesses[0])
     else:
         require(not rows, f"{mode}: rejected selector/capture gate emitted buffer records")
+    if mode in ("selected", "wrong-code", "wrong-hash", "disabled", "capture-idle"):
+        require(not census_lines, f"{mode}: disabled/unselected cache census emitted rows")
     return witnesses[0]
 
 
@@ -215,7 +266,7 @@ def main():
         witnesses = []
         errors = []
         for mode in ("selected", "wrong-code", "wrong-hash", "disabled",
-                     "capture-idle", "capture-armed", "promotion", "promotion-cpu"):
+                     "capture-idle", "capture-armed", "promotion", "promotion-cpu", "cache-census"):
             directory = Path(scratch) / mode
             directory.mkdir()
             try:

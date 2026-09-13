@@ -11944,6 +11944,34 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     // cleanup() would destroy/recycle command resources and release borrowed renderer-image pins
     // that the GPU may still own. Deliberately retain this raw-handle closure; the sticky entry
     // check prevents reuse and the atexit handler retains the context itself.
+    // Diagnostic snapshots observe pins before cleanup releases this dispatch's owners. Copy only
+    // metadata, never resource contents, and emit after the phase clocks have stopped. The copy's
+    // cost remains in cleanup timing; census runs are observations, not uninstrumented throughput.
+    struct BufferCacheCensusRow {
+        ComputeBufferCacheKey key;
+        VkDeviceSize primary_bytes, result_bytes;
+        uint64_t last_use;
+        uint32_t pins;
+        bool content_valid;
+    };
+    std::vector<BufferCacheCensusRow> cache_census;
+    static const bool cache_census_enabled =
+        std::getenv("PROSPER_COMPUTE_BUFFER_CACHE_CENSUS") != nullptr;
+    const bool collect_cache_census = buffer_timing && cache_census_enabled;
+    const uint64_t cache_census_clock = ctx.buffer_cache_clock;
+    const size_t cache_census_entries = ctx.buffer_cache.size();
+    const VkDeviceSize cache_census_bytes = ctx.buffer_cache_bytes;
+    if (collect_cache_census) {
+        constexpr size_t max_rows = 256;
+        cache_census.reserve(std::min(ctx.buffer_cache.size(), max_rows));
+        for (const auto& [key, cached] : ctx.buffer_cache) {
+            if (cache_census.size() == max_rows) break;
+            cache_census.push_back({key,
+                cached.allocation_bytes - cached.result_allocation_bytes,
+                cached.result_allocation_bytes, cached.last_use, cached.pins,
+                cached.content_valid});
+        }
+    }
     if (!ctx.completion_unproven) cleanup();
     const auto phase_cleanup = ComputeClock::now();
     auto phase_milliseconds = [](auto begin, auto end) {
@@ -11979,6 +12007,38 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                      pack_ms, layout_ms, image_notify_ms, image_cache_ms,
                      phase_milliseconds(phase_writeback, phase_cleanup),
                      phase_milliseconds(phase_start, phase_cleanup), item.required_subgroup_size);
+    }
+    if (collect_cache_census) {
+        std::fprintf(stderr,
+            "[compute-buffer-cache] submit=%llu dispatch=%llu order=%llu "
+            "code=0x%llx hash=0x%016llx ok=%u phase=before-cleanup "
+            "clock=%llu entries=%zu emitted=%zu complete=%u bytes=%llu limit=%llu "
+            "completion-unproven=%u\n",
+            (unsigned long long)item.submit_no, (unsigned long long)item.dispatch_index,
+            (unsigned long long)item.command_order, (unsigned long long)item.code_addr,
+            (unsigned long long)timing_program_hash, ok ? 1u : 0u,
+            (unsigned long long)cache_census_clock, cache_census_entries, cache_census.size(),
+            cache_census.size() == cache_census_entries ? 1u : 0u,
+            (unsigned long long)cache_census_bytes,
+            (unsigned long long)persistent_compute_buffer_limit(),
+            ctx.completion_unproven ? 1u : 0u);
+        for (const auto& row : cache_census) {
+            std::fprintf(stderr,
+                "[compute-buffer-cache-owner] submit=%llu dispatch=%llu order=%llu "
+                "code=0x%llx hash=0x%016llx addr=0x%llx host-key=0x%llx bytes=%u "
+                "semantic=%u logical-bytes=%llu binding-bytes=%llu "
+                "primary-allocation-bytes=%llu result-allocation-bytes=%llu "
+                "last-use=%llu pins=%u content-valid=%u\n",
+                (unsigned long long)item.submit_no, (unsigned long long)item.dispatch_index,
+                (unsigned long long)item.command_order, (unsigned long long)item.code_addr,
+                (unsigned long long)timing_program_hash, (unsigned long long)row.key.gpu_addr,
+                (unsigned long long)row.key.host_data, row.key.bytes,
+                static_cast<unsigned>(row.key.materialization.semantic),
+                (unsigned long long)row.key.materialization.logical_bytes,
+                (unsigned long long)row.key.materialization.binding_bytes,
+                (unsigned long long)row.primary_bytes, (unsigned long long)row.result_bytes,
+                (unsigned long long)row.last_use, row.pins, row.content_valid ? 1u : 0u);
+        }
     }
     // Emit only after timers/cleanup. Resource descriptions belong to buffer_resources, whose
     // lifetime covers this report even though cleanup has released the device allocations.

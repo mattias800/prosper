@@ -124,6 +124,15 @@ notification, source validation/watch rearming and provenance. Those last two ha
 `source_validation_ms` and `provenance_ms` fields. Use the existing dispatch phase totals for the
 remaining setup checks and loop overhead; do not claim the sum of owner timers covers all setup.
 
+`PROSPER_COMPUTE_BUFFER_CACHE_CENSUS=1` additionally snapshots up to 256 complete cache keys
+when buffer timing is selected. `compute-buffer-cache` states total/emitted entry counts and
+whether the snapshot is complete; `compute-buffer-cache-owner` rows include separate primary and
+baseline charges, content validity, pins before cleanup, and the existing last-use cache clock.
+The clock counts primary insertions/acquisitions, including failed validations; it is neither time
+nor a completed-dispatch count. Compare full keys and last-use values across snapshots to observe
+reuse. Pins include this dispatch's owners and prohibit reclamation. Census collection adds work
+inside cleanup timing; use it to diagnose residency, disable it for throughput comparisons.
+
 ## Read-only storage images
 
 Storage descriptor class does not imply an output. Omit output staging, masks, retile, comparisons,
