@@ -21,6 +21,24 @@ from the tracker issues, and still gated, because it is a projection of state ra
 
 ## 2026-09-13
 
+### Making room for exact comparisons
+
+Sonic retains its known black world and HUD, while GTA retains the lit Performance Story bank;
+[the cache comparison saving repeats, without an established FPS gain](prosper/docs/COMPUTE_BUFFER_IDLE_RESIDENCY_2026_09.md).
+
+*Linux `prosper-app`, Sonic gameplay route: census, policy control/enabled, then former/new defaults.*
+
+![Sonic black world and HUD, residency-census-sonic](assets/screenshots/3407-residency-census-sonic.webp)
+![Sonic black world and HUD, idle-control-sonic](assets/screenshots/3407-idle-control-sonic.webp)
+![Sonic black world and HUD, idle-enabled-sonic](assets/screenshots/3407-idle-enabled-sonic.webp)
+![Sonic black world and HUD, default-control-sonic](assets/screenshots/3407-default-control-sonic.webp)
+![Sonic black world and HUD, default-enabled-sonic](assets/screenshots/3407-default-enabled-sonic.webp)
+
+*Linux `prosper-app`, GTA Performance Story route: former defaults, then new defaults.*
+
+![GTA lit bank, default-control-gta](assets/screenshots/3407-default-control-gta.webp)
+![GTA lit bank, default-enabled-gta](assets/screenshots/3407-default-enabled-gta.webp)
+
 ### A correct comparison still needs correct write order
 
 An overlapping private output could make a later “unchanged” result skip a necessary write;

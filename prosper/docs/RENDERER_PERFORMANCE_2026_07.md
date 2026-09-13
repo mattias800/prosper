@@ -1465,8 +1465,10 @@ first five iterations:
 
 The replay owns resource bytes as `host_data`, so its repeated setup scan is not representative of the
 live guest-write-provenance fast path; the comparison isolates the result-side tradeoff. The adjacent
-8,355,840-byte result was neutral (2.02 versus 2.04 ms total), so GPU result baselines default to a
-measured **16 MiB crossover** instead of doubling every persistent buffer. Set
+8,355,840-byte result was neutral (2.02 versus 2.04 ms total), so the original GPU result baseline
+policy selected a **16 MiB threshold** instead of doubling every persistent buffer. The later
+[complete-cache residency measurements](COMPUTE_BUFFER_IDLE_RESIDENCY_2026_09.md) admit otherwise
+unchanged 15.9375 MiB outputs and set the current default to **8 MiB**, with bounded idle reclamation. Set
 `PROSPER_COMPUTE_BUFFER_RESULT_MIN_MB` to retune it, or
 `PROSPER_NO_PERSISTENT_COMPUTE_BUFFER_RESULTS=1` for an exact A/B. The production-backend test runs an
 idempotent one-MiB buffer with the test threshold lowered, requires the normal invalidation on the
