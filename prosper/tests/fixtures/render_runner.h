@@ -505,7 +505,14 @@ inline bool backend_texture_array_span_valid(const FrameResource& resource) {
 inline bool backend_texture_plane_span_valid(const FrameResource& resource) {
     if (resource.gpu_detile) {
         const auto& upload = *resource.gpu_detile;
-        return !resource.tex_rgba && !resource.is_storage_image &&
+        const bool raw = upload.program && upload.program->output_kind ==
+            prosper::gpu::Float16DetileOutput::RawUvec4;
+        return !resource.tex_rgba && resource.is_storage_image == raw &&
+               (!raw || (resource.img_dim == 1 && resource.storage_image_contract_valid &&
+                         resource.storage_image_numeric_class == prosper::gpu::SpirvImageNumericClass::Uint)) &&
+               (!resource.storage_image_writeback ||
+                (raw && !std::getenv("PROSPER_NO_BACKEND_TEXTURE_SHARE") &&
+                 upload.readback.buffer && upload.readback.memory && upload.readback.mapped)) &&
                !resource.has_uniform_color && !resource.persistent_texture_id &&
                !resource.persistent_render_target_id && !resource.persistent_depth_target_id &&
                !resource.borrowed_compute_image &&
@@ -514,7 +521,7 @@ inline bool backend_texture_plane_span_valid(const FrameResource& resource) {
                resource.sample_count == 1 && resource.td == 1 &&
                resource.declared_mip_levels == 1 &&
                resource.tw == upload.width && uint64_t(resource.th) == uint64_t(upload.height) * upload.faces &&
-               resource.texture_format == VK_FORMAT_R8G8B8A8_UNORM &&
+               resource.texture_format == (raw ? VK_FORMAT_R32G32B32A32_UINT : VK_FORMAT_R8G8B8A8_UNORM) &&
                upload.program && upload.program->pipeline && upload.input && upload.output &&
                upload.descriptors;
     }
@@ -1228,7 +1235,7 @@ struct RenderVkCtx {
     bool queue_supports_compute = false;
     // Same intentional process lifetime as the device; creation is protected by
     // BackendPersistentResourceGuard, including frontend preflight calls.
-    mutable std::array<GpuDetilePipeline*, 2> detile_pipelines{};
+    mutable std::array<GpuDetilePipeline*, 4> detile_pipelines{};
     VkShaderStageFlags required_subgroup_size_stages = 0;
     VkShaderStageFlags subgroup_stages = 0;
     VkSubgroupFeatureFlags subgroup_operations = 0;
@@ -1832,20 +1839,25 @@ inline std::shared_ptr<GpuDetileUpload> prepare_render_gpu_detile(
     uint32_t width, uint32_t height, uint32_t faces, uint64_t guest_base,
     uint64_t face_stride, uint64_t mip_offset,
     const std::function<size_t(uint8_t*, uint64_t, size_t)>& copy_source,
-    uint32_t components = 4) {
-    if (components != 2 && components != 4) return {};
+    uint32_t components = 4,
+    prosper::gpu::Float16DetileOutput output = prosper::gpu::Float16DetileOutput::Rgba8,
+    bool writable = false) {
+    if ((components != 2 && components != 4) ||
+        (output != prosper::gpu::Float16DetileOutput::Rgba8 &&
+         output != prosper::gpu::Float16DetileOutput::RawUvec4)) return {};
     BackendPersistentResourceGuard guard;
     const auto& ctx = render_vk_ctx();
     if (!ctx.ok || !ctx.queue_supports_compute) return {};
-    auto& pipeline = ctx.detile_pipelines[components == 2 ? 0 : 1];
+    auto& pipeline = ctx.detile_pipelines[(components == 2 ? 0 : 1) +
+        (output == prosper::gpu::Float16DetileOutput::RawUvec4 ? 2 : 0)];
     if (!pipeline) {
         auto program = std::make_unique<GpuDetilePipeline>();
-        if (!program->initialize(ctx.dev, components)) return {};
+        if (!program->initialize(ctx.dev, components, output)) return {};
         pipeline = program.release(); // lifetime matches the retained device
     }
     return prepare_gpu_detile_upload(*pipeline, ctx.phys, ctx.detile_limits,
                                      width, height, faces, guest_base, face_stride,
-                                     mip_offset, copy_source);
+                                     mip_offset, copy_source, writable);
 }
 
 // Explicit snapshot for frontends that use _Exit. Do not initialize a renderer during shutdown
@@ -8757,6 +8769,13 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                             // (Evergate's title froze the publish rate — snapshot-gate catch).
                             if (r.gpu_detile) {
                                 upload.gpu_detile = r.gpu_detile;
+                                // Borrow the upload owner's separate mapped result buffer. The
+                                // ordinary storage completion/writeback path below remains in charge.
+                                const auto& readback = r.gpu_detile->readback;
+                                upload.staging = readback.buffer;
+                                upload.staging_memory = readback.memory;
+                                upload.staging_mapped = readback.mapped;
+                                upload.staging_lease = readback.lease;
                             } else if (r.has_uniform_color) {
                                 upload.uniform_clear = true;
                                 std::copy(r.uniform_color.begin(), r.uniform_color.end(),
@@ -11690,7 +11709,10 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 }
                 // #3405: the cache owns its blocks and answers true even for a duplicate
                 // release, so the generic teardown can never free an allocation it still maps.
-                if (!release_mapped_staging(dev, upload.staging, upload.staging_memory,
+                if (upload.gpu_detile && upload.staging == upload.gpu_detile->readback.buffer) {
+                    // Its immutable snapshot owner retains this lease through completion;
+                    // releasing it here would return a still-owned mapping to the idle pool.
+                } else if (!release_mapped_staging(dev, upload.staging, upload.staging_memory,
                                             upload.staging_mapped, upload.staging_lease)) {
                     if (upload.staging) vkDestroyBuffer(dev, upload.staging, nullptr);
                     if (upload.staging_memory)

@@ -275,8 +275,9 @@ std::vector<uint32_t> build_compute_compare_uvec4() {
     return e.assemble();
 }
 
-std::vector<uint32_t> build_compute_detile_float16(uint32_t components) {
-  if (components != 2 && components != 4) return {};
+std::vector<uint32_t> build_compute_detile_float16(uint32_t components, Float16DetileOutput output_kind) {
+  if ((components != 2 && components != 4) ||
+      (output_kind != Float16DetileOutput::Rgba8 && output_kind != Float16DetileOutput::RawUvec4)) return {};
   Emitter e;
   // Integer-only conversion: the source's half bits, including NaNs/subnormals,
   // are preserved by raw buffer loads rather than native float16 operations.
@@ -395,39 +396,79 @@ std::vector<uint32_t> build_compute_detile_float16(uint32_t components) {
                     binary(Op_ShiftRightLogical, byte_offset, constant(2)))));
   const uint32_t raw[2] = {load(source, address), components == 4 ?
       load(source, binary(Op_IAdd, address, constant(1))) : 0};
-  // Missing channels follow the CPU sampled conversion: B=0, A=1.
-  uint32_t packed = constant(components == 2 ? 0xff000000u : 0);
-  for (uint32_t channel = 0; channel < components; ++channel) {
-    const auto half = binary(Op_BitwiseAnd,
-                             binary(Op_ShiftRightLogical, raw[channel / 2],
-                                    constant((channel % 2) * 16)),
-                             constant(65535));
-    // All evaluated shifts stay in range, even for values subsequently rejected
-    // by OpSelect. Only exponents 6..14 use the arithmetic result.
-    const auto exponent =
-        binary(Op_BitwiseAnd, binary(Op_ShiftRightLogical, half, constant(10)),
-               constant(15));
-    const auto shift = binary(Op_ISub, constant(25), exponent);
-    const auto numerator = binary(
-        Op_IAdd,
-        binary(Op_IMul,
-               binary(Op_IAdd, binary(Op_BitwiseAnd, half, constant(1023)),
-                      constant(1024)),
-               constant(255)),
-        binary(Op_ShiftLeftLogical, constant(1),
-               binary(Op_ISub, shift, constant(1))));
-    auto value =
-        select(less(half, constant(0x3c00)),
-               binary(Op_ShiftRightLogical, numerator, shift), constant(255));
-    value = select(less(half, constant(0x7c00)), value, constant(0));
-    value = select(less(half, constant(0x1800)), constant(0), value);
-    packed = binary(Op_BitwiseOr, packed,
-                    binary(Op_ShiftLeftLogical, value, constant(channel * 8)));
+  auto store = [&](uint32_t word, uint32_t value) {
+    const auto destination = e.id();
+    Emitter::put(e.code, Op_AccessChain,
+                 {word_ptr, destination, output, constant(0), word});
+    Emitter::put(e.code, Op_Store, {destination, value});
+  };
+  if (output_kind == Float16DetileOutput::RawUvec4) {
+    for (uint32_t channel = 0; channel < 4; ++channel) {
+      uint32_t value = constant(channel == 3 ? 0x3f800000u : 0);
+      if (channel < components) {
+        const auto half = binary(Op_BitwiseAnd,
+            binary(Op_ShiftRightLogical, raw[channel / 2], constant((channel % 2) * 16)),
+            constant(65535));
+        const auto mantissa = binary(Op_BitwiseAnd, half, constant(1023));
+        const auto exponent = binary(Op_BitwiseAnd,
+            binary(Op_ShiftRightLogical, half, constant(10)), constant(31));
+        const auto fraction = binary(Op_ShiftLeftLogical, mantissa, constant(13));
+        const auto normal = binary(Op_BitwiseOr, fraction,
+            binary(Op_ShiftLeftLogical, binary(Op_IAdd, exponent, constant(112)), constant(23)));
+        const auto exceptional = binary(Op_BitwiseOr, fraction, constant(0x7f800000u));
+        // Fill below the most significant mantissa bit. Its population gives
+        // floor(log2(mantissa))+1 without floating operations or optional features.
+        auto filled = mantissa;
+        for (uint32_t shift : {1u, 2u, 4u, 8u})
+          filled = binary(Op_BitwiseOr, filled,
+              binary(Op_ShiftRightLogical, filled, constant(shift)));
+        const auto bits = e.id();
+        Emitter::put(e.code, Op_BitCount, {uint_t, bits, filled});
+        const auto shift = binary(Op_ISub, constant(11), bits);
+        auto subnormal = binary(Op_BitwiseOr,
+            binary(Op_ShiftLeftLogical, binary(Op_ISub, constant(113), shift), constant(23)),
+            binary(Op_ShiftLeftLogical, binary(Op_BitwiseAnd,
+                binary(Op_ShiftLeftLogical, mantissa, shift), constant(1023)), constant(13)));
+        subnormal = select(less(mantissa, constant(1)), constant(0), subnormal);
+        value = select(less(exponent, constant(1)), subnormal,
+            select(less(exponent, constant(31)), normal, exceptional));
+        value = binary(Op_BitwiseOr, value,
+            binary(Op_ShiftLeftLogical, binary(Op_BitwiseAnd, half, constant(0x8000)), constant(16)));
+      }
+      store(binary(Op_IAdd, binary(Op_IMul, index, constant(4)), constant(channel)), value);
+    }
+  } else {
+    // Missing channels follow the CPU sampled conversion: B=0, A=1.
+    uint32_t packed = constant(components == 2 ? 0xff000000u : 0);
+    for (uint32_t channel = 0; channel < components; ++channel) {
+      const auto half = binary(Op_BitwiseAnd,
+                               binary(Op_ShiftRightLogical, raw[channel / 2],
+                                      constant((channel % 2) * 16)),
+                               constant(65535));
+      // All evaluated shifts stay in range, even for values subsequently rejected
+      // by OpSelect. Only exponents 6..14 use the arithmetic result.
+      const auto exponent =
+          binary(Op_BitwiseAnd, binary(Op_ShiftRightLogical, half, constant(10)),
+                 constant(15));
+      const auto shift = binary(Op_ISub, constant(25), exponent);
+      const auto numerator = binary(
+          Op_IAdd,
+          binary(Op_IMul,
+                 binary(Op_IAdd, binary(Op_BitwiseAnd, half, constant(1023)),
+                        constant(1024)),
+                 constant(255)),
+          binary(Op_ShiftLeftLogical, constant(1),
+                 binary(Op_ISub, shift, constant(1))));
+      auto value =
+          select(less(half, constant(0x3c00)),
+                 binary(Op_ShiftRightLogical, numerator, shift), constant(255));
+      value = select(less(half, constant(0x7c00)), value, constant(0));
+      value = select(less(half, constant(0x1800)), constant(0), value);
+      packed = binary(Op_BitwiseOr, packed,
+                      binary(Op_ShiftLeftLogical, value, constant(channel * 8)));
+    }
+    store(index, packed);
   }
-  const auto destination = e.id();
-  Emitter::put(e.code, Op_AccessChain,
-               {word_ptr, destination, output, constant(0), index});
-  Emitter::put(e.code, Op_Store, {destination, packed});
   Emitter::put(e.code, Op_Branch, {done});
   Emitter::put(e.code, Op_Label, {done});
   Emitter::put(e.code, Op_Return, {});

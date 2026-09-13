@@ -4997,14 +4997,15 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         }
                         // Keep established persistent CPU decodes: replacing a cache miss with an
                         // unretained GPU conversion would repeat that work on every later submit.
-                        const bool gpu_detile_2d_shape = r.cls == RC::Texture && r.img_dim == 1u &&
+                        const bool gpu_detile_2d_shape =
+                            ((r.cls == RC::Texture && !persistent_cache_eligible) ||
+                             (portable_raw_uvec4_storage && portable_storage_shape &&
+                              fr.storage_image_contract_valid)) && r.img_dim == 1u &&
                             r.depth == 1u && r.declared_mip_levels == 1u &&
                             !r.layer_stride_bytes && !r.layer_mip_offset_bytes &&
-                            !persistent_cache_eligible &&
                             !PROSPER_ENV_ON("PROSPER_NO_GPU_DETILE_2D");
                         const bool gpu_detile_shape =
-                            ((is_cube && r.num_components == 4) || gpu_detile_2d_shape) &&
-                            !fr.is_storage_image &&
+                            ((is_cube && !fr.is_storage_image && r.num_components == 4) || gpu_detile_2d_shape) &&
                             !r.compression_enabled && !r.in_mip_tail && !r.depth_compare &&
                             r.format == prosper::gpu::DataFormat::Float16 &&
                             (r.num_components == 2 || r.num_components == 4) &&
@@ -5696,7 +5697,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 tw, th, is_cube ? 6u : 1u,
                                 is_cube ? r.gpu_addr : sampled_source_addr,
                                 r.layer_stride_bytes, r.layer_mip_offset_bytes, copy_resource,
-                                r.num_components);
+                                r.num_components,
+                                portable_raw_uvec4_storage ? prosper::gpu::Float16DetileOutput::RawUvec4
+                                                           : prosper::gpu::Float16DetileOutput::Rgba8,
+                                writable_storage_image);
                             if (fr.gpu_detile) {
                                 if (timing_enabled) {
                                     ++pending_timing.gpu_detile_preparations;

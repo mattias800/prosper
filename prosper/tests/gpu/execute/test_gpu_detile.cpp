@@ -21,11 +21,13 @@ int main() {
   };
   check(build_compute_detile_float16(1).empty() &&
             build_compute_detile_float16(3).empty(), "unsupported components refuse emission");
+  for (auto output_kind : {Float16DetileOutput::Rgba8, Float16DetileOutput::RawUvec4})
   for (uint32_t components : {2u, 4u})
   for (const auto [width, height] :
        {std::pair{257u, 131u}, std::pair{1031u, 67u}}) {
     constexpr uint32_t faces = 6;
     const uint32_t count = width * height * faces;
+    const uint32_t output_words = output_kind == Float16DetileOutput::RawUvec4 ? 4u : 1u;
     const size_t face_bytes = tiled_surface_bytes(width, height, 27, 0, components * 2);
     // An extra page between faces proves that the shader uses the supplied
     // stride, rather than a tight width*height*8 or inferred face footprint.
@@ -39,7 +41,7 @@ int main() {
     check(tile64_word_equation(27, components * 2, equation, block_width, block_height),
           "source equation exists for the component count");
     std::memcpy(bytes.data() + 16, equation.data(), sizeof(equation));
-    std::vector<uint32_t> expected(count);
+    std::vector<uint32_t> expected(count * output_words);
     std::array<std::array<bool, 65536>, 4> seen{};
     for (uint32_t face = 0; face < faces; ++face) {
       std::vector<uint8_t> linear(size_t(width) * height * components * 2);
@@ -52,13 +54,18 @@ int main() {
           std::memcpy(linear.data() + size_t(pixel) * components * 2 + channel * 2, &half,
                       2);
           float value = half_to_float(half);
+          if (output_words == 4) {
+            expected[(face * width * height + pixel) * 4 + channel] = std::bit_cast<uint32_t>(value);
+            continue;
+          }
           if (!std::isfinite(value) || value <= 0.0f)
             value = 0.0f;
           else if (value >= 1.0f)
             value = 1.0f;
           packed |= uint32_t(std::lround(value * 255.0f)) << (channel * 8);
         }
-        expected[face * width * height + pixel] = packed;
+        if (output_words == 1) expected[face * width * height + pixel] = packed;
+        else if (components == 2) expected[(face * width * height + pixel) * 4 + 3] = 0x3f800000u;
       }
       tile_surface(bytes.data() + 80 + face * stride, linear.data(), width,
                    height, 27, 0, components * 2);
@@ -68,7 +75,7 @@ int main() {
       for (bool value : seen[channel])
         exhaustive &= value;
     check(exhaustive, "every half encoding occurs in every channel");
-    if (components == 4 && width == 257 && std::getenv("PROSPER_RX_PIPES") == nullptr) {
+    if (output_words == 1 && components == 4 && width == 257 && std::getenv("PROSPER_RX_PIPES") == nullptr) {
       // Independent addresses for the default 16-pipe eight-byte equation:
       // x8 sets bits8/13; x8+y8 cancels bit8; x64+y32 cancels bit10;
       // y64 adds pipe bit11 on top of the next 3-block-wide macroblock row.
@@ -86,18 +93,18 @@ int main() {
     std::vector<float> input(bytes.size() / 4);
     std::memcpy(input.data(), bytes.data(), bytes.size());
     const auto output = prosper::test::run_compute(
-        build_compute_detile_float16(components), input, count + 127, count + 127, {}, {},
+        build_compute_detile_float16(components, output_kind), input, count + 127, (count + 127) * output_words, {}, {},
         nullptr, 128);
-    check(output.size() == count + 127, "detile shader executes on Vulkan");
-    if (output.size() != count + 127)
+    check(output.size() == (count + 127) * output_words, "detile shader executes on Vulkan");
+    if (output.size() != (count + 127) * output_words)
       continue;
     size_t mismatches = 0;
-    for (uint32_t i = 0; i < count; ++i)
+    for (uint32_t i = 0; i < expected.size(); ++i)
       mismatches += std::bit_cast<uint32_t>(output[i]) != expected[i];
-    for (size_t i = count; i < output.size(); ++i)
+    for (size_t i = expected.size(); i < output.size(); ++i)
       mismatches += std::bit_cast<uint32_t>(output[i]) != 0;
-    std::printf("%ux%ux6 components=%u: %zu byte-exact output/tail mismatches\n", width,
-                height, components, mismatches);
+    std::printf("%ux%ux6 components=%u output-words=%u: %zu byte-exact output/tail mismatches\n", width,
+                height, components, output_words, mismatches);
     check(mismatches == 0, "GPU detile/quantize matches CPU pixels and refuses "
                            "excess invocations");
   }
