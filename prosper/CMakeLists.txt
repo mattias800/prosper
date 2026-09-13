@@ -1374,6 +1374,10 @@ if(TARGET prosper_core)
   target_include_directories(test_rtt_injection PRIVATE frontends)
   add_test(NAME rtt_injection COMMAND test_rtt_injection)
 
+  add_executable(test_buffer_range_plan frontends/shared/tests/test_buffer_range_plan.cpp)
+  target_include_directories(test_buffer_range_plan PRIVATE tests)
+  add_test(NAME buffer_range_plan COMMAND test_buffer_range_plan)
+
   add_executable(test_readback_policy frontends/shared/tests/test_readback_policy.cpp)
   target_include_directories(test_readback_policy PRIVATE frontends)
   add_test(NAME readback_policy COMMAND test_readback_policy)
@@ -3705,6 +3709,25 @@ if(TARGET prosper_core AND TARGET Vulkan::Vulkan)
   add_executable(test_render_buffer_residency tests/gpu/state/test_render_buffer_residency.cpp)
   target_include_directories(test_render_buffer_residency PRIVATE tests frontends)
   target_link_libraries(test_render_buffer_residency PRIVATE prosper_core Vulkan::Vulkan)
+  foreach(range_control IN ITEMS on off arena_off verify)
+    set(range_environment PROSPER_BACKEND_BUFFER_RESIDENCY_MB=0
+      --unset=PROSPER_NO_BACKEND_RESOURCE_SHARE --unset=PROSPER_NO_BACKEND_BUFFER_POOL
+      --unset=PROSPER_NO_BACKEND_BUFFER_ARENA --unset=PROSPER_BUFVERIFY
+      --unset=PROSPER_NO_BACKEND_BUFFER_RANGE_SHARE)
+    set(range_expected off)
+    if(range_control STREQUAL "on")
+      set(range_expected on)
+    elseif(range_control STREQUAL "off")
+      list(APPEND range_environment PROSPER_NO_BACKEND_BUFFER_RANGE_SHARE=1)
+    elseif(range_control STREQUAL "arena_off")
+      list(APPEND range_environment PROSPER_NO_BACKEND_BUFFER_ARENA=1)
+    elseif(range_control STREQUAL "verify")
+      list(APPEND range_environment PROSPER_BUFVERIFY=1)
+    endif()
+    add_test(NAME render_buffer_range_${range_control} COMMAND ${CMAKE_COMMAND} -E env
+      ${range_environment} $<TARGET_FILE:test_render_buffer_residency>
+      --range-sharing ${range_expected})
+  endforeach()
   add_test(NAME render_buffer_residency COMMAND ${CMAKE_COMMAND} -E env
     --unset=PROSPER_NO_BACKEND_RESOURCE_SHARE
     --unset=PROSPER_NO_BACKEND_BUFFER_POOL --unset=PROSPER_BUFVERIFY
@@ -3741,6 +3764,10 @@ if(TARGET prosper_live_renderer AND TARGET Vulkan::Vulkan)
   target_link_libraries(test_render_buffer_capture PRIVATE prosper_live_renderer
                                                          prosper_performance_capture Vulkan::Vulkan)
   add_test(NAME render_buffer_capture COMMAND test_render_buffer_capture)
+  add_test(NAME render_buffer_range_capture COMMAND test_render_buffer_capture --range-sharing)
+  set_tests_properties(render_buffer_range_capture PROPERTIES
+    ENVIRONMENT "PROSPER_NO_LIVE_PERSISTENT_COLOR_TARGETS=1;PROSPER_BACKEND_BUFFER_RESIDENCY_MB=0"
+    TIMEOUT 120)
   add_test(NAME render_texture_snapshot_capture COMMAND test_render_buffer_capture --source-snapshot)
   add_test(NAME render_texture_snapshot_capture_copy COMMAND test_render_buffer_capture --source-snapshot)
   set_tests_properties(render_texture_snapshot_capture PROPERTIES

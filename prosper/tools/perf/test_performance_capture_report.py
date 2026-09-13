@@ -66,6 +66,24 @@ class PerformanceCaptureReportTests(unittest.TestCase):
                 self.assertIn('host_backed=' + ('UNAVAILABLE' if expected_class is None else '0'),
                               output.getvalue())
 
+    def test_range_sharing_totals_missing_fields_and_signed_savings(self):
+        row = {"res_texture_ms": 0, "res_buffer_ms": 10, "res_buffer_copy_ms": 3,
+               "res_descriptor_ms": 0, "buffer_range_uploads": 2, "buffer_range_bindings": 1,
+               "buffer_range_upload_bytes": 2**53 + 7, "buffer_range_bound_bytes": 4096,
+               "res_buffer_range_plan_ms": 1.25}
+        full = summarize(capture(SAMPLES, renderer=[row, row]))["resource_breakdown"]
+        self.assertTrue(full["buffer_range_sharing_available"])
+        ranges = full["buffer_range_sharing"]
+        self.assertEqual(ranges["buffer_range_upload_bytes"], 2**54 + 14)
+        self.assertEqual(ranges["avoided_copy_bytes"], 8192 - (2**54 + 14))
+        self.assertEqual(ranges["res_buffer_range_plan_ms"], 2.5)
+        for field in ("buffer_range_bindings", "res_buffer_range_plan_ms"):
+            partial = dict(row)
+            del partial[field]
+            mixed = summarize(capture(SAMPLES, renderer=[row, partial]))["resource_breakdown"]
+            self.assertFalse(mixed["buffer_range_sharing_available"])
+            self.assertNotIn("buffer_range_sharing", mixed)
+
     def test_resident_buffer_partition_and_partial_population(self):
         row = {"res_texture_ms": 0, "res_buffer_ms": 20, "res_descriptor_ms": 0,
                "res_buffer_copy_ms": 2, "res_buffer_create_ms": 1,

@@ -142,6 +142,84 @@ double milliseconds(const std::string& row, const char* field) {
 }
 } // namespace
 
+int range_capture() {
+    namespace fs = std::filesystem;
+    uint64_t address = 0;
+    auto map = prosper::Hle::lookup(prosper::nid_hash("sceKernelMapNamedFlexibleMemory"));
+    auto unmap = prosper::Hle::lookup(prosper::nid_hash("sceKernelMunmap"));
+    check(map && unmap &&
+          map(reinterpret_cast<uint64_t>(&address),0x10000,0x2,0,
+              reinterpret_cast<uint64_t>("buffer-range-capture"),0) == 0 && address,
+          "real guest-readable mapping supplies overlapping inputs");
+    if (!address) return 1;
+    std::vector<uint32_t> source(Words,0);
+    positions(source,true);
+    std::memcpy(reinterpret_cast<void*>(address),source.data(),Bytes);
+    std::memcpy(reinterpret_cast<void*>(address+1024),source.data(),32);
+    std::vector<uint8_t> target(Width*Height*4u), changed_target(target.size());
+    auto draw = make_draw(source,target);
+    auto& resource = draw.vrt->resources[0];
+    resource.host_data = nullptr; resource.host_data_size = 0; resource.gpu_addr = address;
+    auto second = draw;
+    second.vrt = std::make_shared<ShaderResourceTable>(*draw.vrt);
+    second.vrt->resources[0].gpu_addr += 1024; second.draw_index = 1;
+    auto third = draw, fourth = second; third.draw_index = 2; fourth.draw_index = 3;
+    auto& capture = prosper::perf::interactive_performance_capture();
+    capture.cancel();
+    const fs::path directory = "render_buffer_range_capture_test";
+    fs::create_directories(directory);
+    const auto start = prosper::perf::monotonic_now_ns();
+    prosper::perf::ProcessSample sample; sample.monotonic_ns = start;
+    capture.observe_sample(sample);
+    const auto armed = capture.arm(directory.string(),"TEST","live range statistics","test",
+                                   start,std::chrono::system_clock::now());
+    check(armed.ok,"F8 records real range-sharing backend calls");
+    LiveRenderFn live = [](const std::vector<DrawItem>& items,uint32_t w,uint32_t h) {
+        return RenderedFrame(render_submit_items(items,w,h));
+    };
+    LiveComputeFn separator = [](const std::vector<ComputeItem>&) { return true; };
+    const std::vector<SubmitOperation> operations{
+        {SubmitOperationKind::Draw,0,10},{SubmitOperationKind::Draw,1,11},
+        {SubmitOperationKind::Dispatch,0,20},
+        {SubmitOperationKind::Draw,2,30},{SubmitOperationKind::Draw,3,31}};
+    const auto split = execute_ordered_items(operations,{draw,second,third,fourth},
+                                            {ComputeItem{}},live,separator,Width,Height);
+    check(split.render_spans == 2 && solid(split.frame.bytes(),true),
+          "two ordered live spans render both overlapping vertex inputs");
+    positions(source,false);
+    std::memcpy(reinterpret_cast<void*>(address),source.data(),32);
+    std::memcpy(reinterpret_cast<void*>(address+1024),source.data(),32);
+    draw.color0_base = second.color0_base = reinterpret_cast<uintptr_t>(changed_target.data());
+    check(solid(render_submit_items({draw,second},Width,Height),false),
+          "next semantic submit sees changed guest vertices");
+    sample.monotonic_ns = std::max<uint64_t>(prosper::perf::monotonic_now_ns(),start+5'000'000'000ull);
+    capture.observe_sample(sample);
+    prosper::perf::CaptureOutcome outcome;
+    check(capture.take_outcome(outcome) && outcome.ok && outcome.renderer_records == 2,
+          "actual live callbacks publish exactly two F8 submit records");
+    std::ifstream input(outcome.path);
+    size_t records = 0;
+    for (std::string row; std::getline(input,row);) {
+        if (row.find("\"type\":\"renderer\"") == std::string::npos) continue;
+        const uint64_t callbacks = records++ == 0 ? 2 : 1;
+        check(integer(row,"callbacks") == callbacks &&
+              integer(row,"buffer_range_uploads") == callbacks &&
+              integer(row,"buffer_range_bindings") == 2*callbacks &&
+              integer(row,"buffer_range_upload_bytes") == (Bytes+1024)*callbacks &&
+              integer(row,"buffer_range_bound_bytes") == 2*Bytes*callbacks &&
+              integer(row,"buffer_upload_bytes") == (Bytes+1024)*callbacks,
+              "F8 accumulates union copies once across ordered spans and resets on next submit");
+        check(milliseconds(row,"res_buffer_range_plan_ms") > 0 &&
+              milliseconds(row,"setup_resources_ms") >= milliseconds(row,"res_buffer_range_plan_ms"),
+              "measured planner time reaches F8 inside enclosing resource setup");
+    }
+    check(records == 2,"both published rows were checked");
+    capture.cancel(); set_submit_renderer({}); present_reset();
+    unmap(address,0x10000,0,0,0,0);
+    fs::remove_all(directory);
+    return failures ? 1 : 0;
+}
+
 int main(int argc, char** argv) {
     using namespace prosper::gpu;
     namespace fs = std::filesystem;
@@ -180,6 +258,7 @@ int main(int argc, char** argv) {
     if (failures) return 1;
 
     prosper::frontend::register_live_renderer("", false);
+    if (argc == 2 && std::strcmp(argv[1], "--range-sharing") == 0) return range_capture();
     std::vector<uint32_t> source(Words, 0);
     std::vector<uint8_t> target(Width * Height * 4u, 0);
     positions(source, true);

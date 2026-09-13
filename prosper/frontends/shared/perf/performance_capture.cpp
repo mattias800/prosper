@@ -368,6 +368,10 @@ void InteractivePerformanceCapture::publish_completed(std::unique_ptr<PendingCap
                 << ",\"frontend_gpu_detile_2d_preparations\":" << record.frontend_gpu_detile_2d_preparations
                 << ",\"frontend_gpu_detile_source_bytes\":" << record.frontend_gpu_detile_source_bytes
                 << ",\"buffer_bytes\":" << record.buffer_bytes
+                << ",\"buffer_range_uploads\":" << record.buffer_range_uploads
+                << ",\"buffer_range_bindings\":" << record.buffer_range_bindings
+                << ",\"buffer_range_upload_bytes\":" << record.buffer_range_upload_bytes
+                << ",\"buffer_range_bound_bytes\":" << record.buffer_range_bound_bytes
                 << ",\"buffer_upload_bytes\":" << record.buffer_upload_bytes
                 << ",\"buffer_resident_hits\":" << record.buffer_resident_hits
                 << ",\"buffer_resident_compared_bytes\":" << record.buffer_resident_compared_bytes
@@ -465,6 +469,7 @@ void InteractivePerformanceCapture::publish_completed(std::unique_ptr<PendingCap
                 << ",\"frontend_reflect_ms\":" << record.frontend_reflect_ms
                 << ",\"res_texture_ms\":" << record.res_texture_ms
                 << ",\"res_buffer_ms\":" << record.res_buffer_ms
+                << ",\"res_buffer_range_plan_ms\":" << record.res_buffer_range_plan_ms
                 << ",\"res_buffer_copy_ms\":" << record.res_buffer_copy_ms
                 << ",\"res_buffer_resident_ms\":" << record.res_buffer_resident_ms
                 << ",\"res_buffer_watch_ms\":" << record.res_buffer_watch_ms
