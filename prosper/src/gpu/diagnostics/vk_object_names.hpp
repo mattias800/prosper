@@ -13,7 +13,10 @@
 //
 // Two properties this must have, both of them stated as requirements rather than discovered later:
 //
-//  1. It must work WITHOUT the validation layer. `VK_EXT_debug_utils` used to be requested only
+//  1. It must work WITHOUT the validation layer, on EVERY instance that creates nameable objects --
+//     not just the renderer's. prosper builds more than one: the live compute backend creates its own
+//     private instance when it does not adopt the renderer's device, and naming there was silently
+//     inert until #3597 armed it too. `VK_EXT_debug_utils` used to be requested only
 //     inside the `if (validation_enabled)` branch, so naming would have silently done nothing in an
 //     ordinary run -- which is the run people actually capture. The instance now requests it
 //     unconditionally and tolerates its absence.
@@ -21,7 +24,6 @@
 //     call through a null pointer is a no-op, and no result code is propagated anywhere. An object
 //     name is a convenience, and a run that died because it could not name a shader module would be
 //     a worse tool than no names at all.
-#include <atomic>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
@@ -33,24 +35,29 @@ namespace prosper::gpu {
 // VK_EXT_debug_utils, which is the ordinary case on a driver or loader that does not offer it --
 // not an error, and deliberately not logged on every call.
 inline PFN_vkSetDebugUtilsObjectNameEXT vk_object_name_fn(VkDevice device) {
-    // Atomic because prosper runs two guest submit threads and this is an inline function shared
-    // across translation units, so the cache is genuinely reachable concurrently. The worst outcome
-    // of a race here would be a missed name rather than a crash -- but this file's contract is that
-    // naming must NEVER fail a run, and "probably benign" is not that. Resolution is idempotent, so
-    // two threads racing to resolve simply store the same pointer; relaxed ordering is enough because
-    // neither value guards any other memory.
-    static std::atomic<VkDevice> cached_device{VK_NULL_HANDLE};
-    static std::atomic<PFN_vkSetDebugUtilsObjectNameEXT> cached_fn{nullptr};
-    if (device != cached_device.load(std::memory_order_relaxed)) {
-        const PFN_vkSetDebugUtilsObjectNameEXT resolved =
-            device ? (PFN_vkSetDebugUtilsObjectNameEXT)vkGetDeviceProcAddr(
-                         device, "vkSetDebugUtilsObjectNameEXT")
-                   : nullptr;
-        cached_fn.store(resolved, std::memory_order_relaxed);
-        cached_device.store(device, std::memory_order_relaxed);
-        return resolved;
+    // THREAD_LOCAL, which removes the race rather than synchronising it. An earlier version kept the
+    // device and the function pointer in two independent atomics, and that pair TEARS: a thread
+    // matching the stale device could read a pointer another thread had already replaced for a
+    // different device, then call a foreign dispatch entry. Benign with one VkDevice, not benign in
+    // general, and this file's contract is that naming must NEVER fail a run (#3597).
+    //
+    // Holding both halves in one atomic was the obvious repair and does not work here: two pointers
+    // is 16 bytes, and `std::atomic<>::is_always_lock_free` is FALSE for that on this target -- the
+    // static_assert that said so is why this is thread_local instead. A locking atomic on a
+    // diagnostic path would be a worse trade than a per-thread copy.
+    //
+    // Cost is one pointer pair per thread that ever names an object, and a re-resolve the first time
+    // each thread sees a device. Naming happens once per object CREATION, never per draw or dispatch,
+    // so even resolving every call would be affordable; the cache is politeness, not necessity.
+    thread_local VkDevice cached_device = VK_NULL_HANDLE;
+    thread_local PFN_vkSetDebugUtilsObjectNameEXT cached_fn = nullptr;
+    if (device != cached_device) {
+        cached_fn = device ? (PFN_vkSetDebugUtilsObjectNameEXT)vkGetDeviceProcAddr(
+                                 device, "vkSetDebugUtilsObjectNameEXT")
+                           : nullptr;
+        cached_device = device;
     }
-    return cached_fn.load(std::memory_order_relaxed);
+    return cached_fn;
 }
 
 // Name one object. Silently does nothing when the extension is absent.

@@ -3371,6 +3371,29 @@ struct VulkanComputeContext {
         app.apiVersion = kVulkanRuntimeVersion;
         VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
         ici.pApplicationInfo = &app;
+        // VK_EXT_debug_utils, add-if-available (#3597). Guest compute shader modules are named through
+        // `vk_object_name_fn`, which resolves per DEVICE -- but the entry point only exists when the
+        // INSTANCE enabled the extension. The renderer arms it; this private instance did not, so
+        // `guest cs 0x...` naming was silently inert whenever compute did not adopt the renderer's
+        // device, which is exactly the configuration a compute-only capture runs in.
+        //
+        // Probed rather than pushed blind: an unadvertised extension fails the whole vkCreateInstance,
+        // and losing the compute backend to a debug convenience would be a far worse trade than
+        // unnamed modules.
+        std::vector<const char*> compute_inst_exts;
+        {
+            uint32_t count = 0;
+            vkEnumerateInstanceExtensionProperties(nullptr, &count, nullptr);
+            std::vector<VkExtensionProperties> avail(count);
+            if (count) vkEnumerateInstanceExtensionProperties(nullptr, &count, avail.data());
+            for (const auto& e : avail)
+                if (!strcmp(e.extensionName, "VK_EXT_debug_utils"))
+                    compute_inst_exts.push_back("VK_EXT_debug_utils");
+        }
+        if (!compute_inst_exts.empty()) {
+            ici.enabledExtensionCount = (uint32_t)compute_inst_exts.size();
+            ici.ppEnabledExtensionNames = compute_inst_exts.data();
+        }
         if (vkCreateInstance(&ici, nullptr, &instance) != VK_SUCCESS) return false;
 
         uint32_t device_count = 0;
@@ -9435,8 +9458,27 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         case 5: return VK_COMPONENT_SWIZZLE_G;
                         case 6: return VK_COMPONENT_SWIZZLE_B;
                         case 7: return VK_COMPONENT_SWIZZLE_A;
-                        default: return VK_COMPONENT_SWIZZLE_IDENTITY;
+                        default: break;
                     }
+                    // SQ_SEL 2 and 3 are RESERVED, and anything above 7 cannot come out of a
+                    // three-bit descriptor field at all. Both used to fall into a silent
+                    // `default: IDENTITY` -- the selector for whichever position the value sat in --
+                    // so an undecodable routing became a plausible wrong picture with no diagnostic
+                    // anywhere. The graphics path was made loud for that reason; this is its twin
+                    // and was missed (#3609).
+                    //
+                    // A reserved selector can no longer reach here FROM A DESCRIPTOR, because
+                    // `image_descriptor_reject_reason` now refuses such a T# before it becomes a
+                    // ShaderResource. It stays reachable from a capture deserialized verbatim and
+                    // from a directly-built resource, so this warns rather than dropping: reproducing
+                    // the frame that was recorded is replay's job, and the drop belongs upstream.
+                    static std::once_flag warned;
+                    std::call_once(warned, [&] {
+                        fprintf(stderr,
+                                "[compute] T# DST_SEL %u is reserved or unrepresentable; binding it "
+                                "as IDENTITY, which is a GUESS at the routing (#3609)\n", s);
+                    });
+                    return VK_COMPONENT_SWIZZLE_IDENTITY;
                 };
                 vci.components = {sel(r->swizzle[0]), sel(r->swizzle[1]),
                                   sel(r->swizzle[2]), sel(r->swizzle[3])};

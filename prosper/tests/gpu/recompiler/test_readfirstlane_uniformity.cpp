@@ -15,10 +15,16 @@
 // The fix taints the SSA VALUE rather than the register, so it survives scalar copies (`s_mov_b32`
 // lowers as `d = a`) and clears itself on overwrite.
 //
+// #3607 EXTENDS THIS to a second proof site. The taint above lives on an SSA value inside the
+// emitter, so it is invisible to the CFG stage, which runs earlier and judged the same question from
+// `kind == SGPR` alone. The final section covers that predicate directly.
+//
 // WHAT THIS TEST DOES NOT CLAIM. It does not establish that the proof is now sound in general — see
 // the residual recorded in #3596. It establishes that the one demonstrated counterexample no longer
 // passes, and it is built as a PAIR so it cannot pass by the escape simply never firing.
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include "gpu/recompiler/rdna2_cfg_support.hpp"
+#include "gpu/recompiler/rdna2_decode.hpp"
 
 #include <cstdint>
 #include <cstdio>
@@ -161,6 +167,93 @@ int main() {
         CHECK(count_opcode(spv_b, kOpGroupNonUniformAny) == 0,
               "CONTROL: a readfirstlane whose result never reaches the compare does NOT suppress the "
               "escape -- the taint follows the VALUE into the compare, it is not a program-wide flag");
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // #3607 -- the SAME defect at a SECOND proof site, which the fix above does not reach.
+    //
+    // #3596 tainted the SSA value inside the emitter, so `scalar_data_operand` refuses it. But the
+    // CFG stage runs BEFORE emission and has no SSA values at all: `vcc_exit_is_wave_uniform` in
+    // rdna2_cfg_support.hpp judged a compare operand uniform on the strength of `kind == SGPR`
+    // alone. That predicate decides whether a divergent loop's exit is wave-uniform, which changes
+    // how the whole loop is lowered -- so the same lane-local value that #3596 stopped at the
+    // emitter still satisfied this one.
+    //
+    // This calls the predicate DIRECTLY rather than inspecting a recompiled module: the two ways
+    // the answer shows up in emitted SPIR-V (a real loop vs. dispatcher emulation) also differ for
+    // a dozen unrelated reasons, so a module-level assertion here would pass or fail for reasons
+    // that have nothing to do with the operand's provenance.
+    {
+        // pc0 v_mov_b32 v2, 0        -- a provably uniform VGPR, so the compare's OTHER operand
+        //                               cannot be what decides the verdict
+        // pc1 <producer of s0>       -- the single instruction the pair differs in
+        // pc2 v_cmp_eq_u32_e32 vcc, s0, v2
+        // pc3 s_cbranch_vccnz
+        // pc4 s_endpgm
+        auto build_cfg = [](uint32_t producer) {
+            return std::vector<uint32_t>{0x7E040280u, producer, 0x7D840400u, 0xBF870004u,
+                                         0xBF810000u};
+        };
+        const std::vector<uint32_t> u_imm = build_cfg(0xBE800380u);   // s_mov_b32 s0, 0
+        const std::vector<uint32_t> u_rfl = build_cfg(0x7E000501u);   // v_readfirstlane_b32 s0, ...
+
+        std::vector<Rdna2Inst> ins_imm, ins_rfl;
+        rdna2_walk(u_imm.data(), u_imm.size(), ins_imm);
+        rdna2_walk(u_rfl.data(), u_rfl.size(), ins_rfl);
+
+        // FIXTURE CONTROLS. Every arm below is meaningless if these words did not decode to the
+        // instructions the comments claim -- a mis-encoded compare would simply never be found by
+        // the backward walk, and the predicate would return false for a reason unrelated to #3607.
+        CHECK(ins_imm.size() >= 4 && ins_rfl.size() >= 4, "CONTROL: both CFG fixtures decode");
+        if (ins_imm.size() >= 4 && ins_rfl.size() >= 4) {
+            CHECK(ins_imm[2].fmt == Rdna2Format::VOPC && ins_rfl[2].fmt == Rdna2Format::VOPC,
+                  "CONTROL: the compare really encodes as VOPC -- the backward walk accepts no "
+                  "other format, so a VOP3 e64 form here would test nothing");
+            CHECK(ins_rfl[1].fmt == Rdna2Format::VOP1 && ins_rfl[1].opcode == 0x02u,
+                  "CONTROL: the producer really is v_readfirstlane_b32");
+            CHECK(ins_rfl[1].dst.value == ins_rfl[2].src[0].value &&
+                      ins_rfl[2].src[0].kind == OperandKind::SGPR,
+                  "CONTROL: it writes exactly the SGPR the compare reads -- the guard keys on the "
+                  "register number, so an off-by-one fixture would silently test nothing");
+            CHECK(ins_imm[1].dst.value == ins_imm[2].src[0].value,
+                  "CONTROL: the immediate variant defines that same register");
+
+            const uint32_t branch_pc = ins_imm[3].pc;
+            CHECK(vcc_exit_is_wave_uniform(ins_imm, branch_pc),
+                  "CONTROL: with s0 defined by an immediate the exit IS provably wave-uniform -- "
+                  "without this the arm below could pass on a predicate that refuses everything");
+            CHECK(!vcc_exit_is_wave_uniform(ins_rfl, ins_rfl[3].pc),
+                  "#3607: an exit compare reading an SGPR that v_readfirstlane_b32 wrote is NOT "
+                  "accepted as wave-uniform");
+        }
+
+        // VCC_LO IS NOT AN `SGPR` OPERAND, and screening only `SGPR` left this hole wide open.
+        // `decode_src_field` maps 0..105 to SGPR and sends 106/107 (VCC_LO/HI) to `Special`, so
+        // `v_readfirstlane_b32 s106, v1` writes VCC_LO and a compare reading it used to satisfy the
+        // proof through the branch that asserted VCC halves "broadcast one wave value".
+        {
+            const std::vector<uint32_t> u_vcc = {
+                0x7E040280u,              // pc0 v_mov_b32 v2, 0
+                0x7ED40501u,              // pc1 v_readfirstlane_b32 s106, v1   (s106 = VCC_LO)
+                0x7D84046Au,              // pc2 v_cmp_eq_u32_e32 vcc, s106, v2
+                0xBF870004u,              // pc3 s_cbranch_vccnz
+                0xBF810000u,              // pc4 s_endpgm
+            };
+            std::vector<Rdna2Inst> ins_vcc;
+            rdna2_walk(u_vcc.data(), u_vcc.size(), ins_vcc);
+            CHECK(ins_vcc.size() >= 4, "CONTROL: the VCC fixture decodes");
+            if (ins_vcc.size() >= 4) {
+                CHECK(ins_vcc[1].fmt == Rdna2Format::VOP1 && ins_vcc[1].opcode == 0x02u &&
+                          ins_vcc[1].dst.value == 106,
+                      "CONTROL: the producer really is v_readfirstlane_b32 writing register 106");
+                CHECK(ins_vcc[2].src[0].kind == OperandKind::Special &&
+                          ins_vcc[2].src[0].value == 106,
+                      "CONTROL: and the compare really reads it as a SPECIAL operand, not an SGPR -- "
+                      "which is the whole reason an SGPR-only screen missed it");
+                CHECK(!vcc_exit_is_wave_uniform(ins_vcc, ins_vcc[3].pc),
+                      "#3607: a readfirstlane-written VCC_LO is refused too, not just an SGPR");
+            }
+        }
     }
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
