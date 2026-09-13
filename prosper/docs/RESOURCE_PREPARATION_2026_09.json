@@ -1,0 +1,677 @@
+{
+  "description": "2026-09-13 resource preparation measurements. Rates count flips/presentations; newly rendered FPS unavailable. Nested timing totals must not be added. GPU load is from earlier20s profile, not F8. Cache charges are requested residency, not physical allocations. Audio counts are per output/generation active-phase cumulative observations, not device XRUNs.",
+  "runs": [
+    {
+      "run": "key-legacy-sonic",
+      "head": "47420495b85482ede8e0d31af3408a8a94c689fd",
+      "binary_sha256": "51cded865993ff0c0fc2f29f8ef7e5974b89648822897d7a7c16a893cd4bdaa9",
+      "route_sha256": "1468421f7b87b21f07287af8b9e79fd0f0963811cfacdf3a69448dcef7f7decd",
+      "seconds": 5.01344967,
+      "rates": {
+        "guest_fps": 6.781757519867552,
+        "rendered_fps": null,
+        "host_fps": 6.781757519867552
+      },
+      "cpu_cores": 1.4173615908664343,
+      "rss_max_bytes": 4822745088,
+      "graphics_total_ms": 2311.279091,
+      "compute_total_ms": 1372.999897,
+      "compute_cpu_phases": {
+        "setup_ms": 131.943905,
+        "pipeline_ms": 4.66425,
+        "dispatch_wait_ms": 476.045484,
+        "writeback_ms": 497.049504,
+        "cleanup_ms": 23.042532
+      },
+      "compute_gpu_brackets": {
+        "gpu_pre_ms": 82.4690121434308,
+        "gpu_shader_ms": 125.4425824595906,
+        "gpu_storage_copy_ms": 120.7753947454131,
+        "gpu_compare_ms": 10.10431833008016,
+        "gpu_restore_ms": 0.11269412022225
+      },
+      "compute_gpu_device_ms": 338.904001802062,
+      "components": {
+        "renderer-resource": 1076.897037,
+        "gpu-wait": 652.576286,
+        "gpu-device": 533.486210407356,
+        "gpu-wait-overhead": 119.09007559264398,
+        "readback": 0.178092,
+        "compute": 1372.999897
+      },
+      "counts": {
+        "pre": 20,
+        "post": 21,
+        "renderer": 556,
+        "compute": 1172
+      },
+      "phase_rows": 963,
+      "phase_all_success": true,
+      "gpu_profile_samples": 20,
+      "gpu_profile_mean_percent": 20.0,
+      "max_cache_charge_bytes": 267386880,
+      "observed_cache_limits_bytes": [
+        268435456
+      ],
+      "large_owner_observations": 103,
+      "large_owner_cpu_compare_ms": 144.904184,
+      "large_owner_decisions": {
+        "baseline": {
+          "budget": 103
+        },
+        "gpu-compare": {
+          "ineligible": 103
+        },
+        "writeback": {
+          "unchanged": 103
+        }
+      },
+      "audio_active_cumulative": {
+        "17/1/active": {
+          "first_shortfall_calls": 0,
+          "last_shortfall_calls": 1,
+          "first_calls": 31,
+          "last_calls": 17816,
+          "first_t_us": 1001700,
+          "last_t_us": 380437700
+        }
+      },
+      "f8_sha256": "79a321591fa6ebf09a218b71e7467883983b108092cdbc992b0610719dab260b",
+      "original_bmp_sha256": "cb00e5064051cc6a1db5edde68f8ee5852e1dc43f96a98f9dd82734bf81fa511",
+      "screenshot": "docs/screenshots/3407-resource-key-legacy-sonic.webp"
+    },
+    {
+      "run": "key-default-sonic",
+      "head": "47420495b85482ede8e0d31af3408a8a94c689fd",
+      "binary_sha256": "51cded865993ff0c0fc2f29f8ef7e5974b89648822897d7a7c16a893cd4bdaa9",
+      "route_sha256": "1468421f7b87b21f07287af8b9e79fd0f0963811cfacdf3a69448dcef7f7decd",
+      "seconds": 5.009743869,
+      "rates": {
+        "guest_fps": 7.18599611903632,
+        "rendered_fps": null,
+        "host_fps": 6.986385115729756
+      },
+      "cpu_cores": 1.464289830343021,
+      "rss_max_bytes": 4726902784,
+      "graphics_total_ms": 2021.927078,
+      "compute_total_ms": 1594.329311,
+      "compute_cpu_phases": {
+        "setup_ms": 158.334012,
+        "pipeline_ms": 5.47199,
+        "dispatch_wait_ms": 521.655002,
+        "writeback_ms": 607.381049,
+        "cleanup_ms": 27.57429
+      },
+      "compute_gpu_brackets": {
+        "gpu_pre_ms": 88.5828284715844,
+        "gpu_shader_ms": 142.3806449863385,
+        "gpu_storage_copy_ms": 129.7470810609956,
+        "gpu_compare_ms": 11.16236863873376,
+        "gpu_restore_ms": 0.12094980612786
+      },
+      "compute_gpu_device_ms": 371.993872967365,
+      "components": {
+        "renderer-resource": 793.014144,
+        "gpu-wait": 658.746696,
+        "gpu-device": 527.899816188497,
+        "gpu-wait-overhead": 130.84687981150307,
+        "readback": 0.241945,
+        "compute": 1594.329311
+      },
+      "counts": {
+        "pre": 20,
+        "post": 21,
+        "renderer": 603,
+        "compute": 1240
+      },
+      "phase_rows": 1025,
+      "phase_all_success": true,
+      "gpu_profile_samples": 20,
+      "gpu_profile_mean_percent": 20.0,
+      "max_cache_charge_bytes": 267386880,
+      "observed_cache_limits_bytes": [
+        268435456
+      ],
+      "large_owner_observations": 110,
+      "large_owner_cpu_compare_ms": 159.079559,
+      "large_owner_decisions": {
+        "baseline": {
+          "budget": 110
+        },
+        "gpu-compare": {
+          "ineligible": 110
+        },
+        "writeback": {
+          "unchanged": 110
+        }
+      },
+      "audio_active_cumulative": {
+        "17/1/active": {
+          "first_shortfall_calls": 0,
+          "last_shortfall_calls": 2,
+          "first_calls": 29,
+          "last_calls": 17815,
+          "first_t_us": 1001184,
+          "last_t_us": 380435186
+        }
+      },
+      "f8_sha256": "046df5e1b6596961a5c080faa009cb203a26f9812db72b819cb163d7e4ac4e57",
+      "original_bmp_sha256": "a15129abd444607e9cf821509beaadc15242aa4ab14778f4883a81026e9e0965",
+      "screenshot": "docs/screenshots/3407-resource-key-default-sonic.webp"
+    },
+    {
+      "run": "key-default-gta",
+      "head": "47420495b85482ede8e0d31af3408a8a94c689fd",
+      "binary_sha256": "51cded865993ff0c0fc2f29f8ef7e5974b89648822897d7a7c16a893cd4bdaa9",
+      "route_sha256": "683994c1b5e6fb14b07e90e7d07390d52a1ffb7ebbf1cc496d2b92489c81ed7a",
+      "seconds": 5.021495166,
+      "rates": {
+        "guest_fps": 6.173460090113726,
+        "rendered_fps": null,
+        "host_fps": 6.173460090113726
+      },
+      "cpu_cores": 1.4534585335096188,
+      "rss_max_bytes": 10091966464,
+      "graphics_total_ms": 2597.718792,
+      "compute_total_ms": 1166.29426,
+      "compute_cpu_phases": {
+        "setup_ms": 211.770537,
+        "pipeline_ms": 14.01894,
+        "dispatch_wait_ms": 413.742373,
+        "writeback_ms": 350.138274,
+        "cleanup_ms": 14.859368
+      },
+      "compute_gpu_brackets": {
+        "gpu_pre_ms": 23.0191767207518,
+        "gpu_shader_ms": 179.7965757213148,
+        "gpu_storage_copy_ms": 105.3389853759479,
+        "gpu_compare_ms": 1.8712754465085701,
+        "gpu_restore_ms": 0.32978659862612997
+      },
+      "compute_gpu_device_ms": 310.355799864207,
+      "components": {
+        "renderer-resource": 1394.61865,
+        "gpu-wait": 519.731349,
+        "gpu-device": 323.405434330581,
+        "gpu-wait-overhead": 196.32591466941903,
+        "readback": 44.012936,
+        "compute": 1166.29426
+      },
+      "counts": {
+        "pre": 20,
+        "post": 21,
+        "renderer": 772,
+        "compute": 2071
+      },
+      "phase_rows": 1051,
+      "phase_all_success": true,
+      "gpu_profile_samples": 20,
+      "gpu_profile_mean_percent": 16.5,
+      "max_cache_charge_bytes": 11796480,
+      "observed_cache_limits_bytes": [
+        268435456
+      ],
+      "large_owner_observations": 0,
+      "large_owner_cpu_compare_ms": 0,
+      "large_owner_decisions": {
+        "baseline": {},
+        "gpu-compare": {},
+        "writeback": {}
+      },
+      "audio_active_cumulative": {
+        "17/1/active": {
+          "first_shortfall_calls": 0,
+          "last_shortfall_calls": 0,
+          "first_calls": 41,
+          "last_calls": 16887,
+          "first_t_us": 1001059,
+          "last_t_us": 360389060
+        },
+        "18/1/active": {
+          "first_shortfall_calls": 1,
+          "last_shortfall_calls": 40,
+          "first_calls": 38,
+          "last_calls": 742,
+          "first_t_us": 1001059,
+          "last_t_us": 16015061
+        }
+      },
+      "f8_sha256": "e5571772e4be12ee377a357a6cdd5155f74e242901b11ffc7aab4c0e3e1ab79b",
+      "original_bmp_sha256": "f99f080bb187c22d23c791f54ab587e9eb7c9fba3a079d0bdf6c564848802e1c",
+      "screenshot": "docs/screenshots/3407-resource-key-default-gta.webp"
+    },
+    {
+      "run": "key-legacy-gta",
+      "head": "47420495b85482ede8e0d31af3408a8a94c689fd",
+      "binary_sha256": "51cded865993ff0c0fc2f29f8ef7e5974b89648822897d7a7c16a893cd4bdaa9",
+      "route_sha256": "683994c1b5e6fb14b07e90e7d07390d52a1ffb7ebbf1cc496d2b92489c81ed7a",
+      "seconds": 5.01989644,
+      "rates": {
+        "guest_fps": 5.976218903830613,
+        "rendered_fps": null,
+        "host_fps": 5.976218903830613
+      },
+      "cpu_cores": 1.4619540637376178,
+      "rss_max_bytes": 9701822464,
+      "graphics_total_ms": 2560.474418,
+      "compute_total_ms": 1157.595411,
+      "compute_cpu_phases": {
+        "setup_ms": 210.172078,
+        "pipeline_ms": 13.228891,
+        "dispatch_wait_ms": 416.434105,
+        "writeback_ms": 346.913283,
+        "cleanup_ms": 12.915012
+      },
+      "compute_gpu_brackets": {
+        "gpu_pre_ms": 22.8960628029259,
+        "gpu_shader_ms": 192.535048977808,
+        "gpu_storage_copy_ms": 98.1373020897654,
+        "gpu_compare_ms": 1.83909430193089,
+        "gpu_restore_ms": 0.31507865334602997
+      },
+      "compute_gpu_device_ms": 315.722586821077,
+      "components": {
+        "renderer-resource": 1388.5354829999999,
+        "gpu-wait": 507.326428,
+        "gpu-device": 319.317186610414,
+        "gpu-wait-overhead": 188.009241389586,
+        "readback": 43.000268,
+        "compute": 1157.595411
+      },
+      "counts": {
+        "pre": 19,
+        "post": 21,
+        "renderer": 752,
+        "compute": 2029
+      },
+      "phase_rows": 1022,
+      "phase_all_success": true,
+      "gpu_profile_samples": 20,
+      "gpu_profile_mean_percent": 14.5,
+      "max_cache_charge_bytes": 11796480,
+      "observed_cache_limits_bytes": [
+        268435456
+      ],
+      "large_owner_observations": 0,
+      "large_owner_cpu_compare_ms": 0,
+      "large_owner_decisions": {
+        "baseline": {},
+        "gpu-compare": {},
+        "writeback": {}
+      },
+      "audio_active_cumulative": {
+        "17/1/active": {
+          "first_shortfall_calls": 1,
+          "last_shortfall_calls": 1,
+          "first_calls": 41,
+          "last_calls": 16888,
+          "first_t_us": 1000248,
+          "last_t_us": 360404248
+        },
+        "18/1/active": {
+          "first_shortfall_calls": 1,
+          "last_shortfall_calls": 39,
+          "first_calls": 38,
+          "last_calls": 742,
+          "first_t_us": 1000248,
+          "last_t_us": 16016256
+        }
+      },
+      "f8_sha256": "8678724bd948963986f483dd57713932baf766533e68691f7dc9cd8b116b8539",
+      "original_bmp_sha256": "664066a22e9c43a3b84aae4af8cf60ca7e595da0e3a2bc1e5c5536c2752cf835",
+      "screenshot": "docs/screenshots/3407-resource-key-legacy-gta.webp"
+    },
+    {
+      "run": "capacity-current-512-sonic",
+      "head": "47420495b85482ede8e0d31af3408a8a94c689fd",
+      "binary_sha256": "51cded865993ff0c0fc2f29f8ef7e5974b89648822897d7a7c16a893cd4bdaa9",
+      "route_sha256": "1468421f7b87b21f07287af8b9e79fd0f0963811cfacdf3a69448dcef7f7decd",
+      "seconds": 5.020722603,
+      "rates": {
+        "guest_fps": 7.966980684433563,
+        "rendered_fps": null,
+        "host_fps": 7.767806167322724
+      },
+      "cpu_cores": 1.2244512366261076,
+      "rss_max_bytes": 4733800448,
+      "graphics_total_ms": 2070.870041,
+      "compute_total_ms": 1567.001771,
+      "compute_cpu_phases": {
+        "setup_ms": 153.188933,
+        "pipeline_ms": 5.210848,
+        "dispatch_wait_ms": 643.60432,
+        "writeback_ms": 471.392479,
+        "cleanup_ms": 26.815727
+      },
+      "compute_gpu_brackets": {
+        "gpu_pre_ms": 96.0186766747445,
+        "gpu_shader_ms": 146.7363609011166,
+        "gpu_storage_copy_ms": 139.7254801422449,
+        "gpu_compare_ms": 99.40643345455548,
+        "gpu_restore_ms": 0.12555856282192
+      },
+      "compute_gpu_device_ms": 482.0125097481,
+      "components": {
+        "renderer-resource": 809.486461,
+        "gpu-wait": 675.947918,
+        "gpu-device": 553.816698588033,
+        "gpu-wait-overhead": 122.13121941196698,
+        "readback": 0.20045,
+        "compute": 1567.001771
+      },
+      "counts": {
+        "pre": 20,
+        "post": 21,
+        "renderer": 642,
+        "compute": 1365
+      },
+      "phase_rows": 1126,
+      "phase_all_success": true,
+      "gpu_profile_samples": 20,
+      "gpu_profile_mean_percent": 18.0,
+      "max_cache_charge_bytes": 534773760,
+      "observed_cache_limits_bytes": [
+        536870912
+      ],
+      "large_owner_observations": 120,
+      "large_owner_cpu_compare_ms": 0.0,
+      "large_owner_decisions": {
+        "baseline": {
+          "present": 120
+        },
+        "gpu-compare": {
+          "unchanged": 120
+        },
+        "writeback": {
+          "gpu-unchanged": 120
+        }
+      },
+      "audio_active_cumulative": {
+        "17/1/active": {
+          "first_shortfall_calls": 1,
+          "last_shortfall_calls": 1,
+          "first_calls": 29,
+          "last_calls": 17861,
+          "first_t_us": 1000010,
+          "last_t_us": 381434006
+        }
+      },
+      "f8_sha256": "130306c3ef7b7a949d477bd203da8ee0eb5ecf984226de955682e2b0489aa9f2",
+      "original_bmp_sha256": "253439fc234226edb9daaa064d3e31f8532f9078bab8eeb5f8684fc80c6d26ca",
+      "screenshot": "docs/screenshots/3407-resource-capacity-current-512-sonic.webp"
+    },
+    {
+      "run": "capacity-current-256-repeat-sonic",
+      "head": "47420495b85482ede8e0d31af3408a8a94c689fd",
+      "binary_sha256": "51cded865993ff0c0fc2f29f8ef7e5974b89648822897d7a7c16a893cd4bdaa9",
+      "route_sha256": "1468421f7b87b21f07287af8b9e79fd0f0963811cfacdf3a69448dcef7f7decd",
+      "seconds": 5.015494332,
+      "rates": {
+        "guest_fps": 7.377139231108595,
+        "rendered_fps": null,
+        "host_fps": 7.377139231108595
+      },
+      "cpu_cores": 1.4491074097379717,
+      "rss_max_bytes": 4723253248,
+      "graphics_total_ms": 1999.10312,
+      "compute_total_ms": 1597.799821,
+      "compute_cpu_phases": {
+        "setup_ms": 150.91739,
+        "pipeline_ms": 5.184252,
+        "dispatch_wait_ms": 527.680862,
+        "writeback_ms": 621.880473,
+        "cleanup_ms": 28.056359
+      },
+      "compute_gpu_brackets": {
+        "gpu_pre_ms": 92.5407485672181,
+        "gpu_shader_ms": 142.2703554365982,
+        "gpu_storage_copy_ms": 132.6056724199218,
+        "gpu_compare_ms": 11.10854637569313,
+        "gpu_restore_ms": 0.12451658304797
+      },
+      "compute_gpu_device_ms": 378.649839388232,
+      "components": {
+        "renderer-resource": 776.2937939999999,
+        "gpu-wait": 660.570962,
+        "gpu-device": 536.298333470556,
+        "gpu-wait-overhead": 124.27262852944398,
+        "readback": 0.222776,
+        "compute": 1597.799821
+      },
+      "counts": {
+        "pre": 20,
+        "post": 21,
+        "renderer": 611,
+        "compute": 1268
+      },
+      "phase_rows": 1046,
+      "phase_all_success": true,
+      "gpu_profile_samples": 20,
+      "gpu_profile_mean_percent": 18.0,
+      "max_cache_charge_bytes": 267386880,
+      "observed_cache_limits_bytes": [
+        268435456
+      ],
+      "large_owner_observations": 111,
+      "large_owner_cpu_compare_ms": 156.495014,
+      "large_owner_decisions": {
+        "baseline": {
+          "budget": 111
+        },
+        "gpu-compare": {
+          "ineligible": 111
+        },
+        "writeback": {
+          "unchanged": 111
+        }
+      },
+      "audio_active_cumulative": {
+        "17/1/active": {
+          "first_shortfall_calls": 0,
+          "last_shortfall_calls": 2,
+          "first_calls": 30,
+          "last_calls": 17816,
+          "first_t_us": 1000483,
+          "last_t_us": 380422489
+        }
+      },
+      "f8_sha256": "d67638692c36ff007af6c1572ff5a233d4259325e82a5869b48d1672c4145f53",
+      "original_bmp_sha256": "4854bf8bfeda3c6906c546b11edf4c69ac9a8d03a1c93ebe3f395b110691f1fc",
+      "screenshot": "docs/screenshots/3407-resource-capacity-current-256-repeat-sonic.webp"
+    },
+    {
+      "run": "final-defaults-sonic",
+      "head": "1a28926a1d8c39613d36d762fd2cddafdbf5f9db",
+      "binary_sha256": "eb2bc32005c891e260217682c82dfb3a67f0ac2a9e2d4b619ee5e10472362abd",
+      "route_sha256": "1468421f7b87b21f07287af8b9e79fd0f0963811cfacdf3a69448dcef7f7decd",
+      "seconds": 5.020276193,
+      "rates": {
+        "guest_fps": 7.768496891541441,
+        "rendered_fps": null,
+        "host_fps": 7.768496891541441
+      },
+      "cpu_cores": 1.2368929041510208,
+      "rss_max_bytes": 4723810304,
+      "graphics_total_ms": 2076.572868,
+      "compute_total_ms": 1533.784943,
+      "compute_cpu_phases": {
+        "setup_ms": 147.695171,
+        "pipeline_ms": 5.085526,
+        "dispatch_wait_ms": 621.036105,
+        "writeback_ms": 467.218774,
+        "cleanup_ms": 27.156163
+      },
+      "compute_gpu_brackets": {
+        "gpu_pre_ms": 92.8460085668105,
+        "gpu_shader_ms": 140.4066944582383,
+        "gpu_storage_copy_ms": 134.929527773456,
+        "gpu_compare_ms": 98.06207916450833,
+        "gpu_restore_ms": 0.11742310535212
+      },
+      "compute_gpu_device_ms": 466.361733069915,
+      "components": {
+        "renderer-resource": 829.423039,
+        "gpu-wait": 660.652905,
+        "gpu-device": 542.957866673939,
+        "gpu-wait-overhead": 117.69503832606108,
+        "readback": 0.216254,
+        "compute": 1533.784943
+      },
+      "counts": {
+        "pre": 20,
+        "post": 21,
+        "renderer": 625,
+        "compute": 1329
+      },
+      "phase_rows": 1095,
+      "phase_all_success": true,
+      "gpu_profile_samples": 20,
+      "gpu_profile_mean_percent": 16.0,
+      "max_cache_charge_bytes": 534773760,
+      "observed_cache_limits_bytes": [
+        536870912
+      ],
+      "large_owner_observations": 118,
+      "large_owner_cpu_compare_ms": 0.0,
+      "large_owner_decisions": {
+        "baseline": {
+          "present": 118
+        },
+        "gpu-compare": {
+          "unchanged": 118
+        },
+        "writeback": {
+          "gpu-unchanged": 118
+        }
+      },
+      "audio_active_cumulative": {
+        "17/1/active": {
+          "first_shortfall_calls": 2,
+          "last_shortfall_calls": 2,
+          "first_calls": 31,
+          "last_calls": 17863,
+          "first_t_us": 1001485,
+          "last_t_us": 381431524
+        }
+      },
+      "f8_sha256": "4946d96b6ae70159f043bcac725f96d7e6c9dac4fa61d28107cab97e43cfa79d",
+      "original_bmp_sha256": "1f24620dc3e37ccd019c69fa4538a28bc0a9b92b57d73367e70d9e87798d1fe9",
+      "screenshot": "docs/screenshots/3407-resource-final-defaults-sonic.webp"
+    },
+    {
+      "run": "final-defaults-gta",
+      "head": "1a28926a1d8c39613d36d762fd2cddafdbf5f9db",
+      "binary_sha256": "eb2bc32005c891e260217682c82dfb3a67f0ac2a9e2d4b619ee5e10472362abd",
+      "route_sha256": "683994c1b5e6fb14b07e90e7d07390d52a1ffb7ebbf1cc496d2b92489c81ed7a",
+      "seconds": 5.027546916,
+      "rates": {
+        "guest_fps": 5.967124822749242,
+        "rendered_fps": null,
+        "host_fps": 5.967124822749242
+      },
+      "cpu_cores": 1.439153551600591,
+      "rss_max_bytes": 9661304832,
+      "graphics_total_ms": 2605.548973,
+      "compute_total_ms": 1161.670698,
+      "compute_cpu_phases": {
+        "setup_ms": 214.350439,
+        "pipeline_ms": 13.236157,
+        "dispatch_wait_ms": 404.229128,
+        "writeback_ms": 355.021521,
+        "cleanup_ms": 13.153055
+      },
+      "compute_gpu_brackets": {
+        "gpu_pre_ms": 23.4665868054783,
+        "gpu_shader_ms": 178.373792413587,
+        "gpu_storage_copy_ms": 99.7126152034655,
+        "gpu_compare_ms": 1.8711151419291001,
+        "gpu_restore_ms": 0.32890492343108
+      },
+      "compute_gpu_device_ms": 303.753014486751,
+      "components": {
+        "renderer-resource": 1404.761346,
+        "gpu-wait": 518.295489,
+        "gpu-device": 318.978823716387,
+        "gpu-wait-overhead": 199.31666528361296,
+        "readback": 45.310267,
+        "compute": 1161.670698
+      },
+      "counts": {
+        "pre": 19,
+        "post": 21,
+        "renderer": 751,
+        "compute": 2010
+      },
+      "phase_rows": 1021,
+      "phase_all_success": true,
+      "gpu_profile_samples": 20,
+      "gpu_profile_mean_percent": 15.0,
+      "max_cache_charge_bytes": 280231936,
+      "observed_cache_limits_bytes": [
+        536870912
+      ],
+      "large_owner_observations": 0,
+      "large_owner_cpu_compare_ms": 0,
+      "large_owner_decisions": {
+        "baseline": {},
+        "gpu-compare": {},
+        "writeback": {}
+      },
+      "audio_active_cumulative": {
+        "17/1/active": {
+          "first_shortfall_calls": 1,
+          "last_shortfall_calls": 1,
+          "first_calls": 42,
+          "last_calls": 16887,
+          "first_t_us": 1001550,
+          "last_t_us": 360369533
+        },
+        "18/1/active": {
+          "first_shortfall_calls": 1,
+          "last_shortfall_calls": 39,
+          "first_calls": 38,
+          "last_calls": 741,
+          "first_t_us": 1001550,
+          "last_t_us": 16011552
+        }
+      },
+      "f8_sha256": "751ddedccc38a9061fd2227982c34c47c4327507b56c8870e8e0f2ac8abf3cc0",
+      "original_bmp_sha256": "c19d6a3ecc41993e645ab4c5142f08c3c872381057fced47747de507a68441c5",
+      "screenshot": "docs/screenshots/3407-resource-final-defaults-gta.webp"
+    }
+  ],
+  "benchmark_median_ns_per_lookup": {
+    "default": {
+      "1": 466.9475,
+      "8": 1032.6585,
+      "32": 2851.264,
+      "64": 5328.335999999999,
+      "2": 525.5945,
+      "0": 354.7
+    },
+    "legacy_hash": {
+      "1": 651.6805,
+      "8": 2050.7165,
+      "32": 6779.469,
+      "64": 13127.747,
+      "2": 836.2345,
+      "0": 391.6165
+    },
+    "legacy_scratch": {
+      "1": 474.472,
+      "8": 1000.1505,
+      "32": 2855.4835000000003,
+      "64": 5306.0695,
+      "2": 536.326,
+      "0": 350.5765
+    },
+    "legacy_both": {
+      "1": 702.7125,
+      "8": 2043.5375,
+      "32": 6704.724,
+      "64": 12932.4465,
+      "2": 851.335,
+      "0": 398.14099999999996
+    }
+  }
+}

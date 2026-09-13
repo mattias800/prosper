@@ -251,6 +251,25 @@ int main() {
         adaptive_storage_result_validation_enabled;
     const bool cold_storage_snapshot_deferral_enabled =
         adaptive_storage_result_validation_enabled;
+    using prosper::frontend::compute_result_compare_group_count;
+    CHECK(compute_result_compare_group_count(16, 16, 1) == 1 &&
+          compute_result_compare_group_count(4096, 4096, 1) == 1 &&
+          compute_result_compare_group_count(4112, 4112, 2) == 2,
+          "GPU comparison includes exact descriptor and dispatch boundaries");
+    CHECK(!compute_result_compare_group_count(4112, 4096, 2) &&
+          !compute_result_compare_group_count(4112, 4112, 1),
+          "GPU comparison retains CPU fallback beyond either device limit");
+    CHECK(compute_result_compare_group_count(66846720, UINT32_MAX, 65535) == 16320 &&
+          compute_result_compare_group_count(268431360, UINT32_MAX, 65535) == 65535 &&
+          !compute_result_compare_group_count(268431376, UINT32_MAX, 65535),
+          "larger baselines cannot exceed the portable dispatch X boundary");
+    CHECK(!compute_result_compare_group_count(0, UINT32_MAX, UINT32_MAX) &&
+          !compute_result_compare_group_count(17, UINT32_MAX, UINT32_MAX) &&
+          !compute_result_compare_group_count(16, 0, UINT32_MAX) &&
+          !compute_result_compare_group_count(16, UINT32_MAX, 0) &&
+          !compute_result_compare_group_count(UINT64_MAX, UINT32_MAX, UINT32_MAX) &&
+          !compute_result_compare_group_count(UINT64_MAX - 15, UINT32_MAX, UINT32_MAX),
+          "invalid or oversized comparison ranges decline without overflow");
     using prosper::frontend::ComputeImageCacheClass;
     CHECK(prosper::frontend::compute_image_cache_default_minimum_bytes(
               ComputeImageCacheClass::sampled) == 4ull * 1024ull &&

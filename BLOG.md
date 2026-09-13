@@ -21,6 +21,24 @@ from the tracker issues, and still gated, because it is a projection of state ra
 
 ## 2026-09-13
 
+### Cheaper preparation, more GPU comparisons
+
+GTA retains its lit bank, while Sonic still shows its HUD over a missing world; the
+[combined performance measurements](prosper/docs/SHADER_KEY_PREPARATION_2026_09.md) show cheaper
+preparation and higher observed Sonic presentation rates, with more memory retained.
+
+*Linux `prosper-app` with FPS overlay: Sonic gameplay route, then GTA Performance Story; legacy/new
+keys, capacity controls and final defaults are identified below.*
+
+![key-legacy-sonic](prosper/docs/screenshots/3407-resource-key-legacy-sonic.webp)
+![key-default-sonic](prosper/docs/screenshots/3407-resource-key-default-sonic.webp)
+![capacity-current-512-sonic](prosper/docs/screenshots/3407-resource-capacity-current-512-sonic.webp)
+![capacity-current-256-repeat-sonic](prosper/docs/screenshots/3407-resource-capacity-current-256-repeat-sonic.webp)
+![final-defaults-sonic](prosper/docs/screenshots/3407-resource-final-defaults-sonic.webp)
+![key-default-gta](prosper/docs/screenshots/3407-resource-key-default-gta.webp)
+![key-legacy-gta](prosper/docs/screenshots/3407-resource-key-legacy-gta.webp)
+![final-defaults-gta](prosper/docs/screenshots/3407-resource-final-defaults-gta.webp)
+
 ### Making room for exact comparisons
 
 Sonic retains its known black world and HUD, while GTA retains the lit Performance Story bank;

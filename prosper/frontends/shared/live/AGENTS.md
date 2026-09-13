@@ -76,7 +76,8 @@ production backend without a frontend or a game dump.
 
 ## Measuring buffer setup and writeback
 
-The persistent buffer budget charges primary allocations and optional exact-result baselines.
+The persistent buffer budget defaults to 512 MiB and charges primary allocations and optional
+exact-result baselines. `PROSPER_COMPUTE_BUFFER_CACHE_MB` overrides it; zero disables retention.
 Primary admission first proves that enough unpinned storage can be reclaimed, then drops unpinned
 baselines before evicting primary entries. Baseline admission uses spare capacity or owners that
 have been unused for at least 256 cache insertions/acquisitions; it proves enough eligible capacity
@@ -86,6 +87,10 @@ pin protects both handles through completion; a failed submission without comple
 that pin. Reclaiming a baseline preserves the primary's guest-content validation and write watches.
 Unchanged writeback preserves watch-promotion progress already earned by exact source validation;
 it neither resets that progress nor counts it a second time. Changed content resets progress.
+`compute_result_compare_group_count()` checks the real device's storage-descriptor range and
+X-dispatch limit before GPU baseline retention or comparison. Unsupported extents keep exact CPU
+comparison; otherwise eligible storage images rejected by the device-limit guard retain the
+current host snapshot instead of transferring GPU ownership.
 
 `PROSPER_COMPUTE_BUFFER_TIMING=1` emits `[compute-buffer-timing]` records after cleanup. Use
 `PROSPER_COMPUTE_TIMING_CODE` / `PROSPER_COMPUTE_TIMING_HASH` to select a program and

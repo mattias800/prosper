@@ -1989,6 +1989,16 @@ if(TARGET prosper_core)
   target_include_directories(test_shader_recompile_cache PRIVATE tests)
   target_link_libraries(test_shader_recompile_cache PRIVATE prosper_core)
   add_test(NAME shader_recompile_cache COMMAND test_shader_recompile_cache)
+  # Each policy is frozen for the process lifetime; exercise all combinations in separate tests.
+  foreach(key_policy IN ITEMS legacy_hash legacy_scratch legacy_both)
+    add_test(NAME shader_recompile_cache_${key_policy} COMMAND test_shader_recompile_cache)
+  endforeach()
+  set_tests_properties(shader_recompile_cache_legacy_hash PROPERTIES
+    ENVIRONMENT "PROSPER_NO_SHADER_KEY_WORD_HASH=1")
+  set_tests_properties(shader_recompile_cache_legacy_scratch PROPERTIES
+    ENVIRONMENT "PROSPER_NO_SHADER_KEY_SCRATCH=1")
+  set_tests_properties(shader_recompile_cache_legacy_both PROPERTIES
+    ENVIRONMENT "PROSPER_NO_SHADER_KEY_WORD_HASH=1;PROSPER_NO_SHADER_KEY_SCRATCH=1")
 
   # RDNA2 shader instruction-stream walker (first stage of the RDNA2->SPIR-V recompiler).
   add_executable(test_compressed_source_authority tests/gpu/resources/test_compressed_source_authority.cpp)

@@ -4,6 +4,9 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <chrono>
+#include <cstring>
+#include <new>
 #include <cstdlib>
 #include <cstdio>
 #include <filesystem>
@@ -19,6 +22,25 @@
 #endif
 #include "fixtures/gta5_nullable_output_fixture.hpp"
 #include "fixtures/test_scratch.h"
+
+// Observe scalar C++ allocation requests only during an already-warm public cache call.
+// This includes the production key vector; it does not measure malloc, GPU memory or RSS.
+namespace {
+thread_local bool count_key_allocations = false;
+thread_local size_t key_allocations = 0;
+thread_local size_t largest_key_allocation = 0;
+}
+void* operator new(std::size_t bytes) {
+    void* result = std::malloc(bytes ? bytes : 1);
+    if (!result) throw std::bad_alloc();
+    if (count_key_allocations) {
+        ++key_allocations;
+        if (bytes > largest_key_allocation) largest_key_allocation = bytes;
+    }
+    return result;
+}
+void operator delete(void* pointer) noexcept { std::free(pointer); }
+void operator delete(void* pointer, std::size_t) noexcept { std::free(pointer); }
 
 using namespace prosper::gpu;
 
@@ -170,7 +192,132 @@ static void set_env_for_test(const char* name, const char* value) {
 #endif
 }
 
-int main() {
+// Exercise actual lookup construction across several resource counts and code-generation
+// contexts. Optional timing reports the entire warm shared-module API, not the hash in isolation.
+// No timing threshold is a test assertion. Run policy controls in separate processes.
+static void check_warm_key_preparation(size_t iterations, bool report_timing) {
+    clear_shader_recompile_cache();
+    clear_shader_analysis_cache();
+    const size_t context_count = report_timing ? 64 : 8;
+    ShaderResourceTable large_table;
+    SharedShaderWords large_module;
+    uint64_t large_identity = 0;
+    for (size_t resource_count : {size_t{1}, size_t{8}, size_t{32}, size_t{64}, size_t{2}, size_t{0}}) {
+        std::vector<ShaderResourceTable> tables(context_count);
+        std::vector<SharedShaderWords> modules(context_count);
+        std::vector<uint64_t> identities(context_count);
+        bool direct_match = true, distinct = true;
+        for (size_t context = 0; context < context_count; ++context) {
+            auto& table = tables[context];
+            table.vertices_per_instance = resource_count ? 1u : static_cast<uint32_t>(context + 1);
+            for (size_t i = 0; i < resource_count; ++i) {
+                ShaderResource resource;
+                resource.cls = ResourceClass::VertexBuffer;
+                resource.format = DataFormat::Float32;
+                resource.num_components = 3;
+                resource.binding = static_cast<uint32_t>(7 + i);
+                // All table-level inputs stay identical when resources are present. Vary only
+                // the last resource, so early/header-only hashing cannot mask that workload.
+                resource.stride = static_cast<uint32_t>(12 + (i + 1 == resource_count ? context * 4 : 0));
+                resource.srt_offset = static_cast<uint32_t>(0x20 + i * 16);
+                resource.sgpr_base = 8;
+                resource.fetch_pc = static_cast<uint32_t>(4 + i * 4);
+                resource.gpu_addr = 0x100000;
+                resource.size = 4096;
+                table.resources.push_back(resource);
+            }
+            modules[context] = recompile_graphics_shader_cached_shared(
+                ShaderProgramStage::Vertex, kVs, std::size(kVs), &table,
+                nullptr, nullptr, &identities[context]);
+            const auto direct = recompile_vertex(kVs, std::size(kVs), &table);
+            direct_match &= modules[context] && !modules[context]->empty() && *modules[context] == direct;
+            for (size_t previous = 0; previous < context; ++previous)
+                distinct &= identities[context] != identities[previous];
+        }
+        CHECK(direct_match, "resource-key preparation preserves direct SPIR-V");
+        CHECK(distinct, "changed compilation context remains a distinct cache entry");
+        if (resource_count == 2) {
+            // A smaller miss must give oversized scratch back before transferring its key to
+            // the cache. An immediate large hit detects losing that allocation to a small key.
+            key_allocations = 0;
+            count_key_allocations = true;
+            uint64_t identity = 0;
+            const auto hit = recompile_graphics_shader_cached_shared(
+                ShaderProgramStage::Vertex, kVs, std::size(kVs), &large_table,
+                nullptr, nullptr, &identity);
+            count_key_allocations = false;
+            CHECK(hit == large_module && identity == large_identity &&
+                      key_allocations == (std::getenv("PROSPER_NO_SHADER_KEY_SCRATCH") ? 1u : 0u),
+                  "a smaller missing key preserves scratch for the next large warm key");
+        }
+        // Cache misses transfer their key allocation to the cache; warm scratch once afterwards.
+        (void)recompile_graphics_shader_cached_shared(
+            ShaderProgramStage::Vertex, kVs, std::size(kVs), &tables[0]);
+        const auto before = shader_recompile_cache_stats();
+        bool stable = true;
+        key_allocations = 0;
+        const auto start = std::chrono::steady_clock::now();
+        count_key_allocations = true;
+        for (size_t i = 0; i < iterations; ++i) {
+            const size_t context = i % context_count;
+            uint64_t identity = 0;
+            const auto hit = recompile_graphics_shader_cached_shared(
+                ShaderProgramStage::Vertex, kVs, std::size(kVs), &tables[context],
+                nullptr, nullptr, &identity);
+            stable &= hit == modules[context] && identity == identities[context];
+        }
+        count_key_allocations = false;
+        const auto end = std::chrono::steady_clock::now();
+        const auto after = shader_recompile_cache_stats();
+        CHECK(stable && after.hits == before.hits + iterations && after.misses == before.misses,
+              "warm multi-context lookups preserve module ownership and hit exactly once");
+        const bool legacy_scratch = std::getenv("PROSPER_NO_SHADER_KEY_SCRATCH") != nullptr;
+        CHECK(key_allocations == (legacy_scratch && resource_count ? iterations : 0),
+              "warm resource keys allocate only with scratch reuse disabled");
+        if (resource_count == 64) {
+            large_table = tables[0];
+            large_module = modules[0];
+            large_identity = identities[0];
+        }
+        if (report_timing) {
+            uint64_t checksum = 1469598103934665603ull;
+            for (const auto& module : modules)
+                for (uint32_t word : *module) checksum = (checksum ^ word) * 1099511628211ull;
+            const double elapsed_ns =
+                std::chrono::duration<double, std::nano>(end - start).count();
+            std::printf("{\"resources\":%zu,\"contexts\":%zu,\"iterations\":%zu,"
+                        "\"ns_per_lookup\":%.3f,\"allocations\":%zu,"
+                        "\"spirv_checksum\":\"%016llx\"}\n",
+                        resource_count, context_count, iterations, elapsed_ns / iterations,
+                        key_allocations, static_cast<unsigned long long>(checksum));
+        }
+    }
+    if (!report_timing) {
+        // An unusually large resource table remains valid but must not stay in idle TLS storage.
+        large_table.resources.resize(512, large_table.resources.front());
+        for (size_t i = 0; i < large_table.resources.size(); ++i) {
+            large_table.resources[i].binding = static_cast<uint32_t>(7 + i);
+            large_table.resources[i].fetch_pc = static_cast<uint32_t>(4 + i * 4);
+        }
+        const auto oversized = recompile_graphics_shader_cached_shared(
+            ShaderProgramStage::Vertex, kVs, std::size(kVs), &large_table);
+        (void)recompile_graphics_shader_cached_shared(
+            ShaderProgramStage::Vertex, kVs, std::size(kVs), &large_table);
+        key_allocations = largest_key_allocation = 0;
+        count_key_allocations = true;
+        const auto oversized_hit = recompile_graphics_shader_cached_shared(
+            ShaderProgramStage::Vertex, kVs, std::size(kVs), &large_table);
+        count_key_allocations = false;
+        CHECK(oversized && !oversized->empty() && oversized_hit == oversized && key_allocations == 1 &&
+                  largest_key_allocation > 65536,
+              "over-limit resource-key storage is not retained between warm lookups");
+    }
+}
+
+int main(int argc, char** argv) {
+    const bool benchmark = argc == 2 && std::strcmp(argv[1], "--benchmark-key-preparation") == 0;
+    check_warm_key_preparation(benchmark ? 100000 : 64, benchmark);
+    if (benchmark) return failures ? 1 : 0;
     std::printf("== test_shader_recompile_cache ==\n");
     clear_shader_recompile_cache();
     clear_shader_analysis_cache();
