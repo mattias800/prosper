@@ -1,0 +1,942 @@
+{
+  "capture_head": "5603a8821ed168ca0a4fe04a2473db5cc9943049",
+  "base_main": "3c4e4db9a2e5",
+  "method": "Separate20s CPU/GPU profiles at250s; F8 at300s; F9 aftertiming. Samebinary GPU/CPU GTA pair, Sonic andBluePrince compatibility only. No newlyrendered FPS measurement. Summary regenerated from unchanged raw captures with reporter identity fix.",
+  "runs": [
+    {
+      "label": "storage-gpu-gta",
+      "arm": "enabled",
+      "head": "5603a8821ed168ca0a4fe04a2473db5cc9943049",
+      "binary_sha256": "61dc303b709a107e1590987cc1e65436bea2256678d180203a7dbfa50a2b7d5a",
+      "route_sha256": "683994c1b5e6fb14b07e90e7d07390d52a1ffb7ebbf1cc496d2b92489c81ed7a",
+      "started_utc": "2026-09-13T15:36:51.969408+00:00",
+      "separate_gpu_load": {
+        "samples": 20,
+        "mean_percent": 8.5,
+        "min_percent": 0.0,
+        "max_percent": 30.0
+      },
+      "summary": {
+        "title_id": "PPSA04263",
+        "title": "PPSA04263 (Grand Theft Auto V)",
+        "revision": "5603a8821ed168ca0a4fe04a2473db5cc9943049",
+        "seconds": 5.019220616,
+        "cpu_cores": 1.4335651987607312,
+        "rss_min": 9328820224,
+        "rss_max": 9329082368,
+        "private_min": null,
+        "private_max": null,
+        "rates": {
+          "guest_fps": 6.375491823968074,
+          "rendered_fps": null,
+          "host_fps": 6.375491823968074
+        },
+        "graphics_total_ms": 2643.51278,
+        "compute_total_ms": 1246.895113,
+        "compute_cpu_phases": {
+          "setup_ms": 218.714522,
+          "pipeline_ms": 13.428678,
+          "dispatch_wait_ms": 443.965529,
+          "writeback_ms": 390.973305,
+          "cleanup_ms": 13.990757
+        },
+        "compute_gpu_brackets": {
+          "gpu_pre_ms": 25.3319309824255,
+          "gpu_shader_ms": 194.7256210926946,
+          "gpu_storage_copy_ms": 110.369824032133,
+          "gpu_compare_ms": 2.08664465071597,
+          "gpu_restore_ms": 0.3587616515867
+        },
+        "compute_gpu_device_ms": 332.872782410871,
+        "gpu_timestamp_samples": 1222,
+        "gpu_timestamps_available": true,
+        "components": {
+          "renderer-resource": 1422.672836,
+          "gpu-wait": 532.136823,
+          "gpu-device": 341.285646954854,
+          "gpu-wait-overhead": 190.85117604514608,
+          "readback": 46.984782,
+          "compute": 1246.895113
+        },
+        "resource_breakdown": {
+          "build_resources": 919.795432,
+          "frontend_texture": 652.920522,
+          "frontend_buffer": 134.687857,
+          "setup_resources": 502.877404,
+          "backend_available": true,
+          "gpu_detile_available": true,
+          "gpu_detile": {
+            "preparations": 33,
+            "2d_preparations": 33,
+            "source_bytes": 129763920
+          },
+          "texture_source_snapshot_available": true,
+          "texture_source_snapshot": {
+            "copied_bytes": 129761280,
+            "transferred_bytes": 1102970880,
+            "handoff_ms": 4.99173
+          },
+          "tex_classes_available": true,
+          "tex_rtt": 236.31637800000001,
+          "tex_compute": 1.988087,
+          "tex_local": 24.84032,
+          "tex_persist_hit": 182.102414,
+          "tex_persist_reuse": 0.0,
+          "tex_persist_miss": 0.0,
+          "tex_invalid_available": true,
+          "tex_persist_invalid": 182.23157700000002,
+          "tex_other_n_available": true,
+          "tex_other_n": 99,
+          "tex_other": 25.441745999999966,
+          "tex_other_witness": {
+            "ms": 0.8296,
+            "addr": 139712528384,
+            "source_bytes": 0,
+            "width": 1280,
+            "height": 720,
+            "depth": 1,
+            "format": 4,
+            "components": 2,
+            "tile_mode": 27,
+            "resource_class": 4,
+            "resource_class_name": "StorageImage",
+            "img_dim": 1,
+            "depth_compare": false,
+            "host_backed": false,
+            "compute_candidate": false,
+            "persistent_candidate": false,
+            "compressed": false
+          },
+          "res_texture": 108.26018,
+          "res_buffer": 306.763892,
+          "res_buffer_copy": 160.718524,
+          "res_descriptor": 48.891709,
+          "buffer_leaves_available": true,
+          "buffer_residency_available": true,
+          "buffer_residency": {
+            "buffer_upload_bytes": 7526671716,
+            "buffer_resident_hits": 0,
+            "buffer_resident_compared_bytes": 0,
+            "buffer_resident_reused_bytes": 0,
+            "buffer_resident_admitted_bytes": 0,
+            "buffer_resident_refreshed_bytes": 0,
+            "buffer_resident_declined_bytes": 0,
+            "buffer_resident_ineligible_bytes": 7440413616,
+            "res_buffer_resident_ms": 0
+          },
+          "buffer_watch_available": true,
+          "buffer_watch": {
+            "buffer_resident_watched_bytes": 0,
+            "res_buffer_watch_ms": 0
+          },
+          "res_buffer_create": 0.0,
+          "res_buffer_index_find": 45.353557,
+          "res_buffer_index_insert": 17.392828,
+          "res_buffer_hash": 17.24465,
+          "res_buffer_other": 66.05433299999999,
+          "res_other": 38.961623000000024,
+          "res_over_attributed": 0.0
+        },
+        "classification": "inconclusive",
+        "reason": "measured work is split across components; no component reaches the 40% evidence threshold",
+        "pacing_note": null,
+        "readback_note": null,
+        "truncation": "detail not truncated",
+        "counts": {
+          "pre": 20,
+          "post": 21,
+          "renderer": 825,
+          "compute": 2217
+        }
+      },
+      "audio_note": "Per-output/open-generation cumulative demand; FLOW sums reset intervals only. Queue-log-order brackets are not precise cross-thread timestamps. No physical XRUN claim.",
+      "audio_active": {
+        "17/1/active": {
+          "first_shortfalls": 1,
+          "last_shortfalls": 2,
+          "near_f8": [
+            {
+              "t_us": 299349635,
+              "calls": 14027,
+              "shortfall_calls": 2
+            },
+            {
+              "t_us": 300351632,
+              "calls": 14074,
+              "shortfall_calls": 2
+            },
+            {
+              "t_us": 301351631,
+              "calls": 14121,
+              "shortfall_calls": 2
+            },
+            {
+              "t_us": 302353631,
+              "calls": 14168,
+              "shortfall_calls": 2
+            },
+            {
+              "t_us": 303355630,
+              "calls": 14215,
+              "shortfall_calls": 2
+            },
+            {
+              "t_us": 304355630,
+              "calls": 14262,
+              "shortfall_calls": 2
+            },
+            {
+              "t_us": 305355633,
+              "calls": 14309,
+              "shortfall_calls": 2
+            }
+          ]
+        },
+        "18/1/active": {
+          "first_shortfalls": 1,
+          "last_shortfalls": 39,
+          "near_f8": []
+        }
+      },
+      "audio_flow": {
+        "ctx0/sink17/guest1": {
+          "intervals": 359,
+          "first_preceding_queue_s": 1.099622,
+          "last_preceding_queue_s": 360.05363,
+          "sum": {
+            "reads": 67490,
+            "mixed": 67490,
+            "frames": 17277440,
+            "bytes": 138219520,
+            "no-pcm": 0,
+            "short": 0,
+            "no-grain": 0,
+            "published": 67490,
+            "replaced-pending": 0
+          }
+        },
+        "ctx0/sink17/guest2": {
+          "intervals": 359,
+          "first_preceding_queue_s": 1.099622,
+          "last_preceding_queue_s": 360.05363,
+          "sum": {
+            "reads": 67490,
+            "mixed": 67490,
+            "frames": 17277440,
+            "bytes": 138219520,
+            "no-pcm": 0,
+            "short": 0,
+            "no-grain": 0,
+            "published": 67490,
+            "replaced-pending": 0
+          }
+        },
+        "ctx1/sink18/guest77": {
+          "intervals": 14,
+          "first_preceding_queue_s": 1.183629,
+          "last_preceding_queue_s": 14.217631,
+          "sum": {
+            "reads": 2631,
+            "mixed": 2631,
+            "frames": 673536,
+            "bytes": 2694144,
+            "no-pcm": 0,
+            "short": 0,
+            "no-grain": 0,
+            "published": 2632,
+            "replaced-pending": 0
+          }
+        }
+      },
+      "visual_file": "frame_grab_PPSA04263_20260913-174202-665.bmp",
+      "visual_sha256": "cebdb4004d17d076bfe2ce386a20208c6d008d6aba20f44f47645e6915314a48",
+      "bundle_bytes": 1386369214,
+      "validation_complete": true,
+      "foreign_samples": []
+    },
+    {
+      "label": "storage-cpu-gta",
+      "arm": "disabled",
+      "head": "5603a8821ed168ca0a4fe04a2473db5cc9943049",
+      "binary_sha256": "61dc303b709a107e1590987cc1e65436bea2256678d180203a7dbfa50a2b7d5a",
+      "route_sha256": "683994c1b5e6fb14b07e90e7d07390d52a1ffb7ebbf1cc496d2b92489c81ed7a",
+      "started_utc": "2026-09-13T15:43:35.821888+00:00",
+      "separate_gpu_load": {
+        "samples": 20,
+        "mean_percent": 9.5,
+        "min_percent": 0.0,
+        "max_percent": 40.0
+      },
+      "summary": {
+        "title_id": "PPSA04263",
+        "title": "PPSA04263 (Grand Theft Auto V)",
+        "revision": "5603a8821ed168ca0a4fe04a2473db5cc9943049",
+        "seconds": 4.769721174,
+        "cpu_cores": 1.4495469960986864,
+        "rss_min": 9715462144,
+        "rss_max": 9715478528,
+        "private_min": null,
+        "private_max": null,
+        "rates": {
+          "guest_fps": 6.080019972253414,
+          "rendered_fps": null,
+          "host_fps": 6.2896758333656
+        },
+        "graphics_total_ms": 2591.010945,
+        "compute_total_ms": 1174.35418,
+        "compute_cpu_phases": {
+          "setup_ms": 211.126614,
+          "pipeline_ms": 13.143668,
+          "dispatch_wait_ms": 417.076682,
+          "writeback_ms": 358.54301,
+          "cleanup_ms": 13.198053
+        },
+        "compute_gpu_brackets": {
+          "gpu_pre_ms": 23.766276219042698,
+          "gpu_shader_ms": 184.4747042214438,
+          "gpu_storage_copy_ms": 104.3529919771604,
+          "gpu_compare_ms": 1.95956319443404,
+          "gpu_restore_ms": 0.33195071046443997
+        },
+        "compute_gpu_device_ms": 314.885486317375,
+        "gpu_timestamp_samples": 1159,
+        "gpu_timestamps_available": true,
+        "components": {
+          "renderer-resource": 1406.808061,
+          "gpu-wait": 521.03048,
+          "gpu-device": 337.363675159982,
+          "gpu-wait-overhead": 183.66680484001802,
+          "readback": 45.783407,
+          "compute": 1174.35418
+        },
+        "resource_breakdown": {
+          "build_resources": 922.21359,
+          "frontend_texture": 665.951828,
+          "frontend_buffer": 131.133558,
+          "setup_resources": 484.594471,
+          "backend_available": true,
+          "gpu_detile_available": true,
+          "gpu_detile": {
+            "preparations": 0,
+            "2d_preparations": 0,
+            "source_bytes": 0
+          },
+          "texture_source_snapshot_available": true,
+          "texture_source_snapshot": {
+            "copied_bytes": 121896960,
+            "transferred_bytes": 1069547520,
+            "handoff_ms": 5.580405
+          },
+          "tex_classes_available": true,
+          "tex_rtt": 241.499283,
+          "tex_compute": 1.886451,
+          "tex_local": 23.27708,
+          "tex_persist_hit": 170.174646,
+          "tex_persist_reuse": 0.0,
+          "tex_persist_miss": 0.0,
+          "tex_invalid_available": true,
+          "tex_persist_invalid": 171.646142,
+          "tex_other_n_available": true,
+          "tex_other_n": 94,
+          "tex_other": 57.46822599999996,
+          "tex_other_witness": {
+            "ms": 1.982448,
+            "addr": 139712528384,
+            "source_bytes": 0,
+            "width": 1280,
+            "height": 720,
+            "depth": 1,
+            "format": 4,
+            "components": 2,
+            "tile_mode": 27,
+            "resource_class": 4,
+            "resource_class_name": "StorageImage",
+            "img_dim": 1,
+            "depth_compare": false,
+            "host_backed": false,
+            "compute_candidate": false,
+            "persistent_candidate": false,
+            "compressed": false
+          },
+          "res_texture": 113.219084,
+          "res_buffer": 287.91356,
+          "res_buffer_copy": 149.248596,
+          "res_descriptor": 47.003276,
+          "buffer_leaves_available": true,
+          "buffer_residency_available": true,
+          "buffer_residency": {
+            "buffer_upload_bytes": 7058366976,
+            "buffer_resident_hits": 0,
+            "buffer_resident_compared_bytes": 0,
+            "buffer_resident_reused_bytes": 0,
+            "buffer_resident_admitted_bytes": 0,
+            "buffer_resident_refreshed_bytes": 0,
+            "buffer_resident_declined_bytes": 0,
+            "buffer_resident_ineligible_bytes": 6977068848,
+            "res_buffer_resident_ms": 0
+          },
+          "buffer_watch_available": true,
+          "buffer_watch": {
+            "buffer_resident_watched_bytes": 0,
+            "res_buffer_watch_ms": 0
+          },
+          "res_buffer_create": 0.0,
+          "res_buffer_index_find": 42.677258,
+          "res_buffer_index_insert": 16.848807,
+          "res_buffer_hash": 16.103961,
+          "res_buffer_other": 63.03493800000004,
+          "res_other": 36.45855099999997,
+          "res_over_attributed": 0.0
+        },
+        "classification": "inconclusive",
+        "reason": "measured work is split across components; no component reaches the 40% evidence threshold",
+        "pacing_note": null,
+        "readback_note": null,
+        "truncation": "detail not truncated",
+        "counts": {
+          "pre": 20,
+          "post": 20,
+          "renderer": 780,
+          "compute": 2085
+        }
+      },
+      "audio_note": "Per-output/open-generation cumulative demand; FLOW sums reset intervals only. Queue-log-order brackets are not precise cross-thread timestamps. No physical XRUN claim.",
+      "audio_active": {
+        "17/1/active": {
+          "first_shortfalls": 1,
+          "last_shortfalls": 2,
+          "near_f8": [
+            {
+              "t_us": 299327050,
+              "calls": 14026,
+              "shortfall_calls": 2
+            },
+            {
+              "t_us": 300329049,
+              "calls": 14073,
+              "shortfall_calls": 2
+            },
+            {
+              "t_us": 301329052,
+              "calls": 14120,
+              "shortfall_calls": 2
+            },
+            {
+              "t_us": 302329052,
+              "calls": 14166,
+              "shortfall_calls": 2
+            },
+            {
+              "t_us": 303329066,
+              "calls": 14213,
+              "shortfall_calls": 2
+            },
+            {
+              "t_us": 304331049,
+              "calls": 14260,
+              "shortfall_calls": 2
+            },
+            {
+              "t_us": 305333048,
+              "calls": 14307,
+              "shortfall_calls": 2
+            }
+          ]
+        },
+        "18/1/active": {
+          "first_shortfalls": 2,
+          "last_shortfalls": 41,
+          "near_f8": []
+        }
+      },
+      "audio_flow": {
+        "ctx0/sink17/guest1": {
+          "intervals": 359,
+          "first_preceding_queue_s": 1.099063,
+          "last_preceding_queue_s": 360.055047,
+          "sum": {
+            "reads": 67490,
+            "mixed": 67490,
+            "frames": 17277440,
+            "bytes": 138219520,
+            "no-pcm": 0,
+            "short": 0,
+            "no-grain": 0,
+            "published": 67490,
+            "replaced-pending": 0
+          }
+        },
+        "ctx0/sink17/guest2": {
+          "intervals": 359,
+          "first_preceding_queue_s": 1.099063,
+          "last_preceding_queue_s": 360.055047,
+          "sum": {
+            "reads": 67490,
+            "mixed": 67490,
+            "frames": 17277440,
+            "bytes": 138219520,
+            "no-pcm": 0,
+            "short": 0,
+            "no-grain": 0,
+            "published": 67490,
+            "replaced-pending": 0
+          }
+        },
+        "ctx1/sink18/guest77": {
+          "intervals": 14,
+          "first_preceding_queue_s": 1.18505,
+          "last_preceding_queue_s": 14.219047,
+          "sum": {
+            "reads": 2631,
+            "mixed": 2631,
+            "frames": 673536,
+            "bytes": 2694144,
+            "no-pcm": 0,
+            "short": 0,
+            "no-grain": 0,
+            "published": 2632,
+            "replaced-pending": 0
+          }
+        }
+      },
+      "visual_file": "frame_grab_PPSA04263_20260913-174846-236.bmp",
+      "visual_sha256": "7af9007ced1747f62a063a041665b7d135b3e910c869c7453957c2654c2c49e8",
+      "bundle_bytes": 1372817170,
+      "validation_complete": true,
+      "foreign_samples": []
+    },
+    {
+      "label": "storage-gpu-sonic",
+      "arm": "enabled",
+      "head": "5603a8821ed168ca0a4fe04a2473db5cc9943049",
+      "binary_sha256": "61dc303b709a107e1590987cc1e65436bea2256678d180203a7dbfa50a2b7d5a",
+      "route_sha256": "1468421f7b87b21f07287af8b9e79fd0f0963811cfacdf3a69448dcef7f7decd",
+      "started_utc": "2026-09-13T15:50:23.194589+00:00",
+      "separate_gpu_load": {
+        "samples": 20,
+        "mean_percent": 16.5,
+        "min_percent": 0.0,
+        "max_percent": 30.0
+      },
+      "summary": {
+        "title_id": "PPSA03831",
+        "title": "PPSA03831 (SONIC FRONTIERS)",
+        "revision": "5603a8821ed168ca0a4fe04a2473db5cc9943049",
+        "seconds": 5.027351872,
+        "cpu_cores": 1.241076646086809,
+        "rss_min": 4737355776,
+        "rss_max": 4737437696,
+        "private_min": null,
+        "private_max": null,
+        "rates": {
+          "guest_fps": 8.155386979843373,
+          "rendered_fps": null,
+          "host_fps": 8.155386979843373
+        },
+        "graphics_total_ms": 2118.731131,
+        "compute_total_ms": 1598.149358,
+        "compute_cpu_phases": {
+          "setup_ms": 156.067464,
+          "pipeline_ms": 5.25939,
+          "dispatch_wait_ms": 666.2163,
+          "writeback_ms": 478.411457,
+          "cleanup_ms": 27.471542
+        },
+        "compute_gpu_brackets": {
+          "gpu_pre_ms": 100.9674794616157,
+          "gpu_shader_ms": 151.6022060685155,
+          "gpu_storage_copy_ms": 144.7991601983887,
+          "gpu_compare_ms": 103.65173958889687,
+          "gpu_restore_ms": 0.1312092992915
+        },
+        "compute_gpu_device_ms": 501.151794609687,
+        "gpu_timestamp_samples": 935,
+        "gpu_timestamps_available": true,
+        "components": {
+          "renderer-resource": 817.514397,
+          "gpu-wait": 697.766746,
+          "gpu-device": 577.136847155483,
+          "gpu-wait-overhead": 120.62989884451702,
+          "readback": 0.177047,
+          "compute": 1598.149358
+        },
+        "resource_breakdown": {
+          "build_resources": 435.807829,
+          "frontend_texture": 342.824534,
+          "frontend_buffer": 40.692931,
+          "setup_resources": 381.706568,
+          "backend_available": true,
+          "gpu_detile_available": true,
+          "gpu_detile": {
+            "preparations": 267,
+            "2d_preparations": 0,
+            "source_bytes": 3359658864
+          },
+          "texture_source_snapshot_available": true,
+          "texture_source_snapshot": {
+            "copied_bytes": 0,
+            "transferred_bytes": 0,
+            "handoff_ms": 0
+          },
+          "tex_classes_available": true,
+          "tex_rtt": 12.882281,
+          "tex_compute": 4.204102,
+          "tex_local": 6.259487,
+          "tex_persist_hit": 97.607002,
+          "tex_persist_reuse": 0.0,
+          "tex_persist_miss": 0.0,
+          "tex_invalid_available": true,
+          "tex_persist_invalid": 0.0,
+          "tex_other_n_available": true,
+          "tex_other_n": 351,
+          "tex_other": 221.87166200000001,
+          "tex_other_witness": {
+            "ms": 0.994821,
+            "addr": 140192579584,
+            "source_bytes": 0,
+            "width": 512,
+            "height": 512,
+            "depth": 6,
+            "format": 4,
+            "components": 4,
+            "tile_mode": 27,
+            "resource_class": 2,
+            "resource_class_name": "Texture",
+            "img_dim": 3,
+            "depth_compare": false,
+            "host_backed": false,
+            "compute_candidate": false,
+            "persistent_candidate": false,
+            "compressed": false
+          },
+          "res_texture": 34.028762,
+          "res_buffer": 305.375043,
+          "res_buffer_copy": 240.551559,
+          "res_descriptor": 26.800117,
+          "buffer_leaves_available": true,
+          "buffer_residency_available": true,
+          "buffer_residency": {
+            "buffer_upload_bytes": 11795356736,
+            "buffer_resident_hits": 0,
+            "buffer_resident_compared_bytes": 0,
+            "buffer_resident_reused_bytes": 0,
+            "buffer_resident_admitted_bytes": 0,
+            "buffer_resident_refreshed_bytes": 0,
+            "buffer_resident_declined_bytes": 0,
+            "buffer_resident_ineligible_bytes": 11768490856,
+            "res_buffer_resident_ms": 0
+          },
+          "buffer_watch_available": true,
+          "buffer_watch": {
+            "buffer_resident_watched_bytes": 0,
+            "res_buffer_watch_ms": 0
+          },
+          "res_buffer_create": 0.0,
+          "res_buffer_index_find": 23.328147,
+          "res_buffer_index_insert": 8.76622,
+          "res_buffer_hash": 4.184559,
+          "res_buffer_other": 28.544558000000002,
+          "res_other": 15.502646000000027,
+          "res_over_attributed": 0.0
+        },
+        "classification": "compute",
+        "reason": "compute is the largest measured component (1598.1 ms, 43%)",
+        "pacing_note": null,
+        "readback_note": null,
+        "truncation": "detail not truncated",
+        "counts": {
+          "pre": 20,
+          "post": 21,
+          "renderer": 683,
+          "compute": 1441
+        }
+      },
+      "audio_note": "Per-output/open-generation cumulative demand; FLOW sums reset intervals only. Queue-log-order brackets are not precise cross-thread timestamps. No physical XRUN claim.",
+      "audio_active": {
+        "17/1/active": {
+          "first_shortfalls": 0,
+          "last_shortfalls": 1,
+          "near_f8": [
+            {
+              "t_us": 299338422,
+              "calls": 14013,
+              "shortfall_calls": 0
+            },
+            {
+              "t_us": 300340421,
+              "calls": 14060,
+              "shortfall_calls": 0
+            },
+            {
+              "t_us": 301340423,
+              "calls": 14107,
+              "shortfall_calls": 0
+            },
+            {
+              "t_us": 302340423,
+              "calls": 14154,
+              "shortfall_calls": 0
+            },
+            {
+              "t_us": 303342422,
+              "calls": 14201,
+              "shortfall_calls": 0
+            },
+            {
+              "t_us": 304344422,
+              "calls": 14248,
+              "shortfall_calls": 0
+            },
+            {
+              "t_us": 305346422,
+              "calls": 14295,
+              "shortfall_calls": 0
+            }
+          ]
+        }
+      },
+      "audio_flow": {
+        "ctx0/sink17/guest1": {
+          "intervals": 379,
+          "first_preceding_queue_s": 1.348421,
+          "last_preceding_queue_s": 380.370425,
+          "sum": {
+            "reads": 71248,
+            "mixed": 71248,
+            "frames": 18239488,
+            "bytes": 583663616,
+            "no-pcm": 2,
+            "short": 0,
+            "no-grain": 0,
+            "published": 71249,
+            "replaced-pending": 0
+          }
+        }
+      },
+      "visual_file": "frame_grab_PPSA03831_20260913-175553-714.bmp",
+      "visual_sha256": "5b1075b24943a6bb980f41f020cc66241ac512f08ea1fdadd76b78118b1f4cde",
+      "bundle_bytes": 1488741833,
+      "validation_complete": true,
+      "foreign_samples": []
+    },
+    {
+      "label": "storage-gpu-blue-prince",
+      "arm": "enabled",
+      "head": "5603a8821ed168ca0a4fe04a2473db5cc9943049",
+      "binary_sha256": "61dc303b709a107e1590987cc1e65436bea2256678d180203a7dbfa50a2b7d5a",
+      "route_sha256": null,
+      "started_utc": "2026-09-13T15:57:16.492647+00:00",
+      "separate_gpu_load": {
+        "samples": 20,
+        "mean_percent": 8.0,
+        "min_percent": 0.0,
+        "max_percent": 20.0
+      },
+      "summary": {
+        "title_id": "PPSA25009",
+        "title": "PPSA25009 (Blue Prince)",
+        "revision": "5603a8821ed168ca0a4fe04a2473db5cc9943049",
+        "seconds": 5.02673101,
+        "cpu_cores": 2.0403395327095493,
+        "rss_min": 5108670464,
+        "rss_max": 5108973568,
+        "private_min": null,
+        "private_max": null,
+        "rates": {
+          "guest_fps": 11.538313843453501,
+          "rendered_fps": null,
+          "host_fps": 11.538313843453501
+        },
+        "graphics_total_ms": 3595.043391,
+        "compute_total_ms": 16.355233,
+        "compute_cpu_phases": {
+          "setup_ms": 0.0,
+          "pipeline_ms": 0.0,
+          "dispatch_wait_ms": 0.0,
+          "writeback_ms": 0.0,
+          "cleanup_ms": 0.0
+        },
+        "compute_gpu_brackets": {
+          "gpu_pre_ms": 0.0,
+          "gpu_shader_ms": 0.0,
+          "gpu_storage_copy_ms": 0.0,
+          "gpu_compare_ms": 0.0,
+          "gpu_restore_ms": 0.0
+        },
+        "compute_gpu_device_ms": 0.0,
+        "gpu_timestamp_samples": 1475,
+        "gpu_timestamps_available": true,
+        "components": {
+          "renderer-resource": 2305.563121,
+          "gpu-wait": 218.836911,
+          "gpu-device": 102.029176695,
+          "gpu-wait-overhead": 116.80773430499998,
+          "readback": 0.181557,
+          "compute": 16.355233
+        },
+        "resource_breakdown": {
+          "build_resources": 690.060182,
+          "frontend_texture": 96.710348,
+          "frontend_buffer": 318.03206,
+          "setup_resources": 1615.502939,
+          "backend_available": true,
+          "gpu_detile_available": true,
+          "gpu_detile": {
+            "preparations": 0,
+            "2d_preparations": 0,
+            "source_bytes": 0
+          },
+          "texture_source_snapshot_available": true,
+          "texture_source_snapshot": {
+            "copied_bytes": 0,
+            "transferred_bytes": 0,
+            "handoff_ms": 0
+          },
+          "tex_classes_available": true,
+          "tex_rtt": 10.026772,
+          "tex_compute": 0.0,
+          "tex_local": 66.530092,
+          "tex_persist_hit": 20.153484,
+          "tex_persist_reuse": 0.0,
+          "tex_persist_miss": 0.0,
+          "tex_invalid_available": true,
+          "tex_persist_invalid": 0.0,
+          "tex_other_n_available": true,
+          "tex_other_n": 0,
+          "tex_other": 0.0,
+          "res_texture": 43.470104,
+          "res_buffer": 1390.135192,
+          "res_buffer_copy": 1111.388196,
+          "res_descriptor": 61.181645,
+          "buffer_leaves_available": true,
+          "buffer_residency_available": true,
+          "buffer_residency": {
+            "buffer_upload_bytes": 53787299888,
+            "buffer_resident_hits": 0,
+            "buffer_resident_compared_bytes": 0,
+            "buffer_resident_reused_bytes": 0,
+            "buffer_resident_admitted_bytes": 0,
+            "buffer_resident_refreshed_bytes": 0,
+            "buffer_resident_declined_bytes": 0,
+            "buffer_resident_ineligible_bytes": 53703047968,
+            "res_buffer_resident_ms": 0
+          },
+          "buffer_watch_available": true,
+          "buffer_watch": {
+            "buffer_resident_watched_bytes": 0,
+            "res_buffer_watch_ms": 0
+          },
+          "res_buffer_create": 0.0,
+          "res_buffer_index_find": 77.584027,
+          "res_buffer_index_insert": 38.824319,
+          "res_buffer_hash": 18.196076,
+          "res_buffer_other": 144.14257399999985,
+          "res_other": 120.71599800000001,
+          "res_over_attributed": 0.0
+        },
+        "classification": "renderer-resource",
+        "reason": "renderer-resource is the largest measured component (2305.6 ms, 64%)",
+        "pacing_note": null,
+        "readback_note": null,
+        "truncation": "detail not truncated",
+        "counts": {
+          "pre": 20,
+          "post": 21,
+          "renderer": 59,
+          "compute": 1590
+        }
+      },
+      "audio_note": "Per-output/open-generation cumulative demand; FLOW sums reset intervals only. Queue-log-order brackets are not precise cross-thread timestamps. No physical XRUN claim.",
+      "audio_active": {
+        "1/1/active": {
+          "first_shortfalls": 1,
+          "last_shortfalls": 1,
+          "near_f8": [
+            {
+              "t_us": 299300678,
+              "calls": 14022,
+              "shortfall_calls": 1
+            },
+            {
+              "t_us": 300300681,
+              "calls": 14069,
+              "shortfall_calls": 1
+            },
+            {
+              "t_us": 301302679,
+              "calls": 14116,
+              "shortfall_calls": 1
+            },
+            {
+              "t_us": 302304678,
+              "calls": 14163,
+              "shortfall_calls": 1
+            },
+            {
+              "t_us": 303304678,
+              "calls": 14209,
+              "shortfall_calls": 1
+            },
+            {
+              "t_us": 304304694,
+              "calls": 14256,
+              "shortfall_calls": 1
+            },
+            {
+              "t_us": 305304695,
+              "calls": 14303,
+              "shortfall_calls": 1
+            }
+          ]
+        },
+        "2/1/active": {
+          "first_shortfalls": 0,
+          "last_shortfalls": 0,
+          "near_f8": [
+            {
+              "t_us": 299300678,
+              "calls": 0,
+              "shortfall_calls": 0
+            },
+            {
+              "t_us": 300300681,
+              "calls": 0,
+              "shortfall_calls": 0
+            },
+            {
+              "t_us": 301302679,
+              "calls": 0,
+              "shortfall_calls": 0
+            },
+            {
+              "t_us": 302304678,
+              "calls": 0,
+              "shortfall_calls": 0
+            },
+            {
+              "t_us": 303304678,
+              "calls": 0,
+              "shortfall_calls": 0
+            },
+            {
+              "t_us": 304304694,
+              "calls": 0,
+              "shortfall_calls": 0
+            },
+            {
+              "t_us": 305304695,
+              "calls": 0,
+              "shortfall_calls": 0
+            }
+          ]
+        }
+      },
+      "audio_flow": {},
+      "visual_file": "frame_grab_PPSA25009_20260913-180247-050.bmp",
+      "visual_sha256": "083b9febfb0fa1620bb3fd2781471d386eacef27fe0a0cacace3dbaa649b8f3e",
+      "bundle_bytes": 500177075,
+      "validation_complete": true,
+      "foreign_samples": []
+    }
+  ]
+}

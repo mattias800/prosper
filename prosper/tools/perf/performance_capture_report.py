@@ -11,6 +11,10 @@ import json
 import math
 import sys
 
+# ResourceClass in gpu/resources/shader_resources.hpp. Unknown future values stay numeric.
+RESOURCE_CLASS_NAMES = {0: "ConstantBuffer", 1: "VertexBuffer", 2: "Texture",
+                        3: "Sampler", 4: "StorageImage"}
+
 
 class CaptureError(ValueError):
     pass
@@ -183,6 +187,13 @@ def _resource_breakdown(renderer):
                 "format": witness.get("frontend_tex_other_format", 0),
                 "components": witness.get("frontend_tex_other_components", 0),
                 "tile_mode": witness.get("frontend_tex_other_tile_mode", 0),
+                # Keep the selected witness's own identity; an older winning row must
+                # not inherit metadata from a slower-ranked, newer-format observation.
+                "resource_class": witness.get("frontend_tex_other_class"),
+                "resource_class_name": RESOURCE_CLASS_NAMES.get(witness.get("frontend_tex_other_class")),
+                "img_dim": witness.get("frontend_tex_other_img_dim"),
+                "depth_compare": witness.get("frontend_tex_other_depth_compare"),
+                "host_backed": witness.get("frontend_tex_other_host_backed"),
                 "compute_candidate": witness.get("frontend_tex_other_compute_candidate", False),
                 "persistent_candidate": witness.get("frontend_tex_other_persistent_candidate", False),
                 "compressed": witness.get("frontend_tex_other_compressed", False),
@@ -824,11 +835,17 @@ def print_summary(summary):
             if witness:
                 # The identity of the slowest unclassified reference. Without it `other` is a number
                 # with nothing to act on; with it the surface can be looked up directly.
+                def identity(key):
+                    value = witness.get(key)
+                    return "UNAVAILABLE" if value is None else str(int(value))
+                resource_class = witness.get("resource_class_name") or identity("resource_class")
                 print(f"    slowest unclassified reference: {witness['ms']:.1f}ms"
                       f" addr=0x{witness['addr']:x}"
                       f" {witness['width']}x{witness['height']}x{witness['depth']}"
                       f" fmt={witness['format']}/{witness['components']}c"
                       f" tile={witness['tile_mode']}"
+                      f" class={resource_class} dim={identity('img_dim')}"
+                      f" depth_compare={identity('depth_compare')} host_backed={identity('host_backed')}"
                       f" src={witness['source_bytes'] / (1024 * 1024):.1f}MiB"
                       f" compute_cand={int(witness['compute_candidate'])}"
                       f" persist_cand={int(witness['persistent_candidate'])}"
