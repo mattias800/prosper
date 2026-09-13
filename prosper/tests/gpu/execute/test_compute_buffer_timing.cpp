@@ -114,11 +114,12 @@ struct GuestBuffer {
 int main(int argc, char** argv) {
     if (argc != 3) { std::fprintf(stderr, "usage: fixture MODE CAPTURE_DIRECTORY\n"); return 2; }
     const std::string mode = argv[1];
+    const bool hosted_overlap = mode == "hosted-overlap";
     const bool promotion = mode == "promotion" || mode == "promotion-cpu";
     const bool cpu_result = mode == "promotion-cpu";
     if (mode != "selected" && mode != "wrong-code" && mode != "wrong-hash" &&
         mode != "disabled" && mode != "capture-idle" && mode != "capture-armed" &&
-        !promotion) return 2;
+        !promotion && !hosted_overlap) return 2;
     env("PROSPER_COMPUTELOG", nullptr);
     env("PROSPER_COMPUTELOG_CODE", nullptr);
     env("PROSPER_COMPUTE_BUFFER_RESULT_MIN_MB", cpu_result ? nullptr : "1");
@@ -195,6 +196,70 @@ int main(int argc, char** argv) {
         if ((address == first.address() || address == second.address()) && length == bytes)
             ++notifications;
     });
+    if (hosted_overlap) {
+        unsigned private_notifications = 0;
+        bool private_large = false;
+        set_guest_gpu_write_observer([&](uint64_t address, uint64_t length, const char*) {
+            if (!address || ((address == first.address() || address == second.address()) &&
+                             length == (private_large ? bytes : 16u)))
+                ++private_notifications;
+        });
+        // #3619: distinct advertised identities can still publish into the same hosted bytes.
+        // A small private output must not hide from B's earlier-write overlap check.
+        for (bool large_is_private : {false, true}) {
+            private_large = large_is_private;
+            for (bool reversed : {false, true}) {
+                for (bool overlap : {false, true}) {
+                    std::fprintf(stderr, "[hosted-overlap-case] private-large=%u reversed=%u overlap=%u\n",
+                                 unsigned(private_large), unsigned(reversed), unsigned(overlap));
+                    auto table = std::make_shared<ShaderResourceTable>(*resources);
+                    const unsigned small = reversed ? 1 : 0, large = 1 - small;
+                    auto& sa = table->resources[small];
+                    auto& lb = table->resources[large];
+                    sa.gpu_addr = private_large ? second.address() : 0;
+                    sa.size = 16;
+                    sa.host_data = reinterpret_cast<uint8_t*>(second.data);
+                    sa.host_data_size = 16;
+                    lb.gpu_addr = private_large ? 0 : first.address();
+                    lb.host_data = reinterpret_cast<uint8_t*>(first.data);
+                    lb.host_data_size = bytes;
+                    item.resources = table;
+                    item.user_sgprs = config.user_sgprs;
+                    // Warm the exact large-result baseline with a disjoint private output.
+                    for (unsigned n = 0; n < 2; ++n)
+                        check(prosper::frontend::execute_live_compute_items({dispatch(10 + n)}),
+                              "hosted overlap baseline warmup executes");
+                    check(first.correct(), "warm hosted buffer has exact baseline bytes");
+                    const auto before = prosper::frontend::live_compute_buffer_gpu_result_skips();
+                    if (overlap) sa.host_data = reinterpret_cast<uint8_t*>(first.data);
+                    for (unsigned lane = 0; lane < 4; ++lane)
+                        item.user_sgprs[small * 8 + 4 + lane] = fill[lane] ^ 0xffffffffu;
+                    check(prosper::frontend::execute_live_compute_items({dispatch(12)}),
+                          "private hosted overlap dispatch executes");
+                    for (unsigned lane = 0; lane < 4; ++lane) {
+                        const uint32_t expected = overlap && reversed ? fill[lane] ^ 0xffffffffu : fill[lane];
+                        check(first.data[lane] == expected,
+                              "hosted outputs preserve last-writer bytes");
+                    }
+                    check(std::all_of(first.data + 4, first.data + bytes / 4,
+                                      [](uint32_t v) { return v == 0xababababu; }),
+                          "hosted overlap leaves the complete large-buffer tail intact");
+                    const auto after = prosper::frontend::live_compute_buffer_gpu_result_skips();
+                    check(after == before + (overlap && !reversed ? 0u : 1u),
+                          "only an earlier effective overlap vetoes the large GPU result skip");
+                    // A subsequent writer must repair the final private mutation.
+                    sa.host_data = reinterpret_cast<uint8_t*>(second.data);
+                    item.user_sgprs = config.user_sgprs;
+                    check(prosper::frontend::execute_live_compute_items({dispatch(13)}) && first.correct(),
+                          "subsequent hosted writer repairs any last private output");
+                }
+            }
+        }
+        check(private_notifications == 0, "private hosted outputs do not announce architectural writes");
+        set_guest_gpu_write_observer({});
+        if (!failures) std::fprintf(stderr, "[buffer-timing-fixture] success mode=%s\n", mode.c_str());
+        return failures ? 1 : 0;
+    }
     if (promotion) {
         const auto initial_skips = prosper::frontend::live_compute_buffer_gpu_result_skips();
         for (unsigned index = 1; index <= 9; ++index) {

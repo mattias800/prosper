@@ -3477,6 +3477,9 @@ if(TARGET prosper_core)
                          "${CMAKE_SOURCE_DIR}/tools/perf/test_compute_buffer_timing_runtime.py"
                          $<TARGET_FILE:test_compute_buffer_timing>)
         set_tests_properties(compute_buffer_timing_runtime PROPERTIES TIMEOUT 180)
+        add_test(NAME compute_buffer_hosted_overlap
+                 COMMAND test_compute_buffer_timing hosted-overlap "${CMAKE_CURRENT_BINARY_DIR}")
+        set_tests_properties(compute_buffer_hosted_overlap PROPERTIES TIMEOUT 120)
         # #3425: the compute driver pipeline cache is written on the frontend's _Exit path, not by a
         # destructor. Separate processes are required -- a single process could pass while writing
         # nothing -- and the driver also asserts prosper-app still names the flush.

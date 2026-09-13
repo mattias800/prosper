@@ -593,14 +593,22 @@ struct Fixture {
         code.push_back(0xbf810000u);
         return item(code, table, 0x34760004u, 1);
     }
-    void image_after_buffer(bool host_baseline) {
+    void image_after_buffer(bool host_baseline, bool private_hosted = false) {
         const auto before = prosper::frontend::live_compute_image_result_snapshot_bytes();
         if (host_baseline)
             prosper::frontend::live_compute_force_next_image_result_host_fallback_for_test();
         unsigned calls = 0;
         bool ok = true;
+        auto mixed = buffer_writer(true);
+        if (private_hosted) {
+            auto table = std::make_shared<ShaderResourceTable>(*mixed.resources);
+            table->resources[0].gpu_addr = 0;
+            table->resources[0].host_data = reinterpret_cast<uint8_t*>(guest.data());
+            table->resources[0].host_data_size = table->resources[0].size;
+            mixed.resources = table;
+        }
         execute_sequence(
-            {writer(0x13579bdfu, 0, 0), buffer_writer(true), reader()},
+            {writer(0x13579bdfu, 0, 0), mixed, reader()},
             [&](const std::vector<ComputeItem> &items) {
                 ++calls;
                 const bool executed = prosper::frontend::execute_live_compute_items(items);
@@ -870,6 +878,9 @@ int main(int argc, char **argv) {
     buffer_unbound.unbound_hosted(true);
     buffer_gpu.image_after_buffer(false);
     buffer_cpu.image_after_buffer(true);
+    Fixture private_gpu(true, false), private_cpu(true, false);
+    private_gpu.image_after_buffer(false, true);
+    private_cpu.image_after_buffer(true, true);
     Fixture internal(false, false);
     internal.internal_output();
     BufferFixture buffers(true);
