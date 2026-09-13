@@ -138,4 +138,3 @@ The [measurement summary](FP16_GPU_PREPARATION_2026_09.json) retains the complet
 window populations, hashes and separate GPU-load observations. Original F8/F9, images, logs, CPU
 profiles and runner remain in the private evidence archive `issue-3407-fp16-preparation-20260913`.
 No snapshot baseline or blog screenshot was changed.
-
