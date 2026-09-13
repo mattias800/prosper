@@ -348,6 +348,15 @@ static const Site kSites[] = {
     {"render_runner.h PROSPER_BACKEND_BUFFER_RESIDENCY_MB (cap)",
      "PROSPER_BACKEND_BUFFER_RESIDENCY_MB", buffer_residency_new<0>,
      buffer_residency_permissive<0>, "64MiB", 0, "4096", 2048ull * kMiB},
+    {"render_runner.h PROSPER_BACKEND_BUFFER_RANGE_RESIDENCY_MB (zero)",
+     "PROSPER_BACKEND_BUFFER_RANGE_RESIDENCY_MB", buffer_residency_new<0>,
+     buffer_residency_permissive<0>, "-1", 0, "0", 0},
+    {"render_runner.h PROSPER_BACKEND_BUFFER_RANGE_RESIDENCY_MB (opt-in)",
+     "PROSPER_BACKEND_BUFFER_RANGE_RESIDENCY_MB", buffer_residency_new<0>,
+     buffer_residency_permissive<0>, "-1", 0, "256", 256ull * kMiB},
+    {"render_runner.h PROSPER_BACKEND_BUFFER_RANGE_RESIDENCY_MB (cap)",
+     "PROSPER_BACKEND_BUFFER_RANGE_RESIDENCY_MB", buffer_residency_new<0>,
+     buffer_residency_permissive<0>, "64MiB", 0, "4096", 2048ull * kMiB},
     // A malformed value used to make the cap 1024x TIGHTER than asked for -- which on this knob
     // means "watch essentially nothing", since every range above 8 KiB is then refused a watch.
     // TWO malformed inputs are deliberately absent, for the same reason: `-1` saturates and is then
