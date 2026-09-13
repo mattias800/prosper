@@ -575,15 +575,25 @@ inline bool vcc_exit_is_wave_uniform(const std::vector<Rdna2Inst>& ins, uint32_t
 
     std::function<bool(const Operand&, uint32_t)> uniform_operand_at;
     uniform_operand_at = [&](const Operand& operand, uint32_t use_pc) -> bool {
-        if (operand.kind == OperandKind::SGPR) {
+        if (operand.kind == OperandKind::SGPR || operand.kind == OperandKind::Special) {
             // "Lives in a scalar register" is NOT the same as "is wave-uniform" (#3607).
             // `v_readfirstlane_b32` writes an SGPR while producing THIS lane's value under prosper's
             // per-lane model -- its lowering is annotated SPECULATIVE(confidence: med) in
             // rdna2_emit_alu.cpp for exactly that reason -- so accepting the register unconditionally
             // lets a lane-varying value satisfy a wave-uniformity proof.
             //
-            // Refuse when any earlier instruction read this SGPR out of a lane that way. Two notes on
-            // the shape, both load-bearing:
+            // `Special` is in this branch and NOT with the constants below, which is the half a
+            // first version of this guard got wrong. `decode_src_field` maps 0..105 to `SGPR` but
+            // sends VCC_LO/HI (106/107), EXEC, M0 and ttmp to `Special` -- so screening `SGPR` alone
+            // left `v_readfirstlane_b32 s106, v1` writing VCC_LO and then satisfying the proof
+            // through the very branch that used to assert "scalar-register sources (including VCC
+            // halves) broadcast one wave value". This file's own comments note the shaders use
+            // s106/s107 as scratch, so that is a reachable shape, and #3596's emitter-side sibling
+            // already screens `Special` for exactly this reason. Matching on `value` works uniformly
+            // across both kinds because the destination carries the raw register number.
+            //
+            // Refuse when any earlier instruction read this register out of a lane that way. Two
+            // notes on the shape, both load-bearing:
             //
             //  - The match is on `dst.value`, NOT on `dst.kind`. The decoder builds every VOP1 dst as
             //    `vgpr(w >> 17)` (rdna2_decode.cpp:269), so this instruction's dst reports kind VGPR
@@ -606,10 +616,9 @@ inline bool vcc_exit_is_wave_uniform(const std::vector<Rdna2Inst>& ins, uint32_t
                     return false;
             return true;
         }
-        if (operand.kind == OperandKind::Special ||
-            operand.kind == OperandKind::InlineInt || operand.kind == OperandKind::InlineFloat ||
+        if (operand.kind == OperandKind::InlineInt || operand.kind == OperandKind::InlineFloat ||
             operand.kind == OperandKind::Literal)
-            return true; // scalar-register sources (including VCC halves) broadcast one wave value
+            return true;   // a constant is uniform by construction and nothing can write it
         if (operand.kind != OperandKind::VGPR) return false;
         for (auto it = ins.rbegin(); it != ins.rend(); ++it) {
             if (it->pc >= use_pc) continue;

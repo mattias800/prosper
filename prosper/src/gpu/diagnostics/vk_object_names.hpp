@@ -24,7 +24,6 @@
 //     call through a null pointer is a no-op, and no result code is propagated anywhere. An object
 //     name is a convenience, and a run that died because it could not name a shader module would be
 //     a worse tool than no names at all.
-#include <atomic>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>

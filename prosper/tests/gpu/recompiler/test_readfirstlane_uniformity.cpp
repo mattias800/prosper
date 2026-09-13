@@ -226,6 +226,34 @@ int main() {
                   "#3607: an exit compare reading an SGPR that v_readfirstlane_b32 wrote is NOT "
                   "accepted as wave-uniform");
         }
+
+        // VCC_LO IS NOT AN `SGPR` OPERAND, and screening only `SGPR` left this hole wide open.
+        // `decode_src_field` maps 0..105 to SGPR and sends 106/107 (VCC_LO/HI) to `Special`, so
+        // `v_readfirstlane_b32 s106, v1` writes VCC_LO and a compare reading it used to satisfy the
+        // proof through the branch that asserted VCC halves "broadcast one wave value".
+        {
+            const std::vector<uint32_t> u_vcc = {
+                0x7E040280u,              // pc0 v_mov_b32 v2, 0
+                0x7ED40501u,              // pc1 v_readfirstlane_b32 s106, v1   (s106 = VCC_LO)
+                0x7D84046Au,              // pc2 v_cmp_eq_u32_e32 vcc, s106, v2
+                0xBF870004u,              // pc3 s_cbranch_vccnz
+                0xBF810000u,              // pc4 s_endpgm
+            };
+            std::vector<Rdna2Inst> ins_vcc;
+            rdna2_walk(u_vcc.data(), u_vcc.size(), ins_vcc);
+            CHECK(ins_vcc.size() >= 4, "CONTROL: the VCC fixture decodes");
+            if (ins_vcc.size() >= 4) {
+                CHECK(ins_vcc[1].fmt == Rdna2Format::VOP1 && ins_vcc[1].opcode == 0x02u &&
+                          ins_vcc[1].dst.value == 106,
+                      "CONTROL: the producer really is v_readfirstlane_b32 writing register 106");
+                CHECK(ins_vcc[2].src[0].kind == OperandKind::Special &&
+                          ins_vcc[2].src[0].value == 106,
+                      "CONTROL: and the compare really reads it as a SPECIAL operand, not an SGPR -- "
+                      "which is the whole reason an SGPR-only screen missed it");
+                CHECK(!vcc_exit_is_wave_uniform(ins_vcc, ins_vcc[3].pc),
+                      "#3607: a readfirstlane-written VCC_LO is refused too, not just an SGPR");
+            }
+        }
     }
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }

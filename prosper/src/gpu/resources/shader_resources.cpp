@@ -1594,7 +1594,7 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
             // whole reason a term is possible at all: graphics derives the view from the RESOURCE
             // (`guest_texture_is_uploaded_array` over img_dim/depth/format, the same predicate the
             // upload path uses), while compute derives it from THIS reflection
-            // (`live_compute.cpp:5996` reads `image.image_arrayed` directly). So a compute binding is
+            // (`live_compute.cpp:7242-7245` passes `image_arrayed` straight into the view type). So a compute binding is
             // consistent by construction and a stage-blind term would report every compute array as a
             // mismatch; only a graphics stage can disagree with itself.
             //
@@ -1604,8 +1604,19 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
             // synthesis site runs for VS and PS. Both sides read false and the term stays silent.
             const bool graphics_stage = d.stage == SpirvShaderStage::Vertex ||
                                         d.stage == SpirvShaderStage::Fragment;
-            if (graphics_stage &&
-                d.image_arrayed != guest_texture_is_uploaded_array(r.img_dim, r.depth, r.format))
+            //
+            // MIRROR THE BACKEND'S WHOLE PREDICATE, not just its first clause. The view type is
+            // `(guest_array || sample_count > 1) ? 2D_ARRAY : 2D` (render_runner.h:8836-8838), where
+            // `guest_array` is itself `guest_texture_is_uploaded_array(...) && cls == Texture`
+            // (live_renderer.cpp:3491-3495). The `sample_count > 1` arm is the MSAA PLANE ARRAY,
+            // which render_runner.h:188-192 documents as deliberate and which carries no
+            // `guest_array` flag -- so a term built on the array predicate alone reports every
+            // graphics MSAA-array fetch, a shape this repo asserts by pixels.
+            const bool backend_builds_array =
+                (guest_texture_is_uploaded_array(r.img_dim, r.depth, r.format) &&
+                 r.cls == ResourceClass::Texture) ||
+                r.sample_count > 1u;
+            if (graphics_stage && d.image_arrayed != backend_builds_array)
                 report.issues.push_back({DescriptorIssueCode::InvalidImageMetadata, false, d.set,
                                          d.binding, d.kind, actual});
 

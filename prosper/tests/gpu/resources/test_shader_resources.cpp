@@ -268,11 +268,12 @@ static std::vector<uint32_t> image_test_spirv(bool sampled_float = true) {
 // two things it varies are exactly the two the validator's shape terms read -- OpTypeImage's Dim
 // operand, and the entry point's execution model, since `SpirvDescriptorBinding::stage` is taken from
 // OpEntryPoint rather than from the caller's expected-stage argument.
-static std::vector<uint32_t> image_dim_test_spirv(uint32_t dim, bool compute) {
+static std::vector<uint32_t> image_dim_test_spirv(uint32_t dim, bool compute,
+                                                 uint32_t arrayed = 0u) {
     std::vector<uint32_t> s = {0x07230203u, 0x00010000u, 0, 16, 0};
     emit(s, 15, {compute ? 5u : 4u, 10, 0x6e69616d, 0});  // OpEntryPoint GLCompute/Fragment %10
     emit(s, 22, {1, 32});                                  // %1 = f32
-    emit(s, 25, {2, 1, dim, 0, 0, 0, 1, 0});              // %2 = sampled image, given Dim
+    emit(s, 25, {2, 1, dim, 0, arrayed, 0, 1, 0});         // %2 = sampled image, given Dim/Arrayed
     emit(s, 27, {3, 2});                                   // %3 = sampled-image %2
     emit(s, 32, {4, 0, 3});                                // %4 = UniformConstant pointer
     emit(s, 59, {4, 5, 0});                                // %5 = image variable
@@ -1132,6 +1133,28 @@ int main() {
         CHECK(!reported_at_binding_4(validate_spirv_descriptor_interface(
                   image_dim_test_spirv(1u, true), &arrayed_table, 1, SpirvShaderStage::Compute)),
               "#3588: ...and a compute binding against the ARRAY resource is likewise not reported");
+
+        // THE MSAA PLANE ARRAY. The backend's view type is `(guest_array || sample_count > 1)`, and
+        // the second arm carries no `guest_array` flag -- render_runner.h documents it as deliberate.
+        // A term built on the array predicate ALONE reports every graphics MSAA-array fetch, which is
+        // a shape this repo asserts by pixels elsewhere. The declaration here is Arrayed=1, matching
+        // what the backend actually builds, so the correct answer is silence.
+        ShaderResource msaa_res = image;
+        msaa_res.sample_count = 2;
+        ShaderResourceTable msaa_table; msaa_table.resources.push_back(msaa_res);
+        CHECK(!guest_texture_is_uploaded_array(msaa_res.img_dim, msaa_res.depth, msaa_res.format),
+              "CONTROL: the MSAA fixture is NOT an array by the upload predicate -- which is exactly "
+              "why a term keyed on that predicate alone would misjudge it");
+        CHECK(!reported_at_binding_4(validate_spirv_descriptor_interface(
+                  image_dim_test_spirv(1u, false, 1u), &msaa_table, 1, SpirvShaderStage::Fragment)),
+              "#3588: a graphics MSAA resource under an ARRAYED declaration is NOT reported -- the "
+              "backend builds a 2D_ARRAY view for sample_count > 1, so the two agree");
+        // ...and the term is still live on that same resource: drop the declaration's Arrayed and the
+        // two genuinely disagree again, so the arm above is silence-by-agreement, not silence-by-death.
+        CHECK(reported_at_binding_4(validate_spirv_descriptor_interface(
+                  image_dim_test_spirv(1u, false, 0u), &msaa_table, 1, SpirvShaderStage::Fragment)),
+              "#3588: the SAME MSAA resource under a NON-arrayed declaration IS reported, so the arm "
+              "above is not passing because the term stopped working");
     }
     const auto query_report = validate_spirv_descriptor_interface(
         image_query_test_spirv(), &image_table, 0, SpirvShaderStage::Compute);
