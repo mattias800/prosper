@@ -31,6 +31,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <pthread.h>
+#include <chrono>
 #include <thread>
 
 static int fails = 0;
@@ -95,6 +96,54 @@ int main() {
           "than its failure being hidden");
     if (relock == 0) pthread_mutex_unlock(&m);
     pthread_mutex_destroy(&m);
+
+    // ---- The same mechanism reaches the CONDITION WAIT, whose re-acquire is an ownership op -----
+    // Review of #3624 measured `pthread_cond_timedwait` on an ERRORCHECK mutex returning EPERM
+    // rather than ETIMEDOUT under a foreign TCB, so the cond bodies that resolve their mutex through
+    // `ensure_mutex` need the same correction. (The event-flag and semaphore condvars do NOT: their
+    // mutexes are `pthread_mutex_init(&m, nullptr)`, i.e. host-default NORMAL, which performs no
+    // ownership check at all.)
+    //
+    // The waiter is woken by a REPEATING broadcast rather than a sleep. A one-shot signal races the
+    // waiter's registration and would make this pass or hang on timing; re-broadcasting until the
+    // waiter reports itself done cannot lose the wakeup.
+    {
+        pthread_mutex_t cm;
+        pthread_mutexattr_t cat; pthread_mutexattr_init(&cat);
+        pthread_mutexattr_settype(&cat, PTHREAD_MUTEX_ERRORCHECK);
+        pthread_mutex_init(&cm, &cat);
+        pthread_mutexattr_destroy(&cat);
+        pthread_cond_t cc; pthread_cond_init(&cc, nullptr);
+
+        void* cm_slot_value = &cm;   void* cc_slot_value = &cc;
+        const uint64_t cm_slot = (uint64_t)&cm_slot_value;
+        const uint64_t cc_slot = (uint64_t)&cc_slot_value;
+
+        std::atomic<bool> waiter_done{false};
+        std::thread waker([&] {
+            while (!waiter_done.load(std::memory_order_acquire)) {
+                pthread_cond_broadcast(&cc);
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        });
+
+        const uint64_t clock_rc = prosper::guest_mutex_lock_slot(cm_slot);
+        CHECK(clock_rc == 0, "CONTROL: the cond fixture's mutex locks on this thread");
+
+        wr_fs(foreign);
+        const uint64_t wait_rc = prosper::guest_cond_wait_slot(cc_slot, cm_slot);
+        wr_fs(mine);
+        waiter_done.store(true, std::memory_order_release);
+        waker.join();
+
+        CHECK(wait_rc == 0,
+              "#3615: a condition wait whose call arrived on ANOTHER host thread's TCB completes -- "
+              "without the fix glibc refuses it EPERM because the caller is judged not to own the "
+              "mutex it is about to release");
+        prosper::guest_mutex_unlock_slot(cm_slot);
+        pthread_cond_destroy(&cc);
+        pthread_mutex_destroy(&cm);
+    }
 
     done.store(true, std::memory_order_release);
     helper.join();

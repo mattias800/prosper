@@ -845,6 +845,18 @@ namespace {
         static const uint64_t want = std::strtoull(env, nullptr, 16);
         return slot == want;
     }
+    // `prosper_gettid()` does not exist on Windows -- posix_shim.hpp is entirely #ifndef _WIN32 --
+    // so this mirrors the rw_self_tid()/sctid() split already in this file. Syscall-derived wherever
+    // one exists, because a TLS-derived id is exactly what this trace is built to catch going wrong.
+    inline uint64_t mtx_trace_tid() {
+#if defined(__linux__) || defined(__APPLE__)
+        return (uint64_t)prosper_gettid();
+#elif defined(_WIN32)
+        return (uint64_t)GetCurrentThreadId();
+#else
+        return (uint64_t)(uintptr_t)pthread_self();
+#endif
+    }
     inline void mtx_trace(const char* op, uint64_t slot, pthread_mutex_t* m, int rc) {
         if (!mtx_trace_enabled(slot)) return;
         int kind = -1, owner = -1, count = -1;
@@ -864,7 +876,7 @@ namespace {
         std::fprintf(stderr,
                      "[mtx-trace] %-8s slot=0x%llx m=%p tid=%ld rc=%d kind=%d owner=%d count=%d "
                      "fs=0x%lx guest_tcb=%d\n",
-                     op, (unsigned long long)slot, (void*)m, (long)prosper_gettid(), rc,
+                     op, (unsigned long long)slot, (void*)m, (long)mtx_trace_tid(), rc,
                      kind, owner, count, fs, guest_tcb);
     }
 
@@ -949,20 +961,29 @@ namespace {
     // validation. A no-op when guest TLS is off, when the thread never activated it, or when %fs is
     // already this thread's own -- which is every call on every title that does not move a TCB.
     struct HostTcbScope {
+        HostTcbScope(const HostTcbScope&) = delete;
+        HostTcbScope& operator=(const HostTcbScope&) = delete;
+#if defined(__linux__) && !defined(__APPLE__) && defined(__x86_64__)
         uint64_t prev = 0;
-#if defined(__linux__) && !defined(__APPLE__)
         static uint64_t rd() { uint64_t v; __asm__ volatile("rdfsbase %0" : "=r"(v)); return v; }
         static void     wr(uint64_t v) { __asm__ volatile("wrfsbase %0" : : "r"(v)); }
         HostTcbScope() {
+            // The order here is the safety argument: `rd()` is unreachable unless the registry has
+            // an entry for this thread, and the registry's only writer runs AFTER `rd_fsbase()` has
+            // already retired on this same thread. So rdfsbase/wrfsbase never execute on a build or
+            // machine where guest %fs is not in use.
             const uint64_t want = guest_tls_host_fs_for_current_thread();
             if (!want) return;                       // guest TLS off, or thread never activated it
             const uint64_t cur = rd();
             if (cur && cur != want) { prev = cur; wr(want); }
         }
         ~HostTcbScope() { if (prev) wr(prev); }      // leave %fs exactly as the stub left it
+#else
+        // Every other platform: a well-formed no-op. The declarations above suppress the implicit
+        // default constructor, so this arm is REQUIRED -- without it `HostTcbScope x;` does not
+        // compile on Windows or macOS, which is exactly how the first version broke both builds.
+        HostTcbScope() = default;
 #endif
-        HostTcbScope(const HostTcbScope&) = delete;
-        HostTcbScope& operator=(const HostTcbScope&) = delete;
     };
 
 uint64_t guest_mutex_lock_slot(uint64_t slot_addr) {
@@ -1367,6 +1388,7 @@ pthread_cond_t*  guest_cond_from_slot(uint64_t slot_addr)  { return ensure_cond(
 // through the C11 spelling was invisible to `k_cond_destroy`'s busy check, so a destroy retired the
 // object out from under it. The RESULT is where the two spellings differ; the wait itself is not.
 uint64_t guest_cond_wait_slot(uint64_t cond_slot, uint64_t mutex_slot) {
+    HostTcbScope host_tcb;                      // #3623: ownership is resolved through %fs
     auto* c = ensure_cond(cond_slot); auto* m = ensure_mutex(mutex_slot);
     if (!c || !m) return 22;   // EINVAL — not a condition variable, or not a mutex. Bare; see the alias.
     GuestCondWaiterScope waiting(c);   // #2168 -- covers every wait path in this body
@@ -1401,6 +1423,7 @@ SCE_PTHREAD_ALIAS(k_sce_cond_wait, k_cond_wait)
 // branch), so ensure_cond/ensure_mutex map them to the identical host objects.
 // CONFIDENCE: HIGH (POSIX semantics; spin diagnosed live; FreeBSD errno per Kyty Errno.h).
 HLE(k_cond_timedwait) {
+    HostTcbScope host_tcb;                      // #3623: the re-acquire is an ownership operation
     auto* c = ensure_cond(a0); auto* m = ensure_mutex(a1);
     if (!c || !m) return 22;                                   // EINVAL
     // #2168: one scope for the WHOLE body, not one per call. Review found the count bracketed on
@@ -1649,6 +1672,7 @@ namespace {
 // answering one question two ways across the eight rwlock acquisition handlers would be its own
 // defect. Reachable only for a guest passing a null rwlock, where EINVAL is the platform answer.
 HLE(k_rwlock_rdlock)  {
+    HostTcbScope host_tcb;                      // #3623: ownership is resolved through %fs
     auto* g = ensure_rwlock(a0);
     if (!g) return 0x16;   // EINVAL
     const int rc = pthread_rwlock_rdlock(&g->rw);
@@ -1657,6 +1681,7 @@ HLE(k_rwlock_rdlock)  {
     return fbsd_errno(rc);
 }
 HLE(k_rwlock_wrlock)  {
+    HostTcbScope host_tcb;                      // #3623: ownership is resolved through %fs
     auto* g = ensure_rwlock(a0);
     if (!g) return 0x16;   // EINVAL
     const int rc = pthread_rwlock_wrlock(&g->rw);
@@ -1665,6 +1690,7 @@ HLE(k_rwlock_wrlock)  {
     return fbsd_errno(rc);
 }
 HLE(k_rwlock_unlock)  {
+    HostTcbScope host_tcb;                      // #3623: ownership is resolved through %fs
     auto* g = ensure_rwlock(a0);
     // EINVAL, matching every sibling rwlock entry point (rd/wr/tryrd/trywr and all four timed
     // forms). ensure_rwlock returns null only for a null slot address or a failed allocation;
@@ -3112,6 +3138,7 @@ static timespec abs_deadline_us(uint64_t usec) {
 // ordinary lock timeout into an uncaught std::system_error. Same contract as the mutex lock/trylock
 // aliases above (#1945).
 HLE(k_mutex_timedlock) {
+    HostTcbScope host_tcb;                      // #3623: ownership is resolved through %fs
     auto* m = ensure_mutex(a0); if (!m) return prosper::hle::kSceKernelErrorEINVAL;
     if (guest_mutex_self_deadlock(m)) return prosper::hle::kSceKernelErrorEDEADLK;
     // Saturating for the same reason k_sem_timedwait's is (#3022's rule for the whole family):
