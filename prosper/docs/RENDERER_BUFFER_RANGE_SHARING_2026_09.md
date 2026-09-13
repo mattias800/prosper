@@ -129,7 +129,7 @@ cmake -S prosper -B prosper/build-linux -G Ninja -DCMAKE_BUILD_TYPE=Release -DPR
 cmake --build prosper/build-linux -j6
 ctest --test-dir prosper/build-linux --no-tests=error --output-on-failure
 python3 prosper/tools/perf/test_performance_capture_report.py
-touch prosper/build-linux/empty-vkval-allowlist.txt
+: > prosper/build-linux/empty-vkval-allowlist.txt
 python3 prosper/tools/vkval/vk_validation_scan.py --build-dir prosper/build-linux \
   --allowlist prosper/build-linux/empty-vkval-allowlist.txt --sync \
   --ctest-arg=-R --ctest-arg='^(render_buffer_range_.*|render_buffer_residency|render_buffer_capture)$'
@@ -168,7 +168,8 @@ it does not reject compute-to-graphics ownership sharing in general.
 writeback and synchronous compute/writeback still need ownership work. GTA's larger compute
 and frontend resource scopes explain why removing this copy bucket alone need not change its
 presentation rate. Next, census index/indirect/prior-frame producer populations and stable
-union reuse before choosing another cache. Union sharing reduces owner population substantially
-in Blue Prince; any cross-call retention must still demonstrate reuse, content invalidation,
+union reuse before choosing another cache. Union sharing reduces the number of distinct copied spans substantially
+in Blue Prince; this is not a measurement of allocation owners. Any cross-call retention must
+still demonstrate reuse, content invalidation,
 safe pinning and lower enclosing CPU cost. Do not re-enable the previously rejected generic
 per-binding residency policy without that new evidence.
