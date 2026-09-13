@@ -476,6 +476,52 @@ const char* image_descriptor_reject_reason(const DecodedImageDescriptor& d) {
     if (d.base_array != 0 && !image_type_has_modeled_layer_stride(d.type))
         return "base-array-on-unmodelled-type";
     if (d.width > 16384 || d.height > 16384) return "extent-too-large";
+    // SQ_SEL 2 and 3 are RESERVED encodings. prosper already asserts this twice in its own source --
+    // the `DecodedBufferDescriptor::dst_sel` comment in this file's header ("4/5/6/7 = the stored
+    // R/G/B/A component (2 and 3 reserved)") and the buffer lowering in `rdna2_emit_alu.cpp`, which
+    // refuses such a selector with `reject-dst-sel-reserved` rather than guessing a meaning for it.
+    // The image path did not, and the asymmetry was not benign: all four T# selectors flow verbatim
+    // into `ShaderResource::swizzle`, and the backend's `vkswz` maps anything outside {0,1,4,5,6,7}
+    // to VK_COMPONENT_SWIZZLE_IDENTITY through a `default:` case. So a reserved selector became the
+    // IDENTITY selector for its own position -- a wrong channel routing with no reject and no
+    // diagnostic, which is exactly the failure the buffer comment warns about ("a plausible wrong
+    // picture"). Reporting it here routes it through the existing drop-reason machinery instead
+    // (PROSPER_SHARPLOG / PROSPER_DYNTRACE_FAIL), so the descriptor is visibly refused (#3587).
+    //
+    // This screens the ENCODING, not the routing. A T# is free to name any permutation of the six
+    // defined selectors, constants included, and a one-component surface declaring identity
+    // (R,G,B,A) is an ordinary descriptor -- `docs/RESOURCE_BINDING.md` § Ruled out records the
+    // falsification of the opposite claim (#2731). Nothing here constrains which defined selector a
+    // channel may carry.
+    //
+    // Placed LAST on purpose. `base-zero` must keep winning for a zero-base descriptor: the
+    // explicit-null-image path in gpu_executor.cpp keys on that exact verdict string (plus an
+    // all-zero eight-dword check) to publish a null binding, and an all-zero T# decodes all four
+    // selectors as 0 (SQ_SEL_0, a DEFINED constant) rather than as reserved, so the two never
+    // collide today -- but only this ordering keeps that true if either predicate moves.
+    //
+    // What a tightening can cost is a draw that renders TODAY, so the local capture corpus was swept
+    // before landing it (`gpu_replay --inspect-only` over every `.prgcap` under ~/, 56 of which carry
+    // resource records; 21 run directories spanning GTA V, Stray, Evergate, Asterix, DQ, Cobra and
+    // others). 137,588 materialized resources, of which **15,370 are image-class** -- 15,041 TEX and
+    // 329 STORAGE, the exact population this screen judges. Every one decodes to a selector word
+    // built only from defined SQ_SELs: TEX shows seven distinct words (4567, 4561, 4001, 4444, 6547,
+    // 4501, 0004), so the field is demonstrably live and routed rather than a constant default --
+    // 1,203 TEX descriptors declare outright BGRA. Zero reserved selectors, in any position, in any
+    // title. Those records all passed the OLD predicate, so they ARE the set this screen could newly
+    // drop. (`.prgbundle` files are not in that count: gpu_replay rejects `--bundle` together with
+    // `--inspect-only`, so the census route does not reach them.) The scan was validated on
+    // hand-built reserved instances constructed outside the corpus, because a clean zero from an
+    // instrument nobody has seen fire is not evidence (#3587).
+    //
+    // CONFIDENCE: HIGH on the encoding being reserved (published SQ_SEL enum, RDNA2 ISA document
+    // 70648, and prosper's own two prior assertions). CONFIDENCE: HIGH that this drops nothing that
+    // renders today, on that census. What the census cannot say is that no title ANYWHERE emits one
+    // -- it covers the titles that already boot far enough to capture -- so the residual risk is a
+    // T# prosper today mis-binds as identity becoming a visible, named drop instead, which is the
+    // direction this project prefers.
+    for (uint32_t k = 0; k < 4u; ++k)
+        if (d.dst_sel[k] == 2u || d.dst_sel[k] == 3u) return "dst-sel-reserved";
     return nullptr;
 }
 
