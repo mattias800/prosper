@@ -53,6 +53,10 @@ struct RendererTimingRecord {
     // Reused/admitted/refreshed/declined/ineligible count payload bytes, not live cache size.
     // Refresh overwrites a changed entry only when the cache is its sole allocation owner.
     // Ineligible covers the whole-pass gate (also explicit controls), not only shader proof.
+    uint64_t buffer_range_uploads = 0;
+    uint64_t buffer_range_bindings = 0;
+    uint64_t buffer_range_upload_bytes = 0;
+    uint64_t buffer_range_bound_bytes = 0;
     uint64_t buffer_upload_bytes = 0;
     uint64_t buffer_resident_hits = 0;
     uint64_t buffer_resident_compared_bytes = 0;
@@ -168,6 +172,7 @@ struct RendererTimingRecord {
     // reader of an F8 capture cannot repeat that. `other` stays underived here for the same reason
     // as above, but the report prints it SIGNED: a negative remainder is over-attribution, and
     // clamping it would make a broken partition look like a complete one (#2245).
+    double res_buffer_range_plan_ms = 0; // nested in backend resource setup, outside buffer copies
     double res_buffer_copy_ms = 0;
     // Resident lookup/validation and admission allocation/copy, nested in res_buffer_ms.
     // Ordinary arena/pool copies remain in res_buffer_copy_ms; these leaves do not overlap.

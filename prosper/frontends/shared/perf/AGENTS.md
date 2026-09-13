@@ -24,3 +24,9 @@ Direct-source write-watch reuse is a subset of total resident reuse. Watched byt
 comparison spans; unknown or unsupported coverage retains comparison. The watch timer is a child
 of resident time and must not be added to the buffer partition a second time. CPU snapshot
 maintenance remains within resident time but is not another Vulkan upload-byte count.
+
+Overlapping direct-view sharing reports actual union copy counts/bytes separately from resolved
+unique descriptor slices/bytes. These are copy-span observations, not completed draws or physical
+memory traffic. A planned union can include an unused member; keep bound-minus-upload bytes signed.
+`res_buffer_range_plan_ms` includes metadata grouping and any needed shared negative-write proof.
+It is nested in backend resource setup, outside the per-binding buffer timer and its copy leaf.

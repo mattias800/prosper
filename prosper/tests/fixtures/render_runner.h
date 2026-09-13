@@ -10,6 +10,7 @@
 #include <vulkan/vulkan.h>
 #include "gpu_detile_upload.h"
 #include "mapped_staging.h"
+#include "buffer_range_plan.h"
 #include "gpu/capture/gpu_capture.hpp"
 #include "gpu/diagnostics/gpu_memory_budget_vk.hpp"  // #3533: count what we hold on each heap
 #include "gpu/execute/host_read_barrier.hpp"   // the availability half of a readback (#2944/#3249)
@@ -691,6 +692,11 @@ struct BackendResourceReuseStats {
     // they are large by definition, so their byte share is necessarily higher, but "higher" is not
     // a number. These two make the conclusion readable instead of derivable (#2245 review).
     uint64_t buffer_skipped_large_dwords = 0;   // payload that bypasses content dedup by size
+    // Actual union copies and distinct descriptor slices after the existing reference memo.
+    uint64_t buffer_range_uploads = 0;
+    uint64_t buffer_range_bindings = 0;
+    uint64_t buffer_range_upload_bytes = 0;
+    uint64_t buffer_range_bound_bytes = 0;
     uint64_t buffer_upload_bytes = 0;           // bytes actually memcpy'd into mapped staging
     uint64_t buffer_resident_hits = 0;
     uint64_t buffer_resident_compared_bytes = 0; // requested comparison spans, not bytes read
@@ -1112,6 +1118,7 @@ struct BackendRenderTimingStats {
     // and res_buffer_other_ms() is printed SIGNED so an incomplete partition reports itself instead
     // of looking finished (#2245).
     double res_buffer_acquire_ms = 0;
+    double res_buffer_range_plan_ms = 0; // pass setup, outside per-binding buffer time
     double res_buffer_copy_ms = 0;
     double res_buffer_resident_ms = 0;
     double res_buffer_watch_ms = 0; // nested in resident time: setup/query/rearm, not additive
@@ -7238,23 +7245,71 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             effective_resources[i] = &draws[i].R;
         }
     }
+    // Scope-guard timer, so a bucket stays correct across the `continue`/`break` exits the resource
+    // loop already uses. Reads the clock only when timing is enabled; the whole sub-attribution is
+    // inert (two predictable branches per resource) on a default run.
+    struct ResourcePhaseTimer {
+        bool enabled;
+        double* sink;
+        TimingClock::time_point begin;
+        ResourcePhaseTimer(bool en, double* s)
+            : enabled(en), sink(s),
+              begin(en ? TimingClock::now() : TimingClock::time_point{}) {}
+        ResourcePhaseTimer(const ResourcePhaseTimer&) = delete;
+        ResourcePhaseTimer& operator=(const ResourcePhaseTimer&) = delete;
+        ~ResourcePhaseTimer() {
+            if (enabled)
+                *sink += std::chrono::duration<double, std::milli>(TimingClock::now() - begin)
+                             .count();
+        }
+    };
+    auto direct_range_eligible = [](const FrameResource& r) {
+        return !r.is_texture() && !r.is_internal_gds && r.table_entries.empty() &&
+            r.dwords.empty() && r.direct_guest_buffer_addr != 0 &&
+            r.direct_guest_buffer_addr == r.buffer_identity &&
+            r.direct_guest_buffer_addr == reinterpret_cast<uintptr_t>(r.buffer_words_data()) &&
+            r.buffer_word_count() >= 1024 && r.buffer_word_count() <= UINT64_MAX / 4;
+    };
+    std::vector<BufferRangeGroup> buffer_range_groups;
+    double res_buffer_range_plan_ms = 0;
     bool readonly_buffer_pass = share_backend_resources && reuse_host_buffers &&
         !buffer_verify_enabled && getenv("PROSPER_NO_BACKEND_BUFFER_RESIDENCY") == nullptr &&
         resident_render_buffer_limit() != 0 &&
         resident_render_buffer_configured_owner_limit(ctx.detile_limits.maxMemoryAllocationCount) != 0;
-    const bool readonly_buffer_watch =
-        getenv("PROSPER_NO_BACKEND_BUFFER_WRITE_WATCH") == nullptr;
-    if (readonly_buffer_pass) {
-        for (const auto& draw : draws) {
-            if (!backend_module_has_readonly_buffers(draw.vs_words(), draw.vs_shared) ||
-                !backend_module_has_readonly_buffers(draw.fs_words(), draw.fs_shared) ||
-                (!draw.gs_words().empty() &&
-                 !backend_module_has_readonly_buffers(draw.gs_words()))) {
-                readonly_buffer_pass = false;
-                break;
+    {
+        const ResourcePhaseTimer phase_plan(timing_enabled, &res_buffer_range_plan_ms);
+        if (share_backend_resources && use_buffer_arena && !buffer_verify_enabled &&
+            !PROSPER_ENV_ON("PROSPER_NO_BACKEND_BUFFER_RANGE_SHARE")) {
+            std::vector<BufferRangeSpan> spans;
+            for (const auto& draw : draws)
+                for (const auto& r : draw.R)
+                    if (direct_range_eligible(r))
+                        spans.push_back({r.direct_guest_buffer_addr, r.buffer_word_count() * 4});
+            buffer_range_groups = plan_buffer_ranges(std::move(spans), storage_buffer_alignment,
+                std::min<uint64_t>(ctx.detile_limits.maxStorageBufferRange, 64ull << 20));
+        }
+        // New overlap aliasing is safe only with complete whole-pass negative write proof.
+        // Reflect only when a consumer needs it, and share the proof with optional residency.
+        if (readonly_buffer_pass || !buffer_range_groups.empty()) {
+            for (const auto& draw : draws) {
+                if (!backend_module_has_readonly_buffers(draw.vs_words(), draw.vs_shared) ||
+                    !backend_module_has_readonly_buffers(draw.fs_words(), draw.fs_shared) ||
+                    (!draw.gs_words().empty() &&
+                     !backend_module_has_readonly_buffers(draw.gs_words()))) {
+                    readonly_buffer_pass = false;
+                    buffer_range_groups.clear();
+                    break;
+                }
             }
         }
     }
+    const bool readonly_buffer_watch =
+        getenv("PROSPER_NO_BACKEND_BUFFER_WRITE_WATCH") == nullptr;
+    struct BufferRangeUpload {
+        SharedBufferUpload upload;
+        bool attempted = false;
+    };
+    std::vector<BufferRangeUpload> buffer_range_uploads(buffer_range_groups.size());
     std::vector<SharedTextureUpload> texture_uploads;
     texture_uploads.reserve(std::min<size_t>(draws.size() * 2, 1024));
     std::unordered_map<TextureUploadKey, size_t, TextureUploadKeyHash> texture_upload_indices;
@@ -7272,7 +7327,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     double res_fixed_stages_ms = 0.0;
     double res_fixed_prologue_ms = 0.0;
     double res_prologue_subgroup_scan_ms = 0.0;
-    double setup_resources_ms = 0.0;
+    double setup_resources_ms = res_buffer_range_plan_ms;
     double setup_pipeline_ms = 0.0;
     // #1284 sub-attribution of setup_resources_ms; see BackendRenderTimingStats for what each covers.
     double res_texture_ms = 0.0;
@@ -7292,24 +7347,6 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     double res_descriptor_ms = 0.0;
     auto setup_elapsed_ms = [](auto begin, auto end) {
         return std::chrono::duration<double, std::milli>(end - begin).count();
-    };
-    // Scope-guard timer, so a bucket stays correct across the `continue`/`break` exits the resource
-    // loop already uses. Reads the clock only when timing is enabled; the whole sub-attribution is
-    // inert (two predictable branches per resource) on a default run.
-    struct ResourcePhaseTimer {
-        bool enabled;
-        double* sink;
-        TimingClock::time_point begin;
-        ResourcePhaseTimer(bool en, double* s)
-            : enabled(en), sink(s),
-              begin(en ? TimingClock::now() : TimingClock::time_point{}) {}
-        ResourcePhaseTimer(const ResourcePhaseTimer&) = delete;
-        ResourcePhaseTimer& operator=(const ResourcePhaseTimer&) = delete;
-        ~ResourcePhaseTimer() {
-            if (enabled)
-                *sink += std::chrono::duration<double, std::milli>(TimingClock::now() - begin)
-                             .count();
-        }
     };
     BackendPipelineCacheStats& pipeline_stats = backend_pipeline_cache_stats_storage();
     pipeline_stats = {};
@@ -8267,7 +8304,45 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                             upload.range = bytes;
                         } else resource_reuse_stats.buffer_resident_declined_bytes += bytes;
                     }
-                    if (!upload.resident && use_buffer_arena) {
+                    bool range_shared = false;
+                    if (!upload.resident && direct_guest_addr && identity == direct_guest_addr &&
+                        reinterpret_cast<uintptr_t>(words) == direct_guest_addr && bytes >= 4096) {
+                        const size_t group_index = find_buffer_range(buffer_range_groups,
+                            direct_guest_addr, bytes, storage_buffer_alignment);
+                        if (group_index != buffer_range_groups.size()) {
+                            const auto& group = buffer_range_groups[group_index];
+                            auto& owner = buffer_range_uploads[group_index];
+                            if (!owner.attempted) {
+                                owner.attempted = true;
+                                {
+                                    const ResourcePhaseTimer phase_acquire(timing_enabled,
+                                        &res_buffer_acquire_ms);
+                                    acquire_buffer_arena_slice(group.bytes, owner.upload);
+                                }
+                                if (owner.upload.arena) {
+                                    const ResourcePhaseTimer phase_copy(timing_enabled,
+                                        &res_buffer_copy_ms);
+                                    parallel_render_memcpy(
+                                        static_cast<uint8_t*>(owner.upload.mapped) + owner.upload.offset,
+                                        reinterpret_cast<const void*>(static_cast<uintptr_t>(group.address)),
+                                        static_cast<size_t>(group.bytes));
+                                    ++resource_reuse_stats.buffer_range_uploads;
+                                    resource_reuse_stats.buffer_range_upload_bytes += group.bytes;
+                                    resource_reuse_stats.buffer_upload_bytes += group.bytes;
+                                }
+                            }
+                            const VkDeviceSize delta = direct_guest_addr - group.address;
+                            if (owner.upload.arena && owner.upload.offset <= UINT64_MAX - delta) {
+                                upload = owner.upload;
+                                upload.offset += delta;
+                                upload.range = bytes; // Preserve descriptor bounds, including robust OOB.
+                                range_shared = true;
+                                ++resource_reuse_stats.buffer_range_bindings;
+                                resource_reuse_stats.buffer_range_bound_bytes += bytes;
+                            }
+                        }
+                    }
+                    if (!upload.resident && !range_shared && use_buffer_arena) {
                         const ResourcePhaseTimer phase_acquire(timing_enabled,
                                                                &res_buffer_acquire_ms);
                         acquire_buffer_arena_slice(bytes, upload);
@@ -8322,7 +8397,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                             upload.range = bytes;
                             resource_reuse_stats.buffer_upload_bytes += bytes;
                         }
-                    } else if (!upload.resident) {
+                    } else if (!upload.resident && !range_shared) {
                         const ResourcePhaseTimer phase_copy(timing_enabled,
                                                             &res_buffer_copy_ms);
                         resource_reuse_stats.buffer_upload_bytes += static_cast<uint64_t>(bytes);
@@ -9226,7 +9301,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                         // False is the fatal upload path: the zero-word fallback itself failed, so this
                         // draw cannot be bound. Same effect as the `break` this replaced.
                         if (!resolve_buffer_upload(entry_words, entry_count, entry_identity,
-                                                  r.table_entries.empty() ? r.direct_guest_buffer_addr : 0,
+                                                  direct_range_eligible(r) ? r.direct_guest_buffer_addr : 0,
                                                   r.set, r.binding, entry_index)) {
                             entries_ready = false;
                             break;
@@ -11797,6 +11872,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         call_timing.res_texture_bind_ms = res_texture_bind_ms;
         call_timing.res_buffer_ms = res_buffer_ms;
         call_timing.res_buffer_acquire_ms = res_buffer_acquire_ms;
+        call_timing.res_buffer_range_plan_ms = res_buffer_range_plan_ms;
         call_timing.res_buffer_copy_ms = res_buffer_copy_ms;
         call_timing.res_buffer_resident_ms = res_buffer_resident_ms;
         call_timing.res_buffer_watch_ms = res_buffer_watch_ms;
@@ -12185,6 +12261,10 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         PROSPER_SUM_RESOURCE_STAT(buffer_hash_skipped_large);
         PROSPER_SUM_RESOURCE_STAT(buffer_ref_memo_hits);
         PROSPER_SUM_RESOURCE_STAT(buffer_skipped_large_dwords);
+        PROSPER_SUM_RESOURCE_STAT(buffer_range_uploads);
+        PROSPER_SUM_RESOURCE_STAT(buffer_range_bindings);
+        PROSPER_SUM_RESOURCE_STAT(buffer_range_upload_bytes);
+        PROSPER_SUM_RESOURCE_STAT(buffer_range_bound_bytes);
         PROSPER_SUM_RESOURCE_STAT(buffer_upload_bytes);
         PROSPER_SUM_RESOURCE_STAT(buffer_resident_hits);
         PROSPER_SUM_RESOURCE_STAT(buffer_resident_compared_bytes);
@@ -12245,6 +12325,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
             PROSPER_SUM_TIMING_STAT(res_texture_bind_ms);
             PROSPER_SUM_TIMING_STAT(res_buffer_ms);
             PROSPER_SUM_TIMING_STAT(res_buffer_acquire_ms);
+            PROSPER_SUM_TIMING_STAT(res_buffer_range_plan_ms);
             PROSPER_SUM_TIMING_STAT(res_buffer_copy_ms);
             PROSPER_SUM_TIMING_STAT(res_buffer_resident_ms);
             PROSPER_SUM_TIMING_STAT(res_buffer_watch_ms);

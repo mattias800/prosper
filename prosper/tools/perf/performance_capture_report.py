@@ -227,6 +227,20 @@ def _resource_breakdown(renderer):
         if breakdown["buffer_residency_available"]:
             breakdown["buffer_residency"] = {
                 field: sum(row[field] for row in renderer) for field in residency_fields}
+        range_fields = ("buffer_range_uploads", "buffer_range_bindings",
+                        "buffer_range_upload_bytes", "buffer_range_bound_bytes",
+                        "res_buffer_range_plan_ms")
+        breakdown["buffer_range_sharing_available"] = all(
+            field in row for row in renderer for field in range_fields)
+        if breakdown["buffer_range_sharing_available"]:
+            breakdown["buffer_range_sharing"] = {
+                field: sum(row[field] for row in renderer) for field in range_fields}
+            ranges = breakdown["buffer_range_sharing"]
+            # Signed: unused planned members can make the union exceed actual bound slices.
+            # These are logical copy spans, not measured physical memory traffic.
+            ranges["avoided_copy_bytes"] = (ranges["buffer_range_bound_bytes"] -
+                                             ranges["buffer_range_upload_bytes"])
+
         watch_fields = ("buffer_resident_watched_bytes", "res_buffer_watch_ms")
         breakdown["buffer_watch_available"] = breakdown["buffer_residency_available"] and all(
             field in row for row in renderer for field in watch_fields)
@@ -868,6 +882,15 @@ def print_summary(summary):
                           " create/index_find/index_insert/hash UNAVAILABLE") + ")"
                   f" descriptor={breakdown['res_descriptor']:.1f}"
                   f" other={breakdown['res_other']:.1f}]")
+            if breakdown["buffer_range_sharing_available"]:
+                ranges = breakdown["buffer_range_sharing"]
+                print(f"    buffer ranges: uploads={ranges['buffer_range_uploads']}"
+                      f" slices={ranges['buffer_range_bindings']}"
+                      f" copied={ranges['buffer_range_upload_bytes'] / (1024*1024):.1f}MiB"
+                      f" avoided_copy={ranges['avoided_copy_bytes'] / (1024*1024):+.1f}MiB"
+                      f" plan={ranges['res_buffer_range_plan_ms']:.1f}ms (included in setup other)")
+            else:
+                print("    buffer range sharing: UNAVAILABLE")
             if breakdown["buffer_watch_available"]:
                 watch = breakdown["buffer_watch"]
                 print(f"    included in resident: watch={watch['res_buffer_watch_ms']:.1f}ms"

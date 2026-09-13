@@ -137,3 +137,20 @@ Linux inputs whose watches fail or are disabled still use exact comparison; this
 correct but can cost more than ordinary uploads.
 Runtime cache fixtures explicitly select a nonzero budget so unsupported platforms exercise the
 portable ownership and comparison contract too.
+
+## Within-pass overlapping buffer uploads
+
+Direct guest buffer views may share one arena upload for connected overlapping ranges with the
+same address residue modulo the device's storage-buffer alignment. Each descriptor retains its
+original exact range. Admission excludes owned/hosted/table/GDS/texture inputs and requires complete
+negative buffer-write proof for all final shaders in the pass, including later draws and geometry.
+The planner deduplicates exact spans before counting benefit, never bridges gaps, and caps each
+union at the smaller of 64 MiB and the device range limit. Ordinary resource sharing and arenas
+must be enabled; `PROSPER_BUFVERIFY` and `PROSPER_NO_BACKEND_BUFFER_RANGE_SHARE` decline this path.
+
+Union uploads are lazy and owned only by existing per-pass arenas through submission completion.
+A failed group allocation is not retried for each member; ordinary uploads handle the fallback.
+There is no cross-call guest-pointer retention or implicit extension of guest mapping lifetime.
+The range counters distinguish actual union copies from distinct resolved descriptor slices;
+skipped draws can leave planned bytes unused, so bound bytes minus upload bytes remains signed.
+Planning and shared write-proof time are nested in resource setup, outside per-binding copy time.

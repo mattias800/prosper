@@ -154,6 +154,10 @@ int main() {
         // Distinct counters above 32 bits catch omitted/swapped/narrowed serialization without
         // pretending this CPU recorder test establishes actual backend copy or cache decisions.
         record.buffer_upload_bytes = 4'294'967'296ull + 0 + i;
+        record.buffer_range_uploads = 4'294'967'296ull + 1000 + i;
+        record.buffer_range_bindings = 4'294'967'296ull + 1100 + i;
+        record.buffer_range_upload_bytes = 4'294'967'296ull + 1200 + i;
+        record.buffer_range_bound_bytes = 4'294'967'296ull + 1300 + i;
         record.buffer_resident_hits = 4'294'967'296ull + 100 + i;
         record.buffer_resident_compared_bytes = 4'294'967'296ull + 200 + i;
         record.buffer_resident_reused_bytes = 4'294'967'296ull + 300 + i;
@@ -213,6 +217,22 @@ int main() {
               text.find("\"buffer_upload_bytes\":4294967297,") != std::string::npos &&
               text.find("\"buffer_upload_bytes\":4294967298,") == std::string::npos,
           "buffer_upload_bytes preserves exact 64-bit values and the renderer cap");
+    check(count_text(text, "\"buffer_range_uploads\":") == 2 &&
+              text.find("\"buffer_range_uploads\":4294968296,") != std::string::npos &&
+              text.find("\"buffer_range_uploads\":4294968297,") != std::string::npos,
+          "buffer_range_uploads preserves distinct 64-bit values and the renderer cap");
+    check(count_text(text, "\"buffer_range_bindings\":") == 2 &&
+              text.find("\"buffer_range_bindings\":4294968396,") != std::string::npos &&
+              text.find("\"buffer_range_bindings\":4294968397,") != std::string::npos,
+          "buffer_range_bindings preserves distinct 64-bit values and the renderer cap");
+    check(count_text(text, "\"buffer_range_upload_bytes\":") == 2 &&
+              text.find("\"buffer_range_upload_bytes\":4294968496,") != std::string::npos &&
+              text.find("\"buffer_range_upload_bytes\":4294968497,") != std::string::npos,
+          "buffer_range_upload_bytes preserves distinct 64-bit values and the renderer cap");
+    check(count_text(text, "\"buffer_range_bound_bytes\":") == 2 &&
+              text.find("\"buffer_range_bound_bytes\":4294968596,") != std::string::npos &&
+              text.find("\"buffer_range_bound_bytes\":4294968597,") != std::string::npos,
+          "buffer_range_bound_bytes preserves distinct 64-bit values and the renderer cap");
     check(count_text(text, "\"buffer_resident_hits\":") == 2 &&
               text.find("\"buffer_resident_hits\":4294967396,") != std::string::npos &&
               text.find("\"buffer_resident_hits\":4294967397,") != std::string::npos &&
