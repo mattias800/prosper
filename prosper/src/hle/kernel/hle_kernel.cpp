@@ -51,6 +51,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#if defined(__linux__)
+#include <asm/prctl.h>
+extern "C" int arch_prctl(int, unsigned long);
+#endif
 #include <vector>
 #include <unordered_map>
 #include <mutex>
@@ -815,7 +819,57 @@ uint64_t guest_mutex_destroy_slot(uint64_t slot_addr, SyncObjectKind kind) {
 // a FreeBSD EINVAL(0x16) to the guest's libc++, which throws and terminates. This pinpoints the
 // exact slot/host-pointer producing the bad lock without needing a debugger (unusable under Rosetta).
 namespace {
+    // PROSPER_MUTEX_TRACE -- name every lock/trylock/unlock on ONE guest mutex slot, with the host
+    // thread and the host TCB that performed it. Set it to the slot address in hex
+    // (`PROSPER_MUTEX_TRACE=1500001e80`) or to `all`. Zero cost when unset.
+    //
+    // Why this exists rather than reusing what was here (#3615). `PROSPER_MUTEX_FAILLOG` prints the
+    // failing call and nothing else, so it cannot say who held the lock; `PROSPER_SYNCLOG` prints
+    // acquisitions only and is hardcoded to the AkSoundEngine slot range, so it answers nothing for
+    // any other title. An ownership question needs the SEQUENCE, the thread, and -- this is the part
+    // that actually cracked #3615 -- the %fs base, because on glibc a mutex's owner check is resolved
+    // through the TCB that %fs points at, NOT through a syscall-derived thread id. A trace showing
+    // "same thread, same mutex, EPERM anyway" is unreadable until you can also see that the two calls
+    // ran on two different TCBs.
+    //
+    // `tid` is `prosper_gettid()`, a raw syscall, deliberately: anything TLS-derived would be fooled
+    // by the very TCB swap this is built to expose. `guest_tcb` says whether %fs is one of OUR guest
+    // TCBs (the "PROS" magic guest_tls.cpp stamps) or a host one, which separates "the import stub
+    // restored the wrong host TCB" from "the stub did not swap back at all" -- two different bugs
+    // that present identically in every other field.
+    inline bool mtx_trace_enabled(uint64_t slot) {
+        static const char* const env = getenv("PROSPER_MUTEX_TRACE");
+        if (!env) return false;
+        static const bool all = std::strcmp(env, "all") == 0;
+        if (all) return true;
+        static const uint64_t want = std::strtoull(env, nullptr, 16);
+        return slot == want;
+    }
+    inline void mtx_trace(const char* op, uint64_t slot, pthread_mutex_t* m, int rc) {
+        if (!mtx_trace_enabled(slot)) return;
+        int kind = -1, owner = -1, count = -1;
+#if defined(__GLIBC__)
+        kind = m->__data.__kind; owner = m->__data.__owner; count = (int)m->__data.__count;
+#else
+        (void)m;
+#endif
+        unsigned long fs = 0; int guest_tcb = -1;
+#if defined(__linux__)
+        if (arch_prctl(ARCH_GET_FS, (unsigned long)&fs) != 0) fs = 0;
+        // guest_tls.cpp stamps GUEST_TCB_MAGIC at TP+0x108 on every TCB it manufactures. Reading it
+        // on a host TCB is safe -- it is a positive offset into the allocated TLS block -- and simply
+        // does not match. Keep these two constants in sync with guest_tls.cpp.
+        if (fs) guest_tcb = (*(volatile unsigned*)(fs + 0x108) == 0x50524F53u) ? 1 : 0;
+#endif
+        std::fprintf(stderr,
+                     "[mtx-trace] %-8s slot=0x%llx m=%p tid=%ld rc=%d kind=%d owner=%d count=%d "
+                     "fs=0x%lx guest_tcb=%d\n",
+                     op, (unsigned long long)slot, (void*)m, (long)prosper_gettid(), rc,
+                     kind, owner, count, fs, guest_tcb);
+    }
+
     inline uint64_t mtx_report(const char* op, uint64_t slot, pthread_mutex_t* m, int host) {
+        mtx_trace(op, slot, m, host);
         static const bool on = getenv("PROSPER_MUTEX_FAILLOG") != nullptr;
         if (on && host != 0)
             fprintf(stderr, "[mtx-fail] %s slot=0x%llx host_m=%p rc=%d(%s)\n", op,
