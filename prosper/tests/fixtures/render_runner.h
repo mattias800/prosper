@@ -3412,6 +3412,19 @@ inline VkDeviceSize resident_render_buffer_limit() {
     return limit * 1024ull * 1024ull;
 }
 
+// Independent experiment for connected within-pass unions. General per-binding retention stays
+// opt-in. Both policies use one cache and the larger budget, never two independent allowances.
+inline VkDeviceSize resident_render_buffer_range_limit() {
+    static const auto limit = prosper::diag::env_u64_or_default_capped(
+        "PROSPER_BACKEND_BUFFER_RANGE_RESIDENCY_MB",
+        getenv("PROSPER_BACKEND_BUFFER_RANGE_RESIDENCY_MB"), 0, 2048, "MiB");
+    return limit * 1024ull * 1024ull;
+}
+
+inline VkDeviceSize resident_render_buffer_shared_limit() {
+    return std::max(resident_render_buffer_limit(), resident_render_buffer_range_limit());
+}
+
 struct ResidentRenderBufferCacheSnapshot {
     bool available;
     size_t indexed_entries;
@@ -3428,7 +3441,7 @@ inline ResidentRenderBufferCacheSnapshot resident_render_buffer_cache_snapshot()
     return {true, cache.index.size(), cache.charged_owners->load(std::memory_order_relaxed),
             cache.charged_bytes->load(std::memory_order_relaxed),
             resident_render_buffer_configured_owner_limit(ctx->detile_limits.maxMemoryAllocationCount),
-            resident_render_buffer_limit()};
+            resident_render_buffer_shared_limit()};
 }
 
 // Deterministic one-shot injection for the fresh storage-buffer upload regression checks. The
@@ -8281,11 +8294,20 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                     buffer_index = shared_buffers.size();
                     SharedBufferUpload upload;
                     const VkDeviceSize bytes = static_cast<VkDeviceSize>(word_count) * 4;
-                    // Small uniforms keep the existing arena/hash route. The exact current
-                    // materialized span is authoritative, including hosted sources and padded tails.
-                    if (shareable && bytes >= 4096 && !readonly_buffer_pass)
+                    const size_t range_group_index = direct_guest_addr && identity == direct_guest_addr &&
+                        reinterpret_cast<uintptr_t>(words) == direct_guest_addr && bytes >= 4096
+                        ? find_buffer_range(buffer_range_groups, direct_guest_addr, bytes,
+                                            storage_buffer_alignment)
+                        : buffer_range_groups.size();
+                    const bool retain_range = range_group_index != buffer_range_groups.size() &&
+                        resident_render_buffer_range_limit() &&
+                        getenv("PROSPER_NO_BACKEND_BUFFER_RESIDENCY") == nullptr &&
+                        resident_render_buffer_configured_owner_limit(ctx.detile_limits.maxMemoryAllocationCount);
+                    // Prefer one union owner to independently retained overlapping descriptors.
+                    // Small uniforms and non-union inputs keep the existing arena/hash route.
+                    if (shareable && bytes >= 4096 && !readonly_buffer_pass && !retain_range)
                         resource_reuse_stats.buffer_resident_ineligible_bytes += bytes;
-                    if (shareable && bytes >= 4096 && readonly_buffer_pass) {
+                    if (shareable && bytes >= 4096 && readonly_buffer_pass && !retain_range) {
                         const ResourcePhaseTimer phase_resident(timing_enabled, &res_buffer_resident_ms);
                         auto& cache = resident_render_buffer_cache();
                         const ResidentRenderBufferKey key{identity, bytes};
@@ -8294,7 +8316,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                             timing_enabled ? &res_buffer_watch_ms : nullptr);
                         if (!upload.resident)
                             upload.resident = cache.admit(ctx, key, words,
-                                resident_render_buffer_limit(), resource_reuse_stats,
+                                resident_render_buffer_shared_limit(), resource_reuse_stats,
                                 readonly_buffer_watch ? direct_guest_addr : 0,
                                 timing_enabled ? &res_buffer_watch_ms : nullptr);
                         if (upload.resident) {
@@ -8307,14 +8329,36 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                     bool range_shared = false;
                     if (!upload.resident && direct_guest_addr && identity == direct_guest_addr &&
                         reinterpret_cast<uintptr_t>(words) == direct_guest_addr && bytes >= 4096) {
-                        const size_t group_index = find_buffer_range(buffer_range_groups,
-                            direct_guest_addr, bytes, storage_buffer_alignment);
+                        const size_t group_index = range_group_index;
                         if (group_index != buffer_range_groups.size()) {
                             const auto& group = buffer_range_groups[group_index];
                             auto& owner = buffer_range_uploads[group_index];
                             if (!owner.attempted) {
                                 owner.attempted = true;
-                                {
+                                const uint64_t copied_before = resource_reuse_stats.buffer_upload_bytes;
+                                if (retain_range) {
+                                    const ResourcePhaseTimer phase_resident(timing_enabled,
+                                        &res_buffer_resident_ms);
+                                    auto& cache = resident_render_buffer_cache();
+                                    const auto* source = reinterpret_cast<const void*>(
+                                        static_cast<uintptr_t>(group.address));
+                                    const ResidentRenderBufferKey key{group.address, group.bytes};
+                                    const uint64_t watched_addr = readonly_buffer_watch ? group.address : 0;
+                                    auto* watch_ms = timing_enabled ? &res_buffer_watch_ms : nullptr;
+                                    owner.upload.resident = cache.find(ctx.dev, key, source,
+                                        resource_reuse_stats, watched_addr, watch_ms);
+                                    if (!owner.upload.resident)
+                                        owner.upload.resident = cache.admit(ctx, key, source,
+                                            resident_render_buffer_shared_limit(),
+                                            resource_reuse_stats, watched_addr, watch_ms);
+                                    if (owner.upload.resident) {
+                                        const auto& retained = owner.upload.resident->storage;
+                                        owner.upload.buffer = retained.buffer;
+                                        owner.upload.mapped = retained.mapped;
+                                        owner.upload.range = group.bytes;
+                                    } else resource_reuse_stats.buffer_resident_declined_bytes += group.bytes;
+                                }
+                                if (!owner.upload.resident) {
                                     const ResourcePhaseTimer phase_acquire(timing_enabled,
                                         &res_buffer_acquire_ms);
                                     acquire_buffer_arena_slice(group.bytes, owner.upload);
@@ -8326,13 +8370,17 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                         static_cast<uint8_t*>(owner.upload.mapped) + owner.upload.offset,
                                         reinterpret_cast<const void*>(static_cast<uintptr_t>(group.address)),
                                         static_cast<size_t>(group.bytes));
-                                    ++resource_reuse_stats.buffer_range_uploads;
-                                    resource_reuse_stats.buffer_range_upload_bytes += group.bytes;
                                     resource_reuse_stats.buffer_upload_bytes += group.bytes;
+                                }
+                                const uint64_t copied = resource_reuse_stats.buffer_upload_bytes - copied_before;
+                                if (copied) {
+                                    ++resource_reuse_stats.buffer_range_uploads;
+                                    resource_reuse_stats.buffer_range_upload_bytes += copied;
                                 }
                             }
                             const VkDeviceSize delta = direct_guest_addr - group.address;
-                            if (owner.upload.arena && owner.upload.offset <= UINT64_MAX - delta) {
+                            if ((owner.upload.arena || owner.upload.resident) &&
+                                owner.upload.offset <= UINT64_MAX - delta) {
                                 upload = owner.upload;
                                 upload.offset += delta;
                                 upload.range = bytes; // Preserve descriptor bounds, including robust OOB.

@@ -3728,6 +3728,33 @@ if(TARGET prosper_core AND TARGET Vulkan::Vulkan)
       ${range_environment} $<TARGET_FILE:test_render_buffer_residency>
       --range-sharing ${range_expected})
   endforeach()
+  foreach(range_retention IN ITEMS on off owners_off disabled combined budget)
+    set(range_retention_environment PROSPER_BACKEND_BUFFER_RESIDENCY_MB=0
+      PROSPER_BACKEND_BUFFER_RANGE_RESIDENCY_MB=256
+      PROSPER_BACKEND_BUFFER_RESIDENCY_OWNERS=4096
+      --unset=PROSPER_NO_BACKEND_RESOURCE_SHARE --unset=PROSPER_NO_BACKEND_BUFFER_POOL
+      --unset=PROSPER_NO_BACKEND_BUFFER_ARENA --unset=PROSPER_BUFVERIFY
+      --unset=PROSPER_NO_BACKEND_BUFFER_RANGE_SHARE --unset=PROSPER_NO_BACKEND_BUFFER_RESIDENCY)
+    set(range_retention_expected off)
+    if(range_retention STREQUAL "on")
+      set(range_retention_expected on)
+    elseif(range_retention STREQUAL "off")
+      list(APPEND range_retention_environment PROSPER_BACKEND_BUFFER_RANGE_RESIDENCY_MB=0)
+    elseif(range_retention STREQUAL "owners_off")
+      list(APPEND range_retention_environment PROSPER_BACKEND_BUFFER_RESIDENCY_OWNERS=0)
+    elseif(range_retention STREQUAL "disabled")
+      list(APPEND range_retention_environment PROSPER_NO_BACKEND_BUFFER_RESIDENCY=1)
+    elseif(range_retention STREQUAL "combined")
+      list(APPEND range_retention_environment PROSPER_BACKEND_BUFFER_RESIDENCY_MB=1)
+      set(range_retention_expected combined)
+    elseif(range_retention STREQUAL "budget")
+      list(APPEND range_retention_environment PROSPER_BACKEND_BUFFER_RANGE_RESIDENCY_MB=1)
+      set(range_retention_expected budget)
+    endif()
+    add_test(NAME render_buffer_range_residency_${range_retention} COMMAND ${CMAKE_COMMAND} -E env
+      ${range_retention_environment} $<TARGET_FILE:test_render_buffer_residency>
+      --range-residency ${range_retention_expected})
+  endforeach()
   add_test(NAME render_buffer_residency COMMAND ${CMAKE_COMMAND} -E env
     --unset=PROSPER_NO_BACKEND_RESOURCE_SHARE
     --unset=PROSPER_NO_BACKEND_BUFFER_POOL --unset=PROSPER_BUFVERIFY

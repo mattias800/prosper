@@ -482,6 +482,89 @@ void resident_owner_limits() {
           "missing old cursor safely resumes at the remaining singleton");
 }
 
+void range_residency(const Fixture& f, bool enabled, bool large = false) {
+    const size_t range_words = large ? 256 * 1024 : Words;
+    std::vector<uint32_t> source(range_words + 256, 0);
+    quad(source, 0, false); quad(source, 128, true);
+    auto draws = [&] {
+        std::vector<BackendDraw> result;
+        for (size_t shift : {size_t{0}, size_t{256}}) {
+            auto d = f.draw(source, reinterpret_cast<uintptr_t>(source.data() + shift));
+            auto& r = d.R[0];
+            r.dwords_view = source.data() + shift; r.dwords_view_count = range_words;
+            r.direct_guest_buffer_addr = r.buffer_identity;
+            result.push_back(std::move(d));
+        }
+        return result;
+    };
+    const uint64_t RangeBytes = range_words * 4;
+    const uint64_t UnionBytes = RangeBytes + 1024;
+    CHECK(solid(render_draws_rgba(draws(), W, H, nullptr, Clear), true),
+          "cold retained union preserves shifted descriptor data");
+    auto stats = backend_resource_reuse_stats();
+    CHECK(stats.buffer_upload_bytes == UnionBytes && stats.buffer_range_uploads == 1 &&
+          stats.buffer_resident_admitted_bytes == (enabled ? UnionBytes : 0),
+          "one cold union upload admits only when retention is allowed");
+    if (large && !enabled) CHECK(stats.buffer_resident_declined_bytes == UnionBytes,
+          "cold oversized union reaches retention refusal before arena fallback");
+    if (enabled && large) {
+        CHECK(resident_render_buffer_cache_snapshot().charged_bytes > resident_render_buffer_limit(),
+              "union owns more than the smaller generic allowance");
+        CHECK(solid(f.render(payload(),0x3407eff1ull),true) &&
+              backend_resource_reuse_stats().buffer_resident_admitted_bytes == Bytes,
+              "generic admission uses the same larger shared allowance as union admission");
+    }
+    CHECK(solid(render_draws_rgba(draws(), W, H, nullptr, Clear), true),
+          "unchanged retained union preserves shifted descriptor data");
+    stats = backend_resource_reuse_stats();
+    CHECK(stats.buffer_upload_bytes == (enabled ? 0 : UnionBytes) &&
+          stats.buffer_range_uploads == (enabled ? 0 : 1) &&
+          stats.buffer_range_bound_bytes == 2 * RangeBytes &&
+          stats.buffer_resident_hits == (enabled ? 1 : 0),
+          "one exact union reuse serves both descriptor slices without another upload");
+    if (large && !enabled) CHECK(stats.buffer_resident_declined_bytes == UnionBytes,
+          "repeated oversized union reaches retention refusal once per pass");
+    quad(source, 128, false);
+    CHECK(solid(render_draws_rgba(draws(), W, H, nullptr, Clear), false),
+          "idle union refresh observes changed guest contents");
+    CHECK(backend_resource_reuse_stats().buffer_upload_bytes == UnionBytes,
+          "changed bytes require a complete union upload");
+    quad(source, 128, true);
+    BackendColorTarget old_target{0x3407ef01ull,false,false};
+    BackendColorTarget new_target{0x3407ef02ull,false,false};
+    BackendSubmissionBatch batch;
+    (void)render_draws_rgba(draws(),W,H,nullptr,Clear,false,&old_target,
+                           nullptr,nullptr,nullptr,&batch,false,nullptr,false);
+    CHECK(batch.pending(), "retained union is pinned before deferred submission");
+    quad(source,128,false);
+    (void)render_draws_rgba(draws(),W,H,nullptr,Clear,false,&new_target,
+                           nullptr,nullptr,nullptr,&batch,false,nullptr,false);
+    if (enabled) CHECK(resident_render_buffer_cache_snapshot().live_owners >= 2,
+          "changed queued union retains separate old and new allocation owners");
+    const auto& ctx = render_vk_ctx();
+    BackendSubmissionBatchResult submitted;
+    { BackendPersistentResourceGuard guard;
+      submitted = batch.submit_and_wait(ctx.dev,ctx.queue,false);
+      if (submitted.submit_result == VK_SUCCESS && submitted.wait_result == VK_SUCCESS)
+          batch.complete(); }
+    CHECK(submitted.submit_result == VK_SUCCESS && submitted.wait_result == VK_SUCCESS,
+          "retained union submissions complete");
+    if (submitted.submit_result != VK_SUCCESS || submitted.wait_result != VK_SUCCESS) return;
+    std::vector<uint8_t> before, after; std::string error;
+    CHECK(readback_persistent_color_target(old_target.persistent_id,W,H,VK_FORMAT_UNDEFINED,before,error) &&
+          solid(before,true), "pinned old union retains its green contents");
+    CHECK(readback_persistent_color_target(new_target.persistent_id,W,H,VK_FORMAT_UNDEFINED,after,error) &&
+          solid(after,false), "new union retains changed offscreen contents");
+    auto writable = draws();
+    writable[1].set_fs(atomic_fragment(f.fs,false));
+    auto alias = writable[1].R[0]; alias.set = 1; alias.binding = 4;
+    writable[1].R.push_back(alias);
+    CHECK(solid(render_draws_rgba(writable,W,H,nullptr,Clear),false) &&
+          backend_resource_reuse_stats().buffer_resident_hits == 0 &&
+          backend_resource_reuse_stats().buffer_range_uploads == 0,
+          "later writer prevents reuse of an otherwise cached union");
+}
+
 void range_sharing(const Fixture& f, bool expect_sharing) {
     // Shift by an aligned KiB, with overlapping 8 KiB views. The first draw is offscreen;
     // only the second view can produce green, exposing an incorrectly rebased slice.
@@ -587,6 +670,12 @@ int main(int argc, char** argv) {
     Fixture f;
     CHECK(!f.vs.empty() && !f.fs.empty(), "real vertex-fetch and green fragment shaders compile");
     if (f.vs.empty() || f.fs.empty()) return 1;
+    if (argc == 3 && std::string(argv[1]) == "--range-residency") {
+        const std::string mode = argv[2];
+        range_residency(f, mode == "on" || mode == "combined",
+                        mode == "combined" || mode == "budget");
+        return failures ? 1 : 0;
+    }
     if (argc == 3 && std::string(argv[1]) == "--range-sharing") {
         range_sharing(f, std::string(argv[2]) == "on");
         return failures ? 1 : 0;

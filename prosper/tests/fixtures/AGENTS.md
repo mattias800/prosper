@@ -148,9 +148,25 @@ The planner deduplicates exact spans before counting benefit, never bridges gaps
 union at the smaller of 64 MiB and the device range limit. Ordinary resource sharing and arenas
 must be enabled; `PROSPER_BUFVERIFY` and `PROSPER_NO_BACKEND_BUFFER_RANGE_SHARE` decline this path.
 
-Union uploads are lazy and owned only by existing per-pass arenas through submission completion.
+By default, union uploads are lazy and owned by existing per-pass arenas through submission completion.
 A failed group allocation is not retried for each member; ordinary uploads handle the fallback.
 There is no cross-call guest-pointer retention or implicit extension of guest mapping lifetime.
 The range counters distinguish actual union copies from distinct resolved descriptor slices;
 skipped draws can leave planned bytes unused, so bound bytes minus upload bytes remains signed.
 Planning and shared write-proof time are nested in resource setup, outside per-binding copy time.
+
+
+`PROSPER_BACKEND_BUFFER_RANGE_RESIDENCY_MB` optionally retains complete unions through the existing
+exact snapshot cache; it defaults to zero pending measured enclosing-cost evidence. The generic
+per-binding allowance remains separate as an admission switch. When both are enabled they share
+one cache and the larger byte allowance, including detached submission owners, with the existing
+allocation-count cap. A retained union is preferred over separate retained child descriptors.
+Each union validates once per pass; its children keep exact bounds and share its immutable pin.
+Budget/admission refusal falls back to the existing arena upload. Whole-pass write proof and all
+range-sharing diagnostic controls apply before retention is considered.
+
+Actual range-upload counters include new or refreshed retained union copies, but not cache hits.
+Retained union comparison, snapshot copying and Vulkan-storage copying are timed inside resident
+cost, not the ordinary arena-copy timer; include that cost and enclosing setup in any comparison.
+Existing resident hit/reuse/watch counters count the union once, not each descriptor slice. Watches
+remain optional exact-validation accelerators and do not extend guest mapping lifetime.
