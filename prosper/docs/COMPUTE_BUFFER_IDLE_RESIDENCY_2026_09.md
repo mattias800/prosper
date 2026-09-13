@@ -189,7 +189,8 @@ Executable SHA256 by captured source:
 - `1584fff34723`: `669969561b62caaee9df24670fb1d38435d4e0df6338b4bf0cc03f0803d17f26`
 - `e518caeaa8d5`: `eab609c163768dba5e85f21871bb21fa4b236d99b3c4fadd77a9cc0ec6685c90`
 
-Subsequent documentation/image commits do not change the tested or captured implementation.
+Subsequent documentation, image and diagnostic-baseline updates do not change the tested or
+captured implementation.
 
 
 ## Reproduction and checks
