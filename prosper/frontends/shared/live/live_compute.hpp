@@ -18,6 +18,17 @@ namespace prosper::frontend {
 
 enum class ComputeImageCacheClass : uint8_t { sampled, storage };
 
+// Exact result comparison uses one uvec4 per invocation and 256 invocations per group.
+// Zero means CPU fallback. Check the complete descriptor range and device dispatch limit before
+// narrowing either the push constant or group count; image byte sizes can exceed 32 bits.
+constexpr uint32_t compute_result_compare_group_count(
+    uint64_t bytes, uint32_t max_storage_buffer_range, uint32_t max_groups_x) {
+    if (!bytes || (bytes & 15u) || bytes > max_storage_buffer_range) return 0;
+    const uint64_t vectors = bytes / 16u;
+    const uint64_t groups = vectors / 256u + (vectors % 256u != 0);
+    return groups <= max_groups_x ? static_cast<uint32_t>(groups) : 0;
+}
+
 // Persistent SSBO identity must distinguish guest bytes from their Vulkan materialization. A
 // one-record 16-bit source and an ordinary four-byte source can otherwise share address, host-data
 // identity, and bound size while requiring different upper bytes and typed shader semantics.

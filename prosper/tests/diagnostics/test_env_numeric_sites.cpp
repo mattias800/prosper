@@ -371,7 +371,7 @@ static const Site kSites[] = {
      "1gib", 1024ull << 20, "512", 512ull << 20},
 
     {"live_compute.cpp PROSPER_COMPUTE_BUFFER_CACHE_MB", "PROSPER_COMPUTE_BUFFER_CACHE_MB",
-     mib_cap_new<256>, mib_cap_old<256>, "-1", 256ull * kMiB, "512", 512ull * kMiB},
+     mib_cap_new<512>, mib_cap_old<512>, "-1", 512ull * kMiB, "256", 256ull * kMiB},
     {"live_compute.cpp PROSPER_COMPUTE_MEMORY_POOL_MB", "PROSPER_COMPUTE_MEMORY_POOL_MB",
      mib_cap_new<640>, mib_cap_old<640>, "1gb", 640ull * kMiB, "1024", 1024ull * kMiB},
     {"render_runner.h PROSPER_BACKEND_TARGET_CACHE_MB", "PROSPER_BACKEND_TARGET_CACHE_MB",

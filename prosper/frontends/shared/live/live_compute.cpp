@@ -1205,7 +1205,7 @@ VkDeviceSize persistent_compute_buffer_limit() {
         // Both look deliberate afterwards; neither is (#3267).
         const char* value = std::getenv("PROSPER_COMPUTE_BUFFER_CACHE_MB");
         const uint64_t mib = prosper::diag::env_u64_or_default_capped(
-            "PROSPER_COMPUTE_BUFFER_CACHE_MB", value, 256ull,
+            "PROSPER_COMPUTE_BUFFER_CACHE_MB", value, 512ull,
             UINT64_MAX / (1024ull * 1024ull), "MiB");
         return static_cast<VkDeviceSize>(mib) * 1024ull * 1024ull;
     }();
@@ -1530,6 +1530,7 @@ struct VulkanComputeContext {
     VkShaderStageFlags subgroup_stages = 0;
     VkSubgroupFeatureFlags subgroup_operations = 0;
     std::array<uint32_t, 3> max_compute_workgroup_count{};
+    uint32_t max_storage_buffer_range = 0;
     // Exact-subgroup pipelines are valid only on an adopted renderer device that enabled the
     // published size-control/full-subgroup contract. Private fallback devices deliberately do not
     // enable that optional extension.
@@ -2406,6 +2407,8 @@ struct VulkanComputeContext {
         if (!persistent_compute_buffer_result_enabled(key.bytes)) return false;
         timing.baseline = "invalid";
         if (!result || !key.bytes || (key.bytes & 15u)) return false;
+        timing.baseline = "device-limit";
+        if (!result_compare_group_count(key.bytes)) return false;
         auto found = buffer_cache.find(key);
         timing.baseline = "missing-entry";
         if (found == buffer_cache.end()) return false;
@@ -3257,8 +3260,14 @@ struct VulkanComputeContext {
         subgroup_operations = subgroup.supportedOperations;
         std::copy_n(properties.properties.limits.maxComputeWorkGroupCount, 3,
                     max_compute_workgroup_count.begin());
+        max_storage_buffer_range = properties.properties.limits.maxStorageBufferRange;
         storage_buffer_offset_alignment = std::max<VkDeviceSize>(
             1, properties.properties.limits.minStorageBufferOffsetAlignment);
+    }
+
+    uint32_t result_compare_group_count(VkDeviceSize bytes) const {
+        return prosper::frontend::compute_result_compare_group_count(
+            bytes, max_storage_buffer_range, max_compute_workgroup_count[0]);
     }
 
     // Byte distance between consecutive per-target compare flags. Each flag is one uint32_t, but it
@@ -10059,8 +10068,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             buffer.timing.gpu_compare = "ineligible";
             if (buffer.alias_of == SIZE_MAX && buffer.writable && !buffer.output_conflict &&
                 buffer.persistent &&
-                buffer.upload_skipped && buffer.result_baseline && buffer.resource->size &&
-                !(buffer.resource->size & 15u)) {
+                buffer.upload_skipped && buffer.result_baseline &&
+                ctx.result_compare_group_count(buffer.resource->size)) {
                 buffer.timing.gpu_compare = "eligible";
                 compare_targets.push_back({
                     buffer.buffer, buffer.result_baseline, buffer.resource->size,
@@ -10071,9 +10080,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             BoundImage& image = images[i];
             if (image.storage_writeback && !image.prior_output_conflict &&
                 image.cache_candidate && image.persistent && image.upload_skipped &&
-                image.result_baseline && image.exact_result_bytes &&
-                image.exact_result_bytes <= max_gpu_compare_image_bytes() &&
-                !(image.exact_result_bytes & 15u) && staging[i])
+                image.result_baseline && image.exact_result_bytes <= max_gpu_compare_image_bytes() &&
+                ctx.result_compare_group_count(image.exact_result_bytes) && staging[i])
                 compare_targets.push_back({
                     staging[i], image.result_baseline, image.exact_result_bytes,
                     VK_ACCESS_TRANSFER_WRITE_BIT, nullptr, &image});
@@ -10747,7 +10755,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     static_cast<uint32_t>(target.bytes / 16u);
                 vkCmdPushConstants(command, ctx.compare_pipeline_layout,
                                    VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(vectors), &vectors);
-                vkCmdDispatch(command, (vectors + 255u) / 256u, 1, 1);
+                vkCmdDispatch(command, ctx.result_compare_group_count(target.bytes), 1, 1);
             }
         }
         // If source validation found an external guest change, the exact comparator is not allowed
@@ -11755,9 +11763,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         false, std::memory_order_acq_rel);
                 retain_gpu_result_baseline = !renderer_result_retained &&
                     bi.persistent && !bi.result_baseline &&
-                    bi.exact_result_bytes &&
                     bi.exact_result_bytes <= max_gpu_compare_image_bytes() &&
-                    !(bi.exact_result_bytes & 15u) &&
+                    ctx.result_compare_group_count(bi.exact_result_bytes) &&
                     !force_host_result_fallback && ctx.prepare_compare_pipeline();
                 // This result serves later consumers; the next renderer producer still seeds a
                 // private image. A second result baseline would add a full-image copy without
