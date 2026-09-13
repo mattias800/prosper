@@ -14,9 +14,15 @@
 #if defined(__linux__) || defined(__APPLE__)
 #include "hle/dispatch/dispatch.hpp"
 #include "loader/tls_layout.hpp"
+#include "host/platform/posix_shim.hpp"
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <unordered_map>
+#include <mutex>
+#include <pthread.h>
+#include <atomic>
+#include <shared_mutex>
 #include <vector>
 #include <sys/mman.h>
 
@@ -108,9 +114,73 @@ uint64_t guest_tls_activate_thread() {
     return tp;   // NB: hardware fs base stays 0; accesses are trapped+emulated (try_emulate_fs_access)
 }
 #else
+
+// #3623: the HOSTFS stash above is per-GUEST-TCB while the value it holds is per-HOST-THREAD, so a
+// guest TCB that migrates between host threads makes the import stub restore ANOTHER thread's host
+// TCB. This registry is the FS-independent answer to "what is THIS host thread's own host %fs?" --
+// recorded here, where `rd_fsbase()` is read before any guest TCB exists for the thread, and keyed by
+// `prosper_gettid()` (a raw syscall) because every TLS-derived id is exactly what goes wrong.
+//
+// Scoped deliberately: this does NOT repair the stub. It gives callers that must be right about
+// thread identity -- the guest-sync layer, whose ownership checks glibc resolves through the TCB --
+// a way to correct %fs for the duration of a call. The stub itself is #3623's own fix.
+namespace {
+    std::shared_mutex g_host_fs_mx;                       // read-mostly: written once per thread
+    std::unordered_map<uint64_t, uint64_t> g_host_fs_by_tid;
+    std::atomic<size_t> g_host_fs_count{0};           // lock-free "is the map empty?" gate
+
+    // Erase this thread's entry when it exits. Without this a recycled tid inherits a DEAD thread's
+    // TCB, and a consumer would install it -- strictly worse than having no entry at all. A pthread
+    // key destructor is the hook that runs on every exit path glibc controls.
+    pthread_key_t g_host_fs_key;
+    std::once_flag g_host_fs_key_once;
+    void host_fs_forget(void*) {
+        const uint64_t tid = (uint64_t)prosper_gettid();
+        std::unique_lock<std::shared_mutex> lk(g_host_fs_mx);
+        g_host_fs_by_tid.erase(tid);
+        g_host_fs_count.store(g_host_fs_by_tid.size(), std::memory_order_relaxed);
+    }
+}
+void guest_tls_record_host_fs(uint64_t host_fs) {
+    if (!host_fs) return;
+    // NEVER record one of OUR guest TCBs as a host %fs. `guest_tls_activate_thread` is not
+    // idempotent on this platform (its Apple sibling is), so a second activation on a thread that
+    // already carries a guest TCB would otherwise capture that TCB here and hand it back as "the
+    // host TCB" -- installing guest TLS for host code, which is the inverse of the bug this exists
+    // to fix. The magic is the same marker the stubs and signal helpers key on.
+    if (*(volatile uint32_t*)(host_fs + MAGIC_OFF) == TCB_MAGIC) return;
+    std::call_once(g_host_fs_key_once, [] { pthread_key_create(&g_host_fs_key, host_fs_forget); });
+    pthread_setspecific(g_host_fs_key, (void*)1);          // arm the exit hook for this thread
+    const uint64_t tid = (uint64_t)prosper_gettid();       // syscall OUTSIDE the lock
+    std::unique_lock<std::shared_mutex> lk(g_host_fs_mx);
+    g_host_fs_by_tid[tid] = host_fs;
+    g_host_fs_count.store(g_host_fs_by_tid.size(), std::memory_order_relaxed);
+}
+uint64_t guest_tls_host_fs_for_current_thread() {
+    // Fast-out BEFORE the syscall and before the lock: on a title that never activates guest TLS the
+    // map stays empty forever, and this is on the guest-mutex path.
+    //
+    // WHY A RELAXED LOAD IS SOUND HERE, stated because the invariant it rests on is load-bearing and
+    // a future change could break it silently. A thread with an entry necessarily wrote that entry
+    // ITSELF, earlier, on this same thread: sequenced-before implies happens-before, so this load
+    // takes its value either from that store or from one later in the counter's modification order,
+    // and every such store is `map.size()` taken under the lock while this thread's entry is present
+    // -- hence >= 1. The escape that usually defeats this reasoning is another thread removing the
+    // entry in between; that is closed because the ONLY erase is `host_fs_forget`, keyed by this
+    // thread's own `prosper_gettid()`, and there is no `clear()`. If a cross-thread eraser is ever
+    // added, this gate must become acquire/release or go away.
+    //
+    // It also fails SAFE: a wrong answer here skips a correction, it never installs a wrong TCB.
+    if (g_host_fs_count.load(std::memory_order_relaxed) == 0) return 0;
+    const uint64_t tid = (uint64_t)prosper_gettid();       // syscall OUTSIDE the lock (review B2)
+    std::shared_lock<std::shared_mutex> lk(g_host_fs_mx);
+    auto it = g_host_fs_by_tid.find(tid);
+    return it == g_host_fs_by_tid.end() ? 0 : it->second;
+}
 uint64_t guest_tls_activate_thread() {
     if (!guest_tls_enabled()) return 0;
     uint64_t host_fs = rd_fsbase();
+    guest_tls_record_host_fs(host_fs);   // #3623: before any guest TCB exists for this thread
     size_t total = (size_t)g_total_below + TCB_SIZE;
     uint8_t* block = (uint8_t*)mmap(nullptr, total, PROT_READ | PROT_WRITE,
                                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
