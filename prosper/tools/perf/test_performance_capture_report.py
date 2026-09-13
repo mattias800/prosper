@@ -111,6 +111,28 @@ class PerformanceCaptureReportTests(unittest.TestCase):
         self.assertIn("transferred=3072B", lines[0])
         self.assertIn("excludes guest reads and GPU uploads", lines[0])
 
+    def test_gpu_detile_population_preserves_missing_and_integer_bytes(self):
+        row = {"frontend_gpu_detile_preparations": 5,
+               "frontend_gpu_detile_2d_preparations": 3,
+               "frontend_gpu_detile_source_bytes": 2**53 + 17}
+        result = summarize(capture(SAMPLES, renderer=[row, row]))["resource_breakdown"]
+        self.assertTrue(result["gpu_detile_available"])
+        self.assertEqual(result["gpu_detile"], {
+            "preparations": 10, "2d_preparations": 6, "source_bytes": 2**54 + 34})
+        self.assertIsInstance(result["gpu_detile"]["source_bytes"], int)
+        zero = dict.fromkeys(row, 0)
+        result = summarize(capture(SAMPLES, renderer=[zero]))["resource_breakdown"]
+        self.assertTrue(result["gpu_detile_available"])
+        self.assertEqual(result["gpu_detile"]["preparations"], 0)
+        for missing in row:
+            partial = row.copy()
+            del partial[missing]
+            result = summarize(capture(SAMPLES, renderer=[row, partial]))["resource_breakdown"]
+            self.assertFalse(result["gpu_detile_available"])
+            self.assertNotIn("gpu_detile", result)
+        result = summarize(capture(SAMPLES, renderer=[{}]))["resource_breakdown"]
+        self.assertFalse(result["gpu_detile_available"])
+
     def test_texture_snapshot_zero_and_missing_population_are_distinct(self):
         fields = ("frontend_tex_source_snapshot_copied_bytes",
                   "frontend_tex_source_snapshot_transferred_bytes",

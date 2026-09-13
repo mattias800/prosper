@@ -364,6 +364,9 @@ void InteractivePerformanceCapture::publish_completed(std::unique_ptr<PendingCap
                 << relative_ns(record.monotonic_ns, capture->trigger_ns)
                 << ",\"callbacks\":" << record.callbacks << ",\"draws\":" << record.draws
                 << ",\"texture_bytes\":" << record.texture_bytes
+                << ",\"frontend_gpu_detile_preparations\":" << record.frontend_gpu_detile_preparations
+                << ",\"frontend_gpu_detile_2d_preparations\":" << record.frontend_gpu_detile_2d_preparations
+                << ",\"frontend_gpu_detile_source_bytes\":" << record.frontend_gpu_detile_source_bytes
                 << ",\"buffer_bytes\":" << record.buffer_bytes
                 << ",\"buffer_upload_bytes\":" << record.buffer_upload_bytes
                 << ",\"buffer_resident_hits\":" << record.buffer_resident_hits

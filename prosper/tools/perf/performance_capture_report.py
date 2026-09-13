@@ -124,6 +124,13 @@ def _resource_breakdown(renderer):
         "setup_resources": _total(renderer, "setup_resources_ms"),
         "backend_available": have_backend,
     }
+    detile_fields = ("preparations", "2d_preparations", "source_bytes")
+    breakdown["gpu_detile_available"] = all(
+        f"frontend_gpu_detile_{field}" in row for row in renderer for field in detile_fields)
+    if breakdown["gpu_detile_available"]:
+        breakdown["gpu_detile"] = {
+            field: sum(row[f"frontend_gpu_detile_{field}"] for row in renderer)
+            for field in detile_fields}
     # An admitted encoded CPU snapshot either copies or transfers its owner. Require the
     # complete population: a missing field in one row cannot silently contribute a zero.
     # Handoff is already inside frontend texture time and its cache-outcome buckets.
@@ -784,6 +791,13 @@ def print_summary(summary):
                   " (admitted CPU snapshots; excludes guest reads and GPU uploads)")
         else:
             print("    texture source snapshot: UNAVAILABLE")
+        if breakdown["gpu_detile_available"]:
+            detile = breakdown["gpu_detile"]
+            print(f"    GPU detile snapshots: prepared={detile['preparations']}"
+                  f" 2d={detile['2d_preparations']} input={detile['source_bytes']}B"
+                  " (includes padded backing and headers; not completed dispatches)")
+        else:
+            print("    GPU detile snapshots: UNAVAILABLE")
         if breakdown["tex_classes_available"]:
             invalid = (f"persist_invalid={breakdown['tex_persist_invalid']:.1f}"
                        if breakdown["tex_invalid_available"] else "persist_invalid=UNAVAILABLE")

@@ -1963,6 +1963,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 double backend_res_buffer_acquire_ms = 0, backend_res_buffer_copy_ms = 0;
                 double backend_res_buffer_resident_ms = 0;
                 double backend_res_buffer_watch_ms = 0;
+                uint64_t gpu_detile_preparations = 0, gpu_detile_2d_preparations = 0;
+                uint64_t gpu_detile_source_bytes = 0;
                 uint64_t buffer_upload_bytes = 0;
                 uint64_t buffer_resident_hits = 0;
                 uint64_t buffer_resident_compared_bytes = 0;
@@ -5696,6 +5698,11 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 r.layer_stride_bytes, r.layer_mip_offset_bytes, copy_resource,
                                 r.num_components);
                             if (fr.gpu_detile) {
+                                if (timing_enabled) {
+                                    ++pending_timing.gpu_detile_preparations;
+                                    pending_timing.gpu_detile_2d_preparations += !is_cube;
+                                    pending_timing.gpu_detile_source_bytes += fr.gpu_detile->source_bytes;
+                                }
                                 cube_done = is_cube;
                                 texture_pixels.clear();
                                 fr.persistent_texture_id = 0;
@@ -10522,6 +10529,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     record.frontend_reflect_ms = pending_timing.build_reflect_ms;
                     // These four DO decompose setup_resources_ms, so an offline report can attribute
                     // the largest bucket in the capture instead of leaving a plausible residue.
+                    record.frontend_gpu_detile_preparations = pending_timing.gpu_detile_preparations;
+                    record.frontend_gpu_detile_2d_preparations = pending_timing.gpu_detile_2d_preparations;
+                    record.frontend_gpu_detile_source_bytes = pending_timing.gpu_detile_source_bytes;
                     record.res_texture_ms = pending_timing.backend_res_texture_ms;
                     record.res_buffer_ms = pending_timing.backend_res_buffer_ms;
                     record.res_buffer_copy_ms = pending_timing.backend_res_buffer_copy_ms;
