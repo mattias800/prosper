@@ -3,6 +3,7 @@
 #include "gpu/resources/mip_chain_plan.hpp"
 #include "gpu/texture/tile.hpp"
 #include "gpu/resources/shader_resources.hpp"
+#include "gpu/texture/bc_decode.hpp"
 #include "gpu/execute/gpu_execute.hpp"
 #include "shared/live/live_compute.hpp"
 #include <algorithm>
@@ -151,6 +152,24 @@ static std::vector<uint32_t> image_test_spirv(bool sampled_float = true) {
     if (sampled_float) emit(s, 22, {1, 32});                // %1 = f32
     else emit(s, 21, {1, 32, 0});                           // %1 = u32
     emit(s, 25, {2, 1, 1, 0, 0, 0, 1, 0});                // %2 = sampled 2D image
+    emit(s, 27, {3, 2});                                   // %3 = sampled-image %2
+    emit(s, 32, {4, 0, 3});                                // %4 = UniformConstant pointer
+    emit(s, 59, {4, 5, 0});                                // %5 = image variable
+    emit(s, 71, {5, 34, 1}); emit(s, 71, {5, 33, 4});      // set 1 binding 4
+    emit(s, 61, {3, 6, 5});                                // %6 = load %5
+    emit(s, 87, {1, 7, 6, 8});                             // %7 = OpImageSampleImplicitLod %6
+    return s;
+}
+
+// A Dim- and stage-parameterised twin of image_test_spirv (#3588). Same binding and same shape; the
+// two things it varies are exactly the two the validator's shape terms read -- OpTypeImage's Dim
+// operand, and the entry point's execution model, since `SpirvDescriptorBinding::stage` is taken from
+// OpEntryPoint rather than from the caller's expected-stage argument.
+static std::vector<uint32_t> image_dim_test_spirv(uint32_t dim, bool compute) {
+    std::vector<uint32_t> s = {0x07230203u, 0x00010000u, 0, 16, 0};
+    emit(s, 15, {compute ? 5u : 4u, 10, 0x6e69616d, 0});  // OpEntryPoint GLCompute/Fragment %10
+    emit(s, 22, {1, 32});                                  // %1 = f32
+    emit(s, 25, {2, 1, dim, 0, 0, 0, 1, 0});              // %2 = sampled image, given Dim
     emit(s, 27, {3, 2});                                   // %3 = sampled-image %2
     emit(s, 32, {4, 0, 3});                                // %4 = UniformConstant pointer
     emit(s, 59, {4, 5, 0});                                // %5 = image variable
@@ -958,6 +977,58 @@ int main() {
               mixed_access_report.descriptors[0].texel_access &&
               mixed_access_report.descriptors[0].sampled_float,
           "a normalized sample does not hide an unnormalized texel read on the same image");
+
+    // ---- #3588: the arrayed and 1D axes, which the validator never compared ----------------------
+    // Both backends read the same declaration but answer the SHAPE from different places: graphics
+    // builds the view from the RESOURCE, compute from this reflection. So only a graphics stage can
+    // disagree with itself, and a stage-blind term would report every compute array.
+    {
+        auto reported_at_binding_4 = [](const DescriptorValidationReport& rep) {
+            for (const auto& issue : rep.issues)
+                if (issue.code == DescriptorIssueCode::InvalidImageMetadata && issue.binding == 4)
+                    return true;
+            return false;
+        };
+
+        // ARRAYEDNESS. Same Fragment module as above (Dim=2D, Arrayed=0), but a resource the graphics
+        // upload path WOULD stage as an array. No new SPIR-V needed: only the table changes, so the
+        // declaration is provably identical to the clean case asserted above.
+        ShaderResource arrayed_res = image;
+        arrayed_res.img_dim = 5; arrayed_res.depth = 6; arrayed_res.format = DataFormat::Bc1;
+        ShaderResourceTable arrayed_table; arrayed_table.resources.push_back(arrayed_res);
+        CHECK(guest_texture_is_uploaded_array(arrayed_res.img_dim, arrayed_res.depth,
+                                              arrayed_res.format),
+              "CONTROL: the fixture really does satisfy the graphics array predicate -- otherwise the "
+              "arm below would be asserting about an ordinary 2D texture");
+        CHECK(reported_at_binding_4(validate_spirv_descriptor_interface(
+                  image_spv, &arrayed_table, 1, SpirvShaderStage::Fragment)),
+              "#3588: a graphics binding whose resource stages as a 2D ARRAY under a non-arrayed "
+              "declaration is reported (the backend builds a 2D_ARRAY view for a Dim=2D shader)");
+        CHECK(!reported_at_binding_4(ir),
+              "CONTROL: the same declaration against a non-array resource is still clean, so the arm "
+              "above is caused by the resource shape and not by the module");
+
+        // THE 1D AXIS. The graphics backend has no 1D view type at all, so every graphics Dim_1D is
+        // unsatisfiable -- there is no view it could build.
+        CHECK(reported_at_binding_4(validate_spirv_descriptor_interface(
+                  image_dim_test_spirv(0u, false), &image_table, 1, SpirvShaderStage::Fragment)),
+              "#3588: a graphics-stage Dim_1D declaration is reported -- the graphics backend builds "
+              "only 3D / 2D_ARRAY / 2D views, so it would bind a 2D view to a Dim=1D shader");
+        CHECK(!reported_at_binding_4(validate_spirv_descriptor_interface(
+                  image_dim_test_spirv(1u, false), &image_table, 1, SpirvShaderStage::Fragment)),
+              "CONTROL: the same fixture at Dim=2D is NOT reported, so the arm above keys on the "
+              "dimension rather than on the fixture");
+
+        // STAGE SCOPING is the load-bearing part of both terms: compute derives its view from this
+        // same reflection and has VK_IMAGE_VIEW_TYPE_1D, so it cannot disagree and must not report.
+        CHECK(!reported_at_binding_4(validate_spirv_descriptor_interface(
+                  image_dim_test_spirv(0u, true), &image_table, 1, SpirvShaderStage::Compute)),
+              "#3588: the SAME Dim_1D declaration under a COMPUTE entry point is NOT reported -- "
+              "a stage-blind term would false-positive on every compute 1D image and array");
+        CHECK(!reported_at_binding_4(validate_spirv_descriptor_interface(
+                  image_dim_test_spirv(1u, true), &arrayed_table, 1, SpirvShaderStage::Compute)),
+              "#3588: ...and a compute binding against the ARRAY resource is likewise not reported");
+    }
     const auto query_report = validate_spirv_descriptor_interface(
         image_query_test_spirv(), &image_table, 0, SpirvShaderStage::Compute);
     CHECK(query_report.ok() && query_report.descriptors.size() == 1 &&

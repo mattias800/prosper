@@ -1,6 +1,7 @@
 // shader_resources.cpp — see shader_resources.hpp. Pure lookups + format sizing; no Vulkan, no state.
 #include "gpu/resources/shader_resources.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_packed_pointer.hpp"
+#include "gpu/texture/bc_decode.hpp"   // guest_texture_is_uploaded_array (#3588)
 #include "gpu/recompiler/indirect/rdna2_indirect_pointer_analysis.hpp"
 
 #include <algorithm>
@@ -1524,6 +1525,36 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
             // descriptor, a future change to that default), and it is deliberately cheap enough to
             // keep on that basis. Do not describe it as covering the synthesis line.
             else if (resource_3d && r.depth == 0u)
+                report.issues.push_back({DescriptorIssueCode::InvalidImageMetadata, false, d.set,
+                                         d.binding, d.kind, actual});
+
+            // ARRAYEDNESS (#3588). The two backends answer this from DIFFERENT SOURCES, which is the
+            // whole reason a term is possible at all: graphics derives the view from the RESOURCE
+            // (`guest_texture_is_uploaded_array` over img_dim/depth/format, the same predicate the
+            // upload path uses), while compute derives it from THIS reflection
+            // (`live_compute.cpp:5996` reads `image.image_arrayed` directly). So a compute binding is
+            // consistent by construction and a stage-blind term would report every compute array as a
+            // mismatch; only a graphics stage can disagree with itself.
+            //
+            // Not a defect for synthesized nulls, checked rather than assumed: the null has depth 1
+            // and no format, so the predicate is false, and the three lowerings that could force
+            // `Arrayed` in the shader all additionally require `is_compute` while the only null
+            // synthesis site runs for VS and PS. Both sides read false and the term stays silent.
+            const bool graphics_stage = d.stage == SpirvShaderStage::Vertex ||
+                                        d.stage == SpirvShaderStage::Fragment;
+            if (graphics_stage &&
+                d.image_arrayed != guest_texture_is_uploaded_array(r.img_dim, r.depth, r.format))
+                report.issues.push_back({DescriptorIssueCode::InvalidImageMetadata, false, d.set,
+                                         d.binding, d.kind, actual});
+
+            // THE 1D AXIS (#3588). The 2D-vs-3D term above cannot see this, because neither side is
+            // 3D. The graphics backend builds only 3D / 2D_ARRAY / 2D views -- it has no 1D view type
+            // at all, where compute has `VK_IMAGE_VIEW_TYPE_1D` -- while `image_get_resinfo` declares
+            // `Dim_1D` straight from `in.mimg_dim == 0`. So a graphics-stage resinfo on a 1D image
+            // binds a 2D view under a `Dim=1D` declaration, which is the same undefined pairing the
+            // 3D term exists to report. Every graphics Dim_1D is therefore a mismatch, not merely a
+            // suspicious one: there is no view the backend could build that would satisfy it.
+            if (graphics_stage && d.image_dim == 0u)                    // SPIR-V Dim_1D
                 report.issues.push_back({DescriptorIssueCode::InvalidImageMetadata, false, d.set,
                                          d.binding, d.kind, actual});
         }
