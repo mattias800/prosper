@@ -4639,19 +4639,6 @@ HLE(s_savedata_mount3)  {
     uint32_t mode = *(const uint32_t*)(m + 0x20);
     return savedata_mount_common("Mount3", dirname, mode, a1);
 }
-HLE(s_savedata_umount) {
-    svc_log("sceSaveDataUmount", a0,a1,a2,a3,a4,a5);
-    if (!a0) return SAVE_DATA_ERR_PARAMETER;
-    const char* mount_point = (const char*)PW(a0); // OrbisSaveDataMountPoint: char data[16]
-    if (strncmp(mount_point, "/savedata0", 16) != 0) return SAVE_DATA_ERR_NOT_FOUND;
-    return savedata0_umount() ? 0 : SAVE_DATA_ERR_NOT_FOUND;
-}
-HLE(s_savedata_umount2) {
-    svc_log("sceSaveDataUmount2", a0,a1,a2,a3,a4,a5);
-    savedata0_umount();
-    g_savedata_umount_events.fetch_add(1, std::memory_order_release);
-    return 0;
-}
 // The mount-point argument every one of these calls takes is SceSaveDataMountPoint { char data[16] }.
 // Accept only the mount this build serves, so a title passing a different one is refused instead of
 // having its request applied to whatever happens to be mounted.
@@ -4676,6 +4663,19 @@ static bool savedata_mount_point_ok(uint64_t mount_point_va) {
     return strncmp(mp, "/savedata0", 16) == 0;
 }
 
+HLE(s_savedata_umount) {
+    svc_log("sceSaveDataUmount", a0,a1,a2,a3,a4,a5);
+    if (!a0) return SAVE_DATA_ERR_PARAMETER;
+    const char* mount_point = (const char*)PW(a0); // OrbisSaveDataMountPoint: char data[16]
+    if (strncmp(mount_point, "/savedata0", 16) != 0) return SAVE_DATA_ERR_NOT_FOUND;
+    return savedata0_umount() ? 0 : SAVE_DATA_ERR_NOT_FOUND;
+}
+HLE(s_savedata_umount2) {
+    svc_log("sceSaveDataUmount2", a0,a1,a2,a3,a4,a5);
+    savedata0_umount();
+    g_savedata_umount_events.fetch_add(1, std::memory_order_release);
+    return 0;
+}
 // sceSaveDataGetMountInfo(const SceSaveDataMountPoint* mp, SceSaveDataMountInfo* info):
 //   SceSaveDataMountInfo { u64 blocks; u64 freeBlocks; u8 reserved[32] } -- 48 bytes.
 //
