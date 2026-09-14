@@ -300,10 +300,11 @@ int main() {
         // ReleaseMem sync patchers. Each read cmd[0] inside its header check before anything
         // validated the pointer, so on master this arm SIGSEGVs rather than failing.
         //
-        // Two of them are the sharper ones and are why the spans are per-handler rather than one
-        // constant: SetPacketPredication validates cmd[0] and then writes **cmd[4]**, and
-        // ReleaseMem writes cmd[7]/cmd[8] on its long arm. A packet at the very end of a mapping
-        // passes a header-sized probe and faults on the store, so those re-probe before the tail.
+        // ReleaseMem is the sharper one and is why the spans are per-handler rather than one
+        // constant: it writes cmd[7]/cmd[8] on its long arm, and a packet at the very end of a
+        // mapping passes a header-sized probe and faults on that store, so it re-probes before the
+        // tail. (SetPacketPredication was the other until #3676 moved the predication flag from
+        // cmd[4] into header bit 0; it now reads and writes cmd[0] alone.)
         {
             const struct { const char* nid; const char* name; } late[] = {
                 { "w6Dj1VJt5qY", "SetPacketPredication"    },
@@ -741,8 +742,10 @@ int main() {
     // ---- Ikfdt-rIqCE: the Jump-packet target patcher (#2711 Q5) -------------------------------
     // GTA V builds Jump packets EMPTY and fills them in through this call, so an unregistered
     // handler left every one of them reaching the command processor with target=0 and count=0.
-    // The pairing is what matters and is what this locks: sceAgcDcbJump BUILDS the packet, this
-    // patches it, and cmd[4] belongs to sceAgcSetPacketPredication and must survive untouched.
+    // The pairing is what matters and is what this locks: sceAgcDcbJump BUILDS the packet and this
+    // patches it. Since #3676 the packet is FOUR dwords -- the hardware INDIRECT_BUFFER size the
+    // guest reserves from -- and sceAgcSetPacketPredication's flag lives in header bit 0, so what
+    // must survive this patcher untouched is the header, predicate bit included.
     {
         auto jump  = Hle::lookup("xSAR0LTcRKM");   // sceAgcDcbJump
         auto jpatch = Hle::lookup("Ikfdt-rIqCE");  // the target patcher under test
@@ -754,7 +757,14 @@ int main() {
             CHECK(jr == (uint64_t)(uintptr_t)jpkt, "DcbJump returned the packet it built");
             CHECK(jpkt[1] == 0 && jpkt[2] == 0 && jpkt[3] == 0,
                   "the built Jump packet starts EMPTY (target=0, count=0) -- the state the guest patches");
-            jpkt[4] = 0xA5A5A5A5u;   // stand in for sceAgcSetPacketPredication's flag
+            CHECK((jpkt[0] & 1u) == 0, "the built Jump packet starts UNPREDICATED (header bit 0 clear)");
+
+            // Predicate it the way the guest does, through the real handler, and pin that the
+            // 4-dword packet still round-trips the flag the 5-dword one carried in cmd[4].
+            auto pred = Hle::lookup("w6Dj1VJt5qY");   // sceAgcSetPacketPredication
+            CHECK(pred, "SetPacketPredication is registered");
+            if (pred) pred((uint64_t)(uintptr_t)jpkt, 0, 0, 0, 0, 0);
+            CHECK((jpkt[0] & 1u) == 1u, "SetPacketPredication set the PM4 header's PREDICATE bit");
 
             const uint32_t header_before = jpkt[0];
             jpatch((uint64_t)(uintptr_t)jpkt, /*cache policy=*/2,
@@ -763,8 +773,8 @@ int main() {
             CHECK(jpkt[1] == 0x40290080u, "JumpPatchTarget wrote cmd[1] = target low");
             CHECK(jpkt[2] == 0x00000020u, "JumpPatchTarget wrote cmd[2] = target high");
             CHECK(jpkt[3] == 359u,        "JumpPatchTarget wrote cmd[3] = dword COUNT (not a packed policy)");
-            CHECK(jpkt[4] == 0xA5A5A5A5u, "JumpPatchTarget left cmd[4] (predication) untouched");
-            CHECK(jpkt[0] == header_before, "JumpPatchTarget left the header untouched");
+            CHECK(jpkt[0] == header_before,
+                  "JumpPatchTarget left the header -- predicate bit included -- untouched");
 
             // Wrong packet class must be refused byte-for-byte. patch_check is the only thing standing
             // between a mis-typed pointer and five clobbered dwords, and a live run does hand this

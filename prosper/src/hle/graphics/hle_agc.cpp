@@ -148,7 +148,20 @@ constexpr uint32_t kDwSetRegisterDirect  = 3;
 constexpr uint32_t kDwSetRegsIndirect    = 4;
 constexpr uint32_t kDwAcquireMem         = 8;
 constexpr uint32_t kDwReleaseMem         = 8;
-constexpr uint32_t kDwJump               = 5;
+// 4, matching the hardware INDIRECT_BUFFER this packet stands for. It was 5 until #3676: the extra
+// dword held the per-packet predication flag, and the cost of housing it there was a stream that
+// stops dead. A guest that reserves the chain link from the AGC headers rather than from
+// sceAgcDcbJumpGetSize leaves exactly FOUR dwords at the end of a command buffer, so the Jump was
+// refused for want of one dword -- and a refused Jump is not one lost packet, it is the link that
+// chains the next buffer, so every command built after it (every draw) is never folded. Measured on
+// Uncharted: `DCB FULL: need=5 ... callback DECLINED` against `raw=4 reserved=0`, with the guest
+// calling DrawIndex/DrawIndexAuto >=50 times each while the fold reported draws_cum=0.
+//
+// The flag now lives in bit 0 of the PM4 type-3 header, which is where the hardware keeps it
+// (type-3 header: bit 0 PREDICATE, bit 1 SHADER_TYPE, bits 8..15 opcode, bits 16..29 count,
+// bits 30..31 type). Both header parsers already mask it off -- hle_agc's patch_check and
+// pm4_decode's hdr_r/hdr_op read bits 2 and up -- so it costs no dword and no new state.
+constexpr uint32_t kDwJump               = 4;
 constexpr uint64_t kAgcErrInvalidArg = 0x8a6c000aull;
 constexpr uint64_t kAgcErrInvalidShaderHalves = 0x8a6c0008ull;
 inline uint32_t PM4(uint32_t len, uint32_t op, uint32_t r) {
@@ -260,8 +273,28 @@ struct AgcDcb {
         if (n == 0) return nullptr;
         if (n > available_dw()) {
             dcb_report_full(this, n);          // #1756 probe; no-op unless PROSPER_DCBFULL
-            if (!callback || !invoke_full_callback(n + reserved_dw)) return nullptr;
-            if (available_dw() < n) return nullptr;
+            // Name WHY a full buffer stayed full. The three outcomes are different defects and the
+            // drop looks identical from downstream: no callback installed at all, a callback that
+            // declined, and a callback that succeeded but did not actually free enough room.
+            if (!callback || !invoke_full_callback(n + reserved_dw)) {
+                static std::atomic<uint64_t> f{0};
+                const uint64_t k = f.fetch_add(1) + 1;
+                if (k <= 4 || (k & (k - 1)) == 0)
+                    fprintf(stderr, "[agc] DCB FULL #%llu: need=%u %s -- callback %s\n",
+                            (unsigned long long)k, n,
+                            callback ? "" : "(none installed)",
+                            callback ? "DECLINED" : "absent");
+                return nullptr;
+            }
+            if (available_dw() < n) {
+                static std::atomic<uint64_t> g{0};
+                const uint64_t k = g.fetch_add(1) + 1;
+                if (k <= 4 || (k & (k - 1)) == 0)
+                    fprintf(stderr, "[agc] DCB FULL #%llu: need=%u -- callback SUCCEEDED but left "
+                                    "only %u dwords\n",
+                            (unsigned long long)k, n, available_dw());
+                return nullptr;
+            }
         }
         uint32_t* r = cursor_up;
         cursor_up += n;
@@ -452,6 +485,25 @@ inline uint32_t* begin_packet(uint64_t buf, uint32_t n, uint32_t op, uint32_t r,
     dcb_report_window(dcb, n, op, r);          // #1756 probe; no-op unless PROSPER_DCBWIN
     uint32_t* cmd = dcb->allocate_dw(n);
     if (cmd) cmd[0] = PM4(n, op, r);
+    else {
+        // A REFUSED allocation drops the packet — a draw, a dispatch, a state write — with no
+        // trace anywhere downstream: the fold simply never sees it, and the result is a frame
+        // missing geometry that looks exactly like a shader or resource defect. That is the
+        // failure the charter's fail-visible rule exists to prevent, and this is the one choke
+        // point every builder goes through, so one counter here covers all of them.
+        //
+        // Unconditional and rate-limited rather than env-gated: a run that silently drops draws
+        // must say so without anyone having guessed in advance to ask.
+        static std::atomic<uint64_t> refused{0};
+        const uint64_t k = refused.fetch_add(1) + 1;
+        if (k <= 8 || (k & (k - 1)) == 0)      // first 8, then powers of two
+            fprintf(stderr,
+                    "[agc] PACKET DROPPED #%llu: dcb=%p has no room for %u dwords (op=0x%x r=0x%x "
+                    "%s) -- raw=%d reserved=%u available=%u -- this packet never reaches the fold\n",
+                    (unsigned long long)k, (void*)dcb, n, op, r, dcb_subop_name(r),
+                    (int)(dcb->cursor_down - dcb->cursor_up), dcb->reserved_dw,
+                    dcb->available_dw());
+    }
     *out = cmd;
     return cmd;
 }
@@ -732,7 +784,8 @@ HLE(agc_dcb_jump) {  // sceAgcDcbJump(dcb, ?, ?, target_addr, num_dw)
     uint32_t* cmd; if (!begin_packet(a0, kDwJump, IT_NOP, R_JUMP, &cmd)) return 0;
     cmd[1] = (uint32_t)(a3 & 0xffffffffu); cmd[2] = (uint32_t)(a3 >> 32u);
     cmd[3] = (uint32_t)a4;
-    cmd[4] = 0;   // predicated flag — set by sceAgcSetPacketPredication on this returned packet
+    // Unpredicated until sceAgcSetPacketPredication says otherwise: PM4() writes a fresh header with
+    // bit 0 clear, which IS that initial state, so there is nothing to zero here.
     return (uint64_t)(uintptr_t)cmd;
 }
 HLE(agc_dcb_set_predication) {  // sceAgcDcbSetPredication(dcb, 1, op, 1, cond_addr) / (dcb, 1, 0, 1, 0)=end
@@ -759,14 +812,18 @@ HLE(agc_dcb_set_predication) {  // sceAgcDcbSetPredication(dcb, 1, op, 1, cond_a
 // reaching the extended tail: a packet at the end of a mapping otherwise passes the header check
 // and faults on the store, which is the sharper half of this issue.
 HLE(agc_set_packet_predication) {  // sceAgcSetPacketPredication(packet, ...)
-    // Marks an already-built packet as participating in the enclosing predication window. For our
-    // R_JUMP encoding that is payload[3] (cmd[4]). Header-verified like the other packet patchers —
-    // a different packet kind means the RE drifted, so refuse loudly rather than corrupt the stream.
+    // Marks an already-built packet as participating in the enclosing predication window. That is
+    // bit 0 of the PM4 type-3 header — the hardware PREDICATE bit — since #3676; it used to be a
+    // fifth dword appended to the packet, which made the Jump one dword wider than the
+    // INDIRECT_BUFFER it stands for and cost the guest its chain link (see kDwJump).
+    // Header-verified like the other packet patchers — a different packet kind means the RE
+    // drifted, so refuse loudly rather than corrupt the stream.
     auto* cmd = (uint32_t*)(uintptr_t)a0; if (!cmd) return 0;
-    // Writes cmd[4], five dwords in, after validating cmd[0] (#2157).
-    if (!patch_target_writable(a0, 5 * sizeof(uint32_t), "SetPacketPredication")) return 0;
+    // Reads AND writes cmd[0], and nothing else (#2157). The span shrank with the flag's home: this
+    // handler no longer reaches a packet tail, so it cannot fault past a header-sized probe.
+    if (!patch_target_writable(a0, sizeof(uint32_t), "SetPacketPredication")) return 0;
     if (!patch_check(cmd, R_JUMP, "SetPacketPredication")) return 0;
-    cmd[4] = 1;
+    cmd[0] |= 1u;
     return 0;
 }
 
