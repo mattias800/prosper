@@ -11,10 +11,10 @@ namespace {
 enum : uint32_t {
     Op_MemoryModel=14, Op_EntryPoint=15, Op_ExecutionMode=16, Op_Capability=17,
     Op_TypeVoid=19, Op_TypeBool=20, Op_TypeInt=21, Op_TypeFloat=22, Op_TypeVector=23,
-    Op_TypeArray=28, Op_TypeRuntimeArray=29, Op_TypeStruct=30, Op_TypePointer=32, Op_TypeFunction=33,
+    Op_TypeImage=25, Op_TypeArray=28, Op_TypeRuntimeArray=29, Op_TypeStruct=30, Op_TypePointer=32, Op_TypeFunction=33,
     Op_Constant=43, Op_Function=54, Op_FunctionEnd=56, Op_Variable=59,
     Op_Load=61, Op_Store=62, Op_AccessChain=65, Op_Decorate=71, Op_MemberDecorate=72,
-    Op_CompositeExtract=81, Op_IAdd=128, Op_FAdd=129, Op_ISub=130, Op_IMul=132,
+    Op_CompositeConstruct=80, Op_CompositeExtract=81, Op_ImageRead=98, Op_IAdd=128, Op_FAdd=129, Op_ISub=130, Op_IMul=132,
     Op_FMul=133, Op_UDiv=134, Op_UMod=137, Op_Any=154, Op_LogicalAnd=167, Op_Select=169, Op_INotEqual=171,
     Op_ShiftRightLogical=194, Op_ShiftLeftLogical=196, Op_BitwiseOr=197,
     Op_BitwiseXor=198, Op_BitwiseAnd=199, Op_BitCount=205,
@@ -24,7 +24,7 @@ enum : uint32_t {
 // Enumerants.
 enum : uint32_t {
     Cap_Shader=1, Addr_Logical=0, Mem_GLSL450=1, Exec_GLCompute=5, EM_LocalSize=17,
-    SC_Input=1, SC_PushConstant=9, SC_StorageBuffer=12, FC_None=0,
+    SC_UniformConstant=0, SC_Input=1, SC_PushConstant=9, SC_StorageBuffer=12, FC_None=0,
     Dec_Block=2, Dec_ArrayStride=6, Dec_BuiltIn=11, Dec_Binding=33, Dec_DescriptorSet=34, Dec_Offset=35,
     BI_GlobalInvocationId=28,
 };
@@ -476,7 +476,10 @@ std::vector<uint32_t> build_compute_detile_float16(uint32_t components, Float16D
   return e.assemble();
 }
 
-std::vector<uint32_t> build_compute_retile_words(RetileShaderKind kind) {
+std::vector<uint32_t> build_compute_retile_words(RetileShaderKind kind,
+                                               RetileImageSource source_kind, bool image_arrayed) {
+    const bool image_source = source_kind != RetileImageSource::LinearBuffer;
+    if (image_source && kind != RetileShaderKind::Words2D) return {};
     const bool volume = kind == RetileShaderKind::Volume3D;
     const bool paired = kind == RetileShaderKind::PackedSubwordArray;
     Emitter e;
@@ -487,6 +490,13 @@ std::vector<uint32_t> build_compute_retile_words(RetileShaderKind kind) {
     const auto push_ptr = e.id(), push_word = e.id(), push = e.id();
     const auto main = e.id(), entry = e.id(), body = e.id(), done = e.id();
     const auto read_pixel = e.id(), pixel_done = e.id();
+    uint32_t image_t = 0, image_ptr = 0, image = 0, v2_t = 0, v4_t = 0;
+    if (image_source) {
+        image_t = e.id(); image_ptr = e.id(); image = e.id(); v2_t = e.id(); v4_t = e.id();
+        Emitter::put(e.deco, Op_Decorate, {image, Dec_DescriptorSet, 0});
+        Emitter::put(e.deco, Op_Decorate, {image, Dec_Binding, 2});
+        Emitter::put(e.deco, Op_Decorate, {image, 24}); // NonWritable
+    }
     Emitter::put(e.caps, Op_Capability, {Cap_Shader});
     Emitter::put(e.mem, Op_MemoryModel, {Addr_Logical, Mem_GLSL450});
     std::vector<uint32_t> ep{Exec_GLCompute, main};
@@ -509,6 +519,15 @@ std::vector<uint32_t> build_compute_retile_words(RetileShaderKind kind) {
     Emitter::put(e.types, Op_TypeBool, {bool_t});
     Emitter::put(e.types, Op_TypeInt, {uint_t, 32, 0});
     Emitter::put(e.types, Op_TypeVector, {v3_t, uint_t, 3});
+    if (image_source) {
+        Emitter::put(e.types, Op_TypeVector, {v2_t, uint_t, 2});
+        Emitter::put(e.types, Op_TypeVector, {v4_t, uint_t, 4});
+        // Typed integer storage reads preserve every bit. Both formats need only Shader.
+        const uint32_t format = source_kind == RetileImageSource::Rgba8Uint ? 32u : 33u;
+        Emitter::put(e.types, Op_TypeImage, {image_t, uint_t, 1, 0, image_arrayed ? 1u : 0u, 0, 2, format});
+        Emitter::put(e.types, Op_TypePointer, {image_ptr, SC_UniformConstant, image_t});
+        Emitter::put(e.types, Op_Variable, {image_ptr, image, SC_UniformConstant});
+    }
     Emitter::put(e.types, Op_TypePointer, {input_ptr, SC_Input, v3_t});
     Emitter::put(e.types, Op_Variable, {input_ptr, gid, SC_Input});
     Emitter::put(e.types, Op_TypeRuntimeArray, {array_t, uint_t});
@@ -639,7 +658,33 @@ std::vector<uint32_t> build_compute_retile_words(RetileShaderKind kind) {
     const auto row = volume ? binary(Op_IAdd, binary(Op_IMul, z, params[1]), y) : y;
     auto linear = binary(Op_IAdd, binary(Op_IMul, row, row_words), word_x);
     if (paired) linear = binary(Op_IAdd, linear, binary(Op_IMul, z, linear_layer_words));
-    const auto loaded = load(source, word_ptr, linear);
+    uint32_t loaded;
+    if (image_source) {
+        const auto object = e.id(), coordinate = e.id(), texel = e.id();
+        Emitter::put(e.code, Op_Load, {image_t, object, image});
+        if (image_arrayed)
+            Emitter::put(e.code, Op_CompositeConstruct, {v3_t, coordinate, x, y, constant(0)});
+        else
+            Emitter::put(e.code, Op_CompositeConstruct, {v2_t, coordinate, x, y});
+        Emitter::put(e.code, Op_ImageRead, {v4_t, texel, object, coordinate});
+        loaded = e.id();
+        Emitter::put(e.code, Op_CompositeExtract, {uint_t, loaded, texel, 0});
+        if (source_kind == RetileImageSource::Rgba8Uint) {
+            loaded = binary(Op_BitwiseAnd, loaded, constant(255));
+            for (uint32_t c = 1; c < 4; ++c) {
+                const auto channel = e.id();
+                Emitter::put(e.code, Op_CompositeExtract, {uint_t, channel, texel, c});
+                loaded = binary(Op_BitwiseOr, loaded, binary(Op_ShiftLeftLogical,
+                    binary(Op_BitwiseAnd, channel, constant(255)), constant(c * 8)));
+            }
+        }
+        // Keep the exact linear result for all current and future comparison/diagnostic consumers.
+        const auto linear_output = e.id();
+        Emitter::put(e.code, Op_AccessChain, {word_ptr, linear_output, source, constant(0), linear});
+        Emitter::put(e.code, Op_Store, {linear_output, loaded});
+    } else {
+        loaded = load(source, word_ptr, linear);
+    }
     Emitter::put(e.code, Op_Branch, {pixel_done});
     Emitter::put(e.code, Op_Label, {pixel_done});
     const auto value = e.id(), destination = e.id();

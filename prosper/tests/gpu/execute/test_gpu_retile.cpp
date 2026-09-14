@@ -66,13 +66,16 @@ static bool volume_equation_covers_block(uint32_t mode, uint32_t bpe, bool colla
 }
 
 int run_case(int argc, char** argv) {
+    const bool direct = argc == 2 && std::strstr(argv[1], "direct");
+    const bool host_baseline = direct && std::strstr(argv[1], "host");
+    const bool failed_readback = direct && std::strstr(argv[1], "readback");
     const bool mixed = argc == 2 && std::strstr(argv[1], "mixed");
     const bool volume = argc == 2 && std::strstr(argv[1], "volume");
     const bool subword = argc == 2 && std::strstr(argv[1], "subword");
     const bool array16 = argc == 2 && std::strstr(argv[1], "array16");
     const bool shape_refusal = array16 && std::strstr(argv[1], "shape-refusal");
     const bool cpu = argc == 2 && std::strstr(argv[1], "cpu");
-    const bool clean = argc == 2 && std::strcmp(argv[1], "--clean") == 0;
+    const bool clean = argc == 2 && std::strstr(argv[1], "clean");
     const bool mapping = argc == 2 && std::strstr(argv[1], "map-");
     const bool allocation = argc == 2 && std::strstr(argv[1], "alloc-");
     const bool fault_mode = mapping || allocation;
@@ -358,12 +361,18 @@ int run_case(int argc, char** argv) {
         const uint64_t output_images =
             std::getenv("PROSPER_NO_READONLY_STORAGE_WRITEBACK_SKIP") ? 2 : 1;
         const auto before = gpu_retile_recordings().load();
-        for (uint32_t round = 0; round < 3; ++round) {
-            fill(source_linear, 7 + round * 31);
+        const bool direct_format = direct && (format.format == DataFormat::Uint32 ||
+                                             format.format == DataFormat::Uint8);
+        const auto direct_before = gpu_direct_retile_recordings().load();
+        uint64_t extra_recordings = 0;
+        const uint32_t rounds = direct ? 6 : 3;
+        for (uint32_t round = 0; round < rounds; ++round) {
+            // Additional A→B→A writes to the same last-row region challenge retained baselines.
+            fill(source_linear, 7 + (round < 3 ? round * 31 : round == 4 ? 31 : 0));
             tile(source.data(), source_linear.data());
             const uint32_t row = round == 0 ? 0 : round == 1 ? height / 2 : height - 1;
             // Odd starts/ends independently update the high and low halves of paired stores.
-            const uint32_t first_x = round == 2 ? width - 64 : ((array16 || subword) && round == 1 ? 1 : 0);
+            const uint32_t first_x = round >= 2 ? width - 64 : ((array16 || subword) && round == 1 ? 1 : 0);
             const uint32_t slice = round == 0 ? 0 : round == 1 ? depth / 2 : depth - 1;
             const uint32_t shader[]{
                 0x4A0800FFu, first_x, // v_add_nc_u32 v4, first_x, v0
@@ -413,6 +422,37 @@ int run_case(int argc, char** argv) {
             item.launch.local_y = item.launch.local_z = 1;
             item.launch.groups_x = item.launch.groups_y = item.launch.groups_z = 1;
             item.code_addr = code + round;
+            // The oracle is derived from the guest store coordinates, before either GPU result
+            // is observed. Inspecting both outputs detects a missing linear store even when guest
+            // tiled bytes remain correct and a stale baseline happens to evade reuse.
+            for (uint32_t lane : coordinates) {
+                const uint32_t x = lane + first_x;
+                std::copy_n(source_linear.data() + ((size_t(slice) * height + row) * width + x) * format.bpe,
+                            format.bpe, expected_linear.data() + ((size_t(slice) * height + row) * width + x) * format.bpe);
+            }
+            uint32_t linear_reads = 0;
+            if (direct_format)
+                live_compute_set_image_readback_observer_for_test(
+                    [&](uint32_t binding, const uint8_t* bytes, size_t size) {
+                        if (binding != 5) return;
+                        ++linear_reads;
+                        check(size == expected_linear.size() && std::equal(expected_linear.begin(), expected_linear.end(), bytes),
+                              "actual row-major result matches every written and untouched guest texel");
+                    });
+            if (failed_readback && code == 0x34070000 && round == 0) {
+                const auto unchanged_guest = destination;
+                live_compute_fail_next_storage_readback_for_test();
+                const auto submissions = live_compute_queue_submit_attempts();
+                const auto retiles = gpu_direct_retile_recordings().load();
+                check(!execute_live_compute_items({item}) && destination == unchanged_guest &&
+                          live_compute_queue_submit_attempts() == submissions + 1 &&
+                          gpu_direct_retile_recordings().load() == retiles + 1,
+                      "post-dispatch readback failure preserves guest bytes before retry");
+                ++extra_recordings;
+            }
+            const auto host_snapshots = live_compute_image_result_snapshot_bytes();
+            if (host_baseline && direct_format && !(linear_bytes & 15))
+                live_compute_force_next_image_result_host_fallback_for_test();
             const auto barriers_before = backend_host_read_barrier_count().load();
             const auto retile_before = gpu_retile_recordings().load();
             const bool inject = fault_mode && code == 0x34070000 && round == 0;
@@ -423,6 +463,7 @@ int run_case(int argc, char** argv) {
             if (inject) check(!live_compute_retile_memory_fault_pending_for_test(),
                               "injected error reached the actual allocator driver boundary");
             if (inject && loss) {
+                live_compute_set_image_readback_observer_for_test({});
                 check(!executed && destination == guest_before &&
                       live_compute_queue_submit_attempts() == submits_before,
                       "allocation or eager-map device loss stops before submission and guest writeback");
@@ -432,16 +473,18 @@ int run_case(int argc, char** argv) {
                 return failures ? 1 : 0;
             }
             check(executed, "partial guest image copy executes through live Vulkan");
+            live_compute_set_image_readback_observer_for_test({});
+            if (direct_format) {
+                check(linear_reads > 0, "changed direct output reaches the real linear readback observer");
+                if (host_baseline && !(linear_bytes & 15))
+                    check(live_compute_image_result_snapshot_bytes() - host_snapshots == linear_bytes,
+                          "forced host baseline consumes the exact new linear result");
+            }
             check(gpu_retile_recordings().load() - retile_before == (!gpu ? 0 : output_images - (inject ? 1 : 0)),
                   "every actual output takes the selected GPU/CPU path");
             if (code == 0x34070000 && round == 0 && !inject)
                 check(backend_host_read_barrier_count().load() - barriers_before == output_images * (gpu ? 2 : 1),
                       "first dispatch records host availability for every linear and tiled output");
-            for (uint32_t lane : coordinates) {
-                const uint32_t x = lane + first_x;
-                std::copy_n(source_linear.data() + ((size_t(slice) * height + row) * width + x) * format.bpe,
-                            format.bpe, expected_linear.data() + ((size_t(slice) * height + row) * width + x) * format.bpe);
-            }
             std::vector<uint8_t> expected(tiled_bytes, 0xcc);
             tile(expected.data(), expected_linear.data());
             check(std::equal(expected.begin(), expected.end(), destination.begin()),
@@ -452,8 +495,12 @@ int run_case(int argc, char** argv) {
         std::printf("mode=%u bpe=%u format=%u extent=%ux%u resource-dim=%u instruction-dim=%u GPU retile dispatches=%llu\n",
             mode, format.bpe, unsigned(format.format), width, height, resource_dim, instruction_dim,
             static_cast<unsigned long long>(gpu_retile_recordings().load() - before));
-        check(!gpu ? gpu_retile_recordings().load() == before : gpu_retile_recordings().load() == before + 3 * output_images - (fault_mode ? 1 : 0),
+        check(!gpu ? gpu_retile_recordings().load() == before : gpu_retile_recordings().load() == before + rounds * output_images - (fault_mode ? 1 : 0) + extra_recordings,
               !gpu ? "CPU fallback used" : "GPU tiler actually recorded; CPU equivalence alone is insufficient");
+        if (direct)
+            check(gpu_direct_retile_recordings().load() - direct_before ==
+                      (direct_format ? rounds * output_images + extra_recordings - (fault_mode ? 1 : 0) : 0),
+                  "only native integer formats record fused image conversion");
         if (fault_mode) return failures ? 1 : 0;
         code += 16;
     }

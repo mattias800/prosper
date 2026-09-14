@@ -3794,6 +3794,17 @@ if(TARGET prosper_live_renderer AND TARGET Vulkan::Vulkan)
   target_link_libraries(test_gpu_retile PRIVATE prosper_live_renderer Vulkan::Vulkan)
   add_test(NAME gpu_retile COMMAND test_gpu_retile)
   add_test(NAME gpu_retile_clean COMMAND test_gpu_retile --clean)
+  foreach(mode direct direct-clean direct-host direct-readback direct-alloc-oom direct-map-oom
+               direct-alloc-loss direct-map-loss)
+    add_test(NAME gpu_retile_${mode} COMMAND ${CMAKE_COMMAND} -E env
+      PROSPER_DIRECT_IMAGE_RETILE=1 PROSPER_COMPUTE_STORAGE_IMAGE_CACHE_MIN_KB=1
+      $<TARGET_FILE:test_gpu_retile> --${mode})
+    set_tests_properties(gpu_retile_${mode} PROPERTIES TIMEOUT 60)
+  endforeach()
+  add_test(NAME gpu_retile_direct_writeback_control COMMAND ${CMAKE_COMMAND} -E env
+    PROSPER_DIRECT_IMAGE_RETILE=1 PROSPER_COMPUTE_STORAGE_IMAGE_CACHE_MIN_KB=1
+    PROSPER_NO_READONLY_STORAGE_WRITEBACK_SKIP=1 $<TARGET_FILE:test_gpu_retile> --direct)
+  set_tests_properties(gpu_retile_direct_writeback_control PROPERTIES TIMEOUT 60)
   add_test(NAME gpu_retile_cpu COMMAND test_gpu_retile --cpu)
   add_test(NAME gpu_retile_allocation_loss COMMAND test_gpu_retile --alloc-loss)
   add_test(NAME gpu_retile_mapping_loss COMMAND test_gpu_retile --map-loss)

@@ -459,6 +459,7 @@ void report_image_borrow_census() {
 std::atomic<uint64_t> g_dcc_forced_seed_allocation_reuses{0};
 std::atomic<uint64_t> g_dcc_post_writeback_replacements{0};
 std::atomic<bool> g_fail_next_storage_readback_for_test{false};
+std::function<void(uint32_t, const uint8_t*, size_t)> g_image_readback_observer_for_test;
 std::atomic<bool> g_fail_next_buffer_readback_for_test{false};
 std::atomic<bool> g_leave_next_dcc_metadata_compressed_for_test{false};
 std::atomic<bool> g_disable_next_dcc_allocation_reuse_for_test{false};
@@ -1514,6 +1515,7 @@ struct VulkanComputeContext {
     VkPipeline compare_pipeline = VK_NULL_HANDLE;
     PackedRttConversion packed_rtt_conversion;
     GpuRetilePipeline retile_pipeline, volume_retile_pipeline, packed_retile_pipeline;
+    std::array<GpuRetilePipeline, 4> image_retile_pipelines; // R32/RGBA8, ordinary/one-layer array
     // Storage-image support (#590): the recompiler's storage path declares the
     // StorageImageRead/WriteWithoutFormat capabilities (raw uvec4 texel model — see
     // tests/fixtures/image_compute_runner.h, the exec-diff harness for that contract). When the device lacks
@@ -1657,6 +1659,7 @@ struct VulkanComputeContext {
         retile_pipeline.destroy();
         volume_retile_pipeline.destroy();
         packed_retile_pipeline.destroy();
+        for (auto& pipeline : image_retile_pipelines) pipeline.destroy();
         if (compare_pipeline) vkDestroyPipeline(device, compare_pipeline, nullptr);
         if (compare_pipeline_layout)
             vkDestroyPipelineLayout(device, compare_pipeline_layout, nullptr);
@@ -3684,6 +3687,9 @@ struct BoundImage {
     VkDescriptorPool retile_pool = VK_NULL_HANDLE;
     VkDescriptorSet retile_set = VK_NULL_HANDLE;
     GpuRetileParameters retile_parameters{};
+    bool direct_retile = false;
+    uint32_t image_retile_index = 0;
+    VkFormat materialized_format = VK_FORMAT_UNDEFINED;
     bool storage = false;               // descriptor/representation, independent of access
     bool storage_writeback = false;     // whole-alias output obligation, conservatively proven
     bool prior_output_conflict = false; // earlier writeback can invalidate setup-time equality
@@ -8128,6 +8134,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                                   : VK_FORMAT_R32G32B32A32_SFLOAT)
                 : sampled_float32 ? VK_FORMAT_R32G32B32A32_SFLOAT
                                   : VK_FORMAT_R8G8B8A8_UNORM;
+            bi.materialized_format = image_format;
             // Most storage images use raw uvec4 channels; reflected exact paths keep native-width
             // bytes. Most sampled formats normalize to RGBA8, while HDR/integer formats stay native.
             // #3048: the T#-declared mip chain. `shader_resource_compute_mip_chain_levels` is the
@@ -9844,6 +9851,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         // mode-24 two-byte multilayer path and all word/volume tiling.
         static const bool packed_extension_disabled =
             std::getenv("PROSPER_NO_GPU_RETILE_PACKED_EXTENSION") != nullptr;
+        static const bool direct_retile_enabled = std::getenv("PROSPER_DIRECT_IMAGE_RETILE") != nullptr;
         if (!gpu_retile_disabled) {
             VkPhysicalDeviceProperties properties{};
             vkGetPhysicalDeviceProperties(ctx.physical, &properties);
@@ -9886,7 +9894,21 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     bi.retile_parameters.linear_bytes != staging_bytes[i] ||
                     (array && r->layer_stride_bytes && r->layer_stride_bytes !=
                         bi.retile_parameters.tiled_bytes / r->depth)) continue;
-                auto& retile = packed ? ctx.packed_retile_pipeline :
+                // Only typed integer reads prove exact bits here. Keep the linear output for
+                // current and future baseline consumers and all existing seed/padding gates.
+                const auto image_source = bi.materialized_format == VK_FORMAT_R8G8B8A8_UINT
+                    ? RetileImageSource::Rgba8Uint : RetileImageSource::R32Uint;
+                bi.direct_retile = direct_retile_enabled && !packed && !volume && !array && bpe == 4 &&
+                    (bi.native_uint_storage || bi.packed_r11_storage) &&
+                    (bi.materialized_format == VK_FORMAT_R32_UINT ||
+                     bi.materialized_format == VK_FORMAT_R8G8B8A8_UINT) &&
+                    bi.mip_levels == 1 && r->sample_count == 1 && r->declared_mip_levels == 1 &&
+                    !r->mip_chain_base_level && !r->mip_chain_max_level && !r->linear_row_pitch_bytes &&
+                    !r->mip_tail_bytes && !r->mip_tail_offset;
+                bi.image_retile_index = (image_source == RetileImageSource::Rgba8Uint ? 2u : 0u) +
+                    (bi.arrayed_2d ? 1u : 0u);
+                auto& retile = bi.direct_retile ? ctx.image_retile_pipelines[bi.image_retile_index] :
+                    packed ? ctx.packed_retile_pipeline :
                     volume ? ctx.volume_retile_pipeline : ctx.retile_pipeline;
                 auto prepare = [&] {
                     // #3425: this creates a compute pipeline INTO the shared VkPipelineCache, which
@@ -9899,7 +9921,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         std::lock_guard<std::timed_mutex> cache_lock(ctx.pipeline_cache_mutex);
                         retile_ready = vk_soft_ok(
                             retile.initialize(ctx.device, ctx.pipeline_cache,
-                                              bi.retile_parameters.kind), "retile-pipeline");
+                                              bi.retile_parameters.kind,
+                                              bi.direct_retile ? image_source : RetileImageSource::LinearBuffer,
+                                              bi.arrayed_2d, ctx.physical), "retile-pipeline");
                     }
                     if (!retile_ready) return false;
                     VkBufferCreateInfo ci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
@@ -9917,7 +9941,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         !vk_soft_ok(vkBindBufferMemory(ctx.device, bi.retile_buffer,
                             bi.retile_memory, 0), "retile-bind")) return false;
                     return vk_soft_ok(retile.bind(staging[i], bi.retile_buffer,
-                        bi.retile_parameters, bi.retile_pool, bi.retile_set), "retile-descriptors");
+                        bi.retile_parameters, bi.retile_pool, bi.retile_set,
+                        bi.direct_retile ? bi.view : VK_NULL_HANDLE), "retile-descriptors");
                 };
                 if (!prepare()) {
                     if (bi.retile_pool) vkDestroyDescriptorPool(ctx.device, bi.retile_pool, nullptr);
@@ -9925,6 +9950,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     if (bi.retile_memory) ctx.release_memory(bi.retile_memory);
                     bi.retile_pool = VK_NULL_HANDLE; bi.retile_set = VK_NULL_HANDLE;
                     bi.retile_buffer = VK_NULL_HANDLE; bi.retile_memory = VK_NULL_HANDLE;
+                    bi.direct_retile = false;
                     if (ctx.device_lost) { images_ready = false; break; }
                 }
             }
@@ -10255,7 +10281,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 ctx.result_compare_group_count(image.exact_result_bytes) && staging[i])
                 compare_targets.push_back({
                     staging[i], image.result_baseline, image.exact_result_bytes,
-                    VK_ACCESS_TRANSFER_WRITE_BIT, nullptr, &image});
+                    image.direct_retile ? VK_ACCESS_SHADER_WRITE_BIT : VK_ACCESS_TRANSFER_WRITE_BIT,
+                    nullptr, &image});
         }
         bool compare_ready = compare_targets.empty();
         if (!compare_targets.empty() && ctx.prepare_compare_pipeline()) {
@@ -10816,8 +10843,16 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // Future partial writers and guest readers need completed architectural bytes,
             // independently of which texels this dispatch happened to store (#3455).
             const ShaderResource* r = bi.resource;
+            if (bi.direct_retile) {
+                const uint32_t retile_start = storage_timestamp();
+                ctx.image_retile_pipelines[bi.image_retile_index].record(command,
+                    staging[i], bi.retile_buffer, bi.retile_set, bi.retile_parameters, bi.image);
+                storage_timestamp();
+                if (perf_gpu_timing) storage_timestamp_spans.emplace_back(retile_start, true);
+            }
+            const bool transfer_image = !bi.direct_retile || bi.mirror_result_to_imported;
             VkImageMemoryBarrier to_src{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-            to_src.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            to_src.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
             to_src.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
             to_src.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
             to_src.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
@@ -10825,30 +10860,33 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             to_src.image = bi.image;
             to_src.subresourceRange = {
                 VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, bi.array_layers};
-            vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                                 VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &to_src);
-            VkBufferImageCopy region{};
-            region.imageSubresource = {
-                VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, bi.array_layers};
-            region.imageExtent = {r->width, r->height,
-                                  bi.array_layers > 1 ? 1u : bi.texel_depth};
-            const uint32_t transfer_start = storage_timestamp();
-            vkCmdCopyImageToBuffer(command, bi.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                                   staging[i], 1, &region);
-            // #3249: the storage-image writeback maps this staging buffer and reads every texel.
-            // TRANSFER, not COMPUTE_SHADER: the shader wrote the IMAGE, the copy above wrote this
-            // buffer, and the source scope has to name the write that actually produced the bytes.
-            prosper::gpu::record_host_read_barrier(command, staging[i]);
-            storage_timestamp();
-            if (perf_gpu_timing) storage_timestamp_spans.emplace_back(transfer_start, false);
-            if (bi.retile_buffer) {
-                const uint32_t retile_start = storage_timestamp();
-                (bi.retile_parameters.kind == RetileShaderKind::PackedSubwordArray ? ctx.packed_retile_pipeline :
-                 bi.retile_parameters.kind == RetileShaderKind::Volume3D ? ctx.volume_retile_pipeline : ctx.retile_pipeline)
-                    .record(command, staging[i], bi.retile_buffer,
-                            bi.retile_set, bi.retile_parameters);
+            if (transfer_image)
+                vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                     VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &to_src);
+            if (!bi.direct_retile) {
+                VkBufferImageCopy region{};
+                region.imageSubresource = {
+                    VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, bi.array_layers};
+                region.imageExtent = {r->width, r->height,
+                                      bi.array_layers > 1 ? 1u : bi.texel_depth};
+                const uint32_t transfer_start = storage_timestamp();
+                vkCmdCopyImageToBuffer(command, bi.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                       staging[i], 1, &region);
+                // #3249: the storage-image writeback maps this staging buffer and reads every texel.
+                // TRANSFER, not COMPUTE_SHADER: the shader wrote the IMAGE, the copy above wrote this
+                // buffer, and the source scope has to name the write that actually produced the bytes.
+                prosper::gpu::record_host_read_barrier(command, staging[i]);
                 storage_timestamp();
-                if (perf_gpu_timing) storage_timestamp_spans.emplace_back(retile_start, true);
+                if (perf_gpu_timing) storage_timestamp_spans.emplace_back(transfer_start, false);
+                if (bi.retile_buffer) {
+                    const uint32_t retile_start = storage_timestamp();
+                    (bi.retile_parameters.kind == RetileShaderKind::PackedSubwordArray ? ctx.packed_retile_pipeline :
+                     bi.retile_parameters.kind == RetileShaderKind::Volume3D ? ctx.volume_retile_pipeline : ctx.retile_pipeline)
+                        .record(command, staging[i], bi.retile_buffer,
+                                bi.retile_set, bi.retile_parameters);
+                    storage_timestamp();
+                    if (perf_gpu_timing) storage_timestamp_spans.emplace_back(retile_start, true);
+                }
             }
             if (bi.mirror_result_to_imported) {
                 const BoundImage& mirror = images[bi.seed_from_imported];
@@ -10882,8 +10920,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             }
             // Promotion is decided after host writeback, but a possible retained result must
             // already have the GENERAL layout promised to both compute and graphics consumers.
-            if (bi.cache_candidate || bi.persistent || bi.renderer_seeded_result_candidate ||
-                bi.post_writeback_promotion_candidate) {
+            if (transfer_image && (bi.cache_candidate || bi.persistent || bi.renderer_seeded_result_candidate ||
+                bi.post_writeback_promotion_candidate)) {
                 VkImageMemoryBarrier to_general = to_src;
                 to_general.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
                 to_general.dstAccessMask = VK_ACCESS_SHADER_READ_BIT |
@@ -11003,7 +11041,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // identical result therefore has no redundant 66 MiB baseline copy at all.
             if (image.compare_flag_index != SIZE_MAX) continue;
             copy_result_baseline(staging[i], image.result_baseline,
-                                 image.exact_result_bytes, VK_ACCESS_TRANSFER_WRITE_BIT);
+                                 image.exact_result_bytes,
+                                 image.direct_retile ? VK_ACCESS_SHADER_WRITE_BIT : VK_ACCESS_TRANSFER_WRITE_BIT);
         }
         if (!compare_targets.empty()) {
             // The comparator's flag word is the one host read on this path that always had its
@@ -11625,6 +11664,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             }
             const uint32_t* channels = static_cast<const uint32_t*>(mapped);
             const uint8_t* native_texels = static_cast<const uint8_t*>(mapped);
+            if (g_image_readback_observer_for_test)
+                g_image_readback_observer_for_test(bi.binding, native_texels, staging_bytes[i]);
             // A retained output can avoid the expensive CPU pack/retile and renderer
             // invalidation when BOTH sides of the contract are exact: acquire_cached_image proved
             // that guest memory still contains the prior result, and this dispatch reproduced the
@@ -12008,7 +12049,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                              "[compute-image-writeback] code=0x%llx hash=0x%016llx "
                              "binding=%u addr=0x%llx "
                              "fmt=%u comps=%u tile=%u bytes=%zu cache-hit=%u write-only=%u "
-                             "poison=%u gpu-retile=%u dim=%u layers=%u texel-depth=%u "
+                             "poison=%u gpu-retile=%u direct-retile=%u dim=%u layers=%u texel-depth=%u "
                              "renderer-result-retained=%u "
                              "in-tail=%u tail-x=%u tail-y=%u tail-bytes=%llu "
                              "map_ms=%.3f prepare_ms=%.3f watch_ms=%.3f "
@@ -12018,7 +12059,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                              (unsigned long long)timing_program_hash, bi.binding,
                              (unsigned long long)r->gpu_addr, (unsigned)r->format, nc,
                              r->tile_mode, bi.guest_bytes, image_cache_hit ? 1u : 0u,
-                             bi.storage_write_only ? 1u : 0u, 0u, bi.retile_buffer ? 1u : 0u,
+                             bi.storage_write_only ? 1u : 0u, 0u, bi.retile_buffer ? 1u : 0u, bi.direct_retile ? 1u : 0u,
                              r->img_dim, bi.array_layers, bi.texel_depth,
                              renderer_result_retained ? 1u : 0u,
                              r->in_mip_tail ? 1u : 0u, r->mip_tail_x, r->mip_tail_y,
@@ -12827,6 +12868,11 @@ bool cold_storage_result_snapshot_can_defer(bool host_data, bool full_overwrite,
 
 void live_compute_fail_next_buffer_readback_for_test() {
     g_fail_next_buffer_readback_for_test.store(true, std::memory_order_release);
+}
+
+void live_compute_set_image_readback_observer_for_test(
+    std::function<void(uint32_t, const uint8_t*, size_t)> observer) {
+    g_image_readback_observer_for_test = std::move(observer);
 }
 
 void live_compute_fail_next_storage_readback_for_test() {

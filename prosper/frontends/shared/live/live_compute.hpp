@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <functional>
 #include <vector>
 
 namespace prosper::gpu {
@@ -396,6 +397,10 @@ bool cold_storage_result_snapshot_can_defer(bool host_data, bool full_overwrite,
 // Deterministic failure injection for the storage-image recovery regression test. The next storage
 // readback fails after dispatch, exercising retained-image invalidation without a Vulkan fault.
 void live_compute_fail_next_storage_readback_for_test();
+// Quiescent test fixtures only. Observe actual mapped linear bytes before comparison/packing;
+// the callback cannot change ownership or authorize guest content and must not retain the pointer.
+void live_compute_set_image_readback_observer_for_test(
+    std::function<void(uint32_t, const uint8_t*, size_t)> observer);
 // Consume only after a writable-buffer GPU dispatch completes, before guest publication.
 void live_compute_fail_next_buffer_readback_for_test();
 // Inject an optional conversion-admission result; does not fail an actual driver call.
