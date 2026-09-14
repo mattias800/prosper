@@ -1113,16 +1113,55 @@ HLE(s_vdecsw_try_sync_decode_input) {
     // synchronous inside TrySyncDecodeOutput, so by the time the guest can observe anything the
     // input either was staged or was not.
     //
-    // WHAT THIS DOES NOT DO: write an out-parameter. a1 points at a
-    // caller struct whose layout is not measured yet, and answering "done" while leaving it
-    // untouched is exactly the #2951 failure this file has been bitten by. So the declared size is
-    // logged and nothing is written -- if the title needs a field there, the log names the struct
-    // to go and read. CONFIDENCE: LOW.
-    if (a1) vdecsw_note_struct("TrySyncDecodeInput", *(const uint64_t*)PW(a1), a1);
-    std::lock_guard<std::mutex> lk(g_vdecsw_mx);
-    auto it = g_vdecsw.find(a0);
-    if (it == g_vdecsw.end()) return VDEC_ERR_DECODER;
+    // The caller struct is 0x18: a size field it sets itself, then two qwords it does NOT initialise
+    // (measured: +0x08 reads 0 and +0x10 reads stack residue -- 0x0000000400000000 on one call,
+    // 0x00007fa700000000 on the next). Answering success while leaving those untouched hands the
+    // title its own stack back as an answer, which is the #2951 failure exactly, and it is how a
+    // movie-player queue ends up holding an entry whose pictureCount is garbage.
+    //
+    // They are ZEROED rather than filled with a guess. Zero is not an invented value here: it is
+    // "no information", the same resolution s_gamepresets settles on for the same reason, and it
+    // makes the answer a property of prosper rather than of whatever the guest last pushed. If a
+    // title turns out to need a real count there, it will be visible as a title that stops making
+    // progress rather than as one reading noise. CONFIDENCE: MED on zero being adequate,
+    // HIGH on untouched being wrong.
+    if (a1 && getenv("PROSPER_VDEC2_CONTRACT")) {
+        const auto* q = (const uint64_t*)PW(a1);
+        static std::atomic<unsigned> seq{0};
+        if (seq.fetch_add(1) < 3)
+            fprintf(stderr, "[vdecsw] TrySyncDecodeInput struct: %016llx %016llx %016llx\n",
+                    (unsigned long long)q[0], (unsigned long long)q[1], (unsigned long long)q[2]);
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_vdecsw_mx);
+        if (g_vdecsw.find(a0) == g_vdecsw.end()) return VDEC_ERR_DECODER;
+    }
+    if (a1) {
+        auto* q = (uint64_t*)PW(a1);
+        if (q[0] != 0x18) return vdec_reject("vdecsw.syncinput.size", q[0], VDEC_ERR_STRUCT);
+        q[1] = 0; q[2] = 0;
+    }
     return 0;
+}
+// libSceVdecsw's output struct is the same SIZE as Videodec2's (0x38, measured) but does not put
+// the picture count in the same byte. The title reads it at **+0x0B**, which is where Videodec2's
+// layout keeps `discarded`:
+//
+//     eboot+0x1a405b9: cmp BYTE PTR [r12+0x30],0    ; struct+0x08 -- `valid`, same as Videodec2
+//     eboot+0x1a407a0: cmp BYTE PTR [r13+0x0b],1    ; struct+0x0B -- pictureCount
+//     eboot+0x1a407a5: jne <ASSERTION: pNextDecodedFrame->m_outputInfo.pictureCount == 1>
+//
+// So `valid` agrees and the count does not, and a run that gets both wrong is indistinguishable
+// from one that decodes nothing: the pictures were real, and the title threw every one of them away
+// 63 times a run on an assertion about the byte next door.
+//
+// Only that one byte is re-placed. +0x09 and +0x0A have no measured meaning under Vdecsw and are
+// left exactly as the shared decode wrote them rather than being zeroed on a guess; `discarded` is
+// the field being overwritten and prosper's decode always sets it to 0, so nothing is lost.
+// CONFIDENCE: HIGH on the offset (the guest's own compare), LOW on the rest of the layout.
+static void vdecsw_place_picture_count(VdecOutput* out) {
+    if (!out) return;
+    ((uint8_t*)out)[0x0B] = out->pictures;
 }
 HLE(s_vdecsw_try_sync_decode_output) {
     VdecswPending p;
@@ -1151,6 +1190,7 @@ HLE(s_vdecsw_try_sync_decode_output) {
           if (it == g_vdec_codecs.end()) return VDEC_ERR_DECODER; codec = it->second; }
         VdecFrame fr{}; fr.size = sizeof(fr); fr.data = p.out_data; fr.data_size = p.out_bytes;
         vdec_no_picture(&fr, out, codec);
+        vdecsw_place_picture_count(out);
         return 0;
     }
     VdecswInput staged;
@@ -1167,7 +1207,10 @@ HLE(s_vdecsw_try_sync_decode_output) {
     in.data = (uint64_t)(uintptr_t)staged.au.data(); in.data_size = staged.au.size();
     in.pts = staged.pts;
     VdecFrame fr{}; fr.size = sizeof(fr); fr.data = p.out_data; fr.data_size = p.out_bytes;
-    return s_videodec2_decode(a0, (uint64_t)(uintptr_t)&in, (uint64_t)(uintptr_t)&fr, a1, 0, 0);
+    const uint64_t rc = s_videodec2_decode(a0, (uint64_t)(uintptr_t)&in,
+                                           (uint64_t)(uintptr_t)&fr, a1, 0, 0);
+    vdecsw_place_picture_count(out);
+    return rc;
 }
 HLE(s_videodec2_flush) {
     uint32_t codec;
