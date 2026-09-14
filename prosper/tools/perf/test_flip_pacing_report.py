@@ -629,6 +629,258 @@ def main():
                 if want == "unclear" and "more than one run" in sentence:
                     failures.append("case 26: the unclassifiable band still asserts a second run")
 
+    # ---------------------------------------------------------------- #3581
+    # Three of #3562's six behaviour changes were GREEN IN BOTH DIRECTIONS when it merged:
+    # reverting them changed the report and reddened nothing, so three `(#3560)` comments went on
+    # asserting fixes that no arm held down (#3581). None of the three can produce a wrong number
+    # on its own, which is why it was not blocking -- but this file's history is corrections that
+    # each carried the previous defect forward in a narrower form (instrument trap 275/277), and
+    # an unpinned claim in a tool whose subject is "a number that reads as a measurement and is
+    # not one" is the one thing that must not be left lying around here.
+    #
+    # Cases 27-29 are those three arms, one per unpinned line. Each block names the exact
+    # pre-#3562 expression it is measured against, so the without-fix run stays reproducible.
+    #
+    # A SECOND BUILDER, because `burst_log` above spreads its bursts evenly at a chosen fraction
+    # and these arms need the interval VALUES placed deliberately -- a tick-locked phase beside an
+    # anti-aligned one, and one long interval at a known ordinal. The caller writes the interval
+    # list, so every expected number below is derived from the construction and never read back
+    # out of the tool.
+    def interval_log(ivals, t0=1.0):
+        t = t0
+        rows = [f"[ev] GpuFlip t={t:.6f} handle=0x1002 bufidx=0 mode=0x1 fliparg=0x0"]
+        for ms in ivals:
+            t += ms / 1000.0
+            rows.append(f"[ev] GpuFlip t={t:.6f} handle=0x1002 bufidx=0 mode=0x1 fliparg=0x0")
+        return "\n".join(rows) + "\n"
+
+    WINDOW_ROW = re.compile(r"flips\s+(\d+)-\s*(\d+):\s+([0-9.]+) fps\s+mean\s+[0-9.]+ ms"
+                            r"\s+tick-aligned\s+([0-9.]+)%")
+    RETAINED = re.compile(r"\[mean over (\d+)/(\d+)\]")
+
+    def window_rows(text):
+        """(start, end, fps, share, retained) per window row.
+
+        The retained count is the bracketed one where anything was dropped and the row's own
+        width where nothing was -- the report prints the bracket only when the two differ. Rows
+        whose whole population was filtered carry no statistic and are not rows for this purpose.
+        """
+        found = []
+        for line in text.splitlines():
+            m = WINDOW_ROW.search(line)
+            if not m:
+                continue
+            r = RETAINED.search(line)
+            start, end = int(m.group(1)), int(m.group(2))
+            found.append((start, end, float(m.group(3)), float(m.group(4)) / 100.0,
+                          int(r.group(1)) if r else end - start))
+        return found
+
+    def window_width(text):
+        m = re.search(r"windows of ~(\d+) flips", text)
+        return None if m is None else int(m.group(1))
+
+    # 27. THE WINDOW LENGTH IS CUT OVER THE RAW TIMELINE:
+    #
+    #       window_flips = max(1, int(window_s * 1000.0 * len(raw) / span_ms))
+    #
+    #     The pre-#3562 line was `int(window_s * (1000.0 / statistics.mean(intervals)))`, i.e.
+    #     window_s times the rate of the RETAINED set. That rate is the true rate multiplied by
+    #     the retained fraction, so every window comes out short by exactly that fraction: on a
+    #     run that drops half its intervals to the burst filter, a `--window-s 5` row covers 2.5 s
+    #     of wall clock while the header above it says the reader got the period they asked for.
+    #     The windowed view exists to locate a phase change in TIME, so a window length that
+    #     shrinks with a run's burstiness misplaces the boundary it is read for -- silently,
+    #     because nothing in the output is denominated in seconds.
+    #
+    #     CASE 22 CANNOT SEE THIS, which is why this needs its own arm. Case 22 checks each row's
+    #     RATE (its own flips over its own span -- right at any window length) and the last row's
+    #     ordinal (the full 1200 whatever the step -- also right at any window length). The cut
+    #     can be halved with both still passing, and measured, it is.
+    #
+    #     Case 20's `dense` run is reused rather than rebuilt, so this arm cannot drift from the
+    #     construction it judges: 1200 intervals over exactly 20.000 s, half of them sub-0.5 ms.
+    #     At --window-s 5 that is four windows of 300 flips, each covering 5.000 s. Pre-fix it is
+    #     eight windows of 150, each covering 2.500 s.
+    span_s, n_raw, window_s = 20.0, 1200, 5.0
+    want_width = int(window_s * n_raw / span_s)     # 300 flips = 5 s at 60 flips/s
+    want_rows = int(span_s / window_s)              # 4 windows over a 20 s run
+    out, _ = run(dense, ["--window-s", str(window_s)])
+    # The regime, stated rather than assumed: half of this run is burst, which is the whole reason
+    # the two forms differ at all. If that ever stops holding, the arm below measures nothing.
+    expect(out, "600 of 1200 retained", "case 27 the run is half burst, or this arm is void")
+    width = window_width(out)
+    if width != want_width:
+        failures.append(
+            f"case 27: {n_raw} intervals over {span_s:.3f} s is {n_raw / span_s:.0f} flips/s, so a"
+            f" {window_s:.0f} s window is {want_width} flips and the report says {width} -- the"
+            f" window length is cut over the retained set, so it is short by the retained"
+            f" fraction (#3560)")
+    rows = window_rows(out)
+    if len(rows) != want_rows:
+        failures.append(
+            f"case 27: a {span_s:.0f} s run at --window-s {window_s:.0f} must split into"
+            f" {want_rows} windows and produced {len(rows)} -- the window length is not"
+            f" {window_s:.0f} s of wall clock (#3560)")
+    for start, end, fps, _share, _retained in rows:
+        # The row prints its flips and its rate, so the wall clock it covers is flips/rate -- the
+        # quantity --window-s names, and the one nothing else in this file asserts.
+        covered = (end - start) / fps
+        if abs(covered - window_s) > 0.15:
+            failures.append(
+                f"case 27: window {start}-{end} reports {end - start} flips at {fps} fps, so it"
+                f" covers {covered:.3f} s of wall clock where --window-s asked for"
+                f" {window_s:.3f} s (#3560)")
+
+    # 28. THE WINDOW-VOTE BAR IS A QUARTER OF THE LARGEST WINDOW'S RETAINED COUNT:
+    #
+    #       cap = max((n for _, n in window_sizes), default=0)
+    #       full = [share for share, n in window_sizes if n >= max(8, cap // 4)]
+    #
+    #     The pre-#3562 predicate was `n >= max(8, window_flips // 4)`. `n` is a RETAINED count
+    #     and `window_flips` is a RAW one, so as soon as the retained fraction falls below a
+    #     quarter the bar sits above every window at once: `full` comes out empty, and the
+    #     "windows disagree ... read the windows, not the summary" note is silenced ENTIRELY.
+    #     That fails in the worse direction twice over -- the note disappears on the burstiest
+    #     runs, which are where a phase change is likeliest to be hiding, and its absence reads
+    #     as windows that agree rather than as a threshold none of them could clear.
+    #
+    #     Two equal phases, one locked to the tick and one parked on the half-tick offset, each
+    #     600 real intervals with five 0.2 ms bursts behind every one -- a 16.7% retained
+    #     fraction, comfortably under the quarter where the two bars cross. --window-s is half the
+    #     constructed span, so the cut lands on the seam and the two windows ARE the two phases:
+    #     100.0% against 0.0% tick-aligned, 600 retained of 3600 raw each. The correct bar is
+    #     max(8, 600 // 4) = 150 and both vote; the pre-fix bar is max(8, 3600 // 4) = 900 and
+    #     neither does.
+    bursts_per_long, groups = 5, 600
+    ivals = []
+    for long_ms in (FPR.TICK_MS, FPR.TICK_MS * 1.5):
+        for _ in range(groups):
+            ivals.append(long_ms)
+            ivals.extend([0.2] * bursts_per_long)
+    out, _ = run(interval_log(ivals), ["--window-s", f"{sum(ivals) / 2000.0:.6f}"])
+    width = window_width(out)
+    rows = window_rows(out)
+    voters = [r for r in rows if r[4] >= 8]
+    # THE PRECONDITIONS, asserted apart from the conclusion so a construction that drifts out of
+    # the regime fails under its own name instead of quietly making the arm pass. The regime is:
+    # at least two windows large enough to vote, disagreeing by more than the note's 25-point
+    # threshold, every one of them below a quarter of the RAW window width.
+    if width is None or len(voters) < 2:
+        failures.append(f"case 28: expected at least two windows with a votable retained"
+                        f" population, got {rows!r}: {out!r}")
+    else:
+        shares = [r[3] for r in voters]
+        over = [r[4] for r in voters if r[4] >= width // 4]
+        if max(shares) - min(shares) < 0.25:
+            failures.append(f"case 28: the two phases were built to disagree by 100 points and the"
+                            f" windows report {shares!r} -- this run is no longer the regime the"
+                            f" arm is about")
+        elif over:
+            failures.append(f"case 28: a window retained {over!r} intervals of a {width}-flip raw"
+                            f" window and so clears the pre-fix bar of {width // 4} on its own,"
+                            f" which means this run cannot tell the two bars apart")
+        elif "windows disagree" not in out:
+            failures.append(
+                f"case 28: two windows at {100 * min(shares):.1f}% and {100 * max(shares):.1f}%"
+                f" tick-aligned printed no disagreement note, because each retained"
+                f" {voters[0][4]} intervals and the bar was a quarter of the {width}-flip RAW"
+                f" window rather than of the largest window's retained count -- so the note is"
+                f" silenced exactly on the bursty runs a phase change is likeliest to hide in"
+                f" (#3560): {out!r}")
+
+    # 28b. ...and the 8-interval FLOOR must survive, or case 28 is equally satisfied by dropping
+    #      the bar altogether, which would reintroduce the defect the bar was added for (#3454
+    #      review): a trailing sliver's share is quantised into huge steps -- 3 intervals can only
+    #      score 0/33/67/100% -- so comparing one against a full window manufactures a
+    #      disagreement out of the quantisation. This is a CONTROL, not a discriminator for
+    #      #3581: it passes in both directions of all three mutations above, and is counted as
+    #      neither. It discriminates only the floor.
+    #
+    #      The tail has to land in the gap BETWEEN the two terms or the control is void, which is
+    #      the first thing asserted below: three windows of 20 anti-aligned intervals (0% each,
+    #      so cap // 4 = 5) and a 6-interval tail of tick-locked ones (100%). Six clears 5 and is
+    #      under 8, so the floor is the only term excluding it -- with the floor the three full
+    #      windows agree and nothing prints, without it the tail votes and 0%..100% does. A
+    #      3-interval tail would be excluded by `cap // 4` alone and would assert nothing.
+    #
+    #      The window length carries a deliberate +0.4 flip: the report TRUNCATES window_flips, so
+    #      an exactly-20.0 request can land on 19 through float error and put three anti-aligned
+    #      intervals into the tail, which is a different regime rather than a failure.
+    ivals = [FPR.TICK_MS * 1.5] * 60 + [FPR.TICK_MS] * 6
+    window_s = (20 + 0.4) * (sum(ivals) / 1000.0) / len(ivals)
+    out, _ = run(interval_log(ivals), ["--window-s", f"{window_s:.6f}"])
+    rows = window_rows(out)
+    slivers = [r for r in rows if r[4] < 8]
+    full_rows = [r[3] for r in rows if r[4] >= 8]
+    if not slivers or not full_rows:
+        failures.append(f"case 28b: this run was built to leave a sub-8-interval tail beside full"
+                        f" windows and produced {rows!r}, so the control is void: {out!r}")
+    elif max(r[3] for r in slivers) - min(full_rows) < 0.25:
+        failures.append(f"case 28b: the tail scores {[r[3] for r in slivers]!r} against full"
+                        f" windows at {full_rows!r}, so there is no manufactured disagreement for"
+                        f" the floor to suppress and the control claims nothing")
+    elif "windows disagree" in out:
+        failures.append(f"case 28b: a {slivers[-1][1] - slivers[-1][0]}-interval tail voted"
+                        f" against full windows that agree with each other, which is the"
+                        f" quantisation the 8-interval floor exists to keep out (#3454 review):"
+                        f" {out!r}")
+
+    # 29. THE SLOWEST-INTERVAL ORDINALS ARE OVER THE RAW LIST:
+    #
+    #       slowest = sorted(range(len(raw)), key=lambda i: -raw[i])[:5]
+    #       ... f"{raw[i]:.1f} @ flip {i}"
+    #
+    #     The pre-#3562 pair indexed `intervals`, the filtered list, under a label reading "flip".
+    #     This line's whole job is to point a reader back into the log at the moment the run
+    #     stalled, and a filtered index is off by every burst that preceded it -- so the tool
+    #     names a flip that is not the one it measured, and the reader goes and looks at it. It is
+    #     the only output here that is a POINTER rather than a statistic, which is why being
+    #     quietly wrong costs more than a wrong number would.
+    #
+    #     The issue's worked example, constructed exactly: 112 dropped bursts interleaved among
+    #     the first 300 real intervals, then one 500 ms stall. Its raw ordinal is 412 and its
+    #     index in the filtered list is 300, so the two forms print `@ flip 412` and `@ flip 300`
+    #     for the same interval.
+    normal_ms, burst_ms, stall_ms = 16.0, 0.2, 500.0
+    ivals = []
+    for _ in range(112):
+        ivals.extend([normal_ms, burst_ms])
+    ivals.extend([normal_ms] * 188)
+    stall_at = len(ivals)
+    ivals.append(stall_ms)
+    ivals.extend([normal_ms] * 100)
+    filtered_at = sum(1 for ms in ivals[:stall_at] if ms > 0.5)
+    if (stall_at, filtered_at) != (412, 300):
+        failures.append(f"case 29: the construction drifted -- the stall sits at raw ordinal"
+                        f" {stall_at} and filtered index {filtered_at}, expected 412 and 300")
+    out, _ = run(interval_log(ivals))
+    named = re.findall(r"([0-9.]+) @ flip (\d+)", out)
+    if not named:
+        failures.append(f"case 29: no slowest-interval line at all: {out!r}")
+    # THE GENERAL INVARIANT first: whatever the tool names, `flip i` must index the flip timeline,
+    # so raw[i] has to be the value printed beside it. That catches the defect on all five entries
+    # rather than only on the stall, and no filtered index can satisfy it once anything is dropped.
+    for value, ordinal in named:
+        i = int(ordinal)
+        if i >= len(ivals) or abs(ivals[i] - float(value)) > 0.06:
+            failures.append(
+                f"case 29: the report names {value} ms '@ flip {ordinal}', but flip {ordinal} of"
+                f" this run is {ivals[i] if i < len(ivals) else 'past the end'} ms -- the ordinals"
+                f" index the filtered list while the label says flip, so they point at the wrong"
+                f" line of the log (#3560)")
+    # ...and the stall itself, named with both numbers, because this is the one a reader follows.
+    stall = [int(o) for v, o in named if abs(float(v) - stall_ms) < 0.06]
+    if not stall:
+        failures.append(f"case 29: the {stall_ms:.0f} ms stall is not among the slowest intervals"
+                        f" at all: {out!r}")
+    elif stall[0] != stall_at:
+        failures.append(
+            f"case 29: the {stall_ms:.0f} ms stall is flip {stall_at} and the report says flip"
+            f" {stall[0]}, which is its index in the filtered list after the"
+            f" {stall_at - filtered_at} earlier bursts were dropped -- a pointer into the log that"
+            f" does not point at the thing (#3560)")
+
     if failures:
         print("FAILURES:")
         for failure in failures:
