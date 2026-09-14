@@ -6278,7 +6278,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     // A diagnostic replacement or shader transformation is a different program. The
     // original instruction classification cannot authorize its effects or suppress its work.
     if (override_applies || !write_masks.words.empty()) known_fill = nullptr;
-    static const bool cached_fill_enabled = std::getenv("PROSPER_CACHED_COMPUTE_FILL") != nullptr;
+    static const bool cached_fill_enabled = std::getenv("PROSPER_NO_CACHED_COMPUTE_FILL") == nullptr;
     const bool trace = trace_compute_item(item);
     const bool perf_capture_timing =
         prosper::perf::interactive_performance_capture().detailed_timing_active();

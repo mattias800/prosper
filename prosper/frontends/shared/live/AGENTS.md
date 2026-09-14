@@ -153,14 +153,16 @@ equal the fill pattern. `cached_compute_fill` exercises this distinction against
 only while F8 detailed timing is active. Broadcast-buffer shortcuts have a separate implementation
 and are not included in this reason partition. The census reads no additional guest contents.
 
-`PROSPER_CACHED_COMPUTE_FILL=1` currently opts into reusing a complete fill pattern on an existing
-compute-buffer owner. Full ordinary direct backing, matching emitted extent and current acquired
+Complete fill patterns can be reused on an existing compute-buffer owner by default.
+`PROSPER_NO_CACHED_COMPUTE_FILL=1` disables pattern recording and reuse for comparisons.
+Full ordinary direct backing, matching emitted extent and current acquired
 source authority are required. The pattern is cleared before source refresh or writable dispatch
 and published only after all result writebacks succeed. Partial/hosted/tail bindings and applied
 shader overrides are excluded. No additional guest-data cache is created. A `cached-fill` buffer
 timing row identifies an actual skipped submission; its GPU comparison is `not-recorded`.
 
-Known fills use an explicit clear origin for unchanged GPU writeback and cached reuse. Guest-byte
+Known fills use an explicit clear origin for unchanged GPU writeback and cached reuse, including
+when reuse is disabled. Guest-byte
 watches/journal remain valid, while renderer aliases still receive the semantic clear. Generic
 refresh operations retain their existing preservation classification. The production fixture also
 checks complete-pattern reuse, intervening writers, alias mutations, failed publication, partial

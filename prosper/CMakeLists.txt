@@ -3351,11 +3351,11 @@ if(TARGET prosper_core)
         target_include_directories(test_cached_compute_fill PRIVATE tests frontends)
         target_link_libraries(test_cached_compute_fill PRIVATE prosper_live_renderer prosper_core Vulkan::Vulkan)
         add_test(NAME cached_compute_fill COMMAND ${CMAKE_COMMAND} -E env
-                 PROSPER_CACHED_COMPUTE_FILL=1 PROSPER_COMPUTE_WRITE_WATCH_PROMOTE_HITS=1
+                 PROSPER_COMPUTE_WRITE_WATCH_PROMOTE_HITS=1
                  PROSPER_COMPUTE_BUFFER_RESULT_MIN_MB=0
                  $<TARGET_FILE:test_cached_compute_fill>)
         add_test(NAME cached_compute_fill_override COMMAND ${CMAKE_COMMAND} -E env
-                 PROSPER_CACHED_COMPUTE_FILL=1 PROSPER_COMPUTE_WRITE_WATCH_PROMOTE_HITS=1
+                 PROSPER_COMPUTE_WRITE_WATCH_PROMOTE_HITS=1
                  PROSPER_COMPUTE_BUFFER_RESULT_MIN_MB=0
                  $<TARGET_FILE:test_cached_compute_fill> --cached-override)
         set_tests_properties(cached_compute_fill cached_compute_fill_override PROPERTIES TIMEOUT 60)
