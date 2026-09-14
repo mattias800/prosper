@@ -1208,6 +1208,18 @@ if(TARGET prosper_core)
   target_link_libraries(test_savedata_mountinfo PRIVATE prosper_core)
   add_test(NAME savedata_mount_info COMMAND test_savedata_mountinfo)
 
+  # The two umount entry points (#3666). sceSaveDataUmount2 read NONE of its arguments -- it
+  # unmounted /savedata0 and reported success whatever it was handed, so a title naming another
+  # mount point had a live mount discarded on its behalf -- and sceSaveDataUmount answered NOT_FOUND
+  # both for a bad argument and for "nothing is mounted", where its siblings answer PARAMETER and
+  # NOT_MOUNTED. Drives the real NIDs, including GetEventResult, so a refused umount is shown to
+  # queue no completion event. Pins Umount2's argument ORDER (flags first, mount point second),
+  # which live capture and four titles' disassembly establish against the obvious reading.
+  add_executable(test_savedata_umount tests/hle/test_savedata_umount.cpp)
+  target_include_directories(test_savedata_umount PRIVATE tests)
+  target_link_libraries(test_savedata_umount PRIVATE prosper_core)
+  add_test(NAME savedata_umount_contract COMMAND test_savedata_umount)
+
   # Save data is namespaced by title id (#2734): two titles that pick the same guest save name --
   # `OptionSettings`, or SaveDataMemory's (user 1, slot 0) -- must not share one host save. Runs two
   # application roots over one guest name, because a single-title round trip passes on the broken code.
@@ -1577,6 +1589,7 @@ if(TARGET prosper_core)
   add_test(NAME savedata_tx_resource_ids COMMAND test_savedata_txres)
 
   add_executable(test_savedata_event_drain tests/hle/service/test_savedata_event_drain.cpp)
+  target_include_directories(test_savedata_event_drain PRIVATE tests)
   target_link_libraries(test_savedata_event_drain PRIVATE prosper_core)
   add_test(NAME savedata_event_drain_code COMMAND test_savedata_event_drain)
 

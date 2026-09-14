@@ -4663,16 +4663,90 @@ static bool savedata_mount_point_ok(uint64_t mount_point_va) {
     return strncmp(mp, "/savedata0", 16) == 0;
 }
 
+// --- the two umount entry points (#3666) --------------------------------------------------------
+//
+// sceSaveDataUmount  (BMR4F-Uek3E, libSceSaveData)         PS4-namespace
+// sceSaveDataUmount2 (uW4vfTwMQVo, libSceSaveData.native)  PS5-native, and the one titles use
+//
+// Umount2 previously read NONE of its arguments: it unmounted /savedata0, queued a completion
+// event and returned SCE_OK whatever it was handed. A title passing a mount point this build does
+// not serve therefore had a LIVE MOUNT DISCARDED on its behalf and was told it had succeeded --
+// the #3653 shape, but mutating state rather than only misreporting it.
+//
+// THE ARGUMENT ORDER IS NOT THE OBVIOUS ONE, and this is the finding to carry: Umount2's mount
+// point is the SECOND argument. The first is a small flags word. Reading it as (mountPoint, ...)
+// by analogy with Umount would have validated the flags word as a pointer and refused every
+// correct call.
+//
+//   int sceSaveDataUmount2(uint32_t flags, const SceSaveDataMountPoint* mountPoint);
+//
+// CONFIDENCE: HIGH on that shape. Established top-of-hierarchy first -- a LIVE CAPTURE of Dead
+// Cells (PPSA15552) on its own snapshot route, PROSPER_SVCLOG=1, three calls, every one of them:
+//
+//   [svc] sceSaveDataUmount2(0x1, 0x7f8953c20c60, ...)
+//   [svc]   a1 -> 746164657661732f 0000000000003061 ...      <- "/savedat" "a0\0"
+//
+// and corroborated statically in four independent titles, where the pointer handed to Umount2 is
+// provably the MountResult a mount call just filled in (mountPoint char[16] sits at its +0x00, so
+// &result and &result.mountPoint are the same address):
+//
+//   PPSA03831 Sonic Frontiers  eboot+0x165f177 mounts into &rsp[0], then eboot+0x165f180-87 does
+//                              `mov rsi,rsp / xor edi,edi / call Umount2` -- the same buffer.
+//   PPSA15552 Dead Cells       r15 is the result out-param of Mount3 at eboot+0x173c90c and the
+//                              rsi of Umount2 at eboot+0x173c960.
+//   PPSA20447 Khazan           eboot+0x1531bc6 `mov rsi,rbx / xor edi,edi` after Commit.
+//   PPSA17942 DOLL             eboot+0x2251792-97 `mov rsi,r14 / xor edi,edi`, the wrapper's own
+//                              second parameter passed straight through.
+//
+// In every site rdi and rsi are the only registers set after the preceding call, so the call takes
+// TWO arguments; rdx/rcx are clobbered garbage (they differ per call in the live capture).
+//
+// THE FLAGS WORD IS DELIBERATELY NOT VALIDATED. Observed values are 0, 1 and 0x10001 -- Sonic
+// Frontiers builds its at eboot+0x18a2401-0d as `v` or `v + 0x10000` under a runtime condition, so
+// bit 16 is an independent flag rather than part of a small enum. What those bits MEAN is not
+// established, and a validator aimed at a guessed flag set would refuse correct calls to buy
+// nothing. CONFIDENCE: MED that the word is flags at all (the conditional bit-16 set is the
+// evidence); no confidence is claimed about individual bits, so none are rejected. If it later
+// turns out to carry something prosper must honour -- a "discard without commit" bit, say -- that
+// is a behaviour to add, not a check.
+//
+// THE CONTRACT, now the same one for both entry points and the same one GetMountInfo/SetParam/
+// GetParam use:
+//
+//   input                                    answer
+//   mount point null, or not this build's    SAVE_DATA_ERR_PARAMETER    (0x809F0000)
+//   valid /savedata0, nothing mounted        SAVE_DATA_ERR_NOT_MOUNTED  (0x809F0004)
+//   valid /savedata0, live mount             0, and the mount is gone
+//
+// Umount previously answered NOT_FOUND to BOTH error rows, collapsing "your argument is wrong" and
+// "nothing is mounted" into one code that means neither. CONFIDENCE: LOW that PARAMETER/NOT_MOUNTED
+// is what the firmware returns, and the local corpus cannot raise it: of the 61 local dumps with an
+// eboot, ZERO import BMR4F-Uek3E -- Umount, UmountSys and UmountWithBackup are absent from every
+// one of them, while 34 import Umount2 (exactly the 34 that import Mount3). So this row is
+// consistency with the four sibling handlers, not evidence, and nothing local can falsify it. What
+// WOULD: a title that const-compares an umount return against 0x809F0008.
+// CONFIDENCE: HIGH on the polarity, which is the part titles branch on -- discarding a mount that
+// was never asked for, and reporting success for an unmount that did not happen, are both wrong.
+//
+// THE COMPLETION EVENT IS NOW QUEUED ONLY BY AN UNMOUNT THAT HAPPENED. g_savedata_umount_events
+// used to be bumped unconditionally, so a refused call still fed sceSaveDataGetEventResult a
+// fabricated UMOUNT_BACKUP completion for an operation that never ran -- the same false-success
+// class one layer down. A synchronous failure starts no operation and so completes none.
+//
+// No snapshot of the mount state is taken here, unlike GetMountInfo: savedata0_umount() tests and
+// clears under one hold of g_save0_mx, so "was it mounted" and "unmount it" cannot be separated by
+// a concurrent umount on another guest thread. Two threads racing to unmount therefore produce
+// exactly one success and one NOT_MOUNTED rather than two successes and two events.
 HLE(s_savedata_umount) {
     svc_log("sceSaveDataUmount", a0,a1,a2,a3,a4,a5);
-    if (!a0) return SAVE_DATA_ERR_PARAMETER;
-    const char* mount_point = (const char*)PW(a0); // OrbisSaveDataMountPoint: char data[16]
-    if (strncmp(mount_point, "/savedata0", 16) != 0) return SAVE_DATA_ERR_NOT_FOUND;
-    return savedata0_umount() ? 0 : SAVE_DATA_ERR_NOT_FOUND;
+    if (!savedata_mount_point_ok(a0)) return SAVE_DATA_ERR_PARAMETER;
+    if (!savedata0_umount()) return SAVE_DATA_ERR_NOT_MOUNTED;
+    return 0;
 }
 HLE(s_savedata_umount2) {
-    svc_log("sceSaveDataUmount2", a0,a1,a2,a3,a4,a5);
-    savedata0_umount();
+    svc_log("sceSaveDataUmount2", a0,a1,a2,a3,a4,a5);   // a0 = flags, a1 = const SceSaveDataMountPoint*
+    if (!savedata_mount_point_ok(a1)) return SAVE_DATA_ERR_PARAMETER;
+    if (!savedata0_umount()) return SAVE_DATA_ERR_NOT_MOUNTED;
     g_savedata_umount_events.fetch_add(1, std::memory_order_release);
     return 0;
 }
