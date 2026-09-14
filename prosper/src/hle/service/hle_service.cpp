@@ -4267,6 +4267,13 @@ HLE(s_playgo_getlang) { if (!a1) return PLAYGO_ERR_BAD_POINTER;
 static constexpr uint64_t SAVE_DATA_ERR_PARAMETER = 0x809F0000ull;
 static constexpr uint64_t SAVE_DATA_ERR_EXISTS = 0x809F0007ull;
 static constexpr uint64_t SAVE_DATA_ERR_NOT_FOUND = 0x809F0008ull;
+// From the same published table this file's other savedata codes come from. Spelled out rather than
+// folded into a near-miss: "no save is mounted" and "the host write failed" are different facts, and
+// answering either with PARAMETER would send a title looking at its own arguments.
+// CONFIDENCE: MED on both numeric values; HIGH on the polarity, which is what a title branches on.
+constexpr uint64_t SAVE_DATA_ERR_NOT_MOUNTED = 0x809F0004ull;
+constexpr uint64_t SAVE_DATA_ERR_INTERNAL    = 0x809F000Bull;
+
 // 0x809F0018 is the "the operation is STILL IN FLIGHT, keep waiting" code. That meaning is
 // corroborated by four independent titles in the local dump set, each of which sleeps and re-polls
 // on it -- better evidence than exists for most constants in this file:
@@ -4645,6 +4652,15 @@ HLE(s_savedata_umount2) {
     g_savedata_umount_events.fetch_add(1, std::memory_order_release);
     return 0;
 }
+// The mount-point argument is SceSaveDataMountPoint { char data[16] }. Accept only the mount this
+// build serves, so a title passing a different one is refused instead of having its parameter block
+// applied to whatever happens to be mounted.
+static bool savedata_mount_point_ok(uint64_t mount_point_va) {
+    if (!mount_point_va) return false;
+    const char* mp = (const char*)PW(mount_point_va);
+    return strncmp(mp, "/savedata0", 16) == 0;
+}
+
 // sceSaveDataGetMountInfo(mp, OrbisSaveDataMountInfo* info = { u64 blocks; u64 freeBlocks; u8 rsv[32] }, 48
 // bytes): was MISSING -> success with garbage free-space, so a title sizing its save against freeBlocks
 // could abort ("disk full") or corrupt its math. Report a generous, consistent size (256K blocks free).
@@ -4690,13 +4706,6 @@ constexpr size_t SAVE_DATA_PARAM_OFF_SUBTITLE = 128;
 constexpr size_t SAVE_DATA_PARAM_OFF_DETAIL = 256;
 constexpr size_t SAVE_DATA_PARAM_OFF_USER_PARAM = 1280;
 constexpr size_t SAVE_DATA_PARAM_OFF_MTIME = 1288;
-// From the same published table this file's other savedata codes come from. Spelled out rather than
-// folded into a near-miss: "no save is mounted" and "the host write failed" are different facts, and
-// answering either with PARAMETER would send a title looking at its own arguments.
-// CONFIDENCE: MED on both numeric values; HIGH on the polarity, which is what a title branches on.
-constexpr uint64_t SAVE_DATA_ERR_NOT_MOUNTED = 0x809F0004ull;
-constexpr uint64_t SAVE_DATA_ERR_INTERNAL    = 0x809F000Bull;
-
 // The byte count TYPE_<x> transfers. 0 means "not a type this can answer", which is refused rather
 // than guessed: answering an unknown type with silent success is exactly what #2786 was.
 static size_t savedata_param_type_size(uint32_t type) {
@@ -4721,15 +4730,6 @@ static void savedata_param_write_text(uint8_t* field, size_t capacity, const std
     const size_t n = value.size() < capacity - 1 ? value.size() : capacity - 1;
     memcpy(field, value.data(), n);
 }
-// The mount-point argument is SceSaveDataMountPoint { char data[16] }. Accept only the mount this
-// build serves, so a title passing a different one is refused instead of having its parameter block
-// applied to whatever happens to be mounted.
-static bool savedata_mount_point_ok(uint64_t mount_point_va) {
-    if (!mount_point_va) return false;
-    const char* mp = (const char*)PW(mount_point_va);
-    return strncmp(mp, "/savedata0", 16) == 0;
-}
-
 HLE(s_savedata_setparam) {
     svc_log("sceSaveDataSetParam", a0,a1,a2,a3,a4,a5);
     const uint32_t type = (uint32_t)a1;
