@@ -17,7 +17,9 @@ enum class FoldProbe : uint32_t { Raw, Base48, Base40, ScalarBuffer, OptionalTab
 struct FoldReader {
     bool branch_exclusive_disabled = false;
     uint64_t logical_code_address = 0;
-    uint64_t evaluations = 0, evaluated_instructions = 0;
+    uint64_t evaluations = 0;
+    // Accumulated on successful completion; not a live progress or exception counter.
+    uint64_t evaluated_instructions = 0;
     uint32_t decoded_dwords = 0;
     bool shader_constant_specialized = false;
     virtual ~FoldReader() = default;

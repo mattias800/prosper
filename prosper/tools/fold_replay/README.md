@@ -58,3 +58,16 @@ Limits are 65,536 code dwords/events, 16,384 outputs per kind, 4 MiB event paylo
 a whole-file checksum; these are corruption guards, not cryptographic authentication.
 Captured addresses are logical identities and are never mapped or dereferenced offline.
 Agreement proves reproduction of Prosper's current evaluator, not correct guest semantics.
+
+For a direct-reader control, run `<BUILD>/test_fold_control_plan benchmark` and
+`<BUILD>/test_fold_control_plan benchmark-long` (the latter retains 1,500 additional
+scalar instructions). Both warm the selected stream and check descriptor results on each
+invocation. These synthetic timings include live probes, validation and result destruction;
+they are separate from the replay CLI's timing contract. Compare identical workloads on
+both revisions, alternate execution order, and exclude concurrent builds/games.
+
+The reusable plan also stores instruction-only EXEC-write and mip-operand classification.
+It never stores the runtime zero-mip result: current register values, intervening EXEC writes
+and block boundaries still determine that proof on every invocation. These facts occupy the
+existing 16-byte step's padding. Construction performs the classification once; warm folds
+avoid three repeated helper calls per instruction. Cold/reconstructed plans still pay for it.

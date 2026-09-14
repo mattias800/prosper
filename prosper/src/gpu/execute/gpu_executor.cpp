@@ -3834,26 +3834,25 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
     std::bitset<256> same_block_zero_vgprs;
     bool zero_mip_exec_pristine = true;
 
-    for (size_t instruction_index = 0; instruction_index < ins.size(); ++instruction_index) {
+    size_t instruction_index = 0;
+    for (; instruction_index < ins.size(); ++instruction_index) {
         const auto& in = ins[instruction_index];
         watch_pc = in.pc;
         watch_w0 = in.words[0]; watch_w1 = in.len_dwords > 1 ? in.words[1] : 0u;
         watch_len = in.len_dwords;
         if (in.is_end) break;
-        read_pc = in.pc;
-        if (reader) ++reader->evaluated_instructions;
         const FoldControlStep& control = control_plan->steps[instruction_index];
         if (control.reset_zero_mip) same_block_zero_vgprs.reset();
         // A plain v_mov is still lane-predicated by EXEC. Without tracking the active mask and its
         // later restoration, no pre-mutation all-lanes zero fact can survive any explicit or
         // implicit EXEC write (including every v_cmpx encoding).
-        if (rdna2_instruction_may_change_exec(in)) {
+        if (control.changes_exec) {
             same_block_zero_vgprs.reset();
             zero_mip_exec_pristine = false;
         }
-        uint32_t mip_vgpr = 0;
+        const uint32_t mip_vgpr = control.zero_mip_vgpr;
         const bool proven_zero_mip_at_use =
-            rdna2_mimg_zero_mip_shape(in, &mip_vgpr) &&
+            mip_vgpr != UINT16_MAX &&
             same_block_zero_vgprs.test(mip_vgpr);
         // Why the proof failed, at the site that knows. `[mimg-mip]` downstream reports
         // `proven_zero_mip=0` and stops there, which is the bool this line produced -- it cannot say
@@ -3861,7 +3860,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
         // fold could not evaluate, or was discarded by an EXEC write. Those are three different
         // pieces of work and the difference is only visible here. Deduped per pc, ungated for the
         // same reason the downstream line is: PROSPER_DBG desyncs the routed repro.
-        if (rdna2_mimg_zero_mip_shape(in, &mip_vgpr)) {
+        if (mip_vgpr != UINT16_MAX) {
             // Dedup by (PROGRAM, pc). A pc-only key collides across programs -- every shader has a
             // pc=16 -- so the first program to reach a pc silently speaks for every later one, and
             // the line then describes a kernel the reader is not looking at.
@@ -4506,6 +4505,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 break;
             }
             case Rdna2Format::SMEM: {
+                read_pc = in.pc;
                 // SBASE (src[0]) is a 2-dword pointer (s_load, op<8) or a 4-dword V# (s_buffer_load, op>=8).
                 // Address = base + immediate OFFSET (in.literal) + SOFFSET register value (decoded here from
                 // words[1][31:25]; the shared decoder doesn't expose it). Dword count from the opcode.
@@ -5901,6 +5901,9 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 break;
         }
     }
+    // The fold visits the retained stream linearly, stopping before an end marker.
+    // Count once at completion instead of testing instrumentation at every instruction.
+    if (reader) reader->evaluated_instructions += instruction_index;
     if (profile_fold)
         record_stage_fold_profile(
             reader ? reader->logical_code_address : (uint64_t)(uintptr_t)code,
