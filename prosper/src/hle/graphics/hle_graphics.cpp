@@ -241,6 +241,11 @@ namespace {
 // prosper_vo_flip_count: total flips so far (either flip path) — read by the PROSPER_PROGRESS
 // heartbeat in hle_agc.cpp as a cheap forward-progress signal for long diagnostic runs.
 extern "C" uint64_t prosper_vo_flip_count() { std::lock_guard<std::mutex> lk(g_flip_mx); return g_flip_count; }
+// The flipArg of the most recently COMPLETED flip, or -1 before the first one. This is the guest's
+// OWN frame ordinal -- it is the value the title passed to sceAgcDcbSetFlip / sceVideoOutSubmitFlip,
+// echoed back, never a number prosper invents. The AGC end-of-pipe event path (hle_kernel_time.cpp)
+// reads it to answer "how far has the GPU actually got" in the guest's own numbering.
+extern "C" int64_t prosper_vo_last_flip_arg() { std::lock_guard<std::mutex> lk(g_flip_mx); return g_last_flip_arg; }
 extern "C" int prosper_vo_flip_rate() { std::lock_guard<std::mutex> lk(g_flip_mx); return g_flip_rate; }
 
 // Hold the GUEST flip rate at the cadence the title asked for, sleeping in the flip path when we
@@ -875,6 +880,19 @@ HLE(g_vo_submitflip)  {
 // it must advance the SAME flip status (count/flipArg/currentBuffer) that GetFlipStatus reports:
 // Unity's frame pacer polls for its submitted flipArg to complete before building the next frame, so
 // dropping this packet stalls the game at one rendered frame forever.
+// Guest flip -> "is there a frame to publish?", for a title that composites with COMPUTE and never
+// draws. The live renderer owns the decision and the publish, so core reaches it through a
+// REGISTERED HOOK rather than by naming a frontend symbol.
+//
+// This used to be a weak declaration called through a null check, which links on ELF and does NOT
+// link on Mach-O: a weak *declaration* with no definition there is still an undefined symbol
+// (`weak_import` is the Mach-O spelling), so every tool that links prosper_core WITHOUT a frontend
+// failed at link time -- `nid_census`, on the macOS x86_64 job only. A registered pointer needs no
+// per-platform attribute and is the pattern the rest of this boundary already uses.
+static std::atomic<void (*)(uint64_t)> g_flip_publish_hook{nullptr};
+extern "C" void prosper_vo_set_flip_publish_hook(void (*fn)(uint64_t)) {
+    g_flip_publish_hook.store(fn, std::memory_order_release);
+}
 extern "C" void prosper_vo_flip_from_gpu(uint32_t handle, int32_t bufidx, uint32_t flip_mode, int64_t flip_arg) {
     VideoOutHandleGuard live_handle(handle);
     if (!live_handle.valid()) return;
@@ -886,6 +904,13 @@ extern "C" void prosper_vo_flip_from_gpu(uint32_t handle, int32_t bufidx, uint32
     flip_advance(bufidx, flip_arg);
     flip_pace_wait();                      // both halves pace: see flip_pace_wait
     gpu::present_flip(bufidx, flip_arg);   // scanout bookkeeping, same as the API flip
+    // A title that composites with COMPUTE and never draws produces no graphics span, and every
+    // publish decision — including the guest-scanout fallback written for exactly that case — sits
+    // behind one. Give the flip itself a chance to publish. Null until a frontend registers, so a
+    // build without the live renderer does nothing here. Default off (PROSPER_FLIP_GUEST_SCANOUT),
+    // and inert once the renderer has produced any frame of its own.
+    if (auto* publish = g_flip_publish_hook.load(std::memory_order_acquire))
+        publish(prosper_vo_flip_count());
     prosper_eq_trigger_flip(flip_arg);     // flip completed (synchronous): fire the flip event
 }
 HLE(g_vo_flippending) {

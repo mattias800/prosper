@@ -1,7 +1,7 @@
 // test_agc_getsize — #1143 drift guard for the AGC GetSize cluster.
 //
 // The guest reserves command-buffer space with sceAgc*GetSize BEFORE calling the matching builder,
-// so GetSize must equal the exact dword count the builder emits. Today the constants (Jump=5, AcquireMem
+// so GetSize must equal the exact dword count the builder emits. Today the constants (Jump=4, AcquireMem
 // =8, ReleaseMem/EOP=8, Rewind=2, Nop=n dwords) are correct but were untested — a future change to a
 // builder's `begin_packet(a0, N, ...)` size would silently desync the reservation and corrupt the stream.
 //
@@ -63,7 +63,7 @@ int main() {
     struct Case { const char* name; const char* gs_nid; const char* build_nid; uint64_t exp_dw;
                   uint64_t a1,a2,a3,a4,a5; };
     const Case cases[] = {
-        { "Jump",           "VEGu4dixjUg", "xSAR0LTcRKM", 5, 0, 0, 0x1000, 0, 0 },  // sceAgcDcbJump -> 5 dw
+        { "Jump",           "VEGu4dixjUg", "xSAR0LTcRKM", 4, 0, 0, 0x1000, 0, 0 },  // sceAgcDcbJump -> 4 dw (#3676)
         { "AcquireMem/Dcb", "-vnlTPPXPrw", "57labkp+rSQ", 8, 0, 0, 0,      0, 0 },  // sceAgcDcbAcquireMem -> 8 dw
         { "AcquireMem/Acb", "ewobAQeMo5k", "KT-hTp-Ch14", 8, 0, 0, 0,      0, 0 },  // sceAgcAcbAcquireMem -> 8 dw
         { "ReleaseMem/EOP", "hL7C0IRpWZI", "wr23dPKyWc0", 8, 0, 0, 0,      0, 0 },  // sceAgcCbReleaseMem -> 8 dw

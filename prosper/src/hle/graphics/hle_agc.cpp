@@ -148,7 +148,20 @@ constexpr uint32_t kDwSetRegisterDirect  = 3;
 constexpr uint32_t kDwSetRegsIndirect    = 4;
 constexpr uint32_t kDwAcquireMem         = 8;
 constexpr uint32_t kDwReleaseMem         = 8;
-constexpr uint32_t kDwJump               = 5;
+// 4, matching the hardware INDIRECT_BUFFER this packet stands for. It was 5 until #3676: the extra
+// dword held the per-packet predication flag, and the cost of housing it there was a stream that
+// stops dead. A guest that reserves the chain link from the AGC headers rather than from
+// sceAgcDcbJumpGetSize leaves exactly FOUR dwords at the end of a command buffer, so the Jump was
+// refused for want of one dword -- and a refused Jump is not one lost packet, it is the link that
+// chains the next buffer, so every command built after it (every draw) is never folded. Measured on
+// Uncharted: `DCB FULL: need=5 ... callback DECLINED` against `raw=4 reserved=0`, with the guest
+// calling DrawIndex/DrawIndexAuto >=50 times each while the fold reported draws_cum=0.
+//
+// The flag now lives in bit 0 of the PM4 type-3 header, which is where the hardware keeps it
+// (type-3 header: bit 0 PREDICATE, bit 1 SHADER_TYPE, bits 8..15 opcode, bits 16..29 count,
+// bits 30..31 type). Both header parsers already mask it off -- hle_agc's patch_check and
+// pm4_decode's hdr_r/hdr_op read bits 2 and up -- so it costs no dword and no new state.
+constexpr uint32_t kDwJump               = 4;
 constexpr uint64_t kAgcErrInvalidArg = 0x8a6c000aull;
 constexpr uint64_t kAgcErrInvalidShaderHalves = 0x8a6c0008ull;
 inline uint32_t PM4(uint32_t len, uint32_t op, uint32_t r) {
@@ -260,8 +273,28 @@ struct AgcDcb {
         if (n == 0) return nullptr;
         if (n > available_dw()) {
             dcb_report_full(this, n);          // #1756 probe; no-op unless PROSPER_DCBFULL
-            if (!callback || !invoke_full_callback(n + reserved_dw)) return nullptr;
-            if (available_dw() < n) return nullptr;
+            // Name WHY a full buffer stayed full. The three outcomes are different defects and the
+            // drop looks identical from downstream: no callback installed at all, a callback that
+            // declined, and a callback that succeeded but did not actually free enough room.
+            if (!callback || !invoke_full_callback(n + reserved_dw)) {
+                static std::atomic<uint64_t> f{0};
+                const uint64_t k = f.fetch_add(1) + 1;
+                if (k <= 4 || (k & (k - 1)) == 0)
+                    fprintf(stderr, "[agc] DCB FULL #%llu: need=%u %s -- callback %s\n",
+                            (unsigned long long)k, n,
+                            callback ? "" : "(none installed)",
+                            callback ? "DECLINED" : "absent");
+                return nullptr;
+            }
+            if (available_dw() < n) {
+                static std::atomic<uint64_t> g{0};
+                const uint64_t k = g.fetch_add(1) + 1;
+                if (k <= 4 || (k & (k - 1)) == 0)
+                    fprintf(stderr, "[agc] DCB FULL #%llu: need=%u -- callback SUCCEEDED but left "
+                                    "only %u dwords\n",
+                            (unsigned long long)k, n, available_dw());
+                return nullptr;
+            }
         }
         uint32_t* r = cursor_up;
         cursor_up += n;
@@ -452,6 +485,25 @@ inline uint32_t* begin_packet(uint64_t buf, uint32_t n, uint32_t op, uint32_t r,
     dcb_report_window(dcb, n, op, r);          // #1756 probe; no-op unless PROSPER_DCBWIN
     uint32_t* cmd = dcb->allocate_dw(n);
     if (cmd) cmd[0] = PM4(n, op, r);
+    else {
+        // A REFUSED allocation drops the packet — a draw, a dispatch, a state write — with no
+        // trace anywhere downstream: the fold simply never sees it, and the result is a frame
+        // missing geometry that looks exactly like a shader or resource defect. That is the
+        // failure the charter's fail-visible rule exists to prevent, and this is the one choke
+        // point every builder goes through, so one counter here covers all of them.
+        //
+        // Unconditional and rate-limited rather than env-gated: a run that silently drops draws
+        // must say so without anyone having guessed in advance to ask.
+        static std::atomic<uint64_t> refused{0};
+        const uint64_t k = refused.fetch_add(1) + 1;
+        if (k <= 8 || (k & (k - 1)) == 0)      // first 8, then powers of two
+            fprintf(stderr,
+                    "[agc] PACKET DROPPED #%llu: dcb=%p has no room for %u dwords (op=0x%x r=0x%x "
+                    "%s) -- raw=%d reserved=%u available=%u -- this packet never reaches the fold\n",
+                    (unsigned long long)k, (void*)dcb, n, op, r, dcb_subop_name(r),
+                    (int)(dcb->cursor_down - dcb->cursor_up), dcb->reserved_dw,
+                    dcb->available_dw());
+    }
     *out = cmd;
     return cmd;
 }
@@ -732,7 +784,8 @@ HLE(agc_dcb_jump) {  // sceAgcDcbJump(dcb, ?, ?, target_addr, num_dw)
     uint32_t* cmd; if (!begin_packet(a0, kDwJump, IT_NOP, R_JUMP, &cmd)) return 0;
     cmd[1] = (uint32_t)(a3 & 0xffffffffu); cmd[2] = (uint32_t)(a3 >> 32u);
     cmd[3] = (uint32_t)a4;
-    cmd[4] = 0;   // predicated flag — set by sceAgcSetPacketPredication on this returned packet
+    // Unpredicated until sceAgcSetPacketPredication says otherwise: PM4() writes a fresh header with
+    // bit 0 clear, which IS that initial state, so there is nothing to zero here.
     return (uint64_t)(uintptr_t)cmd;
 }
 HLE(agc_dcb_set_predication) {  // sceAgcDcbSetPredication(dcb, 1, op, 1, cond_addr) / (dcb, 1, 0, 1, 0)=end
@@ -759,14 +812,18 @@ HLE(agc_dcb_set_predication) {  // sceAgcDcbSetPredication(dcb, 1, op, 1, cond_a
 // reaching the extended tail: a packet at the end of a mapping otherwise passes the header check
 // and faults on the store, which is the sharper half of this issue.
 HLE(agc_set_packet_predication) {  // sceAgcSetPacketPredication(packet, ...)
-    // Marks an already-built packet as participating in the enclosing predication window. For our
-    // R_JUMP encoding that is payload[3] (cmd[4]). Header-verified like the other packet patchers —
-    // a different packet kind means the RE drifted, so refuse loudly rather than corrupt the stream.
+    // Marks an already-built packet as participating in the enclosing predication window. That is
+    // bit 0 of the PM4 type-3 header — the hardware PREDICATE bit — since #3676; it used to be a
+    // fifth dword appended to the packet, which made the Jump one dword wider than the
+    // INDIRECT_BUFFER it stands for and cost the guest its chain link (see kDwJump).
+    // Header-verified like the other packet patchers — a different packet kind means the RE
+    // drifted, so refuse loudly rather than corrupt the stream.
     auto* cmd = (uint32_t*)(uintptr_t)a0; if (!cmd) return 0;
-    // Writes cmd[4], five dwords in, after validating cmd[0] (#2157).
-    if (!patch_target_writable(a0, 5 * sizeof(uint32_t), "SetPacketPredication")) return 0;
+    // Reads AND writes cmd[0], and nothing else (#2157). The span shrank with the flag's home: this
+    // handler no longer reaches a packet tail, so it cannot fault past a header-sized probe.
+    if (!patch_target_writable(a0, sizeof(uint32_t), "SetPacketPredication")) return 0;
     if (!patch_check(cmd, R_JUMP, "SetPacketPredication")) return 0;
-    cmd[4] = 1;
+    cmd[0] |= 1u;
     return 0;
 }
 
@@ -823,13 +880,34 @@ HLE(agc_cb_nop) {  // (dcb, num_dwords, ...)
 //    pass sourceKind=0 and sourceAddress=0; the address form passes sourceKind=2 and a 64-bit source.
 //    Select solely from that ABI discriminator: an invalid address must reach the executor and fail
 //    visibly rather than silently changing into an immediate fill.
+//  - **A NON-ZERO sourceAddress with NO immediate is an address source even when sourceKind is not
+//    2** (#3616). Uncharted: Legacy of Thieves emits a third call shape the two above did not
+//    anticipate: sourceKind=0, srcImmediate=0, and a non-zero sourceAddress that EQUALS the
+//    destination, dstSel=2, srcSel=0, numBytes exactly the shader's `shader_size`. That is a copy
+//    of a region onto itself through L2 -- PM4 DST_SEL=2 is DST_ADDR_USING_L2 -- i.e. the cache
+//    maintenance a CPU-written shader needs before the GPU fetches it, and its correct effect on
+//    memory is NOTHING.
+//    Both halves of the test matter and both come from the contract above, which says the
+//    immediate/placeholder forms pass sourceKind=0 AND sourceAddress=0. Requiring srcImmediate to
+//    be absent as well is what keeps a genuine non-zero fill a fill: a caller that means an
+//    immediate says so by passing one, so only the a1=0 case is ambiguous, and there the recorded
+//    forms pass sourceAddress=0 while this one passes a real pointer.
+//    Read as an immediate, it is a fill of a1=0 over exactly the shader code: prosper zeroed every
+//    graphics program in the title, leaving the AGC header at code+shader_size untouched beside it.
+//    Every shader then decoded as zeros -- which are VOP2 opcode 0 -- so every draw was refused for
+//    an unsupported opcode and no frame was ever produced (render_spans=0, 0 published).
+//    The rule is the one the two recorded forms already state rather than a new special case: the
+//    immediate/placeholder forms pass sourceAddress=0, so a sourceAddress that is NOT zero is an
+//    address. dst==src is not tested for -- a self-copy is simply what a memmove of a range onto
+//    itself does, which is the hardware's answer too.
 // numBytes is stack arg9. The import ABI bridge forwards args 7-9 as normal fixed parameters on
 // Windows and on Linux's guest-FS path; no compiler-frame decoding is involved (#672).
 // Custom R_DMA_DATA payload: [1..2]=dst lo/hi, [3..4]=srcOrImm lo/hi, [5]=numBytes, [6]=selector
 // bytes plus prosper's kDmaDataAddressSource form bit. The bit is necessary because sourceKind=2
 // can assert an address whose numeric value is still <=32 bits; discarding the kind would silently
 // reinterpret an invalid/unmapped address as an immediate fill in the executor.
-// CONFIDENCE: HIGH on a4=dst/a1=srcOrImm (malloc-destination callsite + patcher names + protocol);
+// CONFIDENCE: HIGH on a4=dst/a1=srcOrImm (malloc-destination callsite + patcher names + protocol)
+// and on a7=sourceAddress (three titles now, two of them with sourceKind disagreeing about it);
 // MED on the selector args (recorded raw; the executor distinguishes the captured 32-bit immediate
 // domain from mapped 64-bit address sources and keeps GDS/unmapped forms fail-closed).
 static uint64_t label_build_pre(uint64_t dst, uint64_t num_bytes) {
@@ -841,7 +919,7 @@ static uint64_t label_build_pre(uint64_t dst, uint64_t num_bytes) {
 
 HLE9(agc_dcb_dma_data) {  // (..., srcImmediate, dstSel?, srcSel?, dst, policy, sourceKind, sourceAddress, bytes)
     uint64_t num_bytes = a8 <= 0x10000000ull ? a8 : 0;
-    const bool address_source = a6 == 2;
+    const bool address_source = a6 == 2 || (a7 != 0 && a1 == 0);
     const uint64_t src_or_imm = address_source ? a7 : a1;
     static std::atomic<uint64_t> g_dma_n{0};
     uint32_t* cmd; if (!begin_packet(a0, kDwDmaData, IT_NOP, R_DMA_DATA, &cmd)) return 0;
@@ -3325,8 +3403,10 @@ HLE(agc_patch_release_mem_data) {
 // target=0 and dword count=0 — a jump to nothing — which is exactly the "prosper can fold a command
 // graph different from the one the guest built" confounder (#2711 Q5).
 //
-// cmd[4] is deliberately NOT touched: predication is owned by sceAgcSetPacketPredication on this same
-// packet, and the composite segments this title jumps to are predicated (#319). Cache policy has no
+// The header's PREDICATE bit is deliberately NOT touched: predication is owned by
+// sceAgcSetPacketPredication on this same packet, and the composite segments this title jumps to are
+// predicated (#319). It lived in cmd[4] until #3676 shrank the packet to the hardware's four
+// dwords; the rule is unchanged, only its home. Cache policy has no
 // field in the R_JUMP representation and prosper's own sceAgcDcbJump likewise records no policy, so it
 // is logged rather than stored — a slot invented for it here would be read by nothing.
 // CONFIDENCE: HIGH on the argument roles and the packet shape (both measured); MED on cache policy
@@ -3428,9 +3508,10 @@ inline void jump_patch_refusal_detail(const uint32_t* cmd, uint64_t policy, uint
 
 HLE(agc_jump_patch_target) {
     auto* cmd = (uint32_t*)(uintptr_t)a0; if (!cmd) return 0;
-    // FOUR dwords, not kDwJump: this handler reads cmd[0] and writes cmd[1..3], and the span contract
-    // above is the dwords each handler actually TOUCHES rather than the packet's nominal length.
-    // cmd[4] is deliberately outside it -- predication belongs to sceAgcSetPacketPredication.
+    // FOUR dwords: this handler reads cmd[0] and writes cmd[1..3], and the span contract above is the
+    // dwords each handler actually TOUCHES rather than the packet's nominal length. Since #3676 that
+    // is also the whole packet -- and cmd[0] must survive UNCHANGED, because the header now carries
+    // sceAgcSetPacketPredication's PREDICATE bit.
     if (!patch_target_writable(a0, 4u * sizeof(uint32_t), "JumpPatchTarget")) return 0;
     if (!patch_check(cmd, R_JUMP, "JumpPatchTarget")) { jump_patch_refusal_detail(cmd, a1, a2, a3); return 0; }
     const uint32_t pre_lo = cmd[1], pre_hi = cmd[2], pre_ndw = cmd[3];

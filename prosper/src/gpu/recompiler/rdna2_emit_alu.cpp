@@ -3316,7 +3316,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     // The decoder admits only GTA V's full-mask, BC1, FI0 MIN/MAX packets here.
                     // Direct subgroup shuffle is valid only when one native subgroup is exactly one
                     // guest wave; portable/default-subgroup compute uses CFG scratch below.
-                    if (!b.is_compute || dpp_row_ror8_op(in) == DppRowRor8Op::None ||
+                    if (!b.is_compute || !dpp_row_xor_source_transform_ok(in) ||
                         !b.native_subgroup_size) {
                         ok = false; return true;
                     }
@@ -5291,6 +5291,23 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 }
                 return true;
             }
+            // The whole-stream proof established that this S_LOAD_DWORDX2 loads a DESCRIPTOR-TABLE
+            // POINTER -- its only use anywhere is as the SBASE of another raw scalar load -- so the
+            // value it produces is provenance, not scalar data. The front half followed the same
+            // pointer out of guest memory and published every descriptor behind it at its exact
+            // consumer PC, so zero placeholders represent it exactly. The SRT tag is ERASED rather
+            // than propagated: the pointer's own offset names the pointer, not the descriptor a
+            // later load fetches through it, and leaving it would resolve that load to the wrong
+            // resource. Without this the load reached the constant-buffer path below and rejected
+            // the shader for an unresolved cbuf (#3616).
+            if (rt && in.opcode == kSmemOpcodeLoadDwordX2 &&
+                rs.smem_pointer_loads.contains(in.pc)) {
+                for (uint32_t k = 0; k < n; ++k) {
+                    rs.sreg[in.dst.value + static_cast<int>(k)] = b.uconst(0);
+                    rs.sreg_srt.erase(in.dst.value + static_cast<int>(k));
+                }
+                return true;
+            }
             // SOFFSET handling. Immediate-only loads encode SOFFSET = SGPR_NULL (125). A register
             // SOFFSET adds an SGPR-computed byte offset:
             //  * a DESCRIPTOR s_load (x4/x8 = V#/T#) with a computed offset is the bindless fetch's
@@ -5307,11 +5324,65 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             uint32_t soff_bits = 0; bool soff_dyn = false;
             if (!soff_null) {
                 if (rt && (in.opcode == 0x2 || in.opcode == 0x3)) {
+                    // An x4/x8 DESCRIPTOR load with a non-null soffset leaves here with placeholders
+                    // and NO SRT tag, so every MIMG that consumes one of its descriptors reports
+                    // srt_tag=NONE and cannot resolve. Say so when asked: whether the soffset is a
+                    // TRACKED scalar decides whether an effective offset could be computed at all,
+                    // and that is the question any fix starts from.
+                    if (getenv("PROSPER_DBG")) {
+                        bool tracked = false; uint32_t val = 0;
+                        if (in.src[1].kind == OperandKind::SGPR ||
+                            (in.src[1].kind == OperandKind::Special &&
+                             in.src[1].value >= 106 && in.src[1].value <= 123)) {
+                            auto it = rs.sreg.find(in.src[1].value);
+                            tracked = it != rs.sreg.end();
+                            if (tracked) val = it->second;
+                        } else if (in.src[1].kind == OperandKind::InlineInt) {
+                            tracked = true; val = (uint32_t)in.src[1].value;
+                        }
+                        fprintf(stderr,
+                                "[smem-untagged] pc=%u op=0x%x dst=s%d src1-kind=%d src1=%d "
+                                "tracked=%d val=%u imm=0x%x\n",
+                                in.pc, in.opcode, in.dst.value,
+                                static_cast<int>(in.src[1].kind), in.src[1].value,
+                                (int)tracked, val, in.literal);
+                        // Answers the tempting follow-up before anyone spends a build on it: if
+                        // the soffset were a literal the effective SRT offset would be
+                        // `soffset + imm` and the bundle could be tagged exactly as the
+                        // null-soffset form is. Measured on PPSA05684 it is NOT -- the offset is
+                        // computed, so there is no static tag to attach and constant folding is
+                        // not the route to these descriptors.
+                        uint32_t lit = 0;
+                        auto srt_it = rs.sreg_srt.find(in.src[1].value);
+                        fprintf(stderr,
+                                "[smem-untagged]   soffset: builder-constant=%s srt_tag=%s\n",
+                                (tracked && b.uconst_literal(val, &lit)) ? "YES" : "no",
+                                srt_it == rs.sreg_srt.end()
+                                    ? "none"
+                                    : ("0x" + std::to_string(srt_it->second)).c_str());
+                    }
                     for (uint32_t k = 0; k < n; k++) rs.sreg[in.dst.value + (int)k] = b.uconst(0);
                     return true;
                 }
                 bool tracked = false;
-                if (in.opcode >= 0x8 && in.opcode <= 0xC) {
+                // A register SOFFSET means the same thing on a raw `s_load_*` as on an
+                // `s_buffer_load_*`: a scalar byte offset added to the base. The gate admitted only
+                // the buffer opcodes, so a raw load with a perfectly TRACKED offset register was
+                // refused without the tracking ever being attempted (#3616). The raw form resolves
+                // through the same provenance the buffer form does -- the front half publishes a
+                // raw-pointer resource at the load's exact PC and `by_fetch_pc` finds it below --
+                // and the dword index is `(soffset + imm) >> 2` either way. An UNTRACKED offset
+                // still rejects, for both forms: never fold an unknown runtime offset as 0.
+                //
+                // Only `s_load_dword` (opcode 0x0), because that is exactly as far as the
+                // provenance reaches. The fold publishes a raw-pointer ConstantBuffer for
+                // SINGLE-DWORD loads only (`gpu_executor.cpp`, "This is the widest form that is
+                // unambiguously data") -- every wider raw form is a pointer or descriptor fetch
+                // whose result the fold tracks as V#/T#/BVH provenance instead. Admitting x2/x4/x8/
+                // x16 here would let them past the offset check with no resource to resolve against
+                // and fall to the binding-2 fallback, which renders wrong where they used to
+                // reject. The bound is the fold's own, not a guess.
+                if (in.opcode == 0x0 || (in.opcode >= 0x8 && in.opcode <= 0xC)) {
                     if (in.src[1].kind == OperandKind::SGPR ||
                         (in.src[1].kind == OperandKind::Special && in.src[1].value >= 106 && in.src[1].value <= 123)) {
                         auto it = rs.sreg.find(in.src[1].value);

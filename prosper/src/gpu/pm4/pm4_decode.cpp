@@ -224,12 +224,18 @@ size_t decode_pm4(const uint32_t* buf, size_t dwords, std::vector<Pm4Command>& o
                     break;
                 case R_JUMP:
                     // sceAgcDcbJump (#319): call-with-length of a side command segment.
-                    // payload: [0..1]=target addr lo/hi, [2]=dword count, [3]=predicated flag.
+                    // payload: [0..1]=target addr lo/hi, [2]=dword count. The predication flag is
+                    // HEADER bit 0 — the hardware type-3 PREDICATE bit — since #3676, which took the
+                    // packet from 5 dwords to the INDIRECT_BUFFER's 4 (see hle_agc.cpp kDwJump).
+                    //
+                    // pl[3] is still read when a 5-dword packet arrives, so a capture recorded
+                    // before #3676 replays with its predication intact rather than silently losing
+                    // it. The two can never both be set by a live guest: this build emits 4.
                     c.kind = K::Jump;
-                    if (npl >= 4) {
+                    if (npl >= 3) {
                         c.jump_addr   = lo_hi(pl);
                         c.jump_dwords = pl[2];
-                        c.jump_pred   = pl[3];
+                        c.jump_pred   = (h & 1u) | (npl >= 4 ? pl[3] : 0u);
                         c.jump_valid  = true;
                     }
                     break;

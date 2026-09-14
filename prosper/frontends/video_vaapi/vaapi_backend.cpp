@@ -1016,6 +1016,12 @@ struct AuDecoder {
     // hardware while decoding in software, which is exactly what the first version of this did.
     std::shared_ptr<HardwareSelection> selection;
     AVPacket* packet = nullptr;
+    // libavcodec REQUIRES AV_INPUT_BUFFER_PADDING_SIZE zero bytes past the end of a packet's data
+    // (avcodec.h: "the input buffer must be padded ... otherwise optimized bitstream readers ...
+    // will read past the end"). The guest's access unit lives in guest memory with whatever happens
+    // to follow it, so it is copied here first rather than pointed at. Reused across access units so
+    // the copy costs one memcpy, not an allocation per frame.
+    std::vector<uint8_t> padded;
 };
 
 std::mutex g_au_mutex;
@@ -1191,8 +1197,30 @@ VideoBackend::AuResult VaapiBackend::decode_au(int id, const uint8_t* au, size_t
 
     // av_packet_from_data would take ownership of a buffer we do not own; the guest's access unit
     // lives in guest memory and must not be freed by libavcodec.
-    d.packet->data = const_cast<uint8_t*>(au);
+    //
+    // It must not be pointed at DIRECTLY either, and that was a real defect rather than a
+    // tidiness point: libavcodec requires AV_INPUT_BUFFER_PADDING_SIZE zero bytes after the data,
+    // and the bytes after a guest access unit are the next access unit. Measured on Uncharted
+    // (PPSA05684, #3669): every H.264 unit -- including a well-formed head carrying SPS, PPS, SEI
+    // and IDR slices -- came back AVERROR_INVALIDDATA from avcodec_send_packet, and the stream was
+    // not at fault. Copy into a padded buffer instead.
+    d.padded.resize(bytes + AV_INPUT_BUFFER_PADDING_SIZE);
+    std::memcpy(d.padded.data(), au, bytes);
+    std::memset(d.padded.data() + bytes, 0, AV_INPUT_BUFFER_PADDING_SIZE);
+    d.packet->data = d.padded.data();
     d.packet->size = static_cast<int>(bytes);
+    // PROSPER_VDEC2_DUMP_AU=<file> (default off): append every access unit, exactly as it is handed
+    // to libavcodec, to one elementary-stream file. When a decoder refuses a stream the first
+    // question is whether the BYTES are decodable at all, and the only way to answer it without
+    // arguing is to run the same bytes through ffmpeg outside prosper. Appending keeps the stream in
+    // order, so the dump is directly playable.
+    if (const char* path = std::getenv("PROSPER_VDEC2_DUMP_AU")) {
+        static std::mutex mx; static FILE* f = nullptr; static bool tried = false;
+        std::lock_guard<std::mutex> lk(mx);
+        if (!tried) { tried = true; f = fopen(path, "wb");
+                      if (!f) fprintf(stderr, "[vdec2] AU dump: cannot open %s\n", path); }
+        if (f) { fwrite(au, 1, bytes, f); fflush(f); }
+    }
     const int sent = avcodec_send_packet(d.ctx, d.packet);
     const int got = sent >= 0 ? avcodec_receive_frame(d.ctx, d.frame) : -1;
     {

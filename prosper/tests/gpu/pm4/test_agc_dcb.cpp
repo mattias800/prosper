@@ -300,10 +300,11 @@ int main() {
         // ReleaseMem sync patchers. Each read cmd[0] inside its header check before anything
         // validated the pointer, so on master this arm SIGSEGVs rather than failing.
         //
-        // Two of them are the sharper ones and are why the spans are per-handler rather than one
-        // constant: SetPacketPredication validates cmd[0] and then writes **cmd[4]**, and
-        // ReleaseMem writes cmd[7]/cmd[8] on its long arm. A packet at the very end of a mapping
-        // passes a header-sized probe and faults on the store, so those re-probe before the tail.
+        // ReleaseMem is the sharper one and is why the spans are per-handler rather than one
+        // constant: it writes cmd[7]/cmd[8] on its long arm, and a packet at the very end of a
+        // mapping passes a header-sized probe and faults on that store, so it re-probes before the
+        // tail. (SetPacketPredication was the other until #3676 moved the predication flag into
+        // header bit 0; it now reads and writes cmd[0] alone.)
         {
             const struct { const char* nid; const char* name; } late[] = {
                 { "w6Dj1VJt5qY", "SetPacketPredication"    },
@@ -457,9 +458,10 @@ int main() {
             CHECK((packet[6] & gpu::kDmaDataAddressSource) != 0,
                   "address-source DmaData preserves the asserted source form in packet metadata");
 
-            // The other ABI arm must remain independent of a7. Existing immediate/offset calls use
-            // sourceKind=0; give this one a deliberately tempting address in a7 and prove that the
-            // packet still contains a1. This keeps the historical fill path intact.
+            // The other ABI arm. It is NOT independent of a7 -- the third shape below shows a7
+            // selecting the source when no immediate is given -- so what this pins is the other
+            // half of the discriminator: an immediate that is PRESENT wins, however tempting the
+            // address in a7 looks. This keeps the historical fill path intact.
             constexpr uint64_t immediate = 0x12345678ull;
             d.cursor_up = buf;
             packet = (uint32_t*)(uintptr_t)
@@ -475,6 +477,29 @@ int main() {
                   "sourceKind=0 preserves a1 even when stack source looks addressable");
             CHECK((packet[6] & gpu::kDmaDataAddressSource) == 0,
                   "immediate-source DmaData does not acquire address-form metadata");
+
+            // Uncharted: Legacy of Thieves (PPSA05684) is the third call shape: sourceKind=0 with
+            // NO immediate and a real pointer in a7. Its shader upload issues this against the
+            // shader's own code range -- dst == src, numBytes == shader_size -- which is a copy
+            // through L2, i.e. cache maintenance whose effect on memory is nothing. Read as an
+            // immediate it fills the code with a1=0, and prosper zeroed every graphics program in
+            // the title; every shader then decoded as VOP2 opcode 0 and no draw could render
+            // (#3616). The arm above and this one together pin the discriminator from BOTH halves
+            // of the recorded contract: a1 present means immediate, a1 absent with a pointer in a7
+            // means address. Mutating either half of `a6 == 2 || (a7 != 0 && a1 == 0)` reddens one
+            // of the two.
+            d.cursor_up = buf;
+            packet = (uint32_t*)(uintptr_t)
+                ((uint64_t(*)(uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,
+                              uint64_t,uint64_t,uint64_t))dma_build)(
+                    (uint64_t)(uintptr_t)&d,
+                    /*srcImmediateOrOffset*/0, /*dstSel*/2, /*srcSel*/0, src,
+                    /*policy*/0, /*sourceKind*/0, src, sizeof source);
+            CHECK(packet[3] == (uint32_t)src && packet[4] == (uint32_t)(src >> 32u) &&
+                      packet[5] == sizeof source,
+                  "sourceKind=0 with no immediate takes the stack source address, not a zero fill");
+            CHECK((packet[6] & gpu::kDmaDataAddressSource) != 0,
+                  "that shape is recorded as an address source in the packet metadata");
 
             // An asserted address form must not degrade into an immediate fill merely because the
             // address is malformed or currently unmapped. The executor owns validation and will
@@ -741,8 +766,10 @@ int main() {
     // ---- Ikfdt-rIqCE: the Jump-packet target patcher (#2711 Q5) -------------------------------
     // GTA V builds Jump packets EMPTY and fills them in through this call, so an unregistered
     // handler left every one of them reaching the command processor with target=0 and count=0.
-    // The pairing is what matters and is what this locks: sceAgcDcbJump BUILDS the packet, this
-    // patches it, and cmd[4] belongs to sceAgcSetPacketPredication and must survive untouched.
+    // The pairing is what matters and is what this locks: sceAgcDcbJump BUILDS the packet and this
+    // patches it. Since #3676 the packet is FOUR dwords -- the hardware INDIRECT_BUFFER size the
+    // guest reserves from -- and sceAgcSetPacketPredication's flag lives in header bit 0, so what
+    // must survive this patcher untouched is the header, predicate bit included.
     {
         auto jump  = Hle::lookup("xSAR0LTcRKM");   // sceAgcDcbJump
         auto jpatch = Hle::lookup("Ikfdt-rIqCE");  // the target patcher under test
@@ -754,7 +781,14 @@ int main() {
             CHECK(jr == (uint64_t)(uintptr_t)jpkt, "DcbJump returned the packet it built");
             CHECK(jpkt[1] == 0 && jpkt[2] == 0 && jpkt[3] == 0,
                   "the built Jump packet starts EMPTY (target=0, count=0) -- the state the guest patches");
-            jpkt[4] = 0xA5A5A5A5u;   // stand in for sceAgcSetPacketPredication's flag
+            CHECK((jpkt[0] & 1u) == 0, "the built Jump packet starts UNPREDICATED (header bit 0 clear)");
+
+            // Predicate it the way the guest does, through the real handler, and pin that the flag
+            // round-trips through the header bit that replaced the packet's fifth dword (#3676).
+            auto pred = Hle::lookup("w6Dj1VJt5qY");   // sceAgcSetPacketPredication
+            CHECK(pred, "SetPacketPredication is registered");
+            if (pred) pred((uint64_t)(uintptr_t)jpkt, 0, 0, 0, 0, 0);
+            CHECK((jpkt[0] & 1u) == 1u, "SetPacketPredication set the PM4 header's PREDICATE bit");
 
             const uint32_t header_before = jpkt[0];
             jpatch((uint64_t)(uintptr_t)jpkt, /*cache policy=*/2,
@@ -763,8 +797,8 @@ int main() {
             CHECK(jpkt[1] == 0x40290080u, "JumpPatchTarget wrote cmd[1] = target low");
             CHECK(jpkt[2] == 0x00000020u, "JumpPatchTarget wrote cmd[2] = target high");
             CHECK(jpkt[3] == 359u,        "JumpPatchTarget wrote cmd[3] = dword COUNT (not a packed policy)");
-            CHECK(jpkt[4] == 0xA5A5A5A5u, "JumpPatchTarget left cmd[4] (predication) untouched");
-            CHECK(jpkt[0] == header_before, "JumpPatchTarget left the header untouched");
+            CHECK(jpkt[0] == header_before,
+                  "JumpPatchTarget left the header -- predicate bit included -- untouched");
 
             // Wrong packet class must be refused byte-for-byte. patch_check is the only thing standing
             // between a mis-typed pointer and five clobbered dwords, and a live run does hand this

@@ -197,7 +197,7 @@ struct Pm4Command {
     // length), gated by the active predication window when the flag is set.
     uint64_t jump_addr = 0;              // Jump: target segment guest address
     uint32_t jump_dwords = 0;            // Jump: segment length in dwords
-    uint32_t jump_pred = 0;              // Jump: 1 = packet-predicated (participates in the window)
+    uint32_t jump_pred = 0;              // Jump: 1 = packet-predicated (header bit 0, the PM4 PREDICATE bit)
     bool     jump_valid = false;         // Jump: payload carried the full operand set
 
     // SetPredication (sceAgcDcbSetPredication -> R_SET_PRED; #319). Payload: [0..1]=condition

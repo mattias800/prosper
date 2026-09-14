@@ -666,6 +666,17 @@ struct SpirvCompute {
         auto it = uconst_cache.find(v); if (it != uconst_cache.end()) return it->second;
         uint32_t c = id(); put(types, Op_Constant, {t_u32, c, v}); uconst_cache[v] = c; return c;
     }
+    // Reverse of uconst: the literal behind an id, when that id IS one of our u32 constants.
+    //
+    // Only ids this builder minted through uconst() are answerable, which is the point: a value that
+    // came out of arithmetic has no literal and must report false rather than a plausible number.
+    // The cache is small (one entry per distinct constant in the module) and this is called at
+    // descriptor-resolution sites, not per instruction.
+    bool uconst_literal(uint32_t id_, uint32_t* out) const {
+        for (const auto& kv : uconst_cache)
+            if (kv.second == id_) { if (out) *out = kv.first; return true; }
+        return false;
+    }
     // VGPRs are modeled as raw 32-bit VALUES (uint). Float ops bitcast their operands uint->float and
     // bitcast the result back to uint; integer ops operate on the bits directly. This matches the
     // hardware's untyped VGPRs and lets float and integer instructions share the same register file.
@@ -4717,6 +4728,13 @@ struct SpirvCompute {
 // lookup is on the register's CURRENT SSA value, so an overwrite clears it without bookkeeping.
 inline bool scalar_is_lane_local(const struct RegState& rs, int sgpr);
 
+// Seed RegState::smem_pointer_loads from the decoded stream (see proven_smem_pointer_loads in
+// rdna2_emit_cfg.cpp). Every emission entry must call this: the proof used to be seeded only inside
+// the CFG dispatcher, so a shader emitted straight-line carried an empty set and its SRT pointer
+// loads reached the constant-buffer path and rejected the shader (#3616).
+struct RegState;
+void seed_smem_pointer_provenance(RegState& rs, const std::vector<Rdna2Inst>& ins);
+
 struct RegState {
     std::unordered_map<int, uint32_t> vreg, sreg;
     // The latest VCC SSA value proved identical in every guest lane. A fragment VCCZ branch over
@@ -4810,6 +4828,11 @@ struct RegState {
     // two resources at one byte offset, so every consumer must retain exact-PC provenance.
     std::unordered_set<uint32_t> smem_x16_descriptor_loads;
     bool smem_x16_descriptor_analysis_done = false;
+    // Immediate S_LOAD_DWORDX2 that loads a DESCRIPTOR-TABLE POINTER rather than data: the shader
+    // chases an SRT pointer to reach the table the real V#/T#/S# lives in. Admitted by a
+    // whole-stream use proof (proven_smem_pointer_loads); load PCs, not SRT keys.
+    std::unordered_set<uint32_t> smem_pointer_loads;
+    bool smem_pointer_analysis_done = false;
     // Register-offset S_LOAD_DWORDX2 is likewise typeless. GTA V uses it to fetch the first two
     // words of a V#, then replaces/fills the remaining words before an exact-PC buffer consumer.
     // Only PCs certified by the whole-CFG descriptor-use proof may substitute placeholders.
