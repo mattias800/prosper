@@ -1199,6 +1199,27 @@ if(TARGET prosper_core)
   target_link_libraries(test_savedata_param PRIVATE prosper_core)
   add_test(NAME savedata_param COMMAND test_savedata_param)
 
+  # sceSaveDataGetMountInfo ignored its mount-point argument (#3653), so a null mount point,
+  # "/savedata1", and "/savedata0" after an unmount all got a successful capacity report. Drives the
+  # real NIDs -- GetMountInfo, Mount3, Umount -- over a disposable save root, with canaries around
+  # the 48-byte output so a write past the ABI reddens.
+  add_executable(test_savedata_mountinfo tests/hle/test_savedata_mountinfo.cpp)
+  target_include_directories(test_savedata_mountinfo PRIVATE tests)
+  target_link_libraries(test_savedata_mountinfo PRIVATE prosper_core)
+  add_test(NAME savedata_mount_info COMMAND test_savedata_mountinfo)
+
+  # The two umount entry points (#3666). sceSaveDataUmount2 read NONE of its arguments -- it
+  # unmounted /savedata0 and reported success whatever it was handed, so a title naming another
+  # mount point had a live mount discarded on its behalf -- and sceSaveDataUmount answered NOT_FOUND
+  # both for a bad argument and for "nothing is mounted", where its siblings answer PARAMETER and
+  # NOT_MOUNTED. Drives the real NIDs, including GetEventResult, so a refused umount is shown to
+  # queue no completion event. Pins Umount2's argument ORDER (flags first, mount point second),
+  # which live capture and four titles' disassembly establish against the obvious reading.
+  add_executable(test_savedata_umount tests/hle/test_savedata_umount.cpp)
+  target_include_directories(test_savedata_umount PRIVATE tests)
+  target_link_libraries(test_savedata_umount PRIVATE prosper_core)
+  add_test(NAME savedata_umount_contract COMMAND test_savedata_umount)
+
   # Save data is namespaced by title id (#2734): two titles that pick the same guest save name --
   # `OptionSettings`, or SaveDataMemory's (user 1, slot 0) -- must not share one host save. Runs two
   # application roots over one guest name, because a single-title round trip passes on the broken code.
@@ -1568,6 +1589,7 @@ if(TARGET prosper_core)
   add_test(NAME savedata_tx_resource_ids COMMAND test_savedata_txres)
 
   add_executable(test_savedata_event_drain tests/hle/service/test_savedata_event_drain.cpp)
+  target_include_directories(test_savedata_event_drain PRIVATE tests)
   target_link_libraries(test_savedata_event_drain PRIVATE prosper_core)
   add_test(NAME savedata_event_drain_code COMMAND test_savedata_event_drain)
 
@@ -2075,6 +2097,24 @@ if(TARGET prosper_core)
   target_include_directories(test_dynfetch_fold PRIVATE tests)
   target_link_libraries(test_dynfetch_fold PRIVATE prosper_core)
   add_test(NAME dynfetch_fold COMMAND test_dynfetch_fold)
+  add_executable(fold_replay tools/fold_replay/main.cpp)
+target_link_libraries(fold_replay PRIVATE prosper_core)
+
+add_executable(test_fold_capture tests/gpu/execute/test_fold_capture.cpp)
+  target_link_libraries(test_fold_capture PRIVATE prosper_core)
+  add_test(NAME fold_capture COMMAND test_fold_capture)
+if(Python3_Interpreter_FOUND)
+  add_test(NAME fold_capture_cli COMMAND "${Python3_EXECUTABLE}"
+    "${CMAKE_SOURCE_DIR}/tools/fold_replay/test_cli.py"
+    "$<TARGET_FILE:test_fold_capture>" "$<TARGET_FILE:fold_replay>")
+endif()
+
+  add_executable(test_fold_control_plan tests/gpu/execute/test_fold_control_plan.cpp)
+  target_link_libraries(test_fold_control_plan PRIVATE prosper_core)
+  add_test(NAME fold_control_plan COMMAND test_fold_control_plan)
+  add_test(NAME fold_control_plan_uncached COMMAND test_fold_control_plan)
+  set_tests_properties(fold_control_plan_uncached PROPERTIES
+    ENVIRONMENT "PROSPER_NO_FOLD_CONTROL_CACHE=1")
 
   # #3137: the FORMAT-path MUBUF reject diagnostic must name which provenance step failed.
   add_executable(test_vertex_fetch_reject_diagnostic

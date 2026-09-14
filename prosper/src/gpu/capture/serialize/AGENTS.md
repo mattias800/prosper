@@ -4,6 +4,8 @@ Turning a collected capture into bytes and back. Its sibling `capture/` decides 
 this folder decides only how that is written down and read again, and the boundary is the version
 contract: a change here is a change to a format that already-written captures are in.
 
+- `fold_capture_codec` — independent versioned `.prfold` format with bounded field-wise encoding
+  and code/file integrity checks. Its schema is separate from frame and bundle versions.
 - `capture_codecs` — the `Writer`/`Reader` byte cursors, and one `write_*`/`read_*` pair per field
   group (pipeline, colour target, scissor, logic op, resource, table). A header because both entry
   points use them, and the only place a field's on-disk shape is spelled.

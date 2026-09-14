@@ -106,6 +106,7 @@ AgcPixelInputControls derive_agc_pixel_input_controls(const AgcShaderHeader* pro
 // format+num_components come from gfx1030's combined seven-bit FORMAT. `size_bytes` is the backing
 // region size.
 struct DecodedBufferDescriptor {
+    bool operator==(const DecodedBufferDescriptor&) const = default;
     uint64_t   base = 0;
     uint32_t   stride = 0;
     uint32_t   num_records = 0;

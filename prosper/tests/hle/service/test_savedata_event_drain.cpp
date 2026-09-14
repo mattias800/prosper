@@ -35,9 +35,13 @@
 // queued-event checks kill "always answer drained", which would silently discard the completion
 // Dead Cells consumes.
 #include "hle/dispatch/dispatch.hpp"
+#include "fixtures/test_scratch.h"
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 
 using namespace prosper;
 
@@ -60,6 +64,38 @@ int main() {
     CHECK(get_event != nullptr, "sceSaveDataGetEventResult is registered");
     CHECK(umount2 != nullptr, "sceSaveDataUmount2 is registered");
     if (!get_event || !umount2) { std::printf("FAILED (%d)\n", fails + 1); return 1; }
+
+    // A disposable save root, so queueing an event never touches the developer's real saves.
+    namespace fs = std::filesystem;
+    const fs::path scratch = prosper_test::test_scratch_dir() / "savedata-event-drain";
+    std::error_code ec;
+    fs::remove_all(scratch, ec);
+    fs::create_directories(scratch / "save0", ec);
+    fs::create_directories(scratch / "app0" / "sce_sys", ec);
+    { std::ofstream pj(scratch / "app0" / "sce_sys" / "param.json", std::ios::binary);
+      pj << "{\"titleId\":\"PPSA00042\"}"; }
+#ifdef _WIN32
+    _putenv_s("PROSPER_SAVE0", (scratch / "save0").string().c_str());
+#else
+    setenv("PROSPER_SAVE0", (scratch / "save0").string().c_str(), 1);
+#endif
+    set_app0_root((scratch / "app0").string());
+
+    // Queue one umount completion THE WAY A GUEST DOES: mount a save, then unmount it through the
+    // real NID with the mount point this build serves.
+    //
+    // Before #3666 this test queued events with a bare `umount2(0, 0, 0, 0, 0, 0)` -- no mount, and
+    // a NULL mount point -- because the handler read none of its arguments and bumped the completion
+    // counter unconditionally. That is the defect #3666 fixed: a refused or no-op unmount now queues
+    // nothing, so the setup here has to perform a real unmount. NOTHING this fixture MEASURES
+    // changed; only how the queue is filled. The refusal paths themselves are asserted in
+    // test_savedata_umount (ctest case savedata_umount_contract).
+    static const char kMountPoint[16] = "/savedata0";
+    auto queue_umount_event = [&]() -> bool {
+        savedata0_mount("EventDrainSlot", SaveDataMountPolicy::OpenOrCreate);
+        return umount2(1, (uint64_t)(uintptr_t)kMountPoint, 0, 0, 0, 0) == 0;
+    };
+    CHECK(queue_umount_event(), "an event can be queued by mounting and unmounting a save");
 
     // Guest pointers are host pointers in this build (hle_service.cpp's PW() is a cast), so a plain
     // buffer is a valid `SceSaveDataEvent*`. 104 bytes is the size the API writes; the guard bytes
@@ -86,7 +122,7 @@ int main() {
 
     // 2. A queued completion is still delivered, and delivered BEFORE the drain answer — otherwise
     //    this change would trade one title's boot for the completion Dead Cells consumes.
-    umount2(0, 0, 0, 0, 0, 0);
+    queue_umount_event();
     arm();
     const uint64_t got = get_event(0, ev, 0, 0, 0, 0);
     CHECK(got == 0, "a queued umount completion is reported as success");
@@ -100,8 +136,8 @@ int main() {
           "the queue reads drained again once the event has been consumed");
 
     // 4. Two queued events are both delivered before the drain answer returns.
-    umount2(0, 0, 0, 0, 0, 0);
-    umount2(0, 0, 0, 0, 0, 0);
+    queue_umount_event();
+    queue_umount_event();
     arm(); CHECK(get_event(0, ev, 0, 0, 0, 0) == 0, "first of two queued events delivered");
     arm(); CHECK(get_event(0, ev, 0, 0, 0, 0) == 0, "second of two queued events delivered");
     arm(); CHECK(get_event(0, ev, 0, 0, 0, 0) == kKhazanDrainCode, "then drained");
@@ -114,7 +150,7 @@ int main() {
     // 6. NO path returns the in-flight code, whatever the queue state. prosper completes every file
     //    operation synchronously, so "still running" is never true here; a future async Mount3 that
     //    genuinely has work outstanding must add its own path and update this arm deliberately.
-    umount2(0, 0, 0, 0, 0, 0);
+    queue_umount_event();
     bool any_in_flight = (bad == kInFlightCode);
     for (int i = 0; i < 8; i++) { arm(); any_in_flight |= (get_event(0, ev, 0, 0, 0, 0) == kInFlightCode); }
     CHECK(!any_in_flight,
