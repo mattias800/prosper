@@ -204,7 +204,54 @@ Whatever the right value is, a constant is not it — the consumer's arithmetic 
 against a monotonic count. That is a genuine modelling gap in prosper's EOP contract, filed on its
 own account.
 
-**It is not, however, this title's blocker** — see `## Ruled out`.
+**It is not, however, this title's blocker** — see `## Ruled out`. The consumer above is on the
+**flip** queue, not the EOP one, and that is where the deadlock actually was.
+
+### THE DEADLOCK IS BROKEN: the flip event's data must carry the flipArg in bits 16+
+
+Reading the consumer's guard, rather than assuming which queue fed it, is what settled this:
+
+```
+eboot+0x15b31e4: call sceKernelGetEventFilter ; cmp eax,0xfffffff3   ; -13 == VideoOut, else retry
+eboot+0x15b31f1: call sceKernelGetEventId     ; 1 -> retry, 3 -> …, else fall through
+eboot+0x15b3229: call sceKernelGetEventData
+eboot+0x15b3239: sar r14,0x10                 ; completed frame = data >> 16
+```
+
+So the ordinal comes from the **VideoOut flip event**, whose data prosper posts as the flipArg
+*verbatim* (`prosper_eq_trigger_flip`). This title's flipArgs are its own small frame ordinals
+(0, 1, 2, …), so `data >> 16` is always 0.
+
+`PROSPER_FLIP_EVENT_DATA_SHIFT=1` posts `flipArg << 16` instead, and the title changes completely:
+
+| | default | `PROSPER_FLIP_EVENT_DATA_SHIFT=1` |
+| --- | --- | --- |
+| game-loop iterations (25 s) | **5** | **1,552** |
+| GPU flips (25 s) | **3** | **1,550** |
+| over 270 s | deadlocked | **254,425 submits, 576,951 dispatches, 14,964 flips** |
+
+The title goes from a hard deadlock at frame 5 to a live ~55 fps frame loop, completes its world
+load, and reaches its intro movie. It is the single largest change this title has seen.
+
+**It still renders nothing** — `draws_cum` stays 0 and every captured frame is uniform black — and
+the reason is now a different, named gap: the title decodes its intro movie with
+`libSceVdecsw`, the **GPU-compute software video decoder** (`gamelib\render\gui\movie-decoder-vdecsw.cpp`),
+and all eight of its entry points are unimplemented:
+
+```
+sceVdecswQueryComputeMemoryInfo   sceVdecswQueryDecoderMemoryInfo   sceVdecswCreateDecoder
+sceVdecswAllocateComputeQueue     sceVdecswSetDecodeInput           sceVdecswSetDecodeOutput
+sceVdecswTrySyncDecodeInput       sceVdecswTrySyncDecodeOutput
+```
+
+so `TryFetchDecodedFrame` asserts `pNextDecodedFrame->m_frameBuffer.pFrameBuffer != NULL` forever.
+That is the frontier now, and it is the direct path to pixels: the guest runs the decode itself on
+the GPU (hence the 577k compute dispatches), so prosper has to manage the decoder object, the
+compute queue and the input/output buffers rather than decode anything.
+
+The lever is **default OFF** on purpose. It changes a contract every title shares, prosper's current
+model is pinned by `tests/hle/test_equeue_events.cpp`, and the evidence for changing it is one
+title's consumer — so it waits on a cross-title snapshot pass, exactly as #2219's SDK gate does.
 
 ## Open blockers
 

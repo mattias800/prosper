@@ -1375,9 +1375,20 @@ void prosper_eq_add_flip(uint64_t eq, int64_t ident, uint64_t udata) {
 void prosper_eq_trigger_flip(int64_t flip_arg) {
     std::vector<FlipReg> regs;
     { std::lock_guard lk(g_eq_mx); regs = g_flip_regs; }
+    // PROSPER_FLIP_EVENT_DATA_SHIFT=1 (default OFF, #3669): put the flipArg in bits 16+ of the
+    // kevent data instead of the low bits.
+    //
+    // Uncharted (PPSA05684) consumes the flip event and takes `sceKernelGetEventData(ev) >> 16` as
+    // the ordinal of the frame the GPU has finished -- `sar r14,0x10` at eboot+0x15b3239, on the
+    // branch reached after it has checked `GetEventFilter(ev) == -13` and `GetEventId(ev) != 2`. It
+    // then refuses any result below a high-water and stamps every frame slot up to it as complete.
+    // With the arg in the LOW bits that shift is always 0 for a title whose flipArgs are small
+    // ordinals, so the high-water advances once and sticks.
+    static const bool shift = getenv("PROSPER_FLIP_EVENT_DATA_SHIFT") != nullptr;
+    const int64_t data = shift ? (int64_t)((uint64_t)flip_arg << 16) : flip_arg;
     for (auto& r : regs) {
         SceKEvent e{}; e.ident = VIDEO_OUT_EVENT_FLIP; e.filter = EVFILT_VIDEO_OUT;
-        e.fflags = 1; e.data = flip_arg; e.udata = r.udata;
+        e.fflags = 1; e.data = data; e.udata = r.udata;
         eq_post(r.eq, e);
     }
 }
