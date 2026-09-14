@@ -23,9 +23,10 @@ found Vulkan.
   Current multi-layer codegen exposes native Uint16; RG8/R16F arrays retain raw interchange storage
   and CPU conversion. Incomplete source words, ambiguous strides/mips and other sub-word layouts
   retain CPU conversion. Linear comparison baselines stay separate from the tiled host-read buffer.
-  `PROSPER_DIRECT_IMAGE_RETILE=1` experimentally fuses typed R32_UINT/RGBA8_UINT image reads with
+  Typed R32_UINT/RGBA8_UINT image reads are fused by default with
   both tiled and exact linear output in one submission, including one-layer array views. This is
-  a prosper comparison control, not an experimental driver feature. Other representations retain
+  a checked core storage-image path. `PROSPER_NO_DIRECT_IMAGE_RETILE=1` restores transfer plus
+  retile for comparison without changing publication semantics. Other representations retain
   transfer plus retile. The linear allocation remains required by current/future result baselines,
   CPU fallback and diagnostics; a cold cache miss does not prove it unnecessary. Its producer is
   now a shader write, including for host availability, comparison and baseline-copy dependencies.

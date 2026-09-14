@@ -361,8 +361,8 @@ int run_case(int argc, char** argv) {
         const uint64_t output_images =
             std::getenv("PROSPER_NO_READONLY_STORAGE_WRITEBACK_SKIP") ? 2 : 1;
         const auto before = gpu_retile_recordings().load();
-        const bool direct_format = direct && (format.format == DataFormat::Uint32 ||
-                                             format.format == DataFormat::Uint8);
+        const bool direct_format = direct && !std::getenv("PROSPER_NO_DIRECT_IMAGE_RETILE") &&
+            (format.format == DataFormat::Uint32 || format.format == DataFormat::Uint8);
         const auto direct_before = gpu_direct_retile_recordings().load();
         uint64_t extra_recordings = 0;
         const uint32_t rounds = direct ? 6 : 3;

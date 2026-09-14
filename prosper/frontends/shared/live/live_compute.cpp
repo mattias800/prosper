@@ -9851,7 +9851,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         // mode-24 two-byte multilayer path and all word/volume tiling.
         static const bool packed_extension_disabled =
             std::getenv("PROSPER_NO_GPU_RETILE_PACKED_EXTENSION") != nullptr;
-        static const bool direct_retile_enabled = std::getenv("PROSPER_DIRECT_IMAGE_RETILE") != nullptr;
+        static const bool direct_retile_enabled = std::getenv("PROSPER_NO_DIRECT_IMAGE_RETILE") == nullptr;
         if (!gpu_retile_disabled) {
             VkPhysicalDeviceProperties properties{};
             vkGetPhysicalDeviceProperties(ctx.physical, &properties);

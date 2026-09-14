@@ -1,4 +1,4 @@
-// Exact device-side guest tiling, recorded after a storage-image transfer.
+// Exact device-side guest tiling from linear staging or a typed storage image.
 #pragma once
 #include "gpu/recompiler/spirv_builder.hpp"
 #include "gpu/diagnostics/vk_object_names.hpp"   // #3578
