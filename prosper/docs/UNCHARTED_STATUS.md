@@ -137,13 +137,43 @@ Two of those are now closed and are struck from the table above: the raw-`s_load
 opcode allow-list so `has_dpp` stayed false and SRC0 arrived as the raw special operand 250
 (`v_add_f32_dpp row_xmask:4` / `v_or_b32_dpp row_ror:8`, 4 → 0).
 
+**Two hypotheses about a different writer are dead, both cheaply:** no CP DMA ever targets a
+scanout VA (`PROSPER_DMA_WATCH_DST` on the flipped buffer, 0 hits in 40 s), and the title does not
+simply need longer — a 270 s run reaches 1,033,139 folded draws and 8,055 flips in exactly the same
+state, `scanout=MISS` on all 9,544 present callbacks and the same 262,144-pixel 512x512 target as
+its best content. So the composite really is the refused compute chain.
+
+**And the descriptor is partly assembled by shader code, which is what makes this hard.** At the
+failing consumer the resolver reports every route exhausted at once:
+
+```
+[mimg-unresolved] program=0x1400199800 pc=938 op=0x27 storage=0 need=sampled srsrc=s8
+                  srt_tag=NONE key_res=null pc_res=null ud_alias=NONE alias_res=null
+                  sgpr_res=not-consulted(null) written=1 (25 res)
+```
+
+`written=1` is the load-bearing field: the SRSRC range was written by shader ALU, not merely loaded,
+so `by_sgpr_base` is deliberately not consulted — binding a descriptor the shader computed is the
+failure mode this project rates as worse than declining the draw.
+
 **The x16 bundle is the root of the first three**, and the shape matters: `s_load_dwordx16
 s[4:19], s[0:1], 0x50` is consumed as a T# at `s[8:15]` — bundle offset **4**, neither half — while
 `s6`, another word of the same bundle, is read as an ordinary scalar soffset. So this bundle carries
 descriptors AND scalar data at once. That is why the existing narrow x16 proof
 (`proven_smem_x16_descriptor_loads`: two aligned T# halves, each consumed by a MIMG, no branches)
 cannot admit it, and it is also why a by-use widening of that proof cannot either — a use proof of
-the whole bundle must refuse a bundle one of whose words is data. **Tried and reverted rather than
+the whole bundle must refuse a bundle one of whose words is data.
+
+**What a fix has to change, named so the next agent starts from the design rather than the
+symptom.** Both halves of prosper assume a descriptor's SRT key is UNIFORM across its words — the
+emitter in `sreg_srt_range_tag` ("accept it only while every word still carries the same
+provenance") and the fold in its `common_key` loop over the eight T# words. That assumption is
+exactly what a bundle cannot satisfy: a T# at bundle offset 4 has no key of its own, only the
+bundle's. The shape of the answer is per-word offsets (`literal + 4k`) with a consecutive-run
+matcher returning the first word's offset, applied to the fold and the emitter together, plus
+publishing a descriptor at the offset where it actually starts. It is not a small change and it
+must not be guessed at: this subsystem's comments repeatedly record that binding the WRONG resource
+renders silently wrong texels, which is worse than declining. **Tried and reverted rather than
 recorded as untested:** a `proven_smem_descriptor_bundle_loads` written exactly that way changed
 nothing on this title, for that reason. The answer has to be per-word, not per-load.
 
@@ -476,6 +506,12 @@ One line per hypothesis that was tested and died. Do not re-derive these.
   `untracked-soffset` goes **3 → 0** with no new signature family appearing, and the change is in.
   Instrument trap 283 — and note this entry once stood in `## Ruled out`, which is exactly where a
   confounded metric does the most damage.
+- **"The title just needs longer to reach a screen worth compositing."** Falsified: a 270 s run
+  reaches 1,033,139 folded draws, 8,055 flips and 9,544 present callbacks, every one `scanout=MISS`,
+  with the same best content (262,144 non-black pixels in a 512x512 target) as a 45 s run.
+- **"Something other than a shader writes the scanout — a CP DMA, or the CPU."** Falsified both
+  ways: `PROSPER_DMA_WATCH_DST` on the flipped buffer records 0 hits in 40 s, and every flip reports
+  `authored=0`, prosper's "was anything written here" test.
 - **"The guest's buffer-full callback is refusing because `available_dw()` subtracts
   `reserved_dw`."** Falsified by the allocator's own report: `raw=4 reserved=0 available=4`. The
   reserve was not involved; the buffer genuinely had four dwords and prosper's Jump wanted five.
