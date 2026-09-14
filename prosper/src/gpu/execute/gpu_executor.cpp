@@ -3383,14 +3383,16 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
     std::array<OptionalNullRole, kFoldSgprs> optional_null_role{};
     // Producer PC per tagged origin. The exact location lets the optional proof impose a narrow
     // dominance contract over direct CFG instead of trusting this fold's linear walk.
-    std::vector<uint32_t> optional_table_null_origin_pc(1u, UINT32_MAX);
+    // Allocate provenance PC tables only when a qualifying null load needs an origin. Reads
+    // below check the index bound; first growth fills the sentinel slot with UINT32_MAX too.
+    std::vector<uint32_t> optional_table_null_origin_pc;
     // Same mapped-qword proof for GTA V's distinct +0x20 output/work pointer convention. Keeping a
     // separate origin table prevents the existing +0x58 load-only contract from authorizing stores.
-    std::vector<uint32_t> nullable_output_null_origin_pc(1u, UINT32_MAX);
+    std::vector<uint32_t> nullable_output_null_origin_pc;
     // Only x16-header roots need the narrow straight-line dominance contract added for GTA V. The
     // generic mapped-qword null proof predates this shape and has separate loop/CFG validation.
     // Origin ids are monotonic and never restored, so this metadata is immutable once published.
-    std::vector<uint32_t> x16_null_origin_pc(1u, UINT32_MAX);
+    std::vector<uint32_t> x16_null_origin_pc;
     // Null-pointer provenance carried by SCC between the low and high halves of an exact
     // s_add_u32/s_addc_u32 pair. The concrete carry can be unknown after a failed null dereference;
     // this records only that the high result still belongs to that null chain.

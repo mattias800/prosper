@@ -46,7 +46,7 @@ Input mutation disables expected-output comparison explicitly; it still refuses 
 without matching backing events. The report counts changed outputs against the recording.
 Source revisions are printed, allowing captures to be replayed against candidate code.
 
-Use `heaptrack <BUILD>/fold_replay ...` and `heaptrack_print` for allocation counts and
+Use `heaptrack --record-only <BUILD>/fold_replay ...` and `heaptrack_print` for allocation counts and
 peak retained memory, separately for cold-only (`--iterations 0`), repeated cold and warm
 runs. These process-wide reports include parsing and tool startup; use allocation stacks
 to attribute evaluator/cache/validation costs. Do not call file size or retained payload
