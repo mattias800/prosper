@@ -1199,6 +1199,15 @@ if(TARGET prosper_core)
   target_link_libraries(test_savedata_param PRIVATE prosper_core)
   add_test(NAME savedata_param COMMAND test_savedata_param)
 
+  # sceSaveDataGetMountInfo ignored its mount-point argument (#3653), so a null mount point,
+  # "/savedata1", and "/savedata0" after an unmount all got a successful capacity report. Drives the
+  # real NIDs -- GetMountInfo, Mount3, Umount -- over a disposable save root, with canaries around
+  # the 48-byte output so a write past the ABI reddens.
+  add_executable(test_savedata_mountinfo tests/hle/test_savedata_mountinfo.cpp)
+  target_include_directories(test_savedata_mountinfo PRIVATE tests)
+  target_link_libraries(test_savedata_mountinfo PRIVATE prosper_core)
+  add_test(NAME savedata_mount_info COMMAND test_savedata_mountinfo)
+
   # Save data is namespaced by title id (#2734): two titles that pick the same guest save name --
   # `OptionSettings`, or SaveDataMemory's (user 1, slot 0) -- must not share one host save. Runs two
   # application roots over one guest name, because a single-title round trip passes on the broken code.
