@@ -4654,11 +4654,22 @@ HLE(s_savedata_umount2) {
 }
 // The mount-point argument every one of these calls takes is SceSaveDataMountPoint { char data[16] }.
 // Accept only the mount this build serves, so a title passing a different one is refused instead of
-// having its request applied to whatever happens to be mounted. The comparison is bounded at the
-// ABI's own 16 bytes, which is also what makes an UNTERMINATED field safe to hand in: a guest that
-// fills all 16 bytes gets a mismatch rather than a read off the end of its struct. This is the only
-// mount-point spelling check in the savedata surface -- GetMountInfo, SetParam and GetParam all go
-// through it, so they cannot drift apart about which mount point is real.
+// having its request applied to whatever happens to be mounted.
+//
+// AN UNTERMINATED FIELD IS SAFE TO HAND IN -- but not because of the n=16, which is what this
+// comment used to say. strncmp stops at the first NUL in EITHER string, and the literal's sits at
+// index 10, so at most 11 bytes of the guest's field are ever examined and the 16 is a ceiling that
+// is never reached. Measured rather than reasoned: with only 11 bytes mapped and the next page
+// PROT_NONE, the comparison completes without faulting. That is also why a guest that fills all 16
+// bytes gets a clean mismatch -- its byte 10 cannot be the literal's terminator -- instead of a read
+// off the end of its struct.
+//
+// The consequence worth carrying: the bound is the LITERAL, so lengthening the accepted name is not
+// free. A longer spelling pushes the read further into the field, and only at 16 characters does the
+// n start doing any work. Widen the name and the ceiling becomes load-bearing for the first time.
+//
+// This is the only mount-point spelling check in the savedata surface -- GetMountInfo, SetParam and
+// GetParam all go through it, so they cannot drift apart about which mount point is real.
 static bool savedata_mount_point_ok(uint64_t mount_point_va) {
     if (!mount_point_va) return false;
     const char* mp = (const char*)PW(mount_point_va);
