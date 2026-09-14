@@ -466,6 +466,13 @@ One line per hypothesis that was tested and died. Do not re-derive these.
   SRSRC/SSAMP, MUBUF/MTBUF SRSRC or SMEM SBASE) fires on nothing here, because the bundles mix
   descriptors and scalar data — `s6` is both a bundle word and an `s_load` soffset. Reverted rather
   than shipped unexercised. A per-word answer is needed, not a per-load one.
+- **"Letting a raw `s_load_*` take a tracked register SOFFSET unblocks the compute chain."**
+  Falsified by implementing it. The emitter's gate admits only `s_buffer_load` (opcode 0x8..0xC),
+  which does reject a resolvable case, but lifting it to every SMEM load took the refused compute
+  programs from **15 to 22 distinct** on this title rather than reducing them — the loads proceed
+  past the offset check and fail later, and a raw pointer's published resource is not sized for the
+  access. Reverted. The gate is not the defect; if it is lifted later it must come with the
+  raw-pointer resource sizing, not on its own.
 - **"The guest's buffer-full callback is refusing because `available_dw()` subtracts
   `reserved_dw`."** Falsified by the allocator's own report: `raw=4 reserved=0 available=4`. The
   reserve was not involved; the buffer genuinely had four dwords and prosper's Jump wanted five.
