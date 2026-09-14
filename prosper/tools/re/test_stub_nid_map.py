@@ -22,6 +22,20 @@ import stub_nid_map as S                                             # noqa: E40
 fails = 0
 
 
+def check_call(name, fn, want):
+    """`check` over a callable, reporting a raise as a failed arm rather than aborting the suite.
+
+    A mutation that removes an empty-population guard makes the function raise, and an uncaught
+    exception kills every arm after it -- so the sweep reports "0 red" for the guard AND loses the
+    arms it would have reddened. That reads as two separate absences of coverage.
+    """
+    try:
+        got = fn()
+    except Exception as exc:                                         # noqa: BLE001 — that IS the arm
+        got = "raised %s: %s" % (type(exc).__name__, exc)
+    check(name, got, want)
+
+
 def check(name, got, want):
     global fails
     if got != want:
@@ -255,11 +269,24 @@ def main():
           S.patched_import_stubs(two_plt, syms), [])
 
     # A module with no lazy PLT at all (`-z now`: no `push; jmp` tails anywhere) yields no candidates
-    # and must report nothing rather than dividing by an empty population. No local dump is built
-    # this way, so this arm is the only thing exercising that path.
+    # and must report nothing rather than taking a mode over an empty population. 22 modules in the
+    # local corpus are built this way -- they bind real imports without a lazy PLT -- so this is not
+    # the hypothetical it was first written as.
     now_bound = FakePlt(b"\xff\x25\x00\x00\x00\x00" * 8)
-    check("non-lazy-module-with-no-plt-tails-reports-nothing",
-          S.patched_import_stubs(now_bound, syms), [])
+    check_call("non-lazy-module-with-no-plt-tails-reports-nothing",
+               lambda: S.patched_import_stubs(now_bound, syms), [])
+
+    # ...and it must not be reported as "nothing to check" when the module HAS imports this analysis
+    # simply cannot see. That is the same error as printing a refusal as a pass, one branch over.
+    check_call("non-lazy-module-with-imports-says-NOT-JUDGED",
+               lambda: "NOT JUDGED" in S.format_patched(now_bound, {}, "x.prx", sym_of=syms)[0],
+               True)
+
+    # A module with genuinely no PLT-bound imports is the one case where "nothing to check" is the
+    # honest answer, and it must stay distinguishable from the refusal above.
+    check_call("module-with-no-imports-at-all-says-nothing-to-check",
+               lambda: "nothing to check" in S.format_patched(now_bound, {}, "x.prx", sym_of={})[0],
+               True)
 
     # format_patched(): a clean module says so out loud rather than printing nothing, so "clean" and
     # "the tool did not run" are distinguishable.

@@ -172,6 +172,10 @@ def patched_scan(img, sym_of=None):
     votes = {}
     for _va, _r, resolver, _ok in cand:
         votes[resolver] = votes.get(resolver, 0) + 1
+    # No `if not votes` guard here: `votes` is built from `cand` and is empty exactly when `cand` is,
+    # which the return above has already handled. A second guard would be dead code, and adding one
+    # was how the previous attempt at this looked fixed while the suite still aborted on a mutation --
+    # the thing that actually needed fixing was the test helper, not this function.
     resolver = max(votes, key=lambda k: votes[k])
 
     if sym_of is None:
@@ -187,8 +191,6 @@ def patched_scan(img, sym_of=None):
     #     candidates and drop anything off it. Fitting from the first and last candidate instead lets
     #     a single stray become an endpoint and silently disable the geometry pass entirely.
     accepted = [(va, reloc, ok) for va, reloc, res, ok in cand if res == resolver]
-    if not accepted:                 # empty-safe: the mode below needs a population to take it over
-        return "uncalibrated", []
     bases = {}
     for va, reloc, _ok in accepted:
         key = va - PLT_ENTRY * reloc
@@ -261,7 +263,15 @@ def format_patched(img, names, label, sym_of=None):
     """
     status, rows = patched_scan(img, sym_of)
     if status == "no-plt":
-        return ["%s: no lazy PLT in this module -- nothing to check" % label]
+        # Two different things reach here, and only one of them is "nothing to check". A module with
+        # no imports at all genuinely has nothing; a module whose imports are bound without a lazy
+        # PLT (`-z now`) has plenty, and this analysis simply cannot see them -- 22 of the local
+        # corpus's modules are in that state, PS5Util.prx among them with 7 jump slots. Calling that
+        # "nothing to check" is the same error as printing a refusal as a pass.
+        if jmprel_index_to_symbol(img) if sym_of is None else sym_of:
+            return ["%s: NOT JUDGED -- this module binds imports without a lazy PLT, which this "
+                    "analysis cannot inspect" % label]
+        return ["%s: no imports bound through a PLT in this module -- nothing to check" % label]
     if status == "uncalibrated":
         return ["%s: NOT JUDGED -- lazy PLT found, but no entry in it has the expected "
                 "`jmp *[rip+disp32]` head, so there is nothing intact to compare against" % label]
