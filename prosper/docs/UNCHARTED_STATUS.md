@@ -152,10 +152,59 @@ three 106-dword ones do. The guest's own submission thread agrees it is not behi
 `eboot+0x211c278` to advance, and that global reads **5** at the stall, i.e. every frame the game
 loop began has already been handed to it.
 
-The remaining question is therefore upstream of the renderer again: **why do frames 3 and 4 produce
-no draws and no flip?** The guest is still inside its first world load (`----- Switching world: from
- to core`), so the likeliest answer is that it is presenting blank frames while waiting for content,
-and something in that load never finishes. That is where the next session should start.
+That reading was wrong on one point, and the correction moves the frontier. The guest DOES build
+flips 3 and 4 — `PROSPER_HWBP` on `sceAgcDcbSetFlip`'s stub catches **five** calls, `bufidx` 0,1,2,0,1
+with flipArg 0..4. Their DCBs are simply never submitted, and nothing is lost on the way in: guest
+submit-wrapper calls and prosper folds agree exactly (12 = 12 in one run).
+
+### Where the submission stops, and the guest state that gates it
+
+The guest's own submission thread is not behind. It spins at `eboot+0x15a7cb0` on `usleep(1)`, and
+its gate is a frame-slot structure (`[eboot+0x2500500]`, stride `0x6700`, 18 slots):
+
+```
+15a7cba: rax = [eboot+0x211c278]      ; newest BEGUN frame -- reads 5 at the stall
+15a7cc4: jle back                      ; wait while it has caught up
+15a7ccf: rax = [0x2500500] + r12*0x6700
+15a7cdd: if slot.+0x48 == 0 -> back    ; three completion stamps must be present
+15a7ce4: if slot.+0x50 == 0 -> back
+15a7ceb: if slot.+0x58 == 0 -> back
+15a7cf2: submit
+```
+
+and at the stall the slots read:
+
+```
+slot 0  +48=set  +50=set  +58=set   counter=0     <- fully complete
+slot 1  +48=set  +50=set  +58=0     counter=0     <- MISSING the third stamp
+slot 2  +48=set  +50=set  +58=0     counter=0     <- MISSING the third stamp
+slot 3  +48=0    +50=0    +58=0     counter=1     <- never started
+slot 4  +48=0    +50=0    +58=0     counter=1
+slot 5  +48=0    +50=0    +58=0     counter=1
+```
+
+`+0x48` is written by the submission thread itself (`eboot+0x15a6f0a`). **`+0x58` is written by
+`eboot+0x15b36b3`**, inside a loop that stamps every frame from a high-water at `eboot+0x2e1a8f8` up
+to a completed-frame ordinal — and that ordinal comes from an imported call:
+
+```
+15b3229: call sceKernelGetEventData
+15b3233: r14 = rax
+15b3239: sar r14,0x10            ; completed frame = data >> 16
+15b323d: cmp r14,[0x2e1a8f8]     ; refuse anything below the high-water
+15b3266: [0x2e1a8f8] = r14 + 1   ; ...then stamp every slot up to it
+```
+
+**prosper posts `e.data = r.ident` for every AGC end-of-pipe event** (`hle_kernel_time.cpp`,
+`eop_post_now`), and this title registers 58 EOP sources with idents `0x0`, `0x1` and `0x20..0x55` —
+all below `0x10000`. So `data >> 16` is **always 0**: the high-water advances exactly once, to 1, and
+every later event is refused. That is measured, not inferred: `[0x2e1a8f8]` reads **1** at the stall.
+
+Whatever the right value is, a constant is not it — the consumer's arithmetic only makes sense
+against a monotonic count. That is a genuine modelling gap in prosper's EOP contract, filed on its
+own account.
+
+**It is not, however, this title's blocker** — see `## Ruled out`.
 
 ## Open blockers
 
@@ -205,6 +254,13 @@ One line per hypothesis that was tested and died. Do not re-derive these.
   when the capture ends. The narrower claim that survives is the one #3615 actually rested on: the
   guest-TP migration observed there arrives through `sceFiberRun` with `started=1`, which the
   fiber-run log does record. Instrument trap 282.
+- **"The AGC EOP event's data should carry the completed-FRAME ordinal (the guest's own flipArg) in
+  bits 16+."** Implemented behind `PROSPER_EOP_FRAME_ORDINAL=1` and falsified. The lever demonstrably
+  moves — its trace reports the ordinal advancing `0 -> 1 -> 2` as the three flips complete, and the
+  accessor is linked — and the title still runs exactly 5 game-loop iterations and 3 flips, with the
+  guest's high-water still stuck at 1. So either the consumer at `eboot+0x15b3229` is fed by a
+  different event source than the AGC EOP queue, or bits 16+ carry something other than the flip
+  ordinal. The lever stays, default OFF, so the A/B remains reproducible. #3616.
 - **"The stall is the Vulkan backend."** Falsified: `PROSPER_RENDER=0` reproduces it exactly — 5
   game-loop iterations, the same counter trajectory, the same ~1.5 s. The 14 compute programs
   skipped as `mode=unresolved-operand` are therefore not the cause either, however much they need

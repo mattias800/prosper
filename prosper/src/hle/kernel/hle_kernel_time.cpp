@@ -1414,6 +1414,8 @@ void prosper_eq_add_eop(uint64_t eq, int64_t id, uint64_t udata) {
 // binaries that link the kernel HLE without the gpu lib still link.
 extern "C" void prosper_gpu_drain_completion_writes() __attribute__((weak));
 extern "C" bool prosper_gpu_submit_scope_active() __attribute__((weak));
+// hle_graphics.cpp — the guest's own flipArg for the last completed flip (-1 before the first).
+extern "C" int64_t prosper_vo_last_flip_arg() __attribute__((weak));
 namespace {
     // Actually post one EOP completion to every registered equeue (the worker below calls this).
     void eop_post_now() {
@@ -1450,10 +1452,45 @@ namespace {
             return n > 0 ? n : 1;
         }();
         static std::atomic<uint64_t> posted{0};
+        // PROSPER_EOP_FRAME_ORDINAL=1 (default OFF, #3616): carry the GPU's COMPLETED-FRAME ordinal
+        // in bits 16+ of the event data, keeping the registration ident in the low 16.
+        //
+        // WHY: `e.data = r.ident` alone is a constant, and at least one title reads the data as a
+        // progress COUNT rather than an identity. Uncharted (PPSA05684) registers 58 EOP sources with
+        // idents 0x0, 0x1 and 0x20..0x55 -- all below 0x10000 -- and its GPU-interrupt thread does
+        // `sceKernelGetEventData(ev) >> 16`, compares the result against its own newest-begun-frame
+        // counter, refuses anything lower than the last value it accepted, and then stamps every frame
+        // slot up to it as GPU-complete. With the ident in the data that shift is always 0, so the
+        // high-water advances exactly once and every later event is refused: measured, its frame slots
+        // 1 and 2 never receive the completion stamp their submission thread waits on, and the title
+        // deadlocks after three flips.
+        //
+        // The ordinal is the guest's OWN flipArg, echoed back -- the value it passed to
+        // sceAgcDcbSetFlip -- so this reports how far the guest's own numbering has got rather than
+        // inventing a scale. Before the first completed flip there is nothing to report and the
+        // legacy value is used unchanged.
+        // CONFIDENCE: MED. The consumer's arithmetic pins the LAYOUT tightly (a frame ordinal in the
+        // same numbering as the title's frame counter, in bits 16+, with the queue ident below it);
+        // what is not pinned by anything measured here is whether Sony's driver derives that ordinal
+        // from the flip or from the submit that precedes it. Default OFF for exactly that reason.
+        static const bool frame_ordinal = getenv("PROSPER_EOP_FRAME_ORDINAL") != nullptr;
+        int64_t completed_frame = -1;
+        if (frame_ordinal && prosper_vo_last_flip_arg) completed_frame = prosper_vo_last_flip_arg();
+        if (frame_ordinal) {   // a lever that cannot show it moved is void: report every CHANGE
+            static std::atomic<int64_t> last{-2};
+            int64_t prev = last.exchange(completed_frame);
+            if (prev != completed_frame)
+                fprintf(stderr, "[eop-ordinal] accessor=%s completed_frame=%lld (was %lld)\n",
+                        prosper_vo_last_flip_arg ? "linked" : "MISSING",
+                        (long long)completed_frame, (long long)prev);
+        }
         for (auto& r : regs) {
             for (int i = 0; i < repeat; ++i) {
                 SceKEvent e{}; e.ident = r.ident; e.filter = EVFILT_GRAPHICS_CORE;
                 e.data = r.ident; e.udata = r.udata;
+                if (completed_frame >= 0)
+                    e.data = (int64_t)(((uint64_t)completed_frame << 16) |
+                                       ((uint64_t)r.ident & 0xffffu));
                 eq_post(r.eq, e, coalesce);
                 const uint64_t n = ++posted;
                 if (getenv("PROSPER_EOP_TRACE") && (n % 2000) == 0)

@@ -241,6 +241,11 @@ namespace {
 // prosper_vo_flip_count: total flips so far (either flip path) — read by the PROSPER_PROGRESS
 // heartbeat in hle_agc.cpp as a cheap forward-progress signal for long diagnostic runs.
 extern "C" uint64_t prosper_vo_flip_count() { std::lock_guard<std::mutex> lk(g_flip_mx); return g_flip_count; }
+// The flipArg of the most recently COMPLETED flip, or -1 before the first one. This is the guest's
+// OWN frame ordinal -- it is the value the title passed to sceAgcDcbSetFlip / sceVideoOutSubmitFlip,
+// echoed back, never a number prosper invents. The AGC end-of-pipe event path (hle_kernel_time.cpp)
+// reads it to answer "how far has the GPU actually got" in the guest's own numbering.
+extern "C" int64_t prosper_vo_last_flip_arg() { std::lock_guard<std::mutex> lk(g_flip_mx); return g_last_flip_arg; }
 extern "C" int prosper_vo_flip_rate() { std::lock_guard<std::mutex> lk(g_flip_mx); return g_flip_rate; }
 
 // Hold the GUEST flip rate at the cadence the title asked for, sleeping in the flip path when we
