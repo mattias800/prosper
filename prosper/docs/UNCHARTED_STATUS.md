@@ -66,10 +66,13 @@ patched stub rather than by anything prosper does: it treats its second argument
 (`cmp esi,0x45`) where the caller passes a **pointer**, so it takes its early `ja` and returns without
 setting `eax` — and at that call site `eax` is left holding the chunk count, `1`.
 
-prosper must not work around this. Patching guest code, or making an HLE answer match what a
-repack's broken stub intended, is not compatibility work; it is the same category as answering an
-ownership query positively to get past a check. The honest position is that **this dump cannot be
-used as evidence about prosper's PlayGo, and progression past loading needs a clean dump.**
+prosper must not work around this. Patching guest code, or shaping an HLE answer to match what a
+repack's broken stub intended, is not compatibility work — and it would not help here in any case,
+since the calls do not reach prosper. (This is *not* the entitlement case CLAUDE.md warns about:
+PlayGo reports install progress, not ownership, and prosper's own PlayGo answers are derived from
+local content as they should be. The objection is simply that there is nothing here for prosper to
+implement.) The honest position is that **this dump cannot be used as evidence about prosper's
+PlayGo, and progression past loading needs a clean dump.**
 (#3634 was filed against prosper on this symptom and closed as not-a-prosper-defect; #3651 tracks the
 generic detector.)
 

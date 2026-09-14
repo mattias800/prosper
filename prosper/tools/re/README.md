@@ -337,6 +337,40 @@ rather than omitted — silently dropping it makes "this call does not go throug
 named the wrong address" the same empty output, and the reader cannot tell which they got.
 `test_stub_nid_map.py` (ctest: `re_stub_nid_map`) pins both, each arm naming the mutation it kills.
 
+### `--patched` — which import stubs were overwritten in place?
+
+A third-party replacement of a Sony library usually arrives as a separate module, and
+`module_path_policy.hpp` refuses to link one while `tools/dump_hygiene.py` finds them on disk.
+Neither can see a replacement **patched into an eboot's own import stubs**: there is no extra module
+to refuse. That form presents at runtime as a prosper HLE defect, because the guest's calls never
+reach prosper at all.
+
+```bash
+python3 tools/re/stub_nid_map.py --patched --names ../PS5-3.20_Libs <DUMP_ROOT>/<TITLE>-app0/eboot.bin
+```
+
+Two signals, and the second is the one that earns its keep. A patched entry usually leaves the
+lazy-binding tail (`push <reloc index>; jmp <resolver>`) sitting in front of a missing
+`jmp *[rip+disp32]` head — but a patcher that overwrote the tail as well leaves nothing to find, and
+on the one flagged dump in the corpus that was precisely the entry that broke the title. The second
+signal recovers it from the PLT geometry: entries are a fixed stride apart with reloc indices running
+alongside, so a reloc inside the observed span with no entry on the grid had its whole entry
+overwritten.
+
+It deliberately does **not** report "an imported NID with no stub". That is the obvious test and it
+accuses clean modules: an import reached only by a direct `call *[rip+disp32]`, or never called, has
+no stub either. Three guards stand behind the verdict, each closing a way a clean module could be
+accused — the grid, a requirement that the module contain at least one *intact* entry to calibrate
+against (so an unfamiliar PLT shape reads as silence rather than "entirely patched"), and a check
+that a gap is not simply a second PLT region's entry. Measured across 61 eboots, 262 firmware
+`.sprx` and 5 game `.prx`: one module flagged, and zero grid violations anywhere.
+
+Worked example (#3634/#3651): *Uncharted* (PPSA05684) asserts 65 times a boot on
+`scePlayGoGetLocus failed: 0x00000001` and never leaves loading. It reads exactly like an HLE defect
+and was filed as one. Seven `libScePlayGo` stubs in that eboot are overwritten, `GetLocus` among
+them, so prosper never sees the call — `PROSPER_SVCLOG=1` shows it servicing only the four PlayGo
+NIDs whose stubs are intact. One `--patched` run replaces the bisection that took an hour.
+
 Worked example (#2186): *Earthion*'s only `sceNpTrophy2GetGroupInfoArray` call site sits in a
 six-step trophy-init chain of anonymous addresses. Mapping the stubs named step 4 as
 `sceNpTrophy2GetGameInfo`, which already answers an error and short-circuits the chain — so the call

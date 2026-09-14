@@ -182,11 +182,79 @@ def main():
     check("geometry-skips-relocs-with-no-symbol",
           S.patched_import_stubs(gone, {0: 10, 2: 12, 3: 13}), [])
 
+    # A patched entry whose reloc the JMPREL table does not know must not be emitted as a row naming
+    # no import -- it renders as `reloc=4  -  ?  ?`, an accusation about an import that does not
+    # exist. The entry has to sit ON the grid, or the grid guard suppresses it first and this arm
+    # tests that guard instead (it did, until a mutation sweep showed the symbol guard could be
+    # deleted with nothing going red).
+    unknown_reloc = FakePlt(entry(0, 0) + entry(1, 1) + entry(2, 2) + entry(3, 3) +
+                            entry(4, 4, JUNK6))
+    check("tail-row-naming-no-import-is-not-emitted",
+          S.patched_import_stubs(unknown_reloc, syms), [])
+
+    # An off-grid candidate whose reloc IS a real index must be refused rather than reported at the
+    # address it happens to sit at. This is the grid guard's actual job: the entries are a fixed
+    # stride apart, so anything not on that stride is not one of them, however well-formed it looks.
+    # Built three bytes off the stride, with reloc 2 -- a reloc the table knows, and one whose real
+    # entry is intact and elsewhere, so a fabricated row here would contradict a row we can see.
+    off_grid = entry(0, 0) + entry(1, 1) + entry(2, 2) + entry(3, 3) + b"\x90" * 3 + \
+        JUNK6 + b"\x68" + _st.pack("<I", 2) + b"\xe9" + \
+        _st.pack("<i", RESOLVER - (BASE + 4 * 16 + 3 + 16))
+    check("off-grid-candidate-is-not-reported",
+          S.patched_import_stubs(FakePlt(off_grid), syms), [])
+
+    # CALIBRATION. A PLT whose entries have a shape this code does not know -- here an `endbr64`
+    # prologue that shifts the `push` off byte 6 -- contains no intact entry to compare against, so
+    # every entry looks patched. Reporting it would be the loudest possible false accusation, so the
+    # answer must be silence. Mutation killed: dropping the "at least one intact entry" guard.
+    ENDBR = b"\xf3\x0f\x1e\xfa"
+
+    def cet_entry(k, reloc):
+        rel = RESOLVER - (BASE + k * 16 + 16)
+        return ENDBR + b"\x68" + _st.pack("<I", reloc) + b"\xe9" + _st.pack("<i", rel) + b"\x90\x90"
+
+    cet = FakePlt(b"".join(cet_entry(k, k) for k in range(4)))
+    check("unrecognised-plt-shape-is-silence-not-an-accusation",
+          S.patched_import_stubs(cet, syms), [])
+
+    # TWO PLT REGIONS with different resolvers. The losing region's entries are real PLT entries, not
+    # overwritten slots, so the geometry must not report the gaps they occupy. Mutation killed:
+    # omitting the other-region check.
+    OTHER = BASE + 0x800
+
+    def other_entry(k, reloc):
+        rel = OTHER - (BASE + k * 16 + 16)
+        return b"\xff\x25\x00\x00\x00\x00" + b"\x68" + _st.pack("<I", reloc) + \
+            b"\xe9" + _st.pack("<i", rel)
+
+    two_plt = FakePlt(entry(0, 0) + other_entry(1, 1) + entry(2, 2) + other_entry(3, 3))
+    check("second-plt-region-is-not-reported-as-overwritten",
+          S.patched_import_stubs(two_plt, syms), [])
+
+    # A module with no lazy PLT at all (`-z now`: no `push; jmp` tails anywhere) yields no candidates
+    # and must report nothing rather than dividing by an empty population. No local dump is built
+    # this way, so this arm is the only thing exercising that path.
+    now_bound = FakePlt(b"\xff\x25\x00\x00\x00\x00" * 8)
+    check("non-lazy-module-with-no-plt-tails-reports-nothing",
+          S.patched_import_stubs(now_bound, syms), [])
+
     # format_patched(): a clean module says so out loud rather than printing nothing, so "clean" and
     # "the tool did not run" are distinguishable.
     check("clean-module-says-so",
           S.format_patched(clean, {}, "eboot.bin"),
           ["eboot.bin: no import stub has been overwritten in place"])
+
+    # ...and the DETECTION row is pinned too, because that row is what a reader pastes into an issue.
+    # Only the clean line was covered before, so the NID/name lookup and the [tail]/[whole-entry]
+    # label could have changed shape unnoticed.
+    detected = FakePlt(entry(0, 0) + entry(1, 1, JUNK6) + entry(2, 2) + entry(3, 3))
+    detected.tags = {}
+    check("detection-row-format-is-pinned",
+          S.format_patched(detected, {"BBBBBBBBBBB": ("sceThing", "libSceThing")}, "eboot.bin",
+                           sym_of=syms),
+          ["eboot.bin: 1 import stub(s) OVERWRITTEN IN PLACE -- calls to these never reach the "
+           "HLE layer",
+           "0x10010\treloc=1\tBBBBBBBBBBB\tsceThing\tlibSceThing\t[tail]"])
 
     print("\n%s (%d failure(s))" % ("FAILED" if fails else "all passed", fails))
     return 1 if fails else 0

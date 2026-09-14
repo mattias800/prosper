@@ -168,46 +168,70 @@ def patched_import_stubs(img, sym_of=None):
 
     if sym_of is None:
         sym_of = jmprel_index_to_symbol(img)
+
+    # THREE guards stand between a byte pattern and telling somebody their dump is tampered with.
+    # Each closes a way a *clean* module can be accused, which is the expensive direction here; all
+    # three were measured free on this corpus (61 eboots + 262 firmware .sprx + 5 game .prx: 0 grid
+    # violations, 0 strays surviving the vote, one flagged module).
+    #
+    # (1) THE GRID. Entries are `PLT_ENTRY` apart with reloc indices running alongside, so every real
+    #     entry shares one value of `va - PLT_ENTRY*reloc`. Take the MODE of that over the surviving
+    #     candidates and drop anything off it. Fitting from the first and last candidate instead lets
+    #     a single stray become an endpoint and silently disable the geometry pass entirely.
+    accepted = [(va, reloc, ok) for va, reloc, res, ok in cand if res == resolver]
+    bases = {}
+    for va, reloc, _ok in accepted:
+        key = va - PLT_ENTRY * reloc
+        bases[key] = bases.get(key, 0) + 1
+    base = max(bases, key=lambda k: bases[k])
+    on_grid = [(va, reloc, ok) for va, reloc, ok in accepted if va - PLT_ENTRY * reloc == base]
+
+    # (2) CALIBRATION. Every judgement here is "this entry does not look like the intact ones", so
+    #     the module has to contain at least one intact entry to compare against. A PLT whose entries
+    #     simply have a shape this code does not know -- an `endbr64` prologue shifting the `push`
+    #     off byte 6, say -- would otherwise present as ENTIRELY patched, which is the loudest
+    #     possible false accusation. No local module has such a PLT, and neither lld nor GNU ld emits
+    #     one, but "unrecognised" and "overwritten" must not be the same answer.
+    if not any(ok for _va, _r, ok in on_grid):
+        return []
+
     out = []
     seen_reloc = {}
-    for entry_va, reloc, res, head_intact in cand:
-        if res != resolver:
-            continue
+    for entry_va, reloc, head_intact in on_grid:
         seen_reloc[reloc] = entry_va
-        if head_intact:
+        if head_intact or reloc not in sym_of:
             continue
         out.append((entry_va, reloc, sym_of.get(reloc), "tail"))
 
     # Second signal, for the case the first cannot reach: a patcher that overwrote the TAIL as well
     # leaves no `push` to find, so such an entry is invisible above -- and on the dump this was
     # written for that was precisely the entry that broke the title, while five noisier ones were
-    # caught. Close it from the geometry instead. PLT entries are `PLT_ENTRY` bytes apart and their
-    # reloc indices run with them, so two intact entries fix `va = A + PLT_ENTRY * reloc`; any reloc
-    # inside the observed span whose derived slot produced no candidate at all had its whole entry
+    # caught. Any reloc inside the observed span with no entry on the grid had its whole entry
     # overwritten.
     #
-    # The span bound is what keeps this honest. Extrapolating past the observed entries would start
-    # inventing slots for imports that may legitimately have none (an import reached only by a
-    # direct `call *[rip+disp32]`), which is the over-report this function exists to avoid, so the
-    # derived address must also still land inside an executable segment.
-    intact = sorted((r, va) for r, va in seen_reloc.items())
-    if len(intact) >= 2:
-        (r0, va0), (r1, va1) = intact[0], intact[-1]
-        if r1 > r0 and (va1 - va0) == PLT_ENTRY * (r1 - r0):
-            base = va0 - PLT_ENTRY * r0
-            for reloc in range(r0, r1 + 1):
-                if reloc in seen_reloc or reloc not in sym_of:
-                    continue
-                va = base + PLT_ENTRY * reloc
-                if img.foff(va) is None:
-                    continue
-                out.append((va, reloc, sym_of.get(reloc), "whole-entry"))
+    # The span bound keeps this honest: extrapolating past the observed entries would invent slots
+    # for imports that may legitimately have none (one reached only by a direct `call *[rip+disp32]`),
+    # which is the over-report this function exists to avoid.
+    #
+    # (3) OTHER-REGION CANDIDATES. A slot that holds a candidate which merely lost the resolver vote
+    #     is a PLT entry belonging to a second region, not an overwritten one. Without this, a module
+    #     with two lazy PLTs reports the losing region's interleaved slots as patched.
+    other_vas = {va for va, _r, _res, _ok in cand} - set(seen_reloc.values())
+    if len(seen_reloc) >= 2:
+        r0, r1 = min(seen_reloc), max(seen_reloc)
+        for reloc in range(r0, r1 + 1):
+            if reloc in seen_reloc or reloc not in sym_of:
+                continue
+            va = base + PLT_ENTRY * reloc
+            if va in other_vas or img.foff(va) is None:
+                continue
+            out.append((va, reloc, sym_of.get(reloc), "whole-entry"))
     return sorted(set(out))
 
 
-def format_patched(img, names, label):
+def format_patched(img, names, label, sym_of=None):
     """Report lines for `patched_import_stubs`, or a single line saying the module is clean."""
-    rows = patched_import_stubs(img)
+    rows = patched_import_stubs(img, sym_of)
     if not rows:
         return ["%s: no import stub has been overwritten in place" % label]
     nid_of = {idx: nid for nid, idx in img.imported_nids()}
@@ -267,6 +291,11 @@ def main():
 
     names = G.load_nid_names(args.names) if args.names else {}
     wanted = [int(a, 0) for a in args.addr]
+    if args.patched and wanted:
+        # Refused rather than ignored. --addr asks "what is at this address"; --patched answers
+        # "which entries were overwritten", and silently dropping the filter would hand back a
+        # module-wide verdict to somebody who asked about three addresses.
+        ap.error("--addr does not apply to --patched: --patched reports the whole module")
 
     rc = 0
     mods = modules_under(args.module)
