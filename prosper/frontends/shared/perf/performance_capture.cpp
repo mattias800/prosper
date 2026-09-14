@@ -381,7 +381,13 @@ void InteractivePerformanceCapture::publish_completed(std::unique_ptr<PendingCap
                 out << "{\"queued\":" << q.queued << ",\"active_submits\":" << q.active_submits
                     << ",\"inflight_batches\":" << q.inflight_batches << ",\"front_item_age_ns\":" << q.front_item_age_ns
                     << ",\"release_delay_ns\":" << q.release_delay_ns
-                    << ",\"scope_begins\":" << q.scope_begins << ",\"scope_ends\":" << q.scope_ends << ",\"deadline_resets\":" << q.deadline_resets << '}';
+                    << ",\"scope_begins\":" << q.scope_begins << ",\"scope_ends\":" << q.scope_ends << ",\"deadline_resets\":" << q.deadline_resets
+                    << ",\"admission_waiters\":" << q.admission_waiters
+                    << ",\"admission_wait_count\":" << q.admission_wait_count
+                    << ",\"admission_wait_ns\":" << q.admission_wait_ns
+                    << ",\"admission_wait_max_ns\":" << q.admission_wait_max_ns
+                    << ",\"admission_retired_wait_count\":" << q.admission_retired_wait_count
+                    << ",\"admission_retired_wait_ns\":" << q.admission_retired_wait_ns << '}';
             } else out << "null";
             out << "}\n";
         };

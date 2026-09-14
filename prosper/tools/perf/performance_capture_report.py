@@ -178,6 +178,17 @@ def summarize_handoffs(records):
             if any(queue[k] < 0 for k in fields if k != "release_delay_ns") or (
                     queue["scope_begins"] - queue["scope_ends"] != queue["active_submits"]):
                 raise CaptureError("inconsistent pending queue snapshot")
+            admission_fields = ("admission_waiters", "admission_wait_count", "admission_wait_ns",
+                     "admission_wait_max_ns", "admission_retired_wait_count", "admission_retired_wait_ns")
+            if any(k in queue for k in admission_fields):
+                if any(type(queue.get(k)) is not int or queue[k] < 0 for k in admission_fields):
+                    raise CaptureError("invalid admission wait observation")
+                if (queue["admission_wait_max_ns"] > queue["admission_wait_ns"] or
+                        queue["admission_retired_wait_ns"] > queue["admission_wait_ns"] or
+                        queue["admission_retired_wait_count"] > queue["admission_wait_count"] or
+                        (queue["admission_wait_count"] == 0 and queue["admission_wait_ns"] != 0) or
+                        (queue["admission_retired_wait_count"] == 0 and queue["admission_retired_wait_ns"] != 0)):
+                    raise CaptureError("inconsistent admission wait observation")
         queue_samples.append({"t_ns":row["t_ns"], "pending_writes":queue})
     return {"scope":"observed GPU handoffs; CPU observations use a separate identity namespace",
         "pending_queue_samples":queue_samples,
@@ -188,7 +199,9 @@ def summarize_handoffs(records):
                   "Window boundaries and collector-close races can omit transitions even without overflow.",
                   "Unresolved chains are unknown, not proven dropped or still pending frames.",
                   "CPU producer publication is unobserved; cpu-fallback-needed is only a selection-stage observation.",
-                  "Waits can overlap and extend before the capture; do not add them as critical-path time."]}
+                  "Waits can overlap and extend before the capture; do not add them as critical-path time.",
+                  "Admission totals count completed CV waits across callers, including mutex reacquisition, drain and scheduling. Initial mutex acquisition and unfinished waits are excluded.",
+                  "Retired admission totals classify queue state at entry, not the cause of each nanosecond. Cumulative maxima cannot be differenced into interval maxima."]}
 
 
 def _gpu_present_adopted(post):

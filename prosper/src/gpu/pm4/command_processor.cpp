@@ -3018,6 +3018,12 @@ struct PendQueue {
     int  inflight = 0;    // items popped but whose write hasn't landed yet (see drain)
     int  active_submits = 0; // fence writes stay private until the import return checkpoint
     uint64_t scope_begins = 0, scope_ends = 0, deadline_resets = 0; // paired checkpoints, under mx
+    uint64_t admission_waiters = 0; // currently blocked submit callers
+    uint64_t admission_wait_count = 0;
+    uint64_t admission_wait_ns = 0;
+    uint64_t admission_wait_max_ns = 0;
+    uint64_t admission_retired_wait_count = 0;
+    uint64_t admission_retired_wait_ns = 0;
     std::chrono::steady_clock::time_point release_after{}; // modeled GPU latency after that checkpoint
 };
 PendQueue& pend_q() { static PendQueue* p = new PendQueue; return *p; }
@@ -3130,6 +3136,12 @@ std::optional<PendingWriteSnapshot> try_pending_write_snapshot() {
     result.scope_begins = p.scope_begins;
     result.scope_ends = p.scope_ends;
     result.deadline_resets = p.deadline_resets;
+    result.admission_waiters = p.admission_waiters;
+    result.admission_wait_count = p.admission_wait_count;
+    result.admission_wait_ns = p.admission_wait_ns;
+    result.admission_wait_max_ns = p.admission_wait_max_ns;
+    result.admission_retired_wait_count = p.admission_retired_wait_count;
+    result.admission_retired_wait_ns = p.admission_retired_wait_ns;
     return result;
 }
 
@@ -3155,10 +3167,26 @@ extern "C" void prosper_gpu_submit_scope_begin() {
     // retaining tens of thousands of completed labels and starving its own progress (#3674).
     // Nested or concurrent active scopes must still be able to proceed: waiting for their own
     // private completion queue here would deadlock. No active-submit write is exposed early.
-    p.cv.wait(lk, [&] {
+    const auto can_enter = [&] {
         return p.inflight == 0 &&
             (t_submit_scope_depth != 0 || p.active_submits != 0 || p.q.empty());
-    });
+    };
+    if (!can_enter()) {
+        const bool retired = t_submit_scope_depth == 0 && p.active_submits == 0 && !p.q.empty();
+        const auto start = std::chrono::steady_clock::now();
+        p.admission_waiters++;
+        p.cv.wait(lk, can_enter);
+        p.admission_waiters--;
+        const uint64_t ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - start).count());
+        p.admission_wait_count++;
+        p.admission_wait_ns += ns;
+        p.admission_wait_max_ns = std::max(p.admission_wait_max_ns, ns);
+        if (retired) {
+            p.admission_retired_wait_count++;
+            p.admission_retired_wait_ns += ns;
+        }
+    }
     t_submit_scope_depth++;
     p.active_submits++;
     p.scope_begins++;

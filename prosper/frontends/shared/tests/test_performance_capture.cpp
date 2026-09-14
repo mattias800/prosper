@@ -49,6 +49,12 @@ prosper::perf::ProcessSample sample(uint64_t at, uint64_t counter) {
         queue.scope_begins = 12;
         queue.scope_ends = 10;
         queue.deadline_resets = 3;
+        queue.admission_waiters = 1;
+        queue.admission_wait_count = 7;
+        queue.admission_wait_ns = 12345;
+        queue.admission_wait_max_ns = 8000;
+        queue.admission_retired_wait_count = 5;
+        queue.admission_retired_wait_ns = 10000;
         out.pending_writes = queue;
     }
     return out;
@@ -232,6 +238,9 @@ int main() {
           text.find("\"front_item_age_ns\":456,\"release_delay_ns\":-789") != std::string::npos &&
           text.find("\"scope_begins\":12,\"scope_ends\":10,\"deadline_resets\":3") != std::string::npos,
           "queue snapshot retains counters, front age and signed deadline");
+    check(text.find("\"admission_waiters\":1,\"admission_wait_count\":7,\"admission_wait_ns\":12345") != std::string::npos &&
+          text.find("\"admission_wait_max_ns\":8000,\"admission_retired_wait_count\":5,\"admission_retired_wait_ns\":10000") != std::string::npos,
+          "queue snapshot serializes completed admission waits and current waiters separately");
     check(text.find("\"pending_writes\":null") != std::string::npos,
           "unavailable queue observation is not an invented empty queue");
     check(count_text(text, "\"buffer_upload_bytes\":") == 2 &&

@@ -15,6 +15,14 @@ struct PendingWriteSnapshot {
     uint64_t scope_begins = 0;
     uint64_t scope_ends = 0;
     uint64_t deadline_resets = 0;
+    // Cumulative completed CV waits, summed across submit callers. Excludes initial mutex lock.
+    // Retired subset began at a zero-active boundary with queued writes; includes drain/scheduling.
+    uint64_t admission_waiters = 0; // currently blocked submit callers
+    uint64_t admission_wait_count = 0;
+    uint64_t admission_wait_ns = 0;
+    uint64_t admission_wait_max_ns = 0;
+    uint64_t admission_retired_wait_count = 0;
+    uint64_t admission_retired_wait_ns = 0;
 };
 
 // Empty means lock contention, never an empty queue. Does not drain or wait for any work.

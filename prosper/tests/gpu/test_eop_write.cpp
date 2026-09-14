@@ -391,6 +391,90 @@ int main() {
         prosper_gpu_drain_completion_writes();
     }
 
+    // Hold an actual worker effect outside p.mx so the next caller deterministically enters
+    // admission wait. No assertion depends on winning a race against the modeled grace timer.
+    {
+        uint64_t labels[2] = {};
+        std::promise<void> worker_entered, release_worker;
+        auto entered = worker_entered.get_future();
+        auto release = release_worker.get_future().share();
+        const auto observe_until = [](auto predicate) {
+            std::optional<PendingWriteSnapshot> state;
+            const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+            do {
+                state = try_pending_write_snapshot();
+                if (state && predicate(*state)) return state;
+                std::this_thread::yield();
+            } while (std::chrono::steady_clock::now() < until);
+            return std::optional<PendingWriteSnapshot>{};
+        };
+        prosper_gpu_drain_completion_writes();
+        const auto before = observe_until([](const auto&) { return true; });
+        set_guest_gpu_write_observer([&](uint64_t address, uint64_t, const char*) {
+            if (address == reinterpret_cast<uint64_t>(&labels[0])) {
+                worker_entered.set_value();
+                release.wait();
+            }
+        });
+        std::vector<uint32_t> stream;
+        for (unsigned i = 0; i < 2; ++i) {
+            const auto address = reinterpret_cast<uint64_t>(&labels[i]);
+            const uint32_t command[] = {PM4(7, IT_NOP, R_RELEASE_MEM),
+                static_cast<uint32_t>(address), static_cast<uint32_t>(address >> 32),
+                2, 0x61000000u + i, 0, 0x04};
+            stream.insert(stream.end(), std::begin(command), std::end(command));
+        }
+        GpuState state;
+        prosper_gpu_submit_scope_begin();
+        CHECK(run_command_buffer(stream.data(), stream.size(), state) == 2,
+              "observer fixture queues two real completion writes");
+        prosper_gpu_submit_scope_end();
+        const bool held = entered.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+        CHECK(held, "worker reached the held completion effect");
+        std::promise<bool> admitted;
+        auto result = admitted.get_future();
+        std::thread caller;
+        if (held) {
+            caller = std::thread([&] {
+                prosper_gpu_submit_scope_begin();
+                const bool ready = labels[0] == 0x61000000u && labels[1] == 0x61000001u;
+                prosper_gpu_submit_scope_end();
+                admitted.set_value(ready);
+            });
+            const auto waiting = observe_until([](const auto& q) { return q.admission_waiters == 1; });
+            CHECK(waiting && waiting->active_submits == 0 && waiting->inflight_batches == 1 &&
+                  waiting->queued == 1 && before && waiting->admission_wait_count == before->admission_wait_count,
+                  "live waiter is observable before completed counters advance");
+        }
+        release_worker.set_value(); // always release before cleanup, including timeout paths
+        if (caller.joinable()) {
+            if (result.wait_for(std::chrono::seconds(2)) != std::future_status::ready) {
+                std::fprintf(stderr, "admission observer fixture failed to unblock after worker release\n");
+                std::exit(2); // bounded failure; never destroy references retained by a stuck worker
+            }
+            CHECK(result.get(), "both held and queued labels land before the waiting caller admits");
+            caller.join();
+        }
+        prosper_gpu_drain_completion_writes();
+        set_guest_gpu_write_observer({});
+        const auto after = observe_until([](const auto&) { return true; });
+        CHECK(before && after && after->admission_waiters == 0 &&
+              after->admission_wait_count == before->admission_wait_count + 1 &&
+              after->admission_retired_wait_count == before->admission_retired_wait_count + 1 &&
+              after->admission_wait_ns > before->admission_wait_ns &&
+              after->admission_retired_wait_ns > before->admission_retired_wait_ns &&
+              after->admission_wait_ns - before->admission_wait_ns ==
+                  after->admission_retired_wait_ns - before->admission_retired_wait_ns &&
+              after->admission_wait_max_ns >= after->admission_wait_ns - before->admission_wait_ns,
+              "one completed real admission wait records its elapsed and retired-subset cost");
+        prosper_gpu_submit_scope_begin();
+        prosper_gpu_submit_scope_end();
+        const auto empty = observe_until([](const auto&) { return true; });
+        CHECK(after && empty && empty->admission_wait_count == after->admission_wait_count &&
+              empty->admission_wait_ns == after->admission_wait_ns,
+              "empty-queue admission does not invent a timed wait");
+    }
+
     // Renderer drains routinely encounter hundreds of resource uploads behind thousands of private
     // completion labels. Exercise the stable batched extraction: every unrelated write must land in
     // packet order while the overlapping label initialization/release pair remains hidden.

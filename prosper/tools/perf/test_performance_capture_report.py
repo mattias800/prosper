@@ -54,6 +54,24 @@ class PerformanceCaptureReportTests(unittest.TestCase):
             records[1]['pending_writes'] = bad
             with self.assertRaises(CaptureError): summarize_handoffs(records)
 
+    def test_admission_waits_are_optional_but_complete_and_consistent(self):
+        queue = dict(queued=2, active_submits=0, inflight_batches=1, front_item_age_ns=5,
+                     release_delay_ns=-2, scope_begins=10, scope_ends=10, deadline_resets=10,
+                     admission_waiters=1, admission_wait_count=3, admission_wait_ns=900,
+                     admission_wait_max_ns=500, admission_retired_wait_count=2,
+                     admission_retired_wait_ns=700)
+        records = capture([dict(SAMPLES[0], pending_writes=queue), SAMPLES[1]])
+        records[0].update(present_handoffs_enabled=True, post_window_ns=2_000_000_000)
+        records[-1].update(present_records=0, present_dropped=0)
+        self.assertEqual(summarize_handoffs(records)['pending_queue_samples'][0]['pending_writes'], queue)
+        partial = dict(queue); del partial['admission_wait_ns']
+        for bad in (partial, dict(queue, admission_waiters=True), dict(queue, admission_wait_ns=-1),
+                    dict(queue, admission_wait_max_ns=901), dict(queue, admission_retired_wait_count=4),
+                    dict(queue, admission_retired_wait_ns=901), dict(queue, admission_wait_count=0),
+                    dict(queue, admission_retired_wait_count=0)):
+            records[1]['pending_writes'] = bad
+            with self.assertRaises(CaptureError): summarize_handoffs(records)
+
     def test_handoffs_keep_boundaries_and_cpu_namespace_separate(self):
         records = capture(SAMPLES)
         records[0].update(present_handoffs_enabled=True, post_window_ns=1000)

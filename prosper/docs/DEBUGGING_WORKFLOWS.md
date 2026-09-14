@@ -166,6 +166,15 @@ drain interval existed between them. Queue fields are sampled after the process 
 adding that earlier timestamp to the relative deadline does not recover its exact absolute time.
 Collection does not wait for the queue, walk it or drain it.
 
+Admission observations separate current `admission_waiters` from completed `admission_wait_count`,
+`admission_wait_ns` and the lifetime `admission_wait_max_ns`. `admission_retired_wait_count/ns`
+are the subset entering with a nonempty queue at a zero-active boundary. Only callers whose
+admission predicate blocks read the two clocks, including when handoff recording is off. Totals
+include CV sleep, mutex reacquisition, draining and scheduling; they exclude initial mutex
+acquisition and still-running waits. They are summed across callers, not critical-path time or
+isolated modeled latency. Difference cumulative totals over a window, but never difference maxima
+into an interval maximum. Older captures omit these fields rather than reporting zero.
+
 The report refuses unavailable/overflowed traces and conflicting outcomes. Missing boundary
 transitions remain unknown: zero overflow does not exclude a collector-close race. CPU producer
 publication and completed image-producer lineage remain unobserved. Waits may overlap and extend
