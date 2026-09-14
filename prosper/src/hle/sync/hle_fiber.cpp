@@ -243,6 +243,20 @@ void repair_suspend_fs_slot(FiberRecord* fiber) {
     // writing 0 would make the stub epilogue `wrfsbase 0` and strand the guest with no TLS at all.
     // That thread still runs on the foreign TCB -- declining is the lesser harm, not a repair. Not
     // reachable from guest code today, since sceFiberRun arrives on threads that have activated.
+    //
+    // HOW THIS FAILS IF IT EVER DOES FAIL, which is the part not to rediscover the hard way.
+    // guest_tls_own_tp() is a thread_local, so it follows %fs -- measured, in every TLS model. It is
+    // therefore correct only while this thread is on its OWN host TCB, and that holds by INDUCTION:
+    // a worker's first resume necessarily happens before any foreign TCB can be installed on it, and
+    // each repair keeps it that way. That is the repair's own coverage claim restated, not an
+    // independent guarantee, so if a path outside the BOUND above ever corrupts a thread, the
+    // induction is already broken -- and the failure is SILENT in the worst way: that thread reads
+    // the FOREIGN t_guest_tp, `*p == own_tp` matches, and the repair declines on exactly the thread
+    // that needed it. A corrupted worker shows ZERO repairs, indistinguishable from a healthy one.
+    // Worse, its own_tp is then non-zero-and-foreign, so it starts writing that foreign TP into
+    // THIRD threads' frames. If this is ever suspected, the cheap detector is to record the
+    // suspending thread_key() beside suspend_fs_slot and shout when a resume arrives on a different
+    // tid whose slot ALREADY equals own_tp -- unreachable in a healthy run, exact signature of this.
     const uint64_t own = guest_tls_own_tp();
     if (!callback_repair_guest_fs_slot(slot, own)) return;
     if (fiber_log())
@@ -504,7 +518,7 @@ uint64_t fiber_return_to_thread_impl(uint64_t return_arg, uint64_t* next_run_arg
 #ifdef _WIN32
 // Windows registers these handlers directly rather than through PROSPER_ASM_TRAMPOLINE, so there is
 // no entry-%rsp to forward -- and the MS/SysV integer bridge fills the 4th parameter unconditionally
-// (`mov r9,rcx ; MS 4th = a3`, sysv_ms_bridge.cpp:129), which at a three-argument sceFiber* call is
+// (`mov r9,rcx ; MS 4th = a3`, sysv_ms_bridge.cpp:123), which at a three-argument sceFiber* call is
 // caller-saved guest SCRATCH. Passing it on as `entry_rsp` would hand a garbage value to a function
 // that dereferences it. These wrappers pass an explicit 0 instead; Windows stubs stash no guest %fs
 // on the guest stack, so there is nothing to locate or repair there anyway.
