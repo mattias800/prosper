@@ -1498,6 +1498,10 @@ if(TARGET prosper_core)
   target_link_libraries(test_mutex_host_tcb_identity PRIVATE prosper_core)
   add_test(NAME mutex_host_tcb_identity COMMAND test_mutex_host_tcb_identity)
 
+  add_executable(test_fiber_guest_tp_stash tests/hle/sync/test_fiber_guest_tp_stash.cpp)
+  target_link_libraries(test_fiber_guest_tp_stash PRIVATE prosper_core)
+  add_test(NAME fiber_guest_tp_stash COMMAND test_fiber_guest_tp_stash)
+
   add_executable(test_cond_slot_identity tests/hle/sync/test_cond_slot_identity.cpp)
   target_link_libraries(test_cond_slot_identity PRIVATE prosper_core)
   add_test(NAME cond_slot_identity COMMAND test_cond_slot_identity)

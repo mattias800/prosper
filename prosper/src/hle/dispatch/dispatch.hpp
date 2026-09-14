@@ -384,6 +384,9 @@ bool hle_kernel_statics_destroyed();
 void guest_tls_set_templates(const TlsModuleDesc* descs, size_t count);
 bool guest_tls_enabled();
 uint64_t guest_tls_activate_thread();   // per guest thread at entry; returns guest TP (0 if disabled)
+// This host thread's OWN guest TP (0 if it never activated one). Unlike guest_tls_tp(), which reports
+// whatever %fs currently holds, this is unaffected by a foreign TCB installed on the thread (#3615).
+uint64_t guest_tls_own_tp();
 // macOS trap mode only: the calling thread's guest thread-pointer, or 0. The SIGSEGV handler uses it
 // to relocate a faulting guest `%fs:`-relative access to guest_TP + offset (Rosetta can't set fs base).
 uint64_t guest_tls_tp();
