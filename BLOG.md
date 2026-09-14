@@ -19,6 +19,20 @@ from the tracker issues, and still gated, because it is a projection of state ra
 > title's current state — for that, read the tracker. Nothing is ever removed when a title moves on,
 > because the point of a blog is that it records *when* things happened.
 
+## 2026-09-14
+
+### Uncharted's job threads were reading another thread's TLS
+
+No picture for this one — *Uncharted: Legacy of Thieves* still renders nothing. But it now survives
+its own boot instead of dying a second in, and mounts its real content archives, so the finding is
+worth writing down. Its Naughty Dog job system starts fibers on the main thread and lets worker
+threads pick them up, and prosper's import stubs stash the calling thread's guest thread pointer on
+the guest stack. Those assumptions are incompatible: the worker returns out of a stub frame the main
+thread pushed, installs the main thread's TLS, and from then on every thread-local the guest reads is
+somebody else's. The job system asked "which worker am I?", got -1, indexed its per-worker array 128
+bytes backwards, and dereferenced the padding it had poisoned itself. Details in
+[#3615](https://github.com/mattias800/prosper/issues/3615).
+
 ## 2026-09-13
 
 ### Cheaper preparation, more GPU comparisons
