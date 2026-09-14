@@ -707,6 +707,7 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
     rs.vcc = b.bfalse();
     rs.scc = b.bfalse();
     rs.exec = b.btrue();
+    seed_smem_pointer_provenance(rs, ins);   // SRT pointer-load provenance (#3616)
     // Inline descriptors are represented by the resource table, not scalar SSA values. Leaving
     // their SGPR range absent also preserves the existing direct-provenance rule: a format MUBUF may
     // fall back to by_sgpr_base only while its SRSRC has not been overwritten by shader code.

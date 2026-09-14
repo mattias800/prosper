@@ -3316,7 +3316,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     // The decoder admits only GTA V's full-mask, BC1, FI0 MIN/MAX packets here.
                     // Direct subgroup shuffle is valid only when one native subgroup is exactly one
                     // guest wave; portable/default-subgroup compute uses CFG scratch below.
-                    if (!b.is_compute || dpp_row_ror8_op(in) == DppRowRor8Op::None ||
+                    if (!b.is_compute || !dpp_row_xor_source_transform_ok(in) ||
                         !b.native_subgroup_size) {
                         ok = false; return true;
                     }

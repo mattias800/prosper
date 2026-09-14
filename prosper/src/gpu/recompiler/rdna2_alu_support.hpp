@@ -395,6 +395,36 @@ inline DppRowRor8Op dpp_row_ror8_op(const Rdna2Inst& in) {
     return DppRowRor8Op::None;
 }
 
+// May the DPP16 row-XOR family be lowered as a pure SOURCE transform for this instruction?
+//
+// This is the same argument the ROW_SHR fragment path already makes in rdna2_emit_alu.cpp, applied
+// to the row-XOR family: DPP16 rewrites SRC0 and nothing else, so both halves of the lowering (the
+// shuffle, and bound_ctrl's zero for an invalid source) are opcode-INDEPENDENT. Every VOP2 whose
+// only architectural result is VDST therefore lowers identically, and a per-opcode allow-list
+// silently drops every shader using any other one.
+//
+// `dpp_row_ror8_op` above stays exactly as it was: the CFG dispatcher needs to NAME the reduction
+// it re-implements, and only MIN/MAX/MOV are named. This predicate is for the ordinary emitter,
+// which needs no name because it does not re-implement anything -- it permutes SRC0 and then emits
+// the instruction it already emits.
+//
+// Fail-closed where the shape really differs: the carry trio (v_add_co_ci_u32, v_sub_co_ci_u32,
+// v_subrev_co_ci_u32) writes VCC as well as VDST, and a bound_ctrl-disabled lane would have to
+// preserve its old VCC bit too, which the epilogue does not restore.
+//
+// Uncharted: Legacy of Thieves (#3616) is the title that needed it: two programs of its
+// full-resolution compute chain are refused for `v_add_f32_dpp row_xmask:4` and `v_or_b32_dpp
+// row_ror:8` -- the same permutation the admitted MIN/MAX packets use, with a different combiner.
+inline bool dpp_row_xor_source_transform_ok(const Rdna2Inst& in) {
+    if (!in.has_dpp || !in.dpp_bound_ctrl || !dpp_row_xor_ctrl(in.dpp_ctrl) ||
+        in.dpp_row_mask != 0xfu || in.dpp_bank_mask != 0xfu ||
+        in.dst.kind != OperandKind::VGPR || in.src[0].kind != OperandKind::VGPR)
+        return false;
+    if (in.fmt == Rdna2Format::VOP1) return in.opcode == 0x01;          // v_mov_b32
+    if (in.fmt != Rdna2Format::VOP2 || in.src[1].kind != OperandKind::VGPR) return false;
+    return in.opcode != 0x28u && in.opcode != 0x29u && in.opcode != 0x2au;
+}
+
 // Exact identity-QUAD_PERM tail of the same reduction. No value crosses lanes; ROW_MASK selects
 // architectural DPP16 rows 1 and 3, while the other rows preserve VDST.
 inline bool is_vadd_nc_u32_dpp_partial_row(const Rdna2Inst& in) {

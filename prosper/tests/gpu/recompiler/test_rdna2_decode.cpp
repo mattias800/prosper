@@ -521,14 +521,35 @@ int main() {
     CHECK(gx0.fmt == Rdna2Format::VOP2 && gx0.opcode == 0x0fu && gx0.has_dpp &&
           gx0.dpp_ctrl == 0x160u && gx0.dpp_bound_ctrl,
           "ROW_XMASK:0 is admitted as the identity member of the lane-XOR family");
-    // The contract is unchanged for everything else: one control OUTSIDE the family, and one inside
-    // it carrying an opcode the family does not admit, both stay undecoded as DPP.
+    // A control OUTSIDE the family stays undecoded as DPP. That half of the contract is unchanged.
     const uint32_t vmin_row_xmask_out[] = { 0x1e0202fau, 0xff097001u };   // ctrl 0x170
     CHECK(!rdna2_decode_one(vmin_row_xmask_out, 2).has_dpp,
           "a control past ROW_XMASK:15 is not admitted");
+    // The OPCODE half is not. This assertion used to read "ROW_XMASK with an opcode outside
+    // MOV/MIN/MAX is not admitted", with V_ADD_F32 as its negative case -- and V_ADD_F32
+    // ROW_XMASK:4 is exactly what Uncharted: Legacy of Thieves issues (#3616). DPP16 rewrites SRC0
+    // and nothing else, so an opcode cannot make an encoding stop being a DPP encoding; deciding it
+    // here made the decoder answer a question that belongs to the emitter, and the shader was then
+    // refused with `dpp=0` and SRC0 left as the raw special operand 250 -- a reject naming the DPP
+    // marker as an unknown operand instead of naming the control.
     const uint32_t vadd_row_xmask4[] = { 0x060202fau, 0xff096401u };      // VOP2 opcode 0x03
-    CHECK(!rdna2_decode_one(vadd_row_xmask4, 2).has_dpp,
-          "ROW_XMASK with an opcode outside MOV/MIN/MAX is not admitted");
+    Rdna2Inst vadd_xm = rdna2_decode_one(vadd_row_xmask4, 2);
+    CHECK(vadd_xm.fmt == Rdna2Format::VOP2 && vadd_xm.opcode == 0x03u &&
+          !vadd_xm.has_modifier && vadd_xm.has_dpp && vadd_xm.dpp_ctrl == 0x164u &&
+          vadd_xm.dpp_bound_ctrl && vadd_xm.dpp_row_mask == 0xfu &&
+          vadd_xm.dpp_bank_mask == 0xfu,
+          "V_ADD_F32 ROW_XMASK:4 decodes as DPP -- the family is not an opcode allow-list");
+    const uint32_t vor_row_ror8[] = { 0x380202fau, 0xff092801u };         // VOP2 opcode 0x1c
+    Rdna2Inst vor_rr = rdna2_decode_one(vor_row_ror8, 2);
+    CHECK(vor_rr.fmt == Rdna2Format::VOP2 && vor_rr.opcode == 0x1cu &&
+          vor_rr.has_dpp && vor_rr.dpp_ctrl == 0x128u && vor_rr.dpp_bound_ctrl,
+          "V_OR_B32 ROW_ROR:8 decodes as DPP (the other shape this title issues)");
+    // What must STAY fail-closed, and this is the assertion that keeps the widening honest: the
+    // carry trio writes VCC as well as VDST, and a BOUND_CTRL-disabled lane would have to preserve
+    // its old VCC bit, which the row-XOR lowering does not restore.
+    const uint32_t vaddco_row_xmask4[] = { 0x502002fau, 0xff096401u };    // VOP2 opcode 0x28
+    CHECK(!rdna2_decode_one(vaddco_row_xmask4, 2).has_dpp,
+          "the carry-writing VOP2 trio is still refused by the row-XOR family");
     const uint32_t gta_vmax_row_ror8[] = { 0x200406fau, 0xff092803u };
     Rdna2Inst gvx = rdna2_decode_one(gta_vmax_row_ror8, 2);
     CHECK(gvx.fmt == Rdna2Format::VOP2 && gvx.opcode == 0x10u &&
@@ -546,7 +567,7 @@ int main() {
           isV(gvm.src[0], 17) && gvm.n_src == 1u,
           "GTA V exact V_MOV_B32 ROW_ROR:8 packet decodes its sole permuted source");
     const std::pair<uint32_t, uint32_t> gta_vmin_row_ror8_mutants[] = {
-        {0x1c2024fau, 0xff092812u}, // different VOP2 opcode
+        {0x502024fau, 0xff092812u}, // V_ADD_CO_CI_U32: writes VCC as well as VDST
         {0x1e2024fau, 0xff012812u}, // BOUND_CTRL=0
         {0x1e2024fau, 0xff092912u}, // ROW_ROR:9
         {0x1e2024fau, 0xef092812u}, // partial ROW_MASK
@@ -569,7 +590,7 @@ int main() {
         {0x7e2402fau, 0xff092911u}, // V_MOV_B32 ROW_ROR:9
         {0x7e2402fau, 0xfe092811u}, // V_MOV_B32 partial BANK_MASK
         {0x7e2402fau, 0xff192811u}, // V_MOV_B32 SRC0_NEG
-        {0x060406fau, 0xff092803u}, // V_ADD_F32 is outside the admitted live family
+        {0x500406fau, 0xff092803u}, // V_ADD_CO_CI_U32: a second architectural result
     };
     for (const auto& mutant : gta_new_row_ror8_mutants) {
         const uint32_t words[] = {mutant.first, mutant.second};
