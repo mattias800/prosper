@@ -162,7 +162,8 @@ shader overrides are excluded. No additional guest-data cache is created. A `cac
 timing row identifies an actual skipped submission; its GPU comparison is `not-recorded`.
 
 Known fills use an explicit clear origin for unchanged GPU writeback and cached reuse, including
-when reuse is disabled. Guest-byte
+when reuse is disabled. A partial fill clears only its written prefix; its untouched tail retains
+the ordinary unchanged-output notification. Guest-byte
 watches/journal remain valid, while renderer aliases still receive the semantic clear. Generic
 refresh operations retain their existing preservation classification. The production fixture also
 checks complete-pattern reuse, intervening writers, alias mutations, failed publication, partial

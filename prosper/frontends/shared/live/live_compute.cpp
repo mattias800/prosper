@@ -6825,10 +6825,16 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
 
     const auto notify_unchanged_buffer = [&](const BoundBuffer& buffer) {
         const char* previous = guest_gpu_write_origin();
-        if (known_fill && known_fill->matches(buffer))
+        const bool clear = known_fill && known_fill->matches(buffer);
+        const auto* destination = resource_bytes_for(buffer.resource, buffer.guest_bytes);
+        // A partial fill proves a clear only for its written prefix. Keep the ordinary
+        // unchanged-output notification for the full binding without clearing tail aliases.
+        if (clear && known_fill->written_bytes < buffer.resource->size)
+            notify_output_write(buffer.resource->gpu_addr, destination, buffer.resource->size, true);
+        if (clear)
             set_guest_gpu_write_origin("compute-writeback(known-fill)");
-        notify_output_write(buffer.resource->gpu_addr,
-            resource_bytes_for(buffer.resource, buffer.guest_bytes), buffer.resource->size, true);
+        notify_output_write(buffer.resource->gpu_addr, destination,
+            clear ? known_fill->written_bytes : buffer.resource->size, true);
         set_guest_gpu_write_origin(previous);
     };
 

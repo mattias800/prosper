@@ -66,7 +66,10 @@ ComputeItem fill(uint32_t* target, uint32_t records, std::array<uint32_t, 4> pat
           "fixture compiles and matches the exact production fill classifier");
     return item;
 }
-void depth_clear(uint32_t* guest, uint32_t extent = bytes, bool cached_fill = false) {
+enum class ClearCoverage { Full, PartialPrefix, UntouchedTail };
+void depth_clear(uint32_t* guest, uint32_t extent = bytes, bool cached_fill = false,
+                 ClearCoverage coverage = ClearCoverage::Full) {
+    const bool untouched_tail = coverage == ClearCoverage::UntouchedTail;
     // Guest metadata is already zero, while the renderer owns nonzero depth.
     // A byte-preserving shortcut would incorrectly keep rejecting this consumer.
     #include "../tools/boot_trace/refvs.inc"
@@ -85,7 +88,7 @@ void depth_clear(uint32_t* guest, uint32_t extent = bytes, bool cached_fill = fa
     writer.depth_test_enable = writer.depth_write_enable = true;
     writer.depth_compare_op = 7; writer.has_depth_clear = true; writer.depth_clear_value = 0;
     writer.depth_read_base = writer.depth_write_base = 0x3407d00000ull;
-    writer.htile_data_base = reinterpret_cast<uint64_t>(guest);
+    writer.htile_data_base = reinterpret_cast<uint64_t>(guest) + (untouched_tail ? extent / 2 : 0);
     ResolvedPipelineState reader = writer;
     reader.depth_write_enable = false; reader.depth_compare_op = 6;
     prosper::test::BackendDraw w, r;
@@ -100,8 +103,10 @@ void depth_clear(uint32_t* guest, uint32_t extent = bytes, bool cached_fill = fa
     check(produced.size() == 64 * 64 * 4 && !green_visible(),
           "rendered depth rejects a farther consumer before the clear");
     unsigned ordinary = 0, preserving = 0;
+    uint64_t clear_address = 0, clear_bytes = 0;
     set_guest_gpu_write_observer([&](uint64_t address, uint64_t size, const char* origin) {
-        if (std::strcmp(origin, "gpu-preserving") == 0) ++preserving; else ++ordinary;
+        if (std::strcmp(origin, "gpu-preserving") == 0) ++preserving;
+        else { ++ordinary; clear_address = address; clear_bytes = size; }
         const auto* previous = guest_gpu_write_origin();
         set_guest_gpu_write_origin(origin);
         prosper::test::invalidate_persistent_ds_guest_write(address, size);
@@ -116,7 +121,8 @@ void depth_clear(uint32_t* guest, uint32_t extent = bytes, bool cached_fill = fa
     const auto reused = prosper::frontend::live_compute_cached_fill_dispatches();
     const auto compared = prosper::frontend::live_compute_buffer_gpu_result_skips();
     const auto submitted = prosper::frontend::live_compute_queue_submit_attempts();
-    check(prosper::frontend::execute_live_compute_items({fill(guest, extent / 16, {0, 0, 0, 0}, extent)}) &&
+    const auto records = coverage == ClearCoverage::Full ? extent / 16 : 65u;
+    check(prosper::frontend::execute_live_compute_items({fill(guest, records, {0, 0, 0, 0}, extent)}) &&
               prosper::frontend::live_compute_cpu_fill_dispatches() == cpu,
           "equal-value metadata clear executes through the selected path");
     check(prosper::frontend::live_compute_cached_fill_dispatches() == reused + cached_fill,
@@ -126,7 +132,14 @@ void depth_clear(uint32_t* guest, uint32_t extent = bytes, bool cached_fill = fa
           "GPU comparator and cached/host comparison depth cases are distinguished");
     check(prosper::frontend::live_compute_queue_submit_attempts() ==
               submitted + (!cached_fill), "depth clear has expected submission count");
-    check(ordinary == 1 && green_visible(), "logical zero-to-zero clear invalidates rendered depth");
+    check(ordinary == 1 && clear_address == reinterpret_cast<uint64_t>(guest) &&
+              clear_bytes == records * 16,
+          "known fill forwards exactly its written range as an architectural clear");
+    check(preserving == (coverage == ClearCoverage::Full ? 1u : 2u),
+          "partial clear retains the ordinary full-binding unchanged notification");
+    check(green_visible() == !untouched_tail,
+          untouched_tail ? "partial clear preserves rendered depth in the untouched buffer tail"
+                         : "logical zero-to-zero clear invalidates rendered depth");
     set_guest_gpu_write_observer({});
 }
 void cached_fills(uint32_t* guest, uint32_t* alias, uint32_t extent) {
@@ -217,6 +230,8 @@ void cached_fills(uint32_t* guest, uint32_t* alias, uint32_t extent) {
     run(zero, false); // Equal GPU primary/baseline, with no uniform-fill proof.
     depth_clear(guest, extent, false); // GPU comparator reports unchanged.
     depth_clear(guest, extent, true);  // Existing complete pattern bypasses submission.
+    depth_clear(guest, extent, false, ClearCoverage::UntouchedTail);
+    depth_clear(guest, extent, false, ClearCoverage::PartialPrefix);
     depth_clear(guest);               // Small uncached result uses host memcmp.
 
     const std::array<uint32_t, 4> fp{0x7fc01234u, 0x80000000u, 0x7f800000u, 0xff800000u};
