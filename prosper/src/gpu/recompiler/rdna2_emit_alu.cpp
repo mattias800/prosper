@@ -5336,8 +5336,13 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         // computed, so there is no static tag to attach and constant folding is
                         // not the route to these descriptors.
                         uint32_t lit = 0;
-                        fprintf(stderr, "[smem-untagged]   soffset is a builder constant: %s\n",
-                                (tracked && b.uconst_literal(val, &lit)) ? "YES" : "no");
+                        auto srt_it = rs.sreg_srt.find(in.src[1].value);
+                        fprintf(stderr,
+                                "[smem-untagged]   soffset: builder-constant=%s srt_tag=%s\n",
+                                (tracked && b.uconst_literal(val, &lit)) ? "YES" : "no",
+                                srt_it == rs.sreg_srt.end()
+                                    ? "none"
+                                    : ("0x" + std::to_string(srt_it->second)).c_str());
                     }
                     for (uint32_t k = 0; k < n; k++) rs.sreg[in.dst.value + (int)k] = b.uconst(0);
                     return true;
