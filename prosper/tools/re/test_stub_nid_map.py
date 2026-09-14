@@ -22,6 +22,20 @@ import stub_nid_map as S                                             # noqa: E40
 fails = 0
 
 
+def check_call(name, fn, want):
+    """`check` over a callable, reporting a raise as a failed arm rather than aborting the suite.
+
+    A mutation that removes an empty-population guard makes the function raise, and an uncaught
+    exception kills every arm after it -- so the sweep reports "0 red" for the guard AND loses the
+    arms it would have reddened. That reads as two separate absences of coverage.
+    """
+    try:
+        got = fn()
+    except Exception as exc:                                         # noqa: BLE001 — that IS the arm
+        got = "raised %s: %s" % (type(exc).__name__, exc)
+    check(name, got, want)
+
+
 def check(name, got, want):
     global fails
     if got != want:
@@ -106,6 +120,198 @@ def main():
     check("unknown-nid-still-listed",
           S.format_rows(rows, [0x1004], "eboot.bin", {}),
           ["0x1004\tfMP5NHUOaMk\t?\t?"])
+
+    # --- patched_import_stubs(): imports overwritten in place -------------------------------------
+    # The detector tells a reader their dump has been modified, so a false positive is expensive and
+    # a false negative wastes the hour it exists to save. Both directions get arms.
+    import struct as _st
+
+    BASE = 0x10000
+    RESOLVER = BASE + 0x400
+
+    ELSEWHERE = BASE + 0x600
+
+    def entry(k, reloc, head=b"\xff\x25\x00\x00\x00\x00", target=None):
+        """One 16-byte PLT entry at blob index k: head, `push reloc`, `jmp target` (default PLT0)."""
+        rel = (RESOLVER if target is None else target) - (BASE + k * 16 + 16)
+        return head[:6].ljust(6, b"\x90") + b"\x68" + _st.pack("<I", reloc) + \
+            b"\xe9" + _st.pack("<i", rel)
+
+    JUNK6 = b"\x83\xfe\x45\x77\x06\x90"          # a hand-written stub's first 6 bytes
+    WHOLE = b"\x31\xc0\xc3" + b"\x90" * 13          # xor eax,eax; ret; padding -- no tail at all
+
+    class FakePlt(G.Image):
+        def __init__(self, blob):
+            self.base, self.raw = BASE, blob
+            self.segs = [(BASE, 0, len(blob), 1)]      # (va, foff, filesz, PF_X)
+            self.tags = {}                             # no JMPREL: format_patched must still work
+
+        def foff(self, va):
+            off = va - self.base
+            return off if 0 <= off < len(self.raw) else None
+
+        def imported_nids(self):
+            return [("AAAAAAAAAAA", 10), ("BBBBBBBBBBB", 11), ("CCCCCCCCCCC", 12),
+                    ("DDDDDDDDDDD", 13)]
+
+    syms = {0: 10, 1: 11, 2: 12, 3: 13}
+
+    # CONTROL, and it comes first: a module whose entries are all intact must report NOTHING. An
+    # arm that only ever checks for detections passes just as well on a detector that fires always.
+    clean = FakePlt(entry(0, 0) + entry(1, 1) + entry(2, 2) + entry(3, 3))
+    check("clean-plt-reports-no-patching", S.patched_import_stubs(clean, syms), [])
+
+    # A patched head with the lazy-binding tail left behind: the `tail` signal.
+    tailed = FakePlt(entry(0, 0) + entry(1, 1, JUNK6) + entry(2, 2) + entry(3, 3))
+    check("tail-left-behind-is-detected",
+          S.patched_import_stubs(tailed, syms), [(BASE + 16, 1, 11, "tail")])
+
+    # A patched entry with the tail ALSO gone leaves no `push` to find, so only the geometry can
+    # reach it -- and on the dump this was written for, that was the entry that broke the title
+    # while five noisier ones were caught. Mutation killed: dropping the geometry pass.
+    gone = FakePlt(entry(0, 0) + WHOLE + entry(2, 2) + entry(3, 3))
+    check("whole-entry-overwritten-is-detected",
+          S.patched_import_stubs(gone, syms), [(BASE + 16, 1, 11, "whole-entry")])
+
+    # ...and the geometry must not INVENT slots outside the span it actually observed, which is the
+    # over-report the docstring promises not to make: an import may legitimately have no PLT entry.
+    # Relocs 0 and 1 are intact and nothing else is, so nothing may be reported.
+    #
+    # The padding is load-bearing and was added after a mutation test: with the blob ending right
+    # after the two entries, widening the loop bound reddened NOTHING, because every extrapolated
+    # address fell outside the segment and was dropped by the `foff is None` guard instead. The arm
+    # was passing for a reason that had nothing to do with the span bound it names. The padding puts
+    # the invented slots inside the segment, so only the bound can refuse them.
+    short = FakePlt(entry(0, 0) + entry(1, 1) + b"\x90" * 64)
+    check("geometry-does-not-extrapolate-past-observed-entries",
+          S.patched_import_stubs(short, syms), [])
+
+    # A `push imm32; jmp rel32` that jumps somewhere OTHER than the module's resolver is not a PLT
+    # entry. Mutation killed: accepting every tail instead of taking the majority vote.
+    #
+    # The stray sits ON the grid, at the slot where entry 4 belongs and with reloc 4, so the grid
+    # guard cannot refuse it and only the resolver can. An earlier version put it off-grid, and the
+    # grid guard therefore shadowed this arm completely -- the vote could be deleted with all 21 arms
+    # still green. That is the third arm in this file to have passed for a reason other than the one
+    # it names; the shape to watch for is a fixture that trips an EARLIER guard than the one under
+    # test.
+    # syms5 (not syms) is load-bearing: with reloc 4 absent from the symbol table the TAIL SYMBOL
+    # GUARD drops the stray first and the vote is never consulted -- which is how this arm failed to
+    # discriminate on its first rewrite too.
+    syms5 = {**syms, 4: 14}
+    on_grid_stray = FakePlt(entry(0, 0) + entry(1, 1) + entry(2, 2) + entry(3, 3) +
+                            entry(4, 4, JUNK6, ELSEWHERE))
+    check("on-grid-stray-jumping-elsewhere-is-not-a-plt-entry",
+          S.patched_import_stubs(on_grid_stray, syms5), [])
+
+    # ...and the twin that proves the arm above discriminates on the RESOLVER and nothing else: the
+    # same slot, same reloc, same patched head, tail jumping to the real PLT0 -- which IS reportable.
+    # Without this an arm expecting [] could pass because the slot is unreportable for some unrelated
+    # reason.
+    on_grid_real = FakePlt(entry(0, 0) + entry(1, 1) + entry(2, 2) + entry(3, 3) +
+                           entry(4, 4, JUNK6))
+    check("...and the same slot WITH the module's own resolver is reported",
+          S.patched_import_stubs(on_grid_real, syms5),
+          [(BASE + 64, 4, 14, "tail")])
+
+    # A reloc index the JMPREL table does not know is not reported by the geometry pass -- it would
+    # be a row naming no import, which is worse than silence.
+    check("geometry-skips-relocs-with-no-symbol",
+          S.patched_import_stubs(gone, {0: 10, 2: 12, 3: 13}), [])
+
+    # A patched entry whose reloc the JMPREL table does not know must not be emitted as a row naming
+    # no import -- it renders as `reloc=4  -  ?  ?`, an accusation about an import that does not
+    # exist. The entry has to sit ON the grid, or the grid guard suppresses it first and this arm
+    # tests that guard instead (it did, until a mutation sweep showed the symbol guard could be
+    # deleted with nothing going red).
+    unknown_reloc = FakePlt(entry(0, 0) + entry(1, 1) + entry(2, 2) + entry(3, 3) +
+                            entry(4, 4, JUNK6))
+    check("tail-row-naming-no-import-is-not-emitted",
+          S.patched_import_stubs(unknown_reloc, syms), [])
+
+    # An off-grid candidate whose reloc IS a real index must be refused rather than reported at the
+    # address it happens to sit at. This is the grid guard's actual job: the entries are a fixed
+    # stride apart, so anything not on that stride is not one of them, however well-formed it looks.
+    # Built three bytes off the stride, with reloc 2 -- a reloc the table knows, and one whose real
+    # entry is intact and elsewhere, so a fabricated row here would contradict a row we can see.
+    off_grid = entry(0, 0) + entry(1, 1) + entry(2, 2) + entry(3, 3) + b"\x90" * 3 + \
+        JUNK6 + b"\x68" + _st.pack("<I", 2) + b"\xe9" + \
+        _st.pack("<i", RESOLVER - (BASE + 4 * 16 + 3 + 16))
+    check("off-grid-candidate-is-not-reported",
+          S.patched_import_stubs(FakePlt(off_grid), syms), [])
+
+    # CALIBRATION. A PLT whose entries have a shape this code does not know -- here an `endbr64`
+    # prologue that shifts the `push` off byte 6 -- contains no intact entry to compare against, so
+    # every entry looks patched. Reporting it would be the loudest possible false accusation, so the
+    # answer must be silence. Mutation killed: dropping the "at least one intact entry" guard.
+    ENDBR = b"\xf3\x0f\x1e\xfa"
+
+    def cet_entry(k, reloc):
+        rel = RESOLVER - (BASE + k * 16 + 16)
+        return ENDBR + b"\x68" + _st.pack("<I", reloc) + b"\xe9" + _st.pack("<i", rel) + b"\x90\x90"
+
+    cet = FakePlt(b"".join(cet_entry(k, k) for k in range(4)))
+    check("unrecognised-plt-shape-is-silence-not-an-accusation",
+          S.patched_import_stubs(cet, syms), [])
+
+    # TWO PLT REGIONS with different resolvers. The losing region's entries are real PLT entries, not
+    # overwritten slots, so the geometry must not report the gaps they occupy. Mutation killed:
+    # omitting the other-region check.
+    OTHER = BASE + 0x800
+
+    def other_entry(k, reloc):
+        rel = OTHER - (BASE + k * 16 + 16)
+        return b"\xff\x25\x00\x00\x00\x00" + b"\x68" + _st.pack("<I", reloc) + \
+            b"\xe9" + _st.pack("<i", rel)
+
+    two_plt = FakePlt(entry(0, 0) + other_entry(1, 1) + entry(2, 2) + other_entry(3, 3))
+    check("second-plt-region-is-not-reported-as-overwritten",
+          S.patched_import_stubs(two_plt, syms), [])
+
+    # A module with no lazy PLT at all (`-z now`: no `push; jmp` tails anywhere) yields no candidates
+    # and must report nothing rather than taking a mode over an empty population. 22 modules in the
+    # local corpus are built this way -- they bind real imports without a lazy PLT -- so this is not
+    # the hypothetical it was first written as.
+    now_bound = FakePlt(b"\xff\x25\x00\x00\x00\x00" * 8)
+    check_call("non-lazy-module-with-no-plt-tails-reports-nothing",
+               lambda: S.patched_import_stubs(now_bound, syms), [])
+
+    # ...and it must not be reported as "nothing to check" when the module HAS imports this analysis
+    # simply cannot see. That is the same error as printing a refusal as a pass, one branch over.
+    check_call("non-lazy-module-with-imports-says-NOT-JUDGED",
+               lambda: "NOT JUDGED" in S.format_patched(now_bound, {}, "x.prx", sym_of=syms)[0],
+               True)
+
+    # A module with genuinely no PLT-bound imports is the one case where "nothing to check" is the
+    # honest answer, and it must stay distinguishable from the refusal above.
+    check_call("module-with-no-imports-at-all-says-nothing-to-check",
+               lambda: "nothing to check" in S.format_patched(now_bound, {}, "x.prx", sym_of={})[0],
+               True)
+
+    # format_patched(): a clean module says so out loud rather than printing nothing, so "clean" and
+    # "the tool did not run" are distinguishable.
+    check("clean-module-says-so",
+          S.format_patched(clean, {}, "eboot.bin"),
+          ["eboot.bin: no import stub has been overwritten in place"])
+
+    # A calibration refusal must SAY it did not judge, rather than printing the clean line. Mutation
+    # killed: collapsing "uncalibrated" into "clean" in format_patched.
+    cet.tags = {}
+    check("not-judged-is-distinguishable-from-clean",
+          S.format_patched(cet, {}, "eboot.bin", sym_of=syms)[0].split(":")[1].strip()[:10],
+          "NOT JUDGED")
+
+    # ...and the DETECTION row is pinned too, because that row is what a reader pastes into an issue.
+    # Only the clean line was covered before, so the NID/name lookup and the [tail]/[whole-entry]
+    # label could have changed shape unnoticed.
+    detected = FakePlt(entry(0, 0) + entry(1, 1, JUNK6) + entry(2, 2) + entry(3, 3))
+    detected.tags = {}
+    check("detection-row-format-is-pinned",
+          S.format_patched(detected, {"BBBBBBBBBBB": ("sceThing", "libSceThing")}, "eboot.bin",
+                           sym_of=syms),
+          ["eboot.bin: 1 import stub(s) OVERWRITTEN IN PLACE -- calls to these never reach the "
+           "HLE layer",
+           "0x10010\treloc=1\tBBBBBBBBBBB\tsceThing\tlibSceThing\t[tail]"])
 
     print("\n%s (%d failure(s))" % ("FAILED" if fails else "all passed", fails))
     return 1 if fails else 0
