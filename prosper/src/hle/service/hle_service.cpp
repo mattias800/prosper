@@ -4267,6 +4267,13 @@ HLE(s_playgo_getlang) { if (!a1) return PLAYGO_ERR_BAD_POINTER;
 static constexpr uint64_t SAVE_DATA_ERR_PARAMETER = 0x809F0000ull;
 static constexpr uint64_t SAVE_DATA_ERR_EXISTS = 0x809F0007ull;
 static constexpr uint64_t SAVE_DATA_ERR_NOT_FOUND = 0x809F0008ull;
+// From the same published table this file's other savedata codes come from. Spelled out rather than
+// folded into a near-miss: "no save is mounted" and "the host write failed" are different facts, and
+// answering either with PARAMETER would send a title looking at its own arguments.
+// CONFIDENCE: MED on both numeric values; HIGH on the polarity, which is what a title branches on.
+constexpr uint64_t SAVE_DATA_ERR_NOT_MOUNTED = 0x809F0004ull;
+constexpr uint64_t SAVE_DATA_ERR_INTERNAL    = 0x809F000Bull;
+
 // 0x809F0018 is the "the operation is STILL IN FLIGHT, keep waiting" code. That meaning is
 // corroborated by four independent titles in the local dump set, each of which sleeps and re-polls
 // on it -- better evidence than exists for most constants in this file:
@@ -4645,14 +4652,73 @@ HLE(s_savedata_umount2) {
     g_savedata_umount_events.fetch_add(1, std::memory_order_release);
     return 0;
 }
-// sceSaveDataGetMountInfo(mp, OrbisSaveDataMountInfo* info = { u64 blocks; u64 freeBlocks; u8 rsv[32] }, 48
-// bytes): was MISSING -> success with garbage free-space, so a title sizing its save against freeBlocks
-// could abort ("disk full") or corrupt its math. Report a generous, consistent size (256K blocks free).
+// The mount-point argument every one of these calls takes is SceSaveDataMountPoint { char data[16] }.
+// Accept only the mount this build serves, so a title passing a different one is refused instead of
+// having its request applied to whatever happens to be mounted. The comparison is bounded at the
+// ABI's own 16 bytes, which is also what makes an UNTERMINATED field safe to hand in: a guest that
+// fills all 16 bytes gets a mismatch rather than a read off the end of its struct. This is the only
+// mount-point spelling check in the savedata surface -- GetMountInfo, SetParam and GetParam all go
+// through it, so they cannot drift apart about which mount point is real.
+static bool savedata_mount_point_ok(uint64_t mount_point_va) {
+    if (!mount_point_va) return false;
+    const char* mp = (const char*)PW(mount_point_va);
+    return strncmp(mp, "/savedata0", 16) == 0;
+}
+
+// sceSaveDataGetMountInfo(const SceSaveDataMountPoint* mp, SceSaveDataMountInfo* info):
+//   SceSaveDataMountInfo { u64 blocks; u64 freeBlocks; u8 reserved[32] } -- 48 bytes.
+//
+// This call was MISSING first (success with garbage free-space, so a title sizing its save against
+// freeBlocks could abort "disk full" or corrupt its math), and the fix for that then IGNORED `mp`
+// entirely: any non-null `info` got a cleared block, two fixed capacity numbers and SCE_OK. So a
+// null mount point, "/savedata1", and "/savedata0" AFTER an unmount all received a successful
+// capacity report for a mount that was not there (#3653). The one call whose job is to describe a
+// live mount could not say that a mount was absent.
+//
+// Identity and lifecycle now go through exactly the contract sceSaveDataSetParam/GetParam below
+// already use -- the bounded savedata_mount_point_ok() above and savedata0_mounted_dir() -- so this
+// file holds ONE notion of what is mounted rather than two that can disagree.
+//
+// ERROR PRECEDENCE, and what is actually established about it. Arguments are checked before
+// lifecycle: a caller that passed a mount point this build does not serve is looking at its own
+// argument, not at a mount that went away. No published ABI text pins that order, and the local
+// corpus cannot pin it either -- of the five call sites in the three dumps that import this NID
+// (PPSA15319 x2, PPSA20447 x2, PPSA28061 x1), tools/re/nid_gate_scan.py buckets four as `nonzero`,
+// its one bucket meaning the result is gated on zero/non-zero and then dead on every reachable
+// path, and the fifth as `forward`, which leaves the scan's reach without ever const-comparing. No
+// local title can tell PARAMETER from NOT_MOUNTED. So: CONFIDENCE: LOW on the ordering between the
+// two error codes (it follows the sibling handlers in this file, which is consistency rather than
+// evidence); CONFIDENCE: HIGH on the polarity every observed call site does read -- an invalid or
+// inactive mount must not return SCE_OK.
+//
+// On an error return the guest's buffer is left EXACTLY as it was, which is this library's existing
+// policy rather than a new one: Mount3's NOT_FOUND path "writes NOTHING" and GetParam refuses before
+// touching `out`. Validation therefore happens before the first store, not after it.
+//
+// The capacity figures are deliberately NOT touched by this change: real used/free accounting is
+// #3654. They remain a fixed, consistent 256K blocks, derived from nothing.
+constexpr size_t   SAVE_DATA_MOUNT_INFO_SIZE           = 48;
+constexpr size_t   SAVE_DATA_MOUNT_INFO_OFF_BLOCKS     = 0;
+constexpr size_t   SAVE_DATA_MOUNT_INFO_OFF_FREE       = 8;
+constexpr size_t   SAVE_DATA_MOUNT_INFO_OFF_RESERVED   = 16;
+constexpr uint64_t SAVE_DATA_MOUNT_INFO_FIXED_BLOCKS   = 0x40000;   // #3654 owns real accounting
+static_assert(SAVE_DATA_MOUNT_INFO_OFF_RESERVED + 32 == SAVE_DATA_MOUNT_INFO_SIZE,
+              "SceSaveDataMountInfo is blocks + freeBlocks + reserved[32]");
 HLE(s_savedata_mountinfo) {
     svc_log("sceSaveDataGetMountInfo", a0,a1,a2,a3,a4,a5);
-    if (!a1) return 0x809F0000ull;   // SAVE_DATA_ERROR_PARAMETER
-    uint8_t* i = (uint8_t*)PW(a1); memset(i, 0, 48);
-    *(uint64_t*)(i + 0) = 0x40000; *(uint64_t*)(i + 8) = 0x40000;   // blocks / freeBlocks
+    if (!savedata_mount_point_ok(a0) || !a1) return SAVE_DATA_ERR_PARAMETER;
+    // A COPY of the mounted path, not a mount LEASE: savedata0_mounted_dir() releases the mount
+    // mutex before returning, so a concurrent sceSaveDataUmount2 on another guest thread can land
+    // the instant after this test and the answer below is then one sample old. That is sound here
+    // only because nothing after this line depends on the mount still being live -- this handler
+    // touches no file. Whoever implements #3654 must not read the emptiness test as a lease: a stat
+    // of the save directory has to treat a path that vanished under it as NOT_MOUNTED, not as an
+    // internal error, and must not assume the directory it measured is still /savedata0.
+    if (savedata0_mounted_dir().empty()) return SAVE_DATA_ERR_NOT_MOUNTED;
+    uint8_t* info = (uint8_t*)PW(a1);
+    memset(info, 0, SAVE_DATA_MOUNT_INFO_SIZE);   // reserved[32] reads back zeroed, as before
+    *(uint64_t*)(info + SAVE_DATA_MOUNT_INFO_OFF_BLOCKS) = SAVE_DATA_MOUNT_INFO_FIXED_BLOCKS;
+    *(uint64_t*)(info + SAVE_DATA_MOUNT_INFO_OFF_FREE)   = SAVE_DATA_MOUNT_INFO_FIXED_BLOCKS;
     return 0;
 }
 // --- sceSaveDataSetParam / sceSaveDataGetParam (#2786) -----------------------------------------
@@ -4690,13 +4756,6 @@ constexpr size_t SAVE_DATA_PARAM_OFF_SUBTITLE = 128;
 constexpr size_t SAVE_DATA_PARAM_OFF_DETAIL = 256;
 constexpr size_t SAVE_DATA_PARAM_OFF_USER_PARAM = 1280;
 constexpr size_t SAVE_DATA_PARAM_OFF_MTIME = 1288;
-// From the same published table this file's other savedata codes come from. Spelled out rather than
-// folded into a near-miss: "no save is mounted" and "the host write failed" are different facts, and
-// answering either with PARAMETER would send a title looking at its own arguments.
-// CONFIDENCE: MED on both numeric values; HIGH on the polarity, which is what a title branches on.
-constexpr uint64_t SAVE_DATA_ERR_NOT_MOUNTED = 0x809F0004ull;
-constexpr uint64_t SAVE_DATA_ERR_INTERNAL    = 0x809F000Bull;
-
 // The byte count TYPE_<x> transfers. 0 means "not a type this can answer", which is refused rather
 // than guessed: answering an unknown type with silent success is exactly what #2786 was.
 static size_t savedata_param_type_size(uint32_t type) {
@@ -4721,15 +4780,6 @@ static void savedata_param_write_text(uint8_t* field, size_t capacity, const std
     const size_t n = value.size() < capacity - 1 ? value.size() : capacity - 1;
     memcpy(field, value.data(), n);
 }
-// The mount-point argument is SceSaveDataMountPoint { char data[16] }. Accept only the mount this
-// build serves, so a title passing a different one is refused instead of having its parameter block
-// applied to whatever happens to be mounted.
-static bool savedata_mount_point_ok(uint64_t mount_point_va) {
-    if (!mount_point_va) return false;
-    const char* mp = (const char*)PW(mount_point_va);
-    return strncmp(mp, "/savedata0", 16) == 0;
-}
-
 HLE(s_savedata_setparam) {
     svc_log("sceSaveDataSetParam", a0,a1,a2,a3,a4,a5);
     const uint32_t type = (uint32_t)a1;
