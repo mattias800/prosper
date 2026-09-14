@@ -38,7 +38,8 @@
 //  arm 6  Umount arguments    [D]  PARAMETER (not NOT_FOUND) for a bad mount point. [G] for the
 //                                  null case, which the pre-fix code already rejected.
 //  arm 7  Umount lifecycle    [D]  NOT_MOUNTED (not NOT_FOUND) when nothing is mounted.
-//  arm 8  the two agree       [D]  same argument class, same answer, through both entry points.
+//  arm 8  the two agree       [D]  same argument class, same answer, through both entry points,
+//                                  and neither of them mutates state on the way to the answer.
 //  arm 9  codes are distinct  [G]  two constants compared -- it cannot redden against the unfixed
 //                                  handler, and says so. (#3665 shipped this arm mis-tagged [D].)
 #include "hle/dispatch/dispatch.hpp"
@@ -214,8 +215,11 @@ int main() {
     CHECK(mounted(), "[D] ...and that call did not unmount anything either");
 
     // And the positive direction: the same pointer in a1 with a plain flags word in a0 succeeds.
+    // [G], and the tag was MEASURED rather than reasoned: the unfixed handler returned 0 for
+    // everything, so a correct call succeeding cannot distinguish the two builds. It is here so a
+    // future validator cannot start refusing the one call shape every title actually makes.
     CHECK(umount2(1, &from_result) == 0,
-          "[D] Umount2(flags, mountPoint) with the mount point Mount3 reported succeeds");
+          "[G] Umount2(flags, mountPoint) with the mount point Mount3 reported succeeds");
     CHECK(!mounted(), "[G] ...and the mount is gone");
 
     // ------------------------------------------------------------------ arm 3: Umount2 lifecycle
@@ -308,8 +312,13 @@ int main() {
         CHECK(mount_save("SlotC", r) == 0, "[G] a save is mounted for the agreement arm");
         CHECK(umount(&other) == umount2(1, &other),
               "[D] both entry points answer a bad mount point the same way");
-        CHECK(mounted(), "[G] ...and neither of them unmounted anything");
-        CHECK(umount(&mp) == 0, "[G] the save is unmounted");
+        CHECK(mounted(), "[D] ...and neither of them unmounted anything");
+        // Re-establish the state explicitly instead of inheriting it from the arm above, so the
+        // lifecycle comparison below fails for its OWN reason or not at all. (Written the other way
+        // first: the follow-on unmount then reddened under the revert purely as collateral of the
+        // discarded mount, which would have made a [G] look like a discriminator.)
+        savedata0_umount();
+        CHECK(!mounted(), "[G] nothing is mounted for the lifecycle comparison");
         CHECK(umount(&mp) == umount2(1, &mp),
               "[D] both entry points answer 'nothing is mounted' the same way");
     }
