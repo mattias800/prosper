@@ -283,9 +283,28 @@ Over a 300 s run it reaches **285,824 submits, 609,767 compute dispatches and 16
 it renders, it renders with compute. And the recompiler currently rejects **21** of its compute
 programs — twenty as `mode=unresolved-operand`, one as `skip invalid descriptor contract`.
 
+Nine minutes of runtime changes none of it: **494,621 submits, 1,018,573 compute dispatches, 29,283
+flips, `draws_cum` 0**, one uniform-black capture.
+
 That is the whole remaining gap, and by the charter's rule it is a fatal one rather than an
-acceptable skip. The root cause is already recorded: these programs declare no sharps at all
-(`counts: ro=0 rw=0 samp=0 cbuf=0`) and address every resource through the SRT.
+acceptable skip. These programs declare no sharps at all (`counts: ro=0 rw=0 samp=0 cbuf=0`) and
+address every resource through the SRT.
+
+**The named blocker, for whoever starts there.** Several of the rejections are
+`fmt=5 op=0x4` — `s_load_dwordx16`, the bundled descriptor fetch. prosper does admit those, but only
+at PCs certified by `proven_smem_x16_descriptor_loads` (`rdna2_emit_cfg.cpp:724`), and that proof is
+deliberately linear:
+
+> *"Alternate entries would require path-sensitive lifetime/provenance joins. Keep this first
+> admission linear: hints, waits and barriers are transparent; every real scalar branch or indirect
+> PC transfer makes the whole candidate ineligible."*
+
+Uncharted's compute shaders have scalar control flow, so the proof bails before it examines a single
+load and every x16 bundle in the title is ineligible. Admitting them needs the path-sensitive join
+that comment defers — which is a design with its own tests, **not** a relaxation of the existing
+guard. `tests/gpu/test_recompile_coverage.cpp:782` pins the current behaviour
+(*"x16 load with an ordinary scalar/vector consumer remains fail-visible"*) and an earlier attempt in
+this same investigation to widen the admission was reverted for exactly that reason.
 
 The lever is **default OFF** on purpose. It changes a contract every title shares, prosper's current
 model is pinned by `tests/hle/test_equeue_events.cpp`, and the evidence for changing it is one
