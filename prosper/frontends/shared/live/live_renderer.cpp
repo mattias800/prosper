@@ -71,6 +71,13 @@
 #include <windows.h>
 #else
 #include <unistd.h>
+
+// The guest-flip publish bridge. Core reaches the frontend through a REGISTERED pointer, never by
+// naming this symbol: prosper_core links into tools that have no frontend at all, and on Mach-O a
+// weak declaration with no definition is still an undefined symbol (`nid_census` failed to link on
+// the macOS x86_64 job for exactly that reason, while ELF accepted it).
+extern "C" void prosper_vo_set_flip_publish_hook(void (*fn)(uint64_t));
+extern "C" void prosper_frontend_flip_publish_guest_scanout(uint64_t flip);
 #endif
 
 // Classify a guest address: 0 => not within a reserved/committed guest mapping (see hle_kernel_mem).
@@ -98,7 +105,8 @@ bool flush_live_graphics_pipeline_cache() {
 // its render-target base and inject them when a subsequent draw samples a texture at a matching base.
 namespace {
 // Installed by the live-renderer registration below; called from the guest flip path through the
-// weak extern "C" entry at the bottom of this file. Empty when the live renderer is not registered.
+// extern "C" entry at the bottom of this file, which that registration hands to core. Empty when
+// the live renderer is not registered.
 std::function<void(uint64_t)> g_flip_scanout_hook;
 // Default ceiling on a single non-texture (vertex/index/storage/constant) buffer upload. This is
 // not borrowed from any other path — it exists only to bound a corrupt descriptor, and it is sized
@@ -1323,6 +1331,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             std::make_shared<const std::vector<uint8_t>>(std::move(read.pixels)), w, h,
             prosper::gpu::PresentFrameOrigin::GuestScanout);
     };
+    // Hand core the entry point now that the hook exists. Registration rather than a symbol
+    // reference: prosper_core links into tools that have no frontend at all.
+    prosper_vo_set_flip_publish_hook(&prosper_frontend_flip_publish_guest_scanout);
     // Shared final-callback ordinal for PROSPER_PASS_LOG (increments where dp_submit does).
     static std::atomic<uint64_t> g_pass_log_submit{0};
     // The census windows those two switches open. Parsed once here rather than per callback so the
@@ -11649,9 +11660,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
 
 } // namespace prosper::frontend
 
-// Guest flip -> "is there a frame to publish?", for titles that never draw. Defined here because
-// the decision and the publish both live in this translation unit; declared weak at the call site
-// (hle_graphics.cpp) so a build without the live renderer links unchanged and does nothing.
+// Guest flip -> "is there a frame to publish?", for a title that composites with COMPUTE and never
+// draws. Defined here because the decision and the publish both live in this translation unit, and
+// REGISTERED with core rather than named by it: core must not reference a frontend symbol, or every
+// tool that links prosper_core without a frontend fails to link (it did, on Mach-O, where a weak
+// declaration with no definition is still an undefined symbol).
+extern "C" void prosper_vo_set_flip_publish_hook(void (*fn)(uint64_t));
 extern "C" void prosper_frontend_flip_publish_guest_scanout(uint64_t flip) {
     if (prosper::frontend::g_flip_scanout_hook) prosper::frontend::g_flip_scanout_hook(flip);
 }

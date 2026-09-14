@@ -880,7 +880,19 @@ HLE(g_vo_submitflip)  {
 // it must advance the SAME flip status (count/flipArg/currentBuffer) that GetFlipStatus reports:
 // Unity's frame pacer polls for its submitted flipArg to complete before building the next frame, so
 // dropping this packet stalls the game at one rendered frame forever.
-extern "C" void prosper_frontend_flip_publish_guest_scanout(uint64_t flip) __attribute__((weak));
+// Guest flip -> "is there a frame to publish?", for a title that composites with COMPUTE and never
+// draws. The live renderer owns the decision and the publish, so core reaches it through a
+// REGISTERED HOOK rather than by naming a frontend symbol.
+//
+// This used to be a weak declaration called through a null check, which links on ELF and does NOT
+// link on Mach-O: a weak *declaration* with no definition there is still an undefined symbol
+// (`weak_import` is the Mach-O spelling), so every tool that links prosper_core WITHOUT a frontend
+// failed at link time -- `nid_census`, on the macOS x86_64 job only. A registered pointer needs no
+// per-platform attribute and is the pattern the rest of this boundary already uses.
+std::atomic<void (*)(uint64_t)> g_flip_publish_hook{nullptr};
+extern "C" void prosper_vo_set_flip_publish_hook(void (*fn)(uint64_t)) {
+    g_flip_publish_hook.store(fn, std::memory_order_release);
+}
 extern "C" void prosper_vo_flip_from_gpu(uint32_t handle, int32_t bufidx, uint32_t flip_mode, int64_t flip_arg) {
     VideoOutHandleGuard live_handle(handle);
     if (!live_handle.valid()) return;
@@ -897,8 +909,8 @@ extern "C" void prosper_vo_flip_from_gpu(uint32_t handle, int32_t bufidx, uint32
     // behind one. Give the flip itself a chance to publish. Weak: a build without the live renderer
     // links unchanged. Default off (PROSPER_FLIP_GUEST_SCANOUT), and inert once the renderer has
     // produced any frame of its own.
-    if (prosper_frontend_flip_publish_guest_scanout)
-        prosper_frontend_flip_publish_guest_scanout(prosper_vo_flip_count());
+    if (auto* publish = g_flip_publish_hook.load(std::memory_order_acquire))
+        publish(prosper_vo_flip_count());
     prosper_eq_trigger_flip(flip_arg);     // flip completed (synchronous): fire the flip event
 }
 HLE(g_vo_flippending) {
