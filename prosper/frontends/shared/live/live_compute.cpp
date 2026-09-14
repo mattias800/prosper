@@ -1142,6 +1142,9 @@ struct CachedComputeImage {
     prosper::gpu::GuestGpuWriteSnapshot graphics_export_snapshot;
     uint64_t graphics_export_command_order = 0;
     bool graphics_export_valid = false;
+    // A borrower outside ordered journal coverage can request a watch for future publications.
+    // This is a performance hint only; it never authorizes the current image.
+    bool export_watch_requested = false;
     prosper::gpu::GuestGpuWriteSnapshot compute_transfer_snapshot;
     bool compute_transfer_valid = false;
     std::vector<uint8_t> source_snapshot;
@@ -1344,6 +1347,13 @@ size_t compute_write_watch_promotion_budget_bytes() {
         return static_cast<size_t>(mib * (1024ull * 1024ull));
     }();
     return value;
+}
+
+// Experimental performance arm: same-submit borrowers already have exact journal authority.
+// An unproven first borrow still declines; it only requests a watch on a future completed result.
+bool demand_compute_export_watch_enabled() {
+    static const bool enabled = std::getenv("PROSPER_DEMAND_COMPUTE_EXPORT_WATCH") != nullptr;
+    return enabled;
 }
 
 bool adaptive_storage_result_validation_enabled() {
@@ -2626,18 +2636,32 @@ struct VulkanComputeContext {
     // was evicted or invalidated between writeback and here leaves the consumer with nothing to
     // borrow, and that is a different failure from an ineligible binding (#3307).
     bool authorize_cached_image_export(const ComputeImageCacheKey& key,
-                                       uint64_t producer_command_order) {
+                                       uint64_t producer_command_order,
+                                       bool report_watch = false) {
         const auto found = image_cache.find(key);
         if (found == image_cache.end() || !found->second.content_valid || !found->second.image)
             return false;
         found->second.graphics_export_snapshot = prosper::gpu::guest_gpu_write_snapshot();
         found->second.graphics_export_command_order = producer_command_order;
         found->second.graphics_export_valid = true;
+        const bool had_watch = static_cast<bool>(found->second.write_watch);
+        bool create_attempted = false;
         if (found->second.write_watch && !found->second.write_watch.rearm())
             found->second.write_watch.reset();
-        if (!found->second.write_watch)
+        if (!found->second.write_watch &&
+            (!demand_compute_export_watch_enabled() || found->second.export_watch_requested)) {
+            create_attempted = true;
             found->second.write_watch = prosper::host::GuestWriteWatch::create(
                 key.gpu_addr, key.guest_bytes);
+        }
+        if (report_watch)
+            std::fprintf(stderr,
+                         "[compute-export-watch] addr=0x%llx bytes=%u demand=%u "
+                         "requested=%u had-watch=%u create-attempted=%u has-watch=%u\n",
+                         (unsigned long long)key.gpu_addr, key.guest_bytes,
+                         demand_compute_export_watch_enabled() ? 1u : 0u,
+                         found->second.export_watch_requested ? 1u : 0u, had_watch ? 1u : 0u,
+                         create_attempted ? 1u : 0u, found->second.write_watch ? 1u : 0u);
         return true;
     }
 
@@ -2716,6 +2740,8 @@ struct VulkanComputeContext {
                                                   key.gpu_addr, key.guest_bytes);
         const bool submit_unchanged =
             submit_query == prosper::gpu::GuestGpuWriteQuery::Unchanged;
+        if (!submit_unchanged)
+            cached.export_watch_requested = true;
         const bool watch_consulted = !submit_unchanged && static_cast<bool>(cached.write_watch);
         const prosper::host::GuestWriteWatchQuery watch_query = watch_consulted
             ? cached.write_watch.query() : prosper::host::GuestWriteWatchQuery::Unknown;
@@ -2817,6 +2843,8 @@ struct VulkanComputeContext {
                                                   key.gpu_addr, key.guest_bytes);
         const bool submit_unchanged =
             submit_query == prosper::gpu::GuestGpuWriteQuery::Unchanged;
+        if (!submit_unchanged)
+            cached.export_watch_requested = true;
         const bool watch_unchanged = !submit_unchanged && cached.write_watch &&
             cached.write_watch.query() == prosper::host::GuestWriteWatchQuery::Unchanged;
         const bool exact_unchanged =
@@ -5548,7 +5576,21 @@ std::optional<bool> execute_cpu_broadcast_fill(const prosper::gpu::ComputeItem& 
 std::optional<bool> execute_cpu_fast_path(const prosper::gpu::ComputeItem& item) {
     using prosper::gpu::ComputeCpuFastPath;
     using prosper::gpu::ResourceClass;
-    if (item.cpu_fast_path == ComputeCpuFastPath::None) return std::nullopt;
+    static const bool census = std::getenv("PROSPER_COMPUTE_FAST_PATH_CENSUS") != nullptr;
+    const auto report = [&](const char* reason) {
+        if (census && prosper::perf::interactive_performance_capture().detailed_timing_active())
+            std::fprintf(stderr,
+                         "[compute-fast-path] submit=%llu dispatch=%llu order=%llu code=0x%llx "
+                         "kind=%u reason=%s\n",
+                         (unsigned long long)item.submit_no, (unsigned long long)item.dispatch_index,
+                         (unsigned long long)item.command_order, (unsigned long long)item.code_addr,
+                         static_cast<unsigned>(item.cpu_fast_path), reason);
+    };
+    const auto decline = [&](const char* reason) -> std::optional<bool> {
+        report(reason);
+        return std::nullopt;
+    };
+    if (item.cpu_fast_path == ComputeCpuFastPath::None) return decline("unclassified");
     if (item.cpu_fast_path == ComputeCpuFastPath::BroadcastBufferU32)
         return execute_cpu_broadcast_fill(item);
     if (item.cpu_fast_path != ComputeCpuFastPath::FillSgprUvec4 ||
@@ -5559,7 +5601,7 @@ std::optional<bool> execute_cpu_fast_path(const prosper::gpu::ComputeItem& item)
         item.launch.local_x != 64 || item.launch.local_y != 1 || item.launch.local_z != 1 ||
         !item.launch.groups_x || item.launch.groups_y != 1 || item.launch.groups_z != 1 ||
         item.launch.threads_y != 1 || item.launch.threads_z != 1)
-        return std::nullopt;
+        return decline("launch-or-config");
 
     const prosper::gpu::ShaderResource* resource = item.resources->by_binding(2);
     // The matched MUBUF instruction uses idxen with the direct V# in s[0:3]. Its element address and
@@ -5571,16 +5613,16 @@ std::optional<bool> execute_cpu_fast_path(const prosper::gpu::ComputeItem& item)
         resource->stride != 16 ||
         resource->num_components != 4 ||
         prosper::gpu::data_format_bytes(resource->format) != sizeof(uint32_t))
-        return std::nullopt;
+        return decline("descriptor");
 
     const uint64_t dispatched_records =
         static_cast<uint64_t>(item.launch.groups_x) * item.launch.local_x;
     const uint64_t records = item.launch.threads_x
         ? std::min<uint64_t>(item.launch.threads_x, dispatched_records)
         : dispatched_records;
-    if (!records || records > UINT64_MAX / 16u) return std::nullopt;
+    if (!records || records > UINT64_MAX / 16u) return decline("record-count");
     const uint64_t written_bytes = records * 16u;
-    if (written_bytes > resource->size || written_bytes > SIZE_MAX) return std::nullopt;
+    if (written_bytes > resource->size || written_bytes > SIZE_MAX) return decline("extent");
 
     uint8_t* destination = nullptr;
     if (resource->host_data && resource->host_data_size >= written_bytes) {
@@ -5590,7 +5632,7 @@ std::optional<bool> execute_cpu_fast_path(const prosper::gpu::ComputeItem& item)
                    resource->gpu_addr, static_cast<uint32_t>(written_bytes))) {
         destination = reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(resource->gpu_addr));
     }
-    if (!destination) return std::nullopt;
+    if (!destination) return decline("destination-not-writable");
 
     // The CPU shortcut bypasses execute_item's reflected-resource census entirely. Publish its
     // exact write boundary before touching bytes so pending storage authority cannot survive an
@@ -5650,6 +5692,7 @@ std::optional<bool> execute_cpu_fast_path(const prosper::gpu::ComputeItem& item)
                      static_cast<unsigned long long>(item.code_addr),
                      static_cast<unsigned long long>(records),
                      static_cast<unsigned long long>(written_bytes));
+    report("executed");
     return true;
 }
 
@@ -11861,7 +11904,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // a borrower without current authority falls back to ordinary guest preparation.
             const bool graphics_export_authorized = publish_eligible &&
                 !image.renderer_seeded_result_candidate && image.graphics_sampled_usage &&
-                ctx.authorize_cached_image_export(image.cache_key, item.command_order);
+                ctx.authorize_cached_image_export(image.cache_key, item.command_order, image_timing);
             // #3307: the producer half of the borrow partition. Without it, a consumer that finds
             // no cache entry cannot tell a producer that declined to publish from a producer that
             // published under a different key.
