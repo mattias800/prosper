@@ -45,6 +45,7 @@
 #include "fixtures/render_runner.h"              // offscreen Vulkan backend (render_draws_rgba) + dump_bmp
 
 #include <atomic>
+#include <functional>
 #include <chrono>
 #include <climits>
 #include <cmath>
@@ -96,6 +97,9 @@ bool flush_live_graphics_pipeline_cache() {
 // this the composite samples zeros and the frame is black. We cache each submit's rendered pixels under
 // its render-target base and inject them when a subsequent draw samples a texture at a matching base.
 namespace {
+// Installed by the live-renderer registration below; called from the guest flip path through the
+// weak extern "C" entry at the bottom of this file. Empty when the live renderer is not registered.
+std::function<void(uint64_t)> g_flip_scanout_hook;
 // Default ceiling on a single non-texture (vertex/index/storage/constant) buffer upload. This is
 // not borrowed from any other path — it exists only to bound a corrupt descriptor, and it is sized
 // against what a 64 MiB read already costs elsewhere (~16K guest_readable page probes). A guest
@@ -1265,6 +1269,60 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
     // compute-only use (tests/gpu/recompiler/test_game_compute.cpp) still creates its own device.
     (void)prosper::test::render_vk_ctx();
     static RttCache g_rtt;   // render-to-texture cache (#167)
+    // PROSPER_FLIP_GUEST_SCANOUT=1 (default OFF): let a guest FLIP publish the guest's own scanout
+    // buffer when the renderer has produced nothing at all.
+    //
+    // prosper's present path is SPAN-DRIVEN: every publish decision above, including the
+    // guest-scanout fallback that exists precisely for "the guest wrote the framebuffer itself",
+    // sits behind `phase.final_span`, i.e. behind a graphics DRAW. A title that composites entirely
+    // with compute and never draws therefore never reaches it -- the flips arrive and nothing
+    // downstream is ever asked whether there is a frame. Measured on Uncharted (PPSA05684, #3616):
+    // 29,283 flips over 540 s, `draws_cum` 0, `[rtt] GUEST SCANOUT` printed ZERO times, and
+    // `0 published`.
+    //
+    // This hook is deliberately the narrowest thing that closes that: it runs only while
+    // `present_has_frame()` is false, so the moment the renderer produces anything the span path
+    // owns presentation again and this never competes with it. That also removes the cross-thread
+    // question -- it does not consult g_rtt, because a renderer that owns a target has necessarily
+    // produced a frame, and this path has already returned by then.
+    //
+    // The POLICY is not re-implemented: guest_scanout_read_warranted / guest_scanout_publishable are
+    // the same unit-tested predicates the span path uses, including the authorship test that is the
+    // whole point (a buffer whose contents have never differed from what they were at registration
+    // is not the guest's frame, whatever is in it).
+    g_flip_scanout_hook = [](uint64_t flip) {
+        static const bool armed = getenv("PROSPER_FLIP_GUEST_SCANOUT") != nullptr;
+        if (!armed) return;
+        if (prosper::gpu::present_has_frame()) return;      // the span path owns presentation
+        const uint32_t w = prosper::gpu::present_width(), h = prosper::gpu::present_height();
+        const size_t display_bytes = static_cast<size_t>(w) * h * 4u;
+        if (!display_bytes) return;
+        auto decision = prosper::frontend::guest_scanout_read_warranted(
+            /*published_gpu=*/false, /*renderer_scanout=*/false, /*have_selected_pixels=*/false,
+            display_bytes, display_bytes);
+        if (decision != prosper::frontend::GuestScanoutDecision::Publish) return;
+        prosper::VideoOutLinearRead read;
+        const bool got = prosper::videoout_read_front_linear(read);
+        decision = prosper::frontend::guest_scanout_publishable(
+            got ? read.pixels.size() : 0u, display_bytes,
+            got && read.metadata.address != 0,
+            /*renderer_owns_target=*/false,      // no rendered frame exists: see the note above
+            read.guest_authored);
+        static std::atomic<uint64_t> reports[(size_t)
+            prosper::frontend::GuestScanoutDecision::SkipNotAuthored + 1]{};
+        const uint64_t ord = reports[(size_t)decision].fetch_add(1) + 1;
+        if (prosper::diag_should_print(ord))
+            fprintf(stderr, "[flip-scanout] #%llu flip=%llu %s (%ux%u addr=0x%llx authored=%d "
+                            "read=%zu want=%zu)\n",
+                    (unsigned long long)ord, (unsigned long long)flip,
+                    prosper::frontend::guest_scanout_decision_name(decision), w, h,
+                    (unsigned long long)read.metadata.address, (int)read.guest_authored,
+                    got ? read.pixels.size() : 0u, display_bytes);
+        if (decision != prosper::frontend::GuestScanoutDecision::Publish) return;
+        prosper::gpu::present_write_frame(
+            std::make_shared<const std::vector<uint8_t>>(std::move(read.pixels)), w, h,
+            prosper::gpu::PresentFrameOrigin::GuestScanout);
+    };
     // Shared final-callback ordinal for PROSPER_PASS_LOG (increments where dp_submit does).
     static std::atomic<uint64_t> g_pass_log_submit{0};
     // The census windows those two switches open. Parsed once here rather than per callback so the
@@ -11590,3 +11648,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
 }
 
 } // namespace prosper::frontend
+
+// Guest flip -> "is there a frame to publish?", for titles that never draw. Defined here because
+// the decision and the publish both live in this translation unit; declared weak at the call site
+// (hle_graphics.cpp) so a build without the live renderer links unchanged and does nothing.
+extern "C" void prosper_frontend_flip_publish_guest_scanout(uint64_t flip) {
+    if (prosper::frontend::g_flip_scanout_hook) prosper::frontend::g_flip_scanout_hook(flip);
+}

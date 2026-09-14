@@ -880,6 +880,7 @@ HLE(g_vo_submitflip)  {
 // it must advance the SAME flip status (count/flipArg/currentBuffer) that GetFlipStatus reports:
 // Unity's frame pacer polls for its submitted flipArg to complete before building the next frame, so
 // dropping this packet stalls the game at one rendered frame forever.
+extern "C" void prosper_frontend_flip_publish_guest_scanout(uint64_t flip) __attribute__((weak));
 extern "C" void prosper_vo_flip_from_gpu(uint32_t handle, int32_t bufidx, uint32_t flip_mode, int64_t flip_arg) {
     VideoOutHandleGuard live_handle(handle);
     if (!live_handle.valid()) return;
@@ -891,6 +892,13 @@ extern "C" void prosper_vo_flip_from_gpu(uint32_t handle, int32_t bufidx, uint32
     flip_advance(bufidx, flip_arg);
     flip_pace_wait();                      // both halves pace: see flip_pace_wait
     gpu::present_flip(bufidx, flip_arg);   // scanout bookkeeping, same as the API flip
+    // A title that composites with COMPUTE and never draws produces no graphics span, and every
+    // publish decision — including the guest-scanout fallback written for exactly that case — sits
+    // behind one. Give the flip itself a chance to publish. Weak: a build without the live renderer
+    // links unchanged. Default off (PROSPER_FLIP_GUEST_SCANOUT), and inert once the renderer has
+    // produced any frame of its own.
+    if (prosper_frontend_flip_publish_guest_scanout)
+        prosper_frontend_flip_publish_guest_scanout(prosper_vo_flip_count());
     prosper_eq_trigger_flip(flip_arg);     // flip completed (synchronous): fire the flip event
 }
 HLE(g_vo_flippending) {
