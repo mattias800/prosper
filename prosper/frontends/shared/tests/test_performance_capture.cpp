@@ -40,6 +40,17 @@ prosper::perf::ProcessSample sample(uint64_t at, uint64_t counter) {
     out.guest_presents = counter * 3;
     out.rendered_frames = counter * 2;
     out.host_presented_frames = counter;
+    if (counter == 1) {
+        prosper::gpu::PendingWriteSnapshot queue;
+        queue.queued = 123;
+        queue.active_submits = 2;
+        queue.front_item_age_ns = 456;
+        queue.release_delay_ns = -789;
+        queue.scope_begins = 12;
+        queue.scope_ends = 10;
+        queue.deadline_resets = 3;
+        out.pending_writes = queue;
+    }
     return out;
 }
 } // namespace
@@ -217,6 +228,12 @@ int main() {
     std::ostringstream bytes;
     bytes << input.rdbuf();
     const std::string text = bytes.str();
+    check(text.find("\"pending_writes\":{\"queued\":123,\"active_submits\":2") != std::string::npos &&
+          text.find("\"front_item_age_ns\":456,\"release_delay_ns\":-789") != std::string::npos &&
+          text.find("\"scope_begins\":12,\"scope_ends\":10,\"deadline_resets\":3") != std::string::npos,
+          "queue snapshot retains counters, front age and signed deadline");
+    check(text.find("\"pending_writes\":null") != std::string::npos,
+          "unavailable queue observation is not an invented empty queue");
     check(count_text(text, "\"buffer_upload_bytes\":") == 2 &&
               text.find("\"buffer_upload_bytes\":4294967296,") != std::string::npos &&
               text.find("\"buffer_upload_bytes\":4294967297,") != std::string::npos &&

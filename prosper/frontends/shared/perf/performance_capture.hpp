@@ -10,6 +10,7 @@
 #include <optional>
 #include <string>
 #include <vector>
+#include "gpu/pm4/pending_write_snapshot.hpp"
 
 namespace prosper::perf {
 
@@ -32,6 +33,7 @@ struct ProcessSample {
     // that handoff, so its production counter is unavailable rather than zero.
     std::optional<uint64_t> rendered_frames;
     uint64_t host_presented_frames = 0;
+    std::optional<gpu::PendingWriteSnapshot> pending_writes;
 };
 
 // One live-renderer callback. These are the existing PROSPER_RENDER_TIMING intervals, recorded in a

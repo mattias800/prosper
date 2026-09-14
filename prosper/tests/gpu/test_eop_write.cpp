@@ -5,6 +5,7 @@
 // builders themselves read SysV stack args via __builtin_frame_address, only valid under the loaded
 // game) and asserts run_command_buffer writes the right bytes to the target address.
 #include "gpu/pm4/command_processor.hpp"
+#include "gpu/pm4/pending_write_snapshot.hpp"
 #include "gpu/execute/gpu_execute.hpp"
 #include "gpu/execute/mb3_freelist.hpp"
 #include "gpu/pm4/pm4_decode.hpp"
@@ -285,8 +286,26 @@ int main() {
         buf[17] = 1; buf[18] = 0x13579bdfu;           // renderer resource upload
         GpuState st;
         prosper_gpu_submit_scope_begin();
+        const auto observe_queue = [] {
+            std::optional<PendingWriteSnapshot> snapshot;
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
+            do {
+                snapshot = try_pending_write_snapshot();
+                if (snapshot) break;
+                std::this_thread::yield();
+            } while (std::chrono::steady_clock::now() < deadline);
+            return snapshot;
+        };
+        const auto scope_start = observe_queue();
         const size_t n = run_command_buffer(buf, 19, st);
+        const auto queued = observe_queue();
+        CHECK(queued && queued->queued == 3 && queued->active_submits == 1 &&
+              queued->inflight_batches == 0 && queued->scope_begins == queued->scope_ends + 1,
+              "pending snapshot observes three real queued writes inside the submit");
         prosper_gpu_drain_renderer_writes();
+        const auto retained = observe_queue();
+        CHECK(retained && retained->queued == 2 && retained->active_submits == 1,
+              "pending snapshot observes the selective resource drain without draining labels");
         CHECK(n == 3 && prosper_gpu_submit_scope_active(),
               "SDK-13 submit scope retains queued label writes");
         CHECK(resource == 0x13579bdfu,
@@ -316,6 +335,11 @@ int main() {
         prosper_gpu_drain_completion_writes();
         CHECK(label == 0xfedcba9876543210ull,
               "ordered label initialization and fence become visible after submit scope end");
+        const auto drained = observe_queue();
+        CHECK(scope_start && drained && drained->queued == 0 && drained->active_submits == 0 &&
+              drained->front_item_age_ns == 0 && drained->scope_begins == drained->scope_ends &&
+              drained->deadline_resets == scope_start->deadline_resets + 1,
+              "nested and unmatched returns preserve snapshot balance and reset only at final return");
     }
 
     // Renderer drains routinely encounter hundreds of resource uploads behind thousands of private

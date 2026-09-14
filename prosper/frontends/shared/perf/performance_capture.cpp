@@ -374,7 +374,16 @@ void InteractivePerformanceCapture::publish_completed(std::unique_ptr<PendingCap
             out << ",\"guest_presents\":" << sample.guest_presents
                 << ",\"rendered_frames\":";
             write_optional(out, sample.rendered_frames);
-            out << ",\"host_presented_frames\":" << sample.host_presented_frames << "}\n";
+            out << ",\"host_presented_frames\":" << sample.host_presented_frames
+                << ",\"pending_writes\":";
+            if (sample.pending_writes) {
+                const auto& q = *sample.pending_writes;
+                out << "{\"queued\":" << q.queued << ",\"active_submits\":" << q.active_submits
+                    << ",\"inflight_batches\":" << q.inflight_batches << ",\"front_item_age_ns\":" << q.front_item_age_ns
+                    << ",\"release_delay_ns\":" << q.release_delay_ns
+                    << ",\"scope_begins\":" << q.scope_begins << ",\"scope_ends\":" << q.scope_ends << ",\"deadline_resets\":" << q.deadline_resets << '}';
+            } else out << "null";
+            out << "}\n";
         };
         for (const ProcessSample& sample : capture->pre_samples) write_sample(sample, "pre");
         for (const ProcessSample& sample : capture->post_samples) write_sample(sample, "post");

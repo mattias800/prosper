@@ -1,5 +1,6 @@
 // command_processor.cpp — see command_processor.hpp.
 #include "gpu/pm4/command_processor.hpp"
+#include "gpu/pm4/pending_write_snapshot.hpp"
 #include "hle/memory/guest_memory_topology.hpp"
 #include "hle/kernel/hle_kernel_time.hpp"
 #include "gpu/diagnostics/diag_ratelimit.hpp"   // #1761: single-sourced ordinal + sparse-tail rule for capped logs
@@ -3016,6 +3017,7 @@ struct PendQueue {
     bool worker_started = false;
     int  inflight = 0;    // items popped but whose write hasn't landed yet (see drain)
     int  active_submits = 0; // fence writes stay private until the import return checkpoint
+    uint64_t scope_begins = 0, scope_ends = 0, deadline_resets = 0; // paired checkpoints, under mx
     std::chrono::steady_clock::time_point release_after{}; // modeled GPU latency after that checkpoint
 };
 PendQueue& pend_q() { static PendQueue* p = new PendQueue; return *p; }
@@ -3111,6 +3113,26 @@ void pend_enqueue(const Pm4Command& c) {
 }
 } // namespace
 
+std::optional<PendingWriteSnapshot> try_pending_write_snapshot() {
+    PendQueue& p = pend_q();
+    std::unique_lock<std::mutex> lk(p.mx, std::try_to_lock);
+    if (!lk.owns_lock()) return std::nullopt;
+    const auto now = std::chrono::steady_clock::now();
+    PendingWriteSnapshot result;
+    result.queued = p.q.size();
+    result.active_submits = p.active_submits;
+    result.inflight_batches = p.inflight;
+    if (!p.q.empty())
+        result.front_item_age_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            now - p.q.front().queued).count();
+    result.release_delay_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        p.release_after - now).count();
+    result.scope_begins = p.scope_begins;
+    result.scope_ends = p.scope_ends;
+    result.deadline_resets = p.deadline_resets;
+    return result;
+}
+
 // Synchronous drain: apply every pending completion write NOW, in order. Called from the fold's
 // WaitRegMem check, before the renderer executes, and by the EOP-event worker before it posts.
 extern "C" void prosper_gpu_drain_completion_writes() {
@@ -3131,6 +3153,7 @@ extern "C" void prosper_gpu_submit_scope_begin() {
     p.cv.wait(lk, [&] { return p.inflight == 0; });
     t_submit_scope_depth++;
     p.active_submits++;
+    p.scope_begins++;
     p.cv.notify_all();
 }
 
@@ -3144,8 +3167,11 @@ extern "C" void prosper_gpu_submit_scope_end() {
         std::lock_guard<std::mutex> lk(p.mx);
         if (p.active_submits == 0) return; // defensive: preserve both counters if the invariant broke
         t_submit_scope_depth--;
-        if (--p.active_submits == 0)
+        p.scope_ends++;
+        if (--p.active_submits == 0) {
+            p.deadline_resets++;
             p.release_after = std::chrono::steady_clock::now() + std::chrono::milliseconds(1);
+        }
     }
     p.cv.notify_all();
 }

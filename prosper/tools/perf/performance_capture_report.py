@@ -165,7 +165,22 @@ def summarize_handoffs(records):
         publications.append({"publication_id":identity, "source_seq":events[0]["source_seq"],
             "publication_observed":bool(event_counts["published"]),
             "outcome":terminal[0] if terminal else "unresolved-in-window"})
+    queue_samples = []
+    for row in records:
+        if row.get("type") != "sample" or row.get("phase") != "post":
+            continue
+        queue = row.get("pending_writes")
+        if queue is not None:
+            fields = ("queued", "active_submits", "inflight_batches", "front_item_age_ns",
+                      "release_delay_ns", "scope_begins", "scope_ends", "deadline_resets")
+            if not isinstance(queue, dict) or any(type(queue.get(k)) is not int for k in fields):
+                raise CaptureError("invalid pending queue snapshot")
+            if any(queue[k] < 0 for k in fields if k != "release_delay_ns") or (
+                    queue["scope_begins"] - queue["scope_ends"] != queue["active_submits"]):
+                raise CaptureError("inconsistent pending queue snapshot")
+        queue_samples.append({"t_ns":row["t_ns"], "pending_writes":queue})
     return {"scope":"observed GPU handoffs; CPU observations use a separate identity namespace",
+        "pending_queue_samples":queue_samples,
         "event_counts":dict(sorted(counts.items())), "gpu_publications":publications,
         "published_outcomes":dict(collections.Counter(p["outcome"] for p in publications if p["publication_observed"])),
         "waits_ms":{k:{"count":len(v), "total":sum(v), "max":max(v)} for k,v in sorted(waits.items())},

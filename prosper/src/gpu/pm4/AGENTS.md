@@ -6,6 +6,8 @@ Decodes the PM4 packet stream the guest submits, and maintains the register stat
 - `pm4_registers` — the register namespace and offsets the packets address.
 - `command_processor` — walks a submission, applies register writes, and emits the draws and
   dispatches the rest of the stack consumes.
+- `pending_write_snapshot` — nonblocking observations of that processor's completion queue for
+  bounded performance capture; it does not alter visibility, execute writes or wait for them.
 
 This is the **entry point of the whole stack**: everything downstream is a consequence of what is
 decoded here, so a decode error does not look like a decode error — it looks like a missing draw, a

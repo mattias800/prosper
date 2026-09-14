@@ -40,6 +40,20 @@ SAMPLES = [
 
 
 class PerformanceCaptureReportTests(unittest.TestCase):
+    def test_pending_queue_observations_keep_signed_deadlines_and_missing_samples(self):
+        queue = dict(queued=123, active_submits=2, inflight_batches=1, front_item_age_ns=456,
+                     release_delay_ns=-789, scope_begins=12, scope_ends=10, deadline_resets=3)
+        records = capture([dict(SAMPLES[0], pending_writes=queue), SAMPLES[1]])
+        records[0].update(present_handoffs_enabled=True, post_window_ns=2_000_000_000)
+        records[-1].update(present_records=0, present_dropped=0)
+        observed = summarize_handoffs(records)['pending_queue_samples']
+        self.assertEqual(observed[0]['pending_writes'], queue)
+        self.assertIsNone(observed[1]['pending_writes'])
+        for bad in (dict(queue, queued=-1), dict(queue, scope_ends=11),
+                    dict(queue, front_item_age_ns=None), dict(queue, inflight_batches=True), 'bad'):
+            records[1]['pending_writes'] = bad
+            with self.assertRaises(CaptureError): summarize_handoffs(records)
+
     def test_handoffs_keep_boundaries_and_cpu_namespace_separate(self):
         records = capture(SAMPLES)
         records[0].update(present_handoffs_enabled=True, post_window_ns=1000)

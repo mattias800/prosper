@@ -155,6 +155,17 @@ present count in `other_seq`, the front index in `result` and its address in `ad
 `superseded.other_seq` names the replacing publication; stale events name the last shown flip.
 Attempt results follow `PresentAttempt`: 0 presented, 1 skipped, 2 out-of-date, 3 failed.
 
+The same opt-in window also samples the pending-write queue at the existing 4 Hz process cadence.
+`pending_writes` is null when unobserved or when its try-lock fails. A snapshot includes all queued
+resource/completion records, active submit scopes, apply batches, paired scope checkpoints and
+zero-active transitions that reset the completion deadline. The signed `release_delay_ns` is
+negative after the deadline; this does not imply the active-scope gate permits draining.
+`front_item_age_ns` measures the queue-front record from its preparation timestamp, which precedes
+enqueue; it is not necessarily the oldest record's age. Samples cannot prove that no short eligible
+drain interval existed between them. Queue fields are sampled after the process sample timestamp;
+adding that earlier timestamp to the relative deadline does not recover its exact absolute time.
+Collection does not wait for the queue, walk it or drain it.
+
 The report refuses unavailable/overflowed traces and conflicting outcomes. Missing boundary
 transitions remain unknown: zero overflow does not exclude a collector-close race. CPU producer
 publication and completed image-producer lineage remain unobserved. Waits may overlap and extend

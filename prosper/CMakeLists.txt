@@ -125,7 +125,7 @@ endif()
 # SDL app and the live graphics/compute backends. It deliberately has no SDL/Vulkan dependency, so
 # its ring, bounds, and atomic file contract run in ordinary headless CI.
 add_library(prosper_performance_capture STATIC frontends/shared/perf/performance_capture.cpp)
-target_include_directories(prosper_performance_capture PUBLIC frontends)
+target_include_directories(prosper_performance_capture PUBLIC frontends src)
 target_link_libraries(prosper_performance_capture PRIVATE prosper_build_revision)
 # Windows: the process memory sample (working set + commit charge) calls GetProcessMemoryInfo, which
 # lives in the PSAPI import library rather than the kernel32 set every target links by default.

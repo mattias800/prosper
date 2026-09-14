@@ -1727,15 +1727,19 @@ int main(int argc, char** argv) {
                 automaticPerfEnv);
         }
     }
+    auto collectPerformanceSample = [&](uint64_t at) {
+        auto sample = prosper::perf::collect_process_sample(
+            at, gpu::present_count(), prosper::frontend::rendered_frame_counter(
+                vk.gpu_present, gpu::present_frame_seq()), shown);
+        if (perfCapture.present_handoff_timing_active())
+            sample.pending_writes = gpu::try_pending_write_snapshot();
+        return sample;
+    };
     bool perfCaptureWasAutomatic = false;
     auto arm_performance_capture = [&](bool automatic, uint64_t armedAt,
                                        uint64_t automaticElapsedMs = 0) {
         if (perfCapture.sample_due(armedAt)) {
-            perfCapture.observe_sample(prosper::perf::collect_process_sample(
-                armedAt, gpu::present_count(),
-                prosper::frontend::rendered_frame_counter(
-                    vk.gpu_present, gpu::present_frame_seq()),
-                shown));
+            perfCapture.observe_sample(collectPerformanceSample(armedAt));
         }
         const prosper::perf::CaptureArmResult armed = perfCapture.arm(
             grabDir, activeCaptureTitle.id, activeCaptureTitle.label,
@@ -2456,11 +2460,7 @@ int main(int argc, char** argv) {
         // process CPU/RSS query is not paid on every UI-loop iteration.
         const uint64_t perfNow = prosper::perf::monotonic_now_ns();
         if (perfCapture.sample_due(perfNow)) {
-            perfCapture.observe_sample(prosper::perf::collect_process_sample(
-                perfNow, gpu::present_count(),
-                prosper::frontend::rendered_frame_counter(
-                    vk.gpu_present, gpu::present_frame_seq()),
-                shown));
+            perfCapture.observe_sample(collectPerformanceSample(perfNow));
         }
         prosper::perf::CaptureOutcome perfOutcome;
         if (perfCapture.take_outcome(perfOutcome)) {
