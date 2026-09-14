@@ -3150,7 +3150,15 @@ extern "C" void prosper_gpu_submit_scope_begin() {
     if (!post_submit_visibility_enabled()) return;
     PendQueue& p = pend_q();
     std::unique_lock<std::mutex> lk(p.mx);
-    p.cv.wait(lk, [&] { return p.inflight == 0; });
+    // At the zero-active boundary, give the worker its existing post-return drain before
+    // accepting more work. Otherwise a fast caller can continually reset the grace deadline,
+    // retaining tens of thousands of completed labels and starving its own progress (#3674).
+    // Nested or concurrent active scopes must still be able to proceed: waiting for their own
+    // private completion queue here would deadlock. No active-submit write is exposed early.
+    p.cv.wait(lk, [&] {
+        return p.inflight == 0 &&
+            (t_submit_scope_depth != 0 || p.active_submits != 0 || p.q.empty());
+    });
     t_submit_scope_depth++;
     p.active_submits++;
     p.scope_begins++;

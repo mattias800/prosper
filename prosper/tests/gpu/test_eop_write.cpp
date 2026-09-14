@@ -18,6 +18,7 @@
 #include <cstring>
 #include <chrono>
 #include <initializer_list>
+#include <future>
 #include <string>
 #include <thread>
 #include <vector>
@@ -319,6 +320,29 @@ int main() {
         rejected_submit_return.join();
         CHECK(prosper_gpu_submit_scope_active() && label == 0xaaaaaaaa55555555ull,
               "unmatched return hook cannot retire another thread's active submit");
+        // A different submitter may enter while this outer scope is still active. Requiring an
+        // empty queue unconditionally would block a producer needed by the active submit (#3674).
+        std::promise<void> concurrent_returned;
+        auto returned = concurrent_returned.get_future();
+        std::thread concurrent_submit([&] {
+            prosper_gpu_submit_scope_begin();
+            prosper_gpu_submit_scope_end();
+            concurrent_returned.set_value();
+        });
+        const bool concurrent_admitted =
+            returned.wait_for(std::chrono::milliseconds(500)) == std::future_status::ready;
+        CHECK(concurrent_admitted, "a concurrent active submit bypasses retired-queue admission");
+        if (!concurrent_admitted) {
+            // Release the outer scope so a broken admission predicate fails rather than hanging
+            // the test. Re-enter after joining to keep the remaining lifecycle checks bounded.
+            prosper_gpu_submit_scope_end();
+            concurrent_submit.join();
+            prosper_gpu_submit_scope_begin();
+        } else concurrent_submit.join();
+        const auto after_concurrent = observe_queue();
+        CHECK(after_concurrent && after_concurrent->active_submits == 1 &&
+              after_concurrent->queued == 2 && label == 0xaaaaaaaa55555555ull,
+              "concurrent return keeps the outer submit's completion label private");
         // A same-thread re-entrant tagged import opens its own scope before validation. Its return
         // checkpoint consumes only that nested token, leaving the outer invocation active.
         prosper_gpu_submit_scope_begin();
@@ -340,6 +364,31 @@ int main() {
               drained->front_item_age_ns == 0 && drained->scope_begins == drained->scope_ends &&
               drained->deadline_resets == scope_start->deadline_resets + 1,
               "nested and unmatched returns preserve snapshot balance and reset only at final return");
+    }
+
+    // A fast sequence of outer submit calls must not postpone retired completion labels forever
+    // by repeatedly resetting the 1 ms worker deadline. The next outer admission is a safe point:
+    // the previous import has returned, while none of the new submit's labels exist yet (#3674).
+    {
+        uint64_t label = 0;
+        const uint64_t address = reinterpret_cast<uintptr_t>(&label);
+        for (uint32_t value = 1; value <= 8; ++value) {
+            const uint32_t stream[] = {
+                PM4(7, IT_NOP, R_RELEASE_MEM), static_cast<uint32_t>(address),
+                static_cast<uint32_t>(address >> 32), 2, value, 0, 0x04};
+            GpuState st;
+            prosper_gpu_submit_scope_begin();
+            CHECK(run_command_buffer(stream, 7, st) == 1,
+                  "consecutive-scope fixture queues a real completion label");
+            CHECK(label == value - 1,
+                  "current submit completion remains private before its return");
+            prosper_gpu_submit_scope_end();
+            prosper_gpu_submit_scope_begin();
+            CHECK(label == value,
+                  "next outer submit admits only after retired completion writes drain");
+            prosper_gpu_submit_scope_end();
+        }
+        prosper_gpu_drain_completion_writes();
     }
 
     // Renderer drains routinely encounter hundreds of resource uploads behind thousands of private
