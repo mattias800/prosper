@@ -16,6 +16,7 @@
 #include "loader/tls_layout.hpp"
 #include "host/platform/posix_shim.hpp"
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <unordered_map>
@@ -93,6 +94,7 @@ bool guest_tls_enabled() { return g_enabled && g_configured; }
 // SIGSEGV handler can read it to relocate a faulting `%fs:` access to guest_TP + offset.
 static thread_local uint64_t t_guest_tp = 0;
 uint64_t guest_tls_tp() { return t_guest_tp; }
+uint64_t guest_tls_own_tp() { return t_guest_tp; }
 
 uint64_t guest_tls_activate_thread() {
     if (!guest_tls_enabled()) return 0;
@@ -177,8 +179,20 @@ uint64_t guest_tls_host_fs_for_current_thread() {
     auto it = g_host_fs_by_tid.find(tid);
     return it == g_host_fs_by_tid.end() ? 0 : it->second;
 }
+// This host thread's OWN guest thread pointer -- the one allocated for it below, never whatever %fs
+// happens to hold right now. `guest_tls_tp()` answers the latter, and the two disagree exactly when
+// something installed a foreign TCB on this thread: the fiber-resume case in #3615. Kept in HOST TLS
+// (an ordinary thread_local, resolved through the host %fs) so it stays this thread's own even while
+// guest %fs is live.
+static thread_local uint64_t t_guest_tp = 0;
+uint64_t guest_tls_own_tp() { return t_guest_tp; }
+
 uint64_t guest_tls_activate_thread() {
     if (!guest_tls_enabled()) return 0;
+    // NB: unlike the macOS and Windows paths this is NOT idempotent -- a second call on one thread
+    // mmaps a fresh zeroed block and installs it, discarding whatever the guest had stored in the
+    // first. No call site reaches here twice today, so it is latent rather than live; tracked
+    // separately rather than changed here, because nothing in this fix depends on it.
     uint64_t host_fs = rd_fsbase();
     guest_tls_record_host_fs(host_fs);   // #3623: before any guest TCB exists for this thread
     size_t total = (size_t)g_total_below + TCB_SIZE;
@@ -204,6 +218,12 @@ uint64_t guest_tls_activate_thread() {
     // host canary makes those reads correct and re-enables HWBP/single-step-based tracing under guest-fs.
     *(uint64_t*)(tp + 0x28) = *(volatile uint64_t*)(host_fs + 0x28);   // stack canary
     *(uint64_t*)(tp + 0x30) = *(volatile uint64_t*)(host_fs + 0x30);   // pointer guard
+    // PROSPER_TLSLOG: which host thread owns which guest TCB. MUST stay ABOVE wr_fsbase -- fprintf is
+    // host libc and reads host TLS, so logging after the switch faults inside libc.
+    if (getenv("PROSPER_TLSLOG"))
+        fprintf(stderr, "[tls] activate tid=%ld guest_tp=0x%llx host_fs=0x%llx\n",
+                (long)prosper_gettid(), (unsigned long long)tp, (unsigned long long)host_fs);
+    t_guest_tp = tp;                             // record BEFORE %fs moves (host TLS write)
     wr_fsbase(tp);
     return tp;
 }
@@ -346,6 +366,7 @@ uint64_t guest_tls_activate_thread() {
 }
 
 uint64_t guest_fs_current_tp() { return t_guest_tp; }
+uint64_t guest_tls_own_tp() { return t_guest_tp; }
 bool guest_fs_reapply() {
     if (!t_guest_tp) return false;
     if (rd_fsbase() == t_guest_tp) return false;   // already correct -> genuine fault, don't loop
