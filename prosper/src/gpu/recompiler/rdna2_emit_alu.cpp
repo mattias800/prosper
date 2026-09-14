@@ -5373,7 +5373,16 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // raw-pointer resource at the load's exact PC and `by_fetch_pc` finds it below --
                 // and the dword index is `(soffset + imm) >> 2` either way. An UNTRACKED offset
                 // still rejects, for both forms: never fold an unknown runtime offset as 0.
-                if (in.opcode <= 0xC) {
+                //
+                // Only `s_load_dword` (opcode 0x0), because that is exactly as far as the
+                // provenance reaches. The fold publishes a raw-pointer ConstantBuffer for
+                // SINGLE-DWORD loads only (`gpu_executor.cpp`, "This is the widest form that is
+                // unambiguously data") -- every wider raw form is a pointer or descriptor fetch
+                // whose result the fold tracks as V#/T#/BVH provenance instead. Admitting x2/x4/x8/
+                // x16 here would let them past the offset check with no resource to resolve against
+                // and fall to the binding-2 fallback, which renders wrong where they used to
+                // reject. The bound is the fold's own, not a guess.
+                if (in.opcode == 0x0 || (in.opcode >= 0x8 && in.opcode <= 0xC)) {
                     if (in.src[1].kind == OperandKind::SGPR ||
                         (in.src[1].kind == OperandKind::Special && in.src[1].value >= 106 && in.src[1].value <= 123)) {
                         auto it = rs.sreg.find(in.src[1].value);

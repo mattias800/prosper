@@ -889,7 +889,7 @@ HLE(g_vo_submitflip)  {
 // (`weak_import` is the Mach-O spelling), so every tool that links prosper_core WITHOUT a frontend
 // failed at link time -- `nid_census`, on the macOS x86_64 job only. A registered pointer needs no
 // per-platform attribute and is the pattern the rest of this boundary already uses.
-std::atomic<void (*)(uint64_t)> g_flip_publish_hook{nullptr};
+static std::atomic<void (*)(uint64_t)> g_flip_publish_hook{nullptr};
 extern "C" void prosper_vo_set_flip_publish_hook(void (*fn)(uint64_t)) {
     g_flip_publish_hook.store(fn, std::memory_order_release);
 }
@@ -906,9 +906,9 @@ extern "C" void prosper_vo_flip_from_gpu(uint32_t handle, int32_t bufidx, uint32
     gpu::present_flip(bufidx, flip_arg);   // scanout bookkeeping, same as the API flip
     // A title that composites with COMPUTE and never draws produces no graphics span, and every
     // publish decision — including the guest-scanout fallback written for exactly that case — sits
-    // behind one. Give the flip itself a chance to publish. Weak: a build without the live renderer
-    // links unchanged. Default off (PROSPER_FLIP_GUEST_SCANOUT), and inert once the renderer has
-    // produced any frame of its own.
+    // behind one. Give the flip itself a chance to publish. Null until a frontend registers, so a
+    // build without the live renderer does nothing here. Default off (PROSPER_FLIP_GUEST_SCANOUT),
+    // and inert once the renderer has produced any frame of its own.
     if (auto* publish = g_flip_publish_hook.load(std::memory_order_acquire))
         publish(prosper_vo_flip_count());
     prosper_eq_trigger_flip(flip_arg);     // flip completed (synchronous): fire the flip event

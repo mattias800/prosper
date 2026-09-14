@@ -323,7 +323,8 @@ std::unordered_set<uint32_t> proven_structured_wave64_mask_reduction_pcs(
 // descriptor, or an address -- and at least one such pointer use must exist, so the proof asserts a
 // shape rather than merely failing to find a counterexample. Scanning EVERY instruction rather than
 // the forward path makes control flow irrelevant: if no read anywhere treats the value as data, no
-// path can. CONFIDENCE: HIGH for the admitted shape.
+// path can — and "every read" has to include the IMPLICIT destination reads that decode no source
+// operand, or the claim is false for the whole SOPK family. CONFIDENCE: HIGH for the admitted shape.
 //
 // A later REDEFINITION of the pair is deliberately not disqualifying, and that is the one subtle
 // point. These shaders reuse the low SGPRs hard -- `s_load_dwordx8 s[0:7], s[38:39]` lands on top of
@@ -391,6 +392,16 @@ std::unordered_set<uint32_t> proven_smem_pointer_loads(const std::vector<Rdna2In
                     valid = false;
                 continue;
             }
+            // An instruction can read its own DESTINATION without naming it as a source, and the
+            // loop below cannot see that: SOPK decodes no source operands at all (`n_src` stays 0),
+            // so `s_cmpk_eq_i32 s2, 0`, `s_addk_i32`, `s_mulk_i32` and `s_cmovk_i32` -- and SOP1's
+            // conditional moves and bitset forms -- would read the pointer pair as ordinary data
+            // with this proof none the wiser. It would then be admitted, placeholdered with zero,
+            // and the shader would compute on that zero and render silently wrong, which is exactly
+            // the outcome the whole proof exists to prevent. The sibling x16 proof already makes
+            // this check; the helper was written for this case and says so.
+            const uint32_t implicit_read = scalar_implicit_destination_read_width(in);
+            if (implicit_read && touches(in.dst.value, implicit_read)) { valid = false; break; }
             for (uint32_t source = 0; valid && source < in.n_src; ++source) {
                 if (!scalar_operand(in.src[source])) continue;
                 const uint32_t words =

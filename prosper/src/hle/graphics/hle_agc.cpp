@@ -3403,8 +3403,10 @@ HLE(agc_patch_release_mem_data) {
 // target=0 and dword count=0 — a jump to nothing — which is exactly the "prosper can fold a command
 // graph different from the one the guest built" confounder (#2711 Q5).
 //
-// cmd[4] is deliberately NOT touched: predication is owned by sceAgcSetPacketPredication on this same
-// packet, and the composite segments this title jumps to are predicated (#319). Cache policy has no
+// The header's PREDICATE bit is deliberately NOT touched: predication is owned by
+// sceAgcSetPacketPredication on this same packet, and the composite segments this title jumps to are
+// predicated (#319). It lived in cmd[4] until #3676 shrank the packet to the hardware's four
+// dwords; the rule is unchanged, only its home. Cache policy has no
 // field in the R_JUMP representation and prosper's own sceAgcDcbJump likewise records no policy, so it
 // is logged rather than stored — a slot invented for it here would be read by nothing.
 // CONFIDENCE: HIGH on the argument roles and the packet shape (both measured); MED on cache policy
@@ -3506,9 +3508,10 @@ inline void jump_patch_refusal_detail(const uint32_t* cmd, uint64_t policy, uint
 
 HLE(agc_jump_patch_target) {
     auto* cmd = (uint32_t*)(uintptr_t)a0; if (!cmd) return 0;
-    // FOUR dwords, not kDwJump: this handler reads cmd[0] and writes cmd[1..3], and the span contract
-    // above is the dwords each handler actually TOUCHES rather than the packet's nominal length.
-    // cmd[4] is deliberately outside it -- predication belongs to sceAgcSetPacketPredication.
+    // FOUR dwords: this handler reads cmd[0] and writes cmd[1..3], and the span contract above is the
+    // dwords each handler actually TOUCHES rather than the packet's nominal length. Since #3676 that
+    // is also the whole packet -- and cmd[0] must survive UNCHANGED, because the header now carries
+    // sceAgcSetPacketPredication's PREDICATE bit.
     if (!patch_target_writable(a0, 4u * sizeof(uint32_t), "JumpPatchTarget")) return 0;
     if (!patch_check(cmd, R_JUMP, "JumpPatchTarget")) { jump_patch_refusal_detail(cmd, a1, a2, a3); return 0; }
     const uint32_t pre_lo = cmd[1], pre_hi = cmd[2], pre_ndw = cmd[3];

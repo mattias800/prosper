@@ -304,7 +304,7 @@ int main() {
         // constant: it writes cmd[7]/cmd[8] on its long arm, and a packet at the very end of a
         // mapping passes a header-sized probe and faults on that store, so it re-probes before the
         // tail. (SetPacketPredication was the other until #3676 moved the predication flag from
-        // cmd[4] into header bit 0; it now reads and writes cmd[0] alone.)
+        // the predication flag into header bit 0; it now reads and writes cmd[0] alone.)
         {
             const struct { const char* nid; const char* name; } late[] = {
                 { "w6Dj1VJt5qY", "SetPacketPredication"    },
@@ -782,8 +782,8 @@ int main() {
                   "the built Jump packet starts EMPTY (target=0, count=0) -- the state the guest patches");
             CHECK((jpkt[0] & 1u) == 0, "the built Jump packet starts UNPREDICATED (header bit 0 clear)");
 
-            // Predicate it the way the guest does, through the real handler, and pin that the
-            // 4-dword packet still round-trips the flag the 5-dword one carried in cmd[4].
+            // Predicate it the way the guest does, through the real handler, and pin that the flag
+            // round-trips through the header bit that replaced the packet's fifth dword (#3676).
             auto pred = Hle::lookup("w6Dj1VJt5qY");   // sceAgcSetPacketPredication
             CHECK(pred, "SetPacketPredication is registered");
             if (pred) pred((uint64_t)(uintptr_t)jpkt, 0, 0, 0, 0, 0);

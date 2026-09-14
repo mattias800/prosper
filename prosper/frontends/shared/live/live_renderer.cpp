@@ -71,6 +71,7 @@
 #include <windows.h>
 #else
 #include <unistd.h>
+#endif
 
 // The guest-flip publish bridge. Core reaches the frontend through a REGISTERED pointer, never by
 // naming this symbol: prosper_core links into tools that have no frontend at all, and on Mach-O a
@@ -78,7 +79,6 @@
 // the macOS x86_64 job for exactly that reason, while ELF accepted it).
 extern "C" void prosper_vo_set_flip_publish_hook(void (*fn)(uint64_t));
 extern "C" void prosper_frontend_flip_publish_guest_scanout(uint64_t flip);
-#endif
 
 // Classify a guest address: 0 => not within a reserved/committed guest mapping (see hle_kernel_mem).
 extern "C" int prosper_reserved_range_state(uint64_t addr);

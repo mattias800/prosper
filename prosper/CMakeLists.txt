@@ -2012,6 +2012,10 @@ if(TARGET prosper_core)
   target_link_libraries(test_direct_descriptor_copy PRIVATE prosper_core)
   add_test(NAME direct_descriptor_copy COMMAND test_direct_descriptor_copy)
 
+  add_executable(test_smem_pointer_provenance tests/gpu/recompiler/test_smem_pointer_provenance.cpp)
+  target_link_libraries(test_smem_pointer_provenance PRIVATE prosper_core)
+  add_test(NAME smem_pointer_provenance COMMAND test_smem_pointer_provenance)
+
   add_executable(test_image_descriptor_class_lookup
                  tests/gpu/recompiler/test_image_descriptor_class_lookup.cpp)
   target_link_libraries(test_image_descriptor_class_lookup PRIVATE prosper_core)
