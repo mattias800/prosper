@@ -53,3 +53,7 @@ before treating an upload as read-only. Unresolved writes must not silently beco
 and exclusive-predecessor snapshot slots. Its owner is the executor's exact-byte-validated decoded
 shader cache. Register values, descriptors, guest reads and snapshot values remain invocation-local;
 a plan must never become proof that resource contents are unchanged.
+
+`fold_reader` is the resource-fold workbench seam. Live reads preserve repeated consumption;
+only the existing partially OOB scalar-buffer load snapshots an in-range prefix. Offline readers
+match ordered logical requests and must never dereference captured guest addresses.

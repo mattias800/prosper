@@ -177,7 +177,10 @@ size_t dynamic_fold_shader_dwords(uint32_t shader_size_bytes);
 // gpu_executor.cpp: the exact fetch instruction (pc), its SRSRC SGPR, and the V# live in that SGPR
 // at that instruction. Exposed (with resolve_dynamic_fetch) so the fold's scalar-ALU semantics are
 // unit-testable; production callers stay inside gpu_executor.cpp.
+struct FoldReader;
+
 struct DynFetch {
+    bool operator==(const DynFetch&) const = default;
     uint32_t fetch_pc; int srsrc; DecodedBufferDescriptor desc; uint32_t desc_v3;
     // Entry user-data dword that supplied the first raw V# word, proven only when all four live
     // descriptor words remain an unchanged consecutive seed (possibly through scalar moves) and
@@ -217,6 +220,7 @@ struct DynFetch {
 inline constexpr uint32_t kMaxSelectedTableRecords = 256u;
 
 struct SrtUse {
+    bool operator==(const SrtUse&) const = default;
     int kind = 0;                    // 0 = texture, 1 = constant buffer, 2 = BVH buffer,
                                      // 3 = proven guarded null BVH
     uint32_t key = 0;                // the s_load immediate byte offset (== emit_alu's sreg_srt tag);
@@ -324,7 +328,8 @@ std::vector<DynFetch> resolve_dynamic_fetch(const uint32_t* code, size_t dwords,
                                             uint32_t pcrel_dispatch_target = UINT32_MAX,
                                             const PcrelDispatchInfo* pcrel_dispatch = nullptr,
                                             const uint32_t* system_sgprs = nullptr,
-                                            uint32_t nsystem_sgprs = 0);
+                                            uint32_t nsystem_sgprs = 0,
+                                            FoldReader* reader = nullptr);
 
 // Add instruction-provenance compute buffer resources to a metadata-built table. This is the exact
 // buffer-discovery path used by realize_compute_dispatches; it is exposed so tests can assert the

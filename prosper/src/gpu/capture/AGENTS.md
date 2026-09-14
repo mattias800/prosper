@@ -3,6 +3,9 @@
 Serializes a live frame — commands, shaders, resources, and the renderer-owned targets it samples —
 into a `.prgbundle` / `.prgcap` that `tools/gpu_replay` can reproduce offline and deterministically.
 
+- `fold_capture` — a separate opt-in `.prfold` transcript at the resource-fold evaluator boundary;
+  code/register ownership, ordered probes and consumed words, and strict offline replay. It does
+  not reuse the frame materializer. See `tools/fold_replay/README.md` for its intrusive capture mode.
 - `gpu_capture` — the capture lifecycle: begin, finish, materialize, and the pending-capture
   plumbing behind the F9 grab and the scheduled triggers.
 - `capture_collect` — gathering a frame's contents: intervals, tables, submit items, raw shader

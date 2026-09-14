@@ -5,6 +5,7 @@
 // pure. No Vulkan here — the backend is a std::function injected by whoever owns a device (the runtime
 // binary at startup, or a test via render_runner.h), so prosper_core links this without Vulkan.
 #include "gpu/resources/fold_control_plan.hpp"
+#include "gpu/capture/fold_capture.hpp"
 #include "gpu/execute/gpu_execute.hpp"
 #include "gpu/diagnostics/watch_list.hpp"   // strict 0x-only watch parsing (shared with the RTT watch)
 #include "diagnostics/env_numeric.hpp"   // #3267: a typo must not silently drop an operator-set cap
@@ -3224,7 +3225,16 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                       uint32_t user_sgpr_base, std::vector<SrtUse>* srt_uses,
                       uint32_t pcrel_dispatch_target,
                       const PcrelDispatchInfo* pcrel_dispatch,
-                      const uint32_t* system_sgprs, uint32_t nsystem_sgprs) {
+                      const uint32_t* system_sgprs, uint32_t nsystem_sgprs, FoldReader* reader) {
+    static const bool capture_enabled = std::getenv("PROSPER_FOLD_CAPTURE_DIR") != nullptr;
+    if (!reader && capture_enabled) {
+        std::vector<DynFetch> captured;
+        if (try_capture_live_fold(code, dwords, user_sgprs, nsgpr, user_sgpr_base,
+                srt_uses, pcrel_dispatch_target, pcrel_dispatch, system_sgprs,
+                nsystem_sgprs, captured)) return captured;
+    }
+    if (reader || capture_enabled) fold_workbench_evaluations.fetch_add(1, std::memory_order_relaxed);
+    if (reader) ++reader->evaluations;
     using FoldClock = std::chrono::steady_clock;
     static const bool profile_fold = std::getenv("PROSPER_STAGE_FOLD_PROFILE") != nullptr;
     const auto fold_start = profile_fold ? FoldClock::now() : FoldClock::time_point{};
@@ -3233,6 +3243,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
     double guest_probe_ms = 0.0;
     std::vector<DynFetch> out;
     const auto decoded = decode_shader_cached(code, dwords);
+    if (reader) reader->decoded_dwords = static_cast<uint32_t>(decoded->code.size());
     const auto decode_done = profile_fold ? FoldClock::now() : FoldClock::time_point{};
     std::vector<Rdna2Inst> specialized;
     const std::vector<Rdna2Inst>* fold_instructions = &decoded->instructions;
@@ -3254,6 +3265,8 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
     if (fold_instructions == &decoded->instructions && decoded->shader_constant_specialized)
         fold_instructions = &decoded->shader_constant_instructions;
     const auto& ins = *fold_instructions;
+    if (reader) reader->shader_constant_specialized =
+        fold_instructions == &decoded->shader_constant_instructions;
     // Specialization selects a different stream. Keep PC-relative plans invocation-local until
     // a cache key explicitly covers that specialization; ordinary and constant-selected streams
     // have separate immutable metadata under the exact-byte-validated decoded owner.
@@ -3268,16 +3281,21 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
         local_control_plan = build_fold_control_plan(ins);
         control_plan = &local_control_plan;
     }
-    static const bool branch_exclusive_disabled =
+    static const bool default_branch_exclusive_disabled =
         std::getenv("PROSPER_NO_BRANCH_EXCLUSIVE") != nullptr;
+    const bool branch_exclusive_disabled = reader ? reader->branch_exclusive_disabled
+                                                 : default_branch_exclusive_disabled;
 
     const bool gta5_null_raw_store_guard = pcrel_dispatch_target == UINT32_MAX &&
         rdna2_gta5_null_guarded_raw_store_shader(code, dwords);
 
-    auto readable = [&](uint64_t addr, uint32_t bytes) {
-        if (!profile_fold) return guest_readable(addr, bytes);
+    uint32_t read_pc = UINT32_MAX;
+    auto readable = [&](uint64_t addr, uint32_t bytes, FoldProbe kind = FoldProbe::Raw) {
+        if (!profile_fold) return reader ? reader->probe(kind, read_pc, addr, bytes)
+                                         : guest_readable(addr, bytes);
         const auto start = FoldClock::now();
-        const bool result = guest_readable(addr, bytes);
+        const bool result = reader ? reader->probe(kind, read_pc, addr, bytes)
+                                   : guest_readable(addr, bytes);
         guest_probe_ms += std::chrono::duration<double, std::milli>(
             FoldClock::now() - start).count();
         ++guest_probe_calls;
@@ -3288,7 +3306,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
     // narrows it to ONE shader (a full run otherwise traces every draw's walk — unusable volume).
     // g_dyntrace_force: set by the PROSPER_DYNTRACE_FAIL failure-replay path (gpu_execute.hpp) so
     // the walk of a shader that just FAILED to recompile is traced without knowing its address.
-    bool trc = g_dyntrace_force || getenv("PROSPER_DYNTRACE") != nullptr;
+    bool trc = !reader && (g_dyntrace_force || getenv("PROSPER_DYNTRACE") != nullptr);
     if (trc && !g_dyntrace_force)
         if (const char* fa = getenv("PROSPER_DYNTRACE_ADDR"))
             trc = strtoull(fa, nullptr, 16) == (uint64_t)(uintptr_t)code;
@@ -3820,6 +3838,8 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
         watch_w0 = in.words[0]; watch_w1 = in.len_dwords > 1 ? in.words[1] : 0u;
         watch_len = in.len_dwords;
         if (in.is_end) break;
+        read_pc = in.pc;
+        if (reader) ++reader->evaluated_instructions;
         const FoldControlStep& control = control_plan->steps[instruction_index];
         if (control.reset_zero_mip) same_block_zero_vgprs.reset();
         // A plain v_mov is still lane-predicated by EXEC. Without tracking the active mask and its
@@ -4784,7 +4804,8 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 if (!is_buffer && !addr_readable) {
                     for (uint64_t mask : {0xFFFFFFFFFFFFull, 0xFFFFFFFFFFull}) {
                         const uint64_t candidate = (((base & mask) + (uint64_t)byte_off) & ~3ull);
-                        if (candidate != addr && readable(candidate, n * 4)) {
+                        if (candidate != addr && readable(candidate, n * 4,
+                            mask == 0xFFFFFFFFFFFFull ? FoldProbe::Base48 : FoldProbe::Base40)) {
                             if (trc) fprintf(stderr, "[dyntrace]   canonical S_LOAD addr 0x%llx -> 0x%llx (mask=0x%llx)\n",
                                              (unsigned long long)addr, (unsigned long long)candidate,
                                              (unsigned long long)mask);
@@ -4796,7 +4817,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 }
                 if (is_buffer)
                     addr_readable = scalar_in_range_dwords != 0u &&
-                                    readable(addr, scalar_in_range_dwords * 4u);
+                                    readable(addr, scalar_in_range_dwords * 4u, FoldProbe::ScalarBuffer);
                 if (!addr_readable) { if (trc) fprintf(stderr, "[dyntrace]   addr 0x%llx unreadable\n", (unsigned long long)addr);
                                       for (uint32_t k = 0; k < n; k++) {
                                           if (is_buffer && k >= scalar_in_range_dwords)
@@ -4904,25 +4925,23 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                     }
                 }
                 std::array<uint32_t, 16> bounded_scalar_words{};
-                const uint32_t* mem = (const uint32_t*)(uintptr_t)addr;
-                if (is_buffer && scalar_in_range_dwords < n) {
-                    std::memcpy(bounded_scalar_words.data(), mem,
-                                scalar_in_range_dwords * sizeof(uint32_t));
-                    mem = bounded_scalar_words.data();
-                }
+                FoldWords mem(reader, in.pc, addr);
+                if (is_buffer && scalar_in_range_dwords < n)
+                    mem.snapshot_prefix(bounded_scalar_words.data(),
+                                        scalar_in_range_dwords * sizeof(uint32_t));
                 const bool imm_only = (soff_field == 125) && (int32_t)in.literal >= 0;   // SGPR_NULL soffset
                 const bool optional_table_source =
                     !is_buffer && in.opcode == kSmemOpcodeLoadDwordX2 && n == 2u &&
                     imm_only && in.literal == kGtaOptionalBufferPointerOffset &&
                     sbase == 0 && consecutive_seed_copy_range(sbase, 2) &&
                     addr == base + kGtaOptionalBufferPointerOffset &&
-                    readable(base, kGtaOptionalBufferTableBytes);
+                    readable(base, kGtaOptionalBufferTableBytes, FoldProbe::OptionalTable);
                 const bool nullable_output_table_source =
                     !is_buffer && in.opcode == kSmemOpcodeLoadDwordX2 && n == 2u &&
                     imm_only && in.literal == kGtaNullableOutputPointerOffset &&
                     sbase == 0 && consecutive_seed_copy_range(sbase, 2) &&
                     addr == base + kGtaNullableOutputPointerOffset &&
-                    readable(base, kGtaNullableOutputWitnessBytes);
+                    readable(base, kGtaNullableOutputWitnessBytes, FoldProbe::NullableOutput);
                 uint32_t bvh_count_origin = 0;
                 if (!is_buffer && n == 4 && imm_only && in.literal == 0x58u &&
                     valid_reg(sbase) && valid_reg(sbase + 1) &&
@@ -5033,7 +5052,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 // is far broader than "descriptor tables", and the design question is specifically about
                 // table slots. Narrowing costs one run and makes the answer actionable instead of
                 // suggestive.
-                if (descr_coherence_enabled() && n == 4 && is_buffer &&
+                if (!reader && descr_coherence_enabled() && n == 4 && is_buffer &&
                     scalar_in_range_dwords == n) {
                     uint64_t h = 1469598103934665603ull;              // FNV-1a over the four dwords
                     for (int k = 0; k < 4; ++k) {
@@ -5882,7 +5901,8 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
     }
     if (profile_fold)
         record_stage_fold_profile(
-            (uint64_t)(uintptr_t)code, user_sgpr_base, decoded->code.size(), ins.size(), out.size(),
+            reader ? reader->logical_code_address : (uint64_t)(uintptr_t)code,
+            user_sgpr_base, decoded->code.size(), ins.size(), out.size(),
             srt_uses ? srt_uses->size() - srt_before : 0, guest_probe_calls,
             std::chrono::duration<double, std::milli>(FoldClock::now() - fold_start).count(),
             std::chrono::duration<double, std::milli>(decode_done - fold_start).count(),
