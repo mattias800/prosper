@@ -211,8 +211,13 @@ int main() {
                   "legacy Umount releases an active mount synchronously");
             CHECK(resolve_guest_path("/savedata0/probe.bin") == "/savedata0/probe.bin",
                   "legacy Umount removes /savedata0 path translation");
-            CHECK(umount((uint64_t)(uintptr_t)guarded.result.mountPoint, 0,0,0,0,0) == 0x809F0008ull,
-                  "legacy Umount of an inactive mount -> NOT_FOUND");
+            // #3666: this used to expect NOT_FOUND (0x809F0008), which sceSaveDataUmount alone
+            // answered for BOTH "your mount point is wrong" and "nothing is mounted". It now
+            // answers the same NOT_MOUNTED its four siblings do for the second of those, so a
+            // caller can tell the two apart. The assertion tracks the contract, not the constant:
+            // what it pins is that an inactive mount is refused and is not a parameter error.
+            CHECK(umount((uint64_t)(uintptr_t)guarded.result.mountPoint, 0,0,0,0,0) == 0x809F0004ull,
+                  "legacy Umount of an inactive mount -> NOT_MOUNTED");
 
             memset(&guarded, 0xAB, sizeof guarded);
             input2.mode = 4; // CREATE is exclusive

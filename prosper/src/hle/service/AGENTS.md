@@ -64,6 +64,19 @@ read the mount point at all (#3653). Validate before touching an out-parameter, 
 caller's buffer untouched on an error return: that is this folder's existing convention, followed by
 Mount3's NOT_FOUND path and by `GetParam`'s refusals.
 
+**And when you add the missing read, establish WHICH argument to read rather than inferring it from
+a sibling.** `sceSaveDataUmount` takes the mount point first; `sceSaveDataUmount2` takes a flags word
+first and the mount point *second*, so the obvious fix -- validate `a0`, by analogy with the call one
+NID over -- would have refused every correct call while still not reading the argument that mattered
+(#3666). The two are not even in the same export library: the PS5-native surface
+(`libSceSaveData.native`: Mount3, Umount2, GetMountInfo, SetParam, GetParam, Prepare, Commit) is a
+different API generation from the PS4-namespace one (`libSceSaveData`: Mount/Mount2, Umount,
+UmountSys, UmountWithBackup), and only the native one is imported by the local corpus -- 34 of 61
+dumps import Umount2 and **none** import Umount. Settle the shape with `PROSPER_SVCLOG=1` on a title
+that actually makes the call (it already dumps the bytes behind every pointer-ish argument, safely
+and page-clamped) before writing a validator; `tools/re/nid_gate_scan.py` then says who can see the
+answer you chose.
+
 ## Where the numbers come from
 
 The `SAVE_DATA_ERR_*`-style constants and struct offsets in here are reverse-engineered, and each
