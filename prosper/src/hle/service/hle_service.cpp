@@ -676,6 +676,53 @@ HLE(s_videodec2_create_decoder) {
                           (unsigned long long)handle, config->codec);
     return 0;
 }
+// --- libSceVdecsw decoder-config adapter (#3669) -----------------------------------------------
+//
+// libSceVdecsw's decoder config is libSceVideodec2's plus 8 bytes -- 0x50 against 0x48 -- and the two
+// agree field-for-field over the part they share. That is read off a live struct rather than assumed
+// (Uncharted PPSA05684, `eboot+0x3289c70` at the moment it calls QueryDecoderMemoryInfo):
+//
+//   +0x00 size=0x50   +0x08 resource=1   +0x0c codec=1        +0x10 profile=100 (High)
+//   +0x14 level=52    +0x18 3840x2160    +0x20 max_dpb=4      +0x24 input_depth=3
+//   +0x28 compute_queue=0x2000000000  <- exactly the handle our AllocateComputeQueue just returned
+//   +0x30 affinity=0x3f   +0x38 priority=-1   +0x3c optimize=1   +0x48 (the extra qword) = 0
+//
+// Every field lands where VdecConfig puts it, and the compute_queue matching our own return value is
+// the strongest single confirmation available: the guest read it back from us and wrote it here.
+//
+// TWO differences are handled rather than papered over:
+//   * the trailing qword at +0x48 has no Videodec2 counterpart and nothing here reads it;
+//   * the byte at +0x3f, which Videodec2 requires to be zero as `reserved1`, carries 1. It is a
+//     Vdecsw field, not a violated reservation, so the shared validator must not reject it -- the
+//     adapted copy zeroes the two reserved bytes and this comment is the record that it did.
+//     CONFIDENCE: LOW on what that byte means; nothing in prosper consumes it.
+struct VdecswConfig { VdecConfig base; uint64_t extra2; };
+static_assert(sizeof(VdecswConfig) == 0x50, "libSceVdecsw decoder config is 0x50 bytes");
+
+// Copy a guest Vdecsw config into a Videodec2-shaped one. Returns false when the guest's declared
+// size is not Vdecsw's, so a wrong ABI guess fails visibly here instead of mis-parsing downstream.
+static bool vdecsw_adapt_config(uint64_t guest_config, VdecConfig* out) {
+    const auto* c = (const VdecswConfig*)PW(guest_config);
+    if (!c || !out) return false;
+    if (c->base.size != sizeof(VdecswConfig)) {
+        vdec_reject("vdecsw.config.size", c->base.size, VDEC_ERR_STRUCT);
+        return false;
+    }
+    *out = c->base;
+    out->size = sizeof(VdecConfig);   // the shared validator checks its OWN struct's size
+    out->reserved0 = 0; out->reserved1 = 0;
+    return true;
+}
+HLE(s_vdecsw_query_decoder_memory) {
+    VdecConfig cfg{};
+    if (!vdecsw_adapt_config(a0, &cfg)) return VDEC_ERR_STRUCT;
+    return s_videodec2_query_decoder_memory((uint64_t)(uintptr_t)&cfg, a1, a2, a3, a4, a5);
+}
+HLE(s_vdecsw_create_decoder) {
+    VdecConfig cfg{};
+    if (!vdecsw_adapt_config(a0, &cfg)) return VDEC_ERR_STRUCT;
+    return s_videodec2_create_decoder((uint64_t)(uintptr_t)&cfg, a1, a2, a3, a4, a5);
+}
 HLE(s_videodec2_delete_decoder) {
     // Tear the access-unit decoder down with the guest's decoder (#2270). Without this every
     // deleted decoder strands an AVCodecContext, two AVFrames, an AVPacket and the NV12 staging
@@ -751,6 +798,20 @@ HLE(s_videodec2_decode) {
                 for (uint64_t i = 0; i < n; ++i)
                     snprintf(head + i * 3, 4, "%02x ", au[i]);
             }
+            // The first 16 bytes name only the FIRST NAL, and "does this access unit contain an SPS"
+            // is a different question that the head cannot answer -- an SPS/PPS pair sitting behind a
+            // leading slice looks identical to a stream that has none. Walk the Annex-B start codes
+            // and list every nal_unit_type, so "no parameter sets anywhere" is a measurement.
+            char nals[128] = {0}; int np = 0;
+            if (input->data && input->data_size > 4) {
+                const auto* au = (const uint8_t*)(uintptr_t)input->data;
+                for (uint64_t i = 0; i + 4 < input->data_size && np < (int)sizeof(nals) - 8; ++i) {
+                    if (au[i] || au[i + 1] || au[i + 2] != 1) continue;   // 00 00 01 start code
+                    np += snprintf(nals + np, sizeof(nals) - np, "%u ", au[i + 3] & 0x1fu);
+                    i += 3;
+                }
+            }
+            if (np) fprintf(stderr, "[vdec-contract]   au nal_unit_types: %s\n", nals);
             fprintf(stderr,
                     "[vdec-contract] decode#%u handle=0x%llx au_bytes=%llu frame_buf=%llu "
                     "frame_ptr=0x%llx head=%s\n",
@@ -942,6 +1003,171 @@ HLE(s_videodec2_decode) {
     }
     frame->accepted = 0; vdec_no_picture(frame, out, codec);
     return 0;
+}
+// --- libSceVdecsw decode loop (#3669) ----------------------------------------------------------
+//
+// Vdecsw splits what sceVideodec2Decode does in ONE synchronous call into four asynchronous ones:
+// the title stages an access unit and a frame buffer, then polls for each to complete. The structs
+// are Videodec2's, measured live rather than assumed (PPSA05684, decoder handle 0x10001):
+//
+//   SetDecodeOutput's frame struct    size = 0x18  {size, data = 0x1f00200000, data_size = 12 MiB}
+//   TrySyncDecodeOutput's out struct  size = 0x38  == sizeof(VdecOutput) exactly
+//
+// 12 MiB against the config's 3840x2160 is 4K NV12 (3840*2160*3/2 = 11.87 MiB rounded up), which
+// agrees with the format the decoder backend produces -- so the staged pieces can be handed to the
+// SAME decode path Videodec2 uses instead of a second implementation of it.
+//
+// What is NOT yet measured is logged rather than guessed: the declared size of SetDecodeInput's
+// struct, and whatever TrySyncDecodeInput writes through its second argument. Both are printed under
+// PROSPER_SVCLOG so the next run reads them off a real call.
+struct VdecswFrame { uint64_t size, data, data_size; };
+static_assert(sizeof(VdecswFrame) == 0x18, "libSceVdecsw frame struct is 0x18 bytes");
+
+// The input side is a QUEUE, not a slot, and that is a correction rather than a refinement.
+//
+// Vdecsw is asynchronous: nothing stops the title staging several access units before it polls for a
+// picture, and a single slot silently keeps only the last of them. Measured with a slot: the first
+// access unit prosper ever saw already carried nal_unit_type 1 exclusively -- no SPS, no PPS, no IDR
+// in any unit, for the whole movie -- which reads as "this stream has no parameter sets" and is a
+// conclusion about our own dropped writes. A queue keeps every staged unit in order, so what the
+// decoder sees is what the title sent.
+// The staged access unit is COPIED, not pointed at, and that is the difference between an
+// asynchronous API and a synchronous one.
+//
+// sceVideodec2Decode consumes its bitstream inside the call, so holding the guest's pointer is safe
+// there. Vdecsw's SetDecodeInput returns immediately and the picture arrives at a later poll, which
+// means the guest is free to refill its staging buffer in between -- and it does. Measured: the
+// access unit prosper logged at SetDecodeInput time carried `7 8 6 5 5 ...` (SPS, PPS, SEI, IDR
+// slices), and the SAME pointer read microseconds later inside the decoder backend carried nothing
+// but type 1. Every parameter set in the movie was overwritten before the decoder saw it, which
+// libavcodec then reported, correctly, as "non-existing PPS 0 referenced".
+struct VdecswInput { std::vector<uint8_t> au; uint64_t pts = 0; };
+struct VdecswPending {
+    std::deque<VdecswInput> inputs;               // staged access units, in order, owned
+    uint64_t out_data = 0, out_bytes = 0;
+    bool out_set = false;
+};
+std::mutex g_vdecsw_mx;
+std::unordered_map<uint64_t, VdecswPending> g_vdecsw;
+
+// Report an unknown struct ONCE per call site with its declared size, so an ABI mismatch is a named
+// finding in the log rather than a silent mis-parse. Rate-limited like vdec_reject for the same
+// reason: these sit in a per-frame loop.
+static void vdecsw_note_struct(const char* what, uint64_t size, uint64_t ptr) {
+    static std::mutex mx;
+    static std::unordered_map<const char*, int> shown;
+    { std::lock_guard<std::mutex> lk(mx); if (shown[what]++ >= 2) return; }
+    fprintf(stderr, "[vdecsw] %s: declared size = 0x%llx at 0x%llx\n", what,
+            (unsigned long long)size, (unsigned long long)ptr);
+}
+
+HLE(s_vdecsw_set_decode_input) {
+    const auto* in = (const uint64_t*)PW(a1);
+    if (!in) return VDEC_ERR_ARG;
+    vdecsw_note_struct("SetDecodeInput", in[0], a1);
+    // The whole struct, twice, under the contract lever: the access units this title stages carry
+    // nal_unit_type 1 ONLY -- no SPS, no PPS, no IDR anywhere -- so H.264 parameter sets must reach
+    // the decoder by some other field, and these six qwords are where to look first.
+    if (getenv("PROSPER_VDEC2_CONTRACT")) {
+        static std::atomic<unsigned> seq{0};
+        if (seq.fetch_add(1) < 2)
+            fprintf(stderr, "[vdecsw] SetDecodeInput struct: %016llx %016llx %016llx %016llx "
+                            "%016llx %016llx\n",
+                    (unsigned long long)in[0], (unsigned long long)in[1], (unsigned long long)in[2],
+                    (unsigned long long)in[3], (unsigned long long)in[4], (unsigned long long)in[5]);
+    }
+    // MEASURED: the title declares 0x30, which is sizeof(VdecInput) exactly -- Vdecsw's input struct
+    // IS Videodec2's. Accept only that, so a different title with a different shape is a named
+    // rejection rather than a silent mis-read of somebody else's fields.
+    if (in[0] != sizeof(VdecInput)) return vdec_reject("vdecsw.input.size", in[0], VDEC_ERR_STRUCT);
+    if (in[2] && !in[1]) return VDEC_ERR_ARG;
+    std::lock_guard<std::mutex> lk(g_vdecsw_mx);
+    auto& p = g_vdecsw[a0];
+    // Bounded: a title that stages without ever polling must not grow this without limit. The cap is
+    // generous against any plausible decode depth (the config asks for input_depth=3) and dropping
+    // the OLDEST keeps the stream's head, which is where the parameter sets live.
+    constexpr size_t kMaxStaged = 64;
+    if (p.inputs.size() >= kMaxStaged) p.inputs.pop_front();
+    VdecswInput staged;
+    if (in[1] && in[2]) {
+        const auto* src = (const uint8_t*)PW(in[1]);
+        staged.au.assign(src, src + in[2]);   // copy NOW: see the note on VdecswPending
+    }
+    staged.pts = in[3];
+    p.inputs.push_back(std::move(staged));
+    return 0;
+}
+HLE(s_vdecsw_set_decode_output) {
+    const auto* f = (const VdecswFrame*)PW(a1);
+    if (!f) return VDEC_ERR_ARG;
+    if (f->size != sizeof(*f)) return vdec_reject("vdecsw.frame.size", f->size, VDEC_ERR_STRUCT);
+    if (!f->data) return VDEC_ERR_FRAME_PTR;
+    if (!f->data_size) return VDEC_ERR_FRAME_SIZE;
+    std::lock_guard<std::mutex> lk(g_vdecsw_mx);
+    auto& p = g_vdecsw[a0];
+    p.out_data = f->data; p.out_bytes = f->data_size; p.out_set = true;
+    return 0;
+}
+HLE(s_vdecsw_try_sync_decode_input) {
+    // The title polls here for the staged access unit to have been consumed. prosper's decode is
+    // synchronous inside TrySyncDecodeOutput, so by the time the guest can observe anything the
+    // input either was staged or was not.
+    //
+    // WHAT THIS DOES NOT DO: write an out-parameter. a1 points at a 
+    // caller struct whose layout is not measured yet, and answering "done" while leaving it
+    // untouched is exactly the #2951 failure this file has been bitten by. So the declared size is
+    // logged and nothing is written -- if the title needs a field there, the log names the struct
+    // to go and read. CONFIDENCE: LOW.
+    if (a1) vdecsw_note_struct("TrySyncDecodeInput", *(const uint64_t*)PW(a1), a1);
+    std::lock_guard<std::mutex> lk(g_vdecsw_mx);
+    auto it = g_vdecsw.find(a0);
+    if (it == g_vdecsw.end()) return VDEC_ERR_DECODER;
+    return 0;
+}
+HLE(s_vdecsw_try_sync_decode_output) {
+    VdecswPending p;
+    {
+        std::lock_guard<std::mutex> lk(g_vdecsw_mx);
+        auto it = g_vdecsw.find(a0);
+        if (it == g_vdecsw.end()) return VDEC_ERR_DECODER;
+        p = it->second;
+    }
+    // A POLL IS NOT AN ACCESS UNIT. This is the one place the async shape differs from
+    // sceVideodec2Decode in a way that matters: the title calls this repeatedly until a picture
+    // appears, and feeding the staged unit to the decoder on every call re-sends the same bytes.
+    // Measured before this guard existed: eight logged decodes were seven copies of one 4253-byte
+    // unit, and the decoder's own send_failures counter climbed once per poll rather than once per
+    // frame -- which reads exactly like a stream the decoder cannot parse, and is not.
+    //
+    // So the staged input is CONSUMED here. A poll with nothing staged is answered honestly as "no
+    // picture", which is a state the Videodec2 path already knows how to express.
+    if (!p.out_set) return VDEC_ERR_FRAME_PTR;
+    auto* out = (VdecOutput*)PW(a1);
+    if (!out) return VDEC_ERR_ARG;
+    if (out->size != sizeof(*out)) return vdec_reject("vdecsw.output.size", out->size, VDEC_ERR_STRUCT);
+    if (p.inputs.empty()) {
+        uint32_t codec = 0;
+        { std::lock_guard<std::mutex> lk(g_vdec_mx); auto it = g_vdec_codecs.find(a0);
+          if (it == g_vdec_codecs.end()) return VDEC_ERR_DECODER; codec = it->second; }
+        VdecFrame fr{}; fr.size = sizeof(fr); fr.data = p.out_data; fr.data_size = p.out_bytes;
+        vdec_no_picture(&fr, out, codec);
+        return 0;
+    }
+    VdecswInput staged;
+    {
+        std::lock_guard<std::mutex> lk(g_vdecsw_mx);
+        auto& q = g_vdecsw[a0].inputs;
+        if (q.empty()) return VDEC_ERR_ARG;   // raced another poller; nothing to do
+        staged = std::move(q.front()); q.pop_front();
+    }
+    // Hand the staged pieces to the SAME decode the Videodec2 path uses -- struct checks, backend
+    // call, NV12 write and VdecOutput fill all included -- rather than reimplementing any of it.
+    // The guest's own output struct (0x38 == sizeof(VdecOutput)) is passed straight through.
+    VdecInput in{}; in.size = sizeof(in);
+    in.data = (uint64_t)(uintptr_t)staged.au.data(); in.data_size = staged.au.size();
+    in.pts = staged.pts;
+    VdecFrame fr{}; fr.size = sizeof(fr); fr.data = p.out_data; fr.data_size = p.out_bytes;
+    return s_videodec2_decode(a0, (uint64_t)(uintptr_t)&in, (uint64_t)(uintptr_t)&fr, a1, 0, 0);
 }
 HLE(s_videodec2_flush) {
     uint32_t codec;
@@ -5686,6 +5912,43 @@ void register_service_hle() {
     Hle::register_fn("NtXRa3dRzU0", (HleFn)s_videodec2_picture_info, "sceVideodec2GetPictureInfo");
     Hle::register_fn("kjrLbcyhEiw", (HleFn)s_videodec2_avc_picture_info,
                      "sceVideodec2GetAvcPictureInfo");
+    // --- libSceVdecsw: the SOFTWARE-decode sibling of libSceVideodec2 (#3669) -------------------
+    //
+    // Uncharted (PPSA05684) decodes its movies through libSceVdecsw rather than libSceVideodec2, and
+    // the two libraries share a set-up ABI. That is measured, not assumed: the title builds its
+    // compute-memory struct with `size = 0x18` and its compute-queue config with `size = 0x10`
+    // (eboot+0x1a3f75d and +0x1a3f74a), which are exactly sizeof(VdecComputeMemory) and
+    // sizeof(VdecComputeConfig) -- and prosper's handlers REJECT a mismatched size, so a wrong guess
+    // here fails visibly instead of silently mis-parsing. The argument positions were captured live
+    // (PROSPER_HWBP_ARGS on each stub) and match one-for-one:
+    //
+    //   QueryComputeMemoryInfo(info*)                 <- rdi = &{size=0x18,...}
+    //   AllocateComputeQueue(config*, memory*, out*)  <- rdi = &{size=0x10,...}, rsi = memInfo,
+    //                                                    rdx = &[rbx+0x168] (the queue handle)
+    //   QueryDecoderMemoryInfo(config*, info*)        <- rdi, rsi: two eboot .data structs
+    //   CreateDecoder(config*, memory*, out*)         <- the same two, plus the handle output
+    //
+    // Only the four SET-UP calls are registered here. The decode loop (SetDecodeInput /
+    // SetDecodeOutput / TrySyncDecodeInput / TrySyncDecodeOutput) is libSceVdecsw's own ASYNCHRONOUS
+    // shape and has no Videodec2 equivalent -- sceVideodec2Decode does all four in one synchronous
+    // call -- so mapping it onto these handlers would be an invention, and its live argument layout
+    // cannot be read until CreateDecoder hands back a decoder (every one of those four is currently
+    // entered with a null handle, which is the bug, not the ABI). Those stay unregistered, and the
+    // title keeps failing VISIBLY at TryFetchDecodedFrame rather than being told a decode succeeded.
+    // CONFIDENCE: HIGH on the four registered here (size-checked structs plus live argument capture).
+    Hle::register_fn("0moTubWCsTM", (HleFn)s_videodec2_query_compute_memory,
+                     "sceVdecswQueryComputeMemoryInfo");
+    Hle::register_fn("hIgrg5h4V6s", (HleFn)s_videodec2_allocate_compute_queue,
+                     "sceVdecswAllocateComputeQueue");
+    Hle::register_fn("A+2M7EivuOU", (HleFn)s_vdecsw_query_decoder_memory,
+                     "sceVdecswQueryDecoderMemoryInfo");
+    Hle::register_fn("+L5ArV1tPGA", (HleFn)s_vdecsw_create_decoder, "sceVdecswCreateDecoder");
+    Hle::register_fn("aqMiF0AgUYI", (HleFn)s_vdecsw_set_decode_input, "sceVdecswSetDecodeInput");
+    Hle::register_fn("rgtMCOpyBSc", (HleFn)s_vdecsw_set_decode_output, "sceVdecswSetDecodeOutput");
+    Hle::register_fn("l4sQYy5wPkc", (HleFn)s_vdecsw_try_sync_decode_input,
+                     "sceVdecswTrySyncDecodeInput");
+    Hle::register_fn("kMBw37oH8nI", (HleFn)s_vdecsw_try_sync_decode_output,
+                     "sceVdecswTrySyncDecodeOutput");
     R("sceUserServiceInitialize", s_ok);
     R("sceUserServiceTerminate", s_ok);
     // NP — an honest signed-out console (#306). NIDs verified against the PS5 3.20
