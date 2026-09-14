@@ -380,6 +380,8 @@ bool live_compute_native_storage_3d_supported(prosper::gpu::DataFormat format,
 // Monotonic count of exact compute fills executed by the structurally guarded CPU path. Tests use
 // the delta to distinguish the intended bypass from a successful Vulkan fallback.
 uint64_t live_compute_cpu_fill_dispatches();
+// Completed full-fill reuse: no CPU stores, guest GPU dispatch, or result comparison.
+uint64_t live_compute_cached_fill_dispatches();
 // Monotonic attribution for storage-result source validation. Production-backend tests use this to
 // prove that changing proven-full results do not copy a redundant guest-byte snapshot.
 uint64_t live_compute_storage_result_snapshot_bytes();
@@ -394,6 +396,8 @@ bool cold_storage_result_snapshot_can_defer(bool host_data, bool full_overwrite,
 // Deterministic failure injection for the storage-image recovery regression test. The next storage
 // readback fails after dispatch, exercising retained-image invalidation without a Vulkan fault.
 void live_compute_fail_next_storage_readback_for_test();
+// Consume only after a writable-buffer GPU dispatch completes, before guest publication.
+void live_compute_fail_next_buffer_readback_for_test();
 // Inject an optional conversion-admission result; does not fail an actual driver call.
 void live_compute_fail_next_packed_rtt_setup_for_test(bool device_lost);
 // One-shot failure at retile's actual allocation/eager-map driver boundary.

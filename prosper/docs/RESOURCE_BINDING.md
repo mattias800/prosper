@@ -219,6 +219,27 @@ on a guest-revoked alias remains unhandled, and a trace's already-owned single-s
 as invalid without restoring revoked permissions. Windows/macOS keep their existing safe fallback.
 This does not establish complete recovery after diagnostic-only partial protection failures.
 
+### Ruled out: deferred compute export watches
+
+A 2026-09-14 same-binary Sonic pair deferred new graphics-export watches until a borrower
+requested authority outside the ordered journal. Presentations stayed at 8.1523 versus 8.1478/s;
+F8 compute setup grew from 161.83 to 327.85 ms while writeback fell from 493.72 to 458.67 ms.
+Ordinary compute input acquisition also consumes those watches: omitting that demand loses source
+validation and increases snapshot work. The tested policy was rejected; its patch and raw evidence
+are retained. Any future demand policy must include input acquisition and measure enclosing costs,
+not just watch time ([#3407 evidence](https://github.com/mattias800/prosper/issues/3407#issuecomment-5660176811)).
+
+The hot buffer comparator is a different cost: all 212 retained Sonic comparisons returned unchanged.
+Reducing contention on its changed-result atomic cannot address that population, since those atomic
+stores never execute. The proposed workgroup reduction was archived without building or enabling it.
+
+A subsequent watched-CPU-fill retry also failed to establish a gain: Sonic measured 8.3493/s
+control versus 7.9647/s enabled, despite eliminating almost all GPU comparison time. The CPU
+stores and watch preparation must be included in that tradeoff. The same fixture exposed a
+separate correctness defect: an explicit equal-value clear must invalidate rendered depth even
+when unchanged guest bytes can retain their watch/journal authority
+([#3407 evidence](https://github.com/mattias800/prosper/issues/3407#issuecomment-5660461734)).
+
 ### Ruled out: shared watch reconstruction
 
 - **Reset/create repairs stale alias protections even when another registration survives:** falsified
