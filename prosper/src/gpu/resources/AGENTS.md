@@ -49,7 +49,11 @@ decline the proof. Known GLSL arithmetic has no writes; Modf and Frexp output po
 A complete report still requires consumers to combine every alias/stage's writable and atomic flags
 before treating an upload as read-only. Unresolved writes must not silently become cache authority.
 
-`fold_control_plan` holds code-only control metadata for the scalar descriptor fold: block boundaries
-and exclusive-predecessor snapshot slots. Its owner is the executor's exact-byte-validated decoded
+`fold_control_plan` holds code-only control metadata for the scalar descriptor fold: block boundaries,
+exclusive-predecessor snapshot slots, EXEC-write classification and mip-operand shape. Its owner is the executor's exact-byte-validated decoded
 shader cache. Register values, descriptors, guest reads and snapshot values remain invocation-local;
 a plan must never become proof that resource contents are unchanged.
+
+`fold_reader` is the resource-fold workbench seam. Live reads preserve repeated consumption;
+only the existing partially OOB scalar-buffer load snapshots an in-range prefix. Offline readers
+match ordered logical requests and must never dereference captured guest addresses.

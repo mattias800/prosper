@@ -2084,6 +2084,18 @@ if(TARGET prosper_core)
   target_include_directories(test_dynfetch_fold PRIVATE tests)
   target_link_libraries(test_dynfetch_fold PRIVATE prosper_core)
   add_test(NAME dynfetch_fold COMMAND test_dynfetch_fold)
+  add_executable(fold_replay tools/fold_replay/main.cpp)
+target_link_libraries(fold_replay PRIVATE prosper_core)
+
+add_executable(test_fold_capture tests/gpu/execute/test_fold_capture.cpp)
+  target_link_libraries(test_fold_capture PRIVATE prosper_core)
+  add_test(NAME fold_capture COMMAND test_fold_capture)
+if(Python3_Interpreter_FOUND)
+  add_test(NAME fold_capture_cli COMMAND "${Python3_EXECUTABLE}"
+    "${CMAKE_SOURCE_DIR}/tools/fold_replay/test_cli.py"
+    "$<TARGET_FILE:test_fold_capture>" "$<TARGET_FILE:fold_replay>")
+endif()
+
   add_executable(test_fold_control_plan tests/gpu/execute/test_fold_control_plan.cpp)
   target_link_libraries(test_fold_control_plan PRIVATE prosper_core)
   add_test(NAME fold_control_plan COMMAND test_fold_control_plan)

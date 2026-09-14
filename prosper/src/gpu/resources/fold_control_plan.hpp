@@ -18,6 +18,8 @@ struct FoldControlStep {
     uint32_t save_slot = UINT32_MAX;
     uint32_t restore_source_pc = UINT32_MAX;
     bool reset_zero_mip = false;
+    bool changes_exec = false;
+    uint16_t zero_mip_vgpr = UINT16_MAX; // absent shape; valid VGPRs are 0..255
 };
 struct FoldControlPlan {
     std::vector<FoldControlStep> steps;
@@ -36,6 +38,15 @@ inline FoldControlPlan build_fold_control_plan(const std::vector<Rdna2Inst>& ins
     fold_control_plan_builds.fetch_add(1, std::memory_order_relaxed);
     FoldControlPlan plan;
     plan.steps.resize(ins.size());
+    // Instruction-only facts are valid even when the stream has an indirect CFG. Derive them
+    // before that conservative early return; the live zero-value/EXEC proof stays per invocation.
+    for (size_t k = 0; k < ins.size(); ++k) {
+        auto& step = plan.steps[k];
+        step.changes_exec = rdna2_instruction_may_change_exec(ins[k]);
+        uint32_t mip = 0;
+        if (rdna2_mimg_zero_mip_shape(ins[k], &mip))
+            step.zero_mip_vgpr = static_cast<uint16_t>(mip);
+    }
     const auto branch = [](const Rdna2Inst& in) {
         return in.fmt == Rdna2Format::SOPP &&
             (in.opcode == 0x02 || (in.opcode >= 0x04 && in.opcode <= 0x09));

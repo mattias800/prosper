@@ -5,6 +5,7 @@
 // pure. No Vulkan here — the backend is a std::function injected by whoever owns a device (the runtime
 // binary at startup, or a test via render_runner.h), so prosper_core links this without Vulkan.
 #include "gpu/resources/fold_control_plan.hpp"
+#include "gpu/capture/fold_capture.hpp"
 #include "gpu/execute/gpu_execute.hpp"
 #include "gpu/diagnostics/watch_list.hpp"   // strict 0x-only watch parsing (shared with the RTT watch)
 #include "diagnostics/env_numeric.hpp"   // #3267: a typo must not silently drop an operator-set cap
@@ -3224,7 +3225,16 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                       uint32_t user_sgpr_base, std::vector<SrtUse>* srt_uses,
                       uint32_t pcrel_dispatch_target,
                       const PcrelDispatchInfo* pcrel_dispatch,
-                      const uint32_t* system_sgprs, uint32_t nsystem_sgprs) {
+                      const uint32_t* system_sgprs, uint32_t nsystem_sgprs, FoldReader* reader) {
+    static const bool capture_enabled = std::getenv("PROSPER_FOLD_CAPTURE_DIR") != nullptr;
+    if (!reader && capture_enabled) {
+        std::vector<DynFetch> captured;
+        if (try_capture_live_fold(code, dwords, user_sgprs, nsgpr, user_sgpr_base,
+                srt_uses, pcrel_dispatch_target, pcrel_dispatch, system_sgprs,
+                nsystem_sgprs, captured)) return captured;
+    }
+    if (reader || capture_enabled) fold_workbench_evaluations.fetch_add(1, std::memory_order_relaxed);
+    if (reader) ++reader->evaluations;
     using FoldClock = std::chrono::steady_clock;
     static const bool profile_fold = std::getenv("PROSPER_STAGE_FOLD_PROFILE") != nullptr;
     const auto fold_start = profile_fold ? FoldClock::now() : FoldClock::time_point{};
@@ -3233,6 +3243,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
     double guest_probe_ms = 0.0;
     std::vector<DynFetch> out;
     const auto decoded = decode_shader_cached(code, dwords);
+    if (reader) reader->decoded_dwords = static_cast<uint32_t>(decoded->code.size());
     const auto decode_done = profile_fold ? FoldClock::now() : FoldClock::time_point{};
     std::vector<Rdna2Inst> specialized;
     const std::vector<Rdna2Inst>* fold_instructions = &decoded->instructions;
@@ -3254,6 +3265,8 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
     if (fold_instructions == &decoded->instructions && decoded->shader_constant_specialized)
         fold_instructions = &decoded->shader_constant_instructions;
     const auto& ins = *fold_instructions;
+    if (reader) reader->shader_constant_specialized =
+        fold_instructions == &decoded->shader_constant_instructions;
     // Specialization selects a different stream. Keep PC-relative plans invocation-local until
     // a cache key explicitly covers that specialization; ordinary and constant-selected streams
     // have separate immutable metadata under the exact-byte-validated decoded owner.
@@ -3268,16 +3281,21 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
         local_control_plan = build_fold_control_plan(ins);
         control_plan = &local_control_plan;
     }
-    static const bool branch_exclusive_disabled =
+    static const bool default_branch_exclusive_disabled =
         std::getenv("PROSPER_NO_BRANCH_EXCLUSIVE") != nullptr;
+    const bool branch_exclusive_disabled = reader ? reader->branch_exclusive_disabled
+                                                 : default_branch_exclusive_disabled;
 
     const bool gta5_null_raw_store_guard = pcrel_dispatch_target == UINT32_MAX &&
         rdna2_gta5_null_guarded_raw_store_shader(code, dwords);
 
-    auto readable = [&](uint64_t addr, uint32_t bytes) {
-        if (!profile_fold) return guest_readable(addr, bytes);
+    uint32_t read_pc = UINT32_MAX;
+    auto readable = [&](uint64_t addr, uint32_t bytes, FoldProbe kind = FoldProbe::Raw) {
+        if (!profile_fold) return reader ? reader->probe(kind, read_pc, addr, bytes)
+                                         : guest_readable(addr, bytes);
         const auto start = FoldClock::now();
-        const bool result = guest_readable(addr, bytes);
+        const bool result = reader ? reader->probe(kind, read_pc, addr, bytes)
+                                   : guest_readable(addr, bytes);
         guest_probe_ms += std::chrono::duration<double, std::milli>(
             FoldClock::now() - start).count();
         ++guest_probe_calls;
@@ -3288,7 +3306,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
     // narrows it to ONE shader (a full run otherwise traces every draw's walk — unusable volume).
     // g_dyntrace_force: set by the PROSPER_DYNTRACE_FAIL failure-replay path (gpu_execute.hpp) so
     // the walk of a shader that just FAILED to recompile is traced without knowing its address.
-    bool trc = g_dyntrace_force || getenv("PROSPER_DYNTRACE") != nullptr;
+    bool trc = !reader && (g_dyntrace_force || getenv("PROSPER_DYNTRACE") != nullptr);
     if (trc && !g_dyntrace_force)
         if (const char* fa = getenv("PROSPER_DYNTRACE_ADDR"))
             trc = strtoull(fa, nullptr, 16) == (uint64_t)(uintptr_t)code;
@@ -3365,14 +3383,16 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
     std::array<OptionalNullRole, kFoldSgprs> optional_null_role{};
     // Producer PC per tagged origin. The exact location lets the optional proof impose a narrow
     // dominance contract over direct CFG instead of trusting this fold's linear walk.
-    std::vector<uint32_t> optional_table_null_origin_pc(1u, UINT32_MAX);
+    // Allocate provenance PC tables only when a qualifying null load needs an origin. Reads
+    // below check the index bound; first growth fills the sentinel slot with UINT32_MAX too.
+    std::vector<uint32_t> optional_table_null_origin_pc;
     // Same mapped-qword proof for GTA V's distinct +0x20 output/work pointer convention. Keeping a
     // separate origin table prevents the existing +0x58 load-only contract from authorizing stores.
-    std::vector<uint32_t> nullable_output_null_origin_pc(1u, UINT32_MAX);
+    std::vector<uint32_t> nullable_output_null_origin_pc;
     // Only x16-header roots need the narrow straight-line dominance contract added for GTA V. The
     // generic mapped-qword null proof predates this shape and has separate loop/CFG validation.
     // Origin ids are monotonic and never restored, so this metadata is immutable once published.
-    std::vector<uint32_t> x16_null_origin_pc(1u, UINT32_MAX);
+    std::vector<uint32_t> x16_null_origin_pc;
     // Null-pointer provenance carried by SCC between the low and high halves of an exact
     // s_add_u32/s_addc_u32 pair. The concrete carry can be unknown after a failed null dereference;
     // this records only that the high result still belongs to that null chain.
@@ -3814,7 +3834,8 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
     std::bitset<256> same_block_zero_vgprs;
     bool zero_mip_exec_pristine = true;
 
-    for (size_t instruction_index = 0; instruction_index < ins.size(); ++instruction_index) {
+    size_t instruction_index = 0;
+    for (; instruction_index < ins.size(); ++instruction_index) {
         const auto& in = ins[instruction_index];
         watch_pc = in.pc;
         watch_w0 = in.words[0]; watch_w1 = in.len_dwords > 1 ? in.words[1] : 0u;
@@ -3825,13 +3846,13 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
         // A plain v_mov is still lane-predicated by EXEC. Without tracking the active mask and its
         // later restoration, no pre-mutation all-lanes zero fact can survive any explicit or
         // implicit EXEC write (including every v_cmpx encoding).
-        if (rdna2_instruction_may_change_exec(in)) {
+        if (control.changes_exec) {
             same_block_zero_vgprs.reset();
             zero_mip_exec_pristine = false;
         }
-        uint32_t mip_vgpr = 0;
+        const uint32_t mip_vgpr = control.zero_mip_vgpr;
         const bool proven_zero_mip_at_use =
-            rdna2_mimg_zero_mip_shape(in, &mip_vgpr) &&
+            mip_vgpr != UINT16_MAX &&
             same_block_zero_vgprs.test(mip_vgpr);
         // Why the proof failed, at the site that knows. `[mimg-mip]` downstream reports
         // `proven_zero_mip=0` and stops there, which is the bool this line produced -- it cannot say
@@ -3839,7 +3860,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
         // fold could not evaluate, or was discarded by an EXEC write. Those are three different
         // pieces of work and the difference is only visible here. Deduped per pc, ungated for the
         // same reason the downstream line is: PROSPER_DBG desyncs the routed repro.
-        if (rdna2_mimg_zero_mip_shape(in, &mip_vgpr)) {
+        if (mip_vgpr != UINT16_MAX) {
             // Dedup by (PROGRAM, pc). A pc-only key collides across programs -- every shader has a
             // pc=16 -- so the first program to reach a pc silently speaks for every later one, and
             // the line then describes a kernel the reader is not looking at.
@@ -4484,6 +4505,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 break;
             }
             case Rdna2Format::SMEM: {
+                read_pc = in.pc;
                 // SBASE (src[0]) is a 2-dword pointer (s_load, op<8) or a 4-dword V# (s_buffer_load, op>=8).
                 // Address = base + immediate OFFSET (in.literal) + SOFFSET register value (decoded here from
                 // words[1][31:25]; the shared decoder doesn't expose it). Dword count from the opcode.
@@ -4784,7 +4806,8 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 if (!is_buffer && !addr_readable) {
                     for (uint64_t mask : {0xFFFFFFFFFFFFull, 0xFFFFFFFFFFull}) {
                         const uint64_t candidate = (((base & mask) + (uint64_t)byte_off) & ~3ull);
-                        if (candidate != addr && readable(candidate, n * 4)) {
+                        if (candidate != addr && readable(candidate, n * 4,
+                            mask == 0xFFFFFFFFFFFFull ? FoldProbe::Base48 : FoldProbe::Base40)) {
                             if (trc) fprintf(stderr, "[dyntrace]   canonical S_LOAD addr 0x%llx -> 0x%llx (mask=0x%llx)\n",
                                              (unsigned long long)addr, (unsigned long long)candidate,
                                              (unsigned long long)mask);
@@ -4796,7 +4819,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 }
                 if (is_buffer)
                     addr_readable = scalar_in_range_dwords != 0u &&
-                                    readable(addr, scalar_in_range_dwords * 4u);
+                                    readable(addr, scalar_in_range_dwords * 4u, FoldProbe::ScalarBuffer);
                 if (!addr_readable) { if (trc) fprintf(stderr, "[dyntrace]   addr 0x%llx unreadable\n", (unsigned long long)addr);
                                       for (uint32_t k = 0; k < n; k++) {
                                           if (is_buffer && k >= scalar_in_range_dwords)
@@ -4904,25 +4927,23 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                     }
                 }
                 std::array<uint32_t, 16> bounded_scalar_words{};
-                const uint32_t* mem = (const uint32_t*)(uintptr_t)addr;
-                if (is_buffer && scalar_in_range_dwords < n) {
-                    std::memcpy(bounded_scalar_words.data(), mem,
-                                scalar_in_range_dwords * sizeof(uint32_t));
-                    mem = bounded_scalar_words.data();
-                }
+                FoldWords mem(reader, in.pc, addr);
+                if (is_buffer && scalar_in_range_dwords < n)
+                    mem.snapshot_prefix(bounded_scalar_words.data(),
+                                        scalar_in_range_dwords * sizeof(uint32_t));
                 const bool imm_only = (soff_field == 125) && (int32_t)in.literal >= 0;   // SGPR_NULL soffset
                 const bool optional_table_source =
                     !is_buffer && in.opcode == kSmemOpcodeLoadDwordX2 && n == 2u &&
                     imm_only && in.literal == kGtaOptionalBufferPointerOffset &&
                     sbase == 0 && consecutive_seed_copy_range(sbase, 2) &&
                     addr == base + kGtaOptionalBufferPointerOffset &&
-                    readable(base, kGtaOptionalBufferTableBytes);
+                    readable(base, kGtaOptionalBufferTableBytes, FoldProbe::OptionalTable);
                 const bool nullable_output_table_source =
                     !is_buffer && in.opcode == kSmemOpcodeLoadDwordX2 && n == 2u &&
                     imm_only && in.literal == kGtaNullableOutputPointerOffset &&
                     sbase == 0 && consecutive_seed_copy_range(sbase, 2) &&
                     addr == base + kGtaNullableOutputPointerOffset &&
-                    readable(base, kGtaNullableOutputWitnessBytes);
+                    readable(base, kGtaNullableOutputWitnessBytes, FoldProbe::NullableOutput);
                 uint32_t bvh_count_origin = 0;
                 if (!is_buffer && n == 4 && imm_only && in.literal == 0x58u &&
                     valid_reg(sbase) && valid_reg(sbase + 1) &&
@@ -5033,7 +5054,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 // is far broader than "descriptor tables", and the design question is specifically about
                 // table slots. Narrowing costs one run and makes the answer actionable instead of
                 // suggestive.
-                if (descr_coherence_enabled() && n == 4 && is_buffer &&
+                if (!reader && descr_coherence_enabled() && n == 4 && is_buffer &&
                     scalar_in_range_dwords == n) {
                     uint64_t h = 1469598103934665603ull;              // FNV-1a over the four dwords
                     for (int k = 0; k < 4; ++k) {
@@ -5880,9 +5901,13 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 break;
         }
     }
+    // The fold visits the retained stream linearly, stopping before an end marker.
+    // Count once at completion instead of testing instrumentation at every instruction.
+    if (reader) reader->evaluated_instructions += instruction_index;
     if (profile_fold)
         record_stage_fold_profile(
-            (uint64_t)(uintptr_t)code, user_sgpr_base, decoded->code.size(), ins.size(), out.size(),
+            reader ? reader->logical_code_address : (uint64_t)(uintptr_t)code,
+            user_sgpr_base, decoded->code.size(), ins.size(), out.size(),
             srt_uses ? srt_uses->size() - srt_before : 0, guest_probe_calls,
             std::chrono::duration<double, std::milli>(FoldClock::now() - fold_start).count(),
             std::chrono::duration<double, std::milli>(decode_done - fold_start).count(),

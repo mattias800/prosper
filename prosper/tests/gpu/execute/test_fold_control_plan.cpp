@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <functional>
 #include <thread>
+#include <string_view>
 
 using namespace prosper::gpu;
 static int failures = 0;
@@ -23,7 +24,7 @@ struct Fixture {
     alignas(16) uint32_t constants[40]{};
     alignas(16) uint32_t descriptor[4]{};
     uint32_t seed[12]{};
-    std::array<uint32_t, 9> code{0xBF860003u, 0xF4300404u, 0xFA000060u,
+    std::vector<uint32_t> code{0xBF860003u, 0xF4300404u, 0xFA000060u,
         0xBF820004u, 0xF4080108u, 0xFA000000u, 0xE0002000u, 0x80010100u, 0xBF810000u};
     Fixture() {
         constants[24] = 0x3f800000u;
@@ -43,7 +44,7 @@ struct Fixture {
     }
 };
 
-int main(int argc, char**) {
+int main(int argc, char** argv) {
     // These hand-built PCs isolate control metadata from decoder and interpreter behavior.
     std::vector<Rdna2Inst> stream{inst(0, 6, 3), inst(1, 0), inst(3, 2, 8),
         inst(4, 4, 3), inst(5, 0), inst(7, 2, 4), inst(8, 0)};
@@ -72,6 +73,54 @@ int main(int argc, char**) {
     // The branch targets PC4, which was compacted out. PC5 must nevertheless start a new block.
     auto gap = build_fold_control_plan({inst(0, 6, 3), inst(1, 0), inst(3, 0), inst(5, 0)});
     CHECK(gap.steps[3].reset_zero_mip, "compacted-out first block instruction still resets proof");
+
+    static_assert(sizeof(FoldControlStep) == 16, "instruction facts fit existing plan storage");
+    Rdna2Inst mip{};
+    mip.fmt = Rdna2Format::MIMG; mip.opcode = 1; mip.len_dwords = 2;
+    mip.src[0] = {OperandKind::VGPR, 253};
+    mip.mimg_unorm = mip.mimg_glc = true; mip.mimg_dmask = 1; mip.mimg_dim = 1;
+    auto exec = inst(1, 0); exec.fmt = Rdna2Format::VOPC; exec.opcode = 0xd2;
+    auto transfer = inst(0, 0); transfer.fmt = Rdna2Format::SOP1; transfer.opcode = 0x20;
+    auto facts = build_fold_control_plan({transfer, exec, mip});
+    CHECK(!facts.cfg_known && facts.steps[1].changes_exec && facts.steps[2].zero_mip_vgpr == 255,
+          "instruction facts after an indirect transfer survive CFG refusal");
+    exec.opcode = 0xc2;
+    mip.src[0].value = 254;
+    facts = build_fold_control_plan({exec, mip});
+    CHECK(!facts.steps[0].changes_exec && facts.steps[1].zero_mip_vgpr == UINT16_MAX,
+          "ordinary compare preserves EXEC and out-of-range mip operand has no shape");
+    exec.sdst = {OperandKind::Special, 126};
+    mip.opcode = 9; mip.mimg_nsa = 1; mip.len_dwords = 3; mip.words[2] = 0xff00;
+    facts = build_fold_control_plan({exec, mip});
+    CHECK(facts.steps[0].changes_exec && facts.steps[1].zero_mip_vgpr == 255,
+          "explicit scalar EXEC destination and NSA mip operand retain their distinct facts");
+    mip.mimg_tfe = true;
+    CHECK(build_fold_control_plan({mip}).steps[0].zero_mip_vgpr == UINT16_MAX,
+          "unsupported mip modifier refuses the cached shape");
+
+    // Reuse the exact code address while changing instruction facts and live register values.
+    uint32_t mip_seed[28]{};
+    const uint32_t image[8] = {0x055c0100u, 0xc1400000u, 0x001fc01fu, 0x91b00204u,
+                              0u, 0x00700000u, 0u, 0u};
+    std::copy(std::begin(image), std::end(image), mip_seed + 20);
+    uint32_t mip_code[] = {0x7e040207u, 0xbe9e0380u, 0xf0043108u, 0x00050000u, 0xbf810000u};
+    const auto mip_proof = [&](bool expected) {
+        std::vector<SrtUse> uses;
+        resolve_dynamic_fetch(mip_code, std::size(mip_code), mip_seed, 28, 0, &uses);
+        return uses.size() == 1 && uses[0].use_pc == 2 && uses[0].proven_zero_mip == expected;
+    };
+    CHECK(mip_proof(true) && mip_proof(true), "warm mip plan keeps current zero-register proof");
+    mip_seed[7] = 1;
+    CHECK(mip_proof(false), "unchanged cached code never caches the mip register value");
+    mip_seed[7] = 0;
+    mip_code[1] = 0x7da40100u; // implicit EXEC write between v2=zero and its use
+    CHECK(mip_proof(false), "same-address EXEC mutation invalidates the expected zero proof");
+    mip_code[1] = 0xbe9e0380u;
+    CHECK(mip_proof(true), "restoring exact code restores its independent zero proof");
+    mip_code[3] = 0x00050001u; // coordinates now start at v1, so mip is v3
+    CHECK(mip_proof(false), "same-address mip-operand mutation selects an unproven register");
+    mip_code[3] = 0x00050000u;
+    CHECK(mip_proof(true), "A-B-A mip-operand mutation restores the original proof");
 
     Fixture f;
     clear_shader_decode_cache();
@@ -117,7 +166,10 @@ int main(int argc, char**) {
     CHECK(left && right, "parallel folds with cache clears preserve independent resources");
 
     if (argc > 1) {
-        constexpr int calls = 100000;
+        const bool long_stream = std::string_view(argv[1]) == "benchmark-long";
+        if (long_stream) f.code.insert(f.code.begin(), 1500, 0xbe9e0380u);
+        CHECK(f.resolves(6), "benchmark validates and warms its selected stream");
+        const int calls = long_stream ? 10000 : 100000;
         const auto start = std::chrono::steady_clock::now();
         for (int n = 0; n < calls; ++n) if (!f.resolves(6)) ++failures;
         const double ms = std::chrono::duration<double, std::milli>(

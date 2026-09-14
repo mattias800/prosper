@@ -8,6 +8,10 @@ question-to-tool map. `doctor/` validates external instruments with bounded posi
 provides a small standalone sanitizer build of existing host tests, and verifies RenderDoc
 capture/replay without requiring an importable system Python module.
 
+- **`fold_replay/`** — bounded opt-in resource-fold capture and offline execution of the actual
+  evaluator, including ordered consumed reads and full output comparison. See its README for
+  capture selection, mutation controls and the limits of offline timing/allocation reports.
+
 - **`session_start.py`** — read-only checkout/instruction freshness signal for #2710. See
   [Session startup](../docs/SESSION_START.md). Its hook mode must deliver failures as visible
   SessionStart context; an unavailable remote must never be reported as current, and a host that
