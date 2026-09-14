@@ -15,6 +15,8 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <chrono>
+#include <thread>
 #include <new>
 #include <pthread.h>
 #include <unordered_map>
@@ -198,6 +200,9 @@ struct ThreadFibers {
 #endif
 };
 
+// SceFiberOptParam is 0x80 bytes; see fiber_opt_param_initialize for how that is derived.
+constexpr size_t kFiberOptParamBytes = 0x80;
+
 std::mutex g_fiber_mutex;
 std::unordered_map<GuestFiber*, std::unique_ptr<FiberRecord>> g_fibers;
 std::unordered_map<uint64_t, std::unique_ptr<ThreadFibers>> g_threads;
@@ -227,6 +232,59 @@ FiberRecord* find_fiber(GuestFiber* guest) {
 }
 
 bool fiber_log() { static const bool enabled = std::getenv("PROSPER_FIBERLOG") != nullptr; return enabled; }
+
+// PROSPER_FIBER_DUMP_MS=<ms> (default off): print every fiber's state on a timer.
+//
+// On a fiber-based title a PARKED job is invisible to every other instrument prosper and the host
+// debugger have. It is not on a host thread's stack (the worker switched away and went back to
+// scanning for work), so `thread apply all bt` shows only idle workers; and its own stack lives in a
+// guest region nothing points at, so a scan of that memory cannot tell a live frame from the stale
+// bytes of a deeper call that already returned. The one place the boundary between the two is known
+// exactly is here: `resume.words[8]` is the stack pointer the fiber will be restored with.
+//
+// Pair it with `tools/re/guest_stacks.py`, which reads the same guest stacks from outside: this
+// names where each fiber's live frames STOP, that one shows what is in them.
+//
+// Word indices below are the save layout in the assembly at the top of this file, and the two ABIs
+// do NOT agree: SysV saves rbx, rbp, r12..r15 and puts rsp at +48 / the return address at +56
+// (words 6 and 7), while the Microsoft x64 block additionally preserves rdi and rsi first and so
+// puts the same two at +64 / +72 (words 8 and 9). Reading the wrong pair prints a plausible 0
+// rather than failing, which is exactly the kind of quiet wrong answer this dump exists to avoid.
+void fiber_dump_state(std::FILE* out) {
+    std::lock_guard<std::mutex> lock(g_fiber_mutex);
+    std::fprintf(out, "[fiber-dump] %zu fiber(s), %zu thread record(s)\n", g_fibers.size(),
+                 g_threads.size());
+    for (const auto& kv : g_fibers) {
+        const FiberRecord* r = kv.second.get();
+        std::fprintf(out,
+                     "[fiber-dump] fiber=%p entry=%p stack=%p+0x%llx started=%d suspended=%d "
+                     "resume_rsp=0x%llx resume_rip=0x%llx\n",
+                     (void*)kv.first, (void*)(uintptr_t)r->entry, r->stack,
+                     (unsigned long long)r->stack_size, (int)r->started, (int)r->suspended,
+#ifdef _WIN32
+                     (unsigned long long)r->resume.words[8],
+                     (unsigned long long)r->resume.words[9]);
+#else
+                     (unsigned long long)r->resume.words[6],
+                     (unsigned long long)r->resume.words[7]);
+#endif
+    }
+}
+
+void start_fiber_dump_thread_once() {
+    static std::atomic<bool> started{false};
+    if (started.exchange(true)) return;
+    const char* e = std::getenv("PROSPER_FIBER_DUMP_MS");
+    if (!e) return;
+    const long ms = std::atol(e);
+    if (ms <= 0) return;   // a malformed value disables its own trigger rather than picking a rate
+    std::thread([ms] {
+        for (;;) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+            fiber_dump_state(stderr);
+        }
+    }).detach();
+}
 
 // Re-point the stub frame this fiber suspended inside at the RESUMING thread's own guest TP. See
 // callback_repair_guest_fs_slot for why the stash goes stale across a fiber migration. Called on the
@@ -411,6 +469,29 @@ uint64_t fiber_rename(GuestFiber* guest, const char* name) {
     std::snprintf(guest->name, sizeof(guest->name), "%s", name);
     if (fiber_log())
         std::fprintf(stderr, "[fiber] rename %p -> \"%s\"\n", (void*)guest, guest->name);
+    return 0;
+}
+
+// sceFiberOptParamInitialize (NID asjUJJ+aa8s) -- #3636.
+//
+// Unregistered, this fell to the dispatcher's `return 0`, which reports SUCCESS and leaves the
+// caller's buffer untouched: the guest then hands 128 bytes of its own uninitialised stack to
+// sceFiberInitialize as an optional-parameter block. Uncharted (PPSA05684) calls it once per fiber,
+// 100 times in a 25 s boot, and checks the result (`test eax,eax ; jne <error>` at eboot+0x1f0d).
+//
+// SIZE: 0x80 bytes, derived from the caller's own frame rather than assumed. At eboot+0x1efe the
+// guest takes `lea r15,[rbp-0xe0]` for this call and `lea r13,[rbp-0x60]` for the next local, so the
+// block it reserves spans exactly 0x80 -- which also matches the published SceFiberOptParam size.
+// CONFIDENCE: HIGH on the size (two independent routes agree), MED on the contents: the documented
+// contract is "initialise to defaults" and every default in the published structure is zero, but
+// prosper has no live capture of a non-zero field to check that against.
+//
+// prosper's own fiber implementation does not consume the block today, so this changes no behaviour
+// for a title that only passes it through. It closes the hazard the #2951 family is named for: a
+// success answer that writes no out-parameter, which the guest cannot distinguish from a real one.
+uint64_t fiber_opt_param_initialize(void* opt_param) {
+    if (!opt_param) return kErrNull;
+    std::memset(opt_param, 0, kFiberOptParamBytes);
     return 0;
 }
 
@@ -630,9 +711,11 @@ extern "C" void fiber_return_to_thread_entry();
 } // namespace
 
 void register_fiber_hle() {
+    start_fiber_dump_thread_once();   // PROSPER_FIBER_DUMP_MS (no-op unless armed)
     Hle::register_fn("hVYD7Ou2pCQ", (HleFn)fiber_initialize, "_sceFiberInitializeImpl");
     Hle::register_fn("JeNX5F-NzQU", (HleFn)fiber_finalize, "sceFiberFinalize");
     Hle::register_fn("JzyT91ucGDc", (HleFn)fiber_rename, "sceFiberRename");
+    Hle::register_fn("asjUJJ+aa8s", (HleFn)fiber_opt_param_initialize, "sceFiberOptParamInitialize");
 #ifndef _WIN32
     Hle::register_fn("a0LLrZWac0M", (HleFn)fiber_run_entry, "sceFiberRun");
     Hle::register_fn("PFT2S-tJ7Uk", (HleFn)fiber_switch_entry, "sceFiberSwitch");

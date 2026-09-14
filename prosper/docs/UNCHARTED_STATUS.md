@@ -36,6 +36,8 @@ Useful diagnostics on this title specifically:
 | `PROSPER_HWWATCH_ABS=<addr> PROSPER_HWWATCH_ABS_ALLTHREADS=1` | who WROTE a guest slot, arming every guest thread rather than the main one (instrument trap 168's blind spot) |
 | `PROSPER_POLLWATCH=<addr>` | when a guest slot changed, with elapsed time — bounds the stall before an exact instrument is pointed at it |
 | `tools/re/guest_stacks.py <pid> --match <lo>-<hi>` | the call chain of a **parked fiber**, which no host-thread backtrace can show: when a job waits, its stack is in guest memory that no thread points at |
+| `PROSPER_FIBER_DUMP_MS=<ms>` | every fiber's state on a timer, including the resume `rsp` — the one place the boundary between a parked fiber's live frames and the stale bytes below them is known exactly. Pair it with `guest_stacks.py` |
+| `PROSPER_FIBERLOG=1` | now records **successful** `sceFiberSwitch` calls too; before that its zero was void (trap 282) |
 
 ## What works
 
@@ -84,18 +86,42 @@ counter-decrement primitive (`dec [rdx+0x30]` under the spinlock at `+0x20`), on
 worker tids. So the counter is released by a **job completing**, not by the GPU — which is the same
 answer the `PROSPER_RENDER=0` arm gives from the other direction.
 
-So the open question is one sentence: **which job never completes, and what is it waiting for?**
 Every job worker is parked in the work-scan loop at `0x1378508` finding all eight queues empty, so
 nothing is runnable anywhere — the missing work was never enqueued, rather than enqueued and
 starved.
+
+### The wait chain, four levels deep
+
+`PROSPER_FIBER_DUMP_MS` gives each parked fiber's exact resume `rsp`, which is what separates its
+live frames from the stale bytes underneath; `tools/re/guest_stacks.py` then reads them. Two fibers
+are parked deep, and together they make the whole chain:
+
+```
+main guest thread            usleep(10) poll                        counter "Err GameLoop()"        = 1
+  -> FrameSpawnerJob #5      WaitForCounter at 0x5ab71c             frame-latency counter          = -3, needs -4
+       -> render job #5      WaitForCounter at 0x565bb8             frame-slot counter (slot+0xc0) =  1, needs 0
+            -> ???           never completes
+```
+
+A whole-heap census of the guest's counter objects (they carry a `__FILE__` pointer at `+0x00`, a
+`__FUNCTION__` pointer at `+0x10`, a spinlock at `+0x20` and the value at `+0x30`) finds **12**
+non-zero counters in 14.6 GiB, and every one is accounted for by the chain above plus
+`AudioManager::Initialize` and three particle counters. So the thing the last job waits on is **not
+a job counter** — every job counter in the process is either satisfied or one of these.
+
+The frame-slot counter is *set* to 1 by the frame setup at `eboot+0x13939b0` and is never written
+again (`PROSPER_HWWATCH_ABS_ALLTHREADS` sees writes `#1..#4` and then nothing), so the work
+registered against it was never completed by anything.
 
 ## Open blockers
 
 - **#3634** — `scePlayGoGetLocus` refuses chunk ids outside prosper's discovered set and the title
   asserts on the refusal, 65 times in a 25 s run, from `gamelib\level\game-loading.cpp:1576`. Loudest
   current complaint and the natural next step. Not fatal: the guest's `int $0x41` is skipped.
-- **#3636** — `sceFiberOptParamInitialize` unregistered; the `return 0` default reports success
-  without writing the out-parameter.
+- ~~**#3636** — `sceFiberOptParamInitialize` unregistered.~~ Implemented: it zeroes the 0x80-byte
+  block the guest reserves for it (`lea r15,[rbp-0xe0]` against the next local at `[rbp-0x60]` at
+  `eboot+0x1efe`). Measured against the loop meter afterwards: still 5 iterations, so it was a real
+  gap and not this one.
 - **#3623** — the import stub's host-`%fs` stash is per-guest-TCB while the value is per-host-thread.
 - **#3638** — a migrated fiber that *returns* from its entry lands on the entering thread's stack.
   Latent: these fibers yield rather than return.
