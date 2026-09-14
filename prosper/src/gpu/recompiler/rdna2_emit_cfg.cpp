@@ -300,6 +300,110 @@ std::unordered_set<uint32_t> proven_structured_wave64_mask_reduction_pcs(
     return proven;
 }
 
+// Prove S_LOAD_DWORDX2 DESCRIPTOR-TABLE POINTER loads.
+//
+// A shader whose resources live entirely in an SRT reaches them through pointers: the driver places
+// a 64-bit table pointer in user data, and the shader chases it -- `s_load_dwordx2 s[2:3], s[0:1],
+// imm` -- before loading the actual V#/T#/S# out of the pointed-to table with an x4/x8. Such a
+// pointer is never data. Its only use is as the SBASE of another raw scalar load.
+//
+// Uncharted: Legacy of Thieves (PPSA05684) declares ZERO sharps in every shader
+// (sharp_resource_count {0,0,0,0}, srt_size_dw 2..9), so every graphics resource arrives this way.
+// The pointer load fell through to the constant-buffer path, found no declared cbuf, and rejected
+// the whole shader -- `[smem-reject] pc=1 reason=unresolved-cbuf op=0x1 src0=s0` -- so every
+// fragment shader in the title failed and no draw could be realized (#3616).
+//
+// The front half already resolves the entire chain: resolve_dynamic_fetch follows exactly these
+// pointers out of guest memory and publishes each descriptor at its exact consumer PC. The pointer
+// is therefore provenance in SPIR-V, the same standing the x16 and x2-fragment shapes below and
+// above already have, and zero placeholders represent it exactly.
+//
+// The admission is a whole-stream USE proof, never opcode-wide. The loaded pair must be read ONLY
+// as a raw `s_load_*` SBASE -- never as scalar data, an s_buffer_load V# base, an image or buffer
+// descriptor, or an address -- and at least one such pointer use must exist, so the proof asserts a
+// shape rather than merely failing to find a counterexample. Scanning EVERY instruction rather than
+// the forward path makes control flow irrelevant: if no read anywhere treats the value as data, no
+// path can. CONFIDENCE: HIGH for the admitted shape.
+//
+// A later REDEFINITION of the pair is deliberately not disqualifying, and that is the one subtle
+// point. These shaders reuse the low SGPRs hard -- `s_load_dwordx8 s[0:7], s[38:39]` lands on top of
+// the s[2:3] pointer a few instructions later -- so requiring sole ownership rejected every real
+// candidate. It is not needed for soundness: this proof decides only what OUR load's destination
+// holds, the scan already refuses if ANY instruction anywhere reads the pair as data, and a read
+// that belongs to a later definition is either another SBASE use (harmless) or a data read (which
+// rejects us conservatively). Dropping the check is strictly more permissive and equally sound.
+std::unordered_set<uint32_t> proven_smem_pointer_loads(const std::vector<Rdna2Inst>& ins) {
+    std::unordered_set<uint32_t> proven;
+    if (ins.empty()) return proven;
+
+    auto scalar_operand = [](const Operand& operand) {
+        return operand.kind == OperandKind::SGPR ||
+               (operand.kind == OperandKind::Special &&
+                operand.value >= 106 && operand.value <= 124);
+    };
+
+    for (size_t load_index = 0; load_index < ins.size(); ++load_index) {
+        const Rdna2Inst& load = ins[load_index];
+        if (load.is_end || load.fmt != Rdna2Format::SMEM ||
+            load.opcode != kSmemOpcodeLoadDwordX2 ||
+            load.dst.kind != OperandKind::SGPR || load.dst.value < 0 ||
+            load.dst.value + 1 > 105 ||
+            // Immediate-only. A register SOFFSET is the fragment shape the sibling proof owns.
+            load.src[1].kind != OperandKind::Special || load.src[1].value != 125 ||
+            static_cast<int32_t>(load.literal) < 0)
+            continue;
+
+        const int lo = load.dst.value, hi = lo + 1;
+        auto touches = [&](int first, uint32_t words) {
+            if (first < 0 || !words) return false;
+            return first <= hi && first + static_cast<int>(words) > lo;
+        };
+
+        bool valid = true, used_as_pointer = false;
+        for (size_t index = 0; valid && index < ins.size(); ++index) {
+            if (index == load_index) continue;
+            const Rdna2Inst& in = ins[index];
+            if (in.is_end) continue;
+
+            if (in.fmt == Rdna2Format::SMEM) {
+                // SBASE is 2 dwords for a raw s_load and 4 for an s_buffer_load's V#. Only the raw
+                // form, naming the pair exactly, is the pointer use admitted here.
+                const bool raw_pointer_base = in.opcode < 0x08u &&
+                    scalar_operand(in.src[0]) && in.src[0].value == lo;
+                if (raw_pointer_base) used_as_pointer = true;
+                const uint32_t base_words = in.opcode >= 0x08u ? 4u : 2u;
+                if (!raw_pointer_base && scalar_operand(in.src[0]) &&
+                    touches(in.src[0].value, base_words))
+                    valid = false;
+                if (valid && scalar_operand(in.src[1]) && touches(in.src[1].value, 1))
+                    valid = false;
+                continue;
+            }
+            if (in.fmt == Rdna2Format::MIMG) {
+                if ((in.src[1].kind == OperandKind::SGPR && touches(in.src[1].value, 8)) ||
+                    (scalar_operand(in.src[2]) && touches(in.src[2].value, 4)))
+                    valid = false;
+                continue;
+            }
+            if (in.fmt == Rdna2Format::MUBUF || in.fmt == Rdna2Format::MTBUF) {
+                if ((in.src[1].kind == OperandKind::SGPR && touches(in.src[1].value, 4)) ||
+                    (scalar_operand(in.src[2]) && touches(in.src[2].value, 1)))
+                    valid = false;
+                continue;
+            }
+            for (uint32_t source = 0; valid && source < in.n_src; ++source) {
+                if (!scalar_operand(in.src[source])) continue;
+                const uint32_t words =
+                    in.fmt == Rdna2Format::SOP1 || in.fmt == Rdna2Format::SOP2 ||
+                    in.fmt == Rdna2Format::SOPC || in.fmt == Rdna2Format::VOP3 ? 2u : 1u;
+                if (touches(in.src[source].value, words)) valid = false;
+            }
+        }
+        if (valid && used_as_pointer) proven.insert(load.pc);
+    }
+    return proven;
+}
+
 // Prove S_LOAD_DWORDX2 descriptor-fragment shapes. The load supplies one or two live words of a
 // four-dword V#; scalar code fills or replaces the other words before MUBUF, MTBUF, or S_BUFFER_LOAD
 // consumes the complete live descriptor. The front half has already read the guest words and
@@ -3756,6 +3860,8 @@ bool emit_cfg_state_machine(
         state.sreg_input = initial.sreg_input;
         state.smem_x16_descriptor_loads = initial.smem_x16_descriptor_loads;
         state.smem_x16_descriptor_analysis_done = initial.smem_x16_descriptor_analysis_done;
+        state.smem_pointer_loads = initial.smem_pointer_loads;
+        state.smem_pointer_analysis_done = initial.smem_pointer_analysis_done;
         state.smem_x2_descriptor_fragment_loads =
             initial.smem_x2_descriptor_fragment_loads;
         state.smem_x2_descriptor_fragment_analysis_done =
@@ -6195,6 +6301,10 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
     if (!rs.smem_x16_descriptor_analysis_done) {
         rs.smem_x16_descriptor_loads = proven_smem_x16_descriptor_loads(ins, rt);
         rs.smem_x16_descriptor_analysis_done = true;
+    }
+    if (!rs.smem_pointer_analysis_done) {
+        rs.smem_pointer_loads = proven_smem_pointer_loads(ins);
+        rs.smem_pointer_analysis_done = true;
     }
     if (!rs.smem_x2_descriptor_fragment_analysis_done) {
         rs.smem_x2_descriptor_fragment_loads =

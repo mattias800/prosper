@@ -4821,6 +4821,11 @@ struct RegState {
     // two resources at one byte offset, so every consumer must retain exact-PC provenance.
     std::unordered_set<uint32_t> smem_x16_descriptor_loads;
     bool smem_x16_descriptor_analysis_done = false;
+    // Immediate S_LOAD_DWORDX2 that loads a DESCRIPTOR-TABLE POINTER rather than data: the shader
+    // chases an SRT pointer to reach the table the real V#/T#/S# lives in. Admitted by a
+    // whole-stream use proof (proven_smem_pointer_loads); load PCs, not SRT keys.
+    std::unordered_set<uint32_t> smem_pointer_loads;
+    bool smem_pointer_analysis_done = false;
     // Register-offset S_LOAD_DWORDX2 is likewise typeless. GTA V uses it to fetch the first two
     // words of a V#, then replaces/fills the remaining words before an exact-PC buffer consumer.
     // Only PCs certified by the whole-CFG descriptor-use proof may substitute placeholders.

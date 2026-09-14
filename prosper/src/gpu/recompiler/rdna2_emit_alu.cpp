@@ -5291,6 +5291,23 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 }
                 return true;
             }
+            // The whole-stream proof established that this S_LOAD_DWORDX2 loads a DESCRIPTOR-TABLE
+            // POINTER -- its only use anywhere is as the SBASE of another raw scalar load -- so the
+            // value it produces is provenance, not scalar data. The front half followed the same
+            // pointer out of guest memory and published every descriptor behind it at its exact
+            // consumer PC, so zero placeholders represent it exactly. The SRT tag is ERASED rather
+            // than propagated: the pointer's own offset names the pointer, not the descriptor a
+            // later load fetches through it, and leaving it would resolve that load to the wrong
+            // resource. Without this the load reached the constant-buffer path below and rejected
+            // the shader for an unresolved cbuf (#3616).
+            if (rt && in.opcode == kSmemOpcodeLoadDwordX2 &&
+                rs.smem_pointer_loads.contains(in.pc)) {
+                for (uint32_t k = 0; k < n; ++k) {
+                    rs.sreg[in.dst.value + static_cast<int>(k)] = b.uconst(0);
+                    rs.sreg_srt.erase(in.dst.value + static_cast<int>(k));
+                }
+                return true;
+            }
             // SOFFSET handling. Immediate-only loads encode SOFFSET = SGPR_NULL (125). A register
             // SOFFSET adds an SGPR-computed byte offset:
             //  * a DESCRIPTOR s_load (x4/x8 = V#/T#) with a computed offset is the bindless fetch's

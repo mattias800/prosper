@@ -477,6 +477,29 @@ int main() {
             CHECK((packet[6] & gpu::kDmaDataAddressSource) == 0,
                   "immediate-source DmaData does not acquire address-form metadata");
 
+            // Uncharted: Legacy of Thieves (PPSA05684) is the third call shape: sourceKind=0 with
+            // NO immediate and a real pointer in a7. Its shader upload issues this against the
+            // shader's own code range -- dst == src, numBytes == shader_size -- which is a copy
+            // through L2, i.e. cache maintenance whose effect on memory is nothing. Read as an
+            // immediate it fills the code with a1=0, and prosper zeroed every graphics program in
+            // the title; every shader then decoded as VOP2 opcode 0 and no draw could render
+            // (#3616). The arm above and this one together pin the discriminator from BOTH halves
+            // of the recorded contract: a1 present means immediate, a1 absent with a pointer in a7
+            // means address. Mutating either half of `a6 == 2 || (a7 != 0 && a1 == 0)` reddens one
+            // of the two.
+            d.cursor_up = buf;
+            packet = (uint32_t*)(uintptr_t)
+                ((uint64_t(*)(uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,
+                              uint64_t,uint64_t,uint64_t))dma_build)(
+                    (uint64_t)(uintptr_t)&d,
+                    /*srcImmediateOrOffset*/0, /*dstSel*/2, /*srcSel*/0, src,
+                    /*policy*/0, /*sourceKind*/0, src, sizeof source);
+            CHECK(packet[3] == (uint32_t)src && packet[4] == (uint32_t)(src >> 32u) &&
+                      packet[5] == sizeof source,
+                  "sourceKind=0 with no immediate takes the stack source address, not a zero fill");
+            CHECK((packet[6] & gpu::kDmaDataAddressSource) != 0,
+                  "that shape is recorded as an address source in the packet metadata");
+
             // An asserted address form must not degrade into an immediate fill merely because the
             // address is malformed or currently unmapped. The executor owns validation and will
             // reject this address visibly; the builder's only job is to retain the selected form.

@@ -880,12 +880,18 @@ HLE(agc_cb_nop) {  // (dcb, num_dwords, ...)
 //    pass sourceKind=0 and sourceAddress=0; the address form passes sourceKind=2 and a 64-bit source.
 //    Select solely from that ABI discriminator: an invalid address must reach the executor and fail
 //    visibly rather than silently changing into an immediate fill.
-//  - **A NON-ZERO sourceAddress is an address source even when sourceKind is not 2** (#3616).
-//    Uncharted: Legacy of Thieves emits a third call shape the two above did not anticipate:
-//    sourceKind=0 with a non-zero sourceAddress that EQUALS the destination, dstSel=2, srcSel=0,
-//    numBytes exactly the shader's `shader_size`. That is a copy of a region onto itself through
-//    L2 -- PM4 DST_SEL=2 is DST_ADDR_USING_L2 -- i.e. the cache maintenance a CPU-written shader
-//    needs before the GPU fetches it, and its correct effect on memory is NOTHING.
+//  - **A NON-ZERO sourceAddress with NO immediate is an address source even when sourceKind is not
+//    2** (#3616). Uncharted: Legacy of Thieves emits a third call shape the two above did not
+//    anticipate: sourceKind=0, srcImmediate=0, and a non-zero sourceAddress that EQUALS the
+//    destination, dstSel=2, srcSel=0, numBytes exactly the shader's `shader_size`. That is a copy
+//    of a region onto itself through L2 -- PM4 DST_SEL=2 is DST_ADDR_USING_L2 -- i.e. the cache
+//    maintenance a CPU-written shader needs before the GPU fetches it, and its correct effect on
+//    memory is NOTHING.
+//    Both halves of the test matter and both come from the contract above, which says the
+//    immediate/placeholder forms pass sourceKind=0 AND sourceAddress=0. Requiring srcImmediate to
+//    be absent as well is what keeps a genuine non-zero fill a fill: a caller that means an
+//    immediate says so by passing one, so only the a1=0 case is ambiguous, and there the recorded
+//    forms pass sourceAddress=0 while this one passes a real pointer.
 //    Read as an immediate, it is a fill of a1=0 over exactly the shader code: prosper zeroed every
 //    graphics program in the title, leaving the AGC header at code+shader_size untouched beside it.
 //    Every shader then decoded as zeros -- which are VOP2 opcode 0 -- so every draw was refused for
@@ -913,7 +919,7 @@ static uint64_t label_build_pre(uint64_t dst, uint64_t num_bytes) {
 
 HLE9(agc_dcb_dma_data) {  // (..., srcImmediate, dstSel?, srcSel?, dst, policy, sourceKind, sourceAddress, bytes)
     uint64_t num_bytes = a8 <= 0x10000000ull ? a8 : 0;
-    const bool address_source = a6 == 2 || a7 != 0;
+    const bool address_source = a6 == 2 || (a7 != 0 && a1 == 0);
     const uint64_t src_or_imm = address_source ? a7 : a1;
     static std::atomic<uint64_t> g_dma_n{0};
     uint32_t* cmd; if (!begin_packet(a0, kDwDmaData, IT_NOP, R_DMA_DATA, &cmd)) return 0;
