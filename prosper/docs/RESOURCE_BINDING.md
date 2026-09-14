@@ -233,6 +233,13 @@ The hot buffer comparator is a different cost: all 212 retained Sonic comparison
 Reducing contention on its changed-result atomic cannot address that population, since those atomic
 stores never execute. The proposed workgroup reduction was archived without building or enabling it.
 
+A subsequent watched-CPU-fill retry also failed to establish a gain: Sonic measured 8.3493/s
+control versus 7.9647/s enabled, despite eliminating almost all GPU comparison time. The CPU
+stores and watch preparation must be included in that tradeoff. The same fixture exposed a
+separate correctness defect: an explicit equal-value clear must invalidate rendered depth even
+when unchanged guest bytes can retain their watch/journal authority
+([#3407 evidence](https://github.com/mattias800/prosper/issues/3407#issuecomment-5660461734)).
+
 ### Ruled out: shared watch reconstruction
 
 - **Reset/create repairs stale alias protections even when another registration survives:** falsified

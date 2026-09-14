@@ -459,6 +459,7 @@ void report_image_borrow_census() {
 std::atomic<uint64_t> g_dcc_forced_seed_allocation_reuses{0};
 std::atomic<uint64_t> g_dcc_post_writeback_replacements{0};
 std::atomic<bool> g_fail_next_storage_readback_for_test{false};
+std::atomic<bool> g_fail_next_buffer_readback_for_test{false};
 std::atomic<bool> g_leave_next_dcc_metadata_compressed_for_test{false};
 std::atomic<bool> g_disable_next_dcc_allocation_reuse_for_test{false};
 std::atomic<bool> g_limit_next_image_replacement_for_test{false};
@@ -996,6 +997,10 @@ struct CachedComputeBuffer {
     uint64_t last_use = 0;
     uint32_t pins = 0;
     bool content_valid = true;
+    // Proof about this primary allocation, established only by a completed exact full fill.
+    // Current guest equality is a separate acquire_cached_buffer obligation.
+    bool uniform_fill_valid = false;
+    std::array<uint32_t, 4> uniform_fill_pattern{};
     // GuestWriteWatch is page-granular internally, but its public query historically collapsed a
     // registration to one Dirty bit. A four-byte guest write could therefore make the persistent
     // compute cache compare an entire 32 MiB buffer. Split large sources into moderately-sized
@@ -2229,6 +2234,9 @@ struct VulkanComputeContext {
         if (submit_unchanged) g_write_watch_census.record_journal_skip(key.bytes);
         else if (upload_skipped) g_write_watch_census.record_watch_skip(key.bytes);
         if (!upload_skipped) {
+            // A source refresh may replace any primary byte. Conservatively discard even
+            // when an exact comparison later discovers that the dirty input stayed equal.
+            cached.uniform_fill_valid = false;
             // Establish the mutation boundary before the authoritative guest-byte comparison.
             // Arming after memcmp would leave a compare-to-arm gap where a concurrent guest CPU
             // write could become permanently invisible to this cache entry.
@@ -2386,8 +2394,31 @@ struct VulkanComputeContext {
         const auto found = buffer_cache.find(key);
         if (found != buffer_cache.end()) {
             found->second.content_valid = false;
+            found->second.uniform_fill_valid = false;
             found->second.write_watch_stable_validations = 0;
         }
+    }
+
+    bool cached_buffer_matches_fill(const ComputeBufferCacheKey& key, VkBuffer primary,
+                                    const std::array<uint32_t, 4>& pattern) const {
+        const auto found = buffer_cache.find(key);
+        return found != buffer_cache.end() && found->second.buffer == primary &&
+            found->second.pins && found->second.content_valid &&
+            found->second.uniform_fill_valid && found->second.uniform_fill_pattern == pattern;
+    }
+
+    void forget_cached_buffer_fill(const ComputeBufferCacheKey& key) {
+        const auto found = buffer_cache.find(key);
+        if (found != buffer_cache.end()) found->second.uniform_fill_valid = false;
+    }
+
+    void remember_cached_buffer_fill(const ComputeBufferCacheKey& key, VkBuffer primary,
+                                     const std::array<uint32_t, 4>& pattern) {
+        const auto found = buffer_cache.find(key);
+        if (found == buffer_cache.end() || found->second.buffer != primary ||
+            !found->second.pins || !found->second.content_valid) return;
+        found->second.uniform_fill_pattern = pattern;
+        found->second.uniform_fill_valid = true;
     }
 
     bool cached_buffer_result_buffer(const ComputeBufferCacheKey& key, VkDeviceSize bytes,
@@ -3561,6 +3592,7 @@ struct VulkanComputeContext {
 std::atomic<VulkanComputeContext*> g_live_compute_context{nullptr};
 std::atomic<uint64_t> g_sampled_image_upload_skips{0};
 std::atomic<uint64_t> g_cpu_fill_dispatches{0};
+std::atomic<uint64_t> g_cached_fill_dispatches{0};
 
 struct BorrowedComputeImageLease {
     VulkanComputeContext* context = nullptr;
@@ -5545,7 +5577,38 @@ std::optional<bool> execute_cpu_broadcast_fill(const prosper::gpu::ComputeItem& 
     return true;
 }
 
-std::optional<bool> execute_cpu_fast_path(const prosper::gpu::ComputeItem& item) {
+// Shared semantic proof survives CPU permission refusal, but carries no memory authority.
+struct KnownFillProof {
+    const prosper::gpu::ShaderResource* resource = nullptr;
+    uint64_t written_bytes = 0;
+    std::array<uint32_t, 4> pattern{};
+
+    bool matches(const BoundBuffer& buffer) const {
+        const auto* r = buffer.resource;
+        return resource && r && buffer.writable && !buffer.atomic_image &&
+            buffer.alias_of == SIZE_MAX && !buffer.output_conflict &&
+            !resource->table_index_count && !r->table_index_count &&
+            r->binding == resource->binding && r->sgpr_base == resource->sgpr_base &&
+            r->cls == resource->cls && r->format == resource->format &&
+            r->num_components == resource->num_components && r->stride == resource->stride &&
+            r->gpu_addr == resource->gpu_addr && r->size == resource->size &&
+            r->host_data == resource->host_data && r->host_data_size == resource->host_data_size &&
+            r->host_data_prefix_bytes == resource->host_data_prefix_bytes &&
+            buffer.bytes == r->size && buffer.guest_bytes == r->size;
+    }
+    bool full_direct(const BoundBuffer& buffer) const {
+        return matches(buffer) && !resource->host_data && !resource->host_data_prefix_bytes &&
+            resource->gpu_addr >= 0x1000 &&
+            resource->gpu_addr <= UINT64_MAX - resource->size && written_bytes == resource->size &&
+            buffer.persistent && !buffer.cache_key.host_data &&
+            buffer.cache_key.materialization.semantic == prosper::gpu::StorageBufferTailSemantic::None &&
+            buffer.cache_key.materialization.logical_bytes == written_bytes &&
+            buffer.cache_key.materialization.binding_bytes == written_bytes;
+    }
+};
+
+std::optional<bool> execute_cpu_fast_path(const prosper::gpu::ComputeItem& item,
+                                        KnownFillProof* known_fill = nullptr) {
     using prosper::gpu::ComputeCpuFastPath;
     using prosper::gpu::ResourceClass;
     static const bool census = std::getenv("PROSPER_COMPUTE_FAST_PATH_CENSUS") != nullptr;
@@ -5596,11 +5659,24 @@ std::optional<bool> execute_cpu_fast_path(const prosper::gpu::ComputeItem& item)
     const uint64_t written_bytes = records * 16u;
     if (written_bytes > resource->size || written_bytes > SIZE_MAX) return decline("extent");
 
-    // Experimental opt-in: a production watch can make an otherwise writable guest
-    // destination fail the OS permission probe. Prepare only after every fill/extent
-    // guard, then recheck the actual permissions; preparation cannot authorize a store.
-    static const bool retry_watched_write =
-        std::getenv("PROSPER_CPU_FILL_WATCH_RETRY") != nullptr;
+    // Match the actually emitted launch before carrying a semantic proof into Vulkan.
+    // Native 32-bit formats preserve the four stored dwords without numeric conversion.
+    const auto& config = item.recompile_config;
+    const bool emitted_extent_matches = config.user_sgprs.size() == item.user_sgprs.size() &&
+        config.local_x == item.launch.local_x &&
+        config.local_y == item.launch.local_y && config.local_z == item.launch.local_z &&
+        (config.exact_thread_extent
+            ? item.launch.threads_x && config.threads_x == item.launch.threads_x &&
+              config.threads_y == 1 && config.threads_z == 1
+            : !item.launch.threads_x || item.launch.threads_x == dispatched_records);
+    const bool exact_words = resource->format == prosper::gpu::DataFormat::Uint32 ||
+        resource->format == prosper::gpu::DataFormat::Sint32 ||
+        resource->format == prosper::gpu::DataFormat::Float32;
+    if (known_fill && emitted_extent_matches && exact_words && !resource->table_index_count)
+        *known_fill = {resource, written_bytes,
+            {item.user_sgprs[4], item.user_sgprs[5], item.user_sgprs[6], item.user_sgprs[7]}};
+
+    // Pair host-write preparation with completion on every admitted CPU fill.
     struct PreparedHostWrite {
         uint64_t address = 0;
         uint64_t bytes = 0;
@@ -5614,16 +5690,7 @@ std::optional<bool> execute_cpu_fast_path(const prosper::gpu::ComputeItem& item)
         destination = resource->host_data;
     } else if (resource->gpu_addr >= 0x1000 && written_bytes <= UINT32_MAX &&
                resource->gpu_addr <= UINT64_MAX - written_bytes) {
-        bool writable = prosper::gpu::guest_writable(
-            resource->gpu_addr, static_cast<uint32_t>(written_bytes));
-        if (!writable && retry_watched_write) {
-            prepared.address = resource->gpu_addr;
-            prepared.bytes = written_bytes;
-            prosper::host::guest_write_watch_notify_host_write(prepared.address, prepared.bytes);
-            writable = prosper::gpu::guest_writable(
-                resource->gpu_addr, static_cast<uint32_t>(written_bytes));
-        }
-        if (writable)
+        if (prosper::gpu::guest_writable(resource->gpu_addr, static_cast<uint32_t>(written_bytes)))
             destination = reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(resource->gpu_addr));
     }
     if (!destination) return decline("destination-not-writable");
@@ -5639,11 +5706,9 @@ std::optional<bool> execute_cpu_fast_path(const prosper::gpu::ComputeItem& item)
         item.submit_no, item.command_order, resource->gpu_addr, written_bytes,
         authority_range_known});
 
-    if (!prepared.address) {
-        prepared.address = reinterpret_cast<uintptr_t>(destination);
-        prepared.bytes = written_bytes;
-        prosper::host::guest_write_watch_notify_host_write(prepared.address, prepared.bytes);
-    }
+    prepared.address = reinterpret_cast<uintptr_t>(destination);
+    prepared.bytes = written_bytes;
+    prosper::host::guest_write_watch_notify_host_write(prepared.address, prepared.bytes);
     const uint32_t pattern[4] = {
         item.user_sgprs[4], item.user_sgprs[5], item.user_sgprs[6], item.user_sgprs[7]};
     const bool zero_fill = !(pattern[0] | pattern[1] | pattern[2] | pattern[3]);
@@ -6100,7 +6165,8 @@ PreparedStorageWriteMasks prepare_storage_write_masks(
     return out;
 }
 
-bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& item) {
+bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& item,
+                  const KnownFillProof* known_fill = nullptr) {
     using namespace prosper::gpu;
     using ComputeClock = std::chrono::steady_clock;
     auto decline = [&item](const char* reason) {
@@ -6209,6 +6275,10 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     }
     const auto& resources = write_masks.resources;
     const auto& spirv = write_masks.words.empty() ? source_spirv : write_masks.words;
+    // A diagnostic replacement or shader transformation is a different program. The
+    // original instruction classification cannot authorize its effects or suppress its work.
+    if (override_applies || !write_masks.words.empty()) known_fill = nullptr;
+    static const bool cached_fill_enabled = std::getenv("PROSPER_CACHED_COMPUTE_FILL") != nullptr;
     const bool trace = trace_compute_item(item);
     const bool perf_capture_timing =
         prosper::perf::interactive_performance_capture().detailed_timing_active();
@@ -6751,6 +6821,15 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         if (resource->host_data && resource->host_data_size >= required)
             return resource->host_data;
         return reinterpret_cast<uint8_t*>(uintptr_t(resource->gpu_addr));
+    };
+
+    const auto notify_unchanged_buffer = [&](const BoundBuffer& buffer) {
+        const char* previous = guest_gpu_write_origin();
+        if (known_fill && known_fill->matches(buffer))
+            set_guest_gpu_write_origin("compute-writeback(known-fill)");
+        notify_output_write(buffer.resource->gpu_addr,
+            resource_bytes_for(buffer.resource, buffer.guest_bytes), buffer.resource->size, true);
+        set_guest_gpu_write_origin(previous);
     };
 
     do {
@@ -9896,6 +9975,45 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         }
         phase_setup = ComputeClock::now();
 
+        // Only a single ordinary full-fill output can finish here: all current guest
+        // bytes were validated by the existing acquisition, and its pinned primary is
+        // already the requested pattern. No commands have begun or handles been borrowed
+        // beyond this dispatch's ordinary cleanup ownership.
+        if (cached_fill_enabled && known_fill && buffers.size() == 1 && images.empty() &&
+            known_fill->full_direct(buffers[0]) && buffers[0].upload_skipped &&
+            ctx.cached_buffer_matches_fill(buffers[0].cache_key, buffers[0].buffer,
+                                            known_fill->pattern)) {
+            auto& buffer = buffers[0];
+            phase_pipeline = phase_dispatch = phase_setup;
+            const auto writeback_start = ComputeClock::now();
+            ComputeBufferCostScope writeback_cost(buffer.timing.enabled, buffer.timing.writeback_ms);
+            buffer.timing.writeback = "cached-fill";
+            buffer.timing.gpu_compare = "not-recorded";
+            {
+                ComputeBufferCostScope cost(buffer.timing.enabled, buffer.timing.notify_ms);
+                notify_compute_authority_boundary({ComputeAuthorityBoundaryKind::Compute,
+                    item.submit_no, item.command_order, buffer.resource->gpu_addr,
+                    known_fill->written_bytes, true});
+                notify_unchanged_buffer(buffer);
+            }
+            {
+                ComputeBufferCostScope cost(buffer.timing.enabled, buffer.timing.source_validation_ms);
+                ctx.validate_cached_buffer_source(buffer.cache_key, ComputeBufferSourceProof::PublishedUnchanged);
+            }
+            if (writer_provenance_enabled()) {
+                ComputeBufferCostScope cost(buffer.timing.enabled, buffer.timing.provenance_ms);
+                record_guest_write(GuestWriterKind::ComputeBuffer, buffer.resource->gpu_addr,
+                    buffer.resource->size, item.submit_no, item.dispatch_index,
+                    item.command_order, item.code_addr);
+            }
+            g_cached_fill_dispatches.fetch_add(1, std::memory_order_relaxed);
+            writeback_buffers_ms = std::chrono::duration<double, std::milli>(
+                ComputeClock::now() - writeback_start).count();
+            phase_writeback = ComputeClock::now();
+            ok = true;
+            break;
+        }
+
         // Layout: the buffer bindings (filled above) + one entry per image binding (#590).
         for (size_t i = 0; i < images.size(); i++) {
             VkDescriptorSetLayoutBinding b{};
@@ -10640,6 +10758,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             vkCmdPushConstants(command, pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                                static_cast<uint32_t>(item.user_sgprs.size() * sizeof(uint32_t)),
                                item.user_sgprs.data());
+        for (const auto& buffer : buffers)
+            if (buffer.alias_of == SIZE_MAX && buffer.persistent && buffer.writable)
+                ctx.forget_cached_buffer_fill(buffer.cache_key);
         vkCmdDispatch(command, item.launch.groups_x, item.launch.groups_y, item.launch.groups_z);
         if (perf_gpu_timing)
             vkCmdWriteTimestamp(command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
@@ -11161,6 +11282,13 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 timing.writeback = "readonly";
                 continue;
             }
+            // Completion is established, but guest publication has not begun. A recoverable
+            // readback failure must discard any old fill proof as well as source authority.
+            if (g_fail_next_buffer_readback_for_test.exchange(false, std::memory_order_acq_rel)) {
+                timing.writeback = "injected-readback-failure";
+                readback_ok = false;
+                break;
+            }
             ComputeBufferCostScope writeback_cost(timing.enabled, timing.writeback_ms);
             // The exact GPU comparator saw the same bytes as the retained baseline, while source
             // validation independently proved that the guest mirror still contains that baseline.
@@ -11178,9 +11306,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                  buffer.resource->size);
                 if (buffer.resource->gpu_addr || buffer.resource->host_data) {
                     ComputeBufferCostScope cost(timing.enabled, timing.notify_ms);
-                    notify_output_write(buffer.resource->gpu_addr,
-                        resource_bytes_for(buffer.resource, buffer.guest_bytes),
-                        buffer.resource->size, true);
+                    notify_unchanged_buffer(buffer);
                 }
                 if (buffer.persistent) {
                     ComputeBufferCostScope cost(timing.enabled, timing.source_validation_ms);
@@ -11372,9 +11498,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     notify_output_write(buffer.resource->gpu_addr, destination, buffer.resource->size);
                     set_guest_gpu_write_origin(nullptr);
                 } else {
-                    notify_output_write(buffer.resource->gpu_addr,
-                        resource_bytes_for(buffer.resource, buffer.guest_bytes),
-                        buffer.resource->size, true);
+                    notify_unchanged_buffer(buffer);
                 }
             }
             if (buffer.persistent) {
@@ -11917,6 +12041,11 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         }
         writeback_publish_ms = std::chrono::duration<double, std::milli>(
             ComputeClock::now() - writeback_publish_start).count();
+        // Publish only after successful completion and every architectural writeback.
+        // Baseline reclamation is independent: this proof describes the primary allocation.
+        if (cached_fill_enabled && known_fill && buffers.size() == 1 && images.empty() &&
+            known_fill->full_direct(buffers[0]))
+            ctx.remember_cached_buffer_fill(buffers[0].cache_key, buffers[0].buffer, known_fill->pattern);
         ok = true;
         phase_writeback = ComputeClock::now();
     } while (false);
@@ -12632,8 +12761,8 @@ bool live_compute_native_storage_3d_supported(prosper::gpu::DataFormat format,
         width, height, depth, 1u);
 }
 
-std::optional<bool> live_compute_cpu_fast_path_for_test(const prosper::gpu::ComputeItem& item) {
-    return execute_cpu_fast_path(item);
+uint64_t live_compute_cached_fill_dispatches() {
+    return g_cached_fill_dispatches.load(std::memory_order_relaxed);
 }
 
 uint64_t live_compute_cpu_fill_dispatches() {
@@ -12653,6 +12782,10 @@ uint64_t live_compute_image_result_snapshot_bytes() {
 bool cold_storage_result_snapshot_can_defer(bool host_data, bool full_overwrite,
                                             size_t guest_bytes, size_t minimum_bytes) {
     return !host_data && full_overwrite && guest_bytes >= minimum_bytes;
+}
+
+void live_compute_fail_next_buffer_readback_for_test() {
+    g_fail_next_buffer_readback_for_test.store(true, std::memory_order_release);
 }
 
 void live_compute_fail_next_storage_readback_for_test() {
@@ -12973,7 +13106,8 @@ bool execute_live_compute_items(const std::vector<prosper::gpu::ComputeItem>& it
         runtime_compute_authority_census();
     const bool authority_requested = authority_census.requested();
     for (const auto& item : items) {
-        if (const std::optional<bool> cpu_result = execute_cpu_fast_path(item)) {
+        KnownFillProof known_fill;
+        if (const std::optional<bool> cpu_result = execute_cpu_fast_path(item, &known_fill)) {
             if (authority_requested) {
                 const uint64_t program_hash = prosper::gpu::gpu_capture_hash(
                     reinterpret_cast<const uint8_t*>(item.spirv.data()),
@@ -12988,7 +13122,7 @@ bool execute_live_compute_items(const std::vector<prosper::gpu::ComputeItem>& it
             bool item_ok = false;
             {
                 prosper::frontend::TripBoundWitnessScope witness(item);
-                item_ok = execute_item(context, item);
+                item_ok = execute_item(context, item, known_fill.resource ? &known_fill : nullptr);
                 witness.report(item);
             }
             all_ok &= item_ok;

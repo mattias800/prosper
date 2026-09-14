@@ -3347,12 +3347,18 @@ if(TARGET prosper_core)
                  PROSPER_COMPUTE_IMAGE_CACHE_MIN_KB=1 PROSPER_COMPUTE_STORAGE_IMAGE_CACHE_MIN_KB=1
                  $<TARGET_FILE:test_storage_output_conflicts> --watched)
         set_tests_properties(storage_output_conflicts_watched PROPERTIES TIMEOUT 60)
-        add_executable(test_cpu_fill_watch_retry tests/gpu/execute/test_cpu_fill_watch_retry.cpp)
-        target_include_directories(test_cpu_fill_watch_retry PRIVATE tests frontends)
-        target_link_libraries(test_cpu_fill_watch_retry PRIVATE prosper_live_renderer prosper_core Vulkan::Vulkan)
-        add_test(NAME cpu_fill_watch_retry COMMAND ${CMAKE_COMMAND} -E env
-                 PROSPER_CPU_FILL_WATCH_RETRY=1 $<TARGET_FILE:test_cpu_fill_watch_retry>)
-        set_tests_properties(cpu_fill_watch_retry PROPERTIES TIMEOUT 60)
+        add_executable(test_cached_compute_fill tests/gpu/execute/test_cached_compute_fill.cpp)
+        target_include_directories(test_cached_compute_fill PRIVATE tests frontends)
+        target_link_libraries(test_cached_compute_fill PRIVATE prosper_live_renderer prosper_core Vulkan::Vulkan)
+        add_test(NAME cached_compute_fill COMMAND ${CMAKE_COMMAND} -E env
+                 PROSPER_CACHED_COMPUTE_FILL=1 PROSPER_COMPUTE_WRITE_WATCH_PROMOTE_HITS=1
+                 PROSPER_COMPUTE_BUFFER_RESULT_MIN_MB=0
+                 $<TARGET_FILE:test_cached_compute_fill>)
+        add_test(NAME cached_compute_fill_override COMMAND ${CMAKE_COMMAND} -E env
+                 PROSPER_CACHED_COMPUTE_FILL=1 PROSPER_COMPUTE_WRITE_WATCH_PROMOTE_HITS=1
+                 PROSPER_COMPUTE_BUFFER_RESULT_MIN_MB=0
+                 $<TARGET_FILE:test_cached_compute_fill> --cached-override)
+        set_tests_properties(cached_compute_fill cached_compute_fill_override PROPERTIES TIMEOUT 60)
       endif()
       set_tests_properties(storage_output_conflicts storage_output_conflicts_unjournaled
                            storage_output_conflicts_overflow storage_output_conflicts_submit_failure PROPERTIES TIMEOUT 60)

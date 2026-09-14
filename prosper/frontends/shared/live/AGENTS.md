@@ -144,16 +144,27 @@ inside cleanup timing; use it to diagnose residency, disable it for throughput c
 ## CPU fill admission
 
 The exact `FillSgprUvec4` shortcut validates the live descriptor and launch before preparing any
-write. `PROSPER_CPU_FILL_WATCH_RETRY=1` currently opts into retrying an OS-writability refusal after
-the existing host-write watch preparation. The second permission check remains authoritative;
-preparation never grants guest permission. Both successful and refused attempts complete their
-prepared host-write scope. Ordinary architectural clear notifications remain required even when
-all destination bytes already equal the fill pattern. `cpu_fill_watch_retry` exercises real watched
-aliases, genuine read-only revocation, partial-launch padding and rendered-depth invalidation.
+write, and completes its prepared host-write scope after the store. Its semantic fill proof can
+survive a CPU permission refusal, but does not itself authorize memory access or cached reuse.
+Ordinary architectural clear semantics remain required even when all destination bytes already
+equal the fill pattern. `cached_compute_fill` exercises this distinction against rendered depth.
 
 `PROSPER_COMPUTE_FAST_PATH_CENSUS=1` reports the first admission/refusal reason for this shortcut
 only while F8 detailed timing is active. Broadcast-buffer shortcuts have a separate implementation
 and are not included in this reason partition. The census reads no additional guest contents.
+
+`PROSPER_CACHED_COMPUTE_FILL=1` currently opts into reusing a complete fill pattern on an existing
+compute-buffer owner. Full ordinary direct backing, matching emitted extent and current acquired
+source authority are required. The pattern is cleared before source refresh or writable dispatch
+and published only after all result writebacks succeed. Partial/hosted/tail bindings and applied
+shader overrides are excluded. No additional guest-data cache is created. A `cached-fill` buffer
+timing row identifies an actual skipped submission; its GPU comparison is `not-recorded`.
+
+Known fills use an explicit clear origin for unchanged GPU writeback and cached reuse. Guest-byte
+watches/journal remain valid, while renderer aliases still receive the semantic clear. Generic
+refresh operations retain their existing preservation classification. The production fixture also
+checks complete-pattern reuse, intervening writers, alias mutations, failed publication, partial
+and mismatched shader extents, and a targeted shader replacement followed by an original shader.
 
 ## Read-only storage images
 
