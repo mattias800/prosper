@@ -21,6 +21,7 @@
 #include "shared/live/decode_scratch.hpp"     // pooled full-surface decode intermediates
 #include "shared/live/live_target_format.hpp"       // the one LiveTargetPixelFormat mapping (exhaustive)
 #include "shared/perf/performance_capture.hpp"      // bounded F8 post-trigger renderer timing
+#include "shared/present/present_handoff_trace.hpp"
 #include "shared/perf/performance_timing_gate.hpp"  // turn on render_runner's existing backend clocks
 #include "shared/perf/performance_timing_policy.hpp" // retain timing across split semantic submits
 
@@ -10148,6 +10149,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 const uint64_t current_flip = prosper_vo_flip_count();
                 const bool new_gpu_flip = prosper::frontend::present_blit_has_new_flip(
                     last_gpu_publish_flip, current_flip);
+                PresentHandoffTrace handoff_trace(current_flip);
+                if (handoff_trace.active)
+                    handoff_trace.emit(prosper::perf::PresentHandoffEvent::RendererGate, front, 0, prosper::gpu::present_count(),
+                                       front >= 0 ? prosper_vo_buffer_addr(front) : 0);
                 // GPU present (#1270): when prosper-app has adopted this device and is consuming the
                 // front-buffer image directly, blit it into a scanout slot on the GPU and SKIP the CPU
                 // readback+reupload entirely. gpu_present_active() is false in every headless/test/
@@ -10161,6 +10166,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     // flip. Treat it as a successful GPU publication so intermediate render
                     // submissions do not fall through to the expensive CPU readback path.
                     published_gpu = true;
+                    handoff_trace.emit(prosper::perf::PresentHandoffEvent::SameFlipSuppressed, 0, 0, last_gpu_publish_flip);
                 } else if (front >= 0 && prosper::gpu::gpu_present_active()) {
                     const uint64_t front_va = prosper_vo_buffer_addr(front);
                     auto rit = g_rtt.find(front_va);
@@ -10177,6 +10183,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         }
                     }
                 }
+                if (!published_gpu) handoff_trace.emit(prosper::perf::PresentHandoffEvent::CpuFallbackNeeded);
                 const RttSurf* scanout = (!published_gpu && front >= 0)
                     ? cached_scanout(prosper_vo_buffer_addr(front)) : nullptr;
                 if (!published_gpu && !scanout) {

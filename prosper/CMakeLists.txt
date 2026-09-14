@@ -4379,6 +4379,9 @@ if(TARGET prosper_live_renderer AND TARGET prosper_core)
   target_include_directories(test_present_blit PRIVATE src tests)
   target_link_libraries(test_present_blit PRIVATE prosper_live_renderer prosper_core Vulkan::Vulkan)
   add_test(NAME present_blit COMMAND test_present_blit)
+  add_test(NAME present_blit_trace COMMAND test_present_blit)
+  set_tests_properties(present_blit_trace PROPERTIES
+    ENVIRONMENT "PROSPER_PRESENT_HANDOFF_TRACE=1")
 endif()
 
 # #3372: gpu_replay's two graphics shader dumps produce OPPOSITE things -- --dump-shader writes

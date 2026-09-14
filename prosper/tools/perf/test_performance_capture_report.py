@@ -8,6 +8,7 @@ import io
 from performance_capture_report import (CaptureError, CLASSIFICATION_EVIDENCE_SHARE,
                                         READBACK_NOTE_MIN_SHARE, print_summary, summarize,
                                         validate_capture)
+from performance_capture_report import summarize_handoffs
 
 
 def capture(post=None, renderer=None, compute=None, dropped=(0, 0)):
@@ -39,6 +40,60 @@ SAMPLES = [
 
 
 class PerformanceCaptureReportTests(unittest.TestCase):
+    def test_handoffs_keep_boundaries_and_cpu_namespace_separate(self):
+        records = capture(SAMPLES)
+        records[0].update(present_handoffs_enabled=True, post_window_ns=1000)
+        def row(event, identity, source=7, kind="gpu", result=0, begin=None):
+            return dict(type="present-handoff", event=event, source_kind=kind, t_ns=100,
+                        begin_ns=begin, publication_id=identity, source_seq=source,
+                        other_seq=0, slot=0, result=result)
+        rows = [row("published", 1), row("superseded", 1),
+                row("published", 2), row("acquired", 2, begin=-100), row("gpu-shown", 2),
+                row("published", 3), row("gpu-attempt-result", 3, result=1),
+                row("published", 4), # window ends before a terminal observation
+                row("gpu-shown", 5), # publication precedes the observed window
+                row("cpu-acquired", 2, source=99, kind="cpu"),
+                row("cpu-shown", 2, source=99, kind="cpu")]
+        rows[1]['other_seq'] = 2
+        records[-1].update(present_records=len(rows), present_dropped=0)
+        records[-1:-1] = rows
+        summary = summarize_handoffs(records)
+        self.assertEqual(summary['published_outcomes'],
+                         {'superseded':1, 'gpu-shown':1, 'skipped':1, 'unresolved-in-window':1})
+        self.assertFalse(summary['gpu_publications'][-1]['publication_observed'])
+        self.assertAlmostEqual(summary['waits_ms']['acquired']['total'], 0.0002)
+        self.assertEqual(summary['event_counts']['cpu-shown'], 1)
+        # Keep footer counts correct so these exercise semantics, not the count guard.
+        rows[1]['event'] = 'future-replacement-name'
+        with self.assertRaises(CaptureError): summarize_handoffs(records)
+        rows[1]['event'] = 'superseded'
+        rows[-1]['event'] = 'cpu-fallback-needed' # GPU selection metadata, never a CPU handoff
+        with self.assertRaises(CaptureError): summarize_handoffs(records)
+        rows[-1]['event'] = 'cpu-shown'
+        rows[0]['publication_id'] = 0
+        with self.assertRaises(CaptureError): summarize_handoffs(records)
+        rows[0]['publication_id'] = 1
+        rows[1]['other_seq'] = 1
+        with self.assertRaises(CaptureError): summarize_handoffs(records)
+        rows[1]['other_seq'] = 2
+        # Removing a production event must fail visibly, rather than inventing a lost frame.
+        records.pop(-2)
+        with self.assertRaises(CaptureError): summarize_handoffs(records)
+
+    def test_handoffs_refuse_unavailable_overflow_and_conflicting_outcomes(self):
+        with self.assertRaises(CaptureError): summarize_handoffs(capture(SAMPLES))
+        records = capture(SAMPLES)
+        records[0].update(present_handoffs_enabled=True, post_window_ns=1000)
+        records[-1].update(present_records=0, present_dropped=1)
+        with self.assertRaises(CaptureError): summarize_handoffs(records)
+        records[-1].update(present_records=2, present_dropped=0)
+        rows = [dict(type="present-handoff", event=e, source_kind="gpu", t_ns=100,
+                     begin_ns=None, publication_id=1, source_seq=7, other_seq=0, slot=0, result=0)
+                for e in ("gpu-shown", "superseded")]
+        rows[1]['other_seq'] = 2
+        records[-1:-1] = rows
+        with self.assertRaises(CaptureError): summarize_handoffs(records)
+
     def test_texture_witness_identity_tracks_selected_row_and_missing_metadata(self):
         row = {"frontend_tex_rtt_ms": 0, "frontend_texture_ms": 2,
                "frontend_tex_other_slowest_ms": 2, "frontend_tex_other_class": 4,

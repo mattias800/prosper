@@ -139,6 +139,29 @@ F8 post-trigger timers, F9 captures, debugger stops, frame dumps, and verbose lo
 Use diagnostic runs to find the cause and separate minimally instrumented runs to measure the win.
 For stopped-stack fallback only: [hostprof](../tools/hostprof/README.md).
 
+For a guest/host presentation-rate split, add `PROSPER_PRESENT_HANDOFF_TRACE=1` before
+launching and trigger ordinary F8. Inspect the same artifact with:
+
+```bash
+python3 tools/perf/performance_capture_report.py "$perf_capture" --handoffs
+```
+
+This opt-in trace reserves at most 8,192 fixed-size records for F8's post-trigger window.
+It observes GPU publication attempts, superseded slots, acquisition/release, stale-source
+rejection, swapchain results and waits. `publication_id` is a handoff identity, not a completed
+render version; `source_seq` retains the caller's flip clock. CPU handoff IDs have a separate
+`source_kind` namespace. `renderer-gate` records the VideoOut flip in `source_seq`, the core
+present count in `other_seq`, the front index in `result` and its address in `address`.
+`superseded.other_seq` names the replacing publication; stale events name the last shown flip.
+Attempt results follow `PresentAttempt`: 0 presented, 1 skipped, 2 out-of-date, 3 failed.
+
+The report refuses unavailable/overflowed traces and conflicting outcomes. Missing boundary
+transitions remain unknown: zero overflow does not exclude a collector-close race. CPU producer
+publication and completed image-producer lineage remain unobserved. Waits may overlap and extend
+before the window; do not add them as independent critical-path costs. No readback or throttle is
+added by the trace, but active recording still has a mutex/copy cost. Compare trace-off controls
+before attributing an end-user performance improvement. Ordinary F8 leaves this trace disabled.
+
 **Before profiling symbols, divide by the core count.** A process consuming about **one**
 core-second per wall-second on a many-core box is doing its work serially, whatever `perf report`
 then attributes the time to — the question stops being "which function" and becomes "why is only one

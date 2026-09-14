@@ -1,6 +1,7 @@
 // present_blit.cpp — see present_blit.hpp (#1270).
 #include "shared/present/present_blit.hpp"
 #include "shared/present/present_blit_policy.hpp"
+#include "shared/present/present_handoff_trace.hpp"
 #include "fixtures/render_runner.h"            // render_vk_ctx()
 #include "gpu/execute/gpu_execute.hpp"        // shared_present_submit_mutex / shared_present_active
 #include "host/platform/gpu_submit_gate.hpp"    // #3225: refuse submits once the frontend shuts down
@@ -24,6 +25,7 @@ struct Slot {
     SlotState      state = SlotState::Free;
     uint32_t       w = 0, h = 0;            // the size of THIS slot's current image (per-slot, #1270)
     uint64_t       frame_seq = 0;
+    uint64_t       publication_id = 0;
 };
 
 struct PresentBlitState {
@@ -39,6 +41,7 @@ struct PresentBlitState {
     Slot            slots[kSlots];
     int             latest = -1;            // slot index of the newest published frame
     bool            latest_taken = false;   // has the consumer acquired `latest`
+    uint64_t        next_publication = 0;    // survives pool reset; not a render counter
 };
 
 PresentBlitState& S() { static PresentBlitState s; return s; }
@@ -146,24 +149,32 @@ int pick_free_slot(PresentBlitState& s) {
 bool present_blit_publish(VkImage src, VkImageLayout src_layout, VkFormat src_format,
                           uint32_t w, uint32_t h, uint64_t frame_seq) {
     if (!src || !w || !h) return false;
+    PresentHandoffTrace trace(frame_seq);
+    const auto lock_begin = trace.now();
     PresentBlitState& s = S();
     std::lock_guard<std::mutex> lk(s.mx);
-    if (!ensure_init(s)) return false;
-    if (!blit_supported(s.phys, src_format)) return false;   // decline -> caller keeps CPU present path
+    trace.identity.publication_id = ++s.next_publication;
+    trace.emit(prosper::perf::PresentHandoffEvent::PublishLock, 0, lock_begin);
+    if (!ensure_init(s)) { trace.emit(prosper::perf::PresentHandoffEvent::PublishInitFailed); return false; }
+    if (!blit_supported(s.phys, src_format)) { trace.emit(prosper::perf::PresentHandoffEvent::PublishFormatDeclined); return false; }
 
     const int slot = pick_free_slot(s);
-    if (slot < 0) return false;   // consumer is behind; drop this frame's publish (it keeps the last one)
+    if (slot < 0) {
+        trace.emit(prosper::perf::PresentHandoffEvent::PublishNoSlot);
+        return false;
+    }
+    trace.identity.slot = slot;
     Slot& sl = s.slots[slot];
     // Size the (Free) slot's image to this frame. A display-size change (or dynamic resolution) recreates
     // ONLY this Free slot's image -- never an in-flight one -- so it cannot free an image the consumer
     // still holds, and needs no device-wide wait (#1270 Finding 1).
-    if (!ensure_slot_image(s, sl, w, h)) return false;
+    if (!ensure_slot_image(s, sl, w, h)) { trace.emit(prosper::perf::PresentHandoffEvent::PublishImageFailed); return false; }
 
     VkCommandBuffer cb = sl.cmd;
     vkResetCommandBuffer(cb, 0);
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    if (vkBeginCommandBuffer(cb, &bi) != VK_SUCCESS) return false;
+    if (vkBeginCommandBuffer(cb, &bi) != VK_SUCCESS) { trace.emit(prosper::perf::PresentHandoffEvent::PublishBeginFailed); return false; }
 
     // src (front-buffer image) -> TRANSFER_SRC; scanout slot -> TRANSFER_DST (contents discarded).
     image_barrier(cb, src, src_layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
@@ -188,7 +199,7 @@ bool present_blit_publish(VkImage src, VkImageLayout src_layout, VkFormat src_fo
     image_barrier(cb, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, src_layout,
                   VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
                   VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
-    if (vkEndCommandBuffer(cb) != VK_SUCCESS) return false;
+    if (vkEndCommandBuffer(cb) != VK_SUCCESS) { trace.emit(prosper::perf::PresentHandoffEvent::PublishEndFailed); return false; }
 
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     si.commandBufferCount = 1; si.pCommandBuffers = &cb;
@@ -201,19 +212,24 @@ bool present_blit_publish(VkImage src, VkImageLayout src_layout, VkFormat src_fo
         // reaches the driver — the caller falls back to the CPU present path, which is the existing
         // behaviour for any failed blit submit and is harmless on the last frame before exit.
         prosper::GpuSubmitRegion submit_gate;
-        if (!submit_gate.admitted()) return false;
+        if (!submit_gate.admitted()) { trace.emit(prosper::perf::PresentHandoffEvent::PublishShutdownDeclined); return false; }
         // Serialize the host submit CALL against prosper-app's present submits on the shared queue.
         std::unique_lock<std::mutex> qlk(prosper::gpu::shared_present_submit_mutex(), std::defer_lock);
+        const auto queue_begin = trace.now();
         if (prosper::gpu::shared_present_active()) qlk.lock();
+        trace.emit(prosper::perf::PresentHandoffEvent::PublishQueueLock, 0, queue_begin);
         sr = vkQueueSubmit(s.queue, 1, &si, s.blit_fence);
     }
+    trace.emit(prosper::perf::PresentHandoffEvent::PublishSubmit, static_cast<int>(sr));
     if (sr != VK_SUCCESS) return false;
     // Wait the blit's completion here (a fast GPU->GPU copy) so the slot is fully written before it can be
     // acquired -- this is what lets the consumer read it with no cross-thread semaphore, and is strictly
     // cheaper than the GPU->CPU readback + CPU->GPU re-upload it replaces. Does not touch the queue, so it
     // is outside the submit mutex.
+    const auto wait_begin = trace.now();
     const VkResult wait_result =
         vkWaitForFences(s.dev, 1, &s.blit_fence, VK_TRUE, 5ull * 1000 * 1000 * 1000);
+    trace.emit(prosper::perf::PresentHandoffEvent::PublishFence, static_cast<int>(wait_result), wait_begin);
     if (!present_blit_wait_completed(wait_result)) {
         // The command buffer and destination slot may still be in flight. Fail the GPU-present path
         // closed for this session so neither can be published or reused; present_blit_reset() retains
@@ -225,21 +241,32 @@ bool present_blit_publish(VkImage src, VkImageLayout src_layout, VkFormat src_fo
     }
 
     sl.frame_seq = frame_seq;
+    sl.publication_id = trace.identity.publication_id;
     sl.state = SlotState::Published;
 
     // A previously published-but-untaken frame is now stale; free its slot for reuse.
     if (s.latest >= 0 && s.latest != slot && !s.latest_taken &&
-        s.slots[s.latest].state == SlotState::Published)
+        s.slots[s.latest].state == SlotState::Published) {
+        const auto& old = s.slots[s.latest];
+        PresentHandoffTrace(old.frame_seq, old.publication_id, s.latest).emit(
+            prosper::perf::PresentHandoffEvent::Superseded, 0, 0, sl.publication_id);
         s.slots[s.latest].state = SlotState::Free;
+    }
     s.latest = slot;
     s.latest_taken = false;
+    trace.emit(prosper::perf::PresentHandoffEvent::Published);
     return true;
 }
 
 bool present_blit_acquire(GpuScanoutFrame& out) {
+    PresentHandoffTrace trace;
+    const auto lock_begin = trace.now();
     PresentBlitState& s = S();
     std::lock_guard<std::mutex> lk(s.mx);
-    if (!s.ok || s.latest < 0 || s.latest_taken) return false;
+    if (!s.ok || s.latest < 0 || s.latest_taken) {
+        trace.emit(prosper::perf::PresentHandoffEvent::AcquireEmpty, 0, lock_begin);
+        return false;
+    }
     Slot& sl = s.slots[s.latest];
     if (sl.state != SlotState::Published) return false;
     sl.state = SlotState::InFlight;
@@ -247,7 +274,12 @@ bool present_blit_acquire(GpuScanoutFrame& out) {
     out.image = sl.image;
     out.width = sl.w; out.height = sl.h;
     out.frame_seq = sl.frame_seq;
+    out.publication_id = sl.publication_id;
     out.slot = s.latest;
+    trace.identity.source_seq = sl.frame_seq;
+    trace.identity.publication_id = sl.publication_id;
+    trace.identity.slot = s.latest;
+    trace.emit(prosper::perf::PresentHandoffEvent::Acquired, 0, lock_begin);
     return true;
 }
 
@@ -256,7 +288,10 @@ void present_blit_release(int slot) {
     PresentBlitState& s = S();
     std::lock_guard<std::mutex> lk(s.mx);
     Slot& sl = s.slots[slot];
-    if (sl.state == SlotState::InFlight) sl.state = SlotState::Free;
+    if (sl.state == SlotState::InFlight) {
+        PresentHandoffTrace(sl.frame_seq, sl.publication_id, slot).emit(prosper::perf::PresentHandoffEvent::Released);
+        sl.state = SlotState::Free;
+    }
 }
 
 void present_blit_reset() {

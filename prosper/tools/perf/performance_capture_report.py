@@ -7,6 +7,7 @@ missing. It never interprets a dropped/capped record count as the real event cou
 """
 
 import argparse
+import collections
 import json
 import math
 import sys
@@ -14,6 +15,41 @@ import sys
 # ResourceClass in gpu/resources/shader_resources.hpp. Unknown future values stay numeric.
 RESOURCE_CLASS_NAMES = {0: "ConstantBuffer", 1: "VertexBuffer", 2: "Texture",
                         3: "Sampler", 4: "StorageImage"}
+
+
+HANDOFF_EVENT_KINDS = {
+    'acquire-empty': 'gpu',
+    'acquired': 'gpu',
+    'consumer-previous-fence': 'gpu',
+    'consumer-queue-lock': 'gpu',
+    'consumer-submit': 'gpu',
+    'cpu-acquired': 'cpu',
+    'cpu-attempt-result': 'cpu',
+    'cpu-fallback-needed': 'gpu',
+    'cpu-shown': 'cpu',
+    'cpu-stale': 'cpu',
+    'gpu-attempt-result': 'gpu',
+    'gpu-shown': 'gpu',
+    'gpu-stale': 'gpu',
+    'publish-begin-failed': 'gpu',
+    'publish-end-failed': 'gpu',
+    'publish-fence': 'gpu',
+    'publish-format-declined': 'gpu',
+    'publish-image-failed': 'gpu',
+    'publish-init-failed': 'gpu',
+    'publish-lock': 'gpu',
+    'publish-no-slot': 'gpu',
+    'publish-queue-lock': 'gpu',
+    'publish-shutdown-declined': 'gpu',
+    'publish-submit': 'gpu',
+    'published': 'gpu',
+    'released': 'gpu',
+    'renderer-gate': 'gpu',
+    'same-flip-suppressed': 'gpu',
+    'superseded': 'gpu',
+    'swapchain-acquire': 'gpu',
+    'swapchain-present': 'gpu',
+}
 
 
 class CaptureError(ValueError):
@@ -60,6 +96,84 @@ def validate_capture(records):
     for key in ("renderer_dropped", "compute_dropped"):
         if not isinstance(footer.get(key), int) or footer[key] < 0:
             raise CaptureError(f"footer has invalid {key}")
+    handoffs = [r for r in records if r.get("type") == "present-handoff"]
+    if "present_handoffs_enabled" in header or handoffs:
+        enabled = header.get("present_handoffs_enabled")
+        if type(enabled) is not bool:
+            raise CaptureError("handoff availability is missing or malformed")
+        if (type(footer.get("present_records")) is not int or
+                footer["present_records"] != len(handoffs) or
+                type(footer.get("present_dropped")) is not int or footer["present_dropped"] < 0):
+            raise CaptureError("handoff footer count/overflow is missing or inconsistent")
+        if not enabled and (handoffs or footer["present_dropped"]):
+            raise CaptureError("disabled handoff trace contains observations")
+
+
+def summarize_handoffs(records):
+    """Account for observed handoffs, leaving incomplete boundary chains unknown."""
+    validate_capture(records)
+    header, footer = records[0], next(r for r in records if r.get("type") == "footer")
+    if header.get("present_handoffs_enabled") is not True:
+        raise CaptureError("handoff trace unavailable; arm PROSPER_PRESENT_HANDOFF_TRACE with F8")
+    if footer["present_dropped"]:
+        raise CaptureError("handoff trace overflowed; event accounting is incomplete")
+    rows = [r for r in records if r.get("type") == "present-handoff"]
+    groups, counts, waits = {}, collections.Counter(), {}
+    window = header.get("post_window_ns")
+    if type(window) is not int or window <= 0:
+        raise CaptureError("handoff window is missing")
+    for row in rows:
+        event, kind = row.get("event"), row.get("source_kind")
+        if not isinstance(event, str) or event not in HANDOFF_EVENT_KINDS:
+            raise CaptureError("unknown handoff event or identity namespace")
+        for key in ("t_ns", "publication_id", "source_seq", "other_seq", "slot", "result"):
+            if type(row.get(key)) is not int:
+                raise CaptureError(f"invalid handoff {key}")
+        if not 0 <= row["t_ns"] <= window or min(row["publication_id"], row["source_seq"], row["other_seq"]) < 0:
+            raise CaptureError("handoff lies outside the window or has a negative identity")
+        if HANDOFF_EVENT_KINDS[event] != kind:
+            raise CaptureError("handoff event/identity namespace mismatch")
+        without_identity = {"acquire-empty", "renderer-gate", "same-flip-suppressed", "cpu-fallback-needed"}
+        if event not in without_identity and not row["publication_id"]:
+            raise CaptureError("handoff transition is missing its publication identity")
+        if event == "superseded" and (not row["other_seq"] or row["other_seq"] == row["publication_id"]):
+            raise CaptureError("supersession is missing a distinct replacing publication")
+        counts[event] += 1
+        begin = row.get("begin_ns")
+        if begin is not None:
+            if type(begin) is not int or begin > row["t_ns"]:
+                raise CaptureError("invalid handoff wait interval")
+            waits.setdefault(event, []).append((row["t_ns"] - begin) / 1e6)
+        if kind == "gpu" and row["publication_id"]:
+            groups.setdefault(row["publication_id"], []).append(row)
+    publications = []
+    for identity, events in sorted(groups.items()):
+        if len({r["source_seq"] for r in events}) != 1:
+            raise CaptureError("one GPU publication ID refers to multiple source clocks")
+        event_counts = collections.Counter(r["event"] for r in events)
+        if any(event_counts[e] > 1 for e in ("published", "acquired", "gpu-shown", "gpu-stale", "superseded")):
+            raise CaptureError("duplicate GPU handoff transition")
+        terminal = [r["event"] for r in events if r["event"] in ("gpu-shown", "gpu-stale", "superseded")]
+        for r in events:
+            if r["event"] == "gpu-attempt-result":
+                if r["result"] not in (0, 1, 2, 3):
+                    raise CaptureError("unknown presentation attempt result")
+                if r["result"]:
+                    terminal.append({1:"skipped", 2:"out-of-date", 3:"failed"}[r["result"]])
+        if len(terminal) > 1:
+            raise CaptureError("conflicting terminal GPU handoff outcomes")
+        publications.append({"publication_id":identity, "source_seq":events[0]["source_seq"],
+            "publication_observed":bool(event_counts["published"]),
+            "outcome":terminal[0] if terminal else "unresolved-in-window"})
+    return {"scope":"observed GPU handoffs; CPU observations use a separate identity namespace",
+        "event_counts":dict(sorted(counts.items())), "gpu_publications":publications,
+        "published_outcomes":dict(collections.Counter(p["outcome"] for p in publications if p["publication_observed"])),
+        "waits_ms":{k:{"count":len(v), "total":sum(v), "max":max(v)} for k,v in sorted(waits.items())},
+        "limits":["Publication IDs and source flips are not completed producer lineage or fresh-render FPS.",
+                  "Window boundaries and collector-close races can omit transitions even without overflow.",
+                  "Unresolved chains are unknown, not proven dropped or still pending frames.",
+                  "CPU producer publication is unobserved; cpu-fallback-needed is only a selection-stage observation.",
+                  "Waits can overlap and extend before the capture; do not add them as critical-path time."]}
 
 
 def _gpu_present_adopted(post):
@@ -941,13 +1055,15 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("capture", help="completed .prperf file")
     parser.add_argument("--json", action="store_true", help="emit the derived summary as JSON")
+    parser.add_argument("--handoffs", action="store_true", help="emit opt-in handoff accounting as JSON, not fresh-render FPS")
     args = parser.parse_args(argv)
     try:
-        summary = summarize(load_capture(args.capture))
+        records = load_capture(args.capture)
+        summary = summarize_handoffs(records) if args.handoffs else summarize(records)
     except CaptureError as exc:
         print(f"performance_capture_report: {exc}", file=sys.stderr)
         return 2
-    if args.json:
+    if args.json or args.handoffs:
         json.dump(summary, sys.stdout, indent=2, sort_keys=True)
         print()
     else:

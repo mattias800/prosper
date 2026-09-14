@@ -42,6 +42,7 @@
 #include "game_library.hpp"              // scan a games dir -> titles + metadata, pure seam
 #include "frame_grab_naming.hpp"         // one stamp + one exclusively claimed name pair per F9 grab
 #include "shared/perf/performance_capture.hpp"        // bounded F8 pre/post performance artifact
+#include "shared/present/present_handoff_trace.hpp"
 #include "performance_capture_schedule.hpp" // unattended elapsed-time trigger for the same artifact
 #include "shared/diagnostics/renderdoc_capture.hpp" // frame-aimed RenderDoc capture (#3321)
 #include "app_config.hpp"                // persisted settings (games_dir), pure seam
@@ -703,8 +704,11 @@ prosper::frontend::PresentAttempt present_frame_gpu(Vk& vk, const prosper::front
                                                     bool& readbackReady, bool sampleContent,
                                                     const std::vector<std::string>* overlayLines = nullptr) {
     readbackReady = false;
+    prosper::frontend::PresentHandoffTrace trace(gf.frame_seq, gf.publication_id, gf.slot);
+    const auto previous_begin = trace.now();
     const VkResult previousWait = vkWaitForFences(
         vk.device, 1, &vk.inFlight, VK_TRUE, UINT64_MAX);   // previous present's read complete
+    trace.emit(prosper::perf::PresentHandoffEvent::ConsumerPreviousFence, static_cast<int>(previousWait), previous_begin);
     if (previousWait != VK_SUCCESS) {
         prosper::frontend::present_blit_release(gf.slot);
         if (prevSlot >= 0) {
@@ -733,8 +737,10 @@ prosper::frontend::PresentAttempt present_frame_gpu(Vk& vk, const prosper::front
 
     uint32_t imgIndex = 0;
     constexpr uint64_t kAcquireTimeoutNs = 100ull * 1000 * 1000;
+    const auto acquire_begin = trace.now();
     VkResult acq = vkAcquireNextImageKHR(vk.device, vk.swapchain, kAcquireTimeoutNs, vk.acquireSem,
                                          VK_NULL_HANDLE, &imgIndex);
+    trace.emit(prosper::perf::PresentHandoffEvent::SwapchainAcquire, static_cast<int>(acq), acquire_begin);
     switch (prosper::frontend::classify_acquire(acq)) {
     case prosper::frontend::AcquireAction::skip:
         prosper::frontend::present_blit_release(gf.slot); return prosper::frontend::PresentAttempt::skipped;
@@ -838,10 +844,14 @@ prosper::frontend::PresentAttempt present_frame_gpu(Vk& vk, const prosper::front
     {
         // Serialize the present submit + present CALL against the renderer's submits on a shared queue.
         std::unique_lock<std::mutex> lk(gpu::shared_present_submit_mutex(), std::defer_lock);
+        const auto queue_begin = trace.now();
         if (vk.queue_shared) lk.lock();
+        trace.emit(prosper::perf::PresentHandoffEvent::ConsumerQueueLock, 0, queue_begin);
         submitResult = vkQueueSubmit(vk.queue, 1, &su, vk.inFlight);
         if (submitResult == VK_SUCCESS) pr = vkQueuePresentKHR(vk.queue, &pi);
     }
+    trace.emit(prosper::perf::PresentHandoffEvent::ConsumerSubmit, static_cast<int>(submitResult));
+    if (submitResult == VK_SUCCESS) trace.emit(prosper::perf::PresentHandoffEvent::SwapchainPresent, static_cast<int>(pr));
     if (submitResult != VK_SUCCESS) {
         prosper::frontend::present_blit_release(gf.slot);
         // The sample copy was RECORDED but never executed, so the buffer still holds the previous
@@ -2963,8 +2973,10 @@ int main(int argc, char** argv) {
             // GPU present (#1270): blit the renderer's front-buffer image straight to the swapchain.
             prosper::frontend::GpuScanoutFrame gf;
             if (prosper::frontend::present_blit_acquire(gf)) {
+                prosper::frontend::PresentHandoffTrace trace(gf.frame_seq, gf.publication_id, gf.slot);
                 if (!prosper::frontend::present_source_is_newer(
                         havePresentedGuestFlip, lastPresentedGuestFlip, gf.frame_seq)) {
+                    trace.emit(prosper::perf::PresentHandoffEvent::GpuStale, 0, 0, lastPresentedGuestFlip);
                     prosper::frontend::present_blit_release(gf.slot);
                     continue;
                 }
@@ -2977,6 +2989,7 @@ int main(int argc, char** argv) {
                     !pendingGrabScreenshot.empty() || pendingSnapVerdict.has_value() ||
                         pendingActualTarget.has_value(), grabReady,
                     showFps, fpsForPresent);
+                trace.emit(prosper::perf::PresentHandoffEvent::GpuAttemptResult, static_cast<int>(attempt));
                 gpuPresentedW = gf.width; gpuPresentedH = gf.height;
                 if (grabReady) {
                     flushGrabScreenshot(static_cast<const uint8_t*>(vk.stageMapped),
@@ -2994,6 +3007,7 @@ int main(int argc, char** argv) {
                     running = false;
                 } else {
                     shown.record(prosper::frontend::PresentedFrameSource::GpuScanout, running);
+                    trace.emit(prosper::perf::PresentHandoffEvent::GpuShown);
                     lastFrameProgress = std::chrono::steady_clock::now();
                     havePresentedGuestFlip = true;
                     lastPresentedGuestFlip = gf.frame_seq;
@@ -3037,9 +3051,13 @@ int main(int argc, char** argv) {
                 gpu::PresentFrameLease cf;
                 if (gpu::present_acquire_rendered_frame(cf) && cf.width && cf.height && cf.rgba &&
                     cf.rgba->size() == (size_t)cf.width * cf.height * 4) {
+                    prosper::frontend::PresentHandoffTrace trace(cf.guest_present_count, cf.frame_seq);
+                    trace.identity.cpu_source = true;
+                    trace.emit(prosper::perf::PresentHandoffEvent::CpuAcquired);
                     if (!prosper::frontend::present_source_is_newer(
                             havePresentedGuestFlip, lastPresentedGuestFlip,
                             cf.guest_present_count)) {
+                        trace.emit(prosper::perf::PresentHandoffEvent::CpuStale, 0, 0, lastPresentedGuestFlip);
                         // Consume this CPU publication even though it is stale. Otherwise every
                         // GPU acquire gap would redisplay the same old fallback indefinitely.
                         lastFrameSeq = cf.frame_seq;
@@ -3047,6 +3065,7 @@ int main(int argc, char** argv) {
                     }
                     PresentAttempt a = present_frame(vk, cf.rgba->data(), cf.width, cf.height,
                                                      fpsForPresent);
+                    trace.emit(prosper::perf::PresentHandoffEvent::CpuAttemptResult, static_cast<int>(a));
                     if (gpuPrevSlot >= 0) { prosper::frontend::present_blit_release(gpuPrevSlot); gpuPrevSlot = -1; }
                     if (a == PresentAttempt::out_of_date) swapchainDirty = true;
                     else if (a == PresentAttempt::skipped) std::this_thread::sleep_for(std::chrono::milliseconds(4));
@@ -3055,6 +3074,7 @@ int main(int argc, char** argv) {
                         lastFrameSeq = cf.frame_seq;
                         shown.record(
                             prosper::frontend::PresentedFrameSource::GpuCpuFallback, running);
+                        trace.emit(prosper::perf::PresentHandoffEvent::CpuShown);
                         lastFrameProgress = std::chrono::steady_clock::now();
                         havePresentedGuestFlip = true;
                         lastPresentedGuestFlip = cf.guest_present_count;
