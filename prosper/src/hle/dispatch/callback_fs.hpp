@@ -4,10 +4,26 @@
 
 namespace prosper {
 
-// The guest import stub's frame, as seen from an HLE entry's %rsp (exec_image_linux.cpp's
-// emit_swap_stub): return-to-stub at +0, forwarded args7/8/9 at +8/+0x10/+0x18, an alignment pad at
-// +0x20, saved r11 (the CALLING host thread's guest %fs) at +0x28, and the guest return address at
-// +0x30. Host-context tail calls have no such frame.
+// The guest import stub's frame, as seen from an HLE entry's %rsp. This describes ONE of the two
+// shapes prosper emits -- `emit_swap_stub` (exec_image_linux.cpp): return-to-stub at +0, the four
+// forwarded stack arguments 7/8/9/10 at +8/+0x10/+0x18/+0x20, saved r11 (the CALLING host thread's
+// guest %fs) at +0x28, and the guest return address at +0x30. Its five pushes are what align the
+// handler's entry; there is no dead slot in it.
+//
+// The OTHER shape is `prosper_hle_hook_swap_trampoline` (same file), used by imports that carry a
+// return hook. Its real guest-%fs slot is at +0x38, and +0x28 holds a COPY of it -- so the +0x28
+// test alone does NOT distinguish them. What excludes a hooked frame here is the aperture check
+// below: the trampoline reaches the handler through `callq *%r10`, so the qword at +0 is a return
+// address in prosper's own text rather than in the emitted-stub aperture. Today no fiber NID has a
+// return hook (only the AGC submit NIDs do), so nothing reaches that path; if one ever gains one,
+// this must grow a shape discriminator rather than silently repairing the spill slot.
+//
+// Host-context tail calls have no such frame at all.
+//
+// VERIFIED BY EXECUTION, not by reading: in review of #3637 both stubs' emitted bytes were run in a
+// standalone program against a fake guest TCB and the frame captured live inside the handler --
+// +0x28 carries the TCB for the swap stub, and the epilogue restores %fs from that slot. Note that
+// agreement is NOT machine-checked by any test; see test_fiber_guest_tp_stash.cpp.
 inline constexpr uint64_t kStubGuestFsSlotOffset = 0x28;
 
 // Address of the slot holding the stashed guest %fs, or 0 when this is not a swap-stub frame. The

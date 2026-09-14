@@ -231,14 +231,23 @@ bool fiber_log() { static const bool enabled = std::getenv("PROSPER_FIBERLOG") !
 // Re-point the stub frame this fiber suspended inside at the RESUMING thread's own guest TP. See
 // callback_repair_guest_fs_slot for why the stash goes stale across a fiber migration. Called on the
 // resume side of every context save, so it also covers the ordinary same-thread resume (a no-op).
+// BOUND: this repairs the SUSPENDING CALL'S OWN frame and no other. An *outer* swap-stub frame still
+// on the fiber's stack -- a guest callback invoked from inside another HLE handler, which then yields
+// the fiber -- unwinds through its own `pop r11; wrfsbase r11` with the suspending thread's TP and is
+// not covered. Not on any measured path (#3615); do not read this as covering it.
 void repair_suspend_fs_slot(FiberRecord* fiber) {
     if (!fiber) return;
     const uint64_t slot = fiber->suspend_fs_slot;
     fiber->suspend_fs_slot = 0;
-    if (!callback_repair_guest_fs_slot(slot, guest_tls_own_tp())) return;
+    // A resuming thread that never activated guest TLS reports 0, and the frame is then left alone:
+    // writing 0 would make the stub epilogue `wrfsbase 0` and strand the guest with no TLS at all.
+    // That thread still runs on the foreign TCB -- declining is the lesser harm, not a repair. Not
+    // reachable from guest code today, since sceFiberRun arrives on threads that have activated.
+    const uint64_t own = guest_tls_own_tp();
+    if (!callback_repair_guest_fs_slot(slot, own)) return;
     if (fiber_log())
         std::fprintf(stderr, "[fiber] repaired stub guest-TP on tid=%llu -> 0x%llx\n",
-                     (unsigned long long)thread_key(), (unsigned long long)guest_tls_own_tp());
+                     (unsigned long long)thread_key(), (unsigned long long)own);
 }
 
 #ifdef _WIN32
@@ -470,12 +479,21 @@ uint64_t fiber_return_to_thread_impl(uint64_t return_arg, uint64_t* next_run_arg
     repair_suspend_fs_slot(current);
     // ...and `thread` above is that OTHER thread's record. Everything before the suspend deliberately
     // uses it (thread->root and thread->return_arg belong to the sceFiberRun that is about to be
-    // resumed), but the bookkeeping below describes "which fiber is this host thread running", so it
-    // must land on the RESUMING thread. Writing it to the suspending thread instead left the resuming
-    // thread's ThreadFibers::current stale, and sceFiberSwitch then compared its target against
-    // another thread's notion of the running fiber -- observed on Uncharted as three refusals
-    // ("target is the running fiber" / "target already running") and the guest's own
-    // "ASSERTION: retval == SCE_OK" in SwitchToFiber.
+    // unwound to), but the bookkeeping below describes "which fiber is this host thread running", so
+    // it must land on the RESUMING thread. Observed on Uncharted as two sceFiberSwitch refusals per
+    // run ("target is the running fiber" / "target already running") and the guest's own
+    // "ASSERTION: retval == SCE_OK" in SwitchToFiber; removing just these two lines reproduces it
+    // 3 runs out of 3.
+    //
+    // NO UNIT ARM COVERS THIS, and the reason is worth writing down. Both resume paths already set
+    // the RESUMING thread's ThreadFibers::current before they jump, so the write here is
+    // redundant-but-correct on that side; the whole benefit is not CLOBBERING the suspending
+    // thread's record. Observing that needs the suspending thread to be running a fiber of its own
+    // at the moment a second thread resumes this one -- T1 running fiber C, T2 resuming fiber A,
+    // then asserting T1's sceFiberSwitch is not refused -- which is constructible with two threads
+    // and a handshake inside the fiber bodies, but is a synchronised multi-thread fiber test and was
+    // judged more likely to become a flaky guard than to catch a regression. If this line is ever
+    // touched again, build that arm.
     thread = thread_fibers();
     current->guest->state = kStateRun;
     thread->current = current;
@@ -484,6 +502,12 @@ uint64_t fiber_return_to_thread_impl(uint64_t return_arg, uint64_t* next_run_arg
 }
 
 #ifdef _WIN32
+// Windows registers these handlers directly rather than through PROSPER_ASM_TRAMPOLINE, so there is
+// no entry-%rsp to forward -- and the MS/SysV integer bridge fills the 4th parameter unconditionally
+// (`mov r9,rcx ; MS 4th = a3`, sysv_ms_bridge.cpp:129), which at a three-argument sceFiber* call is
+// caller-saved guest SCRATCH. Passing it on as `entry_rsp` would hand a garbage value to a function
+// that dereferences it. These wrappers pass an explicit 0 instead; Windows stubs stash no guest %fs
+// on the guest stack, so there is nothing to locate or repair there anyway.
 uint64_t fiber_return_to_thread_win(uint64_t return_arg, uint64_t* next_run_arg) {
     return fiber_return_to_thread_impl(return_arg, next_run_arg, 0);
 }
@@ -537,6 +561,15 @@ uint64_t fiber_switch_impl(GuestFiber* target_guest, uint64_t run_arg, uint64_t*
     return 0;
 }
 
+#ifdef _WIN32
+uint64_t fiber_run_win(uint64_t guest, uint64_t run_arg, uint64_t* return_arg) {
+    return fiber_run_impl((GuestFiber*)(uintptr_t)guest, run_arg, return_arg, 0);
+}
+uint64_t fiber_switch_win(uint64_t target_guest, uint64_t run_arg, uint64_t* resumed_arg) {
+    return fiber_switch_impl((GuestFiber*)(uintptr_t)target_guest, run_arg, resumed_arg, 0);
+}
+#endif
+
 uint64_t fiber_get_self(GuestFiber** out) {
     if (!out) return kErrNull;
     ThreadFibers* thread = thread_fibers();
@@ -581,8 +614,8 @@ void register_fiber_hle() {
     Hle::register_fn("a0LLrZWac0M", (HleFn)fiber_run_entry, "sceFiberRun");
     Hle::register_fn("PFT2S-tJ7Uk", (HleFn)fiber_switch_entry, "sceFiberSwitch");
 #else
-    Hle::register_fn("a0LLrZWac0M", (HleFn)fiber_run_impl, "sceFiberRun");
-    Hle::register_fn("PFT2S-tJ7Uk", (HleFn)fiber_switch_impl, "sceFiberSwitch");
+    Hle::register_fn("a0LLrZWac0M", (HleFn)fiber_run_win, "sceFiberRun");
+    Hle::register_fn("PFT2S-tJ7Uk", (HleFn)fiber_switch_win, "sceFiberSwitch");
 #endif
 #ifndef _WIN32
     Hle::register_fn("B0ZX2hx9DMw", (HleFn)fiber_return_to_thread_entry, "sceFiberReturnToThread");

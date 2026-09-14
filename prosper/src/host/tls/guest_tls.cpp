@@ -16,6 +16,7 @@
 #include "loader/tls_layout.hpp"
 #include "host/platform/posix_shim.hpp"
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <unordered_map>

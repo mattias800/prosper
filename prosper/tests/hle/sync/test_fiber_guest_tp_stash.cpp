@@ -4,8 +4,15 @@
 // after which every guest initial-exec TLS read on it resolves to another thread's storage.
 //
 // These arms cover the two pure pieces of the repair: locating the stashed slot in a stub frame, and
-// re-pointing it at the resuming thread. Both are exercised against a hand-built frame rather than a
-// real stub, so a change to the stub's frame layout is meant to redden `kStubGuestFsSlotOffset` here.
+// re-pointing it at the resuming thread.
+//
+// WHAT THEY DO NOT PIN, stated because the obvious reading is the wrong one: the frame here is built
+// by hand from `kStubGuestFsSlotOffset`, the same constant the code under test uses, so this is a
+// same-source control -- it exercises the discriminator, never the domain. Editing the constant
+// reddens the acceptance CONTROL below (which asserts a literal `+ 0x28`), but adding a `push` to
+// `emit_swap_stub` reddens NOTHING in ctest. That agreement was closed by hand in review of #3637, by
+// running the real emitted bytes and capturing the live frame inside the handler; closing it
+// automatically needs an arm that executes those bytes rather than a transcription of them.
 #include "hle/dispatch/callback_fs.hpp"
 #include "hle/dispatch/dispatch.hpp"
 
