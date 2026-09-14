@@ -4,10 +4,14 @@
 starts its world load, and executes **exactly five iterations of its game loop** before parking.
 Nothing renders. Tracker: #3616.
 
-**The renderer is not the frontier on this title, and that is measured rather than argued:** the
-stall reproduces identically with `PROSPER_RENDER=0` (same five iterations, same wait, same
-timing). Whatever holds this title is CPU-side — HLE, sync, or the job system — so a GPU
-hypothesis needs new evidence before it is worth spending a run on. See `## Ruled out`.
+**The Vulkan backend is not the frontier on this title, and that is measured rather than argued:**
+the stall reproduces identically with `PROSPER_RENDER=0` (same five iterations, same wait, same
+timing). **State that arm precisely, because the obvious paraphrase overstates it:** `PROSPER_RENDER`
+turns off the *live renderer*; prosper still parses the guest's command buffers, still folds its
+submits, and still runs its flip and event-queue emulation. So what the arm rules out is the
+recompiler, the descriptor layer, the Vulkan submission path and the 14 skipped compute programs —
+**not** prosper's flip/EOP *semantics*, which the guest's frame pacing does depend on. See
+`## Ruled out`.
 
 The title is a Naughty Dog engine with a **fiber-based job system** (`NdJob Fiber`, `NdJobWorkerThre`),
 and that is the single most important thing to know before working on it: fibers start on the main
@@ -113,6 +117,21 @@ The frame-slot counter is *set* to 1 by the frame setup at `eboot+0x13939b0` and
 again (`PROSPER_HWWATCH_ABS_ALLTHREADS` sees writes `#1..#4` and then nothing), so the work
 registered against it was never completed by anything.
 
+### What clears it, and how far it gets
+
+The same frame setup (`eboot+0x1391d30`, called from `FrameSpawnerJob` at `0x5ab627`) stores a
+callback into the slot at `+0x80`: **`FrameCleanup`** (`eboot+0x1390ef0`, named by the string it is
+registered with at `0x1390e0b`). That function takes the frame index, sets the slot's counter to 0
+and wakes its waiters — it is the only writer that would release the render job.
+
+`PROSPER_HWBP` on it, with arguments: **it runs exactly three times, for frame indices 0, 1 and 2,
+and never again**, dispatched as an ordinary job (`ret=eboot+0x1378fdc`, the job dispatcher). Three
+cleanups, three `GpuFlip`s, three buffer indices — and then the fourth of each is missing.
+
+So the next question is narrower than the last one: **what kicks `FrameCleanup`, and why does the
+fourth kick never happen?** The count matching the flip count exactly is the strongest hint on the
+table, and it is the one place prosper's flip emulation is still in scope.
+
 ## Open blockers
 
 - **#3634** — `scePlayGoGetLocus` refuses chunk ids outside prosper's discovered set and the title
@@ -161,10 +180,11 @@ One line per hypothesis that was tested and died. Do not re-derive these.
   when the capture ends. The narrower claim that survives is the one #3615 actually rested on: the
   guest-TP migration observed there arrives through `sceFiberRun` with `started=1`, which the
   fiber-run log does record. Instrument trap 282.
-- **"The stall is the renderer / the GPU / the flip path."** Falsified: `PROSPER_RENDER=0`
-  reproduces it exactly — 5 game-loop iterations, the same counter trajectory, the same ~1.5 s. The
-  14 compute programs skipped as `mode=unresolved-operand` are therefore not the cause either,
-  however much they need fixing on their own account.
+- **"The stall is the Vulkan backend."** Falsified: `PROSPER_RENDER=0` reproduces it exactly — 5
+  game-loop iterations, the same counter trajectory, the same ~1.5 s. The 14 compute programs
+  skipped as `mode=unresolved-operand` are therefore not the cause either, however much they need
+  fixing on their own account. **This arm does NOT clear prosper's flip/EOP emulation**, which runs
+  in both arms — see the note under the headline.
 - **"It is the SDK-gated post-submit completion contract (#2219)."** This title requests **SDK 9**,
   so the gate is closed for it and the shape fits *ArcRunner* and *Crisis Core* exactly. It is still
   not the cause: `PROSPER_POST_SUBMIT_VISIBILITY=1` gives 5 iterations, against 5 for each of two
