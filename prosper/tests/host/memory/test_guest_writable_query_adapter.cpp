@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <initializer_list>
 #include <fcntl.h>
 #include <linux/fs.h>
@@ -52,6 +53,7 @@ int forced_errno = ENOTTY;
 unsigned query_calls = 0;
 unsigned query_successes = 0;
 unsigned generation_advances = 0;
+unsigned maps_opens = 0;
 void* revoke_address = nullptr;
 size_t revoke_bytes = 0;
 int revoke_result = -1;
@@ -60,6 +62,7 @@ void reset_probe(Mode next = Mode::Pass, int error = ENOTTY) {
     mode = next;
     forced_errno = error;
     query_calls = query_successes = generation_advances = 0;
+    maps_opens = 0;
     revoke_result = -1;
     changed_mapping(); // Every arm starts with an actually invalidated writable cache.
 }
@@ -71,7 +74,95 @@ void check_one_unavailable_probe() {
     check(query_calls == 0, "old-header refusal used no adapter ioctl");
 #endif
 }
+
+int scope_controls(const char* arm) {
+    const bool text = std::strcmp(arm, "text") == 0;
+    const bool local_text = std::strcmp(arm, "text-local") == 0;
+    check(text || local_text || std::strcmp(arm, "native") == 0, "known scope arm");
+    check((std::getenv("PROSPER_NO_GUEST_WRITABLE_QUERY") != nullptr) == (text || local_text),
+          "query selection matches independently supplied arm");
+    check((std::getenv("PROSPER_GUEST_WRITABLE_LOCAL_TEXT_CACHE") != nullptr) == local_text,
+          "cache scope matches independently supplied arm");
+    check(!std::getenv("PROSPER_NO_GUEST_WRITE_CACHE"), "scope controls require enabled cache");
+    if (failures) return 1;
+    const long page_size = sysconf(_SC_PAGESIZE);
+    check(page_size > 0, "scope host page size available");
+    if (page_size <= 0) return 1;
+    const size_t page = static_cast<size_t>(page_size);
+    for (bool adjacent : {false, true}) {
+        Mapping mapping(5 * page, PROT_NONE);
+        check(mapping.data != MAP_FAILED, "owned guarded scope reservation");
+        if (mapping.data == MAP_FAILED) continue;
+        auto* a = static_cast<unsigned char*>(mapping.data) + page;
+        auto* b = a + (adjacent ? page : 2 * page);
+        const bool a_ok = mprotect(a, page, PROT_READ | PROT_WRITE) == 0;
+        // Shared, write-only backing gives a distinct writable VMA even when adjacent.
+        const bool b_ok = mmap(b, page, PROT_WRITE,
+            MAP_SHARED | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == b;
+        changed_mapping();
+        check(a_ok && b_ok, "owned A is RW and distinct B is write-only");
+        if (!a_ok || !b_ok) continue;
+        const uint64_t aa = reinterpret_cast<uintptr_t>(a);
+        const uint64_t bb = reinterpret_cast<uintptr_t>(b);
+        reset_probe();
+        const auto support = prosper::host::query_guest_writable_range(aa, aa + 8);
+        const bool native = support.status == prosper::host::GuestWritableQueryStatus::Writable;
+        check(native || support.status == prosper::host::GuestWritableQueryStatus::Unavailable,
+              "owned writable capability control is positive or explicitly unavailable");
+        const bool binary = !text && !local_text && native;
+        if (!text && !local_text && !native)
+            std::fprintf(stderr, "[coverage] native scope unavailable; checking broad fallback only\n");
+        reset_probe();
+        check(prosper::gpu::guest_writable(aa, 8), "small query warms A");
+        const unsigned opens_a = maps_opens;
+        check(opens_a > 0, "cold query actually opens maps");
+        check(prosper::gpu::guest_writable(aa + 32, 8), "another byte range in A is writable");
+        check(maps_opens == opens_a, "same-VMA range is an actual cache hit");
+        check(prosper::gpu::guest_writable(bb, 8), "B has same permission truth in every arm");
+        check(maps_opens == opens_a + ((binary || local_text) ? 1u : 0u),
+              adjacent ? "adjacent distinct VMA: local queries re-probe, broad cache already warmed"
+                       : "separate VMA: local queries re-probe, broad cache already warmed");
+        if (binary)
+            check(query_calls == 2 && query_successes == 2,
+                  "native scope actually performed two successful binary queries");
+        else if (text || local_text)
+            check(query_calls == 0, "text scope never attempted a binary query");
+        else
+            check(query_successes == 0, "unavailable native scope used fallback, not binary success");
+        reset_probe();
+        check(prosper::gpu::guest_writable(aa + page - 8,
+                  static_cast<uint32_t>(bb - aa - page + 16)) == adjacent,
+              "whole-range proof crosses adjacent writable VMAs but refuses a hole");
+        check(prosper::gpu::guest_writable(bb, 8), "rewarm B before testing revocation");
+        const unsigned before_revoke = maps_opens;
+        check(prosper::gpu::guest_writable(bb + 16, 8), "B subrange remains writable before revocation");
+        check(maps_opens == before_revoke, "B really is cached before revocation");
+        check(mprotect(b, page, PROT_READ) == 0, "revoke B after warming");
+        changed_mapping();
+        check(!prosper::gpu::guest_writable(bb, 8), "notified revocation refuses previously warm B");
+        check(mmap(b, page, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == b,
+              "replace owned B with a new writable mapping");
+        changed_mapping();
+        check(prosper::gpu::guest_writable(bb, 8), "notified remap observes new B permissions");
+    }
+    std::fprintf(stderr, "== scope %s: %d assertions, %d failures ==\n", arm, checks, failures);
+    return failures ? 1 : 0;
+}
 } // namespace
+
+extern "C" int __real_open(const char*, int, ...);
+extern "C" int __wrap_open(const char* path, int flags, ...) {
+    if (std::strcmp(path, "/proc/self/maps") == 0) ++maps_opens;
+    if ((flags & O_CREAT) || (flags & O_TMPFILE) == O_TMPFILE) {
+        va_list args;
+        va_start(args, flags);
+        const mode_t permissions = va_arg(args, mode_t);
+        va_end(args);
+        return __real_open(path, flags, permissions);
+    }
+    return __real_open(path, flags);
+}
 
 extern "C" int __real_ioctl(int, unsigned long, ...);
 extern "C" int __wrap_ioctl(int fd, unsigned long request, ...) {
@@ -113,7 +204,8 @@ extern "C" int __wrap_ioctl(int fd, unsigned long request, ...) {
     return __real_ioctl(fd, request, argument);
 }
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc == 3 && std::strcmp(argv[1], "scope") == 0) return scope_controls(argv[2]);
     std::fprintf(stderr, "== test_guest_writable_query_adapter ==\n");
     // CTest supplies a clean environment before process/TLS initialization. Refuse a conflicting
     // direct invocation rather than silently changing the production bisection setting in main.

@@ -2242,9 +2242,22 @@ endif()
     add_executable(test_guest_writable_query_adapter
       tests/host/memory/test_guest_writable_query_adapter.cpp)
     target_link_libraries(test_guest_writable_query_adapter PRIVATE prosper_core)
-    target_link_options(test_guest_writable_query_adapter PRIVATE "-Wl,--wrap=ioctl")
+    target_link_options(test_guest_writable_query_adapter PRIVATE "-Wl,--wrap=ioctl" "-Wl,--wrap=open")
     add_test(NAME guest_writable_query_adapter COMMAND ${CMAKE_COMMAND} -E env
-      --unset=PROSPER_NO_GUEST_WRITE_CACHE $<TARGET_FILE:test_guest_writable_query_adapter>)
+      --unset=PROSPER_NO_GUEST_WRITE_CACHE --unset=PROSPER_NO_GUEST_WRITABLE_QUERY
+      --unset=PROSPER_GUEST_WRITABLE_LOCAL_TEXT_CACHE $<TARGET_FILE:test_guest_writable_query_adapter>)
+    foreach(scope_arm native text text-local)
+      set(scope_env --unset=PROSPER_NO_GUEST_WRITE_CACHE
+        --unset=PROSPER_NO_GUEST_WRITABLE_QUERY --unset=PROSPER_GUEST_WRITABLE_LOCAL_TEXT_CACHE)
+      if(NOT scope_arm STREQUAL "native")
+        list(APPEND scope_env PROSPER_NO_GUEST_WRITABLE_QUERY=1)
+      endif()
+      if(scope_arm STREQUAL "text-local")
+        list(APPEND scope_env PROSPER_GUEST_WRITABLE_LOCAL_TEXT_CACHE=1)
+      endif()
+      add_test(NAME guest_writable_query_scope_${scope_arm} COMMAND ${CMAKE_COMMAND} -E env
+        ${scope_env} $<TARGET_FILE:test_guest_writable_query_adapter> scope ${scope_arm})
+    endforeach()
 
     add_executable(test_watch_mapping_generation tests/host/memory/test_watch_mapping_generation.cpp)
     target_link_libraries(test_watch_mapping_generation PRIVATE prosper_core)

@@ -44,6 +44,18 @@ and reviewers know what the invariants are.
   guest hands back by range compare, and only misses fall through to the probe. Structure such a cache
   as a pure accelerator — a hit skips the probe, a miss falls back — so the safety argument rests on
   the predicate and never on the cache.
+
+  Linux comparison controls (read once per querying thread):
+  `PROSPER_NO_GUEST_WRITABLE_QUERY=1` restores text enumeration and broad cache warming,
+  without first paying a failed binary query. Adding
+  `PROSPER_GUEST_WRITABLE_LOCAL_TEXT_CACHE=1` keeps full text enumeration but publishes only
+  the first through last individual VMAs needed by the request, matching binary-query cache
+  coverage. The second control affects text fallback only; native queries already have local
+  coverage. Adjacent writable VMAs remain separate until the whole requested span is proven.
+  These arms distinguish query cost from cache population; all retain positive-only caching,
+  generation invalidation and ordinary permission refusals. The native query fixture compares
+  actual probe counts across separate and adjacent mappings, including revocation and remap.
+  No control supplies guest-content authority or an end-to-end speedup guarantee.
 - **`rd<T>(file, off)`** (`src/self/module.cpp`) — bounded structured read: gates the `memcpy` on
   `self_read_ok` and zero-fills a `T{}` on an out-of-range offset. Every SELF/ELF header/table read goes
   through it; a raw `reinterpret_cast`/`memcpy` into `file.data() + off` is a red flag.
