@@ -244,10 +244,48 @@ sceVdecswAllocateComputeQueue     sceVdecswSetDecodeInput           sceVdecswSet
 sceVdecswTrySyncDecodeInput       sceVdecswTrySyncDecodeOutput
 ```
 
-so `TryFetchDecodedFrame` asserts `pNextDecodedFrame->m_frameBuffer.pFrameBuffer != NULL` forever.
-That is the frontier now, and it is the direct path to pixels: the guest runs the decode itself on
-the GPU (hence the 577k compute dispatches), so prosper has to manage the decoder object, the
-compute queue and the input/output buffers rather than decode anything.
+so `TryFetchDecodedFrame` asserted `pNextDecodedFrame->m_frameBuffer.pFrameBuffer != NULL` forever.
+
+### `libSceVdecsw` is implemented, and the movie DECODES
+
+All eight entry points now answer. `libSceVdecsw` is `libSceVideodec2`'s software-decode sibling and
+shares its structs — measured, not assumed: the title declares `0x18`, `0x10` and `0x30` for the
+compute-memory, compute-queue and decode-input structs, which are `sizeof(VdecComputeMemory)`,
+`sizeof(VdecComputeConfig)` and `sizeof(VdecInput)` exactly, and its `0x38` sync-output struct is
+`sizeof(VdecOutput)`. Its decoder config is `0x50` against Videodec2's `0x48`, which
+`vdecsw_adapt_config` translates.
+
+Two corrections came out of the ASYNCHRONOUS shape, and both were caught by measurement rather than
+reasoning:
+
+- **The staged input is a queue, not a slot.** With a slot, the first access unit prosper ever saw
+  carried `nal_unit_type` 1 exclusively, for the whole movie — which reads as "this stream has no
+  parameter sets" and was a statement about prosper's own dropped writes. Queued, the head reads
+  `7 8 6 5 5 …` (SPS, PPS, SEI, IDR slices).
+- **The access unit must be COPIED at staging time.** The guest refills its bitstream buffer as soon
+  as `SetDecodeInput` returns, so a pointer held until the poll is stale: the unit logged as
+  SPS/PPS/SEI/IDR arrived at the backend microseconds later as slices only, and libavcodec reported
+  that — correctly — as `non-existing PPS 0 referenced`. Two views of one pointer disagreeing is what
+  named it.
+
+Separately, the VA-API backend pointed libavcodec straight at guest memory; `avcodec.h` requires
+`AV_INPUT_BUFFER_PADDING_SIZE` zero bytes past a packet, and the bytes after a guest access unit are
+the next access unit.
+
+Result: **61 decoded pictures out of 64 access units, 2560x1440 NV12, into the guest's own 12 MiB
+frame buffer.** The title then runs on past the movie into its game-process update
+(`UpdateProcesses : SaveTreasures`) and starts its **Iggy** UI runtime.
+
+### The frontier: this title draws nothing, ever
+
+Over a 300 s run it reaches **285,824 submits, 609,767 compute dispatches and 16,891 flips** — and
+`draws_cum` is **0**, with every capture uniform black. It has no graphics draws at all; everything
+it renders, it renders with compute. And the recompiler currently rejects **21** of its compute
+programs — twenty as `mode=unresolved-operand`, one as `skip invalid descriptor contract`.
+
+That is the whole remaining gap, and by the charter's rule it is a fatal one rather than an
+acceptable skip. The root cause is already recorded: these programs declare no sharps at all
+(`counts: ro=0 rw=0 samp=0 cbuf=0`) and address every resource through the SRT.
 
 The lever is **default OFF** on purpose. It changes a contract every title shares, prosper's current
 model is pinned by `tests/hle/test_equeue_events.cpp`, and the evidence for changing it is one
