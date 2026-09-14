@@ -4728,6 +4728,13 @@ struct SpirvCompute {
 // lookup is on the register's CURRENT SSA value, so an overwrite clears it without bookkeeping.
 inline bool scalar_is_lane_local(const struct RegState& rs, int sgpr);
 
+// Seed RegState::smem_pointer_loads from the decoded stream (see proven_smem_pointer_loads in
+// rdna2_emit_cfg.cpp). Every emission entry must call this: the proof used to be seeded only inside
+// the CFG dispatcher, so a shader emitted straight-line carried an empty set and its SRT pointer
+// loads reached the constant-buffer path and rejected the shader (#3616).
+struct RegState;
+void seed_smem_pointer_provenance(RegState& rs, const std::vector<Rdna2Inst>& ins);
+
 struct RegState {
     std::unordered_map<int, uint32_t> vreg, sreg;
     // The latest VCC SSA value proved identical in every guest lane. A fragment VCCZ branch over

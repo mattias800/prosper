@@ -1327,6 +1327,12 @@ bool entry_block_defines_vcc_before_any_read(const std::vector<Rdna2Inst>& ins,
 
 }  // namespace
 
+void seed_smem_pointer_provenance(RegState& rs, const std::vector<Rdna2Inst>& ins) {
+    if (rs.smem_pointer_analysis_done) return;
+    rs.smem_pointer_loads = proven_smem_pointer_loads(ins);
+    rs.smem_pointer_analysis_done = true;
+}
+
 bool emit_cfg_state_machine(
     SpirvCompute& b, RegState& initial, const std::vector<Rdna2Inst>& ins,
     const std::unordered_set<uint32_t>& safe, const ShaderResourceTable* rt,
@@ -6302,10 +6308,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         rs.smem_x16_descriptor_loads = proven_smem_x16_descriptor_loads(ins, rt);
         rs.smem_x16_descriptor_analysis_done = true;
     }
-    if (!rs.smem_pointer_analysis_done) {
-        rs.smem_pointer_loads = proven_smem_pointer_loads(ins);
-        rs.smem_pointer_analysis_done = true;
-    }
+    seed_smem_pointer_provenance(rs, ins);
     if (!rs.smem_x2_descriptor_fragment_analysis_done) {
         rs.smem_x2_descriptor_fragment_loads =
             proven_smem_x2_descriptor_fragment_loads(ins, rt, b.wave_size);
