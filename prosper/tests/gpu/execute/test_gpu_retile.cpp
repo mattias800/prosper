@@ -2,11 +2,15 @@
 // tiled byte (including padding and untouched texels) to the established CPU walk.
 #include "shared/live/gpu_retile.hpp"
 #include "shared/live/live_compute.hpp"
+#include "shared/perf/performance_capture.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/resources/shader_resources.hpp"
 #include <algorithm>
 #include <bit>
 #include <cstdio>
+#include <filesystem>
+#include <fstream>
+#include <string>
 #include <cstring>
 #include <vector>
 
@@ -73,7 +77,41 @@ int run_case(int argc, char** argv) {
     const bool allocation = argc == 2 && std::strstr(argv[1], "alloc-");
     const bool fault_mode = mapping || allocation;
     const bool loss = fault_mode && std::strstr(argv[1], "loss");
+    // A real buffer-only GPU dispatch before and after images grows the F8 pool from six
+    // queries, then uses a smaller prefix of that retained pool. Both outputs are checked.
+    auto buffer_dispatch = [] {
+        std::array<float, 64> input{}, output{};
+        input.fill(3.0f);
+        ComputeItem item;
+        item.spirv = build_compute_scale_bias(2.0f, 1.0f);
+        auto resources = std::make_shared<ShaderResourceTable>();
+        for (uint32_t binding = 0; binding < 2; ++binding) {
+            ShaderResource r{};
+            r.cls = ResourceClass::ConstantBuffer; // reflection carries writable access
+            r.binding = binding; r.format = DataFormat::Float32; r.num_components = 1;
+            r.gpu_addr = reinterpret_cast<uintptr_t>(binding ? output.data() : input.data());
+            r.size = sizeof(input);
+            resources->resources.push_back(r);
+        }
+        item.resources = resources;
+        item.launch.threads_x = item.launch.local_x = 64;
+        item.launch.local_y = item.launch.local_z = 1;
+        item.launch.groups_x = item.launch.groups_y = item.launch.groups_z = 1;
+        check(execute_live_compute_items({item}) &&
+                  std::all_of(output.begin(), output.end(), [](float value) { return value == 7.0f; }),
+              "buffer-only GPU work executes across timestamp pool growth");
+    };
     gpu_retile_poison_output_for_test().store(!cpu && !clean);
+    auto& capture = prosper::perf::interactive_performance_capture();
+    const uint64_t capture_start = prosper::perf::monotonic_now_ns();
+    const std::filesystem::path capture_directory = "gpu_retile_capture";
+    if (clean) {
+        std::filesystem::create_directories(capture_directory);
+        check(capture.arm(capture_directory.string(), "fixture", "retile timestamps", "test",
+                          capture_start, std::chrono::system_clock::now()).ok,
+              "real retile integration arms bounded GPU timing");
+        buffer_dispatch();
+    }
     VkPhysicalDeviceLimits limits{};
     limits.maxStorageBufferRange = UINT32_MAX;
     limits.maxComputeWorkGroupSize[0] = limits.maxComputeWorkGroupInvocations = 128;
@@ -418,6 +456,49 @@ int run_case(int argc, char** argv) {
               !gpu ? "CPU fallback used" : "GPU tiler actually recorded; CPU equivalence alone is insufficient");
         if (fault_mode) return failures ? 1 : 0;
         code += 16;
+    }
+    if (clean) {
+        buffer_dispatch();
+        prosper::perf::ProcessSample sample;
+        sample.monotonic_ns = std::max(prosper::perf::monotonic_now_ns(), capture_start + uint64_t{6'000'000'000});
+        capture.observe_sample(sample);
+        prosper::perf::CaptureOutcome outcome;
+        check(capture.take_outcome(outcome) && outcome.ok && outcome.compute_records > 0 &&
+                  !outcome.compute_dropped, "actual completed compute records reach F8");
+        std::ifstream file(outcome.path);
+        std::string line;
+        double transfer = 0, retile = 0, storage = 0;
+        uint64_t samples = 0;
+        std::vector<std::array<double, 3>> observed;
+        auto value = [](const std::string& line, const char* key) {
+            const auto at = line.find(std::string("\"") + key + "\":");
+            return at == std::string::npos ? -1.0 : std::stod(line.substr(at + std::strlen(key) + 3));
+        };
+        while (std::getline(file, line)) {
+            if (line.find("\"type\":\"compute\"") == std::string::npos) continue;
+            const double count = value(line, "gpu_timestamp_samples");
+            const double image_ms = value(line, "gpu_image_transfer_ms");
+            const double retile_ms = value(line, "gpu_retile_ms");
+            observed.push_back({count, image_ms, retile_ms});
+            if (count <= 0) continue;
+            samples += uint64_t(count);
+            const double storage_ms = value(line, "gpu_storage_copy_ms");
+            check(image_ms >= 0 && retile_ms >= 0 && image_ms + retile_ms <= storage_ms + 0.00001,
+                  "production transfer and retile timestamps remain within the storage bracket");
+            transfer += image_ms; retile += retile_ms; storage += storage_ms;
+        }
+        const int support = live_compute_timestamp_support_for_test();
+        check(support >= 0, "actual timestamp capability was observed, not assumed unsupported");
+        if (support > 0) {
+            check(samples > 2 && transfer > 0 && retile > 0 && storage > 0,
+                  "supported queue measures real copies/retiles across query-pool growth");
+            const std::array<double, 3> buffer_timing{1, 0, 0};
+            check(observed.size() > 2 && observed.front() == buffer_timing && observed.back() == buffer_timing,
+                  "buffer-only records measure six queries before and after the larger image pool");
+        } else if (support == 0) {
+            check(samples == 0, "unsupported queue retains functional retile without timestamps");
+        }
+        std::filesystem::remove(outcome.path);
     }
     return failures ? 1 : 0;
 }

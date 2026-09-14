@@ -203,6 +203,10 @@ struct ComputeTimingRecord {
     double gpu_shader_ms = 0;
     double gpu_pre_ms = 0;
     double gpu_storage_copy_ms = 0;
+    // Children of storage-copy. Transfer brackets the image-to-buffer copy and host availability;
+    // retile brackets layout conversion and its dependencies. Mirror/layout overhead stays outside.
+    double gpu_image_transfer_ms = 0;
+    double gpu_retile_ms = 0;
     double gpu_compare_ms = 0;
     double gpu_restore_ms = 0;
     double setup_ms = 0;

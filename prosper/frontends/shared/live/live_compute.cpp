@@ -476,6 +476,8 @@ thread_local double g_perf_compute_gpu_device_ms = 0.0;
 thread_local double g_perf_compute_gpu_shader_ms = 0.0;
 thread_local double g_perf_compute_gpu_pre_ms = 0.0;
 thread_local double g_perf_compute_gpu_storage_copy_ms = 0.0;
+thread_local double g_perf_compute_gpu_image_transfer_ms = 0.0;
+thread_local double g_perf_compute_gpu_retile_ms = 0.0;
 thread_local double g_perf_compute_gpu_compare_ms = 0.0;
 thread_local double g_perf_compute_gpu_restore_ms = 0.0;
 thread_local double g_perf_compute_setup_ms = 0.0;
@@ -1461,8 +1463,10 @@ struct VulkanComputeContext {
     VkCommandBuffer command_buffer = VK_NULL_HANDLE;
     VkFence dispatch_fence = VK_NULL_HANDLE;
     VkQueryPool dispatch_timestamp_pool = VK_NULL_HANDLE;
+    uint32_t dispatch_timestamp_capacity = 0;
     float timestamp_period_ns = 0.0f;
     uint32_t timestamp_valid_bits = 0;
+    bool timestamp_properties_observed = false;
     uint32_t descriptor_buffer_capacity = 0;
     uint32_t descriptor_sampled_capacity = 0;
     uint32_t descriptor_storage_capacity = 0;
@@ -1711,8 +1715,9 @@ struct VulkanComputeContext {
         return command_buffer != VK_NULL_HANDLE;
     }
 
-    bool prepare_dispatch_timestamps() {
-        if (dispatch_timestamp_pool) return timestamp_valid_bits != 0;
+    bool prepare_dispatch_timestamps(uint32_t count) {
+        if (dispatch_timestamp_pool && dispatch_timestamp_capacity >= count)
+            return timestamp_valid_bits != 0;
         uint32_t family_count = 0;
         vkGetPhysicalDeviceQueueFamilyProperties(physical, &family_count, nullptr);
         if (queue_family >= family_count) return false;
@@ -1722,15 +1727,18 @@ struct VulkanComputeContext {
         VkPhysicalDeviceProperties properties{};
         vkGetPhysicalDeviceProperties(physical, &properties);
         timestamp_period_ns = properties.limits.timestampPeriod;
+        timestamp_properties_observed = true;
         if (!timestamp_valid_bits || timestamp_period_ns <= 0.0f) return false;
         VkQueryPoolCreateInfo info{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
         info.queryType = VK_QUERY_TYPE_TIMESTAMP;
-        info.queryCount = 6;
-        if (vkCreateQueryPool(device, &info, nullptr, &dispatch_timestamp_pool) != VK_SUCCESS) {
-            dispatch_timestamp_pool = VK_NULL_HANDLE;
-            timestamp_valid_bits = 0;
+        info.queryCount = count;
+        VkQueryPool replacement = VK_NULL_HANDLE;
+        if (vkCreateQueryPool(device, &info, nullptr, &replacement) != VK_SUCCESS)
             return false;
-        }
+        // The synchronous context has completed the previous dispatch before growing this pool.
+        if (dispatch_timestamp_pool) vkDestroyQueryPool(device, dispatch_timestamp_pool, nullptr);
+        dispatch_timestamp_pool = replacement;
+        dispatch_timestamp_capacity = count;
         return true;
     }
 
@@ -6282,7 +6290,6 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     const bool trace = trace_compute_item(item);
     const bool perf_capture_timing =
         prosper::perf::interactive_performance_capture().detailed_timing_active();
-    const bool perf_gpu_timing = perf_capture_timing && ctx.prepare_dispatch_timestamps();
     // Per-resource table dump for a traced program. The writeback line names a BINDING and the
     // disassembly names a fetch PC; without the mapping between them, attributing a buffer's contents
     // to the instruction that wrote it is guesswork. Printing the table closes that gap, and it is
@@ -10344,12 +10351,28 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             if (trace) std::fprintf(stderr, "[compute]   Vulkan failure stage=command-reuse\n");
             break;
         }
+        // Additional F8-only pairs retain the existing command order. These are children of
+        // storage-copy, not additional device time. BOTTOM_OF_PIPE gives completion-point
+        // intervals, not isolated execution costs: overlap and dependencies can affect attribution.
+        // Never request results for unwritten queries.
+        const bool perf_gpu_timing = perf_capture_timing && images.size() <= (UINT32_MAX - 6) / 4 &&
+            ctx.prepare_dispatch_timestamps(6 + uint32_t(images.size()) * 4);
+        uint32_t timestamp_count = 6;
+        std::vector<std::pair<uint32_t, bool>> storage_timestamp_spans;
         const VkCommandBuffer command = ctx.command_buffer;
+        auto storage_timestamp = [&] {
+            if (!perf_gpu_timing) return uint32_t{0};
+            const uint32_t index = timestamp_count++;
+            vkCmdWriteTimestamp(command, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                                ctx.dispatch_timestamp_pool, index);
+            return index;
+        };
         VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         if (!vk_ok(vkBeginCommandBuffer(command, &begin), "command-begin")) break;
         if (perf_gpu_timing) {
-            vkCmdResetQueryPool(command, ctx.dispatch_timestamp_pool, 0, 6);
+            vkCmdResetQueryPool(command, ctx.dispatch_timestamp_pool, 0,
+                                6 + uint32_t(images.size()) * 4);
             vkCmdWriteTimestamp(command, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                                 ctx.dispatch_timestamp_pool, 0);
         }
@@ -10809,17 +10832,24 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, bi.array_layers};
             region.imageExtent = {r->width, r->height,
                                   bi.array_layers > 1 ? 1u : bi.texel_depth};
+            const uint32_t transfer_start = storage_timestamp();
             vkCmdCopyImageToBuffer(command, bi.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                    staging[i], 1, &region);
             // #3249: the storage-image writeback maps this staging buffer and reads every texel.
             // TRANSFER, not COMPUTE_SHADER: the shader wrote the IMAGE, the copy above wrote this
             // buffer, and the source scope has to name the write that actually produced the bytes.
             prosper::gpu::record_host_read_barrier(command, staging[i]);
-            if (bi.retile_buffer)
+            storage_timestamp();
+            if (perf_gpu_timing) storage_timestamp_spans.emplace_back(transfer_start, false);
+            if (bi.retile_buffer) {
+                const uint32_t retile_start = storage_timestamp();
                 (bi.retile_parameters.kind == RetileShaderKind::PackedSubwordArray ? ctx.packed_retile_pipeline :
                  bi.retile_parameters.kind == RetileShaderKind::Volume3D ? ctx.volume_retile_pipeline : ctx.retile_pipeline)
                     .record(command, staging[i], bi.retile_buffer,
                             bi.retile_set, bi.retile_parameters);
+                storage_timestamp();
+                if (perf_gpu_timing) storage_timestamp_spans.emplace_back(retile_start, true);
+            }
             if (bi.mirror_result_to_imported) {
                 const BoundImage& mirror = images[bi.seed_from_imported];
                 VkImageMemoryBarrier mirror_to_dst{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
@@ -11177,12 +11207,17 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         }
         completion_proven = true;
         if (perf_gpu_timing) {
-            uint64_t timestamps[6]{};
-            if (vkGetQueryPoolResults(ctx.device, ctx.dispatch_timestamp_pool, 0, 6,
-                                      sizeof(timestamps), timestamps, sizeof(uint64_t),
+            std::vector<uint64_t> timestamps(timestamp_count);
+            if (vkGetQueryPoolResults(ctx.device, ctx.dispatch_timestamp_pool, 0, timestamp_count,
+                                      timestamps.size() * sizeof(uint64_t), timestamps.data(), sizeof(uint64_t),
                                       VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
                 const uint64_t mask = ctx.timestamp_valid_bits >= 64
                     ? UINT64_MAX : ((uint64_t{1} << ctx.timestamp_valid_bits) - 1u);
+                for (const auto [start, retile] : storage_timestamp_spans) {
+                    const double ms = static_cast<double>((timestamps[start + 1] - timestamps[start]) & mask) *
+                        ctx.timestamp_period_ns / 1'000'000.0;
+                    (retile ? g_perf_compute_gpu_retile_ms : g_perf_compute_gpu_image_transfer_ms) += ms;
+                }
                 const uint64_t device_ticks = (timestamps[5] - timestamps[0]) & mask;
                 const uint64_t shader_ticks = (timestamps[2] - timestamps[1]) & mask;
                 ++g_perf_compute_gpu_timestamp_samples;
@@ -12847,6 +12882,12 @@ void live_compute_force_next_queue_submit_device_lost_for_test() {
     g_force_next_queue_submit_device_lost_for_test.store(true, std::memory_order_release);
 }
 
+int live_compute_timestamp_support_for_test() {
+    auto* context = g_live_compute_context.load(std::memory_order_acquire);
+    if (!context || !context->timestamp_properties_observed) return -1;
+    return context->timestamp_valid_bits != 0 && context->timestamp_period_ns > 0 ? 1 : 0;
+}
+
 uint64_t live_compute_queue_submit_attempts() {
     return g_live_compute_queue_submit_attempts.load(std::memory_order_relaxed);
 }
@@ -13095,6 +13136,8 @@ bool execute_live_compute_items(const std::vector<prosper::gpu::ComputeItem>& it
     g_perf_compute_gpu_shader_ms = 0.0;
     g_perf_compute_gpu_pre_ms = 0.0;
     g_perf_compute_gpu_storage_copy_ms = 0.0;
+    g_perf_compute_gpu_image_transfer_ms = 0.0;
+    g_perf_compute_gpu_retile_ms = 0.0;
     g_perf_compute_gpu_compare_ms = 0.0;
     g_perf_compute_gpu_restore_ms = 0.0;
     g_perf_compute_setup_ms = 0.0;
@@ -13165,6 +13208,8 @@ bool execute_live_compute_items(const std::vector<prosper::gpu::ComputeItem>& it
             record.gpu_shader_ms = g_perf_compute_gpu_shader_ms;
             record.gpu_pre_ms = g_perf_compute_gpu_pre_ms;
             record.gpu_storage_copy_ms = g_perf_compute_gpu_storage_copy_ms;
+            record.gpu_image_transfer_ms = g_perf_compute_gpu_image_transfer_ms;
+            record.gpu_retile_ms = g_perf_compute_gpu_retile_ms;
             record.gpu_compare_ms = g_perf_compute_gpu_compare_ms;
             record.gpu_restore_ms = g_perf_compute_gpu_restore_ms;
             record.setup_ms = g_perf_compute_setup_ms;

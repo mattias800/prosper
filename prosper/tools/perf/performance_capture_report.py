@@ -315,6 +315,19 @@ COMPUTE_GPU_BRACKETS = (
     "gpu_restore_ms",
 )
 
+COMPUTE_STORAGE_CHILDREN = ("gpu_image_transfer_ms", "gpu_retile_ms")
+
+
+def _compute_storage_children(records):
+    # Old captures and failed/unsupported timestamp queries carry no split measurement.
+    measured = [r for r in records if r.get("gpu_timestamp_samples", 0) > 0]
+    if not measured or any(field not in r for r in measured for field in COMPUTE_STORAGE_CHILDREN):
+        return None
+    children = _phase_totals(measured, COMPUTE_STORAGE_CHILDREN)
+    children["other_storage_ms"] = sum(float(r.get("gpu_storage_copy_ms", 0)) for r in measured) - sum(children.values())
+    return children
+
+
 # Short labels for the one-line breakdowns; the long names stay in the JSON.
 PHASE_LABELS = {
     "setup_ms": "setup",
@@ -325,6 +338,9 @@ PHASE_LABELS = {
     "gpu_pre_ms": "pre",
     "gpu_shader_ms": "shader",
     "gpu_storage_copy_ms": "storage-copy",
+    "gpu_image_transfer_ms": "image-transfer",
+    "gpu_retile_ms": "retile",
+    "other_storage_ms": "other-storage",
     "gpu_compare_ms": "compare",
     "gpu_restore_ms": "restore",
 }
@@ -635,6 +651,7 @@ def summarize(records):
         "compute_total_ms": compute_total,
         "compute_cpu_phases": _phase_totals(compute, COMPUTE_CPU_PHASES),
         "compute_gpu_brackets": _phase_totals(compute, COMPUTE_GPU_BRACKETS),
+        "compute_storage_children": _compute_storage_children(compute),
         "compute_gpu_device_ms": _total(compute, "gpu_device_ms"),
         "compute_programs": compute_programs,
         "gpu_timestamp_samples": gpu_timestamp_samples,
@@ -706,6 +723,11 @@ def _print_compute_phases(summary):
         extra = ([f"unattributed={unattributed:.1f}ms ({100.0 * unattributed / device:.1f}%)"]
                  if abs(unattributed) >= 0.05 else None)
         _print_phase_line(f"GPU brackets of {device:.1f}ms device", gpu, device, extra)
+        storage_children = summary.get("compute_storage_children")
+        if storage_children is not None:
+            print("    storage children are completion intervals; overlap/dependencies affect attribution")
+            _print_phase_line("children of storage-copy (already included)", storage_children,
+                              gpu.get("gpu_storage_copy_ms", 0.0))
         shader = gpu.get("gpu_shader_ms", 0.0)
         print(f"    the guest's own compute shader is {100.0 * shader / device:.1f}% of the "
               f"device time prosper spends running it")
