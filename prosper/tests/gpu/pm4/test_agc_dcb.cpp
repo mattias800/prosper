@@ -303,8 +303,8 @@ int main() {
         // ReleaseMem is the sharper one and is why the spans are per-handler rather than one
         // constant: it writes cmd[7]/cmd[8] on its long arm, and a packet at the very end of a
         // mapping passes a header-sized probe and faults on that store, so it re-probes before the
-        // tail. (SetPacketPredication was the other until #3676 moved the predication flag from
-        // the predication flag into header bit 0; it now reads and writes cmd[0] alone.)
+        // tail. (SetPacketPredication was the other until #3676 moved the predication flag into
+        // header bit 0; it now reads and writes cmd[0] alone.)
         {
             const struct { const char* nid; const char* name; } late[] = {
                 { "w6Dj1VJt5qY", "SetPacketPredication"    },
@@ -458,9 +458,10 @@ int main() {
             CHECK((packet[6] & gpu::kDmaDataAddressSource) != 0,
                   "address-source DmaData preserves the asserted source form in packet metadata");
 
-            // The other ABI arm must remain independent of a7. Existing immediate/offset calls use
-            // sourceKind=0; give this one a deliberately tempting address in a7 and prove that the
-            // packet still contains a1. This keeps the historical fill path intact.
+            // The other ABI arm. It is NOT independent of a7 -- the third shape below shows a7
+            // selecting the source when no immediate is given -- so what this pins is the other
+            // half of the discriminator: an immediate that is PRESENT wins, however tempting the
+            // address in a7 looks. This keeps the historical fill path intact.
             constexpr uint64_t immediate = 0x12345678ull;
             d.cursor_up = buf;
             packet = (uint32_t*)(uintptr_t)
