@@ -2075,6 +2075,12 @@ if(TARGET prosper_core)
   target_include_directories(test_dynfetch_fold PRIVATE tests)
   target_link_libraries(test_dynfetch_fold PRIVATE prosper_core)
   add_test(NAME dynfetch_fold COMMAND test_dynfetch_fold)
+  add_executable(test_fold_control_plan tests/gpu/execute/test_fold_control_plan.cpp)
+  target_link_libraries(test_fold_control_plan PRIVATE prosper_core)
+  add_test(NAME fold_control_plan COMMAND test_fold_control_plan)
+  add_test(NAME fold_control_plan_uncached COMMAND test_fold_control_plan)
+  set_tests_properties(fold_control_plan_uncached PROPERTIES
+    ENVIRONMENT "PROSPER_NO_FOLD_CONTROL_CACHE=1")
 
   # #3137: the FORMAT-path MUBUF reject diagnostic must name which provenance step failed.
   add_executable(test_vertex_fetch_reject_diagnostic

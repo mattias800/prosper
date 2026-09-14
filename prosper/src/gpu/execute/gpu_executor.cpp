@@ -4,6 +4,7 @@
 // ONLY place the executor touches process-global state; execute_gpustate() itself (gpu_execute.hpp) stays
 // pure. No Vulkan here — the backend is a std::function injected by whoever owns a device (the runtime
 // binary at startup, or a test via render_runner.h), so prosper_core links this without Vulkan.
+#include "gpu/resources/fold_control_plan.hpp"
 #include "gpu/execute/gpu_execute.hpp"
 #include "gpu/diagnostics/watch_list.hpp"   // strict 0x-only watch parsing (shared with the RTT watch)
 #include "diagnostics/env_numeric.hpp"   // #3267: a typo must not silently drop an operator-set cap
@@ -940,7 +941,14 @@ ShaderCache& shader_cache() {
     return cache;
 }
 
+bool fold_control_cache_enabled() {
+    static const bool enabled = std::getenv("PROSPER_NO_FOLD_CONTROL_CACHE") == nullptr;
+    return enabled;
+}
+
 struct DecodedShader {
+    FoldControlPlan control_plan;
+    FoldControlPlan shader_constant_control_plan;
     std::vector<uint32_t> code;
     std::vector<Rdna2Inst> instructions;
     std::vector<Rdna2Inst> shader_constant_instructions;
@@ -1031,6 +1039,8 @@ struct InterpolationCache {
 };
 
 struct StageFoldProfileEntry {
+    uint64_t cached_control_calls = 0;
+    uint64_t control_bytes = 0;
     uint64_t code = 0;
     uint32_t user_base = 0;
     uint64_t calls = 0;
@@ -1073,7 +1083,7 @@ StageFoldProfiler& stage_fold_profiler() {
 void record_stage_fold_profile(uint64_t code, uint32_t user_base, size_t code_dwords,
                                size_t instructions, size_t dynamic_fetches, size_t srt_uses,
                                uint64_t guest_probes, double elapsed_ms, double decode_ms,
-                               double guest_probe_ms) {
+                               double guest_probe_ms, bool cached_control, uint64_t control_bytes) {
     static const uint64_t interval = [] {
         const char* value = std::getenv("PROSPER_STAGE_FOLD_PROFILE_CALLS");
         if (!value || !*value) return 4096ull;
@@ -1087,6 +1097,8 @@ void record_stage_fold_profile(uint64_t code, uint32_t user_base, size_t code_dw
     entry.code = code;
     entry.user_base = user_base;
     ++entry.calls;
+    entry.cached_control_calls += cached_control;
+    entry.control_bytes = std::max(entry.control_bytes, control_bytes);
     entry.instructions += instructions;
     entry.dynamic_fetches += dynamic_fetches;
     entry.srt_uses += srt_uses;
@@ -1104,21 +1116,33 @@ void record_stage_fold_profile(uint64_t code, uint32_t user_base, size_t code_dw
     std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) {
         return a.total_ms > b.total_ms;
     });
-    std::fprintf(stderr, "[stage-fold-profile] calls=%llu shaders=%zu top-by-total-ms:\n",
-                 (unsigned long long)profiler.calls, ranked.size());
+    double total = 0.0, decode = 0.0, probe = 0.0;
+    uint64_t cached_calls = 0, instruction_total = 0;
+    for (const auto& item : ranked) {
+        total += item.total_ms; decode += item.decode_ms; probe += item.guest_probe_ms;
+        cached_calls += item.cached_control_calls; instruction_total += item.instructions;
+    }
+    std::fprintf(stderr, "[stage-fold-profile] calls=%llu shaders=%zu total=%.6f "
+                        "decode=%.6f probe=%.6f body=%.6f instructions=%llu "
+                        "control_cached=%llu top-by-total-ms:\n",
+                 (unsigned long long)profiler.calls, ranked.size(), total, decode, probe,
+                 total - decode - probe, (unsigned long long)instruction_total,
+                 (unsigned long long)cached_calls);
     for (size_t i = 0; i < std::min<size_t>(ranked.size(), 12); ++i) {
         const StageFoldProfileEntry& item = ranked[i];
         const double calls = static_cast<double>(item.calls);
         std::fprintf(stderr,
-                     "[stage-fold-profile] code=0x%llx base=%u calls=%llu total=%.3f avg=%.3f "
-                     "max=%.3f decode=%.3f probe=%.3f body=%.3f dw/call=%.1f ins/call=%.1f "
-                     "probes/call=%.1f dyn/call=%.1f srt/call=%.1f\n",
+                     "[stage-fold-profile] code=0x%llx base=%u calls=%llu total=%.6f avg=%.6f "
+                     "max=%.6f decode=%.6f probe=%.6f body=%.6f dw/call=%.1f ins/call=%.1f "
+                     "probes/call=%.1f dyn/call=%.1f srt/call=%.1f control_cached=%llu control_bytes=%llu\n",
                      (unsigned long long)item.code, item.user_base,
                      (unsigned long long)item.calls, item.total_ms, item.total_ms / calls,
                      item.max_ms, item.decode_ms / calls, item.guest_probe_ms / calls,
                      (item.total_ms - item.decode_ms - item.guest_probe_ms) / calls,
                      item.code_dwords / calls, item.instructions / calls,
-                     item.guest_probes / calls, item.dynamic_fetches / calls, item.srt_uses / calls);
+                     item.guest_probes / calls, item.dynamic_fetches / calls, item.srt_uses / calls,
+                     (unsigned long long)item.cached_control_calls,
+                     (unsigned long long)item.control_bytes);
     }
     profiler.window.clear();
     profiler.calls = 0;
@@ -1252,10 +1276,18 @@ std::shared_ptr<const DecodedShader> decode_shader_cached(const uint32_t* code, 
         if (result->shader_constant_specialized)
             retain_fold_instructions(shader_constant_decoded,
                                      result->shader_constant_instructions);
+        if (fold_control_cache_enabled()) {
+            result->control_plan = build_fold_control_plan(result->instructions);
+            if (result->shader_constant_specialized)
+                result->shader_constant_control_plan =
+                    build_fold_control_plan(result->shader_constant_instructions);
+        }
         result->bytes = static_cast<uint64_t>(result->code.size()) * sizeof(uint32_t) +
                         static_cast<uint64_t>(result->instructions.size() +
                                               result->shader_constant_instructions.size()) *
-                            sizeof(Rdna2Inst) + sizeof(result->scalar_spill_written_vgprs);
+                            sizeof(Rdna2Inst) + sizeof(result->scalar_spill_written_vgprs) +
+                        result->control_plan.allocated_bytes() +
+                        result->shader_constant_control_plan.allocated_bytes();
         return result;
     };
 
@@ -3222,6 +3254,23 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
     if (fold_instructions == &decoded->instructions && decoded->shader_constant_specialized)
         fold_instructions = &decoded->shader_constant_instructions;
     const auto& ins = *fold_instructions;
+    // Specialization selects a different stream. Keep PC-relative plans invocation-local until
+    // a cache key explicitly covers that specialization; ordinary and constant-selected streams
+    // have separate immutable metadata under the exact-byte-validated decoded owner.
+    FoldControlPlan local_control_plan;
+    const FoldControlPlan* control_plan = nullptr;
+    if (fold_control_cache_enabled() && fold_instructions == &decoded->instructions)
+        control_plan = &decoded->control_plan;
+    else if (fold_control_cache_enabled() &&
+             fold_instructions == &decoded->shader_constant_instructions)
+        control_plan = &decoded->shader_constant_control_plan;
+    else {
+        local_control_plan = build_fold_control_plan(ins);
+        control_plan = &local_control_plan;
+    }
+    static const bool branch_exclusive_disabled =
+        std::getenv("PROSPER_NO_BRANCH_EXCLUSIVE") != nullptr;
+
     const bool gta5_null_raw_store_guard = pcrel_dispatch_target == UINT32_MAX &&
         rdna2_gta5_null_guarded_raw_store_shader(code, dwords);
 
@@ -3536,49 +3585,10 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
     // That is strictly closer to one real path than mixing both arms of a branch.
     // CONFIDENCE: HIGH on the CFG rule; the shape is proved from the guest's own encodings.
     //
-    // Kept allocation-free for the overwhelmingly common shader (no branch at all): this fold runs
-    // thousands of times per submit. The scan is linear — one pass collecting every branch target,
-    // one sort, then a binary search per candidate.
-    std::vector<std::pair<uint32_t, uint32_t>> restore_at;   // (target pc, its sole predecessor branch pc)
-    size_t restore_cursor = 0;
-    {
-        // PROSPER_NO_BRANCH_EXCLUSIVE=<any value> restores the old straight-line walk. It exists so
-        // the A/B that established this — CrossWorlds' two dropped vertex pipelines and its
-        // `[mubuf-unresolved]` line appear with it set and are absent without it — stays reproducible
-        // for the next reader, in the same spirit as PROSPER_UD_TAIL_ALIGN. It must stay OFF in every
-        // normal run: with it set the fold reports descriptors built from a path the wave cannot be on.
-        static const bool branch_exclusive_disabled =
-            std::getenv("PROSPER_NO_BRANCH_EXCLUSIVE") != nullptr;
-        bool any_branch = false;
-        for (const Rdna2Inst& in : ins)
-            if (sopp_is_branch(in)) { any_branch = true; break; }
-        if (any_branch && !branch_exclusive_disabled && !has_indirect_control_flow(ins)) {
-            // Every branch edge, both directions — the predecessor tally is only a tally if it
-            // counts them all.
-            std::vector<std::pair<uint32_t, uint32_t>> edges;   // (target, branch pc)
-            for (const Rdna2Inst& in : ins) {
-                if (!sopp_is_branch(in)) continue;
-                const int64_t t = sopp_branch_target(in);
-                if (t < 0 || t > (int64_t)UINT32_MAX) continue;
-                edges.emplace_back((uint32_t)t, in.pc);
-            }
-            std::sort(edges.begin(), edges.end());
-            for (size_t k = 1; k < ins.size(); ++k) {
-                const Rdna2Inst& prev = ins[k - 1];
-                const uint32_t t = ins[k].pc;
-                if (!sopp_is_unconditional_branch(prev)) continue;      // a fall-through edge exists
-                if (prev.pc + prev.len_dwords != t) continue;           // ...unless prev physically ends here
-                const auto lo = std::lower_bound(edges.begin(), edges.end(),
-                                                 std::make_pair(t, uint32_t{0}));
-                const auto hi = std::upper_bound(edges.begin(), edges.end(),
-                                                 std::make_pair(t, UINT32_MAX));
-                if (std::distance(lo, hi) != 1) continue;               // 0 or >=2 predecessors
-                const uint32_t source = lo->second;
-                if (source >= t) continue;                              // a lone backward edge: no region
-                restore_at.emplace_back(t, source);
-            }
-        }
-    }
+    // This code-only analysis runs when building the decoded owner's control plan. The warm fold
+    // needs no edge sort, per-invocation slot map or per-instruction block lookup.
+    // The decoded owner caches the code-only qualification and slot assignment. The diagnostic
+    // opt-out disables their use, not their construction, so it cannot contaminate cached metadata.
     // The interpreter state that a restore has to put back. Everything the walk mutates and that can
     // be read after the target — deliberately excluding the published uses, and excluding
     // `next_null_chain_origin`, which is a monotonic id allocator: rewinding it would let two
@@ -3615,27 +3625,9 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
         std::array<VertexFetchIndexMode, kFoldVgprs> vector_index_mode;
         int scc;
     };
-    // One slot per qualifying target, indexed rather than searched: each target has exactly one
-    // predecessor branch, so `restore_slot[i]` is the slot that `restore_at[i]`'s branch fills.
-    // `.first` is "this slot has been written", so a target reached before its branch (impossible for
-    // a forward edge, but cheap to be safe about) restores nothing rather than garbage.
-    std::vector<std::pair<bool, FoldStateSnapshot>> saved_at_branch;
-    std::vector<size_t> restore_slot;
-    std::unordered_map<uint32_t, size_t> save_slot_of_pc;
-    if (!restore_at.empty()) {
-        restore_slot.reserve(restore_at.size());
-        saved_at_branch.reserve(restore_at.size());
-        for (const auto& [target, branch_pc] : restore_at) {
-            (void)target;
-            auto existing = save_slot_of_pc.find(branch_pc);
-            if (existing == save_slot_of_pc.end()) {
-                existing = save_slot_of_pc.emplace(branch_pc, saved_at_branch.size()).first;
-                saved_at_branch.emplace_back();
-                saved_at_branch.back().first = false;
-            }
-            restore_slot.push_back(existing->second);
-        }
-    }
+    // Snapshot VALUES always belong to this invocation, including nested and parallel folds.
+    std::vector<std::pair<bool, FoldStateSnapshot>> saved_at_branch(
+        branch_exclusive_disabled ? 0 : control_plan->snapshot_count);
     auto capture_fold_state = [&]() {
         FoldStateSnapshot s;
         s.val = val; s.val_known = val_known;
@@ -3818,20 +3810,8 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
     // begin blocks; indirect control flow makes this finite edge inventory incomplete and disables
     // the proof for the whole program. Any EXEC writer also disables later proofs globally: without
     // a mask dataflow model, a subsequent v_mov may still execute on only a subset of lanes.
-    const bool zero_mip_cfg_known = !has_indirect_control_flow(ins);
-    std::set<uint32_t> zero_mip_block_starts;
-    if (!ins.empty()) zero_mip_block_starts.insert(ins.front().pc);
-    if (zero_mip_cfg_known) {
-        for (const Rdna2Inst& candidate : ins) {
-            if (!sopp_is_branch(candidate)) continue;
-            const int64_t target = sopp_branch_target(candidate);
-            if (target >= 0 && target <= static_cast<int64_t>(UINT32_MAX))
-                zero_mip_block_starts.insert(static_cast<uint32_t>(target));
-            zero_mip_block_starts.insert(candidate.pc + candidate.len_dwords);
-        }
-    }
+    const bool zero_mip_cfg_known = control_plan->cfg_known;
     std::bitset<256> same_block_zero_vgprs;
-    uint32_t current_zero_mip_block = UINT32_MAX;
     bool zero_mip_exec_pristine = true;
 
     for (size_t instruction_index = 0; instruction_index < ins.size(); ++instruction_index) {
@@ -3840,20 +3820,8 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
         watch_w0 = in.words[0]; watch_w1 = in.len_dwords > 1 ? in.words[1] : 0u;
         watch_len = in.len_dwords;
         if (in.is_end) break;
-        uint32_t zero_mip_block = UINT32_MAX;
-        if (zero_mip_cfg_known) {
-            // The retained fold stream may omit the first physical instruction of a block (EXP is
-            // a common example). Classify by the greatest start not after this PC instead of
-            // waiting to observe the start itself, or a pre-branch proof could leak across a block
-            // whose first instruction was compacted out.
-            auto block = zero_mip_block_starts.upper_bound(in.pc);
-            if (block != zero_mip_block_starts.begin())
-                zero_mip_block = *std::prev(block);
-        }
-        if (!zero_mip_cfg_known ||
-            (instruction_index != 0 && zero_mip_block != current_zero_mip_block))
-            same_block_zero_vgprs.reset();
-        current_zero_mip_block = zero_mip_block;
+        const FoldControlStep& control = control_plan->steps[instruction_index];
+        if (control.reset_zero_mip) same_block_zero_vgprs.reset();
         // A plain v_mov is still lane-predicated by EXEC. Without tracking the active mask and its
         // later restoration, no pre-mutation all-lanes zero fact can survive any explicit or
         // implicit EXEC write (including every v_cmpx encoding).
@@ -3898,30 +3866,20 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
         // store the pre-restore chimera and reinstate it one block later, so the second target would
         // be handed exactly the mixed-path state the rule is meant to remove.
         //
-        // Arrival at a target: put back the state its only predecessor left, discarding everything
-        // the walk did on the path that branch skips. `restore_at` is ascending by target, as is the
-        // walk, so a cursor suffices.
-        while (restore_cursor < restore_at.size() && restore_at[restore_cursor].first < in.pc)
-            ++restore_cursor;
-        if (restore_cursor < restore_at.size() && restore_at[restore_cursor].first == in.pc) {
-            const size_t slot = restore_slot[restore_cursor];
-            if (slot < saved_at_branch.size() && saved_at_branch[slot].first) {
-                restore_fold_state(saved_at_branch[slot].second);
+        if (!branch_exclusive_disabled) {
+            const size_t restore = control.restore_slot;
+            if (restore < saved_at_branch.size() && saved_at_branch[restore].first) {
+                restore_fold_state(saved_at_branch[restore].second);
                 if (trc)
                     fprintf(stderr, "[dyntrace]   branch-exclusive: pc=%u restored the fold state to "
                                     "pc=%u (its only predecessor); every write in between is on the "
                                     "path that branch skips\n",
-                            in.pc, restore_at[restore_cursor].second);
+                            in.pc, control.restore_source_pc);
             }
-        }
-        // ...and only now record the state at this instruction, if it is itself some later target's
-        // only predecessor. Each source appears at most once in `restore_at`, so this is an indexed
-        // store rather than a scan.
-        if (!save_slot_of_pc.empty()) {
-            const auto slot = save_slot_of_pc.find(in.pc);
-            if (slot != save_slot_of_pc.end()) {
-                saved_at_branch[slot->second].first = true;
-                saved_at_branch[slot->second].second = capture_fold_state();
+            const size_t save = control.save_slot;
+            if (save < saved_at_branch.size()) {
+                saved_at_branch[save].first = true;
+                saved_at_branch[save].second = capture_fold_state();
             }
         }
         if (gta5_null_raw_store_guard && in.pc == 42u) {
@@ -5928,7 +5886,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
             srt_uses ? srt_uses->size() - srt_before : 0, guest_probe_calls,
             std::chrono::duration<double, std::milli>(FoldClock::now() - fold_start).count(),
             std::chrono::duration<double, std::milli>(decode_done - fold_start).count(),
-            guest_probe_ms);
+            guest_probe_ms, control_plan != &local_control_plan, control_plan->allocated_bytes());
     return out;
 }
 
