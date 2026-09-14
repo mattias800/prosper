@@ -290,7 +290,35 @@ That is the whole remaining gap, and by the charter's rule it is a fatal one rat
 acceptable skip. These programs declare no sharps at all (`counts: ro=0 rw=0 samp=0 cbuf=0`) and
 address every resource through the SRT.
 
-**The named blocker, for whoever starts there.** Several of the rejections are
+**CORRECTION (same day): "the rejected compute programs are the blocker" is NOT supported.** I wrote
+that here and in the tracker before measuring what actually touches the display buffers. Measured:
+
+- the guest's registered framebuffers are `0x1403930000`, `0x1405910000`, `0x14078f0000`,
+  `0x14098e0000`, `0x1409fe0000`;
+- **no compute program writes one** — every `class=4` target in every `[compute-table]` row lies in
+  `0x143eb10000 .. 0x1498630000`. The only two programs that mention a scanout address bind it
+  `class=2` (a texture READ of the previous frame) and **both are accepted, not rejected**;
+- **no DMA writes one** — 31,105 `DmaData` packets in 25 s, none with a scanout destination;
+- **no compute program references the decoded movie buffer** either, so the movie compositor has not
+  run;
+- prosper's authorship latch agrees from the other end: `[flip-scanout] … not-authored`.
+
+So the title has not reached the point of compositing **at all**; the rejected programs are
+background/streaming work and none of them is the compositor, because no compute program is. The
+rejections remain a fatal gap on their own account (#3671) — they are just not demonstrably this
+title's path to a first pixel.
+
+**Falsified with an engaged lever:** it is not waiting for input either. A 12-entry
+`PROSPER_PAD_SCRIPT` mash of Cross and Options across flips 200-5060 (`[pad] … loaded 12 entries`)
+leaves `draws_cum` at 0 over 270 s.
+
+**So the open question is: what is the title waiting for before it begins compositing?** Its last
+console output is Iggy UI initialisation, it has zero assertions, and it makes no further progress
+messages. That is a guest-state question — the same shape as the frame-loop deadlock at the top of
+this document, and answerable the same way (a `PROSPER_HWBP` bisect of the frame job to find where
+it early-outs before emitting draws).
+
+**The x16 proof, recorded because it is real even though it is not the blocker.** Several of the rejections are
 `fmt=5 op=0x4` — `s_load_dwordx16`, the bundled descriptor fetch. prosper does admit those, but only
 at PCs certified by `proven_smem_x16_descriptor_loads` (`rdna2_emit_cfg.cpp:724`), and that proof is
 deliberately linear:
