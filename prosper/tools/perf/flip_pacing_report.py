@@ -342,15 +342,21 @@ def report(stamps, window_s, tick, untimed=0, backsteps=()):
             print(f"  {bucket:4d} ms x{count}")
 
     # Windowed view: a phase change (cinematic -> gameplay) must not smear two regimes.
-    # Windows are cut over the RAW timeline and each row's rate is its own flips over its own
-    # span -- the same correction as the headline, one level down. Cutting them over the FILTERED
-    # list instead left every row printing 1000/mean of its retained subset, so a bursty phase and
-    # a slow phase produced the same row; and the row ordinals, labelled 'flips', indexed the
-    # filtered list rather than the flips (#3560).
+    #
+    # THE WINDOW LENGTH is cut over the RAW timeline, because window_s seconds of wall clock is
+    # window_s * (flips / span). Deriving it from 1000/mean(retained) instead gives the retained
+    # set's rate, which is this one times the retained fraction, so every window comes out short
+    # by that fraction -- a --window-s 5 row covering 2.5 s on a run that is half burst, while
+    # the header above still reports the period the reader asked for (#3560; pinned by case 27).
     window_flips = max(1, int(window_s * 1000.0 * len(raw) / span_ms))
     print(f"windows of ~{window_flips} flips:")
     start = 0
     window_sizes = []   # (share, retained interval count) -- the count decides if it may vote
+    # THE WINDOWS THEMSELVES are cut over `raw`, and each row's rate is its own flips over its own
+    # span -- the same correction as the headline, one level down. Walking the FILTERED list
+    # instead left every row printing 1000/mean of its retained subset, so a bursty phase and a
+    # genuinely slower phase produced the same row; and the row ordinals, labelled 'flips',
+    # indexed the filtered list rather than the flips (#3560; pinned by case 22).
     while start < len(raw):
         chunk_raw = raw[start:start + window_flips]
         end = start + len(chunk_raw)
