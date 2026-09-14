@@ -128,9 +128,34 @@ and wakes its waiters — it is the only writer that would release the render jo
 and never again**, dispatched as an ordinary job (`ret=eboot+0x1378fdc`, the job dispatcher). Three
 cleanups, three `GpuFlip`s, three buffer indices — and then the fourth of each is missing.
 
-So the next question is narrower than the last one: **what kicks `FrameCleanup`, and why does the
-fourth kick never happen?** The count matching the flip count exactly is the strongest hint on the
-table, and it is the one place prosper's flip emulation is still in scope.
+What kicks it is now measured rather than guessed. Run `PROSPER_EVLOG=1` and the breakpoint
+together and they strictly alternate:
+
+```
+[ev]   GpuFlip t=0.123749 handle=0x1001 bufidx=0 ...
+[hwbp] #1 rip=eboot+0x1390ef0  rdi=0x0   ret=eboot+0x1378fdc
+[ev]   GpuFlip t=0.174088 handle=0x1001 bufidx=1 ...
+[hwbp] #2 rip=eboot+0x1390ef0  rdi=0x1   ret=eboot+0x1378fdc
+[ev]   GpuFlip t=0.191451 handle=0x1001 bufidx=2 ...
+[hwbp] #3 rip=eboot+0x1390ef0  rdi=0x2   ret=eboot+0x1378fdc
+```
+
+**`FrameCleanup(N)` is driven one-for-one by the `GpuFlip` of frame N.** And the render job's wait
+is on its OWN frame's slot: `PROSPER_HWBP_ARGS` at `0x565bb8` gives the counter objects in order —
+`0x1500002080`, `0x1500002100`, `0x1500002180`, `0x1500002200` — and the fourth is exactly the one
+the census reports still holding 1.
+
+So the title stalls waiting for **its own fourth flip**, and there is no fourth flip because the
+guest's fourth and fifth submissions carry no `Flip` packet: of ten `SubmitDcb` folds, only the
+three 106-dword ones do. The guest's own submission thread agrees it is not behind — it sits in a
+`usleep(1)` loop at `eboot+0x15a7cba` waiting for the "newest begun frame" global at
+`eboot+0x211c278` to advance, and that global reads **5** at the stall, i.e. every frame the game
+loop began has already been handed to it.
+
+The remaining question is therefore upstream of the renderer again: **why do frames 3 and 4 produce
+no draws and no flip?** The guest is still inside its first world load (`----- Switching world: from
+ to core`), so the likeliest answer is that it is presenting blank frames while waiting for content,
+and something in that load never finishes. That is where the next session should start.
 
 ## Open blockers
 
