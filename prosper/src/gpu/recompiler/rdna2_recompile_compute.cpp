@@ -422,6 +422,7 @@ std::vector<uint32_t> recompile_valu(const uint32_t* code, size_t dwords,
     b.begin(num_inputs ? num_inputs : 1, rt, local_x_for_test, 1, 1, 64, 0);
     b.declare_guest_scratch(scratch);
     RegState rs; rs.vcc = b.bfalse(); rs.scc = b.bfalse(); rs.exec = b.btrue();
+    seed_smem_pointer_provenance(rs, ins);   // SRT pointer-load provenance (#3616)
     auto safe_branches = safe_execz_branches(ins);
     for (uint32_t wpc : waterfall_branches(ins)) safe_branches.insert(wpc);   // readfirstlane waterfalls (#273)
     for (uint32_t k = 0; k < num_inputs; k++) rs.vreg[(int)k] = b.load_input(k);
@@ -706,6 +707,7 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
     rs.vcc = b.bfalse();
     rs.scc = b.bfalse();
     rs.exec = b.btrue();
+    seed_smem_pointer_provenance(rs, ins);   // SRT pointer-load provenance (#3616)
     // Inline descriptors are represented by the resource table, not scalar SSA values. Leaving
     // their SGPR range absent also preserves the existing direct-provenance rule: a format MUBUF may
     // fall back to by_sgpr_base only while its SRSRC has not been overwritten by shader code.
@@ -788,6 +790,7 @@ RecompileCoverage recompile_coverage(const uint32_t* code, size_t dwords,
     b.vcc_b32_low_only_analysis_done = true;
     b.declare_guest_scratch(scratch);
     RegState rs; rs.vcc = b.bfalse(); rs.scc = b.bfalse(); rs.exec = b.btrue();
+    seed_smem_pointer_provenance(rs, ins);   // SRT pointer-load provenance (#3616)
     auto safe_branches = safe_execz_branches(ins);
     for (uint32_t wpc : waterfall_branches(ins)) safe_branches.insert(wpc);   // readfirstlane waterfalls (#273)
     // emit_alu is a per-instruction check and rejects control-flow branches, but the whole-stream emit_body

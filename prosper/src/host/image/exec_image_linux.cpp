@@ -497,6 +497,39 @@ namespace {
     int      g_hwwatch_fd = -1;
     uint64_t g_hwwatch_addr = 0;
     volatile sig_atomic_t g_hwwatch_count = 0;
+    // PROSPER_HWWATCH_ABS_ALLTHREADS=1: arm the SAME absolute write-watch on every guest thread as it
+    // enters guest execution, instead of on the main guest thread alone.
+    //
+    // This exists because a one-thread watchpoint's ZERO is not evidence (instrument trap 168): x86
+    // debug registers are per-thread state, so a watch armed here is structurally blind to a write
+    // from a worker -- and on a fiber/job-system title every interesting write is on a worker. The
+    // arming point is the one PROSPER_HWBP_ALLTHREADS already uses, so a thread that can execute
+    // guest code is a thread that carries the watch.
+    //
+    // Each armed thread owns its own perf fd and its own SIGTRAP delivery, so the handler needs a
+    // table rather than the single `g_hwwatch_fd` anchor: a fd it does not recognise would fall
+    // through to the exec-bp path and be reported as the wrong kind of hit.
+    bool     g_hwwatch_abs_all = false;
+    uint64_t g_hwwatch_abs_addr = 0;
+    int      g_hwwatch_fds[64] = { -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+                                   -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+                                   -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+                                   -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1 };
+    volatile sig_atomic_t g_hwwatch_nfds = 0;
+    // Signal-handler side: a plain bounded scan, no lock and no allocation.
+    bool hwwatch_fd_known(int fd) {
+        if (fd < 0) return false;
+        if (fd == g_hwwatch_fd) return true;
+        const int n = (int)g_hwwatch_nfds;
+        for (int i = 0; i < n && i < 64; i++) if (g_hwwatch_fds[i] == fd) return true;
+        return false;
+    }
+    void hwwatch_register_fd(int fd) {
+        const int n = (int)g_hwwatch_nfds;
+        if (n >= 64) return;
+        g_hwwatch_fds[n] = fd;
+        g_hwwatch_nfds = (sig_atomic_t)(n + 1);   // publish the slot only after it holds the fd
+    }
     long perf_bp_open(uint64_t addr, uint32_t bp_type) {
 #ifdef __linux__
         struct perf_event_attr pe; memset(&pe, 0, sizeof pe);
@@ -607,14 +640,26 @@ namespace {
         char b[160];
         if (fd < 0) { int n = snprintf(b, sizeof b, "[hwwatch] perf W-watch FAILED addr=0x%llx errno=%d\n",
                           (unsigned long long)addr, errno); raw_write_fmt(2, b, sizeof b, n);   /* raw syscall: no libc TLS access */ return; }
-        g_hwwatch_fd = (int)fd; g_hwwatch_addr = addr;
-        fcntl(g_hwwatch_fd, F_SETFL, O_ASYNC);
-        fcntl(g_hwwatch_fd, F_SETSIG, SIGTRAP);
+        if (g_hwwatch_fd < 0) g_hwwatch_fd = (int)fd;
+        g_hwwatch_addr = addr;
+        hwwatch_register_fd((int)fd);
+        fcntl((int)fd, F_SETFL, O_ASYNC);
+        fcntl((int)fd, F_SETSIG, SIGTRAP);
         struct f_owner_ex ow; ow.type = F_OWNER_TID; ow.pid = (pid_t)prosper_gettid();
-        fcntl(g_hwwatch_fd, F_SETOWN_EX, &ow);
-        ioctl(g_hwwatch_fd, PERF_EVENT_IOC_ENABLE, 0);
-        int n = snprintf(b, sizeof b, "[hwwatch] armed W-watch at 0x%llx (fd=%d)\n",
-                         (unsigned long long)addr, g_hwwatch_fd); raw_write_fmt(2, b, sizeof b, n);   /* raw syscall: no libc TLS access */
+        fcntl((int)fd, F_SETOWN_EX, &ow);
+        ioctl((int)fd, PERF_EVENT_IOC_ENABLE, 0);
+        int n = snprintf(b, sizeof b, "[hwwatch] armed W-watch at 0x%llx (fd=%d tid=%ld)\n",
+                         (unsigned long long)addr, (int)fd, (long)prosper_gettid());
+        raw_write_fmt(2, b, sizeof b, n);   /* raw syscall: no libc TLS access */
+    }
+    // The per-thread half of PROSPER_HWWATCH_ABS_ALLTHREADS, called from the same guest-execution
+    // entry point PROSPER_HWBP_ALLTHREADS arms on. `t_hwwatch_armed` keeps a thread that re-enters
+    // from opening a second fd for the same address.
+    thread_local bool t_hwwatch_armed = false;
+    void arm_hwwatch_this_thread() {
+        if (!g_hwwatch_abs_all || !g_hwwatch_abs_addr || t_hwwatch_armed) return;
+        t_hwwatch_armed = true;
+        arm_hwwatch(g_hwwatch_abs_addr);
     }
     // ---- #312 per-thread MallocBinned3 pool-descriptor HEAD watch (PROSPER_MB3WATCH) -----------
     // The per-run corruptor stomps poolArray[idx].head (struct +0x20, size-class idx=1) of the MB3
@@ -1562,8 +1607,15 @@ namespace {
             }
             // Chained DATA write-watchpoint hit (a write to the watched slot completed): log the writer
             // RIP + the value just stored. Write-watchpoints trap AFTER the store, so no step is needed.
-            if (g_hwwatch_fd >= 0 && PROSPER_SI_FD(si) == g_hwwatch_fd) {
+            if (g_hwwatch_addr && hwwatch_fd_known(PROSPER_SI_FD(si))) {
                 auto gr2 = PROSPER_GREGS(uc);
+                // A worker thread traps here on the GUEST %fs, and everything below this line —
+                // snprintf, and classify_addr's stdio — is host libc, which resolves its own TLS
+                // through %fs. Without the swap the diagnostic itself faults on the guest TCB, which
+                // is how the first all-threads arm of this watch killed the run it was measuring.
+                // (Before PROSPER_HWWATCH_ABS_ALLTHREADS this branch only ever ran on the main guest
+                // thread, where %fs is already the host's, so the omission was invisible.)
+                uint64_t wfs = guest_fs_to_host_scoped();
                 unsigned long long v = 0; { auto p=(volatile uint64_t*)g_hwwatch_addr; v=*p; }
                 // Always log an ANOMALOUS store (not a plausible guest heap pointer 0x1000000000..
                 // 0x1720000000, and nonzero) even past the count cap — this is how a corrupt value
@@ -1580,6 +1632,7 @@ namespace {
                     raw_write_fmt(2, b, sizeof b, n);   /* raw syscall: no libc TLS access */
                     if (!in_eboot) classify_addr(wr);
                 }
+                guest_fs_restore_scoped(wfs);
                 return;
             }
             auto gr = PROSPER_GREGS(uc);
@@ -3432,6 +3485,11 @@ void install_trap_handler() {
         uint64_t addr = strtoull(wa, nullptr, 0);
         struct sigaction ta{}; ta.sa_sigaction = fault_handler; ta.sa_flags = SA_SIGINFO;
         sigemptyset(&ta.sa_mask); sigaction(SIGTRAP, &ta, nullptr);
+        // Record BEFORE arming: a guest thread may enter while this one is still in perf_event_open,
+        // and the per-thread arm reads these two.
+        g_hwwatch_abs_addr = addr;
+        if (getenv("PROSPER_HWWATCH_ABS_ALLTHREADS")) g_hwwatch_abs_all = true;
+        t_hwwatch_armed = true;
         arm_hwwatch(addr);
     }
     // PROSPER_POLLWATCH="0xADDR[,0xADDR...]" (diagnostic, default off) — sample up to 6 guest
@@ -3727,6 +3785,7 @@ void arm_hwbp_this_thread() {
 void guest_execution_thread_enter(bool primary) {
     if (primary) arm_hwbp();
     else arm_hwbp_this_thread();
+    arm_hwwatch_this_thread();   // PROSPER_HWWATCH_ABS_ALLTHREADS (no-op unless armed)
     // Observe completion of the real arm boundary, not merely a helper called by the test. This
     // stays useful on machines where perf_event is unavailable: the seam proves ordering and the
     // production arm path remains responsible for its existing fail-visible error.

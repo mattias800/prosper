@@ -21,6 +21,29 @@ from the tracker issues, and still gated, because it is a projection of state ra
 
 ## 2026-09-14
 
+### Uncharted was drawing all along — into shaders we had filled with zeros
+
+No picture: this one still renders nothing, and the reason it renders nothing changed four times in
+a day. *Uncharted: Legacy of Thieves* folded **zero** draws because our `sceAgcDcbJump` packet was
+one dword wider than the hardware packet it stands for, so the guest's chain link never fit and
+every command after it was lost. Behind that, prosper was **zeroing every shader in the title**: the
+engine issues a CP DMA of each shader's code onto itself through L2 — cache maintenance whose
+correct effect is nothing at all — and we read it as a fill with zero. Behind *that*, its shaders
+declare no resources at all and reach everything through a pointer chased out of a table, which our
+emitter had no rule for. Draws folded went from 0 to a million, every graphics shader now compiles,
+and the renderer runs on every submit. The screen is still black, because the thing that composites
+it is a compute chain we still refuse.
+
+### The save-unmount call that unmounted whatever was there
+
+No picture: this is a defect nothing on screen ever showed. `sceSaveDataUmount2` read none of its
+arguments, so a title asking prosper to unmount one mount point had `/savedata0` discarded instead
+and was told it succeeded. Finding the fix meant establishing the call's shape first, and it is not
+the obvious one -- the mount point is the SECOND argument, the first is a flags word, which a live
+capture of *Dead Cells* settled in one run. Thirty-four of the sixty-one local dumps call it.
+Details in [#3666](https://github.com/mattias800/prosper/issues/3666).
+
+
 ### Uncharted's job threads were reading another thread's TLS
 
 No picture for this one — *Uncharted: Legacy of Thieves* still renders nothing. But it now survives

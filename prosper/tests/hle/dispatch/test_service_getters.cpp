@@ -1296,7 +1296,27 @@ int main() {
             uint8_t event[112]; memset(event, 0xAB, sizeof event);
             CHECK(get_event(0, (uint64_t)(uintptr_t)event, 0, 0, 0, 0) == 0x809F0008ull,
                   "GetEventResult with no completion -> NOT_FOUND (the drained-queue code)");
-            umount(0, 0, 0, 0, 0, 0);
+            // Queue the completion the way a guest does -- mount a save, then unmount it through
+            // the real NID with the mount point this build serves. This used to be a bare
+            // `umount(0, 0, 0, 0, 0, 0)`, which only queued anything because sceSaveDataUmount2 read
+            // none of its arguments and bumped the completion counter unconditionally (#3666). A
+            // refused or no-op unmount now queues nothing, so an event has to be earned. Note the
+            // ARGUMENT ORDER: flags first, mount point second.
+            {
+                namespace fs = std::filesystem;
+                const fs::path save0 = prosper_test::test_scratch_dir() / "service-getters-save0";
+                std::error_code sec;
+                fs::create_directories(save0, sec);
+#ifdef _WIN32
+                _putenv_s("PROSPER_SAVE0", save0.string().c_str());
+#else
+                setenv("PROSPER_SAVE0", save0.string().c_str(), 1);
+#endif
+                savedata0_mount("UmountEventSlot", SaveDataMountPolicy::OpenOrCreate);
+                static const char kMountPoint[16] = "/savedata0";
+                CHECK(umount(1, (uint64_t)(uintptr_t)kMountPoint, 0, 0, 0, 0) == 0,
+                      "Umount2 of a live mount succeeds and queues its completion");
+            }
             CHECK(get_event(0, (uint64_t)(uintptr_t)event, 0, 0, 0, 0) == 0,
                   "GetEventResult consumes the queued unmount completion");
             CHECK(*(uint32_t*)(event + 0) == 1, "SaveData completion type -> UMOUNT_BACKUP(1)");

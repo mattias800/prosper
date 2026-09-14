@@ -414,6 +414,7 @@ static std::vector<uint32_t> recompile_vertex_impl(const uint32_t* code, size_t 
     b.begin_vertex(rt);
     b.declare_guest_scratch(scratch);
     RegState rs; rs.vcc = b.bfalse(); rs.scc = b.bfalse(); rs.exec = b.btrue();
+    seed_smem_pointer_provenance(rs, ins);   // SRT pointer-load provenance (#3616)
     auto safe_branches = safe_execz_branches(ins);
     for (uint32_t wpc : waterfall_branches(ins)) safe_branches.insert(wpc);   // readfirstlane waterfalls (#273)
     // NGG vertex shaders (the exact GS_ALLOC_REQ message present) carry the vertex index in v5, not v0, and wrap

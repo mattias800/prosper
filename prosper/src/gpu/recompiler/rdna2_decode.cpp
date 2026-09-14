@@ -1017,13 +1017,31 @@ Rdna2Inst rdna2_decode_one(const uint32_t* code, size_t max_dwords) {
                 // carries the stride separately.
                 const bool row_xor_ctrl = ctrl == 0x128u ||
                     (ctrl >= 0x160u && ctrl <= 0x16fu);
-                const bool gta_row_ror8 =
+                // The row-XOR family is decoded for every VOP1 MOV and every VOP2 whose only
+                // architectural result is VDST -- not for a three-opcode allow-list.
+                //
+                // DPP16 rewrites SRC0 and nothing else, so what an opcode is has no bearing on
+                // whether the ENCODING is a DPP encoding; deciding that here made the decoder answer
+                // a question that belongs to the emitter, and answer it wrongly. The visible cost was
+                // that `has_dpp` stayed false and SRC0 was left as the raw special operand 250, so
+                // the shader was refused with `mode=unresolved-operand ... dpp=0` -- a reject that
+                // names the DPP marker as an unknown operand rather than naming the control. Two
+                // programs of Uncharted's full-resolution compute chain died that way, on
+                // `v_add_f32_dpp row_xmask:4` and `v_or_b32_dpp row_ror:8` (#3616): the same
+                // permutation the admitted MIN/MAX packets use, with a different combiner.
+                //
+                // Widening the DECODER cannot widen what is emitted: the row-XOR lowering is gated
+                // independently by `dpp_row_xor_source_transform_ok` (compute only, native subgroup,
+                // carry-writers excluded), and every other consumer keeps its own gate. The carry
+                // trio is excluded here too, so a second architectural result is never silently
+                // decoded into a lowering that restores only VDST.
+                const bool row_xor_lowerable =
                     row_xor_ctrl && ((d1 >> 19) & 1u) == 1u &&
                     ((vf == Rdna2Format::VOP1 && vop1_opcode == 0x01u) ||
-                     (vf == Rdna2Format::VOP2 &&
-                      (vop2_opcode == 0x0fu || vop2_opcode == 0x10u)));
+                     (vf == Rdna2Format::VOP2 && vop2_opcode != 0x28u &&
+                      vop2_opcode != 0x29u && vop2_opcode != 0x2au));
                 const bool modeled_ctrl = ctrl < 0x100u ||
-                    (ctrl >= 0x111u && ctrl <= 0x11Fu) || gta_row_ror8;
+                    (ctrl >= 0x111u && ctrl <= 0x11Fu) || row_xor_lowerable;
                 if (modeled_ctrl && ((d1 >> 28) & 0xFu) == 0xFu && ((d1 >> 24) & 0xFu) == 0xFu &&
                     ((d1 >> 20) & 0xFu) == 0u && ((d1 >> 18) & 1u) == 0u) {
                     i.has_modifier = false; i.has_dpp = true; i.dpp_ctrl = (uint16_t)ctrl;

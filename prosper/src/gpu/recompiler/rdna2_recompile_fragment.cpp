@@ -460,6 +460,10 @@ static std::vector<uint32_t> recompile_fragment_impl(
         }
     }
     RegState rs; rs.vcc = b.bfalse(); rs.scc = b.bfalse(); rs.exec = b.btrue();
+    // Which S_LOAD_DWORDX2 loads are descriptor-table POINTERS rather than data. Seeded here, not
+    // only in the CFG dispatcher: a shader emitted straight-line otherwise carries an empty set and
+    // its SRT pointer load reaches the constant-buffer path and rejects the whole shader (#3616).
+    seed_smem_pointer_provenance(rs, ins);
     // #2418: a static property of the decoded stream, set once and never mutated during emission.
     // Gates the fragment SCC re-arm after mask ops so only shaders that actually consume SCC pay the
     // exact-wave-vote's subgroup-size requirement.

@@ -1352,7 +1352,9 @@ inline uint32_t scalar_alu_source_words(const Rdna2Inst& in, uint32_t source) {
 }
 
 // Scalar instructions whose encoded destination is also an implicit source. These reads must be
-// observed before writer transfer functions invalidate the old lifetime. SOPK has no decoded src
+// observed before writer transfer functions invalidate the old lifetime. Every SOPK form whose SDST
+// field is READ belongs here, not merely the arithmetic band: none of them decodes a src operand at
+// all, so a caller scanning `n_src` sees nothing for any of them. SOPK has no decoded src
 // operands at all; conditional moves preserve the old destination on one SCC outcome, comparisons
 // consume SDST without writing it, and ADDK/MULK are ordinary read-modify-write operations. SOP1
 // conditional moves and bitset operations have an explicit source too, but it is the replacement
@@ -1361,7 +1363,12 @@ inline uint32_t scalar_implicit_destination_read_width(const Rdna2Inst& in) {
     if (in.dst.kind != OperandKind::SGPR) return 0;
     if (in.fmt == Rdna2Format::SOPK) {
         if (in.opcode == 0x02 ||                         // s_cmovk_i32
-            (in.opcode >= 0x03 && in.opcode <= 0x10))   // s_cmpk_*, s_addk, s_mulk
+            (in.opcode >= 0x03 && in.opcode <= 0x10) ||  // s_cmpk_*, s_addk, s_mulk
+            // s_setreg_b32: the encoded SDST field is the SOURCE SGPR, which rdna2_emit_alu.cpp's
+            // own handler says in as many words. It reads the register and writes none.
+            in.opcode == 0x13 ||
+            // s_subvector_loop_begin/end read SDST as the loop counter.
+            in.opcode == 0x1b || in.opcode == 0x1c)
             return 1;
         return 0;
     }

@@ -371,6 +371,79 @@ void bind_imports_to_stubs(const Module& m, LoadedImage& img, uint64_t stub_base
         img.import_addr[m.imports[i].sym_index] = stub_base + i * stub_size;
 }
 
+// PROSPER_RESTORE_PATCHED_IMPORTS=1 — re-point import stubs that a dump has overwritten in place.
+//
+// Some dumps ship an eboot whose PLT entries for a Sony library have been replaced with short
+// hand-written stubs, so the guest's calls never reach prosper's implementation at all. That is the
+// same situation `module_path_policy.hpp` refuses for replacement MODULES -- prosper implements the
+// Sony API and a third party's stand-in must not answer for it -- except that there is no extra
+// module to refuse, so the guard cannot see it. `tools/re/stub_nid_map.py --patched` reports them.
+//
+// Restoring the entry writes back exactly what the original did: `jmp *[rip+disp32]` at the GOT slot
+// the JMPREL relocation names, which `apply_relocations` has already filled with prosper's stub. It
+// adds no behaviour of its own and cannot invent a target -- an entry whose slot prosper did not
+// resolve is left alone.
+//
+// OFF BY DEFAULT, because it edits guest code: the decision that a dump's own bytes should be
+// bypassed belongs to whoever is running it, not to the loader.
+//
+// Worked example (#3634/#3651): Uncharted (PPSA05684) has seven libScePlayGo entries overwritten,
+// `scePlayGoGetLocus` among them, and the replacement is broken on its own terms -- it reads its
+// second argument as a chunk index where the caller passes a pointer, so it returns without setting
+// eax. The title's level loader retries ~64 times, unmounts its archives and gives up.
+static void restore_patched_import_stubs(const Module& m, LoadedImage& img) {
+    if (!getenv("PROSPER_RESTORE_PATCHED_IMPORTS")) return;
+
+    std::vector<uint64_t> slot;                       // slot[i] = VA of the i-th JUMP_SLOT's GOT word
+    for (const auto& r : m.relocs)
+        if (r.type == R_X86_64_JUMP_SLOT) slot.push_back(img.base + r.offset);
+    if (slot.size() < 2) return;
+    std::unordered_map<uint64_t, uint64_t> index_of;
+    for (uint64_t i = 0; i < slot.size(); i++) index_of[slot[i]] = i;
+
+    // Calibrate the PLT from entries that are still intact: every entry is `kPltEntry` bytes apart
+    // with the reloc ordinal running alongside, so one surviving `jmp *[rip+disp32]` whose target is
+    // a known jump slot fixes `entry = A + kPltEntry*ordinal`. The mode over all of them is taken,
+    // never a single sighting. With no intact entry there is nothing to calibrate against and the
+    // function does nothing -- an unrecognised PLT shape must not be "restored" into.
+    constexpr uint64_t kPltEntry = 16;
+    std::unordered_map<uint64_t, uint32_t> votes;
+    const uint64_t lo = img.base + img.min_vaddr;
+    for (size_t o = 0; o + 6 <= img.mem.size(); o++) {
+        if (img.mem[o] != 0xFF || img.mem[o + 1] != 0x25) continue;
+        int32_t disp = 0; memcpy(&disp, img.mem.data() + o + 2, 4);
+        const uint64_t entry = lo + o;
+        const auto it = index_of.find(entry + 6 + (int64_t)disp);
+        if (it == index_of.end()) continue;
+        const uint64_t ordinal = it->second;
+        if (entry < lo + kPltEntry * ordinal) continue;
+        votes[entry - kPltEntry * ordinal]++;
+    }
+    if (votes.empty()) return;
+    uint64_t plt_base = 0, best = 0;
+    for (const auto& [b, n] : votes) if (n > best) { best = n; plt_base = b; }
+    if (best < 2) return;                             // one sighting is not a calibration
+
+    uint32_t restored = 0;
+    for (uint64_t i = 0; i < slot.size(); i++) {
+        const uint64_t entry = plt_base + kPltEntry * i;
+        uint8_t* p = img.at(entry);
+        if (!p || !img.at(entry + kPltEntry - 1)) continue;
+        if (p[0] == 0xFF && p[1] == 0x25) continue;   // intact; leave it exactly as it is
+        const uint64_t target = slot[i];
+        const int64_t disp = (int64_t)target - (int64_t)(entry + 6);
+        if (disp < INT32_MIN || disp > INT32_MAX) continue;
+        const int32_t d32 = (int32_t)disp;
+        p[0] = 0xFF; p[1] = 0x25; memcpy(p + 2, &d32, 4);
+        restored++;
+        fprintf(stderr, "[import-restore] PLT entry 0x%llx (reloc %llu) re-pointed at its jump slot "
+                        "0x%llx -- it had been overwritten in place\n",
+                (unsigned long long)entry, (unsigned long long)i, (unsigned long long)target);
+    }
+    if (restored)
+        fprintf(stderr, "[import-restore] %u overwritten import stub(s) restored\n", restored);
+}
+
 size_t apply_relocations(const Module& m, LoadedImage& img,
                          const TlsSymbolMap* tls_symbols_by_nid,
                          const std::vector<uint64_t>* tls_module_below) {
@@ -522,6 +595,8 @@ size_t apply_relocations(const Module& m, LoadedImage& img,
             fprintf(stderr, "[reloc]   type %u: %llu%s\n", kv.first, (unsigned long long)kv.second,
                     unhandled.count(kv.first) ? "  <<< UNHANDLED/FALLBACK" : "");
     }
+    restore_patched_import_stubs(m, img);
+
     return applied;
 }
 
