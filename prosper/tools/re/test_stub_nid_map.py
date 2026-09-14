@@ -107,6 +107,87 @@ def main():
           S.format_rows(rows, [0x1004], "eboot.bin", {}),
           ["0x1004\tfMP5NHUOaMk\t?\t?"])
 
+    # --- patched_import_stubs(): imports overwritten in place -------------------------------------
+    # The detector tells a reader their dump has been modified, so a false positive is expensive and
+    # a false negative wastes the hour it exists to save. Both directions get arms.
+    import struct as _st
+
+    BASE = 0x10000
+    RESOLVER = BASE + 0x400
+
+    def entry(k, reloc, head=b"\xff\x25\x00\x00\x00\x00"):
+        """One 16-byte PLT entry at blob index k: head, `push reloc`, `jmp RESOLVER`."""
+        rel = RESOLVER - (BASE + k * 16 + 16)
+        return head[:6].ljust(6, b"\x90") + b"\x68" + _st.pack("<I", reloc) + \
+            b"\xe9" + _st.pack("<i", rel)
+
+    JUNK6 = b"\x83\xfe\x45\x77\x06\x90"          # a hand-written stub's first 6 bytes
+    WHOLE = b"\x31\xc0\xc3" + b"\x90" * 13          # xor eax,eax; ret; padding -- no tail at all
+
+    class FakePlt(G.Image):
+        def __init__(self, blob):
+            self.base, self.raw = BASE, blob
+            self.segs = [(BASE, 0, len(blob), 1)]      # (va, foff, filesz, PF_X)
+            self.tags = {}                             # no JMPREL: format_patched must still work
+
+        def foff(self, va):
+            off = va - self.base
+            return off if 0 <= off < len(self.raw) else None
+
+        def imported_nids(self):
+            return [("AAAAAAAAAAA", 10), ("BBBBBBBBBBB", 11), ("CCCCCCCCCCC", 12),
+                    ("DDDDDDDDDDD", 13)]
+
+    syms = {0: 10, 1: 11, 2: 12, 3: 13}
+
+    # CONTROL, and it comes first: a module whose entries are all intact must report NOTHING. An
+    # arm that only ever checks for detections passes just as well on a detector that fires always.
+    clean = FakePlt(entry(0, 0) + entry(1, 1) + entry(2, 2) + entry(3, 3))
+    check("clean-plt-reports-no-patching", S.patched_import_stubs(clean, syms), [])
+
+    # A patched head with the lazy-binding tail left behind: the `tail` signal.
+    tailed = FakePlt(entry(0, 0) + entry(1, 1, JUNK6) + entry(2, 2) + entry(3, 3))
+    check("tail-left-behind-is-detected",
+          S.patched_import_stubs(tailed, syms), [(BASE + 16, 1, 11, "tail")])
+
+    # A patched entry with the tail ALSO gone leaves no `push` to find, so only the geometry can
+    # reach it -- and on the dump this was written for, that was the entry that broke the title
+    # while five noisier ones were caught. Mutation killed: dropping the geometry pass.
+    gone = FakePlt(entry(0, 0) + WHOLE + entry(2, 2) + entry(3, 3))
+    check("whole-entry-overwritten-is-detected",
+          S.patched_import_stubs(gone, syms), [(BASE + 16, 1, 11, "whole-entry")])
+
+    # ...and the geometry must not INVENT slots outside the span it actually observed, which is the
+    # over-report the docstring promises not to make: an import may legitimately have no PLT entry.
+    # Relocs 0 and 1 are intact and nothing else is, so nothing may be reported.
+    #
+    # The padding is load-bearing and was added after a mutation test: with the blob ending right
+    # after the two entries, widening the loop bound reddened NOTHING, because every extrapolated
+    # address fell outside the segment and was dropped by the `foff is None` guard instead. The arm
+    # was passing for a reason that had nothing to do with the span bound it names. The padding puts
+    # the invented slots inside the segment, so only the bound can refuse them.
+    short = FakePlt(entry(0, 0) + entry(1, 1) + b"\x90" * 64)
+    check("geometry-does-not-extrapolate-past-observed-entries",
+          S.patched_import_stubs(short, syms), [])
+
+    # A stray `push imm32; jmp rel32` that jumps somewhere OTHER than the module's resolver is not a
+    # PLT entry. Mutation killed: accepting every tail shape instead of taking the majority vote.
+    stray = JUNK6 + b"\x68" + _st.pack("<I", 99) + b"\xe9" + _st.pack("<i", 0x1234)
+    with_stray = FakePlt(entry(0, 0) + entry(1, 1) + entry(2, 2) + entry(3, 3) + stray)
+    check("stray-push-jmp-to-another-target-is-not-a-plt-entry",
+          S.patched_import_stubs(with_stray, syms), [])
+
+    # A reloc index the JMPREL table does not know is not reported by the geometry pass -- it would
+    # be a row naming no import, which is worse than silence.
+    check("geometry-skips-relocs-with-no-symbol",
+          S.patched_import_stubs(gone, {0: 10, 2: 12, 3: 13}), [])
+
+    # format_patched(): a clean module says so out loud rather than printing nothing, so "clean" and
+    # "the tool did not run" are distinguishable.
+    check("clean-module-says-so",
+          S.format_patched(clean, {}, "eboot.bin"),
+          ["eboot.bin: no import stub has been overwritten in place"])
+
     print("\n%s (%d failure(s))" % ("FAILED" if fails else "all passed", fails))
     return 1 if fails else 0
 

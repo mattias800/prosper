@@ -33,11 +33,49 @@ Useful diagnostics on this title specifically:
 - Mounts its real content archives: `bin.psarc`, `shaders.psarc`, `data.psarc`, `core.psarc`,
   `combo-common.psarc`, `common.psarc`, `sp-common.psarc`, `world-boat-intro.psarc`.
 
+## THIS DUMP IS MODIFIED: seven libScePlayGo imports are patched out of the eboot
+
+Read this before spending any time on the title's PlayGo wall, because the wall is not prosper's.
+
+Seven `libScePlayGo` import stubs in this eboot have been **overwritten in place** with short
+hand-written stubs, so calls to them never reach prosper's HLE layer at all:
+
+```
+0x1b9f620  g4AZyxpSAlA  scePlayGoGetOptionalChunk   [whole-entry]
+0x1ba0080  M1Gma1ocrGE  scePlayGoOpen               [tail]
+0x1ba0090  rvBSfTimejE  scePlayGoGetInstallSpeed    [tail]
+0x1ba00a0  uWIYLFkkwqk  scePlayGoGetLocus           [whole-entry]
+0x1ba00b0  4AAcTU9R3XM  scePlayGoSetInstallSpeed    [tail]
+0x1ba00e0  -Q1-u1a7p0g  scePlayGoPrefetch           [tail]
+0x1ba00f0  Nn7zKwnA5q0  scePlayGoGetToDoList        [tail]
+```
+
+`python3 tools/re/stub_nid_map.py --patched --names <PS5-3.20_Libs> <eboot>` reproduces this. A sweep
+of the whole local corpus on 2026-09-14 found **60 of 61 dumps clean and only this one flagged**, so
+this is a property of this dump and not something the tool says about everything.
+
+Two independent routes agree on exactly which seven. Statically, the patched entries are the ones
+with no import stub; at runtime, with `PROSPER_SVCLOG=1`, prosper sees only the four PlayGo calls
+whose stubs are *intact* (`Initialize`, `GetEta`, `GetProgress`, `GetLanguageMask`) and never sees any
+of the seven. The partition matches with nothing left over.
+
+**The consequence for bring-up**: the title spins forever in `CheckPlayGoStatus`
+(`gamelib\level\game-loading.cpp:1576`) on `scePlayGoGetLocus failed: 0x00000001`, never leaves
+loading, and therefore never issues a graphics draw. That error value is fully explained by the
+patched stub rather than by anything prosper does: it treats its second argument as a chunk **index**
+(`cmp esi,0x45`) where the caller passes a **pointer**, so it takes its early `ja` and returns without
+setting `eax` — and at that call site `eax` is left holding the chunk count, `1`.
+
+prosper must not work around this. Patching guest code, or making an HLE answer match what a
+repack's broken stub intended, is not compatibility work; it is the same category as answering an
+ownership query positively to get past a check. The honest position is that **this dump cannot be
+used as evidence about prosper's PlayGo, and progression past loading needs a clean dump.**
+(#3634 was filed against prosper on this symptom and closed as not-a-prosper-defect; #3651 tracks the
+generic detector.)
+
 ## Open blockers
 
-- **#3634** — `scePlayGoGetLocus` refuses chunk ids outside prosper's discovered set and the title
-  asserts on the refusal, 65 times in a 25 s run, from `gamelib\level\game-loading.cpp:1576`. Loudest
-  current complaint and the natural next step. Not fatal: the guest's `int $0x41` is skipped.
+- **#3651** — the generic detector for the patched-import class above.
 - **#3636** — `sceFiberOptParamInitialize` unregistered; the `return 0` default reports success
   without writing the out-parameter.
 - **#3623** — the import stub's host-`%fs` stash is per-guest-TCB while the value is per-host-thread.
@@ -74,6 +112,13 @@ One line per hypothesis that was tested and died. Do not re-derive these.
   epilogue instead, on a plain `sceFiberRun` of an already-started fiber. #3615.
 - **`sceFiberSwitch` is not involved in the migration.** 0 switch events in a full run; the
   work-stealing goes through `sceFiberRun` with `started=1`. #3615.
+- **"The PlayGo wall is prosper's: `scePlayGoGetLocus` refuses a chunk id `discover_playgo_chunks()`
+  failed to find."** Falsified twice over. A refusal log on that path fires **zero** times while the
+  guest asserts 66 times, and `PROSPER_SVCLOG=1` shows prosper's `GetLocus` is **never called at
+  all** — the eboot's stub for it is patched out (see above). The ids the guest builds are `{0}`
+  anyway, which the discovery fallback already accepts, so even the chunk-set half of the hypothesis
+  was moot. The lesson worth keeping is the order: **check that your handler RUNS before theorising
+  about what it returns** — one `PROSPER_SVCLOG` run would have replaced the whole detour. #3634.
 
 ## History
 

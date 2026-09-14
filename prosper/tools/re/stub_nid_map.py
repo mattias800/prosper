@@ -40,6 +40,7 @@ Output is `stub_va<TAB>NID<TAB>name<TAB>library`, ascending by address.
 """
 import argparse
 import os
+import struct
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -82,6 +83,143 @@ def stub_map(path):
     return invert(img, G.scan_code(img))
 
 
+# ---------------------------------------------------- imports patched out of the module in place
+
+# A lazy PLT entry on these modules is 16 bytes: `jmp *[rip+disp32]` (6) then the lazy-binding tail
+# `push <reloc index>` (5) and `jmp <resolver>` (5). Offsets of the tail within the entry.
+PLT_PUSH_OFF = 6
+PLT_JMP_OFF = 11
+PLT_ENTRY = 16
+
+
+def jmprel_index_to_symbol(img):
+    """{reloc index: symbol index} over JMPREL, in table order.
+
+    The reloc index is what a lazy PLT entry pushes before jumping to the resolver, so this is what
+    ties an orphaned tail back to the import whose stub used to sit in front of it. `jump_slots`
+    already walks this table; it just throws the index away because it is matching on the symbol.
+    """
+    out = {}
+    for tv, sv in [(0x17, 0x2), (0x61000029, 0x6100002D)]:
+        va, sz = img.tags.get(tv), img.tags.get(sv)
+        if va is None or sz is None:
+            continue
+        base = img.foff(va)
+        if base is None:
+            continue
+        for i in range(sz // 24):
+            off = base + i * 24
+            if off + 24 > len(img.raw):
+                break
+            _r_off, r_info, _r_add = struct.unpack_from("<QQq", img.raw, off)
+            if (r_info & 0xFFFFFFFF) == G.JMP_SLOT:
+                out[i] = r_info >> 32
+    return out
+
+
+def patched_import_stubs(img, sym_of=None):
+    """Import stubs whose `jmp *[rip+disp32]` head was overwritten, leaving the original tail.
+
+    Returns [(entry VA, reloc index, symbol index or None)], ascending.
+
+    WHY NOT "imported but has no stub": that is the obvious test and it over-reports. An import
+    reached only by a direct `call *[rip+disp32]` legitimately has no stub (see `invert`), and so
+    does one the module never calls. Neither is tampering, and a detector that cannot tell them
+    apart would tell people their dump is modified when it is not.
+
+    What IS evidence is a 16-byte entry that still carries `push <reloc index>; jmp <resolver>`
+    while its leading `jmp *[rip+disp32]` is gone. That tail is lazy-binding code no compiler emits
+    on its own and nothing else jumps to; its presence without a head means something wrote over the
+    head in place. Observed on Uncharted (PPSA05684), whose libScePlayGo entries for
+    scePlayGoGetLocus and scePlayGoOpen were replaced with short hand-written stubs -- so the calls
+    never reached prosper at all, and the resulting assertion read exactly like an HLE defect (see
+    the issue this function was written for).
+
+    The resolver is not assumed: every candidate tail votes with its own `jmp` target and only the
+    majority target is accepted as the module's resolver. That is what keeps an incidental
+    `push imm32; jmp rel32` elsewhere in the text from being read as a PLT entry.
+    """
+    cand = []
+    for seg_va, seg_off, seg_len, flags in img.segs:
+        if not (flags & 1):          # PF_X only: the PLT lives in executable memory
+            continue
+        blob = img.raw[seg_off:seg_off + seg_len]
+        start = 0
+        while True:
+            i = blob.find(b"\x68", start)
+            if i < 0 or i + 10 > len(blob):
+                break
+            start = i + 1
+            if blob[i + 5] != 0xE9 or i < PLT_PUSH_OFF:
+                continue
+            reloc = struct.unpack_from("<I", blob, i + 1)[0]
+            rel = struct.unpack_from("<i", blob, i + 6)[0]
+            entry_va = seg_va + i - PLT_PUSH_OFF
+            resolver = seg_va + i + 10 + rel
+            head_intact = blob[i - PLT_PUSH_OFF] == 0xFF and blob[i - PLT_PUSH_OFF + 1] == 0x25
+            cand.append((entry_va, reloc, resolver, head_intact))
+
+    if not cand:
+        return []
+    votes = {}
+    for _va, _r, resolver, _ok in cand:
+        votes[resolver] = votes.get(resolver, 0) + 1
+    resolver = max(votes, key=lambda k: votes[k])
+
+    if sym_of is None:
+        sym_of = jmprel_index_to_symbol(img)
+    out = []
+    seen_reloc = {}
+    for entry_va, reloc, res, head_intact in cand:
+        if res != resolver:
+            continue
+        seen_reloc[reloc] = entry_va
+        if head_intact:
+            continue
+        out.append((entry_va, reloc, sym_of.get(reloc), "tail"))
+
+    # Second signal, for the case the first cannot reach: a patcher that overwrote the TAIL as well
+    # leaves no `push` to find, so such an entry is invisible above -- and on the dump this was
+    # written for that was precisely the entry that broke the title, while five noisier ones were
+    # caught. Close it from the geometry instead. PLT entries are `PLT_ENTRY` bytes apart and their
+    # reloc indices run with them, so two intact entries fix `va = A + PLT_ENTRY * reloc`; any reloc
+    # inside the observed span whose derived slot produced no candidate at all had its whole entry
+    # overwritten.
+    #
+    # The span bound is what keeps this honest. Extrapolating past the observed entries would start
+    # inventing slots for imports that may legitimately have none (an import reached only by a
+    # direct `call *[rip+disp32]`), which is the over-report this function exists to avoid, so the
+    # derived address must also still land inside an executable segment.
+    intact = sorted((r, va) for r, va in seen_reloc.items())
+    if len(intact) >= 2:
+        (r0, va0), (r1, va1) = intact[0], intact[-1]
+        if r1 > r0 and (va1 - va0) == PLT_ENTRY * (r1 - r0):
+            base = va0 - PLT_ENTRY * r0
+            for reloc in range(r0, r1 + 1):
+                if reloc in seen_reloc or reloc not in sym_of:
+                    continue
+                va = base + PLT_ENTRY * reloc
+                if img.foff(va) is None:
+                    continue
+                out.append((va, reloc, sym_of.get(reloc), "whole-entry"))
+    return sorted(set(out))
+
+
+def format_patched(img, names, label):
+    """Report lines for `patched_import_stubs`, or a single line saying the module is clean."""
+    rows = patched_import_stubs(img)
+    if not rows:
+        return ["%s: no import stub has been overwritten in place" % label]
+    nid_of = {idx: nid for nid, idx in img.imported_nids()}
+    lines = ["%s: %d import stub(s) OVERWRITTEN IN PLACE -- calls to these never reach the HLE layer"
+             % (label, len(rows))]
+    for va, reloc, sym, how in rows:
+        nid = nid_of.get(sym) if sym is not None else None
+        fn, lib = names.get(nid, ("?", "?")) if nid else ("?", "?")
+        lines.append("0x%x\treloc=%d\t%s\t%s\t%s\t[%s]" % (va, reloc, nid or "-", fn, lib, how))
+    return lines
+
+
 def format_rows(smap, wanted, label, names):
     """Output lines for one module.
 
@@ -121,6 +259,10 @@ def main():
     ap.add_argument("--names", help="PS5-3.20_Libs directory, for NID -> name symbolication")
     ap.add_argument("--addr", action="append", default=[],
                     help="only report these stub addresses (repeatable; hex 0x… or decimal)")
+    ap.add_argument("--patched", action="store_true",
+                    help="instead of the stub map, report import stubs OVERWRITTEN IN PLACE -- a "
+                         "third-party replacement patched into the module, which the module-path "
+                         "policy cannot see because there is no extra module to refuse")
     args = ap.parse_args()
 
     names = G.load_nid_names(args.names) if args.names else {}
@@ -130,14 +272,18 @@ def main():
     mods = modules_under(args.module)
     for mod in mods:
         try:
-            smap = stub_map(mod)
+            if args.patched:
+                img = G.Image(G.flatten(mod))
+                lines = format_patched(img, names, os.path.basename(mod))
+            else:
+                lines = format_rows(stub_map(mod), wanted, os.path.basename(mod), names)
         except Exception as exc:                                     # noqa: BLE001 — report, go on
             print("%s\tunreadable: %s" % (mod, exc), file=sys.stderr)
             rc = 2
             continue
         if len(mods) > 1:
             print("### %s" % mod)
-        for line in format_rows(smap, wanted, os.path.basename(mod), names):
+        for line in lines:
             print(line)
     return rc
 
