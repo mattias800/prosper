@@ -1,7 +1,13 @@
 # Uncharted: Legacy of Thieves Collection (PPSA05684) — status
 
-**Rung 0 as of 2026-09-14.** The guest boots, runs its job system, and mounts its content archives.
+**Rung 0 as of 2026-09-14.** The guest boots, runs its job system, mounts its content archives,
+starts its world load, and executes **exactly five iterations of its game loop** before parking.
 Nothing renders. Tracker: #3616.
+
+**The renderer is not the frontier on this title, and that is measured rather than argued:** the
+stall reproduces identically with `PROSPER_RENDER=0` (same five iterations, same wait, same
+timing). Whatever holds this title is CPU-side — HLE, sync, or the job system — so a GPU
+hypothesis needs new evidence before it is worth spending a run on. See `## Ruled out`.
 
 The title is a Naughty Dog engine with a **fiber-based job system** (`NdJob Fiber`, `NdJobWorkerThre`),
 and that is the single most important thing to know before working on it: fibers start on the main
@@ -26,12 +32,62 @@ Useful diagnostics on this title specifically:
 | `PROSPER_FIBERLOG=1` | fiber init/run/yield with the owning **tid**, and which `sceFiberSwitch` branch refused |
 | `PROSPER_TLSLOG=1` | `tid -> guest_tp` for every guest-TLS activation — the map that identifies a foreign TCB |
 | `PROSPER_HWBP=<off> PROSPER_HWBP_ALLTHREADS=1` | execute breakpoint **on worker threads**; without `ALLTHREADS` a zero is void, not negative |
+| `PROSPER_HWBP=0x57e829 PROSPER_HWBP_ALLTHREADS=1 PROSPER_HWBP_MAX=4000` | **the progression meter for this title**: one hit per game-loop iteration. Reads 5 on every arm so far, across four separate runs and two baselines, so a lever that does not move it did nothing |
+| `PROSPER_HWWATCH_ABS=<addr> PROSPER_HWWATCH_ABS_ALLTHREADS=1` | who WROTE a guest slot, arming every guest thread rather than the main one (instrument trap 168's blind spot) |
+| `PROSPER_POLLWATCH=<addr>` | when a guest slot changed, with elapsed time — bounds the stall before an exact instrument is pointed at it |
+| `tools/re/guest_stacks.py <pid> --match <lo>-<hi>` | the call chain of a **parked fiber**, which no host-thread backtrace can show: when a job waits, its stack is in guest memory that no thread points at |
 
 ## What works
 
 - Boots and survives a 25 s capture with no faults, across 13 worker threads and 100 fibers.
 - Mounts its real content archives: `bin.psarc`, `shaders.psarc`, `data.psarc`, `core.psarc`,
   `combo-common.psarc`, `common.psarc`, `sp-common.psarc`, `world-boat-intro.psarc`.
+- Classifies its PlayGo chunks and starts its first world switch (`----- Switching world: from  to
+  core`), loads its script modules, and runs its save-data and trophy initialisation.
+- **Submits real command buffers.** With `PROSPER_GFXLOG=1`, a 25 s run folds **10 `SubmitDcb`** and
+  **33 `SubmitAcb`** streams, including three `Flip` packets carrying buffer indices 0, 1 and 2.
+  Zero draws in any of them.
+- Runs **real GPU compute**: `[render-timing] compute calls=50 dispatches=50 avg_ms=3.34`, with
+  137.2 MiB of image snapshots and 56.4 MiB of storage-image results copied back.
+- 6,770 successful `sceFiberSwitch` calls in a 22 s run, still switching at the moment the capture
+  ends: the job system stays alive and keeps cycling fibers. It simply has no work.
+
+## The frontier: five game-loop iterations, then a job that never completes
+
+The stall is located exactly, and the addresses below are module offsets (`eboot+`), stable across
+runs:
+
+| where | what |
+| --- | --- |
+| `0x57e9e0` | `common-game-loop-job.cpp`: the main guest thread kicks the game-loop job and then `usleep(10)`-polls a counter at `0x57eaab`. It never stops polling. |
+| `0x57e7d0` | the game-loop job body, run once on a worker fiber. Its loop head is `0x57e829`. |
+| `0x57e829` | **executes exactly 5 times**, every run. |
+| `0x5a9ce0` | `GameLoopUpdate` — the per-frame job the loop runs, entered 5 times. |
+| `0x5ab6de` | `GameLoopUpdate` kicks its own sub-job (`0x5a45c0`) at `common-game-loop.cpp:5081` and waits; reached and RETURNED FROM 5 times. |
+| `0x5ab71c` | the frame-latency wait: `WaitForCounter(counter, -frameIndex, 1)`. Reached 5 times, returns 4 times. **This is where the title stops.** |
+
+The counter is a guest object built by `InitializeFrameParams()` (`ndlib/frame-params.cpp`), with its
+value word at `+0x30`. `PROSPER_POLLWATCH` gives its whole life:
+
+```
++23.2ms    0 -> 1
++1292.4ms  1 -> 0
++1426.6ms  0 -> -1
++1486.6ms -1 -> -2
++1516.1ms -2 -> -3      <- and never again
+```
+
+Iteration *n* waits for `-(n-1)`, so the fifth waits for `-4` and the counter stops at `-3`.
+
+`PROSPER_HWWATCH_ABS_ALLTHREADS` names the writer: **`eboot+0x13790c3`**, the job system's
+counter-decrement primitive (`dec [rdx+0x30]` under the spinlock at `+0x20`), on five *different*
+worker tids. So the counter is released by a **job completing**, not by the GPU — which is the same
+answer the `PROSPER_RENDER=0` arm gives from the other direction.
+
+So the open question is one sentence: **which job never completes, and what is it waiting for?**
+Every job worker is parked in the work-scan loop at `0x1378508` finding all eight queues empty, so
+nothing is runnable anywhere — the missing work was never enqueued, rather than enqueued and
+starved.
 
 ## Open blockers
 
@@ -72,11 +128,38 @@ One line per hypothesis that was tested and died. Do not re-derive these.
   `write_fsbase(thread->guest_fs)`)."** Falsified: all 100 of those swaps are on the main thread and
   each installs that thread's *own* TCB — correct. The migration happens through the import stub's
   epilogue instead, on a plain `sceFiberRun` of an already-started fiber. #3615.
-- **`sceFiberSwitch` is not involved in the migration.** 0 switch events in a full run; the
-  work-stealing goes through `sceFiberRun` with `started=1`. #3615.
+- ~~**`sceFiberSwitch` is not involved in the migration.** 0 switch events in a full run.~~
+  **WITHDRAWN — the zero was the instrument.** `fiber_switch_impl` logged only its REFUSAL branches;
+  a successful switch printed nothing, so "switched 6,770 times" and "never switched" produced the
+  same empty evidence. With the success line added, a 22 s run logs **6,770 switches**, still going
+  when the capture ends. The narrower claim that survives is the one #3615 actually rested on: the
+  guest-TP migration observed there arrives through `sceFiberRun` with `started=1`, which the
+  fiber-run log does record. Instrument trap 282.
+- **"The stall is the renderer / the GPU / the flip path."** Falsified: `PROSPER_RENDER=0`
+  reproduces it exactly — 5 game-loop iterations, the same counter trajectory, the same ~1.5 s. The
+  14 compute programs skipped as `mode=unresolved-operand` are therefore not the cause either,
+  however much they need fixing on their own account.
+- **"It is the SDK-gated post-submit completion contract (#2219)."** This title requests **SDK 9**,
+  so the gate is closed for it and the shape fits *ArcRunner* and *Crisis Core* exactly. It is still
+  not the cause: `PROSPER_POST_SUBMIT_VISIBILITY=1` gives 5 iterations, against 5 for each of two
+  baselines and 5 for `PROSPER_EOP_WATCHDOG_MS=200`.
+- **"`sceAgcDriverRegisterWorkloadStream` returning 0 without an out-parameter starves the graphics
+  path."** Falsified at the call site: the guest calls it once as `(1, "Entire Frame")` from its
+  render init and **drops the result** — it is a Razor workload-stream NAME, not a handle the title
+  keeps. Registering it honestly is still worth doing; it will not move this title.
+- **"The title never reaches an AGC submit entry point."** Withdrawn — it was measured by a route
+  that could not establish it (the unimplemented-NID census, which by construction says nothing
+  about a NID that IS implemented). `PROSPER_GFXLOG=1` shows 10 `SubmitDcb` and 33 `SubmitAcb` folds
+  in 25 s. What is true, and is the part worth keeping, is that **none of them contains a draw**.
 
 ## History
 
+- **2026-09-14 (later)** — the frontier is located to one wait: five game-loop iterations, then
+  `GameLoopUpdate` parks in the frame-latency `WaitForCounter` at `eboot+0x5ab71c`. Renderer ruled
+  out by a `PROSPER_RENDER=0` arm. Rung unchanged.
+- **2026-09-14** — `PROSPER_RESTORE_PATCHED_IMPORTS` removes the PlayGo blocker: 7 overwritten
+  import stubs restored, `CheckPlayGoStatus` assertions 64 -> 0, `scePlayGoGetLocus` serviced 1,059
+  times, archives unmounted 3 -> 1, and the guest reaches its world switch. Rung unchanged.
 - **2026-09-14** — #3615 fixed (fiber guest-TP migration). Guest goes from faulting ~1 s into boot to
   surviving a full capture and loading content. Rung unchanged.
 - Earlier — guest mutex ownership resolved on the calling host thread's TCB (`3c4e4db9a`), the first
