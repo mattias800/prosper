@@ -52,6 +52,9 @@ std::vector<uint32_t> build_compute_rgba8_to_packed10();
 // halfwords per horizontal word. Words 22..24 are layer count,
 // linear words/layer and tiled words/layer. Each layer is an ordinary 2D tile plane.
 enum class RetileShaderKind { Words2D, Volume3D, PackedSubwordArray };
-std::vector<uint32_t> build_compute_retile_words(RetileShaderKind kind = RetileShaderKind::Words2D);
+enum class RetileImageSource { LinearBuffer, R32Uint, Rgba8Uint };
+// Image variants also publish exact row-major words for existing result baselines.
+std::vector<uint32_t> build_compute_retile_words(RetileShaderKind kind = RetileShaderKind::Words2D,
+    RetileImageSource source = RetileImageSource::LinearBuffer, bool image_arrayed = false);
 
 } // namespace prosper::gpu

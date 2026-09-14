@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <functional>
 #include <vector>
 
 namespace prosper::gpu {
@@ -396,6 +397,10 @@ bool cold_storage_result_snapshot_can_defer(bool host_data, bool full_overwrite,
 // Deterministic failure injection for the storage-image recovery regression test. The next storage
 // readback fails after dispatch, exercising retained-image invalidation without a Vulkan fault.
 void live_compute_fail_next_storage_readback_for_test();
+// Quiescent test fixtures only. Observe actual mapped linear bytes before comparison/packing;
+// the callback cannot change ownership or authorize guest content and must not retain the pointer.
+void live_compute_set_image_readback_observer_for_test(
+    std::function<void(uint32_t, const uint8_t*, size_t)> observer);
 // Consume only after a writable-buffer GPU dispatch completes, before guest publication.
 void live_compute_fail_next_buffer_readback_for_test();
 // Inject an optional conversion-admission result; does not fail an actual driver call.
@@ -427,6 +432,8 @@ void live_compute_fail_next_image_result_buffer_retain_for_test();
 // another vkQueueSubmit after the injected failure.
 void live_compute_force_next_queue_submit_device_lost_for_test();
 uint64_t live_compute_queue_submit_attempts();
+// Actual queue/device capability observed by an attempted F8 dispatch, independent of query success.
+int live_compute_timestamp_support_for_test(); // -1 unobserved, 0 unsupported, 1 supported
 
 // Register the synchronous Vulkan compute backend used by AGC submit processing.
 void register_live_compute();

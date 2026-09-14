@@ -494,6 +494,8 @@ void InteractivePerformanceCapture::publish_completed(std::unique_ptr<PendingCap
                 << ",\"gpu_shader_ms\":" << record.gpu_shader_ms
                 << ",\"gpu_pre_ms\":" << record.gpu_pre_ms
                 << ",\"gpu_storage_copy_ms\":" << record.gpu_storage_copy_ms
+                << ",\"gpu_image_transfer_ms\":" << record.gpu_image_transfer_ms
+                << ",\"gpu_retile_ms\":" << record.gpu_retile_ms
                 << ",\"gpu_compare_ms\":" << record.gpu_compare_ms
                 << ",\"gpu_restore_ms\":" << record.gpu_restore_ms
                 << ",\"setup_ms\":" << record.setup_ms

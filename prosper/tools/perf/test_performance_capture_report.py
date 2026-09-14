@@ -654,6 +654,23 @@ class ComputeDecompositionTests(unittest.TestCase):
         self.assertIn("pipeline=220.0ms", text)
         self.assertIn("storage-copy=55.0ms", text)
 
+    def test_storage_children_remain_nested_and_signed(self):
+        records = [dict(HIDDEN_COST_COMPUTE[0], gpu_image_transfer_ms=20.0, gpu_retile_ms=36.0)]
+        summary, text = self._render(records)
+        self.assertEqual(summary["compute_storage_children"], {
+            "gpu_image_transfer_ms": 20.0, "gpu_retile_ms": 36.0, "other_storage_ms": -1.0})
+        self.assertEqual(sum(summary["compute_gpu_brackets"].values()), 65.0)
+        self.assertIn("children of storage-copy (already included)", text)
+        self.assertIn("other-storage=-1.0ms", text)
+
+    def test_missing_storage_children_are_unavailable(self):
+        summary, text = self._render(HIDDEN_COST_COMPUTE)
+        self.assertIsNone(summary["compute_storage_children"])
+        self.assertNotIn("children of storage-copy", text)
+        complete = dict(HIDDEN_COST_COMPUTE[0], gpu_image_transfer_ms=0.0, gpu_retile_ms=0.0)
+        self.assertIsNone(self._render([complete, HIDDEN_COST_COMPUTE[0]])[0]["compute_storage_children"])
+        self.assertEqual(self._render([complete])[0]["compute_storage_children"]["gpu_retile_ms"], 0.0)
+
     def test_dominant_timer_reaches_the_printed_output(self):
         # The point of the fix: the largest cost must be visible without parsing the file by hand.
         _, text = self._render(HIDDEN_COST_COMPUTE)

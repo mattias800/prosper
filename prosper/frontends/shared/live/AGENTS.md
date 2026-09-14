@@ -23,6 +23,14 @@ found Vulkan.
   Current multi-layer codegen exposes native Uint16; RG8/R16F arrays retain raw interchange storage
   and CPU conversion. Incomplete source words, ambiguous strides/mips and other sub-word layouts
   retain CPU conversion. Linear comparison baselines stay separate from the tiled host-read buffer.
+  Typed R32_UINT/RGBA8_UINT image reads are fused by default with
+  both tiled and exact linear output in one submission, including one-layer array views. This is
+  a checked core storage-image path. `PROSPER_NO_DIRECT_IMAGE_RETILE=1` restores transfer plus
+  retile for comparison without changing publication semantics. Other representations retain
+  transfer plus retile. The linear allocation remains required by current/future result baselines,
+  CPU fallback and diagnostics; a cold cache miss does not prove it unnecessary. Its producer is
+  now a shader write, including for host availability, comparison and baseline-copy dependencies.
+  Image mirroring and borrowed-image layout restoration remain independent obligations.
   `PROSPER_NO_GPU_RETILE_PACKED_EXTENSION` restores the prior mode-24 multilayer-only packed scope
   for comparable runs while leaving ordinary word and volume GPU tiling enabled.
 - `packed_rtt_conversion.hpp` — device-owned RGBA8→packed-10-bit sampled conversion.

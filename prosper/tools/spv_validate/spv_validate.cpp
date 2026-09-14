@@ -797,6 +797,13 @@ int main(int argc, char** argv) {
          "build_compute_retile_words");
     dump(dir, "builder_retile_volume_words", build_compute_retile_words(RetileShaderKind::Volume3D),
          "build_compute_retile_words");
+    for (auto source : {RetileImageSource::R32Uint, RetileImageSource::Rgba8Uint})
+        for (bool arrayed : {false, true}) {
+            const std::string name = std::string("builder_retile_image_") +
+                (source == RetileImageSource::R32Uint ? "r32" : "rgba8") + (arrayed ? "_array" : "_2d");
+            dump(dir, name.c_str(), build_compute_retile_words(RetileShaderKind::Words2D, source, arrayed),
+                 "build_compute_retile_words");
+        }
     dump(dir, "builder_rgba8_to_packed10", build_compute_rgba8_to_packed10(),
          "build_compute_rgba8_to_packed10");
 

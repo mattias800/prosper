@@ -1,4 +1,4 @@
-// Exact device-side guest tiling, recorded after a storage-image transfer.
+// Exact device-side guest tiling from linear staging or a typed storage image.
 #pragma once
 #include "gpu/recompiler/spirv_builder.hpp"
 #include "gpu/diagnostics/vk_object_names.hpp"   // #3578
@@ -14,6 +14,10 @@
 
 namespace prosper::frontend {
 inline std::atomic<uint64_t>& gpu_retile_recordings() {
+    static std::atomic<uint64_t> count{0};
+    return count;
+}
+inline std::atomic<uint64_t>& gpu_direct_retile_recordings() {
     static std::atomic<uint64_t> count{0};
     return count;
 }
@@ -158,6 +162,7 @@ struct GpuRetilePipeline {
     VkDescriptorSetLayout descriptors = VK_NULL_HANDLE;
     VkPipelineLayout layout = VK_NULL_HANDLE;
     VkPipeline pipeline = VK_NULL_HANDLE;
+    prosper::gpu::RetileImageSource image_source = prosper::gpu::RetileImageSource::LinearBuffer;
     bool attempted = false;
     VkResult setup_result = VK_ERROR_INITIALIZATION_FAILED;
     void destroy() {
@@ -167,14 +172,28 @@ struct GpuRetilePipeline {
         pipeline = VK_NULL_HANDLE; layout = VK_NULL_HANDLE; descriptors = VK_NULL_HANDLE;
     }
     VkResult initialize(VkDevice dev, VkPipelineCache cache,
-                        prosper::gpu::RetileShaderKind kind = prosper::gpu::RetileShaderKind::Words2D) {
+                        prosper::gpu::RetileShaderKind kind = prosper::gpu::RetileShaderKind::Words2D,
+                        prosper::gpu::RetileImageSource source_kind = prosper::gpu::RetileImageSource::LinearBuffer,
+                        bool image_arrayed = false, VkPhysicalDevice physical = VK_NULL_HANDLE) {
         if (attempted) return setup_result;
-        attempted = true; device = dev;
+        attempted = true; device = dev; image_source = source_kind;
+        const bool from_image = image_source != prosper::gpu::RetileImageSource::LinearBuffer;
+        if (from_image) {
+            if (!physical || kind != prosper::gpu::RetileShaderKind::Words2D)
+                return setup_result = VK_ERROR_FORMAT_NOT_SUPPORTED;
+            VkFormatProperties format{};
+            vkGetPhysicalDeviceFormatProperties(physical,
+                source_kind == prosper::gpu::RetileImageSource::Rgba8Uint
+                    ? VK_FORMAT_R8G8B8A8_UINT : VK_FORMAT_R32_UINT, &format);
+            if (!(format.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT))
+                return setup_result = VK_ERROR_FORMAT_NOT_SUPPORTED;
+        }
         const VkDescriptorSetLayoutBinding bindings[]{
             {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
-            {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}};
+            {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+            {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}};
         VkDescriptorSetLayoutCreateInfo dci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-        dci.bindingCount = 2; dci.pBindings = bindings;
+        dci.bindingCount = from_image ? 3 : 2; dci.pBindings = bindings;
         setup_result = vkCreateDescriptorSetLayout(device, &dci, nullptr, &descriptors);
         if (setup_result != VK_SUCCESS) return setup_result;
         const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, 26 * sizeof(uint32_t)};
@@ -183,7 +202,7 @@ struct GpuRetilePipeline {
         lci.pushConstantRangeCount = 1; lci.pPushConstantRanges = &push;
         setup_result = vkCreatePipelineLayout(device, &lci, nullptr, &layout);
         if (setup_result != VK_SUCCESS) { destroy(); return setup_result; }
-        const auto words = prosper::gpu::build_compute_retile_words(kind);
+        const auto words = prosper::gpu::build_compute_retile_words(kind, source_kind, image_arrayed);
         VkShaderModuleCreateInfo sci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         sci.codeSize = words.size() * sizeof(uint32_t); sci.pCode = words.data();
         VkShaderModule shader = VK_NULL_HANDLE;
@@ -202,10 +221,15 @@ struct GpuRetilePipeline {
         return setup_result;
     }
     VkResult bind(VkBuffer source, VkBuffer output, const GpuRetileParameters& p,
-                  VkDescriptorPool& pool, VkDescriptorSet& set) const {
-        const VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2};
+                  VkDescriptorPool& pool, VkDescriptorSet& set,
+                  VkImageView image_view = VK_NULL_HANDLE) const {
+        const bool from_image = image_source != prosper::gpu::RetileImageSource::LinearBuffer;
+        if (from_image && (!image_view || p.kind != prosper::gpu::RetileShaderKind::Words2D || p.words[2]))
+            return VK_ERROR_FORMAT_NOT_SUPPORTED;
+        const VkDescriptorPoolSize sizes[]{
+            {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1}};
         VkDescriptorPoolCreateInfo ci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-        ci.maxSets = 1; ci.poolSizeCount = 1; ci.pPoolSizes = &size;
+        ci.maxSets = 1; ci.poolSizeCount = from_image ? 2 : 1; ci.pPoolSizes = sizes;
         auto result = vkCreateDescriptorPool(device, &ci, nullptr, &pool);
         if (result != VK_SUCCESS) return result;
         VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
@@ -214,18 +238,27 @@ struct GpuRetilePipeline {
         if (result != VK_SUCCESS) return result; // caller releases the partial binding
         const VkDescriptorBufferInfo infos[]{
             {source, 0, p.linear_bytes}, {output, 0, p.tiled_bytes}};
-        VkWriteDescriptorSet writes[2]{};
+        VkWriteDescriptorSet writes[3]{};
         for (uint32_t i = 0; i < 2; ++i) {
             writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
             writes[i].dstSet = set; writes[i].dstBinding = i;
             writes[i].descriptorCount = 1; writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
             writes[i].pBufferInfo = &infos[i];
         }
-        vkUpdateDescriptorSets(device, 2, writes, 0, nullptr);
+        const VkDescriptorImageInfo image_info{VK_NULL_HANDLE, image_view, VK_IMAGE_LAYOUT_GENERAL};
+        if (from_image) {
+            writes[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[2].dstSet = set; writes[2].dstBinding = 2;
+            writes[2].descriptorCount = 1; writes[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            writes[2].pImageInfo = &image_info;
+        }
+        vkUpdateDescriptorSets(device, from_image ? 3 : 2, writes, 0, nullptr);
         return VK_SUCCESS;
     }
     void record(VkCommandBuffer command, VkBuffer source, VkBuffer output,
-                VkDescriptorSet set, const GpuRetileParameters& p) const {
+                VkDescriptorSet set, const GpuRetileParameters& p,
+                VkImage image = VK_NULL_HANDLE) const {
+        const bool from_image = image_source != prosper::gpu::RetileImageSource::LinearBuffer;
         // A pooled allocation can have a previous device writer under a different
         // buffer handle. Every output word, including padding, is shader-written.
         VkMemoryBarrier recycled{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
@@ -241,17 +274,35 @@ struct GpuRetilePipeline {
         }
         vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &recycled, 0, nullptr, 0, nullptr);
-        VkBufferMemoryBarrier before{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
-        before.srcQueueFamilyIndex = before.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        before.size = VK_WHOLE_SIZE; before.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        before.buffer = source; before.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-        vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 1, &before, 0, nullptr);
+        if (from_image) {
+            VkImageMemoryBarrier before{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+            before.srcQueueFamilyIndex = before.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            before.image = image; before.oldLayout = before.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            before.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            before.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            before.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &before);
+        } else {
+            VkBufferMemoryBarrier before{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+            before.srcQueueFamilyIndex = before.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            before.size = VK_WHOLE_SIZE; before.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            before.buffer = source; before.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 1, &before, 0, nullptr);
+        }
         vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
         vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &set, 0, nullptr);
         vkCmdPushConstants(command, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(p.words), p.words.data());
         vkCmdDispatch(command, p.groups_x, p.groups_y, p.groups_z);
         gpu_retile_recordings().fetch_add(1, std::memory_order_relaxed);
+        if (from_image) {
+            gpu_direct_retile_recordings().fetch_add(1, std::memory_order_relaxed);
+            // Linear output is now shader-produced, including any allocation later adopted as
+            // a comparison baseline or recycled and read through another buffer handle.
+            prosper::gpu::record_host_read_barrier(command, source,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT);
+        }
         // The host reads the entire shader-written allocation, even if exact-result
         // comparison later skips this mapping.
         prosper::gpu::record_host_read_barrier(command, output,

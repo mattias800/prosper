@@ -30,3 +30,9 @@ unique descriptor slices/bytes. These are copy-span observations, not completed 
 memory traffic. A planned union can include an unused member; keep bound-minus-upload bytes signed.
 `res_buffer_range_plan_ms` includes metadata grouping and any needed shared negative-write proof.
 It is nested in backend resource setup, outside the per-binding buffer timer and its copy leaf.
+
+Compute image-transfer and retile timers are children of `gpu_storage_copy_ms`, not additional GPU
+work. They use completion-point timestamps around the existing commands; dependency costs, overlap
+with start markers and instrumentation effects prevent interpreting them as isolated execution
+costs or removable time. Mirror copies and image transitions remain in the parent's signed residual.
+Compare identically instrumented arms. Unsupported/failed queries contribute no timestamp sample.
