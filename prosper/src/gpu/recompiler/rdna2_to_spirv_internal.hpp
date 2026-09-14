@@ -666,6 +666,17 @@ struct SpirvCompute {
         auto it = uconst_cache.find(v); if (it != uconst_cache.end()) return it->second;
         uint32_t c = id(); put(types, Op_Constant, {t_u32, c, v}); uconst_cache[v] = c; return c;
     }
+    // Reverse of uconst: the literal behind an id, when that id IS one of our u32 constants.
+    //
+    // Only ids this builder minted through uconst() are answerable, which is the point: a value that
+    // came out of arithmetic has no literal and must report false rather than a plausible number.
+    // The cache is small (one entry per distinct constant in the module) and this is called at
+    // descriptor-resolution sites, not per instruction.
+    bool uconst_literal(uint32_t id_, uint32_t* out) const {
+        for (const auto& kv : uconst_cache)
+            if (kv.second == id_) { if (out) *out = kv.first; return true; }
+        return false;
+    }
     // VGPRs are modeled as raw 32-bit VALUES (uint). Float ops bitcast their operands uint->float and
     // bitcast the result back to uint; integer ops operate on the bits directly. This matches the
     // hardware's untyped VGPRs and lets float and integer instructions share the same register file.

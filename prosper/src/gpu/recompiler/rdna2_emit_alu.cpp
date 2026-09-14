@@ -5307,6 +5307,38 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             uint32_t soff_bits = 0; bool soff_dyn = false;
             if (!soff_null) {
                 if (rt && (in.opcode == 0x2 || in.opcode == 0x3)) {
+                    // An x4/x8 DESCRIPTOR load with a non-null soffset leaves here with placeholders
+                    // and NO SRT tag, so every MIMG that consumes one of its descriptors reports
+                    // srt_tag=NONE and cannot resolve. Say so when asked: whether the soffset is a
+                    // TRACKED scalar decides whether an effective offset could be computed at all,
+                    // and that is the question any fix starts from.
+                    if (getenv("PROSPER_DBG")) {
+                        bool tracked = false; uint32_t val = 0;
+                        if (in.src[1].kind == OperandKind::SGPR ||
+                            (in.src[1].kind == OperandKind::Special &&
+                             in.src[1].value >= 106 && in.src[1].value <= 123)) {
+                            auto it = rs.sreg.find(in.src[1].value);
+                            tracked = it != rs.sreg.end();
+                            if (tracked) val = it->second;
+                        } else if (in.src[1].kind == OperandKind::InlineInt) {
+                            tracked = true; val = (uint32_t)in.src[1].value;
+                        }
+                        fprintf(stderr,
+                                "[smem-untagged] pc=%u op=0x%x dst=s%d src1-kind=%d src1=%d "
+                                "tracked=%d val=%u imm=0x%x\n",
+                                in.pc, in.opcode, in.dst.value,
+                                static_cast<int>(in.src[1].kind), in.src[1].value,
+                                (int)tracked, val, in.literal);
+                        // Answers the tempting follow-up before anyone spends a build on it: if
+                        // the soffset were a literal the effective SRT offset would be
+                        // `soffset + imm` and the bundle could be tagged exactly as the
+                        // null-soffset form is. Measured on PPSA05684 it is NOT -- the offset is
+                        // computed, so there is no static tag to attach and constant folding is
+                        // not the route to these descriptors.
+                        uint32_t lit = 0;
+                        fprintf(stderr, "[smem-untagged]   soffset is a builder constant: %s\n",
+                                (tracked && b.uconst_literal(val, &lit)) ? "YES" : "no");
+                    }
                     for (uint32_t k = 0; k < n; k++) rs.sreg[in.dst.value + (int)k] = b.uconst(0);
                     return true;
                 }
