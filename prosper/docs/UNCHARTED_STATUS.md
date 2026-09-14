@@ -1,8 +1,52 @@
 # Uncharted: Legacy of Thieves Collection (PPSA05684) — status
 
-**Rung 0 as of 2026-09-14.** The guest boots, runs its job system, mounts its content archives,
-starts its world load, and executes **exactly five iterations of its game loop** before parking.
-Nothing renders. Tracker: #3616.
+**Rung 0 as of 2026-09-14, and the frontier moved a long way inside one session.** Nothing is
+published yet, so the rung is unchanged — but the title has gone from *no decoded draws at all* to
+*every graphics draw recompiling, executing, and producing real pixels*. Tracker: #3616.
+
+**The route below sets `PROSPER_FLIP_EVENT_DATA_SHIFT=1`, which is NOT the default.** Every number
+on this page is from that route. Without it the guest still stops after five game-loop iterations
+(the section below), so quote the lever whenever you quote a figure from here.
+
+Where it stands now, measured over 35-120 s runs:
+
+| | before | now |
+| --- | --- | --- |
+| folded draws (`draws_cum`) | 0 | 414,751 |
+| graphics draws refused by the recompiler | all of them (40,710 in 35 s) | **0** |
+| shader decode coverage (a typical VS) | `total=242 alu=6 exp=0 unsupported=236` | `total=431 alu=420 exp=4 unsupported=0` |
+| live render callbacks in 45 s | 0 | 3,578 |
+| rendered non-black pixels | none | 262,144 in a 512x512 target |
+| published frames | 0 | 0 |
+
+Four prosper defects were in that chain, each hiding the next, and none of them was in the renderer:
+
+1. **The Jump packet was one dword too wide.** `sceAgcDcbJump` emitted 5 dwords where the hardware
+   `INDIRECT_BUFFER` is 4. This guest sizes its chain link from the AGC headers rather than from
+   `sceAgcDcbJumpGetSize`, so it leaves exactly four dwords at the end of a command buffer; the Jump
+   did not fit, the buffer-full callback declined, and the chain link was dropped — taking every
+   command built after it, which is every draw. The predication flag that needed the extra dword now
+   lives in PM4 header bit 0, where the hardware keeps it.
+2. **prosper was zeroing every graphics shader.** The guest issues a CP DMA of each shader's code
+   range onto itself through L2 (`dst == sourceAddress`, `bytes == shader_size`, `DST_SEL=2` =
+   `DST_ADDR_USING_L2`) — the cache maintenance a CPU-written shader needs before the GPU fetches
+   it, whose correct effect on memory is nothing. `sceAgcDcbDmaData` keyed "is this an address
+   source?" on `sourceKind == 2` alone and read the call as an immediate fill of zero. The AGC
+   header at `code + shader_size` survived beside the zeroed code, which is what made the blob look
+   half-loaded. Zeros decode as VOP2 opcode 0, so every shader was refused for an unsupported opcode.
+3. **Every resource in this title is reached through an SRT pointer, and the emitter had no standing
+   for one.** Its shaders declare *zero* sharps (`sharp_resource_count {0,0,0,0}`, `srt_size_dw`
+   2..9): the driver puts a 64-bit table pointer in user data and the shader chases it with
+   `s_load_dwordx2 s[2:3], s[0:1], imm` before loading the real V#/T#/S#. That pointer load fell
+   through to the constant-buffer path and rejected the whole shader. The front half was never the
+   problem — `resolve_dynamic_fetch` already follows the same pointers out of guest memory.
+   `proven_smem_pointer_loads` is the missing provenance rule, a whole-stream use proof.
+4. **That proof was consulted only from the CFG dispatcher**, so a straight-line shader carried an
+   empty set and rejected exactly as before — which is what made the third fix look like it had done
+   nothing.
+
+**The remaining blocker is the full-resolution compute chain**, and it is named instruction by
+instruction below.
 
 **The Vulkan backend is not the frontier on this title, and that is measured rather than argued:**
 the stall reproduces identically with `PROSPER_RENDER=0` (same five iterations, same wait, same
@@ -58,7 +102,54 @@ Useful diagnostics on this title specifically:
 - 6,770 successful `sceFiberSwitch` calls in a 22 s run, still switching at the moment the capture
   ends: the job system stays alive and keeps cycling fibers. It simply has no work.
 
-## The frontier: five game-loop iterations, then a job that never completes
+## The frontier: the 2560x1440 composite is compute, and that compute is refused
+
+Every graphics draw now realizes, but nothing is published. The reason is not in the present path:
+
+```
+[rtt] GUEST SCANOUT: no present source and no renderer target at the flipped buffer
+      0x1403930000 -- not-authored (2560x1440 tiling=0 authored=0 footprint=padded)
+[rtt] GUEST SCANOUT phys: va=0x1403930000 -> phys=0x263d30000 (aliases=176 rtt_owns=0)
+```
+
+`authored=0` means the guest never writes the scanout buffer itself, and `rtt_owns=0` means no
+renderer target maps its physical page. The graphics draws all land in small targets (512x512,
+128x128, 64x64); nothing graphics-side is 2560x1440. The full-resolution surfaces belong to compute:
+
+```
+[compute-table] program 0x1400196100 binding=20 class=2 addr=0x144a6f0000 size=29491200
+[compute-table] program 0x140019bc00 binding=11 class=4 addr=0x143eb10000 size=14745600
+```
+
+**and every compute program that writes one of them is a program the recompiler refuses.** Six of
+them, six different unresolved operands, named with `tools/re/disasm_words.py` rather than from an
+opcode table:
+
+| blocking instruction | what is unresolved |
+| --- | --- |
+| `s_load_dwordx16 s[4:19], s[0:1], 0x50` | the descriptor bundle itself |
+| `s_load_dword s26, s[0:1], s6 offset:0x120` | a raw `s_load` with a REGISTER soffset — the emitter only tracks soffset for `s_buffer_load` (opcode 0x8..0xC) and rejects the raw form outright |
+| `image_store v0, v[9:10], s[8:15] dmask:0x1 dim:2D` | SRSRC, which is words 4..11 of the x16 bundle above |
+| `global_load_dword v17, v3, s[2:3]` | SADDR, an SRT-chased pointer |
+| `global_load_dwordx2 v[0:1], v3, s[22:23]` / `s[42:43]` | same |
+| `v_add_f32_dpp v4, v0, v0 row_xmask:4 bound_ctrl:1` | DPP `row_xmask` (prosper admits the `row_shr` ladder only) |
+| `v_or_b32_dpp v1, v1, v1 row_ror:8 bound_ctrl:1` | DPP `row_ror` |
+
+**The x16 bundle is the root of the first three**, and the shape matters: `s_load_dwordx16
+s[4:19], s[0:1], 0x50` is consumed as a T# at `s[8:15]` — bundle offset **4**, neither half — while
+`s6`, another word of the same bundle, is read as an ordinary scalar soffset. So this bundle carries
+descriptors AND scalar data at once. That is why the existing narrow x16 proof
+(`proven_smem_x16_descriptor_loads`: two aligned T# halves, each consumed by a MIMG, no branches)
+cannot admit it, and it is also why a by-use widening of that proof cannot either — a use proof of
+the whole bundle must refuse a bundle one of whose words is data. **Tried and reverted rather than
+recorded as untested:** a `proven_smem_descriptor_bundle_loads` written exactly that way changed
+nothing on this title, for that reason. The answer has to be per-word, not per-load.
+
+## History: five game-loop iterations, then a job that never completes
+
+Solved by `PROSPER_FLIP_EVENT_DATA_SHIFT=1` (5 -> 1,552 iterations, 3 -> 1,550 flips); kept here
+because the investigation's addresses and the progression meter below are still the right
+instruments on this title.
 
 The stall is located exactly, and the addresses below are module offsets (`eboot+`), stable across
 runs:
@@ -356,6 +447,28 @@ title's consumer — so it waits on a cross-title snapshot pass, exactly as #221
 ## Ruled out
 
 One line per hypothesis that was tested and died. Do not re-derive these.
+
+- **"The title never calls any AGC submit entry point."** Falsified: `PROSPER_GFXLOG` shows 10
+  `SubmitDcb` and 33 `SubmitAcb` in a short run. The claim came from reading an *unimplemented-NID*
+  census, which by construction cannot see an implemented NID. #3616.
+- **"`sceFiberSwitch` is not involved — there are 0 switch events."** Falsified: the log simply had
+  no success line. Adding one gives 6,770 switches in 22 s. Instrument trap 282.
+- **"`PROSPER_RENDER=0` proves the renderer is not the frontier."** Overstated rather than wrong:
+  that arm clears the Vulkan backend, the recompiler and the descriptor layer, but NOT prosper's
+  flip/EOP semantics, which the guest's frame pacing does depend on.
+- **"The rejected compute programs are the blocker" (as stated in 2026-09-13).** Withdrawn at the
+  time as unsupported — no compute program of any status was then shown to write a scanout buffer.
+  It is now supported, by a different route and with the evidence attached: the full-resolution
+  surfaces belong to compute and every program writing one is refused. Record both, because the
+  first version was a correct conclusion reached by a route that did not establish it.
+- **"A by-use widening of the x16 descriptor proof admits this title's bundles."** Falsified by
+  implementing it: `proven_smem_descriptor_bundle_loads` (every word read only as a MIMG
+  SRSRC/SSAMP, MUBUF/MTBUF SRSRC or SMEM SBASE) fires on nothing here, because the bundles mix
+  descriptors and scalar data — `s6` is both a bundle word and an `s_load` soffset. Reverted rather
+  than shipped unexercised. A per-word answer is needed, not a per-load one.
+- **"The guest's buffer-full callback is refusing because `available_dw()` subtracts
+  `reserved_dw`."** Falsified by the allocator's own report: `raw=4 reserved=0 available=4`. The
+  reserve was not involved; the buffer genuinely had four dwords and prosper's Jump wanted five.
 
 - **"The `-1` fault is guest-TLS-related because it disappears under `PROSPER_NO_GUEST_FS=1`."**
   Falsified: that arm never reaches `NdJobWorkerThre` at all (0 mentions vs 1), dying earlier on three
