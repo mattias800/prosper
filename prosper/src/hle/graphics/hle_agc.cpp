@@ -880,13 +880,28 @@ HLE(agc_cb_nop) {  // (dcb, num_dwords, ...)
 //    pass sourceKind=0 and sourceAddress=0; the address form passes sourceKind=2 and a 64-bit source.
 //    Select solely from that ABI discriminator: an invalid address must reach the executor and fail
 //    visibly rather than silently changing into an immediate fill.
+//  - **A NON-ZERO sourceAddress is an address source even when sourceKind is not 2** (#3616).
+//    Uncharted: Legacy of Thieves emits a third call shape the two above did not anticipate:
+//    sourceKind=0 with a non-zero sourceAddress that EQUALS the destination, dstSel=2, srcSel=0,
+//    numBytes exactly the shader's `shader_size`. That is a copy of a region onto itself through
+//    L2 -- PM4 DST_SEL=2 is DST_ADDR_USING_L2 -- i.e. the cache maintenance a CPU-written shader
+//    needs before the GPU fetches it, and its correct effect on memory is NOTHING.
+//    Read as an immediate, it is a fill of a1=0 over exactly the shader code: prosper zeroed every
+//    graphics program in the title, leaving the AGC header at code+shader_size untouched beside it.
+//    Every shader then decoded as zeros -- which are VOP2 opcode 0 -- so every draw was refused for
+//    an unsupported opcode and no frame was ever produced (render_spans=0, 0 published).
+//    The rule is the one the two recorded forms already state rather than a new special case: the
+//    immediate/placeholder forms pass sourceAddress=0, so a sourceAddress that is NOT zero is an
+//    address. dst==src is not tested for -- a self-copy is simply what a memmove of a range onto
+//    itself does, which is the hardware's answer too.
 // numBytes is stack arg9. The import ABI bridge forwards args 7-9 as normal fixed parameters on
 // Windows and on Linux's guest-FS path; no compiler-frame decoding is involved (#672).
 // Custom R_DMA_DATA payload: [1..2]=dst lo/hi, [3..4]=srcOrImm lo/hi, [5]=numBytes, [6]=selector
 // bytes plus prosper's kDmaDataAddressSource form bit. The bit is necessary because sourceKind=2
 // can assert an address whose numeric value is still <=32 bits; discarding the kind would silently
 // reinterpret an invalid/unmapped address as an immediate fill in the executor.
-// CONFIDENCE: HIGH on a4=dst/a1=srcOrImm (malloc-destination callsite + patcher names + protocol);
+// CONFIDENCE: HIGH on a4=dst/a1=srcOrImm (malloc-destination callsite + patcher names + protocol)
+// and on a7=sourceAddress (three titles now, two of them with sourceKind disagreeing about it);
 // MED on the selector args (recorded raw; the executor distinguishes the captured 32-bit immediate
 // domain from mapped 64-bit address sources and keeps GDS/unmapped forms fail-closed).
 static uint64_t label_build_pre(uint64_t dst, uint64_t num_bytes) {
@@ -898,7 +913,7 @@ static uint64_t label_build_pre(uint64_t dst, uint64_t num_bytes) {
 
 HLE9(agc_dcb_dma_data) {  // (..., srcImmediate, dstSel?, srcSel?, dst, policy, sourceKind, sourceAddress, bytes)
     uint64_t num_bytes = a8 <= 0x10000000ull ? a8 : 0;
-    const bool address_source = a6 == 2;
+    const bool address_source = a6 == 2 || a7 != 0;
     const uint64_t src_or_imm = address_source ? a7 : a1;
     static std::atomic<uint64_t> g_dma_n{0};
     uint32_t* cmd; if (!begin_packet(a0, kDwDmaData, IT_NOP, R_DMA_DATA, &cmd)) return 0;

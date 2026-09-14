@@ -6,6 +6,7 @@
 // binary at startup, or a test via render_runner.h), so prosper_core links this without Vulkan.
 #include "gpu/execute/gpu_execute.hpp"
 #include "gpu/diagnostics/watch_list.hpp"   // strict 0x-only watch parsing (shared with the RTT watch)
+#include "gpu/diagnostics/diag_ratelimit.hpp"   // first-N-then-powers-of-two report throttling
 #include "diagnostics/env_numeric.hpp"   // #3267: a typo must not silently drop an operator-set cap
 #include <cstdint>
 #include "gpu/capture/gpu_capture.hpp"
@@ -11213,10 +11214,30 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                         realized = true;
                     }
                 } else {
+                    // PROSPER_PRESENT_WHY also asks for the reason. Without it the out-parameter is
+                    // requested only by a capture, so a run where EVERY draw fails to realize --
+                    // render_spans=0, an empty frame, nothing published -- has no reason recorded
+                    // anywhere, which is the state Uncharted was in (#3616). This is the serial
+                    // ordered path, so the reason costs a struct fill, not a throughput mode.
+                    static const bool want_reason = PROSPER_ENV_ON("PROSPER_PRESENT_WHY");
+                    const bool collect = capture_trace != nullptr || want_reason;
                     realized = realize_retained_draw(
                         st, operation.index, scale_x, scale_y, item,
-                        capture_trace ? &failure : nullptr);
-                    failure_known = capture_trace != nullptr;
+                        collect ? &failure : nullptr);
+                    failure_known = collect;
+                    if (!realized && want_reason) {
+                        static std::atomic<uint64_t> n{0};
+                        const uint64_t k = n.fetch_add(1) + 1;
+                        if (prosper::diag_should_print(k))
+                            fprintf(stderr,
+                                    "[present-why] #%llu draw UNREALIZED submit=%llu index=%zu "
+                                    "reason=%s target=0x%llx %ux%u\n",
+                                    (unsigned long long)k, (unsigned long long)submit_no,
+                                    operation.index,
+                                    realization_failure_reason_name(failure.reason),
+                                    (unsigned long long)failure.color0_base,
+                                    failure.color0_width, failure.color0_height);
+                    }
                 }
                 if (realized) {
                     notify_compute_authority_draw_resources(item, submit_no);
@@ -12084,6 +12105,25 @@ bool execute_ordered_and_present(const GpuState& st, uint32_t width, uint32_t he
     notify_compute_authority_unknown(
         ComputeAuthorityBoundaryKind::SubmitEnd, submit_no);
     const bool frame_ready = px.size() == static_cast<size_t>(width) * height * 4;
+    // A submit that carried draws and produced NO pixels at all is invisible today: the
+    // PUBLISH DROPPED backstop below requires a non-empty frame, so the empty case -- the one where
+    // the renderer never selected a scanout source -- says nothing anywhere, and the run looks
+    // identical to one with no draws in it. That is how Uncharted's 131,072 executed draws sat
+    // behind `presents=0` with no line to read (#3616).
+    //
+    // Reports the two facts that separate the causes: how many draw SPANS reached the frontend (0 =
+    // every draw was refused before the render callback; >0 = the callback ran and returned nothing,
+    // i.e. the present selection found no source at the present extent).
+    if (px.empty() && !st.draws.empty() && PROSPER_ENV_ON("PROSPER_PRESENT_WHY")) {
+        static std::atomic<uint64_t> n{0};
+        const uint64_t k = n.fetch_add(1) + 1;
+        if (prosper::diag_should_print(k))
+            fprintf(stderr,
+                    "[present-why] #%llu submit=%llu: %zu draws, %zu dispatches -> render_spans=%zu "
+                    "and an EMPTY frame for a requested %ux%u -- nothing to publish\n",
+                    (unsigned long long)k, (unsigned long long)submit_no, st.draws.size(),
+                    st.dispatches.size(), result.render_spans, width, height);
+    }
     // A submit that RENDERED but whose frame does not match the requested extent is dropped here
     // with no trace anywhere: the frontend's own failure log prints only for an EMPTY frame
     // (instrument trap 87), so a non-empty wrong-extent frame is silently discarded and the
