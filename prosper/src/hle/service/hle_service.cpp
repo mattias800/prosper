@@ -1113,7 +1113,7 @@ HLE(s_vdecsw_try_sync_decode_input) {
     // synchronous inside TrySyncDecodeOutput, so by the time the guest can observe anything the
     // input either was staged or was not.
     //
-    // WHAT THIS DOES NOT DO: write an out-parameter. a1 points at a 
+    // WHAT THIS DOES NOT DO: write an out-parameter. a1 points at a
     // caller struct whose layout is not measured yet, and answering "done" while leaving it
     // untouched is exactly the #2951 failure this file has been bitten by. So the declared size is
     // logged and nothing is written -- if the title needs a field there, the log names the struct
