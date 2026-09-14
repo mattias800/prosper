@@ -554,6 +554,15 @@ uint64_t fiber_switch_impl(GuestFiber* target_guest, uint64_t run_arg, uint64_t*
         current->suspend_fs_slot = callback_guest_fs_slot_from_entry_stack(entry_rsp);
         target->incoming_arg = run_arg; target_guest->state = kStateRun;
         thread->previous = current; thread->current = target;
+        // A SUCCESSFUL switch was the one fiber transition PROSPER_FIBERLOG did not record — only
+        // refusals were logged here, so a run that switched thousands of times and a run that never
+        // switched at all produced the same (empty) evidence. On Uncharted that absence was read as
+        // "sceFiberSwitch is not involved", which the counts could not support: NdJob parks a waiting
+        // job by switching to a pool fiber, and every one of those was invisible.
+        if (fiber_log())
+            std::fprintf(stderr, "[fiber] switch %p -> %p arg=0x%llx tid=%llu\n",
+                         (void*)current->guest, (void*)target_guest,
+                         (unsigned long long)run_arg, (unsigned long long)thread_key());
         if (target->suspended) {
 #ifdef _WIN32
             set_windows_fiber_stack(target);
