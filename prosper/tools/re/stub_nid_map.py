@@ -117,10 +117,16 @@ def jmprel_index_to_symbol(img):
     return out
 
 
-def patched_import_stubs(img, sym_of=None):
+def patched_scan(img, sym_of=None):
     """Import stubs whose `jmp *[rip+disp32]` head was overwritten, leaving the original tail.
 
-    Returns [(entry VA, reloc index, symbol index or None)], ascending.
+    Returns (status, rows): status is "no-plt" | "uncalibrated" | "clean" | "patched",
+    rows is [(entry VA, reloc index, symbol index or None, how)], ascending.
+
+    The status exists because "I did not judge this module" and "I judged it clean" must
+    not be the same answer -- the same reason `format_rows` prints NOT A STUB rather than
+    omitting a row. A reader sweeping a corpus would otherwise count a refusal as a pass,
+    and 14 modules in the local corpus are in exactly that state.
 
     WHY NOT "imported but has no stub": that is the obvious test and it over-reports. An import
     reached only by a direct `call *[rip+disp32]` legitimately has no stub (see `invert`), and so
@@ -140,6 +146,7 @@ def patched_import_stubs(img, sym_of=None):
     `push imm32; jmp rel32` elsewhere in the text from being read as a PLT entry.
     """
     cand = []
+    push_vas = []
     for seg_va, seg_off, seg_len, flags in img.segs:
         if not (flags & 1):          # PF_X only: the PLT lives in executable memory
             continue
@@ -158,9 +165,10 @@ def patched_import_stubs(img, sym_of=None):
             resolver = seg_va + i + 10 + rel
             head_intact = blob[i - PLT_PUSH_OFF] == 0xFF and blob[i - PLT_PUSH_OFF + 1] == 0x25
             cand.append((entry_va, reloc, resolver, head_intact))
+            push_vas.append(seg_va + i)
 
     if not cand:
-        return []
+        return "no-plt", []
     votes = {}
     for _va, _r, resolver, _ok in cand:
         votes[resolver] = votes.get(resolver, 0) + 1
@@ -171,7 +179,7 @@ def patched_import_stubs(img, sym_of=None):
 
     # THREE guards stand between a byte pattern and telling somebody their dump is tampered with.
     # Each closes a way a *clean* module can be accused, which is the expensive direction here; all
-    # three were measured free on this corpus (61 eboots + 262 firmware .sprx + 5 game .prx: 0 grid
+    # three were measured free on this corpus (61 eboots, 261 firmware .sprx and 726 game .prx: 0 grid
     # violations, 0 strays surviving the vote, one flagged module).
     #
     # (1) THE GRID. Entries are `PLT_ENTRY` apart with reloc indices running alongside, so every real
@@ -179,6 +187,8 @@ def patched_import_stubs(img, sym_of=None):
     #     candidates and drop anything off it. Fitting from the first and last candidate instead lets
     #     a single stray become an endpoint and silently disable the geometry pass entirely.
     accepted = [(va, reloc, ok) for va, reloc, res, ok in cand if res == resolver]
+    if not accepted:                 # empty-safe: the mode below needs a population to take it over
+        return "uncalibrated", []
     bases = {}
     for va, reloc, _ok in accepted:
         key = va - PLT_ENTRY * reloc
@@ -192,8 +202,8 @@ def patched_import_stubs(img, sym_of=None):
     #     off byte 6, say -- would otherwise present as ENTIRELY patched, which is the loudest
     #     possible false accusation. No local module has such a PLT, and neither lld nor GNU ld emits
     #     one, but "unrecognised" and "overwritten" must not be the same answer.
-    if not any(ok for _va, _r, ok in on_grid):
-        return []
+    if not on_grid or not any(ok for _va, _r, ok in on_grid):
+        return "uncalibrated", []
 
     out = []
     seen_reloc = {}
@@ -216,23 +226,46 @@ def patched_import_stubs(img, sym_of=None):
     # (3) OTHER-REGION CANDIDATES. A slot that holds a candidate which merely lost the resolver vote
     #     is a PLT entry belonging to a second region, not an overwritten one. Without this, a module
     #     with two lazy PLTs reports the losing region's interleaved slots as patched.
-    other_vas = {va for va, _r, _res, _ok in cand} - set(seen_reloc.values())
+    #     Compared by the PUSH's address rather than the derived entry VA: an entry whose shape this
+    #     code does not recognise carries its push at a different offset, so a VA comparison misses it
+    #     and the slot is then reported as overwritten. Neither real whole-entry slot on the one
+    #     flagged dump contains a 0x68 byte, so this costs nothing there.
+    mine = set(seen_reloc.values())
+    other_pushes = [pv for pv, (va, _r, _res, _ok) in zip(push_vas, cand) if va not in mine]
     if len(seen_reloc) >= 2:
         r0, r1 = min(seen_reloc), max(seen_reloc)
         for reloc in range(r0, r1 + 1):
             if reloc in seen_reloc or reloc not in sym_of:
                 continue
             va = base + PLT_ENTRY * reloc
-            if va in other_vas or img.foff(va) is None:
+            if img.foff(va) is None:
+                continue
+            if any(va <= pv < va + PLT_ENTRY for pv in other_pushes):
                 continue
             out.append((va, reloc, sym_of.get(reloc), "whole-entry"))
-    return sorted(set(out))
+    rows = sorted(set(out))
+    return ("patched" if rows else "clean"), rows
+
+
+def patched_import_stubs(img, sym_of=None):
+    """The rows from `patched_scan`, for callers that only care whether anything was found."""
+    return patched_scan(img, sym_of)[1]
 
 
 def format_patched(img, names, label, sym_of=None):
-    """Report lines for `patched_import_stubs`, or a single line saying the module is clean."""
-    rows = patched_import_stubs(img, sym_of)
-    if not rows:
+    """Report lines for one module, naming which of the four outcomes it got.
+
+    A refusal must not print as a pass. `uncalibrated` means the module has a lazy PLT whose entry
+    shape this code does not recognise, so it has nothing intact to compare against and declines to
+    judge; a reader sweeping a corpus has to be able to count those separately from clean ones.
+    """
+    status, rows = patched_scan(img, sym_of)
+    if status == "no-plt":
+        return ["%s: no lazy PLT in this module -- nothing to check" % label]
+    if status == "uncalibrated":
+        return ["%s: NOT JUDGED -- lazy PLT found, but no entry in it has the expected "
+                "`jmp *[rip+disp32]` head, so there is nothing intact to compare against" % label]
+    if status == "clean":
         return ["%s: no import stub has been overwritten in place" % label]
     nid_of = {idx: nid for nid, idx in img.imported_nids()}
     lines = ["%s: %d import stub(s) OVERWRITTEN IN PLACE -- calls to these never reach the HLE layer"

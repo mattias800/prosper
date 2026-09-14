@@ -362,8 +362,14 @@ accuses clean modules: an import reached only by a direct `call *[rip+disp32]`, 
 no stub either. Three guards stand behind the verdict, each closing a way a clean module could be
 accused — the grid, a requirement that the module contain at least one *intact* entry to calibrate
 against (so an unfamiliar PLT shape reads as silence rather than "entirely patched"), and a check
-that a gap is not simply a second PLT region's entry. Measured across 61 eboots, 262 firmware
-`.sprx` and 5 game `.prx`: one module flagged, and zero grid violations anywhere.
+that a gap is not simply a second PLT region's entry. Measured across 61 eboots, 261 firmware
+`.sprx` and the corpus's game `.prx` modules: zero grid violations anywhere, and the guards remove
+false accusations that a guardless version raises on clean Sony modules — they are load-bearing on
+real data, not only on fixtures.
+
+A module can also come back **NOT JUDGED**: it has a lazy PLT, but no entry in it carries the
+expected `jmp *[rip+disp32]` head, so there is nothing intact to calibrate against. That is reported
+distinctly from "clean" on purpose — a corpus sweep must not count a refusal as a pass.
 
 Worked example (#3634/#3651): *Uncharted* (PPSA05684) asserts 65 times a boot on
 `scePlayGoGetLocus failed: 0x00000001` and never leaves loading. It reads exactly like an HLE defect

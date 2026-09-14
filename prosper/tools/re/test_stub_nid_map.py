@@ -115,9 +115,11 @@ def main():
     BASE = 0x10000
     RESOLVER = BASE + 0x400
 
-    def entry(k, reloc, head=b"\xff\x25\x00\x00\x00\x00"):
-        """One 16-byte PLT entry at blob index k: head, `push reloc`, `jmp RESOLVER`."""
-        rel = RESOLVER - (BASE + k * 16 + 16)
+    ELSEWHERE = BASE + 0x600
+
+    def entry(k, reloc, head=b"\xff\x25\x00\x00\x00\x00", target=None):
+        """One 16-byte PLT entry at blob index k: head, `push reloc`, `jmp target` (default PLT0)."""
+        rel = (RESOLVER if target is None else target) - (BASE + k * 16 + 16)
         return head[:6].ljust(6, b"\x90") + b"\x68" + _st.pack("<I", reloc) + \
             b"\xe9" + _st.pack("<i", rel)
 
@@ -170,12 +172,33 @@ def main():
     check("geometry-does-not-extrapolate-past-observed-entries",
           S.patched_import_stubs(short, syms), [])
 
-    # A stray `push imm32; jmp rel32` that jumps somewhere OTHER than the module's resolver is not a
-    # PLT entry. Mutation killed: accepting every tail shape instead of taking the majority vote.
-    stray = JUNK6 + b"\x68" + _st.pack("<I", 99) + b"\xe9" + _st.pack("<i", 0x1234)
-    with_stray = FakePlt(entry(0, 0) + entry(1, 1) + entry(2, 2) + entry(3, 3) + stray)
-    check("stray-push-jmp-to-another-target-is-not-a-plt-entry",
-          S.patched_import_stubs(with_stray, syms), [])
+    # A `push imm32; jmp rel32` that jumps somewhere OTHER than the module's resolver is not a PLT
+    # entry. Mutation killed: accepting every tail instead of taking the majority vote.
+    #
+    # The stray sits ON the grid, at the slot where entry 4 belongs and with reloc 4, so the grid
+    # guard cannot refuse it and only the resolver can. An earlier version put it off-grid, and the
+    # grid guard therefore shadowed this arm completely -- the vote could be deleted with all 21 arms
+    # still green. That is the third arm in this file to have passed for a reason other than the one
+    # it names; the shape to watch for is a fixture that trips an EARLIER guard than the one under
+    # test.
+    # syms5 (not syms) is load-bearing: with reloc 4 absent from the symbol table the TAIL SYMBOL
+    # GUARD drops the stray first and the vote is never consulted -- which is how this arm failed to
+    # discriminate on its first rewrite too.
+    syms5 = {**syms, 4: 14}
+    on_grid_stray = FakePlt(entry(0, 0) + entry(1, 1) + entry(2, 2) + entry(3, 3) +
+                            entry(4, 4, JUNK6, ELSEWHERE))
+    check("on-grid-stray-jumping-elsewhere-is-not-a-plt-entry",
+          S.patched_import_stubs(on_grid_stray, syms5), [])
+
+    # ...and the twin that proves the arm above discriminates on the RESOLVER and nothing else: the
+    # same slot, same reloc, same patched head, tail jumping to the real PLT0 -- which IS reportable.
+    # Without this an arm expecting [] could pass because the slot is unreportable for some unrelated
+    # reason.
+    on_grid_real = FakePlt(entry(0, 0) + entry(1, 1) + entry(2, 2) + entry(3, 3) +
+                           entry(4, 4, JUNK6))
+    check("...and the same slot WITH the module's own resolver is reported",
+          S.patched_import_stubs(on_grid_real, syms5),
+          [(BASE + 64, 4, 14, "tail")])
 
     # A reloc index the JMPREL table does not know is not reported by the geometry pass -- it would
     # be a row naming no import, which is worse than silence.
@@ -243,6 +266,13 @@ def main():
     check("clean-module-says-so",
           S.format_patched(clean, {}, "eboot.bin"),
           ["eboot.bin: no import stub has been overwritten in place"])
+
+    # A calibration refusal must SAY it did not judge, rather than printing the clean line. Mutation
+    # killed: collapsing "uncalibrated" into "clean" in format_patched.
+    cet.tags = {}
+    check("not-judged-is-distinguishable-from-clean",
+          S.format_patched(cet, {}, "eboot.bin", sym_of=syms)[0].split(":")[1].strip()[:10],
+          "NOT JUDGED")
 
     # ...and the DETECTION row is pinned too, because that row is what a reader pastes into an issue.
     # Only the clean line was covered before, so the NID/name lookup and the [tail]/[whole-entry]
