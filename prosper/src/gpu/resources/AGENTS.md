@@ -48,3 +48,8 @@ pointer destinations for stores, copies and atomics. Unknown pointer or extended
 decline the proof. Known GLSL arithmetic has no writes; Modf and Frexp output pointers must resolve.
 A complete report still requires consumers to combine every alias/stage's writable and atomic flags
 before treating an upload as read-only. Unresolved writes must not silently become cache authority.
+
+`fold_control_plan` holds code-only control metadata for the scalar descriptor fold: block boundaries
+and exclusive-predecessor snapshot slots. Its owner is the executor's exact-byte-validated decoded
+shader cache. Register values, descriptors, guest reads and snapshot values remain invocation-local;
+a plan must never become proof that resource contents are unchanged.

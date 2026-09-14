@@ -219,6 +219,26 @@ on a guest-revoked alias remains unhandled, and a trace's already-owned single-s
 as invalid without restoring revoked permissions. Windows/macOS keep their existing safe fallback.
 This does not establish complete recovery after diagnostic-only partial protection failures.
 
+### Cached fold control metadata
+
+The decoded shader owner retains code-only control metadata for each compact instruction stream:
+zero-mip block boundaries and exclusive-predecessor save/restore slots. Each hit still verifies the
+consumed shader bytes. Ordinary and shader-constant-specialized streams own separate plans;
+PC-relative specialization constructs its plan locally after selecting the stream.
+
+Every evaluation retains fresh SGPR values, descriptor/provenance state, guest reads and branch
+snapshot values. Metadata reuse proves nothing about resource content, and does not change the
+interpreter's existing path-insensitive limitations. Both-direction predecessor counts, physical
+adjacency across compaction gaps, indirect-transfer refusal and restore-before-save remain required.
+Plan allocations count against the decoded cache budget; shared ownership keeps borrowed plans alive.
+
+`PROSPER_NO_FOLD_CONTROL_CACHE=1` reconstructs control metadata per evaluation. The existing
+`PROSPER_STAGE_FOLD_PROFILE` diagnostic reports complete-window totals and cached-control call counts;
+per-shader rows remain a top-twelve sample. Profile time includes instrumentation and nested guest
+probes; its residual is evaluator time, not pure instruction execution. This is an initial reduction
+of repeated analysis under [#3655](https://github.com/mattias800/prosper/issues/3655), not a replacement
+operation interpreter or completed-table cache.
+
 ### Ruled out: deferred compute export watches
 
 A 2026-09-14 same-binary Sonic pair deferred new graphics-export watches until a borrower
