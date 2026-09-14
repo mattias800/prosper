@@ -128,12 +128,14 @@ opcode table:
 | blocking instruction | what is unresolved |
 | --- | --- |
 | `s_load_dwordx16 s[4:19], s[0:1], 0x50` | the descriptor bundle itself |
-| `s_load_dword s26, s[0:1], s6 offset:0x120` | a raw `s_load` with a REGISTER soffset — the emitter only tracks soffset for `s_buffer_load` (opcode 0x8..0xC) and rejects the raw form outright |
 | `image_store v0, v[9:10], s[8:15] dmask:0x1 dim:2D` | SRSRC, which is words 4..11 of the x16 bundle above |
 | `global_load_dword v17, v3, s[2:3]` | SADDR, an SRT-chased pointer |
 | `global_load_dwordx2 v[0:1], v3, s[22:23]` / `s[42:43]` | same |
-| `v_add_f32_dpp v4, v0, v0 row_xmask:4 bound_ctrl:1` | DPP `row_xmask` (prosper admits the `row_shr` ladder only) |
-| `v_or_b32_dpp v1, v1, v1 row_ror:8 bound_ctrl:1` | DPP `row_ror` |
+
+Two of those are now closed and are struck from the table above: the raw-`s_load` register SOFFSET
+(`untracked-soffset` 3 → 0) and the DPP16 row-XOR family, which the *decoder* was gating on an
+opcode allow-list so `has_dpp` stayed false and SRC0 arrived as the raw special operand 250
+(`v_add_f32_dpp row_xmask:4` / `v_or_b32_dpp row_ror:8`, 4 → 0).
 
 **The x16 bundle is the root of the first three**, and the shape matters: `s_load_dwordx16
 s[4:19], s[0:1], 0x50` is consumed as a T# at `s[8:15]` — bundle offset **4**, neither half — while
@@ -466,13 +468,14 @@ One line per hypothesis that was tested and died. Do not re-derive these.
   SRSRC/SSAMP, MUBUF/MTBUF SRSRC or SMEM SBASE) fires on nothing here, because the bundles mix
   descriptors and scalar data — `s6` is both a bundle word and an `s_load` soffset. Reverted rather
   than shipped unexercised. A per-word answer is needed, not a per-load one.
-- **"Letting a raw `s_load_*` take a tracked register SOFFSET unblocks the compute chain."**
-  Falsified by implementing it. The emitter's gate admits only `s_buffer_load` (opcode 0x8..0xC),
-  which does reject a resolvable case, but lifting it to every SMEM load took the refused compute
-  programs from **15 to 22 distinct** on this title rather than reducing them — the loads proceed
-  past the offset check and fail later, and a raw pointer's published resource is not sized for the
-  access. Reverted. The gate is not the defect; if it is lifted later it must come with the
-  raw-pointer resource sizing, not on its own.
+- **"The raw-`s_load` SOFFSET gate is not the defect — lifting it took the refused compute programs
+  from 15 to 22."** *Withdrawn: the measurement was confounded, not the change.* "Distinct compute
+  programs refused in a fixed-length run" divides by nothing: a run that stalls early reaches fewer
+  programs and therefore refuses fewer, so it scores better, and two runs of the identical binary
+  here scored 15 and 21. Re-measured by the reject SIGNATURE the change actually claims to move,
+  `untracked-soffset` goes **3 → 0** with no new signature family appearing, and the change is in.
+  Instrument trap 283 — and note this entry once stood in `## Ruled out`, which is exactly where a
+  confounded metric does the most damage.
 - **"The guest's buffer-full callback is refusing because `available_dw()` subtracts
   `reserved_dw`."** Falsified by the allocator's own report: `raw=4 reserved=0 available=4`. The
   reserve was not involved; the buffer genuinely had four dwords and prosper's Jump wanted five.

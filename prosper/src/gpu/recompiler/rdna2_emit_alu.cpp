@@ -5365,7 +5365,15 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     return true;
                 }
                 bool tracked = false;
-                if (in.opcode >= 0x8 && in.opcode <= 0xC) {
+                // A register SOFFSET means the same thing on a raw `s_load_*` as on an
+                // `s_buffer_load_*`: a scalar byte offset added to the base. The gate admitted only
+                // the buffer opcodes, so a raw load with a perfectly TRACKED offset register was
+                // refused without the tracking ever being attempted (#3616). The raw form resolves
+                // through the same provenance the buffer form does -- the front half publishes a
+                // raw-pointer resource at the load's exact PC and `by_fetch_pc` finds it below --
+                // and the dword index is `(soffset + imm) >> 2` either way. An UNTRACKED offset
+                // still rejects, for both forms: never fold an unknown runtime offset as 0.
+                if (in.opcode <= 0xC) {
                     if (in.src[1].kind == OperandKind::SGPR ||
                         (in.src[1].kind == OperandKind::Special && in.src[1].value >= 106 && in.src[1].value <= 123)) {
                         auto it = rs.sreg.find(in.src[1].value);
