@@ -3347,14 +3347,12 @@ if(TARGET prosper_core)
                  PROSPER_COMPUTE_IMAGE_CACHE_MIN_KB=1 PROSPER_COMPUTE_STORAGE_IMAGE_CACHE_MIN_KB=1
                  $<TARGET_FILE:test_storage_output_conflicts> --watched)
         set_tests_properties(storage_output_conflicts_watched PROPERTIES TIMEOUT 60)
-        add_executable(test_demand_compute_export_watch tests/gpu/execute/test_demand_compute_export_watch.cpp)
-        target_include_directories(test_demand_compute_export_watch PRIVATE tests frontends)
-        target_link_libraries(test_demand_compute_export_watch PRIVATE prosper_live_renderer prosper_core Vulkan::Vulkan)
-        add_test(NAME demand_compute_export_watch COMMAND ${CMAKE_COMMAND} -E env
-                 PROSPER_DEMAND_COMPUTE_EXPORT_WATCH=1
-                 PROSPER_COMPUTE_IMAGE_CACHE_MIN_KB=1 PROSPER_COMPUTE_STORAGE_IMAGE_CACHE_MIN_KB=1
-                 $<TARGET_FILE:test_demand_compute_export_watch>)
-        set_tests_properties(demand_compute_export_watch PROPERTIES TIMEOUT 60)
+        add_executable(test_cpu_fill_watch_retry tests/gpu/execute/test_cpu_fill_watch_retry.cpp)
+        target_include_directories(test_cpu_fill_watch_retry PRIVATE tests frontends)
+        target_link_libraries(test_cpu_fill_watch_retry PRIVATE prosper_live_renderer prosper_core Vulkan::Vulkan)
+        add_test(NAME cpu_fill_watch_retry COMMAND ${CMAKE_COMMAND} -E env
+                 PROSPER_CPU_FILL_WATCH_RETRY=1 $<TARGET_FILE:test_cpu_fill_watch_retry>)
+        set_tests_properties(cpu_fill_watch_retry PROPERTIES TIMEOUT 60)
       endif()
       set_tests_properties(storage_output_conflicts storage_output_conflicts_unjournaled
                            storage_output_conflicts_overflow storage_output_conflicts_submit_failure PROPERTIES TIMEOUT 60)

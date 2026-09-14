@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <vector>
 
 namespace prosper::gpu {
@@ -380,6 +381,8 @@ bool live_compute_native_storage_3d_supported(prosper::gpu::DataFormat format,
 // Monotonic count of exact compute fills executed by the structurally guarded CPU path. Tests use
 // the delta to distinguish the intended bypass from a successful Vulkan fallback.
 uint64_t live_compute_cpu_fill_dispatches();
+// Exercise CPU admission/refusal without dispatching an intentionally invalid destination on Vulkan.
+std::optional<bool> live_compute_cpu_fast_path_for_test(const prosper::gpu::ComputeItem& item);
 // Monotonic attribution for storage-result source validation. Production-backend tests use this to
 // prove that changing proven-full results do not copy a redundant guest-byte snapshot.
 uint64_t live_compute_storage_result_snapshot_bytes();

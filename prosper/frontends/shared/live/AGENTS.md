@@ -141,6 +141,20 @@ nor a completed-dispatch count. Compare full keys and last-use values across sna
 reuse. Pins include this dispatch's owners and prohibit reclamation. Census collection adds work
 inside cleanup timing; use it to diagnose residency, disable it for throughput comparisons.
 
+## CPU fill admission
+
+The exact `FillSgprUvec4` shortcut validates the live descriptor and launch before preparing any
+write. `PROSPER_CPU_FILL_WATCH_RETRY=1` currently opts into retrying an OS-writability refusal after
+the existing host-write watch preparation. The second permission check remains authoritative;
+preparation never grants guest permission. Both successful and refused attempts complete their
+prepared host-write scope. Ordinary architectural clear notifications remain required even when
+all destination bytes already equal the fill pattern. `cpu_fill_watch_retry` exercises real watched
+aliases, genuine read-only revocation, partial-launch padding and rendered-depth invalidation.
+
+`PROSPER_COMPUTE_FAST_PATH_CENSUS=1` reports the first admission/refusal reason for this shortcut
+only while F8 detailed timing is active. Broadcast-buffer shortcuts have a separate implementation
+and are not included in this reason partition. The census reads no additional guest contents.
+
 ## Read-only storage images
 
 Storage descriptor class does not imply an output. Omit output staging, masks, retile, comparisons,
