@@ -4371,6 +4371,19 @@ if(TARGET prosper_live_renderer AND TARGET prosper_core)
                                                         Vulkan::Vulkan)
   add_test(NAME live_target_format COMMAND test_live_target_format)
 
+  add_executable(test_guest_write_drain tests/shared/live/test_guest_write_drain.cpp)
+  target_include_directories(test_guest_write_drain PRIVATE frontends src tests)
+  target_link_libraries(test_guest_write_drain PRIVATE prosper_live_renderer prosper_core Vulkan::Vulkan)
+  add_test(NAME guest_write_drain COMMAND test_guest_write_drain)
+  add_test(NAME guest_write_drain_ordinary COMMAND test_guest_write_drain --ordinary)
+  add_test(NAME guest_write_drain_watch COMMAND test_guest_write_drain --ordinary)
+  set_tests_properties(guest_write_drain PROPERTIES
+    ENVIRONMENT "PROSPER_GPU_REPLAY_RTT_SEEDS=1;PROSPER_WRITE_DRAIN_CENSUS=1" TIMEOUT 60)
+  set_tests_properties(guest_write_drain_ordinary PROPERTIES
+    ENVIRONMENT "PROSPER_GPU_REPLAY_RTT_SEEDS=1;PROSPER_WRITE_DRAIN_CENSUS=1;PROSPER_NO_RTT_WRITE_BATCH=1" TIMEOUT 60)
+  set_tests_properties(guest_write_drain_watch PROPERTIES
+    ENVIRONMENT "PROSPER_GPU_REPLAY_RTT_SEEDS=1;PROSPER_WRITE_DRAIN_CENSUS=1;PROSPER_RTT_INVALIDATE_WATCH=0x10000" TIMEOUT 60)
+
   # GPU scanout handoff (#1270): the front-buffer image blits into a scanout slot byte-exactly, and the
   # producer/consumer slot handoff never tears or reuses an image in flight. Headless (no surface).
   add_executable(test_present_blit tests/shared/present/test_present_blit.cpp)

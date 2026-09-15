@@ -58,6 +58,14 @@ entry's capacity beyond its outgoing allocation or exact readable prefix. The sa
 allocation inheritance. F8 handoff time is nested in frontend texture time; copied/transferred
 bytes describe actual admitted snapshots and exclude the guest read and GPU uploads.
 
+Queued renderer invalidation keeps writes ordered, including their captured origins. Multi-write
+drains prepare CPU RTT footprints only for the lifetime of that drain; metadata association must
+precede preparation, and erased entries cannot be revisited. Single writes and RTT-watch diagnostics
+retain ordinary traversal. `PROSPER_NO_RTT_WRITE_BATCH` selects that control at startup.
+`PROSPER_WRITE_DRAIN_CENSUS=1` enables recurring per-thread work counts without changing execution
+policy. Logical live-entry visits and physical prepared-record visits are separate; counters are
+not timings, and overflow's wholesale invalidation is excluded from traversal totals.
+
 ## The boundary that is easy to get wrong
 
 The compute backend is where *guest memory* and *device memory* meet twice per dispatch — an upload

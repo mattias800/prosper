@@ -61,6 +61,7 @@
 #include <set>
 #include <utility>
 #include <tuple>
+#include <thread>
 #include <map>
 #include <unordered_map>
 #include <unordered_set>
@@ -193,6 +194,48 @@ struct PendingGuestGpuWrites {
     bool overflowed = false;
 };
 
+// Per-thread cumulative work counts. No guest reads, per-call clocks, shared counter locks or
+// execution-policy changes: this distinguishes empty queue drains from actual cache traversal.
+// The recurring report interval is not a collection cap. Enable with exactly "1" at startup.
+struct GuestWriteDrainCensus {
+    uint64_t calls = 0, empty = 0, overflows = 0, ranges = 0, max_ranges = 0, ignored = 0;
+    uint64_t ds_visits = 0, ds_invalidations = 0, color_visits = 0, color_overlaps = 0;
+    uint64_t rtt_visits = 0, rtt_erases = 0, rtt_dcc = 0, dcc_color_visits = 0;
+    uint64_t rtt_footprints = 0, prepared_drains = 0, prepared_record_visits = 0;
+
+    void report() const {
+        if (calls > 4 && calls % 4096) return;
+        static thread_local const size_t thread = std::hash<std::thread::id>{}(
+            std::this_thread::get_id());
+        const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        fprintf(stderr, "[guest-write-drain] thread=%zu steady_ns=%lld calls=%llu empty=%llu "
+                "overflows=%llu ranges=%llu max_ranges=%llu ignored=%llu ds_visits=%llu "
+                "ds_invalidations=%llu color_visits=%llu color_overlaps=%llu rtt_visits=%llu "
+                "rtt_erases=%llu rtt_dcc=%llu dcc_color_visits=%llu rtt_footprints=%llu "
+                "prepared_drains=%llu prepared_record_visits=%llu\n",
+                thread, (long long)ns, (unsigned long long)calls, (unsigned long long)empty,
+                (unsigned long long)overflows, (unsigned long long)ranges,
+                (unsigned long long)max_ranges, (unsigned long long)ignored,
+                (unsigned long long)ds_visits, (unsigned long long)ds_invalidations,
+                (unsigned long long)color_visits, (unsigned long long)color_overlaps,
+                (unsigned long long)rtt_visits, (unsigned long long)rtt_erases,
+                (unsigned long long)rtt_dcc, (unsigned long long)dcc_color_visits,
+                (unsigned long long)rtt_footprints, (unsigned long long)prepared_drains,
+                (unsigned long long)prepared_record_visits);
+    }
+};
+
+GuestWriteDrainCensus* guest_write_drain_census() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("PROSPER_WRITE_DRAIN_CENSUS");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    if (!enabled) return nullptr;
+    static thread_local GuestWriteDrainCensus census;
+    return &census;
+}
+
 PendingGuestGpuWrites& pending_guest_gpu_writes() {
     static PendingGuestGpuWrites pending;
     return pending;
@@ -296,8 +339,63 @@ const char* rtt_guest_write_effect_name(prosper::frontend::LiveRttGuestWriteEffe
     }
 }
 
-void invalidate_cpu_rtt_guest_write(RttCache& cache, uint64_t addr, uint64_t size) {
+// A footprint is valid only for this drain. Its operations can revoke authority or erase entries,
+// but cannot change their extent/metadata or insert new entries. Producers append to the queue;
+// they do not mutate the renderer cache. The existing serialized-renderer contract still applies.
+struct PreparedRttGuestWrite {
+    RttCache::iterator target;
+    uint64_t address, bytes, metadata_address, metadata_bytes;
+};
+
+uint64_t cpu_rtt_guest_write_bytes(const RttSurf& surface, GuestWriteDrainCensus* census) {
+    if (census) ++census->rtt_footprints;
+    const uint64_t bpp = prosper::test::backend_color_bytes_per_pixel(surface.format);
+    const uint64_t pixels = static_cast<uint64_t>(surface.w) * surface.h;
+    return pixels > UINT64_MAX / bpp ? UINT64_MAX : pixels * bpp;
+}
+
+RttCache::iterator invalidate_cpu_rtt_entry(
+    RttCache& cache, RttCache::iterator it,
+    prosper::frontend::LiveRttGuestWriteEffect effect, GuestWriteDrainCensus* census) {
+    if (effect == prosper::frontend::LiveRttGuestWriteEffect::color_plane) {
+        if (census) ++census->rtt_erases;
+        return cache.erase(it);
+    } else if (effect == prosper::frontend::LiveRttGuestWriteEffect::dcc_metadata) {
+        // Keep the surface identity/extent long enough to materialize a uniform DCC clear from
+        // the descriptor in the following graphics span, but never LOAD or sample stale pixels.
+        if (census) {
+            ++census->rtt_dcc;
+            census->dcc_color_visits += prosper::test::persistent_color_target_cache().size();
+        }
+        prosper::test::invalidate_persistent_color_target(it->first);
+        it->second.rgba.reset();
+        it->second.has_uniform_color = false;
+        it->second.gpu_valid = false;
+        it->second.dcc_metadata_dirty = true;
+        return ++it;
+    } else {
+        return ++it;
+    }
+}
+
+void invalidate_cpu_rtt_guest_write(RttCache& cache, uint64_t addr, uint64_t size,
+                                  GuestWriteDrainCensus* census = nullptr,
+                                  std::vector<PreparedRttGuestWrite>* prepared = nullptr) {
     if (!addr || !size) return;
+    if (prepared) {
+        if (census) census->prepared_record_visits += prepared->size();
+        for (auto& entry : *prepared) {
+            if (entry.target == cache.end()) continue;
+            const auto effect = prosper::frontend::live_rtt_guest_write_effect(
+                entry.address, entry.bytes, entry.metadata_address, entry.metadata_bytes, addr, size);
+            if (effect == prosper::frontend::LiveRttGuestWriteEffect::none) continue;
+            invalidate_cpu_rtt_entry(cache, entry.target, effect, census);
+            // Other unordered-map iterators survive erasure. This one must never be used again.
+            if (effect == prosper::frontend::LiveRttGuestWriteEffect::color_plane)
+                entry.target = cache.end();
+        }
+        return;
+    }
     auto& watch = rtt_invalidate_watch();
     if (!watch.addrs.empty()) {
         watch.writes_examined.fetch_add(1, std::memory_order_relaxed);
@@ -351,25 +449,10 @@ void invalidate_cpu_rtt_guest_write(RttCache& cache, uint64_t addr, uint64_t siz
     }
     for (auto it = cache.begin(); it != cache.end();) {
         const RttSurf& surface = it->second;
-        const uint64_t bpp = prosper::test::backend_color_bytes_per_pixel(surface.format);
-        const uint64_t pixels = static_cast<uint64_t>(surface.w) * surface.h;
-        const uint64_t bytes = pixels > UINT64_MAX / bpp ? UINT64_MAX : pixels * bpp;
         const auto effect = prosper::frontend::live_rtt_guest_write_effect(
-            it->first, bytes, surface.dcc_metadata_addr, surface.dcc_metadata_bytes, addr, size);
-        if (effect == prosper::frontend::LiveRttGuestWriteEffect::color_plane) {
-            it = cache.erase(it);
-        } else if (effect == prosper::frontend::LiveRttGuestWriteEffect::dcc_metadata) {
-            // Keep the surface identity/extent long enough to materialize a uniform DCC clear from
-            // the descriptor in the following graphics span, but never LOAD or sample stale pixels.
-            prosper::test::invalidate_persistent_color_target(it->first);
-            it->second.rgba.reset();
-            it->second.has_uniform_color = false;
-            it->second.gpu_valid = false;
-            it->second.dcc_metadata_dirty = true;
-            ++it;
-        } else {
-            ++it;
-        }
+            it->first, cpu_rtt_guest_write_bytes(surface, census),
+            surface.dcc_metadata_addr, surface.dcc_metadata_bytes, addr, size);
+        it = invalidate_cpu_rtt_entry(cache, it, effect, census);
     }
 }
 
@@ -407,6 +490,14 @@ void drain_guest_gpu_writes(RttCache& cache, bool invalidate_ds) {
         overflowed = pending.overflowed;
         pending.overflowed = false;
     }
+    auto* census = guest_write_drain_census();
+    if (census) {
+        ++census->calls;
+        census->empty += ranges.empty() && !overflowed;
+        census->overflows += overflowed;
+        census->ranges += ranges.size();
+        census->max_ranges = std::max<uint64_t>(census->max_ranges, ranges.size());
+    }
     if (overflowed) {
         for (auto& [key, target] : prosper::test::persistent_color_target_cache()) {
             (void)key;
@@ -419,19 +510,54 @@ void drain_guest_gpu_writes(RttCache& cache, bool invalidate_ds) {
                 image.stencil_valid = false;
             }
         cache.clear();
+        if (census) census->report();
         return;
     }
+    std::vector<PreparedRttGuestWrite> prepared;
+    static const bool prepare_enabled = !PROSPER_ENV_ON("PROSPER_NO_RTT_WRITE_BATCH");
+    // One useful write cannot amortize copying the footprints. Keep the original watch path so
+    // per-write watched-address hits, absences and origins retain exactly their previous meaning.
+    size_t useful_writes = 0;
+    if (prepare_enabled && ranges.size() >= 2 && !cache.empty() &&
+        rtt_invalidate_watch().addrs.empty()) {
+        for (const auto& write : ranges)
+            if (write.addr && write.size && ++useful_writes == 2) break;
+    }
+    if (useful_writes == 2) {
+        prepared.reserve(cache.size());
+        for (auto it = cache.begin(); it != cache.end(); ++it) {
+            const auto& surface = it->second;
+            prepared.push_back({it, it->first, cpu_rtt_guest_write_bytes(surface, census),
+                                surface.dcc_metadata_addr, surface.dcc_metadata_bytes});
+        }
+        if (census) ++census->prepared_drains;
+    }
     for (const auto& write : ranges) {
+        if (census) {
+            if (!write.addr || !write.size) ++census->ignored;
+            else {
+                if (invalidate_ds) census->ds_visits += prosper::test::persistent_ds_cache().size();
+                census->color_visits += prosper::test::persistent_color_target_cache().size();
+                census->rtt_visits += cache.size();
+            }
+        }
         // Restore the writer's own origin for the duration of this range's invalidation, so the
         // diagnostics inside report who actually wrote the bytes rather than the drain thread's
         // default. Cleared afterwards so a queued origin never leaks into an unrelated later write.
         prosper::gpu::set_guest_gpu_write_origin(write.origin);
-        if (invalidate_ds)
-            prosper::test::invalidate_persistent_ds_guest_write(write.addr, write.size);
-        prosper::test::invalidate_persistent_color_target_guest_write(write.addr, write.size);
-        invalidate_cpu_rtt_guest_write(cache, write.addr, write.size);
+        if (invalidate_ds) {
+            const auto invalidations =
+                prosper::test::invalidate_persistent_ds_guest_write(write.addr, write.size);
+            if (census) census->ds_invalidations += invalidations;
+        }
+        const auto color_overlaps =
+            prosper::test::invalidate_persistent_color_target_guest_write(write.addr, write.size);
+        if (census) census->color_overlaps += color_overlaps;
+        invalidate_cpu_rtt_guest_write(cache, write.addr, write.size, census,
+                                      prepared.empty() ? nullptr : &prepared);
         prosper::gpu::set_guest_gpu_write_origin(nullptr);
     }
+    if (census) census->report();
 }
 
 bool capture_color_format(VkFormat format, prosper::gpu::GpuCaptureColorFormat& captured) {
@@ -877,6 +1003,13 @@ bool submit_local_texture_decode_reusable(uint64_t entry_span, uint64_t current_
         entry_source_addr == current_source_addr &&
         entry_source_size == current_source_size &&
         journal_query == prosper::gpu::GuestGpuWriteQuery::Unchanged;
+}
+
+GuestWriteDrainWork guest_write_drain_work_for_thread() {
+    const auto* census = guest_write_drain_census();
+    if (!census) return {};
+    return {true, census->calls, census->rtt_footprints, census->prepared_drains,
+            census->rtt_erases, census->rtt_dcc};
 }
 
 TextureDecodeScopeStats texture_decode_scope_stats() { return g_texture_decode_scope; }
