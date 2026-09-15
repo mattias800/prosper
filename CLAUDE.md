@@ -793,6 +793,34 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
     than per second — is a better read than most screenshots, and it went unwritten because the PR
     happened to contain no image. Keep those short, and skip them when there is genuinely nothing a
     reader would enjoy; a blog nobody wants to read is worse than a thin one.
+  - **Batch related work into one PR. A PR per commit is a real, measured cost to everyone.**
+    Every PR runs the **entire** CI matrix — `.github/workflows/ci.yml` carries **no `paths` or
+    `paths-ignore` filter**, so a one-line documentation change costs the same runner time as a
+    recompiler change, and the queue it sits in is shared with every other lane. Measured over the
+    30 most recently merged PRs (2026-09-15): median **5** files, but **17% touched exactly one
+    file** and **33% touched two or fewer**. Four of those five single-file PRs came from one
+    session, and **three of them edited the same file within about an hour** — three full matrix
+    runs for what one PR would have carried.
+    So: when you have several changes in the same area, land them together. A follow-up correction
+    to a PR that has not merged yet belongs in that PR, not a new one. Three documentation edits to
+    one file are one PR. Groundwork plus the change it enables is one PR.
+    **Batch by coherence, never by count.** The failure this replaces is many tiny PRs; the failure
+    it must not create is a grab-bag. Do not pad a PR with unrelated subsystems to make it look
+    substantial — an unreviewable diff costs more than an extra CI run, and a reviewer who cannot
+    hold the change in their head is the most expensive outcome on this list. If you cannot write
+    one PR description that explains the whole diff as a single piece of work, it is two PRs.
+    **What stays small, deliberately:**
+    - **A revert**, and any fix whose whole value is being bisectable on its own. Squash-merge means
+      one PR becomes one commit on `main`, so batching genuinely does coarsen `git bisect` — accept
+      that for docs, tests, tooling and groundwork; decline it for a behaviour change to a hot path
+      that a later regression would need to isolate.
+    - **A relocation**, which this file already requires be kept separable from a behaviour change.
+    - **Anything blocking another lane**, where the delay costs more than the runner time.
+    - **A charter or instruction-file change**, which should be reviewable on its own terms.
+    This does not license sitting on finished work to accumulate bulk. Land what is ready when the
+    next related piece is not close behind; the rule is about not *splitting* coherent work, not
+    about delaying it.
+
   Run the strongest relevant local checks and wait for every applicable required CI check. Before
   merging, synchronize with the live target branch when needed, inspect the resulting diff, run `diff --check`,
   and address every known correctness concern.
@@ -1061,6 +1089,9 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
   - **One issue → one focused PR** where feasible; reference the issue in the PR body
     (`Fixes #NN`) so the merge closes it. When a fix lands that partially addresses an issue,
     comment on the issue with what remains instead of closing it.
+    **"Focused" is about coherence, not size** — see *Batch related work into one PR* under
+    **PR verification and merging**. One issue may close across several files and several
+    commits; what it must not do is arrive as a stream of one-file PRs.
   - Larger planned work (frontier steps, refactors) also gets an issue when it will span
     sessions — issues are the durable queue; `docs/` files explain *how*, issues track *what
     remains*. The umbrella issue for the history-review backlog is #72

@@ -5225,6 +5225,22 @@ One line per falsified hypothesis, the evidence that killed it, and where. **Rea
 a new one** — and note which entries are *solid* versus *void*, because a void result is not a
 falsification.
 
+- **The redundant 256 MiB upload can be avoided by copying from the first differing byte onward.**
+  Falsified by direct measurement, 2026-09-15 (#3696 / #3697). This title's hottest compute program
+  `0x2042f47600` re-uploads a 256 MiB read-only binding on all 108 of its dispatches in a 75 s route
+  (27.0 GiB), because the cache is keyed on the exact base address and the guest re-binds the same
+  window with its start drifting a few hundred bytes to a few tens of KB — 108 distinct addresses
+  inside a 7.0 MiB span, any two overlapping by ≥ 249 of their 256 MiB. The natural inference from
+  the timing is that the difference must lie *late* in the buffer, so a copy starting at the first
+  difference would be short. **The first difference is at byte 0 on every one of the 108.** Nothing
+  is saved from that end. What is saved is at the other one: the difference *ends* at a median
+  41.3 MiB, so 215 MiB of each copy was already correct, and copying the inclusive [first,last]
+  extent took the run's upload to 4.47 GiB and this title's compute time down 20%.
+  **The timing could not have told you which end**, and that is the transferable part:
+  `compute_buffers_equal` scans every byte by construction (eight workers, each memcmp-ing its whole
+  slice), so a full-length compare time says nothing about *where* a difference lies. An earlier note
+  in this work inferred "late" from "the scan ran to completion" and was simply wrong.
+
 - **GTA intro output 18 shortages come from leaving its SDL stream alive after guest
   `PortDestroy`.** Ruled out for the 2026-09-09 30-second `ea80d412` lifecycle trace (#3435).
   Guest port 77 and sink 18/open generation 1 each recorded 2,814 valid PCM publications/Puts.

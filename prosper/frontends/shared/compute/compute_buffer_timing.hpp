@@ -19,6 +19,15 @@ struct ComputeBufferTiming {
     uint64_t compared_bytes = 0;
     uint64_t uploaded_bytes = 0;
     uint64_t result_compared_bytes = 0;
+    // What the upload actually copied, which since #3696 is only the bytes that differ rather than
+    // the whole binding. `diff_span_bytes` is the inclusive first..last extent, so a wholesale
+    // change reads as the full length and a localized one reads as a small span -- the ratio against
+    // `bytes` is how much the differential upload saved. Only meaningful when `diff_observed`; the
+    // comparison that produces it is the same one `upload_compare_ms` already timed, so no separate
+    // cost appears here.
+    bool diff_observed = false;
+    uint64_t diff_first = 0;
+    uint64_t diff_span_bytes = 0;
     uint64_t guest_copied_bytes = 0;
     double setup_ms = 0;
     double validation_ms = 0;
