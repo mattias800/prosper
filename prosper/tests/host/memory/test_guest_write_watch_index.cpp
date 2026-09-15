@@ -235,7 +235,10 @@ int main() {
 
                 // Drops the alias at `base` and the whole AliasRange, leaving the second page's alias
                 // with no AliasRange covering it. The watch's own range is untouched, so it stays
-                // mapping_valid; the purge dirties it, and the rearm brings it back to clean.
+                // mapping_valid. The purge does NOT dirty this registration -- it bumps a generation
+                // only for pages that actually lost an alias, and this page loses none -- so the
+                // rearm below is confirming an already-clean watch rather than recovering it. Stated
+                // exactly because these comments are the record of why the case discriminates.
                 guest_write_watch_notify_direct_mapping_removed(base, page);
                 CHECK(watch.rearm(), "rearm after the partial unmap");
                 CHECK(watch.query() == GuestWriteWatchQuery::Unchanged, "clean again after rearm");
@@ -286,7 +289,11 @@ int main() {
                       "the wide registration rearms");
 
                 // A notification wider than kMaxQueryChunks (8 GiB) abandons the buckets for a full
-                // scan. It must reach the same registrations -- including this one.
+                // scan. This is a CONFIRMATION that the oversized path still answers correctly, not a
+                // guard on the branch: since the fallback routes through the same `consider`, the two
+                // branches are answer-identical by construction and deleting the fallback would leave
+                // this passing. No mutation arm exists for it, and none can -- the branch is a cost
+                // choice, and unifying the predicate is what removed its only way to diverge.
                 guest_write_watch_notify_gpu_write(reinterpret_cast<uint64_t>(wide_map),
                                                    9ull * 1024ull * 1024ull * 1024ull);
                 CHECK(wide.query() == GuestWriteWatchQuery::Dirty,

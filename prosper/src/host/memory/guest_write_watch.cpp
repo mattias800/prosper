@@ -2321,27 +2321,27 @@ void guest_write_watch_notify_host_write(uint64_t addr, uint64_t size) {
     const bool legacy_scan = watch_legacy_scan_enabled();
     for (uint64_t chunk_begin = begin & ~(kIndexChunk - 1); chunk_begin < end;
          chunk_begin += kIndexChunk) {
-        if (!legacy_scan &&
-            w.page_chunks.find(index_chunk_of(chunk_begin)) == w.page_chunks.end()) continue;
         const uint64_t from = chunk_begin > begin ? chunk_begin : begin;
         const uint64_t chunk_end = chunk_begin + kIndexChunk;
         // The old per-page walk could not wrap; this one can. A chunk at the very top of the address
-        // space overflows to 0, which would make `to` 0, scan nothing, and then restart the outer
-        // loop from chunk 0. Unreachable with canonical addresses, and one comparison to keep it so.
-        if (chunk_end < chunk_begin) {
-            for (uint64_t va = from; va < end; va += kPage) {
+        // space overflows to 0, so `chunk_begin += kIndexChunk` restarts the walk from chunk 0.
+        //
+        // The termination test has to come BEFORE the skip, not after it: the first version put it
+        // after, which left the commoner sub-case -- the top chunk holds no watched page, so the skip
+        // fires first -- still restarting. Unreachable either way with canonical addresses, but the
+        // ordering is what makes that a property of the code rather than of the address space.
+        const bool wrapped = chunk_end < chunk_begin;
+        const bool skip = !legacy_scan &&
+            w.page_chunks.find(index_chunk_of(chunk_begin)) == w.page_chunks.end();
+        if (!skip) {
+            const uint64_t chunk_limit = wrapped || chunk_end > end ? end : chunk_end;
+            for (uint64_t va = from; va < chunk_limit; va += kPage) {
                 ++scanned;
                 auto it = w.pages_by_addr.find(va);
                 if (it != w.pages_by_addr.end() && it->second) hit.push_back(it->second);
             }
-            break;
         }
-        const uint64_t to = chunk_end < end ? chunk_end : end;
-        for (uint64_t va = from; va < to; va += kPage) {
-            ++scanned;
-            auto it = w.pages_by_addr.find(va);
-            if (it != w.pages_by_addr.end() && it->second) hit.push_back(it->second);
-        }
+        if (wrapped) break;
     }
     stats().host_write_pages_scanned.fetch_add(scanned, std::memory_order_relaxed);
     if (hit.empty()) return;
