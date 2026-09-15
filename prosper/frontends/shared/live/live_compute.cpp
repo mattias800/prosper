@@ -11980,9 +11980,12 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 // [compute-image-writeback] line, so a census built from those rows cannot see it.
                 //
                 // The two do not overlap -- they PARTITION. `retain_gpu_result_baseline` needs
-                // compute_result_compare_group_count(), which refuses any byte count that is not a
-                // multiple of 16 (live_compute.hpp), so a small or unaligned result can never take
-                // the GPU comparison and takes the host snapshot and this CPU comparison instead.
+                // compute_result_compare_group_count(), which refuses a byte count for any of four
+                // reasons (live_compute.hpp) -- zero, not a multiple of 16, past the device's
+                // storage-buffer range, or more workgroups than the dispatch limit -- and also needs
+                // prepare_compare_pipeline() to have succeeded. A result refused for ANY of those
+                // never takes the GPU comparison, and takes the host snapshot and this CPU
+                // comparison instead. Alignment is the most common of them, not the only one.
                 // Instrumenting only the GPU half would therefore have left the census biased in the
                 // same direction and against the same population: the cheapest writebacks.
                 if (image_timing)

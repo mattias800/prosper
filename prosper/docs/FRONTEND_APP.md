@@ -420,8 +420,10 @@ leaf. A skipped row carries `skipped=1`, a `reason=` naming which skip fired, an
 `code=`/`hash=`/`binding=`/`addr=`/`bytes=` — no timings, because nothing was done and there was
 nothing to measure. Two reasons exist and they **partition** rather than overlap:
 `reason=gpu-identical` for a result the GPU comparison proved unchanged, and
-`reason=repeated-output` for one the CPU comparison did, which is the path a result takes when its
-byte count is not a multiple of 16 and so cannot use the GPU comparison at all.
+`reason=repeated-output` for one the CPU comparison did, which is the path a result takes whenever it
+cannot use the GPU comparison at all — for instance when its byte count is not a multiple of 16, but
+equally when it is zero, exceeds the device's storage-buffer range, or would need more workgroups
+than the dispatch limit allows, or when the compare pipeline could not be prepared.
 
 Both skips were invisible before #3690 — they returned before the row was written — so **any census
 taken from a log predating it undercounts writebacks and reports a skip fraction of zero.** The
