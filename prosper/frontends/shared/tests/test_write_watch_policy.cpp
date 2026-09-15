@@ -249,17 +249,16 @@ int main() {
         CHECK(kept_budget.try_consume(64u << 20));
         CHECK(!kept_budget.try_consume(64u << 20));  // bounded, which is what was asked for
 
-        // PROSPER_MAX_GPU_COMPARE_IMAGE_MB (#3276): negative or unit typo keeps default 2 MiB rather
-        // than wrapping to UINT64_MAX or zero.
-        using prosper::diag::env_u64_or_default_capped;
-        CHECK(env_u64_or_default_capped(
-            "PROSPER_MAX_GPU_COMPARE_IMAGE_MB", "-1", 2ull, 1024ull, "MiB") == 2ull);
-        CHECK(env_u64_or_default_capped(
-            "PROSPER_MAX_GPU_COMPARE_IMAGE_MB", "2mb", 2ull, 1024ull, "MiB") == 2ull);
-        CHECK(env_u64_or_default_capped(
-            "PROSPER_MAX_GPU_COMPARE_IMAGE_MB", "8", 2ull, 1024ull, "MiB") == 8ull);
-        CHECK(env_u64_or_default_capped(
-            "PROSPER_MAX_GPU_COMPARE_IMAGE_MB", "2048", 2ull, 1024ull, "MiB") == 1024ull);
+        // PROSPER_MAX_GPU_COMPARE_IMAGE_MB's arms MOVED to tests/diagnostics/test_env_numeric_sites.cpp
+        // and are deliberately not duplicated here.
+        //
+        // What stood here asserted that a unit typo "keeps default 2 MiB". That is no longer this
+        // knob's contract: the ceiling is derived from the memory topology (128 MiB on a unified
+        // device, 2 MiB on discrete), and a malformed value keeps the DERIVED ceiling. The arms went
+        // on passing after that change, because they called env_u64_or_default_capped directly with
+        // literal arguments rather than the site -- a green assertion about a contract that no longer
+        // existed, filed under the real variable name. That is worse than no coverage, so it is
+        // removed rather than repaired in place. See test_env_numeric_sites.cpp's row for this knob.
     }
 
     if (!failures) std::printf("write_watch_policy: OK\n");

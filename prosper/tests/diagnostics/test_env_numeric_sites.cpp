@@ -252,6 +252,33 @@ static uint64_t mib_cap_size_new(const char* n, const char* t) {
     return env_u64_or_default_capped(n, t, Default, SIZE_MAX / (1024ull * 1024ull), "MiB")
            * 1024ull * 1024ull;
 }
+// --- frontends/shared/live/live_compute.cpp : PROSPER_MAX_GPU_COMPARE_IMAGE_MB ------------------
+//
+// This site's fallback stopped being a constant: the GPU result-compare ceiling is now DERIVED from
+// whether the compare crosses a bus (2 MiB discrete, 128 MiB unified), because that is what decides
+// whether the comparison is cheap. The arm below is about the malformed case specifically. Under the
+// previous shape a typo fell back to the discrete constant, which on a unified-memory device silently
+// disabled the mechanism for every 4K target -- a 64x difference in ceiling, chosen by a typo. The
+// sentinel is what separates "malformed" from "the person wrote a number", and an explicit 0 must
+// still be honoured as "disable the comparison" rather than read as a parse failure.
+static constexpr uint64_t kDerivedCeilingStandIn = 128ull * 1024ull * 1024ull;
+static uint64_t gpu_compare_new(const char* n, const char* t) {
+    // The site uses a PRESENT FLAG, not a sentinel value: UINT64_MAX is a reachable input here
+    // (parse_u64_strict refuses only overflow, so `=18446744073709551615` parses exactly), and a
+    // sentinel a person can type is not a sentinel. Review finding on #3685.
+    if (!t || !*t) return kDerivedCeilingStandIn;
+    uint64_t probe = 0;
+    const bool well_formed = parse_u64_strict(t, &probe);
+    const uint64_t mib = env_u64_or_default(n, t, 0ull, "MiB");
+    if (!well_formed) return kDerivedCeilingStandIn;                   // malformed -> derived
+    const uint64_t capped = mib < SIZE_MAX / (1024ull * 1024ull)
+        ? mib : SIZE_MAX / (1024ull * 1024ull);
+    return capped * 1024ull * 1024ull;
+}
+static uint64_t gpu_compare_old(const char* t) {
+    return (t ? std::strtoull(t, nullptr, 10) : 2ull) * 1024ull * 1024ull;
+}
+
 template <uint64_t Default>
 static uint64_t hits_new(const char* n, const char* t) {
     return env_u64_or_default_capped(n, t, Default, UINT32_MAX, "unchanged validations");
@@ -489,7 +516,7 @@ static const Site kSites[] = {
      "PROSPER_COLD_STORAGE_SNAPSHOT_MIN_MB", mib_cap_size_new<16>, mib_cap_old<16>,
      "64 MB", 16ull * kMiB, "64", 64ull * kMiB},
     {"live_compute.cpp PROSPER_MAX_GPU_COMPARE_IMAGE_MB", "PROSPER_MAX_GPU_COMPARE_IMAGE_MB",
-     mib_cap_size_new<2>, mib_cap_old<2>, "32mb", 2ull * kMiB, "8", 8ull * kMiB},
+     gpu_compare_new, gpu_compare_old, "32mb", kDerivedCeilingStandIn, "8", 8ull * kMiB},
 
     // #3304. WAITCAP's malformed answers are the two ends of its own policy: `-1` used to REMOVE
     // the cap (UINT64_MAX passes the `cap &&` guard and no wait can exceed it) and `5ms` used to

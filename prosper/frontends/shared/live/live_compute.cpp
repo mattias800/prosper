@@ -1389,15 +1389,101 @@ size_t cold_storage_result_snapshot_defer_min_bytes() {
     return bytes;
 }
 
+size_t max_gpu_compare_image_bytes();
+
+// Whether the GPU result comparison has to cross a bus to reach the staging buffer it reads.
+// Written once by VulkanComputeContext::init(); 0 = not yet known, 1 = discrete, 2 = unified.
+// Not an enum class because it is read with relaxed ordering from the size query below. Relaxed is
+// adequate: every consumer sits downstream of the function-local static whose initializer calls
+// init(), and magic-static initialization supplies the release/acquire edge.
+std::atomic<uint32_t>& compare_memory_topology() {
+    static std::atomic<uint32_t> value{0};
+    return value;
+}
+
+// Called once from each device-init path, with the physical device that will run the comparison.
+// INTEGRATED_GPU is the signal, not a heap-size heuristic: it is what the Vulkan spec offers for
+// "this device shares memory with the host", it is what decides whether the comparison's reads cross
+// a bus, and it does not need a threshold anybody has to tune. VIRTUAL_GPU and CPU devices are
+// deliberately left on the conservative ceiling -- a software rasterizer's cost model is neither of
+// the two this is choosing between, and lavapipe is what CI runs.
+void record_compare_memory_topology(VkPhysicalDevice physical) {
+    if (!physical) return;
+    VkPhysicalDeviceProperties properties{};
+    vkGetPhysicalDeviceProperties(physical, &properties);
+    const bool unified = properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
+    compare_memory_topology().store(unified ? 2u : 1u, std::memory_order_relaxed);
+    if (std::getenv("PROSPER_COMPUTELOG") || std::getenv("PROSPER_GFXLOG"))
+        std::fprintf(stderr,
+                     "[compute] gpu result-compare ceiling: %zu MiB (%s device: %s)\n",
+                     max_gpu_compare_image_bytes() / (1024 * 1024),
+                     unified ? "unified-memory" : "discrete", properties.deviceName);
+}
+
+// The ceiling on the result size the GPU equality comparison will accept. Above it, the comparison
+// is skipped and every writeback publishes unconditionally.
+//
+// **This default is a property of the BUS, not of the workload**, which is why it is derived rather
+// than fixed. The 2 MiB ceiling came from GTA V on Windows/NVIDIA (#3275): there the comparison read
+// 33-66 MB of staging back across PCIe on every writeback and `gpu_compare_ms` reached 1,138.6 ms per
+// window, so bounding it was worth 38x. On a unified-memory device the same comparison reads memory
+// the GPU already owns, and the ceiling instead disables the mechanism for every 4K target -- which
+// is every compute target that matters.
+//
+// Measured on an integrated Radeon 8060S, one 5.02 s window each, PPSA03831 default launch:
+//
+//     ceiling   compute CPU   CPU writeback   GPU compare   process CPU
+//       2 MiB      2,545 ms        1,321 ms        0.1 ms      1.90 cores
+//     128 MiB      1,961 ms          512 ms      173.8 ms      1.66 cores
+//
+// i.e. it trades 174 ms on a GPU measured 9% busy for 809 ms of CPU writeback. Six interleaved 60 s
+// arms of THIS derivation against an explicit `=2` put distinct frames at 1233/1231/1304 against
+// 1493/1472/1489, with no overlap between the groups. (An earlier six-arm run comparing an explicit
+// `=128` against `=2` gave 1280/1257/1210 against 1448/1481/1526 -- the same conclusion from a
+// different binary, and NOT the run that justifies this code.)
+//
+// The discrete default is deliberately left at 2 MiB: this changes which devices take the shipped
+// GTA V/NVIDIA tuning, and does not retune it. An explicit PROSPER_MAX_GPU_COMPARE_IMAGE_MB still
+// overrides both.
 size_t max_gpu_compare_image_bytes() {
-    static const size_t bytes = [] {
+    // 128 MiB covers a 4K RGBA16F target (66 MB) with room for a larger one, and still refuses a
+    // result big enough that the comparison would cost more than the publication it avoids.
+    constexpr size_t kUnifiedBytes = 128ull * 1024 * 1024;
+    constexpr size_t kDiscreteBytes = 2ull * 1024 * 1024;
+    // Not latched: this function is reachable before the compute device exists, and latching then
+    // would pin every later call to the conservative value on exactly the devices the derivation is
+    // for. Two relaxed atomic loads and a compare.
+    const size_t derived = compare_memory_topology().load(std::memory_order_relaxed) == 2u
+        ? kUnifiedBytes : kDiscreteBytes;
+    // The ENV READ is latched; the derived default is not, so the latch cannot pin an early call's
+    // conservative answer. A malformed value keeps the DERIVED ceiling rather than the discrete one,
+    // which matters because the two now differ by 64x: falling back to the constant would let a typo
+    // quietly cost a unified-memory device the whole mechanism. An explicit 0 is honoured and
+    // disables the comparison -- a real setting, and not to be confused with a parse failure. #3267.
+    //
+    // A separate `present` flag rather than a sentinel value: UINT64_MAX is a REACHABLE input here
+    // (parse_u64_strict refuses only overflow, so `=18446744073709551615` parses exactly), and a
+    // sentinel it can reach is not a sentinel. Review finding on #3685.
+    struct Requested { bool present; uint64_t mib; };
+    static const Requested requested = [] {
         const char* value = std::getenv("PROSPER_MAX_GPU_COMPARE_IMAGE_MB");
-        const uint64_t mib = prosper::diag::env_u64_or_default_capped(
-            "PROSPER_MAX_GPU_COMPARE_IMAGE_MB", value, 2ull,
-            SIZE_MAX / (1024ull * 1024ull), "MiB");
-        return static_cast<size_t>(mib * (1024ull * 1024ull));
+        if (!value || !*value) return Requested{false, 0};
+        // The VALUE and the refusal message both come from the shared helper, so this site keeps the
+        // one grammar and the one operator-facing line every other numeric knob uses -- which
+        // `check_env_numeric_arms.py` also requires of any knob carrying an arm in
+        // test_env_numeric_sites.cpp. `parse_u64_strict` is asked separately, and only to tell a
+        // well-formed value from a refused one, because the helper reports that distinction to the
+        // operator but cannot return it.
+        uint64_t probe = 0;
+        const bool well_formed = prosper::diag::parse_u64_strict(value, &probe);
+        const uint64_t mib = prosper::diag::env_u64_or_default(
+            "PROSPER_MAX_GPU_COMPARE_IMAGE_MB", value, 0ull, "MiB",
+            "so the device-derived ceiling stands: 128 MiB on unified memory, 2 MiB on discrete");
+        return well_formed ? Requested{true, mib} : Requested{false, 0};
     }();
-    return bytes;
+    if (!requested.present) return derived;
+    const uint64_t capped = std::min<uint64_t>(requested.mib, SIZE_MAX / (1024ull * 1024ull));
+    return static_cast<size_t>(capped * (1024ull * 1024ull));
 }
 
 struct CachedComputePipeline {
@@ -3481,6 +3567,7 @@ struct VulkanComputeContext {
             storage_image_device_adopted = true;
             image_support = storage_image_features.storage_image_capable();
             mutable_storage_image_device() = {storage_image_features, true, true};
+            record_compare_memory_topology(physical);
             // Inherit the descriptor-indexing capability from the device being adopted. Its absence was
             // the blocking review finding on #2458: the flag stayed false on the shared path -- which is
             // the normal path whenever a renderer exists -- even though the adopted device had the
@@ -3685,6 +3772,7 @@ struct VulkanComputeContext {
         storage_image_device_adopted = false;
         image_support = storage_image_features.storage_image_capable();
         mutable_storage_image_device() = {storage_image_features, false, true};
+        record_compare_memory_topology(physical);
 #ifdef __APPLE__
         // Spec-mandated on MoltenVK: enable VK_KHR_portability_subset when advertised (always is).
         { uint32_t ne = 0; vkEnumerateDeviceExtensionProperties(physical, nullptr, &ne, nullptr);
