@@ -463,13 +463,29 @@ the same 60 s. Scaled by that ratio an unchanged skip path would still have prod
 rows against the 0 observed, so the deficit cannot manufacture the result; it is recorded because
 8,394 and 6,922 do not otherwise reconcile on the page.
 
-**How often `reason=repeated-output` fires is UNKNOWN, and a live log cannot currently tell you.**
-It fired zero times across three measured runs, but do not read that as "the path is dead" — see the
-`## Ruled out` section below for why one of those arms was void and the other two are unvalidated
-nulls. There is also an observability gap underneath them: `live_compute_image_result_snapshot_bytes()`
-is read only from tests and printed by nothing, so a live run cannot distinguish *"a host snapshot was
-armed and the output never repeated"* from *"no host snapshot was ever armed"*. Printing that counter
-under the existing `image_timing` gate would separate the two.
+**`reason=repeated-output` never fires on either route measured, and the reason is now known.** An
+earlier version of this paragraph said the frequency was unknowable from a live log because
+`live_compute_image_result_snapshot_bytes()` is read only from tests and "printed by nothing". The
+first half is true and the conclusion was wrong: that *accessor* is test-only, but the counter it
+wraps is printed directly, by `PROSPER_RENDER_TIMING=1`, as the `result_fallbacks=` field of the
+`[render-timing] compute_image_source` line. Grepping the accessor's name instead of the field is
+what hid it.
+
+Measured with that field, `result_fallbacks=0 0.0 MiB` on both routes — over 21,900 dispatches on
+*Sonic Frontiers* and 1,275 on *Grand Theft Auto V*. **No host result snapshot is ever taken**, so
+`cached_image_result_matches()` has nothing to match and `repeated_output` cannot become true. The
+answer is "never armed", not "armed and never repeated".
+
+That zero is trustworthy because the same `fprintf` carries its own control: `snapshots=` and
+`storage_results=` on the same line, under the same gate, read 4 / 16.0 MiB and 3 / 12.0 MiB on those
+runs. A dead print path would have zeroed those too.
+
+**The mechanism is the ceiling, working in the opposite direction to the one assumed.**
+`remember_cached_image_result` early-returns unless `!found->second.result_buffer`
+(`live_compute.cpp:3443`), and its call site additionally requires `!retain_gpu_result_baseline`
+(`:12335`). Raising the GPU-compare ceiling therefore makes *more* results retain a GPU baseline and
+so takes *fewer* host snapshots, not more — #3685 reduced this population toward zero rather than
+growing it (#3687).
 
 #### Reading the compute side at run scale
 
@@ -923,8 +939,11 @@ duplicate. Until then the app is fully functional via `--test-pattern` (and any 
   test-shaped, and half of it exists already:
   `live_compute_force_next_image_result_host_fallback_for_test()` (`live_compute.hpp:427`) is exactly
   that bypass, and `tests/gpu/execute/test_storage_readonly.cpp:189` already arms it and asserts the
-  snapshot grows; only dispatching the same producer twice is missing. The observed zero is therefore
-  a property of the **instrument**, not of the code, and is not quotable as "this never fires"
+  snapshot grows; only dispatching the same producer twice is missing. The observed zero was therefore
+  a property of the **instrument** rather than of the code — but the question has since been settled
+  by a different instrument that does not share the flaw: `PROSPER_RENDER_TIMING=1` reports
+  `result_fallbacks=0 0.0 MiB` on both routes, so no host snapshot is ever taken and the path cannot
+  fire. The ceiling-0 arm remains ruled out as a way to *exercise* it
   (#3692).
 
 ## Risks & open questions
