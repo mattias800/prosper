@@ -10,6 +10,7 @@
 #include <optional>
 #include <string>
 #include <vector>
+#include "gpu/pm4/pending_write_snapshot.hpp"
 
 namespace prosper::perf {
 
@@ -32,6 +33,7 @@ struct ProcessSample {
     // that handoff, so its production counter is unavailable rather than zero.
     std::optional<uint64_t> rendered_frames;
     uint64_t host_presented_frames = 0;
+    std::optional<gpu::PendingWriteSnapshot> pending_writes;
 };
 
 // One live-renderer callback. These are the existing PROSPER_RENDER_TIMING intervals, recorded in a
@@ -216,12 +218,102 @@ struct ComputeTimingRecord {
     double cleanup_ms = 0;
 };
 
+enum class PresentHandoffEvent {
+    Unknown,
+    ConsumerPreviousFence,
+    SwapchainAcquire,
+    ConsumerQueueLock,
+    ConsumerSubmit,
+    SwapchainPresent,
+    GpuStale,
+    GpuAttemptResult,
+    GpuShown,
+    CpuAcquired,
+    CpuStale,
+    CpuAttemptResult,
+    CpuShown,
+    RendererGate,
+    SameFlipSuppressed,
+    CpuFallbackNeeded,
+    PublishLock,
+    PublishInitFailed,
+    PublishFormatDeclined,
+    PublishNoSlot,
+    PublishImageFailed,
+    PublishBeginFailed,
+    PublishEndFailed,
+    PublishShutdownDeclined,
+    PublishQueueLock,
+    PublishSubmit,
+    PublishFence,
+    Superseded,
+    Published,
+    AcquireEmpty,
+    Acquired,
+    Released,
+};
+
+inline const char* present_handoff_event_name(PresentHandoffEvent event) {
+    switch (event) {
+    case PresentHandoffEvent::ConsumerPreviousFence: return "consumer-previous-fence";
+    case PresentHandoffEvent::SwapchainAcquire: return "swapchain-acquire";
+    case PresentHandoffEvent::ConsumerQueueLock: return "consumer-queue-lock";
+    case PresentHandoffEvent::ConsumerSubmit: return "consumer-submit";
+    case PresentHandoffEvent::SwapchainPresent: return "swapchain-present";
+    case PresentHandoffEvent::GpuStale: return "gpu-stale";
+    case PresentHandoffEvent::GpuAttemptResult: return "gpu-attempt-result";
+    case PresentHandoffEvent::GpuShown: return "gpu-shown";
+    case PresentHandoffEvent::CpuAcquired: return "cpu-acquired";
+    case PresentHandoffEvent::CpuStale: return "cpu-stale";
+    case PresentHandoffEvent::CpuAttemptResult: return "cpu-attempt-result";
+    case PresentHandoffEvent::CpuShown: return "cpu-shown";
+    case PresentHandoffEvent::RendererGate: return "renderer-gate";
+    case PresentHandoffEvent::SameFlipSuppressed: return "same-flip-suppressed";
+    case PresentHandoffEvent::CpuFallbackNeeded: return "cpu-fallback-needed";
+    case PresentHandoffEvent::PublishLock: return "publish-lock";
+    case PresentHandoffEvent::PublishInitFailed: return "publish-init-failed";
+    case PresentHandoffEvent::PublishFormatDeclined: return "publish-format-declined";
+    case PresentHandoffEvent::PublishNoSlot: return "publish-no-slot";
+    case PresentHandoffEvent::PublishImageFailed: return "publish-image-failed";
+    case PresentHandoffEvent::PublishBeginFailed: return "publish-begin-failed";
+    case PresentHandoffEvent::PublishEndFailed: return "publish-end-failed";
+    case PresentHandoffEvent::PublishShutdownDeclined: return "publish-shutdown-declined";
+    case PresentHandoffEvent::PublishQueueLock: return "publish-queue-lock";
+    case PresentHandoffEvent::PublishSubmit: return "publish-submit";
+    case PresentHandoffEvent::PublishFence: return "publish-fence";
+    case PresentHandoffEvent::Superseded: return "superseded";
+    case PresentHandoffEvent::Published: return "published";
+    case PresentHandoffEvent::AcquireEmpty: return "acquire-empty";
+    case PresentHandoffEvent::Acquired: return "acquired";
+    case PresentHandoffEvent::Released: return "released";
+    default: return "unknown";
+    }
+}
+
+// Publication/consumer observations, NOT completed rendering or pixel novelty. IDs identify
+// a particular handoff; source_seq retains the caller's flip clock. Window boundaries may
+// split a handoff, so a missing event is not automatically a dropped frame.
+struct PresentHandoffRecord {
+    uint64_t monotonic_ns = 0;
+    uint64_t begin_ns = 0;
+    uint64_t publication_id = 0;
+    uint64_t source_seq = 0;
+    uint64_t other_seq = 0;
+    uint64_t address = 0;
+    int32_t slot = -1;
+    int32_t result = 0;
+    bool cpu_source = false; // CPU frame_seq and GPU publication IDs have independent namespaces
+    PresentHandoffEvent event = PresentHandoffEvent::Unknown;
+};
+
 struct CaptureConfig {
     uint64_t pre_window_ns = 5'000'000'000ull;
     uint64_t post_window_ns = 5'000'000'000ull;
     uint64_t sample_interval_ns = 250'000'000ull;
     size_t max_renderer_records = 4096;
     size_t max_compute_records = 4096;
+    bool present_handoffs = false;
+    size_t max_present_records = 8192;
 };
 
 struct CaptureArmResult {
@@ -242,6 +334,8 @@ struct CaptureOutcome {
     size_t compute_records = 0;
     size_t renderer_dropped = 0;
     size_t compute_dropped = 0;
+    size_t present_records = 0;
+    size_t present_dropped = 0;
 };
 
 // Thread-safe capture state. The app thread owns process samples and finalization; renderer/compute
@@ -264,6 +358,10 @@ public:
     }
     void record_renderer(RendererTimingRecord record);
     void record_compute(ComputeTimingRecord record);
+    bool present_handoff_timing_active() const {
+        return config_.present_handoffs && detailed_timing_active();
+    }
+    void record_present(PresentHandoffRecord record);
     bool take_outcome(CaptureOutcome& outcome);
     void cancel();
 

@@ -29,6 +29,7 @@
 #include "gpu/recompiler/rdna2_to_spirv.hpp"     // recompile_compute
 #include "gpu/capture/writer_provenance.hpp"
 #include "host/memory/guest_memory_map.hpp"
+#include "host/memory/guest_memory_query.hpp"
 #include "host/memory/guest_write_watch.hpp"
 #include <chrono>
 #include <cerrno>
@@ -2673,15 +2674,13 @@ void cache_guest_readable_range(uint64_t begin, uint64_t end,
 // notify_guest_mapping_removed + notify_guest_mapping_added(..., committed && (prot & 0x1)), and
 // both advance the generation.
 //
-// KNOWN EXCEPTION, deliberately not fixed here (#2393): the PROSPER_LWATCH fault handler in
-// exec_image_linux.cpp mprotects a live guest page down to PROT_READ and back without notifying,
-// so while that watch is armed this cache can answer true for a page that is momentarily
-// read-only. It is diagnostic-only and off by default, and the fix is NOT to call
-// notify_guest_mapping_* from a signal handler -- those take a mutex and are not
-// async-signal-safe. Recorded rather than papered over; see the issue for the options.
-// Found in review by Wren, who went looking for this after the two attacks I had asked for.
+// Watchpoint protection changes must obey the same generation contract (#2393/#2601).
+// Their signal-safe notification is notify_guest_page_protection_changed(), not the
+// mutex-taking mapping-registry operations. Never retain positives across those changes.
 struct GuestWritableCacheState {
     bool enabled = getenv("PROSPER_NO_GUEST_WRITE_CACHE") == nullptr;   // bisection lever
+    bool query_enabled = getenv("PROSPER_NO_GUEST_WRITABLE_QUERY") == nullptr;
+    bool local_text_cache = getenv("PROSPER_GUEST_WRITABLE_LOCAL_TEXT_CACHE") != nullptr;
     host::GuestReadableRangeCache ranges;    // the range-set container, not the readable DATA
     uint64_t calls = 0, hits = 0, os_probes = 0;
 };
@@ -2859,10 +2858,26 @@ bool guest_writable(uint64_t a, uint32_t n) {
     cache_guest_writable_range(span_lo, span_hi);   // #2387
     return true;
 #else
-    // #2387: this is the arm the cache above exists for. Windows and macOS answer with a syscall
-    // per region; here on Linux the answer is /proc/self/maps. Parsing all writable ranges in one
-    // fast pass and assigning them to the range cache populates the cache for the entire generation,
-    // converting hundreds of stdio opens into nanosecond cache hits.
+    // Preserve generation-before-probe ordering. Exact covering queries avoid formatting
+    // every unrelated VMA when write-watch activity frequently invalidates this cache.
+    // Unsupported headers/kernels or ioctl access retain the text enumeration below.
+    const uint64_t query_generation = host::guest_mapping_generation();
+    const auto query = g_guest_writable_cache.query_enabled
+        ? host::query_guest_writable_range(a, end) : host::GuestWritableQueryResult{};
+    if (query.status != host::GuestWritableQueryStatus::Unavailable) {
+        ++g_guest_writable_cache.os_probes;
+        if (query.status == host::GuestWritableQueryStatus::Writable) {
+            if (g_guest_writable_cache.enabled) {
+                g_guest_writable_cache.ranges.sync_generation(query_generation);
+                cache_guest_writable_range(std::max(query.begin, uint64_t{0x1000}), query.end);
+            }
+            return true;
+        }
+        return false;
+    }
+    // Compatibility path: enumerate all writable ranges in the text maps table and
+    // retain them only when the original whole request succeeds. Unlike the binary
+    // path, this warms unrelated VMAs too; their later queries may hit until invalidation.
     const uint64_t gen = host::guest_mapping_generation();
     ++g_guest_writable_cache.os_probes;
     int fd = open("/proc/self/maps", O_RDONLY | O_CLOEXEC);
@@ -2899,7 +2914,8 @@ bool guest_writable(uint64_t a, uint32_t n) {
                         if (p[0] && p[1] == 'w' && finish > begin) {
                             begin = std::max(begin, (uint64_t)0x1000);
                             if (finish > begin) {
-                                if (!writable_ranges.empty() && writable_ranges.back().end == begin) {
+                                if (!g_guest_writable_cache.local_text_cache &&
+                                    !writable_ranges.empty() && writable_ranges.back().end == begin) {
                                     writable_ranges.back().end = finish;
                                 } else {
                                     writable_ranges.push_back({begin, finish});
@@ -2917,6 +2933,31 @@ bool guest_writable(uint64_t a, uint32_t n) {
         }
     }
     close(fd);
+
+    // Diagnostic third arm: retain text enumeration's work but publish exactly the
+    // first/last VMAs a covering query would visit. Preserve individual VMA boundaries
+    // above: the ordinary merged range could include adjacent VMAs never queried.
+    // This separates query cost from broad cache warming without caching negatives.
+    if (g_guest_writable_cache.local_text_cache) {
+        const auto local = host::detail::query_contiguous_writable_range(a, end,
+            [&](uint64_t cursor) -> host::GuestWritableQueryResult {
+                auto it = std::upper_bound(writable_ranges.begin(), writable_ranges.end(), cursor,
+                    [](uint64_t value, const host::GuestReadableRange& range) {
+                        return value < range.begin;
+                    });
+                if (it == writable_ranges.begin())
+                    return {host::GuestWritableQueryStatus::NotWritable};
+                --it;
+                if (cursor >= it->end) return {host::GuestWritableQueryStatus::NotWritable};
+                return {host::GuestWritableQueryStatus::Writable, it->begin, it->end};
+            });
+        const bool found = local.status == host::GuestWritableQueryStatus::Writable;
+        if (found && g_guest_writable_cache.enabled) {
+            g_guest_writable_cache.ranges.sync_generation(gen);
+            cache_guest_writable_range(local.begin, local.end);
+        }
+        return found;
+    }
 
     bool found = false;
     for (const auto& r : writable_ranges) {

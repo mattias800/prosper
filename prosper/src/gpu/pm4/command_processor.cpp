@@ -1,5 +1,6 @@
 // command_processor.cpp — see command_processor.hpp.
 #include "gpu/pm4/command_processor.hpp"
+#include "gpu/pm4/pending_write_snapshot.hpp"
 #include "hle/memory/guest_memory_topology.hpp"
 #include "hle/kernel/hle_kernel_time.hpp"
 #include "gpu/diagnostics/diag_ratelimit.hpp"   // #1761: single-sourced ordinal + sparse-tail rule for capped logs
@@ -2912,9 +2913,9 @@ static void honor_write_data(const Pm4Command& c) {
 // and our later label writes stomp MallocBinned3 free-block headers (live-attributed: the GPU
 // write-ring shows our RELEASE_MEM value-1 writes at exactly the corrupted qword).
 //
-// Model: honor_* enqueue the write; a FIFO worker applies them in submission order after a 1 ms
-// modeled pipe-drain latency (same constant as the EOP-event worker). Synchronous drain points
-// keep every intra-model data dependency exact:
+// Model: honor_* enqueue writes; modern callers retain them until the actual import-return
+// checkpoint, then the FIFO worker applies them without an added latency. Older callers retain
+// the legacy 1 ms worker delay. Existing synchronous drain points preserve their dependencies:
 //   - WaitRegMem fold checks drain first (a prior submit's fence must be visible to its consumer),
 //   - execute_and_present's callers drain first (the renderer reads WRITE_DATA-uploaded memory),
 //   - the EOP-event worker drains before posting (an event must never overtake its data writes).
@@ -2977,7 +2978,7 @@ struct PendWrite {
     std::chrono::steady_clock::time_point queued{};   // #1945: enqueue instant (see pend_age_note)
 };
 // #1945: how long a completion write actually sat in this queue before it landed in guest memory.
-// The model promises "post-submit plus ~1 ms of modeled pipe drain"; the WAF family this queue was
+// The original model promised "post-submit plus ~1 ms of modeled pipe drain"; the WAF family this queue was
 // built to prevent only happens when a write lands after the guest has recycled its 0x20-byte
 // label, so the queue's real residency IS the exposure window and nothing measured it. Reports the
 // running max and a loud line for any write older than PROSPER_PEND_AGE_WARN_MS (default 20).
@@ -3016,7 +3017,14 @@ struct PendQueue {
     bool worker_started = false;
     int  inflight = 0;    // items popped but whose write hasn't landed yet (see drain)
     int  active_submits = 0; // fence writes stay private until the import return checkpoint
-    std::chrono::steady_clock::time_point release_after{}; // modeled GPU latency after that checkpoint
+    uint64_t scope_begins = 0, scope_ends = 0, deadline_resets = 0; // paired checkpoints, under mx
+    uint64_t admission_waiters = 0; // currently blocked submit callers
+    uint64_t admission_wait_count = 0;
+    uint64_t admission_wait_ns = 0;
+    uint64_t admission_wait_max_ns = 0;
+    uint64_t admission_retired_wait_count = 0;
+    uint64_t admission_retired_wait_ns = 0;
+    std::chrono::steady_clock::time_point release_after{}; // earliest release: actual return checkpoint
 };
 PendQueue& pend_q() { static PendQueue* p = new PendQueue; return *p; }
 // A return hook is attached to the import NID, so it also runs when that handler rejects its
@@ -3053,8 +3061,8 @@ void pend_drain_locked(PendQueue& p, std::unique_lock<std::mutex>& lk) {
         p.q.pop_front();
         p.inflight++;
         lk.unlock();                     // the write itself never needs the queue lock
-        // Guard the target's mappedness (#449/#483): the pend queue applies completion writes ~1 ms
-        // after enqueue (the pipe-drain window), during which the guest may have freed+decommitted
+        // Guard the target's mappedness (#449/#483): the pend queue applies completion writes
+        // asynchronously after enqueue, during which the guest may have freed+decommitted
         // the label page (MallocBinned3, #312). apply_deferred_effect probes guest_readable before
         // the raw memcpy — without it an unmapped label SIGSEGVs here, exactly the case the deferred-
         // stream path already survives (this pend path releases asynchronously too, so it needs it).
@@ -3066,10 +3074,11 @@ void pend_drain_locked(PendQueue& p, std::unique_lock<std::mutex>& lk) {
     }
 }
 // The HLE import trampoline owns scope_end(), so active_submits cannot reach zero until the submit
-// handler has returned and the trampoline is at its guest-return checkpoint. The deadline below is
-// only modeled GPU latency after that real boundary; correctness no longer depends on a timer being
-// long enough to cover guest-side bookkeeping. A new submit may begin during the latency window; in
-// that case wait for its later checkpoint/deadline instead.
+// handler has returned and the trampoline is at its guest-return checkpoint. The synchronous
+// execution callbacks have finished by that boundary. An artificial latency after it neither proves
+// GPU readiness nor protects later guest bookkeeping; it adds completion latency and can
+// serialize the next admission.
+// Keep the real active-scope boundary and in-flight/FIFO guards, without inventing a GPU delay.
 void pend_wait_post_submit(PendQueue& p, std::unique_lock<std::mutex>& lk) {
     for (;;) {
         p.cv.wait(lk, [&] { return p.active_submits == 0; });
@@ -3111,6 +3120,32 @@ void pend_enqueue(const Pm4Command& c) {
 }
 } // namespace
 
+std::optional<PendingWriteSnapshot> try_pending_write_snapshot() {
+    PendQueue& p = pend_q();
+    std::unique_lock<std::mutex> lk(p.mx, std::try_to_lock);
+    if (!lk.owns_lock()) return std::nullopt;
+    const auto now = std::chrono::steady_clock::now();
+    PendingWriteSnapshot result;
+    result.queued = p.q.size();
+    result.active_submits = p.active_submits;
+    result.inflight_batches = p.inflight;
+    if (!p.q.empty())
+        result.front_item_age_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            now - p.q.front().queued).count();
+    result.release_delay_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        p.release_after - now).count();
+    result.scope_begins = p.scope_begins;
+    result.scope_ends = p.scope_ends;
+    result.deadline_resets = p.deadline_resets;
+    result.admission_waiters = p.admission_waiters;
+    result.admission_wait_count = p.admission_wait_count;
+    result.admission_wait_ns = p.admission_wait_ns;
+    result.admission_wait_max_ns = p.admission_wait_max_ns;
+    result.admission_retired_wait_count = p.admission_retired_wait_count;
+    result.admission_retired_wait_ns = p.admission_retired_wait_ns;
+    return result;
+}
+
 // Synchronous drain: apply every pending completion write NOW, in order. Called from the fold's
 // WaitRegMem check, before the renderer executes, and by the EOP-event worker before it posts.
 extern "C" void prosper_gpu_drain_completion_writes() {
@@ -3128,9 +3163,35 @@ extern "C" void prosper_gpu_submit_scope_begin() {
     if (!post_submit_visibility_enabled()) return;
     PendQueue& p = pend_q();
     std::unique_lock<std::mutex> lk(p.mx);
-    p.cv.wait(lk, [&] { return p.inflight == 0; });
+    // At the zero-active boundary, give the worker its existing post-return drain before
+    // accepting more work. Otherwise fast callers can keep the worker out of the zero-active
+    // boundary, retaining completed labels and starving progress (#3674). The former 1 ms grace
+    // deadline made this starvation worse by resetting after every return.
+    // Nested or concurrent active scopes must still be able to proceed: waiting for their own
+    // private completion queue here would deadlock. No active-submit write is exposed early.
+    const auto can_enter = [&] {
+        return p.inflight == 0 &&
+            (t_submit_scope_depth != 0 || p.active_submits != 0 || p.q.empty());
+    };
+    if (!can_enter()) {
+        const bool retired = t_submit_scope_depth == 0 && p.active_submits == 0 && !p.q.empty();
+        const auto start = std::chrono::steady_clock::now();
+        p.admission_waiters++;
+        p.cv.wait(lk, can_enter);
+        p.admission_waiters--;
+        const uint64_t ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - start).count());
+        p.admission_wait_count++;
+        p.admission_wait_ns += ns;
+        p.admission_wait_max_ns = std::max(p.admission_wait_max_ns, ns);
+        if (retired) {
+            p.admission_retired_wait_count++;
+            p.admission_retired_wait_ns += ns;
+        }
+    }
     t_submit_scope_depth++;
     p.active_submits++;
+    p.scope_begins++;
     p.cv.notify_all();
 }
 
@@ -3144,8 +3205,11 @@ extern "C" void prosper_gpu_submit_scope_end() {
         std::lock_guard<std::mutex> lk(p.mx);
         if (p.active_submits == 0) return; // defensive: preserve both counters if the invariant broke
         t_submit_scope_depth--;
-        if (--p.active_submits == 0)
-            p.release_after = std::chrono::steady_clock::now() + std::chrono::milliseconds(1);
+        p.scope_ends++;
+        if (--p.active_submits == 0) {
+            p.deadline_resets++;
+            p.release_after = std::chrono::steady_clock::now();
+        }
     }
     p.cv.notify_all();
 }
@@ -3159,8 +3223,8 @@ extern "C" bool prosper_gpu_submit_scope_active() {
 
 // The renderer runs synchronously inside the submit import and needs resource initialization before
 // it samples guest memory. A full drain here is unsafe: it also exposes ReleaseMem and EVENT_WRITE
-// completion fences before the submitter has returned and finished its guest-side bookkeeping,
-// allowing another thread to recycle their 0x20-byte labels (#312). Extract every queued
+// completion fences before the submit handler and its cleanup have finished, allowing another
+// thread to recycle their 0x20-byte labels (#312). Extract every queued
 // WriteData/DmaData resource update except one whose destination overlaps a queued completion
 // fence/event. Selected resource writes may pass unrelated completion records, but never a write to
 // the same label. This boundary retains small descriptor/constant uploads used by older titles;

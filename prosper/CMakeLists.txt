@@ -125,7 +125,7 @@ endif()
 # SDL app and the live graphics/compute backends. It deliberately has no SDL/Vulkan dependency, so
 # its ring, bounds, and atomic file contract run in ordinary headless CI.
 add_library(prosper_performance_capture STATIC frontends/shared/perf/performance_capture.cpp)
-target_include_directories(prosper_performance_capture PUBLIC frontends)
+target_include_directories(prosper_performance_capture PUBLIC frontends src)
 target_link_libraries(prosper_performance_capture PRIVATE prosper_build_revision)
 # Windows: the process memory sample (working set + commit charge) calls GetProcessMemoryInfo, which
 # lives in the PSAPI import library rather than the kernel32 set every target links by default.
@@ -2219,6 +2219,10 @@ endif()
   target_link_libraries(test_guest_memory_map PRIVATE prosper_core)
   add_test(NAME guest_memory_map COMMAND test_guest_memory_map)
 
+  add_executable(test_guest_memory_query tests/host/memory/test_guest_memory_query.cpp)
+  target_link_libraries(test_guest_memory_query PRIVATE prosper_core)
+  add_test(NAME guest_memory_query COMMAND test_guest_memory_query)
+
   # #3142: the chunked guest-memory content scan. The straddling case is the one that earns the
   # test -- a scanner that drops its overlap still returns a plausible hit list, so the blindness
   # is invisible in a live run and turns a "not found" into a wrong answer.
@@ -2252,6 +2256,26 @@ endif()
   # sources are handed to the wiring check, which confirms no protection change in the handler
   # bypasses the notifying wrapper and that the notifier is still lock-free.
   if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(test_guest_writable_query_adapter
+      tests/host/memory/test_guest_writable_query_adapter.cpp)
+    target_link_libraries(test_guest_writable_query_adapter PRIVATE prosper_core)
+    target_link_options(test_guest_writable_query_adapter PRIVATE "-Wl,--wrap=ioctl" "-Wl,--wrap=open")
+    add_test(NAME guest_writable_query_adapter COMMAND ${CMAKE_COMMAND} -E env
+      --unset=PROSPER_NO_GUEST_WRITE_CACHE --unset=PROSPER_NO_GUEST_WRITABLE_QUERY
+      --unset=PROSPER_GUEST_WRITABLE_LOCAL_TEXT_CACHE $<TARGET_FILE:test_guest_writable_query_adapter>)
+    foreach(scope_arm native text text-local)
+      set(scope_env --unset=PROSPER_NO_GUEST_WRITE_CACHE
+        --unset=PROSPER_NO_GUEST_WRITABLE_QUERY --unset=PROSPER_GUEST_WRITABLE_LOCAL_TEXT_CACHE)
+      if(NOT scope_arm STREQUAL "native")
+        list(APPEND scope_env PROSPER_NO_GUEST_WRITABLE_QUERY=1)
+      endif()
+      if(scope_arm STREQUAL "text-local")
+        list(APPEND scope_env PROSPER_GUEST_WRITABLE_LOCAL_TEXT_CACHE=1)
+      endif()
+      add_test(NAME guest_writable_query_scope_${scope_arm} COMMAND ${CMAKE_COMMAND} -E env
+        ${scope_env} $<TARGET_FILE:test_guest_writable_query_adapter> scope ${scope_arm})
+    endforeach()
+
     add_executable(test_watch_mapping_generation tests/host/memory/test_watch_mapping_generation.cpp)
     target_link_libraries(test_watch_mapping_generation PRIVATE prosper_core)
     target_compile_definitions(test_watch_mapping_generation PRIVATE
@@ -4355,6 +4379,9 @@ if(TARGET prosper_live_renderer AND TARGET prosper_core)
   target_include_directories(test_present_blit PRIVATE src tests)
   target_link_libraries(test_present_blit PRIVATE prosper_live_renderer prosper_core Vulkan::Vulkan)
   add_test(NAME present_blit COMMAND test_present_blit)
+  add_test(NAME present_blit_trace COMMAND test_present_blit)
+  set_tests_properties(present_blit_trace PROPERTIES
+    ENVIRONMENT "PROSPER_PRESENT_HANDOFF_TRACE=1")
 endif()
 
 # #3372: gpu_replay's two graphics shader dumps produce OPPOSITE things -- --dump-shader writes

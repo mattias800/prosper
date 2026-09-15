@@ -7,6 +7,7 @@
 #include <climits>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <filesystem>
@@ -163,8 +164,10 @@ struct InteractivePerformanceCapture::PendingCapture {
     std::vector<ProcessSample> post_samples;
     std::vector<RendererTimingRecord> renderer;
     std::vector<ComputeTimingRecord> compute;
+    std::vector<PresentHandoffRecord> present;
     size_t renderer_dropped = 0;
     size_t compute_dropped = 0;
+    size_t present_dropped = 0;
 };
 
 InteractivePerformanceCapture::InteractivePerformanceCapture(CaptureConfig config)
@@ -254,6 +257,7 @@ CaptureArmResult InteractivePerformanceCapture::arm(
     pending_->revision = revision;
     pending_->wall_clock = iso_local_time(wall_clock);
     pending_->trigger_ns = monotonic_ns;
+    if (config_.present_handoffs) pending_->present.reserve(config_.max_present_records);
     const uint64_t cutoff = monotonic_ns > config_.pre_window_ns
         ? monotonic_ns - config_.pre_window_ns : 0;
     for (const ProcessSample& sample : ring_) {
@@ -289,6 +293,18 @@ void InteractivePerformanceCapture::record_compute(ComputeTimingRecord record) {
         ++pending_->compute_dropped;
 }
 
+void InteractivePerformanceCapture::record_present(PresentHandoffRecord record) {
+    if (!present_handoff_timing_active()) return;
+    if (!record.monotonic_ns) record.monotonic_ns = monotonic_now_ns();
+    std::lock_guard lock(mutex_);
+    if (!pending_ || record.monotonic_ns < pending_->trigger_ns ||
+        record.monotonic_ns - pending_->trigger_ns > config_.post_window_ns) return;
+    if (pending_->present.size() < config_.max_present_records)
+        pending_->present.push_back(std::move(record));
+    else
+        ++pending_->present_dropped;
+}
+
 std::unique_ptr<InteractivePerformanceCapture::PendingCapture>
 InteractivePerformanceCapture::finish_if_due_locked(uint64_t monotonic_ns) {
     if (!pending_ || monotonic_ns < pending_->trigger_ns ||
@@ -307,6 +323,8 @@ void InteractivePerformanceCapture::publish_completed(std::unique_ptr<PendingCap
     result.compute_records = capture->compute.size();
     result.renderer_dropped = capture->renderer_dropped;
     result.compute_dropped = capture->compute_dropped;
+    result.present_records = capture->present.size();
+    result.present_dropped = capture->present_dropped;
 
     std::ofstream out(capture->part_path, std::ios::binary | std::ios::trunc);
     if (!out) {
@@ -340,7 +358,9 @@ void InteractivePerformanceCapture::publish_completed(std::unique_ptr<PendingCap
             // Additive within format version 1: readers select every field by name, so a reader
             // that predates this flag ignores it and a reader that expects it reads an older
             // capture as "unavailable", which is exactly what an older capture knew.
-            << ",\"private_bytes_available\":" << (private_available ? "true" : "false") << "}\n";
+            << ",\"private_bytes_available\":" << (private_available ? "true" : "false")
+            << ",\"present_handoffs_enabled\":" << (config_.present_handoffs ? "true" : "false")
+            << ",\"present_handoff_limit\":" << config_.max_present_records << "}\n";
 
         const auto write_sample = [&](const ProcessSample& sample, const char* phase) {
             out << "{\"type\":\"sample\",\"phase\":\"" << phase << "\",\"t_ns\":"
@@ -354,7 +374,22 @@ void InteractivePerformanceCapture::publish_completed(std::unique_ptr<PendingCap
             out << ",\"guest_presents\":" << sample.guest_presents
                 << ",\"rendered_frames\":";
             write_optional(out, sample.rendered_frames);
-            out << ",\"host_presented_frames\":" << sample.host_presented_frames << "}\n";
+            out << ",\"host_presented_frames\":" << sample.host_presented_frames
+                << ",\"pending_writes\":";
+            if (sample.pending_writes) {
+                const auto& q = *sample.pending_writes;
+                out << "{\"queued\":" << q.queued << ",\"active_submits\":" << q.active_submits
+                    << ",\"inflight_batches\":" << q.inflight_batches << ",\"front_item_age_ns\":" << q.front_item_age_ns
+                    << ",\"release_delay_ns\":" << q.release_delay_ns
+                    << ",\"scope_begins\":" << q.scope_begins << ",\"scope_ends\":" << q.scope_ends << ",\"deadline_resets\":" << q.deadline_resets
+                    << ",\"admission_waiters\":" << q.admission_waiters
+                    << ",\"admission_wait_count\":" << q.admission_wait_count
+                    << ",\"admission_wait_ns\":" << q.admission_wait_ns
+                    << ",\"admission_wait_max_ns\":" << q.admission_wait_max_ns
+                    << ",\"admission_retired_wait_count\":" << q.admission_retired_wait_count
+                    << ",\"admission_retired_wait_ns\":" << q.admission_retired_wait_ns << '}';
+            } else out << "null";
+            out << "}\n";
         };
         for (const ProcessSample& sample : capture->pre_samples) write_sample(sample, "pre");
         for (const ProcessSample& sample : capture->post_samples) write_sample(sample, "post");
@@ -504,12 +539,28 @@ void InteractivePerformanceCapture::publish_completed(std::unique_ptr<PendingCap
                 << ",\"writeback_ms\":" << record.writeback_ms
                 << ",\"cleanup_ms\":" << record.cleanup_ms << "}\n";
         }
+        for (const auto& record : capture->present) {
+            out << "{\"type\":\"present-handoff\",\"t_ns\":"
+                << relative_ns(record.monotonic_ns, capture->trigger_ns)
+                << ",\"begin_ns\":" << (record.begin_ns
+                    ? std::to_string(relative_ns(record.begin_ns, capture->trigger_ns)) : "null")
+                << ",\"event\":" << json_string(present_handoff_event_name(record.event))
+                << ",\"source_kind\":" << (record.cpu_source ? "\"cpu\"" : "\"gpu\"")
+                << ",\"publication_id\":" << record.publication_id
+                << ",\"source_seq\":" << record.source_seq
+                << ",\"other_seq\":" << record.other_seq
+                << ",\"address\":" << record.address
+                << ",\"slot\":" << record.slot
+                << ",\"result\":" << record.result << "}\n";
+        }
         out << "{\"type\":\"footer\",\"complete\":true,\"pre_samples\":"
             << capture->pre_samples.size() << ",\"post_samples\":" << capture->post_samples.size()
             << ",\"renderer_records\":" << capture->renderer.size()
             << ",\"compute_records\":" << capture->compute.size()
             << ",\"renderer_dropped\":" << capture->renderer_dropped
-            << ",\"compute_dropped\":" << capture->compute_dropped << "}\n";
+            << ",\"compute_dropped\":" << capture->compute_dropped
+            << ",\"present_records\":" << capture->present.size()
+            << ",\"present_dropped\":" << capture->present_dropped << "}\n";
         out.flush();
         if (!out.good()) result.error = "writing the performance capture failed";
         out.close();
@@ -554,7 +605,11 @@ void InteractivePerformanceCapture::cancel() {
 }
 
 InteractivePerformanceCapture& interactive_performance_capture() {
-    static InteractivePerformanceCapture capture;
+    static InteractivePerformanceCapture capture([] {
+        CaptureConfig config;
+        config.present_handoffs = std::getenv("PROSPER_PRESENT_HANDOFF_TRACE") != nullptr;
+        return config;
+    }());
     return capture;
 }
 

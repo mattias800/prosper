@@ -39,6 +39,7 @@ struct GpuScanoutFrame {
     VkImage     image = VK_NULL_HANDLE;      // RGBA8_UNORM, in TRANSFER_SRC_OPTIMAL, ready to read
     uint32_t    width = 0, height = 0;
     uint64_t    frame_seq = 0;               // caller-supplied source identity (guest flip in production)
+    uint64_t    publication_id = 0;          // handoff identity only; never a completed producer version
     int         slot = -1;                   // opaque handle to pass back to present_blit_release
     bool valid() const { return image && width && height && slot >= 0; }
 };

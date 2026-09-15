@@ -83,7 +83,3 @@ VUID-vkCmdDispatch-maintenance4-08602 | environment-dependent | game_compute_exe
 
 # ---- #1715: generated geometry stage declares no invocation count -------------------------------
 VUID-VkPipelineShaderStageCreateInfo-stage-00715 | required | interp_render, rect_synthesis_render | The synthesised geometry entry point has no OpExecutionMode Invocations, so the declared count is 0 (#1715)
-
-# ---- #1716: present_blit fixture transitions a transfer-only image to SHADER_READ_ONLY_OPTIMAL --
-# 168 of the CI environment's 187 messages; the test's own header asked for this check.
-VUID-VkImageMemoryBarrier-oldLayout-01211 | required | present_blit | Fixture source images lack SAMPLED_BIT but are transitioned to SHADER_READ_ONLY_OPTIMAL (#1716)

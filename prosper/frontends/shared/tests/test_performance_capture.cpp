@@ -40,6 +40,23 @@ prosper::perf::ProcessSample sample(uint64_t at, uint64_t counter) {
     out.guest_presents = counter * 3;
     out.rendered_frames = counter * 2;
     out.host_presented_frames = counter;
+    if (counter == 1) {
+        prosper::gpu::PendingWriteSnapshot queue;
+        queue.queued = 123;
+        queue.active_submits = 2;
+        queue.front_item_age_ns = 456;
+        queue.release_delay_ns = -789;
+        queue.scope_begins = 12;
+        queue.scope_ends = 10;
+        queue.deadline_resets = 3;
+        queue.admission_waiters = 1;
+        queue.admission_wait_count = 7;
+        queue.admission_wait_ns = 12345;
+        queue.admission_wait_max_ns = 8000;
+        queue.admission_retired_wait_count = 5;
+        queue.admission_retired_wait_ns = 10000;
+        out.pending_writes = queue;
+    }
     return out;
 }
 } // namespace
@@ -112,6 +129,11 @@ int main() {
     check(armed.ok, "F8 arm reserves a temporary capture");
     check(armed.pre_samples == 6, "F8 arm freezes the actual pre-trigger ring");
     check(capture.detailed_timing_active(), "F8 arm enables post-trigger detailed timing");
+    check(!capture.present_handoff_timing_active(), "ordinary F8 does not arm handoff tracing");
+    prosper::perf::PresentHandoffRecord unarmed;
+    unarmed.monotonic_ns = 550;
+    unarmed.event = prosper::perf::PresentHandoffEvent::Published;
+    capture.record_present(unarmed);
 
     size_t part_files = 0, final_files = 0;
     for (const auto& entry : fs::directory_iterator(dir)) {
@@ -212,6 +234,15 @@ int main() {
     std::ostringstream bytes;
     bytes << input.rdbuf();
     const std::string text = bytes.str();
+    check(text.find("\"pending_writes\":{\"queued\":123,\"active_submits\":2") != std::string::npos &&
+          text.find("\"front_item_age_ns\":456,\"release_delay_ns\":-789") != std::string::npos &&
+          text.find("\"scope_begins\":12,\"scope_ends\":10,\"deadline_resets\":3") != std::string::npos,
+          "queue snapshot retains counters, front age and signed deadline");
+    check(text.find("\"admission_waiters\":1,\"admission_wait_count\":7,\"admission_wait_ns\":12345") != std::string::npos &&
+          text.find("\"admission_wait_max_ns\":8000,\"admission_retired_wait_count\":5,\"admission_retired_wait_ns\":10000") != std::string::npos,
+          "queue snapshot serializes completed admission waits and current waiters separately");
+    check(text.find("\"pending_writes\":null") != std::string::npos,
+          "unavailable queue observation is not an invented empty queue");
     check(count_text(text, "\"buffer_upload_bytes\":") == 2 &&
               text.find("\"buffer_upload_bytes\":4294967296,") != std::string::npos &&
               text.find("\"buffer_upload_bytes\":4294967297,") != std::string::npos &&
@@ -375,6 +406,49 @@ int main() {
     check(!live.private_bytes.has_value(),
           "a host with no separate committed-bytes counter leaves the field unavailable, not zero");
 #endif
+
+    {
+        CaptureConfig traced = config;
+        traced.present_handoffs = true;
+        traced.max_present_records = 2;
+        InteractivePerformanceCapture handoffs(traced);
+        check(!handoffs.present_handoff_timing_active(), "trace requires an active F8 window");
+        check(handoffs.arm(dir.string(), "handoffs", "handoffs", "test", 1000, wall).ok,
+              "handoff control arms");
+        auto row = unarmed;
+        row.event = prosper::perf::PresentHandoffEvent::Published;
+        row.publication_id = 42;
+        row.source_seq = 7;
+        row.slot = 2;
+        row.monotonic_ns = 999;
+        handoffs.record_present(row); // excluded: before the capture, must not consume the cap
+        row.monotonic_ns = 1301;
+        handoffs.record_present(row); // excluded: after the exact post window
+        row.monotonic_ns = 1100;
+        row.begin_ns = 900; // a measured wait may start before the capture
+        handoffs.record_present(row);
+        row.event = prosper::perf::PresentHandoffEvent::Superseded;
+        row.monotonic_ns = 1200;
+        row.other_seq = 43;
+        handoffs.record_present(row);
+        row.event = prosper::perf::PresentHandoffEvent::ConsumerSubmit;
+        handoffs.record_present(row);
+        handoffs.observe_sample(sample(1300, 1));
+        prosper::perf::CaptureOutcome traced_out;
+        check(handoffs.take_outcome(traced_out) && traced_out.ok &&
+              traced_out.present_records == 2 && traced_out.present_dropped == 1,
+              "handoff bounds exclude wrong windows and expose overflow");
+        std::ifstream input(traced_out.path);
+        const std::string contents((std::istreambuf_iterator<char>(input)), {});
+        check(count_text(contents, "\"type\":\"present-handoff\"") == 2 &&
+              contents.find("\"begin_ns\":-100") != std::string::npos &&
+              contents.find("\"publication_id\":42,\"source_seq\":7,\"other_seq\":43") != std::string::npos &&
+              contents.find("consumer-submit") == std::string::npos,
+              "handoff identities and pre-window wait starts survive bounded serialization");
+        check(text.find("\"type\":\"present-handoff\"") == std::string::npos &&
+              text.find("\"present_handoffs_enabled\":false") != std::string::npos,
+              "ordinary F8 explicitly reports tracing disabled and stores no handoff events");
+    }
 
     fs::remove_all(dir, ec);
     std::cout << (failures ? "FAIL" : "PASS") << ": " << checks << " checks, "

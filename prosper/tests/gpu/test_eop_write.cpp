@@ -5,6 +5,7 @@
 // builders themselves read SysV stack args via __builtin_frame_address, only valid under the loaded
 // game) and asserts run_command_buffer writes the right bytes to the target address.
 #include "gpu/pm4/command_processor.hpp"
+#include "gpu/pm4/pending_write_snapshot.hpp"
 #include "gpu/execute/gpu_execute.hpp"
 #include "gpu/execute/mb3_freelist.hpp"
 #include "gpu/pm4/pm4_decode.hpp"
@@ -17,6 +18,7 @@
 #include <cstring>
 #include <chrono>
 #include <initializer_list>
+#include <future>
 #include <string>
 #include <thread>
 #include <vector>
@@ -285,8 +287,26 @@ int main() {
         buf[17] = 1; buf[18] = 0x13579bdfu;           // renderer resource upload
         GpuState st;
         prosper_gpu_submit_scope_begin();
+        const auto observe_queue = [] {
+            std::optional<PendingWriteSnapshot> snapshot;
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
+            do {
+                snapshot = try_pending_write_snapshot();
+                if (snapshot) break;
+                std::this_thread::yield();
+            } while (std::chrono::steady_clock::now() < deadline);
+            return snapshot;
+        };
+        const auto scope_start = observe_queue();
         const size_t n = run_command_buffer(buf, 19, st);
+        const auto queued = observe_queue();
+        CHECK(queued && queued->queued == 3 && queued->active_submits == 1 &&
+              queued->inflight_batches == 0 && queued->scope_begins == queued->scope_ends + 1,
+              "pending snapshot observes three real queued writes inside the submit");
         prosper_gpu_drain_renderer_writes();
+        const auto retained = observe_queue();
+        CHECK(retained && retained->queued == 2 && retained->active_submits == 1,
+              "pending snapshot observes the selective resource drain without draining labels");
         CHECK(n == 3 && prosper_gpu_submit_scope_active(),
               "SDK-13 submit scope retains queued label writes");
         CHECK(resource == 0x13579bdfu,
@@ -300,6 +320,29 @@ int main() {
         rejected_submit_return.join();
         CHECK(prosper_gpu_submit_scope_active() && label == 0xaaaaaaaa55555555ull,
               "unmatched return hook cannot retire another thread's active submit");
+        // A different submitter may enter while this outer scope is still active. Requiring an
+        // empty queue unconditionally would block a producer needed by the active submit (#3674).
+        std::promise<void> concurrent_returned;
+        auto returned = concurrent_returned.get_future();
+        std::thread concurrent_submit([&] {
+            prosper_gpu_submit_scope_begin();
+            prosper_gpu_submit_scope_end();
+            concurrent_returned.set_value();
+        });
+        const bool concurrent_admitted =
+            returned.wait_for(std::chrono::milliseconds(500)) == std::future_status::ready;
+        CHECK(concurrent_admitted, "a concurrent active submit bypasses retired-queue admission");
+        if (!concurrent_admitted) {
+            // Release the outer scope so a broken admission predicate fails rather than hanging
+            // the test. Re-enter after joining to keep the remaining lifecycle checks bounded.
+            prosper_gpu_submit_scope_end();
+            concurrent_submit.join();
+            prosper_gpu_submit_scope_begin();
+        } else concurrent_submit.join();
+        const auto after_concurrent = observe_queue();
+        CHECK(after_concurrent && after_concurrent->active_submits == 1 &&
+              after_concurrent->queued == 2 && label == 0xaaaaaaaa55555555ull,
+              "concurrent return keeps the outer submit's completion label private");
         // A same-thread re-entrant tagged import opens its own scope before validation. Its return
         // checkpoint consumes only that nested token, leaving the outer invocation active.
         prosper_gpu_submit_scope_begin();
@@ -316,6 +359,120 @@ int main() {
         prosper_gpu_drain_completion_writes();
         CHECK(label == 0xfedcba9876543210ull,
               "ordered label initialization and fence become visible after submit scope end");
+        const auto drained = observe_queue();
+        CHECK(scope_start && drained && drained->queued == 0 && drained->active_submits == 0 &&
+              drained->front_item_age_ns == 0 && drained->scope_begins == drained->scope_ends &&
+              drained->deadline_resets == scope_start->deadline_resets + 1,
+              "nested and unmatched returns preserve snapshot balance and reset only at final return");
+    }
+
+    // A fast sequence of outer submit calls must not postpone retired completion labels forever
+    // by repeatedly resetting the 1 ms worker deadline. The next outer admission is a safe point:
+    // the previous import has returned, while none of the new submit's labels exist yet (#3674).
+    {
+        uint64_t label = 0;
+        const uint64_t address = reinterpret_cast<uintptr_t>(&label);
+        for (uint32_t value = 1; value <= 8; ++value) {
+            const uint32_t stream[] = {
+                PM4(7, IT_NOP, R_RELEASE_MEM), static_cast<uint32_t>(address),
+                static_cast<uint32_t>(address >> 32), 2, value, 0, 0x04};
+            GpuState st;
+            prosper_gpu_submit_scope_begin();
+            CHECK(run_command_buffer(stream, 7, st) == 1,
+                  "consecutive-scope fixture queues a real completion label");
+            CHECK(label == value - 1,
+                  "current submit completion remains private before its return");
+            prosper_gpu_submit_scope_end();
+            prosper_gpu_submit_scope_begin();
+            CHECK(label == value,
+                  "next outer submit admits only after retired completion writes drain");
+            prosper_gpu_submit_scope_end();
+        }
+        prosper_gpu_drain_completion_writes();
+    }
+
+    // Hold an actual worker effect outside p.mx so the next caller deterministically enters
+    // admission wait. No assertion depends on winning a race against the modeled grace timer.
+    {
+        uint64_t labels[2] = {};
+        std::promise<void> worker_entered, release_worker;
+        auto entered = worker_entered.get_future();
+        auto release = release_worker.get_future().share();
+        const auto observe_until = [](auto predicate) {
+            std::optional<PendingWriteSnapshot> state;
+            const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+            do {
+                state = try_pending_write_snapshot();
+                if (state && predicate(*state)) return state;
+                std::this_thread::yield();
+            } while (std::chrono::steady_clock::now() < until);
+            return std::optional<PendingWriteSnapshot>{};
+        };
+        prosper_gpu_drain_completion_writes();
+        const auto before = observe_until([](const auto&) { return true; });
+        set_guest_gpu_write_observer([&](uint64_t address, uint64_t, const char*) {
+            if (address == reinterpret_cast<uint64_t>(&labels[0])) {
+                worker_entered.set_value();
+                release.wait();
+            }
+        });
+        std::vector<uint32_t> stream;
+        for (unsigned i = 0; i < 2; ++i) {
+            const auto address = reinterpret_cast<uint64_t>(&labels[i]);
+            const uint32_t command[] = {PM4(7, IT_NOP, R_RELEASE_MEM),
+                static_cast<uint32_t>(address), static_cast<uint32_t>(address >> 32),
+                2, 0x61000000u + i, 0, 0x04};
+            stream.insert(stream.end(), std::begin(command), std::end(command));
+        }
+        GpuState state;
+        prosper_gpu_submit_scope_begin();
+        CHECK(run_command_buffer(stream.data(), stream.size(), state) == 2,
+              "observer fixture queues two real completion writes");
+        prosper_gpu_submit_scope_end();
+        const bool held = entered.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+        CHECK(held, "worker reached the held completion effect");
+        std::promise<bool> admitted;
+        auto result = admitted.get_future();
+        std::thread caller;
+        if (held) {
+            caller = std::thread([&] {
+                prosper_gpu_submit_scope_begin();
+                const bool ready = labels[0] == 0x61000000u && labels[1] == 0x61000001u;
+                prosper_gpu_submit_scope_end();
+                admitted.set_value(ready);
+            });
+            const auto waiting = observe_until([](const auto& q) { return q.admission_waiters == 1; });
+            CHECK(waiting && waiting->active_submits == 0 && waiting->inflight_batches == 1 &&
+                  waiting->queued == 1 && before && waiting->admission_wait_count == before->admission_wait_count,
+                  "live waiter is observable before completed counters advance");
+        }
+        release_worker.set_value(); // always release before cleanup, including timeout paths
+        if (caller.joinable()) {
+            if (result.wait_for(std::chrono::seconds(2)) != std::future_status::ready) {
+                std::fprintf(stderr, "admission observer fixture failed to unblock after worker release\n");
+                std::exit(2); // bounded failure; never destroy references retained by a stuck worker
+            }
+            CHECK(result.get(), "both held and queued labels land before the waiting caller admits");
+            caller.join();
+        }
+        prosper_gpu_drain_completion_writes();
+        set_guest_gpu_write_observer({});
+        const auto after = observe_until([](const auto&) { return true; });
+        CHECK(before && after && after->admission_waiters == 0 &&
+              after->admission_wait_count == before->admission_wait_count + 1 &&
+              after->admission_retired_wait_count == before->admission_retired_wait_count + 1 &&
+              after->admission_wait_ns > before->admission_wait_ns &&
+              after->admission_retired_wait_ns > before->admission_retired_wait_ns &&
+              after->admission_wait_ns - before->admission_wait_ns ==
+                  after->admission_retired_wait_ns - before->admission_retired_wait_ns &&
+              after->admission_wait_max_ns >= after->admission_wait_ns - before->admission_wait_ns,
+              "one completed real admission wait records its elapsed and retired-subset cost");
+        prosper_gpu_submit_scope_begin();
+        prosper_gpu_submit_scope_end();
+        const auto empty = observe_until([](const auto&) { return true; });
+        CHECK(after && empty && empty->admission_wait_count == after->admission_wait_count &&
+              empty->admission_wait_ns == after->admission_wait_ns,
+              "empty-queue admission does not invent a timed wait");
     }
 
     // Renderer drains routinely encounter hundreds of resource uploads behind thousands of private

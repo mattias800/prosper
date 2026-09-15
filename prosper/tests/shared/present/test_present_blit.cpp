@@ -9,22 +9,19 @@
 // (b) the slot handoff -- with fence-gated publish and release, the consumer never reads a half-written or
 // reused image even while the producer runs ahead. No window/surface is needed, so it runs headlessly.
 //
-// This file used to end with "Run it under VK_LAYER_KHRONOS_validation in CI to catch sync/layout
-// hazards." That is now done (#1704: `tools/vkval`, a step on the Linux job), and the first run
-// found a layout hazard here: the fixture's source images carry transfer usage only, yet are
-// transitioned to VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL to imitate the layout the renderer hands
-// present_blit_publish. That is VUID-VkImageMemoryBarrier-oldLayout-01211, it accounts for 168 of
-// the suite's 187 validation messages on the CI runner, and it is tracked in #1716. The scanout
-// handoff assertions below are unaffected — the hazard is in this fixture's setup, not in
-// present_blit — but fix #1716 before trusting this test to report a *new* layout hazard, because
-// today's finding would bury one.
+// Source fixtures carry SAMPLED_BIT because they model the renderer's shader-read layout.
+// Strict core/synchronization validation is the regression guard for that usage contract (#1716).
 #include "fixtures/render_runner.h"
 #include "shared/live/live_renderer.hpp"
 #include "shared/present/present_blit.hpp"
+#include "shared/perf/performance_capture.hpp"
 #include "gpu/execute/gpu_execute.hpp"
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <thread>
 #include <vector>
 
@@ -99,7 +96,7 @@ int main() {
         ici.imageType = VK_IMAGE_TYPE_2D; ici.format = VK_FORMAT_R8G8B8A8_UNORM;
         ici.extent = {W, H, 1}; ici.mipLevels = 1; ici.arrayLayers = 1;
         ici.samples = VK_SAMPLE_COUNT_1_BIT; ici.tiling = VK_IMAGE_TILING_OPTIMAL;
-        ici.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        ici.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
         ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE; ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         CHECK(vkCreateImage(ctx.dev, &ici, nullptr, &src) == VK_SUCCESS, "create source image");
         VkMemoryRequirements req{}; vkGetImageMemoryRequirements(ctx.dev, src, &req);
@@ -238,7 +235,7 @@ int main() {
         ici.imageType = VK_IMAGE_TYPE_2D; ici.format = VK_FORMAT_R16G16B16A16_SFLOAT;
         ici.extent = {rw, rh, 1}; ici.mipLevels = 1; ici.arrayLayers = 1;
         ici.samples = VK_SAMPLE_COUNT_1_BIT; ici.tiling = VK_IMAGE_TILING_OPTIMAL;
-        ici.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        ici.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
         ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE; ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         vkCreateImage(ctx.dev, &ici, nullptr, &r16);
         VkMemoryRequirements rq{}; vkGetImageMemoryRequirements(ctx.dev, r16, &rq);
@@ -310,7 +307,7 @@ int main() {
           ici.imageType = VK_IMAGE_TYPE_2D; ici.format = VK_FORMAT_R8G8B8A8_UNORM; ici.extent = {w2, h2, 1};
           ici.mipLevels = 1; ici.arrayLayers = 1; ici.samples = VK_SAMPLE_COUNT_1_BIT;
           ici.tiling = VK_IMAGE_TILING_OPTIMAL;
-          ici.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+          ici.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
           ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE; ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
           vkCreateImage(ctx.dev, &ici, nullptr, &src2);
           VkMemoryRequirements q{}; vkGetImageMemoryRequirements(ctx.dev, src2, &q);
@@ -347,6 +344,15 @@ int main() {
             return frontend::present_blit_publish(img, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                     VK_FORMAT_R8G8B8A8_UNORM, iw, ih, seq);
         };
+        // Record the actual held-slot/supersession path in the opt-in CTest variant. Recording
+        // synthetic "published" rows cannot prove the production handoff emitted its decisions.
+        auto& handoffs = perf::interactive_performance_capture();
+        const bool trace_requested = std::getenv("PROSPER_PRESENT_HANDOFF_TRACE") != nullptr;
+        const auto trace_start = perf::monotonic_now_ns();
+        if (trace_requested)
+            CHECK(handoffs.arm("present_blit_trace_test", "fixture", "fixture", "test",
+                               trace_start, std::chrono::system_clock::now()).ok,
+                  "held-slot: arm production handoff recording");
         // Frame A at WxH; hold it.
         CHECK(upload_and_publish(src, stage, stageMap, W, H, 777), "held-slot: publish A (WxH)");
         frontend::GpuScanoutFrame gfA; bool gotA = false;
@@ -368,6 +374,37 @@ int main() {
             frontend::present_blit_release(gfA.slot);
         }
         CHECK(held_mismatch == 0, "held-slot: acquired image survives a different-size publish, content intact");
+        if (trace_requested) {
+            perf::ProcessSample finish;
+            finish.monotonic_ns = trace_start + 5'000'000'000ull;
+            handoffs.observe_sample(finish);
+            perf::CaptureOutcome outcome;
+            CHECK(handoffs.take_outcome(outcome) && outcome.ok && outcome.present_dropped == 0,
+                  "held-slot: production trace completes without truncation");
+            std::ifstream file(outcome.path);
+            std::string line;
+            unsigned replacements = 0, published = 0, acquired_a = 0, released_a = 0;
+            while (std::getline(file, line)) {
+                if (line.find("\"type\":\"present-handoff\"") == std::string::npos) continue;
+                if (line.find("\"event\":\"published\"") != std::string::npos) ++published;
+                for (unsigned source = 800; source < 803; ++source)
+                    if (line.find("\"event\":\"superseded\"") != std::string::npos &&
+                        line.find("\"source_seq\":" + std::to_string(source) + ",") != std::string::npos)
+                        ++replacements;
+                const auto id = "\"publication_id\":" + std::to_string(gfA.publication_id) + ",";
+                if (line.find(id) != std::string::npos &&
+                    line.find("\"source_seq\":777,") != std::string::npos) {
+                    acquired_a += line.find("\"event\":\"acquired\"") != std::string::npos;
+                    released_a += line.find("\"event\":\"released\"") != std::string::npos;
+                }
+            }
+            CHECK(published == 5 && replacements == 3 && acquired_a == 1 && released_a == 1,
+                  "held-slot: trace distinguishes five publications, three replacements and A's lease");
+            CHECK(gfA.publication_id != 0 && gfA.publication_id != gfA.frame_seq,
+                  "held-slot: publication identity is not substituted with the guest flip");
+            std::error_code ignored;
+            std::filesystem::remove_all("present_blit_trace_test", ignored);
+        }
         vkDeviceWaitIdle(ctx.dev);
         vkDestroyBuffer(ctx.dev, st2, nullptr); vkFreeMemory(ctx.dev, st2Mem, nullptr);
         vkDestroyBuffer(ctx.dev, rbA, nullptr); vkFreeMemory(ctx.dev, rbAMem, nullptr);

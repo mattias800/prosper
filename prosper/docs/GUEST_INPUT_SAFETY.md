@@ -31,16 +31,31 @@ and reviewers know what the invariants are.
   then faults on a page the probe just called fine — the guest module's own `.text`/`.rodata` are large
   read-only mappings in the same address space. That was a real defect in #1637 as merged, fixed by
   #1654.
-  **Cost, and what to do on a hot path:** `guest_writable` is **uncached**, and on Linux it `fopen`s
-  and parses `/proc/self/maps` on **every** call — unlike `guest_readable`, which has a thread-local
-  range cache. So it must not be dropped into a per-draw path. Do **not** resolve that by switching
-  back to `guest_readable` (wrong predicate, above — and its cache consults `submit_ranges` only
-  inside a renderer submit scope, which the DCB-build path is not). Prefer an **arithmetic answer to
+  **Cost, and what to do on a hot path:** `guest_writable` has a separate thread-local positive
+  range cache, invalidated by the mapping/protection generation (#2387/#2389). On supporting Linux
+  kernels, misses query exact covering writable VMAs using `PROCMAP_QUERY` (#3398); unavailable
+  interfaces retain textual `/proc/self/maps` enumeration. Adjacent VMAs must cover the entire
+  request, with no read-only region or hole, and only a complete positive query may populate the
+  cache. The generation is captured **before** the evidence it tags. Neither route supplies a
+  lifetime guarantee or an atomic multi-VMA snapshot. Do **not** replace it with `guest_readable`
+  (wrong predicate, above). Prefer an **arithmetic answer to
   the question actually being asked**: `hle_agc.cpp`'s DCB ring registry (#1650) remembers the
   `[bottom, top)` extent each command packet was built into, so a patcher validates the pointer the
   guest hands back by range compare, and only misses fall through to the probe. Structure such a cache
   as a pure accelerator — a hit skips the probe, a miss falls back — so the safety argument rests on
   the predicate and never on the cache.
+
+  Linux comparison controls (read once per querying thread):
+  `PROSPER_NO_GUEST_WRITABLE_QUERY=1` restores text enumeration and broad cache warming,
+  without first paying a failed binary query. Adding
+  `PROSPER_GUEST_WRITABLE_LOCAL_TEXT_CACHE=1` keeps full text enumeration but publishes only
+  the first through last individual VMAs needed by the request, matching binary-query cache
+  coverage. The second control affects text fallback only; native queries already have local
+  coverage. Adjacent writable VMAs remain separate until the whole requested span is proven.
+  These arms distinguish query cost from cache population; all retain positive-only caching,
+  generation invalidation and ordinary permission refusals. The native query fixture compares
+  actual probe counts across separate and adjacent mappings, including revocation and remap.
+  No control supplies guest-content authority or an end-to-end speedup guarantee.
 - **`rd<T>(file, off)`** (`src/self/module.cpp`) — bounded structured read: gates the `memcpy` on
   `self_read_ok` and zero-fills a `T{}` on an out-of-range offset. Every SELF/ELF header/table read goes
   through it; a raw `reinterpret_cast`/`memcpy` into `file.data() + off` is a red flag.

@@ -3,6 +3,7 @@
 // guest-FS path interposes a call while swapping FS. Both paths must forward stack args 7-10.
 #include "host/image/exec_image.hpp"
 #include "hle/dispatch/dispatch.hpp"
+#include "gpu/pm4/command_processor.hpp"
 
 #include <cstdint>
 #include <cstdio>
@@ -32,21 +33,40 @@ uint64_t g_guest_return = 0;
 bool g_handler_finished = false;
 bool g_hook_saw_finished_handler = false;
 uint32_t g_return_hook_calls = 0;
+uint64_t g_completion_label = 0;
+bool g_completion_decoded = false;
+bool g_destructor_saw_private_completion = false;
+bool g_hook_saw_private_completion = false;
 
 extern "C" uint64_t prosper_test_hle10_handler(
     uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
     uint64_t a5, uint64_t a6, uint64_t a7, uint64_t a8, uint64_t a9) {
+    prosper_gpu_submit_scope_begin();
+    struct Lifetime {
+        ~Lifetime() {
+            g_destructor_saw_private_completion = prosper_gpu_submit_scope_active() &&
+                g_completion_label == 0;
+            g_handler_finished = true;
+        }
+    } lifetime;
+    const uint64_t address = reinterpret_cast<uint64_t>(&g_completion_label);
+    const uint32_t stream[] = {0xC0000000u | (5u << 16u) | (gpu::IT_NOP << 8u) |
+        (gpu::R_RELEASE_MEM << 2u), static_cast<uint32_t>(address),
+        static_cast<uint32_t>(address >> 32u), 2, 0x13579bdu, 0, 0x04};
+    gpu::GpuState state;
+    g_completion_decoded = gpu::run_command_buffer(stream, 7, state) == 1;
     const uint64_t args[10] = {a0, a1, a2, a3, a4, a5, a6, a7, a8, a9};
     for (int i = 0; i < 10; ++i) g_seen[i] = args[i];
     g_immediate_return = *(const uint64_t*)(uintptr_t)prosper_test_hle_entry_rsp;
     g_guest_return = hle_guest_return_address(prosper_test_hle_entry_rsp);
-    g_handler_finished = true;
     return kReturn;
 }
 
 extern "C" void prosper_test_hle_return_hook() {
     g_hook_saw_finished_handler = g_handler_finished;
+    g_hook_saw_private_completion = prosper_gpu_submit_scope_active() && g_completion_label == 0;
     ++g_return_hook_calls;
+    prosper_gpu_submit_scope_end();
 }
 
 extern "C" void prosper_test_hle10_entry();
@@ -114,6 +134,7 @@ int main(int argc, char** argv) {
 
     constexpr const char* kNid = "test.hle.stack.args";
     register_builtin_hle();
+    prosper_gpu_enable_post_submit_visibility();
     Hle::register_fn(kNid, reinterpret_cast<HleFn>(&prosper_test_hle10_entry),
                      "prosper_test_hle10_entry", &prosper_test_hle_return_hook);
     // Keep an unresolved import immediately before the implemented one. The largest Linux guest-FS
@@ -176,6 +197,13 @@ after_hle_call:
           "return-hook handler returns into a trampoline, not directly to guest code");
     CHECK(g_return_hook_calls == 1 && g_hook_saw_finished_handler,
           "return hook runs exactly once after the HLE handler has returned");
+    CHECK(g_completion_decoded && g_destructor_saw_private_completion && g_hook_saw_private_completion,
+          "real completion remains private through handler destruction and until the return hook");
+    const bool retired = !prosper_gpu_submit_scope_active();
+    CHECK(retired, "real import-return hook retires the submit scope");
+    if (!retired) prosper_gpu_submit_scope_end(); // bounded cleanup if hook emission regresses
+    prosper_gpu_drain_completion_writes();
+    CHECK(g_completion_label == 0x13579bdu, "completion lands after the actual import return checkpoint");
     const uint64_t callsite_lo = callsite_begin < callsite_end ? callsite_begin : callsite_end;
     const uint64_t callsite_hi = callsite_begin < callsite_end ? callsite_end : callsite_begin;
     CHECK(g_guest_return >= callsite_lo && g_guest_return <= callsite_hi,
