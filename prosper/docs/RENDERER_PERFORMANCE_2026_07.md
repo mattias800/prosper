@@ -2071,6 +2071,35 @@ pipeline contracts. Keep the exact-byte and disable-switch A/B discipline used h
 screenshot/capture correctness while reducing the synchronous boundaries.
 
 
+### Ruled out: moving compute work from the GPU onto the CPU (2026-09-15)
+
+**On this machine's balance, a cheaper-looking CPU path is usually the more expensive one.** Stated
+as a cross-title fact rather than a title finding, because it is a property of the ratio between the
+two resources and it has now been measured in both directions on the same route.
+
+`execute_cpu_fast_path` refuses a fill whose destination is not host-writable. Half of one *Sonic
+Frontiers* program's fills were refused that way, and the cause is prosper's own write watch: a
+watched page is mprotected read-only, so `guest_writable` reports a guest permission refusal for a
+protection prosper itself applied and was about to remove. Causally confirmed, not inferred — with
+watches suppressed the refusal count is exactly 0. Each refusal paid a full `vkQueueSubmit` plus a
+blocking fence wait plus a writeback, for a memset.
+
+Admitting those fills — a predicate proving the range is read-only only because *we* armed it, which
+is sound and which removed the refusals entirely — measured **-30% fps**: 19.7/19.7/19.7 against
+26.2/28.8/28.8 distinct-frame rate, six interleaved arms, one binary. Reverted; #3686 carries the
+arms and the retained patch.
+
+The reason it loses is the same reason #3685 won by doing the opposite. The GPU is measured **9-14%
+busy** while the compute thread blocks on every dispatch, so the idle resource is the GPU and the
+contended one is the CPU. #3685 moved a 174 ms result comparison *onto* the GPU to avoid 809 ms of
+CPU writeback and gained 17-21%; this moved work the other way and lost 30%. **Until the GPU stops
+being idle, prefer the GPU path even where it looks heavier**, and treat "this avoids a GPU round
+trip" as a cost argument that has to be measured rather than an obvious win.
+
+What this does not say: that the watch-induced refusals are acceptable, or that the CPU fast path
+should be removed. The observation stands and someone will rediscover it; it is the remedy that is
+falsified.
+
 ### Ruled out: reusable CPU comparison workers (2026-09-08)
 
 A bounded reusable-worker candidate for `parallel_compute_texels` was implemented and rejected
