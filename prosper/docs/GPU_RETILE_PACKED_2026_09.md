@@ -194,4 +194,6 @@ fresh directories. The archived helper's private dump paths must be adjusted on 
   ~6,550 ms sums of `%.2f`-quantised per-dispatch values, and per-dispatch copies under 0.005 ms print
   as `0.00`, which biases the residual upward. The conclusion — immaterial — survives that; the digits
   do not. Do not open further CPU-tiling vectorisation work against this route without first
-  re-splitting the timer: the cost is publication, and #3683 carries it. #3683.
+  re-splitting the timer — `retile_copy_ms` on the `[compute-phase]` line under
+  `PROSPER_COMPUTE_PHASE_TIMING=1`, which `tools/perf/compute_phase_report.py` now models as layout's
+  child. The cost is publication, and #3683 carries it. #3683.

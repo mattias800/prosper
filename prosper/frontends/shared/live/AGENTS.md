@@ -159,8 +159,10 @@ memcpy'd out of the retile buffer, a declined one is tiled on the CPU. `retile_c
 subset of `layout_ms` covering only the memcpy, so `layout_ms - retile_copy_ms` is the CPU tiling
 residual — measured 2026-09-15 at 6,551 / 6,541 / ~10 ms on a Sonic Frontiers route, i.e. the name is
 misleading by three orders of magnitude on that title. `tools/perf/compute_phase_report.py` models the
-copy as layout's child so the residual surfaces as layout's `unattributed` row rather than the whole
-branch reading as a targetable leaf.
+copy as layout's child, so the whole branch no longer reads as a targetable leaf. On those figures the
+residual does not print at all: that report gates `unattributed` at 1% of its parent and 10 / 6,551 is
+0.15%. An absent `unattributed` row under layout therefore means the residual is under ~65 ms on that
+route, not that it is zero.
 
 Timers are nested, not additive: `setup_ms` covers owner materialization after resource/alias checks;
 `validation_ms` includes upload compare/copy/map/watch on cache hits. `writeback_ms` encloses result

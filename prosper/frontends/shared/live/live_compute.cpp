@@ -10010,8 +10010,11 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     // Only count images that would otherwise have been candidates: an image with no
                     // storage writeback at all never had a CPU tiling pass to avoid, and counting it
                     // would put the census's largest number on the one reason that costs nothing.
-                    // Named individually: the first version of this census put all six behind one
-                    // label, which put its largest number on a bucket that cannot be acted on.
+                    // Named individually: the first version of this census put all seven behind one
+                    // label, which put its largest number on a bucket that cannot be acted on. The
+                    // second version still merged `!r` into `no-staging`, which is the same defect one
+                    // arm down -- a missing resource and a missing staging buffer are different
+                    // subsystems and need different fixes.
                     if (bi.storage_writeback) {
                         decline(bi.alias_of != SIZE_MAX ? GpuRetileDecline::Aliased
                                 : bi.imported          ? GpuRetileDecline::Imported
