@@ -24,6 +24,18 @@ namespace prosper::frontend {
 // are not time-bounded. Never initializes a renderer or destroys resources.
 bool flush_live_graphics_pipeline_cache();
 
+// Opt-in cumulative work on the calling renderer thread. Disabled is unobserved, not zero work.
+// Footprints count actual CPU RTT extent calculations, excluding extra watched-address diagnostics.
+struct GuestWriteDrainWork {
+    bool observed = false;
+    uint64_t calls = 0;
+    uint64_t rtt_footprints = 0;
+    uint64_t prepared_drains = 0;
+    uint64_t rtt_erases = 0;
+    uint64_t rtt_dcc = 0;
+};
+GuestWriteDrainWork guest_write_drain_work_for_thread();
+
 // The decoded-texture identity map lives for one SUBMIT (#1691). A submit is cut into a new graphics
 // span at every interleaved compute/DMA operation, and that split is exactly what could rewrite guest
 // texture bytes mid-submit, so an entry crossing a span boundary must carry proof that nothing wrote
