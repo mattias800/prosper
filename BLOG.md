@@ -19,6 +19,17 @@ from the tracker issues, and still gated, because it is a projection of state ra
 > title's current state — for that, read the tracker. Nothing is ever removed when a title moves on,
 > because the point of a blog is that it records *when* things happened.
 
+## 2026-09-15
+
+### Sonic Frontiers got 10% faster by not asking the same question 253 million times
+
+No picture — the frame looks identical, which is the point. Every time prosper wanted to know
+whether the guest had touched a watched texture it re-walked every page of that watch, and on a 63 s
+Sonic Frontiers route that came to **253 million page visits across 444,024 questions, to find 16
+that had actually changed**. The same route also tested all 189 live watches against every GPU write
+— 65 million comparisons to find 6,639 real overlaps. Both now answer from an index, and the title
+runs at 26.2 fps where it ran at 23.8, repeated in two interleaved pairs.
+
 ## 2026-09-14
 
 ### Uncharted was drawing all along — into shaders we had filled with zeros

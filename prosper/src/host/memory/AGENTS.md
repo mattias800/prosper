@@ -17,6 +17,18 @@ whatever ended up mapped, without any opinion on why.
   direct-memory write trace that attributes a guest write to the module and RIP that made it. Host
   writes into guest memory (file reads, DMA-shaped producers) must bracket themselves with the
   notify/notify-done pair here, or they either fault or leave a range recorded as in flight forever.
+
+  Its one state mutex is held by paths a running title enters thousands of times a second, so the
+  file keeps **lookup indexes beside the authoritative containers** — a per-chunk occupancy count
+  over `pages_by_addr`, registration ids bucketed by the chunks they span, and each page's list of
+  the registrations that reference it. Two rules keep those from becoming a correctness surface.
+  **An index may only narrow the candidate set; the original predicate still decides** — the
+  half-open overlap test, the armed/generation comparison. And **a page's state change is PUSHED to
+  its registrations** through `mark_page_changed_locked` rather than pulled by each query, which
+  means every transition that can make a registration read Dirty has to route through it. Adding a
+  new one and forgetting that is silent by nature, so `PROSPER_WATCH_QUERY_AUDIT=1` re-derives every
+  fast answer from the walk it replaced and reports disagreement; `guest_write_watch_index` builds a
+  desynchronized state by hand to prove the audit fires rather than trusting its zero.
 - **`guest_memory_search.{hpp,cpp}`** — "where else in the guest's address space do these exact bytes
   appear?". Used when an address stops holding what it held and the question becomes whether the
   guest *moved* the data or *consumed* it, which need opposite fixes. Its pure half owns the chunking

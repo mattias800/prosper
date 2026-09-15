@@ -503,6 +503,7 @@ void guest_write_watch_invalidate_all() {
 void guest_write_watch_notify_host_write(uint64_t, uint64_t) {}
 void guest_write_watch_notify_host_write_done(uint64_t, uint64_t) {}
 void guest_write_watch_notify_gpu_write(uint64_t, uint64_t) {}
+bool guest_write_watch_desynchronize_for_test(uint64_t) { return false; }
 
 bool guest_write_watch_handle_fault(uint64_t addr) {
     (void)addr;
@@ -623,6 +624,13 @@ struct WatchedPage {
     // recovery record, but never publish Unchanged or skip the next complete protection pass.
     bool coverage_incomplete = false;
     std::vector<PageAlias> aliases;
+    // #3681: the inverse of Registration::pages -- every registration that references this page.
+    // Maintained only at create/release (189 times over a measured 63 s Sonic route), and read on
+    // every state change so a change is pushed to its registrations once instead of every query
+    // pulling it. It must be the PAGE that carries this and not a VA range: one physical page can
+    // carry several guest VA aliases, and a registration watching a different alias of the same page
+    // is exactly the case this machinery exists to catch. A VA-keyed shortcut would miss it.
+    std::vector<uint64_t> registrations;
 };
 struct RegistrationPage { WatchedPage* page = nullptr; uint64_t generation = 0; };
 struct Registration {
@@ -630,6 +638,16 @@ struct Registration {
     uint64_t begin = 0, end = 0;
     bool gpu_dirty = false;
     bool mapping_valid = true;
+    // #3681: "some covered page has changed generation, been disarmed, or lost complete coverage
+    // since this registration was last verified clean" -- i.e. exactly the disjunction query() used
+    // to re-derive by walking every page, every time. Measured on a 63 s Sonic route: 253,500,144
+    // page visits across 444,024 queries (571 per query) to produce 16 Dirty answers.
+    //
+    // Set by mark_page_changed_locked() from every transition that can make this read Dirty; cleared
+    // only by a complete verification (create, rearm). Conservative in the safe direction by
+    // construction: a spurious set costs one extra rearm, a missed set would publish a stale
+    // Unchanged -- which is why PROSPER_WATCH_QUERY_AUDIT exists to re-derive it against the walk.
+    bool pages_dirty = false;
 };
 
 struct DmemTracePage {
@@ -684,7 +702,25 @@ struct WatchState {
     std::vector<AliasRange> aliases;                                       // live dmem topology
     std::unordered_map<uint64_t, std::unique_ptr<WatchedPage>> pages_by_phys;
     std::unordered_map<uint64_t, WatchedPage*> pages_by_addr;              // page-aligned VA -> page
+    // #3681: how many entries of `pages_by_addr` fall in each kIndexChunk-aligned VA chunk. Lets a
+    // host-write notification skip a whole 2 MiB of unwatched address space with one lookup instead
+    // of 512 misses. Kept exactly in step with pages_by_addr through index_page_addr_locked() /
+    // unindex_page_addr_locked(); a chunk is erased when its count reaches zero, so "present" always
+    // means "at least one watched page inside".
+    std::unordered_map<uint64_t, uint32_t> page_chunks;
     std::unordered_map<uint64_t, Registration> registrations;
+    // #3681: registration ids bucketed by the VA chunks they span, plus the ones too large to bucket.
+    // notify_gpu_write() used to test every live registration: measured 65,442,919 registration
+    // visits across 423,134 notifications to find 6,639 real overlaps, a 9,857:1 ratio.
+    //
+    // Bucketing by START ALONE would be wrong -- a long registration beginning before the write and
+    // containing it has no start inside the queried range. Recording an id in every chunk it spans is
+    // what makes a containing interval findable from the middle. Registrations spanning more than
+    // kMaxRegistrationChunks go in `wide_registrations` instead, so one enormous watch cannot make
+    // registration and teardown O(address space); that list is always scanned, which keeps the
+    // overlap test exact for them at a cost proportional to how few they are.
+    std::unordered_map<uint64_t, std::vector<uint64_t>> registration_chunks;
+    std::vector<uint64_t> wide_registrations;
     std::atomic<bool> fault_onstack{false};                               // red-zone-safe gate
     // Lock-free ownership gate for SIGTRAP coexistence. Most TRAP_TRACE deliveries belong to other
     // debugger/profiler machinery; they must not touch (or wait for) the dmem state mutex unless this
@@ -715,10 +751,94 @@ struct AtomicStats {
         queries{0}, unchanged{0}, dirty{0}, unknown{0}, faults{0}, stale_faults{0},
         physical_writes{0}, rearms{0},
         host_write_notifies{0}, host_write_no_alias{0}, host_write_pages_hit{0},
-        host_write_lock_contended{0};
+        host_write_lock_contended{0},
+        query_pages_visited{0}, host_write_pages_scanned{0}, gpu_write_notifies{0},
+        gpu_write_registrations_visited{0}, gpu_write_overlaps{0},
+        query_audit_stale{0}, query_audit_conservative{0}, rearm_fast{0};
 };
 AtomicStats& stats() { static AtomicStats* value = new AtomicStats; return *value; }
 inline void bump(std::atomic<uint64_t>& c) { c.fetch_add(1, std::memory_order_relaxed); }
+
+// #3681 lookup indexes. 2 MiB per chunk: 512 pages, so a chunk lookup replaces up to 512 misses in
+// pages_by_addr, and a registration under 2 MiB (168 of the 189 live on the measured Sonic route)
+// occupies one or two buckets.
+constexpr uint64_t kIndexChunk = 2ull * 1024ull * 1024ull;
+constexpr uint64_t kMaxRegistrationChunks = 64;   // 128 MiB before a registration is called wide
+// Above this the query itself would visit more buckets than a full scan is worth; fall back rather
+// than let a pathological range turn a bounded lookup into an unbounded one.
+constexpr uint64_t kMaxQueryChunks = 4096;        // 8 GiB
+
+inline uint64_t index_chunk_of(uint64_t addr) { return addr / kIndexChunk; }
+
+void index_page_addr_locked(WatchState& w, uint64_t va, WatchedPage* page) {
+    w.pages_by_addr[va] = page;
+    ++w.page_chunks[index_chunk_of(va)];
+}
+
+void unindex_page_addr_locked(WatchState& w, uint64_t va) {
+    if (!w.pages_by_addr.erase(va)) return;
+    const auto found = w.page_chunks.find(index_chunk_of(va));
+    if (found == w.page_chunks.end()) return;
+    if (--found->second == 0) w.page_chunks.erase(found);
+}
+
+// Every transition that can make a covering registration read Dirty routes through here: a
+// generation bump, a disarm, or a coverage failure. Pushing the change to the registrations once is
+// what lets query() and rearm() answer without re-walking the page list.
+void mark_page_changed_locked(WatchState& w, WatchedPage* page) {
+    if (!page) return;
+    for (const uint64_t id : page->registrations) {
+        const auto found = w.registrations.find(id);
+        if (found != w.registrations.end()) found->second.pages_dirty = true;
+    }
+}
+
+void index_registration_locked(WatchState& w, uint64_t id, const Registration& reg) {
+    if (reg.end <= reg.begin) return;
+    const uint64_t first = index_chunk_of(reg.begin);
+    const uint64_t last = index_chunk_of(reg.end - 1);
+    if (last - first + 1 > kMaxRegistrationChunks) {
+        w.wide_registrations.push_back(id);
+        return;
+    }
+    for (uint64_t chunk = first; chunk <= last; ++chunk)
+        w.registration_chunks[chunk].push_back(id);
+}
+
+void unindex_registration_locked(WatchState& w, uint64_t id, const Registration& reg) {
+    if (reg.end <= reg.begin) return;
+    const uint64_t first = index_chunk_of(reg.begin);
+    const uint64_t last = index_chunk_of(reg.end - 1);
+    if (last - first + 1 > kMaxRegistrationChunks) {
+        const auto it = std::find(w.wide_registrations.begin(), w.wide_registrations.end(), id);
+        if (it != w.wide_registrations.end()) w.wide_registrations.erase(it);
+        return;
+    }
+    for (uint64_t chunk = first; chunk <= last; ++chunk) {
+        const auto found = w.registration_chunks.find(chunk);
+        if (found == w.registration_chunks.end()) continue;
+        const auto it = std::find(found->second.begin(), found->second.end(), id);
+        if (it != found->second.end()) found->second.erase(it);
+        if (found->second.empty()) w.registration_chunks.erase(found);
+    }
+}
+
+// Opt-in self-check: re-derive every fast answer from the walk it replaced and report any
+// disagreement. A missed propagation site publishes a stale Unchanged, which is silent by nature --
+// this is the instrument that makes it loud, and it runs against real titles, not only fixtures.
+bool watch_query_audit_enabled() {
+    static const bool enabled = std::getenv("PROSPER_WATCH_QUERY_AUDIT") != nullptr;
+    return enabled;
+}
+
+// Restores the pre-#3681 walks so the two policies can be interleaved inside ONE binary on one
+// route. Kept because the alternative is comparing two builds and attributing the difference to the
+// only change you remember making; the indexes stay maintained in both arms, so the arm switches
+// which lookup answers, not what the state is.
+bool watch_legacy_scan_enabled() {
+    static const bool enabled = std::getenv("PROSPER_WATCH_LEGACY_SCAN") != nullptr;
+    return enabled;
+}
 
 // Does any recorded alias overlap [begin, end)? O(alias ranges). Lets the notify hooks skip the O(watched
 // pages) purge on the common path: a fresh VA (no reuse) or a non-dmem munmap (every guest heap free).
@@ -823,7 +943,10 @@ bool set_pages_armed(WatchState& w, const std::vector<Page>& pages, bool arm) {
         if (watch_mprotect(reinterpret_cast<void*>(static_cast<uintptr_t>(run.addr)),
                            static_cast<size_t>(run.size), run.to) != 0) {
             for (const auto& entry : pages)
-                if (WatchedPage* page = page_pointer(entry)) page->coverage_incomplete = true;
+                if (WatchedPage* page = page_pointer(entry)) {
+                    page->coverage_incomplete = true;
+                    mark_page_changed_locked(w, page);
+                }
             while (changed) {
                 const ProtectionRun& prior = runs[--changed];
                 watch_mprotect(reinterpret_cast<void*>(static_cast<uintptr_t>(prior.addr)),
@@ -837,6 +960,9 @@ bool set_pages_armed(WatchState& w, const std::vector<Page>& pages, bool arm) {
         if (WatchedPage* page = page_pointer(entry)) {
             page->armed = arm;
             page->coverage_incomplete = false;
+            // Disarming is what makes a covering registration read Dirty; arming never does. The
+            // registration that ASKED to arm clears its own flag afterwards, by verification.
+            if (!arm) mark_page_changed_locked(w, page);
         }
     }
     return true;
@@ -847,17 +973,25 @@ void erase_released_pages_locked(WatchState& w, const std::vector<WatchedPage*>&
         // Failed restoration may leave real guest-writable VAs read-only. Retain their fault index
         // even after the last registration goes away; normal mapping removal retries cleanup.
         if (page->references || page->armed || page->coverage_incomplete) continue;
-        for (const PageAlias& alias : page->aliases) w.pages_by_addr.erase(alias.addr);
+        for (const PageAlias& alias : page->aliases) unindex_page_addr_locked(w, alias.addr);
         w.pages_by_phys.erase(page->phys);
     }
 }
 
 void release_registration_locked(WatchState& w,
                                  std::unordered_map<uint64_t, Registration>::iterator reg) {
+    const uint64_t id = reg->first;
+    unindex_registration_locked(w, id, reg->second);
     std::vector<WatchedPage*> released;
     for (const RegistrationPage& rp : reg->second.pages) {
         WatchedPage* page = rp.page;
-        if (!page || !page->references) continue;
+        if (!page) continue;
+        // Leave the inverse index before the page can be freed, and before any later change can try
+        // to mark an id that no longer resolves. Erase one occurrence per RegistrationPage entry so
+        // a registration covering the same page twice stays balanced.
+        const auto slot = std::find(page->registrations.begin(), page->registrations.end(), id);
+        if (slot != page->registrations.end()) page->registrations.erase(slot);
+        if (!page->references) continue;
         if (--page->references) continue;
         released.push_back(page);
     }
@@ -873,7 +1007,10 @@ void invalidate_phys_range_locked(WatchState& w, uint64_t phys_begin, uint64_t p
     for (auto& [phys, page] : w.pages_by_phys)
         if (phys < phys_end && phys + kPage > phys_begin) hit.push_back(page.get());
     set_pages_armed(w, hit, false);
-    for (WatchedPage* page : hit) page->generation++;
+    for (WatchedPage* page : hit) {
+        page->generation++;
+        mark_page_changed_locked(w, page);
+    }
 }
 
 // Drop every page-granular alias whose VA falls in [begin, end) from its WatchedPage: remove it from the
@@ -902,7 +1039,7 @@ void purge_va_range_locked(WatchState& w, uint64_t begin, uint64_t end, bool rem
         for (auto ai = page->aliases.begin(); ai != page->aliases.end();) {
             const uint64_t apage = ai->addr & ~(kPage - 1);
             if (apage < end && apage + kPage > begin) {
-                w.pages_by_addr.erase(apage);
+                unindex_page_addr_locked(w, apage);
                 ai = page->aliases.erase(ai);
                 changed = true;
             } else {
@@ -911,6 +1048,7 @@ void purge_va_range_locked(WatchState& w, uint64_t begin, uint64_t end, bool rem
         }
         if (changed) {
             page->generation++;
+            mark_page_changed_locked(w, page);
             if (!page->references) recovery.push_back(page);
         }
     }
@@ -1370,7 +1508,8 @@ GuestWriteWatch GuestWriteWatch::create(uint64_t addr, uint64_t size) {
             up->aliases = std::move(aliases_by_phys[r.phys].aliases);
             page = up.get();
             w.pages_by_phys.emplace(r.phys, std::move(up));
-            for (const PageAlias& al : page->aliases) w.pages_by_addr[al.addr & ~(kPage - 1)] = page;
+            for (const PageAlias& al : page->aliases)
+                index_page_addr_locked(w, al.addr & ~(kPage - 1), page);
             to_arm.push_back(page);
         } else {
             page = it->second.get();
@@ -1390,7 +1529,19 @@ GuestWriteWatch GuestWriteWatch::create(uint64_t addr, uint64_t size) {
     }
     bump(stats().registrations);
     stats().registered_pages.fetch_add(reg.pages.size(), std::memory_order_relaxed);
-    w.registrations.emplace(id, std::move(reg));
+    // Seed the flag from the same predicate query() used to evaluate, rather than assuming a fresh
+    // registration is clean. `to_arm` holds only the NEWLY created pages, so a page that already
+    // existed and is currently disarmed joins this registration already dirty -- which is what the
+    // per-query walk reported, and what a default-false flag would silently have lost.
+    reg.pages_dirty = std::any_of(
+        reg.pages.begin(), reg.pages.end(), [](const RegistrationPage& rp) {
+            return !rp.page || !rp.page->armed || rp.page->coverage_incomplete ||
+                   rp.page->generation != rp.generation;
+        });
+    for (RegistrationPage& rp : reg.pages)
+        if (rp.page) rp.page->registrations.push_back(id);
+    const auto inserted = w.registrations.emplace(id, std::move(reg));
+    index_registration_locked(w, id, inserted.first->second);
     return GuestWriteWatch(id);
 }
 
@@ -1405,13 +1556,39 @@ GuestWriteWatchQuery GuestWriteWatch::query() const {
         bump(stats().dirty);
         return GuestWriteWatchQuery::Dirty;
     }
-    for (const RegistrationPage& rp : found->second.pages) {
-        if (!rp.page || !rp.page->armed || rp.page->coverage_incomplete ||
-            rp.page->generation != rp.generation) {
-            bump(stats().dirty);
-            return GuestWriteWatchQuery::Dirty;
+    bool dirty = found->second.pages_dirty;
+    if (watch_legacy_scan_enabled()) {
+        uint64_t visited = 0;
+        dirty = false;
+        for (const RegistrationPage& rp : found->second.pages) {
+            ++visited;
+            if (!rp.page || !rp.page->armed || rp.page->coverage_incomplete ||
+                rp.page->generation != rp.generation) { dirty = true; break; }
+        }
+        stats().query_pages_visited.fetch_add(visited, std::memory_order_relaxed);
+    } else if (watch_query_audit_enabled()) {
+        uint64_t visited = 0;
+        bool walked_dirty = false;
+        for (const RegistrationPage& rp : found->second.pages) {
+            ++visited;
+            if (!rp.page || !rp.page->armed || rp.page->coverage_incomplete ||
+                rp.page->generation != rp.generation) { walked_dirty = true; break; }
+        }
+        stats().query_pages_visited.fetch_add(visited, std::memory_order_relaxed);
+        // Only one direction is a correctness failure. The flag is allowed to be conservatively
+        // dirty where the walk says clean (it costs a rearm); the flag saying CLEAN where the walk
+        // says dirty is a missed propagation site publishing a stale Unchanged.
+        if (!dirty && walked_dirty) {
+            bump(stats().query_audit_stale);
+            std::fprintf(stderr,
+                         "[write-watch-audit] STALE CLEAN id=%llu pages=%zu -- a page changed "
+                         "without marking its registrations\n",
+                         (unsigned long long)id_, found->second.pages.size());
+        } else if (dirty && !walked_dirty) {
+            bump(stats().query_audit_conservative);
         }
     }
+    if (dirty) { bump(stats().dirty); return GuestWriteWatchQuery::Dirty; }
     bump(stats().unchanged);
     return GuestWriteWatchQuery::Unchanged;
 }
@@ -1422,11 +1599,30 @@ bool GuestWriteWatch::rearm() {
     std::lock_guard lock(w.mutex);
     auto found = w.registrations.find(id_);
     if (found == w.registrations.end() || !found->second.mapping_valid) return false;
+    // Nothing covered has changed since the last complete verification, so every page is already
+    // armed at the generation this registration recorded: protection_runs would build a run list
+    // only to issue no syscall, and the resync would assign each page its own value back. Measured
+    // on a 63 s Sonic route: 415,029 rearms over registrations averaging 571 pages.
+    //
+    // Excluded while the dmem trace holds a single-step window, because set_pages_armed REFUSES to
+    // arm across one and returns false; skipping the call there would turn that refusal into a
+    // success. The trace is diagnostic and off by default.
+    if (!found->second.pages_dirty && !watch_legacy_scan_enabled() &&
+        w.trace.status != GuestDmemWriteTraceStatus::Armed &&
+        w.trace.status != GuestDmemWriteTraceStatus::Stepping) {
+        found->second.gpu_dirty = false;
+        bump(stats().rearms);
+        bump(stats().rearm_fast);
+        return true;
+    }
     // The registration already owns the page list under this lock. Use it directly instead of
     // allocating and copying a second list, including when all pages are already armed.
     if (!set_pages_armed(w, found->second.pages, true)) return false;
     for (RegistrationPage& rp : found->second.pages) if (rp.page) rp.generation = rp.page->generation;
     found->second.gpu_dirty = false;
+    // A complete pass just armed every page and resynced every generation: this registration is
+    // verified clean by construction, whatever marked it dirty before.
+    found->second.pages_dirty = false;
     bump(stats().rearms);
     return true;
 }
@@ -1452,7 +1648,11 @@ GuestWriteWatchStats guest_write_watch_stats() {
             v.physical_writes.load(), v.rearms.load(),
             v.host_write_notifies.load(), v.host_write_no_alias.load(),
             v.host_write_pages_hit.load(), v.host_write_lock_contended.load(),
-            g_protect_calls.load(), g_protect_bytes.load()};
+            g_protect_calls.load(), g_protect_bytes.load(),
+            v.query_pages_visited.load(), v.host_write_pages_scanned.load(),
+            v.gpu_write_notifies.load(), v.gpu_write_registrations_visited.load(),
+            v.gpu_write_overlaps.load(), v.query_audit_stale.load(),
+            v.query_audit_conservative.load(), v.rearm_fast.load()};
 }
 
 bool guest_dmem_write_trace_configure(const GuestDmemWriteTraceConfig& config) {
@@ -1750,12 +1950,13 @@ void guest_write_watch_notify_direct_mapping_added(uint64_t addr, uint64_t size,
         WatchedPage* page = it->second.get();
         const uint64_t va = (addr + off) & ~(kPage - 1);
         page->aliases.push_back({va, protection});
-        w.pages_by_addr[va] = page;
+        index_page_addr_locked(w, va, page);
         if (page->armed && cpu_writable(protection) &&
             watch_mprotect(reinterpret_cast<void*>(static_cast<uintptr_t>(va)), kPage,
                            host_prot(protection) & ~PROT_WRITE) != 0) {
             page->generation++;
             page->coverage_incomplete = true;
+            mark_page_changed_locked(w, page);
         }
     }
 }
@@ -2076,14 +2277,32 @@ void guest_write_watch_notify_host_write(uint64_t addr, uint64_t size) {
     // must cost nothing when it is off.
     if (trace_rebase_enabled()) w.host_write_ranges.emplace_back(begin, end);
     std::vector<WatchedPage*> hit;
-    for (uint64_t va = begin; va < end; va += kPage) {
-        auto it = w.pages_by_addr.find(va);
-        if (it != w.pages_by_addr.end() && it->second) hit.push_back(it->second);
+    uint64_t scanned = 0;
+    // A chunk absent from page_chunks holds no watched page at all, so its 512 individual probes
+    // are all misses by construction and are skipped as a block. The per-page probe below is
+    // unchanged for chunks that do hold something, so the resulting `hit` set is identical.
+    const bool legacy_scan = watch_legacy_scan_enabled();
+    for (uint64_t chunk_begin = begin & ~(kIndexChunk - 1); chunk_begin < end;
+         chunk_begin += kIndexChunk) {
+        if (!legacy_scan &&
+            w.page_chunks.find(index_chunk_of(chunk_begin)) == w.page_chunks.end()) continue;
+        const uint64_t from = chunk_begin > begin ? chunk_begin : begin;
+        const uint64_t chunk_end = chunk_begin + kIndexChunk;
+        const uint64_t to = chunk_end < end ? chunk_end : end;
+        for (uint64_t va = from; va < to; va += kPage) {
+            ++scanned;
+            auto it = w.pages_by_addr.find(va);
+            if (it != w.pages_by_addr.end() && it->second) hit.push_back(it->second);
+        }
     }
+    stats().host_write_pages_scanned.fetch_add(scanned, std::memory_order_relaxed);
     if (hit.empty()) return;
     stats().host_write_pages_hit.fetch_add(hit.size(), std::memory_order_relaxed);
     set_pages_armed(w, hit, false);
-    for (WatchedPage* page : hit) page->generation++;
+    for (WatchedPage* page : hit) {
+        page->generation++;
+        mark_page_changed_locked(w, page);
+    }
 }
 
 // Paired with guest_write_watch_notify_host_write: called AFTER the host write has completed, so the
@@ -2129,11 +2348,54 @@ void guest_write_watch_notify_gpu_write(uint64_t addr, uint64_t size) {
             trace_invalidate_locked(w, GuestDmemWriteTraceInvalidReason::PhysicalWrite,
                                     w.trace.status == GuestDmemWriteTraceStatus::Stepping);
     }
-    for (auto& [id, registration] : w.registrations) {
-        (void)id;
-        if (registration.begin < end && addr < registration.end)
-            registration.gpu_dirty = true;
+    bump(stats().gpu_write_notifies);
+    uint64_t overlaps = 0, visited = 0;
+    // The half-open overlap test below is unchanged and still decides every registration; the index
+    // only narrows which ones are offered to it, so a bucketing mistake can cost work but cannot
+    // change an answer for a registration that is actually examined.
+    const auto consider = [&](uint64_t id) {
+        const auto found = w.registrations.find(id);
+        if (found == w.registrations.end()) return;
+        ++visited;
+        if (found->second.begin < end && addr < found->second.end) {
+            if (!found->second.gpu_dirty) ++overlaps;
+            found->second.gpu_dirty = true;
+        }
+    };
+    const uint64_t first_chunk = index_chunk_of(addr);
+    const uint64_t last_chunk = index_chunk_of(end - 1);
+    if (watch_legacy_scan_enabled() || last_chunk - first_chunk + 1 > kMaxQueryChunks) {
+        // Wider than the index is worth walking. Fall back to the complete scan rather than let one
+        // enormous notification visit more buckets than there are registrations.
+        for (auto& [id, registration] : w.registrations) {
+            (void)id;
+            ++visited;
+            if (registration.begin < end && addr < registration.end) {
+                if (!registration.gpu_dirty) ++overlaps;
+                registration.gpu_dirty = true;
+            }
+        }
+    } else {
+        for (uint64_t chunk = first_chunk; chunk <= last_chunk; ++chunk) {
+            const auto found = w.registration_chunks.find(chunk);
+            if (found == w.registration_chunks.end()) continue;
+            for (const uint64_t id : found->second) consider(id);
+        }
+        // Always scanned: a registration spanning more chunks than kMaxRegistrationChunks is not in
+        // any bucket, so omitting this list would silently stop dirtying the largest watches.
+        for (const uint64_t id : w.wide_registrations) consider(id);
     }
+    stats().gpu_write_registrations_visited.fetch_add(visited, std::memory_order_relaxed);
+    stats().gpu_write_overlaps.fetch_add(overlaps, std::memory_order_relaxed);
+}
+
+bool guest_write_watch_desynchronize_for_test(uint64_t addr) {
+    WatchState& w = state();
+    std::lock_guard lock(w.mutex);
+    const auto found = w.pages_by_addr.find(addr & ~(kPage - 1));
+    if (found == w.pages_by_addr.end() || !found->second) return false;
+    found->second->generation++;   // deliberately WITHOUT mark_page_changed_locked
+    return true;
 }
 
 void guest_write_watch_invalidate_all() {
@@ -2143,7 +2405,10 @@ void guest_write_watch_invalidate_all() {
     all.reserve(w.pages_by_phys.size());
     for (auto& [phys, page] : w.pages_by_phys) { (void)phys; all.push_back(page.get()); }
     set_pages_armed(w, all, false);
-    for (WatchedPage* page : all) page->generation++;
+    for (WatchedPage* page : all) {
+        page->generation++;
+        mark_page_changed_locked(w, page);
+    }
 }
 
 // Unified page-fault path for the production dirty bit and the opt-in dmem provenance overlay. The
@@ -2210,6 +2475,7 @@ static GuestWriteWatchFaultAction guest_write_watch_handle_fault_impl(
         }
         page->generation++;
         page->coverage_incomplete = !restored;
+        mark_page_changed_locked(w, page);
         // Preserve #1144's stale-alias contract: a failure on a non-faulting alias must not leave the
         // successfully restored faulting VA logically armed. For diagnostic-only sibling pages there
         // is no faulting VA, so require the complete restore instead.
