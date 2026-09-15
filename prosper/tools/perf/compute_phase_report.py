@@ -82,6 +82,18 @@ PHASES = [
     ("    watch",          "watch_ms",              "writeback_images_ms"),
     ("    pack",           "pack_ms",               "writeback_images_ms"),
     ("    layout(retile)",  "layout_ms",            "writeback_images_ms"),
+    # layout_ms times the whole publication branch, whose two arms are different work: a GPU-retiled
+    # result is memcpy'd out of the retile buffer, a declined one is tiled on the CPU. Modelling the
+    # memcpy as a child does two things -- it surfaces the copy, and it drops layout_ms out of LEAVES,
+    # so the "dominant leaf" line below stops naming a phase that is 99.8% memcpy as the thing to
+    # optimise. Measured 2026-09-15 on PPSA03831: layout 6,551 ms, retile copy 6,541 ms.
+    #
+    # On those figures the CPU-tiling residual does NOT print: `unattributed` is gated at 1% of the
+    # parent, and 10 / 6,551 is 0.15%. That is the stronger statement -- below the threshold this
+    # report considers worth naming -- but it has a corollary worth stating because a blank reads as a
+    # zero: an ABSENT `unattributed` row under layout means the residual is under ~65 ms on this
+    # route, not that it is nothing.
+    ("      retile copy",  "retile_copy_ms",        "layout_ms"),
     ("    notify",         "notify_ms",             "writeback_images_ms"),
     ("    cache",          "cache_ms",              "writeback_images_ms"),
     ("  publish",          "writeback_publish_ms",  "writeback_ms"),
