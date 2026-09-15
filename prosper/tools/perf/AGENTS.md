@@ -4,6 +4,13 @@ Offline readers and regression checks for structured F8 captures. These tools an
 observations; they do not change guest execution or run games. Runtime collection and schema live
 in `frontends/shared/perf/`.
 
+`perf_caller_report.py` separately reads strict native `perf script --no-inline` exports. It reports
+libc family weights, named recorded application ancestors, leaf-only/unresolved/suspicious stacks,
+and optional raw-record loss markers. Application and libc DSO selectors must be exact and disjoint;
+unobserved selectors are not proof of absent work. Event/thread denominators remain separate.
+See `PERF_CALLER_REPORT.md` for commands and limits. A valid parse does not establish build identity,
+complete unwinding, a complete recording, worker coverage or low profiler overhead.
+
 Keep missing measurements distinct from measured zeros, and retain signed timing residuals.
 Nested CPU timers and GPU intervals cannot be added as independent work. Buffer comparison byte
 counts are requested spans, not physical memory traffic or the bytes an early-exiting comparison

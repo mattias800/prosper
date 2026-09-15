@@ -909,18 +909,20 @@ struct CachedShader {
     uint64_t identity = 0;
     mutable std::atomic<uint64_t> last_use{0};
     uint64_t bytes = 0;
+    bool writes_trip_witness = false;
 
     CachedShader() = default;
     CachedShader(const CachedShader& other)
         : spirv(other.spirv), identity(other.identity),
           last_use(other.last_use.load(std::memory_order_relaxed)),
-          bytes(other.bytes) {}
+          bytes(other.bytes), writes_trip_witness(other.writes_trip_witness) {}
     CachedShader& operator=(const CachedShader& other) {
         if (this != &other) {
             spirv = other.spirv;
             identity = other.identity;
             last_use.store(other.last_use.load(std::memory_order_relaxed), std::memory_order_relaxed);
             bytes = other.bytes;
+            writes_trip_witness = other.writes_trip_witness;
         }
         return *this;
     }
@@ -931,6 +933,7 @@ struct ShaderCache {
     std::unordered_map<ShaderCompileKey, CachedShader, ShaderCompileKeyHash> entries;
     std::atomic<uint64_t> hits{0};
     std::atomic<uint64_t> bypasses{0};
+    std::atomic<uint64_t> compute_witness_analyses{0};
     std::atomic<uint64_t> use_counter{0};
     ShaderRecompileCacheStats stats;
     uint64_t next_identity = 1;
@@ -2253,8 +2256,9 @@ std::vector<uint32_t> recompile_graphics_shader_cached(
 std::vector<uint32_t> recompile_compute_shader_cached(
         const uint32_t* code, size_t dwords, const ShaderResourceTable* resources,
         const ComputeShaderConfig& config, uint64_t* cache_identity,
-        RecompileDiagnosticContext diagnostic) {
+        RecompileDiagnosticContext diagnostic, bool* writes_trip_witness) {
     if (cache_identity) *cache_identity = 0;
+    if (writes_trip_witness) *writes_trip_witness = false;
     const bool has_null_guarded_raw_store = resources &&
         std::any_of(resources->resources.begin(), resources->resources.end(),
                     is_proven_null_guarded_raw_store);
@@ -2312,16 +2316,28 @@ std::vector<uint32_t> recompile_compute_shader_cached(
         const size_t owned_dwords = key.code ? key.code->size() : 0u;
         return recompile_compute(owned_code, owned_dwords, resources, config, diagnostic);
     };
+    auto& cache = shader_cache();
+    auto analyze_witness = [&](const std::vector<uint32_t>& spirv) {
+        cache.compute_witness_analyses.fetch_add(1, std::memory_order_relaxed);
+        return spirv_writes_trip_witness(spirv);
+    };
+    // The control re-derives the same fact from returned words on warm hits. It does
+    // not disable compilation caching or change any witness/GDS semantics.
+    static const bool cache_witness = getenv("PROSPER_NO_COMPUTE_WITNESS_CACHE") == nullptr;
+    auto return_witness = [&](const CachedShader& shader) {
+        if (writes_trip_witness)
+            *writes_trip_witness = cache_witness ? shader.writes_trip_witness
+                                                 : analyze_witness(*shader.spirv);
+    };
     if (getenv("PROSPER_NO_SHADER_CACHE")) {
-        auto& cache = shader_cache();
         cache.bypasses.fetch_add(1, std::memory_order_relaxed);
         std::vector<uint32_t> spirv = compile();
+        if (writes_trip_witness) *writes_trip_witness = analyze_witness(spirv);
         maybe_dump_successful_shader(ShaderProgramStage::Compute, key, spirv,
                                      diagnostic.program_address, 0);
         return spirv;
     }
 
-    auto& cache = shader_cache();
     {
         std::shared_lock lock(cache.mutex);
         auto found = cache.entries.find(key);
@@ -2330,6 +2346,7 @@ std::vector<uint32_t> recompile_compute_shader_cached(
             found->second.last_use.store(cache.use_counter.fetch_add(1, std::memory_order_relaxed),
                                          std::memory_order_relaxed);
             if (cache_identity) *cache_identity = found->second.identity;
+            return_witness(found->second);
             maybe_dump_successful_shader(ShaderProgramStage::Compute, key, *found->second.spirv,
                                         diagnostic.program_address, 0);
             return *found->second.spirv;
@@ -2343,6 +2360,7 @@ std::vector<uint32_t> recompile_compute_shader_cached(
         double_check->second.last_use.store(cache.use_counter.fetch_add(1, std::memory_order_relaxed),
                                             std::memory_order_relaxed);
         if (cache_identity) *cache_identity = double_check->second.identity;
+        return_witness(double_check->second);
         maybe_dump_successful_shader(ShaderProgramStage::Compute, key, *double_check->second.spirv,
                                     diagnostic.program_address, 0);
         return *double_check->second.spirv;
@@ -2350,6 +2368,10 @@ std::vector<uint32_t> recompile_compute_shader_cached(
 
     const auto start = std::chrono::steady_clock::now();
     auto spirv = std::make_shared<const std::vector<uint32_t>>(compile());
+    // Retain the derived fact with its immutable module, including when this caller
+    // did not request it. Later callers may request metadata on the same cache hit.
+    const bool witness = analyze_witness(*spirv);
+    if (writes_trip_witness) *writes_trip_witness = witness;
     maybe_dump_successful_shader(ShaderProgramStage::Compute, key, *spirv,
                                  diagnostic.program_address, 0);
     const auto end = std::chrono::steady_clock::now();
@@ -2374,6 +2396,7 @@ std::vector<uint32_t> recompile_compute_shader_cached(
     if (bytes <= limit && max_entries != 0) {
         CachedShader value;
         value.spirv = spirv;
+        value.writes_trip_witness = witness;
         value.identity = cache.next_identity++;
         value.last_use.store(cache.use_counter.fetch_add(1, std::memory_order_relaxed),
                              std::memory_order_relaxed);
@@ -2565,6 +2588,7 @@ ShaderRecompileCacheStats shader_recompile_cache_stats() {
     ShaderRecompileCacheStats result = cache.stats;
     result.hits = cache.hits.load(std::memory_order_relaxed);
     result.bypasses = cache.bypasses.load(std::memory_order_relaxed);
+    result.compute_witness_analyses = cache.compute_witness_analyses.load(std::memory_order_relaxed);
     result.entries = cache.entries.size();
     return result;
 }
@@ -2576,6 +2600,7 @@ void clear_shader_recompile_cache() {
     cache.stats = {};
     cache.hits.store(0, std::memory_order_relaxed);
     cache.bypasses.store(0, std::memory_order_relaxed);
+    cache.compute_witness_analyses.store(0, std::memory_order_relaxed);
     cache.use_counter.store(0, std::memory_order_relaxed);
 }
 
@@ -8748,9 +8773,10 @@ std::vector<ComputeItem> realize_compute_dispatches(
         // Fold-time half of the paired read: the descriptors this dispatch will use were just
         // resolved from guest memory, so sample that memory NOW, before anything else runs.
         compute_memprobe_at_fold(code_addr, dispatch_index, config.user_sgprs);
+        bool compiled_trip_witness = false;
         item.spirv = recompile_compute_shader_cached(
             (const uint32_t*)(uintptr_t)code_addr, 0x10000, table.get(), config, nullptr,
-            recompile_diagnostic);
+            recompile_diagnostic, program_uses_guest_gds_for_item ? nullptr : &compiled_trip_witness);
         item.user_sgprs = config.user_sgprs;
         item.required_subgroup_size = config.native_subgroup_size;
         item.cpu_fast_path = classify_compute_cpu_fast_path(
@@ -8782,7 +8808,7 @@ std::vector<ComputeItem> realize_compute_dispatches(
         // this address's history: a structured loop or a phase ordinal the program lacks compiles to
         // a module with no witness, and a cache hit returns whichever module the key selected.
         item.trip_witness_instrumented = !program_uses_guest_gds_for_item &&
-            spirv_writes_trip_witness(item.spirv);
+            compiled_trip_witness;
         item.terminator_only_program_validated = rdna2_program_is_terminator_only(
             reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)), shader_dwords);
         item.gta5_cf9200_no_backing_validated = item.spirv.size() &&

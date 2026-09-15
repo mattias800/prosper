@@ -2471,6 +2471,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     static uint64_t refs = 0, uniq = 0, memo = 0, hashed = 0, dwords = 0;
                     static uint64_t skipped_large = 0, skipped_unique = 0, fallbacks = 0, calls = 0;
                     static uint64_t large_dwords = 0, upload_bytes = 0;
+                    static PassBufferLookupStats lookup;
                     refs += reuse.buffer_references;      uniq += reuse.unique_buffers;
                     memo += reuse.buffer_ref_memo_hits;   hashed += reuse.buffer_hash_calls;
                     dwords += reuse.buffer_hash_dwords;   fallbacks += reuse.buffer_upload_fallbacks;
@@ -2478,7 +2479,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     skipped_unique += reuse.buffer_hash_skipped_unique;
                     large_dwords += reuse.buffer_skipped_large_dwords;
                     upload_bytes += reuse.buffer_upload_bytes;
-                    if (prosper::diag_should_print(++calls))
+                    lookup.add(reuse.buffer_lookup);
+                    if (prosper::diag_should_print(++calls)) {
                         fprintf(stderr,
                                 "[render-timing] buffer_reuse (cumulative over %llu backend calls) "
                                 "refs=%llu unique=%llu memo_hits=%llu hashed=%llu (%.1f MiB) "
@@ -2492,6 +2494,18 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 (unsigned long long)skipped_unique,
                                 (double)upload_bytes / (1024.0 * 1024.0),
                                 (unsigned long long)fallbacks);
+                        fprintf(stderr,
+                                "[render-timing] buffer_lookup (cumulative over %llu backend calls) "
+                                "observed_passes=%llu arena_passes=%llu allocations=%llu "
+                                "allocation_bytes=%llu deallocations=%llu deallocation_bytes=%llu\n",
+                                (unsigned long long)calls,
+                                (unsigned long long)lookup.observed_passes,
+                                (unsigned long long)lookup.arena_passes,
+                                (unsigned long long)lookup.allocations,
+                                (unsigned long long)lookup.allocation_bytes,
+                                (unsigned long long)lookup.deallocations,
+                                (unsigned long long)lookup.deallocation_bytes);
+                    }
                 }
             };
             auto append_rtt_timing = [](std::string& output, const RttTimingRecord& record) {

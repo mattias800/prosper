@@ -30,6 +30,7 @@
 #include "shared/perf/performance_timing_gate.hpp"
 #include "shared/perf/performance_timing_policy.hpp"
 #include "shared/present/readback_policy.hpp"
+#include "shared/live/pass_buffer_lookup_memory.hpp"
 #include "gpu/present/videoout_present.hpp"
 #include <algorithm>
 #include <array>
@@ -687,6 +688,9 @@ struct BackendResourceReuseStats {
     uint64_t buffer_hash_skipped_unique = 0;
     uint64_t buffer_hash_skipped_large = 0;
     uint64_t buffer_ref_memo_hits = 0;
+    // Heap requests made by the two CPU lookup maps, not Vulkan buffer bytes.
+    // Updated through map/arena destruction; unsupported PMR targets stay unobserved.
+    prosper::frontend::PassBufferLookupStats buffer_lookup;
     // Reference share is not byte share, and the cost here is BYTES. skipped_large at 9.3% of
     // references says nothing on its own about how much of the copy volume those buffers are --
     // they are large by definition, so their byte share is necessarily higher, but "higher" is not
@@ -7084,7 +7088,12 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     };
     std::vector<BufferVerifyRecord> buffer_verify_records;
     std::vector<SharedBufferArena> shared_buffer_arenas;
-    std::unordered_map<SharedBufferKey, size_t, SharedBufferKeyHash> shared_buffer_indices;
+    static const bool use_buffer_lookup_arena =
+        getenv("PROSPER_NO_BUFFER_LOOKUP_ARENA") == nullptr;
+    prosper::frontend::PassBufferLookupMemory buffer_lookup_memory(
+        resource_reuse_stats.buffer_lookup, use_buffer_lookup_arena);
+    prosper::frontend::PassBufferLookupMap<SharedBufferKey, SharedBufferKeyHash>
+        shared_buffer_indices(buffer_lookup_memory.allocator<SharedBufferKey>());
     shared_buffer_indices.reserve(estimated_backend_resources);
     // Per-call repeat-reference memo (#1268): draws in one pass batch overwhelmingly re-reference
     // the same guest ranges (same VB/UB across hundreds of draws), and the SharedBufferKey lookup
@@ -7107,7 +7116,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 (key.count * 0x9e3779b97f4a7c15ull) ^ key.identity);
         }
     };
-    std::unordered_map<BufferRefMemoKey, size_t, BufferRefMemoKeyHash> buffer_ref_memo;
+    prosper::frontend::PassBufferLookupMap<BufferRefMemoKey, BufferRefMemoKeyHash>
+        buffer_ref_memo(buffer_lookup_memory.allocator<BufferRefMemoKey>());
     buffer_ref_memo.reserve(estimated_backend_resources);
     struct BufferUploadSlotMemo {
         uint32_t pass_id0 = 0;
@@ -12266,6 +12276,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         PROSPER_SUM_RESOURCE_STAT(buffer_hash_skipped_unique);
         PROSPER_SUM_RESOURCE_STAT(buffer_hash_skipped_large);
         PROSPER_SUM_RESOURCE_STAT(buffer_ref_memo_hits);
+        aggregate_resources.buffer_lookup.add(resources.buffer_lookup);
         PROSPER_SUM_RESOURCE_STAT(buffer_skipped_large_dwords);
         PROSPER_SUM_RESOURCE_STAT(buffer_range_uploads);
         PROSPER_SUM_RESOURCE_STAT(buffer_range_bindings);

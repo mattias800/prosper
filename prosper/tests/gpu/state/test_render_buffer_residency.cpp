@@ -567,6 +567,73 @@ void range_sharing(const Fixture& f, bool expect_sharing) {
 }
 } // namespace
 
+namespace {
+void lookup_arena(const Fixture& f, bool expected_arena) {
+    disabled(true); // This guard prices pass-local lookup storage, not retained uploads.
+    ResolvedPipelineState hidden = f.state;
+    hidden.color_write_mask = 0;
+    auto pass = [&](const std::vector<std::vector<uint32_t>>& sources) {
+        std::vector<BackendDraw> draws;
+        for (size_t i = 0; i < sources.size(); ++i) {
+            auto d = f.draw(sources[i], 0x735600000ull + i * 65536);
+            d.ps = &hidden;
+            draws.push_back(std::move(d));
+        }
+        // A, B, C, then A again at one binding: A is no longer in the two-slot memo.
+        // Earlier draws cannot color the target, so a wrong final index cannot hide
+        // behind an earlier successful draw of A.
+        draws.push_back(f.draw(sources.front(), 0x735600000ull));
+        auto pixels = render_draws_rgba(draws, W, H, nullptr, Clear);
+        auto stats = backend_resource_reuse_stats();
+        CHECK(stats.unique_buffers == sources.size(), "distinct identities retain distinct uploads");
+        CHECK(stats.buffer_hash_calls == sources.size(), "small inputs exercise the content-key map too");
+        CHECK(stats.buffer_ref_memo_hits == 1, "revisit beyond the two-slot memo resolves one prior upload");
+        if constexpr (prosper::frontend::PassBufferLookupMemory::supported) {
+            CHECK(stats.buffer_lookup.observed_passes == 1 &&
+                      stats.buffer_lookup.arena_passes == uint64_t(expected_arena),
+                  "actual production maps select the expected allocation policy");
+            CHECK(stats.buffer_lookup.allocations == stats.buffer_lookup.deallocations &&
+                      stats.buffer_lookup.allocation_bytes == stats.buffer_lookup.deallocation_bytes,
+                  "all lookup heap blocks are freed before the pass returns");
+        } else {
+            CHECK(stats.buffer_lookup.observed_passes == 0,
+                  "unsupported PMR deployment retains ordinary maps without false allocation evidence");
+        }
+        return std::pair{std::move(pixels), stats.buffer_lookup};
+    };
+    std::vector<std::vector<uint32_t>> sources(3, payload());
+    // Small inputs enter both the content-key map and the pointer-reference memo.
+    // The fixture's ordinary 8 KiB inputs intentionally skip content-key insertion.
+    for (auto& source : sources) source.resize(32);
+    for (size_t i = 1; i < sources.size(); ++i) quad(sources[i], 0, false);
+    auto [visible, small] = pass(sources);
+    CHECK(solid(visible, true), "revisited first buffer actually draws green after three distinct references");
+    if constexpr (prosper::frontend::PassBufferLookupMemory::supported) {
+        CHECK(expected_arena ? small.allocations == 0 : small.allocations >= 6,
+              "small production lookup population avoids individual heap allocations only with the arena");
+    }
+    quad(sources[0], 0, false);
+    CHECK(solid(pass(sources).first, false),
+          "same pointers and identities in a later pass read changed current contents");
+    quad(sources[0], 0, true);
+    CHECK(solid(pass(sources).first, true), "A to B to A content changes never retain lookup authority");
+
+    // Enough independent nodes and reserved buckets to exceed the initial seed on
+    // all supported library layouts. Fallback must preserve real vertex fetches.
+    sources.resize(192, payload());
+    for (auto& source : sources) source.resize(32);
+    for (size_t i = 1; i < sources.size(); ++i) quad(sources[i], 0, false);
+    auto [large_pixels, large] = pass(sources);
+    CHECK(solid(large_pixels, true), "large lookup population preserves the final selected upload");
+    if constexpr (prosper::frontend::PassBufferLookupMemory::supported) {
+        CHECK(large.allocations > 0 && large.allocation_bytes > 4096,
+              "large production lookup population exercises ordinary heap fallback");
+        CHECK(!expected_arena || large.allocations < sources.size(),
+              "growing the arena allocates chunks rather than one heap block per map node");
+    }
+}
+}
+
 int main(int argc, char** argv) {
     if (argc == 3 && std::string(argv[1]) == "--configured-owner-limit") {
         const uint64_t expected = std::stoull(argv[2]);
@@ -587,6 +654,10 @@ int main(int argc, char** argv) {
     Fixture f;
     CHECK(!f.vs.empty() && !f.fs.empty(), "real vertex-fetch and green fragment shaders compile");
     if (f.vs.empty() || f.fs.empty()) return 1;
+    if (argc == 3 && std::string(argv[1]) == "--lookup-arena") {
+        lookup_arena(f, std::string(argv[2]) == "on");
+        return failures ? 1 : 0;
+    }
     if (argc == 3 && std::string(argv[1]) == "--range-sharing") {
         range_sharing(f, std::string(argv[2]) == "on");
         return failures ? 1 : 0;
