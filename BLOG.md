@@ -30,7 +30,9 @@ memory whether it had changed or not. The 2 MiB came from a real measurement —
 graphics card, where that comparison has to cross the PCIe bus. On the machine this is developed on
 the GPU shares memory with the CPU and the comparison is nearly free. Deriving the ceiling from the
 hardware instead of fixing it: **Sonic Frontiers 23.8 → 28.8 fps, Grand Theft Auto V 19.7 → 21.6**,
-and 143 GB a minute of image copying that simply stops happening.
+and 143 GB a minute of image copying that simply stops happening. Only on machines whose GPU shares
+memory with the CPU — a desktop with a separate graphics card keeps the old setting, which is still
+the right one there.
 
 ### The thing we thought was slow was 10 milliseconds
 

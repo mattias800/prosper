@@ -263,12 +263,16 @@ static uint64_t mib_cap_size_new(const char* n, const char* t) {
 // still be honoured as "disable the comparison" rather than read as a parse failure.
 static constexpr uint64_t kDerivedCeilingStandIn = 128ull * 1024ull * 1024ull;
 static uint64_t gpu_compare_new(const char* n, const char* t) {
-    constexpr uint64_t kNoValue = UINT64_MAX;
+    // The site uses a PRESENT FLAG, not a sentinel value: UINT64_MAX is a reachable input here
+    // (parse_u64_strict refuses only overflow, so `=18446744073709551615` parses exactly), and a
+    // sentinel a person can type is not a sentinel. Review finding on #3685.
     if (!t || !*t) return kDerivedCeilingStandIn;
-    const uint64_t requested = env_u64_or_default(n, t, kNoValue, "MiB");
-    if (requested == kNoValue) return kDerivedCeilingStandIn;   // malformed -> derived, not discrete
-    const uint64_t capped = requested < SIZE_MAX / (1024ull * 1024ull)
-        ? requested : SIZE_MAX / (1024ull * 1024ull);
+    uint64_t probe = 0;
+    const bool well_formed = parse_u64_strict(t, &probe);
+    const uint64_t mib = env_u64_or_default(n, t, 0ull, "MiB");
+    if (!well_formed) return kDerivedCeilingStandIn;                   // malformed -> derived
+    const uint64_t capped = mib < SIZE_MAX / (1024ull * 1024ull)
+        ? mib : SIZE_MAX / (1024ull * 1024ull);
     return capped * 1024ull * 1024ull;
 }
 static uint64_t gpu_compare_old(const char* t) {

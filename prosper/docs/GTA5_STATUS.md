@@ -226,8 +226,10 @@ The primary bottlenecks identified and resolved are detailed below; they are gen
   first line — and it was then applied as a global default, so a unified-memory device paid a bound
   whose justification it does not have. On an integrated Radeon 8060S the same ceiling disabled the
   comparison for every 4K target; deriving it (128 MiB on unified memory, 2 MiB unchanged on
-  discrete) measured **GTA V 19.7 → 21.6 fps** on a 60 s default launch here, and Sonic Frontiers
-  23.8 → 28.8. `PROSPER_MAX_GPU_COMPARE_IMAGE_MB` still overrides both. Nothing about the
+  discrete) measured **GTA V 19.7 → 21.6 fps** on a 60 s default launch here (distinct frames
+  462 → 506), and Sonic Frontiers **median 23.8 → 28.8** over six interleaved arms (+21% on medians,
+  +17% on means; distinct 1233/1231/1304 → 1493/1472/1489). Default present mode, so read the
+  distinct counts as the throughput rather than the presented rate. `PROSPER_MAX_GPU_COMPARE_IMAGE_MB` still overrides both. Nothing about the
   Windows/NVIDIA tuning changed — this changes which devices receive it.
 
 ### 4. Eliminating Spurious 4K Scanout and Unbound Slot CPU Readbacks

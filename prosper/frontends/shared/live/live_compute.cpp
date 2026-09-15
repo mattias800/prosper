@@ -1389,9 +1389,13 @@ size_t cold_storage_result_snapshot_defer_min_bytes() {
     return bytes;
 }
 
+size_t max_gpu_compare_image_bytes();
+
 // Whether the GPU result comparison has to cross a bus to reach the staging buffer it reads.
 // Written once by VulkanComputeContext::init(); 0 = not yet known, 1 = discrete, 2 = unified.
-// Not an enum class because it is read without synchronization from the size query below.
+// Not an enum class because it is read with relaxed ordering from the size query below. Relaxed is
+// adequate: every consumer sits downstream of the function-local static whose initializer calls
+// init(), and magic-static initialization supplies the release/acquire edge.
 std::atomic<uint32_t>& compare_memory_topology() {
     static std::atomic<uint32_t> value{0};
     return value;
@@ -1403,7 +1407,6 @@ std::atomic<uint32_t>& compare_memory_topology() {
 // a bus, and it does not need a threshold anybody has to tune. VIRTUAL_GPU and CPU devices are
 // deliberately left on the conservative ceiling -- a software rasterizer's cost model is neither of
 // the two this is choosing between, and lavapipe is what CI runs.
-size_t max_gpu_compare_image_bytes();
 void record_compare_memory_topology(VkPhysicalDevice physical) {
     if (!physical) return;
     VkPhysicalDeviceProperties properties{};
@@ -1433,8 +1436,11 @@ void record_compare_memory_topology(VkPhysicalDevice physical) {
 //       2 MiB      2,545 ms        1,321 ms        0.1 ms      1.90 cores
 //     128 MiB      1,961 ms          512 ms      173.8 ms      1.66 cores
 //
-// i.e. it trades 174 ms on a GPU measured 9% busy for 809 ms of CPU writeback. Six interleaved arms
-// put distinct frames at 1280/1257/1210 against 1448/1481/1526, with no overlap between the groups.
+// i.e. it trades 174 ms on a GPU measured 9% busy for 809 ms of CPU writeback. Six interleaved 60 s
+// arms of THIS derivation against an explicit `=2` put distinct frames at 1233/1231/1304 against
+// 1493/1472/1489, with no overlap between the groups. (An earlier six-arm run comparing an explicit
+// `=128` against `=2` gave 1280/1257/1210 against 1448/1481/1526 -- the same conclusion from a
+// different binary, and NOT the run that justifies this code.)
 //
 // The discrete default is deliberately left at 2 MiB: this changes which devices take the shipped
 // GTA V/NVIDIA tuning, and does not retune it. An explicit PROSPER_MAX_GPU_COMPARE_IMAGE_MB still
@@ -1449,27 +1455,34 @@ size_t max_gpu_compare_image_bytes() {
     // for. Two relaxed atomic loads and a compare.
     const size_t derived = compare_memory_topology().load(std::memory_order_relaxed) == 2u
         ? kUnifiedBytes : kDiscreteBytes;
-    // The ENV READ is latched, and the sentinel is what keeps a typo from silently choosing a
-    // setting. `env_u64_or_default` returns its fallback for a malformed value, so a fallback of
-    // UINT64_MAX -- which no honest input reaches, and which the cap below would swallow anyway --
-    // is distinguishable from every value a person could mean. A malformed value therefore falls
-    // back to the DERIVED default rather than to the discrete one, which matters because the two now
-    // differ by 64x: under the previous shape a typo would have quietly cost a unified-memory device
-    // the whole mechanism. An explicit 0 is honoured and disables the comparison; that is a real
-    // setting, so it must not be confused with a parse failure. #3267.
-    constexpr uint64_t kNoValue = UINT64_MAX;
-    static const uint64_t requested = [] {
+    // The ENV READ is latched; the derived default is not, so the latch cannot pin an early call's
+    // conservative answer. A malformed value keeps the DERIVED ceiling rather than the discrete one,
+    // which matters because the two now differ by 64x: falling back to the constant would let a typo
+    // quietly cost a unified-memory device the whole mechanism. An explicit 0 is honoured and
+    // disables the comparison -- a real setting, and not to be confused with a parse failure. #3267.
+    //
+    // A separate `present` flag rather than a sentinel value: UINT64_MAX is a REACHABLE input here
+    // (parse_u64_strict refuses only overflow, so `=18446744073709551615` parses exactly), and a
+    // sentinel it can reach is not a sentinel. Review finding on #3685.
+    struct Requested { bool present; uint64_t mib; };
+    static const Requested requested = [] {
         const char* value = std::getenv("PROSPER_MAX_GPU_COMPARE_IMAGE_MB");
-        if (!value || !*value) return kNoValue;
-        // The sentinel is what the refusal would otherwise print as "the default", and
-        // 18446744073709551615 tells an operator nothing. `default_note` exists for exactly this
-        // case -- a default that is itself a sentinel -- so the line names what will actually be used.
-        return prosper::diag::env_u64_or_default(
-            "PROSPER_MAX_GPU_COMPARE_IMAGE_MB", value, kNoValue, "MiB",
+        if (!value || !*value) return Requested{false, 0};
+        // The VALUE and the refusal message both come from the shared helper, so this site keeps the
+        // one grammar and the one operator-facing line every other numeric knob uses -- which
+        // `check_env_numeric_arms.py` also requires of any knob carrying an arm in
+        // test_env_numeric_sites.cpp. `parse_u64_strict` is asked separately, and only to tell a
+        // well-formed value from a refused one, because the helper reports that distinction to the
+        // operator but cannot return it.
+        uint64_t probe = 0;
+        const bool well_formed = prosper::diag::parse_u64_strict(value, &probe);
+        const uint64_t mib = prosper::diag::env_u64_or_default(
+            "PROSPER_MAX_GPU_COMPARE_IMAGE_MB", value, 0ull, "MiB",
             "so the device-derived ceiling stands: 128 MiB on unified memory, 2 MiB on discrete");
+        return well_formed ? Requested{true, mib} : Requested{false, 0};
     }();
-    if (requested == kNoValue) return derived;
-    const uint64_t capped = std::min<uint64_t>(requested, SIZE_MAX / (1024ull * 1024ull));
+    if (!requested.present) return derived;
+    const uint64_t capped = std::min<uint64_t>(requested.mib, SIZE_MAX / (1024ull * 1024ull));
     return static_cast<size_t>(capped * (1024ull * 1024ull));
 }
 

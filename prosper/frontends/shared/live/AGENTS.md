@@ -175,6 +175,15 @@ unconditionally; below it, an unchanged result skips the map, the CPU retile cop
 and the write-watch notify. `PROSPER_MAX_GPU_COMPARE_IMAGE_MB` overrides the derivation; a malformed
 value keeps the derived ceiling rather than silently selecting the discrete one.
 
+One consequence of admitting larger results, worth knowing before trusting the skip's proof at every
+size: `cold_storage_result_snapshot_can_defer` stops retaining a host source snapshot for write-only
+storage images at or above its minimum (16 MiB by default), and `acquire_cached_image`'s exact-memcmp
+leg needs that snapshot. So for images between that minimum and the ceiling, `upload_skipped` rests on
+the GPU-write journal and the page write-watch alone rather than on all three legs. Those two legs
+already carried the upload decision at every size and are unchanged — but if the watch ever misses a
+guest write, the failure mode for this population is a STALE RESULT left in guest memory rather than a
+fresh result computed from stale input, which is the harder one to notice.
+
 Timers are nested, not additive: `setup_ms` covers owner materialization after resource/alias checks;
 `validation_ms` includes upload compare/copy/map/watch on cache hits. `writeback_ms` encloses result
 comparison, guest copy/layout, map, host-write-watch notification, baseline creation, architectural
