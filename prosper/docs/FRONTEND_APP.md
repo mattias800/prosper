@@ -435,7 +435,33 @@ measurement. Ratios between the two row kinds are unaffected, since both sit und
 
 When grepping these rows, **anchor on `^[compute-image-writeback]`**. An unanchored
 `grep -o 'skipped=[01]'` also matches `upload-skipped=` on `[compute-image]` lines and silently
-inflates the count.
+inflates the count — measured on a 60 s *Sonic Frontiers* log, 8,394 real rows against 25,176
+unanchored matches, so the error is a factor of three rather than a rounding one.
+
+**How large the skip fraction actually is, measured at `28070b24c`** — and it is title-dependent
+enough that a figure from one route should not be carried to another:
+
+| route | total rows | `skipped=0` | `skipped=1` | skip fraction |
+| --- | --- | --- | --- | --- |
+| *Sonic Frontiers*, 60 s | 8,394 | 4,774 | 3,620 | 43.1% |
+| *Grand Theft Auto V*, 75 s | 616 | 111 | 505 | **82.0%** |
+
+On *Grand Theft Auto V* the pre-#3690 rows therefore described barely a fifth of the image
+writebacks, and any per-writeback mean taken from such a log is biased upward by roughly five.
+
+The two *Sonic Frontiers* arms below do different total work — 8,394 rows against 6,922, a 17.5%
+deficit, since every writeback does real work once the comparison is off and fewer therefore fit in
+the same 60 s. Scaled by that ratio an unchanged skip path would still have produced roughly 2,985
+rows against the 0 observed, so the deficit cannot manufacture the result; it is recorded because
+8,394 and 6,922 do not otherwise reconcile on the page.
+
+**How often `reason=repeated-output` fires is UNKNOWN, and a live log cannot currently tell you.**
+It fired zero times across three measured runs, but do not read that as "the path is dead" — see the
+`## Ruled out` section below for why one of those arms was void and the other two are unvalidated
+nulls. There is also an observability gap underneath them: `live_compute_image_result_snapshot_bytes()`
+is read only from tests and printed by nothing, so a live run cannot distinguish *"a host snapshot was
+armed and the output never repeated"* from *"no host snapshot was ever armed"*. Printing that counter
+under the existing `image_timing` gate would separate the two.
 
 #### Reading the compute side at run scale
 
@@ -873,6 +899,25 @@ duplicate. Until then the app is fully functional via `--test-pattern` (and any 
 - **"A GPU hang / driver fault is involved."** No fault is logged at all: nothing in `journalctl -k`
   for 30 minutes around the freeze, and the amdgpu hang detector never fires — there is no stuck job
   to detect, only a held lock, which is why there is no self-recovery and no timeout (#3225).
+- **"Forcing the GPU comparison off exercises the CPU-comparison skip."** The natural way to produce
+  a `reason=repeated-output` census row is `PROSPER_MAX_GPU_COMPARE_IMAGE_MB=0`, on the reasoning
+  that results refused by the GPU comparison must fall to the host-snapshot path. Measured on a 60 s
+  *Sonic Frontiers* route the GPU skips do vanish (3,620 → 0), but those writebacks become
+  **ordinary** ones (4,774 → 6,922) and none reach `repeated_output`. **The arm is void by
+  construction, not merely unlucky, and that is the part worth keeping:**
+  `remember_cached_image_result` is gated on
+  `(force_host_result_fallback || bi.exact_result_bytes <= max_gpu_compare_image_bytes())`
+  (`live_compute.cpp:12335`) — *the same ceiling the switch zeroes* — so no host snapshot is ever
+  stored, and `cached_image_result_matches()` needs `result_snapshot.size() == bytes`
+  (`:3391`), which an absent snapshot cannot satisfy. **The experiment cannot be run this way on any
+  title**, so changing route or hunting for a small/unaligned title — which an earlier draft of this
+  entry suggested — is chasing the wrong variable. The constructed positive instance is instead
+  test-shaped, and half of it exists already:
+  `live_compute_force_next_image_result_host_fallback_for_test()` (`live_compute.hpp:427`) is exactly
+  that bypass, and `tests/gpu/execute/test_storage_readonly.cpp:189` already arms it and asserts the
+  snapshot grows; only dispatching the same producer twice is missing. The observed zero is therefore
+  a property of the **instrument**, not of the code, and is not quotable as "this never fires"
+  (#3692).
 
 ## Risks & open questions
 
