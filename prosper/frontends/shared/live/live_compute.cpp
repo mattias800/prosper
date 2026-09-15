@@ -683,6 +683,68 @@ bool compute_buffers_equal(const void* lhs, const void* rhs, size_t bytes) {
     return equal.load(std::memory_order_relaxed);
 }
 
+// Exact comparison that also reports WHERE the buffers differ. Returns true when equal; writes the
+// inclusive first/last differing byte offsets otherwise.
+//
+// **The extent is load-bearing, not diagnostic.** The upload copies ONLY [first,last], so every byte
+// outside it is written on the strength of this function having proved it already equal. A span one
+// byte too NARROW leaves a stale byte in a GPU buffer, which no shader-output assertion necessarily
+// catches and which surfaces as a wrong pixel much later. An earlier revision of this comment said
+// "for diagnostics only" -- it was written when the span merely reported, and it survived into the
+// revision that made the copy depend on it, where it would have licensed a future reader to make the
+// narrowing approximate. Keep it exact; `tests/shared/live/test_compute_buffer_diff_span.cpp` pins
+// the property that the narrowed copy reproduces a full one.
+//
+// It is also the only thing that can answer where a difference lies: `compute_buffers_equal` above
+// scans every byte by construction (eight workers, each memcmp-ing its whole slice), so a
+// full-length compare time says nothing about whether one byte changed or all of them.
+bool compute_buffers_diff_span(const void* lhs, const void* rhs, size_t bytes,
+                               size_t* first, size_t* last) {
+    const auto* a = static_cast<const uint8_t*>(lhs);
+    const auto* b = static_cast<const uint8_t*>(rhs);
+    std::atomic<size_t> lowest{SIZE_MAX};
+    std::atomic<size_t> highest{0};
+    const auto scan = [&](size_t begin, size_t end) {
+        if (begin >= end) return;
+        // Block-wise from both ends, never byte-at-a-time (a 41 MiB span scanned per byte would cost
+        // more than the copy this avoids) and never a whole-slice memcmp first. An earlier version
+        // did exactly that -- memcmp the slice to decide equality, then narrow -- which scanned every
+        // differing slice TWICE and made the comparison 20% slower than the plain equality check it
+        // replaced, eating a third of the win. The forward scan below already proves equality by
+        // reaching `end`, so the extra pass bought nothing. 64 KiB blocks so the per-call overhead
+        // stays negligible against memcmp's throughput.
+        constexpr size_t kBlock = 64u << 10;
+        size_t f = begin;
+        while (f < end) {
+            const size_t step = std::min(kBlock, end - f);
+            if (std::memcmp(a + f, b + f, step) != 0) break;
+            f += step;
+        }
+        if (f >= end) return;                 // this slice is equal
+        while (f < end && a[f] == b[f]) ++f;
+        size_t l = end;                       // exclusive while narrowing
+        while (l > f + 1) {
+            const size_t step = std::min(kBlock, l - f - 1);
+            if (std::memcmp(a + l - step, b + l - step, step) != 0) break;
+            l -= step;
+        }
+        --l;                                  // inclusive
+        while (l > f && a[l] == b[l]) --l;
+        size_t seen = lowest.load(std::memory_order_relaxed);
+        while (f < seen && !lowest.compare_exchange_weak(seen, f, std::memory_order_relaxed)) {}
+        seen = highest.load(std::memory_order_relaxed);
+        while (l > seen && !highest.compare_exchange_weak(seen, l, std::memory_order_relaxed)) {}
+    };
+    constexpr size_t kParallelThreshold = 8u << 20;
+    if (bytes < kParallelThreshold) scan(0, bytes);
+    else parallel_compute_texels(bytes, bytes, scan, 8u);
+    const size_t f = lowest.load(std::memory_order_relaxed);
+    if (f == SIZE_MAX) return true;
+    if (first) *first = f;
+    if (last) *last = highest.load(std::memory_order_relaxed);
+    return false;
+}
+
 void copy_compute_buffer(void* destination, const void* source, size_t bytes) {
     constexpr size_t kParallelThreshold = 8u << 20;
     if (bytes < kParallelThreshold) {
@@ -7332,16 +7394,44 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     // Pooled host-visible allocations retain their previous contents. Compare them
                     // with current guest memory before uploading: any mutation takes the exact copy.
                     bool equal;
+                    size_t diff_first = 0, diff_last = 0;
                     timing.validation = "pooled-full";
                     {
                         ComputeBufferCostScope cost(timing.enabled, timing.upload_compare_ms);
-                        equal = compute_buffers_equal(mapped, source, buffers[i].bytes);
+                        equal = compute_buffers_diff_span(mapped, source, buffers[i].bytes,
+                                                          &diff_first, &diff_last);
                     }
                     timing.compared_bytes += buffers[i].bytes;
                     if (!equal) {
+                        // Copy ONLY the bytes that differ. The comparison above established the
+                        // exact inclusive extent, so writing the bytes outside it would be a no-op
+                        // and the destination ends byte-identical to a full copy either way.
+                        //
+                        // Read "no-op" precisely: it is a statement about the instant the
+                        // comparison ran, NOT a claim that guest memory stays equal afterwards. If
+                        // the guest can mutate `source` between the comparison and this copy, a
+                        // full copy would race exactly as this narrowed one does -- the window is
+                        // the same one that already existed, widened only by the copy being
+                        // shorter. Nothing here establishes stability, and a future reader must not
+                        // take this sentence as though it did; that is how the "for diagnostics
+                        // only" line above the comparison came to outlive its own truth.
+                        //
+                        // This is worth the narrowing because a pooled host-visible allocation
+                        // retains its previous tenant's contents, which for a repeatedly-bound
+                        // buffer is mostly the same data. Measured on GTA V's 0x2042f47600: the
+                        // difference starts at byte 0 on every one of 108 bindings but ENDS at a
+                        // median 41.3 MiB, so 215 MiB of each 256 MiB upload was already correct
+                        // (#3696).
                         ComputeBufferCostScope cost(timing.enabled, timing.upload_copy_ms);
-                        copy_compute_buffer(mapped, source, buffers[i].bytes);
-                        timing.uploaded_bytes += buffers[i].bytes;
+                        const size_t span = diff_last - diff_first + 1;
+                        copy_compute_buffer(static_cast<uint8_t*>(mapped) + diff_first,
+                                            static_cast<const uint8_t*>(source) + diff_first, span);
+                        timing.uploaded_bytes += span;
+                        if (timing.enabled) {
+                            timing.diff_observed = true;
+                            timing.diff_first = diff_first;
+                            timing.diff_span_bytes = span;
+                        }
                     }
                     {
                         ComputeBufferCostScope cost(timing.enabled, timing.upload_map_ms);
@@ -12664,7 +12754,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 "upload_compare_ms=%.6f upload_copy_ms=%.6f upload_map_ms=%.6f "
                 "upload_watch_ms=%.6f writeback_ms=%.6f result_compare_ms=%.6f "
                 "guest_copy_ms=%.6f guest_layout_ms=%.6f result_map_ms=%.6f result_watch_ms=%.6f "
-                "baseline_ms=%.6f notify_ms=%.6f source_validation_ms=%.6f provenance_ms=%.6f\n",
+                "baseline_ms=%.6f notify_ms=%.6f source_validation_ms=%.6f provenance_ms=%.6f "
+                "diff-observed=%u diff-first=%llu diff-span-bytes=%llu\n",
                 (unsigned long long)item.submit_no, (unsigned long long)item.dispatch_index,
                 (unsigned long long)item.command_order, (unsigned long long)item.code_addr,
                 (unsigned long long)timing_program_hash, ok ? 1u : 0u, r.binding, i,
@@ -12687,7 +12778,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 t.setup_ms, t.validation_ms, t.upload_compare_ms, t.upload_copy_ms,
                 t.upload_map_ms, t.upload_watch_ms, t.writeback_ms, t.result_compare_ms,
                 t.guest_copy_ms, t.guest_layout_ms, t.result_map_ms, t.result_watch_ms,
-                t.baseline_ms, t.notify_ms, t.source_validation_ms, t.provenance_ms);
+                t.baseline_ms, t.notify_ms, t.source_validation_ms, t.provenance_ms,
+                t.diff_observed ? 1u : 0u, (unsigned long long)t.diff_first,
+                (unsigned long long)t.diff_span_bytes);
         }
     }
     return ok;
@@ -13171,6 +13264,11 @@ uint64_t live_compute_cpu_fill_dispatches() {
 uint64_t live_compute_storage_result_snapshot_bytes() {
     const VulkanComputeContext* context = g_live_compute_context.load(std::memory_order_acquire);
     return context ? context->storage_result_snapshot_bytes : 0;
+}
+
+bool compute_buffer_diff_span_for_test(const void* lhs, const void* rhs, size_t bytes,
+                                       size_t* first, size_t* last) {
+    return compute_buffers_diff_span(lhs, rhs, bytes, first, last);
 }
 
 uint64_t live_compute_image_result_snapshot_bytes() {
