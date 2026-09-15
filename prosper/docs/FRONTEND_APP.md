@@ -435,8 +435,16 @@ measurement. Ratios between the two row kinds are unaffected, since both sit und
 
 When grepping these rows, **anchor on `^[compute-image-writeback]`**. An unanchored
 `grep -o 'skipped=[01]'` also matches `upload-skipped=` on `[compute-image]` lines and silently
-inflates the count — measured on a 60 s *Sonic Frontiers* log, 8,394 real rows against 25,176
-unanchored matches, so the error is a factor of three rather than a rounding one.
+inflates the count. Derive the ratio from your own log rather than trusting this one — the two
+commands are
+
+```bash
+grep -c '^\[compute-image-writeback\]' <log>      # real rows
+grep -o 'skipped=[01]' <log> | wc -l              # what the unanchored form counts
+```
+
+On one 60 s *Sonic Frontiers* log that was 8,394 against 25,176, so the error is a factor of three
+rather than a rounding one.
 
 **How large the skip fraction actually is, measured at `28070b24c`** — and it is title-dependent
 enough that a figure from one route should not be carried to another:
@@ -907,9 +915,9 @@ duplicate. Until then the app is fully functional via `--test-pattern` (and any 
   construction, not merely unlucky, and that is the part worth keeping:**
   `remember_cached_image_result` is gated on
   `(force_host_result_fallback || bi.exact_result_bytes <= max_gpu_compare_image_bytes())`
-  (`live_compute.cpp:12335`) — *the same ceiling the switch zeroes* — so no host snapshot is ever
+  (`live_compute.cpp:12336`) — *the same ceiling the switch zeroes* — so no host snapshot is ever
   stored, and `cached_image_result_matches()` needs `result_snapshot.size() == bytes`
-  (`:3391`), which an absent snapshot cannot satisfy. **The experiment cannot be run this way on any
+  (`:3392`), which an absent snapshot cannot satisfy. **The experiment cannot be run this way on any
   title**, so changing route or hunting for a small/unaligned title — which an earlier draft of this
   entry suggested — is chasing the wrong variable. The constructed positive instance is instead
   test-shaped, and half of it exists already:
