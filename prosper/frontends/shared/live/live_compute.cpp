@@ -1407,6 +1407,110 @@ struct CachedComputePipeline {
     VkPipeline pipeline = VK_NULL_HANDLE;
 };
 
+// Why a storage image took the CPU tiling path instead of the GPU retile compute shader.
+//
+// `layout_ms` -- the CPU tile_surface/tile_volume pass -- is one of the largest leaves in the compute
+// profile (about 7 s of a 33 s summed-thread total on a 70 s Sonic Frontiers route), and it runs
+// exactly when this admission declines. The admission has a dozen `continue`s and no counter on any of
+// them, so "the CPU path is hot" and "which condition sent it there" were separate questions with only
+// the first answerable. Nothing here changes a decision; each reason is recorded where the decision was
+// already being made.
+//
+// Counted per reason and per program, because the interesting quantity is which SHAPE a hot program
+// presents, not the global mix: a title can decline ten thousand times for a reason that costs nothing
+// and a hundred times for the one that owns the frame.
+enum class GpuRetileDecline : uint8_t {
+    Admitted = 0,
+    Aliased,               // this binding is an alias of an earlier one; the owner does the writeback
+    Imported,              // guest-imported image, not a storage result prosper produced
+    PartialWrite,          // a write mask means the result does not cover the whole surface
+    InexactBytes,          // staged bytes are not the guest's exact storage extent
+    MipTailOrOffset,       // in a mip tail, or at a nonzero layer/mip offset
+    NoStaging,             // no staging buffer for this image
+    UnsupportedShape,      // layer/depth/dimension combination outside the admitted set
+    PackedDisabled,        // packed byte/halfword words with the extension switched off
+    PackedUnsupported,     // array-and-not-packed, or a packed descriptor the layout cannot express
+    LayoutMismatch,        // parameters would not reproduce the guest's exact tiled/linear extents
+    PrepareFailed,         // pipeline/buffer/memory/descriptor setup declined at runtime
+    Disabled,              // PROSPER_NO_GPU_RETILE
+    Count
+};
+
+const char* gpu_retile_decline_name(GpuRetileDecline reason) {
+    switch (reason) {
+        case GpuRetileDecline::Admitted: return "admitted";
+        case GpuRetileDecline::Aliased: return "aliased";
+        case GpuRetileDecline::Imported: return "imported";
+        case GpuRetileDecline::PartialWrite: return "partial-write";
+        case GpuRetileDecline::InexactBytes: return "inexact-bytes";
+        case GpuRetileDecline::MipTailOrOffset: return "mip-tail-or-offset";
+        case GpuRetileDecline::NoStaging: return "no-staging";
+        case GpuRetileDecline::UnsupportedShape: return "unsupported-shape";
+        case GpuRetileDecline::PackedDisabled: return "packed-disabled";
+        case GpuRetileDecline::PackedUnsupported: return "packed-unsupported";
+        case GpuRetileDecline::LayoutMismatch: return "layout-mismatch";
+        case GpuRetileDecline::PrepareFailed: return "prepare-failed";
+        case GpuRetileDecline::Disabled: return "disabled";
+        default: return "?";
+    }
+}
+
+struct GpuRetileCensus {
+    struct Row {
+        std::array<uint64_t, static_cast<size_t>(GpuRetileDecline::Count)> reasons{};
+        // One representative shape per reason, so a row can be acted on without a second run. First
+        // seen wins: a later one would need a policy for which is representative, and there is none.
+        std::array<char, 96> sample{};
+        uint64_t sampled_reason = 0;
+    };
+    std::mutex mutex;
+    std::unordered_map<uint64_t, Row> by_code;   // guest code address of the dispatching program
+    std::atomic<bool> any{false};
+
+    void record(uint64_t code_addr, GpuRetileDecline reason,
+                const prosper::gpu::ShaderResource* r, uint32_t bpe) {
+        any.store(true, std::memory_order_relaxed);
+        std::lock_guard<std::mutex> lock(mutex);
+        Row& row = by_code[code_addr];
+        row.reasons[static_cast<size_t>(reason)]++;
+        if (reason != GpuRetileDecline::Admitted && !row.sample[0] && r) {
+            std::snprintf(row.sample.data(), row.sample.size(),
+                          "%ux%ux%u dim=%u tile=%u fmt=%u bpe=%u",
+                          r->width, r->height, r->depth, (unsigned)r->img_dim,
+                          (unsigned)r->tile_mode, (unsigned)r->format, bpe);
+            row.sampled_reason = static_cast<uint64_t>(reason);
+        }
+    }
+
+    void report() {
+        if (!any.load(std::memory_order_relaxed)) return;
+        std::lock_guard<std::mutex> lock(mutex);
+        std::fprintf(stderr, "[gpu-retile-census] %zu program(s)\n", by_code.size());
+        for (const auto& [code, row] : by_code) {
+            std::string line;
+            uint64_t total = 0;
+            for (size_t i = 0; i < row.reasons.size(); ++i) {
+                if (!row.reasons[i]) continue;
+                total += row.reasons[i];
+                line += " ";
+                line += gpu_retile_decline_name(static_cast<GpuRetileDecline>(i));
+                line += "=" + std::to_string(row.reasons[i]);
+            }
+            std::fprintf(stderr, "[gpu-retile-census] code=0x%llx images=%llu%s%s%s\n",
+                         (unsigned long long)code, (unsigned long long)total, line.c_str(),
+                         row.sample[0] ? "  first-decline: " : "",
+                         row.sample[0] ? row.sample.data() : "");
+        }
+    }
+};
+
+GpuRetileCensus& gpu_retile_census() { static GpuRetileCensus* value = new GpuRetileCensus; return *value; }
+
+bool gpu_retile_census_enabled() {
+    static const bool enabled = std::getenv("PROSPER_GPU_RETILE_CENSUS") != nullptr;
+    return enabled;
+}
+
 bool compute_memory_pool_enabled() {
     static const bool enabled = std::getenv("PROSPER_NO_MEMORY_POOL") == nullptr;
     return enabled;
@@ -2072,6 +2176,18 @@ struct VulkanComputeContext {
         (void)once;
     }
     uint64_t image_borrow_census_submits = 0;
+
+    // Its own gate and its own period, for the reason the comment above gives: a shared cadence makes
+    // one report's timing an artefact of the other's variable. atexit as well as periodic, because a
+    // routed run is usually ended by a signal after the interesting phase rather than at a multiple of
+    // the period.
+    void report_gpu_retile_census_periodically() {
+        if (!gpu_retile_census_enabled()) return;
+        if (++gpu_retile_census_submits % 256 == 0) gpu_retile_census().report();
+        static const bool once = [] { std::atexit([] { gpu_retile_census().report(); }); return true; }();
+        (void)once;
+    }
+    uint64_t gpu_retile_census_submits = 0;
 
     bool may_promote_write_watch_before_exact(size_t source_bytes,
                                               uint32_t stable_validations) {
@@ -6194,6 +6310,11 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     auto phase_writeback = phase_start;
     double pack_ms = 0.0;
     double layout_ms = 0.0;
+    // layout_ms covers BOTH arms of the publication branch below, and they are different work: a
+    // GPU-retiled result is copied out of the retile buffer (a straight memcpy of the image), while a
+    // declined one is tiled on the CPU. Reading the total as "CPU tiling cost" overstates it by
+    // whatever fraction was admitted -- on the hot Sonic program the census says 60% is admitted.
+    double retile_copy_ms = 0.0;
     double writeback_prepare_ms = 0.0;
     double writeback_buffers_ms = 0.0;
     double writeback_images_ms = 0.0;
@@ -9852,6 +9973,16 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         static const bool packed_extension_disabled =
             std::getenv("PROSPER_NO_GPU_RETILE_PACKED_EXTENSION") != nullptr;
         static const bool direct_retile_enabled = std::getenv("PROSPER_NO_DIRECT_IMAGE_RETILE") == nullptr;
+        const bool retile_census = gpu_retile_census_enabled();
+        // `continue` keeps its meaning; this only names the branch on the way out.
+        const auto decline = [&](GpuRetileDecline reason, const prosper::gpu::ShaderResource* r,
+                                 uint32_t bpe) {
+            if (retile_census) gpu_retile_census().record(item.code_addr, reason, r, bpe);
+        };
+        if (gpu_retile_disabled && retile_census) {
+            for (const BoundImage& bi : images)
+                if (bi.storage_writeback) decline(GpuRetileDecline::Disabled, bi.resource, 0);
+        }
         if (!gpu_retile_disabled) {
             VkPhysicalDeviceProperties properties{};
             vkGetPhysicalDeviceProperties(ctx.physical, &properties);
@@ -9861,13 +9992,33 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 if (!bi.storage_writeback || bi.alias_of != SIZE_MAX || bi.imported || bi.storage_write_mask ||
                     !bi.exact_storage_bytes() || !r ||
                     r->in_mip_tail ||
-                    r->layer_mip_offset_bytes || !staging[i]) continue;
+                    r->layer_mip_offset_bytes || !staging[i]) {
+                    // Only count images that would otherwise have been candidates: an image with no
+                    // storage writeback at all never had a CPU tiling pass to avoid, and counting it
+                    // would put the census's largest number on the one reason that costs nothing.
+                    // Named individually: the first version of this census put all six behind one
+                    // label, which put its largest number on a bucket that cannot be acted on.
+                    if (bi.storage_writeback) {
+                        decline(bi.alias_of != SIZE_MAX ? GpuRetileDecline::Aliased
+                                : bi.imported          ? GpuRetileDecline::Imported
+                                : bi.storage_write_mask ? GpuRetileDecline::PartialWrite
+                                : !bi.exact_storage_bytes() ? GpuRetileDecline::InexactBytes
+                                : !r                   ? GpuRetileDecline::NoStaging
+                                : (r->in_mip_tail || r->layer_mip_offset_bytes)
+                                                       ? GpuRetileDecline::MipTailOrOffset
+                                                       : GpuRetileDecline::NoStaging,
+                                r, 0);
+                    }
+                    continue;
+                }
                 const bool volume = r->img_dim == 2 && r->depth > 1 && bi.texel_depth == r->depth;
                 const bool array = r->img_dim == 5 && r->depth > 1 &&
                     bi.array_layers == r->depth && bi.texel_depth == 1;
                 if (!array && (bi.array_layers != 1 || (!volume &&
-                    (r->depth != 1 || (r->img_dim != 1 && r->img_dim != 5) || bi.texel_depth != 1))))
+                    (r->depth != 1 || (r->img_dim != 1 && r->img_dim != 5) || bi.texel_depth != 1)))) {
+                    decline(GpuRetileDecline::UnsupportedShape, r, 0);
                     continue;
+                }
                 // One-layer array descriptors use the same physical 2D tiling,
                 // with either an ordinary or a reflected one-layer array view.
                 const uint32_t bpe = r->format == DataFormat::Float10_11_11 ||
@@ -9877,10 +10028,15 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 // Ambiguous views/strides retain the established CPU layout path.
                 const bool packed = !volume && bpe < 4;
                 if (packed && packed_extension_disabled &&
-                    !(array && bpe == 2 && r->tile_mode == 24)) continue;
-                if ((array && !packed) ||
-                    (packed && !gpu_retile_packed_descriptor_supported(*r, bpe, bi.mip_levels)))
+                    !(array && bpe == 2 && r->tile_mode == 24)) {
+                    decline(GpuRetileDecline::PackedDisabled, r, bpe);
                     continue;
+                }
+                if ((array && !packed) ||
+                    (packed && !gpu_retile_packed_descriptor_supported(*r, bpe, bi.mip_levels))) {
+                    decline(GpuRetileDecline::PackedUnsupported, r, bpe);
+                    continue;
+                }
                 const bool layout_ok = packed
                     ? bi.retile_parameters.initialize_packed_array(r->width, r->height, array ? r->depth : 1u,
                         bpe, r->tile_mode, properties.limits)
@@ -9893,7 +10049,10 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     bi.retile_parameters.tiled_bytes != bi.guest_bytes ||
                     bi.retile_parameters.linear_bytes != staging_bytes[i] ||
                     (array && r->layer_stride_bytes && r->layer_stride_bytes !=
-                        bi.retile_parameters.tiled_bytes / r->depth)) continue;
+                        bi.retile_parameters.tiled_bytes / r->depth)) {
+                    decline(GpuRetileDecline::LayoutMismatch, r, bpe);
+                    continue;
+                }
                 // Only typed integer reads prove exact bits here. Keep the linear output for
                 // current and future baseline consumers and all existing seed/padding gates.
                 const auto image_source = bi.materialized_format == VK_FORMAT_R8G8B8A8_UINT
@@ -9945,6 +10104,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         bi.direct_retile ? bi.view : VK_NULL_HANDLE), "retile-descriptors");
                 };
                 if (!prepare()) {
+                    decline(GpuRetileDecline::PrepareFailed, r, bpe);
                     if (bi.retile_pool) vkDestroyDescriptorPool(ctx.device, bi.retile_pool, nullptr);
                     if (bi.retile_buffer) vkDestroyBuffer(ctx.device, bi.retile_buffer, nullptr);
                     if (bi.retile_memory) ctx.release_memory(bi.retile_memory);
@@ -9952,6 +10112,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     bi.retile_buffer = VK_NULL_HANDLE; bi.retile_memory = VK_NULL_HANDLE;
                     bi.direct_retile = false;
                     if (ctx.device_lost) { images_ready = false; break; }
+                } else {
+                    decline(GpuRetileDecline::Admitted, r, bpe);
                 }
             }
         }
@@ -11773,7 +11935,10 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             }
             const uint8_t* layout_source = tile_mapped_bytes ? native_texels : packed;
             if (bi.retile_buffer) {
+                const auto retile_copy_start = ComputeClock::now();
                 copy_compute_buffer(destination, tiled_mapping.data, bi.guest_bytes);
+                retile_copy_ms += std::chrono::duration<double, std::milli>(
+                    ComputeClock::now() - retile_copy_start).count();
             } else if (r->tile_mode && r->img_dim == 2 && r->depth > 1) {
                 if (!tile_volume(destination, bi.guest_bytes, layout_source, r->width, r->height,
                                  r->depth, r->tile_mode, static_cast<uint32_t>(guest_texel))) {
@@ -12264,7 +12429,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                      "writeback_ms=%.2f writeback_prepare_ms=%.2f "
                      "writeback_buffers_ms=%.2f writeback_images_ms=%.2f "
                      "writeback_publish_ms=%.2f map_ms=%.2f prepare_ms=%.2f watch_ms=%.2f "
-                     "pack_ms=%.2f layout_ms=%.2f notify_ms=%.2f cache_ms=%.2f "
+                     "pack_ms=%.2f layout_ms=%.2f retile_copy_ms=%.2f notify_ms=%.2f cache_ms=%.2f "
                      "cleanup_ms=%.2f total_ms=%.2f subgroup=%u\n",
                      (unsigned long long)item.submit_no, (unsigned long long)item.code_addr,
                      (unsigned long long)timing_program_hash, ok ? 1u : 0u,
@@ -12276,7 +12441,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                      writeback_prepare_ms, writeback_buffers_ms,
                      writeback_images_ms, writeback_publish_ms,
                      image_map_ms, image_prepare_ms, image_watch_ms,
-                     pack_ms, layout_ms, image_notify_ms, image_cache_ms,
+                     pack_ms, layout_ms, retile_copy_ms, image_notify_ms, image_cache_ms,
                      phase_milliseconds(phase_writeback, phase_cleanup),
                      phase_milliseconds(phase_start, phase_cleanup), item.required_subgroup_size);
     }
@@ -13193,6 +13358,7 @@ bool execute_live_compute_items(const std::vector<prosper::gpu::ComputeItem>& it
     g_perf_compute_cleanup_ms = 0.0;
     context.begin_write_watch_promotions();
     context.report_image_borrow_census_periodically();
+    context.report_gpu_retile_census_periodically();
     // Dispatches are independent PM4-order operations: one item failing (e.g. an image shape the
     // backend can't bind yet, #590) must not abort the rest of the batch — that would regress
     // dispatches that executed before image bindings existed. Run all; report all-succeeded.

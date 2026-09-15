@@ -21,6 +21,17 @@ from the tracker issues, and still gated, because it is a projection of state ra
 
 ## 2026-09-15
 
+### The thing we thought was slow was 10 milliseconds
+
+No picture. We have spent a while assuming CPU tiling — rearranging a compute result into the layout
+the game expects — was a big cost on Sonic Frontiers. Splitting the timer that measures it: the whole
+stage is 6,551 ms across a minute, of which **6,541 ms is a memcpy and 10 ms is the tiling**. The
+tiling had already been moved onto the GPU and nobody had re-measured. What is actually expensive is
+copying the finished result into the game's own memory and re-protecting it, which is now written down
+as [#3683](https://github.com/mattias800/prosper/issues/3683) with the numbers behind it.
+
+## 2026-09-15
+
 ### Sonic Frontiers got 10% faster by not asking the same question 253 million times
 
 No picture — the frame looks identical, which is the point. Every time prosper wanted to know

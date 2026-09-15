@@ -179,3 +179,14 @@ fresh directories. The archived helper's private dump paths must be adjusted on 
   bit1. The equation proof refuses them, and real runtime cases preserve correct CPU fallback. #3407.
 - Reduced CPU layout alone is not an end-to-end speedup. The enclosing GPU/dispatch and presentation
   costs remain the acceptance measurements; the previous buffer-cache experiment remains closed.
+- **CPU tiling is not a material cost on the measured Sonic Frontiers route, and `layout_ms` is not a
+  measurement of it.** `layout_ms` times the whole publication branch, and both of its arms land in the
+  same counter: a GPU-retiled result is memcpy'd out of the retile buffer, a declined one is tiled on
+  the CPU. Split on 2026-09-15 over 18,354 dispatch records (`PPSA03831`, native `prosper-app`,
+  Linux/RADV, default launch, full cadence): `layout_ms` **6,551 ms** of which `retile_copy_ms`
+  **6,541 ms** and CPU tiling proper **10 ms**. So reading `layout_ms` as tiling cost overstated it by
+  650x on this route. `PROSPER_GPU_RETILE_CENSUS` says why the split lands there: on the hot program
+  `0x20002fe800` the retile is **admitted 5,961 of 10,001** times, and every decline is `inexact-bytes`
+  on `2x2x1` images that cost nothing to tile either way. Do not open further CPU-tiling vectorisation
+  work against this route without first re-splitting the timer — the cost is publication, and #3683
+  carries it. #3683.
