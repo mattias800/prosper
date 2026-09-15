@@ -530,6 +530,16 @@ code comment since long before this — remains the actual fix.
 
 ## Ruled out (2026-08-19)
 
+- **Retired-write admission can retain the extra modern 1 ms grace without affecting throughput:**
+  falsified by matched Performance Story text-query captures: guest/host counters fell from
+  5.574/s before admission to 4.175/s with it. Completed admission waits then measured 1,672 ms
+  across a five-second diagnostic window. Retiring at the actual import-return checkpoint,
+  while retaining active-scope/FIFO/inflight ownership, reduced those aggregate waits to 35 ms
+  and restored the text control to 5.575/s; the matching native-query run measured 5.973/s.
+  Wait totals include scheduling/draining across callers, and these single-window presentation
+  counters do not establish newly rendered FPS or library-wide gains. The legacy delay is unchanged.
+  Evidence and remaining overlap limits: #3674, PR #3399.
+
 - **The full offline dissection pipeline is verified end to end on a fresh gameplay bundle, and the
   exact invocations are recorded because three of the four are easy to get wrong.** Captured on the
   stable four-decline baseline: **1.7 GB, 75 submits, 1,415 operations**, replays `RC=0`, and the
