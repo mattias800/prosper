@@ -16,6 +16,7 @@
 #include "shared/present/readback_policy.hpp"
 #include "shared/diagnostics/capture_renderer_policy.hpp"
 #include "shared/texture/write_watch_policy.hpp"
+#include "shared/texture/validation_census.hpp"
 #include "shared/live/live_compute.hpp"
 #include "shared/live/texture_source_snapshot.hpp"
 #include "shared/live/decode_scratch.hpp"     // pooled full-surface decode intermediates
@@ -2342,6 +2343,36 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             static thread_local std::vector<RttTimingRecord> pending_rtt_timing;
             const bool perf_capture_timing =
                 prosper::perf::interactive_performance_capture().detailed_timing_active();
+            // The timing bool is sampled per callback, not a capture ID or completion proof.
+            // Keep cumulative per-thread populations across captures; a falling edge is only
+            // an observed inactive callback. This diagnostic does not change realization policy.
+            struct ValidationCensusLog {
+                prosper::frontend::TextureValidationCensus data;
+                unsigned long thread = 0;
+                bool active = false;
+                ~ValidationCensusLog() {
+                    if (active) data.report(stderr, thread, "thread-exit");
+                }
+            };
+            static const bool validation_census_requested =
+                PROSPER_ENV_VALUE("PROSPER_TEXTURE_VALIDATION_CENSUS") != nullptr;
+            ValidationCensusLog* validation_census = nullptr;
+            if (validation_census_requested) {
+                static thread_local ValidationCensusLog log;
+                if (log.active && !perf_capture_timing)
+                    log.data.report(stderr, log.thread, "timing-inactive");
+                log.active = perf_capture_timing;
+                if (perf_capture_timing) {
+                    if (!log.thread) {
+#ifdef _WIN32
+                        log.thread = static_cast<unsigned long>(GetCurrentThreadId());
+#else
+                        log.thread = static_cast<unsigned long>((uintptr_t)pthread_self());
+#endif
+                    }
+                    validation_census = &log;
+                }
+            }
             const bool timing_capture_only =
                 getenv("PROSPER_RENDER_TIMING_CAPTURE_ONLY") != nullptr;
             const bool timing_log_enabled = getenv("PROSPER_RENDER_TIMING") != nullptr &&
@@ -4350,10 +4381,37 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 resource_texture_watch_stability =
                                     cached->second.source_watch_stable_validations;
                                 auto validate_exact = [&] {
+                                    auto record_validation = [&](bool matches, bool refusal,
+                                                                 size_t bytes, double milliseconds) {
+                                        if (!validation_census) return;
+                                        using Watch = TextureValidationWatch;
+                                        using Query = prosper::host::GuestWriteWatchQuery;
+                                        Watch reason = !cross_submit_watch_enabled
+                                            ? Watch::ControlDisabled
+                                            : !cross_submit_watch_eligible ? Watch::BelowMinimum
+                                            : cached->second.source_watch_disabled
+                                                ? Watch::DisabledAfterDirty
+                                            : resource_texture_watch_query == static_cast<int>(Query::Dirty)
+                                                ? Watch::Dirty
+                                            : resource_texture_watch_query == static_cast<int>(Query::Unknown)
+                                                ? Watch::Unknown
+                                            : resource_texture_watch_query == static_cast<int>(Query::Unchanged)
+                                                ? Watch::Unchanged : Watch::NotQueried;
+                                        validation_census->data.record(
+                                            refusal ? TextureValidationOutcome::WatchOnlyRefusal
+                                                : matches ? TextureValidationOutcome::Match
+                                                          : TextureValidationOutcome::ExactFailure,
+                                            reason, persistent_source_size, bytes, milliseconds,
+                                            static_cast<bool>(cached->second.source_watch),
+                                            cached->second.source_watch_stable_validations);
+                                    };
                                     // A successfully promoted Linux watch may own the mutation proof
                                     // without retaining a second encoded copy. Dirty/Unknown must miss;
                                     // there is deliberately no probabilistic hash fallback here.
-                                    if (cached->second.source_watch_only) return false;
+                                    if (cached->second.source_watch_only) {
+                                        record_validation(false, true, 0, 0);
+                                        return false;
+                                    }
                                     resource_texture_exact_validation = true;
                                     const auto validation_start = timing_enabled
                                         ? RenderClock::now() : RenderClock::time_point{};
@@ -4393,9 +4451,11 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     if (timing_enabled) {
                                         pending_timing.persistent_validations++;
                                         pending_timing.persistent_validation_bytes += validated_bytes;
-                                        resource_texture_validation_ms +=
+                                        const double validation_ms =
                                             std::chrono::duration<double, std::milli>(
                                                 RenderClock::now() - validation_start).count();
+                                        resource_texture_validation_ms += validation_ms;
+                                        record_validation(matches, false, validated_bytes, validation_ms);
                                     }
                                     return matches;
                                 };

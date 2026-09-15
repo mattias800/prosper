@@ -281,3 +281,19 @@ share one owner. Pinned replacement refusal and failure invalidation retain thei
 No separate comparison baseline is created for this consumer source. The control
 `PROSPER_NO_RENDERER_SEEDED_RESULT_CACHE=1` disables this promotion; F8 writeback rows report
 `renderer-result-retained` separately from input cache hits.
+
+## Texture validation census
+
+`PROSPER_TEXTURE_VALIDATION_CENSUS=1` counts validation invocations in callbacks that observe
+F8 detailed timing active. It adds no guest reads or extra clocks and does not change realization
+parallelism. Fixed buckets partition exact matches, exact failures (including short/unavailable
+sources), and untimed watch-only refusals by watch reason and declared source-size band.
+
+Reports are cumulative per thread across all observed timing intervals. `timing-inactive` means a
+later callback observed timing off; `thread-exit` can flush a still-active interval. Neither proves
+a complete F8 window or whole-process coverage. Sum bucket calls against the matching header.
+Watch queries precede rearming; active flags follow it; stability precedes this validation's update.
+All count acquisition observations, not distinct entries. Reported validated bytes retain the
+helper's platform-dependent extent semantics, not physical read traffic. Refusals have no measured
+comparison work; their zero timer does not mean a zero-cost acquisition. Timers exclude the census
+update and remain nested in existing texture preparation.
