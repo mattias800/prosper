@@ -221,6 +221,15 @@ The primary bottlenecks identified and resolved are detailed below; they are gen
   Bounded host GPU storage image comparisons over PCIe to targets $\le 2\text{ MiB}$ (`PROSPER_MAX_GPU_COMPARE_IMAGE_MB=2`).
   **Impact**: `gpu_compare_ms` dropped from **1,138.6 ms down to 30.2 ms** (a 38x reduction), speeding up compute execution 3x to 5.4x.
 
+  **This ceiling is now derived from the device rather than fixed, and the 2 MiB above is the
+  DISCRETE case.** The measurement that produced it is a PCIe measurement — "over PCIe" is in its own
+  first line — and it was then applied as a global default, so a unified-memory device paid a bound
+  whose justification it does not have. On an integrated Radeon 8060S the same ceiling disabled the
+  comparison for every 4K target; deriving it (128 MiB on unified memory, 2 MiB unchanged on
+  discrete) measured **GTA V 19.7 → 21.6 fps** on a 60 s default launch here, and Sonic Frontiers
+  23.8 → 28.8. `PROSPER_MAX_GPU_COMPARE_IMAGE_MB` still overrides both. Nothing about the
+  Windows/NVIDIA tuning changed — this changes which devices receive it.
+
 ### 4. Eliminating Spurious 4K Scanout and Unbound Slot CPU Readbacks
 
 - **Problem Description**:
