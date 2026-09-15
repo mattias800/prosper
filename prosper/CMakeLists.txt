@@ -3242,6 +3242,15 @@ endif()
       add_test(NAME live_compute_host_read_barrier
                COMMAND test_live_compute_host_read_barrier)
 
+      # The exactness proof behind the differential buffer upload (#3696). Pure CPU -- it drives no
+      # device -- but it links prosper_live_renderer for the comparison helper, so it registers here
+      # with the other cases that need that library rather than in the platform-independent block.
+      add_executable(test_compute_buffer_diff_span
+                     tests/shared/live/test_compute_buffer_diff_span.cpp)
+      target_include_directories(test_compute_buffer_diff_span PRIVATE frontends)
+      target_link_libraries(test_compute_buffer_diff_span PRIVATE prosper_live_renderer)
+      add_test(NAME compute_buffer_diff_span COMMAND test_compute_buffer_diff_span)
+
       # Prove our own SPIR-V emitter produces valid, correct, runnable SPIR-V (execution-differential).
       add_executable(test_spirv_builder tests/gpu/recompiler/test_spirv_builder.cpp)
       # Includes a shared fixture, which resolves from the `tests` root.
