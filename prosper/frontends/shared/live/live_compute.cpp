@@ -11893,6 +11893,20 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                  "addr=0x%llx bytes=%llu\n",
                                  bi.binding, (unsigned long long)r->gpu_addr,
                                  (unsigned long long)bi.exact_result_bytes);
+                // A row for the skip, because this `continue` returns before the
+                // [compute-image-writeback] line below and the skip is now common. #3685 made the GPU
+                // comparison reachable for 4K targets on a unified-memory device, and the writebacks
+                // it skips are exactly the CHEAPEST ones -- so a census that omits them no longer
+                // counts writebacks, and every mean derived from its rows is biased upward by however
+                // often the skip fires. Same key fields, `skipped=1`, and no timings: nothing was
+                // measured here because nothing was done.
+                if (image_timing)
+                    std::fprintf(stderr,
+                                 "[compute-image-writeback] code=0x%llx hash=0x%016llx "
+                                 "binding=%u addr=0x%llx bytes=%zu skipped=1 reason=gpu-identical\n",
+                                 (unsigned long long)item.code_addr,
+                                 (unsigned long long)timing_program_hash, bi.binding,
+                                 (unsigned long long)r->gpu_addr, bi.guest_bytes);
                 if (r->gpu_addr || r->host_data)
                     notify_output_write(r->gpu_addr, destination, bi.guest_bytes, true);
                 continue;
@@ -12317,7 +12331,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             if (image_timing)
                 std::fprintf(stderr,
                              "[compute-image-writeback] code=0x%llx hash=0x%016llx "
-                             "binding=%u addr=0x%llx "
+                             "binding=%u addr=0x%llx skipped=0 "
                              "fmt=%u comps=%u tile=%u bytes=%zu cache-hit=%u write-only=%u "
                              "poison=%u gpu-retile=%u direct-retile=%u dim=%u layers=%u texel-depth=%u "
                              "renderer-result-retained=%u "

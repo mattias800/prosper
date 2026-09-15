@@ -1038,8 +1038,14 @@ GuestGpuWriteQuery guest_gpu_writes_since(const GuestGpuWriteSnapshot& snapshot,
 // The journal is thread_local, so this answers for the calling thread and nothing else.
 bool guest_gpu_write_tracking_active();
 
-// Register the synchronous live compute backend. execute_compute_dispatches realizes every retained
-// dispatch from its state snapshot and invokes the backend in stream order.
+// Register the synchronous live compute backend.
+//
+// It is invoked ONE ITEM AT A TIME, and that is worth stating here because the opposite was believed:
+// any submit carrying a dispatch takes the ordered path (`needs_ordered_realization`), and both
+// ordered executors call this backend with a single-element list so the dispatch lands in stream
+// order relative to the draws and DMA around it. There is no batch. A previous version of this
+// comment described a whole-submit realizer, which #3157's design then proposed to pipeline -- into
+// one fence per batch, over batches of one. The function it named had no caller and is gone.
 void set_submit_compute(LiveComputeFn fn);
 bool have_submit_compute();
 
@@ -1265,7 +1271,6 @@ LiveTargetByteReadResult read_live_render_target_bytes(uint64_t gpu_addr, uint32
 std::vector<ComputeItem> realize_compute_dispatches(const GpuState& st,
                                                      uint64_t submit_no = 0,
                                                      std::vector<OperationRealizationFailure>* failures = nullptr);
-bool execute_compute_dispatches(const GpuState& st, uint64_t submit_no = 0);
 // Execute retained dispatches and address-backed DMA copies in PM4 order when graphics rendering is
 // intentionally skipped or unavailable. Draw operations are omitted, but still delimit ordering.
 bool execute_nonrender_submit_work(const GpuState& st, uint64_t submit_no = 0);
