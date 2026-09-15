@@ -159,7 +159,10 @@ The same opt-in window also samples the pending-write queue at the existing 4 Hz
 `pending_writes` is null when unobserved or when its try-lock fails. A snapshot includes all queued
 resource/completion records, active submit scopes, apply batches, paired scope checkpoints and
 zero-active transitions that reset the completion deadline. The signed `release_delay_ns` is
-negative after the deadline; this does not imply the active-scope gate permits draining.
+negative after the deadline; this does not imply the active-scope gate permits draining. Modern
+submit retirement now sets that deadline to its actual import-return checkpoint with no extra
+modeled delay; older captures may include the former 1 ms grace interval. The legacy worker path
+retains its existing delay.
 `front_item_age_ns` measures the queue-front record from its preparation timestamp, which precedes
 enqueue; it is not necessarily the oldest record's age. Samples cannot prove that no short eligible
 drain interval existed between them. Queue fields are sampled after the process sample timestamp;
