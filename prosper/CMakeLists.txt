@@ -3917,6 +3917,14 @@ if(TARGET prosper_live_renderer AND TARGET Vulkan::Vulkan)
   set_tests_properties(render_buffer_capture PROPERTIES
     ENVIRONMENT "PROSPER_NO_LIVE_PERSISTENT_COLOR_TARGETS=1;PROSPER_BACKEND_BUFFER_RESIDENCY_MB=256;PROSPER_BACKEND_BUFFER_RESIDENCY_OWNERS=4096" TIMEOUT 120)
 
+  # Execution coverage for the result-compare shader. Its own target because it drives the shader
+  # against a plain Vulkan device rather than through the live backend -- a failure should indict the
+  # module, not the backend's resource machinery.
+  add_executable(test_compute_result_compare tests/gpu/execute/test_compute_result_compare.cpp)
+  target_include_directories(test_compute_result_compare PRIVATE tests frontends)
+  target_link_libraries(test_compute_result_compare PRIVATE prosper_live_renderer Vulkan::Vulkan)
+  add_test(NAME compute_result_compare COMMAND test_compute_result_compare)
+
   add_executable(test_gpu_retile tests/gpu/execute/test_gpu_retile.cpp)
   target_include_directories(test_gpu_retile PRIVATE tests frontends)
   target_link_libraries(test_gpu_retile PRIVATE prosper_live_renderer Vulkan::Vulkan)
