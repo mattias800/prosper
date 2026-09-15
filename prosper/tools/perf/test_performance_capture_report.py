@@ -357,9 +357,84 @@ class PerformanceCaptureReportTests(unittest.TestCase):
         self.assertEqual(dominant["max_ms"], 20)
 
     def test_cpu_outside_renderer_classification(self):
-        summary = summarize(capture(SAMPLES, renderer=[{"total_ms": 100}]))
+        # The record carries a timestamp inside the sample window, as every real capture's does --
+        # `performance_capture.cpp` stamps `monotonic_ns` on every renderer and compute record. The
+        # fixture previously omitted it, which since #3678 means no cohort can be formed and the
+        # coverage ratio is withheld, so the verdict this test names could not be reached.
+        summary = summarize(capture(SAMPLES, renderer=[{"total_ms": 100, "t_ns": 500_000_000}]))
         self.assertEqual(summary["classification"], "cpu-outside-renderer")
         self.assertAlmostEqual(summary["cpu_cores"], 1.0, places=3)
+        self.assertEqual(summary["detail_outside"], 0)
+        self.assertAlmostEqual(summary["coverage"], 0.1, places=6)
+
+    # ---- #3678: the counter-rate window and the detail population are distinct observations ----
+
+    def test_detail_records_outside_the_sample_window_are_reported_and_excluded_from_coverage(self):
+        # Two records of equal cost, one completing inside the 1 s sample window and one 2 s after
+        # its end. `measured_total` keeps both -- it is the population actually retained -- but the
+        # coverage ratio against the window may only use the one that completed inside it.
+        summary = summarize(capture(SAMPLES, renderer=[
+            {"total_ms": 100, "t_ns": 500_000_000},
+            {"total_ms": 100, "t_ns": 3_000_000_000},
+        ]))
+        self.assertEqual(summary["graphics_total_ms"], 200)
+        self.assertEqual(summary["detail_outside"], 1)
+        self.assertEqual(summary["windowed_total_ms"], 100)
+        # 100 ms of 1000 ms, NOT 200/1000 -- mixing the populations would have doubled it.
+        self.assertAlmostEqual(summary["coverage"], 0.1, places=6)
+
+    def test_detail_span_is_reported_separately_from_the_sample_window(self):
+        summary = summarize(capture(SAMPLES, renderer=[
+            {"total_ms": 1, "t_ns": 0},
+            {"total_ms": 1, "t_ns": 4_000_000_000},
+        ]))
+        self.assertAlmostEqual(summary["seconds"], 1.0, places=6)
+        self.assertAlmostEqual(summary["detail_seconds"], 4.0, places=6)
+
+    def test_timestampless_details_withhold_coverage_and_the_verdict_it_would_drive(self):
+        # The deliberately mismatched fixture the issue asks for: a population that cannot be
+        # aligned to the sampled window must not yield a ratio that looks aligned. Withholding it
+        # also withholds `cpu-outside-renderer`, which is the point -- that verdict must not rest on
+        # a number formed across two populations.
+        summary = summarize(capture(SAMPLES, renderer=[{"total_ms": 100}]))
+        self.assertIsNone(summary["coverage"])
+        self.assertIsNone(summary["detail_outside"])
+        self.assertNotEqual(summary["classification"], "cpu-outside-renderer")
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            print_summary(summary)
+        self.assertIn("window coverage: unavailable", output.getvalue())
+
+    def test_rates_expose_their_numerator_so_one_event_is_visible(self):
+        # #3678's own example: 36 events against 35 read as 7.16884 and 7.34651 per second, a gap
+        # smaller than one event's contribution. The count has to be on the page.
+        summary = summarize(capture(SAMPLES))
+        self.assertEqual(summary["rate_events"]["guest_fps"], 60)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            print_summary(summary)
+        self.assertIn("(60 over 1.00 s)", output.getvalue())
+
+    def test_a_late_first_post_sample_shortens_only_the_rate_window(self):
+        # The rate window starts at the FIRST post sample, so a late first sample shortens it while
+        # leaving the detail population alone. The two must move independently.
+        late = [
+            {"t_ns": 2_000_000_000, "process_cpu_ns": 0, "guest_presents": 0,
+             "rendered_frames": 0, "host_presented_frames": 0},
+            {"t_ns": 3_000_000_000, "process_cpu_ns": 10, "guest_presents": 30,
+             "rendered_frames": 5, "host_presented_frames": 5},
+        ]
+        summary = summarize(capture(late, renderer=[{"total_ms": 10, "t_ns": 0}]))
+        self.assertAlmostEqual(summary["seconds"], 1.0, places=6)
+        # The record predates the window entirely; it is retained but cannot count toward coverage.
+        self.assertEqual(summary["detail_outside"], 1)
+        self.assertEqual(summary["windowed_total_ms"], 0)
+        self.assertAlmostEqual(summary["coverage"], 0.0, places=6)
+
+    def test_single_post_sample_leaves_both_spans_and_coverage_unavailable(self):
+        summary = summarize(capture(SAMPLES[:1], renderer=[{"total_ms": 10, "t_ns": 0}]))
+        self.assertIsNone(summary["seconds"])
+        self.assertIsNone(summary["coverage"])
 
     def test_inconclusive_without_post_population(self):
         summary = summarize(capture())
