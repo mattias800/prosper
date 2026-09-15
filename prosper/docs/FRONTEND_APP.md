@@ -414,6 +414,29 @@ retain their own identity. A selected image record additionally carries its gues
 resolved to a `persistent=` image, and whether validation made the upload `upload-skipped=`. Alias
 records name `alias_of=` and copy those two state bits from the real owner; they remain no-work records.
 
+**`[compute-image-writeback]` rows come in two shapes, and a census must read `skipped=` before
+anything else.** An ordinary row carries `skipped=0` and the full field set including every `*_ms`
+leaf. A skipped row carries `skipped=1`, a `reason=` naming which skip fired, and only
+`code=`/`hash=`/`binding=`/`addr=`/`bytes=` — no timings, because nothing was done and there was
+nothing to measure. Two reasons exist and they **partition** rather than overlap:
+`reason=gpu-identical` for a result the GPU comparison proved unchanged, and
+`reason=repeated-output` for one the CPU comparison did, which is the path a result takes whenever it
+cannot use the GPU comparison at all — for instance when its byte count is not a multiple of 16, but
+equally when it is zero, exceeds the device's storage-buffer range, or would need more workgroups
+than the dispatch limit allows, or when the compare pipeline could not be prepared.
+
+Both skips were invisible before #3690 — they returned before the row was written — so **any census
+taken from a log predating it undercounts writebacks and reports a skip fraction of zero.** The
+writebacks they omit are systematically the *cheapest* ones, so every per-writeback mean derived
+from such a log is biased upward. Two residuals remain even now: a `readback_ok` abort emits no row
+for the failing item or any after it, and every row is written inside `writeback_images_ms`, so the
+absolute writeback cost reported by an `image_timing` run is an upper bound rather than a
+measurement. Ratios between the two row kinds are unaffected, since both sit under the same gate.
+
+When grepping these rows, **anchor on `^[compute-image-writeback]`**. An unanchored
+`grep -o 'skipped=[01]'` also matches `upload-skipped=` on `[compute-image]` lines and silently
+inflates the count.
+
 #### Reading the compute side at run scale
 
 `PROSPER_COMPUTE_PHASE_TIMING=1` emits one `[compute-phase]` line per dispatch and

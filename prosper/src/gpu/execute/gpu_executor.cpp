@@ -9078,12 +9078,6 @@ std::vector<ComputeItem> realize_compute_dispatches(
     return items;
 }
 
-bool execute_compute_dispatches(const GpuState& st, uint64_t submit_no) {
-    if (!g_compute) return false;
-    std::vector<ComputeItem> items = realize_compute_dispatches(st, submit_no);
-    return !items.empty() && g_compute(items);
-}
-
 struct OrderedGpustateCaptureTrace {
     std::vector<DrawItem> draws;
     std::vector<ComputeItem> computes;
