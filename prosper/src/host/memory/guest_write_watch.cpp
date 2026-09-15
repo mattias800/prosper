@@ -721,6 +721,8 @@ struct WatchState {
     // overlap test exact for them at a cost proportional to how few they are.
     std::unordered_map<uint64_t, std::vector<uint64_t>> registration_chunks;
     std::vector<uint64_t> wide_registrations;
+    // Reused by mark_pages_changed_locked. Always used under `mutex`, never retained across a call.
+    std::vector<uint64_t> mark_scratch;
     std::atomic<bool> fault_onstack{false};                               // red-zone-safe gate
     // Lock-free ownership gate for SIGTRAP coexistence. Most TRAP_TRACE deliveries belong to other
     // debugger/profiler machinery; they must not touch (or wait for) the dmem state mutex unless this
@@ -790,6 +792,28 @@ void mark_page_changed_locked(WatchState& w, WatchedPage* page) {
     for (const uint64_t id : page->registrations) {
         const auto found = w.registrations.find(id);
         if (found != w.registrations.end()) found->second.pages_dirty = true;
+    }
+}
+
+// The same, for a whole run of pages, resolving each DISTINCT registration once.
+//
+// A host write covering a 10 MiB storage image touches ~2,500 watched pages that in practice all
+// belong to the same one or two registrations, so marking per page turns one logical fact into
+// thousands of hash lookups. The scratch list is linear, which is the right shape: it holds the
+// number of registrations over a range (one or two), not the number of pages.
+template <typename PageRange>
+void mark_pages_changed_locked(WatchState& w, const PageRange& pages) {
+    w.mark_scratch.clear();
+    for (const auto& entry : pages) {
+        const WatchedPage* page = page_pointer(entry);
+        if (!page) continue;
+        for (const uint64_t id : page->registrations) {
+            if (std::find(w.mark_scratch.begin(), w.mark_scratch.end(), id) != w.mark_scratch.end())
+                continue;
+            w.mark_scratch.push_back(id);
+            const auto found = w.registrations.find(id);
+            if (found != w.registrations.end()) found->second.pages_dirty = true;
+        }
     }
 }
 
@@ -943,10 +967,8 @@ bool set_pages_armed(WatchState& w, const std::vector<Page>& pages, bool arm) {
         if (watch_mprotect(reinterpret_cast<void*>(static_cast<uintptr_t>(run.addr)),
                            static_cast<size_t>(run.size), run.to) != 0) {
             for (const auto& entry : pages)
-                if (WatchedPage* page = page_pointer(entry)) {
-                    page->coverage_incomplete = true;
-                    mark_page_changed_locked(w, page);
-                }
+                if (WatchedPage* page = page_pointer(entry)) page->coverage_incomplete = true;
+            mark_pages_changed_locked(w, pages);
             while (changed) {
                 const ProtectionRun& prior = runs[--changed];
                 watch_mprotect(reinterpret_cast<void*>(static_cast<uintptr_t>(prior.addr)),
@@ -960,11 +982,11 @@ bool set_pages_armed(WatchState& w, const std::vector<Page>& pages, bool arm) {
         if (WatchedPage* page = page_pointer(entry)) {
             page->armed = arm;
             page->coverage_incomplete = false;
-            // Disarming is what makes a covering registration read Dirty; arming never does. The
-            // registration that ASKED to arm clears its own flag afterwards, by verification.
-            if (!arm) mark_page_changed_locked(w, page);
         }
     }
+    // Disarming is what makes a covering registration read Dirty; arming never does. The registration
+    // that ASKED to arm clears its own flag afterwards, by verification.
+    if (!arm) mark_pages_changed_locked(w, pages);
     return true;
 }
 
@@ -1007,10 +1029,11 @@ void invalidate_phys_range_locked(WatchState& w, uint64_t phys_begin, uint64_t p
     for (auto& [phys, page] : w.pages_by_phys)
         if (phys < phys_end && phys + kPage > phys_begin) hit.push_back(page.get());
     set_pages_armed(w, hit, false);
-    for (WatchedPage* page : hit) {
-        page->generation++;
-        mark_page_changed_locked(w, page);
-    }
+    // No mark pass here: set_pages_armed(arm=false) already marked every registration covering these
+    // pages, on both its success and its failure path, and pages_dirty is sticky -- nothing can clear
+    // it before this returns, because the clear only happens in rearm() under this same lock. A second
+    // walk of `hit` would be one more pass over ~2,500 pages per notification for no state change.
+    for (WatchedPage* page : hit) page->generation++;
 }
 
 // Drop every page-granular alias whose VA falls in [begin, end) from its WatchedPage: remove it from the
@@ -2299,10 +2322,11 @@ void guest_write_watch_notify_host_write(uint64_t addr, uint64_t size) {
     if (hit.empty()) return;
     stats().host_write_pages_hit.fetch_add(hit.size(), std::memory_order_relaxed);
     set_pages_armed(w, hit, false);
-    for (WatchedPage* page : hit) {
-        page->generation++;
-        mark_page_changed_locked(w, page);
-    }
+    // No mark pass here: set_pages_armed(arm=false) already marked every registration covering these
+    // pages, on both its success and its failure path, and pages_dirty is sticky -- nothing can clear
+    // it before this returns, because the clear only happens in rearm() under this same lock. A second
+    // walk of `hit` would be one more pass over ~2,500 pages per notification for no state change.
+    for (WatchedPage* page : hit) page->generation++;
 }
 
 // Paired with guest_write_watch_notify_host_write: called AFTER the host write has completed, so the
@@ -2405,10 +2429,11 @@ void guest_write_watch_invalidate_all() {
     all.reserve(w.pages_by_phys.size());
     for (auto& [phys, page] : w.pages_by_phys) { (void)phys; all.push_back(page.get()); }
     set_pages_armed(w, all, false);
-    for (WatchedPage* page : all) {
-        page->generation++;
-        mark_page_changed_locked(w, page);
-    }
+    // No mark pass here: set_pages_armed(arm=false) already marked every registration covering these
+    // pages, on both its success and its failure path, and pages_dirty is sticky -- nothing can clear
+    // it before this returns, because the clear only happens in rearm() under this same lock. A second
+    // walk of `hit` would be one more pass over ~2,500 pages per notification for no state change.
+    for (WatchedPage* page : all) page->generation++;
 }
 
 // Unified page-fault path for the production dirty bit and the opt-in dmem provenance overlay. The
