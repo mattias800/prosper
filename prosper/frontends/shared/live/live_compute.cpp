@@ -7403,10 +7403,18 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     }
                     timing.compared_bytes += buffers[i].bytes;
                     if (!equal) {
-                        // Copy ONLY the bytes that differ. The comparison above already established
-                        // the exact inclusive extent, so the bytes outside it are known equal and
-                        // writing them again is provably a no-op -- the destination ends
-                        // byte-identical to a full copy either way.
+                        // Copy ONLY the bytes that differ. The comparison above established the
+                        // exact inclusive extent, so writing the bytes outside it would be a no-op
+                        // and the destination ends byte-identical to a full copy either way.
+                        //
+                        // Read "no-op" precisely: it is a statement about the instant the
+                        // comparison ran, NOT a claim that guest memory stays equal afterwards. If
+                        // the guest can mutate `source` between the comparison and this copy, a
+                        // full copy would race exactly as this narrowed one does -- the window is
+                        // the same one that already existed, widened only by the copy being
+                        // shorter. Nothing here establishes stability, and a future reader must not
+                        // take this sentence as though it did; that is how the "for diagnostics
+                        // only" line above the comparison came to outlive its own truth.
                         //
                         // This is worth the narrowing because a pooled host-visible allocation
                         // retains its previous tenant's contents, which for a repeatedly-bound

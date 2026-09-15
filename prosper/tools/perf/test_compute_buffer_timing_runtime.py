@@ -43,6 +43,25 @@ def number(row, key):
     return int(row[key], 0)
 
 
+def check_upload_matches_reported_span(row):
+    """The differential upload's end-to-end contract (#3697).
+
+    The comparison reports an inclusive differing extent and the upload copies exactly that. Tying
+    `uploaded-bytes` to `diff-span-bytes` holds whatever the fixture's data happens to be, so it
+    cannot be satisfied by an accident of the fixture the way a fixed constant could.
+    """
+    uploaded = number(row, "uploaded-bytes")
+    if number(row, "diff-observed"):
+        span = number(row, "diff-span-bytes")
+        require(0 < span <= number(row, "bytes"),
+                f"reported differing span {span} outside the binding")
+        require(uploaded == span,
+                f"upload copied {uploaded} bytes but the comparison reported {span} differing")
+    else:
+        require(uploaded == 0,
+                f"upload copied {uploaded} bytes although no difference was reported")
+
+
 def expect(row, **wanted):
     for key, value in wanted.items():
         key = key.replace("_", "-")
@@ -87,14 +106,18 @@ def check_selected(rows, witness):
            compared_bytes=BYTES, baseline="created",
            gpu_compare="ineligible", writeback="changed",
            result_compared_bytes=BYTES, guest_copied_bytes=BYTES)
-    # A fresh Vulkan allocation's initial contents are unspecified. The cold path always compares
-    # its full extent, but what it UPLOADS is now only the bytes that differ (#3697), so any count
-    # from 0 to the full extent is legal -- 0 when the allocation already matched, BYTES when it
-    # differed end to end, and anything between when it differed over part of the range. This
-    # assertion previously admitted only 0 or BYTES and passed solely because the fixture fills
-    # guest memory uniformly against a zero-filled fresh allocation; a fixture that differed over a
-    # sub-range would have read as "invalid" rather than as the saving it is.
-    require(0 <= number(cold, "uploaded-bytes") <= BYTES, "invalid cold upload byte count")
+    # A fresh Vulkan allocation's initial contents are unspecified, and since #3697 the cold path
+    # uploads only the bytes that DIFFER rather than the whole extent -- so its byte count is not a
+    # constant this test can name. Two earlier versions both failed to say anything useful: `in
+    # (0, BYTES)` rejected a legal partial span and passed only because the fixture fills guest
+    # memory uniformly against a zero-filled allocation, and `0 <= n <= BYTES` is close to vacuous
+    # because the field parses unsigned, so only the upper bound survives.
+    #
+    # Assert the IDENTITY instead, which is fixture-independent: the upload copied exactly the
+    # extent the comparison reported. That is the one link neither side otherwise tests --
+    # test_compute_buffer_diff_span proves the span is exact, and this proves the production backend
+    # actually uploads it rather than reporting one number and copying another.
+    check_upload_matches_reported_span(cold)
     journal = grouped[2][0]
     expect(journal, cache="hit", validation="journal", upload_skipped=1,
            compared_bytes=0, uploaded_bytes=0, gpu_compare="unchanged",
@@ -164,9 +187,8 @@ def check_promotion(rows, witness):
             expect(row, validation="pooled-full", compared_bytes=BYTES)
             if not cpu_result:
                 expect(row, baseline="created")
-            # Same widening as the cold row above: the pooled-full path uploads only the differing
-            # extent since #3697, so any count in [0, BYTES] is legal.
-            require(0 <= number(row, "uploaded-bytes") <= BYTES, "invalid cold upload bytes")
+            # Same identity as the cold row above.
+            check_upload_matches_reported_span(row)
         elif dispatch == 8 and watched:
             expect(row, validation="dirty-chunks", dirty_watch_chunks=1, total_watch_chunks=2,
                    compared_bytes=1 << 20, uploaded_bytes=1 << 20)

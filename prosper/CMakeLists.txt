@@ -3248,12 +3248,15 @@ endif()
       #
       # KNOWN GAP, recorded rather than hidden: this block is inside both `if(UNIX)` and
       # `if(Vulkan_FOUND)`, so a correctness-critical helper goes UNTESTED on the Windows build even
-      # though nothing in it is platform-specific. The comparison runs eight std::thread workers and
-      # combines their results through atomics, which is exactly the kind of code where a second
-      # toolchain earns its keep. Closing it properly means lifting the comparison (and the
-      # parallel_compute_texels helper it uses) out of live_compute.cpp into
-      # frontends/shared/compute/, where a pure byte utility belongs anyway -- deliberately left as
-      # follow-up so this PR stays a behaviour change plus its test rather than also a relocation.
+      # though nothing in it is platform-specific. Closing it properly means lifting the comparison
+      # (and the parallel_compute_texels helper it uses) out of live_compute.cpp into
+      # frontends/shared/compute/, where a pure byte utility belongs anyway -- left as follow-up
+      # (#3699) so this PR stays a behaviour change plus its test rather than also a relocation.
+      #
+      # Do NOT read that relocation as buying race coverage for the eight std::thread workers and
+      # their atomic combine. `Host TSan` in .github/workflows/ci.yml configures
+      # `-S prosper/tools/doctor`, a separate CMake project -- it does not build prosper at all, so
+      # this code is not under TSan today and moving it would not change that by itself.
       add_executable(test_compute_buffer_diff_span
                      tests/shared/live/test_compute_buffer_diff_span.cpp)
       target_include_directories(test_compute_buffer_diff_span PRIVATE frontends)
