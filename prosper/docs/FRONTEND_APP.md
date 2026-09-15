@@ -435,7 +435,35 @@ measurement. Ratios between the two row kinds are unaffected, since both sit und
 
 When grepping these rows, **anchor on `^[compute-image-writeback]`**. An unanchored
 `grep -o 'skipped=[01]'` also matches `upload-skipped=` on `[compute-image]` lines and silently
-inflates the count.
+inflates the count — measured on a 60 s *Sonic Frontiers* log, 8,394 real rows against 25,176
+unanchored matches, so the error is a factor of three rather than a rounding one.
+
+**How large the skip fraction actually is, measured at `28070b24c`** — and it is title-dependent
+enough that a figure from one route should not be carried to another:
+
+| route | total rows | `skipped=0` | `skipped=1` | skip fraction |
+| --- | --- | --- | --- | --- |
+| *Sonic Frontiers*, 60 s | 8,394 | 4,774 | 3,620 | 43.1% |
+| *Grand Theft Auto V*, 75 s | 616 | 111 | 505 | **82.0%** |
+
+On *Grand Theft Auto V* the pre-#3690 rows therefore described barely a fifth of the image
+writebacks, and any per-writeback mean taken from such a log is biased upward by roughly five.
+
+**Ruled out: forcing the GPU comparison off does NOT exercise the CPU-comparison skip.** The obvious
+way to produce `reason=repeated-output` rows is to refuse every result from the GPU comparison with
+`PROSPER_MAX_GPU_COMPARE_IMAGE_MB=0`, on the reasoning that those writebacks must then fall to the
+host-snapshot path. **It does not work.** Measured on the same route: the GPU skips vanish as
+intended (3,620 → 0) and those writebacks become *ordinary* ones (4,774 → 6,922); none reach
+`repeated_output`, because that path additionally requires `cache_candidate && persistent &&
+upload_skipped && exact_storage_bytes()` and a `cached_image_result_matches()` hit, none of which
+removing the GPU comparison supplies.
+
+So `reason=repeated-output` is **reachable structurally but unexercised on every route measured so
+far** — zero occurrences across *Sonic Frontiers* default, *Sonic Frontiers* with the comparison
+disabled, and *Grand Theft Auto V*. Treat that zero as uninformative rather than as evidence the path
+is dead: no positive instance has been constructed outside the routes that produced the null, which
+is what a clean zero needs before it can be believed. A title whose compute results are small or
+unaligned is where to look, since those are exactly the ones the GPU comparison refuses outright.
 
 #### Reading the compute side at run scale
 
