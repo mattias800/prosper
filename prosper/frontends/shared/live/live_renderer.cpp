@@ -61,6 +61,7 @@
 #include <set>
 #include <utility>
 #include <tuple>
+#include <thread>
 #include <map>
 #include <unordered_map>
 #include <unordered_set>
@@ -193,6 +194,44 @@ struct PendingGuestGpuWrites {
     bool overflowed = false;
 };
 
+// Per-thread cumulative work counts. No guest reads, per-call clocks, shared counter locks or
+// execution-policy changes: this distinguishes empty queue drains from actual cache traversal.
+// The recurring report interval is not a collection cap. Enable with exactly "1" at startup.
+struct GuestWriteDrainCensus {
+    uint64_t calls = 0, empty = 0, overflows = 0, ranges = 0, max_ranges = 0, ignored = 0;
+    uint64_t ds_visits = 0, ds_invalidations = 0, color_visits = 0, color_overlaps = 0;
+    uint64_t rtt_visits = 0, rtt_erases = 0, rtt_dcc = 0, dcc_color_visits = 0;
+
+    void report() const {
+        if (calls > 4 && calls % 4096) return;
+        static thread_local const size_t thread = std::hash<std::thread::id>{}(
+            std::this_thread::get_id());
+        const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        fprintf(stderr, "[guest-write-drain] thread=%zu steady_ns=%lld calls=%llu empty=%llu "
+                "overflows=%llu ranges=%llu max_ranges=%llu ignored=%llu ds_visits=%llu "
+                "ds_invalidations=%llu color_visits=%llu color_overlaps=%llu rtt_visits=%llu "
+                "rtt_erases=%llu rtt_dcc=%llu dcc_color_visits=%llu\n",
+                thread, (long long)ns, (unsigned long long)calls, (unsigned long long)empty,
+                (unsigned long long)overflows, (unsigned long long)ranges,
+                (unsigned long long)max_ranges, (unsigned long long)ignored,
+                (unsigned long long)ds_visits, (unsigned long long)ds_invalidations,
+                (unsigned long long)color_visits, (unsigned long long)color_overlaps,
+                (unsigned long long)rtt_visits, (unsigned long long)rtt_erases,
+                (unsigned long long)rtt_dcc, (unsigned long long)dcc_color_visits);
+    }
+};
+
+GuestWriteDrainCensus* guest_write_drain_census() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("PROSPER_WRITE_DRAIN_CENSUS");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    if (!enabled) return nullptr;
+    static thread_local GuestWriteDrainCensus census;
+    return &census;
+}
+
 PendingGuestGpuWrites& pending_guest_gpu_writes() {
     static PendingGuestGpuWrites pending;
     return pending;
@@ -296,7 +335,8 @@ const char* rtt_guest_write_effect_name(prosper::frontend::LiveRttGuestWriteEffe
     }
 }
 
-void invalidate_cpu_rtt_guest_write(RttCache& cache, uint64_t addr, uint64_t size) {
+void invalidate_cpu_rtt_guest_write(RttCache& cache, uint64_t addr, uint64_t size,
+                                  GuestWriteDrainCensus* census = nullptr) {
     if (!addr || !size) return;
     auto& watch = rtt_invalidate_watch();
     if (!watch.addrs.empty()) {
@@ -357,10 +397,15 @@ void invalidate_cpu_rtt_guest_write(RttCache& cache, uint64_t addr, uint64_t siz
         const auto effect = prosper::frontend::live_rtt_guest_write_effect(
             it->first, bytes, surface.dcc_metadata_addr, surface.dcc_metadata_bytes, addr, size);
         if (effect == prosper::frontend::LiveRttGuestWriteEffect::color_plane) {
+            if (census) ++census->rtt_erases;
             it = cache.erase(it);
         } else if (effect == prosper::frontend::LiveRttGuestWriteEffect::dcc_metadata) {
             // Keep the surface identity/extent long enough to materialize a uniform DCC clear from
             // the descriptor in the following graphics span, but never LOAD or sample stale pixels.
+            if (census) {
+                ++census->rtt_dcc;
+                census->dcc_color_visits += prosper::test::persistent_color_target_cache().size();
+            }
             prosper::test::invalidate_persistent_color_target(it->first);
             it->second.rgba.reset();
             it->second.has_uniform_color = false;
@@ -407,6 +452,14 @@ void drain_guest_gpu_writes(RttCache& cache, bool invalidate_ds) {
         overflowed = pending.overflowed;
         pending.overflowed = false;
     }
+    auto* census = guest_write_drain_census();
+    if (census) {
+        ++census->calls;
+        census->empty += ranges.empty() && !overflowed;
+        census->overflows += overflowed;
+        census->ranges += ranges.size();
+        census->max_ranges = std::max<uint64_t>(census->max_ranges, ranges.size());
+    }
     if (overflowed) {
         for (auto& [key, target] : prosper::test::persistent_color_target_cache()) {
             (void)key;
@@ -419,19 +472,34 @@ void drain_guest_gpu_writes(RttCache& cache, bool invalidate_ds) {
                 image.stencil_valid = false;
             }
         cache.clear();
+        if (census) census->report();
         return;
     }
     for (const auto& write : ranges) {
+        if (census) {
+            if (!write.addr || !write.size) ++census->ignored;
+            else {
+                if (invalidate_ds) census->ds_visits += prosper::test::persistent_ds_cache().size();
+                census->color_visits += prosper::test::persistent_color_target_cache().size();
+                census->rtt_visits += cache.size();
+            }
+        }
         // Restore the writer's own origin for the duration of this range's invalidation, so the
         // diagnostics inside report who actually wrote the bytes rather than the drain thread's
         // default. Cleared afterwards so a queued origin never leaks into an unrelated later write.
         prosper::gpu::set_guest_gpu_write_origin(write.origin);
-        if (invalidate_ds)
-            prosper::test::invalidate_persistent_ds_guest_write(write.addr, write.size);
-        prosper::test::invalidate_persistent_color_target_guest_write(write.addr, write.size);
-        invalidate_cpu_rtt_guest_write(cache, write.addr, write.size);
+        if (invalidate_ds) {
+            const auto invalidations =
+                prosper::test::invalidate_persistent_ds_guest_write(write.addr, write.size);
+            if (census) census->ds_invalidations += invalidations;
+        }
+        const auto color_overlaps =
+            prosper::test::invalidate_persistent_color_target_guest_write(write.addr, write.size);
+        if (census) census->color_overlaps += color_overlaps;
+        invalidate_cpu_rtt_guest_write(cache, write.addr, write.size, census);
         prosper::gpu::set_guest_gpu_write_origin(nullptr);
     }
+    if (census) census->report();
 }
 
 bool capture_color_format(VkFormat format, prosper::gpu::GpuCaptureColorFormat& captured) {

@@ -2602,15 +2602,21 @@ inline void invalidate_persistent_color_target(uint64_t id) {
         if (key.id == id) target.valid = false;
 }
 
-inline void invalidate_persistent_color_target_guest_write(uint64_t addr, uint64_t size) {
-    if (!addr || !size) return;
+// Returns overlapping entries, including entries already invalid before this write.
+inline size_t invalidate_persistent_color_target_guest_write(uint64_t addr, uint64_t size) {
+    if (!addr || !size) return 0;
+    size_t overlaps = 0;
     const uint64_t end = size > UINT64_MAX - addr ? UINT64_MAX : addr + size;
     for (auto& [key, target] : persistent_color_target_cache()) {
         const uint64_t bytes = static_cast<uint64_t>(key.width) * key.height *
                                backend_color_bytes_per_pixel(key.format);
         const uint64_t target_end = bytes > UINT64_MAX - key.id ? UINT64_MAX : key.id + bytes;
-        if (addr < target_end && key.id < end) target.valid = false;
+        if (addr < target_end && key.id < end) {
+            target.valid = false;
+            ++overlaps;
+        }
     }
+    return overlaps;
 }
 
 // A compute dispatch can publish both exact guest bytes and an equivalent device-local result into
