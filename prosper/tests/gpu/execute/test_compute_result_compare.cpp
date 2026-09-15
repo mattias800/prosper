@@ -29,6 +29,13 @@
 //     difference beyond the count does not raise the flag. The count is deliberately 300, not a
 //     multiple of 256, so the final workgroup launches 256 invocations of which 44 are in range.
 //
+// One note on the skip, so it is not misread as "no GPU". The device is requested at
+// VK_API_VERSION_1_4 and selected through `select_vulkan_device`, whose runtime-version gate is the
+// contract live_compute.cpp ships against; robustBufferAccess is required for the same reason. That
+// is a real narrowing over the 1.1 an earlier version accepted -- on a 1.3-only environment this
+// test now skips where it would once have run. Testing against a looser contract than production's
+// would be testing a different shader environment, so the narrowing is deliberate.
+//
 // And one property is deliberately NOT claimed. The shader stores the baseline only on the differing
 // branch, but writing `a[i]` where `a[i] == b[i]` is byte-idempotent, so an implementation that
 // stored unconditionally is indistinguishable through buffer contents. No assertion below pins it,
@@ -246,9 +253,16 @@ bool run_compare(Device& d, ComparePipeline& p, Buffer& a, Buffer& b, Buffer& fl
     cbi.commandPool = d.pool; cbi.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; cbi.commandBufferCount = 1;
     VkCommandBuffer cmd = VK_NULL_HANDLE;
     if (vkAllocateCommandBuffers(d.device, &cbi, &cmd) != VK_SUCCESS) return false;
+    // Every failure from here on frees the command buffer. The descriptor set is NOT reclaimed --
+    // the pool has no FREE bit, by design -- so a failing path permanently consumes one of kRuns;
+    // bounded, and every such path has already reddened a check.
+    const auto give_up = [&] {
+        vkFreeCommandBuffers(d.device, d.pool, 1, &cmd);
+        return false;
+    };
     VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    if (vkBeginCommandBuffer(cmd, &begin) != VK_SUCCESS) return false;
+    if (vkBeginCommandBuffer(cmd, &begin) != VK_SUCCESS) return give_up();
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.layout, 0, 1, &set, 0, nullptr);
     vkCmdPushConstants(cmd, p.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(count), &count);
@@ -258,7 +272,7 @@ bool run_compare(Device& d, ComparePipeline& p, Buffer& a, Buffer& b, Buffer& fl
     const uint32_t groups = prosper::frontend::compute_result_compare_group_count(
         VkDeviceSize(count) * sizeof(Uvec4), d.properties.limits.maxStorageBufferRange,
         d.properties.limits.maxComputeWorkGroupCount[0]);
-    if (!groups) return false;
+    if (!groups) { vkEndCommandBuffer(cmd); return give_up(); }
     vkCmdDispatch(cmd, groups, 1, 1);
     // The availability operation into the host domain. A fence orders EXECUTION; it does not move a
     // shader write into the host domain, and HOST_COHERENT does not exempt it. Production records
@@ -269,11 +283,11 @@ bool run_compare(Device& d, ComparePipeline& p, Buffer& a, Buffer& b, Buffer& fl
                                            VK_ACCESS_SHADER_WRITE_BIT);
     prosper::gpu::record_host_read_barrier(cmd, flag.buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                            VK_ACCESS_SHADER_WRITE_BIT);
-    if (vkEndCommandBuffer(cmd) != VK_SUCCESS) return false;
+    if (vkEndCommandBuffer(cmd) != VK_SUCCESS) return give_up();
 
     VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
     VkFence fence = VK_NULL_HANDLE;
-    if (vkCreateFence(d.device, &fci, nullptr, &fence) != VK_SUCCESS) return false;
+    if (vkCreateFence(d.device, &fci, nullptr, &fence) != VK_SUCCESS) return give_up();
     VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     submit.commandBufferCount = 1; submit.pCommandBuffers = &cmd;
     const auto started = std::chrono::steady_clock::now();
@@ -291,87 +305,119 @@ bool run_compare(Device& d, ComparePipeline& p, Buffer& a, Buffer& b, Buffer& fl
 }  // namespace
 
 int main() {
-    // The pure eligibility contract, checked without a device. Production refuses a comparison whose
-    // byte count is not a multiple of 16 or exceeds the device's storage-buffer range, and every
-    // dispatch below is sized by this same function.
-    using prosper::frontend::compute_result_compare_group_count;
-    check(compute_result_compare_group_count(4096, 1u << 27, 65535) == 1,
-          "group count: 4096 bytes is one workgroup");
-    check(compute_result_compare_group_count(0, 1u << 27, 65535) == 0,
-          "group count: zero bytes is refused");
-    check(compute_result_compare_group_count(4095, 1u << 27, 65535) == 0,
-          "group count: a byte count that is not a multiple of 16 is refused");
-    check(compute_result_compare_group_count(1ull << 28, 1u << 27, 65535) == 0,
-          "group count: a byte count over the device's storage-buffer range is refused");
-
+    // The pure eligibility contract -- which byte counts and device limits admit a comparison at
+    // all -- is NOT restated here. `tests/gpu/recompiler/test_game_compute.cpp` already covers it,
+    // and covers it better, because it separates each refusal clause instead of merely reaching
+    // one: `!(4112, 4096, 2)` is the storage-range clause alone (2 groups is within the 2
+    // permitted) and `!(4112, 4112, 1)` is the max-groups clause alone, alongside the zero,
+    // not-a-multiple-of-16, zero-limit and overflow arms and the 65,535 dispatch boundary pair.
+    //
+    // An earlier version of this file restated four of those here and got one wrong in exactly the
+    // way that block existed to prevent: `(1ull << 28, 1u << 27, 65535)` lands one workgroup past
+    // BOTH limits at once, so deleting the storage-range clause entirely left the assertion green.
+    // A correct assertion that cannot fail for the reason it names is worse than no assertion. What
+    // this file demonstrates about that function instead is the coupling a pure test cannot: every
+    // dispatch below is sized by calling it, so a sizing mistake here would be the backend's too.
     Device d;
     if (!d.init()) {
         // Name the cause. Several of the failures reachable here are environment or driver DEFECTS,
-        // and reporting them as a benign absence is how a green run comes to mean nothing.
+        // and reporting them as a benign absence is how a green run comes to mean nothing. Nothing
+        // above asserts, so a skip is a clean exit rather than a suppressed failure.
         std::printf("[skip] %s\n", d.failure ? d.failure : "device initialization failed");
         d.destroy();
-        return failures ? 1 : 0;
+        return 0;
     }
     std::printf("[info] device: %s (type %u)\n", d.properties.deviceName,
                 (unsigned)d.properties.deviceType);
 
-    constexpr uint32_t kRuns = 32;            // descriptor sets allocated; the pool is sized from it
+    // A hand-counted ceiling on the 19 dispatches below, not a derived one; the pool is sized from
+    // it, and exceeding it fails loudly (VK_ERROR_OUT_OF_POOL_MEMORY -> run_compare false -> a red
+    // "dispatch completed") rather than silently.
+    constexpr uint32_t kRuns = 32;
     ComparePipeline p;
     if (!p.create(d, kRuns)) { std::printf("FAIL: could not build the compare pipeline\n"); return 1; }
 
     constexpr uint32_t kWords = 1024;         // uvec4s; 4 full workgroups
     const VkDeviceSize bytes = kWords * sizeof(Uvec4);
-    // Two flag slots, bound the way production binds them. It slices one buffer at
-    // `target_index * compare_flag_stride()`, so the dword beside a flag is ANOTHER TARGET'S FLAG --
-    // an over-wide write through the flag chain corrupts a neighbour there, where in a dedicated
-    // 4-byte buffer it would land harmlessly in allocation padding.
+    // Flag slots, bound the way production binds them: it slices ONE buffer at
+    // `target_index * compare_flag_stride()`, so the dwords beside a flag are OTHER TARGETS' flags
+    // rather than allocation padding. The flag under test is slot 1, leaving one neighbour behind it
+    // and three ahead, and the DIRECTION is the point. An over-wide store or atomic through the flag
+    // chain always smears forward: a SPIR-V access chain cannot produce a negative byte offset from
+    // the binding base, so 16 bytes from that base covers slots 2 and 3 at the 4-byte stride RADV
+    // and lavapipe report here. Production smears the same way -- `{compare_flags, j * stride, 4}`
+    // puts target j's overrun on j+1, j+2, j+3. An earlier version of this file placed its only
+    // canary BEHIND the binding, where no device write can reach it by any route.
+    //
+    // The honest limit, because a guard that cannot fail is worse than none: the descriptor's range
+    // is 4 bytes and robustBufferAccess is on, so on RADV the byte-granular buffer bound is what
+    // stops such a write, and a shader carrying that defect would very likely leave these canaries
+    // green on this driver anyway. They are a cheap structural guard that CAN fail, not a
+    // discriminator for the class -- `spv_validate` and the Vulkan validation scan are what catch
+    // it. Slot 0 earns its place on a different property: paired with the flag at slot 1 reading
+    // back as expected, an untouched slot 0 shows the device honoured the descriptor's nonzero
+    // offset rather than writing at the buffer base.
     const VkDeviceSize flag_stride =
         d.properties.limits.minStorageBufferOffsetAlignment > sizeof(uint32_t)
             ? d.properties.limits.minStorageBufferOffsetAlignment : sizeof(uint32_t);
+    constexpr uint32_t kFlagSlots = 5;
+    constexpr uint32_t kFlagSlot = 1;         // slots 0 and 2..4 are canaries
     Buffer a, b, flags;
-    if (!a.create(d, bytes) || !b.create(d, bytes) || !flags.create(d, 2 * flag_stride)) {
+    if (!a.create(d, bytes) || !b.create(d, bytes) || !flags.create(d, kFlagSlots * flag_stride)) {
         std::printf("FAIL: buffer allocation\n");
         return 1;
     }
     auto* av = static_cast<Uvec4*>(a.mapped);
     auto* bv = static_cast<Uvec4*>(b.mapped);
-    auto* neighbour = reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(flags.mapped));
-    auto* fv = reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(flags.mapped) + flag_stride);
+    const auto slot = [&](uint32_t i) {
+        return reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(flags.mapped) + i * flag_stride);
+    };
+    uint32_t* const fv = slot(kFlagSlot);
     const auto fill = [&](Uvec4* dst, uint32_t seed) {
         for (uint32_t i = 0; i < kWords; ++i)
             dst[i] = {seed + i, seed + i * 3u, seed + i * 5u, seed + i * 7u};
     };
-    // Every case binds the flag at slot 1, leaving slot 0 as a live neighbour to check.
     const auto compare = [&](uint32_t count) {
-        return run_compare(d, p, a, b, flags, count, flag_stride);
+        return run_compare(d, p, a, b, flags, count, kFlagSlot * flag_stride);
     };
     constexpr uint32_t kCanary = 0xA5A5A5A5u;
+    // Re-armed before every case, not once: a case that ran after a corrupting one would otherwise
+    // read an already-clobbered slot and attribute it to itself.
+    const auto arm_canaries = [&] {
+        for (uint32_t i = 0; i < kFlagSlots; ++i)
+            if (i != kFlagSlot) *slot(i) = kCanary;
+    };
+    const auto canaries_intact = [&] {
+        for (uint32_t i = 0; i < kFlagSlots; ++i)
+            if (i != kFlagSlot && *slot(i) != kCanary) return false;
+        return true;
+    };
 
     // ---- equal: the flag stays clear ------------------------------------------------------------
-    fill(av, 11); fill(bv, 11); *fv = 0; *neighbour = kCanary;
+    fill(av, 11); fill(bv, 11); *fv = 0; arm_canaries();
     check(compare(kWords), "equal: dispatch completed");
     check(*fv == 0, "equal: flag stays clear");
-    check(*neighbour == kCanary, "equal: the adjacent flag slot is untouched");
+    check(canaries_intact(), "equal: the neighbouring flag slots are untouched");
 
     // ---- one differing component, in each lane --------------------------------------------------
     // A comparison that tested only .x would pass three of these four.
     for (uint32_t lane = 0; lane < 4; ++lane) {
-        fill(av, 11); fill(bv, 11); *fv = 0; *neighbour = kCanary;
+        fill(av, 11); fill(bv, 11); *fv = 0; arm_canaries();
         uint32_t* component = &reinterpret_cast<uint32_t*>(&av[500])[lane];
         *component += 1;
         check(compare(kWords), "single-component: dispatch completed");
         check(*fv == 1, "a difference in lane " + std::to_string(lane) + " alone raises the flag");
         check(std::memcmp(&bv[500], &av[500], sizeof(Uvec4)) == 0,
               "single-component: that word's baseline adopts the new value");
-        check(*neighbour == kCanary, "single-component: the adjacent flag slot is untouched");
+        check(canaries_intact(), "single-component: the neighbouring flag slots are untouched");
     }
 
     // ---- every word differs ---------------------------------------------------------------------
-    fill(av, 11); fill(bv, 22); *fv = 0; *neighbour = kCanary;
+    fill(av, 11); fill(bv, 22); *fv = 0; arm_canaries();
     check(compare(kWords), "all-different: dispatch completed");
     check(*fv == 1, "all-different: flag raised");
     check(std::memcmp(bv, av, bytes) == 0, "all-different: the whole baseline adopts the new result");
-    check(*neighbour == kCanary, "all-different: the adjacent flag slot is untouched");
+    check(canaries_intact(), "all-different: the neighbouring flag slots are untouched");
 
     // ---- out of range: words at or beyond `count` are untouched even when they differ ------------
     // 300 is deliberately not a multiple of 256, so the final workgroup launches 256 invocations of
@@ -379,7 +425,7 @@ int main() {
     // and never in a tidy fixture. 300 * 16 = 4800 bytes is a multiple of 16, so the group-count
     // contract admits it.
     constexpr uint32_t kInRange = 300;
-    fill(av, 11); fill(bv, 22); *fv = 0;
+    fill(av, 11); fill(bv, 22); *fv = 0; arm_canaries();
     std::vector<Uvec4> tail(bv + kInRange, bv + kWords);
     check(compare(kInRange), "partial workgroup: dispatch completed");
     check(*fv == 1, "partial workgroup: an in-range difference raises the flag");
@@ -387,12 +433,14 @@ int main() {
           "partial workgroup: every in-range word is updated");
     check(std::memcmp(bv + kInRange, tail.data(), tail.size() * sizeof(Uvec4)) == 0,
           "partial workgroup: words at and beyond count are UNTOUCHED");
+    check(canaries_intact(), "partial workgroup: the neighbouring flag slots are untouched");
 
     // ---- a difference only beyond count must not raise the flag ---------------------------------
-    fill(av, 11); fill(bv, 11); *fv = 0;
+    fill(av, 11); fill(bv, 11); *fv = 0; arm_canaries();
     av[kInRange].x += 1;                              // the first word past the end
     check(compare(kInRange), "beyond-count: dispatch completed");
     check(*fv == 0, "a difference beyond count does not raise the flag");
+    check(canaries_intact(), "beyond-count: the neighbouring flag slots are untouched");
 
     // ---- how much more a changed result costs than an unchanged one ------------------------------
     // Reported, never asserted, as a MINIMUM over repetitions. The question is whether the
@@ -420,11 +468,11 @@ int main() {
             std::memcpy(bb, ba, big_bytes);
             constexpr int kReps = 5;
             double equal_ms = 1e9, different_ms = 1e9, sample = 0;
-            run_compare(d, p, big_a, big_b, flags, kBig, flag_stride, &sample);   // warm
+            run_compare(d, p, big_a, big_b, flags, kBig, kFlagSlot * flag_stride, &sample);   // warm
             bool equal_clean = true;
             for (int i = 0; i < kReps; ++i) {
                 *fv = 0;
-                run_compare(d, p, big_a, big_b, flags, kBig, flag_stride, &sample);
+                run_compare(d, p, big_a, big_b, flags, kBig, kFlagSlot * flag_stride, &sample);
                 equal_clean = equal_clean && *fv == 0;
                 if (sample < equal_ms) equal_ms = sample;
             }
@@ -438,7 +486,7 @@ int main() {
                 // the per-repetition flag assertion below is what caught it.
                 for (uint32_t j = 0; j < kBig; ++j) bb[j].w ^= 0xffffffffu;
                 *fv = 0;
-                run_compare(d, p, big_a, big_b, flags, kBig, flag_stride, &sample);
+                run_compare(d, p, big_a, big_b, flags, kBig, kFlagSlot * flag_stride, &sample);
                 different_raised = different_raised && *fv == 1;
                 if (sample < different_ms) different_ms = sample;
             }
