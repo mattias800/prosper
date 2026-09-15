@@ -15,6 +15,13 @@
 //   * a registration whose end is exactly the write's start must NOT be dirtied (half-open).
 //   * the audit must be shown to FIRE on a hand-built desynchronized state, or its zero on a real
 //     title says nothing.
+//
+// PROSPER_WATCH_QUERY_AUDIT is armed by CTest, in one arm of two, rather than by a setenv in main().
+// watch_query_audit_enabled() latches into a function-local static on first call, so a setenv here
+// would be correct only for as long as nobody moved a query above it -- an ordering argument, which
+// is the failure #2214 is about. Arming it outside the process removes the argument, and running the
+// same cases with it OFF is what gives the SHIPPED path its own coverage: every assertion below
+// except the audit control itself must hold identically in both arms.
 
 #if !defined(__linux__)
 int main() { return 0; }
@@ -60,8 +67,10 @@ int main() {
     // every registration landing in one bucket, where a broken index would still pass.
     const size_t span = 8u * 1024u * 1024u;
 
-    CHECK(setenv("PROSPER_WRITE_WATCH_MAX_KB", "65536", 1) == 0, "watch size policy raised");
-    CHECK(setenv("PROSPER_WATCH_QUERY_AUDIT", "1", 1) == 0, "query audit armed for the whole run");
+    // 256 MiB: large enough to admit the >128 MiB registration the wide-bucket case needs.
+    CHECK(setenv("PROSPER_WRITE_WATCH_MAX_KB", "262144", 1) == 0, "watch size policy raised");
+    const bool auditing = std::getenv("PROSPER_WATCH_QUERY_AUDIT") != nullptr;
+    std::fprintf(stderr, "arm: query audit %s\n", auditing ? "ON" : "off (shipped path)");
     CHECK(unsetenv("PROSPER_FAULT_NO_ONSTACK") == 0, "production signal path");
     prosper::install_trap_handler();
     guest_write_watch_set_fault_onstack(true);
@@ -134,8 +143,14 @@ int main() {
     // --------------------------------------------------- release leaves the index, ids do not leak
     {
         // Create and destroy a registration over the same range, then prove a GPU write to that range
-        // neither crashes nor resurrects the dead id, and that a fresh registration still works. A
-        // bucket left holding a released id would be a dangling lookup on the next notification.
+        // neither crashes nor resurrects the dead id, and that a fresh registration still works.
+        //
+        // What this does NOT establish, stated because the obvious reading is wrong: ids come from
+        // ++w.next_id and are never reused, and consider() resolves through registrations.find(), so
+        // a bucket entry left behind by a release can never bind to a different registration. Deleting
+        // unindex_registration_locked would still pass this case -- its only consequence is unbounded
+        // growth of registration_chunks, which nothing here can observe. This is a lifecycle smoke
+        // test, not a discriminator for the unindex call.
         {
             GuestWriteWatch transient = GuestWriteWatch::create(reinterpret_cast<uint64_t>(a), span);
             CHECK(static_cast<bool>(transient), "transient watch created");
@@ -184,8 +199,117 @@ int main() {
         right.reset();
     }
 
-    // -------------------------------------------------------- the audit's own positive control
+    // ------------------------------------ a protection change marks, outside set_pages_armed
     {
+        // guest_write_watch_notify_direct_mapping_protection sets coverage_incomplete DIRECTLY on the
+        // page rather than through set_pages_armed -- a fourth way a registration becomes Dirty, and
+        // the one the first version of this change missed. The old per-query walk saw it for free
+        // because it read coverage_incomplete itself; the flag sees it only if that site marks.
+        //
+        // The obvious version of this case does not discriminate, and the first draft of it did not:
+        // the same function's SECOND loop clears mapping_valid for every registration whose pages
+        // overlap a live AliasRange, and query() tests mapping_valid first, so the missing mark is
+        // masked and the case passes with the fix removed. What separates them is that the two loops
+        // are keyed differently -- loop 1 on a surviving PageAlias, loop 2 on a live AliasRange -- so
+        // the state to build is one where a page alias outlives its AliasRange.
+        //
+        // notify_direct_mapping_removed does exactly that: purge_va_range_locked drops only the page
+        // aliases inside the removed range, but erases every AliasRange that merely OVERLAPS it,
+        // whole. So unmapping the first page of a two-page mapping orphans the second page's alias.
+        const size_t two_pages = page * 2;
+        const int orphan_fd = make_memfd("prosper-ww-orphan", two_pages);
+        CHECK(orphan_fd >= 0, "orphan memfd created");
+        if (orphan_fd >= 0) {
+            auto* m = static_cast<uint8_t*>(
+                mmap(nullptr, two_pages, PROT_READ | PROT_WRITE, MAP_SHARED, orphan_fd, 0));
+            CHECK(m != MAP_FAILED, "orphan mapping");
+            if (m != MAP_FAILED) {
+                constexpr uint64_t kOrphanPhys = 0xC0000000;
+                const uint64_t base = reinterpret_cast<uint64_t>(m);
+                guest_write_watch_notify_direct_mapping_added(base, two_pages, kOrphanPhys, kCpuRw);
+
+                // Watch the SECOND page only, so removing the first does not overlap this range.
+                GuestWriteWatch watch = GuestWriteWatch::create(base + page, page);
+                CHECK(static_cast<bool>(watch), "watch created over the second page");
+                CHECK(watch.query() == GuestWriteWatchQuery::Unchanged, "clean before the unmap");
+
+                // Drops the alias at `base` and the whole AliasRange, leaving the second page's alias
+                // with no AliasRange covering it. The watch's own range is untouched, so it stays
+                // mapping_valid; the purge dirties it, and the rearm brings it back to clean.
+                guest_write_watch_notify_direct_mapping_removed(base, page);
+                CHECK(watch.rearm(), "rearm after the partial unmap");
+                CHECK(watch.query() == GuestWriteWatchQuery::Unchanged, "clean again after rearm");
+
+                // Loop 1 finds the orphaned PageAlias and sets coverage_incomplete. Loop 2 finds no
+                // AliasRange, so nothing clears mapping_valid. Only the mark at that site can make
+                // this read Dirty -- which is what makes this the discriminator the simple version
+                // was not.
+                guest_write_watch_notify_direct_mapping_protection(base + page, page, kCpuRw);
+                CHECK(watch.query() == GuestWriteWatchQuery::Dirty,
+                      "a protection change on a page whose AliasRange is gone still dirties its watch");
+                watch.reset();
+                guest_write_watch_notify_direct_mapping_removed(base + page, page);
+                munmap(m, two_pages);
+            }
+            close(orphan_fd);
+        }
+    }
+
+    // ------------------------------------------------ wide registrations and the query fallback
+    {
+        // kMaxRegistrationChunks is 64, i.e. 128 MiB, so a registration wider than that is NOT in any
+        // chunk bucket and is reachable only through the wide list that notify_gpu_write always
+        // scans. Without an arm here, deleting that scan would redden nothing while silently
+        // stopping dirty propagation to exactly the largest watches.
+        const size_t wide_span = 132u * 1024u * 1024u;
+        const int wide_fd = make_memfd("prosper-ww-wide", wide_span);
+        CHECK(wide_fd >= 0, "wide memfd created");
+        if (wide_fd >= 0) {
+            auto* wide_map = static_cast<uint8_t*>(
+                mmap(nullptr, wide_span, PROT_READ | PROT_WRITE, MAP_SHARED, wide_fd, 0));
+            CHECK(wide_map != MAP_FAILED, "wide mapping");
+            if (wide_map != MAP_FAILED) {
+                constexpr uint64_t kWidePhys = 0x80000000;
+                guest_write_watch_notify_direct_mapping_added(
+                    reinterpret_cast<uint64_t>(wide_map), wide_span, kWidePhys, kCpuRw);
+                GuestWriteWatch wide = GuestWriteWatch::create(
+                    reinterpret_cast<uint64_t>(wide_map), wide_span);
+                CHECK(static_cast<bool>(wide), "watch spanning more than 64 chunks created");
+                CHECK(wide.query() == GuestWriteWatchQuery::Unchanged, "wide watch starts clean");
+
+                // Inside the registration but far past the 64-chunk bucketing limit.
+                guest_write_watch_notify_gpu_write(
+                    reinterpret_cast<uint64_t>(wide_map) + 130u * 1024u * 1024u, 4096);
+                CHECK(wide.query() == GuestWriteWatchQuery::Dirty,
+                      "a GPU write dirties a registration too wide to be bucketed");
+                CHECK(wide.rearm() && wide.query() == GuestWriteWatchQuery::Unchanged,
+                      "the wide registration rearms");
+
+                // A notification wider than kMaxQueryChunks (8 GiB) abandons the buckets for a full
+                // scan. It must reach the same registrations -- including this one.
+                guest_write_watch_notify_gpu_write(reinterpret_cast<uint64_t>(wide_map),
+                                                   9ull * 1024ull * 1024ull * 1024ull);
+                CHECK(wide.query() == GuestWriteWatchQuery::Dirty,
+                      "the full-scan fallback for an oversized notification still dirties it");
+                CHECK(wide.rearm(), "rearm after the fallback notification");
+                // No negative arm for the fallback's overlap test, deliberately: the fallback routes
+                // through the same `consider` as the bucketed path, so there is one predicate and the
+                // adjacency cases above already cover it. A negative here would also be unsound --
+                // mmap places these two mappings within a few GiB of each other, so a 9 GiB
+                // notification genuinely DOES cover an "unrelated" watch, and asserting otherwise
+                // tests the allocator's layout rather than this code. (That is what the first draft
+                // of this case did, and it failed for exactly that reason.)
+                wide.reset();
+                guest_write_watch_notify_direct_mapping_removed(
+                    reinterpret_cast<uint64_t>(wide_map), wide_span);
+                munmap(wide_map, wide_span);
+            }
+            close(wide_fd);
+        }
+    }
+
+    // -------------------------------------------------------- the audit's own positive control
+    if (auditing) {
         // Everything above ran with PROSPER_WATCH_QUERY_AUDIT armed and reported no stale registration.
         // That is only evidence if the audit can fire, so build the defect by hand: bump a covered
         // page's generation WITHOUT propagating, which is precisely a missed propagation site.

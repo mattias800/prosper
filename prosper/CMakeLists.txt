@@ -2298,7 +2298,15 @@ endif()
     add_test(NAME guest_write_watch COMMAND test_guest_write_watch)
     add_executable(test_guest_write_watch_index tests/host/memory/test_guest_write_watch_index.cpp)
     target_link_libraries(test_guest_write_watch_index PRIVATE prosper_core)
+    # Two arms, and the environment is armed HERE rather than by a setenv inside main():
+    # watch_query_audit_enabled() latches into a function-local static on its first call, so arming it
+    # in-process is correct only while nobody moves a query above the setenv -- an ordering argument of
+    # exactly the shape #2214 is about. The `off` arm is the one that covers the SHIPPED path; every
+    # case except the audit's own positive control must hold identically in both.
     add_test(NAME guest_write_watch_index COMMAND test_guest_write_watch_index)
+    add_test(NAME guest_write_watch_index_audit
+             COMMAND ${CMAKE_COMMAND} -E env PROSPER_WATCH_QUERY_AUDIT=1
+                     $<TARGET_FILE:test_guest_write_watch_index>)
   endif()
   if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_executable(test_dmem_write_trace tests/host/memory/test_dmem_write_trace.cpp)

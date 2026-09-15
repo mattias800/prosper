@@ -773,8 +773,14 @@ constexpr uint64_t kMaxQueryChunks = 4096;        // 8 GiB
 inline uint64_t index_chunk_of(uint64_t addr) { return addr / kIndexChunk; }
 
 void index_page_addr_locked(WatchState& w, uint64_t va, WatchedPage* page) {
-    w.pages_by_addr[va] = page;
-    ++w.page_chunks[index_chunk_of(va)];
+    // emplace, not operator[]: the count must follow the KEY's existence, not the number of times a
+    // VA was indexed. Re-indexing an already-present VA (two PageAlias entries at one page-aligned
+    // address) would otherwise ratchet the counter up with nothing to decrement it, and a chunk stuck
+    // above zero is scanned forever. The drift is conservative -- an over-counted chunk is scanned and
+    // misses -- but it degrades the index toward the walk it replaced.
+    const auto inserted = w.pages_by_addr.emplace(va, page);
+    if (inserted.second) ++w.page_chunks[index_chunk_of(va)];
+    else inserted.first->second = page;
 }
 
 void unindex_page_addr_locked(WatchState& w, uint64_t va) {
@@ -2023,6 +2029,14 @@ void guest_write_watch_notify_direct_mapping_protection(uint64_t addr, uint64_t 
             if (alias.addr < end && alias.addr + kPage > addr) {
                 alias.prot = protection;
                 page->coverage_incomplete = true;
+                // The fourth place a registration can become Dirty, and the one the first version of
+                // this change missed: coverage_incomplete set OUTSIDE set_pages_armed. The loop below
+                // usually masks it by clearing mapping_valid, but it is keyed on a live AliasRange
+                // covering this VA while THIS loop is keyed on a surviving PageAlias -- and
+                // purge_va_range_locked drops an overlapping AliasRange whole while dropping only the
+                // page aliases inside the purged range, so the two sets can diverge. Mark here rather
+                // than rely on the other loop's key agreeing.
+                mark_page_changed_locked(w, page.get());
             }
     }
     for (DmemTracePage& page : w.trace.pages)
@@ -2311,6 +2325,17 @@ void guest_write_watch_notify_host_write(uint64_t addr, uint64_t size) {
             w.page_chunks.find(index_chunk_of(chunk_begin)) == w.page_chunks.end()) continue;
         const uint64_t from = chunk_begin > begin ? chunk_begin : begin;
         const uint64_t chunk_end = chunk_begin + kIndexChunk;
+        // The old per-page walk could not wrap; this one can. A chunk at the very top of the address
+        // space overflows to 0, which would make `to` 0, scan nothing, and then restart the outer
+        // loop from chunk 0. Unreachable with canonical addresses, and one comparison to keep it so.
+        if (chunk_end < chunk_begin) {
+            for (uint64_t va = from; va < end; va += kPage) {
+                ++scanned;
+                auto it = w.pages_by_addr.find(va);
+                if (it != w.pages_by_addr.end() && it->second) hit.push_back(it->second);
+            }
+            break;
+        }
         const uint64_t to = chunk_end < end ? chunk_end : end;
         for (uint64_t va = from; va < to; va += kPage) {
             ++scanned;
@@ -2391,14 +2416,14 @@ void guest_write_watch_notify_gpu_write(uint64_t addr, uint64_t size) {
     if (watch_legacy_scan_enabled() || last_chunk - first_chunk + 1 > kMaxQueryChunks) {
         // Wider than the index is worth walking. Fall back to the complete scan rather than let one
         // enormous notification visit more buckets than there are registrations.
-        for (auto& [id, registration] : w.registrations) {
-            (void)id;
-            ++visited;
-            if (registration.begin < end && addr < registration.end) {
-                if (!registration.gpu_dirty) ++overlaps;
-                registration.gpu_dirty = true;
-            }
-        }
+        //
+        // Routed through `consider` rather than repeating the overlap test: a second copy of the
+        // predicate is a second thing that can drift, and it would need its own coverage to prove it
+        // had not. The redundant find() costs nothing on a path this rare.
+        std::vector<uint64_t> every;
+        every.reserve(w.registrations.size());
+        for (const auto& [id, registration] : w.registrations) { (void)registration; every.push_back(id); }
+        for (const uint64_t id : every) consider(id);
     } else {
         for (uint64_t chunk = first_chunk; chunk <= last_chunk; ++chunk) {
             const auto found = w.registration_chunks.find(chunk);
