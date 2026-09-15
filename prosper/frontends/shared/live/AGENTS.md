@@ -33,6 +33,10 @@ found Vulkan.
   Image mirroring and borrowed-image layout restoration remain independent obligations.
   `PROSPER_NO_GPU_RETILE_PACKED_EXTENSION` restores the prior mode-24 multilayer-only packed scope
   for comparable runs while leaving ordinary word and volume GPU tiling enabled.
+  `PROSPER_GPU_RETILE_CENSUS=1` reports, per dispatching program, how many storage images this
+  admission accepted and how many it declined **for which named reason**, with one representative
+  shape per reason. The admission has a dozen `continue`s; before the census, "the CPU layout path is
+  hot" and "which condition sent it there" were separate questions with only the first answerable.
 - `packed_rtt_conversion.hpp` — device-owned RGBA8→packed-10-bit sampled conversion.
   Records transfers and conversion into the guest compute submission; setup failures retain their
   `VkResult` so optional fallback cannot hide device loss.
@@ -148,6 +152,15 @@ early-exiting comparison. `compared-bytes` includes the initial exact comparison
 allocation contents. `upload-skipped` is the existing cached-source authority bit: zero upload bytes
 on a cold, already-equal pooled allocation does not set it. Atomic image writeback uses
 `guest_layout_ms`; `guest-copied-bytes` counts only the ordinary contiguous buffer copy.
+
+`layout_ms` is the one timer here whose name does not describe what it usually measures. It times the
+whole publication branch, and the branch has two arms that are different work: a GPU-retiled result is
+memcpy'd out of the retile buffer, a declined one is tiled on the CPU. `retile_copy_ms` is a strict
+subset of `layout_ms` covering only the memcpy, so `layout_ms - retile_copy_ms` is the CPU tiling
+residual — measured 2026-09-15 at 6,551 / 6,541 / ~10 ms on a Sonic Frontiers route, i.e. the name is
+misleading by three orders of magnitude on that title. `tools/perf/compute_phase_report.py` models the
+copy as layout's child so the residual surfaces as layout's `unattributed` row rather than the whole
+branch reading as a targetable leaf.
 
 Timers are nested, not additive: `setup_ms` covers owner materialization after resource/alias checks;
 `validation_ms` includes upload compare/copy/map/watch on cache hits. `writeback_ms` encloses result

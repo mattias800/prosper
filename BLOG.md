@@ -30,8 +30,6 @@ tiling had already been moved onto the GPU and nobody had re-measured. What is a
 copying the finished result into the game's own memory and re-protecting it, which is now written down
 as [#3683](https://github.com/mattias800/prosper/issues/3683) with the numbers behind it.
 
-## 2026-09-15
-
 ### Sonic Frontiers got 10% faster by not asking the same question 253 million times
 
 No picture — the frame looks identical, which is the point. Every time prosper wanted to know

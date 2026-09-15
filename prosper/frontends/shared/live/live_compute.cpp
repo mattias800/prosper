@@ -1426,6 +1426,7 @@ enum class GpuRetileDecline : uint8_t {
     PartialWrite,          // a write mask means the result does not cover the whole surface
     InexactBytes,          // staged bytes are not the guest's exact storage extent
     MipTailOrOffset,       // in a mip tail, or at a nonzero layer/mip offset
+    NoResource,            // the binding carries no ShaderResource at all
     NoStaging,             // no staging buffer for this image
     UnsupportedShape,      // layer/depth/dimension combination outside the admitted set
     PackedDisabled,        // packed byte/halfword words with the extension switched off
@@ -1444,6 +1445,7 @@ const char* gpu_retile_decline_name(GpuRetileDecline reason) {
         case GpuRetileDecline::PartialWrite: return "partial-write";
         case GpuRetileDecline::InexactBytes: return "inexact-bytes";
         case GpuRetileDecline::MipTailOrOffset: return "mip-tail-or-offset";
+        case GpuRetileDecline::NoResource: return "no-resource";
         case GpuRetileDecline::NoStaging: return "no-staging";
         case GpuRetileDecline::UnsupportedShape: return "unsupported-shape";
         case GpuRetileDecline::PackedDisabled: return "packed-disabled";
@@ -1458,10 +1460,12 @@ const char* gpu_retile_decline_name(GpuRetileDecline reason) {
 struct GpuRetileCensus {
     struct Row {
         std::array<uint64_t, static_cast<size_t>(GpuRetileDecline::Count)> reasons{};
-        // One representative shape per reason, so a row can be acted on without a second run. First
-        // seen wins: a later one would need a policy for which is representative, and there is none.
-        std::array<char, 96> sample{};
-        uint64_t sampled_reason = 0;
+        // One representative shape PER REASON, and printed next to that reason's name. A single
+        // sample per program was the first shape of this and it is not enough to act on: it is
+        // whichever reason declined first, it carries no label saying which, and quoting it beside a
+        // count generalizes one image to every decline in the row. Per reason, first seen wins --
+        // a later one would need a policy for which is representative, and there is none.
+        std::array<std::array<char, 96>, static_cast<size_t>(GpuRetileDecline::Count)> samples{};
     };
     std::mutex mutex;
     std::unordered_map<uint64_t, Row> by_code;   // guest code address of the dispatching program
@@ -1473,12 +1477,12 @@ struct GpuRetileCensus {
         std::lock_guard<std::mutex> lock(mutex);
         Row& row = by_code[code_addr];
         row.reasons[static_cast<size_t>(reason)]++;
-        if (reason != GpuRetileDecline::Admitted && !row.sample[0] && r) {
-            std::snprintf(row.sample.data(), row.sample.size(),
+        auto& sample = row.samples[static_cast<size_t>(reason)];
+        if (reason != GpuRetileDecline::Admitted && !sample[0] && r) {
+            std::snprintf(sample.data(), sample.size(),
                           "%ux%ux%u dim=%u tile=%u fmt=%u bpe=%u",
                           r->width, r->height, r->depth, (unsigned)r->img_dim,
                           (unsigned)r->tile_mode, (unsigned)r->format, bpe);
-            row.sampled_reason = static_cast<uint64_t>(reason);
         }
     }
 
@@ -1495,11 +1499,18 @@ struct GpuRetileCensus {
                 line += " ";
                 line += gpu_retile_decline_name(static_cast<GpuRetileDecline>(i));
                 line += "=" + std::to_string(row.reasons[i]);
+                // The sample belongs to THIS reason, and says so. A shape printed once per row with
+                // no label cannot be attributed to any bucket, and reads as representative of all of
+                // them. "first" rather than "e.g." because it is the first seen, not a typical one:
+                // nothing here establishes that the other declines in this bucket share its shape.
+                if (row.samples[i][0]) {
+                    line += "(first ";
+                    line += row.samples[i].data();
+                    line += ")";
+                }
             }
-            std::fprintf(stderr, "[gpu-retile-census] code=0x%llx images=%llu%s%s%s\n",
-                         (unsigned long long)code, (unsigned long long)total, line.c_str(),
-                         row.sample[0] ? "  first-decline: " : "",
-                         row.sample[0] ? row.sample.data() : "");
+            std::fprintf(stderr, "[gpu-retile-census] code=0x%llx images=%llu%s\n",
+                         (unsigned long long)code, (unsigned long long)total, line.c_str());
         }
     }
 };
@@ -2178,9 +2189,12 @@ struct VulkanComputeContext {
     uint64_t image_borrow_census_submits = 0;
 
     // Its own gate and its own period, for the reason the comment above gives: a shared cadence makes
-    // one report's timing an artefact of the other's variable. atexit as well as periodic, because a
-    // routed run is usually ended by a signal after the interesting phase rather than at a multiple of
-    // the period.
+    // one report's timing an artefact of the other's variable.
+    //
+    // BOTH mechanisms, and the roles are the opposite way round from the obvious reading: the PERIODIC
+    // report is the one that survives a routed run, because SIGTERM's default action terminates
+    // without running atexit handlers at all. atexit is the fallback for an ordinary return from
+    // main(). An earlier version of this comment had the two swapped.
     void report_gpu_retile_census_periodically() {
         if (!gpu_retile_census_enabled()) return;
         if (++gpu_retile_census_submits % 256 == 0) gpu_retile_census().report();
@@ -10003,7 +10017,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                 : bi.imported          ? GpuRetileDecline::Imported
                                 : bi.storage_write_mask ? GpuRetileDecline::PartialWrite
                                 : !bi.exact_storage_bytes() ? GpuRetileDecline::InexactBytes
-                                : !r                   ? GpuRetileDecline::NoStaging
+                                : !r                   ? GpuRetileDecline::NoResource
                                 : (r->in_mip_tail || r->layer_mip_offset_bytes)
                                                        ? GpuRetileDecline::MipTailOrOffset
                                                        : GpuRetileDecline::NoStaging,
