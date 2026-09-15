@@ -52,6 +52,28 @@ struct GuestWriteWatchStats {
     // volume rather than leaving it inferred from arm/disarm counts of unknown extent.
     uint64_t protect_calls = 0;
     uint64_t protect_bytes = 0;
+    // #3681: the SCAN COST of this machinery, as distinct from the work it performs. Each of the
+    // three hot entry points is O(something the caller does not control) under the one state mutex,
+    // and until these existed the only visible figure was elapsed `watch_ms`, which cannot say
+    // whether a call walked a million entries or waited on the lock.
+    //
+    // `query_pages_visited` / `queries` is the real page cost of a query; `host_write_pages_scanned`
+    // against `host_write_pages_hit` says what fraction of a notified range is watched at all; and
+    // `gpu_write_registrations_visited` against `gpu_write_overlaps` says the same for the
+    // registration walk. A ratio near 1 means the walk is inherent and only the work can be cut; a
+    // ratio far from 1 means the walk itself is the waste.
+    uint64_t query_pages_visited = 0;
+    uint64_t host_write_pages_scanned = 0;
+    uint64_t gpu_write_notifies = 0;
+    uint64_t gpu_write_registrations_visited = 0;
+    uint64_t gpu_write_overlaps = 0;
+    // PROSPER_WATCH_QUERY_AUDIT outcomes. `stale_clean` must stay 0: it counts a registration the
+    // fast path called clean while the page walk it replaced says dirty, i.e. a state change that
+    // failed to reach its registrations. `conservative` is the benign direction and costs a rearm.
+    uint64_t query_audit_stale = 0;
+    uint64_t query_audit_conservative = 0;
+    // Rearms answered without touching the page list because nothing covered had changed.
+    uint64_t rearm_fast = 0;
 };
 
 // Bounded, diagnostic-only provenance overlay for direct-memory CPU writes.  Unlike GuestWriteWatch,
@@ -207,6 +229,16 @@ private:
 };
 
 GuestWriteWatchStats guest_write_watch_stats();
+
+// Test-only. Bumps the generation of the watched page covering `addr` WITHOUT marking the
+// registrations that cover it -- by hand, exactly the missed-propagation defect that
+// PROSPER_WATCH_QUERY_AUDIT exists to catch. Returns false when no watched page covers `addr`.
+//
+// This exists because the audit reporting zero stale registrations across a real title is only
+// evidence if the audit can be shown to fire at all, and no input the machinery accepts can produce
+// a desynchronized state on its own: the propagation is wired into every transition. A control built
+// from the same machinery would inherit the property under test and pass for the wrong reason.
+bool guest_write_watch_desynchronize_for_test(uint64_t addr);
 
 // Direct-memory mapping notifications. A topology/protection change invalidates existing watches;
 // their next query is Dirty/Unknown and the exact path may establish a fresh complete registration.

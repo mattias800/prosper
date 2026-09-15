@@ -2296,6 +2296,25 @@ endif()
     add_executable(test_guest_write_watch tests/host/memory/test_guest_write_watch.cpp)
     target_link_libraries(test_guest_write_watch PRIVATE prosper_core)
     add_test(NAME guest_write_watch COMMAND test_guest_write_watch)
+    add_executable(test_guest_write_watch_index tests/host/memory/test_guest_write_watch_index.cpp)
+    target_link_libraries(test_guest_write_watch_index PRIVATE prosper_core)
+    # Two arms, and the environment is armed HERE rather than by a setenv inside main():
+    # watch_query_audit_enabled() latches into a function-local static on its first call, so arming it
+    # in-process is correct only while nobody moves a query above the setenv -- an ordering argument of
+    # exactly the shape #2214 is about. The `off` arm is the one that covers the SHIPPED path; every
+    # case except the audit's own positive control must hold identically in both.
+    # The off arm UNSETS both switches rather than merely not setting them: a developer working on
+    # this feature plausibly has them exported, and inheriting them turns the shipped-path arm into a
+    # second audit arm (losing the only shipped-path coverage) or -- with PROSPER_WATCH_LEGACY_SCAN --
+    # into a run where every assertion passes for the pre-#3681 reason. Neither announces itself.
+    add_test(NAME guest_write_watch_index
+             COMMAND ${CMAKE_COMMAND} -E env --unset=PROSPER_WATCH_QUERY_AUDIT
+                     --unset=PROSPER_WATCH_LEGACY_SCAN
+                     $<TARGET_FILE:test_guest_write_watch_index>)
+    add_test(NAME guest_write_watch_index_audit
+             COMMAND ${CMAKE_COMMAND} -E env --unset=PROSPER_WATCH_LEGACY_SCAN
+                     PROSPER_WATCH_QUERY_AUDIT=1
+                     $<TARGET_FILE:test_guest_write_watch_index>)
   endif()
   if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_executable(test_dmem_write_trace tests/host/memory/test_dmem_write_trace.cpp)
