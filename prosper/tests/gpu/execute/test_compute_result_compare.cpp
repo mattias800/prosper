@@ -1,31 +1,42 @@
-// Execution coverage for build_compute_compare_uvec4() -- the shader that decides whether a compute
-// storage writeback is SKIPPED.
+// EXECUTION coverage for build_compute_compare_uvec4() -- the shader whose changed-flag decides
+// whether a compute storage writeback is skipped.
 //
-// It had none. That mattered less when the ceiling admitting it was 2 MiB, because almost nothing
+// What was missing, stated precisely: the module is already emitted and `spirv-val`-checked by
+// `tools/spv_validate` (registered unconditionally; CI hard-fails when spirv-val is absent), and the
+// Vulkan validation scan covers it at runtime. What nothing did was RUN it and look at what it
+// computed.
+//
+// That gap grew teeth recently. While the ceiling admitting the comparison was 2 MiB almost nothing
 // reached it; #3685 derives that ceiling from the memory topology and admits results up to 128 MiB on
 // a unified-memory device, so this shader now gates the publication of every 4K compute target on the
-// platform this project develops on. A false "unchanged" here does not merely skip a baseline update
-// -- live_compute.cpp reads the flag as `gpu_result_unchanged` and skips writing the dispatch's result
-// back to guest memory at all, which surfaces as a frame that silently keeps stale pixels.
+// platform this project develops on. A false "unchanged" does not merely skip a baseline update --
+// live_compute.cpp reads the flag as `gpu_result_unchanged` and skips writing the dispatch's result
+// to guest memory at all, which surfaces as a frame silently keeping stale pixels.
 //
-// The cases are chosen for what a wrong implementation would get wrong, not to re-walk the happy path:
+// **This test does not guard #1711**, and an earlier version of this header claimed it did. That
+// defect declared the flag as a uvec4 runtime array with ArrayStride 16 over a 4-byte binding, making
+// element 0 out of bounds under robustBufferAccess -- which a driver is PERMITTED to discard. The fix
+// commit records that neither RADV nor lavapipe actually did, so the module behaved correctly for the
+// whole life of the bug and any behavioural assertion would have been green throughout. What catches
+// that class is `spv_validate` and the validation scan, not this file.
 //
-//   * a difference in ANY of the four components of ANY word must raise the flag -- a comparison that
-//     tested only .x would pass an equal-x/different-y case;
-//   * the baseline must be updated to the new value, and ONLY where it differed;
-//   * words at or beyond the push-constant count must be untouched even when they differ. That is the
-//     bounds property the shader's own comment calls load-bearing, and it is the one a partial final
-//     workgroup exercises for real: 256 invocations launch, fewer than 256 are in range;
-//   * the flag buffer is bound as FOUR BYTES. The #1711 comment records that declaring it as a
-//     uvec4 runtime array gave it ArrayStride 16 over a 4-byte range, making element 0 out of bounds
-//     under robustBufferAccess -- which a conformant driver may discard, leaving the flag stuck at
-//     zero. This test binds it the way production does and asserts the flag actually changes, so that
-//     regression cannot come back silently.
+// Two properties here are worth more than the rest, because they fail against a real wrong
+// implementation rather than re-walking the happy path:
 //
-// robustBufferAccess is requested because live_compute.cpp requires it; testing this shader without it
-// would test a different device contract than the one it ships against.
+//   * a difference in ANY of the four components raises the flag -- asserted per lane, because a
+//     comparison testing only .x passes three of the four;
+//   * words at or beyond the push-constant count are untouched even when they differ, and a
+//     difference beyond the count does not raise the flag. The count is deliberately 300, not a
+//     multiple of 256, so the final workgroup launches 256 invocations of which 44 are in range.
+//
+// And one property is deliberately NOT claimed. The shader stores the baseline only on the differing
+// branch, but writing `a[i]` where `a[i] == b[i]` is byte-idempotent, so an implementation that
+// stored unconditionally is indistinguishable through buffer contents. No assertion below pins it,
+// and none pretends to.
 
 #include "gpu/recompiler/spirv_builder.hpp"
+#include "gpu/execute/host_read_barrier.hpp"
+#include "shared/device/vulkan_device_select.hpp"
 #include "shared/live/live_compute.hpp"
 
 #include <vulkan/vulkan.h>
@@ -46,13 +57,12 @@ void check(bool ok, const std::string& message) {
 }
 
 struct Uvec4 { uint32_t x, y, z, w; };
-bool operator==(const Uvec4& a, const Uvec4& b) {
-    return a.x == b.x && a.y == b.y && a.z == b.z && a.w == b.w;
-}
 
-// A minimal compute device. Deliberately standalone rather than reaching into the live backend: the
-// point is to exercise the SHADER against a plain Vulkan contract, so a failure here indicts the
-// module rather than the backend's resource machinery.
+// The device is built here rather than through the live backend so a failure indicts the SHADER
+// rather than the backend's resource machinery. The SELECTION, though, is the shared one production
+// uses: Vulkan does not promise physical devices are enumerated in performance order, and a
+// hand-rolled "first with a compute queue" can land on a software implementation on a box that also
+// has a real GPU -- which for a test about driver-dependent behaviour is the wrong device entirely.
 struct Device {
     VkInstance instance = VK_NULL_HANDLE;
     VkPhysicalDevice physical = VK_NULL_HANDLE;
@@ -60,48 +70,60 @@ struct Device {
     VkQueue queue = VK_NULL_HANDLE;
     uint32_t family = UINT32_MAX;
     VkCommandPool pool = VK_NULL_HANDLE;
+    VkPhysicalDeviceProperties properties{};
     VkPhysicalDeviceMemoryProperties memory{};
+    const char* failure = nullptr;   // which step failed, so a skip names its own cause
 
     bool init() {
         VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
-        app.apiVersion = VK_API_VERSION_1_1;
+        app.apiVersion = VK_API_VERSION_1_4;
         VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
         ici.pApplicationInfo = &app;
-        if (vkCreateInstance(&ici, nullptr, &instance) != VK_SUCCESS) return false;
+        if (vkCreateInstance(&ici, nullptr, &instance) != VK_SUCCESS) {
+            failure = "vkCreateInstance failed"; return false;
+        }
         uint32_t count = 0;
         vkEnumeratePhysicalDevices(instance, &count, nullptr);
-        if (!count) return false;
+        if (!count) { failure = "no Vulkan physical devices"; return false; }
         std::vector<VkPhysicalDevice> devices(count);
         vkEnumeratePhysicalDevices(instance, &count, devices.data());
-        for (VkPhysicalDevice candidate : devices) {
-            VkPhysicalDeviceFeatures features{};
-            vkGetPhysicalDeviceFeatures(candidate, &features);
-            if (!features.robustBufferAccess) continue;
-            uint32_t families = 0;
-            vkGetPhysicalDeviceQueueFamilyProperties(candidate, &families, nullptr);
-            std::vector<VkQueueFamilyProperties> properties(families);
-            vkGetPhysicalDeviceQueueFamilyProperties(candidate, &families, properties.data());
-            for (uint32_t i = 0; i < families; ++i)
-                if (properties[i].queueFlags & VK_QUEUE_COMPUTE_BIT) { physical = candidate; family = i; break; }
-            if (physical) break;
+        const auto selection =
+            prosper::frontend::select_vulkan_device(devices, VK_QUEUE_COMPUTE_BIT);
+        if (!selection.device || selection.queue_family == UINT32_MAX) {
+            failure = "no device with the runtime version, a compute queue and robustBufferAccess";
+            return false;
         }
-        if (!physical) return false;
+        physical = selection.device;
+        family = selection.queue_family;
+        properties = selection.properties;
         vkGetPhysicalDeviceMemoryProperties(physical, &memory);
         float priority = 1.0f;
         VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
         qci.queueFamilyIndex = family; qci.queueCount = 1; qci.pQueuePriorities = &priority;
+        // Requested because live_compute.cpp requires it; testing without it would exercise a
+        // different device contract than the one this shader ships against.
         VkPhysicalDeviceFeatures enabled{};
         enabled.robustBufferAccess = VK_TRUE;
         VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
         dci.queueCreateInfoCount = 1; dci.pQueueCreateInfos = &qci; dci.pEnabledFeatures = &enabled;
-        if (vkCreateDevice(physical, &dci, nullptr, &device) != VK_SUCCESS) return false;
+        if (vkCreateDevice(physical, &dci, nullptr, &device) != VK_SUCCESS) {
+            failure = "vkCreateDevice failed"; return false;
+        }
         vkGetDeviceQueue(device, family, 0, &queue);
         VkCommandPoolCreateInfo cpi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
         cpi.queueFamilyIndex = family;
         cpi.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-        return vkCreateCommandPool(device, &cpi, nullptr, &pool) == VK_SUCCESS;
+        if (vkCreateCommandPool(device, &cpi, nullptr, &pool) != VK_SUCCESS) {
+            failure = "vkCreateCommandPool failed"; return false;
+        }
+        return true;
     }
-
+    void destroy() {
+        if (pool) vkDestroyCommandPool(device, pool, nullptr);
+        if (device) vkDestroyDevice(device, nullptr);
+        if (instance) vkDestroyInstance(instance, nullptr);
+        pool = VK_NULL_HANDLE; device = VK_NULL_HANDLE; instance = VK_NULL_HANDLE;
+    }
     uint32_t host_memory_type(uint32_t bits) const {
         const VkMemoryPropertyFlags want =
             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
@@ -126,21 +148,23 @@ struct Buffer {
         VkMemoryRequirements requirements{};
         vkGetBufferMemoryRequirements(d.device, buffer, &requirements);
         const uint32_t type = d.host_memory_type(requirements.memoryTypeBits);
-        if (type == UINT32_MAX) return false;
+        if (type == UINT32_MAX) { destroy(d); return false; }
         VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         mai.allocationSize = requirements.size; mai.memoryTypeIndex = type;
-        if (vkAllocateMemory(d.device, &mai, nullptr, &memory) != VK_SUCCESS) return false;
-        if (vkBindBufferMemory(d.device, buffer, memory, 0) != VK_SUCCESS) return false;
-        return vkMapMemory(d.device, memory, 0, size, 0, &mapped) == VK_SUCCESS;
+        if (vkAllocateMemory(d.device, &mai, nullptr, &memory) != VK_SUCCESS) { destroy(d); return false; }
+        if (vkBindBufferMemory(d.device, buffer, memory, 0) != VK_SUCCESS) { destroy(d); return false; }
+        if (vkMapMemory(d.device, memory, 0, size, 0, &mapped) != VK_SUCCESS) { destroy(d); return false; }
+        return true;
     }
     void destroy(Device& d) {
-        if (memory) { vkUnmapMemory(d.device, memory); vkFreeMemory(d.device, memory, nullptr); }
+        if (mapped) vkUnmapMemory(d.device, memory);
+        if (memory) vkFreeMemory(d.device, memory, nullptr);
         if (buffer) vkDestroyBuffer(d.device, buffer, nullptr);
         buffer = VK_NULL_HANDLE; memory = VK_NULL_HANDLE; mapped = nullptr;
     }
 };
 
-// The production pipeline shape: three storage bindings and a one-uint push constant.
+// Three storage bindings and a one-uint push constant, matching the production layout.
 struct ComparePipeline {
     VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
     VkPipelineLayout layout = VK_NULL_HANDLE;
@@ -148,7 +172,7 @@ struct ComparePipeline {
     VkPipeline pipeline = VK_NULL_HANDLE;
     VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
 
-    bool create(Device& d) {
+    bool create(Device& d, uint32_t max_sets) {
         VkDescriptorSetLayoutBinding bindings[3]{};
         for (uint32_t i = 0; i < 3; ++i) {
             bindings[i].binding = i;
@@ -177,25 +201,38 @@ struct ComparePipeline {
         cpi.layout = layout;
         if (vkCreateComputePipelines(d.device, VK_NULL_HANDLE, 1, &cpi, nullptr, &pipeline) != VK_SUCCESS)
             return false;
-        VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3 * 64};
+        // Created WITHOUT VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT and never freed
+        // individually -- which is production's shape too (it recycles with vkResetDescriptorPool or
+        // destroys the pool). Calling vkFreeDescriptorSets on a pool lacking that bit is undefined
+        // behaviour, and the Vulkan validation scan fails the build for it; the first version of this
+        // file did exactly that and turned the Linux job red.
+        VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3 * max_sets};
         VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-        dpi.maxSets = 64; dpi.poolSizeCount = 1; dpi.pPoolSizes = &size;
+        dpi.maxSets = max_sets; dpi.poolSizeCount = 1; dpi.pPoolSizes = &size;
         return vkCreateDescriptorPool(d.device, &dpi, nullptr, &descriptor_pool) == VK_SUCCESS;
+    }
+    void destroy(Device& d) {
+        if (descriptor_pool) vkDestroyDescriptorPool(d.device, descriptor_pool, nullptr);
+        if (pipeline) vkDestroyPipeline(d.device, pipeline, nullptr);
+        if (module_) vkDestroyShaderModule(d.device, module_, nullptr);
+        if (layout) vkDestroyPipelineLayout(d.device, layout, nullptr);
+        if (set_layout) vkDestroyDescriptorSetLayout(d.device, set_layout, nullptr);
     }
 };
 
-// Runs the comparison once. `count` is in uvec4 units and goes in the push constant, exactly as
-// live_compute.cpp sets it; the buffers may be LONGER than count, which is how the out-of-range cases
-// are built. Returns the elapsed device-visible wall time so the same helper can answer the timing
-// question without a second harness.
+// One comparison. `count` is in uvec4 units and goes in the push constant exactly as production sets
+// it; the buffers may be longer than count, which is how the out-of-range cases are built.
+// `flag_offset` binds the changed flag at a nonzero offset the way production does -- it slices ONE
+// shared buffer at `target_index * compare_flag_stride()`, so the dword beside a flag is another
+// target's flag rather than allocation padding.
 bool run_compare(Device& d, ComparePipeline& p, Buffer& a, Buffer& b, Buffer& flag,
-                 uint32_t count, double* elapsed_ms = nullptr) {
+                 uint32_t count, VkDeviceSize flag_offset = 0, double* elapsed_ms = nullptr) {
     VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
     dai.descriptorPool = p.descriptor_pool; dai.descriptorSetCount = 1; dai.pSetLayouts = &p.set_layout;
     VkDescriptorSet set = VK_NULL_HANDLE;
     if (vkAllocateDescriptorSets(d.device, &dai, &set) != VK_SUCCESS) return false;
     VkDescriptorBufferInfo infos[3] = {
-        {a.buffer, 0, a.bytes}, {b.buffer, 0, b.bytes}, {flag.buffer, 0, flag.bytes}};
+        {a.buffer, 0, a.bytes}, {b.buffer, 0, b.bytes}, {flag.buffer, flag_offset, sizeof(uint32_t)}};
     VkWriteDescriptorSet writes[3]{};
     for (uint32_t i = 0; i < 3; ++i) {
         writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -211,18 +248,32 @@ bool run_compare(Device& d, ComparePipeline& p, Buffer& a, Buffer& b, Buffer& fl
     if (vkAllocateCommandBuffers(d.device, &cbi, &cmd) != VK_SUCCESS) return false;
     VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(cmd, &begin);
+    if (vkBeginCommandBuffer(cmd, &begin) != VK_SUCCESS) return false;
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.layout, 0, 1, &set, 0, nullptr);
     vkCmdPushConstants(cmd, p.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(count), &count);
-    // The same group count the backend computes, so a sizing mistake here would be the backend's too.
-    const uint32_t groups = (count + 255u) / 256u;
+    // Production's own group count rather than a local replica, so a sizing mistake here would be the
+    // backend's too. (The previous version hardcoded `(count + 255) / 256` under a comment claiming
+    // exactly this coupling, which it did not have.)
+    const uint32_t groups = prosper::frontend::compute_result_compare_group_count(
+        VkDeviceSize(count) * sizeof(Uvec4), d.properties.limits.maxStorageBufferRange,
+        d.properties.limits.maxComputeWorkGroupCount[0]);
+    if (!groups) return false;
     vkCmdDispatch(cmd, groups, 1, 1);
-    vkEndCommandBuffer(cmd);
+    // The availability operation into the host domain. A fence orders EXECUTION; it does not move a
+    // shader write into the host domain, and HOST_COHERENT does not exempt it. Production records
+    // exactly this on the flag and on every baseline before reading them back. Without it this test
+    // stays green on these drivers, which is why it is here deliberately rather than by luck --
+    // frontends/shared/live/AGENTS.md and #2944.
+    prosper::gpu::record_host_read_barrier(cmd, b.buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                           VK_ACCESS_SHADER_WRITE_BIT);
+    prosper::gpu::record_host_read_barrier(cmd, flag.buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                           VK_ACCESS_SHADER_WRITE_BIT);
+    if (vkEndCommandBuffer(cmd) != VK_SUCCESS) return false;
 
     VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
     VkFence fence = VK_NULL_HANDLE;
-    vkCreateFence(d.device, &fci, nullptr, &fence);
+    if (vkCreateFence(d.device, &fci, nullptr, &fence) != VK_SUCCESS) return false;
     VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     submit.commandBufferCount = 1; submit.pCommandBuffers = &cmd;
     const auto started = std::chrono::steady_clock::now();
@@ -233,138 +284,161 @@ bool run_compare(Device& d, ComparePipeline& p, Buffer& a, Buffer& b, Buffer& fl
             std::chrono::steady_clock::now() - started).count();
     vkDestroyFence(d.device, fence, nullptr);
     vkFreeCommandBuffers(d.device, d.pool, 1, &cmd);
-    vkFreeDescriptorSets(d.device, p.descriptor_pool, 1, &set);
+    // The descriptor set is deliberately NOT freed; see the pool's creation flags.
     return ok;
 }
 
 }  // namespace
 
 int main() {
+    // The pure eligibility contract, checked without a device. Production refuses a comparison whose
+    // byte count is not a multiple of 16 or exceeds the device's storage-buffer range, and every
+    // dispatch below is sized by this same function.
+    using prosper::frontend::compute_result_compare_group_count;
+    check(compute_result_compare_group_count(4096, 1u << 27, 65535) == 1,
+          "group count: 4096 bytes is one workgroup");
+    check(compute_result_compare_group_count(0, 1u << 27, 65535) == 0,
+          "group count: zero bytes is refused");
+    check(compute_result_compare_group_count(4095, 1u << 27, 65535) == 0,
+          "group count: a byte count that is not a multiple of 16 is refused");
+    check(compute_result_compare_group_count(1ull << 28, 1u << 27, 65535) == 0,
+          "group count: a byte count over the device's storage-buffer range is refused");
+
     Device d;
     if (!d.init()) {
-        // No conformant compute device with robustBufferAccess. Say so rather than passing silently:
-        // a green run here must mean the shader was exercised.
-        std::printf("[skip] no Vulkan compute device with robustBufferAccess\n");
-        return 0;
+        // Name the cause. Several of the failures reachable here are environment or driver DEFECTS,
+        // and reporting them as a benign absence is how a green run comes to mean nothing.
+        std::printf("[skip] %s\n", d.failure ? d.failure : "device initialization failed");
+        d.destroy();
+        return failures ? 1 : 0;
     }
-    ComparePipeline p;
-    if (!p.create(d)) { std::printf("FAIL: could not build the compare pipeline\n"); return 1; }
+    std::printf("[info] device: %s (type %u)\n", d.properties.deviceName,
+                (unsigned)d.properties.deviceType);
 
-    constexpr uint32_t kWords = 1024;          // uvec4s; 4 full workgroups
+    constexpr uint32_t kRuns = 32;            // descriptor sets allocated; the pool is sized from it
+    ComparePipeline p;
+    if (!p.create(d, kRuns)) { std::printf("FAIL: could not build the compare pipeline\n"); return 1; }
+
+    constexpr uint32_t kWords = 1024;         // uvec4s; 4 full workgroups
     const VkDeviceSize bytes = kWords * sizeof(Uvec4);
-    Buffer a, b, flag;
-    if (!a.create(d, bytes) || !b.create(d, bytes) || !flag.create(d, sizeof(uint32_t))) {
+    // Two flag slots, bound the way production binds them. It slices one buffer at
+    // `target_index * compare_flag_stride()`, so the dword beside a flag is ANOTHER TARGET'S FLAG --
+    // an over-wide write through the flag chain corrupts a neighbour there, where in a dedicated
+    // 4-byte buffer it would land harmlessly in allocation padding.
+    const VkDeviceSize flag_stride =
+        d.properties.limits.minStorageBufferOffsetAlignment > sizeof(uint32_t)
+            ? d.properties.limits.minStorageBufferOffsetAlignment : sizeof(uint32_t);
+    Buffer a, b, flags;
+    if (!a.create(d, bytes) || !b.create(d, bytes) || !flags.create(d, 2 * flag_stride)) {
         std::printf("FAIL: buffer allocation\n");
         return 1;
     }
     auto* av = static_cast<Uvec4*>(a.mapped);
     auto* bv = static_cast<Uvec4*>(b.mapped);
-    auto* fv = static_cast<uint32_t*>(flag.mapped);
+    auto* neighbour = reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(flags.mapped));
+    auto* fv = reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(flags.mapped) + flag_stride);
     const auto fill = [&](Uvec4* dst, uint32_t seed) {
         for (uint32_t i = 0; i < kWords; ++i)
             dst[i] = {seed + i, seed + i * 3u, seed + i * 5u, seed + i * 7u};
     };
+    // Every case binds the flag at slot 1, leaving slot 0 as a live neighbour to check.
+    const auto compare = [&](uint32_t count) {
+        return run_compare(d, p, a, b, flags, count, flag_stride);
+    };
+    constexpr uint32_t kCanary = 0xA5A5A5A5u;
 
-    // ---- equal: the flag must stay clear and the baseline must not move -------------------------
-    fill(av, 11); fill(bv, 11); *fv = 0;
-    std::vector<Uvec4> before(bv, bv + kWords);
-    check(run_compare(d, p, a, b, flag, kWords), "equal: dispatch completed");
+    // ---- equal: the flag stays clear ------------------------------------------------------------
+    fill(av, 11); fill(bv, 11); *fv = 0; *neighbour = kCanary;
+    check(compare(kWords), "equal: dispatch completed");
     check(*fv == 0, "equal: flag stays clear");
-    check(std::memcmp(bv, before.data(), bytes) == 0, "equal: baseline untouched");
+    check(*neighbour == kCanary, "equal: the adjacent flag slot is untouched");
 
-    // ---- one differing component, in each lane, must raise the flag ------------------------------
+    // ---- one differing component, in each lane --------------------------------------------------
     // A comparison that tested only .x would pass three of these four.
     for (uint32_t lane = 0; lane < 4; ++lane) {
-        fill(av, 11); fill(bv, 11); *fv = 0;
+        fill(av, 11); fill(bv, 11); *fv = 0; *neighbour = kCanary;
         uint32_t* component = &reinterpret_cast<uint32_t*>(&av[500])[lane];
         *component += 1;
-        check(run_compare(d, p, a, b, flag, kWords), "single-component: dispatch completed");
-        check(*fv == 1, "single-component difference in lane " + std::to_string(lane) + " raises the flag");
-        check(bv[500] == av[500], "single-component: that word's baseline is updated");
-        check(bv[499] == av[499] && bv[501] == av[501], "single-component: neighbours still equal");
+        check(compare(kWords), "single-component: dispatch completed");
+        check(*fv == 1, "a difference in lane " + std::to_string(lane) + " alone raises the flag");
+        check(std::memcmp(&bv[500], &av[500], sizeof(Uvec4)) == 0,
+              "single-component: that word's baseline adopts the new value");
+        check(*neighbour == kCanary, "single-component: the adjacent flag slot is untouched");
     }
 
-    // ---- only the differing word is written ------------------------------------------------------
-    fill(av, 11); fill(bv, 22); *fv = 0;             // every word differs
-    check(run_compare(d, p, a, b, flag, kWords), "all-different: dispatch completed");
+    // ---- every word differs ---------------------------------------------------------------------
+    fill(av, 11); fill(bv, 22); *fv = 0; *neighbour = kCanary;
+    check(compare(kWords), "all-different: dispatch completed");
     check(*fv == 1, "all-different: flag raised");
-    check(std::memcmp(bv, av, bytes) == 0, "all-different: whole baseline adopts the new result");
+    check(std::memcmp(bv, av, bytes) == 0, "all-different: the whole baseline adopts the new result");
+    check(*neighbour == kCanary, "all-different: the adjacent flag slot is untouched");
 
-    // ---- out of range: words at or beyond `count` are untouched even when they differ -------------
-    // The bounds property the shader's own #1711 comment calls load-bearing. 300 is deliberately not
-    // a multiple of 256, so the final workgroup launches 256 invocations of which only 44 are in
-    // range -- the case a missing bounds check gets wrong in production and never in a tidy fixture.
+    // ---- out of range: words at or beyond `count` are untouched even when they differ ------------
+    // 300 is deliberately not a multiple of 256, so the final workgroup launches 256 invocations of
+    // which 44 are in range -- the case a missing or off-by-one bounds check gets wrong in production
+    // and never in a tidy fixture. 300 * 16 = 4800 bytes is a multiple of 16, so the group-count
+    // contract admits it.
     constexpr uint32_t kInRange = 300;
     fill(av, 11); fill(bv, 22); *fv = 0;
     std::vector<Uvec4> tail(bv + kInRange, bv + kWords);
-    check(run_compare(d, p, a, b, flag, kInRange), "partial workgroup: dispatch completed");
-    check(*fv == 1, "partial workgroup: in-range difference raises the flag");
+    check(compare(kInRange), "partial workgroup: dispatch completed");
+    check(*fv == 1, "partial workgroup: an in-range difference raises the flag");
     check(std::memcmp(bv, av, kInRange * sizeof(Uvec4)) == 0,
           "partial workgroup: every in-range word is updated");
     check(std::memcmp(bv + kInRange, tail.data(), tail.size() * sizeof(Uvec4)) == 0,
           "partial workgroup: words at and beyond count are UNTOUCHED");
 
-    // ---- a difference only beyond count must NOT raise the flag ----------------------------------
+    // ---- a difference only beyond count must not raise the flag ---------------------------------
     fill(av, 11); fill(bv, 11); *fv = 0;
     av[kInRange].x += 1;                              // the first word past the end
-    check(run_compare(d, p, a, b, flag, kInRange), "beyond-count: dispatch completed");
+    check(compare(kInRange), "beyond-count: dispatch completed");
     check(*fv == 0, "a difference beyond count does not raise the flag");
 
-    // ---- count 0: nothing runs, nothing changes ---------------------------------------------------
-    fill(av, 11); fill(bv, 22); *fv = 0;
-    before.assign(bv, bv + kWords);
-    check(run_compare(d, p, a, b, flag, 0), "zero count: dispatch completed");
-    check(*fv == 0 && std::memcmp(bv, before.data(), bytes) == 0,
-          "zero count: flag clear and baseline untouched");
-
     // ---- how much more a changed result costs than an unchanged one ------------------------------
-    // Reported, never asserted, and reported as a MINIMUM over repetitions rather than a single pair.
+    // Reported, never asserted, as a MINIMUM over repetitions. The question is whether the
+    // all-different case is dominated by contention on the changed-flag dword: every differing
+    // invocation issues a Device-scope OpAtomicExchange against the same uint, while an all-equal
+    // target issues none. Extra baseline traffic alone predicts about 1.5x.
     //
-    // The question this answers is whether the all-different case is dominated by contention on the
-    // changed-flag dword: every differing invocation issues a Device-scope OpAtomicExchange against
-    // the SAME uint, so an all-different target could serialize one atomic per uvec4 on one cache
-    // line, while an all-equal target issues none. Extra baseline traffic alone predicts about 1.5x.
-    //
-    // It was measured, and it does not settle that question. Guarding the exchange with a plain load
-    // (skip when the flag already reads 1 -- sound, since the flag is only ever set and the stored
-    // value is the constant 1) produced all-different times of 1.449/1.741/1.807 ms against
-    // 2.012/1.784/2.280 ms unguarded: the spread WITHIN each arm is as large as the difference
-    // between them. The guard was not adopted. Do not re-derive that from a single pair -- this
-    // harness times a submit-plus-fence on the CPU, so it carries queue scheduling noise and needs
-    // GPU timestamps to answer the question properly.
-    //
-    // The number is printed because whoever fuses this comparison into the retile shader will want a
-    // before/after, and a min-of-N from a fixed fixture is a better baseline than a game route.
+    // It was measured and it does NOT settle that. Guarding the exchange with a plain load (sound --
+    // the flag is only ever set, and the stored value is the constant 1) gave all-different times of
+    // 1.449/1.741/1.807 ms against 2.012/1.784/2.280 ms unguarded: the spread WITHIN each arm is as
+    // large as the difference between them. The guard was not adopted. This harness times a
+    // submit-plus-fence on the CPU, so it carries queue scheduling noise and needs GPU timestamps to
+    // answer the question properly. The figure is printed because whoever fuses this comparison into
+    // the retile shader will want a before/after, and a fixed fixture beats a game route.
     {
         Buffer big_a, big_b;
         constexpr uint32_t kBig = 1u << 19;           // 8 MiB of uvec4
         const VkDeviceSize big_bytes = VkDeviceSize(kBig) * sizeof(Uvec4);
-        if (big_a.create(d, big_bytes) && big_b.create(d, big_bytes)) {
+        check(big_a.create(d, big_bytes) && big_b.create(d, big_bytes),
+              "timing fixture: 8 MiB buffers allocated");
+        if (big_a.mapped && big_b.mapped) {
             auto* ba = static_cast<Uvec4*>(big_a.mapped);
             auto* bb = static_cast<Uvec4*>(big_b.mapped);
             for (uint32_t i = 0; i < kBig; ++i) ba[i] = {i, i, i, i};
             std::memcpy(bb, ba, big_bytes);
             constexpr int kReps = 5;
             double equal_ms = 1e9, different_ms = 1e9, sample = 0;
-            run_compare(d, p, big_a, big_b, flag, kBig, &sample);            // warm
+            run_compare(d, p, big_a, big_b, flags, kBig, flag_stride, &sample);   // warm
             bool equal_clean = true;
             for (int i = 0; i < kReps; ++i) {
                 *fv = 0;
-                run_compare(d, p, big_a, big_b, flag, kBig, &sample);
+                run_compare(d, p, big_a, big_b, flags, kBig, flag_stride, &sample);
                 equal_clean = equal_clean && *fv == 0;
                 if (sample < equal_ms) equal_ms = sample;
             }
             bool different_raised = true;
             for (int i = 0; i < kReps; ++i) {
-                // Diverge at the TOP of every repetition, and only here. The baseline is equal to `a`
-                // on entry -- either from the equal loop above, or because the previous repetition's
-                // comparison adopted `a` into it -- so one XOR per iteration is what makes each run
-                // measure the changed path. Diverging once before the loop as well would cancel this
-                // one on the first iteration and silently measure the EQUAL path instead, which is
-                // what the first version of this did; the flag assertion below caught it.
+                // Diverge at the TOP of every repetition, and only here. The baseline equals `a` on
+                // entry -- from the equal loop, or because the previous repetition's comparison
+                // adopted `a` into it -- so one XOR per iteration is what makes each run measure the
+                // changed path. Diverging before the loop as well would cancel this one on the first
+                // iteration and silently measure the EQUAL path, which is what the first version did;
+                // the per-repetition flag assertion below is what caught it.
                 for (uint32_t j = 0; j < kBig; ++j) bb[j].w ^= 0xffffffffu;
                 *fv = 0;
-                run_compare(d, p, big_a, big_b, flag, kBig, &sample);
+                run_compare(d, p, big_a, big_b, flags, kBig, flag_stride, &sample);
                 different_raised = different_raised && *fv == 1;
                 if (sample < different_ms) different_ms = sample;
             }
@@ -373,11 +447,13 @@ int main() {
                         kReps, equal_ms, different_ms, equal_ms > 0 ? different_ms / equal_ms : 0.0);
             check(equal_clean, "8 MiB all-equal comparison leaves the flag clear, every repetition");
             check(different_raised, "8 MiB all-different comparison raises the flag, every repetition");
-            big_a.destroy(d); big_b.destroy(d);
         }
+        big_a.destroy(d); big_b.destroy(d);
     }
 
-    a.destroy(d); b.destroy(d); flag.destroy(d);
+    a.destroy(d); b.destroy(d); flags.destroy(d);
+    p.destroy(d);
+    d.destroy();
     if (failures) { std::printf("compute_result_compare: %d FAILED\n", failures); return 1; }
     std::printf("compute_result_compare: OK\n");
     return 0;
