@@ -36,6 +36,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <chrono>
 #include <set>
 #include <cstdint>
 #include <cstdio>
@@ -79,7 +80,7 @@ static void set_env(const char* name, const char* value) {
 #endif
 }
 
-int main() {
+int main(int argc, char** argv) {
     printf("== test_cfg_trip_bound ==\n");
     set_env("PROSPER_CFG_TRIP_BOUND", nullptr);
     set_env("PROSPER_CFG_TRIP_BOUND_PROGRAM", nullptr);
@@ -88,6 +89,40 @@ int main() {
 
     constexpr uint32_t kLanes = 128;
     const size_t kWords = sizeof(kExecWalk) / sizeof(kExecWalk[0]);
+
+    // Optional CPU-only repeated-hit benchmark. No Vulkan work, game timing or
+    // frame-rate claim: this prices the real cache entry point and returned words.
+    if (argc == 2 && std::string(argv[1]) == "--benchmark-cache-witness") {
+        ComputeShaderConfig config{};
+        config.local_x = 64; config.wave_size = 64; config.tgid_x_en = true;
+        ShaderResourceTable table{};
+        bool witness = true;
+        auto compile = [&] {
+            return recompile_compute_shader_cached(kExecWalk, kWords, &table, config, nullptr,
+                {RecompileDiagnosticStage::Compute, 0x900000001ull}, &witness);
+        };
+        clear_shader_recompile_cache();
+        const auto warm = compile();
+        if (warm.empty() || witness) return 1;
+        constexpr uint64_t calls = 10000;
+        const auto before = shader_recompile_cache_stats();
+        const auto start = std::chrono::steady_clock::now();
+        uint64_t returned_words = 0, witnessed = 0;
+        for (uint64_t i = 0; i < calls; ++i) {
+            auto module = compile();
+            returned_words += module.size();
+            witnessed += witness;
+        }
+        const double ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - start).count();
+        const auto after = shader_recompile_cache_stats();
+        std::printf("calls=%llu hits=%llu analyses=%llu returned_words=%llu witnessed=%llu ms=%.6f\n",
+            (unsigned long long)calls, (unsigned long long)(after.hits - before.hits),
+            (unsigned long long)(after.compute_witness_analyses - before.compute_witness_analyses),
+            (unsigned long long)returned_words, (unsigned long long)witnessed, ms);
+        return after.hits - before.hits == calls && !witnessed &&
+            returned_words == calls * warm.size() ? 0 : 1;
+    }
 
     // Lane i walks a chain of length i. Expected depth is therefore i, and the value is DISTINCT per
     // lane on purpose: a single shared expectation would be satisfied by a lowering that ignores the
@@ -687,9 +722,21 @@ int main() {
         // cache -- while the implementation and the PR both claimed hits were covered. The trip-bound
         // identity is part of ShaderCompileKey, so changing the phase must MISS and recompile; the
         // repeats around it must HIT and keep their answer.
-        auto compile_at = [&](const uint32_t* code, size_t words, uint64_t address) {
-            return recompile_compute_shader_cached(code, words, &table, config, nullptr,
-                                                   {RecompileDiagnosticStage::Compute, address});
+        auto compile_at = [&](const uint32_t* code, size_t words, uint64_t address,
+                              bool expected_witness, bool expect_hit = false) {
+            bool witness = !expected_witness;
+            const auto before = shader_recompile_cache_stats();
+            auto module = recompile_compute_shader_cached(code, words, &table, config, nullptr,
+                {RecompileDiagnosticStage::Compute, address}, &witness);
+            const auto after = shader_recompile_cache_stats();
+            CHECK(witness == expected_witness,
+                  "returned metadata describes this module, overwriting the opposite sentinel");
+            CHECK(after.hits - before.hits == uint64_t(expect_hit),
+                  "metadata arm reaches the intended cold or warm cache path");
+            CHECK(after.compute_witness_analyses - before.compute_witness_analyses ==
+                      uint64_t(!expect_hit),
+                  "warm module metadata avoids repeating the witness parser");
+            return module;
         };
 
         set_env("PROSPER_CFG_TRIP_BOUND", std::to_string(kBound).c_str());
@@ -698,30 +745,68 @@ int main() {
 
         set_env("PROSPER_CFG_TRIP_BOUND_PHASE", "0");
         const std::vector<uint32_t> emitted =
-            compile_at(kDispatcherLoops, kDispatcherWords, kAddress);
+            compile_at(kDispatcherLoops, kDispatcherWords, kAddress, true);
         CHECK(spirv_writes_trip_witness(emitted),
               "the bounded dispatcher module writes the witness (cold)");
-        CHECK(spirv_writes_trip_witness(compile_at(kDispatcherLoops, kDispatcherWords, kAddress)),
+        CHECK(spirv_writes_trip_witness(compile_at(kDispatcherLoops, kDispatcherWords, kAddress, true, true)),
               "and an emitting CACHE HIT still writes it");
 
         // SAME address, cache left warm, phase the program does not have.
         set_env("PROSPER_CFG_TRIP_BOUND_PHASE", "99");
         const std::vector<uint32_t> not_emitted =
-            compile_at(kDispatcherLoops, kDispatcherWords, kAddress);
+            compile_at(kDispatcherLoops, kDispatcherWords, kAddress, false);
         CHECK(!spirv_writes_trip_witness(not_emitted),
               "the SAME address under a phase it does not have writes no witness, warm "
               "(a process-history emission record fails HERE)");
-        CHECK(!spirv_writes_trip_witness(compile_at(kDispatcherLoops, kDispatcherWords, kAddress)),
+        CHECK(!spirv_writes_trip_witness(compile_at(kDispatcherLoops, kDispatcherWords, kAddress, false, true)),
               "and the non-emitting CACHE HIT still writes none");
 
         set_env("PROSPER_CFG_TRIP_BOUND_PHASE", "0");
-        CHECK(!spirv_writes_trip_witness(compile_at(kExecWalk, kWords, kAddress)),
+        CHECK(compile_at(kDispatcherLoops, kDispatcherWords, kAddress, true, true) == emitted,
+              "returning to the original phase recovers its original module and metadata");
+        CHECK(!spirv_writes_trip_witness(compile_at(kExecWalk, kWords, kAddress, false)),
               "a structured-loop program writes no witness even with every selector satisfied");
+
+        set_env("PROSPER_NO_SHADER_CACHE", "1");
+        CHECK(compile_at(kDispatcherLoops, kDispatcherWords, kAddress, true) == emitted,
+              "cache bypass derives metadata from the newly returned module");
+        set_env("PROSPER_NO_SHADER_CACHE", nullptr);
+        clear_shader_recompile_cache();
+        set_env("PROSPER_SHADER_CACHE_MB", "0");
+        CHECK(compile_at(kDispatcherLoops, kDispatcherWords, kAddress, true) == emitted &&
+                  shader_recompile_cache_stats().entries == 0,
+              "cache admission refusal still returns correct module metadata");
+        set_env("PROSPER_SHADER_CACHE_MB", nullptr);
+
+        // A caller not requesting metadata must still populate it for later hits.
+        recompile_compute_shader_cached(kDispatcherLoops, kDispatcherWords, &table, config,
+            nullptr, {RecompileDiagnosticStage::Compute, kAddress});
+        CHECK(compile_at(kDispatcherLoops, kDispatcherWords, kAddress, true, true) == emitted,
+              "a prior caller without an output parameter cannot leave cached metadata missing");
+
+        ShaderResource invalid{};
+        invalid.cls = ResourceClass::ConstantBuffer;
+        invalid.format = DataFormat::Unknown;
+        invalid.num_components = 0;
+        invalid.stride = kProvenNullGuardedRawStoreStride;
+        invalid.srt_offset = invalid.sgpr_base = 0xFFFFFFFFu;
+        invalid.fetch_pc = 74;
+        ShaderResourceTable invalid_table{};
+        invalid_table.resources.push_back(invalid);
+        bool refused_witness = true;
+        const auto before_refusal = shader_recompile_cache_stats();
+        const auto refused = recompile_compute_shader_cached(kDispatcherLoops, kDispatcherWords,
+            &invalid_table, config, nullptr, {RecompileDiagnosticStage::Compute, kAddress},
+            &refused_witness);
+        CHECK(is_proven_null_guarded_raw_store(invalid) && refused.empty() && !refused_witness &&
+                  shader_recompile_cache_stats().compute_witness_analyses ==
+                      before_refusal.compute_witness_analyses,
+              "early dispatch-proof refusal clears stale metadata before cache lookup or analysis");
 
         set_env("PROSPER_CFG_TRIP_BOUND_PHASE", nullptr);
         set_env("PROSPER_CFG_TRIP_BOUND", nullptr);
         clear_shader_recompile_cache();
-        CHECK(!spirv_writes_trip_witness(compile_at(kDispatcherLoops, kDispatcherWords, kAddress)),
+        CHECK(!spirv_writes_trip_witness(compile_at(kDispatcherLoops, kDispatcherWords, kAddress, false)),
               "and disarmed, the same program writes none either");
 
         // IDENTITY, not coincidence. The predicate must recognise the witness RESOURCE -- the

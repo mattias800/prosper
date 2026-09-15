@@ -540,6 +540,7 @@ struct ShaderRecompileCacheStats {
     uint64_t evictions = 0;
     uint64_t entries = 0;
     uint64_t bytes = 0;
+    uint64_t compute_witness_analyses = 0;
     double compile_ms = 0.0;
 };
 std::vector<uint32_t> recompile_graphics_shader_cached(ShaderProgramStage stage,
@@ -563,10 +564,13 @@ SharedShaderWords recompile_graphics_shader_cached_shared(
 // Compute uses the same bounded content-addressed cache as graphics. Launch geometry that changes
 // generated SPIR-V participates in the key; ordinary per-dispatch push-constant values do not.
 // Conditional marker lowerings validate their value-dependent dispatch proof before cache lookup.
+// Optional witness metadata describes only the returned exact module. A caller replacing or
+// transforming those words must derive fresh metadata. Refusal resets the output to false.
 std::vector<uint32_t> recompile_compute_shader_cached(
     const uint32_t* code, size_t dwords, const ShaderResourceTable* resources,
     const ComputeShaderConfig& config, uint64_t* cache_identity = nullptr,
-    RecompileDiagnosticContext diagnostic = {RecompileDiagnosticStage::Compute, 0});
+    RecompileDiagnosticContext diagnostic = {RecompileDiagnosticStage::Compute, 0},
+    bool* writes_trip_witness = nullptr);
 // Report the final live consequence once per guest program address. Returns true only for the first
 // report so the caller can keep its adjacent resource-table dump on the same distinct-address gate.
 bool report_compute_recompile_skip_once(RecompileDiagnosticContext diagnostic);

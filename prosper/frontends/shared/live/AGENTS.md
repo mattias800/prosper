@@ -66,6 +66,14 @@ retain ordinary traversal. `PROSPER_NO_RTT_WRITE_BATCH` selects that control at 
 policy. Logical live-entry visits and physical prepared-record visits are separate; counters are
 not timings, and overflow's wholesale invalidation is excluded from traversal totals.
 
+`pass_buffer_lookup_memory.hpp` supplies strictly per-pass CPU allocation storage for the backend's
+buffer-reference memo and content-dedup index. Keys, equality, slot memoization and Vulkan upload
+owners are unchanged. Four KiB is initial storage, not a cap; larger passes use the ordinary heap,
+and replaced hash buckets remain until arena destruction. Every map dies before its arena, and
+the arena never enters submission cleanup callbacks. `PROSPER_NO_BUFFER_LOOKUP_ARENA` selects
+direct PMR heap allocation; unsupported PMR deployment targets retain ordinary standard maps.
+Allocation observations count upstream heap requests/bytes, not nodes or GPU buffer traffic.
+
 ## The boundary that is easy to get wrong
 
 The compute backend is where *guest memory* and *device memory* meet twice per dispatch — an upload

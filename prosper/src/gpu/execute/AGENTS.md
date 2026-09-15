@@ -2,6 +2,13 @@
 
 Where a decoded draw or dispatch becomes real GPU work.
 
+The existing immutable compiled-shader entry also owns its compute trip-witness analysis result.
+Return that fact only with the exact selected module; replacement or transformation needs fresh
+analysis. Dispatch-specific guest-GDS exclusion remains outside the cache. Cold compilation,
+bypass and admission refusal still derive the result from emitted words, and early refusal clears
+the output. `PROSPER_NO_COMPUTE_WITNESS_CACHE` restores analysis on requested warm results for
+comparisons; `compute_witness_analyses` counts actual cache-entry-point parser invocations.
+
 - `gpu_executor` — the executor: builds each stage's resource table, runs the scalar const-fold that
   recovers descriptors the shader header does not declare, and issues the work. Large; navigate it by
   symbol rather than by reading it.

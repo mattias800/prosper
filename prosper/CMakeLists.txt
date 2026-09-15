@@ -562,6 +562,9 @@ if(Python3_Interpreter_FOUND)
   add_test(NAME stack_profile_logic
            COMMAND "${Python3_EXECUTABLE}"
                    "${CMAKE_SOURCE_DIR}/tools/perf/test_stack_profile.py")
+  add_test(NAME perf_caller_report
+           COMMAND "${Python3_EXECUTABLE}"
+                   "${CMAKE_SOURCE_DIR}/tools/perf/test_perf_caller_report.py")
   if(GIT_EXECUTABLE)
     # The provenance GATE: refuses to quote a measurement from a build that is not the revision the
     # author thinks it is. Pure argument/exit-status contract, no build required — but it resolves
@@ -3793,6 +3796,17 @@ if(TARGET prosper_core AND TARGET Vulkan::Vulkan)
   add_executable(test_render_buffer_residency tests/gpu/state/test_render_buffer_residency.cpp)
   target_include_directories(test_render_buffer_residency PRIVATE tests frontends)
   target_link_libraries(test_render_buffer_residency PRIVATE prosper_core Vulkan::Vulkan)
+  foreach(lookup_control IN ITEMS on off)
+    set(lookup_environment --unset=PROSPER_NO_BACKEND_RESOURCE_SHARE
+      --unset=PROSPER_NO_BACKEND_BUFFER_POOL --unset=PROSPER_BUFVERIFY
+      --unset=PROSPER_NO_BUFFER_LOOKUP_ARENA PROSPER_BACKEND_BUFFER_RESIDENCY_MB=0)
+    if(lookup_control STREQUAL "off")
+      list(APPEND lookup_environment PROSPER_NO_BUFFER_LOOKUP_ARENA=1)
+    endif()
+    add_test(NAME render_buffer_lookup_${lookup_control} COMMAND ${CMAKE_COMMAND} -E env
+      ${lookup_environment} $<TARGET_FILE:test_render_buffer_residency>
+      --lookup-arena ${lookup_control})
+  endforeach()
   foreach(range_control IN ITEMS on off arena_off verify)
     set(range_environment PROSPER_BACKEND_BUFFER_RESIDENCY_MB=0
       --unset=PROSPER_NO_BACKEND_RESOURCE_SHARE --unset=PROSPER_NO_BACKEND_BUFFER_POOL
