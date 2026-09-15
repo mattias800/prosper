@@ -914,6 +914,15 @@ duplicate. Until then the app is fully functional via `--test-pattern` (and any 
 
 ## Ruled out
 
+- **“Fusing result comparison into retile requires scattered reads of a padded baseline.”**
+  The live comparator binds `staging[i]` over `exact_result_bytes`, and baseline retention adopts
+  that same **linear** staging allocation. The retile emitter's valid-pixel block already computes
+  `linear`; its separate padded tiled store uses `address`. A fusion preserving today's baseline
+  representation compares at `linear`, excluding padding just as the current comparison does.
+  Comparing at `address` would change the representation and can exceed the baseline range.
+  The remaining performance questions include scalar versus vector work, flag contention and
+  register pressure; a scattered-baseline fixture would measure the wrong proposed path (#3691, #3695).
+
 - **"The headless path is safer by design."** The issue observed that `tools/screenshot` had never
   taken the desktop down and read that as a property of the frontend. It is not: `screenshot.cpp`
   detaches its guest thread and calls `_exit` in exactly the same shape `prosper-app` does, so it can

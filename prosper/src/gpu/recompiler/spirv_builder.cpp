@@ -477,7 +477,8 @@ std::vector<uint32_t> build_compute_detile_float16(uint32_t components, Float16D
 }
 
 std::vector<uint32_t> build_compute_retile_words(RetileShaderKind kind,
-                                               RetileImageSource source_kind, bool image_arrayed) {
+                                               RetileImageSource source_kind, bool image_arrayed,
+                                               bool compare_result) {
     const bool image_source = source_kind != RetileImageSource::LinearBuffer;
     if (image_source && kind != RetileShaderKind::Words2D) return {};
     const bool volume = kind == RetileShaderKind::Volume3D;
@@ -490,6 +491,16 @@ std::vector<uint32_t> build_compute_retile_words(RetileShaderKind kind,
     const auto push_ptr = e.id(), push_word = e.id(), push = e.id();
     const auto main = e.id(), entry = e.id(), body = e.id(), done = e.id();
     const auto read_pixel = e.id(), pixel_done = e.id();
+    uint32_t baseline = 0, flag = 0, flag_t = 0, flag_ptr = 0;
+    if (compare_result) {
+        baseline = e.id(); flag = e.id(); flag_t = e.id(); flag_ptr = e.id();
+        for (auto [variable, binding] : {std::pair{baseline, 3u}, std::pair{flag, 4u}}) {
+            Emitter::put(e.deco, Op_Decorate, {variable, Dec_DescriptorSet, 0});
+            Emitter::put(e.deco, Op_Decorate, {variable, Dec_Binding, binding});
+        }
+        Emitter::put(e.deco, Op_Decorate, {flag_t, Dec_Block});
+        Emitter::put(e.deco, Op_MemberDecorate, {flag_t, 0, Dec_Offset, 0});
+    }
     uint32_t image_t = 0, image_ptr = 0, image = 0, v2_t = 0, v4_t = 0;
     if (image_source) {
         image_t = e.id(); image_ptr = e.id(); image = e.id(); v2_t = e.id(); v4_t = e.id();
@@ -536,6 +547,12 @@ std::vector<uint32_t> build_compute_retile_words(RetileShaderKind kind,
     Emitter::put(e.types, Op_TypePointer, {word_ptr, SC_StorageBuffer, uint_t});
     Emitter::put(e.types, Op_Variable, {block_ptr, source, SC_StorageBuffer});
     Emitter::put(e.types, Op_Variable, {block_ptr, output, SC_StorageBuffer});
+    if (compare_result) {
+        Emitter::put(e.types, Op_Variable, {block_ptr, baseline, SC_StorageBuffer});
+        Emitter::put(e.types, Op_TypeStruct, {flag_t, uint_t});
+        Emitter::put(e.types, Op_TypePointer, {flag_ptr, SC_StorageBuffer, flag_t});
+        Emitter::put(e.types, Op_Variable, {flag_ptr, flag, SC_StorageBuffer});
+    }
     std::vector<std::pair<uint32_t, uint32_t>> constants;
     auto constant = [&](uint32_t value) {
         for (auto [v, id] : constants) if (v == value) return id;
@@ -685,10 +702,29 @@ std::vector<uint32_t> build_compute_retile_words(RetileShaderKind kind,
     } else {
         loaded = load(source, word_ptr, linear);
     }
+    uint32_t pixel_predecessor = read_pixel;
+    if (compare_result) {
+        const auto prior_ptr = e.id(), prior = e.id(), changed = e.id();
+        const auto adopt = e.id(), compared = e.id();
+        Emitter::put(e.code, Op_AccessChain, {word_ptr, prior_ptr, baseline, constant(0), linear});
+        Emitter::put(e.code, Op_Load, {uint_t, prior, prior_ptr});
+        Emitter::put(e.code, Op_INotEqual, {bool_t, changed, loaded, prior});
+        Emitter::put(e.code, Op_SelectionMerge, {compared, 0});
+        Emitter::put(e.code, Op_BranchConditional, {changed, adopt, compared});
+        Emitter::put(e.code, Op_Label, {adopt});
+        Emitter::put(e.code, Op_Store, {prior_ptr, loaded});
+        const auto changed_ptr = e.id(), old_flag = e.id();
+        Emitter::put(e.code, Op_AccessChain, {word_ptr, changed_ptr, flag, constant(0)});
+        Emitter::put(e.code, Op_AtomicExchange,
+            {uint_t, old_flag, changed_ptr, constant(1), constant(0), constant(1)});
+        Emitter::put(e.code, Op_Branch, {compared});
+        Emitter::put(e.code, Op_Label, {compared});
+        pixel_predecessor = compared;
+    }
     Emitter::put(e.code, Op_Branch, {pixel_done});
     Emitter::put(e.code, Op_Label, {pixel_done});
     const auto value = e.id(), destination = e.id();
-    Emitter::put(e.code, Op_Phi, {uint_t, value, loaded, read_pixel, constant(0), body});
+    Emitter::put(e.code, Op_Phi, {uint_t, value, loaded, pixel_predecessor, constant(0), body});
     Emitter::put(e.code, Op_AccessChain, {word_ptr, destination, output, constant(0), address});
     Emitter::put(e.code, Op_Store, {destination, value});
     Emitter::put(e.code, Op_Branch, {done});

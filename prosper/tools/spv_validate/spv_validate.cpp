@@ -783,6 +783,8 @@ int main(int argc, char** argv) {
          "build_compute_scale_bias");
     dump(dir, "builder_compare_uvec4", build_compute_compare_uvec4(),
          "build_compute_compare_uvec4");
+    dump(dir, "builder_retile_compare", build_compute_retile_words(RetileShaderKind::Words2D,
+         RetileImageSource::LinearBuffer, false, true), "build_compute_retile_words");
     dump(dir, "builder_detile_rgba16f", build_compute_detile_float16(),
          "build_compute_detile_float16");
     dump(dir, "builder_detile_rg16f", build_compute_detile_float16(2),
@@ -802,6 +804,9 @@ int main(int argc, char** argv) {
             const std::string name = std::string("builder_retile_image_") +
                 (source == RetileImageSource::R32Uint ? "r32" : "rgba8") + (arrayed ? "_array" : "_2d");
             dump(dir, name.c_str(), build_compute_retile_words(RetileShaderKind::Words2D, source, arrayed),
+                 "build_compute_retile_words");
+            dump(dir, (name + "_compare").c_str(),
+                 build_compute_retile_words(RetileShaderKind::Words2D, source, arrayed, true),
                  "build_compute_retile_words");
         }
     dump(dir, "builder_rgba8_to_packed10", build_compute_rgba8_to_packed10(),
