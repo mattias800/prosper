@@ -25,6 +25,29 @@ inline uint32_t update_write_watch_stability(uint32_t stable_exact_validations,
     return stable_exact_validations + 1;
 }
 
+struct RendererWriteWatchAdmission {
+    bool eligible = false;
+    bool ready = false;
+    uint32_t stability_limit = 0;
+};
+
+// Extend the renderer's ordinary size policy only for repeatedly unchanged small sources.
+// A cold small source never arms. Keep the existing immediate/deferred larger-source policy,
+// and require at least three exact matches even when the ordinary promotion override is zero.
+// The caller still supplies the global disable, registration budget and mutation boundary.
+inline RendererWriteWatchAdmission renderer_write_watch_admission(
+    size_t source_bytes, uint32_t stable_exact_validations, size_t ordinary_min_bytes,
+    size_t defer_min_bytes, uint32_t promotion_validations, bool stable_small_sources) {
+    if (source_bytes >= ordinary_min_bytes)
+        return {true, should_promote_write_watch(source_bytes, stable_exact_validations,
+                                                defer_min_bytes, promotion_validations),
+                promotion_validations};
+    const bool small = stable_small_sources && source_bytes >= (64u << 10) &&
+                       source_bytes < (1u << 20);
+    const uint32_t required = small ? std::max(3u, promotion_validations) : promotion_validations;
+    return {small, small && stable_exact_validations >= required, required};
+}
+
 class WriteWatchPromotionBudget {
 public:
     void reset(size_t byte_limit) {

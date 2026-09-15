@@ -5,6 +5,10 @@
 #include "gpu/present/videoout_present.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "hle/dispatch/dispatch.hpp"
+#include "host/memory/guest_write_watch.hpp"
+#ifdef __linux__
+#include "host/image/exec_image.hpp"
+#endif
 #include "shared/live/live_renderer.hpp"
 #include "shared/perf/performance_capture.hpp"
 
@@ -82,7 +86,7 @@ bool solid(const std::vector<uint8_t>& rgba, bool green) {
     return true;
 }
 
-void sample_packed_texture(DrawItem& draw, uint64_t address) {
+void sample_packed_texture(DrawItem& draw, uint64_t address, uint32_t extent = 2) {
     const uint32_t fragment[]{
         0x7e0002ffu, 0x3e800000u, 0x7e0202ffu, 0x3e800000u, 0xf0800f08u, 0x00820000u,
         0xf800000fu, 0x03020100u, 0xbf810000u};
@@ -93,9 +97,9 @@ void sample_packed_texture(DrawItem& draw, uint64_t address) {
     texture.binding = 4;
     texture.sgpr_base = 8;
     texture.img_dim = 1;
-    texture.width = texture.height = 2;
+    texture.width = texture.height = extent;
     texture.depth = 1;
-    texture.size = 16;
+    texture.size = extent * extent * 4u;
     texture.gpu_addr = address;
     draw.prt = std::make_shared<ShaderResourceTable>();
     draw.prt->resources.push_back(texture);
@@ -220,6 +224,80 @@ int range_capture() {
     return failures ? 1 : 0;
 }
 
+#ifdef __linux__
+int small_texture_watch(bool unsupported, bool control) {
+    using prosper::host::guest_write_watch_stats;
+    constexpr size_t SourceBytes = 64u << 10;
+    // Install the actual fault handler before HLE mapping registers the source's physical identity.
+    check(unsetenv("PROSPER_FAULT_NO_ONSTACK") == 0,
+          "production write-watch signal path uses the alternate stack");
+    prosper::install_trap_handler();
+    prosper::host::guest_write_watch_set_fault_onstack(!unsupported);
+    uint64_t address = 0;
+    auto map = prosper::Hle::lookup(prosper::nid_hash("sceKernelMapNamedFlexibleMemory"));
+    auto unmap = prosper::Hle::lookup(prosper::nid_hash("sceKernelMunmap"));
+    check(map && unmap &&
+          map(reinterpret_cast<uint64_t>(&address), SourceBytes, 0x2, 0,
+              reinterpret_cast<uint64_t>("stable-small-texture"), 0) == 0 && address,
+          "real mapped 64KiB source provides watchable guest backing");
+    if (!address) return 1;
+    auto* words = reinterpret_cast<uint32_t*>(address);
+    std::fill_n(words, SourceBytes / 4, 0xc00ffc00u);
+    std::vector<uint32_t> positions_source(Words, 0);
+    positions(positions_source, true);
+    std::vector<uint8_t> target(Width * Height * 4u);
+    auto draw = make_draw(positions_source, target);
+    sample_packed_texture(draw, address, 128);
+    const auto baseline = guest_write_watch_stats();
+    auto green = [&] {
+        check(solid(render_submit_items({draw}, Width, Height), true),
+              "unchanged mapped texture renders green");
+    };
+    green(); // Cold decode has no stability history.
+    for (unsigned i = 0; i < 3; ++i) {
+        check(guest_write_watch_stats().create_attempts == baseline.create_attempts,
+              "cold source and insufficient stability do not attempt registration");
+        green();
+    }
+    check(guest_write_watch_stats().create_attempts == baseline.create_attempts,
+          "three exact matches authorize only the next acquisition's attempt");
+    green(); // Arm before this acquisition's exact comparison.
+    const auto promoted = guest_write_watch_stats();
+    if (control) {
+        check(promoted.create_attempts == baseline.create_attempts,
+              "small-watch control preserves comparison-only admission");
+    } else if (unsupported) {
+        check(promoted.create_attempts > baseline.create_attempts &&
+              promoted.registrations == baseline.registrations &&
+              promoted.create_no_mapping > baseline.create_no_mapping,
+              "unsupported fault handling refuses registration after a real attempt");
+    } else {
+        check(promoted.registrations == baseline.registrations + 1,
+              "repeated exact matches promote precisely one source watch");
+    }
+    green();
+    const auto reused = guest_write_watch_stats();
+    check((reused.unchanged > promoted.unchanged) == (!unsupported && !control),
+          "only a successfully registered watch supplies unchanged authority");
+    // No manual write notification: the actual CPU store must take the production watch fault.
+    std::fill_n(words, SourceBytes / 4, 0xc00003ffu);
+    if (!unsupported && !control)
+        check(guest_write_watch_stats().faults > reused.faults,
+              "raw CPU mutation reaches the production fault handler");
+    check(solid_red(render_submit_items({draw}, Width, Height)),
+          "mutation invalidates the promoted texture and renders new red pixels");
+    check(solid_red(render_submit_items({draw}, Width, Height)),
+          "refreshed texture remains red on subsequent reuse");
+    if (!unsupported && !control)
+        check(guest_write_watch_stats().dirty > reused.dirty,
+              "renderer observes the dirty source before reusing decoded pixels");
+    check(unmap(address, SourceBytes, 0, 0, 0, 0) == 0, "source unmaps through the HLE");
+    set_submit_renderer({});
+    present_reset();
+    return failures ? 1 : 0;
+}
+#endif
+
 int main(int argc, char** argv) {
     using namespace prosper::gpu;
     namespace fs = std::filesystem;
@@ -258,6 +336,14 @@ int main(int argc, char** argv) {
     if (failures) return 1;
 
     prosper::frontend::register_live_renderer("", false);
+#ifdef __linux__
+    if (argc == 2 && std::strcmp(argv[1], "--small-watch") == 0)
+        return small_texture_watch(false, false);
+    if (argc == 2 && std::strcmp(argv[1], "--small-watch-unsupported") == 0)
+        return small_texture_watch(true, false);
+    if (argc == 2 && std::strcmp(argv[1], "--small-watch-control") == 0)
+        return small_texture_watch(false, true);
+#endif
     if (argc == 2 && std::strcmp(argv[1], "--range-sharing") == 0) return range_capture();
     std::vector<uint32_t> source(Words, 0);
     std::vector<uint8_t> target(Width * Height * 4u, 0);

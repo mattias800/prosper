@@ -297,3 +297,5 @@ All count acquisition observations, not distinct entries. Reported validated byt
 helper's platform-dependent extent semantics, not physical read traffic. Refusals have no measured
 comparison work; their zero timer does not mean a zero-cost acquisition. Timers exclude the census
 update and remain nested in existing texture preparation.
+The thread identifier is the POSIX `pthread_self()` token or Windows thread ID; do not join POSIX
+values directly to a native profiler's operating-system TIDs.
