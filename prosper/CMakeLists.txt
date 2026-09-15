@@ -3244,7 +3244,16 @@ endif()
 
       # The exactness proof behind the differential buffer upload (#3696). Pure CPU -- it drives no
       # device -- but it links prosper_live_renderer for the comparison helper, so it registers here
-      # with the other cases that need that library rather than in the platform-independent block.
+      # with the other cases that need that library.
+      #
+      # KNOWN GAP, recorded rather than hidden: this block is inside both `if(UNIX)` and
+      # `if(Vulkan_FOUND)`, so a correctness-critical helper goes UNTESTED on the Windows build even
+      # though nothing in it is platform-specific. The comparison runs eight std::thread workers and
+      # combines their results through atomics, which is exactly the kind of code where a second
+      # toolchain earns its keep. Closing it properly means lifting the comparison (and the
+      # parallel_compute_texels helper it uses) out of live_compute.cpp into
+      # frontends/shared/compute/, where a pure byte utility belongs anyway -- deliberately left as
+      # follow-up so this PR stays a behaviour change plus its test rather than also a relocation.
       add_executable(test_compute_buffer_diff_span
                      tests/shared/live/test_compute_buffer_diff_span.cpp)
       target_include_directories(test_compute_buffer_diff_span PRIVATE frontends)

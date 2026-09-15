@@ -87,9 +87,14 @@ def check_selected(rows, witness):
            compared_bytes=BYTES, baseline="created",
            gpu_compare="ineligible", writeback="changed",
            result_compared_bytes=BYTES, guest_copied_bytes=BYTES)
-    # A fresh Vulkan allocation's initial contents are unspecified. The cold path always
-    # compares its full extent, but an already-equal allocation legitimately needs no copy.
-    require(number(cold, "uploaded-bytes") in (0, BYTES), "invalid cold upload byte count")
+    # A fresh Vulkan allocation's initial contents are unspecified. The cold path always compares
+    # its full extent, but what it UPLOADS is now only the bytes that differ (#3697), so any count
+    # from 0 to the full extent is legal -- 0 when the allocation already matched, BYTES when it
+    # differed end to end, and anything between when it differed over part of the range. This
+    # assertion previously admitted only 0 or BYTES and passed solely because the fixture fills
+    # guest memory uniformly against a zero-filled fresh allocation; a fixture that differed over a
+    # sub-range would have read as "invalid" rather than as the saving it is.
+    require(0 <= number(cold, "uploaded-bytes") <= BYTES, "invalid cold upload byte count")
     journal = grouped[2][0]
     expect(journal, cache="hit", validation="journal", upload_skipped=1,
            compared_bytes=0, uploaded_bytes=0, gpu_compare="unchanged",
@@ -159,7 +164,9 @@ def check_promotion(rows, witness):
             expect(row, validation="pooled-full", compared_bytes=BYTES)
             if not cpu_result:
                 expect(row, baseline="created")
-            require(number(row, "uploaded-bytes") in (0, BYTES), "invalid cold upload bytes")
+            # Same widening as the cold row above: the pooled-full path uploads only the differing
+            # extent since #3697, so any count in [0, BYTES] is legal.
+            require(0 <= number(row, "uploaded-bytes") <= BYTES, "invalid cold upload bytes")
         elif dispatch == 8 and watched:
             expect(row, validation="dirty-chunks", dirty_watch_chunks=1, total_watch_chunks=2,
                    compared_bytes=1 << 20, uploaded_bytes=1 << 20)

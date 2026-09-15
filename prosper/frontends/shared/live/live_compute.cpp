@@ -683,13 +683,21 @@ bool compute_buffers_equal(const void* lhs, const void* rhs, size_t bytes) {
     return equal.load(std::memory_order_relaxed);
 }
 
-// Exact comparison that also reports WHERE the buffers differ, for diagnostics only. Returns true
-// when equal; writes the inclusive first/last differing byte offsets otherwise.
+// Exact comparison that also reports WHERE the buffers differ. Returns true when equal; writes the
+// inclusive first/last differing byte offsets otherwise.
 //
-// This exists to answer one question the timing alone cannot: `compute_buffers_equal` above scans
-// every byte by construction (eight workers, each memcmp-ing its whole slice), so a full-length
-// compare time says nothing about whether one byte changed or all of them. Choosing between a
-// differential copy and a wider cache redesign depends entirely on that distinction.
+// **The extent is load-bearing, not diagnostic.** The upload copies ONLY [first,last], so every byte
+// outside it is written on the strength of this function having proved it already equal. A span one
+// byte too NARROW leaves a stale byte in a GPU buffer, which no shader-output assertion necessarily
+// catches and which surfaces as a wrong pixel much later. An earlier revision of this comment said
+// "for diagnostics only" -- it was written when the span merely reported, and it survived into the
+// revision that made the copy depend on it, where it would have licensed a future reader to make the
+// narrowing approximate. Keep it exact; `tests/shared/live/test_compute_buffer_diff_span.cpp` pins
+// the property that the narrowed copy reproduces a full one.
+//
+// It is also the only thing that can answer where a difference lies: `compute_buffers_equal` above
+// scans every byte by construction (eight workers, each memcmp-ing its whole slice), so a
+// full-length compare time says nothing about whether one byte changed or all of them.
 bool compute_buffers_diff_span(const void* lhs, const void* rhs, size_t bytes,
                                size_t* first, size_t* last) {
     const auto* a = static_cast<const uint8_t*>(lhs);
