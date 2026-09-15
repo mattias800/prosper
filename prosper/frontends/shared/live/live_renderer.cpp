@@ -11618,11 +11618,21 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     // #3681: the scan cost of the three hot entry points, printed as visited/useful
                     // pairs. Elapsed `watch_ms` alone cannot say whether a call walked a million
                     // entries or waited on the mutex; these separate the two.
+                    // `query_pages` is counted only on the paths that actually walk the page list --
+                    // the audit and the legacy control. On the shipped path query() answers from the
+                    // flag and walks nothing, so printing a bare 0 here would state a measured "no
+                    // pages visited" where the truth is "not counted"; those need opposite reactions.
+                    char query_pages[64];
+                    if (write_watch.query_pages_visited)
+                        snprintf(query_pages, sizeof(query_pages), "%llu",
+                                 (unsigned long long)write_watch.query_pages_visited);
+                    else
+                        snprintf(query_pages, sizeof(query_pages), "0(not-walked)");
                     fprintf(stderr,
-                            "[render-timing] write_watch_scan query_pages=%llu/%llu queries "
+                            "[render-timing] write_watch_scan query_pages=%s/%llu queries "
                             "host_write_pages=%llu scanned/%llu hit "
                             "gpu_write=%llu notifies/%llu visited/%llu overlaps\n",
-                            (unsigned long long)write_watch.query_pages_visited,
+                            query_pages,
                             (unsigned long long)write_watch.queries,
                             (unsigned long long)write_watch.host_write_pages_scanned,
                             (unsigned long long)write_watch.host_write_pages_hit,
