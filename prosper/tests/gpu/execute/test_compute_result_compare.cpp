@@ -45,10 +45,13 @@
 #include "gpu/execute/host_read_barrier.hpp"
 #include "shared/device/vulkan_device_select.hpp"
 #include "shared/live/live_compute.hpp"
+#include "shared/live/gpu_retile.hpp"
 
 #include <vulkan/vulkan.h>
 
 #include <chrono>
+#include <algorithm>
+#include <cstdlib>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -79,30 +82,47 @@ struct Device {
     VkCommandPool pool = VK_NULL_HANDLE;
     VkPhysicalDeviceProperties properties{};
     VkPhysicalDeviceMemoryProperties memory{};
+    VkQueryPool timestamps = VK_NULL_HANDLE;
+    uint32_t timestamp_bits = 0;
+    int failure_exit = 1;
     const char* failure = nullptr;   // which step failed, so a skip names its own cause
 
-    bool init() {
+    bool init(bool benchmark) {
         VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
         app.apiVersion = VK_API_VERSION_1_4;
         VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
         ici.pApplicationInfo = &app;
-        if (vkCreateInstance(&ici, nullptr, &instance) != VK_SUCCESS) {
+        const auto instance_result = vkCreateInstance(&ici, nullptr, &instance);
+        if (instance_result != VK_SUCCESS) {
+            failure_exit = instance_result == VK_ERROR_INCOMPATIBLE_DRIVER ? 77 : 1;
             failure = "vkCreateInstance failed"; return false;
         }
         uint32_t count = 0;
-        vkEnumeratePhysicalDevices(instance, &count, nullptr);
-        if (!count) { failure = "no Vulkan physical devices"; return false; }
+        if (vkEnumeratePhysicalDevices(instance, &count, nullptr) != VK_SUCCESS) {
+            failure = "physical-device enumeration failed"; return false;
+        }
+        if (!count) { failure_exit = 77; failure = "no Vulkan physical devices"; return false; }
         std::vector<VkPhysicalDevice> devices(count);
-        vkEnumeratePhysicalDevices(instance, &count, devices.data());
+        if (vkEnumeratePhysicalDevices(instance, &count, devices.data()) != VK_SUCCESS) {
+            failure = "physical-device enumeration changed or failed"; return false;
+        }
+        devices.resize(count);
         const auto selection =
             prosper::frontend::select_vulkan_device(devices, VK_QUEUE_COMPUTE_BIT);
         if (!selection.device || selection.queue_family == UINT32_MAX) {
+            failure_exit = 77;
             failure = "no device with the runtime version, a compute queue and robustBufferAccess";
             return false;
         }
         physical = selection.device;
         family = selection.queue_family;
         properties = selection.properties;
+
+        uint32_t families = 0;
+        vkGetPhysicalDeviceQueueFamilyProperties(physical, &families, nullptr);
+        std::vector<VkQueueFamilyProperties> queues(families);
+        vkGetPhysicalDeviceQueueFamilyProperties(physical, &families, queues.data());
+        timestamp_bits = queues.at(family).timestampValidBits;
         vkGetPhysicalDeviceMemoryProperties(physical, &memory);
         float priority = 1.0f;
         VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
@@ -117,6 +137,14 @@ struct Device {
             failure = "vkCreateDevice failed"; return false;
         }
         vkGetDeviceQueue(device, family, 0, &queue);
+        if (benchmark && timestamp_bits && properties.limits.timestampPeriod > 0) {
+            VkQueryPoolCreateInfo info{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+            info.queryType = VK_QUERY_TYPE_TIMESTAMP;
+            info.queryCount = 2;
+            if (vkCreateQueryPool(device, &info, nullptr, &timestamps) != VK_SUCCESS) {
+                failure = "timestamp query pool creation failed"; return false;
+            }
+        }
         VkCommandPoolCreateInfo cpi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
         cpi.queueFamilyIndex = family;
         cpi.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
@@ -126,6 +154,7 @@ struct Device {
         return true;
     }
     void destroy() {
+        if (timestamps) vkDestroyQueryPool(device, timestamps, nullptr);
         if (pool) vkDestroyCommandPool(device, pool, nullptr);
         if (device) vkDestroyDevice(device, nullptr);
         if (instance) vkDestroyInstance(instance, nullptr);
@@ -134,6 +163,10 @@ struct Device {
     uint32_t host_memory_type(uint32_t bits) const {
         const VkMemoryPropertyFlags want =
             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        // Match the live allocator: prefer cached coherent host memory, then coherent.
+        const auto cached = want | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+        for (uint32_t i = 0; i < memory.memoryTypeCount; ++i)
+            if ((bits & (1u << i)) && (memory.memoryTypes[i].propertyFlags & cached) == cached) return i;
         for (uint32_t i = 0; i < memory.memoryTypeCount; ++i)
             if ((bits & (1u << i)) && (memory.memoryTypes[i].propertyFlags & want) == want) return i;
         return UINT32_MAX;
@@ -150,7 +183,7 @@ struct Buffer {
         bytes = size;
         VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         bci.size = size;
-        bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+        bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
         if (vkCreateBuffer(d.device, &bci, nullptr, &buffer) != VK_SUCCESS) return false;
         VkMemoryRequirements requirements{};
         vkGetBufferMemoryRequirements(d.device, buffer, &requirements);
@@ -227,13 +260,20 @@ struct ComparePipeline {
     }
 };
 
+struct RetileStep {
+    prosper::frontend::GpuRetilePipeline* pipeline;
+    prosper::frontend::GpuRetileParameters parameters;
+    VkBuffer output;
+    VkDescriptorSet set;
+};
+
 // One comparison. `count` is in uvec4 units and goes in the push constant exactly as production sets
 // it; the buffers may be longer than count, which is how the out-of-range cases are built.
 // `flag_offset` binds the changed flag at a nonzero offset the way production does -- it slices ONE
 // shared buffer at `target_index * compare_flag_stride()`, so the dword beside a flag is another
 // target's flag rather than allocation padding.
 bool run_compare(Device& d, ComparePipeline& p, Buffer& a, Buffer& b, Buffer& flag,
-                 uint32_t count, VkDeviceSize flag_offset = 0, double* elapsed_ms = nullptr) {
+                 uint32_t count, VkDeviceSize flag_offset = 0, double* elapsed_ms = nullptr, double* gpu_ms = nullptr, const RetileStep* retile = nullptr) {
     VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
     dai.descriptorPool = p.descriptor_pool; dai.descriptorSetCount = 1; dai.pSetLayouts = &p.set_layout;
     VkDescriptorSet set = VK_NULL_HANDLE;
@@ -263,9 +303,6 @@ bool run_compare(Device& d, ComparePipeline& p, Buffer& a, Buffer& b, Buffer& fl
     VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     if (vkBeginCommandBuffer(cmd, &begin) != VK_SUCCESS) return give_up();
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.layout, 0, 1, &set, 0, nullptr);
-    vkCmdPushConstants(cmd, p.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(count), &count);
     // Production's own group count rather than a local replica, so a sizing mistake here would be the
     // backend's too. (The previous version hardcoded `(count + 255) / 256` under a comment claiming
     // exactly this coupling, which it did not have.)
@@ -273,16 +310,53 @@ bool run_compare(Device& d, ComparePipeline& p, Buffer& a, Buffer& b, Buffer& fl
         VkDeviceSize(count) * sizeof(Uvec4), d.properties.limits.maxStorageBufferRange,
         d.properties.limits.maxComputeWorkGroupCount[0]);
     if (!groups) { vkEndCommandBuffer(cmd); return give_up(); }
-    vkCmdDispatch(cmd, groups, 1, 1);
+    if (gpu_ms) {
+        if (!d.timestamps) { vkEndCommandBuffer(cmd); return give_up(); }
+        vkCmdResetQueryPool(cmd, d.timestamps, 0, 2);
+        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, d.timestamps, 0);
+    }
+    if (retile)
+        retile->pipeline->record(cmd, a.buffer, retile->output, retile->set, retile->parameters,
+                                VK_NULL_HANDLE, b.buffer, flag.buffer, flag_offset);
+    if (!retile || !retile->pipeline->compare_result) {
+        if (retile) {
+            // Match the production separate-pass dependency, including retile's compute stage.
+            VkBufferMemoryBarrier barriers[3]{};
+            for (auto& barrier : barriers) {
+                barrier = {VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+                barrier.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT |
+                                        VK_ACCESS_SHADER_WRITE_BIT;
+                barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+                barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            }
+            barriers[0].buffer = a.buffer; barriers[0].size = a.bytes;
+            barriers[1].buffer = b.buffer; barriers[1].size = b.bytes;
+            barriers[2].buffer = flag.buffer; barriers[2].offset = flag_offset;
+            barriers[2].size = sizeof(uint32_t);
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT |
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                0, 0, nullptr, 3, barriers, 0, nullptr);
+        }
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.layout, 0, 1, &set, 0, nullptr);
+        vkCmdPushConstants(cmd, p.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(count), &count);
+        vkCmdDispatch(cmd, groups, 1, 1);
+    }
+    if (gpu_ms && !retile)
+        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, d.timestamps, 1);
     // The availability operation into the host domain. A fence orders EXECUTION; it does not move a
     // shader write into the host domain, and HOST_COHERENT does not exempt it. Production records
     // exactly this on the flag and on every baseline before reading them back. Without it this test
     // stays green on these drivers, which is why it is here deliberately rather than by luck --
     // frontends/shared/live/AGENTS.md and #2944.
-    prosper::gpu::record_host_read_barrier(cmd, b.buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                                           VK_ACCESS_SHADER_WRITE_BIT);
-    prosper::gpu::record_host_read_barrier(cmd, flag.buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                                           VK_ACCESS_SHADER_WRITE_BIT);
+    if (!retile || !retile->pipeline->compare_result) {
+        prosper::gpu::record_host_read_barrier(cmd, b.buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                               VK_ACCESS_SHADER_WRITE_BIT);
+        prosper::gpu::record_host_read_barrier(cmd, flag.buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                               VK_ACCESS_SHADER_WRITE_BIT);
+    }
+    if (gpu_ms && retile)
+        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, d.timestamps, 1);
     if (vkEndCommandBuffer(cmd) != VK_SUCCESS) return give_up();
 
     VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
@@ -291,20 +365,121 @@ bool run_compare(Device& d, ComparePipeline& p, Buffer& a, Buffer& b, Buffer& fl
     VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     submit.commandBufferCount = 1; submit.pCommandBuffers = &cmd;
     const auto started = std::chrono::steady_clock::now();
-    const bool ok = vkQueueSubmit(d.queue, 1, &submit, fence) == VK_SUCCESS &&
+    bool ok = vkQueueSubmit(d.queue, 1, &submit, fence) == VK_SUCCESS &&
                     vkWaitForFences(d.device, 1, &fence, VK_TRUE, 30ull * 1000 * 1000 * 1000) == VK_SUCCESS;
+    if (!ok) {
+        // Completion is unproved. Do not destroy possibly pending commands or their resources.
+        std::fprintf(stderr, "FAIL: comparison submission/completion failed\n");
+        std::fflush(nullptr);
+        std::_Exit(1);
+    }
     if (elapsed_ms)
         *elapsed_ms = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - started).count();
+    if (ok && gpu_ms) {
+        uint64_t ticks[2]{};
+        ok = vkGetQueryPoolResults(d.device, d.timestamps, 0, 2, sizeof(ticks), ticks,
+                                  sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS;
+        if (ok) {
+            const uint64_t mask = d.timestamp_bits == 64 ? UINT64_MAX :
+                                  (uint64_t{1} << d.timestamp_bits) - 1;
+            *gpu_ms = double((ticks[1] - ticks[0]) & mask) *
+                      d.properties.limits.timestampPeriod / 1e6;
+        }
+    }
     vkDestroyFence(d.device, fence, nullptr);
     vkFreeCommandBuffers(d.device, d.pool, 1, &cmd);
     // The descriptor set is deliberately NOT freed; see the pool's creation flags.
     return ok;
 }
 
+// Same command-buffer boundary for separate and fused work. Inputs/baselines use the
+// production host-visible allocation preference; this does not simulate a preceding guest shader.
+void compare_retile(Device& d, bool measured) {
+    using namespace prosper::frontend;
+    GpuRetilePipeline pipelines[2];
+    ComparePipeline comparator;
+    bool ready = comparator.create(d, 256) &&
+        pipelines[0].initialize(d.device, VK_NULL_HANDLE) == VK_SUCCESS &&
+        pipelines[1].initialize(d.device, VK_NULL_HANDLE, prosper::gpu::RetileShaderKind::Words2D,
+            prosper::gpu::RetileImageSource::LinearBuffer, false, d.physical, true) == VK_SUCCESS;
+    check(ready, "retile benchmark pipelines created");
+    const auto flag_stride = std::max(VkDeviceSize(4), d.properties.limits.minStorageBufferOffsetAlignment);
+    for (const auto [width, height] : {std::pair{260u, 129u}, std::pair{2048u, 1024u},
+                                    std::pair{4096u, 2048u}}) {
+        if (!ready) break;
+        if (!measured && width > 260) continue;
+        GpuRetileParameters params;
+        ready = params.initialize(width, height, 4, 27, d.properties.limits);
+        check(ready, "retile benchmark shape admitted");
+        if (!ready) break;
+        Buffer input, baseline, output, flag;
+        VkDescriptorPool pools[2]{};
+        VkDescriptorSet sets[2]{};
+        ready = input.create(d, params.linear_bytes) && baseline.create(d, params.linear_bytes) &&
+                output.create(d, params.tiled_bytes) && flag.create(d, flag_stride * 5);
+        check(ready, "retile benchmark buffers allocated");
+        if (ready) {
+            const uint32_t words = uint32_t(params.linear_bytes / 4);
+            auto* in = static_cast<uint32_t*>(input.mapped);
+            auto* prior = static_cast<uint32_t*>(baseline.mapped);
+            auto* flags = static_cast<uint8_t*>(flag.mapped);
+            for (uint32_t i = 0; i < words; ++i) in[i] = i * 2654435761u;
+            std::vector<uint8_t> expected(params.tiled_bytes, 0);
+            prosper::gpu::tile_surface(expected.data(), reinterpret_cast<uint8_t*>(in),
+                                      width, height, 27, 0, 4);
+            for (unsigned arm = 0; arm < 2; ++arm)
+                ready = ready && pipelines[arm].bind(input.buffer, output.buffer, params, pools[arm],
+                    sets[arm], VK_NULL_HANDLE, baseline.buffer, flag.buffer, flag_stride) == VK_SUCCESS;
+            check(ready, "retile benchmark bindings created");
+            for (unsigned pattern = 0; pattern < 3 && ready; ++pattern) {
+                for (int rep = measured ? -2 : 0; rep < (measured ? 12 : 1) && ready; ++rep) {
+                    for (unsigned order = 0; order < 2; ++order) {
+                        const unsigned arm = order ^ unsigned((rep + 2) & 1);
+                        std::memcpy(prior, in, params.linear_bytes);
+                        if (pattern) {
+                            for (uint32_t i = pattern == 1 ? words - 1 : 0; i < words; ++i)
+                                prior[i] ^= 0x80000000u;
+                        }
+                        // Poison padding on every dispatch, including the fully equal comparison.
+                        std::memset(output.mapped, 0xa5, params.tiled_bytes);
+                        std::memset(flags, 0xa5, flag.bytes);
+                        *reinterpret_cast<uint32_t*>(flags + flag_stride) = 0;
+                        RetileStep step{&pipelines[arm], params, output.buffer, sets[arm]};
+                        double cpu_ms = 0, gpu_ms = 0;
+                        ready = run_compare(d, comparator, input, baseline, flag, words / 4,
+                                            flag_stride, measured ? &cpu_ms : nullptr, measured ? &gpu_ms : nullptr, &step) &&
+                            *reinterpret_cast<uint32_t*>(flags + flag_stride) == unsigned(pattern != 0) &&
+                            std::memcmp(prior, in, params.linear_bytes) == 0 &&
+                            std::memcmp(output.mapped, expected.data(), params.tiled_bytes) == 0;
+                        for (uint32_t slot = 0; slot < 5; ++slot)
+                            if (slot != 1) ready = ready &&
+                                *reinterpret_cast<uint32_t*>(flags + flag_stride * slot) == 0xa5a5a5a5u;
+                        if (!ready) { check(false, "retile benchmark completion/bytes/padding/flag"); break; }
+                        if (measured && rep >= 0)
+                            std::printf("[retile-benchmark] width=%u height=%u pattern=%u rep=%d "
+                                        "order=%u fused=%u gpu_ms=%.6f cpu_ms=%.6f\n",
+                                        width, height, pattern, rep, order, arm, gpu_ms, cpu_ms);
+                    }
+                }
+            }
+        }
+        for (auto pool : pools) if (pool) vkDestroyDescriptorPool(d.device, pool, nullptr);
+        input.destroy(d); baseline.destroy(d); output.destroy(d); flag.destroy(d);
+    }
+    comparator.destroy(d);
+    for (auto& pipeline : pipelines) pipeline.destroy();
+}
+
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    bool benchmark = false, retile = false;
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--retile-benchmark") == 0) benchmark = retile = true;
+        else if (std::strcmp(argv[i], "--retile") == 0) retile = true;
+        else { std::fprintf(stderr, "unknown option: %s\n", argv[i]); return 1; }
+    }
     // The pure eligibility contract -- which byte counts and device limits admit a comparison at
     // all -- is NOT restated here. `tests/gpu/recompiler/test_game_compute.cpp` already covers it,
     // and covers it better, because it separates each refusal clause instead of merely reaching
@@ -319,21 +494,20 @@ int main() {
     // this file demonstrates about that function instead is the coupling a pure test cannot: every
     // dispatch below is sized by calling it, so a sizing mistake here would be the backend's too.
     Device d;
-    if (!d.init()) {
-        // Name the cause. Several of the failures reachable here are environment or driver DEFECTS,
-        // and reporting them as a benign absence is how a green run comes to mean nothing. Nothing
-        // above asserts, so a skip is a clean exit rather than a suppressed failure.
-        std::printf("[skip] %s\n", d.failure ? d.failure : "device initialization failed");
+    if (!d.init(benchmark)) {
+        std::printf("[%s] %s\n", d.failure_exit == 77 ? "skip" : "FAIL",
+                    d.failure ? d.failure : "device initialization failed");
         d.destroy();
-        return 0;
+        return d.failure_exit;
     }
     std::printf("[info] device: %s (type %u)\n", d.properties.deviceName,
                 (unsigned)d.properties.deviceType);
 
-    // A hand-counted ceiling on the 19 dispatches below, not a derived one; the pool is sized from
-    // it, and exceeding it fails loudly (VK_ERROR_OUT_OF_POOL_MEMORY -> run_compare false -> a red
-    // "dispatch completed") rather than silently.
-    constexpr uint32_t kRuns = 32;
+    if (benchmark && !d.timestamps) {
+        std::printf("[skip] queue timestamps unavailable\n"); d.destroy(); return 77;
+    }
+    // Deliberate upper bound; descriptor exhaustion fails a dispatch assertion.
+    constexpr uint32_t kRuns = 128;
     ComparePipeline p;
     if (!p.create(d, kRuns)) { std::printf("FAIL: could not build the compare pipeline\n"); return 1; }
 
@@ -445,62 +619,30 @@ int main() {
     check(*fv == 0, "a difference beyond count does not raise the flag");
     check(canaries_intact(), "beyond-count: the neighbouring flag slots are untouched");
 
-    // ---- how much more a changed result costs than an unchanged one ------------------------------
-    // Reported, never asserted, as a MINIMUM over repetitions. The question is whether the
-    // all-different case is dominated by contention on the changed-flag dword: every differing
-    // invocation issues a Device-scope OpAtomicExchange against the same uint, while an all-equal
-    // target issues none. Extra baseline traffic alone predicts about 1.5x.
-    //
-    // It was measured and it does NOT settle that. Guarding the exchange with a plain load (sound --
-    // the flag is only ever set, and the stored value is the constant 1) gave all-different times of
-    // 1.449/1.741/1.807 ms against 2.012/1.784/2.280 ms unguarded: the spread WITHIN each arm is as
-    // large as the difference between them. The guard was not adopted. This harness times a
-    // submit-plus-fence on the CPU, so it carries queue scheduling noise and needs GPU timestamps to
-    // answer the question properly. The figure is printed because whoever fuses this comparison into
-    // the retile shader will want a before/after, and a fixed fixture beats a game route.
-    {
-        Buffer big_a, big_b;
-        constexpr uint32_t kBig = 1u << 19;           // 8 MiB of uvec4
-        const VkDeviceSize big_bytes = VkDeviceSize(kBig) * sizeof(Uvec4);
-        check(big_a.create(d, big_bytes) && big_b.create(d, big_bytes),
-              "timing fixture: 8 MiB buffers allocated");
-        if (big_a.mapped && big_b.mapped) {
-            auto* ba = static_cast<Uvec4*>(big_a.mapped);
-            auto* bb = static_cast<Uvec4*>(big_b.mapped);
-            for (uint32_t i = 0; i < kBig; ++i) ba[i] = {i, i, i, i};
-            std::memcpy(bb, ba, big_bytes);
-            constexpr int kReps = 5;
-            double equal_ms = 1e9, different_ms = 1e9, sample = 0;
-            run_compare(d, p, big_a, big_b, flags, kBig, kFlagSlot * flag_stride, &sample);   // warm
-            bool equal_clean = true;
-            for (int i = 0; i < kReps; ++i) {
-                *fv = 0;
-                run_compare(d, p, big_a, big_b, flags, kBig, kFlagSlot * flag_stride, &sample);
-                equal_clean = equal_clean && *fv == 0;
-                if (sample < equal_ms) equal_ms = sample;
-            }
-            bool different_raised = true;
-            for (int i = 0; i < kReps; ++i) {
-                // Diverge at the TOP of every repetition, and only here. The baseline equals `a` on
-                // entry -- from the equal loop, or because the previous repetition's comparison
-                // adopted `a` into it -- so one XOR per iteration is what makes each run measure the
-                // changed path. Diverging before the loop as well would cancel this one on the first
-                // iteration and silently measure the EQUAL path, which is what the first version did;
-                // the per-repetition flag assertion below is what caught it.
-                for (uint32_t j = 0; j < kBig; ++j) bb[j].w ^= 0xffffffffu;
-                *fv = 0;
-                run_compare(d, p, big_a, big_b, flags, kBig, kFlagSlot * flag_stride, &sample);
-                different_raised = different_raised && *fv == 1;
-                if (sample < different_ms) different_ms = sample;
-            }
-            std::printf("[info] 8 MiB compare, min of %d: all-equal %.3f ms, all-different %.3f ms "
-                        "(ratio %.2f) -- CPU-timed, carries scheduling noise\n",
-                        kReps, equal_ms, different_ms, equal_ms > 0 ? different_ms / equal_ms : 0.0);
-            check(equal_clean, "8 MiB all-equal comparison leaves the flag clear, every repetition");
-            check(different_raised, "8 MiB all-different comparison raises the flag, every repetition");
-        }
-        big_a.destroy(d); big_b.destroy(d);
+    // A single changed invocation must publish even when it is not a subgroup leader.
+    // Boundaries cover typical wave sizes without assuming any of them on this device.
+    for (const uint32_t index : {1u, 31u, 32u, 63u, 64u, 255u, 256u, 299u}) {
+        fill(av, 11); fill(bv, 11); *fv = 0; arm_canaries();
+        av[index].z ^= 0x80000000u;
+        check(compare(kInRange), "singleton: dispatch completed");
+        check(*fv == 1, "singleton " + std::to_string(index) + ": flag raised");
+        check(std::memcmp(bv, av, bytes) == 0, "singleton: complete baseline adopted");
+        *fv = 0;
+        check(compare(kInRange) && *fv == 0, "singleton: repeat after adoption is equal");
+        check(canaries_intact(), "singleton: flag neighbours untouched");
     }
+    fill(av, 11); fill(bv, 11); *fv = 0; arm_canaries();
+    av[0].w ^= 1;
+    check(compare(1) && *fv == 1 && std::memcmp(bv, av, bytes) == 0,
+          "count one: sole valid invocation adopts and publishes");
+    check(canaries_intact(), "count one: flag neighbours untouched");
+    fill(av, 11); fill(bv, 11); *fv = 0; arm_canaries();
+    for (uint32_t i = 1; i < kInRange; i += 2) av[i].y ^= 1;
+    check(compare(kInRange) && *fv == 1 && std::memcmp(bv, av, bytes) == 0,
+          "alternating differences: all changed invocations adopt their baseline");
+    check(canaries_intact(), "alternating: flag neighbours untouched");
+
+    if (retile) compare_retile(d, benchmark);
 
     a.destroy(d); b.destroy(d); flags.destroy(d);
     p.destroy(d);

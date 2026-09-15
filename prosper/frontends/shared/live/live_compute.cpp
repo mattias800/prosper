@@ -1716,6 +1716,8 @@ struct VulkanComputeContext {
     VkPipeline compare_pipeline = VK_NULL_HANDLE;
     PackedRttConversion packed_rtt_conversion;
     GpuRetilePipeline retile_pipeline, volume_retile_pipeline, packed_retile_pipeline;
+    GpuRetilePipeline compare_retile_pipeline;
+    std::array<GpuRetilePipeline, 4> compare_image_retile_pipelines;
     std::array<GpuRetilePipeline, 4> image_retile_pipelines; // R32/RGBA8, ordinary/one-layer array
     // Storage-image support (#590): the recompiler's storage path declares the
     // StorageImageRead/WriteWithoutFormat capabilities (raw uvec4 texel model — see
@@ -1861,6 +1863,8 @@ struct VulkanComputeContext {
         volume_retile_pipeline.destroy();
         packed_retile_pipeline.destroy();
         for (auto& pipeline : image_retile_pipelines) pipeline.destroy();
+        compare_retile_pipeline.destroy();
+        for (auto& pipeline : compare_image_retile_pipelines) pipeline.destroy();
         if (compare_pipeline) vkDestroyPipeline(device, compare_pipeline, nullptr);
         if (compare_pipeline_layout)
             vkDestroyPipelineLayout(device, compare_pipeline_layout, nullptr);
@@ -3904,6 +3908,8 @@ struct BoundImage {
     VkDeviceMemory retile_memory = VK_NULL_HANDLE;
     VkDescriptorPool retile_pool = VK_NULL_HANDLE;
     VkDescriptorSet retile_set = VK_NULL_HANDLE;
+    bool retile_binding_pending = false;
+    GpuRetilePipeline* fused_retile = nullptr;
     GpuRetileParameters retile_parameters{};
     bool direct_retile = false;
     uint32_t image_retile_index = 0;
@@ -10075,6 +10081,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         static const bool packed_extension_disabled =
             std::getenv("PROSPER_NO_GPU_RETILE_PACKED_EXTENSION") != nullptr;
         static const bool direct_retile_enabled = std::getenv("PROSPER_NO_DIRECT_IMAGE_RETILE") == nullptr;
+        static const bool fused_retile_enabled = std::getenv("PROSPER_NO_FUSED_RETILE_COMPARE") == nullptr;
         const bool retile_census = gpu_retile_census_enabled();
         // `continue` keeps its meaning; this only names the branch on the way out.
         const auto decline = [&](GpuRetileDecline reason, const prosper::gpu::ShaderResource* r,
@@ -10204,6 +10211,16 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         !vk_soft_handle_ok(bi.retile_memory, "retile-memory-handle") ||
                         !vk_soft_ok(vkBindBufferMemory(ctx.device, bi.retile_buffer,
                             bi.retile_memory, 0), "retile-bind")) return false;
+                    // Delay only a potential fused binding until the shared comparison flags exist.
+                    // This avoids allocating an ordinary retile descriptor pool just to replace it.
+                    bi.retile_binding_pending = fused_retile_enabled &&
+                        bi.retile_parameters.kind == RetileShaderKind::Words2D &&
+                        !bi.prior_output_conflict && bi.cache_candidate && bi.persistent &&
+                        bi.upload_skipped && bi.result_baseline &&
+                        bi.exact_result_bytes == bi.retile_parameters.linear_bytes &&
+                        bi.exact_result_bytes <= max_gpu_compare_image_bytes() &&
+                        ctx.result_compare_group_count(bi.exact_result_bytes);
+                    if (bi.retile_binding_pending) return true;
                     return vk_soft_ok(retile.bind(staging[i], bi.retile_buffer,
                         bi.retile_parameters, bi.retile_pool, bi.retile_set,
                         bi.direct_retile ? bi.view : VK_NULL_HANDLE), "retile-descriptors");
@@ -10217,7 +10234,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     bi.retile_buffer = VK_NULL_HANDLE; bi.retile_memory = VK_NULL_HANDLE;
                     bi.direct_retile = false;
                     if (ctx.device_lost) { images_ready = false; break; }
-                } else {
+                } else if (!bi.retile_binding_pending) {
                     decline(GpuRetileDecline::Admitted, r, bpe);
                 }
             }
@@ -10640,6 +10657,56 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             }
             compare_targets.clear();
         }
+
+        for (size_t i = 0; i < images.size(); ++i) {
+            auto& bi = images[i];
+            if (!bi.retile_binding_pending) continue;
+            bi.retile_binding_pending = false;
+            auto& fallback = bi.direct_retile ? ctx.image_retile_pipelines[bi.image_retile_index]
+                                              : ctx.retile_pipeline;
+            auto& fused = bi.direct_retile ? ctx.compare_image_retile_pipelines[bi.image_retile_index]
+                                           : ctx.compare_retile_pipeline;
+            bool bound = false;
+            if (bi.compare_flag_index != SIZE_MAX) {
+                VkResult prepared;
+                {
+                    std::lock_guard<std::timed_mutex> cache_lock(ctx.pipeline_cache_mutex);
+                    prepared = fused.initialize(ctx.device, ctx.pipeline_cache,
+                        bi.retile_parameters.kind, fallback.image_source, bi.arrayed_2d, ctx.physical, true);
+                }
+                if (vk_soft_ok(prepared, "retile-compare-pipeline")) {
+                    bound = vk_soft_ok(fused.bind(staging[i], bi.retile_buffer, bi.retile_parameters,
+                        bi.retile_pool, bi.retile_set, bi.direct_retile ? bi.view : VK_NULL_HANDLE,
+                        bi.result_baseline, compare_flags, bi.compare_flag_index * ctx.compare_flag_stride()),
+                        "retile-compare-descriptor");
+                    if (bound) bi.fused_retile = &fused;
+                    else {
+                        if (bi.retile_pool) vkDestroyDescriptorPool(ctx.device, bi.retile_pool, nullptr);
+                        bi.retile_pool = VK_NULL_HANDLE; bi.retile_set = VK_NULL_HANDLE;
+                    }
+                }
+            }
+            if (!bound && !ctx.device_lost)
+                bound = vk_soft_ok(fallback.bind(staging[i], bi.retile_buffer, bi.retile_parameters,
+                    bi.retile_pool, bi.retile_set, bi.direct_retile ? bi.view : VK_NULL_HANDLE),
+                    "retile-fallback-descriptor");
+            decline(bound ? GpuRetileDecline::Admitted : GpuRetileDecline::PrepareFailed,
+                    bi.resource, 4u << bi.retile_parameters.words[2]);
+            if (!bound) {
+                if (bi.retile_pool) vkDestroyDescriptorPool(ctx.device, bi.retile_pool, nullptr);
+                if (bi.retile_buffer) vkDestroyBuffer(ctx.device, bi.retile_buffer, nullptr);
+                if (bi.retile_memory) ctx.release_memory(bi.retile_memory);
+                bi.retile_pool = VK_NULL_HANDLE; bi.retile_set = VK_NULL_HANDLE;
+                bi.retile_buffer = VK_NULL_HANDLE; bi.retile_memory = VK_NULL_HANDLE;
+                bi.direct_retile = false;
+                // Descriptor failure restores image transfer plus CPU tiling. The comparator still
+                // consumes the same staging allocation, but its last writer is now TRANSFER.
+                for (auto& target : compare_targets)
+                    if (target.image == &bi) target.current_src_access = VK_ACCESS_TRANSFER_WRITE_BIT;
+            }
+            if (ctx.device_lost) break;
+        }
+        if (ctx.device_lost) break;
 
         if (!ctx.prepare_dispatch_commands()) {
             if (trace) std::fprintf(stderr, "[compute]   Vulkan failure stage=command-reuse\n");
@@ -11099,6 +11166,10 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                                    VK_ACCESS_SHADER_WRITE_BIT);
         }
+        // Fused comparisons write flags during retile, before the separate comparison loop.
+        if (!compare_targets.empty())
+            vkCmdFillBuffer(command, compare_flags, 0,
+                            compare_targets.size() * ctx.compare_flag_stride(), 0);
         // Storage images: copy the written texels back into the staging buffer for guest writeback.
         // When this private image was seeded from an exact borrowed renderer target, copy the final
         // result back to that same image as well. The CPU writeback below remains mandatory for
@@ -11112,8 +11183,10 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             const ShaderResource* r = bi.resource;
             if (bi.direct_retile) {
                 const uint32_t retile_start = storage_timestamp();
-                ctx.image_retile_pipelines[bi.image_retile_index].record(command,
-                    staging[i], bi.retile_buffer, bi.retile_set, bi.retile_parameters, bi.image);
+                (bi.fused_retile ? *bi.fused_retile : ctx.image_retile_pipelines[bi.image_retile_index])
+                    .record(command, staging[i], bi.retile_buffer, bi.retile_set, bi.retile_parameters,
+                            bi.image, bi.result_baseline, compare_flags,
+                            bi.compare_flag_index == SIZE_MAX ? 0 : bi.compare_flag_index * ctx.compare_flag_stride());
                 storage_timestamp();
                 if (perf_gpu_timing) storage_timestamp_spans.emplace_back(retile_start, true);
             }
@@ -11147,10 +11220,13 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 if (perf_gpu_timing) storage_timestamp_spans.emplace_back(transfer_start, false);
                 if (bi.retile_buffer) {
                     const uint32_t retile_start = storage_timestamp();
-                    (bi.retile_parameters.kind == RetileShaderKind::PackedSubwordArray ? ctx.packed_retile_pipeline :
+                    (bi.fused_retile ? *bi.fused_retile :
+                     bi.retile_parameters.kind == RetileShaderKind::PackedSubwordArray ? ctx.packed_retile_pipeline :
                      bi.retile_parameters.kind == RetileShaderKind::Volume3D ? ctx.volume_retile_pipeline : ctx.retile_pipeline)
                         .record(command, staging[i], bi.retile_buffer,
-                                bi.retile_set, bi.retile_parameters);
+                                bi.retile_set, bi.retile_parameters, VK_NULL_HANDLE, bi.result_baseline,
+                                compare_flags, bi.compare_flag_index == SIZE_MAX ? 0 :
+                                    bi.compare_flag_index * ctx.compare_flag_stride());
                     storage_timestamp();
                     if (perf_gpu_timing) storage_timestamp_spans.emplace_back(retile_start, true);
                 }
@@ -11210,11 +11286,10 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         if (!compare_targets.empty()) {
             for (auto& target : compare_targets)
                 if (target.buffer) target.buffer->timing.gpu_compare = "recorded";
-            vkCmdFillBuffer(command, compare_flags, 0,
-                            compare_targets.size() * ctx.compare_flag_stride(), 0);
             std::vector<VkBufferMemoryBarrier> before_compare;
             before_compare.reserve(compare_targets.size() * 2 + 1);
             for (const CompareTarget& target : compare_targets) {
+                if (target.image && target.image->fused_retile) continue;
                 VkBufferMemoryBarrier current{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
                 current.srcAccessMask = target.current_src_access;
                 current.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
@@ -11233,7 +11308,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 before_compare.push_back(prior);
             }
             VkBufferMemoryBarrier flags{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
-            flags.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            flags.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT;
             flags.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
             flags.srcQueueFamilyIndex = flags.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
             flags.buffer = compare_flags;
@@ -11250,6 +11325,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                               ctx.compare_pipeline);
             for (size_t j = 0; j < compare_targets.size(); ++j) {
                 const CompareTarget& target = compare_targets[j];
+                if (target.image && target.image->fused_retile) continue;
                 vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE,
                                         ctx.compare_pipeline_layout, 0, 1,
                                         &compare_descriptor_sets[j], 0, nullptr);
@@ -11258,6 +11334,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 vkCmdPushConstants(command, ctx.compare_pipeline_layout,
                                    VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(vectors), &vectors);
                 vkCmdDispatch(command, ctx.result_compare_group_count(target.bytes), 1, 1);
+                if (target.image)
+                    gpu_separate_image_compare_recordings().fetch_add(1, std::memory_order_relaxed);
             }
         }
         // If source validation found an external guest change, the exact comparator is not allowed
@@ -13604,6 +13682,10 @@ bool execute_live_compute_items(const std::vector<prosper::gpu::ComputeItem>& it
                     "[render-timing] compute_cpu_fast fills=%llu\n",
                     (unsigned long long)g_cpu_fill_dispatches.load(
                         std::memory_order_relaxed));
+                std::fprintf(stderr,
+                    "[render-timing] compute_retile recorded=%llu fused_compare_recorded=%llu\n",
+                    (unsigned long long)gpu_retile_recordings().load(std::memory_order_relaxed),
+                    (unsigned long long)gpu_retile_compare_recordings().load(std::memory_order_relaxed));
                 const ComputeMemoryPoolStats pool = context.memory_pool_stats();
                 std::fprintf(stderr,
                     "[render-timing] compute_memory_pool hits=%llu misses=%llu cached=%zu "

@@ -54,7 +54,10 @@ std::vector<uint32_t> build_compute_rgba8_to_packed10();
 enum class RetileShaderKind { Words2D, Volume3D, PackedSubwordArray };
 enum class RetileImageSource { LinearBuffer, R32Uint, Rgba8Uint };
 // Image variants also publish exact row-major words for existing result baselines.
+// compare_result compares/adopts exact linear words at binding 3 and atomically sets
+// the scalar flag at binding 4. Padding remains outside this linear comparison.
 std::vector<uint32_t> build_compute_retile_words(RetileShaderKind kind = RetileShaderKind::Words2D,
-    RetileImageSource source = RetileImageSource::LinearBuffer, bool image_arrayed = false);
+    RetileImageSource source = RetileImageSource::LinearBuffer, bool image_arrayed = false,
+    bool compare_result = false);
 
 } // namespace prosper::gpu

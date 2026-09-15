@@ -67,6 +67,11 @@ static bool volume_equation_covers_block(uint32_t mode, uint32_t bpe, bool colla
 
 int run_case(int argc, char** argv) {
     const bool direct = argc == 2 && std::strstr(argv[1], "direct");
+    const auto fused_before = gpu_retile_compare_recordings().load();
+    const bool compare_fallback = direct && std::strstr(argv[1], "compare-fallback");
+    const bool compare_transfer = direct && std::strstr(argv[1], "compare-transfer");
+    const bool compare_loss = direct && std::strstr(argv[1], "compare-loss");
+    bool compare_fault_exercised = false;
     const bool host_baseline = direct && std::strstr(argv[1], "host");
     const bool failed_readback = direct && std::strstr(argv[1], "readback");
     const bool mixed = argc == 2 && std::strstr(argv[1], "mixed");
@@ -364,7 +369,7 @@ int run_case(int argc, char** argv) {
         const bool direct_format = direct && !std::getenv("PROSPER_NO_DIRECT_IMAGE_RETILE") &&
             (format.format == DataFormat::Uint32 || format.format == DataFormat::Uint8);
         const auto direct_before = gpu_direct_retile_recordings().load();
-        uint64_t extra_recordings = 0;
+        uint64_t extra_recordings = 0, transfer_failures = 0;
         const uint32_t rounds = direct ? 6 : 3;
         for (uint32_t round = 0; round < rounds; ++round) {
             // Additional A→B→A writes to the same last-row region challenge retained baselines.
@@ -459,7 +464,19 @@ int run_case(int argc, char** argv) {
             const auto submits_before = live_compute_queue_submit_attempts();
             const auto guest_before = destination;
             if (inject) live_compute_fail_next_retile_memory_for_test(mapping, loss);
+            const bool transfer_failure = compare_transfer && !compare_fault_exercised && round == 1 && direct_format && !(linear_bytes & 15);
+            if (transfer_failure) {
+                gpu_retile_compare_bind_failure_for_test().store(VK_ERROR_OUT_OF_POOL_MEMORY);
+                gpu_retile_bind_failure_for_test().store(VK_ERROR_OUT_OF_POOL_MEMORY);
+            }
             const bool executed = !item.spirv.empty() && execute_live_compute_items({item});
+            if (transfer_failure) {
+                check(gpu_retile_compare_bind_failure_for_test().load() == VK_SUCCESS &&
+                      gpu_retile_bind_failure_for_test().load() == VK_SUCCESS,
+                      "both fused and ordinary bindings fail before transfer fallback");
+                compare_fault_exercised = true;
+                ++transfer_failures;
+            }
             if (inject) check(!live_compute_retile_memory_fault_pending_for_test(),
                               "injected error reached the actual allocator driver boundary");
             if (inject && loss) {
@@ -480,7 +497,7 @@ int run_case(int argc, char** argv) {
                     check(live_compute_image_result_snapshot_bytes() - host_snapshots == linear_bytes,
                           "forced host baseline consumes the exact new linear result");
             }
-            check(gpu_retile_recordings().load() - retile_before == (!gpu ? 0 : output_images - (inject ? 1 : 0)),
+            check(gpu_retile_recordings().load() - retile_before == (!gpu ? 0 : output_images - ((inject || transfer_failure) ? 1 : 0)),
                   "every actual output takes the selected GPU/CPU path");
             if (code == 0x34070000 && round == 0 && !inject)
                 check(backend_host_read_barrier_count().load() - barriers_before == output_images * (gpu ? 2 : 1),
@@ -491,15 +508,62 @@ int run_case(int argc, char** argv) {
                   "every guest byte matches CPU tiling, including untouched texels and padding");
             check(std::all_of(destination.begin() + tiled_bytes, destination.end(),
                              [](uint8_t v) { return v == 0xcc; }), "writeback keeps destination guard bytes");
+            // Ordinary host vectors have no submit-journal/write-watch authority. A changed warm
+            // output may discard its source snapshot; the first repeat restores that proof, and
+            // the second must exercise exact GPU equality without a host readback.
+            for (unsigned repeat = 0; direct_format && !host_baseline && !fault_mode &&
+                                      !(linear_bytes & 15) && repeat < 2; ++repeat) {
+                uint32_t repeated_reads = 0;
+                live_compute_set_image_readback_observer_for_test(
+                    [&](uint32_t binding, const uint8_t*, size_t) { repeated_reads += binding == 5; });
+                const auto repeated_guest = destination;
+                const auto repeated_submits = live_compute_queue_submit_attempts();
+                const auto repeated_fused = gpu_retile_compare_recordings().load();
+                const auto repeated_separate = gpu_separate_image_compare_recordings().load();
+                const bool force_compare_failure = (compare_fallback || compare_loss) && !compare_fault_exercised;
+                if (force_compare_failure)
+                    gpu_retile_compare_bind_failure_for_test().store(compare_loss ? VK_ERROR_DEVICE_LOST
+                                                                                : VK_ERROR_OUT_OF_POOL_MEMORY);
+                const bool repeated = execute_live_compute_items({item});
+                live_compute_set_image_readback_observer_for_test({});
+                if (force_compare_failure) {
+                    check(gpu_retile_compare_bind_failure_for_test().load() == VK_SUCCESS,
+                          "fused binding failure reaches the actual optional setup boundary");
+                    compare_fault_exercised = true;
+                    check(gpu_retile_compare_recordings().load() == repeated_fused,
+                          "failed fused setup records no fused dispatch");
+                    if (compare_loss) {
+                        check(!repeated && destination == repeated_guest &&
+                              live_compute_queue_submit_attempts() == repeated_submits,
+                              "fused setup device loss stops before submission or guest mutation");
+                        check(!execute_live_compute_items({item}) &&
+                              live_compute_queue_submit_attempts() == repeated_submits,
+                              "fused setup device loss remains sticky");
+                        return failures ? 1 : 0;
+                    }
+                }
+                check(repeated, "repeated output executes");
+                check(destination == repeated_guest, "repeated output preserves every guest byte");
+                if (repeat == 1) {
+                    check(repeated_reads == 0, "validated repeated output skips host readback");
+                    const bool control = std::getenv("PROSPER_NO_FUSED_RETILE_COMPARE") != nullptr;
+                    check(gpu_retile_compare_recordings().load() - repeated_fused == (control ? 0 : output_images) &&
+                          gpu_separate_image_compare_recordings().load() - repeated_separate == (control ? output_images : 0),
+                          "each validated output records exactly one selected comparison path");
+                }
+                check(live_compute_queue_submit_attempts() == repeated_submits + 1,
+                      "repeated output issues one submission");
+                extra_recordings += output_images;
+            }
         }
         std::printf("mode=%u bpe=%u format=%u extent=%ux%u resource-dim=%u instruction-dim=%u GPU retile dispatches=%llu\n",
             mode, format.bpe, unsigned(format.format), width, height, resource_dim, instruction_dim,
             static_cast<unsigned long long>(gpu_retile_recordings().load() - before));
-        check(!gpu ? gpu_retile_recordings().load() == before : gpu_retile_recordings().load() == before + rounds * output_images - (fault_mode ? 1 : 0) + extra_recordings,
+        check(!gpu ? gpu_retile_recordings().load() == before : gpu_retile_recordings().load() == before + rounds * output_images - ((fault_mode ? 1 : 0) + transfer_failures) + extra_recordings,
               !gpu ? "CPU fallback used" : "GPU tiler actually recorded; CPU equivalence alone is insufficient");
         if (direct)
             check(gpu_direct_retile_recordings().load() - direct_before ==
-                      (direct_format ? rounds * output_images + extra_recordings - (fault_mode ? 1 : 0) : 0),
+                      (direct_format ? rounds * output_images + extra_recordings - ((fault_mode ? 1 : 0) + transfer_failures) : 0),
                   "only native integer formats record fused image conversion");
         if (fault_mode) return failures ? 1 : 0;
         code += 16;
@@ -546,6 +610,14 @@ int run_case(int argc, char** argv) {
             check(samples == 0, "unsupported queue retains functional retile without timestamps");
         }
         std::filesystem::remove(outcome.path);
+    }
+    if (compare_fallback || compare_loss || compare_transfer)
+        check(compare_fault_exercised, "requested fused-setup failure was exercised");
+    if (direct && !host_baseline && !fault_mode && !cpu) {
+        const bool control = std::getenv("PROSPER_NO_FUSED_RETILE_COMPARE") != nullptr;
+        check((gpu_retile_compare_recordings().load() > fused_before) != control,
+              control ? "control records no fused comparisons" :
+                        "eligible retained outputs execute fused comparisons in the live backend");
     }
     return failures ? 1 : 0;
 }

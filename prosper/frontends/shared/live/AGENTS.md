@@ -31,6 +31,15 @@ found Vulkan.
   CPU fallback and diagnostics; a cold cache miss does not prove it unnecessary. Its producer is
   now a shader write, including for host availability, comparison and baseline-copy dependencies.
   Image mirroring and borrowed-image layout restoration remain independent obligations.
+  Eligible retained 2D word outputs also compare/adopt their exact **linear** baseline inside
+  retile. Padding is written deterministically but excluded from equality. Shared flags clear
+  before retile, and fused targets omit the separate comparison dispatch. The control
+  `PROSPER_NO_FUSED_RETILE_COMPARE=1` restores separate comparison. Optional setup refusal retains
+  ordinary GPU retile, then image transfer plus CPU tiling if its binding also fails; device loss
+  remains fatal. Owners, pins, content invalidation and guest publication are unchanged.
+  `gpu_retile_ms` includes fused comparison when selected; compare total storage/dispatch time
+  across policies instead of treating a smaller `gpu_compare_ms` alone as savings. Render timing's
+  `fused_compare_recorded` is a cumulative command-recording count, not completed dispatches.
   `PROSPER_NO_GPU_RETILE_PACKED_EXTENSION` restores the prior mode-24 multilayer-only packed scope
   for comparable runs while leaving ordinary word and volume GPU tiling enabled.
   `PROSPER_GPU_RETILE_CENSUS=1` reports, per dispatching program, how many storage images this

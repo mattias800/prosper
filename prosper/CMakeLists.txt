@@ -3924,6 +3924,8 @@ if(TARGET prosper_live_renderer AND TARGET Vulkan::Vulkan)
   target_include_directories(test_compute_result_compare PRIVATE tests frontends)
   target_link_libraries(test_compute_result_compare PRIVATE prosper_live_renderer Vulkan::Vulkan)
   add_test(NAME compute_result_compare COMMAND test_compute_result_compare)
+  add_test(NAME compute_retile_result_compare COMMAND test_compute_result_compare --retile)
+  set_tests_properties(compute_result_compare compute_retile_result_compare PROPERTIES SKIP_RETURN_CODE 77)
 
   add_executable(test_gpu_retile tests/gpu/execute/test_gpu_retile.cpp)
   target_include_directories(test_gpu_retile PRIVATE tests frontends)
@@ -3931,12 +3933,16 @@ if(TARGET prosper_live_renderer AND TARGET Vulkan::Vulkan)
   add_test(NAME gpu_retile COMMAND test_gpu_retile)
   add_test(NAME gpu_retile_clean COMMAND test_gpu_retile --clean)
   foreach(mode direct direct-clean direct-host direct-readback direct-alloc-oom direct-map-oom
-               direct-alloc-loss direct-map-loss)
+               direct-alloc-loss direct-map-loss direct-compare-fallback direct-compare-loss direct-compare-transfer)
     add_test(NAME gpu_retile_${mode} COMMAND ${CMAKE_COMMAND} -E env
       --unset=PROSPER_NO_DIRECT_IMAGE_RETILE PROSPER_COMPUTE_STORAGE_IMAGE_CACHE_MIN_KB=1
       $<TARGET_FILE:test_gpu_retile> --${mode})
     set_tests_properties(gpu_retile_${mode} PROPERTIES TIMEOUT 60)
   endforeach()
+  add_test(NAME gpu_retile_compare_control COMMAND ${CMAKE_COMMAND} -E env
+    --unset=PROSPER_NO_DIRECT_IMAGE_RETILE PROSPER_COMPUTE_STORAGE_IMAGE_CACHE_MIN_KB=1
+    PROSPER_NO_FUSED_RETILE_COMPARE=1 $<TARGET_FILE:test_gpu_retile> --direct)
+  set_tests_properties(gpu_retile_compare_control PROPERTIES TIMEOUT 60)
   add_test(NAME gpu_retile_direct_disabled COMMAND ${CMAKE_COMMAND} -E env
     PROSPER_NO_DIRECT_IMAGE_RETILE=1 PROSPER_COMPUTE_STORAGE_IMAGE_CACHE_MIN_KB=1
     $<TARGET_FILE:test_gpu_retile> --direct-disabled)
