@@ -1333,6 +1333,10 @@ if(TARGET prosper_core)
   target_include_directories(test_texture_source_snapshot PRIVATE frontends)
   add_test(NAME texture_source_snapshot COMMAND test_texture_source_snapshot)
 
+  add_executable(test_texture_validation_census frontends/shared/tests/test_texture_validation_census.cpp)
+  target_include_directories(test_texture_validation_census PRIVATE frontends)
+  add_test(NAME texture_validation_census COMMAND test_texture_validation_census)
+
   add_executable(test_performance_capture frontends/shared/tests/test_performance_capture.cpp)
   target_link_libraries(test_performance_capture PRIVATE prosper_performance_capture)
   add_test(NAME performance_capture COMMAND test_performance_capture)
@@ -3867,6 +3871,25 @@ if(TARGET prosper_live_renderer AND TARGET Vulkan::Vulkan)
     ENVIRONMENT "PROSPER_NO_LIVE_PERSISTENT_COLOR_TARGETS=1;PROSPER_BACKEND_BUFFER_RESIDENCY_MB=0"
     TIMEOUT 120)
   add_test(NAME render_texture_snapshot_capture COMMAND test_render_buffer_capture --source-snapshot)
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_test(NAME render_small_texture_watch COMMAND test_render_buffer_capture --small-watch)
+    add_test(NAME render_small_texture_watch_zero_hits COMMAND test_render_buffer_capture --small-watch)
+    add_test(NAME render_small_texture_watch_unsupported COMMAND test_render_buffer_capture --small-watch-unsupported)
+    add_test(NAME render_small_texture_watch_control COMMAND test_render_buffer_capture --small-watch-control)
+    set_tests_properties(render_small_texture_watch render_small_texture_watch_unsupported PROPERTIES
+      ENVIRONMENT "PROSPER_NO_LIVE_PERSISTENT_COLOR_TARGETS=1;PROSPER_BACKEND_BUFFER_RESIDENCY_MB=0" TIMEOUT 120)
+    set_tests_properties(render_small_texture_watch_zero_hits PROPERTIES
+      ENVIRONMENT "PROSPER_NO_LIVE_PERSISTENT_COLOR_TARGETS=1;PROSPER_BACKEND_BUFFER_RESIDENCY_MB=0;PROSPER_TEXTURE_WRITE_WATCH_PROMOTE_HITS=0" TIMEOUT 120)
+    set_tests_properties(render_small_texture_watch_control PROPERTIES
+      ENVIRONMENT "PROSPER_NO_LIVE_PERSISTENT_COLOR_TARGETS=1;PROSPER_BACKEND_BUFFER_RESIDENCY_MB=0;PROSPER_NO_SMALL_TEXTURE_WRITE_WATCH=1" TIMEOUT 120)
+  endif()
+  if(Python3_Interpreter_FOUND)
+    add_test(NAME render_texture_validation_census
+      COMMAND "${Python3_EXECUTABLE}"
+        "${CMAKE_SOURCE_DIR}/tests/shared/live/test_texture_validation_census.py"
+        $<TARGET_FILE:test_render_buffer_capture>)
+    set_tests_properties(render_texture_validation_census PROPERTIES TIMEOUT 150)
+  endif()
   add_test(NAME render_texture_snapshot_capture_copy COMMAND test_render_buffer_capture --source-snapshot)
   set_tests_properties(render_texture_snapshot_capture PROPERTIES
     ENVIRONMENT "PROSPER_NO_LIVE_PERSISTENT_COLOR_TARGETS=1;PROSPER_BACKEND_BUFFER_RESIDENCY_MB=256;PROSPER_BACKEND_BUFFER_RESIDENCY_OWNERS=4096" TIMEOUT 120)

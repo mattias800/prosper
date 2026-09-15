@@ -24,3 +24,13 @@ does for a given path; the header describes a contract only one caller uses in f
 answer was measured from outside the process with an `LD_PRELOAD` `memcmp` interposer whose periodic
 tally was read as a run total. Prefer counting a decision where it is taken over counting a proxy for
 its consequences; if you add a counter here, make its report carry its own denominator.
+
+`renderer_write_watch_admission` adds a separate stable-source tier: 64 KiB–<1 MiB sources
+require at least three successful exact validations before a budgeted registration attempt. It
+preserves the existing ordinary size exemption and larger-source deferral. Its stability limit
+must also govern the caller's counter, including when the ordinary promotion override is zero.
+The live renderer enables this extension on Linux, where the fault-safe watch is supported.
+An explicit minimum override retains its previous semantics and disables the additional tier;
+`PROSPER_NO_SMALL_TEXTURE_WRITE_WATCH=1` supplies the default-policy comparison control.
+Retained depth-cube entries are excluded from the new tier: their renderer-generation proof can
+advance the shared stability counter without an exact guest-byte comparison.

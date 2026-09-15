@@ -16,6 +16,7 @@
 #include "shared/present/readback_policy.hpp"
 #include "shared/diagnostics/capture_renderer_policy.hpp"
 #include "shared/texture/write_watch_policy.hpp"
+#include "shared/texture/validation_census.hpp"
 #include "shared/live/live_compute.hpp"
 #include "shared/live/texture_source_snapshot.hpp"
 #include "shared/live/decode_scratch.hpp"     // pooled full-surface decode intermediates
@@ -2342,6 +2343,36 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             static thread_local std::vector<RttTimingRecord> pending_rtt_timing;
             const bool perf_capture_timing =
                 prosper::perf::interactive_performance_capture().detailed_timing_active();
+            // The timing bool is sampled per callback, not a capture ID or completion proof.
+            // Keep cumulative per-thread populations across captures; a falling edge is only
+            // an observed inactive callback. This diagnostic does not change realization policy.
+            struct ValidationCensusLog {
+                prosper::frontend::TextureValidationCensus data;
+                unsigned long thread = 0;
+                bool active = false;
+                ~ValidationCensusLog() {
+                    if (active) data.report(stderr, thread, "thread-exit");
+                }
+            };
+            static const bool validation_census_requested =
+                PROSPER_ENV_VALUE("PROSPER_TEXTURE_VALIDATION_CENSUS") != nullptr;
+            ValidationCensusLog* validation_census = nullptr;
+            if (validation_census_requested) {
+                static thread_local ValidationCensusLog log;
+                if (log.active && !perf_capture_timing)
+                    log.data.report(stderr, log.thread, "timing-inactive");
+                log.active = perf_capture_timing;
+                if (perf_capture_timing) {
+                    if (!log.thread) {
+#ifdef _WIN32
+                        log.thread = static_cast<unsigned long>(GetCurrentThreadId());
+#else
+                        log.thread = static_cast<unsigned long>((uintptr_t)pthread_self());
+#endif
+                    }
+                    validation_census = &log;
+                }
+            }
             const bool timing_capture_only =
                 getenv("PROSPER_RENDER_TIMING_CAPTURE_ONLY") != nullptr;
             const bool timing_log_enabled = getenv("PROSPER_RENDER_TIMING") != nullptr &&
@@ -4254,8 +4285,21 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 SIZE_MAX / 1024ull, "KiB");
                             return static_cast<size_t>(kib * 1024ull);
                         }();
-                        const bool cross_submit_watch_eligible = cross_submit_watch_enabled &&
-                            persistent_source_size >= cross_submit_watch_min_bytes;
+                        // An explicit minimum keeps its historical meaning, including diagnostic
+                        // trials that deliberately enable eager watches for smaller sources.
+#ifdef __linux__
+                        static const bool stable_small_sources =
+                            !PROSPER_ENV_VALUE("PROSPER_NO_SMALL_TEXTURE_WRITE_WATCH") &&
+                            !PROSPER_ENV_VALUE("PROSPER_TEXTURE_WRITE_WATCH_MIN_KB");
+#else
+                        // Other hosts cannot arm the fault-safe page watch. Repeated unsuccessful
+                        // small promotions would consume budget without avoiding any comparisons.
+                        constexpr bool stable_small_sources = false;
+#endif
+                        // Retained depth cubes can advance stability from renderer-generation
+                        // authority without comparing guest bytes. That is not small-tier evidence.
+                        const bool stable_small_guest_sources =
+                            stable_small_sources && !retained_depth_cube_cache_eligible;
                         static const size_t cross_submit_watch_defer_min_bytes = [] {
                             // 0 means "defer nothing": should_promote_write_watch returns true
                             // immediately, arming every source on first sight. This is the knob
@@ -4276,6 +4320,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 "PROSPER_TEXTURE_WRITE_WATCH_PROMOTE_HITS", value, 3ull, UINT32_MAX,
                                 "unchanged validations"));
                         }();
+                        const auto cold_watch_admission = renderer_write_watch_admission(
+                            persistent_source_size, 0, cross_submit_watch_min_bytes,
+                            cross_submit_watch_defer_min_bytes,
+                            cross_submit_watch_promotion_validations, stable_small_guest_sources);
+                        const bool cross_submit_watch_eligible =
+                            cross_submit_watch_enabled && cold_watch_admission.eligible;
                         static const bool audit_cross_submit_watch =
                             PROSPER_ENV_VALUE("PROSPER_AUDIT_CROSS_SUBMIT_TEXTURE_WRITE_WATCH") != nullptr;
                         prosper::host::GuestWriteWatch pending_source_watch;
@@ -4349,11 +4399,38 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 resource_texture_watch_only = cached->second.source_watch_only;
                                 resource_texture_watch_stability =
                                     cached->second.source_watch_stable_validations;
+                                auto record_validation = [&](bool matches, bool refusal,
+                                                             size_t bytes, double milliseconds) {
+                                    if (!validation_census) return;
+                                    using Watch = TextureValidationWatch;
+                                    using Query = prosper::host::GuestWriteWatchQuery;
+                                    Watch reason = !cross_submit_watch_enabled
+                                        ? Watch::ControlDisabled
+                                        : !cross_submit_watch_eligible ? Watch::BelowMinimum
+                                        : cached->second.source_watch_disabled
+                                            ? Watch::DisabledAfterDirty
+                                        : resource_texture_watch_query == static_cast<int>(Query::Dirty)
+                                            ? Watch::Dirty
+                                        : resource_texture_watch_query == static_cast<int>(Query::Unknown)
+                                            ? Watch::Unknown
+                                        : resource_texture_watch_query == static_cast<int>(Query::Unchanged)
+                                            ? Watch::Unchanged : Watch::NotQueried;
+                                    validation_census->data.record(
+                                        refusal ? TextureValidationOutcome::WatchOnlyRefusal
+                                            : matches ? TextureValidationOutcome::Match
+                                                      : TextureValidationOutcome::ExactFailure,
+                                        reason, persistent_source_size, bytes, milliseconds,
+                                        static_cast<bool>(cached->second.source_watch),
+                                        cached->second.source_watch_stable_validations);
+                                };
                                 auto validate_exact = [&] {
                                     // A successfully promoted Linux watch may own the mutation proof
                                     // without retaining a second encoded copy. Dirty/Unknown must miss;
                                     // there is deliberately no probabilistic hash fallback here.
-                                    if (cached->second.source_watch_only) return false;
+                                    if (cached->second.source_watch_only) {
+                                        record_validation(false, true, 0, 0);
+                                        return false;
+                                    }
                                     resource_texture_exact_validation = true;
                                     const auto validation_start = timing_enabled
                                         ? RenderClock::now() : RenderClock::time_point{};
@@ -4393,9 +4470,11 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     if (timing_enabled) {
                                         pending_timing.persistent_validations++;
                                         pending_timing.persistent_validation_bytes += validated_bytes;
-                                        resource_texture_validation_ms +=
+                                        const double validation_ms =
                                             std::chrono::duration<double, std::milli>(
                                                 RenderClock::now() - validation_start).count();
+                                        resource_texture_validation_ms += validation_ms;
+                                        record_validation(matches, false, validated_bytes, validation_ms);
                                     }
                                     return matches;
                                 };
@@ -4450,11 +4529,13 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 const bool watch_unchanged = !submit_unchanged &&
                                     watch_query == prosper::host::GuestWriteWatchQuery::Unchanged;
                                 const bool watch_ready =
-                                    prosper::frontend::should_promote_write_watch(
+                                    prosper::frontend::renderer_write_watch_admission(
                                         persistent_source_size,
                                         cached->second.source_watch_stable_validations,
+                                        cross_submit_watch_min_bytes,
                                         cross_submit_watch_defer_min_bytes,
-                                        cross_submit_watch_promotion_validations);
+                                        cross_submit_watch_promotion_validations,
+                                        stable_small_guest_sources).ready;
                                 const bool may_arm_watch = cached->second.source_watch ||
                                     (!submit_unchanged && !watch_unchanged &&
                                      cross_submit_watch_eligible &&
@@ -4507,7 +4588,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                         prosper::frontend::update_write_watch_stability(
                                             cached->second.source_watch_stable_validations,
                                             content_matches,
-                                            cross_submit_watch_promotion_validations);
+                                            cold_watch_admission.stability_limit);
                                 }
                                 resource_texture_watch_active =
                                     static_cast<bool>(cached->second.source_watch);
@@ -4563,11 +4644,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 // Establish the mutation boundary before the initial source read/decode.
                                 // If registration is unsupported, the empty watch keeps all later reuse on
                                 // the exact fallback.
-                                if (cross_submit_watch_eligible &&
-                                    prosper::frontend::should_promote_write_watch(
-                                        persistent_source_size, 0,
-                                        cross_submit_watch_defer_min_bytes,
-                                        cross_submit_watch_promotion_validations))
+                                if (cross_submit_watch_eligible && cold_watch_admission.ready)
                                     pending_source_watch = prosper::host::GuestWriteWatch::create(
                                         persistent_source_addr, persistent_source_size);
                                 resource_persistent_miss = true;

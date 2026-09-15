@@ -59,6 +59,27 @@ int main() {
     CHECK(!should_promote_write_watch(4u << 10, 0, 1, promote_after));
     CHECK(should_promote_write_watch(4u << 10, promote_after, 1, promote_after));
 
+    // The new renderer tier must not inherit the existing <8MiB immediate-size exemption.
+    const auto admission = [](size_t bytes, uint32_t stable, uint32_t hits = 3,
+                              bool small = true, size_t minimum = 1u << 20) {
+        return prosper::frontend::renderer_write_watch_admission(
+            bytes, stable, minimum, 8u << 20, hits, small);
+    };
+    CHECK(!admission((64u << 10) - 1, 100).eligible);
+    CHECK(admission(64u << 10, 0).eligible && !admission(64u << 10, 0).ready);
+    CHECK(!admission(64u << 10, 2).ready && admission(64u << 10, 3).ready);
+    CHECK(!admission(64u << 10, 3, 3, false).eligible);
+    CHECK(!admission(128u * 128u * 6u * 2u, 100, 3, false).eligible);
+    CHECK(!admission(64u << 10, 0, 0).ready && admission(64u << 10, 0, 0).stability_limit == 3);
+    CHECK(admission(64u << 10, 3, 0).ready);
+    CHECK(!admission(64u << 10, 3, 4).ready && admission(64u << 10, 4, 4).ready);
+    CHECK(admission(1u << 20, 0).ready && admission((8u << 20) - 1, 0).ready);
+    CHECK(!admission(8u << 20, 2).ready && admission(8u << 20, 3).ready);
+    CHECK(admission(8u << 20, 0, 0).ready);
+    // Explicit ordinary-minimum controls retain their existing eager behavior.
+    CHECK(admission(64u << 10, 0, 3, false, 64u << 10).ready);
+    CHECK(admission(16, 0, 3, false, 0).ready);
+
     // ---- census (#3155) -------------------------------------------------------------------
     // A census whose buckets do not partition its own denominator is worse than none: every ratio
     // it prints is then wrong in a way no reader can see.
