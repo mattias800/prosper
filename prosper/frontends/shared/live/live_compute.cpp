@@ -11900,6 +11900,19 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 // counts writebacks, and every mean derived from its rows is biased upward by however
                 // often the skip fires. Same key fields, `skipped=1`, and no timings: nothing was
                 // measured here because nothing was done.
+                //
+                // Two residuals a census built from these rows must still account for, neither of
+                // them closed by this row or its `reason=repeated-output` sibling below:
+                //   * the `readback_ok = false; break` exits abort the whole loop and emit nothing,
+                //     so an aborted run's row count is short by the item that failed and every item
+                //     after it. Those paths already trace loudly and the run is broken anyway, so
+                //     they are named here rather than instrumented.
+                //   * every row in this loop, this one and the ordinary one alike, is written INSIDE
+                //     `writeback_images_ms`, so an `image_timing` run pays for its own diagnostics
+                //     inside the figure it reports. That was already true of the ordinary row; what
+                //     is new is that the skip paths now pay it too. Ratios between the two row kinds
+                //     are unaffected -- both sit under the same `image_timing` gate -- but the
+                //     absolute writeback cost from such a run is an upper bound, not a measurement.
                 if (image_timing)
                     std::fprintf(stderr,
                                  "[compute-image-writeback] code=0x%llx hash=0x%016llx "
@@ -11962,6 +11975,23 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                  "addr=0x%llx bytes=%llu\n",
                                  bi.binding, (unsigned long long)r->gpu_addr,
                                  (unsigned long long)bi.exact_result_bytes);
+                // The SECOND skip in this loop, and it needs its own row for exactly the reason the
+                // GPU-identical one above does: this `continue` returns before the
+                // [compute-image-writeback] line, so a census built from those rows cannot see it.
+                //
+                // The two do not overlap -- they PARTITION. `retain_gpu_result_baseline` needs
+                // compute_result_compare_group_count(), which refuses any byte count that is not a
+                // multiple of 16 (live_compute.hpp), so a small or unaligned result can never take
+                // the GPU comparison and takes the host snapshot and this CPU comparison instead.
+                // Instrumenting only the GPU half would therefore have left the census biased in the
+                // same direction and against the same population: the cheapest writebacks.
+                if (image_timing)
+                    std::fprintf(stderr,
+                                 "[compute-image-writeback] code=0x%llx hash=0x%016llx "
+                                 "binding=%u addr=0x%llx bytes=%zu skipped=1 reason=repeated-output\n",
+                                 (unsigned long long)item.code_addr,
+                                 (unsigned long long)timing_program_hash, bi.binding,
+                                 (unsigned long long)r->gpu_addr, bi.guest_bytes);
                 ctx.unmap_memory(staging_memory[i]);
                 if (r->gpu_addr || r->host_data)
                     notify_output_write(r->gpu_addr, destination, bi.guest_bytes, true);
