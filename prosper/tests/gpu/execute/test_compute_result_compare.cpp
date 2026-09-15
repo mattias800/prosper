@@ -342,12 +342,15 @@ int main() {
     // Flag slots, bound the way production binds them: it slices ONE buffer at
     // `target_index * compare_flag_stride()`, so the dwords beside a flag are OTHER TARGETS' flags
     // rather than allocation padding. The flag under test is slot 1, leaving one neighbour behind it
-    // and three ahead, and the DIRECTION is the point. An over-wide store or atomic through the flag
-    // chain always smears forward: a SPIR-V access chain cannot produce a negative byte offset from
-    // the binding base, so 16 bytes from that base covers slots 2 and 3 at the 4-byte stride RADV
-    // and lavapipe report here. Production smears the same way -- `{compare_flags, j * stride, 4}`
-    // puts target j's overrun on j+1, j+2, j+3. An earlier version of this file placed its only
-    // canary BEHIND the binding, where no device write can reach it by any route.
+    // and three ahead, and the DIRECTION is the point. An over-wide STORE through the flag chain can
+    // only smear forward: a SPIR-V access chain cannot produce a negative byte offset from the
+    // binding base, so a 16-byte write from that base spans slots 1 through 4 at the 4-byte stride
+    // RADV and lavapipe report here -- the flag itself plus all three canaries ahead of it, which is
+    // why the buffer is five slots and not two. (A uint OpAtomicExchange through such a chain writes
+    // only its own four bytes and does not smear at all; the over-wide store is the case worth
+    // guarding.) Production smears the same way -- `{compare_flags, j * stride, 4}` puts target j's
+    // overrun on j+1, j+2, j+3. An earlier version of this file placed its only canary BEHIND the
+    // binding, where no device write can reach it by any route.
     //
     // The honest limit, because a guard that cannot fail is worse than none: the descriptor's range
     // is 4 bytes and robustBufferAccess is on, so on RADV the byte-granular buffer bound is what
