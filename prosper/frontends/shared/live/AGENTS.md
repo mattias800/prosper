@@ -71,6 +71,16 @@ entry's capacity beyond its outgoing allocation or exact readable prefix. The sa
 allocation inheritance. F8 handoff time is nested in frontend texture time; copied/transferred
 bytes describe actual admitted snapshots and exclude the guest read and GPU uploads.
 
+Texture preparation rejects impossible compute imports before deriving their guest footprint.
+GPU/uniform RTT winners also omit unused guest DCC reads; CPU-only RTT fallback keeps them.
+Ordinary tiled RGBA8 decoding defers the initial logical source copy when the subsequent detiler
+writes every output byte from its independently acquired padded source. Short logical backing
+restores the original copy and zero-tail recovery; partial tile padding keeps staged zero filling.
+Raw-texture inspection and GFXLOG retain their original input copy. The startup control
+`PROSPER_NO_TEXTURE_PREPARATION_PRUNING=1` restores all three eager preparations. Render timing's
+`texture_preparation` line reports cumulative per-thread read/query/copy counts, not a bounded F8
+window or elapsed cost. The live `texture_preparation` tests constrain both saved work and pixels.
+
 Queued renderer invalidation keeps writes ordered, including their captured origins. Multi-write
 drains prepare CPU RTT footprints only for the lifetime of that drain; metadata association must
 precede preparation, and erased entries cannot be revisited. Single writes and RTT-watch diagnostics
