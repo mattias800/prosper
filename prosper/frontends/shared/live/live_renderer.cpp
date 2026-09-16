@@ -19,6 +19,7 @@
 #include "shared/texture/validation_census.hpp"
 #include "shared/live/live_compute.hpp"
 #include "shared/live/texture_source_snapshot.hpp"
+#include "shared/live/depth_cube_source_snapshot.hpp"
 #include "shared/live/decode_scratch.hpp"     // pooled full-surface decode intermediates
 #include "shared/live/live_target_format.hpp"       // the one LiveTargetPixelFormat mapping (exhaustive)
 #include "shared/perf/performance_capture.hpp"      // bounded F8 post-trigger renderer timing
@@ -944,6 +945,7 @@ struct PersistentDecodedTexture {
     size_t source_size = 0;
     size_t source_prefix_size = 0;
     bool source_matches_pixels = false;
+    DepthCubeSourceSnapshot depth_cube_source;
     std::vector<uint8_t> source_prefix;
     std::shared_ptr<const std::vector<uint8_t>> pixels;
     uint32_t output_height = 0;
@@ -4257,6 +4259,17 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 resource_compute_image_hit = false;
                             }
                         }
+                        DepthCubeSourceLayout depth_cube_source_layout;
+                        if (retained_depth_cube_cache_candidate) {
+                            const size_t face_bytes = persistent_source_is_tiled
+                                ? prosper::gpu::tiled_surface_bytes(tw, th, r.tile_mode, 0, 2)
+                                : static_cast<size_t>(tw) * th * 2u;
+                            depth_cube_source_layout = {r.gpu_addr,
+                                r.layer_stride_bytes ? r.layer_stride_bytes : face_bytes, face_bytes};
+                        }
+                        const bool depth_cube_source_layout_valid =
+                            retained_depth_cube_cache_candidate && depth_cube_source_layout.fits(
+                                persistent_source_addr, persistent_source_size);
                         auto copy_persistent_source = [&](uint8_t* dst, size_t bytes) {
                             return persistent_dcc_fast_clear
                                 ? copy_dcc_metadata(dst, bytes)
@@ -4410,7 +4423,11 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             auto cached = persistent_decoded_textures.find(decode_key);
                             if (cached != persistent_decoded_textures.end() &&
                                 cached->second.source_addr == persistent_source_addr &&
-                                cached->second.source_size == persistent_source_size) {
+                                cached->second.source_size == persistent_source_size &&
+                                (!retained_depth_cube_cache_eligible ||
+                                 (depth_cube_source_layout_valid && cached->second.depth_cube_source.active &&
+                                  cached->second.depth_cube_source.renderer_mask ==
+                                      retained_depth_cube.present_mask))) {
                                 resource_texture_watch_active =
                                     static_cast<bool>(cached->second.source_watch);
                                 resource_texture_watch_disabled =
@@ -4455,7 +4472,11 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                         ? RenderClock::now() : RenderClock::time_point{};
                                     bool matches = false;
                                     size_t validated_bytes = 0;
-                                    if (cached->second.source_matches_pixels) {
+                                    if (cached->second.depth_cube_source.active) {
+                                        matches = equal_depth_cube_source(depth_cube_source_layout,
+                                            cached->second.depth_cube_source, cached->second.source_prefix,
+                                            safe_span, safe_equal, validated_bytes);
+                                    } else if (cached->second.source_matches_pixels) {
                                         matches = safe_equal(
                                             cached->second.pixels ? cached->second.pixels->data() : nullptr,
                                             persistent_source_addr,
@@ -4573,8 +4594,11 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                             prosper::host::GuestWriteWatch::create(
                                                 persistent_source_addr, persistent_source_size);
                                 }
-                                bool content_matches = retained_depth_cube_cache_eligible;
-                                if (retained_depth_cube_cache_eligible) {
+                                const bool renderer_only_cube = retained_depth_cube_cache_eligible &&
+                                    cached->second.depth_cube_source.active &&
+                                    cached->second.depth_cube_source.renderer_mask == 0x3fu;
+                                bool content_matches = renderer_only_cube;
+                                if (renderer_only_cube) {
                                     // The key carries the newest selected retained-depth write.
                                     // Finding this entry is the exact renderer-authority proof;
                                     // there are intentionally no guest bytes to compare.
@@ -4622,7 +4646,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                         prosper::gpu::guest_gpu_write_snapshot();
                                     static const bool keep_source_snapshots =
                                         PROSPER_ENV_VALUE("PROSPER_KEEP_TEXTURE_SOURCE_SNAPSHOTS") != nullptr;
-                                    if (!keep_source_snapshots &&
+                                    if (!keep_source_snapshots && !cached->second.depth_cube_source.active &&
                                         texture_source_snapshot_can_follow_watch(
                                             cached->second.source_matches_pixels,
                                             audit_submit_reuse || audit_cross_submit_watch,
@@ -5353,6 +5377,40 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         size_t nb = volume_texels * output_bpp *
                             (is_cube ? 6u : (is_array ? decoded_layers : 1u));
                         size_t linear_source_prefix_size = 0;
+                        bool decoder_source_snapshot_ready = false;
+                        size_t decoder_source_prefix_size = 0;
+                        // Only an exact encoded footprint can serve both the decoder and validation.
+                        // Repacked rows, detiled bytes and metadata are different source domains.
+                        // When used, the source watch was armed above, before this authoritative read.
+                        auto stage_linear_decoder_source = [&](
+                            prosper::frontend::DecodeScratchPool::Lease& lease,
+                            size_t bytes, bool tiled) {
+                            const bool candidate = !tiled && !linear_padded_read &&
+                                !is_cube && !is_array && !is_volume && !r.in_mip_tail &&
+                                persistent_cache_eligible && !persistent_source_matches_pixels &&
+                                !persistent_dcc_fast_clear &&
+                                persistent_source_addr == sampled_source_addr &&
+                                bytes != 0 && bytes == persistent_source_size;
+                            if (candidate)
+                                g_texture_decode_scope.decoder_snapshot_candidate_bytes += bytes;
+                            if (candidate &&
+                                !PROSPER_ENV_ON("PROSPER_NO_DECODE_SOURCE_SNAPSHOT_REUSE")) {
+                                persistent_validation_scratch.resize(bytes);
+                                decoder_source_prefix_size = copy_resource(
+                                    persistent_validation_scratch.data(), sampled_source_addr, bytes);
+                                // The decoder consumes zeros beyond the readable prefix, but the
+                                // persistent entry must retain only the bytes actually read.
+                                std::fill(persistent_validation_scratch.begin() +
+                                              decoder_source_prefix_size,
+                                          persistent_validation_scratch.end(), 0);
+                                decoder_source_snapshot_ready = true;
+                                g_texture_decode_scope.decoder_snapshot_reused_bytes +=
+                                    decoder_source_prefix_size;
+                                return true;
+                            }
+                            lease = prosper::frontend::decode_scratch_pool().take(bytes);
+                            return false;
+                        };
                         bool generic_source_copy_deferred = false;
                         ++g_texture_decode_scope.decodes;
                         const size_t texture_slot = acquire_texstore_slot();
@@ -5870,6 +5928,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         // faithful, the precision is not the guest's, and a shadow compare is
                         // precision-sensitive. Recorded rather than hidden.
                         bool cube_depth_bridged = false;
+                        bool renderer_cube_snapshot_ready = false;
                         if (is_cube && !rtt_hit && !resource_compute_depth_hybrid &&
                             !fr.is_storage_image && r.depth == 6u &&
                             prosper::test::is_retained_ds_plane(r.gpu_addr)) {
@@ -5886,12 +5945,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             uint32_t known_mask = retained_depth_cube.known_mask;
                             for (uint32_t face = 0; face < 6u; ++face)
                                 slices_found += (present_mask >> face) & 1u;
-                            // Selection above is metadata-only. Do not synchronously read back four
-                            // or five resident faces merely to discover that the sixth is absent and
-                            // discard every byte into the guest fallback. Only a complete selection
-                            // can enter this all-renderer bridge; the compute/DS hybrid is handled by
-                            // its independently ordered path below.
-                            const bool complete = retained_depth_cube_cache_candidate &&
+                            // Selection above is metadata-only. Read every selected renderer face;
+                            // missing faces retain the independent guest fallback below. A failure
+                            // must not publish a cache entry under the selected renderer generation.
+                            const bool readback_ok = retained_depth_cube_cache_candidate &&
                                 prosper::test::read_persistent_ds_cube_depth(
                                     r.gpu_addr, tw, th, faces, slices_found, cube_error,
                                     &present_mask, &known_mask);
@@ -5940,7 +5997,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 }
                             }
                             (void)cube_error;
-                            if (complete && texture_pixels.size() >=
+                            if (readback_ok && texture_pixels.size() >=
                                     static_cast<size_t>(tw) * th * 6u * 4u) {
                                 const bool ctiled = prosper::gpu::tile_mode_is_tiled(r.tile_mode) &&
                                     !PROSPER_ENV_VALUE("PROSPER_NODETILE");
@@ -5999,6 +6056,11 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                         }
                                     }
                                 }
+                                renderer_cube_snapshot_ready = depth_cube_source_layout_valid &&
+                                    present_mask == retained_depth_cube.present_mask;
+                                for (uint32_t face = 0; face < 6; ++face)
+                                    renderer_cube_snapshot_ready &= faces[face].size() ==
+                                        ((present_mask & (1u << face)) ? static_cast<size_t>(tw) * th : 0);
                                 cube_depth_bridged = true;
                                 rtt_hit = true;          // do not overwrite with a guest-byte decode
                                 resource_rtt_hit = true;
@@ -6395,8 +6457,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             // micro-tile geometry from the block size (bpe) internally (#119) — 16-byte
                             // blocks -> 16x16, 8-byte -> 32x16 — so no tile_side is passed here.
                             size_t comp_bytes = (size_t)bw * bh * bcb;
-                            auto lin = prosper::frontend::decode_scratch_pool().take(comp_bytes);
+                            prosper::frontend::DecodeScratchPool::Lease lin;
                             bool tiled = prosper::gpu::tile_mode_is_tiled(r.tile_mode) && !PROSPER_ENV_VALUE("PROSPER_NODETILE");
+                            const bool snapshot_source = stage_linear_decoder_source(
+                                lin, comp_bytes, tiled);
                             if (tiled) {
                                 size_t tbytes = prosper::gpu::tiled_elements_bytes(bw, bh, bcb, r.tile_mode);
                                 prosper::frontend::DecodeScratchPool::Lease traw_lease;
@@ -6422,12 +6486,14 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 lin.zero_all();
                                 copy_linear_padded_rows(
                                     lin.data(), static_cast<size_t>(bw) * bcb, bh);
-                            } else {
+                            } else if (!snapshot_source) {
                                 lin.zero_tail(copy_resource(
                                     lin.data(), sampled_source_addr, comp_bytes));
                             }
                             if (!prosper::gpu::bc_decode_surface(
-                                    texture_pixels.data(), lin.data(), lin.size(), tw, th, r.format))
+                                    texture_pixels.data(), snapshot_source ? persistent_validation_scratch.data()
+                                                                          : lin.data(),
+                                    comp_bytes, tw, th, r.format))
                                 std::fill(texture_pixels.begin(), texture_pixels.end(), 0);
                         } else if (f32) {
                             // Sampled Float32 resources cannot be reinterpreted as RGBA8: a value such as
@@ -6438,10 +6504,11 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             // Power-of-two component counts keep the source texel size compatible with the
                             // supported GFX10 surface detilers (4/8/16 B per texel).
                             const uint32_t nc = bpt / 4;
-                            auto flin = prosper::frontend::decode_scratch_pool().take(
-                                volume_texels * bpt);
+                            prosper::frontend::DecodeScratchPool::Lease flin;
                             const bool tiled = prosper::gpu::tile_mode_is_tiled(r.tile_mode) &&
                                 !PROSPER_ENV_VALUE("PROSPER_NODETILE");
+                            const bool snapshot_source = stage_linear_decoder_source(
+                                flin, volume_texels * bpt, tiled);
                             if (tiled) {
                                 const size_t tbytes = is_volume
                                     ? prosper::gpu::tiled_volume_bytes(
@@ -6475,7 +6542,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             } else if (linear_padded_read) {
                                 flin.zero_all();
                                 copy_linear_padded_rows(flin.data(), (size_t)tw * bpt, th);
-                            } else {
+                            } else if (!snapshot_source) {
                                 flin.zero_tail(copy_resource(
                                     flin.data(), sampled_source_addr, flin.size()));
                             }
@@ -6486,7 +6553,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             // to the narrower component counts; it keeps the same (0,0,0,1) fill and
                             // the same bit-for-bit rounding/NaN-payload contract.
                             prosper::frontend::pack_float32_to_rgba16f_range(
-                                flin.data(), nc, bpt, volume_texels, texture_pixels.data());
+                                snapshot_source ? persistent_validation_scratch.data() : flin.data(),
+                                nc, bpt, volume_texels, texture_pixels.data());
                             f32_done = true;
                         } else if (f16) {
                             // fp16 texture (#290 wall 1): read at the REAL bytes-per-texel and detile
@@ -6504,9 +6572,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             // Pooled, so a 4K HDR intermediate does not mmap/fault/munmap 63 MiB per
                             // reference. It arrives holding the PREVIOUS surface, so every arm below
                             // either covers it completely or zeroes what it does not fill.
-                            auto hlin = prosper::frontend::decode_scratch_pool().take(
-                                volume_texels * bpt);
+                            prosper::frontend::DecodeScratchPool::Lease hlin;
                             bool tiled = prosper::gpu::tile_mode_is_tiled(r.tile_mode) && !PROSPER_ENV_VALUE("PROSPER_NODETILE");
+                            const bool snapshot_source = stage_linear_decoder_source(
+                                hlin, volume_texels * bpt, tiled);
                             if (tiled) {
                                 size_t tbytes = is_volume
                                     ? prosper::gpu::tiled_volume_bytes(tw, th, r.depth, r.tile_mode, bpt)
@@ -6537,7 +6606,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             } else if (linear_padded_read) {
                                 hlin.zero_all();
                                 copy_linear_padded_rows(hlin.data(), (size_t)tw * bpt, th);
-                            } else {
+                            } else if (!snapshot_source) {
                                 hlin.zero_tail(copy_resource(hlin.data(), sampled_source_addr,
                                                              hlin.size()));
                             }
@@ -6545,7 +6614,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             // as the historical scalar loop, exhaustively checked over all binary16
                             // inputs by test_game_compute. Large dynamic textures convert in parallel.
                             sampled_float16_to_unorm8_range(
-                                hlin.data(), nc, volume_texels, texture_pixels.data());
+                                snapshot_source ? persistent_validation_scratch.data() : hlin.data(),
+                                nc, volume_texels, texture_pixels.data());
                             f16_done = true;   // read+detiled at the real element size already
                         } else if (native_r8_sampled) {
                             // Tight linear R8 needs neither detiling nor per-texel expansion. One guarded
@@ -6585,9 +6655,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             // resource instead receives the format-defined missing channels (R,0,0,1), after
                             // which the real T# DST_SEL is applied below. Its R component must be normalized
                             // from both bytes; selecting byte zero makes a smooth ramp a sawtooth (#1186).
-                            auto nlin = prosper::frontend::decode_scratch_pool().take(
-                                volume_texels * bpt);
+                            prosper::frontend::DecodeScratchPool::Lease nlin;
                             bool tiled = prosper::gpu::tile_mode_is_tiled(r.tile_mode) && !PROSPER_ENV_VALUE("PROSPER_NODETILE");
+                            const bool snapshot_source = stage_linear_decoder_source(
+                                nlin, volume_texels * bpt, tiled);
                             if (tiled) {
                                 size_t tbytes = is_volume
                                     ? prosper::gpu::tiled_volume_bytes(tw, th, r.depth, r.tile_mode, bpt)
@@ -6626,24 +6697,26 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             } else if (linear_padded_read) {
                                 nlin.zero_all();
                                 copy_linear_padded_rows(nlin.data(), (size_t)tw * bpt, th);
-                            } else {
+                            } else if (!snapshot_source) {
                                 nlin.zero_tail(copy_resource(nlin.data(), sampled_source_addr,
                                                              nlin.size()));
                             }
+                            const uint8_t* narrow_source = snapshot_source
+                                ? persistent_validation_scratch.data() : nlin.data();
                             const bool unorm16 = r.format == prosper::gpu::DataFormat::Unorm16;
                             for (size_t t = 0; t < volume_texels; t++) {
                                 uint8_t* p = &texture_pixels[t * 4];
                                 if (avplayer_chroma_layout) {
-                                    const uint8_t* source = &nlin[t * bpt];
+                                    const uint8_t* source = &narrow_source[t * bpt];
                                     p[0] = source[0];
                                     p[1] = source[1];
                                     p[2] = r.num_components > 2 ? source[2] : 0;
                                     p[3] = 255;
                                 } else {
-                                    uint8_t v = nlin[t * bpt]; // first (coverage) channel
+                                    uint8_t v = narrow_source[t * bpt]; // first (coverage) channel
                                     if (unorm16) {
                                         uint16_t raw;
-                                        std::memcpy(&raw, &nlin[t * bpt], sizeof(raw));
+                                        std::memcpy(&raw, &narrow_source[t * bpt], sizeof(raw));
                                         v = prosper::gpu::unorm16_to_unorm8(raw);
                                         p[0] = v; p[1] = p[2] = 0; p[3] = 255;
                                     } else {
@@ -7052,13 +7125,36 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         // #1272: see the reuse path — plain 2D guest textures only.
                         if (!is_volume && !cube_done)
                             fr.declared_mip_levels = r.declared_mip_levels;
-                        if (persistent_cache_eligible && !fr.gpu_detile) {
+                        // Failed/mismatched renderer readback must retry on the next use. Caching
+                        // its guest fallback under the renderer generation would freeze that fallback.
+                        const bool cube_cache_proven = !retained_depth_cube_cache_candidate ||
+                            renderer_cube_snapshot_ready;
+                        if (!cube_cache_proven) ++g_texture_decode_scope.cube_snapshot_refusals;
+                        if (persistent_cache_eligible && !fr.gpu_detile && cube_cache_proven) {
+                            DepthCubeSourceSnapshot cube_source_snapshot;
                             size_t source_prefix_size = linear_source_prefix_size;
                             if (!persistent_source_matches_pixels && persistent_source_size) {
-                                persistent_validation_scratch.resize(persistent_source_size);
-                                source_prefix_size = copy_persistent_source(
-                                    persistent_validation_scratch.data(),
-                                    persistent_source_size);
+                                if (renderer_cube_snapshot_ready) {
+                                    size_t read_bytes = 0;
+                                    source_prefix_size = capture_depth_cube_source(
+                                        depth_cube_source_layout, retained_depth_cube.present_mask,
+                                        PROSPER_ENV_ON("PROSPER_NO_CUBE_SOURCE_SNAPSHOT_PRUNING"),
+                                        persistent_validation_scratch, cube_source_snapshot,
+                                        copy_resource, read_bytes);
+                                    g_texture_decode_scope.late_snapshot_read_bytes += read_bytes;
+                                    g_texture_decode_scope.cube_snapshot_guest_bytes += source_prefix_size;
+                                    for (unsigned face = 0; face < 6; ++face)
+                                        if (retained_depth_cube.present_mask & (1u << face))
+                                            g_texture_decode_scope.cube_snapshot_renderer_bytes +=
+                                                depth_cube_source_layout.face_bytes;
+                                } else if (decoder_source_snapshot_ready) {
+                                    source_prefix_size = decoder_source_prefix_size;
+                                } else {
+                                    persistent_validation_scratch.resize(persistent_source_size);
+                                    source_prefix_size = copy_persistent_source(
+                                        persistent_validation_scratch.data(), persistent_source_size);
+                                    g_texture_decode_scope.late_snapshot_read_bytes += source_prefix_size;
+                                }
                             }
                             auto old = persistent_decoded_textures.find(decode_key);
                             // PROSPER_NO_TEXTURE_PREFIX_INHERIT prevents reusing the outgoing
@@ -7146,6 +7242,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 cached.source_addr = persistent_source_addr;
                                 cached.source_size = persistent_source_size;
                                 cached.source_prefix_size = source_prefix_size;
+                                cached.depth_cube_source = cube_source_snapshot;
                                 cached.source_matches_pixels = persistent_source_matches_pixels;
                                 if (!persistent_source_matches_pixels) {
                                     static const bool transfer_source_snapshot =
@@ -7206,7 +7303,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 decoded_pixels_in_texstore = false;
                             }
                         }
-                        if (!resource_rtt_hit && !resource_compute_image_hit && !has_live_rtt) {
+                        if (cube_cache_proven && !resource_rtt_hit && !resource_compute_image_hit && !has_live_rtt) {
                             const bool pin_scratch =
                                 decoded_pixels_in_texstore && cross_span_source_size != 0;
                             const size_t pinned_slot = pin_scratch ? texture_slot : SIZE_MAX;
@@ -11602,12 +11699,21 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     fprintf(stderr,
                             "[render-timing] texture_preparation cumulative_this_thread "
                             "dcc_reads=%llu dcc_bytes=%llu compute_span_queries=%llu "
-                            "generic_copy_bytes=%llu generic_copy_deferrals=%llu\n",
+                            "generic_copy_bytes=%llu generic_copy_deferrals=%llu "
+                            "decoder_snapshot_candidate_bytes=%llu decoder_snapshot_reused_bytes=%llu "
+                            "late_snapshot_read_bytes=%llu cube_snapshot_guest_bytes=%llu "
+                            "cube_snapshot_renderer_bytes=%llu cube_snapshot_refusals=%llu\n",
                             (unsigned long long)g_texture_decode_scope.dcc_metadata_read_attempts,
                             (unsigned long long)g_texture_decode_scope.dcc_metadata_read_bytes,
                             (unsigned long long)g_texture_decode_scope.compute_import_span_queries,
                             (unsigned long long)g_texture_decode_scope.generic_source_copied_bytes,
-                            (unsigned long long)g_texture_decode_scope.generic_source_copy_deferrals);
+                            (unsigned long long)g_texture_decode_scope.generic_source_copy_deferrals,
+                            (unsigned long long)g_texture_decode_scope.decoder_snapshot_candidate_bytes,
+                            (unsigned long long)g_texture_decode_scope.decoder_snapshot_reused_bytes,
+                            (unsigned long long)g_texture_decode_scope.late_snapshot_read_bytes,
+                            (unsigned long long)g_texture_decode_scope.cube_snapshot_guest_bytes,
+                            (unsigned long long)g_texture_decode_scope.cube_snapshot_renderer_bytes,
+                            (unsigned long long)g_texture_decode_scope.cube_snapshot_refusals);
                     size_t rtt_bytes = 0;
                     for (const auto& [addr, surface] : g_rtt) {
                         (void)addr;
