@@ -32,6 +32,7 @@ int main() { return 0; }
 
 #include <cstdint>
 #include <cstdio>
+#include <vector>
 #include <cstdlib>
 #include <cstring>
 #include <sys/mman.h>
@@ -313,6 +314,70 @@ int main() {
             }
             close(wide_fd);
         }
+    }
+
+    // ------------------------------------------- #3681: the index must REDUCE WORK, not just agree
+    {
+        // Every other case here proves the index returns the same ANSWERS as a full scan. None of
+        // them would notice if the index silently stopped narrowing -- a bucketing mistake that fell
+        // back to considering every registration would keep all of them green while giving back the
+        // whole saving. That is the failure this case exists to catch, and it is why #3681 asks for a
+        // "removed-index negative control" rather than more correctness arms.
+        //
+        // The control is the shipped fallback itself: PROSPER_WATCH_LEGACY_SCAN forces the complete
+        // scan, and CMake registers a third arm that sets it. Same assertions about dirty tracking in
+        // both arms; opposite assertions about how much was visited.
+        const bool legacy = std::getenv("PROSPER_WATCH_LEGACY_SCAN") != nullptr;
+        constexpr uint64_t kRegistrations = 64;
+        const uint64_t slice = span / kRegistrations;          // 128 KiB each, across four 2 MiB chunks
+        std::vector<GuestWriteWatch> watches;
+        watches.reserve(kRegistrations);
+        for (uint64_t i = 0; i < kRegistrations; ++i)
+            watches.push_back(GuestWriteWatch::create(reinterpret_cast<uint64_t>(a) + i * slice, slice));
+        bool all_created = true, all_clean = true;
+        for (const auto& watch : watches) all_created = all_created && static_cast<bool>(watch);
+        CHECK(all_created, "64 registrations created for the work-reduction control");
+        for (auto& watch : watches)
+            all_clean = all_clean && watch.query() == GuestWriteWatchQuery::Unchanged;
+        CHECK(all_clean, "all 64 registrations start clean");
+
+        // One 4 KiB GPU write, entirely inside registration 40 -- deliberately not the first, so an
+        // index that only ever buckets the start of the mapping cannot pass by accident.
+        constexpr uint64_t kTarget = 40;
+        const auto before = guest_write_watch_stats();
+        guest_write_watch_notify_gpu_write(reinterpret_cast<uint64_t>(a) + kTarget * slice + 4096, 4096);
+        const auto after = guest_write_watch_stats();
+        const uint64_t visited =
+            after.gpu_write_registrations_visited - before.gpu_write_registrations_visited;
+        const uint64_t overlaps = after.gpu_write_overlaps - before.gpu_write_overlaps;
+
+        // Identical in BOTH arms: narrowing may not change which registration the write dirties.
+        CHECK(overlaps == 1, "exactly one registration overlaps a write inside one slice");
+        CHECK(watches[kTarget].query() == GuestWriteWatchQuery::Dirty,
+              "the registration containing the GPU write is dirty");
+        bool neighbours_clean = true;
+        for (uint64_t i = 0; i < kRegistrations; ++i) {
+            if (i == kTarget) continue;
+            neighbours_clean = neighbours_clean &&
+                               watches[i].query() == GuestWriteWatchQuery::Unchanged;
+        }
+        CHECK(neighbours_clean, "no other registration was dirtied -- narrowing did not lose coverage");
+
+        // Opposite in the two arms, and this is the whole point of the case.
+        if (legacy) {
+            CHECK(visited >= kRegistrations,
+                  "legacy arm: the complete scan really does visit every registration");
+        } else {
+            // Four 2 MiB chunks over 64 registrations puts ~16 in the written chunk, so half is a
+            // wide margin rather than a tuned threshold -- it discriminates without being brittle if
+            // the chunk size changes.
+            CHECK(visited <= kRegistrations / 2,
+                  "index arm: a narrow write visits far fewer than every registration");
+        }
+        std::fprintf(stderr, "work-reduction arm: legacy=%d visited=%llu of %llu registrations\n",
+                     legacy ? 1 : 0, (unsigned long long)visited,
+                     (unsigned long long)kRegistrations);
+        for (auto& watch : watches) watch.reset();
     }
 
     // -------------------------------------------------------- the audit's own positive control
