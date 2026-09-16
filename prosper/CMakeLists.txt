@@ -2315,6 +2315,16 @@ endif()
              COMMAND ${CMAKE_COMMAND} -E env --unset=PROSPER_WATCH_LEGACY_SCAN
                      PROSPER_WATCH_QUERY_AUDIT=1
                      $<TARGET_FILE:test_guest_write_watch_index>)
+    # Third arm (#3681): the complete scan the index replaced. Until this existed the fallback had no
+    # coverage at all -- both arms above UNSET the switch -- and, more importantly, nothing anywhere
+    # asserted that the index REDUCES work. Every correctness case passes just as well against a
+    # full scan, so an index that silently stopped narrowing would have given back the entire saving
+    # while leaving the suite green. This arm is the negative control: identical dirty-tracking
+    # assertions, opposite assertions about registrations visited.
+    add_test(NAME guest_write_watch_index_legacy_scan
+             COMMAND ${CMAKE_COMMAND} -E env --unset=PROSPER_WATCH_QUERY_AUDIT
+                     PROSPER_WATCH_LEGACY_SCAN=1
+                     $<TARGET_FILE:test_guest_write_watch_index>)
   endif()
   if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_executable(test_dmem_write_trace tests/host/memory/test_dmem_write_trace.cpp)
