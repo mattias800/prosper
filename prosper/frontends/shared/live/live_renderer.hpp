@@ -87,6 +87,11 @@ struct TextureDecodeScopeStats {
     // Encoded source bytes handed to admitted persistent entries; excludes guest reads.
     uint64_t source_snapshot_copied_bytes = 0;
     uint64_t source_snapshot_transferred_bytes = 0;
+    // Requested exact linear decoder footprints, reused readable prefixes, and remaining
+    // post-decode snapshot reads. Logical bytes, not physical memory-bandwidth measurements.
+    uint64_t decoder_snapshot_candidate_bytes = 0;
+    uint64_t decoder_snapshot_reused_bytes = 0;
+    uint64_t late_snapshot_read_bytes = 0;
     // Actual preparation work, including work whose result is later discarded. These counters
     // constrain admission ordering without relying on elapsed time or unchanged output pixels.
     uint64_t dcc_metadata_read_attempts = 0;

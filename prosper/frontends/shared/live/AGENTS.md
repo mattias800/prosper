@@ -97,6 +97,19 @@ the arena never enters submission cleanup callbacks. `PROSPER_NO_BUFFER_LOOKUP_A
 direct PMR heap allocation; unsupported PMR deployment targets retain ordinary standard maps.
 Allocation observations count upstream heap requests/bytes, not nodes or GPU buffer traffic.
 
+## Encoded decoder snapshots
+
+Ordinary tight linear BC, Float32, Float16 and narrow sampled textures can decode directly from
+owned validation scratch when its address and complete encoded footprint match the persistent
+cache source. The source watch is armed before that read. The decoder sees zero-filled short tails,
+but the cache retains only the readable prefix through its existing capacity-aware admission.
+Repacked rows, tiled inputs, arrays, cubes, volumes, mip tails and DCC metadata retain their separate
+snapshot reads. Fully readable tiled inputs already use direct guest spans; they do not own a
+staging allocation to transfer. `PROSPER_NO_DECODE_SOURCE_SNAPSHOT_REUSE=1` restores the duplicate
+linear read. The texture-preparation counters report requested candidate bytes, reused readable
+prefixes and remaining late snapshot reads, cumulatively per thread, not physical bandwidth or an
+F8 rate-window total.
+
 ## The boundary that is easy to get wrong
 
 The compute backend is where *guest memory* and *device memory* meet twice per dispatch — an upload

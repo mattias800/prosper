@@ -5353,6 +5353,40 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         size_t nb = volume_texels * output_bpp *
                             (is_cube ? 6u : (is_array ? decoded_layers : 1u));
                         size_t linear_source_prefix_size = 0;
+                        bool decoder_source_snapshot_ready = false;
+                        size_t decoder_source_prefix_size = 0;
+                        // Only an exact encoded footprint can serve both the decoder and validation.
+                        // Repacked rows, detiled bytes and metadata are different source domains.
+                        // The source watch has already been armed above, before this authoritative read.
+                        auto stage_linear_decoder_source = [&](
+                            prosper::frontend::DecodeScratchPool::Lease& lease,
+                            size_t bytes, bool tiled) {
+                            const bool candidate = !tiled && !linear_padded_read &&
+                                !is_cube && !is_array && !is_volume && !r.in_mip_tail &&
+                                persistent_cache_eligible && !persistent_source_matches_pixels &&
+                                !persistent_dcc_fast_clear &&
+                                persistent_source_addr == sampled_source_addr &&
+                                bytes != 0 && bytes == persistent_source_size;
+                            if (candidate)
+                                g_texture_decode_scope.decoder_snapshot_candidate_bytes += bytes;
+                            if (candidate &&
+                                !PROSPER_ENV_ON("PROSPER_NO_DECODE_SOURCE_SNAPSHOT_REUSE")) {
+                                persistent_validation_scratch.resize(bytes);
+                                decoder_source_prefix_size = copy_resource(
+                                    persistent_validation_scratch.data(), sampled_source_addr, bytes);
+                                // The decoder consumes zeros beyond the readable prefix, but the
+                                // persistent entry must retain only the bytes actually read.
+                                std::fill(persistent_validation_scratch.begin() +
+                                              decoder_source_prefix_size,
+                                          persistent_validation_scratch.end(), 0);
+                                decoder_source_snapshot_ready = true;
+                                g_texture_decode_scope.decoder_snapshot_reused_bytes +=
+                                    decoder_source_prefix_size;
+                                return true;
+                            }
+                            lease = prosper::frontend::decode_scratch_pool().take(bytes);
+                            return false;
+                        };
                         bool generic_source_copy_deferred = false;
                         ++g_texture_decode_scope.decodes;
                         const size_t texture_slot = acquire_texstore_slot();
@@ -6395,8 +6429,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             // micro-tile geometry from the block size (bpe) internally (#119) — 16-byte
                             // blocks -> 16x16, 8-byte -> 32x16 — so no tile_side is passed here.
                             size_t comp_bytes = (size_t)bw * bh * bcb;
-                            auto lin = prosper::frontend::decode_scratch_pool().take(comp_bytes);
+                            prosper::frontend::DecodeScratchPool::Lease lin;
                             bool tiled = prosper::gpu::tile_mode_is_tiled(r.tile_mode) && !PROSPER_ENV_VALUE("PROSPER_NODETILE");
+                            const bool snapshot_source = stage_linear_decoder_source(
+                                lin, comp_bytes, tiled);
                             if (tiled) {
                                 size_t tbytes = prosper::gpu::tiled_elements_bytes(bw, bh, bcb, r.tile_mode);
                                 prosper::frontend::DecodeScratchPool::Lease traw_lease;
@@ -6422,12 +6458,14 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 lin.zero_all();
                                 copy_linear_padded_rows(
                                     lin.data(), static_cast<size_t>(bw) * bcb, bh);
-                            } else {
+                            } else if (!snapshot_source) {
                                 lin.zero_tail(copy_resource(
                                     lin.data(), sampled_source_addr, comp_bytes));
                             }
                             if (!prosper::gpu::bc_decode_surface(
-                                    texture_pixels.data(), lin.data(), lin.size(), tw, th, r.format))
+                                    texture_pixels.data(), snapshot_source ? persistent_validation_scratch.data()
+                                                                          : lin.data(),
+                                    comp_bytes, tw, th, r.format))
                                 std::fill(texture_pixels.begin(), texture_pixels.end(), 0);
                         } else if (f32) {
                             // Sampled Float32 resources cannot be reinterpreted as RGBA8: a value such as
@@ -6438,10 +6476,11 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             // Power-of-two component counts keep the source texel size compatible with the
                             // supported GFX10 surface detilers (4/8/16 B per texel).
                             const uint32_t nc = bpt / 4;
-                            auto flin = prosper::frontend::decode_scratch_pool().take(
-                                volume_texels * bpt);
+                            prosper::frontend::DecodeScratchPool::Lease flin;
                             const bool tiled = prosper::gpu::tile_mode_is_tiled(r.tile_mode) &&
                                 !PROSPER_ENV_VALUE("PROSPER_NODETILE");
+                            const bool snapshot_source = stage_linear_decoder_source(
+                                flin, volume_texels * bpt, tiled);
                             if (tiled) {
                                 const size_t tbytes = is_volume
                                     ? prosper::gpu::tiled_volume_bytes(
@@ -6475,7 +6514,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             } else if (linear_padded_read) {
                                 flin.zero_all();
                                 copy_linear_padded_rows(flin.data(), (size_t)tw * bpt, th);
-                            } else {
+                            } else if (!snapshot_source) {
                                 flin.zero_tail(copy_resource(
                                     flin.data(), sampled_source_addr, flin.size()));
                             }
@@ -6486,7 +6525,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             // to the narrower component counts; it keeps the same (0,0,0,1) fill and
                             // the same bit-for-bit rounding/NaN-payload contract.
                             prosper::frontend::pack_float32_to_rgba16f_range(
-                                flin.data(), nc, bpt, volume_texels, texture_pixels.data());
+                                snapshot_source ? persistent_validation_scratch.data() : flin.data(),
+                                nc, bpt, volume_texels, texture_pixels.data());
                             f32_done = true;
                         } else if (f16) {
                             // fp16 texture (#290 wall 1): read at the REAL bytes-per-texel and detile
@@ -6504,9 +6544,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             // Pooled, so a 4K HDR intermediate does not mmap/fault/munmap 63 MiB per
                             // reference. It arrives holding the PREVIOUS surface, so every arm below
                             // either covers it completely or zeroes what it does not fill.
-                            auto hlin = prosper::frontend::decode_scratch_pool().take(
-                                volume_texels * bpt);
+                            prosper::frontend::DecodeScratchPool::Lease hlin;
                             bool tiled = prosper::gpu::tile_mode_is_tiled(r.tile_mode) && !PROSPER_ENV_VALUE("PROSPER_NODETILE");
+                            const bool snapshot_source = stage_linear_decoder_source(
+                                hlin, volume_texels * bpt, tiled);
                             if (tiled) {
                                 size_t tbytes = is_volume
                                     ? prosper::gpu::tiled_volume_bytes(tw, th, r.depth, r.tile_mode, bpt)
@@ -6537,7 +6578,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             } else if (linear_padded_read) {
                                 hlin.zero_all();
                                 copy_linear_padded_rows(hlin.data(), (size_t)tw * bpt, th);
-                            } else {
+                            } else if (!snapshot_source) {
                                 hlin.zero_tail(copy_resource(hlin.data(), sampled_source_addr,
                                                              hlin.size()));
                             }
@@ -6545,7 +6586,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             // as the historical scalar loop, exhaustively checked over all binary16
                             // inputs by test_game_compute. Large dynamic textures convert in parallel.
                             sampled_float16_to_unorm8_range(
-                                hlin.data(), nc, volume_texels, texture_pixels.data());
+                                snapshot_source ? persistent_validation_scratch.data() : hlin.data(),
+                                nc, volume_texels, texture_pixels.data());
                             f16_done = true;   // read+detiled at the real element size already
                         } else if (native_r8_sampled) {
                             // Tight linear R8 needs neither detiling nor per-texel expansion. One guarded
@@ -6585,9 +6627,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             // resource instead receives the format-defined missing channels (R,0,0,1), after
                             // which the real T# DST_SEL is applied below. Its R component must be normalized
                             // from both bytes; selecting byte zero makes a smooth ramp a sawtooth (#1186).
-                            auto nlin = prosper::frontend::decode_scratch_pool().take(
-                                volume_texels * bpt);
+                            prosper::frontend::DecodeScratchPool::Lease nlin;
                             bool tiled = prosper::gpu::tile_mode_is_tiled(r.tile_mode) && !PROSPER_ENV_VALUE("PROSPER_NODETILE");
+                            const bool snapshot_source = stage_linear_decoder_source(
+                                nlin, volume_texels * bpt, tiled);
                             if (tiled) {
                                 size_t tbytes = is_volume
                                     ? prosper::gpu::tiled_volume_bytes(tw, th, r.depth, r.tile_mode, bpt)
@@ -6626,24 +6669,26 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             } else if (linear_padded_read) {
                                 nlin.zero_all();
                                 copy_linear_padded_rows(nlin.data(), (size_t)tw * bpt, th);
-                            } else {
+                            } else if (!snapshot_source) {
                                 nlin.zero_tail(copy_resource(nlin.data(), sampled_source_addr,
                                                              nlin.size()));
                             }
+                            const uint8_t* narrow_source = snapshot_source
+                                ? persistent_validation_scratch.data() : nlin.data();
                             const bool unorm16 = r.format == prosper::gpu::DataFormat::Unorm16;
                             for (size_t t = 0; t < volume_texels; t++) {
                                 uint8_t* p = &texture_pixels[t * 4];
                                 if (avplayer_chroma_layout) {
-                                    const uint8_t* source = &nlin[t * bpt];
+                                    const uint8_t* source = &narrow_source[t * bpt];
                                     p[0] = source[0];
                                     p[1] = source[1];
                                     p[2] = r.num_components > 2 ? source[2] : 0;
                                     p[3] = 255;
                                 } else {
-                                    uint8_t v = nlin[t * bpt]; // first (coverage) channel
+                                    uint8_t v = narrow_source[t * bpt]; // first (coverage) channel
                                     if (unorm16) {
                                         uint16_t raw;
-                                        std::memcpy(&raw, &nlin[t * bpt], sizeof(raw));
+                                        std::memcpy(&raw, &narrow_source[t * bpt], sizeof(raw));
                                         v = prosper::gpu::unorm16_to_unorm8(raw);
                                         p[0] = v; p[1] = p[2] = 0; p[3] = 255;
                                     } else {
@@ -7055,10 +7100,14 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         if (persistent_cache_eligible && !fr.gpu_detile) {
                             size_t source_prefix_size = linear_source_prefix_size;
                             if (!persistent_source_matches_pixels && persistent_source_size) {
-                                persistent_validation_scratch.resize(persistent_source_size);
-                                source_prefix_size = copy_persistent_source(
-                                    persistent_validation_scratch.data(),
-                                    persistent_source_size);
+                                if (decoder_source_snapshot_ready) {
+                                    source_prefix_size = decoder_source_prefix_size;
+                                } else {
+                                    persistent_validation_scratch.resize(persistent_source_size);
+                                    source_prefix_size = copy_persistent_source(
+                                        persistent_validation_scratch.data(), persistent_source_size);
+                                    g_texture_decode_scope.late_snapshot_read_bytes += source_prefix_size;
+                                }
                             }
                             auto old = persistent_decoded_textures.find(decode_key);
                             // PROSPER_NO_TEXTURE_PREFIX_INHERIT prevents reusing the outgoing
@@ -11602,12 +11651,17 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     fprintf(stderr,
                             "[render-timing] texture_preparation cumulative_this_thread "
                             "dcc_reads=%llu dcc_bytes=%llu compute_span_queries=%llu "
-                            "generic_copy_bytes=%llu generic_copy_deferrals=%llu\n",
+                            "generic_copy_bytes=%llu generic_copy_deferrals=%llu "
+                            "decoder_snapshot_candidate_bytes=%llu decoder_snapshot_reused_bytes=%llu "
+                            "late_snapshot_read_bytes=%llu\n",
                             (unsigned long long)g_texture_decode_scope.dcc_metadata_read_attempts,
                             (unsigned long long)g_texture_decode_scope.dcc_metadata_read_bytes,
                             (unsigned long long)g_texture_decode_scope.compute_import_span_queries,
                             (unsigned long long)g_texture_decode_scope.generic_source_copied_bytes,
-                            (unsigned long long)g_texture_decode_scope.generic_source_copy_deferrals);
+                            (unsigned long long)g_texture_decode_scope.generic_source_copy_deferrals,
+                            (unsigned long long)g_texture_decode_scope.decoder_snapshot_candidate_bytes,
+                            (unsigned long long)g_texture_decode_scope.decoder_snapshot_reused_bytes,
+                            (unsigned long long)g_texture_decode_scope.late_snapshot_read_bytes);
                     size_t rtt_bytes = 0;
                     for (const auto& [addr, surface] : g_rtt) {
                         (void)addr;

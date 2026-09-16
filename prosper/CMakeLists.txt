@@ -3156,6 +3156,18 @@ endif()
       # Capture -> serialize -> owned replay backing -> SAME live renderer -> pixels. This specifically
       # proves replay textures do not dereference the captured guest VA and still sample exact bytes.
       add_executable(test_gpu_capture_render tests/misc/test_gpu_capture_render.cpp)
+      add_executable(test_decoder_source_snapshot tests/shared/live/test_decoder_source_snapshot.cpp)
+      target_include_directories(test_decoder_source_snapshot PRIVATE frontends src tests)
+      target_link_libraries(test_decoder_source_snapshot PRIVATE prosper_core prosper_live_renderer Vulkan::Vulkan)
+      add_test(NAME decoder_source_snapshot COMMAND test_decoder_source_snapshot)
+      add_test(NAME decoder_source_snapshot_control COMMAND test_decoder_source_snapshot --control)
+      set_tests_properties(decoder_source_snapshot_control PROPERTIES
+        ENVIRONMENT "PROSPER_NO_DECODE_SOURCE_SNAPSHOT_REUSE=1")
+      if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_test(NAME decoder_source_snapshot_watch COMMAND test_decoder_source_snapshot --watch)
+        set_tests_properties(decoder_source_snapshot_watch PROPERTIES
+          ENVIRONMENT "PROSPER_TEXTURE_WRITE_WATCH_MIN_KB=1")
+      endif()
       add_executable(test_texture_preparation tests/shared/live/test_texture_preparation.cpp)
       target_include_directories(test_texture_preparation PRIVATE frontends src tests)
       target_link_libraries(test_texture_preparation PRIVATE prosper_core prosper_live_renderer Vulkan::Vulkan)
