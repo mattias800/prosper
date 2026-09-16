@@ -227,6 +227,28 @@ def _gpu_present_adopted(post):
     return None             # adopted then lost, or never coherent: say so rather than guess
 
 
+def _counter_delta(samples, field):
+    """The integer event count behind a rate, or None when it cannot be formed.
+
+    Rates in this report are small -- single-digit events per second -- so one event is a large
+    fraction of the numerator and two captures can differ by a single event while their rates look
+    meaningfully apart. #3678 measured exactly that: 36 events against 35 presented as 7.16884 and
+    7.34651 per second, a gap smaller than one event's contribution to either. Printing the
+    numerator beside the rate makes that resolution visible instead of leaving a reader to infer
+    precision the measurement does not have.
+    """
+    if len(samples) < 2:
+        return None
+    first = samples[0].get(field)
+    last = samples[-1].get(field)
+    if first is None or last is None or last < first:
+        # Same guard `_counter_rate` applies: these are monotonic counters, so a decrease means the
+        # samples are not a usable pair (a reset, or records out of order). Reporting "-4 events"
+        # beside a rate of "unavailable" would be worse than reporting nothing.
+        return None
+    return last - first
+
+
 def _counter_rate(samples, field, seconds):
     if len(samples) < 2 or seconds <= 0:
         return None
@@ -636,10 +658,61 @@ def summarize(records):
     seconds = None
     if len(post) >= 2 and post[-1].get("t_ns", 0) > post[0].get("t_ns", 0):
         seconds = (post[-1]["t_ns"] - post[0]["t_ns"]) / 1e9
+
+    # TWO DISTINCT OBSERVATION SPANS, and conflating them is what #3678 is about. `seconds` above is
+    # the counter-rate window: first to last post sample. The renderer/compute detail records below
+    # are a DIFFERENT population -- runtime recording is admitted while a capture is pending and is
+    # never clipped to those sample endpoints -- so dividing a detail sum by `seconds` mixes
+    # boundaries and produces a throughput that looks reliable and is not.
+    #
+    # A caveat that must travel with these timestamps: `t_ns` is stamped when the record reaches the
+    # capture (`performance_capture.cpp` sets `monotonic_ns` at record time), so it is a COMPLETION
+    # time. A record completing inside the window may have begun before it, and asynchronous GPU work
+    # it accounts for may have run earlier still. So "records inside the window" bounds which records
+    # are counted; it does NOT prove the whole CPU/GPU interval each one measures lies inside.
+    detail_records = renderer + compute
+    detail_times = sorted(record["t_ns"] for record in detail_records
+                          if record.get("t_ns") is not None)
+    detail_seconds = None
+    if len(detail_times) >= 2 and detail_times[-1] > detail_times[0]:
+        detail_seconds = (detail_times[-1] - detail_times[0]) / 1e9
+    # Several distinct states all leave `detail_seconds` unset, and they are NOT the same fact. An
+    # earlier revision printed "records carry no usable timestamps" for every one of them, which is
+    # false for the commonest -- a capture that retained no detail records at all, which is exactly
+    # what F8 on a hung title produces. Stating a plausible cause instead of the real one is the same
+    # defect this whole change is about, one level up.
+    if not detail_records:
+        detail_status = "no renderer or compute records were retained"
+    elif not detail_times:
+        detail_status = "records carry no timestamps"
+    elif len(detail_times) < len(detail_records):
+        detail_status = (f"only {len(detail_times)} of {len(detail_records)} records carry "
+                         "timestamps")
+    elif detail_seconds is None:
+        detail_status = (f"all {len(detail_times)} record(s) share one timestamp, so they span no "
+                         "measurable interval")
+    else:
+        detail_status = None
+    detail_outside = None
+    windowed_renderer, windowed_compute = renderer, compute
+    if post and detail_times and len(detail_times) == len(detail_records):
+        low, high = post[0].get("t_ns", 0), post[-1].get("t_ns", 0)
+        detail_outside = sum(1 for value in detail_times if value < low or value > high)
+        # One comparable cohort for any ratio against the sampled window: records that COMPLETED
+        # inside it. When nothing falls outside, this is the whole population and nothing changes.
+        windowed_renderer = [record for record in renderer
+                             if record.get("t_ns") is not None and low <= record["t_ns"] <= high]
+        windowed_compute = [record for record in compute
+                            if record.get("t_ns") is not None and low <= record["t_ns"] <= high]
     cpu_cores = _counter_rate(post, "process_cpu_ns", seconds or 0) if seconds else None
     if cpu_cores is not None:
         cpu_cores /= 1e9
 
+    rate_events = {
+        "guest_fps": _counter_delta(post, "guest_presents"),
+        "rendered_fps": _counter_delta(post, "rendered_frames"),
+        "host_fps": _counter_delta(post, "host_presented_frames"),
+    }
     rates = {
         "guest_fps": _counter_rate(post, "guest_presents", seconds or 0) if seconds else None,
         "rendered_fps": _counter_rate(post, "rendered_frames", seconds or 0) if seconds else None,
@@ -692,16 +765,38 @@ def summarize(records):
     classification = "inconclusive"
     reason = "the capture does not contain enough post-trigger process and timing data"
     wall_ms = (seconds or 0) * 1000.0
+    # Coverage compares a detail SUM against the sampled WINDOW, so it may only use the cohort that
+    # completed inside that window. `measured_total` is the whole retained population and is the
+    # right numerator for component SHARES (which are ratios within one population) but the wrong
+    # one here. When no record falls outside, the two are identical and this changes nothing.
+    windowed_total = (_total(windowed_renderer, "total_ms") +
+                      _total(windowed_compute, "total_ms"))
+    # Unavailable rather than approximate: with no timestamps on the detail records there is no
+    # cohort to form, and a ratio across two populations is exactly the misleading number #3678
+    # reports. A verdict must not rest on it.
+    # `detail_outside` is set only when EVERY detail record carries a timestamp: a partially
+    # timestamped population cannot be partitioned, and claiming "every record completed inside the
+    # window" from a subset would be a false statement about the records with none.
+    coverage = (windowed_total / wall_ms) if (wall_ms and detail_outside is not None) else None
+    if coverage is None:
+        coverage_status = ("the capture has no post-sample window to measure against"
+                           if not wall_ms else
+                           f"the detail records cannot be aligned to it -- {detail_status}")
+    else:
+        coverage_status = None
+    # None rather than the unclipped total: publishing the whole population under a name that says
+    # "windowed" invites exactly the mix-up this change removes from the printed report.
+    windowed_total_ms = windowed_total if coverage is not None else None
     if measured_total > 0:
         largest, cost = max(classification_components.items(), key=lambda item: item[1])
         share = cost / measured_total
         if share >= CLASSIFICATION_EVIDENCE_SHARE:
             classification = largest
             reason = f"{largest} is the largest measured component ({cost:.1f} ms, {share:.0%})"
-        elif cpu_cores is not None and cpu_cores >= 0.80 and wall_ms and measured_total < wall_ms * 0.40:
+        elif cpu_cores is not None and cpu_cores >= 0.80 and coverage is not None and coverage < 0.40:
             classification = "cpu-outside-renderer"
-            reason = (f"the process used {cpu_cores:.2f} CPU cores while measured renderer/compute "
-                      f"work covered only {measured_total / wall_ms:.0%} of the sampled wall window")
+            reason = (f"the process used {cpu_cores:.2f} CPU cores while renderer/compute work "
+                      f"completing inside the sampled window covered only {coverage:.0%} of it")
         else:
             reason = ("measured work is split across components; no component reaches the "
                       f"{CLASSIFICATION_EVIDENCE_SHARE:.0%} evidence threshold")
@@ -783,6 +878,13 @@ def summarize(records):
         "title": header.get("title", ""),
         "revision": header.get("revision", "unknown"),
         "seconds": seconds,
+        "detail_seconds": detail_seconds,
+        "detail_outside": detail_outside,
+        "windowed_total_ms": windowed_total_ms,
+        "coverage": coverage,
+        "detail_status": detail_status,
+        "coverage_status": coverage_status,
+        "rate_events": rate_events,
         "cpu_cores": cpu_cores,
         "rss_min": min(rss) if rss else None,
         "rss_max": max(rss) if rss else None,
@@ -889,7 +991,23 @@ def print_summary(summary):
     if summary["seconds"] is None:
         print("post sample window: unavailable (fewer than two ordered samples)")
     else:
-        print(f"post sample window: {summary['seconds']:.2f} s")
+        print(f"post sample window: {summary['seconds']:.2f} s  (counter rates use THIS span)")
+    # Printed as its own line, never folded into the one above, because the whole defect in #3678 was
+    # a reader dividing a detail sum by the sample window as though they described one population.
+    if summary["detail_seconds"] is None:
+        print(f"detail record span: unavailable ({summary['detail_status']})")
+    else:
+        outside = summary["detail_outside"]
+        note = ""
+        if outside:
+            note = (f"; {outside} record(s) completed OUTSIDE the sample window, so detail sums and "
+                    "counter rates do not describe the same population")
+        elif outside == 0:
+            note = "; every record completed inside the sample window"
+        print(f"detail record span: {summary['detail_seconds']:.2f} s "
+              f"(renderer+compute completion times){note}")
+        print("  a record completing inside the window may have STARTED before it -- these bound "
+              "which records are counted, not the intervals they measure")
     cpu = summary["cpu_cores"]
     print("process CPU: " + ("unavailable" if cpu is None else f"{cpu:.2f} cores"))
     if summary["rss_min"] is None:
@@ -902,10 +1020,30 @@ def print_summary(summary):
         print(f"private/committed: {summary['private_min'] / 2**20:.1f}.."
               f"{summary['private_max'] / 2**20:.1f} MiB")
     rates = summary["rates"]
-    print(f"rates: guest flips={_fmt_rate(rates['guest_fps'])} "
-          f"rendered={_fmt_rate(rates['rendered_fps'])} host-presented={_fmt_rate(rates['host_fps'])}")
+    events = summary["rate_events"]
+    seconds = summary["seconds"]
+
+    def _rate_with_numerator(key):
+        # The numerator is the point: at these magnitudes a one-event difference moves the rate by
+        # more than most changes being measured, and a bare rate hides that.
+        text = _fmt_rate(rates[key])
+        count = events.get(key)
+        if count is None or seconds is None:
+            return text
+        return f"{text} ({count} over {seconds:.2f} s)"
+
+    print(f"rates: guest flips={_rate_with_numerator('guest_fps')} "
+          f"rendered={_rate_with_numerator('rendered_fps')} "
+          f"host-presented={_rate_with_numerator('host_fps')}")
     print(f"measured totals: graphics={summary['graphics_total_ms']:.1f} ms "
-          f"compute={summary['compute_total_ms']:.1f} ms")
+          f"compute={summary['compute_total_ms']:.1f} ms "
+          f"(ALL retained records, not clipped to the sample window)")
+    if summary["coverage"] is None:
+        print(f"window coverage: unavailable -- {summary['coverage_status']}, so no ratio between "
+              "them is meaningful")
+    else:
+        print(f"window coverage: {summary['windowed_total_ms']:.1f} ms of renderer+compute work "
+              f"completed inside the {summary['seconds']:.2f} s window ({summary['coverage']:.0%})")
     _print_compute_phases(summary)
     programs = summary["compute_programs"]
     print(f"compute identities: groups={programs['group_count']} "
