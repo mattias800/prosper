@@ -5,6 +5,7 @@
 #include "gpu/pm4/pm4_registers.hpp"
 #include "gpu/texture/tile.hpp"
 #include "gpu/state/vk_translate.hpp"
+#include "diagnostics/env_cache.hpp"   // cached PROSPER_* gates on per-draw/per-resource paths
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -342,7 +343,7 @@ RenderState extract_render_state(const GpuState& st) {
     // Diagnostic (PROSPER_MSAA_LOG): report MSAA sample/fragment programming and the CB color mode so we
     // can tell whether a title uses MSAA + hardware resolve (CB_COLOR_CONTROL.MODE=3), which prosper renders
     // single-sample and does not yet resolve. Gated; no default behavior change.
-    if (getenv("PROSPER_MSAA_LOG")) {
+    if (PROSPER_ENV_ON("PROSPER_MSAA_LOG")) {
         const uint32_t cattr    = st.cx.count(P::CB_COLOR0_ATTRIB)   ? rd(st.cx, P::CB_COLOR0_ATTRIB)   : 0u;
         const uint32_t aacfg    = st.cx.count(P::PA_SC_AA_CONFIG)    ? rd(st.cx, P::PA_SC_AA_CONFIG)    : 0u;
         const uint32_t modecntl = st.cx.count(P::PA_SC_MODE_CNTL_0)  ? rd(st.cx, P::PA_SC_MODE_CNTL_0)  : 0u;
@@ -615,7 +616,7 @@ RenderState extract_render_state(const GpuState& st) {
     // PROSPER_STENCILLOG (gated, off by default): the guest's RAW depth/stencil register dwords per
     // stencil-enabled draw — ground truth for compare/op decode questions (the translated fields
     // above can be audited against exactly what the title programmed). Dedup on change.
-    if (rs.stencil_enable && getenv("PROSPER_STENCILLOG")) {
+    if (rs.stencil_enable && PROSPER_ENV_ON("PROSPER_STENCILLOG")) {
         static thread_local uint32_t last_dc, last_sc, last_rm, last_rmb, last_prim = 0xFFFFFFFFu;
         if (dc != last_dc || rs.db_stencil_control != last_sc ||
             rs.db_stencilrefmask != last_rm || rs.db_stencilrefmask_bf != last_rmb ||

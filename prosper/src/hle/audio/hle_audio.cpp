@@ -2034,7 +2034,7 @@ HLE(audio2_port_set_attr) {
                 if (pcm && audio_flow()) ++g_flow_pcm_published;
                 layout_note_pcm_ptr(port_slot, pcm);
             }
-            if (getenv("PROSPER_AUDIO2_PROBE")) {
+            if (PROSPER_ENV_ON("PROSPER_AUDIO2_PROBE")) {
                 // Keep probe history per AudioOut2 port. Object-heavy titles routinely create
                 // more than 16 ports; aliasing this table made their alternating grain buffers
                 // look like a state change on every SetAttributes call and flooded the log.
@@ -2051,7 +2051,7 @@ HLE(audio2_port_set_attr) {
                     }
                 }
             }
-        } else if (audio2log() || getenv("PROSPER_AUDIO2_PROBE")) {
+        } else if (audio2log() || PROSPER_ENV_ON("PROSPER_AUDIO2_PROBE")) {
             static std::set<uint64_t> seen;
             if (seen.insert(at.id).second) {
                 uint8_t value[16]{};
@@ -2139,7 +2139,7 @@ HLE(audio2_ctx_push) {
         if (!c) return kA2ErrInvalidParam;
         grain = (c->grain >= 64 && c->grain <= 4096) ? c->grain : 256;
         std::memset(bed.data(), 0, sizeof(float) * grain * 2);
-        const bool probe = getenv("PROSPER_AUDIO2_PROBE") != nullptr;
+        const bool probe = PROSPER_ENV_ON("PROSPER_AUDIO2_PROBE");
         const bool flow = audio_flow();
         const bool layout = audio_layout();
         uint32_t object_ports_with_pcm = 0;
@@ -2523,7 +2523,7 @@ HLE(audio2_speaker_array_create) {
     // Signature: (SpeakerArrayHandle* out, const void* vbap_params, const void* ambi_params).
     // The work-memory and speaker geometry live in those parameter objects; this backend only needs
     // an opaque identity because it computes deterministic stereo coefficients below.
-    if (getenv("PROSPER_AUDIO2_PROBE")) {
+    if (PROSPER_ENV_ON("PROSPER_AUDIO2_PROBE")) {
         fprintf(stderr, "[audio2-speaker] create out=0x%llx vbap=0x%llx ambi=0x%llx\n",
                 (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2);
         const uint64_t params[2] = {a1, a2};
@@ -2564,7 +2564,7 @@ HLE(audio2_get_speaker_array_coefficients) {
     const uint64_t coefficients = a1;
     const uint32_t count = (uint32_t)a2;
     const uint8_t height_aware = (uint8_t)a3;
-    if (getenv("PROSPER_AUDIO2_PROBE")) {
+    if (PROSPER_ENV_ON("PROSPER_AUDIO2_PROBE")) {
         static std::atomic<uint32_t> calls{0};
         const uint32_t call = calls.fetch_add(1);
         if (call < 64)
@@ -2586,7 +2586,7 @@ HLE(audio2_get_speaker_array_coefficients) {
 }
 
 HLE(audio2_get_speaker_array_ambisonics_coefficients) {
-    if (getenv("PROSPER_AUDIO2_PROBE")) {
+    if (PROSPER_ENV_ON("PROSPER_AUDIO2_PROBE")) {
         static std::atomic<uint32_t> calls{0};
         const uint32_t call = calls.fetch_add(1);
         if (call < 64)

@@ -6,6 +6,7 @@
 #include "gpu/diagnostics/diag_ratelimit.hpp"   // #1761: single-sourced ordinal + sparse-tail rule for capped logs
 #include "gpu/execute/mb3_freelist.hpp"
 #include "diagnostics/env_numeric.hpp"   // #3267: a typo must not switch a default-ON guard off
+#include "diagnostics/env_cache.hpp"   // cached PROSPER_* gates on per-draw/per-resource paths
 #include "gpu/pm4/pm4_registers.hpp"
 #include "gpu/capture/writer_provenance.hpp"
 #include "hle/sync/sync_futex.hpp"   // wake_label_waiters (shared with sceKernelWaitOnAddress's futex)
@@ -185,7 +186,7 @@ static void wake_on_label(uint64_t addr) { wake_label_waiters(addr); }
 // because our CommandProcessor folds each submit synchronously, the pipe has "drained" by the time we
 // apply a packet, so this IS the end-of-pipe moment. Set PROSPER_NO_EOP_WRITE=1 to suppress the writes.
 static bool eop_writes_disabled() {
-    const char* off = getenv("PROSPER_NO_EOP_WRITE");
+    const char* off = PROSPER_ENV_VALUE("PROSPER_NO_EOP_WRITE");
     return off && off[0] == '1';
 }
 
@@ -4307,7 +4308,7 @@ void GpuState::apply(const Pm4Command& c) {
             auto* regs = reinterpret_cast<const ShaderReg*>(static_cast<uintptr_t>(c.regs_vaddr));
             auto& file = (c.reg_class == RegClass::Cx) ? cx
                        : (c.reg_class == RegClass::Sh) ? sh : uc;
-            if (getenv("PROSPER_RESDUMP")) {
+            if (PROSPER_ENV_ON("PROSPER_RESDUMP")) {
                 const char* cn = c.reg_class == RegClass::Cx ? "Cx" : c.reg_class == RegClass::Sh ? "Sh" : "Uc";
                 fprintf(stderr, "[regindir] class=%s num=%u vaddr=0x%llx pairs:", cn, c.num_regs,
                         (unsigned long long)c.regs_vaddr);
@@ -4485,7 +4486,7 @@ void GpuState::apply(const Pm4Command& c) {
             // uploads a whole user-data SGPR block, while the direct APIs emit one Cx/Sh/Uc pair.
             auto& file = (c.reg_class == RegClass::Cx) ? cx
                        : (c.reg_class == RegClass::Sh) ? sh : uc;
-            if (getenv("PROSPER_RESDUMP")) {
+            if (PROSPER_ENV_ON("PROSPER_RESDUMP")) {
                 const char* cn = c.reg_class == RegClass::Cx ? "Cx" : c.reg_class == RegClass::Sh ? "Sh" : "Uc";
                 fprintf(stderr, "[regdirect] class=%s off=0x%x count=%u vals:", cn, c.reg_offset,
                         c.reg_data ? c.reg_count : 1u);
@@ -4623,7 +4624,7 @@ void GpuState::apply(const Pm4Command& c) {
             // Gen5 indexed draw (issue #232). Uses the bound index base + count; DrawIndexOffset's own
             // count (c.index_count) overrides the SetIndexCount state when non-zero. The element size is
             // the current SetIndexType (0=16-bit, 1=32-bit), captured in the per-draw snapshot.
-            if (getenv("PROSPER_RESDUMP")) {   // draw-vs-bind association diagnostic (#273)
+            if (PROSPER_ENV_ON("PROSPER_RESDUMP")) {   // draw-vs-bind association diagnostic (#273)
                 auto rd = [&](uint32_t off) { auto it = sh.find(off); return it == sh.end() ? 0u : it->second; };
                 fprintf(stderr, "[drawpkt] idx#%zu es=0x%08x count=%u dirty=%d ud=[%08x %08x %08x %08x | %08x %08x %08x %08x]\n",
                         draws.size(), rd(0xc8), c.index_count ? c.index_count : index_num, (int)state_dirty_,
@@ -5304,7 +5305,7 @@ void GpuState::apply(const Pm4Command& c) {
                 memcpy(&cond, (const void*)(uintptr_t)pred_cond_addr, sizeof cond);
                 skip = (cond != 0);
             }
-            if (getenv("PROSPER_PREDLOG")) {
+            if (PROSPER_ENV_ON("PROSPER_PREDLOG")) {
                 // A flat first-N cap answers only about start-up. On a routed GTA V boot the 3D
                 // chain does not begin until roughly 87% of the run, so a 96-line cap expired
                 // thousands of frames before the phase under investigation and reported the loading
