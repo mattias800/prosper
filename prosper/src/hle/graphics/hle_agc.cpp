@@ -31,6 +31,8 @@
 #include <chrono>
 #include <thread>
 #include <unordered_map>
+#include <algorithm>
+#include <iterator>
 
 #ifndef _WIN32
 // #312 label-slot write watch (exec_image_linux.cpp). Weak: tools that link the AGC HLE without
@@ -1287,6 +1289,114 @@ std::unordered_map<uint64_t, uint64_t>& agc_shader_continuations() {
     return continuations;
 }
 
+// Code-address index over the append-only registry above.
+//
+// `prosper_agc_shader_header_for_code` is called two to four times per DRAW by
+// `build_stage_table` (vertex program, chain program, and the two pixel-interpolant lookups), and
+// its body was a linear walk of every shader the title has ever created. A `perf` profile of a
+// Grand Theft Auto V Performance-Story route measured this one function at 2.27% of the
+// `[RAGE] RenderTh` thread, which is itself 86.5% of the process's CPU — the third-largest prosper
+// symbol in the profile, above the AVX2 detiler. The registry only grows, so the cost grows with
+// the run: nothing about a warm frame is cheaper than a cold one.
+//
+// The index maps a code address to the registry slots filed under it, in registration order, and
+// `_for_code` scans that list for the first (or, under PROSPER_SHADER_HEADER_NEWEST, the last)
+// entry whose LIVE `code` is the requested address. `_headers_for_code` is not indexed at all --
+// see the note on it below.
+//
+// The subtlety this must respect is the one `agc_fix_ptr` already records: a title can free a
+// shader header and construct another at the SAME allocation, so an entry's `h->code` is not
+// necessarily the value it carried when it was registered. **The walk reads that field LIVE, and
+// the index cannot**, so the index is a hint and never the authority:
+//
+//   * a bucket is scanned in full, in the walk's own order, and every candidate is checked against
+//     its live `code` -- taking the bucket's front unchecked answers `nullptr` for an address whose
+//     match sits one slot further along;
+//   * a bucket that yields no live match falls through to the walk, because an entry whose `code`
+//     the guest rewrote after registration is indexed under its OLD address and no bucket can see
+//     it. The walk's answer is then re-indexed, so the next lookup is O(1) again.
+//
+// That last case is not hypothetical and it is not rare. An earlier revision of this index assumed
+// "`code` changes only through a construction, and construction always registers", took the bucket
+// front unchecked, and answered `nullptr` where the walk answers a header -- which drops the draw.
+// On *Blue Prince* that turned the Mount Holly entrance hall black, 3 runs of 3, while the same
+// binary under `PROSPER_NO_AGC_SHADER_INDEX=1` rendered it correctly.
+//
+// What the index still cannot see, stated plainly because the comment it replaces understated it:
+// a header whose live `code` moves INTO an address some other header is already filed under is
+// found by the walk and not by the bucket, and the bucket still produces a match, so no miss and
+// no heal follows. The lookup then differs from the walk. It is detectable only with
+// PROSPER_AGC_SHADER_INDEX_AUDIT, which found 0 disagreements over 28.4 M lookups on Blue Prince
+// (the title that demonstrably rewrites these fields) and 9.2 M on Grand Theft Auto V -- evidence
+// that it does not occur in practice, not a proof that it cannot. Note the walk-fallback counter
+// says nothing about it either: this case produces a live match, so there is no miss to count.
+std::unordered_map<uint64_t, std::vector<uint32_t>>& agc_shader_slots_by_code() {
+    static std::unordered_map<uint64_t, std::vector<uint32_t>> index;
+    return index;
+}
+// Front code address -> the back headers fused onto it, in registration order. `front_code` is a
+// stored scalar and never changes, so this key is stable even when a back header is recycled; the
+// ambiguity rule below still reads each candidate's live `code`, exactly as the walk did.
+std::unordered_map<uint64_t, std::vector<const AgcShader*>>& agc_fused_backs_by_front() {
+    static std::unordered_map<uint64_t, std::vector<const AgcShader*>> index;
+    return index;
+}
+
+// PROSPER_NO_AGC_SHADER_INDEX restores the linear walks. It is the A/B arm for the speedup and the
+// escape hatch if a title ever violates the construction-always-registers invariant above.
+bool agc_shader_index_enabled() {
+    static const bool on = std::getenv("PROSPER_NO_AGC_SHADER_INDEX") == nullptr;
+    return on;
+}
+// PROSPER_AGC_SHADER_INDEX_AUDIT runs BOTH and reports any disagreement. A cache that cannot show
+// it still answers what the thing it replaced answered is not verifiable from a screenshot.
+bool agc_shader_index_audit_enabled() {
+    static const bool on = std::getenv("PROSPER_AGC_SHADER_INDEX_AUDIT") != nullptr;
+    return on;
+}
+// How often a lookup had to walk because the index could not answer. Always maintained, because
+// with the walk fallback below in place the repoint machinery is a PERFORMANCE mechanism and not a
+// correctness one -- a broken repoint still returns the right header, via the walk. So the only
+// arm that can redden for it is this counter, and a test that asserts on returned pointers alone
+// would pass against an index that had silently degenerated into the thing it replaced.
+std::atomic<uint64_t> g_agc_index_lookups{0};
+std::atomic<uint64_t> g_agc_index_fallbacks{0};
+
+// Caller holds agc_shaders_mx(). Appends `h` and files its slot under the code it carries now.
+//
+// Nothing re-points an EARLIER slot when a header allocation is recycled under a new code, and that
+// is deliberate: a stale slot in an old bucket is skipped by the live check in the lookup and
+// rescued by the walk, so the repoint changes no answer and no fallback -- it only bounds bucket
+// length, which nothing can observe. An earlier revision carried that machinery and two independent
+// mutations of it left every assertion green, which is the definition of code a test cannot defend.
+void agc_index_shader_locked(const AgcShader* h) {
+    auto& registry = agc_shaders();
+    const uint32_t slot = static_cast<uint32_t>(registry.size());
+    registry.push_back(h);
+    // Registration order is slot order, and a slot is filed once, so the bucket stays ascending.
+    agc_shader_slots_by_code()[(uint64_t)(uintptr_t)h->code].push_back(slot);
+}
+
+// The original walks, retained as the audit reference and the PROSPER_NO_AGC_SHADER_INDEX arm.
+const AgcShader* agc_scan_header_for_code_locked(uint64_t code_addr, bool newest,
+                                                size_t* matched_slot = nullptr) {
+    const auto& all = agc_shaders();
+    if (newest) {
+        for (size_t i = all.size(); i-- > 0;)
+            if (all[i] && (uint64_t)(uintptr_t)all[i]->code == code_addr) {
+                if (matched_slot) *matched_slot = i;
+                return all[i];
+            }
+        return nullptr;
+    }
+    for (size_t i = 0; i < all.size(); ++i)
+        if (all[i] && (uint64_t)(uintptr_t)all[i]->code == code_addr) {
+            if (matched_slot) *matched_slot = i;
+            return all[i];
+        }
+    return nullptr;
+}
+
 // Relocate one self-relative pointer field in place. SDK shader blobs use small forward offsets from
 // the pointer field; linked guest pointers live above 4 GiB. Inspect the field representation rather
 // than caching the header address: Sonic Origins frees a shader header and later constructs another
@@ -1313,6 +1423,77 @@ extern "C" size_t prosper_agc_shader_count() {
 // resource table from its user_data descriptors. Null if no registered shader binds that code. The
 // registry is written by guest loader threads (CreateShader) and read on the submit thread; both
 // sides take the registry mutex (an unlocked read raced push_back's reallocation — UAF).
+// Caller holds agc_shaders_mx(). The whole resolution, with `newest` as a parameter so a test can
+// exercise both modes -- the production entry point reads it from a process-lifetime env static,
+// which a test cannot flip.
+static const AgcShader* agc_resolve_header_locked(uint64_t code_addr, bool newest) {
+    if (!agc_shader_index_enabled())
+        return agc_scan_header_for_code_locked(code_addr, newest);
+    const AgcShader* found = nullptr;
+    bool from_index = false;
+    const auto& registry = agc_shaders();
+    auto& by_code = agc_shader_slots_by_code();
+    const auto entry = by_code.find(code_addr);
+    if (entry != by_code.end()) {
+        // The whole bucket, in the walk's own order, each candidate checked against its LIVE code.
+        // `newest` takes the highest matching slot and the default the lowest, which is what the
+        // forward and backward walks return.
+        const auto& slots = entry->second;
+        const auto matches = [&](uint32_t slot) {
+            return slot < registry.size() && registry[slot] &&
+                   (uint64_t)(uintptr_t)registry[slot]->code == code_addr;
+        };
+        if (newest) {
+            for (auto slot = slots.rbegin(); slot != slots.rend(); ++slot)
+                if (matches(*slot)) { found = registry[*slot]; break; }
+        } else {
+            for (const uint32_t slot : slots)
+                if (matches(slot)) { found = registry[slot]; break; }
+        }
+        from_index = found != nullptr;
+    }
+    // A bucket that yields no live match is not an answer. The index files a header under the code
+    // it carried at REGISTRATION, and a guest that rewrites that field afterwards leaves an entry
+    // only the walk can find -- so a miss falls through to the authority and the answer is then
+    // re-indexed, which keeps the fallback self-limiting rather than permanent.
+    if (!found) {
+        size_t matched = 0;
+        found = agc_scan_header_for_code_locked(code_addr, newest, &matched);
+        if (found) {
+            // File the slot the walk matched under the address it actually carries, so the next
+            // lookup of this address answers from the index. Without this the fallback is not
+            // self-limiting: every later reference to a rewritten header walks the whole registry
+            // again, which is the cost this index exists to remove.
+            auto& list = by_code[code_addr];
+            const uint32_t slot = static_cast<uint32_t>(matched);
+            if (std::find(list.begin(), list.end(), slot) == list.end())
+                list.insert(std::upper_bound(list.begin(), list.end(), slot), slot);
+        }
+    }
+    const uint64_t n = g_agc_index_lookups.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (!from_index) g_agc_index_fallbacks.fetch_add(1, std::memory_order_relaxed);
+    if (agc_shader_index_audit_enabled()) {
+        const AgcShader* reference = agc_scan_header_for_code_locked(code_addr, newest);
+        if (reference != found) {
+            static std::atomic<int> reported{0};
+            if (reported.fetch_add(1) < 32)
+                fprintf(stderr,
+                        "[agc-index-audit] MISMATCH code=0x%llx newest=%d index=%p scan=%p -- the "
+                        "code-address index disagrees with the registry walk it replaced\n",
+                        (unsigned long long)code_addr, (int)newest, (const void*)found,
+                        (const void*)reference);
+        }
+        // A rising fallback share means the index is degenerating into the walk it replaced, which
+        // is a verdict the mismatch counter cannot give: both arms are then CORRECT and one is O(N).
+        if (n % 200000 == 0)
+            fprintf(stderr, "[agc-index-audit] lookups=%llu walk-fallbacks=%llu (%.3f%%)\n",
+                    (unsigned long long)n,
+                    (unsigned long long)g_agc_index_fallbacks.load(std::memory_order_relaxed),
+                    100.0 * (double)g_agc_index_fallbacks.load(std::memory_order_relaxed) / (double)n);
+    }
+    return found;
+}
+
 extern "C" const void* prosper_agc_shader_header_for_code(uint64_t code_addr) {
     if (!code_addr) return nullptr;
     // PROSPER_SHADER_HEADER_NEWEST=1 (#305 A/B): resolve to the MOST RECENT registration bound to
@@ -1320,15 +1501,34 @@ extern "C" const void* prosper_agc_shader_header_for_code(uint64_t code_addr) {
     // hypothesis; see prosper_agc_shader_headers_for_code below.
     static const bool newest = std::getenv("PROSPER_SHADER_HEADER_NEWEST") != nullptr;
     std::lock_guard<std::mutex> lk(agc_shaders_mx());
-    if (newest) {
-        const auto& all = agc_shaders();
-        for (size_t i = all.size(); i-- > 0;)
-            if (all[i] && (uint64_t)(uintptr_t)all[i]->code == code_addr) return all[i];
-        return nullptr;
-    }
-    for (const AgcShader* h : agc_shaders())
-        if (h && (uint64_t)(uintptr_t)h->code == code_addr) return h;
-    return nullptr;
+    return agc_resolve_header_locked(code_addr, newest);
+}
+
+// Test entry points, and test-only for a reason worth stating: production cannot mix resolution
+// modes, because `newest` is one process-lifetime static, while `_mode` can. A heal performed in
+// one mode files the slot THAT mode selected -- the lowest matching for the default, the highest
+// for `newest` -- so alternating modes through this symbol could file a slot that is not the other
+// mode's front. Do not reach for it as a general API. `_scan` is the pre-index walk the index must
+// agree with; `_stats` reports how often the index could not answer.
+extern "C" const void* prosper_agc_shader_header_for_code_mode(uint64_t code_addr, int newest) {
+    if (!code_addr) return nullptr;
+    std::lock_guard<std::mutex> lk(agc_shaders_mx());
+    return agc_resolve_header_locked(code_addr, newest != 0);
+}
+
+extern "C" void prosper_agc_shader_index_stats(uint64_t* lookups, uint64_t* walk_fallbacks) {
+    if (lookups) *lookups = g_agc_index_lookups.load(std::memory_order_relaxed);
+    if (walk_fallbacks) *walk_fallbacks = g_agc_index_fallbacks.load(std::memory_order_relaxed);
+}
+
+// The pre-index registry walk, exposed so a regression test can compare the indexed answer with
+// the one it replaced for both resolution modes, without depending on a process-lifetime env
+// static. `newest` mirrors PROSPER_SHADER_HEADER_NEWEST. Production never calls this except as the
+// PROSPER_NO_AGC_SHADER_INDEX arm and the PROSPER_AGC_SHADER_INDEX_AUDIT reference.
+extern "C" const void* prosper_agc_shader_header_for_code_scan(uint64_t code_addr, int newest) {
+    if (!code_addr) return nullptr;
+    std::lock_guard<std::mutex> lk(agc_shaders_mx());
+    return agc_scan_header_for_code_locked(code_addr, newest != 0);
 }
 
 // #305 instrument: enumerate the registry by index, so a diagnostic can ask "which registered
@@ -1348,6 +1548,11 @@ extern "C" size_t prosper_agc_shader_headers_for_code(uint64_t code_addr, const 
                                                       size_t max) {
     if (!code_addr) return 0;
     std::lock_guard<std::mutex> lk(agc_shaders_mx());
+    // Deliberately NOT indexed. This enumerates EVERY registration matching an address, and the
+    // index files a header under the code it carried at registration -- so a bucket can under-report
+    // a header whose `code` the guest rewrote afterwards, and there is no miss to fall back on when
+    // the count is merely too low. Its one caller is the #305 `[udcand]` diagnostic, so the walk
+    // costs nothing anybody measures.
     size_t n = 0;
     for (const AgcShader* h : agc_shaders()) {
         if (!h || (uint64_t)(uintptr_t)h->code != code_addr) continue;
@@ -1364,6 +1569,18 @@ extern "C" const void* prosper_agc_fused_back_header_for_front(uint64_t front_co
     if (!front_code_addr) return nullptr;
     std::lock_guard<std::mutex> lk(agc_shaders_mx());
     const AgcShader* match = nullptr;
+    if (agc_shader_index_enabled()) {
+        const auto& by_front = agc_fused_backs_by_front();
+        const auto entry = by_front.find(front_code_addr);
+        if (entry == by_front.end()) return nullptr;
+        // Same rule over the same candidates in the same order, including the live `code` compare:
+        // only the search for them is indexed.
+        for (const AgcShader* back : entry->second) {
+            if (match && match->code != back->code) return nullptr;  // ambiguous reuse: fail closed
+            match = back;
+        }
+        return match;
+    }
     for (const auto& pair : agc_fused_shader_pairs()) {
         if (pair.front_code != front_code_addr) continue;
         if (match && match->code != pair.back->code) return nullptr; // ambiguous reuse: fail closed
@@ -1525,7 +1742,7 @@ HLE(agc_create_shader) {  // (Shader** dst, void* header, const void* code)
     }
     pipetrace_shader_user_data("CreateShader", h);
 
-    { std::lock_guard<std::mutex> lk(agc_shaders_mx()); agc_shaders().push_back(h); }
+    { std::lock_guard<std::mutex> lk(agc_shaders_mx()); agc_index_shader_locked(h); }
     *dst = h;               // <- the write our old stub omitted; populates the shader-registry slots
     return 0;
 }
@@ -1670,6 +1887,14 @@ HLE(agc_fuse_shader_halves) {  // (Shader* dst, const Shader* front, const Shade
         });
         if (found == pairs.end()) pairs.push_back({front_code, back});
         else found->back = back;
+        // Rebuild this front's bucket from the vector rather than patching it at a computed
+        // position. Fusion construction is cold -- this runs once per fused shader, never per draw
+        // -- and a rebuild cannot drift out of lockstep, where an index arithmetic repair can and
+        // would do so silently.
+        auto& backs = agc_fused_backs_by_front()[front_code];
+        backs.clear();
+        for (const auto& pair : pairs)
+            if (pair.front_code == front_code) backs.push_back(pair.back);
         if (front_code && back_code) agc_shader_continuations()[front_code] = back_code;
     }
     return 0;

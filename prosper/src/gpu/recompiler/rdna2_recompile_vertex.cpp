@@ -10,6 +10,7 @@
 #include "gpu/recompiler/indirect/rdna2_indirect_buffer_shadow.hpp"
 #include "gpu/recompiler/indirect/rdna2_indirect_pointer_analysis.hpp"
 #include "gpu/resources/shader_resources.hpp"
+#include "diagnostics/env_cache.hpp"   // cached PROSPER_* gates on per-draw/per-resource paths
 #include <algorithm>
 #include <bit>
 #include <cstdarg>
@@ -86,7 +87,7 @@ VertexPrologInfo rdna2_vertex_prolog_info(const uint32_t* code, size_t dwords) {
     VertexPrologInfo result;
     if (!code || !dwords) return result;
 
-    const bool prologlog = getenv("PROSPER_PROLOGLOG") != nullptr;
+    const bool prologlog = PROSPER_ENV_ON("PROSPER_PROLOGLOG");
     uint64_t phash = 0xcbf29ce484222325ull;
     if (prologlog)
         for (size_t i = 0; i < dwords && i < 4096; ++i) phash = (phash ^ code[i]) * 0x100000001b3ull;

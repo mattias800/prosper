@@ -1299,7 +1299,7 @@ std::shared_ptr<const DecodedShader> decode_shader_cached(const uint32_t* code, 
 
     if (!code || !dwords) return decode();
     auto& cache = shader_decode_cache();
-    if (getenv("PROSPER_NO_SHADER_DECODE_CACHE")) {
+    if (PROSPER_ENV_ON("PROSPER_NO_SHADER_DECODE_CACHE")) {
         std::lock_guard lock(cache.mutex);
         ++cache.stats.bypasses;
         return decode();
@@ -2132,7 +2132,7 @@ FragmentInterpolationLayout fragment_interpolation_layout_cached(
         const PixelSystemInputMapping* system_inputs,
         const PixelInputMapping* pixel_inputs) {
     const auto analysis = analyze_shader_code_cached(code, dwords);
-    if (!analysis || getenv("PROSPER_NO_SHADER_ANALYSIS_CACHE"))
+    if (!analysis || PROSPER_ENV_ON("PROSPER_NO_SHADER_ANALYSIS_CACHE"))
         return fragment_interpolation_layout(code, dwords, system_inputs, pixel_inputs);
 
     InterpolationCacheKey key;
@@ -3373,9 +3373,9 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
     // narrows it to ONE shader (a full run otherwise traces every draw's walk — unusable volume).
     // g_dyntrace_force: set by the PROSPER_DYNTRACE_FAIL failure-replay path (gpu_execute.hpp) so
     // the walk of a shader that just FAILED to recompile is traced without knowing its address.
-    bool trc = !reader && (g_dyntrace_force || getenv("PROSPER_DYNTRACE") != nullptr);
+    bool trc = !reader && (g_dyntrace_force || PROSPER_ENV_ON("PROSPER_DYNTRACE"));
     if (trc && !g_dyntrace_force)
-        if (const char* fa = getenv("PROSPER_DYNTRACE_ADDR"))
+        if (const char* fa = PROSPER_ENV_VALUE("PROSPER_DYNTRACE_ADDR"))
             trc = strtoull(fa, nullptr, 16) == (uint64_t)(uintptr_t)code;
     // A full scalar-fold trace is intentionally verbose. Live shaders can rebuild their stage table
     // thousands of times per scene, so permit a targeted diagnostic run to capture the first matching
@@ -3524,7 +3524,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
     //
     // Deliberately mirrors the register watch, including printing the program identity rather than
     // the sh= signature -- which is not unique (#2548).
-    const bool watch_scc = std::getenv("PROSPER_DYNTRACE_SCC") != nullptr;
+    const bool watch_scc = PROSPER_ENV_ON("PROSPER_DYNTRACE_SCC");
     int last_reported_scc = -2;
     auto report_scc = [&](const char* why) {
         if (!watch_scc || scc == last_reported_scc) return;
@@ -3540,7 +3540,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
     std::array<uint32_t, kFoldSgprs> forget_pc{}; forget_pc.fill(0xffffffffu);
     std::array<uint32_t, kFoldSgprs> forget_w0{}, forget_w1{};
     const int watch_sgpr = [] {
-        const char* w = std::getenv("PROSPER_DYNTRACE_SGPR");
+        const char* w = PROSPER_ENV_VALUE("PROSPER_DYNTRACE_SGPR");
         return w ? (int)strtol(w, nullptr, 0) : -1;
     }();
     auto set_value = [&](int r, uint32_t v) {
@@ -7014,9 +7014,9 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
 
     // PROSPER_RESDUMP: raw dump of the user-data struct + SGPR block per base, so the EUD layout
     // (which sharps have offset_dw>=16, and where the EUD pointer sits) can be read empirically.
-    bool resdump = getenv("PROSPER_RESDUMP") != nullptr;
+    bool resdump = PROSPER_ENV_ON("PROSPER_RESDUMP");
     if (resdump)   // PROSPER_RESDUMP_ADDR=<hex code addr>: narrow the dump to one shader
-        if (const char* fa = getenv("PROSPER_RESDUMP_ADDR"))
+        if (const char* fa = PROSPER_ENV_VALUE("PROSPER_RESDUMP_ADDR"))
             resdump = strtoull(fa, nullptr, 16) == code_addr;
     if (g_dyntrace_force) resdump = true;   // failure replay: always dump the failing stage's blocks
     if (resdump) {
@@ -7370,7 +7370,7 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
         dyn_vb = resolve_dynamic_fetch((const uint32_t*)(uintptr_t)code_addr, shader_dwords,
                                        primary_sgprs, kUserSgprs, 8, &srt_uses,
                                        UINT32_MAX, nullptr, system_sgprs, system_count);
-        if (getenv("PROSPER_GFXLOG") || getenv("PROSPER_RESDUMP")) {
+        if (log || PROSPER_ENV_ON("PROSPER_RESDUMP")) {
             fprintf(stderr, "[dynvb] VS resolved %zu dynamic vertex-fetch descriptor(s):\n", dyn_vb.size());
             for (auto& kv : dyn_vb) {
                 const auto& d = kv.desc;
@@ -9369,7 +9369,7 @@ void diagnose_resource_provenance(const GpuState& st, uint64_t submit_no) {
     // writer" for a range a colour target had in fact written, with nothing in the log to say the
     // recorder had never been armed. Measured on CrossWorlds: `color=0` recorded across a whole boot
     // with writer provenance explicitly on, against `compute-buffer=54` and `write-data=7`.
-    const char* dim_env = getenv("PROSPER_PROVENANCE_DIM");
+    const char* dim_env = PROSPER_ENV_VALUE("PROSPER_PROVENANCE_DIM");
     uint32_t want_w = 0, want_h = 0;
     bool record_only = !dim_env || !*dim_env;
     if (!record_only && (sscanf(dim_env, "%ux%u", &want_w, &want_h) != 2 || !want_w || !want_h)) {
@@ -10376,7 +10376,7 @@ bool realize_retained_draw(const GpuState& st, size_t index, float scale_x, floa
     GpuState::Draw draw;
     if (!resolve_indirect_draw_arguments(st, st.draws[index], draw))
         return note(RealizationFailureReason::IndirectArguments);
-    const bool log = getenv("PROSPER_GFXLOG") != nullptr || getenv("PROSPER_EXECLOG") != nullptr;
+    const bool log = getenv("PROSPER_GFXLOG") != nullptr || PROSPER_ENV_ON("PROSPER_EXECLOG");
     if (!realize_draw_item(draw_state, &draw, draw.index_count, 0x10000, log, item,
                            failure, true)) {
         // realize_draw_item resets and fills the record, including pipeline/targets/extent, but has
@@ -11127,7 +11127,7 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                         }
                     }
                 }
-                if (std::getenv("PROSPER_DRAW_CENSUS")) {
+                if (PROSPER_ENV_ON("PROSPER_DRAW_CENSUS")) {
                     static std::atomic<uint64_t> seen{0}, indirect_seen{0};
                     const uint64_t n = seen.fetch_add(1) + 1;
                     if (st.draws[operation.index].indirect)

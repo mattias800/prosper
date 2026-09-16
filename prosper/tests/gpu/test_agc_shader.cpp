@@ -81,6 +81,13 @@ int fails = 0;
 } // namespace
 
 extern "C" size_t prosper_agc_shader_count();
+extern "C" const void* prosper_agc_shader_at(size_t index);
+extern "C" const void* prosper_agc_shader_header_for_code(uint64_t code_addr);
+extern "C" const void* prosper_agc_shader_header_for_code_scan(uint64_t code_addr, int newest);
+extern "C" const void* prosper_agc_shader_header_for_code_mode(uint64_t code_addr, int newest);
+extern "C" void prosper_agc_shader_index_stats(uint64_t* lookups, uint64_t* walk_fallbacks);
+extern "C" size_t prosper_agc_shader_headers_for_code(uint64_t code_addr, const void** out,
+                                                      size_t max);
 extern "C" const void* prosper_agc_fused_back_header_for_front(uint64_t front_code_addr);
 extern "C" uint64_t prosper_agc_shader_continuation_for_code(uint64_t code_addr);
 
@@ -290,6 +297,186 @@ int main() {
           "recycled shader allocation relocates the new header again");
     CHECK(recycled_regs[0].value == 0x23456789u,
           "recycled shader allocation patches the new program base");
+
+    auto walks = [] {
+        uint64_t lookups = 0, fallbacks = 0;
+        prosper_agc_shader_index_stats(&lookups, &fallbacks);
+        return fallbacks;
+    };
+    // Under PROSPER_NO_AGC_SHADER_INDEX=1 -- the A/B arm, which nothing in CI sets but somebody will
+    // eventually run the suite under -- the resolution returns before any counter moves, so every
+    // "without walking" arm below would fail for a reason that is the point of that switch rather
+    // than a defect. Detect it by whether a lookup advances the lookup counter, and report those
+    // arms as inapplicable instead of red.
+    const bool indexed = [] {
+        uint64_t before = 0, after = 0, ignored_fallbacks = 0;
+        prosper_agc_shader_index_stats(&before, &ignored_fallbacks);
+        (void)prosper_agc_shader_header_for_code(0x2000ull);
+        prosper_agc_shader_index_stats(&after, &ignored_fallbacks);
+        return after > before;
+    }();
+    if (!indexed)
+        printf("  [note] PROSPER_NO_AGC_SHADER_INDEX is set: the walk-count arms do not apply\n");
+
+    // #3407: the registry lookup is indexed by code address instead of walked. `build_stage_table`
+    // calls it two to four times per DRAW, so the walk made every warm frame pay for every shader
+    // the title had ever created; a GTA V profile put it at 2.27% of the render thread.
+    //
+    // The index is NOT exactly equivalent to the walk and does not claim to be -- `hle_agc.cpp`
+    // states the residual it cannot see. What these assertions pin is everything else: that a
+    // bucket is scanned in full against the live `code` field, that a bucket with no live match
+    // falls through to the walk, and that the walk's answer is filed so the fallback does not
+    // become permanent. Two of the three can only be observed through the fallback COUNTER, because
+    // with the fallback in place neither defect changes an answer.
+    {
+        // Both modes, against the walk each replaced. `_mode` supplies `newest` as a parameter
+        // because the production entry point reads it from a process-lifetime env static that a
+        // test cannot flip -- without it the newest branch of the index is never executed at all.
+        auto agrees = [](uint64_t address) {
+            return prosper_agc_shader_header_for_code_mode(address, 0) ==
+                       prosper_agc_shader_header_for_code_scan(address, 0) &&
+                   prosper_agc_shader_header_for_code_mode(address, 1) ==
+                       prosper_agc_shader_header_for_code_scan(address, 1);
+        };
+        // The repoint machinery cannot change the ANSWER -- a slot filed under a stale address is
+        // rescued by the walk fallback -- so the only observable it has is whether the fallback had
+        // to run, and a guard that asserts on returned pointers alone passes against an index that
+        // has silently degenerated into the walk it replaced.
+        CHECK(prosper_agc_shader_header_for_code(0x2000ull) == &good,
+              "indexed lookup resolves a plain registration by its code address");
+        CHECK(prosper_agc_shader_header_for_code(0x2345678900ull) ==
+                  reinterpret_cast<const void*>(recycled),
+              "indexed lookup resolves the live code of a recycled header allocation");
+        CHECK(prosper_agc_shader_header_for_code(0x1234567800ull) == nullptr,
+              "the superseded code address of a recycled header resolves to nothing");
+        CHECK(prosper_agc_shader_header_for_code(0x9999999900ull) == nullptr,
+              "an address no shader was ever registered at resolves to nothing");
+        CHECK(agrees(0x2000ull) && agrees(0x2345678900ull) && agrees(0x1234567800ull) &&
+                  agrees(0x9999999900ull) && agrees(0x1000ull),
+              "indexed lookup agrees with the registry walk, in BOTH resolution modes");
+
+        CHECK(prosper_agc_shader_header_for_code_mode(0x1234567800ull, 0) == nullptr &&
+                  prosper_agc_shader_header_for_code_mode(0x1234567800ull, 1) == nullptr,
+              "the superseded code address resolves to nothing in both modes");
+        const uint64_t before_recycled = walks();
+        CHECK(prosper_agc_shader_header_for_code_mode(0x2345678900ull, 0) ==
+                  reinterpret_cast<const void*>(recycled) &&
+              prosper_agc_shader_header_for_code_mode(0x2345678900ull, 1) ==
+                  reinterpret_cast<const void*>(recycled),
+              "the recycled header's current code resolves in both modes");
+        CHECK(!indexed || walks() == before_recycled, "...from the index, without walking");
+        const uint64_t before_plain = walks();
+        CHECK(prosper_agc_shader_header_for_code_mode(0x2000ull, 0) == &good &&
+                  prosper_agc_shader_header_for_code_mode(0x2000ull, 1) == &good,
+              "a plain registration resolves in both modes");
+        CHECK(!indexed || walks() == before_plain, "...from the index in both, without walking");
+
+        // `_headers_for_code` is deliberately NOT indexed, so this is a contract check on the walk
+        // rather than a guard on the index: both registrations of the recycled allocation read the
+        // same live code, so both must be enumerated, in registration order.
+        const void* headers[4] = {};
+        const size_t total = prosper_agc_shader_headers_for_code(0x2345678900ull, headers, 4);
+        CHECK(total == 2 && headers[0] == reinterpret_cast<const void*>(recycled) &&
+                  headers[1] == reinterpret_cast<const void*>(recycled),
+              "both registrations of one recycled allocation enumerate, in registration order");
+        CHECK(prosper_agc_shader_headers_for_code(0x1234567800ull, headers, 4) == 0,
+              "the superseded code address enumerates nothing");
+    }
+
+    // The defect the block above did NOT catch, built by hand because nothing in this file
+    // produces it: a shader header is GUEST memory, and its `code` field can change after
+    // CreateShader filed it. The registry walk reads that field live on every entry; an index can
+    // only file a header under the value it carried at registration, so it must treat a bucket that
+    // yields no live match as "no answer" and fall through to the walk.
+    //
+    // The first revision did not. It took the bucket's front unchecked, so a rewritten header
+    // resolved to nullptr, `build_stage_table` returned no resource table, and the draws using that
+    // program were dropped: *Blue Prince*'s Mount Holly entrance hall went black on 3 runs of 3
+    // while the same binary under PROSPER_NO_AGC_SHADER_INDEX=1 rendered it. Both arms below fail
+    // against that revision and neither fails against the walk.
+    {
+        // static storage: the registry is append-only and never cleared, and everything after this
+        // point that walks it dereferences `h->code`. A block-scoped header would be a dangling
+        // read the moment this scope ends, and the realistic symptom is reused stack bytes
+        // producing a false match rather than a crash.
+        static Shader rewritten{};
+        rewritten.file_header = 0x34333231u;
+        rewritten.version = 0x18u;
+        rewritten.shader_size = 64;
+        rewritten.type = 1;
+        dst = nullptr;
+        rc = create_shader(reinterpret_cast<uint64_t>(&dst), reinterpret_cast<uint64_t>(&rewritten),
+                           0x5100ull, 0, 0, 0);
+        CHECK(rc == 0 && rewritten.code == reinterpret_cast<const void*>(0x5100ull),
+              "a shader registered at a fresh code address");
+        CHECK(prosper_agc_shader_header_for_code(0x5100ull) == &rewritten,
+              "...resolves there before its header is touched");
+
+        // The guest rewrites the field prosper filed it under. No re-registration follows.
+        rewritten.code = reinterpret_cast<const void*>(0x5200ull);
+        uint64_t walks_before = 0, walks_after = 0, ignored = 0;
+        prosper_agc_shader_index_stats(&ignored, &walks_before);
+        CHECK(prosper_agc_shader_header_for_code(0x5200ull) == &rewritten,
+              "a header whose code was rewritten after registration still resolves");
+        prosper_agc_shader_index_stats(&ignored, &walks_after);
+        // ...and the FIRST such resolution is the one that walks, because no bucket can hold it.
+        CHECK(!indexed || walks_after == walks_before + 1,
+              "...because the index could not answer it");
+        // The walk's answer is filed, so the next reference is O(1) again. Without that heal the
+        // fallback is not self-limiting and every later draw using this program walks the whole
+        // registry -- correct, and exactly the cost this index exists to remove.
+        prosper_agc_shader_index_stats(&ignored, &walks_before);
+        CHECK(prosper_agc_shader_header_for_code(0x5200ull) == &rewritten,
+              "...and resolves again on the next reference");
+        prosper_agc_shader_index_stats(&ignored, &walks_after);
+        CHECK(!indexed || walks_after == walks_before,
+              "...from the index that time, not by walking again");
+        CHECK(prosper_agc_shader_header_for_code(0x5200ull) ==
+                  prosper_agc_shader_header_for_code_scan(0x5200ull, 0),
+              "...by the same answer the registry walk gives");
+        CHECK(prosper_agc_shader_header_for_code(0x5100ull) == nullptr &&
+                  prosper_agc_shader_header_for_code_scan(0x5100ull, 0) == nullptr,
+              "...and its registration address resolves to nothing, as the walk says");
+
+        // The same hazard one slot along: two headers share a code address and the EARLIER one is
+        // rewritten away. A bucket front taken unchecked now names a header that no longer matches,
+        // where the walk simply continues to the next entry.
+        static Shader shared_first{}, shared_second{};
+        for (Shader* each : {&shared_first, &shared_second}) {
+            *each = {};
+            each->file_header = 0x34333231u;
+            each->version = 0x18u;
+            each->shader_size = 64;
+            each->type = 1;
+        }
+        dst = nullptr;
+        rc = create_shader(reinterpret_cast<uint64_t>(&dst),
+                           reinterpret_cast<uint64_t>(&shared_first), 0x5300ull, 0, 0, 0);
+        const bool first_ok = rc == 0;
+        dst = nullptr;
+        rc = create_shader(reinterpret_cast<uint64_t>(&dst),
+                           reinterpret_cast<uint64_t>(&shared_second), 0x5300ull, 0, 0, 0);
+        CHECK(first_ok && rc == 0 && prosper_agc_shader_header_for_code(0x5300ull) == &shared_first,
+              "two headers at one code address resolve to the FIRST registration");
+        shared_first.code = reinterpret_cast<const void*>(0x5400ull);
+        CHECK(prosper_agc_shader_header_for_code(0x5300ull) == &shared_second,
+              "rewriting the first away resolves to the second, not to nothing");
+        // With the walk fallback in place this arrangement can no longer produce a WRONG answer,
+        // so the front-unchecked defect survives here only as cost: the bucket's front is now
+        // permanently stale, the heal has nothing new to file, and every reference to this address
+        // walks the whole registry forever. The count is the only thing that can say so.
+        prosper_agc_shader_index_stats(&ignored, &walks_before);
+        CHECK(prosper_agc_shader_header_for_code(0x5300ull) == &shared_second,
+              "...on every later reference too");
+        prosper_agc_shader_index_stats(&ignored, &walks_after);
+        CHECK(!indexed || walks_after == walks_before,
+              "...from the index, because the whole bucket is scanned rather than just its front");
+        CHECK(prosper_agc_shader_header_for_code(0x5300ull) ==
+                  prosper_agc_shader_header_for_code_scan(0x5300ull, 0) &&
+                  prosper_agc_shader_header_for_code(0x5400ull) ==
+                      prosper_agc_shader_header_for_code_scan(0x5400ull, 0),
+              "...and both addresses still agree with the registry walk");
+    }
 
     // #719: UE4 pixel shaders use buffer_load_format_* for structured/material data too. The
     // dynamic V# fold is stage-agnostic; build_stage_table must retain its result for PS instead of

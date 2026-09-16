@@ -3,6 +3,7 @@
 #include "diagnostics/diag_clock.hpp"
 #include "gpu/execute/gpu_execute.hpp"
 #include "gpu/texture/tile.hpp"
+#include "diagnostics/env_cache.hpp"   // cached PROSPER_* gates on per-draw/per-resource paths
 #include <algorithm>
 #include <climits>
 #include <cstdio>
@@ -1111,7 +1112,7 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
             // scoring). Fires at T#-decode time (every draw's stage build), so it captures textures even
             // on runs whose intermittent content never reaches the render backend. Guest memory is
             // 1:1-mapped; the size is the tiled element footprint (BCn: (w/4)*(h/4)*block_bytes).
-            if (getenv("PROSPER_DUMP_TILERAW") && d.base > 0x10000 && d.tile_mode != 0) {
+            if (PROSPER_ENV_ON("PROSPER_DUMP_TILERAW") && d.base > 0x10000 && d.tile_mode != 0) {
                 static bool tseen[1u << 12] = {};                  // dedupe by low base bits
                 uint32_t key = (uint32_t)((d.base >> 12) & 0xfffu);
                 if (!tseen[key]) {
@@ -1155,7 +1156,7 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
             // surface filled moments later still reads as empty. That mistake cost three published
             // corrections on #3140 before it was caught; with the verdict in the key a state change
             // prints and "it was empty" cannot masquerade as "it is empty".
-            if (getenv("PROSPER_TEXCONTENT") && d.width >= 1920u && d.height >= 1080u &&
+            if (PROSPER_ENV_ON("PROSPER_TEXCONTENT") && d.width >= 1920u && d.height >= 1080u &&
                 d.base > 0x1000000000ull) {
                 // BYTES, not texels. Offsets computed in texels and applied as byte addresses sample
                 // only the first bytes-per-texel'th of an RGBA8 surface -- reporting a false
@@ -1221,7 +1222,7 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
                                 cached ? "authoritative" : "MISS");
                 }
             }
-            if (getenv("PROSPER_GFXLOG") || getenv("PROSPER_TEXLOG")) {
+            if (PROSPER_ENV_ON("PROSPER_TEXLOG") || getenv("PROSPER_GFXLOG")) {
                 const uint32_t* t = tv;   // the fetched T# (SGPR block or EUD spill)
                 fprintf(stderr, "[t#] %ux%u base=0x%llx tile_mode=%u type=%u fmt=%u mips=%u:%u/%u swz=%u,%u,%u,%u "
                                 "dcc=%u meta=0x%llx blocks=%u/%u flags=%u%u%u%u | raw: %08x %08x %08x %08x %08x %08x %08x %08x\n",
@@ -1410,7 +1411,7 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
                 // here, and the guard correctly drops it — but the log then looks identical to a
                 // genuinely absent resource. Printing the words separates "not a descriptor" from
                 // "a descriptor we mis-decoded", which need opposite fixes.
-                if (getenv("PROSPER_SHARPLOG")) {
+                if (PROSPER_ENV_ON("PROSPER_SHARPLOG")) {
                     // Which of the two candidate BASE readings is actually mapped guest memory. A V#
                     // stores base at bit 0 (Base48); the Gen5 256-byte-unit form used by
                     // decode_bvh_descriptor just below stores it shifted, `base_256 << 8`. If the
@@ -1460,7 +1461,7 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
             // whether the inline interpretation is load-bearing anywhere, which is the gate on any
             // change to this path: if type 8/10 never resolve inline on any title, the inline reading
             // for those types is dead and can be replaced; if they do, it cannot.
-            if (getenv("PROSPER_SHARPLOG"))
+            if (PROSPER_ENV_ON("PROSPER_SHARPLOG"))
                 fprintf(stderr,
                         "[direct-accept] type=%u sgpr=%u base=0x%llx size=%llu stride=%u fmt=%u\n",
                         type, reg, (unsigned long long)d.base, (unsigned long long)d.size_bytes,
