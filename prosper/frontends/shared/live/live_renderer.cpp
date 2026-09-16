@@ -5945,12 +5945,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             uint32_t known_mask = retained_depth_cube.known_mask;
                             for (uint32_t face = 0; face < 6u; ++face)
                                 slices_found += (present_mask >> face) & 1u;
-                            // Selection above is metadata-only. Do not synchronously read back four
-                            // or five resident faces merely to discover that the sixth is absent and
-                            // discard every byte into the guest fallback. Only a complete selection
-                            // can enter this all-renderer bridge; the compute/DS hybrid is handled by
-                            // its independently ordered path below.
-                            const bool complete = retained_depth_cube_cache_candidate &&
+                            // Selection above is metadata-only. Read every selected renderer face;
+                            // missing faces retain the independent guest fallback below. A failure
+                            // must not publish a cache entry under the selected renderer generation.
+                            const bool readback_ok = retained_depth_cube_cache_candidate &&
                                 prosper::test::read_persistent_ds_cube_depth(
                                     r.gpu_addr, tw, th, faces, slices_found, cube_error,
                                     &present_mask, &known_mask);
@@ -5999,7 +5997,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 }
                             }
                             (void)cube_error;
-                            if (complete && texture_pixels.size() >=
+                            if (readback_ok && texture_pixels.size() >=
                                     static_cast<size_t>(tw) * th * 6u * 4u) {
                                 const bool ctiled = prosper::gpu::tile_mode_is_tiled(r.tile_mode) &&
                                     !PROSPER_ENV_VALUE("PROSPER_NODETILE");

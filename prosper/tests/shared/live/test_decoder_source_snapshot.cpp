@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <bit>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <vector>
@@ -63,6 +64,7 @@ int main(int argc, char** argv) {
     prosper::frontend::register_live_renderer(".", false);
     auto render = [&](const DrawItem& draw) { return render_submit_items({draw}, W, H); };
 #ifdef __linux__
+    check(unsetenv("PROSPER_FAULT_NO_ONSTACK") == 0, "enable the safe production fault handler");
     prosper::install_trap_handler();
 #endif
     auto alloc = prosper::Hle::lookup(prosper::nid_hash("sceKernelAllocateDirectMemory"));
