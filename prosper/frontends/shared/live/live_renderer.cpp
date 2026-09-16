@@ -19,6 +19,7 @@
 #include "shared/texture/validation_census.hpp"
 #include "shared/live/live_compute.hpp"
 #include "shared/live/texture_source_snapshot.hpp"
+#include "shared/live/depth_cube_source_snapshot.hpp"
 #include "shared/live/decode_scratch.hpp"     // pooled full-surface decode intermediates
 #include "shared/live/live_target_format.hpp"       // the one LiveTargetPixelFormat mapping (exhaustive)
 #include "shared/perf/performance_capture.hpp"      // bounded F8 post-trigger renderer timing
@@ -944,6 +945,7 @@ struct PersistentDecodedTexture {
     size_t source_size = 0;
     size_t source_prefix_size = 0;
     bool source_matches_pixels = false;
+    DepthCubeSourceSnapshot depth_cube_source;
     std::vector<uint8_t> source_prefix;
     std::shared_ptr<const std::vector<uint8_t>> pixels;
     uint32_t output_height = 0;
@@ -4257,6 +4259,17 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 resource_compute_image_hit = false;
                             }
                         }
+                        DepthCubeSourceLayout depth_cube_source_layout;
+                        if (retained_depth_cube_cache_candidate) {
+                            const size_t face_bytes = persistent_source_is_tiled
+                                ? prosper::gpu::tiled_surface_bytes(tw, th, r.tile_mode, 0, 2)
+                                : static_cast<size_t>(tw) * th * 2u;
+                            depth_cube_source_layout = {r.gpu_addr,
+                                r.layer_stride_bytes ? r.layer_stride_bytes : face_bytes, face_bytes};
+                        }
+                        const bool depth_cube_source_layout_valid =
+                            retained_depth_cube_cache_candidate && depth_cube_source_layout.fits(
+                                persistent_source_addr, persistent_source_size);
                         auto copy_persistent_source = [&](uint8_t* dst, size_t bytes) {
                             return persistent_dcc_fast_clear
                                 ? copy_dcc_metadata(dst, bytes)
@@ -4410,7 +4423,11 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             auto cached = persistent_decoded_textures.find(decode_key);
                             if (cached != persistent_decoded_textures.end() &&
                                 cached->second.source_addr == persistent_source_addr &&
-                                cached->second.source_size == persistent_source_size) {
+                                cached->second.source_size == persistent_source_size &&
+                                (!retained_depth_cube_cache_eligible ||
+                                 (depth_cube_source_layout_valid && cached->second.depth_cube_source.active &&
+                                  cached->second.depth_cube_source.renderer_mask ==
+                                      retained_depth_cube.present_mask))) {
                                 resource_texture_watch_active =
                                     static_cast<bool>(cached->second.source_watch);
                                 resource_texture_watch_disabled =
@@ -4455,7 +4472,11 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                         ? RenderClock::now() : RenderClock::time_point{};
                                     bool matches = false;
                                     size_t validated_bytes = 0;
-                                    if (cached->second.source_matches_pixels) {
+                                    if (cached->second.depth_cube_source.active) {
+                                        matches = equal_depth_cube_source(depth_cube_source_layout,
+                                            cached->second.depth_cube_source, cached->second.source_prefix,
+                                            safe_span, safe_equal, validated_bytes);
+                                    } else if (cached->second.source_matches_pixels) {
                                         matches = safe_equal(
                                             cached->second.pixels ? cached->second.pixels->data() : nullptr,
                                             persistent_source_addr,
@@ -4573,8 +4594,11 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                             prosper::host::GuestWriteWatch::create(
                                                 persistent_source_addr, persistent_source_size);
                                 }
-                                bool content_matches = retained_depth_cube_cache_eligible;
-                                if (retained_depth_cube_cache_eligible) {
+                                const bool renderer_only_cube = retained_depth_cube_cache_eligible &&
+                                    cached->second.depth_cube_source.active &&
+                                    cached->second.depth_cube_source.renderer_mask == 0x3fu;
+                                bool content_matches = renderer_only_cube;
+                                if (renderer_only_cube) {
                                     // The key carries the newest selected retained-depth write.
                                     // Finding this entry is the exact renderer-authority proof;
                                     // there are intentionally no guest bytes to compare.
@@ -4622,7 +4646,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                         prosper::gpu::guest_gpu_write_snapshot();
                                     static const bool keep_source_snapshots =
                                         PROSPER_ENV_VALUE("PROSPER_KEEP_TEXTURE_SOURCE_SNAPSHOTS") != nullptr;
-                                    if (!keep_source_snapshots &&
+                                    if (!keep_source_snapshots && !cached->second.depth_cube_source.active &&
                                         texture_source_snapshot_can_follow_watch(
                                             cached->second.source_matches_pixels,
                                             audit_submit_reuse || audit_cross_submit_watch,
@@ -5357,7 +5381,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         size_t decoder_source_prefix_size = 0;
                         // Only an exact encoded footprint can serve both the decoder and validation.
                         // Repacked rows, detiled bytes and metadata are different source domains.
-                        // The source watch has already been armed above, before this authoritative read.
+                        // When used, the source watch was armed above, before this authoritative read.
                         auto stage_linear_decoder_source = [&](
                             prosper::frontend::DecodeScratchPool::Lease& lease,
                             size_t bytes, bool tiled) {
@@ -5904,6 +5928,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         // faithful, the precision is not the guest's, and a shadow compare is
                         // precision-sensitive. Recorded rather than hidden.
                         bool cube_depth_bridged = false;
+                        bool renderer_cube_snapshot_ready = false;
                         if (is_cube && !rtt_hit && !resource_compute_depth_hybrid &&
                             !fr.is_storage_image && r.depth == 6u &&
                             prosper::test::is_retained_ds_plane(r.gpu_addr)) {
@@ -6033,6 +6058,11 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                         }
                                     }
                                 }
+                                renderer_cube_snapshot_ready = depth_cube_source_layout_valid &&
+                                    present_mask == retained_depth_cube.present_mask;
+                                for (uint32_t face = 0; face < 6; ++face)
+                                    renderer_cube_snapshot_ready &= faces[face].size() ==
+                                        ((present_mask & (1u << face)) ? static_cast<size_t>(tw) * th : 0);
                                 cube_depth_bridged = true;
                                 rtt_hit = true;          // do not overwrite with a guest-byte decode
                                 resource_rtt_hit = true;
@@ -7097,10 +7127,29 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         // #1272: see the reuse path — plain 2D guest textures only.
                         if (!is_volume && !cube_done)
                             fr.declared_mip_levels = r.declared_mip_levels;
-                        if (persistent_cache_eligible && !fr.gpu_detile) {
+                        // Failed/mismatched renderer readback must retry on the next use. Caching
+                        // its guest fallback under the renderer generation would freeze that fallback.
+                        const bool cube_cache_proven = !retained_depth_cube_cache_candidate ||
+                            renderer_cube_snapshot_ready;
+                        if (!cube_cache_proven) ++g_texture_decode_scope.cube_snapshot_refusals;
+                        if (persistent_cache_eligible && !fr.gpu_detile && cube_cache_proven) {
+                            DepthCubeSourceSnapshot cube_source_snapshot;
                             size_t source_prefix_size = linear_source_prefix_size;
                             if (!persistent_source_matches_pixels && persistent_source_size) {
-                                if (decoder_source_snapshot_ready) {
+                                if (renderer_cube_snapshot_ready) {
+                                    size_t read_bytes = 0;
+                                    source_prefix_size = capture_depth_cube_source(
+                                        depth_cube_source_layout, retained_depth_cube.present_mask,
+                                        PROSPER_ENV_ON("PROSPER_NO_CUBE_SOURCE_SNAPSHOT_PRUNING"),
+                                        persistent_validation_scratch, cube_source_snapshot,
+                                        copy_resource, read_bytes);
+                                    g_texture_decode_scope.late_snapshot_read_bytes += read_bytes;
+                                    g_texture_decode_scope.cube_snapshot_guest_bytes += source_prefix_size;
+                                    for (unsigned face = 0; face < 6; ++face)
+                                        if (retained_depth_cube.present_mask & (1u << face))
+                                            g_texture_decode_scope.cube_snapshot_renderer_bytes +=
+                                                depth_cube_source_layout.face_bytes;
+                                } else if (decoder_source_snapshot_ready) {
                                     source_prefix_size = decoder_source_prefix_size;
                                 } else {
                                     persistent_validation_scratch.resize(persistent_source_size);
@@ -7195,6 +7244,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 cached.source_addr = persistent_source_addr;
                                 cached.source_size = persistent_source_size;
                                 cached.source_prefix_size = source_prefix_size;
+                                cached.depth_cube_source = cube_source_snapshot;
                                 cached.source_matches_pixels = persistent_source_matches_pixels;
                                 if (!persistent_source_matches_pixels) {
                                     static const bool transfer_source_snapshot =
@@ -7255,7 +7305,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 decoded_pixels_in_texstore = false;
                             }
                         }
-                        if (!resource_rtt_hit && !resource_compute_image_hit && !has_live_rtt) {
+                        if (cube_cache_proven && !resource_rtt_hit && !resource_compute_image_hit && !has_live_rtt) {
                             const bool pin_scratch =
                                 decoded_pixels_in_texstore && cross_span_source_size != 0;
                             const size_t pinned_slot = pin_scratch ? texture_slot : SIZE_MAX;
@@ -11653,7 +11703,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             "dcc_reads=%llu dcc_bytes=%llu compute_span_queries=%llu "
                             "generic_copy_bytes=%llu generic_copy_deferrals=%llu "
                             "decoder_snapshot_candidate_bytes=%llu decoder_snapshot_reused_bytes=%llu "
-                            "late_snapshot_read_bytes=%llu\n",
+                            "late_snapshot_read_bytes=%llu cube_snapshot_guest_bytes=%llu "
+                            "cube_snapshot_renderer_bytes=%llu cube_snapshot_refusals=%llu\n",
                             (unsigned long long)g_texture_decode_scope.dcc_metadata_read_attempts,
                             (unsigned long long)g_texture_decode_scope.dcc_metadata_read_bytes,
                             (unsigned long long)g_texture_decode_scope.compute_import_span_queries,
@@ -11661,7 +11712,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             (unsigned long long)g_texture_decode_scope.generic_source_copy_deferrals,
                             (unsigned long long)g_texture_decode_scope.decoder_snapshot_candidate_bytes,
                             (unsigned long long)g_texture_decode_scope.decoder_snapshot_reused_bytes,
-                            (unsigned long long)g_texture_decode_scope.late_snapshot_read_bytes);
+                            (unsigned long long)g_texture_decode_scope.late_snapshot_read_bytes,
+                            (unsigned long long)g_texture_decode_scope.cube_snapshot_guest_bytes,
+                            (unsigned long long)g_texture_decode_scope.cube_snapshot_renderer_bytes,
+                            (unsigned long long)g_texture_decode_scope.cube_snapshot_refusals);
                     size_t rtt_bytes = 0;
                     for (const auto& [addr, surface] : g_rtt) {
                         (void)addr;

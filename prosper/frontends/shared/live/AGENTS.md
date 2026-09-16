@@ -101,7 +101,7 @@ Allocation observations count upstream heap requests/bytes, not nodes or GPU buf
 
 Ordinary tight linear BC, Float32, Float16 and narrow sampled textures can decode directly from
 owned validation scratch when its address and complete encoded footprint match the persistent
-cache source. The source watch is armed before that read. The decoder sees zero-filled short tails,
+cache source. When used, the source watch is armed before that read. The decoder sees zero-filled short tails,
 but the cache retains only the readable prefix through its existing capacity-aware admission.
 Repacked rows, tiled inputs, arrays, cubes, volumes, mip tails and DCC metadata retain their separate
 snapshot reads. Fully readable tiled inputs already use direct guest spans; they do not own a
@@ -109,6 +109,18 @@ staging allocation to transfer. `PROSPER_NO_DECODE_SOURCE_SNAPSHOT_REUSE=1` rest
 linear read. The texture-preparation counters report requested candidate bytes, reused readable
 prefixes and remaining late snapshot reads, cumulatively per thread, not physical bandwidth or an
 F8 rate-window total.
+
+Retained depth cubes can mix renderer-owned faces with guest-backed faces. Successful readback must
+match the selected renderer mask and each face extent before caching. The cache keeps renderer
+generation identity plus exact prefixes for each missing face; equal concatenated bytes alone are
+insufficient if the readable lengths move between faces. Fully renderer-owned cubes need no guest
+snapshot. Failed readback and unproved ranges decline both cache scopes so the next reference retries.
+Compact snapshots keep the whole source range for journal/watch invalidation, and are excluded from
+ordinary snapshot dropping. `PROSPER_NO_CUBE_SOURCE_SNAPSHOT_PRUNING=1` additionally reads the owned
+faces before forming the same compact snapshot; this isolates discarded read work without changing
+cache contents. It is an eager diagnostic control, not a restoration of the old partial-cube
+validation bug. Counters separate guest prefix bytes, renderer-owned requested face bytes and refused
+cube admissions.
 
 ## The boundary that is easy to get wrong
 

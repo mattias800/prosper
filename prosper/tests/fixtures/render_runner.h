@@ -5347,8 +5347,8 @@ inline bool read_persistent_ds_depth(PersistentDsImage& image, uint32_t width, u
 
 // Metadata-only selection for a retained depth cube. `overlay_version` is the newest selected
 // depth-write generation, so a CPU-decoded six-face stack can be cached against renderer authority
-// without consulting stale guest bytes. Any new face write advances that generation; an invalid or
-// missing face makes the selection incomplete and therefore ineligible for that cache.
+// without consulting stale guest bytes for those faces. A partial selection still depends on
+// guest memory for every missing face; its generation alone cannot validate a mixed cube.
 struct PersistentDsCubeSelection {
     std::array<PersistentDsImage*, 6> faces{};
     uint32_t present_mask = 0;
@@ -5381,9 +5381,15 @@ inline PersistentDsCubeSelection select_persistent_ds_cube_depth(
     return selected;
 }
 
-// All six faces of a depth cube whose faces are retained separately, or false when any is missing.
-// `slices_found` reports how many were present, so a partial cube is a stated fact rather than a
-// silent half-result.
+// Programmatic one-shot failure for the mixed-authority cache regression. No environment setting
+// can activate it in a live game. The next ordinary read must retry the same renderer generation.
+inline bool& depth_cube_readback_failure_once() {
+    static thread_local bool armed = false;
+    return armed;
+}
+
+// Read every currently retained face. Missing faces stay empty for the caller's guest fallback;
+// false means no retained faces or a failed readback, not merely an incomplete six-face selection.
 inline bool read_persistent_ds_cube_depth(uint64_t base, uint32_t width, uint32_t height,
                                           std::array<std::vector<float>, 6>& faces,
                                           uint32_t& slices_found, std::string& error,
@@ -5395,6 +5401,10 @@ inline bool read_persistent_ds_cube_depth(uint64_t base, uint32_t width, uint32_
         select_persistent_ds_cube_depth(base, width, height);
     if (present_mask) *present_mask = selected.present_mask;
     if (known_mask) *known_mask = selected.known_mask;
+    if (std::exchange(depth_cube_readback_failure_once(), false)) {
+        error = "injected depth cube readback failure";
+        return false;
+    }
     for (uint32_t slice = 0; slice < 6u; ++slice) {
         PersistentDsImage* found = selected.faces[slice];
         if (!found) continue;

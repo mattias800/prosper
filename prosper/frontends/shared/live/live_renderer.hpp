@@ -92,6 +92,9 @@ struct TextureDecodeScopeStats {
     uint64_t decoder_snapshot_candidate_bytes = 0;
     uint64_t decoder_snapshot_reused_bytes = 0;
     uint64_t late_snapshot_read_bytes = 0;
+    uint64_t cube_snapshot_guest_bytes = 0;
+    uint64_t cube_snapshot_renderer_bytes = 0;
+    uint64_t cube_snapshot_refusals = 0;
     // Actual preparation work, including work whose result is later discarded. These counters
     // constrain admission ordering without relying on elapsed time or unchanged output pixels.
     uint64_t dcc_metadata_read_attempts = 0;

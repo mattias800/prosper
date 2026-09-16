@@ -3156,6 +3156,15 @@ endif()
       # Capture -> serialize -> owned replay backing -> SAME live renderer -> pixels. This specifically
       # proves replay textures do not dereference the captured guest VA and still sample exact bytes.
       add_executable(test_gpu_capture_render tests/misc/test_gpu_capture_render.cpp)
+      add_executable(test_depth_cube_source_snapshot tests/shared/live/test_depth_cube_source_snapshot.cpp)
+      target_include_directories(test_depth_cube_source_snapshot PRIVATE frontends src tests)
+      target_link_libraries(test_depth_cube_source_snapshot PRIVATE prosper_core prosper_live_renderer Vulkan::Vulkan)
+      add_test(NAME depth_cube_source_snapshot COMMAND test_depth_cube_source_snapshot)
+      add_test(NAME depth_cube_source_snapshot_control COMMAND test_depth_cube_source_snapshot --control)
+      set_tests_properties(depth_cube_source_snapshot PROPERTIES
+        ENVIRONMENT "PROSPER_GPU_REPLAY_DS_SEEDS=1")
+      set_tests_properties(depth_cube_source_snapshot_control PROPERTIES
+        ENVIRONMENT "PROSPER_GPU_REPLAY_DS_SEEDS=1;PROSPER_NO_CUBE_SOURCE_SNAPSHOT_PRUNING=1")
       add_executable(test_decoder_source_snapshot tests/shared/live/test_decoder_source_snapshot.cpp)
       target_include_directories(test_decoder_source_snapshot PRIVATE frontends src tests)
       target_link_libraries(test_decoder_source_snapshot PRIVATE prosper_core prosper_live_renderer Vulkan::Vulkan)
