@@ -405,12 +405,6 @@ class PerformanceCaptureReportTests(unittest.TestCase):
             print_summary(summary)
         self.assertIn("window coverage: unavailable", output.getvalue())
 
-    def _printed(self, summary):
-        output = io.StringIO()
-        with contextlib.redirect_stdout(output):
-            print_summary(summary)
-        return output.getvalue()
-
     def test_unavailable_lines_name_the_actual_cause_not_a_plausible_one(self):
         # Review of #3701 found the first version printing "records carry no timestamps" for every
         # state that left the span unset -- including a capture that retained no records at all,
@@ -432,9 +426,15 @@ class PerformanceCaptureReportTests(unittest.TestCase):
         # ...and the coverage line beside it must NOT deny timestamps, because this record has one.
         self.assertIsNotNone(single["coverage"])
 
+        # Two DISTINCT in-window timestamps plus one bare record. The two distinct values are what
+        # make `detail_seconds` computable and so make the "every record completed inside" note
+        # REACHABLE -- with a single timestamp the branch is unreachable regardless of the gate, and
+        # the assertion below would have passed before the fix as well as after it.
         partial = summarize(capture(SAMPLES, renderer=[
-            {"total_ms": 1, "t_ns": 100}, {"total_ms": 1}]))
-        self.assertIn("only 1 of 2 records carry timestamps", partial["detail_status"])
+            {"total_ms": 1, "t_ns": 100_000_000},
+            {"total_ms": 1, "t_ns": 900_000_000},
+            {"total_ms": 1}]))
+        self.assertIn("only 2 of 3 records carry timestamps", partial["detail_status"])
         # A population that cannot be partitioned must not claim every record landed inside.
         self.assertIsNone(partial["detail_outside"])
         self.assertNotIn("every record completed inside", self._printed(partial))
@@ -477,9 +477,11 @@ class PerformanceCaptureReportTests(unittest.TestCase):
             print_summary(summary)
         self.assertIn("(60 over 1.00 s)", output.getvalue())
 
-    def test_a_late_first_post_sample_shortens_only_the_rate_window(self):
-        # The rate window starts at the FIRST post sample, so a late first sample shortens it while
-        # leaving the detail population alone. The two must move independently.
+    def test_a_late_first_post_sample_displaces_only_the_rate_window(self):
+        # The rate window starts at the FIRST post sample, so a late first sample DISPLACES it --
+        # the span is 1.00 s either way -- while leaving the detail population where it was. The two
+        # must move independently, which is the property under test; an earlier name said
+        # "shortens", which this fixture does not do.
         late = [
             {"t_ns": 2_000_000_000, "process_cpu_ns": 0, "guest_presents": 0,
              "rendered_frames": 0, "host_presented_frames": 0},
