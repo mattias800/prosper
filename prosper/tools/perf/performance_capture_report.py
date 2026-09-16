@@ -241,7 +241,10 @@ def _counter_delta(samples, field):
         return None
     first = samples[0].get(field)
     last = samples[-1].get(field)
-    if first is None or last is None:
+    if first is None or last is None or last < first:
+        # Same guard `_counter_rate` applies: these are monotonic counters, so a decrease means the
+        # samples are not a usable pair (a reset, or records out of order). Reporting "-4 events"
+        # beside a rate of "unavailable" would be worse than reporting nothing.
         return None
     return last - first
 
@@ -667,14 +670,32 @@ def summarize(records):
     # time. A record completing inside the window may have begun before it, and asynchronous GPU work
     # it accounts for may have run earlier still. So "records inside the window" bounds which records
     # are counted; it does NOT prove the whole CPU/GPU interval each one measures lies inside.
-    detail_times = sorted(record["t_ns"] for record in (renderer + compute)
+    detail_records = renderer + compute
+    detail_times = sorted(record["t_ns"] for record in detail_records
                           if record.get("t_ns") is not None)
     detail_seconds = None
     if len(detail_times) >= 2 and detail_times[-1] > detail_times[0]:
         detail_seconds = (detail_times[-1] - detail_times[0]) / 1e9
+    # Several distinct states all leave `detail_seconds` unset, and they are NOT the same fact. An
+    # earlier revision printed "records carry no usable timestamps" for every one of them, which is
+    # false for the commonest -- a capture that retained no detail records at all, which is exactly
+    # what F8 on a hung title produces. Stating a plausible cause instead of the real one is the same
+    # defect this whole change is about, one level up.
+    if not detail_records:
+        detail_status = "no renderer or compute records were retained"
+    elif not detail_times:
+        detail_status = "records carry no timestamps"
+    elif len(detail_times) < len(detail_records):
+        detail_status = (f"only {len(detail_times)} of {len(detail_records)} records carry "
+                         "timestamps")
+    elif detail_seconds is None:
+        detail_status = (f"all {len(detail_times)} record(s) share one timestamp, so they span no "
+                         "measurable interval")
+    else:
+        detail_status = None
     detail_outside = None
     windowed_renderer, windowed_compute = renderer, compute
-    if post and detail_times:
+    if post and detail_times and len(detail_times) == len(detail_records):
         low, high = post[0].get("t_ns", 0), post[-1].get("t_ns", 0)
         detail_outside = sum(1 for value in detail_times if value < low or value > high)
         # One comparable cohort for any ratio against the sampled window: records that COMPLETED
@@ -753,7 +774,19 @@ def summarize(records):
     # Unavailable rather than approximate: with no timestamps on the detail records there is no
     # cohort to form, and a ratio across two populations is exactly the misleading number #3678
     # reports. A verdict must not rest on it.
+    # `detail_outside` is set only when EVERY detail record carries a timestamp: a partially
+    # timestamped population cannot be partitioned, and claiming "every record completed inside the
+    # window" from a subset would be a false statement about the records with none.
     coverage = (windowed_total / wall_ms) if (wall_ms and detail_outside is not None) else None
+    if coverage is None:
+        coverage_status = ("the capture has no post-sample window to measure against"
+                           if not wall_ms else
+                           f"the detail records cannot be aligned to it -- {detail_status}")
+    else:
+        coverage_status = None
+    # None rather than the unclipped total: publishing the whole population under a name that says
+    # "windowed" invites exactly the mix-up this change removes from the printed report.
+    windowed_total_ms = windowed_total if coverage is not None else None
     if measured_total > 0:
         largest, cost = max(classification_components.items(), key=lambda item: item[1])
         share = cost / measured_total
@@ -847,8 +880,10 @@ def summarize(records):
         "seconds": seconds,
         "detail_seconds": detail_seconds,
         "detail_outside": detail_outside,
-        "windowed_total_ms": windowed_total,
+        "windowed_total_ms": windowed_total_ms,
         "coverage": coverage,
+        "detail_status": detail_status,
+        "coverage_status": coverage_status,
         "rate_events": rate_events,
         "cpu_cores": cpu_cores,
         "rss_min": min(rss) if rss else None,
@@ -960,7 +995,7 @@ def print_summary(summary):
     # Printed as its own line, never folded into the one above, because the whole defect in #3678 was
     # a reader dividing a detail sum by the sample window as though they described one population.
     if summary["detail_seconds"] is None:
-        print("detail record span: unavailable (records carry no usable timestamps)")
+        print(f"detail record span: unavailable ({summary['detail_status']})")
     else:
         outside = summary["detail_outside"]
         note = ""
@@ -1004,8 +1039,8 @@ def print_summary(summary):
           f"compute={summary['compute_total_ms']:.1f} ms "
           f"(ALL retained records, not clipped to the sample window)")
     if summary["coverage"] is None:
-        print("window coverage: unavailable -- detail records carry no timestamps, so they cannot "
-              "be aligned to the sampled window and no ratio between them is meaningful")
+        print(f"window coverage: unavailable -- {summary['coverage_status']}, so no ratio between "
+              "them is meaningful")
     else:
         print(f"window coverage: {summary['windowed_total_ms']:.1f} ms of renderer+compute work "
               f"completed inside the {summary['seconds']:.2f} s window ({summary['coverage']:.0%})")

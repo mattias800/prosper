@@ -405,6 +405,68 @@ class PerformanceCaptureReportTests(unittest.TestCase):
             print_summary(summary)
         self.assertIn("window coverage: unavailable", output.getvalue())
 
+    def _printed(self, summary):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            print_summary(summary)
+        return output.getvalue()
+
+    def test_unavailable_lines_name_the_actual_cause_not_a_plausible_one(self):
+        # Review of #3701 found the first version printing "records carry no timestamps" for every
+        # state that left the span unset -- including a capture that retained no records at all,
+        # which is what F8 on a hung title produces. A report whose explanation is wrong is the same
+        # defect this change exists to remove, so each cause is asserted by TEXT.
+        empty = summarize(capture(SAMPLES))
+        self.assertIsNone(empty["detail_seconds"])
+        self.assertEqual(empty["detail_status"], "no renderer or compute records were retained")
+        printed = self._printed(empty)
+        self.assertIn("no renderer or compute records were retained", printed)
+        self.assertNotIn("carry no timestamps", printed)
+
+        untimed = summarize(capture(SAMPLES, renderer=[{"total_ms": 1}]))
+        self.assertEqual(untimed["detail_status"], "records carry no timestamps")
+
+        single = summarize(capture(SAMPLES, renderer=[{"total_ms": 1, "t_ns": 500_000_000}]))
+        self.assertIsNone(single["detail_seconds"])
+        self.assertIn("share one timestamp", single["detail_status"])
+        # ...and the coverage line beside it must NOT deny timestamps, because this record has one.
+        self.assertIsNotNone(single["coverage"])
+
+        partial = summarize(capture(SAMPLES, renderer=[
+            {"total_ms": 1, "t_ns": 100}, {"total_ms": 1}]))
+        self.assertIn("only 1 of 2 records carry timestamps", partial["detail_status"])
+        # A population that cannot be partitioned must not claim every record landed inside.
+        self.assertIsNone(partial["detail_outside"])
+        self.assertNotIn("every record completed inside", self._printed(partial))
+
+    def test_coverage_unavailable_distinguishes_no_window_from_no_alignment(self):
+        # `coverage` is also None when there is no post-sample window at all -- a property of the
+        # SAMPLES, not of the records. The first version blamed the records either way.
+        no_window = summarize(capture(SAMPLES[:1], renderer=[{"total_ms": 1, "t_ns": 0}]))
+        self.assertIsNone(no_window["coverage"])
+        self.assertIn("no post-sample window", no_window["coverage_status"])
+        self.assertNotIn("carry no timestamps", self._printed(no_window))
+
+    def test_windowed_total_is_withheld_rather_than_reported_unclipped(self):
+        # Publishing the whole population under a key named "windowed" would reintroduce the exact
+        # mix-up removed from the printed report.
+        untimed = summarize(capture(SAMPLES, renderer=[{"total_ms": 100}]))
+        self.assertIsNone(untimed["coverage"])
+        self.assertIsNone(untimed["windowed_total_ms"])
+
+    def test_counter_delta_rejects_a_decreasing_counter(self):
+        # These are monotonic counters; a decrease means the pair is unusable, and printing
+        # "unavailable (-4 over 5.02 s)" would be worse than printing nothing.
+        backwards = [
+            {"t_ns": 0, "process_cpu_ns": 0, "guest_presents": 60,
+             "rendered_frames": 10, "host_presented_frames": 9},
+            {"t_ns": 1_000_000_000, "process_cpu_ns": 10, "guest_presents": 56,
+             "rendered_frames": 10, "host_presented_frames": 9},
+        ]
+        summary = summarize(capture(backwards))
+        self.assertIsNone(summary["rate_events"]["guest_fps"])
+        self.assertNotIn("-4 over", self._printed(summary))
+
     def test_rates_expose_their_numerator_so_one_event_is_visible(self):
         # #3678's own example: 36 events against 35 read as 7.16884 and 7.34651 per second, a gap
         # smaller than one event's contribution. The count has to be on the page.
