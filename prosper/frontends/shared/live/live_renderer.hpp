@@ -87,6 +87,13 @@ struct TextureDecodeScopeStats {
     // Encoded source bytes handed to admitted persistent entries; excludes guest reads.
     uint64_t source_snapshot_copied_bytes = 0;
     uint64_t source_snapshot_transferred_bytes = 0;
+    // Actual preparation work, including work whose result is later discarded. These counters
+    // constrain admission ordering without relying on elapsed time or unchanged output pixels.
+    uint64_t dcc_metadata_read_attempts = 0;
+    uint64_t dcc_metadata_read_bytes = 0;
+    uint64_t compute_import_span_queries = 0;
+    uint64_t generic_source_copied_bytes = 0;
+    uint64_t generic_source_copy_deferrals = 0;
 };
 TextureDecodeScopeStats texture_decode_scope_stats();
 void reset_texture_decode_scope_stats();

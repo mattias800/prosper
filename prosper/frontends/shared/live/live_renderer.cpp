@@ -4135,8 +4135,15 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         // provided we re-check the complete metadata plane before every reuse.  Other
                         // metadata states remain on the existing fast-clear/unsupported paths: caching
                         // them from base bytes alone would miss a metadata-only content transition.
+                        static const bool prune_unused_texture_preparation =
+                            PROSPER_ENV_VALUE("PROSPER_NO_TEXTURE_PREPARATION_PRUNING") == nullptr;
+                        // These branches already own the sampled pixels. DCC describes guest
+                        // backing that neither winner consumes. CPU-only RTTs retain preparation:
+                        // their injection can fail and still needs the ordinary guest fallback.
                         const uint64_t sampled_dcc_metadata_size =
-                            !has_ds_live && r.compression_enabled
+                            !has_ds_live && r.compression_enabled &&
+                            !(prune_unused_texture_preparation &&
+                              (has_gpu_live_rtt || has_uniform_live_rtt))
                             ? prosper::gpu::gpu_capture_dcc_metadata_footprint(r)
                             : 0u;
                         std::vector<uint8_t> sampled_dcc_metadata(
@@ -4145,6 +4152,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             ? copy_dcc_metadata(sampled_dcc_metadata.data(),
                                                 sampled_dcc_metadata.size())
                             : 0u;
+                        if (sampled_dcc_metadata_size) {
+                            ++g_texture_decode_scope.dcc_metadata_read_attempts;
+                            g_texture_decode_scope.dcc_metadata_read_bytes += sampled_dcc_metadata_got;
+                        }
                         const bool persistent_dcc_uncompressed = r.compression_enabled &&
                             sampled_dcc_metadata_got == sampled_dcc_metadata.size() &&
                             !sampled_dcc_metadata.empty() &&
@@ -4177,23 +4188,31 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         // Uint16 2D-array producer is keyed by all six. Keep that exception beside
                         // the importer; ordinary decoded formats continue to use the exact span the
                         // persistent cache validates.
-                        const uint64_t compute_image_guest_bytes =
-                            prosper::frontend::live_compute_graphics_import_guest_bytes(
-                                r, persistent_source_size);
                         const bool compute_image_shape =
                             (r.img_dim == 1u && r.depth == 1u) ||
                             (r.img_dim == 2u && r.depth != 0u) ||
                             (r.img_dim == 3u && r.depth == 6u);
-                        const bool compute_image_candidate =
+                        const bool compute_image_import_eligible =
                             !PROSPER_ENV_VALUE("PROSPER_NO_DIRECT_COMPUTE_IMAGE_BIND") &&
                             !has_live_rtt && !has_ds_live && r.cls == RC::Texture &&
                             compute_image_shape && !r.in_mip_tail &&
                             r.declared_mip_levels == 1u && !r.srgb &&
                             (!r.depth_compare || (r.img_dim == 3u && r.depth == 6u)) &&
                             !r.host_data &&
-                            compute_image_guest_bytes &&
                             (!r.compression_enabled || persistent_dcc_uncompressed) &&
                             compute_image_format != VK_FORMAT_UNDEFINED;
+                        // A zero decode span can trigger a full tiled capture-footprint derivation.
+                        // Resolve it only after the independent import prerequisites pass; keep the
+                        // same exact extent/alias proof for every import that can actually run.
+                        uint64_t compute_image_guest_bytes = 0;
+                        if (!prune_unused_texture_preparation || compute_image_import_eligible) {
+                            ++g_texture_decode_scope.compute_import_span_queries;
+                            compute_image_guest_bytes =
+                                prosper::frontend::live_compute_graphics_import_guest_bytes(
+                                    r, persistent_source_size);
+                        }
+                        const bool compute_image_candidate =
+                            compute_image_import_eligible && compute_image_guest_bytes;
                         resource_compute_image_candidate = compute_image_candidate;
                         if (compute_image_candidate &&
                             prosper::frontend::import_live_compute_storage_image(
@@ -5334,6 +5353,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         size_t nb = volume_texels * output_bpp *
                             (is_cube ? 6u : (is_array ? decoded_layers : 1u));
                         size_t linear_source_prefix_size = 0;
+                        bool generic_source_copy_deferred = false;
                         ++g_texture_decode_scope.decodes;
                         const size_t texture_slot = acquire_texstore_slot();
                         std::vector<uint8_t>& texture_pixels = texstore[texture_slot];
@@ -6641,11 +6661,31 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             linear_source_prefix_size = copy_linear_padded_rows(
                                 texture_pixels.data(), linear_dst_row, th);
                         } else {
-                            const size_t got = copy_resource(
-                                texture_pixels.data(), sampled_source_addr, nb);
-                            linear_source_prefix_size = got;
-                            if (got < nb)
-                                std::fill(texture_pixels.begin() + got, texture_pixels.end(), 0);
+                            // Ordinary RGBA8 detiling reads its own padded source below and writes
+                            // every output byte. Preserve the raw copy for inspectors and for shapes
+                            // with partial-write/conversion semantics; short backing still takes the
+                            // historical recovery copy before detiling.
+                            generic_source_copy_deferred = prune_unused_texture_preparation &&
+                                !rtt_hit && !cube_done && !array_done && !dcc_fast_clear_done &&
+                                !fr.gpu_detile && !bcb && !narrow_decode_done &&
+                                !f16_done && !f32_done && !portable_raw_uvec4_storage &&
+                                output_bpp == 4u &&
+                                r.format == prosper::gpu::DataFormat::Unorm8 &&
+                                r.num_components == 4u && !is_cube && !is_array && !is_volume &&
+                                !r.in_mip_tail && prosper::gpu::tile_mode_is_tiled(r.tile_mode) &&
+                                prosper::gpu::detile_writes_whole_destination(r.tile_mode, 4u) &&
+                                !PROSPER_ENV_VALUE("PROSPER_NODETILE") &&
+                                !PROSPER_ENV_ON("PROSPER_DUMP_RAWTEX") && !getenv("PROSPER_GFXLOG");
+                            if (generic_source_copy_deferred) {
+                                ++g_texture_decode_scope.generic_source_copy_deferrals;
+                            } else {
+                                const size_t got = copy_resource(
+                                    texture_pixels.data(), sampled_source_addr, nb);
+                                g_texture_decode_scope.generic_source_copied_bytes += got;
+                                linear_source_prefix_size = got;
+                                if (got < nb)
+                                    std::fill(texture_pixels.begin() + got, texture_pixels.end(), 0);
+                            }
                         }
                         // PROSPER_DUMP_RAWTEX: write the raw tiled RGBA bytes (pre-detile) to a .bin for
                         // offline swizzle experimentation.
@@ -6690,6 +6730,14 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 tiled = tiled_lease.data();
                             }
                             if (got < nb) {
+                                if (generic_source_copy_deferred) {
+                                    linear_source_prefix_size = copy_resource(
+                                        texture_pixels.data(), sampled_source_addr, nb);
+                                    g_texture_decode_scope.generic_source_copied_bytes +=
+                                        linear_source_prefix_size;
+                                    std::fill(texture_pixels.begin() + linear_source_prefix_size,
+                                              texture_pixels.end(), 0);
+                                }
                                 // Reachable only on the staged path -- the direct branch above
                                 // requires tiled_bytes >= nb and then delivers all of them -- so the
                                 // lease is already the buffer just filled. Re-staging if it somehow
@@ -11551,6 +11599,15 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             (unsigned long long)g_texture_decode_scope.invalidations,
                             (unsigned long long)g_texture_decode_scope.scratch_pins,
                             submit_decode_scope_disabled ? "span" : "submit");
+                    fprintf(stderr,
+                            "[render-timing] texture_preparation cumulative_this_thread "
+                            "dcc_reads=%llu dcc_bytes=%llu compute_span_queries=%llu "
+                            "generic_copy_bytes=%llu generic_copy_deferrals=%llu\n",
+                            (unsigned long long)g_texture_decode_scope.dcc_metadata_read_attempts,
+                            (unsigned long long)g_texture_decode_scope.dcc_metadata_read_bytes,
+                            (unsigned long long)g_texture_decode_scope.compute_import_span_queries,
+                            (unsigned long long)g_texture_decode_scope.generic_source_copied_bytes,
+                            (unsigned long long)g_texture_decode_scope.generic_source_copy_deferrals);
                     size_t rtt_bytes = 0;
                     for (const auto& [addr, surface] : g_rtt) {
                         (void)addr;
