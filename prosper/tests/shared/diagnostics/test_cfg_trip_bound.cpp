@@ -559,6 +559,31 @@ int main(int argc, char** argv) {
         CHECK(!live_before.empty() && live_after != live_before,
               "control: the same sequence with no operation open DOES follow the environment");
 
+        // (e) The same, varying `bound` instead of `only_ordinal`. (d) alone binds only the emitter
+        // site that reads the ordinal (rdna2_emit_cfg.cpp:5483) -- `bound` and `only_phase` are
+        // equal on both sides of its pin, so a mutation of the site that reads THOSE
+        // (:1211, emitted_loop_trip_bound) stays invisible to it. This arm pins an armed bound and
+        // then disarms the environment, so the module must still be the bounded one.
+        //
+        // The third site (:3582) only prints the ordinal -> guest-pc map to stderr and changes no
+        // module bytes, so no word comparison can reach it; that is stated rather than papered over.
+        set_env("PROSPER_CFG_TRIP_BOUND_ORDINAL", nullptr);
+        set_env("PROSPER_CFG_TRIP_BOUND", std::to_string(kScopedBound).c_str());
+        const std::vector<uint32_t> armed_module = recompile_valu(kDispatcherLoops, kDispatcherWords, 2, 2);
+        set_env("PROSPER_CFG_TRIP_BOUND", nullptr);
+        const std::vector<uint32_t> disarmed_module = recompile_valu(kDispatcherLoops, kDispatcherWords, 2, 2);
+        CHECK(!armed_module.empty() && !disarmed_module.empty() && armed_module != disarmed_module,
+              "precondition: an armed bound and a disarmed one produce different modules");
+        set_env("PROSPER_CFG_TRIP_BOUND", std::to_string(kScopedBound).c_str());
+        std::vector<uint32_t> pinned_bound;
+        {
+            const prosper::gpu::TripBoundOperation op;      // pins the armed bound
+            set_env("PROSPER_CFG_TRIP_BOUND", nullptr);     // disarm; the emitter must ignore it
+            pinned_bound = recompile_valu(kDispatcherLoops, kDispatcherWords, 2, 2);
+        }
+        CHECK(pinned_bound == armed_module,
+              "#3714: the emitter uses the pinned BOUND too, not only the pinned ordinal");
+
         set_env("PROSPER_CFG_TRIP_BOUND_ORDINAL", nullptr);
         set_env("PROSPER_CFG_TRIP_BOUND", std::to_string(kBound).c_str());
         set_env("PROSPER_CFG_TRIP_BOUND_PHASE", "0");

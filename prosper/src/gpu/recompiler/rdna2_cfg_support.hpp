@@ -2013,15 +2013,23 @@ inline const ComputeTripBoundSettings*& trip_bound_pin() {
 // about removing per-draw getenv, in a place nobody re-derives. Three of the callers are not in the
 // recompiler at all — gpu_executor.cpp builds the shader-cache KEY from these settings, so they are
 // read on every cache HIT as well as every miss, i.e. once or twice per draw. Measured on a 240 s
-// routed Grand Theft Auto V window with the switch unset (#3714): 3,941,101 reads of
-// PROSPER_CFG_TRIP_BOUND, ~16,400/s, the largest single getenv name left after #3712. An unset name
-// is the expensive case on glibc — a full scan of environ — so those are all misses.
+// routed Grand Theft Auto V window with the switch unset (#3714): 3,989,848 reads of
+// PROSPER_CFG_TRIP_BOUND at `ec02a77f6`, ~16,600/s. That is nominally the largest remaining getenv
+// name, but it leads PROSPER_GFXLOG by 0.39% while GFXLOG itself varies by 35,143 between two runs
+// of the same route -- so read the two as jointly largest, not ranked. An unset name is the
+// expensive case on glibc -- a full scan of environ -- so those are all misses.
+//
 // The body. `parse_trip_bound_settings()` and `compute_trip_bound_settings()` are declared in the
-// public header and defined ONCE in rdna2_to_spirv.cpp on top of this. The reason is [basic.def.odr]
-// rather than anything about symbol emission: an `inline` function must be defined in every
-// translation unit that uses it, and this header is internal to src/gpu/recompiler/, so a TU outside
-// it -- `test_trip_bound_operation`, say -- cannot legally see a definition at all. In practice the
-// link also fails, because every recompiler TU inlines its call and no out-of-line copy survives.
+// public header and defined ONCE in rdna2_to_spirv.cpp on top of this. The reason is
+// [basic.def.odr]/11: an `inline` function must be defined in every translation unit that uses it,
+// and this header is internal to src/gpu/recompiler/, so a TU outside it -- the new
+// `test_trip_bound_operation` -- cannot legally see a definition at all.
+//
+// Do NOT restate that as "no out-of-line copy survives". It does: on `ec02a77f6` gpu_executor.cpp
+// calls `compute_trip_bound_settings()` through the public declaration WITHOUT including this
+// header, and links. What was actually observed is narrower -- linking the new test against
+// libprosper_core.a failed with an undefined reference -- and the mechanism for that was not
+// established, so it is recorded as the symptom it is.
 inline ComputeTripBoundSettings parse_trip_bound_settings_impl() {
     trip_bound_parse_counter().fetch_add(1, std::memory_order_relaxed);
     ComputeTripBoundSettings settings;
