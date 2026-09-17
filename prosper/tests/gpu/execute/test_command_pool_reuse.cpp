@@ -177,9 +177,14 @@ int main() {
         check(post_flood.cached == 0, "control: reuse disabled retains nothing at all");
     }
 
-    // What this file does and does not catch. Every line below was produced by APPLYING the mutation
-    // and running it, not by reading the code and reasoning about it -- an earlier version of this
-    // comment was wrong in both directions, which is the whole reason it is now measured.
+    // What this file does and does not catch. An earlier version of this comment was wrong in both
+    // directions, so read the provenance of each claim below rather than the confidence of its
+    // wording:
+    //   - every CAUGHT / NOT-CAUGHT verdict was produced by applying the mutation and running it;
+    //   - the mechanisms explaining WHY, and the statement about this device's queue families, are
+    //     reasoned from the code and the environment, and are not backed by a mutation run.
+    // The distinction is kept because a promise that is 90% true is the kind that gets trusted at
+    // the 10%.
     //
     //  * NOT CAUGHT HERE: making vkResetCommandPool a no-op (`if (true)` at its call site). All
     //    arms in this file stay green, because the difference is not observable through the handles
