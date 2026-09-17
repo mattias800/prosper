@@ -190,10 +190,14 @@ int main() {
     //    under tools/vkval/vk_validation_scan.py, and zero with the reset restored.
     //  * CAUGHT, and by design: handing the same cached pool to two live callers (deleting the
     //    free list's `erase`). The exclusive-ownership arm above fails on it. Note the run ALSO
-    //    aborts later, inside the bound arm, once a duplicated entry is destroyed while another
-    //    copy is still cached -- and the abort discards buffered stdout, so a plain run shows no
-    //    [FAIL] line at all. Read this test's failures with `stdbuf -o0` before concluding which
-    //    arm caught what.
+    //    dies with SIGABRT afterwards, once a duplicated entry is destroyed while another copy is
+    //    still cached -- and the abort discards buffered stdout, so a plain run shows NO [FAIL]
+    //    line at all and reads like a bare crash. Read this test's failures with `stdbuf -o0`
+    //    before concluding which arm caught what. (Where it dies is deliberately not named here:
+    //    the observation was rc=134 with the ownership arm already reported, and the abort point
+    //    itself was never established. Review's reading of the code puts the precondition at
+    //    iteration 7 of the reuse loop, which is earlier than an earlier version of this comment
+    //    claimed.)
     //  * GENUINELY NOT CAUGHT: ignoring `queue_family` when matching a cached pool. This device
     //    exposes one usable family, so no arm here can distinguish a correct match from a
     //    device-only one.
