@@ -8540,6 +8540,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                                   in.opcode != 0x13 && in.opcode != 0x20 &&
                                   in.opcode != 0x2d &&
                                   in.opcode != 0x0d && in.opcode != 0x0e &&
+                                  in.opcode != 0x0f && in.opcode != 0x38 &&
                                   in.opcode != 0x36 && in.opcode != 0x37 &&
                                   in.opcode != 0x3d && in.opcode != 0x3e && in.opcode != 0x4d && in.opcode != 0x4e &&
                                   in.opcode != 0x76 && in.opcode != 0x77 &&
@@ -8560,6 +8561,32 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 b.lds_store(idx0, vread(in.src[1].value), rs.exec_narrowed, rs.exec,
                             atomicize_store);
                 // Equal offsets encode one memory access and use DATA0; DATA1 is ignored.
+                if ((in.literal & 0xFFu) != ((in.literal >> 8) & 0xFFu))
+                    b.lds_store(idx1, vread(in.src[2].value), rs.exec_narrowed, rs.exec,
+                                atomicize_store);
+                return true;
+            }
+            if (in.opcode == 0x0f) {                    // ds_write2st64_b32: offsets scaled by 64
+                // AMD RDNA2 ISA 70648 §12.13: MEM[ADDR + OFFSET0/1 * 4 * 64] = DATA0/1. Identical
+                // to ds_write2_b32 (0x0e) above except each 8-bit offset counts 64-dword strides
+                // instead of single dwords, which is how a workgroup reduction lays one value per
+                // 64-lane wave without the lanes colliding.
+                //
+                // Measured need (2026-09-17): Sonic Frontiers' Cyber Space stage. Three programs
+                // use it and NOTHING else in them is unsupported -- `0x2005712000` (the exposure
+                // reduction, 7 uses), `0x2005713000` (the pass whose output the final draws consume,
+                // 7 uses) and `0x200581bb00` (22 uses). `tools/shader_inspect` generic coverage over
+                // every dumped stage shader in that scene reports `DS op=0xf` as their only gap.
+                //
+                // The equal-offset guard is the same contract as 0x0e and 0x4e: OFFSET0 == OFFSET1
+                // encodes ONE memory access which uses DATA0, so writing DATA1 as well would let the
+                // later store win and a subsequent read observe DATA1 where hardware preserves
+                // DATA0 -- silent wrong data rather than a fault (#1473).
+                const uint32_t base = b.ibin(Op_ShiftRightLogical, vread(in.src[0].value), b.uconst(2));
+                const uint32_t idx0 = b.ibin(Op_IAdd, base, b.uconst((in.literal & 0xFFu) * 64u));
+                const uint32_t idx1 = b.ibin(Op_IAdd, base, b.uconst(((in.literal >> 8) & 0xFFu) * 64u));
+                b.lds_store(idx0, vread(in.src[1].value), rs.exec_narrowed, rs.exec,
+                            atomicize_store);
                 if ((in.literal & 0xFFu) != ((in.literal >> 8) & 0xFFu))
                     b.lds_store(idx1, vread(in.src[2].value), rs.exec_narrowed, rs.exec,
                                 atomicize_store);
@@ -8615,6 +8642,27 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 const uint32_t indices[2] = {
                     b.ibin(Op_IAdd, base, b.uconst(in.literal & 0xFFu)),
                     b.ibin(Op_IAdd, base, b.uconst((in.literal >> 8) & 0xFFu)),
+                };
+                for (int k = 0; k < 2; ++k) {
+                    const uint32_t old = vreg_old(b, rs, in.dst.value + k);
+                    rs.vreg[in.dst.value + k] = b.lds_load(
+                        indices[k], rs.exec_narrowed, rs.exec, old);
+                }
+                return true;
+            }
+            if (in.opcode == 0x38) {                    // ds_read2st64_b32: offsets scaled by 64
+                // RETURN_DATA[0/1] = MEM[ADDR + OFFSET0/1 * 4 * 64]. The read sibling of 0x0f above,
+                // and implemented with it rather than after it: a kernel that lays values out on
+                // 64-dword strides reads them back the same way, so supporting only the write would
+                // move the reject one instruction later in the same program. `0x200581bb00` in this
+                // scene uses both (22 writes, 2 reads).
+                //
+                // No equal-offset guard here, deliberately: a read has no write hazard, and
+                // ds_read2_b32 (0x37) above loads both slots unconditionally for the same reason.
+                const uint32_t base = b.ibin(Op_ShiftRightLogical, vread(in.src[0].value), b.uconst(2));
+                const uint32_t indices[2] = {
+                    b.ibin(Op_IAdd, base, b.uconst((in.literal & 0xFFu) * 64u)),
+                    b.ibin(Op_IAdd, base, b.uconst(((in.literal >> 8) & 0xFFu) * 64u)),
                 };
                 for (int k = 0; k < 2; ++k) {
                     const uint32_t old = vreg_old(b, rs, in.dst.value + k);

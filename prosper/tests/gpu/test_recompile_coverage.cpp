@@ -86,6 +86,50 @@ int main() {
     CHECK(co.total == 3 && co.alu == 3 && co.unsupported == 0 && co.first_bad_fmt < 0,
           "v_add/sub/subrev_co_u32 (VOP3B carry-out) recompile as supported ALU");
 
+    // ds_write2st64_b32 (DS 0x0f) / ds_read2st64_b32 (DS 0x38). The st64 pair addresses LDS on
+    // 64-dword strides -- MEM[ADDR + OFFSET*4*64] -- which is how a workgroup reduction gives each
+    // 64-lane wave its own slot without the lanes colliding. Their non-st64 siblings (0x0e/0x37)
+    // have been emitted for a long time; the st64 forms were absent from the DS opcode allowlist,
+    // so they rejected and took their whole program with them.
+    //
+    // Measured need (2026-09-17, Sonic Frontiers PPSA03831 Cyber Space): `tools/shader_inspect`
+    // generic coverage over every dumped stage shader reports `DS op=0xf` as the ONLY unsupported
+    // instruction in `0x2005712000` (the exposure reduction) and `0x2005713000` (whose 4K output
+    // `0x2037960000` the frame's final draws consume), 7 uses each, plus 22 uses and 2 reads in
+    // `0x200581bb00`. #2790 / #3713.
+    //
+    // Encodings are the exact gfx10 words, derived from the 0x0e/0x37 pair already asserted in
+    // test_recompiled_shaders.cpp: DS base 0xD8000000 | (opcode << 18) | (offset1 << 8 | offset0).
+    const uint32_t ds_st64_code[] = {
+        0xD83C0100u, 0x00020105u,   // ds_write2st64_b32 v5, v1, v2 offset0:0 offset1:1
+        0xD8E00100u, 0x01000005u,   // ds_read2st64_b32  v[1:2], v5 offset0:0 offset1:1
+        0xBF810000u,                // s_endpgm
+    };
+    RecompileCoverage ds_st64 = recompile_coverage(ds_st64_code,
+                                                   sizeof(ds_st64_code)/sizeof(ds_st64_code[0]));
+    CHECK(ds_st64.total == 2 && ds_st64.unsupported == 0 && ds_st64.first_bad_fmt < 0,
+          "ds_write2st64_b32 / ds_read2st64_b32 recompile as supported DS ops");
+
+    // The arm above only proves the opcodes are ACCEPTED. It cannot see whether the ISA's 64-dword
+    // stride was applied, and an implementation that ignored the scaling would pass it while
+    // writing every wave's value to the same slot -- silent wrong data, which is worse than the
+    // reject it replaced. So compare the emitted modules: the st64 form must NOT equal its non-st64
+    // twin, whose only difference is that its offsets count single dwords.
+    const uint32_t ds_plain_code[] = {
+        0xD8380100u, 0x00020105u,   // ds_write2_b32 v5, v1, v2 offset0:0 offset1:1
+        0xD8DC0100u, 0x01000005u,   // ds_read2_b32  v[1:2], v5 offset0:0 offset1:1
+        0xBF810000u,
+    };
+    ComputeShaderConfig ds_st64_config;   // wave64 defaults; LDS needs only a compute shell
+    const std::vector<uint32_t> st64_spv = recompile_compute(
+        ds_st64_code, std::size(ds_st64_code), nullptr, ds_st64_config);
+    const std::vector<uint32_t> plain_spv = recompile_compute(
+        ds_plain_code, std::size(ds_plain_code), nullptr, ds_st64_config);
+    CHECK(!st64_spv.empty() && !plain_spv.empty(),
+          "both the st64 and non-st64 DS write2/read2 pairs lower to real modules");
+    CHECK(st64_spv != plain_spv,
+          "ds_*2st64_b32 scales its offsets by 64 rather than emitting the non-st64 lowering");
+
     // Coverage only inspects emit_alu's `ok` flag and discards the SPIR-V; also prove v_add_co_u32
     // lowers to a real, well-formed module (VGPR operands this time: v2 = v0 + v1, carry->vcc). Without
     // the emit branch recompile_valu returns {}; with it, a valid module (magic 0x07230203) is produced.
