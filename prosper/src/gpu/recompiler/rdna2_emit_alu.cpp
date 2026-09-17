@@ -8562,12 +8562,22 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // programs that rejected outright before these opcodes were implemented, so it costs
             // nothing that worked, and it is a bound on the constant part only: the base address is
             // a runtime VGPR and was never statically bounded for any DS opcode.
+            //
+            // The limit MUST be read the same way `declare_lds()` sizes the array --
+            // `is_compute ? lds_dwords : vertex_lds_dwords` -- and not from `lds_dwords` alone.
+            // `lds_dwords` is only ever assigned on the compute path, so testing it unconditionally
+            // would compare an NGG vertex shader's index against an unrelated 4096 default while its
+            // array is `vertex_lds_dwords` wide: a guard that is absent on exactly the path this
+            // change newly opens. Caught in review, and it is the same shape as the defect the guard
+            // exists to stop.
+            const uint32_t lds_limit = b.is_compute ? b.lds_dwords : b.vertex_lds_dwords;
             auto lds_const_index_in_range = [&](uint32_t index) {
-                if (index < b.lds_dwords) return true;
+                if (index < lds_limit) return true;
                 if (getenv("PROSPER_DBG"))
                     std::fprintf(stderr,
-                                 "[ds-st64-oob] pc=%u op=0x%x const_index=%u lds_dwords=%u\n",
-                                 in.pc, in.opcode, index, b.lds_dwords);
+                                 "[ds-st64-oob] pc=%u op=0x%x const_index=%u limit=%u stage=%s\n",
+                                 in.pc, in.opcode, index, lds_limit,
+                                 b.is_compute ? "compute" : "vertex");
                 return false;
             };
             if (in.opcode == 0x0e) {                    // ds_write2_b32: two dwords at offset0/offset1
