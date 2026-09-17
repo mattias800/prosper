@@ -1,5 +1,6 @@
 // test_rdna2_spirv_struct -- structural checks for RDNA2->SPIR-V output that do not require Vulkan.
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include "gpu/resources/mip_chain_plan.hpp"
 #include "gpu/resources/shader_resources.hpp"
 #include <algorithm>
 #include <array>
@@ -5493,6 +5494,89 @@ int main() {
         return 1;
     }
     printf("  [ok]   IMAGE_LOAD_MIP 2D_ARRAY preserves its slice in an arrayed OpImageFetch\n");
+
+    // Sonic Frontiers (PPSA03831) Cyber Space, #2818. Its three scene-width stage kernels issue
+    // IMAGE_LOAD_MIP against a 2048x2048 twelve-level R32G32_FLOAT 2D_ARRAY with a RUNTIME mip
+    // operand, so the zero-mip specialization can never admit them and the DYNAMIC path must.
+    // Measured live on 2026-09-17 (routed boot_trace census, in-stage arm):
+    //   [mimg-mip] declined pc=33 img_dim=5/1 mips=12 mip_tail=0 compressed=0 layer_stride=0
+    //              dyn_shape=1 nsa=0 materialized_mips=12 compute=1
+    // i.e. the address shape IS recognised and the chain PLAN resolves twelve levels -- every
+    // headline precondition of this gate holds and the lowering still declined. The remaining
+    // term was the S#-derived FORCE_UNNORMALIZED bit, which is meaningless for a non-sampling
+    // load: IMAGE_LOAD_MIP addresses texels by integer coordinate and consumes no sampler at all.
+    // The zero-mip acceptance path above never consulted it, so the two IMAGE_LOAD_MIP routes
+    // disagreed about whether a sampler flag gates a load.
+    //
+    // `materialized_mips` is `shader_resource_compute_mip_chain_levels` -- the chain PLAN's level
+    // count, NOT a statement that the backend will build the chain. DO NOT read it as one: the
+    // backend applies a SECOND, independent admission test this emitter never consults,
+    // `compute_binding_mip_chain_materializable` (live_compute.cpp), which still refuses
+    // `img_dim != 1`. So for THIS title's 2D_ARRAY resource the dispatch remains declined
+    // downstream, at `[compute-mip-chain]` instead of here. Clearing one gate is not opening the
+    // path -- "a terminal reject line is a lower bound of one", one layer down.
+    // Encoding note, so nobody reads more fidelity into this than it has: the live packet is
+    // `f0040308,00000101` (dmask=0x3, UNRM=0, GLC=0); this one is dmask=0xF, UNRM=1, GLC=1. The
+    // RESOURCE fields -- which are what this gate tests -- match the live ones exactly. The packet
+    // difference is confined to one term of the OTHER path: `rdna2_mimg_zero_mip_shape` requires
+    // UNRM && GLC, so this fixture satisfies it (`shape=1`) where the live one does not
+    // (`shape=0`). That only makes the arm STRICTER -- the zero-mip route is closer to admitting
+    // this fixture than it is to admitting the real packet, and it still declines on
+    // `proven_zero_mip`, `declared_mip_levels != 1` and `img_dim != mimg_dim`.
+    const uint32_t frontiers_load_mip_dynamic[] = {
+        0xf0043f08u, 0x00050000u,            // IMAGE_LOAD_MIP xyzw 2D, mip operand NOT folded to 0
+        0xbf810000u,
+    };
+    ShaderResourceTable rt_frontiers_dynamic;
+    { ShaderResource texture{}; texture.cls = ResourceClass::Texture;
+      texture.format = DataFormat::Float32; texture.num_components = 2;
+      texture.binding = 4; texture.fetch_pc = 0; texture.img_dim = 5;
+      texture.width = 2048; texture.height = 2048; texture.depth = 1;
+      texture.declared_mip_levels = 12; texture.sample_count = 1; texture.tile_mode = 27;
+      texture.mip_chain_element_width = 2048; texture.mip_chain_element_height = 2048;
+      texture.mip_chain_bytes_per_block = 8; texture.mip_chain_max_level = 11;
+      texture.mip_chain_base_level = 0;
+      texture.size = 2048u * 2048u * 8u;
+      rt_frontiers_dynamic.resources.push_back(texture); }
+
+    // Self-validation FIRST. If this fixture does not reproduce the live twelve-level chain then
+    // the arm below is exercising some other shape and a pass would mean nothing -- the failure
+    // this guards against is an arm that sits NEXT to the case it claims to cover.
+    if (prosper::gpu::shader_resource_compute_mip_chain_levels(
+            rt_frontiers_dynamic.resources[0]) != 12u) {
+        printf("  [FAIL] fixture does not materialize the live 12-level chain; arm tests nothing\n");
+        return 1;
+    }
+
+    // Control: with FORCE_UNNORMALIZED clear the dynamic path already admits this resource. This
+    // is what makes the arm below a discriminator rather than a bare assertion -- it shows the
+    // lever moves, and that the ONLY difference between accept and decline is that one bit.
+    const std::vector<uint32_t> frontiers_normalized_spv = recompile_valu(
+        frontiers_load_mip_dynamic, std::size(frontiers_load_mip_dynamic), 1, 0,
+        &rt_frontiers_dynamic);
+    if (frontiers_normalized_spv.empty() || !has_opcode(frontiers_normalized_spv, OpImageFetch)) {
+        printf("  [FAIL] dynamic-mip IMAGE_LOAD_MIP rejected a materialized 12-level chain\n");
+        return 1;
+    }
+
+    ShaderResourceTable rt_frontiers_unnormalized = rt_frontiers_dynamic;
+    rt_frontiers_unnormalized.resources[0].unnormalized = 1;
+    const std::vector<uint32_t> frontiers_unnormalized_spv = recompile_valu(
+        frontiers_load_mip_dynamic, std::size(frontiers_load_mip_dynamic), 1, 0,
+        &rt_frontiers_unnormalized);
+    if (frontiers_unnormalized_spv.empty() ||
+        !has_opcode(frontiers_unnormalized_spv, OpImageFetch)) {
+        printf("  [FAIL] FORCE_UNNORMALIZED still gates a non-sampling IMAGE_LOAD_MIP\n");
+        return 1;
+    }
+    // The bit must have NO effect on a load, so the two modules must be byte-identical -- a far
+    // stronger contract than "both contain an OpImageFetch", and the one that reddens if anyone
+    // ever reintroduces a coordinate transform on this path.
+    if (frontiers_unnormalized_spv != frontiers_normalized_spv) {
+        printf("  [FAIL] FORCE_UNNORMALIZED changed the emitted IMAGE_LOAD_MIP module\n");
+        return 1;
+    }
+    printf("  [ok]   dynamic IMAGE_LOAD_MIP ignores the sampler's FORCE_UNNORMALIZED bit\n");
 
     const uint32_t gta_store_mip_2d[] = {
         0x7e0a0206u,                         // v_mov_b32 v5, s6 (production fold proves zero)

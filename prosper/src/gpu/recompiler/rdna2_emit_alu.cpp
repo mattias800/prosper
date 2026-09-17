@@ -7926,7 +7926,15 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // backend materializes this resource's whole declared chain -- one derivation,
             // `shader_resource_compute_mip_chain_levels`, read by BOTH this lowering and
             // live_compute's image creation so the two cannot disagree about how many levels exist
-            // -- the operand reaches OpImageFetch's Lod. This is the only honest answer for the
+            // -- the operand reaches OpImageFetch's Lod.
+            //
+            // That agreement is about the COUNT ONLY, and reading it as more is a documented
+            // mistake (#2818): live_compute applies a SECOND, independent SHAPE test that this
+            // lowering never consults -- `compute_binding_mip_chain_materializable`, which still
+            // refuses `img_dim != 1` -- so a resource admitted here can still have its dispatch
+            // dropped downstream at `[compute-mip-chain]`. A non-zero level count from this
+            // function is NOT a promise that the backend will build the chain.
+            // This is the only honest answer for the
             // dynamic case: Sonic Frontiers' three scene-width stage kernels issue IMAGE_LOAD_MIP
             // against a 12-level 2048x2048 R32G32_FLOAT surface with the mip NOT provably zero, so
             // the specialization below can never admit them.
@@ -7942,6 +7950,36 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 rdna2_mimg_dynamic_mip_shape(in, &dynamic_mip_vgpr) &&
                 in.mimg_dim == SQ_DIM_2D &&
                 prosper::gpu::shader_resource_uses_ordinary_2d_image(*res, true, false, false) &&
+                // `res->unnormalized` used to be refused here. It is NOT a property of this
+                // operation (#2818). FORCE_UNNORMALIZED is S# WORD0[15] -- a SAMPLER bit that
+                // decides how a sample's coordinates are interpreted -- and `IMAGE_LOAD_MIP`
+                // binds no sampler at all: it addresses texels by integer coordinate, so there
+                // are no normalized coordinates for the bit to describe. The zero-mip
+                // specialization immediately below never consulted it, so the two IMAGE_LOAD_MIP
+                // routes disagreed about whether a sampler flag gates a load; this is the half
+                // that was wrong.
+                //
+                // Measured: Sonic Frontiers' three scene-width Cyber Space kernels declined with
+                // `ord2d=1 res_unnorm=1 depth_cmp=0 dim_is_2d=1 dyn_shape=1 materialized_mips=12`
+                // -- every other term of THIS gate satisfied, the chain PLAN resolving twelve
+                // levels, and this one sampler bit holding the lowering. CONFIDENCE: HIGH -- the
+                // operand is an integer texel coordinate by ISA definition, and the accepting
+                // sibling path already ignores the bit.
+                //
+                // `materialized_mips` is a PLAN count, NOT "the backend built the chain" -- see
+                // the note on `shader_resource_compute_mip_chain_levels` above. For this title's
+                // 2D_ARRAY resource the dispatch is still declined downstream; admitting it here
+                // moves the reject, it does not open the path.
+                //
+                // `depth_compare` is NOT removed alongside it. It is equally meaningless for a
+                // load, but it is only ever set for IMAGE_SAMPLE_C* (see its declaration), so no
+                // measured resource reaches here with it set and widening it would be an
+                // unexercised change. Note the standalone `!res->depth_compare` below is
+                // redundant belt-and-braces: `shader_resource_uses_ordinary_2d_image` already
+                // tests it (shader_resources.hpp). Kept deliberately so this gate reads as a
+                // complete statement of its own terms rather than depending on a helper's
+                // internals.
+                //
                 // `in_mip_tail` used to be refused here as well. It no longer is (#3134): a
                 // tail-packed selected level is a MODELLED placement, and the level count above is
                 // the authority on it -- `shader_resource_mip_chain_plan` admits the tail only
@@ -7950,7 +7988,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // kept refusing the whole small-texture class (Stray's 32x32 six-level pyramid is
                 // smaller than one 64 KiB macroblock, so EVERY one of its levels is in the tail)
                 // for a placement the backend now uploads.
-                !res->unnormalized && !res->depth_compare &&
+                !res->depth_compare &&
                 res->sample_count == 1u && !res->compression_enabled;
             // IMAGE_LOAD_MIP's final address is a real guest mip selector. Specialize it away only
             // after the per-use fold and the materialized-resource checks agree. The 2D_ARRAY form
@@ -7988,7 +8026,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                                  "compressed=%d array_in_gfx=%d addr=0x%llx %ux%ux%u "
                                  "dataformat=%d ncomp=%u "
                                  "tile=%u dmask=0x%x unorm=%u glc=%u layer_stride=%u "
-                                 "dyn_shape=%d nsa=%u materialized_mips=%u compute=%d\n",
+                                 "dyn_shape=%d nsa=%u materialized_mips=%u compute=%d "
+                                 "ord2d=%d res_unnorm=%u depth_cmp=%u dim_is_2d=%d\n",
                                  (unsigned long long)b.diagnostic.program_address, in.pc,
                                  (int)rdna2_mimg_zero_mip_shape(in),
                                  (int)res->proven_zero_mip, res->img_dim, in.mimg_dim,
@@ -8006,7 +8045,17 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                                  // (#3134's original state) from "the chain is not materialized on
                                  // this stage" -- which are different pieces of work.
                                  (int)rdna2_mimg_dynamic_mip_shape(in), in.mimg_nsa,
-                                 materialized_mip_levels, (int)b.is_compute);
+                                 materialized_mip_levels, (int)b.is_compute,
+                                 // The remaining terms of the DYNAMIC gate. Without these the line
+                                 // reports `dyn_shape=1 materialized_mips=12 compute=1` -- every
+                                 // headline precondition satisfied -- and still says "declined",
+                                 // which names no work. `res_unnorm` and `depth_cmp` are the
+                                 // RESOURCE's own fields; the `unorm=` field above is the
+                                 // INSTRUCTION's `mimg_unorm` and is a different thing.
+                                 (int)prosper::gpu::shader_resource_uses_ordinary_2d_image(
+                                     *res, true, false, false),
+                                 res->unnormalized, (unsigned)res->depth_compare,
+                                 (int)(in.mimg_dim == SQ_DIM_2D));
                 ok = false;
                 return true;
             }
