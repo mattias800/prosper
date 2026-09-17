@@ -40,7 +40,13 @@
 #include <set>
 #include <cstdint>
 #include <cstdio>
+#if defined(_WIN32)
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
 #include <cstdlib>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -78,6 +84,55 @@ static void set_env(const char* name, const char* value) {
 #else
     if (value) setenv(name, value, 1); else unsetenv(name);
 #endif
+}
+
+// Capture stderr for one call. The dispatch-map line that arm (f) binds is emitted with fprintf
+// and changes no module bytes, so it is the only observable that reaches rdna2_emit_cfg.cpp:3582.
+// Deliberately local and minimal: the two other capture_stderr helpers in the tree live in test
+// files rather than a shared fixture, and copying either whole would bring scratch-path machinery
+// this needs nothing of.
+static std::string capture_stderr_of(const std::function<void()>& body) {
+    std::fflush(stderr);
+#if defined(_WIN32)
+    const int fd = _fileno(stderr);
+    const int saved = _dup(fd);
+#else
+    const int fd = fileno(stderr);
+    const int saved = dup(fd);
+#endif
+    if (saved < 0) return {};
+    std::string path = "cfg_trip_bound_stderr_capture.txt";
+    FILE* sink = std::fopen(path.c_str(), "w+");
+    if (!sink) {
+#if defined(_WIN32)
+        _close(saved);
+#else
+        close(saved);
+#endif
+        return {};
+    }
+#if defined(_WIN32)
+    const bool ok = _dup2(_fileno(sink), fd) == 0;
+#else
+    const bool ok = dup2(fileno(sink), fd) >= 0;
+#endif
+    if (ok) body();
+    std::fflush(stderr);
+#if defined(_WIN32)
+    _dup2(saved, fd); _close(saved);
+#else
+    dup2(saved, fd); close(saved);
+#endif
+    std::string out;
+    if (ok) {
+        std::rewind(sink);
+        char buf[4096];
+        size_t n;
+        while ((n = std::fread(buf, 1, sizeof buf, sink)) > 0) out.append(buf, n);
+    }
+    std::fclose(sink);
+    std::remove(path.c_str());
+    return out;
 }
 
 int main(int argc, char** argv) {
@@ -583,6 +638,34 @@ int main(int argc, char** argv) {
         }
         CHECK(pinned_bound == armed_module,
               "#3714: the emitter uses the pinned BOUND too, not only the pinned ordinal");
+
+        // (f) The third emitter site (rdna2_emit_cfg.cpp:3582) emits no SPIR-V -- it prints the
+        // ordinal -> guest-pc dispatch map to stderr under `if (compute_trip_bound_settings().bound)`.
+        // No word comparison can reach it, but the GATE is still pinned-vs-live, so stderr binds it:
+        // under a pinned-armed / live-disarmed compile the line must appear, and it is absent if
+        // that site alone reads the environment.
+        //
+        // The capture is scoped to the inside-the-operation compile ONLY. The `armed_module` compile
+        // in (e) runs with the environment armed and prints the same line, so a capture spanning
+        // both would pass under the mutation. The complementary arm below -- disarmed, no
+        // operation, nothing printed -- is what stops this passing against a site that prints
+        // unconditionally.
+        set_env("PROSPER_CFG_TRIP_BOUND", std::to_string(kScopedBound).c_str());
+        std::string pinned_stderr;
+        {
+            const prosper::gpu::TripBoundOperation op;
+            set_env("PROSPER_CFG_TRIP_BOUND", nullptr);
+            pinned_stderr = capture_stderr_of([&] {
+                (void)recompile_valu(kDispatcherLoops, kDispatcherWords, 2, 2);
+            });
+        }
+        const std::string disarmed_stderr = capture_stderr_of([&] {
+            (void)recompile_valu(kDispatcherLoops, kDispatcherWords, 2, 2);
+        });
+        CHECK(pinned_stderr.find("[cfg-trip-bound]") != std::string::npos,
+              "#3714: the dispatch-map print also honours the pin, not the live environment");
+        CHECK(disarmed_stderr.find("[cfg-trip-bound]") == std::string::npos,
+              "control: disarmed and unpinned, that line is not printed at all");
 
         set_env("PROSPER_CFG_TRIP_BOUND_ORDINAL", nullptr);
         set_env("PROSPER_CFG_TRIP_BOUND", std::to_string(kBound).c_str());

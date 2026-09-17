@@ -2027,9 +2027,11 @@ inline const ComputeTripBoundSettings*& trip_bound_pin() {
 //
 // Do NOT restate that as "no out-of-line copy survives". It does: on `ec02a77f6` gpu_executor.cpp
 // calls `compute_trip_bound_settings()` through the public declaration WITHOUT including this
-// header, and links. What was actually observed is narrower -- linking the new test against
-// libprosper_core.a failed with an undefined reference -- and the mechanism for that was not
-// established, so it is recorded as the symptom it is.
+// header, and links. What was actually observed is narrower: linking test_trip_bound_operation
+// against libprosper_core.a failed with `undefined reference to
+// 'prosper::gpu::compute_trip_bound_settings()'` -- the PRE-EXISTING function, not any of the
+// symbols this change adds, which is the only reason the observation bears on the inline question
+// at all. The mechanism for it was not established and is deliberately not guessed at here.
 inline ComputeTripBoundSettings parse_trip_bound_settings_impl() {
     trip_bound_parse_counter().fetch_add(1, std::memory_order_relaxed);
     ComputeTripBoundSettings settings;
