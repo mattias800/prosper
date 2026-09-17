@@ -308,11 +308,19 @@ HOT_SELF_TESTS = [
 
 
 # The tier-4 predicate, which is a set intersection and therefore looks too simple to test. It is
-# not the arithmetic that can break -- it is the DIRECTION. A check written the other way round
-# ("per-submit names must also be cached", or an intersection taken against the armed set instead of
-# the cached one) passes a clean tree exactly as loudly as the right one, and the clean run below is
-# what a reader would take as proof it works. Same shape as the positive-control rule in CLAUDE.md:
-# a check that has never been shown to FIRE has not been shown to do anything.
+# not the arithmetic that can break -- it is the DIRECTION. Write it as `per_submit - cached`
+# ("a per-submit name must ALSO be cached") and it reports nothing on a tree where the two sets do
+# overlap nowhere, i.e. on this one; the clean run is then what a reader takes as proof it works,
+# and it proves nothing. The two FIRING cases below are the whole defence. Same shape as the
+# positive-control rule in CLAUDE.md: a check that has never been shown to FIRE has not been shown
+# to do anything.
+#
+# What these cases can NOT see, measured rather than assumed: passing the wrong SET at the call
+# site in main() -- `check_per_submit(armed, per_submit)` instead of `cached` -- since `armed` is
+# not a parameter here and no self-test input reaches that choice. That variant fails closed (the
+# tree scan reports 5 clashes and exits 1) but it fails for the wrong reason, so read the call site
+# as well as this table. Nor do these cases see a reporting regression: stdout is discarded and
+# only the count is asserted.
 #
 # (cached, per_submit, expected number of clashes reported)
 PER_SUBMIT_SELF_TESTS = [
