@@ -41,6 +41,23 @@ inline constexpr uint32_t kSop1OpcodeFlbitI32B64 = 0x16;
 inline constexpr uint32_t kSop1OpcodeBitset0B32 = 0x1b;
 inline constexpr uint32_t kSop1OpcodeBitset1B32 = 0x1d;
 inline constexpr uint32_t kSop1OpcodeGetpcB64 = 0x1f;
+
+// SOP1 opcodes that leave SCC untouched. RDNA2 ISA 70648: most scalar ALU operations write SCC as a
+// side effect, and these do not -- moves, conditional moves, bit-reverse/count/find, bitset, and
+// s_getpc_b64.
+//
+// This list existed in THREE copies in rdna2_emit_cfg.cpp (the SCC-liveness walks) before a fourth
+// consumer needed it, and a duplicated opcode table is exactly what went wrong elsewhere in this
+// subsystem today: one copy silently fell two entries behind the decoder. One definition, here with
+// the opcode constants it names.
+inline constexpr bool sop1_opcode_preserves_scc(uint32_t opcode) {
+    return opcode == kSop1OpcodeMovB32 || opcode == kSop1OpcodeMovB64 ||
+           opcode == kSop1OpcodeCmovB32 || opcode == kSop1OpcodeCmovB64 ||
+           opcode == kSop1OpcodeBrevB32 || opcode == kSop1OpcodeBcnt1I32B64 ||
+           opcode == kSop1OpcodeFf1I32B64 || opcode == kSop1OpcodeFlbitI32B32 ||
+           opcode == kSop1OpcodeFlbitI32B64 || opcode == kSop1OpcodeBitset0B32 ||
+           opcode == kSop1OpcodeBitset1B32 || opcode == kSop1OpcodeGetpcB64;
+}
 inline constexpr uint32_t kSop1OpcodeSetpcB64 = 0x20;
 inline constexpr uint32_t kSop1OpcodeSwappcB64 = 0x21;
 inline constexpr uint32_t kSop1OpcodeRfeB64 = 0x22;
