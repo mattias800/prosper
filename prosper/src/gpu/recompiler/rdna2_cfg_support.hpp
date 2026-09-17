@@ -1626,6 +1626,7 @@ inline bool branch_is_workgroup_uniform(const std::vector<Rdna2Inst>& ins, uint3
         return !fact.empty() && index < fact.size() && fact[index] != 0;
     };
     auto sole_launch_derived_definition = [&](int reg) -> bool {
+        if (reg < 0 || reg > 105) return false;            // EXEC/VCC/SCC are not launch data
         size_t only = ins.size();
         for (size_t i = 0; i < ins.size(); ++i) {
             if (!writes_reg(ins[i], reg, 1)) continue;
@@ -1633,6 +1634,28 @@ inline bool branch_is_workgroup_uniform(const std::vector<Rdna2Inst>& ins, uint3
             only = i;
         }
         if (only == ins.size()) return false;
+        // The definition must lie in the program's ENTRY straight-line region -- before any branch.
+        //
+        // Without this the rule is UNSOUND, and the way it fails is subtle enough to be worth
+        // spelling out. "Exactly one definition, so the use saw either that value or the untouched
+        // launch value, and both are uniform" is wrong: each alternative is uniform on its own, but
+        // the CHOICE between them need not be. Put the sole `s_buffer_load` inside an
+        // `s_cbranch_vccz` arm and put the compare and the scalar branch after the merge, and waves
+        // that took the arm carry the loaded value while waves that skipped it carry the launch
+        // value. They then disagree at the branch -- so only some of them reach the `s_barrier`
+        // inside its region, which is exactly what this proof exists to prevent.
+        //
+        // Requiring the definition to precede every branch makes it dominate every use, which is
+        // the property the informal argument was silently assuming. `terminal_guard_scc_is_...`
+        // above states the same hazard for the same reason, and I read past it. Caught in review.
+        for (size_t i = 0; i < only; ++i) {
+            const Rdna2Inst& before_def = ins[i];
+            if (before_def.is_end) return false;
+            if (before_def.fmt == Rdna2Format::SOPP && !sopp_is_noop(before_def)) return false;
+            if (before_def.fmt == Rdna2Format::SOP1 && before_def.opcode >= 0x20u &&
+                before_def.opcode <= 0x22u)
+                return false;                              // indirect PC change
+        }
         const Rdna2Inst& def = ins[only];
         if (def.fmt != Rdna2Format::SMEM || !scalar_write_width(def) || def.n_src < 1) return false;
         // Scalar-buffer loads carry a four-dword descriptor; scalar-memory loads a base pair.
@@ -1705,13 +1728,15 @@ inline bool branch_is_workgroup_uniform(const std::vector<Rdna2Inst>& ins, uint3
             // not a relaxation of the proof, it is the proof reaching its subject -- the guest puts
             // `s_mov_b64 exec, -1` between the compare and the branch (#3713, `0x2005713000` at
             // pc 199/200/201), so stopping at every SOP1 made the compare unreachable and the whole
-            // uber-shader family unprovable. `sop1_opcode_preserves_scc` is the decoder's one copy
-            // of that list, shared with the SCC-liveness walks in rdna2_emit_cfg.cpp.
+            // uber-shader family unprovable. `sop1_opcode_leaves_scc_unmodified` is derived for THIS
+            // question and is deliberately NOT the SCC-liveness list in rdna2_emit_cfg.cpp -- that
+            // one asks whether SCC is still scalar-valued, which an SCC WRITER can satisfy. See its
+            // definition for the `s_bcnt1_i32_b64` case that separates them.
             //
             // Everything else still stops the walk. Any other scalar ALU or SOPK instruction may
             // write SCC, and consuming an older compare through an unmodeled writer would prove
             // uniformity of a condition the branch never saw.
-            if (in.fmt == Rdna2Format::SOP1 && sop1_opcode_preserves_scc(in.opcode)) continue;
+            if (in.fmt == Rdna2Format::SOP1 && sop1_opcode_leaves_scc_unmodified(in.opcode)) continue;
             if (in.fmt == Rdna2Format::SOP1 || in.fmt == Rdna2Format::SOP2 ||
                 in.fmt == Rdna2Format::SOPK)
                 return false;

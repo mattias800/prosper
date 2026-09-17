@@ -2148,6 +2148,14 @@ endif()
   target_link_libraries(test_readfirstlane_uniformity PRIVATE prosper_core)
   add_test(NAME readfirstlane_uniformity COMMAND test_readfirstlane_uniformity)
 
+  # #3713: a scalar branch may only be called workgroup-uniform when the value it compares is the
+  # same for every wave along every path. Built as positive/negative pairs -- a proof that never
+  # fires would otherwise pass the suite.
+  add_executable(test_scc_branch_uniformity
+                 tests/gpu/recompiler/test_scc_branch_uniformity.cpp)
+  target_link_libraries(test_scc_branch_uniformity PRIVATE prosper_core)
+  add_test(NAME scc_branch_uniformity COMMAND test_scc_branch_uniformity)
+
   # #3573: the CFG dispatcher must lower a fragment exec/vcc branch as a wave vote.
   add_executable(test_dispatcher_wave_vote tests/gpu/recompiler/test_dispatcher_wave_vote.cpp)
   target_link_libraries(test_dispatcher_wave_vote PRIVATE prosper_core)

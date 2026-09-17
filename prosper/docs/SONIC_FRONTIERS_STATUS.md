@@ -392,10 +392,12 @@ Two claims that were made here earlier and are corrected:
   (#3706 / #3709) left the composite unchanged at ~0.94% non-black with an identical bbox, which is
   what falsified the scene-width explanation and pointed at the edge above.
 
-Root cause: **#3713**, wave64 barrier semantics in the CFG dispatcher
-(`rdna2_emit_cfg.cpp:7215-7225`). Its barrier is not top level and it has a nested wave forward if,
-so `analyze_barrier_phased_compute`'s narrow escape does not admit it. The existing
-`terminal_guard_scc_is_workgroup_uniform` cannot be reused: it requires a branch-free prefix.
+~~Root cause: **#3713**~~ — **this line was wrong and is superseded (2026-09-17).** #3713 was a real
+blocker: wave64 barrier semantics in the CFG dispatcher (`rdna2_emit_cfg.cpp:7215-7225`), where the
+barrier is not top level and there is a nested wave forward if. It has been **fixed**, both programs
+execute on a live routed run (0 skips, 0 `compute-cfg-reject`), and **the frame is unchanged** at
+0.933% non-black. So #3713 was necessary and is not the root cause of the black world. See
+`## Ruled out` and the live measurements on #2790.
 
 ### The DS `st64` gap — necessary, and **not** sufficient (#3713)
 
@@ -815,6 +817,9 @@ to remember to update it. The last one did not (review of #2820).
 
 | Hypothesis | Verdict and evidence |
 | --- | --- |
+| #3713 (wave64 barrier semantics blocking `0x2005713000`) is the root cause of the black world | **Falsified by fixing it.** The proof was implemented, both `0x2005712000` and `0x2005713000` execute on a **live routed run** with the real renderer — 0 `[compute] skip`, 0 `[compute-cfg-reject]`, 0 device losses — and the frame is **0.933%** non-black against ~0.94% before. The census skip list went 11 → 9. #3713 is necessary and not sufficient, exactly as the DS `st64` gap was. Do not re-derive it as the cause. #3713 / #3717. |
+| The dropped 960x540 draw to `0x20171a0000` is the missing full-screen term | **Not supported by the one experiment that can see it.** Its fragment shader declines on a dynamic `image_load_mip` gated `b.is_compute`; widening that gate behind a throwaway diagnostic made the draw recompile (`[mimg-mip]` declines 1 → 0) and the frame moved **0.933% → 0.929%**, i.e. not at all. Caveat that keeps this OPEN rather than falsified: the diagnostic samples level 0 where the guest asks for level N, so the draw's output is wrong by construction — read the consumer's `nz=` before concluding. #2790. |
+| Removing the `b.is_compute` gate on the dynamic-mip lowering is the fix | **No — and it would be the bad kind of fix.** `upload_guest_mip_chain_levels` and the whole materialisation path live in `frontends/shared/live/live_compute.cpp`; the graphics path's `renderer_mip_chain_layout` assembles chains from **renderer-owned render targets**, opt-in per address via a selector, and has no guest-memory chain upload. Dropping the gate lets a fragment stage sample levels nothing uploaded — silent wrong pixels in place of a visible reject. The work is the materialisation, not the gate. #2790. |
 | The present/composition path is why the stage shows a HUD over black | **Falsified as THE cause, and that is the whole claim.** 40/40 published frames in the stage window are `guest_scanout`, which `guest_scanout_present.hpp:8-17` documents as the correct source for this title — its final composite is not a draw — and an upstream break fully accounts for the picture: the consumed 4K surface `0x2037960000` is never produced. What this row does **not** assert is that presentation is defect-free; it asserts that nothing in presentation needs to change for the world to appear, so do not replace the guest-scanout route to display an intermediate target. #2790. |
 | `0x2005713000` writes the display buffer, so forcing its target on screen would show the world | **Falsified, twice over.** Its write target `0x2037960000` is not a registered scanout — the registered scanouts are `0x200a160000` and `0x200c140000`, both via `RegisterBuffers2` (`[videoout] scanout buffer[N]`, ungated). `0x2037960000` is a 4K intermediate that `draw[186]`/`draw[188]` read. The program is still the right root cause; the "final composite that writes the display buffer" wording was too strong and is retracted. #2790 / #3713. |
 | `0x2037960000` is absent from the capture, so the pass that would write it is unnecessary | **Backwards.** A capture omits *skipped* operations, so the missing `rtt-seed` is evidence that the surface's only producer was declined — every other 4K surface in the frame (`0x200e230000`, `0x20121f0000`, `0x202b800000`, `0x2049a00000`, `0x204b9e0000`, `0x204f9a0000`, `0x2068790000`) has one. Verify replay coverage before treating an absent operation as proof it was not needed. #2790. |
