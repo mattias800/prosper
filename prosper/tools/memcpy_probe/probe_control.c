@@ -70,13 +70,24 @@ static void calibrate(void) {
     // an artifact of measuring the instrument with itself, so refuse rather than print it.
     // `&memcpy` is this binary's PLT stub and names this binary whatever is loaded. Ask the
     // global search order instead -- which a preload heads -- and see which object answers.
+    //
+    // FAIL CLOSED: calibrate only when memcpy resolves inside libc. Matching the shim by NAME was
+    // the first attempt and it was worse than useless: the README builds the shim as `probe.so`,
+    // so a reader following the recipe verbatim got no refusal and a plausible NEGATIVE overhead --
+    // the exact wrong reading this refusal exists to prevent, delivered to the one person who
+    // followed the instructions. Anything that is not libc is either the shim under a different
+    // name or something else this control cannot reason about; both must refuse.
     Dl_info info;
     void* resolved = dlsym(RTLD_DEFAULT, "memcpy");
-    if (resolved && dladdr(resolved, &info) && info.dli_fname &&
-        strstr(info.dli_fname, "memcpy_probe")) {
-        printf("\nCYCLE-COLUMN CALIBRATION SKIPPED: memcpy resolves to %s.\n"
-               "  Re-run this control WITHOUT LD_PRELOAD to calibrate; under the preload both arms\n"
-               "  are interposed and the comparison measures nothing.\n", info.dli_fname);
+    const char* from = resolved && dladdr(resolved, &info) && info.dli_fname ? info.dli_fname : NULL;
+    const char* base = from ? strrchr(from, '/') : NULL;
+    const char* leaf = base ? base + 1 : from;
+    if (!leaf || strncmp(leaf, "libc.", 5) != 0) {
+        printf("\nCYCLE-COLUMN CALIBRATION SKIPPED: memcpy resolves to %s, not libc.\n"
+               "  Re-run this control WITHOUT LD_PRELOAD to calibrate; under one, both arms are\n"
+               "  interposed and the comparison measures the instrument with itself -- which prints\n"
+               "  a plausible near-zero overhead rather than an obvious error.\n",
+               from ? from : "an object this control could not name");
         return;
     }
     unsigned long long pair = 0;

@@ -7,15 +7,21 @@ and aggregates by the caller's return address. Writes a report every 10 s and ag
 
 Measured on a routed *Grand Theft Auto V* window, 2026-09-17, twice:
 
-- `perf record --call-graph dwarf` unwinds **0 of 807** `__memmove_avx512_unaligned_erms` samples.
-  `perf report -g` reports **children == self** for that symbol — no callers at all — while 42.9% of
-  the render comm's samples carry no callchain whatsoever. Raising the user-stack dump from the
-  default 8 KiB to 32 KiB and restricting to `cycles:u` changed nothing: **0 of 964**.
+- `perf record --call-graph dwarf` resolves a callchain for **1 of 807**
+  `__memmove_avx512_unaligned_erms` samples; 42.9% of the render comm's samples (4,465 of 10,417)
+  carry no callchain at all. Raising the user-stack dump from the default 8 KiB to 32 KiB and
+  restricting to `cycles:u` gives **0 of 964**.
+
+  Count the samples. Do **not** cite `perf report -g`'s "children == self" for this, which an
+  earlier revision of this file did: that is a **tautology for any leaf function**, true whether or
+  not unwinding worked, so it establishes nothing about unwinding.
 - `--call-graph fp` against a `-fno-omit-frame-pointer` build *does* produce chains, and they are
   **wrong at the first hop**. glibc's AVX-512 copy never pushes `%rbp`, so the unwinder reads the
   caller's frame base and silently skips the direct caller. Stacks like
   `__memmove_avx512 → __clone3` are the visible symptom.
-- `backtrace()` fails the same way, for the same reason.
+- `backtrace()` called at the *sample* site fails the same way, for the same reason. It does **not**
+  fail when called from this probe's own frame after the real routine has returned — which is why
+  the large-copy feature below can use it.
 
 So the symbol is 8–10% of the busiest thread group and nothing in `perf` says who calls it.
 `__builtin_return_address(0)` inside an interposer sidesteps unwinding entirely.
@@ -34,7 +40,10 @@ sort -k2 -rn memcpy-sites-<pid>.txt | head -20
 
 `PROSPER_MEMCPY_PROBE_BIG_BYTES` (default 1 MiB) also captures a short `backtrace()` for copies at
 or above that size — useful when the return address lands in a runtime thunk rather than in
-prosper, though it inherits the unwinder's limits above.
+prosper. It unwinds from this probe's frame, so glibc's missing frame pointer does not apply to it;
+what does limit it is (a) a tail-called copy, whose caller is already gone from the stack, (b) the
+`BIG_FRAMES` bound of 6, and (c) `dladdr` resolving only *dynamic* symbols, so a static function
+reports the nearest exported one. The observed GTA shape — three frames ending in libc — is (a).
 
 ## The cycle column is calibrated, not assumed
 

@@ -1,9 +1,10 @@
 // memcpy_probe -- attribute memcpy/memmove to their exact CALL SITES, by cycles as well as bytes.
 //
 // WHY THIS EXISTS. `perf` cannot attribute these copies on this machine, measured twice:
-// `--call-graph dwarf` (8 KiB and 32 KiB user-stack dumps) unwinds ZERO of ~960
-// `__memmove_avx512_unaligned_erms` samples -- `perf report -g` reports children == self for that
-// symbol -- while resolving prosper's own frames fine. `--call-graph fp` against a
+// `--call-graph dwarf` resolves a callchain for 1 of 807 `__memmove_avx512_unaligned_erms` samples
+// with an 8 KiB user-stack dump and 0 of 964 with a 32 KiB one, while resolving prosper's own
+// frames fine. (Count samples: "children == self" in `perf report -g` is a tautology for a leaf
+// function and establishes nothing.) `--call-graph fp` against a
 // -fno-omit-frame-pointer build does produce chains, but they are wrong at the first hop: glibc's
 // AVX-512 copy never pushes %rbp, so the unwinder reads the CALLER's frame base and silently skips
 // the direct caller. Stacks like `__memmove_avx512 -> __clone3` are the visible symptom.
@@ -32,9 +33,12 @@
 
 #define SLOTS 8192u
 
-struct site { _Atomic uint64_t ra, calls, bytes, cycles; };
+// Plain types, not _Atomic: every access here goes through a __atomic_* builtin, and clang
+// REFUSES to pass an _Atomic-qualified object to those builtins (gcc allows it). Measured with
+// the clang in this project's own container at -std=c17 and -std=c23.
+struct site { uint64_t ra, calls, bytes, cycles; };
 static struct site g_sites[SLOTS];
-static _Atomic uint64_t g_calls, g_bytes, g_cycles, g_overflow;
+static uint64_t g_calls, g_bytes, g_cycles, g_overflow;
 
 // A return address names the CALL, not the code that wanted the copy. The biggest site in the
 // first GTA run was `libstdc++.so.6+0x523b6` -- a local symbol inside the C++ runtime, which says
@@ -46,10 +50,10 @@ static _Atomic uint64_t g_calls, g_bytes, g_cycles, g_overflow;
 // PROSPER_MEMCPY_PROBE_BIG_BYTES, default 1 MiB.
 #define BIG_FRAMES 6u
 #define BIG_SLOTS 512u
-struct big { _Atomic uint64_t calls, bytes, cycles; void* frames[BIG_FRAMES]; _Atomic int used; };
+struct big { uint64_t calls, bytes, cycles; void* frames[BIG_FRAMES]; int used; };
 static struct big g_big[BIG_SLOTS];
 static size_t g_big_threshold = 1u << 20;
-static _Atomic uint64_t g_big_dropped;
+static uint64_t g_big_dropped;
 
 static void record_big(size_t n, uint64_t cycles) {
     void* fr[BIG_FRAMES + 2];
@@ -201,9 +205,14 @@ static void* reporter(void* unused) {
 __attribute__((destructor)) static void dump_at_exit(void) { dump(); }
 
 __attribute__((constructor)) static void init(void) {
-    if (const char* t = getenv("PROSPER_MEMCPY_PROBE_BIG_BYTES")) {
+    // Declared before the `if` rather than inside its condition: a declaration-as-condition is C2y,
+    // and clang rejects it in C mode at -std=c17 and -std=c23 -- including the clang in this
+    // project's own container. Nothing builds this file today, which is exactly why it must not
+    // acquire a dialect trap for whoever first adds it to a target.
+    const char* big = getenv("PROSPER_MEMCPY_PROBE_BIG_BYTES");
+    if (big) {
         char* end = NULL;
-        const unsigned long long v = strtoull(t, &end, 0);
+        const unsigned long long v = strtoull(big, &end, 0);
         if (end && !*end && v) g_big_threshold = (size_t)v;
     }
     real_memcpy = (void* (*)(void*, const void*, size_t))dlsym(RTLD_NEXT, "memcpy");
