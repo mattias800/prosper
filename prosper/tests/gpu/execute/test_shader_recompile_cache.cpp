@@ -957,16 +957,30 @@ int main(int argc, char** argv) {
     // module without a terminal line. Cache the rejection, then report two distinct live program
     // addresses: the second compile must be a cache hit, while the final skip consequence remains
     // attributable and once-per-address at the production reporting boundary.
+    // The barrier sits in a scalar arm whose SCC is NOT workgroup-uniform, which is what makes the
+    // exact-wave dispatcher decline it.
+    //
+    // This used to read `s_cmp_eq_u32 s0, s0`, and #3713 changed what that means: a scalar branch on
+    // launch data compared with itself is now PROVED workgroup-uniform, every wave takes it
+    // together, the barrier is reached by all invocations or none, and the program correctly stops
+    // rejecting. The fixture's premise expired -- it was written when no SCC branch could be proved
+    // uniform, so "nested in a scalar arm" was by itself sufficient to guarantee the decline.
+    //
+    // `vcc_lo` as the compare operand restores it: `uniform_operand` refuses VCC/EXEC/SCC as data by
+    // construction, so the branch cannot be proved uniform however the proof grows, and the decline
+    // stands for the reason this case exists to check. Keep the operand lane-derived; do not relax
+    // the expectation if a future change proves some other scalar branch uniform.
     static const uint32_t kExactWaveBarrierReject[] = {
         0x7c020300u, // 0: v_cmp_lt_f32 vcc, v0, v1
         0xbf860001u, // 1: s_cbranch_vccz +1 -> pc3 (exact guest-wave branch)
         0x7e040281u, // 2: v_mov_b32 v2, 1
-        0xbf060000u, // 3: s_cmp_eq_u32 s0, s0
+        0xbf06006au, // 3: s_cmp_eq_u32 vcc_lo, s0  (lane mask: never workgroup-uniform)
         0xbf840002u, // 4: s_cbranch_scc0 +2 -> pc7
         0xbf8a0000u, // 5: s_barrier nested in the scalar arm
         0x7e040282u, // 6: v_mov_b32 v2, 2
         0xbf810000u, // 7: s_endpgm
     };
+
     // A partial workgroup whose barrier cannot be lifted into uniform control flow.
     //
     // This was `{ s_barrier, s_endpgm }` -- a partial workgroup with ANY barrier used to reject, so
