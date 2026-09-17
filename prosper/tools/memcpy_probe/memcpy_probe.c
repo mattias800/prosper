@@ -33,12 +33,18 @@
 
 #define SLOTS 8192u
 
-// Plain types, not _Atomic: every access here goes through a __atomic_* builtin, and clang
+// Plain types, not _Atomic: every access goes through a __atomic_* builtin (LOAD below for the
+// report side, which would otherwise be a plain read and a formal data race), and clang
 // REFUSES to pass an _Atomic-qualified object to those builtins (gcc allows it). Measured with
 // the clang in this project's own container at -std=c17 and -std=c23.
 struct site { uint64_t ra, calls, bytes, cycles; };
 static struct site g_sites[SLOTS];
 static uint64_t g_calls, g_bytes, g_cycles, g_overflow;
+
+// The report reads shared counters while the game keeps writing them. Relaxed is the right
+// strength -- a torn-free snapshot of each counter, no ordering claimed between them -- and it
+// keeps the comment above true, which a plain read would not.
+#define LOAD(x) __atomic_load_n(&(x), __ATOMIC_RELAXED)
 
 // A return address names the CALL, not the code that wanted the copy. The biggest site in the
 // first GTA run was `libstdc++.so.6+0x523b6` -- a local symbol inside the C++ runtime, which says
@@ -141,8 +147,8 @@ static void dump(void) {
     FILE* f = fopen(tmp, "w");
     if (!f) return;
     fprintf(f, "total_calls=%llu total_bytes=%llu total_cycles=%llu overflow_calls=%llu\n",
-            (unsigned long long)g_calls, (unsigned long long)g_bytes,
-            (unsigned long long)g_cycles, (unsigned long long)g_overflow);
+            (unsigned long long)LOAD(g_calls), (unsigned long long)LOAD(g_bytes),
+            (unsigned long long)LOAD(g_cycles), (unsigned long long)LOAD(g_overflow));
     // Resolve here rather than offline. A raw return address is useless once the process is gone --
     // shared libraries are relocated, so `addr2line` against the executable silently prints `??` for
     // every site that is NOT in it, and the biggest site in the first run of this probe was exactly
@@ -150,7 +156,7 @@ static void dump(void) {
     fprintf(f, "# return_address cycles calls bytes dso dso_offset nearest_symbol\n");
     for (unsigned i = 0; i < SLOTS; i++) {
         if (!g_sites[i].ra) continue;
-        const uint64_t raw = g_sites[i].ra;
+        const uint64_t raw = LOAD(g_sites[i].ra);
         const int is_cmp = (raw >> 63) & 1;
         const uint64_t addr = raw & ~(1ull << 63);
         Dl_info info;
@@ -160,17 +166,19 @@ static void dump(void) {
         unsigned long long off = 0;
         if (ok && info.dli_fbase) off = addr - (uint64_t)(uintptr_t)info.dli_fbase;
         fprintf(f, "%s%llx %llu %llu %llu %s %llx %s\n", is_cmp ? "CMP:" : "",
-                (unsigned long long)addr, (unsigned long long)g_sites[i].cycles,
-                (unsigned long long)g_sites[i].calls, (unsigned long long)g_sites[i].bytes,
+                (unsigned long long)addr, (unsigned long long)LOAD(g_sites[i].cycles),
+                (unsigned long long)LOAD(g_sites[i].calls),
+                (unsigned long long)LOAD(g_sites[i].bytes),
                 dso, off, sym);
     }
     fprintf(f, "# --- backtraces for copies >= %llu bytes (dropped=%llu) ---\n",
-            (unsigned long long)g_big_threshold, (unsigned long long)g_big_dropped);
+            (unsigned long long)g_big_threshold, (unsigned long long)LOAD(g_big_dropped));
     for (unsigned i = 0; i < BIG_SLOTS; i++) {
         if (__atomic_load_n(&g_big[i].used, __ATOMIC_ACQUIRE) != 1) continue;
         fprintf(f, "BIG cycles=%llu calls=%llu bytes=%llu\n",
-                (unsigned long long)g_big[i].cycles, (unsigned long long)g_big[i].calls,
-                (unsigned long long)g_big[i].bytes);
+                (unsigned long long)LOAD(g_big[i].cycles),
+                (unsigned long long)LOAD(g_big[i].calls),
+                (unsigned long long)LOAD(g_big[i].bytes));
         for (unsigned k = 0; k < BIG_FRAMES; k++) {
             void* a = g_big[i].frames[k];
             if (!a) break;
