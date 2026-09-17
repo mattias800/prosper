@@ -966,13 +966,26 @@ int main(int argc, char** argv) {
     // rejecting. The fixture's premise expired -- it was written when no SCC branch could be proved
     // uniform, so "nested in a scalar arm" was by itself sufficient to guarantee the decline.
     //
-    // `vcc_lo` as the compare operand restores it -- but the durable part is the PRODUCER, not the
-    // register name, and an earlier draft of this comment had that wrong. `uniform_operand` screens
-    // only SGPR_NULL, EXEC_LO/HI and SCC (125/126/127/253, rdna2_cfg_support.hpp:1591); VCC is
-    // 106/107 and falls through to `uniform_scalar`, so a `vcc_lo` written by `s_mov_b32 vcc_lo, s0`
-    // WOULD be provable. What this fixture actually rests on is pc0's `v_cmp_lt_f32 vcc, v0, v1`,
-    // which writes VCC from lane data and which `uniform_scalar` refuses at the VOPC-implicit-write
-    // check. So keep the PRODUCER lane-derived: naming vcc_lo alone protects nothing.
+    // `vcc_lo` as the compare operand restores it. Two earlier drafts of this comment named the wrong
+    // mechanism, so the actual walk, traced instruction by instruction:
+    //
+    //   * `uniform_operand` does NOT screen VCC. It refuses only SGPR_NULL, EXEC_LO/HI and SCC
+    //     (125/126/127/253, rdna2_cfg_support.hpp:1591-1594); VCC is 106/107 and falls through to
+    //     `uniform_scalar`.
+    //   * `uniform_scalar(106, ...)` first asks `last_writer` for an in-region definition. The
+    //     region is the straight-line block ending at the branch (`:1537-1543`), and pc1's
+    //     `s_cbranch_vccz` TARGETS pc3, so pc3 is a block entry and `block_start == 3`. The region
+    //     is therefore [3,4), holding only the `s_cmp_eq_u32` that writes SCC -- not VCC.
+    //   * With no writer in region, `uniform_scalar` takes the out-of-region path (`:1681-1683`),
+    //     which admits only launch data: `reg <= 105 && still_entry_value(reg)`, or
+    //     `sole_launch_derived_definition`, which itself bounds `reg > 105`. 106 fails both.
+    //
+    // So what is load-bearing is the register NUMBER together with there being no in-region VCC
+    // write -- pc0's `v_cmp_lt_f32` is never consulted, and replacing it with `s_mov_b32 vcc_lo, s0`
+    // would fail in exactly the same place. Do not "harden" this by making the producer more
+    // lane-derived; that changes nothing. It would only become provable if a future proof admitted
+    // VCC as launch data or extended the region across the pc3 block entry, and either of those
+    // should redden this case deliberately rather than quietly.
     static const uint32_t kExactWaveBarrierReject[] = {
         0x7c020300u, // 0: v_cmp_lt_f32 vcc, v0, v1
         0xbf860001u, // 1: s_cbranch_vccz +1 -> pc3 (exact guest-wave branch)
