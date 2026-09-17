@@ -5984,6 +5984,41 @@ int main() {
                 CHECK(!prosper::frontend::compute_binding_mip_chain_materializable(chain, true),
                       "multi-level compute image binding is declined when aliasing a live render target");
 
+                // #2818: Sonic Frontiers' three scene-width Cyber Space kernels load their mip chain
+                // from a 2D_ARRAY descriptor (`img_dim=5`) with a SINGLE layer. That is byte-identical
+                // to the 2D case at every level -- the plan, the staging offsets and the copy regions
+                // are all driven by the layer count, not by `img_dim` -- so it must be materializable.
+                // A one-layer array is the shape the image-creation guard already accepted; this
+                // predicate was the only thing refusing it.
+                prosper::gpu::ShaderResource array_chain = chain;
+                array_chain.img_dim = 5;
+                array_chain.depth = 1;
+                CHECK(prosper::gpu::shader_resource_compute_mip_chain_levels(array_chain) == kMaxMip + 1,
+                      "one-layer 2D_ARRAY chain plans the same nine levels as its 2D twin");
+                CHECK(prosper::frontend::compute_binding_mip_chain_materializable(array_chain, false),
+                      "one-layer 2D_ARRAY tiled chain is materializable (#2818)");
+
+                // The bound of that widening, stated as arms rather than as prose -- and the
+                // bound is NOT "these shapes return false". Three arms asserting that failed when
+                // first written, which is the useful part: this predicate early-returns TRUE at
+                // `declared_chain_levels <= 1`, so a shape the PLAN rejects has no chain to
+                // materialize and is trivially materializable. What actually bounds the widening is
+                // that such a shape never PLANS a chain, so it can never reach the new branch.
+                prosper::gpu::ShaderResource multi_layer_chain = array_chain;
+                multi_layer_chain.depth = 6;
+                CHECK(prosper::gpu::shader_resource_compute_mip_chain_levels(multi_layer_chain) == 1,
+                      "multi-layer 2D_ARRAY plans no chain, so it never reaches the one-layer branch");
+
+                prosper::gpu::ShaderResource strided_array_chain = array_chain;
+                strided_array_chain.layer_stride_bytes = 4096;
+                CHECK(prosper::gpu::shader_resource_compute_mip_chain_levels(strided_array_chain) == 1,
+                      "a per-slice (strided) array plans no chain");
+
+                prosper::gpu::ShaderResource volume_chain = chain;
+                volume_chain.img_dim = 2;
+                CHECK(prosper::gpu::shader_resource_compute_mip_chain_levels(volume_chain) == 1,
+                      "a 3D resource plans no chain");
+
                 // Caching multi-level sampled textures with allocation-spanning validation (#3291)
                 const auto chain_plan = prosper::gpu::shader_resource_mip_chain_plan(chain);
                 const auto single_span = prosper::frontend::compute_sampled_cache_span(

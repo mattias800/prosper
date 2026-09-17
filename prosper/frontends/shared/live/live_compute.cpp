@@ -12874,7 +12874,55 @@ bool compute_binding_mip_chain_materializable(const prosper::gpu::ShaderResource
     if (renderer_owned) return false;
     const auto mip_chain = prosper::gpu::shader_resource_mip_chain_plan(r);
     if (!mip_chain.valid || mip_chain.level_count != declared_chain_levels) return false;
-    if (r.img_dim != 1 /* 2D */ || r.depth_compare) return false;
+    // A ONE-LAYER 2D_ARRAY is admitted alongside plain 2D (#2818). It is not a widening of what the
+    // backend can actually build: its level layout, its staging arithmetic and its copy regions are
+    // byte-identical to the 2D case, because every one of them is driven by the LAYER COUNT rather
+    // than by `img_dim`.
+    //
+    //   * `shader_resource_mip_chain_plan` already admits `img_dim == 5`, and independently requires
+    //     `depth == 1` with no `layer_stride_bytes` / `layer_mip_offset_bytes` -- so the plan this
+    //     function just validated was computed for exactly this shape.
+    //   * the image-creation guard (`chain_binding_shape`) never tested `img_dim` at all. It tests
+    //     the real Vulkan shape -- `sampled_layers == 1 && bi.array_layers == 1 &&
+    //     volume_texels == width * height` -- so it ALREADY accepts a one-layer array and was only
+    //     ever unreachable for one because this predicate refused first.
+    //   * the per-level copy builds `imageExtent.depth = 1` with `layerCount = bi.array_layers`,
+    //     against `mip_staging_offsets` computed as `width * height * texel_bytes` per level with no
+    //     layer multiplication. That is correct for exactly one layer and wrong for more.
+    //
+    // WHAT ACTUALLY BOUNDS THE LAYER COUNT IS THE PLAN, NOT THE CREATION GUARD. An earlier draft of
+    // this comment said `chain_binding_shape` would still decline a resource admitted here that is
+    // not really one layer. That is WRONG and was corrected in review. Every layer term that guard
+    // tests derives from the same `r->depth` this function already relied on:
+    //   `sampled_layers`    = dim_cube_stacked ? 6 : dim_2d_array ? r->depth : 1
+    //   `bi.array_layers`   = img_dim == 5 && reflected-2D-arrayed ? r->depth : 1
+    //   `volume_texels == width * height`  reduces to `sampled_layers == 1`
+    // so it has no independent input and cannot catch a layer error this line let through. The real
+    // reason a multi-layer or per-slice array never arrives here is `shader_resource_mip_chain_plan`
+    // (mip_chain_plan.cpp), which refuses `depth != 1`, `layer_stride_bytes` and
+    // `layer_mip_offset_bytes` -- so such a shape plans NO chain, takes the
+    // `declared_chain_levels <= 1` early return above, and never reaches this branch.
+    // Do not remove the plan's `depth != 1` check believing this guard covers it; it does not.
+    // `chain_binding_shape` IS a genuine independent second gate -- for its other terms
+    // (`!bi.storage`, `!bi.imported`, `!renderer_owned`, `!bi.depth_view`, the dim exclusions, and
+    // `texel_bytes == mip_chain_bytes_per_block`), which come from reflected descriptor and realized
+    // binding state. Just not for layers.
+    //
+    // The `depth == 1` / no-stride terms below are therefore UNREACHABLE today -- and kept because
+    // they are the FORWARD guard, not decoration. If the plan is ever widened to multi-layer chains
+    // (a contemplated change), they become the only thing keeping a multi-layer array out of this
+    // one-layer branch, precisely because the creation guard cannot. Being unreachable, **no test
+    // arm can redden if they are deleted** -- which is why that is said here rather than left for a
+    // reader to assume the arms cover it.
+    //
+    // (Three arms asserting these shapes return FALSE were written and failed: they return true,
+    // because "no chain declared" is trivially materializable. The arms now assert the real bound --
+    // that such a shape plans one level. Nothing asserts the LINK between the two, because the
+    // assertion would be `== true`, which is also what a bug would produce.)
+    const bool ordinary_2d = (r.img_dim == 1);
+    const bool one_layer_2d_array =
+        (r.img_dim == 5 && r.depth == 1u && !r.layer_stride_bytes && !r.layer_mip_offset_bytes);
+    if ((!ordinary_2d && !one_layer_2d_array) || r.depth_compare) return false;
     return true;
 }
 
