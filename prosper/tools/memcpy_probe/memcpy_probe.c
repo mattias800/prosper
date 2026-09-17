@@ -27,6 +27,7 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <x86intrin.h>
+#include <stdio.h>
 #include <execinfo.h>
 
 #define SLOTS 8192u
@@ -53,7 +54,7 @@ static _Atomic uint64_t g_big_dropped;
 static void record_big(size_t n, uint64_t cycles) {
     void* fr[BIG_FRAMES + 2];
     const int got = backtrace(fr, (int)(BIG_FRAMES + 2));
-    if (got <= 2) return;
+    if (got <= 2) { __atomic_fetch_add(&g_big_dropped, 1, __ATOMIC_RELAXED); return; }
     void* const* chain = fr + 2;                    // skip backtrace() and this interposer
     const int depth = got - 2 > (int)BIG_FRAMES ? (int)BIG_FRAMES : got - 2;
     uint64_t h = 1469598103934665603ull;
@@ -124,11 +125,16 @@ static void record(uint64_t ra, size_t n, uint64_t cycles) {
 }
 
 static void dump(void) {
-    char path[256];
-    snprintf(path, sizeof path, "%s/memcpy-sites-%d.txt",
-             getenv("PROSPER_MEMCPY_PROBE_DIR") ? getenv("PROSPER_MEMCPY_PROBE_DIR") : ".",
-             (int)getpid());
-    FILE* f = fopen(path, "w");
+    // Write a temporary and rename. `fopen(path, "w")` truncates in place, so a reader polling the
+    // report while the game runs can observe a ZERO-BYTE file -- which is exactly the signature of a
+    // broken shim that the positive control exists to rule out. rename(2) is atomic within a
+    // directory, so a reader sees either the previous report or the next one, never a partial one.
+    const char* dir = getenv("PROSPER_MEMCPY_PROBE_DIR");
+    if (!dir) dir = ".";
+    char path[256], tmp[288];
+    snprintf(path, sizeof path, "%s/memcpy-sites-%d.txt", dir, (int)getpid());
+    snprintf(tmp, sizeof tmp, "%s/.memcpy-sites-%d.tmp", dir, (int)getpid());
+    FILE* f = fopen(tmp, "w");
     if (!f) return;
     fprintf(f, "total_calls=%llu total_bytes=%llu total_cycles=%llu overflow_calls=%llu\n",
             (unsigned long long)g_calls, (unsigned long long)g_bytes,
@@ -174,6 +180,7 @@ static void dump(void) {
         }
     }
     fclose(f);
+    rename(tmp, path);
 }
 
 // Rewritten every 10 s from a background thread rather than at exit: a run ended by `timeout` dies

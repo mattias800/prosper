@@ -36,6 +36,33 @@ sort -k2 -rn memcpy-sites-<pid>.txt | head -20
 or above that size — useful when the return address lands in a runtime thunk rather than in
 prosper, though it inherits the unwinder's limits above.
 
+## The cycle column is calibrated, not assumed
+
+Counts and bytes are exact. **Cycles are not**, and cycles is the column this README tells you to
+rank by, so the control measures the bias rather than leaving you to trust it. Run the control
+**without** the preload (it refuses to calibrate under one, because both arms would be interposed
+and the comparison would measure the instrument with itself):
+
+```
+  an rdtsc pair alone costs ~24-29 cycles
+       bytes    bracketed    amortised  inflation
+          64        23.72         3.75     532.3%
+        1024        23.70        14.63      62.0%
+       65536      2459.09      2575.27      -4.5%
+     1048576     32585.19     32998.57      -1.3%
+     3145728    140741.90    140622.39       0.1%
+```
+
+So: **rank large sites by the cycle column and treat sub-KiB rows as mostly instrument.** A row of
+90 M calls at 64 bytes will show a few percent of total cycles that is very nearly all bracketing
+overhead. Figures vary a few tens of percent run to run at the small end because the absolute
+numbers are single-digit cycles; the conclusion does not.
+
+**The delta is ELAPSED tsc.** Anything that deschedules the thread mid-copy — another lane on the
+box, an interrupt — is counted as copy time. Measured: identical work with one competing spinner
+pinned to the same core read 1.98x higher. Run attribution on a quiet machine for the same reason a
+timing run needs one.
+
 ## Verify it before believing it
 
 `probe_control.c` is the positive control: a known 200,000 + 100,000 + 50,000 copies and 70,000
@@ -61,3 +88,9 @@ no call happens. Only a copy that really calls libc is in scope for either instr
 - **Time.** Two `rdtsc` and a hash probe per call is small but real, and a run under this preload is
   an **attribution** run. Never quote a frame rate from one, and never combine it with a
   probe-free timing run.
+- **Copies made before the constructor runs** — by the dynamic loader itself — are counted nowhere.
+  `bootstrap_copy` serves them correctly and silently.
+- **`__memcpy_chk` / `__memmove_chk` are not interposed.** A caller built with
+  `_FORTIFY_SOURCE` and a known destination size reaches those instead, and they are invisible here.
+  Checked on this workload before it mattered: zero `_chk` samples in the profile, so nothing was
+  being missed — but a different binary could differ, and `perf` is where to check that.
