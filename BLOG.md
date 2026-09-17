@@ -21,6 +21,16 @@ from the tracker issues, and still gated, because it is a projection of state ra
 
 ## 2026-09-17
 
+### …and now we know which one step is missing
+
+No picture — the frame below is still the one that renders. Following that capture through
+the commands that actually consume it: the last two draws of the frame read a full-screen surface
+that **nothing in the frame ever wrote**, because the one compute pass that writes it is declined by
+the recompiler. That is why the world comes out at 0.9% brightness instead of absent — the scene is
+being combined with a term that is missing rather than failing to draw.
+[#2790](https://github.com/mattias800/prosper/issues/2790),
+[#3713](https://github.com/mattias800/prosper/issues/3713).
+
 ### Sonic Frontiers' Cyber Space world is rendered — it just never reaches the screen
 
 The game has been filed for weeks as "gameplay reached, world black". It is not black: prosper draws

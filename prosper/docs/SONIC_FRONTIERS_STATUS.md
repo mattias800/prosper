@@ -333,10 +333,13 @@ the census numbers and encodings are measured.
 - The guest-composited HUD spans `x[64..3776] y[59..2090]` of 3840x2160 — full frame, correctly
   placed, about 1% of pixels non-black.
 - The frames prosper *does* composite are confined to the top-left **2880x1620**, exactly 75% of each
-  axis and unscaled, and contain a flat blue-grey gradient — sky and fog with no geometry, which is
-  what a scene target looks like when its shading passes never ran. 2880x1620 is Hedgehog Engine 2
-  dynamic resolution at 75%; `CONFIDENCE: MED` that the missing step is the guest's own
-  upscale/resolve.
+  axis and unscaled, and contain a flat blue-grey gradient — sky and fog with no geometry. 2880x1620
+  is Hedgehog Engine 2 dynamic resolution at 75%.
+  **The reading attached to that measurement — "what a scene target looks like when its shading
+  passes never ran" — is superseded (2026-09-17).** The measurement stands; the inference does not.
+  The world *is* shaded, into `0x2049a00000`, and dumping that surface from an F9 bundle shows a
+  fully textured Cyber Space level (#3711). Whatever those three composited samples caught, it was
+  not an unshaded scene target. See *The first failing boundary* below.
 - **The present path is not broken in general.** In the same arms prosper composites the in-engine
   *cutscene* correctly at full width (`x[0..3839] y[272..1887]`, letterboxed). Only the stage fails.
 - **It is not a `--warmup-seconds` artifact.** The control arm used `--warmup-seconds 90`, so the
@@ -347,6 +350,68 @@ This is the frontier for this title, and it is plausibly a **Hedgehog Engine 2**
 a Frontiers one: *Sonic Origins* (#1871) and *Sonic Racing: CrossWorlds* (#1895) share the Needle
 stack, and CrossWorlds' "the composite then goes uniform" (#2013) deserves a census taken the same
 way before it is treated as unrelated.
+
+### The first failing boundary, from captured commands (2026-09-17)
+
+The census above says *which* programs never run. It does not say which missing program the picture
+depends on, and a census cannot: sixteen absences look alike. Reading the in-stage F9 bundle as a
+producer/consumer graph rather than as a list does answer it, and the break is a single edge.
+
+| # | step | evidence | state |
+| --- | --- | --- | --- |
+| 1 | **162 draws** render the world into `0x2049a00000` | draw-target census of the in-stage submit | **correct** — dumped, a fully textured Cyber Space level (#3711) |
+| 2 | bloom/downsample pyramid produced | rgba16f 3840 → 1920 → … → 60 seeds present | correct |
+| 3 | **compute `0x2005713000` writes `0x2037960000`** (4K, 33,177,600 B) | its binding table: bindings 10, 12–18, 20–23, 25–28 all `class=2 addr=0x2037960000` | **never runs** — `exact-wave-dispatcher-unsafe guest-barrier=1` |
+| 4 | **`draw[186]` and `draw[188]` read `0x2037960000`**, write `0x204f9a0000` | their resource lists, both `addr=0x2037960000 declared=33177600` | consumes a surface nothing produced |
+| 5 | `0x204f9a0000` is the near-black image | dumped: the same foliage silhouettes as `0x2049a00000`, peak 255, **0.889%** of pixels above threshold 8 | — |
+
+The confirmation that makes edge 3→4 an observation rather than an inference: **`0x2037960000` has
+no `rtt-seed` in the capture at all**, while every other 4K surface in the frame does —
+`0x200e230000`, `0x20121f0000`, `0x202b800000`, `0x2049a00000`, `0x204b9e0000`, `0x204f9a0000`,
+`0x2068790000`. A capture seeds a surface from whatever wrote it, so a surface with no seed is one
+nothing in the frame wrote.
+
+**Read that absence the right way round.** A capture omits *skipped* operations, so `0x2037960000`'s
+missing seed is evidence that its only producer was declined — not evidence that the surface was
+unnecessary. The same caveat applies to every "operation X is absent from the bundle, so X is not
+needed" argument on this title: verify replay coverage first.
+
+Step 5 also disposes of "the world does not draw". `0x204f9a0000` holds the scene geometry at
+essentially zero luminance, which is the signature of the scene being combined with a **missing
+full-screen term**, not of the scene failing to render.
+
+Two claims that were made here earlier and are corrected:
+
+- `0x2005713000` was described as "the final composite that writes the display buffer". Its write
+  target `0x2037960000` is **not** a registered scanout. The registered scanouts are `0x200a160000`
+  and `0x200c140000` (3840×2160, both via `RegisterBuffers2`); `0x2037960000` is a 4K intermediate
+  the final draws consume. So the break is **upstream of the display path** — consistent with
+  `guest_scanout` being correct for this title (40/40 samples), and with nothing in presentation
+  needing to change.
+- "All three scene-target-width kernels are blocked" — see the `## Ruled out` row. Clearing them
+  (#3706 / #3709) left the composite unchanged at ~0.94% non-black with an identical bbox, which is
+  what falsified the scene-width explanation and pointed at the edge above.
+
+Root cause: **#3713**, wave64 barrier semantics in the CFG dispatcher
+(`rdna2_emit_cfg.cpp:7215-7225`). Its barrier is not top level and it has a nested wave forward if,
+so `analyze_barrier_phased_compute`'s narrow escape does not admit it. The existing
+`terminal_guard_scc_is_workgroup_uniform` cannot be reused: it requires a branch-free prefix.
+
+### The DS `st64` gap — necessary, and **not** sufficient (#3713)
+
+`ds_write2st64_b32` (DS `0x0f`) and `ds_read2st64_b32` (DS `0x38`) were missing from the DS opcode
+allowlist, so both rejected. `tools/shader_inspect` generic coverage over every dumped stage shader
+in this scene reports `DS op=0xf` as the **only** unsupported instruction in `0x2005712000` (the
+exposure reduction) and `0x2005713000` (step 3 above), 7 uses each, and `0x200581bb00` uses it 22
+times plus 2 `st64` reads. Implementing both takes those programs from `unsupported=7 first=DS/0xf`
+to `unsupported=0 first=none` (ALU 421→428, exactly +7).
+
+**It does not make them run.** A valid in-stage census afterwards —
+`262144 dispatch decisions over 32 program(s)`, 300 stage markers — still reports both programs
+`executed=0 skipped=5170`, with the skip list unchanged at 11 and the remaining reject
+`compute-cfg-reject reason=exact-wave-dispatcher-unsafe guest-barrier=1`. Two independent blockers
+sat on the same programs; this closed the first. Anyone fixing #3713 needs this as well, which is
+why it landed separately rather than waiting.
 
 ## Rung 2 — title screen and main menu (still current, still checked in)
 
@@ -750,6 +815,11 @@ to remember to update it. The last one did not (review of #2820).
 
 | Hypothesis | Verdict and evidence |
 | --- | --- |
+| The present/composition path is why the stage shows a HUD over black | **Falsified as THE cause, and that is the whole claim.** 40/40 published frames in the stage window are `guest_scanout`, which `guest_scanout_present.hpp:8-17` documents as the correct source for this title — its final composite is not a draw — and an upstream break fully accounts for the picture: the consumed 4K surface `0x2037960000` is never produced. What this row does **not** assert is that presentation is defect-free; it asserts that nothing in presentation needs to change for the world to appear, so do not replace the guest-scanout route to display an intermediate target. #2790. |
+| `0x2005713000` writes the display buffer, so forcing its target on screen would show the world | **Falsified, twice over.** Its write target `0x2037960000` is not a registered scanout — the registered scanouts are `0x200a160000` and `0x200c140000`, both via `RegisterBuffers2` (`[videoout] scanout buffer[N]`, ungated). `0x2037960000` is a 4K intermediate that `draw[186]`/`draw[188]` read. The program is still the right root cause; the "final composite that writes the display buffer" wording was too strong and is retracted. #2790 / #3713. |
+| `0x2037960000` is absent from the capture, so the pass that would write it is unnecessary | **Backwards.** A capture omits *skipped* operations, so the missing `rtt-seed` is evidence that the surface's only producer was declined — every other 4K surface in the frame (`0x200e230000`, `0x20121f0000`, `0x202b800000`, `0x2049a00000`, `0x204b9e0000`, `0x204f9a0000`, `0x2068790000`) has one. Verify replay coverage before treating an absent operation as proof it was not needed. #2790. |
+| The DS `st64` recompiler gap is what keeps `0x2005712000` / `0x2005713000` from executing | **Falsified as sufficient; confirmed as necessary.** Implementing `ds_write2st64_b32` (0x0f) and `ds_read2st64_b32` (0x38) takes both programs from `unsupported=7 first=DS/0xf` to `unsupported=0 first=none` (ALU 421→428, exactly +7), and a valid in-stage census afterwards (`262144 dispatch decisions over 32 program(s)`, 300 stage markers) still reports them `executed=0 skipped=5170`, skip list unchanged at 11, remaining reject `exact-wave-dispatcher-unsafe guest-barrier=1`. Two independent blockers on the same programs. #3713. |
+| An unsupported opcode reported by a static coverage tool is the reason a program is skipped at runtime | **Not by itself, and this title is the counter-example.** Static coverage answers "does the recompiler emit every instruction"; the live skip decision also runs a CFG/dispatcher admission test that static coverage never reaches. Both programs above read `unsupported=0` and are still declined. Quote the live `[compute] skip` / `[compute-cfg-reject]` line, not the static tool, when naming why a dispatch did not run. #3713. |
 | Enabling the initial #3439 GPU-retile implementation establishes a GPU writeback comparison | **Falsified on `8e02a1963c68`.** The same-binary control recorded 33 selected `e3c2229a45c7807c` binding-9 CPU writebacks; the enabled arm recorded 31, all still `gpu-retile=0`, with no poison-verification rows. The positive-use assertion rejected the treatment, so these runs establish no speedup. Unit coverage had used plain 2D descriptors only; added one-layer array cases fail 240 path-use assertions before the admission correction while retaining exact output bytes. Require actual GPU use alongside byte equivalence. #3407 / #3439. |
 | Still-owned matching detile inputs or varying input shape explain the zero-reuse window observed after #3437 | **Falsified for the diagnostic run on `5cdd7ecb`.** All 175 F8-window uploads use the same device, 12,582,992-byte size and storage-buffer usage. Every acquisition reports zero matching idle/live blocks; every completed input is explicitly discarded for budget. The cache retains 268,423,456 requested bytes against its 268,435,456-byte limit, leaving only 12,000 bytes free. All 39,701 pool events reconcile with independently reconstructed idle/live ownership. Logging under the mutex makes this a structural witness, not a timing comparison or retroactive proof for the earlier uninstrumented arms. #3407. |
 | The packed GPU conversion in #3437 or mapped detile inputs in #3434 first introduced the black title-menu background | **Falsified as first introduction.** Retained user F9 `frame_grab_PPSA03831_20260907-153044-350`, written at guest present 1285 on source `0927f6d3a8a8` (tree-identical to pre-#3434 main `92f0e7368e48`) with `PROSPER_NO_GPU_DETILE=1`, already shows black behind the menu and incorrect TIME UP artwork. New #3437 compositor screenshots after route f1700/f1940 show the same visible failure class at different selections. The earlier run was excluded from the cutscene comparison for capturing a menu; that does not invalidate this menu evidence. This establishes prior occurrence, not unchanged frequency or a shared root cause. #2206 remains open. |

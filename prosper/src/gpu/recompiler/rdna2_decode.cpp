@@ -137,7 +137,12 @@ uint32_t rdna2_vgpr_write_count(const Rdna2Inst& in) {
                 in.opcode == 0x3eu || in.opcode == 0xb1u || in.opcode == 0x20u ||
                 in.opcode == 0x2du || in.opcode == kDsOpcodeBpermuteB32)
                 return 1;
-            if (in.opcode == 0x37u || in.opcode == 0x76u) return 2;
+            // 0x38 is ds_read2st64_b32: the st64 sibling of 0x37, and it writes the same two
+            // VGPRs. Missing it here is silent rather than fail-visible -- writes_vgpr() then
+            // walks past the read to an older definition, and every consumer of that
+            // (wave-uniform store-data proof, loop-header phis, executor liveness) draws a
+            // conclusion about the wrong instruction.
+            if (in.opcode == 0x37u || in.opcode == 0x38u || in.opcode == 0x76u) return 2;
             if (in.opcode == 0xfeu) return 3;
             if (in.opcode == 0x77u || in.opcode == 0xffu) return 4;
             return 0;

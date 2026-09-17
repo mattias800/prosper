@@ -252,9 +252,15 @@ NggLdsSource ngg_find_terminal_output(const std::vector<Rdna2Inst>& ins, size_t 
             const NggLdsSource source = ngg_terminal_lds_source(ins, j, output_vgpr);
             if (source.valid) return source;
             const uint32_t first = static_cast<uint32_t>(writer.dst.value);
-            const uint32_t count = writer.opcode == 0x37u || writer.opcode == 0x76u ? 2u
-                                 : writer.opcode == 0xfeu ? 3u
-                                 : writer.opcode == 0xffu ? 4u : 1u;
+            // Ask the decoder rather than keeping a second opcode table here. The local copy this
+            // replaces was already two entries behind it -- it lacked 0x77 (ds_read2_b64, four
+            // VGPRs) and would have lacked 0x38 (ds_read2st64_b32, two) -- and an undercount is
+            // silent: the scan walks PAST the instruction that really defined `output_vgpr` and can
+            // then declare a user GS a passthrough.
+            // The max(1) floor is deliberate and preserves this helper's existing conservatism:
+            // rdna2_vgpr_write_count reports 0 for DS stores, whose VDST field is a source, while
+            // this scan wants any DS instruction naming the output register to stop it.
+            const uint32_t count = std::max(1u, rdna2_vgpr_write_count(writer));
             if (output_vgpr >= first && output_vgpr < first + count) return {};
         }
         if (writer.dst.kind == OperandKind::VGPR &&

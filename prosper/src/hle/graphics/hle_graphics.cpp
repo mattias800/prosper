@@ -554,6 +554,52 @@ void videoout_seed_authorship_locked(int slot, uint64_t address, uint32_t width,
     g_display.buffer_digest_valid[slot] = 1;
 }
 
+// Register ONE scanout slot. Both `sceVideoOutRegisterBuffers` and `sceVideoOutRegisterBuffers2`
+// used to carry their own copy of this body, and the copies were identical -- which is exactly how
+// a diagnostic added to one path silently misses the other. #2790 hit that: a scanout report added
+// to the RegisterBuffers loop printed nothing for Sonic Frontiers, because this title (like every
+// Gen5 title) registers through RegisterBuffers2. One body, both callers, so the next addition
+// cannot land on only half the titles.
+//
+// The report is UNGATED and deliberately so, following the `[vo] display:` line above: these are the
+// addresses the guest will flip, and every "why is the picture wrong" investigation eventually needs
+// them -- a display buffer and a same-size intermediate are both `width*height*4` bytes, so size
+// alone cannot tell them apart, and without this line the only way to learn them is to instrument
+// the emulator mid-investigation.
+//
+// It carries its own cap rather than relying on "a boot registers a handful of slots", because that
+// is a claim about the titles seen so far and not a property of the API: nothing stops a guest
+// re-registering a set on every mode change, and an ungated per-call line would then be unbounded
+// stderr on a path nobody is watching. The cap is generous enough that a title with several sets
+// still reports all of them, and the suppression announces itself once so a truncated log is never
+// mistaken for a complete one.
+static void videoout_register_buffer_slot_locked(int slot, int set, uint64_t address,
+                                                 const DisplayConfig::SetConfig& config,
+                                                 const char* via) {
+    g_display.buffer_addr[slot] = address;
+    g_display.buffer_set[slot] = (uint8_t)(set + 1);
+    uint64_t generation = ++g_display.next_generation;
+    if (generation == 0) generation = ++g_display.next_generation;
+    g_display.buffer_generation[slot] = generation;
+    videoout_seed_authorship_locked(slot, address, config.width, config.height);
+    static unsigned reported = 0;          // guarded by the registry lock, like everything here
+    constexpr unsigned kReportCap = 64;
+    if (reported < kReportCap) {
+        ++reported;
+        std::fprintf(stderr,
+                     "[videoout] scanout buffer[%d] set=%d addr=0x%llx %ux%u fmt=0x%llx tile=%u "
+                     "bytes=%llu gen=%llu via=%s\n",
+                     slot, set, (unsigned long long)address, config.width, config.height,
+                     (unsigned long long)config.pixel_format, (unsigned)config.tiling_mode,
+                     (unsigned long long)config.width * (unsigned long long)config.height * 4ull,
+                     (unsigned long long)generation, via);
+        if (reported == kReportCap)
+            std::fprintf(stderr,
+                         "[videoout] scanout buffer report capped at %u; further registrations are "
+                         "silent\n", kReportCap);
+    }
+}
+
 // True when this buffer's contents have been observed to differ from its registration baseline.
 // Sticky, so a title whose frame N happens to match the baseline does not lose authorship it has
 // already demonstrated. Requires the registry lock.
@@ -1210,15 +1256,9 @@ HLE(g_vo_register_buffers) {  // a0=handle a1=start a2=addresses a3=buffer_num a
         std::lock_guard<std::mutex> flip_lk(g_flip_mx);
         for (int i = 0; i < num; ++i) g_buffer_labels[start + i] = 0;
     }
-    for (int i = 0; i < num; ++i) {
-        g_display.buffer_addr[start + i] = (uint64_t)(uintptr_t)addresses[i];
-        g_display.buffer_set[start + i] = (uint8_t)(set + 1);
-        uint64_t generation = ++g_display.next_generation;
-        if (generation == 0) generation = ++g_display.next_generation;
-        g_display.buffer_generation[start + i] = generation;
-        videoout_seed_authorship_locked(start + i, g_display.buffer_addr[start + i],
-                                        config.width, config.height);
-    }
+    for (int i = 0; i < num; ++i)
+        videoout_register_buffer_slot_locked(start + i, set, (uint64_t)(uintptr_t)addresses[i],
+                                             config, "RegisterBuffers");
     if (g_display.buffer_num < start + num) g_display.buffer_num = start + num;
     g_display.configured = true;
     return (uint64_t)set;
@@ -1260,15 +1300,9 @@ HLE(g_vo_register_buffers2) {  // a0=handle a1=set_index a2=buffer_index_start a
         std::lock_guard<std::mutex> flip_lk(g_flip_mx);
         for (int i = 0; i < num; ++i) g_buffer_labels[start + i] = 0;
     }
-    for (int i = 0; i < num; i++) {
-        g_display.buffer_addr[start + i] = (uint64_t)(uintptr_t)bufs[i].data;
-        g_display.buffer_set[start + i] = (uint8_t)(set + 1);
-        uint64_t generation = ++g_display.next_generation;
-        if (generation == 0) generation = ++g_display.next_generation;
-        g_display.buffer_generation[start + i] = generation;
-        videoout_seed_authorship_locked(start + i, g_display.buffer_addr[start + i],
-                                        config.width, config.height);
-    }
+    for (int i = 0; i < num; i++)
+        videoout_register_buffer_slot_locked(start + i, set, (uint64_t)(uintptr_t)bufs[i].data,
+                                             config, "RegisterBuffers2");
     if (g_display.buffer_num < start + num) g_display.buffer_num = start + num;
     g_display.configured = true;
     if (getenv("PROSPER_GFXLOG"))

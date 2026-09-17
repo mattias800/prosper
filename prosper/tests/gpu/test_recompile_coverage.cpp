@@ -86,6 +86,109 @@ int main() {
     CHECK(co.total == 3 && co.alu == 3 && co.unsupported == 0 && co.first_bad_fmt < 0,
           "v_add/sub/subrev_co_u32 (VOP3B carry-out) recompile as supported ALU");
 
+    // ds_write2st64_b32 (DS 0x0f) / ds_read2st64_b32 (DS 0x38). The st64 pair addresses LDS on
+    // 64-dword strides -- MEM[ADDR + OFFSET*4*64] -- which is how a workgroup reduction gives each
+    // 64-lane wave its own slot without the lanes colliding. Their non-st64 siblings (0x0e/0x37)
+    // have been emitted for a long time; the st64 forms were absent from the DS opcode allowlist,
+    // so they rejected and took their whole program with them.
+    //
+    // Measured need (2026-09-17, Sonic Frontiers PPSA03831 Cyber Space): `tools/shader_inspect`
+    // generic coverage over every dumped stage shader reports `DS op=0xf` as the ONLY unsupported
+    // instruction in `0x2005712000` (the exposure reduction) and `0x2005713000` (whose 4K output
+    // `0x2037960000` the frame's final draws consume), 7 uses each, plus 22 uses and 2 reads in
+    // `0x200581bb00`. #2790 / #3713.
+    //
+    // Encodings are the exact gfx10 words, derived from the 0x0e/0x37 pair already asserted in
+    // test_recompiled_shaders.cpp: DS base 0xD8000000 | (opcode << 18) | (offset1 << 8 | offset0).
+    //
+    // BOTH offsets are non-zero, deliberately. With `offset0:0` the first index is 0 whatever the
+    // multiplier is, so a mutation that drops the scaling on offset0 alone would pass every arm
+    // below -- the arm would be testing offset1's multiplier twice and offset0's not at all.
+    // Raised in review. offset0:1 offset1:2 makes each multiplier independently observable.
+    const uint32_t ds_st64_code[] = {
+        0xD83C0201u, 0x00020105u,   // ds_write2st64_b32 v5, v1, v2 offset0:1 offset1:2
+        0xD8E00201u, 0x01000005u,   // ds_read2st64_b32  v[1:2], v5 offset0:1 offset1:2
+        0xBF810000u,                // s_endpgm
+    };
+    RecompileCoverage ds_st64 = recompile_coverage(ds_st64_code,
+                                                   sizeof(ds_st64_code)/sizeof(ds_st64_code[0]));
+    CHECK(ds_st64.total == 2 && ds_st64.unsupported == 0 && ds_st64.first_bad_fmt < 0,
+          "ds_write2st64_b32 / ds_read2st64_b32 recompile as supported DS ops");
+
+    // The arm above only proves the opcodes are ACCEPTED. It says nothing about whether the ISA's
+    // 64-dword stride was applied, and a lowering that used the wrong multiplier would pass it
+    // while putting every wave's value in the wrong slot -- silent wrong data, which is worse than
+    // the reject it replaced. So pin the stride by EQUIVALENCE, not by difference.
+    //
+    // `ds_write2st64_b32 offset0:1 offset1:2` addresses dwords {base+64, base+128}. The non-st64
+    // `ds_write2_b32 offset0:64 offset1:128` addresses the same two. So the two must emit the SAME
+    // module -- BYTE-EXACT, and that is deliberate rather than incidental: the 0x0e and 0x0f
+    // handlers emit an identical operation sequence once their constants coincide, and nothing in
+    // the module derives from the raw instruction words. Do not weaken this back to `!=`; the
+    // inequality form cannot see a wrong-but-different multiplier. Requiring equality is what makes
+    // the arm discriminating:
+    //   x64 -> x1   equals `ds_plain_code` below      -> the inequality arm reddens
+    //   x64 -> x2   equals NEITHER                    -> this equality arm reddens
+    // A "must differ from the x1 twin" assertion alone catches only the first of those, and `* 2u`
+    // is not a hypothetical mutation -- it is the literal multiplier the ds_write2_b64 (0x4e) and
+    // ds_read2_b64 (0x77) handlers next door use, so it is exactly the copy/paste this file exists
+    // to catch.
+    const uint32_t ds_plain_code[] = {
+        0xD8380201u, 0x00020105u,   // ds_write2_b32 v5, v1, v2 offset0:1 offset1:2
+        0xD8DC0201u, 0x01000005u,   // ds_read2_b32  v[1:2], v5 offset0:1 offset1:2
+        0xBF810000u,
+    };
+    const uint32_t ds_equiv_code[] = {
+        0xD8388040u, 0x00020105u,   // ds_write2_b32 v5, v1, v2 offset0:64 offset1:128
+        0xD8DC8040u, 0x01000005u,   // ds_read2_b32  v[1:2], v5 offset0:64 offset1:128
+        0xBF810000u,
+    };
+    ComputeShaderConfig ds_st64_config;   // wave64 defaults; LDS needs only a compute shell
+    const std::vector<uint32_t> st64_spv = recompile_compute(
+        ds_st64_code, std::size(ds_st64_code), nullptr, ds_st64_config);
+    const std::vector<uint32_t> plain_spv = recompile_compute(
+        ds_plain_code, std::size(ds_plain_code), nullptr, ds_st64_config);
+    const std::vector<uint32_t> equiv_spv = recompile_compute(
+        ds_equiv_code, std::size(ds_equiv_code), nullptr, ds_st64_config);
+    // Non-emptiness is asserted separately and FIRST: both comparisons below are vacuous on an
+    // empty module (an empty vector differs from a non-empty one, and two empty ones are equal),
+    // so without this arm a total lowering failure would read as a pass on one of them.
+    CHECK(!st64_spv.empty() && !plain_spv.empty() && !equiv_spv.empty(),
+          "the st64 pair and both non-st64 comparison pairs lower to real modules");
+    CHECK(st64_spv == equiv_spv,
+          "ds_*2st64_b32 offset0:1 offset1:2 lowers identically to ds_*2_b32 offset0:64 offset1:128 "
+          "(both offsets scale by 64 dwords)");
+    CHECK(st64_spv != plain_spv,
+          "ds_*2st64_b32 does not emit the unscaled ds_*2_b32 offset0:1 offset1:2 lowering");
+
+    // The arms above still pass if the 0x0f handler's EQUAL-OFFSET guard is deleted, because their
+    // offsets differ (1 != 2) so the guarded branch is taken either way. Found in review, and the
+    // guard is not decorative: OFFSET0 == OFFSET1 encodes ONE memory access which uses DATA0, so
+    // storing DATA1 as well lets the later store win and a subsequent read observes DATA1 where
+    // hardware preserves DATA0 -- silent wrong data, the same defect #1473 fixed for 0x4e.
+    //
+    // `ds_write2st64_b32 offset0:1 offset1:1` and `ds_write2_b32 offset0:64 offset1:64` both address
+    // the single dword base+64, so both must emit ONE store and therefore the same module.
+    // Scope, stated so this is not read as more than it is: this arm targets the 0x0f guard. Deleting
+    // BOTH handlers' guards would make the two modules agree again (each emitting two stores), which
+    // the 0x0e guard's own coverage elsewhere is responsible for.
+    const uint32_t ds_st64_equal_off[] = {
+        0xD83C0101u, 0x00020105u,   // ds_write2st64_b32 v5, v1, v2 offset0:1 offset1:1
+        0xBF810000u,
+    };
+    const uint32_t ds_plain_equal_off[] = {
+        0xD8384040u, 0x00020105u,   // ds_write2_b32 v5, v1, v2 offset0:64 offset1:64
+        0xBF810000u,
+    };
+    const std::vector<uint32_t> st64_eq_spv = recompile_compute(
+        ds_st64_equal_off, std::size(ds_st64_equal_off), nullptr, ds_st64_config);
+    const std::vector<uint32_t> plain_eq_spv = recompile_compute(
+        ds_plain_equal_off, std::size(ds_plain_equal_off), nullptr, ds_st64_config);
+    CHECK(!st64_eq_spv.empty() && !plain_eq_spv.empty(),
+          "both equal-offset DS write2 programs lower to real modules");
+    CHECK(st64_eq_spv == plain_eq_spv,
+          "ds_write2st64_b32 with OFFSET0 == OFFSET1 emits one store, like ds_write2_b32");
+
     // Coverage only inspects emit_alu's `ok` flag and discards the SPIR-V; also prove v_add_co_u32
     // lowers to a real, well-formed module (VGPR operands this time: v2 = v0 + v1, carry->vcc). Without
     // the emit branch recompile_valu returns {}; with it, a valid module (magic 0x07230203) is produced.
