@@ -6,9 +6,11 @@
 // boot-time switch and wrong for any variable a test arms at runtime: the read is frozen before
 // the arm, and such a test does not fail, it goes VACUOUS. `tools/env/check_cached_env.py` refuses
 // those names for exactly that reason, which leaves them as live `getenv` calls -- and several of
-// them sit on per-DRAW paths. Measured on a routed Grand Theft Auto V window after #3705 cached
-// everything that could be cached: 58,304,770 remaining `getenv` calls, of which `PROSPER_GFXLOG`
-// is 13.4 M and `PROSPER_RENDER_TIMING` 10.0 M, both read per draw per stage. `getenv` itself is
+// them sit on per-DRAW paths. Measured with tools/getenv_probe over a **240 s** routed Grand Theft
+// Auto V window after #3705 had cached everything that could be cached, diagnostics in their
+// default state: 33,852,129 `getenv` calls, of which `PROSPER_GFXLOG` is 7.51 M and
+// `PROSPER_RENDER_TIMING` 5.95 M, both read per draw per stage. (A 340 s window of the same route
+// gives 58.3 M / 13.4 M / 10.0 M -- so quote a window with any of these.) `getenv` itself is
 // 1.92% of the render thread in the retained native profile, and a name that is ABSENT -- the
 // normal state of a diagnostic switch -- costs a full scan of the environment, so the misses are
 // the expensive ones.

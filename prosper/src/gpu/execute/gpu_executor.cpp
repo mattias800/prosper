@@ -1045,16 +1045,11 @@ struct InterpolationCache {
     uint64_t use_counter = 0;
 };
 
-// sizeof(FoldStateSnapshot), which is declared inside resolve_dynamic_fetch and so is not nameable
-// here. Pinned to the real type by a static_assert at the definition, because a stale constant would
-// silently rescale every byte figure this profiler prints.
-constexpr uint64_t kFoldStateSnapshotBytes = 16504;
-
 struct StageFoldProfileEntry {
     uint64_t cached_control_calls = 0;
     uint64_t control_bytes = 0;
     // Branch-exclusive snapshot storage, in SLOTS the plan reserves against CAPTURES actually
-    // taken. One snapshot is 16,504 bytes, so the gap between these two is the per-call cost of
+    // taken. A snapshot is several kilobytes, so the gap between these two is the per-call cost of
     // reserving storage for a save that never happens.
     uint64_t snapshot_slots = 0;
     uint64_t snapshot_captures = 0;
@@ -1103,7 +1098,12 @@ void record_stage_fold_profile(uint64_t code, uint32_t user_base, size_t code_dw
                                uint64_t guest_probes, double elapsed_ms, double decode_ms,
                                double guest_probe_ms, bool cached_control, uint64_t control_bytes,
                                uint64_t snapshot_slots, uint64_t snapshot_captures,
-                               uint64_t snapshot_restores) {
+                               uint64_t snapshot_restores, uint64_t snapshot_bytes) {
+    // snapshot_bytes is sizeof(FoldStateSnapshot), passed in because that type is declared inside
+    // resolve_dynamic_fetch and is not nameable here. The obvious alternative -- a constant here
+    // pinned by a static_assert at the definition -- is WRONG rather than merely ugly: the size is
+    // 16,504 bytes on x86-64 Linux and need not be that on another ABI, and the assert duly failed
+    // the macOS build of this change's first revision.
     static const uint64_t interval = [] {
         const char* value = std::getenv("PROSPER_STAGE_FOLD_PROFILE_CALLS");
         if (!value || !*value) return 4096ull;
@@ -1159,8 +1159,8 @@ void record_stage_fold_profile(uint64_t code, uint32_t user_base, size_t code_dw
                  total - decode - probe, (unsigned long long)instruction_total,
                  (unsigned long long)cached_calls, (unsigned long long)slots_total,
                  (unsigned long long)captures_total, (unsigned long long)restores_total,
-                 (unsigned long long)(slots_total * kFoldStateSnapshotBytes),
-                 (unsigned long long)(captures_total * kFoldStateSnapshotBytes));
+                 (unsigned long long)(slots_total * snapshot_bytes),
+                 (unsigned long long)(captures_total * snapshot_bytes));
     for (size_t i = 0; i < std::min<size_t>(ranked.size(), 12); ++i) {
         const StageFoldProfileEntry& item = ranked[i];
         const double calls = static_cast<double>(item.calls);
@@ -3748,8 +3748,6 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
         std::array<VertexFetchIndexMode, kFoldVgprs> vector_index_mode;
         int scc;
     };
-    static_assert(sizeof(FoldStateSnapshot) == kFoldStateSnapshotBytes,
-                  "kFoldStateSnapshotBytes must track the snapshot it measures");
     // Snapshot VALUES always belong to this invocation, including nested and parallel folds.
     std::vector<std::pair<bool, FoldStateSnapshot>> saved_at_branch(
         branch_exclusive_disabled ? 0 : control_plan->snapshot_count);
@@ -6020,7 +6018,8 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
             std::chrono::duration<double, std::milli>(FoldClock::now() - fold_start).count(),
             std::chrono::duration<double, std::milli>(decode_done - fold_start).count(),
             guest_probe_ms, control_plan != &local_control_plan, control_plan->allocated_bytes(),
-            saved_at_branch.size(), snapshot_captures, snapshot_restores);
+            saved_at_branch.size(), snapshot_captures, snapshot_restores,
+            sizeof(FoldStateSnapshot));
     return out;
 }
 

@@ -49,8 +49,8 @@ asking the moment you step outside one. A test that flips a switch between two b
 
 The same session also killed one of its own theories. A 16 KB block of state the shader interpreter
 saves at certain branches looked like it explained the biggest cost in the profile; counting showed
-95% of the time it saves nothing at all. That measurement is kept and the code built on the theory
-was thrown away.
+it saves nothing at all at least 95% of the time. That measurement is kept and the code built on the
+theory was thrown away.
 
 ## 2026-09-15
 

@@ -103,8 +103,13 @@ int main() {
     // Leaving the scope must restore the live read rather than leave the last sample standing --
     // the destructor closing the window is what makes "forgetting a scope costs speed, never
     // correctness" true.
-    set_test_env("PROSPER_TEST_ENV_SUBMIT", nullptr);
-    CHECK(!probe_a(), "after the last scope closes, a clear made outside it is visible at once");
+    //
+    // The switch is ARMED here rather than cleared, and that is the whole arm. Site A's cached
+    // value at this point is `false` (it sampled a cleared switch just above), so an arm expecting
+    // `false` would be satisfied by the stale cache: it would pass whether or not the scope closed,
+    // which is a vacuous arm sitting next to the property it claims to test.
+    set_test_env("PROSPER_TEST_ENV_SUBMIT", "1");
+    CHECK(probe_a(), "after the last scope closes, an arm made outside it is visible at once");
 
     // Worker threads realize a submit's draws, so the generation must be global rather than
     // thread_local: a per-thread counter is never bumped on a worker, which would freeze the value
