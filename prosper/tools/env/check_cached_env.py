@@ -307,8 +307,38 @@ HOT_SELF_TESTS = [
 ]
 
 
+# The tier-4 predicate, which is a set intersection and therefore looks too simple to test. It is
+# not the arithmetic that can break -- it is the DIRECTION. A check written the other way round
+# ("per-submit names must also be cached", or an intersection taken against the armed set instead of
+# the cached one) passes a clean tree exactly as loudly as the right one, and the clean run below is
+# what a reader would take as proof it works. Same shape as the positive-control rule in CLAUDE.md:
+# a check that has never been shown to FIRE has not been shown to do anything.
+#
+# (cached, per_submit, expected number of clashes reported)
+PER_SUBMIT_SELF_TESTS = [
+    ({"PROSPER_X": ["a.cpp:1"]}, {"PROSPER_X": ["b.cpp:2"]}, 1),      # must FIRE
+    ({"PROSPER_X": ["a.cpp:1"]}, {"PROSPER_Y": ["b.cpp:2"]}, 0),      # disjoint: legal
+    ({"PROSPER_X": ["a.cpp:1"]}, {}, 0),                              # no per-submit sites at all
+    ({}, {"PROSPER_Y": ["b.cpp:2"]}, 0),                              # per-submit only: legal
+    # Armed is NOT an input here, deliberately: a per-submit name may be armed at runtime, and an
+    # intersection taken against the armed set instead of the cached one would refuse every
+    # conversion this mechanism exists to allow. Two clashes, so a check that stops at the first
+    # also fails.
+    ({"PROSPER_X": ["a.cpp:1"], "PROSPER_Z": ["c.cpp:3"]},
+     {"PROSPER_X": ["b.cpp:2"], "PROSPER_Z": ["d.cpp:4"]}, 2),
+]
+
+
 def self_test() -> int:
     bad = 0
+    import io, contextlib
+    for cached, per_submit, want in PER_SUBMIT_SELF_TESTS:
+        with contextlib.redirect_stdout(io.StringIO()):
+            got = check_per_submit(cached, per_submit)
+        if got != want:
+            print(f"  [FAIL] per-submit self-test: cached={sorted(cached)} "
+                  f"per_submit={sorted(per_submit)} want={want} got={got}")
+            bad += 1
     for snippet, want in HOT_SELF_TESTS:
         got = live_getenv_names(snippet)
         if got != want:
@@ -325,7 +355,8 @@ def self_test() -> int:
     if bad:
         print(f"  the scanner's own patterns are broken -- a tree scan would report a false CLEAN")
     else:
-        print(f"  [ok]   scanner self-test: {len(SELF_TESTS) + len(HOT_SELF_TESTS)} cases")
+        print(f"  [ok]   scanner self-test: "
+              f"{len(SELF_TESTS) + len(HOT_SELF_TESTS) + len(PER_SUBMIT_SELF_TESTS)} cases")
     return bad
 
 
