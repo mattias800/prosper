@@ -525,6 +525,40 @@ int main(int argc, char** argv) {
         CHECK(scoped_module("0") != scoped_module("1"),
               "two different ordinal selections produce two different modules");
 
+        // (d) #3714: the EMITTER must read the operation's pinned value, not the live environment.
+        //
+        // This is the arm the rest of #3714's coverage cannot supply. `test_trip_bound_operation`
+        // asserts on `compute_trip_bound_settings()` directly, which is a PROXY for what the
+        // emitter reads; the shader-cache arms observe a mid-submit HIT, so no compilation happens
+        // inside them at all. Swap `rdna2_emit_cfg.cpp`'s three calls to the parsing function and
+        // every one of those stays green -- while the module is then built under settings the key
+        // never saw, which is the entire defect. Only compiling INSIDE an operation whose value
+        // disagrees with the environment can see it.
+        //
+        // Shape: pin ordinal 0, then set the environment to ordinal 1, then compile. The module
+        // must be ordinal 0's -- and (c) just proved those two modules differ, so this cannot pass
+        // by the two being identical.
+        set_env("PROSPER_CFG_TRIP_BOUND", std::to_string(kScopedBound).c_str());
+        set_env("PROSPER_CFG_TRIP_BOUND_PHASE", "0");
+        set_env("PROSPER_CFG_TRIP_BOUND_ORDINAL", "0");
+        const std::vector<uint32_t> ordinal0 = recompile_valu(kDispatcherLoops, kDispatcherWords, 2, 2);
+        std::vector<uint32_t> pinned_module;
+        {
+            const prosper::gpu::TripBoundOperation op;          // pins ordinal 0
+            set_env("PROSPER_CFG_TRIP_BOUND_ORDINAL", "1");     // the change the emitter must ignore
+            pinned_module = recompile_valu(kDispatcherLoops, kDispatcherWords, 2, 2);
+        }
+        CHECK(!ordinal0.empty() && pinned_module == ordinal0,
+              "#3714: a compilation inside an operation emits the PINNED selector, not the live one");
+        // Negative control: the identical sequence with no operation open follows the environment,
+        // which is what made the key and the module disagree before this change.
+        set_env("PROSPER_CFG_TRIP_BOUND_ORDINAL", "0");
+        const std::vector<uint32_t> live_before = recompile_valu(kDispatcherLoops, kDispatcherWords, 2, 2);
+        set_env("PROSPER_CFG_TRIP_BOUND_ORDINAL", "1");
+        const std::vector<uint32_t> live_after = recompile_valu(kDispatcherLoops, kDispatcherWords, 2, 2);
+        CHECK(!live_before.empty() && live_after != live_before,
+              "control: the same sequence with no operation open DOES follow the environment");
+
         set_env("PROSPER_CFG_TRIP_BOUND_ORDINAL", nullptr);
         set_env("PROSPER_CFG_TRIP_BOUND", std::to_string(kBound).c_str());
         set_env("PROSPER_CFG_TRIP_BOUND_PHASE", "0");

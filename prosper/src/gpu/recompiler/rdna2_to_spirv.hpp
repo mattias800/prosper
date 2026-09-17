@@ -166,8 +166,12 @@ uint64_t trip_bound_parses();
 // every submit each operation parses afresh, so a test that arms between two operations still sees
 // its change -- which is what test_cfg_trip_bound depends on.
 //
-// Nesting adopts rather than re-samples: an inner operation keeps the outer pin, so a chained
-// vertex program cannot disagree with the program it is chained to.
+// Nesting adopts rather than re-samples: an inner operation keeps the outer pin. No production
+// path nests one today -- the three key sites are leaves, and `recompile_vertex_chain_cached_shared`
+// compiles prolog and continuation under ONE operation rather than two -- so this is a defensive
+// rule about what an added scope may not do, not a description of a live call chain. Stated that
+// way round on purpose: a comment that invents a caller to justify a rule is the failure this whole
+// change is about.
 class TripBoundOperation {
 public:
     TripBoundOperation();
