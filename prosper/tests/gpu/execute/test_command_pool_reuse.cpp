@@ -64,21 +64,45 @@ int main() {
     };
 
     const auto before = render_command_pool_stats();
+
+    // WARM THE FREE LIST FIRST. This is load-bearing for the exclusive-ownership arm below, and the
+    // reason is worth stating because the arm looked sound without it: against an EMPTY cache both
+    // acquires take the create path, so the arm would assert only that vkCreateCommandPool returns
+    // distinct handles and would stay green with the cache's erase (render_runner.h) deleted. It has
+    // to be the CACHED path that is asked to hand out each entry at most once.
+    RenderCommandPoolLease warm = acquire_render_command_pool(ctx.dev, ctx.qfi);
+    check(static_cast<bool>(warm), "a pool and its command buffer are acquired");
+    check(record_and_submit(warm), "the acquired pool records and submits");
+    release_render_command_pool(ctx.dev, ctx.qfi, warm);
+
+    const auto after_warm = render_command_pool_stats();
     RenderCommandPoolLease first = acquire_render_command_pool(ctx.dev, ctx.qfi);
-    check(static_cast<bool>(first), "a pool and its command buffer are acquired");
-    check(record_and_submit(first), "the acquired pool records and submits");
+    const auto after_first = render_command_pool_stats();
+    check(static_cast<bool>(first), "a second acquire after that release succeeds");
+    if (reuse) {
+        // The arm that detects its own invalidity: if this is a miss the free list was not warm and
+        // the ownership arm below has silently degraded into the void version described above.
+        check(after_first.hits == after_warm.hits + 1,
+              "the free list really is warm, so the ownership arm exercises the CACHED path");
+    }
 
     // EXCLUSIVE OWNERSHIP. Vulkan requires external synchronisation on a command pool, so handing
     // the same one to two live callers would be a use-after-handout even though nothing crashes
-    // immediately. Acquire a second WITHOUT releasing the first.
+    // immediately. Acquire a second WITHOUT releasing the first: `first` holds the entry that was
+    // cached, so a cache that failed to remove what it hands out would return it again here.
     RenderCommandPoolLease concurrent = acquire_render_command_pool(ctx.dev, ctx.qfi);
     check(concurrent && concurrent.pool != first.pool && concurrent.command != first.command,
           "a second acquire while the first is still held returns a DIFFERENT pool and buffer");
-    release_render_command_pool(ctx.dev, ctx.qfi, concurrent);
 
     // REUSE. Released, then re-acquired: with reuse on this must be the same handle and a hit;
     // with reuse off it must be a fresh pool and no hit. The two directions are what separate this
     // from an arm that would pass against either implementation.
+    //
+    // `concurrent` is deliberately still HELD here rather than released above, so that exactly one
+    // entry is in the free list when `second` is acquired. Releasing it first would leave two, and
+    // then "the pool that comes back is `first`" would silently depend on the cache being scanned
+    // newest-first -- an implementation detail, not the property under test. A correct cache that
+    // scanned oldest-first would fail the arm. It is released after the cycles below.
     release_render_command_pool(ctx.dev, ctx.qfi, first);
     const auto after_release = render_command_pool_stats();
     RenderCommandPoolLease second = acquire_render_command_pool(ctx.dev, ctx.qfi);
@@ -106,10 +130,20 @@ int main() {
     for (int i = 0; i < 8 && stable; ++i) {
         release_render_command_pool(ctx.dev, ctx.qfi, second);
         second = acquire_render_command_pool(ctx.dev, ctx.qfi);
-        stable = second && second.command == first.command && record_and_submit(second);
+        // The identity requirement is the REUSE property, so it must not be asserted against the
+        // control, where every acquire builds a fresh pool. It is conditional rather than merely
+        // moved because the unconditional version PASSED locally on RADV: the driver handed back
+        // identical handle values for the pool destroyed a moment earlier, so the arm read as green
+        // for a reason that had nothing to do with reuse. CI's lavapipe does not recycle handles and
+        // failed it. A handle equality is only evidence when something guarantees the handle was
+        // never freed -- here that guarantee is the free list, and only when reuse is on.
+        stable = second && record_and_submit(second) && (!reuse || second.command == first.command);
     }
-    check(stable, "eight further acquire/release cycles keep the same pool AND the same buffer");
+    check(stable, reuse
+          ? "eight further acquire/release cycles keep the same pool AND the same buffer"
+          : "control: eight further cycles still record and submit with reuse disabled");
     release_render_command_pool(ctx.dev, ctx.qfi, second);
+    release_render_command_pool(ctx.dev, ctx.qfi, concurrent);   // held since the ownership arm
 
     // BOUNDED. The whole hazard of a free list is trading allocator time for unbounded memory, and
     // each retained pool still owns its command-stream allocations. Release well past the limit and
@@ -135,11 +169,26 @@ int main() {
         check(post_flood.cached == 0, "control: reuse disabled retains nothing at all");
     }
 
-    // Two mutations this file deliberately does NOT catch, recorded rather than implied:
-    //  * ignoring `queue_family` when matching a cached pool. This device exposes one usable family,
-    //    so no arm here can distinguish a correct match from a device-only one.
-    //  * handing the same cached pool to two live callers. That aborts the process under validation
-    //    rather than failing an assertion, so it is detected but not diagnosed.
+    // What this file does and does not catch. Every line below was produced by APPLYING the mutation
+    // and running it, not by reading the code and reasoning about it -- an earlier version of this
+    // comment was wrong in both directions, which is the whole reason it is now measured.
+    //
+    //  * NOT CAUGHT HERE: making vkResetCommandPool a no-op (`if (true)` at its call site). All
+    //    arms in this file stay green, because the difference is not observable through the handles
+    //    or the counters. It IS caught by Vulkan validation, which is part of this change's merge
+    //    gate: the pool is created WITHOUT VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, so
+    //    re-recording a buffer that was never reset violates
+    //    VUID-vkBeginCommandBuffer-commandBuffer-00050. Measured: 9 such messages from this test
+    //    under tools/vkval/vk_validation_scan.py, and zero with the reset restored.
+    //  * CAUGHT, and by design: handing the same cached pool to two live callers (deleting the
+    //    free list's `erase`). The exclusive-ownership arm above fails on it. Note the run ALSO
+    //    aborts later, inside the bound arm, once a duplicated entry is destroyed while another
+    //    copy is still cached -- and the abort discards buffered stdout, so a plain run shows no
+    //    [FAIL] line at all. Read this test's failures with `stdbuf -o0` before concluding which
+    //    arm caught what.
+    //  * GENUINELY NOT CAUGHT: ignoring `queue_family` when matching a cached pool. This device
+    //    exposes one usable family, so no arm here can distinguish a correct match from a
+    //    device-only one.
     if (failures) { std::printf("== FAIL: %d ==\n", failures); return 1; }
     std::printf("== PASS ==\n");
     return 0;
