@@ -107,6 +107,18 @@ static uint64_t mib_cap_old(const char* t) {
 static uint64_t copy_threads_new(const char* n, const char* t) {
     return env_u64_or_default_capped(n, t, 0ull, 32ull, "threads");
 }
+// #3407: the bounded VkCommandPool free list. 0 is MEANINGFUL here -- retain nothing, i.e. the old
+// destroy-every-time behaviour -- so it cannot double as the failure value, which is exactly why
+// the site uses env_numeric rather than strtoul. The old spelling wrapped "-1" to a huge retention
+// count; a reader setting -1 to "turn it off" would have got the opposite of off.
+static uint64_t command_pool_cache_new(const char* n, const char* t) {
+    return env_u64_or_default_capped(n, t, 8ull, 256ull, "pools");
+}
+static uint64_t command_pool_cache_old(const char* t) {
+    if (!t || !*t) return 8ull;
+    const unsigned long parsed = std::strtoul(t, nullptr, 10);
+    return parsed > 256ul ? 256ull : static_cast<uint64_t>(parsed);
+}
 static uint64_t copy_threads_old(const char* t) {
     if (!t || !*t) return 0ull;
     const unsigned long parsed = std::strtoul(t, nullptr, 10);
@@ -414,6 +426,8 @@ static const Site kSites[] = {
      mib_cap_new<256>, mib_cap_old<256>, "-1", 256ull * kMiB, "512", 512ull * kMiB},
     {"render_runner.h PROSPER_RENDER_COPY_THREADS", "PROSPER_RENDER_COPY_THREADS",
      copy_threads_new, copy_threads_old, "-1", 0ull, "4", 4ull},
+    {"render_runner.h PROSPER_COMMAND_POOL_CACHE", "PROSPER_COMMAND_POOL_CACHE",
+     command_pool_cache_new, command_pool_cache_old, "-1", 8ull, "16", 16ull},
 
     {"render_runner.h PROSPER_BACKEND_BUFFER_ARENA_KB", "PROSPER_BACKEND_BUFFER_ARENA_KB",
      arena_new, arena_old, "4mb", 1024ull * 1024ull, "2048", 2048ull * 1024ull},
