@@ -1696,6 +1696,15 @@ if(TARGET prosper_core)
   target_include_directories(test_env_cache PRIVATE src)
   add_test(NAME diagnostics_env_cache COMMAND test_env_cache)
 
+  # The per-submit sampling contract (diagnostics/env_submit.hpp). Two-sided by construction: it
+  # asserts a value is frozen INSIDE one SubmitEnvScope -- which a live getenv cannot do -- and that
+  # the next scope observes an arm made since -- which PROSPER_ENV_ON cannot do. Either half alone
+  # would pass against the wrong mechanism. Threads, so link the thread library.
+  add_executable(test_env_submit tests/diagnostics/test_env_submit.cpp)
+  target_include_directories(test_env_submit PRIVATE src)
+  target_link_libraries(test_env_submit PRIVATE Threads::Threads)
+  add_test(NAME diagnostics_env_submit COMMAND test_env_submit)
+
   # One arm per PROSPER_* knob #3267 converted to diagnostics/env_numeric.hpp. Header-only and
   # environment-free by construction: nearly every converted site caches its read in a
   # function-local static, so an arm that armed the variable at runtime would go VACUOUS rather
