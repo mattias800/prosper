@@ -19,6 +19,20 @@ from the tracker issues, and still gated, because it is a projection of state ra
 > title's current state — for that, read the tracker. Nothing is ever removed when a title moves on,
 > because the point of a blog is that it records *when* things happened.
 
+## 2026-09-17
+
+### Sonic Frontiers' Cyber Space world is rendered — it just never reaches the screen
+
+The game has been filed for weeks as "gameplay reached, world black". It is not black: prosper draws
+the whole level, correctly textured and lit. This is one of prosper's own render targets, pulled out
+of a frame captured while the on-screen picture was a HUD over pure black.
+
+![Sonic Frontiers — Cyber Space rendered into prosper's render target](assets/screenshots/sonic-frontiers-cyberspace-world-in-target.webp)
+
+What reaches the display buffer in that same frame is 0.94% non-black: the ring counter, the timer
+and the boost gauge, over nothing. So the frontier moves from "the world does not render" to "the
+rendered world does not reach the guest's display buffer" — see [#2790](https://github.com/mattias800/prosper/issues/2790).
+
 ## 2026-09-15
 
 ### A tuning number from a different graphics card was costing us a fifth of the frame rate
