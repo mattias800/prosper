@@ -308,19 +308,27 @@ HOT_SELF_TESTS = [
 
 
 # The tier-4 predicate, which is a set intersection and therefore looks too simple to test. It is
-# not the arithmetic that can break -- it is the DIRECTION. Write it as `per_submit - cached`
-# ("a per-submit name must ALSO be cached") and it reports nothing on a tree where the two sets do
-# overlap nowhere, i.e. on this one; the clean run is then what a reader takes as proof it works,
-# and it proves nothing. The two FIRING cases below are the whole defence. Same shape as the
-# positive-control rule in CLAUDE.md: a check that has never been shown to FIRE has not been shown
-# to do anything.
+# not the arithmetic that can break -- it is the DIRECTION. The inverse, `per_submit - cached`
+# ("a per-submit name must ALSO be cached"), is this check's complement: it is empty exactly when
+# every per-submit name is cached, which is the state this check exists to forbid -- so on any tree
+# this check passes, the inverse fires on everything. On this one it selects all five per-submit
+# names, prints the first, and dies on a KeyError in the reporting loop below, which indexes
+# `cached[name]` for a name that by construction is not in `cached`. The
+# two FIRING cases still earn their place, for a narrower reason than "nothing else would notice":
+# they catch the inversion here, with a message instead of a traceback, and they pin the direction.
+# Same shape as the positive-control rule in CLAUDE.md: a check that has never been shown to FIRE
+# has not been shown to do anything.
 #
 # What these cases can NOT see, measured rather than assumed: passing the wrong SET at the call
 # site in main() -- `check_per_submit(armed, per_submit)` instead of `cached` -- since `armed` is
-# not a parameter here and no self-test input reaches that choice. That variant fails closed (the
-# tree scan reports 5 clashes and exits 1) but it fails for the wrong reason, so read the call site
-# as well as this table. Nor do these cases see a reporting regression: stdout is discarded and
-# only the count is asserted.
+# not a parameter here and no self-test input reaches that choice. On today's tree it is caught
+# anyway, because all five per-submit names happen to be armed, so the mutated intersection is
+# non-empty and the scan reports 5 clashes and exits 1. That is COINCIDENCE, not fail-closed: a
+# per-submit name nothing arms contributes nothing to it, and a tree with no armed per-submit name
+# would pass silently. (The overlap is total today only because this contract exists FOR
+# runtime-armed names -- a strong tendency, and nothing here enforces it.) So read the call site as
+# well as this table. Nor do these cases see a reporting regression: stdout is discarded and only
+# the count is asserted.
 #
 # (cached, per_submit, expected number of clashes reported)
 PER_SUBMIT_SELF_TESTS = [
