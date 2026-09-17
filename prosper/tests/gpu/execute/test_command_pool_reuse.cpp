@@ -131,12 +131,20 @@ int main() {
         release_render_command_pool(ctx.dev, ctx.qfi, second);
         second = acquire_render_command_pool(ctx.dev, ctx.qfi);
         // The identity requirement is the REUSE property, so it must not be asserted against the
-        // control, where every acquire builds a fresh pool. It is conditional rather than merely
-        // moved because the unconditional version PASSED locally on RADV: the driver handed back
-        // identical handle values for the pool destroyed a moment earlier, so the arm read as green
-        // for a reason that had nothing to do with reuse. CI's lavapipe does not recycle handles and
-        // failed it. A handle equality is only evidence when something guarantees the handle was
-        // never freed -- here that guarantee is the free list, and only when reuse is on.
+        // control, where every acquire builds a fresh pool. It was unconditional once, and passed
+        // locally while failing in CI.
+        //
+        // Do NOT "fix" that by making it unconditional again and blaming one driver. Whether a
+        // destroyed handle comes back with the same value is not a property of the no-reuse path at
+        // all: it depends on the driver, on whether the validation layer is loaded, AND on the
+        // allocation sequence ahead of it. Measured here on this file, reuse off, identity asserted
+        // unconditionally, 10 runs per cell, deterministic in every cell -- RADV without the layer
+        // FAILS, RADV with the layer PASSES, lavapipe passes either way. Change the sequence above
+        // and the cells move. So every green run of the unconditional version was an accident of the
+        // allocator, in whichever direction it happened to fall that day.
+        //
+        // A handle equality is evidence only when something guarantees the handle was never freed.
+        // Here that guarantee is the free list, and it exists only when reuse is on.
         stable = second && record_and_submit(second) && (!reuse || second.command == first.command);
     }
     check(stable, reuse
