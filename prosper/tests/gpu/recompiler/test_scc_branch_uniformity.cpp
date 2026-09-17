@@ -81,7 +81,7 @@ int main() {
     // writes SCC from a LANE MASK. Stepping over the popcount would prove the branch from the older
     // compare. The walk must stop at it.
     const uint32_t ballot_popcount_guard[] = {
-        0x7D020300u,                // v_cmp_eq_u32 vcc, v0, v1
+        0x7D020300u,                // v_cmp_lt_i32 vcc, v0, v1  (any VOPC writing VCC)
         0xBF008005u,                // s_cmp_eq_i32 s5, 0       <- the decoy uniform compare
         0xBE86106Au,                // s_bcnt1_i32_b64 s6, vcc  <- writes SCC from the lane mask
         0xBEFE04C1u,                // s_mov_b64 exec, -1
@@ -110,7 +110,7 @@ int main() {
     // untouched launch value while waves that took it compare the loaded one. Both values are
     // uniform; the CHOICE is not.
     const uint32_t non_dominating_guard[] = {
-        0x7D020300u,                // v_cmp_eq_u32 vcc, v0, v1
+        0x7D020300u,                // v_cmp_lt_i32 vcc, v0, v1  (any VOPC writing VCC)
         0xBF860003u,                // s_cbranch_vccz -> the merge
         0xF4200404u, 0xFA000000u,   // s_buffer_load_dword s16, s[8:11], null   <- only in this arm
         0xBF800000u,                // s_nop
@@ -131,6 +131,44 @@ int main() {
               "negative fixture really places the load behind a wave-varying branch");
         CHECK(!scc_branch_is_workgroup_uniform(ins, branch_pc),
               "a scalar branch whose value is defined inside a wave-varying arm is NOT uniform");
+    }
+
+    // ---- positive that actually reaches sole_launch_derived_definition --------------------------
+    // The first positive above does NOT exercise part 3 of this proof, and that was found in review:
+    // with no branches at all, `block_start` walks to 0, so `last_writer` finds the load INSIDE the
+    // branch's straight-line region and `uniform_scalar` takes its ordinary in-region SMEM case.
+    // Replacing `sole_launch_derived_definition`'s body with `return false;` left every other
+    // assertion in this file green — an arm sitting next to the property instead of on it.
+    //
+    // Reaching part 3 needs the definition OUTSIDE the branch's own block while still dominating it,
+    // which is exactly the guest shape: the load sits before all control flow, and the compare that
+    // consumes it sits in a later block whose start is a branch target. Here `s_cbranch_execz`
+    // targets the compare, so `block_start` stops there and the load is out of region.
+    const uint32_t out_of_region_guard[] = {
+        0xF4200404u, 0xFA000000u,   // pc 0: s_buffer_load_dword s16, s[8:11], null  (sole def)
+        0xBF880001u,                // pc 2: s_cbranch_execz -> pc 4
+        0xBF800000u,                // pc 3: s_nop
+        0xBF0B8110u,                // pc 4: s_cmp_le_u32 s16, 1   <- branch target: block starts here
+        0xBEFE04C1u,                // pc 5: s_mov_b64 exec, -1
+        0xBF850001u,                // pc 6: s_cbranch_scc1 -> pc 8
+        0xBF800000u,                // pc 7: s_nop
+        0xBF810000u,                // pc 8: s_endpgm
+    };
+    {
+        const std::vector<Rdna2Inst> ins = walk(out_of_region_guard, std::size(out_of_region_guard));
+        uint32_t branch_pc = 0, execz_pc = 0, load_pc = UINT32_MAX;
+        for (const auto& in : ins) {
+            if (in.fmt == Rdna2Format::SOPP && in.opcode == 0x05u) branch_pc = in.pc;
+            if (in.fmt == Rdna2Format::SOPP && in.opcode == 0x08u) execz_pc = in.pc;
+            if (in.fmt == Rdna2Format::SMEM && load_pc == UINT32_MAX) load_pc = in.pc;
+        }
+        // Without these the arm could pass while the fixture had drifted into the shape of the
+        // first positive, which is how part 3 went untested in the first place.
+        CHECK(load_pc < execz_pc && execz_pc < branch_pc && branch_pc != 0,
+              "fixture really places the sole definition before all control flow, and the consuming "
+              "compare in a later block");
+        CHECK(scc_branch_is_workgroup_uniform(ins, branch_pc),
+              "a sole launch-derived definition OUTSIDE the branch's block still proves uniform");
     }
 
     // ---- control: the load's ADDRESS is lane-local ----------------------------------------------
