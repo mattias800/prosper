@@ -110,14 +110,28 @@ int main() {
     CHECK(ds_st64.total == 2 && ds_st64.unsupported == 0 && ds_st64.first_bad_fmt < 0,
           "ds_write2st64_b32 / ds_read2st64_b32 recompile as supported DS ops");
 
-    // The arm above only proves the opcodes are ACCEPTED. It cannot see whether the ISA's 64-dword
-    // stride was applied, and an implementation that ignored the scaling would pass it while
-    // writing every wave's value to the same slot -- silent wrong data, which is worse than the
-    // reject it replaced. So compare the emitted modules: the st64 form must NOT equal its non-st64
-    // twin, whose only difference is that its offsets count single dwords.
+    // The arm above only proves the opcodes are ACCEPTED. It says nothing about whether the ISA's
+    // 64-dword stride was applied, and a lowering that used the wrong multiplier would pass it
+    // while putting every wave's value in the wrong slot -- silent wrong data, which is worse than
+    // the reject it replaced. So pin the stride by EQUIVALENCE, not by difference.
+    //
+    // `ds_write2st64_b32 offset0:0 offset1:1` addresses dwords {base+0, base+1*64}. The non-st64
+    // `ds_write2_b32 offset0:0 offset1:64` addresses {base+0, base+64}. Same two indices, so the
+    // two must emit the SAME module. Requiring equality is what makes the arm discriminating:
+    //   x64 -> x1   equals `ds_plain_code` below      -> the inequality arm reddens
+    //   x64 -> x2   equals NEITHER                    -> this equality arm reddens
+    // A "must differ from the x1 twin" assertion alone catches only the first of those, and `* 2u`
+    // is not a hypothetical mutation -- it is the literal multiplier the ds_write2_b64 (0x4e) and
+    // ds_read2_b64 (0x77) handlers next door use, so it is exactly the copy/paste this file exists
+    // to catch.
     const uint32_t ds_plain_code[] = {
         0xD8380100u, 0x00020105u,   // ds_write2_b32 v5, v1, v2 offset0:0 offset1:1
         0xD8DC0100u, 0x01000005u,   // ds_read2_b32  v[1:2], v5 offset0:0 offset1:1
+        0xBF810000u,
+    };
+    const uint32_t ds_equiv_code[] = {
+        0xD8384000u, 0x00020105u,   // ds_write2_b32 v5, v1, v2 offset0:0 offset1:64
+        0xD8DC4000u, 0x01000005u,   // ds_read2_b32  v[1:2], v5 offset0:0 offset1:64
         0xBF810000u,
     };
     ComputeShaderConfig ds_st64_config;   // wave64 defaults; LDS needs only a compute shell
@@ -125,10 +139,17 @@ int main() {
         ds_st64_code, std::size(ds_st64_code), nullptr, ds_st64_config);
     const std::vector<uint32_t> plain_spv = recompile_compute(
         ds_plain_code, std::size(ds_plain_code), nullptr, ds_st64_config);
-    CHECK(!st64_spv.empty() && !plain_spv.empty(),
-          "both the st64 and non-st64 DS write2/read2 pairs lower to real modules");
+    const std::vector<uint32_t> equiv_spv = recompile_compute(
+        ds_equiv_code, std::size(ds_equiv_code), nullptr, ds_st64_config);
+    // Non-emptiness is asserted separately and FIRST: both comparisons below are vacuous on an
+    // empty module (an empty vector differs from a non-empty one, and two empty ones are equal),
+    // so without this arm a total lowering failure would read as a pass on one of them.
+    CHECK(!st64_spv.empty() && !plain_spv.empty() && !equiv_spv.empty(),
+          "the st64 pair and both non-st64 comparison pairs lower to real modules");
+    CHECK(st64_spv == equiv_spv,
+          "ds_*2st64_b32 offset1:1 lowers identically to ds_*2_b32 offset1:64 (stride is 64 dwords)");
     CHECK(st64_spv != plain_spv,
-          "ds_*2st64_b32 scales its offsets by 64 rather than emitting the non-st64 lowering");
+          "ds_*2st64_b32 does not emit the unscaled ds_*2_b32 offset1:1 lowering");
 
     // Coverage only inspects emit_alu's `ok` flag and discards the SPIR-V; also prove v_add_co_u32
     // lowers to a real, well-formed module (VGPR operands this time: v2 = v0 + v1, carry->vcc). Without

@@ -78,8 +78,16 @@ bool prepare_lds_fminmax_synchronization(std::vector<Rdna2Inst>& ins,
     if (synchronization) *synchronization = {};
     auto ordinary_lds_store = [](const Rdna2Inst& in) {
         if (in.fmt != Rdna2Format::DS || in.ds_gds) return false;
-        return in.opcode == 0x0d || in.opcode == 0x0e || in.opcode == 0x4d ||
-               in.opcode == 0x4e ||
+        // 0x0f is ds_write2st64_b32 -- an ordinary two-dword LDS store like 0x0e, differing only
+        // in that its packed offsets count 64-dword strides. It belongs here for the same reason
+        // 0x0e does: a workgroup reduction that feeds ds_min_f32/ds_max_f32 through st64 slots
+        // needs its stores serialized exactly as one using the unscaled form would. Sonic
+        // Frontiers' `0x200581bb00` is that shape, with 22 st64 writes.
+        // Whatever is added here MUST also gain a `store_data_registers` case below: that helper
+        // returning {} makes store_data_are_wave_uniform() iterate nothing and answer true
+        // vacuously, i.e. the store would be atomicized on a proof that never ran.
+        return in.opcode == 0x0d || in.opcode == 0x0e || in.opcode == 0x0f ||
+               in.opcode == 0x4d || in.opcode == 0x4e ||
                in.opcode == 0xb0 || in.opcode == 0xde || in.opcode == 0xdf;
     };
     auto float_lds_atomic = [](const Rdna2Inst& in) {
@@ -94,7 +102,9 @@ bool prepare_lds_fminmax_synchronization(std::vector<Rdna2Inst>& ins,
         };
         switch (in.opcode) {
             case 0x0d: case 0xb0: append(in.src[1].value, 1); break;
-            case 0x0e:
+            // 0x0f (st64) stores the same two single-dword operands as 0x0e; only the ADDRESS
+            // scaling differs, and this helper is about DATA registers.
+            case 0x0e: case 0x0f:
                 append(in.src[1].value, 1);
                 if ((in.literal & 0xffu) != ((in.literal >> 8u) & 0xffu))
                     append(in.src[2].value, 1);

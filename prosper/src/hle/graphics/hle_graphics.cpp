@@ -561,12 +561,18 @@ void videoout_seed_authorship_locked(int slot, uint64_t address, uint32_t width,
 // Gen5 title) registers through RegisterBuffers2. One body, both callers, so the next addition
 // cannot land on only half the titles.
 //
-// The report is UNGATED and deliberately so. These are the addresses the guest will flip, and every
-// "why is the picture wrong" investigation eventually needs them: a display buffer and a same-size
-// intermediate are both `width*height*4` bytes, so size alone cannot tell them apart, and without
-// this line the only way to learn them is to instrument the emulator mid-investigation. A boot
-// registers a handful of slots, so this is bounded without a rate limit and costs nothing
-// measurable.
+// The report is UNGATED and deliberately so, following the `[vo] display:` line above: these are the
+// addresses the guest will flip, and every "why is the picture wrong" investigation eventually needs
+// them -- a display buffer and a same-size intermediate are both `width*height*4` bytes, so size
+// alone cannot tell them apart, and without this line the only way to learn them is to instrument
+// the emulator mid-investigation.
+//
+// It carries its own cap rather than relying on "a boot registers a handful of slots", because that
+// is a claim about the titles seen so far and not a property of the API: nothing stops a guest
+// re-registering a set on every mode change, and an ungated per-call line would then be unbounded
+// stderr on a path nobody is watching. The cap is generous enough that a title with several sets
+// still reports all of them, and the suppression announces itself once so a truncated log is never
+// mistaken for a complete one.
 static void videoout_register_buffer_slot_locked(int slot, int set, uint64_t address,
                                                  const DisplayConfig::SetConfig& config,
                                                  const char* via) {
@@ -576,13 +582,22 @@ static void videoout_register_buffer_slot_locked(int slot, int set, uint64_t add
     if (generation == 0) generation = ++g_display.next_generation;
     g_display.buffer_generation[slot] = generation;
     videoout_seed_authorship_locked(slot, address, config.width, config.height);
-    std::fprintf(stderr,
-                 "[videoout] scanout buffer[%d] set=%d addr=0x%llx %ux%u fmt=0x%llx tile=%u "
-                 "bytes=%llu gen=%llu via=%s\n",
-                 slot, set, (unsigned long long)address, config.width, config.height,
-                 (unsigned long long)config.pixel_format, (unsigned)config.tiling_mode,
-                 (unsigned long long)config.width * (unsigned long long)config.height * 4ull,
-                 (unsigned long long)generation, via);
+    static unsigned reported = 0;          // guarded by the registry lock, like everything here
+    constexpr unsigned kReportCap = 64;
+    if (reported < kReportCap) {
+        ++reported;
+        std::fprintf(stderr,
+                     "[videoout] scanout buffer[%d] set=%d addr=0x%llx %ux%u fmt=0x%llx tile=%u "
+                     "bytes=%llu gen=%llu via=%s\n",
+                     slot, set, (unsigned long long)address, config.width, config.height,
+                     (unsigned long long)config.pixel_format, (unsigned)config.tiling_mode,
+                     (unsigned long long)config.width * (unsigned long long)config.height * 4ull,
+                     (unsigned long long)generation, via);
+        if (reported == kReportCap)
+            std::fprintf(stderr,
+                         "[videoout] scanout buffer report capped at %u; further registrations are "
+                         "silent\n", kReportCap);
+    }
 }
 
 // True when this buffer's contents have been observed to differ from its registration baseline.

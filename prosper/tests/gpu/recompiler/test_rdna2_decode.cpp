@@ -306,6 +306,21 @@ int main() {
     CHECK(dr2b.fmt == Rdna2Format::DS && dr2b.opcode == 0x37u && dr2b.literal == 0x1110u &&
           isV(dr2b.src[0], 2) && isV(dr2b.dst, 2),
           "Astro DS_READ2_B32 decodes non-zero offsets 16/17");
+    // DS_READ2ST64_B32 (0x38) writes the same two VGPRs as its non-st64 sibling above. This
+    // asserts the WRITE COUNT, not the decode: rdna2_vgpr_write_count() feeds writes_vgpr(), and
+    // a missing entry there is silent -- the wave-uniform store-data proof, the loop-header phi
+    // builder and the executor's liveness all then reason about an older definition of the same
+    // register instead of this read. Same words as the 0x37 case with only the opcode field moved.
+    const uint32_t ds_read2st64_adjacent[] = { 0xd8e00100u, 0x04000002u };
+    Rdna2Inst dr2s = rdna2_decode_one(ds_read2st64_adjacent, 2);
+    CHECK(dr2s.fmt == Rdna2Format::DS && dr2s.opcode == 0x38u && dr2s.literal == 0x0100u &&
+          isV(dr2s.src[0], 2) && isV(dr2s.dst, 4),
+          "DS_READ2ST64_B32 decodes as DS opcode 0x38 with ADDR v2 and VDST v4");
+    CHECK(rdna2_vgpr_write_count(dr2s) == 2u,
+          "DS_READ2ST64_B32 is counted as writing two VGPRs, like DS_READ2_B32");
+    CHECK(rdna2_vgpr_write_count(dr2a) == 2u,
+          "control: DS_READ2_B32 is still counted as writing two VGPRs");
+
     // VOP SDWA/DPP forms carry a mandatory 2nd (control) dword — the decoder must count it, or the
     // whole downstream stream mis-aligns. Encodings from llvm-mc gfx1030: SDWA src0=0xf9,
     // DPP16 src0=0xfa, DPP8 src0=0xe9.

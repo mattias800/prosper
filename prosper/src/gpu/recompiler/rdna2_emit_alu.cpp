@@ -8552,6 +8552,24 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             if (!b.lds_var) { ok = false; return true; }
             auto vread = [&](int r){ auto it = rs.vreg.find(r); return it == rs.vreg.end() ? b.uconst(0) : it->second; };
             const bool atomicize_store = b.atomicized_lds_store_pcs.contains(in.pc);
+            // The st64 forms multiply their 8-bit offsets by 64, so their CONSTANT index alone
+            // reaches 255*64 = 16320 dwords where every other DS form stops at a few hundred. The
+            // LDS array is sized from the shader's real allocation when the caller plumbed one and
+            // otherwise keeps a 4096-dword default (`rdna2_to_spirv_internal.hpp`,
+            // `rdna2_recompile_compute.cpp`), so an unplumbed shader can put a constant index past
+            // the end -- an out-of-bounds Workgroup OpAccessChain, which is undefined behaviour and
+            // is NOT covered by robustBufferAccess. Fail visibly instead. This can only reject
+            // programs that rejected outright before these opcodes were implemented, so it costs
+            // nothing that worked, and it is a bound on the constant part only: the base address is
+            // a runtime VGPR and was never statically bounded for any DS opcode.
+            auto lds_const_index_in_range = [&](uint32_t index) {
+                if (index < b.lds_dwords) return true;
+                if (getenv("PROSPER_DBG"))
+                    std::fprintf(stderr,
+                                 "[ds-st64-oob] pc=%u op=0x%x const_index=%u lds_dwords=%u\n",
+                                 in.pc, in.opcode, index, b.lds_dwords);
+                return false;
+            };
             if (in.opcode == 0x0e) {                    // ds_write2_b32: two dwords at offset0/offset1
                 // AMD RDNA2 ISA 12.13: MEM[ADDR + OFFSET0/1 * 4] = DATA0/1. The packed offsets
                 // mirror ds_read2_b32 below; Astro Bot's world-map reduction uses both operations.
@@ -8582,9 +8600,14 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // encodes ONE memory access which uses DATA0, so writing DATA1 as well would let the
                 // later store win and a subsequent read observe DATA1 where hardware preserves
                 // DATA0 -- silent wrong data rather than a fault (#1473).
+                const uint32_t off0 = (in.literal & 0xFFu) * 64u;
+                const uint32_t off1 = ((in.literal >> 8) & 0xFFu) * 64u;
+                if (!lds_const_index_in_range(off0) || !lds_const_index_in_range(off1)) {
+                    ok = false; return true;
+                }
                 const uint32_t base = b.ibin(Op_ShiftRightLogical, vread(in.src[0].value), b.uconst(2));
-                const uint32_t idx0 = b.ibin(Op_IAdd, base, b.uconst((in.literal & 0xFFu) * 64u));
-                const uint32_t idx1 = b.ibin(Op_IAdd, base, b.uconst(((in.literal >> 8) & 0xFFu) * 64u));
+                const uint32_t idx0 = b.ibin(Op_IAdd, base, b.uconst(off0));
+                const uint32_t idx1 = b.ibin(Op_IAdd, base, b.uconst(off1));
                 b.lds_store(idx0, vread(in.src[1].value), rs.exec_narrowed, rs.exec,
                             atomicize_store);
                 if ((in.literal & 0xFFu) != ((in.literal >> 8) & 0xFFu))
@@ -8659,10 +8682,15 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 //
                 // No equal-offset guard here, deliberately: a read has no write hazard, and
                 // ds_read2_b32 (0x37) above loads both slots unconditionally for the same reason.
+                const uint32_t roff0 = (in.literal & 0xFFu) * 64u;
+                const uint32_t roff1 = ((in.literal >> 8) & 0xFFu) * 64u;
+                if (!lds_const_index_in_range(roff0) || !lds_const_index_in_range(roff1)) {
+                    ok = false; return true;
+                }
                 const uint32_t base = b.ibin(Op_ShiftRightLogical, vread(in.src[0].value), b.uconst(2));
                 const uint32_t indices[2] = {
-                    b.ibin(Op_IAdd, base, b.uconst((in.literal & 0xFFu) * 64u)),
-                    b.ibin(Op_IAdd, base, b.uconst(((in.literal >> 8) & 0xFFu) * 64u)),
+                    b.ibin(Op_IAdd, base, b.uconst(roff0)),
+                    b.ibin(Op_IAdd, base, b.uconst(roff1)),
                 };
                 for (int k = 0; k < 2; ++k) {
                     const uint32_t old = vreg_old(b, rs, in.dst.value + k);
