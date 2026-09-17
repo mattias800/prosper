@@ -161,6 +161,34 @@ int main() {
     CHECK(st64_spv != plain_spv,
           "ds_*2st64_b32 does not emit the unscaled ds_*2_b32 offset0:1 offset1:2 lowering");
 
+    // The arms above still pass if the 0x0f handler's EQUAL-OFFSET guard is deleted, because their
+    // offsets differ (1 != 2) so the guarded branch is taken either way. Found in review, and the
+    // guard is not decorative: OFFSET0 == OFFSET1 encodes ONE memory access which uses DATA0, so
+    // storing DATA1 as well lets the later store win and a subsequent read observes DATA1 where
+    // hardware preserves DATA0 -- silent wrong data, the same defect #1473 fixed for 0x4e.
+    //
+    // `ds_write2st64_b32 offset0:1 offset1:1` and `ds_write2_b32 offset0:64 offset1:64` both address
+    // the single dword base+64, so both must emit ONE store and therefore the same module.
+    // Scope, stated so this is not read as more than it is: this arm targets the 0x0f guard. Deleting
+    // BOTH handlers' guards would make the two modules agree again (each emitting two stores), which
+    // the 0x0e guard's own coverage elsewhere is responsible for.
+    const uint32_t ds_st64_equal_off[] = {
+        0xD83C0101u, 0x00020105u,   // ds_write2st64_b32 v5, v1, v2 offset0:1 offset1:1
+        0xBF810000u,
+    };
+    const uint32_t ds_plain_equal_off[] = {
+        0xD8384040u, 0x00020105u,   // ds_write2_b32 v5, v1, v2 offset0:64 offset1:64
+        0xBF810000u,
+    };
+    const std::vector<uint32_t> st64_eq_spv = recompile_compute(
+        ds_st64_equal_off, std::size(ds_st64_equal_off), nullptr, ds_st64_config);
+    const std::vector<uint32_t> plain_eq_spv = recompile_compute(
+        ds_plain_equal_off, std::size(ds_plain_equal_off), nullptr, ds_st64_config);
+    CHECK(!st64_eq_spv.empty() && !plain_eq_spv.empty(),
+          "both equal-offset DS write2 programs lower to real modules");
+    CHECK(st64_eq_spv == plain_eq_spv,
+          "ds_write2st64_b32 with OFFSET0 == OFFSET1 emits one store, like ds_write2_b32");
+
     // Coverage only inspects emit_alu's `ok` flag and discards the SPIR-V; also prove v_add_co_u32
     // lowers to a real, well-formed module (VGPR operands this time: v2 = v0 + v1, carry->vcc). Without
     // the emit branch recompile_valu returns {}; with it, a valid module (magic 0x07230203) is produced.
