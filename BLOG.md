@@ -33,6 +33,25 @@ What reaches the display buffer in that same frame is 0.94% non-black: the ring 
 and the boost gauge, over nothing. So the frontier moves from "the world does not render" to "the
 rendered world does not reach the guest's display buffer" — see [#2790](https://github.com/mattias800/prosper/issues/2790).
 
+### Half of everything prosper asked the operating system was the same four questions
+
+No picture — same frames, less work getting to them. Every frame, prosper asks the system whether a
+handful of debugging switches are turned on, and it asks once per drawn object rather than once. On
+a four-minute run of *Grand Theft Auto V* that came to **33.9 million** questions, and the answer is
+the same for all of them, because nothing turns a switch on halfway through a frame. Asking once per
+batch of work instead removes **48%** of them.
+
+The reason nobody had simply remembered the answers before is the interesting half. Some of these
+switches are flipped by the test suite while it runs, and a remembered answer would make those tests
+quietly stop testing anything — they would still pass, on the old answer, and say nothing. So the
+rule here is narrower: remember the answer for the length of one batch of work, and go back to
+asking the moment you step outside one. A test that flips a switch between two batches still sees it.
+
+The same session also killed one of its own theories. A 16 KB block of state the shader interpreter
+saves at certain branches looked like it explained the biggest cost in the profile; counting showed
+95% of the time it saves nothing at all. That measurement is kept and the code built on the theory
+was thrown away.
+
 ## 2026-09-15
 
 ### A tuning number from a different graphics card was costing us a fifth of the frame rate
