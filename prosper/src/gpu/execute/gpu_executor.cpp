@@ -7,6 +7,7 @@
 #include "gpu/resources/fold_control_plan.hpp"
 #include "gpu/capture/fold_capture.hpp"
 #include "gpu/execute/gpu_execute.hpp"
+#include "diagnostics/env_submit.hpp"
 #include "gpu/diagnostics/watch_list.hpp"   // strict 0x-only watch parsing (shared with the RTT watch)
 #include "gpu/diagnostics/diag_ratelimit.hpp"   // first-N-then-powers-of-two report throttling
 #include "diagnostics/env_numeric.hpp"   // #3267: a typo must not silently drop an operator-set cap
@@ -1047,6 +1048,12 @@ struct InterpolationCache {
 struct StageFoldProfileEntry {
     uint64_t cached_control_calls = 0;
     uint64_t control_bytes = 0;
+    // Branch-exclusive snapshot storage, in SLOTS the plan reserves against CAPTURES actually
+    // taken. A snapshot is several kilobytes, so the gap between these two is the per-call cost of
+    // reserving storage for a save that never happens.
+    uint64_t snapshot_slots = 0;
+    uint64_t snapshot_captures = 0;
+    uint64_t snapshot_restores = 0;
     uint64_t code = 0;
     uint32_t user_base = 0;
     uint64_t calls = 0;
@@ -1089,7 +1096,14 @@ StageFoldProfiler& stage_fold_profiler() {
 void record_stage_fold_profile(uint64_t code, uint32_t user_base, size_t code_dwords,
                                size_t instructions, size_t dynamic_fetches, size_t srt_uses,
                                uint64_t guest_probes, double elapsed_ms, double decode_ms,
-                               double guest_probe_ms, bool cached_control, uint64_t control_bytes) {
+                               double guest_probe_ms, bool cached_control, uint64_t control_bytes,
+                               uint64_t snapshot_slots, uint64_t snapshot_captures,
+                               uint64_t snapshot_restores, uint64_t snapshot_bytes) {
+    // snapshot_bytes is sizeof(FoldStateSnapshot), passed in because that type is declared inside
+    // resolve_dynamic_fetch and is not nameable here. The obvious alternative -- a constant here
+    // pinned by a static_assert at the definition -- is WRONG rather than merely ugly: the size is
+    // 16,504 bytes on x86-64 Linux and need not be that on another ABI, and the assert duly failed
+    // the macOS build of this change's first revision.
     static const uint64_t interval = [] {
         const char* value = std::getenv("PROSPER_STAGE_FOLD_PROFILE_CALLS");
         if (!value || !*value) return 4096ull;
@@ -1105,6 +1119,9 @@ void record_stage_fold_profile(uint64_t code, uint32_t user_base, size_t code_dw
     ++entry.calls;
     entry.cached_control_calls += cached_control;
     entry.control_bytes = std::max(entry.control_bytes, control_bytes);
+    entry.snapshot_slots += snapshot_slots;
+    entry.snapshot_captures += snapshot_captures;
+    entry.snapshot_restores += snapshot_restores;
     entry.instructions += instructions;
     entry.dynamic_fetches += dynamic_fetches;
     entry.srt_uses += srt_uses;
@@ -1124,29 +1141,41 @@ void record_stage_fold_profile(uint64_t code, uint32_t user_base, size_t code_dw
     });
     double total = 0.0, decode = 0.0, probe = 0.0;
     uint64_t cached_calls = 0, instruction_total = 0;
+    uint64_t slots_total = 0, captures_total = 0, restores_total = 0;
     for (const auto& item : ranked) {
         total += item.total_ms; decode += item.decode_ms; probe += item.guest_probe_ms;
         cached_calls += item.cached_control_calls; instruction_total += item.instructions;
+        slots_total += item.snapshot_slots; captures_total += item.snapshot_captures;
+        restores_total += item.snapshot_restores;
     }
+    // A snapshot is sizeof(FoldStateSnapshot) bytes, so `slots` is what the walk RESERVES and
+    // `captures` what it uses. Their difference, times that size, is storage created for a save
+    // that never happens -- the quantity this line exists to make visible.
     std::fprintf(stderr, "[stage-fold-profile] calls=%llu shaders=%zu total=%.6f "
                         "decode=%.6f probe=%.6f body=%.6f instructions=%llu "
-                        "control_cached=%llu top-by-total-ms:\n",
+                        "control_cached=%llu snapshot_slots=%llu captures=%llu restores=%llu "
+                        "slot_bytes=%llu capture_bytes=%llu top-by-total-ms:\n",
                  (unsigned long long)profiler.calls, ranked.size(), total, decode, probe,
                  total - decode - probe, (unsigned long long)instruction_total,
-                 (unsigned long long)cached_calls);
+                 (unsigned long long)cached_calls, (unsigned long long)slots_total,
+                 (unsigned long long)captures_total, (unsigned long long)restores_total,
+                 (unsigned long long)(slots_total * snapshot_bytes),
+                 (unsigned long long)(captures_total * snapshot_bytes));
     for (size_t i = 0; i < std::min<size_t>(ranked.size(), 12); ++i) {
         const StageFoldProfileEntry& item = ranked[i];
         const double calls = static_cast<double>(item.calls);
         std::fprintf(stderr,
                      "[stage-fold-profile] code=0x%llx base=%u calls=%llu total=%.6f avg=%.6f "
                      "max=%.6f decode=%.6f probe=%.6f body=%.6f dw/call=%.1f ins/call=%.1f "
-                     "probes/call=%.1f dyn/call=%.1f srt/call=%.1f control_cached=%llu control_bytes=%llu\n",
+                     "probes/call=%.1f dyn/call=%.1f srt/call=%.1f slots/call=%.1f "
+                     "captures/call=%.2f control_cached=%llu control_bytes=%llu\n",
                      (unsigned long long)item.code, item.user_base,
                      (unsigned long long)item.calls, item.total_ms, item.total_ms / calls,
                      item.max_ms, item.decode_ms / calls, item.guest_probe_ms / calls,
                      (item.total_ms - item.decode_ms - item.guest_probe_ms) / calls,
                      item.code_dwords / calls, item.instructions / calls,
                      item.guest_probes / calls, item.dynamic_fetches / calls, item.srt_uses / calls,
+                     item.snapshot_slots / calls, item.snapshot_captures / calls,
                      (unsigned long long)item.cached_control_calls,
                      (unsigned long long)item.control_bytes);
     }
@@ -1887,6 +1916,10 @@ void maybe_dump_successful_shader(ShaderProgramStage stage, const ShaderCompileK
     }();
     (void)announced_filter_without_directory;
 
+    // Per draw realization on a cache hit (see the comment above), and 3.8 M calls on a 240 s
+    // routed window -- so it is sampled per submit rather than read live. The directory VALUE is
+    // still read live, but only once the switch is on, i.e. never on a default run.
+    if (!PROSPER_ENV_ON_PER_SUBMIT("PROSPER_SHADER_DUMP_SUCCESS")) return;
     const char* directory = getenv("PROSPER_SHADER_DUMP_SUCCESS");
     if (!directory || !*directory || !key.code || key.code->empty() || spirv.empty()) return;
 
@@ -1991,7 +2024,10 @@ SharedShaderWords cache_compiled_graphics_shader(ShaderProgramStage stage, Shade
                                                   uint64_t chain_address) {
     ShaderKeyResourceScratch scratch(key);
     if (cache_identity) *cache_identity = 0;
-    if (getenv("PROSPER_NO_SHADER_CACHE")) {
+    // One read per graphics shader lookup, so once or twice per draw: 3.8 M calls on the same
+    // window. Armed by test_shader_recompile_cache and test_cfg_trip_bound, both between
+    // operations, so a per-submit sample keeps them honest.
+    if (PROSPER_ENV_ON_PER_SUBMIT("PROSPER_NO_SHADER_CACHE")) {
         auto& cache = shader_cache();
         cache.bypasses.fetch_add(1, std::memory_order_relaxed);
         auto spirv = std::make_shared<const std::vector<uint32_t>>(
@@ -2329,7 +2365,7 @@ std::vector<uint32_t> recompile_compute_shader_cached(
             *writes_trip_witness = cache_witness ? shader.writes_trip_witness
                                                  : analyze_witness(*shader.spirv);
     };
-    if (getenv("PROSPER_NO_SHADER_CACHE")) {
+    if (PROSPER_ENV_ON_PER_SUBMIT("PROSPER_NO_SHADER_CACHE")) {   // the compute mirror of the above
         cache.bypasses.fetch_add(1, std::memory_order_relaxed);
         std::vector<uint32_t> spirv = compile();
         if (writes_trip_witness) *writes_trip_witness = analyze_witness(spirv);
@@ -3715,6 +3751,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
     // Snapshot VALUES always belong to this invocation, including nested and parallel folds.
     std::vector<std::pair<bool, FoldStateSnapshot>> saved_at_branch(
         branch_exclusive_disabled ? 0 : control_plan->snapshot_count);
+    uint64_t snapshot_captures = 0, snapshot_restores = 0;
     auto capture_fold_state = [&]() {
         FoldStateSnapshot s;
         s.val = val; s.val_known = val_known;
@@ -3958,6 +3995,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
             const size_t restore = control.restore_slot;
             if (restore < saved_at_branch.size() && saved_at_branch[restore].first) {
                 restore_fold_state(saved_at_branch[restore].second);
+                ++snapshot_restores;
                 if (trc)
                     fprintf(stderr, "[dyntrace]   branch-exclusive: pc=%u restored the fold state to "
                                     "pc=%u (its only predecessor); every write in between is on the "
@@ -3968,6 +4006,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
             if (save < saved_at_branch.size()) {
                 saved_at_branch[save].first = true;
                 saved_at_branch[save].second = capture_fold_state();
+                ++snapshot_captures;
             }
         }
         if (gta5_null_raw_store_guard && in.pc == 42u) {
@@ -5978,7 +6017,9 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
             srt_uses ? srt_uses->size() - srt_before : 0, guest_probe_calls,
             std::chrono::duration<double, std::milli>(FoldClock::now() - fold_start).count(),
             std::chrono::duration<double, std::milli>(decode_done - fold_start).count(),
-            guest_probe_ms, control_plan != &local_control_plan, control_plan->allocated_bytes());
+            guest_probe_ms, control_plan != &local_control_plan, control_plan->allocated_bytes(),
+            saved_at_branch.size(), snapshot_captures, snapshot_restores,
+            sizeof(FoldStateSnapshot));
     return out;
 }
 
@@ -6925,10 +6966,15 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
     const auto* hdr = (const AgcShaderHeader*)prosper_agc_shader_header_for_code(code_addr);
     if (!hdr) return nullptr;
     using StageClock = std::chrono::steady_clock;
-    const bool phase_timing = getenv("PROSPER_RENDER_TIMING") != nullptr;
+    // Read once per draw per stage, and the two largest remaining `getenv` names on a routed
+    // window (10.0 M and 13.4 M calls). Both are armed at runtime -- by test_texture_sample_render
+    // and test_multidraw_render, and by test_eop_write -- and every one of those arms happens
+    // BETWEEN operations, so "visible at the next submit" is the weakest rule that keeps them
+    // honest. Outside a SubmitEnvScope this is still a live getenv; see diagnostics/env_submit.hpp.
+    const bool phase_timing = PROSPER_ENV_ON_PER_SUBMIT("PROSPER_RENDER_TIMING");
     const auto metadata_start = phase_timing ? StageClock::now() : StageClock::time_point{};
     namespace P = prosper::agc::Pm4;
-    const bool log = getenv("PROSPER_GFXLOG") != nullptr;
+    const bool log = PROSPER_ENV_ON_PER_SUBMIT("PROSPER_GFXLOG");
     const size_t shader_dwords = registered_shader_dwords(*hdr, code_addr);
 
     // The V#/T# descriptors live in the stage's user-data SGPR block. The pixel stage uses PS user
@@ -10947,6 +10993,10 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                                                      OrderedGpustateCaptureTrace* capture_trace,
                                                      const std::vector<DrawItem>* eager_draws) {
     GuestGpuWriteSubmitScope guest_gpu_write_scope;
+    // The ordered path reaches build_stage_table through realize_retained_draw rather than through
+    // realize_gpustate_draws, so it needs its own sampling window or its per-draw switches fall
+    // back to a live getenv. See diagnostics/env_submit.hpp.
+    const prosper::diag::SubmitEnvScope submit_env_scope;
     if (st.dma_execution_rejected) {
         for (const GpuState::Dispatch& dispatch : st.dispatches)
             notify_compute_authority_unknown(

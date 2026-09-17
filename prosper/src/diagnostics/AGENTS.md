@@ -45,7 +45,7 @@ is process-wide, so independently taken values in unrelated translation units co
 no anchor or registry. Anything that needs to be time-ordered against a diagnostic in another
 subsystem should stamp it rather than grow a private clock.
 
-`env_cache.hpp` and `env_numeric.hpp` are the remaining always-reachable files, and they are here for
+`env_cache.hpp`, `env_numeric.hpp` and `env_submit.hpp` are the remaining always-reachable files, and they are here for
 the same reason as `diag_clock.hpp`: it is shared, and it belongs to no one subsystem. It holds `PROSPER_ENV_ON` /
 `PROSPER_ENV_VALUE`, the one-shot reads of a `PROSPER_*` switch. They lived in
 `hle/dispatch/dispatch.hpp` until #3094, which is where they were first needed and not where they
@@ -63,6 +63,22 @@ runtime, and separately pins the hot sites #3094 converted so they cannot regrow
 Run it before caching a new name. Note it can only see arming through a *literal* name —
 `tools/gpu_replay` re-applies `render_env[]` (`gpu/capture/gpu_capture.cpp`) per bundle submit
 through a variable, which is invisible to it; that comment lives in `env_cache.hpp` itself.
+
+`env_submit.hpp` is the third visibility contract, and it exists because the gate above leaves the
+hottest names with nowhere to go. A name a test arms cannot be process-cached, so it stays a live
+`getenv` — and several of those are read once per draw per stage. `PROSPER_ENV_ON_PER_SUBMIT`
+re-samples at each `SubmitEnvScope` and reads **live outside every scope**, which is the part that
+makes it safe to adopt one site at a time: a path with no scope behaves exactly as it did before, so
+forgetting a scope costs speed and never correctness. Measured on a 240 s routed *Grand Theft Auto
+V* window with diagnostics in their default state, converting four names took the process from
+33.9 M `getenv` calls to 17.6 M (#3407).
+
+Which of the three to reach for: **`PROSPER_ENV_ON`** when nothing arms the name at runtime —
+`check_cached_env.py` will tell you. **`PROSPER_ENV_ON_PER_SUBMIT`** when something does and the
+site is hot enough to matter; check the arming sites first and confirm each arms BETWEEN operations
+rather than inside one, because that is the contract, not an assumption. **A live `getenv`**
+otherwise. The gate refuses a name read two of those ways at once, since which answer you get would
+then depend on which call site ran.
 
 `env_numeric.hpp` answers the neighbouring question — not "was this set?" but "what NUMBER is that
 text?" — and exists because the obvious spelling is quietly wrong. `strtoull(value, nullptr, 10)`

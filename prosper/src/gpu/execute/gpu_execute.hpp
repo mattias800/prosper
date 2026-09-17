@@ -11,7 +11,8 @@
 #include <map>
 #include <atomic>
 #include <string>
-#include "diagnostics/env_cache.hpp"        // PROSPER_ENV_ON / _VALUE: cached reads on the per-draw path
+#include "diagnostics/env_cache.hpp"         // PROSPER_ENV_ON / _VALUE: process-lifetime reads
+#include "diagnostics/env_submit.hpp"        // PROSPER_ENV_ON_PER_SUBMIT: re-sampled each submit
 #include "gpu/pm4/command_processor.hpp"   // GpuState
 #include "gpu/state/render_state.hpp"        // extract_render_state / resolve_pipeline_state / ResolvedPipelineState
 #include "gpu/pm4/pm4_registers.hpp"        // CB_COLOR_CONTROL operation decode
@@ -1765,7 +1766,7 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     }
     const auto* fused_back = static_cast<const AgcShaderHeader*>(
         prosper_agc_fused_back_header_for_front(rs.es_addr));
-    const bool phase_timing = getenv("PROSPER_RENDER_TIMING") != nullptr;
+    const bool phase_timing = PROSPER_ENV_ON_PER_SUBMIT("PROSPER_RENDER_TIMING");
     const auto table_start = phase_timing
         ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto* vertex_header = static_cast<const AgcShaderHeader*>(
@@ -2551,6 +2552,9 @@ inline std::vector<DrawItem> realize_gpustate_draws(const GpuState& st,
                                                     bool allow_parallel = true) {
     if (failures) failures->clear();
     if (st.draws.empty()) return {};
+    // One sampling window per submit for the per-draw diagnostic switches below and in
+    // build_stage_table. See diagnostics/env_submit.hpp for the contract and the evidence for it.
+    const prosper::diag::SubmitEnvScope submit_env_scope;
     // PROSPER_EXECLOG: just the per-draw bail-point/skip logs, without PROSPER_GFXLOG's per-packet
     // firehose (which is GBs over a minutes-long run) — for "which draws skip and why" surveys (#319).
     const bool log = getenv("PROSPER_GFXLOG") != nullptr ||
