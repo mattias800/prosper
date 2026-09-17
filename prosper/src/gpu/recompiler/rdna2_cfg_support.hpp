@@ -345,6 +345,8 @@ inline std::unordered_set<uint32_t> proven_wave64_vcc_b32_low_only_pcs(
     return result;
 }
 bool vcc_branch_is_workgroup_uniform(const std::vector<Rdna2Inst>& ins, uint32_t branch_pc);
+// Same proof, applied to a scalar branch's SCC instead of a VCC lane mask (#3713).
+bool scc_branch_is_workgroup_uniform(const std::vector<Rdna2Inst>& ins, uint32_t branch_pc);
 
 // WATERFALL loops (#273 — DOLL's skinned scene VS): the readfirstlane-uniformize idiom
 //   L: v_readfirstlane s4, vIDX ; v_cmpx_eq_u32 s4, vIDX ; s_mov m0, s4 ; v_movrels …
@@ -1195,6 +1197,23 @@ inline std::vector<ForwardIf> detect_forward_ifs(const std::vector<Rdna2Inst>& i
             if (getenv("PROSPER_DBG"))
                 std::fprintf(stderr, "[compute-cfg] workgroup-uniform vcc branch pc=%u\n", in.pc);
         }
+        // The same proof for a SCALAR branch (#3713). A generated uber-shader selects between
+        // barrier-separated variants with `s_cbranch_scc0/1` on a constant read once from a uniform
+        // address, so its barriers sit inside SCC regions and nothing else. `top_level_pc` already
+        // skips a region carrying this flag -- that machinery came in with #1554 and was only ever
+        // fed by VCC branches, which is the whole of why those programs were rejected.
+        //
+        // Both conjuncts this unblocks want the same guarantee and say so in their own comments:
+        // `barriers_are_top_level` needs every workgroup invocation to reach a barrier together, and
+        // `structured_wave_forward_ifs_ok` needs every workgroup invocation to reach a portable
+        // scratch vote's synthesized barriers together. A workgroup-uniform enclosing condition is
+        // exactly that: all of them take the region or none does.
+        if (compute_wave_branches && (in.opcode == 0x04 || in.opcode == 0x05) &&
+            !F.uniform_workgroup && scc_branch_is_workgroup_uniform(ins, in.pc)) {
+            F.uniform_workgroup = true;
+            if (getenv("PROSPER_DBG"))
+                std::fprintf(stderr, "[compute-cfg] workgroup-uniform scc branch pc=%u\n", in.pc);
+        }
         if (compute_uniform_vcc) {
             // The exact branch decision is per-WAVE, so different waves in one workgroup may take
             // different arms. Ordinary LDS loads/stores/atomics are valid under that control flow:
@@ -1487,7 +1506,13 @@ inline bool exec_write_sets_full_mask(const Rdna2Inst& in) {
     return in.src[0].kind == OperandKind::InlineInt && in.src[0].value == -1;
 }
 
-inline bool vcc_branch_is_workgroup_uniform(const std::vector<Rdna2Inst>& ins, uint32_t branch_pc) {
+// Which condition register the branch consumes. The two share every obligation and every step of
+// the backwards slice; only the final question differs, so they share one body rather than two
+// copies that can drift -- this file has already paid for a duplicated opcode table once.
+enum class UniformBranchCondition { Vcc, Scc };
+
+inline bool branch_is_workgroup_uniform(const std::vector<Rdna2Inst>& ins, uint32_t branch_pc,
+                                        UniformBranchCondition condition) {
     size_t branch_index = ins.size();
     for (size_t i = 0; i < ins.size(); ++i)
         if (ins[i].pc == branch_pc) { branch_index = i; break; }
@@ -1578,10 +1603,84 @@ inline bool vcc_branch_is_workgroup_uniform(const std::vector<Rdna2Inst>& ins, u
         }
     };
 
+    // A register whose reaching definition lies OUTSIDE the branch's straight-line region, in the
+    // one shape where no dominance question arises: it has exactly ONE definition in the entire
+    // program, so whatever path reached the use, that is the definition it saw -- or the register is
+    // untouched launch data, which is uniform too. Both alternatives are uniform, so the value is.
+    //
+    // Deliberately narrow. The definition must be a scalar memory load whose address operands still
+    // hold their wave-entry values AT THE LOAD, which is the uber-shader shape this exists for: a
+    // quality/variant selector read once from a constant buffer at the top of the kernel and then
+    // compared against literals to pick between barrier-separated phases (#3713 --
+    // `0x2005713000`'s `s16`, an `s_buffer_load_dwordx8` at pc 5 from launch SGPRs `s[8:11]`).
+    //
+    // What this must NOT become is a flow-insensitive "every writer of the register is uniform"
+    // rule, which is the obvious generalisation and is wrong here: that same program reuses `s8` as
+    // a VOPC lane mask at pc 49, long AFTER the load at pc 5 reads `s[8:11]`. A rule that asks about
+    // `s8` globally marks it non-uniform and rejects a program that is plainly fine. The operands
+    // are therefore asked about at the LOAD's index, not at the use's.
+    auto entry_value_at = [&](int reg, size_t index) {
+        const std::vector<uint8_t> fact = must_fact_at(
+            ins, [](const Rdna2Inst&) { return false; },
+            [&](const Rdna2Inst& in) { return writes_reg(in, reg, 1); }, true);
+        return !fact.empty() && index < fact.size() && fact[index] != 0;
+    };
+    auto sole_launch_derived_definition = [&](int reg) -> bool {
+        if (reg < 0 || reg > 105) return false;            // EXEC/VCC/SCC are not launch data
+        size_t only = ins.size();
+        for (size_t i = 0; i < ins.size(); ++i) {
+            if (!writes_reg(ins[i], reg, 1)) continue;
+            if (only != ins.size()) return false;          // more than one definition: not this shape
+            only = i;
+        }
+        if (only == ins.size()) return false;
+        // The definition must lie in the program's ENTRY straight-line region -- before any branch.
+        //
+        // Without this the rule is UNSOUND, and the way it fails is subtle enough to be worth
+        // spelling out. "Exactly one definition, so the use saw either that value or the untouched
+        // launch value, and both are uniform" is wrong: each alternative is uniform on its own, but
+        // the CHOICE between them need not be. Put the sole `s_buffer_load` inside an
+        // `s_cbranch_vccz` arm and put the compare and the scalar branch after the merge, and waves
+        // that took the arm carry the loaded value while waves that skipped it carry the launch
+        // value. They then disagree at the branch -- so only some of them reach the `s_barrier`
+        // inside its region, which is exactly what this proof exists to prevent.
+        //
+        // Requiring the definition to precede every branch makes it dominate every use, which is
+        // the property the informal argument was silently assuming. `terminal_guard_scc_is_...`
+        // above states the same hazard for the same reason, and I read past it. Caught in review.
+        for (size_t i = 0; i < only; ++i) {
+            const Rdna2Inst& before_def = ins[i];
+            if (before_def.is_end) return false;
+            if (before_def.fmt == Rdna2Format::SOPP && !sopp_is_noop(before_def)) return false;
+            if (before_def.fmt == Rdna2Format::SOP1 && before_def.opcode >= 0x20u &&
+                before_def.opcode <= 0x22u)
+                return false;                              // indirect PC change
+        }
+        const Rdna2Inst& def = ins[only];
+        if (def.fmt != Rdna2Format::SMEM || !scalar_write_width(def) || def.n_src < 1) return false;
+        // Scalar-buffer loads carry a four-dword descriptor; scalar-memory loads a base pair.
+        const uint32_t base_words = def.opcode >= 0x8 ? 4u : 2u;
+        auto address_operand_is_launch = [&](const Operand& op, uint32_t count) {
+            if (op.kind == OperandKind::Special && op.value == 125) return true;   // SGPR_NULL
+            if (op.kind == OperandKind::InlineInt || op.kind == OperandKind::Literal) return true;
+            if (op.kind != OperandKind::SGPR && op.kind != OperandKind::Special) return false;
+            for (uint32_t word = 0; word < count; ++word) {
+                const int r = op.value + static_cast<int>(word);
+                if (r < 0 || r > 105) return false;                    // EXEC/VCC/SCC are not launch data
+                if (!entry_value_at(r, only)) return false;
+            }
+            return true;
+        };
+        if (!address_operand_is_launch(def.src[0], base_words)) return false;
+        return def.n_src < 2 || address_operand_is_launch(def.src[1], 1);
+    };
+
     uniform_scalar = [&](int reg, size_t before, uint32_t depth) -> bool {
         if (depth > 64) return false;
         const size_t w = last_writer(reg, 1, before);
-        if (w == ins.size()) return reg >= 0 && reg <= 105 && still_entry_value(reg);
+        if (w == ins.size())
+            return (reg >= 0 && reg <= 105 && still_entry_value(reg)) ||
+                   sole_launch_derived_definition(reg);
         const Rdna2Inst& in = ins[w];
         switch (in.fmt) {
             case Rdna2Format::SOP1:
@@ -1624,8 +1723,20 @@ inline bool vcc_branch_is_workgroup_uniform(const std::vector<Rdna2Inst>& ins, u
                     if (!uniform_operand(in.src[s], words, i, depth)) return false;
                 return true;
             }
-            // Any scalar ALU or SOPK instruction may write SCC. Stop rather than accidentally
-            // consuming an older compare through an unmodeled SCC writer.
+            // A SOP1 that provably leaves SCC alone is stepped OVER rather than stopping the walk:
+            // the SCC the branch consumes is still the one the compare below it produced. This is
+            // not a relaxation of the proof, it is the proof reaching its subject -- the guest puts
+            // `s_mov_b64 exec, -1` between the compare and the branch (#3713, `0x2005713000` at
+            // pc 199/200/201), so stopping at every SOP1 made the compare unreachable and the whole
+            // uber-shader family unprovable. `sop1_opcode_leaves_scc_unmodified` is derived for THIS
+            // question and is deliberately NOT the SCC-liveness list in rdna2_emit_cfg.cpp -- that
+            // one asks whether SCC is still scalar-valued, which an SCC WRITER can satisfy. See its
+            // definition for the `s_bcnt1_i32_b64` case that separates them.
+            //
+            // Everything else still stops the walk. Any other scalar ALU or SOPK instruction may
+            // write SCC, and consuming an older compare through an unmodeled writer would prove
+            // uniformity of a condition the branch never saw.
+            if (in.fmt == Rdna2Format::SOP1 && sop1_opcode_leaves_scc_unmodified(in.opcode)) continue;
             if (in.fmt == Rdna2Format::SOP1 || in.fmt == Rdna2Format::SOP2 ||
                 in.fmt == Rdna2Format::SOPK)
                 return false;
@@ -1665,8 +1776,19 @@ inline bool vcc_branch_is_workgroup_uniform(const std::vector<Rdna2Inst>& ins, u
         return false;
     };
 
-    // Obligation (2): architectural VCC at the branch is a select over workgroup-uniform SCCs.
-    return uniform_mask(106, branch_index, 0);
+    // Obligation (2): the consumed condition is workgroup-uniform. For a VCC branch that means the
+    // architectural mask is a select over workgroup-uniform SCCs; for a scalar branch it is the SCC
+    // itself, which `uniform_scc` already proves for the VCC case's inner terms.
+    return condition == UniformBranchCondition::Vcc ? uniform_mask(106, branch_index, 0)
+                                                    : uniform_scc(branch_index, 0);
+}
+
+inline bool vcc_branch_is_workgroup_uniform(const std::vector<Rdna2Inst>& ins, uint32_t branch_pc) {
+    return branch_is_workgroup_uniform(ins, branch_pc, UniformBranchCondition::Vcc);
+}
+
+inline bool scc_branch_is_workgroup_uniform(const std::vector<Rdna2Inst>& ins, uint32_t branch_pc) {
+    return branch_is_workgroup_uniform(ins, branch_pc, UniformBranchCondition::Scc);
 }
 
 // PC-relative EMBEDDED-TABLE detection (#273). Compilers put small constant lookup tables (a 4x4

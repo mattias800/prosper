@@ -958,16 +958,76 @@ int main(int argc, char** argv) {
     // module without a terminal line. Cache the rejection, then report two distinct live program
     // addresses: the second compile must be a cache hit, while the final skip consequence remains
     // attributable and once-per-address at the production reporting boundary.
+    // The barrier sits in a scalar arm whose SCC is NOT workgroup-uniform, which is what makes the
+    // exact-wave dispatcher decline it.
+    //
+    // This used to read `s_cmp_eq_u32 s0, s0`, and #3713 changed what that means: a scalar branch on
+    // launch data compared with itself is now PROVED workgroup-uniform, every wave takes it
+    // together, the barrier is reached by all invocations or none, and the program correctly stops
+    // rejecting. The fixture's premise expired -- it was written when no SCC branch could be proved
+    // uniform, so "nested in a scalar arm" was by itself sufficient to guarantee the decline.
+    //
+    // `vcc_lo` as the compare operand restores it. Three drafts of this comment named the wrong
+    // mechanism, so here is the walk -- and the part every earlier draft missed: WHICH mechanism
+    // refuses this depends on how far the proof is widened. The fixture is defended twice over.
+    //
+    // As the code stands, the REGION is what refuses it:
+    //   * `uniform_operand` does not screen VCC. It admits SGPR_NULL (125) as uniform and refuses
+    //     only EXEC_LO/EXEC_HI/SCC (126/127/253, rdna2_cfg_support.hpp:1591-1594). VCC is 106/107
+    //     and falls through to `uniform_scalar`.
+    //   * `uniform_scalar(106, ...)` asks `last_writer` for an in-region definition. The region is
+    //     the straight-line block ending at the branch (`:1537-1543`), and pc1's `s_cbranch_vccz`
+    //     TARGETS pc3, so pc3 is a block entry and `block_start == 3`. The region is [3,4), holding
+    //     only the `s_cmp_eq_u32` that writes SCC -- not VCC.
+    //   * With no writer in region it takes the out-of-region path (`:1681-1683`), which admits only
+    //     launch data: `reg <= 105 && still_entry_value(reg)`, or `sole_launch_derived_definition`,
+    //     which refuses `reg > 105` itself. 106 is outside both bounds.
+    //
+    // So pc0's `v_cmp_lt_f32` is NOT consulted today, and `s_mov_b32 vcc_lo, s0` in its place would
+    // be refused at the same line. Earlier drafts got that far and then drew the wrong conclusion
+    // from it -- that the producer is decorative. It is not.
+    //
+    // Widen the region across the pc3 block entry -- the obvious future change -- and `last_writer`
+    // DOES find pc0, because `writes_reg` models a VOPC's implicit VCC write (`:1551-1556`).
+    // `uniform_scalar` then refuses it at its `default` arm (`:1709-1710`, "VOPC masks"). Under that
+    // same widening the `s_mov_b32 vcc_lo, s0` variant would flip to provable, via the SOP1 case.
+    //
+    // Keep BOTH properties: the operand is VCC, and its producer is a lane-derived VOPC. They refuse
+    // in different regimes, so neither is redundant, and a fixture carrying only one of them stops
+    // testing this case the first time the proof grows -- silently, which is the failure mode this
+    // whole file exists to prevent.
     static const uint32_t kExactWaveBarrierReject[] = {
         0x7c020300u, // 0: v_cmp_lt_f32 vcc, v0, v1
         0xbf860001u, // 1: s_cbranch_vccz +1 -> pc3 (exact guest-wave branch)
         0x7e040281u, // 2: v_mov_b32 v2, 1
-        0xbf060000u, // 3: s_cmp_eq_u32 s0, s0
+        0xbf06006au, // 3: s_cmp_eq_u32 vcc_lo, s0  (lane mask: never workgroup-uniform)
         0xbf840002u, // 4: s_cbranch_scc0 +2 -> pc7
         0xbf8a0000u, // 5: s_barrier nested in the scalar arm
         0x7e040282u, // 6: v_mov_b32 v2, 2
         0xbf810000u, // 7: s_endpgm
     };
+
+    // The same program with the ORIGINAL `s_cmp_eq_u32 s0, s0`, kept deliberately: it is the only
+    // end-to-end evidence in the suite that #3713's proof does anything. Before that change this
+    // shape REJECTED (empty module plus an exact-wave-dispatcher-unsafe line); the scalar branch
+    // compares launch data with itself, so the proof now finds it workgroup-uniform, the nested
+    // `s_barrier` is reached by all invocations or none, and the program compiles.
+    //
+    // Without this arm the delta that repaired the fixture above would have DELETED the positive
+    // control rather than converted it -- `test_scc_branch_uniformity.cpp` exercises the predicate
+    // in isolation and says so in its own header, so nothing else here would fail if the hook in
+    // `rdna2_cfg_support.hpp` that sets `uniform_workgroup` were removed.
+    static const uint32_t kUniformSccBarrierCompiles[] = {
+        0x7c020300u, // 0: v_cmp_lt_f32 vcc, v0, v1
+        0xbf860001u, // 1: s_cbranch_vccz +1 -> pc3 (exact guest-wave branch)
+        0x7e040281u, // 2: v_mov_b32 v2, 1
+        0xbf060000u, // 3: s_cmp_eq_u32 s0, s0  (launch data vs itself: workgroup-uniform)
+        0xbf840002u, // 4: s_cbranch_scc0 +2 -> pc7
+        0xbf8a0000u, // 5: s_barrier nested in the PROVED-uniform scalar arm
+        0x7e040282u, // 6: v_mov_b32 v2, 2
+        0xbf810000u, // 7: s_endpgm
+    };
+
     // A partial workgroup whose barrier cannot be lifted into uniform control flow.
     //
     // This was `{ s_barrier, s_endpgm }` -- a partial workgroup with ANY barrier used to reject, so
@@ -1001,8 +1061,10 @@ int main(int argc, char** argv) {
         RecompileDiagnosticStage::Compute, 0xabcdef120000dd55ull};
     const RecompileDiagnosticContext partial_barrier_diagnostic{
         RecompileDiagnosticStage::Compute, 0x135724680000aa55ull};
+    const RecompileDiagnosticContext uniform_scc_diagnostic{
+        RecompileDiagnosticStage::Compute, 0x2468ace000005577ull};
     clear_shader_recompile_cache();
-    std::vector<uint32_t> rejected_first, rejected_cached, partial_barrier;
+    std::vector<uint32_t> rejected_first, rejected_cached, partial_barrier, uniform_scc_barrier;
     set_test_env("PROSPER_DBG", "1");
     const CapturedStderr final_reject_capture = capture_stderr([&] {
         rejected_first = recompile_compute_shader_cached(
@@ -1020,6 +1082,9 @@ int main(int argc, char** argv) {
         partial_barrier = recompile_compute(
             kPartialBarrierReject, std::size(kPartialBarrierReject), nullptr,
             partial_barrier_config, partial_barrier_diagnostic);
+        uniform_scc_barrier = recompile_compute(
+            kUniformSccBarrierCompiles, std::size(kUniformSccBarrierCompiles), nullptr,
+            rejected_config, uniform_scc_diagnostic);
     });
     set_test_env("PROSPER_DBG", nullptr);
     stats = shader_recompile_cache_stats();
@@ -1032,6 +1097,15 @@ int main(int argc, char** argv) {
     CHECK(rejected_first.empty() && rejected_cached.empty() &&
               stats.misses == 1 && stats.hits == 1,
           "rejected compute modules retain empty results across the real shader cache boundary");
+    // The positive control for #3713, and the reason the fixture above could be repaired at all:
+    // the SAME shape with a workgroup-uniform scalar compare must COMPILE. Non-empty is the half
+    // that reddens if the `uniform_workgroup` hook is removed; zero reject lines for this program id
+    // is the half that reddens if it starts declining for some other reason instead.
+    CHECK(!uniform_scc_barrier.empty(),
+          "a guest barrier inside a PROVED workgroup-uniform scalar arm compiles");
+    CHECK(final_reject_log.find("program=0x2468ace000005577") == std::string::npos,
+          "the proved-uniform scalar barrier emits no compute-cfg-reject of any reason");
+
     CHECK(count_occurrences(
               final_reject_log,
               "[compute-cfg-reject] reason=exact-wave-dispatcher-unsafe guest-barrier=1 "

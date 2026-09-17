@@ -41,6 +41,31 @@ inline constexpr uint32_t kSop1OpcodeFlbitI32B64 = 0x16;
 inline constexpr uint32_t kSop1OpcodeBitset0B32 = 0x1b;
 inline constexpr uint32_t kSop1OpcodeBitset1B32 = 0x1d;
 inline constexpr uint32_t kSop1OpcodeGetpcB64 = 0x1f;
+
+// SOP1 opcodes that leave SCC **UNMODIFIED**.
+//
+// This is NOT the list in `rdna2_emit_cfg.cpp`'s SCC-liveness walks, and the difference is the whole
+// reason this one exists separately. That list answers *"is SCC still SCALAR-VALUED after this?"* --
+// it may be written, as long as what lands in it is still a modellable scalar. This one answers
+// *"is the SCC a later branch reads still the one an EARLIER compare produced?"*, which an
+// instruction that writes SCC breaks even when the value it writes is perfectly scalar.
+//
+// Borrowing that list for this question shipped a real defect and it is worth naming: it includes
+// `s_bcnt1_i32_b64`, whose ISA definition is `D.i = CountOneBits(S0.u64); SCC = (D.i != 0)`
+// (RDNA2 70648). Under the wrong reading, `v_cmp_* -> s_cmp_eq_u32 -> s_bcnt1_i32_b64 s5,s[20:21]
+// -> s_cbranch_scc0` would step over the popcount and prove the branch uniform from the *earlier*
+// compare, when the branch really reads a ballot popcount of a lane mask. Silent wrong pixels.
+//
+// So: derived for this question, against the ISA, and deliberately NOT shared. A verdict does not
+// transfer across a change of question just because the two lists look alike.
+inline constexpr bool sop1_opcode_leaves_scc_unmodified(uint32_t opcode) {
+    return opcode == kSop1OpcodeMovB32 || opcode == kSop1OpcodeMovB64 ||
+           opcode == kSop1OpcodeCmovB32 || opcode == kSop1OpcodeCmovB64 ||
+           opcode == kSop1OpcodeBrevB32 ||
+           opcode == kSop1OpcodeFf1I32B64 || opcode == kSop1OpcodeFlbitI32B32 ||
+           opcode == kSop1OpcodeFlbitI32B64 || opcode == kSop1OpcodeBitset0B32 ||
+           opcode == kSop1OpcodeBitset1B32 || opcode == kSop1OpcodeGetpcB64;
+}
 inline constexpr uint32_t kSop1OpcodeSetpcB64 = 0x20;
 inline constexpr uint32_t kSop1OpcodeSwappcB64 = 0x21;
 inline constexpr uint32_t kSop1OpcodeRfeB64 = 0x22;
