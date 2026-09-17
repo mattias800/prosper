@@ -10,6 +10,7 @@
 #include "gpu/recompiler/indirect/rdna2_indirect_buffer_shadow.hpp"
 #include "gpu/recompiler/indirect/rdna2_indirect_pointer_analysis.hpp"
 #include "gpu/resources/shader_resources.hpp"
+#include "diagnostics/env_submit.hpp"   // submit_env_window(): one trip-bound sample per submit
 #include <algorithm>
 #include <bit>
 #include <cstdarg>
@@ -253,6 +254,53 @@ bool rdna2_specialize_pcrel_dispatch(std::vector<Rdna2Inst>& instructions,
                                      const PcrelDispatchInfo& info,
                                      uint32_t selected_target) {
     return specialize_pcrel_dispatch(instructions, info, selected_target);
+}
+
+ComputeTripBoundSettings parse_trip_bound_settings() {
+    return parse_trip_bound_settings_impl();
+}
+
+// The settings in effect for the caller. Inside a TripBoundOperation this is that operation's own
+// value, so the shader-cache key and the module it names cannot disagree; outside one it is a fresh
+// parse, which is what keeps arm/compile/disarm/compile working in a single process.
+ComputeTripBoundSettings compute_trip_bound_settings() {
+    if (const ComputeTripBoundSettings* pinned = trip_bound_pin()) return *pinned;
+    return parse_trip_bound_settings_impl();
+}
+
+uint64_t trip_bound_parses() {
+    return trip_bound_parse_counter().load(std::memory_order_relaxed);
+}
+
+TripBoundOperation::TripBoundOperation() {
+    previous_ = trip_bound_pin();
+    if (previous_) {
+        // Nested: adopt the enclosing operation's value rather than re-sampling, so a chained
+        // vertex program cannot be keyed or compiled under settings its prolog did not see.
+        settings_ = *previous_;
+        return;
+    }
+    // One sample per submit per thread, or a fresh parse when no submit is in progress. The second
+    // half is what preserves live behaviour for every caller outside the renderer's submit path --
+    // tools, capture/replay, and the tests that arm between two operations.
+    static thread_local uint64_t seen_window = 0;
+    static thread_local ComputeTripBoundSettings window_settings{};
+    const uint64_t window = prosper::diag::submit_env_window();
+    if (window == 0) {
+        settings_ = parse_trip_bound_settings_impl();
+    } else {
+        if (seen_window != window) {
+            seen_window = window;
+            window_settings = parse_trip_bound_settings_impl();
+        }
+        settings_ = window_settings;
+    }
+    trip_bound_pin() = &settings_;
+    owns_ = true;
+}
+
+TripBoundOperation::~TripBoundOperation() {
+    if (owns_) trip_bound_pin() = previous_;
 }
 
 bool compute_trip_witness_active(uint64_t program_address) {

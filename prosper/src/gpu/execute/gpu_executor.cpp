@@ -2243,7 +2243,11 @@ SharedShaderWords recompile_graphics_shader_cached_shared(
     // fragment diagnostics were pinned at address 0 — the selector could not match a program that
     // had no address. This change gives them their real address, which makes the hazard real for
     // graphics exactly as it already is for compute, so the guard has to arrive with it.
-    key.trip_bound = compute_trip_bound_settings();
+    // One owned settings value for the key AND the compilation it names. Sampling them separately
+    // lets an environment change in between key a module under settings the module was not built
+    // with, which no later lookup can detect. See TripBoundOperation.
+    const TripBoundOperation trip_bound_op;
+    key.trip_bound = trip_bound_op.settings();
     if (key.trip_bound.bound) key.trip_bound_program_address = program_address;
     key.cached_hash = ShaderCompileKeyHash::compute(key);
     return cache_compiled_graphics_shader(stage, std::move(key), resources, cache_identity,
@@ -2269,7 +2273,8 @@ SharedShaderWords recompile_vertex_chain_cached_shared(
     // by either half, matching what gpu_capture already does when it resolves a wanted code address.
     const uint64_t prolog_address = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(prolog));
     const uint64_t main_address = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(main));
-    key.trip_bound = compute_trip_bound_settings();
+    const TripBoundOperation trip_bound_op;   // key + compilation, one value; see the graphics site
+    key.trip_bound = trip_bound_op.settings();
     if (key.trip_bound.bound) key.trip_bound_program_address = prolog_address;
     key.cached_hash = ShaderCompileKeyHash::compute(key);
     return cache_compiled_graphics_shader(
@@ -2344,7 +2349,8 @@ std::vector<uint32_t> recompile_compute_shader_cached(
     // it was. The program address is carried on the diagnostic context because nothing else in the
     // key identifies WHICH program these code bytes belong to, and that is precisely the distinction
     // the selector makes. Finalize the hash only after attaching those diagnostic settings.
-    key.trip_bound = compute_trip_bound_settings();
+    const TripBoundOperation trip_bound_op;   // key + compilation, one value; see the graphics site
+    key.trip_bound = trip_bound_op.settings();
     if (key.trip_bound.bound) key.trip_bound_program_address = diagnostic.program_address;
     key.cached_hash = ShaderCompileKeyHash::compute(key);
     auto compile = [&] {

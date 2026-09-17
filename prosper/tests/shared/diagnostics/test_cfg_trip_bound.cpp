@@ -40,7 +40,13 @@
 #include <set>
 #include <cstdint>
 #include <cstdio>
+#if defined(_WIN32)
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
 #include <cstdlib>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -78,6 +84,67 @@ static void set_env(const char* name, const char* value) {
 #else
     if (value) setenv(name, value, 1); else unsetenv(name);
 #endif
+}
+
+// Capture stderr for one call. The dispatch-map line that arm (f) binds is emitted with fprintf
+// and changes no module bytes, so it is the only observable that reaches rdna2_emit_cfg.cpp:3582.
+// Deliberately local and minimal: the two other capture_stderr helpers in the tree live in test
+// files rather than a shared fixture, and copying either whole would bring scratch-path machinery
+// this needs nothing of.
+// The fixed scratch filename is safe because `test_cfg_trip_bound` is registered ONCE
+// (CMakeLists.txt). `test_shader_recompile_cache`'s equivalent needs atomic unique paths precisely
+// because that binary is registered several times and ctest -j runs them concurrently -- so if a
+// second add_test for this binary is ever added, this filename has to become unique with it.
+static std::string capture_stderr_of(const std::function<void()>& body) {
+    std::fflush(stderr);
+#if defined(_WIN32)
+    const int fd = _fileno(stderr);
+    const int saved = _dup(fd);
+#else
+    const int fd = fileno(stderr);
+    const int saved = dup(fd);
+#endif
+    if (saved < 0) return {};
+    std::string path = "cfg_trip_bound_stderr_capture.txt";
+    FILE* sink = std::fopen(path.c_str(), "w+");
+    if (!sink) {
+#if defined(_WIN32)
+        _close(saved);
+#else
+        close(saved);
+#endif
+        return {};
+    }
+#if defined(_WIN32)
+    const bool ok = _dup2(_fileno(sink), fd) == 0;
+#else
+    const bool ok = dup2(fileno(sink), fd) >= 0;
+#endif
+    // Restore on the way out whatever happens. A throwing body that skipped the restore would
+    // leak both descriptors and silently discard every later diagnostic in the process -- the
+    // exact CI failure this helper exists to avoid producing.
+    struct Restore {
+        int fd, saved;
+        ~Restore() {
+            std::fflush(stderr);
+#if defined(_WIN32)
+            _dup2(saved, fd); _close(saved);
+#else
+            dup2(saved, fd); close(saved);
+#endif
+        }
+    } restore{fd, saved};
+    if (ok) body();
+    std::string out;
+    if (ok) {
+        std::rewind(sink);
+        char buf[4096];
+        size_t n;
+        while ((n = std::fread(buf, 1, sizeof buf, sink)) > 0) out.append(buf, n);
+    }
+    std::fclose(sink);
+    std::remove(path.c_str());
+    return out;
 }
 
 int main(int argc, char** argv) {
@@ -524,6 +591,101 @@ int main(int argc, char** argv) {
         // (c) The selector's VALUE must reach the emitter, not merely its set/unset state.
         CHECK(scoped_module("0") != scoped_module("1"),
               "two different ordinal selections produce two different modules");
+
+        // (d) #3714: the EMITTER must read the operation's pinned value, not the live environment.
+        //
+        // This is the arm the rest of #3714's coverage cannot supply. `test_trip_bound_operation`
+        // asserts on `compute_trip_bound_settings()` directly, which is a PROXY for what the
+        // emitter reads; the shader-cache arms observe a mid-submit HIT, so no compilation happens
+        // inside them at all. Swap `rdna2_emit_cfg.cpp`'s three calls to the parsing function and
+        // every one of those stays green -- while the module is then built under settings the key
+        // never saw, which is the entire defect. Only compiling INSIDE an operation whose value
+        // disagrees with the environment can see it.
+        //
+        // Shape: pin ordinal 0, then set the environment to ordinal 1, then compile. The module
+        // must be ordinal 0's -- and (c) just proved those two modules differ, so this cannot pass
+        // by the two being identical.
+        set_env("PROSPER_CFG_TRIP_BOUND", std::to_string(kScopedBound).c_str());
+        set_env("PROSPER_CFG_TRIP_BOUND_PHASE", "0");
+        set_env("PROSPER_CFG_TRIP_BOUND_ORDINAL", "0");
+        const std::vector<uint32_t> ordinal0 = recompile_valu(kDispatcherLoops, kDispatcherWords, 2, 2);
+        std::vector<uint32_t> pinned_module;
+        {
+            const prosper::gpu::TripBoundOperation op;          // pins ordinal 0
+            set_env("PROSPER_CFG_TRIP_BOUND_ORDINAL", "1");     // the change the emitter must ignore
+            pinned_module = recompile_valu(kDispatcherLoops, kDispatcherWords, 2, 2);
+        }
+        CHECK(!ordinal0.empty() && pinned_module == ordinal0,
+              "#3714: a compilation inside an operation emits the PINNED selector, not the live one");
+        // Negative control: the identical sequence with no operation open follows the environment,
+        // which is what made the key and the module disagree before this change.
+        set_env("PROSPER_CFG_TRIP_BOUND_ORDINAL", "0");
+        const std::vector<uint32_t> live_before = recompile_valu(kDispatcherLoops, kDispatcherWords, 2, 2);
+        set_env("PROSPER_CFG_TRIP_BOUND_ORDINAL", "1");
+        const std::vector<uint32_t> live_after = recompile_valu(kDispatcherLoops, kDispatcherWords, 2, 2);
+        CHECK(!live_before.empty() && live_after != live_before,
+              "control: the same sequence with no operation open DOES follow the environment");
+
+        // (e) The same, varying `bound` instead of `only_ordinal`. (d) alone binds only the emitter
+        // site that reads the ordinal (rdna2_emit_cfg.cpp:5483) -- `bound` and `only_phase` are
+        // equal on both sides of its pin, so a mutation of the site that reads THOSE
+        // (:1211, emitted_loop_trip_bound) stays invisible to it. This arm pins an armed bound and
+        // then disarms the environment, so the module must still be the bounded one.
+        //
+        // The third site (:3582) only prints the ordinal -> guest-pc map to stderr and changes no
+        // module bytes, so no word comparison can reach it; that is stated rather than papered over.
+        set_env("PROSPER_CFG_TRIP_BOUND_ORDINAL", nullptr);
+        set_env("PROSPER_CFG_TRIP_BOUND", std::to_string(kScopedBound).c_str());
+        const std::vector<uint32_t> armed_module = recompile_valu(kDispatcherLoops, kDispatcherWords, 2, 2);
+        set_env("PROSPER_CFG_TRIP_BOUND", nullptr);
+        const std::vector<uint32_t> disarmed_module = recompile_valu(kDispatcherLoops, kDispatcherWords, 2, 2);
+        CHECK(!armed_module.empty() && !disarmed_module.empty() && armed_module != disarmed_module,
+              "precondition: an armed bound and a disarmed one produce different modules");
+        set_env("PROSPER_CFG_TRIP_BOUND", std::to_string(kScopedBound).c_str());
+        std::vector<uint32_t> pinned_bound;
+        {
+            const prosper::gpu::TripBoundOperation op;      // pins the armed bound
+            set_env("PROSPER_CFG_TRIP_BOUND", nullptr);     // disarm; the emitter must ignore it
+            pinned_bound = recompile_valu(kDispatcherLoops, kDispatcherWords, 2, 2);
+        }
+        CHECK(pinned_bound == armed_module,
+              "#3714: the emitter uses the pinned BOUND too, not only the pinned ordinal");
+
+        // (f) The third emitter site (rdna2_emit_cfg.cpp:3582) emits no SPIR-V -- it prints the
+        // ordinal -> guest-pc dispatch map to stderr under `if (compute_trip_bound_settings().bound)`.
+        // No word comparison can reach it, but the GATE is still pinned-vs-live, so stderr binds it:
+        // under a pinned-armed / live-disarmed compile the line must appear, and it is absent if
+        // that site alone reads the environment.
+        //
+        // The capture is scoped to the inside-the-operation compile ONLY. The `armed_module` compile
+        // in (e) runs with the environment armed and prints the same line, so a capture spanning
+        // both would pass under the mutation. The complementary arm below -- disarmed, no
+        // operation, nothing printed -- is what stops this passing against a site that prints
+        // unconditionally.
+        //
+        // The needle is "dispatch map:", not "[cfg-trip-bound]". Five sites in rdna2_emit_cfg.cpp
+        // share that prefix, and under a :3582-only mutation `emitted_loop_trip_bound` still reads
+        // the pinned value and still arms, so :1271's arming notice would satisfy the prefix and
+        // this arm would pass without :3582 having honoured anything. It does not today only
+        // because that notice is deduped process-wide per {program, phase} and arm (b)'s ordinal
+        // sweep already consumed it -- i.e. the arm would rest on the ORDER of arms in this file
+        // and on another diagnostic's dedupe. The unique literal removes both dependencies.
+        set_env("PROSPER_CFG_TRIP_BOUND", std::to_string(kScopedBound).c_str());
+        std::string pinned_stderr;
+        {
+            const prosper::gpu::TripBoundOperation op;
+            set_env("PROSPER_CFG_TRIP_BOUND", nullptr);
+            pinned_stderr = capture_stderr_of([&] {
+                (void)recompile_valu(kDispatcherLoops, kDispatcherWords, 2, 2);
+            });
+        }
+        const std::string disarmed_stderr = capture_stderr_of([&] {
+            (void)recompile_valu(kDispatcherLoops, kDispatcherWords, 2, 2);
+        });
+        CHECK(pinned_stderr.find("dispatch map:") != std::string::npos,
+              "#3714: the dispatch-map print also honours the pin, not the live environment");
+        CHECK(disarmed_stderr.find("dispatch map:") == std::string::npos,
+              "control: disarmed and unpinned, that line is not printed at all");
 
         set_env("PROSPER_CFG_TRIP_BOUND_ORDINAL", nullptr);
         set_env("PROSPER_CFG_TRIP_BOUND", std::to_string(kBound).c_str());
