@@ -155,7 +155,7 @@ static void dump(void) {
     // that. dladdr costs one call per site per dump, never per copy.
     fprintf(f, "# return_address cycles calls bytes dso dso_offset nearest_symbol\n");
     for (unsigned i = 0; i < SLOTS; i++) {
-        if (!g_sites[i].ra) continue;
+        if (!LOAD(g_sites[i].ra)) continue;
         const uint64_t raw = LOAD(g_sites[i].ra);
         const int is_cmp = (raw >> 63) & 1;
         const uint64_t addr = raw & ~(1ull << 63);

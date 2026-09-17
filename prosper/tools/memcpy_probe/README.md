@@ -72,6 +72,22 @@ box, an interrupt — is counted as copy time. Measured: identical work with one
 pinned to the same core read 1.98x higher. Run attribution on a quiet machine for the same reason a
 timing run needs one.
 
+## A periodic report does not sum exactly, and it under-counts
+
+`total_calls - sum(per-site calls) - overflow_calls` is the natural self-check, and on a **periodic**
+report it comes out slightly **negative**. Measured at ~15.5 M calls/s across 12 threads: `0`, `-154`,
+`-180`, `-489`.
+
+The mechanism is the dump itself, not the counters. `dump()` reads the three totals once and then
+walks 8,192 slots doing a `dladdr` per live row, so the rows are sampled tens of microseconds later
+than the totals and have grown in between. The skew therefore scales with the dump's duration times
+the call rate, and a real prosper run has more live rows than that control did, so expect a larger
+gap than those figures, not a smaller one.
+
+The **exit** report is written after the work stops and was exactly summable (`diff = 0`) in the
+same test. So: use the final report when you want the sum to close, and read a small negative
+residual on a periodic one as this, not as a defect. A LARGE or positive residual is not this.
+
 ## Verify it before believing it
 
 `probe_control.c` is the positive control: a known 200,000 + 100,000 + 50,000 copies and 70,000
