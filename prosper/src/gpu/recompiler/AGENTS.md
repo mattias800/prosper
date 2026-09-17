@@ -77,6 +77,17 @@ Three things about it are load-bearing and each has cost someone a run:
   `0x5008f1400` has four guest loops behind one dispatcher and this is how the runaway among them was
   named (#3193).
 
+- **The selectors are sampled ONCE per shader-cache operation, not read per site.** They are part
+  of the cache key — the cache is keyed on code BYTES and never on the address, so a bounded target
+  and an unbounded non-target with identical bodies would collide on one entry. That only works if
+  the key and the module agree about which settings were in force, and before #3714 the key sampled
+  them in `gpu_executor.cpp` while the compiler re-read the environment from four further sites. A
+  change in between keys an entry under settings A while the module in it was built under B, for
+  good, with nothing to report it. `TripBoundOperation` pins one owned value across both halves;
+  nesting adopts rather than re-samples. Inside a submit the pinned value is sampled once per
+  submit, and outside every submit each operation parses afresh — which is what keeps
+  `test_cfg_trip_bound`'s arm/compile/disarm/compile working in one process.
+
 Every SPIR-V emitter path is `spirv-val`-gated in CI (`tools/spv_validate`) with one representative
 module per path, not one per game shader.
 

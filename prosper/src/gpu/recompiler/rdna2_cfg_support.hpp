@@ -1991,10 +1991,37 @@ inline uint32_t scalar_branch_target(const Rdna2Inst& in) {
 //
 // Second, function-local statics parse the environment exactly once per process, which makes the
 // selectors untestable in-process: no test could arm a bound, assert, then disarm and assert again.
-// Re-reading costs three getenv calls per emitted loop during RECOMPILATION only (never per draw or
-// per dispatch — cf. #2214, which removed per-resource-per-draw getenv from the live renderer), and
-// recompiles are cache-warm after the first. CONFIDENCE: HIGH.
-inline ComputeTripBoundSettings compute_trip_bound_settings() {
+// So this parses on demand, and `TripBoundOperation` (rdna2_to_spirv.hpp) is what keeps one
+// operation's reads coherent without freezing them for the process.
+//
+// Work counter for the operation scope. See trip_bound_parses().
+inline std::atomic<uint64_t>& trip_bound_parse_counter() {
+    static std::atomic<uint64_t> parses{0};
+    return parses;
+}
+
+// The innermost TripBoundOperation's owned settings, or null when none is open on this thread.
+// Per thread because compilation runs on whatever worker realized the draw.
+inline const ComputeTripBoundSettings*& trip_bound_pin() {
+    static thread_local const ComputeTripBoundSettings* pinned = nullptr;
+    return pinned;
+}
+
+// THE COMMENT HERE USED TO SAY the re-reads happen "during RECOMPILATION only (never per draw or
+// per dispatch — cf. #2214)", with CONFIDENCE: HIGH. That was wrong, and wrong in the way this
+// project's charter warns about most: a true-sounding claim wearing a citation to the very issue
+// about removing per-draw getenv, in a place nobody re-derives. Three of the callers are not in the
+// recompiler at all — gpu_executor.cpp builds the shader-cache KEY from these settings, so they are
+// read on every cache HIT as well as every miss, i.e. once or twice per draw. Measured on a 240 s
+// routed Grand Theft Auto V window with the switch unset (#3714): 3,941,101 reads of
+// PROSPER_CFG_TRIP_BOUND, ~16,400/s, the largest single getenv name left after #3712. An unset name
+// is the expensive case on glibc — a full scan of environ — so those are all misses.
+// The body. `parse_trip_bound_settings()` and `compute_trip_bound_settings()` are declared in the
+// public header and defined ONCE in rdna2_to_spirv.cpp on top of this, because a definition that is
+// only `inline` in an internal header leaves no symbol for a translation unit outside the
+// recompiler to call -- which is exactly what a test linking prosper_core needs.
+inline ComputeTripBoundSettings parse_trip_bound_settings_impl() {
+    trip_bound_parse_counter().fetch_add(1, std::memory_order_relaxed);
     ComputeTripBoundSettings settings;
     const char* spec = getenv("PROSPER_CFG_TRIP_BOUND");
     if (!spec || !*spec) return settings;

@@ -1,4 +1,5 @@
 #include "gpu/execute/gpu_execute.hpp"
+#include "diagnostics/env_submit.hpp"   // #3714: the per-submit half of the trip-bound contract
 #include "gpu/diagnostics/shader_dump_filter.hpp"
 #include "hle/dispatch/dispatch.hpp"
 #include <array>
@@ -2070,6 +2071,205 @@ int main(int argc, char** argv) {
         set_test_env("PROSPER_CFG_TRIP_BOUND_PROGRAM", nullptr);
         set_test_env("PROSPER_CFG_TRIP_BOUND_PHASE", nullptr);
         // Restore the ordinary pair for the LDS and code-mutation arms below.
+        clear_shader_recompile_cache();
+        (void)recompile_vertex_chain_cached_shared(
+            vertex_prolog, std::size(vertex_prolog), chain_main.data(), chain_main.size(),
+            &table, nullptr, &chain_first_identity);
+        stats = shader_recompile_cache_stats();
+    }
+
+    // #3714: a CHANGED effective bound must not reuse a module built under the old one, and the
+    // scope that makes the key and the compilation agree must not weaken that. Three cached paths,
+    // because they finalize their keys at three separate sites and a scope added to two of them
+    // would leave the third silently sampling twice.
+    //
+    // Each path: arm, compile (miss), compile again (hit), CHANGE the bound, compile (must MISS),
+    // disarm, compile (must MISS again). Three distinct effective settings, three entries, and the
+    // repeat in the middle proves the miss is caused by the changed bound rather than by the cache
+    // never hitting at all -- which is the reading a miss-only arm would permit.
+    {
+        char selector[32];
+        std::snprintf(selector, sizeof selector, "0x%llx",
+                      static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(kVs)));
+        set_test_env("PROSPER_CFG_TRIP_BOUND_PHASE", "0");
+
+        clear_shader_recompile_cache();
+        set_test_env("PROSPER_CFG_TRIP_BOUND", "4");
+        set_test_env("PROSPER_CFG_TRIP_BOUND_PROGRAM", selector);
+        const auto gfx_bound4 = recompile_graphics_shader_cached_shared(
+            ShaderProgramStage::Vertex, kVs, std::size(kVs), &table, nullptr, nullptr, nullptr);
+        const auto gfx_bound4_again = recompile_graphics_shader_cached_shared(
+            ShaderProgramStage::Vertex, kVs, std::size(kVs), &table, nullptr, nullptr, nullptr);
+        set_test_env("PROSPER_CFG_TRIP_BOUND", "8");
+        const auto gfx_bound8 = recompile_graphics_shader_cached_shared(
+            ShaderProgramStage::Vertex, kVs, std::size(kVs), &table, nullptr, nullptr, nullptr);
+        set_test_env("PROSPER_CFG_TRIP_BOUND", nullptr);
+        const auto gfx_disarmed = recompile_graphics_shader_cached_shared(
+            ShaderProgramStage::Vertex, kVs, std::size(kVs), &table, nullptr, nullptr, nullptr);
+        const auto gfx_stats = shader_recompile_cache_stats();
+        CHECK(gfx_bound4 && gfx_bound4_again == gfx_bound4 && gfx_bound8 && gfx_disarmed &&
+                  gfx_bound8 != gfx_bound4 && gfx_disarmed != gfx_bound4 &&
+                  gfx_stats.misses == 3 && gfx_stats.hits == 1,
+              "#3714 graphics: 4 / 8 / disarmed are three entries, and the repeat still hits");
+
+        clear_shader_recompile_cache();
+        std::snprintf(selector, sizeof selector, "0x%llx",
+                      static_cast<unsigned long long>(
+                          reinterpret_cast<uintptr_t>(vertex_prolog)));
+        set_test_env("PROSPER_CFG_TRIP_BOUND", "4");
+        set_test_env("PROSPER_CFG_TRIP_BOUND_PROGRAM", selector);
+        const auto chain_bound4 = recompile_vertex_chain_cached_shared(
+            vertex_prolog, std::size(vertex_prolog), chain_main.data(), chain_main.size(),
+            &table, nullptr, nullptr);
+        const auto chain_bound4_again = recompile_vertex_chain_cached_shared(
+            vertex_prolog, std::size(vertex_prolog), chain_main.data(), chain_main.size(),
+            &table, nullptr, nullptr);
+        set_test_env("PROSPER_CFG_TRIP_BOUND", "8");
+        const auto chain_bound8 = recompile_vertex_chain_cached_shared(
+            vertex_prolog, std::size(vertex_prolog), chain_main.data(), chain_main.size(),
+            &table, nullptr, nullptr);
+        set_test_env("PROSPER_CFG_TRIP_BOUND", nullptr);
+        const auto chain_disarmed = recompile_vertex_chain_cached_shared(
+            vertex_prolog, std::size(vertex_prolog), chain_main.data(), chain_main.size(),
+            &table, nullptr, nullptr);
+        const auto chain_stats = shader_recompile_cache_stats();
+        CHECK(chain_bound4 && chain_bound4_again == chain_bound4 && chain_bound8 &&
+                  chain_disarmed && chain_bound8 != chain_bound4 &&
+                  chain_disarmed != chain_bound4 &&
+                  chain_stats.misses == 3 && chain_stats.hits == 1,
+              "#3714 chained vertex: same three entries through the chain key site");
+
+        clear_shader_recompile_cache();
+        RecompileDiagnosticContext trip_diagnostic{};
+        trip_diagnostic.program_address = 0x4413dc0000ull;
+        std::snprintf(selector, sizeof selector, "0x%llx",
+                      static_cast<unsigned long long>(trip_diagnostic.program_address));
+        set_test_env("PROSPER_CFG_TRIP_BOUND", "4");
+        set_test_env("PROSPER_CFG_TRIP_BOUND_PROGRAM", selector);
+        // Compare cache IDENTITIES, not returned words. This program emits no bounded loop, so
+        // bound=4 and bound=8 compile to byte-identical SPIR-V -- a value comparison is satisfied
+        // by two different entries and cannot see the separation it claims to test. Measured: with
+        // the operation scope removed from this site, the value-comparing version of this arm and
+        // of the per-submit one below both stayed green.
+        uint64_t cmp_id4 = 0, cmp_id4_again = 0, cmp_id8 = 0, cmp_id_off = 0;
+        const auto cmp_bound4 = recompile_compute_shader_cached(
+            kCompute, std::size(kCompute), &compute_table, compute_config, &cmp_id4,
+            trip_diagnostic);
+        const auto cmp_bound4_again = recompile_compute_shader_cached(
+            kCompute, std::size(kCompute), &compute_table, compute_config, &cmp_id4_again,
+            trip_diagnostic);
+        set_test_env("PROSPER_CFG_TRIP_BOUND", "8");
+        const auto cmp_bound8 = recompile_compute_shader_cached(
+            kCompute, std::size(kCompute), &compute_table, compute_config, &cmp_id8,
+            trip_diagnostic);
+        set_test_env("PROSPER_CFG_TRIP_BOUND", nullptr);
+        const auto cmp_disarmed = recompile_compute_shader_cached(
+            kCompute, std::size(kCompute), &compute_table, compute_config, &cmp_id_off,
+            trip_diagnostic);
+        const auto cmp_stats = shader_recompile_cache_stats();
+        CHECK(!cmp_bound4.empty() && !cmp_bound8.empty() && !cmp_disarmed.empty() &&
+                  cmp_id4 != 0 && cmp_id4_again == cmp_id4 &&
+                  cmp_id8 != cmp_id4 && cmp_id_off != cmp_id4 && cmp_id_off != cmp_id8 &&
+                  cmp_stats.misses == 3 && cmp_stats.hits == 1,
+              "#3714 compute: 4 / 8 / disarmed are three distinct cache entries");
+
+        // The per-submit half of the contract, in the cache's own accounting. Inside one submit the
+        // selectors are sampled once, so a change made MID-submit is not observed and the second
+        // lookup HITS -- which is the point: the key and the module it names cannot disagree,
+        // because neither of them saw the change. The next submit re-samples and misses.
+        //
+        // A test that only asserted the miss at the next submit would pass against a per-lookup
+        // sample too; the mid-submit HIT is the half that separates them.
+        clear_shader_recompile_cache();
+        std::snprintf(selector, sizeof selector, "0x%llx",
+                      static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(kVs)));
+        set_test_env("PROSPER_CFG_TRIP_BOUND", "4");
+        set_test_env("PROSPER_CFG_TRIP_BOUND_PROGRAM", selector);
+        SharedShaderWords in_submit_first, in_submit_second, next_submit;
+        {
+            const prosper::diag::SubmitEnvScope submit;
+            in_submit_first = recompile_graphics_shader_cached_shared(
+                ShaderProgramStage::Vertex, kVs, std::size(kVs), &table, nullptr, nullptr, nullptr);
+            set_test_env("PROSPER_CFG_TRIP_BOUND", "8");
+            in_submit_second = recompile_graphics_shader_cached_shared(
+                ShaderProgramStage::Vertex, kVs, std::size(kVs), &table, nullptr, nullptr, nullptr);
+        }
+        {
+            const prosper::diag::SubmitEnvScope submit;
+            next_submit = recompile_graphics_shader_cached_shared(
+                ShaderProgramStage::Vertex, kVs, std::size(kVs), &table, nullptr, nullptr, nullptr);
+        }
+        const auto submit_stats = shader_recompile_cache_stats();
+        CHECK(in_submit_first && in_submit_second == in_submit_first && next_submit &&
+                  next_submit != in_submit_first &&
+                  submit_stats.misses == 2 && submit_stats.hits == 1,
+              "#3714 per submit, graphics: a mid-submit change is not observed until the next");
+
+        // The same discriminator on the other two key sites. The three "three entries" arms above
+        // pass with or without the operation scope -- they guard the KEY, which already mixed these
+        // selectors in. Only the mid-submit HIT distinguishes a per-operation sample from a
+        // per-lookup one, so each site needs its own or a site left unscoped goes unnoticed.
+        clear_shader_recompile_cache();
+        std::snprintf(selector, sizeof selector, "0x%llx",
+                      static_cast<unsigned long long>(
+                          reinterpret_cast<uintptr_t>(vertex_prolog)));
+        set_test_env("PROSPER_CFG_TRIP_BOUND", "4");
+        set_test_env("PROSPER_CFG_TRIP_BOUND_PROGRAM", selector);
+        SharedShaderWords chain_in_first, chain_in_second, chain_next;
+        {
+            const prosper::diag::SubmitEnvScope submit;
+            chain_in_first = recompile_vertex_chain_cached_shared(
+                vertex_prolog, std::size(vertex_prolog), chain_main.data(), chain_main.size(),
+                &table, nullptr, nullptr);
+            set_test_env("PROSPER_CFG_TRIP_BOUND", "8");
+            chain_in_second = recompile_vertex_chain_cached_shared(
+                vertex_prolog, std::size(vertex_prolog), chain_main.data(), chain_main.size(),
+                &table, nullptr, nullptr);
+        }
+        {
+            const prosper::diag::SubmitEnvScope submit;
+            chain_next = recompile_vertex_chain_cached_shared(
+                vertex_prolog, std::size(vertex_prolog), chain_main.data(), chain_main.size(),
+                &table, nullptr, nullptr);
+        }
+        const auto chain_submit_stats = shader_recompile_cache_stats();
+        CHECK(chain_in_first && chain_in_second == chain_in_first && chain_next &&
+                  chain_next != chain_in_first &&
+                  chain_submit_stats.misses == 2 && chain_submit_stats.hits == 1,
+              "#3714 per submit, chained vertex: same, through the chain key site");
+
+        clear_shader_recompile_cache();
+        std::snprintf(selector, sizeof selector, "0x%llx",
+                      static_cast<unsigned long long>(trip_diagnostic.program_address));
+        set_test_env("PROSPER_CFG_TRIP_BOUND", "4");
+        set_test_env("PROSPER_CFG_TRIP_BOUND_PROGRAM", selector);
+        std::vector<uint32_t> cmp_in_first, cmp_in_second, cmp_next;
+        uint64_t cmp_in_id1 = 0, cmp_in_id2 = 0, cmp_next_id = 0;   // identities, per the note above
+        {
+            const prosper::diag::SubmitEnvScope submit;
+            cmp_in_first = recompile_compute_shader_cached(
+                kCompute, std::size(kCompute), &compute_table, compute_config, &cmp_in_id1,
+                trip_diagnostic);
+            set_test_env("PROSPER_CFG_TRIP_BOUND", "8");
+            cmp_in_second = recompile_compute_shader_cached(
+                kCompute, std::size(kCompute), &compute_table, compute_config, &cmp_in_id2,
+                trip_diagnostic);
+        }
+        {
+            const prosper::diag::SubmitEnvScope submit;
+            cmp_next = recompile_compute_shader_cached(
+                kCompute, std::size(kCompute), &compute_table, compute_config, &cmp_next_id,
+                trip_diagnostic);
+        }
+        const auto cmp_submit_stats = shader_recompile_cache_stats();
+        CHECK(!cmp_in_first.empty() && !cmp_next.empty() && cmp_in_id1 != 0 &&
+                  cmp_in_id2 == cmp_in_id1 && cmp_next_id != cmp_in_id1 &&
+                  cmp_submit_stats.misses == 2 && cmp_submit_stats.hits == 1,
+              "#3714 per submit, compute: same, through the compute key site");
+
+        set_test_env("PROSPER_CFG_TRIP_BOUND", nullptr);
+        set_test_env("PROSPER_CFG_TRIP_BOUND_PROGRAM", nullptr);
+        set_test_env("PROSPER_CFG_TRIP_BOUND_PHASE", nullptr);
         clear_shader_recompile_cache();
         (void)recompile_vertex_chain_cached_shared(
             vertex_prolog, std::size(vertex_prolog), chain_main.data(), chain_main.size(),

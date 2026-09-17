@@ -2038,6 +2038,14 @@ if(TARGET prosper_core)
   add_test(NAME image_descriptor_class_lookup COMMAND test_image_descriptor_class_lookup)
 
   # Bounded graphics-shader cache: cached modules must match the direct recompiler byte-for-byte.
+  # The trip-bound OPERATION scope (#3714): one sampled selector value shared by the shader-cache
+  # key and the compilation it names. Needs no GPU and no fixture -- it asserts agreement between
+  # two reads, plus a work counter, because correct settings cannot show that the sampling happened
+  # once rather than four times.
+  add_executable(test_trip_bound_operation tests/gpu/execute/test_trip_bound_operation.cpp)
+  target_link_libraries(test_trip_bound_operation PRIVATE prosper_core)
+  add_test(NAME trip_bound_operation COMMAND test_trip_bound_operation)
+
   add_executable(test_shader_recompile_cache tests/gpu/execute/test_shader_recompile_cache.cpp)
   # Includes a shared fixture, which resolves from the `tests` root.
   target_include_directories(test_shader_recompile_cache PRIVATE tests)

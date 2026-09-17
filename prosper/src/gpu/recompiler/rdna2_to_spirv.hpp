@@ -137,7 +137,49 @@ struct ComputeTripBoundSettings {
     // arms informative rather than merely quiet.
     uint32_t only_ordinal = kAllOrdinals;
 };
+
+// Parse the four PROSPER_CFG_TRIP_BOUND* variables. Always touches the environment; increments
+// trip_bound_parses(). Callers normally want compute_trip_bound_settings() instead.
+ComputeTripBoundSettings parse_trip_bound_settings();
+
+// The settings in effect for the caller: the value pinned by the innermost enclosing
+// TripBoundOperation if there is one, and a fresh parse otherwise.
 ComputeTripBoundSettings compute_trip_bound_settings();
+
+// How many times the environment has actually been parsed. A work counter, not a diagnostic: it is
+// the only thing that can distinguish "the operation scope is doing its job" from "the answers
+// happen to agree", which correct output alone cannot.
+uint64_t trip_bound_parses();
+
+// One shader-cache operation -- key construction AND, on a miss, the compilation the key will name.
+//
+// THE CONTRACT THIS EXISTS FOR is coherence, not speed. The cache key mixes in the whole selector
+// struct (see gpu_executor.cpp) because a target and a non-target with identical code bytes would
+// otherwise collide on one entry. That only works if the key and the module agree about which
+// settings were in force: sample the key, let the environment change, and let the compiler re-read
+// it, and the entry is keyed under settings A while holding a module built under settings B --
+// permanently, for every later lookup that hashes to A. Nothing would ever report it. Pinning one
+// owned value for the whole operation makes the two agree by construction rather than by timing.
+//
+// Speed is the secondary effect and it is bounded: inside a submit (diagnostics/env_submit.hpp) the
+// pinned value is sampled once per submit per thread rather than once per shader lookup. Outside
+// every submit each operation parses afresh, so a test that arms between two operations still sees
+// its change -- which is what test_cfg_trip_bound depends on.
+//
+// Nesting adopts rather than re-samples: an inner operation keeps the outer pin, so a chained
+// vertex program cannot disagree with the program it is chained to.
+class TripBoundOperation {
+public:
+    TripBoundOperation();
+    ~TripBoundOperation();
+    TripBoundOperation(const TripBoundOperation&) = delete;
+    TripBoundOperation& operator=(const TripBoundOperation&) = delete;
+    const ComputeTripBoundSettings& settings() const { return settings_; }
+private:
+    ComputeTripBoundSettings settings_{};
+    const ComputeTripBoundSettings* previous_ = nullptr;
+    bool owns_ = false;
+};
 
 // Does THIS compiled module write the trip-bound witness? Distinct from compute_trip_witness_active,
 // which reports INTENT: a structured-loop program, or a selected phase the program does not have,
