@@ -91,6 +91,10 @@ static void set_env(const char* name, const char* value) {
 // Deliberately local and minimal: the two other capture_stderr helpers in the tree live in test
 // files rather than a shared fixture, and copying either whole would bring scratch-path machinery
 // this needs nothing of.
+// The fixed scratch filename is safe because `test_cfg_trip_bound` is registered ONCE
+// (CMakeLists.txt). `test_shader_recompile_cache`'s equivalent needs atomic unique paths precisely
+// because that binary is registered several times and ctest -j runs them concurrently -- so if a
+// second add_test for this binary is ever added, this filename has to become unique with it.
 static std::string capture_stderr_of(const std::function<void()>& body) {
     std::fflush(stderr);
 #if defined(_WIN32)
@@ -116,13 +120,21 @@ static std::string capture_stderr_of(const std::function<void()>& body) {
 #else
     const bool ok = dup2(fileno(sink), fd) >= 0;
 #endif
-    if (ok) body();
-    std::fflush(stderr);
+    // Restore on the way out whatever happens. A throwing body that skipped the restore would
+    // leak both descriptors and silently discard every later diagnostic in the process -- the
+    // exact CI failure this helper exists to avoid producing.
+    struct Restore {
+        int fd, saved;
+        ~Restore() {
+            std::fflush(stderr);
 #if defined(_WIN32)
-    _dup2(saved, fd); _close(saved);
+            _dup2(saved, fd); _close(saved);
 #else
-    dup2(saved, fd); close(saved);
+            dup2(saved, fd); close(saved);
 #endif
+        }
+    } restore{fd, saved};
+    if (ok) body();
     std::string out;
     if (ok) {
         std::rewind(sink);
@@ -650,6 +662,14 @@ int main(int argc, char** argv) {
         // both would pass under the mutation. The complementary arm below -- disarmed, no
         // operation, nothing printed -- is what stops this passing against a site that prints
         // unconditionally.
+        //
+        // The needle is "dispatch map:", not "[cfg-trip-bound]". Five sites in rdna2_emit_cfg.cpp
+        // share that prefix, and under a :3582-only mutation `emitted_loop_trip_bound` still reads
+        // the pinned value and still arms, so :1271's arming notice would satisfy the prefix and
+        // this arm would pass without :3582 having honoured anything. It does not today only
+        // because that notice is deduped process-wide per {program, phase} and arm (b)'s ordinal
+        // sweep already consumed it -- i.e. the arm would rest on the ORDER of arms in this file
+        // and on another diagnostic's dedupe. The unique literal removes both dependencies.
         set_env("PROSPER_CFG_TRIP_BOUND", std::to_string(kScopedBound).c_str());
         std::string pinned_stderr;
         {
@@ -662,9 +682,9 @@ int main(int argc, char** argv) {
         const std::string disarmed_stderr = capture_stderr_of([&] {
             (void)recompile_valu(kDispatcherLoops, kDispatcherWords, 2, 2);
         });
-        CHECK(pinned_stderr.find("[cfg-trip-bound]") != std::string::npos,
+        CHECK(pinned_stderr.find("dispatch map:") != std::string::npos,
               "#3714: the dispatch-map print also honours the pin, not the live environment");
-        CHECK(disarmed_stderr.find("[cfg-trip-bound]") == std::string::npos,
+        CHECK(disarmed_stderr.find("dispatch map:") == std::string::npos,
               "control: disarmed and unpinned, that line is not printed at all");
 
         set_env("PROSPER_CFG_TRIP_BOUND_ORDINAL", nullptr);
