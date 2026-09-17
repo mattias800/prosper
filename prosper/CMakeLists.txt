@@ -3956,6 +3956,17 @@ if(TARGET prosper_core AND TARGET Vulkan::Vulkan)
   target_include_directories(test_gpu_detile PRIVATE tests)
   target_link_libraries(test_gpu_detile PRIVATE prosper_core Vulkan::Vulkan)
   add_test(NAME gpu_detile COMMAND test_gpu_detile)
+  # The bounded VkCommandPool free list (#3407). Registered TWICE: the second run sets
+  # PROSPER_NO_COMMAND_POOL_REUSE, which is the negative control and has to be a separate process
+  # because the switch is read once into a function-local static.
+  add_executable(test_command_pool_reuse tests/gpu/execute/test_command_pool_reuse.cpp)
+  target_include_directories(test_command_pool_reuse PRIVATE tests frontends)
+  target_link_libraries(test_command_pool_reuse PRIVATE prosper_core Vulkan::Vulkan)
+  add_test(NAME command_pool_reuse COMMAND test_command_pool_reuse)
+  add_test(NAME command_pool_reuse_disabled COMMAND test_command_pool_reuse)
+  set_tests_properties(command_pool_reuse_disabled PROPERTIES
+                       ENVIRONMENT "PROSPER_NO_COMMAND_POOL_REUSE=1")
+
   add_executable(test_mapped_staging tests/gpu/execute/test_mapped_staging.cpp)
   target_include_directories(test_mapped_staging PRIVATE tests frontends)
   target_link_libraries(test_mapped_staging PRIVATE prosper_core Vulkan::Vulkan)

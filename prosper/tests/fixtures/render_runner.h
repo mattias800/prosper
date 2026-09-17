@@ -2817,6 +2817,157 @@ inline VkDeviceSize render_memory_pool_limit() {
     return limit;
 }
 
+// #3407: a VkCommandPool created and destroyed per draw pass, and what that costs.
+//
+// Destroying a command pool makes RADV tear down every command stream it owns, which frees their
+// buffer objects and releases each one's GPU virtual-address range. Measured on the serial critical
+// path of a routed Grand Theft Auto V window -- TID 403475, 74.7% of process CPU and 99.0%
+// EXECUTING rather than blocked, so its CPU time is frame latency rather than background work:
+//
+//   3.79%  destroy command pool  (vkDestroyCommandPool -> ... -> amdgpu_vamgr_free_va)
+//   0.39%  create pool / allocate command buffer
+//
+// 4.18% of that thread, spent building and demolishing an object whose entire contents are
+// immediately rebuilt. `vkResetCommandPool` with flags 0 recycles the pool's blocks WITHOUT
+// returning them to the system, which is precisely the churn above.
+//
+// WHY THIS IS SAFE, and it rests on the existing lifetime rather than changing it. Every site below
+// already destroys its pool in a completion-gated path -- the deferred cleanup lambda that runs
+// after the GPU signals, or after an explicit fence wait. Returning the pool there instead of
+// destroying it retires it at exactly the same moment, so no command buffer is recycled while it is
+// still in flight. A pool handed out by `acquire` is owned exclusively by that caller until it is
+// released, which is what Vulkan's external-synchronisation rule for command pools requires.
+//
+// BOUNDED ON PURPOSE. Each retained pool holds its command-stream allocations, so an unbounded free
+// list would trade allocator time for unbounded memory. The cap is per (device, queue family) and
+// small; beyond it, release destroys as before. `PROSPER_NO_COMMAND_POOL_REUSE` restores the old
+// behaviour exactly, which is also the negative control the test uses.
+// The pool AND its single command buffer. Caching the pool alone is a large REGRESSION, measured:
+// `vkResetCommandPool` resets every command buffer ever allocated from the pool and leaves them
+// allocated, so a caller that allocates a fresh buffer on each reuse grows the pool without bound
+// and the reset cost grows with it. A first attempt did exactly that and took the routed Grand
+// Theft Auto V window from 8.7 fps to 3.5, with `vk_common_ResetCommandPool` at 41.6% of the
+// critical thread and `amdgpu_vamgr_find_va` -- VA *allocation* -- newly at 11.0%. Holding one
+// buffer per pool keeps the reset O(1) and is the only reason this is a win rather than a trade.
+struct RenderCommandPoolEntry {
+    VkDevice device = VK_NULL_HANDLE;
+    uint32_t queue_family = 0;
+    VkCommandPool pool = VK_NULL_HANDLE;
+    VkCommandBuffer command = VK_NULL_HANDLE;
+};
+
+// What a caller holds between acquire and release. `command` is already allocated and in the
+// INITIAL state, ready for vkBeginCommandBuffer.
+struct RenderCommandPoolLease {
+    VkCommandPool pool = VK_NULL_HANDLE;
+    VkCommandBuffer command = VK_NULL_HANDLE;
+    explicit operator bool() const { return pool != VK_NULL_HANDLE && command != VK_NULL_HANDLE; }
+};
+
+struct RenderCommandPoolCache {
+    std::mutex mutex;
+    std::vector<RenderCommandPoolEntry> available;
+    uint64_t hits = 0, misses = 0, retired = 0, destroyed = 0;
+};
+
+struct RenderCommandPoolStats {
+    uint64_t hits = 0, misses = 0, retired = 0, destroyed = 0;
+    size_t cached = 0;
+};
+
+inline RenderCommandPoolCache& render_command_pool_cache() {
+    static RenderCommandPoolCache cache;
+    return cache;
+}
+
+inline bool render_command_pool_reuse_enabled() {
+    static const bool enabled = getenv("PROSPER_NO_COMMAND_POOL_REUSE") == nullptr;
+    return enabled;
+}
+
+inline size_t render_command_pool_cache_limit() {
+    static const size_t limit = []() -> size_t {
+        const char* value = getenv("PROSPER_COMMAND_POOL_CACHE");
+        // env_numeric rather than strtoul: a malformed value must keep the default rather than wrap,
+        // and 0 is a meaningful setting here (retain nothing) so it cannot be the failure value.
+        const uint64_t parsed = prosper::diag::env_u64_or_default_capped(
+            "PROSPER_COMMAND_POOL_CACHE", value, 8ull, 256ull, "pools");
+        return static_cast<size_t>(parsed);
+    }();
+    return limit;
+}
+
+// The one bit that decides whether any of this works. RESET_RELEASE_RESOURCES hands the pool's
+// blocks back to the driver, so the next recording re-acquires buffer objects and re-allocates their
+// VA ranges -- exactly the churn this exists to remove, at exactly the same cost, while every
+// functional test still passes. Exposed as a function so a test can assert on it, because there is
+// no way for an application to observe the difference at runtime: it appears only as driver BO
+// traffic, which is what the profile measures and what a unit test cannot see.
+inline VkCommandPoolResetFlags render_command_pool_reset_flags() { return 0; }
+
+inline RenderCommandPoolLease acquire_render_command_pool(VkDevice device,
+                                                          uint32_t queue_family) {
+    if (render_command_pool_reuse_enabled()) {
+        RenderCommandPoolCache& cache = render_command_pool_cache();
+        std::lock_guard<std::mutex> lock(cache.mutex);
+        for (size_t i = cache.available.size(); i-- > 0;) {
+            const RenderCommandPoolEntry entry = cache.available[i];
+            if (entry.device != device || entry.queue_family != queue_family) continue;
+            cache.available.erase(cache.available.begin() + static_cast<ptrdiff_t>(i));
+            // Resets the pool's one buffer back to INITIAL and keeps the pool's blocks. With a
+            // single buffer this is O(1); see RenderCommandPoolEntry for what happens when it is not.
+            if (vkResetCommandPool(device, entry.pool,
+                                   render_command_pool_reset_flags()) == VK_SUCCESS) {
+                ++cache.hits;
+                return RenderCommandPoolLease{entry.pool, entry.command};
+            }
+            // A pool that will not reset is not reusable and must not be leaked or handed out.
+            vkDestroyCommandPool(device, entry.pool, nullptr);
+            ++cache.destroyed;
+            break;
+        }
+        ++cache.misses;
+    }
+    VkCommandPoolCreateInfo info{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+    info.queueFamilyIndex = queue_family;
+    VkCommandPool pool = VK_NULL_HANDLE;
+    if (vkCreateCommandPool(device, &info, nullptr, &pool) != VK_SUCCESS) return {};
+    VkCommandBufferAllocateInfo alloc{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    alloc.commandPool = pool;
+    alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    alloc.commandBufferCount = 1;
+    VkCommandBuffer command = VK_NULL_HANDLE;
+    if (vkAllocateCommandBuffers(device, &alloc, &command) != VK_SUCCESS) {
+        vkDestroyCommandPool(device, pool, nullptr);
+        return {};
+    }
+    return RenderCommandPoolLease{pool, command};
+}
+
+inline void release_render_command_pool(VkDevice device, uint32_t queue_family,
+                                        const RenderCommandPoolLease& lease) {
+    if (!lease.pool) return;
+    if (render_command_pool_reuse_enabled()) {
+        RenderCommandPoolCache& cache = render_command_pool_cache();
+        std::lock_guard<std::mutex> lock(cache.mutex);
+        if (cache.available.size() < render_command_pool_cache_limit()) {
+            cache.available.push_back(
+                RenderCommandPoolEntry{device, queue_family, lease.pool, lease.command});
+            ++cache.retired;
+            return;
+        }
+        ++cache.destroyed;
+    }
+    vkDestroyCommandPool(device, lease.pool, nullptr);   // frees its command buffer with it
+}
+
+inline RenderCommandPoolStats render_command_pool_stats() {
+    RenderCommandPoolCache& cache = render_command_pool_cache();
+    std::lock_guard<std::mutex> lock(cache.mutex);
+    return RenderCommandPoolStats{cache.hits, cache.misses, cache.retired, cache.destroyed,
+                                  cache.available.size()};
+}
+
 inline VkDeviceMemory allocate_transient_render_memory(VkDevice device, VkDeviceSize bytes,
                                                        uint32_t memory_type) {
     if (memory_type == UINT32_MAX) return VK_NULL_HANDLE;
@@ -4872,20 +5023,18 @@ inline BackendSubmissionState submit_persistent_ds_transfer(
     VkCommandPool pool = VK_NULL_HANDLE;
     VkCommandBuffer command = VK_NULL_HANDLE;
     VkFence fence = VK_NULL_HANDLE;
-    VkCommandPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
-    pool_info.queueFamilyIndex = ctx.qfi;
-    if (vkCreateCommandPool(ctx.dev, &pool_info, nullptr, &pool) != VK_SUCCESS) {
+    const RenderCommandPoolLease lease = acquire_render_command_pool(ctx.dev, ctx.qfi);
+    pool = lease.pool; command = lease.command;
+    if (!lease) {
         error = "cannot create persistent DS transfer command pool";
         return BackendSubmissionState::NotSubmitted;
     }
-    VkCommandBufferAllocateInfo command_info{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-    command_info.commandPool = pool; command_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    command_info.commandBufferCount = 1;
     VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    if (vkAllocateCommandBuffers(ctx.dev, &command_info, &command) != VK_SUCCESS ||
-        vkBeginCommandBuffer(command, &begin) != VK_SUCCESS) {
-        vkDestroyCommandPool(ctx.dev, pool, nullptr);
+    // No vkAllocateCommandBuffers here: the lease already owns this pool's one buffer. Allocating
+    // another on every acquire is what made the first version of this change a 60% regression.
+    if (vkBeginCommandBuffer(command, &begin) != VK_SUCCESS) {
+        release_render_command_pool(ctx.dev, ctx.qfi, RenderCommandPoolLease{pool, command});
         error = "cannot begin persistent DS transfer command";
         return BackendSubmissionState::NotSubmitted;
     }
@@ -4950,7 +5099,7 @@ inline BackendSubmissionState submit_persistent_ds_transfer(
         backend_mark_unproven_submission();
     if (state != BackendSubmissionState::Pending) {
         if (fence) vkDestroyFence(ctx.dev, fence, nullptr);
-        vkDestroyCommandPool(ctx.dev, pool, nullptr);
+        release_render_command_pool(ctx.dev, ctx.qfi, RenderCommandPoolLease{pool, command});
     }
     if (state != BackendSubmissionState::Complete)
         error = "persistent DS transfer did not complete";
@@ -4998,23 +5147,20 @@ inline bool readback_persistent_color_target(uint64_t id, uint32_t width, uint32
     VkFence fence = VK_NULL_HANDLE;
     auto cleanup = [&] {
         if (fence) vkDestroyFence(ctx.dev, fence, nullptr);
-        if (pool) vkDestroyCommandPool(ctx.dev, pool, nullptr);
+        if (pool) release_render_command_pool(ctx.dev, ctx.qfi, RenderCommandPoolLease{pool, command});
         if (buffer) vkDestroyBuffer(ctx.dev, buffer, nullptr);
         if (memory) prosper::gpu::free_device_memory(ctx.dev, memory);
     };
-    VkCommandPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
-    pool_info.queueFamilyIndex = ctx.qfi;
-    if (vkCreateCommandPool(ctx.dev, &pool_info, nullptr, &pool) != VK_SUCCESS) {
+    const RenderCommandPoolLease lease = acquire_render_command_pool(ctx.dev, ctx.qfi);
+    pool = lease.pool; command = lease.command;
+    if (!lease) {
         cleanup(); error = "cannot create persistent color target readback command pool"; return false;
     }
-    VkCommandBufferAllocateInfo command_info{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-    command_info.commandPool = pool;
-    command_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    command_info.commandBufferCount = 1;
     VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    if (vkAllocateCommandBuffers(ctx.dev, &command_info, &command) != VK_SUCCESS ||
-        vkBeginCommandBuffer(command, &begin) != VK_SUCCESS) {
+    // No vkAllocateCommandBuffers here: the lease already owns this pool's one buffer. Allocating
+    // another on every acquire is what made the first version of this change a 60% regression.
+    if (vkBeginCommandBuffer(command, &begin) != VK_SUCCESS) {
         cleanup(); error = "cannot begin persistent color target readback command"; return false;
     }
 
@@ -5194,10 +5340,8 @@ inline bool copy_persistent_color_target(uint64_t src_id, uint64_t dst_id, uint3
     VkFence fence = VK_NULL_HANDLE;
     auto cleanup = [&] {
         if (fence) vkDestroyFence(ctx.dev, fence, nullptr);
-        if (pool) vkDestroyCommandPool(ctx.dev, pool, nullptr);
+        if (pool) release_render_command_pool(ctx.dev, ctx.qfi, RenderCommandPoolLease{pool, command});
     };
-    VkCommandPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
-    pool_info.queueFamilyIndex = ctx.qfi;
     // A pre-existing valid destination image is exactly the stale object this helper exists to
     // replace — on ANY failure past this point it must not stay valid (#1382 review finding 2).
     auto fail = [&](const char* message) {
@@ -5205,16 +5349,15 @@ inline bool copy_persistent_color_target(uint64_t src_id, uint64_t dst_id, uint3
         error = message;
         return false;
     };
-    if (vkCreateCommandPool(ctx.dev, &pool_info, nullptr, &pool) != VK_SUCCESS)
+    const RenderCommandPoolLease lease = acquire_render_command_pool(ctx.dev, ctx.qfi);
+    pool = lease.pool; command = lease.command;
+    if (!lease)
         return fail("cannot create resolve copy command pool");
-    VkCommandBufferAllocateInfo command_info{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-    command_info.commandPool = pool;
-    command_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    command_info.commandBufferCount = 1;
     VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    if (vkAllocateCommandBuffers(ctx.dev, &command_info, &command) != VK_SUCCESS ||
-        vkBeginCommandBuffer(command, &begin) != VK_SUCCESS) {
+    // No vkAllocateCommandBuffers here: the lease already owns this pool's one buffer. Allocating
+    // another on every acquire is what made the first version of this change a 60% regression.
+    if (vkBeginCommandBuffer(command, &begin) != VK_SUCCESS) {
         cleanup(); return fail("cannot begin resolve copy command");
     }
     const VkImageLayout src_saved = src->layout;
@@ -9892,11 +10035,9 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         vkBindBufferMemory(dev, rb, bmem, 0);
     }
 
-    VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO}; pci.queueFamilyIndex = qfi;
-    VkCommandPool pool; vkCreateCommandPool(dev, &pci, nullptr, &pool);
-    VkCommandBufferAllocateInfo cbai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-    cbai.commandPool = pool; cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; cbai.commandBufferCount = 1;
-    VkCommandBuffer cmd; vkAllocateCommandBuffers(dev, &cbai, &cmd);
+    const RenderCommandPoolLease lease = acquire_render_command_pool(dev, qfi);
+    VkCommandPool pool = lease.pool;
+    VkCommandBuffer cmd = lease.command;   // already allocated; see RenderCommandPoolEntry
     VkCommandBufferBeginInfo cbbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO}; cbbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(cmd, &cbbi);
     if (timing_enabled)
@@ -11739,7 +11880,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     const bool transient_ds = use_ds && cached_ds == nullptr;
     const RenderVkCtx* ctx_ptr = &ctx;
     active_submission.add_cleanup(
-        [dev, pool, dv = std::move(dv), shared_descriptor_pool,
+        [dev, qfi, pool, cmd, dv = std::move(dv), shared_descriptor_pool,
          shared_pipeline_layouts = std::move(shared_pipeline_layouts),
          shared_descriptor_set_layouts = std::move(shared_descriptor_set_layouts),
          shared_texture_bindings = std::move(shared_texture_bindings),
@@ -11753,7 +11894,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
          transient_ds, dview, dimg, dmem, ds_stats_pool, ds_occ_pool,
          geom_buf, geom_mem, geom_counter, geom_counter_mem, ctx_ptr,
          color_target_generation]() mutable {
-            vkDestroyCommandPool(dev, pool, nullptr);
+            release_render_command_pool(dev, qfi, RenderCommandPoolLease{pool, cmd});
             if (ds_stats_pool) vkDestroyQueryPool(dev, ds_stats_pool, nullptr);
             if (ds_occ_pool) vkDestroyQueryPool(dev, ds_occ_pool, nullptr);
             if (geom_buf) vkDestroyBuffer(dev, geom_buf, nullptr);
