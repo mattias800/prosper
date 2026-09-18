@@ -1983,15 +1983,13 @@ inline PcrelTables detect_pcrel_tables(
                 // Same proof as the MUBUF case below, with two extra obligations: the typed format
                 // must be a pure 32-bit-per-component pass-through (so the fold copies dwords, not
                 // converted texels), and TFE must be off (its trailing status word is not modelled).
+                // Per RDNA2 ISA Table 31, TBUFFER_LOAD_FORMAT_* always uses DST SEL = identity,
+                // ignoring the descriptor's DST_SEL field entirely (see test_rdna2_to_spirv.cpp:4261).
                 if (in.opcode > 0x03u || in.mtbuf_tfe) break;      // typed LOADS only, no status
                 const uint32_t components = in.opcode + 1u;
                 if (!rdna2_buffer_format_is_raw_dwords(in.mtbuf_format, components)) break;
                 const int sb = in.src[1].value;
-                // word3 is required here and not in the untyped case below: a FORMAT load applies the
-                // descriptor's DST_SEL and a raw load does not.
-                if (!pcoff.count(sb) || !pchi.count(sb + 1) || !kconst.count(sb + 2) ||
-                    !kconst.count(sb + 3) ||
-                    !rdna2_buffer_dst_sel_is_identity(kconst[sb + 3], components)) break;
+                if (!pcoff.count(sb) || !pchi.count(sb + 1) || !kconst.count(sb + 2)) break;
                 const uint32_t nrec = kconst[sb + 2];
                 const bool idxen = (in.literal >> 13) & 1u;
                 const bool soff0 = (in.src[2].kind == OperandKind::Special && in.src[2].value == 125) ||
@@ -2007,7 +2005,7 @@ inline PcrelTables detect_pcrel_tables(
                 // widening the fix to the untyped ones needs its own evidence and its own arms.)
                 uint32_t oldest = UINT32_MAX;
                 bool entered = false;
-                for (int r : {sb, sb + 1, sb + 2, sb + 3}) {
+                for (int r : {sb, sb + 1, sb + 2}) {
                     auto it = fact_pc.find(r);
                     if (it == fact_pc.end()) { entered = true; break; }   // no proven fact at all
                     if (it->second < oldest) oldest = it->second;

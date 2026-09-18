@@ -12377,6 +12377,39 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                  "binding=%u addr=0x%llx extent=%ux%u\n",
                                  bi.binding, (unsigned long long)r->gpu_addr,
                                  mirror.imported_width, mirror.imported_height);
+            } else if (bi.storage && layout_source && r->width && r->height &&
+                       r->depth == 1 && !r->in_mip_tail &&
+                       !r->layer_mip_offset_bytes && !r->mip_chain_base_level) {
+                LiveTargetPixelFormat target_format = LiveTargetPixelFormat::Rgba8Unorm;
+                bool format_ok = false;
+                if (r->format == DataFormat::Unorm8 && nc == 4) {
+                    target_format = LiveTargetPixelFormat::Rgba8Unorm;
+                    format_ok = true;
+                } else if (r->format == DataFormat::Float16 && nc == 4) {
+                    target_format = LiveTargetPixelFormat::Rgba16Float;
+                    format_ok = true;
+                } else if (r->format == DataFormat::Float32 && nc == 4) {
+                    target_format = LiveTargetPixelFormat::Rgba32Float;
+                    format_ok = true;
+                } else if (r->format == DataFormat::Float10_11_11 && (nc == 3 || nc == 4)) {
+                    target_format = LiveTargetPixelFormat::R11G11B10Float;
+                    format_ok = true;
+                } else if (r->format == DataFormat::Unorm8 && nc == 1) {
+                    target_format = LiveTargetPixelFormat::R8Unorm;
+                    format_ok = true;
+                }
+                if (format_ok) {
+                    auto pixels = std::make_shared<std::vector<uint8_t>>(
+                        layout_source, layout_source + linear_bytes);
+                    notify_live_render_target_image_written({
+                        r->gpu_addr, r->width, r->height, target_format, std::move(pixels)});
+                    if (trace)
+                        std::fprintf(stderr,
+                                     "[compute]   published linear storage result into renderer RTT "
+                                     "binding=%u addr=0x%llx extent=%ux%u format=%u\n",
+                                     bi.binding, (unsigned long long)r->gpu_addr,
+                                     r->width, r->height, static_cast<unsigned>(target_format));
+                }
             }
             const auto notify_done = ComputeClock::now();
             bool retain_gpu_result_baseline = false;

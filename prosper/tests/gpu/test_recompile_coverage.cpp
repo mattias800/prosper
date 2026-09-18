@@ -5,6 +5,7 @@
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/resources/shader_resources.hpp"
+#include "gpu/texture/tile.hpp"
 #include <algorithm>
 #include <cstdlib>
 #include <cstdio>
@@ -3045,10 +3046,10 @@ int main() {
                             std::size(pcrel_table_vs_typed_x), nullptr).empty(),
           "Sonic Frontiers' own tbuffer_load_format_x embedded-table word folds (#2859)");
 
-    // A FORMAT load applies the descriptor's DST_SEL and a raw load does not, so the typed fold has
-    // to prove the routing is identity as well as the format. Same program as the arm above with
-    // DST_SEL_X = SQ_SEL_0 (constant zero) instead of SQ_SEL_X: the fetch would return 0 rather than
-    // the stored dword, so the fold must not be offered and the getpc must still reject.
+    // Per RDNA2 ISA Table 31, TBUFFER_LOAD_FORMAT_* always uses DST SEL = identity,
+    // ignoring the descriptor's DST_SEL field entirely (see test_rdna2_to_spirv.cpp:4261).
+    // The program below with DST_SEL_X = SQ_SEL_0 still folds and recompiles because the hardware
+    // ignores descriptor word 3 DST_SEL on MTBUF.
     const uint32_t pcrel_table_vs_typed_x_swizzled[] = {
         0xb0020010u,               // s_movk_i32 s2, 16 bytes
         0xbe8303ffu, 0x10005000u,  // s_mov_b32 s3, V# config -- DST_SEL_X = 0 (constant zero)
@@ -3062,9 +3063,9 @@ int main() {
         0xbf810000u,               // s_endpgm
         0xbf800000u, 0xbf800000u, 0u, 0x3f800000u,
     };
-    CHECK(recompile_vertex(pcrel_table_vs_typed_x_swizzled,
-                           std::size(pcrel_table_vs_typed_x_swizzled), nullptr).empty(),
-          "a non-identity DST_SEL is refused the typed embedded-table fold (#2859)");
+    CHECK(!recompile_vertex(pcrel_table_vs_typed_x_swizzled,
+                            std::size(pcrel_table_vs_typed_x_swizzled), nullptr).empty(),
+          "MTBUF format load ignores descriptor DST_SEL per RDNA2 Table 31, admitting the fold");
 
     // Entry soundness, which the typed case bounds by its OLDEST contributing fact rather than its
     // newest (#2862 covers the untyped and scalar cases, which still use the newest). A branch
@@ -3125,8 +3126,8 @@ int main() {
                             std::size(pcrel_table_vs_typed_x)) == 1,
           "detector: Sonic Frontiers' own tbuffer_load_format_x word is admitted (#2859)");
     CHECK(typed_pcrel_folds(pcrel_table_vs_typed_x_swizzled,
-                            std::size(pcrel_table_vs_typed_x_swizzled)) == 0,
-          "detector: a non-identity DST_SEL is refused (#2859)");
+                            std::size(pcrel_table_vs_typed_x_swizzled)) == 1,
+          "detector: MTBUF ignores descriptor DST_SEL per Table 31");
     CHECK(typed_pcrel_folds(pcrel_table_vs_typed_branch_entry,
                             std::size(pcrel_table_vs_typed_branch_entry)) == 0,
           "detector: a branch entering after the s_getpc is refused (#2862)");

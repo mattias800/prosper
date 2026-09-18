@@ -1408,6 +1408,16 @@ int main(int argc, char** argv) {
             }
             gamesDirFlag = argv[++i];
         }
+        else if (a == "--capture-dir") {                     // where F8/F9 captures are saved
+            if (i + 1 >= argc || !*argv[i + 1]) {
+                fprintf(stderr, "prosper-app: --capture-dir requires a path\n");
+                return 2;
+            }
+            if (!set_environment("PROSPER_CAPTURE_DIR", argv[++i])) {
+                fprintf(stderr, "prosper-app: failed to set PROSPER_CAPTURE_DIR\n");
+                return 2;
+            }
+        }
         else if (a == "--list-games") listGames = true;      // print the library and exit (headless)
         else if (a == "--set-games-dir") {                   // persist and exit
             if (i + 1 >= argc) {
