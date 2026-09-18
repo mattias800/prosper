@@ -59,6 +59,11 @@ int main() {
     CHECK(!rtt_sampled_extent_compatible(1920, 1080, 960, 540, 1, true));
     CHECK(!rtt_sampled_extent_compatible(1216, 684, 960, 540, 2, true));
     CHECK(!rtt_sampled_extent_compatible(1920, 1620, 960, 540, 2, true));
+    // Aliased target reuse with incompatible extent (#3436):
+    CHECK(!rtt_sampled_extent_compatible(1920, 1080, 504, 204, 1, false));
+    CHECK(!rtt_sampled_extent_compatible(1920, 1080, 504, 204, 1, true));
+    CHECK(!rtt_sampled_extent_compatible(1024, 1024, 504, 204, 1, false));
+    CHECK(!rtt_sampled_extent_compatible(512, 256, 132, 36, 1, false));
     CHECK(rtt_direct_import_compatible(false, 1920, 1080, 1920, 1080, 1, false));
     CHECK(rtt_direct_import_compatible(false, 1920, 1080, 960, 540, 2, true));
     CHECK(!rtt_direct_import_compatible(false, 1920, 1080, 960, 540, 2, false));
