@@ -1150,6 +1150,7 @@ struct LiveTargetImageWrite {
     uint64_t gpu_addr = 0;
     uint32_t width = 0, height = 0;
     LiveTargetPixelFormat format = LiveTargetPixelFormat::Rgba8Unorm;
+    std::shared_ptr<const std::vector<uint8_t>> linear_pixels;
     bool valid() const { return gpu_addr && width && height; }
 };
 using LiveTargetImageWrittenFn = std::function<void(const LiveTargetImageWrite& write)>;

@@ -22,10 +22,11 @@ aggregate frame metric was used to make the call. Checked-in capture:
 `assets/screenshots/sonic-frontiers-cyberspace-hud.webp` (direct unmodified `tools/screenshot` frame,
 3840x2160, route arm, stage clock at 00:55.89).
 
-**What is not there is the world.** The 3840x2160 frame is black behind the HUD, because
-**16 of the stage's 32 compute programs never execute** (#2790). See the section below. So the rung is deliberately not
-ticked as a rendered-gameplay milestone: the route reaches gameplay, and a rendering defect stands
-between that and a gameplay screenshot.
+**What is not there is the world (#2790).** The 3840x2160 frame remains black behind the HUD in
+live gameplay because 16 of the stage's 32 compute programs never execute due to recompiler rejects.
+Seeding the renderer color target from compute storage writeback preserves composited compute buffers,
+and the MTBUF descriptor DST_SEL fold works per RDNA2 Table 31, but full 3D world presentation requires
+resolving the remaining 16 skipped compute programs.
 
 ## Compute writeback profile (2026-09-07, #3407)
 
@@ -883,6 +884,8 @@ to remember to update it. The last one did not (review of #2820).
 | `upload_mapping.unmap()` costs the frame | **No.** A dedicated sub-timer on `upload_mapping.unmap()` recorded **zero** records above 0.5 ms across a full run. **The sub-timer's own record count was not retained**, so what this establishes is "no unmap teardown exceeded 0.5 ms in that run", not "the timer fired N times and none exceeded" — the two read identically here. Re-run with the count if you need the stronger form. #3405 |
 | `not_native_exact` publishes starve the FMV planes' cache | **No.** Instrumenting the refused triples shows every refusal is a tiny surface — 956 x `2x2`, 34 x `1x1`, a few `128x32`/`64x64`. None are the 4K planes. The planes are uncached for a different reason: they are renderer-sourced, so `live_compute.cpp:7293` skips the whole guest-source block that would have built a cache key. #3407 |
 | Repeated renderer-publication pointers prove a consumer conversion cache can eliminate 66% of the intro conversions | **Falsified by the implemented cache in WIP commit `c232a2c7e`.** The original 441-conversion/148-pointer census counted allocator address reuse, not shared immutable publications. Holding the publication `shared_ptr` and checking both identities recorded 380 conversions over 181 pointers with **0% cache hits**: `cached-pub[n]` always matched `now-pub[n-1]`, never the current publication, while `content-valid=1`. A consumer pointer cache cannot exploit that workload. This is historical evidence about that WIP, not a current-main import or readback census; remeasure those paths after #3420. #3407 |
+| Seeding renderer color targets from compute storage writeback | **CONFIRMED & LANDED.** In submit 216110, compute[1] writes the scene composite to storage binding 5 (`0x2008180000`, 3840x2160 RGBA8). Because `0x2008180000` had never previously been drawn by graphics, `persistent_color_target_cache()` had no entry, and the guest GPU write drain invalidated any cached seed. Draw 1 (HUD blend) then found no entry in `g_rtt`, causing `render_runner.h` to set `att[0].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR`, clearing the buffer before blending HUD icons. Publishing linear un-tiled pixels from storage image writeback into `g_rtt` allows Draw 1 to seed and set `loadOp = VK_ATTACHMENT_LOAD_OP_LOAD`. In offline submit 216110 replay this moved non-black pixels from 1.13% to 94.04%; in live gameplay the world remains black until the 16 skipped compute passes execute. #2790, #3723 |
+
 
 ### Void, not falsified — do not cite these as settled
 

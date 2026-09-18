@@ -1787,7 +1787,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
     prosper::gpu::set_live_target_image_written_notifier(
         [invalidate_ds](const prosper::gpu::LiveTargetImageWrite& write) {
             auto it = g_rtt.find(write.gpu_addr);
-            if (it == g_rtt.end()) return;
+            if (it == g_rtt.end() && !write.linear_pixels) return;
             // Name the write's format exhaustively. Reporting an unmapped format as RGBA8 does not
             // merely mislabel it: the mirror-identity check below then rejects a target the compute
             // dispatch really did write, the entry stays invalidated by the ordinary guest-write
@@ -1795,7 +1795,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             // whole Syberia black-3D-menu defect, and #773 in a different format.
             const VkFormat format = prosper::frontend::live_target_pixel_format_vk(write.format);
             if (format == VK_FORMAT_UNDEFINED) return;
-            if (!prosper::frontend::live_rtt_mirror_identity_matches(
+            if (it != g_rtt.end() && !write.linear_pixels &&
+                !prosper::frontend::live_rtt_mirror_identity_matches(
                     it->first, it->second.w, it->second.h,
                     static_cast<uint32_t>(
                         prosper::test::backend_color_format(it->second.format)),
@@ -1809,8 +1810,19 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             // invalidation in force and let the next graphics use rebuild from the correct guest bytes.
             drain_guest_gpu_writes(g_rtt, invalidate_ds);
             if (!prosper::test::restore_persistent_color_target_after_mirrored_write(
-                    write.gpu_addr, write.width, write.height, format))
+                    write.gpu_addr, write.width, write.height, format)) {
+                if (write.linear_pixels && !write.linear_pixels->empty()) {
+                    RttSurf& published = g_rtt[write.gpu_addr];
+                    published.rgba = write.linear_pixels;
+                    published.has_uniform_color = false;
+                    published.w = write.width;
+                    published.h = write.height;
+                    published.format = format;
+                    published.guest_format = format;
+                    published.gpu_valid = false;
+                }
                 return;
+            }
             RttSurf& published = g_rtt[write.gpu_addr];
             published.rgba.reset();
             published.has_uniform_color = false;
