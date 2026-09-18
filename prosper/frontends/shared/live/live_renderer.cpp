@@ -3552,8 +3552,14 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             const long v = e ? std::strtol(e, nullptr, 10) : 1;
                             return v > 0 ? static_cast<uint32_t>(v) : 1u;
                         }();
+                        if (live_rtt != g_rtt.end() &&
+                            !prosper::frontend::rtt_sampled_extent_compatible(
+                                tw, th, live_rtt->second.w, live_rtt->second.h, render_scale,
+                                normalized_sampling)) {
+                            live_rtt = g_rtt.end();
+                        }
                         // Deferred RTT readback (#1284): a GPU-resident target consumed in a way the
-                        // GPU bind below cannot serve (extent mismatch or storage image) materializes
+                        // GPU bind below cannot serve (e.g. format mismatch or storage image) materializes
                         // its CPU copy here on demand. Exact 2D attachment feedback is served by the
                         // backend's prior-version GPU snapshot rather than by a synchronous readback.
                         // The producer
@@ -5368,7 +5374,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         // address; failed GPU preflight allocates it at the fallback below.
                         const bool defer_detile_pixels = gpu_detile_shape &&
                             !resource_compute_depth_hybrid && !resource_compute_image_hit &&
-                            g_rtt.find(sampled_source_addr) == g_rtt.end() &&
+                            live_rtt == g_rtt.end() &&
                             !prosper::test::is_retained_ds_plane(r.gpu_addr);
                         const size_t volume_texels = (size_t)tw * th * (is_volume ? r.depth : 1u);
                         fr.texture_format = decoded_texture_format;
@@ -5524,7 +5530,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     (int)fr.is_storage_image, (int)rtt_on, (int)is_volume,
                                     (int)r.in_mip_tail);
                         if (!fr.is_storage_image && rtt_on && !is_volume && !r.in_mip_tail) {
-                            auto rit = g_rtt.find(sampled_source_addr);
+                            auto rit = live_rtt;
                             if (rit != g_rtt.end() && rit->second.w && rit->second.h && rit->second.rgba &&
                                 !rit->second.rgba->empty()) {
                                 const RttSurf& s = rit->second;
@@ -9337,17 +9343,18 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     }
                                     // Exact 2D color feedback is GPU-bindable: the backend copies
                                     // the prior attachment version to a distinct sampled image before
-                                    // the render pass. Storage, dimension, and extent mismatches still
-                                    // require the CPU representation.
+                                    // the render pass. Storage and dimension mismatches still
+                                    // require the CPU representation. An extent mismatch is an alias
+                                    // rather than a consumer of this target.
                                     const bool direct_bindable =
-                                        resource.cls == RC::Texture && sampled_shape &&
-                                        sampled_extent_compatible;
-                                    if (!direct_bindable) {
+                                        resource.cls == RC::Texture && sampled_shape;
+                                    if (!sampled_extent_compatible) {
+                                        result.extent_mismatches++;
+                                    } else if (!direct_bindable) {
                                         result.cpu_needed = true;
                                         result.storage_references +=
                                             resource.cls == RC::StorageImage;
                                         result.dimension_mismatches += !sampled_shape;
-                                        result.extent_mismatches += !sampled_extent_compatible;
                                         result.feedback_references += same_pass_target;
                                         static const uint64_t diagnose_min_submit = [] {
                                             const char* text = PROSPER_ENV_VALUE(
