@@ -56,6 +56,7 @@
 #include <unistd.h>
 #endif
 #include "hle/service/service_trace.hpp"
+#include "hle/service/hle_handles.hpp"
 #ifdef _WIN32
 #include <bcrypt.h>     // BCryptGenRandom (prosper_core already links bcrypt on Windows)
 #endif
@@ -71,7 +72,6 @@ extern "C" uint64_t prosper_call_guest_sysv4(uint64_t fn, uint64_t a0, uint64_t 
                                        uint64_t a3, uint64_t a4, uint64_t a5)
 #define PW(x) ((void*)(uintptr_t)(x))
 
-namespace { std::atomic<uint64_t> g_handle{1}; }
 
 // Diagnostic logging for the Sony service families in this file, gated on PROSPER_SVCLOG=1 (same
 // pattern as PROSPER_FILELOG/[file]). Dumps call args and a bounded hexdump of pointer-shaped args
