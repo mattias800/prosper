@@ -1806,6 +1806,14 @@ struct SpirvCompute {
     uint32_t t_v3f() { if (!t_v3f_cache) { t_v3f_cache = id(); put(types, Op_TypeVector, {t_v3f_cache, t_f32, 3}); } return t_v3f_cache; }
     uint32_t t_v3i_cache = 0;
     uint32_t t_v3i() { if (!t_v3i_cache) { t_v3i_cache = id(); put(types, Op_TypeVector, {t_v3i_cache, t_i32, 3}); } return t_v3i_cache; }
+    // Separate flags on purpose: the sampled path needs Sampled1D ONLY, so a shared flag would
+    // let a sampled 1D image suppress Image1D for a storage 1D image declared afterwards.
+    void declare_cap_sampled1d() {
+        if (!declared_sampled1d) { put(caps, Op_Capability, {Cap_Sampled1D}); declared_sampled1d = true; }
+    }
+    void declare_cap_image1d() {
+        if (!declared_image1d) { put(caps, Op_Capability, {Cap_Image1D}); declared_image1d = true; }
+    }
     static uint32_t sampled_image_key(uint32_t dim, bool is_uint, bool arrayed, bool depth) {
         return dim | (is_uint ? 0x100u : 0u) | (arrayed ? 0x200u : 0u) |
                (depth ? 0x400u : 0u);
@@ -1814,6 +1822,12 @@ struct SpirvCompute {
                                 bool arrayed = false, bool depth = false) {
         const uint32_t key = sampled_image_key(dim, is_uint, arrayed, depth);
         auto it = tex_simg_type.find(key); if (it != tex_simg_type.end()) return it->second;
+        // A SAMPLED Dim=1D image needs Sampled1D just as a storage one does, and this path used
+        // to omit it -- spirv-val: "Operand 3 of TypeImage requires one of these capabilities:
+        // Sampled1D". It stayed invisible while every 1D binding reaching here was refused
+        // upstream; #657 admits Sonic Frontiers' query-only 1D binding, which is what surfaced it.
+        // NOT Image1D: that capability is for a 1D STORAGE image, and this type has Sampled=1.
+        if (dim == Dim_1D) declare_cap_sampled1d();
         uint32_t ti = id(); put(types, Op_TypeImage, {ti, is_uint ? t_u32 : t_f32,
                                                       dim, depth ? 1u : 0u, arrayed ? 1u : 0u,
                                                       0, 1, 0});  // sampled, Sampled=1
@@ -2355,6 +2369,7 @@ struct SpirvCompute {
     std::unordered_map<uint32_t, bool> stg_img_packed_r11; // binding -> R11G11B10 packed in R32ui
     bool declared_read_wo_fmt = false, declared_write_wo_fmt = false,
          declared_storage_extended = false, declared_sampled1d = false,
+         declared_image1d = false,
          declared_ms = false, declared_msarray = false;
     static uint32_t stg_key(uint32_t dim, bool arrayed, bool ms, bool float_texel,
                             uint32_t image_format) {
@@ -2367,10 +2382,9 @@ struct SpirvCompute {
                                bool ms = false, bool float_texel = false,
                                uint32_t image_format = ImgFmt_Unknown,
                                bool packed_r11 = false) {
-        if (dim == Dim_1D && !declared_sampled1d) {   // SPIR-V: Dim=1D needs Sampled1D; storage 1D also needs Image1D
-            put(caps, Op_Capability, {Cap_Sampled1D});
-            put(caps, Op_Capability, {Cap_Image1D});
-            declared_sampled1d = true;
+        if (dim == Dim_1D) {   // SPIR-V: Dim=1D needs Sampled1D; storage 1D also needs Image1D
+            declare_cap_sampled1d();
+            declare_cap_image1d();
         }
         if (ms && !declared_ms) { put(caps, Op_Capability, {Cap_StorageImageMultisample}); declared_ms = true; }
         if (ms && arrayed && !declared_msarray) { put(caps, Op_Capability, {Cap_ImageMSArray}); declared_msarray = true; }
