@@ -349,7 +349,7 @@ def cross_refs(tu, target: pathlib.Path, regions: list[dict]) -> dict[int, dict[
     return {k: dict(v) for k, v in edges.items()}
 
 
-def propose_clusters(regions, edges, parts: int) -> tuple[list[list[int]], dict]:
+def propose_clusters(regions, edges, parts: int, cap_lines: int | None = None) -> tuple[list[list[int]], dict]:
     """Group body regions into PARTS candidate output files, cutting where the references are thin.
 
     Greedy agglomeration over the reference matrix, heaviest edge first, which is what the file's
@@ -360,11 +360,20 @@ def propose_clusters(regions, edges, parts: int) -> tuple[list[list[int]], dict]
     on the same line count means the CAP stopped the merge, not that a seam is there -- so the
     summary marks which boundaries are structural and which are the cap talking. Grouping by NAME
     does not find these: on gpu_executor.cpp a name-prefix pass put 183 of 273 regions in "other".
+
+    CAP AND PART COUNT ARE SEPARATE KNOBS, and conflating them made the tool answer a question
+    nobody asked. Deriving `cap = total // parts` asserts that every output should be the same size,
+    which is true of a balanced partition and false of a SEMANTIC one: `hle_service.cpp` divides
+    along the Sony library each block reimplements, and those libraries are genuinely unequal --
+    libSceAvPlayer is an order of magnitude more code than libScePsml. Asking that file for 12 parts
+    derived a 532-line cap, refused 583 merges the references wanted, and returned 96 groups with
+    39% of references cut: a report about the cap, not about the file. Pass `cap_lines` to say how
+    big an output may get and let the part count fall out of the structure.
     """
     body = {r["index"]: r for r in regions if r["role"] == "body"}
     size = {i: r["end"] - r["start"] + 1 for i, r in body.items()}
     total = sum(size.values())
-    cap = max(1, total // max(1, parts))
+    cap = max(1, cap_lines) if cap_lines else max(1, total // max(1, parts))
 
     w: dict[tuple[int, int], int] = {}
     for a, ds in edges.items():
@@ -435,17 +444,23 @@ def propose_clusters(regions, edges, parts: int) -> tuple[list[list[int]], dict]
     gid = {i: n for n, g in enumerate(out) for i in g}
     cut = sum(n for (a, b), n in w.items() if gid[a] != gid[b])
     stats = {"cut": cut, "total_refs": sum(w.values()), "cap": cap, "capped_merges": capped,
-             "singletons": sum(1 for g in out if len(g) == 1), "asked": parts}
+             "singletons": sum(1 for g in out if len(g) == 1), "asked": parts,
+             "cap_explicit": bool(cap_lines)}
     return out, stats
 
 
-def print_clusters(regions, edges, parts: int) -> None:
+def print_clusters(regions, edges, parts: int, cap_lines: int | None = None) -> None:
     body = {r["index"]: r for r in regions if r["role"] == "body"}
     size = {i: r["end"] - r["start"] + 1 for i, r in body.items()}
-    groups, st = propose_clusters(regions, edges, parts)
+    groups, st = propose_clusters(regions, edges, parts, cap_lines)
     share = st["cut"] / st["total_refs"] if st["total_refs"] else 0.0
-    over = (f" -- you asked for {st['asked']}, and the reference structure plus that size cap do "
-            f"not permit fewer" if len(groups) > st["asked"] else "")
+    if st["cap_explicit"]:
+        over = (f" -- cap {st['cap']}L was given explicitly, so the group COUNT is whatever the "
+                f"structure yields" if len(groups) != st["asked"] else "")
+    else:
+        over = (f" -- you asked for {st['asked']}, and the reference structure plus that size cap do "
+                f"not permit fewer (pass --cap-lines to set the cap independently)"
+                if len(groups) > st["asked"] else "")
     print(f"\n== proposed seams: {len(groups)} group(s), target ~{st['cap']} lines each =={over}")
     print(f"   {st['cut']} of {st['total_refs']} references cross a boundary ({share:.0%}) -- that "
           f"is the promote-to-header list")
@@ -527,6 +542,20 @@ def selftest() -> int:
           f"connected component (got {len(dgroups)} group(s))")
     check(dst["cut"] > 0, "and a 0% cut is not manufactured by merging everything")
 
+    # --cap-lines must OVERRIDE the derived cap, in both directions, on the same fixture. Testing
+    # only the loosening direction would pass for an implementation that ignored the flag whenever
+    # it was smaller than total/parts, which is the half a semantic split needs least.
+    wide, wst = propose_clusters(big, dense, 4, cap_lines=650)
+    check(len(wide) == 1 and wst["cap"] == 650,
+          f"--cap-lines 650 lets the whole 600-line fixture become one group "
+          f"(got {len(wide)} group(s), cap {wst['cap']})")
+    narrow, nst = propose_clusters(big, dense, 1, cap_lines=100)
+    check(len(narrow) == 6 and nst["cap"] == 100,
+          f"--cap-lines 100 keeps six groups even though --clusters 1 would derive a 600-line cap "
+          f"(got {len(narrow)} group(s), cap {nst['cap']})")
+    check(wst["cap_explicit"] and not dst["cap_explicit"],
+          "the report can tell an explicit cap from a derived one")
+
     # A region nothing references has nothing to attach to; it must survive rather than vanish.
     lone, _ = propose_clusters(regions, {1: {2: 5}}, 2)
     seen = [i for g in lone for i in g]
@@ -550,6 +579,11 @@ def main() -> int:
     ap.add_argument("--clusters", nargs="?", type=int, const=6, default=None,
                     metavar="PARTS",
                     help="suggest seams: group regions that reference each other (default 6 parts)")
+    ap.add_argument("--cap-lines", type=int, default=None, metavar="N",
+                    help="largest output a group may reach, INDEPENDENT of --clusters. Without it "
+                         "the cap is total/PARTS, which assumes every output should be the same "
+                         "size -- false for a split along semantic lines, where the parts are "
+                         "genuinely unequal")
     ap.add_argument("--min-lines", type=int, default=0,
                     help="only print regions at least this many lines long")
     args = ap.parse_args()
@@ -603,7 +637,7 @@ def main() -> int:
               f"out={out:<4d} in={inn:<4d} {r['role']:<9s} {r['kind']:<22s} {r['name'][:52]}")
 
     if args.clusters is not None:
-        print_clusters(regions, edges, args.clusters)
+        print_clusters(regions, edges, args.clusters, args.cap_lines)
 
     if args.json:
         # The digest is what lets split_file.py prove the map still describes the file. Without it
