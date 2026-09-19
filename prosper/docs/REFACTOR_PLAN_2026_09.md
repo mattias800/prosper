@@ -169,7 +169,7 @@ shared header), not a size job, and doing that first is what makes them measurab
 - **`src/hle/service/hle_service.cpp` is fifteen Sony libraries in one file**, each with its own
   banner comment: Videodec2, Vdecsw, AvPlayer, Psml, NP, Ime, ImeDialog, AppContent,
   SaveDataDialog, NpTrophy2, PlayGo, SaveData, save-data memory, UserService, mouse. To find
-  `sceAvPlayerStart` today you grep. After, you open `src/hle/media/avplayer.cpp`.
+  `sceAvPlayerStart` today you grep. After, you open `src/hle/video/avplayer.cpp`.
 - **`tests/` is half-classified**: the subsystem subdirectories exist, and 57 files still sit loose
   in `tests/hle`, 26 in `tests/gpu`, 16 in `tests/` itself. `tests/misc/` holds boot, loader,
   present and trap tests that all have homes. `classify_tests.py` proposes a destination for 339 of
@@ -277,9 +277,30 @@ modulo the namespace name; step 3 is where inlining can move, and step 3 is the 
 `split_file.py` applies to all 35 SPLIT files today. Take them in this order, because the first two
 are the ones where the folder structure is wrong rather than merely crowded:
 
-1. **`hle_service.cpp` → `src/hle/media/`, `src/hle/np/`, `src/hle/savedata/`, `src/hle/ime/`** —
-   one file per Sony library, named after the library. With `--cap-lines 1200` the clustering already
-   isolates AvPlayer, Videodec2, SaveData, PlayGo and save-data memory as distinct groups.
+1. **`hle_service.cpp` → one file per Sony library, in the folders that already hold that
+   library's helpers.** This line first read `src/hle/{media,np,savedata,ime}/`, and **three of
+   those four would have duplicated an existing folder** — checked by listing `src/hle/` rather
+   than by guessing:
+
+   | library group | destination | what is already there |
+   | --- | --- | --- |
+   | Videodec2, Vdecsw, Psml, AvPlayer | `src/hle/video/` | `video_backend.*`, `h264_sps.*` |
+   | Ime, IME injection, ImeDialog | `src/hle/input/` | `ime_input.hpp`, `hle_pad.cpp` |
+   | SaveData + transactions + save-data memory + params + dialog | `src/hle/fs/` | `save_param.*`, `save_paths.*` |
+   | NP, Trophy2, entitlement, UDS, Share, NetCtl | `src/hle/np/` | **the one genuinely new folder** |
+   | user service, app content, PlayGo, error dialog, mouse, random | `src/hle/service/` | `hle_addcontent.*`, `platform_ui.*` |
+
+   Recorded because it is the plan's own failure mode in miniature: a restructure proposed from the
+   *names of the things being moved* rather than from the tree it is moving them into invents
+   folders that already exist, and the result is worse than leaving it alone.
+
+   **The split has a measured prerequisite.** `map_symbols.py` reports 1,123 of 4,147 body-region
+   references (27.1%) crossing that partition over 194 symbols — but it is three things and only
+   one is real coupling: 378 crossings are the shared `svc_*` helpers (one `promote_internal.py`
+   run), most of the rest are per-library error constants the line-range partition misfiled, and
+   the NID handlers reached by `register_service_hle` (each library gets its own `register_X()`).
+   Cheapest cut first, measured per group: AvPlayer needs **four** symbols from outside, then
+   Videodec2, Ime, PlayGo, SaveData, NP last. Tracked in #3735.
 2. **`gpu_executor.cpp` (12,399 lines, 329 regions)** → shader cache / compute realization / stage
    table / ordered execution+present / guest-memory probes / diagnostics. `map_symbols --clusters 8`
    reports **447 of 3,128 references crossing (14%)** — that crossing list *is* the
@@ -344,6 +365,10 @@ it is the file most likely to conflict with an active lane.
 * **Splitting files does not, on its own, make functions smaller** — and for `live_renderer.cpp` it
   achieves nothing at all, because 89% of the file is one function. The two jobs need different
   tools and the plan keeps them in different phases.
+* **A restructure planned from symbol names invents folders that already exist.** Three of the four
+  destinations in this plan's first draft (`src/hle/{media,savedata,ime}/`) duplicated
+  `src/hle/{video,fs,input}/`, each of which already held the moved library's own helpers. Ruled out
+  by `ls src/hle/`, which is the check that should precede proposing any destination.
 * **The AST's nesting depth is not brace depth.** `census_bodies.py` counts `COMPOUND_STMT` only; a
   flat 197-line function reports AST depth 21 and brace depth 6. Verified against a textual
   brace-balance count on `linker.cpp:56-252` — both give 6.
