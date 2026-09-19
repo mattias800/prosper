@@ -102,6 +102,11 @@ int main() {
     // persistent texture-image and binding caches are separate and stay at their defaults.
     set_env("PROSPER_NO_BACKEND_PIPELINE_CACHE", "1");
 
+    // The acquisition checks deliberately exercise failure with a warm free list. Pin that
+    // configuration so an inherited diagnostic override cannot silently change the control.
+    set_env("PROSPER_NO_COMMAND_POOL_REUSE", nullptr);
+    set_env("PROSPER_COMMAND_POOL_CACHE", "8");
+
     // Fullscreen-triangle VS from gl_VertexIndex; no resource table. Same words the texture-sample
     // render test uses, so the sampled texel really does land on the centre pixel.
     const uint32_t vs_words[] = {
@@ -170,6 +175,8 @@ int main() {
         // pass is dropped with nothing yet built. The dedicated block after this loop is what
         // checks that "nothing yet built" claim; here it only has to report and drop.
         {RenderVkObjectCreateSite::CommandPool, "command-pool", "vkCreateCommandPool",
+         &opaque,     true,  "queue-family="},
+        {RenderVkObjectCreateSite::CommandBuffer, "command-buffer", "vkAllocateCommandBuffers",
          &opaque,     true,  "queue-family="},
     };
 
@@ -505,81 +512,68 @@ int main() {
               "the None site never fires");
     }
 
-    // ---- #3721: a failed command-pool acquisition costs NOTHING to undo --------------------
-    //
-    // The fix is an ordering claim, not just a null check: `render_draw_pass_rgba` takes its
-    // command pool before it creates anything else, so the failure path is the pass's ordinary
-    // empty result with no teardown of its own. A plain "it returned empty" assertion cannot tell
-    // that apart from a pass that built forty handles and leaked them, so this block measures the
-    // resource traffic instead.
-    //
-    // The positive control is the load-bearing half. "The injected run allocated nothing" is only
-    // evidence if an uninjected run of the SAME render demonstrably allocates something -- against
-    // a counter that never moves, every implementation passes.
+    // ---- #3721: acquisition precedes transient render allocations ---------------------------
+    // The counter below measures requests to the transient memory allocator, including reuse.
+    // It does not count every Vulkan object or prove absence of every possible leak. A control
+    // render must move it before a zero delta on either failure path says anything useful.
     {
         printf("  -- command-pool acquisition is first (#3721) --\n");
-        auto render_once = [&](bool inject, std::vector<uint8_t>* px) {
+        auto render_once = [&](RenderVkObjectCreateSite site, std::vector<uint8_t>* px) {
             prosper::test::BackendDraw d;
             d.vs = vert; d.fs = red_fs; d.ps = &opaque; d.vcount = 3;
-            if (inject)
-                prosper::test::inject_render_vk_object_create_failure_once(
-                    RenderVkObjectCreateSite::CommandPool);
+            if (site != RenderVkObjectCreateSite::None)
+                prosper::test::inject_render_vk_object_create_failure_once(site);
             *px = prosper::test::render_draws_rgba({d}, W, H, nullptr, black);
         };
-        auto mem_traffic = [] {
+        auto transient_requests = [] {
             const auto m = prosper::test::render_memory_pool_stats();
             return m.hits + m.misses;
         };
 
-        // POSITIVE CONTROL: an ordinary render moves the device-memory counter, and releases its
-        // pool EXACTLY ONCE. The second half is what catches a deleted `dismiss()`: the guard and
-        // the completion-gated cleanup would then both release the same lease, pushing one pool
-        // onto the free list twice so two later callers are handed the same one. Nothing else in
-        // this file reds on that mutation.
+        // A successful pass releases exactly once. Removing dismiss() otherwise lets both the
+        // scope guard and completion cleanup retire the same lease into the free list.
         std::vector<uint8_t> px;
         const auto pool_pre_control = prosper::test::render_command_pool_stats();
-        const uint64_t mem_before_control = mem_traffic();
-        render_once(false, &px);
-        const uint64_t control_traffic = mem_traffic() - mem_before_control;
+        const uint64_t requests_before_control = transient_requests();
+        render_once(RenderVkObjectCreateSite::None, &px);
         const auto pool_post_control = prosper::test::render_command_pool_stats();
         const uint64_t control_releases =
             (pool_post_control.retired - pool_pre_control.retired) +
             (pool_post_control.destroyed - pool_pre_control.destroyed);
         CHECK(center_red(px) > 0xC0, "control: an uninjected render still draws");
-        CHECK(control_traffic > 0,
-              "control: an ordinary render DOES allocate device memory (so 0 below means something)");
+        CHECK(transient_requests() > requests_before_control,
+              "control: an ordinary render makes transient allocator requests");
         CHECK(control_releases == 1,
               "control: a successful pass releases its pool exactly once, not twice");
+        CHECK(pool_post_control.cached > 0, "control: the free list is warm before injection");
 
-        // THE ARM. Nothing may be allocated, and the free list must be exactly as it was: a failed
-        // acquisition neither takes an entry out nor puts one in.
-        const auto pool_before = prosper::test::render_command_pool_stats();
-        const uint64_t mem_before = mem_traffic();
-        std::vector<uint8_t> failed_px;
-        render_once(true, &failed_px);
-        const auto pool_after = prosper::test::render_command_pool_stats();
+        for (const auto site : {RenderVkObjectCreateSite::CommandPool,
+                                RenderVkObjectCreateSite::CommandBuffer}) {
+            const auto pool_before = prosper::test::render_command_pool_stats();
+            const uint64_t requests_before = transient_requests();
+            std::vector<uint8_t> failed_px;
+            render_once(site, &failed_px);
+            const auto pool_after = prosper::test::render_command_pool_stats();
 
-        CHECK(failed_px.empty(), "a failed acquisition drops the pass and reports the empty result");
-        CHECK(mem_traffic() == mem_before,
-              "...allocating NO device memory, so there is nothing that could have leaked");
-        CHECK(pool_after.cached == pool_before.cached,
-              "...leaving the free list exactly as it was");
-        CHECK(pool_after.retired == pool_before.retired &&
-              pool_after.destroyed == pool_before.destroyed,
-              "...retiring and destroying nothing");
+            CHECK(failed_px.empty(), "a failed acquisition drops the pass with an empty result");
+            CHECK(transient_requests() == requests_before,
+                  "...before any transient render-memory allocator request");
+            CHECK(pool_after.cached == pool_before.cached &&
+                  pool_after.hits == pool_before.hits && pool_after.misses == pool_before.misses,
+                  "...without consuming an entry from the warm free list");
+            CHECK(pool_after.retired == pool_before.retired,
+                  "...without caching an incomplete lease");
+            const uint64_t expected_destroys = site == RenderVkObjectCreateSite::CommandBuffer ? 1 : 0;
+            CHECK(pool_after.destroyed - pool_before.destroyed == expected_destroys,
+                  "...counting destruction only of a successfully created pool");
 
-        // No assertion for "no null command buffer was used", because none is possible and a
-        // CHECK(true) would only look like one: vkBeginCommandBuffer(VK_NULL_HANDLE) aborts inside
-        // the loader, so unfixed code does not reach any assertion after it -- the process is
-        // gone. What demonstrates it is the MUTATION: removing the guard's check turns this test
-        // into SIGABRT / "Subprocess aborted" under ctest. Under the validation layer (this test is
-        // in the vkval scan's set) the same call is reported rather than merely fatal.
-
-        // One-shot: the next render must be unaffected.
-        std::vector<uint8_t> after_px;
-        render_once(false, &after_px);
-        CHECK(center_red(after_px) > 0xC0,
-              "the injection is one-shot: the next render draws normally");
+            // Removing the null-lease check causes a loader abort before these assertions. The
+            // report assertions above separately exercise each production VkResult failure path.
+            std::vector<uint8_t> after_px;
+            render_once(RenderVkObjectCreateSite::None, &after_px);
+            CHECK(center_red(after_px) > 0xC0,
+                  "the injection is one-shot: the next render draws normally");
+        }
     }
 
     printf(fails ? "FAILED (%d)\n" : "PASSED\n", fails);

@@ -2912,7 +2912,8 @@ inline VkCommandPoolResetFlags render_command_pool_reset_flags() { return 0; }
 // ---------------------------------------------------------------------------------------------
 enum class RenderVkObjectCreateSite : uint32_t {
     None = 0,
-    CommandPool,              // acquire_render_command_pool: the pool AND its one command buffer
+    CommandPool,              // acquire_render_command_pool: vkCreateCommandPool
+    CommandBuffer,            // ...vkAllocateCommandBuffers after pool creation
     RenderPass,               // the pass's own vkCreateRenderPass
     Framebuffer,              // vkCreateFramebuffer over the attachment views
     DepthStencilView,         // the depth/stencil attachment's view
@@ -2926,6 +2927,7 @@ enum class RenderVkObjectCreateSite : uint32_t {
 inline const char* render_vk_object_site_name(RenderVkObjectCreateSite site) {
     switch (site) {
         case RenderVkObjectCreateSite::CommandPool:              return "command-pool";
+        case RenderVkObjectCreateSite::CommandBuffer:            return "command-buffer";
         case RenderVkObjectCreateSite::RenderPass:               return "render-pass";
         case RenderVkObjectCreateSite::Framebuffer:              return "framebuffer";
         case RenderVkObjectCreateSite::DepthStencilView:         return "ds-view";
@@ -2980,9 +2982,11 @@ inline RenderCommandPoolLease acquire_render_command_pool(VkDevice device,
     // injector's own output while the production report went uncovered. Consuming early is still
     // necessary: it has to suppress the reuse path too, or an armed acquisition would take a pool
     // off the warm free list and then throw it away.
-    const bool inject_acquire_failure =
+    const bool inject_pool_failure =
         consume_render_vk_object_create_failure(RenderVkObjectCreateSite::CommandPool);
-    if (!inject_acquire_failure && render_command_pool_reuse_enabled()) {
+    const bool inject_buffer_failure =
+        consume_render_vk_object_create_failure(RenderVkObjectCreateSite::CommandBuffer);
+    if (!inject_pool_failure && !inject_buffer_failure && render_command_pool_reuse_enabled()) {
         RenderCommandPoolCache& cache = render_command_pool_cache();
         std::lock_guard<std::mutex> lock(cache.mutex);
         for (size_t i = cache.available.size(); i-- > 0;) {
@@ -3007,8 +3011,8 @@ inline RenderCommandPoolLease acquire_render_command_pool(VkDevice device,
     info.queueFamilyIndex = queue_family;
     VkCommandPool pool = VK_NULL_HANDLE;
     const VkResult pool_result =
-        inject_acquire_failure ? VK_ERROR_OUT_OF_DEVICE_MEMORY
-                               : vkCreateCommandPool(device, &info, nullptr, &pool);
+        inject_pool_failure ? VK_ERROR_OUT_OF_DEVICE_MEMORY
+                            : vkCreateCommandPool(device, &info, nullptr, &pool);
     if (pool_result != VK_SUCCESS || !pool) {
         // Not destroyed here: a create that did not report success did not give us a handle to
         // destroy, and the rest of this family treats the output as null on failure rather than
@@ -3026,7 +3030,9 @@ inline RenderCommandPoolLease acquire_render_command_pool(VkDevice device,
     alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     alloc.commandBufferCount = 1;
     VkCommandBuffer command = VK_NULL_HANDLE;
-    const VkResult buffer_result = vkAllocateCommandBuffers(device, &alloc, &command);
+    const VkResult buffer_result =
+        inject_buffer_failure ? VK_ERROR_OUT_OF_DEVICE_MEMORY
+                              : vkAllocateCommandBuffers(device, &alloc, &command);
     if (buffer_result != VK_SUCCESS || !command) {
         // The pool is destroyed rather than cached: a lease is the pool AND its buffer together,
         // so a pool without one must never enter the free list.
@@ -3034,9 +3040,12 @@ inline RenderCommandPoolLease acquire_render_command_pool(VkDevice device,
             std::fprintf(stderr,
                          "[render-object-create-failed] site=%s vkAllocateCommandBuffers result=%d "
                          "queue-family=%u -- dropping the pass\n",
-                         render_vk_object_site_name(RenderVkObjectCreateSite::CommandPool),
+                         render_vk_object_site_name(RenderVkObjectCreateSite::CommandBuffer),
                          (int)buffer_result, queue_family);
         vkDestroyCommandPool(device, pool, nullptr);
+        RenderCommandPoolCache& cache = render_command_pool_cache();
+        std::lock_guard<std::mutex> lock(cache.mutex);
+        ++cache.destroyed;
         return {};
     }
     return RenderCommandPoolLease{pool, command};
@@ -3070,9 +3079,7 @@ inline void release_render_command_pool(VkDevice device, uint32_t queue_family,
 // cleanup takes ownership -- this guard covers them by scope exit rather than by one edit per exit
 // that the next person to add one would have to remember.
 //
-// Deliberately no count here. An earlier version of this comment said "sixteen"; three independent
-// counts of it disagreed (16, 13, 12), and the number changes the moment anyone adds an exit --
-// which is the very case the guard exists for. The invariant is what matters and it is checkable:
+// The safety invariant is independent of how many exits the function has:
 // every one of those exits precedes `vkBeginCommandBuffer`, so the guard can never release a pool
 // whose commands have been recorded or submitted.
 //
