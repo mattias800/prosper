@@ -6,13 +6,22 @@ each one does a transformation whose correctness can be *checked*, not merely re
 
 | tool | what it does |
 | --- | --- |
+| `survey_sizes.py` | ranks large FILES by which tool can act on each (SPLIT / EXTRACT / HAND / UNPARSED) |
+| `census_bodies.py` | ranks every FUNCTION, METHOD and CLASS body tree-wide — the measurement `survey_sizes` cannot make |
 | `move_module.py` | relocates modules into folders; rewrites every `#include` to one canonical form and every path citation repo-wide |
 | `map_symbols.py` | tiles a translation unit into top-level regions and computes the reference graph between them |
 | `promote_internal.py` | lifts shared internals out of anonymous namespaces into an internal header |
 | `split_file.py` | splits one translation unit into several along a region partition |
+| `extract_function.py` | drives clangd's `ExtractFunction` over AST-derived statement runs |
 | `classify_tests.py` | proposes a folder for each test from its own includes |
 | `check_include_paths.py` | finds targets that reach a project include they cannot resolve |
-| `survey_sizes.py` | ranks every large file by WHICH of these tools can act on it |
+
+The first two answer different questions and the difference decides which you want. `survey_sizes`
+is **per file**: it names each file's dominant region and stops, which is what you need to choose a
+file to split. `census_bodies` is **per body**: it ranks `register_live_renderer` against `emit_alu`
+against `SpirvCompute` tree-wide, which is what you need to choose a *function* to shrink — and
+`survey_sizes` cannot do it, because one row per file cannot say that the runner-up body in the same
+file is 40 lines.
 
 Run every tool's `--selftest` first; `split_file.py` and `promote_internal.py` run theirs
 automatically before doing anything.

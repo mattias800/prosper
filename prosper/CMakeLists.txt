@@ -205,6 +205,13 @@ if(Python3_Interpreter_FOUND)
   add_test(NAME refactor_survey_classifier
            COMMAND "${Python3_EXECUTABLE}"
                    "${CMAKE_SOURCE_DIR}/tools/refactor/survey_sizes.py" --selftest)
+  # census_bodies ranks FUNCTION and CLASS bodies, which is the measurement survey_sizes cannot
+  # make: survey_sizes names a file's dominant region and stops, so it cannot rank two files' worst
+  # functions against each other. Its arithmetic half (line spans, the lambda-share union, the
+  # verdict thresholds) runs with no libclang; the parse arm is skipped there rather than folded in.
+  add_test(NAME refactor_census_bodies
+           COMMAND "${Python3_EXECUTABLE}"
+                   "${CMAKE_SOURCE_DIR}/tools/refactor/census_bodies.py" --selftest)
   # The measurement fixtures are a SEPARATE case so that a runner without libclang reports them as
   # Skipped rather than folding them into a green Passed. A pass whose domain is smaller than the
   # local one, with nothing in the report saying so, is the hazard this project records for its GPU

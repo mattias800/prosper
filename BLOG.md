@@ -27,6 +27,14 @@ The project owner confirms that GTA V's world renders properly with
 [#3731](https://github.com/mattias800/prosper/pull/3731), and Sonic Frontiers now shows its world too.
 Sonic still has shader failures; this is visible progress, not complete rendering compatibility.
 
+### The renderer has been living in the test directory
+
+No picture — a measurement. `tests/fixtures/render_runner.h` is not a test fixture: it is prosper's
+offscreen Vulkan backend, 12,702 lines of it, and the shipping frontend calls into `prosper::test::`
+185 times. It is also 21.6% of everything this repository parses of its own source. Two more numbers
+from the same pass: three functions hold 11.8% of the emulator, and eighty-two hold 31.1% of it, out
+of 5,684. [The plan](prosper/docs/REFACTOR_PLAN_2026_09.md).
+
 ## 2026-09-17
 
 ### …and now we know which one step is missing
