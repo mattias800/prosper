@@ -370,8 +370,11 @@ void decode_operands(Rdna2Inst& i) {
                 // `v_cvt_u32_f32_sdwa v2, v2 dst_sel:WORD_0 dst_unused:UNUSED_PRESERVE
                 // src0_sel:DWORD` (7e040ef9 00061402) and `v_cvt_u32_f32_sdwa v0, v3
                 // dst_sel:WORD_1 ...` (7e000ef9 00061503), both llvm-mc gfx1030 round-trip
-                // verified. Only the result's signedness differs; the destination-half insert and
-                // the preserved half are the same operation.
+                // verified. Also accepts dst_sel BYTE_0..BYTE_3 (e.g. Sonic Frontiers' Cyber Space
+                // compositing compute shaders: `v_cvt_u32_f32_sdwa v19, v5 dst_sel:BYTE_2
+                // dst_unused:UNUSED_PRESERVE src0_sel:DWORD` 7e260ef9 00061205 and 7e2c0ef9 00061216).
+                // Only the result's signedness differs; the destination sub-dword insert and the
+                // preserved bytes/words are the same operation.
                 //
                 // NOT checked here, deliberately: `sd & 0xff000000` — the SRC1_* fields, which are
                 // meaningless for a one-source VOP1 SDWA word. The 0x38 arm below does refuse a
@@ -385,7 +388,7 @@ void decode_operands(Rdna2Inst& i) {
                 else if (((w >> 9) & 0xFFu) == 0x07u || ((w >> 9) & 0xFFu) == 0x08u) {
                     const uint32_t dsel = (sd >> 8) & 7u, dun = (sd >> 11) & 3u;
                     const uint32_t s0sel = (sd >> 16) & 7u;
-                    if ((dsel == 4u || dsel == 5u) && dun == 2u && s0sel == 6u &&
+                    if (dsel <= 5u && dun == 2u && s0sel == 6u &&
                         !((sd >> 19) & 0x9u) && !i.clamp && !i.omod &&
                         !i.src_neg[0] && !i.src_abs[0]) {
                         i.sdwa_dst_sel = static_cast<uint8_t>(dsel);
