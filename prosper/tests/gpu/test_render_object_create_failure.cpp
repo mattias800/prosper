@@ -531,14 +531,25 @@ int main() {
             return m.hits + m.misses;
         };
 
-        // POSITIVE CONTROL: an ordinary render moves the device-memory counter.
+        // POSITIVE CONTROL: an ordinary render moves the device-memory counter, and releases its
+        // pool EXACTLY ONCE. The second half is what catches a deleted `dismiss()`: the guard and
+        // the completion-gated cleanup would then both release the same lease, pushing one pool
+        // onto the free list twice so two later callers are handed the same one. Nothing else in
+        // this file reds on that mutation.
         std::vector<uint8_t> px;
+        const auto pool_pre_control = prosper::test::render_command_pool_stats();
         const uint64_t mem_before_control = mem_traffic();
         render_once(false, &px);
         const uint64_t control_traffic = mem_traffic() - mem_before_control;
+        const auto pool_post_control = prosper::test::render_command_pool_stats();
+        const uint64_t control_releases =
+            (pool_post_control.retired - pool_pre_control.retired) +
+            (pool_post_control.destroyed - pool_pre_control.destroyed);
         CHECK(center_red(px) > 0xC0, "control: an uninjected render still draws");
         CHECK(control_traffic > 0,
               "control: an ordinary render DOES allocate device memory (so 0 below means something)");
+        CHECK(control_releases == 1,
+              "control: a successful pass releases its pool exactly once, not twice");
 
         // THE ARM. Nothing may be allocated, and the free list must be exactly as it was: a failed
         // acquisition neither takes an entry out nor puts one in.
@@ -557,11 +568,12 @@ int main() {
               pool_after.destroyed == pool_before.destroyed,
               "...retiring and destroying nothing");
 
-        // The process reaching this line is itself the "no null command buffer was used" evidence:
-        // vkBeginCommandBuffer(VK_NULL_HANDLE) aborts in the loader, so unfixed code cannot get
-        // here at all. Under the validation layer it is reported rather than merely fatal, which
-        // is why this test is in the vkval scan's set.
-        CHECK(true, "no null command buffer reached the loader (reaching this line proves it)");
+        // No assertion for "no null command buffer was used", because none is possible and a
+        // CHECK(true) would only look like one: vkBeginCommandBuffer(VK_NULL_HANDLE) aborts inside
+        // the loader, so unfixed code does not reach any assertion after it -- the process is
+        // gone. What demonstrates it is the MUTATION: removing the guard's check turns this test
+        // into SIGABRT / "Subprocess aborted" under ctest. Under the validation layer (this test is
+        // in the vkval scan's set) the same call is reported rather than merely fatal.
 
         // One-shot: the next render must be unaffected.
         std::vector<uint8_t> after_px;

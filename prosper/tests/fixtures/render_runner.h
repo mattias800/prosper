@@ -2972,18 +2972,17 @@ inline RenderCommandPoolLease acquire_render_command_pool(VkDevice device,
     // #3721. Both creates below can fail under device-memory exhaustion or device loss, and no
     // real device refuses an ordinary command pool on demand, so the failure return was
     // unreachable in practice -- which is precisely why its caller walked past it into a null
-    // command buffer. Arming this site makes the next acquisition report failure without calling
-    // the driver. The production path never arms it.
-    if (consume_render_vk_object_create_failure(RenderVkObjectCreateSite::CommandPool)) {
-        if (render_vk_object_create_failure_should_log())
-            std::fprintf(stderr,
-                         "[render-object-create-failed] site=%s vkCreateCommandPool result=%d "
-                         "queue-family=%u -- dropping the pass\n",
-                         render_vk_object_site_name(RenderVkObjectCreateSite::CommandPool),
-                         (int)VK_ERROR_OUT_OF_DEVICE_MEMORY, queue_family);
-        return {};
-    }
-    if (render_command_pool_reuse_enabled()) {
+    // command buffer. The production path never arms this.
+    //
+    // The arming is CONSUMED here but APPLIED below, at the real create, by substituting its
+    // result. Reporting from here instead would be a second copy of the message that no test of
+    // the real path can distinguish from the real one -- the assertions would be checking the
+    // injector's own output while the production report went uncovered. Consuming early is still
+    // necessary: it has to suppress the reuse path too, or an armed acquisition would take a pool
+    // off the warm free list and then throw it away.
+    const bool inject_acquire_failure =
+        consume_render_vk_object_create_failure(RenderVkObjectCreateSite::CommandPool);
+    if (!inject_acquire_failure && render_command_pool_reuse_enabled()) {
         RenderCommandPoolCache& cache = render_command_pool_cache();
         std::lock_guard<std::mutex> lock(cache.mutex);
         for (size_t i = cache.available.size(); i-- > 0;) {
@@ -3007,15 +3006,19 @@ inline RenderCommandPoolLease acquire_render_command_pool(VkDevice device,
     VkCommandPoolCreateInfo info{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     info.queueFamilyIndex = queue_family;
     VkCommandPool pool = VK_NULL_HANDLE;
-    const VkResult pool_result = vkCreateCommandPool(device, &info, nullptr, &pool);
+    const VkResult pool_result =
+        inject_acquire_failure ? VK_ERROR_OUT_OF_DEVICE_MEMORY
+                               : vkCreateCommandPool(device, &info, nullptr, &pool);
     if (pool_result != VK_SUCCESS || !pool) {
+        // Not destroyed here: a create that did not report success did not give us a handle to
+        // destroy, and the rest of this family treats the output as null on failure rather than
+        // passing a maybe-handle to a destroy.
         if (render_vk_object_create_failure_should_log())
             std::fprintf(stderr,
                          "[render-object-create-failed] site=%s vkCreateCommandPool result=%d "
                          "queue-family=%u -- dropping the pass\n",
                          render_vk_object_site_name(RenderVkObjectCreateSite::CommandPool),
                          (int)pool_result, queue_family);
-        if (pool) vkDestroyCommandPool(device, pool, nullptr);
         return {};
     }
     VkCommandBufferAllocateInfo alloc{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
@@ -3062,10 +3065,16 @@ inline void release_render_command_pool(VkDevice device, uint32_t queue_family,
 // `render_draw_pass_rgba` acquires its pool as its FIRST resource, ahead of everything else it
 // builds. That ordering is the fix, not a detail: it means a failed acquisition returns the pass's
 // ordinary empty result with nothing yet created to tear down, instead of needing a second copy of
-// a teardown that currently frees around forty handles. The cost of acquiring early is sixteen
-// further `return out;` exits between the acquisition and the point where the completion-gated
-// cleanup takes ownership -- this guard covers all sixteen by scope exit rather than by sixteen
-// edits that the next person to add an exit would have to remember.
+// a teardown that currently frees around forty handles. The cost of acquiring early is the
+// several `return out;` exits between the acquisition and the point where the completion-gated
+// cleanup takes ownership -- this guard covers them by scope exit rather than by one edit per exit
+// that the next person to add one would have to remember.
+//
+// Deliberately no count here. An earlier version of this comment said "sixteen"; three independent
+// counts of it disagreed (16, 13, 12), and the number changes the moment anyone adds an exit --
+// which is the very case the guard exists for. The invariant is what matters and it is checkable:
+// every one of those exits precedes `vkBeginCommandBuffer`, so the guard can never release a pool
+// whose commands have been recorded or submitted.
 //
 // `dismiss()` hands ownership to that completion-gated cleanup, which is what keeps retirement
 // completion-based: the pool returns to the free list only once the GPU has signalled the pass
