@@ -1295,6 +1295,58 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 rs.sreg_srt.erase(126);
                 return true;
             }
+            if (in.opcode == kSop1OpcodeBitreplicateB64B32) { // 0x3b: s_bitreplicate_b64_b32
+                const uint32_t a = val(in.src[0]);
+                if (!ok) return true;
+                const int dst = in.dst.value;
+                auto replicate_16 = [&](uint32_t in_val) {
+                    uint32_t out_val = b.uconst(0);
+                    for (uint32_t i = 0; i < 16; ++i) {
+                        const uint32_t bit = b.ibin(
+                            Op_BitwiseAnd,
+                            b.ibin(Op_ShiftRightLogical, in_val, b.uconst(i)),
+                            b.uconst(1u));
+                        const uint32_t rep = b.ibin(
+                            Op_BitwiseOr,
+                            b.ibin(Op_ShiftLeftLogical, bit, b.uconst(2u * i)),
+                            b.ibin(Op_ShiftLeftLogical, bit, b.uconst(2u * i + 1u)));
+                        out_val = b.ibin(Op_BitwiseOr, out_val, rep);
+                    }
+                    return out_val;
+                };
+                const uint32_t lo = replicate_16(a);
+                const uint32_t hi = replicate_16(b.ibin(Op_ShiftRightLogical, a, b.uconst(16u)));
+                rs.sreg_written.insert(dst);
+                rs.sreg_written.insert(dst + 1);
+                rs.sreg_srt.erase(dst); rs.sreg_srt.erase(dst + 1);
+                rs.sreg_bool.erase(dst); rs.sreg_bool.erase(dst + 1);
+                rs.sreg_bool_narrowed.erase(dst); rs.sreg_bool_narrowed.erase(dst + 1);
+                rs.sreg_bool_b32.erase(dst); rs.sreg_bool_b32.erase(dst + 1);
+                rs.sreg_entry_m0.erase(dst); rs.sreg_entry_m0.erase(dst + 1);
+
+                const uint32_t lane = b.ibin(Op_BitwiseAnd, b.guest_lane_id(), b.uconst(63u));
+                const uint32_t src_bit_index = b.ibin(Op_ShiftRightLogical, lane, b.uconst(1u));
+                const uint32_t bit = b.ibin(
+                    Op_BitwiseAnd,
+                    b.ibin(Op_ShiftRightLogical, a, src_bit_index),
+                    b.uconst(1u));
+                const uint32_t as_bool = b.ucmp(Op_INotEqual, bit, b.uconst(0u));
+                if (dst == 126 || dst == 127) {
+                    rs.exec = as_bool;
+                    rs.exec_narrowed = true;
+                    rs.sreg.erase(126);
+                    rs.sreg.erase(127);
+                } else if (dst == 106 || dst == 107) {
+                    rs.vcc = as_bool;
+                    rs.sreg[dst] = lo;
+                    rs.sreg[dst + 1] = hi;
+                } else {
+                    rs.sreg[dst] = lo;
+                    rs.sreg[dst + 1] = hi;
+                }
+                // s_bitreplicate_b64_b32 leaves SCC unmodified per ISA.
+                return true;
+            }
             // A 32-bit scalar DATA write into an EXEC half would leave the live per-lane mask
             // (rs.exec) stale — hardware updates EXEC (and EXECZ) immediately. No exercised title
             // writes EXEC halves via b32 scalar ops (wave64 compilers use the b64 forms), so
@@ -1891,12 +1943,12 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         if (it != rs.sreg_bool.end()) return it->second; }
                     if (o.kind == OperandKind::InlineInt)
                         return inline_int_mask_bit(b, o.value);
-                    // A native Wave64 subgroup can project an ordinary scalar pair into the same
-                    // per-invocation Bool representation used for wave masks: select this guest
-                    // lane's 32-bit half, then extract its bit. GTA copies EXEC_LO/HI ballots into
-                    // scalar scratch and intersects that pair with VCC at pc1467. Both halves must
-                    // exist; narrower/unknown subgroup modes remain fail-visible.
-                    if (b.is_compute && b.wave_size == 64 && b.native_subgroup_size == 64 &&
+                    // Project an ordinary scalar pair into the same per-invocation Bool representation
+                    // used for wave masks: select this guest lane's 32-bit half, then extract its bit.
+                    // GTA copies EXEC_LO/HI ballots into scalar scratch and intersects that pair with
+                    // VCC at pc1467; Sonic Frontiers Cyber Space uses s[0:1]={1,1} intersected with VCC.
+                    // Both halves must exist.
+                    if (b.is_compute && b.wave_size == 64 &&
                         (o.kind == OperandKind::SGPR ||
                          (o.kind == OperandKind::Special &&
                           (o.value == 106 || o.value == 107)))) {
@@ -1915,10 +1967,10 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         };
                         uint32_t lo = 0, hi = 0;
                         if (scalar_word(o.value, lo) && scalar_word(o.value + 1, hi)) {
-                            // Invert the ballot with the same subgroup-local index that assigned
-                            // its bits; this needs no LocalInvocationIndex ordering assumption.
-                            const uint32_t lane = b.ibin(
-                                Op_BitwiseAnd, b.subgroup_local_id(), b.uconst(63));
+                            // Invert the ballot with the subgroup-local index if native 64, or guest_lane_id.
+                            const uint32_t lane = b.native_subgroup_size == 64
+                                ? b.ibin(Op_BitwiseAnd, b.subgroup_local_id(), b.uconst(63))
+                                : b.ibin(Op_BitwiseAnd, b.guest_lane_id(), b.uconst(63));
                             const uint32_t word = b.sel(
                                 b.ucmp(Op_UGreaterThanEqual, lane, b.uconst(32)), hi, lo);
                             const uint32_t bit = b.ibin(Op_BitwiseAnd, lane, b.uconst(31));
@@ -3074,19 +3126,29 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 return true;
             }
             // v_cvt_i32_f32_sdwa / v_cvt_u32_f32_sdwa convert the full source, then insert the
-            // selected low/high result word while preserving the other destination word. The
-            // decoder accepts only this exact WORD + UNUSED_PRESERVE + DWORD-source subset. The
-            // two opcodes differ only in the signedness of the 32-bit conversion; the inserted
-            // half is its low 16 bits either way, so they share this lowering.
+            // selected low/high result word or byte while preserving the other destination parts.
+            // The decoder accepts BYTE_0..BYTE_3, WORD_0, WORD_1 + UNUSED_PRESERVE + DWORD-source.
+            // The two opcodes differ only in the signedness of the 32-bit conversion; the inserted
+            // sub-dword is masked and shifted into place, preserving all untouched bytes.
             if ((in.opcode == 0x07 || in.opcode == 0x08) && in.sdwa_dst_sel != 6) {
                 const uint32_t result = in.opcode == 0x07 ? b.cvt_f2u(a) : b.cvt_f2i(a);
-                const uint32_t word = b.ibin(Op_BitwiseAnd, result, b.uconst(0xFFFFu));
-                d = in.sdwa_dst_sel == 5
-                    ? b.ibin(Op_BitwiseOr,
-                             b.ibin(Op_BitwiseAnd, old_d, b.uconst(0x0000FFFFu)),
-                             b.ibin(Op_ShiftLeftLogical, word, b.uconst(16)))
-                    : b.ibin(Op_BitwiseOr,
-                             b.ibin(Op_BitwiseAnd, old_d, b.uconst(0xFFFF0000u)), word);
+                if (in.sdwa_dst_sel <= 3u) {
+                    const uint32_t shift = in.sdwa_dst_sel * 8u;
+                    const uint32_t byte_val = b.ibin(Op_BitwiseAnd, result, b.uconst(0xFFu));
+                    const uint32_t clear_mask = ~(0xFFu << shift);
+                    d = b.ibin(Op_BitwiseOr,
+                               b.ibin(Op_BitwiseAnd, old_d, b.uconst(clear_mask)),
+                               b.ibin(Op_ShiftLeftLogical, byte_val, b.uconst(shift)));
+                } else if (in.sdwa_dst_sel == 5u) {
+                    const uint32_t word = b.ibin(Op_BitwiseAnd, result, b.uconst(0xFFFFu));
+                    d = b.ibin(Op_BitwiseOr,
+                               b.ibin(Op_BitwiseAnd, old_d, b.uconst(0x0000FFFFu)),
+                               b.ibin(Op_ShiftLeftLogical, word, b.uconst(16)));
+                } else {
+                    const uint32_t word = b.ibin(Op_BitwiseAnd, result, b.uconst(0xFFFFu));
+                    d = b.ibin(Op_BitwiseOr,
+                               b.ibin(Op_BitwiseAnd, old_d, b.uconst(0xFFFF0000u)), word);
+                }
                 predicate_write(b, rs, in.dst.value, old_d);
                 return true;
             }
@@ -7824,6 +7886,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // as actually uploaded, consistent with what every sample of it reads.
                 // CONFIDENCE: MED on that case alone -- no title in the corpus is known to issue
                 // one, so it is reasoned rather than measured.
+                else if (in.mimg_dim == 3u) dim = Dim_Cube;
                 else if (in.mimg_dim == 5u) dim = Dim_2D;
                 else { ok = false; return true; }
                 if (res->cls != ResourceClass::Texture) { ok = false; return true; }

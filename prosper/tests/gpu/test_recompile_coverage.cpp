@@ -3193,6 +3193,57 @@ int main() {
               "descriptor must stay identifiable even when the failure is softened");
     }
 
+    {
+        // #2790 / Sonic Frontiers: v_cvt_u32_f32_sdwa with BYTE_0..3 destination selection and UNUSED_PRESERVE.
+        // v_cvt_u32_f32_sdwa v19, v5 dst_sel:BYTE_2 dst_unused:UNUSED_PRESERVE src0_sel:DWORD
+        const uint32_t cvt_sdwa_byte[] = { 0x7e260ef9u, 0x00061205u, 0xbf810000u };
+        const RecompileCoverage cov = recompile_coverage(cvt_sdwa_byte, std::size(cvt_sdwa_byte));
+        CHECK(cov.total == 1 && cov.alu == 1 && cov.unsupported == 0,
+              "#2790: v_cvt_u32_f32_sdwa with dst_sel:BYTE_2 and UNUSED_PRESERVE is supported");
+    }
+
+    {
+        // #2790 / Sonic Frontiers: image_get_resinfo on SQ_RSRC_IMG_CUBE (dim 3)
+        // image_get_resinfo v4, v0, s[4:11] dmask:0x1 dim:SQ_RSRC_IMG_CUBE
+        const uint32_t resinfo_cube[] = { 0xf0380118u, 0x00000404u, 0xbf810000u };
+        const RecompileCoverage cov = recompile_coverage(resinfo_cube, std::size(resinfo_cube));
+        CHECK(cov.total == 1 && cov.table_dependent == 1 && cov.unsupported == 0,
+              "#2790: image_get_resinfo on CUBE is table-dependent rather than unsupported");
+    }
+
+    {
+        // #2790 / Sonic Frontiers: s_bitreplicate_b64_b32 targeting EXEC and SGPR pair.
+        // s_bitreplicate_b64_b32 exec, s0 (dst=126, op=0x3b, src0=s0)
+        const uint32_t bitrep_exec[] = { 0xbefe3b00u, 0xbf810000u };
+        const RecompileCoverage cov_exec = recompile_coverage(bitrep_exec, std::size(bitrep_exec));
+        CHECK(cov_exec.total == 1 && cov_exec.alu == 1 && cov_exec.unsupported == 0,
+              "#2790: s_bitreplicate_b64_b32 targeting exec (126) is supported");
+
+        // s_bitreplicate_b64_b32 s[2:3], s0 (dst=2, op=0x3b, src0=s0)
+        const uint32_t bitrep_sgpr[] = { 0xbe823b00u, 0xbf810000u };
+        const RecompileCoverage cov_sgpr = recompile_coverage(bitrep_sgpr, std::size(bitrep_sgpr));
+        CHECK(cov_sgpr.total == 1 && cov_sgpr.alu == 1 && cov_sgpr.unsupported == 0,
+              "#2790: s_bitreplicate_b64_b32 targeting SGPR pair is supported");
+    }
+
+    {
+        // #2790 / Sonic Frontiers: Wave64 compute scalar pair intersected with VCC via s_and_b64.
+        // s_mov_b32 s0, 1
+        // s_mov_b32 s1, 1
+        // v_cmp_eq_u32 vcc, 0, v2
+        // s_and_b64 vcc, s[0:1], vcc
+        const uint32_t and_b64_scalar_pair[] = {
+            0xbe800381u,
+            0xbe810381u,
+            0x7d840480u,
+            0x87ea6a00u,
+            0xbf810000u,
+        };
+        const RecompileCoverage cov = recompile_coverage(and_b64_scalar_pair, std::size(and_b64_scalar_pair));
+        CHECK(cov.total == 4 && cov.unsupported == 0,
+              "#2790: Wave64 s_and_b64 with scalar pair and VCC is supported in compute");
+    }
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;

@@ -1296,6 +1296,7 @@ inline uint32_t scalar_alu_source_words(const Rdna2Inst& in, uint32_t source) {
     switch (in.fmt) {
         case Rdna2Format::SOP1:
             if (in.opcode == kSop1OpcodeGetpcB64) return UINT32_MAX; // s_getpc has no source
+            if (in.opcode == kSop1OpcodeBitreplicateB64B32) return 1u; // 32-bit source replicated to 64-bit dst
             if (in.opcode == kSop1OpcodeBcnt1I32B64 ||
                 in.opcode == kSop1OpcodeFf1I32B64 ||
                 in.opcode == kSop1OpcodeFlbitI32B64 ||
