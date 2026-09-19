@@ -21,7 +21,7 @@ from the tracker issues, and still gated, because it is a projection of state ra
 
 ## 2026-09-19
 
-### Sonic's last skipped compute dispatches now run, and the picture does not move
+### Two of Sonic's skipped compute dispatches now run, and the picture does not move
 
 No picture — a null, and a useful one. Two Cyber Space dispatches that the compute backend was
 refusing as "layered images" now run, and the replayed frame comes back **byte-identical to before**

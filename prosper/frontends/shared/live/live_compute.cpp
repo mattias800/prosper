@@ -7738,17 +7738,13 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             const bool dim_2d_array = r->img_dim == 5 &&
                                       image_descriptors[i].image_dim == 1u &&
                                       image_descriptors[i].image_arrayed;
-            // A cube T# IS six 2D layers in memory, and the sampled path above already relies on
-            // that -- it lowers one cube to six stacked faces. A shader that declares a 2D-ARRAY
-            // STORAGE image over the same six faces is that identical shape viewed for WRITING, so
-            // it belongs on the established arrayed-2D path rather than in the skip. Sonic
-            // Frontiers' Cyber Space compute `0x200581bb00` is exactly this: guest `dim=3` 32x32x6
-            // against `shader{dim=1 arrayed=1 storage=1}` (#2790, #657).
-            //
-            // Held to exactly six layers on purpose. A cube ARRAY (depth > 6) addresses more than
-            // one cube, and which cube a write targets is the question the sampled path answers
-            // with its own `dim_cube_stacked` contract; nothing here establishes the same for a
-            // store, so those stay skipped and loud.
+            // A cube T# bound as a 2D-ARRAY STORAGE image -- Sonic Frontiers' Cyber Space compute
+            // `0x200581bb00`, guest `dim=3` 32x32x6 against `shader{dim=1 arrayed=1 storage=1}` --
+            // is deliberately NOT admitted here, and stays in the skip. Binding it is the easy
+            // half; the storage WRITEBACK is the half that does not work, because its layered arm
+            // is `backend_uses_2d_array`, which requires `img_dim == 5`. A cube is `img_dim == 3`,
+            // so the dispatch writes six faces and publishes one with no diagnostic -- strictly
+            // worse than this loud refusal. See #3742 for the evidence and what a fix needs.
             // A binding whose every image access is an OpImageQuery* needs its DIMENSIONS
             // reported and none of its texels. The layered shapes this gate otherwise
             // refuses are refused because materialising their CONTENT is unsolved -- tiling,
@@ -9788,9 +9784,17 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         const size_t linear_bytes = static_cast<size_t>(volume_texels) * bpt;
                         prosper::frontend::ScratchBuffer linear;
                         const uint8_t* sampled_source = src;
+                        // This predicate ALLOCATES the buffer the fill branches below write
+                        // into, so it must admit every shape those branches accept. It is written
+                        // to mirror the layered branch's own condition term for term: a shape the
+                        // branch fills but this does not allocate writes through `linear.get()`
+                        // while `linear` was never reset -- a null-pointer write. `native_cube_sampled`
+                        // is here because an UNTILED native cube reaches that branch with
+                        // `r->tile_mode` false and none of the other terms true (#657).
                         const bool remap = r->tile_mode ||
                             (cube_face_as_2d && r->layer_stride_bytes) ||
-                            (dim_2d_array && r->depth > 1);
+                            ((dim_2d_array || dim_cube_stacked || native_cube_sampled) &&
+                             sampled_layers > 1);
                         if (remap) {
                             // This one always takes the zero: the branches below fill a
                             // `sampled_layers`-slice prefix, which is not always the whole
@@ -9967,8 +9971,11 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 ici.flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
             ici.imageType = (dim_1d || query_only_as_1d) ? VK_IMAGE_TYPE_1D : (dim_3d ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D);
             ici.format = image_format;
+            // Both trailing axes are forced for a query-only 1D view: a VK_IMAGE_TYPE_1D image
+            // must have height AND depth of 1, so a 3D guest surface declared 1D by the module
+            // would otherwise build an image that fails VUID-VkImageCreateInfo-imageType-00957.
             ici.extent = {r->width, query_only_as_1d ? 1u : (dim_cube_stacked ? r->height * 6u : r->height),
-                          dim_3d ? bi.texel_depth : 1u};
+                          (!query_only_as_1d && dim_3d) ? bi.texel_depth : 1u};
             ici.mipLevels = bi.mip_levels;
             ici.arrayLayers = bi.array_layers;
             ici.samples = VK_SAMPLE_COUNT_1_BIT;

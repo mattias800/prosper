@@ -253,6 +253,64 @@ int main() {
     plan = plan_storage_image_aliases(empty, table);
     CHECK(plan.valid && plan.groups.empty() && plan.group_for_image.empty());
 
+    // #657: the cube-sampled predicate and the layer count it drives. This is the agreement the
+    // header exists to enforce -- `compute_image_alias_shape` sizes what the live gate admits, and
+    // a term in one and not the other allocates staging for one layer while the decode reads six
+    // (a measured SIGSEGV in storage_pack_float16x4_f16c). Asserted through BOTH entry points so a
+    // change to either alone reddens.
+    {
+        ShaderResource cube;
+        cube.cls = ResourceClass::Texture;
+        cube.img_dim = 3;                 // guest cube T#
+        cube.depth = 6;
+        cube.binding = 0;
+        SpirvDescriptorBinding cube_view{};
+        cube_view.kind = SpirvDescriptorKind::CombinedImageSampler;
+        cube_view.image_dim = 3u;         // module declares OpTypeImage Dim=Cube
+        cube_view.image_arrayed = false;
+        cube_view.image_multisampled = false;
+
+        context = "a cube T# sampled as a declared Cube is the native-cube shape, sized 6 layers";
+        CHECK(prosper::frontend::compute_native_cube_sampled(cube, cube_view));
+        CHECK(prosper::frontend::compute_image_alias_shape(cube, cube_view).array_layers == 6u);
+
+        // Each arm below changes exactly ONE property and must clear the predicate. Without these
+        // the positive arm passes against a predicate that ignores the property entirely.
+        context = "a cube ARRAY (depth 18) is NOT admitted -- which cube a sample resolves to is unestablished";
+        ShaderResource cube_array = cube; cube_array.depth = 18;
+        CHECK(!prosper::frontend::compute_native_cube_sampled(cube_array, cube_view));
+        CHECK(prosper::frontend::compute_image_alias_shape(cube_array, cube_view).array_layers == 1u);
+
+        context = "a STORAGE descriptor over the same cube is NOT admitted -- its writeback publishes one face (#3742)";
+        SpirvDescriptorBinding storage_view = cube_view;
+        storage_view.kind = SpirvDescriptorKind::StorageImage;
+        storage_view.image_dim = 1u; storage_view.image_arrayed = true;
+        CHECK(!prosper::frontend::compute_native_cube_sampled(cube, storage_view));
+        CHECK(prosper::frontend::compute_image_alias_shape(cube, storage_view).array_layers == 1u);
+
+        // This arm exists because the one above does NOT isolate the `kind` term: it also changes
+        // image_dim and image_arrayed, so deleting the StorageImage exclusion leaves it green
+        // (measured). Here `kind` is the ONLY difference from the positive arm.
+        context = "kind alone: a StorageImage descriptor of otherwise identical Cube shape is NOT admitted";
+        SpirvDescriptorBinding storage_cube_shape = cube_view;
+        storage_cube_shape.kind = SpirvDescriptorKind::StorageImage;
+        CHECK(!prosper::frontend::compute_native_cube_sampled(cube, storage_cube_shape));
+        CHECK(prosper::frontend::compute_image_alias_shape(cube, storage_cube_shape).array_layers == 1u);
+
+        context = "a cube declared 2D-arrayed rather than Cube is NOT the native-cube shape";
+        SpirvDescriptorBinding arrayed = cube_view;
+        arrayed.image_dim = 1u; arrayed.image_arrayed = true;
+        CHECK(!prosper::frontend::compute_native_cube_sampled(cube, arrayed));
+
+        context = "a multisampled declaration is NOT the native-cube shape";
+        SpirvDescriptorBinding ms = cube_view; ms.image_multisampled = true;
+        CHECK(!prosper::frontend::compute_native_cube_sampled(cube, ms));
+
+        context = "a non-cube guest resource declared Cube is NOT the native-cube shape";
+        ShaderResource not_cube = cube; not_cube.img_dim = 5;
+        CHECK(!prosper::frontend::compute_native_cube_sampled(not_cube, cube_view));
+    }
+
     std::printf("storage_image_alias_plan: %d failure(s)\n", failures);
     return failures ? 1 : 0;
 }
