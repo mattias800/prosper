@@ -532,7 +532,14 @@ def test_real_tree():
         check("[%s] nothing unclaimed" % platform, sc.unclaimed, [])
         check("[%s] parsed a real number of sites" % platform, len(sc.regs) > 900, True)
         check("[%s] k_attr_noop serves 20" % platform, s.get("k_attr_noop"), 20)
-        check("[%s] s_ok serves 14" % platform, s.get("s_ok"), 14)
+        # s_ok served 14 until libSceNp moved to src/hle/np/np.cpp with its own `s_np_ok` (#3735).
+        # Both halves are pinned, because the number that matters is the SUM: a per-file success
+        # stub is the intended shape, and the two counts drifting apart would mean a NID had moved
+        # between handlers rather than a file having been split.
+        check("[%s] s_ok serves 12" % platform, s.get("s_ok"), 12)
+        check("[%s] s_np_ok serves the other 2" % platform, s.get("s_np_ok"), 2)
+        check("[%s] the two trivial stubs still serve 14 between them" % platform,
+              s.get("s_ok", 0) + s.get("s_np_ok", 0), 14)
         # The five handlers the platform-blind extraction promoted to "shared" (#2070). Each is
         # registered once per `#if` arm of hle_kernel_mem.cpp and answers exactly ONE Sony function.
         for h in ("k_dmem_size", "k_virtual_query", "k_alloc_dmem", "k_mtypeprotect", "k_mprotect"):
