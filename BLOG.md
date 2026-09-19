@@ -19,6 +19,16 @@ from the tracker issues, and still gated, because it is a projection of state ra
 > title's current state — for that, read the tracker. Nothing is ever removed when a title moves on,
 > because the point of a blog is that it records *when* things happened.
 
+## 2026-09-20
+
+### hle_service.cpp was fifteen Sony libraries in one file; now it is five files
+
+No picture — a structural one. To find `sceAvPlayerStart` yesterday you grepped a 6,394-line file.
+Today you open `src/hle/video/avplayer.cpp`. The same for save data, the on-screen keyboard, video
+decode and the NP/online family, each landing in the folder that already held its own helpers.
+**6,394 → 1,470 lines, 77% out**, no behaviour changed: every split was checked by rebuilding the
+original file byte for byte from the pieces. [#3735](https://github.com/mattias800/prosper/issues/3735).
+
 ## 2026-09-19
 
 ### GTA V's world is back; Sonic's world is visible
