@@ -2905,6 +2905,66 @@ inline size_t render_command_pool_cache_limit() {
 // traffic, which is what the profile measures and what a unit test cannot see.
 inline VkCommandPoolResetFlags render_command_pool_reset_flags() { return 0; }
 
+// ---------------------------------------------------------------------------------------------
+// Deterministic one-shot creation-failure injection, shared by every checked create in this file.
+// Declared here rather than beside its first user because `acquire_render_command_pool` below is
+// the earliest site that arms it (#3721).
+// ---------------------------------------------------------------------------------------------
+enum class RenderVkObjectCreateSite : uint32_t {
+    None = 0,
+    RenderPass,               // the pass's own vkCreateRenderPass
+    Framebuffer,              // vkCreateFramebuffer over the attachment views
+    DepthStencilView,         // the depth/stencil attachment's view
+    TextureViewPersistent,    // a sampled-texture view created for the persistent binding cache
+    TextureSamplerPersistent, // ...and its sampler
+    TextureView,              // a sampled/storage view created for a transient binding
+    TextureSampler,           // ...and its sampler (never created for a storage image)
+    ShaderModule,             // any of a draw's VS/GS/FS modules
+};
+
+inline const char* render_vk_object_site_name(RenderVkObjectCreateSite site) {
+    switch (site) {
+        case RenderVkObjectCreateSite::RenderPass:               return "render-pass";
+        case RenderVkObjectCreateSite::Framebuffer:              return "framebuffer";
+        case RenderVkObjectCreateSite::DepthStencilView:         return "ds-view";
+        case RenderVkObjectCreateSite::TextureViewPersistent:    return "texture-view-persistent";
+        case RenderVkObjectCreateSite::TextureSamplerPersistent: return "texture-sampler-persistent";
+        case RenderVkObjectCreateSite::TextureView:              return "texture-view";
+        case RenderVkObjectCreateSite::TextureSampler:           return "texture-sampler";
+        case RenderVkObjectCreateSite::ShaderModule:             return "shader-module";
+        default:                                                 return "none";
+    }
+}
+
+// Deterministic one-shot injection, the same shape and the same reason as the color-target hook
+// above: these are ordinary render passes, framebuffers, 2D views, trilinear samplers and small
+// SPIR-V modules, so no real device can be made to refuse one on demand. Arming a site makes the
+// NEXT create at exactly that site report VK_ERROR_OUT_OF_DEVICE_MEMORY without calling the driver.
+// The production path never arms this state.
+inline RenderVkObjectCreateSite& render_vk_object_create_failure_storage() {
+    static thread_local RenderVkObjectCreateSite armed = RenderVkObjectCreateSite::None;
+    return armed;
+}
+
+inline void inject_render_vk_object_create_failure_once(RenderVkObjectCreateSite site) {
+    render_vk_object_create_failure_storage() = site;
+}
+
+inline bool consume_render_vk_object_create_failure(RenderVkObjectCreateSite site) {
+    RenderVkObjectCreateSite& armed = render_vk_object_create_failure_storage();
+    if (armed != site || site == RenderVkObjectCreateSite::None) return false;
+    armed = RenderVkObjectCreateSite::None;
+    return true;
+}
+
+// One counter for every site in this family, so a device refusing everything cannot flood a run
+// log. Deliberately separate from the color-target counter: exhausting one must not silence the
+// other, since they answer different questions about the same frame.
+inline bool render_vk_object_create_failure_should_log() {
+    static std::atomic<uint32_t> logs{0};
+    return logs.fetch_add(1, std::memory_order_relaxed) < 32;
+}
+
 inline RenderCommandPoolLease acquire_render_command_pool(VkDevice device,
                                                           uint32_t queue_family) {
     if (render_command_pool_reuse_enabled()) {
@@ -3754,60 +3814,6 @@ inline VkResult create_color_target_image(VkDevice dev, const VkImageCreateInfo&
 //
 // The report format matches #3180's: site name, the API, the real VkResult, and enough of the
 // request to tell an out-of-memory apart from a rejected description.
-enum class RenderVkObjectCreateSite : uint32_t {
-    None = 0,
-    RenderPass,               // the pass's own vkCreateRenderPass
-    Framebuffer,              // vkCreateFramebuffer over the attachment views
-    DepthStencilView,         // the depth/stencil attachment's view
-    TextureViewPersistent,    // a sampled-texture view created for the persistent binding cache
-    TextureSamplerPersistent, // ...and its sampler
-    TextureView,              // a sampled/storage view created for a transient binding
-    TextureSampler,           // ...and its sampler (never created for a storage image)
-    ShaderModule,             // any of a draw's VS/GS/FS modules
-};
-
-inline const char* render_vk_object_site_name(RenderVkObjectCreateSite site) {
-    switch (site) {
-        case RenderVkObjectCreateSite::RenderPass:               return "render-pass";
-        case RenderVkObjectCreateSite::Framebuffer:              return "framebuffer";
-        case RenderVkObjectCreateSite::DepthStencilView:         return "ds-view";
-        case RenderVkObjectCreateSite::TextureViewPersistent:    return "texture-view-persistent";
-        case RenderVkObjectCreateSite::TextureSamplerPersistent: return "texture-sampler-persistent";
-        case RenderVkObjectCreateSite::TextureView:              return "texture-view";
-        case RenderVkObjectCreateSite::TextureSampler:           return "texture-sampler";
-        case RenderVkObjectCreateSite::ShaderModule:             return "shader-module";
-        default:                                                 return "none";
-    }
-}
-
-// Deterministic one-shot injection, the same shape and the same reason as the color-target hook
-// above: these are ordinary render passes, framebuffers, 2D views, trilinear samplers and small
-// SPIR-V modules, so no real device can be made to refuse one on demand. Arming a site makes the
-// NEXT create at exactly that site report VK_ERROR_OUT_OF_DEVICE_MEMORY without calling the driver.
-// The production path never arms this state.
-inline RenderVkObjectCreateSite& render_vk_object_create_failure_storage() {
-    static thread_local RenderVkObjectCreateSite armed = RenderVkObjectCreateSite::None;
-    return armed;
-}
-
-inline void inject_render_vk_object_create_failure_once(RenderVkObjectCreateSite site) {
-    render_vk_object_create_failure_storage() = site;
-}
-
-inline bool consume_render_vk_object_create_failure(RenderVkObjectCreateSite site) {
-    RenderVkObjectCreateSite& armed = render_vk_object_create_failure_storage();
-    if (armed != site || site == RenderVkObjectCreateSite::None) return false;
-    armed = RenderVkObjectCreateSite::None;
-    return true;
-}
-
-// One counter for every site in this family, so a device refusing everything cannot flood a run
-// log. Deliberately separate from the color-target counter: exhausting one must not silence the
-// other, since they answer different questions about the same frame.
-inline bool render_vk_object_create_failure_should_log() {
-    static std::atomic<uint32_t> logs{0};
-    return logs.fetch_add(1, std::memory_order_relaxed) < 32;
-}
 
 // Every helper below forces its output handle to VK_NULL_HANDLE on entry and again on failure, and
 // returns a non-VK_SUCCESS code whenever the handle is not usable. VK_ERROR_INITIALIZATION_FAILED
