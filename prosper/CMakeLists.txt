@@ -2051,6 +2051,12 @@ if(TARGET prosper_core)
   target_link_libraries(test_image_descriptor_class_lookup PRIVATE prosper_core)
   add_test(NAME image_descriptor_class_lookup COMMAND test_image_descriptor_class_lookup)
 
+  # #657: query-only descriptors. The negative control (one added sample instruction) is what makes
+  # the positive arm mean anything, so both live in one binary.
+  add_executable(test_query_only_binding tests/gpu/test_query_only_binding.cpp)
+  target_link_libraries(test_query_only_binding PRIVATE prosper_core)
+  add_test(NAME query_only_binding COMMAND test_query_only_binding)
+
   # Bounded graphics-shader cache: cached modules must match the direct recompiler byte-for-byte.
   # The trip-bound OPERATION scope (#3714): one sampled selector value shared by the shader-cache
   # key and the compilation it names. Needs no GPU and no fixture -- it asserts agreement between

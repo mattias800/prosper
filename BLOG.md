@@ -31,6 +31,13 @@ original file byte for byte from the pieces. [#3735](https://github.com/mattias8
 
 ## 2026-09-19
 
+### Two of Sonic's skipped compute dispatches now run, and the picture does not move
+
+No picture — a null, and a useful one. Two Cyber Space dispatches that the compute backend was
+refusing as "layered images" now run, and the replayed frame comes back **byte-identical to before**
+across all 46 outputs. So whatever is still missing from that world, it is not these dispatches. [#657](https://github.com/mattias800/prosper/issues/657),
+[#2790](https://github.com/mattias800/prosper/issues/2790).
+
 ### GTA V's world is back; Sonic's world is visible
 
 The project owner confirms that GTA V's world renders properly with

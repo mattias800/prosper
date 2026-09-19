@@ -9,6 +9,30 @@
 
 namespace prosper::frontend {
 
+// A cube T# sampled through a module-declared `OpTypeImage Dim=Cube`: the view is a real
+// VK_IMAGE_VIEW_TYPE_CUBE over a CUBE_COMPATIBLE image (#657, #2790).
+//
+// Declared HERE, beside the sizing it feeds, and used by the admission gate in live_compute.cpp
+// rather than restated there. The two must agree: admitting a shape the sizing does not know about
+// allocates staging for one layer and then packs `width * height * depth` texels out of it. That is
+// a SIGSEGV in storage_pack_float16x4_f16c, which is how this pairing was found.
+//
+// Exactly six layers. A cube ARRAY (depth > 6) addresses more than one cube, and which cube a
+// sample resolves to is not established by anything here -- those stay skipped and loud.
+//
+// There is deliberately NO companion predicate for a cube bound as 2D-ARRAY STORAGE. That shape is
+// admissible on the binding side, but the storage WRITEBACK cannot publish it: its layered arm is
+// `backend_uses_2d_array`, which requires `img_dim == 5`, so a cube would write six faces and
+// publish one -- silently partial where the skip is loud. See #3742.
+inline bool compute_native_cube_sampled(
+    const prosper::gpu::ShaderResource& resource,
+    const prosper::gpu::SpirvDescriptorBinding& descriptor) {
+    return resource.img_dim == 3 &&
+           descriptor.kind != prosper::gpu::SpirvDescriptorKind::StorageImage &&
+           descriptor.image_dim == 3u && !descriptor.image_arrayed &&
+           !descriptor.image_multisampled && resource.depth == 6u;
+}
+
 // Metadata only: this is the shape used by live compute before allocating an image. Validation
 // still belongs to the materializer; an invalid descriptor must not become valid by joining a group.
 inline prosper::gpu::ComputeImageViewShape compute_image_alias_shape(
@@ -17,7 +41,8 @@ inline prosper::gpu::ComputeImageViewShape compute_image_alias_shape(
     return {
         descriptor.kind == prosper::gpu::SpirvDescriptorKind::StorageImage,
         resource.img_dim == 2 ? resource.depth : 1u,
-        resource.img_dim == 5 && descriptor.image_dim == 1u && descriptor.image_arrayed
+        (resource.img_dim == 5 && descriptor.image_dim == 1u && descriptor.image_arrayed) ||
+                compute_native_cube_sampled(resource, descriptor)
             ? resource.depth : 1u,
     };
 }

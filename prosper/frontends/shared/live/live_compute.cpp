@@ -1109,6 +1109,15 @@ struct ComputeImageCacheKey {
     // one-level image to a binding whose module fetches level three is not a miss but a fault.
     // Appended LAST so `storage_image_cache_key`'s positional aggregate init keeps its meaning.
     uint32_t mip_levels = 1;
+    // #657: a VK_IMAGE_VIEW_TYPE_CUBE view is only legal over an image created CUBE_COMPATIBLE, and
+    // that flag is fixed at creation. Two T#s over the same allocation can agree on every field
+    // above while one needs a cube view and the other does not, so handing the non-compatible image
+    // to the cube binding is a FAULT, not a hit -- exactly the #3048 argument for `mip_levels`.
+    // Measured: Sonic Frontiers' Cyber Space prefilter writes the cube through storage bindings and
+    // a later dispatch samples it as `OpTypeImage Dim=Cube`; the reader found the writer's cached
+    // image and its view failed VUID-VkImageViewCreateInfo-image-01003.
+    // Appended LAST for the same positional-init reason.
+    bool cube_compatible = false;
 
     bool operator==(const ComputeImageCacheKey& other) const = default;
 };
@@ -1127,7 +1136,7 @@ struct ComputeImageCacheKeyHash {
         mix(key.mip_tail_offset); mix(key.mip_tail_bytes);
         mix(key.mip_tail_x); mix(key.mip_tail_y); mix(key.vk_format);
         mix(key.storage); mix(key.in_mip_tail); mix(key.srgb); mix(key.depth_compare);
-        mix(key.mip_levels);
+        mix(key.mip_levels); mix(key.cube_compatible);
         return result;
     }
 };
@@ -1135,7 +1144,8 @@ struct ComputeImageCacheKeyHash {
 ComputeImageCacheKey storage_image_cache_key(const prosper::gpu::ShaderResource& resource,
                                               uint32_t guest_bytes,
                                               VkFormat native_format,
-                                              uint32_t mip_levels = 1) {
+                                              uint32_t mip_levels = 1,
+                                              bool cube_compatible = false) {
     return {
         resource.gpu_addr, reinterpret_cast<uintptr_t>(resource.host_data),
         guest_bytes, resource.size,
@@ -1147,7 +1157,7 @@ ComputeImageCacheKey storage_image_cache_key(const prosper::gpu::ShaderResource&
         resource.mip_tail_offset, resource.mip_tail_bytes,
         resource.mip_tail_x, resource.mip_tail_y,
         static_cast<uint32_t>(native_format), true, resource.in_mip_tail,
-        resource.srgb, resource.depth_compare, mip_levels};
+        resource.srgb, resource.depth_compare, mip_levels, cube_compatible};
 }
 
 // Which fields two same-address cache keys disagree on, as a bitmask over ComputeImageKeyField.
@@ -1187,6 +1197,7 @@ uint32_t compute_image_key_field_diff_mask(const ComputeImageCacheKey& a,
     note(Field::Srgb, a.srgb != b.srgb);
     note(Field::DepthCompare, a.depth_compare != b.depth_compare);
     note(Field::MipLevels, a.mip_levels != b.mip_levels);
+    note(Field::CubeCompatible, a.cube_compatible != b.cube_compatible);
     return mask;
 }
 
@@ -3996,6 +4007,11 @@ struct BoundImage {
     uint32_t mip_levels = 1;
     std::vector<VkDeviceSize> mip_staging_offsets;
     bool arrayed_2d = false;            // SPIR-V requires a real 2D-array view (not base-slice fallback)
+    // Every image access to this binding is an OpImageQuery*: it needs a correctly SHAPED image
+    // to answer the query and no texels at all. Uploading them is not merely wasted work -- the
+    // staging is sized for the guest surface while the image is the declared query shape, which
+    // is VUID-vkCmdCopyBufferToImage-imageSubresource-07972, measured (#657).
+    bool query_only_shape = false;
     bool stacked_cube = false;          // cube lowering addresses six faces as one w x 6h 2D image
     bool depth_view = false;             // reflected SPIR-V uses a true depth image/sampler contract
     VkImage image = VK_NULL_HANDLE;
@@ -7722,7 +7738,38 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             const bool dim_2d_array = r->img_dim == 5 &&
                                       image_descriptors[i].image_dim == 1u &&
                                       image_descriptors[i].image_arrayed;
+            // A cube T# bound as a 2D-ARRAY STORAGE image -- Sonic Frontiers' Cyber Space compute
+            // `0x200581bb00`, guest `dim=3` 32x32x6 against `shader{dim=1 arrayed=1 storage=1}` --
+            // is deliberately NOT admitted here, and stays in the skip. Binding it is the easy
+            // half; the storage WRITEBACK is the half that does not work, because its layered arm
+            // is `backend_uses_2d_array`, which requires `img_dim == 5`. A cube is `img_dim == 3`,
+            // so the dispatch writes six faces and publishes one with no diagnostic -- strictly
+            // worse than this loud refusal. See #3742 for the evidence and what a fix needs.
+            // A binding whose every image access is an OpImageQuery* needs its DIMENSIONS
+            // reported and none of its texels. The layered shapes this gate otherwise
+            // refuses are refused because materialising their CONTENT is unsolved -- tiling,
+            // layer stride, format conversion, upload. None of that applies when nothing
+            // reads a texel, so a query-only binding may be admitted on its declared shape.
+            // Sonic Frontiers' 0x2005a11600 binding 53 is a 64x64x18 cube array used only by
+            // OpImageQuerySizeLod/OpImageQueryLevels (#657, #2790).
+            const bool query_only = image_descriptors[i].query_only && !bi.storage;
+            // The query is typed against the module's DECLARED image, so that is the shape the
+            // view must have -- a mismatch is VUID-vkCmdDispatch-viewType-07752, measured. The
+            // guest extent is still what the query must ANSWER; only the dimensionality follows
+            // the declaration, and no texels are uploaded either way.
+            // ONLY the 1D declaration is admitted, and the gate below keys on THIS, not on
+            // `query_only`. Everything downstream -- the image type, the extent, the view type,
+            // the suppressed upload -- is written for a 1D view; a query-only binding declared
+            // Cube or 2D-arrayed would be admitted by a broader gate and then fall through to
+            // VK_IMAGE_VIEW_TYPE_2D, which is VUID-vkCmdDispatch-viewType-07752. Widening this
+            // means teaching the view/extent selection the other shapes first.
+            const bool query_only_as_1d =
+                query_only && image_descriptors[i].image_dim == 0u &&
+                !image_descriptors[i].image_arrayed;
+            const bool native_cube_sampled =
+                prosper::frontend::compute_native_cube_sampled(*r, image_descriptors[i]);
             bi.arrayed_2d = dim_2d_array;
+            bi.query_only_shape = query_only_as_1d;
             // The recompiler's established cube lowering converts AMD's cube-processed
             // [x, y, face] coordinates to a plain 2D sample over six vertically stacked faces.
             // Compute must expose the same w x 6h image contract as live_renderer. Astro Bot's
@@ -7743,11 +7790,13 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // Reflection distinguishes that fallback from a shader which retains the layer coordinate.
             const bool dim_2d_single = r->img_dim == 5 && ordinary_2d_view;
             if (!dim_1d && r->img_dim != 1 && !dim_3d && !dim_2d_array &&
-                !dim_2d_single && !dim_cube_stacked && !cube_face_as_2d) {
+                !dim_2d_single && !dim_cube_stacked && !cube_face_as_2d &&
+                !native_cube_sampled && !query_only_as_1d) {
                 skip_image(r, "layered image deferred to #657"); break;
             }
             if (dim_1d && r->height != 1) { skip_image(r, "1D image has non-unit height"); break; }
-            if (!r->depth || (!dim_3d && !dim_2d_array && !dim_cube_stacked && r->depth != 1)) {
+            if (!r->depth || (!dim_3d && !dim_2d_array && !dim_cube_stacked &&
+                              !native_cube_sampled && !query_only_as_1d && r->depth != 1)) {
                 if (!cube_face_as_2d) {
                     skip_image(r, "image depth does not match its dimensionality"); break;
                 }
@@ -8306,8 +8355,14 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 break;
             }
             if (bi.alias_of != SIZE_MAX) continue;
+            // native_cube_sampled counts its six faces here too. Omitting it sizes staging for
+            // ONE layer while the decode packs width*height*depth texels out of it -- measured as
+            // a SIGSEGV in storage_pack_float16x4_f16c before this term existed. Every guest-need
+            // and decode branch below carries the SAME term for the same reason; a term present
+            // here and missing there validates one slice and then reads six.
             const uint32_t sampled_layers = dim_cube_stacked ? 6u
-                                            : dim_2d_array ? r->depth : 1u;
+                                            : (dim_2d_array || native_cube_sampled)
+                                                ? r->depth : 1u;
             const VkDeviceSize volume_texels = static_cast<VkDeviceSize>(r->width) * r->height *
                                                (dim_3d ? r->depth : sampled_layers);
             const uint32_t sampled_components = r->num_components ? r->num_components : 1;
@@ -8569,7 +8624,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                             skip_image(r, "sampled cube-face backing size overflows"); break;
                         }
                         sampled_guest_need = level_offset + selected_slice;
-                    } else if ((dim_2d_array || dim_cube_stacked) && sampled_layers > 1) {
+                    } else if ((dim_2d_array || dim_cube_stacked || native_cube_sampled) && sampled_layers > 1) {
                         const size_t selected_slice = r->in_mip_tail
                             ? r->mip_tail_bytes : slice;
                         const size_t layer_stride = r->layer_stride_bytes
@@ -8613,7 +8668,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     } else if (r->tile_mode && dim_3d && r->depth > 1) {
                         sampled_guest_need = tiled_volume_bytes(
                             r->width, r->height, r->depth, r->tile_mode, bpt);
-                    } else if ((dim_2d_array || dim_cube_stacked) && sampled_layers > 1) {
+                    } else if ((dim_2d_array || dim_cube_stacked || native_cube_sampled) && sampled_layers > 1) {
                         const size_t slice = r->in_mip_tail
                             ? r->mip_tail_bytes
                             : (r->tile_mode
@@ -8845,7 +8900,12 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         r->mip_tail_offset, r->mip_tail_bytes,
                         r->mip_tail_x, r->mip_tail_y,
                         static_cast<uint32_t>(image_format), bi.storage, r->in_mip_tail,
-                        r->srgb, r->depth_compare, bi.mip_levels};
+                        r->srgb, r->depth_compare, bi.mip_levels,
+                        // #657: see the field's comment. A binding that takes a CUBE view must not
+                        // be handed a cached image created without CUBE_COMPATIBLE; the flag is
+                        // fixed at creation, so that is a fault, not a hit. This is the SAMPLED
+                        // key -- the storage key below carries the same term.
+                        native_cube_sampled};
                     // An ordinary native typed 2D image or native typed 3D volume is byte- and
                     // format-identical to the sampled upload that follows it. Borrow that retained
                     // result only as a TRANSFER source: the sampled cache remains a separate image so
@@ -9096,8 +9156,17 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 // Build the same exact identity used by ordinary admission before choosing either
                 // path.  A compressed target may become eligible only after successful writeback;
                 // deriving a second, looser key there could replace an unrelated cached image.
+                // #657: `native_cube_sampled` is a SAMPLED predicate, so it is constant false on
+                // this storage arm and the term is written out deliberately rather than omitted --
+                // the key is positional, and a reader comparing the two call sites should see the
+                // same argument list. The term does real work only on the sampled key above, where
+                // a cached image created without CUBE_COMPATIBLE must MISS rather than be handed
+                // to a cube view (the flag is fixed at creation, so that is a fault, not a hit).
+                // An earlier head of this PR also admitted a cube bound as 2D-array STORAGE, which
+                // would have made this term live here; that shape is withdrawn (#3742).
                 bi.cache_key = storage_image_cache_key(
-                    *r, static_cast<uint32_t>(guest_bytes), image_format);
+                    *r, static_cast<uint32_t>(guest_bytes), image_format, 1u,
+                    native_cube_sampled);
                 bi.cache_candidate =
                     compute_storage_cache_gate_candidate(storage_cache_gates);
                 // Renderer ownership still excludes INPUT reuse. Once ordinary writeback has
@@ -9719,9 +9788,17 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         const size_t linear_bytes = static_cast<size_t>(volume_texels) * bpt;
                         prosper::frontend::ScratchBuffer linear;
                         const uint8_t* sampled_source = src;
+                        // This predicate ALLOCATES the buffer the fill branches below write
+                        // into, so it must admit every shape those branches accept. It is written
+                        // to mirror the layered branch's own condition term for term: a shape the
+                        // branch fills but this does not allocate writes through `linear.get()`
+                        // while `linear` was never reset -- a null-pointer write. `native_cube_sampled`
+                        // is here because an UNTILED native cube reaches that branch with
+                        // `r->tile_mode` false and none of the other terms true (#657).
                         const bool remap = r->tile_mode ||
                             (cube_face_as_2d && r->layer_stride_bytes) ||
-                            (dim_2d_array && r->depth > 1);
+                            ((dim_2d_array || dim_cube_stacked || native_cube_sampled) &&
+                             sampled_layers > 1);
                         if (remap) {
                             // This one always takes the zero: the branches below fill a
                             // `sampled_layers`-slice prefix, which is not always the whole
@@ -9760,7 +9837,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                                r->tile_mode, bpt)) {
                                 skip_image(r, "sampled volume detile failed"); break;
                             }
-                        } else if ((dim_2d_array || dim_cube_stacked) && sampled_layers > 1) {
+                        } else if ((dim_2d_array || dim_cube_stacked || native_cube_sampled) && sampled_layers > 1) {
                             const size_t selected_slice = r->in_mip_tail
                                 ? r->mip_tail_bytes
                                 : (r->tile_mode
@@ -9889,10 +9966,40 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 ici.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
             if (bi.storage && bi.packed_r11_storage && bi.graphics_sampled_usage)
                 ici.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
-            ici.imageType = dim_1d ? VK_IMAGE_TYPE_1D : (dim_3d ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D);
+            // Vulkan permits the flag only on a square 2D image with at least six layers; the
+            // stacked-cube lowering (height x6, one layer) is not such a shape and fails
+            // VUID-VkImageCreateInfo-flags-08866.
+            const bool cube_capable_shape = !dim_3d && !dim_cube_stacked &&
+                                            r->width == r->height && bi.array_layers == 6u;
+            // These two conditions MUST agree, and that is the whole point of this block. The view
+            // below is chosen on `native_cube_sampled` alone, so a cube-declared binding whose
+            // image is not cube-capable would take a VK_IMAGE_VIEW_TYPE_CUBE view over an image
+            // created without the flag -- which is exactly VUID-VkImageViewCreateInfo-image-01003,
+            // the failure this PR's cache-key work exists to prevent, reintroduced at the other
+            // end. A non-square cube T# is the reachable case.
+            //
+            // It declines rather than silently falling back to a 2D or 2D_ARRAY view: nothing here
+            // establishes what a cube-declared sample means over a non-square surface, and a
+            // fallback view would answer it by accident. Loud, per the charter's fail-visible rule.
+            if (native_cube_sampled && !cube_capable_shape) {
+                skip_image(r, "cube-declared sampled binding whose image cannot be "
+                              "CUBE_COMPATIBLE (non-square, wrong layer count, or stacked)");
+                break;
+            }
+            if (native_cube_sampled)
+                ici.flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+            ici.imageType = (dim_1d || query_only_as_1d) ? VK_IMAGE_TYPE_1D : (dim_3d ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D);
             ici.format = image_format;
-            ici.extent = {r->width, dim_cube_stacked ? r->height * 6u : r->height,
-                          dim_3d ? bi.texel_depth : 1u};
+            // Both trailing axes are forced for a query-only 1D view. The Vulkan rule, quoted from
+            // the validation layer's own text: "If imageType is VK_IMAGE_TYPE_1D, both
+            // extent.height and extent.depth must be 1". A 3D guest surface declared 1D by the
+            // module would otherwise build an image that violates it.
+            //
+            // Deliberately no VUID number here: two reviews of this line cited two different ones
+            // (00956 / 00957) and neither was checked against the registry, which is not on this
+            // machine. The rule text IS verifiable in the layer binary, so that is what is cited.
+            ici.extent = {r->width, query_only_as_1d ? 1u : (dim_cube_stacked ? r->height * 6u : r->height),
+                          (!query_only_as_1d && dim_3d) ? bi.texel_depth : 1u};
             ici.mipLevels = bi.mip_levels;
             ici.arrayLayers = bi.array_layers;
             ici.samples = VK_SAMPLE_COUNT_1_BIT;
@@ -9923,8 +10030,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 ComputeClock::now() - image_allocation_start).count();
             VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
             vci.image = bi.image;
-            vci.viewType = dim_1d ? VK_IMAGE_VIEW_TYPE_1D
+            vci.viewType = (dim_1d || query_only_as_1d) ? VK_IMAGE_VIEW_TYPE_1D
                                   : (dim_3d ? VK_IMAGE_VIEW_TYPE_3D
+                                     : native_cube_sampled ? VK_IMAGE_VIEW_TYPE_CUBE
                                      : dim_2d_array ? VK_IMAGE_VIEW_TYPE_2D_ARRAY
                                                     : VK_IMAGE_VIEW_TYPE_2D);
             vci.format = ici.format;
@@ -11022,9 +11130,12 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 target_copy.imageSubresource = {
                     VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
                 target_copy.imageExtent = {r->width, r->height, 1};
-                vkCmdCopyBufferToImage(command, staging[i], bi.image,
-                                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                                       1, &target_copy);
+                // No texels for a query-only binding -- see BoundImage::query_only_shape.
+                if (!bi.query_only_shape) {
+                    vkCmdCopyBufferToImage(command, staging[i], bi.image,
+                                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                           1, &target_copy);
+                }
 
                 VkImageMemoryBarrier ready[2]{source_to_copy, target_to_copy};
                 ready[0].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
@@ -11214,9 +11325,13 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     : VkExtent3D{r->width, bi.stacked_cube ? r->height * 6u : r->height,
                                  bi.array_layers > 1 ? 1u : bi.texel_depth};
             }
-            vkCmdCopyBufferToImage(command, staging[i], bi.image,
-                                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                                   static_cast<uint32_t>(mip_regions.size()), mip_regions.data());
+            // No texels for a query-only binding -- see BoundImage::query_only_shape.
+            if (!bi.query_only_shape) {
+                vkCmdCopyBufferToImage(command, staging[i], bi.image,
+                                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                       static_cast<uint32_t>(mip_regions.size()),
+                                       mip_regions.data());
+            }
             VkImageMemoryBarrier to_general = to_dst;
             to_general.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
             to_general.dstAccessMask = VK_ACCESS_SHADER_READ_BIT |
@@ -12650,7 +12765,26 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         phase_writeback = ComputeClock::now();
     } while (false);
 
-    if (trace)
+    if (trace) {
+        // #2790: dump this dispatch's SPIR-V when asked, INCLUDING when it failed. The existing
+        // PROSPER_DUMP_COMPUTE_SPIRV path only writes modules that reach VkShaderModule creation,
+        // and gpu_replay's --dump-compute rejects --bundle, so a dispatch that is refused at image
+        // binding leaves nothing to read -- which is exactly the dispatch anyone needs to inspect.
+        if (const char* dump_dir = std::getenv("PROSPER_DUMP_DISPATCH_SPIRV")) {
+            if (*dump_dir && !spirv.empty()) {
+                char path[512];
+                std::snprintf(path, sizeof path, "%s/dispatch_0x%llx_%016llx.spv", dump_dir,
+                              (unsigned long long)item.code_addr,
+                              (unsigned long long)gpu_capture_hash(
+                                  reinterpret_cast<const uint8_t*>(spirv.data()),
+                                  spirv.size() * sizeof(uint32_t)));
+                if (FILE* f = std::fopen(path, "wb")) {
+                    std::fwrite(spirv.data(), sizeof(uint32_t), spirv.size(), f);
+                    std::fclose(f);
+                    std::fprintf(stderr, "[compute]   dispatch SPIR-V -> %s\n", path);
+                }
+            }
+        }
         std::fprintf(stderr, "[compute] execute submit=%llu dispatch=%llu code=0x%llx "
                      "threads=%ux%ux%u local=%ux%ux%u groups=%ux%ux%u "
                      "buffers=%zu images=%zu spirv=%zu/%016llx result=%s\n",
@@ -12663,6 +12797,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                          reinterpret_cast<const uint8_t*>(spirv.data()),
                          spirv.size() * sizeof(uint32_t)),
                      ok ? "ok" : "failed");
+    }
     if (trace) {
         for (const auto& buffer : buffers) {
             if (!buffer.resource || buffer.alias_of != SIZE_MAX) continue;

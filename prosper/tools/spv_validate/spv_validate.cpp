@@ -630,6 +630,15 @@ int main(int argc, char** argv) {
       ShaderResource t{}; t.cls=ResourceClass::Texture; t.binding=4; t.sgpr_base=0; t.img_dim=2; rt.resources.push_back(t);
       const uint32_t c[] = {0x7E060280u,0xF0380710u,0x00000003u,0xBF810000u};
       dump(dir, "compute_resinfo_3d", recompile_valu(c, sizeof(c)/4, 0, 0, &rt)); }
+    // Compute image_get_resinfo on a SAMPLED 1D image. The storage 1D case above declares
+    // Sampled1D; the sampled path did not, and nothing here exercised it -- spirv-val:
+    // "Operand 3 of TypeImage requires one of these capabilities: Sampled1D". Same encoding as
+    // compute_resinfo_3d with MIMG DIM (word0 bits [5:3]) set to 0 = 1D, and img_dim 0 = 1D.
+    // This is Sonic Frontiers' query-only binding shape (#657, #2790).
+    { ShaderResourceTable rt;
+      ShaderResource t{}; t.cls=ResourceClass::Texture; t.binding=4; t.sgpr_base=0; t.img_dim=0; rt.resources.push_back(t);
+      const uint32_t c[] = {0x7E060280u,0xF0380700u,0x00000003u,0xBF810000u};
+      dump(dir, "compute_resinfo_1d", recompile_valu(c, sizeof(c)/4, 0, 0, &rt)); }
     // Compute integer image_load from a UINT8x4 3D texture. The sampled image's scalar type and
     // OpImageFetch result must be uint, matching the explicit v_cvt_f32_ubyte* sequence used by
     // UE4's volumetric-lightmap indirection volume (DOLL producer pc 816).
