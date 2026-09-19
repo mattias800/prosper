@@ -11095,10 +11095,11 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
                 target_copy.imageExtent = {r->width, r->height, 1};
                 // No texels for a query-only binding -- see BoundImage::query_only_shape.
-                if (!bi.query_only_shape)
-                vkCmdCopyBufferToImage(command, staging[i], bi.image,
-                                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                                       1, &target_copy);
+                if (!bi.query_only_shape) {
+                    vkCmdCopyBufferToImage(command, staging[i], bi.image,
+                                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                           1, &target_copy);
+                }
 
                 VkImageMemoryBarrier ready[2]{source_to_copy, target_to_copy};
                 ready[0].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
@@ -11289,10 +11290,12 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                  bi.array_layers > 1 ? 1u : bi.texel_depth};
             }
             // No texels for a query-only binding -- see BoundImage::query_only_shape.
-            if (!bi.query_only_shape)
-            vkCmdCopyBufferToImage(command, staging[i], bi.image,
-                                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                                   static_cast<uint32_t>(mip_regions.size()), mip_regions.data());
+            if (!bi.query_only_shape) {
+                vkCmdCopyBufferToImage(command, staging[i], bi.image,
+                                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                       static_cast<uint32_t>(mip_regions.size()),
+                                       mip_regions.data());
+            }
             VkImageMemoryBarrier to_general = to_dst;
             to_general.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
             to_general.dstAccessMask = VK_ACCESS_SHADER_READ_BIT |
@@ -12726,7 +12729,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         phase_writeback = ComputeClock::now();
     } while (false);
 
-    if (trace)
+    if (trace) {
         // #2790: dump this dispatch's SPIR-V when asked, INCLUDING when it failed. The existing
         // PROSPER_DUMP_COMPUTE_SPIRV path only writes modules that reach VkShaderModule creation,
         // and gpu_replay's --dump-compute rejects --bundle, so a dispatch that is refused at image
@@ -12758,6 +12761,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                          reinterpret_cast<const uint8_t*>(spirv.data()),
                          spirv.size() * sizeof(uint32_t)),
                      ok ? "ok" : "failed");
+    }
     if (trace) {
         for (const auto& buffer : buffers) {
             if (!buffer.resource || buffer.alias_of != SIZE_MAX) continue;
