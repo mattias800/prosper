@@ -1519,11 +1519,16 @@ inline bool branch_is_workgroup_uniform(const std::vector<Rdna2Inst>& ins, uint3
         if (ins[i].pc == branch_pc) { branch_index = i; break; }
     if (branch_index == ins.size() || branch_index == 0) return false;
 
-    // Obligation (1): EXEC is full at the branch along every path.
-    const std::vector<uint8_t> exec_full = must_fact_at(
-        ins, exec_write_sets_full_mask,
-        [](const Rdna2Inst& in) { return rdna2_instruction_may_change_exec(in); }, true);
-    if (exec_full.empty() || !exec_full[branch_index]) return false;
+    // Obligation (1): EXEC is full at the branch along every path. Required for VCC branches
+    // because VCC masks are constructed via `s_cselect_b64 vcc, exec, 0`, so an empty or narrowed
+    // EXEC causes VCCZ to differ per-wave. SCC branches consume the scalar condition code directly,
+    // which is independent of EXEC.
+    if (condition == UniformBranchCondition::Vcc) {
+        const std::vector<uint8_t> exec_full = must_fact_at(
+            ins, exec_write_sets_full_mask,
+            [](const Rdna2Inst& in) { return rdna2_instruction_may_change_exec(in); }, true);
+        if (exec_full.empty() || !exec_full[branch_index]) return false;
+    }
 
     auto is_branch = [](const Rdna2Inst& in) {
         return in.fmt == Rdna2Format::SOPP && in.opcode >= 0x02 && in.opcode <= 0x09 &&
@@ -1604,28 +1609,87 @@ inline bool branch_is_workgroup_uniform(const std::vector<Rdna2Inst>& ins, uint3
         }
     };
 
-    // A register whose reaching definition lies OUTSIDE the branch's straight-line region, in the
-    // one shape where no dominance question arises: it has exactly ONE definition in the entire
-    // program, so whatever path reached the use, that is the definition it saw -- or the register is
-    // untouched launch data, which is uniform too. Both alternatives are uniform, so the value is.
+    // A scalar load outside the branch's block can still be traced through a straight-line
+    // entry prefix. Require a sole load definition and no edge that can re-enter that prefix:
+    // one static writer does not mean one execution, and a later backedge may bring different
+    // descriptor values or bypass an earlier definition. Indirect SOP1 edges fail closed; the
+    // remaining SOPK control-flow inventory gap is tracked in #3719.
     //
-    // Deliberately narrow. The definition must be a scalar memory load whose address operands still
-    // hold their wave-entry values AT THE LOAD, which is the uber-shader shape this exists for: a
-    // quality/variant selector read once from a constant buffer at the top of the kernel and then
-    // compared against literals to pick between barrier-separated phases (#3713 --
-    // `0x2005713000`'s `s16`, an `s_buffer_load_dwordx8` at pc 5 from launch SGPRs `s[8:11]`).
-    //
-    // What this must NOT become is a flow-insensitive "every writer of the register is uniform"
-    // rule, which is the obvious generalisation and is wrong here: that same program reuses `s8` as
-    // a VOPC lane mask at pc 49, long AFTER the load at pc 5 reads `s[8:11]`. A rule that asks about
-    // `s8` globally marks it non-uniform and rejects a program that is plainly fine. The operands
-    // are therefore asked about at the LOAD's index, not at the use's.
-    auto entry_value_at = [&](int reg, size_t index) {
-        const std::vector<uint8_t> fact = must_fact_at(
-            ins, [](const Rdna2Inst&) { return false; },
-            [&](const Rdna2Inst& in) { return writes_reg(in, reg, 1); }, true);
-        return !fact.empty() && index < fact.size() && fact[index] != 0;
+    // Resolve descriptor/address inputs at each load, not globally. This admits constant-buffer
+    // indirection and later scratch reuse (Sonic #2790), without confusing that later overwrite
+    // with the value actually read. Every contributing scalar operand must be uniform, including
+    // both words of a B64 source even when the instruction writes only one word.
+    std::function<bool(int, size_t, uint32_t)> entry_uniform_scalar;
+    entry_uniform_scalar = [&](int reg, size_t before, uint32_t depth) -> bool {
+        if (depth > 16 || reg < 0 || reg > 105) return false;
+        size_t w = ins.size();
+        for (size_t i = before; i-- > 0;) {
+            if (writes_reg(ins[i], reg, 1)) {
+                w = i;
+                break;
+            }
+        }
+        if (w == ins.size())
+            return true; // No writer in [0, before); holds wave-entry launch data.
+        const Rdna2Inst& in = ins[w];
+        switch (in.fmt) {
+            case Rdna2Format::SMEM: {
+                if (!scalar_write_width(in) || in.n_src < 1) return false;
+                const uint32_t base_words = in.opcode >= 0x8 ? 4u : 2u;
+                auto op_uniform = [&](const Operand& op, uint32_t words) {
+                    if (op.kind == OperandKind::Special && op.value == 125) return true; // SGPR_NULL
+                    if (op.kind == OperandKind::InlineInt || op.kind == OperandKind::Literal) return true;
+                    if (op.kind != OperandKind::SGPR && op.kind != OperandKind::Special) return false;
+                    for (uint32_t word = 0; word < words; ++word) {
+                        const int r = op.value + static_cast<int>(word);
+                        if (!entry_uniform_scalar(r, w, depth + 1)) return false;
+                    }
+                    return true;
+                };
+                if (!op_uniform(in.src[0], base_words)) return false;
+                return in.n_src < 2 || op_uniform(in.src[1], 1);
+            }
+            case Rdna2Format::SOP1: {
+                if (in.opcode == 0x1f) return true; // s_getpc_b64
+                // Bitset and conditional-move forms read the old destination (and cmov also
+                // reads SCC). The explicit operand alone cannot prove their result uniform.
+                if (rdna2_instruction_may_change_exec(in) || in.n_src != 1 ||
+                    scalar_implicit_destination_read_width(in)) return false;
+                const Operand& op = in.src[0];
+                const uint32_t words = scalar_alu_source_words(in, 0);
+                if (op.kind == OperandKind::Special && op.value == 125) return true;
+                if (op.kind == OperandKind::InlineInt || op.kind == OperandKind::Literal) return true;
+                if (op.kind != OperandKind::SGPR && op.kind != OperandKind::Special) return false;
+                for (uint32_t word = 0; word < words; ++word) {
+                    const int r = op.value + static_cast<int>(word);
+                    if (!entry_uniform_scalar(r, w, depth + 1)) return false;
+                }
+                return true;
+            }
+            case Rdna2Format::SOP2: {
+                if (in.opcode == 0x04 || in.opcode == 0x05 || in.opcode == 0x0a || in.opcode == 0x0b)
+                    return false;
+                if (in.n_src != 2) return false;
+                const uint32_t words = scalar_write_width(in) == 2 ? 2u : 1u;
+                auto op_uniform = [&](const Operand& op) {
+                    if (op.kind == OperandKind::Special && op.value == 125) return true;
+                    if (op.kind == OperandKind::InlineInt || op.kind == OperandKind::Literal) return true;
+                    if (op.kind != OperandKind::SGPR && op.kind != OperandKind::Special) return false;
+                    for (uint32_t word = 0; word < words; ++word) {
+                        const int r = op.value + static_cast<int>(word);
+                        if (!entry_uniform_scalar(r, w, depth + 1)) return false;
+                    }
+                    return true;
+                };
+                return op_uniform(in.src[0]) && op_uniform(in.src[1]);
+            }
+            case Rdna2Format::SOPK:
+                return in.opcode == 0x00; // s_movk_i32 is a literal
+            default:
+                return false;
+        }
     };
+
     auto sole_launch_derived_definition = [&](int reg) -> bool {
         if (reg < 0 || reg > 105) return false;            // EXEC/VCC/SCC are not launch data
         size_t only = ins.size();
@@ -1635,20 +1699,12 @@ inline bool branch_is_workgroup_uniform(const std::vector<Rdna2Inst>& ins, uint3
             only = i;
         }
         if (only == ins.size()) return false;
-        // The definition must lie in the program's ENTRY straight-line region -- before any branch.
-        //
-        // Without this the rule is UNSOUND, and the way it fails is subtle enough to be worth
-        // spelling out. "Exactly one definition, so the use saw either that value or the untouched
-        // launch value, and both are uniform" is wrong: each alternative is uniform on its own, but
-        // the CHOICE between them need not be. Put the sole `s_buffer_load` inside an
-        // `s_cbranch_vccz` arm and put the compare and the scalar branch after the merge, and waves
-        // that took the arm carry the loaded value while waves that skipped it carry the launch
-        // value. They then disagree at the branch -- so only some of them reach the `s_barrier`
-        // inside its region, which is exactly what this proof exists to prevent.
-        //
-        // Requiring the definition to precede every branch makes it dominate every use, which is
-        // the property the informal argument was silently assuming. `terminal_guard_scc_is_...`
-        // above states the same hazard for the same reason, and I read past it. Caught in review.
+        // The textual backward slice is valid only if no other edge can enter through the load.
+        // This includes an edge to pc0: the second visit need not carry launch-time register data.
+        if (!targets.empty() && *targets.begin() <= ins[only].pc) return false;
+        for (const Rdna2Inst& in : ins)
+            if (in.fmt == Rdna2Format::SOP1 && in.opcode >= 0x20u && in.opcode <= 0x22u)
+                return false; // indirect PC change could enter anywhere in the prefix
         for (size_t i = 0; i < only; ++i) {
             const Rdna2Inst& before_def = ins[i];
             if (before_def.is_end) return false;
@@ -1667,8 +1723,7 @@ inline bool branch_is_workgroup_uniform(const std::vector<Rdna2Inst>& ins, uint3
             if (op.kind != OperandKind::SGPR && op.kind != OperandKind::Special) return false;
             for (uint32_t word = 0; word < count; ++word) {
                 const int r = op.value + static_cast<int>(word);
-                if (r < 0 || r > 105) return false;                    // EXEC/VCC/SCC are not launch data
-                if (!entry_value_at(r, only)) return false;
+                if (!entry_uniform_scalar(r, only, 0)) return false;
             }
             return true;
         };
@@ -1686,8 +1741,11 @@ inline bool branch_is_workgroup_uniform(const std::vector<Rdna2Inst>& ins, uint3
         switch (in.fmt) {
             case Rdna2Format::SOP1:
                 if (in.opcode == 0x1f) return true;                     // s_getpc_b64
-                if (rdna2_instruction_may_change_exec(in) || in.n_src != 1) return false;
-                return uniform_operand(in.src[0], scalar_write_width(in) == 2 ? 2u : 1u, w, depth);
+                // Bitset and conditional-move forms read the old destination (and cmov also
+                // reads SCC). The explicit operand alone cannot prove their result uniform.
+                if (rdna2_instruction_may_change_exec(in) || in.n_src != 1 ||
+                    scalar_implicit_destination_read_width(in)) return false;
+                return uniform_operand(in.src[0], scalar_alu_source_words(in, 0), w, depth);
             case Rdna2Format::SOP2: {
                 // Carry and cselect forms consume SCC as well as their decoded operands; the mask
                 // slice models the cselect shape explicitly and nothing else may use them as data.

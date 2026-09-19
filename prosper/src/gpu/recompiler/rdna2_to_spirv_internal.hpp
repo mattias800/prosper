@@ -5022,6 +5022,7 @@ inline uint32_t scalar_write_width(const Rdna2Inst& in) {
         case Rdna2Format::SOP1:
             if (in.opcode == 0x20) return 0; // s_setpc_b64 reads its decoded "dst" field.
             switch (in.opcode) {
+                case kSop1OpcodeCmovB64: // both words may change even though the write is conditional
                 case 0x04: case 0x08: case 0x0a: case 0x1f: case 0x2d:
                 case 0x24: case 0x25: case 0x26: case 0x27:
                 case 0x28: case 0x29: case 0x2a: case 0x2b:

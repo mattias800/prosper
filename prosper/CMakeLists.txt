@@ -2024,6 +2024,13 @@ if(TARGET prosper_core)
   target_link_libraries(test_recompile_coverage PRIVATE prosper_core)
   add_test(NAME recompile_coverage COMMAND test_recompile_coverage)
 
+  # Pure CFG proof regression: compile only the decoder, so adversarial barrier-uniformity
+  # cases can be checked without a renderer/core build or a potentially unsafe GPU dispatch.
+  add_executable(test_workgroup_uniformity tests/gpu/test_workgroup_uniformity.cpp
+      src/gpu/recompiler/rdna2_decode.cpp)
+  target_include_directories(test_workgroup_uniformity PRIVATE src)
+  add_test(NAME workgroup_uniformity COMMAND test_workgroup_uniformity)
+
   add_executable(test_direct_descriptor_copy tests/gpu/recompiler/test_direct_descriptor_copy.cpp)
   target_link_libraries(test_direct_descriptor_copy PRIVATE prosper_core)
   add_test(NAME direct_descriptor_copy COMMAND test_direct_descriptor_copy)
