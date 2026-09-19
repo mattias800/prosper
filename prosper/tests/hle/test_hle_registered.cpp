@@ -48,6 +48,16 @@ int main() {
         // services / dialogs
         "sceUserServiceGetInitialUser", "scePadOpen", "sceMsgDialogUpdateStatus",
         "sceSystemServiceHideSplashScreen",
+        // libSceAvPlayer. These live in their own translation unit and their own entry point
+        // (register_avplayer_hle, src/hle/video/avplayer.cpp) since #3735, so a split that forgot
+        // to call it would leave the whole library unregistered -- and the dispatcher's default of
+        // 0 reads as a SUCCESSFUL init, an active player and a completed video. The title would
+        // hang on a splash it believes is playing, with nothing in any log. That failure is exactly
+        // what this file exists for, and it is per-library now rather than per-file.
+        "sceAvPlayerInit", "sceAvPlayerInitEx", "sceAvPlayerPostInit", "sceAvPlayerSetLogCallback",
+        "sceAvPlayerAddSource", "sceAvPlayerAddSourceEx", "sceAvPlayerStart", "sceAvPlayerIsActive",
+        "sceAvPlayerGetVideoData", "sceAvPlayerGetVideoDataEx", "sceAvPlayerGetAudioData",
+        "sceAvPlayerStop", "sceAvPlayerClose",
         // HTTP helpers
         "sceHttpUriParse",
         // graphics (headless bring-up)

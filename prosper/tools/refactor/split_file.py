@@ -117,6 +117,59 @@ def conditional_depth(lines: list[str]) -> list[int]:
     return depth
 
 
+def _enclosing_conditional(lines: list[str], line_no: int) -> tuple[int, int] | None:
+    """The (`#if` line, `#endif` line) of the innermost conditional containing LINE_NO, 1-indexed.
+
+    Scans outward by depth rather than pattern-matching a nearby directive: a nested conditional
+    between the two would otherwise be mistaken for the enclosing one, which is the failure that
+    makes a safety check quietly approve the thing it exists to refuse."""
+    open_line = None
+    depth = 0
+    for i in range(line_no - 1, 0, -1):
+        text = lines[i - 1]
+        if COND_CLOSE.match(text):
+            depth += 1
+        elif COND_OPEN.match(text):
+            if depth == 0:
+                open_line = i
+                break
+            depth -= 1
+    if open_line is None:
+        return None
+    depth = 0
+    for i in range(open_line, len(lines) + 1):
+        text = lines[i - 1]
+        if COND_OPEN.match(text):
+            depth += 1
+        elif COND_CLOSE.match(text):
+            depth -= 1
+            if depth == 0:
+                return (open_line, i)
+    return None
+
+
+def _region_of(regions: list[dict], line_no: int) -> dict | None:
+    for r in regions:
+        if r["start"] <= line_no <= r["end"]:
+            return r
+    return None
+
+
+def _conditional_is_replicated(lines, depth, line_no, regions, where) -> bool:
+    """True when the conditional containing LINE_NO has BOTH its directives in replicated regions.
+
+    Such a conditional is reproduced whole in every output, so a cut inside it separates members,
+    never the directive from its `#endif`."""
+    span = _enclosing_conditional([ln.rstrip("\n") for ln in lines], line_no)
+    if span is None:
+        return False
+    open_r, close_r = _region_of(regions, span[0]), _region_of(regions, span[1])
+    if open_r is None or close_r is None:
+        return False
+    return (where.get(open_r["index"]) == "<replicated>"
+            and where.get(close_r["index"]) == "<replicated>")
+
+
 def check_structure(regions: list[dict], total_lines: int) -> list[str]:
     """Regions must tile [1, total_lines] exactly. Arithmetic only."""
     problems: list[str] = []
@@ -284,11 +337,21 @@ def split(map_data: dict, plan: dict[str, list[int]], source_text: str,
         if depth[cur["start"]] == 0:
             continue
         a, b = where.get(prev["index"]), where.get(cur["index"])
-        if a != b:
-            problems.append(f"line {cur['start']} is inside an #if (depth {depth[cur['start']]}) "
-                            f"and regions {prev['index']} and {cur['index']} go to different "
-                            f"files ({a} and {b}); that would separate the directive from its "
-                            f"#endif")
+        if a == b:
+            continue
+        # A REPLICATED region is copied into every output, so a conditional whose `#if` and whose
+        # `#endif` both live in replicated regions is intact in every file -- the outputs that got
+        # none of its members simply contain an empty conditional. Refusing those rejected the only
+        # arrangement that works for a guarded anonymous namespace: with the guard OUTSIDE the
+        # namespace the open/close braces sit inside a conditional, and with it INSIDE, the
+        # open-region/body boundary does. One of the two has to be allowed, and this is the one that
+        # is actually safe.
+        if _conditional_is_replicated(lines, depth, cur["start"], regions, where):
+            continue
+        problems.append(f"line {cur['start']} is inside an #if (depth {depth[cur['start']]}) "
+                        f"and regions {prev['index']} and {cur['index']} go to different "
+                        f"files ({a} and {b}); that would separate the directive from its "
+                        f"#endif")
 
     if problems:
         return {}, problems
@@ -512,6 +575,19 @@ def selftest() -> int:
     if bad:
         print("  the splitter's own guarantees are broken; it must not be run")
         return 1
+    # _enclosing_conditional pairs directives by DEPTH. A nearest-directive scan would pair a
+    # nested conditional's `#if` with the outer one's `#endif`, making the replication test answer
+    # about a conditional that does not exist -- a safety check quietly approving what it exists to
+    # refuse.
+    L = ["#ifndef _WIN32", "namespace {", "int a;", "}", "#endif", "int b;"]
+    assert _enclosing_conditional(L, 3) == (1, 5), _enclosing_conditional(L, 3)
+    assert _enclosing_conditional(L, 6) is None, "line outside every conditional"
+    N = ["#ifdef OUTER", "int a;", "#ifdef INNER", "int b;", "#endif", "int c;", "#endif"]
+    assert _enclosing_conditional(N, 4) == (3, 5), f"innermost, got {_enclosing_conditional(N, 4)}"
+    assert _enclosing_conditional(N, 6) == (1, 7), f"outer after inner closed, got {_enclosing_conditional(N, 6)}"
+    assert _enclosing_conditional(N, 2) == (1, 7), "outer before inner opened"
+    print("  [ok]   _enclosing_conditional pairs directives by depth, innermost first")
+
     print("  [ok]   splitter self-test: replication, partition, tiling, #if, reconstruction, "
           "cross-part references")
     return 0
