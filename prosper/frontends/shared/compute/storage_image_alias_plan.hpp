@@ -28,6 +28,15 @@ inline bool compute_cube_as_2d_array_storage(
            !descriptor.image_multisampled && resource.depth == 6u;
 }
 
+inline bool compute_native_cube_sampled(
+    const prosper::gpu::ShaderResource& resource,
+    const prosper::gpu::SpirvDescriptorBinding& descriptor) {
+    return resource.img_dim == 3 &&
+           descriptor.kind != prosper::gpu::SpirvDescriptorKind::StorageImage &&
+           descriptor.image_dim == 3u && !descriptor.image_arrayed &&
+           !descriptor.image_multisampled && resource.depth == 6u;
+}
+
 // Metadata only: this is the shape used by live compute before allocating an image. Validation
 // still belongs to the materializer; an invalid descriptor must not become valid by joining a group.
 inline prosper::gpu::ComputeImageViewShape compute_image_alias_shape(
@@ -37,7 +46,8 @@ inline prosper::gpu::ComputeImageViewShape compute_image_alias_shape(
         descriptor.kind == prosper::gpu::SpirvDescriptorKind::StorageImage,
         resource.img_dim == 2 ? resource.depth : 1u,
         (resource.img_dim == 5 && descriptor.image_dim == 1u && descriptor.image_arrayed) ||
-                compute_cube_as_2d_array_storage(resource, descriptor)
+                compute_cube_as_2d_array_storage(resource, descriptor) ||
+                compute_native_cube_sampled(resource, descriptor)
             ? resource.depth : 1u,
     };
 }

@@ -1109,6 +1109,15 @@ struct ComputeImageCacheKey {
     // one-level image to a binding whose module fetches level three is not a miss but a fault.
     // Appended LAST so `storage_image_cache_key`'s positional aggregate init keeps its meaning.
     uint32_t mip_levels = 1;
+    // #657: a VK_IMAGE_VIEW_TYPE_CUBE view is only legal over an image created CUBE_COMPATIBLE, and
+    // that flag is fixed at creation. Two T#s over the same allocation can agree on every field
+    // above while one needs a cube view and the other does not, so handing the non-compatible image
+    // to the cube binding is a FAULT, not a hit -- exactly the #3048 argument for `mip_levels`.
+    // Measured: Sonic Frontiers' Cyber Space prefilter writes the cube through storage bindings and
+    // a later dispatch samples it as `OpTypeImage Dim=Cube`; the reader found the writer's cached
+    // image and its view failed VUID-VkImageViewCreateInfo-image-01003.
+    // Appended LAST for the same positional-init reason.
+    bool cube_compatible = false;
 
     bool operator==(const ComputeImageCacheKey& other) const = default;
 };
@@ -1135,7 +1144,8 @@ struct ComputeImageCacheKeyHash {
 ComputeImageCacheKey storage_image_cache_key(const prosper::gpu::ShaderResource& resource,
                                               uint32_t guest_bytes,
                                               VkFormat native_format,
-                                              uint32_t mip_levels = 1) {
+                                              uint32_t mip_levels = 1,
+                                              bool cube_compatible = false) {
     return {
         resource.gpu_addr, reinterpret_cast<uintptr_t>(resource.host_data),
         guest_bytes, resource.size,
@@ -1147,7 +1157,7 @@ ComputeImageCacheKey storage_image_cache_key(const prosper::gpu::ShaderResource&
         resource.mip_tail_offset, resource.mip_tail_bytes,
         resource.mip_tail_x, resource.mip_tail_y,
         static_cast<uint32_t>(native_format), true, resource.in_mip_tail,
-        resource.srgb, resource.depth_compare, mip_levels};
+        resource.srgb, resource.depth_compare, mip_levels, cube_compatible};
 }
 
 // Which fields two same-address cache keys disagree on, as a bitmask over ComputeImageKeyField.
@@ -7736,6 +7746,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // Single source of truth with the staging sizing -- see the comment on the predicate.
             const bool cube_as_2d_array_storage =
                 prosper::frontend::compute_cube_as_2d_array_storage(*r, image_descriptors[i]);
+            const bool native_cube_sampled =
+                prosper::frontend::compute_native_cube_sampled(*r, image_descriptors[i]);
             bi.arrayed_2d = dim_2d_array || cube_as_2d_array_storage;
             // The recompiler's established cube lowering converts AMD's cube-processed
             // [x, y, face] coordinates to a plain 2D sample over six vertically stacked faces.
@@ -7758,12 +7770,12 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             const bool dim_2d_single = r->img_dim == 5 && ordinary_2d_view;
             if (!dim_1d && r->img_dim != 1 && !dim_3d && !dim_2d_array &&
                 !dim_2d_single && !dim_cube_stacked && !cube_face_as_2d &&
-                !cube_as_2d_array_storage) {
+                !cube_as_2d_array_storage && !native_cube_sampled) {
                 skip_image(r, "layered image deferred to #657"); break;
             }
             if (dim_1d && r->height != 1) { skip_image(r, "1D image has non-unit height"); break; }
             if (!r->depth || (!dim_3d && !dim_2d_array && !dim_cube_stacked &&
-                              !cube_as_2d_array_storage && r->depth != 1)) {
+                              !cube_as_2d_array_storage && !native_cube_sampled && r->depth != 1)) {
                 if (!cube_face_as_2d) {
                     skip_image(r, "image depth does not match its dimensionality"); break;
                 }
@@ -8326,7 +8338,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // for ONE layer while the writeback packs width*height*depth texels out of it --
             // measured as a SIGSEGV in storage_pack_float16x4_f16c before this term existed.
             const uint32_t sampled_layers = dim_cube_stacked ? 6u
-                                            : (dim_2d_array || cube_as_2d_array_storage)
+                                            : (dim_2d_array || cube_as_2d_array_storage || native_cube_sampled)
                                                 ? r->depth : 1u;
             const VkDeviceSize volume_texels = static_cast<VkDeviceSize>(r->width) * r->height *
                                                (dim_3d ? r->depth : sampled_layers);
@@ -8865,7 +8877,12 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         r->mip_tail_offset, r->mip_tail_bytes,
                         r->mip_tail_x, r->mip_tail_y,
                         static_cast<uint32_t>(image_format), bi.storage, r->in_mip_tail,
-                        r->srgb, r->depth_compare, bi.mip_levels};
+                        r->srgb, r->depth_compare, bi.mip_levels,
+                        // #657: see the field's comment. A binding that takes a CUBE view must not
+                        // be handed a cached image created without CUBE_COMPATIBLE; the flag is
+                        // fixed at creation, so that is a fault, not a hit. This is the SAMPLED
+                        // key -- the storage key below carries the same term.
+                        native_cube_sampled};
                     // An ordinary native typed 2D image or native typed 3D volume is byte- and
                     // format-identical to the sampled upload that follows it. Borrow that retained
                     // result only as a TRANSFER source: the sampled cache remains a separate image so
@@ -9116,8 +9133,13 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 // Build the same exact identity used by ordinary admission before choosing either
                 // path.  A compressed target may become eligible only after successful writeback;
                 // deriving a second, looser key there could replace an unrelated cached image.
+                // #657: a binding that will take a CUBE view must not be satisfied by a cached
+                // image created without CUBE_COMPATIBLE -- the flag is fixed at creation, so that
+                // is a fault rather than a hit. Carrying it in the identity makes such a lookup
+                // MISS and build the right image, instead of failing at vkCreateImageView.
                 bi.cache_key = storage_image_cache_key(
-                    *r, static_cast<uint32_t>(guest_bytes), image_format);
+                    *r, static_cast<uint32_t>(guest_bytes), image_format, 1u,
+                    native_cube_sampled);
                 bi.cache_candidate =
                     compute_storage_cache_gate_candidate(storage_cache_gates);
                 // Renderer ownership still excludes INPUT reuse. Once ordinary writeback has
@@ -9909,6 +9931,13 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 ici.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
             if (bi.storage && bi.packed_r11_storage && bi.graphics_sampled_usage)
                 ici.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+            // Vulkan permits the flag only on a square 2D image with at least six layers; the
+            // stacked-cube lowering (height x6, one layer) is not such a shape and fails
+            // VUID-VkImageCreateInfo-flags-08866. Set it exactly where a cube view is taken.
+            const bool cube_capable_shape = !dim_3d && !dim_cube_stacked &&
+                                            r->width == r->height && bi.array_layers == 6u;
+            if (native_cube_sampled && cube_capable_shape)
+                ici.flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
             ici.imageType = dim_1d ? VK_IMAGE_TYPE_1D : (dim_3d ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D);
             ici.format = image_format;
             ici.extent = {r->width, dim_cube_stacked ? r->height * 6u : r->height,
@@ -9945,6 +9974,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             vci.image = bi.image;
             vci.viewType = dim_1d ? VK_IMAGE_VIEW_TYPE_1D
                                   : (dim_3d ? VK_IMAGE_VIEW_TYPE_3D
+                                     : native_cube_sampled ? VK_IMAGE_VIEW_TYPE_CUBE
                                      : (dim_2d_array || cube_as_2d_array_storage) ? VK_IMAGE_VIEW_TYPE_2D_ARRAY
                                                     : VK_IMAGE_VIEW_TYPE_2D);
             vci.format = ici.format;
