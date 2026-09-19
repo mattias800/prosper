@@ -274,8 +274,12 @@ int main() {
         CHECK(prosper::frontend::compute_native_cube_sampled(cube, cube_view));
         CHECK(prosper::frontend::compute_image_alias_shape(cube, cube_view).array_layers == 6u);
 
-        // Each arm below changes exactly ONE property and must clear the predicate. Without these
-        // the positive arm passes against a predicate that ignores the property entirely.
+        // ONE property per arm, and that is load-bearing rather than tidiness: an arm that varies
+        // two terms at once isolates NEITHER, so deleting either leaves the suite green. That
+        // happened twice while writing this block (`kind`, then `image_dim`/`image_arrayed`), and
+        // both times the arm still passed, which is exactly how the gap hides. Every term of
+        // `compute_native_cube_sampled` has an arm below that differs from the positive case in
+        // that term alone.
         context = "a cube ARRAY (depth 18) is NOT admitted -- which cube a sample resolves to is unestablished";
         ShaderResource cube_array = cube; cube_array.depth = 18;
         CHECK(!prosper::frontend::compute_native_cube_sampled(cube_array, cube_view));
@@ -297,10 +301,23 @@ int main() {
         CHECK(!prosper::frontend::compute_native_cube_sampled(cube, storage_cube_shape));
         CHECK(prosper::frontend::compute_image_alias_shape(cube, storage_cube_shape).array_layers == 1u);
 
-        context = "a cube declared 2D-arrayed rather than Cube is NOT the native-cube shape";
+        // `image_dim` alone. This term is load-bearing, not a formality: without it the predicate
+        // is exactly `cube_face_as_2d`'s shape at depth 6, and since the view chain tests
+        // `native_cube_sampled` first, every established face-zero binding would silently become a
+        // six-face VK_IMAGE_VIEW_TYPE_CUBE.
+        context = "image_dim alone: a cube declared Dim=2D is NOT the native-cube shape";
+        SpirvDescriptorBinding declared_2d = cube_view;
+        declared_2d.image_dim = 1u;
+        CHECK(!prosper::frontend::compute_native_cube_sampled(cube, declared_2d));
+        CHECK(prosper::frontend::compute_image_alias_shape(cube, declared_2d).array_layers == 1u);
+
+        // `image_arrayed` alone. A Cube declaration that ALSO retains the layer coordinate is a
+        // cube array in the module's own terms, which is the case the depth bound refuses.
+        context = "image_arrayed alone: a Cube declaration that is arrayed is NOT the native-cube shape";
         SpirvDescriptorBinding arrayed = cube_view;
-        arrayed.image_dim = 1u; arrayed.image_arrayed = true;
+        arrayed.image_arrayed = true;
         CHECK(!prosper::frontend::compute_native_cube_sampled(cube, arrayed));
+        CHECK(prosper::frontend::compute_image_alias_shape(cube, arrayed).array_layers == 1u);
 
         context = "a multisampled declaration is NOT the native-cube shape";
         SpirvDescriptorBinding ms = cube_view; ms.image_multisampled = true;

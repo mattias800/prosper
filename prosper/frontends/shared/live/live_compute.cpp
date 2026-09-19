@@ -9971,9 +9971,14 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 ici.flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
             ici.imageType = (dim_1d || query_only_as_1d) ? VK_IMAGE_TYPE_1D : (dim_3d ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D);
             ici.format = image_format;
-            // Both trailing axes are forced for a query-only 1D view: a VK_IMAGE_TYPE_1D image
-            // must have height AND depth of 1, so a 3D guest surface declared 1D by the module
-            // would otherwise build an image that fails VUID-VkImageCreateInfo-imageType-00957.
+            // Both trailing axes are forced for a query-only 1D view. The Vulkan rule, quoted from
+            // the validation layer's own text: "If imageType is VK_IMAGE_TYPE_1D, both
+            // extent.height and extent.depth must be 1". A 3D guest surface declared 1D by the
+            // module would otherwise build an image that violates it.
+            //
+            // Deliberately no VUID number here: two reviews of this line cited two different ones
+            // (00956 / 00957) and neither was checked against the registry, which is not on this
+            // machine. The rule text IS verifiable in the layer binary, so that is what is cited.
             ici.extent = {r->width, query_only_as_1d ? 1u : (dim_cube_stacked ? r->height * 6u : r->height),
                           (!query_only_as_1d && dim_3d) ? bi.texel_depth : 1u};
             ici.mipLevels = bi.mip_levels;
