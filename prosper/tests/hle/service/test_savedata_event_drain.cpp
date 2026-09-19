@@ -57,7 +57,10 @@ static constexpr uint64_t kInFlightCode = 0x809F0018ull;
 
 int main() {
     std::printf("== test_savedata_event_drain ==\n");
+    // libSceSaveData moved to src/hle/fs/savedata.cpp with its own entry point (#3735), so
+    // register_service_hle() alone no longer binds its NIDs.
     register_service_hle();
+    register_savedata_hle();
 
     HleFn get_event = Hle::lookup("j8xKtiFj0SY");   // sceSaveDataGetEventResult
     HleFn umount2   = Hle::lookup("uW4vfTwMQVo");   // sceSaveDataUmount2

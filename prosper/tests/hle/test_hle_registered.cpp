@@ -73,6 +73,12 @@ int main() {
         "sceImeKeyboardGetResourceId",
         "sceImeDialogInit", "sceImeDialogGetStatus", "sceImeDialogGetResult", "sceImeDialogTerm",
         "sceImeDialogAbort",
+        // libSceSaveData + libSceSaveDataDialog (register_savedata_hle, src/hle/fs/savedata.cpp),
+        // which is where save_param.* and save_paths.* already lived.
+        "sceSaveDataInitialize3", "sceSaveDataMount", "sceSaveDataMount2", "sceSaveDataTerminate",
+        "sceSaveDataCreateTransactionResource", "sceSaveDataDeleteTransactionResource",
+        "sceSaveDataSetupSaveDataMemory2", "sceSaveDataGetSaveDataMemory2",
+        "sceSaveDataDialogInitialize", "sceSaveDataDialogOpen", "sceSaveDataDialogUpdateStatus",
         // HTTP helpers
         "sceHttpUriParse",
         // graphics (headless bring-up)

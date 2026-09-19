@@ -170,6 +170,36 @@ def _conditional_is_replicated(lines, depth, line_no, regions, where) -> bool:
             and where.get(close_r["index"]) == "<replicated>")
 
 
+def duplicated_prose(regions, replicated_idx, lines, n_outputs: int) -> list[str]:
+    """Replicated regions whose text is mostly COMMENT, which every output therefore gets a copy of.
+
+    A region's text runs from where the previous one ended, so the banner comment above a namespace
+    belongs to that namespace's `open` region -- and `open` is replicated into every output. The code
+    the banner documents goes to exactly one file; the prose goes to all of them.
+
+    Measured on hle_service.cpp: splitting out libSceIme left 42 lines behind, a verbatim copy of two
+    banner blocks whose functions had moved to ime.cpp, including one empty `namespace { }`. Nothing
+    failed -- duplicated comments compile -- and the copy left behind documents code that is no
+    longer in the file, which is worse than no comment.
+
+    This cannot be fixed by choosing a side: a namespace's members may be split across several
+    outputs, so there is no single output the banner belongs to. It is reported instead, with the
+    lines, so whoever runs the split deletes the copies rather than discovering them later."""
+    if n_outputs < 2:
+        return []
+    notes = []
+    for r in regions:
+        if r["index"] not in replicated_idx:
+            continue
+        text = lines[r["start"] - 1:r["end"]]
+        comment = [l for l in text if l.strip().startswith("//")]
+        if len(comment) >= 3:
+            notes.append(f"region {r['index']} ({r['start']}-{r['end']}) is replicated and holds "
+                         f"{len(comment)} comment line(s); every one of the {n_outputs} outputs gets "
+                         f"a copy. Delete the copies that document code which did not go with them.")
+    return notes
+
+
 def check_structure(regions: list[dict], total_lines: int) -> list[str]:
     """Regions must tile [1, total_lines] exactly. Arithmetic only."""
     problems: list[str] = []
@@ -355,6 +385,9 @@ def split(map_data: dict, plan: dict[str, list[int]], source_text: str,
 
     if problems:
         return {}, problems
+
+    for note in duplicated_prose(regions, replicated_idx, lines, len(plan)):
+        print(f"  [note]  {note}")
 
     def text_of(idx: int) -> str:
         r = regions[idx]
@@ -587,6 +620,18 @@ def selftest() -> int:
     assert _enclosing_conditional(N, 6) == (1, 7), f"outer after inner closed, got {_enclosing_conditional(N, 6)}"
     assert _enclosing_conditional(N, 2) == (1, 7), "outer before inner opened"
     print("  [ok]   _enclosing_conditional pairs directives by depth, innermost first")
+
+    # duplicated_prose: a replicated region's banner comment is copied into every output, while the
+    # code it documents goes to one. Reported, not fixed -- a namespace's members can be split across
+    # several outputs, so there is no side the banner belongs to.
+    L = ["// banner line one\n", "// banner line two\n", "// banner line three\n", "namespace {\n"]
+    regs = [{"index": 0, "start": 1, "end": 4, "role": "open"}]
+    assert len(duplicated_prose(regs, {0}, L, 2)) == 1, "3 comment lines in a replicated region reported"
+    assert duplicated_prose(regs, {0}, L, 1) == [], "not reported when there is only one output"
+    assert duplicated_prose(regs, set(), L, 2) == [], "not reported for a non-replicated region"
+    short = [{"index": 0, "start": 1, "end": 2, "role": "open"}]
+    assert duplicated_prose(short, {0}, ["// one\n", "namespace {\n"], 2) == [], "one comment line is not a banner"
+    print("  [ok]   duplicated_prose reports a replicated banner, and only when it is one")
 
     print("  [ok]   splitter self-test: replication, partition, tiling, #if, reconstruction, "
           "cross-part references")
