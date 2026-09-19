@@ -2912,6 +2912,7 @@ inline VkCommandPoolResetFlags render_command_pool_reset_flags() { return 0; }
 // ---------------------------------------------------------------------------------------------
 enum class RenderVkObjectCreateSite : uint32_t {
     None = 0,
+    CommandPool,              // acquire_render_command_pool: the pool AND its one command buffer
     RenderPass,               // the pass's own vkCreateRenderPass
     Framebuffer,              // vkCreateFramebuffer over the attachment views
     DepthStencilView,         // the depth/stencil attachment's view
@@ -2924,6 +2925,7 @@ enum class RenderVkObjectCreateSite : uint32_t {
 
 inline const char* render_vk_object_site_name(RenderVkObjectCreateSite site) {
     switch (site) {
+        case RenderVkObjectCreateSite::CommandPool:              return "command-pool";
         case RenderVkObjectCreateSite::RenderPass:               return "render-pass";
         case RenderVkObjectCreateSite::Framebuffer:              return "framebuffer";
         case RenderVkObjectCreateSite::DepthStencilView:         return "ds-view";
@@ -2967,6 +2969,20 @@ inline bool render_vk_object_create_failure_should_log() {
 
 inline RenderCommandPoolLease acquire_render_command_pool(VkDevice device,
                                                           uint32_t queue_family) {
+    // #3721. Both creates below can fail under device-memory exhaustion or device loss, and no
+    // real device refuses an ordinary command pool on demand, so the failure return was
+    // unreachable in practice -- which is precisely why its caller walked past it into a null
+    // command buffer. Arming this site makes the next acquisition report failure without calling
+    // the driver. The production path never arms it.
+    if (consume_render_vk_object_create_failure(RenderVkObjectCreateSite::CommandPool)) {
+        if (render_vk_object_create_failure_should_log())
+            std::fprintf(stderr,
+                         "[render-object-create-failed] site=%s vkCreateCommandPool result=%d "
+                         "queue-family=%u -- dropping the pass\n",
+                         render_vk_object_site_name(RenderVkObjectCreateSite::CommandPool),
+                         (int)VK_ERROR_OUT_OF_DEVICE_MEMORY, queue_family);
+        return {};
+    }
     if (render_command_pool_reuse_enabled()) {
         RenderCommandPoolCache& cache = render_command_pool_cache();
         std::lock_guard<std::mutex> lock(cache.mutex);
@@ -2991,13 +3007,32 @@ inline RenderCommandPoolLease acquire_render_command_pool(VkDevice device,
     VkCommandPoolCreateInfo info{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     info.queueFamilyIndex = queue_family;
     VkCommandPool pool = VK_NULL_HANDLE;
-    if (vkCreateCommandPool(device, &info, nullptr, &pool) != VK_SUCCESS) return {};
+    const VkResult pool_result = vkCreateCommandPool(device, &info, nullptr, &pool);
+    if (pool_result != VK_SUCCESS || !pool) {
+        if (render_vk_object_create_failure_should_log())
+            std::fprintf(stderr,
+                         "[render-object-create-failed] site=%s vkCreateCommandPool result=%d "
+                         "queue-family=%u -- dropping the pass\n",
+                         render_vk_object_site_name(RenderVkObjectCreateSite::CommandPool),
+                         (int)pool_result, queue_family);
+        if (pool) vkDestroyCommandPool(device, pool, nullptr);
+        return {};
+    }
     VkCommandBufferAllocateInfo alloc{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
     alloc.commandPool = pool;
     alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     alloc.commandBufferCount = 1;
     VkCommandBuffer command = VK_NULL_HANDLE;
-    if (vkAllocateCommandBuffers(device, &alloc, &command) != VK_SUCCESS) {
+    const VkResult buffer_result = vkAllocateCommandBuffers(device, &alloc, &command);
+    if (buffer_result != VK_SUCCESS || !command) {
+        // The pool is destroyed rather than cached: a lease is the pool AND its buffer together,
+        // so a pool without one must never enter the free list.
+        if (render_vk_object_create_failure_should_log())
+            std::fprintf(stderr,
+                         "[render-object-create-failed] site=%s vkAllocateCommandBuffers result=%d "
+                         "queue-family=%u -- dropping the pass\n",
+                         render_vk_object_site_name(RenderVkObjectCreateSite::CommandPool),
+                         (int)buffer_result, queue_family);
         vkDestroyCommandPool(device, pool, nullptr);
         return {};
     }
@@ -3020,6 +3055,38 @@ inline void release_render_command_pool(VkDevice device, uint32_t queue_family,
     }
     vkDestroyCommandPool(device, lease.pool, nullptr);   // frees its command buffer with it
 }
+
+// Scope ownership for a lease, so a function that acquires one early does not have to remember to
+// release it on every exit (#3721).
+//
+// `render_draw_pass_rgba` acquires its pool as its FIRST resource, ahead of everything else it
+// builds. That ordering is the fix, not a detail: it means a failed acquisition returns the pass's
+// ordinary empty result with nothing yet created to tear down, instead of needing a second copy of
+// a teardown that currently frees around forty handles. The cost of acquiring early is sixteen
+// further `return out;` exits between the acquisition and the point where the completion-gated
+// cleanup takes ownership -- this guard covers all sixteen by scope exit rather than by sixteen
+// edits that the next person to add an exit would have to remember.
+//
+// `dismiss()` hands ownership to that completion-gated cleanup, which is what keeps retirement
+// completion-based: the pool returns to the free list only once the GPU has signalled the pass
+// complete. Releasing here instead would recycle a pool while its commands were still in flight.
+struct RenderCommandPoolLeaseGuard {
+    VkDevice device = VK_NULL_HANDLE;
+    uint32_t queue_family = 0;
+    RenderCommandPoolLease lease{};
+    bool owned = false;
+
+    RenderCommandPoolLeaseGuard(VkDevice d, uint32_t qf)
+        : device(d), queue_family(qf), lease(acquire_render_command_pool(d, qf)),
+          owned(static_cast<bool>(lease)) {}
+    RenderCommandPoolLeaseGuard(const RenderCommandPoolLeaseGuard&) = delete;
+    RenderCommandPoolLeaseGuard& operator=(const RenderCommandPoolLeaseGuard&) = delete;
+    ~RenderCommandPoolLeaseGuard() {
+        if (owned) release_render_command_pool(device, queue_family, lease);
+    }
+    explicit operator bool() const { return static_cast<bool>(lease); }
+    void dismiss() { owned = false; }
+};
 
 inline RenderCommandPoolStats render_command_pool_stats() {
     RenderCommandPoolCache& cache = render_command_pool_cache();
@@ -5960,6 +6027,14 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     const uint64_t color_target_generation = ++persistent_color_target_generation();
     VkInstance inst = ctx.inst; (void)inst; VkPhysicalDevice phys = ctx.phys;
     VkDevice dev = ctx.dev; VkQueue queue = ctx.queue; uint32_t qfi = ctx.qfi;
+    // The command pool is acquired BEFORE any other resource (#3721). Acquisition can fail under
+    // device-memory exhaustion or device loss, and recording into the resulting null command buffer
+    // is undefined behaviour that aborts in the loader rather than reporting anything. Taking it
+    // first means the failure path is the pass's ordinary empty result with nothing to undo; the
+    // guard releases it on the early exits between here and the completion-gated cleanup below,
+    // which is where ownership is handed on.
+    RenderCommandPoolLeaseGuard command_pool_lease(dev, qfi);
+    if (!command_pool_lease) return out;
     const bool aniso_enabled = ctx.aniso_enabled; const float max_aniso_limit = ctx.max_aniso_limit;
     VkPhysicalDeviceMemoryProperties memp; vkGetPhysicalDeviceMemoryProperties(phys, &memp);
     init_persistent_color_target_device_budget(memp);   // size the residency budget once (#1177)
@@ -10041,9 +10116,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         vkBindBufferMemory(dev, rb, bmem, 0);
     }
 
-    const RenderCommandPoolLease lease = acquire_render_command_pool(dev, qfi);
-    VkCommandPool pool = lease.pool;
-    VkCommandBuffer cmd = lease.command;   // already allocated; see RenderCommandPoolEntry
+    VkCommandPool pool = command_pool_lease.lease.pool;
+    VkCommandBuffer cmd = command_pool_lease.lease.command;   // see RenderCommandPoolEntry
     VkCommandBufferBeginInfo cbbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO}; cbbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(cmd, &cbbi);
     if (timing_enabled)
@@ -11885,6 +11959,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         transient_extra[slot] = cached_extra[slot] == nullptr;
     const bool transient_ds = use_ds && cached_ds == nullptr;
     const RenderVkCtx* ctx_ptr = &ctx;
+    // From here the completion-gated cleanup owns the pool; the guard must not also release it.
+    command_pool_lease.dismiss();
     active_submission.add_cleanup(
         [dev, qfi, pool, cmd, dv = std::move(dv), shared_descriptor_pool,
          shared_pipeline_layouts = std::move(shared_pipeline_layouts),

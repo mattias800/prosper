@@ -166,6 +166,11 @@ int main() {
          &with_depth, true,  ""},
         {RenderVkObjectCreateSite::ShaderModule, "shader-module", "vkCreateShaderModule",
          &opaque,     false, ""},
+        // #3721. Unlike its siblings this one is acquired FIRST, before any other resource, so the
+        // pass is dropped with nothing yet built. The dedicated block after this loop is what
+        // checks that "nothing yet built" claim; here it only has to report and drop.
+        {RenderVkObjectCreateSite::CommandPool, "command-pool", "vkCreateCommandPool",
+         &opaque,     true,  "queue-family="},
     };
 
     auto run_solid = [&](const Arm& arm, bool inject, std::vector<uint8_t>* px) -> std::string {
@@ -498,6 +503,71 @@ int main() {
         CHECK(!prosper::test::consume_render_vk_object_create_failure(
                   RenderVkObjectCreateSite::None),
               "the None site never fires");
+    }
+
+    // ---- #3721: a failed command-pool acquisition costs NOTHING to undo --------------------
+    //
+    // The fix is an ordering claim, not just a null check: `render_draw_pass_rgba` takes its
+    // command pool before it creates anything else, so the failure path is the pass's ordinary
+    // empty result with no teardown of its own. A plain "it returned empty" assertion cannot tell
+    // that apart from a pass that built forty handles and leaked them, so this block measures the
+    // resource traffic instead.
+    //
+    // The positive control is the load-bearing half. "The injected run allocated nothing" is only
+    // evidence if an uninjected run of the SAME render demonstrably allocates something -- against
+    // a counter that never moves, every implementation passes.
+    {
+        printf("  -- command-pool acquisition is first (#3721) --\n");
+        auto render_once = [&](bool inject, std::vector<uint8_t>* px) {
+            prosper::test::BackendDraw d;
+            d.vs = vert; d.fs = red_fs; d.ps = &opaque; d.vcount = 3;
+            if (inject)
+                prosper::test::inject_render_vk_object_create_failure_once(
+                    RenderVkObjectCreateSite::CommandPool);
+            *px = prosper::test::render_draws_rgba({d}, W, H, nullptr, black);
+        };
+        auto mem_traffic = [] {
+            const auto m = prosper::test::render_memory_pool_stats();
+            return m.hits + m.misses;
+        };
+
+        // POSITIVE CONTROL: an ordinary render moves the device-memory counter.
+        std::vector<uint8_t> px;
+        const uint64_t mem_before_control = mem_traffic();
+        render_once(false, &px);
+        const uint64_t control_traffic = mem_traffic() - mem_before_control;
+        CHECK(center_red(px) > 0xC0, "control: an uninjected render still draws");
+        CHECK(control_traffic > 0,
+              "control: an ordinary render DOES allocate device memory (so 0 below means something)");
+
+        // THE ARM. Nothing may be allocated, and the free list must be exactly as it was: a failed
+        // acquisition neither takes an entry out nor puts one in.
+        const auto pool_before = prosper::test::render_command_pool_stats();
+        const uint64_t mem_before = mem_traffic();
+        std::vector<uint8_t> failed_px;
+        render_once(true, &failed_px);
+        const auto pool_after = prosper::test::render_command_pool_stats();
+
+        CHECK(failed_px.empty(), "a failed acquisition drops the pass and reports the empty result");
+        CHECK(mem_traffic() == mem_before,
+              "...allocating NO device memory, so there is nothing that could have leaked");
+        CHECK(pool_after.cached == pool_before.cached,
+              "...leaving the free list exactly as it was");
+        CHECK(pool_after.retired == pool_before.retired &&
+              pool_after.destroyed == pool_before.destroyed,
+              "...retiring and destroying nothing");
+
+        // The process reaching this line is itself the "no null command buffer was used" evidence:
+        // vkBeginCommandBuffer(VK_NULL_HANDLE) aborts in the loader, so unfixed code cannot get
+        // here at all. Under the validation layer it is reported rather than merely fatal, which
+        // is why this test is in the vkval scan's set.
+        CHECK(true, "no null command buffer reached the loader (reaching this line proves it)");
+
+        // One-shot: the next render must be unaffected.
+        std::vector<uint8_t> after_px;
+        render_once(false, &after_px);
+        CHECK(center_red(after_px) > 0xC0,
+              "the injection is one-shot: the next render draws normally");
     }
 
     printf(fails ? "FAILED (%d)\n" : "PASSED\n", fails);
