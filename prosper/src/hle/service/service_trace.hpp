@@ -3,71 +3,31 @@
 // Shared service-call helpers, lifted out of hle_service.cpp so the per-library files split
 // out of it can reach them: guest-memory read/write for marshalling in and out of a Sony API, and
 // the PROSPER_SVCLOG call trace they all log through.
-// 
 // The copy/write helpers are guest-memory access rather than anything service-specific, and this
 // is one of FOURTEEN files that open-code process_vm_readv/ReadProcessMemory for the same job. This
 // header is not that consolidation -- it is scoped to src/hle/service -- but it is where the service
 // half of it would land.
 
-// hle_service.cpp — HLE of PS5 system services (user, NP/online, mouse, app content,
-// dialogs). Bring-up policy: openers return a valid positive handle; queries zero their
-// output struct and report a sane "not signed in / no device" state and success, so the
-// game gets consistent values instead of uninitialized memory.
-// (Game-controller input — libScePad — moved to hle_pad.cpp with a real host backend.)
-#include "hle/dispatch/dispatch.hpp"
-#include "hle/service/hle_addcontent.hpp"
-#include "hle/fs/save_paths.hpp"   // per-title save roots (#2734)
-#include "hle/fs/save_param.hpp"   // the save's parameter block (#2786)
-#include "hle/util/hle_json2.hpp"
-#include "hle/dispatch/nid.hpp"
-#include "hle/kernel/sce_errno.hpp"   // libkernel error encoding (libSceRandom reject arms)
-#include "diagnostics/env_numeric.hpp"   // #3267: a typo must not unregister a default-ON NID family
-#include "hle/dispatch/callback_fs.hpp"
-#include "hle/input/ime_input.hpp"
-#include "hle/service/platform_ui.hpp"
-#include "hle/video/video_backend.hpp"   // sceAvPlayer -> host hardware-decode backend (#705)
-#include "hle/video/h264_sps.hpp"        // SPS/VUI extraction for GetPictureInfo (#2898)
-#include "gpu/texture/guest_texture_layout.hpp" // exact HLE-produced sampled-linear layouts
+// The generated preamble was hle_service.cpp's own -- forty includes, for six helpers that need
+// eight. Trimmed by hand to what these definitions actually name, because a header included by
+// every per-library file is exactly where an over-broad preamble compounds.
 #include "host/platform/posix_shim.hpp"   // Darwin process_vm_readv shim + asm portability
-#include "host/image/boot_program.hpp"  // guest_module_name: is a callback target guest code?
-#include "host/platform/lifecycle.hpp"  // cooperative stop when the guest reports its own crash (#3119)
-#include <cinttypes>
-#include <cstddef>
-#include <cstdint>
-#include <cstring>
-#include <cstdio>
-#include <cstdlib>
-#include <cerrno>
-#include <atomic>
-#include <algorithm>
-#include <cctype>
-#include <chrono>
-#include <thread>
-#include <deque>
-#include <filesystem>
-#include <mutex>
-#include <new>          // std::bad_alloc — the guest file-replacement buffer is guest-sized (#1955)
-#include <set>
-#include <unordered_map>
-#include <vector>
-#include <string>
+#include <cinttypes>    // PRIx64 in the call trace
+#include <cstddef>      // size_t
+#include <cstdint>      // uint64_t, UINT64_MAX
+#include <cstdio>       // fprintf, stderr
+#include <cstdlib>      // getenv
 #ifdef _WIN32
-#include <direct.h>     // _mkdir (SaveDataMemory persistence dir)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
-#include <windows.h>
+#include <windows.h>    // ReadProcessMemory / WriteProcessMemory
 #else
-#include <sys/stat.h>   // mkdir
-#include <sys/uio.h>    // process_vm_readv: fault-contained diagnostic snapshots
-#include <sys/random.h> // getentropy: the host CSPRNG behind sceRandomGetRandomNumber
-#include <unistd.h>
-
-// Closing 1 conditional(s) the copied preamble left open; the
-// original closes them further down, outside any preamble region.
+#include <sys/uio.h>    // iovec, process_vm_readv/writev
+#include <unistd.h>     // getpid
 #endif
 
 namespace prosper {
