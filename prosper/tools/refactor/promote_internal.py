@@ -264,6 +264,15 @@ def merge_into_existing_header(existing: str, fresh: str, namespace: str) -> str
 
 
 
+class Refuse(Exception):
+    """A promotion the tool will not perform. Distinct from a crash: the message names the fix."""
+
+
+# `namespace {` possibly preceded by nothing else on the line. Matches the one-liner form this
+# codebase uses (`namespace { std::atomic<uint64_t> g_handle{1}; }`) and the multi-line opener.
+ANON_NAMESPACE_DECL = re.compile(r"^namespace\s*\{")
+
+
 def build(map_data: dict, original: str, promote: list[int], header_rel: str,
           namespace: str, guard_note: str, include_spelling: str = "",
           forward_decls: list[str] | None = None) -> tuple[str, str, list[str]]:
@@ -313,6 +322,24 @@ def build(map_data: dict, original: str, promote: list[int], header_rel: str,
                 # the hazard.
                 indent = line[:len(line) - len(stripped)]
                 body_lines[decl_offset] = indent + "inline " + stripped[len("static "):]
+            elif ANON_NAMESPACE_DECL.match(stripped):
+                # REFUSED, and this is the one refusal that exists because the alternative COMPILES.
+                # Prepending `inline` to `namespace { std::atomic<uint64_t> g_handle{1}; }` yields
+                # `inline namespace { ... }` -- an inline ANONYMOUS namespace, which is valid C++,
+                # still internal linkage, and therefore gives every including translation unit its
+                # own copy of the variable. For a handle allocator that means the guest is handed
+                # duplicate handles, with no diagnostic anywhere: the build is green, the tests pass
+                # until two libraries hand out the same number, and the header says `inline` so it
+                # reads as shared.
+                # Unwrapping it safely is not mechanical -- the brace may close on a later line, and
+                # the region may hold several declarations -- so the tool stops and says what it saw.
+                raise Refuse(
+                    f"region {i} ({r['name']}) is wrapped in its own anonymous namespace:\n"
+                    f"    {stripped.rstrip()}\n"
+                    f"  Promoting it would emit `inline namespace {{ ... }}`, which compiles, keeps "
+                    f"INTERNAL linkage, and so gives every includer its own copy -- silently.\n"
+                    f"  Unwrap it in the source first (drop the `namespace {{ }}`, leaving the "
+                    f"declaration at namespace scope), re-run map_symbols.py, then promote.")
             else:
                 body_lines[decl_offset] = "inline " + line
             inlined.append(r["name"])
@@ -656,6 +683,35 @@ def selftest() -> int:
     custom = header_banner("/x/prosper/src/hle/service/hle_service.cpp", "one\ntwo")
     assert custom == "// one\n// two\n", custom
     print("  [ok]   header banner is derived from the source, and --note overrides it")
+
+    # A region that is its own anonymous namespace must be REFUSED, not decorated. This arm exists
+    # because the wrong behaviour compiles: `inline namespace { ... }` is legal C++, keeps internal
+    # linkage, and hands every includer a private copy -- so nothing anywhere reports it.
+    anon_src = ("namespace prosper {\n"
+                "namespace { std::atomic<uint64_t> g_handle{1}; }\n"
+                "}  // namespace prosper\n")
+    wrapped_map = {
+        "file": "prosper/src/hle/service/hle_service.cpp",
+        "regions": [
+            {"index": 0, "start": 1, "end": 1, "role": "open", "kind": "NAMESPACE_OPEN",
+             "name": "prosper", "decl_line": 1, "symbols": [], "is_definition": False},
+            {"index": 1, "start": 2, "end": 2, "role": "body", "kind": "VAR_DECL",
+             "name": "g_handle", "decl_line": 2, "symbols": ["g_handle"], "is_definition": True},
+            {"index": 2, "start": 3, "end": 3, "role": "close", "kind": "NAMESPACE_CLOSE",
+             "name": "prosper", "decl_line": 3, "symbols": [], "is_definition": False},
+        ],
+    }
+    refused = False
+    try:
+        build(wrapped_map, anon_src, {1}, "hle_handles.hpp", "prosper", "// x\n",
+              "hle/service/hle_handles.hpp", [])
+    except Refuse as exc:
+        refused = True
+        assert "anonymous namespace" in str(exc), exc
+        assert "INTERNAL linkage" in str(exc), exc
+    assert refused, ("an anonymous-namespace-wrapped region was promoted instead of refused; "
+                     "that emits `inline namespace { }`, which compiles and is per-TU")
+    print("  [ok]   a region wrapped in its own anonymous namespace is refused, not decorated")
 
     print("  [ok]   promote_internal self-test: detection, extraction, and both must-fail arms")
     return 0
@@ -1020,8 +1076,12 @@ def main() -> int:
 
     note = header_banner(map_data["file"], args.note)
     spelling = canonical_include(map_data["file"], args.header)
-    header_text, new_source, inlined = build(map_data, original, promote, args.header,
-                                             args.namespace, note, spelling, forward_decls)
+    try:
+        header_text, new_source, inlined = build(map_data, original, promote, args.header,
+                                                 args.namespace, note, spelling, forward_decls)
+    except Refuse as refusal:
+        print(f"  [REFUSED] {refusal}")
+        return 1
     print(f"  [ok]   include written as \"{spelling}\" (the canonical form the other tools read)")
     problems = verify(original, map_data, promote, header_text, new_source, spelling)
     if problems:
