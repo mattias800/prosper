@@ -274,6 +274,10 @@ void register_ime_hle();
 // libSceSaveData and its dialog: mounts, transactions, save-data memory, params; called by
 // register_builtin_hle(). Split out of hle_service.cpp (#3735).
 void register_savedata_hle();
+// The NP / online family: NpManager, NpTrophy2, entitlement/GameUpdate, UniversalDataSystem,
+// Share and NetCtl -- one honest signed-out, disconnected console. Called by
+// register_builtin_hle(). Split out of hle_service.cpp (#3735).
+void register_np_hle();
 // libSceHttp local URI helpers; called by register_builtin_hle().
 void register_http_hle();
 // libSceHttp2: local id lifecycle, recorded settings, and an honest offline failure on the

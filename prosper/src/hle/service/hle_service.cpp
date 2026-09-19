@@ -127,22 +127,6 @@ HLE(s_user_age)       { if (a1) *(int32_t*)PW(a1) = 18; return 0; }          // 
 // prevents the frontend from reaching its pad/audio initialization.  This single-user model exposes
 // default user 1 as number 1, consistent with the rest of the UserService handlers above.
 HLE(s_user_number)    { if (a1) *(int32_t*)PW(a1) = 1; return 0; }
-// --- libSceVideodec2 ---------------------------------------------------------------------------
-// These ABI layouts/NIDs are the PS5 3.20 interfaces.  Decoding is intentionally a no-picture
-// implementation for now: it consumes each access unit, reports a valid lifecycle, and lets the
-// movie reach EOF instead of faking video pixels.  Critically, every successful query/open writes
-// all output fields.  The former generic success stubs left a null compute queue and crashed libc
-// at +0xfe66 on its first queue use.
-//
-// WHO ACTUALLY EXERCISES THIS, as recorded rather than as assumed.  A header line here used to read
-// "Sonic's CRI Mana movie backend uses the native VideoDec2 compute queue and decoder lifecycle."
-// It came from #1368 (8b37be95) — the same commit that added the unexplained compute_queue check
-// below and an equally unsupported "Sonic Origins' CRI Mana backend passes it", which was already
-// withdrawn.  No Videodec2 evidence for Sonic exists anywhere in docs/ or COMPATIBILITY.md, so it is
-// withdrawn on the same basis rather than left to be inherited a third time.  What IS recorded:
-//   - QueryComputeMemoryInfo only — Dragon Quest VII Reimagined and the UE4 bring-up.
-//   - The full decoder lifecycle — Tales of Graces f Remastered (PPSA19991) via criMvPly, and only
-//     after #1687; before that no title in this repo's history had ever reached CreateDecoder.
 namespace {
 // The current no-picture backend has no hardware decoder workspace: it only needs a stable,
 // caller-owned address for the opaque compute-queue identity.  Keep one guest page so clients that
@@ -204,42 +188,6 @@ HLE(s_gamepresets) {
     if (a1) { uint32_t sz = *(uint32_t*)PW(a1); if (sz > 8 && sz <= 0x400) memset((char*)PW(a1) + 8, 0, sz - 8); }
     return 0;
 }
-
-// --- NP / online: an honest OFFLINE, SIGNED-OUT console (#306). --------------------------------
-// The DOLL front-end boot flow stalls at UE4's InstallBundleManager PatchCheck because the Np
-// sign-in queries returned success-with-garbage-out: "success" from sceNpGetOnlineId told the
-// game a user IS signed in, pushing its patch/entitlement check onto online branches that then
-// wait forever on fake Http/WebApi handles (docs/DOLL_LOADING_PROGRESSION.md §3). A real console
-// with no PSN sign-in answers these with SCE_NP_ERROR_SIGNED_OUT so the flow resolves to its
-// offline path (UE4 PatchCheck -> NoLoggedInUser).
-// Error space verified against shadPS4 np_error.h (PS4-inherited; identical export names+NIDs in
-// the PS5 3.20 libSceNpManager stub table). SIGNED_OUT = 0x80550006. CONFIDENCE: HIGH on the PS4
-// semantic (shadPS4 returns exactly this from sceNpGetOnlineId/sceNpGetAccountIdA when no user is
-// signed in), MED that the PS5 errno value is unchanged (same 0x8055 Np facility, same API).
-static constexpr uint64_t NP_ERR_SIGNED_OUT = 0x80550006ull;   // SCE_NP_ERROR_SIGNED_OUT
-HLE(s_np_state)       { if (a1) *(int32_t*)PW(a1) = 1; return 0; }           // SCE_NP_STATE_SIGNED_OUT
-HLE(s_np_reach)       { if (a1) *(int32_t*)PW(a1) = 0; return 0; }
-// sceNpGetAccountIdA(userId, u64* accountId): signed-out consoles zero the id AND return the
-// signed-out error (shadPS4 np_manager.cpp:579 does exactly this). The previous success+0 was
-// contradictory garbage ("you have a user; their account id is 0").
-HLE(s_np_accountid)   { if (a1) *(uint64_t*)PW(a1) = 0; return NP_ERR_SIGNED_OUT; }
-// sceNpGetAccountCountryA: signed-out, out-struct untouched (matching the sibling getters). Was returning
-// SUCCESS with a zeroed country code -> the guest reads a blank as a valid region key and takes an
-// age/region/store path (the #306 success-masks-offline wedge) instead of the clean offline branch.
-HLE(s_np_country)     { return NP_ERR_SIGNED_OUT; }
-// sceNpGetOnlineId(userId, SceNpOnlineId* out): the signed-out error, out untouched (shadPS4
-// np_manager.cpp:618). The unimplemented success+garbage here is what faked the sign-in.
-HLE(s_np_getonlineid) { svc_log("sceNpGetOnlineId", a0,a1,a2,a3,a4,a5); return NP_ERR_SIGNED_OUT; }
-// sceNpGetNpId(userId, SceNpId* out): the signed-out error, out untouched (shadPS4 np_manager.cpp) — the
-// most common identity getter. Was MISSING -> the return-0 stub told the guest a valid online identity
-// existed (a garbage ~40-byte SceNpId), pushing it onto online/entitlement branches that dead-end. This
-// was a direct hole in the #306 signed-out fix (the sibling getters below were done, this one wasn't).
-HLE(s_np_getnpid)     { svc_log("sceNpGetNpId", a0,a1,a2,a3,a4,a5); return NP_ERR_SIGNED_OUT; }
-// sceNpCheckNpAvailability / ...A / CheckNpReachability: an honest signed-out console. Were MISSING -> the
-// return-0 stub answered "PSN is available", pushing the guest onto online branches that then wait forever
-// (the #306 wedge class). NOTE: the async poll/request pairing (sceNpPollAsync / CreateAsyncRequest) is
-// deliberately left for a follow-up -- its exact completion flow needs a live PROSPER_SVCLOG capture.
-HLE(s_np_check_avail) { svc_log("sceNpCheckNpAvailability", a0,a1,a2,a3,a4,a5); return NP_ERR_SIGNED_OUT; }
 // The local network libraries allocate opaque contexts even on a disconnected console; connection
 // state is reported separately through NetCtl/NP. Returning generic success (0) from these ID-returning
 // constructors instead creates an invalid context and makes their owner's initialization fail. The
@@ -248,8 +196,6 @@ HLE(s_np_check_avail) { svc_log("sceNpCheckNpAvailability", a0,a1,a2,a3,a4,a5); 
 namespace {
 std::atomic<int32_t> g_net_pool_id{1};
 std::atomic<int32_t> g_ssl_context_id{1};
-std::atomic<int32_t> g_npweb_context_id{1};
-std::atomic<int32_t> g_npweb_user_context_id{1001};
 }
 HLE(s_net_pool_create) {
     svc_log("sceNetPoolCreate", a0,a1,a2,a3,a4,a5);
@@ -260,31 +206,6 @@ HLE(s_ssl_init) {
     svc_log("sceSslInit", a0,a1,a2,a3,a4,a5);
     if (!a0) return 0x8094000cull; // SCE_SSL_ERROR_OUT_OF_SIZE
     return (uint64_t)(uint32_t)g_ssl_context_id.fetch_add(1);
-}
-HLE(s_npweb_init) {
-    svc_log("sceNpWebApi2Initialize", a0,a1,a2,a3,a4,a5);
-    return (uint64_t)(uint32_t)g_npweb_context_id.fetch_add(1);
-}
-HLE(s_npweb_create_user_context) {
-    svc_log("sceNpWebApi2CreateUserContext", a0,a1,a2,a3,a4,a5);
-    return (uint64_t)(uint32_t)g_npweb_user_context_id.fetch_add(1);
-}
-HLE(s_netctl_getresult) {
-    svc_log("sceNetCtlGetResult", a0,a1,a2,a3,a4,a5);
-    if (!svc_ptrish(a1)) return 0x80412103ull; // SCE_NET_CTL_ERROR_INVALID_ADDR
-    *(int32_t*)PW(a1) = 0;
-    return 0;
-}
-// sceNpHasSignedUp(userId, bool* hasSignedUp): Sonic passes an ODD output address (..cdf), proving
-// the result is one byte rather than int32. An offline initial user has no NP signup in this headless
-// profile. Success + false lets the caller select its signed-out branch without inventing an online
-// identity; the old success-with-untouched-stack answer made that branch random. CONFIDENCE: HIGH
-// on the ABI and byte width (live PS5 title trace), MED on success+false for the offline profile.
-HLE(s_np_has_signed_up) {
-    svc_log("sceNpHasSignedUp", a0,a1,a2,a3,a4,a5);
-    if (!svc_ptrish(a1)) return 0x80550003ull; // SCE_NP_ERROR_INVALID_ARGUMENT
-    *(uint8_t*)PW(a1) = 0;
-    return 0;
 }
 
 // --- mouse (report a device that exists but has no input; pad -> hle_pad.cpp real backend) ---
@@ -811,25 +732,6 @@ HLE(s_dialog_result) {
     return 0;
 }
 
-
-// --- libSceNpTrophy2 (PS5 trophy system) — the DOLL 34.6 GB OOM (issue #213 diagnosis). ---------
-// The guest's trophy bring-up (eboot+0xdbcb43..0xdbcc2e, gdb-captured live) calls
-// sceNpTrophy2GetGameInfo(ctx, handle, out*, 0) — NID 4IzqhhUQ3nk named via nid_hash brute force —
-// then grows TWO arrays from the out-struct's counts (u32 at out+0x4: 32-byte entries; a second
-// 0x520-byte-entry array) and calls a sibling (y3zHpdZO6ME, unnamed) to fill them. The generic
-// unimplemented stub returned 0 = SUCCESS with the out-struct UNWRITTEN, so the engine consumed
-// heap garbage as a trophy count: gdb-captured count 0x408bd000 -> a 34,644,492,288-byte TArray
-// grow ("Ran out of memory allocating 34644492288 bytes") — and when the garbage happened to be
-// allocatable-huge instead, the minutes-long zero-fill starved the RenderThread until UE's
-// "GameThread timed out waiting for RenderThread after 120.00 secs" watchdog killed the boot.
-// Without a trophy backend the honest answer is FAILURE: a negative return takes the caller's
-// clean invalid path (eboot+0xdbd239/0xdbd242: mark the trophy config unavailable, continue) —
-// exactly the state a real console reports with no signed-in user. Only the SIGN of the return is
-// consumed by this caller; the exact NpTrophy2 error space is unverified (no Kyty/shadPS4/stub
-// reference), so the value is chosen inside the documented SCE_NP_TROPHY (0x8055xxxx) range.
-// CONFIDENCE: HIGH that failure beats success+garbage; LOW on the specific error constant.
-HLE(s_nptrophy2_unavailable) { return 0x80551500ull; }
-
 // ===== Issue #232: the Sony services DOLL's level-load flow polls (PlayGo / SaveData / =========
 // ===== NpTrophy2 lifecycle / Share). All NID<->name pairs verified against the PS5 3.20 ========
 // ===== library stub tables (PS5-3.20_Libs/libSce{PlayGo,SaveData.native,NpTrophy2,Share}.c). ===
@@ -1012,73 +914,8 @@ HLE(s_playgo_getspeed) { if (!a1) return PLAYGO_ERR_BAD_POINTER; *(int32_t*)PW(a
 // are per-language bits; all-ones = every language's chunks installed).
 HLE(s_playgo_getlang) { if (!a1) return PLAYGO_ERR_BAD_POINTER;
                         *(uint64_t*)PW(a1) = ~0ull; return 0; }
-
-// --- libSceNpTrophy2 lifecycle: succeed with valid ids (trophy CONTENT stays unavailable). ------
-// PS4 NpTrophy ABI carried to Trophy2 (context/handle are small s32 ids written through arg0;
-// Kyty LibNpTrophy + shadPS4 np_trophy agree on the PS4 shape). The game's trophy worker needs
-// CreateContext/CreateHandle/RegisterContext to hand back usable ids so its bring-up completes;
-// the info queries (GetGameInfo/GetTrophyInfoArray) keep returning "unavailable" (see
-// s_nptrophy2_unavailable above) which the guest handles on a clean path. CONFIDENCE: MED.
-HLE(s_nptrophy2_createctx)    { svc_log("sceNpTrophy2CreateContext", a0,a1,a2,a3,a4,a5);
-                                if (a0) *(int32_t*)PW(a0) = 1; return 0; }
-HLE(s_nptrophy2_createhandle) { svc_log("sceNpTrophy2CreateHandle", a0,a1,a2,a3,a4,a5);
-                                if (a0) *(int32_t*)PW(a0) = 1; return 0; }
-HLE(s_nptrophy2_regctx)       { svc_log("sceNpTrophy2RegisterContext", a0,a1,a2,a3,a4,a5); return 0; }
-HLE(s_nptrophy2_ok)           { return 0; }
-
-// --- libSceShare / libSceGameLiveStreaming: local lifecycle, features unavailable headless. -----
-// The PS5 3.20 import table supplies the exact NIDs. Kyty's matching SDK surface gives the call
-// shapes: ShareSetContentParam takes one required C string; GameLiveStreamingInitialize takes only
-// a heap size. Neither successful call has an out-param. CONFIDENCE: HIGH for the live Sonic call
-// shapes (PROSPER_SVCLOG), MED for the reference-derived invalid-param value.
-HLE(s_share_ok) { return 0; }
-HLE(s_share_content_param) {
-    svc_log("sceShareSetContentParam", a0,a1,a2,a3,a4,a5);
-    return a0 ? 0 : 0x81960002ull; // SCE_SHARE_ERROR_INVALID_PARAM (Kyty libShare.cpp)
-}
 HLE(s_live_streaming_init) {
     svc_log("sceGameLiveStreamingInitialize", a0,a1,a2,a3,a4,a5);
-    return 0;
-}
-
-// --- libSceNpUniversalDataSystem (PS5 telemetry/activities): hand out ids, stay inert. ----------
-// PS5-only, no reference implementation; by symmetry with every Np Create* API the first arg of
-// CreateContext/CreateHandle is the out-id pointer (pointer-range-guarded so a wrong guess can't
-// fault). Offline console: everything else no-ops. CONFIDENCE: LOW (guarded).
-HLE(s_npuds_create) { svc_log("sceNpUniversalDataSystemCreate*", a0,a1,a2,a3,a4,a5);
-                      if (svc_ptrish(a0)) *(int32_t*)PW(a0) = 1; return 0; }
-HLE(s_npuds_ok)     { return 0; }
-// Two observed CreateEvent call shapes (both write opaque ids the guest never dereferences):
-//  * Dead Cells: CreateEvent(name?, reserved, Event** a2, PropertyObject** a3) — a2 AND a3 are
-//    out-pointers.
-//  * Alex Kidd DX (PPSA02664, svc dump): CreateEvent(name a0="activityTerminate", ctx a1,
-//    Event** a2, 0, PropertyObject** a4, 0) — outs are a2 and a4, a3 is literal 0, a5 literal 0.
-//    The old a3-must-be-a-pointer guard returned NP-invalid-argument here, and the title retried
-//    every frame forever — holding its cutscene->gameplay transition on a black screen (#320).
-// Accept both: a2 is always the event out; the property out is a3 when pointer-like. The a4 form is
-// admitted ONLY for Alex Kidd's exact trailing shape (a3==0 AND a5==0) — svc_ptrish is a wide range
-// check that cannot by itself tell a real out-pointer from leftover-register garbage, so requiring
-// both trailing reserved words to be zero pins the write to the observed 6-arg layout. A different
-// title that legitimately passes a3==0 with a non-zero/garbage a5 hits neither property write and
-// still returns success (0), which is what actually stops the retry loop. CONFIDENCE: LOW.
-HLE(s_npuds_create_event) {
-    svc_log("sceNpUniversalDataSystemCreateEvent", a0,a1,a2,a3,a4,a5);
-    if (!svc_ptrish(a2)) return 0x80550003ull; // NP invalid argument
-    *(uint64_t*)PW(a2) = g_handle.fetch_add(1);
-    if (svc_ptrish(a3))                                *(uint64_t*)PW(a3) = g_handle.fetch_add(1);
-    else if (a3 == 0 && a5 == 0 && svc_ptrish(a4))     *(uint64_t*)PW(a4) = g_handle.fetch_add(1);
-    return 0;
-}
-HLE(s_npuds_post_event) {
-    svc_log("sceNpUniversalDataSystemPostEvent", a0,a1,a2,a3,a4,a5);
-    return 0;
-}
-HLE(s_npuds_destroy_event) {
-    svc_log("sceNpUniversalDataSystemDestroyEvent", a0,a1,a2,a3,a4,a5);
-    return 0;
-}
-HLE(s_npuds_object_set_string) {
-    svc_log("sceNpUniversalDataSystemEventPropertyObjectSetString", a0,a1,a2,a3,a4,a5);
     return 0;
 }
 HLE(s_gameintent_init) {
@@ -1177,16 +1014,6 @@ HLE(s_npent_addcont_info) {
 // cleanly, no crash). CONFIDENCE: HIGH.
 namespace {
 #ifndef _WIN32
-inline uint64_t cb_rd_fsbase() { uint64_t v; __asm__ volatile("rdfsbase %0" : "=r"(v)); return v; }
-inline void     cb_wr_fsbase(uint64_t v) { __asm__ volatile("wrfsbase %0" : : "r"(v)); }
-// RAII: run the enclosed guest callback on the guest %fs (no-op when guest_fs==0).
-struct CbGuestFsScope {
-    uint64_t saved = 0, active = 0;
-    explicit CbGuestFsScope(uint64_t guest_fs) {
-        if (guest_fs) { saved = cb_rd_fsbase(); cb_wr_fsbase(guest_fs); active = guest_fs; }
-    }
-    ~CbGuestFsScope() { if (active) cb_wr_fsbase(saved); }
-};
 #endif
 }
 
@@ -1202,58 +1029,7 @@ struct CbGuestFsScope {
 // PROSPER_NETCTL_CB=0 restores the old unimplemented behavior.
 namespace {
 #ifndef _WIN32
-std::atomic<uint64_t> g_netctl_cb_fn{0};
-std::atomic<uint64_t> g_netctl_cb_arg{0};
-std::atomic<int>      g_netctl_cb_delivered{0};
 #endif
-}
-#ifndef _WIN32
-HLE(s_netctl_register_cb) {   // (func, arg, int* cid)
-    svc_log("sceNetCtlRegisterCallback", a0,a1,a2,a3,a4,a5);
-    g_netctl_cb_fn.store(a0);
-    g_netctl_cb_arg.store(a1);
-    if (svc_ptrish(a2)) *(int32_t*)PW(a2) = 1;   // callback id (Kyty Network.cpp NetCtlRegisterCallback)
-    return 0;
-}
-// sceNetCtlGetState(int* state): 0 = DISCONNECTED (Kyty Network.cpp:1398 writes exactly this).
-// Run-7 live capture: the game calls this for the FIRST time immediately after the DISCONNECTED
-// callback delivery — the unimplemented success+garbage-out answer is what re-wedged the flow.
-HLE(s_netctl_getstate) {
-    svc_log("sceNetCtlGetState", a0,a1,a2,a3,a4,a5);
-    if (svc_ptrish(a0)) *(int32_t*)PW(a0) = 0;   // SCE_NET_CTL_STATE_DISCONNECTED
-    return 0;
-}
-extern "C" uint64_t s_netctl_check_cb_c(uint64_t a0, uint64_t a1, uint64_t a2,
-                                        uint64_t a3, uint64_t a4, uint64_t a5,
-                                        uint64_t entry_rsp);
-PROSPER_ASM_TRAMPOLINE(s_netctl_check_cb_entry, s_netctl_check_cb_c)
-extern "C" void s_netctl_check_cb_entry();
-extern "C" uint64_t s_netctl_check_cb_c(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
-                                        uint64_t entry_rsp) {
-    uint64_t fn = g_netctl_cb_fn.load();
-    if (!fn || g_netctl_cb_delivered.exchange(1)) return 0;   // deliver the initial state exactly once
-    uint64_t gfs = callback_guest_fs_from_entry_stack(entry_rsp);
-    {
-        CbGuestFsScope fs(gfs);
-        ((void (*)(int, void*))(uintptr_t)fn)(1 /*SCE_NET_CTL_EVENT_TYPE_DISCONNECTED*/,
-                                              (void*)(uintptr_t)g_netctl_cb_arg.load());
-    }
-    // NOTE: log only AFTER the scope restored the host %fs — host libc (fprintf) reads %fs-based
-    // TLS and crashes on the guest %fs (learned the hard way: NULL+0x308 fault in libc).
-    fprintf(stderr, "[svc] NetCtl state callback DELIVERED (eventType=DISCONNECTED, guest_fs=%d)\n",
-            gfs ? 1 : 0);
-    return 0;
-}
-#endif
-// sceNetCtlGetInfo(int code, SceNetCtlInfo* info): a console with no network connection answers
-// NOT_CONNECTED for the connection-dependent info codes and writes nothing (shadPS4 netctl.cpp:163
-// returns ORBIS_NET_CTL_ERROR_NOT_CONNECTED = 0x80412108 for ALL codes when disconnected; Kyty
-// only implements the connected path). PS4-inherited surface, identical export on PS5 3.20
-// (obuxdTiwkF8). Works on all platforms (no callback machinery). CONFIDENCE: HIGH on semantics,
-// MED on the PS5 errno value (same 0x8041 NetCtl facility).
-HLE(s_netctl_getinfo) {
-    svc_log("sceNetCtlGetInfo", a0,a1,a2,a3,a4,a5);
-    return 0x80412108ull;   // SCE_NET_CTL_ERROR_NOT_CONNECTED
 }
 
 // --- libSceNpManager state callback: deliver SIGNED_OUT once (#306). ----------------------------
@@ -1266,46 +1042,8 @@ HLE(s_netctl_getinfo) {
 // contract (two agreeing PS4 references, PS4-inherited surface; PS5 3.20 exports the same names).
 namespace {
 #ifndef _WIN32
-struct NpStateCbSlot { std::atomic<uint64_t> fn{0}, arg{0}; std::atomic<int> delivered{0}; };
-NpStateCbSlot     g_np_state_cbs[4];
-std::atomic<int>  g_np_state_cb_n{0};
 #endif
 }
-#ifndef _WIN32
-HLE(s_np_register_state_cbA) {   // (SceNpStateCallbackA func, void* userdata) -> callback id
-    svc_log("sceNpRegisterStateCallbackA", a0,a1,a2,a3,a4,a5);
-    if (!a0) return 0x80550003ull;   // SCE_NP_ERROR_INVALID_ARGUMENT
-    int i = g_np_state_cb_n.fetch_add(1);
-    if (i >= 4) { g_np_state_cb_n.store(4); return 0x8055001Dull; }  // SCE_NP_ERROR_CALLBACK_MAX
-    g_np_state_cbs[i].arg.store(a1);
-    g_np_state_cbs[i].fn.store(a0);
-    return (uint64_t)(i + 1);
-}
-extern "C" uint64_t s_np_check_cb_c(uint64_t a0, uint64_t a1, uint64_t a2,
-                                    uint64_t a3, uint64_t a4, uint64_t a5,
-                                    uint64_t entry_rsp);
-PROSPER_ASM_TRAMPOLINE(s_np_check_cb_entry, s_np_check_cb_c)
-extern "C" void s_np_check_cb_entry();
-extern "C" uint64_t s_np_check_cb_c(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
-                                    uint64_t entry_rsp) {
-    int n = g_np_state_cb_n.load(); if (n > 4) n = 4;
-    uint64_t gfs = callback_guest_fs_from_entry_stack(entry_rsp);
-    for (int i = 0; i < n; i++) {
-        uint64_t fn = g_np_state_cbs[i].fn.load();
-        if (!fn || g_np_state_cbs[i].delivered.exchange(1)) continue;
-        {
-            CbGuestFsScope fs(gfs);
-            ((void (*)(int32_t, int32_t, void*))(uintptr_t)fn)(
-                1 /*initial userId (sceUserServiceGetInitialUser)*/, 1 /*SCE_NP_STATE_SIGNED_OUT*/,
-                (void*)(uintptr_t)g_np_state_cbs[i].arg.load());
-        }
-        // Log only on the restored host %fs (fprintf on the guest %fs faults in libc TLS).
-        fprintf(stderr, "[svc] Np state callback DELIVERED (userId=1, state=SIGNED_OUT, guest_fs=%d)\n",
-                gfs ? 1 : 0);
-    }
-    return 0;
-}
-#endif
 
 // --- libSceErrorDialog: the real Initialize/Open/Close lifecycle (auto-dismiss, headless). ------
 // Status enum shared with CommonDialog: NONE=0, INITIALIZED=1, RUNNING=2, FINISHED=3 (shadPS4
@@ -1601,44 +1339,8 @@ HLE(s_random_get_random_number) {
 void register_service_hle() {
     register_json2_hle();
     #define R(str, fn) Hle::register_fn(nid_hash(str), (HleFn)(fn), str)
-#ifndef _WIN32
-    // NetCtl offline-console state delivery — default ON since #306 (see block comment above).
-    // PROSPER_NETCTL_CB=0 restores the previous unimplemented behavior.
-    {
-        // DEFAULT ON since #306. `strtol` answered 0 for `=yes`/`=true`/`=on`, and the consequence
-        // is not a lost diagnostic: the three callback NIDs guarded here (RegisterCallback,
-        // CheckCallback, GetState) go UNREGISTERED, so the guest gets the pre-#306 unimplemented
-        // behaviour from what the operator read as "enable it". GetInfo and GetResult below are
-        // registered unconditionally and are unaffected (#3267).
-        const char* e = getenv("PROSPER_NETCTL_CB");
-        if (prosper::diag::env_u64_or_default_auto("PROSPER_NETCTL_CB", e, 1ull) != 0) {
-            R("sceNetCtlRegisterCallback", s_netctl_register_cb);      // UJ+Z7Q+4ck0
-            R("sceNetCtlCheckCallback",    s_netctl_check_cb_entry);   // iQw3iQPhvUQ
-            R("sceNetCtlGetState",         s_netctl_getstate);         // uBPlr0lbuiI
-        }
-    }
-#endif
-    Hle::register_fn("obuxdTiwkF8", (HleFn)s_netctl_getinfo, "sceNetCtlGetInfo");  // NOT_CONNECTED
-    Hle::register_fn("0cBgduPRR+M", (HleFn)s_netctl_getresult, "sceNetCtlGetResult");
     Hle::register_fn("dgJBaeJnGpo", (HleFn)s_net_pool_create, "sceNetPoolCreate");
     Hle::register_fn("hdpVEUDFW3s", (HleFn)s_ssl_init, "sceSslInit");
-    // libSceHttp2 lives in src/hle/net/hle_http2.cpp now, sceHttp2Init with it (#2894): the
-    // context it returns is a slot that library's own create path validates against.
-    Hle::register_fn("+o9816YQhqQ", (HleFn)s_npweb_init, "sceNpWebApi2Initialize");
-    Hle::register_fn("sk54bi6FtYM", (HleFn)s_npweb_create_user_context,
-                     "sceNpWebApi2CreateUserContext");
-    // NpTrophy2: the config/info queries whose success-with-garbage-out crashed DOLL (see above).
-    // ALL FIVE of the library's info queries must answer here, not just the two that a title
-    // happened to crash on. Each writes its result through a caller-supplied out-struct, so any one
-    // of them left unregistered returns the dispatcher's 0 — SCE_OK — over memory nothing wrote,
-    // which is the failure #213 diagnosed (a heap-garbage trophy count sized a 34 GB array). The
-    // singular/plural pairs are the trap: registering `…TrophyInfoArray` and not `…TrophyInfo`
-    // leaves the identical shape live behind a name that looks covered. #1956, swept under #2081.
-    Hle::register_fn("4IzqhhUQ3nk", (HleFn)s_nptrophy2_unavailable, "sceNpTrophy2GetGameInfo");
-    Hle::register_fn("y3zHpdZO6ME", (HleFn)s_nptrophy2_unavailable, "sceNpTrophy2GetTrophyInfoArray");
-    Hle::register_fn("EwNylPdWUTM", (HleFn)s_nptrophy2_unavailable, "sceNpTrophy2GetTrophyInfo");
-    Hle::register_fn("DoZWauG8mu0", (HleFn)s_nptrophy2_unavailable, "sceNpTrophy2GetGroupInfo");
-    Hle::register_fn("+PDSI6WgPRc", (HleFn)s_nptrophy2_unavailable, "sceNpTrophy2GetGroupInfoArray");
     // libSceRandom's only export — see the block comment above s_random_get_random_number.
     Hle::register_fn("PI7jIZj4pcE", (HleFn)s_random_get_random_number, "sceRandomGetRandomNumber");
     // user service
@@ -1669,28 +1371,6 @@ void register_service_hle() {
     Hle::register_fn("qP-EvQRl2Hc", (HleFn)s_ok, "sceLoginDialogInitialize");
     R("sceUserServiceInitialize", s_ok);
     R("sceUserServiceTerminate", s_ok);
-    // NP — an honest signed-out console (#306). NIDs verified against the PS5 3.20
-    // libSceNpManager stub table AND shadPS4's PS4 registrations (identical).
-    R("sceNpGetState", s_np_state);
-    R("sceNpGetNpReachabilityState", s_np_reach);
-    R("sceNpGetAccountIdA", s_np_accountid);
-    R("sceNpGetAccountCountryA", s_np_country);
-    Hle::register_fn("XDncXQIJUSk", (HleFn)s_np_getonlineid, "sceNpGetOnlineId");
-    Hle::register_fn("p-o74CnoNzY", (HleFn)s_np_getnpid,   "sceNpGetNpId");       // was MISSING -> faked identity
-    Hle::register_fn("2rsFmlGWleQ", (HleFn)s_np_check_avail, "sceNpCheckNpAvailability");   // was MISSING -> faked "available"
-    Hle::register_fn("8Z2Jc5GvGDI", (HleFn)s_np_check_avail, "sceNpCheckNpAvailabilityA");
-    Hle::register_fn("KfGZg2y73oM", (HleFn)s_np_check_avail, "sceNpCheckNpReachability");
-    Hle::register_fn("Oad3rvY-NJQ", (HleFn)s_np_has_signed_up, "sceNpHasSignedUp");
-    Hle::register_fn("a8R9-75u4iM", (HleFn)s_np_accountid, "sceNpGetAccountId");  // non-A variant: zero id + SIGNED_OUT
-    R("sceNpRegisterStateCallback", s_ok);
-#ifndef _WIN32
-    // sceNpCheckCallback pumps the registered A-callbacks (SIGNED_OUT delivered once, guest %fs).
-    Hle::register_fn("3Zl8BePTh9Y", (HleFn)s_np_check_cb_entry,      "sceNpCheckCallback");
-    Hle::register_fn("qQJfO8HAiaY", (HleFn)s_np_register_state_cbA,  "sceNpRegisterStateCallbackA");
-    Hle::register_fn("M3wFXbYQtAA", (HleFn)s_ok,                     "sceNpUnregisterStateCallbackA");
-#else
-    R("sceNpCheckCallback", s_ok);
-#endif
     // pad -> hle_pad.cpp (register_pad_hle). mouse:
     R("sceMouseInit", s_ok);
     R("sceMouseOpen", s_open);
@@ -1752,22 +1432,6 @@ void register_service_hle() {
     Hle::register_fn("3OMbYZBaa50", (HleFn)s_playgo_getlang,     "scePlayGoGetLanguageMask");
     Hle::register_fn("LosLlHOpNqQ", (HleFn)s_ok,                 "scePlayGoSetLanguageMask");
     Hle::register_fn("-Q1-u1a7p0g", (HleFn)s_ok,                 "scePlayGoPrefetch");
-    // libSceNpTrophy2 lifecycle — valid ids; content queries stay "unavailable" (above).
-    Hle::register_fn("Bagshr7OQ6Q", (HleFn)s_nptrophy2_createctx,    "sceNpTrophy2CreateContext");
-    Hle::register_fn("Gz1rmUZpROM", (HleFn)s_nptrophy2_createhandle, "sceNpTrophy2CreateHandle");
-    Hle::register_fn("bIDov3wBu5Q", (HleFn)s_nptrophy2_regctx,       "sceNpTrophy2RegisterContext");
-    Hle::register_fn("sUXGfNMalIo", (HleFn)s_nptrophy2_ok,           "sceNpTrophy2RegisterUnlockCallback");
-    Hle::register_fn("sysY2FHYff4", (HleFn)s_nptrophy2_ok,           "sceNpTrophy2DestroyContext");
-    Hle::register_fn("d8P11CI40KE", (HleFn)s_nptrophy2_ok,           "sceNpTrophy2DestroyHandle");
-    Hle::register_fn("fYapWA9xVmA", (HleFn)s_nptrophy2_ok,           "sceNpTrophy2AbortHandle");
-    // libSceShare — succeed; sharing simply unavailable headless.
-    Hle::register_fn("nBDD66kiFW8", (HleFn)s_share_ok, "sceShareInitialize");
-    Hle::register_fn("0IL1keINExQ", (HleFn)s_share_ok, "sceShareTerminate");
-    Hle::register_fn("7QZtURYnXG4", (HleFn)s_share_content_param, "sceShareSetContentParam");
-    Hle::register_fn("ORspsWDXPps", (HleFn)s_share_ok, "sceShareSetContentParamForApplicationTitle");
-    Hle::register_fn("T64o-315wbg", (HleFn)s_share_ok, "sceShareSetScreenshotOverlayImage");
-    Hle::register_fn("kvYEw2lBndk", (HleFn)s_live_streaming_init, "sceGameLiveStreamingInitialize");
-    Hle::register_fn("9yK6Fk8mKOQ", (HleFn)s_share_ok, "sceGameLiveStreamingTerminate");
     // libSceErrorDialog — real lifecycle, auto-dismiss (#306). NIDs from the PS5 3.20 stub table
     // (identical to shadPS4's PS4 registrations).
     Hle::register_fn("I88KChlynSs", (HleFn)s_errdialog_init,   "sceErrorDialogInitialize");
@@ -1778,6 +1442,8 @@ void register_service_hle() {
     Hle::register_fn("9XAxK2PMwk8", (HleFn)s_errdialog_term,   "sceErrorDialogTerminate");
     Hle::register_fn("t2FvHRXzgqk", (HleFn)s_errdialog_status, "sceErrorDialogGetStatus");
     Hle::register_fn("WWiGuh9XfgQ", (HleFn)s_errdialog_status, "sceErrorDialogUpdateStatus");
+    Hle::register_fn("3RQ5aQfnstU", (HleFn)s_syss_noticeskip, "sceSystemServiceGetNoticeScreenSkipFlag");
+    Hle::register_fn("kvYEw2lBndk", (HleFn)s_live_streaming_init, "sceGameLiveStreamingInitialize");
     // libSceNpEntitlementAccess / libSceGameUpdate — observability (svc_log) with the real-console
     // "local init succeeds offline" return; follow-ups deliberately left unimplemented (see above).
     Hle::register_fn("jO8DM8oyego", (HleFn)s_npent_init,      "sceNpEntitlementAccessInitialize");
@@ -1788,20 +1454,6 @@ void register_service_hle() {
                      "sceNpEntitlementAccessGetAddcontEntitlementInfoList");
     Hle::register_fn("5LiMEPuW0DQ", (HleFn)s_npent_getkey, "sceNpEntitlementAccessGetEntitlementKey");
     Hle::register_fn("lPDO62PpJIA", (HleFn)s_npent_skuflag, "sceNpEntitlementAccessGetSkuFlag");
-    Hle::register_fn("3RQ5aQfnstU", (HleFn)s_syss_noticeskip, "sceSystemServiceGetNoticeScreenSkipFlag");
-    // libSceNpUniversalDataSystem — inert ids (guarded LOW-confidence out-writes).
-    Hle::register_fn("sjaobBgqeB4", (HleFn)s_npuds_ok,     "sceNpUniversalDataSystemInitialize");
-    Hle::register_fn("5zBnau1uIEo", (HleFn)s_npuds_create, "sceNpUniversalDataSystemCreateContext");
-    Hle::register_fn("hT0IAEvN+M0", (HleFn)s_npuds_create, "sceNpUniversalDataSystemCreateHandle");
-    Hle::register_fn("tpFJ8LIKvPw", (HleFn)s_npuds_ok,     "sceNpUniversalDataSystemRegisterContext");
-    Hle::register_fn("p+GcLqwpL9M", (HleFn)s_npuds_create_event,
-                     "sceNpUniversalDataSystemCreateEvent");
-    Hle::register_fn("CzkKf7ahIyU", (HleFn)s_npuds_post_event,
-                     "sceNpUniversalDataSystemPostEvent");
-    Hle::register_fn("wG+84pnNIuo", (HleFn)s_npuds_destroy_event,
-                     "sceNpUniversalDataSystemDestroyEvent");
-    Hle::register_fn("MfDb+4Nln64", (HleFn)s_npuds_object_set_string,
-                     "sceNpUniversalDataSystemEventPropertyObjectSetString");
     Hle::register_fn("m87BHxt-H60", (HleFn)s_gameintent_init,
                      "sceNpGameIntentInitialize");
     Hle::register_fn("0HBYxYAjmf0", (HleFn)s_gameintent_term,

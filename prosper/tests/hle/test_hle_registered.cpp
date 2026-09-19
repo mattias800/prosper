@@ -79,6 +79,13 @@ int main() {
         "sceSaveDataCreateTransactionResource", "sceSaveDataDeleteTransactionResource",
         "sceSaveDataSetupSaveDataMemory2", "sceSaveDataGetSaveDataMemory2",
         "sceSaveDataDialogInitialize", "sceSaveDataDialogOpen", "sceSaveDataDialogUpdateStatus",
+        // The NP / online family (register_np_hle, src/hle/np/np.cpp). sceNpCheckCallback and
+        // sceNpUnregisterStateCallbackA bind from inside an #ifndef _WIN32 / #else pair, to a
+        // different handler on each arm, so this asserts the NID is bound on whichever is building.
+        "sceNpGetState", "sceNpGetNpReachabilityState", "sceNpCheckNpAvailability",
+        "sceNpCheckCallback", "sceNpRegisterStateCallback",
+        "sceNetCtlGetInfo", "sceNetCtlGetResult",
+        "sceNpTrophy2GetGameInfo", "sceNpTrophy2CreateContext",
         // HTTP helpers
         "sceHttpUriParse",
         // graphics (headless bring-up)
