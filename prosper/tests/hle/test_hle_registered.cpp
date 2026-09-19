@@ -58,6 +58,14 @@ int main() {
         "sceAvPlayerAddSource", "sceAvPlayerAddSourceEx", "sceAvPlayerStart", "sceAvPlayerIsActive",
         "sceAvPlayerGetVideoData", "sceAvPlayerGetVideoDataEx", "sceAvPlayerGetAudioData",
         "sceAvPlayerStop", "sceAvPlayerClose",
+        // libSceVideodec2 / libSceVdecsw, same reasoning, same entry point shape
+        // (register_videodec_hle, src/hle/video/videodec2.cpp). libScePsml is deliberately absent:
+        // its NIDs have no recovered names, so they are registered by raw NID and there is no name
+        // to hash here. Registering under a name the library does not have would be a worse guard
+        // than none -- it would pass while proving nothing about the real NID.
+        "sceVideodec2CreateDecoder", "sceVideodec2DeleteDecoder", "sceVideodec2Decode",
+        "sceVideodec2Flush", "sceVideodec2Reset", "sceVideodec2GetPictureInfo",
+        "sceVdecswCreateDecoder", "sceVdecswSetDecodeInput", "sceVdecswSetDecodeOutput",
         // HTTP helpers
         "sceHttpUriParse",
         // graphics (headless bring-up)

@@ -265,6 +265,9 @@ void register_service_hle();
 // libSceAvPlayer: playback lifecycle over a host video-decode backend; called by
 // register_builtin_hle(). Split out of hle_service.cpp (#3735).
 void register_avplayer_hle();
+// libSceVideodec2 / libSceVdecsw / libScePsml: the guest's video decode libraries; called by
+// register_builtin_hle(). Split out of hle_service.cpp (#3735).
+void register_videodec_hle();
 // libSceHttp local URI helpers; called by register_builtin_hle().
 void register_http_hle();
 // libSceHttp2: local id lifecycle, recorded settings, and an honest offline failure on the

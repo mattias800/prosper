@@ -60,7 +60,11 @@ static bool guest_takes_allocation_branch(uint64_t init_rc, uint64_t query_rc) {
 
 int main() {
     std::printf("== test_psml_unimplemented ==\n");
+    // libScePsml moved to src/hle/video/videodec2.cpp with the decode libraries (#3735), so its
+    // NIDs are bound by register_videodec_hle() now. register_service_hle() alone no longer
+    // registers them -- which is what this test reported when the split landed, correctly.
     register_service_hle();
+    register_videodec_hle();
 
     HleFn init  = Hle::lookup(kPsmlInit);
     HleFn query = Hle::lookup(kPsmlQuery);
