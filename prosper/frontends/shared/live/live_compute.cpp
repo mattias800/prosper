@@ -1136,7 +1136,7 @@ struct ComputeImageCacheKeyHash {
         mix(key.mip_tail_offset); mix(key.mip_tail_bytes);
         mix(key.mip_tail_x); mix(key.mip_tail_y); mix(key.vk_format);
         mix(key.storage); mix(key.in_mip_tail); mix(key.srgb); mix(key.depth_compare);
-        mix(key.mip_levels);
+        mix(key.mip_levels); mix(key.cube_compatible);
         return result;
     }
 };
@@ -1197,6 +1197,7 @@ uint32_t compute_image_key_field_diff_mask(const ComputeImageCacheKey& a,
     note(Field::Srgb, a.srgb != b.srgb);
     note(Field::DepthCompare, a.depth_compare != b.depth_compare);
     note(Field::MipLevels, a.mip_levels != b.mip_levels);
+    note(Field::CubeCompatible, a.cube_compatible != b.cube_compatible);
     return mask;
 }
 
@@ -7748,9 +7749,6 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // one cube, and which cube a write targets is the question the sampled path answers
             // with its own `dim_cube_stacked` contract; nothing here establishes the same for a
             // store, so those stay skipped and loud.
-            // Single source of truth with the staging sizing -- see the comment on the predicate.
-            const bool cube_as_2d_array_storage =
-                prosper::frontend::compute_cube_as_2d_array_storage(*r, image_descriptors[i]);
             // A binding whose every image access is an OpImageQuery* needs its DIMENSIONS
             // reported and none of its texels. The layered shapes this gate otherwise
             // refuses are refused because materialising their CONTENT is unsolved -- tiling,
@@ -7758,17 +7756,23 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // reads a texel, so a query-only binding may be admitted on its declared shape.
             // Sonic Frontiers' 0x2005a11600 binding 53 is a 64x64x18 cube array used only by
             // OpImageQuerySizeLod/OpImageQueryLevels (#657, #2790).
-            const bool query_only_layered = image_descriptors[i].query_only && !bi.storage;
+            const bool query_only = image_descriptors[i].query_only && !bi.storage;
             // The query is typed against the module's DECLARED image, so that is the shape the
             // view must have -- a mismatch is VUID-vkCmdDispatch-viewType-07752, measured. The
             // guest extent is still what the query must ANSWER; only the dimensionality follows
             // the declaration, and no texels are uploaded either way.
+            // ONLY the 1D declaration is admitted, and the gate below keys on THIS, not on
+            // `query_only`. Everything downstream -- the image type, the extent, the view type,
+            // the suppressed upload -- is written for a 1D view; a query-only binding declared
+            // Cube or 2D-arrayed would be admitted by a broader gate and then fall through to
+            // VK_IMAGE_VIEW_TYPE_2D, which is VUID-vkCmdDispatch-viewType-07752. Widening this
+            // means teaching the view/extent selection the other shapes first.
             const bool query_only_as_1d =
-                query_only_layered && image_descriptors[i].image_dim == 0u &&
+                query_only && image_descriptors[i].image_dim == 0u &&
                 !image_descriptors[i].image_arrayed;
             const bool native_cube_sampled =
                 prosper::frontend::compute_native_cube_sampled(*r, image_descriptors[i]);
-            bi.arrayed_2d = dim_2d_array || cube_as_2d_array_storage;
+            bi.arrayed_2d = dim_2d_array;
             bi.query_only_shape = query_only_as_1d;
             // The recompiler's established cube lowering converts AMD's cube-processed
             // [x, y, face] coordinates to a plain 2D sample over six vertically stacked faces.
@@ -7791,13 +7795,12 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             const bool dim_2d_single = r->img_dim == 5 && ordinary_2d_view;
             if (!dim_1d && r->img_dim != 1 && !dim_3d && !dim_2d_array &&
                 !dim_2d_single && !dim_cube_stacked && !cube_face_as_2d &&
-                !cube_as_2d_array_storage && !native_cube_sampled &&
-                !query_only_layered) {
+                !native_cube_sampled && !query_only_as_1d) {
                 skip_image(r, "layered image deferred to #657"); break;
             }
             if (dim_1d && r->height != 1) { skip_image(r, "1D image has non-unit height"); break; }
             if (!r->depth || (!dim_3d && !dim_2d_array && !dim_cube_stacked &&
-                              !cube_as_2d_array_storage && !native_cube_sampled && !query_only_layered && r->depth != 1)) {
+                              !native_cube_sampled && !query_only_as_1d && r->depth != 1)) {
                 if (!cube_face_as_2d) {
                     skip_image(r, "image depth does not match its dimensionality"); break;
                 }
@@ -8356,11 +8359,13 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 break;
             }
             if (bi.alias_of != SIZE_MAX) continue;
-            // cube_as_2d_array_storage counts its six faces here too. Omitting it sizes staging
-            // for ONE layer while the writeback packs width*height*depth texels out of it --
-            // measured as a SIGSEGV in storage_pack_float16x4_f16c before this term existed.
+            // native_cube_sampled counts its six faces here too. Omitting it sizes staging for
+            // ONE layer while the decode packs width*height*depth texels out of it -- measured as
+            // a SIGSEGV in storage_pack_float16x4_f16c before this term existed. Every guest-need
+            // and decode branch below carries the SAME term for the same reason; a term present
+            // here and missing there validates one slice and then reads six.
             const uint32_t sampled_layers = dim_cube_stacked ? 6u
-                                            : (dim_2d_array || cube_as_2d_array_storage || native_cube_sampled)
+                                            : (dim_2d_array || native_cube_sampled)
                                                 ? r->depth : 1u;
             const VkDeviceSize volume_texels = static_cast<VkDeviceSize>(r->width) * r->height *
                                                (dim_3d ? r->depth : sampled_layers);
@@ -8623,7 +8628,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                             skip_image(r, "sampled cube-face backing size overflows"); break;
                         }
                         sampled_guest_need = level_offset + selected_slice;
-                    } else if ((dim_2d_array || dim_cube_stacked || cube_as_2d_array_storage) && sampled_layers > 1) {
+                    } else if ((dim_2d_array || dim_cube_stacked || native_cube_sampled) && sampled_layers > 1) {
                         const size_t selected_slice = r->in_mip_tail
                             ? r->mip_tail_bytes : slice;
                         const size_t layer_stride = r->layer_stride_bytes
@@ -8667,7 +8672,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     } else if (r->tile_mode && dim_3d && r->depth > 1) {
                         sampled_guest_need = tiled_volume_bytes(
                             r->width, r->height, r->depth, r->tile_mode, bpt);
-                    } else if ((dim_2d_array || dim_cube_stacked || cube_as_2d_array_storage) && sampled_layers > 1) {
+                    } else if ((dim_2d_array || dim_cube_stacked || native_cube_sampled) && sampled_layers > 1) {
                         const size_t slice = r->in_mip_tail
                             ? r->mip_tail_bytes
                             : (r->tile_mode
@@ -9824,7 +9829,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                                r->tile_mode, bpt)) {
                                 skip_image(r, "sampled volume detile failed"); break;
                             }
-                        } else if ((dim_2d_array || dim_cube_stacked || cube_as_2d_array_storage) && sampled_layers > 1) {
+                        } else if ((dim_2d_array || dim_cube_stacked || native_cube_sampled) && sampled_layers > 1) {
                             const size_t selected_slice = r->in_mip_tail
                                 ? r->mip_tail_bytes
                                 : (r->tile_mode
@@ -9997,7 +10002,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             vci.viewType = (dim_1d || query_only_as_1d) ? VK_IMAGE_VIEW_TYPE_1D
                                   : (dim_3d ? VK_IMAGE_VIEW_TYPE_3D
                                      : native_cube_sampled ? VK_IMAGE_VIEW_TYPE_CUBE
-                                     : (dim_2d_array || cube_as_2d_array_storage) ? VK_IMAGE_VIEW_TYPE_2D_ARRAY
+                                     : dim_2d_array ? VK_IMAGE_VIEW_TYPE_2D_ARRAY
                                                     : VK_IMAGE_VIEW_TYPE_2D);
             vci.format = ici.format;
             if (!bi.storage) {

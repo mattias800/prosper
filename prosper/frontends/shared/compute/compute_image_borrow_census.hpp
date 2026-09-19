@@ -216,6 +216,7 @@ enum class ComputeImageKeyField : uint8_t {
     Srgb,
     DepthCompare,
     MipLevels,
+    CubeCompatible,
     Count,
 };
 
@@ -244,6 +245,7 @@ constexpr const char* compute_image_key_field_name(ComputeImageKeyField field) {
     case ComputeImageKeyField::Srgb:           return "srgb";
     case ComputeImageKeyField::DepthCompare:   return "depth_compare";
     case ComputeImageKeyField::MipLevels:      return "mip_levels";
+    case ComputeImageKeyField::CubeCompatible: return "cube_compatible";
     case ComputeImageKeyField::Count:          break;
     }
     return "?";

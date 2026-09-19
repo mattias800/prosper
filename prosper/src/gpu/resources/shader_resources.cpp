@@ -1139,6 +1139,12 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
                 access.pointee_type = pointer_type->second.element;
                 accesses[result] = access;
                 texel_access_vars.insert(image_var);
+                // This is the one image-reading path that does NOT go through `mark_image`: the
+                // following OpAtomic* consumes the pointer, not the image object, so the variable
+                // would never reach `image_nonquery_vars` and could be reported query_only while
+                // an atomic reads its texels. Record it here, where the provenance is known,
+                // rather than relying on the consumer's `!storage` gate to hide it.
+                image_nonquery_vars.insert(image_var);
             }
         } else if (in.opcode == OpLoad && n >= 3) {
             const uint32_t root = pointer_root(word(in, 2));
@@ -1324,6 +1330,13 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
         prior.atomic_access |= descriptor.atomic_access;
         // AND, not OR: one variable reading texels through this binding means the binding is not
         // query-only, however many other variables only measure it.
+        //
+        // NOTE this is currently UNREACHABLE for an image: `compatible` above requires BOTH sides
+        // to be StorageBuffer, so two image descriptors at one (set, binding) take the malformed
+        // path instead of merging. It is kept so the invariant is already right if coalescing ever
+        // widens -- the member default is `false`, which would give an OR-shaped answer by
+        // accident. Do not cite it as the reason `query_only` is safe; the reason is that every
+        // texel-reading opcode records its variable in `image_nonquery_vars`.
         prior.query_only = prior.query_only && descriptor.query_only;
     }
     report.descriptors = std::move(coalesced);
