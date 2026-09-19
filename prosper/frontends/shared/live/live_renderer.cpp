@@ -1809,18 +1809,34 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             // image that received the queue-ordered device copy. If the image disappeared, leave the
             // invalidation in force and let the next graphics use rebuild from the correct guest bytes.
             drain_guest_gpu_writes(g_rtt, invalidate_ds);
+            // CPU PUBLICATION AND GPU-MIRROR RESTORATION ARE DIFFERENT EVENTS (#3727).
+            //
+            // `linear_pixels` means the compute result was NOT mirrored into the renderer's device
+            // image -- that is the only reason the pixels are carried on the CPU side at all. So the
+            // device copy is stale by construction, and
+            // `restore_persistent_color_target_after_mirrored_write` must not run for it: that
+            // helper uploads nothing, it only sets `valid = true` on an image it finds. Where such
+            // an image EXISTS it therefore succeeded, the fresh pixels were dropped by the
+            // `rgba.reset()` below, and the stale device copy became authoritative -- which is the
+            // asymmetry between the two titles that reported this. A target that was never drawn by
+            // graphics has no image to find, restoration failed, and the pixels survived by
+            // accident.
+            //
+            // Publish first and leave `gpu_valid` false, so the device copy is rebuilt from these
+            // pixels rather than asserted to be current.
+            if (write.linear_pixels && !write.linear_pixels->empty()) {
+                RttSurf& published = g_rtt[write.gpu_addr];
+                published.rgba = write.linear_pixels;
+                published.has_uniform_color = false;
+                published.w = write.width;
+                published.h = write.height;
+                published.format = format;
+                published.guest_format = format;
+                published.gpu_valid = false;
+                return;
+            }
             if (!prosper::test::restore_persistent_color_target_after_mirrored_write(
                     write.gpu_addr, write.width, write.height, format)) {
-                if (write.linear_pixels && !write.linear_pixels->empty()) {
-                    RttSurf& published = g_rtt[write.gpu_addr];
-                    published.rgba = write.linear_pixels;
-                    published.has_uniform_color = false;
-                    published.w = write.width;
-                    published.h = write.height;
-                    published.format = format;
-                    published.guest_format = format;
-                    published.gpu_valid = false;
-                }
                 return;
             }
             RttSurf& published = g_rtt[write.gpu_addr];
