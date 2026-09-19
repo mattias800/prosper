@@ -55,6 +55,7 @@
 #include <sys/random.h> // getentropy: the host CSPRNG behind sceRandomGetRandomNumber
 #include <unistd.h>
 #endif
+#include "hle/service/service_trace.hpp"
 #ifdef _WIN32
 #include <bcrypt.h>     // BCryptGenRandom (prosper_core already links bcrypt on Windows)
 #endif
@@ -77,67 +78,6 @@ namespace { std::atomic<uint64_t> g_handle{1}; }
 // so PS5-only ABIs with no Kyty/shadPS4 reference can be pinned from live captures instead of
 // guessed.
 namespace {
-bool svclog() { static int v = getenv("PROSPER_SVCLOG") ? 1 : 0; return v; }
-bool svc_ptrish(uint64_t v) { return v >= 0x10000 && v < 0x7fffffffffffull; }
-bool svc_copy_bytes(uint64_t src, void* dst, size_t bytes) {
-    if (!src || !dst || !bytes || src > UINT64_MAX - (bytes - 1)) return false;
-#ifdef _WIN32
-    SIZE_T copied = 0;
-    return ReadProcessMemory(GetCurrentProcess(), (const void*)(uintptr_t)src, dst, bytes, &copied) &&
-           copied == bytes;
-#else
-    iovec local{dst, bytes};
-    iovec remote{(void*)(uintptr_t)src, bytes};
-    return process_vm_readv(getpid(), &local, 1, &remote, 1, 0) == (ssize_t)bytes;
-#endif
-}
-bool svc_write_bytes(uint64_t dst, const void* src, size_t bytes) {
-    if (!dst || !src || !bytes || dst > UINT64_MAX - (bytes - 1)) return false;
-#ifdef _WIN32
-    SIZE_T copied = 0;
-    return WriteProcessMemory(GetCurrentProcess(), (void*)(uintptr_t)dst, src, bytes, &copied) &&
-           copied == bytes;
-#else
-    iovec local{const_cast<void*>(src), bytes};
-    iovec remote{(void*)(uintptr_t)dst, bytes};
-    return process_vm_writev(getpid(), &local, 1, &remote, 1, 0) == (ssize_t)bytes;
-#endif
-}
-size_t svc_copy_words(uint64_t src, uint64_t* dst, size_t words) {
-    const size_t bytes = words * sizeof(uint64_t);
-#ifdef _WIN32
-    SIZE_T copied = 0;
-    ReadProcessMemory(GetCurrentProcess(), (const void*)(uintptr_t)src, dst, bytes, &copied);
-    return (size_t)copied / sizeof(uint64_t);
-#else
-    iovec local{dst, bytes};
-    iovec remote{(void*)(uintptr_t)src, bytes};
-    const ssize_t copied = process_vm_readv(getpid(), &local, 1, &remote, 1, 0);
-    return copied > 0 ? (size_t)copied / sizeof(uint64_t) : 0;
-#endif
-}
-void svc_log(const char* fn, uint64_t a0, uint64_t a1, uint64_t a2,
-             uint64_t a3, uint64_t a4, uint64_t a5, int dump_words = 8) {
-    if (!svclog()) return;
-    fprintf(stderr, "[svc] %s(%#" PRIx64 ", %#" PRIx64 ", %#" PRIx64
-                    ", %#" PRIx64 ", %#" PRIx64 ", %#" PRIx64 ")\n",
-            fn, a0, a1, a2, a3, a4, a5);
-    const uint64_t args[6] = { a0, a1, a2, a3, a4, a5 };
-    for (int i = 0; i < 6; i++) {
-        if (!svc_ptrish(args[i])) continue;
-        // Never read across the arg's 4 KiB page end: an out-param can be a tiny heap block whose
-        // page neighbor is unmapped, and a diagnostic must not be able to fault the boot.
-        uint64_t page_left = 0x1000 - (args[i] & 0xfff);
-        int words = (int)(page_left / 8); if (words > dump_words) words = dump_words;
-        if (words > 8) words = 8;
-        uint64_t q[8]{};
-        words = (int)svc_copy_words(args[i], q, (size_t)words);
-        if (!words) continue;
-        fprintf(stderr, "[svc]   a%d ->", i);
-        for (int w = 0; w < words; w++) fprintf(stderr, " %016" PRIx64, q[w]);
-        fprintf(stderr, "\n");
-    }
-}
 }
 
 // PS5 Game Intent is how the shell starts a title at a selected activity instead of its default
