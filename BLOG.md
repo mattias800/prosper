@@ -19,6 +19,14 @@ from the tracker issues, and still gated, because it is a projection of state ra
 > title's current state — for that, read the tracker. Nothing is ever removed when a title moves on,
 > because the point of a blog is that it records *when* things happened.
 
+## 2026-09-19
+
+### GTA V's world is back; Sonic's world is visible
+
+The project owner confirms that GTA V's world renders properly with
+[#3731](https://github.com/mattias800/prosper/pull/3731), and Sonic Frontiers now shows its world too.
+Sonic still has shader failures; this is visible progress, not complete rendering compatibility.
+
 ## 2026-09-17
 
 ### …and now we know which one step is missing

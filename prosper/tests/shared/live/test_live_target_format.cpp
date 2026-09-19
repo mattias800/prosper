@@ -48,8 +48,8 @@ bool notifier_republishes(const FormatCase& c, uint64_t base, uint32_t width, ui
     auto& cache = prosper::test::persistent_color_target_cache();
     cache.clear();
     const prosper::test::PersistentColorTargetKey key{base, width, height, c.vk_format};
-    // A borrowed image the compute backend could have written: a real handle value and a layout the
-    // renderer actually left it in. Only the identity is under test, so no device is needed.
+    // A non-null stand-in for a borrowed image, with the renderer's expected layout. Only cache
+    // identity is under test; this is not a valid Vulkan handle and no device is needed.
     cache[key].image = reinterpret_cast<VkImage>(uintptr_t{1});
     cache[key].layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     cache[key].valid = true;
@@ -223,17 +223,10 @@ int main() {
 
     // ---- #3727: a NON-MIRRORED compute result must not lose to a stale device copy -----------
     //
-    // `linear_pixels` exists precisely BECAUSE the compute result was not mirrored into the
-    // renderer's device image -- that is why the pixels travel on the CPU side. The notifier
-    // nonetheless called restore_persistent_color_target_after_mirrored_write() for them, and that
-    // helper uploads nothing: it finds an existing image and sets `valid = true`. So wherever such
-    // an image existed the call SUCCEEDED, the fresh pixels were dropped, and the stale device copy
-    // became authoritative. A target never drawn by graphics has no image to find, the call failed,
-    // and the pixels survived through the error path -- which is why one title was fixed by the
-    // change that regressed another.
-    //
-    // Two assertions, because either alone is satisfiable by a wrong implementation: the stale image
-    // must NOT be re-authorized, AND the consumer must read back the NEW pixels.
+    // A CPU-only result must replace the old pixels without authorizing the stale device image.
+    // Both titles can have such an image after a graphics pass, even if it was absent on frame one.
+    // These are metadata and CPU-consumer assertions: the synthetic handle stores no real pixels.
+    // The capture reader exercises the authority decision; it does not execute a graphics LOAD.
     {
         printf("  -- non-mirrored publication (#3727) --\n");
         auto& cache = prosper::test::persistent_color_target_cache();
@@ -245,7 +238,7 @@ int main() {
         cache[key].layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         cache[key].valid = true;
 
-        // The device copy holds colour A.
+        // Publish the previous CPU snapshot (colour A) and invalidate the stand-in device image.
         prosper::gpu::GpuCaptureRttSeed seed;
         seed.guest_addr = base;
         seed.width = w;
@@ -257,9 +250,11 @@ int main() {
               "an existing renderer target is published (colour A)");
         CHECK(!cache.at(key).valid, "...and seeding invalidated its device image, as a guest write would");
 
-        // Compute writes colour B and does NOT mirror it into that image.
-        auto pixels = std::make_shared<const std::vector<uint8_t>>(
-            static_cast<size_t>(w) * h * 4u, 0x99);
+        // Compute publishes a distinct byte pattern without mirroring it into that image.
+        std::vector<uint8_t> expected(static_cast<size_t>(w) * h * 4u);
+        for (size_t i = 0; i < expected.size(); ++i)
+            expected[i] = static_cast<uint8_t>(0x99u + 37u * i + i / 256u);
+        auto pixels = std::make_shared<const std::vector<uint8_t>>(expected);
         prosper::gpu::LiveTargetImageWrite write;
         write.gpu_addr = base;
         write.width = w;
@@ -283,8 +278,12 @@ int main() {
             prosper::gpu::GpuCaptureRttSeed observed;
             const bool read_ok = prosper::gpu::read_gpu_capture_rtt_seed(base, observed, error);
             CHECK(read_ok, "the published target is readable by a consumer");
-            CHECK(read_ok && !observed.rgba.empty() && observed.rgba[0] == 0x99,
-                  "...and the consumer observes the NEW pixels, not the stale colour A");
+            CHECK(read_ok && observed.guest_addr == base && observed.width == w &&
+                  observed.height == h &&
+                  observed.format == prosper::gpu::GpuCaptureColorFormat::Rgba8Unorm,
+                  "...with the published address, extent and pixel format");
+            CHECK(read_ok && observed.rgba == expected,
+                  "...and the complete published payload reaches the consumer unchanged");
         } else {
             printf("  [skip] pixel read-back skipped: the device copy was re-authorized, so the "
                    "consumer would dereference this harness's synthetic image handle\n");

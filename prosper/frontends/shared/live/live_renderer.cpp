@@ -1809,21 +1809,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             // image that received the queue-ordered device copy. If the image disappeared, leave the
             // invalidation in force and let the next graphics use rebuild from the correct guest bytes.
             drain_guest_gpu_writes(g_rtt, invalidate_ds);
-            // CPU PUBLICATION AND GPU-MIRROR RESTORATION ARE DIFFERENT EVENTS (#3727).
-            //
-            // `linear_pixels` means the compute result was NOT mirrored into the renderer's device
-            // image -- that is the only reason the pixels are carried on the CPU side at all. So the
-            // device copy is stale by construction, and
-            // `restore_persistent_color_target_after_mirrored_write` must not run for it: that
-            // helper uploads nothing, it only sets `valid = true` on an image it finds. Where such
-            // an image EXISTS it therefore succeeded, the fresh pixels were dropped by the
-            // `rgba.reset()` below, and the stale device copy became authoritative -- which is the
-            // asymmetry between the two titles that reported this. A target that was never drawn by
-            // graphics has no image to find, restoration failed, and the pixels survived by
-            // accident.
-            //
-            // Publish first and leave `gpu_valid` false, so the device copy is rebuilt from these
-            // pixels rather than asserted to be current.
+            // CPU publication and device-mirror restoration are different events (#3727).
+            // A linear snapshot means no device mirror received this result. The restore helper
+            // only marks an existing image valid; it uploads nothing. Calling it here would discard
+            // fresh CPU pixels and authorize stale device contents. This affects any title once
+            // graphics has created the persistent image, including later frames in Sonic.
+            // Publish the snapshot with GPU authority false so graphics uploads it on the next use.
             if (write.linear_pixels && !write.linear_pixels->empty()) {
                 RttSurf& published = g_rtt[write.gpu_addr];
                 published.rgba = write.linear_pixels;
