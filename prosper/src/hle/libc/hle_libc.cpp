@@ -1071,6 +1071,7 @@ void register_builtin_hle() {
     register_service_hle();  // PS5 system services (user/NP/mouse/appcontent/dialog)
     register_avplayer_hle();  // libSceAvPlayer, split out of hle_service.cpp (#3735)
     register_videodec_hle();  // libSceVideodec2 / libSceVdecsw / libScePsml (#3735)
+    register_ime_hle();       // libSceIme + libSceImeDialog (#3735)
     register_http_hle();     // libSceHttp local URI parsing
     register_http2_hle();    // libSceHttp2 local ids + honest offline request failure
     register_font_hle();     // libSceFont opaque handles + deterministic text/metric fallback
