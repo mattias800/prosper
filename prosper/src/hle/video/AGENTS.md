@@ -8,12 +8,16 @@ The Sony libraries a title calls to get a movie on screen, and the host backend 
   about a stream (dimensions, aspect, frame rate) that only the bitstream itself carries.
 - `avplayer` — libSceAvPlayer: the playback lifecycle, the media clock, and the guest
   file-replacement reader. Split out of `hle/service/hle_service.cpp` in #3735.
+- `videodec2` — libSceVideodec2, its software-decode sibling libSceVdecsw, and libScePsml. Same
+  split. Videodec2 and Vdecsw share this file because Vdecsw's decoder config *is* Videodec2's plus
+  eight bytes and the two are read by the same code; libScePsml is here because it is a decode
+  library, not because it shares anything — it is four unimplemented NIDs whose names were never
+  recovered.
 
 ## What belongs here
 
-A Sony library whose subject is video. libSceVideodec2, libSceVdecsw and libScePsml are still in
-`hle/service/hle_service.cpp` and are headed here next; when they land, this folder holds the whole
-decode-and-play surface and `hle/service/` keeps only the things that are not about a medium.
+A Sony library whose subject is video. That is now the whole decode-and-play surface, and
+`hle/service/` keeps only the things that are not about a medium.
 
 Audio is `hle/audio/`, not here, even where a title drives both through one AvPlayer handle — the
 split follows the Sony library, not the guest's call graph.
