@@ -1013,27 +1013,6 @@ HLE(s_playgo_getspeed) { if (!a1) return PLAYGO_ERR_BAD_POINTER; *(int32_t*)PW(a
 HLE(s_playgo_getlang) { if (!a1) return PLAYGO_ERR_BAD_POINTER;
                         *(uint64_t*)PW(a1) = ~0ull; return 0; }
 
-// --- Transaction resources (#1905). sceSaveDataCreateTransactionResource returns the NEW RESOURCE'S
-// ID, not 0-on-success. Returning 0 is the shape of the call that succeeds, so this looked correct
-// and is not: Sonic Origins' (PPSA05325) save handler at eboot+0x93fdb0 is exactly
-//     xor edi,edi; call sceSaveDataCreateTransactionResource; test eax,eax; jle <fail>
-// — a zero return is read as failure, the handler records error 3, every later save operation
-// returns that sticky error without running, and the title's boot coroutine polls the failed job
-// forever. That single wrong return value is why PPSA05325 never leaves its first boot step.
-// It really is a HANDLE and not merely "a positive number" — Sonic's full lifecycle proves it:
-//   0x93fdc7  mov [r14+0xc0],eax        Create's result is retained in a member
-//   0x9402cd  mov eax,[r14+0xc0]        ...loaded again to build the Mount3 descriptor,
-//   0x9402d4  mov [rsp+0x68],eax        ...at descriptor base (rsp+0x40) + 0x28,
-//   0x93f24e  mov edi,[rdi+0xc0]        ...and handed back as Delete's sole argument,
-//   0x93f254  cmp edi,0xffffffff        guarded by the guest's own -1 "no resource" sentinel.
-// That also independently reproduces the Mount3 +0x28 field this file documents from DQ7. The id is
-// opaque to the guest, so any positive value satisfies it; we hand out a monotonic counter and keep
-// the live set so Delete can reject one that was never created.
-// CONFIDENCE: HIGH on the polarity, on "returns the resource id", and on Delete's argument being a
-// scalar int32 in edi (the mov above precedes all four of Sonic's Delete sites and Oregon Trail's).
-// Delete's error CODE for an unknown id is the residual unknown: PARAMETER is the facility's generic
-// bad-argument code, and no title is observed passing an id Create did not return.
-
 // --- libSceNpTrophy2 lifecycle: succeed with valid ids (trophy CONTENT stays unavailable). ------
 // PS4 NpTrophy ABI carried to Trophy2 (context/handle are small s32 ids written through arg0;
 // Kyty LibNpTrophy + shadPS4 np_trophy agree on the PS4 shape). The game's trophy worker needs
