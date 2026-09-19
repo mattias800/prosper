@@ -6,7 +6,25 @@ own embedded shader source paths (`Library\hedgehog\…`, `Library\needle\…`) 
 `NeedleShader.pac` / `raw/hedgehog/` asset trees, not assumed from the publisher. *Sonic Origins*
 (#1871) and *Sonic Racing: CrossWorlds* (#1895) share parts of the same stack.
 
-## Current rung — gameplay reached, world not rendered
+## Current state — gameplay world visible, shader failures remain
+
+On 2026-09-19 the project owner confirmed that **Sonic's world is visible with #3731**, although
+some shaders still fail. This supersedes the black-world state described below; it does not claim
+complete rendering or an FPS improvement. The remaining shader work is tracked in #2790.
+
+The publication fix also affects Sonic after graphics creates its persistent target: later CPU
+compute results must replace its contents, not re-authorize the previous device image. The claim
+that Sonic's path was untouched because it never had a device image was false. The author's earlier
+non-black percentages were not isolated by fresh save state, so they are not retained as comparable
+measurements; see the [handoff correction](https://github.com/mattias800/prosper/pull/3731#issuecomment-5743648998).
+
+This correct path may upload a full CPU snapshot where the stale-image path previously skipped it
+(33,177,600 bytes for a 3840×2160 RGBA8 target). That is required publication work, not a measured
+frame-time or FPS regression. Keeping it on the GPU is a separate optimization with the same
+content-authority contract.
+
+### Earlier black-world baseline
+
 
 A committed input route (`scripts/sonic-frontiers-PPSA03831/reach-gameplay.pad`) takes the title
 from boot to **`GameModeStage` running a Cyber Space stage (`w6d01`)** with real GPU work: the
@@ -22,11 +40,10 @@ aggregate frame metric was used to make the call. Checked-in capture:
 `assets/screenshots/sonic-frontiers-cyberspace-hud.webp` (direct unmodified `tools/screenshot` frame,
 3840x2160, route arm, stage clock at 00:55.89).
 
-**What is not there is the world (#2790).** The 3840x2160 frame remains black behind the HUD in
-live gameplay because 16 of the stage's 32 compute programs never execute due to recompiler rejects.
-Seeding the renderer color target from compute storage writeback preserves composited compute buffers,
-and the MTBUF descriptor DST_SEL fold works per RDNA2 Table 31, but full 3D world presentation requires
-resolving the remaining 16 skipped compute programs.
+**In that earlier capture the display remained black behind the HUD (#2790)**, and 16 of the
+stage's 32 compute programs were rejected. Those historical counts are not a current census.
+Subsequent shader support and correct compute-result publication changed the visible result;
+remaining rejects still need to be resolved without treating every black pixel as a shader defect.
 
 ## Compute writeback profile (2026-09-07, #3407)
 
@@ -821,6 +838,13 @@ one. Twelve rows were established on #1968 / #2023 and are copied here so they s
 being closed; the rest are this document's own. **Do not restate the row count in this paragraph** —
 a stated total is stale as soon as the next lane appends, and every lane that adds a row would have
 to remember to update it. The last one did not (review of #2820).
+
+- **"#3731 leaves Sonic untouched because its compute target has no device image."** False:
+  `render_draw_pass_rgba` creates a persistent target when the HUD blend pass renders to that base,
+  so later publications encounter an existing image. The stale-image restoration defect therefore
+  affects Sonic too. The owner confirms the world is visible with the fix, with shader failures
+  still present; the earlier uncontrolled non-black percentages are not a comparable measurement
+  ([#3731](https://github.com/mattias800/prosper/pull/3731)).
 
 | Hypothesis | Verdict and evidence |
 | --- | --- |

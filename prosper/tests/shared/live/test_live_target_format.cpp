@@ -25,6 +25,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <memory>
 #include <vector>
 
 static int fails = 0;
@@ -47,8 +48,8 @@ bool notifier_republishes(const FormatCase& c, uint64_t base, uint32_t width, ui
     auto& cache = prosper::test::persistent_color_target_cache();
     cache.clear();
     const prosper::test::PersistentColorTargetKey key{base, width, height, c.vk_format};
-    // A borrowed image the compute backend could have written: a real handle value and a layout the
-    // renderer actually left it in. Only the identity is under test, so no device is needed.
+    // A non-null stand-in for a borrowed image, with the renderer's expected layout. Only cache
+    // identity is under test; this is not a valid Vulkan handle and no device is needed.
     cache[key].image = reinterpret_cast<VkImage>(uintptr_t{1});
     cache[key].layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     cache[key].valid = true;
@@ -217,6 +218,76 @@ int main() {
         prosper::gpu::notify_live_render_target_image_written(write);
         CHECK(!cache.at(key).valid,
               "a mirrored write with a different extent does not re-authorize the target");
+        cache.clear();
+    }
+
+    // ---- #3727: a NON-MIRRORED compute result must not lose to a stale device copy -----------
+    //
+    // A CPU-only result must replace the old pixels without authorizing the stale device image.
+    // Both titles can have such an image after a graphics pass, even if it was absent on frame one.
+    // These are metadata and CPU-consumer assertions: the synthetic handle stores no real pixels.
+    // The capture reader exercises the authority decision; it does not execute a graphics LOAD.
+    {
+        printf("  -- non-mirrored publication (#3727) --\n");
+        auto& cache = prosper::test::persistent_color_target_cache();
+        cache.clear();
+        const uint64_t base = 0x5150000000ull;
+        const uint32_t w = 64, h = 32;
+        const prosper::test::PersistentColorTargetKey key{base, w, h, VK_FORMAT_R8G8B8A8_UNORM};
+        cache[key].image = reinterpret_cast<VkImage>(uintptr_t{1});
+        cache[key].layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        cache[key].valid = true;
+
+        // Publish the previous CPU snapshot (colour A) and invalidate the stand-in device image.
+        prosper::gpu::GpuCaptureRttSeed seed;
+        seed.guest_addr = base;
+        seed.width = w;
+        seed.height = h;
+        seed.format = prosper::gpu::GpuCaptureColorFormat::Rgba8Unorm;
+        seed.rgba.assign(static_cast<size_t>(w) * h * 4u, 0x11);
+        std::string error;
+        CHECK(prosper::gpu::restore_gpu_replay_rtt_seeds({seed}, error),
+              "an existing renderer target is published (colour A)");
+        CHECK(!cache.at(key).valid, "...and seeding invalidated its device image, as a guest write would");
+
+        // Compute publishes a distinct byte pattern without mirroring it into that image.
+        std::vector<uint8_t> expected(static_cast<size_t>(w) * h * 4u);
+        for (size_t i = 0; i < expected.size(); ++i)
+            expected[i] = static_cast<uint8_t>(0x99u + 37u * i + i / 256u);
+        auto pixels = std::make_shared<const std::vector<uint8_t>>(expected);
+        prosper::gpu::LiveTargetImageWrite write;
+        write.gpu_addr = base;
+        write.width = w;
+        write.height = h;
+        write.format = prosper::gpu::LiveTargetPixelFormat::Rgba8Unorm;
+        write.linear_pixels = pixels;
+        prosper::gpu::notify_live_render_target_image_written(write);
+
+        const bool stale_reauthorized = cache.at(key).valid;
+        CHECK(!stale_reauthorized,
+              "a non-mirrored result does NOT re-authorize the stale device image");
+
+        // The pixel read is GUARDED on that first assertion, and the guard is the point rather than
+        // caution. On the unfixed notifier the device copy is marked authoritative, so the consumer
+        // reads back through the image handle -- which in this harness is a synthetic value, so the
+        // process dies with SIGSEGV instead of reporting anything. A crash is still a red arm under
+        // ctest, but it names nothing and looks like a broken test rather than a found defect. In
+        // production the handle is real and the same routing returns STALE PIXELS silently, which is
+        // the actual defect; the crash here is an artifact of the synthetic handle, not the bug.
+        if (!stale_reauthorized) {
+            prosper::gpu::GpuCaptureRttSeed observed;
+            const bool read_ok = prosper::gpu::read_gpu_capture_rtt_seed(base, observed, error);
+            CHECK(read_ok, "the published target is readable by a consumer");
+            CHECK(read_ok && observed.guest_addr == base && observed.width == w &&
+                  observed.height == h &&
+                  observed.format == prosper::gpu::GpuCaptureColorFormat::Rgba8Unorm,
+                  "...with the published address, extent and pixel format");
+            CHECK(read_ok && observed.rgba == expected,
+                  "...and the complete published payload reaches the consumer unchanged");
+        } else {
+            printf("  [skip] pixel read-back skipped: the device copy was re-authorized, so the "
+                   "consumer would dereference this harness's synthetic image handle\n");
+        }
         cache.clear();
     }
 

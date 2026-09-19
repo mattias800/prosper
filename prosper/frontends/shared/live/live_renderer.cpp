@@ -1809,18 +1809,25 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             // image that received the queue-ordered device copy. If the image disappeared, leave the
             // invalidation in force and let the next graphics use rebuild from the correct guest bytes.
             drain_guest_gpu_writes(g_rtt, invalidate_ds);
+            // CPU publication and device-mirror restoration are different events (#3727).
+            // A linear snapshot means no device mirror received this result. The restore helper
+            // only marks an existing image valid; it uploads nothing. Calling it here would discard
+            // fresh CPU pixels and authorize stale device contents. This affects any title once
+            // graphics has created the persistent image, including later frames in Sonic.
+            // Publish the snapshot with GPU authority false so graphics uploads it on the next use.
+            if (write.linear_pixels && !write.linear_pixels->empty()) {
+                RttSurf& published = g_rtt[write.gpu_addr];
+                published.rgba = write.linear_pixels;
+                published.has_uniform_color = false;
+                published.w = write.width;
+                published.h = write.height;
+                published.format = format;
+                published.guest_format = format;
+                published.gpu_valid = false;
+                return;
+            }
             if (!prosper::test::restore_persistent_color_target_after_mirrored_write(
                     write.gpu_addr, write.width, write.height, format)) {
-                if (write.linear_pixels && !write.linear_pixels->empty()) {
-                    RttSurf& published = g_rtt[write.gpu_addr];
-                    published.rgba = write.linear_pixels;
-                    published.has_uniform_color = false;
-                    published.w = write.width;
-                    published.h = write.height;
-                    published.format = format;
-                    published.guest_format = format;
-                    published.gpu_valid = false;
-                }
                 return;
             }
             RttSurf& published = g_rtt[write.gpu_addr];

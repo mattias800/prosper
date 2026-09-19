@@ -69,6 +69,29 @@ project owner on a routed `reach-performance-story.pad` run with the bank interi
 Historical design note for the descriptor work: `docs/FLAT_LOAD_DESIGN.md`. Do not start from it; the
 descriptor-array lift it describes is complete.
 
+## Compute-publication regression restored (2026-09-19, #3731)
+
+The project owner confirms that **GTA V's world renders properly with #3731**, in contrast to the
+black-world regression under investigation on main. This is a visual confirmation, not a new FPS
+measurement or a claim that every graphics mode is supported. Continue to select **Performance**.
+
+#3723 sent a non-mirrored CPU compute result through a helper that only re-authorizes an existing
+Vulkan image. When that image existed, fresh CPU pixels were discarded and stale device contents
+won. #3731 publishes the owned CPU pixels with GPU authority false; the next graphics consumer
+uploads them. The actual mirrored-image path retains its existing identity check.
+
+The original #3727/#3731 run-rate tables and p-value are **withdrawn**: runs shared accumulating
+save data, changing the landing-menu route and graphics mode. They cannot establish either renderer
+reliability or a statistical improvement. The author subsequently reported fresh-save GTA controls
+(main black in 3/3 runs; fix rendered the world in 3/3), and the owner's visual confirmation supports
+the regression fix. These are small-sample observations, not a success-rate estimate. See the
+[author's correction](https://github.com/mattias800/prosper/pull/3731#issuecomment-5743648998).
+
+For future comparisons, isolate each run's `PROSPER_SAVE0`, `XDG_CACHE_HOME` and
+`MESA_SHADER_CACHE_DIR`, then verify **Display → Graphics Mode: Performance** in the captured
+run. A route filename alone does not establish the mode. The identity-check bypass proposed in
+#3727 is a separate, unverified hypothesis; #3731 does not change that policy or close the issue.
+
 ## Linux windowed baseline (2026-09-06, #3065)
 
 At `a5150495e`, a fresh Release build with `-O3 -DNDEBUG -g1 -fno-omit-frame-pointer`
@@ -5224,6 +5247,14 @@ not the domain. Do not cite that zero as evidence about the nine.
 One line per falsified hypothesis, the evidence that killed it, and where. **Read this before forming
 a new one** — and note which entries are *solid* versus *void*, because a void result is not a
 falsification.
+
+- **"#3722 caused the September black-world regression" from a single-run bisect.** Withdrawn
+  (#3727 / #3731): a repeat at #3722 rendered the world, and the later investigation found shared
+  save state changed menu routing and graphics mode. That experiment cannot attribute a regression
+  to #3722; its original pooled success rates and significance figures are void, not measurements
+  of renderer reliability. Fresh-save comparisons and the owner's visual confirmation support the
+  separate stale-device-authority fix in #3731. Do not treat the still-open mirror-identity policy
+  question in #3727 as disproved by those results.
 
 - **The redundant 256 MiB upload can be avoided by copying from the first differing byte onward.**
   Falsified by direct measurement, 2026-09-15 (#3696 / #3697). This title's hottest compute program
