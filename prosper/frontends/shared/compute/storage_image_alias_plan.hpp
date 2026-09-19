@@ -9,6 +9,25 @@
 
 namespace prosper::frontend {
 
+// A cube T# IS six 2D layers in memory. A 2D-ARRAY STORAGE descriptor over one addresses exactly
+// those six, so it is the same shape as a six-layer 2D array viewed for WRITING (#657, #2790).
+//
+// Declared HERE, beside the sizing it feeds, and used by the admission gate in live_compute.cpp
+// rather than restated there. The two must agree: admitting a shape the sizing does not know about
+// allocates staging for one layer and then packs `width * height * depth` texels out of it. That is
+// a SIGSEGV in storage_pack_float16x4_f16c, which is how this function was found.
+//
+// Exactly six layers. A cube ARRAY (depth > 6) addresses more than one cube, and which cube a store
+// targets is not established by anything here -- those stay skipped and loud.
+inline bool compute_cube_as_2d_array_storage(
+    const prosper::gpu::ShaderResource& resource,
+    const prosper::gpu::SpirvDescriptorBinding& descriptor) {
+    return resource.img_dim == 3 &&
+           descriptor.kind == prosper::gpu::SpirvDescriptorKind::StorageImage &&
+           descriptor.image_dim == 1u && descriptor.image_arrayed &&
+           !descriptor.image_multisampled && resource.depth == 6u;
+}
+
 // Metadata only: this is the shape used by live compute before allocating an image. Validation
 // still belongs to the materializer; an invalid descriptor must not become valid by joining a group.
 inline prosper::gpu::ComputeImageViewShape compute_image_alias_shape(
@@ -17,7 +36,8 @@ inline prosper::gpu::ComputeImageViewShape compute_image_alias_shape(
     return {
         descriptor.kind == prosper::gpu::SpirvDescriptorKind::StorageImage,
         resource.img_dim == 2 ? resource.depth : 1u,
-        resource.img_dim == 5 && descriptor.image_dim == 1u && descriptor.image_arrayed
+        (resource.img_dim == 5 && descriptor.image_dim == 1u && descriptor.image_arrayed) ||
+                compute_cube_as_2d_array_storage(resource, descriptor)
             ? resource.depth : 1u,
     };
 }

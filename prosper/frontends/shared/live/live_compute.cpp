@@ -7722,7 +7722,21 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             const bool dim_2d_array = r->img_dim == 5 &&
                                       image_descriptors[i].image_dim == 1u &&
                                       image_descriptors[i].image_arrayed;
-            bi.arrayed_2d = dim_2d_array;
+            // A cube T# IS six 2D layers in memory, and the sampled path above already relies on
+            // that -- it lowers one cube to six stacked faces. A shader that declares a 2D-ARRAY
+            // STORAGE image over the same six faces is that identical shape viewed for WRITING, so
+            // it belongs on the established arrayed-2D path rather than in the skip. Sonic
+            // Frontiers' Cyber Space compute `0x200581bb00` is exactly this: guest `dim=3` 32x32x6
+            // against `shader{dim=1 arrayed=1 storage=1}` (#2790, #657).
+            //
+            // Held to exactly six layers on purpose. A cube ARRAY (depth > 6) addresses more than
+            // one cube, and which cube a write targets is the question the sampled path answers
+            // with its own `dim_cube_stacked` contract; nothing here establishes the same for a
+            // store, so those stay skipped and loud.
+            // Single source of truth with the staging sizing -- see the comment on the predicate.
+            const bool cube_as_2d_array_storage =
+                prosper::frontend::compute_cube_as_2d_array_storage(*r, image_descriptors[i]);
+            bi.arrayed_2d = dim_2d_array || cube_as_2d_array_storage;
             // The recompiler's established cube lowering converts AMD's cube-processed
             // [x, y, face] coordinates to a plain 2D sample over six vertically stacked faces.
             // Compute must expose the same w x 6h image contract as live_renderer. Astro Bot's
@@ -7743,11 +7757,13 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // Reflection distinguishes that fallback from a shader which retains the layer coordinate.
             const bool dim_2d_single = r->img_dim == 5 && ordinary_2d_view;
             if (!dim_1d && r->img_dim != 1 && !dim_3d && !dim_2d_array &&
-                !dim_2d_single && !dim_cube_stacked && !cube_face_as_2d) {
+                !dim_2d_single && !dim_cube_stacked && !cube_face_as_2d &&
+                !cube_as_2d_array_storage) {
                 skip_image(r, "layered image deferred to #657"); break;
             }
             if (dim_1d && r->height != 1) { skip_image(r, "1D image has non-unit height"); break; }
-            if (!r->depth || (!dim_3d && !dim_2d_array && !dim_cube_stacked && r->depth != 1)) {
+            if (!r->depth || (!dim_3d && !dim_2d_array && !dim_cube_stacked &&
+                              !cube_as_2d_array_storage && r->depth != 1)) {
                 if (!cube_face_as_2d) {
                     skip_image(r, "image depth does not match its dimensionality"); break;
                 }
@@ -8306,8 +8322,12 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 break;
             }
             if (bi.alias_of != SIZE_MAX) continue;
+            // cube_as_2d_array_storage counts its six faces here too. Omitting it sizes staging
+            // for ONE layer while the writeback packs width*height*depth texels out of it --
+            // measured as a SIGSEGV in storage_pack_float16x4_f16c before this term existed.
             const uint32_t sampled_layers = dim_cube_stacked ? 6u
-                                            : dim_2d_array ? r->depth : 1u;
+                                            : (dim_2d_array || cube_as_2d_array_storage)
+                                                ? r->depth : 1u;
             const VkDeviceSize volume_texels = static_cast<VkDeviceSize>(r->width) * r->height *
                                                (dim_3d ? r->depth : sampled_layers);
             const uint32_t sampled_components = r->num_components ? r->num_components : 1;
@@ -8569,7 +8589,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                             skip_image(r, "sampled cube-face backing size overflows"); break;
                         }
                         sampled_guest_need = level_offset + selected_slice;
-                    } else if ((dim_2d_array || dim_cube_stacked) && sampled_layers > 1) {
+                    } else if ((dim_2d_array || dim_cube_stacked || cube_as_2d_array_storage) && sampled_layers > 1) {
                         const size_t selected_slice = r->in_mip_tail
                             ? r->mip_tail_bytes : slice;
                         const size_t layer_stride = r->layer_stride_bytes
@@ -8613,7 +8633,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     } else if (r->tile_mode && dim_3d && r->depth > 1) {
                         sampled_guest_need = tiled_volume_bytes(
                             r->width, r->height, r->depth, r->tile_mode, bpt);
-                    } else if ((dim_2d_array || dim_cube_stacked) && sampled_layers > 1) {
+                    } else if ((dim_2d_array || dim_cube_stacked || cube_as_2d_array_storage) && sampled_layers > 1) {
                         const size_t slice = r->in_mip_tail
                             ? r->mip_tail_bytes
                             : (r->tile_mode
@@ -9760,7 +9780,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                                r->tile_mode, bpt)) {
                                 skip_image(r, "sampled volume detile failed"); break;
                             }
-                        } else if ((dim_2d_array || dim_cube_stacked) && sampled_layers > 1) {
+                        } else if ((dim_2d_array || dim_cube_stacked || cube_as_2d_array_storage) && sampled_layers > 1) {
                             const size_t selected_slice = r->in_mip_tail
                                 ? r->mip_tail_bytes
                                 : (r->tile_mode
