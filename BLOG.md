@@ -21,6 +21,14 @@ from the tracker issues, and still gated, because it is a projection of state ra
 
 ## 2026-09-19
 
+### Sonic's last skipped compute dispatches now run, and the picture does not move
+
+No picture — a null, and a useful one. Cyber Space's cubemap prefilter was being refused by the
+compute backend as a "layered image"; it now runs, and the replayed frame comes back **byte-identical
+to before** across all 46 outputs. So whatever is still missing from that world, it is not these
+dispatches. [#657](https://github.com/mattias800/prosper/issues/657),
+[#2790](https://github.com/mattias800/prosper/issues/2790).
+
 ### GTA V's world is back; Sonic's world is visible
 
 The project owner confirms that GTA V's world renders properly with
