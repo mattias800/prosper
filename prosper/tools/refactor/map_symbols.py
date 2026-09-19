@@ -136,8 +136,69 @@ def _clean(entry: dict) -> list[str]:
 
 REPLICATED = ("open", "close")   # roles that every output file needs a copy of
 
+# A directive that CLOSES or UNDOES something, so it belongs to the declaration BEFORE it.
+CLOSING_DIRECTIVE = re.compile(r"^\s*#\s*(endif|undef)\b")
+# A directive that OPENS something, so it belongs to whatever follows. Absorbing past one of these
+# would drag the next declaration's guard into the previous region.
+OPENING_DIRECTIVE = re.compile(r"^\s*#\s*(if|ifdef|ifndef|define|include|else|elif|pragma)\b")
 
-def regions_of(tu, target: pathlib.Path, total_lines: int, max_depth: int = 3) -> list[dict]:
+
+def absorb_trailing_directives(regions: list[dict], lines: list[str]) -> int:
+    """Move a `#endif`/`#undef` that trails a declaration back into ITS region, not the next one.
+
+    A cursor's extent stops at its last token, so a block written as
+
+        #ifndef _WIN32
+        ... declarations ...          <- the last one's cursor ends HERE
+        #undef HELPER
+        #endif
+        void next_thing() {}          <- a different library's function
+
+    leaves `#undef`/`#endif` prefixing the NEXT region, inseparable from `next_thing`. split_file.py
+    then correctly refuses to put a guard and its `#endif` in different files, so no region-granular
+    partition can cut between those two libraries at all. Measured on hle_service.cpp: the AvPlayer
+    block's `#endif` sat in `s_gamepresets`' region, and every library in that file ends this way.
+
+    RUN AS A POST-PASS, NOT DURING TILING, and that is the whole subtlety. Done inside the emitter
+    this absorbs greedily, including a `#endif` whose natural home is the namespace CLOSE region that
+    follows it -- which is replicated into every output, whereas a body region is not. Pulling it out
+    of the close and into a body means the outputs that did not receive that body get the `#if`
+    (replicated, in the open region) with no `#endif`. That is a strictly worse break than the one
+    being fixed, and it is invisible until the compiler sees it. Absorption therefore happens only
+    when the FOLLOWING region is another body, which needs the finished list.
+
+    Tiling is preserved: whatever one region gains, the next loses. Returns how many it moved."""
+    moved = 0
+    for i, r in enumerate(regions[:-1]):
+        nxt = regions[i + 1]
+        # Absorb into a body, from anything except a namespace CLOSE. A close region's opening
+        # directive lives in the matching OPEN region, which is replicated alongside it, so an
+        # `#endif` there is already paired in every output -- pulling it into a body breaks exactly
+        # that pairing. An OPEN region has no such claim: it spans the text before a namespace's
+        # first member, and a leading `#endif` there closes something that came before it.
+        if r["role"] != "body" or nxt["role"] == "close":
+            continue
+        last, j = r["end"], r["end"] + 1
+        while j < nxt["end"]:            # never consume the next region whole
+            line = lines[j - 1]
+            if CLOSING_DIRECTIVE.match(line):
+                last = j
+            elif line.strip() == "":
+                pass                     # blanks may sit between a block and its `#endif`
+            elif OPENING_DIRECTIVE.match(line):
+                break                    # belongs to what comes after
+            else:
+                break                    # a declaration or a comment: not ours
+            j += 1
+        if last > r["end"]:
+            moved += last - r["end"]
+            r["end"] = last
+            nxt["start"] = last + 1
+    return moved
+
+
+def regions_of(tu, target: pathlib.Path, total_lines: int, lines: list[str] | None = None,
+               max_depth: int = 3) -> list[dict]:
     """Tile TARGET into regions, descending through namespaces.
 
     A flat tiling is useless on this codebase: nearly every file is one `namespace prosper { ... }`,
@@ -213,6 +274,9 @@ def regions_of(tu, target: pathlib.Path, total_lines: int, max_depth: int = 3) -
     # replicate role as a namespace open/close. Marked by POSITION rather than by kind: a stray
     # declaration above the first namespace still belongs in every part, whereas a rule keyed on
     # INCLUSION_DIRECTIVE would quietly file it into one of them.
+    if lines is not None:
+        absorb_trailing_directives(regions, lines)
+
     first_open = next((r["index"] for r in regions if r["role"] == "open"), None)
     if first_open is not None:
         for r in regions[:first_open]:
@@ -254,6 +318,17 @@ def usrs_declared_outside(tu, target: pathlib.Path) -> set[str]:
     return out
 
 
+# USRs libclang hands to entities that have no name to be referenced BY. `c:` is the one it gives a
+# `static_assert`, an `extern "C"` linkage spec, and other anonymous cursors -- all of them, so they
+# collide on a single key and the reference graph links every one of them to every other.
+#
+# The result is not noise, it is a confident wrong answer: on hle_service.cpp a `static_assert` about
+# `VdecswConfig` appeared to be referenced 16 times from the libSceAvPlayer block, and split_file.py
+# refused a correct partition because that "definition cannot be reached". An entity with no name
+# cannot be referenced by name, so an edge to one is spurious by construction.
+UNREFERENCEABLE_USRS = frozenset({"c:"})
+
+
 def cross_refs(tu, target: pathlib.Path, regions: list[dict]) -> dict[int, dict[int, int]]:
     """region -> {other region: reference count}, for symbols defined in this same file."""
     # Own every declaration whose LOCATION falls inside a region, not just the region's own cursor.
@@ -281,7 +356,7 @@ def cross_refs(tu, target: pathlib.Path, regions: list[dict]) -> dict[int, dict[
             if pathlib.Path(ch.location.file.name).resolve() != target.resolve():
                 continue
             usr = ch.get_usr()
-            if not usr:
+            if not usr or usr in UNREFERENCEABLE_USRS:
                 continue
             idx = owning_region(ch.location.line)
             if idx is not None:
@@ -564,6 +639,68 @@ def selftest() -> int:
     check(sorted(seen) == list(range(1, 9)) and len(seen) == 8,
           f"every body region appears in exactly one group (got {sorted(seen)})")
 
+    # absorb_trailing_directives moves a trailing `#endif`/`#undef` back into the region it closes.
+    # Pure arithmetic over a region list, so it runs with no libclang. The NEGATIVE arms matter most:
+    # absorbing one line too many drags the next declaration's own guard backwards, and absorbing
+    # into a body region what belongs to a replicated namespace CLOSE leaves other outputs with an
+    # `#if` and no `#endif` -- a strictly worse break than the one being fixed.
+    def R(i, start, end, role="body"):
+        return {"index": i, "start": start, "end": end, "role": role}
+
+    # The AvPlayer shape: declaration, trailing #undef + #endif, then a different library.
+    L = ["decl_a();", "#undef HELPER", "#endif", "void next() {}"]
+    regs = [R(0, 1, 1), R(1, 2, 4)]
+    check(absorb_trailing_directives(regs, L) == 2 and regs[0]["end"] == 3 and regs[1]["start"] == 4,
+          f"absorbs a trailing #undef + #endif (got end={regs[0]['end']}, next start={regs[1]['start']})")
+
+    # Blank line between the block and its #endif.
+    L2 = ["decl_a();", "", "#endif", "void next() {}"]
+    regs2 = [R(0, 1, 1), R(1, 2, 4)]
+    absorb_trailing_directives(regs2, L2)
+    check(regs2[0]["end"] == 3, f"absorbs across a blank line (got {regs2[0]['end']})")
+
+    # STOPS at an opening directive: that #endif closes the NEXT declaration's conditional.
+    L3 = ["decl_a();", "#ifdef X", "void next() {}", "#endif"]
+    regs3 = [R(0, 1, 1), R(1, 2, 4)]
+    check(absorb_trailing_directives(regs3, L3) == 0 and regs3[0]["end"] == 1,
+          "STOPS at an opening directive")
+
+    # STOPS at a declaration and at a comment (a leading comment documents what FOLLOWS it).
+    L4 = ["decl_a();", "void next() {}", "#endif"]
+    regs4 = [R(0, 1, 1), R(1, 2, 3)]
+    check(absorb_trailing_directives(regs4, L4) == 0, "STOPS at a declaration")
+    L5 = ["decl_a();", "// a comment about next()", "#endif"]
+    regs5 = [R(0, 1, 1), R(1, 2, 3)]
+    check(absorb_trailing_directives(regs5, L5) == 0, "STOPS at a comment")
+
+    # THE REGRESSION ARM. The #endif belongs to the replicated namespace CLOSE that follows, not to
+    # the body before it. Absorbing here is what left avplayer.cpp with an unterminated #ifndef.
+    L6 = ["namespace {", "#ifndef _WIN32", "struct S {", "};", "#endif", "}"]
+    regs6 = [R(0, 1, 2, "open"), R(1, 3, 4), R(2, 5, 6, "close")]
+    check(absorb_trailing_directives(regs6, L6) == 0 and regs6[1]["end"] == 4,
+          f"does NOT absorb into a body what belongs to a replicated close (got {regs6[1]['end']})")
+
+    # Absorbing INTO a body FROM a replicated open is right: the open's job starts at `namespace {`,
+    # and a leading `#endif` there closes a conditional that ended with the previous declaration.
+    L8 = ["decl_a();", "#endif", "", "namespace {", "int x;"]
+    regs8 = [R(0, 1, 1), R(1, 2, 4, "open"), R(2, 5, 5)]
+    absorb_trailing_directives(regs8, L8)
+    check(regs8[0]["end"] == 2 and regs8[1]["start"] == 3,
+          f"absorbs from a replicated OPEN (got end={regs8[0]['end']}, open start={regs8[1]['start']})")
+
+    # A run of closing directives between two bodies is absorbed whole.
+    L7 = ["decl_a();", "#endif", "#endif", "void next() {}"]
+    regs7 = [R(0, 1, 1), R(1, 2, 4)]
+    absorb_trailing_directives(regs7, L7)
+    check(regs7[0]["end"] == 3, f"absorbs a run of closing directives (got {regs7[0]['end']})")
+
+    # An entity with no name cannot be referenced BY name, so the graph must never own a USR that
+    # every anonymous cursor shares. Keyed on the exact value libclang produces, because the failure
+    # is a confident wrong edge rather than a crash: it made split_file.py refuse a correct plan.
+    check("c:" in UNREFERENCEABLE_USRS, "the shared anonymous USR is excluded from the graph")
+    check(not ("c:@F@real_function" in UNREFERENCEABLE_USRS),
+          "a real USR is not excluded by a prefix match")
+
     print("== PASS ==" if not bad else f"== FAIL: {bad} ==")
     return 1 if bad else 0
 
@@ -603,7 +740,8 @@ def main() -> int:
 
     flags, parse_file = flags_for(target, db)
     flags += builtin_includes()
-    total_lines = len(target.read_text().splitlines())
+    source_lines = target.read_text().splitlines()
+    total_lines = len(source_lines)
 
     index = ci.Index.create()
     tu = index.parse(str(parse_file), args=flags,
@@ -614,7 +752,7 @@ def main() -> int:
         for d in fatal[:3]:
             print(f"    {d.spelling}")
 
-    regions = regions_of(tu, target, total_lines)
+    regions = regions_of(tu, target, total_lines, source_lines)
     edges = cross_refs(tu, target, regions)
     # Whether a header also declares each region's symbol. See usrs_declared_outside: this is what
     # decides if a definition can be left in another part, and linkage is not a substitute for it.
