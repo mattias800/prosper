@@ -4006,6 +4006,11 @@ struct BoundImage {
     uint32_t mip_levels = 1;
     std::vector<VkDeviceSize> mip_staging_offsets;
     bool arrayed_2d = false;            // SPIR-V requires a real 2D-array view (not base-slice fallback)
+    // Every image access to this binding is an OpImageQuery*: it needs a correctly SHAPED image
+    // to answer the query and no texels at all. Uploading them is not merely wasted work -- the
+    // staging is sized for the guest surface while the image is the declared query shape, which
+    // is VUID-vkCmdCopyBufferToImage-imageSubresource-07972, measured (#657).
+    bool query_only_shape = false;
     bool stacked_cube = false;          // cube lowering addresses six faces as one w x 6h 2D image
     bool depth_view = false;             // reflected SPIR-V uses a true depth image/sampler contract
     VkImage image = VK_NULL_HANDLE;
@@ -7746,9 +7751,25 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // Single source of truth with the staging sizing -- see the comment on the predicate.
             const bool cube_as_2d_array_storage =
                 prosper::frontend::compute_cube_as_2d_array_storage(*r, image_descriptors[i]);
+            // A binding whose every image access is an OpImageQuery* needs its DIMENSIONS
+            // reported and none of its texels. The layered shapes this gate otherwise
+            // refuses are refused because materialising their CONTENT is unsolved -- tiling,
+            // layer stride, format conversion, upload. None of that applies when nothing
+            // reads a texel, so a query-only binding may be admitted on its declared shape.
+            // Sonic Frontiers' 0x2005a11600 binding 53 is a 64x64x18 cube array used only by
+            // OpImageQuerySizeLod/OpImageQueryLevels (#657, #2790).
+            const bool query_only_layered = image_descriptors[i].query_only && !bi.storage;
+            // The query is typed against the module's DECLARED image, so that is the shape the
+            // view must have -- a mismatch is VUID-vkCmdDispatch-viewType-07752, measured. The
+            // guest extent is still what the query must ANSWER; only the dimensionality follows
+            // the declaration, and no texels are uploaded either way.
+            const bool query_only_as_1d =
+                query_only_layered && image_descriptors[i].image_dim == 0u &&
+                !image_descriptors[i].image_arrayed;
             const bool native_cube_sampled =
                 prosper::frontend::compute_native_cube_sampled(*r, image_descriptors[i]);
             bi.arrayed_2d = dim_2d_array || cube_as_2d_array_storage;
+            bi.query_only_shape = query_only_as_1d;
             // The recompiler's established cube lowering converts AMD's cube-processed
             // [x, y, face] coordinates to a plain 2D sample over six vertically stacked faces.
             // Compute must expose the same w x 6h image contract as live_renderer. Astro Bot's
@@ -7770,12 +7791,13 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             const bool dim_2d_single = r->img_dim == 5 && ordinary_2d_view;
             if (!dim_1d && r->img_dim != 1 && !dim_3d && !dim_2d_array &&
                 !dim_2d_single && !dim_cube_stacked && !cube_face_as_2d &&
-                !cube_as_2d_array_storage && !native_cube_sampled) {
+                !cube_as_2d_array_storage && !native_cube_sampled &&
+                !query_only_layered) {
                 skip_image(r, "layered image deferred to #657"); break;
             }
             if (dim_1d && r->height != 1) { skip_image(r, "1D image has non-unit height"); break; }
             if (!r->depth || (!dim_3d && !dim_2d_array && !dim_cube_stacked &&
-                              !cube_as_2d_array_storage && !native_cube_sampled && r->depth != 1)) {
+                              !cube_as_2d_array_storage && !native_cube_sampled && !query_only_layered && r->depth != 1)) {
                 if (!cube_face_as_2d) {
                     skip_image(r, "image depth does not match its dimensionality"); break;
                 }
@@ -9938,9 +9960,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                             r->width == r->height && bi.array_layers == 6u;
             if (native_cube_sampled && cube_capable_shape)
                 ici.flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
-            ici.imageType = dim_1d ? VK_IMAGE_TYPE_1D : (dim_3d ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D);
+            ici.imageType = (dim_1d || query_only_as_1d) ? VK_IMAGE_TYPE_1D : (dim_3d ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D);
             ici.format = image_format;
-            ici.extent = {r->width, dim_cube_stacked ? r->height * 6u : r->height,
+            ici.extent = {r->width, query_only_as_1d ? 1u : (dim_cube_stacked ? r->height * 6u : r->height),
                           dim_3d ? bi.texel_depth : 1u};
             ici.mipLevels = bi.mip_levels;
             ici.arrayLayers = bi.array_layers;
@@ -9972,7 +9994,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 ComputeClock::now() - image_allocation_start).count();
             VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
             vci.image = bi.image;
-            vci.viewType = dim_1d ? VK_IMAGE_VIEW_TYPE_1D
+            vci.viewType = (dim_1d || query_only_as_1d) ? VK_IMAGE_VIEW_TYPE_1D
                                   : (dim_3d ? VK_IMAGE_VIEW_TYPE_3D
                                      : native_cube_sampled ? VK_IMAGE_VIEW_TYPE_CUBE
                                      : (dim_2d_array || cube_as_2d_array_storage) ? VK_IMAGE_VIEW_TYPE_2D_ARRAY
@@ -11072,6 +11094,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 target_copy.imageSubresource = {
                     VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
                 target_copy.imageExtent = {r->width, r->height, 1};
+                // No texels for a query-only binding -- see BoundImage::query_only_shape.
+                if (!bi.query_only_shape)
                 vkCmdCopyBufferToImage(command, staging[i], bi.image,
                                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                                        1, &target_copy);
@@ -11264,6 +11288,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     : VkExtent3D{r->width, bi.stacked_cube ? r->height * 6u : r->height,
                                  bi.array_layers > 1 ? 1u : bi.texel_depth};
             }
+            // No texels for a query-only binding -- see BoundImage::query_only_shape.
+            if (!bi.query_only_shape)
             vkCmdCopyBufferToImage(command, staging[i], bi.image,
                                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                                    static_cast<uint32_t>(mip_regions.size()), mip_regions.data());
@@ -12701,6 +12727,25 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     } while (false);
 
     if (trace)
+        // #2790: dump this dispatch's SPIR-V when asked, INCLUDING when it failed. The existing
+        // PROSPER_DUMP_COMPUTE_SPIRV path only writes modules that reach VkShaderModule creation,
+        // and gpu_replay's --dump-compute rejects --bundle, so a dispatch that is refused at image
+        // binding leaves nothing to read -- which is exactly the dispatch anyone needs to inspect.
+        if (const char* dump_dir = std::getenv("PROSPER_DUMP_DISPATCH_SPIRV")) {
+            if (*dump_dir && !spirv.empty()) {
+                char path[512];
+                std::snprintf(path, sizeof path, "%s/dispatch_0x%llx_%016llx.spv", dump_dir,
+                              (unsigned long long)item.code_addr,
+                              (unsigned long long)gpu_capture_hash(
+                                  reinterpret_cast<const uint8_t*>(spirv.data()),
+                                  spirv.size() * sizeof(uint32_t)));
+                if (FILE* f = std::fopen(path, "wb")) {
+                    std::fwrite(spirv.data(), sizeof(uint32_t), spirv.size(), f);
+                    std::fclose(f);
+                    std::fprintf(stderr, "[compute]   dispatch SPIR-V -> %s\n", path);
+                }
+            }
+        }
         std::fprintf(stderr, "[compute] execute submit=%llu dispatch=%llu code=0x%llx "
                      "threads=%ux%ux%u local=%ux%ux%u groups=%ux%ux%u "
                      "buffers=%zu images=%zu spirv=%zu/%016llx result=%s\n",

@@ -1058,9 +1058,14 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
         }
         report.storage_buffer_writes_complete = false;
     };
-    auto mark_image = [&](uint32_t object, bool read, bool write) {
+    // Which image variables were touched by a QUERY, and which by anything else. A binding whose
+    // every access is a query needs its declared extent reported but none of its texels.
+    std::set<uint32_t> image_query_vars, image_nonquery_vars;
+    auto mark_image = [&](uint32_t object, bool read, bool write, bool query = false) {
         auto origin = image_objects.find(object);
-        if (origin != image_objects.end()) mark(origin->second, read, write);
+        if (origin == image_objects.end()) return;
+        (query ? image_query_vars : image_nonquery_vars).insert(origin->second);
+        mark(origin->second, read, write);
     };
     auto mark_image_coordinate_contract = [&](uint32_t object, bool normalized) {
         auto origin = image_objects.find(object);
@@ -1178,7 +1183,7 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
             // OpImageQueryFormat/Order/SizeLod/Size/Lod/Levels/Samples all place the image object
             // after result type/result id. Query-only descriptors must remain in the reflected
             // layout, and their reported dimensions/LOD contract requires the guest's exact extent.
-            mark_image(word(in, 2), true, false);
+            mark_image(word(in, 2), true, false, /*query=*/true);
             mark_image_coordinate_contract(word(in, 2), false);
         } else if ((in.opcode == OpAccessChain || in.opcode == OpInBoundsAccessChain) && n >= 3) {
             const uint32_t result = word(in, 1), base = word(in, 2);
@@ -1255,6 +1260,10 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
             image_arrayed, image_multisampled, image_depth,
             atomic_vars.count(var) != 0};
         descriptor.image_numeric_class = image_numeric_classes[var];
+        // Assigned by NAME, deliberately: the initializer above is positional, and adding a field
+        // to it is how #2462 happened. Query-only means every image access was an OpImageQuery*.
+        descriptor.query_only = image_query_vars.count(var) != 0 &&
+                                image_nonquery_vars.count(var) == 0;
         // Assigned here rather than added to the initializer above: that initializer is positional and
         // names no field, so extending it is how #2462 happens. See the note on the member.
         if (auto ai = descriptor_arities.find(var); ai != descriptor_arities.end())
@@ -1313,6 +1322,9 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
         prior.readable |= descriptor.readable;
         prior.writable |= descriptor.writable;
         prior.atomic_access |= descriptor.atomic_access;
+        // AND, not OR: one variable reading texels through this binding means the binding is not
+        // query-only, however many other variables only measure it.
+        prior.query_only = prior.query_only && descriptor.query_only;
     }
     report.descriptors = std::move(coalesced);
     if (!spirv_descriptor_reflection_complete(report))

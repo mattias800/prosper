@@ -978,6 +978,14 @@ struct SpirvDescriptorBinding {
     // The descriptor is reached by an OpAtomic*. Compute uses this to recognize the deliberately
     // buffer-backed view of an exact R32_UINT StorageImage (the RADV image-atomic workaround).
     bool atomic_access = false;
+    // Every image access to this binding is an OpImageQuery* -- the shader asks only for the
+    // surface's DIMENSIONS and mip count and never reads a texel. `readable` is true for such a
+    // binding (a query does read the descriptor), so it cannot distinguish this case; the whole
+    // point here is that no CONTENT is required. A backend may therefore satisfy it without
+    // materialising the guest surface -- which is what lets Sonic Frontiers' Cyber Space dispatch
+    // `0x2005a11600` run: its binding 53 is a 64x64x18 cube array used only by
+    // OpImageQuerySizeLod/OpImageQueryLevels (#657, #2790).
+    bool query_only = false;
     // Exact Sampled Type numeric class. `sampled_float` / `storage_float` remain as convenient,
     // backwards-compatible predicates; this field prevents a signed/unsigned integer image from
     // collapsing into the same false boolean at the Vulkan binding boundary.
