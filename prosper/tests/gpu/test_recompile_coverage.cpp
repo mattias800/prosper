@@ -3244,6 +3244,96 @@ int main() {
               "#2790: Wave64 s_and_b64 with scalar pair and VCC is supported in compute");
     }
 
+    {
+        // #2790 / Sonic Frontiers: Entry-prefix flow-sensitive SMEM descriptor indirection with later SGPR reuse.
+        // pc0: s_buffer_load_dwordx4 s[28:31], s[12:15], 0 (SMEM op 0x0a)
+        // pc2: s_waitcnt 0
+        // pc3: s_buffer_load_dword s20, s[28:31], 0 (SMEM op 0x08)
+        // pc5: s_waitcnt 0
+        // pc6: s_cmp_eq_u32 11, s20 (SOPC op 0x06)
+        // pc7: s_mov_b32 s28, 0 (SOP1 op 0x03, clobbers s28 later in stream)
+        // pc8: s_cbranch_scc1 1 -> pc10
+        // pc9: s_barrier
+        // pc10: s_endpgm
+        const uint32_t smem_reuse_code[] = {
+            0xf4280706u, 0xfa000000u, // pc0: s_buffer_load_dwordx4 s[28:31], s[12:15], 0
+            0xbf8c0000u,              // pc2: s_waitcnt 0
+            0xf420050eu, 0xfa000000u, // pc3: s_buffer_load_dword s20, s[28:31], 0
+            0xbf8c0000u,              // pc5: s_waitcnt 0
+            0xbf06148bu,              // pc6: s_cmp_eq_u32 11, s20
+            0xbe9c0380u,              // pc7: s_mov_b32 s28, 0 (scratch reuse of s28)
+            0xbf850001u,              // pc8: s_cbranch_scc1 1 -> pc10
+            0xbf8a0000u,              // pc9: s_barrier
+            0xbf810000u,              // pc10: s_endpgm
+        };
+        std::vector<Rdna2Inst> smem_ins;
+        rdna2_walk(smem_reuse_code, std::size(smem_reuse_code), smem_ins);
+        CHECK(scc_branch_is_workgroup_uniform(smem_ins, 8),
+              "#2790: entry-prefix SMEM descriptor walk proves uniform despite later SGPR scratch reuse");
+    }
+
+    {
+        // #2790 / Sonic Frontiers: SCC branch evaluated after EXEC narrowing.
+        // pc0: s_mov_b64 exec, -1
+        // pc1: v_cmpx_eq_u32 exec, 0, v0
+        // pc2: s_cbranch_execz 1 -> pc4
+        // pc3: v_add_f32 v1, v0, v0
+        // pc4: s_mov_b32 s0, 5
+        // pc5: s_cmp_eq_u32 5, s0
+        // pc6: s_cbranch_scc1 1 -> pc8
+        // pc7: s_barrier
+        // pc8: s_endpgm
+        const uint32_t scc_exec_narrowed_code[] = {
+            0xbefe04c1u,              // pc0: s_mov_b64 exec, -1
+            0x7da40080u,              // pc1: v_cmpx_eq_u32 exec, 0, v0
+            0xbf880001u,              // pc2: s_cbranch_execz 1 -> pc4
+            0x06020000u,              // pc3: v_add_f32 v1, v0, v0
+            0xbe800385u,              // pc4: s_mov_b32 s0, 5
+            0xbf060085u,              // pc5: s_cmp_eq_u32 5, s0
+            0xbf850001u,              // pc6: s_cbranch_scc1 1 -> pc8
+            0xbf8a0000u,              // pc7: s_barrier
+            0xbf810000u,              // pc8: s_endpgm
+        };
+        std::vector<Rdna2Inst> scc_ins;
+        rdna2_walk(scc_exec_narrowed_code, std::size(scc_exec_narrowed_code), scc_ins);
+        CHECK(scc_branch_is_workgroup_uniform(scc_ins, 6),
+              "#2790: workgroup-uniform SCC branch is recognized even after an EXEC-narrowed region");
+        CHECK(!vcc_branch_is_workgroup_uniform(scc_ins, 6),
+              "#2790: control: VCC branch at the same site correctly fails due to narrowed EXEC");
+    }
+
+    {
+        // #2790 / Sonic Frontiers: compute_shader_prefers_native_multiwave with nested wave votes
+        // in uniform workgroup control flow.
+        const uint32_t nested_wave_votes_code[] = {
+            0xf4200506u, 0xfa000000u, // pc0: s_buffer_load_dword s20, s[12:15], 0
+            0xbf8c0000u,              // pc2: s_waitcnt 0
+            0xbf061480u,              // pc3: s_cmp_eq_u32 0, s20
+            0xbf850012u,              // pc4: s_cbranch_scc1 18 -> pc23 (uniform workgroup guard)
+            0x7da20200u,              // pc5: v_cmpx_lt_u32 exec, s0, v1
+            0xbf880001u,              // pc6: s_cbranch_execz 1 -> pc8
+            0xbe800381u,              // pc7: s_mov_b32 s0, 1
+            0xbefe04c1u,              // pc8: s_mov_b64 exec, -1
+            0xbf8a0000u,              // pc9: s_barrier
+            0x7da20200u,              // pc10: v_cmpx_lt_u32 exec, s0, v1
+            0xbf880001u,              // pc11: s_cbranch_execz 1 -> pc13
+            0xbe800382u,              // pc12: s_mov_b32 s0, 2
+            0xbefe04c1u,              // pc13: s_mov_b64 exec, -1
+            0xbf8a0000u,              // pc14: s_barrier
+            0x7da20200u,              // pc15: v_cmpx_lt_u32 exec, s0, v1
+            0xbf880001u,              // pc16: s_cbranch_execz 1 -> pc18
+            0xbe800383u,              // pc17: s_mov_b32 s0, 3
+            0xbefe04c1u,              // pc18: s_mov_b64 exec, -1
+            0x7da20200u,              // pc19: v_cmpx_lt_u32 exec, s0, v1
+            0xbf880001u,              // pc20: s_cbranch_execz 1 -> pc22
+            0xbe800384u,              // pc21: s_mov_b32 s0, 4
+            0xbefe04c1u,              // pc22: s_mov_b64 exec, -1
+            0xbf810000u,              // pc23: s_endpgm
+        };
+        CHECK(compute_shader_prefers_native_multiwave(nested_wave_votes_code, std::size(nested_wave_votes_code)),
+              "#2790: native multiwave selection recognizes structured wave votes nested in uniform control flow");
+    }
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;
