@@ -9156,10 +9156,14 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 // Build the same exact identity used by ordinary admission before choosing either
                 // path.  A compressed target may become eligible only after successful writeback;
                 // deriving a second, looser key there could replace an unrelated cached image.
-                // #657: a binding that will take a CUBE view must not be satisfied by a cached
-                // image created without CUBE_COMPATIBLE -- the flag is fixed at creation, so that
-                // is a fault rather than a hit. Carrying it in the identity makes such a lookup
-                // MISS and build the right image, instead of failing at vkCreateImageView.
+                // #657: `native_cube_sampled` is a SAMPLED predicate, so it is constant false on
+                // this storage arm and the term is written out deliberately rather than omitted --
+                // the key is positional, and a reader comparing the two call sites should see the
+                // same argument list. The term does real work only on the sampled key above, where
+                // a cached image created without CUBE_COMPATIBLE must MISS rather than be handed
+                // to a cube view (the flag is fixed at creation, so that is a fault, not a hit).
+                // An earlier head of this PR also admitted a cube bound as 2D-array STORAGE, which
+                // would have made this term live here; that shape is withdrawn (#3742).
                 bi.cache_key = storage_image_cache_key(
                     *r, static_cast<uint32_t>(guest_bytes), image_format, 1u,
                     native_cube_sampled);
@@ -9964,10 +9968,25 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 ici.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
             // Vulkan permits the flag only on a square 2D image with at least six layers; the
             // stacked-cube lowering (height x6, one layer) is not such a shape and fails
-            // VUID-VkImageCreateInfo-flags-08866. Set it exactly where a cube view is taken.
+            // VUID-VkImageCreateInfo-flags-08866.
             const bool cube_capable_shape = !dim_3d && !dim_cube_stacked &&
                                             r->width == r->height && bi.array_layers == 6u;
-            if (native_cube_sampled && cube_capable_shape)
+            // These two conditions MUST agree, and that is the whole point of this block. The view
+            // below is chosen on `native_cube_sampled` alone, so a cube-declared binding whose
+            // image is not cube-capable would take a VK_IMAGE_VIEW_TYPE_CUBE view over an image
+            // created without the flag -- which is exactly VUID-VkImageViewCreateInfo-image-01003,
+            // the failure this PR's cache-key work exists to prevent, reintroduced at the other
+            // end. A non-square cube T# is the reachable case.
+            //
+            // It declines rather than silently falling back to a 2D or 2D_ARRAY view: nothing here
+            // establishes what a cube-declared sample means over a non-square surface, and a
+            // fallback view would answer it by accident. Loud, per the charter's fail-visible rule.
+            if (native_cube_sampled && !cube_capable_shape) {
+                skip_image(r, "cube-declared sampled binding whose image cannot be "
+                              "CUBE_COMPATIBLE (non-square, wrong layer count, or stacked)");
+                break;
+            }
+            if (native_cube_sampled)
                 ici.flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
             ici.imageType = (dim_1d || query_only_as_1d) ? VK_IMAGE_TYPE_1D : (dim_3d ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D);
             ici.format = image_format;
