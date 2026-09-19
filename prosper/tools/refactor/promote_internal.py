@@ -646,6 +646,10 @@ def selftest() -> int:
     assert "hle_service.cpp" in hle, hle
     assert "prosper/src/hle/service" in hle, hle
     assert "rdna2" not in hle and "recompiler" not in hle, hle
+    # The default states only what the path establishes. A visibility policy is not derivable --
+    # the header that prompted this fix is included from four sibling directories on purpose -- so
+    # generating one produces a claim that reads as checked and is not.
+    assert "nothing outside" not in hle and "INTERNAL to" not in hle, hle
     gpu = header_banner("/x/prosper/src/gpu/recompiler/rdna2_to_spirv.cpp", None)
     assert "prosper/src/gpu/recompiler" in gpu and "rdna2_to_spirv.cpp" in gpu, gpu
     assert hle != gpu, "the banner must differ between two different sources"
@@ -669,7 +673,15 @@ def header_banner(source_path: str, custom: str | None) -> str:
     the first thing read and the last thing checked.
 
     So it is DERIVED from the source being promoted out of, and `--note` overrides it for a
-    header that wants to say something more specific."""
+    header that wants to say something more specific.
+
+    It states only what the source path establishes: where the code came from and where it now
+    lives. The hardcoded version also asserted a VISIBILITY POLICY -- "nothing outside that
+    directory should include this header" -- and the first derived draft kept that sentence, which
+    just made the tool generate a plausible-looking claim it has no way to know. It was already
+    false for the header that prompted this fix: `src/hle/service/service_trace.hpp` exists
+    precisely so that files in `src/hle/video/`, `src/hle/fs/` and `src/hle/input/` can include it.
+    A policy is the author's to state, so it belongs in --note."""
     if custom:
         return "".join(f"// {line}\n" for line in custom.splitlines())
     src = pathlib.Path(source_path)
@@ -678,8 +690,8 @@ def header_banner(source_path: str, custom: str | None) -> str:
     if marker in owner:
         owner = owner[owner.index(marker):]
     return (f"// Lifted out of {src.name}'s anonymous namespaces so the code that operates on them\n"
-            f"// can live in its own translation units. These are INTERNAL to {owner}: nothing\n"
-            f"// outside that directory should include this header.\n")
+            f"// can live in its own translation units. Declared in {owner}; who may include it is\n"
+            f"// a decision this banner does not make -- say so with --note if it is restricted.\n")
 
 
 def main() -> int:
