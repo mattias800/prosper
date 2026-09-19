@@ -9945,7 +9945,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             vci.image = bi.image;
             vci.viewType = dim_1d ? VK_IMAGE_VIEW_TYPE_1D
                                   : (dim_3d ? VK_IMAGE_VIEW_TYPE_3D
-                                     : dim_2d_array ? VK_IMAGE_VIEW_TYPE_2D_ARRAY
+                                     : (dim_2d_array || cube_as_2d_array_storage) ? VK_IMAGE_VIEW_TYPE_2D_ARRAY
                                                     : VK_IMAGE_VIEW_TYPE_2D);
             vci.format = ici.format;
             if (!bi.storage) {
