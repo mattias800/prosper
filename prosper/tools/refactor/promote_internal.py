@@ -639,8 +639,47 @@ def selftest() -> int:
     if bad:
         print("  the promotion tool's own guarantees are broken; it must not be run")
         return 1
+    # The banner is derived, not hardcoded. Pinned because the failure is silent and permanent:
+    # a header whose first three lines name the wrong subsystem is read by everyone and re-checked
+    # by nobody, and the tool shipped exactly that for every caller after its first.
+    hle = header_banner("/x/prosper/src/hle/service/hle_service.cpp", None)
+    assert "hle_service.cpp" in hle, hle
+    assert "prosper/src/hle/service" in hle, hle
+    assert "rdna2" not in hle and "recompiler" not in hle, hle
+    gpu = header_banner("/x/prosper/src/gpu/recompiler/rdna2_to_spirv.cpp", None)
+    assert "prosper/src/gpu/recompiler" in gpu and "rdna2_to_spirv.cpp" in gpu, gpu
+    assert hle != gpu, "the banner must differ between two different sources"
+    custom = header_banner("/x/prosper/src/hle/service/hle_service.cpp", "one\ntwo")
+    assert custom == "// one\n// two\n", custom
+    print("  [ok]   header banner is derived from the source, and --note overrides it")
+
     print("  [ok]   promote_internal self-test: detection, extraction, and both must-fail arms")
     return 0
+
+
+def header_banner(source_path: str, custom: str | None) -> str:
+    """The comment at the top of the generated header.
+
+    This used to be a hardcoded string naming `rdna2_to_spirv.cpp` and declaring the header
+    INTERNAL to `src/gpu/recompiler/` -- the tool's first caller. It was written verbatim into
+    every header the tool has produced since, so promoting six helpers out of
+    `src/hle/service/hle_service.cpp` produced a header whose own banner told the reader it
+    belonged to the recompiler and that nothing outside the GPU tree should include it. Both
+    statements were false, and a false statement at the top of a file is worse than none: it is
+    the first thing read and the last thing checked.
+
+    So it is DERIVED from the source being promoted out of, and `--note` overrides it for a
+    header that wants to say something more specific."""
+    if custom:
+        return "".join(f"// {line}\n" for line in custom.splitlines())
+    src = pathlib.Path(source_path)
+    owner = src.parent.as_posix()
+    marker = "prosper/"
+    if marker in owner:
+        owner = owner[owner.index(marker):]
+    return (f"// Lifted out of {src.name}'s anonymous namespaces so the code that operates on them\n"
+            f"// can live in its own translation units. These are INTERNAL to {owner}: nothing\n"
+            f"// outside that directory should include this header.\n")
 
 
 def main() -> int:
@@ -655,6 +694,10 @@ def main() -> int:
                          "entity. A forward declaration belongs in the header and its definition "
                          "may deliberately stay behind -- that pairing is the normal one, and "
                          "pulling the definition along turns a 797-line function into header text.")
+    ap.add_argument("--note",
+                    help="replace the generated header banner with this text (one comment line per "
+                         "input line). The default is derived from the source file and its "
+                         "directory; a wrong banner is the one thing here nobody re-checks")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args()
@@ -963,9 +1006,7 @@ def main() -> int:
         for i in sorted(external):
             print(f"           moved for ordering: {regions[i]['kind']:<16s} {regions[i]['name']}")
 
-    note = ("// Lifted out of rdna2_to_spirv.cpp's anonymous namespaces so the emit functions that\n"
-            "// operate on them can live in their own translation units. These are INTERNAL to the\n"
-            "// recompiler: nothing outside src/gpu/recompiler/ should include this header.\n")
+    note = header_banner(map_data["file"], args.note)
     spelling = canonical_include(map_data["file"], args.header)
     header_text, new_source, inlined = build(map_data, original, promote, args.header,
                                              args.namespace, note, spelling, forward_decls)
