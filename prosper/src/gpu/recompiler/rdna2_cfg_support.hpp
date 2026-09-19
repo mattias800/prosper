@@ -1609,31 +1609,16 @@ inline bool branch_is_workgroup_uniform(const std::vector<Rdna2Inst>& ins, uint3
         }
     };
 
-    // A register whose reaching definition lies OUTSIDE the branch's straight-line region, in the
-    // one shape where no dominance question arises: it has exactly ONE definition in the entire
-    // program, so whatever path reached the use, that is the definition it saw -- or the register is
-    // untouched launch data, which is uniform too. Both alternatives are uniform, so the value is.
+    // A scalar load outside the branch's block can still be traced through a straight-line
+    // entry prefix. Require a sole load definition and no edge that can re-enter that prefix:
+    // one static writer does not mean one execution, and a later backedge may bring different
+    // descriptor values or bypass an earlier definition. Indirect SOP1 edges fail closed; the
+    // remaining SOPK control-flow inventory gap is tracked in #3719.
     //
-    // Deliberately narrow. The definition must be a scalar memory load whose address operands still
-    // hold their wave-entry values AT THE LOAD, which is the uber-shader shape this exists for: a
-    // quality/variant selector read once from a constant buffer at the top of the kernel and then
-    // compared against literals to pick between barrier-separated phases (#3713 --
-    // `0x2005713000`'s `s16`, an `s_buffer_load_dwordx8` at pc 5 from launch SGPRs `s[8:11]`).
-    //
-    // What this must NOT become is a flow-insensitive "every writer of the register is uniform"
-    // rule, which is the obvious generalisation and is wrong here: that same program reuses `s8` as
-    // a VOPC lane mask at pc 49, long AFTER the load at pc 5 reads `s[8:11]`. A rule that asks about
-    // `s8` globally marks it non-uniform and rejects a program that is plainly fine. The operands
-    // are therefore asked about at the LOAD's index, not at the use's.
-    // A register whose reaching definition lies in the entry straight-line region and which has
-    // exactly one definition in the entire program: whatever path reached the use, that is the
-    // definition it saw.
-    //
-    // Deliberately flow-sensitive within the entry prefix: the address operands of the load (and
-    // any intermediate scalar ALU ops or buffer loads defining them) are resolved backwards within
-    // the branch-free prefix [0, only). This correctly models constant-buffer indirection (e.g.
-    // descriptor table loaded at pc 9 into s[28:31] from launch s[12:15], then dereferenced at pc 12
-    // into s20, where s28 is later reused as a scratch register past pc 60).
+    // Resolve descriptor/address inputs at each load, not globally. This admits constant-buffer
+    // indirection and later scratch reuse (Sonic #2790), without confusing that later overwrite
+    // with the value actually read. Every contributing scalar operand must be uniform, including
+    // both words of a B64 source even when the instruction writes only one word.
     std::function<bool(int, size_t, uint32_t)> entry_uniform_scalar;
     entry_uniform_scalar = [&](int reg, size_t before, uint32_t depth) -> bool {
         if (depth > 16 || reg < 0 || reg > 105) return false;
@@ -1666,9 +1651,12 @@ inline bool branch_is_workgroup_uniform(const std::vector<Rdna2Inst>& ins, uint3
             }
             case Rdna2Format::SOP1: {
                 if (in.opcode == 0x1f) return true; // s_getpc_b64
-                if (rdna2_instruction_may_change_exec(in) || in.n_src != 1) return false;
+                // Bitset and conditional-move forms read the old destination (and cmov also
+                // reads SCC). The explicit operand alone cannot prove their result uniform.
+                if (rdna2_instruction_may_change_exec(in) || in.n_src != 1 ||
+                    scalar_implicit_destination_read_width(in)) return false;
                 const Operand& op = in.src[0];
-                const uint32_t words = scalar_write_width(in) == 2 ? 2u : 1u;
+                const uint32_t words = scalar_alu_source_words(in, 0);
                 if (op.kind == OperandKind::Special && op.value == 125) return true;
                 if (op.kind == OperandKind::InlineInt || op.kind == OperandKind::Literal) return true;
                 if (op.kind != OperandKind::SGPR && op.kind != OperandKind::Special) return false;
@@ -1711,6 +1699,12 @@ inline bool branch_is_workgroup_uniform(const std::vector<Rdna2Inst>& ins, uint3
             only = i;
         }
         if (only == ins.size()) return false;
+        // The textual backward slice is valid only if no other edge can enter through the load.
+        // This includes an edge to pc0: the second visit need not carry launch-time register data.
+        if (!targets.empty() && *targets.begin() <= ins[only].pc) return false;
+        for (const Rdna2Inst& in : ins)
+            if (in.fmt == Rdna2Format::SOP1 && in.opcode >= 0x20u && in.opcode <= 0x22u)
+                return false; // indirect PC change could enter anywhere in the prefix
         for (size_t i = 0; i < only; ++i) {
             const Rdna2Inst& before_def = ins[i];
             if (before_def.is_end) return false;
@@ -1747,8 +1741,11 @@ inline bool branch_is_workgroup_uniform(const std::vector<Rdna2Inst>& ins, uint3
         switch (in.fmt) {
             case Rdna2Format::SOP1:
                 if (in.opcode == 0x1f) return true;                     // s_getpc_b64
-                if (rdna2_instruction_may_change_exec(in) || in.n_src != 1) return false;
-                return uniform_operand(in.src[0], scalar_write_width(in) == 2 ? 2u : 1u, w, depth);
+                // Bitset and conditional-move forms read the old destination (and cmov also
+                // reads SCC). The explicit operand alone cannot prove their result uniform.
+                if (rdna2_instruction_may_change_exec(in) || in.n_src != 1 ||
+                    scalar_implicit_destination_read_width(in)) return false;
+                return uniform_operand(in.src[0], scalar_alu_source_words(in, 0), w, depth);
             case Rdna2Format::SOP2: {
                 // Carry and cselect forms consume SCC as well as their decoded operands; the mask
                 // slice models the cselect shape explicitly and nothing else may use them as data.
