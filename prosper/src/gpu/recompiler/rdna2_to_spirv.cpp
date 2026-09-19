@@ -365,6 +365,7 @@ bool compute_shader_prefers_native_multiwave(const std::vector<Rdna2Inst>& ins,
 
     auto top_level_pc = [&](uint32_t pc) {
         for (const ForwardIf& parent : branches) {
+            if (parent.uniform_workgroup) continue;
             const uint32_t parent_end = parent.has_else ? parent.merge_pc : parent.target_pc;
             if (parent.branch_pc < pc && pc < parent_end) return false;
         }
@@ -378,7 +379,6 @@ bool compute_shader_prefers_native_multiwave(const std::vector<Rdna2Inst>& ins,
     size_t structured_wave_votes = 0;
     for (const ForwardIf& branch : branches) {
         if (!branch.on_exec && !branch.on_vcc) continue;
-        if (!top_level_pc(branch.branch_pc)) return false;
         ++structured_wave_votes;
     }
     // Four proven scratch-emulated votes keep the default narrower than the all-multi-wave experiment.

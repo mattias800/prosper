@@ -259,7 +259,7 @@ enum : uint32_t {
     EM_SignedZeroInfNanPreserve=4461,
     SC_Input=1, SC_UniformConstant=0, SC_Output=3, SC_Function=7, SC_PushConstant=9,
     SC_Image=11, SC_StorageBuffer=12, FC_None=0,
-    Dim_1D=0, Dim_2D=1, Dim_3D=2,   // SPIR-V Dim. (2D coincides with the SQ_RSRC 2D dim value, but distinct.)
+    Dim_1D=0, Dim_2D=1, Dim_3D=2, Dim_Cube=3,   // SPIR-V Dim. (2D coincides with the SQ_RSRC 2D dim value, but distinct.)
     Cap_Sampled1D=43, Cap_Image1D=44,   // Dim=1D needs Sampled1D; a 1D STORAGE image (read/write) also needs Image1D
     Cap_StorageImageMultisample=27,      // MS=1 storage image (read/write a multisampled image)
     Cap_ImageMSArray=48,                 // MS=1 AND Arrayed=1 image (2D_MSAA_ARRAY)
@@ -2235,11 +2235,12 @@ struct SpirvCompute {
         } else {
             // #325: an Arrayed 2D image queries as ivec3, its third component being the layer
             // COUNT -- which is exactly what GET_RESINFO's third result means for a 2D_ARRAY T#, so
-            // reporting it is right rather than merely legal.
+            // reporting it is right rather than merely legal. Dim_Cube queries as ivec2 (width, height).
             const bool arrayed_2d = dim == Dim_2D && tex_is_arrayed(binding);
-            const uint32_t size_type = (dim == Dim_2D && !arrayed_2d) ? t_v2i() : t_v3i();
+            const bool is_2d_or_cube = (dim == Dim_2D && !arrayed_2d) || dim == Dim_Cube;
+            const uint32_t size_type = is_2d_or_cube ? t_v2i() : t_v3i();
             uint32_t size = id(); put(code, Op_ImageQuerySizeLod, {size_type, size, img, bcs(lod_bits)});
-            const uint32_t components = (dim == Dim_2D && !arrayed_2d) ? 2u : 3u;
+            const uint32_t components = is_2d_or_cube ? 2u : 3u;
             for (uint32_t c = 0; c < components; c++) {
                 uint32_t value = id(); put(code, Op_CompositeExtract, {t_i32, value, size, c});
                 out[c] = i2u(value);
@@ -5021,10 +5022,11 @@ inline uint32_t scalar_write_width(const Rdna2Inst& in) {
         case Rdna2Format::SOP1:
             if (in.opcode == 0x20) return 0; // s_setpc_b64 reads its decoded "dst" field.
             switch (in.opcode) {
+                case kSop1OpcodeCmovB64: // both words may change even though the write is conditional
                 case 0x04: case 0x08: case 0x0a: case 0x1f: case 0x2d:
                 case 0x24: case 0x25: case 0x26: case 0x27:
                 case 0x28: case 0x29: case 0x2a: case 0x2b:
-                case 0x37: case 0x38:
+                case 0x37: case 0x38: case 0x3b:
                     return 2; // B64 data/mask writes
                 default: return 1;
             }

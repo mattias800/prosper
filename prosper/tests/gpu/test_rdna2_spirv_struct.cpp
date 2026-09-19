@@ -5814,23 +5814,51 @@ int main() {
     }
     printf("  [ok]   image_get_resinfo 2D_ARRAY lowers to a size query\n");
 
-    // CONTROL, and it is the arm that keeps the change honest rather than merely wide: CUBE (dim 3)
-    // must STILL reject. Two of this stage's other programs issue exactly that form
-    // (`0xf0380118`, dmask:x), and admitting them would need the stacked-face lowering (#273) to
-    // promise what GET_RESINFO's third result means for a cube, which this change does not
-    // establish. Same word as the accepted case with DIM alone changed 5 -> 3, so a widening that
-    // reached past 2D_ARRAY reddens here.
+    // #3724 added CUBE queries. Pin their image dimension and two-component size result rather
+    // than retaining the old rejection expectation. Use a matching cube resource, not the array
+    // resource from the preceding case.
+    ShaderResourceTable rt_cube = rt_2d_array;
+    rt_cube.resources[0].img_dim = 3;
     std::vector<uint32_t> cs_resinfo_cube(std::begin(cs_resinfo_2d_array),
-                                          std::end(cs_resinfo_2d_array));
-    cs_resinfo_cube[1] = 0xf0380318u;       // DIM 5 -> 3 (CUBE), everything else identical
-    if (!recompile_valu(cs_resinfo_cube.data(), cs_resinfo_cube.size(), 0, 0,
-                        &rt_2d_array).empty()) {
-        printf("  [FAIL] control: image_get_resinfo CUBE was accepted\n");
+                                        std::end(cs_resinfo_2d_array));
+    cs_resinfo_cube[1] = 0xf0380318u;       // DIM 5 -> 3 (CUBE), dmask:xy
+    const auto resinfo_cube_spv = recompile_valu(
+        cs_resinfo_cube.data(), cs_resinfo_cube.size(), 0, 0, &rt_cube);
+    bool cube_image = false;
+    uint32_t cube_size_type = 0;
+    std::unordered_map<uint32_t, uint32_t> vector_widths;
+    for (size_t i = 5; i < resinfo_cube_spv.size();) {
+        const uint32_t op = resinfo_cube_spv[i] & 0xffffu;
+        const uint32_t wc = resinfo_cube_spv[i] >> 16u;
+        if (!wc || i + wc > resinfo_cube_spv.size()) break;
+        if (op == 25u && wc == 9u)         // OpTypeImage: Dim=Cube, Arrayed=0
+            cube_image |= resinfo_cube_spv[i + 3] == 3u && resinfo_cube_spv[i + 5] == 0u;
+        if (op == OpTypeVector && wc == 4u)
+            vector_widths[resinfo_cube_spv[i + 1]] = resinfo_cube_spv[i + 3];
+        if (op == OpImageQuerySizeLod && wc == 5u)
+            cube_size_type = resinfo_cube_spv[i + 1];
+        i += wc;
+    }
+    if (!cube_image || !cube_size_type || vector_widths[cube_size_type] != 2u ||
+        !has_opcode(resinfo_cube_spv, OpImageQueryLevels)) {
+        printf("  [FAIL] image_get_resinfo CUBE did not emit a cube image and vec2 size query\n");
         return 1;
     }
-    printf("  [ok]   control: image_get_resinfo CUBE still rejects\n");
+    printf("  [ok]   image_get_resinfo CUBE lowers to a cube image and vec2 size query\n");
 
-    // The two arms above pin the LOWERING (emit_alu's dispatch). They do not pin the COVERAGE
+    // Keep a reject control at both admission seams: 1D_ARRAY (dim 4) has no lowering yet.
+    ShaderResourceTable rt_1d_array = rt_2d_array;
+    rt_1d_array.resources[0].img_dim = 4;
+    std::vector<uint32_t> cs_resinfo_1d_array = cs_resinfo_cube;
+    cs_resinfo_1d_array[1] = 0xf0380320u;   // DIM 3 -> 4, everything else identical
+    if (!recompile_valu(cs_resinfo_1d_array.data(), cs_resinfo_1d_array.size(), 0, 0,
+                        &rt_1d_array).empty()) {
+        printf("  [FAIL] control: image_get_resinfo 1D_ARRAY was accepted\n");
+        return 1;
+    }
+    printf("  [ok]   control: image_get_resinfo 1D_ARRAY still rejects\n");
+
+    // The arms above pin the LOWERING (emit_alu's dispatch). They do not pin the COVERAGE
     // predicate, which is the half the live `[compute] skip` decision actually consults -- verified
     // by mutation: reverting the predicate alone leaves both of them green. So pin it directly.
     // `recompile_coverage` runs table-less, so a MIMG form it accepts lands in `table_dependent`
@@ -5846,18 +5874,23 @@ int main() {
         }
         printf("  [ok]   coverage counts image_get_resinfo 2D_ARRAY as supported\n");
 
-        // Control on the same seam, and it names the opcode rather than only counting: CUBE must
-        // still be reported as the unsupported site, or a widening past 2D_ARRAY would go unnoticed
-        // by the census that decides whether the program runs at all.
         RecompileCoverage cov_cube = recompile_coverage(
             cs_resinfo_cube.data(), cs_resinfo_cube.size());
-        if (cov_cube.unsupported == 0 || cov_cube.first_bad_op != 0x0eu) {
-            printf("  [FAIL] control: coverage no longer reports image_get_resinfo CUBE as the "
-                   "unsupported site (unsupported=%u op=0x%x)\n",
-                   cov_cube.unsupported, cov_cube.first_bad_op);
+        if (cov_cube.unsupported != 0 || cov_cube.first_bad_fmt != -1) {
+            printf("  [FAIL] coverage still reports image_get_resinfo CUBE unsupported\n");
             return 1;
         }
-        printf("  [ok]   control: coverage still names image_get_resinfo CUBE unsupported\n");
+        printf("  [ok]   coverage counts image_get_resinfo CUBE as supported\n");
+
+        RecompileCoverage cov_1d_array = recompile_coverage(
+            cs_resinfo_1d_array.data(), cs_resinfo_1d_array.size());
+        if (cov_1d_array.unsupported == 0 || cov_1d_array.first_bad_op != 0x0eu) {
+            printf("  [FAIL] control: coverage no longer reports image_get_resinfo 1D_ARRAY as "
+                   "the unsupported site (unsupported=%u op=0x%x)\n",
+                   cov_1d_array.unsupported, cov_1d_array.first_bad_op);
+            return 1;
+        }
+        printf("  [ok]   control: coverage still names image_get_resinfo 1D_ARRAY unsupported\n");
     }
 
     // GTA V's exact stride-8/25-record BUFFER_ATOMIC_SWAP_X2 must be one qword exchange. Include an

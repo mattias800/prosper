@@ -41,6 +41,7 @@ inline constexpr uint32_t kSop1OpcodeFlbitI32B64 = 0x16;
 inline constexpr uint32_t kSop1OpcodeBitset0B32 = 0x1b;
 inline constexpr uint32_t kSop1OpcodeBitset1B32 = 0x1d;
 inline constexpr uint32_t kSop1OpcodeGetpcB64 = 0x1f;
+inline constexpr uint32_t kSop1OpcodeBitreplicateB64B32 = 0x3b;
 
 // SOP1 opcodes that leave SCC **UNMODIFIED**.
 //
@@ -64,7 +65,8 @@ inline constexpr bool sop1_opcode_leaves_scc_unmodified(uint32_t opcode) {
            opcode == kSop1OpcodeBrevB32 ||
            opcode == kSop1OpcodeFf1I32B64 || opcode == kSop1OpcodeFlbitI32B32 ||
            opcode == kSop1OpcodeFlbitI32B64 || opcode == kSop1OpcodeBitset0B32 ||
-           opcode == kSop1OpcodeBitset1B32 || opcode == kSop1OpcodeGetpcB64;
+           opcode == kSop1OpcodeBitset1B32 || opcode == kSop1OpcodeGetpcB64 ||
+           opcode == kSop1OpcodeBitreplicateB64B32;
 }
 inline constexpr uint32_t kSop1OpcodeSetpcB64 = 0x20;
 inline constexpr uint32_t kSop1OpcodeSwappcB64 = 0x21;
