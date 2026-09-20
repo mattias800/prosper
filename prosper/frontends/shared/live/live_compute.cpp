@@ -14218,6 +14218,30 @@ bool execute_live_compute_items(const std::vector<prosper::gpu::ComputeItem>& it
         if (perf_capture_timing) {
             prosper::perf::ComputeTimingRecord record;
             record.dispatches = items.size();
+            for (const auto& item : items) {
+                const auto same_shape = [&](const auto& shape) {
+                    return shape.groups_x == item.launch.groups_x &&
+                        shape.groups_y == item.launch.groups_y &&
+                        shape.groups_z == item.launch.groups_z &&
+                        shape.local_x == item.launch.local_x &&
+                        shape.local_y == item.launch.local_y &&
+                        shape.local_z == item.launch.local_z &&
+                        shape.indirect == item.indirect_dispatch;
+                };
+                const auto found = std::find_if(record.dispatch_shapes.begin(),
+                                                record.dispatch_shapes.end(), same_shape);
+                if (found != record.dispatch_shapes.end()) {
+                    ++found->dispatches;
+                } else if (record.dispatch_shapes.size() <
+                           prosper::perf::ComputeTimingRecord::kMaxDispatchShapes) {
+                    record.dispatch_shapes.push_back({
+                        item.launch.groups_x, item.launch.groups_y, item.launch.groups_z,
+                        item.launch.local_x, item.launch.local_y, item.launch.local_z,
+                        1, item.indirect_dispatch});
+                } else {
+                    ++record.dispatch_shape_overflow;
+                }
+            }
             record.cpu_fast_total = g_cpu_fill_dispatches.load(std::memory_order_relaxed);
             if (!items.empty() && items.front().code_addr && !items.front().spirv.empty()) {
                 const auto& first = items.front();

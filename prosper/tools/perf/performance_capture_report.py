@@ -571,6 +571,56 @@ def _compute_program_groups(records, limit=10, address_limit=8):
     }
 
 
+def _compute_launch_shapes(records):
+    """Summarize the bounded F8 launch-shape histogram."""
+    if not records:
+        return None
+    required = ("dispatch_shapes", "dispatch_shape_overflow")
+    if any(any(field not in record for field in required) for record in records):
+        # Missing means a pre-extension capture, never a zero-sized dispatch.
+        return {"available": False, "reason": "capture predates launch-shape records"}
+
+    shapes = {}
+    overflow = 0
+    for record in records:
+        record_overflow = record["dispatch_shape_overflow"]
+        if type(record_overflow) is not int or record_overflow < 0:
+            raise CaptureError("invalid compute dispatch-shape overflow")
+        overflow += record_overflow
+        row_total = 0
+        rows = record["dispatch_shapes"]
+        if not isinstance(rows, list):
+            raise CaptureError("invalid compute dispatch-shape list")
+        for row in rows:
+            if not isinstance(row, dict) or set(row) != {"groups", "local", "dispatches", "indirect"}:
+                raise CaptureError("invalid compute dispatch-shape record")
+            groups, local = row["groups"], row["local"]
+            if (not isinstance(groups, list) or not isinstance(local, list) or
+                    len(groups) != 3 or len(local) != 3 or
+                    any(type(value) is not int or value < 0 for value in groups + local) or
+                    type(row["dispatches"]) is not int or row["dispatches"] <= 0 or
+                    type(row["indirect"]) is not bool):
+                raise CaptureError("invalid compute dispatch-shape values")
+            row_total += row["dispatches"]
+            key = (tuple(groups), tuple(local), row["indirect"])
+            shapes[key] = shapes.get(key, 0) + row["dispatches"]
+        dispatches = record.get("dispatches", 0)
+        if type(dispatches) is not int or dispatches < 0 or row_total + record_overflow > dispatches:
+            raise CaptureError("compute dispatch-shape population exceeds batch dispatches")
+
+    ordered = sorted(({
+        "groups": groups, "local": local, "indirect": indirect, "dispatches": dispatches,
+    } for (groups, local, indirect), dispatches in shapes.items()),
+        key=lambda shape: (-shape["dispatches"], shape["indirect"], shape["groups"], shape["local"]))
+    return {
+        "available": True,
+        "shapes": ordered,
+        "direct_dispatches": sum(shape["dispatches"] for shape in ordered if not shape["indirect"]),
+        "resolved_indirect_dispatches": sum(shape["dispatches"] for shape in ordered if shape["indirect"]),
+        "unknown_dispatches": overflow,
+    }
+
+
 # The share a component must reach to WIN the classification. Named because two things depend on
 # it and it was previously a bare literal in one of them, so neither the dependency nor the value
 # was pinned by anything -- moving it passed the whole suite.
@@ -898,6 +948,7 @@ def summarize(records):
         "compute_storage_children": _compute_storage_children(compute),
         "compute_gpu_device_ms": _total(compute, "gpu_device_ms"),
         "compute_programs": compute_programs,
+        "compute_launch_shapes": _compute_launch_shapes(compute),
         "gpu_timestamp_samples": gpu_timestamp_samples,
         "gpu_timestamps_available": gpu_timestamps_available,
         "components": components,
@@ -1093,6 +1144,22 @@ def print_summary(summary):
               f"addresses={addresses}")
     if programs["groups_omitted"]:
         print(f"  ... {programs['groups_omitted']} lower-cost groups omitted")
+    launch_shapes = summary["compute_launch_shapes"]
+    if launch_shapes is not None:
+        if not launch_shapes["available"]:
+            print(f"compute launch shapes: UNAVAILABLE ({launch_shapes['reason']})")
+        else:
+            print("compute launch shapes: "
+                  f"direct={launch_shapes['direct_dispatches']} "
+                  f"resolved-indirect={launch_shapes['resolved_indirect_dispatches']} "
+                  f"unknown={launch_shapes['unknown_dispatches']}")
+            for shape in launch_shapes["shapes"]:
+                source = "resolved-indirect" if shape["indirect"] else "direct"
+                groups = "x".join(str(value) for value in shape["groups"])
+                local = "x".join(str(value) for value in shape["local"])
+                print(f"  {source} groups={groups} local={local} dispatches={shape['dispatches']}")
+            if launch_shapes["unknown_dispatches"]:
+                print("  unknown dispatches were omitted after the bounded shape histogram filled")
     print(f"GPU timestamps: {summary['gpu_timestamp_samples']} samples " +
           ("(device/wait split available)" if summary["gpu_timestamps_available"] else
            "(device/wait split unavailable)"))

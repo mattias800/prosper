@@ -10976,6 +10976,10 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                     st, operation.index, resolved_dispatch, submit_no, item,
                     capture_trace ? &failure : nullptr);
                 if (realization == RetainedComputeRealization::Realized) {
+                    // `resolved_dispatch.indirect` is false after its argument dwords were read.
+                    // Preserve the source form beside the resolved dimensions for bounded F8
+                    // reporting; an unresolved indirect dispatch never reaches the live backend.
+                    item.indirect_dispatch = indirect;
                     // PROSPER_COMPUTE_ADDRESS_WATCH=0xADDR: name every program whose realized
                     // resource table touches one guest allocation, with the binding and fetch pc
                     // that reach it. One table scan per dispatch, no per-op cost.
