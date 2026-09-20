@@ -212,6 +212,19 @@ if(Python3_Interpreter_FOUND)
   add_test(NAME refactor_census_bodies
            COMMAND "${Python3_EXECUTABLE}"
                    "${CMAKE_SOURCE_DIR}/tools/refactor/census_bodies.py" --selftest)
+  # outline_methods moves a class's method bodies out of a header. Its arithmetic half -- where the
+  # declarator is, which methods are refusable, and that a moved body is carried verbatim -- is pure
+  # text and runs with no libclang, which is what lets it be a registered case rather than something
+  # somebody remembers to run.
+  # The header this guards is compiled by eleven translation units, so a method written inline in
+  # the class body costs eleven parses and is invisible in review. Textual and dependency-free on
+  # purpose: it must fail for whoever adds the next one, including with no libclang present.
+  add_test(NAME spirv_compute_header_shape
+           COMMAND "${Python3_EXECUTABLE}"
+                   "${CMAKE_SOURCE_DIR}/tests/gpu/recompiler/test_spirv_compute_header_shape.py")
+  add_test(NAME refactor_outline_methods
+           COMMAND "${Python3_EXECUTABLE}"
+                   "${CMAKE_SOURCE_DIR}/tools/refactor/outline_methods.py" --selftest)
   # The measurement fixtures are a SEPARATE case so that a runner without libclang reports them as
   # Skipped rather than folding them into a green Passed. A pass whose domain is smaller than the
   # local one, with nothing in the report saying so, is the hazard this project records for its GPU

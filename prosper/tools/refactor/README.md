@@ -12,6 +12,7 @@ each one does a transformation whose correctness can be *checked*, not merely re
 | `map_symbols.py` | tiles a translation unit into top-level regions and computes the reference graph between them |
 | `promote_internal.py` | lifts shared internals out of anonymous namespaces into an internal header |
 | `split_file.py` | splits one translation unit into several along a region partition |
+| `outline_methods.py` | moves a class's method BODIES out of its header into a .cpp — the one transformation a class-shaped region needs |
 | `extract_function.py` | drives clangd's `ExtractFunction` over AST-derived statement runs |
 | `classify_tests.py` | proposes a folder for each test from its own includes |
 | `check_include_paths.py` | finds targets that reach a project include they cannot resolve |
@@ -120,6 +121,13 @@ caveats found by trying it:
   detection" comes from. (`extractVariable` in the same file is inert too.) No IDE-driven example
   of this route was found working during this survey — which is a statement about what was checked,
   not a proof that none exists — so the route's cost has to be treated as unmeasured rather than low.
+
+**One part of that gap is now closed.** A large CLASS is a different problem from a large
+function, and it has a mechanical answer: leave the declaration in the class, move the
+definition to a .cpp. `outline_methods.py` does that and checks each moved body byte for
+byte. On `SpirvCompute` -- 231 methods, every one defined inline, in a header eleven
+translation units compile -- it moved 147 of them and took the header from 5,390 to 3,278
+lines. What it does not touch is the giant FUNCTIONS, which is still the harder half.
 
 It stays incremental work regardless: a few extractions at a time, verified, by whoever is already
 changing that code.

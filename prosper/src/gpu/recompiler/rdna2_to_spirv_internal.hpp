@@ -397,14 +397,7 @@ struct SpirvCompute {
     // Declare the capability set and extension for an indexed descriptor array, once per module and
     // only when one is actually declared, so every module that does not use one is byte-identical to
     // what this emitter produced before stage 4b.
-    void declare_descriptor_indexing() {
-        if (descriptor_indexing_declared) return;
-        descriptor_indexing_declared = true;
-        put(caps, Op_Capability, {Cap_ShaderNonUniform});
-        put(caps, Op_Capability, {Cap_StorageBufferArrayNonUniformIndexing});
-        std::vector<uint32_t> o; pstr(o, "SPV_EXT_descriptor_indexing");
-        putv(exts, Op_Extension, o);
-    }
+    void declare_descriptor_indexing();
     // GUEST FLOAT SEMANTICS ARE INF/NAN-EXACT; VULKAN'S DEFAULT IS NOT (#3479).
     // RDNA2 VALU arithmetic defines Inf, NaN and signed zero exactly, and real guest programs rely
     // on it. Worked example, the one that found this: Unity's `sign()` idiom synthesises +Inf with
@@ -428,15 +421,7 @@ struct SpirvCompute {
     // contract live at rdna2_to_spirv.hpp's publish_float_controls_support(); this call site only
     // reads the answer, and reads it as "no" until some device owner has measured a device.
     bool float_controls_declared = false;
-    void declare_float_controls(uint32_t entry) {
-        if (float_controls_declared) return;
-        if (!signed_zero_inf_nan_preserve_declared()) return;
-        float_controls_declared = true;
-        put(caps, Op_Capability, {Cap_SignedZeroInfNanPreserve});
-        std::vector<uint32_t> o; pstr(o, "SPV_KHR_float_controls");
-        putv(exts, Op_Extension, o);
-        put(exec, Op_ExecutionMode, {entry, EM_SignedZeroInfNanPreserve, 32});
-    }
+    void declare_float_controls(uint32_t entry);
     std::unordered_map<uint32_t, uint32_t> fconst_cache, uconst_cache;
     uint32_t next_id = 1;
     uint32_t stride = 1;
@@ -640,10 +625,7 @@ struct SpirvCompute {
     // instead of gl_Position. Inert unless the env var is set. Values are bitcast-as-float in the output.
     uint32_t tap_pc = 0xFFFFFFFFu;
     uint32_t tap_vec = 0;   // 0 = no tap captured; else the vec4 SPIR-V id export_position emits
-    void set_tap(uint32_t a, uint32_t bb, uint32_t c, uint32_t d) {
-        uint32_t v = id(); putv(code, Op_CompositeConstruct, {t_v4f, v, bcf(a), bcf(bb), bcf(c), bcf(d)});
-        tap_vec = v;
-    }
+    void set_tap(uint32_t a, uint32_t bb, uint32_t c, uint32_t d);
 
     uint32_t id() { return next_id++; }
     static void put(std::vector<uint32_t>& s, uint32_t op, std::initializer_list<uint32_t> o) {
@@ -652,31 +634,16 @@ struct SpirvCompute {
     static void putv(std::vector<uint32_t>& s, uint32_t op, const std::vector<uint32_t>& o) {
         s.push_back(((uint32_t)(o.size() + 1) << 16) | op); s.insert(s.end(), o.begin(), o.end());
     }
-    void pstr(std::vector<uint32_t>& v, const char* s) {
-        size_t len = std::strlen(s);
-        for (size_t i = 0; i <= len; i += 4) { uint32_t w = 0;
-            for (size_t k = 0; k < 4; k++) { size_t j = i + k; if (j <= len) w |= (uint32_t)(uint8_t)s[j] << (8*k); }
-            v.push_back(w); }
-    }
-    uint32_t fconst(float f) {
-        uint32_t b = fbits(f); auto it = fconst_cache.find(b); if (it != fconst_cache.end()) return it->second;
-        uint32_t c = id(); put(types, Op_Constant, {t_f32, c, b}); fconst_cache[b] = c; return c;
-    }
-    uint32_t uconst(uint32_t v) {
-        auto it = uconst_cache.find(v); if (it != uconst_cache.end()) return it->second;
-        uint32_t c = id(); put(types, Op_Constant, {t_u32, c, v}); uconst_cache[v] = c; return c;
-    }
+    void pstr(std::vector<uint32_t>& v, const char* s);
+    uint32_t fconst(float f);
+    uint32_t uconst(uint32_t v);
     // Reverse of uconst: the literal behind an id, when that id IS one of our u32 constants.
     //
     // Only ids this builder minted through uconst() are answerable, which is the point: a value that
     // came out of arithmetic has no literal and must report false rather than a plausible number.
     // The cache is small (one entry per distinct constant in the module) and this is called at
     // descriptor-resolution sites, not per instruction.
-    bool uconst_literal(uint32_t id_, uint32_t* out) const {
-        for (const auto& kv : uconst_cache)
-            if (kv.second == id_) { if (out) *out = kv.first; return true; }
-        return false;
-    }
+    bool uconst_literal(uint32_t id_, uint32_t* out) const;
     // VGPRs are modeled as raw 32-bit VALUES (uint). Float ops bitcast their operands uint->float and
     // bitcast the result back to uint; integer ops operate on the bits directly. This matches the
     // hardware's untyped VGPRs and lets float and integer instructions share the same register file.
@@ -700,12 +667,7 @@ struct SpirvCompute {
     // RDNA V_FFBH_U32 counts zeroes before the highest set bit and returns all ones for zero.
     // FindUMsb returns the bit index instead and is undefined at zero, so keep the conversion and
     // sentinel in one helper shared by ordinary ALU emission and portable dispatcher wave phases.
-    uint32_t ffbh_u32(uint32_t a) {
-        const uint32_t safe = ibin(Op_BitwiseOr, a, uconst(1));
-        const uint32_t leading_zeroes = ibin(Op_ISub, uconst(31), find_umsb(safe));
-        return sel(ucmp(Op_INotEqual, a, uconst(0)),
-                   leading_zeroes, uconst(0xffffffffu));
-    }
+    uint32_t ffbh_u32(uint32_t a);
     // RDNA V_FFBL_B32 returns the first set-bit index from the LSB, with the same all-ones
     // sentinel for zero. Reversing the dword turns that index into FFBH's leading-zero count and
     // keeps the sentinel exact, so both instructions share one zero-safe FindUMsb lowering.
@@ -717,79 +679,7 @@ struct SpirvCompute {
     // shift remains in SPIR-V's defined [0,31] range. Exponents outside [-512,512] can be clamped
     // before the calculation: every finite nonzero binary32 must overflow above that interval or
     // round to signed zero below it.
-    uint32_t ldexp_f32_bits(uint32_t bits, uint32_t exponent) {
-        const uint32_t sign = ibin(Op_BitwiseAnd, bits, uconst(0x80000000u));
-        const uint32_t magnitude = ibin(Op_BitwiseAnd, bits, uconst(0x7fffffffu));
-        const uint32_t raw_exp = ibin(Op_ShiftRightLogical, magnitude, uconst(23));
-        const uint32_t fraction = ibin(Op_BitwiseAnd, magnitude, uconst(0x007fffffu));
-
-        // Normalize a subnormal input into a 24-bit significand with bit 23 set. FindUMsb is
-        // undefined at zero, so substitute one for that otherwise-dead calculation; signed zero
-        // is selected back unchanged at the end.
-        const uint32_t fraction_zero = ucmp(Op_IEqual, fraction, uconst(0));
-        const uint32_t safe_fraction = sel(fraction_zero, uconst(1), fraction);
-        const uint32_t sub_shift = ibin(Op_ISub, uconst(23), find_umsb(safe_fraction));
-        const uint32_t sub_significand =
-            ibin(Op_ShiftLeftLogical, fraction, sub_shift); // sub_shift is in [1,23]
-        const uint32_t normal_significand =
-            ibin(Op_BitwiseOr, fraction, uconst(0x00800000u));
-        const uint32_t input_subnormal = ucmp(Op_IEqual, raw_exp, uconst(0));
-        const uint32_t significand =
-            sel(input_subnormal, sub_significand, normal_significand);
-        const uint32_t normal_unbiased = ibin(Op_ISub, raw_exp, uconst(127));
-        const uint32_t sub_unbiased = ibin(Op_ISub, uconst(static_cast<uint32_t>(-126)),
-                                           sub_shift);
-        const uint32_t unbiased = sel(input_subnormal, sub_unbiased, normal_unbiased);
-
-        const uint32_t bounded_exponent = sext2(
-            Glsl_SMin,
-            sext2(Glsl_SMax, exponent, uconst(static_cast<uint32_t>(-512))),
-            uconst(512));
-        const uint32_t adjusted = ibin(Op_IAdd, unbiased, bounded_exponent);
-
-        const uint32_t normal_exp = ibin(
-            Op_ShiftLeftLogical, ibin(Op_IAdd, adjusted, uconst(127)), uconst(23));
-        const uint32_t normal_result = ibin(
-            Op_BitwiseOr, normal_exp,
-            ibin(Op_BitwiseAnd, significand, uconst(0x007fffffu)));
-
-        // For adjusted<-126, shift the normalized 24-bit significand into the subnormal range.
-        // The calculations exist in SSA for every input, so clamp the working shift to [1,24]
-        // even when the normal/overflow result is ultimately selected. shift>=25 is strictly below
-        // half the least subnormal (shift==24 retains the exact halfway tie and its RNE decision).
-        const uint32_t under_shift =
-            ibin(Op_ISub, uconst(static_cast<uint32_t>(-126)), adjusted);
-        const uint32_t safe_under_shift = uext2(
-            Glsl_UMax, uconst(1), uext2(Glsl_UMin, under_shift, uconst(24)));
-        const uint32_t truncated =
-            ibin(Op_ShiftRightLogical, significand, safe_under_shift);
-        const uint32_t remainder_mask = ibin(
-            Op_ISub, ibin(Op_ShiftLeftLogical, uconst(1), safe_under_shift), uconst(1));
-        const uint32_t remainder = ibin(Op_BitwiseAnd, significand, remainder_mask);
-        const uint32_t half = ibin(
-            Op_ShiftLeftLogical, uconst(1), ibin(Op_ISub, safe_under_shift, uconst(1)));
-        const uint32_t remainder_gt_half = ucmp(Op_UGreaterThan, remainder, half);
-        const uint32_t remainder_eq_half = ucmp(Op_IEqual, remainder, half);
-        const uint32_t truncated_odd = ucmp(
-            Op_INotEqual, ibin(Op_BitwiseAnd, truncated, uconst(1)), uconst(0));
-        const uint32_t round_up = lor(remainder_gt_half,
-                                      land(remainder_eq_half, truncated_odd));
-        const uint32_t rounded = ibin(
-            Op_IAdd, truncated, sel(round_up, uconst(1), uconst(0)));
-        const uint32_t too_small = scmp(Op_SGreaterThanEqual, under_shift, uconst(25));
-        const uint32_t subnormal_result = sel(too_small, uconst(0), rounded);
-
-        const uint32_t is_underflow =
-            scmp(Op_SLessThan, adjusted, uconst(static_cast<uint32_t>(-126)));
-        const uint32_t is_overflow = scmp(Op_SGreaterThan, adjusted, uconst(127));
-        uint32_t finite_result = sel(is_underflow, subnormal_result, normal_result);
-        finite_result = sel(is_overflow, uconst(0x7f800000u), finite_result);
-        finite_result = ibin(Op_BitwiseOr, sign, finite_result);
-
-        const uint32_t is_special = ucmp(Op_IEqual, raw_exp, uconst(255));
-        const uint32_t is_zero = ucmp(Op_IEqual, magnitude, uconst(0));
-        return sel(is_special, bits, sel(is_zero, bits, finite_result));
-    }
+    uint32_t ldexp_f32_bits(uint32_t bits, uint32_t exponent);
     // GLSL.std.450 float ext-instructions on bit-operands -> bit-result.
     uint32_t fext1(uint32_t inst, uint32_t a) { uint32_t r = id(); putv(code, Op_ExtInst, {t_f32, r, glsl, inst, bcf(a)}); return bcu(r); }
     uint32_t fext2(uint32_t inst, uint32_t a, uint32_t b) { uint32_t r = id(); putv(code, Op_ExtInst, {t_f32, r, glsl, inst, bcf(a), bcf(b)}); return bcu(r); }
@@ -813,16 +703,7 @@ struct SpirvCompute {
     // NaN-undefined, so NaN is routed to 0 explicitly. 4294967040.0f (0x4F7FFFFF) is the largest
     // float < 2^32 — the next float IS 2^32, so the clamp is exact for every in-range input;
     // inputs >= 2^32 (incl. +inf) select UINT_MAX.
-    uint32_t cvt_f2u(uint32_t bits) {
-        uint32_t f = bcf(bits);
-        uint32_t nan = id();  put(code, Op_FUnordNotEqual, {t_bool, nan, f, f});   // true iff NaN
-        uint32_t safe = id(); put(code, Op_Select, {t_f32, safe, nan, fconstf(0.0f), f});
-        uint32_t lo = id();   putv(code, Op_ExtInst, {t_f32, lo, glsl, Glsl_FMax, safe, fconstf(0.0f)});
-        uint32_t cl = id();   putv(code, Op_ExtInst, {t_f32, cl, glsl, Glsl_FMin, lo, fconstf(4294967040.0f)});
-        uint32_t r = id();    put(code, Op_ConvertFToU, {t_u32, r, cl});
-        uint32_t big = id();  put(code, Op_FOrdGreaterThanEqual, {t_bool, big, f, fconstf(4294967296.0f)});
-        return sel(big, uconst(0xFFFFFFFFu), r);
-    }
+    uint32_t cvt_f2u(uint32_t bits);
     // Float ordered compare on bit-operands -> bool (for VCC). select() picks bits by a bool condition.
     uint32_t fcmp(uint32_t cmpop, uint32_t a, uint32_t b) { uint32_t r = id(); put(code, cmpop, {t_bool, r, bcf(a), bcf(b)}); return r; }
     uint32_t bfalse() { if (!bconst_false) { bconst_false = id(); put(types, Op_ConstantFalse, {t_bool, bconst_false}); } return bconst_false; }
@@ -830,43 +711,14 @@ struct SpirvCompute {
     bool is_fragment_wave_vote_value(uint32_t value) const {
         return fragment_wave_vote_values.contains(value);
     }
-    void mark_fragment_wave_vote_value(uint32_t value) {
-        std::vector<uint32_t> pending{value};
-        while (!pending.empty()) {
-            const uint32_t current = pending.back();
-            pending.pop_back();
-            if (!fragment_wave_vote_values.insert(current).second) continue;
-            if (fragment_wave_vote_scalar_consumers.contains(current))
-                fragment_wave_reasons |= kFragmentWaveReasonScalarReduce;
-            const auto dependent = fragment_wave_vote_dependents.find(current);
-            if (dependent != fragment_wave_vote_dependents.end())
-                pending.insert(pending.end(), dependent->second.begin(), dependent->second.end());
-        }
-    }
-    void add_fragment_wave_vote_dependency(uint32_t result, uint32_t source) {
-        fragment_wave_vote_dependents[source].push_back(result);
-        if (is_fragment_wave_vote_value(source)) mark_fragment_wave_vote_value(result);
-    }
+    void mark_fragment_wave_vote_value(uint32_t value);
+    void add_fragment_wave_vote_dependency(uint32_t result, uint32_t source);
     void propagate_fragment_wave_vote(uint32_t result, uint32_t source) {
         add_fragment_wave_vote_dependency(result, source);
     }
-    void propagate_fragment_wave_vote(uint32_t result, uint32_t a, uint32_t b_) {
-        add_fragment_wave_vote_dependency(result, a);
-        add_fragment_wave_vote_dependency(result, b_);
-    }
-    void mark_fragment_wave_scalar_use(uint32_t value) {
-        fragment_wave_vote_scalar_consumers.insert(value);
-        if (is_fragment_wave_vote_value(value))
-            fragment_wave_reasons |= kFragmentWaveReasonScalarReduce;
-    }
-    uint32_t bsel(uint32_t cond, uint32_t tval, uint32_t fval) {
-        uint32_t r = id();
-        put(code, Op_Select, {t_bool, r, cond, tval, fval});
-        add_fragment_wave_vote_dependency(r, cond);
-        add_fragment_wave_vote_dependency(r, tval);
-        add_fragment_wave_vote_dependency(r, fval);
-        return r;
-    }  // bool-domain select (wave masks)
+    void propagate_fragment_wave_vote(uint32_t result, uint32_t a, uint32_t b_);
+    void mark_fragment_wave_scalar_use(uint32_t value);
+    uint32_t bsel(uint32_t cond, uint32_t tval, uint32_t fval);  // bool-domain select (wave masks)
 
     // --- Structured control-flow primitives (for counted-loop reconstruction) ---
     uint32_t cur_block = 0;   // label id of the block currently being emitted (predecessor for OpPhi)
@@ -876,186 +728,29 @@ struct SpirvCompute {
     void emit_loopmerge(uint32_t m, uint32_t c)              { put(code, Op_LoopMerge, {m, c, 0}); }
     // OpPhi with two predecessors; the back-edge (value,label) is patched later via patch_phi(). Returns
     // the phi result id and sets `patch_off` to the code index of the placeholder back-edge value word.
-    uint32_t emit_phi2(uint32_t type, uint32_t v0, uint32_t l0, size_t& patch_off) {
-        uint32_t r = id();
-        put(code, Op_Phi, {type, r, v0, l0, 0u, 0u});
-        patch_off = code.size() - 2;   // the trailing {v1, l1} placeholders
-        propagate_fragment_wave_vote(r, v0);
-        fragment_wave_vote_phi_patch_results[patch_off] = r;
-        return r;
-    }
-    void patch_phi(size_t patch_off, uint32_t v1, uint32_t l1) {
-        code[patch_off] = v1;
-        code[patch_off + 1] = l1;
-        const auto result = fragment_wave_vote_phi_patch_results.find(patch_off);
-        if (result != fragment_wave_vote_phi_patch_results.end())
-            propagate_fragment_wave_vote(result->second, v1);
-    }
+    uint32_t emit_phi2(uint32_t type, uint32_t v0, uint32_t l0, size_t& patch_off);
+    void patch_phi(size_t patch_off, uint32_t v1, uint32_t l1);
     void emit_selmerge(uint32_t m) { put(code, Op_SelectionMerge, {m, 0}); }   // structured if (before condbranch)
     void emit_switch(uint32_t selector, uint32_t fallback,
-                     const std::vector<std::pair<uint32_t, uint32_t>>& cases) {
-        std::vector<uint32_t> operands{selector, fallback};
-        for (const auto& c : cases) { operands.push_back(c.first); operands.push_back(c.second); }
-        putv(code, Op_Switch, operands);
-    }
-    uint32_t function_var(uint32_t type, uint32_t& ptr_type) {
-        if (!ptr_type) { ptr_type = id(); put(types, Op_TypePointer, {ptr_type, SC_Function, type}); }
-        uint32_t var = id();
-        std::vector<uint32_t> decl;
-        put(decl, Op_Variable, {ptr_type, var, SC_Function});
-        code.insert(code.begin() + static_cast<std::ptrdiff_t>(function_var_insert),
-                    decl.begin(), decl.end());
-        function_var_insert += decl.size();
-        return var;
-    }
-    void declare_guest_scratch(const StaticScratchLayout& layout) {
-        if (!layout.valid || !layout.used || !layout.dwords || guest_scratch) return;
-        guest_scratch_min_byte = layout.min_byte;
-        guest_scratch_saddr = layout.saddr;
-        guest_scratch_dwords = layout.dwords;
-        const uint32_t array = id();
-        put(types, Op_TypeArray, {array, t_u32, uconst(layout.dwords)});
-        uint32_t ptr_array = 0;
-        guest_scratch = function_var(array, ptr_array);
-        t_ptr_guest_scratch_u32 = id();
-        put(types, Op_TypePointer, {t_ptr_guest_scratch_u32, SC_Function, t_u32});
-    }
-    uint32_t guest_scratch_load_word(uint32_t index) {
-        uint32_t pointer = id();
-        putv(code, Op_AccessChain,
-             {t_ptr_guest_scratch_u32, pointer, guest_scratch, uconst(index)});
-        uint32_t value = id();
-        put(code, Op_Load, {t_u32, value, pointer});
-        return value;
-    }
+                     const std::vector<std::pair<uint32_t, uint32_t>>& cases);
+    uint32_t function_var(uint32_t type, uint32_t& ptr_type);
+    void declare_guest_scratch(const StaticScratchLayout& layout);
+    uint32_t guest_scratch_load_word(uint32_t index);
     void guest_scratch_store_word(uint32_t index, uint32_t value,
-                                  bool predicated, uint32_t pred) {
-        auto store = [&]() {
-            uint32_t pointer = id();
-            putv(code, Op_AccessChain,
-                 {t_ptr_guest_scratch_u32, pointer, guest_scratch, uconst(index)});
-            put(code, Op_Store, {pointer, value});
-        };
-        if (!predicated) { store(); return; }
-        const uint32_t then_label = id(), merge_label = id();
-        emit_selmerge(merge_label);
-        emit_condbranch(pred, then_label, merge_label);
-        emit_label(then_label);
-        store();
-        emit_branch(merge_label);
-        emit_label(merge_label);
-    }
-    uint32_t guest_scratch_load_bits(int32_t byte_offset, uint32_t bits, bool sign_extend) {
-        const uint32_t relative = static_cast<uint32_t>(byte_offset - guest_scratch_min_byte);
-        const uint32_t index = relative / 4u, shift = (relative & 3u) * 8u;
-        uint32_t value = guest_scratch_load_word(index);
-        if (shift + bits <= 32u)
-            return sign_extend ? bfe_s(value, uconst(shift), uconst(bits))
-                               : bfe_u(value, uconst(shift), uconst(bits));
-        const uint32_t low_bits = 32u - shift, high_bits = bits - low_bits;
-        const uint32_t low = ibin(Op_ShiftRightLogical, value, uconst(shift));
-        const uint32_t high_word = guest_scratch_load_word(index + 1u);
-        const uint32_t high = bfe_u(high_word, uconst(0), uconst(high_bits));
-        const uint32_t joined = ibin(Op_BitwiseOr, low,
-                                     ibin(Op_ShiftLeftLogical, high, uconst(low_bits)));
-        return sign_extend ? bfe_s(joined, uconst(0), uconst(bits)) : joined;
-    }
+                                  bool predicated, uint32_t pred);
+    uint32_t guest_scratch_load_bits(int32_t byte_offset, uint32_t bits, bool sign_extend);
     void guest_scratch_store_bits(int32_t byte_offset, uint32_t bits, uint32_t value,
-                                  bool predicated, uint32_t pred) {
-        const uint32_t relative = static_cast<uint32_t>(byte_offset - guest_scratch_min_byte);
-        const uint32_t index = relative / 4u, shift = (relative & 3u) * 8u;
-        auto bit_mask = [](uint32_t width) {
-            return width == 32u ? 0xffffffffu : ((1u << width) - 1u);
-        };
-        auto replace = [&](uint32_t word_index, uint32_t dst_shift,
-                           uint32_t width, uint32_t source_shift) {
-            const uint32_t mask = bit_mask(width) << dst_shift;
-            const uint32_t old = guest_scratch_load_word(word_index);
-            uint32_t field = source_shift
-                ? ibin(Op_ShiftRightLogical, value, uconst(source_shift)) : value;
-            if (dst_shift) field = ibin(Op_ShiftLeftLogical, field, uconst(dst_shift));
-            field = ibin(Op_BitwiseAnd, field, uconst(mask));
-            const uint32_t retained = ibin(Op_BitwiseAnd, old, uconst(~mask));
-            guest_scratch_store_word(word_index, ibin(Op_BitwiseOr, retained, field),
-                                     predicated, pred);
-        };
-        if (shift + bits <= 32u) {
-            if (bits == 32u && shift == 0u)
-                guest_scratch_store_word(index, value, predicated, pred);
-            else
-                replace(index, shift, bits, 0);
-            return;
-        }
-        const uint32_t low_bits = 32u - shift;
-        replace(index, shift, low_bits, 0);
-        replace(index + 1u, 0, bits - low_bits, low_bits);
-    }
-    uint32_t load_function(uint32_t type, uint32_t var) {
-        uint32_t value = id();
-        put(code, Op_Load, {type, value, var});
-        add_fragment_wave_vote_dependency(value, var);
-        return value;
-    }
-    void store_function(uint32_t var, uint32_t value) {
-        put(code, Op_Store, {var, value});
-        // Function storage can join dynamic paths and loops. Keep an explicit dependency edge so
-        // a vote emitted later can propagate back through loads already generated by a dispatcher.
-        add_fragment_wave_vote_dependency(var, value);
-    }
-    uint32_t logical_not(uint32_t value) {
-        uint32_t result = id();
-        put(code, Op_LogicalNot, {t_bool, result, value});
-        propagate_fragment_wave_vote(result, value);
-        return result;
-    }
-    uint32_t subgroup_local_id() {
-        if (!declared_subgroup) {
-            put(caps, Op_Capability, {Cap_GroupNonUniform});
-            declared_subgroup = true;
-        }
-        if (!v_subgroup_localid) {
-            if (!t_ptr_in_u32) {
-                t_ptr_in_u32 = id();
-                put(types, Op_TypePointer, {t_ptr_in_u32, SC_Input, t_u32});
-            }
-            v_subgroup_localid = id();
-            put(types, Op_Variable, {t_ptr_in_u32, v_subgroup_localid, SC_Input});
-            put(deco, Op_Decorate,
-                {v_subgroup_localid, Dec_BuiltIn, BI_SubgroupLocalInvocationId});
-            put(deco, Op_Decorate, {v_subgroup_localid, Dec_Flat});
-            iface.push_back(v_subgroup_localid);
-        }
-        // Fragment lane ids model the guest RDNA wave, not the implementation's default subgroup.
-        // Record that exact-width contract as non-semantic module metadata in finish().
-        if (is_fragment) fragment_required_subgroup_size = wave_size,
-                         fragment_wave_reasons |= kFragmentWaveReasonLaneId;
-        uint32_t lane = id();
-        put(code, Op_Load, {t_u32, lane, v_subgroup_localid});
-        return lane;
-    }
+                                  bool predicated, uint32_t pred);
+    uint32_t load_function(uint32_t type, uint32_t var);
+    void store_function(uint32_t var, uint32_t value);
+    uint32_t logical_not(uint32_t value);
+    uint32_t subgroup_local_id();
     // Exact scalar wave vote for fragment control flow and mask reductions. A guest scalar branch
     // observes one 64-bit EXEC/VCC value for the complete hardware wave; branching directly on this
     // invocation's bool would instead create 64 independent pixel branches. Mark the module with the
     // same arithmetic capability used by fragment MBCNT so the backend enforces subgroup size 64,
     // and declare Vote for OpGroupNonUniformAny itself.
-    uint32_t fragment_wave_any(uint32_t active_bit) {
-        if (!is_fragment) return 0;
-        if (!declared_subgroup) {
-            put(caps, Op_Capability, {Cap_GroupNonUniform});
-            declared_subgroup = true;
-        }
-        if (!declared_subgroup_vote) {
-            put(caps, Op_Capability, {Cap_GroupNonUniformVote});
-            declared_subgroup_vote = true;
-        }
-        fragment_required_subgroup_size = wave_size;
-        fragment_wave_reasons |= kFragmentWaveReasonWaveAny;
-        uint32_t result = id();
-        put(code, Op_GroupNonUniformAny,
-            {t_bool, result, uconst(Scope_Subgroup), active_bit});
-        mark_fragment_wave_vote_value(result);
-        return result;
-    }
+    uint32_t fragment_wave_any(uint32_t active_bit);
     // Fragment-side ballot (#2412). Same exactness argument as native_wave_ballot_half, but the
     // fragment stage establishes its exact-wave contract differently: it does not carry
     // native_subgroup_size, it DECLARES the width it needs via fragment_required_subgroup_size, which
@@ -1065,180 +760,27 @@ struct SpirvCompute {
     // This is a REDUCE in #2410's taxonomy -- the bits become guest scalar DATA -- so the wave64
     // requirement it records must NOT be relaxed to a narrower subgroup: half a mask reported as whole
     // is silent wrong data.
-    uint32_t fragment_wave_ballot_half(uint32_t mask_bit, uint32_t half) {
-        if (!is_fragment || !mask_bit) return 0;
-        if (!declared_subgroup) {
-            put(caps, Op_Capability, {Cap_GroupNonUniform});
-            declared_subgroup = true;
-        }
-        if (!declared_subgroup_ballot) {
-            put(caps, Op_Capability, {Cap_GroupNonUniformBallot});
-            declared_subgroup_ballot = true;
-        }
-        fragment_required_subgroup_size = wave_size;
-        // Ballot, not vote: the reason bit must say which, because only one of the two can ever be
-        // relaxed to a narrower subgroup and the skip diagnostic is where that question gets asked
-        // (#2441). This records the same width as before -- the gate keys on
-        // fragment_required_subgroup_size, not on the reason -- so behaviour is unchanged.
-        fragment_wave_reasons |= kFragmentWaveReasonWaveBallot;
-        const uint32_t ballot = id();
-        put(code, Op_GroupNonUniformBallot,
-            {t_v4u(), ballot, uconst(Scope_Subgroup), mask_bit});
-        const uint32_t result = id();
-        putv(code, Op_CompositeExtract, {t_u32, result, ballot, half});
-        return result;
-    }
-    uint32_t subgroup_id() {
-        if (!declared_subgroup) {
-            put(caps, Op_Capability, {Cap_GroupNonUniform});
-            declared_subgroup = true;
-        }
-        if (!v_subgroupid) {
-            if (!t_ptr_in_u32) {
-                t_ptr_in_u32 = id();
-                put(types, Op_TypePointer, {t_ptr_in_u32, SC_Input, t_u32});
-            }
-            v_subgroupid = id();
-            put(types, Op_Variable, {t_ptr_in_u32, v_subgroupid, SC_Input});
-            put(deco, Op_Decorate, {v_subgroupid, Dec_BuiltIn, BI_SubgroupId});
-            put(deco, Op_Decorate, {v_subgroupid, Dec_Flat});
-            iface.push_back(v_subgroupid);
-        }
-        uint32_t subgroup = id();
-        put(code, Op_Load, {t_u32, subgroup, v_subgroupid});
-        return subgroup;
-    }
-    uint32_t fragment_mbcnt(uint32_t mask_bit, uint32_t acc_bits, bool lo) {
-        if (!is_fragment) return 0;
-        const uint32_t lane = subgroup_local_id();
-        if (!declared_subgroup_arithmetic) {
-            put(caps, Op_Capability, {Cap_GroupNonUniformArithmetic});
-            declared_subgroup_arithmetic = true;
-        }
-        const uint32_t in_half = lo
-            ? ucmp(Op_ULessThan, lane, uconst(32))
-            : ucmp(Op_UGreaterThanEqual, lane, uconst(32));
-        // Helper invocations execute subgroup operations under WQM but are not guest lanes and
-        // cannot own GDS allocation slots. Excluding them here keeps MBCNT's prefix exactly aligned
-        // with fragment GDS append/consume's non-helper population.
-        const uint32_t guest_lane = land(mask_bit, logical_not(helper_invocation()));
-        const uint32_t selected = sel(land(guest_lane, in_half), uconst(1), uconst(0));
-        uint32_t prefix = id();
-        put(code, Op_GroupNonUniformIAdd,
-            {t_u32, prefix, uconst(Scope_Subgroup), GroupOp_ExclusiveScan, selected});
-        return ibin(Op_IAdd, acc_bits, prefix);
-    }
-    uint32_t native_wave_any(uint32_t value) {
-        if (!native_subgroup_size) return 0;
-        if (!declared_subgroup) {
-            put(caps, Op_Capability, {Cap_GroupNonUniform});
-            declared_subgroup = true;
-        }
-        if (!declared_subgroup_vote) {
-            put(caps, Op_Capability, {Cap_GroupNonUniformVote});
-            declared_subgroup_vote = true;
-        }
-        uint32_t result = id();
-        put(code, Op_GroupNonUniformAny,
-            {t_bool, result, uconst(Scope_Subgroup), value});
-        return result;
-    }
+    uint32_t fragment_wave_ballot_half(uint32_t mask_bit, uint32_t half);
+    uint32_t subgroup_id();
+    uint32_t fragment_mbcnt(uint32_t mask_bit, uint32_t acc_bits, bool lo);
+    uint32_t native_wave_any(uint32_t value);
     // One 32-bit HALF of the guest wave mask, materialised from this lane's bool (#2420).
     // OpGroupNonUniformBallot returns a uvec4 whose .x/.y are lanes 0..31 / 32..63 OF THIS SUBGROUP,
     // so it equals the guest mask only when the subgroup is exactly the guest wave. The caller must
     // establish that; a narrower subgroup would report half a mask as though it were whole, which is
     // silent wrong data rather than a visible reject.
     bool declared_subgroup_ballot = false;
-    uint32_t native_wave_ballot_half(uint32_t mask_bit, uint32_t half) {
-        if (!native_subgroup_size || !mask_bit) return 0;
-        if (!declared_subgroup) {
-            put(caps, Op_Capability, {Cap_GroupNonUniform});
-            declared_subgroup = true;
-        }
-        if (!declared_subgroup_ballot) {
-            put(caps, Op_Capability, {Cap_GroupNonUniformBallot});
-            declared_subgroup_ballot = true;
-        }
-        const uint32_t ballot = id();
-        put(code, Op_GroupNonUniformBallot,
-            {t_v4u(), ballot, uconst(Scope_Subgroup), mask_bit});
-        const uint32_t result = id();
-        putv(code, Op_CompositeExtract, {t_u32, result, ballot, half});
-        return result;
-    }
-    uint32_t native_wave_first_active(uint32_t mask_bit) {
-        if (!native_subgroup_size) return 0;
-        const uint32_t lane = subgroup_local_id();
-        if (!declared_subgroup_arithmetic) {
-            put(caps, Op_Capability, {Cap_GroupNonUniformArithmetic});
-            declared_subgroup_arithmetic = true;
-        }
-        // The exclusive population count is zero only for the first active lane. Exactly one lane
-        // therefore contributes its index to the reduction; an empty mask is distinguished by the
-        // accompanying wave vote. This is exact only under the enforced guest-size subgroup
-        // contract checked by the caller.
-        const uint32_t contribution = sel(mask_bit, uconst(1), uconst(0));
-        uint32_t prefix = id();
-        put(code, Op_GroupNonUniformIAdd,
-            {t_u32, prefix, uconst(Scope_Subgroup), GroupOp_ExclusiveScan, contribution});
-        const uint32_t elected = land(mask_bit, ucmp(Op_IEqual, prefix, uconst(0)));
-        const uint32_t selected_lane = sel(elected, lane, uconst(0));
-        uint32_t first = id();
-        put(code, Op_GroupNonUniformIAdd,
-            {t_u32, first, uconst(Scope_Subgroup), GroupOp_Reduce, selected_lane});
-        return sel(native_wave_any(mask_bit), first, uconst(0xffffffffu));
-    }
-    uint32_t native_wave_popcount(uint32_t mask_bit) {
-        if (!native_subgroup_size || !mask_bit) return 0;
-        if (!declared_subgroup_arithmetic) {
-            put(caps, Op_Capability, {Cap_GroupNonUniformArithmetic});
-            declared_subgroup_arithmetic = true;
-        }
-        const uint32_t contribution = sel(mask_bit, uconst(1), uconst(0));
-        uint32_t result = id();
-        put(code, Op_GroupNonUniformIAdd,
-            {t_u32, result, uconst(Scope_Subgroup), GroupOp_Reduce, contribution});
-        return result;
-    }
-    uint32_t native_compute_mbcnt(uint32_t mask_bit, uint32_t acc_bits, uint32_t lo) {
-        if (!native_subgroup_size) return 0;
-        const uint32_t lane = subgroup_local_id();
-        if (!declared_subgroup_arithmetic) {
-            put(caps, Op_Capability, {Cap_GroupNonUniformArithmetic});
-            declared_subgroup_arithmetic = true;
-        }
-        const uint32_t in_half = bsel(
-            lo, ucmp(Op_ULessThan, lane, uconst(32)),
-            ucmp(Op_UGreaterThanEqual, lane, uconst(32)));
-        const uint32_t selected = sel(land(mask_bit, in_half), uconst(1), uconst(0));
-        uint32_t prefix = id();
-        put(code, Op_GroupNonUniformIAdd,
-            {t_u32, prefix, uconst(Scope_Subgroup), GroupOp_ExclusiveScan, selected});
-        return ibin(Op_IAdd, acc_bits, prefix);
-    }
-    uint32_t helper_invocation() {
-        if (!v_helper_invocation) {
-            t_ptr_in_bool = id();
-            put(types, Op_TypePointer, {t_ptr_in_bool, SC_Input, t_bool});
-            v_helper_invocation = id();
-            put(types, Op_Variable, {t_ptr_in_bool, v_helper_invocation, SC_Input});
-            put(deco, Op_Decorate,
-                {v_helper_invocation, Dec_BuiltIn, BI_HelperInvocation});
-            iface.push_back(v_helper_invocation);
-        }
-        uint32_t result = id();
-        put(code, Op_Load, {t_bool, result, v_helper_invocation});
-        return result;
-    }
+    uint32_t native_wave_ballot_half(uint32_t mask_bit, uint32_t half);
+    uint32_t native_wave_first_active(uint32_t mask_bit);
+    uint32_t native_wave_popcount(uint32_t mask_bit);
+    uint32_t native_compute_mbcnt(uint32_t mask_bit, uint32_t acc_bits, uint32_t lo);
+    uint32_t helper_invocation();
     // Distinct guest descriptors can name the same allocation. Under the GLSL450 memory model,
     // separate StorageBuffer variables otherwise promise non-aliasing to the SPIR-V consumer. The
     // runtime binding addresses are deliberately absent from the shader cache key, so every external
     // guest-backed buffer declaration must retain the possibility of aliasing. Internal GDS uses its
     // own host allocation and intentionally does not go through this helper.
-    void declare_external_storage_buffer(uint32_t pointer_type, uint32_t variable) {
-        put(types, Op_Variable, {pointer_type, variable, SC_StorageBuffer});
-        put(deco, Op_Decorate, {variable, Dec_Aliased});
-    }
+    void declare_external_storage_buffer(uint32_t pointer_type, uint32_t variable);
     void declare_internal_gds(uint32_t set = 1, uint32_t binding = 0) {
         if (v_internal_gds) return;
         uint32_t runtime_array = id(), block = id(), block_ptr = id();
@@ -1261,134 +803,18 @@ struct SpirvCompute {
     // make the record mean anything. A device-scope atomic min/max makes the published pair the true
     // extremes over every invocation and workgroup, which is the only reading the report claims.
     void compute_gds_atomic_minmax(uint16_t opcode, uint32_t index, uint32_t value,
-                                   uint32_t pred) {
-        declare_internal_gds(0, kComputeInternalGdsBinding);
-        uint32_t then = id(), merge = id();
-        put(code, Op_SelectionMerge, {merge, 0});
-        put(code, Op_BranchConditional, {pred, then, merge});
-        put(code, Op_Label, {then}); cur_block = then;
-        uint32_t pointer = id();
-        putv(code, Op_AccessChain,
-             {t_ptr_gds_u32, pointer, v_internal_gds, uconst(0), index});
-        uint32_t old = id();
-        put(code, opcode, {t_u32, old, pointer, uconst(Scope_Device),
-                           uconst(MemSem_UniformAcqRel), value});
-        put(code, Op_Branch, {merge});
-        put(code, Op_Label, {merge}); cur_block = merge;
-    }
-    void compute_gds_store(uint32_t index, uint32_t value, bool predicated, uint32_t pred) {
-        declare_internal_gds(0, kComputeInternalGdsBinding);
-        auto emit = [&]() {
-            uint32_t pointer = id();
-            putv(code, Op_AccessChain,
-                 {t_ptr_gds_u32, pointer, v_internal_gds, uconst(0), index});
-            put(code, Op_Store, {pointer, value});
-        };
-        if (!predicated) { emit(); return; }
-        uint32_t then = id(), merge = id();
-        put(code, Op_SelectionMerge, {merge, 0});
-        put(code, Op_BranchConditional, {pred, then, merge});
-        put(code, Op_Label, {then}); cur_block = then;
-        emit();
-        put(code, Op_Branch, {merge});
-        put(code, Op_Label, {merge}); cur_block = merge;
-    }
-    uint32_t compute_gds_atomic_rtn(uint32_t op, uint32_t index, uint32_t value) {
-        declare_internal_gds(0, kComputeInternalGdsBinding);
-        uint32_t pointer = id();
-        putv(code, Op_AccessChain,
-             {t_ptr_gds_u32, pointer, v_internal_gds, uconst(0), index});
-        uint32_t result = id();
-        put(code, op,
-            {t_u32, result, pointer, uconst(Scope_Device),
-             uconst(MemSem_UniformAcqRel), value});
-        return result;
-    }
+                                   uint32_t pred);
+    void compute_gds_store(uint32_t index, uint32_t value, bool predicated, uint32_t pred);
+    uint32_t compute_gds_atomic_rtn(uint32_t op, uint32_t index, uint32_t value);
     // Native-subgroup GDS append/consume is one device-global atomic per hardware wave. Fragment
     // helper invocations participate in subgroup operations but cannot consume guest counter slots;
     // compute has no helper lanes. Callers use this only when one host subgroup is one guest wave.
-    uint32_t native_gds_append(uint32_t index, uint32_t exec_bit, bool consume) {
-        declare_internal_gds(is_compute ? 0 : 1,
-                             is_compute ? kComputeInternalGdsBinding : 0);
-        if (!declared_subgroup) {
-            put(caps, Op_Capability, {Cap_GroupNonUniform});
-            declared_subgroup = true;
-        }
-        if (!declared_subgroup_arithmetic) {
-            put(caps, Op_Capability, {Cap_GroupNonUniformArithmetic});
-            declared_subgroup_arithmetic = true;
-        }
-        const uint32_t active_bit = is_fragment
-            ? land(exec_bit, logical_not(helper_invocation())) : exec_bit;
-        const uint32_t contribution = sel(active_bit, uconst(1), uconst(0));
-        uint32_t count = id();
-        put(code, Op_GroupNonUniformIAdd,
-            {t_u32, count, uconst(Scope_Subgroup), GroupOp_Reduce, contribution});
-        uint32_t prefix = id();
-        put(code, Op_GroupNonUniformIAdd,
-            {t_u32, prefix, uconst(Scope_Subgroup), GroupOp_ExclusiveScan, contribution});
-        const uint32_t elected = land(active_bit, ucmp(Op_IEqual, prefix, uconst(0)));
-        const uint32_t entry = cur_block, leader = id(), merge = id();
-        put(code, Op_SelectionMerge, {merge, 0});
-        put(code, Op_BranchConditional, {elected, leader, merge});
-        put(code, Op_Label, {leader}); cur_block = leader;
-        uint32_t pointer = id();
-        putv(code, Op_AccessChain,
-             {t_ptr_gds_u32, pointer, v_internal_gds, uconst(0), index});
-        uint32_t leader_old = id();
-        put(code, consume ? Op_AtomicISub : Op_AtomicIAdd,
-            {t_u32, leader_old, pointer, uconst(Scope_Device),
-             uconst(MemSem_UniformAcqRel), count});
-        const uint32_t leader_end = cur_block;
-        put(code, Op_Branch, {merge});
-        put(code, Op_Label, {merge}); cur_block = merge;
-        const uint32_t local_old = emit_phi_2way(
-            t_u32, leader_old, leader_end, uconst(0), entry);
-        uint32_t old = id();
-        put(code, Op_GroupNonUniformIAdd,
-            {t_u32, old, uconst(Scope_Subgroup), GroupOp_Reduce, local_old});
-        return old;
-    }
+    uint32_t native_gds_append(uint32_t index, uint32_t exec_bit, bool consume);
     bool declared_subgroup_shuffle = false;
-    void mark_subgroup_min16() {
-        // DPP rows contain 16 contiguous lanes. Keep width metadata independent of SPIR-V
-        // capabilities: declaring an unused operation merely as a marker over-requires the host and
-        // confuses shaders that genuinely use that capability for unrelated work.
-        if (is_fragment) fragment_required_subgroup_size = wave_size,
-                         fragment_wave_reasons |= kFragmentWaveReasonDppRow16;
-        else compute_min_subgroup_size = std::max(compute_min_subgroup_size, 16u);
-    }
-    void mark_subgroup_min32() {
-        // PERMLANEX16 crosses a pair of 16-lane rows.
-        if (is_fragment) fragment_required_subgroup_size = wave_size,
-                         fragment_wave_reasons |= kFragmentWaveReasonPermLane32;
-        else compute_min_subgroup_size = std::max(compute_min_subgroup_size, 32u);
-    }
-    void mark_subgroup_min64() {
-        // V_READLANE_B32 may address every lane of a wave64.
-        if (is_fragment) fragment_required_subgroup_size = wave_size,
-                         fragment_wave_reasons |= kFragmentWaveReasonReadLane64;
-        else compute_min_subgroup_size = std::max(compute_min_subgroup_size, 64u);
-    }
-    uint32_t subgroup_shuffle(uint32_t value, uint32_t lane) {
-        // Every supported native shuffle at least addresses an architectural quad. Wider row/wave
-        // operations raise this contract before calling the common helper.
-        if (is_fragment) fragment_required_subgroup_size = wave_size,
-                         fragment_wave_reasons |= kFragmentWaveReasonShuffle;
-        else compute_min_subgroup_size = std::max(compute_min_subgroup_size, 4u);
-        if (!declared_subgroup) {
-            put(caps, Op_Capability, {Cap_GroupNonUniform});
-            declared_subgroup = true;
-        }
-        if (!declared_subgroup_shuffle) {
-            put(caps, Op_Capability, {Cap_GroupNonUniformShuffle});
-            declared_subgroup_shuffle = true;
-        }
-        uint32_t result = id();
-        put(code, Op_GroupNonUniformShuffle,
-            {t_u32, result, uconst(Scope_Subgroup), value, lane});
-        return result;
-    }
+    void mark_subgroup_min16();
+    void mark_subgroup_min32();
+    void mark_subgroup_min64();
+    uint32_t subgroup_shuffle(uint32_t value, uint32_t lane);
     uint32_t subgroup_row_shr_dynamic(uint32_t value, uint32_t active,
                                       uint32_t amount, uint32_t event = 0,
                                       uint32_t* valid_lane = nullptr) {
@@ -1447,46 +873,8 @@ struct SpirvCompute {
         if (valid_lane) *valid_lane = valid;
         return sel(valid, rotated, value);
     }
-    uint32_t subgroup_quad_permute(uint32_t value, uint32_t ctrl) {
-        const uint32_t lane = subgroup_local_id();
-        const uint32_t quad_lane = ibin(Op_BitwiseAnd, lane, uconst(3));
-        uint32_t selected = uconst(ctrl & 3u);
-        for (uint32_t output_lane = 1; output_lane < 4; ++output_lane)
-            selected = sel(ucmp(Op_IEqual, quad_lane, uconst(output_lane)),
-                           uconst((ctrl >> (2u * output_lane)) & 3u), selected);
-        const uint32_t source_lane = ibin(
-            Op_BitwiseOr, ibin(Op_BitwiseAnd, lane, uconst(~3u)), selected);
-        return subgroup_shuffle(value, source_lane);
-    }
-    bool ds_swizzle_source_lane(uint32_t offset, uint32_t* source_lane) {
-        // RDNA2 ISA 12.13.1: the two basic DS_SWIZZLE modes precede rotate/FFT. The quad form
-        // (10xx...) carries four two-bit selectors; the group32 form carries AND/OR/XOR masks.
-        // Rotate and FFT remain fail-closed until their distinct mappings are implemented.
-        if (!source_lane || offset >= 0xc000u) return false;
-        const uint32_t lane = subgroup_local_id();
-        if (offset & 0x8000u) {
-            const uint32_t quad_lane = ibin(Op_BitwiseAnd, lane, uconst(3));
-            uint32_t selected = uconst(offset & 3u);
-            for (uint32_t output_lane = 1; output_lane < 4; ++output_lane)
-                selected = sel(ucmp(Op_IEqual, quad_lane, uconst(output_lane)),
-                               uconst((offset >> (2u * output_lane)) & 3u), selected);
-            *source_lane = ibin(
-                Op_BitwiseOr, ibin(Op_BitwiseAnd, lane, uconst(~3u)), selected);
-            return true;
-        }
-        mark_subgroup_min32();
-        const uint32_t and_mask = uconst(offset & 0x1fu);
-        const uint32_t or_mask = uconst((offset >> 5) & 0x1fu);
-        const uint32_t xor_mask = uconst((offset >> 10) & 0x1fu);
-        const uint32_t lane_in_group = ibin(Op_BitwiseAnd, lane, uconst(0x1fu));
-        const uint32_t selected = ibin(
-            Op_BitwiseXor,
-            ibin(Op_BitwiseOr, ibin(Op_BitwiseAnd, lane_in_group, and_mask), or_mask),
-            xor_mask);
-        *source_lane = ibin(
-            Op_BitwiseOr, ibin(Op_BitwiseAnd, lane, uconst(~0x1fu)), selected);
-        return true;
-    }
+    uint32_t subgroup_quad_permute(uint32_t value, uint32_t ctrl);
+    bool ds_swizzle_source_lane(uint32_t offset, uint32_t* source_lane);
     uint32_t ds_bpermute_b32(uint32_t address, uint32_t value,
                              uint32_t active, uint32_t offset,
                              uint32_t event = 0) {
@@ -1534,35 +922,16 @@ struct SpirvCompute {
     // lower an EXP done under a narrowed EXEC (an alpha-test / WQM discard — the surviving lanes are the
     // ones that pass the kill test) to a real per-invocation discard. OpKill is a block terminator, so the
     // kill block has no back-edge to the merge; the merge's sole predecessor is the conditional branch.
-    void discard_unless(uint32_t alive) {
-        uint32_t killL = id(), mergeL = id();
-        put(code, Op_SelectionMerge, {mergeL, 0});
-        put(code, Op_BranchConditional, {alive, mergeL, killL});
-        emit_label(killL); put(code, Op_Kill, {});
-        emit_label(mergeL);
-    }
+    void discard_unless(uint32_t alive);
     // OpPhi with two fully-known predecessors (both edges' values available now) — for an if/merge join.
-    uint32_t emit_phi_2way(uint32_t type, uint32_t va, uint32_t la, uint32_t vb, uint32_t lb) {
-        uint32_t r = id();
-        put(code, Op_Phi, {type, r, va, la, vb, lb});
-        propagate_fragment_wave_vote(r, va, vb);
-        return r;
-    }
+    uint32_t emit_phi_2way(uint32_t type, uint32_t va, uint32_t la, uint32_t vb, uint32_t lb);
     // Signed-int helpers: bits are bitcast to i32, the op runs, and the i32 result is bitcast to bits.
     uint32_t bcs(uint32_t u) { uint32_t r = id(); put(code, Op_Bitcast, {t_i32, r, u}); return r; }   // bits -> i32
     uint32_t i2u(uint32_t i) { uint32_t r = id(); put(code, Op_Bitcast, {t_u32, r, i}); return r; }   // i32 -> bits
     // High 32 bits of a 32x32 multiply (v_/s_mul_hi_*), via the {lo,hi} struct of OpU/SMulExtended.
     uint32_t t_u32pair = 0, t_i32pair = 0;
-    uint32_t umul_hi(uint32_t a, uint32_t b_) {
-        if (!t_u32pair) { t_u32pair = id(); put(types, Op_TypeStruct, {t_u32pair, t_u32, t_u32}); }
-        uint32_t r = id(); put(code, Op_UMulExtended, {t_u32pair, r, a, b_});
-        uint32_t hi = id(); put(code, Op_CompositeExtract, {t_u32, hi, r, 1}); return hi;
-    }
-    uint32_t smul_hi(uint32_t a, uint32_t b_) {
-        if (!t_i32pair) { t_i32pair = id(); put(types, Op_TypeStruct, {t_i32pair, t_i32, t_i32}); }
-        uint32_t r = id(); put(code, Op_SMulExtended, {t_i32pair, r, bcs(a), bcs(b_)});
-        uint32_t hi = id(); put(code, Op_CompositeExtract, {t_i32, hi, r, 1}); return i2u(hi);
-    }
+    uint32_t umul_hi(uint32_t a, uint32_t b_);
+    uint32_t smul_hi(uint32_t a, uint32_t b_);
     uint32_t sbin(uint32_t op, uint32_t a, uint32_t b) { uint32_t ri = id(); put(code, op, {t_i32, ri, bcs(a), bcs(b)}); return i2u(ri); }
     uint32_t sext2(uint32_t inst, uint32_t a, uint32_t b) { uint32_t ri = id(); putv(code, Op_ExtInst, {t_i32, ri, glsl, inst, bcs(a), bcs(b)}); return i2u(ri); }
     // v_cvt_i32_f32 SATURATES: NaN -> 0, clamp to [INT_MIN, INT_MAX] (#135). Do not emit
@@ -1570,24 +939,7 @@ struct SpirvCompute {
     // backend-specific result near the signed limits even after a float clamp (#686). Convert a
     // bounded absolute magnitude through the working unsigned path, then restore two's-complement
     // sign. 2^31 is representable by u32, so every conversion is defined on all backends.
-    uint32_t cvt_f2i(uint32_t bits) {
-        uint32_t f = bcf(bits);
-        uint32_t nan = id();  put(code, Op_FUnordNotEqual, {t_bool, nan, f, f});   // true iff NaN
-        uint32_t safe = id(); put(code, Op_Select, {t_f32, safe, nan, fconstf(0.0f), f});
-        uint32_t magnitude = id();
-        putv(code, Op_ExtInst, {t_f32, magnitude, glsl, Glsl_FAbs, safe});
-        uint32_t bounded = id();
-        putv(code, Op_ExtInst,
-             {t_f32, bounded, glsl, Glsl_FMin, magnitude, fconstf(2147483648.0f)});
-        uint32_t unsigned_magnitude = id();
-        put(code, Op_ConvertFToU, {t_u32, unsigned_magnitude, bounded});
-        uint32_t negative = id();
-        put(code, Op_FOrdLessThan, {t_bool, negative, f, fconstf(0.0f)});
-        uint32_t negated = ibin(Op_ISub, uconst(0), unsigned_magnitude);
-        uint32_t signed_bits = sel(negative, negated, unsigned_magnitude);
-        uint32_t big = id();  put(code, Op_FOrdGreaterThanEqual, {t_bool, big, f, fconstf(2147483648.0f)});
-        return sel(big, uconst(0x7FFFFFFFu), signed_bits);
-    }
+    uint32_t cvt_f2i(uint32_t bits);
     uint32_t cvt_i2f(uint32_t bits) { uint32_t rf = id(); put(code, Op_ConvertSToF, {t_f32, rf, bcs(bits)}); return bcu(rf); }
     // Integer compares -> bool. scmp treats operands as signed, ucmp as unsigned.
     uint32_t scmp(uint32_t op, uint32_t a, uint32_t b) { uint32_t r = id(); put(code, op, {t_bool, r, bcs(a), bcs(b)}); return r; }
@@ -1607,184 +959,50 @@ struct SpirvCompute {
                        t_u64_cache = id(); put(types, Op_TypeInt, {t_u64_cache, 64, 0}); } return t_u64_cache; }
     // A 64-bit uint constant needs two value words. Shift amounts MUST be u64 here: a u32 shift operand on
     // a u64 base is mishandled by some drivers (llvmpipe), silently dropping the high half.
-    uint32_t uconst64(uint64_t v) {
-        // For values that fit in 32 bits (all current uses are shift amounts of 32), materialize the
-        // u64 by widening a 32-bit constant in the body rather than emitting a 2-word 64-bit OpConstant
-        // literal. Two reasons, both satisfied by this form: (1) MoltenVK's bundled SPIRV-Cross
-        // mis-parses 64-bit OpConstant literals (reads the high value word as a zero Id -> "Cannot
-        // resolve expression type", failing the whole shader) — a u32->u64 OpUConvert has no 2-word
-        // literal; (2) the result is still u64-typed, so llvmpipe's requirement that a u64 shift amount
-        // be u64 (a u32 shift operand drops the high half there) is preserved. Semantically identical on
-        // every driver. A genuine >32-bit constant still needs the 2-word form (not currently emitted).
-        if (v <= 0xffffffffull) { uint32_t r = id(); put(code, Op_UConvert, {t_u64(), r, uconst((uint32_t)v)}); return r; }
-        uint32_t c = id(); put(types, Op_Constant, {t_u64(), c, (uint32_t)v, (uint32_t)(v >> 32)}); return c;
-    }
-    uint32_t u64_from_lohi(uint32_t lo, uint32_t hi) {   // (u64)hi<<32 | (u64)lo  — combine an SGPR pair
-        uint32_t l = id(); put(code, Op_UConvert, {t_u64(), l, lo});
-        uint32_t h = id(); put(code, Op_UConvert, {t_u64(), h, hi});
-        uint32_t hs = id(); put(code, Op_ShiftLeftLogical, {t_u64(), hs, h, uconst64(32)});
-        uint32_t r = id(); put(code, Op_BitwiseOr, {t_u64(), r, l, hs}); return r;
-    }
-    uint32_t u64_shift(uint32_t op, uint32_t value, uint32_t amount) {
-        // Keep the shift operand u64-typed for the same cross-driver reason as uconst64 above.
-        uint32_t shift = id(); put(code, Op_UConvert, {t_u64(), shift, amount});
-        uint32_t result = id(); put(code, op, {t_u64(), result, value, shift}); return result;
-    }
-    uint32_t bfe_u64(uint32_t base64, uint32_t off, uint32_t cnt) {   // 64-bit unsigned bitfield extract
-        // res = (base << (64-off-cnt)) >> (64-cnt), all logical u64 (portable — OpBitFieldUExtract on a
-        // 64-bit base isn't reliably supported, e.g. llvmpipe returns 0). The 7-bit width field
-        // legally encodes 0 and values past the register end; SPIR-V shifts >= 64 are undefined
-        // VALUES, so clamp like the 32-bit helper (#455): effective cnt = min(cnt, 64-off) (bits
-        // past bit 63 read as 0), and a zero width selects the architectural result 0 explicitly.
-        // Requires off <= 63 (both callers mask offset to [5:0]).
-        uint32_t cnt_c = uext2(Glsl_UMin, cnt, ibin(Op_ISub, uconst(64), off));
-        uint32_t total = ibin(Op_IAdd, off, cnt_c);
-        uint32_t lsh32 = ibin(Op_ISub, uconst(64), total);
-        uint32_t rsh32 = ibin(Op_ISub, uconst(64), cnt_c);
-        uint32_t lsh = id(); put(code, Op_UConvert, {t_u64(), lsh, lsh32});
-        uint32_t rsh = id(); put(code, Op_UConvert, {t_u64(), rsh, rsh32});
-        uint32_t sl  = id(); put(code, Op_ShiftLeftLogical,  {t_u64(), sl, base64, lsh});
-        uint32_t r   = id(); put(code, Op_ShiftRightLogical, {t_u64(), r, sl, rsh});
-        uint32_t nz  = ucmp(Op_INotEqual, cnt, uconst(0));
-        uint32_t rs  = id(); put(code, Op_Select, {t_u64(), rs, nz, r, uconst64(0)}); return rs; }
+    uint32_t uconst64(uint64_t v);
+    uint32_t u64_from_lohi(uint32_t lo, uint32_t hi);
+    uint32_t u64_shift(uint32_t op, uint32_t value, uint32_t amount);
+    uint32_t bfe_u64(uint32_t base64, uint32_t off, uint32_t cnt);
     uint32_t u64_lo(uint32_t v64) { uint32_t r = id(); put(code, Op_UConvert, {t_u32, r, v64}); return r; }  // truncate low 32
     uint32_t u64_hi(uint32_t v64) { uint32_t s = id(); put(code, Op_ShiftRightLogical, {t_u64(), s, v64, uconst64(32)});
         uint32_t r = id(); put(code, Op_UConvert, {t_u32, r, s}); return r; }
     uint32_t sel64(uint32_t cond, uint32_t yes, uint32_t no) {
         uint32_t r = id(); put(code, Op_Select, {t_u64(), r, cond, yes, no}); return r;
     }
-    uint32_t u64_bit(uint32_t v64, uint32_t bit) {
-        uint32_t shift = id(); put(code, Op_UConvert, {t_u64(), shift, bit});
-        uint32_t shifted = id(); put(code, Op_ShiftRightLogical, {t_u64(), shifted, v64, shift});
-        return ucmp(Op_INotEqual,
-                    ibin(Op_BitwiseAnd, u64_lo(shifted), uconst(1)), uconst(0));
-    }
+    uint32_t u64_bit(uint32_t v64, uint32_t bit);
     // Lazily declared 2-float vector type (types are emitted as a block before code, so on-demand is safe).
     uint32_t t_v2f_cache = 0;
     uint32_t t_v2f() { if (!t_v2f_cache) { t_v2f_cache = id(); put(types, Op_TypeVector, {t_v2f_cache, t_f32, 2}); } return t_v2f_cache; }
     // pack two f32 (raw VGPR bits) into a dword of two f16 halves (src0->low, src1->high). Uses SPIR-V
     // PackHalf2x16, which is round-to-nearest-even — correct for the RTE store path (pack_half_lo).
-    uint32_t pack_half2x16(uint32_t a, uint32_t b) {
-        uint32_t vec = id(); put(code, Op_CompositeConstruct, {t_v2f(), vec, bcf(a), bcf(b)});
-        uint32_t r = id(); putv(code, Op_ExtInst, {t_u32, r, glsl, Glsl_PackHalf2x16, vec}); return r;
-    }
+    uint32_t pack_half2x16(uint32_t a, uint32_t b);
     // v_cvt_pkrtz_f16_f32 is round-toward-ZERO. PackHalf2x16 is round-to-nearest-even — within range that
     // differs by <=1 ULP (accepted), but at the f16 OVERFLOW boundary RTE yields +/-Inf where RTZ clamps
     // to the max finite f16 (+/-65504). Clamp each source to [-65504, 65504] before packing so an HDR
     // value above the f16 range becomes 65504 (matching RTZ's saturate) instead of an Inf/NaN that then
     // propagates through blending/compositing (#452). The RTE store path (pack_half_lo) is unaffected.
-    uint32_t pack_half2x16_rtz(uint32_t a, uint32_t b) {
-        const uint32_t hi = bcu(fconstf(65504.0f)), lo = bcu(fconstf(-65504.0f));
-        uint32_t ca = fext2(Glsl_FMax, fext2(Glsl_FMin, a, hi), lo);
-        uint32_t cb = fext2(Glsl_FMax, fext2(Glsl_FMin, b, hi), lo);
-        return pack_half2x16(ca, cb);
-    }
+    uint32_t pack_half2x16_rtz(uint32_t a, uint32_t b);
     // Vertex-attribute unpacking (buffer_load_format_* with a packed data format). Each returns the
     // component as raw float VGPR bits, matching how the hardware presents a format load to the shader.
     //   unpack_norm: extract a `bits`-wide field at `bit_off` of `dword`, convert to float, divide by
     //   `norm` (255/127/65535/32767) — the UNORM/SNORM normalization; SNORM is clamped to >= -1.0.
-    uint32_t unpack_norm(uint32_t dword, uint32_t bit_off, uint32_t bits, bool is_signed, float norm) {
-        uint32_t fbits_ = is_signed ? cvt_i2f(bfe_s(dword, uconst(bit_off), uconst(bits)))
-                                    : cvt_u2f(bfe_u(dword, uconst(bit_off), uconst(bits)));
-        uint32_t v = fbin(Op_FDiv, fbits_, bcu(fconstf(norm)));
-        if (is_signed) v = fext2(Glsl_FMax, v, bcu(fconstf(-1.0f)));
-        return v;
-    }
+    uint32_t unpack_norm(uint32_t dword, uint32_t bit_off, uint32_t bits, bool is_signed, float norm);
     // unpack_half: extract one of the two f16 halves packed in `dword` (which=0 low, 1 high) -> float bits.
-    uint32_t unpack_half(uint32_t dword, uint32_t which) {
-        uint32_t vec = id(); putv(code, Op_ExtInst, {t_v2f(), vec, glsl, Glsl_UnpackHalf2x16, dword});
-        uint32_t f = id(); put(code, Op_CompositeExtract, {t_f32, f, vec, which}); return bcu(f);
-    }
+    uint32_t unpack_half(uint32_t dword, uint32_t which);
     // GFX10's packed 10/11-bit vertex-float fields use binary16's five-bit exponent and a shortened
     // mantissa, without a sign bit. Widening the complete field left by 4 (11-bit) or 5 (10-bit)
     // produces the exact low-half binary16 encoding, including subnormals, infinity, and NaN.
-    uint32_t unpack_ufloat(uint32_t dword, uint32_t bit_off, uint32_t bits) {
-        uint32_t raw = bfe_u(dword, uconst(bit_off), uconst(bits));
-        uint32_t half = ibin(Op_ShiftLeftLogical, raw, uconst(bits == 11 ? 4u : 5u));
-        return unpack_half(half, 0);
-    }
+    uint32_t unpack_ufloat(uint32_t dword, uint32_t bit_off, uint32_t bits);
     // Round a 24-bit significand right by a dynamic amount using round-to-nearest-even. SPIR-V
     // shifts by the word width are undefined, so clamp the executed shift and select zero for the
     // large-shift case (the significand is then strictly below halfway).
-    uint32_t round_shift_even_u32(uint32_t value, uint32_t shift) {
-        const uint32_t safe_shift = uext2(Glsl_UMin, shift, uconst(31));
-        const uint32_t nonzero_shift = uext2(Glsl_UMax, safe_shift, uconst(1));
-        const uint32_t rounded = ibin(Op_ShiftRightLogical, value, nonzero_shift);
-        const uint32_t one_shifted = ibin(Op_ShiftLeftLogical, uconst(1), nonzero_shift);
-        const uint32_t remainder = ibin(
-            Op_BitwiseAnd, value, ibin(Op_ISub, one_shifted, uconst(1)));
-        const uint32_t halfway_shift = ibin(Op_ISub, nonzero_shift, uconst(1));
-        const uint32_t halfway = ibin(Op_ShiftLeftLogical, uconst(1), halfway_shift);
-        const uint32_t above = ucmp(Op_UGreaterThan, remainder, halfway);
-        const uint32_t tie = land(
-            ucmp(Op_IEqual, remainder, halfway),
-            ucmp(Op_INotEqual, ibin(Op_BitwiseAnd, rounded, uconst(1)), uconst(0)));
-        const uint32_t incremented = ibin(Op_IAdd, rounded, sel(lor(above, tie), uconst(1), uconst(0)));
-        const uint32_t finite = sel(ucmp(Op_IEqual, shift, uconst(0)), value, incremented);
-        return sel(ucmp(Op_UGreaterThanEqual, shift, uconst(32)), uconst(0), finite);
-    }
+    uint32_t round_shift_even_u32(uint32_t value, uint32_t shift);
     // Exact inverse of unpack_ufloat for R11G11B10 stores. This mirrors float_to_f11/f10 without
     // going through binary16, which would double-round values near the shortened-mantissa ties.
-    uint32_t pack_ufloat(uint32_t bits, uint32_t mantissa_bits) {
-        const uint32_t exponent = bfe_u(bits, uconst(23), uconst(8));
-        const uint32_t mantissa = ibin(Op_BitwiseAnd, bits, uconst(0x7fffff));
-        const uint32_t sign = ibin(Op_ShiftRightLogical, bits, uconst(31));
-        const uint32_t exponent_bits = uconst(0x1fu << mantissa_bits);
-        const uint32_t mantissa_mask = uconst((1u << mantissa_bits) - 1u);
-
-        const uint32_t payload_shifted = ibin(
-            Op_ShiftRightLogical, mantissa, uconst(23u - mantissa_bits));
-        const uint32_t payload = sel(
-            ucmp(Op_IEqual, payload_shifted, uconst(0)), uconst(1), payload_shifted);
-        const uint32_t special = sel(
-            ucmp(Op_IEqual, mantissa, uconst(0)), exponent_bits,
-            ibin(Op_BitwiseOr, exponent_bits, payload));
-
-        const uint32_t significand = ibin(Op_BitwiseOr, uconst(0x800000), mantissa);
-        const uint32_t sub_shift = ibin(
-            Op_ISub, uconst(136u - mantissa_bits), exponent);
-        const uint32_t sub_rounded = round_shift_even_u32(significand, sub_shift);
-        const uint32_t subnormal = sel(
-            ucmp(Op_UGreaterThanEqual, sub_rounded, uconst(1u << mantissa_bits)),
-            uconst(1u << mantissa_bits), sub_rounded);
-
-        const uint32_t normal_rounded = round_shift_even_u32(
-            significand, uconst(23u - mantissa_bits));
-        const uint32_t carry = ucmp(
-            Op_IEqual, normal_rounded, uconst(1u << (mantissa_bits + 1u)));
-        const uint32_t target_exponent = ibin(Op_ISub, exponent, uconst(112));
-        const uint32_t carried_exponent = ibin(
-            Op_IAdd, target_exponent, sel(carry, uconst(1), uconst(0)));
-        const uint32_t carried_mantissa = sel(
-            carry, uconst(0), ibin(Op_BitwiseAnd, normal_rounded, mantissa_mask));
-        const uint32_t normal_finite = ibin(
-            Op_BitwiseOr,
-            ibin(Op_ShiftLeftLogical, carried_exponent, uconst(mantissa_bits)),
-            carried_mantissa);
-        const uint32_t normal = sel(
-            ucmp(Op_UGreaterThanEqual, carried_exponent, uconst(31)),
-            exponent_bits, normal_finite);
-
-        const uint32_t finite = sel(
-            ucmp(Op_ULessThanEqual, exponent, uconst(112)), subnormal,
-            sel(ucmp(Op_UGreaterThanEqual, exponent, uconst(143)), exponent_bits, normal));
-        const uint32_t invalid = lor(
-            ucmp(Op_INotEqual, sign, uconst(0)), ucmp(Op_IEqual, exponent, uconst(0)));
-        const uint32_t ordinary = sel(invalid, uconst(0), finite);
-        // Infinity and NaN are handled before the sign clamp, matching the guest conversion.
-        return sel(ucmp(Op_IEqual, exponent, uconst(0xff)), special, ordinary);
-    }
+    uint32_t pack_ufloat(uint32_t bits, uint32_t mantissa_bits);
     // Inverse of unpack_norm: pack a float VGPR (bits) into a `bits`-wide UNORM/SNORM integer field:
     // clamp to [0,1] (unsigned) or [-1,1] (signed), scale by `norm`, round-to-nearest-even, mask to width.
-    uint32_t pack_norm(uint32_t fbits, uint32_t bits, bool is_signed, float norm) {
-        uint32_t lo = bcu(fconstf(is_signed ? -1.0f : 0.0f)), hi = bcu(fconstf(1.0f));
-        uint32_t clamped = fext2(Glsl_FMax, fext2(Glsl_FMin, fbits, hi), lo);
-        uint32_t scaled  = fbin(Op_FMul, clamped, bcu(fconstf(norm)));
-        uint32_t rounded = fext1(Glsl_RoundEven, scaled);
-        uint32_t ival    = is_signed ? cvt_f2i(rounded) : cvt_f2u(rounded);
-        uint32_t mask    = (bits >= 32) ? 0xFFFFFFFFu : ((1u << bits) - 1u);
-        return ibin(Op_BitwiseAnd, ival, uconst(mask));
-    }
+    uint32_t pack_norm(uint32_t fbits, uint32_t bits, bool is_signed, float norm);
     // Pack a float into the low 16 bits as an f16 (inverse of unpack_half low half).
     uint32_t pack_half_lo(uint32_t fbits) {
         return ibin(Op_BitwiseAnd, pack_half2x16(fbits, bcu(fconstf(0.0f))), uconst(0xFFFFu));
@@ -1858,77 +1076,28 @@ struct SpirvCompute {
     // see which opcode will sample it. So a non-array instruction reaching an array texture must
     // still produce a three-component coordinate -- and layer 0 is exactly the base slice it used
     // to get from the old base-slice 2D view, so behaviour is preserved where it was already right.
-    bool tex_is_arrayed(uint32_t binding) {
-        auto it = tex_binding_arrayed.find(binding);
-        return it != tex_binding_arrayed.end() && it->second;
-    }
-    uint32_t tex_coord_uv(uint32_t binding, uint32_t u_bits, uint32_t v_bits) {
-        uint32_t c = id();
-        if (tex_binding_arrayed.count(binding) && tex_binding_arrayed[binding])
-            put(code, Op_CompositeConstruct,
-                {t_v3f(), c, bcf(u_bits), bcf(v_bits), fconstf(0.0f)});
-        else
-            put(code, Op_CompositeConstruct, {t_v2f(), c, bcf(u_bits), bcf(v_bits)});
-        return c;
-    }
+    bool tex_is_arrayed(uint32_t binding);
+    uint32_t tex_coord_uv(uint32_t binding, uint32_t u_bits, uint32_t v_bits);
     uint32_t texture_vec4(uint32_t binding) {
         return tex_binding_uint[binding] ? t_v4u() : t_v4f;
     }
-    void unpack_texture_result(uint32_t binding, uint32_t result, uint32_t out[4]) {
-        const bool is_uint = tex_binding_uint[binding];
-        const uint32_t scalar_type = is_uint ? t_u32 : t_f32;
-        for (uint32_t c = 0; c < 4; c++) {
-            uint32_t e = id(); put(code, Op_CompositeExtract, {scalar_type, e, result, c});
-            out[c] = is_uint ? e : bcu(e);
-        }
-    }
+    void unpack_texture_result(uint32_t binding, uint32_t result, uint32_t out[4]);
     // image_sample 2D: sample the combined sampler at `binding` with (u,v) float-BITS coords; fills
     // out[0..3] with the RGBA result components as raw VGPR bits. Implicit LOD is only legal in the
     // Fragment execution model (#151) — the compute/vertex shells have no derivatives, so there we
     // sample at explicit LOD 0 (what a non-pixel-shader image_sample resolves to without gradients).
-    void image_sample_2d(uint32_t binding, uint32_t u_bits, uint32_t v_bits, uint32_t out[4]) {
-        uint32_t si    = id(); put(code, Op_Load, {tex_binding_simg[binding], si, tex_var[binding]});
-        uint32_t coord = tex_coord_uv(binding, u_bits, v_bits);
-        uint32_t res   = id();
-        if (is_fragment) put(code, Op_ImageSampleImplicitLod, {texture_vec4(binding), res, si, coord});
-        else             put(code, Op_ImageSampleExplicitLod, {texture_vec4(binding), res, si, coord, ImgOp_Lod, fconstf(0.0f)});
-        unpack_texture_result(binding, res, out);
-    }
+    void image_sample_2d(uint32_t binding, uint32_t u_bits, uint32_t v_bits, uint32_t out[4]);
     // image_sample_d 2D: the guest supplies explicit normalized-coordinate derivatives in the
     // modifier-first vaddr slots. Preserve both vectors with the SPIR-V Grad image operand; using
     // implicit fragment-quad derivatives selects the wrong mip at seams and for uniform coordinates.
     void image_sample_grad_2d(uint32_t binding, uint32_t u_bits, uint32_t v_bits,
                               uint32_t dsdx_bits, uint32_t dtdx_bits,
-                              uint32_t dsdy_bits, uint32_t dtdy_bits, uint32_t out[4]) {
-        uint32_t si = id(); put(code, Op_Load, {tex_binding_simg[binding], si, tex_var[binding]});
-        uint32_t coord = tex_coord_uv(binding, u_bits, v_bits);
-        uint32_t grad_x = id(); put(code, Op_CompositeConstruct,
-                                    {t_v2f(), grad_x, bcf(dsdx_bits), bcf(dtdx_bits)});
-        uint32_t grad_y = id(); put(code, Op_CompositeConstruct,
-                                    {t_v2f(), grad_y, bcf(dsdy_bits), bcf(dtdy_bits)});
-        uint32_t res = id(); put(code, Op_ImageSampleExplicitLod,
-                                 {texture_vec4(binding), res, si, coord,
-                                  ImgOp_Grad, grad_x, grad_y});
-        unpack_texture_result(binding, res, out);
-    }
+                              uint32_t dsdy_bits, uint32_t dtdy_bits, uint32_t out[4]);
     // image_sample 3D: (u,v,w) float-BITS coords -> RGBA. Uses the Dim_3D sampled image; same
     // implicit-LOD-only-in-Fragment rule as image_sample_2d.
-    void image_sample_3d(uint32_t binding, uint32_t u_bits, uint32_t v_bits, uint32_t w_bits, uint32_t out[4]) {
-        uint32_t simg  = tex_binding_simg[binding];
-        uint32_t si    = id(); put(code, Op_Load, {simg, si, tex_var[binding]});
-        uint32_t coord = id(); put(code, Op_CompositeConstruct, {t_v3f(), coord, bcf(u_bits), bcf(v_bits), bcf(w_bits)});
-        uint32_t res   = id();
-        if (is_fragment) put(code, Op_ImageSampleImplicitLod, {texture_vec4(binding), res, si, coord});
-        else             put(code, Op_ImageSampleExplicitLod, {texture_vec4(binding), res, si, coord, ImgOp_Lod, fconstf(0.0f)});
-        unpack_texture_result(binding, res, out);
-    }
+    void image_sample_3d(uint32_t binding, uint32_t u_bits, uint32_t v_bits, uint32_t w_bits, uint32_t out[4]);
     // image_sample_l / _lz: sample with an EXPLICIT LOD (lod_bits float). Stage-agnostic (no derivatives).
-    void image_sample_lod_2d(uint32_t binding, uint32_t u_bits, uint32_t v_bits, uint32_t lod_bits, uint32_t out[4]) {
-        uint32_t si    = id(); put(code, Op_Load, {tex_binding_simg[binding], si, tex_var[binding]});
-        uint32_t coord = tex_coord_uv(binding, u_bits, v_bits);
-        uint32_t res   = id(); put(code, Op_ImageSampleExplicitLod, {texture_vec4(binding), res, si, coord, ImgOp_Lod, bcf(lod_bits)});
-        unpack_texture_result(binding, res, out);
-    }
+    void image_sample_lod_2d(uint32_t binding, uint32_t u_bits, uint32_t v_bits, uint32_t lod_bits, uint32_t out[4]);
     // A real 2D-array explicit-LOD sample. The layer is the third float coordinate; keeping it in
     // SPIR-V makes reflection require a matching 2D-array view instead of silently sampling layer 0.
     // IMAGE_SAMPLE from a 2D_ARRAY texture. The implicit-LOD sibling of the _lod_ form below, and
@@ -1962,77 +1131,14 @@ struct SpirvCompute {
         return v;
     }
     void image_sample_2d_array(uint32_t binding, uint32_t u_bits, uint32_t v_bits,
-                               uint32_t layer_bits, uint32_t out[4]) {
-        uint32_t si = id(); put(code, Op_Load, {tex_binding_simg[binding], si, tex_var[binding]});
-        // #2998: PROSPER_FORCE_LAYER=<n> substitutes a constant array layer, and SAYS SO, which is
-        // the point -- it separates "the shader is given the wrong slice" from "the slice it asks
-        // for holds the wrong content", two failures that look identical on screen. A probe that
-        // could not show its own lever moved would leave a null meaning nothing.
-        //
-        // This forces guest-visible state, so its output illustrates an investigation and is never
-        // acceptance evidence for a rendered frame.
-        const int forced_layer = forced_array_layer();
-        uint32_t layer_use = bcf(layer_bits);
-        if (forced_layer >= 0) {
-            layer_use = fconstf((float)forced_layer);
-            announce_forced_layer(binding, forced_layer);
-        }
-        uint32_t coord = id(); put(code, Op_CompositeConstruct,
-                                   {t_v3f(), coord, bcf(u_bits), bcf(v_bits), layer_use});
-        uint32_t res = id();
-        if (is_fragment)
-            put(code, Op_ImageSampleImplicitLod, {texture_vec4(binding), res, si, coord});
-        else
-            put(code, Op_ImageSampleExplicitLod, {texture_vec4(binding), res, si, coord,
-                                                  ImgOp_Lod, fconstf(0.0f)});
-        unpack_texture_result(binding, res, out);
-    }
+                               uint32_t layer_bits, uint32_t out[4]);
     void image_sample_lod_2d_array(uint32_t binding, uint32_t u_bits, uint32_t v_bits,
-                                   uint32_t layer_bits, uint32_t lod_bits, uint32_t out[4]) {
-        uint32_t si = id(); put(code, Op_Load, {tex_binding_simg[binding], si, tex_var[binding]});
-        // #2998: PROSPER_FORCE_LAYER applies HERE TOO. Covering only the implicit-LOD sampler is
-        // the scope error this session already made once and had to withdraw: the census puts most
-        // of this title's array events on other opcodes, so a probe on one helper produces a null
-        // that means nothing about the rest.
-        uint32_t lod_layer = bcf(layer_bits);
-        if (forced_array_layer() >= 0) {
-            lod_layer = fconstf((float)forced_array_layer());
-            announce_forced_layer(binding, forced_array_layer());
-        }
-        uint32_t coord = id(); put(code, Op_CompositeConstruct,
-                                   {t_v3f(), coord, bcf(u_bits), bcf(v_bits), lod_layer});
-        uint32_t res = id(); put(code, Op_ImageSampleExplicitLod,
-                                 {texture_vec4(binding), res, si, coord,
-                                  ImgOp_Lod, bcf(lod_bits)});
-        unpack_texture_result(binding, res, out);
-    }
+                                   uint32_t layer_bits, uint32_t lod_bits, uint32_t out[4]);
     // image_sample_lz from a 3D texture: explicit LOD (usually 0) on a (u,v,w) coord. Stage-agnostic.
     void image_sample_lod_3d(uint32_t binding, uint32_t u_bits, uint32_t v_bits, uint32_t w_bits,
-                             uint32_t lod_bits, uint32_t out[4]) {
-        uint32_t simg  = tex_binding_simg[binding];
-        uint32_t si    = id(); put(code, Op_Load, {simg, si, tex_var[binding]});
-        uint32_t coord = id(); put(code, Op_CompositeConstruct, {t_v3f(), coord, bcf(u_bits), bcf(v_bits), bcf(w_bits)});
-        uint32_t res   = id(); put(code, Op_ImageSampleExplicitLod, {texture_vec4(binding), res, si, coord, ImgOp_Lod, bcf(lod_bits)});
-        unpack_texture_result(binding, res, out);
-    }
+                             uint32_t lod_bits, uint32_t out[4]);
     // Compare one sampled/fetched depth value against DREF and return raw float bits containing 0/1.
-    uint32_t image_dref_compare_bits(uint32_t depth, uint32_t dref_bits, uint32_t compare_func) {
-        if (compare_func == 0u) return bcu(fconstf(0.0f));   // NEVER
-        if (compare_func == 7u) return bcu(fconstf(1.0f));   // ALWAYS
-        uint32_t op;
-        switch (compare_func) {
-            case 1u: op = Op_FOrdLessThan;         break;
-            case 2u: op = Op_FOrdEqual;            break;
-            case 3u: op = Op_FOrdLessThanEqual;    break;
-            case 4u: op = Op_FOrdGreaterThan;      break;
-            case 5u: op = Op_FOrdNotEqual;         break;
-            default: op = Op_FOrdGreaterThanEqual; break;   // 6 GEQUAL
-        }
-        uint32_t cmp = id(); put(code, op, {t_bool, cmp, bcf(dref_bits), depth});
-        uint32_t result = id();
-        put(code, Op_Select, {t_f32, result, cmp, fconstf(1.0f), fconstf(0.0f)});
-        return bcu(result);
-    }
+    uint32_t image_dref_compare_bits(uint32_t depth, uint32_t dref_bits, uint32_t compare_func);
     // IMAGE_SAMPLE_C_LZ on a plain 2D texture (or the backend's base-slice 2D_ARRAY fallback),
     // lowered as a MANUAL depth compare. The hardware path
     // (compareEnable sampler over a depth-format view) needs backend machinery the color-texture path
@@ -2171,24 +1277,12 @@ struct SpirvCompute {
     // image_sample_b 2D: implicit-LOD sample with an LOD BIAS (bias_bits float). Bias only means
     // anything with implicit LOD (fragment derivatives); outside the fragment stage the op resolves
     // like the other samples there — explicit LOD 0 (bias dropped, matching image_sample_2d's rule).
-    void image_sample_bias_2d(uint32_t binding, uint32_t u_bits, uint32_t v_bits, uint32_t bias_bits, uint32_t out[4]) {
-        uint32_t si    = id(); put(code, Op_Load, {tex_binding_simg[binding], si, tex_var[binding]});
-        uint32_t coord = tex_coord_uv(binding, u_bits, v_bits);
-        uint32_t res   = id();
-        if (is_fragment) put(code, Op_ImageSampleImplicitLod, {texture_vec4(binding), res, si, coord, ImgOp_Bias, bcf(bias_bits)});
-        else             put(code, Op_ImageSampleExplicitLod, {texture_vec4(binding), res, si, coord, ImgOp_Lod, fconstf(0.0f)});
-        unpack_texture_result(binding, res, out);
-    }
+    void image_sample_bias_2d(uint32_t binding, uint32_t u_bits, uint32_t v_bits, uint32_t bias_bits, uint32_t out[4]);
     // image_gather4_lz 2D: OpImageGather of component `comp` (0..3) — the 2x2 footprint's four texels
     // of one channel, in the DX/GL gather order ((0,1),(1,1),(1,0),(0,0)), which the AMD gather4
     // result order matches. Gather always samples the base level (== the _lz behavior). out[0..3] =
     // the four gathered values as raw bits.
-    void image_gather_2d(uint32_t binding, uint32_t u_bits, uint32_t v_bits, uint32_t comp, uint32_t out[4]) {
-        uint32_t si    = id(); put(code, Op_Load, {tex_binding_simg[binding], si, tex_var[binding]});
-        uint32_t coord = tex_coord_uv(binding, u_bits, v_bits);
-        uint32_t res   = id(); put(code, Op_ImageGather, {texture_vec4(binding), res, si, coord, uconst(comp)});
-        unpack_texture_result(binding, res, out);
-    }
+    void image_gather_2d(uint32_t binding, uint32_t u_bits, uint32_t v_bits, uint32_t comp, uint32_t out[4]);
     // image_gather4_lz_o 2D: gather with the MIMG _o per-pixel OFFSET operand. The offset VGPR packs
     // signed 6-bit TEXEL offsets (x = bits[5:0], y = bits[13:8] — AMD RDNA2 ISA "offset" packing, the
     // same fields image_sample_*_o uses). SPIR-V's dynamic Offset image operand requires the
@@ -2198,18 +1292,7 @@ struct SpirvCompute {
     uint32_t t_v2i_cache = 0;
     uint32_t t_v2i() { if (!t_v2i_cache) { t_v2i_cache = id(); put(types, Op_TypeVector, {t_v2i_cache, t_i32, 2}); } return t_v2i_cache; }
     void image_gather_offset_2d(uint32_t binding, uint32_t u_bits, uint32_t v_bits, uint32_t comp,
-                                uint32_t off_bits, uint32_t out[4]) {
-        if (!declared_gather_ext) { put(caps, Op_Capability, {Cap_ImageGatherExtended}); declared_gather_ext = true; }
-        uint32_t si    = id(); put(code, Op_Load, {tex_binding_simg[binding], si, tex_var[binding]});
-        uint32_t coord = tex_coord_uv(binding, u_bits, v_bits);
-        // signed 6-bit texel offsets. NOTE: bfe_s takes SPIR-V IDs — raw integers here (the #296
-        // original) emitted OpBitFieldSExtract with invalid operand IDs; never caught live because
-        // the only gather4_lz_o user (DOLL's FXAA PS) still rejected upstream on its execz region.
-        uint32_t ox    = bfe_s(off_bits, uconst(0), uconst(6)), oy = bfe_s(off_bits, uconst(8), uconst(6));
-        uint32_t offv  = id(); put(code, Op_CompositeConstruct, {t_v2i(), offv, bcs(ox), bcs(oy)});
-        uint32_t res   = id(); put(code, Op_ImageGather, {texture_vec4(binding), res, si, coord, uconst(comp), ImgOp_Offset, offv});
-        unpack_texture_result(binding, res, out);
-    }
+                                uint32_t off_bits, uint32_t out[4]);
     // image_sample_lz_o 2D: explicit-LOD-0 sample with the MIMG _o packed texel offset (x = bits[5:0],
     // y = bits[13:8], signed 6-bit — same packing as gather4_lz_o). Vulkan forbids the dynamic Offset
     // image operand on OpImageSample* (it is gather-only), so fold the texel offset into the
@@ -2218,92 +1301,24 @@ struct SpirvCompute {
     // (u + ox/W)*W == u*W + ox). The level-0 size comes from OpImageQuerySizeLod (Cap ImageQuery).
     bool declared_image_query = false;
     void image_sample_lz_offset_2d(uint32_t binding, uint32_t u_bits, uint32_t v_bits,
-                                   uint32_t off_bits, uint32_t out[4]) {
-        if (!declared_image_query) { put(caps, Op_Capability, {Cap_ImageQuery}); declared_image_query = true; }
-        uint32_t si   = id(); put(code, Op_Load,  {tex_binding_simg[binding], si, tex_var[binding]});
-        uint32_t img  = id(); put(code, Op_Image, {tex_binding_img[binding], img, si});
-        // #325: OpImageQuerySizeLod on an Arrayed 2D image yields ivec3 (w, h, layers). Asking
-        // for ivec2 is invalid SPIR-V; the width and height are still components 0 and 1.
-        const uint32_t q_type = tex_is_arrayed(binding) ? t_v3i() : t_v2i();
-        uint32_t size = id(); put(code, Op_ImageQuerySizeLod, {q_type, size, img, uconst(0)});
-        uint32_t w_i  = id(); put(code, Op_CompositeExtract, {t_i32, w_i, size, 0});
-        uint32_t h_i  = id(); put(code, Op_CompositeExtract, {t_i32, h_i, size, 1});
-        uint32_t ox = bfe_s(off_bits, uconst(0), uconst(6)), oy = bfe_s(off_bits, uconst(8), uconst(6));   // signed 6-bit texel offsets
-        uint32_t du = fbin(Op_FDiv, cvt_i2f(ox), cvt_i2f(i2u(w_i)));
-        uint32_t dv = fbin(Op_FDiv, cvt_i2f(oy), cvt_i2f(i2u(h_i)));
-        image_sample_lod_2d(binding, fbin(Op_FAdd, u_bits, du), fbin(Op_FAdd, v_bits, dv), uconst(0), out);
-    }
+                                   uint32_t off_bits, uint32_t out[4]);
     // image_get_resinfo: query a sampled image's dimensions at the integer LOD carried in VADDR.
     // RDNA returns {width,height,depth-or-layers,mip-levels}; absent spatial axes are 1. The result is
     // integer data in ordinary VGPRs, so the signed SPIR-V query result is bitcast back to raw u32.
-    void image_get_resinfo(uint32_t binding, uint32_t dim, uint32_t lod_bits, uint32_t out[4]) {
-        if (!declared_image_query) { put(caps, Op_Capability, {Cap_ImageQuery}); declared_image_query = true; }
-        const uint32_t simg = tex_binding_simg[binding];
-        const uint32_t image_type = tex_binding_img[binding];
-        uint32_t si = id();  put(code, Op_Load,  {simg, si, tex_var[binding]});
-        uint32_t img = id(); put(code, Op_Image, {image_type, img, si});
-        out[0] = out[1] = out[2] = uconst(1);
-        if (dim == Dim_1D) {
-            uint32_t size = id(); put(code, Op_ImageQuerySizeLod, {t_i32, size, img, bcs(lod_bits)});
-            out[0] = i2u(size);
-        } else {
-            // #325: an Arrayed 2D image queries as ivec3, its third component being the layer
-            // COUNT -- which is exactly what GET_RESINFO's third result means for a 2D_ARRAY T#, so
-            // reporting it is right rather than merely legal. Dim_Cube queries as ivec2 (width, height).
-            const bool arrayed_2d = dim == Dim_2D && tex_is_arrayed(binding);
-            const bool is_2d_or_cube = (dim == Dim_2D && !arrayed_2d) || dim == Dim_Cube;
-            const uint32_t size_type = is_2d_or_cube ? t_v2i() : t_v3i();
-            uint32_t size = id(); put(code, Op_ImageQuerySizeLod, {size_type, size, img, bcs(lod_bits)});
-            const uint32_t components = is_2d_or_cube ? 2u : 3u;
-            for (uint32_t c = 0; c < components; c++) {
-                uint32_t value = id(); put(code, Op_CompositeExtract, {t_i32, value, size, c});
-                out[c] = i2u(value);
-            }
-        }
-        uint32_t levels = id(); put(code, Op_ImageQueryLevels, {t_i32, levels, img});
-        out[3] = i2u(levels);
-    }
+    void image_get_resinfo(uint32_t binding, uint32_t dim, uint32_t lod_bits, uint32_t out[4]);
     // image_get_lod: return the sampler-clamped and raw implicit LOD for a hypothetical 2D sample.
     // SPIR-V defines OpImageQueryLod's x/y results in the same order as RDNA2's VDATA[0]/[1], so the
     // two raw FP32 values can be copied directly to the guest VGPRs. Like the hardware instruction,
     // this consumes screen-space derivatives and is therefore fragment-only.
-    void image_get_lod_2d(uint32_t binding, uint32_t u_bits, uint32_t v_bits, uint32_t out[2]) {
-        if (!declared_image_query) { put(caps, Op_Capability, {Cap_ImageQuery}); declared_image_query = true; }
-        const uint32_t simg = tex_binding_simg[binding];
-        uint32_t si = id(); put(code, Op_Load, {simg, si, tex_var[binding]});
-        uint32_t coord = tex_coord_uv(binding, u_bits, v_bits);
-        uint32_t lod = id(); put(code, Op_ImageQueryLod, {t_v2f(), lod, si, coord});
-        for (uint32_t component = 0; component < 2; ++component) {
-            uint32_t value = id();
-            put(code, Op_CompositeExtract, {t_f32, value, lod, component});
-            out[component] = bcu(value);
-        }
-    }
+    void image_get_lod_2d(uint32_t binding, uint32_t u_bits, uint32_t v_bits, uint32_t out[2]);
     // 2-component uint vector (integer texel coordinates for OpImageFetch).
     uint32_t t_v2u_cache = 0;
     uint32_t t_v2u() { if (!t_v2u_cache) { t_v2u_cache = id(); put(types, Op_TypeVector, {t_v2u_cache, t_u32, 2}); } return t_v2u_cache; }
     uint32_t t_v3u_cache2 = 0;
-    uint32_t t_v3u_fetch() {
-        if (t_v3u) return t_v3u;   // compute/vertex shells already declare a uvec3 for built-ins
-        if (!t_v3u_cache2) { t_v3u_cache2 = id(); put(types, Op_TypeVector, {t_v3u_cache2, t_u32, 3}); }
-        return t_v3u_cache2;
-    }
+    uint32_t t_v3u_fetch();
     // image_load 2D (image_load): texelFetch the image at the combined sampler's `binding` with INTEGER
     // (x,y) coords (raw VGPR bits). OpImage strips the sampler; OpImageFetch at explicit LOD 0.
-    void image_fetch_2d(uint32_t binding, uint32_t x_bits, uint32_t y_bits, uint32_t out[4]) {
-        uint32_t si    = id(); put(code, Op_Load,  {tex_binding_simg[binding], si, tex_var[binding]});
-        uint32_t img   = id(); put(code, Op_Image, {tex_binding_img[binding], img, si});
-        // #325: an Arrayed image needs a three-component fetch coordinate whatever opcode got
-        // here. Layer 0 is the base slice a graphics IMAGE_LOAD used to read through the old
-        // base-slice 2D view, so this preserves that behaviour rather than inventing one.
-        uint32_t coord = id();
-        if (tex_is_arrayed(binding))
-            put(code, Op_CompositeConstruct, {t_v3u_fetch(), coord, x_bits, y_bits, uconst(0)});
-        else
-            put(code, Op_CompositeConstruct, {t_v2u(), coord, x_bits, y_bits});
-        uint32_t res   = id(); put(code, Op_ImageFetch, {texture_vec4(binding), res, img, coord, ImgOp_Lod, uconst(0)});
-        unpack_texture_result(binding, res, out);
-    }
+    void image_fetch_2d(uint32_t binding, uint32_t x_bits, uint32_t y_bits, uint32_t out[4]);
 
     // Exact sampled IMAGE_LOAD representation for guest 2D_MSAA: the host image is single-sample
     // 2D-array, with each guest sample plane in one layer. The guest's explicit sample coordinate is
@@ -2312,43 +1327,14 @@ struct SpirvCompute {
     // Identical to image_fetch_2d except that the level is a value rather than the constant zero,
     // so it is valid only against a binding whose image really carries that many levels (#3048).
     void image_fetch_2d_lod(uint32_t binding, uint32_t x_bits, uint32_t y_bits,
-                            uint32_t lod_bits, uint32_t out[4]) {
-        uint32_t si    = id(); put(code, Op_Load,  {tex_binding_simg[binding], si, tex_var[binding]});
-        uint32_t img   = id(); put(code, Op_Image, {tex_binding_img[binding], img, si});
-        uint32_t coord = id();
-        if (tex_is_arrayed(binding))
-            put(code, Op_CompositeConstruct, {t_v3u_fetch(), coord, x_bits, y_bits, uconst(0)});
-        else
-            put(code, Op_CompositeConstruct, {t_v2u(), coord, x_bits, y_bits});
-        uint32_t res   = id();
-        put(code, Op_ImageFetch,
-            {texture_vec4(binding), res, img, coord, ImgOp_Lod, lod_bits});
-        unpack_texture_result(binding, res, out);
-    }
+                            uint32_t lod_bits, uint32_t out[4]);
 
     void image_fetch_2d_array(uint32_t binding, uint32_t x_bits, uint32_t y_bits,
-                              uint32_t layer_bits, uint32_t out[4]) {
-        uint32_t si    = id(); put(code, Op_Load, {tex_binding_simg[binding], si, tex_var[binding]});
-        uint32_t img   = id(); put(code, Op_Image, {tex_binding_img[binding], img, si});
-        uint32_t coord = id(); put(code, Op_CompositeConstruct,
-                                   {t_v3u_fetch(), coord, x_bits, y_bits, layer_bits});
-        uint32_t res   = id(); put(code, Op_ImageFetch,
-                                   {texture_vec4(binding), res, img, coord,
-                                    ImgOp_Lod, uconst(0)});
-        unpack_texture_result(binding, res, out);
-    }
+                              uint32_t layer_bits, uint32_t out[4]);
 
     // image_load from a 3D texture (integer texel fetch through the combined sampler — DOLL's
     // color-grade LUT, #273): OpImage strips the sampler; OpImageFetch with (x,y,z) integer coords.
-    void image_fetch_3d(uint32_t binding, uint32_t x_bits, uint32_t y_bits, uint32_t z_bits, uint32_t out[4]) {
-        uint32_t simg  = tex_binding_simg[binding];
-        uint32_t t_img3 = tex_binding_img[binding];   // OpImage's result type must be the pair's Image type
-        uint32_t si    = id(); put(code, Op_Load,  {simg, si, tex_var[binding]});
-        uint32_t img   = id(); put(code, Op_Image, {t_img3, img, si});
-        uint32_t coord = id(); put(code, Op_CompositeConstruct, {t_v3u_fetch(), coord, x_bits, y_bits, z_bits});
-        uint32_t res   = id(); put(code, Op_ImageFetch, {texture_vec4(binding), res, img, coord, ImgOp_Lod, uconst(0)});
-        unpack_texture_result(binding, res, out);
-    }
+    void image_fetch_3d(uint32_t binding, uint32_t x_bits, uint32_t y_bits, uint32_t z_bits, uint32_t out[4]);
 
     // --- STORAGE images (MIMG image_load / image_store WITHOUT a sampler; compute copy/blit) ---
     // Integer/packed formats use a UINT-sampled OpTypeImage. The portable host path converts between
@@ -2415,19 +1401,7 @@ struct SpirvCompute {
     }
     // Build the integer coordinate operand from `n` raw-bit VGPR coords (u32 texel indices, incl. the
     // array layer as the last component for arrayed images). n=1 -> scalar u32; 2 -> uvec2; 3 -> uvec3.
-    uint32_t stg_coord(uint32_t n, const uint32_t* c) {
-        if (n == 1) return c[0];
-        // 2D reuses the shared uvec2 helper (also used by texelFetch) so a shader mixing a texture
-        // image_load and a 2-coord storage image doesn't emit a duplicate OpTypeVector %uint 2.
-        if (n == 2) { uint32_t v = id(); put(code, Op_CompositeConstruct, {t_v2u(), v, c[0], c[1]}); return v; }
-        // uvec3: reuse the compute shell's uvec3 (t_v3u, declared for gl_GlobalInvocationID) if present —
-        // a second OpTypeVector %uint 3 would be an illegal duplicate non-aggregate type.
-        if (!t_v3u_c) {
-            if (t_v3u) t_v3u_c = t_v3u;
-            else { t_v3u_c = id(); put(types, Op_TypeVector, {t_v3u_c, t_u32, 3}); }
-        }
-        uint32_t v = id(); put(code, Op_CompositeConstruct, {t_v3u_c, v, c[0], c[1], c[2]}); return v;
-    }
+    uint32_t stg_coord(uint32_t n, const uint32_t* c);
     // image_load: OpImageRead the storage image at `binding` (dim gives the coord count); fills out[0..3]
     // with the RGBA texel components as raw VGPR bits (uint sampled type -> no bitcast needed).
     // OOB CONTRACT: like a buffer load (which relies on robustBufferAccess), the read is issued for ALL
@@ -2532,72 +1506,10 @@ struct SpirvCompute {
     // branch. A skipped lane leaves VDATA unchanged, matching the no-operation EXEC fallback.
     uint32_t image_atomic_u32(uint16_t opcode, uint32_t binding, uint32_t ncoord,
                               const uint32_t* coords, uint32_t value, bool predicated,
-                              uint32_t pred, uint32_t fallback) {
-        // 2D and 2D_ARRAY R32_UINT atomics. `arrayed` is implied by ncoord==3 -- the gate below
-        // only reaches here for SQ_DIM_2D (ncoord 2) and SQ_DIM_2D_ARRAY (ncoord 3, x/y/layer).
-        const bool arrayed = ncoord == 3;
-        if (ncoord != 2 && ncoord != 3) return fallback;
-        if (!t_ptr_img_u32) {
-            t_ptr_img_u32 = id();
-            put(types, Op_TypePointer, {t_ptr_img_u32, SC_Image, t_u32});
-        }
-        if (!declared_image_query) {
-            put(caps, Op_Capability, {Cap_ImageQuery});
-            declared_image_query = true;
-        }
-        const uint32_t image = id();
-        put(code, Op_Load, {stg_img_binding_type[binding], image, stg_img_var[binding]});
-        const uint32_t size = id();
-        // An arrayed image's OpImageQuerySize yields (width, height, layers); a plain 2D yields
-        // (width, height). Querying the wrong arity is a SPIR-V validity error rather than a silent
-        // miscompile, so spv_validate catches a mistake here.
-        put(code, Op_ImageQuerySize, {arrayed ? t_v3i() : t_v2i(), size, image});
-        const uint32_t width_i = id(), height_i = id();
-        put(code, Op_CompositeExtract, {t_i32, width_i, size, 0});
-        put(code, Op_CompositeExtract, {t_i32, height_i, size, 1});
-        uint32_t in_bounds = ucmp(Op_ULessThan, coords[0], i2u(width_i));
-        in_bounds = land(in_bounds, ucmp(Op_ULessThan, coords[1], i2u(height_i)));
-        if (arrayed) {
-            // The layer bound is NOT optional. Vulkan leaves an out-of-bounds image atomic
-            // undefined -- robust image access does not cover atomics -- and the 2D case's own
-            // comment records that RADV can spend seconds in one before resetting the GPU. An
-            // unbounded layer index would be exactly that, so the layer is bounded from the image's
-            // own query rather than from a descriptor field the shader cannot see.
-            const uint32_t layers_i = id();
-            put(code, Op_CompositeExtract, {t_i32, layers_i, size, 2});
-            in_bounds = land(in_bounds, ucmp(Op_ULessThan, coords[2], i2u(layers_i)));
-        }
-        const uint32_t active = predicated ? land(pred, in_bounds) : in_bounds;
-        auto emit = [&]() {
-            const uint32_t coord = stg_coord(ncoord, coords);
-            const uint32_t pointer = id();
-            put(code, Op_ImageTexelPointer,
-                {t_ptr_img_u32, pointer, stg_img_var[binding], coord, uconst(0)});
-            const uint32_t result = id();
-            put(code, opcode,
-                {t_u32, result, pointer, uconst(Scope_Device),
-                 uconst(MemSem_ImageAcqRel), value});
-            return result;
-        };
-        const uint32_t entry = cur_block;
-        const uint32_t then = id(), merge = id();
-        put(code, Op_SelectionMerge, {merge, 0});
-        put(code, Op_BranchConditional, {active, then, merge});
-        put(code, Op_Label, {then}); cur_block = then;
-        const uint32_t result = emit();
-        const uint32_t then_end = cur_block;
-        put(code, Op_Branch, {merge});
-        put(code, Op_Label, {merge}); cur_block = merge;
-        return emit_phi_2way(t_u32, result, then_end, fallback, entry);
-    }
+                              uint32_t pred, uint32_t fallback);
 
     // buffer element pointer: base[ gid.x*stride + k ]
-    uint32_t elem_ptr(uint32_t bufvar, uint32_t k) {
-        uint32_t idx = gidx;
-        if (stride != 1) { uint32_t m = id(); put(code, Op_IMul, {t_u32, m, gidx, uconst(stride)}); idx = m; }
-        if (k != 0) { uint32_t a = id(); put(code, Op_IAdd, {t_u32, a, idx, uconst(k)}); idx = a; }
-        uint32_t p = id(); putv(code, Op_AccessChain, {t_ptr_sb_f32, p, bufvar, uconst(0), idx}); return p;
-    }
+    uint32_t elem_ptr(uint32_t bufvar, uint32_t k);
     // Load one float from the input buffer and return it as raw bits (VGPR value).
     uint32_t load_input(uint32_t k) { uint32_t p = elem_ptr(v_in, k); uint32_t r = id(); put(code, Op_Load, {t_f32, r, p}); return bcu(r); }
     // The storage-buffer variable for a descriptor `binding`. N-buffer model: each distinct constant/
@@ -2605,46 +1517,14 @@ struct SpirvCompute {
     // so multiple constant buffers (e.g. Unity's per-draw transform vs per-frame) don't collapse onto one.
     // Bindings 2/3 keep mapping to v_cbuf/v_cbuf1 for the compute-shell + legacy 2-slot callers; any other
     // binding uses cbuf_var[] (declared by declare_cbufs from the resource table). Falls back to v_cbuf.
-    uint32_t buf_for_binding(uint32_t binding) {
-        if (binding == 2) return v_cbuf;
-        if (binding == 3) return v_cbuf1;
-        auto it = cbuf_var.find(binding); return it != cbuf_var.end() ? it->second : v_cbuf;
-    }
+    uint32_t buf_for_binding(uint32_t binding);
     // Logical-addressing SPIR-V cannot bitcast a pointer into the ordinary runtime-u32 Block to a
     // u64 pointer. Declare a second, aliased StorageBuffer variable at the SAME descriptor binding.
     // Vulkan binds both declarations to one VkBuffer; ArrayStride=8 gives the qword atomics their
     // natural record index. The narrow caller excludes descriptor arrays.
-    uint32_t u64_buf_for_binding(uint32_t binding) {
-        if (auto found = cbuf_u64_var.find(binding); found != cbuf_u64_var.end())
-            return found->second;
-        if (!t_ptr_sb_struct_u64) {
-            const uint32_t runtime_array = id(), block = id();
-            t_ptr_sb_struct_u64 = id();
-            t_ptr_sb_u64 = id();
-            put(deco, Op_Decorate, {runtime_array, Dec_ArrayStride, 8});
-            put(deco, Op_MemberDecorate, {block, 0, Dec_Offset, 0});
-            put(deco, Op_Decorate, {block, Dec_Block});
-            put(types, Op_TypeRuntimeArray, {runtime_array, t_u64()});
-            put(types, Op_TypeStruct, {block, runtime_array});
-            put(types, Op_TypePointer, {t_ptr_sb_struct_u64, SC_StorageBuffer, block});
-            put(types, Op_TypePointer, {t_ptr_sb_u64, SC_StorageBuffer, t_u64()});
-        }
-        const uint32_t variable = id();
-        put(deco, Op_Decorate, {variable, Dec_DescriptorSet, desc_set});
-        put(deco, Op_Decorate, {variable, Dec_Binding, binding});
-        declare_external_storage_buffer(t_ptr_sb_struct_u64, variable);
-        cbuf_u64_var[binding] = variable;
-        return variable;
-    }
-    void mark_cbuf_coherent(uint32_t binding) {
-        const uint32_t buf = buf_for_binding(binding);
-        if (cbuf_coherent_vars.insert(buf).second)
-            put(deco, Op_Decorate, {buf, Dec_Coherent});
-    }
-    void device_uniform_release_barrier() {
-        put(code, Op_MemoryBarrier,
-            {uconst(Scope_Device), uconst(MemSem_UniformRelease)});
-    }
+    uint32_t u64_buf_for_binding(uint32_t binding);
+    void mark_cbuf_coherent(uint32_t binding);
+    void device_uniform_release_barrier();
     // Load one dword (raw bits) from the constant/vertex buffer at descriptor `binding` at dword index
     // `idx` (SMEM). The 1-arg form keeps the legacy slot convention (0 -> binding 2, 1 -> binding 3).
     // THE only place a storage-buffer element pointer is built. There were FOUR identical
@@ -2717,16 +1597,7 @@ struct SpirvCompute {
         putv(code, Op_AccessChain, {t_ptr_sb_u32, ptr, buf, uconst(0), idx});
         return ptr;
     }
-    uint32_t cbuf_load_impl(uint32_t idx, uint32_t binding, bool coherent_access) {
-        uint32_t buf = buf_for_binding(binding);
-        if (coherent_access) mark_cbuf_coherent(binding);
-        uint32_t array_valid = 0;
-        uint32_t p = cbuf_element_ptr(buf, binding, idx, &array_valid);
-        uint32_t r = id();
-        if (coherent_access) put(code, Op_Load, {t_u32, r, p, MemAccess_Volatile});
-        else                 put(code, Op_Load, {t_u32, r, p});
-        return array_valid ? sel(array_valid, r, uconst(0)) : r;
-    }
+    uint32_t cbuf_load_impl(uint32_t idx, uint32_t binding, bool coherent_access);
     uint32_t cbuf_load(uint32_t idx, uint32_t binding = 2, bool coherent_access = false) {
         cbuf_ordinary_accesses.insert(binding);
         return cbuf_load_impl(idx, binding, coherent_access);
@@ -2736,156 +1607,21 @@ struct SpirvCompute {
         uint32_t hi = 0;
         uint32_t overflow = 0;
     };
-    U64PairAdd add_u64_pair_u32(uint32_t lo, uint32_t hi, uint32_t addend) {
-        U64PairAdd result;
-        result.lo = ibin(Op_IAdd, lo, addend);
-        const uint32_t carry = ucmp(Op_ULessThan, result.lo, lo);
-        result.hi = ibin(Op_IAdd, hi, sel(carry, uconst(1), uconst(0)));
-        result.overflow = ucmp(Op_ULessThan, result.hi, hi);
-        return result;
-    }
+    U64PairAdd add_u64_pair_u32(uint32_t lo, uint32_t hi, uint32_t addend);
     uint32_t u64_pair_ule(uint32_t lhs_lo, uint32_t lhs_hi,
-                          uint32_t rhs_lo, uint32_t rhs_hi) {
-        const uint32_t high_less = ucmp(Op_ULessThan, lhs_hi, rhs_hi);
-        const uint32_t high_equal = ucmp(Op_IEqual, lhs_hi, rhs_hi);
-        const uint32_t low_less_equal = ucmp(Op_ULessThanEqual, lhs_lo, rhs_lo);
-        return lor(high_less, land(high_equal, low_less_equal));
-    }
-    void declare_indirect_pointer_descriptor_capture() {
-        uint32_t pointer_type = 0;
-        indirect_pointer_source_record_var = function_var(t_u32, pointer_type);
-        indirect_pointer_source_root_lo_var = function_var(t_u32, pointer_type);
-        indirect_pointer_source_root_hi_var = function_var(t_u32, pointer_type);
-        // UINT32_MAX cannot name a record in the validated source table. It is also the safe
-        // fail-closed state for a lane which reaches a consumer without executing the producer.
-        store_function(indirect_pointer_source_record_var, uconst(UINT32_MAX));
-        store_function(indirect_pointer_source_root_lo_var, uconst(0));
-        store_function(indirect_pointer_source_root_hi_var, uconst(0));
-    }
+                          uint32_t rhs_lo, uint32_t rhs_hi);
+    void declare_indirect_pointer_descriptor_capture();
     void capture_indirect_pointer_descriptor_source(
             uint32_t record_index, uint32_t root_lo, uint32_t descriptor_word1,
-            bool predicated, uint32_t predicate) {
-        if (!indirect_pointer_source_record_var ||
-            !indirect_pointer_source_root_lo_var ||
-            !indirect_pointer_source_root_hi_var)
-            return;
-        uint32_t root_hi = ibin(
-            Op_BitwiseAnd, descriptor_word1, uconst(0xffffu));
-        if (predicated) {
-            const uint32_t old_record = load_function(
-                t_u32, indirect_pointer_source_record_var);
-            const uint32_t old_root_lo = load_function(
-                t_u32, indirect_pointer_source_root_lo_var);
-            const uint32_t old_root_hi = load_function(
-                t_u32, indirect_pointer_source_root_hi_var);
-            record_index = sel(predicate, record_index, old_record);
-            root_lo = sel(predicate, root_lo, old_root_lo);
-            root_hi = sel(predicate, root_hi, old_root_hi);
-        }
-        // Preserve one atomic provenance tuple across EXEC masking. The source MUBUF's inactive
-        // destination values may have been recycled since an earlier capture; they must not replace
-        // only the root while the old record identity survives.
-        store_function(indirect_pointer_source_record_var, record_index);
-        store_function(indirect_pointer_source_root_lo_var, root_lo);
-        store_function(indirect_pointer_source_root_hi_var, root_hi);
-    }
+            bool predicated, uint32_t predicate);
     uint32_t relocated_indirect_carrier_dword(uint32_t selected_byte,
-                                               uint32_t valid) {
-        // OpSelect does not short-circuit an OpLoad. Select a known in-range carrier address before
-        // either load, and avoid index+1 for an aligned dword at the physical end of the binding.
-        const uint32_t safe_byte = sel(valid, selected_byte, uconst(0));
-        const uint32_t index0 = ibin(Op_ShiftRightLogical, safe_byte, uconst(2));
-        const uint32_t shift = ibin(
-            Op_ShiftLeftLogical,
-            ibin(Op_BitwiseAnd, safe_byte, uconst(3)), uconst(3));
-        const uint32_t needs_second = ucmp(Op_INotEqual, shift, uconst(0));
-        const uint32_t index1 = sel(
-            needs_second, ibin(Op_IAdd, index0, uconst(1)), index0);
-        const uint32_t dword0 = cbuf_load(index0, indirect_pointer_binding);
-        const uint32_t dword1 = cbuf_load(index1, indirect_pointer_binding);
-        const uint32_t lower = ibin(Op_ShiftRightLogical, dword0, shift);
-        const uint32_t inverse_shift = ibin(
-            Op_BitwiseAnd, ibin(Op_ISub, uconst(32), shift), uconst(31));
-        const uint32_t upper = ibin(Op_ShiftLeftLogical, dword1, inverse_shift);
-        const uint32_t joined = ibin(
-            Op_BitwiseOr, lower, sel(needs_second, upper, uconst(0)));
-        return sel(valid, joined, uconst(0));
-    }
+                                               uint32_t valid);
     // Relocate one proven guest GLOBAL dword through the version-2 carrier. Segment byte_count is
     // the exact guest interval; carrier_bytes includes only the physical zero padding needed for a
     // safe unaligned dword join. An invalid, ambiguous, overflowing, or padding-only address first
     // selects carrier byte zero for memory safety and then returns architectural zero.
     uint32_t relocated_indirect_load_dword(uint32_t address_lo, uint32_t address_hi,
-                                            uint32_t immediate_byte_offset) {
-        const U64PairAdd access_begin =
-            add_u64_pair_u32(address_lo, address_hi, uconst(immediate_byte_offset));
-        const U64PairAdd access_end =
-            add_u64_pair_u32(access_begin.lo, access_begin.hi, uconst(sizeof(uint32_t)));
-        uint32_t selected_byte = uconst(0);
-        uint32_t match_count = uconst(0);
-        const uint32_t directory_dword =
-            indirect_pointer_segment_directory_byte_offset / sizeof(uint32_t);
-        constexpr uint32_t kSegmentDwords =
-            kIndirectBufferRelocationSegmentBytes / sizeof(uint32_t);
-        for (uint32_t segment = 0; segment < indirect_pointer_segment_count; ++segment) {
-            const uint32_t entry = directory_dword + segment * kSegmentDwords;
-            const uint32_t guest_lo = cbuf_load(
-                uconst(entry), indirect_pointer_binding);
-            const uint32_t guest_hi = cbuf_load(
-                uconst(entry + 1u), indirect_pointer_binding);
-            const uint32_t byte_count = cbuf_load(
-                uconst(entry + 2u), indirect_pointer_binding);
-            const uint32_t packed_byte = cbuf_load(
-                uconst(entry + 3u), indirect_pointer_binding);
-
-            const U64PairAdd guest_end =
-                add_u64_pair_u32(guest_lo, guest_hi, byte_count);
-            uint32_t guest_contains = logical_not(access_begin.overflow);
-            guest_contains = land(guest_contains, logical_not(access_end.overflow));
-            guest_contains = land(guest_contains, logical_not(guest_end.overflow));
-            guest_contains = land(
-                guest_contains, ucmp(Op_INotEqual, byte_count, uconst(0)));
-            guest_contains = land(
-                guest_contains,
-                u64_pair_ule(guest_lo, guest_hi, access_begin.lo, access_begin.hi));
-            guest_contains = land(
-                guest_contains,
-                u64_pair_ule(access_end.lo, access_end.hi, guest_end.lo, guest_end.hi));
-
-            // Once containment is true, the interval is at most UINT32_MAX bytes, so the low-word
-            // subtraction is the exact residual even when the guest interval crosses 4 GiB.
-            const uint32_t residual = ibin(Op_ISub, access_begin.lo, guest_lo);
-            const uint32_t candidate = ibin(Op_IAdd, packed_byte, residual);
-            const uint32_t candidate_wrapped = ucmp(Op_ULessThan, candidate, packed_byte);
-            const uint32_t candidate_end =
-                ibin(Op_IAdd, candidate, uconst(sizeof(uint32_t)));
-            const uint32_t candidate_end_wrapped =
-                ucmp(Op_ULessThan, candidate_end, candidate);
-            const uint32_t packed_end = ibin(Op_IAdd, packed_byte, byte_count);
-            const uint32_t packed_end_wrapped = ucmp(Op_ULessThan, packed_end, packed_byte);
-            uint32_t packed_valid = logical_not(candidate_wrapped);
-            packed_valid = land(packed_valid, logical_not(candidate_end_wrapped));
-            packed_valid = land(packed_valid, logical_not(packed_end_wrapped));
-            packed_valid = land(
-                packed_valid,
-                ucmp(Op_UGreaterThanEqual, packed_byte,
-                     uconst(indirect_pointer_payload_byte_offset)));
-            packed_valid = land(
-                packed_valid,
-                ucmp(Op_ULessThanEqual, packed_end,
-                     uconst(indirect_pointer_carrier_bytes)));
-            packed_valid = land(
-                packed_valid, ucmp(Op_ULessThanEqual, candidate_end, packed_end));
-
-            const uint32_t match = land(guest_contains, packed_valid);
-            selected_byte = sel(match, candidate, selected_byte);
-            match_count = ibin(
-                Op_IAdd, match_count, sel(match, uconst(1), uconst(0)));
-        }
-
-        const uint32_t unique = ucmp(Op_IEqual, match_count, uconst(1));
-        return relocated_indirect_carrier_dword(selected_byte, unique);
-    }
+                                            uint32_t immediate_byte_offset);
     // DescriptorRange differs from StaticFootprint in one essential way: adjacent source records
     // may describe adjacent or overlapping guest intervals, but an address derived from record A
     // must never borrow record B's authority. Match the captured producer identity against one
@@ -2894,169 +1630,7 @@ struct SpirvCompute {
     // this path intentionally does not require ShaderInt64.
     uint32_t relocated_indirect_descriptor_load_dword(
             uint32_t address_lo, uint32_t address_hi,
-            uint32_t immediate_byte_offset) {
-        const U64PairAdd access_begin =
-            add_u64_pair_u32(address_lo, address_hi, uconst(immediate_byte_offset));
-        const U64PairAdd access_end =
-            add_u64_pair_u32(access_begin.lo, access_begin.hi, uconst(sizeof(uint32_t)));
-        const uint32_t captured_record = load_function(
-            t_u32, indirect_pointer_source_record_var);
-        const uint32_t captured_root_lo = load_function(
-            t_u32, indirect_pointer_source_root_lo_var);
-        const uint32_t captured_root_hi = load_function(
-            t_u32, indirect_pointer_source_root_hi_var);
-
-        const uint32_t max_source_index =
-            (UINT32_MAX - indirect_pointer_source_pointer_byte_offset) /
-            indirect_pointer_source_stride;
-        const uint32_t source_index_valid = ucmp(
-            Op_ULessThanEqual, captured_record, uconst(max_source_index));
-        const uint32_t expected_source_offset = ibin(
-            Op_IAdd,
-            ibin(Op_IMul, captured_record, uconst(indirect_pointer_source_stride)),
-            uconst(indirect_pointer_source_pointer_byte_offset));
-
-        uint32_t selected_byte = uconst(0);
-        uint32_t matching_records = uconst(0);
-        uint32_t selected_segment_valid = bfalse();
-        const uint32_t records_dword =
-            indirect_pointer_record_directory_byte_offset / sizeof(uint32_t);
-        const uint32_t segments_dword =
-            indirect_pointer_segment_directory_byte_offset / sizeof(uint32_t);
-        constexpr uint32_t kRecordDwords =
-            kIndirectBufferRelocationRecordBytes / sizeof(uint32_t);
-        constexpr uint32_t kSegmentDwords =
-            kIndirectBufferRelocationSegmentBytes / sizeof(uint32_t);
-        for (uint32_t record = 0; record < indirect_pointer_record_count; ++record) {
-            const uint32_t entry = records_dword + record * kRecordDwords;
-            const uint32_t source_offset = cbuf_load(
-                uconst(entry), indirect_pointer_binding);
-            const uint32_t segment_index = cbuf_load(
-                uconst(entry + 1u), indirect_pointer_binding);
-            const uint32_t guest_lo = cbuf_load(
-                uconst(entry + 2u), indirect_pointer_binding);
-            const uint32_t guest_hi = cbuf_load(
-                uconst(entry + 3u), indirect_pointer_binding);
-            const uint32_t byte_count = cbuf_load(
-                uconst(entry + 4u), indirect_pointer_binding);
-            const uint32_t address_kind = cbuf_load(
-                uconst(entry + 5u), indirect_pointer_binding);
-
-            const U64PairAdd record_end = add_u64_pair_u32(
-                guest_lo, guest_hi, byte_count);
-            uint32_t record_contains = logical_not(access_begin.overflow);
-            record_contains = land(record_contains, logical_not(access_end.overflow));
-            record_contains = land(record_contains, logical_not(record_end.overflow));
-            record_contains = land(
-                record_contains, ucmp(Op_INotEqual, byte_count, uconst(0)));
-            record_contains = land(
-                record_contains,
-                u64_pair_ule(guest_lo, guest_hi, access_begin.lo, access_begin.hi));
-            record_contains = land(
-                record_contains,
-                u64_pair_ule(access_end.lo, access_end.hi, record_end.lo, record_end.hi));
-
-            uint32_t record_match = source_index_valid;
-            record_match = land(
-                record_match,
-                ucmp(Op_IEqual, source_offset, expected_source_offset));
-            record_match = land(
-                record_match, ucmp(Op_IEqual, guest_lo, captured_root_lo));
-            record_match = land(
-                record_match, ucmp(Op_IEqual, guest_hi, captured_root_hi));
-            record_match = land(
-                record_match,
-                ucmp(Op_IEqual, address_kind,
-                     uconst(static_cast<uint32_t>(
-                         IndirectBufferRelocationRecord::SourceAddressKind::
-                             BufferDescriptorBase48))));
-            record_match = land(record_match, record_contains);
-            matching_records = ibin(
-                Op_IAdd, matching_records,
-                sel(record_match, uconst(1), uconst(0)));
-
-            const uint32_t segment_index_valid = ucmp(
-                Op_ULessThan, segment_index, uconst(indirect_pointer_segment_count));
-            const uint32_t safe_segment = sel(
-                segment_index_valid, segment_index, uconst(0));
-            const uint32_t segment_entry = ibin(
-                Op_IAdd, uconst(segments_dword),
-                ibin(Op_IMul, safe_segment, uconst(kSegmentDwords)));
-            const uint32_t segment_guest_lo = cbuf_load(
-                segment_entry, indirect_pointer_binding);
-            const uint32_t segment_guest_hi = cbuf_load(
-                ibin(Op_IAdd, segment_entry, uconst(1)),
-                indirect_pointer_binding);
-            const uint32_t segment_bytes = cbuf_load(
-                ibin(Op_IAdd, segment_entry, uconst(2)),
-                indirect_pointer_binding);
-            const uint32_t packed_byte = cbuf_load(
-                ibin(Op_IAdd, segment_entry, uconst(3)),
-                indirect_pointer_binding);
-            const uint32_t reserved_lo = cbuf_load(
-                ibin(Op_IAdd, segment_entry, uconst(4)),
-                indirect_pointer_binding);
-            const uint32_t reserved_hi = cbuf_load(
-                ibin(Op_IAdd, segment_entry, uconst(5)),
-                indirect_pointer_binding);
-
-            const U64PairAdd segment_end = add_u64_pair_u32(
-                segment_guest_lo, segment_guest_hi, segment_bytes);
-            uint32_t segment_valid = segment_index_valid;
-            segment_valid = land(
-                segment_valid, ucmp(Op_INotEqual, segment_bytes, uconst(0)));
-            segment_valid = land(segment_valid, logical_not(segment_end.overflow));
-            segment_valid = land(
-                segment_valid,
-                u64_pair_ule(segment_guest_lo, segment_guest_hi, guest_lo, guest_hi));
-            segment_valid = land(
-                segment_valid,
-                u64_pair_ule(record_end.lo, record_end.hi,
-                             segment_end.lo, segment_end.hi));
-            segment_valid = land(
-                segment_valid, ucmp(Op_IEqual, reserved_lo, uconst(0)));
-            segment_valid = land(
-                segment_valid, ucmp(Op_IEqual, reserved_hi, uconst(0)));
-
-            // The record is contained by this segment, so low-word subtraction is the exact byte
-            // residual. Validate the packed representation independently before selecting it.
-            const uint32_t residual = ibin(
-                Op_ISub, access_begin.lo, segment_guest_lo);
-            const uint32_t candidate = ibin(Op_IAdd, packed_byte, residual);
-            const uint32_t candidate_wrapped = ucmp(
-                Op_ULessThan, candidate, packed_byte);
-            const uint32_t candidate_end = ibin(
-                Op_IAdd, candidate, uconst(sizeof(uint32_t)));
-            const uint32_t candidate_end_wrapped = ucmp(
-                Op_ULessThan, candidate_end, candidate);
-            const uint32_t packed_end = ibin(
-                Op_IAdd, packed_byte, segment_bytes);
-            const uint32_t packed_end_wrapped = ucmp(
-                Op_ULessThan, packed_end, packed_byte);
-            segment_valid = land(segment_valid, logical_not(candidate_wrapped));
-            segment_valid = land(segment_valid, logical_not(candidate_end_wrapped));
-            segment_valid = land(segment_valid, logical_not(packed_end_wrapped));
-            segment_valid = land(
-                segment_valid,
-                ucmp(Op_UGreaterThanEqual, packed_byte,
-                     uconst(indirect_pointer_payload_byte_offset)));
-            segment_valid = land(
-                segment_valid,
-                ucmp(Op_ULessThanEqual, packed_end,
-                     uconst(indirect_pointer_carrier_bytes)));
-            segment_valid = land(
-                segment_valid,
-                ucmp(Op_ULessThanEqual, candidate_end, packed_end));
-
-            const uint32_t select_record = land(record_match, segment_valid);
-            selected_byte = sel(select_record, candidate, selected_byte);
-            selected_segment_valid = lor(selected_segment_valid, select_record);
-        }
-
-        const uint32_t unique = land(
-            ucmp(Op_IEqual, matching_records, uconst(1)), selected_segment_valid);
-        return relocated_indirect_carrier_dword(selected_byte, unique);
-    }
+            uint32_t immediate_byte_offset);
     uint32_t cbuf_load_zero_padded_tail(uint32_t binding,
                                         StorageBufferTailSemantic semantic,
                                         bool coherent_access = false) {
@@ -3092,164 +1666,21 @@ struct SpirvCompute {
     // returns the pre-operation value in VDATA. Inactive EXEC lanes neither access the buffer nor
     // clobber VDATA, hence the predicated path joins the old destination through OpPhi.
     uint32_t cbuf_atomic_rtn(uint32_t op, uint32_t idx, uint32_t value, uint32_t binding,
-                             bool predicated, uint32_t pred, uint32_t fallback) {
-        cbuf_ordinary_accesses.insert(binding);
-        if (cbuf_table_arity.count(binding)) invalid_cbuf_array_access = true;
-        const uint32_t buf = buf_for_binding(binding);
-        auto emit = [&]() {
-            uint32_t p = cbuf_element_ptr(buf, binding, idx);
-            uint32_t result = id();
-            put(code, op, {t_u32, result, p, uconst(Scope_Device),
-                           uconst(MemSem_UniformAcqRel), value});
-            return result;
-        };
-        if (!predicated) return emit();
-        const uint32_t entry = cur_block;
-        uint32_t then = id(), merge = id();
-        put(code, Op_SelectionMerge, {merge, 0});
-        put(code, Op_BranchConditional, {pred, then, merge});
-        put(code, Op_Label, {then}); cur_block = then;
-        const uint32_t result = emit();
-        const uint32_t then_end = cur_block;
-        put(code, Op_Branch, {merge});
-        put(code, Op_Label, {merge}); cur_block = merge;
-        return emit_phi_2way(t_u32, result, then_end, fallback, entry);
-    }
+                             bool predicated, uint32_t pred, uint32_t fallback);
     // RDNA2 BUFFER_ATOMIC_FMIN/FMAX and DS_MIN/MAX_F32 use floating min/max bit semantics, but
     // operate on memory for which SPIR-V 1.3 has no core floating-point min/max atomic. Keep the CAS
     // loop and all selection arithmetic in integer space so host-driver float controls cannot alter
     // the guest result. Signaling NaNs are quieted and propagated before ordinary MINNUM/MAXNUM
     // selection. COMPUTE_PGM_RSRC1.FP32_DENORM controls whether subnormal operands compare as
     // signed zero. MIN/MAX still publishes the selected operand's original, non-flushed bits.
-    uint32_t atomic_fminmax_bits(uint32_t resident, uint32_t value, bool is_min) {
-        const uint32_t denorm_mode =
-            (compute_pgm_rsrc1 >>
-             prosper::agc::Pm4::COMPUTE_PGM_RSRC1_FP32_DENORM_SHIFT) &
-            prosper::agc::Pm4::COMPUTE_PGM_RSRC1_FP32_DENORM_MASK;
-        const bool flush_inputs = denorm_mode == 0u || denorm_mode == 2u;
-        auto flush_subnormal = [&](uint32_t bits) {
-            const uint32_t absolute = ibin(Op_BitwiseAnd, bits, uconst(0x7fffffffu));
-            const uint32_t nonzero = ucmp(Op_INotEqual, absolute, uconst(0));
-            const uint32_t below_normal = ucmp(Op_ULessThan, absolute, uconst(0x00800000u));
-            const uint32_t subnormal = land(nonzero, below_normal);
-            const uint32_t signed_zero = ibin(Op_BitwiseAnd, bits, uconst(0x80000000u));
-            return sel(subnormal, signed_zero, bits);
-        };
-        const uint32_t resident_compare = flush_inputs ? flush_subnormal(resident) : resident;
-        const uint32_t value_compare = flush_inputs ? flush_subnormal(value) : value;
-        auto ordered_key = [&](uint32_t bits) {
-            const uint32_t negative = ucmp(
-                Op_INotEqual, ibin(Op_BitwiseAnd, bits, uconst(0x80000000u)), uconst(0));
-            return sel(negative, iun(Op_Not, bits),
-                       ibin(Op_BitwiseXor, bits, uconst(0x80000000u)));
-        };
-        const uint32_t resident_abs = ibin(
-            Op_BitwiseAnd, resident, uconst(0x7fffffffu));
-        const uint32_t value_abs = ibin(
-            Op_BitwiseAnd, value, uconst(0x7fffffffu));
-        const uint32_t resident_nan = ucmp(
-            Op_UGreaterThan, resident_abs, uconst(0x7f800000u));
-        const uint32_t value_nan = ucmp(
-            Op_UGreaterThan, value_abs, uconst(0x7f800000u));
-        const uint32_t resident_snan = land(
-            resident_nan,
-            ucmp(Op_IEqual,
-                 ibin(Op_BitwiseAnd, resident, uconst(0x00400000u)), uconst(0)));
-        const uint32_t value_snan = land(
-            value_nan,
-            ucmp(Op_IEqual,
-                 ibin(Op_BitwiseAnd, value, uconst(0x00400000u)), uconst(0)));
-        const uint32_t ordered = ucmp(
-            is_min ? Op_ULessThan : Op_UGreaterThan,
-            ordered_key(value_compare), ordered_key(resident_compare));
-        const uint32_t numeric = sel(ordered, value, resident);
-        const uint32_t resident_number = sel(value_nan, resident, numeric);
-        const uint32_t quiet_resident = ibin(
-            Op_BitwiseOr, resident, uconst(0x00400000u));
-        const uint32_t quiet_value = ibin(
-            Op_BitwiseOr, value, uconst(0x00400000u));
-        return sel(
-            resident_snan, quiet_resident,
-            sel(value_snan, quiet_value,
-                sel(resident_nan, sel(value_nan, quiet_resident, value), resident_number)));
-    }
+    uint32_t atomic_fminmax_bits(uint32_t resident, uint32_t value, bool is_min);
     uint32_t cbuf_atomic_fminmax_rtn(uint32_t idx, uint32_t value, uint32_t binding,
                                      bool is_min, bool predicated, uint32_t pred,
-                                     uint32_t fallback) {
-        cbuf_ordinary_accesses.insert(binding);
-        if (cbuf_table_arity.count(binding)) invalid_cbuf_array_access = true;
-        const uint32_t buf = buf_for_binding(binding);
-        auto emit = [&]() {
-            const uint32_t pointer = cbuf_element_ptr(buf, binding, idx);
-            const uint32_t initial = id();
-            put(code, Op_AtomicLoad,
-                {t_u32, initial, pointer, uconst(Scope_Device),
-                 uconst(MemSem_UniformAcquire)});
-
-            const uint32_t preheader = cur_block;
-            const uint32_t header = id(), again = id(), merge = id();
-            put(code, Op_Branch, {header});
-            put(code, Op_Label, {header}); cur_block = header;
-            size_t retry_patch = 0;
-            const uint32_t expected = emit_phi2(t_u32, initial, preheader, retry_patch);
-            const uint32_t desired = atomic_fminmax_bits(expected, value, is_min);
-            const uint32_t observed = id();
-            put(code, Op_AtomicCompareExchange,
-                {t_u32, observed, pointer, uconst(Scope_Device),
-                 uconst(MemSem_UniformAcqRel), uconst(MemSem_UniformAcquire),
-                 desired, expected});
-            const uint32_t succeeded = ucmp(Op_IEqual, observed, expected);
-            put(code, Op_LoopMerge, {merge, again, 0});
-            put(code, Op_BranchConditional, {succeeded, merge, again});
-            put(code, Op_Label, {again}); cur_block = again;
-            put(code, Op_Branch, {header});
-            patch_phi(retry_patch, observed, again);
-            put(code, Op_Label, {merge}); cur_block = merge;
-            return expected;
-        };
-        if (!predicated) return emit();
-        const uint32_t entry = cur_block;
-        const uint32_t then = id(), merge = id();
-        put(code, Op_SelectionMerge, {merge, 0});
-        put(code, Op_BranchConditional, {pred, then, merge});
-        put(code, Op_Label, {then}); cur_block = then;
-        const uint32_t result = emit();
-        const uint32_t then_end = cur_block;
-        put(code, Op_Branch, {merge});
-        put(code, Op_Label, {merge}); cur_block = merge;
-        return emit_phi_2way(t_u32, result, then_end, fallback, entry);
-    }
+                                     uint32_t fallback);
     // One true 64-bit RMW for the exact naturally-strided guest contract. The caller supplies the
     // SPIR-V atomic opcode and original qword record index, and range-checks it before entry.
     uint32_t cbuf_atomic_x2_rtn(uint32_t op, uint32_t index, uint32_t value, uint32_t binding,
-                                uint32_t pred, uint32_t fallback) {
-        cbuf_ordinary_accesses.insert(binding);
-        if (!declared_int64_atomics) {
-            put(caps, Op_Capability, {Cap_Int64Atomics});
-            declared_int64_atomics = true;
-        }
-        const uint32_t buf = u64_buf_for_binding(binding);
-        auto emit = [&]() {
-            const uint32_t pointer = id();
-            putv(code, Op_AccessChain,
-                 {t_ptr_sb_u64, pointer, buf, uconst(0), index});
-            const uint32_t result = id();
-            put(code, op,
-                {t_u64(), result, pointer, uconst(Scope_Device),
-                 uconst(MemSem_UniformAcqRel), value});
-            return result;
-        };
-        const uint32_t entry = cur_block;
-        const uint32_t then = id(), merge = id();
-        put(code, Op_SelectionMerge, {merge, 0});
-        put(code, Op_BranchConditional, {pred, then, merge});
-        put(code, Op_Label, {then}); cur_block = then;
-        const uint32_t result = emit();
-        const uint32_t then_end = cur_block;
-        put(code, Op_Branch, {merge});
-        put(code, Op_Label, {merge}); cur_block = merge;
-        return emit_phi_2way(t_u64(), result, then_end, fallback, entry);
-    }
+                                uint32_t pred, uint32_t fallback);
     // RADV currently hangs/reset-poisons the device on Astro Bot's compute R32_UINT image atomic.
     // Compute lowers that exact 2D resource through a detiled storage-buffer view instead. The live
     // backend recognizes the reflected atomic buffer over a StorageImage resource, detiles before
@@ -3265,18 +1696,7 @@ struct SpirvCompute {
     // ConstantBuffer/VertexBuffer resource is still refused: the types happen to match, which is
     // exactly what would make aliasing onto someone else's buffer silent rather than loud.
     std::set<uint32_t> atomic_img_buf_bindings;
-    bool declare_compute_atomic_image_buffer(uint32_t binding) {
-        if (!is_compute || !t_ptr_sb_struct_u) return false;
-        if (atomic_img_buf_bindings.count(binding)) return true;   // ours already; reuse it
-        if (cbuf_var.count(binding)) return false;                 // someone else's; refuse
-        const uint32_t variable = id();
-        put(deco, Op_Decorate, {variable, Dec_DescriptorSet, desc_set});
-        put(deco, Op_Decorate, {variable, Dec_Binding, binding});
-        declare_external_storage_buffer(t_ptr_sb_struct_u, variable);
-        cbuf_var[binding] = variable;
-        atomic_img_buf_bindings.insert(binding);
-        return true;
-    }
+    bool declare_compute_atomic_image_buffer(uint32_t binding);
     // LDS (Local Data Share) — a workgroup-shared u32 array for compute ds_read/ds_write. NGG shaders
     // are lowered as one independent Vulkan vertex invocation, so their LDS becomes Function-private:
     // the single modeled guest lane can observe its own writes, with no cross-invocation races or an
@@ -3295,48 +1715,14 @@ struct SpirvCompute {
     uint32_t vertex_lds_dwords = 0;
     uint32_t vertices_per_instance = 0;
     uint32_t lds_var = 0, t_ptr_lds_u32 = 0;
-    void declare_lds() {
-        if (lds_var) return;
-        const uint32_t dwords = is_compute ? lds_dwords : vertex_lds_dwords;
-        if (!dwords) return;
-        uint32_t len = uconst(dwords);
-        uint32_t t_arr = id();        put(types, Op_TypeArray, {t_arr, t_u32, len});
-        if (is_vertex) {
-            // Vertex-stage LDS is only legal for the exact NGG wrapper selected by recompile_vertex.
-            // All other vertex DS shapes reject before reaching this declaration.
-            uint32_t t_ptr_fn_arr = 0;
-            lds_var = function_var(t_arr, t_ptr_fn_arr);
-            t_ptr_lds_u32 = id();
-            put(types, Op_TypePointer, {t_ptr_lds_u32, SC_Function, t_u32});
-        } else {
-            uint32_t t_ptr_wg_arr = id(); put(types, Op_TypePointer, {t_ptr_wg_arr, SC_Workgroup, t_arr});
-            lds_var = id();               put(types, Op_Variable, {t_ptr_wg_arr, lds_var, SC_Workgroup});
-            t_ptr_lds_u32 = id();
-            put(types, Op_TypePointer, {t_ptr_lds_u32, SC_Workgroup, t_u32});
-        }
-    }
-    uint32_t lds_load(uint32_t idx) {
-        uint32_t p = id(); putv(code, Op_AccessChain, {t_ptr_lds_u32, p, lds_var, idx});
-        uint32_t r = id(); put(code, Op_Load, {t_u32, r, p}); return r;
-    }
+    void declare_lds();
+    uint32_t lds_load(uint32_t idx);
     // EXEC-predicated LDS load. The inactive arm must not merely discard a loaded value: its
     // address VGPR retains the old, potentially arbitrary bits when the instruction is masked off,
     // so even forming an AccessChain/OpLoad there can access outside the Workgroup array or race an
     // active lane. Keep the memory access inside the active selection and join the architectural
     // old destination through OpPhi, matching the returning-atomic helper below.
-    uint32_t lds_load(uint32_t idx, bool predicated, uint32_t pred, uint32_t fallback) {
-        if (!predicated) return lds_load(idx);
-        const uint32_t entry = cur_block;
-        const uint32_t then = id(), merge = id();
-        put(code, Op_SelectionMerge, {merge, 0});
-        put(code, Op_BranchConditional, {pred, then, merge});
-        put(code, Op_Label, {then}); cur_block = then;
-        const uint32_t result = lds_load(idx);
-        const uint32_t then_end = cur_block;
-        put(code, Op_Branch, {merge});
-        put(code, Op_Label, {merge}); cur_block = merge;
-        return emit_phi_2way(t_u32, result, then_end, fallback, entry);
-    }
+    uint32_t lds_load(uint32_t idx, bool predicated, uint32_t pred, uint32_t fallback);
     // Store to LDS[idx]; EXEC-predicated (conditional store) under a narrowed mask, like cbuf_store.
     void lds_store(uint32_t idx, uint32_t value, bool predicated, uint32_t pred,
                    bool atomicize = false) {
@@ -3360,21 +1746,7 @@ struct SpirvCompute {
     // Unsigned LDS atomic RMW. The old value is intentionally discarded; the non-returning RDNA DS
     // form exposes only the memory effect. Workgroup scope + WorkgroupMemory AcquireRelease matches
     // the storage class and the barrier helper used around cooperating accesses.
-    void lds_atomic(uint32_t op, uint32_t idx, uint32_t value, bool predicated, uint32_t pred) {
-        auto emit = [&]() {
-            uint32_t p = id(); putv(code, Op_AccessChain, {t_ptr_lds_u32, p, lds_var, idx});
-            uint32_t result = id();
-            put(code, op, {t_u32, result, p, uconst(Scope_Workgroup), uconst(MemSem_WGAcqRel), value});
-        };
-        if (!predicated) { emit(); return; }
-        uint32_t then = id(), merge = id();
-        put(code, Op_SelectionMerge, {merge, 0});
-        put(code, Op_BranchConditional, {pred, then, merge});
-        put(code, Op_Label, {then}); cur_block = then;
-        emit();
-        put(code, Op_Branch, {merge});
-        put(code, Op_Label, {merge}); cur_block = merge;
-    }
+    void lds_atomic(uint32_t op, uint32_t idx, uint32_t value, bool predicated, uint32_t pred);
     // RDNA2 DS_MIN/MAX_F32 quiet and propagate signaling NaNs before numeric selection; a lone quiet
     // NaN yields the number. FP32_DENORM controls whether subnormal inputs compare at their true
     // value or as signed zero, while signed-zero ties choose -0 for min / +0 for max.
@@ -3384,113 +1756,27 @@ struct SpirvCompute {
     // depend on the host driver's denormal mode. AMD's both-qNaN selection returns the first operand;
     // the resident `*ptr` value is that first operand for an atomic min/max update.
     void lds_atomic_fminmax(uint32_t idx, uint32_t value, bool is_min,
-                            bool predicated, uint32_t pred) {
-        auto emit = [&]() {
-            const uint32_t p = id();
-            putv(code, Op_AccessChain, {t_ptr_lds_u32, p, lds_var, idx});
-            const uint32_t initial = id();
-            put(code, Op_AtomicLoad,
-                {t_u32, initial, p, uconst(Scope_Workgroup), uconst(MemSem_WGAcquire)});
-
-            const uint32_t preheader = cur_block;
-            const uint32_t header = id(), again = id(), merge = id();
-            put(code, Op_Branch, {header});
-            put(code, Op_Label, {header}); cur_block = header;
-            size_t retry_patch = 0;
-            const uint32_t expected = emit_phi2(t_u32, initial, preheader, retry_patch);
-            const uint32_t desired = atomic_fminmax_bits(expected, value, is_min);
-            const uint32_t observed = id();
-            put(code, Op_AtomicCompareExchange,
-                {t_u32, observed, p, uconst(Scope_Workgroup), uconst(MemSem_WGAcqRel),
-                 uconst(MemSem_WGAcquire), desired, expected});
-            const uint32_t succeeded = ucmp(Op_IEqual, observed, expected);
-            put(code, Op_LoopMerge, {merge, again, 0});
-            put(code, Op_BranchConditional, {succeeded, merge, again});
-            put(code, Op_Label, {again}); cur_block = again;
-            put(code, Op_Branch, {header});
-            patch_phi(retry_patch, observed, again);
-            put(code, Op_Label, {merge}); cur_block = merge;
-        };
-        if (!predicated) { emit(); return; }
-        const uint32_t then = id(), merge = id();
-        put(code, Op_SelectionMerge, {merge, 0});
-        put(code, Op_BranchConditional, {pred, then, merge});
-        put(code, Op_Label, {then}); cur_block = then;
-        emit();
-        put(code, Op_Branch, {merge});
-        put(code, Op_Label, {merge}); cur_block = merge;
-    }
+                            bool predicated, uint32_t pred);
     // Returning LDS atomic RMW. Inactive lanes must neither touch LDS nor observe an undefined
     // atomic result, so the predicated form joins the old destination fallback through OpPhi.
     uint32_t lds_atomic_rtn(uint32_t op, uint32_t idx, uint32_t value,
-                            bool predicated, uint32_t pred, uint32_t fallback) {
-        auto emit = [&]() {
-            uint32_t p = id(); putv(code, Op_AccessChain, {t_ptr_lds_u32, p, lds_var, idx});
-            uint32_t result = id();
-            put(code, op, {t_u32, result, p, uconst(Scope_Workgroup), uconst(MemSem_WGAcqRel), value});
-            return result;
-        };
-        if (!predicated) return emit();
-        const uint32_t entry = cur_block;
-        uint32_t then = id(), merge = id();
-        put(code, Op_SelectionMerge, {merge, 0});
-        put(code, Op_BranchConditional, {pred, then, merge});
-        put(code, Op_Label, {then}); cur_block = then;
-        const uint32_t result = emit();
-        const uint32_t then_end = cur_block;
-        put(code, Op_Branch, {merge});
-        put(code, Op_Label, {merge}); cur_block = merge;
-        return emit_phi_2way(t_u32, result, then_end, fallback, entry);
-    }
+                            bool predicated, uint32_t pred, uint32_t fallback);
     // s_barrier: workgroup execution + memory barrier (OpControlBarrier).
-    void barrier() {
-        if (ngg_private_lds) return; // exact one-lane wrapper has no peer requiring synchronization
-        uses_barrier = true;
-        put(code, Op_ControlBarrier, {uconst(Scope_Workgroup), uconst(Scope_Workgroup), uconst(MemSem_WGAcqRel)});
-    }
+    void barrier();
 
     // Dispatcher-only scratch. Unlike guest LDS, this is private recompiler state: one flag slot per
     // padded hardware-wave lane, one result per wave, and one whole-workgroup liveness result.
     uint32_t cfg_scratch = 0, t_ptr_cfg_u32 = 0, cfg_scratch_dwords = 0;
-    bool declare_cfg_scratch(uint32_t dwords) {
-        // OpTypeArray is immutable once emitted. A later phased dispatcher may require a wider
-        // layout than the first phase; fail closed if its caller did not pre-size from the complete
-        // stream instead of emitting an out-of-bounds Workgroup access.
-        if (cfg_scratch) return dwords <= cfg_scratch_dwords;
-        uint32_t t_arr = id(); put(types, Op_TypeArray, {t_arr, t_u32, uconst(dwords)});
-        uint32_t t_ptr = id(); put(types, Op_TypePointer, {t_ptr, SC_Workgroup, t_arr});
-        cfg_scratch = id(); put(types, Op_Variable, {t_ptr, cfg_scratch, SC_Workgroup});
-        t_ptr_cfg_u32 = id(); put(types, Op_TypePointer, {t_ptr_cfg_u32, SC_Workgroup, t_u32});
-        cfg_scratch_dwords = dwords;
-        return true;
-    }
-    uint32_t cfg_scratch_load(uint32_t idx) {
-        uint32_t p = id(); putv(code, Op_AccessChain, {t_ptr_cfg_u32, p, cfg_scratch, idx});
-        uint32_t value = id(); put(code, Op_Load, {t_u32, value, p}); return value;
-    }
-    void cfg_scratch_store(uint32_t idx, uint32_t value) {
-        uint32_t p = id(); putv(code, Op_AccessChain, {t_ptr_cfg_u32, p, cfg_scratch, idx});
-        put(code, Op_Store, {p, value});
-    }
+    bool declare_cfg_scratch(uint32_t dwords);
+    uint32_t cfg_scratch_load(uint32_t idx);
+    void cfg_scratch_store(uint32_t idx, uint32_t value);
 
     // --- Wave model (cross-lane ops via workgroup scratch). A dedicated LDS scratch array (separate
     // from ds_read/write's lds_var) holds each lane's contribution so cross-lane reductions work.
     // Inactive lanes still EXECUTE (exec is a per-lane predication bool), so all 64 reach the barriers —
     // valid only at wave-uniform points (the caller must not emit these inside divergent control flow). ---
     uint32_t v_localid = 0, localid = 0, lds_wave = 0, t_ptr_wg_u32b = 0;
-    void declare_wave_lds() {
-        if (lds_wave) return;
-        // Keep one result slot per guest wave separate from the per-lane publication area.  A
-        // completed vote can then be consumed while a faster invocation starts publishing the next
-        // one, without needing a third workgroup barrier solely to protect the result.
-        const uint32_t wave_count = (local_count + wave_size - 1) / wave_size;
-        uint32_t t_arr = id();
-        put(types, Op_TypeArray,
-            {t_arr, t_u32, uconst(std::max(1u, local_count + wave_count))});
-        uint32_t t_ptr = id();  put(types, Op_TypePointer, {t_ptr, SC_Workgroup, t_arr});
-        lds_wave = id();        put(types, Op_Variable, {t_ptr, lds_wave, SC_Workgroup});
-        t_ptr_wg_u32b = id();   put(types, Op_TypePointer, {t_ptr_wg_u32b, SC_Workgroup, t_u32});
-    }
+    void declare_wave_lds();
     // Exact guest-wave vote at a workgroup-uniform site. Vulkan subgroup width is implementation-
     // defined and need not match the guest's 32/64-lane wave, so publish every lane through shared
     // scratch and reduce only lanes with the same guest-wave index. One lane per guest wave performs
@@ -3499,116 +1785,18 @@ struct SpirvCompute {
     // the old per-invocation reduction made a 256-thread group perform 65,536 loads for every vote.
     // The first barrier publishes lane bits and the second publishes wave results. The caller proves
     // the site is outside wave-divergent structured control flow.
-    uint32_t guest_wave_any(uint32_t active_bool) {
-        declare_wave_lds();
-        const uint32_t zero = uconst(0);
-        const uint32_t bit = sel(active_bool, uconst(1), uconst(0));
-        uint32_t p = id();
-        putv(code, Op_AccessChain, {t_ptr_wg_u32b, p, lds_wave, linear_localid});
-        put(code, Op_Store, {p, bit});
-        barrier();
-
-        const uint32_t wave_shift = wave_size == 32 ? 5u : 6u;
-        const uint32_t wave_index = ibin(
-            Op_ShiftRightLogical, linear_localid, uconst(wave_shift));
-        const uint32_t wave_base = ibin(
-            Op_ShiftLeftLogical, wave_index, uconst(wave_shift));
-        const uint32_t lane = ibin(
-            Op_BitwiseAnd, linear_localid, uconst(wave_size - 1));
-        const uint32_t leader = id(), reduced = id();
-        const uint32_t is_leader = ucmp(Op_IEqual, lane, zero);
-        emit_selmerge(reduced);
-        emit_condbranch(is_leader, leader, reduced);
-        emit_label(leader);
-        uint32_t any_word = zero;
-        for (uint32_t i = 0; i < wave_size; ++i) {
-            const uint32_t idx = ibin(Op_IAdd, wave_base, uconst(i));
-            const uint32_t valid = ucmp(Op_ULessThan, idx, uconst(local_count));
-            // Keep the memory access in-bounds for a partial final guest wave. The selected value is
-            // ignored when idx names a padded lane, but Vulkan must never observe an OOB OpLoad.
-            const uint32_t safe_idx = sel(valid, idx, zero);
-            uint32_t q = id();
-            putv(code, Op_AccessChain, {t_ptr_wg_u32b, q, lds_wave, safe_idx});
-            uint32_t value = id();
-            put(code, Op_Load, {t_u32, value, q});
-            any_word = ibin(Op_BitwiseOr, any_word, sel(valid, value, zero));
-        }
-        const uint32_t result_index = ibin(Op_IAdd, uconst(local_count), wave_index);
-        uint32_t result_ptr = id();
-        putv(code, Op_AccessChain,
-             {t_ptr_wg_u32b, result_ptr, lds_wave, result_index});
-        put(code, Op_Store, {result_ptr, any_word});
-        emit_branch(reduced);
-        emit_label(reduced);
-        barrier();
-        const uint32_t result_index_all = ibin(
-            Op_IAdd, uconst(local_count), wave_index);
-        uint32_t result_ptr_all = id();
-        putv(code, Op_AccessChain,
-             {t_ptr_wg_u32b, result_ptr_all, lds_wave, result_index_all});
-        uint32_t result = id();
-        put(code, Op_Load, {t_u32, result, result_ptr_all});
-        return ucmp(Op_INotEqual, result, zero);
-    }
+    uint32_t guest_wave_any(uint32_t active_bool);
     // V_READLANE_B32 at a workgroup-uniform site. Publish every invocation's source value and
     // address the selected lane within this invocation's own guest wave. This is exact at any
     // host subgroup width; unlike a native subgroup shuffle it does not require a Wave64 guest
     // wave to fit inside one Vulkan subgroup. V_READLANE ignores EXEC, so publication is
     // unconditional. Missing lanes in a partial final wave read as zero.
-    uint32_t guest_wave_readlane(uint32_t source_value, uint32_t selector) {
-        declare_wave_lds();
-        uint32_t source_ptr = id();
-        putv(code, Op_AccessChain,
-             {t_ptr_wg_u32b, source_ptr, lds_wave, linear_localid});
-        put(code, Op_Store, {source_ptr, source_value});
-        barrier();
-
-        const uint32_t wave_shift = wave_size == 32 ? 5u : 6u;
-        const uint32_t wave_base = ibin(
-            Op_ShiftLeftLogical,
-            ibin(Op_ShiftRightLogical, linear_localid, uconst(wave_shift)),
-            uconst(wave_shift));
-        const uint32_t lane = ibin(
-            Op_BitwiseAnd, selector, uconst(wave_size - 1u));
-        const uint32_t index = ibin(Op_IAdd, wave_base, lane);
-        const uint32_t zero = uconst(0);
-        const uint32_t valid = ucmp(Op_ULessThan, index, uconst(local_count));
-        const uint32_t safe_index = sel(valid, index, zero);
-        uint32_t result_ptr = id();
-        putv(code, Op_AccessChain,
-             {t_ptr_wg_u32b, result_ptr, lds_wave, safe_index});
-        uint32_t result = id();
-        put(code, Op_Load, {t_u32, result, result_ptr});
-        barrier();
-        return sel(valid, result, zero);
-    }
+    uint32_t guest_wave_readlane(uint32_t source_value, uint32_t selector);
     // v_mbcnt_lo/hi: count active lanes below this one. active_bool = this lane's mask bit (EXEC); acc =
     // src1 accumulator (bits); `lo` selects the [0,32) half (lo) or [32,64) half (hi). Combined lo→hi over
     // a wave = the lane's compaction index among active lanes. Populate LDS[lane]=active, barrier, then an
     // unrolled prefix-count over the half; trailing barrier so a following mbcnt can safely re-populate.
-    uint32_t mbcnt(uint32_t active_bool, uint32_t acc_bits, bool lo) {
-        declare_wave_lds();
-        uint32_t bit = sel(active_bool, uconst(1), uconst(0));
-        { uint32_t p = id(); putv(code, Op_AccessChain, {t_ptr_wg_u32b, p, lds_wave, linear_localid}); put(code, Op_Store, {p, bit}); }
-        barrier();
-        const uint32_t lane = ibin(Op_BitwiseAnd, linear_localid, uconst(wave_size - 1));
-        const uint32_t wave_index = ibin(Op_ShiftRightLogical, linear_localid,
-                                          uconst(wave_size == 32 ? 5u : 6u));
-        uint32_t sum = uconst(0);
-        const uint32_t first = lo ? 0u : 32u;
-        const uint32_t last = std::min(wave_size, lo ? 32u : 64u);
-        for (uint32_t i = 0; i < local_count; i++) {
-            const uint32_t candidate_lane = i % wave_size;
-            if (candidate_lane < first || candidate_lane >= last) continue;
-            uint32_t cond = land(ucmp(Op_IEqual, wave_index, uconst(i / wave_size)),
-                                 ucmp(Op_ULessThan, uconst(candidate_lane), lane));
-            uint32_t p = id(); putv(code, Op_AccessChain, {t_ptr_wg_u32b, p, lds_wave, uconst(i)});
-            uint32_t v = id(); put(code, Op_Load, {t_u32, v, p});
-            sum = b_iadd(sum, sel(cond, v, uconst(0)));
-        }
-        barrier();
-        return b_iadd(acc_bits, sum);
-    }
+    uint32_t mbcnt(uint32_t active_bool, uint32_t acc_bits, bool lo);
     // DS_APPEND/DS_CONSUME: one atomic add/subtract per emulated hardware wave, changing the counter
     // by popcount(EXEC), with the old value broadcast to every lane. GDS operations target the
     // backend-owned persistent device buffer; ordinary operations target workgroup LDS. Every
@@ -3660,38 +1848,7 @@ struct SpirvCompute {
         return result;
     }
     uint32_t native_wave_append(uint32_t lds_idx, uint32_t active_bool,
-                                uint32_t consume) {
-        if (!native_subgroup_size) return 0;
-        (void)subgroup_local_id();
-        if (!declared_subgroup_arithmetic) {
-            put(caps, Op_Capability, {Cap_GroupNonUniformArithmetic});
-            declared_subgroup_arithmetic = true;
-        }
-        const uint32_t contribution = sel(active_bool, uconst(1), uconst(0));
-        uint32_t count = id();
-        put(code, Op_GroupNonUniformIAdd,
-            {t_u32, count, uconst(Scope_Subgroup), GroupOp_Reduce, contribution});
-        uint32_t prefix = id();
-        put(code, Op_GroupNonUniformIAdd,
-            {t_u32, prefix, uconst(Scope_Subgroup), GroupOp_ExclusiveScan, contribution});
-        const uint32_t elected = land(active_bool, ucmp(Op_IEqual, prefix, uconst(0)));
-        const uint32_t entry = cur_block, leader = id(), merge = id();
-        emit_selmerge(merge);
-        emit_condbranch(elected, leader, merge);
-        emit_label(leader);
-        const uint32_t delta = sel(consume, ibin(Op_ISub, uconst(0), count), count);
-        const uint32_t leader_old = lds_atomic_rtn(
-            Op_AtomicIAdd, lds_idx, delta, false, btrue(), uconst(0));
-        const uint32_t leader_end = cur_block;
-        emit_branch(merge);
-        emit_label(merge);
-        const uint32_t local_old = emit_phi_2way(
-            t_u32, leader_old, leader_end, uconst(0), entry);
-        uint32_t old = id();
-        put(code, Op_GroupNonUniformIAdd,
-            {t_u32, old, uconst(Scope_Subgroup), GroupOp_Reduce, local_old});
-        return old;
-    }
+                                uint32_t consume);
     uint32_t b_iadd(uint32_t a, uint32_t b_) { uint32_t r = id(); put(code, Op_IAdd, {t_u32, r, a, b_}); return r; }
     // Declare the two scalar-memory constant/vertex buffers (bindings 2 & 3) that SMEM / buffer_load_
     // format_* read. Called by every shell (compute/vertex/fragment) so cbuf_load works in each.
@@ -3820,41 +1977,16 @@ struct SpirvCompute {
         }
     }
     // Store a VGPR (bits) as one float per invocation: b[gid.x] (stride 1), independent of input stride.
-    void     store_output(uint32_t bits) {
-        uint32_t p = id(); putv(code, Op_AccessChain, {t_ptr_sb_f32, p, v_out, uconst(0), gidx});
-        put(code, Op_Store, {p, bcf(bits)});
-    }
+    void     store_output(uint32_t bits);
     // EXEC-predicated store: lanes with exec=false keep the output slot's prior value. Modeled with
     // OpSelect (no control flow needed) — load old, pick new-vs-old by the per-lane exec bool, store.
     // Correct for the straight-line "conditional write / discard" pattern (v_cmpx narrows EXEC).
-    void     store_output_pred(uint32_t bits, uint32_t exec_bool) {
-        uint32_t p = id(); putv(code, Op_AccessChain, {t_ptr_sb_f32, p, v_out, uconst(0), gidx});
-        uint32_t old = id(); put(code, Op_Load, {t_f32, old, p});
-        uint32_t sel = id(); put(code, Op_Select, {t_f32, sel, exec_bool, bcf(bits), old});
-        put(code, Op_Store, {p, sel});
-    }
+    void     store_output_pred(uint32_t bits, uint32_t exec_bool);
     uint32_t btrue() { uint32_t r = id(); put(types, Op_ConstantTrue, {t_bool, r}); return r; }
-    uint32_t load_push_constant(uint32_t index) {
-        uint32_t pointer = id();
-        put(code, Op_AccessChain,
-            {t_ptr_push_u32, pointer, v_push_constants, uconst(0), uconst(index)});
-        uint32_t value = id();
-        put(code, Op_Load, {t_u32, value, pointer});
-        return value;
-    }
+    uint32_t load_push_constant(uint32_t index);
     // Logical AND / OR of two bools (EXEC narrowing / saveexec).
-    uint32_t land(uint32_t a, uint32_t b_) {
-        uint32_t r = id();
-        put(code, Op_LogicalAnd, {t_bool, r, a, b_});
-        propagate_fragment_wave_vote(r, a, b_);
-        return r;
-    }
-    uint32_t lor(uint32_t a, uint32_t b_) {
-        uint32_t r = id();
-        put(code, Op_LogicalOr, {t_bool, r, a, b_});
-        propagate_fragment_wave_vote(r, a, b_);
-        return r;
-    }
+    uint32_t land(uint32_t a, uint32_t b_);
+    uint32_t lor(uint32_t a, uint32_t b_);
 
     void begin(uint32_t input_stride, const ShaderResourceTable* rt = nullptr,
                uint32_t local_x = 64, uint32_t local_y = 1, uint32_t local_z = 1,
@@ -3978,20 +2110,8 @@ struct SpirvCompute {
     // launches the final complete workgroup, so make its excess invocations branch directly to the
     // function merge instead of executing guest instructions (and, in particular, memory stores).
     uint32_t invocation_within_extent(uint32_t threads_x, uint32_t threads_y,
-                                      uint32_t threads_z) {
-        uint32_t within = ucmp(Op_ULessThan, globalid_comp[0], uconst(threads_x));
-        within = land(within, ucmp(Op_ULessThan, globalid_comp[1], uconst(threads_y)));
-        within = land(within, ucmp(Op_ULessThan, globalid_comp[2], uconst(threads_z)));
-        return within;
-    }
-    void guard_invocation_extent(uint32_t threads_x, uint32_t threads_y, uint32_t threads_z) {
-        const uint32_t within = invocation_within_extent(threads_x, threads_y, threads_z);
-        const uint32_t active = id();
-        invocation_guard_merge = id();
-        emit_selmerge(invocation_guard_merge);
-        emit_condbranch(within, active, invocation_guard_merge);
-        emit_label(active);
-    }
+                                      uint32_t threads_z);
+    void guard_invocation_extent(uint32_t threads_x, uint32_t threads_y, uint32_t threads_z);
     // --- Fragment-shader shell: vec4 outputs for the MRT0..MRT7 exports. ---
     //
     // This array WAS sized 2, and that single number was the whole of GTA V's missing 3D world.
@@ -4041,50 +2161,19 @@ struct SpirvCompute {
         function_var_insert = code.size();
     }
     // Write a vec4(r,g,b,a) (bit-operands) to the matching fragment color output.
-    void export_color(uint32_t mrt, uint32_t r, uint32_t g, uint32_t bl, uint32_t a) {
-        if (mrt >= v_color.size() || !v_color[mrt]) return;
-        // Fragment I/O tap (PROSPER_FS_TAP): if an intermediate was snapshotted at the tapped PC, store THAT
-        // as the MRT0 colour instead of the shader's real colour, so the rendered frame visualises the value.
-        uint32_t v;
-        if (tap_vec && mrt == 0) { v = tap_vec; }
-        else { v = id(); putv(code, Op_CompositeConstruct, {t_v4f, v, bcf(r), bcf(g), bcf(bl), bcf(a)}); }
-        put(code, Op_Store, {v_color[mrt], v});
-    }
+    void export_color(uint32_t mrt, uint32_t r, uint32_t g, uint32_t bl, uint32_t a);
     // Fragment depth export (EXP target 8 = MRTZ) — a lazily declared BuiltIn FragDepth output.
     // Writing FragDepth requires ExecutionMode DepthReplacing (fixed-function Z is replaced by the
     // shader's exported value, matching the hardware's shader-Z path). Silently DROPPING the
     // target-8 export left occlusion to interpolated Z — wrong for any depth-writing shader.
     uint32_t v_fragdepth = 0;
-    void export_depth(uint32_t z_bits) {
-        if (!v_fragdepth) {
-            uint32_t t_ptr = id(); put(types, Op_TypePointer, {t_ptr, SC_Output, t_f32});
-            v_fragdepth = id(); put(types, Op_Variable, {t_ptr, v_fragdepth, SC_Output});
-            put(deco, Op_Decorate, {v_fragdepth, Dec_BuiltIn, BI_FragDepth});
-            put(exec, Op_ExecutionMode, {f_main, EM_DepthReplacing});
-            iface.push_back(v_fragdepth);
-        }
-        put(code, Op_Store, {v_fragdepth, bcf(z_bits)});
-    }
+    void export_depth(uint32_t z_bits);
 
     // Fragment sample-coverage export (EXP target 8 / VSRC2). Vulkan exposes this as the first
     // element of a BuiltIn SampleMask output array, matching RDNA's 32-bit sample-mask payload.
     uint32_t v_sample_mask = 0;
     uint32_t t_sample_mask = 0;
-    void export_sample_mask(uint32_t mask_bits) {
-        if (!v_sample_mask) {
-            t_sample_mask = id();
-            put(types, Op_TypeArray, {t_sample_mask, t_u32, uconst(1)});
-            uint32_t t_ptr = id();
-            put(types, Op_TypePointer, {t_ptr, SC_Output, t_sample_mask});
-            v_sample_mask = id();
-            put(types, Op_Variable, {t_ptr, v_sample_mask, SC_Output});
-            put(deco, Op_Decorate, {v_sample_mask, Dec_BuiltIn, BI_SampleMask});
-            iface.push_back(v_sample_mask);
-        }
-        const uint32_t value = id();
-        put(code, Op_CompositeConstruct, {t_sample_mask, value, mask_bits});
-        put(code, Op_Store, {v_sample_mask, value});
-    }
+    void export_sample_mask(uint32_t mask_bits);
 
     // --- Vertex-shader shell: draw inputs + gl_Position (member 0 of a gl_PerVertex Block). ---
     uint32_t v_vid = 0, v_iid = 0, v_pos = 0, t_ptr_out_v4f = 0;
@@ -4139,58 +2228,10 @@ struct SpirvCompute {
     // Hardware packs consecutive vertex/instance invocations into merged guest waves. VertexIndex
     // repeats for each instance, so flatten it with the captured per-instance vertex count before
     // deriving lane and wave IDs. Standalone fixtures retain their historical vertex-only ID.
-    uint32_t vertex_invocation_id() {
-        const uint32_t vertex = load_vertex_index();
-        if (!vertices_per_instance) return vertex;
-        return ibin(Op_IAdd,
-                    ibin(Op_IMul, load_instance_index(), uconst(vertices_per_instance)), vertex);
-    }
-    uint32_t guest_lane_id() {
-        if (is_fragment) return subgroup_local_id();
-        if (is_compute) return linear_localid;
-        return ibin(Op_BitwiseAnd, vertex_invocation_id(), uconst(wave_size - 1));
-    }
+    uint32_t vertex_invocation_id();
+    uint32_t guest_lane_id();
     // Write vec4(x,y,z,w) (bit-operands) to gl_Position (EXP POS0).
-    void export_position(uint32_t x, uint32_t y, uint32_t z, uint32_t w) {
-        // PROSPER_FORCE_W: diagnostic — force the clip-space w to 1.0. Some shaders' factored MVP
-        // multiply leaves w at 0 under our (still-incomplete) descriptor decode, collapsing the
-        // perspective divide; forcing w=1 reveals whether the x/y are otherwise on-screen.
-        if (getenv("PROSPER_FORCE_W")) w = uconst(0x3f800000u);   // raw bits of 1.0f (bcf bitcasts to float)
-        // Shader I/O tap: if an intermediate was snapshotted at PROSPER_SHADER_TAP's PC, export THAT as
-        // gl_Position instead of the real clip position, so the geometry-probe capture reads it back.
-        uint32_t v;
-        if (tap_vec) { v = tap_vec; }
-        else {
-            // A tap was REQUESTED and is not available here, which is the silent-degradation case
-            // (#2064): tap_vec is set only when the instruction at tap_pc is walked, so a tap_pc
-            // AFTER this shader's EXP POS0 leaves it 0 and the real clip position is exported --
-            // while the readout still prints "values below are the tapped VGPR". A plausible,
-            // well-labelled, completely wrong answer.
-            //
-            // Warned rather than rejected, and the distinction matters: tap_pc is GLOBAL across
-            // stages, so a PC tapped in the pixel shader is legitimately absent from every vertex
-            // shader. Refusing here would drop every draw in the frame for a tap that is doing
-            // exactly what it was asked to do. The warning names both PCs so a reader can tell the
-            // two apart immediately -- "after the export" is the defect, "not in this shader" is not.
-            if (tap_pc != 0xFFFFFFFFu) {
-                // Atomic, not a plain counter: parallel_draw_worker_execute realizes draws on
-                // worker threads and realization recompiles, and I could not establish that
-                // the recompile itself runs under ShaderCache's mutex rather than only the
-                // lookup. An unverified serialization claim is not worth one relaxed add.
-                static std::atomic<unsigned> warned{0};
-                if (warned.fetch_add(1, std::memory_order_relaxed) < 8)
-                    fprintf(stderr,
-                            "[shader-tap] NOT APPLIED at the position export: PROSPER_SHADER_TAP "
-                            "pc=%u was not reached before EXP POS0 in this vertex shader, so the "
-                            "REAL clip position is exported. If pc=%u is after the export, move it "
-                            "earlier; if it belongs to another stage, this line is expected (#2064)\n",
-                            tap_pc, tap_pc);
-            }
-            v = id(); putv(code, Op_CompositeConstruct, {t_v4f, v, bcf(x), bcf(y), bcf(z), bcf(w)});
-        }
-        uint32_t p = id(); putv(code, Op_AccessChain, {t_ptr_out_v4f, p, v_pos, uconst(0)});
-        put(code, Op_Store, {p, v});
-    }
+    void export_position(uint32_t x, uint32_t y, uint32_t z, uint32_t w);
 
     // --- Interpolated I/O varyings: VS EXP PARAM_n (output) <-> FS v_interp attribute (input) ---
     std::unordered_map<uint32_t, uint32_t> in_varying, out_varying;
@@ -4207,87 +2248,18 @@ struct SpirvCompute {
     // the same SPIR-V property and are unioned: flat_attrs recognises flat-ness from the shader's own
     // choice of VINTRP opcode (v_interp_mov), while fragment_interpolation->flat_mask recognises it
     // from the guest's declared semantic, which still applies to an ordinary v_interp_p1/p2 read).
-    uint32_t frag_input(uint32_t attr) {
-        auto it = in_varying.find(attr); if (it != in_varying.end()) return it->second;
-        if (!t_ptr_in_v4f) { t_ptr_in_v4f = id(); put(types, Op_TypePointer, {t_ptr_in_v4f, SC_Input, t_v4f}); }
-        uint32_t v = id(); put(types, Op_Variable, {t_ptr_in_v4f, v, SC_Input});
-        put(deco, Op_Decorate, {v, Dec_Location, attr});
-        const bool flat = flat_attrs.count(attr) != 0 ||
-            (fragment_interpolation && attr < 32 &&
-             (fragment_interpolation->flat_mask & (1u << attr)) != 0);
-        if (flat) put(deco, Op_Decorate, {v, Dec_Flat});
-        in_varying[attr] = v; iface.push_back(v); return v;
-    }
+    uint32_t frag_input(uint32_t attr);
     // Read component `chan` (0..3) of interpolated attribute `attr` -> float bits (v_interp_p2 / mov).
-    uint32_t interp_read(uint32_t attr, uint32_t chan) {
-        uint32_t v = frag_input(attr);
-        uint32_t vec = id(); put(code, Op_Load, {t_v4f, vec, v});
-        uint32_t e = id(); put(code, Op_CompositeExtract, {t_f32, e, vec, chan}); return bcu(e);
-    }
+    uint32_t interp_read(uint32_t attr, uint32_t chan);
     // AMD v_interp_mov selects one of the triangle coefficients directly: P10, P20, or P0. On the
     // portable geometry fallback each selected coefficient has a packed Flat vec4 input. The legacy
     // P0-only path remains the ordinary Flat attribute at Location=attr and needs no extra stage.
-    uint32_t interp_parameter(uint32_t attr, uint32_t chan, uint32_t selector) {
-        if (!fragment_interpolation || !fragment_interpolation->requires_geometry)
-            return selector == 2 ? interp_read(attr, chan) : 0;
-        if (attr >= fragment_interpolation->parameter_locations.size() || selector >= 3) return 0;
-        const uint32_t location = fragment_interpolation->parameter_locations[attr][selector];
-        if (location == FragmentInterpolationLayout::kUnusedLocation) return 0;
-        auto it = in_varying.find(0x10000u | location);
-        uint32_t variable = 0;
-        if (it != in_varying.end()) variable = it->second;
-        else {
-            if (!t_ptr_in_v4f) {
-                t_ptr_in_v4f = id();
-                put(types, Op_TypePointer, {t_ptr_in_v4f, SC_Input, t_v4f});
-            }
-            variable = id(); put(types, Op_Variable, {t_ptr_in_v4f, variable, SC_Input});
-            put(deco, Op_Decorate, {variable, Dec_Location, location});
-            put(deco, Op_Decorate, {variable, Dec_Flat});
-            in_varying[0x10000u | location] = variable; iface.push_back(variable);
-        }
-        uint32_t vec = id(); put(code, Op_Load, {t_v4f, vec, variable});
-        uint32_t element = id(); put(code, Op_CompositeExtract, {t_f32, element, vec, chan});
-        return bcu(element);
-    }
-    uint32_t system_interpolation_component(uint32_t field, uint32_t component) {
-        if (!fragment_interpolation || !fragment_interpolation->requires_geometry || field >= 7)
-            return 0;
-        const uint32_t location = fragment_interpolation->system_locations[field];
-        if (location == FragmentInterpolationLayout::kUnusedLocation) return 0;
-        auto it = in_varying.find(0x20000u | location);
-        uint32_t variable = 0;
-        if (it != in_varying.end()) variable = it->second;
-        else {
-            if (!t_ptr_in_v4f) {
-                t_ptr_in_v4f = id();
-                put(types, Op_TypePointer, {t_ptr_in_v4f, SC_Input, t_v4f});
-            }
-            variable = id(); put(types, Op_Variable, {t_ptr_in_v4f, variable, SC_Input});
-            put(deco, Op_Decorate, {variable, Dec_Location, location});
-            if (field >= 4) put(deco, Op_Decorate, {variable, Dec_NoPerspective});
-            if (field == 0 || field == 4) put(deco, Op_Decorate, {variable, Dec_Sample});
-            if (field == 2 || field == 6) put(deco, Op_Decorate, {variable, Dec_Centroid});
-            in_varying[0x20000u | location] = variable; iface.push_back(variable);
-        }
-        uint32_t vec = id(); put(code, Op_Load, {t_v4f, vec, variable});
-        uint32_t element = id(); put(code, Op_CompositeExtract, {t_f32, element, vec, component});
-        return bcu(element);
-    }
+    uint32_t interp_parameter(uint32_t attr, uint32_t chan, uint32_t selector);
+    uint32_t system_interpolation_component(uint32_t field, uint32_t component);
     // FS: gl_FragCoord (BuiltIn 15), lazily declared — used by the DPP quad_perm lowering.
     uint32_t v_fragcoord = 0;
-    uint32_t fragcoord_var() {
-        if (v_fragcoord) return v_fragcoord;
-        if (!t_ptr_in_v4f) { t_ptr_in_v4f = id(); put(types, Op_TypePointer, {t_ptr_in_v4f, SC_Input, t_v4f}); }
-        v_fragcoord = id(); put(types, Op_Variable, {t_ptr_in_v4f, v_fragcoord, SC_Input});
-        put(deco, Op_Decorate, {v_fragcoord, Dec_BuiltIn, BI_FragCoord});
-        iface.push_back(v_fragcoord); return v_fragcoord;
-    }
-    uint32_t fragcoord_component(uint32_t component) {
-        uint32_t value = id(); put(code, Op_Load, {t_v4f, value, fragcoord_var()});
-        uint32_t scalar = id(); put(code, Op_CompositeExtract, {t_f32, scalar, value, component});
-        return bcu(scalar);
-    }
+    uint32_t fragcoord_var();
+    uint32_t fragcoord_component(uint32_t component);
     // DPP16 quad_perm (#273 — DOLL's manual ddx/ddy in its sharpen/AA PSs): the value of `x` at quad
     // lane t = QP[my_lane] is reconstructed as x + (tx-px)·dPdx(x) + (ty-py)·dPdy(x), where (px,py) =
     // (int(gl_FragCoord.xy) & 1) is this invocation's quad position and (tx,ty) = (t&1, t>>1). Exact
@@ -4295,42 +2267,10 @@ struct SpirvCompute {
     // idiom's whole purpose IS ddx/ddy: e.g. `v_sub_f32_dpp v4, v2, v2@[0,0,2,2] qp[1,1,3,3]` =
     // v2@(1,py) - v2@(0,py) = dPdxFine). Fragment-only. CONFIDENCE: MED (render-tested vs a known
     // varying gradient).
-    uint32_t dpp_quad(uint32_t x_bits, uint32_t ctrl) {
-        uint32_t fc = id(); put(code, Op_Load, {t_v4f, fc, fragcoord_var()});
-        uint32_t fx = id(); put(code, Op_CompositeExtract, {t_f32, fx, fc, 0});
-        uint32_t fy = id(); put(code, Op_CompositeExtract, {t_f32, fy, fc, 1});
-        uint32_t pxu = id(); put(code, Op_ConvertFToU, {t_u32, pxu, fx});
-        uint32_t pyu = id(); put(code, Op_ConvertFToU, {t_u32, pyu, fy});
-        uint32_t px = ibin(Op_BitwiseAnd, pxu, uconst(1)), py = ibin(Op_BitwiseAnd, pyu, uconst(1));
-        uint32_t lane = ibin(Op_IAdd, px, ibin(Op_ShiftLeftLogical, py, uconst(1)));
-        uint32_t tsel = uconst((uint32_t)(ctrl & 3u));                 // QP[0] default; select QP[lane]
-        for (uint32_t k = 1; k < 4; k++)
-            tsel = sel(ucmp(Op_IEqual, lane, uconst(k)), uconst((ctrl >> (2 * k)) & 3u), tsel);
-        uint32_t tx = ibin(Op_BitwiseAnd, tsel, uconst(1)), ty = ibin(Op_ShiftRightLogical, tsel, uconst(1));
-        uint32_t xf = bcf(x_bits);
-        uint32_t dx = id(); put(code, Op_DPdx, {t_f32, dx, xf});
-        uint32_t dy = id(); put(code, Op_DPdy, {t_f32, dy, xf});
-        // (tx-px) and (ty-py) as floats (each in {-1,0,1}).
-        uint32_t dtx = id(); put(code, Op_ConvertSToF, {t_f32, dtx, bcs(ibin(Op_ISub, tx, px))});
-        uint32_t dty = id(); put(code, Op_ConvertSToF, {t_f32, dty, bcs(ibin(Op_ISub, ty, py))});
-        uint32_t r0 = id(); put(code, Op_FMul, {t_f32, r0, dtx, dx});
-        uint32_t r1 = id(); put(code, Op_FMul, {t_f32, r1, dty, dy});
-        uint32_t s0 = id(); put(code, Op_FAdd, {t_f32, s0, xf, r0});
-        uint32_t s1 = id(); put(code, Op_FAdd, {t_f32, s1, s0, r1});
-        return bcu(s1);
-    }
+    uint32_t dpp_quad(uint32_t x_bits, uint32_t ctrl);
     // VS: an Output vec4 at Location=loc (EXP PARAM_loc); uses t_ptr_out_v4f from begin_vertex.
-    uint32_t vtx_output(uint32_t loc) {
-        auto it = out_varying.find(loc); if (it != out_varying.end()) return it->second;
-        uint32_t v = id(); put(types, Op_Variable, {t_ptr_out_v4f, v, SC_Output});
-        put(deco, Op_Decorate, {v, Dec_Location, loc});
-        out_varying[loc] = v; iface.push_back(v); return v;
-    }
-    void export_param(uint32_t loc, uint32_t x, uint32_t y, uint32_t z, uint32_t w) {
-        uint32_t v = vtx_output(loc);
-        uint32_t vec = id(); putv(code, Op_CompositeConstruct, {t_v4f, vec, bcf(x), bcf(y), bcf(z), bcf(w)});
-        put(code, Op_Store, {v, vec});
-    }
+    uint32_t vtx_output(uint32_t loc);
+    void export_param(uint32_t loc, uint32_t x, uint32_t y, uint32_t z, uint32_t w);
 
     // Descriptor-free geometry pass-through used when a fragment program asks for AMD's explicit
     // P0/P10/P20 vertex parameters on a Vulkan device without a barycentric/vertex-parameter
@@ -4680,59 +2620,7 @@ struct SpirvCompute {
         return finish();
     }
 
-    std::vector<uint32_t> finish() {
-        if (invalid_cbuf_array_access) return {};
-        if (invocation_guard_merge) {
-            emit_branch(invocation_guard_merge);
-            emit_label(invocation_guard_merge);
-        }
-        put(code, Op_Return, {}); put(code, Op_FunctionEnd, {});
-        // EntryPoint is emitted here (not in begin_*) so lazily-declared Input/Output varyings — added
-        // to `iface` as v_interp / EXP PARAM are encountered — appear in the interface list (SPIR-V 1.3).
-        { std::vector<uint32_t> o{exec_model, f_main}; pstr(o, "main");
-          for (uint32_t v : iface) o.push_back(v); putv(entry, Op_EntryPoint, o); }
-        if (is_compute && compute_min_subgroup_size) {
-            char marker[64];
-            std::snprintf(marker, sizeof marker, "Prosper.ComputeSubgroupMin=%u",
-                          compute_min_subgroup_size);
-            std::vector<uint32_t> words;
-            pstr(words, marker);
-            putv(debug, Op_ModuleProcessed, words);
-        }
-        if (is_fragment && fragment_required_subgroup_size) {
-            char marker[64];
-            std::snprintf(marker, sizeof marker, "Prosper.FragmentSubgroupSize=%u",
-                          fragment_required_subgroup_size);
-            std::vector<uint32_t> words;
-            pstr(words, marker);
-            putv(debug, Op_ModuleProcessed, words);
-            // A SEPARATE marker, not a wider one: a module cached or captured before #2147
-            // carries the size and not this, and a reader must be able to tell 'reasons
-            // unknown' from 'reasons none'. Absent and zero are the same number and opposite
-            // facts -- a zero would assert that nothing required a width this module demands.
-            std::snprintf(marker, sizeof marker, "Prosper.FragmentSubgroupWhy=%u",
-                          fragment_wave_reasons);
-            words.clear();
-            pstr(words, marker);
-            putv(debug, Op_ModuleProcessed, words);
-        }
-        for (const auto& [binding, semantic] : cbuf_zero_pad_candidates) {
-            if (cbuf_ordinary_accesses.count(binding)) continue;
-            char marker[96];
-            const char* token = semantic == StorageBufferTailSemantic::Uint16 ? "u16" :
-                                semantic == StorageBufferTailSemantic::Float16 ? "f16" : nullptr;
-            if (!token) continue;
-            std::snprintf(marker, sizeof marker, "Prosper.StorageBufferZeroPad=%u,%u,2,4,%s",
-                          desc_set, binding, token);
-            std::vector<uint32_t> words;
-            pstr(words, marker);
-            putv(debug, Op_ModuleProcessed, words);
-        }
-        std::vector<uint32_t> m{0x07230203u, 0x00010300u, 0u, next_id, 0u};
-        for (auto* s : {&caps, &exts, &extimp, &mem, &entry, &exec, &debug, &deco, &types, &code})
-            m.insert(m.end(), s->begin(), s->end());
-        return m;
-    }
+    std::vector<uint32_t> finish();
 };
 
 // Machine state during recompilation: the VGPR and SGPR files (VGPR/SGPR number -> current SSA bits
