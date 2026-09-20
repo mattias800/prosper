@@ -548,6 +548,23 @@ int main() {
                   ta->completed_producer != second_a.completed,
               "lineage: new work after invalidation gets a distinct producer");
         if (ta) {
+            // A CPU upload into a retained image followed by a partial draw cannot inherit the
+            // earlier renderer version, even when the allocation and guest target stay the same.
+            std::vector<uint8_t> seed(bytes, 0x6b);
+            test::BackendDraw partial;
+            partial.vs.assign(kTriVertSpv, kTriVertSpv + sizeof(kTriVertSpv) / 4);
+            partial.fs.assign(kTriFragSpv, kTriFragSpv + sizeof(kTriFragSpv) / 4);
+            test::BackendColorTarget seeded_target;
+            seeded_target.persistent_id = a;
+            seeded_target.load_existing = true;
+            seeded_target.readback = false;
+            test::render_draws_rgba({partial}, W, H, seed.data(), nullptr, false,
+                                    &seeded_target, nullptr, nullptr, nullptr, nullptr, true,
+                                    nullptr, false);
+            CHECK(!test::persistent_color_producer_source(*ta).known(),
+                  "lineage: CPU-seeded partial draw cannot inherit old completed work");
+        }
+        if (ta) {
             const auto ticket = test::begin_color_producer_write(*ta);
             test::BackendSubmissionBatch discarded;
             discarded.add_color_completion({ta, ticket, true});

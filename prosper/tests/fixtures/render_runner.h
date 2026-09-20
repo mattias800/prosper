@@ -7163,7 +7163,13 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             return d.ps->color_targets[slot].write_mask != 0;
         });
         if (!cleared && !draw_writes) continue;
-        producer_lineage_proven[slot] = cleared || retained->completed_producer.known();
+        // A CPU seed replaces the old image contents before the pass. Its provenance is unknown
+        // even when the same allocation previously held a completed renderer version.
+        const bool loaded_known_image = retained->completed_producer.known() &&
+            (slot == 0 ? load_cached_color :
+             slot == 1 ? load_cached_color1 :
+             load_extra[slot] && !(color_target && color_target->seed_slots[slot]));
+        producer_lineage_proven[slot] = cleared || loaded_known_image;
         producer_tickets[slot] = begin_color_producer_write(*retained);
     }
     att[ds_attachment].format = DFMT; att[ds_attachment].samples = VK_SAMPLE_COUNT_1_BIT;
