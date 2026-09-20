@@ -32,7 +32,7 @@ Last updated: 2026-08-28
 | *GRIS* | `PPSA09804` | Unity / IL2CPP | ✅ Opening gameplay | [#1869](https://github.com/mattias800/prosper/issues/1869) |
 | *Space Adventure Cobra — The Awakening* | `PPSA17337` | Unity / IL2CPP | 🚧 Tutorial combat on the reviewed revision. The black-frame regression is **fixed**: the route that produced one uniformly black frame now produces 26 of 26 pixel-distinct composited frames. The `cobra-gameplay` guard is **still red** on structure alone, and the scene draws **without its HUD and with a seam in the sky** ([#2899](https://github.com/mattias800/prosper/issues/2899)) | [#1870](https://github.com/mattias800/prosper/issues/1870) |
 | *Sonic Origins* | `PPSA05325` | Hedgehog Engine | 🚧 4K title screen on a one-button route; a default launch stops at the game's own auto-save notice, which waits for Cross | [#1871](https://github.com/mattias800/prosper/issues/1871) |
-| *Sonic Frontiers* | `PPSA03831` | Hedgehog Engine 2 (Needle) | 🚧 Full 4K opening sequence, title screen and main menu; a route reaches Cyber Space gameplay in the guest, but the world does not render behind the HUD | [#1891](https://github.com/mattias800/prosper/issues/1891) |
+| *Sonic Frontiers* | `PPSA03831` | Hedgehog Engine 2 (Needle) | 🚧 Full 4K opening sequence, title screen and main menu; a route reaches Cyber Space gameplay and the world now renders — 84% of the frame is lit with a correct HUD — but a saturated band dominates the middle of it, so the scene is not yet recognisable | [#1891](https://github.com/mattias800/prosper/issues/1891) |
 | *Sonic Racing: CrossWorlds* | `PPSA08804` | Unreal Engine 5 | 🔬 4K title screen and menus with a pad route; needs input to advance past the logos | [#1895](https://github.com/mattias800/prosper/issues/1895) |
 | *Terminator 2D: NO FATE* | `PPSA25872` | Unity / IL2CPP | ✅ Main menu and attract-mode gameplay | [#1872](https://github.com/mattias800/prosper/issues/1872) |
 | *Blue Prince* | `PPSA25009` | Unity | 🚧 Manor entrance-hall gameplay | [#1808](https://github.com/mattias800/prosper/issues/1808) |
@@ -315,9 +315,19 @@ An input route now takes the title past the menu into gameplay:
 clears the twelve-page boot notice queue that a no-input arm sits behind forever, moves the
 main-menu cursor from "Extras" to "New Game", and reaches `GameModeStage` on the Cyber Space stage
 `w6d01` — one hundred streamed terrain sectors, the stage HUD, Cyber Space BGM, and a stage clock
-that runs. **The world behind that HUD is black**: sixteen of the stage's thirty-two compute
-programs never execute, three of them full-screen passes over the scene target
-([#2790](https://github.com/mattias800/prosper/issues/2790)). That is the frontier for this title,
+that runs. **The world behind that HUD now renders, and is spoiled by one defect rather than absent.**
+Measured 2026-09-20 against a PS5 oracle of the same moment: 84% of the frame is lit and the HUD,
+ring counter and stage clock are correct, but 42% of the pixels are clipped to white in a saturated
+band across the middle, where the oracle clips **none** and never exceeds p90 luminance 179. The
+band enters at exactly one submit in the post-process chain. The older reading — "sixteen of
+thirty-two compute programs never execute" — is superseded: a live routed run now reports **zero**
+compute skips ([#3717](https://github.com/mattias800/prosper/pull/3717),
+[#3726](https://github.com/mattias800/prosper/pull/3726),
+[#3740](https://github.com/mattias800/prosper/pull/3740)), and admitting those programs left the
+frame byte-identical, which is what removed them from the suspect list
+([#2790](https://github.com/mattias800/prosper/issues/2790)). It stays at rung 2 because the bar is
+a scene a person would recognise as the game and this one is not yet, degraded though that bar
+deliberately is. That is the frontier for this title,
 and the Needle stack is shared with *Sonic Origins* and *Sonic Racing: CrossWorlds*. See
 [`docs/SONIC_FRONTIERS_STATUS.md`](prosper/docs/SONIC_FRONTIERS_STATUS.md) and the
 [tracker](https://github.com/mattias800/prosper/issues/1891).
