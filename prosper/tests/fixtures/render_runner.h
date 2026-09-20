@@ -2589,6 +2589,18 @@ inline bool pin_persistent_color_target(uint64_t id, uint32_t width, uint32_t he
     return true;
 }
 
+// A full overwrite can use the exact old allocation even after guest-write invalidation. This
+// pin grants no read authority: callers must replace every texel before marking it valid again.
+inline bool pin_persistent_color_target_for_overwrite(
+    uint64_t id, uint32_t width, uint32_t height, VkFormat format) {
+    PersistentColorTargetImage* target = find_persistent_color_target(
+        id, width, height, backend_color_format(format), false);
+    if (!target || !target->image || target->layout == VK_IMAGE_LAYOUT_UNDEFINED ||
+        target->pin_count == UINT32_MAX) return false;
+    ++target->pin_count;
+    return true;
+}
+
 inline bool unpin_persistent_color_target(uint64_t id, uint32_t width, uint32_t height,
                                           VkFormat format) {
     auto& cache = persistent_color_target_cache();

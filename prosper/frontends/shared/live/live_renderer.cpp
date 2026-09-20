@@ -1784,10 +1784,65 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             prosper::test::unpin_persistent_color_target(addr, pin.width, pin.height, pin.format);
             if (--pin.count == 0) pinned_imports.erase(pinned);
         });
+    prosper::gpu::set_live_target_image_destination_borrower(
+        [invalidate_ds, direct_bind](uint64_t addr,
+                        const prosper::gpu::LiveTargetImageDestinationRequest& request,
+                        prosper::gpu::LiveTargetImageImport& destination) {
+            if (!direct_bind) return false;
+            drain_guest_gpu_writes(g_rtt, invalidate_ds);
+            auto it = g_rtt.find(addr);
+            if (it == g_rtt.end() || !request.width || !request.height ||
+                it->second.w != request.width || it->second.h != request.height)
+                return false;
+            const VkFormat format = prosper::frontend::live_target_pixel_format_vk(request.format);
+            if (format == VK_FORMAT_UNDEFINED ||
+                prosper::test::backend_color_format(it->second.format) != format)
+                return false;
+            const prosper::test::RenderVkCtx& ctx = prosper::test::render_vk_ctx();
+            if (!ctx.ok) return false;
+            auto* target = prosper::test::find_persistent_color_target(
+                addr, request.width, request.height, format, false);
+            if (!target || !target->image || target->layout == VK_IMAGE_LAYOUT_UNDEFINED ||
+                !prosper::test::pin_persistent_color_target_for_overwrite(
+                    addr, request.width, request.height, format))
+                return false;
+            PinnedImport& pin = pinned_imports[addr];
+            if (pin.count && (pin.width != request.width || pin.height != request.height ||
+                              pin.format != format)) {
+                prosper::test::unpin_persistent_color_target(addr, request.width,
+                                                               request.height, format);
+                return false;
+            }
+            pin = {request.width, request.height, format, pin.count + 1};
+            destination.width = request.width;
+            destination.height = request.height;
+            destination.format = request.format;
+            destination.native_format = static_cast<uint32_t>(format);
+            destination.image = target->image;
+            destination.device = ctx.dev;
+            destination.layout = static_cast<uint32_t>(target->layout);
+            destination.transfer_dst = true; // persistent color images have TRANSFER_DST usage
+            return true;
+        },
+        [](uint64_t addr, const prosper::gpu::LiveTargetImageImport& destination) {
+            const VkFormat format = prosper::frontend::live_target_pixel_format_vk(destination.format);
+            auto* target = prosper::test::find_persistent_color_target(
+                addr, destination.width, destination.height, format, false);
+            if (!target || target->image != destination.image) return;
+            target->valid = false;
+            auto it = g_rtt.find(addr);
+            if (it != g_rtt.end() && it->second.w == destination.width &&
+                it->second.h == destination.height &&
+                prosper::test::backend_color_format(it->second.format) == format)
+                it->second.gpu_valid = false;
+        });
     prosper::gpu::set_live_target_image_written_notifier(
         [invalidate_ds](const prosper::gpu::LiveTargetImageWrite& write) {
             auto it = g_rtt.find(write.gpu_addr);
-            if (it == g_rtt.end() && !write.linear_pixels) return;
+            // A prior completion in this dispatch may have drained and erased this CPU registry
+            // entry. An exact pinned destination image still proves which allocation was copied;
+            // older address-only mirrors retain the stricter existing-entry requirement.
+            if (it == g_rtt.end() && !write.linear_pixels && !write.mirrored_image) return;
             // Name the write's format exhaustively. Reporting an unmapped format as RGBA8 does not
             // merely mislabel it: the mirror-identity check below then rejects a target the compute
             // dispatch really did write, the entry stays invalidated by the ordinary guest-write
@@ -1803,6 +1858,11 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     write.gpu_addr, write.width, write.height,
                     static_cast<uint32_t>(format)))
                 return;
+            if (write.mirrored_image) {
+                auto* target = prosper::test::find_persistent_color_target(
+                    write.gpu_addr, write.width, write.height, format, false);
+                if (!target || target->image != write.mirrored_image) return;
+            }
 
             // The compute backend also wrote exact guest bytes. Process that ordinary notification
             // first so every color/depth/view alias becomes stale, then restore only the persistent
@@ -1825,6 +1885,11 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 published.guest_format = format;
                 published.gpu_valid = false;
                 return;
+            }
+            if (write.mirrored_image) {
+                auto* target = prosper::test::find_persistent_color_target(
+                    write.gpu_addr, write.width, write.height, format, false);
+                if (!target || target->image != write.mirrored_image) return;
             }
             if (!prosper::test::restore_persistent_color_target_after_mirrored_write(
                     write.gpu_addr, write.width, write.height, format)) {

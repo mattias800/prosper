@@ -11370,11 +11370,19 @@ void set_live_target_reader(LiveTargetReaderFn fn) { g_live_target_reader = std:
 
 static LiveTargetImageImportFn g_live_target_image_import;
 static LiveTargetImageReleaseFn g_live_target_image_release;
+static LiveTargetImageDestinationFn g_live_target_image_destination;
+static LiveTargetImageDestinationInvalidateFn g_live_target_image_destination_invalidate;
 static LiveTargetImageWrittenFn g_live_target_image_written;
 void set_live_target_image_importer(LiveTargetImageImportFn import_fn,
                                     LiveTargetImageReleaseFn release_fn) {
     g_live_target_image_import = std::move(import_fn);
     g_live_target_image_release = std::move(release_fn);
+}
+void set_live_target_image_destination_borrower(
+    LiveTargetImageDestinationFn destination_fn,
+    LiveTargetImageDestinationInvalidateFn invalidate_fn) {
+    g_live_target_image_destination = std::move(destination_fn);
+    g_live_target_image_destination_invalidate = std::move(invalidate_fn);
 }
 void set_live_target_image_written_notifier(LiveTargetImageWrittenFn written_fn) {
     g_live_target_image_written = std::move(written_fn);
@@ -11405,6 +11413,27 @@ bool import_live_render_target_image(uint64_t gpu_addr, const LiveTargetImageReq
         return false;
     }
     return true;
+}
+bool borrow_live_render_target_image_destination(
+    uint64_t gpu_addr, const LiveTargetImageDestinationRequest& request,
+    LiveTargetImageImport& destination) {
+    destination = LiveTargetImageImport{};
+    if (!g_live_target_image_destination) return false;
+    if (!g_live_target_image_destination(gpu_addr, request, destination)) {
+        destination = LiveTargetImageImport{};
+        return false;
+    }
+    if (!destination.valid()) {
+        release_live_render_target_image(gpu_addr);
+        destination = LiveTargetImageImport{};
+        return false;
+    }
+    return true;
+}
+void invalidate_live_render_target_image_destination(
+    uint64_t gpu_addr, const LiveTargetImageImport& destination) {
+    if (g_live_target_image_destination_invalidate && destination.valid())
+        g_live_target_image_destination_invalidate(gpu_addr, destination);
 }
 void release_live_render_target_image(uint64_t gpu_addr) {
     if (g_live_target_image_release) g_live_target_image_release(gpu_addr);

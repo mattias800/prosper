@@ -38,6 +38,56 @@ LD_PRELOAD=$PWD/probe.so PROSPER_MEMCPY_PROBE_DIR=$PWD \
 sort -k2 -rn memcpy-sites-<pid>.txt | head -20
 ```
 
+## Attribute one OS thread (opt-in)
+
+The normal report deliberately keeps its existing process-wide schema. For a serial-path question,
+set exactly one of these before launch:
+
+```bash
+# Only when the target TID is already known before launch.
+PROSPER_MEMCPY_PROBE_TID=<TID>
+
+# Normal routed case: leave this path absent before launch. The parent atomically publishes one
+# decimal TID after its CPU-delta selection, then verifies that TID's identity/liveness at the end
+# of the run.
+PROSPER_MEMCPY_PROBE_TID_FILE=<RUN>/selected-tid
+```
+
+File mode is polled by the reporter once per second only while it is waiting, never by the copy
+hot path. It latches the first valid positive decimal TID forever; later file changes cannot
+redirect a run. Before that latch, calls are deliberately skipped; the report calls that period
+`preselection_skipped_calls=unobserved` because counting it would add contention to every copy. A
+filtered report carries `probe_mode=tid-filter`, `target_tid`, `observed_tid`, and a `tid` column on every
+caller row. `observed_tid != target_tid`, a nonzero `overflow_calls`, an invalid-file count, or a
+preselection period covering the window of interest makes full attribution unavailable.
+
+The filter checks a TLS-cached `gettid`; it does not make a syscall, open a file or inspect `/proc`
+per copy. Non-target threads call the real libc function without the timestamp/table work. Counts,
+bytes and return-address attribution in this mode are for that selected TID only. The cycle column
+is still elapsed TSC and **not latency, FPS, or process CPU time**.
+
+Resolve the recorded address according to the DSO's ELF type, not by applying one formula to every
+binary. Check with `readelf -hW <dso>`. For the current `prosper-app`, an `ET_EXEC` image with an
+image base of `0x200000`, pass the **raw `return_address - 1`** from the report to
+`addr2line -e <dso> -f -C -i`; do not substitute `dso_offset`. For an ordinary PIE or shared
+`ET_DYN` object, use the load-relative `dso_offset - 1`. If its loadable segments have nonzero
+virtual addresses, first establish the actual load bias and use `raw_return_address - load_bias -
+1` instead. The subtraction identifies the call instruction rather than its return address.
+
+Run the native controls (shim and CPU-only test program only) with:
+
+```bash
+tools/memcpy_probe/test_tid_filter.sh
+```
+
+They prove the default report remains process-wide, two workers executing the same call site can be
+selected separately by their actual OS TID, each selected arm reports exactly 50,000 calls with no
+overflow, and an invalid target refuses rather than silently falling back to process-wide output.
+That separation is the point of a serial-path investigation: an older process-wide copy result
+from parallel workers cannot establish that the selected serial render thread has the same cost or
+the same callers. It is attribution evidence only; it does not by itself show which current cost
+is avoidable.
+
 `PROSPER_MEMCPY_PROBE_BIG_BYTES` (default 1 MiB) also captures a short `backtrace()` for copies at
 or above that size — useful when the return address lands in a runtime thunk rather than in
 prosper. It unwinds from this probe's frame, so glibc's missing frame pointer does not apply to it;
