@@ -65,6 +65,30 @@ def _need_clang() -> None:
     ci = _ci
 
 
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
+
+
+def inside_repo(path: pathlib.Path) -> pathlib.Path:
+    """Resolve PATH and refuse it if it escapes the checkout.
+
+    These tools are driven by AGENTS with generated arguments, not only by a human typing a known
+    path -- that is the normal case in this repository, not a hypothetical. `--group` takes a path
+    and the apply step does `mkdir(parents=True)` then `write_text` on it, so a `..` that arrived
+    from a parsed symbol name, an issue body or a templated command would create directories and
+    write files anywhere the process can reach, silently and with a zero exit status.
+
+    Containment is the whole fix and it costs one resolve() per path. A developer who genuinely
+    wants to write outside the checkout can copy the file afterwards; nothing legitimate here needs
+    it, and the refusal names what it saw."""
+    resolved = path.expanduser().resolve()
+    try:
+        resolved.relative_to(REPO_ROOT)
+    except ValueError:
+        sys.exit(f"refusing a path outside the checkout: {path}\n"
+                 f"  resolved to {resolved}\n  checkout is {REPO_ROOT}")
+    return resolved
+
+
 IDENT = r"[A-Za-z_][A-Za-z0-9_]*"
 
 
@@ -270,6 +294,16 @@ def selftest() -> int:
     check("already qualified is not re-qualified", qualify("void C::foo(int)", "foo", "C"), None)
     check("absent declarator refuses", qualify("void bar(int)", "foo", "C"), None)
 
+    print("-- inside_repo (these tools are driven by agents with generated paths) --")
+    ok_path = inside_repo(pathlib.Path("prosper/tools/refactor/outline_methods.py"))
+    check("a path inside the checkout resolves", str(ok_path).startswith(str(REPO_ROOT)), True)
+    for bad in ("../../../etc/passwd", "/etc/passwd", "prosper/../../outside.cpp"):
+        try:
+            inside_repo(pathlib.Path(bad))
+            check(f"refuses {bad}", "accepted", "refused")
+        except SystemExit:
+            check(f"refuses {bad}", True, True)
+
     print("-- qualify_return_type --")
     check("nested return type is qualified",
           qualify_return_type("U64PairAdd foo(int)", "C", {"U64PairAdd"}), "C::U64PairAdd foo(int)")
@@ -331,6 +365,9 @@ def main() -> int:
     if not args.header or not args.cls:
         sys.exit("--header and --class are required")
 
+    args.header = inside_repo(args.header)
+    if args.out:
+        args.out = inside_repo(args.out)
     text, picked, refused, nested = find_methods(args.header, args.cls, args.build, args.min_lines)
     picked.sort(key=lambda r: -r["lines"])
     if args.limit:
@@ -368,7 +405,9 @@ def main() -> int:
     groups = []
     for g in args.group:
         path, _, pattern = g.partition("=")
-        groups.append((pathlib.Path(path), re.compile(pattern)))
+        if not pattern:
+            sys.exit(f"--group needs PATH=REGEX, got {g!r}")
+        groups.append((inside_repo(pathlib.Path(path)), re.compile(pattern)))
     if not groups:
         groups = [(args.out, re.compile(".*"))]
 
