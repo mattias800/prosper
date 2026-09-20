@@ -6022,7 +6022,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         if (is_cube && !rtt_hit && !resource_compute_depth_hybrid &&
                             !fr.is_storage_image && r.depth == 6u &&
                             prosper::test::is_retained_ds_plane(r.gpu_addr)) {
+                            static const bool mapped_depth_cube =
+                                std::getenv("PROSPER_NO_MAPPED_DEPTH_CUBE") == nullptr;
                             std::array<std::vector<float>, 6> faces;
+                            std::array<prosper::test::PersistentDsDepthReadback, 6> mapped_faces;
                             uint32_t slices_found = 0;
                             std::string cube_error;
                             // Publish the consumer descriptor's layer stride so the DS invalidation
@@ -6039,9 +6042,13 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             // missing faces retain the independent guest fallback below. A failure
                             // must not publish a cache entry under the selected renderer generation.
                             const bool readback_ok = retained_depth_cube_cache_candidate &&
-                                prosper::test::read_persistent_ds_cube_depth(
-                                    r.gpu_addr, tw, th, faces, slices_found, cube_error,
-                                    &present_mask, &known_mask);
+                                (mapped_depth_cube
+                                    ? prosper::test::read_persistent_ds_cube_depth_mapped(
+                                          r.gpu_addr, tw, th, mapped_faces, slices_found,
+                                          cube_error, &present_mask, &known_mask)
+                                    : prosper::test::read_persistent_ds_cube_depth(
+                                          r.gpu_addr, tw, th, faces, slices_found, cube_error,
+                                          &present_mask, &known_mask));
                             // Residency DISTRIBUTION, not a first-sight snapshot. "1 of 6 faces"
                             // seen once is consistent with three different worlds: the guest
                             // amortises faces across frames, prosper's invalidation evicts them
@@ -6097,20 +6104,29 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     return r.gpu_addr + static_cast<uint64_t>(face) * stride;
                                 };
                                 for (uint32_t face = 0; face < 6u; ++face) {
-                                    const std::vector<float>& src = faces[face];
                                     uint8_t* dst = texture_pixels.data() +
                                         static_cast<size_t>(face) * tw * th * 4u;
-                                    if (!src.empty()) {
-                                        for (size_t i = 0; i < static_cast<size_t>(tw) * th &&
-                                                           i < src.size(); ++i) {
-                                            float d = src[i];
-                                            d = d < 0.0f ? 0.0f : (d > 1.0f ? 1.0f : d);
-                                            const uint8_t q = static_cast<uint8_t>(d * 255.0f + 0.5f);
-                                            dst[i * 4 + 0] = q;
-                                            dst[i * 4 + 1] = q;
-                                            dst[i * 4 + 2] = q;
-                                            dst[i * 4 + 3] = 0xffu;
-                                        }
+                                    const bool retained_face = mapped_depth_cube
+                                        ? mapped_faces[face].valid() : !faces[face].empty();
+                                    if (retained_face) {
+                                        const size_t count = mapped_depth_cube
+                                            ? mapped_faces[face].count : faces[face].size();
+                                        const size_t pixels = std::min(static_cast<size_t>(tw) * th, count);
+                                        auto quantize = [&](auto read_depth) {
+                                            for (size_t i = 0; i < pixels; ++i) {
+                                                float d = read_depth(i);
+                                                d = d < 0.0f ? 0.0f : (d > 1.0f ? 1.0f : d);
+                                                const uint8_t q = static_cast<uint8_t>(d * 255.0f + 0.5f);
+                                                dst[i * 4 + 0] = q;
+                                                dst[i * 4 + 1] = q;
+                                                dst[i * 4 + 2] = q;
+                                                dst[i * 4 + 3] = 0xffu;
+                                            }
+                                        };
+                                        if (mapped_depth_cube)
+                                            quantize([&](size_t i) { return mapped_faces[face].at(i); });
+                                        else
+                                            quantize([&](size_t i) { return faces[face][i]; });
                                     } else {
                                         const uint32_t source_bpt = bpt ? bpt : 2u;
                                         const size_t linear_bytes = static_cast<size_t>(tw) * th * source_bpt;
@@ -6149,7 +6165,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 renderer_cube_snapshot_ready = depth_cube_source_layout_valid &&
                                     present_mask == retained_depth_cube.present_mask;
                                 for (uint32_t face = 0; face < 6; ++face)
-                                    renderer_cube_snapshot_ready &= faces[face].size() ==
+                                    renderer_cube_snapshot_ready &= (mapped_depth_cube
+                                        ? mapped_faces[face].count : faces[face].size()) ==
                                         ((present_mask & (1u << face)) ? static_cast<size_t>(tw) * th : 0);
                                 cube_depth_bridged = true;
                                 rtt_hit = true;          // do not overwrite with a guest-byte decode
@@ -6432,33 +6449,44 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             }
                             if (is_cube) cube_done = true; else array_done = true;
                             if (resource_compute_depth_hybrid && !decoded_reuse) {
+                                static const bool mapped_depth_cube =
+                                    std::getenv("PROSPER_NO_MAPPED_DEPTH_CUBE") == nullptr;
                                 std::array<std::vector<float>, 6> overlay_faces;
+                                std::array<prosper::test::PersistentDsDepthReadback, 6> mapped_faces;
                                 uint32_t overlay_mask = 0, known_mask = 0;
                                 std::string overlay_error;
-                                const bool overlay_ok =
-                                    prosper::test::read_persistent_ds_cube_depth_after(
-                                        r.gpu_addr, tw, th,
-                                        resource_compute_producer_order,
-                                        overlay_faces, overlay_mask, known_mask,
-                                        overlay_error);
+                                const bool overlay_ok = mapped_depth_cube
+                                    ? prosper::test::read_persistent_ds_cube_depth_after_mapped(
+                                          r.gpu_addr, tw, th, resource_compute_producer_order,
+                                          mapped_faces, overlay_mask, known_mask, overlay_error)
+                                    : prosper::test::read_persistent_ds_cube_depth_after(
+                                          r.gpu_addr, tw, th, resource_compute_producer_order,
+                                          overlay_faces, overlay_mask, known_mask, overlay_error);
                                 if (overlay_ok && overlay_mask ==
                                         resource_compute_depth_overlay_mask) {
                                     for (uint32_t face = 0; face < 6u; ++face) {
                                         if (!(overlay_mask & (1u << face))) continue;
-                                        const std::vector<float>& src = overlay_faces[face];
                                         uint8_t* dst = texture_pixels.data() +
                                             static_cast<size_t>(face) * tw * th * 4u;
-                                        for (size_t i = 0;
-                                             i < static_cast<size_t>(tw) * th && i < src.size();
-                                             ++i) {
-                                            const float d = std::clamp(src[i], 0.0f, 1.0f);
-                                            const uint8_t q = static_cast<uint8_t>(
-                                                d * 255.0f + 0.5f);
-                                            dst[i * 4 + 0] = q;
-                                            dst[i * 4 + 1] = q;
-                                            dst[i * 4 + 2] = q;
-                                            dst[i * 4 + 3] = 0xffu;
-                                        }
+                                        const size_t count = mapped_depth_cube
+                                            ? mapped_faces[face].count : overlay_faces[face].size();
+                                        auto quantize = [&](auto read_depth) {
+                                            for (size_t i = 0;
+                                                 i < static_cast<size_t>(tw) * th && i < count;
+                                                 ++i) {
+                                                const float d = std::clamp(read_depth(i), 0.0f, 1.0f);
+                                                const uint8_t q = static_cast<uint8_t>(
+                                                    d * 255.0f + 0.5f);
+                                                dst[i * 4 + 0] = q;
+                                                dst[i * 4 + 1] = q;
+                                                dst[i * 4 + 2] = q;
+                                                dst[i * 4 + 3] = 0xffu;
+                                            }
+                                        };
+                                        if (mapped_depth_cube)
+                                            quantize([&](size_t i) { return mapped_faces[face].at(i); });
+                                        else
+                                            quantize([&](size_t i) { return overlay_faces[face][i]; });
                                     }
                                     static std::mutex hybrid_log_mutex;
                                     static std::map<uint64_t, uint64_t> hybrid_counts;
