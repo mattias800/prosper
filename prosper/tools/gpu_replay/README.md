@@ -386,6 +386,26 @@ render-state resolve, executor ordering, detile) — it is the right guard for c
 ./build-linux/gpu_replay --dump-failed-shader 0:1 /tmp/failed-fragment.bin /tmp/submit.prgcap
 ```
 
+### Two silent wrong answers when you bisect a MULTI-TARGET chain
+
+Both of these return a plausible number rather than an error, which is what makes them expensive.
+Measured on *Sonic Frontiers*' post-process submit, 2026-09-20 (#2790).
+
+- **`--draw-steps` and `--draw 0:N` dump whichever render target the range ENDS on**, not a fixed
+  surface. On a post-process chain that writes a bloom pyramid, a pair of 2x1 adaptation targets and
+  then a 4K composite, sweeping `N` therefore reports a different *surface* at each step. The
+  sequence looks like a bisection and is not one: a sweep over one such chain read 44.20%, 51.11%,
+  0.06%, 100.00%, 54.55%, 44.03% non-black, where the 0.06% is a 960x540 intermediate and the
+  100.00% is a 2x1 exposure value scaled up. **Use `--output-target-after OP:ADDR` against one fixed
+  address** when you want one surface over time, and use the per-submit form
+  (`--bundle-through-submit N` with an output bmp) when you want the composite.
+- **`--dump-rtt-seed` writes a BMP, not raw floats.** The file begins `42 4d` (`BM`) and carries a
+  54-byte header, so a 2x1 `rgba16f` seed lands as a 62-byte file of 8-bit BGR. Decoding it as
+  `float16` yields numbers that look like plausible HDR values — it produced an apparent exposure of
+  `21.03` here, which was the header. For raw texels use `--dump-resource DRAW:ps:BINDING`, and note
+  that dumps the CAPTURE's copy, which is all zeros for a surface whose content lives in the seed
+  (`nz=0` on the `--inspect-only` line tells you that before you spend the run).
+
 ## Per-draw "fragment funnel" — `PROSPER_DRAW_STATS` (first thing to run on a missing/wrong draw)
 
 ```bash
