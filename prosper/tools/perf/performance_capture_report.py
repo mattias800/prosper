@@ -605,8 +605,8 @@ def _compute_launch_shapes(records):
             key = (tuple(groups), tuple(local), row["indirect"])
             shapes[key] = shapes.get(key, 0) + row["dispatches"]
         dispatches = record.get("dispatches", 0)
-        if type(dispatches) is not int or dispatches < 0 or row_total + record_overflow > dispatches:
-            raise CaptureError("compute dispatch-shape population exceeds batch dispatches")
+        if type(dispatches) is not int or dispatches < 0 or row_total + record_overflow != dispatches:
+            raise CaptureError("compute dispatch-shape population does not match batch dispatches")
 
     ordered = sorted(({
         "groups": groups, "local": local, "indirect": indirect, "dispatches": dispatches,

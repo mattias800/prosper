@@ -1046,7 +1046,15 @@ class ComputeDecompositionTests(unittest.TestCase):
                          dispatch_shapes=[{"groups": [1, 1, 1], "local": [1, 1, 1],
                                            "dispatches": 2, "indirect": True}],
                          dispatch_shape_overflow=0)
-        with self.assertRaisesRegex(CaptureError, "exceeds batch dispatches"):
+        with self.assertRaisesRegex(CaptureError, "does not match batch dispatches"):
+            summarize(capture(SAMPLES, compute=[malformed]))
+
+    def test_launch_shape_population_cannot_omit_dispatches(self):
+        malformed = dict(HIDDEN_COST_COMPUTE[0], dispatches=3,
+                         dispatch_shapes=[{"groups": [1, 1, 1], "local": [1, 1, 1],
+                                           "dispatches": 2, "indirect": False}],
+                         dispatch_shape_overflow=0)
+        with self.assertRaisesRegex(CaptureError, "does not match batch dispatches"):
             summarize(capture(SAMPLES, compute=[malformed]))
 
 
