@@ -386,6 +386,29 @@ render-state resolve, executor ordering, detile) — it is the right guard for c
 ./build-linux/gpu_replay --dump-failed-shader 0:1 /tmp/failed-fragment.bin /tmp/submit.prgcap
 ```
 
+### Three more silent wrong answers, all measured on one investigation (#2790, 2026-09-20)
+
+- **`--override-resource` does nothing to a surface the frame PRODUCES, and says it did something.**
+  It rewrites the capture's stored copy; the draw reads the in-frame result. Overriding one input
+  with `0.0`, `0.5` and `1.0` returned byte-identical frames — which reads as "this input does not
+  matter" and is really "the lever is dead". It prints `[resource-override] … original-hash=… →
+  new-hash=…`, so the log looks like confirmation. **Always pair it with a control whose effect is
+  not in doubt** (override the tonemap's HDR input with zeros; the frame must go black). Use it for
+  surfaces the frame consumes without producing; for a mid-frame surface, bisect with
+  `--output-target-after` instead.
+- **`--output-target-after OP:ADDR` numbers `OP` by DRAW ORDINAL, and computes shift it.** The same
+  frame reported `operation 27 draw=26` in one place and `operation 19 draw=19` in another, because
+  two dispatches sit between. It **errors** when the named operation does not write that address
+  (`does not write addr=…`), which is what catches an off-by-one — but a wrong-yet-valid ordinal
+  dumps a real image of the wrong moment. Read the error, and cross-check against `item=` on the
+  `--inspect-only` draw line.
+- **`PROSPER_DEPTH_DUMP` and `PROSPER_STENCIL_DUMP` can produce nothing at all, silently.** They
+  iterate `snapshot_persistent_ds_images`; when that returns success with an empty seed list the
+  loop body never runs, so there is no output and no "snapshot failed" line either. An empty run
+  directory is therefore not evidence that the frame has no depth. To read a depth surface in a
+  bundle, use `--bundle-ds-summary` / `--bundle-find-ds ADDR` for its identity and write history,
+  and de-tile a captured copy with `prosper::gpu::detile_surface` for its contents.
+
 ### Two silent wrong answers when you bisect a MULTI-TARGET chain
 
 Both of these return a plausible number rather than an error, which is what makes them expensive.
