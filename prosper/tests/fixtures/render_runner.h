@@ -5610,6 +5610,20 @@ struct PersistentDsDepthReadback {
     }
 };
 
+// The direct path keeps every selected face's transfer allocation mapped through conversion.
+// Large cubes use the sequential vector readback to limit concurrent staging payload. The
+// device's actual VkMemoryRequirements::size may exceed this logical payload after alignment, so
+// this is not an exact Vulkan allocation budget or a device-specific feature assumption.
+inline bool mapped_depth_cube_payload_within_limit(uint32_t width, uint32_t height,
+                                                    uint32_t present_mask) {
+    constexpr size_t kMaxConcurrentReadbackPayloadBytes = 64u << 20;
+    unsigned faces = 0;
+    for (uint32_t bit = 0; bit < 6; ++bit) faces += (present_mask >> bit) & 1u;
+    if (!width || !height || !faces) return false;
+    const size_t per_face_limit = kMaxConcurrentReadbackPayloadBytes / faces;
+    return static_cast<size_t>(width) <= per_face_limit / sizeof(float) / height;
+}
+
 inline bool read_persistent_ds_depth(PersistentDsImage& image, uint32_t width, uint32_t height,
                                      std::vector<float>& out, std::string& error) {
     out.clear();

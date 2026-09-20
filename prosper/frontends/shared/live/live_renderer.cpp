@@ -6036,13 +6036,15 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                                                     r.layer_stride_bytes);
                             uint32_t present_mask = retained_depth_cube.present_mask;
                             uint32_t known_mask = retained_depth_cube.known_mask;
+                            const bool use_mapped_depth_cube = mapped_depth_cube &&
+                                prosper::test::mapped_depth_cube_payload_within_limit(tw, th, present_mask);
                             for (uint32_t face = 0; face < 6u; ++face)
                                 slices_found += (present_mask >> face) & 1u;
                             // Selection above is metadata-only. Read every selected renderer face;
                             // missing faces retain the independent guest fallback below. A failure
                             // must not publish a cache entry under the selected renderer generation.
                             const bool readback_ok = retained_depth_cube_cache_candidate &&
-                                (mapped_depth_cube
+                                (use_mapped_depth_cube
                                     ? prosper::test::read_persistent_ds_cube_depth_mapped(
                                           r.gpu_addr, tw, th, mapped_faces, slices_found,
                                           cube_error, &present_mask, &known_mask)
@@ -6106,10 +6108,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 for (uint32_t face = 0; face < 6u; ++face) {
                                     uint8_t* dst = texture_pixels.data() +
                                         static_cast<size_t>(face) * tw * th * 4u;
-                                    const bool retained_face = mapped_depth_cube
+                                    const bool retained_face = use_mapped_depth_cube
                                         ? mapped_faces[face].valid() : !faces[face].empty();
                                     if (retained_face) {
-                                        const size_t count = mapped_depth_cube
+                                        const size_t count = use_mapped_depth_cube
                                             ? mapped_faces[face].count : faces[face].size();
                                         const size_t pixels = std::min(static_cast<size_t>(tw) * th, count);
                                         auto quantize = [&](auto read_depth) {
@@ -6123,7 +6125,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                                 dst[i * 4 + 3] = 0xffu;
                                             }
                                         };
-                                        if (mapped_depth_cube)
+                                        if (use_mapped_depth_cube)
                                             quantize([&](size_t i) { return mapped_faces[face].at(i); });
                                         else
                                             quantize([&](size_t i) { return faces[face][i]; });
@@ -6165,7 +6167,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 renderer_cube_snapshot_ready = depth_cube_source_layout_valid &&
                                     present_mask == retained_depth_cube.present_mask;
                                 for (uint32_t face = 0; face < 6; ++face)
-                                    renderer_cube_snapshot_ready &= (mapped_depth_cube
+                                    renderer_cube_snapshot_ready &= (use_mapped_depth_cube
                                         ? mapped_faces[face].count : faces[face].size()) ==
                                         ((present_mask & (1u << face)) ? static_cast<size_t>(tw) * th : 0);
                                 cube_depth_bridged = true;
@@ -6455,7 +6457,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 std::array<prosper::test::PersistentDsDepthReadback, 6> mapped_faces;
                                 uint32_t overlay_mask = 0, known_mask = 0;
                                 std::string overlay_error;
-                                const bool overlay_ok = mapped_depth_cube
+                                const bool use_mapped_depth_cube = mapped_depth_cube &&
+                                    prosper::test::mapped_depth_cube_payload_within_limit(
+                                        tw, th, resource_compute_depth_overlay_mask);
+                                const bool overlay_ok = use_mapped_depth_cube
                                     ? prosper::test::read_persistent_ds_cube_depth_after_mapped(
                                           r.gpu_addr, tw, th, resource_compute_producer_order,
                                           mapped_faces, overlay_mask, known_mask, overlay_error)
@@ -6468,7 +6473,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                         if (!(overlay_mask & (1u << face))) continue;
                                         uint8_t* dst = texture_pixels.data() +
                                             static_cast<size_t>(face) * tw * th * 4u;
-                                        const size_t count = mapped_depth_cube
+                                        const size_t count = use_mapped_depth_cube
                                             ? mapped_faces[face].count : overlay_faces[face].size();
                                         auto quantize = [&](auto read_depth) {
                                             for (size_t i = 0;
@@ -6483,7 +6488,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                                 dst[i * 4 + 3] = 0xffu;
                                             }
                                         };
-                                        if (mapped_depth_cube)
+                                        if (use_mapped_depth_cube)
                                             quantize([&](size_t i) { return mapped_faces[face].at(i); });
                                         else
                                             quantize([&](size_t i) { return overlay_faces[face][i]; });
