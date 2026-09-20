@@ -109,6 +109,89 @@ int main() {
         on_a.reset();
     }
 
+    // -------------------------------------------- GPU notifications follow exact physical bytes
+    {
+        const uint64_t base_a = reinterpret_cast<uint64_t>(a) + 2 * page;
+        const uint64_t base_b = reinterpret_cast<uint64_t>(b) + 2 * page;
+        GuestWriteWatch on_a = GuestWriteWatch::create(base_a + 128, 64);
+        GuestWriteWatch on_b = GuestWriteWatch::create(base_b + 128, 64);
+        GuestWriteWatch adjacent = GuestWriteWatch::create(base_a + 512, 64);
+        GuestWriteWatch other_page = GuestWriteWatch::create(base_a + page + 128, 64);
+        CHECK(on_a && on_b && adjacent && other_page, "four narrow watches created");
+        const auto before = guest_write_watch_stats();
+        guest_write_watch_notify_gpu_write(base_b + 128, 64);
+        const auto after = guest_write_watch_stats();
+        CHECK(on_a.query() == GuestWriteWatchQuery::Dirty &&
+              on_b.query() == GuestWriteWatchQuery::Dirty,
+              "GPU write through B dirties watches on both physical aliases");
+        CHECK(adjacent.query() == GuestWriteWatchQuery::Unchanged &&
+              other_page.query() == GuestWriteWatchQuery::Unchanged,
+              "GPU write does not dirty adjacent sub-page bytes or another page");
+        CHECK(after.gpu_write_alias_pages > before.gpu_write_alias_pages &&
+              after.gpu_write_alias_registrations_visited >
+                  before.gpu_write_alias_registrations_visited &&
+              after.gpu_write_alias_overlaps > before.gpu_write_alias_overlaps,
+              "physical alias lookup and newly dirtied registration are counted");
+        CHECK(on_a.rearm() && on_a.query() == GuestWriteWatchQuery::Unchanged &&
+              on_b.query() == GuestWriteWatchQuery::Dirty,
+              "GPU-only rearm acknowledges one owner without clearing its alias");
+        CHECK(on_b.rearm() && on_b.query() == GuestWriteWatchQuery::Unchanged,
+              "second alias rearms independently");
+
+        GuestWriteWatch across = GuestWriteWatch::create(base_a + page - 32, 64);
+        CHECK(across && across.query() == GuestWriteWatchQuery::Unchanged,
+              "unaligned cross-page watch starts clean");
+        guest_write_watch_notify_gpu_write(base_b + page - 16, 32);
+        CHECK(across.query() == GuestWriteWatchQuery::Dirty &&
+              other_page.query() == GuestWriteWatchQuery::Unchanged,
+              "cross-page alias notification reaches only intersecting byte ranges");
+        across.reset();
+        on_a.reset(); on_b.reset(); adjacent.reset(); other_page.reset();
+    }
+
+    // A newly mapped alias participates in a pre-existing registration. Removing it and reusing its
+    // exact VA for other backing must not leave an ABA route to the old physical page.
+    {
+        GuestWriteWatch original = GuestWriteWatch::create(reinterpret_cast<uint64_t>(a) + 128, 64);
+        CHECK(original && original.query() == GuestWriteWatchQuery::Unchanged,
+              "original watch is clean before a late alias appears");
+        auto* late = static_cast<uint8_t*>(mmap(nullptr, page, PROT_READ | PROT_WRITE,
+                                               MAP_SHARED, fd, 0));
+        CHECK(late != MAP_FAILED, "late alias mapped");
+        if (late != MAP_FAILED) {
+            const uint64_t late_va = reinterpret_cast<uint64_t>(late);
+            guest_write_watch_notify_direct_mapping_added(late_va, page, kPhys, kCpuRw);
+            guest_write_watch_notify_gpu_write(late_va + 128, 64);
+            CHECK(original.query() == GuestWriteWatchQuery::Dirty,
+                  "GPU write through alias added after registration dirties original");
+            CHECK(original.rearm() && original.query() == GuestWriteWatchQuery::Unchanged,
+                  "original rearms after late-alias notification");
+            guest_write_watch_notify_direct_mapping_removed(late_va, page);
+            CHECK(original.query() == GuestWriteWatchQuery::Dirty &&
+                  original.rearm() && original.query() == GuestWriteWatchQuery::Unchanged,
+                  "removing a sibling alias invalidates then rearms the original page");
+            munmap(late, page);
+            const int replacement_fd = make_memfd("prosper-ww-replacement", page);
+            CHECK(replacement_fd >= 0, "replacement backing created");
+            if (replacement_fd >= 0) {
+                auto* replacement = mmap(late, page, PROT_READ | PROT_WRITE,
+                                         MAP_SHARED | MAP_FIXED, replacement_fd, 0);
+                CHECK(replacement == late, "new physical backing occupies the former alias VA");
+                if (replacement == late) {
+                    guest_write_watch_notify_direct_mapping_added(
+                        late_va, page, kPhys + span, kCpuRw);
+                    guest_write_watch_notify_gpu_write(late_va + 128, 64);
+                    CHECK(original.query() == GuestWriteWatchQuery::Unchanged,
+                          "reused alias VA with different backing cannot dirty old watch");
+                    guest_write_watch_notify_direct_mapping_removed(late_va, page);
+                    munmap(replacement, page);
+                }
+                close(replacement_fd);
+            }
+        }
+        original.reset();
+    }
+
     // ------------------------------------------------------- containing interval, hit from inside
     {
         // The registration spans the whole 8 MiB (four 2 MiB chunks). The GPU write is 4 KiB in the
@@ -124,16 +207,9 @@ int main() {
         CHECK(wide.rearm() && wide.query() == GuestWriteWatchQuery::Unchanged,
               "rearm clears a GPU-write dirty");
 
-        // Half-open: a write that ENDS exactly where the registration begins does not overlap it,
-        // and one that BEGINS exactly at its end does not either.
-        guest_write_watch_notify_gpu_write(reinterpret_cast<uint64_t>(a) - 4096, 4096);
-        CHECK(wide.query() == GuestWriteWatchQuery::Unchanged,
-              "an adjacent write below the registration does not dirty it");
-        guest_write_watch_notify_gpu_write(reinterpret_cast<uint64_t>(a) + span, 4096);
-        CHECK(wide.query() == GuestWriteWatchQuery::Unchanged,
-              "an adjacent write above the registration does not dirty it");
-
-        // The last byte of the registration is inside it; the first byte after it is not.
+        // The last byte of the registration is inside it. The narrow-watch case above guards
+        // half-open adjacency: neighbouring VMAs can physically alias this full-span registration,
+        // so a virtual address next to it is not necessarily an unrelated physical write.
         guest_write_watch_notify_gpu_write(reinterpret_cast<uint64_t>(a) + span - 1, 1);
         CHECK(wide.query() == GuestWriteWatchQuery::Dirty,
               "the final byte of the registration is covered");

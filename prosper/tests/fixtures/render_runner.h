@@ -3820,7 +3820,8 @@ inline VkDeviceSize resident_render_buffer_range_limit() {
     static const auto limit = prosper::diag::env_u64_or_default_capped(
         "PROSPER_BACKEND_BUFFER_RANGE_RESIDENCY_MB",
         getenv("PROSPER_BACKEND_BUFFER_RANGE_RESIDENCY_MB"), 0, 2048, "MiB");
-    static const bool disabled = getenv("PROSPER_NO_BACKEND_BUFFER_RANGE_RESIDENCY") != nullptr;
+    static const bool disabled = getenv("PROSPER_NO_BACKEND_BUFFER_RESIDENCY") != nullptr ||
+        getenv("PROSPER_NO_BACKEND_BUFFER_RANGE_RESIDENCY") != nullptr;
     return disabled ? 0 : limit * 1024ull * 1024ull;
 }
 
@@ -8815,8 +8816,9 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                     // materialized span is authoritative, including hosted sources and padded tails.
                     // Prefer one complete retained range over separate retained children. The
                     // planner has already proved complete read-only shaders and direct backing.
-                    // Exact comparison covers CPU/HLE writes, remapping and physical aliases;
-                    // a VA-only watch is insufficient for an aliased device write.
+                    // The existing watch delays arming until two equal byte comparisons have
+                    // established stable contents. GPU notifications also follow physical aliases;
+                    // when coverage is unknown, the cache falls back to exact comparison.
                     const size_t group_index = direct_guest_addr && identity == direct_guest_addr &&
                         reinterpret_cast<uintptr_t>(words) == direct_guest_addr && bytes >= 4096
                         ? find_buffer_range(buffer_range_groups, direct_guest_addr, bytes,
@@ -8838,11 +8840,14 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                                                     &res_buffer_resident_ms);
                             auto& cache = resident_render_buffer_cache();
                             const auto copied_before = resource_reuse_stats.buffer_upload_bytes;
+                            const uint64_t watched_addr = readonly_buffer_watch ? group.address : 0;
                             owner.upload.resident = cache.find(ctx.dev, key, source,
-                                                                resource_reuse_stats);
+                                resource_reuse_stats, watched_addr,
+                                timing_enabled ? &res_buffer_watch_ms : nullptr);
                             if (!owner.upload.resident)
                                 owner.upload.resident = cache.admit(ctx, key, source,
-                                    range_residency_limit, resource_reuse_stats);
+                                    range_residency_limit, resource_reuse_stats, watched_addr,
+                                    timing_enabled ? &res_buffer_watch_ms : nullptr);
                             if (owner.upload.resident) {
                                 const auto& retained = owner.upload.resident->storage;
                                 owner.upload.buffer = retained.buffer;

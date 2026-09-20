@@ -382,9 +382,9 @@ void guest_buffer_watch(const Fixture& f) {
 }
 
 void range_residency_guest_mapping(const Fixture& f, bool enabled) {
-    // The same physical bytes have two registered VAs. Range retention deliberately uses
-    // exact comparison, so even a device-style write through the other alias is observed
-    // without relying on a notification naming the original virtual address.
+    // The same physical bytes have two registered VAs. A device-style write through B must
+    // invalidate a watched complete range sourced from A, even though the notifying VA differs.
+    prosper::install_trap_handler();
     constexpr uint64_t UnionBytes = Bytes + 1024;
     auto visible = std::vector<uint32_t>(Words + 256, 0);
     quad(visible, 0, false);
@@ -405,18 +405,30 @@ void range_residency_guest_mapping(const Fixture& f, bool enabled) {
         return result;
     };
     auto render = [&] { return render_draws_rgba(draws(), W, H, nullptr, Clear); };
-    CHECK(solid(render(), true) && solid(render(), true),
-          "registered union is correct before and after its first reuse");
-    CHECK(backend_resource_reuse_stats().buffer_resident_hits == (enabled ? 1u : 0u),
-          "registered unchanged union follows the selected residency policy");
+    CHECK(solid(render(), true), "registered complete range is correct on cold upload");
+    for (unsigned i = 0; i < 3; ++i) {
+        CHECK(solid(render(), true), "stable complete range preserves pixels while proving bytes");
+        CHECK(backend_resource_reuse_stats().buffer_resident_compared_bytes ==
+                  (enabled ? UnionBytes : 0),
+              "watch promotion still checks complete current bytes");
+    }
+    CHECK(solid(render(), true) &&
+              backend_resource_reuse_stats().buffer_resident_hits == (enabled ? 1u : 0u) &&
+              backend_resource_reuse_stats().buffer_resident_watched_bytes ==
+                  (enabled ? UnionBytes : 0),
+          "registered unchanged union uses a protected proof only when enabled");
     auto hidden = visible; quad(hidden, 128, false);
-    CHECK(pwrite(mapping.fd, hidden.data(), 8 * sizeof(uint32_t), 256 * sizeof(uint32_t)) ==
+    CHECK(pwrite(mapping.fd, hidden.data() + 256, 8 * sizeof(uint32_t),
+                 256 * sizeof(uint32_t)) ==
               8 * ssize_t(sizeof(uint32_t)),
-          "device-style write changes backing without touching the watched VA");
+          "device-style write changes backing without a CPU store on either mapped VA");
+    prosper::host::guest_write_watch_notify_gpu_write(
+        reinterpret_cast<uint64_t>(mapping.b) + 256 * sizeof(uint32_t), 8 * sizeof(uint32_t));
     CHECK(mapping.a[256] == hidden[256] && mapping.b[256] == hidden[256] &&
               solid(render(), false) &&
-              backend_resource_reuse_stats().buffer_upload_bytes == UnionBytes,
-          "same-backing device write through an alias forces current bytes into a new union");
+              backend_resource_reuse_stats().buffer_upload_bytes == UnionBytes &&
+              backend_resource_reuse_stats().buffer_resident_watched_bytes == 0,
+          "notified same-backing alias write forces current bytes into a new union");
     CHECK(mapping.replace_primary(visible), "same guest VA is remapped to new physical backing");
     if (!mapping.a) return;
     CHECK(solid(render(), true) &&
@@ -652,6 +664,19 @@ void range_residency(const Fixture& f, bool enabled) {
     CHECK(solid(render(), false) &&
               backend_resource_reuse_stats().buffer_resident_hits == (enabled ? 1u : 0u),
           "unchanged refreshed range can be reused after the mutation");
+    source.back() ^= 0x100u; // A partial change in the union tail, outside either visible quad.
+    CHECK(solid(render(), false) &&
+              backend_resource_reuse_stats().buffer_resident_hits == 0 &&
+              backend_resource_reuse_stats().buffer_upload_bytes == UnionBytes,
+          "tail-only mutation refreshes the complete range even when pixels match");
+    if (enabled) {
+        BackendPersistentResourceGuard guard;
+        const auto found = resident_render_buffer_cache().index.find(
+            {reinterpret_cast<uintptr_t>(source.data()), UnionBytes});
+        CHECK(found != resident_render_buffer_cache().index.end() &&
+                  std::memcmp(found->second->owner->snapshot.get(), source.data(), UnionBytes) == 0,
+              "retained snapshot contains the exact complete union after a partial update");
+    }
 
     for (bool unresolved : {false, true}) {
         auto writable = draws();
