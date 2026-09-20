@@ -477,6 +477,45 @@ class PerformanceCaptureReportTests(unittest.TestCase):
             print_summary(summary)
         self.assertIn("(60 over 1.00 s)", output.getvalue())
 
+    def test_producer_lineage_reports_rates_and_known_delivery_coverage(self):
+        lineage = [
+            dict(SAMPLES[0], producer_publications=10, producer_publications_known=8,
+                 producer_delivered_new=4, producer_delivered_repeat=3,
+                 producer_delivered_unknown=1),
+            dict(SAMPLES[1], producer_publications=30, producer_publications_known=24,
+                 producer_delivered_new=13, producer_delivered_repeat=9,
+                 producer_delivered_unknown=3),
+        ]
+        summary = summarize(capture(lineage))
+        observed = summary["producer_lineage"]
+        self.assertEqual(observed["events"], {
+            "producer_publications": 20, "producer_publications_known": 16,
+            "producer_delivered_new": 9, "producer_delivered_repeat": 6,
+            "producer_delivered_unknown": 2})
+        self.assertEqual(observed["rates"]["producer_delivered_new"], 9.0)
+        self.assertEqual(observed["known_deliveries"], 15)
+        self.assertEqual(observed["classified_deliveries"], 17)
+        self.assertAlmostEqual(observed["delivery_coverage"], 15 / 17)
+        self.assertAlmostEqual(observed["publication_coverage"], 0.8)
+        printed = self._printed(summary)
+        self.assertIn("producer lineage rates: publications=20.00/s (20 over 1.00 s)", printed)
+        self.assertIn("producer delivery lineage coverage: 88% (15 known deliveries of 17", printed)
+
+    def test_old_capture_keeps_producer_lineage_unavailable(self):
+        # No producer fields is the expected shape for a capture written before lineage existed.
+        summary = summarize(capture(SAMPLES))
+        observed = summary["producer_lineage"]
+        self.assertIsNone(observed["delivery_coverage"])
+        self.assertIn("delivery lineage counters are unavailable", observed["delivery_coverage_status"])
+        self.assertIn("producer delivery lineage coverage: unavailable", self._printed(summary))
+
+    def test_producer_lineage_requires_complete_delivery_classification(self):
+        partial = [dict(SAMPLES[0], producer_delivered_new=1, producer_delivered_repeat=2),
+                   dict(SAMPLES[1], producer_delivered_new=4, producer_delivered_repeat=6)]
+        observed = summarize(capture(partial))["producer_lineage"]
+        self.assertIsNone(observed["delivery_coverage"])
+        self.assertIsNone(observed["known_deliveries"])
+
     def test_a_late_first_post_sample_displaces_only_the_rate_window(self):
         # The rate window starts at the FIRST post sample, so a late first sample DISPLACES it --
         # the span is 1.00 s either way -- while leaving the detail population where it was. The two

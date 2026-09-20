@@ -40,6 +40,11 @@ prosper::perf::ProcessSample sample(uint64_t at, uint64_t counter) {
     out.guest_presents = counter * 3;
     out.rendered_frames = counter * 2;
     out.host_presented_frames = counter;
+    out.producer_publications = counter * 11;
+    out.producer_publications_known = counter * 7;
+    out.producer_delivered_new = counter * 5;
+    out.producer_delivered_repeat = counter * 3;
+    out.producer_delivered_unknown = counter * 2;
     if (counter == 1) {
         prosper::gpu::PendingWriteSnapshot queue;
         queue.queued = 123;
@@ -219,6 +224,7 @@ int main() {
     capture.observe_sample(unavailable_private_bytes);
     auto unavailable_render_count = sample(700, 7);
     unavailable_render_count.rendered_frames.reset();
+    unavailable_render_count.producer_delivered_unknown.reset();
     capture.observe_sample(unavailable_render_count);
     check(capture.detailed_timing_active(), "detailed timing stays active before the post window ends");
     capture.observe_sample(sample(800, 8));
@@ -332,10 +338,22 @@ int main() {
           "serialized artifact contains the exact post-trigger population");
     check(count_text(text, "\"rendered_frames\":null") == 1,
           "an unavailable rendered-frame population serializes as JSON null");
+    check(count_text(text, "\"producer_delivered_unknown\":null") == 1,
+          "an unavailable producer-lineage counter serializes as JSON null, never as zero");
+    check(text.find("\"producer_publications\":66,\"producer_publications_known\":42,"
+                    "\"producer_delivered_new\":30,\"producer_delivered_repeat\":18,"
+                    "\"producer_delivered_unknown\":12") != std::string::npos,
+          "producer-lineage counters preserve their independent cumulative values");
     check(count_text(text, "\"private_bytes\":null") == 1,
           "an unavailable committed-bytes population serializes as JSON null, never as zero");
     check(text.find("\"rss_available\":true,\"private_bytes_available\":true") != std::string::npos,
           "the header states availability for each memory field the samples carried");
+    check(text.find("\"producer_publications_available\":true,"
+                    "\"producer_publications_known_available\":true,"
+                    "\"producer_delivered_new_available\":true,"
+                    "\"producer_delivered_repeat_available\":true,"
+                    "\"producer_delivered_unknown_available\":true") != std::string::npos,
+          "the header makes producer-lineage counter availability explicit");
     check(count_text(text, "\"type\":\"renderer\"") == 2 &&
           count_text(text, "\"type\":\"compute\"") == 1,
           "serialized detail counts match the bounded retained records");

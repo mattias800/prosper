@@ -26,6 +26,7 @@ struct Slot {
     uint32_t       w = 0, h = 0;            // the size of THIS slot's current image (per-slot, #1270)
     uint64_t       frame_seq = 0;
     uint64_t       publication_id = 0;
+    ProducerSource producer;
 };
 
 struct PresentBlitState {
@@ -147,7 +148,8 @@ int pick_free_slot(PresentBlitState& s) {
 } // namespace
 
 bool present_blit_publish(VkImage src, VkImageLayout src_layout, VkFormat src_format,
-                          uint32_t w, uint32_t h, uint64_t frame_seq) {
+                          uint32_t w, uint32_t h, uint64_t frame_seq,
+                          ProducerSource producer) {
     if (!src || !w || !h) return false;
     PresentHandoffTrace trace(frame_seq);
     const auto lock_begin = trace.now();
@@ -242,6 +244,7 @@ bool present_blit_publish(VkImage src, VkImageLayout src_layout, VkFormat src_fo
 
     sl.frame_seq = frame_seq;
     sl.publication_id = trace.identity.publication_id;
+    sl.producer = producer;
     sl.state = SlotState::Published;
 
     // A previously published-but-untaken frame is now stale; free its slot for reuse.
@@ -255,6 +258,7 @@ bool present_blit_publish(VkImage src, VkImageLayout src_layout, VkFormat src_fo
     s.latest = slot;
     s.latest_taken = false;
     trace.emit(prosper::perf::PresentHandoffEvent::Published);
+    producer_lineage_counters().publication(producer);
     return true;
 }
 
@@ -275,6 +279,7 @@ bool present_blit_acquire(GpuScanoutFrame& out) {
     out.width = sl.w; out.height = sl.h;
     out.frame_seq = sl.frame_seq;
     out.publication_id = sl.publication_id;
+    out.producer = sl.producer;
     out.slot = s.latest;
     trace.identity.source_seq = sl.frame_seq;
     trace.identity.publication_id = sl.publication_id;

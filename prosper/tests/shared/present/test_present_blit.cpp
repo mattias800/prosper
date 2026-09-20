@@ -12,6 +12,7 @@
 // Source fixtures carry SAMPLED_BIT because they model the renderer's shader-read layout.
 // Strict core/synchronization validation is the regression guard for that usage contract (#1716).
 #include "fixtures/render_runner.h"
+#include "fixtures/spirv_triangle.h"
 #include "shared/live/live_renderer.hpp"
 #include "shared/present/present_blit.hpp"
 #include "shared/perf/performance_capture.hpp"
@@ -342,7 +343,8 @@ int main() {
                     VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
             vkEndCommandBuffer(prodCb); locked_submit_wait(ctx, prodCb, prodFence);
             return frontend::present_blit_publish(img, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                    VK_FORMAT_R8G8B8A8_UNORM, iw, ih, seq);
+                    VK_FORMAT_R8G8B8A8_UNORM, iw, ih, seq,
+                    {seq < 800 ? 77u : 88u, {seq < 800 ? 77u : 88u, seq}});
         };
         // Record the actual held-slot/supersession path in the opt-in CTest variant. Recording
         // synthetic "published" rows cannot prove the production handoff emitted its decisions.
@@ -358,6 +360,9 @@ int main() {
         frontend::GpuScanoutFrame gfA; bool gotA = false;
         for (int t = 0; t < 1000 && !gotA; t++) { gotA = frontend::present_blit_acquire(gfA); if (!gotA) std::this_thread::yield(); }
         CHECK(gotA && gfA.width == W && gfA.height == H, "held-slot: acquire A");
+        CHECK(gotA && gfA.producer.completed.work == 777 &&
+                  gfA.producer.image_registration == 77,
+              "held-slot: acquired lineage belongs to the held image");
         // Publish several DIFFERENT-size frames; these recreate other free slots, never the held one.
         for (uint64_t k = 0; k < 4; k++) upload_and_publish(src2, st2, st2Map, w2, h2, 800 + k);
         // The held image must still be valid AND still contain A's pixels.
@@ -374,6 +379,8 @@ int main() {
             frontend::present_blit_release(gfA.slot);
         }
         CHECK(held_mismatch == 0, "held-slot: acquired image survives a different-size publish, content intact");
+        CHECK(gfA.producer.completed.work == 777 && gfA.producer.image_registration == 77,
+              "held-slot: resize and slot replacement cannot mutate the held provenance");
         if (trace_requested) {
             perf::ProcessSample finish;
             finish.monotonic_ns = trace_start + 5'000'000'000ull;
@@ -409,6 +416,180 @@ int main() {
         vkDestroyBuffer(ctx.dev, st2, nullptr); vkFreeMemory(ctx.dev, st2Mem, nullptr);
         vkDestroyBuffer(ctx.dev, rbA, nullptr); vkFreeMemory(ctx.dev, rbAMem, nullptr);
         vkDestroyImage(ctx.dev, src2, nullptr); vkFreeMemory(ctx.dev, src2Mem, nullptr);
+    }
+
+    // Completed backend draw -> exact retained image -> production GPU scanout slot. The draw is
+    // repeated with identical shader/pixels: new completed work must remain new even when pixels
+    // match. Guest flip and publication IDs deliberately change independently of producer work.
+    {
+        constexpr uint64_t a = 0x3486001000ull, b = 0x3486002000ull,
+                           c = 0x3486003000ull, d = 0x3486004000ull;
+        auto render_target = [&](uint64_t id) -> test::PersistentColorTargetImage* {
+            test::BackendDraw draw;
+            draw.vs.assign(kTriVertSpv, kTriVertSpv + sizeof(kTriVertSpv) / 4);
+            draw.fs.assign(kTriFragSpv, kTriFragSpv + sizeof(kTriFragSpv) / 4);
+            test::BackendColorTarget target;
+            target.persistent_id = id;
+            target.load_existing = false;
+            target.readback = false;
+            test::render_draws_rgba({draw}, W, H, nullptr, nullptr, false, &target,
+                                    nullptr, nullptr, nullptr, nullptr, true, nullptr, false);
+            return test::find_persistent_color_target(id, W, H, VK_FORMAT_R8G8B8A8_UNORM);
+        };
+        auto publish_target = [&](test::PersistentColorTargetImage* target, uint64_t flip,
+                                  bool acquire = true) -> frontend::GpuScanoutFrame {
+            frontend::GpuScanoutFrame frame;
+            if (!target || !target->image) return frame;
+            const bool published = frontend::present_blit_publish(
+                target->image, target->layout, VK_FORMAT_R8G8B8A8_UNORM, W, H, flip,
+                test::persistent_color_producer_source(*target));
+            CHECK(published, "lineage: retained renderer image published through GPU scanout");
+            if (published && acquire)
+                CHECK(frontend::present_blit_acquire(frame), "lineage: acquired exact scanout slot");
+            return frame;
+        };
+        frontend::ProducerLineageCounters deliveries;
+        auto* ta = render_target(a);
+        CHECK(ta && test::persistent_color_producer_source(*ta).known(),
+              "lineage: real renderer pass has a completed producer");
+        const auto first_a = ta ? test::persistent_color_producer_source(*ta)
+                                : frontend::ProducerSource{};
+        auto fa = publish_target(ta, 4001);
+        CHECK(fa.producer.completed == first_a.completed && fa.producer.image_registration ==
+                  first_a.image_registration,
+              "lineage: acquired slot carries its exact source image registration and producer");
+        if (fa.valid()) {
+            CHECK(deliveries.presentation(true, fa.producer) == frontend::ProducerDelivery::New,
+                  "lineage: first successful present delivers new completed work");
+            frontend::present_blit_release(fa.slot);
+        }
+        ta = render_target(a);
+        const auto second_a = ta ? test::persistent_color_producer_source(*ta)
+                                 : frontend::ProducerSource{};
+        CHECK(second_a.known() && second_a.image_registration == first_a.image_registration &&
+                  second_a.completed != first_a.completed,
+              "lineage: identical rendering on the same image creates a new completed version");
+        fa = publish_target(ta, 4002);
+        if (fa.valid()) {
+            CHECK(deliveries.presentation(true, fa.producer) == frontend::ProducerDelivery::New,
+                  "lineage: identical pixels from new work are new");
+            frontend::present_blit_release(fa.slot);
+        }
+        auto* tb = render_target(b);
+        const auto source_b = tb ? test::persistent_color_producer_source(*tb)
+                                  : frontend::ProducerSource{};
+        auto fb = publish_target(tb, 4003);
+        if (fb.valid()) {
+            CHECK(deliveries.presentation(true, fb.producer) == frontend::ProducerDelivery::New,
+                  "lineage: second output buffer delivers its own completed work");
+            frontend::present_blit_release(fb.slot);
+        }
+        fa = publish_target(ta, 4004);
+        if (fa.valid()) {
+            CHECK(deliveries.presentation(true, fa.producer) == frontend::ProducerDelivery::Repeat,
+                  "lineage: newer guest flip of stale A repeats despite intervening B");
+            frontend::present_blit_release(fa.slot);
+        }
+        fb = publish_target(tb, 4005);
+        if (fb.valid()) {
+            CHECK(deliveries.presentation(true, fb.producer) == frontend::ProducerDelivery::Repeat,
+                  "lineage: alternating stale B repeats despite intervening A");
+            frontend::present_blit_release(fb.slot);
+        }
+        std::string copy_error;
+        CHECK(test::copy_persistent_color_target(a, c, W, H, VK_FORMAT_R8G8B8A8_UNORM,
+                                                 copy_error),
+              "lineage: pure GPU resolve copy completed");
+        auto* tc = test::find_persistent_color_target(c, W, H, VK_FORMAT_R8G8B8A8_UNORM);
+        CHECK(tc && tc->registration != second_a.image_registration &&
+                  tc->completed_producer == second_a.completed,
+              "lineage: representation copy retains producer across a new allocation");
+        auto fc = publish_target(tc, 4006);
+        if (fc.valid()) {
+            CHECK(deliveries.presentation(true, fc.producer) == frontend::ProducerDelivery::Repeat,
+                  "lineage: pure copy does not manufacture a new producer");
+            frontend::present_blit_release(fc.slot);
+        }
+        auto* td = render_target(d);
+        const auto before_supersede = frontend::producer_lineage_counters().snapshot();
+        publish_target(td, 4007, false); // publication D is replaced before acquisition
+        fa = publish_target(ta, 4008);
+        const auto after_supersede = frontend::producer_lineage_counters().snapshot();
+        CHECK(after_supersede.producer_publications ==
+                  before_supersede.producer_publications + 2,
+              "lineage: both completed scanout publications are counted");
+        CHECK(fa.valid() && fa.producer.completed == second_a.completed,
+              "lineage: supersession acquires A's exact metadata, never D's");
+        if (fa.valid()) {
+            CHECK(deliveries.presentation(true, fa.producer) == frontend::ProducerDelivery::Repeat,
+                  "lineage: superseded D was not delivered");
+            frontend::present_blit_release(fa.slot);
+        }
+        auto fd = publish_target(td, 4009);
+        const auto before_failed = deliveries.snapshot();
+        CHECK(!deliveries.presentation(false, fd.producer).has_value() &&
+                  deliveries.snapshot().producer_delivered_new == before_failed.producer_delivered_new,
+              "lineage: failed or skipped presentation delivers nothing");
+        if (fd.valid()) frontend::present_blit_release(fd.slot);
+        fd = publish_target(td, 4010);
+        if (fd.valid()) {
+            CHECK(deliveries.presentation(true, fd.producer) == frontend::ProducerDelivery::New,
+                  "lineage: previously failed presentation remains undelivered until success");
+            frontend::present_blit_release(fd.slot);
+        }
+        CHECK(deliveries.presentation(true, {}) == frontend::ProducerDelivery::Unknown,
+              "lineage: CPU fallback has unknown producer provenance");
+        CHECK(source_b.known(), "lineage: second output source remained known");
+        test::invalidate_persistent_color_target(a);
+        CHECK(ta && !test::persistent_color_producer_source(*ta).known(),
+              "lineage: invalidation clears a retained image's completed producer");
+        ta = render_target(a);
+        CHECK(ta && test::persistent_color_producer_source(*ta).known() &&
+                  ta->completed_producer != second_a.completed,
+              "lineage: new work after invalidation gets a distinct producer");
+        if (ta) {
+            const auto ticket = test::begin_color_producer_write(*ta);
+            test::BackendSubmissionBatch discarded;
+            discarded.add_color_completion({ta, ticket, true});
+            discarded.discard();
+            CHECK(!test::persistent_color_producer_source(*ta).known(),
+                  "lineage: discarded submission cannot commit recorded work");
+            // Simulate a cache registration reset on the same address and VkImage handle. The old
+            // ticket must not authorize a replacement image, even if a mutation value repeats.
+            test::PersistentColorTargetImage replacement = *ta;
+            replacement.registration = frontend::next_producer_identity();
+            replacement.mutation = ticket.mutation;
+            replacement.completed_producer = {};
+            test::complete_color_producer_write(replacement, ticket, true);
+            CHECK(!replacement.completed_producer.known(),
+                  "lineage: allocation registration prevents address/handle ABA");
+            const auto earlier = test::begin_color_producer_write(replacement);
+            const auto later = test::begin_color_producer_write(replacement);
+            test::complete_color_producer_write(replacement, earlier, true);
+            CHECK(!replacement.completed_producer.known(),
+                  "lineage: older completion cannot label a later pending write");
+            test::complete_color_producer_write(replacement, later, true);
+            CHECK(replacement.completed_producer.known(),
+                  "lineage: latest matching mutation can commit after completion");
+            // Exercise the batch's unproven-completion branch without submitting a doomed GPU
+            // command. It poisons this fixture's backend only after every rendering assertion.
+            const auto unproven_ticket = test::begin_color_producer_write(*ta);
+            test::BackendSubmissionBatch unproven;
+            unproven.add_color_completion({ta, unproven_ticket, true});
+            unproven.abandon_pending_resources();
+            CHECK(!test::persistent_color_producer_source(*ta).known() &&
+                      test::backend_has_unproven_submission(),
+                  "lineage: unproven submission cannot advertise a new completed version");
+        }
+        frontend::ProducerDeliveryHistory bounded_history;
+        const auto first_old = frontend::CompletedProducer{1, 1};
+        CHECK(bounded_history.classify(first_old) == frontend::ProducerDelivery::New,
+              "lineage: first delivered producer enters bounded history");
+        for (uint64_t work = 2; work <= frontend::ProducerDeliveryHistory::kCapacity + 1;
+             ++work)
+            bounded_history.classify({1, work});
+        CHECK(bounded_history.classify(first_old) == frontend::ProducerDelivery::Unknown,
+              "lineage: evicted history never mislabels an old version fresh");
     }
 
     vkDeviceWaitIdle(ctx.dev);

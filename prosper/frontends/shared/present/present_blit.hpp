@@ -30,6 +30,7 @@
 #pragma once
 #include <vulkan/vulkan.h>
 #include <cstdint>
+#include "shared/present/producer_lineage.hpp"
 
 namespace prosper::frontend {
 
@@ -40,6 +41,7 @@ struct GpuScanoutFrame {
     uint32_t    width = 0, height = 0;
     uint64_t    frame_seq = 0;               // caller-supplied source identity (guest flip in production)
     uint64_t    publication_id = 0;          // handoff identity only; never a completed producer version
+    ProducerSource producer;                // exact source image lineage copied with this leased slot
     int         slot = -1;                   // opaque handle to pass back to present_blit_release
     bool valid() const { return image && width && height && slot >= 0; }
 };
@@ -49,7 +51,8 @@ struct GpuScanoutFrame {
 // changes nothing if GPU present cannot run this frame (uninitialized device, no free slot, Vulkan error) --
 // the caller keeps the CPU present path. `frame_seq` is echoed back in the published frame for identity.
 bool present_blit_publish(VkImage src, VkImageLayout src_layout, VkFormat src_format,
-                          uint32_t w, uint32_t h, uint64_t frame_seq);
+                          uint32_t w, uint32_t h, uint64_t frame_seq,
+                          ProducerSource producer = {});
 
 // Consumer side. Fetch the newest published frame not already taken; false if nothing new is available.
 // The caller owns the returned slot until it calls present_blit_release(out.slot).

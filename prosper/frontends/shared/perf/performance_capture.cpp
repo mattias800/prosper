@@ -342,6 +342,11 @@ void InteractivePerformanceCapture::publish_completed(std::unique_ptr<PendingCap
         const bool cpu_available = any_sample_has(&ProcessSample::process_cpu_ns);
         const bool rss_available = any_sample_has(&ProcessSample::rss_bytes);
         const bool private_available = any_sample_has(&ProcessSample::private_bytes);
+        const bool producer_publications_available = any_sample_has(&ProcessSample::producer_publications);
+        const bool producer_publications_known_available = any_sample_has(&ProcessSample::producer_publications_known);
+        const bool producer_delivered_new_available = any_sample_has(&ProcessSample::producer_delivered_new);
+        const bool producer_delivered_repeat_available = any_sample_has(&ProcessSample::producer_delivered_repeat);
+        const bool producer_delivered_unknown_available = any_sample_has(&ProcessSample::producer_delivered_unknown);
         out << std::setprecision(10);
         out << "{\"type\":\"header\",\"format\":\"prosper-performance-capture\","
                "\"version\":1,\"title_id\":" << json_string(capture->title_id)
@@ -359,6 +364,11 @@ void InteractivePerformanceCapture::publish_completed(std::unique_ptr<PendingCap
             // that predates this flag ignores it and a reader that expects it reads an older
             // capture as "unavailable", which is exactly what an older capture knew.
             << ",\"private_bytes_available\":" << (private_available ? "true" : "false")
+            << ",\"producer_publications_available\":" << (producer_publications_available ? "true" : "false")
+            << ",\"producer_publications_known_available\":" << (producer_publications_known_available ? "true" : "false")
+            << ",\"producer_delivered_new_available\":" << (producer_delivered_new_available ? "true" : "false")
+            << ",\"producer_delivered_repeat_available\":" << (producer_delivered_repeat_available ? "true" : "false")
+            << ",\"producer_delivered_unknown_available\":" << (producer_delivered_unknown_available ? "true" : "false")
             << ",\"present_handoffs_enabled\":" << (config_.present_handoffs ? "true" : "false")
             << ",\"present_handoff_limit\":" << config_.max_present_records << "}\n";
 
@@ -375,6 +385,17 @@ void InteractivePerformanceCapture::publish_completed(std::unique_ptr<PendingCap
                 << ",\"rendered_frames\":";
             write_optional(out, sample.rendered_frames);
             out << ",\"host_presented_frames\":" << sample.host_presented_frames
+                << ",\"producer_publications\":";
+            write_optional(out, sample.producer_publications);
+            out << ",\"producer_publications_known\":";
+            write_optional(out, sample.producer_publications_known);
+            out << ",\"producer_delivered_new\":";
+            write_optional(out, sample.producer_delivered_new);
+            out << ",\"producer_delivered_repeat\":";
+            write_optional(out, sample.producer_delivered_repeat);
+            out << ",\"producer_delivered_unknown\":";
+            write_optional(out, sample.producer_delivered_unknown);
+            out
                 << ",\"pending_writes\":";
             if (sample.pending_writes) {
                 const auto& q = *sample.pending_writes;
