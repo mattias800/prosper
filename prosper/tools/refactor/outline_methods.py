@@ -295,11 +295,21 @@ def selftest() -> int:
     check("absent declarator refuses", qualify("void bar(int)", "foo", "C"), None)
 
     print("-- inside_repo (these tools are driven by agents with generated paths) --")
-    ok_path = inside_repo(pathlib.Path("prosper/tools/refactor/outline_methods.py"))
+    # Built from REPO_ROOT, never from the CWD. The first version of this arm passed a path
+    # relative to the working directory, so it asserted where the test was RUN from rather than
+    # anything about the code: green by hand from the checkout root, and a hard exit under ctest,
+    # which runs from the build directory. It failed CI and passed locally, which is the worst
+    # possible split.
+    ok_path = inside_repo(REPO_ROOT / "prosper/tools/refactor/outline_methods.py")
     check("a path inside the checkout resolves", str(ok_path).startswith(str(REPO_ROOT)), True)
-    for bad in ("../../../etc/passwd", "/etc/passwd", "prosper/../../outside.cpp"):
+    outside = [
+        REPO_ROOT / "../../../etc/passwd",      # relative escape, resolved
+        pathlib.Path("/etc/passwd"),            # absolute
+        REPO_ROOT / "prosper/../../outside.cpp",  # only escapes after normalisation
+    ]
+    for bad in outside:
         try:
-            inside_repo(pathlib.Path(bad))
+            inside_repo(bad)
             check(f"refuses {bad}", "accepted", "refused")
         except SystemExit:
             check(f"refuses {bad}", True, True)
