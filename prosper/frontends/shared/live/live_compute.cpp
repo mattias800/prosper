@@ -472,12 +472,24 @@ std::atomic<VkResult> g_next_packed_rtt_setup_result_for_test{VK_SUCCESS};
 std::atomic<VkResult> g_next_retile_allocation_for_test{VK_SUCCESS};
 std::atomic<VkResult> g_next_retile_mapping_for_test{VK_SUCCESS};
 std::atomic<uint64_t> g_live_compute_queue_submit_attempts{0};
-std::atomic<uint64_t> g_rtt_destination_candidates{0};
-std::atomic<uint64_t> g_rtt_destination_borrowed{0};
-std::atomic<uint64_t> g_rtt_destination_recorded{0};
-std::atomic<uint64_t> g_rtt_destination_published{0};
-std::atomic<uint64_t> g_rtt_destination_failed{0};
-std::atomic<uint64_t> g_rtt_r11_source_seed_recorded{0};
+// These are independent diagnostic totals, not a synchronization or ownership protocol. Keep
+// relaxed operations in one place so observing them never adds ordering to the hot dispatch path.
+struct RttMirrorCounter {
+    std::atomic<uint64_t> count{0};
+    uint64_t add() { return count.fetch_add(1, std::memory_order_relaxed) + 1; }
+    uint64_t value() const { return count.load(std::memory_order_relaxed); }
+};
+struct RttDestinationCensus {
+    RttMirrorCounter candidates, borrowed, recorded, published, failed, r11_source_seed_recorded;
+    LiveComputeRttDestinationMirrorCounters snapshot() const {
+        return {candidates.value(), borrowed.value(), recorded.value(), published.value(),
+                failed.value(), r11_source_seed_recorded.value()};
+    }
+};
+RttDestinationCensus& rtt_destination_census() {
+    static constinit RttDestinationCensus census{};
+    return census;
+}
 thread_local uint64_t g_perf_compute_gpu_timestamp_samples = 0;
 thread_local double g_perf_compute_gpu_device_ms = 0.0;
 thread_local double g_perf_compute_gpu_shader_ms = 0.0;
@@ -7116,7 +7128,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 if (!ok && images[i].mirror_destination_revoked) {
                     invalidate_live_render_target_image_destination(
                         images[i].resource->gpu_addr, images[i].mirror_destination);
-                    g_rtt_destination_failed.fetch_add(1, std::memory_order_relaxed);
+                    rtt_destination_census().failed.add();
                 }
                 release_live_render_target_image(images[i].resource->gpu_addr);
             }
@@ -10981,18 +10993,20 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             const uint64_t texels = static_cast<uint64_t>(r->width) * r->height;
             if (!texel_bytes || texels > SIZE_MAX / texel_bytes ||
                 static_cast<size_t>(texels * texel_bytes) != staging_bytes[i]) continue;
-            const uint64_t candidates =
-                g_rtt_destination_candidates.fetch_add(1, std::memory_order_relaxed) + 1;
-            if (perf_capture_timing && candidates % 16 == 0)
+            RttDestinationCensus& mirror_census = rtt_destination_census();
+            const uint64_t candidates = mirror_census.candidates.add();
+            if (perf_capture_timing && candidates % 16 == 0) {
+                const auto totals = mirror_census.snapshot();
                 std::fprintf(stderr,
                     "[compute-rtt-destination-census] candidates=%llu borrowed=%llu "
                     "recorded=%llu published=%llu failed=%llu r11-source-seed=%llu\n",
                     (unsigned long long)candidates,
-                    (unsigned long long)g_rtt_destination_borrowed.load(std::memory_order_relaxed),
-                    (unsigned long long)g_rtt_destination_recorded.load(std::memory_order_relaxed),
-                    (unsigned long long)g_rtt_destination_published.load(std::memory_order_relaxed),
-                    (unsigned long long)g_rtt_destination_failed.load(std::memory_order_relaxed),
-                    (unsigned long long)g_rtt_r11_source_seed_recorded.load(std::memory_order_relaxed));
+                    (unsigned long long)totals.borrowed,
+                    (unsigned long long)totals.recorded,
+                    (unsigned long long)totals.published,
+                    (unsigned long long)totals.failed,
+                    (unsigned long long)totals.r11_source_seed_recorded);
+            }
             const prosper::gpu::LiveTargetImageDestinationRequest request{
                 r->width, r->height, *format};
             prosper::gpu::LiveTargetImageImport destination;
@@ -11020,7 +11034,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 continue;
             }
             bi.mirror_destination = destination;
-            g_rtt_destination_borrowed.fetch_add(1, std::memory_order_relaxed);
+            mirror_census.borrowed.add();
         }
 
         if (!ctx.prepare_dispatch_commands()) {
@@ -11412,7 +11426,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                          &words_ready, 0, nullptr);
                     vkCmdCopyBufferToImage(command, staging[i], bi.image,
                                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &words);
-                    g_rtt_r11_source_seed_recorded.fetch_add(1, std::memory_order_relaxed);
+                    rtt_destination_census().r11_source_seed_recorded.add();
                     // Retile or output transfer later overwrites staging. Complete this seed read
                     // before either compute or transfer can write the same buffer again.
                     VkBufferMemoryBarrier staging_reuse = words_ready;
@@ -11669,7 +11683,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                      VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr,
                                      1, &restore);
                 bi.mirror_destination_recorded = true;
-                g_rtt_destination_recorded.fetch_add(1, std::memory_order_relaxed);
+                rtt_destination_census().recorded.add();
             }
             // Promotion is decided after host writeback, but a possible retained result must
             // already have the GENERAL layout promised to both compute and graphics consumers.
@@ -12961,7 +12975,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 r.gpu_addr, image.mirror_destination.width,
                 image.mirror_destination.height, image.mirror_destination.format, {},
                 image.mirror_destination.image});
-            g_rtt_destination_published.fetch_add(1, std::memory_order_relaxed);
+            rtt_destination_census().published.add();
             if (trace)
                 std::fprintf(stderr,
                              "[compute]   mirrored exact staging result into renderer RTT "
@@ -13805,14 +13819,7 @@ void live_compute_fail_next_storage_readback_for_test() {
 }
 
 LiveComputeRttDestinationMirrorCounters live_compute_rtt_destination_mirror_counters() {
-    return {
-        g_rtt_destination_candidates.load(std::memory_order_relaxed),
-        g_rtt_destination_borrowed.load(std::memory_order_relaxed),
-        g_rtt_destination_recorded.load(std::memory_order_relaxed),
-        g_rtt_destination_published.load(std::memory_order_relaxed),
-        g_rtt_destination_failed.load(std::memory_order_relaxed),
-        g_rtt_r11_source_seed_recorded.load(std::memory_order_relaxed),
-    };
+    return rtt_destination_census().snapshot();
 }
 
 void live_compute_leave_next_dcc_metadata_compressed_for_test() {

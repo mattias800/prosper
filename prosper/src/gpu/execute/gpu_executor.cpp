@@ -11416,24 +11416,24 @@ bool import_live_render_target_image(uint64_t gpu_addr, const LiveTargetImageReq
 }
 bool borrow_live_render_target_image_destination(
     uint64_t gpu_addr, const LiveTargetImageDestinationRequest& request,
-    LiveTargetImageImport& import) {
-    import = LiveTargetImageImport{};
+    LiveTargetImageImport& destination) {
+    destination = LiveTargetImageImport{};
     if (!g_live_target_image_destination) return false;
-    if (!g_live_target_image_destination(gpu_addr, request, import)) {
-        import = LiveTargetImageImport{};
+    if (!g_live_target_image_destination(gpu_addr, request, destination)) {
+        destination = LiveTargetImageImport{};
         return false;
     }
-    if (!import.valid()) {
+    if (!destination.valid()) {
         release_live_render_target_image(gpu_addr);
-        import = LiveTargetImageImport{};
+        destination = LiveTargetImageImport{};
         return false;
     }
     return true;
 }
 void invalidate_live_render_target_image_destination(
-    uint64_t gpu_addr, const LiveTargetImageImport& import) {
-    if (g_live_target_image_destination_invalidate && import.valid())
-        g_live_target_image_destination_invalidate(gpu_addr, import);
+    uint64_t gpu_addr, const LiveTargetImageImport& destination) {
+    if (g_live_target_image_destination_invalidate && destination.valid())
+        g_live_target_image_destination_invalidate(gpu_addr, destination);
 }
 void release_live_render_target_image(uint64_t gpu_addr) {
     if (g_live_target_image_release) g_live_target_image_release(gpu_addr);

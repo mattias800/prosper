@@ -1154,9 +1154,9 @@ using LiveTargetImageImportFn = std::function<bool(
     uint64_t gpu_addr, const LiveTargetImageRequest& request, LiveTargetImageImport& import)>;
 using LiveTargetImageDestinationFn = std::function<bool(
     uint64_t gpu_addr, const LiveTargetImageDestinationRequest& request,
-    LiveTargetImageImport& import)>;
+    LiveTargetImageImport& destination)>;
 using LiveTargetImageDestinationInvalidateFn = std::function<void(
-    uint64_t gpu_addr, const LiveTargetImageImport& import)>;
+    uint64_t gpu_addr, const LiveTargetImageImport& destination)>;
 using LiveTargetImageReleaseFn = std::function<void(uint64_t gpu_addr)>;
 struct LiveTargetImageWrite {
     uint64_t gpu_addr = 0;
@@ -1179,9 +1179,9 @@ bool import_live_render_target_image(uint64_t gpu_addr, const LiveTargetImageReq
                                      LiveTargetImageImport& import);
 bool borrow_live_render_target_image_destination(
     uint64_t gpu_addr, const LiveTargetImageDestinationRequest& request,
-    LiveTargetImageImport& import);
+    LiveTargetImageImport& destination);
 void invalidate_live_render_target_image_destination(
-    uint64_t gpu_addr, const LiveTargetImageImport& import);
+    uint64_t gpu_addr, const LiveTargetImageImport& destination);
 void release_live_render_target_image(uint64_t gpu_addr);
 // Publish that a borrowed renderer image received the completed compute result. The caller may also
 // have written the exact guest bytes for alias correctness; the renderer processes that normal

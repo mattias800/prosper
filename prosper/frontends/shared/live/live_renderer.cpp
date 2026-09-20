@@ -1787,7 +1787,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
     prosper::gpu::set_live_target_image_destination_borrower(
         [invalidate_ds, direct_bind](uint64_t addr,
                         const prosper::gpu::LiveTargetImageDestinationRequest& request,
-                        prosper::gpu::LiveTargetImageImport& import) {
+                        prosper::gpu::LiveTargetImageImport& destination) {
             if (!direct_bind) return false;
             drain_guest_gpu_writes(g_rtt, invalidate_ds);
             auto it = g_rtt.find(addr);
@@ -1814,25 +1814,25 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 return false;
             }
             pin = {request.width, request.height, format, pin.count + 1};
-            import.width = request.width;
-            import.height = request.height;
-            import.format = request.format;
-            import.native_format = static_cast<uint32_t>(format);
-            import.image = target->image;
-            import.device = ctx.dev;
-            import.layout = static_cast<uint32_t>(target->layout);
-            import.transfer_dst = true; // persistent color images have TRANSFER_DST usage
+            destination.width = request.width;
+            destination.height = request.height;
+            destination.format = request.format;
+            destination.native_format = static_cast<uint32_t>(format);
+            destination.image = target->image;
+            destination.device = ctx.dev;
+            destination.layout = static_cast<uint32_t>(target->layout);
+            destination.transfer_dst = true; // persistent color images have TRANSFER_DST usage
             return true;
         },
-        [](uint64_t addr, const prosper::gpu::LiveTargetImageImport& import) {
-            const VkFormat format = prosper::frontend::live_target_pixel_format_vk(import.format);
+        [](uint64_t addr, const prosper::gpu::LiveTargetImageImport& destination) {
+            const VkFormat format = prosper::frontend::live_target_pixel_format_vk(destination.format);
             auto* target = prosper::test::find_persistent_color_target(
-                addr, import.width, import.height, format, false);
-            if (!target || target->image != import.image) return;
+                addr, destination.width, destination.height, format, false);
+            if (!target || target->image != destination.image) return;
             target->valid = false;
             auto it = g_rtt.find(addr);
-            if (it != g_rtt.end() && it->second.w == import.width &&
-                it->second.h == import.height &&
+            if (it != g_rtt.end() && it->second.w == destination.width &&
+                it->second.h == destination.height &&
                 prosper::test::backend_color_format(it->second.format) == format)
                 it->second.gpu_valid = false;
         });
