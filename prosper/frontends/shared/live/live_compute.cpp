@@ -10972,15 +10972,29 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         if (!destination_mirror_disabled) for (size_t i = 0; i < images.size(); ++i) {
             BoundImage& bi = images[i];
             const ShaderResource* r = bi.resource;
-            if (!r || !r->gpu_addr || r->host_data || !bi.storage_writeback ||
-                bi.alias_of != SIZE_MAX || !bi.exact_storage_bytes() ||
-                bi.storage_write_mask || bi.mirror_result_to_imported ||
-                bi.prior_output_conflict || bi.final_output_conflict ||
-                r->img_dim != 1 || r->depth != 1 || bi.array_layers != 1 ||
-                bi.texel_depth != 1 || bi.mip_levels != 1 || r->sample_count != 1 ||
-                r->in_mip_tail || r->mip_chain_base_level || r->layer_mip_offset_bytes ||
-                r->linear_row_pitch_bytes || r->layer_stride_bytes ||
-                !r->width || !r->height || !staging[i]) continue;
+            const bool basic_candidate = r && r->gpu_addr && !r->host_data &&
+                bi.storage_writeback &&
+                bi.alias_of == SIZE_MAX && bi.exact_storage_bytes() &&
+                !bi.storage_write_mask && !bi.mirror_result_to_imported &&
+                !bi.prior_output_conflict && !bi.final_output_conflict &&
+                r->img_dim == 1 && r->depth == 1 && bi.array_layers == 1 &&
+                bi.texel_depth == 1 && bi.mip_levels == 1 && r->sample_count == 1 &&
+                !r->in_mip_tail && !r->mip_chain_base_level && !r->layer_mip_offset_bytes &&
+                !r->linear_row_pitch_bytes && !r->layer_stride_bytes &&
+                r->width && r->height && staging[i];
+            if (image_timing && perf_capture_timing && r && bi.storage_writeback)
+                std::fprintf(stderr,
+                    "[compute-rtt-destination-check] code=0x%llx binding=%u "
+                    "basic=%u exact=%u mask=%u prior-conflict=%u final-conflict=%u "
+                    "seed=%u pitch=%llu layer-stride=%llu\n",
+                    (unsigned long long)item.code_addr, bi.binding, basic_candidate ? 1u : 0u,
+                    bi.exact_storage_bytes() ? 1u : 0u, bi.storage_write_mask ? 1u : 0u,
+                    bi.prior_output_conflict ? 1u : 0u,
+                    bi.final_output_conflict ? 1u : 0u,
+                    bi.standalone_seed.valid() ? 1u : 0u,
+                    (unsigned long long)r->linear_row_pitch_bytes,
+                    (unsigned long long)r->layer_stride_bytes);
+            if (!basic_candidate) continue;
             const auto format = storage_target_format(*r);
             if (!format) continue;
             // A GPU-authoritative result must remain readable by the next partial writer.
@@ -11013,17 +11027,41 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             if (!borrow_live_render_target_image_destination(r->gpu_addr, request, destination))
                 continue;
             const VkFormat expected = live_target_pixel_format_vk(*format);
+            // One dispatch may first seed its private writable image from the current renderer
+            // target, then copy its completed result back into that SAME target. Keep two leases:
+            // the source pin protects old pixels until the seed copy, and the destination pin
+            // protects the allocation until guest writeback and final publication complete.
+            // Only exact RGBA8 self-seeds are admitted here; unrelated sampled/imported aliases
+            // still cannot share a destination allocation in this command buffer.
+            const bool own_seed_destination = *format == LiveTargetPixelFormat::Rgba8Unorm &&
+                bi.standalone_seed.valid() && bi.standalone_seed.image == destination.image &&
+                bi.standalone_seed.device == destination.device &&
+                bi.standalone_seed.width == destination.width &&
+                bi.standalone_seed.height == destination.height &&
+                bi.standalone_seed.format == destination.format &&
+                bi.standalone_seed.native_format == destination.native_format &&
+                bi.standalone_seed.layout == destination.layout;
             bool collides_with_source = false;
-            for (const BoundImage& other : images) {
+            for (size_t other_index = 0; other_index < images.size(); ++other_index) {
+                const BoundImage& other = images[other_index];
                 if ((other.imported && other.image == static_cast<VkImage>(destination.image)) ||
                     (other.standalone_seed.valid() &&
-                     other.standalone_seed.image == destination.image) ||
+                     other.standalone_seed.image == destination.image &&
+                     !(other_index == i && own_seed_destination)) ||
                     (other.mirror_destination.valid() &&
                      other.mirror_destination.image == destination.image)) {
                     collides_with_source = true;
                     break;
                 }
             }
+            if (image_timing && perf_capture_timing)
+                std::fprintf(stderr,
+                    "[compute-rtt-destination-check] code=0x%llx binding=%u "
+                    "borrowed=1 own-seed=%u collision=%u layout-match=%u\n",
+                    (unsigned long long)item.code_addr, bi.binding,
+                    own_seed_destination ? 1u : 0u, collides_with_source ? 1u : 0u,
+                    bi.standalone_seed.valid() &&
+                        bi.standalone_seed.layout == destination.layout ? 1u : 0u);
             if (collides_with_source || destination.device != static_cast<void*>(ctx.device) ||
                 destination.kind != prosper::gpu::LiveTargetImageImport::Kind::Color ||
                 destination.width != r->width || destination.height != r->height ||

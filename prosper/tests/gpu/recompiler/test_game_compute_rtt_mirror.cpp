@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <string>
 #include <vector>
 
 using namespace prosper::gpu;
@@ -178,6 +179,80 @@ static int run_destination_mirror_regression() {
     const auto fallback = render(consumer);
     CHECK(mirrored == fallback,
           "device destination mirror pixels equal the independent CPU publication fallback");
+
+    // A renderer image may be the source of a partial write and the destination of its completed
+    // result in one ordered dispatch. The guest bytes are still black from the prior full write;
+    // repainting the renderer target red makes rows below the partial write prove the GPU seed.
+    const auto red_seed = render(producer);
+    CHECK(red_seed.size() == destination.size() &&
+              !std::equal(red_seed.begin() + W * 4, red_seed.end(),
+                          destination.begin() + W * 4),
+          "partial-write source differs from stale guest rows");
+    const auto* color_target = prosper::test::find_persistent_color_target(
+        address, W, H, VK_FORMAT_R8G8B8A8_UNORM);
+    const auto source_layout = color_target ? color_target->layout : VK_IMAGE_LAYOUT_UNDEFINED;
+    ComputeItem partial = item;
+    partial.launch.threads_y = partial.launch.local_y = partial.launch.groups_y = 1;
+    partial.code_addr = 0x37310002u;
+    const auto partial_before = prosper::frontend::live_compute_rtt_destination_mirror_counters();
+    CHECK(prosper::frontend::execute_live_compute_items({partial}),
+          "partial storage writer completes from the renderer image");
+    const auto partial_after = prosper::frontend::live_compute_rtt_destination_mirror_counters();
+    CHECK(partial_after.recorded == partial_before.recorded + 1 &&
+              partial_after.published == partial_before.published + 1,
+          "same-image source and destination publish only after completed writeback");
+    CHECK(std::equal(destination.begin() + W * 4, destination.end(),
+                     red_seed.begin() + W * 4),
+          "partial writer preserves untouched rows from the renderer image");
+    CHECK(import_live_render_target_image(address, source_request, source_import) &&
+              source_import.valid(),
+          "completed partial write leaves its exact renderer image readable");
+    release_live_render_target_image(address);
+    std::vector<uint8_t> mirrored_partial_pixels;
+    std::string mirror_error;
+    CHECK(prosper::test::readback_persistent_color_target(
+              address, W, H, VK_FORMAT_R8G8B8A8_UNORM,
+              mirrored_partial_pixels, mirror_error) &&
+              mirrored_partial_pixels == destination,
+          "same-image destination has the exact completed guest pixels");
+    color_target = prosper::test::find_persistent_color_target(
+        address, W, H, VK_FORMAT_R8G8B8A8_UNORM);
+    CHECK(color_target && color_target->pin_count == 0 && color_target->layout == source_layout,
+          "source and destination leases release both pins and restore the saved layout");
+
+    // The next partial dispatch must seed from the just-published image even with identical
+    // shader inputs. This does not assert that the cached unchanged-writeback shortcut ran.
+    const auto repeat_before = prosper::frontend::live_compute_rtt_destination_mirror_counters();
+    CHECK(prosper::frontend::execute_live_compute_items({partial}),
+          "second partial writer consumes the first mirrored result");
+    const auto repeat_after = prosper::frontend::live_compute_rtt_destination_mirror_counters();
+    CHECK(repeat_after.recorded == repeat_before.recorded + 1 &&
+              repeat_after.published == repeat_before.published + 1 &&
+              std::equal(destination.begin() + W * 4, destination.end(),
+                         red_seed.begin() + W * 4),
+          "repeat partial result preserves untouched rows and remains published");
+    color_target = prosper::test::find_persistent_color_target(
+        address, W, H, VK_FORMAT_R8G8B8A8_UNORM);
+    CHECK(color_target && color_target->pin_count == 0 && color_target->layout == source_layout,
+          "repeat partial write releases both leases at the saved layout");
+
+    const auto failed_partial_before =
+        prosper::frontend::live_compute_rtt_destination_mirror_counters();
+    prosper::frontend::live_compute_fail_next_storage_readback_for_test();
+    CHECK(!prosper::frontend::execute_live_compute_items({partial}),
+          "failed same-image partial completion is reported");
+    const auto failed_partial_after =
+        prosper::frontend::live_compute_rtt_destination_mirror_counters();
+    CHECK(failed_partial_after.recorded == failed_partial_before.recorded + 1 &&
+              failed_partial_after.failed == failed_partial_before.failed + 1 &&
+              failed_partial_after.published == failed_partial_before.published &&
+              !import_live_render_target_image(address, source_request, source_import),
+          "failed same-image completion revokes renderer authority without publication");
+    color_target = prosper::test::find_persistent_color_target(
+        address, W, H, VK_FORMAT_R8G8B8A8_UNORM, false);
+    CHECK(color_target && color_target->pin_count == 0 &&
+              color_target->layout == source_layout,
+          "failed same-image completion releases both leases at the saved layout");
 
     // Packed R11 is the primary destination-mirror shape. The first complete dispatch removes the
     // CPU snapshot; the second writes only row zero, so rows one through H-1 can survive only if
