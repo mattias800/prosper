@@ -11031,9 +11031,11 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // target, then copy its completed result back into that SAME target. Keep two leases:
             // the source pin protects old pixels until the seed copy, and the destination pin
             // protects the allocation until guest writeback and final publication complete.
-            // Only exact RGBA8 self-seeds are admitted here; unrelated sampled/imported aliases
-            // still cannot share a destination allocation in this command buffer.
-            const bool own_seed_destination = *format == LiveTargetPixelFormat::Rgba8Unorm &&
+            // Only exact RGBA8 and packed R11 self-seeds are admitted here; unrelated
+            // sampled/imported aliases still cannot share a destination allocation.
+            const bool own_seed_destination =
+                (*format == LiveTargetPixelFormat::Rgba8Unorm ||
+                 (*format == LiveTargetPixelFormat::R11G11B10Float && bi.packed_r11_storage)) &&
                 bi.standalone_seed.valid() && bi.standalone_seed.image == destination.image &&
                 bi.standalone_seed.device == destination.device &&
                 bi.standalone_seed.width == destination.width &&

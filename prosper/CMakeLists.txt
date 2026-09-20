@@ -2882,6 +2882,10 @@ endif()
       target_link_libraries(test_game_compute_rtt_mirror PRIVATE prosper_live_renderer)
       add_test(NAME game_compute_exec COMMAND test_game_compute)
       add_test(NAME game_compute_rtt_destination_mirror COMMAND test_game_compute_rtt_mirror)
+      add_test(NAME game_compute_rtt_destination_mirror_no_direct_retile
+               COMMAND test_game_compute_rtt_mirror)
+      set_tests_properties(game_compute_rtt_destination_mirror_no_direct_retile PROPERTIES
+        ENVIRONMENT "PROSPER_NO_DIRECT_IMAGE_RETILE=1")
       add_test(NAME game_compute_exec_no_adaptive_storage_result COMMAND test_game_compute)
       set_tests_properties(game_compute_exec_no_adaptive_storage_result PROPERTIES
         ENVIRONMENT "PROSPER_NO_ADAPTIVE_STORAGE_RESULT_VALIDATION=1")
@@ -3314,6 +3318,10 @@ endif()
       target_link_libraries(test_game_compute_rtt_mirror PRIVATE prosper_live_renderer)
       add_test(NAME game_compute_exec COMMAND test_game_compute)
       add_test(NAME game_compute_rtt_destination_mirror COMMAND test_game_compute_rtt_mirror)
+      add_test(NAME game_compute_rtt_destination_mirror_no_direct_retile
+               COMMAND test_game_compute_rtt_mirror)
+      set_tests_properties(game_compute_rtt_destination_mirror_no_direct_retile PROPERTIES
+        ENVIRONMENT "PROSPER_NO_DIRECT_IMAGE_RETILE=1")
       add_test(NAME game_compute_exec_no_adaptive_storage_result COMMAND test_game_compute)
       set_tests_properties(game_compute_exec_no_adaptive_storage_result PROPERTIES
         ENVIRONMENT "PROSPER_NO_ADAPTIVE_STORAGE_RESULT_VALIDATION=1")
