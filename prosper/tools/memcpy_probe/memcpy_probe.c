@@ -30,6 +30,8 @@
 #include <x86intrin.h>
 #include <stdio.h>
 #include <execinfo.h>
+#include <sys/syscall.h>
+#include <ctype.h>
 
 #define SLOTS 8192u
 
@@ -40,6 +42,7 @@
 struct site { uint64_t ra, calls, bytes, cycles; };
 static struct site g_sites[SLOTS];
 static uint64_t g_calls, g_bytes, g_cycles, g_overflow;
+static uint64_t g_invalid_tid_file_reads;
 
 // The report reads shared counters while the game keeps writing them. Relaxed is the right
 // strength -- a torn-free snapshot of each counter, no ordering claimed between them -- and it
@@ -99,6 +102,55 @@ static void* (*real_memcpy)(void*, const void*, size_t);
 static void* (*real_memmove)(void*, const void*, size_t);
 static int (*real_memcmp)(const void*, const void*, size_t);
 static __thread int in_probe;
+static __thread uint32_t cached_tid;
+enum tid_mode { TID_ALL, TID_NUMERIC, TID_FILE_WAIT, TID_INVALID };
+static uint32_t g_tid_mode;
+static uint32_t g_target_tid;
+static uint32_t g_observed_tid;
+static const char* g_tid_file;
+#define TID_MODE() __atomic_load_n(&g_tid_mode, __ATOMIC_ACQUIRE)
+
+// A TID is constant for a thread. Cache the one syscall in TLS: per-copy gettid would become the
+// thing being measured. File mode is read only by the reporter thread and latches one valid value.
+static uint32_t current_tid(void) {
+    if (!cached_tid) cached_tid = (uint32_t)syscall(SYS_gettid);
+    return cached_tid;
+}
+
+static void refresh_tid_file(void) {
+    if (TID_MODE() != TID_FILE_WAIT) return;
+    FILE* f = fopen(g_tid_file, "r");
+    if (!f) return; // Parent has not published the one-shot selection yet.
+    char text[65];
+    const size_t got = fread(text, 1, sizeof text - 1, f);
+    const int extra = fgetc(f);
+    const int read_error = ferror(f);
+    fclose(f);
+    text[got] = '\0';
+    char* end = NULL;
+    const unsigned long value = got ? strtoul(text, &end, 10) : 0;
+    size_t consumed = end ? (size_t)(end - text) : 0;
+    while (consumed < got && isspace((unsigned char)text[consumed])) ++consumed;
+    if (!got || !isdigit((unsigned char)text[0]) || extra != EOF || read_error || !end ||
+        consumed != got || !value || value > UINT32_MAX) {
+        __atomic_fetch_add(&g_invalid_tid_file_reads, 1, __ATOMIC_RELAXED);
+        return;
+    }
+    // One-way state transition: a later replacement cannot redirect an attribution run.
+    __atomic_store_n(&g_target_tid, (uint32_t)value, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_tid_mode, TID_NUMERIC, __ATOMIC_RELEASE);
+}
+
+static int selected_thread(void) {
+    const uint32_t mode = TID_MODE();
+    if (mode == TID_ALL) return 1;
+    if (mode == TID_FILE_WAIT) {
+        // Do not create a new cross-thread atomic hot spot before selection. This population is
+        // intentionally unobserved; its calls are outside the selected-TID attribution window.
+        return 0;
+    }
+    return mode == TID_NUMERIC && current_tid() == LOAD(g_target_tid);
+}
 
 static void* bootstrap_copy(void* d, const void* s, size_t n) {
     unsigned char* dst = (unsigned char*)d;
@@ -109,6 +161,11 @@ static void* bootstrap_copy(void* d, const void* s, size_t n) {
 }
 
 static void record(uint64_t ra, size_t n, uint64_t cycles) {
+    if (TID_MODE() == TID_NUMERIC) {
+        uint32_t unseen = 0;
+        __atomic_compare_exchange_n(&g_observed_tid, &unseen, current_tid(), 0,
+                                    __ATOMIC_RELAXED, __ATOMIC_RELAXED);
+    }
     __atomic_fetch_add(&g_calls, 1, __ATOMIC_RELAXED);
     __atomic_fetch_add(&g_bytes, n, __ATOMIC_RELAXED);
     __atomic_fetch_add(&g_cycles, cycles, __ATOMIC_RELAXED);
@@ -146,14 +203,29 @@ static void dump(void) {
     snprintf(tmp, sizeof tmp, "%s/.memcpy-sites-%d.tmp", dir, (int)getpid());
     FILE* f = fopen(tmp, "w");
     if (!f) return;
-    fprintf(f, "total_calls=%llu total_bytes=%llu total_cycles=%llu overflow_calls=%llu\n",
-            (unsigned long long)LOAD(g_calls), (unsigned long long)LOAD(g_bytes),
-            (unsigned long long)LOAD(g_cycles), (unsigned long long)LOAD(g_overflow));
+    const uint32_t mode = TID_MODE();
+    if (mode == TID_ALL) {
+        fprintf(f, "total_calls=%llu total_bytes=%llu total_cycles=%llu overflow_calls=%llu\n",
+                (unsigned long long)LOAD(g_calls), (unsigned long long)LOAD(g_bytes),
+                (unsigned long long)LOAD(g_cycles), (unsigned long long)LOAD(g_overflow));
+    } else {
+        const char* mode_name = mode == TID_NUMERIC ? "tid-filter" :
+                                mode == TID_FILE_WAIT ? "tid-file-wait" : "invalid-tid-filter";
+        fprintf(f, "probe_mode=%s target_tid=%u observed_tid=%u preselection_skipped_calls=unobserved "
+                   "invalid_tid_file_reads=%llu total_calls=%llu total_bytes=%llu total_cycles=%llu "
+                   "overflow_calls=%llu\n", mode_name, LOAD(g_target_tid), LOAD(g_observed_tid),
+                (unsigned long long)LOAD(g_invalid_tid_file_reads),
+                (unsigned long long)LOAD(g_calls), (unsigned long long)LOAD(g_bytes),
+                (unsigned long long)LOAD(g_cycles), (unsigned long long)LOAD(g_overflow));
+    }
     // Resolve here rather than offline. A raw return address is useless once the process is gone --
     // shared libraries are relocated, so `addr2line` against the executable silently prints `??` for
     // every site that is NOT in it, and the biggest site in the first run of this probe was exactly
     // that. dladdr costs one call per site per dump, never per copy.
-    fprintf(f, "# return_address cycles calls bytes dso dso_offset nearest_symbol\n");
+    if (mode == TID_ALL)
+        fprintf(f, "# return_address cycles calls bytes dso dso_offset nearest_symbol\n");
+    else
+        fprintf(f, "# tid return_address cycles calls bytes dso dso_offset nearest_symbol\n");
     for (unsigned i = 0; i < SLOTS; i++) {
         if (!LOAD(g_sites[i].ra)) continue;
         const uint64_t raw = LOAD(g_sites[i].ra);
@@ -165,6 +237,7 @@ static void dump(void) {
         const char* sym = ok && info.dli_sname ? info.dli_sname : "?";
         unsigned long long off = 0;
         if (ok && info.dli_fbase) off = addr - (uint64_t)(uintptr_t)info.dli_fbase;
+        if (mode != TID_ALL) fprintf(f, "%u ", LOAD(g_target_tid));
         fprintf(f, "%s%llx %llu %llu %llu %s %llx %s\n", is_cmp ? "CMP:" : "",
                 (unsigned long long)addr, (unsigned long long)LOAD(g_sites[i].cycles),
                 (unsigned long long)LOAD(g_sites[i].calls),
@@ -202,8 +275,20 @@ static void* reporter(void* unused) {
     (void)unused;
     // First report early so a short-lived process -- the positive control, above all -- produces a
     // file at all; then on the same 10 s cadence as tools/getenv_probe.
-    sleep(2); dump();
-    for (;;) { sleep(10); dump(); }
+    sleep(2);
+    refresh_tid_file();
+    dump();
+    for (;;) {
+        if (TID_MODE() == TID_FILE_WAIT) {
+            sleep(1);
+            refresh_tid_file();
+            static unsigned ticks;
+            if (++ticks == 10) { dump(); ticks = 0; }
+        } else {
+            sleep(10);
+            dump();
+        }
+    }
     return NULL;
 }
 
@@ -217,6 +302,23 @@ __attribute__((constructor)) static void init(void) {
     // and clang rejects it in C mode at -std=c17 and -std=c23 -- including the clang in this
     // project's own container. Nothing builds this file today, which is exactly why it must not
     // acquire a dialect trap for whoever first adds it to a target.
+    const char* tid = getenv("PROSPER_MEMCPY_PROBE_TID");
+    g_tid_file = getenv("PROSPER_MEMCPY_PROBE_TID_FILE");
+    if (tid && g_tid_file) {
+        __atomic_store_n(&g_tid_mode, TID_INVALID, __ATOMIC_RELAXED);
+    } else if (tid) {
+        char* end = NULL;
+        const unsigned long value = strtoul(tid, &end, 10);
+        if (!isdigit((unsigned char)tid[0]) || !end || *end || !value || value > UINT32_MAX)
+            __atomic_store_n(&g_tid_mode, TID_INVALID, __ATOMIC_RELAXED);
+        else {
+            __atomic_store_n(&g_target_tid, (uint32_t)value, __ATOMIC_RELAXED);
+            __atomic_store_n(&g_tid_mode, TID_NUMERIC, __ATOMIC_RELEASE);
+        }
+    } else if (g_tid_file) {
+        __atomic_store_n(&g_tid_mode, TID_FILE_WAIT, __ATOMIC_RELAXED);
+        refresh_tid_file();
+    }
     const char* big = getenv("PROSPER_MEMCPY_PROBE_BIG_BYTES");
     if (big) {
         char* end = NULL;
@@ -233,6 +335,7 @@ __attribute__((constructor)) static void init(void) {
 
 #define PROBE_BODY(REAL)                                                          \
     if (in_probe || !(REAL)) return bootstrap_copy(d, s, n);                      \
+    if (!selected_thread()) return (REAL)(d, s, n);                               \
     in_probe = 1;                                                                 \
     const uint64_t t0 = __rdtsc();                                                \
     void* r = (REAL)(d, s, n);                                                    \
@@ -255,6 +358,7 @@ int memcmp(const void* a, const void* b, size_t n) {
         for (size_t i = 0; i < n; i++) if (x[i] != y[i]) return (int)x[i] - (int)y[i];
         return 0;
     }
+    if (!selected_thread()) return real_memcmp(a, b, n);
     in_probe = 1;
     const uint64_t t0 = __rdtsc();
     const int r = real_memcmp(a, b, n);

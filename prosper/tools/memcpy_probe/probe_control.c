@@ -14,23 +14,80 @@
 #include <x86intrin.h>
 #include <dlfcn.h>
 #include <stdint.h>
+#include <pthread.h>
+#include <unistd.h>
+#include <sys/syscall.h>
 
 #define A_CALLS 200000u
 #define B_CALLS 100000u
 #define C_CALLS  50000u
 #define D_CALLS  70000u
+#define THREAD_CALLS 50000u
 
 static unsigned char* src;
 static unsigned char* dst;
+static _Thread_local unsigned char* thread_dst;
 static volatile size_t a_bytes = 64, b_bytes = 4096, c_bytes = 65536, d_bytes = 8192;
 
 __attribute__((noinline)) static void site_a(void) { memcpy(dst, src, a_bytes); }
-__attribute__((noinline)) static void site_b(void) { memcpy(dst, src, b_bytes); }
+__attribute__((noinline)) static void site_b(void) { memcpy(thread_dst ? thread_dst : dst, src, b_bytes); }
 __attribute__((noinline)) static void site_c(void) { memmove(dst, src, c_bytes); }
 // A COMPARISON site. Without it "0 CMP rows" is indistinguishable from an interposer that never
 // fires -- the same trap the byte counts above exist to close, one function over.
 static volatile int sink;
 __attribute__((noinline)) static void site_d(void) { sink = memcmp(dst, src, d_bytes); }
+
+// Two workers intentionally execute the SAME noinline call site. A TID-filtered probe must report
+// exactly one worker's calls when the control publishes that worker's OS TID; run each selection
+// arm separately. The file is written before the workers start their measured loops, then held for
+// three seconds so the probe's reporter can latch it without racing the workload.
+static pthread_barrier_t threaded_ready, threaded_go;
+static uint32_t worker_tid[2];
+static unsigned char* worker_dst[2];
+
+static void* same_site_worker(void* opaque) {
+    const unsigned index = (unsigned)(uintptr_t)opaque;
+    thread_dst = worker_dst[index];
+    worker_tid[index] = (uint32_t)syscall(SYS_gettid);
+    pthread_barrier_wait(&threaded_ready);
+    pthread_barrier_wait(&threaded_go);
+    for (unsigned i = 0; i < THREAD_CALLS; i++) site_b();
+    return NULL;
+}
+
+static int write_selected_tid(const char* path, unsigned selected) {
+    char temp[512];
+    if (snprintf(temp, sizeof temp, "%s.tmp", path) >= (int)sizeof temp) return 1;
+    FILE* f = fopen(temp, "w");
+    if (!f) return 1;
+    const int wrote = fprintf(f, "%u\n", worker_tid[selected]) > 0;
+    const int closed = fclose(f) == 0;
+    const int ok = wrote && closed && rename(temp, path) == 0;
+    if (!ok) { remove(temp); return 1; }
+    return 0;
+}
+
+static int threaded_control(const char* tid_file, unsigned selected) {
+    pthread_t workers[2];
+    if (pthread_barrier_init(&threaded_ready, NULL, 3) ||
+        pthread_barrier_init(&threaded_go, NULL, 3)) return 1;
+    for (unsigned i = 0; i < 2; i++) {
+        worker_dst[i] = calloc(1, 1u << 17);
+        if (!worker_dst[i]) return 1;
+        if (pthread_create(&workers[i], NULL, same_site_worker, (void*)(uintptr_t)i)) return 1;
+    }
+    pthread_barrier_wait(&threaded_ready);
+    if (write_selected_tid(tid_file, selected)) return 1;
+    sleep(3);
+    // The probe is one-shot: replacing the file after its latch must not redirect these calls.
+    if (write_selected_tid(tid_file, 1 - selected)) return 1;
+    pthread_barrier_wait(&threaded_go);
+    for (unsigned i = 0; i < 2; i++) pthread_join(workers[i], NULL);
+    printf("THREAD tid0=%u tid1=%u selected=%u replaced_with=%u EXPECT selected_calls=%u at one shared site\n",
+           worker_tid[0], worker_tid[1], worker_tid[selected], worker_tid[1 - selected], THREAD_CALLS);
+    free(worker_dst[0]); free(worker_dst[1]);
+    return 0;
+}
 
 // CALIBRATE THE CYCLE COLUMN. Counts and bytes above are exact; cycles are not, and the column the
 // README tells you to rank by is the inexact one. The probe brackets every call with two rdtsc, so
@@ -109,9 +166,15 @@ static void calibrate(void) {
     printf("  => rank LARGE sites by the cycle column; treat sub-KiB rows as mostly instrument.\n");
 }
 
-int main(void) {
+int main(int argc, char** argv) {
     src = calloc(1, 1u << 17); dst = calloc(1, 1u << 17);
     if (!src || !dst) return 1;
+    if (argc == 4 && !strcmp(argv[1], "--threaded")) {
+        const unsigned selected = (unsigned)strtoul(argv[3], NULL, 10);
+        if (selected > 1) return 2;
+        return threaded_control(argv[2], selected);
+    }
+    if (argc != 1) return 2;
     for (unsigned i = 0; i < A_CALLS; i++) site_a();
     for (unsigned i = 0; i < B_CALLS; i++) site_b();
     for (unsigned i = 0; i < C_CALLS; i++) site_c();
