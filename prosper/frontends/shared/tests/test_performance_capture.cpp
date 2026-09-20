@@ -202,6 +202,12 @@ int main() {
             record.program_hash = 0xfedcba9876543210ull;
         }
         record.total_ms = 3 + i;
+        if (i == 0) {
+            record.dispatches = 9;
+            record.dispatch_shapes.push_back({4, 5, 6, 8, 2, 1, 3, false});
+            record.dispatch_shapes.push_back({7, 1, 1, 64, 1, 1, 4, true});
+            record.dispatch_shape_overflow = 2;
+        }
         capture.record_compute(record);
     }
 
@@ -248,6 +254,8 @@ int main() {
               text.find("\"buffer_upload_bytes\":4294967297,") != std::string::npos &&
               text.find("\"buffer_upload_bytes\":4294967298,") == std::string::npos,
           "buffer_upload_bytes preserves exact 64-bit values and the renderer cap");
+    check(text.find("\"dispatch_shapes\":[{\"groups\":[4,5,6],\"local\":[8,2,1],\"dispatches\":3,\"indirect\":false},{\"groups\":[7,1,1],\"local\":[64,1,1],\"dispatches\":4,\"indirect\":true}],\"dispatch_shape_overflow\":2") != std::string::npos,
+          "F8 serializes direct and resolved-indirect launch shapes with their overflow count");
     check(count_text(text, "\"buffer_range_uploads\":") == 2 &&
               text.find("\"buffer_range_uploads\":4294968296,") != std::string::npos &&
               text.find("\"buffer_range_uploads\":4294968297,") != std::string::npos,

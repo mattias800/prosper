@@ -1019,6 +1019,44 @@ class ComputeDecompositionTests(unittest.TestCase):
         # ...and the header must not advertise a section this capture cannot supply.
         self.assertNotIn("GPU brackets partition", text)
 
+    def test_launch_shapes_show_direct_and_resolved_indirect_dimensions(self):
+        record = dict(HIDDEN_COST_COMPUTE[0], dispatches=9,
+                      dispatch_shapes=[
+                          {"groups": [4, 5, 6], "local": [8, 2, 1],
+                           "dispatches": 3, "indirect": False},
+                          {"groups": [7, 1, 1], "local": [64, 1, 1],
+                           "dispatches": 4, "indirect": True},
+                      ], dispatch_shape_overflow=2)
+        summary, text = self._render([record])
+        shapes = summary["compute_launch_shapes"]
+        self.assertTrue(shapes["available"])
+        self.assertEqual((shapes["direct_dispatches"],
+                          shapes["resolved_indirect_dispatches"],
+                          shapes["unknown_dispatches"]), (3, 4, 2))
+        self.assertIn("direct groups=4x5x6 local=8x2x1 dispatches=3", text)
+        self.assertIn("resolved-indirect groups=7x1x1 local=64x1x1 dispatches=4", text)
+        self.assertIn("unknown dispatches were omitted", text)
+
+    def test_old_capture_leaves_launch_dimensions_explicitly_unavailable(self):
+        _, text = self._render(HIDDEN_COST_COMPUTE)
+        self.assertIn("compute launch shapes: UNAVAILABLE (capture predates launch-shape records)", text)
+
+    def test_launch_shape_population_cannot_exceed_dispatch_count(self):
+        malformed = dict(HIDDEN_COST_COMPUTE[0], dispatches=1,
+                         dispatch_shapes=[{"groups": [1, 1, 1], "local": [1, 1, 1],
+                                           "dispatches": 2, "indirect": True}],
+                         dispatch_shape_overflow=0)
+        with self.assertRaisesRegex(CaptureError, "does not match batch dispatches"):
+            summarize(capture(SAMPLES, compute=[malformed]))
+
+    def test_launch_shape_population_cannot_omit_dispatches(self):
+        malformed = dict(HIDDEN_COST_COMPUTE[0], dispatches=3,
+                         dispatch_shapes=[{"groups": [1, 1, 1], "local": [1, 1, 1],
+                                           "dispatches": 2, "indirect": False}],
+                         dispatch_shape_overflow=0)
+        with self.assertRaisesRegex(CaptureError, "does not match batch dispatches"):
+            summarize(capture(SAMPLES, compute=[malformed]))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

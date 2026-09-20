@@ -191,8 +191,23 @@ struct RendererTimingRecord {
 // One live-compute batch. CPU-fast-path dispatches are included in `dispatches`; the cumulative
 // fast-path count lets the report keep that population visible instead of silently omitting it.
 struct ComputeTimingRecord {
+    // A bounded histogram of the actual launches handed to the live backend. The source list can
+    // be much larger than an F8 record, so unseen shapes increment `dispatch_shape_overflow`
+    // instead of allocating or serializing an unbounded per-dispatch trace.
+    struct DispatchShape {
+        uint32_t groups_x = 0, groups_y = 0, groups_z = 0;
+        uint32_t local_x = 0, local_y = 0, local_z = 0;
+        uint64_t dispatches = 0;
+        bool indirect = false;
+    };
+    static constexpr size_t kMaxDispatchShapes = 8;
+
     uint64_t monotonic_ns = 0;
     uint64_t dispatches = 0;
+    std::vector<DispatchShape> dispatch_shapes;
+    // Number of dispatches whose distinct shape was omitted after the bounded histogram filled.
+    // A nonzero value makes the report's remaining launch population explicitly incomplete.
+    uint64_t dispatch_shape_overflow = 0;
     uint64_t cpu_fast_total = 0;
     // Present only when every dispatch in the retained batch uses one identical program at one
     // run-local guest address. The SPIR-V hash is stable across address relocation and lets the

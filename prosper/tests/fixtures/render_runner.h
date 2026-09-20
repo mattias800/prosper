@@ -5533,59 +5533,104 @@ inline bool copy_persistent_color_target(uint64_t src_id, uint64_t dst_id, uint3
 //
 // Costly by construction -- a full-extent copy per face -- so callers must gate it on a cube sample
 // that actually resolves to retained faces, never run it speculatively.
+// Keep a completed depth transfer mapped only until its caller consumes it. A cube readback can
+// acquire every selected face before touching the destination, so failure on a later face leaves
+// the old guest/compute fallback untouched. The returned mapping never enters a cache or outlives
+// this synchronous render callback.
+struct PersistentDsDepthReadback {
+    VkDevice device = VK_NULL_HANDLE;
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    void* mapped = nullptr;
+    size_t count = 0;
+
+    PersistentDsDepthReadback() = default;
+    PersistentDsDepthReadback(const PersistentDsDepthReadback&) = delete;
+    PersistentDsDepthReadback& operator=(const PersistentDsDepthReadback&) = delete;
+    ~PersistentDsDepthReadback() {
+        if (mapped) vkUnmapMemory(device, memory);
+        if (buffer) vkDestroyBuffer(device, buffer, nullptr);
+        if (memory) prosper::gpu::free_device_memory(device, memory);
+    }
+
+    bool acquire(PersistentDsImage& image, uint32_t width, uint32_t height,
+                 std::string& error) {
+        error.clear();
+        if (!image.image || !image.layout_initialized || !image.depth_valid) {
+            error = "retained DS image has no readable depth plane";
+            return false;
+        }
+        const RenderVkCtx& ctx = render_vk_ctx();
+        if (!ctx.ok) { error = "Vulkan renderer is unavailable"; return false; }
+        device = ctx.dev;
+        const size_t depth_bytes = static_cast<size_t>(width) * height * sizeof(float);
+        if (!persistent_ds_transfer_buffer(ctx, depth_bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                           buffer, memory, error))
+            return false;
+        const BackendSubmissionState transfer = submit_persistent_ds_transfer(
+            ctx, image.image, VK_IMAGE_ASPECT_DEPTH_BIT,
+            VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer, width, height,
+            /*depth=*/true, /*stencil=*/false, false, error);
+        if (transfer != BackendSubmissionState::Complete) {
+            if (transfer == BackendSubmissionState::Pending) {
+                // The existing unproven-submission path deliberately retains these objects: a
+                // pending command buffer may still reference them after the callback returns.
+                buffer = VK_NULL_HANDLE;
+                memory = VK_NULL_HANDLE;
+            }
+            if (error.empty()) error = "retained DS depth transfer did not complete";
+            return false;
+        }
+        // The transfer records host availability before its completion wait. HOST_CACHED memory
+        // may also be non-coherent, so invalidate it before the first mapped CPU read.
+        const MappedReadbackPlan mapping = mapped_readback_plan(depth_bytes);
+        void* result = nullptr;
+        if (vkMapMemory(device, memory, 0, mapping.map_size, 0, &result) != VK_SUCCESS || !result) {
+            error = "cannot map retained DS depth readback";
+            return false;
+        }
+        mapped = result;
+        if (!invalidate_mapped_readback(ctx, memory, mapping)) {
+            error = "cannot invalidate retained DS depth readback";
+            return false;
+        }
+        count = static_cast<size_t>(width) * height;
+        return true;
+    }
+
+    bool valid() const { return mapped && count; }
+    float at(size_t index) const {
+        // The mapped bytes have no C++ float object lifetime. A scalar memcpy is inlined by the
+        // compiler and preserves the old float-vector conversion bit for bit.
+        float value;
+        std::memcpy(&value, static_cast<const uint8_t*>(mapped) + index * sizeof(value),
+                    sizeof(value));
+        return value;
+    }
+};
+
+// The direct path keeps every selected face's transfer allocation mapped through conversion.
+// Large cubes use the sequential vector readback to limit concurrent staging payload. The
+// device's actual VkMemoryRequirements::size may exceed this logical payload after alignment, so
+// this is not an exact Vulkan allocation budget or a device-specific feature assumption.
+inline bool mapped_depth_cube_payload_within_limit(uint32_t width, uint32_t height,
+                                                    uint32_t present_mask) {
+    constexpr size_t kMaxConcurrentReadbackPayloadBytes = 64u << 20;
+    unsigned faces = 0;
+    for (uint32_t bit = 0; bit < 6; ++bit) faces += (present_mask >> bit) & 1u;
+    if (!width || !height || !faces) return false;
+    const size_t per_face_limit = kMaxConcurrentReadbackPayloadBytes / faces;
+    return static_cast<size_t>(width) <= per_face_limit / sizeof(float) / height;
+}
+
 inline bool read_persistent_ds_depth(PersistentDsImage& image, uint32_t width, uint32_t height,
                                      std::vector<float>& out, std::string& error) {
-    error.clear();
     out.clear();
-    if (!image.image || !image.layout_initialized || !image.depth_valid) {
-        error = "retained DS image has no readable depth plane";
-        return false;
-    }
-    const RenderVkCtx& ctx = render_vk_ctx();
-    if (!ctx.ok) { error = "Vulkan renderer is unavailable"; return false; }
-    const size_t depth_bytes = static_cast<size_t>(width) * height * 4;
-    VkBuffer buffer = VK_NULL_HANDLE; VkDeviceMemory memory = VK_NULL_HANDLE;
-    if (!persistent_ds_transfer_buffer(ctx, depth_bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                                       buffer, memory, error))
-        return false;
-    const BackendSubmissionState transfer = submit_persistent_ds_transfer(
-        ctx, image.image, VK_IMAGE_ASPECT_DEPTH_BIT,
-        VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer, width, height,
-        /*depth=*/true, /*stencil=*/false, false, error);
-    if (transfer != BackendSubmissionState::Complete) {
-        if (transfer != BackendSubmissionState::Pending) {
-            vkDestroyBuffer(ctx.dev, buffer, nullptr);
-            prosper::gpu::free_device_memory(ctx.dev, memory);
-        }
-        if (error.empty()) error = "retained DS depth transfer did not complete";
-        return false;
-    }
-    // This is a pure TRANSFER_DST readback, so its memory may be HOST_CACHED and NOT HOST_COHERENT
-    // -- the allocator above actively prefers HOST_CACHED for this usage. Reading the mapping
-    // without invalidating first returns whatever the CPU cache happens to hold, which for a
-    // freshly-allocated buffer is plausible-looking garbage rather than an obvious failure. Both
-    // sibling readbacks in this file do this; this one did not.
-    const MappedReadbackPlan mapping = mapped_readback_plan(depth_bytes);
-    void* mapped = nullptr;
-    if (vkMapMemory(ctx.dev, memory, 0, mapping.map_size, 0, &mapped) != VK_SUCCESS || !mapped) {
-        vkDestroyBuffer(ctx.dev, buffer, nullptr);
-        prosper::gpu::free_device_memory(ctx.dev, memory);
-        error = "cannot map retained DS depth readback";
-        return false;
-    }
-    if (!invalidate_mapped_readback(ctx, memory, mapping)) {
-        vkUnmapMemory(ctx.dev, memory);
-        vkDestroyBuffer(ctx.dev, buffer, nullptr);
-        prosper::gpu::free_device_memory(ctx.dev, memory);
-        error = "cannot invalidate retained DS depth readback";
-        return false;
-    }
-    out.resize(static_cast<size_t>(width) * height);
-    std::memcpy(out.data(), mapped, depth_bytes);
-    vkUnmapMemory(ctx.dev, memory);
-    vkDestroyBuffer(ctx.dev, buffer, nullptr);
-    prosper::gpu::free_device_memory(ctx.dev, memory);
+    PersistentDsDepthReadback readback;
+    if (!readback.acquire(image, width, height, error)) return false;
+    out.resize(readback.count);
+    std::memcpy(out.data(), readback.mapped, readback.count * sizeof(float));
     return true;
 }
 
@@ -5630,6 +5675,53 @@ inline PersistentDsCubeSelection select_persistent_ds_cube_depth(
 inline bool& depth_cube_readback_failure_once() {
     static thread_local bool armed = false;
     return armed;
+}
+
+// Fail after N successful face acquisitions. This forces the transactional rollback path that a
+// failure before the first face cannot exercise; never armed by the live frontend.
+inline int& depth_cube_readback_failure_after_faces() {
+    static thread_local int remaining = -1;
+    return remaining;
+}
+
+inline bool acquire_persistent_ds_cube_depth(
+    const PersistentDsCubeSelection& selected, uint32_t width, uint32_t height,
+    std::array<PersistentDsDepthReadback, 6>& faces, std::string& error) {
+    for (uint32_t slice = 0; slice < 6u; ++slice) {
+        if (!(selected.present_mask & (1u << slice))) continue;
+        int& remaining = depth_cube_readback_failure_after_faces();
+        if (remaining == 0) {
+            remaining = -1;
+            error = "injected later depth cube readback failure";
+            return false;
+        }
+        if (!faces[slice].acquire(*selected.faces[slice], width, height, error)) return false;
+        if (remaining > 0) --remaining;
+    }
+    // An incomplete selection cannot leave a test-only failure armed for an unrelated callback.
+    if (depth_cube_readback_failure_after_faces() >= 0)
+        depth_cube_readback_failure_after_faces() = -1;
+    return true;
+}
+
+inline bool read_persistent_ds_cube_depth_mapped(
+    uint64_t base, uint32_t width, uint32_t height,
+    std::array<PersistentDsDepthReadback, 6>& faces, uint32_t& slices_found,
+    std::string& error, uint32_t* present_mask = nullptr, uint32_t* known_mask = nullptr) {
+    error.clear();
+    slices_found = 0;
+    const PersistentDsCubeSelection selected =
+        select_persistent_ds_cube_depth(base, width, height);
+    if (present_mask) *present_mask = selected.present_mask;
+    if (known_mask) *known_mask = selected.known_mask;
+    if (std::exchange(depth_cube_readback_failure_once(), false)) {
+        error = "injected depth cube readback failure";
+        return false;
+    }
+    if (!acquire_persistent_ds_cube_depth(selected, width, height, faces, error)) return false;
+    for (uint32_t slice = 0; slice < 6u; ++slice)
+        slices_found += (selected.present_mask >> slice) & 1u;
+    return slices_found != 0;
 }
 
 // Read every currently retained face. Missing faces stay empty for the caller's guest fallback;
@@ -5686,6 +5778,18 @@ inline PersistentDsCubeSelection select_persistent_ds_cube_depth_after(
         }
     }
     return selected;
+}
+
+inline bool read_persistent_ds_cube_depth_after_mapped(
+    uint64_t base, uint32_t width, uint32_t height, uint64_t producer_command_order,
+    std::array<PersistentDsDepthReadback, 6>& faces, uint32_t& present_mask,
+    uint32_t& known_mask, std::string& error) {
+    error.clear();
+    const PersistentDsCubeSelection selected = select_persistent_ds_cube_depth_after(
+        base, width, height, producer_command_order);
+    present_mask = selected.present_mask;
+    known_mask = selected.known_mask;
+    return acquire_persistent_ds_cube_depth(selected, width, height, faces, error);
 }
 
 inline bool read_persistent_ds_cube_depth_after(

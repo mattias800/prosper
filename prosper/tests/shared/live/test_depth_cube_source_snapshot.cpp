@@ -8,6 +8,7 @@
 #include "shared/live/depth_cube_source_snapshot.hpp"
 #include <bit>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <vector>
@@ -134,6 +135,21 @@ int main(int argc, char** argv) {
     check(center(render(), 191) && texture_decode_scope_stats().decodes == 1,
           "same renderer generation retries after readback failure");
 
+    // The mapped path keeps successful faces private until every selected face has been
+    // acquired. Failing after face 0 must leave the destination on the ordinary fallback and
+    // must not admit a cache entry under the unchanged renderer generation.
+    if (!std::getenv("PROSPER_NO_MAPPED_DEPTH_CUBE")) {
+        seed_faces(5, 0.75f); // Advance the renderer generation beyond the successful retry.
+        prosper::test::depth_cube_readback_failure_after_faces() = 1;
+        reset_texture_decode_scope_stats();
+        const auto late_fallback = render();
+        check(!late_fallback.empty() && texture_decode_scope_stats().cube_snapshot_refusals == 1,
+              "later-face failure declines partial mapped cube publication");
+        reset_texture_decode_scope_stats();
+        check(center(render(), 191) && texture_decode_scope_stats().decodes == 1,
+              "later-face failure retries the same renderer generation");
+    }
+
     seed_faces(5, 0.5f);
     prosper::test::depth_cube_readback_failure_once() = true;
     reset_texture_decode_scope_stats();
@@ -181,6 +197,10 @@ int main(int argc, char** argv) {
     check(!DepthCubeSourceLayout{UINT64_MAX - 8, 8, 8}.fits(UINT64_MAX - 8, 8),
           "overflowing face addresses are rejected");
     check(!layout.fits(layout.base, 5 * layout.stride), "full face ranges must fit the mutation-proof span");
+    check(prosper::test::mapped_depth_cube_payload_within_limit(512, 512, 0x3f) &&
+          !prosper::test::mapped_depth_cube_payload_within_limit(4096, 4096, 0x3f) &&
+          !prosper::test::mapped_depth_cube_payload_within_limit(UINT32_MAX, UINT32_MAX, 0x3f),
+          "mapped cube payload limit admits ordinary faces and declines large cubes");
     unmap(guest, 0x10000, 0, 0, 0, 0);
     std::printf("depth cube source snapshot: %d failures\n", failures);
     return failures ? 1 : 0;

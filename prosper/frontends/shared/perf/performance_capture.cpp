@@ -524,6 +524,17 @@ void InteractivePerformanceCapture::publish_completed(std::unique_ptr<PendingCap
             out << ",\"program_hash\":";
             write_optional(out, record.program_hash);
             out << ",\"total_ms\":" << record.total_ms
+                << ",\"dispatch_shapes\":[";
+            for (size_t i = 0; i < record.dispatch_shapes.size(); ++i) {
+                const auto& shape = record.dispatch_shapes[i];
+                if (i) out << ',';
+                out << "{\"groups\":[" << shape.groups_x << ',' << shape.groups_y << ','
+                    << shape.groups_z << "],\"local\":[" << shape.local_x << ','
+                    << shape.local_y << ',' << shape.local_z << "],\"dispatches\":"
+                    << shape.dispatches << ",\"indirect\":"
+                    << (shape.indirect ? "true" : "false") << '}';
+            }
+            out << "],\"dispatch_shape_overflow\":" << record.dispatch_shape_overflow
                 << ",\"gpu_timestamp_samples\":" << record.gpu_timestamp_samples
                 << ",\"gpu_device_ms\":" << record.gpu_device_ms
                 << ",\"gpu_shader_ms\":" << record.gpu_shader_ms

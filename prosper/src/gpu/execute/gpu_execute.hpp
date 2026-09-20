@@ -473,6 +473,10 @@ struct ComputeItem {
     std::vector<uint32_t> user_sgprs;
     std::shared_ptr<ShaderResourceTable> resources;
     ComputeLaunchDimensions launch;
+    // Kept after indirect arguments are resolved, because the resolved Dispatch itself has
+    // `indirect` cleared before it reaches this item. F8 uses this provenance to label a launch
+    // shape as direct or resolved-indirect without re-reading mutable guest argument memory.
+    bool indirect_dispatch = false;
     uint64_t code_addr = 0;
     uint64_t dispatch_index = 0;
     uint64_t submit_no = 0;

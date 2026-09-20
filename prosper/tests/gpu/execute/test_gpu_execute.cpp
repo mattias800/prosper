@@ -1690,15 +1690,19 @@ int main() {
         indirect_dispatch.command_order = 18;
         indirect.dispatches.push_back(indirect_dispatch);
         ComputeLaunchDimensions resolved_large{};
+        bool resolved_large_was_indirect = false;
         compute_calls = 0;
         set_submit_compute([&](const std::vector<ComputeItem>& items) {
             compute_calls += static_cast<uint32_t>(items.size());
-            if (!items.empty()) resolved_large = items.front().launch;
+            if (!items.empty()) {
+                resolved_large = items.front().launch;
+                resolved_large_was_indirect = items.front().indirect_dispatch;
+            }
             return !items.empty();
         });
         const bool indirect_executed = execute_nonrender_submit_work(indirect, 1442);
         set_submit_compute({});
-        CHECK(indirect_executed && compute_calls == 1 &&
+        CHECK(indirect_executed && compute_calls == 1 && resolved_large_was_indirect &&
                   resolved_large.groups_x == large_indirect_args[0] &&
                   resolved_large.groups_y == 1 && resolved_large.groups_z == 1,
               "indirect dispatch retains workgroup counts above Vulkan's portable minimum");
@@ -1742,9 +1746,11 @@ int main() {
         direct_ordered.dispatches = {first_direct, late_direct};
         uint32_t ordered_compute_calls = 0;
         bool late_consumer_executed = false;
+        bool ordered_calls_were_direct = true;
         set_submit_compute([&](const std::vector<ComputeItem>& items) {
             if (items.empty()) return false;
             ++ordered_compute_calls;
+            ordered_calls_were_direct &= !items.front().indirect_dispatch;
             if (items.front().code_addr == reinterpret_cast<uint64_t>(kNoopCs)) {
                 kOrderedLateCs[0] = 0xBF810000u;
             } else if (items.front().code_addr ==
@@ -1755,7 +1761,8 @@ int main() {
         });
         execute_ordered_and_present(direct_ordered, W, H, 1443, /*publish=*/false);
         set_submit_compute({});
-        CHECK(ordered_compute_calls == 2 && late_consumer_executed,
+        CHECK(ordered_compute_calls == 2 && late_consumer_executed &&
+                  ordered_calls_were_direct,
               "direct compute consumer is realized after its in-submit producer completes");
         kOrderedLateCs[0] = 0u;
     }
