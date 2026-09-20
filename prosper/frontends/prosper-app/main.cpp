@@ -1741,6 +1741,14 @@ int main(int argc, char** argv) {
         auto sample = prosper::perf::collect_process_sample(
             at, gpu::present_count(), prosper::frontend::rendered_frame_counter(
                 vk.gpu_present, gpu::present_frame_seq()), shown);
+        if (prosper::frontend::producer_lineage_enabled()) {
+            const auto lineage = prosper::frontend::producer_lineage_counters().snapshot();
+            sample.producer_publications = lineage.producer_publications;
+            sample.producer_publications_known = lineage.producer_publications_known;
+            sample.producer_delivered_new = lineage.producer_delivered_new;
+            sample.producer_delivered_repeat = lineage.producer_delivered_repeat;
+            sample.producer_delivered_unknown = lineage.producer_delivered_unknown;
+        }
         if (perfCapture.present_handoff_timing_active())
             sample.pending_writes = gpu::try_pending_write_snapshot();
         return sample;
@@ -2999,6 +3007,8 @@ int main(int argc, char** argv) {
                     !pendingGrabScreenshot.empty() || pendingSnapVerdict.has_value() ||
                         pendingActualTarget.has_value(), grabReady,
                     showFps, fpsForPresent);
+                prosper::frontend::producer_lineage_counters().presentation(
+                    attempt == PresentAttempt::presented, gf.producer);
                 trace.emit(prosper::perf::PresentHandoffEvent::GpuAttemptResult, static_cast<int>(attempt));
                 gpuPresentedW = gf.width; gpuPresentedH = gf.height;
                 if (grabReady) {
@@ -3075,6 +3085,8 @@ int main(int argc, char** argv) {
                     }
                     PresentAttempt a = present_frame(vk, cf.rgba->data(), cf.width, cf.height,
                                                      fpsForPresent);
+                    prosper::frontend::producer_lineage_counters().presentation(
+                        a == PresentAttempt::presented, {});
                     trace.emit(prosper::perf::PresentHandoffEvent::CpuAttemptResult, static_cast<int>(a));
                     if (gpuPrevSlot >= 0) { prosper::frontend::present_blit_release(gpuPrevSlot); gpuPrevSlot = -1; }
                     if (a == PresentAttempt::out_of_date) swapchainDirty = true;
@@ -3107,6 +3119,8 @@ int main(int argc, char** argv) {
             if (w == 0 || h == 0) { std::this_thread::sleep_for(std::chrono::milliseconds(2)); continue; }
             if (frame.rgba && frame.rgba->size() == (size_t)w * h * 4) {
                 PresentAttempt attempt = present_frame(vk, frame.rgba->data(), w, h, fpsForPresent);
+                prosper::frontend::producer_lineage_counters().presentation(
+                    attempt == PresentAttempt::presented, {});
                 if (attempt == PresentAttempt::out_of_date) {
                     // Out-of-date/suboptimal: share the resize/fullscreen recreation path next loop.
                     swapchainDirty = true;

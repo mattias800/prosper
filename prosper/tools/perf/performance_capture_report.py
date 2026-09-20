@@ -768,6 +768,62 @@ def summarize(records):
         "rendered_fps": _counter_rate(post, "rendered_frames", seconds or 0) if seconds else None,
         "host_fps": _counter_rate(post, "host_presented_frames", seconds or 0) if seconds else None,
     }
+    # Producer lineage was added after the original F8 format. Keep each cumulative counter
+    # independent: an older capture, a frontend without the snapshot API, or one unavailable
+    # counter must report unavailable rather than contributing an invented zero.
+    producer_fields = (
+        "producer_publications",
+        "producer_publications_known",
+        "producer_delivered_new",
+        "producer_delivered_repeat",
+        "producer_delivered_unknown",
+    )
+    producer_events = {field: _counter_delta(post, field) for field in producer_fields}
+    producer_rates = {
+        field: (_counter_rate(post, field, seconds or 0) if seconds else None)
+        for field in producer_fields
+    }
+    publication_total = producer_events["producer_publications"]
+    publication_known = producer_events["producer_publications_known"]
+    if publication_total is None or publication_known is None:
+        publication_coverage = None
+        publication_coverage_status = "publication lineage counters are unavailable or unusable"
+    elif publication_known > publication_total:
+        publication_coverage = None
+        publication_coverage_status = "known publications exceed all publications"
+    elif publication_total == 0:
+        publication_coverage = None
+        publication_coverage_status = "no successful slot publications were observed"
+    else:
+        publication_coverage = publication_known / publication_total
+        publication_coverage_status = None
+    delivered_new = producer_events["producer_delivered_new"]
+    delivered_repeat = producer_events["producer_delivered_repeat"]
+    delivered_unknown = producer_events["producer_delivered_unknown"]
+    if None in (delivered_new, delivered_repeat, delivered_unknown):
+        delivery_coverage = None
+        delivery_coverage_status = "delivery lineage counters are unavailable or unusable"
+        known_deliveries = None
+        classified_deliveries = None
+    else:
+        known_deliveries = delivered_new + delivered_repeat
+        classified_deliveries = known_deliveries + delivered_unknown
+        if classified_deliveries == 0:
+            delivery_coverage = None
+            delivery_coverage_status = "no successful host presentations were classified"
+        else:
+            delivery_coverage = known_deliveries / classified_deliveries
+            delivery_coverage_status = None
+    producer_lineage = {
+        "events": producer_events,
+        "rates": producer_rates,
+        "publication_coverage": publication_coverage,
+        "publication_coverage_status": publication_coverage_status,
+        "delivery_coverage": delivery_coverage,
+        "delivery_coverage_status": delivery_coverage_status,
+        "known_deliveries": known_deliveries,
+        "classified_deliveries": classified_deliveries,
+    }
     rss = [record.get("rss_bytes") for record in post if record.get("rss_bytes") is not None]
     # Additive field: captures written before it, and hosts with no committed-bytes counter, simply
     # carry no value. `is not None` rather than a truth test, so a real zero stays a measurement.
@@ -941,6 +997,7 @@ def summarize(records):
         "private_min": min(private) if private else None,
         "private_max": max(private) if private else None,
         "rates": rates,
+        "producer_lineage": producer_lineage,
         "graphics_total_ms": graphics_total,
         "compute_total_ms": compute_total,
         "compute_cpu_phases": _phase_totals(compute, COMPUTE_CPU_PHASES),
@@ -1086,6 +1143,37 @@ def print_summary(summary):
     print(f"rates: guest flips={_rate_with_numerator('guest_fps')} "
           f"rendered={_rate_with_numerator('rendered_fps')} "
           f"host-presented={_rate_with_numerator('host_fps')}")
+    lineage = summary["producer_lineage"]
+
+    def _lineage_rate(field):
+        value = _fmt_rate(lineage["rates"][field])
+        count = lineage["events"][field]
+        if count is None or seconds is None:
+            return value
+        return f"{value} ({count} over {seconds:.2f} s)"
+
+    print("producer lineage rates: "
+          f"publications={_lineage_rate('producer_publications')} "
+          f"known-publications={_lineage_rate('producer_publications_known')} "
+          f"delivered-new={_lineage_rate('producer_delivered_new')} "
+          f"delivered-repeat={_lineage_rate('producer_delivered_repeat')} "
+          f"delivered-unknown={_lineage_rate('producer_delivered_unknown')}")
+    if lineage["publication_coverage"] is None:
+        print("producer publication lineage coverage: unavailable -- "
+              f"{lineage['publication_coverage_status']}")
+    else:
+        print("producer publication lineage coverage: "
+              f"{lineage['publication_coverage']:.0%} "
+              f"({lineage['events']['producer_publications_known']} known of "
+              f"{lineage['events']['producer_publications']} successful slot publications)")
+    if lineage["delivery_coverage"] is None:
+        print("producer delivery lineage coverage: unavailable -- "
+              f"{lineage['delivery_coverage_status']}")
+    else:
+        print("producer delivery lineage coverage: "
+              f"{lineage['delivery_coverage']:.0%} "
+              f"({lineage['known_deliveries']} known deliveries of "
+              f"{lineage['classified_deliveries']} classified successful host presentations)")
     print(f"measured totals: graphics={summary['graphics_total_ms']:.1f} ms "
           f"compute={summary['compute_total_ms']:.1f} ms "
           f"(ALL retained records, not clipped to the sample window)")

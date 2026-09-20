@@ -24,9 +24,9 @@ constexpr bool request_gpu_present(const char* setting, bool test_pattern, bool 
 }
 
 // F8's rendered-frame population is the CPU frame handoff count, not the number of successful
-// swapchain presents. Shared-device GPU present deliberately skips that handoff. Until that producer
-// exposes its own coherent completion counter, report the population as unavailable; substituting the
-// app's host-present count would manufacture equality between two different clocks.
+// swapchain presents. Shared-device GPU present deliberately skips that handoff. The separate
+// completed-producer lineage counters measure known GPU publications/deliveries where available;
+// they do not change this legacy CPU-handoff population's definition.
 constexpr std::optional<uint64_t> rendered_frame_counter(bool gpu_present,
                                                          uint64_t cpu_frame_seq) {
     return gpu_present ? std::nullopt : std::optional<uint64_t>{cpu_frame_seq};

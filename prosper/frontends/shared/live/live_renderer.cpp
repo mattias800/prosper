@@ -10665,13 +10665,19 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     auto rit = g_rtt.find(front_va);
                     if (rit != g_rtt.end() && rit->second.gpu_valid && rit->second.w && rit->second.h) {
                         const VkFormat fmt = prosper::test::backend_color_format(rit->second.format);
+                        // The cache key is only a lookup hint. Hold its resource-domain lock from
+                        // the exact image/provenance snapshot through the synchronous scanout copy;
+                        // eviction or allocation reuse must not substitute another image mid-handoff.
+                        std::lock_guard resource_lock(
+                            prosper::test::backend_persistent_resource_mutex());
                         prosper::test::PersistentColorTargetImage* tgt =
                             prosper::test::find_persistent_color_target(
                                 front_va, rit->second.w, rit->second.h, fmt);
                         if (tgt && tgt->image && tgt->layout != VK_IMAGE_LAYOUT_UNDEFINED) {
                             published_gpu = prosper::frontend::present_blit_publish(
                                 tgt->image, tgt->layout, fmt, rit->second.w, rit->second.h,
-                                current_flip);
+                                current_flip,
+                                prosper::test::persistent_color_producer_source(*tgt));
                             if (published_gpu) last_gpu_publish_flip = current_flip;
                         }
                     }

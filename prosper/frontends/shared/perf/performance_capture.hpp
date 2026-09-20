@@ -33,6 +33,15 @@ struct ProcessSample {
     // that handoff, so its production counter is unavailable rather than zero.
     std::optional<uint64_t> rendered_frames;
     uint64_t host_presented_frames = 0;
+    // Optional cumulative producer-lineage observations. A missing counter means the frontend did
+    // not have the producer-lineage snapshot; it is not a measured zero. Publications are successful
+    // scanout-slot fence publications (including ones later superseded); deliveries are successful
+    // host presentations, split by the lineage result available at delivery time.
+    std::optional<uint64_t> producer_publications;
+    std::optional<uint64_t> producer_publications_known;
+    std::optional<uint64_t> producer_delivered_new;
+    std::optional<uint64_t> producer_delivered_repeat;
+    std::optional<uint64_t> producer_delivered_unknown;
     std::optional<gpu::PendingWriteSnapshot> pending_writes;
 };
 
