@@ -4,7 +4,9 @@
 #include "gpu/resources/shader_resources.hpp"
 #include "shared/live/live_compute.hpp"
 #include "shared/live/live_renderer.hpp"
+#include "shared/live/gpu_retile.hpp"
 #include "fixtures/render_runner.h"
+#include "gpu/texture/tile.hpp"
 
 #include <algorithm>
 #include <bit>
@@ -297,6 +299,28 @@ static int run_destination_mirror_regression() {
               import_live_render_target_image(r11_address, source_request, r11_source),
           "first packed R11 mirror publishes an exact readable renderer result");
     release_live_render_target_image(r11_address);
+    CHECK(!render(r11_producer).empty(),
+          "packed R11 renderer repaints its target before the partial dispatch");
+    std::vector<uint8_t> r11_seed_pixels;
+    std::string r11_readback_error;
+    CHECK(prosper::test::readback_persistent_color_target(
+              r11_address, W, H, VK_FORMAT_B10G11R11_UFLOAT_PACK32,
+              r11_seed_pixels, r11_readback_error) &&
+              r11_seed_pixels.size() == r11_words.size() * sizeof(uint32_t),
+          "packed R11 renderer seed has exact readable words");
+    std::vector<uint32_t> r11_seed_words(r11_words.size());
+    if (r11_seed_pixels.size() == r11_seed_words.size() * sizeof(uint32_t))
+        std::memcpy(r11_seed_words.data(), r11_seed_pixels.data(), r11_seed_pixels.size());
+    CHECK(!std::equal(r11_seed_words.begin() + W, r11_seed_words.end(),
+                      first_r11.begin() + W),
+          "packed R11 renderer seed differs from stale guest words below the written row");
+    const auto* r11_target = prosper::test::find_persistent_color_target(
+        r11_address, W, H, VK_FORMAT_B10G11R11_UFLOAT_PACK32);
+    const VkImage r11_image = r11_target ? r11_target->image : VK_NULL_HANDLE;
+    const VkImageLayout r11_layout = r11_target ? r11_target->layout : VK_IMAGE_LAYOUT_UNDEFINED;
+    // Packed HDR mip producers keep an independent renderer retention pin until sampled.
+    // Compute must return to that baseline after releasing its source and destination leases.
+    const uint32_t r11_renderer_pins = r11_target ? r11_target->pin_count : 0;
     const auto r11_partial_spirv = recompile_compute(store_black, std::size(store_black),
                                                       &r11_table, r11_config);
     CHECK(!r11_partial_spirv.empty(), "packed R11 partial writer recompiles");
@@ -311,10 +335,225 @@ static int run_destination_mirror_regression() {
           "packed R11 partial consumer executes from the renderer GPU seed");
     const auto r11_seed_after =
         prosper::frontend::live_compute_rtt_destination_mirror_counters();
-    CHECK(r11_seed_after.r11_source_seed_recorded == r11_seed_before.r11_source_seed_recorded + 1,
-          "packed R11 partial writer records the exact renderer-image source seed");
-    CHECK(std::equal(r11_words.begin() + W, r11_words.end(), first_r11.begin() + W),
-          "packed R11 partial writer preserves every untouched canonical word from GPU source");
+    CHECK(r11_seed_after.r11_source_seed_recorded == r11_seed_before.r11_source_seed_recorded + 1 &&
+              r11_seed_after.borrowed == r11_seed_before.borrowed + 1 &&
+              r11_seed_after.recorded == r11_seed_before.recorded + 1 &&
+              r11_seed_after.published == r11_seed_before.published + 1 &&
+              r11_seed_after.failed == r11_seed_before.failed,
+          "packed R11 partial writer seeds and publishes the same renderer image");
+    CHECK(std::equal(r11_words.begin() + W, r11_words.end(), r11_seed_words.begin() + W) &&
+              !std::equal(r11_words.begin(), r11_words.begin() + W, r11_seed_words.begin()),
+          "packed R11 partial writer changes row zero and preserves GPU-seeded rows");
+    CHECK(import_live_render_target_image(r11_address, source_request, r11_source) &&
+              r11_source.valid(),
+          "packed R11 partial result remains a strict renderer source");
+    release_live_render_target_image(r11_address);
+    std::vector<uint8_t> r11_mirrored_pixels;
+    CHECK(prosper::test::readback_persistent_color_target(
+              r11_address, W, H, VK_FORMAT_B10G11R11_UFLOAT_PACK32,
+              r11_mirrored_pixels, r11_readback_error) &&
+              r11_mirrored_pixels.size() == r11_words.size() * sizeof(uint32_t) &&
+              std::memcmp(r11_mirrored_pixels.data(), r11_words.data(), r11_mirrored_pixels.size()) == 0,
+          "packed R11 renderer image contains the exact completed guest words");
+    r11_target = prosper::test::find_persistent_color_target(
+        r11_address, W, H, VK_FORMAT_B10G11R11_UFLOAT_PACK32);
+    CHECK(r11_target && r11_target->image == r11_image &&
+              r11_target->pin_count == r11_renderer_pins &&
+              r11_target->layout == r11_layout,
+          "packed R11 source and destination release their pins at the saved layout");
+
+    const std::vector<uint32_t> first_partial_r11 = r11_words;
+    static const uint32_t store_red_r11[] = {
+        0x7E080300u, 0x7E0A0301u, // v4=x, v5=y
+        0x7E0002F2u, 0x7E020280u, 0x7E040280u, // R=1, G/B=0
+        0x7E0602F2u, 0xF0200F08u, 0x00020004u, 0xBF810000u,
+    };
+    const auto r11_red_spirv = recompile_compute(
+        store_red_r11, std::size(store_red_r11), &r11_table, r11_config);
+    CHECK(!r11_red_spirv.empty(), "changed packed R11 partial writer recompiles");
+    ComputeItem r11_partial_changed = r11_partial;
+    r11_partial_changed.spirv = r11_red_spirv;
+    r11_partial_changed.code_addr = 0x37310014u;
+    const auto r11_repeat_before =
+        prosper::frontend::live_compute_rtt_destination_mirror_counters();
+    CHECK(prosper::frontend::execute_live_compute_items({r11_partial_changed}),
+          "second packed R11 partial dispatch changes the published renderer result");
+    const auto r11_repeat_after =
+        prosper::frontend::live_compute_rtt_destination_mirror_counters();
+    CHECK(r11_repeat_after.r11_source_seed_recorded == r11_repeat_before.r11_source_seed_recorded + 1 &&
+              r11_repeat_after.recorded == r11_repeat_before.recorded + 1 &&
+              r11_repeat_after.published == r11_repeat_before.published + 1 &&
+              !std::equal(r11_words.begin(), r11_words.begin() + W,
+                          first_partial_r11.begin()) &&
+              std::equal(r11_words.begin() + W, r11_words.end(), r11_seed_words.begin() + W),
+          "second packed R11 partial result changes only its written row and remains published");
+    r11_target = prosper::test::find_persistent_color_target(
+        r11_address, W, H, VK_FORMAT_B10G11R11_UFLOAT_PACK32);
+    CHECK(r11_target && r11_target->image == r11_image &&
+              r11_target->pin_count == r11_renderer_pins &&
+              r11_target->layout == r11_layout,
+          "repeat packed R11 dispatch preserves allocation, layout, and released leases");
+
+    const auto r11_failure_before =
+        prosper::frontend::live_compute_rtt_destination_mirror_counters();
+    prosper::frontend::live_compute_fail_next_storage_readback_for_test();
+    CHECK(!prosper::frontend::execute_live_compute_items({r11_partial}),
+          "failed packed R11 partial completion is reported");
+    const auto r11_failure_after =
+        prosper::frontend::live_compute_rtt_destination_mirror_counters();
+    CHECK(r11_failure_after.r11_source_seed_recorded ==
+                  r11_failure_before.r11_source_seed_recorded + 1 &&
+              r11_failure_after.borrowed == r11_failure_before.borrowed + 1 &&
+              r11_failure_after.recorded == r11_failure_before.recorded + 1 &&
+              r11_failure_after.failed == r11_failure_before.failed + 1 &&
+              r11_failure_after.published == r11_failure_before.published &&
+              !import_live_render_target_image(r11_address, source_request, r11_source),
+          "failed packed R11 completion revokes renderer authority");
+    r11_target = prosper::test::find_persistent_color_target(
+        r11_address, W, H, VK_FORMAT_B10G11R11_UFLOAT_PACK32, false);
+    CHECK(r11_target && r11_target->image == r11_image &&
+              r11_target->pin_count == r11_renderer_pins &&
+              r11_target->layout == r11_layout,
+          "failed packed R11 completion releases both leases at the saved layout");
+
+    // A tiled guest result produces canonical packed words in staging via either the direct
+    // retile shader or the image-transfer plus buffer-retile route. Both feed the same renderer
+    // destination copy; run this test once with each route selected by the CTest environment.
+    constexpr uint32_t tiled_mode = uint32_t(TileMode::Sw64KbS);
+    const size_t tiled_bytes = tiled_surface_bytes(W, H, tiled_mode, 0, sizeof(uint32_t));
+    std::vector<uint8_t> tiled_guest(tiled_bytes, 0xcd);
+    const uint64_t tiled_address = reinterpret_cast<uint64_t>(tiled_guest.data());
+    DrawItem tiled_producer = r11_producer;
+    tiled_producer.color0_base = tiled_address;
+    CHECK(!render(tiled_producer).empty(), "tiled R11 producer creates an exact renderer seed");
+    std::vector<uint8_t> tiled_seed;
+    CHECK(prosper::test::readback_persistent_color_target(
+              tiled_address, W, H, VK_FORMAT_B10G11R11_UFLOAT_PACK32,
+              tiled_seed, r11_readback_error) && tiled_seed.size() == W * H * sizeof(uint32_t),
+          "tiled R11 renderer seed has exact packed words");
+    const auto* tiled_target = prosper::test::find_persistent_color_target(
+        tiled_address, W, H, VK_FORMAT_B10G11R11_UFLOAT_PACK32);
+    const VkImage tiled_image = tiled_target ? tiled_target->image : VK_NULL_HANDLE;
+    const VkImageLayout tiled_layout = tiled_target ? tiled_target->layout : VK_IMAGE_LAYOUT_UNDEFINED;
+    const uint32_t tiled_renderer_pins = tiled_target ? tiled_target->pin_count : 0;
+    ShaderResource tiled_output = r11_output;
+    tiled_output.gpu_addr = tiled_address;
+    tiled_output.size = static_cast<uint32_t>(tiled_bytes);
+    tiled_output.tile_mode = tiled_mode;
+    ShaderResourceTable tiled_table;
+    tiled_table.resources.push_back(tiled_output);
+    const auto tiled_spirv = recompile_compute(
+        store_black, std::size(store_black), &tiled_table, r11_config);
+    CHECK(!tiled_spirv.empty(), "tiled packed R11 partial writer recompiles");
+    ComputeItem tiled_partial = r11_partial;
+    tiled_partial.spirv = tiled_spirv;
+    tiled_partial.resources = std::make_shared<ShaderResourceTable>(tiled_table);
+    tiled_partial.code_addr = 0x37310013u;
+    const auto tiled_before = prosper::frontend::live_compute_rtt_destination_mirror_counters();
+    const auto direct_before = prosper::frontend::gpu_direct_retile_recordings().load();
+    CHECK(!tiled_spirv.empty() && prosper::frontend::execute_live_compute_items({tiled_partial}),
+          "tiled packed R11 partial writer completes from renderer seed");
+    const auto tiled_after = prosper::frontend::live_compute_rtt_destination_mirror_counters();
+    const bool direct_expected = std::getenv("PROSPER_NO_DIRECT_IMAGE_RETILE") == nullptr;
+    CHECK(tiled_after.r11_source_seed_recorded == tiled_before.r11_source_seed_recorded + 1 &&
+              tiled_after.recorded == tiled_before.recorded + 1 &&
+              tiled_after.published == tiled_before.published + 1 &&
+              prosper::frontend::gpu_direct_retile_recordings().load() ==
+                  direct_before + (direct_expected ? 1u : 0u),
+          "tiled packed R11 publishes through the selected staging producer");
+    std::vector<uint8_t> tiled_linear(W * H * sizeof(uint32_t), 0);
+    detile_surface(tiled_linear.data(), tiled_guest.data(), W, H, tiled_mode, 0,
+                   sizeof(uint32_t));
+    CHECK(tiled_seed.size() == tiled_linear.size() &&
+              std::equal(tiled_linear.begin() + W * sizeof(uint32_t), tiled_linear.end(),
+                         tiled_seed.begin() + W * sizeof(uint32_t)) &&
+              !std::equal(tiled_linear.begin(), tiled_linear.begin() + W * sizeof(uint32_t),
+                          tiled_seed.begin()),
+          "tiled R11 guest writeback changes row zero and preserves renderer-seeded rows");
+    std::vector<uint8_t> tiled_mirrored;
+    CHECK(prosper::test::readback_persistent_color_target(
+              tiled_address, W, H, VK_FORMAT_B10G11R11_UFLOAT_PACK32,
+              tiled_mirrored, r11_readback_error) && tiled_mirrored == tiled_linear,
+          "tiled R11 renderer destination equals detiled guest result bit for bit");
+    tiled_target = prosper::test::find_persistent_color_target(
+        tiled_address, W, H, VK_FORMAT_B10G11R11_UFLOAT_PACK32);
+    CHECK(tiled_target && tiled_target->image == tiled_image &&
+              tiled_target->layout == tiled_layout &&
+              tiled_target->pin_count == tiled_renderer_pins,
+          "tiled R11 destination retains image and layout and releases compute leases");
+
+    // A different binding importing the same renderer image must keep the destination lease
+    // collision closed. The storage binding's own packed seed is allowed, but this sampled import
+    // is a second reader whose ordering and layout cannot be justified by the self-seed exception.
+    std::vector<uint32_t> collision_words(W * H, 0xdeadbeefu);
+    const uint64_t collision_address = reinterpret_cast<uint64_t>(collision_words.data());
+    DrawItem collision_producer = r11_producer;
+    collision_producer.color0_base = collision_address;
+    CHECK(!render(collision_producer).empty(),
+          "packed R11 collision producer creates a renderer image");
+    const auto* collision_target = prosper::test::find_persistent_color_target(
+        collision_address, W, H, VK_FORMAT_B10G11R11_UFLOAT_PACK32);
+    const VkImage collision_image = collision_target ? collision_target->image : VK_NULL_HANDLE;
+    const VkImageLayout collision_layout = collision_target
+        ? collision_target->layout : VK_IMAGE_LAYOUT_UNDEFINED;
+    const uint32_t collision_renderer_pins = collision_target ? collision_target->pin_count : 0;
+    std::vector<uint8_t> collision_seed;
+    CHECK(prosper::test::readback_persistent_color_target(
+              collision_address, W, H, VK_FORMAT_B10G11R11_UFLOAT_PACK32,
+              collision_seed, r11_readback_error) &&
+              collision_seed.size() == W * H * sizeof(uint32_t),
+          "packed R11 collision source has readable renderer pixels");
+    LiveTargetImageImport collision_destination;
+    CHECK(borrow_live_render_target_image_destination(
+              collision_address, {W, H, LiveTargetPixelFormat::R11G11B10Float},
+              collision_destination) && collision_destination.valid() &&
+              collision_destination.image == collision_image,
+          "packed R11 collision destination itself remains borrowable");
+    release_live_render_target_image(collision_address);
+    ShaderResource collision_sampled = r11_output;
+    collision_sampled.cls = ResourceClass::Texture;
+    collision_sampled.binding = 4;
+    collision_sampled.sgpr_base = 0;
+    collision_sampled.gpu_addr = collision_address;
+    ShaderResource collision_output = r11_output;
+    collision_output.gpu_addr = collision_address;
+    ShaderResourceTable collision_table;
+    collision_table.resources = {collision_sampled, collision_output};
+    static const uint32_t image_copy_r11[] = {
+        0x7E080300u, 0x7E0A0280u, // v4=x, v5=0
+        0xF0000F08u, 0x00000004u, 0xBF8C3F70u, // load sampled binding 4
+        0xF0200F08u, 0x00020004u, 0xBF810000u, // store binding 5
+    };
+    const auto collision_spirv = recompile_compute(
+        image_copy_r11, std::size(image_copy_r11), &collision_table, r11_config);
+    CHECK(!collision_spirv.empty(), "packed R11 sampled/storage collision recompiles");
+    ComputeItem collision_item = r11_partial;
+    collision_item.spirv = collision_spirv;
+    collision_item.resources = std::make_shared<ShaderResourceTable>(collision_table);
+    collision_item.code_addr = 0x37310015u;
+    const auto collision_before = prosper::frontend::live_compute_rtt_destination_mirror_counters();
+    CHECK(!collision_spirv.empty() && prosper::frontend::execute_live_compute_items({collision_item}),
+          "packed R11 sampled/storage collision completes through fallback");
+    const auto collision_after = prosper::frontend::live_compute_rtt_destination_mirror_counters();
+    CHECK(collision_after.r11_source_seed_recorded ==
+                  collision_before.r11_source_seed_recorded + 1 &&
+              collision_after.candidates == collision_before.candidates + 1 &&
+              collision_after.borrowed == collision_before.borrowed &&
+              collision_after.recorded == collision_before.recorded &&
+              collision_after.published == collision_before.published,
+          "second imported R11 binding rejects an otherwise borrowable destination");
+    CHECK(collision_seed.size() == W * H * sizeof(uint32_t) &&
+              std::memcmp(collision_words.data(), collision_seed.data(),
+                          collision_seed.size()) == 0,
+          "sampled R11 binding uses renderer pixels while guest fallback writes exact words");
+    CHECK(!import_live_render_target_image(collision_address, source_request, r11_source),
+          "rejected R11 destination does not restore strict renderer authority");
+    collision_target = prosper::test::find_persistent_color_target(
+        collision_address, W, H, VK_FORMAT_B10G11R11_UFLOAT_PACK32, false);
+    CHECK(collision_target && collision_target->image == collision_image &&
+              collision_target->layout == collision_layout &&
+              collision_target->pin_count == collision_renderer_pins,
+          "rejected R11 destination releases imports and preserves image layout");
     return fails ? 1 : 0;
 }
 
