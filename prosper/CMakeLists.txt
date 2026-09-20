@@ -3965,6 +3965,7 @@ if(TARGET prosper_core AND TARGET Vulkan::Vulkan)
   endforeach()
   foreach(range_control IN ITEMS on off arena_off verify)
     set(range_environment PROSPER_BACKEND_BUFFER_RESIDENCY_MB=0
+      PROSPER_BACKEND_BUFFER_RANGE_RESIDENCY_MB=0
       --unset=PROSPER_NO_BACKEND_RESOURCE_SHARE --unset=PROSPER_NO_BACKEND_BUFFER_POOL
       --unset=PROSPER_NO_BACKEND_BUFFER_ARENA --unset=PROSPER_BUFVERIFY
       --unset=PROSPER_NO_BACKEND_BUFFER_RANGE_SHARE)
@@ -3982,9 +3983,36 @@ if(TARGET prosper_core AND TARGET Vulkan::Vulkan)
       ${range_environment} $<TARGET_FILE:test_render_buffer_residency>
       --range-sharing ${range_expected})
   endforeach()
+  foreach(range_residency_control IN ITEMS on off)
+    set(range_residency_environment PROSPER_BACKEND_BUFFER_RESIDENCY_MB=0
+      PROSPER_BACKEND_BUFFER_RANGE_RESIDENCY_MB=64
+      --unset=PROSPER_NO_BACKEND_BUFFER_RANGE_RESIDENCY
+      --unset=PROSPER_NO_BACKEND_RESOURCE_SHARE
+      --unset=PROSPER_NO_BACKEND_BUFFER_POOL --unset=PROSPER_BUFVERIFY
+      --unset=PROSPER_NO_BACKEND_BUFFER_ARENA
+      --unset=PROSPER_NO_BACKEND_BUFFER_RANGE_SHARE)
+    if(range_residency_control STREQUAL "off")
+      list(APPEND range_residency_environment PROSPER_NO_BACKEND_BUFFER_RANGE_RESIDENCY=1)
+    endif()
+    add_test(NAME render_buffer_range_residency_${range_residency_control}
+      COMMAND ${CMAKE_COMMAND} -E env ${range_residency_environment}
+      $<TARGET_FILE:test_render_buffer_residency> --range-residency ${range_residency_control})
+  endforeach()
+  add_test(NAME render_buffer_range_residency_owner_exhausted
+    COMMAND ${CMAKE_COMMAND} -E env
+      PROSPER_BACKEND_BUFFER_RESIDENCY_MB=0
+      PROSPER_BACKEND_BUFFER_RANGE_RESIDENCY_MB=64
+      PROSPER_BACKEND_BUFFER_RESIDENCY_OWNERS=0
+      --unset=PROSPER_NO_BACKEND_BUFFER_RANGE_RESIDENCY
+      --unset=PROSPER_NO_BACKEND_RESOURCE_SHARE
+      --unset=PROSPER_NO_BACKEND_BUFFER_POOL --unset=PROSPER_BUFVERIFY
+      --unset=PROSPER_NO_BACKEND_BUFFER_ARENA
+      --unset=PROSPER_NO_BACKEND_BUFFER_RANGE_SHARE
+      $<TARGET_FILE:test_render_buffer_residency> --range-residency off)
   add_test(NAME render_buffer_residency COMMAND ${CMAKE_COMMAND} -E env
     --unset=PROSPER_NO_BACKEND_RESOURCE_SHARE
     --unset=PROSPER_NO_BACKEND_BUFFER_POOL --unset=PROSPER_BUFVERIFY
+    PROSPER_BACKEND_BUFFER_RANGE_RESIDENCY_MB=0
     PROSPER_BACKEND_BUFFER_RESIDENCY_MB=256
     PROSPER_BACKEND_BUFFER_RESIDENCY_OWNERS=4096
     $<TARGET_FILE:test_render_buffer_residency>)
@@ -3995,6 +4023,8 @@ if(TARGET prosper_core AND TARGET Vulkan::Vulkan)
   endforeach()
   add_test(NAME render_buffer_residency_default COMMAND ${CMAKE_COMMAND} -E env
     --unset=PROSPER_BACKEND_BUFFER_RESIDENCY_MB
+    --unset=PROSPER_BACKEND_BUFFER_RANGE_RESIDENCY_MB
+    --unset=PROSPER_NO_BACKEND_BUFFER_RANGE_RESIDENCY
     --unset=PROSPER_NO_BACKEND_BUFFER_RESIDENCY
     --unset=PROSPER_BACKEND_BUFFER_RESIDENCY_OWNERS
     --unset=PROSPER_NO_BACKEND_RESOURCE_SHARE
