@@ -1143,22 +1143,45 @@ struct LiveTargetImageRequest {
     // sample/gather operations. Integer image fetch/read must retain the exact declared extent.
     bool normalized_sampling = false;
 };
+// A destination borrow never authorizes reading the old image. It may pin an invalid persistent
+// color allocation for a complete, byte-exact compute overwrite, provided the actual image's
+// format, extent, device and TRANSFER_DST usage match the request.
+struct LiveTargetImageDestinationRequest {
+    uint32_t width = 0, height = 0;
+    LiveTargetPixelFormat format = LiveTargetPixelFormat::Rgba8Unorm;
+};
 using LiveTargetImageImportFn = std::function<bool(
     uint64_t gpu_addr, const LiveTargetImageRequest& request, LiveTargetImageImport& import)>;
+using LiveTargetImageDestinationFn = std::function<bool(
+    uint64_t gpu_addr, const LiveTargetImageDestinationRequest& request,
+    LiveTargetImageImport& import)>;
+using LiveTargetImageDestinationInvalidateFn = std::function<void(
+    uint64_t gpu_addr, const LiveTargetImageImport& import)>;
 using LiveTargetImageReleaseFn = std::function<void(uint64_t gpu_addr)>;
 struct LiveTargetImageWrite {
     uint64_t gpu_addr = 0;
     uint32_t width = 0, height = 0;
     LiveTargetPixelFormat format = LiveTargetPixelFormat::Rgba8Unorm;
     std::shared_ptr<const std::vector<uint8_t>> linear_pixels;
+    // An exact destination mirror names the actual pinned image. The renderer must not restore
+    // authority to another allocation that reused the same address/shape before notification.
+    void* mirrored_image = nullptr;
     bool valid() const { return gpu_addr && width && height; }
 };
 using LiveTargetImageWrittenFn = std::function<void(const LiveTargetImageWrite& write)>;
 void set_live_target_image_importer(LiveTargetImageImportFn import_fn,
                                     LiveTargetImageReleaseFn release_fn);
+void set_live_target_image_destination_borrower(
+    LiveTargetImageDestinationFn destination_fn,
+    LiveTargetImageDestinationInvalidateFn invalidate_fn);
 void set_live_target_image_written_notifier(LiveTargetImageWrittenFn written_fn);
 bool import_live_render_target_image(uint64_t gpu_addr, const LiveTargetImageRequest& request,
                                      LiveTargetImageImport& import);
+bool borrow_live_render_target_image_destination(
+    uint64_t gpu_addr, const LiveTargetImageDestinationRequest& request,
+    LiveTargetImageImport& import);
+void invalidate_live_render_target_image_destination(
+    uint64_t gpu_addr, const LiveTargetImageImport& import);
 void release_live_render_target_image(uint64_t gpu_addr);
 // Publish that a borrowed renderer image received the completed compute result. The caller may also
 // have written the exact guest bytes for alias correctness; the renderer processes that normal

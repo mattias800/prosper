@@ -442,6 +442,14 @@ uint64_t live_compute_queue_submit_attempts();
 // Actual queue/device capability observed by an attempted F8 dispatch, independent of query success.
 int live_compute_timestamp_support_for_test(); // -1 unobserved, 0 unsupported, 1 supported
 
+// Monotonic exact-destination mirror census. A "published" increment means the ordered renderer
+// notification was emitted after successful guest writeback; tests also inspect image authority.
+struct LiveComputeRttDestinationMirrorCounters {
+    uint64_t candidates = 0, borrowed = 0, recorded = 0, published = 0, failed = 0;
+    uint64_t r11_source_seed_recorded = 0;
+};
+LiveComputeRttDestinationMirrorCounters live_compute_rtt_destination_mirror_counters();
+
 // Register the synchronous Vulkan compute backend used by AGC submit processing.
 void register_live_compute();
 
