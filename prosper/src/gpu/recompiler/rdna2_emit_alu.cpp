@@ -2009,11 +2009,12 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     // like [mimg-unresolved] above: it fires only on a path that has already
                     // failed, so its volume is bounded by the defect it reports.
                     //
-                    // Caveat on the dedup key, same shape as the one [mimg-unresolved] records:
-                    // it includes program_address, but `--retry-failed-stage` recompiles through
-                    // a standalone entry point where that field is 0. On THAT path two different
-                    // programs rejecting at the same (pc, operand) would print once, attributed
-                    // to neither. Live execution carries a real address and does not collide.
+                    // The dedup key includes program_address, which matters: every shader has a
+                    // pc 328, so a pc-only key would let the first program to reach one silence
+                    // every later program and attribute its line to a shader nobody is looking at.
+                    // `--retry-failed-stage` used to recompile through an entry point that left
+                    // that field 0, collapsing the key across programs; it now passes the real
+                    // address, so this attributes correctly on both the live and the replay path.
                     {
                         static std::mutex probe_mutex;
                         static std::set<std::tuple<uint64_t, uint32_t, int>> probe_reported;

@@ -3321,8 +3321,17 @@ int main(int argc, char** argv) {
                     raw.words.data(), raw.words.size(), resources);
                 break;
             case prosper::gpu::ShaderProgramStage::Fragment:
+                // Pass the REAL program address in the diagnostic context. Several recompiler
+                // diagnostics are gated on `program_address != 0` -- `[divloop-reject]` among
+                // them (`rdna2_cfg_support.hpp`) -- so a retry that left it 0 silently withheld
+                // the one line that names why a loop shape was refused, and the dedup keys of
+                // the ones that did print collapsed across programs. Every other argument keeps
+                // its previous default, so this changes what is REPORTED and nothing else.
                 spirv = prosper::gpu::recompile_fragment(
-                    raw.words.data(), raw.words.size(), resources);
+                    raw.words.data(), raw.words.size(), resources,
+                    /*system_inputs=*/nullptr, /*pcrel_dispatch_target=*/UINT32_MAX,
+                    /*interpolation=*/nullptr, /*wave32=*/false,
+                    {prosper::gpu::RecompileDiagnosticStage::Fragment, stage.program_addr});
                 break;
             case prosper::gpu::ShaderProgramStage::Compute:
                 if (!prosper::tools::recompile_failed_compute_stage(
