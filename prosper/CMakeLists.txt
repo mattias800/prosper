@@ -2659,6 +2659,8 @@ endif()
   target_link_libraries(test_gpu_replay_pixel_inputs PRIVATE prosper_core)
   add_test(NAME gpu_replay_pixel_inputs COMMAND test_gpu_replay_pixel_inputs)
 
+  # Native-typed readback formatting: the property asserted is the one an RGBA8 conversion
+  # destroys, so these arms fail if a scalar is ever routed through one again (#3765).
   add_executable(test_gpu_replay_native_texels tests/test_gpu_replay_native_texels.cpp)
   target_link_libraries(test_gpu_replay_native_texels PRIVATE prosper_core)
   add_test(NAME gpu_replay_native_texels COMMAND test_gpu_replay_native_texels)

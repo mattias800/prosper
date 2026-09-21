@@ -27,6 +27,22 @@ static bool has(const std::string& haystack, const char* needle) {
     return haystack.find(needle) != std::string::npos;
 }
 
+// Just the decoded `value=` fields, joined. Comparing whole reports lets an arm pass on the
+// `raw=` bits alone: under a full RGBA8 clamp both 10 and 100 decode to the same text, and a
+// review found the "distinguishable" arm below still green because the raw words differ. The
+// property under test is about the DECODED value, so compare only that.
+static std::string values_only(const std::string& report) {
+    std::string out;
+    size_t at = 0;
+    while ((at = report.find("value=", at)) != std::string::npos) {
+        at += 6;
+        const size_t end = report.find('\n', at);
+        out += report.substr(at, end == std::string::npos ? end : end - at);
+        out += ';';
+    }
+    return out;
+}
+
 static std::vector<uint8_t> f32_bytes(const std::vector<float>& values) {
     std::vector<uint8_t> out(values.size() * 4);
     for (size_t i = 0; i < values.size(); ++i) std::memcpy(out.data() + i * 4, &values[i], 4);
@@ -46,8 +62,9 @@ int main() {
         check("0.5 is reported exactly", has(a, "value=0.5"));
         check("10 is reported exactly", has(a, "value=10"));
         check("100 is reported exactly", has(b, "value=100"));
-        // The whole point: 10 and 100 must not render identically, as they would at 8 bits.
-        check("10 and 100 are distinguishable", a != b);
+        // The whole point: 10 and 100 must not DECODE identically, as they would at 8 bits.
+        // Compare values only -- `a != b` was true even under the clamp, on the raw bits.
+        check("10 and 100 decode distinguishably", values_only(a) != values_only(b));
         check("raw bits accompany the value (0x41200000 == 10.0f)", has(a, "raw=41200000"));
     }
 
@@ -110,15 +127,80 @@ int main() {
         check("...and its layout reports zero bytes", native_texel_layout(bogus).bytes == 0);
     }
 
+    // Texel COORDINATES must be row-major over the real width. Nothing asserted this: every
+    // fixture above is a single row, where (t % width, t / width) and (t, 0) agree.
+    {
+        const auto bytes = f32_bytes({1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f});
+        const std::string s = format_native_texels(F::R32Float, bytes.data(), bytes.size(), 3, 2, 8);
+        check("coordinates are row-major on a multi-row target",
+              has(s, "texel[3] (0,1)") && has(s, "texel[5] (2,1)"));
+        check("...and the value follows the coordinate", has(s, "texel[4] (1,1) raw=40a00000 value=5"));
+    }
+
+    // MULTI-COMPONENT formats must advance per component. Every arm above is single-component,
+    // so collapsing all component offsets to 0 -- and even applying a wrong unorm scale --
+    // survived the whole suite.
+    {
+        std::vector<uint8_t> rgba(16);
+        const float comps[4] = {0.25f, 4.0f, -1.5f, 8.0f};
+        for (int i = 0; i < 4; ++i) std::memcpy(rgba.data() + i * 4, &comps[i], 4);
+        const std::string s = format_native_texels(F::Rgba32Float, rgba.data(), rgba.size(), 1, 1, 8);
+        check("Rgba32Float decodes each component at its own offset",
+              has(s, "value=0.25,4,-1.5,8"));
+        std::vector<uint8_t> half(8);
+        const uint16_t halves[4] = {0x3C00, 0x4000, 0x4200, 0x4400};  // 1, 2, 3, 4
+        for (int i = 0; i < 4; ++i) std::memcpy(half.data() + i * 2, &halves[i], 2);
+        const std::string h = format_native_texels(F::Rgba16Float, half.data(), half.size(), 1, 1, 8);
+        check("Rgba16Float decodes each component at its own offset", has(h, "value=1,2,3,4"));
+        check("...and prints per-component raw words", has(h, "raw=3c00,4000,4200,4400"));
+        const uint8_t unorm[4] = {0, 51, 204, 255};
+        const std::string u = format_native_texels(F::Rgba8Unorm, unorm, sizeof unorm, 1, 1, 8);
+        // 255 is the divisor, not 256: under /256 these read 0.19921875 / 0.796875 / 0.99609375.
+        check("Rgba8Unorm normalizes by 255, not 256",
+              has(u, "value=0,0.200000003,0.800000012,1") && !has(u, "0.99609375"));
+    }
+
+    // R32Uint is an integer channel: it must print the integer, not a normalized float.
+    {
+        const uint32_t big = 4294967295u;
+        std::vector<uint8_t> bytes(4);
+        std::memcpy(bytes.data(), &big, 4);
+        const std::string s = format_native_texels(F::R32Uint, bytes.data(), bytes.size(), 1, 1, 8);
+        check("R32Uint prints the integer value", has(s, "value=4294967295"));
+    }
+
+    // R11G11B10Float packs three channels in one word: R low, G middle, B high. A wrong channel
+    // order survived every arm. One `raw=` for the whole packed word is deliberate.
+    {
+        // 1.0, 2.0, 0.5 in 11/11/10-bit float, matching gpu_replay.cpp's existing convention.
+        const uint32_t packed = 0x702003c0u;
+        std::vector<uint8_t> bytes(4);
+        std::memcpy(bytes.data(), &packed, 4);
+        const std::string s = format_native_texels(F::R11G11B10Float, bytes.data(), bytes.size(), 1, 1, 8);
+        check("R11G11B10Float decodes R,G,B in that order", has(s, "value=1,2,0.5"));
+        check("...and prints the packed word once", has(s, "raw=702003c0"));
+    }
+
     // Layout coverage: every enumerator the executor can hand back must be handled, or the
     // formatter silently degrades to "not handled here" on a real target.
     {
         const F all[] = {F::Rgba8Unorm, F::Rgba16Float, F::R11G11B10Float, F::R8Unorm,
                          F::R32Uint, F::R32Float, F::Rg8Unorm, F::Rgba32Float,
                          F::Rg16Float, F::R16Float};
+        // Calling the formatter, not just reading the layout table: a loop that only checks
+        // `layout.bytes != 0` reads like format coverage and exercises none of the decode --
+        // the same "looks like coverage" shape already caught one level up in this file.
         bool every = true;
-        for (F f : all) every = every && native_texel_layout(f).bytes != 0;
-        check("every LiveTargetPixelFormat enumerator has a layout", every);
+        for (F f : all) {
+            const NativeTexelLayout layout = native_texel_layout(f);
+            if (!layout.bytes) { every = false; continue; }
+            const std::vector<uint8_t> zero(layout.bytes * 2, 0);
+            const std::string s =
+                format_native_texels(f, zero.data(), zero.size(), 2, 1, 8);
+            every = every && has(s, "texel[0] (0,0)") && has(s, "texel[1] (1,0)") &&
+                    has(s, layout.name) && !has(s, "not handled here");
+        }
+        check("every LiveTargetPixelFormat enumerator formats two texels", every);
     }
 
     std::printf("%s\n", failures ? "FAILURES PRESENT" : "all passed");

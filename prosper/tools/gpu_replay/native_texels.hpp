@@ -20,6 +20,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <string>
 
 namespace prosper::gpu::replay_tool {
@@ -130,6 +131,10 @@ inline std::string format_native_texels(prosper::gpu::LiveTargetPixelFormat form
                     break;
                 }
                 case F::R11G11B10Float: {
+                    // One `raw=` for the whole packed word, deliberately: the three channels
+                    // share a single 32-bit texel, so per-component raw fields would invent a
+                    // boundary the format does not have. R is the low 11 bits, G the middle 11,
+                    // B the high 10 -- the same convention as inspect_rtt_seed.
                     uint32_t packed = 0; std::memcpy(&packed, p, sizeof packed);
                     if (!c) { std::snprintf(piece, sizeof piece, "%08x", packed); raw += piece; }
                     const float v = c == 0 ? prosper::gpu::f11_to_float(static_cast<uint16_t>(packed))
