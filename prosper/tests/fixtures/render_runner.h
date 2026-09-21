@@ -6,6 +6,7 @@
 #include <system_error>   // #3407: the catch in parallel_render_memcpy
 #include <thread>         // #3407: parallel_render_memcpy
 #include "host/memory/guest_write_watch.hpp"   // VA->phys for the #2932 target census
+#include "host/memory/guest_memory_map.hpp"    // mapping generation for opt-in range census
 #include "shared/rtt/mrt_extent.hpp"
 #include <vulkan/vulkan.h>
 #include "gpu_detile_upload.h"
@@ -44,6 +45,7 @@
 #include <cstring>
 #include <deque>
 #include <functional>
+#include <filesystem>
 #include <mutex>
 #include <memory>
 #include <optional>
@@ -3584,6 +3586,144 @@ struct ResidentRenderBufferKeyHash {
         return static_cast<size_t>(key.identity ^ (key.bytes * 0x9e3779b97f4a7c15ull));
     }
 };
+
+// Opt-in diagnostic for #3661.  This observes the existing cache decisions; it never supplies
+// cache authority or changes an admission result.  The key table is deliberately bounded so a
+// streaming title cannot turn an intrusive census into an unbounded allocation/logging path.
+enum class ResidentRangeCensusOutcome : uint8_t {
+    HitWatch, HitCompare, ChangedRefresh, ChangedDetach, PinnedDetach, DeviceDetach,
+    OwnerLimitDisabled, ExistingKey, TooLarge, BytePressure, OwnerPinned,
+    OwnerNoCompatible, AllocationFailure, NewAdmission, ExactRekey,
+    Count
+};
+inline const char* resident_range_census_outcome_name(ResidentRangeCensusOutcome value) {
+    static constexpr const char* names[] = {
+        "hit_watch", "hit_compare", "changed_refresh", "changed_detach", "pinned_detach",
+        "device_detach", "owner_limit_disabled", "existing_key", "too_large", "byte_pressure",
+        "owner_pinned", "owner_no_compatible", "allocation_failure", "new_admission", "exact_rekey"};
+    return names[static_cast<size_t>(value)];
+}
+struct ResidentRangeCensusRecord {
+    ResidentRenderBufferKey key{};
+    uint64_t first_event = 0, last_event = 0, references = 0;
+    uint64_t physical_start_first_observation = 0, physical_end_first_observation = 0;
+    size_t aliases_start_first_observation = 0, aliases_end_first_observation = 0;
+    uint64_t global_generation_first_observation = 0;
+    uint64_t global_generation_last_observation = 0;
+    uint64_t generation_change_observations = 0, endpoint_change_observations = 0;
+    uint32_t first_set = 0, first_binding = 0;
+    bool physical_start_known = false, physical_end_known = false, endpoint_contiguous = false;
+    uint64_t byte_pressure_candidates = 0, owner_pressure_candidates = 0;
+    uint64_t reclaimed_owners = 0;
+    std::array<uint64_t, static_cast<size_t>(ResidentRangeCensusOutcome::Count)> outcomes{};
+    double find_ms = 0, admit_ms = 0, watch_ms = 0, scan_ms = 0;
+};
+struct ResidentRenderBufferCache;
+struct ResidentRangeCensus {
+    static constexpr size_t kMaxKeys = 65536;
+    bool enabled() const {
+        static const bool value = getenv("PROSPER_RENDER_BUFFER_RANGE_CENSUS") != nullptr;
+        return value;
+    }
+    bool active() const {
+        if (!enabled()) return false;
+        // Intrusive runs can start after a long scripted route, keeping the bounded key table
+        // available for the settled scene instead of filling it during loading screens.
+        static const auto start = std::chrono::steady_clock::now();
+        static const uint64_t after_ms = prosper::diag::env_u64_or_default_capped(
+            "PROSPER_RENDER_BUFFER_RANGE_CENSUS_AFTER_MS",
+            getenv("PROSPER_RENDER_BUFFER_RANGE_CENSUS_AFTER_MS"), 0, 3600000, "ms");
+        return std::chrono::steady_clock::now() - start >= std::chrono::milliseconds(after_ms);
+    }
+    ResidentRangeCensusRecord* record(ResidentRenderBufferKey key, uint32_t set, uint32_t binding) {
+        auto found = records.find(key);
+        if (found != records.end()) return &found->second;
+        if (records.size() == kMaxKeys) return nullptr;
+        ResidentRangeCensusRecord record;
+        record.key = key; record.first_event = events; record.first_set = set;
+        record.first_binding = binding;
+        record.global_generation_first_observation = prosper::host::guest_mapping_generation();
+        record.global_generation_last_observation = record.global_generation_first_observation;
+        if (key.identity && key.bytes && key.identity <= UINT64_MAX - (key.bytes - 1)) {
+            record.physical_start_known = prosper::host::guest_write_watch_va_to_phys(
+                key.identity, record.physical_start_first_observation,
+                &record.aliases_start_first_observation);
+            record.physical_end_known = prosper::host::guest_write_watch_va_to_phys(
+                key.identity + key.bytes - 1, record.physical_end_first_observation,
+                &record.aliases_end_first_observation);
+            // This proves only the two endpoints. Interior pages are intentionally unknown:
+            // the diagnostic alias API resolves a VA, not a whole contiguous physical span.
+            record.endpoint_contiguous = record.physical_start_known && record.physical_end_known &&
+                record.physical_end_first_observation >= record.physical_start_first_observation &&
+                record.physical_end_first_observation - record.physical_start_first_observation ==
+                    key.bytes - 1;
+        }
+        return &records.emplace(key, std::move(record)).first->second;
+    }
+    void begin_candidate(ResidentRenderBufferKey key, uint32_t set, uint32_t binding) {
+        if (!active()) return;
+        ++events;
+        if (!records.contains(key) && records.size() == kMaxKeys) { ++key_overflow; return; }
+        if (auto* value = record(key, set, binding)) {
+            value->last_event = events;
+            ++value->references;
+            const auto generation = prosper::host::guest_mapping_generation();
+            if (generation != value->global_generation_last_observation) {
+                ++value->generation_change_observations;
+                value->global_generation_last_observation = generation;
+                if (key.identity && key.bytes && key.identity <= UINT64_MAX - (key.bytes - 1)) {
+                    uint64_t first = 0, last = 0;
+                    const bool first_known = prosper::host::guest_write_watch_va_to_phys(key.identity, first);
+                    const bool last_known = prosper::host::guest_write_watch_va_to_phys(
+                        key.identity + key.bytes - 1, last);
+                    if (first_known != value->physical_start_known ||
+                        last_known != value->physical_end_known ||
+                        (first_known && first != value->physical_start_first_observation) ||
+                        (last_known && last != value->physical_end_first_observation))
+                        ++value->endpoint_change_observations;
+                }
+            }
+        }
+    }
+    void observe(ResidentRenderBufferKey key, uint32_t set, uint32_t binding,
+                 ResidentRangeCensusOutcome outcome, double find_ms = 0, double admit_ms = 0,
+                 double watch_ms = 0, double scan_ms = 0) {
+        if (!active()) return;
+        auto* value = record(key, set, binding);
+        if (!value) return;
+        ++value->outcomes[static_cast<size_t>(outcome)];
+        value->find_ms += find_ms; value->admit_ms += admit_ms;
+        value->watch_ms += watch_ms; value->scan_ms += scan_ms;
+        ++totals[static_cast<size_t>(outcome)];
+    }
+    void mark_pressure(ResidentRenderBufferKey key, uint32_t set, uint32_t binding,
+                       bool byte, bool owner) {
+        if (!active()) return;
+        if (auto* value = record(key, set, binding)) {
+            value->byte_pressure_candidates += byte;
+            value->owner_pressure_candidates += owner;
+        }
+    }
+    void mark_reclaimed(ResidentRenderBufferKey key, uint32_t set, uint32_t binding) {
+        if (!active()) return;
+        if (auto* value = record(key, set, binding)) ++value->reclaimed_owners;
+    }
+    void maybe_write(const ResidentRenderBufferCache& cache);
+    uint64_t events = 0, key_overflow = 0, last_written = 0;
+    std::chrono::steady_clock::time_point last_written_at = std::chrono::steady_clock::now();
+    std::unordered_map<ResidentRenderBufferKey, ResidentRangeCensusRecord,
+                       ResidentRenderBufferKeyHash> records;
+    std::array<uint64_t, static_cast<size_t>(ResidentRangeCensusOutcome::Count)> totals{};
+};
+inline ResidentRangeCensus& resident_range_census() {
+    static ResidentRangeCensus census;
+    return census;
+}
+inline bool resident_render_buffer_range_reclaim_enabled() {
+    static const bool forced_on = getenv("PROSPER_BACKEND_BUFFER_RANGE_RECLAIM") != nullptr;
+    static const bool forced_off = getenv("PROSPER_NO_BACKEND_BUFFER_RANGE_RECLAIM") != nullptr;
+    return forced_on && !forced_off;
+}
 // Bound this cache's additional standalone allocations, including detached submission owners.
 // Other pools and images consume allocation slots too; this is not device-wide accounting.
 inline uint64_t resident_render_buffer_owner_limit(uint32_t device_allocation_limit,
@@ -3688,12 +3828,20 @@ struct ResidentRenderBufferCache {
     // Called under BackendPersistentResourceGuard; cleanup only destroys independent owners.
     Owner find(VkDevice device, ResidentRenderBufferKey key, const void* source,
                BackendResourceReuseStats& stats, uint64_t direct_guest_addr = 0,
-               double* watch_ms = nullptr) {
+               double* watch_ms = nullptr, uint32_t set = UINT32_MAX, uint32_t binding = UINT32_MAX) {
+        auto& census = resident_range_census();
+        census.maybe_write(*this);
+        const bool census_active = census.active() && set != UINT32_MAX;
+        const auto begin = census_active ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         auto found = index.find(key);
+        // A miss is deliberately not recorded here: the callsite immediately tries admission, and
+        // the census counts that one logical candidate by its terminal admission/refusal outcome.
         if (found == index.end()) return {};
         auto entry = found->second;
         if (entry->owner->device == device) {
+            const double watch_before = watch_ms ? *watch_ms : 0;
             const bool watched = entry->unchanged_before_exact(source, direct_guest_addr, watch_ms);
+            const double watch_elapsed = watch_ms ? *watch_ms - watch_before : 0;
             if (!watched) stats.buffer_resident_compared_bytes += key.bytes;
             if (watched || std::memcmp(entry->owner->snapshot.get(), source, key.bytes) == 0) {
                 if (watched) stats.buffer_resident_watched_bytes += key.bytes;
@@ -3701,6 +3849,10 @@ struct ResidentRenderBufferCache {
                 lru.splice(lru.end(), lru, entry);
                 ++stats.buffer_resident_hits;
                 stats.buffer_resident_reused_bytes += key.bytes;
+                if (census_active) census.observe(key, set, binding,
+                    watched ? ResidentRangeCensusOutcome::HitWatch : ResidentRangeCensusOutcome::HitCompare,
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count(),
+                    0, watch_elapsed);
                 return entry->owner;
             }
             entry->equal_validations = 0;
@@ -3712,48 +3864,74 @@ struct ResidentRenderBufferCache {
                 stats.buffer_upload_bytes += key.bytes;
                 stats.buffer_resident_refreshed_bytes += key.bytes;
                 lru.splice(lru.end(), lru, entry);
+                if (census_active) census.observe(key, set, binding, ResidentRangeCensusOutcome::ChangedRefresh,
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count(),
+                    0, watch_elapsed);
                 return entry->owner;
             }
         }
         // Changed current bytes never overwrite an older recorded or in-flight upload.
+        const auto detach = entry->owner->device != device ? ResidentRangeCensusOutcome::DeviceDetach :
+            entry->owner.use_count() != 1 ? ResidentRangeCensusOutcome::PinnedDetach :
+            ResidentRangeCensusOutcome::ChangedDetach;
         lru.erase(entry);
         index.erase(found);
+        if (census_active) census.observe(key, set, binding, detach,
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count());
         return {};
     }
     Owner admit(const RenderVkCtx& ctx, ResidentRenderBufferKey key, const void* source,
                 VkDeviceSize limit, BackendResourceReuseStats& stats,
-                uint64_t direct_guest_addr = 0, double* watch_ms = nullptr) {
+                uint64_t direct_guest_addr = 0, double* watch_ms = nullptr,
+                uint32_t set = UINT32_MAX, uint32_t binding = UINT32_MAX,
+                bool reclaim_idle = false) {
+        auto& census = resident_range_census();
+        census.maybe_write(*this);
+        const bool census_active = census.active() && set != UINT32_MAX;
+        const auto begin = census_active ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        const auto report = [&](ResidentRangeCensusOutcome outcome, double scan_ms = 0) {
+            if (census_active) census.observe(key, set, binding, outcome, 0,
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count(),
+                0, scan_ms);
+        };
         const uint64_t source_addr = Entry::eligible_address(key, source, direct_guest_addr);
         const auto owner_limit = resident_render_buffer_configured_owner_limit(
             ctx.detile_limits.maxMemoryAllocationCount);
-        if (!owner_limit) return {};
-        if (index.contains(key) || key.bytes > limit / 2) return {};
+        if (!owner_limit) { report(ResidentRangeCensusOutcome::OwnerLimitDisabled); return {}; }
+        if (index.contains(key)) { report(ResidentRangeCensusOutcome::ExistingKey); return {}; }
+        if (key.bytes > limit / 2) { report(ResidentRangeCensusOutcome::TooLarge); return {}; }
         const auto capacity = render_host_buffer_capacity(key.bytes);
-        if (capacity > limit - key.bytes) return {};
+        if (capacity > limit - key.bytes) { report(ResidentRangeCensusOutcome::BytePressure); return {}; }
         const auto minimum_charge = capacity + key.bytes;
         const auto charged = charged_bytes->load(std::memory_order_relaxed);
-        if (charged > limit) return {};
-        if (charged > limit - minimum_charge || index.size() >= 4096 ||
-            charged_owners->load(std::memory_order_relaxed) >= owner_limit) {
+        if (charged > limit) { report(ResidentRangeCensusOutcome::BytePressure); return {}; }
+        const bool byte_pressure = charged > limit - minimum_charge;
+        const bool owner_pressure = index.size() >= 4096 ||
+            charged_owners->load(std::memory_order_relaxed) >= owner_limit;
+        if (byte_pressure || owner_pressure) {
             // A streaming working set can exceed residency without changing its allocation
             // shapes. Rekey an idle exact-size upload instead of freeing it and allocating the
             // same Vulkan buffer again. Pending versions remain ineligible and retain their charge.
+            const auto scan_begin = census_active ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            if (census_active) census.mark_pressure(key, set, binding, byte_pressure, owner_pressure);
             auto scan = lru.begin();
             if (rekey_next) {
                 const auto next = index.find(*rekey_next);
                 if (next != index.end()) scan = next->second;
             }
             const auto inspect_count = std::min<size_t>(32, lru.size());
+            bool saw_idle_exact = false, saw_pinned_exact = false;
             for (size_t inspected = 0; inspected < inspect_count; ++inspected) {
                 const auto entry = scan++;
                 if (scan == lru.end()) scan = lru.begin();
                 // Save before a successful rekey moves this element to the MRU end. With one
                 // element the old key may disappear; next admission simply resumes at begin().
                 rekey_next = scan->key;
-                if (entry->key.bytes != key.bytes || entry->owner.use_count() != 1 ||
-                    entry->owner->device != ctx.dev ||
+                if (entry->key.bytes != key.bytes || entry->owner->device != ctx.dev ||
                     entry->owner->snapshot_bytes != key.bytes)
                     continue;
+                if (entry->owner.use_count() != 1) { saw_pinned_exact = true; continue; }
+                saw_idle_exact = true;
                 // The node and list element already exist; replacing one key leaves the map's
                 // population unchanged and needs no rehash. Hash/equality are scalar operations.
                 auto node = index.extract(index.find(entry->key));
@@ -3766,11 +3944,48 @@ struct ResidentRenderBufferCache {
                 stats.buffer_upload_bytes += key.bytes;
                 stats.buffer_resident_admitted_bytes += key.bytes;
                 lru.splice(lru.end(), lru, entry);
+                report(ResidentRangeCensusOutcome::ExactRekey,
+                    census_active ? std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - scan_begin).count() : 0);
                 return entry->owner;
             }
-            // Do not churn unrelated allocations or repeatedly scan a full pinned cache. A miss
-            // outside this bounded compatible set keeps the existing ordinary upload route.
-            return {};
+            // Under owner pressure, a cold idle owner of another shape can prevent a recurring
+            // range from ever entering the cache. Retire at most one old entry; its watch and
+            // allocation must be destroyed before the replacement is acquired. This only changes
+            // admission, never content authority. The old policy remains selectable for A/B.
+            bool reclaimed = false;
+            if (reclaim_idle && owner_pressure && !byte_pressure &&
+                charged_owners->load(std::memory_order_relaxed) <= owner_limit) {
+                size_t inspected = 0;
+                for (auto victim = lru.begin(); victim != lru.end() && inspected < 32;
+                     ++victim, ++inspected) {
+                    if (victim->owner.use_count() != 1) continue;
+                    const auto victim_charge = victim->owner->retained_bytes();
+                    // Preflight against the victim's actual charge. Allocation may still have
+                    // higher requirements; the ordinary post-allocation gate remains authoritative.
+                    if (charged < victim_charge || charged - victim_charge > limit - minimum_charge)
+                        continue;
+                    index.erase(victim->key);
+                    lru.erase(victim);
+                    reclaimed = true;
+                    if (census_active) census.mark_reclaimed(key, set, binding);
+                    break;
+                }
+            }
+            if (!reclaimed) {
+                // A pinned or unsuitable cache keeps the ordinary upload route.
+                report(saw_pinned_exact && !saw_idle_exact ? ResidentRangeCensusOutcome::OwnerPinned :
+                        ResidentRangeCensusOutcome::OwnerNoCompatible,
+                    census_active ? std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - scan_begin).count() : 0);
+                return {};
+            }
+            // Positive failure control: a retired cache entry is optional state. If the next
+            // acquisition fails, the caller must still use the ordinary current-byte upload.
+            static const bool inject_reclaim_failure =
+                getenv("PROSPER_TEST_RENDER_BUFFER_RECLAIM_FAIL_AFTER_EVICT") != nullptr;
+            if (inject_reclaim_failure) {
+                report(ResidentRangeCensusOutcome::AllocationFailure);
+                return {};
+            }
         }
         Owner owner;
         try {
@@ -3778,12 +3993,12 @@ struct ResidentRenderBufferCache {
             owner->snapshot = std::make_unique_for_overwrite<std::byte[]>(key.bytes);
             owner->snapshot_bytes = key.bytes;
         }
-        catch (const std::bad_alloc&) { return {}; }
+        catch (const std::bad_alloc&) { report(ResidentRangeCensusOutcome::AllocationFailure); return {}; }
         owner->device = ctx.dev;
         owner->storage = acquire_render_host_buffer(ctx, key.bytes);
         if (!owner->storage.mapped || owner->retained_bytes() > limit ||
             charged_bytes->load(std::memory_order_relaxed) > limit - owner->retained_bytes())
-            return {};
+            { report(ResidentRangeCensusOutcome::AllocationFailure); return {}; }
         owner->charged_bytes = charged_bytes;
         charged_bytes->fetch_add(owner->retained_bytes(), std::memory_order_relaxed);
         owner->charged_owners = charged_owners;
@@ -3795,14 +4010,87 @@ struct ResidentRenderBufferCache {
             lru.emplace_back(key, owner, source_addr);
             try { index.emplace(key, std::prev(lru.end())); }
             catch (...) { lru.pop_back(); throw; }
-        } catch (const std::bad_alloc&) { return {}; }
+        } catch (const std::bad_alloc&) { report(ResidentRangeCensusOutcome::AllocationFailure); return {}; }
         stats.buffer_resident_admitted_bytes += key.bytes;
+        report(ResidentRangeCensusOutcome::NewAdmission);
         return owner;
     }
 };
 inline ResidentRenderBufferCache& resident_render_buffer_cache() {
     static ResidentRenderBufferCache cache;
     return cache;
+}
+inline void ResidentRangeCensus::maybe_write(const ResidentRenderBufferCache& cache) {
+    if (!active()) return;
+    static const uint64_t interval_ms = std::max<uint64_t>(10000,
+        prosper::diag::env_u64_or_default_capped(
+            "PROSPER_RENDER_BUFFER_RANGE_CENSUS_WRITE_INTERVAL_MS",
+            getenv("PROSPER_RENDER_BUFFER_RANGE_CENSUS_WRITE_INTERVAL_MS"),
+            60000, 600000, "ms"));
+    const auto now = std::chrono::steady_clock::now();
+    if (events == last_written || now - last_written_at < std::chrono::milliseconds(interval_ms)) return;
+    last_written = events;
+    last_written_at = now;
+    const char* configured = getenv("PROSPER_CAPTURE_DIR");
+    const std::filesystem::path directory = configured && *configured ? configured : ".";
+    std::error_code error;
+    std::filesystem::create_directories(directory, error);
+    if (error) return;
+    const auto keys_path = directory / "render_buffer_range_census_keys.csv";
+    const auto owners_path = directory / "render_buffer_range_census_owners.csv";
+    if (FILE* file = fopen(keys_path.string().c_str(), "wb")) {
+        fprintf(file, "event,key_overflow,va,logical_bytes,physical_start_first_observation,physical_end_first_observation,physical_start_known,physical_end_known,endpoint_contiguous_interior_unknown,aliases_start_first_observation,aliases_end_first_observation,global_generation_first_observation,global_generation_last_observation,generation_change_observations,endpoint_change_observations,first_set,first_binding,role,candidates,last_event,byte_pressure_candidates,owner_pressure_candidates,reclaimed_owners,hit_watch,hit_compare,changed_refresh,changed_detach,pinned_detach,device_detach,owner_limit_disabled,existing_key,too_large,byte_pressure,owner_pinned,owner_no_compatible,allocation_failure,new_admission,exact_rekey,find_ms,admit_ms,watch_ms,scan_ms\n");
+        for (const auto& [key, record] : records) {
+            const char* role = record.first_set == 0 ? "VS" : record.first_set == 1 ? "PS" : "other";
+            fprintf(file, "%llu,%llu,0x%llx,%llu,0x%llx,0x%llx,%u,%u,%u,%zu,%zu,%llu,%llu,%llu,%llu,%u,%u,%s,%llu,%llu,%llu,%llu,%llu",
+                (unsigned long long)events, (unsigned long long)key_overflow,
+                (unsigned long long)key.identity, (unsigned long long)key.bytes,
+                (unsigned long long)record.physical_start_first_observation,
+                (unsigned long long)record.physical_end_first_observation,
+                unsigned(record.physical_start_known), unsigned(record.physical_end_known),
+                unsigned(record.endpoint_contiguous), record.aliases_start_first_observation,
+                record.aliases_end_first_observation,
+                (unsigned long long)record.global_generation_first_observation,
+                (unsigned long long)record.global_generation_last_observation,
+                (unsigned long long)record.generation_change_observations,
+                (unsigned long long)record.endpoint_change_observations,
+                record.first_set, record.first_binding, role,
+                (unsigned long long)record.references, (unsigned long long)record.last_event,
+                (unsigned long long)record.byte_pressure_candidates,
+                (unsigned long long)record.owner_pressure_candidates,
+                (unsigned long long)record.reclaimed_owners);
+            for (const auto count : record.outcomes) fprintf(file, ",%llu", (unsigned long long)count);
+            fprintf(file, ",%.6f,%.6f,%.6f,%.6f\n", record.find_ms, record.admit_ms,
+                    record.watch_ms, record.scan_ms);
+        }
+        fclose(file);
+    }
+    if (FILE* file = fopen(owners_path.string().c_str(), "wb")) {
+        fprintf(file, "event,key_overflow,va,logical_bytes,host_capacity_bytes,snapshot_bytes,allocation_bytes,use_count,pinned,watch_present,watch_disabled,equal_validations,dirty_queries,candidate_age,global_generation_snapshot\n");
+        for (const auto& entry : cache.lru) {
+            const auto found = records.find(entry.key);
+            const uint64_t last = found == records.end() ? 0 : found->second.last_event;
+            const uint64_t age = last && events >= last ? events - last : UINT64_MAX;
+            fprintf(file, "%llu,%llu,0x%llx,%llu,%llu,%llu,%llu,%ld,%u,%u,%u,%u,%u,%llu,%llu\n",
+                (unsigned long long)events, (unsigned long long)key_overflow,
+                (unsigned long long)entry.key.identity, (unsigned long long)entry.key.bytes,
+                (unsigned long long)entry.owner->storage.bytes,
+                (unsigned long long)entry.owner->snapshot_bytes,
+                (unsigned long long)entry.owner->storage.allocation_bytes,
+                long(entry.owner.use_count()), unsigned(entry.owner.use_count() != 1), unsigned(bool(entry.watch)),
+                unsigned(entry.watch_disabled), unsigned(entry.equal_validations), unsigned(entry.dirty_queries),
+                (unsigned long long)age, (unsigned long long)prosper::host::guest_mapping_generation());
+        }
+        fclose(file);
+    }
+    fprintf(stderr, "[render-buffer-range-census] events=%llu keys=%zu overflow=%llu owners=%zu"
+                    " hits=%llu/%llu new=%llu rekey=%llu owner_no_compatible=%llu\n",
+            (unsigned long long)events, records.size(), (unsigned long long)key_overflow, cache.index.size(),
+            (unsigned long long)totals[static_cast<size_t>(ResidentRangeCensusOutcome::HitWatch)],
+            (unsigned long long)totals[static_cast<size_t>(ResidentRangeCensusOutcome::HitCompare)],
+            (unsigned long long)totals[static_cast<size_t>(ResidentRangeCensusOutcome::NewAdmission)],
+            (unsigned long long)totals[static_cast<size_t>(ResidentRangeCensusOutcome::ExactRekey)],
+            (unsigned long long)totals[static_cast<size_t>(ResidentRangeCensusOutcome::OwnerNoCompatible)]);
 }
 inline VkDeviceSize resident_render_buffer_limit() {
     // Retention can reduce copying while increasing enclosing frame costs, including on Linux
@@ -3825,6 +4113,15 @@ inline VkDeviceSize resident_render_buffer_range_limit() {
     return disabled ? 0 : limit * 1024ull * 1024ull;
 }
 
+inline VkDeviceSize resident_render_buffer_range_min_bytes() {
+    // Admission hint for connected ranges only. A separately enabled per-binding cache keeps
+    // its own policy. The exact-byte and write-watch proofs remain authoritative for admissions.
+    static const auto minimum = prosper::diag::env_u64_or_default_capped(
+        "PROSPER_BACKEND_BUFFER_RANGE_MIN_BYTES",
+        getenv("PROSPER_BACKEND_BUFFER_RANGE_MIN_BYTES"), 0, 64ull << 20, "bytes");
+    return minimum;
+}
+
 struct ResidentRenderBufferCacheSnapshot {
     bool available;
     size_t indexed_entries;
@@ -3838,6 +4135,7 @@ inline ResidentRenderBufferCacheSnapshot resident_render_buffer_cache_snapshot()
     if (!ctx || !ctx->ok) return {}; // Observing statistics must not initialize a Vulkan device.
     BackendPersistentResourceGuard guard;
     const auto& cache = resident_render_buffer_cache();
+    resident_range_census().maybe_write(cache);
     return {true, cache.index.size(), cache.charged_owners->load(std::memory_order_relaxed),
             cache.charged_bytes->load(std::memory_order_relaxed),
             resident_render_buffer_configured_owner_limit(ctx->detile_limits.maxMemoryAllocationCount),
@@ -8828,7 +9126,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                         group_index == buffer_range_groups.size())
                         resource_reuse_stats.buffer_resident_ineligible_bytes += bytes;
                     bool range_shared = false;
-                    if (group_index != buffer_range_groups.size() && range_residency_limit) {
+                    if (group_index != buffer_range_groups.size() && range_residency_limit &&
+                        buffer_range_groups[group_index].bytes >= resident_render_buffer_range_min_bytes()) {
                         auto& owner = buffer_range_uploads[group_index];
                         if (!owner.resident_attempted) {
                             owner.resident_attempted = true;
@@ -8836,6 +9135,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                             const auto* source = reinterpret_cast<const void*>(
                                 static_cast<uintptr_t>(group.address));
                             const ResidentRenderBufferKey key{group.address, group.bytes};
+                            resident_range_census().begin_candidate(key, set, binding);
                             const ResourcePhaseTimer phase_resident(timing_enabled,
                                                                     &res_buffer_resident_ms);
                             auto& cache = resident_render_buffer_cache();
@@ -8843,11 +9143,12 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                             const uint64_t watched_addr = readonly_buffer_watch ? group.address : 0;
                             owner.upload.resident = cache.find(ctx.dev, key, source,
                                 resource_reuse_stats, watched_addr,
-                                timing_enabled ? &res_buffer_watch_ms : nullptr);
+                                timing_enabled ? &res_buffer_watch_ms : nullptr, set, binding);
                             if (!owner.upload.resident)
                                 owner.upload.resident = cache.admit(ctx, key, source,
                                     range_residency_limit, resource_reuse_stats, watched_addr,
-                                    timing_enabled ? &res_buffer_watch_ms : nullptr);
+                                    timing_enabled ? &res_buffer_watch_ms : nullptr, set, binding,
+                                    resident_render_buffer_range_reclaim_enabled());
                             if (owner.upload.resident) {
                                 const auto& retained = owner.upload.resident->storage;
                                 owner.upload.buffer = retained.buffer;

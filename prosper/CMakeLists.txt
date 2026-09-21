@@ -3986,6 +3986,10 @@ if(TARGET prosper_core AND TARGET Vulkan::Vulkan)
   foreach(range_residency_control IN ITEMS on off)
     set(range_residency_environment PROSPER_BACKEND_BUFFER_RESIDENCY_MB=0
       PROSPER_BACKEND_BUFFER_RANGE_RESIDENCY_MB=64
+      --unset=PROSPER_BACKEND_BUFFER_RANGE_MIN_BYTES
+      --unset=PROSPER_BACKEND_BUFFER_RANGE_RECLAIM
+      --unset=PROSPER_NO_BACKEND_BUFFER_RANGE_RECLAIM
+      --unset=PROSPER_TEST_RENDER_BUFFER_RECLAIM_FAIL_AFTER_EVICT
       --unset=PROSPER_NO_BACKEND_BUFFER_RESIDENCY
       --unset=PROSPER_NO_BACKEND_BUFFER_RANGE_RESIDENCY
       --unset=PROSPER_NO_BACKEND_RESOURCE_SHARE
@@ -3999,6 +4003,47 @@ if(TARGET prosper_core AND TARGET Vulkan::Vulkan)
       COMMAND ${CMAKE_COMMAND} -E env ${range_residency_environment}
       $<TARGET_FILE:test_render_buffer_residency> --range-residency ${range_residency_control})
   endforeach()
+  foreach(range_reclaim_control IN ITEMS on off fail)
+    set(range_reclaim_environment PROSPER_BACKEND_BUFFER_RESIDENCY_MB=0
+      PROSPER_BACKEND_BUFFER_RANGE_RESIDENCY_MB=64
+      PROSPER_BACKEND_BUFFER_RESIDENCY_OWNERS=1
+      --unset=PROSPER_BACKEND_BUFFER_RANGE_MIN_BYTES
+      --unset=PROSPER_NO_BACKEND_BUFFER_RESIDENCY
+      --unset=PROSPER_NO_BACKEND_BUFFER_RANGE_RESIDENCY
+      --unset=PROSPER_NO_BACKEND_RESOURCE_SHARE
+      --unset=PROSPER_NO_BACKEND_BUFFER_POOL --unset=PROSPER_BUFVERIFY
+      --unset=PROSPER_NO_BACKEND_BUFFER_ARENA
+      --unset=PROSPER_NO_BACKEND_BUFFER_RANGE_SHARE
+      --unset=PROSPER_BACKEND_BUFFER_RANGE_RECLAIM
+      --unset=PROSPER_NO_BACKEND_BUFFER_RANGE_RECLAIM
+      --unset=PROSPER_TEST_RENDER_BUFFER_RECLAIM_FAIL_AFTER_EVICT)
+    if(NOT range_reclaim_control STREQUAL "off")
+      list(APPEND range_reclaim_environment PROSPER_BACKEND_BUFFER_RANGE_RECLAIM=1)
+    endif()
+    if(range_reclaim_control STREQUAL "fail")
+      list(APPEND range_reclaim_environment
+        PROSPER_TEST_RENDER_BUFFER_RECLAIM_FAIL_AFTER_EVICT=1)
+    endif()
+    add_test(NAME render_buffer_range_reclaim_${range_reclaim_control}
+      COMMAND ${CMAKE_COMMAND} -E env ${range_reclaim_environment}
+      $<TARGET_FILE:test_render_buffer_residency> --range-reclaim ${range_reclaim_control})
+  endforeach()
+  add_test(NAME render_buffer_range_minimum
+    COMMAND ${CMAKE_COMMAND} -E env
+      PROSPER_BACKEND_BUFFER_RESIDENCY_MB=0
+      PROSPER_BACKEND_BUFFER_RANGE_RESIDENCY_MB=64
+      PROSPER_BACKEND_BUFFER_RANGE_MIN_BYTES=10000
+      PROSPER_BACKEND_BUFFER_RESIDENCY_OWNERS=1
+      --unset=PROSPER_BACKEND_BUFFER_RANGE_RECLAIM
+      --unset=PROSPER_NO_BACKEND_BUFFER_RANGE_RECLAIM
+      --unset=PROSPER_TEST_RENDER_BUFFER_RECLAIM_FAIL_AFTER_EVICT
+      --unset=PROSPER_NO_BACKEND_BUFFER_RESIDENCY
+      --unset=PROSPER_NO_BACKEND_BUFFER_RANGE_RESIDENCY
+      --unset=PROSPER_NO_BACKEND_RESOURCE_SHARE
+      --unset=PROSPER_NO_BACKEND_BUFFER_POOL --unset=PROSPER_BUFVERIFY
+      --unset=PROSPER_NO_BACKEND_BUFFER_ARENA
+      --unset=PROSPER_NO_BACKEND_BUFFER_RANGE_SHARE
+      $<TARGET_FILE:test_render_buffer_residency> --range-minimum)
   add_test(NAME render_buffer_range_residency_global_disabled
     COMMAND ${CMAKE_COMMAND} -E env
       PROSPER_BACKEND_BUFFER_RESIDENCY_MB=0
@@ -4037,13 +4082,16 @@ if(TARGET prosper_core AND TARGET Vulkan::Vulkan)
   add_test(NAME render_buffer_residency_default COMMAND ${CMAKE_COMMAND} -E env
     --unset=PROSPER_BACKEND_BUFFER_RESIDENCY_MB
     --unset=PROSPER_BACKEND_BUFFER_RANGE_RESIDENCY_MB
+    --unset=PROSPER_BACKEND_BUFFER_RANGE_MIN_BYTES
+    --unset=PROSPER_BACKEND_BUFFER_RANGE_RECLAIM
+    --unset=PROSPER_NO_BACKEND_BUFFER_RANGE_RECLAIM
     --unset=PROSPER_NO_BACKEND_BUFFER_RANGE_RESIDENCY
     --unset=PROSPER_NO_BACKEND_BUFFER_RESIDENCY
+    --unset=PROSPER_NO_BACKEND_BUFFER_WRITE_WATCH
     --unset=PROSPER_BACKEND_BUFFER_RESIDENCY_OWNERS
     --unset=PROSPER_NO_BACKEND_RESOURCE_SHARE
     --unset=PROSPER_NO_BACKEND_BUFFER_POOL --unset=PROSPER_BUFVERIFY
     $<TARGET_FILE:test_render_buffer_residency> --default-disabled)
-
   add_executable(test_gpu_detile tests/gpu/execute/test_gpu_detile.cpp)
   target_include_directories(test_gpu_detile PRIVATE tests)
   target_link_libraries(test_gpu_detile PRIVATE prosper_core Vulkan::Vulkan)

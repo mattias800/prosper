@@ -129,11 +129,14 @@ never own or extend guest mapping lifetime; recorded GPU snapshots remain indepe
 comparable exact-validation controls. Watched bytes are a subset of reused bytes; watch time is
 already included in resident time.
 
-The combined residency budget defaults to zero on every platform: the measured enclosing costs
-have not justified general enablement, even with Linux write watches. An explicit
-`PROSPER_BACKEND_BUFFER_RESIDENCY_MB` override enables exact snapshot residency on any platform,
-capped at 2048 MiB. Zero bypasses both admission and the pass's additional write-proof reflection.
-Linux inputs whose watches fail or are disabled still use exact comparison; this fallback is
+The combined residency budget defaults to zero on every platform. Explicit
+`PROSPER_BACKEND_BUFFER_RANGE_RESIDENCY_MB` budgets can use
+`PROSPER_BACKEND_BUFFER_RANGE_MIN_BYTES` to bypass small connected ranges and
+`PROSPER_BACKEND_BUFFER_RANGE_RECLAIM` to reclaim one incompatible idle owner under pressure;
+`PROSPER_NO_BACKEND_BUFFER_RANGE_RECLAIM` overrides the latter. Admission policy never grants
+content authority. `PROSPER_BACKEND_BUFFER_RESIDENCY_MB` independently enables per-binding exact
+snapshot residency on any platform, capped at 2048 MiB. Explicit zero and the existing disable
+switches bypass retention. Inputs whose watches fail still use exact comparison; this fallback is
 correct but can cost more than ordinary uploads.
 Runtime cache fixtures explicitly select a nonzero budget so unsupported platforms exercise the
 portable ownership and comparison contract too.
