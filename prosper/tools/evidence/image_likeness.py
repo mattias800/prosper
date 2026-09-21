@@ -570,7 +570,10 @@ def selftest():
         # Honest claim: the blend REMOVES THE JUMP, it does not make the crossing
         # flat. second = (1-w)*struct, so likeness falls like sqrt(1-w) and the
         # approach steepens at the boundary by construction. Measured across the
-        # floor: ~0.21 blended against ~0.94 under a hard switch.
+        # floor: 0.207 blended against 0.922 under a hard switch. (Exact, not
+        # approximate, and quoted once: the same two numbers appearing twice ten
+        # lines apart with different roundings is how the reviewer-figure error
+        # above got in.)
         check(f"the hue/structure crossing is a ramp, not a jump "
               f"({lo_c*100:.2f}% -> {hi_c*100:.2f}% chromatic, step {step:.3f} "
               f"vs 0.922 switched)",

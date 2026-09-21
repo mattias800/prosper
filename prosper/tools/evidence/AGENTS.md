@@ -239,8 +239,9 @@ whether a scene looks right. Two cautions learned while building it:
 - **`--threshold` and `--cells` belong to the spatial modes only.** An early version
   dropped `--threshold` outside `--grid`; the repair was incomplete and a review
   found `--rank` still took no options at all while `--locate` accepted `--cells`
-  and discarded it. If a mode accepts an option now, it uses it — pinned by four
-  arms that compare CLI output at two settings.
+  and discarded it. If a mode accepts an option now, it uses it — pinned by one
+  arm per (mode, option) pair, six in all, each comparing CLI output at two
+  settings.
   **Compare the result rows, never the whole output.** Every mode echoes its own
   settings in a header — `--locate` its `grid=`, `grid_compare` and `region_match`
   their `tol=` — so a whole-output comparison is satisfied by the echo whether or
