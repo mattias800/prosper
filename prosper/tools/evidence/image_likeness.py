@@ -538,11 +538,21 @@ def selftest():
         check(f"...and so does a scaled-to-black copy that CORRELATES perfectly "
               f"({s_dim:.3f}, brightest pixel {dim_max}/255)", s_dim < s_real * 0.5)
 
-        # The blend across the chromatic floor must be CONTINUOUS. Nothing pinned
-        # this, and a hard switch is the shape the round-2 defect had: two
-        # references straddling the floor step 0.227 on the blend and 0.962 under
-        # a switch. Build a pair either side of MIN_REF_CHROMATIC from the same
-        # scene, so only the crossing differs.
+        # The blend across the chromatic floor must be a RAMP. Nothing pinned this,
+        # and a hard switch is the shape the round-2 defect had. Measured on THIS
+        # fixture: step 0.207 blended against 0.922 switched. (An earlier version
+        # of this comment quoted 0.227/0.962 -- a reviewer's numbers from THEIR
+        # fixture, copied in as though they described this one. A cited figure that
+        # does not reproduce is the charter's most contagious error; measure your
+        # own.) Build a pair either side of MIN_REF_CHROMATIC from the same scene,
+        # so only the crossing differs.
+        #
+        # The bound is derivable rather than chosen: at w = 0.95 the second factor
+        # is (1-w)*struct with hue_recall ~ 0, so likeness falls like sqrt(1-w) and
+        # any blend of this form steps at most sqrt(0.05) = 0.224 here. 0.40 leaves
+        # deliberate headroom -- a review probed w = ratio**k and found k<=4 passes
+        # (0.399) while k>=5 fails (0.440), and every shape in the passing band is
+        # still a ramp, so nothing that falsifies the claim gets through.
         def tinted(frac):
             im = mono.copy()
             n = int(H * W * frac)
@@ -563,7 +573,7 @@ def selftest():
         # floor: ~0.21 blended against ~0.94 under a hard switch.
         check(f"the hue/structure crossing is a ramp, not a jump "
               f"({lo_c*100:.2f}% -> {hi_c*100:.2f}% chromatic, step {step:.3f} "
-              f"vs ~0.94 switched)",
+              f"vs 0.922 switched)",
               lo_c < MIN_REF_CHROMATIC <= hi_c and step < 0.40)
 
         # Region location, on the STRUCTURED fixture. Three shapes, not one.
@@ -599,9 +609,28 @@ def selftest():
                 rc = e.code if isinstance(e.code, int) else 1
             return rc, buf.getvalue(), err.getvalue()
 
+        def rows(text):
+            # Drop everything the CALLEE or the harness merely echoes back: the
+            # `=== ... ===` banner --locate prints from _main's parsed values, and
+            # any per-candidate header carrying `tol=`/`grid=`, which grid_compare
+            # and region_match echo. A review showed hardcoding the tolerance
+            # INSIDE grid_compare left a whole-output arm 29/29 green, because the
+            # echoed header still moved. Compare only what was computed.
+            return "\n".join(l for l in text.splitlines()
+                              if not l.startswith("===")
+                              and "tol=" not in l and "grid=" not in l)
+
         _, o_a, _ = cli(["--grid", ref_p, grey, "--threshold", "0"])
         _, o_b, _ = cli(["--grid", ref_p, grey, "--threshold", "255"])
-        check("--threshold reaches --grid via the CLI", o_a != o_b)
+        check("--threshold reaches --grid via the CLI", rows(o_a) != rows(o_b))
+        _, o_i, _ = cli(["--grid", ref_p, dgrad_p, "--cells", "4x3"])
+        _, o_j, _ = cli(["--grid", ref_p, dgrad_p, "--cells", "16x9"])
+        check("--cells reaches --grid via the CLI (4x3 vs 16x9)",
+              rows(o_i) != rows(o_j))
+        _, o_k, _ = cli(["--regions", ref_p, dgrad_p, "--threshold", "1"])
+        _, o_l, _ = cli(["--regions", ref_p, dgrad_p, "--threshold", "200"])
+        check("--threshold reaches --regions via the CLI (1 vs 200)",
+              rows(o_k) != rows(o_l))
         # BOTH values must sit below the old max(cols, 8) clamp, or the clamp maps
         # them to different grids anyway and the arm passes with the defect present.
         _, o_c, _ = cli(["--regions", ref_p, dgrad_p, "--cells", "2x2"])
@@ -612,8 +641,6 @@ def selftest():
         # options reach region_match: a review reinstated the drop-the-options
         # defect in --locate alone and the suite stayed 27/27 green while all three
         # --cells values gave byte-identical answers. Compare the RESULT ROWS.
-        def rows(text):
-            return "\n".join(l for l in text.splitlines() if not l.startswith("==="))
         _, o_e, _ = cli(["--locate", ref_p, td, "--cells", "2x2"])
         _, o_f, _ = cli(["--locate", ref_p, td, "--cells", "4x3"])
         check("--cells reaches --locate via the CLI (2x2 vs 4x3)",

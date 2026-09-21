@@ -208,7 +208,7 @@ whether a scene looks right. Two cautions learned while building it:
   the oracle's bottom half being located as "bottom third", a frame compared against
   itself reporting "top-right q" instead of "full", and each mode refusing the
   options it does not use. The arms are written so that reinstating the old
-  behaviour reddens a named case — verified by mutation, **thirteen for thirteen**,
+  behaviour reddens a named case — verified by mutation, **fifteen for fifteen**,
   including reinstating the exact pre-review region algorithm rather than a
   convenient substitute for it.
 
@@ -241,11 +241,15 @@ whether a scene looks right. Two cautions learned while building it:
   found `--rank` still took no options at all while `--locate` accepted `--cells`
   and discarded it. If a mode accepts an option now, it uses it — pinned by four
   arms that compare CLI output at two settings.
-  **Compare the result rows, never the whole output.** `--locate` echoes its grid
-  in its own header, so a whole-output comparison is satisfied by the echo whether
-  or not the options reach the scoring function: a review reinstated exactly that
-  defect in `--locate` and the suite stayed 27/27 green while all three `--cells`
-  values produced byte-identical answers.
+  **Compare the result rows, never the whole output.** Every mode echoes its own
+  settings in a header — `--locate` its `grid=`, `grid_compare` and `region_match`
+  their `tol=` — so a whole-output comparison is satisfied by the echo whether or
+  not the options reach the code that scores. Two reviews demonstrated it from
+  opposite ends: reinstating the drop-the-options defect in `--locate` left the
+  suite 27/27 green with all three `--cells` values byte-identical, and hardcoding
+  the tolerance *inside* `grid_compare` left it 29/29 green. The `rows()` helper in
+  the selftest drops `===` banners and any line carrying `tol=`/`grid=`, so the
+  arms see only what was computed. All six (mode, option) pairs now have an arm.
 - **Absolute scores are low even for good renders**, because exposure and tonemap
   differences shift every cell. Compare candidates against each other, and watch the
   per-hue deltas and the spatial map rather than the single number.
