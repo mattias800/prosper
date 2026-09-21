@@ -613,7 +613,8 @@ void resident_owner_limits() {
           "detached pin completion releases only its own charge");
 }
 
-void range_sharing(const Fixture& f, bool expect_sharing) {
+void range_sharing(const Fixture& f, bool expect_sharing,
+                   bool expect_copy_batch = false) {
     // Shift by an aligned KiB, with overlapping 8 KiB views. The first draw is offscreen;
     // only the second view can produce green, exposing an incorrectly rebased slice.
     std::vector<uint32_t> source(Words + 256, 0);
@@ -636,7 +637,9 @@ void range_sharing(const Fixture& f, bool expect_sharing) {
                   stats.buffer_range_uploads == (expect_sharing ? 1u : 0u) &&
                   stats.buffer_range_bindings == (expect_sharing ? 2u : 0u) &&
                   stats.buffer_range_bound_bytes == (expect_sharing ? 2 * Bytes : 0u) &&
-                  stats.buffer_range_upload_bytes == (expect_sharing ? UnionBytes : 0u), message);
+                  stats.buffer_range_upload_bytes == (expect_sharing ? UnionBytes : 0u) &&
+                  stats.buffer_range_copy_batches == (expect_copy_batch ? 1u : 0u) &&
+                  stats.buffer_range_copy_spans == (expect_copy_batch ? 1u : 0u), message);
     };
     CHECK(solid(render_draws_rgba(draws(), W, H, nullptr, Clear), true),
           "shifted view fetches the correct green quad");
@@ -695,6 +698,66 @@ void range_sharing(const Fixture& f, bool expect_sharing) {
               solid(before,true), "old queued upload preserves its original green contents");
     CHECK(readback_persistent_color_target(new_target.persistent_id,W,H,VK_FORMAT_UNDEFINED,after,error) &&
               solid(after,false), "new queued upload observes the changed offscreen quad");
+}
+
+void copy_batch_helper() {
+    constexpr size_t SourceBytes = 4u << 20;
+    constexpr size_t GuardBytes = 64;
+    std::vector<uint8_t> source(SourceBytes);
+    for (size_t i = 0; i < source.size(); ++i)
+        source[i] = static_cast<uint8_t>((i * 131u + i / 251u) & 0xffu);
+    std::vector<uint8_t> actual(SourceBytes + 2 * GuardBytes, 0xa5);
+    std::vector<uint8_t> expected = actual;
+    const std::array<RenderCopySpan, 4> spans{{
+        {actual.data() + GuardBytes, source.data(), 1300u << 10},
+        {actual.data() + GuardBytes + (1400u << 10), source.data() + (512u << 10), 900u << 10},
+        {actual.data() + GuardBytes + (2400u << 10), source.data() + (2u << 20), 700u << 10},
+        {actual.data() + GuardBytes + (3200u << 10), source.data() + (3u << 20), 512u << 10},
+    }};
+    for (size_t i = 0; i < spans.size(); ++i) {
+        const size_t offset = static_cast<uint8_t*>(spans[i].destination) - actual.data();
+        std::memcpy(expected.data() + offset, spans[i].source, spans[i].bytes);
+    }
+    parallel_render_memcpy_batch(spans);
+    CHECK(actual == expected,
+          "batched copies preserve nonuniform tails, overlapping sources and destination guards");
+    actual[GuardBytes + (2400u << 10) + 17] ^= 0xff;
+    CHECK(actual != expected, "independent expected bytes detect a missed or corrupted copy task");
+}
+
+void range_copy_batch_production(const Fixture& f, bool enabled) {
+    // Three independent unions, each smaller than the old 2 MiB per-copy parallel threshold but
+    // larger than 2 MiB together. Every pair overlaps by all but 1 KiB. The first view is offscreen
+    // and the shifted view is green, so correct pixels independently check each descriptor's exact
+    // rebasing while the counters prove the production worker-batch path was selected.
+    constexpr size_t LargeWords = (1u << 20) / sizeof(uint32_t);
+    constexpr uint64_t UnionBytes = LargeWords * sizeof(uint32_t) + 1024;
+    std::array<std::vector<uint32_t>, 3> sources;
+    std::vector<BackendDraw> draws;
+    for (auto& source : sources) {
+        source.assign(LargeWords + 256, 0);
+        quad(source, 0, false);
+        quad(source, 128, true);
+        for (size_t shift : {size_t{0}, size_t{256}}) {
+            auto draw = f.draw(source, reinterpret_cast<uintptr_t>(source.data() + shift));
+            auto& r = draw.R[0];
+            r.dwords_view = source.data() + shift;
+            r.dwords_view_count = LargeWords;
+            r.direct_guest_buffer_addr = r.buffer_identity;
+            draws.push_back(std::move(draw));
+        }
+    }
+    CHECK(solid(render_draws_rgba(draws, W, H, nullptr, Clear), true),
+          "multi-union production batch preserves exact shifted guest views");
+    const auto stats = backend_resource_reuse_stats();
+    CHECK(stats.buffer_range_uploads == sources.size() &&
+              stats.buffer_range_bindings == 2 * sources.size() &&
+              stats.buffer_range_upload_bytes == UnionBytes * sources.size() &&
+              stats.buffer_range_bound_bytes ==
+                  2 * LargeWords * sizeof(uint32_t) * sources.size() &&
+              stats.buffer_range_copy_batches == (enabled ? 1u : 0u) &&
+              stats.buffer_range_copy_spans == (enabled ? sources.size() : 0u),
+          "multiple sub-threshold production unions distinguish batched and immediate copies");
 }
 
 void range_residency(const Fixture& f, bool enabled) {
@@ -1011,6 +1074,10 @@ void lookup_arena(const Fixture& f, bool expected_arena) {
 }
 
 int main(int argc, char** argv) {
+    if (argc == 2 && std::string(argv[1]) == "--copy-batch-helper") {
+        copy_batch_helper();
+        return failures ? 1 : 0;
+    }
     if (argc == 3 && std::string(argv[1]) == "--configured-owner-limit") {
         const uint64_t expected = std::stoull(argv[2]);
         CHECK(resident_render_buffer_configured_owner_limit(UINT32_MAX) == expected,
@@ -1035,7 +1102,12 @@ int main(int argc, char** argv) {
         return failures ? 1 : 0;
     }
     if (argc == 3 && std::string(argv[1]) == "--range-sharing") {
-        range_sharing(f, std::string(argv[2]) == "on");
+        range_sharing(f, std::string(argv[2]) == "on",
+                      std::string(argv[2]) == "on");
+        return failures ? 1 : 0;
+    }
+    if (argc == 3 && std::string(argv[1]) == "--range-copy-batch") {
+        range_copy_batch_production(f, std::string(argv[2]) == "on");
         return failures ? 1 : 0;
     }
     if (argc == 3 && std::string(argv[1]) == "--range-residency") {

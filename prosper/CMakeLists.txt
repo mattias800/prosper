@@ -3979,7 +3979,8 @@ if(TARGET prosper_core AND TARGET Vulkan::Vulkan)
       PROSPER_BACKEND_BUFFER_RANGE_RESIDENCY_MB=0
       --unset=PROSPER_NO_BACKEND_RESOURCE_SHARE --unset=PROSPER_NO_BACKEND_BUFFER_POOL
       --unset=PROSPER_NO_BACKEND_BUFFER_ARENA --unset=PROSPER_BUFVERIFY
-      --unset=PROSPER_NO_BACKEND_BUFFER_RANGE_SHARE)
+      --unset=PROSPER_NO_BACKEND_BUFFER_RANGE_SHARE
+      --unset=PROSPER_NO_BACKEND_BUFFER_COPY_BATCH)
     set(range_expected off)
     if(range_control STREQUAL "on")
       set(range_expected on)
@@ -3993,6 +3994,24 @@ if(TARGET prosper_core AND TARGET Vulkan::Vulkan)
     add_test(NAME render_buffer_range_${range_control} COMMAND ${CMAKE_COMMAND} -E env
       ${range_environment} $<TARGET_FILE:test_render_buffer_residency>
       --range-sharing ${range_expected})
+  endforeach()
+  add_test(NAME render_buffer_copy_batch_helper COMMAND ${CMAKE_COMMAND} -E env
+    PROSPER_RENDER_COPY_THREADS=4
+    $<TARGET_FILE:test_render_buffer_residency> --copy-batch-helper)
+  foreach(copy_batch_control IN ITEMS on off)
+    set(copy_batch_environment PROSPER_BACKEND_BUFFER_RESIDENCY_MB=0
+      PROSPER_BACKEND_BUFFER_RANGE_RESIDENCY_MB=0
+      PROSPER_RENDER_COPY_THREADS=4
+      --unset=PROSPER_NO_BACKEND_RESOURCE_SHARE --unset=PROSPER_NO_BACKEND_BUFFER_POOL
+      --unset=PROSPER_NO_BACKEND_BUFFER_ARENA --unset=PROSPER_BUFVERIFY
+      --unset=PROSPER_NO_BACKEND_BUFFER_RANGE_SHARE
+      --unset=PROSPER_NO_BACKEND_BUFFER_COPY_BATCH)
+    if(copy_batch_control STREQUAL "off")
+      list(APPEND copy_batch_environment PROSPER_NO_BACKEND_BUFFER_COPY_BATCH=1)
+    endif()
+    add_test(NAME render_buffer_copy_batch_${copy_batch_control} COMMAND ${CMAKE_COMMAND} -E env
+      ${copy_batch_environment} $<TARGET_FILE:test_render_buffer_residency>
+      --range-copy-batch ${copy_batch_control})
   endforeach()
   foreach(range_residency_control IN ITEMS on off)
     set(range_residency_environment PROSPER_BACKEND_BUFFER_RESIDENCY_MB=0
