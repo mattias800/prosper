@@ -11,8 +11,9 @@
 
 namespace prosper::frontend {
 
-// A work serial is assigned only when its submission has completed. The originating image's
-// registration makes the identity explicit; a pure copy keeps this pair unchanged.
+// A work serial may be reserved while an ordered submission is being recorded, but it becomes
+// public only after that submission has completed. The originating image's registration makes the
+// identity explicit; a pure copy keeps this pair unchanged.
 struct CompletedProducer {
     uint64_t registration = 0;
     uint64_t work = 0;

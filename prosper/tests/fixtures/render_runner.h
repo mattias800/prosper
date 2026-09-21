@@ -2144,9 +2144,11 @@ struct ColorProducerTicket {
 struct ColorProducerCompletion {
     PersistentColorTargetImage* image = nullptr;
     ColorProducerTicket ticket;
-    bool lineage_proven = false;
+    prosper::frontend::CompletedProducer producer;
+    const class BackendSubmissionBatch* batch = nullptr;
 };
 inline void apply_color_producer_completion(const ColorProducerCompletion& completion);
+inline void discard_color_producer_completion(const ColorProducerCompletion& completion);
 
 // Collect command buffers that belong to one ordered renderer callback. Vulkan queue order preserves
 // target producer/consumer dependencies; one fence on the final submission is enough to retain every
@@ -2406,6 +2408,10 @@ private:
             for (const auto& completion : overflow_completions_)
                 apply_color_producer_completion(completion);
         } else {
+            for (size_t i = 0; i < inline_completion_count_; ++i)
+                discard_color_producer_completion(inline_completions_[i]);
+            for (const auto& completion : overflow_completions_)
+                discard_color_producer_completion(completion);
             for (auto cleanup = failure_cleanups_.rbegin();
                  cleanup != failure_cleanups_.rend(); ++cleanup)
                 (*cleanup)();
@@ -2458,12 +2464,21 @@ struct PersistentColorTargetImage {
     uint64_t registration = 0;
     uint64_t mutation = 0;
     prosper::frontend::CompletedProducer completed_producer;
+    // A same-batch consumer may need the exact version recorded immediately before it. Keep that
+    // value private until the batch fence proves completion; a later mutation replaces this plan
+    // without changing completion records that already captured it by value.
+    const BackendSubmissionBatch* planned_batch = nullptr;
+    ColorProducerTicket planned_ticket;
+    prosper::frontend::CompletedProducer planned_producer;
 };
 
 inline void invalidate_color_producer(PersistentColorTargetImage& image) {
     if (!prosper::frontend::producer_lineage_enabled()) return;
     ++image.mutation;
     image.completed_producer = {};
+    image.planned_batch = nullptr;
+    image.planned_ticket = {};
+    image.planned_producer = {};
 }
 
 inline ColorProducerTicket begin_color_producer_write(PersistentColorTargetImage& image) {
@@ -2487,8 +2502,51 @@ inline void complete_color_producer_write(PersistentColorTargetImage& image,
 }
 
 inline void apply_color_producer_completion(const ColorProducerCompletion& completion) {
-    complete_color_producer_write(*completion.image, completion.ticket,
-                                  completion.lineage_proven);
+    if (!completion.image) return;
+    if (color_producer_ticket_matches(*completion.image, completion.ticket))
+        completion.image->completed_producer = completion.producer;
+    discard_color_producer_completion(completion);
+}
+
+inline void discard_color_producer_completion(const ColorProducerCompletion& completion) {
+    if (!completion.image || completion.image->planned_batch != completion.batch ||
+        completion.image->planned_ticket.registration != completion.ticket.registration ||
+        completion.image->planned_ticket.mutation != completion.ticket.mutation)
+        return;
+    completion.image->planned_batch = nullptr;
+    completion.image->planned_ticket = {};
+    completion.image->planned_producer = {};
+}
+
+inline prosper::frontend::CompletedProducer color_producer_for_batch(
+        const PersistentColorTargetImage& image, const BackendSubmissionBatch& batch) {
+    if (!prosper::frontend::producer_lineage_enabled() || !image.valid) return {};
+    if (image.planned_batch == &batch &&
+        image.planned_ticket.registration == image.registration &&
+        image.planned_ticket.mutation == image.mutation)
+        return image.planned_producer;
+    return image.completed_producer;
+}
+
+inline void queue_color_producer_completion(
+        BackendSubmissionBatch& batch, PersistentColorTargetImage& image,
+        ColorProducerTicket ticket, prosper::frontend::CompletedProducer producer) {
+    if (batch.retains_pending_resources()) return;
+    if (ticket.registration && color_producer_ticket_matches(image, ticket)) {
+        image.planned_batch = &batch;
+        image.planned_ticket = ticket;
+        image.planned_producer = producer;
+    }
+    batch.add_color_completion({&image, ticket, producer, &batch});
+}
+
+inline void queue_color_producer_write(BackendSubmissionBatch& batch,
+                                       PersistentColorTargetImage& image,
+                                       ColorProducerTicket ticket, bool lineage_proven) {
+    prosper::frontend::CompletedProducer producer;
+    if (lineage_proven && ticket.registration)
+        producer = {ticket.registration, prosper::frontend::next_producer_identity()};
+    queue_color_producer_completion(batch, image, ticket, producer);
 }
 
 inline prosper::frontend::ProducerSource persistent_color_producer_source(
@@ -5732,12 +5790,15 @@ inline bool readback_persistent_color_target(uint64_t id, uint32_t width, uint32
 // imported the stale image and read black, cascading the #1287 display-chain collapse. Copy the
 // device-local pixels so the destination image is genuinely valid. Creates the destination if
 // absent (same shape/usage as the render path; budget-checked with LRU eviction of unpinned older
-// targets — an allocation failure returns false and the caller keeps the CPU pixels as the only truth,
-// fail-visibly).
+// targets when no open batch may reference them, otherwise bounded by the existing deferred count
+// headroom — an allocation failure returns false and the caller keeps the CPU pixels as the only
+// truth, fail-visibly).
 inline bool copy_persistent_color_target(uint64_t src_id, uint64_t dst_id, uint32_t width,
-                                         uint32_t height, VkFormat format, std::string& error) {
+                                         uint32_t height, VkFormat format, std::string& error,
+                                         BackendSubmissionBatch* submission_batch = nullptr) {
     error.clear();
-    if (backend_has_unproven_submission()) {
+    if (backend_has_unproven_submission() ||
+        (submission_batch && submission_batch->retains_pending_resources())) {
         error = "Vulkan submission completion is unproven";
         return false;
     }
@@ -5756,6 +5817,7 @@ inline bool copy_persistent_color_target(uint64_t src_id, uint64_t dst_id, uint3
 
     PersistentColorTargetKey dst_key{dst_id, width, height, format};
     auto [dst_it, dst_inserted] = persistent_color_target_cache().try_emplace(dst_key);
+    (void)dst_inserted;
     PersistentColorTargetImage* dst = &dst_it->second;
     dst->last_use = ++persistent_color_target_generation();
     if (!dst->image) {
@@ -5775,8 +5837,9 @@ inline bool copy_persistent_color_target(uint64_t src_id, uint64_t dst_id, uint3
         VkMemoryRequirements ir{}; vkGetImageMemoryRequirements(ctx.dev, img, &ir);
         const VkDeviceSize limit = persistent_color_target_limit();
         const size_t count_limit = persistent_color_target_count_limit();
+        const bool eviction_deferred = submission_batch && submission_batch->pending();
         const size_t count_ceiling = persistent_color_target_count_ceiling(true);
-        if (ir.size <= limit) {
+        if (ir.size <= limit && !eviction_deferred) {
             ++src->pin_count;
             while ((persistent_color_target_cache().size() > count_limit ||
                     persistent_color_target_bytes() > limit - ir.size) &&
@@ -5835,9 +5898,30 @@ inline bool copy_persistent_color_target(uint64_t src_id, uint64_t dst_id, uint3
     }
 
     // A resolve is a representation-only copy. Capture the exact source's completed work before
-    // touching the destination; an unproven source stays unknown after the copy.
-    const prosper::frontend::CompletedProducer copied_producer = src->completed_producer;
+    // touching the destination. A same-batch producer is private until completion but is still the
+    // exact version this ordered copy consumes; an unproven source stays unknown after the copy.
+    const prosper::frontend::CompletedProducer copied_producer = submission_batch
+        ? color_producer_for_batch(*src, *submission_batch)
+        : src->completed_producer;
     const ColorProducerTicket copy_ticket = begin_color_producer_write(*dst);
+
+    // The synchronous helper owns no state after it returns. A batched copy must keep both exact
+    // allocations alive until the common fence, including an indeterminate-completion path.
+    bool pins_held = false;
+    if (submission_batch) {
+        if (src->pin_count == UINT32_MAX || dst->pin_count == UINT32_MAX) {
+            error = "resolve copy pin count exhausted";
+            dst->valid = false;
+            return false;
+        }
+        ++src->pin_count;
+        ++dst->pin_count;
+        pins_held = true;
+    }
+    const uint64_t src_registration = src->registration;
+    const uint64_t dst_registration = dst->registration;
+    const VkImage src_image = src->image;
+    const VkImage dst_image = dst->image;
 
     VkCommandPool pool = VK_NULL_HANDLE;
     VkCommandBuffer command = VK_NULL_HANDLE;
@@ -5845,6 +5929,13 @@ inline bool copy_persistent_color_target(uint64_t src_id, uint64_t dst_id, uint3
     auto cleanup = [&] {
         if (fence) vkDestroyFence(ctx.dev, fence, nullptr);
         if (pool) release_render_command_pool(ctx.dev, ctx.qfi, RenderCommandPoolLease{pool, command});
+        if (pins_held) {
+            if (src->registration == src_registration && src->image == src_image && src->pin_count)
+                --src->pin_count;
+            if (dst->registration == dst_registration && dst->image == dst_image && dst->pin_count)
+                --dst->pin_count;
+            pins_held = false;
+        }
     };
     // A pre-existing valid destination image is exactly the stale object this helper exists to
     // replace — on ANY failure past this point it must not stay valid (#1382 review finding 2).
@@ -5855,8 +5946,10 @@ inline bool copy_persistent_color_target(uint64_t src_id, uint64_t dst_id, uint3
     };
     const RenderCommandPoolLease lease = acquire_render_command_pool(ctx.dev, ctx.qfi);
     pool = lease.pool; command = lease.command;
-    if (!lease)
+    if (!lease) {
+        cleanup();
         return fail("cannot create resolve copy command pool");
+    }
     VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     // No vkAllocateCommandBuffers here: the lease already owns this pool's one buffer. Allocating
@@ -5902,6 +5995,46 @@ inline bool copy_persistent_color_target(uint64_t src_id, uint64_t dst_id, uint3
                          VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 2, barriers);
     if (vkEndCommandBuffer(command) != VK_SUCCESS) {
         cleanup(); return fail("cannot record resolve copy command");
+    }
+    if (submission_batch) {
+        // Publish speculative image state so later command buffers in this ordered batch may sample
+        // or LOAD the result. Public producer lineage remains empty until completion proves the copy.
+        dst->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        dst->valid = true;
+        queue_color_producer_completion(
+            *submission_batch, *dst, copy_ticket, copied_producer);
+        submission_batch->add_failure_cleanup(
+            [dst_key, dst_registration, dst_image, copy_ticket]() {
+                auto found = persistent_color_target_cache().find(dst_key);
+                if (found == persistent_color_target_cache().end()) return;
+                PersistentColorTargetImage& image = found->second;
+                if (image.registration != dst_registration || image.image != dst_image ||
+                    image.mutation != copy_ticket.mutation)
+                    return;
+                image.valid = false;
+                image.layout = VK_IMAGE_LAYOUT_UNDEFINED;
+                image.completed_producer = {};
+            });
+        submission_batch->enqueue(command);
+        submission_batch->add_cleanup(
+            [dev = ctx.dev, qfi = ctx.qfi, pool, command, src_id, dst_key,
+             src_registration, dst_registration, src_image, dst_image]() {
+                release_render_command_pool(dev, qfi, RenderCommandPoolLease{pool, command});
+                if (auto* source = find_persistent_color_target(
+                        src_id, dst_key.width, dst_key.height, dst_key.format, false);
+                    source && source->registration == src_registration &&
+                    source->image == src_image && source->pin_count)
+                    --source->pin_count;
+                auto found = persistent_color_target_cache().find(dst_key);
+                if (found != persistent_color_target_cache().end() &&
+                    found->second.registration == dst_registration &&
+                    found->second.image == dst_image && found->second.pin_count)
+                    --found->second.pin_count;
+            });
+        pool = VK_NULL_HANDLE;
+        command = VK_NULL_HANDLE;
+        pins_held = false;
+        return true;
     }
     VkFenceCreateInfo fence_info{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
     if (vkCreateFence(ctx.dev, &fence_info, nullptr, &fence) != VK_SUCCESS) {
@@ -7475,7 +7608,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         if (!cleared && !draw_writes) continue;
         // A CPU seed replaces the old image contents before the pass. Its provenance is unknown
         // even when the same allocation previously held a completed renderer version.
-        const bool loaded_known_image = retained->completed_producer.known() &&
+        const bool loaded_known_image =
+            color_producer_for_batch(*retained, active_submission).known() &&
             (slot == 0 ? load_cached_color :
              slot == 1 ? load_cached_color1 :
              load_extra[slot] && !(color_target && color_target->seed_slots[slot]));
@@ -12171,7 +12305,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         const bool realized_write = att[slot].loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR ||
                                     (realized_color_mask & (1u << slot));
         const bool lineage_proven = producer_lineage_proven[slot] && realized_write;
-        active_submission.add_color_completion({retained, ticket, lineage_proven});
+        queue_color_producer_write(active_submission, *retained, ticket, lineage_proven);
     }
     BackendSubmissionBatchResult batch_result;
     if (flush_now)

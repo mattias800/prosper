@@ -1430,6 +1430,11 @@ if(TARGET prosper_core)
   target_include_directories(test_readback_policy PRIVATE frontends)
   add_test(NAME readback_policy COMMAND test_readback_policy)
 
+  add_executable(test_resolve_submission_policy
+    frontends/shared/tests/test_resolve_submission_policy.cpp)
+  target_include_directories(test_resolve_submission_policy PRIVATE frontends)
+  add_test(NAME resolve_submission_policy COMMAND test_resolve_submission_policy)
+
   add_executable(test_capture_renderer_policy frontends/shared/tests/test_capture_renderer_policy.cpp)
   target_include_directories(test_capture_renderer_policy PRIVATE frontends)
   add_test(NAME capture_renderer_policy COMMAND test_capture_renderer_policy)
