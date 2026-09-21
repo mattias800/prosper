@@ -714,14 +714,28 @@ int main() {
         setenv("PROSPER_RENDER_TIMING", "1", 1);
 #endif
         constexpr uint64_t batched_target_id = 0x9940000000000001ull;
+        constexpr uint64_t batched_resolve_id = 0x9940000000000003ull;
         prosper::test::BackendColorTarget batched_target{batched_target_id, false, false};
         prosper::test::BackendSubmissionBatch submission_batch;
         const std::vector<uint8_t> batched_producer = prosper::test::render_draws_rgba(
             {producer}, W, H, nullptr, nullptr, false, &batched_target,
             nullptr, nullptr, nullptr, &submission_batch, false);
         const auto producer_timing = prosper::test::backend_render_timing_stats();
+        std::string batched_copy_error;
+        const bool batched_copy = prosper::test::copy_persistent_color_target(
+            batched_target_id, batched_resolve_id, W, H, VK_FORMAT_R8G8B8A8_UNORM,
+            batched_copy_error, &submission_batch);
+        auto* batched_source_image = prosper::test::find_persistent_color_target(
+            batched_target_id, W, H, VK_FORMAT_R8G8B8A8_UNORM);
+        auto* batched_resolve_image = prosper::test::find_persistent_color_target(
+            batched_resolve_id, W, H, VK_FORMAT_R8G8B8A8_UNORM);
+        CHECK(batched_copy && submission_batch.pending() && batched_source_image &&
+                  batched_resolve_image &&
+                  !prosper::test::persistent_color_producer_source(*batched_source_image).known() &&
+                  !prosper::test::persistent_color_producer_source(*batched_resolve_image).known(),
+              "batched resolve records after a pending producer without publishing lineage early");
         prosper::test::FrameResource batched_resource = gpu_resource;
-        batched_resource.persistent_render_target_id = batched_target_id;
+        batched_resource.persistent_render_target_id = batched_resolve_id;
         prosper::test::BackendDraw batched_sample = gpu_sample;
         batched_sample.R = {batched_resource};
         const std::vector<uint8_t> batched_roundtrip = prosper::test::render_draws_rgba(
@@ -773,9 +787,98 @@ int main() {
                   producer_timing.fence_waits == 0,
               "intermediate batched target records without submitting or waiting");
         CHECK(batched_roundtrip == cpu_roundtrip &&
-                  consumer_timing.command_buffers == 2 &&
+                  consumer_timing.command_buffers == 3 &&
                   consumer_timing.queue_submits == 1 && consumer_timing.fence_waits == 1,
-              "batched producer-to-sampler output matches synchronous output with one submit/wait");
+              "batched producer, resolve copy and sampler match synchronous output with one submit/wait");
+        CHECK(batched_source_image && batched_resolve_image &&
+                  prosper::test::persistent_color_producer_source(*batched_source_image).known() &&
+                  prosper::test::persistent_color_producer_source(*batched_resolve_image).known() &&
+                  batched_source_image->completed_producer ==
+                      batched_resolve_image->completed_producer,
+              "batched representation copy publishes the exact completed producer after the fence");
+
+        // Capture-by-value matters when the source is rendered twice in one batch. The resolve sits
+        // between those writes in queue order, so its destination must inherit the first version,
+        // even though the source advertises only the second version after the common fence.
+        constexpr uint64_t versioned_source_id = 0x9940000000000011ull;
+        constexpr uint64_t versioned_resolve_id = 0x9940000000000012ull;
+        prosper::test::BackendColorTarget versioned_target{
+            versioned_source_id, false, false};
+        prosper::test::BackendSubmissionBatch versioned_batch;
+        prosper::test::render_draws_rgba(
+            {producer}, W, H, nullptr, nullptr, false, &versioned_target,
+            nullptr, nullptr, nullptr, &versioned_batch, false);
+        auto* versioned_source = prosper::test::find_persistent_color_target(
+            versioned_source_id, W, H, VK_FORMAT_R8G8B8A8_UNORM);
+        const prosper::frontend::CompletedProducer copied_version = versioned_source
+            ? prosper::test::color_producer_for_batch(*versioned_source, versioned_batch)
+            : prosper::frontend::CompletedProducer{};
+        std::string versioned_copy_error;
+        CHECK(versioned_source && copied_version.known() &&
+                  !prosper::test::persistent_color_producer_source(*versioned_source).known() &&
+                  prosper::test::copy_persistent_color_target(
+                      versioned_source_id, versioned_resolve_id, W, H,
+                      VK_FORMAT_R8G8B8A8_UNORM, versioned_copy_error, &versioned_batch),
+              "batched resolve captures a private pending source version");
+        prosper::test::render_draws_rgba(
+            {producer}, W, H, nullptr, nullptr, false, &versioned_target,
+            nullptr, nullptr, nullptr, &versioned_batch, true);
+        versioned_source = prosper::test::find_persistent_color_target(
+            versioned_source_id, W, H, VK_FORMAT_R8G8B8A8_UNORM);
+        auto* versioned_resolve = prosper::test::find_persistent_color_target(
+            versioned_resolve_id, W, H, VK_FORMAT_R8G8B8A8_UNORM);
+        CHECK(versioned_source && versioned_resolve &&
+                  versioned_resolve->completed_producer == copied_version &&
+                  versioned_source->completed_producer.known() &&
+                  versioned_source->completed_producer != copied_version,
+              "render-copy-render ordering preserves the exact copied producer version");
+
+        // A batch that never reaches the queue must invalidate the speculative destination and
+        // release both exact allocation pins. This exercises the production copy helper rather
+        // than only the generic lineage-token container.
+        constexpr uint64_t discarded_resolve_id = 0x9940000000000013ull;
+        prosper::test::BackendSubmissionBatch discarded_copy_batch;
+        const uint32_t source_pins_before = versioned_source ? versioned_source->pin_count : 0;
+        std::string discarded_copy_error;
+        const bool discarded_copy = prosper::test::copy_persistent_color_target(
+            versioned_source_id, discarded_resolve_id, W, H,
+            VK_FORMAT_R8G8B8A8_UNORM, discarded_copy_error, &discarded_copy_batch);
+        auto* discarded_resolve = prosper::test::find_persistent_color_target(
+            discarded_resolve_id, W, H, VK_FORMAT_R8G8B8A8_UNORM);
+        CHECK(discarded_copy && discarded_copy_batch.pending() && versioned_source &&
+                  discarded_resolve && versioned_source->pin_count == source_pins_before + 1 &&
+                  discarded_resolve->pin_count == 1 && discarded_resolve->valid,
+              "pending resolve pins its exact source and destination allocations");
+        discarded_copy_batch.discard();
+        discarded_copy_batch.complete();
+        CHECK(versioned_source && discarded_resolve &&
+                  versioned_source->pin_count == source_pins_before &&
+                  discarded_resolve->pin_count == 0 && !discarded_resolve->valid &&
+                  discarded_resolve->layout == VK_IMAGE_LAYOUT_UNDEFINED &&
+                  !prosper::test::persistent_color_producer_source(*discarded_resolve).known(),
+              "discarded resolve releases pins and cannot publish speculative destination state");
+
+        // A guest-side invalidation after recording remains authoritative even when the queued copy
+        // itself completes. The completion ticket may never revive that invalidated image.
+        constexpr uint64_t invalidated_resolve_id = 0x9940000000000014ull;
+        prosper::test::BackendSubmissionBatch invalidated_copy_batch;
+        std::string invalidated_copy_error;
+        CHECK(prosper::test::copy_persistent_color_target(
+                  versioned_source_id, invalidated_resolve_id, W, H,
+                  VK_FORMAT_R8G8B8A8_UNORM, invalidated_copy_error, &invalidated_copy_batch),
+              "batched resolve records before a guest invalidation");
+        auto* invalidated_resolve = prosper::test::find_persistent_color_target(
+            invalidated_resolve_id, W, H, VK_FORMAT_R8G8B8A8_UNORM);
+        prosper::test::invalidate_persistent_color_target(invalidated_resolve_id);
+        const auto invalidated_result = invalidated_copy_batch.submit_and_wait(
+            prosper::test::render_vk_ctx().dev,
+            prosper::test::render_vk_ctx().queue, false);
+        invalidated_copy_batch.complete();
+        CHECK(invalidated_result.submit_result == VK_SUCCESS &&
+                  invalidated_result.wait_result == VK_SUCCESS && invalidated_resolve &&
+                  !invalidated_resolve->valid && invalidated_resolve->pin_count == 0 &&
+                  !prosper::test::persistent_color_producer_source(*invalidated_resolve).known(),
+              "completed resolve cannot override a later guest invalidation");
         const auto& timing_ctx = prosper::test::render_vk_ctx();
         const bool gpu_timestamps_supported = timing_ctx.timestamp_valid_bits != 0 &&
                                               timing_ctx.timestamp_period_ns > 0.0;

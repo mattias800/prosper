@@ -19,6 +19,7 @@
 #include "shared/texture/validation_census.hpp"
 #include "shared/live/live_compute.hpp"
 #include "shared/live/buffer_source_gate.hpp"
+#include "shared/live/resolve_submission_policy.hpp"
 #include "shared/live/texture_source_snapshot.hpp"
 #include "shared/live/depth_cube_source_snapshot.hpp"
 #include "shared/live/decode_scratch.hpp"     // pooled full-surface decode intermediates
@@ -9115,6 +9116,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             resolved.dcc_metadata_bytes = 0;
                             resolved.dcc_metadata_dirty = false;
                             const uint32_t rw = resolved.w, rh = resolved.h;
+                            bool batched_copy_recorded = false;
                             // #1334: the destination-keyed persistent GPU image did NOT receive these
                             // pixels — inheriting gpu_valid from the source let a later #780 CPU-copy
                             // discard leave consumers importing a stale/zero image (Blue Prince's
@@ -9122,12 +9124,17 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             // device-local pixels into the destination identity so gpu_valid is
                             // genuinely true; on failure the shared CPU pixels are the only truth.
                             if (resolved.gpu_valid) {
-                                // #1382 review: the copy submits out-of-band, so any pending
-                                // batched pass — including one targeting the DESTINATION identity
-                                // — must reach the queue first, or it would execute after the copy
-                                // and overwrite the resolve while gpu_valid=true. Mirror the
-                                // source-materialization flush above unconditionally here.
-                                {
+                                // The control submits the copy out of band, so every earlier pass —
+                                // including one targeting the destination — must complete first.
+                                // The default records the copy into the same ordered batch instead;
+                                // its barriers supply visibility and the final batch fence owns
+                                // publication, failure invalidation and resource lifetime.
+                                static const bool no_batched_resolve_copy =
+                                    PROSPER_ENV_VALUE("PROSPER_NO_BATCHED_RESOLVE_COPY") != nullptr;
+                                const bool batch_resolve_copy =
+                                    prosper::frontend::resolve_copy_may_batch(
+                                        batch_backend_submits, no_batched_resolve_copy);
+                                if (!batch_resolve_copy) {
                                     const prosper::test::RenderVkCtx& copy_ctx =
                                         prosper::test::render_vk_ctx();
                                     const auto cs0 = timing_enabled
@@ -9146,7 +9153,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 const bool copy_ok = prosper::test::copy_persistent_color_target(
                                         rsrc, rdst, rw, rh,
                                         prosper::test::backend_color_format(resolved.format),
-                                        copy_error);
+                                        copy_error,
+                                        batch_resolve_copy ? &backend_submission : nullptr);
+                                batched_copy_recorded = copy_ok && batch_resolve_copy;
                                 if (timing_enabled)
                                     pending_timing.resolve_copy_ms +=
                                         std::chrono::duration<double, std::milli>(
@@ -9189,6 +9198,17 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 }
                             }
                             g_rtt[rdst] = std::move(resolved);    // dest inherits src content/extent/format
+                            if (batched_copy_recorded) {
+                                const VkFormat resolved_format = g_rtt[rdst].format;
+                                backend_submission.add_failure_cleanup(
+                                    [rdst, rw, rh, resolved_format]() {
+                                        auto failed = g_rtt.find(rdst);
+                                        if (failed != g_rtt.end() && failed->second.w == rw &&
+                                            failed->second.h == rh &&
+                                            failed->second.format == resolved_format)
+                                            failed->second.gpu_valid = false;
+                                    });
+                            }
                             if (PROSPER_ENV_ON("PROSPER_MSAA_LOG"))
                                 fprintf(stderr, "[msaa] resolve copy 0x%llx -> 0x%llx (%ux%u)\n",
                                         (unsigned long long)rsrc, (unsigned long long)rdst, rw, rh);
@@ -9208,6 +9228,22 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                                        : "source has no rendered surface");
                         }
                         if (timing_enabled) ++pending_timing.resolve_n;
+                        // A normal final render group flushes the ordered backend batch inside
+                        // render_draws_rgba. A resolve returns before that call, so a terminal
+                        // resolve must establish the same boundary here. Otherwise the tail below
+                        // can read back or publish g_rtt's speculative destination before the copy
+                        // has even reached the queue.
+                        if (prosper::frontend::terminal_resolve_must_flush(
+                                batch_backend_submits, pass_i == items.size(),
+                                backend_submission.pending())) {
+                            const prosper::test::RenderVkCtx& terminal_ctx =
+                                prosper::test::render_vk_ctx();
+                            if (terminal_ctx.ok)
+                                backend_submission.submit_and_wait(
+                                    terminal_ctx.dev, terminal_ctx.queue, false);
+                            else
+                                backend_submission.discard();
+                        }
                         continue;   // resolve is a copy, not an ordinary-draw render
                     }
 

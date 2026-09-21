@@ -567,7 +567,7 @@ int main() {
         if (ta) {
             const auto ticket = test::begin_color_producer_write(*ta);
             test::BackendSubmissionBatch discarded;
-            discarded.add_color_completion({ta, ticket, true});
+            test::queue_color_producer_write(discarded, *ta, ticket, true);
             discarded.discard();
             CHECK(!test::persistent_color_producer_source(*ta).known(),
                   "lineage: discarded submission cannot commit recorded work");
@@ -592,7 +592,7 @@ int main() {
             // command. It poisons this fixture's backend only after every rendering assertion.
             const auto unproven_ticket = test::begin_color_producer_write(*ta);
             test::BackendSubmissionBatch unproven;
-            unproven.add_color_completion({ta, unproven_ticket, true});
+            test::queue_color_producer_write(unproven, *ta, unproven_ticket, true);
             unproven.abandon_pending_resources();
             CHECK(!test::persistent_color_producer_source(*ta).known() &&
                       test::backend_has_unproven_submission(),
