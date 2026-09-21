@@ -113,21 +113,47 @@ effects. One run of this tool said it in a line: **the reference is 61.6% green 
 candidate 0.0% green**, and the candidate that scored best on every achromatic measure
 scored *worse* than baseline on palette intersection (0.094 → 0.080).
 
-Four modes, in the order they are usually reached for:
+**The score is a composite, and that is load-bearing.** `likeness` is
+`sqrt(palette intersection * hue recall)`. The palette term alone is very nearly the
+achromatic measure this tool exists to replace: a 512-bin RGB histogram is dominated
+by whatever bins hold the most mass, which on most frames is the dark and grey bins.
+An independent review measured a plain grey gradient at **0.502** against a real dark
+frame, ranking third of eleven and above a real menu capture; the tool's own selftest
+now reproduces a worse case, a grey gradient matched to the reference's luminance
+range scoring **0.740** on palette alone and **0.000** on likeness. That is the
+project's recorded gradient trap, reproduced on the tool written to prevent it. When
+the *reference* is itself achromatic there is no hue evidence, so the score falls
+back to the palette term and the output line says `PALETTE ONLY` — read that label.
+
+Five modes, in the order they are usually reached for:
 
 ```bash
-# 1. Is this frame like the reference, and what is it missing?
+# 1. Is this frame like the reference, and what is it missing?   (no options)
 image_likeness.py oracle.png candidate.bmp
 
 # 2. Where is it wrong, spatially? 16x9 keeps cells square on a widescreen frame.
 image_likeness.py --grid oracle.png candidate.bmp [--cells 16x9] [--threshold 32]
 
-# 3. Which of these surfaces is closest to the reference?
+# 3. Which of these surfaces is closest to the reference?        (no options)
 image_likeness.py --rank oracle.png /path/to/dumped/surfaces
 
 # 4. Which REGION of the reference does each surface correspond to?
-image_likeness.py --locate oracle.png /path/to/dumped/surfaces [--threshold 64]
+image_likeness.py --locate oracle.png /path/to/dumped/surfaces [--cells 64x36] [--threshold 64]
+
+# 4b. The same question for ONE surface, printing every region's score.
+image_likeness.py --regions oracle.png candidate.bmp [--cells 64x36] [--threshold 32]
+
+# 5. Verify the measure's own claims before trusting a number from it.
+image_likeness.py --selftest
 ```
+
+**Each mode accepts exactly the options it USES, and refuses the rest.** `--rank`
+and the default mode score by palette and hue, which have no grid and no tolerance,
+so they take no options at all and reject `--threshold`/`--cells` rather than
+accepting and ignoring them. "Accepted but unused" is indistinguishable from
+"unknown and ignored" at the terminal, and both produce the same false reading:
+several runs at several settings returning identical numbers, which looks exactly
+like a robust result.
 
 Mode 2 prints a map — lowercase means the candidate is *short* of the reference on
 that channel, uppercase means *excess*. On the Sonic frame it renders the defect
@@ -141,11 +167,18 @@ corresponds to the reference's lower half".
 **Read it as triage, not as a gate.** It ranks and locates; a human still judges
 whether a scene looks right. Two cautions learned while building it:
 
-- **Pass `--threshold` deliberately and check the ranking moves.** The tool refuses
-  unknown options rather than ignoring them, because an early version silently
-  dropped `--threshold` outside `--grid` and three runs at three tolerances returned
-  byte-identical numbers — which reads exactly like a robust result. At tol 32 the
-  top-ranked surface was one frame; at 64 it was a different one entirely.
+- **Run `--selftest` before trusting a number, and add an arm when you find a new
+  way to fool it.** It is a few seconds, needs no fixtures, and every case in it is
+  one that actually broke a previous version: the gradient above, a surface that IS
+  the oracle's bottom half being located as "bottom third", a frame compared against
+  itself reporting "top-right q" instead of "full", and each mode refusing the
+  options it does not use. The arms are written so that reinstating the old
+  behaviour reddens a named case — verified by mutation, four for four.
+- **`--threshold` and `--cells` belong to the spatial modes only.** An early version
+  dropped `--threshold` outside `--grid`; the repair was incomplete and a review
+  found `--rank` still took no options at all while `--locate` accepted `--cells`
+  and discarded it. If a mode accepts an option now, it uses it — that is what the
+  `--cells changes the answer` selftest arm pins.
 - **Absolute scores are low even for good renders**, because exposure and tonemap
   differences shift every cell. Compare candidates against each other, and watch the
   per-hue deltas and the spatial map rather than the single number.
