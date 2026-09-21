@@ -480,10 +480,12 @@ struct RttMirrorCounter {
     uint64_t value() const { return count.load(std::memory_order_relaxed); }
 };
 struct RttDestinationCensus {
-    RttMirrorCounter candidates, borrowed, recorded, published, failed, r11_source_seed_recorded;
+    RttMirrorCounter candidates, borrowed, recorded, published, failed;
+    RttMirrorCounter r11_source_seed_recorded, rgba16_source_seed_recorded;
     LiveComputeRttDestinationMirrorCounters snapshot() const {
         return {candidates.value(), borrowed.value(), recorded.value(), published.value(),
-                failed.value(), r11_source_seed_recorded.value()};
+                failed.value(), r11_source_seed_recorded.value(),
+                rgba16_source_seed_recorded.value()};
     }
 };
 RttDestinationCensus& rtt_destination_census() {
@@ -6508,6 +6510,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                   const KnownFillProof* known_fill = nullptr) {
     using namespace prosper::gpu;
     using ComputeClock = std::chrono::steady_clock;
+    static const bool rgba16_compute_rtt_mirror_disabled =
+        std::getenv("PROSPER_NO_RGBA16_COMPUTE_RTT_MIRROR") != nullptr;
     auto decline = [&item](const char* reason) {
         report_compute_decline(item, reason);
         return false;
@@ -8141,15 +8145,19 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // source: direct writable imports would bypass the guest mirror required by aliases.
             // The sampled-sibling path above remains preferred and owns its own import lifetime.
             if (renderer_owned && bi.storage && !bi.has_renderer_seed()) {
-                const bool exact_rgba = bi.native_float_storage &&
+                const bool exact_rgba8 = bi.native_float_storage &&
                     r->format == DataFormat::Unorm8 && descriptor_components == 4 &&
                     native_storage_format == VK_FORMAT_R8G8B8A8_UNORM;
+                const bool exact_rgba16 = bi.native_float_storage &&
+                    r->format == DataFormat::Float16 && descriptor_components == 4 &&
+                    native_storage_format == VK_FORMAT_R16G16B16A16_SFLOAT &&
+                    !rgba16_compute_rtt_mirror_disabled;
                 // R11 is represented as exact packed words in a private R32_UINT image. Vulkan
                 // forbids an image copy across those formats; the transfer buffer below preserves
                 // each 32-bit word without numeric conversion.
                 const bool exact_packed_r11 = bi.packed_r11_storage &&
                     r->format == DataFormat::Float10_11_11 && descriptor_components == 3;
-                const bool exact_view = (exact_rgba || exact_packed_r11) &&
+                const bool exact_view = (exact_rgba8 || exact_rgba16 || exact_packed_r11) &&
                     !bi.storage_write_mask &&
                     image_descriptors[i].image_dim == 1 &&
                     !image_descriptors[i].image_arrayed &&
@@ -8182,11 +8190,15 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                             const char* reason = !source.valid() ? "invalid-import"
                                 : source.kind != LiveTargetImageImport::Kind::Color ? "not-color"
                                 : source.device != static_cast<void*>(ctx.device) ? "device-mismatch"
-                                : !(exact_rgba
-                                      ? source.format == LiveTargetPixelFormat::Rgba8Unorm &&
-                                        source.native_format == VK_FORMAT_R8G8B8A8_UNORM
-                                      : source.format == LiveTargetPixelFormat::R11G11B10Float &&
-                                        source.native_format == VK_FORMAT_B10G11R11_UFLOAT_PACK32)
+                                : !((exact_rgba8 &&
+                                      source.format == LiveTargetPixelFormat::Rgba8Unorm &&
+                                      source.native_format == VK_FORMAT_R8G8B8A8_UNORM) ||
+                                    (exact_rgba16 &&
+                                      source.format == LiveTargetPixelFormat::Rgba16Float &&
+                                      source.native_format == VK_FORMAT_R16G16B16A16_SFLOAT) ||
+                                    (exact_packed_r11 &&
+                                      source.format == LiveTargetPixelFormat::R11G11B10Float &&
+                                      source.native_format == VK_FORMAT_B10G11R11_UFLOAT_PACK32))
                                     ? "format-mismatch"
                                 : !source.transfer_src ? "no-transfer-src"
                                 : !rtt_gpu_seed_import_extent_compatible(
@@ -11000,7 +11012,10 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // A GPU-authoritative result must remain readable by the next partial writer.
             // Only these exact formats currently have a renderer-image storage seed path.
             if (*format != LiveTargetPixelFormat::Rgba8Unorm &&
+                *format != LiveTargetPixelFormat::Rgba16Float &&
                 *format != LiveTargetPixelFormat::R11G11B10Float) continue;
+            if (*format == LiveTargetPixelFormat::Rgba16Float &&
+                (!bi.native_float_storage || rgba16_compute_rtt_mirror_disabled)) continue;
             if (*format == LiveTargetPixelFormat::R11G11B10Float &&
                 !bi.packed_r11_storage) continue;
             const size_t texel_bytes = live_target_pixel_format_bytes(*format);
@@ -11013,13 +11028,15 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 const auto totals = mirror_census.snapshot();
                 std::fprintf(stderr,
                     "[compute-rtt-destination-census] candidates=%llu borrowed=%llu "
-                    "recorded=%llu published=%llu failed=%llu r11-source-seed=%llu\n",
+                    "recorded=%llu published=%llu failed=%llu r11-source-seed=%llu "
+                    "rgba16-source-seed=%llu\n",
                     (unsigned long long)candidates,
                     (unsigned long long)totals.borrowed,
                     (unsigned long long)totals.recorded,
                     (unsigned long long)totals.published,
                     (unsigned long long)totals.failed,
-                    (unsigned long long)totals.r11_source_seed_recorded);
+                    (unsigned long long)totals.r11_source_seed_recorded,
+                    (unsigned long long)totals.rgba16_source_seed_recorded);
             }
             const prosper::gpu::LiveTargetImageDestinationRequest request{
                 r->width, r->height, *format};
@@ -11031,10 +11048,11 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // target, then copy its completed result back into that SAME target. Keep two leases:
             // the source pin protects old pixels until the seed copy, and the destination pin
             // protects the allocation until guest writeback and final publication complete.
-            // Only exact RGBA8 and packed R11 self-seeds are admitted here; unrelated
+            // Only exact native RGBA and packed R11 self-seeds are admitted here; unrelated
             // sampled/imported aliases still cannot share a destination allocation.
             const bool own_seed_destination =
                 (*format == LiveTargetPixelFormat::Rgba8Unorm ||
+                 *format == LiveTargetPixelFormat::Rgba16Float ||
                  (*format == LiveTargetPixelFormat::R11G11B10Float && bi.packed_r11_storage)) &&
                 bi.standalone_seed.valid() && bi.standalone_seed.image == destination.image &&
                 bi.standalone_seed.device == destination.device &&
@@ -11484,6 +11502,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     copy.extent = {r->width, r->height, r->depth};
                     vkCmdCopyImage(command, source_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                    bi.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+                    if (standalone &&
+                        bi.standalone_seed.format == LiveTargetPixelFormat::Rgba16Float)
+                        rtt_destination_census().rgba16_source_seed_recorded.add();
                 }
 
                 VkImageMemoryBarrier ready[2]{};
@@ -11508,7 +11529,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         "hash=0x%016llx binding=%u recorded=1 bytes=%llu\n",
                         (unsigned long long)item.submit_no, (unsigned long long)item.dispatch_index,
                         (unsigned long long)item.code_addr, (unsigned long long)timing_program_hash,
-                        bi.binding, (unsigned long long)r->width * r->height * 4u);
+                        bi.binding, (unsigned long long)r->width * r->height *
+                            live_target_pixel_format_bytes(bi.standalone_seed.format));
                 continue;
             }
             VkImageMemoryBarrier to_dst{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
