@@ -154,6 +154,12 @@ must be enabled; `PROSPER_BUFVERIFY` and `PROSPER_NO_BACKEND_BUFFER_RANGE_SHARE`
 Union uploads are lazy and owned only by existing per-pass arenas through submission completion.
 A failed group allocation is not retried for each member; ordinary uploads handle the fallback.
 There is no cross-call guest-pointer retention or implicit extension of guest mapping lifetime.
+The unions actually used by resource setup are copied together before command recording. Their
+guest views remain borrowed under the synchronous-call contract; only completed arena uploads enter
+a deferred submission. The bounded copy cohort shares `PROSPER_RENDER_COPY_THREADS`, and partial
+worker creation drains all work on the workers that did start plus the calling thread.
+`PROSPER_NO_BACKEND_BUFFER_COPY_BATCH` restores immediate per-union copies as a measurement and
+recovery control without disabling range sharing.
 The range counters distinguish actual union copies from distinct resolved descriptor slices;
 skipped draws can leave planned bytes unused, so bound bytes minus upload bytes remains signed.
 Planning and shared write-proof time are nested in resource setup, outside per-binding copy time.

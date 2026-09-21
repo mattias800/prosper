@@ -722,6 +722,8 @@ struct BackendResourceReuseStats {
     uint64_t buffer_range_bindings = 0;
     uint64_t buffer_range_upload_bytes = 0;
     uint64_t buffer_range_bound_bytes = 0;
+    uint64_t buffer_range_copy_batches = 0;
+    uint64_t buffer_range_copy_spans = 0;
     uint64_t buffer_upload_bytes = 0;           // bytes actually memcpy'd into mapped staging
     uint64_t buffer_resident_hits = 0;
     uint64_t buffer_resident_compared_bytes = 0; // requested comparison spans, not bytes read
@@ -2913,7 +2915,7 @@ inline RenderMemoryPool& render_memory_pool() {
 // Deliberately simple: disjoint destination ranges, every worker joined before the function
 // returns, so the copy is complete before the caller unmaps or submits. Small copies stay on the
 // calling thread, because thread creation would cost more than the copy.
-inline void parallel_render_memcpy(void* dst, const void* src, size_t bytes) {
+inline unsigned render_copy_configured_threads() {
     static const unsigned configured = []() -> unsigned {
         // env_numeric, not strtoul: a malformed or negative value must keep the default rather
         // than wrap. "-1" through strtoul is 32 workers, which is the opposite of what a reader
@@ -2923,6 +2925,21 @@ inline void parallel_render_memcpy(void* dst, const void* src, size_t bytes) {
             "PROSPER_RENDER_COPY_THREADS", value, 0ull, 32ull, "threads");
         return static_cast<unsigned>(parsed);
     }();
+    return configured;
+}
+
+inline unsigned render_copy_wanted_threads() {
+    static const unsigned wanted = [] {
+        const unsigned configured = render_copy_configured_threads();
+        if (configured) return configured;
+        const unsigned hardware = std::thread::hardware_concurrency();
+        return std::min(hardware ? hardware : 4u, 8u);
+    }();
+    return wanted;
+}
+
+inline void parallel_render_memcpy(void* dst, const void* src, size_t bytes) {
+    const unsigned configured = render_copy_configured_threads();
     // Below this the copy is not worth splitting; above it the win is real and bandwidth-bound,
     // which is why the worker count is capped rather than scaled to the core count.
     constexpr size_t kMinParallelBytes = 2u << 20;
@@ -2932,11 +2949,7 @@ inline void parallel_render_memcpy(void* dst, const void* src, size_t bytes) {
     }
     // hardware_concurrency is only a scheduling hint, and some standard libraries probe sysfs
     // on every call. Discover it once, only when an automatic parallel copy actually needs it.
-    static const unsigned wanted = [] {
-        if (configured) return configured;
-        const unsigned hardware = std::thread::hardware_concurrency();
-        return std::min(hardware ? hardware : 4u, 8u);
-    }();
+    const unsigned wanted = render_copy_wanted_threads();
     const unsigned threads = static_cast<unsigned>(
         std::min<size_t>(wanted, bytes / (1u << 20)));
     if (threads <= 1) { std::memcpy(dst, src, bytes); return; }
@@ -2974,6 +2987,83 @@ inline void parallel_render_memcpy(void* dst, const void* src, size_t bytes) {
         std::memcpy(static_cast<uint8_t*>(dst) + begin,
                     static_cast<const uint8_t*>(src) + begin, end - begin);
     }
+}
+
+struct RenderCopySpan {
+    void* destination = nullptr;
+    const void* source = nullptr;
+    size_t bytes = 0;
+};
+
+// Execute many small, independent uploads with one worker cohort. A settled Blue Prince pass
+// commonly produces hundreds of gap-free unions around 250 KiB each: every individual copy is
+// correctly below parallel_render_memcpy's 2 MiB threshold, but together they move about 97 MiB.
+// Starting workers per union would cost more than it saves, while serializing the whole batch leaves
+// the already-independent destination slices on one CPU.
+//
+// Callers retain every source and destination until return. Sources may overlap because they are
+// read only; destinations must be disjoint and must not alias a source. Logical 1 MiB tasks split
+// large spans without allocating a second task vector. If worker creation fails, the workers already
+// started and this thread drain the same atomic counter, so no span is left partially copied.
+inline void parallel_render_memcpy_batch(std::span<const RenderCopySpan> spans) {
+    constexpr size_t kMinParallelBytes = 2u << 20;
+    constexpr size_t kTaskBytes = 1u << 20;
+    size_t total_bytes = 0;
+    size_t task_count = 0;
+    for (const RenderCopySpan& span : spans) {
+        if (!span.bytes) continue;
+        const size_t span_tasks = (span.bytes - 1) / kTaskBytes + 1;
+        if (total_bytes > SIZE_MAX - span.bytes || task_count > SIZE_MAX - span_tasks) {
+            for (const RenderCopySpan& fallback : spans)
+                parallel_render_memcpy(fallback.destination, fallback.source, fallback.bytes);
+            return;
+        }
+        total_bytes += span.bytes;
+        task_count += span_tasks;
+    }
+    const unsigned configured = render_copy_configured_threads();
+    if (total_bytes < kMinParallelBytes || configured == 1 || task_count <= 1) {
+        for (const RenderCopySpan& span : spans)
+            if (span.bytes) std::memcpy(span.destination, span.source, span.bytes);
+        return;
+    }
+    const unsigned threads = static_cast<unsigned>(
+        std::min<size_t>(render_copy_wanted_threads(), total_bytes / kTaskBytes));
+    if (threads <= 1) {
+        for (const RenderCopySpan& span : spans)
+            if (span.bytes) std::memcpy(span.destination, span.source, span.bytes);
+        return;
+    }
+
+    std::atomic<size_t> next_task{0};
+    auto worker = [&] {
+        for (;;) {
+            size_t task = next_task.fetch_add(1, std::memory_order_relaxed);
+            if (task >= task_count) return;
+            for (const RenderCopySpan& span : spans) {
+                if (!span.bytes) continue;
+                const size_t span_tasks = (span.bytes - 1) / kTaskBytes + 1;
+                if (task >= span_tasks) {
+                    task -= span_tasks;
+                    continue;
+                }
+                const size_t offset = task * kTaskBytes;
+                const size_t bytes = std::min(kTaskBytes, span.bytes - offset);
+                std::memcpy(static_cast<uint8_t*>(span.destination) + offset,
+                            static_cast<const uint8_t*>(span.source) + offset, bytes);
+                break;
+            }
+        }
+    };
+    std::array<std::jthread, 31> workers;
+    unsigned started = 0;
+    try {
+        for (; started + 1 < threads; ++started) workers[started] = std::jthread(worker);
+    } catch (...) {
+        // Existing workers remain joinable. Together with this thread they drain every task.
+    }
+    worker();
+    for (unsigned i = 0; i < started; ++i) workers[i].join();
 }
 
 inline bool render_memory_pool_enabled() {
@@ -8339,6 +8429,19 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         bool resident_attempted = false;
     };
     std::vector<BufferRangeUpload> buffer_range_uploads(buffer_range_groups.size());
+    std::vector<RenderCopySpan> buffer_range_copy_jobs;
+    bool batch_buffer_range_copies =
+        !PROSPER_ENV_ON("PROSPER_NO_BACKEND_BUFFER_COPY_BATCH");
+    if (batch_buffer_range_copies) {
+        try {
+            // One upload at most per planned group. Reserving before any group is published means
+            // an allocation failure can retain the established immediate-copy path without leaving
+            // an arena slice whose contents were never written.
+            buffer_range_copy_jobs.reserve(buffer_range_groups.size());
+        } catch (...) {
+            batch_buffer_range_copies = false;
+        }
+    }
     const VkDeviceSize range_residency_limit = resident_render_buffer_range_limit();
     std::vector<SharedTextureUpload> texture_uploads;
     texture_uploads.reserve(std::min<size_t>(draws.size() * 2, 1024));
@@ -9404,12 +9507,19 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                     acquire_buffer_arena_slice(group.bytes, owner.upload);
                                 }
                                 if (owner.upload.arena) {
-                                    const ResourcePhaseTimer phase_copy(timing_enabled,
-                                        &res_buffer_copy_ms);
-                                    parallel_render_memcpy(
-                                        static_cast<uint8_t*>(owner.upload.mapped) + owner.upload.offset,
-                                        reinterpret_cast<const void*>(static_cast<uintptr_t>(group.address)),
-                                        static_cast<size_t>(group.bytes));
+                                    void* destination =
+                                        static_cast<uint8_t*>(owner.upload.mapped) + owner.upload.offset;
+                                    const void* source = reinterpret_cast<const void*>(
+                                        static_cast<uintptr_t>(group.address));
+                                    if (batch_buffer_range_copies) {
+                                        buffer_range_copy_jobs.push_back(
+                                            {destination, source, static_cast<size_t>(group.bytes)});
+                                    } else {
+                                        const ResourcePhaseTimer phase_copy(timing_enabled,
+                                            &res_buffer_copy_ms);
+                                        parallel_render_memcpy(destination, source,
+                                                               static_cast<size_t>(group.bytes));
+                                    }
                                     ++resource_reuse_stats.buffer_range_uploads;
                                     resource_reuse_stats.buffer_range_upload_bytes += group.bytes;
                                     resource_reuse_stats.buffer_upload_bytes += group.bytes;
@@ -10847,6 +10957,23 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         if (timing_enabled) {
             setup_pipeline_ms += setup_elapsed_ms(setup_resources_ready, setup_pipeline_key_ready);
             setup_pipeline_ms += setup_elapsed_ms(setup_pipeline_create_begin, setup_pipeline_ready);
+        }
+    }
+
+    // All jobs point into the synchronous borrowed guest views and disjoint slices of the pass's
+    // mapped arenas. Finish them before command recording; deferred submissions retain only the
+    // completed arena uploads. The immediate compatibility path above remains available both as a
+    // same-binary measurement control and when job storage could not be reserved.
+    if (!buffer_range_copy_jobs.empty()) {
+        const auto copy_begin = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
+        parallel_render_memcpy_batch(buffer_range_copy_jobs);
+        ++resource_reuse_stats.buffer_range_copy_batches;
+        resource_reuse_stats.buffer_range_copy_spans += buffer_range_copy_jobs.size();
+        if (timing_enabled) {
+            const double elapsed = setup_elapsed_ms(copy_begin, TimingClock::now());
+            res_buffer_copy_ms += elapsed;
+            res_buffer_ms += elapsed;
+            setup_resources_ms += elapsed;
         }
     }
 
@@ -13389,6 +13516,8 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         PROSPER_SUM_RESOURCE_STAT(buffer_range_bindings);
         PROSPER_SUM_RESOURCE_STAT(buffer_range_upload_bytes);
         PROSPER_SUM_RESOURCE_STAT(buffer_range_bound_bytes);
+        PROSPER_SUM_RESOURCE_STAT(buffer_range_copy_batches);
+        PROSPER_SUM_RESOURCE_STAT(buffer_range_copy_spans);
         PROSPER_SUM_RESOURCE_STAT(buffer_upload_bytes);
         PROSPER_SUM_RESOURCE_STAT(buffer_resident_hits);
         PROSPER_SUM_RESOURCE_STAT(buffer_resident_compared_bytes);
