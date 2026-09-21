@@ -6591,6 +6591,39 @@ inline bool backend_module_has_readonly_buffers(const std::vector<uint32_t>& wor
     return readonly;
 }
 
+// Validate frontend-owned split-resource metadata for the whole logical draw batch. This must run
+// before depth-feedback splitting: validating each physical segment independently can let an early
+// segment acquire/submit Vulkan work before a malformed later segment is discovered. Compact
+// resources always require explicit order metadata; an empty order retains its historical meaning
+// that every resource is in R.
+inline bool backend_compact_resource_orders_valid(std::span<const BackendDraw> draws) {
+    for (const BackendDraw& draw : draws) {
+        if (draw.resource_order.empty()) {
+            if (draw.B.empty()) continue;
+            std::fprintf(stderr, "prosper: compact resources require explicit order metadata\n");
+            return false;
+        }
+        if (draw.resource_order.size() != draw.R.size() + draw.B.size()) {
+            std::fprintf(stderr, "prosper: malformed compact resource order\n");
+            return false;
+        }
+        uint32_t next_full = 0;
+        uint32_t next_compact = 0;
+        for (uint32_t token : draw.resource_order) {
+            const bool compact = (token & 0x80000000u) != 0;
+            const uint32_t index = token & 0x7fffffffu;
+            uint32_t& next = compact ? next_compact : next_full;
+            const size_t count = compact ? draw.B.size() : draw.R.size();
+            if (index != next || index >= count) {
+                std::fprintf(stderr, "prosper: compact resource order is not a permutation\n");
+                return false;
+            }
+            ++next;
+        }
+    }
+    return true;
+}
+
 // `submission_batch` is an explicit live-renderer ownership scope. Calls with no requested CPU
 // readback may return after recording; `flush_submission_batch` submits every accumulated command
 // buffer in order, waits once, and releases all retained resources. Omitting the batch preserves the
@@ -6688,31 +6721,6 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         draws = std::span<const BackendDraw>(proven_storage);
     }
     if (backend_has_unproven_submission()) return out;
-    // The split representation is frontend-owned metadata, so reject a malformed handoff before
-    // acquiring any Vulkan object. Within each carrier vector indices are appended monotonically;
-    // requiring that sequence makes every entry appear exactly once while still allowing arbitrary
-    // image/buffer interleaving. A size-and-bounds check alone would accept {B0, B0}, silently omit
-    // B1, and only fail after transient targets had already been created.
-    for (const BackendDraw& draw : draws) {
-        if (draw.resource_order.empty()) continue;
-        if (draw.resource_order.size() != draw.R.size() + draw.B.size()) {
-            std::fprintf(stderr, "prosper: malformed compact resource order\n");
-            return out;
-        }
-        uint32_t next_full = 0;
-        uint32_t next_compact = 0;
-        for (uint32_t token : draw.resource_order) {
-            const bool compact = (token & 0x80000000u) != 0;
-            const uint32_t index = token & 0x7fffffffu;
-            uint32_t& next = compact ? next_compact : next_full;
-            const size_t count = compact ? draw.B.size() : draw.R.size();
-            if (index != next || index >= count) {
-                std::fprintf(stderr, "prosper: compact resource order is not a permutation\n");
-                return out;
-            }
-            ++next;
-        }
-    }
     // #2953. Everything from here on reads and writes the backend's persistent-resource domain --
     // the pipeline, pipeline-layout, colour-target, depth/stencil and texture caches, their byte
     // totals and their generation counters. Taken BEFORE `direct_submission` is constructed, so the
@@ -13308,6 +13316,9 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                                               BackendMrtOutputs* mrt_outputs = nullptr,
                                               bool want_color_readback = true) {   // #2283
     const std::span<const BackendDraw> all(draws);
+    // One preflight over the logical batch, before splitting or any render-pass state. A malformed
+    // later segment must not leave earlier producer work submitted or speculative cache state live.
+    if (!backend_compact_resource_orders_valid(all)) return {};
     if (!persist_depth_stencil ||
         depth_feedback_split_index(all, W, H) == all.size())
         return render_draw_pass_rgba(all, W, H, seed_rgba, clear_rgba,

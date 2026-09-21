@@ -484,6 +484,49 @@ int main() {
         malformed_compact.resource_order = {0x80000000u, 0x80000000u};
         CHECK(prosper::test::render_draws_rgba({malformed_compact}, W, H).empty(),
               "duplicate compact resource tokens fail before Vulkan submission");
+        malformed_compact = compact_draw;
+        malformed_compact.resource_order.clear();
+        CHECK(prosper::test::render_draws_rgba({malformed_compact}, W, H).empty(),
+              "compact resources without explicit order fail before Vulkan submission");
+
+        // The order preflight belongs to the whole logical batch, ahead of depth-feedback
+        // splitting. Put a malformed draw after a forced split and seed the timing stats with a
+        // value no real pass produces: segment-local validation would render the first segment and
+        // replace it, while whole-batch rejection leaves it untouched.
+        constexpr uint64_t kPreflightDepth = 0x7f31000000ull;
+        ResolvedPipelineState preflight_writer = opaque;
+        preflight_writer.depth_test_enable = true;
+        preflight_writer.depth_write_enable = true;
+        preflight_writer.depth_compare_op = 7; // ALWAYS
+        preflight_writer.depth_read_base = kPreflightDepth;
+        preflight_writer.depth_write_base = kPreflightDepth;
+        prosper::test::BackendDraw valid_first_segment = d0;
+        valid_first_segment.ps = &preflight_writer;
+        prosper::test::BackendDraw malformed_later_segment = compact_draw;
+        prosper::test::FrameResource depth_sample;
+        depth_sample.binding = 7;
+        depth_sample.set = 1;
+        depth_sample.persistent_depth_target_id = kPreflightDepth;
+        depth_sample.img_dim = 1;
+        depth_sample.tw = W;
+        depth_sample.th = H;
+        malformed_later_segment.R.push_back(std::move(depth_sample));
+        malformed_later_segment.resource_order = {
+            0u, 0x80000000u, 0x80000000u,
+        };
+        const std::vector<prosper::test::BackendDraw> malformed_split{
+            valid_first_segment, malformed_later_segment,
+        };
+        CHECK(prosper::test::depth_feedback_split_index(malformed_split, W, H) == 1u,
+              "malformed-order control would enter a later depth-feedback segment");
+        auto& preflight_stats = prosper::test::backend_render_timing_stats_storage();
+        preflight_stats = {};
+        preflight_stats.calls = 123;
+        CHECK(prosper::test::render_draws_rgba(
+                  malformed_split, W, H, nullptr, nullptr,
+                  /*persist_depth_stencil=*/true).empty() &&
+                  prosper::test::backend_render_timing_stats().calls == 123,
+              "a malformed later segment rejects the whole batch before the first Vulkan pass");
 
         const auto pool_before_capacity = prosper::test::render_host_buffer_pool_stats();
         prosper::test::BackendDraw capacity_peer0 = d0;
