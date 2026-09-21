@@ -538,6 +538,34 @@ def selftest():
         check(f"...and so does a scaled-to-black copy that CORRELATES perfectly "
               f"({s_dim:.3f}, brightest pixel {dim_max}/255)", s_dim < s_real * 0.5)
 
+        # The blend across the chromatic floor must be CONTINUOUS. Nothing pinned
+        # this, and a hard switch is the shape the round-2 defect had: two
+        # references straddling the floor step 0.227 on the blend and 0.962 under
+        # a switch. Build a pair either side of MIN_REF_CHROMATIC from the same
+        # scene, so only the crossing differs.
+        def tinted(frac):
+            im = mono.copy()
+            n = int(H * W * frac)
+            flat = im.reshape(-1, 3)
+            flat[:n] = [200, 40, 30]
+            return Image.fromarray(im.clip(0, 255).astype(np.uint8))
+        # Straddle the floor TIGHTLY. Two points far apart on the ramp measure the
+        # ramp, not the boundary: at 0.5x and 1.5x the floor the blend itself steps
+        # 0.661, which says nothing about continuity where the switch would be.
+        lo_p = save("chrom_lo.png", tinted(MIN_REF_CHROMATIC * 0.95))
+        hi_p = save("chrom_hi.png", tinted(MIN_REF_CHROMATIC * 1.05))
+        lo_c = hue_profile(load(lo_p))["_chromatic"]
+        hi_c = hue_profile(load(hi_p))["_chromatic"]
+        step = abs(report(lo_p, near_p, quiet=True) - report(hi_p, near_p, quiet=True))
+        # Honest claim: the blend REMOVES THE JUMP, it does not make the crossing
+        # flat. second = (1-w)*struct, so likeness falls like sqrt(1-w) and the
+        # approach steepens at the boundary by construction. Measured across the
+        # floor: ~0.21 blended against ~0.94 under a hard switch.
+        check(f"the hue/structure crossing is a ramp, not a jump "
+              f"({lo_c*100:.2f}% -> {hi_c*100:.2f}% chromatic, step {step:.3f} "
+              f"vs ~0.94 switched)",
+              lo_c < MIN_REF_CHROMATIC <= hi_c and step < 0.40)
+
         # Region location, on the STRUCTURED fixture. Three shapes, not one.
         for rname, box in (("bottom half", (0, H // 2, W, H)),
                            ("left half", (0, 0, W // 2, H)),
@@ -579,9 +607,21 @@ def selftest():
         _, o_c, _ = cli(["--regions", ref_p, dgrad_p, "--cells", "2x2"])
         _, o_d, _ = cli(["--regions", ref_p, dgrad_p, "--cells", "4x3"])
         check("--cells reaches --regions via the CLI (2x2 vs 4x3)", o_c != o_d)
+        # --locate ECHOES its grid in the header, straight from the parsed values,
+        # so comparing whole output is satisfied by the echo whether or not the
+        # options reach region_match: a review reinstated the drop-the-options
+        # defect in --locate alone and the suite stayed 27/27 green while all three
+        # --cells values gave byte-identical answers. Compare the RESULT ROWS.
+        def rows(text):
+            return "\n".join(l for l in text.splitlines() if not l.startswith("==="))
         _, o_e, _ = cli(["--locate", ref_p, td, "--cells", "2x2"])
         _, o_f, _ = cli(["--locate", ref_p, td, "--cells", "4x3"])
-        check("--cells reaches --locate via the CLI (2x2 vs 4x3)", o_e != o_f)
+        check("--cells reaches --locate via the CLI (2x2 vs 4x3)",
+              rows(o_e) != rows(o_f))
+        _, o_g, _ = cli(["--locate", ref_p, td, "--threshold", "1"])
+        _, o_h, _ = cli(["--locate", ref_p, td, "--threshold", "200"])
+        check("--threshold reaches --locate via the CLI (1 vs 200)",
+              rows(o_g) != rows(o_h))
 
         # Options a mode does not USE must be refused, not accepted and dropped.
         for args in (["--rank", ref_p, td, "--threshold", "40"],

@@ -135,11 +135,19 @@ three are the same trap wearing different clothes. Reference: the committed *Lit
 Nightmares III* title screen, 0.00% chromatic — and 32 of this repository's 190
 screenshots are under the floor, so this is not a corner.
 
-| version | all-black | reference × 0.01 (brightest pixel 2/255) | a real capture |
-| --- | --- | --- | --- |
-| v1 — fall back to the bare palette term | **0.968, 3rd of 6** | — | 0.942 |
-| v2 — plain Pearson correlation | 0.000 | **0.869, above the real capture** | 0.771 |
-| v3 — correlation × gain penalty | 0.000 | 0.076 | 0.726 |
+All three versions below are measured on **one** candidate set against that
+reference, because an earlier version of this table quoted "a real capture" that
+was a different image in different rows:
+
+| version | all-black | ref × 0.01 (brightest pixel 2/255) | boot splash | EULA | what ranks first |
+| --- | --- | --- | --- | --- | --- |
+| v1 — bare palette fallback | **0.968** | 0.968 | 0.981 | 0.942 | splash, then **all-black 2nd — above the EULA** |
+| v2 — plain Pearson correlation | 0.000 | **0.869** | 0.771 | 0.000 | **ref × 0.01**, above the real splash |
+| v3 — correlation × gain penalty | 0.000 | 0.076 | **0.726** | 0.000 | the real splash |
+
+What v3 fixes is that the matching capture ranks first. `ref × 0.01` still scores
+a small non-zero (0.076) and so sits above two real captures that are *different
+scenes* and score 0.000 — that ordering is correct, not a residue of the defect.
 
 The palette term is *high* for a black candidate precisely because the reference is
 dark, and Pearson is **affine invariant**, so in v2 nothing in the product could see
@@ -200,7 +208,7 @@ whether a scene looks right. Two cautions learned while building it:
   the oracle's bottom half being located as "bottom third", a frame compared against
   itself reporting "top-right q" instead of "full", and each mode refusing the
   options it does not use. The arms are written so that reinstating the old
-  behaviour reddens a named case — verified by mutation, **ten for ten**,
+  behaviour reddens a named case — verified by mutation, **thirteen for thirteen**,
   including reinstating the exact pre-review region algorithm rather than a
   convenient substitute for it.
 
@@ -231,8 +239,13 @@ whether a scene looks right. Two cautions learned while building it:
 - **`--threshold` and `--cells` belong to the spatial modes only.** An early version
   dropped `--threshold` outside `--grid`; the repair was incomplete and a review
   found `--rank` still took no options at all while `--locate` accepted `--cells`
-  and discarded it. If a mode accepts an option now, it uses it — that is what the
-  `--cells changes the answer` selftest arm pins.
+  and discarded it. If a mode accepts an option now, it uses it — pinned by four
+  arms that compare CLI output at two settings.
+  **Compare the result rows, never the whole output.** `--locate` echoes its grid
+  in its own header, so a whole-output comparison is satisfied by the echo whether
+  or not the options reach the scoring function: a review reinstated exactly that
+  defect in `--locate` and the suite stayed 27/27 green while all three `--cells`
+  values produced byte-identical answers.
 - **Absolute scores are low even for good renders**, because exposure and tonemap
   differences shift every cell. Compare candidates against each other, and watch the
   per-hue deltas and the spatial map rather than the single number.
