@@ -931,6 +931,85 @@ int main() {
             CHECK(lc[0] > 56 && lc[0] < 72,
                   "light samples the casters' depth, not the ineffective clear value (#1287)");
         }
+
+        // ---- #2790: HOST-PASS PARTITION INVARIANCE ----
+        // The identical guest draw sequence must render identically whether prosper batches it
+        // into one host render pass or splits it across two. prosper chooses that partition for
+        // its own reasons (feedback splits, attachment changes, batching); the guest can neither
+        // see nor control it, so any depth rule whose result depends on it is wrong by
+        // construction -- independently of the unresolved hardware meaning of DEPTH_CLEAR_ENABLE.
+        //
+        // The arms must be able to SHOW an extra reset, which needs two things a naive version
+        // lacks (the first draft of this test used two identical draws and passed vacuously):
+        //   * different depths, so the second draw is genuinely occluded by the first;
+        //   * different colour channels, so "was the second draw drawn?" is readable.
+        // Near draw writes R at z=0.75; far draw writes G at z=0.25 under reverse-Z GEQUAL, so it
+        // is occluded and G must stay 0. An extra depth reset at a pass boundary lets it through
+        // and G becomes nonzero -- the exact signature of a partition-dependent rule.
+        {
+            std::vector<uint32_t> vs_near_words(vs_z, vs_z + sizeof(vs_z) / sizeof(vs_z[0]));
+            for (auto& w : vs_near_words) if (w == 0x3e800000u) w = 0x3f400000u;  // 0.25 -> 0.75
+            std::vector<uint32_t> vert_near =
+                recompile_vertex(vs_near_words.data(), vs_near_words.size());
+            CHECK(!vert_near.empty(), "recompiled the near-depth (z=0.75) producer (#2790)");
+
+            constexpr uint64_t kPart = 0x20d7000000ull;
+            ResolvedPipelineState near_ps = producer;
+            near_ps.depth_read_base = kPart; near_ps.depth_write_base = kPart;
+            near_ps.depth_test_enable = true; near_ps.depth_write_enable = true;
+            near_ps.depth_compare_op = 6;         // GREATER_OR_EQUAL (reverse-Z)
+            near_ps.depth_clear_enable = true;    // sticky bit, never cleared by this guest
+            near_ps.depth_clear_value = 0.0f;
+            near_ps.color_write_mask = 0x1u;      // R only
+            ResolvedPipelineState far_ps = near_ps;
+            far_ps.color_write_mask = 0x2u;       // G only
+
+            prosper::test::BackendDraw dn = pw; dn.vs = vert_near; dn.ps = &near_ps;
+            prosper::test::BackendDraw df = pw; df.vs = vert_z;    df.ps = &far_ps;
+            prosper::test::BackendColorTarget ct{0x20d7800000ull, true, true,
+                                                 VK_FORMAT_R8G8B8A8_UNORM};
+
+            std::vector<uint8_t> one = prosper::test::render_draws_rgba(
+                {dn, df}, W, H, nullptr, nullptr, /*persist_depth_stencil=*/true, &ct);
+            prosper::test::render_draws_rgba({dn}, W, H, nullptr, nullptr,
+                                             /*persist_depth_stencil=*/true, &ct);
+            std::vector<uint8_t> split = prosper::test::render_draws_rgba(
+                {df}, W, H, nullptr, nullptr, /*persist_depth_stencil=*/true, &ct);
+
+            // POSITIVE CONTROL, mandatory: the far draw must be able to write G at all. Without
+            // this the comparison is void -- two zeroes agree for any reason, including a colour
+            // write mask or shader that never produces G. (The first discriminating draft of this
+            // test reported 0 == 0 and I nearly read it as partition invariance.)
+            constexpr uint64_t kPartCtl = 0x20d7900000ull;
+            ResolvedPipelineState far_alone = far_ps;
+            far_alone.depth_read_base = kPartCtl; far_alone.depth_write_base = kPartCtl;
+            prosper::test::BackendDraw df_alone = pw;
+            df_alone.vs = vert_z; df_alone.ps = &far_alone;
+            prosper::test::BackendColorTarget ct_ctl{0x20d7980000ull, true, true,
+                                                     VK_FORMAT_R8G8B8A8_UNORM};
+            std::vector<uint8_t> ctl = prosper::test::render_draws_rgba(
+                {df_alone}, W, H, nullptr, nullptr, /*persist_depth_stencil=*/true, &ct_ctl);
+            size_t g_ctl = 0;
+            for (size_t i2 = 0; i2 + 3 < ctl.size(); i2 += 4) if (ctl[i2 + 1] > 8) ++g_ctl;
+            printf("  [#2790] CONTROL far draw alone wrote G on %zu px\n", g_ctl);
+            CHECK(g_ctl > 0,
+                  "control: the far draw can write G when nothing occludes it (#2790)");
+
+            CHECK(!one.empty() && one.size() == split.size(),
+                  "partition arms produced comparable frames (#2790)");
+            if (!one.empty() && one.size() == split.size()) {
+                size_t g_one = 0, g_split = 0;
+                for (size_t i2 = 0; i2 < one.size(); i2 += 4) {
+                    if (one[i2 + 1] > 8) ++g_one;
+                    if (split[i2 + 1] > 8) ++g_split;
+                }
+                printf("  [#2790] occluded far draw leaked G: one-pass=%zu split=%zu of %zu px\n",
+                       g_one, g_split, one.size() / 4);
+                CHECK(g_one == g_split,
+                      "an occluded draw stays occluded however prosper partitions host passes (#2790)");
+            }
+        }
+
     }
 
     {

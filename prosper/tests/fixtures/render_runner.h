@@ -6557,6 +6557,72 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             fprintf(stderr, "[ds] new-entry dr=0x%llx dw=0x%llx sr=0x%llx slice=%u extent=%ux%u\n",
                     (unsigned long long)ds_key.dr, (unsigned long long)ds_key.dw,
                     (unsigned long long)ds_key.sr, ds_key.slice, ds_key.w, ds_key.h);
+        // #2790 DIAGNOSTIC: depth lifetime probe for ONE selected plane, sampled at PASS ENTRY so
+        // it reports the state this pass INHERITS. Identity and validity are logged without touching
+        // the image; the content histogram is behind a SECOND switch because its readback inserts
+        // barriers and could mask a visibility problem -- run with and without to keep that honest.
+        static const char* lifetime_sel = std::getenv("PROSPER_DEPTH_LIFETIME");
+        if (lifetime_sel && *lifetime_sel) {
+            // Guest addresses are RUN-LOCAL (charter: "addresses and operation ordinals are
+            // run-local"), so an address copied from a capture selects nothing in a fresh run --
+            // measured, it cost one 9-minute run. Accept a shape instead: "WxH" matches the pass
+            // extent, and a trailing "+s" additionally requires a paired stencil plane, which is
+            // what distinguishes the world depth target from shadow/aux planes of the same size.
+            bool want_match = false;
+            if (std::strchr(lifetime_sel, 'x')) {
+                unsigned lw = 0, lh = 0;
+                if (std::sscanf(lifetime_sel, "%ux%u", &lw, &lh) == 2)
+                    want_match = ds_key.w == lw && ds_key.h == lh &&
+                                 (!std::strstr(lifetime_sel, "+s") || ds_key.sr != 0);
+            } else {
+                const uint64_t want = std::strtoull(lifetime_sel, nullptr, 0);
+                want_match = (ds_key.dr == want || ds_key.dw == want);
+            }
+            if (want_match) {
+                static uint64_t probe_seq = 0;
+                static const bool probe_read = std::getenv("PROSPER_DEPTH_LIFETIME_READ") != nullptr;
+                char content[240]; content[0] = 0;
+                if (probe_read && cached_ds->image && cached_ds->depth_valid) {
+                    std::vector<float> px; std::string perr;
+                    if (read_persistent_ds_depth(*cached_ds, ds_key.w, ds_key.h, px, perr) &&
+                        !px.empty()) {
+                        // Bounded histogram + finite/NaN counts + distinct estimate. Min/max alone
+                        // cannot tell valid retained depth from stale depth with the same extrema.
+                        size_t bins[8] = {0}; size_t nan = 0, zero = 0;
+                        std::set<uint32_t> distinct;   // bounded below
+                        for (size_t i = 0; i < px.size(); i += 97) {
+                            const float v = px[i];
+                            if (!std::isfinite(v)) { ++nan; continue; }
+                            if (v == 0.0f) ++zero;
+                            int b = (int)(std::clamp(v, 0.0f, 0.999f) * 8.0f);
+                            ++bins[b];
+                            if (distinct.size() < 4096) {
+                                uint32_t u; std::memcpy(&u, &v, 4); distinct.insert(u);
+                            }
+                        }
+                        std::snprintf(content, sizeof content,
+                            " hist=%zu/%zu/%zu/%zu/%zu/%zu/%zu/%zu zero=%zu nan=%zu distinct%s=%zu",
+                            bins[0],bins[1],bins[2],bins[3],bins[4],bins[5],bins[6],bins[7],
+                            zero, nan, distinct.size() >= 4096 ? ">=" : "", distinct.size());
+                    } else {
+                        std::snprintf(content, sizeof content, " read-failed(%s)", perr.c_str());
+                    }
+                }
+                std::fprintf(stderr,
+                    "[depth-life] seq=%llu dr=0x%llx dw=0x%llx sr=0x%llx slice=%u extent=%ux%u "
+                    "fmt=%u img=%p layout-init=%d depth-valid=%d stencil-valid=%d "
+                    "last-write=%llu last-order=%llu last-present=%llu gen=%llu%s\n",
+                    (unsigned long long)probe_seq++,
+                    (unsigned long long)ds_key.dr, (unsigned long long)ds_key.dw,
+                    (unsigned long long)ds_key.sr, ds_key.slice, ds_key.w, ds_key.h, ds_key.fmt,
+                    (void*)cached_ds->image, (int)cached_ds->layout_initialized,
+                    (int)cached_ds->depth_valid, (int)cached_ds->stencil_valid,
+                    (unsigned long long)cached_ds->last_depth_write,
+                    (unsigned long long)cached_ds->last_depth_command_order,
+                    (unsigned long long)cached_ds->last_depth_present,
+                    (unsigned long long)persistent_ds_write_generation(), content);
+            }
+        }
         dimg = cached_ds->image; dmem = cached_ds->memory; dview = cached_ds->view;
         ds_layout_initialized = cached_ds->layout_initialized;
         depth_was_valid = cached_ds->depth_valid;
@@ -11133,6 +11199,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         vkCmdSetPrimitiveTopology(command, v.topology);
         vkCmdSetPrimitiveRestartEnable(command, v.primitive_restart);
     };
+    bool ds_clear_done_this_pass = false;   // #2790 diagnostic: see PROSPER_DS_CLEAR_ONCE_PER_PASS
     vkCmdBeginRenderPass(cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
     for (size_t di = 0; di < dv.size(); di++) {
         auto& v = dv[di];
@@ -11151,8 +11218,34 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             VkClearRect rect{v.scissor, 0, 1};
             // A fully clipped draw legitimately has a zero-area dynamic scissor, but Vulkan requires
             // vkCmdClearAttachments rectangles to have non-zero width and height (VUID 02682/02683).
-            if (dsc.aspectMask && rect.rect.extent.width && rect.rect.extent.height)
+            static const bool no_depth_clear   = std::getenv("PROSPER_DS_NO_DEPTH_CLEAR") != nullptr;
+            static const bool no_stencil_clear = std::getenv("PROSPER_DS_NO_STENCIL_CLEAR") != nullptr;
+            static const bool always_only = std::getenv("PROSPER_DS_CLEAR_ALWAYS_ONLY") != nullptr;
+            // DIAGNOSTIC: clear at most ONCE per render pass instead of once per draw.
+            // Rationale, not a shape heuristic: DB_RENDER_CONTROL is emitted at depth-view BIND
+            // time by both PAL and RADV, alongside DB_Z_INFO / DB_HTILE_DATA_BASE -- it is not
+            // per-draw pipeline state. prosper folds it into per-draw ResolvedPipelineState and
+            // therefore replays one bind-time operation once per draw. This arm asks what the
+            // frame looks like when the operation happens at the granularity the register is
+            // actually programmed at.
+            static const bool clear_once = std::getenv("PROSPER_DS_CLEAR_ONCE_PER_PASS") != nullptr;
+            if (clear_once && ds_clear_done_this_pass)
+                dsc.aspectMask &= ~VkImageAspectFlags(VK_IMAGE_ASPECT_DEPTH_BIT);
+            if (no_depth_clear)   dsc.aspectMask &= ~VkImageAspectFlags(VK_IMAGE_ASPECT_DEPTH_BIT);
+            if (no_stencil_clear) dsc.aspectMask &= ~VkImageAspectFlags(VK_IMAGE_ASPECT_STENCIL_BIT);
+            if (always_only && ps->depth_compare_op != VK_COMPARE_OP_ALWAYS)
+                dsc.aspectMask &= ~VkImageAspectFlags(VK_IMAGE_ASPECT_DEPTH_BIT);
+            static const bool ds_clear_log = std::getenv("PROSPER_DS_CLEARLOG") != nullptr;
+            if (ds_clear_log)
+                std::fprintf(stderr, "[ds-clear] draw=%zu emit-aspect=0x%x rect=%d,%d %ux%u "
+                    "depth=%g test=%d write=%d cmp=%u\n", di, (unsigned)dsc.aspectMask,
+                    rect.rect.offset.x, rect.rect.offset.y, rect.rect.extent.width,
+                    rect.rect.extent.height, (double)ps->depth_clear_value,
+                    (int)ps->depth_test_enable, (int)ps->depth_write_enable, ps->depth_compare_op);
+            if (dsc.aspectMask && rect.rect.extent.width && rect.rect.extent.height) {
+                if (dsc.aspectMask & VK_IMAGE_ASPECT_DEPTH_BIT) ds_clear_done_this_pass = true;
                 vkCmdClearAttachments(cmd, 1, &dsc, 1, &rect);
+            }
         }
         if (!v.ok) continue;
         if (ds_active) {
