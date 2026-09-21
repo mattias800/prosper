@@ -2485,6 +2485,15 @@ int main(int argc, char** argv) {
             !compute_resource_spec.empty() || !post_compute_resource_spec.empty() ||
             require_post_change || expected_post_hash_set || !failed_shader_spec.empty() ||
             !retry_failed_chain_spec.empty() ||
+            // These three are read only AFTER the `return replay_bundle(...)` below, so a bundle
+            // run that passed one used to execute the ordinary replay and exit 0 having silently
+            // ignored it -- the void experiment the sibling guard below is careful to make loud.
+            // Measured: `--bundle <b> --retry-failed-stage 99:99`, a deliberately out-of-range
+            // selector, exited 0 with no diagnostic, and so did the in-range selector whose
+            // answer was being relied on. All three need `replay.items` /
+            // `replay.failure_diagnostics`, which only the capture path builds; refusing is
+            // correct, being quiet was not. #2790, instrument trap 287.
+            !retry_failed_stage_spec.empty() || !list_resources_spec.empty() || recompile_raw ||
             !prepend_path.empty() || !draw_steps_prefix.empty()) {
             usage(argv[0]); return 2;
         }
