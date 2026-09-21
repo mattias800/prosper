@@ -124,12 +124,41 @@ def hue_profile(px):
     return out
 
 
-def compare(ref_px, cand_px):
-    """Return (palette, hue_recall_or_None, likeness, ref_hues, cand_hues).
+def structure(ref_path, cand_path, cols=16, rows=9):
+    """Pearson correlation of the two images' downsampled luminance, clamped to 0..1.
 
-    `hue_recall` is None exactly when the reference has too little chromatic mass
-    for the ratio to mean anything; `likeness` then equals `palette`, and every
-    caller is expected to say which of the two it printed.
+    The second factor for references that carry no hue evidence. It is threshold
+    free, and it is zero for exactly the images that fake a palette match: a flat
+    fill and a near-flat frame have no luminance variance, so the correlation is
+    undefined and is reported as 0 rather than as agreement.
+
+    This exists because the first fix's `PALETTE ONLY` fallback reopened the very
+    defect it was written for. Below the chromatic floor the score WAS the plain
+    palette intersection, and on a real achromatic reference (a title screen) an
+    all-black candidate scored 0.968 and ranked third of six, above a real capture
+    at 0.942 -- the previous review's sentence, verbatim, one branch over. 32 of
+    this repository's 190 committed screenshots sit under that floor, so it was
+    not a corner.
+    """
+    a = np.asarray(load_full(ref_path).convert("L").resize((cols, rows), Image.BOX),
+                   dtype=np.float64).ravel()
+    b = np.asarray(load_full(cand_path).convert("L").resize((cols, rows), Image.BOX),
+                   dtype=np.float64).ravel()
+    if a.std() < 1e-6 or b.std() < 1e-6:
+        return 0.0
+    return float(max(0.0, np.corrcoef(a, b)[0, 1]))
+
+
+def compare(ref_px, cand_px, struct=None):
+    """Return (palette, second, likeness, ref_hues, cand_hues).
+
+    `second` is the factor multiplied with the palette term. Which one it is
+    depends on how much chromatic mass the REFERENCE carries, and the two are
+    blended rather than switched so there is no cliff at the boundary: a review
+    measured the switched version jumping from 0.978 at 1.9% chromatic to 0.000
+    at 3.0%, which is a property of the instrument and not of the images.
+    `struct` is the structure factor, which the caller supplies because it needs
+    the file paths; when it is None only the hue term is used.
     """
     hr, hc = hist(ref_px), hist(cand_px)
     palette = float(np.minimum(hr, hc).sum())
@@ -140,27 +169,41 @@ def compare(ref_px, cand_px):
     # candidate. Do not reintroduce it as a second measure.
     ph, qh = hue_profile(ref_px), hue_profile(cand_px)
     ref_chromatic = ph["_chromatic"]
-    if ref_chromatic < MIN_REF_CHROMATIC:
-        return palette, None, palette, ph, qh
     hue_inter = sum(min(ph[n], qh[n]) for n, _, _ in HUES)
-    hue_recall = hue_inter / ref_chromatic
-    return palette, hue_recall, float(np.sqrt(palette * hue_recall)), ph, qh
+    hue_recall = hue_inter / ref_chromatic if ref_chromatic > 1e-9 else 0.0
+    if struct is None:
+        second = hue_recall
+    else:
+        # Weight hue by how much chromatic mass the reference actually has. At or
+        # above the floor this is pure hue recall (the factor an independent review
+        # measured as well founded, and which is left untouched); as the reference
+        # goes achromatic the weight falls to zero and structure carries it.
+        w = min(1.0, ref_chromatic / MIN_REF_CHROMATIC)
+        second = w * hue_recall + (1.0 - w) * struct
+    return palette, second, float(np.sqrt(palette * second)), ph, qh
 
 
 def report(ref_path, cand_path, ref_px=None):
     ref_px = load(ref_path) if ref_px is None else ref_px
     cand_px = load(cand_path)
-    palette, hue_recall, likeness, hr, hc = compare(ref_px, cand_px)
+    struct = structure(ref_path, cand_path)
+    palette, second, likeness, hr, hc = compare(ref_px, cand_px, struct)
+    chrom = hr["_chromatic"]
+    w = min(1.0, chrom / MIN_REF_CHROMATIC)
     print(f"\n{os.path.basename(cand_path)}")
     print(f"  palette intersection : {palette:6.3f}   (1.0 = same colour distribution)")
-    if hue_recall is None:
-        print(f"  hue recall           :    n/a   (reference is achromatic: "
-              f"{hr['_chromatic']*100:.1f}% chromatic pixels)")
-        print(f"  likeness             : {likeness:6.3f}   (PALETTE ONLY -- no hue evidence)")
+    hue_inter = sum(min(hr[n], hc[n]) for n, _, _ in HUES)
+    hue_recall = hue_inter / chrom if chrom > 1e-9 else 0.0
+    print(f"  hue recall           : {hue_recall:6.3f}   "
+          f"(of the reference's chromatic mass)")
+    print(f"  structure            : {struct:6.3f}   (luminance correlation)")
+    if w >= 1.0:
+        print(f"  likeness             : {likeness:6.3f}   = sqrt(palette x hue recall)")
     else:
-        print(f"  hue recall           : {hue_recall:6.3f}   "
-              f"(of the reference's chromatic mass)")
-        print(f"  likeness             : {likeness:6.3f}   (sqrt of the two above)")
+        print(f"  likeness             : {likeness:6.3f}   = sqrt(palette x second), "
+              f"second = {w:.2f}*hue + {1-w:.2f}*structure")
+        print(f"       (reference is only {chrom*100:.1f}% chromatic, so hue evidence "
+              f"is weighted down)")
     print(f"  chromatic pixels  ref={hr['_chromatic']*100:5.1f}%  cand={hc['_chromatic']*100:5.1f}%")
     rows = [(n, hr[n] * 100, hc[n] * 100) for n, _, _ in HUES]
     rows = [r for r in rows if r[1] > 0.5 or r[2] > 0.5]
@@ -288,7 +331,7 @@ def region_match(ref_path, cand_path, cols=64, rows=36, threshold=32, quiet=Fals
     return res[0]
 
 
-def _take_opts(rest, known):
+def _take_opts(rest, known, cols_default=16, rows_default=9):
     """Pull shared options out of `rest`, in one place.
 
     EVERY mode calls this, including --rank and the default mode. An earlier version
@@ -301,7 +344,7 @@ def _take_opts(rest, known):
     but unused" produces the identical symptom to "unknown and ignored", so a mode
     must consume its options through here AND pass them on.
     """
-    cols, rows, thr = 16, 9, 32
+    cols, rows, thr = cols_default, rows_default, 32
     i = 0
     while i < len(rest):
         if rest[i].startswith("--") and rest[i] not in known:
@@ -372,11 +415,23 @@ def _report_failures(failures, total_wanted):
 def selftest():
     """Assert the properties this file claims, on synthetic images.
 
-    Every case here is one a review actually broke the first version with. They are
-    cheap, they need no fixtures, and they are the difference between "the tool
-    reports a number" and "the number means what the docstring says".
+    Every case here is one a review actually broke a previous version with. They
+    are cheap, they need no fixtures, and they are the difference between "the
+    tool reports a number" and "the number means what the docstring says".
+
+    THE FIXTURE IS PART OF THE TEST. A second review found the region arm could
+    not fail: the fixture was two flat colour bands, and the defect it was meant
+    to catch -- comparing two full images stretched to one grid instead of
+    cropping the reference -- is a no-op on flat bands, so reinstating it left the
+    suite green while the ground truth went from 13 regions correct to 4. That is
+    this project's same-source-control trap: the arm tested the discriminator, not
+    the domain. The reference below is deliberately STRUCTURED (a vertical
+    gradient plus four differently-coloured blocks at four distinct positions) so
+    that the stretch and the crop cannot agree. Verified: with the legacy
+    algorithm reinstated, bottom-half locates as "top-right q", left-half as
+    "bottom-left q" and centre as "top-left q". Do not simplify this fixture.
     """
-    import tempfile
+    import io, contextlib, tempfile
     ok = True
 
     def check(name, cond):
@@ -388,98 +443,156 @@ def selftest():
         def save(name, im):
             p = os.path.join(td, name); im.save(p); return p
 
-        # A colourful reference: green top half, red bottom half.
         W, H = 320, 180
-        ref = Image.new("RGB", (W, H), (20, 200, 60))
-        for y in range(H // 2, H):
-            for x in range(W):
-                ref.putpixel((x, y), (200, 40, 30))
+        a = np.zeros((H, W, 3), np.float64)
+        yy = np.linspace(0, 1, H)[:, None]
+        a[:, :, 0] = 30 + 60 * yy; a[:, :, 1] = 40 + 40 * yy; a[:, :, 2] = 70 - 40 * yy
+        a[int(H * .05):int(H * .22), int(W * .06):int(W * .30)] = [40, 190, 70]
+        a[int(H * .40):int(H * .52), int(W * .55):int(W * .92)] = [210, 80, 40]
+        a[int(H * .62):int(H * .80), int(W * .10):int(W * .40)] = [60, 90, 220]
+        a[int(H * .85):, int(W * .70):] = [220, 210, 60]
+        ref = Image.fromarray(a.clip(0, 255).astype(np.uint8))
         ref_p = save("ref.png", ref)
 
         grey = save("grey.png", Image.linear_gradient("L").convert("RGB").resize((W, H)))
         black = save("black.png", Image.new("RGB", (W, H), (0, 0, 0)))
-        bottom = save("bottom.png", ref.crop((0, H // 2, W, H)))
-
         ref_px = load(ref_p)
-        s_self = report_score(ref_p, ref_p, ref_px)
-        s_grey = report_score(ref_p, grey, ref_px)
-        s_black = report_score(ref_p, black, ref_px)
-        check("identical scores 1.000", abs(s_self - 1.0) < 1e-6)
+
+        check("identical scores 1.000", abs(report_score(ref_p, ref_p, ref_px) - 1.0) < 1e-6)
+        s_grey, s_black = report_score(ref_p, grey, ref_px), report_score(ref_p, black, ref_px)
         check(f"grey gradient ({s_grey:.3f}) scores below 0.10", s_grey < 0.10)
         check(f"all-black ({s_black:.3f}) scores below 0.10", s_black < 0.10)
-        check("gradient does not beat identity", s_grey < s_self)
 
-        # The arm that actually discriminates the composite score from the plain
-        # palette intersection. The saturated two-colour reference above CANNOT:
-        # a grey gradient has no mass in its two bins, so palette alone already
-        # scores it 0 and the check passes under either measure -- a control drawn
-        # from the same source as the null. A REALISTIC dark frame is needed, and
-        # with one the old measure is badly fooled: 0.740.
-        yy = np.linspace(0, 1, H)[:, None]
+        # Palette ALONE is fooled by a grey gradient matched to the reference's own
+        # luminance range; the composite is not. This is the arm that separates the
+        # two measures -- a saturated fixture cannot, because a gradient has no mass
+        # in its bins and scores 0 under either.
         basev = (8 + 70 * yy) * np.ones((1, W))
         dark = np.stack([basev * 1.00, basev * 1.04, basev * 1.12], axis=2)
-        dark[int(H * 0.55):, int(W * 0.15):int(W * 0.60)] = [30, 165, 55]
-        dark[int(H * 0.20):int(H * 0.35), int(W * 0.60):] = [180, 60, 40]
+        dark[int(H * .55):, int(W * .15):int(W * .60)] = [30, 165, 55]
+        dark[int(H * .20):int(H * .35), int(W * .60):] = [180, 60, 40]
         dark_p = save("dark.png", Image.fromarray(dark.clip(0, 255).astype(np.uint8)))
         gv = (np.linspace(6, 95, H)[:, None] * np.ones((1, W)))
         dgrad_p = save("dgrad.png", Image.fromarray(
             np.stack([gv, gv * 1.03, gv * 1.10], 2).clip(0, 255).astype(np.uint8)))
-        dark_px = load(dark_p)
-        pal, hue, like, _, _ = compare(dark_px, load(dgrad_p))
-        check(f"palette ALONE is fooled by a matched grey gradient ({pal:.3f}) -- "
-              f"this is why the score is a composite", pal > 0.50)
-        check(f"likeness is not ({like:.3f}, hue recall {hue:.3f})", like < 0.10)
+        pal, _, like, _, _ = compare(load(dark_p), load(dgrad_p), structure(dark_p, dgrad_p))
+        check(f"palette ALONE is fooled by a matched grey gradient ({pal:.3f})", pal > 0.50)
+        check(f"likeness is not ({like:.3f})", like < 0.10)
 
-        frac, name, _ = region_match(ref_p, bottom, quiet=True)
-        check(f"oracle's bottom half locates as 'bottom half' (got {name!r} "
-              f"{frac*100:.1f}%)", name == "bottom half" and frac > 0.99)
+        # An ACHROMATIC reference: the first fix fell back to the bare palette term
+        # here, which reopened the defect one branch over -- all-black outranked a
+        # real capture on a real title screen. Structure carries the weight now.
+        gg = (np.linspace(20, 210, H)[:, None] * np.ones((1, W)))
+        mono = np.stack([gg, gg * 1.01, gg * 1.02], 2)
+        mono[int(H * .3):int(H * .5), int(W * .2):int(W * .8)] = 240   # a bright panel
+        mono_p = save("mono.png", Image.fromarray(mono.clip(0, 255).astype(np.uint8)))
+        mono_chrom = hue_profile(load(mono_p))["_chromatic"]
+        near = mono.copy(); near[:, :, :] = np.clip(near * 0.92 + 6, 0, 255)
+        near_p = save("near.png", Image.fromarray(near.astype(np.uint8)))
+        s_real = report_score(mono_p, near_p)
+        s_flat = report_score(mono_p, black)
+        check(f"achromatic reference is under the hue floor ({mono_chrom*100:.1f}% < "
+              f"{MIN_REF_CHROMATIC*100:.0f}%)", mono_chrom < MIN_REF_CHROMATIC)
+        check(f"...and all-black ({s_flat:.3f}) still loses to a real capture "
+              f"({s_real:.3f})", s_flat < s_real and s_flat < 0.10)
 
-        frac, name, _ = region_match(ref_p, ref_p, quiet=True)
-        check(f"a frame against itself locates as 'full' (got {name!r})",
-              name == "full" and frac > 0.99)
+        # Region location, on the STRUCTURED fixture. Three shapes, not one.
+        for rname, box in (("bottom half", (0, H // 2, W, H)),
+                           ("left half", (0, 0, W // 2, H)),
+                           ("centre", (int(W * .25), int(H * .25),
+                                       int(W * .75), int(H * .75)))):
+            cp = save(rname.replace(" ", "_") + ".png", ref.crop(box))
+            frac, got, _ = region_match(ref_p, cp, quiet=True)
+            check(f"the oracle's {rname} locates as {rname!r} (got {got!r} "
+                  f"{frac*100:.1f}%)", got == rname and frac > 0.99)
+        frac, got, _ = region_match(ref_p, ref_p, quiet=True)
+        check(f"a frame against itself locates as 'full' (got {got!r})",
+              got == "full" and frac > 0.99)
+        # A genuine TIE: every region of a flat reference matches a flat candidate
+        # at 100%, so only the tie-break decides. Cropping alone does not reach
+        # this -- a self-comparison of a STRUCTURED frame has a unique winner, so
+        # the arm above passes even with the tie-break reverted.
+        flat_p = save("flat.png", Image.new("RGB", (W, H), (90, 92, 96)))
+        flat2_p = save("flat2.png", Image.new("RGB", (W, H), (92, 94, 98)))
+        tfrac, tgot, _ = region_match(flat_p, flat2_p, quiet=True)
+        check(f"a tie across every region resolves to the largest, 'full' "
+              f"(got {tgot!r} at {tfrac*100:.1f}%)", tgot == "full" and tfrac > 0.99)
 
-        # An option that is accepted must change something.
-        a = grid_compare_score(ref_p, grey, 16, 9, 0)
-        b = grid_compare_score(ref_p, grey, 16, 9, 255)
-        check(f"--threshold changes --grid ({a:.3f} vs {b:.3f})", a != b)
-        # --cells must CHANGE the answer, not merely be accepted. A control that
-        # cannot fail is void (this one asserted True until it was rewritten).
-        # Fine noise averages away on a coarse grid and survives on a fine one.
-        rng = np.random.default_rng(7)
-        noise = Image.fromarray(
-            (np.asarray(ref, dtype=np.int16) +
-             rng.integers(-90, 91, (H, W, 3))).clip(0, 255).astype(np.uint8))
-        noise_p = save("noise.png", noise)
-        coarse = grid_compare_score(ref_p, noise_p, 4, 3, 24)
-        fine = grid_compare_score(ref_p, noise_p, 64, 36, 24)
-        check(f"--cells changes the answer (4x3 {coarse:.3f} vs 64x36 {fine:.3f})",
-              coarse != fine)
-        r_coarse = region_match(ref_p, noise_p, cols=4, rows=3, threshold=24,
-                                quiet=True)[0]
-        r_fine = region_match(ref_p, noise_p, cols=64, rows=36, threshold=24,
-                              quiet=True)[0]
-        check(f"--cells reaches region_match ({r_coarse:.3f} vs {r_fine:.3f})",
-              r_coarse != r_fine)
+        # Options must reach the code that uses them, THROUGH THE CLI. Calling the
+        # internals directly would leave a broken call site green.
+        def cli(args):
+            buf, err = io.StringIO(), io.StringIO()
+            try:
+                with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(err):
+                    rc = main(args)
+            except SystemExit as e:
+                rc = e.code if isinstance(e.code, int) else 1
+            return rc, buf.getvalue(), err.getvalue()
+
+        _, o_a, _ = cli(["--grid", ref_p, grey, "--threshold", "0"])
+        _, o_b, _ = cli(["--grid", ref_p, grey, "--threshold", "255"])
+        check("--threshold reaches --grid via the CLI", o_a != o_b)
+        # BOTH values must sit below the old max(cols, 8) clamp, or the clamp maps
+        # them to different grids anyway and the arm passes with the defect present.
+        _, o_c, _ = cli(["--regions", ref_p, dgrad_p, "--cells", "2x2"])
+        _, o_d, _ = cli(["--regions", ref_p, dgrad_p, "--cells", "4x3"])
+        check("--cells reaches --regions via the CLI (2x2 vs 4x3)", o_c != o_d)
+        _, o_e, _ = cli(["--locate", ref_p, td, "--cells", "2x2"])
+        _, o_f, _ = cli(["--locate", ref_p, td, "--cells", "4x3"])
+        check("--cells reaches --locate via the CLI (2x2 vs 4x3)", o_e != o_f)
 
         # Options a mode does not USE must be refused, not accepted and dropped.
-        for mode_args in (["--rank", ref_p, td, "--threshold", "40"],
-                          ["--rank", ref_p, td, "--cells", "4x3"],
-                          [ref_p, grey, "--threshold", "40"]):
-            try:
-                main(mode_args); refused = False
-            except SystemExit:
-                refused = True
-            check(f"{' '.join(mode_args[:1] or ['default'])} refuses "
-                  f"{mode_args[-2]}", refused)
+        for args in (["--rank", ref_p, td, "--threshold", "40"],
+                     ["--rank", ref_p, td, "--cells", "4x3"],
+                     [ref_p, grey, "--threshold", "40"],
+                     ["--grid", ref_p, grey, "--bogus"]):
+            rc, _, _ = cli(args)
+            check(f"{args[0] if args[0].startswith('--') else 'default'} refuses "
+                  f"{args[-2] if args[-1].isdigit() or 'x' in args[-1] else args[-1]}",
+                  rc != 0)
+
+        # Silent success: every one of these returned 0 before, and none is covered
+        # by the arms above.
+        bad = os.path.join(td, "bad"); os.makedirs(bad, exist_ok=True)
+        open(os.path.join(bad, "x.png"), "w").write("not an image")
+        for name, args in (("--grid with the candidate forgotten",
+                            ["--grid", ref_p, "--threshold", "40"]),
+                           ("--locate with an unreadable reference",
+                            ["--locate", os.path.join(td, "nope.png"), td]),
+                           ("--rank over an all-corrupt directory",
+                            ["--rank", ref_p, bad]),
+                           ("--locate over an all-corrupt directory",
+                            ["--locate", ref_p, bad]),
+                           ("--rank on a missing directory",
+                            ["--rank", ref_p, os.path.join(td, "nodir")]),
+                           ("a corrupt candidate in the default mode",
+                            [ref_p, os.path.join(bad, "x.png")])):
+            rc, _, _ = cli(args)
+            check(f"{name} exits non-zero (got {rc})", rc != 0)
+
+        # A directory with ONE good image and one corrupt one: the run succeeds, so
+        # no exit code can report the skip. It must be named on stderr, or a
+        # partially-read directory is silently reported as a complete ranking.
+        mixed = os.path.join(td, "mixed"); os.makedirs(mixed, exist_ok=True)
+        ref.save(os.path.join(mixed, "good.png"))
+        open(os.path.join(mixed, "broken.png"), "w").write("not an image")
+        rc, _, errtxt = cli(["--rank", ref_p, mixed])
+        check(f"a skipped file in a mixed directory is NAMED on stderr (rc={rc})",
+              "broken.png" in errtxt)
 
     print("\nselftest: " + ("all passed" if ok else "FAILURES PRESENT"))
     return 0 if ok else 1
 
 
 def report_score(ref_path, cand_path, ref_px=None):
-    """The likeness score with no printing -- for selftest and ranking."""
+    """The likeness score with no printing -- for selftest and ranking.
+
+    Must compute the score exactly as report() does, structure factor included;
+    a quiet path that scores differently from the printing path is the same class
+    of defect as an option that is accepted and ignored.
+    """
     ref_px = load(ref_path) if ref_px is None else ref_px
-    return compare(ref_px, load(cand_path))[2]
+    return compare(ref_px, load(cand_path), structure(ref_path, cand_path))[2]
 
 
 def grid_compare_score(ref_path, cand_path, cols, rows, threshold):
@@ -507,13 +620,21 @@ def _main(argv):
         # accepts neither. Declaring the set per mode is what stops the
         # "accepted but unused" form of the original defect coming back.
         spatial = ("--cells", "--threshold")
-        cols, rows, thr = _take_opts(rest, () if mode == "--rank" else spatial)
+        # The region modes read their scores numerically rather than as a picture,
+        # so they default to a finer grid -- 64x36, which is what this file and
+        # AGENTS.md have always documented. The CLI previously defaulted them to
+        # 16x9 and then clamped any smaller --cells up to 8, so `--regions --cells
+        # 2x2`, `4x2` and `8x8` returned byte-identical output with no grid printed,
+        # and the documented default was not the one in force.
+        fine = mode in ("--locate", "--regions")
+        cols, rows, thr = _take_opts(rest, () if mode == "--rank" else spatial,
+                                     64 if fine else 16, 36 if fine else 9)
         if mode == "--rank":
             _need(rest, 2, "--rank REFERENCE DIR")
             ref, d = rest[0], rest[1]
             ref_px = load(ref)                     # loud if unreadable
             scored, failures = _scan_dir(d, lambda p: report(ref, p, ref_px))
-            print("\n=== ranked by likeness (sqrt(palette * hue recall)) ===")
+            print("\n=== ranked by likeness (sqrt(palette x hue/structure)) ===")
             for s, f in sorted(scored, key=lambda t: (-t[0], t[1])):
                 print(f"  {s:6.3f}  {f}")
             return _report_failures(failures, len(scored))
@@ -522,11 +643,13 @@ def _main(argv):
             ref, d = rest[0], rest[1]
             load_full(ref)                         # loud if unreadable
             found, failures = _scan_dir(
-                d, lambda p: region_match(ref, p, cols=max(cols, 8), rows=max(rows, 8),
+                d, lambda p: region_match(ref, p, cols=cols, rows=rows,
                                           threshold=thr, quiet=True))
             print(f"=== best-matching region of {os.path.basename(ref)} per surface "
-                  f"(tol={thr}, grid={max(cols,8)}x{max(rows,8)}) ===")
-            for (frac, name, mad), f in sorted(found, key=lambda t: -t[0][0])[:20]:
+                  f"(tol={thr}, grid={cols}x{rows}) ===")
+            # Tie-break on mean|d| ascending, so a flat fill that matches the same
+            # cell fraction cannot outrank a closer surface on filename order.
+            for (frac, name, mad), f in sorted(found, key=lambda t: (-t[0][0], t[0][2], t[1]))[:20]:
                 print(f"  {frac*100:5.1f}%  {name:<15} mean|d|={mad:6.1f}  {f}")
             return _report_failures(failures, len(found))
         if mode == "--grid":
@@ -536,7 +659,7 @@ def _main(argv):
             return 0
         _need(rest, 2, "--regions REFERENCE CANDIDATE")
         for c in rest[1:]:
-            region_match(rest[0], c, cols=max(cols, 8), rows=max(rows, 8), threshold=thr)
+            region_match(rest[0], c, cols=cols, rows=rows, threshold=thr)
         return 0
 
     rest = list(argv)

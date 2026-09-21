@@ -121,9 +121,19 @@ An independent review measured a plain grey gradient at **0.502** against a real
 frame, ranking third of eleven and above a real menu capture; the tool's own selftest
 now reproduces a worse case, a grey gradient matched to the reference's luminance
 range scoring **0.740** on palette alone and **0.000** on likeness. That is the
-project's recorded gradient trap, reproduced on the tool written to prevent it. When
-the *reference* is itself achromatic there is no hue evidence, so the score falls
-back to the palette term and the output line says `PALETTE ONLY` — read that label.
+project's recorded gradient trap, reproduced on the tool written to prevent it.
+
+**When the reference is itself achromatic, the second factor becomes STRUCTURE** —
+the Pearson correlation of the two downsampled luminance grids, clamped to 0..1 and
+defined as 0 when either image has no variance. The two factors are blended by how
+much chromatic mass the reference carries rather than switched at the boundary, so
+there is no cliff. This is the second version of that branch: the first fell back to
+the bare palette term, which **reopened the same defect one branch over** — on the
+committed *Little Nightmares III* title screen (0.00% chromatic; 32 of this
+repository's 190 screenshots are under the floor) an all-black candidate scored
+**0.968 and ranked third of six, above a real capture at 0.942**. With structure it
+scores **0.000** and ranks last, while the reference itself scores 1.000 and a real
+related capture 0.771. A flat fill has no luminance variance, so it cannot fake it.
 
 Five modes, in the order they are usually reached for:
 
@@ -173,7 +183,26 @@ whether a scene looks right. Two cautions learned while building it:
   the oracle's bottom half being located as "bottom third", a frame compared against
   itself reporting "top-right q" instead of "full", and each mode refusing the
   options it does not use. The arms are written so that reinstating the old
-  behaviour reddens a named case — verified by mutation, four for four.
+  behaviour reddens a named case — verified by mutation, **eight for eight**,
+  including reinstating the exact pre-review region algorithm rather than a
+  convenient substitute for it.
+
+  **That distinction is the lesson, and it cost a second rejection.** The first
+  round claimed "four for four" and it was false: the region mutation replaced the
+  reference crop with the whole reference, which is a *stronger* change that happens
+  to redden, while reinstating the algorithm actually under review left the suite
+  green. The fixture was two flat colour bands, and stretch-versus-crop is a no-op
+  on flat bands — the defect was structurally inexpressible, so the arm tested the
+  discriminator and not the domain. The fixture is now deliberately structured (a
+  gradient plus four differently-coloured blocks at four distinct positions); do not
+  simplify it. Three further arms were found to be unfallible the same way and were
+  replaced: the tie-break arm (a self-comparison has a unique winner once cropping
+  is correct, so only a flat-on-flat comparison actually ties), the `--cells` arm
+  (both values must sit below the old clamp or it maps them apart anyway), and the
+  skip-reporting arm (an all-corrupt directory exits non-zero whether or not skips
+  are recorded — it takes a *mixed* directory, where the run succeeds and stderr is
+  the only channel left). **When you add an arm, mutate the real defect and watch
+  that arm go red.**
 - **`--threshold` and `--cells` belong to the spatial modes only.** An early version
   dropped `--threshold` outside `--grid`; the repair was incomplete and a review
   found `--rank` still took no options at all while `--locate` accepted `--cells`
