@@ -1983,23 +1983,36 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     }
                     // Name WHICH representation is missing. A wave-mask op that cannot resolve
                     // an operand rejects the whole shader, and the reject line downstream says
-                    // only `mode=unresolved-operand` -- which cannot distinguish the three cases
-                    // that need three different repairs:
+                    // only `mode=unresolved-operand` -- which cannot distinguish these states,
+                    // and they point at different places to look:
                     //
-                    //   sreg_bool=0, sreg absent      the mask lifetime was lost UPSTREAM; the
-                    //                                 reject PC names where a fact was consumed,
-                    //                                 not where it went missing.
-                    //   sreg present, no_placeholders the words are proven -- a genuine
-                    //                                 scalar-pair projection is admissible.
-                    //   sreg present, placeholders    the words may be phi-fabricated zeros, and
-                    //                                 projecting them would produce an empty
-                    //                                 survivor mask: silently wrong pixels in
-                    //                                 place of a visible reject.
+                    //   sreg_bool=0, sreg absent     no representation reached here. Could be lost mask
+                    //                                provenance, ordinary scalar data never classified, or a
+                    //                                genuinely undefined register -- this line does not
+                    //                                distinguish them.
+                    //   sreg present, proven         the words are definitely assigned. Necessary for a
+                    //                                scalar-pair projection and NOT sufficient: the wave/lane
+                    //                                contract is a separate question this line is silent on.
+                    //   sreg present, unproven       definite assignment is unproven SOMEWHERE in this
+                    //                                shader. The flag is a broad state property -- it cannot
+                    //                                say which register, which predecessor or which dynamic
+                    //                                path carries a placeholder, so on its own it does not
+                    //                                convict these operands.
                     //
-                    // Sonic Frontiers' dropped HDR producer (#2790) is the third case, and it was
-                    // indistinguishable from the first two for a full investigation round. Ungated
-                    // and deduped like [mimg-unresolved] above: it fires only on a path that has
-                    // already failed, so its volume is bounded by the defect it reports.
+                    // So this narrows the question rather than answering it. In particular a missing
+                    // `sreg_bool` entry is compatible with the operand HAVING originated from EXEC/VCC and the
+                    // provenance having been dropped: absence here is not evidence the source was never a mask.
+                    //
+                    // Sonic Frontiers' dropped HDR producer (#2790) reports the third row, which was
+                    // indistinguishable from the other two for a full investigation round. Ungated and deduped
+                    // like [mimg-unresolved] above: it fires only on a path that has already
+                    // failed, so its volume is bounded by the defect it reports.
+                    //
+                    // Caveat on the dedup key, same shape as the one [mimg-unresolved] records:
+                    // it includes program_address, but `--retry-failed-stage` recompiles through
+                    // a standalone entry point where that field is 0. On THAT path two different
+                    // programs rejecting at the same (pc, operand) would print once, attributed
+                    // to neither. Live execution carries a real address and does not collide.
                     {
                         static std::mutex probe_mutex;
                         static std::set<std::tuple<uint64_t, uint32_t, int>> probe_reported;
