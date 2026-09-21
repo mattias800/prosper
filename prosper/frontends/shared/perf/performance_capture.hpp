@@ -131,6 +131,8 @@ struct RendererTimingRecord {
     uint64_t frontend_buffer_tracked_cache_fills = 0;
     uint64_t frontend_buffer_tracked_untracked_misses = 0;
     uint64_t frontend_buffer_reserved_state_queries = 0;
+    uint64_t frontend_buffer_compact_resources = 0;
+    uint64_t frontend_buffer_full_resources = 0;
     double frontend_tex_rtt_ms = 0;
     double frontend_tex_compute_ms = 0;
     double frontend_tex_local_ms = 0;

@@ -189,6 +189,8 @@ int main() {
         record.frontend_buffer_tracked_cache_fills = 4'294'967'296ULL + 1500 + i;
         record.frontend_buffer_tracked_untracked_misses = 4'294'967'296ULL + 1600 + i;
         record.frontend_buffer_reserved_state_queries = 4'294'967'296ULL + 1700 + i;
+        record.frontend_buffer_compact_resources = 4'294'967'296ULL + 1800 + i;
+        record.frontend_buffer_full_resources = 4'294'967'296ULL + 1900 + i;
         record.buffer_resident_hits = 4'294'967'296ull + 100 + i;
         record.buffer_resident_compared_bytes = 4'294'967'296ull + 200 + i;
         record.buffer_resident_reused_bytes = 4'294'967'296ull + 300 + i;
@@ -300,6 +302,10 @@ int main() {
                        "tracked untracked misses preserve distinct 64-bit values and the renderer cap");
     check_counter_pair("frontend_buffer_reserved_state_queries", 4'294'968'996ULL,
                        "numeric fallback queries preserve distinct 64-bit values and the renderer cap");
+    check_counter_pair("frontend_buffer_compact_resources", 4'294'969'096ULL,
+                       "compact buffer carriers preserve distinct 64-bit values and the renderer cap");
+    check_counter_pair("frontend_buffer_full_resources", 4'294'969'196ULL,
+                       "full buffer carriers preserve distinct 64-bit values and the renderer cap");
     check(count_text(text, "\"buffer_resident_hits\":") == 2 &&
               text.find("\"buffer_resident_hits\":4294967396,") != std::string::npos &&
               text.find("\"buffer_resident_hits\":4294967397,") != std::string::npos &&

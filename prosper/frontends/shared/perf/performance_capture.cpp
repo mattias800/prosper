@@ -487,6 +487,10 @@ void InteractivePerformanceCapture::publish_completed(std::unique_ptr<PendingCap
                 << record.frontend_buffer_tracked_untracked_misses
                 << ",\"frontend_buffer_reserved_state_queries\":"
                 << record.frontend_buffer_reserved_state_queries
+                << ",\"frontend_buffer_compact_resources\":"
+                << record.frontend_buffer_compact_resources
+                << ",\"frontend_buffer_full_resources\":"
+                << record.frontend_buffer_full_resources
                 << ",\"frontend_tex_rtt_ms\":" << record.frontend_tex_rtt_ms
                 << ",\"frontend_tex_compute_ms\":" << record.frontend_tex_compute_ms
                 << ",\"frontend_tex_local_ms\":" << record.frontend_tex_local_ms

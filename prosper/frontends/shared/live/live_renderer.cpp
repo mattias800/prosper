@@ -2283,6 +2283,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 uint64_t color_target_sample_hits = 0, color_target_readbacks = 0;
                 uint64_t color_target_cached_bytes = 0, color_target_cached_entries = 0;
                 uint64_t textures = 0, texture_reuses = 0, buffers = 0, buffer_views = 0;
+                uint64_t compact_buffer_resources = 0, full_buffer_resources = 0;
                 BufferSourceGateCounters buffer_source_gate;
                 uint64_t persistent_hits = 0, persistent_misses = 0, persistent_invalidations = 0;
                 uint64_t persistent_submit_reuses = 0, persistent_validations = 0;
@@ -3025,10 +3026,26 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             };
             static thread_local std::unordered_map<uint64_t, ReflectMemoEntry> reflect_memo;
             constexpr size_t kReflectMemoMaxEntries = 4096;
+            // Read once per submit. Poison mode mutates the completed resource vector, so it keeps
+            // the compatibility representation where every resource is a FrameResource. Ordinary
+            // rendering stores buffers in the compact carrier and records their original order.
+            const char* const descriptor_validate_mode = getenv("PROSPER_DESCRIPTOR_VALIDATE");
+            const bool compact_buffer_resources =
+                getenv("PROSPER_NO_COMPACT_BUFFER_RESOURCES") == nullptr &&
+                (!descriptor_validate_mode || strcmp(descriptor_validate_mode, "poison") != 0);
+            struct BuiltFrameResources {
+                std::vector<prosper::test::FrameResource> full;
+                std::vector<prosper::test::FrameBufferResource> buffers;
+                // High bit selects buffers; remaining bits index the selected vector. Present only
+                // for the split representation, so the compatibility arm remains byte-for-byte in
+                // the resource order it used before.
+                std::vector<uint32_t> order;
+            };
+            constexpr uint32_t kCompactBufferResourceBit = 0x80000000u;
             auto build_R = [&](const prosper::gpu::DrawItem& draw,
                                const prosper::gpu::ShaderResourceTable* vrt,
                                const prosper::gpu::ShaderResourceTable* prt) {
-              std::vector<prosper::test::FrameResource> R;
+              BuiltFrameResources built;
               auto add = [&](const prosper::gpu::ShaderResourceTable* t, uint32_t set,
                              const std::vector<uint32_t>& spirv,
                              prosper::gpu::SpirvShaderStage stage,
@@ -3158,12 +3175,15 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     bool resource_has_ds_live = false;
                     bool resource_persistent_candidate = false;
                     size_t resource_persistent_source_size = 0;
-                    prosper::test::FrameResource fr; fr.binding = r.binding; fr.set = set;
-                    fr.is_storage_image = r.cls == RC::StorageImage;
-                    fr.storage_image_numeric_class = reflected_binding->image_numeric_class;
-                    fr.storage_image_contract_valid = !fr.is_storage_image ||
-                        reflected_binding->image_numeric_class !=
-                            prosper::gpu::SpirvImageNumericClass::Unknown;
+                    const bool image_resource = r.cls == RC::Texture || r.cls == RC::StorageImage;
+                    std::optional<prosper::test::FrameResource> full_resource;
+                    prosper::test::FrameBufferResource compact_resource;
+                    if (image_resource || !compact_buffer_resources) full_resource.emplace();
+                    prosper::test::FrameBufferResource& buffer_resource = full_resource
+                        ? static_cast<prosper::test::FrameBufferResource&>(*full_resource)
+                        : compact_resource;
+                    buffer_resource.binding = r.binding;
+                    buffer_resource.set = set;
                     const bool normalized_sampling =
                         reflected_binding->kind ==
                             prosper::gpu::SpirvDescriptorKind::CombinedImageSampler &&
@@ -3270,7 +3290,13 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         std::memcpy(dst, r.dcc_metadata_host_data, take);
                         return take;
                     };
-                    if (r.cls == RC::Texture || r.cls == RC::StorageImage) {
+                    if (image_resource) {
+                        auto& fr = *full_resource;
+                        fr.is_storage_image = r.cls == RC::StorageImage;
+                        fr.storage_image_numeric_class = reflected_binding->image_numeric_class;
+                        fr.storage_image_contract_valid = !fr.is_storage_image ||
+                            reflected_binding->image_numeric_class !=
+                                prosper::gpu::SpirvImageNumericClass::Unknown;
                         uint32_t tw = r.width ? r.width : 4, th = r.height ? r.height : 4;
                         // AvPlayer exposes NV12 as an R8 luma plane followed by an RG8 UV plane.
                         // Which resource IS that chroma plane — and why a candidate was rejected —
@@ -7678,6 +7704,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         if (PROSPER_ENV_ON("PROSPER_ALPHA1")) fr.swizzle[3] = 1;
                         }
                     } else {
+                        auto& fr = buffer_resource;
                         fr.buffer_identity = r.gpu_addr;
                         const prosper::gpu::StorageBufferMaterializationPlan materialization =
                             prosper::gpu::plan_storage_buffer_materialization(
@@ -7888,7 +7915,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     if (timing_enabled) {
                         const double elapsed = std::chrono::duration<double, std::milli>(
                             RenderClock::now() - resource_timing_start).count();
-                        if (fr.is_texture()) {
+                        if (image_resource) {
+                            const auto& image = *full_resource;
                             // Classified in the SAME order the path decides them, and exclusively:
                             // a reference satisfied by an earlier class never reaches a later one,
                             // so every reference lands in exactly one bucket or in `other`. The
@@ -7931,9 +7959,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 }
                             }
                             pending_timing.textures++;
-                            pending_timing.texture_bytes += static_cast<uint64_t>(fr.tw) * fr.th * fr.td *
-                                fr.sample_count *
-                                prosper::test::backend_color_bytes_per_pixel(fr.texture_format);
+                            pending_timing.texture_bytes += static_cast<uint64_t>(image.tw) *
+                                image.th * image.td * image.sample_count *
+                                prosper::test::backend_color_bytes_per_pixel(image.texture_format);
                             pending_timing.texture_ms += elapsed;
                             const uint64_t detail_min_submit = PROSPER_ENV_VALUE("PROSPER_RENDER_TIMING_DETAIL_MIN_SUBMIT")
                                 ? strtoull(PROSPER_ENV_VALUE("PROSPER_RENDER_TIMING_DETAIL_MIN_SUBMIT"), nullptr, 0) : 0;
@@ -7994,10 +8022,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                             "submit=%s watch=%s active=%d disabled=%d only=%d stable=%u "
                                             "total=%.2f ms\n",
                                             (unsigned long long)r.gpu_addr, r.width, r.height,
-                                            r.depth, fr.tw, fr.th, fr.td, r.img_dim,
+                                            r.depth, image.tw, image.th, image.td, r.img_dim,
                                             (unsigned)r.format, r.num_components,
                                             r.tile_mode, static_cast<unsigned>(r.cls),
-                                            static_cast<int>(fr.is_storage_image),
+                                            static_cast<int>(image.is_storage_image),
                                             static_cast<int>(r.host_data != nullptr),
                                             static_cast<int>(resource_has_live_rtt),
                                             static_cast<int>(resource_has_ds_live),
@@ -8007,7 +8035,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                             static_cast<int>(r.depth_compare),
                                             static_cast<int>(resource_compute_image_candidate),
                                             cache_state,
-                                            (unsigned long long)fr.persistent_texture_id,
+                                            (unsigned long long)image.persistent_texture_id,
                                             resource_texture_exact_validation ? "exact" : "skip",
                                             resource_texture_validation_ms,
                                             resource_texture_validated_bytes,
@@ -8021,7 +8049,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 }
                             }
                         } else {
-                            const size_t buffer_bytes = fr.buffer_word_count() * sizeof(uint32_t);
+                            const size_t buffer_bytes =
+                                buffer_resource.buffer_word_count() * sizeof(uint32_t);
                             pending_timing.buffers++;
                             pending_timing.buffer_views += resource_buffer_view;
                             pending_timing.buffer_bytes += buffer_bytes;
@@ -8030,7 +8059,19 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             pending_timing.buffer_ms += elapsed;
                         }
                     }
-                    R.push_back(std::move(fr));
+                    if (full_resource) {
+                        const uint32_t index = static_cast<uint32_t>(built.full.size());
+                        built.full.push_back(std::move(*full_resource));
+                        if (compact_buffer_resources) built.order.push_back(index);
+                    } else {
+                        const uint32_t index = static_cast<uint32_t>(built.buffers.size());
+                        built.buffers.push_back(std::move(compact_resource));
+                        built.order.push_back(kCompactBufferResourceBit | index);
+                    }
+                    if (timing_enabled && !image_resource) {
+                        if (compact_buffer_resources) ++pending_timing.compact_buffer_resources;
+                        else ++pending_timing.full_buffer_resources;
+                    }
                 }
               };
               add(vrt, 0, draw.vs_words(), prosper::gpu::SpirvShaderStage::Vertex,
@@ -8038,7 +8079,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
               add(prt, 1, draw.fs_words(), prosper::gpu::SpirvShaderStage::Fragment,
                   draw.fs_identity);
               // VS resources -> descriptor set 0, PS -> set 1
-              return R;
+              return built;
             };
             // Poison mode keeps the draw running while making invalid bindings visually/numerically
             // unmistakable: magenta/cyan texels for images and NaN-like dwords for buffers. Missing,
@@ -8054,7 +8095,6 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             // tests would not fail -- they would go VACUOUS and keep printing [ok] against a stale
             // value, which is the #2214 defect that `cached_env_arming_logic` now gates. A per-submit
             // hoist keeps every runtime write observable from the next submit on.
-            const char* const descriptor_validate_mode = getenv("PROSPER_DESCRIPTOR_VALIDATE");
             auto poison_R = [descriptor_validate_mode](
                                std::vector<prosper::test::FrameResource>& resources,
                                const std::vector<uint32_t>& spirv,
@@ -8293,7 +8333,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     // this bucket at 2,100 draws a submit. It inflates what it measures while
                     // armed, as every timer here does; read the shares, not the totals.
                     const auto bt0 = timing_enabled ? RenderClock::now() : RenderClock::time_point{};
-                    bd.R      = build_R(it, it.vrt.get(), it.prt.get());
+                    auto built_resources = build_R(it, it.vrt.get(), it.prt.get());
+                    bd.R = std::move(built_resources.full);
+                    bd.B = std::move(built_resources.buffers);
+                    bd.resource_order = std::move(built_resources.order);
                     const auto bt1 = timing_enabled ? RenderClock::now() : RenderClock::time_point{};
                     // && of the positives rather than || of the negations: identical short-circuit
                     // and identical outcome, but it puts the accounting below on a path the
@@ -8345,7 +8388,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     }
                     if (gfxlog) fprintf(stderr,
                         "[render] item %zu: %zu resources vcount=%u instances=%u nidx=%zu topo=%u mask=0x%x blend=%d\n",
-                        bds.size(), bd.R.size(), bd.vcount, bd.instance_count, bd.indices.size(), it.ps.topology,
+                        bds.size(), bd.R.size() + bd.B.size(), bd.vcount, bd.instance_count,
+                        bd.indices.size(), it.ps.topology,
                         it.ps.color_write_mask, (int)it.ps.blend_enable);
                     // RTTLOG per-draw detail (render-window-only, unlike the GFXLOG firehose): enough
                     // state to diagnose a pass whose inputs HIT the RTT cache yet outputs nothing —
@@ -8399,8 +8443,24 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         const uint32_t* heads_words = nullptr; size_t heads_count = 0;
                         const uint32_t* rec_words = nullptr;   size_t rec_count = 0;
                         size_t buffers_seen = 0;
-                        for (const auto& fr : bd.R) {
-                            if (fr.is_texture() || fr.is_storage_image) continue;
+                        std::vector<const prosper::test::FrameBufferResource*> link_resources;
+                        link_resources.reserve(bd.R.size() + bd.B.size());
+                        if (bd.resource_order.empty()) {
+                            for (const auto& fr : bd.R)
+                                if (!fr.is_texture() && !fr.is_storage_image)
+                                    link_resources.push_back(&fr);
+                            for (const auto& fr : bd.B) link_resources.push_back(&fr);
+                        } else {
+                            for (uint32_t token : bd.resource_order) {
+                                const bool compact = (token & kCompactBufferResourceBit) != 0;
+                                const uint32_t index = token & ~kCompactBufferResourceBit;
+                                if (compact) link_resources.push_back(&bd.B[index]);
+                                else if (!bd.R[index].is_texture() && !bd.R[index].is_storage_image)
+                                    link_resources.push_back(&bd.R[index]);
+                            }
+                        }
+                        for (const auto* fr_ptr : link_resources) {
+                            const auto& fr = *fr_ptr;
                             const uint32_t* words = fr.buffer_words_data();
                             const size_t nwords = fr.buffer_word_count();
                             if (!words || nwords == 0) continue;
@@ -11129,6 +11189,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         pending_timing.buffer_source_gate.tracked_untracked_misses;
                     record.frontend_buffer_reserved_state_queries =
                         pending_timing.buffer_source_gate.reserved_state_queries;
+                    record.frontend_buffer_compact_resources =
+                        pending_timing.compact_buffer_resources;
+                    record.frontend_buffer_full_resources =
+                        pending_timing.full_buffer_resources;
                     record.frontend_tex_rtt_ms = pending_timing.tex_rtt_ms;
                     record.frontend_tex_compute_ms = pending_timing.tex_compute_ms;
                     record.frontend_tex_local_ms = pending_timing.tex_local_ms;
@@ -11265,6 +11329,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     uint64_t color_target_sample_hits = 0, color_target_readbacks = 0;
                     uint64_t color_target_cached_bytes = 0, color_target_cached_entries = 0;
                     uint64_t textures = 0, texture_reuses = 0, buffers = 0, buffer_views = 0;
+                    uint64_t compact_buffer_resources = 0, full_buffer_resources = 0;
                     BufferSourceGateCounters buffer_source_gate;
                     uint64_t persistent_hits = 0, persistent_misses = 0, persistent_invalidations = 0;
                     uint64_t persistent_submit_reuses = 0, persistent_validations = 0;
@@ -11419,6 +11484,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     timing.persistent_watch_disabled += pending_timing.persistent_watch_disabled;
                     timing.buffers += pending_timing.buffers;
                     timing.buffer_views += pending_timing.buffer_views;
+                    timing.compact_buffer_resources += pending_timing.compact_buffer_resources;
+                    timing.full_buffer_resources += pending_timing.full_buffer_resources;
                     timing.buffer_source_gate.add(pending_timing.buffer_source_gate);
                     timing.texture_bytes += pending_timing.texture_bytes;
                     timing.buffer_bytes += pending_timing.buffer_bytes;
