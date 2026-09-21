@@ -479,6 +479,14 @@ void InteractivePerformanceCapture::publish_completed(std::unique_ptr<PendingCap
                 << ",\"backend_pipeline_evictions\":" << record.backend_pipeline_evictions
                 << ",\"frontend_texture_ms\":" << record.frontend_texture_ms
                 << ",\"frontend_buffer_ms\":" << record.frontend_buffer_ms
+                << ",\"frontend_buffer_tracked_cache_hits\":"
+                << record.frontend_buffer_tracked_cache_hits
+                << ",\"frontend_buffer_tracked_cache_fills\":"
+                << record.frontend_buffer_tracked_cache_fills
+                << ",\"frontend_buffer_tracked_untracked_misses\":"
+                << record.frontend_buffer_tracked_untracked_misses
+                << ",\"frontend_buffer_reserved_state_queries\":"
+                << record.frontend_buffer_reserved_state_queries
                 << ",\"frontend_tex_rtt_ms\":" << record.frontend_tex_rtt_ms
                 << ",\"frontend_tex_compute_ms\":" << record.frontend_tex_compute_ms
                 << ",\"frontend_tex_local_ms\":" << record.frontend_tex_local_ms

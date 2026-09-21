@@ -243,6 +243,40 @@ class PerformanceCaptureReportTests(unittest.TestCase):
         self.assertIn("transferred=3072B", lines[0])
         self.assertIn("excludes guest reads and GPU uploads", lines[0])
 
+    def test_buffer_source_gate_requires_a_complete_population(self):
+        row = {"frontend_buffer_tracked_cache_hits": 2**40 + 5,
+               "frontend_buffer_tracked_cache_fills": 3,
+               "frontend_buffer_tracked_untracked_misses": 4,
+               "frontend_buffer_reserved_state_queries": 7}
+        summary = summarize(capture(SAMPLES, renderer=[row, row]))
+        gate = summary["resource_breakdown"]
+        self.assertTrue(gate["buffer_source_gate_available"])
+        self.assertEqual(gate["buffer_source_gate"], {
+            "tracked_cache_hits": 2**41 + 10,
+            "tracked_cache_fills": 6,
+            "tracked_untracked_misses": 8,
+            "reserved_state_queries": 14,
+        })
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            print_summary(summary)
+        self.assertIn("buffer source gate: cache_hits=2199023255562 fills=6"
+                      " untracked_misses=8 numeric_queries=14",
+                      output.getvalue())
+
+        partial = dict(row)
+        del partial["frontend_buffer_reserved_state_queries"]
+        mixed = summarize(capture(SAMPLES, renderer=[row, partial]))["resource_breakdown"]
+        self.assertFalse(mixed["buffer_source_gate_available"])
+        self.assertNotIn("buffer_source_gate", mixed)
+
+        legacy = summarize(capture(SAMPLES, renderer=[{}]))
+        self.assertFalse(legacy["resource_breakdown"]["buffer_source_gate_available"])
+        legacy_output = io.StringIO()
+        with contextlib.redirect_stdout(legacy_output):
+            print_summary(legacy)
+        self.assertIn("buffer source gate: UNAVAILABLE", legacy_output.getvalue())
+
     def test_gpu_detile_population_preserves_missing_and_integer_bytes(self):
         row = {"frontend_gpu_detile_preparations": 5,
                "frontend_gpu_detile_2d_preparations": 3,

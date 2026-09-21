@@ -124,6 +124,13 @@ struct RendererTimingRecord {
     // residue -- I published one (#2215) before noticing, so the names now say which layer they are.
     double frontend_texture_ms = 0;
     double frontend_buffer_ms = 0;
+    // Admission to the buffer source path. Warm hits avoid the authoritative mapping lock/search;
+    // fills and untracked misses expose the exact cold population. An untracked miss retains the
+    // signal-facing numeric query because POSIX AMM state is outside the tracked map.
+    uint64_t frontend_buffer_tracked_cache_hits = 0;
+    uint64_t frontend_buffer_tracked_cache_fills = 0;
+    uint64_t frontend_buffer_tracked_untracked_misses = 0;
+    uint64_t frontend_buffer_reserved_state_queries = 0;
     double frontend_tex_rtt_ms = 0;
     double frontend_tex_compute_ms = 0;
     double frontend_tex_local_ms = 0;

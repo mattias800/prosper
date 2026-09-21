@@ -2284,6 +2284,12 @@ endif()
   target_link_libraries(test_guest_memory_map PRIVATE prosper_core)
   add_test(NAME guest_memory_map COMMAND test_guest_memory_map)
 
+  add_executable(test_renderer_tracked_mapping_cache
+                 tests/hle/memory/test_renderer_tracked_mapping_cache.cpp)
+  target_include_directories(test_renderer_tracked_mapping_cache PRIVATE frontends)
+  target_link_libraries(test_renderer_tracked_mapping_cache PRIVATE prosper_core)
+  add_test(NAME renderer_tracked_mapping_cache COMMAND test_renderer_tracked_mapping_cache)
+
   add_executable(test_guest_memory_query tests/host/memory/test_guest_memory_query.cpp)
   target_link_libraries(test_guest_memory_query PRIVATE prosper_core)
   add_test(NAME guest_memory_query COMMAND test_guest_memory_query)
