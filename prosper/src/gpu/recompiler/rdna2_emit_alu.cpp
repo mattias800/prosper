@@ -18,6 +18,7 @@
 #include <cstdarg>
 #include <cstring>
 #include <cstdio>
+#include <type_traits>
 #include <cstdlib>
 #include <functional>
 #include <map>
@@ -2018,25 +2019,29 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         static std::set<std::tuple<uint64_t, uint32_t, int>> probe_reported;
                         bool first = false;
                         {
-                            std::lock_guard<std::mutex> lock(probe_mutex);
+                            std::lock_guard lock(probe_mutex);
                             first = probe_reported.emplace(b.diagnostic.program_address, in.pc,
                                                            o.value).second;
                         }
+                        const char* stage_name = b.is_compute  ? "compute"
+                                               : b.is_fragment ? "fragment"
+                                                               : "vertex";
                         if (first)
                             std::fprintf(stderr,
-                                "[wave-mask-unresolved] program=0x%llx pc=%u operand=%d kind=%d "
+                                "[wave-mask-unresolved] program=0x%llx pc=%u operand=%d kind=%u "
                                 "sreg_bool=%d sreg=%d/%d sreg_input=%d/%d "
                                 "no_placeholders=%d stage=%s wave=%u native_sg=%u\n",
-                                (unsigned long long)b.diagnostic.program_address,
-                                in.pc, o.value, (int)o.kind,
-                                (int)(rs.sreg_bool.find(o.value) != rs.sreg_bool.end()),
-                                (int)(rs.sreg.find(o.value) != rs.sreg.end()),
-                                (int)(rs.sreg.find(o.value + 1) != rs.sreg.end()),
-                                (int)(rs.sreg_input.find(o.value) != rs.sreg_input.end()),
-                                (int)(rs.sreg_input.find(o.value + 1) != rs.sreg_input.end()),
-                                (int)rs.scalar_presence_has_no_placeholders,
-                                b.is_compute ? "compute" : b.is_fragment ? "fragment" : "vertex",
-                                b.wave_size, b.native_subgroup_size);
+                                static_cast<unsigned long long>(b.diagnostic.program_address),
+                                in.pc, o.value,
+                                static_cast<unsigned>(
+                                    static_cast<std::underlying_type_t<OperandKind>>(o.kind)),
+                                static_cast<int>(rs.sreg_bool.contains(o.value)),
+                                static_cast<int>(rs.sreg.contains(o.value)),
+                                static_cast<int>(rs.sreg.contains(o.value + 1)),
+                                static_cast<int>(rs.sreg_input.contains(o.value)),
+                                static_cast<int>(rs.sreg_input.contains(o.value + 1)),
+                                static_cast<int>(rs.scalar_presence_has_no_placeholders),
+                                stage_name, b.wave_size, b.native_subgroup_size);
                     }
                     return 0;
                 };
