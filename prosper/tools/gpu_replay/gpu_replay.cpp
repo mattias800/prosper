@@ -3330,6 +3330,12 @@ int main(int argc, char** argv) {
                 spirv = prosper::gpu::recompile_fragment(
                     raw.words.data(), raw.words.size(), resources,
                     /*system_inputs=*/nullptr, /*pcrel_dispatch_target=*/UINT32_MAX,
+                    // `wave32=false` is this tool's DEFAULT, not the draw's wave size, and it
+                    // is not recoverable here: GpuCapturedStageDiagnostic records no wave size for
+                    // a graphics stage, and `ps_wave32` lives on RenderState rather than on the
+                    // captured pipeline state. So `wave=64` in any diagnostic printed from a retry
+                    // is an artefact of this line -- do not quote it as a measurement, and treat
+                    // any wave-size-dependent conclusion drawn from a retry as void.
                     /*interpolation=*/nullptr, /*wave32=*/false,
                     {prosper::gpu::RecompileDiagnosticStage::Fragment, stage.program_addr});
                 break;

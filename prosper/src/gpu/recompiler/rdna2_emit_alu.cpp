@@ -2006,7 +2006,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     //
                     // Sonic Frontiers' dropped HDR producer (#2790) reports the third row, which was
                     // indistinguishable from the other two for a full investigation round. Ungated and deduped
-                    // like [mimg-unresolved] above: it fires only on a path that has already
+                    // like [mimg-unresolved] (further down this file): it fires only on a path that has already
                     // failed, so its volume is bounded by the defect it reports.
                     //
                     // The dedup key includes program_address, which matters: every shader has a
@@ -2021,8 +2021,12 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         bool first = false;
                         {
                             std::lock_guard lock(probe_mutex);
-                            first = probe_reported.emplace(b.diagnostic.program_address, in.pc,
-                                                           o.value).second;
+                            // Capped like divloop_reject's set: a long-lived process compiling many
+                            // shaders must not grow this without bound. Past the cap the diagnostic
+                            // goes quiet rather than the set growing.
+                            if (probe_reported.size() < 4096)
+                                first = probe_reported.emplace(b.diagnostic.program_address, in.pc,
+                                                               o.value).second;
                         }
                         const char* stage_name = b.is_compute  ? "compute"
                                                : b.is_fragment ? "fragment"
