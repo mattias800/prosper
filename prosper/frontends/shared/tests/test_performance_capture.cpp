@@ -185,6 +185,10 @@ int main() {
         record.buffer_range_bindings = 4'294'967'296ull + 1100 + i;
         record.buffer_range_upload_bytes = 4'294'967'296ull + 1200 + i;
         record.buffer_range_bound_bytes = 4'294'967'296ull + 1300 + i;
+        record.frontend_buffer_tracked_cache_hits = 4'294'967'296ULL + 1400 + i;
+        record.frontend_buffer_tracked_cache_fills = 4'294'967'296ULL + 1500 + i;
+        record.frontend_buffer_tracked_untracked_misses = 4'294'967'296ULL + 1600 + i;
+        record.frontend_buffer_reserved_state_queries = 4'294'967'296ULL + 1700 + i;
         record.buffer_resident_hits = 4'294'967'296ull + 100 + i;
         record.buffer_resident_compared_bytes = 4'294'967'296ull + 200 + i;
         record.buffer_resident_reused_bytes = 4'294'967'296ull + 300 + i;
@@ -278,6 +282,24 @@ int main() {
               text.find("\"buffer_range_bound_bytes\":4294968596,") != std::string::npos &&
               text.find("\"buffer_range_bound_bytes\":4294968597,") != std::string::npos,
           "buffer_range_bound_bytes preserves distinct 64-bit values and the renderer cap");
+    const auto check_counter_pair = [&](const char* name, uint64_t first,
+                                        const char* description) {
+        const std::string field = std::string{"\""} + name + "\":";
+        const std::string first_value = field + std::to_string(first) + ",";
+        const std::string second_value = field + std::to_string(first + 1) + ",";
+        check(count_text(text, field) == 2 &&
+                  text.find(first_value) != std::string::npos &&
+                  text.find(second_value) != std::string::npos,
+              description);
+    };
+    check_counter_pair("frontend_buffer_tracked_cache_hits", 4'294'968'696ULL,
+                       "tracked cache hits preserve distinct 64-bit values and the renderer cap");
+    check_counter_pair("frontend_buffer_tracked_cache_fills", 4'294'968'796ULL,
+                       "tracked cache fills preserve distinct 64-bit values and the renderer cap");
+    check_counter_pair("frontend_buffer_tracked_untracked_misses", 4'294'968'896ULL,
+                       "tracked untracked misses preserve distinct 64-bit values and the renderer cap");
+    check_counter_pair("frontend_buffer_reserved_state_queries", 4'294'968'996ULL,
+                       "numeric fallback queries preserve distinct 64-bit values and the renderer cap");
     check(count_text(text, "\"buffer_resident_hits\":") == 2 &&
               text.find("\"buffer_resident_hits\":4294967396,") != std::string::npos &&
               text.find("\"buffer_resident_hits\":4294967397,") != std::string::npos &&

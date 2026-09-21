@@ -18,6 +18,7 @@
 #include "shared/texture/write_watch_policy.hpp"
 #include "shared/texture/validation_census.hpp"
 #include "shared/live/live_compute.hpp"
+#include "shared/live/buffer_source_gate.hpp"
 #include "shared/live/texture_source_snapshot.hpp"
 #include "shared/live/depth_cube_source_snapshot.hpp"
 #include "shared/live/decode_scratch.hpp"     // pooled full-surface decode intermediates
@@ -2281,6 +2282,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 uint64_t color_target_sample_hits = 0, color_target_readbacks = 0;
                 uint64_t color_target_cached_bytes = 0, color_target_cached_entries = 0;
                 uint64_t textures = 0, texture_reuses = 0, buffers = 0, buffer_views = 0;
+                BufferSourceGateCounters buffer_source_gate;
                 uint64_t persistent_hits = 0, persistent_misses = 0, persistent_invalidations = 0;
                 uint64_t persistent_submit_reuses = 0, persistent_validations = 0;
                 uint64_t persistent_validation_bytes = 0;
@@ -2933,6 +2935,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             decode_scope_submit = g_this_submit;
             const bool use_direct_buffer_views =
                 PROSPER_ENV_VALUE("PROSPER_NO_FRONTEND_BUFFER_VIEW") == nullptr;
+            static const bool use_tracked_buffer_membership_cache =
+                PROSPER_ENV_VALUE("PROSPER_NO_TRACKED_BUFFER_GATE") == nullptr;
             static std::unordered_map<TextureDecodeKey, PersistentDecodedTexture, TextureDecodeKeyHash>
                 persistent_decoded_textures;
             static size_t persistent_decoded_texture_bytes = 0;
@@ -7763,9 +7767,14 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         // descriptor's potentially corrupt declared size; robust buffer access makes
                         // accesses beyond this minimum zero as well. Static reflection tells us how
                         // much in-bounds storage the shader can definitely address.
-                        const bool unavailable_guest_buffer = !r.host_data &&
-                            (r.gpu_addr < 0x1000 ||
-                             prosper_reserved_range_state(r.gpu_addr) == 0);
+                        const BufferSourceGateResult source_gate = classify_buffer_source(
+                            r.host_data != nullptr, r.gpu_addr,
+                            use_tracked_buffer_membership_cache,
+                            prosper_renderer_guest_address_tracked,
+                            prosper_reserved_range_state);
+                        const bool unavailable_guest_buffer = source_gate.unavailable;
+                        if (timing_enabled)
+                            pending_timing.buffer_source_gate.record(source_gate);
                         if (materialization.zero_padded_tail) {
                             uint8_t logical[2] = {};
                             const uint8_t* logical_source = nullptr;
@@ -11076,6 +11085,14 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     // texture/buffer time and are NOT parts of setup_resources_ms above.
                     record.frontend_texture_ms = pending_timing.texture_ms;
                     record.frontend_buffer_ms = pending_timing.buffer_ms;
+                    record.frontend_buffer_tracked_cache_hits =
+                        pending_timing.buffer_source_gate.tracked_cache_hits;
+                    record.frontend_buffer_tracked_cache_fills =
+                        pending_timing.buffer_source_gate.tracked_cache_fills;
+                    record.frontend_buffer_tracked_untracked_misses =
+                        pending_timing.buffer_source_gate.tracked_untracked_misses;
+                    record.frontend_buffer_reserved_state_queries =
+                        pending_timing.buffer_source_gate.reserved_state_queries;
                     record.frontend_tex_rtt_ms = pending_timing.tex_rtt_ms;
                     record.frontend_tex_compute_ms = pending_timing.tex_compute_ms;
                     record.frontend_tex_local_ms = pending_timing.tex_local_ms;
@@ -11212,6 +11229,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     uint64_t color_target_sample_hits = 0, color_target_readbacks = 0;
                     uint64_t color_target_cached_bytes = 0, color_target_cached_entries = 0;
                     uint64_t textures = 0, texture_reuses = 0, buffers = 0, buffer_views = 0;
+                    BufferSourceGateCounters buffer_source_gate;
                     uint64_t persistent_hits = 0, persistent_misses = 0, persistent_invalidations = 0;
                     uint64_t persistent_submit_reuses = 0, persistent_validations = 0;
                     uint64_t persistent_validation_bytes = 0;
@@ -11365,6 +11383,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     timing.persistent_watch_disabled += pending_timing.persistent_watch_disabled;
                     timing.buffers += pending_timing.buffers;
                     timing.buffer_views += pending_timing.buffer_views;
+                    timing.buffer_source_gate.add(pending_timing.buffer_source_gate);
                     timing.texture_bytes += pending_timing.texture_bytes;
                     timing.buffer_bytes += pending_timing.buffer_bytes;
                     timing.buffer_materialized_bytes += pending_timing.buffer_materialized_bytes;
@@ -11652,13 +11671,17 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             totals.color_target_cached_bytes / (1024.0 * 1024.0));
                     fprintf(stderr,
                             "[render-timing] resources textures=%llu reused=%llu %.1f MiB %.2f ms/submit; "
-                            "buffers=%llu views=%llu logical=%.1f MiB materialized=%.1f MiB "
-                            "%.2f ms/submit\n",
+                            "buffers=%llu views=%llu gate=%llu/%llu/%llu/%llu logical=%.1f MiB "
+                            "materialized=%.1f MiB %.2f ms/submit\n",
                             (unsigned long long)totals.textures,
                             (unsigned long long)totals.texture_reuses,
                             totals.texture_bytes / (1024.0 * 1024.0), totals.texture_ms / nsub,
                             (unsigned long long)totals.buffers,
                             (unsigned long long)totals.buffer_views,
+                            (unsigned long long)totals.buffer_source_gate.tracked_cache_hits,
+                            (unsigned long long)totals.buffer_source_gate.tracked_cache_fills,
+                            (unsigned long long)totals.buffer_source_gate.tracked_untracked_misses,
+                            (unsigned long long)totals.buffer_source_gate.reserved_state_queries,
                             totals.buffer_bytes / (1024.0 * 1024.0),
                             totals.buffer_materialized_bytes / (1024.0 * 1024.0),
                             totals.buffer_ms / nsub);
@@ -11950,6 +11973,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             "output_copy=%.2f other=%.2f dcc=%.2f/%0.2f/%.1fMiB; "
                             "resources textures=%.1f "
                             "reused=%.1f %.1f MiB %.2f ms buffers=%.1f views=%.1f "
+                            "gate=%.1f/%.1f/%.1f/%.1f "
                             "logical=%.1f MiB materialized=%.1f MiB %.2f ms\n",
                             (unsigned long long)window.submits, window.callbacks / wn,
                             window.total_ms / wn, window.prelude_ms / wn,
@@ -11962,6 +11986,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             window.texture_reuses / wn,
                             window.texture_bytes / (wn * 1024.0 * 1024.0), window.texture_ms / wn,
                             window.buffers / wn, window.buffer_views / wn,
+                            window.buffer_source_gate.tracked_cache_hits / wn,
+                            window.buffer_source_gate.tracked_cache_fills / wn,
+                            window.buffer_source_gate.tracked_untracked_misses / wn,
+                            window.buffer_source_gate.reserved_state_queries / wn,
                             window.buffer_bytes / (wn * 1024.0 * 1024.0),
                             window.buffer_materialized_bytes / (wn * 1024.0 * 1024.0),
                             window.buffer_ms / wn);

@@ -17,6 +17,8 @@
 #include "diagnostics/env_numeric.hpp"   // #3267: -1 here overflowed the MiB multiply
 #include "hle/memory/dmem_caller_chain.hpp"
 #include "hle/memory/guest_memory_topology.hpp"
+#include "hle/memory/renderer_tracked_mapping.hpp"
+#include "hle/memory/renderer_tracked_mapping_cache.hpp"
 #include "hle/dispatch/nid.hpp"
 #include "hle/kernel/sce_errno.hpp"
 #include "host/image/boot_program.hpp"   // #1659: shared guest-module labelling
@@ -1122,6 +1124,7 @@ namespace {
             if (nm) { strncpy(m.name, nm, sizeof m.name - 1); }
             insert_mapping_by_base(out, m);
             g_maps.swap(out);
+            detail::advance_renderer_tracked_mapping_generation();
         }
         host::notify_guest_mapping_added(base, size, committed && (prot & 0x1));
         // Flexible memory has no physical alias identity, but it is still ordinary guest memory
@@ -1157,6 +1160,7 @@ namespace {
             }
         }
         g_maps.swap(out);
+        detail::advance_renderer_tracked_mapping_generation();
         host::notify_guest_mapping_removed(base, len);
     }
     // Re-tag [base, base+len) with a new protection (mprotect) without changing whether each
@@ -1208,6 +1212,7 @@ namespace {
                 retagged.push_back(changed);
             }
             g_maps.swap(out);
+            detail::advance_renderer_tracked_mapping_generation();
         }
         host::notify_guest_mapping_removed(base, len);
         for (const auto& m : retagged)
@@ -3466,6 +3471,16 @@ extern "C" int prosper_reserved_range_state(uint64_t addr) {
             addr - decline_base < kAmmWindowSize) ? 4 : 1;
 }
 
+// Positive-only renderer cache for the one predicate its buffer admission gate needs:
+// `prosper_reserved_range_state(addr) != 0`. Numeric state is deliberately absent because AMM
+// decline and Windows sparse commitment can change independently of membership. On a miss, keep
+// the authoritative g_maps lookup; untracked loader/host mappings must not become admitted merely
+// because an OS readability probe succeeds.
+extern "C" ProsperRendererTrackedMappingResult
+prosper_renderer_guest_address_tracked(uint64_t addr) {
+    return detail::renderer_guest_address_tracked(addr, g_mx, g_maps);
+}
+
 // sceKernelBatchMap(SceKernelBatchMapEntry* entries, int numberOfEntries, int* numberOfEntriesOut)
 // Entry (0x20 bytes, Orbis ABI): start@0x00, physOffset@0x08, length@0x10, protection@0x18 (char),
 // type@0x19 (char), operation@0x1c (int). Operations: 0=MAP_DIRECT, 1=UNMAP, 2=PROTECT,
@@ -4493,6 +4508,7 @@ namespace {
             if (nm) { strncpy(m.name, nm, sizeof m.name - 1); }
             insert_mapping_by_base(out, m);
             g_maps.swap(out);
+            detail::advance_renderer_tracked_mapping_generation();
         }
         host::notify_guest_mapping_added(base, size,
                                          committed && host_readable && (prot & 0x1));
@@ -4515,6 +4531,7 @@ namespace {
             }
         }
         g_maps.swap(out);
+        detail::advance_renderer_tracked_mapping_generation();
         host::notify_guest_mapping_removed(base, len);
     }
     void retrack_prot(uint64_t base, uint64_t len, int prot, uint32_t guest_prot,
@@ -4561,6 +4578,7 @@ namespace {
                 retagged.push_back(changed);
             }
             g_maps.swap(out);
+            detail::advance_renderer_tracked_mapping_generation();
         }
         host::notify_guest_mapping_removed(base, len);
         for (const auto& m : retagged) {
@@ -6742,6 +6760,11 @@ extern "C" int prosper_reserved_range_state(uint64_t addr) {
     if (!tracked) return 0;
     if (!committed) return 1;
     return addr != UINT64_MAX && sparse_dmem_page_uncommitted(addr) ? 3 : 2;
+}
+
+extern "C" ProsperRendererTrackedMappingResult
+prosper_renderer_guest_address_tracked(uint64_t addr) {
+    return detail::renderer_guest_address_tracked(addr, g_mx, g_maps);
 }
 
 // --- Handlers: Win32 versions of the Linux memory HLE, same Sony contracts -------------------

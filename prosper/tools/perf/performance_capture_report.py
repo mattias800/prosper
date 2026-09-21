@@ -292,6 +292,15 @@ def _resource_breakdown(renderer):
         "setup_resources": _total(renderer, "setup_resources_ms"),
         "backend_available": have_backend,
     }
+    buffer_gate_fields = ("tracked_cache_hits", "tracked_cache_fills",
+                          "tracked_untracked_misses", "reserved_state_queries")
+    breakdown["buffer_source_gate_available"] = all(
+        f"frontend_buffer_{field}" in row
+        for row in renderer for field in buffer_gate_fields)
+    if breakdown["buffer_source_gate_available"]:
+        breakdown["buffer_source_gate"] = {
+            field: sum(row[f"frontend_buffer_{field}"] for row in renderer)
+            for field in buffer_gate_fields}
     detile_fields = ("preparations", "2d_preparations", "source_bytes")
     breakdown["gpu_detile_available"] = all(
         f"frontend_gpu_detile_{field}" in row for row in renderer for field in detile_fields)
@@ -1264,6 +1273,14 @@ def print_summary(summary):
         print("  build_resources (frontend materializer): "
               f"{breakdown['build_resources']:.1f}ms"
               f"  [texture={breakdown['frontend_texture']:.1f} buffer={breakdown['frontend_buffer']:.1f}]")
+        if breakdown["buffer_source_gate_available"]:
+            gate = breakdown["buffer_source_gate"]
+            print(f"    buffer source gate: cache_hits={gate['tracked_cache_hits']}"
+                  f" fills={gate['tracked_cache_fills']}"
+                  f" untracked_misses={gate['tracked_untracked_misses']}"
+                  f" numeric_queries={gate['reserved_state_queries']}")
+        else:
+            print("    buffer source gate: UNAVAILABLE")
         if breakdown["texture_source_snapshot_available"]:
             snapshot = breakdown["texture_source_snapshot"]
             print("    texture source snapshot (included in frontend texture): "
