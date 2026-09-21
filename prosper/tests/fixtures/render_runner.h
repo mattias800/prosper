@@ -3625,7 +3625,7 @@ struct ResidentRangeCensus {
         static const bool value = getenv("PROSPER_RENDER_BUFFER_RANGE_CENSUS") != nullptr;
         return value;
     }
-    bool active() const {
+    bool range_census_active() const {
         if (!enabled()) return false;
         // Intrusive runs can start after a long scripted route, keeping the bounded key table
         // available for the settled scene instead of filling it during loading screens.
@@ -3661,7 +3661,7 @@ struct ResidentRangeCensus {
         return &records.emplace(key, std::move(record)).first->second;
     }
     void begin_candidate(ResidentRenderBufferKey key, uint32_t set, uint32_t binding) {
-        if (!active()) return;
+        if (!range_census_active()) return;
         ++events;
         if (!records.contains(key) && records.size() == kMaxKeys) { ++key_overflow; return; }
         if (auto* value = record(key, set, binding)) {
@@ -3688,7 +3688,7 @@ struct ResidentRangeCensus {
     void observe(ResidentRenderBufferKey key, uint32_t set, uint32_t binding,
                  ResidentRangeCensusOutcome outcome, double find_ms = 0, double admit_ms = 0,
                  double watch_ms = 0, double scan_ms = 0) {
-        if (!active()) return;
+        if (!range_census_active()) return;
         auto* value = record(key, set, binding);
         if (!value) return;
         ++value->outcomes[static_cast<size_t>(outcome)];
@@ -3698,14 +3698,14 @@ struct ResidentRangeCensus {
     }
     void mark_pressure(ResidentRenderBufferKey key, uint32_t set, uint32_t binding,
                        bool byte, bool owner) {
-        if (!active()) return;
+        if (!range_census_active()) return;
         if (auto* value = record(key, set, binding)) {
             value->byte_pressure_candidates += byte;
             value->owner_pressure_candidates += owner;
         }
     }
     void mark_reclaimed(ResidentRenderBufferKey key, uint32_t set, uint32_t binding) {
-        if (!active()) return;
+        if (!range_census_active()) return;
         if (auto* value = record(key, set, binding)) ++value->reclaimed_owners;
     }
     void maybe_write(const ResidentRenderBufferCache& cache);
@@ -3831,7 +3831,7 @@ struct ResidentRenderBufferCache {
                double* watch_ms = nullptr, uint32_t set = UINT32_MAX, uint32_t binding = UINT32_MAX) {
         auto& census = resident_range_census();
         census.maybe_write(*this);
-        const bool census_active = census.active() && set != UINT32_MAX;
+        const bool census_active = census.range_census_active() && set != UINT32_MAX;
         const auto begin = census_active ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         auto found = index.find(key);
         // A miss is deliberately not recorded here: the callsite immediately tries admission, and
@@ -3887,7 +3887,7 @@ struct ResidentRenderBufferCache {
                 bool reclaim_idle = false) {
         auto& census = resident_range_census();
         census.maybe_write(*this);
-        const bool census_active = census.active() && set != UINT32_MAX;
+        const bool census_active = census.range_census_active() && set != UINT32_MAX;
         const auto begin = census_active ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         const auto report = [&](ResidentRangeCensusOutcome outcome, double scan_ms = 0) {
             if (census_active) census.observe(key, set, binding, outcome, 0,
@@ -4021,7 +4021,7 @@ inline ResidentRenderBufferCache& resident_render_buffer_cache() {
     return cache;
 }
 inline void ResidentRangeCensus::maybe_write(const ResidentRenderBufferCache& cache) {
-    if (!active()) return;
+    if (!range_census_active()) return;
     static const uint64_t interval_ms = std::max<uint64_t>(10000,
         prosper::diag::env_u64_or_default_capped(
             "PROSPER_RENDER_BUFFER_RANGE_CENSUS_WRITE_INTERVAL_MS",
