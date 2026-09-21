@@ -1,8 +1,8 @@
 # Retained renderer buffer inputs (September 2026)
 
-Tracking: [#3407](https://github.com/mattias800/prosper/issues/3407).
-Retention is opt-in on every platform. The measured cross-title results do not justify a default
-policy; further tuning of this standalone-allocation approach is deferred.
+Tracking: [#2343](https://github.com/mattias800/prosper/issues/2343),
+[#3661](https://github.com/mattias800/prosper/issues/3661), and
+[#3407](https://github.com/mattias800/prosper/issues/3407).
 
 ## Ownership and validation
 
@@ -35,11 +35,17 @@ host/GPU notifications and remapping invalidate watch authority. Failed coverage
 comparison; repeatedly dirty entries stop watching until their source changes or they are rekeyed.
 GPU owners never retain a guest pointer or a guest mapping lease.
 
-The default byte budget is zero on every platform, including Linux with production write watches.
-`PROSPER_BACKEND_BUFFER_RESIDENCY_MB` explicitly selects 0–2048 MiB on any platform. Zero bypasses
-additional pass write-proof work. `PROSPER_NO_BACKEND_BUFFER_RESIDENCY=1` disables retention;
-`PROSPER_NO_BACKEND_BUFFER_WRITE_WATCH=1` keeps exact-comparison retention but disables these watches.
-No GPU vendor, title identity or experimental driver flag selects admission.
+All retention remains default-off on every platform. No GPU vendor, title identity, guest address
+or experimental driver flag selects admission.
+
+`PROSPER_BACKEND_BUFFER_RANGE_RESIDENCY_MB` explicitly selects 0–2048 MiB on any platform.
+`PROSPER_BACKEND_BUFFER_RANGE_MIN_BYTES` selects a 0–64 MiB admission minimum;
+`PROSPER_BACKEND_BUFFER_RANGE_RECLAIM=1` enables idle-owner reclamation and
+`PROSPER_NO_BACKEND_BUFFER_RANGE_RECLAIM=1` disables it. These are admission controls only: exact
+content equality, write-watch invalidation, physical aliases, mapping generation and completion
+leases retain authority. `PROSPER_BACKEND_BUFFER_RESIDENCY_MB` independently selects per-binding
+retention. Explicit zero and `PROSPER_NO_BACKEND_BUFFER_RESIDENCY=1` or
+`PROSPER_NO_BACKEND_BUFFER_RANGE_RESIDENCY=1` disable the corresponding path.
 
 `PROSPER_BACKEND_BUFFER_RESIDENCY_OWNERS` selects a lower owner allowance (0–4096,
 default 4096), still bounded by one sixteenth of the device allocation limit. It permits
@@ -184,3 +190,53 @@ be attributed to that request. Its writer-plus-15-second interval is not fully o
 sink stops receiving deliveries around 15.18 seconds in all three runs and has no later output
 coverage. These observations neither establish a hardware XRUN count nor explain the intro sink's
 guest-production stop; that investigation remains under #3435.
+
+## Connected-range admission evaluation (September 21, 2026)
+
+A bounded, opt-in census explains the GTA owner limit rather than assuming more owners would help.
+In an early Performance Story run, 3,635 exact ranges occurred only once or twice and accounted for
+3,594 of the first 4,096 admissions. Every admitted range was below 64 KiB, with a 7,012-byte median.
+At the settled bank anchor, 115,045 candidates came from only 187 exact ranges, but all 4,096 owners
+were older idle entries and the active ranges found no compatible owner. These intrusive counts and
+summed diagnostic timings are attribution evidence, not serial latency.
+
+Blue Prince's late hall had a different distribution. Its existing explicit 256 MiB policy was
+byte-limited at 582 owners and reused about 30.12 GB of sampled logical bytes. A 256 KiB minimum for
+connected ranges retained 80.9% of those sampled hit bytes while bypassing 99.14% of settled GTA
+candidates. The minimum is an admission hint only; exact equality, write-watch invalidation, mapping
+generation, aliases and GPU completion remain authoritative.
+
+The implementation can also reclaim one incompatible idle owner after the existing exact-size scan
+fails under owner pressure without byte pressure. It examines at most 32 LRU entries and accepts only
+a sole-owned entry. Recorded or in-flight owners remain pinned and charged. Allocation failure after
+eviction takes the ordinary current-byte upload path. Explicit controls preserve the old policy for
+A/B comparisons.
+
+Clean timing used frozen executable SHA-256
+`6ba8f61521c8088c531eac22dce4c33893fd19411d3e26b3f878f7de63401f13`, fresh saves and shader
+caches, the updated peer detector including `screenshot_snap`, and no census. Two comparable Blue
+hall windows per arm produced:
+
+| Explicit policy | Matched hall records | Renderer median ms | Backend buffer median ms | Copy median ms | Delivered producer versions/s |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 256 MiB, 256 KiB minimum, idle reclaim | 84 / 86 | 35.327 / 35.144 | 3.585 / 3.614 | 0.876 / 0.870 | 16.937 / 16.512 |
+| Disabled | 77 / 81 | 38.798 / 38.970 | 6.186 / 6.172 | 3.501 / 3.498 | 15.708 / 15.731 |
+
+Every Blue delivery in all four windows had known-new completed-producer lineage, with no repeat or
+unknown deliveries. The enabled windows reused 6.509/6.662 GB of fully watch-proven logical bytes and
+uploaded 1.704/1.744 GB; disabled uploaded 7.526/7.887 GB. These repeated scene-shape observations
+support the explicit policy's local benefit. Delivered producer versions are not simulation FPS,
+equal-work proof or a visual-correctness metric.
+
+On GTA, all-size idle reclamation lowered the local backend buffer median from 0.128-0.130 ms under
+the old unsuccessful cache to 0.0836 ms, but remained above the disabled arm in enclosing renderer
+cost. The 256 KiB policy's first clean GTA window instead matched the disabled spread: one-callback
+enclosing 0.855 ms versus 0.847/0.888 ms disabled, backend buffer 0.0943 ms versus 0.0943/0.0952 ms.
+Its 46/46 successful deliveries retained unknown producer lineage. This removes the demonstrated
+unsuccessful-cache overhead without establishing a GTA speedup.
+
+The combined residency budget remains zero by default. Automatic enablement would require a separate
+all-writer safety contract: page protection is process-wide, while alternate signal-stack readiness
+is per-thread, so readiness on the admitting renderer thread does not prove that every possible
+writer can service a watch fault. The measured policy remains available explicitly while that
+prerequisite is unresolved. #2343, #3661.

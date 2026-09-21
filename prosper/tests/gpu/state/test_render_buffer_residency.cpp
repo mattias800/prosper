@@ -540,6 +540,77 @@ void resident_owner_limits() {
     fresh.reset();
     CHECK(bool(cache.admit(constrained, {Identity+61, Bytes}, source.data(), Limit, stats)),
           "missing old cursor safely resumes at the remaining singleton");
+
+    // An incompatible idle owner is disposable cache state, while a recorded/in-flight owner
+    // is not. The new policy must actually release the old allocation charge before admission.
+    ResidentRenderBufferCache reclaim;
+    auto cold = reclaim.admit(constrained, {Identity+70, Bytes/2}, source.data(), Limit, stats);
+    CHECK(bool(cold), "reclaim control has one real retained owner");
+    if (!cold) return;
+    std::weak_ptr<ResidentRenderBuffer> old_weak = cold;
+    cold.reset();
+    auto replacement = reclaim.admit(constrained, {Identity+71, Bytes}, source.data(),
+                                     Limit, stats, 0, nullptr, UINT32_MAX, UINT32_MAX, true);
+    CHECK(replacement && old_weak.expired() &&
+              !reclaim.index.contains({Identity+70, Bytes/2}) &&
+              reclaim.index.contains({Identity+71, Bytes}) &&
+              reclaim.charged_owners->load() == 1 &&
+              reclaim.charged_bytes->load() <= Limit &&
+              std::memcmp(replacement->snapshot.get(), source.data(), Bytes) == 0,
+          "incompatible idle owner is fully retired before the current bytes are retained");
+    if (!replacement) return;
+    auto distinct = source;
+    distinct[0] ^= 0x1234u;
+    CHECK(!reclaim.admit(constrained, {Identity+72, Bytes/2}, distinct.data(),
+                         Limit, stats, 0, nullptr, UINT32_MAX, UINT32_MAX, true) &&
+              reclaim.index.contains({Identity+71, Bytes}) &&
+              std::memcmp(replacement->snapshot.get(), source.data(), Bytes) == 0,
+          "a pinned incompatible owner cannot be reclaimed or overwritten");
+    replacement.reset();
+    auto recovered = reclaim.admit(constrained, {Identity+72, Bytes/2}, distinct.data(),
+                                   Limit, stats, 0, nullptr, UINT32_MAX, UINT32_MAX, true);
+    CHECK(recovered && reclaim.charged_owners->load() == 1 &&
+              std::memcmp(recovered->snapshot.get(), distinct.data(), Bytes/2) == 0,
+          "owner pressure recovers after the prior pin is released");
+
+    ResidentRenderBufferCache too_small;
+    auto budget_victim = too_small.admit(constrained, {Identity+80, Bytes/2},
+                                        source.data(), Limit, stats);
+    CHECK(bool(budget_victim), "byte preflight control has one real owner");
+    if (!budget_victim) return;
+    const VkDeviceSize replacement_charge = render_host_buffer_capacity(Bytes) + Bytes;
+    const VkDeviceSize tight_limit = budget_victim->retained_bytes() + replacement_charge - 1;
+    budget_victim.reset();
+    CHECK(!too_small.admit(constrained, {Identity+81, Bytes}, distinct.data(),
+                           tight_limit, stats, 0, nullptr, UINT32_MAX, UINT32_MAX, true) &&
+              too_small.index.contains({Identity+80, Bytes/2}) &&
+              too_small.charged_owners->load() == 1,
+          "an insufficient byte budget declines without evicting an unrelated owner");
+
+    constrained.detile_limits.maxMemoryAllocationCount = 32; // Two real owner slots.
+    ResidentRenderBufferCache mixed;
+    auto detached_pin = mixed.admit(constrained, {Identity+90, Bytes/2},
+                                    source.data(), Limit, stats);
+    auto idle = mixed.admit(constrained, {Identity+91, Bytes/2},
+                            source.data(), Limit, stats);
+    CHECK(detached_pin && idle && mixed.charged_owners->load() == 2,
+          "mixed ownership control fills both allocation slots");
+    if (!detached_pin || !idle) return;
+    std::weak_ptr<ResidentRenderBuffer> idle_weak = idle;
+    idle.reset();
+    CHECK(!mixed.find(ctx.dev, {Identity+90, Bytes/2}, distinct.data(), stats) &&
+              !mixed.index.contains({Identity+90, Bytes/2}) &&
+              mixed.charged_owners->load() == 2,
+          "changed pinned source detaches while its actual allocation remains charged");
+    auto mixed_replacement = mixed.admit(constrained, {Identity+92, Bytes}, source.data(),
+                                         Limit, stats, 0, nullptr, UINT32_MAX, UINT32_MAX, true);
+    CHECK(mixed_replacement && idle_weak.expired() &&
+              mixed.charged_owners->load() == 2 &&
+              std::memcmp(detached_pin->snapshot.get(), source.data(), Bytes/2) == 0,
+          "one idle eviction admits a replacement without erasing the detached GPU pin charge");
+    detached_pin.reset();
+    CHECK(mixed.charged_owners->load() == 1,
+          "detached pin completion releases only its own charge");
 }
 
 void range_sharing(const Fixture& f, bool expect_sharing) {
@@ -718,6 +789,158 @@ void range_residency(const Fixture& f, bool enabled) {
     range_residency_guest_mapping(f, enabled);
 #endif
 }
+
+void range_reclaim_production(const Fixture& f, bool enabled, bool injected_failure) {
+    // Each pass has one complete read-only direct range. B has a different extent, so the old
+    // exact-size rekey cannot reach it under the one-owner test limit. The visible quad is in
+    // the second slice; correct pixels require the current union bytes and descriptor offset.
+    auto make_source = [](size_t shift_words) {
+        std::vector<uint32_t> source(Words + shift_words, 0);
+        quad(source, 0, false);
+        quad(source, shift_words / 2, true);
+        return source;
+    };
+    auto a = make_source(256), b = make_source(512);
+    auto draws = [&](const std::vector<uint32_t>& source, size_t shift_words) {
+        std::vector<BackendDraw> result;
+        for (size_t shift : {size_t{0}, shift_words}) {
+            auto draw = f.draw(source, reinterpret_cast<uintptr_t>(source.data() + shift));
+            auto& r = draw.R[0];
+            r.dwords_view = source.data() + shift;
+            r.dwords_view_count = Words;
+            r.direct_guest_buffer_addr = r.buffer_identity;
+            result.push_back(std::move(draw));
+        }
+        return result;
+    };
+    auto render = [&](const std::vector<uint32_t>& source, size_t shift_words) {
+        return render_draws_rgba(draws(source, shift_words), W, H, nullptr, Clear);
+    };
+    const ResidentRenderBufferKey key_a{reinterpret_cast<uintptr_t>(a.data()), Bytes + 1024};
+    const ResidentRenderBufferKey key_b{reinterpret_cast<uintptr_t>(b.data()), Bytes + 2048};
+    auto has_key = [](ResidentRenderBufferKey key) {
+        BackendPersistentResourceGuard guard;
+        return resident_render_buffer_cache().index.contains(key);
+    };
+    CHECK(resident_render_buffer_range_reclaim_enabled() == enabled,
+          "production range reclaim arm uses its intended policy");
+    CHECK(resident_render_buffer_cache_snapshot().indexed_entries == 0,
+          "production reclaim arm begins with an empty retained cache");
+    CHECK(solid(render(a, 256), true) && has_key(key_a),
+          "first complete range renders and occupies the sole owner slot");
+    CHECK(solid(render(b, 512), true),
+          "different-extent range renders the correct shifted vertex slice");
+    if (injected_failure) {
+        const auto failed = resident_render_buffer_cache_snapshot();
+        CHECK(!has_key(key_a) && !has_key(key_b) && failed.live_owners == 0 &&
+                  failed.charged_bytes == 0 &&
+                  backend_resource_reuse_stats().buffer_resident_declined_bytes >= key_b.bytes,
+              "failed post-reclaim allocation releases the old entry and takes ordinary upload");
+        return;
+    }
+    CHECK(has_key(key_b) == enabled && has_key(key_a) == !enabled,
+          "only enabled reclaim retires an incompatible idle owner");
+    CHECK(solid(render(b, 512), true) &&
+              backend_resource_reuse_stats().buffer_resident_hits == (enabled ? 1u : 0u),
+          "second use of the new range distinguishes real reuse from fallback uploads");
+    b.back() ^= 0x100u;
+    CHECK(solid(render(b, 512), true) &&
+              backend_resource_reuse_stats().buffer_resident_hits == 0,
+          "partial tail mutation is observed even when visible pixels remain green");
+    CHECK(solid(render(b, 512), true) &&
+              backend_resource_reuse_stats().buffer_resident_hits == (enabled ? 1u : 0u),
+          "the changed range can become reusable again after its current bytes are retained");
+    if (enabled) {
+        BackendPersistentResourceGuard guard;
+        const auto found = resident_render_buffer_cache().index.find(key_b);
+        CHECK(found != resident_render_buffer_cache().index.end() &&
+                  std::memcmp(found->second->owner->snapshot.get(), b.data(), key_b.bytes) == 0,
+              "reclaimed slot holds the exact changed complete range");
+    }
+    quad(b, 256, false);
+    CHECK(solid(render(b, 512), false),
+          "visible source mutation after reclaim renders current offscreen geometry");
+    const auto snapshot = resident_render_buffer_cache_snapshot();
+    CHECK(snapshot.live_owners <= 1 && snapshot.indexed_entries <= 1 &&
+              snapshot.charged_bytes <= snapshot.byte_limit,
+          "reclamation and fallback respect the real owner and byte allowances");
+    if (enabled) {
+        // The cached B owner becomes a recorded GPU lease. A different-size C must take the
+        // ordinary upload route until B completes, even though B is oldest in the sole slot.
+        quad(b, 256, true);
+        auto c = make_source(768);
+        quad(c, 384, false);
+        const ResidentRenderBufferKey key_c{reinterpret_cast<uintptr_t>(c.data()), Bytes + 3072};
+        BackendColorTarget old_target{0x2343ee01ull,false,false};
+        BackendColorTarget new_target{0x2343ee02ull,false,false};
+        BackendSubmissionBatch batch;
+        (void)render_draws_rgba(draws(b, 512), W, H, nullptr, Clear, false, &old_target,
+                                nullptr, nullptr, nullptr, &batch, false, nullptr, false);
+        CHECK(batch.pending() && backend_resource_reuse_stats().buffer_resident_hits == 0,
+              "changed B records a new retained version before completion");
+        (void)render_draws_rgba(draws(c, 768), W, H, nullptr, Clear, false, &new_target,
+                                nullptr, nullptr, nullptr, &batch, false, nullptr, false);
+        CHECK(has_key(key_b) && !has_key(key_c) &&
+                  backend_resource_reuse_stats().buffer_resident_declined_bytes >= key_c.bytes,
+              "recorded B pin prevents incompatible C from reclaiming its owner");
+        const auto& ctx = render_vk_ctx();
+        BackendSubmissionBatchResult submitted;
+        { BackendPersistentResourceGuard guard;
+          submitted = batch.submit_and_wait(ctx.dev, ctx.queue, false);
+          if (submitted.submit_result == VK_SUCCESS && submitted.wait_result == VK_SUCCESS)
+              batch.complete(); }
+        CHECK(submitted.submit_result == VK_SUCCESS && submitted.wait_result == VK_SUCCESS,
+              "pinned-reclaim control submits and completes both recorded draws");
+        if (submitted.submit_result == VK_SUCCESS && submitted.wait_result == VK_SUCCESS) {
+            std::vector<uint8_t> before, after; std::string error;
+            CHECK(readback_persistent_color_target(old_target.persistent_id, W, H,
+                      VK_FORMAT_UNDEFINED, before, error) && solid(before, true),
+                  "recorded B retains its green pixels through later incompatible admission");
+            CHECK(readback_persistent_color_target(new_target.persistent_id, W, H,
+                      VK_FORMAT_UNDEFINED, after, error) && solid(after, false),
+                  "fallback C renders its current blue pixels while B remains pinned");
+        }
+    }
+}
+
+void range_minimum_production(const Fixture& f) {
+    // Both sources are complete direct ranges. The first union is below the configured
+    // admission threshold; the second is above it. Either path must fetch current bytes.
+    auto render = [&](std::vector<uint32_t>& source, size_t shift_words) {
+        std::vector<BackendDraw> draws;
+        for (size_t shift : {size_t{0}, shift_words}) {
+            auto draw = f.draw(source, reinterpret_cast<uintptr_t>(source.data() + shift));
+            auto& r = draw.R[0];
+            r.dwords_view = source.data() + shift;
+            r.dwords_view_count = Words;
+            r.direct_guest_buffer_addr = r.buffer_identity;
+            draws.push_back(std::move(draw));
+        }
+        return render_draws_rgba(draws, W, H, nullptr, Clear);
+    };
+    std::vector<uint32_t> small(Words + 256, 0), large(Words + 512, 0);
+    quad(small, 128, true);
+    quad(large, 256, true);
+    const ResidentRenderBufferKey small_key{reinterpret_cast<uintptr_t>(small.data()), Bytes + 1024};
+    const ResidentRenderBufferKey large_key{reinterpret_cast<uintptr_t>(large.data()), Bytes + 2048};
+    CHECK(resident_render_buffer_range_min_bytes() == 10000,
+          "size admission control uses the requested byte threshold");
+    CHECK(solid(render(small, 256), true), "below-threshold source renders current pixels");
+    { BackendPersistentResourceGuard guard;
+      CHECK(!resident_render_buffer_cache().index.contains(small_key),
+            "below-threshold range does not consume a retained owner"); }
+    CHECK(solid(render(large, 512), true), "above-threshold source renders current pixels");
+    { BackendPersistentResourceGuard guard;
+      CHECK(resident_render_buffer_cache().index.contains(large_key),
+            "above-threshold range may be retained under the existing proof"); }
+    CHECK(solid(render(large, 512), true) &&
+              backend_resource_reuse_stats().buffer_resident_hits == 1,
+          "second above-threshold use exercises actual retention");
+    quad(large, 256, false);
+    CHECK(solid(render(large, 512), false) &&
+              backend_resource_reuse_stats().buffer_resident_hits == 0,
+          "a partial mutation of a retained range remains visible");
+}
 } // namespace
 
 namespace {
@@ -817,6 +1040,15 @@ int main(int argc, char** argv) {
     }
     if (argc == 3 && std::string(argv[1]) == "--range-residency") {
         range_residency(f, std::string(argv[2]) == "on");
+        return failures ? 1 : 0;
+    }
+    if (argc == 3 && std::string(argv[1]) == "--range-reclaim") {
+        const std::string mode = argv[2];
+        range_reclaim_production(f, mode != "off", mode == "fail");
+        return failures ? 1 : 0;
+    }
+    if (argc == 2 && std::string(argv[1]) == "--range-minimum") {
+        range_minimum_production(f);
         return failures ? 1 : 0;
     }
     if (argc == 2 && std::string(argv[1]) == "--default-disabled") {

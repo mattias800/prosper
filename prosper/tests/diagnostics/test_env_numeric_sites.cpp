@@ -138,6 +138,32 @@ static uint64_t buffer_residency_permissive(const char* t) {
     return (mib > 2048 ? 2048 : mib) * 1024ull * 1024ull;
 }
 
+// New byte and opt-in census knobs use the same strict parser. The permissive spelling is a
+// counterexample, not prior shipped behavior; the floor matches the census write interval.
+static uint64_t range_min_new(const char* n, const char* t) {
+    return env_u64_or_default_capped(n, t, 0, 64ull * 1024ull * 1024ull, "bytes");
+}
+static uint64_t range_min_permissive(const char* t) {
+    const uint64_t value = t ? std::strtoull(t, nullptr, 10) : 0;
+    return value > 64ull * 1024ull * 1024ull ? 64ull * 1024ull * 1024ull : value;
+}
+static uint64_t range_census_after_new(const char* n, const char* t) {
+    return env_u64_or_default_capped(n, t, 0, 3600000, "ms");
+}
+static uint64_t range_census_after_permissive(const char* t) {
+    const uint64_t value = t ? std::strtoull(t, nullptr, 10) : 0;
+    return value > 3600000 ? 3600000 : value;
+}
+static uint64_t range_census_interval_new(const char* n, const char* t) {
+    const uint64_t value = env_u64_or_default_capped(n, t, 60000, 600000, "ms");
+    return value < 10000 ? 10000 : value;
+}
+static uint64_t range_census_interval_permissive(const char* t) {
+    const uint64_t value = t ? std::strtoull(t, nullptr, 10) : 60000;
+    const uint64_t capped = value > 600000 ? 600000 : value;
+    return capped < 10000 ? 10000 : capped;
+}
+
 // Explicit lower owner allowance; permissive spelling is a counterexample, not shipped history.
 static uint64_t buffer_owners_new(const char* n, const char* t) {
     return env_u64_or_default_capped(n, t, 4096, 4096, "owners");
@@ -396,6 +422,16 @@ static const Site kSites[] = {
     {"render_runner.h PROSPER_BACKEND_BUFFER_RANGE_RESIDENCY_MB (cap)",
      "PROSPER_BACKEND_BUFFER_RANGE_RESIDENCY_MB", buffer_residency_new<0>,
      buffer_residency_permissive<0>, "64MiB", 0, "4096", 2048ull * kMiB},
+    {"render_runner.h PROSPER_BACKEND_BUFFER_RANGE_MIN_BYTES (strict)",
+     "PROSPER_BACKEND_BUFFER_RANGE_MIN_BYTES", range_min_new,
+     range_min_permissive, "-1", 0, "262144", 262144},
+    {"render_runner.h PROSPER_RENDER_BUFFER_RANGE_CENSUS_AFTER_MS (strict)",
+     "PROSPER_RENDER_BUFFER_RANGE_CENSUS_AFTER_MS", range_census_after_new,
+     range_census_after_permissive, "-1", 0, "175000", 175000},
+    {"render_runner.h PROSPER_RENDER_BUFFER_RANGE_CENSUS_WRITE_INTERVAL_MS (strict)",
+     "PROSPER_RENDER_BUFFER_RANGE_CENSUS_WRITE_INTERVAL_MS",
+     range_census_interval_new, range_census_interval_permissive,
+     "-1", 60000, "15000", 15000},
     // A malformed value used to make the cap 1024x TIGHTER than asked for -- which on this knob
     // means "watch essentially nothing", since every range above 8 KiB is then refused a watch.
     // TWO malformed inputs are deliberately absent, for the same reason: `-1` saturates and is then
