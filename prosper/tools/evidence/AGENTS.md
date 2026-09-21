@@ -93,3 +93,168 @@ never be reportable as *checked and clean*. `prerender_check.py` exits 0 only wh
 compared something and nothing matched; when it finds no comparable asset it exits 1, distinct from
 both the pass and the match. A tool in this folder that fails silently is worse than no tool, since
 its whole purpose is to be trusted at the moment somebody is about to publish a claim.
+
+## `image_likeness.py` — colour-aware comparison against a reference frame
+
+Added 2026-09-21 out of #2790, where the absence of this tool cost most of a session.
+
+**The problem it exists for: every metric this project reaches for by default is
+ACHROMATIC.** Non-black percentage, distinct-colour count, near-white fraction,
+luminance percentiles — and the snapshot guards' SSIM over compact *luminance*
+signatures — all share one blind spot. A frame can score 88% non-black with 3,676
+colours and "correct" luminance percentiles while containing none of the reference's
+colour at all.
+
+That is not hypothetical. On *Sonic Frontiers*' Cyber Space stage those numbers rose
+steadily across a day's work — 454 to 1,271 to 3,676 colours, clipping 42% to 0% —
+while the project owner, looking at the same frames, kept reporting that no level was
+visible. What the metrics were tracking was an atmosphere shader and some laser
+effects. One run of this tool said it in a line: **the reference is 61.6% green and the
+candidate 0.0% green**, and the candidate that scored best on every achromatic measure
+scored *worse* than baseline on palette intersection (0.094 → 0.080).
+
+**The score is a composite, and that is load-bearing.** `likeness` is
+`sqrt(palette intersection * hue recall)`. The palette term alone is very nearly the
+achromatic measure this tool exists to replace: a 512-bin RGB histogram is dominated
+by whatever bins hold the most mass, which on most frames is the dark and grey bins.
+An independent review measured a plain grey gradient at **0.502** against a real dark
+frame, ranking third of eleven and above a real menu capture; the tool's own selftest
+now reproduces a worse case, a grey gradient matched to the reference's luminance
+range scoring **0.740** on palette alone and **0.000** on likeness. That is the
+project's recorded gradient trap, reproduced on the tool written to prevent it.
+
+**When the reference is itself achromatic, the second factor becomes STRUCTURE** —
+the Pearson correlation of the two downsampled luminance grids, **multiplied by a
+gain penalty** `min(slope, 1/slope)` from regressing the candidate on the reference,
+and defined as 0 when either image has no variance. The two factors are blended by
+how much chromatic mass the reference carries rather than switched at the boundary,
+so there is no cliff (measured: a continuous 0.980 → 0.000 ramp across it).
+
+This branch took **three** attempts and each failure is worth knowing, because all
+three are the same trap wearing different clothes. Reference: the committed *Little
+Nightmares III* title screen, 0.00% chromatic — and 32 of this repository's 190
+screenshots are under the floor, so this is not a corner.
+
+All three versions below are measured on **one** candidate set against that
+reference, because an earlier version of this table quoted "a real capture" that
+was a different image in different rows:
+
+| version | all-black | ref × 0.01 (brightest pixel 2/255) | boot splash | EULA | what ranks first |
+| --- | --- | --- | --- | --- | --- |
+| v1 — bare palette fallback | **0.968** | 0.968 | 0.981 | 0.942 | splash, then **all-black 2nd — above the EULA** |
+| v2 — plain Pearson correlation | 0.000 | **0.869** | 0.771 | 0.000 | **ref × 0.01**, above the real splash |
+| v3 — correlation × gain penalty | 0.000 | 0.076 | **0.726** | 0.000 | the real splash |
+
+What v3 fixes is that the matching capture ranks first. `ref × 0.01` still scores
+a small non-zero (0.076) and so sits above two real captures that are *different
+scenes* and score 0.000 — that ordering is correct, not a residue of the defect.
+
+The palette term is *high* for a black candidate precisely because the reference is
+dark, and Pearson is **affine invariant**, so in v2 nothing in the product could see
+magnitude: an image that is black to look at correlated perfectly and outranked a
+real frame. The gain penalty is what sees it.
+
+**A tie at 0.000 is not a ranking.** Several genuinely unrelated candidates score
+exactly 0.000, and among them the order is filename only — `--rank` now prints that
+on the first zero row. An earlier version of this paragraph claimed all-black "ranks
+last"; it does not, it ties at zero with the other non-matches. What it no longer
+does is outrank a capture that actually resembles the reference.
+
+Five modes, in the order they are usually reached for:
+
+```bash
+# 1. Is this frame like the reference, and what is it missing?   (no options)
+image_likeness.py oracle.png candidate.bmp
+
+# 2. Where is it wrong, spatially? 16x9 keeps cells square on a widescreen frame.
+image_likeness.py --grid oracle.png candidate.bmp [--cells 16x9] [--threshold 32]
+
+# 3. Which of these surfaces is closest to the reference?        (no options)
+image_likeness.py --rank oracle.png /path/to/dumped/surfaces
+
+# 4. Which REGION of the reference does each surface correspond to?
+image_likeness.py --locate oracle.png /path/to/dumped/surfaces [--cells 64x36] [--threshold 64]
+
+# 4b. The same question for ONE surface, printing every region's score.
+image_likeness.py --regions oracle.png candidate.bmp [--cells 64x36] [--threshold 32]
+
+# 5. Verify the measure's own claims before trusting a number from it.
+image_likeness.py --selftest
+```
+
+**Each mode accepts exactly the options it USES, and refuses the rest.** `--rank`
+and the default mode score by palette and hue, which have no grid and no tolerance,
+so they take no options at all and reject `--threshold`/`--cells` rather than
+accepting and ignoring them. "Accepted but unused" is indistinguishable from
+"unknown and ignored" at the terminal, and both produce the same false reading:
+several runs at several settings returning identical numbers, which looks exactly
+like a robust result.
+
+Mode 2 prints a map — lowercase means the candidate is *short* of the reference on
+that channel, uppercase means *excess*. On the Sonic frame it renders the defect
+directly: the lower two-thirds read `g` on the G-buffer (grass missing) and `B` on the
+presented frame (atmosphere flooding the gap).
+
+Mode 4 is the locator: an intermediate surface rarely holds the whole frame, so
+scoring halves, thirds and quadrants separately turns "this scores 0.11" into "this
+corresponds to the reference's lower half".
+
+**Read it as triage, not as a gate.** It ranks and locates; a human still judges
+whether a scene looks right. Two cautions learned while building it:
+
+- **Run `--selftest` before trusting a number, and add an arm when you find a new
+  way to fool it.** It is a few seconds, needs no fixtures, and every case in it is
+  one that actually broke a previous version: the gradient above, a surface that IS
+  the oracle's bottom half being located as "bottom third", a frame compared against
+  itself reporting "top-right q" instead of "full", and each mode refusing the
+  options it does not use. The arms are written so that reinstating the old
+  behaviour reddens a named case — verified by mutation, **fifteen for fifteen**,
+  including reinstating the exact pre-review region algorithm rather than a
+  convenient substitute for it.
+
+  **That distinction is the lesson, and it cost three rejections — the same
+  mistake three rounds running, each time on the arm guarding the previous
+  round's finding.** Round 1's region mutation replaced the crop with the whole
+  reference; round 2's achromatic mutation set the second factor to 1.0 (giving
+  `sqrt(palette)`) instead of reinstating `likeness = palette`. Both are
+  *stronger* changes that redden for the wrong reason, and both left the real
+  defect undetected — round 3 reinstated the actual round-2 branch and the suite
+  stayed 26/26 green. **A mutation you write yourself will drift toward one that
+  fails loudly; the only safe one is the diff you are actually replacing.** The first
+  round claimed "four for four" and it was false: the region mutation replaced the
+  reference crop with the whole reference, which is a *stronger* change that happens
+  to redden, while reinstating the algorithm actually under review left the suite
+  green. The fixture was two flat colour bands, and stretch-versus-crop is a no-op
+  on flat bands — the defect was structurally inexpressible, so the arm tested the
+  discriminator and not the domain. The fixture is now deliberately structured (a
+  gradient plus four differently-coloured blocks at four distinct positions); do not
+  simplify it. Three further arms were found to be unfallible the same way and were
+  replaced: the tie-break arm (a self-comparison has a unique winner once cropping
+  is correct, so only a flat-on-flat comparison actually ties), the `--cells` arm
+  (both values must sit below the old clamp or it maps them apart anyway), and the
+  skip-reporting arm (an all-corrupt directory exits non-zero whether or not skips
+  are recorded — it takes a *mixed* directory, where the run succeeds and stderr is
+  the only channel left). **When you add an arm, mutate the real defect and watch
+  that arm go red.**
+- **`--threshold` and `--cells` belong to the spatial modes only.** An early version
+  dropped `--threshold` outside `--grid`; the repair was incomplete and a review
+  found `--rank` still took no options at all while `--locate` accepted `--cells`
+  and discarded it. If a mode accepts an option now, it uses it — pinned by one
+  arm per (mode, option) pair, six in all, each comparing CLI output at two
+  settings.
+  **Compare the result rows, never the whole output.** Every mode echoes its own
+  settings in a header — `--locate` its `grid=`, `grid_compare` and `region_match`
+  their `tol=` — so a whole-output comparison is satisfied by the echo whether or
+  not the options reach the code that scores. Two reviews demonstrated it from
+  opposite ends: reinstating the drop-the-options defect in `--locate` left the
+  suite 27/27 green with all three `--cells` values byte-identical, and hardcoding
+  the tolerance *inside* `grid_compare` left it 29/29 green. The `rows()` helper in
+  the selftest drops `===` banners and any line carrying `tol=`/`grid=`, so the
+  arms see only what was computed. All six (mode, option) pairs now have an arm.
+- **Absolute scores are low even for good renders**, because exposure and tonemap
+  differences shift every cell. Compare candidates against each other, and watch the
+  per-hue deltas and the spatial map rather than the single number.
+
+Still to do (deliberately not done at once): wire it into `tools/snapshot` so guarded
+titles gain a colour-aware check alongside the luminance SSIM, which has the same
+blind spot described above.
