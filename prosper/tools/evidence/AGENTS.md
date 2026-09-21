@@ -93,3 +93,63 @@ never be reportable as *checked and clean*. `prerender_check.py` exits 0 only wh
 compared something and nothing matched; when it finds no comparable asset it exits 1, distinct from
 both the pass and the match. A tool in this folder that fails silently is worse than no tool, since
 its whole purpose is to be trusted at the moment somebody is about to publish a claim.
+
+## `image_likeness.py` — colour-aware comparison against a reference frame
+
+Added 2026-09-21 out of #2790, where the absence of this tool cost most of a session.
+
+**The problem it exists for: every metric this project reaches for by default is
+ACHROMATIC.** Non-black percentage, distinct-colour count, near-white fraction,
+luminance percentiles — and the snapshot guards' SSIM over compact *luminance*
+signatures — all share one blind spot. A frame can score 88% non-black with 3,676
+colours and "correct" luminance percentiles while containing none of the reference's
+colour at all.
+
+That is not hypothetical. On *Sonic Frontiers*' Cyber Space stage those numbers rose
+steadily across a day's work — 454 to 1,271 to 3,676 colours, clipping 42% to 0% —
+while the project owner, looking at the same frames, kept reporting that no level was
+visible. What the metrics were tracking was an atmosphere shader and some laser
+effects. One run of this tool said it in a line: **the reference is 61.6% green and the
+candidate 0.0% green**, and the candidate that scored best on every achromatic measure
+scored *worse* than baseline on palette intersection (0.094 → 0.080).
+
+Four modes, in the order they are usually reached for:
+
+```bash
+# 1. Is this frame like the reference, and what is it missing?
+image_likeness.py oracle.png candidate.bmp
+
+# 2. Where is it wrong, spatially? 16x9 keeps cells square on a widescreen frame.
+image_likeness.py --grid oracle.png candidate.bmp [--cells 16x9] [--threshold 32]
+
+# 3. Which of these surfaces is closest to the reference?
+image_likeness.py --rank oracle.png /path/to/dumped/surfaces
+
+# 4. Which REGION of the reference does each surface correspond to?
+image_likeness.py --locate oracle.png /path/to/dumped/surfaces [--threshold 64]
+```
+
+Mode 2 prints a map — lowercase means the candidate is *short* of the reference on
+that channel, uppercase means *excess*. On the Sonic frame it renders the defect
+directly: the lower two-thirds read `g` on the G-buffer (grass missing) and `B` on the
+presented frame (atmosphere flooding the gap).
+
+Mode 4 is the locator: an intermediate surface rarely holds the whole frame, so
+scoring halves, thirds and quadrants separately turns "this scores 0.11" into "this
+corresponds to the reference's lower half".
+
+**Read it as triage, not as a gate.** It ranks and locates; a human still judges
+whether a scene looks right. Two cautions learned while building it:
+
+- **Pass `--threshold` deliberately and check the ranking moves.** The tool refuses
+  unknown options rather than ignoring them, because an early version silently
+  dropped `--threshold` outside `--grid` and three runs at three tolerances returned
+  byte-identical numbers — which reads exactly like a robust result. At tol 32 the
+  top-ranked surface was one frame; at 64 it was a different one entirely.
+- **Absolute scores are low even for good renders**, because exposure and tonemap
+  differences shift every cell. Compare candidates against each other, and watch the
+  per-hue deltas and the spatial map rather than the single number.
+
+Still to do (deliberately not done at once): wire it into `tools/snapshot` so guarded
+titles gain a colour-aware check alongside the luminance SSIM, which has the same
+blind spot described above.
