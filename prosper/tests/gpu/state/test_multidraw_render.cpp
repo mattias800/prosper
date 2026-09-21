@@ -432,6 +432,103 @@ int main() {
                   shared_stats.buffer_hash_calls == 4,
               "owned-vector references (distinct pointers) keep full hash+memcmp dedup");
 
+        // Production draws carry storage buffers separately from the 512-byte texture-capable
+        // FrameResource. Exercise that exact handoff with R empty: independent red/blue pixel
+        // expectations prove that the backend reads current bytes through B. The order tokens use
+        // the same monotonic per-carrier sequence the live frontend emits.
+        std::vector<uint32_t> mutable_vertices = buffer.dwords;
+        prosper::test::FrameBufferResource compact_filler =
+            static_cast<const prosper::test::FrameBufferResource&>(filler);
+        compact_filler.dwords.clear();
+        compact_filler.dwords_view = filler.dwords.data();
+        compact_filler.dwords_view_count = filler.dwords.size();
+        prosper::test::FrameBufferResource compact_vertices =
+            static_cast<const prosper::test::FrameBufferResource&>(buffer);
+        compact_vertices.dwords.clear();
+        compact_vertices.dwords_view = mutable_vertices.data();
+        compact_vertices.dwords_view_count = mutable_vertices.size();
+        prosper::test::BackendDraw compact_draw = d0;
+        compact_draw.R.clear();
+        compact_draw.B = {compact_filler, compact_vertices};
+        compact_draw.resource_order = {0x80000000u, 0x80000001u};
+        const std::vector<uint8_t> compact_frame =
+            prosper::test::render_draws_rgba({compact_draw}, W, H);
+        const uint8_t* compact_center = center(compact_frame);
+        CHECK(compact_center && compact_center[0] > 0xC0 && compact_center[1] < 0x40 &&
+                  compact_center[2] < 0x40,
+              "compact buffer resources preserve binding identity and render the expected red frame");
+
+        std::fill_n(mutable_vertices.begin(), std::size(fullscreen_triangle), 0u);
+        const std::vector<uint8_t> compact_mutated =
+            prosper::test::render_draws_rgba({compact_draw}, W, H);
+        const uint8_t* compact_mutated_center = center(compact_mutated);
+        CHECK(compact_mutated_center && compact_mutated_center[0] < 0x40 &&
+                  compact_mutated_center[1] < 0x40 && compact_mutated_center[2] > 0xC0,
+              "compact buffer resources re-read changed bytes at the same pointer and identity");
+        std::copy(std::begin(fullscreen_triangle), std::end(fullscreen_triangle),
+                  mutable_vertices.begin());
+
+        prosper::test::BackendDraw mixed_carriers = d0;
+        mixed_carriers.R = {filler};
+        mixed_carriers.B = {compact_vertices};
+        mixed_carriers.resource_order = {0u, 0x80000000u};
+        const std::vector<uint8_t> mixed_carrier_frame =
+            prosper::test::render_draws_rgba({mixed_carriers}, W, H);
+        CHECK(mixed_carrier_frame == compact_frame,
+              "interleaved full and compact carriers preserve the expected resource handoff");
+
+        prosper::test::BackendDraw malformed_compact = compact_draw;
+        malformed_compact.resource_order = {0x80000002u, 0x80000000u};
+        CHECK(prosper::test::render_draws_rgba({malformed_compact}, W, H).empty(),
+              "an out-of-range compact resource token fails before Vulkan submission");
+        malformed_compact.resource_order = {0x80000000u, 0x80000000u};
+        CHECK(prosper::test::render_draws_rgba({malformed_compact}, W, H).empty(),
+              "duplicate compact resource tokens fail before Vulkan submission");
+        malformed_compact = compact_draw;
+        malformed_compact.resource_order.clear();
+        CHECK(prosper::test::render_draws_rgba({malformed_compact}, W, H).empty(),
+              "compact resources without explicit order fail before Vulkan submission");
+
+        // The order preflight belongs to the whole logical batch, ahead of depth-feedback
+        // splitting. Put a malformed draw after a forced split and seed the timing stats with a
+        // value no real pass produces: segment-local validation would render the first segment and
+        // replace it, while whole-batch rejection leaves it untouched.
+        constexpr uint64_t kPreflightDepth = 0x7f31000000ull;
+        ResolvedPipelineState preflight_writer = opaque;
+        preflight_writer.depth_test_enable = true;
+        preflight_writer.depth_write_enable = true;
+        preflight_writer.depth_compare_op = 7; // ALWAYS
+        preflight_writer.depth_read_base = kPreflightDepth;
+        preflight_writer.depth_write_base = kPreflightDepth;
+        prosper::test::BackendDraw valid_first_segment = d0;
+        valid_first_segment.ps = &preflight_writer;
+        prosper::test::BackendDraw malformed_later_segment = compact_draw;
+        prosper::test::FrameResource depth_sample;
+        depth_sample.binding = 7;
+        depth_sample.set = 1;
+        depth_sample.persistent_depth_target_id = kPreflightDepth;
+        depth_sample.img_dim = 1;
+        depth_sample.tw = W;
+        depth_sample.th = H;
+        malformed_later_segment.R.push_back(std::move(depth_sample));
+        malformed_later_segment.resource_order = {
+            0u, 0x80000000u, 0x80000000u,
+        };
+        const std::vector<prosper::test::BackendDraw> malformed_split{
+            valid_first_segment, malformed_later_segment,
+        };
+        CHECK(prosper::test::depth_feedback_split_index(malformed_split, W, H) == 1u,
+              "malformed-order control would enter a later depth-feedback segment");
+        auto& preflight_stats = prosper::test::backend_render_timing_stats_storage();
+        preflight_stats = {};
+        preflight_stats.calls = 123;
+        CHECK(prosper::test::render_draws_rgba(
+                  malformed_split, W, H, nullptr, nullptr,
+                  /*persist_depth_stencil=*/true).empty() &&
+                  prosper::test::backend_render_timing_stats().calls == 123,
+              "a malformed later segment rejects the whole batch before the first Vulkan pass");
+
+        const auto pool_before_capacity = prosper::test::render_host_buffer_pool_stats();
         prosper::test::BackendDraw capacity_peer0 = d0;
         prosper::test::BackendDraw capacity_peer1 = d1;
         capacity_peer0.R[1].dwords.resize(61);
@@ -440,8 +537,8 @@ int main() {
             {capacity_peer0, capacity_peer1}, W, H);
         const auto pool_after_second = prosper::test::render_host_buffer_pool_stats();
         const auto layout_stats = prosper::test::backend_resource_reuse_stats();
-        CHECK(pool_after_second.hits == pool_after_shared_contents.hits + 1 &&
-                  pool_after_second.misses == pool_after_shared_contents.misses &&
+        CHECK(pool_after_second.hits == pool_before_capacity.hits + 1 &&
+                  pool_after_second.misses == pool_before_capacity.misses &&
                   pooled_again == shared,
               "next logical size reuses the mapped arena byte-identically");
         CHECK(layout_stats.persistent_pipeline_layout_hits >= 1 &&

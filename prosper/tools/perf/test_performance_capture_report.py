@@ -277,6 +277,26 @@ class PerformanceCaptureReportTests(unittest.TestCase):
             print_summary(legacy)
         self.assertIn("buffer source gate: UNAVAILABLE", legacy_output.getvalue())
 
+    def test_buffer_carriers_require_a_complete_population(self):
+        row = {"frontend_buffer_compact_resources": 2**40 + 5,
+               "frontend_buffer_full_resources": 7}
+        breakdown = summarize(capture(SAMPLES, renderer=[row, row]))["resource_breakdown"]
+        self.assertTrue(breakdown["buffer_carriers_available"])
+        self.assertEqual(breakdown["buffer_carriers"], {
+            "compact_resources": 2**41 + 10,
+            "full_resources": 14,
+        })
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            print_summary(summarize(capture(SAMPLES, renderer=[row, row])))
+        self.assertIn("buffer carriers: compact=2199023255562 full=14", output.getvalue())
+
+        partial = dict(row)
+        del partial["frontend_buffer_full_resources"]
+        mixed = summarize(capture(SAMPLES, renderer=[row, partial]))["resource_breakdown"]
+        self.assertFalse(mixed["buffer_carriers_available"])
+        self.assertNotIn("buffer_carriers", mixed)
+
     def test_gpu_detile_population_preserves_missing_and_integer_bytes(self):
         row = {"frontend_gpu_detile_preparations": 5,
                "frontend_gpu_detile_2d_preparations": 3,

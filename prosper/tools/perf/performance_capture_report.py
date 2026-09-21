@@ -301,6 +301,14 @@ def _resource_breakdown(renderer):
         breakdown["buffer_source_gate"] = {
             field: sum(row[f"frontend_buffer_{field}"] for row in renderer)
             for field in buffer_gate_fields}
+    carrier_fields = ("compact_resources", "full_resources")
+    breakdown["buffer_carriers_available"] = all(
+        f"frontend_buffer_{field}" in row
+        for row in renderer for field in carrier_fields)
+    if breakdown["buffer_carriers_available"]:
+        breakdown["buffer_carriers"] = {
+            field: sum(row[f"frontend_buffer_{field}"] for row in renderer)
+            for field in carrier_fields}
     detile_fields = ("preparations", "2d_preparations", "source_bytes")
     breakdown["gpu_detile_available"] = all(
         f"frontend_gpu_detile_{field}" in row for row in renderer for field in detile_fields)
@@ -1281,6 +1289,12 @@ def print_summary(summary):
                   f" numeric_queries={gate['reserved_state_queries']}")
         else:
             print("    buffer source gate: UNAVAILABLE")
+        if breakdown["buffer_carriers_available"]:
+            carriers = breakdown["buffer_carriers"]
+            print(f"    buffer carriers: compact={carriers['compact_resources']}"
+                  f" full={carriers['full_resources']}")
+        else:
+            print("    buffer carriers: UNAVAILABLE")
         if breakdown["texture_source_snapshot_available"]:
             snapshot = breakdown["texture_source_snapshot"]
             print("    texture source snapshot (included in frontend texture): "

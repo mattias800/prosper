@@ -144,6 +144,18 @@ int main() {
         prosper::test::backend_pipeline_cache_stats();
     CHECK(after_b.hits == 1 && after_b.misses == 0,
           "a second arity-3 draw with the same shaders DOES reuse Case A's pipeline (hits=1)");
+    {
+        prosper::test::BackendDraw compact_array = draw_with({}, {quad, decoy, decoy});
+        prosper::test::FrameBufferResource compact =
+            static_cast<const prosper::test::FrameBufferResource&>(compact_array.R[0]);
+        compact_array.R.clear();
+        compact_array.B.push_back(std::move(compact));
+        compact_array.resource_order = {0x80000000u};
+        const std::vector<uint8_t> px_compact =
+            prosper::test::render_draws_rgba({std::move(compact_array)}, W, H);
+        CHECK(px_compact == px_arr,
+              "a compact buffer carrier preserves descriptor-array arity and element contents");
+    }
 
     // --- Case D: a non-zero run-table offset -------------------------------------------------------
     // Binding 2 comes FIRST and occupies two descriptors, so binding 3's run starts at offset 2. The

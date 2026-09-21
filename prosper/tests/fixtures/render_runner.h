@@ -141,10 +141,12 @@ inline uint64_t hash_buffer_words(const uint32_t* words, size_t count) {
     return hash;
 }
 
-// One resource for the general N-binding path (render_triangle_rgba's `gres`): a storage buffer
-// (dwords non-empty, tex_rgba null), combined image sampler, or storage image at `binding`. Lets a
-// real game shader that declares several buffers and images have each bound distinctly.
-struct FrameResource {
+// The storage-buffer subset of FrameResource. The live frontend keeps these in a separate vector:
+// a settled Blue Prince submit carries tens of thousands of buffers, and constructing the complete
+// texture-capable object (currently 512 bytes) for every one only to leave all image state empty is
+// measurable resource-preparation work. Tests and replay inputs may continue putting buffers in
+// FrameResource; the backend accepts both representations through the same upload path.
+struct FrameBufferResource {
     uint32_t binding = 0;
     uint32_t set = 0;               // descriptor set: VS resources -> 0, PS resources -> 1 (they must not
                                     // share a set — both stages number bindings from 2, so one set would
@@ -166,6 +168,29 @@ struct FrameResource {
     // Backend-owned PS5 GDS storage. Unlike guest/capture buffers this is one persistent,
     // zero-initialized 64 KiB allocation shared across ordered render calls.
     bool is_internal_gds = false;
+    // Per-entry payloads for a RUNTIME-SELECTED descriptor array (#2412 stage 5). Empty -- the only
+    // state any producer creates today -- means an ordinary single descriptor and every path below
+    // behaves exactly as before.
+    std::vector<std::vector<uint32_t>> table_entries;
+    const uint32_t* buffer_words_data() const {
+        return dwords_view && dwords_view_count
+            ? dwords_view : (dwords.empty() ? nullptr : dwords.data());
+    }
+    size_t buffer_word_count() const {
+        return dwords_view && dwords_view_count ? dwords_view_count : dwords.size();
+    }
+    uint32_t descriptor_arity() const {
+        return table_entries.empty() ? 1u : static_cast<uint32_t>(table_entries.size());
+    }
+    uint32_t written_descriptor_count() const {
+        return is_internal_gds ? 1u : descriptor_arity();
+    }
+};
+
+// One resource for the general N-binding path (render_triangle_rgba's `gres`): a storage buffer
+// (dwords non-empty, tex_rgba null), combined image sampler, or storage image at `binding`. Lets a
+// real game shader that declares several buffers and images have each bound distinctly.
+struct FrameResource : FrameBufferResource {
     const uint8_t* tex_rgba = nullptr;   // non-null => a texture; then tw/th are its dimensions
     // Immutable tiled snapshot plus conversion resources; the submission retains
     // this owner through completion. Never interpreted as CPU RGBA pixels.
@@ -277,13 +302,6 @@ struct FrameResource {
     // vertical regions of a sampled image without visiting host/guest memory.
     uint32_t borrowed_compute_vertical_stack_layers = 0;
     std::shared_ptr<void> borrowed_compute_image_lease;
-    const uint32_t* buffer_words_data() const {
-        return dwords_view && dwords_view_count
-            ? dwords_view : (dwords.empty() ? nullptr : dwords.data());
-    }
-    size_t buffer_word_count() const {
-        return dwords_view && dwords_view_count ? dwords_view_count : dwords.size();
-    }
     bool is_texture() const {
         return tex_rgba != nullptr || gpu_detile || has_uniform_color || persistent_render_target_id != 0 ||
                persistent_depth_target_id != 0 || borrowed_compute_image != nullptr;
@@ -296,7 +314,6 @@ struct FrameResource {
     // two sources of truth for "how many descriptors" is precisely the disagreement that makes a
     // layout declare N while a write supplies M, which is a validation error at bind time and a wrong
     // shader read if validation is off. One vector, one length, no way to disagree.
-    std::vector<std::vector<uint32_t>> table_entries;
     // The number of descriptors this binding DECLARES: 1 ordinary, N for a table-indexed array.
     // This is the guest's intent, not what any Vulkan object ends up carrying -- for that, use
     // `written_descriptor_count()` below.
@@ -307,9 +324,6 @@ struct FrameResource {
     // and the texture and internal-GDS writes each supply ONE, while the layout took this value for
     // every class -- so the invariant the comment asserted was the one thing not being maintained.
     // #2477.
-    uint32_t descriptor_arity() const {
-        return table_entries.empty() ? 1u : static_cast<uint32_t>(table_entries.size());
-    }
     // The number of descriptors the WRITE path actually supplies, and therefore what the POOL and the
     // LAYOUT must both declare (#2477). Only the storage-buffer path loops over `table_entries`; the
     // texture / storage-image write and the internal-GDS write each supply exactly one descriptor.
@@ -600,7 +614,11 @@ struct BackendDraw {
     // and therefore identifies which retained attachment layer is newer than a compute image.
     uint64_t command_order = 0;
     const prosper::gpu::ResolvedPipelineState* ps = nullptr;   // null -> triangle-list, write RGBA, no depth
-    std::vector<FrameResource> R;                              // set-tagged resources (empty -> no descriptors)
+    std::vector<FrameResource> R;                              // textures plus compatibility/test buffers
+    std::vector<FrameBufferResource> B;                        // compact production storage buffers
+    // Original frontend binding order. High bit selects B; the remaining bits index R or B. Empty
+    // means every resource is in R, preserving the replay/test construction contract.
+    std::vector<uint32_t> resource_order;
     uint32_t vcount = 3;
     uint32_t instance_count = 1;
     int32_t vertex_offset = 0;
@@ -6573,6 +6591,39 @@ inline bool backend_module_has_readonly_buffers(const std::vector<uint32_t>& wor
     return readonly;
 }
 
+// Validate frontend-owned split-resource metadata for the whole logical draw batch. This must run
+// before depth-feedback splitting: validating each physical segment independently can let an early
+// segment acquire/submit Vulkan work before a malformed later segment is discovered. Compact
+// resources always require explicit order metadata; an empty order retains its historical meaning
+// that every resource is in R.
+inline bool backend_compact_resource_orders_valid(std::span<const BackendDraw> draws) {
+    for (const BackendDraw& draw : draws) {
+        if (draw.resource_order.empty()) {
+            if (draw.B.empty()) continue;
+            std::fprintf(stderr, "prosper: compact resources require explicit order metadata\n");
+            return false;
+        }
+        if (draw.resource_order.size() != draw.R.size() + draw.B.size()) {
+            std::fprintf(stderr, "prosper: malformed compact resource order\n");
+            return false;
+        }
+        uint32_t next_full = 0;
+        uint32_t next_compact = 0;
+        for (uint32_t token : draw.resource_order) {
+            const bool compact = (token & 0x80000000u) != 0;
+            const uint32_t index = token & 0x7fffffffu;
+            uint32_t& next = compact ? next_compact : next_full;
+            const size_t count = compact ? draw.B.size() : draw.R.size();
+            if (index != next || index >= count) {
+                std::fprintf(stderr, "prosper: compact resource order is not a permutation\n");
+                return false;
+            }
+            ++next;
+        }
+    }
+    return true;
+}
+
 // `submission_batch` is an explicit live-renderer ownership scope. Calls with no requested CPU
 // readback may return after recording; `flush_submission_batch` submits every accumulated command
 // buffer in order, waits once, and releases all retained resources. Omitting the batch preserves the
@@ -8186,24 +8237,38 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         return bits;
     };
     std::vector<DV> dv(draws.size());
-    // Most draws use the frontend's immutable resource vector verbatim. Copying every FrameResource
-    // here copied owned buffer payloads, callbacks and shared owners for thousands of draws before
-    // the backend could even consult its upload caches. Only a shader that needs prosper's synthetic
-    // GDS binding requires an augmented vector; all ordinary draws borrow the caller-owned vector for
-    // this synchronous backend call.
-    std::vector<std::vector<FrameResource>> augmented_resources(draws.size());
-    std::vector<const std::vector<FrameResource>*> effective_resources(draws.size());
+    // Preserve the frontend's exact descriptor order while borrowing either the complete resource or
+    // its compact buffer-only carrier. The references are synchronous: every pointed-to vector belongs
+    // to `draws`, which outlives this call. Synthetic GDS entries are owned alongside these views.
+    struct EffectiveResource {
+        const FrameResource* full = nullptr;
+        const FrameBufferResource* buffer = nullptr;
+        const FrameBufferResource& common() const { return full ? *full : *buffer; }
+        bool is_texture() const { return full && full->is_texture(); }
+    };
+    std::vector<FrameBufferResource> synthetic_gds(draws.size());
+    std::vector<std::vector<EffectiveResource>> effective_resources(draws.size());
     for (size_t i = 0; i < draws.size(); ++i) {
+        const BackendDraw& draw = draws[i];
+        auto& effective = effective_resources[i];
+        effective.reserve(draw.R.size() + draw.B.size() + 1);
+        if (draw.resource_order.empty()) {
+            for (const auto& resource : draw.R) effective.push_back({&resource, nullptr});
+            for (const auto& resource : draw.B) effective.push_back({nullptr, &resource});
+        } else {
+            for (uint32_t token : draw.resource_order) {
+                const bool compact = (token & 0x80000000u) != 0;
+                const uint32_t index = token & 0x7fffffffu;
+                if (compact) effective.push_back({nullptr, &draw.B[index]});
+                else effective.push_back({&draw.R[index], nullptr});
+            }
+        }
         if (fragment_uses_internal_gds_memoized(draws[i].fs_identity, draws[i].fs_words())) {
-            augmented_resources[i] = draws[i].R;
-            FrameResource gds;
+            FrameBufferResource& gds = synthetic_gds[i];
             gds.set = 1;
             gds.binding = 0;
             gds.is_internal_gds = true;
-            augmented_resources[i].push_back(std::move(gds));
-            effective_resources[i] = &augmented_resources[i];
-        } else {
-            effective_resources[i] = &draws[i].R;
+            effective.push_back({nullptr, &gds});
         }
     }
     // Scope-guard timer, so a bucket stays correct across the `continue`/`break` exits the resource
@@ -8224,8 +8289,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                              .count();
         }
     };
-    auto direct_range_eligible = [](const FrameResource& r) {
-        return !r.is_texture() && !r.is_internal_gds && r.table_entries.empty() &&
+    auto direct_range_eligible = [](const FrameBufferResource& r) {
+        return !r.is_internal_gds && r.table_entries.empty() &&
             r.dwords.empty() && r.direct_guest_buffer_addr != 0 &&
             r.direct_guest_buffer_addr == r.buffer_identity &&
             r.direct_guest_buffer_addr == reinterpret_cast<uintptr_t>(r.buffer_words_data()) &&
@@ -8242,10 +8307,12 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         if (share_backend_resources && use_buffer_arena && !buffer_verify_enabled &&
             !PROSPER_ENV_ON("PROSPER_NO_BACKEND_BUFFER_RANGE_SHARE")) {
             std::vector<BufferRangeSpan> spans;
-            for (const auto& draw : draws)
-                for (const auto& r : draw.R)
-                    if (direct_range_eligible(r))
+            for (const auto& resources : effective_resources)
+                for (const auto& ref : resources) {
+                    const auto& r = ref.common();
+                    if (!ref.is_texture() && direct_range_eligible(r))
                         spans.push_back({r.direct_guest_buffer_addr, r.buffer_word_count() * 4});
+                }
             buffer_range_groups = plan_buffer_ranges(std::move(spans), storage_buffer_alignment,
                 std::min<uint64_t>(ctx.detile_limits.maxStorageBufferRange, 64ull << 20));
         }
@@ -8372,18 +8439,18 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     uint64_t storage_buffers = 0;
     uint64_t sampled_images = 0;
     uint64_t storage_images = 0;
-    for (const auto* resource_ptr : effective_resources) {
-        const auto& resources = *resource_ptr;
+    for (const auto& resources : effective_resources) {
         if (resources.empty()) continue;
         uint32_t set_count = 1;
-        for (const FrameResource& resource : resources) {
+        for (const EffectiveResource& ref : resources) {
+            const FrameBufferResource& resource = ref.common();
             set_count = std::max(set_count, resource.set + 1);
-            if (!resource.is_texture()) {
+            if (!ref.is_texture()) {
                 // N per array, not 1 per resource: the pool is sized from these counters, and an
                 // N-entry array that reserved 1 fails inside vkAllocateDescriptorSets with
                 // VK_ERROR_OUT_OF_POOL_MEMORY -- an error with no visible connection to arrays.
                 storage_buffers += resource.written_descriptor_count();
-            } else if (resource.is_storage_image) {
+            } else if (ref.full->is_storage_image) {
                 ++storage_images;
             } else {
                 ++sampled_images;
@@ -8765,7 +8832,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                     "vs_id=%016llx fs_id=%016llx resources=%zu\n",
                     di, draws.size(), W, H, bd_vs.size(), bd_gs.size(), bd_fs.size(),
                     (unsigned long long)bd.vs_identity,
-                    (unsigned long long)bd.fs_identity, bd.R.size());
+                    (unsigned long long)bd.fs_identity, bd.R.size() + bd.B.size());
             fflush(stderr);
         }
         // Pipeline hits do not need temporary VkShaderModules. Defer module creation until after the
@@ -9094,9 +9161,10 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         if (timing_enabled) res_fixed_depth_stencil_ms += setup_elapsed_ms(fixed_blend_ready, fixed_dss_ready);
         const auto setup_fixed_ready = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
         if (timing_enabled) setup_fixed_ms += setup_elapsed_ms(setup_shaders_ready, setup_fixed_ready);
-        const auto& R = *effective_resources[di];
+        const auto& R = effective_resources[di];
         v.use_desc = !R.empty();
-        for (auto& r : R) v.n_sets = std::max(v.n_sets, r.set + 1);
+        for (const auto& ref : R)
+            v.n_sets = std::max(v.n_sets, ref.common().set + 1);
         if (v.n_sets > v.dsets.size()) {
             std::fprintf(stderr, "prosper: draw %zu requires %u descriptor sets, max supported is %zu\n",
                          di, v.n_sets, v.dsets.size());
@@ -9117,12 +9185,13 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 uint32_t running = 0;
                 for (size_t i = 0; i < R.size(); i++) {
                     draw_dbi_offset[i] = running;
-                    running += R[i].descriptor_arity();
+                    running += R[i].common().descriptor_arity();
                 }
                 (void)running;
             }
             const size_t dbi_total = R.empty()
-                ? 0 : static_cast<size_t>(draw_dbi_offset.back()) + R.back().descriptor_arity();
+                ? 0 : static_cast<size_t>(draw_dbi_offset.back()) +
+                    R.back().common().descriptor_arity();
             draw_dbi.resize(dbi_total);
                 // Resolve one storage-buffer payload to an index in `shared_buffers` -- the memo lookup,
                 // the size-gated content dedup, and the arena/pool/create upload. Extracted verbatim
@@ -9453,14 +9522,18 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             draw_wr.resize(R.size());
             bool buffer_resources_ready = true;
             for (size_t i = 0; i < R.size(); i++) {
-                const FrameResource& r = R[i];
-                draw_lb[i] = {}; draw_lb[i].binding = r.binding;
+                const EffectiveResource& resource_ref = R[i];
+                const FrameBufferResource& common = resource_ref.common();
+                draw_lb[i] = {}; draw_lb[i].binding = common.binding;
                 // What the WRITE will supply, not what the resource declares (#2477). See
                 // `written_descriptor_count()`. Loud once if a producer ever asks for an array on a
                 // class whose write path cannot build one -- silently declaring 1 would drop the
                 // extra entries and read as handled.
-                draw_lb[i].descriptorCount = r.written_descriptor_count();
-                if (r.descriptor_arity() != r.written_descriptor_count()) {
+                const uint32_t written_descriptor_count = resource_ref.is_texture()
+                    ? resource_ref.full->written_descriptor_count()
+                    : common.written_descriptor_count();
+                draw_lb[i].descriptorCount = written_descriptor_count;
+                if (common.descriptor_arity() != written_descriptor_count) {
                     static std::once_flag warned;
                     std::call_once(warned, [&] {
                         std::fprintf(stderr,
@@ -9469,12 +9542,16 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                      "internal-gds=%d). Declaring 1 so the layout and the write agree; "
                                      "entries 1..%u are IGNORED. Arrays are implemented for storage "
                                      "buffers only -- see #2477.\n",
-                                     r.binding, r.descriptor_arity(),
-                                     (int)r.is_texture(), (int)r.is_storage_image,
-                                     (int)r.is_internal_gds, r.descriptor_arity() - 1u);
+                                     common.binding, common.descriptor_arity(),
+                                     (int)resource_ref.is_texture(),
+                                     (int)(resource_ref.is_texture() &&
+                                           resource_ref.full->is_storage_image),
+                                     (int)common.is_internal_gds,
+                                     common.descriptor_arity() - 1u);
                     });
                 }
-                if (r.is_texture()) {
+                if (resource_ref.is_texture()) {
+                    const FrameResource& r = *resource_ref.full;
                     const ResourcePhaseTimer phase_texture(timing_enabled, &res_texture_ms);
                     draw_lb[i].descriptorType = r.is_storage_image
                         ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
@@ -10273,6 +10350,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                     draw_wr[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}; draw_wr[i].dstBinding = r.binding; draw_wr[i].descriptorCount = 1;
                     draw_wr[i].descriptorType = draw_lb[i].descriptorType; draw_wr[i].pImageInfo = &draw_dii[i];
                 } else {
+                    const FrameBufferResource& r = common;
                     const ResourcePhaseTimer phase_buffer(timing_enabled, &res_buffer_ms);
                     draw_lb[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; draw_lb[i].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
                     if (r.is_internal_gds) {
@@ -10336,7 +10414,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             const ResourcePhaseTimer phase_descriptor(timing_enabled, &res_descriptor_ms);
             for (uint32_t s = 0; s < v.n_sets; s++) {
                 draw_slb.clear();
-                for (size_t i = 0; i < R.size(); i++) if (R[i].set == s) draw_slb.push_back(draw_lb[i]);
+                for (size_t i = 0; i < R.size(); i++)
+                    if (R[i].common().set == s) draw_slb.push_back(draw_lb[i]);
                 std::sort(draw_slb.begin(), draw_slb.end(), [](const auto& left, const auto& right) {
                     return left.binding < right.binding;
                 });
@@ -10428,7 +10507,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                     std::fprintf(stderr, " set%u=%p", s, (void*)v.dsets[s]);
                 for (size_t i = 0; i < R.size(); i++)
                     std::fprintf(stderr, " [b%u type=%d cnt=%u buf=%p off=%llu range=%llu]",
-                                 R[i].binding, (int)draw_wr[i].descriptorType, draw_wr[i].descriptorCount,
+                                 R[i].common().binding, (int)draw_wr[i].descriptorType,
+                                 draw_wr[i].descriptorCount,
                                  draw_wr[i].pBufferInfo ? (void*)draw_wr[i].pBufferInfo->buffer : nullptr,
                                  draw_wr[i].pBufferInfo
                                      ? (unsigned long long)draw_wr[i].pBufferInfo->offset : 0ull,
@@ -10437,7 +10517,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 std::fprintf(stderr, "\n");
             }
             for (size_t i = 0; i < R.size(); i++)
-                draw_wr[i].dstSet = v.dsets[R[i].set];
+                draw_wr[i].dstSet = v.dsets[R[i].common().set];
             vkUpdateDescriptorSets(dev, static_cast<uint32_t>(draw_wr.size()), draw_wr.data(), 0, nullptr);
         }
         const auto setup_resources_ready = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
@@ -10603,19 +10683,21 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             // same drift risk that put a hardcoded 1 in the fallback in the first place. `R.size()`
             // comes along because the arity list is meaningless without its length.
             append(static_cast<uint32_t>(R.size()));
-            for (size_t i = 0; i < R.size(); ++i) append(R[i].descriptor_arity());
+            for (size_t i = 0; i < R.size(); ++i)
+                append(R[i].common().descriptor_arity());
             append(!exact_shader_identities);
             if (!exact_shader_identities) {
                 for (size_t i = 0; i < R.size(); ++i) {
                     const bool texture = R[i].is_texture();
                     const VkDescriptorType descriptor_type = !texture
                         ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
-                        : (R[i].is_storage_image ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
-                                                 : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
-                    const VkShaderStageFlags stage_flags = !texture || R[i].set == 0
+                        : (R[i].full->is_storage_image ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
+                                                      : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
+                    const auto& common = R[i].common();
+                    const VkShaderStageFlags stage_flags = !texture || common.set == 0
                         ? (VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT)
                         : VK_SHADER_STAGE_FRAGMENT_BIT;
-                    append(R[i].set); append(R[i].binding); append(descriptor_type);
+                    append(common.set); append(common.binding); append(descriptor_type);
                     append(stage_flags);   // count already keyed above, for both branches
                 }
             }
@@ -10674,9 +10756,9 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 std::string arity_text = "[";
                 for (size_t i = 0; i < R.size(); ++i) {
                     if (i) arity_text += ' ';
-                    arity_text += std::to_string(R[i].binding);
+                    arity_text += std::to_string(R[i].common().binding);
                     arity_text += ':';
-                    arity_text += std::to_string(R[i].descriptor_arity());
+                    arity_text += std::to_string(R[i].common().descriptor_arity());
                 }
                 arity_text += ']';
                 std::fprintf(stderr,
@@ -13234,6 +13316,9 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                                               BackendMrtOutputs* mrt_outputs = nullptr,
                                               bool want_color_readback = true) {   // #2283
     const std::span<const BackendDraw> all(draws);
+    // One preflight over the logical batch, before splitting or any render-pass state. A malformed
+    // later segment must not leave earlier producer work submitted or speculative cache state live.
+    if (!backend_compact_resource_orders_valid(all)) return {};
     if (!persist_depth_stencil ||
         depth_feedback_split_index(all, W, H) == all.size())
         return render_draw_pass_rgba(all, W, H, seed_rgba, clear_rgba,
