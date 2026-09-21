@@ -1,3 +1,5 @@
+#include "native_texels.hpp"
+
 #include "gpu/capture/gpu_capture.hpp"
 #include "gpu/capture/gpu_capture_bundle.hpp"
 #include "gpu/execute/gpu_dependency_graph.hpp"
@@ -98,6 +100,11 @@ void usage(const char* argv0) {
                  "(--recompile-raw, --retry-failed-*); a plain replay runs stored SPIR-V and\n"
                  "writes nothing for it. Use the per-draw flags above.\n");
 }
+
+// Targets at or below this many texels get a native-typed dump alongside any image conversion.
+// Small enough that the report stays readable on a scalar or a tiny reduction result, which is
+// the only place the numbers matter more than the picture.
+constexpr uint64_t kNativeTexelReportLimit = 64;
 
 std::vector<uint8_t> inspect_rtt_seed(const prosper::gpu::GpuCaptureRttSeed& seed) {
     const size_t texels = static_cast<size_t>(seed.width) * seed.height;
@@ -308,6 +315,18 @@ bool read_exact_output_target(
                      snapshot.height, static_cast<unsigned>(readback_format));
         return false;
     }
+    // Native-typed values for a SMALL target, printed BEFORE the RGBA8 conversion below and
+    // independently of whether that conversion exists for this format (#3765). The conversion
+    // clamps to 0..1 and scales to 0..255, which is right for anything you look at and wrong for
+    // anything you need the number of -- an exposure of 10 and one of 100 both arrive as 255.
+    // Sonic Frontiers' tonemap reads its exposure from a 2x1 R32_SFLOAT target (#2790), and no
+    // image of that answers the question it is read to answer.
+    if (snapshot.pixels &&
+        static_cast<uint64_t>(target.width) * target.height <= kNativeTexelReportLimit)
+        std::fputs(prosper::gpu::replay_tool::format_native_texels(
+                       snapshot.format, snapshot.pixels->data(), snapshot.pixels->size(),
+                       snapshot.width, snapshot.height, kNativeTexelReportLimit).c_str(),
+                   stderr);
     pixels = inspect_live_target(snapshot);
     const uint64_t expected_bytes =
         static_cast<uint64_t>(target.width) * target.height * 4u;
