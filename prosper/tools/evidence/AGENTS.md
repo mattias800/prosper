@@ -124,16 +124,33 @@ range scoring **0.740** on palette alone and **0.000** on likeness. That is the
 project's recorded gradient trap, reproduced on the tool written to prevent it.
 
 **When the reference is itself achromatic, the second factor becomes STRUCTURE** —
-the Pearson correlation of the two downsampled luminance grids, clamped to 0..1 and
-defined as 0 when either image has no variance. The two factors are blended by how
-much chromatic mass the reference carries rather than switched at the boundary, so
-there is no cliff. This is the second version of that branch: the first fell back to
-the bare palette term, which **reopened the same defect one branch over** — on the
-committed *Little Nightmares III* title screen (0.00% chromatic; 32 of this
-repository's 190 screenshots are under the floor) an all-black candidate scored
-**0.968 and ranked third of six, above a real capture at 0.942**. With structure it
-scores **0.000** and ranks last, while the reference itself scores 1.000 and a real
-related capture 0.771. A flat fill has no luminance variance, so it cannot fake it.
+the Pearson correlation of the two downsampled luminance grids, **multiplied by a
+gain penalty** `min(slope, 1/slope)` from regressing the candidate on the reference,
+and defined as 0 when either image has no variance. The two factors are blended by
+how much chromatic mass the reference carries rather than switched at the boundary,
+so there is no cliff (measured: a continuous 0.980 → 0.000 ramp across it).
+
+This branch took **three** attempts and each failure is worth knowing, because all
+three are the same trap wearing different clothes. Reference: the committed *Little
+Nightmares III* title screen, 0.00% chromatic — and 32 of this repository's 190
+screenshots are under the floor, so this is not a corner.
+
+| version | all-black | reference × 0.01 (brightest pixel 2/255) | a real capture |
+| --- | --- | --- | --- |
+| v1 — fall back to the bare palette term | **0.968, 3rd of 6** | — | 0.942 |
+| v2 — plain Pearson correlation | 0.000 | **0.869, above the real capture** | 0.771 |
+| v3 — correlation × gain penalty | 0.000 | 0.076 | 0.726 |
+
+The palette term is *high* for a black candidate precisely because the reference is
+dark, and Pearson is **affine invariant**, so in v2 nothing in the product could see
+magnitude: an image that is black to look at correlated perfectly and outranked a
+real frame. The gain penalty is what sees it.
+
+**A tie at 0.000 is not a ranking.** Several genuinely unrelated candidates score
+exactly 0.000, and among them the order is filename only — `--rank` now prints that
+on the first zero row. An earlier version of this paragraph claimed all-black "ranks
+last"; it does not, it ties at zero with the other non-matches. What it no longer
+does is outrank a capture that actually resembles the reference.
 
 Five modes, in the order they are usually reached for:
 
@@ -183,11 +200,19 @@ whether a scene looks right. Two cautions learned while building it:
   the oracle's bottom half being located as "bottom third", a frame compared against
   itself reporting "top-right q" instead of "full", and each mode refusing the
   options it does not use. The arms are written so that reinstating the old
-  behaviour reddens a named case — verified by mutation, **eight for eight**,
+  behaviour reddens a named case — verified by mutation, **ten for ten**,
   including reinstating the exact pre-review region algorithm rather than a
   convenient substitute for it.
 
-  **That distinction is the lesson, and it cost a second rejection.** The first
+  **That distinction is the lesson, and it cost three rejections — the same
+  mistake three rounds running, each time on the arm guarding the previous
+  round's finding.** Round 1's region mutation replaced the crop with the whole
+  reference; round 2's achromatic mutation set the second factor to 1.0 (giving
+  `sqrt(palette)`) instead of reinstating `likeness = palette`. Both are
+  *stronger* changes that redden for the wrong reason, and both left the real
+  defect undetected — round 3 reinstated the actual round-2 branch and the suite
+  stayed 26/26 green. **A mutation you write yourself will drift toward one that
+  fails loudly; the only safe one is the diff you are actually replacing.** The first
   round claimed "four for four" and it was false: the region mutation replaced the
   reference crop with the whole reference, which is a *stronger* change that happens
   to redden, while reinstating the algorithm actually under review left the suite

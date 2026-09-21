@@ -146,7 +146,17 @@ def structure(ref_path, cand_path, cols=16, rows=9):
                    dtype=np.float64).ravel()
     if a.std() < 1e-6 or b.std() < 1e-6:
         return 0.0
-    return float(max(0.0, np.corrcoef(a, b)[0, 1]))
+    r = float(max(0.0, np.corrcoef(a, b)[0, 1]))
+    # Correlation ALONE is affine invariant, and on a dark reference the palette
+    # term is high precisely because both images are dark -- so nothing in the
+    # product sees magnitude. Measured on the Little Nightmares III title screen:
+    # the reference scaled by 0.01, a frame whose brightest pixel is 2/255 and
+    # which is black to look at, scored r=0.781 and likeness 0.869 -- ABOVE a real
+    # capture at 0.771. That is the gradient trap in its third form, so the
+    # correlation is penalised by how far the best-fit gain departs from 1.
+    slope = float(np.cov(a, b, bias=True)[0, 1] / max(a.var(), 1e-12))
+    gain = 0.0 if slope <= 0.0 else min(slope, 1.0 / slope)
+    return r * gain
 
 
 def compare(ref_px, cand_px, struct=None):
@@ -183,20 +193,33 @@ def compare(ref_px, cand_px, struct=None):
     return palette, second, float(np.sqrt(palette * second)), ph, qh
 
 
-def report(ref_path, cand_path, ref_px=None):
+def report(ref_path, cand_path, ref_px=None, quiet=False):
+    """Score one candidate, printing the breakdown unless `quiet`.
+
+    The selftest calls this with quiet=True rather than a private scoring helper.
+    An earlier round had a separate `report_score()` that no mode ran, so its
+    arms measured a quantity the tool never reported -- and it had already
+    drifted (it omitted the structure factor).
+    """
     ref_px = load(ref_path) if ref_px is None else ref_px
     cand_px = load(cand_path)
-    struct = structure(ref_path, cand_path)
+    chrom_probe = hue_profile(ref_px)["_chromatic"]
+    # Only pay for the structure factor when the blend will actually use it.
+    struct = (structure(ref_path, cand_path)
+              if chrom_probe < MIN_REF_CHROMATIC else None)
     palette, second, likeness, hr, hc = compare(ref_px, cand_px, struct)
     chrom = hr["_chromatic"]
     w = min(1.0, chrom / MIN_REF_CHROMATIC)
+    if quiet:
+        return likeness
     print(f"\n{os.path.basename(cand_path)}")
     print(f"  palette intersection : {palette:6.3f}   (1.0 = same colour distribution)")
     hue_inter = sum(min(hr[n], hc[n]) for n, _, _ in HUES)
     hue_recall = hue_inter / chrom if chrom > 1e-9 else 0.0
     print(f"  hue recall           : {hue_recall:6.3f}   "
           f"(of the reference's chromatic mass)")
-    print(f"  structure            : {struct:6.3f}   (luminance correlation)")
+    if struct is not None:
+        print(f"  structure            : {struct:6.3f}   (luminance correlation x gain)")
     if w >= 1.0:
         print(f"  likeness             : {likeness:6.3f}   = sqrt(palette x hue recall)")
     else:
@@ -324,7 +347,8 @@ def region_match(ref_path, cand_path, cols=64, rows=36, threshold=32, quiet=Fals
     out.sort(reverse=True)
     res = [(frac, name, -negmad) for frac, area, negmad, name in out]
     if not quiet:
-        print(f"\n{os.path.basename(cand_path)}  [region match, tol={threshold}]")
+        print(f"\n{os.path.basename(cand_path)}  [region match, tol={threshold}, "
+              f"grid={cols}x{rows}]")
         for frac, name, mad in res[:6]:
             bar = "#" * int(frac * 40)
             print(f"  {name:<15} {frac*100:5.1f}% cells   mean|d|={mad:6.1f}  {bar}")
@@ -458,8 +482,8 @@ def selftest():
         black = save("black.png", Image.new("RGB", (W, H), (0, 0, 0)))
         ref_px = load(ref_p)
 
-        check("identical scores 1.000", abs(report_score(ref_p, ref_p, ref_px) - 1.0) < 1e-6)
-        s_grey, s_black = report_score(ref_p, grey, ref_px), report_score(ref_p, black, ref_px)
+        check("identical scores 1.000", abs(report(ref_p, ref_p, ref_px, quiet=True) - 1.0) < 1e-6)
+        s_grey, s_black = report(ref_p, grey, ref_px, quiet=True), report(ref_p, black, ref_px, quiet=True)
         check(f"grey gradient ({s_grey:.3f}) scores below 0.10", s_grey < 0.10)
         check(f"all-black ({s_black:.3f}) scores below 0.10", s_black < 0.10)
 
@@ -482,19 +506,37 @@ def selftest():
         # An ACHROMATIC reference: the first fix fell back to the bare palette term
         # here, which reopened the defect one branch over -- all-black outranked a
         # real capture on a real title screen. Structure carries the weight now.
-        gg = (np.linspace(20, 210, H)[:, None] * np.ones((1, W)))
+        # THE FIXTURE MUST BE DARK. A third review found this arm could not fail
+        # either: it used a BRIGHT ramp (20..210), against which all-black shares
+        # only 6.1% of the palette mass, so reinstating the real defect -- below
+        # the floor, likeness = the bare palette term -- still scored all-black
+        # 0.061 and the arm passed. A real achromatic reference is a title screen:
+        # mostly near-black, where all-black shares 90%+ of the palette and the
+        # defect scores it 0.909. Measured on this fixture: HEAD gives all-black
+        # 0.000 against a real capture at 0.937; the defect gives 0.909.
+        gg = (3 + 9 * yy) * np.ones((1, W))
         mono = np.stack([gg, gg * 1.01, gg * 1.02], 2)
-        mono[int(H * .3):int(H * .5), int(W * .2):int(W * .8)] = 240   # a bright panel
+        mono[int(H * .34):int(H * .48), int(W * .22):int(W * .78)] = 120  # lit panel
+        mono[int(H * .70):int(H * .74), int(W * .35):int(W * .65)] = 55   # dim prompt
         mono_p = save("mono.png", Image.fromarray(mono.clip(0, 255).astype(np.uint8)))
         mono_chrom = hue_profile(load(mono_p))["_chromatic"]
-        near = mono.copy(); near[:, :, :] = np.clip(near * 0.92 + 6, 0, 255)
-        near_p = save("near.png", Image.fromarray(near.astype(np.uint8)))
-        s_real = report_score(mono_p, near_p)
-        s_flat = report_score(mono_p, black)
+        near_p = save("near.png", Image.fromarray(
+            (mono * 0.88 + 3).clip(0, 255).astype(np.uint8)))
+        # T2: correlation alone is affine invariant, so a scaled-to-black copy
+        # correlates perfectly while being black to look at. On the real LM3 title
+        # screen it scored 0.869 -- above a real capture at 0.771.
+        dim_p = save("dim.png", Image.fromarray(
+            (mono * 0.01).clip(0, 255).astype(np.uint8)))
+        s_real = report(mono_p, near_p, quiet=True)
+        s_flat = report(mono_p, black, quiet=True)
+        s_dim = report(mono_p, dim_p, quiet=True)
+        dim_max = int(np.asarray(Image.open(dim_p)).max())
         check(f"achromatic reference is under the hue floor ({mono_chrom*100:.1f}% < "
               f"{MIN_REF_CHROMATIC*100:.0f}%)", mono_chrom < MIN_REF_CHROMATIC)
-        check(f"...and all-black ({s_flat:.3f}) still loses to a real capture "
-              f"({s_real:.3f})", s_flat < s_real and s_flat < 0.10)
+        check(f"...all-black ({s_flat:.3f}) loses to a real capture ({s_real:.3f})",
+              s_flat < s_real and s_flat < 0.10)
+        check(f"...and so does a scaled-to-black copy that CORRELATES perfectly "
+              f"({s_dim:.3f}, brightest pixel {dim_max}/255)", s_dim < s_real * 0.5)
 
         # Region location, on the STRUCTURED fixture. Three shapes, not one.
         for rname, box in (("bottom half", (0, H // 2, W, H)),
@@ -584,23 +626,6 @@ def selftest():
     return 0 if ok else 1
 
 
-def report_score(ref_path, cand_path, ref_px=None):
-    """The likeness score with no printing -- for selftest and ranking.
-
-    Must compute the score exactly as report() does, structure factor included;
-    a quiet path that scores differently from the printing path is the same class
-    of defect as an option that is accepted and ignored.
-    """
-    ref_px = load(ref_path) if ref_px is None else ref_px
-    return compare(ref_px, load(cand_path), structure(ref_path, cand_path))[2]
-
-
-def grid_compare_score(ref_path, cand_path, cols, rows, threshold):
-    a = np.asarray(load_full(ref_path).resize((cols, rows), Image.BOX), dtype=np.int16)
-    b = np.asarray(load_full(cand_path).resize((cols, rows), Image.BOX), dtype=np.int16)
-    return float((np.abs(a - b).max(axis=2) <= threshold).mean())
-
-
 def main(argv):
     try:
         return _main(argv)
@@ -635,8 +660,13 @@ def _main(argv):
             ref_px = load(ref)                     # loud if unreadable
             scored, failures = _scan_dir(d, lambda p: report(ref, p, ref_px))
             print("\n=== ranked by likeness (sqrt(palette x hue/structure)) ===")
-            for s, f in sorted(scored, key=lambda t: (-t[0], t[1])):
-                print(f"  {s:6.3f}  {f}")
+            zeros = 0
+            for sc, f in sorted(scored, key=lambda t: (-t[0], t[1])):
+                mark = "   (no likeness -- order below here is filename only)" \
+                       if sc <= 0.0 and zeros == 0 else ""
+                if sc <= 0.0:
+                    zeros += 1
+                print(f"  {sc:6.3f}  {f}{mark}")
             return _report_failures(failures, len(scored))
         if mode == "--locate":
             _need(rest, 2, "--locate REFERENCE DIR")
