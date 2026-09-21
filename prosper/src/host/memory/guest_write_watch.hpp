@@ -74,6 +74,12 @@ struct GuestWriteWatchStats {
     uint64_t query_audit_conservative = 0;
     // Rearms answered without touching the page list because nothing covered had changed.
     uint64_t rearm_fast = 0;
+    // GPU notifications also follow watched physical-page aliases. These count the address-index
+    // entries and candidate registrations examined by that pass, separately from the logical-VA
+    // interval index above, so its extra cost is visible without changing the old scan counters.
+    uint64_t gpu_write_alias_pages = 0;
+    uint64_t gpu_write_alias_registrations_visited = 0;
+    uint64_t gpu_write_alias_overlaps = 0;
 };
 
 // Bounded, diagnostic-only provenance overlay for direct-memory CPU writes.  Unlike GuestWriteWatch,
@@ -287,9 +293,9 @@ void guest_write_watch_notify_host_write(uint64_t addr, uint64_t size);
 // Paired completion for the call above. Optional: not calling it only disables rebaselining.
 void guest_write_watch_notify_host_write_done(uint64_t addr, uint64_t size);
 
-// Device/DMA writes already carry an exact guest VA range. Mark only registrations whose logical
-// source overlaps that range; unlike a CPU protection fault, an adjacent write on the same host page
-// need not create a false dirty result.
+// Device/DMA writes carry an exact guest VA range. Mark registrations covering those bytes either
+// through that VA or through another VA mapping the same physical bytes. Unlike a CPU protection
+// fault, an adjacent write on the same host page need not create a false dirty result.
 void guest_write_watch_notify_gpu_write(uint64_t addr, uint64_t size);
 
 // Retained for callers that can only resume a handled fault and cannot own a TF completion. On Linux

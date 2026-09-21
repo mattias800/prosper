@@ -125,9 +125,9 @@ static uint64_t copy_threads_old(const char* t) {
     return parsed > 32ul ? 32ull : static_cast<uint64_t>(parsed);
 }
 
-// --- tests/fixtures/render_runner.h : PROSPER_BACKEND_BUFFER_RESIDENCY_MB ----------------------
-// New strict-only knob: the permissive spelling below is a counterexample, not shipped history.
-// All platforms default to zero; explicit overrides exercise the optional retention path.
+// --- tests/fixtures/render_runner.h : renderer buffer residency budgets ------------------------
+// Both strict-only knobs default to zero. The permissive spelling below is a counterexample,
+// not shipped history; explicit overrides exercise the optional retention paths.
 template <uint64_t Default>
 static uint64_t buffer_residency_new(const char* n, const char* t) {
     return env_u64_or_default_capped(n, t, Default, 2048, "MiB") * 1024ull * 1024ull;
@@ -386,6 +386,15 @@ static const Site kSites[] = {
      buffer_residency_permissive<0>, "-1", 0, "256", 256ull * kMiB},
     {"render_runner.h PROSPER_BACKEND_BUFFER_RESIDENCY_MB (cap)",
      "PROSPER_BACKEND_BUFFER_RESIDENCY_MB", buffer_residency_new<0>,
+     buffer_residency_permissive<0>, "64MiB", 0, "4096", 2048ull * kMiB},
+    {"render_runner.h PROSPER_BACKEND_BUFFER_RANGE_RESIDENCY_MB (zero)",
+     "PROSPER_BACKEND_BUFFER_RANGE_RESIDENCY_MB", buffer_residency_new<0>,
+     buffer_residency_permissive<0>, "-1", 0, "0", 0},
+    {"render_runner.h PROSPER_BACKEND_BUFFER_RANGE_RESIDENCY_MB (opt-in)",
+     "PROSPER_BACKEND_BUFFER_RANGE_RESIDENCY_MB", buffer_residency_new<0>,
+     buffer_residency_permissive<0>, "-1", 0, "256", 256ull * kMiB},
+    {"render_runner.h PROSPER_BACKEND_BUFFER_RANGE_RESIDENCY_MB (cap)",
+     "PROSPER_BACKEND_BUFFER_RANGE_RESIDENCY_MB", buffer_residency_new<0>,
      buffer_residency_permissive<0>, "64MiB", 0, "4096", 2048ull * kMiB},
     // A malformed value used to make the cap 1024x TIGHTER than asked for -- which on this knob
     // means "watch essentially nothing", since every range above 8 KiB is then refused a watch.

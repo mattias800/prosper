@@ -195,7 +195,7 @@ struct GuestBufferAliases {
     bool initialize(const std::vector<uint32_t>& initial) {
         const long page = sysconf(_SC_PAGESIZE);
         if (page <= 0) return false;
-        mapped_size = ((Bytes + size_t(page) - 1) / size_t(page)) * size_t(page);
+        mapped_size = ((Bytes + 1024 + size_t(page) - 1) / size_t(page)) * size_t(page);
         fd = memfd_create("renderer-buffer-watch", 0);
         if (fd < 0 || ftruncate(fd, static_cast<off_t>(mapped_size))) return false;
         auto map = [&] {
@@ -379,6 +379,66 @@ void guest_buffer_watch(const Fixture& f) {
               solid(after,true), "queued replacement independently produces the new green result");
     { BackendPersistentResourceGuard guard; cache.index.clear(); cache.lru.clear(); }
     // Destroy every cache watch before the actual mapping RAII cleanup publishes unmap events.
+}
+
+void range_residency_guest_mapping(const Fixture& f, bool enabled) {
+    // The same physical bytes have two registered VAs. A device-style write through B must
+    // invalidate a watched complete range sourced from A, even though the notifying VA differs.
+    prosper::install_trap_handler();
+    constexpr uint64_t UnionBytes = Bytes + 1024;
+    auto visible = std::vector<uint32_t>(Words + 256, 0);
+    quad(visible, 0, false);
+    quad(visible, 128, true);
+    GuestBufferAliases mapping;
+    CHECK(mapping.initialize(visible), "range source has two registered physical aliases");
+    if (!mapping.a || !mapping.b) return;
+    std::memcpy(mapping.a, visible.data(), UnionBytes);
+    auto draws = [&] {
+        std::vector<BackendDraw> result;
+        for (size_t shift : {size_t{0}, size_t{256}}) {
+            auto d = f.draw(visible, reinterpret_cast<uintptr_t>(mapping.a + shift));
+            d.R[0].dwords_view = mapping.a + shift;
+            d.R[0].dwords_view_count = Words;
+            d.R[0].direct_guest_buffer_addr = d.R[0].buffer_identity;
+            result.push_back(std::move(d));
+        }
+        return result;
+    };
+    auto render = [&] { return render_draws_rgba(draws(), W, H, nullptr, Clear); };
+    CHECK(solid(render(), true), "registered complete range is correct on cold upload");
+    for (unsigned i = 0; i < 3; ++i) {
+        CHECK(solid(render(), true), "stable complete range preserves pixels while proving bytes");
+        CHECK(backend_resource_reuse_stats().buffer_resident_compared_bytes ==
+                  (enabled ? UnionBytes : 0),
+              "watch promotion still checks complete current bytes");
+    }
+    CHECK(solid(render(), true) &&
+              backend_resource_reuse_stats().buffer_resident_hits == (enabled ? 1u : 0u) &&
+              backend_resource_reuse_stats().buffer_resident_watched_bytes ==
+                  (enabled ? UnionBytes : 0),
+          "registered unchanged union uses a protected proof only when enabled");
+    auto hidden = visible; quad(hidden, 128, false);
+    CHECK(pwrite(mapping.fd, hidden.data() + 256, 8 * sizeof(uint32_t),
+                 256 * sizeof(uint32_t)) ==
+              8 * ssize_t(sizeof(uint32_t)),
+          "device-style write changes backing without a CPU store on either mapped VA");
+    prosper::host::guest_write_watch_notify_gpu_write(
+        reinterpret_cast<uint64_t>(mapping.b) + 256 * sizeof(uint32_t), 8 * sizeof(uint32_t));
+    CHECK(mapping.a[256] == hidden[256] && mapping.b[256] == hidden[256] &&
+              solid(render(), false) &&
+              backend_resource_reuse_stats().buffer_upload_bytes == UnionBytes &&
+              backend_resource_reuse_stats().buffer_resident_watched_bytes == 0,
+          "notified same-backing alias write forces current bytes into a new union");
+    CHECK(mapping.replace_primary(visible), "same guest VA is remapped to new physical backing");
+    if (!mapping.a) return;
+    CHECK(solid(render(), true) &&
+              backend_resource_reuse_stats().buffer_upload_bytes == UnionBytes,
+          "remapped range cannot inherit the old physical contents");
+    CHECK(solid(render(), true) &&
+              backend_resource_reuse_stats().buffer_resident_hits == (enabled ? 1u : 0u),
+          "unchanged remapped range may reuse its verified current bytes");
+    auto& cache = resident_render_buffer_cache();
+    { BackendPersistentResourceGuard guard; cache.index.clear(); cache.lru.clear(); }
 }
 #else
 void guest_buffer_watch(const Fixture&) {
@@ -565,6 +625,99 @@ void range_sharing(const Fixture& f, bool expect_sharing) {
     CHECK(readback_persistent_color_target(new_target.persistent_id,W,H,VK_FORMAT_UNDEFINED,after,error) &&
               solid(after,false), "new queued upload observes the changed offscreen quad");
 }
+
+void range_residency(const Fixture& f, bool enabled) {
+    // Two overlapping direct guest views, with the visible quad in the second slice. The
+    // complete 9 KiB union is the only valid retained identity; a child-only hit would bind
+    // the wrong vertex positions or leave the uncovered tail stale.
+    std::vector<uint32_t> source(Words + 256, 0);
+    quad(source, 0, false);
+    quad(source, 128, true);
+    constexpr uint64_t UnionBytes = Bytes + 1024;
+    auto draws = [&] {
+        std::vector<BackendDraw> result;
+        for (size_t shift : {size_t{0}, size_t{256}}) {
+            auto draw = f.draw(source, reinterpret_cast<uintptr_t>(source.data() + shift));
+            auto& r = draw.R[0];
+            r.dwords_view = source.data() + shift;
+            r.dwords_view_count = Words;
+            r.direct_guest_buffer_addr = r.buffer_identity;
+            result.push_back(std::move(draw));
+        }
+        return result;
+    };
+    auto render = [&] { return render_draws_rgba(draws(), W, H, nullptr, Clear); };
+    CHECK(solid(render(), true), "cold complete range renders the second guest view");
+    CHECK(backend_resource_reuse_stats().buffer_upload_bytes == UnionBytes &&
+              backend_resource_reuse_stats().buffer_range_uploads == 1,
+          "cold complete range uploads exactly one union");
+    CHECK(solid(render(), true), "unchanged complete range preserves visible pixels");
+    CHECK(backend_resource_reuse_stats().buffer_resident_hits == (enabled ? 1u : 0u) &&
+              backend_resource_reuse_stats().buffer_upload_bytes == (enabled ? 0u : UnionBytes) &&
+              backend_resource_reuse_stats().buffer_range_bindings == 2,
+          "only enabled range residency avoids a second complete upload");
+    quad(source, 128, false); // Write through a same-backing alias inside the second view.
+    CHECK(solid(render(), false), "changed overlapping source changes the rendered output");
+    CHECK(backend_resource_reuse_stats().buffer_resident_hits == 0 &&
+              backend_resource_reuse_stats().buffer_upload_bytes == UnionBytes,
+          "changed range requires an exact full-union upload");
+    CHECK(solid(render(), false) &&
+              backend_resource_reuse_stats().buffer_resident_hits == (enabled ? 1u : 0u),
+          "unchanged refreshed range can be reused after the mutation");
+    source.back() ^= 0x100u; // A partial change in the union tail, outside either visible quad.
+    CHECK(solid(render(), false) &&
+              backend_resource_reuse_stats().buffer_resident_hits == 0 &&
+              backend_resource_reuse_stats().buffer_upload_bytes == UnionBytes,
+          "tail-only mutation refreshes the complete range even when pixels match");
+    if (enabled) {
+        BackendPersistentResourceGuard guard;
+        const auto found = resident_render_buffer_cache().index.find(
+            {reinterpret_cast<uintptr_t>(source.data()), UnionBytes});
+        CHECK(found != resident_render_buffer_cache().index.end() &&
+                  std::memcmp(found->second->owner->snapshot.get(), source.data(), UnionBytes) == 0,
+              "retained snapshot contains the exact complete union after a partial update");
+    }
+
+    for (bool unresolved : {false, true}) {
+        auto writable = draws();
+        writable[1].set_fs(atomic_fragment(f.fs, unresolved));
+        auto alias = writable[1].R[0]; alias.set = 1; alias.binding = 4;
+        writable[1].R.push_back(alias);
+        CHECK(solid(render_draws_rgba(writable,W,H,nullptr,Clear), false) &&
+                  backend_resource_reuse_stats().buffer_resident_hits == 0 &&
+                  backend_resource_reuse_stats().buffer_range_bindings == 0,
+              "writer or incomplete write proof refuses retained range sharing");
+    }
+
+    BackendColorTarget old_target{0x3661ee01ull,false,false};
+    BackendColorTarget new_target{0x3661ee02ull,false,false};
+    BackendSubmissionBatch batch;
+    (void)render_draws_rgba(draws(),W,H,nullptr,Clear,false,&old_target,
+                           nullptr,nullptr,nullptr,&batch,false,nullptr,false);
+    CHECK(batch.pending(), "old retained union has a recorded submission lease");
+    quad(source, 128, true);
+    (void)render_draws_rgba(draws(),W,H,nullptr,Clear,false,&new_target,
+                           nullptr,nullptr,nullptr,&batch,false,nullptr,false);
+    CHECK(backend_resource_reuse_stats().buffer_upload_bytes == UnionBytes,
+          "pending old version cannot be overwritten by a new range");
+    const auto& ctx = render_vk_ctx();
+    BackendSubmissionBatchResult submitted;
+    { BackendPersistentResourceGuard guard;
+      submitted = batch.submit_and_wait(ctx.dev,ctx.queue,false);
+      if (submitted.submit_result == VK_SUCCESS && submitted.wait_result == VK_SUCCESS)
+          batch.complete(); }
+    CHECK(submitted.submit_result == VK_SUCCESS && submitted.wait_result == VK_SUCCESS,
+          "old and new range submissions complete");
+    if (submitted.submit_result != VK_SUCCESS || submitted.wait_result != VK_SUCCESS) return;
+    std::vector<uint8_t> before, after; std::string error;
+    CHECK(readback_persistent_color_target(old_target.persistent_id,W,H,VK_FORMAT_UNDEFINED,before,error) &&
+              solid(before,false), "pending old range keeps its original pixels");
+    CHECK(readback_persistent_color_target(new_target.persistent_id,W,H,VK_FORMAT_UNDEFINED,after,error) &&
+              solid(after,true), "new range uses the mutated guest bytes");
+#ifdef __linux__
+    range_residency_guest_mapping(f, enabled);
+#endif
+}
 } // namespace
 
 namespace {
@@ -660,6 +813,10 @@ int main(int argc, char** argv) {
     }
     if (argc == 3 && std::string(argv[1]) == "--range-sharing") {
         range_sharing(f, std::string(argv[2]) == "on");
+        return failures ? 1 : 0;
+    }
+    if (argc == 3 && std::string(argv[1]) == "--range-residency") {
+        range_residency(f, std::string(argv[2]) == "on");
         return failures ? 1 : 0;
     }
     if (argc == 2 && std::string(argv[1]) == "--default-disabled") {

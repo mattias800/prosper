@@ -756,7 +756,9 @@ struct AtomicStats {
         host_write_lock_contended{0},
         query_pages_visited{0}, host_write_pages_scanned{0}, gpu_write_notifies{0},
         gpu_write_registrations_visited{0}, gpu_write_overlaps{0},
-        query_audit_stale{0}, query_audit_conservative{0}, rearm_fast{0};
+        query_audit_stale{0}, query_audit_conservative{0}, rearm_fast{0},
+        gpu_write_alias_pages{0}, gpu_write_alias_registrations_visited{0},
+        gpu_write_alias_overlaps{0};
 };
 AtomicStats& stats() { static AtomicStats* value = new AtomicStats; return *value; }
 inline void bump(std::atomic<uint64_t>& c) { c.fetch_add(1, std::memory_order_relaxed); }
@@ -1681,7 +1683,9 @@ GuestWriteWatchStats guest_write_watch_stats() {
             v.query_pages_visited.load(), v.host_write_pages_scanned.load(),
             v.gpu_write_notifies.load(), v.gpu_write_registrations_visited.load(),
             v.gpu_write_overlaps.load(), v.query_audit_stale.load(),
-            v.query_audit_conservative.load(), v.rearm_fast.load()};
+            v.query_audit_conservative.load(), v.rearm_fast.load(),
+            v.gpu_write_alias_pages.load(), v.gpu_write_alias_registrations_visited.load(),
+            v.gpu_write_alias_overlaps.load()};
 }
 
 bool guest_dmem_write_trace_configure(const GuestDmemWriteTraceConfig& config) {
@@ -2436,6 +2440,58 @@ void guest_write_watch_notify_gpu_write(uint64_t addr, uint64_t size) {
     }
     stats().gpu_write_registrations_visited.fetch_add(visited, std::memory_order_relaxed);
     stats().gpu_write_overlaps.fetch_add(overlaps, std::memory_order_relaxed);
+
+    // A device can write through a different guest VA of the same physical dmem. Logical interval
+    // buckets above cannot see that alias. The watched-page address index already resolves every
+    // live alias to one physical page and its inverse registration list. Preserve exact-byte
+    // notifications: a watch on another subrange of the same page remains clean.
+    uint64_t alias_pages = 0, alias_visited = 0, alias_overlaps = 0;
+    const uint64_t first_page = addr & ~(kPage - 1);
+    const uint64_t last_page = (end - 1) & ~(kPage - 1);
+    const auto consider_page = [&](uint64_t va, WatchedPage* page) {
+        if (!page) return;
+        ++alias_pages;
+        const uint64_t lo = va == first_page ? addr - va : 0;
+        const uint64_t hi = va == last_page ? end - va : kPage;
+        for (const uint64_t id : page->registrations) {
+            const auto found = w.registrations.find(id);
+            if (found == w.registrations.end()) continue;
+            ++alias_visited;
+            Registration& reg = found->second;
+            for (const PageAlias& alias : page->aliases) {
+                // Work in page offsets so alias.addr + kPage cannot overflow at the top of VA.
+                if (reg.end <= alias.addr ||
+                    (reg.begin > alias.addr && reg.begin - alias.addr >= kPage)) continue;
+                const uint64_t reg_lo = reg.begin > alias.addr ? reg.begin - alias.addr : 0;
+                const uint64_t reg_hi = std::min<uint64_t>(reg.end - alias.addr, kPage);
+                if (reg_lo >= hi || lo >= reg_hi) continue;
+                if (!reg.gpu_dirty) ++alias_overlaps;
+                reg.gpu_dirty = true;
+                break;
+            }
+        }
+    };
+    if (last_chunk - first_chunk + 1 > kMaxQueryChunks) {
+        // A huge notification must not walk billions of absent pages. This fallback still follows
+        // physical aliases; the logical full scan above alone would miss them.
+        for (const auto& [va, page] : w.pages_by_addr)
+            if (va >= first_page && va <= last_page) consider_page(va, page);
+    } else {
+        for (uint64_t chunk = first_chunk; chunk <= last_chunk; ++chunk) {
+            if (!w.page_chunks.contains(chunk)) continue;
+            const uint64_t begin_page = std::max(first_page, chunk * kIndexChunk);
+            const uint64_t end_page = chunk == last_chunk
+                ? last_page : (chunk + 1) * kIndexChunk - kPage;
+            for (uint64_t va = begin_page;; va += kPage) {
+                const auto found = w.pages_by_addr.find(va);
+                if (found != w.pages_by_addr.end()) consider_page(va, found->second);
+                if (va == end_page) break;
+            }
+        }
+    }
+    stats().gpu_write_alias_pages.fetch_add(alias_pages, std::memory_order_relaxed);
+    stats().gpu_write_alias_registrations_visited.fetch_add(alias_visited, std::memory_order_relaxed);
+    stats().gpu_write_alias_overlaps.fetch_add(alias_overlaps, std::memory_order_relaxed);
 }
 
 bool guest_write_watch_desynchronize_for_test(uint64_t addr) {
