@@ -1981,6 +1981,50 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                                 b.uconst(0));
                         }
                     }
+                    // Name WHICH representation is missing. A wave-mask op that cannot resolve
+                    // an operand rejects the whole shader, and the reject line downstream says
+                    // only `mode=unresolved-operand` -- which cannot distinguish the three cases
+                    // that need three different repairs:
+                    //
+                    //   sreg_bool=0, sreg absent      the mask lifetime was lost UPSTREAM; the
+                    //                                 reject PC names where a fact was consumed,
+                    //                                 not where it went missing.
+                    //   sreg present, no_placeholders the words are proven -- a genuine
+                    //                                 scalar-pair projection is admissible.
+                    //   sreg present, placeholders    the words may be phi-fabricated zeros, and
+                    //                                 projecting them would produce an empty
+                    //                                 survivor mask: silently wrong pixels in
+                    //                                 place of a visible reject.
+                    //
+                    // Sonic Frontiers' dropped HDR producer (#2790) is the third case, and it was
+                    // indistinguishable from the first two for a full investigation round. Ungated
+                    // and deduped like [mimg-unresolved] above: it fires only on a path that has
+                    // already failed, so its volume is bounded by the defect it reports.
+                    {
+                        static std::mutex probe_mutex;
+                        static std::set<std::tuple<uint64_t, uint32_t, int>> probe_reported;
+                        bool first = false;
+                        {
+                            std::lock_guard<std::mutex> lock(probe_mutex);
+                            first = probe_reported.emplace(b.diagnostic.program_address, in.pc,
+                                                           o.value).second;
+                        }
+                        if (first)
+                            std::fprintf(stderr,
+                                "[wave-mask-unresolved] program=0x%llx pc=%u operand=%d kind=%d "
+                                "sreg_bool=%d sreg=%d/%d sreg_input=%d/%d "
+                                "no_placeholders=%d stage=%s wave=%u native_sg=%u\n",
+                                (unsigned long long)b.diagnostic.program_address,
+                                in.pc, o.value, (int)o.kind,
+                                (int)(rs.sreg_bool.find(o.value) != rs.sreg_bool.end()),
+                                (int)(rs.sreg.find(o.value) != rs.sreg.end()),
+                                (int)(rs.sreg.find(o.value + 1) != rs.sreg.end()),
+                                (int)(rs.sreg_input.find(o.value) != rs.sreg_input.end()),
+                                (int)(rs.sreg_input.find(o.value + 1) != rs.sreg_input.end()),
+                                (int)rs.scalar_presence_has_no_placeholders,
+                                b.is_compute ? "compute" : b.is_fragment ? "fragment" : "vertex",
+                                b.wave_size, b.native_subgroup_size);
+                    }
                     return 0;
                 };
                 uint32_t m0 = mask(in.src[0]), m1 = mask(in.src[1]);
