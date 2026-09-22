@@ -6530,7 +6530,7 @@ int main() {
     // pinned that. The uploader can now create matching array views, so the descriptor is ARRAYED
     // in graphics exactly as it already was in compute -- and it must be, because the view type is
     // chosen from guest_texture_is_uploaded_array() (img_dim 5 AND multi-layer AND
-    // block-compressed, NOT img_dim alone): a non-arrayed declaration against it is a descriptor
+    // supported BC/Float32 format, NOT img_dim alone): a non-arrayed declaration against it is a descriptor
     // mismatch. The negative arm below pins the other half of that predicate. What has NOT changed, and is still pinned below, is that SAMPLE_L consumes its
     // FOURTH address as the LOD rather than mistaking the third (slice) address for it.
     const uint32_t ps_sample_array_l[] = {
@@ -6558,9 +6558,55 @@ int main() {
     }
     printf("  [ok]   graphics DIM=5 image_sample_l is arrayed and keeps its fourth-address LOD\n");
 
+    // Float32 graphics arrays retain their layer coordinate independently of guest/DS residency.
+    ShaderResourceTable rt_float_array = rt_array;
+    rt_float_array.resources[0].format = DataFormat::Float32;
+    rt_float_array.resources[0].num_components = 1;
+    rt_float_array.resources[0].depth = 3;
+    rt_float_array.resources[0].size = 4 * 4 * 3 * sizeof(float);
+    const auto float_array_spv = recompile_fragment(
+        ps_sample_array_l, std::size(ps_sample_array_l), &rt_float_array);
+    const auto float_array_report = validate_spirv_descriptor_interface(
+        float_array_spv, &rt_float_array, 1, SpirvShaderStage::Fragment);
+    bool float_array_found = false;
+    for (const auto& descriptor : float_array_report.descriptors)
+        if (descriptor.binding == 4u && descriptor.image_arrayed && descriptor.image_dim == 1u)
+            float_array_found = true;
+    if (float_array_spv.empty() || !float_array_found || !float_array_report.ok() ||
+        !has_explicit_lod_constant(float_array_spv, 0u)) {
+        printf("  [FAIL] Float32 graphics array lost its layer/descriptor/fourth-address LOD contract "
+               "(words=%zu array=%u issues=%zu lod=%u)\n", float_array_spv.size(),
+               unsigned(float_array_found), float_array_report.issues.size(),
+               unsigned(has_explicit_lod_constant(float_array_spv, 0u)));
+        for (const auto& issue : float_array_report.issues)
+            printf("    issue=%u set=%u binding=%u error=%u\n", unsigned(issue.code),
+                   issue.set, issue.binding, unsigned(issue.error));
+        return 1;
+    }
+
+    const uint32_t ps_float_array_load[] = {
+        0x7e000280u, 0x7e020280u, 0x7e040282u, // integer x=0, y=0, layer=2
+        0xf0000f28u, 0x00000000u,
+        0xf800000fu, 0x03020100u, 0xbf810000u,
+    };
+    const auto float_load_spv = recompile_fragment(
+        ps_float_array_load, std::size(ps_float_array_load), &rt_float_array);
+    if (float_load_spv.empty() || !image_fetch_coord_literals(float_load_spv, 0u, 0u, 2u)) {
+        printf("  [FAIL] Float32 graphics IMAGE_LOAD dropped its explicit layer\n");
+        return 1;
+    }
+    for (uint32_t opcode : {0x25u, 0x22u, 0x37u, 0x47u, 0x57u}) {
+        std::vector<uint32_t> unsupported(std::begin(ps_sample_array_l), std::end(ps_sample_array_l));
+        unsupported[7] = 0xf0000128u | (opcode << 18); // single-component dmask, array DIM
+        if (!recompile_fragment(unsupported.data(), unsupported.size(), &rt_float_array).empty()) {
+            printf("  [FAIL] unsupported Float32 array modifier opcode=%u silently discarded its layer\n", opcode);
+            return 1;
+        }
+    }
+
     // #325: the NEGATIVE arm, and it exists because the positive one above could not see the
     // defect. A DIM=5 instruction is not sufficient to declare Arrayed -- the uploader arrays a
-    // resource only when it is ALSO multi-layer and block-compressed, and gives everything else a
+    // resource only when it is ALSO multi-layer and a supported BC/Float32 format, and gives everything else a
     // plain 2D view. Declaring Arrayed against that is VUID-vkCmdDraw-viewType-07752.
     //
     // Worth stating why this is not redundant: the whole suite passed 311/311 AND the Vulkan
@@ -6598,7 +6644,7 @@ int main() {
             return 1;
         }
     }
-    printf("  [ok]   graphics DIM=5 stays 2D for depth-1 and non-block-compressed resources\n");
+    printf("  [ok]   graphics DIM=5 stays 2D for depth-1 and unsupported-format resources\n");
 
     // The visibility half of the same kernel comparison-samples a sixteen-layer shadow array.
     // Compute keeps its slice and performs the compare manually over a color-sampled array image.

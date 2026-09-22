@@ -7927,11 +7927,13 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // descriptor is a mismatch. Non-array instructions reaching an array texture get a
             // three-component coordinate with layer 0 -- the same base slice the old base-slice 2D
             // view gave them. The predicate is guest_texture_is_uploaded_array(): img_dim 5 AND
-            // more than one layer AND block-compressed. `img_dim == 5` alone is NOT it -- a depth-1
-            // or non-BC array is a plain 2D image on both sides, and keying on img_dim is exactly
+            // more than one layer AND a supported upload format (BC or Float32).
+            // A depth-1 or unsupported-format array stays plain 2D; keying on img_dim alone is exactly
             // the mistake this comment used to describe.
             const bool res_arrayed = res && prosper::gpu::guest_texture_is_uploaded_array(
                                                 res->img_dim, res->depth, res->format);
+            const bool graphics_float_array = !b.is_compute && res_arrayed &&
+                res->format == DataFormat::Float32 && res->cls == ResourceClass::Texture;
             if (in.opcode == 0x0e) {
                 uint32_t dim;
                 if (in.mimg_dim == 0u) dim = Dim_1D;
@@ -8040,6 +8042,15 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // CONFIDENCE: HIGH — operand order is ISA-defined and an execution regression distinguishes the
             // requested gradient-selected mip from the implicit-derivative result.
             const bool is_sample_d = (in.opcode == 0x22);
+            // These array lowerings preserve the guest's layer operand. The older generic
+            // bias/gradient/offset/gather helpers default arrays to layer zero, so do not admit
+            // those forms for the newly supported Float32 graphics representation.
+            if (graphics_float_array && in.mimg_dim == 5u &&
+                (in.mimg_a16 || (!is_load && !is_sample && !is_sample_l &&
+                                 !is_sample_lz && !is_sample_c_lz))) {
+                ok = false;
+                return true;
+            }
             // #325: 2D_ARRAY resources are now uploaded and declared as real arrays -- see
             // res_arrayed above. The historical base-slice fallback this comment used to describe is
             // gone; what remains of it is that a non-array INSTRUCTION reaching an array resource
@@ -8419,8 +8430,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 }
                 return true;
             } else {
-                const bool load_2d_array = b.is_compute && in.opcode == 0x00 &&
-                    in.mimg_dim == 5u && res->img_dim == 5u;
+                const bool load_2d_array = (b.is_compute || graphics_float_array) &&
+                    in.opcode == 0x00 && in.mimg_dim == 5u && res->img_dim == 5u;
                 const bool mip_load_2d_array = b.is_compute && is_zero_mip_load &&
                     in.mimg_dim == 5u && res->img_dim == 5u;
                 // #325: array SAMPLE was restricted to compute. Nothing about an array slice is
@@ -8430,9 +8441,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // rendered flat. Measured on a captured Croft Manor frame, zeroing slices 1..255
                 // changed 0.0% of pixels while zeroing all 256 changed 62.9%.
                 // `res_arrayed` and not `img_dim == 5` alone: the uploader arrays a resource only
-                // when it is ALSO multi-layer and block-compressed, so keying on img_dim would
-                // declare Arrayed for this title's depth-1 shadow maps and for Float32 arrays that
-                // get a plain 2D view -- VUID-vkCmdDraw-viewType-07752, the same failure as the
+                // when it is ALSO multi-layer with a supported BC/Float32 format. Keying only
+                // on img_dim would declare Arrayed for depth-1 or unsupported-format resources
+                // that receive a plain 2D view -- the same failure as the
                 // hardcoded flag two branches up, at a different site. Compute keeps its own path:
                 // it picks the view from the SPIR-V reflection, so it is not bound by that.
                 const bool array_sample = in.mimg_dim == 5u &&

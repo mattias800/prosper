@@ -1113,6 +1113,14 @@ int main() {
               "CONTROL: the same declaration against a non-array resource is still clean, so the arm "
               "above is caused by the resource shape and not by the module");
 
+        arrayed_table.resources[0].format = DataFormat::Float32;
+        CHECK(reported_at_binding_4(validate_spirv_descriptor_interface(
+                  image_spv, &arrayed_table, 1, SpirvShaderStage::Fragment)),
+              "Float32 array rejects a plain 2D module regardless of source residency");
+        CHECK(!reported_at_binding_4(validate_spirv_descriptor_interface(
+                  image_dim_test_spirv(1u, true), &arrayed_table, 1, SpirvShaderStage::Fragment)),
+              "Float32 array accepts a matching array declaration");
+
         // THE 1D AXIS. The graphics backend has no 1D view type at all, so every graphics Dim_1D is
         // unsatisfiable -- there is no view it could build.
         CHECK(reported_at_binding_4(validate_spirv_descriptor_interface(
