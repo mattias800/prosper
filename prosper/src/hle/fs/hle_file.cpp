@@ -4,6 +4,7 @@
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE   // pthread_getattr_np (bound the PREADLOG/DEEPTRACE stack walk to the real stack)
 #endif
+#include "hle/fs/save_capacity.hpp"   // allocation record + usage for GetMountInfo (#3654)
 #include "hle/dispatch/dispatch.hpp"
 #include "hle/fs/save_paths.hpp"
 #include "hle/service/hle_addcontent.hpp"
@@ -942,10 +943,15 @@ std::string resolve_guest_path(const char* guest_path) {
 // opens an existing directory or creates a missing one. The outcome lets the HLE write an honest
 // MountResult status instead of deriving CREATED from the requested mode.
 bool savedata_dirname_ok(const std::string& dirname) {
+    // kSaveCapacityDirName is prosper's per-title allocation bookkeeping (#3654). It sits beside the
+    // saves, so a guest dirName spelling it would mount prosper's records as a save. The SDK's own
+    // dirName alphabet has no '.', so no valid guest name is refused by this.
     return !dirname.empty() && dirname != "." && dirname != ".." &&
+           dirname != kSaveCapacityDirName &&
            dirname.find('/') == std::string::npos && dirname.find('\\') == std::string::npos;
 }
-SaveDataMountOutcome savedata0_mount(const char* dirname, SaveDataMountPolicy policy) {
+SaveDataMountOutcome savedata0_mount(const char* dirname, SaveDataMountPolicy policy,
+                                     uint64_t requested_blocks) {
     // Reject an empty / traversal dirName before composing the host path — otherwise a name like
     // "../foo" would stat/create a directory OUTSIDE the save sandbox root (savedata0_dir_mtime already
     // guards this; sharing savedata_dirname_ok keeps the two paths from diverging again).
@@ -985,6 +991,9 @@ SaveDataMountOutcome savedata0_mount(const char* dirname, SaveDataMountPolicy po
         // report EXISTS and must not activate the mount in that case.
         if (!created && policy == SaveDataMountPolicy::Create) return SaveDataMountOutcome::Exists;
     }
+    // Retain the requested allocation (#3654). A failure to write the record does not fail the
+    // mount -- the save itself is there -- it leaves the capacity reported as unknown, loudly.
+    save_allocation_note_mount(save0_base(), dirname, created, requested_blocks);
     std::lock_guard<std::mutex> lk(g_save0_mx);
     g_save0 = d;
     return created ? SaveDataMountOutcome::Created : SaveDataMountOutcome::Opened;

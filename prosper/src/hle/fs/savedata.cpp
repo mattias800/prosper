@@ -3,6 +3,7 @@
 // output struct and report a sane "not signed in / no device" state and success, so the
 // game gets consistent values instead of uninitialized memory.
 // (Game-controller input — libScePad — moved to hle_pad.cpp with a real host backend.)
+#include "hle/fs/save_capacity.hpp"   // GetMountInfo accounting (#3654)
 #include "hle/dispatch/dispatch.hpp"
 #include "hle/service/hle_addcontent.hpp"
 #include "hle/fs/save_paths.hpp"   // per-title save roots (#2734)
@@ -571,13 +572,15 @@ HLE(s_savemem_sync) {
 //   Mount:  dirName pointer @0x10, blocks @0x20, mode @0x28, size 0x50
 //   Mount2: dirName pointer @0x08, blocks @0x10, mode @0x18, size 0x40
 // Mount3's PS5-native layout is documented below. MountResult is the shared exact 0x40-byte shape.
+// `blocks` (SceSaveDataBlocks, u64) is carried to the backend, which records it as the save's
+// allocation when this mount creates it (#3654, hle/fs/save_capacity.hpp).
 static uint64_t savedata_mount_common(const char* api, const char* dirname,
-                                      uint32_t mode, uint64_t result_va) {
+                                      uint32_t mode, uint64_t blocks, uint64_t result_va) {
     if (!dirname || !*dirname || !result_va) return SAVE_DATA_ERR_PARAMETER;
     const SaveDataMountPolicy policy = (mode & 0x04) ? SaveDataMountPolicy::Create
         : (mode & 0x20) ? SaveDataMountPolicy::OpenOrCreate
                         : SaveDataMountPolicy::Open;
-    const SaveDataMountOutcome outcome = savedata0_mount(dirname, policy);
+    const SaveDataMountOutcome outcome = savedata0_mount(dirname, policy, blocks);
     if (outcome == SaveDataMountOutcome::Exists) {
         if (svclog()) fprintf(stderr, "[svc]   %s dir='%s' mode=%#x -> EXISTS\n",
                               api, dirname, mode);
@@ -593,8 +596,8 @@ static uint64_t savedata_mount_common(const char* api, const char* dirname,
     memcpy(result, "/savedata0", 11);
     const bool created = outcome == SaveDataMountOutcome::Created;
     *(uint32_t*)(result + 0x1c) = created ? 1u : 0u;
-    if (svclog()) fprintf(stderr, "[svc]   %s dir='%s' mode=%#x -> OK (created=%d)\n",
-                          api, dirname, mode, (int)created);
+    if (svclog()) fprintf(stderr, "[svc]   %s dir='%s' mode=%#x blocks=%llu -> OK (created=%d)\n",
+                          api, dirname, mode, (unsigned long long)blocks, (int)created);
     return 0;
 }
 
@@ -603,8 +606,9 @@ HLE(s_savedata_mount) {
     if (!a0 || !a1) return SAVE_DATA_ERR_PARAMETER;
     const uint8_t* mount = (const uint8_t*)PW(a0);
     const char* dirname = *(const char* const*)(mount + 0x10);
+    const uint64_t blocks = *(const uint64_t*)(mount + 0x20);
     const uint32_t mode = *(const uint32_t*)(mount + 0x28);
-    return savedata_mount_common("Mount", dirname, mode, a1);
+    return savedata_mount_common("Mount", dirname, mode, blocks, a1);
 }
 
 HLE(s_savedata_mount2) {
@@ -612,8 +616,9 @@ HLE(s_savedata_mount2) {
     if (!a0 || !a1) return SAVE_DATA_ERR_PARAMETER;
     const uint8_t* mount = (const uint8_t*)PW(a0);
     const char* dirname = *(const char* const*)(mount + 0x08);
+    const uint64_t blocks = *(const uint64_t*)(mount + 0x10);
     const uint32_t mode = *(const uint32_t*)(mount + 0x18);
-    return savedata_mount_common("Mount2", dirname, mode, a1);
+    return savedata_mount_common("Mount2", dirname, mode, blocks, a1);
 }
 
 // sceSaveDataMount3(const Mount3* mount, MountResult* result). The mount desc layout is pinned
@@ -636,8 +641,9 @@ HLE(s_savedata_mount3)  {
     if (!a0 || !a1) return SAVE_DATA_ERR_PARAMETER;
     const uint8_t* m = (const uint8_t*)PW(a0);
     const char* dirname = *(const char* const*)(m + 0x08);
+    const uint64_t blocks = *(const uint64_t*)(m + 0x10);
     uint32_t mode = *(const uint32_t*)(m + 0x20);
-    return savedata_mount_common("Mount3", dirname, mode, a1);
+    return savedata_mount_common("Mount3", dirname, mode, blocks, a1);
 }
 // The mount-point argument every one of these calls takes is SceSaveDataMountPoint { char data[16] }.
 // Accept only the mount this build serves, so a title passing a different one is refused instead of
@@ -780,13 +786,13 @@ HLE(s_savedata_umount2) {
 // policy rather than a new one: Mount3's NOT_FOUND path "writes NOTHING" and GetParam refuses before
 // touching `out`. Validation therefore happens before the first store, not after it.
 //
-// The capacity figures are deliberately NOT touched by this change: real used/free accounting is
-// #3654. They remain a fixed, consistent 256K blocks, derived from nothing.
+// The capacity figures come from the save store (#3654): the allocation recorded when the save was
+// created, and the blocks its files occupy now. hle/fs/save_capacity.hpp states the accounting rule
+// and how sure each part of it is. An allocation prosper never saw keeps the pre-#3654 answer.
 constexpr size_t   SAVE_DATA_MOUNT_INFO_SIZE           = 48;
 constexpr size_t   SAVE_DATA_MOUNT_INFO_OFF_BLOCKS     = 0;
 constexpr size_t   SAVE_DATA_MOUNT_INFO_OFF_FREE       = 8;
 constexpr size_t   SAVE_DATA_MOUNT_INFO_OFF_RESERVED   = 16;
-constexpr uint64_t SAVE_DATA_MOUNT_INFO_FIXED_BLOCKS   = 0x40000;   // #3654 owns real accounting
 static_assert(SAVE_DATA_MOUNT_INFO_OFF_RESERVED + 32 == SAVE_DATA_MOUNT_INFO_SIZE,
               "SceSaveDataMountInfo is blocks + freeBlocks + reserved[32]");
 HLE(s_savedata_mountinfo) {
@@ -794,16 +800,43 @@ HLE(s_savedata_mountinfo) {
     if (!savedata_mount_point_ok(a0) || !a1) return SAVE_DATA_ERR_PARAMETER;
     // A COPY of the mounted path, not a mount LEASE: savedata0_mounted_dir() releases the mount
     // mutex before returning, so a concurrent sceSaveDataUmount2 on another guest thread can land
-    // the instant after this test and the answer below is then one sample old. That is sound here
-    // only because nothing after this line depends on the mount still being live -- this handler
-    // touches no file. Whoever implements #3654 must not read the emptiness test as a lease: a stat
-    // of the save directory has to treat a path that vanished under it as NOT_MOUNTED, not as an
-    // internal error, and must not assume the directory it measured is still /savedata0.
-    if (savedata0_mounted_dir().empty()) return SAVE_DATA_ERR_NOT_MOUNTED;
+    // the instant after this and the answer below is then one sample old. So the measurement below
+    // treats a directory that vanished under it as NOT_MOUNTED rather than as an internal error, and
+    // it measures the directory it was handed, whatever is mounted by the time it finishes.
+    const std::string dir = savedata0_mounted_dir();
+    if (dir.empty()) return SAVE_DATA_ERR_NOT_MOUNTED;
+    uint64_t used = 0;
+    if (!save_usage_blocks(dir, used)) {
+        std::error_code ec;
+        if (!std::filesystem::is_directory(dir, ec)) return SAVE_DATA_ERR_NOT_MOUNTED;
+        if (svclog()) fprintf(stderr, "[svc]   GetMountInfo: cannot measure '%s' -> INTERNAL\n",
+                              dir.c_str());
+        return SAVE_DATA_ERR_INTERNAL;
+    }
+    const std::filesystem::path mounted(dir);
+    uint64_t allocation = 0;
+    const SaveAllocationState state = save_allocation_read(mounted.parent_path().string(),
+                                                           mounted.filename().string(), allocation);
+    if (state != SaveAllocationState::Present) {
+        // Loud, once per process: this answer is the legacy constant, not the save's real size.
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true))
+            fprintf(stderr, "[savedata] the allocation of save '%s' is unknown (record %s); reporting "
+                            "the legacy capacity of %llu blocks minus usage. The record is left untouched.\n",
+                    dir.c_str(),
+                    state == SaveAllocationState::Corrupt ? "corrupt"
+                    : state == SaveAllocationState::Unreadable ? "unreadable" : "absent",
+                    (unsigned long long)kSaveUnknownAllocationBlocks);
+    }
+    const SaveCapacity cap =
+        save_capacity_from(state == SaveAllocationState::Present, allocation, used);
+    if (svclog()) fprintf(stderr, "[svc]   GetMountInfo: blocks=%llu free=%llu used=%llu (record %d)\n",
+                          (unsigned long long)cap.blocks, (unsigned long long)cap.free_blocks,
+                          (unsigned long long)used, (int)state);
     uint8_t* info = (uint8_t*)PW(a1);
     memset(info, 0, SAVE_DATA_MOUNT_INFO_SIZE);   // reserved[32] reads back zeroed, as before
-    *(uint64_t*)(info + SAVE_DATA_MOUNT_INFO_OFF_BLOCKS) = SAVE_DATA_MOUNT_INFO_FIXED_BLOCKS;
-    *(uint64_t*)(info + SAVE_DATA_MOUNT_INFO_OFF_FREE)   = SAVE_DATA_MOUNT_INFO_FIXED_BLOCKS;
+    *(uint64_t*)(info + SAVE_DATA_MOUNT_INFO_OFF_BLOCKS) = cap.blocks;
+    *(uint64_t*)(info + SAVE_DATA_MOUNT_INFO_OFF_FREE)   = cap.free_blocks;
     return 0;
 }
 // --- sceSaveDataSetParam / sceSaveDataGetParam (#2786) -----------------------------------------
