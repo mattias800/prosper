@@ -1,89 +1,23 @@
 #pragma once
 
-// Lifted out of live_compute.cpp's anonymous namespaces so the code that operates on them
-// can live in its own translation units. Declared in prosper/frontends/shared/live; who may include it is
-// a decision this banner does not make -- say so with --note if it is restricted.
-
-#include "shared/live/live_compute.hpp"
-#include "shared/compute/storage_write_mask_spirv.hpp"
-#include "shared/diagnostics/trip_bound_witness.hpp"
-#include "shared/compute/compute_authority_live_census.hpp"
-#include "shared/compute/compute_image_borrow_census.hpp"
-#include "shared/compute/compute_timing_selector.hpp"
-#include "shared/compute/compute_buffer_timing.hpp"
-#include "shared/compute/compute_transfer_gate_census.hpp"
-#include "shared/compute/storage_image_alias_plan.hpp"
-#include "shared/live/decode_scratch.hpp"  // pooled full-surface intermediates (#3309's mechanism)
-#include "shared/live/live_target_format.hpp"
-#include "shared/live/packed_rtt_conversion.hpp"
-#include "shared/live/gpu_retile.hpp"
-#include "shared/rtt/rtt_scale.hpp"
-#include "shared/rtt/rtt_authority.hpp"
-#include "shared/device/pipeline_cache_file.hpp"  // #3425: one checked envelope for both stages
-#include "shared/device/vulkan_device_select.hpp"
-#include "shared/device/image_robustness.hpp"  // #3531: the recompiler's OOB image-read contract
-#include "shared/texture/write_watch_census.hpp"
-#include "shared/texture/write_watch_policy.hpp"
-#include "diagnostics/env_numeric.hpp"   // #3253: a typo must not select a different setting
-#include "shared/perf/performance_capture.hpp"      // bounded F8 post-trigger compute timing
-#include "shared/perf/performance_timing_policy.hpp" // F8 measures without enabling verbose timing logs
-
-#include "gpu/texture/bc_decode.hpp"
-#include "gpu/diagnostics/vk_object_names.hpp"   // #3578
-#include "gpu/capture/gpu_capture.hpp"
-#include "gpu/diagnostics/gpu_memory_budget_vk.hpp"  // #3533: how much of the heap does prosper hold?
-#include "gpu/execute/gpu_execute.hpp"
-#include "gpu/execute/host_read_barrier.hpp"  // #3249: a host read of a dispatch result needs an availability op
-#include "gpu/execute/float_controls_probe.hpp"  // #3479: the device gate on SignedZeroInfNanPreserve
-#include "gpu/recompiler/rdna2_decode.hpp"
-#include "gpu/recompiler/gta5/rdna2_gta5_cf9200_contract.hpp"
-#include "gpu/resources/shader_resources.hpp"
-#include "gpu/recompiler/spirv_builder.hpp"
-#include "gpu/resources/mip_chain_plan.hpp"
-#include "gpu/resources/atomic_image_staging.hpp"  // #3195: the LOGICAL/PHYSICAL atomic-image extent split
-#include "gpu/resources/image_identity.hpp"
-#include "gpu/resources/compressed_source_authority.hpp"
-#include "gpu/resources/spirv_storage_match.hpp"  // #3204: SPIR-V/guest storage agreement  // #3204: named image-identity predicates
-#include "gpu/texture/tile.hpp"
-#include "gpu/capture/writer_provenance.hpp"
-#include "host/memory/guest_write_watch.hpp"
-#include "host/platform/gpu_submit_gate.hpp"  // #3225: refuse submits once the frontend shuts down
-
-#include <vulkan/vulkan.h>
+// Exact byte comparison and copy for the live compute backend's buffer uploads and writebacks, and
+// the bounded worker split they share with its storage-image format conversions. Lifted out of
+// live/live_compute.cpp (#3699) because nothing here touches a device: these are pure functions
+// over two host byte ranges, so the property the differential upload depends on --
+// `compute_buffers_diff_span` reports an EXACT extent -- is unit-tested on every platform
+// (tests/shared/compute/test_compute_buffer_diff_span.cpp), not only where Vulkan is found.
 
 #include <algorithm>
 #include <atomic>
-#include <array>
-#include <cerrno>
-#include <chrono>
-#include <cmath>
+#include <cstddef>
+#include <cstdint>
 #include <cstdlib>
-#include <cstdio>
 #include <cstring>
-#include <functional>
-#include <filesystem>
-#include <fstream>
-#include <map>
-#include <memory>
-#include <mutex>
-#include <optional>
-#include <string>
 #include <system_error>
 #include <thread>
-#include <tuple>
-#include <unordered_map>
-#include <set>
-#include <unordered_set>
 #include <vector>
 
-#if (defined(__x86_64__) || defined(__i386__)) && \
-    (defined(__GNUC__) || defined(__clang__))
-#include <immintrin.h>
-#define PROSPER_HAVE_TARGET_F16C 1
-#endif
-
 namespace prosper::frontend {
-
 
 // Large storage-image format conversions are independent per texel. Astro Bot's 4K FP16 target is
 // 8.3 million texels, so leaving its lookup/pack walk on one core made a ~5 ms GPU dispatch wait on

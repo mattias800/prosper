@@ -13722,11 +13722,6 @@ uint64_t live_compute_storage_result_snapshot_bytes() {
     return context ? context->storage_result_snapshot_bytes : 0;
 }
 
-bool compute_buffer_diff_span_for_test(const void* lhs, const void* rhs, size_t bytes,
-                                       size_t* first, size_t* last) {
-    return compute_buffers_diff_span(lhs, rhs, bytes, first, last);
-}
-
 uint64_t live_compute_image_result_snapshot_bytes() {
     const VulkanComputeContext* context = g_live_compute_context.load(std::memory_order_acquire);
     return context ? context->image_result_snapshot_bytes : 0;
