@@ -7095,9 +7095,17 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     // A DEPTH_CLEAR_ENABLE bit only acts through the enabled depth-write path (see
     // depth_clear_effective) — the writes-disabled Blue Prince light-loop shape is depth-inert and
     // must not force a depth attachment, pick the clear value, or clear in-pass (#1287).
+    // Investigation-only A/B control for #2790. This reproduces the lit-world probe: limit
+    // attachment clears to ALWAYS draws, then prevent those draws from overwriting the clear with
+    // their interpolated depth. It is not a claim about the guest hardware's clear semantics.
+    static const bool sonic_clear_probe = [] {
+        const char* value = std::getenv("PROSPER_DIAG_CLEAR_OVERWRITE");
+        return value && value[0] == '2' && value[1] == '\0';
+    }();
     const auto effective_depth_clear = [](const prosper::gpu::ResolvedPipelineState* ps) {
         return depth_clear_effective(ps->depth_clear_enable, ps->depth_test_enable,
-                                     ps->depth_write_enable, ps->depth_compare_op);
+                                     ps->depth_write_enable, ps->depth_compare_op) &&
+               (!sonic_clear_probe || ps->depth_compare_op == VK_COMPARE_OP_ALWAYS);
     };
     for (const auto& d : draws) {
         if (!d.ps) continue;
@@ -9365,6 +9373,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             dss.depthTestEnable  = VK_TRUE;
             dss.depthWriteEnable = ps->depth_write_enable ? VK_TRUE : VK_FALSE;
             dss.depthCompareOp   = (VkCompareOp)ps->depth_compare_op;
+            if (sonic_clear_probe && effective_depth_clear(ps))
+                dss.depthWriteEnable = VK_FALSE;
             // UE4 repeats its reverse-Z depth prepass in a separately translated base-pass shader.
             // A one-ULP position difference between those shaders makes exact EQUAL reject the whole
             // base pass, although the guest hardware accepts the pair. Preserve occlusion by relaxing
