@@ -125,6 +125,26 @@ inline std::string native_texel_line(prosper::gpu::LiveTargetPixelFormat format,
     return line;
 }
 
+// Why a readback cannot be decoded, or "" when it can. Shared by both reports so their refusals
+// are worded identically; `label` names the report the line belongs to.
+inline std::string native_readback_problem(const char* label,
+                                           prosper::gpu::LiveTargetPixelFormat format,
+                                           const NativeTexelLayout& layout,
+                                           const uint8_t* bytes, size_t size,
+                                           uint32_t width, uint32_t height) {
+    if (!layout.bytes)
+        return std::string("  ") + label + ": format enumerator " +
+               std::to_string(static_cast<int>(format)) + " is not handled here\n";
+    const uint64_t expected = static_cast<uint64_t>(width) * height * layout.bytes;
+    if (bytes && size == expected) return {};
+    char line[192];
+    std::snprintf(line, sizeof line, "  %s: %s %ux%u wants %llu bytes, readback has %llu\n",
+                  label, layout.name, width, height,
+                  static_cast<unsigned long long>(expected),
+                  static_cast<unsigned long long>(size));
+    return line;
+}
+
 // Format the first `max_texels` texels of `bytes` in the target's native type.
 //
 // Returns a human-readable block, ALWAYS non-empty: when the format is unhandled or the byte
@@ -135,20 +155,10 @@ inline std::string format_native_texels(prosper::gpu::LiveTargetPixelFormat form
                                         uint32_t width, uint32_t height,
                                         size_t max_texels) {
     const NativeTexelLayout layout = native_texel_layout(format);
-    if (!layout.bytes)
-        return std::string("  native readback: format enumerator ") +
-               std::to_string(static_cast<int>(format)) + " is not handled here\n";
+    const std::string problem =
+        native_readback_problem("native readback", format, layout, bytes, size, width, height);
+    if (!problem.empty()) return problem;
     const uint64_t texels = static_cast<uint64_t>(width) * height;
-    const uint64_t expected = texels * layout.bytes;
-    if (!bytes || size != expected) {
-        char line[192];
-        std::snprintf(line, sizeof line,
-                      "  native readback: %s %ux%u wants %llu bytes, readback has %llu\n",
-                      layout.name, width, height,
-                      static_cast<unsigned long long>(expected),
-                      static_cast<unsigned long long>(size));
-        return line;
-    }
 
     std::string out;
     char head[160];
@@ -185,20 +195,9 @@ inline std::string format_native_texels_at(prosper::gpu::LiveTargetPixelFormat f
                                            uint32_t width, uint32_t height,
                                            const std::vector<NativeTexelPoint>& points) {
     const NativeTexelLayout layout = native_texel_layout(format);
-    if (!layout.bytes)
-        return std::string("  native texels at points: format enumerator ") +
-               std::to_string(static_cast<int>(format)) + " is not handled here\n";
-    const uint64_t texels = static_cast<uint64_t>(width) * height;
-    const uint64_t expected = texels * layout.bytes;
-    if (!bytes || size != expected) {
-        char line[192];
-        std::snprintf(line, sizeof line,
-                      "  native texels at points: %s %ux%u wants %llu bytes, readback has %llu\n",
-                      layout.name, width, height,
-                      static_cast<unsigned long long>(expected),
-                      static_cast<unsigned long long>(size));
-        return line;
-    }
+    const std::string problem = native_readback_problem("native texels at points", format, layout,
+                                                        bytes, size, width, height);
+    if (!problem.empty()) return problem;
     char head[160];
     std::snprintf(head, sizeof head, "  native texels at %zu point(s): %s %ux%u\n",
                   points.size(), layout.name, width, height);
