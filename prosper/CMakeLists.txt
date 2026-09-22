@@ -3261,6 +3261,18 @@ endif()
         ENVIRONMENT "PROSPER_GPU_REPLAY_DS_SEEDS=1")
       set_tests_properties(depth_cube_source_snapshot_control PROPERTIES
         ENVIRONMENT "PROSPER_GPU_REPLAY_DS_SEEDS=1;PROSPER_NO_CUBE_SOURCE_SNAPSHOT_PRUNING=1")
+      add_executable(test_depth_array_source_snapshot tests/shared/live/test_depth_array_source_snapshot.cpp)
+      target_include_directories(test_depth_array_source_snapshot PRIVATE frontends src tests)
+      target_link_libraries(test_depth_array_source_snapshot PRIVATE prosper_core prosper_live_renderer Vulkan::Vulkan)
+      add_test(NAME depth_array_source_snapshot COMMAND test_depth_array_source_snapshot)
+      add_executable(test_depth_only_attachment_extent tests/shared/live/test_depth_only_attachment_extent.cpp)
+      target_include_directories(test_depth_only_attachment_extent PRIVATE frontends src tests)
+      target_link_libraries(test_depth_only_attachment_extent PRIVATE prosper_core prosper_live_renderer Vulkan::Vulkan)
+      add_test(NAME depth_only_attachment_extent COMMAND test_depth_only_attachment_extent)
+      add_executable(test_float32_array_upload tests/shared/live/test_float32_array_upload.cpp)
+      target_include_directories(test_float32_array_upload PRIVATE frontends src tests)
+      target_link_libraries(test_float32_array_upload PRIVATE prosper_core prosper_live_renderer Vulkan::Vulkan)
+      add_test(NAME float32_array_upload COMMAND test_float32_array_upload)
       add_executable(test_decoder_source_snapshot tests/shared/live/test_decoder_source_snapshot.cpp)
       target_include_directories(test_decoder_source_snapshot PRIVATE frontends src tests)
       target_link_libraries(test_decoder_source_snapshot PRIVATE prosper_core prosper_live_renderer Vulkan::Vulkan)
@@ -3665,6 +3677,17 @@ endif()
       set_tests_properties(storage_rtt_gpu_seed storage_rtt_cpu_seed
                            storage_rtt_result_retention storage_rtt_result_retention_off
                            PROPERTIES TIMEOUT 60)
+
+      add_executable(test_compute_transfer_mip_chain
+                     tests/gpu/execute/test_compute_transfer_mip_chain.cpp)
+      target_include_directories(test_compute_transfer_mip_chain PRIVATE tests frontends)
+      target_link_libraries(test_compute_transfer_mip_chain PRIVATE
+                           prosper_live_renderer prosper_core Vulkan::Vulkan)
+      add_test(NAME compute_transfer_mip_chain COMMAND ${CMAKE_COMMAND} -E env
+               PROSPER_COMPUTE_IMAGE_CACHE_MIN_KB=0
+               PROSPER_COMPUTE_STORAGE_IMAGE_CACHE_MIN_KB=0
+               $<TARGET_FILE:test_compute_transfer_mip_chain>)
+      set_tests_properties(compute_transfer_mip_chain PROPERTIES TIMEOUT 60)
 
       add_executable(test_near_full_storage_authority
                      tests/gpu/execute/test_near_full_storage_authority.cpp)

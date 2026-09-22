@@ -2,6 +2,7 @@
 """The verdict must not soften: a black frame has four causes and they are not interchangeable."""
 import struct
 import unittest
+from types import SimpleNamespace
 import pixel_history as ph
 
 
@@ -904,6 +905,86 @@ class TransferControlCheckTests(unittest.TestCase):
 
     def test_a_correct_reading_of_both_halves_passes(self):
         self.assertEqual(ph.check_control(self.regions()), [])
+
+
+class ReplaySelection(unittest.TestCase):
+    """The history cutoff must include transfers after the draw that identified the target."""
+
+    @staticmethod
+    def fixture():
+        def action(eid, flags=0, children=()):
+            return SimpleNamespace(eventId=eid, flags=flags, children=children)
+
+        rd = SimpleNamespace(ActionFlags=SimpleNamespace(Drawcall=1),
+                             TextureCategory=SimpleNamespace(ColorTarget=1),
+                             ResourceId=SimpleNamespace(Null=lambda: 0))
+        target = SimpleNamespace(resourceId=7, creationFlags=1)
+        unrelated = SimpleNamespace(resourceId=9, creationFlags=1)
+
+        class Controller:
+            def __init__(self):
+                self.current = 0
+                self.selected = []
+                # Synthetic grouping marker 1000 remaps to before its first child. The final
+                # real leaf is a transfer, nested inside that marker and after the last draw.
+                self.roots = [action(1000, children=[action(10, 1), action(20, 1),
+                                                    action(30)])]
+
+            def GetRootActions(self):
+                return self.roots
+
+            def SetFrameEvent(self, eid, force):
+                self.selected.append((eid, force))
+                self.current = 9 if eid == 1000 else eid
+
+            def GetTextures(self):
+                return [unrelated, target]
+
+            def GetPipelineState(self):
+                # Only the draw's bindings identify this target. At capture end no graphics
+                # framebuffer remains bound; a texture scan would choose unrelated resource 9.
+                outputs = [SimpleNamespace(resource=7)] if self.current == 20 else []
+                return SimpleNamespace(GetOutputTargets=lambda: outputs)
+
+            def PixelHistory(self, resource):
+                assert resource == 7
+                history = [ev(True, shader=(0, 0, 0, 1), eid=20),
+                           transfer(eid=30, pre=(0, 0, 0, 1), post=(1, .5, 0, 1))]
+                return [entry for entry in history if entry["eventId"] <= self.current]
+
+        return Controller(), rd
+
+    def test_post_draw_transfer_is_evaluated_on_last_draws_target(self):
+        ctl, rd = self.fixture()
+        # The former cutoff reproduces the control failure under the API's documented filter.
+        ctl.SetFrameEvent(20, True)
+        self.assertEqual(ph.classify(ctl.PixelHistory(7))[0], "SHADER_WROTE_BLACK")
+        ctl.selected.clear()
+        tex, source, targets, draws, selected_eid, end_eid = ph.select_history_target(ctl, rd, 0)
+        self.assertEqual(tex.resourceId, 7)
+        self.assertEqual(source, "bound output targets at the last draw")
+        self.assertEqual((targets, draws, selected_eid, end_eid), (1, 2, 20, 30))
+        self.assertEqual(ctl.selected, [(20, True), (30, True)])
+        self.assertEqual(ph.classify(ctl.PixelHistory(tex.resourceId))[0], "TRANSFER_WROTE_PIXEL")
+
+    def test_draw_at_capture_end_still_selects_its_output(self):
+        ctl, rd = self.fixture()
+        ctl.roots[0].children.pop()
+        tex, _, _, _, selected_eid, end_eid = ph.select_history_target(ctl, rd, 0)
+        self.assertEqual((tex.resourceId, selected_eid, end_eid), (7, 20, 20))
+
+    def test_missing_draw_does_not_guess_a_transfer_target(self):
+        ctl, rd = self.fixture()
+        ctl.roots[0].children = ctl.roots[0].children[-1:]
+        with self.assertRaisesRegex(RuntimeError, "no draw actions"):
+            ph.select_history_target(ctl, rd, 0)
+        self.assertEqual(ctl.selected, [])
+
+    def test_invalid_index_does_not_silently_select_another_target(self):
+        ctl, rd = self.fixture()
+        with self.assertRaisesRegex(RuntimeError, "out of range"):
+            ph.select_history_target(ctl, rd, 1)
+        self.assertEqual(ctl.selected, [(20, True)])
 
 
 if __name__ == "__main__":

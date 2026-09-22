@@ -7921,17 +7921,26 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // DOLL UE4 volume initializer uses dim:3D, dmask:xyz to bounds-check its 8x8x8 dispatch
             // before loading and writing the volume. Array/cube queries remain deferred with their
             // corresponding sampled-image representations.
-            // #325: arrayed-ness is a property of the RESOURCE, not of the instruction. The
-            // uploader picks the Vulkan view type from the guest T# and cannot see which opcode will
-            // sample it, so every declaration of this binding must agree with the T# or the
-            // descriptor is a mismatch. Non-array instructions reaching an array texture get a
-            // three-component coordinate with layer 0 -- the same base slice the old base-slice 2D
-            // view gave them. The predicate is guest_texture_is_uploaded_array(): img_dim 5 AND
-            // more than one layer AND block-compressed. `img_dim == 5` alone is NOT it -- a depth-1
-            // or non-BC array is a plain 2D image on both sides, and keying on img_dim is exactly
+            // #325: BC arrays follow the resource-wide T# shape, including a layer-zero
+            // coordinate for ordinary 2D instructions. Layered Float32 graphics resources have
+            // one exception below: ordinary 2D instructions select a retained base-slice view,
+            // while DIM=5 instructions need the full array. Each declaration of one binding must
+            // still agree or compilation rejects it. The predicate is
+            // guest_texture_is_uploaded_array(): img_dim 5 AND more than one layer AND a
+            // supported upload format (BC or Float32).
+            // A depth-1 or unsupported-format array stays plain 2D; keying on img_dim alone is exactly
             // the mistake this comment used to describe.
             const bool res_arrayed = res && prosper::gpu::guest_texture_is_uploaded_array(
                                                 res->img_dim, res->depth, res->format);
+            const bool graphics_float_array = !b.is_compute && res_arrayed &&
+                res->format == DataFormat::Float32 && res->cls == ResourceClass::Texture;
+            // A graphics DIM=2D read of a layered Float32 T# selects only its base slice.
+            // Keeping that declaration 2D lets a retained color RTT serve the authoritative
+            // slice; declaring an array would make the renderer reject the whole draw because
+            // the RTT owns no other layers. Actual DIM=2D_ARRAY reads still require an array.
+            // BC resources retain their resource-wide array declaration (#325).
+            const bool declared_arrayed = res_arrayed &&
+                !(graphics_float_array && in.mimg_dim == SQ_DIM_2D);
             if (in.opcode == 0x0e) {
                 uint32_t dim;
                 if (in.mimg_dim == 0u) dim = Dim_1D;
@@ -7945,22 +7954,20 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // for the array case and this dispatch is the site that still declined it -- the
                 // same lag #2265 records for the atomic coverage predicate.
                 //
-                // `res_arrayed` above, not `mimg_dim == 5`, decides which query shape is emitted,
-                // and the distinction is load-bearing. `guest_texture_is_uploaded_array()` is dim-5
-                // AND depth>1 AND block-compressed; a dim-5 T# that fails it (Sonic Frontiers' own
+                // `declared_arrayed` above, not `mimg_dim == 5`, decides which query shape is
+                // emitted, and the distinction is load-bearing. `guest_texture_is_uploaded_array()`
+                // requires dim-5, depth>1 and BC or Float32; a dim-5 T# that fails it (Sonic Frontiers' own
                 // is depth=1) is a plain 2D image on both sides, so the ivec2 path runs and out[2]
                 // keeps its default of 1 -- the true layer count for a one-layer array.
                 //
-                // What this does NOT do is report a layer count for a MULTI-layer non-BC array,
-                // because prosper does not materialize one; the query then answers for the resource
-                // as actually uploaded, consistent with what every sample of it reads.
-                // CONFIDENCE: MED on that case alone -- no title in the corpus is known to issue
-                // one, so it is reasoned rather than measured.
+                // A Float32 graphics DIM=2D query observes the base-slice view selected above;
+                // a DIM=5 query observes the full array. Unsupported multi-layer formats retain
+                // their plain 2D fallback.
                 else if (in.mimg_dim == 3u) dim = Dim_Cube;
                 else if (in.mimg_dim == 5u) dim = Dim_2D;
                 else { ok = false; return true; }
                 if (res->cls != ResourceClass::Texture) { ok = false; return true; }
-                if (!b.declare_texture(res->binding, dim, uint_texture, res_arrayed)) {
+                if (!b.declare_texture(res->binding, dim, uint_texture, declared_arrayed)) {
                     ok = false; return true;
                 }
                 uint32_t out[4]; b.image_get_resinfo(res->binding, dim, vread(in.src[0].value), out);
@@ -8040,10 +8047,19 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // CONFIDENCE: HIGH — operand order is ISA-defined and an execution regression distinguishes the
             // requested gradient-selected mip from the implicit-derivative result.
             const bool is_sample_d = (in.opcode == 0x22);
-            // #325: 2D_ARRAY resources are now uploaded and declared as real arrays -- see
-            // res_arrayed above. The historical base-slice fallback this comment used to describe is
-            // gone; what remains of it is that a non-array INSTRUCTION reaching an array resource
-            // reads layer 0, which is the same slice it used to get.
+            // These array lowerings preserve the guest's layer operand. The older generic
+            // bias/gradient/offset/gather helpers default arrays to layer zero, so do not admit
+            // those forms for the newly supported Float32 graphics representation.
+            if (graphics_float_array && in.mimg_dim == 5u &&
+                (in.mimg_a16 || (!is_load && !is_sample && !is_sample_l &&
+                                 !is_sample_lz && !is_sample_c_lz))) {
+                ok = false;
+                return true;
+            }
+            // #325: supported 2D_ARRAY resources can be uploaded as arrays. BC graphics
+            // declarations remain resource-wide; an ordinary instruction on one reads layer 0.
+            // Layered Float32 graphics resources can instead expose a 2D base-slice view when
+            // every consumer of the binding declares it that way.
             const bool dim2d = (in.mimg_dim == 1u || in.mimg_dim == 5u), dim3d = (in.mimg_dim == 2u);
             const bool dim_msaa = in.mimg_dim == 6u;
             const bool dimcube = (in.mimg_dim == 3u);   // CUBE: stacked-face 2D lowering (#273, below)
@@ -8274,7 +8290,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     // faces as one vertical 2D stack, so compare the transformed face coordinate
                     // manually through its ordinary non-compare sampler (#1167/#1169).
                     if (uint_texture || !res->depth_compare) { ok = false; return true; }
-                    if (!b.declare_texture(res->binding, Dim_2D, false, res_arrayed)) {
+                    if (!b.declare_texture(res->binding, Dim_2D, false, declared_arrayed)) {
                         ok = false; return true;
                     }
                     b.image_sample_dref_manual_2d(res->binding, uf, v6, vread(cvg(0)),
@@ -8282,7 +8298,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                                                   res->mag_filter != 0u, res->addr_uvw[0],
                                                   res->addr_uvw[1], res->border_color_type, out);
                 } else {
-                    if (!b.declare_texture(res->binding, Dim_2D, uint_texture, res_arrayed)) {
+                    if (!b.declare_texture(res->binding, Dim_2D, uint_texture, declared_arrayed)) {
                         ok = false; return true;
                     }
                     b.image_sample_lod_2d(res->binding, uf, v6, b.uconst(0), out);
@@ -8349,7 +8365,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         // are uploaded as plain 2D, and declaring them Arrayed produced
                         // VUID-vkCmdDraw-viewType-07752 (caught by tools/vkval, not by ctest --
                         // validation errors do not fail a test).
-                        if (!b.declare_texture(res->binding, Dim_2D, false, res_arrayed)) {
+                        if (!b.declare_texture(res->binding, Dim_2D, false, declared_arrayed)) {
                             ok = false; return true;
                         }
                         b.image_sample_dref_manual_2d(
@@ -8359,7 +8375,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                             vread(cvg(0)),
                             res->depth_compare_func, res->mag_filter != 0u,
                             res->addr_uvw[0], res->addr_uvw[1], res->border_color_type,
-                            out, res_arrayed, vread(cvg(3)));
+                            out, declared_arrayed, vread(cvg(3)));
                     }
                 } else if (in.mimg_dim == 1u) {
                     // Plain 2D form (Blue Prince's lit-material PSes, #1271: 436 rejects/run, all
@@ -8367,7 +8383,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     // scene rendered unattenuated/blown-out). Same 8.2.5 vaddr order with no array
                     // slice: [dref, u, v]. Lowered as a manual compare against the color-sampled
                     // shadow map (see image_sample_dref_manual_2d for why not a compare sampler).
-                    if (!b.declare_texture(res->binding, Dim_2D, false, res_arrayed)) {
+                    if (!b.declare_texture(res->binding, Dim_2D, false, declared_arrayed)) {
                         ok = false; return true;
                     }
                     b.image_sample_dref_manual_2d(
@@ -8387,7 +8403,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 uint32_t dm = in.mimg_dmask;
                 if (dm != 1u && dm != 2u && dm != 4u && dm != 8u) { ok = false; return true; }
                 uint32_t comp = dm == 1u ? 0u : dm == 2u ? 1u : dm == 4u ? 2u : 3u;
-                if (!b.declare_texture(res->binding, Dim_2D, uint_texture, res_arrayed)) {
+                if (!b.declare_texture(res->binding, Dim_2D, uint_texture, declared_arrayed)) {
                     ok = false; return true;
                 }
                 if (is_gather_lz_o)   // vaddr order for _o: [packed offset, u, v]
@@ -8419,8 +8435,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 }
                 return true;
             } else {
-                const bool load_2d_array = b.is_compute && in.opcode == 0x00 &&
-                    in.mimg_dim == 5u && res->img_dim == 5u;
+                const bool load_2d_array = (b.is_compute || graphics_float_array) &&
+                    in.opcode == 0x00 && in.mimg_dim == 5u && res->img_dim == 5u;
                 const bool mip_load_2d_array = b.is_compute && is_zero_mip_load &&
                     in.mimg_dim == 5u && res->img_dim == 5u;
                 // #325: array SAMPLE was restricted to compute. Nothing about an array slice is
@@ -8430,9 +8446,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // rendered flat. Measured on a captured Croft Manor frame, zeroing slices 1..255
                 // changed 0.0% of pixels while zeroing all 256 changed 62.9%.
                 // `res_arrayed` and not `img_dim == 5` alone: the uploader arrays a resource only
-                // when it is ALSO multi-layer and block-compressed, so keying on img_dim would
-                // declare Arrayed for this title's depth-1 shadow maps and for Float32 arrays that
-                // get a plain 2D view -- VUID-vkCmdDraw-viewType-07752, the same failure as the
+                // when it is ALSO multi-layer with a supported BC/Float32 format. Keying only
+                // on img_dim would declare Arrayed for depth-1 or unsupported-format resources
+                // that receive a plain 2D view -- the same failure as the
                 // hardcoded flag two branches up, at a different site. Compute keeps its own path:
                 // it picks the view from the SPIR-V reflection, so it is not bound by that.
                 const bool array_sample = in.mimg_dim == 5u &&
@@ -8440,7 +8456,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     res->img_dim == 5u && (is_sample || is_sample_l || is_sample_lz);
                 const bool host_array = load_2d_array || mip_load_2d_array ||
                     array_sample || msaa_array_fetch;
-                if (!b.declare_texture(res->binding, Dim_2D, uint_texture, host_array || res_arrayed)) {
+                if (!b.declare_texture(res->binding, Dim_2D, uint_texture,
+                                       host_array || declared_arrayed)) {
                     ok = false; return true;
                 }
                 if (msaa_array_fetch || load_2d_array || mip_load_2d_array) {

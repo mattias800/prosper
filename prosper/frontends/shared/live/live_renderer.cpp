@@ -29,6 +29,7 @@
 #include "shared/perf/performance_timing_gate.hpp"  // turn on render_runner's existing backend clocks
 #include "shared/perf/performance_timing_policy.hpp" // retain timing across split semantic submits
 
+#include "gpu/pm4/pm4_registers.hpp"
 #include "gpu/execute/gpu_execute.hpp"          // DrawItem, set_submit_renderer
 #include "gpu/timeline/gpu_timeline.hpp"         // phase-gated detailed-capture policy
 #include "gpu/capture/writer_provenance.hpp"
@@ -3040,6 +3041,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 getenv("PROSPER_NO_COMPACT_BUFFER_RESOURCES") == nullptr &&
                 (!descriptor_validate_mode || strcmp(descriptor_validate_mode, "poison") != 0);
             struct BuiltFrameResources {
+                bool complete = true;
                 std::vector<prosper::test::FrameResource> full;
                 std::vector<prosper::test::FrameBufferResource> buffers;
                 // High bit selects buffers; remaining bits index the selected vector. Present only
@@ -3050,7 +3052,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             constexpr uint32_t kCompactBufferResourceBit = 0x80000000u;
             auto build_R = [&](const prosper::gpu::DrawItem& draw,
                                const prosper::gpu::ShaderResourceTable* vrt,
-                               const prosper::gpu::ShaderResourceTable* prt) {
+                               const prosper::gpu::ShaderResourceTable* prt,
+                               prosper::test::BackendSubmissionBatch* producer_batch) {
               BuiltFrameResources built;
               auto add = [&](const prosper::gpu::ShaderResourceTable* t, uint32_t set,
                              const std::vector<uint32_t>& spirv,
@@ -3304,6 +3307,27 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             reflected_binding->image_numeric_class !=
                                 prosper::gpu::SpirvImageNumericClass::Unknown;
                         uint32_t tw = r.width ? r.width : 4, th = r.height ? r.height : 4;
+                        const bool float32_layered_texture = r.cls == RC::Texture &&
+                            r.img_dim == 5u && r.depth > 1u &&
+                            r.format == prosper::gpu::DataFormat::Float32;
+                        // A layered T# may be consumed by an ordinary DIM=2D instruction.
+                        // That shader selects the base slice and may use its current color RTT;
+                        // only an arrayed declaration requires every layer to be materialized.
+                        // Unknown or incompatible reflection is not proof of a base-slice view.
+                        if (float32_layered_texture &&
+                            (reflected_binding->kind !=
+                                 prosper::gpu::SpirvDescriptorKind::CombinedImageSampler ||
+                             reflected_binding->image_dim != 1u ||
+                             reflected_binding->image_multisampled ||
+                             reflected_binding->image_depth || !reflected_binding->sampled_float)) {
+                            std::fprintf(stderr,
+                                "[render-array-reject] binding=%u unsupported Float32 reflected image shape\n",
+                                r.binding);
+                            built.complete = false;
+                            continue;
+                        }
+                        const bool float32_array = float32_layered_texture &&
+                            reflected_binding->image_arrayed;
                         // AvPlayer exposes NV12 as an R8 luma plane followed by an RG8 UV plane.
                         // Which resource IS that chroma plane — and why a candidate was rejected —
                         // is decided by avplayer_plane_policy.hpp, which carries the reasoning and
@@ -3679,6 +3703,16 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 normalized_sampling)) {
                             live_rtt = g_rtt.end();
                         }
+                        // A single retained color image proves only one layer. Never reinterpret its
+                        // CPU snapshot as the complete Float32 array or replace renderer authority
+                        // with stale guest bytes. Multi-layer color ownership needs a separate proof.
+                        if (float32_array && live_rtt != g_rtt.end()) {
+                            std::fprintf(stderr,
+                                "[render-array-reject] binding=%u Float32 array aliases a single color RTT\n",
+                                r.binding);
+                            built.complete = false;
+                            continue;
+                        }
                         // Deferred RTT readback (#1284): a GPU-resident target consumed in a way the
                         // GPU bind below cannot serve (e.g. format mismatch or storage image) materializes
                         // its CPU copy here on demand. Exact 2D attachment feedback is served by the
@@ -3828,7 +3862,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         // absent from every statistic the lookup keeps -- it reads as "we hold no
                         // such surface" when we may hold it and be perfectly valid. Name the
                         // failing sub-condition, once per (address, reason).
-                        if (PROSPER_ENV_ON("PROSPER_DSBRIDGE_LOG") && !has_ds_live) {
+                        if (PROSPER_ENV_ON("PROSPER_DSBRIDGE_LOG") && !has_ds_live && !float32_array) {
                             uint32_t held_w = 0, held_h = 0;
                             if (!(!has_live_rtt && !fr.is_storage_image && r.img_dim == 1u &&
                                   r.cls == RC::Texture) &&
@@ -3872,15 +3906,122 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         // is silent, because vkCreateImage's result is discarded and the null handle
                         // is used anyway (#3045).
                         const uint64_t array_budget_bytes = array_decode_budget_bytes();
+                        const uint32_t array_output_bpp = float32_array ? 16u : 4u;
+                        const uint64_t array_texels = static_cast<uint64_t>(tw) * th;
                         const uint64_t array_footprint =
-                            (uint64_t)tw * th * 4ull * (r.depth ? r.depth : 1u);
+                            array_texels > UINT64_MAX / array_output_bpp / std::max(r.depth, 1u)
+                                ? UINT64_MAX
+                                : array_texels * array_output_bpp * std::max(r.depth, 1u);
+                        if (float32_array && (!r.width || !r.height || r.depth > 2048u ||
+                            (r.num_components != 1u && r.num_components != 2u && r.num_components != 4u) ||
+                            array_footprint > array_budget_bytes)) {
+                            std::fprintf(stderr,
+                                "[render-array-reject] binding=%u Float32 %ux%ux%u components=%u "
+                                "compression=%u decoded-bytes=%llu budget=%llu\n",
+                                r.binding, r.width, r.height, r.depth, r.num_components,
+                                unsigned(r.compression_enabled),
+                                (unsigned long long)array_footprint,
+                                (unsigned long long)array_budget_bytes);
+                            built.complete = false;
+                            continue;
+                        }
+                        std::shared_ptr<const std::vector<uint8_t>> retained_depth_array;
+                        if (float32_array && !resource_compute_image_hit) {
+                            const auto& array_ctx = prosper::test::render_vk_ctx();
+                            VkFormatProperties array_properties{};
+                            if (array_ctx.ok)
+                                vkGetPhysicalDeviceFormatProperties(array_ctx.phys,
+                                    VK_FORMAT_R32G32B32A32_SFLOAT, &array_properties);
+                            const VkFormatFeatureFlags needed = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+                                ((r.min_filter || r.mag_filter)
+                                    ? VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT : 0u);
+                            if (!array_ctx.ok ||
+                                (array_properties.optimalTilingFeatures & needed) != needed) {
+                                std::fprintf(stderr,
+                                    "[render-array-reject] binding=%u RGBA32F sampling unsupported\n",
+                                    r.binding);
+                                built.complete = false;
+                                continue;
+                            }
+                            const bool depth_array_shape = r.num_components == 1u &&
+                                !r.in_mip_tail && r.layer_mip_offset_bytes == 0u;
+                            bool retained_exact = false;
+                            bool retained_subview = false;
+                            {
+                                const prosper::test::BackendPersistentResourceGuard guard;
+                                for (const auto& [key, image] : prosper::test::persistent_ds_cache()) {
+                                    (void)image;
+                                    for (const uint64_t base : {key.dr, key.dw}) {
+                                        if (!base) continue;
+                                        if (base == r.gpu_addr) retained_exact = true;
+                                        // The descriptor is already rebased to its first selected
+                                        // slice. Its explicit stride can prove overlap with an
+                                        // actual retained layer, but does not grant a complete view.
+                                        if (base >= r.gpu_addr || !r.layer_stride_bytes ||
+                                            key.w != tw || key.h != th) continue;
+                                        const uint64_t offset = r.gpu_addr - base;
+                                        if (offset % r.layer_stride_bytes) continue;
+                                        const uint64_t first = offset / r.layer_stride_bytes;
+                                        if (first <= key.slice && key.slice - first < r.depth)
+                                            retained_subview = true;
+                                    }
+                                }
+                            }
+                            if (retained_subview || (retained_exact && !depth_array_shape)) {
+                                std::fprintf(stderr,
+                                    "[render-array-reject] binding=%u unsupported retained depth view\n",
+                                    r.binding);
+                                built.complete = false;
+                                continue;
+                            }
+                            if (depth_array_shape) {
+                                std::vector<float> depth;
+                                std::string error;
+                                const auto status = prosper::test::read_persistent_ds_depth_array(
+                                    r.gpu_addr, tw, th, 0u, r.depth, depth, error, producer_batch);
+                                if (status == prosper::test::PersistentDsDepthArrayStatus::Unavailable) {
+                                    std::fprintf(stderr,
+                                        "[render-array-reject] binding=%u retained depth: %s\n",
+                                        r.binding, error.c_str());
+                                    built.complete = false;
+                                    continue;
+                                }
+                                if (status == prosper::test::PersistentDsDepthArrayStatus::Ready) {
+                                    auto pixels = std::make_shared<std::vector<uint8_t>>(
+                                        depth.size() * 4u * sizeof(float));
+                                    constexpr uint32_t defaults[4] = {0, 0, 0, 0x3f800000u};
+                                    for (size_t i = 0; i < depth.size(); ++i) {
+                                        auto* pixel = pixels->data() + i * sizeof(defaults);
+                                        std::memcpy(pixel, defaults, sizeof(defaults));
+                                        std::memcpy(pixel, &depth[i], sizeof(float));
+                                    }
+                                    retained_depth_array = std::move(pixels);
+                                    resource_has_ds_live = true;
+                                    if (PROSPER_ENV_ON("PROSPER_DSBRIDGE_LOG")) {
+                                        static unsigned reports = 0;
+                                        if (reports++ < 16u)
+                                            std::fprintf(stderr,
+                                                "[dsbridge] array addr=0x%llx %ux%ux%u exact-f32\n",
+                                                (unsigned long long)r.gpu_addr, tw, th, r.depth);
+                                    }
+                                }
+                            }
+                            if (r.compression_enabled && !retained_depth_array) {
+                                std::fprintf(stderr,
+                                    "[render-array-reject] binding=%u compressed Float32 array has no retained depth\n",
+                                    r.binding);
+                                built.complete = false;
+                                continue;
+                            }
+                        }
                         // The SHAPE question -- is this a layered array? -- is what the
                         // recompiler also answers, so it must not depend on anything the recompiler
                         // cannot see. The budget below decides only how many layers we DECODE.
                         const bool guest_array =
                             prosper::gpu::guest_texture_is_uploaded_array(r.img_dim, r.depth,
                                                                           r.format) &&
-                            r.cls == RC::Texture;
+                            r.cls == RC::Texture &&
+                            (!float32_layered_texture || float32_array);
                         fr.guest_array = guest_array;
                         const bool is_array = guest_array &&
                             array_footprint <= array_budget_bytes;
@@ -4007,7 +4148,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             persistent_unorm16_texture && r.num_components == 1u &&
                             !r.compression_enabled;
                         const bool persistent_sampled_texture = texture_decode_cache_candidate(
-                            has_live_rtt_authority, has_ds_live, r.host_data != nullptr, r.img_dim,
+                            has_live_rtt_authority, has_ds_live || retained_depth_array != nullptr,
+                            r.host_data != nullptr, r.img_dim,
                             r.cls == RC::Texture, persistent_format_supported,
                             persistent_bc_block_bytes != 0, exact_unorm16_cube);
                         resource_persistent_candidate = persistent_sampled_texture ||
@@ -4175,7 +4317,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             reflected_binding->image_numeric_class ==
                                 prosper::gpu::SpirvImageNumericClass::Sint)
                             fr.storage_image_contract_valid = false;
-                        const VkFormat decoded_texture_format = has_cpu_live_rtt
+                        const VkFormat decoded_texture_format = float32_array
+                            ? VK_FORMAT_R32G32B32A32_SFLOAT : has_cpu_live_rtt
                             ? live_rtt->second.format
                             : (portable_raw_uvec4_storage
                                    ? VK_FORMAT_R32G32B32A32_UINT
@@ -4986,6 +5129,20 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 ? 1u : compute_image_import.depth;
                             fr.img_dim = r.img_dim;
                             fr.texture_format = compute_image_format;
+                        } else if (retained_depth_array) {
+                            // Owned CPU snapshot spans every requested layer; it is never entered
+                            // into guest-byte caches, which cannot observe renderer-only rewrites.
+                            fr.tex_rgba_owner = retained_depth_array;
+                            fr.tex_rgba = retained_depth_array->data();
+                            fr.tex_byte_size = retained_depth_array->size();
+                            fr.texture_format = VK_FORMAT_R32G32B32A32_SFLOAT;
+                            fr.tw = tw;
+                            fr.th = th;
+                            fr.td = 1;
+                            fr.img_dim = r.img_dim;
+                            fr.guest_array = true;
+                            fr.sample_count = r.depth;
+                            resource_rtt_hit = true;
                         } else if (has_ds_live) {
                             fr.persistent_depth_target_id = r.gpu_addr;
                             fr.tw = sampled_ds.width;
@@ -6250,6 +6407,13 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         if (defer_detile_pixels && !fr.gpu_detile) texture_pixels.resize(nb);
                         if ((is_cube || is_array) && !cube_done && !rtt_hit && !dcc_fast_clear_done &&
                             !cube_depth_bridged) {
+                            if (float32_array && r.compression_enabled) {
+                                std::fprintf(stderr,
+                                    "[render-array-reject] binding=%u compressed Float32 guest backing\n",
+                                    r.binding);
+                                built.complete = false;
+                                continue;
+                            }
                             const uint32_t cb = prosper::gpu::bc_block_bytes(r.format);
                             const bool ctiled = prosper::gpu::tile_mode_is_tiled(r.tile_mode) &&
                                 !PROSPER_ENV_VALUE("PROSPER_NODETILE");
@@ -6279,7 +6443,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                             r.mip_tail_bytes, r.declared_mip_levels, r.size);
                             }
                             for (uint32_t fface = 0; fface < slice_count; fface++) {
-                                uint8_t* slice = texture_pixels.data() + (size_t)fface * tw * th * 4;
+                                uint8_t* slice = texture_pixels.data() + (size_t)fface * tw * th * output_bpp;
                                 if (cb) {
                                     uint32_t bw = (tw + 3) / 4, bh = (th + 3) / 4;
                                     size_t comp = (size_t)bw * bh * cb;
@@ -6333,7 +6497,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                               tw, th, r.tile_mode, 0, source_bpt)
                                         : linear_bytes;
                                     const size_t selected_span = r.in_mip_tail
-                                        ? r.mip_tail_bytes : surface_bytes;
+                                        ? r.mip_tail_bytes
+                                        : (float32_array && !ctiled && linear_padded_read
+                                               ? linear_src_row * th : surface_bytes);
                                     const uint64_t selected_addr = face_base(fface, selected_span) +
                                         (r.in_mip_tail ? 0u : r.layer_mip_offset_bytes);
                                     std::vector<uint8_t> linear(linear_bytes, 0);
@@ -6390,7 +6556,18 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     if (slice_short_count < slice_count &&
                                         nbc_want && nbc_got < nbc_want)
                                         slice_short[slice_short_count++] = fface;
-                                    if (f16) {
+                                    if (float32_array) {
+                                        // Preserve every source bit, including sub-half precision,
+                                        // signed zero and NaNs. Missing channels follow texture defaults.
+                                        const uint32_t nc = source_bpt / 4;
+                                        for (size_t texel = 0; texel < (size_t)tw * th; ++texel) {
+                                            const uint32_t defaults[4] = {0, 0, 0, 0x3f800000u};
+                                            uint8_t* pixel = slice + texel * 16;
+                                            std::memcpy(pixel, defaults, sizeof(defaults));
+                                            std::memcpy(pixel, linear.data() + texel * source_bpt,
+                                                        nc * sizeof(float));
+                                        }
+                                    } else if (f16) {
                                         const uint32_t nc = source_bpt / 2;
                                         // Same-build performance control for the scalar float path.
                                         static const bool old_half_quantization =
@@ -6443,6 +6620,14 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     }
                                 }
                             }
+                            if (float32_array && slice_short_count) {
+                                std::fprintf(stderr,
+                                    "[render-array-reject] binding=%u Float32 short backing: "
+                                    "%u/%u slices, first=%u\n", r.binding, slice_short_count,
+                                    slice_count, slice_short[0]);
+                                built.complete = false;
+                                continue;
+                            }
                             // The loop above filled `slice_count` slices. A cube publishes them through
                             // HEIGHT (fr.th = th*6) and an array through LAYERS (fr.sample_count), so the
                             // two completion flags must stay distinct.
@@ -6463,7 +6648,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 //    byte-identical to one the guest never WROTE. Reporting empties
                                 //    without this invites exactly the wrong conclusion, which is the
                                 //    one it invited from me.
-                                const size_t lsz = (size_t)tw * th * 4u;
+                                const size_t lsz = (size_t)tw * th * output_bpp;
                                 const size_t step = 61u;
                                 std::string map;
                                 uint32_t nonempty = 0;
@@ -8282,7 +8467,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             // Hoisted for the same reason as the two above -- disarmed it is one bool.
             auto& link_scan = prosper::gpu::draw_link_scan_selector();
             const bool link_scan_armed = prosper::gpu::draw_link_scan_enabled();
-            auto build_bds = [&](const std::vector<const prosper::gpu::DrawItem*>& group) {
+            auto build_bds = [&](const std::vector<const prosper::gpu::DrawItem*>& group,
+                                 prosper::test::BackendSubmissionBatch* producer_batch = nullptr) {
                 std::vector<prosper::test::BackendDraw> bds;
                 // Once per call, not once per draw -- see the note on descriptor_validate_mode above
                 // for why this is a hoist and not a PROSPER_ENV_* cache (test_eop_write.cpp arms
@@ -8339,7 +8525,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     // this bucket at 2,100 draws a submit. It inflates what it measures while
                     // armed, as every timer here does; read the shares, not the totals.
                     const auto bt0 = timing_enabled ? RenderClock::now() : RenderClock::time_point{};
-                    auto built_resources = build_R(it, it.vrt.get(), it.prt.get());
+                    auto built_resources = build_R(it, it.vrt.get(), it.prt.get(), producer_batch);
                     bd.R = std::move(built_resources.full);
                     bd.B = std::move(built_resources.buffers);
                     bd.resource_order = std::move(built_resources.order);
@@ -8370,7 +8556,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     // counted above. Dropping it without accounting would move that time into the
                     // residual, where it reads as unattributed work -- the exact defect this
                     // partition exists to make visible.
-                    if (!contract_ok) { if (timing_enabled) ++pending_timing.build_rejected; continue; }
+                    if (!built_resources.complete || !contract_ok) {
+                        if (timing_enabled) ++pending_timing.build_rejected;
+                        continue;
+                    }
                     poison_R(bd.R, bd.vs_words(), it.vrt.get(), 0, prosper::gpu::SpirvShaderStage::Vertex);
                     poison_R(bd.R, bd.fs_words(), it.prt.get(), 1, prosper::gpu::SpirvShaderStage::Fragment);
                     const auto bt3 = timing_enabled ? RenderClock::now() : RenderClock::time_point{};
@@ -8851,7 +9040,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     // from pass_groups is exactly the number of iterations that returned without
                     // rendering, which is the population the missing time must belong to.
                     if (timing_enabled) ++pending_timing.pass_groups_seen;
-                    const uint64_t base = items[pass_i].color0_base;
+                    uint64_t base = items[pass_i].color0_base;
                     const uint32_t requested_color_count = active_color_count(items[pass_i]);
                     // PROSPER_MRT_CENSUS=1 — per slot, why an attachment did or did not become
                     // active. A slot needs all three of base, a known format, and a non-zero write
@@ -9037,7 +9226,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     auto ds_identity = [](const prosper::gpu::DrawItem& draw) {
                         return std::tuple(draw.ps.depth_read_base, draw.ps.depth_write_base,
                                           draw.ps.stencil_read_base, draw.ps.stencil_write_base,
-                                          draw.ps.htile_data_base,
+                                          draw.ps.htile_data_base, draw.ps.db_depth_size_xy,
                                           prosper::test::ds_depth_view_slice_start(
                                               draw.ps.db_depth_view));
                     };
@@ -9347,14 +9536,39 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     // as 16384x16384 and exhausted the host while Dead Cells loaded its first level.
                     const bool color_disabled = !pass.empty() && std::all_of(
                         pass.begin(), pass.end(), [](const auto* draw) {
-                            return draw->ps.color_write_mask == 0;
+                            for (uint32_t slot = 0; slot < prosper::gpu::kColorTargetCount; ++slot)
+                                if (prosper::frontend::mrt_write_mask(*draw, slot)) return false;
+                            return true;
                         });
                     const bool uses_ds = std::any_of(pass.begin(), pass.end(), [](const auto* draw) {
                         return draw->ps.depth_test_enable || draw->ps.depth_write_enable ||
                                draw->ps.depth_clear_enable || draw->ps.stencil_enable ||
                                draw->ps.stencil_clear_enable;
                     });
-                    if (color_disabled && uses_ds && w && h) {
+                    // A masked color attachment does not determine the depth allocation's size.
+                    // DB_DEPTH_SIZE_XY is the guest extent; both clear and caster passes must name
+                    // the same persistent depth image even when their inactive color bindings differ.
+                    // Resolved/captured state does not retain this register's presence flag. Zero
+                    // therefore remains ambiguous (absent versus explicit 1x1) and keeps the legacy
+                    // fallback. Pass grouping above keeps distinct DB extents separate.
+                    const auto* depth_state = pass.empty() ? nullptr : &pass.front()->ps;
+                    const bool explicit_depth_extent = depth_state && color_disabled && uses_ds &&
+                        (depth_state->depth_read_base || depth_state->depth_write_base ||
+                         depth_state->stencil_read_base || depth_state->stencil_write_base) &&
+                        depth_state->db_depth_size_xy != 0;
+                    if (explicit_depth_extent) {
+                        native_w = PM4_FIELD(depth_state->db_depth_size_xy, DB_DEPTH_SIZE_XY, X_MAX) + 1u;
+                        native_h = PM4_FIELD(depth_state->db_depth_size_xy, DB_DEPTH_SIZE_XY, Y_MAX) + 1u;
+                        // All color writes are disabled. The backend still needs a dummy color
+                        // attachment, but resizing it to the depth extent must not create or
+                        // publish a new color authority under an inactive guest CB address.
+                        // Zero pass identities select transient attachments and bypass color
+                        // seeding, retained-target publication and scanout selection below.
+                        base = 0;
+                        pass_bases.fill(0);
+                        is_vo = false;
+                    }
+                    if (color_disabled && uses_ds && !explicit_depth_extent && w && h) {
                         float viewport_x = 0.0f, viewport_y = 0.0f;
                         for (const auto* draw : pass) {
                             if (!draw->ps.has_viewport) continue;
@@ -9789,7 +10003,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         backend_target.load_existing_slots[slot] = seed_target(pass_bases[slot]);
                         backend_target.readback_slots[slot] = pass_bases[slot] != 0 && !defer_readback_slots[slot];
                     }
-                    auto backend_draws = build_bds(render_pass);
+                    auto backend_draws = build_bds(
+                        render_pass, batch_backend_submits ? &backend_submission : nullptr);
                     const auto build_done = timing_enabled
                         ? RenderClock::now() : RenderClock::time_point{};
                     prosper::test::BackendMrtOutputs mrt_outputs;
@@ -10323,7 +10538,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     // readback skip is safe.
                     if (timing_enabled && !pass.empty() && pass.front()->ps.color0_format == 0)
                         ++pending_timing.publish_candidate_fmt0;
-                    if (!rendered_pixels.empty() && pass_format == VK_FORMAT_R8G8B8A8_UNORM) {
+                    if (!explicit_depth_extent && !rendered_pixels.empty() &&
+                        pass_format == VK_FORMAT_R8G8B8A8_UNORM) {
                         // Recorded alongside each candidate rather than re-derived at selection
                         // time: by then the pass loop has moved on and `pass` no longer refers to
                         // the pass that produced these pixels (#2283).
@@ -10339,7 +10555,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         }
                         px_last = pass_pixels;                                  // last non-empty (fallback)
                         px_last_w = gw; px_last_h = gh; px_last_base = base; px_last_fmt = candidate_fmt;
-                    } else if (!rendered_pixels.empty() && prefix_inspect_publish()) {
+                    } else if (!explicit_depth_extent && !rendered_pixels.empty() &&
+                               prefix_inspect_publish()) {
                         // #1330: under gpu_replay's ordered-prefix inspection (--draw/--draw-steps/
                         // --through-operation set PROSPER_PREFIX_INSPECT), a prefix ending on a
                         // non-RGBA8 pass (an FP16 HDR scene target) must return THAT surface, not

@@ -477,6 +477,54 @@ def classify(events):
         f"resource binding, textures, uniforms or the shader itself." + note)
 
 
+def select_history_target(ctl, rd, target_index):
+    """Select the last draw's output, then replay that resource through capture end.
+
+    PixelHistory includes only usages at or before the current replay event. The bound
+    output identifies the image at the last draw, but later transfers/clears still belong
+    in its history and saved pixels. Only leaf action IDs establish the end: RenderDoc's
+    generated marker parents can have larger synthetic IDs that remap BEFORE their children.
+    """
+    draws, leaves = [], []
+
+    def walk(nodes):
+        for action in nodes:
+            if action.flags & rd.ActionFlags.Drawcall:
+                draws.append(action)
+            if action.children:
+                walk(action.children)
+            else:
+                leaves.append(int(action.eventId))
+
+    walk(ctl.GetRootActions())
+    if not draws:
+        raise RuntimeError("no draw actions in capture")
+    last_draw_eid = max(int(action.eventId) for action in draws)
+    history_eid = max(leaves)
+    ctl.SetFrameEvent(last_draw_eid, True)
+
+    # TextureCategory.ColorTarget can include transient attachments, so prefer outputs
+    # actually bound at the draw. Querying bindings after the final transfer loses this proof.
+    textures = ctl.GetTextures()
+    by_id = {texture.resourceId: texture for texture in textures}
+    targets = [by_id[output.resource] for output in ctl.GetPipelineState().GetOutputTargets()
+               if output.resource != rd.ResourceId.Null() and output.resource in by_id]
+    source = "bound output targets at the last draw"
+    if not targets:
+        targets = [texture for texture in textures
+                   if texture.creationFlags & rd.TextureCategory.ColorTarget]
+        source = "texture scan (no bound output target; may include transient attachments)"
+    if not targets:
+        raise RuntimeError("no colour targets in capture")
+    if not 0 <= target_index < len(targets):
+        raise RuntimeError(
+            f"--target {target_index} out of range: {len(targets)} target(s) available "
+            f"from {source}. Silently clamping would analyse a different image than asked.")
+    tex = targets[target_index]
+    ctl.SetFrameEvent(history_eid, True)
+    return tex, source, len(targets), len(draws), last_draw_eid, history_eid
+
+
 def embedded():
     req = json.loads(Path(os.environ["PROSPER_PIXHIST_REQUEST"]).read_text())
     out = Path(req["output"])
@@ -500,38 +548,8 @@ def embedded():
                 "this replay driver reports no pixel-history support; an empty result here "
                 "would be indistinguishable from 'nothing drew', so refusing to report one")
 
-        actions = []
-
-        def walk(nodes):
-            for a in nodes:
-                if a.flags & rd.ActionFlags.Drawcall:
-                    actions.append(a)
-                walk(a.children)
-
-        walk(ctl.GetRootActions())
-        if not actions:
-            raise RuntimeError("no draw actions in capture")
-        ctl.SetFrameEvent(actions[-1].eventId, True)
-
-        # Prefer the targets actually BOUND at the selected event. TextureCategory.ColorTarget
-        # is set for VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT as well as COLOR_ATTACHMENT
-        # (vk_info.cpp:2601-2603), so scanning every texture can hand back a transient
-        # attachment nothing presents -- and its empty history reads as NOTHING_DREW.
-        by_id = {t.resourceId: t for t in ctl.GetTextures()}
-        bound = [by_id[o.resource] for o in ctl.GetPipelineState().GetOutputTargets()
-                 if o.resource != rd.ResourceId.Null() and o.resource in by_id]
-        source, targets = "bound output targets at the last draw", bound
-        if not targets:
-            targets = [t for t in ctl.GetTextures()
-                       if t.creationFlags & rd.TextureCategory.ColorTarget]
-            source = "texture scan (no bound output target; may include transient attachments)"
-        if not targets:
-            raise RuntimeError("no colour targets in capture")
-        if not 0 <= req["target"] < len(targets):
-            raise RuntimeError(
-                f"--target {req['target']} out of range: {len(targets)} target(s) available "
-                f"from {source}. Silently clamping would analyse a different image than asked.")
-        tex = targets[req["target"]]
+        tex, source, target_count, draw_count, last_draw_eid, history_eid = \
+            select_history_target(ctl, rd, req["target"])
 
         # Save the target first: selection needs to see the image, and the image is also
         # the evidence a reader wants beside the verdict.
@@ -622,8 +640,9 @@ def embedded():
                   "pixel": list(pixel), "pixel_choice": how,
                   "target": {"id": str(tex.resourceId), "width": tex.width,
                              "height": tex.height, "chosen_from": source,
-                             "candidates": len(targets)},
-                  "target_image": image, "draw_count": len(actions),
+                             "candidates": target_count},
+                  "target_image": image, "draw_count": draw_count,
+                  "target_selection_event": last_draw_eid, "history_end_event": history_eid,
                   "events": events,
                   "api": {"pixelHistory": bool(props.pixelHistory),
                           "shaderDebugging": bool(props.shaderDebugging),

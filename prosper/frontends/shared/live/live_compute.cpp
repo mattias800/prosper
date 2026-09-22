@@ -8929,14 +8929,14 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     std::fprintf(stderr,
                                  "[compute]   native transfer gate binding=%u dimension=%u "
                                  "hostless=%u format-match=%u validation=%u defined=%u "
-                                 "storage-format=%u sampled-format=%u\n",
+                                 "storage-format=%u sampled-format=%u mip-levels=%u\n",
                                  bi.binding, native_transfer_dimension ? 1u : 0u,
                                  transfer_hostless ? 1u : 0u,
                                  transfer_format_match ? 1u : 0u,
                                  transfer_validation_enabled ? 1u : 0u,
                                  transfer_native_defined ? 1u : 0u,
                                  static_cast<unsigned>(transfer_native_format),
-                                 static_cast<unsigned>(image_format));
+                                 static_cast<unsigned>(image_format), bi.mip_levels);
                 ComputeTransferBorrowResult transfer_borrow_result =
                     ComputeTransferBorrowResult::NotAttempted;
                 if (bi.cache_candidate) {
@@ -8967,7 +8967,11 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     // replacement at the same guest address. Exact key lookup plus the ordered-submit
                     // journal (or an independently clean write watch) makes an intervening guest write
                     // fail closed to the existing upload path.
-                    if (native_transfer_dimension && transfer_hostless &&
+                    // A retained storage result owns exactly one mip. The transfer command below
+                    // copies/transitions only level zero and bypasses every guest upload; accepting
+                    // a declared chain here would leave its other levels uninitialized. Keep the
+                    // complete guest-chain upload until a source proves every requested level.
+                    if (bi.mip_levels == 1u && native_transfer_dimension && transfer_hostless &&
                         transfer_format_match && transfer_validation_enabled &&
                         transfer_native_defined) {
                         ComputeImageCacheKey storage_key = storage_image_cache_key(

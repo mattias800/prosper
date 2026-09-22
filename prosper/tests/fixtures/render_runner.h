@@ -6293,6 +6293,109 @@ inline bool read_persistent_ds_depth(PersistentDsImage& image, uint32_t width, u
     return true;
 }
 
+enum class PersistentDsDepthArrayStatus { NoIdentity, Ready, Unavailable };
+
+// Failure injection after N successful layer reads. Consumed by one array attempt only.
+inline int& depth_array_readback_failure_after_layers() {
+    static thread_local int count = -1;
+    return count;
+}
+
+// Gather a complete Float32 depth array without publishing a partial replacement. This bridge
+// deliberately declines incomplete retained identities; it does not yet combine retained layers
+// with guest-backed layers. A cache placeholder or guest-invalidated entry is not itself proof of
+// renderer authority. NoIdentity permits ordinary decoding when no retained identity is involved.
+// The caller must not already hold BackendPersistentResourceGuard (its mutex is not recursive).
+// Pass the ordered producer batch if it contains unsubmitted writes to these retained images.
+inline PersistentDsDepthArrayStatus read_persistent_ds_depth_array(
+        uint64_t base, uint32_t width, uint32_t height, uint32_t first_layer,
+        uint32_t layer_count, std::vector<float>& output, std::string& error,
+        BackendSubmissionBatch* producer_batch = nullptr) {
+    const BackendPersistentResourceGuard guard;
+    error.clear();
+    int fail_after = depth_array_readback_failure_after_layers();
+    depth_array_readback_failure_after_layers() = -1;
+    auto unavailable = [&](const char* reason) {
+        error = reason;
+        return PersistentDsDepthArrayStatus::Unavailable;
+    };
+    if (!base || !width || !height || !layer_count)
+        return unavailable("invalid retained depth array extent");
+    bool known = false;
+    for (const auto& [key, image] : persistent_ds_cache()) {
+        (void)image;
+        if (key.dr == base || key.dw == base) { known = true; break; }
+    }
+    if (!known) return PersistentDsDepthArrayStatus::NoIdentity;
+
+    const RenderVkCtx& ctx = render_vk_ctx();
+    if (!ctx.ok) return unavailable("Vulkan renderer is unavailable");
+    const auto& limits = ctx.detile_limits;
+    const uint32_t max_layers = std::min(kBackendMaxArrayLayers, limits.maxImageArrayLayers);
+    if (width > limits.maxImageDimension2D || height > limits.maxImageDimension2D ||
+        first_layer >= max_layers || layer_count > max_layers - first_layer)
+        return unavailable("retained depth array exceeds device extent or layer limits");
+    // One Float32 CPU snapshot, plus at most one layer of temporary staging. Bound allocation
+    // before multiplying extents; the frontend's expanded sampling payload is a separate owner.
+    constexpr size_t max_values = (64u << 20) / sizeof(float);
+    if (width > max_values / height / layer_count)
+        return unavailable("retained depth array exceeds snapshot byte limit");
+    if (backend_has_unproven_submission())
+        return unavailable("Vulkan submission completion is unproven");
+    if (producer_batch) {
+        const auto submitted = producer_batch->submit_and_wait(ctx.dev, ctx.queue, false);
+        if (submitted.submit_result != VK_SUCCESS || submitted.wait_result != VK_SUCCESS)
+            return unavailable("retained depth array producer did not complete");
+    }
+
+    std::vector<PersistentDsImage*> selected(layer_count, nullptr);
+    std::vector<bool> ambiguous(layer_count, false);
+    uint32_t format = VK_FORMAT_UNDEFINED;
+    for (auto& [key, image] : persistent_ds_cache()) {
+        if ((key.dr != base && key.dw != base) || key.w != width || key.h != height ||
+            key.slice < first_layer || key.slice - first_layer >= layer_count)
+            continue;
+        if (key.fmt != VK_FORMAT_D32_SFLOAT && key.fmt != VK_FORMAT_D32_SFLOAT_S8_UINT)
+            return unavailable("retained depth array format is not Float32");
+        if (format != VK_FORMAT_UNDEFINED && format != key.fmt)
+            return unavailable("retained depth array has ambiguous formats");
+        format = key.fmt;
+        if (!image.last_depth_write &&
+            (!image.image || !image.layout_initialized || !image.depth_valid))
+            return unavailable("retained depth array has an unversioned invalid identity");
+        const uint32_t layer = key.slice - first_layer;
+        auto*& chosen = selected[layer];
+        // Validity must be checked AFTER recency: an invalid newer identity cannot resurrect
+        // an older image containing pixels from before a guest overwrite or failed producer.
+        if (chosen && chosen->last_depth_write == image.last_depth_write)
+            ambiguous[layer] = true;
+        if (!chosen || image.last_depth_write > chosen->last_depth_write) {
+            chosen = &image;
+            ambiguous[layer] = false;
+        }
+    }
+    for (bool conflict : ambiguous)
+        if (conflict) return unavailable("retained depth array has ambiguous layer identities");
+    for (const auto* image : selected)
+        if (!image || !image->image || !image->layout_initialized || !image->depth_valid)
+            return unavailable("retained depth array has missing or invalid layers");
+
+    const size_t layer_values = static_cast<size_t>(width) * height;
+    std::vector<float> snapshot(layer_values * layer_count);
+    for (uint32_t layer = 0; layer < layer_count; ++layer) {
+        if (fail_after == 0)
+            return unavailable("injected retained depth array readback failure");
+        PersistentDsDepthReadback readback;
+        if (!readback.acquire(*selected[layer], width, height, error))
+            return PersistentDsDepthArrayStatus::Unavailable;
+        std::memcpy(snapshot.data() + layer * layer_values, readback.mapped,
+                    layer_values * sizeof(float));
+        if (fail_after > 0) --fail_after;
+    }
+    output.swap(snapshot);
+    return PersistentDsDepthArrayStatus::Ready;
+}
+
 // Metadata-only selection for a retained depth cube. `overlay_version` is the newest selected
 // depth-write generation, so a CPU-decoded six-face stack can be cached against renderer authority
 // without consulting stale guest bytes for those faces. A partial selection still depends on
