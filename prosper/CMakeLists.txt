@@ -3459,7 +3459,7 @@ endif()
       # `-S prosper/tools/doctor`, a separate CMake project -- it does not build prosper at all, so
       # this code is not under TSan today and moving it would not change that by itself.
       add_executable(test_compute_buffer_diff_span
-                     tests/shared/live/test_compute_buffer_diff_span.cpp)
+                     tests/shared/compute/test_compute_buffer_diff_span.cpp)
       target_include_directories(test_compute_buffer_diff_span PRIVATE frontends)
       target_link_libraries(test_compute_buffer_diff_span PRIVATE prosper_live_renderer)
       add_test(NAME compute_buffer_diff_span COMMAND test_compute_buffer_diff_span)
