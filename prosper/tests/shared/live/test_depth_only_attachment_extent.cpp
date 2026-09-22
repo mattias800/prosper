@@ -105,7 +105,7 @@ int main() {
     (void)render_submit_items({seed}, StaleColorW, StaleColorH);
     std::vector<float> values;
     check(read(MainDepth, values) && depth_is(values, DepthW, DepthH, 0.25f, 0.25f),
-          "first depth-only callback writes the authoritative 32² attachment");
+          "first depth-only callback writes the authoritative 32x32 attachment");
 
     // Establish actual 64² color authority at the stale CB address. The following depth-only
     // callback must neither overwrite nor re-publish that disabled attachment under a 32² identity.
@@ -121,7 +121,7 @@ int main() {
                                            VK_FORMAT_R8G8B8A8_UNORM, saved_color, color_error) &&
               saved_color.size() == size_t(StaleColorW) * StaleColorH * 4 &&
               saved_color[0] == 255 && saved_color[1] == 0 && saved_color[2] == 0,
-          "fixture establishes a real 64² color target before its CB is disabled");
+          "fixture establishes a real 64x64 color target before its CB is disabled");
 
     // Callback 2 deliberately carries that obsolete disabled 64² color description. The DB extent,
     // viewport, and clear-writing VS all agree on 32². Keeping clear_value == VS depth means this
@@ -135,12 +135,12 @@ int main() {
     check(read(MainDepth, values) && depth_is(values, DepthW, DepthH, 0.75f, 0.75f),
           "disabled stale color target clears the pre-existing DB-sized depth image");
     check(has_depth_key(MainDepth, DepthW, DepthH) && !has_depth_key(MainDepth, StaleColorW, StaleColorH),
-          "depth-only clear mints no persistent key from its disabled 64² color target");
+          "depth-only clear mints no persistent key from its disabled 64x64 color target");
     std::vector<uint8_t> retained_color;
     check(readback_persistent_color_target(StaleColor, StaleColorW, StaleColorH,
                                            VK_FORMAT_R8G8B8A8_UNORM, retained_color, color_error) &&
               retained_color == saved_color && !has_color_key(StaleColor, DepthW, DepthH),
-          "disabled CB retains its old 64² color authority and mints no 32² alias");
+          "disabled CB retains its old 64x64 color authority and mints no 32x32 alias");
     ShaderResource sampled_color{};
     sampled_color.cls = ResourceClass::Texture; sampled_color.format = DataFormat::Unorm8;
     sampled_color.num_components = 4; sampled_color.binding = 4; sampled_color.sgpr_base = 8;
