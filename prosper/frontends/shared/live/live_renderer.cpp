@@ -4033,13 +4033,16 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             bool retained_noncanonical = false;
                             {
                                 const prosper::test::BackendPersistentResourceGuard guard;
-                                for (const auto& [key, image] : prosper::test::persistent_ds_cache()) {
-                                    (void)image;
+                                const auto& ds_cache = prosper::test::persistent_ds_cache();
+                                std::vector<std::pair<uint32_t, uint64_t>> write_aliases;
+                                for (const auto& [key, image] : ds_cache) {
                                     // Invalidation addresses layer strides by the read base when
                                     // both bases exist. A consumer of a distinct write alias does
-                                    // not establish a stride for that canonical identity.
-                                    if (key.dw == r.gpu_addr && key.dr && key.dr != r.gpu_addr)
-                                        retained_noncanonical = true;
+                                    // not establish a stride for that canonical identity. Only a
+                                    // matching, selected layer can be an array source candidate.
+                                    if (key.dw == r.gpu_addr && key.dr && key.dr != r.gpu_addr &&
+                                        key.w == tw && key.h == th && key.slice < r.depth)
+                                        write_aliases.emplace_back(key.slice, image.last_depth_write);
                                     for (const uint64_t base : {key.dr, key.dw}) {
                                         if (!base) continue;
                                         if (base == r.gpu_addr) retained_exact = true;
@@ -4053,6 +4056,25 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                         const uint64_t first = offset / r.layer_stride_bytes;
                                         if (first <= key.slice && key.slice - first < r.depth)
                                             retained_subview = true;
+                                    }
+                                }
+                                // The readback selects the newest key for each layer. An older
+                                // write-base alias cannot veto a newer canonical read-base plane;
+                                // a selected or tied alias cannot prove the stride identity.
+                                // Do this extra scan only when an alias exists (normally none).
+                                for (const auto& [slice, alias_generation] : write_aliases) {
+                                    bool superseded = false;
+                                    for (const auto& [key, image] : ds_cache) {
+                                        if (key.dr == r.gpu_addr && key.w == tw && key.h == th &&
+                                            key.slice == slice &&
+                                            image.last_depth_write > alias_generation) {
+                                            superseded = true;
+                                            break;
+                                        }
+                                    }
+                                    if (!superseded) {
+                                        retained_noncanonical = true;
+                                        break;
                                     }
                                 }
                             }

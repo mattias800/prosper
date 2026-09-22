@@ -71,10 +71,12 @@ int main(int argc, char** argv) {
     // the separate process arm supplies the per-draw oracle without changing startup semantics.
 #ifdef _WIN32
     _putenv_s("PROSPER_DEPTH_ARRAY_SNAPSHOT_CENSUS", "1");
+    _putenv_s("PROSPER_ARRAY_REJECT_LOG_ALL", "1");
     if (per_draw_control) _putenv_s("PROSPER_NO_SUBMIT_DEPTH_ARRAY_SNAPSHOT_REUSE", "1");
     if (expanded_control) _putenv_s("PROSPER_NO_COMPACT_DEPTH_ARRAY_SNAPSHOT", "1");
 #else
     setenv("PROSPER_DEPTH_ARRAY_SNAPSHOT_CENSUS", "1", 1);
+    setenv("PROSPER_ARRAY_REJECT_LOG_ALL", "1", 1);
     if (per_draw_control) setenv("PROSPER_NO_SUBMIT_DEPTH_ARRAY_SNAPSHOT_REUSE", "1", 1);
     if (expanded_control) setenv("PROSPER_NO_COMPACT_DEPTH_ARRAY_SNAPSHOT", "1", 1);
 #endif
@@ -591,6 +593,69 @@ int main(int argc, char** argv) {
         if (!seed_layer(layer, expected[layer])) return 1;
     check(ds_layer_stride_for(seed_base, W, H) == 0 && live_matches(),
           "untouched freshly rendered array admits its first exact consumer after older writes");
+    // A recycled write address can coexist with an unrelated old attachment. Neither a
+    // different extent nor a slice outside this consumer's range is one of its source planes.
+    // A rejected draw can return an earlier color image, so positive arms must also assert the
+    // specific decline is absent. The matching-alias negative arm below proves that lever logs.
+    const uint64_t saved_color_base = live_draw.color0_base;
+    const auto canonical_survives_alias = [&](const char* pixel_label, const char* log_label) {
+        bool pixels_match = false;
+        const auto diagnostic = capture_stderr([&] { pixels_match = live_matches(); });
+        check(pixels_match, pixel_label);
+        check(diagnostic.find("[render-array-reject] binding=4 unproven retained depth "
+              "write-base alias") == std::string::npos, log_label);
+    };
+    PersistentDsKey coexisting_alias{Base + 0xe00000, seed_base, 0, 0, 0,
+                                    W / 2, H / 2, VK_FORMAT_D32_SFLOAT, 0};
+    {
+        BackendPersistentResourceGuard guard;
+        persistent_ds_cache()[coexisting_alias] = {};
+    }
+    live_draw.color0_base = Base + 0x1400000;
+    canonical_survives_alias("different-extent alias preserves canonical pixels",
+                             "different-extent alias does not trigger noncanonical veto");
+    {
+        BackendPersistentResourceGuard guard;
+        persistent_ds_cache().erase(coexisting_alias);
+        coexisting_alias.w = W; coexisting_alias.h = H; coexisting_alias.slice = Layers;
+        persistent_ds_cache()[coexisting_alias] = {};
+    }
+    live_draw.color0_base = Base + 0x1410000;
+    canonical_survives_alias("out-of-range alias preserves canonical pixels",
+                             "out-of-range alias does not trigger noncanonical veto");
+    {
+        BackendPersistentResourceGuard guard;
+        persistent_ds_cache().erase(coexisting_alias);
+        coexisting_alias.slice = 0;
+        uint64_t canonical_generation = 0;
+        for (const auto& [key, image] : persistent_ds_cache())
+            if (key.dr == seed_base && key.w == W && key.h == H && key.slice == 0)
+                canonical_generation = std::max(canonical_generation, image.last_depth_write);
+        check(canonical_generation > 1, "canonical layer has a version newer than stale alias");
+        auto& old_alias = persistent_ds_cache()[coexisting_alias];
+        old_alias.last_depth_write = canonical_generation - 1;
+    }
+    live_draw.color0_base = Base + 0x1420000;
+    canonical_survives_alias("older same-shape alias preserves newer canonical pixels",
+                             "older same-shape alias does not trigger noncanonical veto");
+    {
+        BackendPersistentResourceGuard guard;
+        note_persistent_ds_depth_write(persistent_ds_cache()[coexisting_alias], true, true);
+    }
+    live_draw.color0_base = Base + 0x1430000;
+    const auto coexisting_diagnostic = capture_stderr([&] {
+        (void)render_submit_items({live_draw}, W, H);
+    });
+    check(coexisting_diagnostic.find("[render-array-reject] binding=4 unproven retained depth "
+          "write-base alias") != std::string::npos,
+          "newer matching write-base alias still refuses selected noncanonical source");
+    {
+        BackendPersistentResourceGuard guard;
+        persistent_ds_cache().erase(coexisting_alias);
+    }
+    live_draw.color0_base = Base + 0x1440000;
+    check(live_matches(), "canonical array recovers after matching alias is removed");
+    live_draw.color0_base = saved_color_base;
     // Re-key the real images without duplicating their Vulkan ownership. Sampling a distinct
     // write-base alias must not publish a stride that the read-base invalidator never consults.
     const uint64_t write_alias = Base + 0x1000000;
