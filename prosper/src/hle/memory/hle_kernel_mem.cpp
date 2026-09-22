@@ -5932,6 +5932,48 @@ namespace {
             // two lists, so keeping the capture adjacent to the failure it describes is the form
             // that stays correct if anything is ever inserted above it.
             const DWORD err = GetLastError();
+            {
+                // DIAG (Kena PPSA01802): what does Windows itself have at the failing range?
+                static std::atomic<int> diag_n{0};
+                if (diag_n.fetch_add(1) < 4) {
+                    for (uint64_t probe : {hint, hint + len - 1}) {
+                        MEMORY_BASIC_INFORMATION mbi{};
+                        if (VirtualQuery(reinterpret_cast<void*>(static_cast<uintptr_t>(probe)),
+                                         &mbi, sizeof(mbi)))
+                            std::fprintf(stderr,
+                                "[kena-diag] probe=0x%llx base=0x%llx alloc_base=0x%llx size=0x%llx "
+                                "state=0x%lx type=0x%lx prot=0x%lx\n",
+                                (unsigned long long)probe,
+                                (unsigned long long)(uintptr_t)mbi.BaseAddress,
+                                (unsigned long long)(uintptr_t)mbi.AllocationBase,
+                                (unsigned long long)mbi.RegionSize, (unsigned long)mbi.State,
+                                (unsigned long)mbi.Type, (unsigned long)mbi.Protect);
+                    }
+                    std::lock_guard<std::mutex> lk(g_dview_mx);
+                    std::fprintf(stderr, "[kena-diag] err=%lu hint=0x%llx len=0x%llx free=%zu guest=%zu views=%zu\n",
+                                 (unsigned long)err, (unsigned long long)hint,
+                                 (unsigned long long)len, g_free_placeholders.size(),
+                                 g_guest_placeholders.size(), g_dviews.size());
+                    const uint64_t wlo = hint > 0x10000000 ? hint - 0x10000000 : 0;
+                    const uint64_t whi = hint + len + 0x10000000;
+                    for (const PlaceholderSpan& sp : g_free_placeholders)
+                        if (sp.base < whi && wlo < sp.base + sp.size)
+                            std::fprintf(stderr, "[kena-diag]   free 0x%llx +0x%llx\n",
+                                         (unsigned long long)sp.base, (unsigned long long)sp.size);
+                    for (const PlaceholderSpan& sp : g_guest_placeholders)
+                        if (sp.base < whi && wlo < sp.base + sp.size)
+                            std::fprintf(stderr, "[kena-diag]   guest 0x%llx +0x%llx\n",
+                                         (unsigned long long)sp.base, (unsigned long long)sp.size);
+                    int shown = 0;
+                    for (const DmemView& v : g_dviews)
+                        if (v.guest_base < whi && wlo < v.guest_base + v.guest_size && shown++ < 40)
+                            std::fprintf(stderr, "[kena-diag]   view 0x%llx +0x%llx phys=0x%llx ph=%d sparse=%d\n",
+                                         (unsigned long long)v.guest_base,
+                                         (unsigned long long)v.guest_size,
+                                         (unsigned long long)v.phys, (int)v.placeholder, (int)v.sparse);
+                }
+                SetLastError(err);
+            }
             if (memlog()) {   // guard the lock too: MLOG alone would still take g_dview_mx
                 MLOG("map_dmem FIXED FAILED hint=0x%llx len=0x%llx phys=0x%llx align=0x%llx error=%lu"
                      " -- guest gets ENOMEM\n",
