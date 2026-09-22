@@ -14,10 +14,12 @@
 //     shim in posix_shim.hpp on Darwin, Read/WriteProcessMemory on Windows), which reports an
 //     unmapped or protected page as an error instead of delivering SIGSEGV. A guest pointer can be
 //     garbage, and a diagnostic must never be able to take the boot down by reading one.
-//   * A NULL guest address is never a guest buffer. `addr == 0` copies nothing.
+//   * A NULL guest address is never a guest buffer, whatever the length: `addr == 0` is refused
+//     (exact → false, prefix → 0) even for zero bytes, so a NULL out-pointer is always an error.
+//   * Otherwise zero bytes is a trivially successful copy (exact → true) and touches nothing, even
+//     with a NULL host buffer -- the memcpy convention.
 //   * A range that would WRAP past the top of the address space is not a range. The exact forms
 //     refuse it; the prefix form stops at the top.
-//   * Zero bytes is a trivially successful copy (exact → true, prefix → 0) and touches nothing.
 //   * errno is preserved: several callers read errno for the guest after a copy.
 //
 // ## Two forms, and which one to use

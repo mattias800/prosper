@@ -90,6 +90,10 @@ int main() {
     CHECK(!guest_read_exact(0, buf.data(), 8) && guest_read_prefix(0, buf.data(), 8) == 0 &&
               !guest_write_exact(0, buf.data(), 8),
           "a NULL guest address is never a buffer");
+    CHECK(!guest_read_exact(0, buf.data(), 0) && !guest_write_exact(0, buf.data(), 0),
+          "...not even for zero bytes: a NULL out-pointer is always an error");
+    CHECK(guest_read_exact(addr(base), nullptr, 0) && guest_write_exact(addr(base), nullptr, 0),
+          "a zero-byte copy with a NULL HOST buffer is the memcpy convention: trivially fine");
     CHECK(!guest_read_exact(addr(base), nullptr, 8) && guest_read_prefix(addr(base), nullptr, 8) == 0 &&
               !guest_write_exact(addr(base), nullptr, 8),
           "a NULL host buffer copies nothing");

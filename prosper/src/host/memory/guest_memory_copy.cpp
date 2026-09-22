@@ -87,8 +87,9 @@ bool wraps(uint64_t addr, size_t bytes) {
 }  // namespace
 
 bool guest_read_exact(uint64_t src, void* dst, size_t bytes) {
+    if (src == 0) return false;
     if (bytes == 0) return true;
-    if (src == 0 || dst == nullptr || wraps(src, bytes)) return false;
+    if (dst == nullptr || wraps(src, bytes)) return false;
     ErrnoGuard keep;
     auto* out = static_cast<uint8_t*>(dst);
     return copy_while_progress(src, bytes, [&](uint64_t a, size_t off, size_t n) {
@@ -122,8 +123,9 @@ size_t guest_read_prefix(uint64_t src, void* dst, size_t bytes) {
 }
 
 bool guest_write_exact(uint64_t dst, const void* src, size_t bytes) {
+    if (dst == 0) return false;
     if (bytes == 0) return true;
-    if (dst == 0 || src == nullptr || wraps(dst, bytes)) return false;
+    if (src == nullptr || wraps(dst, bytes)) return false;
     ErrnoGuard keep;
     const auto* in = static_cast<const uint8_t*>(src);
     return copy_while_progress(dst, bytes, [&](uint64_t a, size_t off, size_t n) {
