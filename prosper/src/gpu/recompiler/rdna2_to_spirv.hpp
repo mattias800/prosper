@@ -619,6 +619,12 @@ uint32_t fragment_spirv_required_subgroup_size(const std::vector<uint32_t>& spir
 // diagnostic could not tell them apart: kFragmentSubgroup* below are CAPABILITY bits, and the
 // lane-id path declares only base GroupNonUniform, so it reported required-ops=0.
 //
+// Read the "can never run at 32" claims below as claims about ONE FIXED 64-lane wave split in two.
+// They are true of that model, and the model is not what any host executes: #3464's partial-wave
+// tier (kFragmentWavePartialWaveExactReasons, below) runs lane id, vote, ballot and scalar-reduce
+// modules at 32 as complete, partially populated guest waves. The bits keep their meaning; what
+// changed is which of them a narrow host can honour.
+//
 // These name the emitter path that raised the contract. A module may set several.
 inline constexpr uint32_t kFragmentWaveReasonLaneId     = 1u << 0;  // lane id from SubgroupLocalInvocationId
 inline constexpr uint32_t kFragmentWaveReasonWaveAny    = 1u << 1;  // OpGroupNonUniformAny (vote)
