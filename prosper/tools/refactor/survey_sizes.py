@@ -214,7 +214,23 @@ def merge_spans(spans: list[tuple[int, int]]) -> int:
 
 
 def skipped_lines(tu, path: pathlib.Path) -> int:   # requires _need_clang()
-    """Lines of PATH the PREPROCESSOR skipped -- the inactive arms of #if/#ifdef/#ifndef.
+    """Lines of PATH the PREPROCESSOR skipped -- the count of skipped_spans()."""
+    return merge_spans(skipped_spans(tu, path))
+
+
+def merged_spans(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """SPANS unioned into disjoint, sorted [start, end] ranges."""
+    out: list[list[int]] = []
+    for s, e in sorted(spans):
+        if out and s <= out[-1][1] + 1:
+            out[-1][1] = max(out[-1][1], e)
+        else:
+            out.append([s, e])
+    return [(s, e) for s, e in out]
+
+
+def skipped_spans(tu, path: pathlib.Path) -> list[tuple[int, int]]:   # requires _need_clang()
+    """The line ranges of PATH the PREPROCESSOR skipped -- the inactive arms of #if/#ifdef/#ifndef.
 
     Summed over every arm, and clipped to this file: a TU pulls in hundreds of headers whose own
     include guards skip, and those say nothing about the file being surveyed.
@@ -248,7 +264,7 @@ def skipped_lines(tu, path: pathlib.Path) -> int:   # requires _need_clang()
             # produced nothing for, which is the quantity here. Worth two lines per span if anyone
             # reconstructs this figure as "lines of skipped CODE" and finds it slightly smaller.
             spans.append((s.line, e.line))
-        return merge_spans(spans)
+        return merged_spans(spans)
     finally:
         _DISPOSE_RANGES(rl)
 

@@ -760,6 +760,28 @@ def main() -> int:
     for r in regions:
         r["declared_in_header"] = bool(r.get("usr") and r["usr"] in declared)
 
+    # THE ARMS THIS PARSE DID NOT SEE (#3520). One libclang parse sees one arm of every #if, so every
+    # reference edge above is a fact about the parsed arms only. Record the preprocessor's skipped
+    # spans so each consumer can say exactly which lines its verdict does NOT cover. If they cannot
+    # be measured the field is null with a reason -- never an empty list, which would read as
+    # "nothing was skipped".
+    unparsed_spans, unparsed_error = None, None
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "survey_sizes", pathlib.Path(__file__).resolve().parent / "survey_sizes.py")
+        ss = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(ss)
+        ss._need_clang()
+        unparsed_spans = [list(s) for s in ss.skipped_spans(tu, target)]
+    except (Exception, SystemExit) as exc:   # noqa: BLE001 - reported, never swallowed as zero
+        unparsed_error = f"skipped #if ranges could not be measured: {exc}"
+        print(f"  WARNING {unparsed_error}")
+    if unparsed_spans:
+        n = sum(e - s + 1 for s, e in unparsed_spans)
+        print(f"  NOTE {n} line(s) in {len(unparsed_spans)} inactive #if arm(s) were not parsed; "
+              f"references inside them are absent from this map")
+
     bodies = [r for r in regions if r["role"] == "body"]
     print(f"== {target.relative_to(root)}: {total_lines} lines, {len(regions)} region(s) "
           f"({len(bodies)} splittable, {len(regions) - len(bodies)} replicated) ==")
@@ -791,6 +813,8 @@ def main() -> int:
                                          "sha256": digest,
                                          "total_lines": total_lines,
                                          "parse_errors": len(fatal),
+                                         "unparsed_spans": unparsed_spans,
+                                         "unparsed_error": unparsed_error,
                                          "regions": regions,
                                          "edges": {str(k): v for k, v in edges.items()}}, indent=1))
         print(f"  wrote {args.json}")
