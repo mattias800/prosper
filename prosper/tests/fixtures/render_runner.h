@@ -7102,14 +7102,17 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     // depth. Mode 3 instead writes the clear value through the draw's actual fragment coverage by
     // collapsing its dynamic depth range. Mode 4 narrows mode 3 to a clear-shaped depth-only
     // late-Z strip without a shader Z export, to test the state split observed in a Sonic stage
-    // bundle. None of these modes establishes the hardware clear predicate.
+    // bundle. Mode 5 suppresses the ordinary write of ALWAYS clear draws like mode 2, but keeps
+    // the default full-scissor clear on every draw admitted by the default gate (the missing 2x2
+    // control).
+    // None of these modes establishes the hardware clear predicate.
     static const int sonic_clear_probe = [] {
         const char* value = std::getenv("PROSPER_DIAG_CLEAR_OVERWRITE");
-        return value && value[0] >= '1' && value[0] <= '4' && value[1] == '\0'
+        return value && value[0] >= '1' && value[0] <= '5' && value[1] == '\0'
             ? value[0] - '0' : 0;
     }();
     const auto effective_depth_clear = [](const prosper::gpu::ResolvedPipelineState* ps) {
-        const bool probe_admits = sonic_clear_probe == 0 ||
+        const bool probe_admits = sonic_clear_probe == 0 || sonic_clear_probe == 5 ||
             (ps->depth_compare_op == VK_COMPARE_OP_ALWAYS &&
              (sonic_clear_probe != 4 ||
               ((ps->db_shader_control & 0x31u) == 0u && ps->color_write_mask == 0u &&
@@ -9384,7 +9387,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             dss.depthTestEnable  = VK_TRUE;
             dss.depthWriteEnable = ps->depth_write_enable ? VK_TRUE : VK_FALSE;
             dss.depthCompareOp   = (VkCompareOp)ps->depth_compare_op;
-            if (sonic_clear_probe == 2 && effective_depth_clear(ps))
+            if ((sonic_clear_probe == 2 || sonic_clear_probe == 5) &&
+                ps->depth_compare_op == VK_COMPARE_OP_ALWAYS && effective_depth_clear(ps))
                 dss.depthWriteEnable = VK_FALSE;
             // UE4 repeats its reverse-Z depth prepass in a separately translated base-pass shader.
             // A one-ULP position difference between those shaders makes exact EQUAL reject the whole
@@ -12007,7 +12011,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     // state was the part the layer could see; this part it cannot, and it is not fixed here.
     auto record_draw_dynamic_state = [&](VkCommandBuffer command, const DV& v, const prosper::gpu::ResolvedPipelineState* ps) {
         VkViewport viewport = v.viewport;
-        if (sonic_clear_probe >= 3 && ps && effective_depth_clear(ps))
+        if ((sonic_clear_probe == 3 || sonic_clear_probe == 4) && ps && effective_depth_clear(ps))
             viewport.minDepth = viewport.maxDepth = ps->depth_clear_value;
         vkCmdSetViewport(command, 0, 1, &viewport);
         vkCmdSetScissor(command, 0, 1, &v.scissor);
@@ -12051,7 +12055,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
              stencil_clear_effective(ps->stencil_clear_enable, ps->stencil_enable,
                                      ps->stencil_write_mask[0], ps->stencil_write_mask[1]))) {
             VkClearAttachment dsc{};
-            if (effective_depth_clear(ps) && sonic_clear_probe < 3)
+            if (effective_depth_clear(ps) &&
+                (sonic_clear_probe <= 2 || sonic_clear_probe == 5))
                 dsc.aspectMask |= VK_IMAGE_ASPECT_DEPTH_BIT;
             if (stencil_clear_effective(ps->stencil_clear_enable, ps->stencil_enable,
                                         ps->stencil_write_mask[0], ps->stencil_write_mask[1]) &&
