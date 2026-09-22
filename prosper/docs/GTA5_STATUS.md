@@ -92,6 +92,51 @@ For future comparisons, isolate each run's `PROSPER_SAVE0`, `XDG_CACHE_HOME` and
 run. A route filename alone does not establish the mode. The identity-check bypass proposed in
 #3727 is a separate, unverified hypothesis; #3731 does not change that policy or close the issue.
 
+## Windows/NVIDIA: the world was black because 187 Wave64 fragment shaders were dropped (2026-09-22, #3464)
+
+**On Windows/NVIDIA, current `main` (`87cb2106`) draws the prologue with the HUD and radar over a
+black world. The cause on this host is the wave width, not a renderer regression:** the RTX 4090's
+fragment subgroup is fixed at 32 lanes, and every Wave64 fragment program with a lane id, a ballot
+or a vote the width proof could not clear was skipped. Measured on the route below, distinct
+fragment shaders:
+
+| arm (same route, fresh save per run) | refused | admitted at native width | world |
+| --- | ---: | ---: | --- |
+| `main` `87cb2106` | **187** (103 `wave-any`, 24 `lane-id wave-ballot`, 60 `lane-id wave-any wave-ballot`) | 0 | black, HUD and radar only |
+| partial-wave tier, `PROSPER_NO_PARTIAL_WAVE_FRAGMENT=1` (same binary) | **188** (103 / 24 / 61) | 0 | black, HUD and radar only |
+| partial-wave tier, default | **0** | **186** | the bank lobby, lit |
+
+The tier (`kFragmentWavePartialWaveExactReasons`, `rdna2_to_spirv.hpp`) runs a module at the host's
+width when every wave reason it records is exact on a partially populated guest wave. The argument,
+and what it leaves refused, is in `RECOMPILER_REMAINING.md` Â§ Ruled out (the partial-wave row).
+
+**What turned the world black on this host is #3480, and it was not a bug in #3480's terms.**
+Before it (2026-09-08) GTA V's `wave-any` modules were admitted on the reason set alone, and a
+capture census of the bank counted 20 of them admitted; the world rendered, under-lit, because the
+`lane-id`/`wave-ballot` classes were already refused. #3480 (2026-09-09) added the
+width-independence proof as a second conjunct, and that proof clears **none** of GTA V's `wave-any`
+modules -- measured with `shader_inspect --wave-reasons` on current code: 0 of the 20 modules from
+the 2026-09-08 capture, 0 of the 103 dumped on this route. The only later change to the proof
+(#3547) loosens it. So from #3480 on, every GTA V fragment program that asks for 64 lanes is
+refused on NVIDIA, and the world's surfaces go with them. #3480's own verification table covers
+four titles and not this one, which is why nothing flagged it. This is DERIVED from the proof's
+verdicts and the dated census, not reproduced by building `2a2bcba8^` and `2a2bcba8`; the
+same-binary A/B above is the measured half. The partial-wave tier supersedes the proof for this
+class -- it admits all 103 -- so the old reason-set admission does not need restoring.
+
+**The route selected `Performance RT`, not `Performance`, on a fresh save.** The snap taken on
+the Display page after the route's `Left` reads `Graphics Mode < Performance RT >`
+(`reach-performance-story.pad`, Windows/NVIDIA, fresh `PROSPER_SAVE0`). The route's own header and
+the 2026-09-11 verification screenshot show `< Performance >`, which was taken on a non-fresh save.
+Every arm above ran the same route with a fresh save, so the comparison is sound; but any claim
+that this route selects `Performance` should be checked against a Display-page capture from the run
+it is about.
+
+Route: `PROSPER_RENDER=1 PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_PAD_SCRIPT=@scripts/gta5/reach-performance-story.pad`,
+fresh `PROSPER_SAVE0` and `XDG_CACHE_HOME` per run, frames by `PROSPER_SNAP_AT_FLIPS`, `prosper-app`,
+Windows 11 / RTX 4090. Counts are distinct shaders from the renderer's own dedupe-guarded log lines,
+not draws. Other agents' workloads shared the GPU; no timing is claimed.
+
 ## Linux windowed baseline (2026-09-06, #3065)
 
 At `a5150495e`, a fresh Release build with `-O3 -DNDEBUG -g1 -fno-omit-frame-pointer`
