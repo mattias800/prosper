@@ -2937,6 +2937,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             decode_scope_submit = g_this_submit;
             const bool use_direct_buffer_views =
                 PROSPER_ENV_VALUE("PROSPER_NO_FRONTEND_BUFFER_VIEW") == nullptr;
+            // DrawItem retains the widened index words until this synchronous renderer callback
+            // returns. The backend consumes them into its host-visible upload before then, so an
+            // intermediate BackendDraw vector copy has no ownership or completion role. Keep the
+            // owned-vector route as a same-binary control and compatibility fallback.
+            const bool use_direct_index_views =
+                PROSPER_ENV_VALUE("PROSPER_NO_DIRECT_INDEX_VIEW") == nullptr;
             static const bool use_tracked_buffer_membership_cache =
                 PROSPER_ENV_VALUE("PROSPER_NO_TRACKED_BUFFER_GATE") == nullptr;
             static std::unordered_map<TextureDecodeKey, PersistentDecodedTexture, TextureDecodeKeyHash>
@@ -8370,7 +8376,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     const auto bt3 = timing_enabled ? RenderClock::now() : RenderClock::time_point{};
                     // Indexed draw: hand the executor-fetched index data to the backend (vkCmdDrawIndexed).
                     // Skipped under REFVS — the reference VS is a 3-vertex non-indexed fullscreen triangle.
-                    if (!refvs) bd.indices = it.indices;
+                    if (!refvs) {
+                        if (use_direct_index_views) bd.borrow_indices(it.indices);
+                        else bd.indices = it.indices;
+                    }
                     if (timing_enabled) {
                         const auto bt4 = RenderClock::now();
                         pending_timing.build_poison_ms +=
@@ -8389,7 +8398,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     if (gfxlog) fprintf(stderr,
                         "[render] item %zu: %zu resources vcount=%u instances=%u nidx=%zu topo=%u mask=0x%x blend=%d\n",
                         bds.size(), bd.R.size() + bd.B.size(), bd.vcount, bd.instance_count,
-                        bd.indices.size(), it.ps.topology,
+                        bd.index_count(), it.ps.topology,
                         it.ps.color_write_mask, (int)it.ps.blend_enable);
                     // RTTLOG per-draw detail (render-window-only, unlike the GFXLOG firehose): enough
                     // state to diagnose a pass whose inputs HIT the RTT cache yet outputs nothing —
@@ -8401,7 +8410,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 (unsigned long long)it.draw_index,
                                 (unsigned long long)it.vs_guest_addr,
                                 (unsigned long long)it.fs_guest_addr,
-                                (unsigned long long)it.color0_base, bd.vcount, bd.indices.size(),
+                                (unsigned long long)it.color0_base, bd.vcount, bd.index_count(),
                                 it.ps.topology, it.ps.color_write_mask, (int)it.ps.blend_enable,
                                 it.ps.src_color_blend_factor, it.ps.dst_color_blend_factor,
                                 (int)it.ps.has_viewport,
@@ -8429,7 +8438,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     (unsigned long long)it.fs_guest_addr,
                                     (unsigned long long)sighting.ordinal,
                                     (unsigned long long)sighting.distinct,
-                                    bd.vcount, bd.indices.size(), it.ps.topology,
+                                    bd.vcount, bd.index_count(), it.ps.topology,
                                     (unsigned long long)it.color0_base);
                     }
                     // PROSPER_DRAW_LINKSCAN: census the LINKED LISTS this draw's scalar buffers
@@ -8625,7 +8634,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                         (unsigned long long)it.vs_guest_addr,
                                         (unsigned long long)it.vs_chain_guest_addr,
                                         (unsigned long long)it.fs_guest_addr,
-                                        bd.vcount, bd.indices.size(),
+                                        bd.vcount, bd.index_count(),
                                         (unsigned long long)it.color0_base);
                             continue;
                         }
