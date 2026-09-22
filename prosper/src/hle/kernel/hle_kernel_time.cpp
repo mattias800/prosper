@@ -1,5 +1,6 @@
 // hle_kernel_time.cpp — time/clock sources, C11 thread primitives, and assorted
 // libkernel stubs the engine needs during init. Cross-platform (chrono + pthread).
+#include "diagnostics/exit_reports.hpp"
 #include "hle/dispatch/dispatch.hpp"
 #include "hle/dispatch/nid.hpp"
 #include "hle/kernel/hle_kernel_time.hpp"
@@ -919,6 +920,7 @@ HLE(k_exit) {
     fprintf(stderr, "[prosper] guest _exit(%d) -- terminating\n", (int)a0);
     report_guest_fatal_caller(entry_rbp, entry_rsp);
     host::guest_dmem_write_trace_report();
+    prosper::diagnostics::flush_exit_reports();   // _Exit skips atexit (#3353)
     fflush(nullptr);
     _Exit((int)a0);
 }
@@ -935,6 +937,7 @@ HLE(k_debug_raise_release) {
             (unsigned long long)a0, (unsigned long long)a1);
     report_guest_fatal_caller(entry_rbp, entry_rsp);
     host::guest_dmem_write_trace_report();
+    prosper::diagnostics::flush_exit_reports();   // _Exit skips atexit (#3353)
     fflush(nullptr);
     _Exit(0x66);
 }

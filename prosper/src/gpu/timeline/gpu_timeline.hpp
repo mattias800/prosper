@@ -361,8 +361,9 @@ std::string format_guest_log_capture_miss(const GuestLogCaptureMiss& miss);
 // and never matched. Returns false when no marker was configured or the marker matched.
 bool guest_log_capture_miss_snapshot(GuestLogCaptureMiss& out);
 // Prints one report for the configured automatic whole-frame capture gate when it never armed a
-// capture. Registered with std::atexit at load time, so a run that silently produced no bundle now
-// says so; exported so the same text can be asserted by a test.
+// capture. Registered at load through diagnostics/exit_reports.hpp (every frontend's exit path
+// flushes it -- bare std::atexit reached none of them, #3353), so a run that silently produced no
+// bundle now says so; exported so the same text can be asserted by a test.
 void report_unfired_automatic_capture_gates();
 
 // ---- capture tunables (#2565) ----------------------------------------------------------------
@@ -452,7 +453,8 @@ std::string format_timeline_capture_selector_miss(const TimelineCaptureSelectorM
 // Snapshot of the live selector. True when a report is due: a selector was configured and no
 // detailed capture was ever taken.
 bool timeline_capture_selector_miss_snapshot(TimelineCaptureSelectorMiss& out);
-// Registered with std::atexit at load, next to report_unfired_automatic_capture_gates().
+// Registered at load through diagnostics/exit_reports.hpp, next to
+// report_unfired_automatic_capture_gates().
 void report_unfired_timeline_capture_selector();
 // Marks bytes omitted by a bounded stdout adapter. It deliberately discards through the next observed
 // line ending so an unobserved suffix can cause only a missed match, never a false exact-line match.

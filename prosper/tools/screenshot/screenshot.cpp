@@ -57,6 +57,7 @@
 // PROSPER_GUEST_ARGS= PROSPER_NULL_PAGE=1).
 #include "loader/linker.hpp"          // Program
 #include "host/memory/guest_write_watch.hpp"
+#include "diagnostics/exit_reports.hpp"
 #include "host/image/boot_program.hpp"       // boot_program
 #include "host/image/exec_image.hpp"         // run_entry
 #include "host/platform/gpu_submit_gate.hpp" // #3225: drain guest GPU submits before _exit
@@ -991,6 +992,9 @@ int main(int argc, char** argv) {
     // reports here; the asymmetry was silent, because a diagnostic that produces no output looks
     // exactly like one that found nothing. Report before exiting, as prosper-app does.
     prosper::host::guest_dmem_write_trace_report();
+    // The same for everything registered through diagnostics/exit_reports.hpp, including the two
+    // reports that explain an empty capture (#3353).
+    prosper::diagnostics::flush_exit_reports();
     // #3225: same shape as prosper-app's exit -- a detached guest thread and a raw _exit. _exit
     // becomes exit_group(), and a thread inside an amdgpu command submission at that moment cannot
     // be torn down until it returns from the kernel; it parks in __drm_exec_lock_obj on a GEM
