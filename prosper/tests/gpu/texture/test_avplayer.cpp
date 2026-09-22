@@ -1257,6 +1257,42 @@ int main() {
     CHECK(gpu::guest_linear_texture_row_pitch(synthetic_frame_address, pitch) == 0,
           "Close removes fallback AvPlayer layout provenance");
 
+    // ---- sceAvPlayerStartEx (NxSdL9t-KXk) ---------------------------------------------------
+    // Kena: Bridge of Spirits (PPSA01802) adds its logo movie with auto_start 0 and starts it with
+    // ONLY this function, passing the 16-byte block {0x10, 1} it copies from rodata. While it was
+    // unregistered the dispatcher's `return 0` answered SCE_OK and nothing ever played. The arms
+    // below fail on that pre-fix build three ways: the lookup is null, no PLAY event fires, and the
+    // first video pull (after the PLAY that never came) returns no frame.
+    {
+        HleFn start_ex = Hle::lookup("NxSdL9t-KXk");
+        CHECK(start_ex != nullptr && start_ex == Hle::lookup(nid_hash("sceAvPlayerStartEx")),
+              "sceAvPlayerStartEx is registered under NID NxSdL9t-KXk (its name hash)");
+        if (start_ex) {
+            set_synthetic_frames("1");
+            event_count = 0;
+            uint64_t h3 = init((uint64_t)(uintptr_t)&data, 0, 0, 0, 0, 0);
+            CHECK(add(h3, (uint64_t)(uintptr_t)source, 0, 0, 0, 0) == 0,
+                  "StartEx arm: sceAvPlayerAddSource succeeds");
+            CHECK(event_count == 1 && events[0] == 2, "StartEx arm: READY fires on AddSource");
+            CHECK(start_ex(h3, 0, 0, 0, 0, 0) != 0 && event_count == 1,
+                  "sceAvPlayerStartEx with a NULL parameter block FAILS and starts nothing");
+            struct { uint64_t this_size; uint64_t value; } kena_param{0x10, 1};
+            CHECK(start_ex(h3, (uint64_t)(uintptr_t)&kena_param, 0, 0, 0, 0) == 0,
+                  "sceAvPlayerStartEx({16, 1}) succeeds");
+            CHECK(event_count == 2 && events[1] == 3, "sceAvPlayerStartEx fires exactly one PLAY");
+            AvpFrameInfoEx ex_frame{};
+            CHECK(video(h3, (uint64_t)(uintptr_t)&ex_frame, 0, 0, 0, 0) == 1 && ex_frame.data,
+                  "a player started by sceAvPlayerStartEx delivers its first frame");
+            CHECK(start_ex(h3, (uint64_t)(uintptr_t)&kena_param, 0, 0, 0, 0) == 0 &&
+                      event_count == 2,
+                  "a second sceAvPlayerStartEx on a playing player fires no second PLAY");
+            CHECK(start_ex(0xdeadbeefull, (uint64_t)(uintptr_t)&kena_param, 0, 0, 0, 0) != 0,
+                  "sceAvPlayerStartEx FAILS for an unknown player handle");
+            close(h3, 0, 0, 0, 0, 0);
+            set_synthetic_frames(nullptr);
+        }
+    }
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;
