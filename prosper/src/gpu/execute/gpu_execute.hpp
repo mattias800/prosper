@@ -49,6 +49,13 @@ bool guest_readable(uint64_t address, uint32_t bytes);
 
 using SharedShaderWords = std::shared_ptr<const std::vector<uint32_t>>;
 
+// One byte-validated immutable shader version. The live draw path acquires this after resource
+// realization and shares it only across the fragment metadata + compilation operation for that
+// draw. A later draw acquires again, so same-address guest shader rewrites remain visible.
+struct ShaderCodeAnalysis;
+using SharedShaderAnalysis = std::shared_ptr<const ShaderCodeAnalysis>;
+SharedShaderAnalysis acquire_shader_analysis(const uint32_t* code, size_t dwords);
+
 // One realized draw of a submit: recompiled VS+PS SPIR-V, the draw's OWN resolved fixed-function
 // state, the two stages' resource tables (so the backend can bind the constant/vertex buffers +
 // textures the shaders declare, reading their bytes from 1:1-mapped guest memory), and its vertex
@@ -556,7 +563,8 @@ std::vector<uint32_t> recompile_graphics_shader_cached(ShaderProgramStage stage,
                                                        uint64_t* cache_identity = nullptr,
                                                        bool fragment_wave32 = false,
                                                        uint32_t vertex_lds_dwords = 0,
-                                                       bool vertex_capture_position = false);
+                                                       bool vertex_capture_position = false,
+                                                       const SharedShaderAnalysis& captured_analysis = {});
 SharedShaderWords recompile_graphics_shader_cached_shared(
     ShaderProgramStage stage, const uint32_t* code, size_t dwords,
     const ShaderResourceTable* resources = nullptr,
@@ -565,7 +573,8 @@ SharedShaderWords recompile_graphics_shader_cached_shared(
     uint64_t* cache_identity = nullptr,
     bool fragment_wave32 = false,
     uint32_t vertex_lds_dwords = 0,
-    bool vertex_capture_position = false);
+    bool vertex_capture_position = false,
+    const SharedShaderAnalysis& captured_analysis = {});
 // Compute uses the same bounded content-addressed cache as graphics. Launch geometry that changes
 // generated SPIR-V participates in the key; ordinary per-dispatch push-constant values do not.
 // Conditional marker lowerings validate their value-dependent dispatch proof before cache lookup.
@@ -684,6 +693,10 @@ FragmentInterpolationLayout fragment_interpolation_layout_cached(
     const uint32_t* code, size_t dwords,
     const PixelSystemInputMapping* system_inputs = nullptr,
     const PixelInputMapping* pixel_inputs = nullptr);
+FragmentInterpolationLayout fragment_interpolation_layout_cached(
+    const SharedShaderAnalysis& analysis,
+    const PixelSystemInputMapping* system_inputs = nullptr,
+    const PixelInputMapping* pixel_inputs = nullptr);
 
 // Memoized on the shader-analysis identity, exactly as fragment_interpolation_layout_cached is and
 // for the same reason (#2945). The uncached form walks the whole recompile span TWICE -- once
@@ -691,6 +704,14 @@ FragmentInterpolationLayout fragment_interpolation_layout_cached(
 // per-draw realize path, seven lines from the cache that exists to keep one such walk off it. The
 // mask is a pure function of the shader bytes, so it memoizes identically.
 uint32_t fragment_consumed_attribute_mask_cached(const uint32_t* code, size_t dwords);
+uint32_t fragment_consumed_attribute_mask_cached(const SharedShaderAnalysis& analysis);
+
+// These properties come from the same owned byte version used by the fragment module key. The
+// prefix helper preserves guest-address provenance outside the analysis while avoiding a later raw
+// read for helper-program recognition.
+uint32_t fragment_color_export_mask_cached(const SharedShaderAnalysis& analysis);
+bool shader_analysis_has_prefix(const SharedShaderAnalysis& analysis,
+                                const uint32_t* words, size_t dwords);
 
 // apply_fragment_consumption over the memoized mask. Honours PROSPER_NO_DEAD_VARYING_ELIM through
 // dead_varying_elimination_enabled(), so the live path and the uncached form cannot drift on the
@@ -700,6 +721,13 @@ inline void apply_fragment_consumption_cached(PixelInputMapping& mapping,
     if (!dead_varying_elimination_enabled() || !mapping.valid_mask || !fragment_code || !dwords)
         return;
     mapping.consumed_mask = fragment_consumed_attribute_mask_cached(fragment_code, dwords);
+    mapping.consumed_known = true;
+}
+
+inline void apply_fragment_consumption_cached(PixelInputMapping& mapping,
+                                              const SharedShaderAnalysis& analysis) {
+    if (!dead_varying_elimination_enabled() || !mapping.valid_mask || !analysis) return;
+    mapping.consumed_mask = fragment_consumed_attribute_mask_cached(analysis);
     mapping.consumed_known = true;
 }
 
@@ -1938,17 +1966,31 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     //
     // The lever (PROSPER_NO_DEAD_VARYING_ELIM=1) lives in apply_fragment_consumption, so the live
     // path and gpu_replay's --recompile-raw substitution honour exactly the same switch.
-    if (rs.ps_addr)
-        apply_fragment_consumption_cached(
-            pixel_inputs, reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(rs.ps_addr)),
-            max_shader_dwords);
+    const auto* fragment_code = reinterpret_cast<const uint32_t*>(
+        static_cast<uintptr_t>(rs.ps_addr));
+    // One immutable version for the post-resource fragment operation. The compatibility lever is
+    // also the same-binary timing control: without reuse, each helper retains its historical exact
+    // address validation and the export mask retains its direct scan.
+    static const bool reuse_fragment_analysis =
+        !PROSPER_ENV_ON("PROSPER_NO_FRAGMENT_ANALYSIS_REUSE");
+    const SharedShaderAnalysis fragment_analysis = reuse_fragment_analysis && rs.ps_addr
+        ? acquire_shader_analysis(fragment_code, max_shader_dwords)
+        : SharedShaderAnalysis{};
+    if (rs.ps_addr) {
+        if (fragment_analysis)
+            apply_fragment_consumption_cached(pixel_inputs, fragment_analysis);
+        else
+            apply_fragment_consumption_cached(pixel_inputs, fragment_code, max_shader_dwords);
+    }
     const PixelInputMapping* pixel_input_ptr = pixel_inputs.valid_mask ? &pixel_inputs : nullptr;
     PixelSystemInputMapping system_inputs{rs.ps_input_ena, rs.ps_input_addr};
     const PixelSystemInputMapping* system_input_ptr =
         (system_inputs.ena || system_inputs.addr) ? &system_inputs : nullptr;
-    const FragmentInterpolationLayout interpolation = fragment_interpolation_layout_cached(
-        reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(rs.ps_addr)),
-        max_shader_dwords, system_input_ptr, pixel_input_ptr);
+    const FragmentInterpolationLayout interpolation = fragment_analysis
+        ? fragment_interpolation_layout_cached(
+              fragment_analysis, system_input_ptr, pixel_input_ptr)
+        : fragment_interpolation_layout_cached(
+              fragment_code, max_shader_dwords, system_input_ptr, pixel_input_ptr);
     const bool capture_vertex_position = PROSPER_ENV_ON("PROSPER_GEOM_PROBE") &&
                                          !interpolation.requires_geometry &&
                                          !rect_list_synthesis;
@@ -1970,7 +2012,7 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
         fs_shared = recompile_graphics_shader_cached_shared(
             ShaderProgramStage::Fragment, (const uint32_t*)(uintptr_t)rs.ps_addr,
             max_shader_dwords, prt.get(), pixel_input_ptr, system_input_ptr, &fs_identity,
-            rs.ps_wave32);
+            rs.ps_wave32, 0, false, fragment_analysis);
     } else {
         if (vertex_chain) {
             const SharedShaderWords linked = recompile_vertex_chain_cached_shared(
@@ -1988,7 +2030,7 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
         fs = recompile_graphics_shader_cached(
             ShaderProgramStage::Fragment, (const uint32_t*)(uintptr_t)rs.ps_addr,
             max_shader_dwords, prt.get(), pixel_input_ptr, system_input_ptr, &fs_identity,
-            rs.ps_wave32);
+            rs.ps_wave32, 0, false, fragment_analysis);
     }
     // CB_COLOR_CONTROL.DCC_DECOMPRESS interprets the bound AGC metadata helper, rather than its
     // ordinary fragment-color export. The operation bits can remain folded into a later graphics
@@ -1999,12 +2041,13 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     static constexpr uint32_t kDccDecompressHelperProgram[] = {
         0x7e000280u, 0xf8001803u, 0x00000000u, 0xbf810000u,
     };
-    const auto* raw_fragment = reinterpret_cast<const uint32_t*>(
-        static_cast<uintptr_t>(rs.ps_addr));
-    const bool dcc_helper_program = raw_fragment && max_shader_dwords >=
-        std::size(kDccDecompressHelperProgram) &&
-        std::equal(std::begin(kDccDecompressHelperProgram),
-                   std::end(kDccDecompressHelperProgram), raw_fragment);
+    const auto* raw_fragment = fragment_code;
+    const bool dcc_helper_program = fragment_analysis
+        ? shader_analysis_has_prefix(fragment_analysis, kDccDecompressHelperProgram,
+                                     std::size(kDccDecompressHelperProgram))
+        : raw_fragment && max_shader_dwords >= std::size(kDccDecompressHelperProgram) &&
+              std::equal(std::begin(kDccDecompressHelperProgram),
+                         std::end(kDccDecompressHelperProgram), raw_fragment);
     const bool dcc_decompress = dcc_helper_program &&
         PM4_FIELD(rs.cb_color_control, CB_COLOR_CONTROL, MODE) ==
             prosper::agc::Pm4::CB_COLOR_CONTROL_MODE_DCC_DECOMPRESS;
@@ -2187,8 +2230,9 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     // `&= 0` on every slot above it.
     static_assert(kFragmentColorOutputs == kColorTargetCount,
                   "fragment colour outputs must cover every render-state colour target");
-    const uint32_t exp_mask = fragment_color_export_mask(
-        reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(rs.ps_addr)), max_shader_dwords);
+    const uint32_t exp_mask = fragment_analysis
+        ? fragment_color_export_mask_cached(fragment_analysis)
+        : fragment_color_export_mask(fragment_code, max_shader_dwords);
     for (uint32_t slot = 0; slot < ps.color_targets.size(); ++slot)
         ps.color_targets[slot].write_mask &= (exp_mask >> (slot * 4u)) & 0xFu;
     ps.color_write_mask = ps.color_targets[0].write_mask;

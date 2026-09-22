@@ -792,6 +792,69 @@ int main(int argc, char** argv) {
               analysis_stats.invalidations == 1 && stats.hits == 1 && stats.misses == 2,
           "same-address shader mutation invalidates analysis and misses the compiled cache");
 
+    // One live fragment operation must use one immutable byte version for interpolation metadata,
+    // export gating, and module compilation. Rewrite the same allocation after acquisition, then
+    // clear both process caches: the retained version must still describe and compile A while a
+    // fresh acquisition observes B. This also fails if the optimized path falls back to the guest
+    // address for any of the three properties.
+    static const uint32_t kVersionedFragmentA[] = {
+        0xc80e0002u, 0xc8110002u, 0xf800000fu, 0x03030303u, 0xbf810000u,
+    };
+    std::vector<uint32_t> versioned_fragment(
+        std::begin(kVersionedFragmentA), std::end(kVersionedFragmentA));
+    const ShaderAnalysisCacheStats analysis_before_snapshot = shader_analysis_cache_stats();
+    const SharedShaderAnalysis version_a = acquire_shader_analysis(
+        versioned_fragment.data(), versioned_fragment.size());
+    const uint32_t consumed_a = fragment_consumed_attribute_mask_cached(version_a);
+    const FragmentInterpolationLayout interpolation_a =
+        fragment_interpolation_layout_cached(version_a);
+    const uint32_t exports_a = fragment_color_export_mask_cached(version_a);
+    const std::vector<uint32_t> direct_a = recompile_fragment(
+        kVersionedFragmentA, std::size(kVersionedFragmentA));
+    const ShaderAnalysisCacheStats analysis_after_snapshot = shader_analysis_cache_stats();
+    CHECK(analysis_after_snapshot.misses == analysis_before_snapshot.misses + 1 &&
+              analysis_after_snapshot.hits == analysis_before_snapshot.hits,
+          "fragment metadata reuses one analysis acquisition without hidden revalidation");
+    versioned_fragment[0] = 0x7e000280u;
+    versioned_fragment[1] = 0x7e020280u;
+    versioned_fragment[2] = 0xf8000075u;
+    clear_shader_recompile_cache();
+    clear_shader_analysis_cache();
+    uint64_t retained_identity = 0, fresh_identity = 0;
+    const SharedShaderWords retained_a = recompile_graphics_shader_cached_shared(
+        ShaderProgramStage::Fragment, versioned_fragment.data(), versioned_fragment.size(),
+        nullptr, nullptr, nullptr, &retained_identity, false, 0, false, version_a);
+    const ShaderAnalysisCacheStats retained_compile_stats = shader_analysis_cache_stats();
+    const SharedShaderAnalysis version_b = acquire_shader_analysis(
+        versioned_fragment.data(), versioned_fragment.size());
+    const uint32_t consumed_b = fragment_consumed_attribute_mask_cached(version_b);
+    const FragmentInterpolationLayout interpolation_b =
+        fragment_interpolation_layout_cached(version_b);
+    const uint32_t exports_b = fragment_color_export_mask_cached(version_b);
+    const SharedShaderWords fresh_b = recompile_graphics_shader_cached_shared(
+        ShaderProgramStage::Fragment, versioned_fragment.data(), versioned_fragment.size(),
+        nullptr, nullptr, nullptr, &fresh_identity, false, 0, false, version_b);
+    CHECK(version_a && retained_a && !direct_a.empty() && *retained_a == direct_a &&
+              shader_analysis_has_prefix(version_a, kVersionedFragmentA,
+                                         std::size(kVersionedFragmentA)) &&
+              consumed_a != consumed_b &&
+              interpolation_a.attribute_mask != interpolation_b.attribute_mask &&
+              exports_a != exports_b,
+          "retained fragment analysis keeps metadata, exports, and module on one byte version");
+    CHECK(retained_compile_stats.hits == 0 && retained_compile_stats.misses == 0,
+          "retained fragment compilation performs no address revalidation after cache reset");
+    CHECK(version_b && fresh_b && retained_identity != 0 && fresh_identity != 0 &&
+              retained_identity != fresh_identity && *fresh_b != *retained_a &&
+              shader_analysis_has_prefix(version_b, versioned_fragment.data(),
+                                         versioned_fragment.size()),
+          "fresh fragment analysis observes a same-address rewrite after retained-version use");
+    clear_shader_recompile_cache();
+    const std::vector<uint32_t> copied_a = recompile_graphics_shader_cached(
+        ShaderProgramStage::Fragment, versioned_fragment.data(), versioned_fragment.size(),
+        nullptr, nullptr, nullptr, nullptr, false, 0, false, version_a);
+    CHECK(copied_a == direct_a,
+          "copying fragment path compiles the retained byte version rather than the rewritten address");
+
     // Live realization retains the cache allocation directly. Repeated hits must share one immutable
     // word vector, and eviction/reset must not invalidate a DrawItem that still owns that version.
     clear_shader_recompile_cache();
