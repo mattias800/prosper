@@ -97,6 +97,22 @@ int main() {
     CHECK(px_noidx.size() == (size_t)W*H*4 && px_noidx != px_tri,
           "dropping the indices changes the picture (indices are really applied)");
 
+    // The live frontend borrows DrawItem's index storage for the synchronous backend call. Give the
+    // BackendDraw a conflicting owned list so this arm fails if the optimized path is ignored, then
+    // mutate the same borrowed storage at the same address so it also fails if a prior value is
+    // retained. Direct tests and replay still exercise the owned-vector fallback above.
+    std::vector<uint32_t> borrowed_indices = {1, 2, 3};
+    prosper::test::BackendDraw borrowed = draw_of(vbufB, &list_ps, 4, {0, 0, 0});
+    borrowed.borrow_indices(borrowed_indices);
+    const std::vector<uint8_t> px_borrowed = prosper::test::render_draws_rgba({borrowed}, W, H);
+    CHECK(px_borrowed == px_tri,
+          "borrowed index words override conflicting owned words and select records 1..3");
+    borrowed_indices[0] = borrowed_indices[1] = borrowed_indices[2] = 0;
+    const std::vector<uint8_t> px_borrowed_mutated =
+        prosper::test::render_draws_rgba({borrowed}, W, H);
+    CHECK(px_borrowed_mutated.size() == (size_t)W*H*4 && px_borrowed_mutated != px_borrowed,
+          "same-address borrowed index mutation is observed by the next backend call");
+
     // --- Case C: GE_INDX_OFFSET reaches both Vulkan draw variants. The same shared pool can select
     // records 1..3 either with non-indexed firstVertex=1 or indexed vertexOffset=1.
     std::vector<uint8_t> px_first_vertex = prosper::test::render_draws_rgba(

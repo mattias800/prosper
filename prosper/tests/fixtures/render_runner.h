@@ -622,11 +622,15 @@ struct BackendDraw {
     uint32_t vcount = 3;
     uint32_t instance_count = 1;
     int32_t vertex_offset = 0;
-    // Indexed draw: 32-bit index data (the executor widens guest 16-bit indices). Non-empty -> the draw
-    // is recorded as vkCmdBindIndexBuffer + vkCmdDrawIndexed(indices.size()), so gl_VertexIndex is the
-    // fetched index — exactly what the recompiled VS's storage-buffer vertex fetch expects. Empty ->
-    // plain vkCmdDraw(vcount). Both paths preserve instance_count.
+    // Indexed draw: 32-bit index data (the executor widens guest 16-bit indices). The live frontend
+    // lends the DrawItem's already-owned words for this synchronous backend call; replay and direct
+    // tests keep using the owned vector. The backend copies either form into its host-visible Vulkan
+    // upload before returning, so the borrowed span never crosses submission or GPU completion.
+    // Consumers must use index_words(): a borrowed value wins over `indices`, matching the shader
+    // accessors above and making a deliberately conflicting owned value a useful regression control.
     std::vector<uint32_t> indices;
+    std::span<const uint32_t> borrowed_indices{};
+    bool has_borrowed_indices = false;
 
     // Same precedence — and same trap — as DrawItem (#1434): a shared value WINS, so assigning
     // `vs`/`fs` on a draw that already carries one silently keeps the ORIGINAL shader. Substitute
@@ -636,6 +640,15 @@ struct BackendDraw {
     const std::vector<uint32_t>& vs_words() const { return vs_shared ? *vs_shared : vs; }
     const std::vector<uint32_t>& gs_words() const { return gs; }
     const std::vector<uint32_t>& fs_words() const { return fs_shared ? *fs_shared : fs; }
+    std::span<const uint32_t> index_words() const {
+        return has_borrowed_indices ? borrowed_indices : std::span<const uint32_t>(indices);
+    }
+    size_t index_count() const { return index_words().size(); }
+    void borrow_indices(const std::vector<uint32_t>& words) {
+        borrowed_indices = words;
+        has_borrowed_indices = true;
+    }
+    void borrow_indices(std::vector<uint32_t>&&) = delete;
 
     void set_vs(std::vector<uint32_t> words) {
         vs = std::move(words); vs_shared.reset(); vs_identity = 0;
@@ -8964,12 +8977,13 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         if (timing_enabled) res_fixed_prologue_ms += setup_elapsed_ms(setup_begin, TimingClock::now());
         // Indexed draw: upload the 32-bit index data to a host-visible VkIndexBuffer now; the record
         // pass binds it and issues vkCmdDrawIndexed instead of vkCmdDraw.
-        if (!bd.indices.empty()) {
+        const std::span<const uint32_t> draw_indices = bd.index_words();
+        if (!draw_indices.empty()) {
             // Per INDEXED DRAW: create a buffer, allocate memory, bind, map, copy, unmap. Six
             // Vulkan entry points and one allocation on every draw that carries indices, and until
             // this timer none of it was separable from fixed-function state translation.
             const ResourcePhaseTimer phase_index_upload(timing_enabled, &res_fixed_index_upload_ms);
-            VkDeviceSize isz = (VkDeviceSize)bd.indices.size() * 4;
+            VkDeviceSize isz = (VkDeviceSize)draw_indices.size() * 4;
             // Prefer a slice of the shared host-buffer arena. The storage path next door has used
             // this since #1284 and #2246's partition measured what it is worth there: `create=0.00`
             // in every window of every run, because the arena absorbs the transient path entirely.
@@ -8997,12 +9011,12 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 if (acquire_buffer_arena_slice(isz, islice) && islice.arena && islice.mapped &&
                     (islice.offset % 4) == 0) {
                     std::memcpy(static_cast<uint8_t*>(islice.mapped) + islice.offset,
-                                bd.indices.data(), (size_t)isz);
+                                draw_indices.data(), (size_t)isz);
                     v.ibuf = islice.buffer;
                     v.ioffset = islice.offset;
                     v.iarena = true;
                     v.imapped = static_cast<const uint8_t*>(islice.mapped) + islice.offset;
-                    v.icount = (uint32_t)bd.indices.size();
+                    v.icount = (uint32_t)draw_indices.size();
                 }
             }
             // Fallback: a dedicated buffer, exactly as before. Reached when the arena is disabled
@@ -9022,8 +9036,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                                         imai.memoryTypeIndex);
             vkBindBufferMemory(dev, v.ibuf, v.ibmem, 0);
             void* ip = nullptr; vkMapMemory(dev, v.ibmem, 0, isz, 0, &ip);
-            std::memcpy(ip, bd.indices.data(), (size_t)isz); vkUnmapMemory(dev, v.ibmem);
-            v.icount = (uint32_t)bd.indices.size();
+            std::memcpy(ip, draw_indices.data(), (size_t)isz); vkUnmapMemory(dev, v.ibmem);
+            v.icount = (uint32_t)draw_indices.size();
             }
         }
         const auto fixed_stages_begin = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
@@ -11895,7 +11909,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         // this host-side reading was needed at all.
         static const bool index_echo = getenv("PROSPER_INDEX_ECHO") != nullptr;
         if (index_echo && v.icount) {
-            const std::vector<uint32_t>& want = draws[di].indices;
+            const std::span<const uint32_t> want = draws[di].index_words();
             uint32_t want_max = 0;
             for (uint32_t x : want) want_max = std::max(want_max, x);
             std::fprintf(stderr,
