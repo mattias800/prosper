@@ -40,6 +40,8 @@ directly, and a claim in this folder should cite the offset it came from. Two fa
 re-deriving: **libSceHttp2's error facility is `0x817b____`, not v1's `0x8043____`** (the low code
 bytes are shared, so the v1 constants are not reusable across the two), and on a connect failure the
 library propagates the **raw libSceNet error**, encoded `0x80410100 | BSD errno`. See #2894.
+That encoding belongs to libSceNet, not to either HTTP library, and lives in `sce_net_errors.hpp`
+(#3545): take a constant from there rather than writing a `0x8041____` literal at a call site.
 
 ## The boundary against its siblings
 

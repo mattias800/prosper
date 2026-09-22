@@ -11,6 +11,7 @@
 // reports the libSceNet error an unreachable network produces, and every response getter reports
 // that same failure. Nothing here manufactures a status code, a header block or a body.
 #include "hle/net/hle_http.hpp"
+#include "hle/net/sce_net_errors.hpp"
 #include "hle/dispatch/dispatch.hpp"
 
 #include <algorithm>
@@ -675,8 +676,8 @@ HLE(h_http_send_request) { // sceHttpSendRequest(requestId, postData, size)
     HttpObject* req = http_live(a0, Kind::Request);
     if (!req) return http_err(http::kErrorInvalidId);
     req->send_attempted = true;
-    req->send_error = http::kNetErrorNetUnreach;
-    req->last_errno = http::kNetErrnoNetUnreach;
+    req->send_error = net::kNetErrorNetUnreach;
+    req->last_errno = static_cast<int32_t>(net::kOfflineConnectErrno);   // sceHttpGetLastErrno
     return http_err(req->send_error);
 }
 

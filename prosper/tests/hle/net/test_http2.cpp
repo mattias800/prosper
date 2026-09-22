@@ -211,7 +211,7 @@ int main() {
     CHECK(sent != 0, "SendRequest does NOT report success for a request prosper never sent");
     // Kills: an arbitrary non-zero. The offline answer is the libSceNet error an unreachable
     // network produces, which is the family the library itself propagates from its connect site.
-    CHECK(sent == http2::kNetErrorNetUnreach,
+    CHECK(sent == 0x80410133u,   // libSceNet 0x80410100 | FreeBSD ENETUNREACH (51)
           "SendRequest reports SCE_NET_ERROR_ENETUNREACH (0x80410133)");
     CHECK((sent & 0x80000000u) != 0, "...and it is an error-shaped value with the top bit set");
 
