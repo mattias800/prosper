@@ -22,7 +22,7 @@
 using prosper::gpu::CachedShader;
 using prosper::gpu::SharedShaderWords;
 
-static int failures = 0;
+// `failures` is main()'s local; CHECK is only used there.
 #define CHECK(condition, message) do { \
     if (!(condition)) { std::fprintf(stderr, "FAIL: %s\n", message); ++failures; } \
     else { std::printf("ok: %s\n", message); } \
@@ -32,7 +32,7 @@ static CachedShader make_entry(const SharedShaderWords& words) {
     CachedShader value;
     value.spirv = words;
     value.identity = 7;
-    value.last_use.store(42, std::memory_order_relaxed);
+    value.last_use.store(42);
     value.bytes = 12;
     value.writes_trip_witness = true;
     return value;
@@ -40,11 +40,12 @@ static CachedShader make_entry(const SharedShaderWords& words) {
 
 static bool same_fields(const CachedShader& e, const SharedShaderWords& words) {
     return e.spirv == words && e.identity == 7 &&
-           e.last_use.load(std::memory_order_relaxed) == 42 && e.bytes == 12 &&
+           e.last_use.load() == 42 && e.bytes == 12 &&
            e.writes_trip_witness;
 }
 
 int main() {
+    int failures = 0;
     // Traits: a trait query cannot distinguish "moved" from "copied through const&" for plain
     // is_move_constructible (both are true today), so ask for noexcept, which the hand-written
     // copy constructor does not have.
@@ -80,11 +81,12 @@ int main() {
         CHECK(same_fields(dest, words), "self move-assignment is a no-op");
     }
 
-    {   // The production insertion shape: emplace(key, std::move(value)).
+    {   // The production insertion shape, emplace(key, std::move(value)); try_emplace constructs the
+        // mapped value from the same rvalue, so it exercises the same constructor.
         std::unordered_map<int, CachedShader> entries;
         CachedShader value = make_entry(words);
-        entries.emplace(1, std::move(value));
-        CHECK(!value.spirv, "emplace(std::move(value)) moves the entry into the map");
+        entries.try_emplace(1, std::move(value));
+        CHECK(!value.spirv, "inserting std::move(value) moves the entry into the map");
         CHECK(words.use_count() == 2, "the map entry is the words' only other owner");
         CHECK(same_fields(entries.at(1), words), "the map entry carries every field");
     }

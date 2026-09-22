@@ -436,17 +436,19 @@ struct CachedShader {
     // last_use has to be written by hand. Declaring the copy pair suppresses the implicit move pair
     // (#3745), so the move pair is spelled out too: without it every `emplace(std::move(value))`
     // into ShaderCache::entries silently took the copy constructor. Moving transfers `spirv`
-    // (no refcount traffic) and snapshots last_use exactly as the copy does.
+    // (no refcount traffic) and snapshots last_use as the copy does. The default (seq_cst) ordering
+    // is deliberate rather than the copy's relaxed: a moved-from entry is exclusively owned, so the
+    // ordering is irrelevant to correctness and the stronger one costs nothing measurable here.
     CachedShader() = default;
     CachedShader(CachedShader&& other) noexcept
         : spirv(std::move(other.spirv)), identity(other.identity),
-          last_use(other.last_use.load(std::memory_order_relaxed)),
+          last_use(other.last_use.load()),
           bytes(other.bytes), writes_trip_witness(other.writes_trip_witness) {}
     CachedShader& operator=(CachedShader&& other) noexcept {
         if (this != &other) {
             spirv = std::move(other.spirv);
             identity = other.identity;
-            last_use.store(other.last_use.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            last_use.store(other.last_use.load());
             bytes = other.bytes;
             writes_trip_witness = other.writes_trip_witness;
         }
