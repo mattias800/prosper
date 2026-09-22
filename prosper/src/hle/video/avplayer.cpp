@@ -1215,12 +1215,13 @@ HLE(s_avp_addsourceex) {   // s32 sceAvPlayerAddSourceEx(handle, AvPlayerUriType
     if (auto* d = (const AvpSourceDetails*)PW(a2)) path = d->uri.name;
     return avp_add_source(a0, path);
 }
-HLE(s_avp_start) {   // s32 sceAvPlayerStart(handle) — used when auto_start is false
-    svc_log("sceAvPlayerStart", a0,a1,a2,a3,a4,a5);
+// The shared body of sceAvPlayerStart and sceAvPlayerStartEx: begin playback of a player whose
+// source was added with auto_start false, and fire AVP_PLAY outside the player lock.
+static uint64_t avp_start_playback(uint64_t handle) {
     void* obj = nullptr; AvpEventCb cb = nullptr; bool play = false;
     {
         std::lock_guard<std::mutex> lk(g_avp_mx);
-        auto it = g_avp.find(a0); if (it == g_avp.end()) return 0x80000000ull;
+        auto it = g_avp.find(handle); if (it == g_avp.end()) return 0x80000000ull;
         AvpPlayer& p = it->second;
         if (p.have_source && !p.playing && !p.stop_fired) {
             p.playing = true; p.paused = false; play = true; obj = p.ev_obj; cb = p.ev_cb;
@@ -1229,6 +1230,39 @@ HLE(s_avp_start) {   // s32 sceAvPlayerStart(handle) — used when auto_start is
     }
     if (play) avp_fire(obj, cb, AVP_PLAY);
     return 0;
+}
+HLE(s_avp_start) {   // s32 sceAvPlayerStart(handle) — used when auto_start is false
+    svc_log("sceAvPlayerStart", a0,a1,a2,a3,a4,a5);
+    return avp_start_playback(a0);
+}
+// s32 sceAvPlayerStartEx(handle, const StartParam* param) — NID NxSdL9t-KXk in the PS5 3.20
+// libSceAvPlayer stub table. Unregistered, the dispatcher's `return 0` answered SCE_OK without
+// starting anything: Kena: Bridge of Spirits (PPSA01802) adds its Ember Lab logo movie with
+// auto_start 0, calls ONLY this function from its READY callback (eboot+0x11b13bf, the sole call
+// site), and then waits for a movie that never played -- a black 4K composite for the whole run.
+//
+// The parameter block's layout is taken from that call site: a 16-byte block copied from rodata,
+// `{ u64 = 0x10, u64 = 1 }`. The first word is the block's own size (the usual Sony `thisSize`
+// convention, and exactly sizeof the block the guest built). The meaning of the second word is NOT
+// established; the one title that calls this passes 1 and ignores the return value. prosper starts
+// playback from the beginning, exactly as sceAvPlayerStart does, and logs any block that differs
+// from the observed one so a title that relies on the second word surfaces instead of silently
+// playing from the wrong place. CONFIDENCE: MED (start semantics HIGH; second word unknown).
+struct AvpStartParam { uint64_t this_size; uint64_t value; };
+HLE(s_avp_start_ex) {
+    svc_log("sceAvPlayerStartEx", a0,a1,a2,a3,a4,a5);
+    const auto* param = (const AvpStartParam*)PW(a1);
+    if (!param) return 0x806a0001ull;
+    if (param->this_size != sizeof(AvpStartParam) || param->value != 1) {
+        static std::atomic<int> reported{0};
+        if (reported.fetch_add(1) < 8)
+            fprintf(stderr,
+                    "[avp] sceAvPlayerStartEx: unobserved parameter block this_size=%llu "
+                    "value=%llu (only {16, 1} has been seen in a title); starting from the "
+                    "beginning like sceAvPlayerStart\n",
+                    (unsigned long long)param->this_size, (unsigned long long)param->value);
+    }
+    return avp_start_playback(a0);
 }
 HLE(s_avp_pause) {   // s32 sceAvPlayerPause(handle)
     svc_log("sceAvPlayerPause", a0,a1,a2,a3,a4,a5);
@@ -1720,6 +1754,7 @@ HLE(s_avp_close) {   // s32 sceAvPlayerClose(handle)
 AVP_CALLBACK_ENTRY(s_avp_addsource_entry, s_avp_addsource_entry_c, s_avp_addsource)
 AVP_CALLBACK_ENTRY(s_avp_addsourceex_entry, s_avp_addsourceex_entry_c, s_avp_addsourceex)
 AVP_CALLBACK_ENTRY(s_avp_start_entry, s_avp_start_entry_c, s_avp_start)
+AVP_CALLBACK_ENTRY(s_avp_start_ex_entry, s_avp_start_ex_entry_c, s_avp_start_ex)
 AVP_CALLBACK_ENTRY(s_avplayer_isactive_entry, s_avplayer_isactive_entry_c, s_avplayer_isactive)
 AVP_CALLBACK_ENTRY(s_avp_getvideodata_entry, s_avp_getvideodata_entry_c, s_avp_getvideodata)
 AVP_CALLBACK_ENTRY(s_avp_getvideodataex_entry, s_avp_getvideodataex_entry_c, s_avp_getvideodataex)
@@ -1777,9 +1812,11 @@ void register_avplayer_hle() {
     Hle::register_fn("BOVKAzRmuTQ", (HleFn)s_avp_stream_ok, "sceAvPlayerDisableStream");
     Hle::register_fn("buMCiJftcfw", (HleFn)s_avp_stream_ok, "sceAvPlayerChangeStream");
 #ifdef _WIN32
+    Hle::register_fn("NxSdL9t-KXk", (HleFn)s_avp_start_ex, "sceAvPlayerStartEx");
     Hle::register_fn("9y5v+fGN4Wk", (HleFn)s_avp_pause, "sceAvPlayerPause");
     Hle::register_fn("w5moABNwnRY", (HleFn)s_avp_resume, "sceAvPlayerResume");
 #else
+    Hle::register_fn("NxSdL9t-KXk", (HleFn)s_avp_start_ex_entry, "sceAvPlayerStartEx");
     Hle::register_fn("9y5v+fGN4Wk", (HleFn)s_avp_pause_entry, "sceAvPlayerPause");
     Hle::register_fn("w5moABNwnRY", (HleFn)s_avp_resume_entry, "sceAvPlayerResume");
 #endif
