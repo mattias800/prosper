@@ -1039,6 +1039,12 @@ HLE(s_savedata_dirsearch) {
     uint32_t hit = (cap && total > cap) ? cap : total;
     *(uint32_t*)(res + 0x00) = hit;        // hitNum
     *(uint32_t*)(res + 0x14) = hit;        // setNum
+    // The ANSWER, which svc_log above cannot show (it dumps the arguments on entry). "0 hits" is what
+    // a fresh console reports, so without this line a listing that silently enumerates nothing
+    // (#2760: Windows, for every title) is indistinguishable from a title that has no saves yet.
+    if (svclog())
+        fprintf(stderr, "[svc]   sceSaveDataDirNameSearch -> hitNum=%u (%zu save dirs on disk%s%s)\n",
+                hit, dirs.size(), filter ? ", dirName filter=" : "", filter ? filter : "");
     return 0;
 }
 

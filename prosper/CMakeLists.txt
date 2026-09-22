@@ -1272,6 +1272,15 @@ if(TARGET prosper_core)
   target_link_libraries(test_savedata_title_namespace PRIVATE prosper_core)
   add_test(NAME savedata_title_namespace COMMAND test_savedata_title_namespace)
 
+  # sceSaveDataDirNameSearch reported NO saves on Windows (#2760): savedata0_list_dirs() was
+  # `#ifndef _WIN32`-ed out, so every title's load/continue list was empty there. Drives the real NID
+  # over a disposable save root with saves made both through the mount path and by hand, plus a file
+  # and a dot-directory that must not be reported. Registered unconditionally so the MinGW job runs it.
+  add_executable(test_savedata_dirsearch tests/hle/test_savedata_dirsearch.cpp)
+  target_include_directories(test_savedata_dirsearch PRIVATE tests)
+  target_link_libraries(test_savedata_dirsearch PRIVATE prosper_core)
+  add_test(NAME savedata_dirsearch COMMAND test_savedata_dirsearch)
+
   # libSceIme keyboard API (#186): reports a consistent "no keyboard connected" state (empty resource
   # array + disconnected info, bounds-checked) so the per-frame input poll never reads garbage.
   add_executable(test_ime_keyboard tests/hle/service/test_ime_keyboard.cpp)
