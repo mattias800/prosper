@@ -29,6 +29,7 @@
 #include "shared/perf/performance_timing_gate.hpp"  // turn on render_runner's existing backend clocks
 #include "shared/perf/performance_timing_policy.hpp" // retain timing across split semantic submits
 
+#include "gpu/pm4/pm4_registers.hpp"
 #include "gpu/execute/gpu_execute.hpp"          // DrawItem, set_submit_renderer
 #include "gpu/timeline/gpu_timeline.hpp"         // phase-gated detailed-capture policy
 #include "gpu/capture/writer_provenance.hpp"
@@ -9039,7 +9040,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     // from pass_groups is exactly the number of iterations that returned without
                     // rendering, which is the population the missing time must belong to.
                     if (timing_enabled) ++pending_timing.pass_groups_seen;
-                    const uint64_t base = items[pass_i].color0_base;
+                    uint64_t base = items[pass_i].color0_base;
                     const uint32_t requested_color_count = active_color_count(items[pass_i]);
                     // PROSPER_MRT_CENSUS=1 — per slot, why an attachment did or did not become
                     // active. A slot needs all three of base, a known format, and a non-zero write
@@ -9225,7 +9226,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     auto ds_identity = [](const prosper::gpu::DrawItem& draw) {
                         return std::tuple(draw.ps.depth_read_base, draw.ps.depth_write_base,
                                           draw.ps.stencil_read_base, draw.ps.stencil_write_base,
-                                          draw.ps.htile_data_base,
+                                          draw.ps.htile_data_base, draw.ps.db_depth_size_xy,
                                           prosper::test::ds_depth_view_slice_start(
                                               draw.ps.db_depth_view));
                     };
@@ -9535,14 +9536,39 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     // as 16384x16384 and exhausted the host while Dead Cells loaded its first level.
                     const bool color_disabled = !pass.empty() && std::all_of(
                         pass.begin(), pass.end(), [](const auto* draw) {
-                            return draw->ps.color_write_mask == 0;
+                            for (uint32_t slot = 0; slot < prosper::gpu::kColorTargetCount; ++slot)
+                                if (prosper::frontend::mrt_write_mask(*draw, slot)) return false;
+                            return true;
                         });
                     const bool uses_ds = std::any_of(pass.begin(), pass.end(), [](const auto* draw) {
                         return draw->ps.depth_test_enable || draw->ps.depth_write_enable ||
                                draw->ps.depth_clear_enable || draw->ps.stencil_enable ||
                                draw->ps.stencil_clear_enable;
                     });
-                    if (color_disabled && uses_ds && w && h) {
+                    // A masked color attachment does not determine the depth allocation's size.
+                    // DB_DEPTH_SIZE_XY is the guest extent; both clear and caster passes must name
+                    // the same persistent depth image even when their inactive color bindings differ.
+                    // Resolved/captured state does not retain this register's presence flag. Zero
+                    // therefore remains ambiguous (absent versus explicit 1x1) and keeps the legacy
+                    // fallback. Pass grouping above keeps distinct DB extents separate.
+                    const auto* depth_state = pass.empty() ? nullptr : &pass.front()->ps;
+                    const bool explicit_depth_extent = depth_state && color_disabled && uses_ds &&
+                        (depth_state->depth_read_base || depth_state->depth_write_base ||
+                         depth_state->stencil_read_base || depth_state->stencil_write_base) &&
+                        depth_state->db_depth_size_xy != 0;
+                    if (explicit_depth_extent) {
+                        native_w = PM4_FIELD(depth_state->db_depth_size_xy, DB_DEPTH_SIZE_XY, X_MAX) + 1u;
+                        native_h = PM4_FIELD(depth_state->db_depth_size_xy, DB_DEPTH_SIZE_XY, Y_MAX) + 1u;
+                        // All color writes are disabled. The backend still needs a dummy color
+                        // attachment, but resizing it to the depth extent must not create or
+                        // publish a new color authority under an inactive guest CB address.
+                        // Zero pass identities select transient attachments and bypass color
+                        // seeding, retained-target publication and scanout selection below.
+                        base = 0;
+                        pass_bases.fill(0);
+                        is_vo = false;
+                    }
+                    if (color_disabled && uses_ds && !explicit_depth_extent && w && h) {
                         float viewport_x = 0.0f, viewport_y = 0.0f;
                         for (const auto* draw : pass) {
                             if (!draw->ps.has_viewport) continue;
@@ -10512,7 +10538,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     // readback skip is safe.
                     if (timing_enabled && !pass.empty() && pass.front()->ps.color0_format == 0)
                         ++pending_timing.publish_candidate_fmt0;
-                    if (!rendered_pixels.empty() && pass_format == VK_FORMAT_R8G8B8A8_UNORM) {
+                    if (!explicit_depth_extent && !rendered_pixels.empty() &&
+                        pass_format == VK_FORMAT_R8G8B8A8_UNORM) {
                         // Recorded alongside each candidate rather than re-derived at selection
                         // time: by then the pass loop has moved on and `pass` no longer refers to
                         // the pass that produced these pixels (#2283).
@@ -10528,7 +10555,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         }
                         px_last = pass_pixels;                                  // last non-empty (fallback)
                         px_last_w = gw; px_last_h = gh; px_last_base = base; px_last_fmt = candidate_fmt;
-                    } else if (!rendered_pixels.empty() && prefix_inspect_publish()) {
+                    } else if (!explicit_depth_extent && !rendered_pixels.empty() &&
+                               prefix_inspect_publish()) {
                         // #1330: under gpu_replay's ordered-prefix inspection (--draw/--draw-steps/
                         // --through-operation set PROSPER_PREFIX_INSPECT), a prefix ending on a
                         // non-RGBA8 pass (an FP16 HDR scene target) must return THAT surface, not
