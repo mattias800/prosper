@@ -199,7 +199,17 @@ uint64_t guest_tls_activate_thread() {
     // Precondition, shared with the allocating path below: called on the HOST %fs. t_guest_tp is an
     // ordinary thread_local, resolved through %fs, and the allocating path stashes rd_fsbase() as
     // this thread's host TCB. Every call site (hle_kernel.cpp thread entry, run_entry) runs on host %fs.
-    if (t_guest_tp) { wr_fsbase(t_guest_tp); return t_guest_tp; }
+    //
+    // Read t_guest_tp ONCE, before %fs moves, and return that copy. `wr_fsbase(t_guest_tp); return
+    // t_guest_tp;` is wrong on Linux (unlike Windows, where host TLS is %gs): the compiler may re-read
+    // the thread_local for the return -- an unoptimised build does -- and after wrfsbase that read
+    // resolves through the GUEST TCB and returns guest memory. The empty asm makes `own` opaque, so
+    // the compiler cannot replace it with a second load of t_guest_tp.
+    if (uint64_t own = t_guest_tp) {
+        __asm__ volatile("" : "+r"(own));
+        wr_fsbase(own);
+        return own;
+    }
     uint64_t host_fs = rd_fsbase();
     guest_tls_record_host_fs(host_fs);   // #3623: before any guest TCB exists for this thread
     size_t total = (size_t)g_total_below + TCB_SIZE;

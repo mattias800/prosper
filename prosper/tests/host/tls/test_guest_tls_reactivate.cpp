@@ -21,7 +21,7 @@
 #include <cstdio>
 #include <cstdlib>
 
-static int fails = 0;
+// `fails` is main()'s local; CHECK is only used there.
 #define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
                          else       { printf("  [ok]   %s\n", m); } } while (0)
 
@@ -41,6 +41,7 @@ int main() {
     printf("  [skip] the wrfsbase activation path is x86-64 Linux only\n== PASS ==\n");
     return 0;
 #else
+    int fails = 0;
     unsetenv("PROSPER_NO_GUEST_FS");   // the Linux path is on by default; make sure a caller's env
     unsetenv("PROSPER_TLSLOG");        // cannot turn it off, and keep the activation free of stderr
 
