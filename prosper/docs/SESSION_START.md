@@ -74,9 +74,9 @@ worktrees, detached HEAD, feature branches, Windows line endings and paths conta
 as the `session_start` CTest case. The contribution-shape gate allows only `.claude/settings.json`,
 keeping private settings and agent worktree contents outside the exception.
 
-## Two ways this check has failed on Windows
+## Three ways this check has failed on Windows
 
-Both were quiet, and they are told apart by where the failure is raised. Read the symptom before
+The first two were quiet, and they are told apart by where the failure is raised. Read the symptom before
 reaching for either explanation: they share a platform and nothing else.
 
 The **interpreter never starts**. On a stock Windows install the name `python3` is the Microsoft
@@ -100,3 +100,38 @@ MinGW job runs `session_start` and passes (304 of 304 tests), and the pre-fix mo
 guard is `test_git_path_output_is_never_used_as_a_filesystem_path`, whose poisoned answer is built by
 hand rather than taken from the git on the host running it -- a control drawn from that git would
 inherit the flavour that host already survives, and so could not express the case at all.
+
+The third is loud and is not a defect in the check at all: **the test's first hook call overran the
+20-second cap on a freshly built CI runner** (#3583). It surfaces as
+`subprocess.TimeoutExpired ... timed out after 20 seconds` in
+`test_current_and_hook_positive_control`, the first arm unittest runs, and was 6 of the 19
+`Windows MinGW` failures in the 300 CI runs up to 2026-09-22. Instrumented on twelve replicas of
+that job, the first hook of a run took 0.86-11.7 s while every later hook took 0.13-0.76 s, and the
+whole excess elapsed *before* `session_start.py` executed its first statement: the check itself,
+git and `ls-remote` included, took about 0.6 s even inside the 11.7 s call. What is slow is
+starting `cmd.exe`, the `py` launcher and Python for the first time after a full build. A CTest
+entry of 40-100 s rather than 20 is the same fact seen from outside: `subprocess.run` kills only the
+shell at the cap, then waits for the interpreter it started to finish before it returns.
+Which of those three executables carries the cost was not isolated.
+
+So the test now starts the configured hook once, untimed, in `setUpClass`, against a directory
+that is not a repository, and only then holds real calls to the 20-second budget. With that
+warm-up, three more replicas absorbed 0.3-2.5 s in the warm-up and the first timed hook took
+0.50-0.63 s. The budget is unchanged, because the work it bounds was never close to it. An overrun
+now reports how long `subprocess.run` really took, how long the warm-up took, and whatever the hook
+printed, so the next one is a diagnosis rather than a cross-check against `main`.
+
+## Ruled out
+
+- **The interpreter fallback chain eating the budget.** On the CI runner `python3` and `python` are
+  not on the `minimal` MSYS2 `PATH` at all, and `cmd.exe` rejects each in about 0.01 s before `py`
+  runs; `py -c pass` itself takes 0.05 s warm. The chain costs milliseconds, not seconds (#3583).
+- **The remote-ref freshness check (#2710).** The fixture's `origin` is a local bare repository,
+  so there is no network; the instrumented `ls-remote` took 0.08-0.10 s, including inside the
+  11.7 s call (#3583).
+- **Git in general, or the path with spaces.** Every instrumented git call took under 0.1 s, and
+  every later hook uses the same checkout-with-spaces path and finishes in under a second. Only the
+  first launch in a run is slow (#3583).
+- **Raising the 20-second cap.** The cap mirrors Claude Code's own hook `timeout`, and the check's
+  work never came within a factor of 20 of it; the overrun was a one-off start-up cost of a fresh
+  runner, which the untimed warm-up now pays (#3583).
