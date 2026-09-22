@@ -1414,7 +1414,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
     // Two of those titles are on the list although most or some of their modules do NOT clear. That
     // is safe BECAUSE the decision is per module: the 11 that cannot be proved keep the exact-width
     // contract and are refused individually. Admitting a title no longer means trusting all of its
-    // shaders, which is what made a title the wrong unit before.
+    // shaders, which is what made a title the wrong unit before. (On PPSA04263 alone the partial-wave
+    // tier below admits the modules this proof declines; on the other four it does not -- #3797.)
     //
     // NOT on this list: PPSA21564 (6 measured refusals, no dump and no after-arm yet). One survey
     // run away, and with the per-module proof the run is confirmation rather than a gamble.
@@ -1427,6 +1428,18 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
         !PROSPER_ENV_VALUE("PROSPER_STRICT_FRAGMENT_WAVE_WIDTH") &&
         std::any_of(std::begin(kNativeFragmentVoteTitles), std::end(kNativeFragmentVoteTitles),
                     [&](const char* id) { return title_id == id; });
+    // The partial-wave tier (#3464, rdna2_to_spirv.hpp kFragmentWavePartialWaveExactReasons) is scoped
+    // to GTA V, the one title measured with it on and off (same binary, same route: 188 refused and a
+    // black world, against 0 refused and the bank lit). Its argument does not depend on the title, but
+    // on the other four titles above it would admit exactly the modules the vote tier's proof declined,
+    // and nobody has surveyed those with it -- three are rung-6 snapshot-guarded. Extending it is
+    // #3797's before/after work, not a side effect of this line.
+    //
+    // Two switches turn it off: PROSPER_NO_PARTIAL_WAVE_FRAGMENT isolates THIS tier for an A/B on one
+    // binary (the renderer then behaves exactly as before the tier existed), and
+    // PROSPER_STRICT_FRAGMENT_WAVE_WIDTH, which disables both tiers through native_fragment_vote_width.
+    const bool partial_wave_fragment = native_fragment_vote_width && title_id == "PPSA04263" &&
+        !PROSPER_ENV_VALUE("PROSPER_NO_PARTIAL_WAVE_FRAGMENT");
     // Create (and thereby PUBLISH) the renderer's Vulkan device up front so the compute backend can
     // adopt it (#1091). Compute initializes lazily on its first dispatch, and titles routinely
     // dispatch before their first draw -- without this the compute device would be created first and
@@ -2053,7 +2066,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
     if (batch_backend_submits)
         fprintf(stderr, "[render] backend target-submit batching enabled (experimental)\n");
     prosper::gpu::set_submit_renderer(
-        [frame_dir, dump_bmps, invalidate_ds, native_fragment_vote_width](const std::vector<prosper::gpu::DrawItem>& items,
+        [frame_dir, dump_bmps, invalidate_ds, native_fragment_vote_width,
+         partial_wave_fragment](const std::vector<prosper::gpu::DrawItem>& items,
                                uint32_t w, uint32_t h) -> prosper::gpu::RenderedFrame {
             using RC = prosper::gpu::ResourceClass;
             // #2215 instrument: publish which thread is inside a submit-render callback right
@@ -8749,6 +8763,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     bd.fs_identity = fs_ov ? 0 : it.fs_identity;
                     bd.allow_native_fragment_vote_width =
                         !fs_ov && native_fragment_vote_width;
+                    bd.allow_partial_wave_fragment = !fs_ov && partial_wave_fragment;
                     bd.draw_index = it.draw_index;
                     bd.command_order = it.command_order;
                     bd.vcount = refvs ? 3u : it.vertex_count;
