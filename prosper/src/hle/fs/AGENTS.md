@@ -7,6 +7,9 @@ save data the platform layers on top of it.
   thing here and still per-platform in one file; see the note below.
 - `save_paths` — where a title's saves live on the host, per title id (#2734).
 - `save_param` — the save's parameter block, the metadata a title attaches to a slot (#2786).
+- `save_capacity` — a save's allocation (the blocks its creating mount asked for) and how much of it
+  its files use, for `sceSaveDataGetMountInfo` (#3654). The accounting rule and how sure each part is
+  are in its header; the records live in a dot-directory beside the saves, never inside one.
 - `savedata` — libSceSaveData and libSceSaveDataDialog: mounts, transaction resources, the
   save-data memory API, the two umount entry points, and SetParam/GetParam. Split out of
   `hle/service/hle_service.cpp` in #3735, into the folder that already held the two helpers above.

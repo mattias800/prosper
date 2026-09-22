@@ -32,8 +32,8 @@
 //                                save is mounted.
 //  arm 6  ABI constants     [G]  the 48-byte layout, pinned in one falsifiable place.
 //
-// Capacity ACCOUNTING is deliberately out of scope here and is issue #3654: this fixture asserts
-// that the figures are present and self-consistent, never that they describe the host filesystem.
+// Capacity ACCOUNTING is out of scope here and is tested by test_savedata_capacity (#3654): this
+// fixture asserts that the figures are present and self-consistent.
 #include "hle/dispatch/dispatch.hpp"
 #include "fixtures/test_scratch.h"
 
@@ -132,6 +132,11 @@ uint64_t mount_save(const char* dirname, uint32_t mode, MountResult& result) {
     memset(desc.bytes, 0, sizeof desc.bytes);
     const char* name = dirname;
     memcpy(desc.bytes + 0x08, &name, sizeof name);
+    // blocks @+0x10. Since #3654 the capacity comes from the allocation the save was created with;
+    // a save created with no request reports itself as exactly full, which arm 4's "free > 0" check
+    // is not about. 96 is the PS4-inherited minimum allocation.
+    const uint64_t blocks = 96;
+    memcpy(desc.bytes + 0x10, &blocks, sizeof blocks);
     memcpy(desc.bytes + 0x20, &mode, sizeof mode);
     memset(result.bytes, 0, sizeof result.bytes);
     return g_mount3((uint64_t)(uintptr_t)&desc, (uint64_t)(uintptr_t)&result, 0, 0, 0, 0);

@@ -1231,6 +1231,14 @@ if(TARGET prosper_core)
   target_link_libraries(test_savedata_mountinfo PRIVATE prosper_core)
   add_test(NAME savedata_mount_info COMMAND test_savedata_mountinfo)
 
+  # #3654: the mount wrappers carry the requested blocks into a per-save allocation record, and
+  # GetMountInfo reports blocks / freeBlocks from that record and the files in the save. Includes a
+  # re-exec of itself to prove the allocation survives a new process.
+  add_executable(test_savedata_capacity tests/hle/test_savedata_capacity.cpp)
+  target_include_directories(test_savedata_capacity PRIVATE tests)
+  target_link_libraries(test_savedata_capacity PRIVATE prosper_core)
+  add_test(NAME savedata_capacity COMMAND test_savedata_capacity)
+
   # The two umount entry points (#3666). sceSaveDataUmount2 read NONE of its arguments -- it
   # unmounted /savedata0 and reported success whatever it was handed, so a title naming another
   # mount point had a live mount discarded on its behalf -- and sceSaveDataUmount answered NOT_FOUND
