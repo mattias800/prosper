@@ -12,6 +12,7 @@
 // Sony libs, so they're registered by raw NID with a note on the observed role.
 #include "hle/dispatch/dispatch.hpp"
 #include "hle/dispatch/nid.hpp"
+#include "hle/graphics/videoout_event_data.hpp"   // #3668: flip event data layout
 #include "host/image/boot_program.hpp"   // #1659: shared guest-module labelling
 #include "host/image/exec_image.hpp"
 #include "gpu/present/videoout_present.hpp"
@@ -241,11 +242,6 @@ namespace {
 // prosper_vo_flip_count: total flips so far (either flip path) — read by the PROSPER_PROGRESS
 // heartbeat in hle_agc.cpp as a cheap forward-progress signal for long diagnostic runs.
 extern "C" uint64_t prosper_vo_flip_count() { std::lock_guard<std::mutex> lk(g_flip_mx); return g_flip_count; }
-// The flipArg of the most recently COMPLETED flip, or -1 before the first one. This is the guest's
-// OWN frame ordinal -- it is the value the title passed to sceAgcDcbSetFlip / sceVideoOutSubmitFlip,
-// echoed back, never a number prosper invents. The AGC end-of-pipe event path (hle_kernel_time.cpp)
-// reads it to answer "how far has the GPU actually got" in the guest's own numbering.
-extern "C" int64_t prosper_vo_last_flip_arg() { std::lock_guard<std::mutex> lk(g_flip_mx); return g_last_flip_arg; }
 extern "C" int prosper_vo_flip_rate() { std::lock_guard<std::mutex> lk(g_flip_mx); return g_flip_rate; }
 
 // Hold the GUEST flip rate at the cadence the title asked for, sleeping in the flip path when we
@@ -1428,16 +1424,20 @@ HLE(g_vo_get_event_id) {
 }
 
 // sceVideoOutGetEventData (rWUTcKdkUzQ): return the data carried by a delivered VideoOut kevent.
-// Prosper's producer owns this contract: flip completion posts the submitted flipArg verbatim at
-// SceKernelEvent+0x10, while vblank posts its frame counter there. Do not apply the packed-event
-// decoding used by backends whose producers encode time/count bits into this field.
+// A FLIP event carries its flipArg in bits 16+ of SceKernelEvent+0x10 (#3668 -- the layout and the
+// guest evidence for it are in videoout_event_data.hpp), so the accessor returns `data >> 16`,
+// arithmetic, exactly as Uncharted decodes the raw word inline. Every other VideoOut event (vblank
+// posts its frame counter) is returned as posted: no title here reads one through this accessor and
+// prosper's producer stores those raw, so decoding them would invent a layout nothing has shown.
 HLE(g_vo_get_event_data) {
     if (!a0 || !a1)
         return (uint64_t)(int64_t)(int32_t)0x80290002;         // SCE_VIDEO_OUT_ERROR_INVALID_ADDRESS
     const uint8_t* ev = (const uint8_t*)(uintptr_t)a0;
     if (*(const int16_t*)(ev + 8) != -13)
         return (uint64_t)(int64_t)(int32_t)0x8029000d;         // SCE_VIDEO_OUT_ERROR_INVALID_EVENT
-    *(int64_t*)(uintptr_t)a1 = *(const int64_t*)(ev + 0x10);
+    const int64_t data = *(const int64_t*)(ev + 0x10);
+    const bool flip = *(const int64_t*)ev == 0;   // ident: VIDEO_OUT_EVENT_FLIP
+    *(int64_t*)(uintptr_t)a1 = flip ? videoout::flip_arg_from_event_data(data) : data;
     return 0;
 }
 

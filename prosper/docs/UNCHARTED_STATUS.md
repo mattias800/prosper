@@ -4,9 +4,11 @@
 published yet, so the rung is unchanged — but the title has gone from *no decoded draws at all* to
 *every graphics draw recompiling, executing, and producing real pixels*. Tracker: #3616.
 
-**The route below sets `PROSPER_FLIP_EVENT_DATA_SHIFT=1`, which is NOT the default.** Every number
-on this page is from that route. Without it the guest still stops after five game-loop iterations
-(the section below), so quote the lever whenever you quote a figure from here.
+**The flip-event layout this title needs is now the default (#3668).** Figures on this page dated
+2026-09-14 were measured with the old opt-in `PROSPER_FLIP_EVENT_DATA_SHIFT=1`; that switch no longer
+exists, because prosper now posts every VideoOut flip event with the flipArg in bits 16+ (the layout
+and its evidence are in `src/hle/graphics/videoout_event_data.hpp`). Measured on the default route
+after the change: **1,936 flips in 25 s** (`tools/screenshot`, `PROSPER_EVLOG=1`), against **3** before.
 
 Where it stands now, measured over 35-120 s runs:
 
@@ -179,7 +181,8 @@ nothing on this title, for that reason. The answer has to be per-word, not per-l
 
 ## History: five game-loop iterations, then a job that never completes
 
-Solved by `PROSPER_FLIP_EVENT_DATA_SHIFT=1` (5 -> 1,552 iterations, 3 -> 1,550 flips); kept here
+Solved by the flip-event data layout, first as the opt-in `PROSPER_FLIP_EVENT_DATA_SHIFT=1`
+(5 -> 1,552 iterations, 3 -> 1,550 flips) and by default since #3668; kept here
 because the investigation's addresses and the progression meter below are still the right
 instruments on this title.
 
@@ -323,12 +326,10 @@ to a completed-frame ordinal — and that ordinal comes from an imported call:
 all below `0x10000`. So `data >> 16` is **always 0**: the high-water advances exactly once, to 1, and
 every later event is refused. That is measured, not inferred: `[0x2e1a8f8]` reads **1** at the stall.
 
-Whatever the right value is, a constant is not it — the consumer's arithmetic only makes sense
-against a monotonic count. That is a genuine modelling gap in prosper's EOP contract, filed on its
-own account.
-
-**It is not, however, this title's blocker** — see `## Ruled out`. The consumer above is on the
-**flip** queue, not the EOP one, and that is where the deadlock actually was.
+**That paragraph's premise was wrong, and it is kept only so the correction below reads in
+order.** The consumer above is on the **flip** queue, not the EOP one — its guard is
+`sceKernelGetEventFilter == -13` — so it says nothing about what an AGC EOP event's data should be.
+#3668 was filed on this reading and closed by correcting it; see `## Ruled out`.
 
 ### THE DEADLOCK IS BROKEN: the flip event's data must carry the flipArg in bits 16+
 
@@ -336,7 +337,7 @@ Reading the consumer's guard, rather than assuming which queue fed it, is what s
 
 ```
 eboot+0x15b31e4: call sceKernelGetEventFilter ; cmp eax,0xfffffff3   ; -13 == VideoOut, else retry
-eboot+0x15b31f1: call sceKernelGetEventId     ; 1 -> retry, 3 -> …, else fall through
+eboot+0x15b31f1: call sceKernelGetEventUserData ; 1 -> retry, 3 -> …, 2 -> output status, else fall through
 eboot+0x15b3229: call sceKernelGetEventData
 eboot+0x15b3239: sar r14,0x10                 ; completed frame = data >> 16
 ```
@@ -345,7 +346,8 @@ So the ordinal comes from the **VideoOut flip event**, whose data prosper posts 
 *verbatim* (`prosper_eq_trigger_flip`). This title's flipArgs are its own small frame ordinals
 (0, 1, 2, …), so `data >> 16` is always 0.
 
-`PROSPER_FLIP_EVENT_DATA_SHIFT=1` posts `flipArg << 16` instead, and the title changes completely:
+`PROSPER_FLIP_EVENT_DATA_SHIFT=1` posted `flipArg << 16` instead (it is the default since #3668,
+and the switch is gone), and the title changes completely:
 
 | | default | `PROSPER_FLIP_EVENT_DATA_SHIFT=1` |
 | --- | --- | --- |
@@ -592,11 +594,19 @@ One line per hypothesis that was tested and died. Do not re-derive these.
   fiber-run log does record. Instrument trap 282.
 - **"The AGC EOP event's data should carry the completed-FRAME ordinal (the guest's own flipArg) in
   bits 16+."** Implemented behind `PROSPER_EOP_FRAME_ORDINAL=1` and falsified. The lever demonstrably
-  moves — its trace reports the ordinal advancing `0 -> 1 -> 2` as the three flips complete, and the
-  accessor is linked — and the title still runs exactly 5 game-loop iterations and 3 flips, with the
-  guest's high-water still stuck at 1. So either the consumer at `eboot+0x15b3229` is fed by a
-  different event source than the AGC EOP queue, or bits 16+ carry something other than the flip
-  ordinal. The lever stays, default OFF, so the A/B remains reproducible. #3616.
+  moved — its trace reported the ordinal advancing `0 -> 1 -> 2` as the three flips completed — and
+  the title still ran exactly 5 game-loop iterations and 3 flips. The reason is now read off the
+  guest: the consumer at `eboot+0x15b3229` is guarded by `sceKernelGetEventFilter == -13`
+  (`eboot+0x15b31e9`), so it is fed by the **VideoOut flip** queue and never sees an EOP event. The
+  lever was removed with #3668, since the one consumer that motivated it cannot reach it. #3616.
+- **"AGC end-of-pipe events carry a constant ident as their data, and a title reads it as a monotonic
+  completion count" (#3668's premise).** Falsified by the same guard: the `data >> 16` consumer is a
+  VideoOut consumer, so this title is no evidence about the EOP payload, which stays `data = ident`.
+  (Not examined, and worth knowing before anyone reopens it: eight Unreal titles in the corpus decode a
+  `sceKernelGetEventData` result as `queue << 58 | counter` — e.g. `PPSA17942` `eboot+0x2274166` —
+  from a queue nobody here has traced.) What #3668 actually needed was the
+  **flip** event's layout, which is now the default. Also corrected on the way: the call at
+  `eboot+0x15b31f1` is `sceKernelGetEventUserData`, not `GetEventId` (`stub_nid_map.py --addr`).
 - **"The stall is the Vulkan backend."** Falsified: `PROSPER_RENDER=0` reproduces it exactly — 5
   game-loop iterations, the same counter trajectory, the same ~1.5 s. The 14 compute programs
   skipped as `mode=unresolved-operand` are therefore not the cause either, however much they need
