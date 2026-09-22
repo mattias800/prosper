@@ -2950,6 +2950,11 @@ endif()
       add_test(NAME game_compute_exec_no_adaptive_storage_result COMMAND test_game_compute)
       set_tests_properties(game_compute_exec_no_adaptive_storage_result PROPERTIES
         ENVIRONMENT "PROSPER_NO_ADAPTIVE_STORAGE_RESULT_VALIDATION=1")
+      # PROSPER_NO_SKIP_SEED forces a real seed upload; the fixture asserts that mode's own expectations
+      # (identical output is rewritten) instead of the default policy's (#3390).
+      add_test(NAME game_compute_exec_no_skip_seed COMMAND test_game_compute)
+      set_tests_properties(game_compute_exec_no_skip_seed PROPERTIES
+        ENVIRONMENT "PROSPER_NO_SKIP_SEED=1")
       # The compute path's full-surface seed/pack intermediates are pooled rather than freshly
       # allocated. Their old allocation was `make_unique_for_overwrite`, i.e. nominally
       # indeterminate -- but at these sizes it was a fresh mmap, which reads as ZERO, so a call site
@@ -3408,6 +3413,11 @@ endif()
       add_test(NAME game_compute_exec_no_adaptive_storage_result COMMAND test_game_compute)
       set_tests_properties(game_compute_exec_no_adaptive_storage_result PROPERTIES
         ENVIRONMENT "PROSPER_NO_ADAPTIVE_STORAGE_RESULT_VALIDATION=1")
+      # PROSPER_NO_SKIP_SEED forces a real seed upload; the fixture asserts that mode's own expectations
+      # (identical output is rewritten) instead of the default policy's (#3390).
+      add_test(NAME game_compute_exec_no_skip_seed COMMAND test_game_compute)
+      set_tests_properties(game_compute_exec_no_skip_seed PROPERTIES
+        ENVIRONMENT "PROSPER_NO_SKIP_SEED=1")
       # The compute path's full-surface seed/pack intermediates are pooled rather than freshly
       # allocated. Their old allocation was `make_unique_for_overwrite`, i.e. nominally
       # indeterminate -- but at these sizes it was a fresh mmap, which reads as ZERO, so a call site

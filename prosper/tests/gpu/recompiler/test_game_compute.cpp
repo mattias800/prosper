@@ -251,6 +251,15 @@ int main() {
         adaptive_storage_result_validation_enabled;
     const bool cold_storage_snapshot_deferral_enabled =
         adaptive_storage_result_validation_enabled;
+    // PROSPER_NO_SKIP_SEED is a diagnostic control that forces a real current-input upload even
+    // when a retained storage image is valid (live_compute.cpp, acquire_cached_image's caller). The
+    // GPU-identical writeback skip is admitted only when that acquisition PROVED the guest mirror
+    // still holds the baseline (`gpu_result_unchanged && upload_skipped`), so under the control an
+    // identical result is written back -- the same bytes, re-written. The byte assertions hold in
+    // both modes; the three "dirty tracking stays clean" ones are properties of the default policy
+    // and are asserted as such, with the control's own expectation beside them, which is also the
+    // proof that the requested mode actually ran (#3390).
+    const bool seed_skip_enabled = std::getenv("PROSPER_NO_SKIP_SEED") == nullptr;
     using prosper::frontend::compute_result_compare_group_count;
     CHECK(compute_result_compare_group_count(16, 16, 1) == 1 &&
           compute_result_compare_group_count(4096, 4096, 1) == 1 &&
@@ -5700,9 +5709,15 @@ int main() {
             CHECK(repeated_write_notifications == 1,
                   "identical retained output invalidates renderer aliases without rewriting bytes");
 #if defined(__linux__)
-            CHECK(static_cast<bool>(repeated_write_watch) && repeated_write_watch.query() ==
-                      prosper::host::GuestWriteWatchQuery::Unchanged,
-                  "identical retained output leaves guest-byte dirty tracking clean");
+            if (seed_skip_enabled)
+                CHECK(static_cast<bool>(repeated_write_watch) && repeated_write_watch.query() ==
+                          prosper::host::GuestWriteWatchQuery::Unchanged,
+                      "identical retained output leaves guest-byte dirty tracking clean");
+            else
+                CHECK(static_cast<bool>(repeated_write_watch) && repeated_write_watch.query() ==
+                          prosper::host::GuestWriteWatchQuery::Dirty,
+                      "PROSPER_NO_SKIP_SEED: forced upload withholds the unchanged-mirror proof, so "
+                      "identical retained output is rewritten (the control ran)");
             CHECK(prosper::frontend::live_compute_storage_result_snapshot_bytes() ==
                       repeated_snapshots_before,
                   "identical retained output does not recopy its guest-byte baseline");
@@ -6389,10 +6404,17 @@ int main() {
                 CHECK(recovered_repeat_notifications == 1,
                       "post-recovery identical result still invalidates renderer aliases");
 #if defined(__linux__)
-                CHECK(static_cast<bool>(recovered_write_watch) &&
-                          recovered_write_watch.query() ==
-                              prosper::host::GuestWriteWatchQuery::Unchanged,
-                      "post-recovery identical result does not rewrite guest bytes");
+                if (seed_skip_enabled)
+                    CHECK(static_cast<bool>(recovered_write_watch) &&
+                              recovered_write_watch.query() ==
+                                  prosper::host::GuestWriteWatchQuery::Unchanged,
+                          "post-recovery identical result does not rewrite guest bytes");
+                else
+                    CHECK(static_cast<bool>(recovered_write_watch) &&
+                              recovered_write_watch.query() ==
+                                  prosper::host::GuestWriteWatchQuery::Dirty,
+                          "PROSPER_NO_SKIP_SEED: post-recovery identical result is rewritten "
+                          "(the control ran)");
                 CHECK(prosper::frontend::live_compute_storage_result_snapshot_bytes() ==
                           recovered_snapshots_before,
                       "post-recovery identical result does not recopy its repaired baseline");
@@ -6745,9 +6767,15 @@ int main() {
                       raw_repeat_notifications == 1,
                   "GPU-identical raw 3D output skips pack/retile but invalidates renderer aliases");
 #if defined(__linux__)
-            CHECK(static_cast<bool>(raw_repeat_watch) && raw_repeat_watch.query() ==
-                      prosper::host::GuestWriteWatchQuery::Unchanged,
-                  "GPU-identical raw 3D output leaves guest-byte dirty tracking clean");
+            if (seed_skip_enabled)
+                CHECK(static_cast<bool>(raw_repeat_watch) && raw_repeat_watch.query() ==
+                          prosper::host::GuestWriteWatchQuery::Unchanged,
+                      "GPU-identical raw 3D output leaves guest-byte dirty tracking clean");
+            else
+                CHECK(static_cast<bool>(raw_repeat_watch) && raw_repeat_watch.query() ==
+                          prosper::host::GuestWriteWatchQuery::Dirty,
+                      "PROSPER_NO_SKIP_SEED: GPU-identical raw 3D output is rewritten "
+                      "(the control ran)");
             raw_repeat_watch.reset();
 #endif
 
