@@ -13,7 +13,7 @@
 // Expected numbers come from the contract in hle/fs/save_capacity.hpp, restated here independently:
 // one block is 32768 bytes; each regular file costs ceil(size / 32768) blocks; directories cost
 // nothing; the allocation is the CREATING mount's request; free = max(0, allocation - used); a save
-// whose allocation is unknown reports blocks = used and free = 0.
+// whose allocation is unknown keeps the legacy answer, blocks = max(0x40000, used), free = blocks - used.
 //
 // Uses a disposable save root under the test scratch directory, never a developer's real saves.
 #include "hle/dispatch/dispatch.hpp"
@@ -42,6 +42,7 @@ static int checks = 0;
 namespace {
 
 constexpr uint64_t kBlock = 32768;                // the contract's block size, stated independently
+constexpr uint64_t kLegacy = 0x40000;             // the pre-#3654 answer an unknown allocation keeps
 constexpr uint64_t ERR_NOT_MOUNTED = 0x809F0004ull;
 constexpr uint32_t MODE_RDWR = 0x02, MODE_CREATE = 0x04;
 
@@ -261,8 +262,10 @@ int main(int argc, char** argv) {
         write_file(title_a / "Legacy" / "old.bin", 2 * kBlock);
         CHECK(mount3("Legacy", MODE_RDWR, 0) == 0, "[G] open a pre-existing save with no record, no request");
         Info i = info();
-        CHECK(i.rc == 0 && i.blocks == 2 && i.free_blocks == 0,
-              "[D] an unknown allocation reports blocks = used and free = 0, never invented free space");
+        CHECK(i.rc == 0 && i.free_blocks != 0,
+              "[D] a legacy save with no record, opened with blocks=0, still reports free space");
+        CHECK(i.blocks == kLegacy && i.free_blocks == kLegacy - 2,
+              "[D] ...exactly the legacy capacity less the 2 blocks it uses");
         umount();
         CHECK(mount3("Legacy", MODE_RDWR, 120) == 0, "[G] open it again with a 120-block request");
         i = info();
@@ -281,8 +284,8 @@ int main(int argc, char** argv) {
         { std::ofstream f(rec, std::ios::binary | std::ios::trunc); f << "not a record"; }
         CHECK(mount3("Corrupt", MODE_RDWR, 500) == 0, "[G] open it with a 500-block request");
         const Info i = info();
-        CHECK(i.rc == 0 && i.blocks == 0 && i.free_blocks == 0,
-              "[D] a corrupt record reports the (empty) save as full, not as free space");
+        CHECK(i.rc == 0 && i.blocks == kLegacy && i.free_blocks == kLegacy,
+              "[D] a corrupt record keeps the legacy answer, not the 500 an open asked for");
         umount();
         CHECK(read_all(rec) == "not a record", "[D] an opening mount never overwrites a corrupt record");
         uint64_t b = 0;
@@ -299,8 +302,8 @@ int main(int argc, char** argv) {
         CHECK(mount3("Blocked", MODE_CREATE | MODE_RDWR, 80) == 0,
               "[D] a save whose record cannot be written still mounts");
         const Info i = info();
-        CHECK(i.rc == 0 && i.blocks == 0 && i.free_blocks == 0,
-              "[D] ...and reports its allocation as unknown (full), not as the unrecorded 80");
+        CHECK(i.rc == 0 && i.blocks == kLegacy && i.free_blocks == kLegacy,
+              "[D] ...and reports its allocation as unknown (legacy answer), not as the unrecorded 80");
         umount();
         set_env("PROSPER_SAVE0", save_root.string().c_str());
     }
@@ -358,6 +361,9 @@ int main(int argc, char** argv) {
               "[G] rounding the largest size does not overflow");
         const SaveCapacity over = save_capacity_from(true, 10, UINT64_MAX);
         CHECK(over.blocks == 10 && over.free_blocks == 0, "[G] usage at the limit reports 0 free");
+        const SaveCapacity unknown_big = save_capacity_from(false, 0, kLegacy + 5);
+        CHECK(unknown_big.blocks == kLegacy + 5 && unknown_big.free_blocks == 0,
+              "[D] an unknown allocation smaller than usage reports blocks = used, free = 0");
         CHECK(save_allocation_write(title_a.string(), "Huge", UINT64_MAX), "[G] the largest allocation is recordable");
         uint64_t b = 0;
         CHECK(save_allocation_read(title_a.string(), "Huge", b) == SaveAllocationState::Present && b == UINT64_MAX,

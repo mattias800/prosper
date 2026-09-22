@@ -47,7 +47,10 @@ how confident each part is.
 
 A save written before these records existed has none. The first mount that carries a request adopts
 that request, and nothing inside the save is touched. A record that does not parse is never rewritten or
-deleted: that save is reported as full (blocks = used, free = 0), not given invented free space.
+deleted. Until a save has a usable record, it keeps the answer prosper gave before records existed:
+the fixed legacy capacity of 0x40000 blocks, less the blocks it uses. It is deliberately not reported
+as full, because a title that checks free space would then refuse to save over a save the user
+already has.
 
 ## `PROSPER_SAVE0` and `PROSPER_SAVEDATA_DIR` are ROOTS
 

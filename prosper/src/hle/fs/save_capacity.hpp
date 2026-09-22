@@ -41,8 +41,16 @@
 // its allocation and records it: the title's own statement of how big its save is, which is the
 // only primary evidence there is. Nothing is moved, deleted or rewritten inside the save.
 // A record that does not parse is left exactly as it is (never overwritten, never deleted) and the
-// save is reported as allocation-unknown. Allocation-unknown reports blocks = usage and free = 0:
-// "full", which a title can react to, rather than a fabricated amount of free space.
+// save is reported as allocation-unknown.
+//
+// Allocation-unknown keeps the answer prosper gave before it tracked allocations at all: blocks =
+// max(kSaveUnknownAllocationBlocks, used), free = blocks - used. That is deliberately NOT "full":
+// every save a user already has was created before these records existed, and reporting those as
+// full would make a title that checks free space before writing refuse to save over them -- a
+// regression from what already worked. The figure is not derived from the save; it is the legacy
+// constant, kept so an unknown allocation behaves exactly as every allocation did before #3654, and
+// usage is still subtracted so free space never exceeds what the save could plausibly hold.
+// CONFIDENCE: LOW on the number itself (0x40000 blocks = 8 GiB, never derived from anything).
 #pragma once
 
 #include <cstdint>
@@ -51,6 +59,9 @@
 namespace prosper {
 
 inline constexpr uint64_t kSaveDataBlockBytes = 32768;   // CONFIDENCE: MED, see above
+
+// What an allocation prosper never saw is reported as: the pre-#3654 fixed answer. CONFIDENCE: LOW.
+inline constexpr uint64_t kSaveUnknownAllocationBlocks = 0x40000;
 
 // ceil(bytes / block), overflow-safe for every uint64_t input.
 constexpr uint64_t save_blocks_for_bytes(uint64_t bytes) {

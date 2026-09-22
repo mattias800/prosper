@@ -788,7 +788,7 @@ HLE(s_savedata_umount2) {
 //
 // The capacity figures come from the save store (#3654): the allocation recorded when the save was
 // created, and the blocks its files occupy now. hle/fs/save_capacity.hpp states the accounting rule
-// and how sure each part of it is; an allocation prosper never saw is reported as exactly full.
+// and how sure each part of it is. An allocation prosper never saw keeps the pre-#3654 answer.
 constexpr size_t   SAVE_DATA_MOUNT_INFO_SIZE           = 48;
 constexpr size_t   SAVE_DATA_MOUNT_INFO_OFF_BLOCKS     = 0;
 constexpr size_t   SAVE_DATA_MOUNT_INFO_OFF_FREE       = 8;
@@ -817,12 +817,16 @@ HLE(s_savedata_mountinfo) {
     uint64_t allocation = 0;
     const SaveAllocationState state = save_allocation_read(mounted.parent_path().string(),
                                                            mounted.filename().string(), allocation);
-    if (state == SaveAllocationState::Corrupt || state == SaveAllocationState::Unreadable) {
+    if (state != SaveAllocationState::Present) {
+        // Loud, once per process: this answer is the legacy constant, not the save's real size.
         static std::atomic<bool> warned{false};
         if (!warned.exchange(true))
-            fprintf(stderr, "[savedata] the allocation record for '%s' is %s; it is left untouched and "
-                            "the save is reported as full (blocks = used, free = 0)\n", dir.c_str(),
-                    state == SaveAllocationState::Corrupt ? "corrupt" : "unreadable");
+            fprintf(stderr, "[savedata] the allocation of save '%s' is unknown (record %s); reporting "
+                            "the legacy capacity of %llu blocks minus usage. The record is left untouched.\n",
+                    dir.c_str(),
+                    state == SaveAllocationState::Corrupt ? "corrupt"
+                    : state == SaveAllocationState::Unreadable ? "unreadable" : "absent",
+                    (unsigned long long)kSaveUnknownAllocationBlocks);
     }
     const SaveCapacity cap =
         save_capacity_from(state == SaveAllocationState::Present, allocation, used);

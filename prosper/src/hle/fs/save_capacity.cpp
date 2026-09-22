@@ -157,8 +157,10 @@ bool save_usage_blocks(const std::string& save_dir, uint64_t& used) {
 SaveCapacity save_capacity_from(bool allocation_known, uint64_t allocation_blocks, uint64_t used_blocks) {
     SaveCapacity c;
     if (!allocation_known) {
-        c.blocks = used_blocks;   // unknown size: report it as exactly full, never as free space
-        c.free_blocks = 0;
+        // Unknown size: the legacy answer, so a save that predates allocation records still has room
+        // (see save_capacity.hpp). Usage still counts against it.
+        c.blocks = used_blocks > kSaveUnknownAllocationBlocks ? used_blocks : kSaveUnknownAllocationBlocks;
+        c.free_blocks = c.blocks - used_blocks;
         return c;
     }
     c.blocks = allocation_blocks;

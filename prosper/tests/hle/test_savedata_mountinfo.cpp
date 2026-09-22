@@ -132,9 +132,8 @@ uint64_t mount_save(const char* dirname, uint32_t mode, MountResult& result) {
     memset(desc.bytes, 0, sizeof desc.bytes);
     const char* name = dirname;
     memcpy(desc.bytes + 0x08, &name, sizeof name);
-    // blocks @+0x10. Since #3654 the capacity comes from the allocation the save was created with;
-    // a save created with no request reports itself as exactly full, which arm 4's "free > 0" check
-    // is not about. 96 is the PS4-inherited minimum allocation.
+    // blocks @+0x10. Since #3654 the capacity comes from the allocation the save was created with,
+    // so the fixture asks for a real one. 96 is the PS4-inherited minimum allocation.
     const uint64_t blocks = 96;
     memcpy(desc.bytes + 0x10, &blocks, sizeof blocks);
     memcpy(desc.bytes + 0x20, &mode, sizeof mode);
