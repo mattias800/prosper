@@ -35,16 +35,8 @@ constexpr uint32_t kErrorInvalidId = 0x817b1100u;
 // fabricating data (see hle_http2.cpp's "not modelled" note). CONFIDENCE: MED.
 constexpr uint32_t kErrorInvalidValue = 0x817b11feu;
 
-// What the send path answers offline. libSceHttp2 does NOT wrap a connect failure in an HTTP
-// error: it propagates the raw libSceNet error, encoded 0x80410100 | <FreeBSD errno>. That
-// encoding is pinned by the library special-casing 0x80410124 (errno 36, EINPROGRESS) as *not* a
-// failure at its connect site, and corroborated by the blocking title's own classifier naming
-// 0x8041013d (61, ECONNREFUSED) and 0x80410140 (64, EHOSTDOWN).
-//
-// prosper has no network, so the honest answer is the one a machine with no route produces:
-// ENETUNREACH (FreeBSD errno 51 = 0x33). This agrees with what prosper already tells the same
-// guest through NetCtl, which reports the link DISCONNECTED / NOT_CONNECTED.
-// CONFIDENCE: HIGH that a libSceNet-facility error is the right family; MED on this exact errno.
-constexpr uint32_t kNetErrorNetUnreach = 0x80410133u;
+// What the send path answers offline is NOT an HTTP error: libSceHttp2 propagates the raw
+// libSceNet error out of a failed connect, so it is net::kNetErrorNetUnreach from
+// hle/net/sce_net_errors.hpp, which owns that facility and records the evidence for it (#3545).
 
 } // namespace prosper::http2

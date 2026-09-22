@@ -347,7 +347,7 @@ int main() {
                   "SendRequest does NOT report success for a request prosper never sent");
             // Kills: an arbitrary non-zero. The offline answer is the libSceNet error an
             // unreachable network produces, which is the family this library propagates.
-            CHECK(sent == http::kNetErrorNetUnreach,
+            CHECK(sent == 0x80410133u,   // libSceNet 0x80410100 | FreeBSD ENETUNREACH (51)
                   "SendRequest reports SCE_NET_ERROR_ENETUNREACH (0x80410133)");
             CHECK((sent & 0x80000000u) != 0, "...and it is error-shaped, with the top bit set");
             CHECK(send(0, 0, 0, 0, 0, 0) == http::kErrorInvalidId,
@@ -381,7 +381,7 @@ int main() {
             // none.
             int32_t probe[3] = {(int32_t)0xA5A5A5A5, (int32_t)0xA5A5A5A5, (int32_t)0xA5A5A5A5};
             CHECK(last_errno(req, (uint64_t)(uintptr_t)&probe[1], 0, 0, 0, 0) == 0 &&
-                      probe[1] == http::kNetErrnoNetUnreach,
+                      probe[1] == 51,   // FreeBSD ENETUNREACH
                   "GetLastErrno reports the errno the failed send recorded");
             CHECK(probe[0] == (int32_t)0xA5A5A5A5 && probe[2] == (int32_t)0xA5A5A5A5,
                   "...writing exactly its own 32-bit slot, not its neighbours");
