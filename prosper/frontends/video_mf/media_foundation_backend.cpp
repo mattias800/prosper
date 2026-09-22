@@ -1,4 +1,5 @@
 #include "media_foundation_backend.hpp"
+#include "mf_access_unit_decoder.hpp"
 #include "mf_com_ptr.hpp"
 
 #ifndef _WIN32
@@ -730,6 +731,20 @@ void MediaFoundationBackend::close(int id) {
     }
     stop_session(session);
 }
+
+int MediaFoundationBackend::open_decoder(uint32_t codec) {
+    return available() ? mf_au::open_decoder(codec) : -1;
+}
+
+VideoBackend::AuResult MediaFoundationBackend::decode_au(int id, const uint8_t* au, size_t bytes,
+                                                         uint8_t* dst, uint64_t dst_bytes,
+                                                         AuPicture& out) {
+    return mf_au::decode_au(id, au, bytes, dst, dst_bytes, out);
+}
+
+bool MediaFoundationBackend::reset_decoder(int id) { return mf_au::reset_decoder(id); }
+
+void MediaFoundationBackend::close_decoder(int id) { mf_au::close_decoder(id); }
 
 MediaFoundationBackend& shared_media_foundation_backend() {
     static MediaFoundationBackend backend;
