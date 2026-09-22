@@ -909,6 +909,11 @@ if(TARGET prosper_core)
     add_executable(test_guest_tls_align tests/loader/test_guest_tls_align.cpp)
     target_link_libraries(test_guest_tls_align PRIVATE prosper_core)
     add_test(NAME guest_tls_align COMMAND test_guest_tls_align)
+    # #3635: a second guest_tls_activate_thread() on one thread keeps its guest TCB instead of
+    # installing a fresh zeroed block. The wrfsbase path is x86-64 Linux only; the test skips elsewhere.
+    add_executable(test_guest_tls_reactivate tests/host/tls/test_guest_tls_reactivate.cpp)
+    target_link_libraries(test_guest_tls_reactivate PRIVATE prosper_core)
+    add_test(NAME guest_tls_reactivate COMMAND test_guest_tls_reactivate)
   endif()
 
   # Cross-module TLS resolution (#136/#338): dynamic and initial-exec relocations resolve through
