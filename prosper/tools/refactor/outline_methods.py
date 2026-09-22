@@ -364,9 +364,13 @@ def selftest() -> int:
               build_dir(str(fake / "prosper/build-other"), root=fake),
               str(fake / "prosper/build-other"))
         for bad in (fake / "../../../somewhere",              # the issue's own example
-                    *([fake / "prosper/build-linux/..",        # '..' through the link: /tmp side
-                       fake / "prosper/build-linux/../../x"]      # ...and further out
-                      if linked else [fake / "prosper/build-linux/../../x"]),
+                    # '..' THROUGH the link. POSIX resolves it physically, on the link target's
+                    # side, so these escape. Win32 collapses '..' lexically before the path ever
+                    # reaches the filesystem, so on Windows they really do name a directory inside
+                    # the fake checkout and accepting them is correct; they are POSIX-only arms.
+                    *([fake / "prosper/build-linux/..",
+                       fake / "prosper/build-linux/../../x"]
+                      if linked and os.name != "nt" else []),
                     elsewhere,                                 # the link target named directly
                     pathlib.Path("/etc")):
             try:
@@ -388,7 +392,8 @@ def selftest() -> int:
           and "somewhere-3751" in proc.stderr, True)
     # And the real checkout's default spelling, from REPO_ROOT (see the arm above for why).
     check("the default --build under the real checkout is accepted",
-          build_dir(str(REPO_ROOT / "prosper/build-linux")).endswith("prosper/build-linux"), True)
+          pathlib.Path(build_dir(str(REPO_ROOT / "prosper/build-linux"))).parts[-2:],
+          ("prosper", "build-linux"))
 
     print("-- qualify_return_type --")
     check("nested return type is qualified",
