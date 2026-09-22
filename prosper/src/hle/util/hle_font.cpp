@@ -204,14 +204,18 @@ FontFace* face(void* handle) {
 //            (eboot+0x1001a5b..0x1001a63), so any other value walks the wrong rows.
 //   +0x28/+0x2c -> floats, truncated to int by the caller, recording WHERE in the surface the
 //            glyph landed.
-//   +0x30 -> a float, truncated to int exactly as the placement pair above is, then stored into
-//            the engine's own glyph record at [glyph+0x34] (eboot+0x1001432..0x100143f). It is
-//            CONSUMED -- what it MEANS is not derivable from anything in this title's code, which
-//            only copies it. prosper writes 0.
-//            **CONFIDENCE: LOW that 0 is the right answer.** It is the right *default* -- before
-//            this file existed the field was uninitialised stack, so 0 is strictly an improvement
-//            and at least deterministic -- but it is a guess about a value the engine keeps. If a
-//            glyph-placement defect ever shows up on this title, start here.
+//   +0x30 -> the glyph's horizontal ADVANCE, a float, truncated to int exactly as the placement
+//            pair above is and stored into the engine's own glyph record at [glyph+0x34]
+//            (eboot+0x1001432..0x100143f). #2956 recorded this field as consumed-but-underived and
+//            wrote 0; that was the next defect (#3791). The record field's consumer is the line
+//            layout: the loops at eboot+0x100057b and eboot+0x10005f7 run
+//            `vaddss xmm3, xmm2, [glyph+0x34]` -- per-glyph value plus the letter-spacing term in
+//            xmm2 -- then scale it and accumulate it into the line's pen position, once per glyph.
+//            That is an advance by construction. With 0 there, every glyph of a string was laid
+//            out at the same x: the SYSTEM page's text drew as one smudge per line.
+//            CONFIDENCE: HIGH that it is an advance (its only arithmetic consumer sums it per glyph
+//            into a pen position); MED that it is exactly the metrics' h_advance rather than a
+//            rounded variant -- the caller truncates it to an integer anyway.
 //   +0x38/+0x3c -> the drawn size in pixels, as signed ints. These are the two the title maxes
 //            against its configured cell size to size its glyph atlas texture -- the pair that
 //            were uninitialised stack in #2951.
@@ -223,7 +227,7 @@ struct RenderResult {
     uint32_t reserved1[5];   // +0x14
     float    x;              // +0x28
     float    y;              // +0x2c
-    float    consumed_0x30;  // +0x30  read by the caller; meaning underived. See above.
+    float    h_advance;      // +0x30  horizontal advance; the caller's pen step. See above.
     uint32_t reserved3;      // +0x34
     int32_t  width;          // +0x38
     int32_t  height;         // +0x3c
@@ -231,7 +235,7 @@ struct RenderResult {
 static_assert(sizeof(RenderResult) == 0x40);
 static_assert(offsetof(RenderResult, pitch)  == 0x10);
 static_assert(offsetof(RenderResult, x)      == 0x28);
-static_assert(offsetof(RenderResult, consumed_0x30) == 0x30);
+static_assert(offsetof(RenderResult, h_advance) == 0x30);
 static_assert(offsetof(RenderResult, width)  == 0x38);
 static_assert(offsetof(RenderResult, height) == 0x3c);
 
@@ -649,9 +653,12 @@ int32_t render_glyph(void* handle, uint32_t code, RenderSurface* surface,
     if (!f || !surface) return static_cast<int32_t>(0x80540002u);
     if (result) result->pitch = surface->width_bytes;
 
-    if (metrics) {
-        if (!(f->data && real_metrics(f, code, metrics))) fill_metrics(handle, metrics);
-    }
+    // The advance at +0x30 is reported for EVERY glyph the face can describe, before any of the
+    // early returns below -- whitespace draws nothing and still has to move the pen (#3791).
+    GlyphMetrics advance_source{};
+    if (!(f->data && real_metrics(f, code, &advance_source))) fill_metrics(handle, &advance_source);
+    if (metrics) *metrics = advance_source;
+    if (result) result->h_advance = advance_source.h_advance;
     // No font behind this face: there is nothing to rasterize and nothing to pretend. The report
     // says zero pixels were drawn, which is true, and the caller's own fallback handles it.
     if (!f->data) return 0;

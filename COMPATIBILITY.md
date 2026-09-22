@@ -68,7 +68,7 @@ Last updated: 2026-09-23
 | *Sniper Ghost Warrior Contracts 2* | `PPSA03130` | CryEngine | 🔬 Rung 0 — boots in 91 ms and drives a 4K present loop at ~21 flips/s, but every frame is black: no pass produces a present source ([#2871](https://github.com/mattias800/prosper/issues/2871)). The boot deadlock in a preloaded PRX the title never imports is fixed | [#2867](https://github.com/mattias800/prosper/issues/2867) |
 | *The Lord of the Rings: Gollum* | `PPSA06367` | Unreal Engine 4 | 🔬 Rung 0 — boots, links every module and composites a 2560x1440 frame, but the only frame is a flat white clear. The startup-movie crash is fixed: `sceVideodec2GetPictureInfo` now fills its struct from the movie's own SPS/VUI ([#2898](https://github.com/mattias800/prosper/issues/2898)); the boot advances through Electra's picture consumer and stops at the record-ownership contract ([#2967](https://github.com/mattias800/prosper/issues/2967)). Its AAC movie audio decodes | [#2900](https://github.com/mattias800/prosper/issues/2900) |
 | *The First Berserker: Khazan* | `PPSA20447` | Unreal Engine 4 | 🔬 Rung 0 — boots, mounts and enumerates all thirty save slots, and no longer aborts: it now runs a full two-minute session under the live renderer instead of dying at 8.6 s. The `PS5 Out of Memory` abort was never a memory shortage — two unregistered `libScePsml` NIDs answered `SCE_OK` and left the caller's out-parameter unwritten, so the guest read stack residue as a count and asked for 244.5 TiB of **address space** ([#3347](https://github.com/mattias800/prosper/pull/3347); the direct-memory reading in [#2908](https://github.com/mattias800/prosper/issues/2908) is superseded). Still rung 0: the nine pictures it composites are a yellow quadrant, a brown gradient and a flat white clear, and none of them is content. The save-data event-drain code that parked its game thread forever is fixed | [#2909](https://github.com/mattias800/prosper/issues/2909) |
-| *Metaphor: ReFantazio* | `PPSA20800` | Atlus GFD | 🔬 Loading mascot and the language-selection screen, twelve languages drawn legibly in Latin, Cyrillic, Japanese, Chinese and Korean; the background art behind the menu does not draw ([#2952](https://github.com/mattias800/prosper/issues/2952)). The SIGFPE that killed every boot at five seconds is fixed ([#2951](https://github.com/mattias800/prosper/issues/2951)), as is the CRI Mana crash before it ([#2934](https://github.com/mattias800/prosper/issues/2934)) | [#2876](https://github.com/mattias800/prosper/issues/2876) |
+| *Metaphor: ReFantazio* | `PPSA20800` | Atlus GFD | 🚧 **Title screen** and title menu, reached through the first-boot setup (language, network prompt, brightness) and the opening movie; with the setup saved, NEW GAME plays the storybook prologue to name entry. Movies render as horizontal stripes ([#3801](https://github.com/mattias800/prosper/issues/3801)). The black screen after the SYSTEM page was the PSN sign-in dialog never finishing ([#3784](https://github.com/mattias800/prosper/issues/3784)) | [#2876](https://github.com/mattias800/prosper/issues/2876) |
 | *Judgment* | `PPSA02739` | Ryu Ga Gotoku (PAR) | 🔬 Rung 0 — boots and runs indefinitely without faulting, executes real GPU draws and presents 4K frames with zero recompiler rejections, but every frame is pure black ([#2923](https://github.com/mattias800/prosper/issues/2923)) | [#2880](https://github.com/mattias800/prosper/issues/2880) |
 | *BALAN WONDERWORLD* | `PPSA02058` | Unreal Engine 4 | 🔬 Rung 2 — a routed run answers the language menu's own *"Are you sure you want to change the game language to English?"* modal, which needs **Down** and not Cross, and reaches the title screen at t≈15 s, the main menu, and the opening story cutscene, which is a **decoded 4K H.264 movie** (two VA-API access-unit decoders open at t≈126 s, 3070 pictures) composited by prosper. No stage loads in 717 s, and the wrong composite still takes most frames ([#2932](https://github.com/mattias800/prosper/issues/2932)). Route: `prosper/scripts/balan-PPSA02058/` | [#2882](https://github.com/mattias800/prosper/issues/2882) |
 | *Stray* | `PPSA02101` | Unreal Engine 4 | 🔬 Rung 2 — a Cross-only route accepts the brightness-calibration screen its own `✕ Accept` prompt names, and reaches the first map load (`hk_project_mainstart`, t≈37 s, absent from every default run). The world then composites as a flat **letterboxed** clear, so no scene renders ([#2932](https://github.com/mattias800/prosper/issues/2932)). Route: `prosper/scripts/stray-PPSA02101/` | [#2883](https://github.com/mattias800/prosper/issues/2883) |
@@ -572,17 +572,17 @@ The opening sequence and ASTRO BOT title card render at native 3840×2160. See t
 
 ## Metaphor: ReFantazio — `PPSA20800`
 
+<p align="center"><img src="assets/screenshots/metaphor-title-screen.webp" alt="Metaphor: ReFantazio — the title screen: the METAPHOR ReFantazio logo over its city background, with the NEW GAME / LOAD GAME / SYSTEM title menu"></p>
+<p align="center"><img src="assets/screenshots/metaphor-prologue.webp" alt="Metaphor: ReFantazio — the storybook prologue after NEW GAME: an ink-wash city street with figures walking toward towers"></p>
+<p align="center"><img src="assets/screenshots/metaphor-system-offline.webp" alt="Metaphor: ReFantazio — the SYSTEM page reading Unable to connect to the PlayStation Network"></p>
 <p align="center"><img src="assets/screenshots/metaphor-language-select.webp" alt="Metaphor: ReFantazio — the language-selection screen, twelve languages in white serif type with English highlighted by a blue brush-stroke"></p>
-<p align="center"><img src="assets/screenshots/metaphor-loading-mascot.webp" alt="Metaphor: ReFantazio — the loading screen's winged fairy perched on an open book"></p>
 
-A default 3840×2160 launch reaches the loading mascot and then the language-selection screen, and
-holds it: 12 of 12 samples distinct over 60 s with the guest still running. Every glyph above is
-rasterized from the title's own TrueType file, which it hands prosper through
-`sceFontOpenFontMemory` — Latin, Cyrillic, Japanese, Traditional and Simplified Chinese and Korean.
-The **background art behind the menu does not draw** ([#2952](https://github.com/mattias800/prosper/issues/2952)).
-Until 2026-08-23 the title died of a divide-by-zero five seconds into every boot
-([#2951](https://github.com/mattias800/prosper/issues/2951)). See the
-[tracker](https://github.com/mattias800/prosper/issues/2876).
+`tools/screenshot` at 3840×2160, route `scripts/metaphor/reach-title-screen.pad`: the first-boot
+setup, the notices and logos, the opening movie, then the **title screen** and its menu. With the
+setup saved, NEW GAME plays the storybook prologue and stops at name entry. The movies, including the
+title screen's own background, render as horizontal stripes
+([#3801](https://github.com/mattias800/prosper/issues/3801)). Every glyph is rasterized from the
+title's own TrueType file. See the [tracker](https://github.com/mattias800/prosper/issues/2876).
 
 ## The Forgotten City — `PPSA03026`
 

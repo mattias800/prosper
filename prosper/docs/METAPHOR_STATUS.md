@@ -3,19 +3,37 @@
 Atlus GFD engine + CRIWARE middleware, AGC SDK 12, 71 GB dump. Tracker
 [#2876](https://github.com/mattias800/prosper/issues/2876).
 
-**Rung 1.** The title boots in ~90 ms, loads its GFD assets, opens two audio ports, initialises
-save data, compute and fonts, renders its animated loading mascot in full colour, and then reaches
-and holds its **language-selection screen** — twelve languages drawn legibly in Latin, Cyrillic,
-Japanese, Traditional and Simplified Chinese and Korean. A 60 s default-route run publishes 12 of
-12 distinct samples with `guest=running status=ok` and `max-pixel-stale=0.0s`.
+**Rung 2 — the title screen**, reached and rendered: the `METAPHOR: ReFantazio` logo over its
+animated background, `PRESS ANY BUTTON`, then the NEW GAME / LOAD GAME / SYSTEM title menu. Route:
+`scripts/metaphor/reach-title-screen.pad`, frontend `tools/screenshot`, 3840x2160, Linux / Radeon 8060S.
+From a clean save the route walks the first-boot setup (language, network prompt, brightness), the
+notices, the logos and the unskippable opening movie, and the title is up at ~340 s. With the SYSTEM
+save that setup writes, it is up at ~40 s, and NEW GAME plays the storybook prologue and stops at
+name entry.
+
+Three prosper defects stood between the language screen and the title, all of them prosper answering
+a question wrongly:
+
+- **The SYSTEM page's text drew as one smudge per line** (#3791). `sceFontRenderCharGlyphImage`
+  wrote 0 to the result's `+0x30`, which the engine's line layout sums per glyph as the advance.
+- **After the network prompt the title waited forever on a black screen** (#3784). libSceSigninDialog
+  was unregistered, so `sceSigninDialogUpdateStatus`'s `return 0` read as NONE and the title's
+  `cmp eax,3` wait never ended. It now runs the common-dialog lifecycle and ends dismissed. This is
+  what a real user declining the prompt produces on a signed-out console, and the title then shows its
+  own "Unable to connect to the PlayStation Network" page.
+- **The network prompt's "Retry?" defaults to Yes**, so a Cross-only route loops through the sign-in
+  dialog indefinitely. That is input, not a defect: answer the first prompt with Down, Cross (No).
+
+What does not render correctly yet:
+
+- **Movies render as horizontal stripes with upside-down subtitles** (#3801). That covers the opening
+  movie and the title screen's own background movie layer. The UI over them is correct.
+- Text glyphs sit on a slightly uneven baseline. They are legible, and the vertical placement fields
+  of the same result block are the first place to look.
 
 That is a different place from where it was earlier on 2026-08-23, when the primary thread died of
 a divide-by-zero five seconds in and all 24 samples were one retained black frame. The section
 below is the record of what that was.
-
-The screen's **background art is still absent** — the menu and its selection brush-stroke draw over
-black ([#2952](https://github.com/mattias800/prosper/issues/2952)), which is now separable for the
-first time because the guest survives to produce a population of frames to characterise.
 
 That is a different place from where it was on 2026-08-22, when it produced **zero** frames and
 died in its CRI Mana movie thread ([#2934](https://github.com/mattias800/prosper/issues/2934)).
@@ -175,53 +193,22 @@ library on a Windows desktop is still unobserved.
 
 ## Where it stops now
 
-1. **The background art behind the language menu never draws.** The menu, its text and its
-   selection brush-stroke composite correctly over black.
-   [#2952](https://github.com/mattias800/prosper/issues/2952) — reopened in substance by this
-   change, because it is finally measurable: the run now yields 12 distinct live frames instead of
-   one stale one.
-2. ~~**SIGFPE in the guest's primary thread at `eboot+0x10019f6`**~~ — **fixed**, see above
-   ([#2951](https://github.com/mattias800/prosper/issues/2951)). The historical derivation, kept
-   because the shape is worth keeping: it faulted about 5 s in, on `div r14d` with `r14d == 0`. The enclosing function is `eboot+0x1001970`, and RTTI names it: it is slot 3 of
-   **`fw::font::Font_PS5`**'s vtable (typeinfo `N2fw4font8Font_PS5E` at `0x237078f`), the routine
-   that expands an 8-bit glyph coverage bitmap into a white RGBA8 texture. `r14d` is
-   **bytes-per-pixel**, resolved through two lookup tables from the FORMAT field of the target
-   image's Gen5 T# — `(dword[image+0x64] >> 20) & 0x1ff` — and every stage of that resolution
-   defaults to **0** on an unrecognised value. The healthy answer is 4. The `div` runs *before*
-   both zero-dimension guards, so a zero glyph width or height is not what kills it.
-   **The lead:** the four `libSceFont` entry points this path calls —
-   `sceFontSelectRendererFt` (`Xx974EW-QFY`), `sceFontRenderSurfaceSetScissor` (`vRxf4d0ulPs`),
-   `sceFontGetCharGlyphMetrics` (`L97d+3OgMlE`) and `sceFontRenderCharGlyphImage` (`3G4zhgKuxE8`)
-   — are all **unregistered** and all answer 0, and they are the last four
-   `[prosper] unimplemented:` lines before the fault. `sceFontRenderSurfaceInit` and
-   `sceFontCreateRendererWithEdition` on the same path *are* registered
-   (`src/hle/util/hle_font.cpp:332`, `:311`), so this is a partial library rather than an absent
-   one. Full derivation, the T# layout and the one-run experiment that would settle it are on
-   [#2951](https://github.com/mattias800/prosper/issues/2951).
-   Once it dies, `tools/screenshot` reports `guest=faulted` and every sample after that moment is
-   stale (`max-pixel-stale=115.0s`), so the run's 24 identical PNGs are one frame served 24 times.
-   *(Historical, kept because the shape is worth keeping: the four unregistered entry points named
-   above were the lead, and they were the cause. The file:line citations are to the pre-fix file.)*
-3. **The frames it published were black.** Superseded by item 1: with the guest alive the run
-   produces 12 distinct frames, the menu and its text draw, and only the background art is missing.
-   Still [#2952](https://github.com/mattias800/prosper/issues/2952), now with a population to
-   characterise.
-4. **A host-side null dereference in prosper's own renderer, on the guest job thread
-   `job_render_0`** — inside a `std::unordered_map` lookup in `render_draw_pass_rgba`
-   (`tests/fixtures/render_runner.h:6169`, whose `persistent_texture_images` is an unsynchronised
-   function-local static). **Deterministic under `boot_trace`: 5 of 5 runs**, at two distinct
-   instructions that both resolve to libstdc++'s `_M_equals`. **0 of 2 under `tools/screenshot`**,
-   which is why the rung evidence above exists at all. Name the frontend in any claim about this
-   one (instrument trap 127). [#2953](https://github.com/mattias800/prosper/issues/2953).
+1. **Name entry after NEW GAME** is the next frontier toward gameplay (rung 3). "Who are you, who shall
+   guide the protagonist?" waits for text input, and the route stops there.
+2. **Movies render as stripes** ([#3801](https://github.com/mattias800/prosper/issues/3801)).
+3. The historical items below are kept for their shape.
+   - ~~The background art behind the language menu never draws~~. **Not a defect** (see Ruled out,
+     #2952). The one compute program the title used to lose, `0x2281c74100`, is compiled by
+     [#3800](https://github.com/mattias800/prosper/pull/3800). It was not the cause.
+   - ~~SIGFPE at `eboot+0x10019f6`~~: **fixed** (#2951), derivation above.
+   - The `job_render_0` host fault under `boot_trace` was #2953, since fixed by #3241.
 
-## What a pad route adds, and where it then stalls
+## What a pad route adds
 
-`scripts/metaphor/explore-past-language-select.pad` is exploratory, not a milestone route. With it,
-the title advances off the language screen to a **SYSTEM** screen — its brush-stroke art, a `SYSTEM`
-heading and a Cross prompt, all drawn — and then returns to the loading mascot and **stays there**
-for the rest of a 120 s run (`guest=running`, 12/12 samples, 7 pixel-distinct). **No title screen is
-reached**, which is why the rung above is 1 and not 2. The next question on this title is what that
-loading state is waiting for.
+`scripts/metaphor/reach-title-screen.pad` is the milestone route (its header gives the per-screen
+timeline). `scripts/metaphor/explore-past-language-select.pad` is the older exploratory Cross-only route. Before
+#3784 it stopped on black after the SYSTEM page; after it, it loops on "Cannot connect to network.
+Retry?" because Cross answers Yes.
 
 ## Reproduction route
 
@@ -242,6 +229,23 @@ from outside and its silence is not evidence.
 ## Ruled out
 
 One line per hypothesis this work killed, so nobody re-derives it at full cost.
+
+- **The language screen's black background is not a missing layer (#2952).** Every draw in an F9 bundle
+  of that frame is accounted for (`gpu_replay --draw-steps --draw-steps-every 1`). The 2844x1600
+  world targets are cleared and sampled at zero coverage (`nz=0`) because there is no world yet. The
+  4K loading-screen snapshot (`0x23267a4000`, rgba16f, mascot only) is composited full-screen by
+  draw 3. Draw 4 then covers it with the menu's own opaque black quads before the menu, text and
+  brush-stroke draw. The one compute program the title lost (`0x2281c74100`, now compiled by #3800)
+  composites that same empty world layer and changes nothing on this screen. Every later screen
+  (SYSTEM, logos, title) renders its backgrounds. #2952.
+- **The black screen after the SYSTEM page is not a loading stall or a renderer defect.** It is the
+  guest polling `sceSigninDialogUpdateStatus` for 3 (FINISHED) at `eboot+0x863e80` against an
+  unregistered NID that answered 0 (NONE). The guest stayed `running` with 100 s of identical frames.
+  #3784.
+- **Glyph advance at `sceFontRenderCharGlyphImage` result `+0x30` is not underived.** #2956 recorded it as
+  "consumed, meaning unknown, CONFIDENCE: LOW" and wrote 0. Its consumer is the line layout at
+  `eboot+0x100057b` / `+0x10005f7`, which adds it plus letter spacing into the pen position once per
+  glyph. #3791.
 
 - **A zero glyph width or height is not what caused the SIGFPE, and neither is a null texture.**
   The `div` at `eboot+0x10019f6` runs *before* both of the routine's zero-dimension guards, and a

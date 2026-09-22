@@ -1669,6 +1669,11 @@ if(TARGET prosper_core)
   target_link_libraries(test_psml_unimplemented PRIVATE prosper_core)
   add_test(NAME psml_unimplemented COMMAND test_psml_unimplemented)
 
+  # libSceSigninDialog runs its common-dialog lifecycle and ends dismissed (#3784). Pure, no dump.
+  add_executable(test_signin_dialog tests/hle/service/test_signin_dialog.cpp)
+  target_link_libraries(test_signin_dialog PRIVATE prosper_core)
+  add_test(NAME signin_dialog COMMAND test_signin_dialog)
+
   add_executable(test_translate_sandbox tests/hle/test_translate_sandbox.cpp)
   # Includes a shared fixture, which resolves from the `tests` root.
   target_include_directories(test_translate_sandbox PRIVATE tests)

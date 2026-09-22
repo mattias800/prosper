@@ -282,6 +282,29 @@ int main() {
     // test asserted nothing here and would not have caught a regression.
     CHECK((uint32_t)rd_i32(0x30) != 0xafafafafu,
           "the field at +0x30 the caller also reads is written, not left as residue");
+    // #3791: +0x30 is the glyph's ADVANCE. Metaphor's line layout sums it per glyph into the pen
+    // position (eboot+0x100057b), so 0 here stacked every glyph of a string at one x. The expected
+    // value is the font's own hmtx advance (800 units at 0.064 = 51.2 px), the same number
+    // GetCharGlyphMetrics reported above -- not "nonzero", which a placeholder could satisfy.
+    CHECK(std::fabs(rd_f32(0x30) - m[4]) < 0.01f && std::fabs(rd_f32(0x30) - 51.2f) < 0.5f,
+          "the result reports the glyph's advance at +0x30 (#3791)");
+
+    // Whitespace draws nothing and must still move the pen. The test font maps only 'A'; every
+    // other code falls to glyph 0, which is EMPTY and carries its own 800-unit advance -- exactly
+    // the shape of a space. An implementation that sets the advance only after rasterizing leaves
+    // this at 0, because the empty-glyph early return comes first.
+    {
+        uint8_t result_ws[0x40];
+        std::memset(result_ws, kPoison, sizeof(result_ws));
+        float mws[8];
+        std::memset(mws, kPoison, sizeof(mws));
+        const int32_t wrc = call_render(render, face, ' ', surface, 0.0f, 0.0f, mws, result_ws);
+        float adv_ws; std::memcpy(&adv_ws, result_ws + 0x30, 4);
+        int32_t ww; std::memcpy(&ww, result_ws + 0x38, 4);
+        CHECK(wrc == 0 && ww == 0, "an empty glyph reports success and zero drawn width");
+        CHECK(std::fabs(adv_ws - 51.2f) < 0.5f,
+              "an empty glyph still reports its advance, so a space moves the pen (#3791)");
+    }
     // The poison compare is not redundant with the magnitude compare, and mutation testing is how
     // that was found: 0xafafafaf reinterpreted as a float32 is -3.196e-10, which sails through any
     // "close to zero" test. An untouched buffer therefore PASSES a placement assertion written the
