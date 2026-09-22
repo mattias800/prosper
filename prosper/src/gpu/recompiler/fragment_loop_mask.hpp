@@ -64,9 +64,13 @@ inline FragmentLoopMaskProof prove_fragment_loop_mask(
         return in.fmt == Rdna2Format::VOP3 && in.opcode == 0x101 && source == 2;
     };
     const auto known_mask = [&](const Operand& operand) {
+        // MOV/CSELECT can also emit scalar data and erase the destination's Bool. A physical
+        // VCC pair is not proof of its representation: scalar writes can leave rs.vcc absent.
+        // The eagerly seeded pair, EXEC, and inline integers always retain a Bool view;
+        // inline_int_mask_bit projects every signed inline value using the exact fragment lane.
         return operand.kind == OperandKind::InlineInt ||
                (operand.kind == OperandKind::SGPR && operand.value == pair_base) ||
-               (scalar_operand(operand) && (operand.value == 106 || operand.value == 126));
+               (scalar_operand(operand) && operand.value == 126);
     };
     const auto mask_writer = [&](const Rdna2Inst& in, int base, uint32_t width) {
         if (base != pair_base || width != 2 || !scalar_write_is_b64_mask(in, base))

@@ -190,6 +190,29 @@ int main(int argc, char** argv) {
     reject(scalar_copy, "non-mask-or-partial-pair-write",
            "MOV_B64 from an unproved scalar pair cannot masquerade as a mask writer");
 
+    // A numeric VCC operand does not certify rs.vcc. These scalar writes leave only its data
+    // words, so MOV/CSELECT would erase the promoted pair's Bool after the earlier logical write.
+    reject(alias_tail({sop1(0x15, 106, 129), sop1(0x03, 107, 128),
+                       sop1(0x04, 84, 106)}),
+           "non-mask-or-partial-pair-write",
+           "data-only VCC cannot replace the promoted Bool through MOV_B64 on a backedge");
+    for (uint32_t source : {0u, 1u}) {
+        reject(alias_tail({sop1(0x15, 106, 129), sop1(0x03, 107, 128),
+                           sop2(0x00, 10, 128, 128), // scalar ADD re-arms SCC
+                           sop2(0x0b, 84, source == 0 ? 106 : 84,
+                                          source == 1 ? 106 : 84)}),
+               "non-mask-or-partial-pair-write",
+               source == 0 ? "CSELECT first source cannot be an unproved VCC representation"
+                           : "CSELECT second source cannot be an unproved VCC representation");
+    }
+    for (uint32_t source : {84u, 126u, 128u, 193u, 129u, 194u}) {
+        CHECK(analyze(alias_tail({sop1(0x04, 84, source)})).admitted,
+              "MOV_B64 retains self, EXEC and uniform or partial signed inline mask sources");
+        CHECK(analyze(alias_tail({sop2(0x00, 10, 128, 128),
+                                 sop2(0x0b, 84, source, 84)})).admitted,
+              "CSELECT preserves the Bool when both sources have certified mask representations");
+    }
+
     auto wrong_root = loop();
     wrong_root[3] = sop2(0x15, 68, 85, 126);
     reject(wrong_root, "scalar-or-unmodelled-read",
