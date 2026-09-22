@@ -6,6 +6,7 @@
 #include "gpu/texture/tile.hpp"
 #include "gpu/state/vk_translate.hpp"
 #include "diagnostics/env_cache.hpp"   // cached PROSPER_* gates on per-draw/per-resource paths
+#include "diagnostics/exit_reports.hpp"
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -154,31 +155,18 @@ std::atomic<uint64_t> g_unmodeled_cb_mode_counts[P::CB_COLOR_CONTROL_MODE_MASK +
 // 2,533 NORMAL scanout draws reported as a zero. That is not a missing measurement; it is a
 // permanent structural zero wearing the shape of a measured population, which is strictly worse.
 //
-// KNOWN GAPS, stated rather than discovered later. An atexit report is lost on THREE paths, and the
-// eight pre-existing atexit censuses in this codebase all inherit the same three (#3353):
-//
-//   1. `prosper-app` and `boot_trace` call `_Exit`, which does not run atexit handlers.
-//   2. The GUEST's own exit path calls `_Exit` (`src/hle/kernel/hle_kernel_time.cpp`), so a run that
-//      ends because the title exited loses the report even on a frontend that would have flushed it.
-//   3. SIGTERM's default action skips atexit entirely -- which is how a `timeout`-wrapped or
-//      operator-interrupted run ends. `live_compute.cpp:1954` records this as the path that actually
-//      bites, because bounded runs are where this project's evidence mostly comes from.
-//
-//   4. `tools/screenshot` ends in `_exit(verdict.exit_code)` (`screenshot.cpp:1000`) -- lowercase
-//      `_exit`, the POSIX one, which skips atexit exactly as `_Exit` does. So the project's PRIMARY
-//      EVIDENCE FRONTEND loses these reports too. An earlier revision of this comment claimed the
-//      opposite; it was written from a grep for `_Exit(` that a lowercase `_exit(` does not match,
-//      and the first run that could test it printed nothing. The same is true of the worker-fault
-//      path's `_exit(90)`, which `command_processor.cpp:1111` already records.
-//
-// So an atexit hook reaches essentially none of the ways a real run ends here, and this registration
-// is best-effort rather than a reporting mechanism. Use `PROSPER_COLORSTATETRACE`, whose per-draw
-// records carry `mode=` unconditionally, when the number has to survive the exit path -- it also
-// covers `NORMAL`, which this counter never sees. #3353 tracks giving these censuses an explicit
-// flush hook, which is what the frontends already do for several other diagnostics.
+// EXIT PATHS. This summary is registered through diagnostics/exit_reports.hpp rather than bare
+// std::atexit, because almost no run here returns from main(): prosper-app, tools/screenshot,
+// tools/boot_trace's host-exception path and the guest's own exit all end in _Exit/_exit, which
+// skip atexit, and each of them now flushes the registry first (#3353). Two paths are still NOT
+// covered and a missing line means "not reachable here", not zero: SIGTERM (how a
+// `timeout`-wrapped run ends) and the worker-fault `_exit(90)`, which runs in signal context where a
+// report is unsafe. Use `PROSPER_COLORSTATETRACE`, whose per-draw records carry `mode=`
+// unconditionally, when the number has to survive those -- it also covers `NORMAL`, which this
+// counter never sees.
 void report_unmodeled_cb_color_mode(uint32_t mode) {
     static const bool exit_dump_registered = [] {
-        std::atexit([] {
+        prosper::diagnostics::register_exit_report([] {
             char line[256];
             if (unmodeled_cb_color_mode_summary(line, sizeof line))
                 fprintf(stderr, "%s\n", line);

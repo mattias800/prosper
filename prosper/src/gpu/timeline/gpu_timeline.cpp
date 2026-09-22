@@ -1,6 +1,7 @@
 #include "gpu/timeline/gpu_timeline.hpp"
 
 #include "build_revision.hpp"
+#include "diagnostics/exit_reports.hpp"
 #include "gpu/capture/gpu_capture.hpp"
 #include "gpu/capture/gpu_capture_bundle.hpp"
 #include "gpu/execute/gpu_dependency_graph.hpp"
@@ -2833,12 +2834,15 @@ namespace {
     // bound on the run, and doing it at load means the operator learns before the route starts
     // rather than after a multi-gigabyte capture is already underway.
     capture_max_submits();
-    std::atexit(&report_unfired_automatic_capture_gates);
+    // Through the exit-report registry, not bare std::atexit: every frontend and the guest's own
+    // exit end the process with _Exit/_exit, which skips atexit, so these two reports -- whose
+    // whole job is to explain an EMPTY capture -- could not print on any bounded run (#3353).
+    prosper::diagnostics::register_exit_report(&report_unfired_automatic_capture_gates);
     // The detailed timeline selector is a separate family with its own state, so it gets its own
     // handler rather than being folded into the gate report (#2564). Registered at load for the
     // same reason: its request object is built lazily on the first recorded submit, and a run that
     // never records one is exactly the run whose silence is hardest to explain.
-    std::atexit(&report_unfired_timeline_capture_selector);
+    prosper::diagnostics::register_exit_report(&report_unfired_timeline_capture_selector);
     return 0;
 }();
 

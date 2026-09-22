@@ -1706,6 +1706,13 @@ if(TARGET prosper_core)
            COMMAND ${Python3_EXECUTABLE} -m unittest tests.tools.test_dump_hygiene
            WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 
+  # End-of-run reports reachable on the exit paths runs actually take (#3353). Its subprocess arms
+  # re-run the test binary: one exits with _Exit and no flush as the positive control that atexit
+  # really is skipped, one flushes first, one returns from main to cover the atexit fallback.
+  add_executable(test_exit_reports tests/diagnostics/test_exit_reports.cpp)
+  target_link_libraries(test_exit_reports PRIVATE prosper_core)
+  add_test(NAME exit_reports COMMAND test_exit_reports)
+
   # Diagnostics: disabled-path test — verifies stubs are zero-cost (always runs).
   add_executable(test_diagnostics_disabled tests/diagnostics/test_diagnostics_disabled.cpp)
   target_link_libraries(test_diagnostics_disabled PRIVATE prosper_core)

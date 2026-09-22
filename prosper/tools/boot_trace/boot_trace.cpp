@@ -3,6 +3,7 @@
 // plus, on a fault, the register state and an rbp-chain backtrace classified by module. The primary bring-up debugging
 // tool. Builds on Linux and Windows (the Windows path is narrower; --capture-first-frame needs a
 // Vulkan-enabled build). Usage: boot_trace <dump-root> [--capture-first-frame [output.bmp]]
+#include "diagnostics/exit_reports.hpp"
 #include "loader/linker.hpp"
 #include "host/image/exec_image.hpp"
 #include "host/image/boot_program.hpp"          // shared guest-boot path (also used by prosper-app)
@@ -137,6 +138,9 @@ int main(int argc, char** argv) {
             // No execinfo on MinGW; the exception message above is still the useful part.
             fprintf(stderr, "  (host backtrace unavailable on this platform)\n");
 #endif
+            // _Exit skips atexit, so the end-of-run reports would be lost on exactly the run that
+            // needs explaining (#3353).
+            prosper::diagnostics::flush_exit_reports();
             fflush(stderr);
             _Exit(42);
         });
