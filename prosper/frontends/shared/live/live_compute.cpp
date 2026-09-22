@@ -4,6 +4,7 @@
 #include "shared/compute/compute_authority_live_census.hpp"
 #include "shared/compute/compute_image_borrow_census.hpp"
 #include "shared/compute/compute_timing_selector.hpp"
+#include "shared/compute/compute_phase_attribution.hpp"
 #include "shared/compute/compute_buffer_timing.hpp"
 #include "shared/compute/compute_transfer_gate_census.hpp"
 #include "shared/compute/storage_image_alias_plan.hpp"
@@ -6516,11 +6517,14 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         report_compute_decline(item, reason);
         return false;
     };
+    // Phase markers are set in order as execute_item() passes each boundary. A `break` out of the
+    // do/while below leaves every later marker UNSET, so they are optional rather than defaulted to
+    // phase_start: a defaulted marker made the interval spanning the break negative and booked the
+    // whole item to cleanup, which read as "teardown is the cost" on every failed dispatch (#3461).
+    // See attribute_compute_phases() for how the intervals are then formed.
     const auto phase_start = ComputeClock::now();
-    auto phase_setup = phase_start;
-    auto phase_pipeline = phase_start;
-    auto phase_dispatch = phase_start;
-    auto phase_writeback = phase_start;
+    std::optional<ComputeClock::time_point> phase_setup, phase_pipeline, phase_dispatch,
+        phase_writeback;
     double pack_ms = 0.0;
     double layout_ms = 0.0;
     // layout_ms covers BOTH arms of the publication branch below, and they are different work: a
@@ -12111,7 +12115,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         }
         if (trace) std::fprintf(stderr, "[compute]   dispatch complete\n");
         phase_dispatch = ComputeClock::now();
-        const auto writeback_prepare_start = phase_dispatch;
+        const auto writeback_prepare_start = *phase_dispatch;
 
         if (!compare_targets.empty()) {
             void* mapped = nullptr;
@@ -13056,6 +13060,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         ok = true;
         phase_writeback = ComputeClock::now();
     } while (false);
+    // Where the phase chain stopped: equal to phase_writeback (to the clock's resolution) on both
+    // success paths, and the end of the truncated phase on every early break.
+    const auto phase_loop_exit = ComputeClock::now();
 
     if (trace) {
         // #2790: dump this dispatch's SPIR-V when asked, INCLUDING when it failed. The existing
@@ -13194,12 +13201,15 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     auto phase_milliseconds = [](auto begin, auto end) {
         return std::chrono::duration<double, std::milli>(end - begin).count();
     };
+    const ComputePhaseMilliseconds phases = attribute_compute_phases(
+        phase_start, phase_setup, phase_pipeline, phase_dispatch, phase_writeback,
+        phase_loop_exit, phase_cleanup);
     if (perf_capture_timing) {
-        g_perf_compute_setup_ms += phase_milliseconds(phase_start, phase_setup);
-        g_perf_compute_pipeline_ms += phase_milliseconds(phase_setup, phase_pipeline);
-        g_perf_compute_dispatch_wait_ms += phase_milliseconds(phase_pipeline, phase_dispatch);
-        g_perf_compute_writeback_ms += phase_milliseconds(phase_dispatch, phase_writeback);
-        g_perf_compute_cleanup_ms += phase_milliseconds(phase_writeback, phase_cleanup);
+        g_perf_compute_setup_ms += phases.setup;
+        g_perf_compute_pipeline_ms += phases.pipeline;
+        g_perf_compute_dispatch_wait_ms += phases.dispatch;
+        g_perf_compute_writeback_ms += phases.writeback;
+        g_perf_compute_cleanup_ms += phases.cleanup;
     }
     if (phase_timing) {
         std::fprintf(stderr,
@@ -13213,16 +13223,16 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                      "cleanup_ms=%.2f total_ms=%.2f subgroup=%u\n",
                      (unsigned long long)item.submit_no, (unsigned long long)item.code_addr,
                      (unsigned long long)timing_program_hash, ok ? 1u : 0u,
-                     phase_milliseconds(phase_start, phase_setup),
+                     phases.setup,
                      setup_validate_ms, setup_buffers_ms,
-                     phase_milliseconds(phase_setup, phase_pipeline),
-                     phase_milliseconds(phase_pipeline, phase_dispatch),
-                     phase_milliseconds(phase_dispatch, phase_writeback),
+                     phases.pipeline,
+                     phases.dispatch,
+                     phases.writeback,
                      writeback_prepare_ms, writeback_buffers_ms,
                      writeback_images_ms, writeback_publish_ms,
                      image_map_ms, image_prepare_ms, image_watch_ms,
                      pack_ms, layout_ms, retile_copy_ms, image_notify_ms, image_cache_ms,
-                     phase_milliseconds(phase_writeback, phase_cleanup),
+                     phases.cleanup,
                      phase_milliseconds(phase_start, phase_cleanup), item.required_subgroup_size);
     }
     if (collect_cache_census) {

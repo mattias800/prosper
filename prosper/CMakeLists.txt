@@ -147,6 +147,12 @@ add_executable(test_compute_timing_selector tests/shared/compute/test_compute_ti
 target_include_directories(test_compute_timing_selector PRIVATE frontends)
 add_test(NAME compute_timing_selector_policy COMMAND test_compute_timing_selector)
 
+# execute_item()'s five CPU phases on a dispatch that breaks early (#3461): no negative interval,
+# no whole-item cleanup, and the parts still sum to the item.
+add_executable(test_compute_phase_attribution tests/shared/compute/test_compute_phase_attribution.cpp)
+target_include_directories(test_compute_phase_attribution PRIVATE frontends)
+add_test(NAME compute_phase_attribution COMMAND test_compute_phase_attribution)
+
 # Pure fail-closed policy for a behavior-neutral census of hypothetical deferred compute results.
 # It has no Vulkan dependency and does not change the live backend's synchronous writeback.
 add_executable(test_compute_authority_census tests/shared/compute/test_compute_authority_census.cpp)
