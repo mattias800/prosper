@@ -2661,6 +2661,13 @@ endif()
 
   # Native-typed readback formatting: the property asserted is the one an RGBA8 conversion
   # destroys, so these arms fail if a scalar is ever routed through one again (#3765).
+  # #2790's dropped HDR producer as an executable fixture: an undef loop-carried mask accumulator
+  # must reach the divergent-loop emitter and reject AT the accumulator operand, not earlier on
+  # control flow. Seven of its dwords are byte-identical to the real shader.
+  add_executable(test_undef_loop_accumulator tests/gpu/recompiler/test_undef_loop_accumulator.cpp)
+  target_link_libraries(test_undef_loop_accumulator PRIVATE prosper_core)
+  add_test(NAME undef_loop_accumulator COMMAND test_undef_loop_accumulator)
+
   add_executable(test_gpu_replay_native_texels tests/test_gpu_replay_native_texels.cpp)
   target_link_libraries(test_gpu_replay_native_texels PRIVATE prosper_core)
   add_test(NAME gpu_replay_native_texels COMMAND test_gpu_replay_native_texels)
