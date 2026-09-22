@@ -472,28 +472,31 @@ HLE(s_np_ok) { return 0; }
 // three independent titles); MED that no error returns are needed for out-of-order calls, which no
 // local title exercises.
 namespace {
-std::atomic<int> g_signin_dialog_status{0 /*NONE*/};
+std::atomic<int>& signin_dialog_status() {
+    static std::atomic<int> status{0 /*NONE*/};
+    return status;
+}
 }
 HLE(s_signin_dialog_init) {
-    g_signin_dialog_status.store(1 /*INITIALIZED*/, std::memory_order_release);
+    signin_dialog_status().store(1 /*INITIALIZED*/);
     return 0;
 }
 HLE(s_signin_dialog_open) {
     int32_t user = 0;
     if (svc_ptrish(a0)) user = *(const int32_t*)((const char*)PW(a0) + 4);
     fprintf(stderr, "[svc] sceSigninDialogOpen(userId=%d) -> headless: dismissed, FINISHED\n", user);
-    g_signin_dialog_status.store(3 /*FINISHED*/, std::memory_order_release);
+    signin_dialog_status().store(3 /*FINISHED*/);
     return 0;
 }
 HLE(s_signin_dialog_status) {
-    return (uint64_t)(unsigned)g_signin_dialog_status.load(std::memory_order_acquire);
+    return (uint64_t)(unsigned)signin_dialog_status().load();
 }
 HLE(s_signin_dialog_close) {
-    g_signin_dialog_status.store(3 /*FINISHED*/, std::memory_order_release);
+    signin_dialog_status().store(3 /*FINISHED*/);
     return 0;
 }
 HLE(s_signin_dialog_term) {
-    g_signin_dialog_status.store(0 /*NONE*/, std::memory_order_release);
+    signin_dialog_status().store(0 /*NONE*/);
     return 0;
 }
 

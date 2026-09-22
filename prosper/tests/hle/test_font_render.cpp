@@ -18,6 +18,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <array>
 #include <cstring>
 #include <algorithm>
 #include <vector>
@@ -294,13 +295,14 @@ int main() {
     // the shape of a space. An implementation that sets the advance only after rasterizing leaves
     // this at 0, because the empty-glyph early return comes first.
     {
-        uint8_t result_ws[0x40];
-        std::memset(result_ws, kPoison, sizeof(result_ws));
-        float mws[8];
-        std::memset(mws, kPoison, sizeof(mws));
-        const int32_t wrc = call_render(render, face, ' ', surface, 0.0f, 0.0f, mws, result_ws);
-        float adv_ws; std::memcpy(&adv_ws, result_ws + 0x30, 4);
-        int32_t ww; std::memcpy(&ww, result_ws + 0x38, 4);
+        std::array<uint8_t, 0x40> result_ws{};
+        result_ws.fill(kPoison);
+        std::array<float, 8> mws{};
+        std::memset(mws.data(), kPoison, sizeof(float) * mws.size());
+        const int32_t wrc = call_render(render, face, ' ', surface, 0.0f, 0.0f, mws.data(),
+                                        result_ws.data());
+        float adv_ws; std::memcpy(&adv_ws, result_ws.data() + 0x30, 4);
+        int32_t ww; std::memcpy(&ww, result_ws.data() + 0x38, 4);
         CHECK(wrc == 0 && ww == 0, "an empty glyph reports success and zero drawn width");
         CHECK(std::fabs(adv_ws - 51.2f) < 0.5f,
               "an empty glyph still reports its advance, so a space moves the pen (#3791)");

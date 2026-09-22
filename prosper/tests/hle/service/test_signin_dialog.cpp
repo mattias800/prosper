@@ -26,7 +26,7 @@
 
 using namespace prosper;
 
-static int fails = 0;
+// `fails` is a local of main(); CHECK is only used there.
 #define CHECK(c, m) do { if (!(c)) { std::printf("  [FAIL] %s\n", m); ++fails; } \
                          else std::printf("  [ok]   %s\n", m); } while (0)
 
@@ -34,6 +34,7 @@ static int fails = 0;
 static bool guest_sees_dialog_finished(uint64_t status) { return (uint32_t)status == 3u; }
 
 int main() {
+    int fails = 0;
     std::printf("== test_signin_dialog ==\n");
     register_np_hle();
 
