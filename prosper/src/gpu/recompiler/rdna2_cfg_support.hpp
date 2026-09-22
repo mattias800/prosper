@@ -1360,10 +1360,25 @@ inline uint32_t scalar_alu_source_words(const Rdna2Inst& in, uint32_t source) {
             // observed reading a mask half through one, so they stay out of the list under the
             // add-on-evidence rule above -- but the next investigation that meets one has the set
             // rather than re-deriving it (review of #2820).
+            //
+            // V_MUL_LO_U32 / V_MUL_HI_U32 (0x169 / 0x16a): `D.u32 = S0.u32 * S1.u32`, low or high 32
+            // bits of the product -- two 32-bit operands (RDNA2 ISA 70648). Metaphor: ReFantazio's
+            // UI-composite kernel 0x2281c74100 (#2952) runs the compiler's unsigned-division idiom
+            // with VCC_LO as scalar scratch:
+            //
+            //     s_sub_i32          vcc_lo, 0, s26
+            //     v_readfirstlane_b32 vcc_hi, v5
+            //     s_mul_i32 / s_mul_hi_u32 / s_add_i32 over vcc_lo, vcc_hi
+            //     v_mul_hi_u32       v5, vcc_lo, v23       a 32-BIT read of that scratch dword
+            //     v_mul_lo_u32       v6, s26, v5
+            //
+            // and the pair charge rejected its second barrier phase with
+            // `wave64-ambiguous-mask-read` at pc184.
             if (in.opcode == 0x141 || in.opcode == 0x143 ||
                 in.opcode == kVop3OpcodeLshlAddU32 || in.opcode == 0x347 ||
                 in.opcode == 0x36f || in.opcode == kVop3OpcodeAdd3U32 ||
-                in.opcode == kVop3OpcodeAndOrB32)
+                in.opcode == kVop3OpcodeAndOrB32 ||
+                in.opcode == kVop3OpcodeMulLoU32 || in.opcode == kVop3OpcodeMulHiU32)
                 return 1;
             return 2;
         default:
