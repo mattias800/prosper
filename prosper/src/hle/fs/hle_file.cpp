@@ -4,6 +4,7 @@
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE   // pthread_getattr_np (bound the PREADLOG/DEEPTRACE stack walk to the real stack)
 #endif
+#include "hle/fs/save_capacity.hpp"   // allocation record + usage for GetMountInfo (#3654)
 #include "hle/dispatch/dispatch.hpp"
 #include "hle/fs/save_paths.hpp"
 #include "hle/service/hle_addcontent.hpp"
@@ -36,7 +37,7 @@
 #include <unistd.h>
 #include <sys/time.h>    // utimes: sceKernelUtimes timestamp preservation
 #include <sys/syscall.h>
-#include <dirent.h>      // opendir/readdir: savedata0_list_dirs (sceSaveDataDirNameSearch, #299)
+#include <dirent.h>      // opendir/readdir: savedata0_list_dirs (sceSaveDataDirNameSearch, #299; Windows: FindFirstFileA)
 #include <sys/uio.h>     // process_vm_readv: fault-safe guest-memory reads for the APR diagnostics
 #include <sys/mman.h>    // PROSPER_APR_ALTDEST: prosper-owned guest read buffer
 #include <pthread.h>
@@ -942,10 +943,15 @@ std::string resolve_guest_path(const char* guest_path) {
 // opens an existing directory or creates a missing one. The outcome lets the HLE write an honest
 // MountResult status instead of deriving CREATED from the requested mode.
 bool savedata_dirname_ok(const std::string& dirname) {
+    // kSaveCapacityDirName is prosper's per-title allocation bookkeeping (#3654). It sits beside the
+    // saves, so a guest dirName spelling it would mount prosper's records as a save. The SDK's own
+    // dirName alphabet has no '.', so no valid guest name is refused by this.
     return !dirname.empty() && dirname != "." && dirname != ".." &&
+           dirname != kSaveCapacityDirName &&
            dirname.find('/') == std::string::npos && dirname.find('\\') == std::string::npos;
 }
-SaveDataMountOutcome savedata0_mount(const char* dirname, SaveDataMountPolicy policy) {
+SaveDataMountOutcome savedata0_mount(const char* dirname, SaveDataMountPolicy policy,
+                                     uint64_t requested_blocks) {
     // Reject an empty / traversal dirName before composing the host path — otherwise a name like
     // "../foo" would stat/create a directory OUTSIDE the save sandbox root (savedata0_dir_mtime already
     // guards this; sharing savedata_dirname_ok keeps the two paths from diverging again).
@@ -985,6 +991,9 @@ SaveDataMountOutcome savedata0_mount(const char* dirname, SaveDataMountPolicy po
         // report EXISTS and must not activate the mount in that case.
         if (!created && policy == SaveDataMountPolicy::Create) return SaveDataMountOutcome::Exists;
     }
+    // Retain the requested allocation (#3654). A failure to write the record does not fail the
+    // mount -- the save itself is there -- it leaves the capacity reported as unknown, loudly.
+    save_allocation_note_mount(save0_base(), dirname, created, requested_blocks);
     std::lock_guard<std::mutex> lk(g_save0_mx);
     g_save0 = d;
     return created ? SaveDataMountOutcome::Created : SaveDataMountOutcome::Opened;
@@ -1002,10 +1011,23 @@ bool savedata0_umount() {
 // List the save-dir names that exist under the host save root (each subdir is one save the guest created
 // via sceSaveDataMount3 create-mode). sceSaveDataDirNameSearch reports these so a prior session's saves
 // appear in the game's load/continue list (#299 — the saves persisted but were invisible).
+//
+// Both hosts apply the SAME filter, and it is deliberately the one a directory entry's own bytes can
+// answer: skip any name beginning with '.', and keep an entry only when a stat() of the composed
+// path says it is a directory (on Linux that follows a link, so a link to a save directory counts
+// and a dangling one does not; Windows links are not exercised by the test). A regular file under
+// the title's save root is not a save.
+// Order is the host enumeration order on both; the guest's SearchCond sort key is not honoured by
+// either (sceSaveDataDirNameSearch passes the list through as-is).
+//
+// Windows used to be `#ifndef _WIN32`-ed out and returned an empty list for every title, so every
+// title was told it had no saves however many it had written (#2760). It enumerates with the
+// narrow (ANSI) Find API because savedata0_mount() creates these directories with the narrow
+// _mkdir(): a name the mount path can spell therefore round-trips through this listing unchanged.
 std::vector<std::string> savedata0_list_dirs() {
     std::vector<std::string> out;
+    const std::string base = save0_base();
 #ifndef _WIN32
-    std::string base = save0_base();
     if (DIR* dp = opendir(base.c_str())) {
         while (struct dirent* de = readdir(dp)) {
             if (de->d_name[0] == '.') continue;
@@ -1015,7 +1037,20 @@ std::vector<std::string> savedata0_list_dirs() {
         }
         closedir(dp);
     }
-#endif   // Windows host is secondary; report no saves there.
+#else
+    WIN32_FIND_DATAA fd{};
+    HANDLE h = FindFirstFileA((base + "/*").c_str(), &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            if (fd.cFileName[0] == '.') continue;   // also drops the "." and ".." pseudo-entries
+            ProsperStat st{};
+            if (PROSPER_STAT((base + "/" + fd.cFileName).c_str(), &st) == 0 &&
+                (st.st_mode & _S_IFMT) == _S_IFDIR)
+                out.emplace_back(fd.cFileName);
+        } while (FindNextFileA(h, &fd));
+        FindClose(h);
+    }
+#endif
     return out;
 }
 

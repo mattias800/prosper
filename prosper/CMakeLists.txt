@@ -1252,6 +1252,14 @@ if(TARGET prosper_core)
   target_link_libraries(test_savedata_mountinfo PRIVATE prosper_core)
   add_test(NAME savedata_mount_info COMMAND test_savedata_mountinfo)
 
+  # #3654: the mount wrappers carry the requested blocks into a per-save allocation record, and
+  # GetMountInfo reports blocks / freeBlocks from that record and the files in the save. Includes a
+  # re-exec of itself to prove the allocation survives a new process.
+  add_executable(test_savedata_capacity tests/hle/test_savedata_capacity.cpp)
+  target_include_directories(test_savedata_capacity PRIVATE tests)
+  target_link_libraries(test_savedata_capacity PRIVATE prosper_core)
+  add_test(NAME savedata_capacity COMMAND test_savedata_capacity)
+
   # The two umount entry points (#3666). sceSaveDataUmount2 read NONE of its arguments -- it
   # unmounted /savedata0 and reported success whatever it was handed, so a title naming another
   # mount point had a live mount discarded on its behalf -- and sceSaveDataUmount answered NOT_FOUND
@@ -1271,6 +1279,15 @@ if(TARGET prosper_core)
   target_include_directories(test_savedata_title_namespace PRIVATE tests)
   target_link_libraries(test_savedata_title_namespace PRIVATE prosper_core)
   add_test(NAME savedata_title_namespace COMMAND test_savedata_title_namespace)
+
+  # sceSaveDataDirNameSearch reported NO saves on Windows (#2760): savedata0_list_dirs() was
+  # `#ifndef _WIN32`-ed out, so every title's load/continue list was empty there. Drives the real NID
+  # over a disposable save root with saves made both through the mount path and by hand, plus a file
+  # and a dot-directory that must not be reported. Registered unconditionally so the MinGW job runs it.
+  add_executable(test_savedata_dirsearch tests/hle/test_savedata_dirsearch.cpp)
+  target_include_directories(test_savedata_dirsearch PRIVATE tests)
+  target_link_libraries(test_savedata_dirsearch PRIVATE prosper_core)
+  add_test(NAME savedata_dirsearch COMMAND test_savedata_dirsearch)
 
   # libSceIme keyboard API (#186): reports a consistent "no keyboard connected" state (empty resource
   # array + disconnected info, bounds-checked) so the per-frame input poll never reads garbage.
@@ -2962,6 +2979,11 @@ endif()
       add_test(NAME game_compute_exec_no_adaptive_storage_result COMMAND test_game_compute)
       set_tests_properties(game_compute_exec_no_adaptive_storage_result PROPERTIES
         ENVIRONMENT "PROSPER_NO_ADAPTIVE_STORAGE_RESULT_VALIDATION=1")
+      # PROSPER_NO_SKIP_SEED forces a real seed upload; the fixture asserts that mode's own expectations
+      # (identical output is rewritten) instead of the default policy's (#3390).
+      add_test(NAME game_compute_exec_no_skip_seed COMMAND test_game_compute)
+      set_tests_properties(game_compute_exec_no_skip_seed PROPERTIES
+        ENVIRONMENT "PROSPER_NO_SKIP_SEED=1")
       # The compute path's full-surface seed/pack intermediates are pooled rather than freshly
       # allocated. Their old allocation was `make_unique_for_overwrite`, i.e. nominally
       # indeterminate -- but at these sizes it was a fresh mmap, which reads as ZERO, so a call site
@@ -3420,6 +3442,11 @@ endif()
       add_test(NAME game_compute_exec_no_adaptive_storage_result COMMAND test_game_compute)
       set_tests_properties(game_compute_exec_no_adaptive_storage_result PROPERTIES
         ENVIRONMENT "PROSPER_NO_ADAPTIVE_STORAGE_RESULT_VALIDATION=1")
+      # PROSPER_NO_SKIP_SEED forces a real seed upload; the fixture asserts that mode's own expectations
+      # (identical output is rewritten) instead of the default policy's (#3390).
+      add_test(NAME game_compute_exec_no_skip_seed COMMAND test_game_compute)
+      set_tests_properties(game_compute_exec_no_skip_seed PROPERTIES
+        ENVIRONMENT "PROSPER_NO_SKIP_SEED=1")
       # The compute path's full-surface seed/pack intermediates are pooled rather than freshly
       # allocated. Their old allocation was `make_unique_for_overwrite`, i.e. nominally
       # indeterminate -- but at these sizes it was a fresh mmap, which reads as ZERO, so a call site

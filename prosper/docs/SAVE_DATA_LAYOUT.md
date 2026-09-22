@@ -36,6 +36,22 @@ default). If neither variable that names such a location is set, prosper falls b
 per-user quota shared by every concurrent agent, and a save that quietly does not survive a reboot is
 worse than one that announces where it went.
 
+## Allocation records (`/savedata0` only)
+
+A save's allocation, the blocks its creating `sceSaveDataMount*` call asked for, is kept at
+`<root>/<TITLE_ID>/.prosper-capacity/<guest dirName>` (#3654). It is kept outside the save, so the guest
+never sees it in `/savedata0`. The leading dot keeps it out of `sceSaveDataDirNameSearch`, and
+`savedata_dirname_ok` refuses that one name as a guest dirName. `sceSaveDataGetMountInfo` reports this
+allocation and the blocks the save's files use now; `src/hle/fs/save_capacity.hpp` states that rule and
+how confident each part is.
+
+A save written before these records existed has none. The first mount that carries a request adopts
+that request, and nothing inside the save is touched. A record that does not parse is never rewritten or
+deleted. Until a save has a usable record, it keeps the answer prosper gave before records existed:
+the fixed legacy capacity of 0x40000 blocks, less the blocks it uses. It is deliberately not reported
+as full, because a title that checks free space would then refuse to save over a save the user
+already has.
+
 ## `PROSPER_SAVE0` and `PROSPER_SAVEDATA_DIR` are ROOTS
 
 Both used to name the flat directory saves were written directly into. They now name the root that

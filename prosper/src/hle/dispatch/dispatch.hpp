@@ -239,7 +239,11 @@ enum class SaveDataMountOutcome { NotFound, Exists, Opened, Created };
 // "." / "..", and any embedded '/' or '\\' so a crafted/garbled name can't traverse out of the sandbox.
 // Shared by savedata0_mount and savedata0_dir_mtime so the guard can't exist in only one of them.
 bool savedata_dirname_ok(const std::string& dirname);
-SaveDataMountOutcome savedata0_mount(const char* dirname, SaveDataMountPolicy policy);
+// `requested_blocks` is the allocation the mount descriptor asked for (#3654; 0 = none). It is recorded
+// when the mount creates the save, and adopted by a save that has no record yet -- see
+// hle/fs/save_capacity.hpp for the accounting contract.
+SaveDataMountOutcome savedata0_mount(const char* dirname, SaveDataMountPolicy policy,
+                                     uint64_t requested_blocks = 0);
 bool savedata0_umount();
 // The host directory the guest's "/savedata0" currently resolves to, or "" when nothing is mounted.
 // The save's parameter block (sceSaveDataSetParam/GetParam, #2786) is stored inside that directory,

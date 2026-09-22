@@ -68,8 +68,8 @@
 # unsettled question. #3255.
 
 # ---- #1710: compute pipeline layout has no push-constant range, and nothing is ever pushed -----
-VUID-VkComputePipelineCreateInfo-layout-07987 | required | game_compute_exec, game_compute_exec_no_adaptive_storage_result, game_compute_exec_scratch_poison, game_compute_rtt_destination_mirror, game_compute_rtt_destination_mirror_no_direct_retile, game_compute_rtt_destination_mirror_no_rgba16 | Compute module declares a PushConstant block while the layout declares no range (#1710)
-VUID-vkCmdDispatch-maintenance4-08602 | environment-dependent | game_compute_exec, game_compute_exec_no_adaptive_storage_result, game_compute_exec_scratch_poison, game_compute_rtt_destination_mirror, game_compute_rtt_destination_mirror_no_direct_retile, game_compute_rtt_destination_mirror_no_rgba16 | Same root cause as 07987: the shader reads push constants that vkCmdPushConstants never wrote (#1710). Absent on the CI runner because validation layers 1.3.275 do not implement this check.
+VUID-VkComputePipelineCreateInfo-layout-07987 | required | game_compute_exec, game_compute_exec_no_adaptive_storage_result, game_compute_exec_no_skip_seed, game_compute_exec_scratch_poison, game_compute_rtt_destination_mirror, game_compute_rtt_destination_mirror_no_direct_retile, game_compute_rtt_destination_mirror_no_rgba16 | Compute module declares a PushConstant block while the layout declares no range (#1710)
+VUID-vkCmdDispatch-maintenance4-08602 | environment-dependent | game_compute_exec, game_compute_exec_no_adaptive_storage_result, game_compute_exec_no_skip_seed, game_compute_exec_scratch_poison, game_compute_rtt_destination_mirror, game_compute_rtt_destination_mirror_no_direct_retile, game_compute_rtt_destination_mirror_no_rgba16 | Same root cause as 07987: the shader reads push constants that vkCmdPushConstants never wrote (#1710). Absent on the CI runner because validation layers 1.3.275 do not implement this check.
 
 # ---- 08740: the old #1712 Int64 reason became stale when shaderInt64 was enabled.
 # The remaining texture_sample_render report was ImageGatherExtended, fixed by #3417.

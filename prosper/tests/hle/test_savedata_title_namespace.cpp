@@ -195,33 +195,21 @@ int main() {
     // ---------------------------------------------------------------- arm 3: dirName search
     CHECK(savedata0_umount(), "title B unmounts");
 
-    // This arm needs savedata0_list_dirs() to actually enumerate. Its body is wrapped in
-    // `#ifndef _WIN32` (hle_file.cpp), so on Windows it returns an empty vector for EVERY title —
-    // and an empty list makes the isolation half ("title A's private save is not offered to title
-    // B") pass while proving nothing, because nothing is offered to anyone. A permanently-green
-    // assertion is worse than an absent one, so the positive and negative halves are kept together
-    // and both are gated on a positive control: title A's own two saves, which certainly exist by
-    // this point. If the control cannot see them, the instrument is not enumerating and the arm
-    // says so instead of reporting a pass it did not earn. #2760 tracks enumerating on Windows.
+    // The isolation half ("title A's private save is not offered to title B") passes vacuously on a
+    // listing that enumerates nothing, so it is paired with a positive control: title A's own two
+    // saves, which certainly exist by this point. Until #2760 the Windows listing WAS empty and this
+    // arm printed a [skip]; it now enumerates on every host, so the control is a hard assertion and
+    // a platform that stops enumerating reddens here instead of skipping.
     set_app0_root(app0_a);
     const std::vector<std::string> visible_to_a = savedata0_list_dirs();
-    const bool enumeration_works =
-        contains(visible_to_a, kSharedSlot) && contains(visible_to_a, kTitleAOnlySlot);
-    if (!enumeration_works) {
-        printf("  [skip] savedata0_list_dirs() reported %zu entries for a title that has two "
-               "saves, so it does not enumerate on this platform (#2760). The dirName-search arm "
-               "cannot discriminate here and is SKIPPED, not passed.\n",
-               visible_to_a.size());
-    } else {
-        CHECK(enumeration_works,
-              "title A sees both of its own saves (positive control for this arm)");
-        set_app0_root(app0_b);
-        const std::vector<std::string> visible_to_b = savedata0_list_dirs();
-        CHECK(contains(visible_to_b, kSharedSlot),
-              "sceSaveDataDirNameSearch shows title B its own save");
-        CHECK(!contains(visible_to_b, kTitleAOnlySlot),
-              "sceSaveDataDirNameSearch does not offer title A's saves to title B");
-    }
+    CHECK(contains(visible_to_a, kSharedSlot) && contains(visible_to_a, kTitleAOnlySlot),
+          "title A sees both of its own saves (positive control for this arm)");
+    set_app0_root(app0_b);
+    const std::vector<std::string> visible_to_b = savedata0_list_dirs();
+    CHECK(contains(visible_to_b, kSharedSlot),
+          "sceSaveDataDirNameSearch shows title B its own save");
+    CHECK(!visible_to_a.empty() && !contains(visible_to_b, kTitleAOnlySlot),
+          "sceSaveDataDirNameSearch does not offer title A's saves to title B");
 
     // ---------------------------------------------------------------- arm 4: SaveDataMemory
     HleFn setup = Hle::lookup("oQySEUfgXRA"), set = Hle::lookup("cduy9v4YmT4"),
