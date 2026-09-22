@@ -1,4 +1,5 @@
 #include "native_texels.hpp"
+#include "rtt_seed_rgba8.hpp"
 
 #include "gpu/capture/gpu_capture.hpp"
 #include "gpu/capture/gpu_capture_bundle.hpp"
@@ -55,7 +56,7 @@ void usage(const char* argv0) {
     std::fprintf(stderr, "usage: %s [--inspect|--inspect-only|--validate|--graph] "
                          "[--graph-json PATH] [--draw N[:M]] [--draw-with-compute-prefix] "
                          "[--through-operation N] [--compute-only N] [--warmup-repeats N] "
-                         "[--output-target-after OP:ADDR] "
+                         "[--output-target-after OP:ADDR [--native-texel X,Y]...] "
                          "[--bundle capture.prgbundle] [--bundle-tail N] "
                          "[--bundle-through-submit N] [--bundle-compact PATH] "
                          "[--bundle-intermediate-through-target WxH] "
@@ -110,67 +111,14 @@ void usage(const char* argv0) {
 // the only place the numbers matter more than the picture.
 constexpr uint64_t kNativeTexelReportLimit = 64;
 
-std::vector<uint8_t> inspect_rtt_seed(const prosper::gpu::GpuCaptureRttSeed& seed) {
-    const size_t texels = static_cast<size_t>(seed.width) * seed.height;
-    if (seed.format == prosper::gpu::GpuCaptureColorFormat::Rgba8Unorm &&
-        seed.rgba.size() == texels * 4)
-        return seed.rgba;
-    if (seed.format == prosper::gpu::GpuCaptureColorFormat::R11G11B10Float &&
-        seed.rgba.size() == texels * 4) {
-        std::vector<uint8_t> rgba(texels * 4);
-        for (size_t texel = 0; texel < texels; ++texel) {
-            uint32_t packed = 0;
-            std::memcpy(&packed, seed.rgba.data() + texel * 4, sizeof(packed));
-            const float values[3] = {
-                prosper::gpu::f11_to_float(static_cast<uint16_t>(packed)),
-                prosper::gpu::f11_to_float(static_cast<uint16_t>(packed >> 11)),
-                prosper::gpu::f10_to_float(static_cast<uint16_t>(packed >> 22)),
-            };
-            for (uint32_t channel = 0; channel < 3; ++channel) {
-                const float value = values[channel];
-                rgba[texel * 4 + channel] = !std::isfinite(value) || value <= 0.0f ? 0
-                    : value >= 1.0f ? 255 : static_cast<uint8_t>(value * 255.0f + 0.5f);
-            }
-            rgba[texel * 4 + 3] = 255;
-        }
-        return rgba;
-    }
-    if (seed.format == prosper::gpu::GpuCaptureColorFormat::R8Unorm &&
-        seed.rgba.size() == texels) {
-        std::vector<uint8_t> rgba(texels * 4);
-        for (size_t texel = 0; texel < texels; ++texel) {
-            rgba[texel * 4] = rgba[texel * 4 + 1] = rgba[texel * 4 + 2] = seed.rgba[texel];
-            rgba[texel * 4 + 3] = 255;
-        }
-        return rgba;
-    }
-    if (seed.format == prosper::gpu::GpuCaptureColorFormat::R32Uint &&
-        seed.rgba.size() == texels * 4) {
-        std::vector<uint8_t> rgba(texels * 4);
-        for (size_t texel = 0; texel < texels; ++texel) {
-            uint32_t value = 0;
-            std::memcpy(&value, seed.rgba.data() + texel * 4, sizeof(value));
-            const uint8_t visible = static_cast<uint8_t>(std::min(value, 255u));
-            rgba[texel * 4] = rgba[texel * 4 + 1] = rgba[texel * 4 + 2] = visible;
-            rgba[texel * 4 + 3] = 255;
-        }
-        return rgba;
-    }
-    if (seed.format != prosper::gpu::GpuCaptureColorFormat::Rgba16Float ||
-        seed.rgba.size() != texels * 8)
-        return {};
+// `--native-texel X,Y` points, read back in the exact output target's native type whatever its
+// size (#3765). The first-N report above cannot reach a chosen texel of a large HDR target.
+std::vector<prosper::gpu::replay_tool::NativeTexelPoint> g_native_texel_points;
 
-    std::vector<uint8_t> rgba(texels * 4);
-    for (size_t texel = 0; texel < texels; ++texel) {
-        for (uint32_t channel = 0; channel < 4; ++channel) {
-            uint16_t half = 0;
-            std::memcpy(&half, seed.rgba.data() + texel * 8 + channel * 2, sizeof(half));
-            const float value = prosper::gpu::half_to_float(half);
-            rgba[texel * 4 + channel] = !std::isfinite(value) || value <= 0.0f ? 0
-                : value >= 1.0f ? 255 : static_cast<uint8_t>(value * 255.0f + 0.5f);
-        }
-    }
-    return rgba;
+// The RGBA8 picture of a seed. The conversion lives in rtt_seed_rgba8.hpp so it can be tested
+// without a Vulkan device, and so its switch is the one exhaustive place (#3765).
+std::vector<uint8_t> inspect_rtt_seed(const prosper::gpu::GpuCaptureRttSeed& seed) {
+    return prosper::gpu::replay_tool::rtt_seed_to_rgba8(seed);
 }
 
 std::vector<uint8_t> inspect_live_target(const prosper::gpu::LiveTargetSnapshot& snapshot) {
@@ -330,6 +278,11 @@ bool read_exact_output_target(
         std::fputs(prosper::gpu::replay_tool::format_native_texels(
                        snapshot.format, snapshot.pixels->data(), snapshot.pixels->size(),
                        snapshot.width, snapshot.height, kNativeTexelReportLimit).c_str(),
+                   stderr);
+    if (snapshot.pixels && !g_native_texel_points.empty())
+        std::fputs(prosper::gpu::replay_tool::format_native_texels_at(
+                       snapshot.format, snapshot.pixels->data(), snapshot.pixels->size(),
+                       snapshot.width, snapshot.height, g_native_texel_points).c_str(),
                    stderr);
     pixels = inspect_live_target(snapshot);
     const uint64_t expected_bytes =
@@ -2340,6 +2293,26 @@ int main(int argc, char** argv) {
             output_target_after_operation = static_cast<size_t>(operation);
             output_target_after_addr = static_cast<uint64_t>(address);
         }
+        else if (std::string(argv[i]) == "--native-texel" && i + 1 < argc) {
+            const char* spec = argv[++i];
+            char* x_end = nullptr;
+            errno = 0;
+            const unsigned long x = std::strtoul(spec, &x_end, 10);
+            if (*spec == '-' || errno == ERANGE || x_end == spec || *x_end != ',' ||
+                x > UINT32_MAX) {
+                usage(argv[0]); return 2;
+            }
+            const char* y_begin = x_end + 1;
+            char* y_end = nullptr;
+            errno = 0;
+            const unsigned long y = std::strtoul(y_begin, &y_end, 10);
+            if (*y_begin == '-' || errno == ERANGE || y_end == y_begin || *y_end ||
+                y > UINT32_MAX) {
+                usage(argv[0]); return 2;
+            }
+            g_native_texel_points.push_back(
+                {static_cast<uint32_t>(x), static_cast<uint32_t>(y)});
+        }
         else if (std::string(argv[i]) == "--compute-only" && i + 1 < argc) {
             char* end = nullptr;
             const long value = std::strtol(argv[++i], &end, 0);
@@ -2485,6 +2458,12 @@ int main(int argc, char** argv) {
     if (resource_override_submit_no && !resource_override_requested) {
         std::fprintf(stderr,
                      "gpu_replay: --override-submit requires --override-resource\n");
+        return 2;
+    }
+    if (!g_native_texel_points.empty() && output_target_after_operation == SIZE_MAX) {
+        std::fprintf(stderr,
+                     "gpu_replay: --native-texel requires --output-target-after (it reads back "
+                     "that exact target)\n");
         return 2;
     }
     if (!retry_failed_stage_spv_path.empty()) {
@@ -3058,14 +3037,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr,
                      "[gpureplay] dumped RTT seed %016llx %ux%u format=%s -> %s\n",
                      static_cast<unsigned long long>(seed->guest_addr), seed->width, seed->height,
-                     seed->format == prosper::gpu::GpuCaptureColorFormat::Rgba16Float
-                         ? "rgba16f"
-                         : seed->format == prosper::gpu::GpuCaptureColorFormat::R11G11B10Float
-                             ? "r11g11b10f"
-                             : seed->format == prosper::gpu::GpuCaptureColorFormat::R8Unorm
-                                 ? "r8"
-                                 : seed->format == prosper::gpu::GpuCaptureColorFormat::R32Uint
-                                     ? "r32ui" : "rgba8",
+                     prosper::gpu::replay_tool::rtt_seed_format_name(seed->format),
                      rtt_seed_path.c_str());
     }
     if (graph_only) {

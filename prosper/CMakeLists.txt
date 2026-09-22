@@ -2674,6 +2674,16 @@ endif()
   target_link_libraries(test_gpu_replay_native_texels PRIVATE prosper_core)
   add_test(NAME gpu_replay_native_texels COMMAND test_gpu_replay_native_texels)
 
+  # The RGBA8 picture of a seed must cover every GpuCaptureColorFormat member (#3765: five were
+  # dropped to an empty image). -Werror=switch here as on gpu_replay, so the header's exhaustive
+  # switches fail the build for a new enumerator even in a configuration that skips gpu_replay.
+  add_executable(test_gpu_replay_rtt_seed_rgba8 tests/test_gpu_replay_rtt_seed_rgba8.cpp)
+  target_link_libraries(test_gpu_replay_rtt_seed_rgba8 PRIVATE prosper_core)
+  if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(test_gpu_replay_rtt_seed_rgba8 PRIVATE -Werror=switch)
+  endif()
+  add_test(NAME gpu_replay_rtt_seed_rgba8 COMMAND test_gpu_replay_rtt_seed_rgba8)
+
   add_executable(test_gpu_dependency_graph tests/gpu/execute/test_gpu_dependency_graph.cpp)
   target_link_libraries(test_gpu_dependency_graph PRIVATE prosper_core)
   add_test(NAME gpu_dependency_graph COMMAND test_gpu_dependency_graph)
