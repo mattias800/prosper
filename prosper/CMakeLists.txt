@@ -544,6 +544,16 @@ if(Python3_Interpreter_FOUND)
   add_test(NAME flip_pacing_report_logic
            COMMAND "${Python3_EXECUTABLE}"
                    "${CMAKE_SOURCE_DIR}/tools/perf/test_flip_pacing_report.py")
+  # The two /proc samplers (#3400 / #3401). Both run against a /proc tree the test BUILDS, so they
+  # need no target process, no privileges and no sleeping: wait_profile's arms pin per-thread
+  # identity (same-name threads, TID reuse, renames, PID reuse), and lock_holder's pin that a run
+  # which could read no thread's syscall state is UNAVAILABLE (exit 2) rather than a negative.
+  add_test(NAME wait_profile_logic
+           COMMAND "${Python3_EXECUTABLE}"
+                   "${CMAKE_SOURCE_DIR}/tools/perf/test_wait_profile.py")
+  add_test(NAME lock_holder_logic
+           COMMAND "${Python3_EXECUTABLE}"
+                   "${CMAKE_SOURCE_DIR}/tools/perf/test_lock_holder.py")
   # The queue-depth timeline reader (#3033). Registered for a reason specific to this one: its
   # verdict is a DISCRIMINATOR that a pacer A/B rests on, and its first version could not tell a
   # port that was starved from a port that was merely silent -- both read queued=0. It reported a

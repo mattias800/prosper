@@ -73,7 +73,10 @@ distinction**, which is the difference between a measurement and an answer.
 - **Every sampled thread lands in exactly one bucket** (`RUNNING`, or `<state>:<wchan> [arg0]`), so shares
   sum to 100 by construction rather than by arithmetic that can drift.
 - **Shares are per thread** — `n / (samples in which THAT thread was seen)` — so a thread that starts late
-  is not diluted by samples it could not appear in.
+  is not diluted by samples it could not appear in. **A thread is `(tid, starttime)`, never its name**:
+  until #3400 rows were keyed by `comm`, so one running thread beside fifteen idle same-named workers
+  reported 6.25% RUNNING, a share true of none of the sixteen. Collisions are now stated, a reused TID is
+  a new row, and the target PID is pinned by its own starttime.
 - **The residual is printed, never absorbed.** With `--top` / `--min-share`, whatever is not displayed is
   shown as a remainder, so the column is visibly complete whatever the flags do.
 - **The overran-sweep count prints even when zero**, so its absence is never ambiguous.
@@ -210,7 +213,10 @@ alone is the aggregate that cannot distinguish contention from an idle pool. Can
 These are the properties, not the implementation:
 
 1. An empty or failed sample is **reported as failed**, never as "nothing was blocked", and an all-failed
-   run exits non-zero.
+   run exits non-zero. `lock_holder.py` broke this until #3401: an unreadable `syscall` file returned the
+   same `None` as a readable non-futex one, so a permission-denied run printed "not blocked on a lock"
+   and exited 0. It now counts read, unreadable (with errno) and vanished thread-samples separately and
+   exits 2 when it read none.
 2. Perturbation is measured and printed **before** any finding, labelled as a bound with its direction.
 3. Buckets partition by construction; shares are per thread; the residual is printed, not absorbed.
 4. Wait machinery is never reported as a blocking site — and the plumbing list is validated by a
