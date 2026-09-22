@@ -2327,6 +2327,12 @@ endif()
   target_link_libraries(test_guest_memory_search PRIVATE prosper_core)
   add_test(NAME guest_memory_search COMMAND test_guest_memory_search)
 
+  # #3734: the single guest<->host copy policy every subsystem's helper forwards to -- never faults,
+  # exact vs prefix, NULL / wrap / zero-length, errno preserved -- against a mapping with a hole in it.
+  add_executable(test_guest_memory_copy tests/host/memory/test_guest_memory_copy.cpp)
+  target_link_libraries(test_guest_memory_copy PRIVATE prosper_core)
+  add_test(NAME guest_memory_copy COMMAND test_guest_memory_copy)
+
   add_executable(test_guest_read_cache_disabled tests/host/memory/test_guest_read_cache_disabled.cpp)
   target_link_libraries(test_guest_read_cache_disabled PRIVATE prosper_core)
   add_test(NAME guest_read_cache_disabled COMMAND test_guest_read_cache_disabled)

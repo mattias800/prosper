@@ -10,6 +10,7 @@
 #endif
 #endif
 
+#include "host/memory/guest_memory_copy.hpp"   // read_capture_guest_memory (#3734)
 #include "gpu/capture/gpu_capture.hpp"
 
 #include <mutex>
@@ -1399,29 +1400,11 @@ inline bool validate_failure_diagnostics(const GpuCaptureFile& capture, std::str
 // ---- appended by a later promotion out of the same source ----
 inline CaptureRttSeedReader g_rtt_seed_reader;
 
+// The readable prefix of a buffer being captured. Forwards to the shared policy (#3734); on Windows
+// this used to be a guest_readable() probe plus memcpy in 64 KiB steps, which could fault if the
+// range was revoked between probe and copy, and reported the prefix only to 64 KiB granularity.
 inline size_t read_capture_guest_memory(uint64_t addr, uint8_t* dst, size_t bytes) {
-#if defined(__linux__) || defined(__APPLE__)
-    size_t done = 0;
-    while (done < bytes) {
-        iovec local{dst + done, bytes - done};
-        iovec remote{reinterpret_cast<void*>(static_cast<uintptr_t>(addr + done)), bytes - done};
-        const ssize_t read = process_vm_readv(getpid(), &local, 1, &remote, 1, 0);
-        if (read < 0 && errno == EINTR) continue;
-        if (read <= 0) break;
-        done += static_cast<size_t>(read);
-    }
-    return done;
-#else
-    size_t done = 0;
-    constexpr size_t chunk_max = 0x10000;
-    while (done < bytes) {
-        const size_t n = std::min(bytes - done, chunk_max);
-        if (!guest_readable(addr + done, static_cast<uint32_t>(n))) break;
-        std::memcpy(dst + done, reinterpret_cast<const void*>(static_cast<uintptr_t>(addr + done)), n);
-        done += n;
-    }
-    return done;
-#endif
+    return host::guest_read_prefix(addr, dst, bytes);
 }
 
 inline bool is_capture_authority_resource(const ShaderResource& resource) {
