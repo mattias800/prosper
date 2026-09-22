@@ -35,6 +35,11 @@ using ExitReport = void (*)();
 // Register `report` to run once at the end of the run. Safe to call from any thread and at any
 // time, including during static initialisation. A report registered after a flush runs at the
 // next one (or at the atexit fallback).
+//
+// A report must not read objects with non-trivial destructors. The one atexit fallback is
+// registered by the FIRST registrant, so on an ordinary return from main() it runs late in
+// teardown, possibly after the statics a lazily registered report would want. Read atomics, the
+// environment, or deliberately leaked state, as the existing reports do.
 void register_exit_report(ExitReport report);
 
 // Run every registered report that has not already run, in registration order, then fflush stdio.
