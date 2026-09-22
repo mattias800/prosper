@@ -157,6 +157,18 @@ def main():
         if "DIFFERENT process" not in out:
             failures.append(f"case 5: the early stop is not explained: {out!r}")
 
+    # 5b. EXIT between the directory check and the stat read: reported as an exit, not as reuse.
+    with tempfile.TemporaryDirectory() as tmp:
+        fp = FakeProc(tmp)
+        fp.thread(510, "main", "S", 9300)
+
+        def vanish(sweep):
+            if sweep == 1:
+                (Path(tmp) / "999" / "stat").unlink()
+        out, _ = run(mod, tmp, seconds=3, hz=1, on_sleep=vanish)
+        if "the target process exited" not in out or "DIFFERENT process" in out:
+            failures.append(f"case 5b: an exit was reported as PID reuse: {out!r}")
+
     # 6. CONTROL: distinct names still produce the ordinary per-thread rows and no NOTE.
     with tempfile.TemporaryDirectory() as tmp:
         fp = FakeProc(tmp)

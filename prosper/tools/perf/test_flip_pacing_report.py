@@ -913,6 +913,12 @@ def main():
         failures.append(f"case 30: mixed run must name both emitter counts: {out!r}")
     #     A SubmitFlip the emulator REJECTED (bufidx outside [-1, 15]) is printed before the
     #     validation and never flips, so it must not become an interval.
+    #     Both edges of the emulator's accepted range [-1, 15] are flips; 16 is not.
+    edges = ("[ev] SubmitFlip t=1.000000 handle=0x1001 bufidx=-1 flipmode=0x1 fl013arg=0x0\n"
+             "[ev] SubmitFlip t=1.016000 handle=0x1001 bufidx=15 flipmode=0x1 fl013arg=0x1\n")
+    out, _ = run(edges)
+    if "flips=2 " not in out or "rejected" in out:
+        failures.append(f"case 30: bufidx -1 and 15 must both be accepted flips: {out!r}")
     rejected = api + "[ev] SubmitFlip t=9.000000 handle=0x1001 bufidx=16 flipmode=0x1 fl013arg=0x0\n"
     out, _ = run(rejected)
     if "flips=121 " not in out or "1 SubmitFlip call(s) with an out-of-range bufidx" not in out:

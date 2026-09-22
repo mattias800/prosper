@@ -260,7 +260,9 @@ def main() -> int:
     print(f"\nlock_holder: pid {args.pid}")
     short = ""
     if samples_taken != args.samples:
-        short = f"  ({stopped})" if stopped else "  (task list unreadable in the rest)"
+        missed_sweeps = sum(enum_failures.values())
+        short = f"  ({stopped})" if stopped else (
+            f"  ({missed_sweeps} sweep(s) could not read the task list)" if missed_sweeps else "")
     print(f"  samples: {samples_taken} of {args.samples} attempted{short}")
     if enum_failures:
         print("  task-list read failures: " + ", ".join(

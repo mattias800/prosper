@@ -109,6 +109,8 @@ def main():
         expect_void("case 4", out, rc)
         if "task-list read failures: EACCES x2" not in out:
             failures.append(f"case 4: enumeration failure not named: {out!r}")
+        if "(2 sweep(s) could not read the task list)" not in out:
+            failures.append(f"case 4: the short sample count does not say why: {out!r}")
         if "target exited" in out:
             failures.append(f"case 4: a permission failure was reported as the target exiting: {out!r}")
 
@@ -127,6 +129,15 @@ def main():
             failures.append(f"case 6: vanished threads not counted as such: {out!r}")
         if "0 unreadable" not in out:
             failures.append(f"case 6: a vanished thread was counted as unreadable: {out!r}")
+
+    # 6b. MALFORMED: the file reads, but holds nothing parseable (an empty line, or a futex number
+    #     with no address). Not an observation, and not a vanished thread.
+    with tempfile.TemporaryDirectory() as tmp:
+        make_tree(tmp, {101: ("main", ""), 102: ("worker", "202")})
+        out, rc = run(mod, tmp)
+        expect_void("case 6b", out, rc)
+        if "malformed x4" not in out:
+            failures.append(f"case 6b: malformed syscall files not counted as such: {out!r}")
 
     # 7. CONTROL: fully readable, nobody in a futex wait. A scoped negative, exit 0.
     with tempfile.TemporaryDirectory() as tmp:

@@ -226,11 +226,12 @@ def main():
                   "(run with PROSPER_COMPUTE_PHASE_TIMING=1)", file=sys.stderr)
         return 1
 
-    # A dispatch that fails leaves execute_item() through an early break, so phase_dispatch and
-    # phase_writeback are never advanced past phase_start. Its `dispatch_ms` is then computed
-    # backwards (and prints NEGATIVE) while `cleanup_ms` swallows the whole dispatch. Those records
-    # carry a valid `total_ms` and nothing else, so they are reported separately and never summed
-    # into the phase table -- mixing them in silently inverts it. See #1732.
+    # A dispatch that fails leaves execute_item() through an early break, so its later phase
+    # markers are never reached. Records from builds before #3461 print that as a NEGATIVE interval
+    # with `cleanup_ms` swallowing the whole dispatch; since #3461 the broken phase runs to the loop
+    # exit and the phases after it print 0. Either way the split describes a truncated dispatch, not
+    # a comparable one, so these records are reported separately and never summed into the phase
+    # table -- mixing them in silently inverts it. See #1732.
     # A record with no `ok` field at all is a truncated or interleaved line. Default it to FAILED,
     # not succeeded: the whole point of this split is that mixing a broken record into the phase
     # table inverts it, so the unsafe default must be the one that keeps it out.
@@ -333,8 +334,9 @@ def main():
         share = 100.0 * len(failed) / (len(failed) + n)
         print(f"  EXCLUDED: {len(failed)} FAILED dispatches ({share:.0f}% of the "
               f"{len(failed) + n} that reached execute_item), {failed_ms:.0f} ms wall. Their phase "
-              f"split is not recoverable -- a failed dispatch leaves execute_item early, so the "
-              f"phase spanning the break prints NEGATIVE and cleanup_ms absorbs the whole record.")
+              f"split describes a TRUNCATED dispatch -- a failed dispatch leaves execute_item "
+              f"early, so the phases after the break never ran (logs from before #3461 show that "
+              f"as a negative interval with cleanup_ms holding the whole record).")
         print("  That share is NOT the fraction of all guest dispatches: CPU-fast-path fills return "
               "before execute_item and emit no record here. Take their count from the run log's "
               "'[render-timing] compute_cpu_fast fills=N' line and add it to the denominator.")
