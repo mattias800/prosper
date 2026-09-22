@@ -89,6 +89,12 @@ SKIP = re.compile(r"\[render\] skip draw=\d+ fs=([0-9a-f]+): fragment shader req
 # reporting admitted=0 across a whole corpus while 43 admit lines sat in the logs.
 ADMIT = re.compile(r"\[render\] native-width fragment vote: subgroup (\d+) -> (\d+) "
                    r"\(why=(\S+?)[ )]")
+# "[render] partial-wave fragment: subgroup 64 -> 32..32 (why=0x43 fs=...)" -- the second admit tier
+# (#3464): a module whose every wave reason is exact on a partially populated guest wave runs at the
+# host's native width. Also emitted INSTEAD of a skip line, so it is counted into `admitted` exactly
+# as the vote tier is, and reported separately so the two tiers can be told apart.
+ADMIT_PARTIAL = re.compile(r"\[render\] partial-wave fragment: subgroup (\d+) -> (\d+)\.\.(\d+) "
+                           r"\(why=(\S+?)[ )]")
 FPS = re.compile(r"\[app\] [\d.]+ fps \((\d+) frames")
 # Belt and braces against the failure that invalidated every routed run before it was noticed: the
 # path is checked before the corpus starts, and the log is checked after each boot, because a file
@@ -155,6 +161,7 @@ def survey(app, dump, seconds, out_dir, route=None):
     for fs_hash, size, mask, names in SKIP.findall(text):
         shaders[fs_hash] = (int(size), mask, names.strip())
     admitted = ADMIT.findall(text)
+    admitted_partial = ADMIT_PARTIAL.findall(text)
     # NOT a "did it draw" test. The fps line prints once per 60 presented frames (main.cpp), so this
     # is 0 for any run that presented fewer than 60 -- which is emphatically not the same as never
     # drawing, and skip lines are emitted from the submit path independently of presentation. It is
@@ -175,7 +182,8 @@ def survey(app, dump, seconds, out_dir, route=None):
         "exited_early": exited_early,
         "returncode": proc.returncode,
         "refused_shaders": len(shaders),
-        "admitted_shaders": len(admitted),
+        "admitted_shaders": len(admitted) + len(admitted_partial),
+        "admitted_partial_wave_shaders": len(admitted_partial),
         "reasons": collections.Counter("%s %s" % (m, n) for _, m, n in shaders.values()),
         "widths": sorted({s for s, _, _ in shaders.values()}),
         "log": str(log),

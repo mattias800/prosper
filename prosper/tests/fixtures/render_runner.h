@@ -608,6 +608,12 @@ struct BackendDraw {
     // incidental: gpu_replay gates on expected_output_hash, and an earlier draft of #3480 keyed this
     // on an env var instead, which admitted in replay and moved its per-submit hash.
     bool allow_native_fragment_vote_width = false;
+    // Whether the backend may run a fragment program whose wave reasons are all exact on a partially
+    // populated guest wave (rdna2_to_spirv.hpp, kFragmentWavePartialWaveExactReasons) at the host's
+    // native width when the host cannot supply the guest wave. Same default and the same reason for
+    // it as the flag above: only the live renderer sets it, so tests opt in explicitly and gpu_replay
+    // keeps its strict per-submit hashes (#3464).
+    bool allow_partial_wave_fragment = false;
     // Stable semantic draw ID from DrawItem::draw_index. Diagnostics must not use this backend
     // vector's pass-local offset: target/compute splitting can make that offset differ per pass.
     uint64_t draw_index = UINT64_MAX;
@@ -8985,7 +8991,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             }
         };
 
-        if (fragment_subgroup_skip && bd.allow_native_fragment_vote_width &&
+        if (fragment_subgroup_skip &&
+            (bd.allow_native_fragment_vote_width || bd.allow_partial_wave_fragment) &&
             (ctx.subgroup_stages & VK_SHADER_STAGE_FRAGMENT_BIT) &&
             prosper::gpu::fragment_subgroup_features_supported(
                 required_fragment_subgroup_features,
@@ -9009,19 +9016,42 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             // exactly WaveAny are provably width-independent and 11 are not, and the split runs
             // through titles rather than between them (Blue Prince 18 of 22, Blasphemous 2 1 of 8).
             // A title-wide answer would be wrong in both directions.
-            if (subgroup_reasons == prosper::gpu::kFragmentWaveReasonWaveAny &&
-                prosper::gpu::fragment_spirv_wave_width_independent(bd_fs)) {
+            //
+            // The second tier (#3464) admits by what the lowering is exact FOR rather than by proving
+            // the width cannot matter: a host subgroup narrower than the guest wave is itself a legal
+            // guest wave whose upper lanes are unpopulated, and lane id, vote, ballot and MBCNT all
+            // compute that wave's answer exactly. The argument, and what it deliberately leaves out,
+            // is at kFragmentWavePartialWaveExactReasons. Checked first because it needs no module
+            // analysis; the vote tier remains for the opt-out A/B (PROSPER_NO_PARTIAL_WAVE_FRAGMENT).
+            const bool partial_wave_exact = bd.allow_partial_wave_fragment &&
+                prosper::gpu::fragment_wave_exact_on_partial_wave(
+                    subgroup_reasons, required_fragment_subgroup_size,
+                    ctx.min_subgroup_size, ctx.max_subgroup_size);
+            if (partial_wave_exact ||
+                (bd.allow_native_fragment_vote_width &&
+                 subgroup_reasons == prosper::gpu::kFragmentWaveReasonWaveAny &&
+                 prosper::gpu::fragment_spirv_wave_width_independent(bd_fs))) {
                 const uint64_t shader_key = bd.fs_identity
                     ? bd.fs_identity : hash_buffer_words(bd_fs.data(), bd_fs.size());
                 static std::mutex native_width_log_mutex;
                 static std::unordered_set<uint64_t> native_width_logged;
                 std::lock_guard<std::mutex> lock(native_width_log_mutex);
                 if (native_width_logged.insert(shader_key).second) {
-                    std::fprintf(stderr,
-                                 "[render] native-width fragment vote: subgroup %u -> %u "
-                                 "(why=0x%x fs=%016llx)\n",
-                                 required_fragment_subgroup_size, ctx.max_subgroup_size,
-                                 subgroup_reasons, (unsigned long long)shader_key);
+                    // Two spellings, one per tier, so a survey can count them separately. The
+                    // first is unchanged: skip_survey.py and the census tools key on it.
+                    if (partial_wave_exact)
+                        std::fprintf(stderr,
+                                     "[render] partial-wave fragment: subgroup %u -> %u..%u "
+                                     "(why=0x%x fs=%016llx)\n",
+                                     required_fragment_subgroup_size, ctx.min_subgroup_size,
+                                     ctx.max_subgroup_size, subgroup_reasons,
+                                     (unsigned long long)shader_key);
+                    else
+                        std::fprintf(stderr,
+                                     "[render] native-width fragment vote: subgroup %u -> %u "
+                                     "(why=0x%x fs=%016llx)\n",
+                                     required_fragment_subgroup_size, ctx.max_subgroup_size,
+                                     subgroup_reasons, (unsigned long long)shader_key);
                     dump_fragment_wave_module("admitted", shader_key, subgroup_reasons);
                 }
                 // Omitting the required-size pNext below selects the device's native fragment

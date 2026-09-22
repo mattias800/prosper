@@ -2994,6 +2994,16 @@ endif()
       set_tests_properties(game_compute_exec_scratch_poison PROPERTIES
         ENVIRONMENT "PROSPER_DECODE_SCRATCH_POISON=1")
 
+      # #3464: registered on Windows as well as in the UNIX block below, deliberately. The tier it
+      # exercises exists for hosts that cannot supply a 64-lane fragment subgroup -- NVIDIA is the
+      # one this project runs on -- so a UNIX-only registration would execute it on RADV, where the
+      # tier is never reached, and on lavapipe, but never on the hardware it was written for.
+      add_executable(test_fragment_partial_wave_exec tests/gpu/execute/test_fragment_partial_wave_exec.cpp)
+      target_include_directories(test_fragment_partial_wave_exec PRIVATE tests frontends)
+      target_link_libraries(test_fragment_partial_wave_exec PRIVATE prosper_live_renderer)
+      add_test(NAME fragment_partial_wave_exec COMMAND test_fragment_partial_wave_exec)
+      set_tests_properties(fragment_partial_wave_exec PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+
       # #3425: registered on Windows as well as in the UNIX block below, deliberately. This
       # defect is about the WINDOWS/NVIDIA frontend's _Exit path and the cost it recovers was
       # measured there (#3450), so a Linux-only guard would test the fix everywhere except
@@ -3636,6 +3646,15 @@ endif()
       target_link_libraries(test_fragment_loop_mask_exec PRIVATE prosper_core Vulkan::Vulkan)
       add_test(NAME fragment_loop_mask_exec COMMAND test_fragment_loop_mask_exec)
       set_tests_properties(fragment_loop_mask_exec PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+
+      # A Wave64 lane-id/ballot/MBCNT/vote pixel shader executed on this device's own fragment
+      # subgroup, narrower than the guest wave included (#3464's partial-wave tier). Checks are
+      # invariant under any grouping of pixels into waves.
+      add_executable(test_fragment_partial_wave_exec tests/gpu/execute/test_fragment_partial_wave_exec.cpp)
+      target_include_directories(test_fragment_partial_wave_exec PRIVATE tests frontends)
+      target_link_libraries(test_fragment_partial_wave_exec PRIVATE prosper_core Vulkan::Vulkan)
+      add_test(NAME fragment_partial_wave_exec COMMAND test_fragment_partial_wave_exec)
+      set_tests_properties(fragment_partial_wave_exec PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
 
       # Render a frame where BOTH vertex + pixel shaders are recompiled from RDNA2.
       add_executable(test_recompiled_shaders tests/gpu/recompiler/test_recompiled_shaders.cpp)

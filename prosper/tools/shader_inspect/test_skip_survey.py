@@ -109,6 +109,21 @@ def main() -> int:
     # The two must not overlap: an admit line counted as a refusal would invert the finding it
     # exists to report.
     check("ADMIT does not match a skip line", not skip_survey.ADMIT.findall(skip_line))
+    # The partial-wave tier (#3464) is a second admit line with its own shape; pinned the same way
+    # against the emitter's format string, so the admitted column cannot silently lose that tier.
+    check("the partial-wave admit emitter still exists with the fields ADMIT_PARTIAL reads",
+          '"[render] partial-wave fragment: subgroup %u -> %u..%u "' in rr and
+          '"(why=0x%x fs=%016llx)' in rr,
+          "-- the partial-wave admit line changed shape; its shaders would vanish from `admitted`")
+    partial_line = ("[render] partial-wave fragment: subgroup 64 -> 32..32 "
+                    "(why=0x43 fs=00000000000000b7)")
+    check("ADMIT_PARTIAL extracts the widths and reason from a real partial-wave line",
+          skip_survey.ADMIT_PARTIAL.findall(partial_line) == [("64", "32", "32", "0x43")])
+    check("the two admit tiers do not match each other's lines",
+          not skip_survey.ADMIT.findall(partial_line) and
+          not skip_survey.ADMIT_PARTIAL.findall(admit_line))
+    check("ADMIT_PARTIAL does not match a skip line",
+          not skip_survey.ADMIT_PARTIAL.findall(skip_line))
     check("SKIP does not match an admit line", not skip_survey.SKIP.findall(admit_line))
 
     check("FPS extracts the frame count",

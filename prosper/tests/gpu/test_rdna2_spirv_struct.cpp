@@ -7300,6 +7300,54 @@ int main() {
                sizeof(cases) / sizeof(cases[0]));
     }
 
+    // fragment_wave_exact_on_partial_wave (#3464): which reason sets run as a partially populated
+    // guest wave on a host narrower than the guest. Every excluded bit is tried ALONE and together
+    // with an admitted one, so an implementation that tested only "any admitted bit present" fails,
+    // and each host bound is probed on both sides.
+    {
+        struct Case { const char* what; uint32_t reasons, guest, lo, hi; bool expect; };
+        const uint32_t lane = kFragmentWaveReasonLaneId, any = kFragmentWaveReasonWaveAny,
+                       ballot = kFragmentWaveReasonWaveBallot,
+                       reduce = kFragmentWaveReasonScalarReduce;
+        const Case cases[] = {
+            {"GTA V's lane-id + ballot (0x41) on NVIDIA 32..32", lane | ballot, 64, 32, 32, true},
+            {"GTA V's lane-id + vote + ballot (0x43) on NVIDIA", lane | any | ballot, 64, 32, 32,
+             true},
+            {"a vote alone", any, 64, 32, 32, true},
+            {"a vote reaching scalar data", any | reduce, 64, 32, 32, true},
+            {"lane id alone on an 8-lane host", lane, 64, 8, 8, true},
+            {"a variable-width host inside the guest wave", lane | ballot, 64, 8, 32, true},
+            {"a Wave32 program on an 8-lane host", lane | ballot, 32, 8, 8, true},
+            {"host exactly the guest width", lane | ballot, 64, 64, 64, true},
+            {"DPP row alone", kFragmentWaveReasonDppRow16, 64, 32, 32, false},
+            {"DPP row beside a vote", kFragmentWaveReasonDppRow16 | any, 64, 32, 32, false},
+            {"PERMLANEX16 beside lane id", kFragmentWaveReasonPermLane32 | lane, 64, 32, 32,
+             false},
+            {"READLANE beside a ballot", kFragmentWaveReasonReadLane64 | ballot, 64, 32, 32,
+             false},
+            {"a shuffle beside a vote", kFragmentWaveReasonShuffle | any, 64, 32, 32, false},
+            {"an unknown future reason bit", (1u << 8) | any, 64, 32, 32, false},
+            {"absent reasons (pre-#2147 module)", UINT32_MAX, 64, 32, 32, false},
+            {"no reasons at all", 0, 64, 32, 32, false},
+            {"a host WIDER than the guest wave would alias lane ids", lane | ballot, 32, 64, 64,
+             false},
+            {"a host range that reaches past the guest wave", lane | ballot, 32, 32, 64, false},
+            {"an unreported host range", lane | ballot, 64, 0, 0, false},
+            {"an inverted host range", lane | ballot, 64, 32, 16, false},
+            {"a guest wave size that is not 32 or 64", lane | ballot, 16, 8, 8, false},
+        };
+        for (const Case& c : cases) {
+            const bool got = fragment_wave_exact_on_partial_wave(c.reasons, c.guest, c.lo, c.hi);
+            if (got != c.expect) {
+                printf("  [FAIL] partial-wave exactness: %s -> %d, expected %d\n", c.what,
+                       got ? 1 : 0, c.expect ? 1 : 0);
+                return 1;
+            }
+        }
+        printf("  [ok]   partial-wave exactness: %zu reason/host combinations classified\n",
+               sizeof(cases) / sizeof(cases[0]));
+    }
+
     printf("== PASS ==\n");
     return 0;
 }

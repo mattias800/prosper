@@ -19,6 +19,23 @@ from the tracker issues, and still gated, because it is a projection of state ra
 > title's current state — for that, read the tracker. Nothing is ever removed when a title moves on,
 > because the point of a blog is that it records *when* things happened.
 
+## 2026-09-23
+
+### GTA V's world renders on NVIDIA again
+
+On Windows/NVIDIA the prologue bank was a HUD over black: the GPU runs 32 lanes where the game's
+pixel shaders ask for 64, and all 187 such shaders were being dropped. They now run as 64-lane
+waves that simply have their upper half empty. Same binary, same route, only that switch changed.
+[#3464](https://github.com/mattias800/prosper/issues/3464).
+
+![GTA V on Windows/NVIDIA before: HUD and radar over a black world](assets/screenshots/gta5-nvidia-partial-wave-before.webp)
+![GTA V on Windows/NVIDIA after: the bank lobby, masked gunman, security door and counter, lit](assets/screenshots/gta5-nvidia-partial-wave-after.webp)
+![GTA V on Windows/NVIDIA after: the same lobby with the Go to the guard prompt](assets/screenshots/gta5-nvidia-partial-wave-after-guard.webp)
+
+The route's graphics-mode press is not deterministic: these runs landed on **Performance RT**, and a
+later one on Performance. The world renders in both.
+
+![GTA V Display settings on a fresh save: Graphics Mode reads Performance RT](assets/screenshots/gta5-route-fresh-save-performance-rt.webp)
 ## 2026-09-22
 
 ### Kena: Bridge of Spirits reaches its main menu
