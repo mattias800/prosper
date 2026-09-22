@@ -1427,6 +1427,13 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
         !PROSPER_ENV_VALUE("PROSPER_STRICT_FRAGMENT_WAVE_WIDTH") &&
         std::any_of(std::begin(kNativeFragmentVoteTitles), std::end(kNativeFragmentVoteTitles),
                     [&](const char* id) { return title_id == id; });
+    // The partial-wave tier (#3464, rdna2_to_spirv.hpp kFragmentWavePartialWaveExactReasons) rides on
+    // the same title list for now, so every title it can change is one with a surveyed before/after
+    // route. Its argument does not depend on the title, which is why a later change can retire the
+    // list; that is a separate, cross-title decision. The opt-out isolates THIS tier for an A/B on one
+    // binary: set it and the renderer behaves exactly as it did before the tier existed.
+    const bool partial_wave_fragment = native_fragment_vote_width &&
+        !PROSPER_ENV_VALUE("PROSPER_NO_PARTIAL_WAVE_FRAGMENT");
     // Create (and thereby PUBLISH) the renderer's Vulkan device up front so the compute backend can
     // adopt it (#1091). Compute initializes lazily on its first dispatch, and titles routinely
     // dispatch before their first draw -- without this the compute device would be created first and
@@ -2053,7 +2060,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
     if (batch_backend_submits)
         fprintf(stderr, "[render] backend target-submit batching enabled (experimental)\n");
     prosper::gpu::set_submit_renderer(
-        [frame_dir, dump_bmps, invalidate_ds, native_fragment_vote_width](const std::vector<prosper::gpu::DrawItem>& items,
+        [frame_dir, dump_bmps, invalidate_ds, native_fragment_vote_width,
+         partial_wave_fragment](const std::vector<prosper::gpu::DrawItem>& items,
                                uint32_t w, uint32_t h) -> prosper::gpu::RenderedFrame {
             using RC = prosper::gpu::ResourceClass;
             // #2215 instrument: publish which thread is inside a submit-render callback right
@@ -8749,6 +8757,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     bd.fs_identity = fs_ov ? 0 : it.fs_identity;
                     bd.allow_native_fragment_vote_width =
                         !fs_ov && native_fragment_vote_width;
+                    bd.allow_partial_wave_fragment = !fs_ov && partial_wave_fragment;
                     bd.draw_index = it.draw_index;
                     bd.command_order = it.command_order;
                     bd.vcount = refvs ? 3u : it.vertex_count;

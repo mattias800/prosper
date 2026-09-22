@@ -639,6 +639,62 @@ inline constexpr uint32_t kFragmentWaveReasonWaveBallot = 1u << 6;  // OpGroupNo
 // route cannot accidentally admit a scalar reduction.
 inline constexpr uint32_t kFragmentWaveReasonScalarReduce = 1u << 7;
 
+// Reasons whose lowering is exact on a PARTIALLY POPULATED guest wave (#3464).
+//
+// The fact this rests on: prosper has never reproduced the PS5's assignment of pixels to waves, on
+// any host. At a native 64-lane subgroup on RADV it is the HOST rasterizer that decides which pixels
+// share a wave, and at primitive edges it launches fewer than 64. So the contract every fragment
+// lowering already meets is "the guest wave is the host subgroup, and the guest lanes it did not
+// launch are unpopulated": EXEC starts as exactly the launched lanes, a ballot carries zero for the
+// others, a vote reduces over the launched ones. A host subgroup of S < 64 invocations is a guest
+// wave of that same kind whose lanes S..63 are unpopulated -- the wave a PS5 launches for any
+// primitive that does not fill one. Nothing the guest program can observe tells the two apart.
+//
+// The lowerings named below compute exactly that wave's answer, because their lane arithmetic never
+// names a lane outside [0, S): the lane id is SubgroupLocalInvocationId (< S); a lane below 32 reads
+// the LOW half of a 64-bit mask, and the HIGH half of a ballot over a subgroup of at most 32 is zero,
+// which is precisely the high half of that wave's EXEC; a vote and an MBCNT reduce or scan over the
+// same launched set the ballot reports. So the module runs as a correct guest Wave64 program; it is
+// the WAVE that is smaller, not the semantics that are approximate.
+//
+// Why the counterexample that stopped #2404, #2410, #2984 and the first form of #3480 does not apply:
+// "let the predicate be true in the upper 32 lanes and false in the lower, then two 32-lane votes
+// disagree with one 64-lane vote" presupposes a particular set of 64 pixels that forms one wave. No
+// host reproduces that set -- RADV at 64 included -- so a result that depends on it is not reproduced
+// at 64 today either. What IS guaranteed at every width is that each subgroup answers as some wave
+// the guest could have been given. A guest program whose pixels depend on which pixels its
+// rasterizer happened to group has no single image to reproduce, on this host or any other.
+//
+// Deliberately NOT here: DPP rows, PERMLANE, READLANE and shuffles read ANOTHER lane's register by
+// index, and below 64 lanes that index can name a lane outside the subgroup. SPIR-V returns an
+// undefined value there, where the guest ISA returns zero or that lane's register. Each is exact only
+// for the index range the host holds (a DPP row at S >= 16, PERMLANEX16 at S >= 32), which is its
+// own change with its own execution tests.
+//
+// A limitation this SHARES with the native path rather than introduces: a mask the guest builds from
+// a constant or by complement (`s_mov_b64 exec, -1`, `s_not_b64`) is represented per launched lane,
+// so its bits for unpopulated lanes read back as zero where hardware would read one. That already
+// held at 64 for every partially filled wave; below 64 it holds for every wave. CONFIDENCE: HIGH for
+// the lowerings above, MED for that shared constant-mask read-back.
+inline constexpr uint32_t kFragmentWavePartialWaveExactReasons =
+    kFragmentWaveReasonLaneId | kFragmentWaveReasonWaveAny | kFragmentWaveReasonWaveBallot |
+    kFragmentWaveReasonScalarReduce;
+
+// Whether a fragment module recording `reasons` for a `guest_wave_size`-lane contract runs as a
+// correct partially populated guest wave on a host whose fragment subgroups hold host_min..host_max
+// invocations. Absent reasons (UINT32_MAX, a pre-#2147 module) are never admitted: absent is not
+// none. The host may not exceed the guest wave, because the lowerings fold the lane id with
+// `& (wave_size - 1)` and a wider subgroup would give two invocations one guest lane.
+inline constexpr bool fragment_wave_exact_on_partial_wave(uint32_t reasons,
+                                                          uint32_t guest_wave_size,
+                                                          uint32_t host_min, uint32_t host_max) {
+    if (reasons == UINT32_MAX || reasons == 0) return false;
+    if (reasons & ~kFragmentWavePartialWaveExactReasons) return false;
+    if (guest_wave_size != 32 && guest_wave_size != 64) return false;
+    if (host_min == 0 || host_min > host_max) return false;
+    return host_max <= guest_wave_size;
+}
+
 // Reasons recorded by the emitter, or UINT32_MAX when the module carries no reason marker at
 // all (built, cached or captured before #2147). Absent must not read as none.
 // Whether this fragment module's wave votes answer the same at a narrower subgroup width.
