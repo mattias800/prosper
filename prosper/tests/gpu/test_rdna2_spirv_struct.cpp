@@ -6624,7 +6624,8 @@ int main() {
         printf("  [FAIL] Float32 graphics IMAGE_LOAD dropped its explicit layer\n");
         return 1;
     }
-    for (uint32_t opcode : {0x25u, 0x22u, 0x37u, 0x47u, 0x57u}) {
+    // 0x47 (GATHER4_LZ) and 0x57 (GATHER4_LZ_O) now preserve array layers.
+    for (uint32_t opcode : {0x25u, 0x22u, 0x37u}) {
         std::vector<uint32_t> unsupported(std::begin(ps_sample_array_l), std::end(ps_sample_array_l));
         unsupported[7] = 0xf0000128u | (opcode << 18); // single-component dmask, array DIM
         if (!recompile_fragment(unsupported.data(), unsupported.size(), &rt_float_array).empty()) {

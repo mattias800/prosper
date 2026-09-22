@@ -181,7 +181,8 @@ using RttCache = std::unordered_map<uint64_t, RttSurf>;
 // A failed array binding can recur on every draw. Bound routine diagnostics while preserving
 // the first rejection at each site; the opt-in full log remains available for investigation.
 bool log_array_rejection(uint32_t& count, const char* site) {
-    static const bool full_log = PROSPER_ENV_ON("PROSPER_ARRAY_REJECT_LOG_ALL");
+    // Tests arm this between submits; a process-lifetime cache would make the arm vacuous.
+    const bool full_log = std::getenv("PROSPER_ARRAY_REJECT_LOG_ALL") != nullptr;
     if (full_log) return true;
     constexpr uint32_t Limit = 64;
     if (count < Limit) { ++count; return true; }
@@ -3090,16 +3091,16 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             (unsigned long long)reads, (unsigned long long)reuses,
                             (unsigned long long)payload_bytes, (unsigned long long)producer_flushes);
                 }
-            } depth_array_census{PROSPER_ENV_ON("PROSPER_DEPTH_ARRAY_SNAPSHOT_CENSUS")};
+            } depth_array_census{std::getenv("PROSPER_DEPTH_ARRAY_SNAPSHOT_CENSUS") != nullptr};
             std::vector<DepthArraySnapshot> depth_array_snapshots;
             size_t depth_array_snapshot_bytes = 0;
             bool depth_array_snapshot_admitted = false;
             constexpr size_t kDepthArraySnapshotEntries = 16;
             constexpr size_t kDepthArraySnapshotBytes = 128u * 1024u * 1024u;
             const bool reuse_depth_arrays_across_draws =
-                !PROSPER_ENV_ON("PROSPER_NO_SUBMIT_DEPTH_ARRAY_SNAPSHOT_REUSE");
+                std::getenv("PROSPER_NO_SUBMIT_DEPTH_ARRAY_SNAPSHOT_REUSE") == nullptr;
             const bool compact_depth_array_snapshots =
-                !PROSPER_ENV_ON("PROSPER_NO_COMPACT_DEPTH_ARRAY_SNAPSHOT");
+                std::getenv("PROSPER_NO_COMPACT_DEPTH_ARRAY_SNAPSHOT") == nullptr;
             const auto clear_depth_array_snapshots = [&] {
                 depth_array_snapshots.clear();
                 depth_array_snapshot_bytes = 0;
