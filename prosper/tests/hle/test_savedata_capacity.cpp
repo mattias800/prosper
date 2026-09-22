@@ -236,9 +236,15 @@ int main(int argc, char** argv) {
         CHECK(mount3("Persist", MODE_CREATE | MODE_RDWR, 333) == 0, "[G] create 'Persist' with 333 blocks");
         write_file(fs::path(savedata0_mounted_dir()) / "one.bin", 1);
         umount();
-        const std::string cmd = "\"" + std::string(argv[0]) + "\" --child \"" + save_root.string() +
-                                "\" \"" + app_a + "\"";
+        std::string cmd = "\"" + std::string(argv[0]) + "\" --child \"" + save_root.string() +
+                          "\" \"" + app_a + "\"";
+#ifdef _WIN32
+        // cmd.exe /c strips the first and last quote of a line that starts with one, so a command
+        // whose program path is quoted needs one more pair around the whole line.
+        cmd = "\"" + cmd + "\"";
+#endif
         const int rc = std::system(cmd.c_str());
+        if (rc != 0) printf("  (child exit status %d)\n", rc);
         CHECK(rc == 0, "[D] a new process opening the save reports the allocation this one created it with");
     }
 
@@ -330,9 +336,17 @@ int main(int argc, char** argv) {
 
     // --------------------------------------------- arm 11: bookkeeping is invisible to the guest
     {
+        // savedata0_list_dirs reports no saves on a Windows host at all (hle_file.cpp: "Windows host
+        // is secondary"), so the POSITIVE half -- that real saves are listed -- is POSIX-only there.
+        // The half this issue owns, that the bookkeeping directory is never listed, holds everywhere.
+#ifdef _WIN32
+        constexpr bool kHostEnumerates = false;
+#else
+        constexpr bool kHostEnumerates = true;
+#endif
         const std::vector<std::string> dirs = savedata0_list_dirs();
         CHECK(std::find(dirs.begin(), dirs.end(), kSaveCapacityDirName) == dirs.end() &&
-                  std::find(dirs.begin(), dirs.end(), "Usage") != dirs.end(),
+                  (!kHostEnumerates || std::find(dirs.begin(), dirs.end(), "Usage") != dirs.end()),
               "[D] enumeration lists the saves and not the bookkeeping directory");
         uint8_t res[0x30] = {};
         char names[64][32] = {};
@@ -346,7 +360,8 @@ int main(int argc, char** argv) {
         bool leaked = false;
         for (uint32_t k = 0; k < hits && k < 64; ++k)
             if (std::string(names[k]) == kSaveCapacityDirName) leaked = true;
-        CHECK(hits > 0 && !leaked, "[D] DirNameSearch never reports the bookkeeping directory");
+        CHECK((!kHostEnumerates || hits > 0) && !leaked,
+              "[D] DirNameSearch never reports the bookkeeping directory");
         CHECK(mount3(kSaveCapacityDirName, MODE_RDWR, 0) != 0,
               "[D] the bookkeeping directory cannot be mounted as a save");
         CHECK(info().rc == ERR_NOT_MOUNTED, "[G] ...and nothing is mounted afterwards");
