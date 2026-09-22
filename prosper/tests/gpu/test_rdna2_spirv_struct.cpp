@@ -6584,6 +6584,35 @@ int main() {
         return 1;
     }
 
+    // The same multi-layer Float32 T# can be read through an ordinary DIM=2D instruction.
+    // A retained renderer color target owns only its base slice; the renderer can serve that
+    // read through a 2D view, but must reject a real array read until all layers are owned.
+    const uint32_t ps_float_base_sample_l[] = {
+        0x7e0002ffu, 0x3f000000u, 0x7e0202ffu, 0x3f000000u,
+        0x7e0402ffu, 0x3f800000u, 0x7e060280u,
+        0xf0900f08u, 0x00400000u, // same binding as DIM=5 arm, ordinary DIM=2D
+        0xf800000fu, 0x03020100u, 0xbf810000u,
+    };
+    const auto float_base_spv = recompile_fragment(
+        ps_float_base_sample_l, std::size(ps_float_base_sample_l), &rt_float_array);
+    const auto float_base_report = validate_spirv_descriptor_interface(
+        float_base_spv, &rt_float_array, 1, SpirvShaderStage::Fragment);
+    const SpirvDescriptorBinding* float_base_descriptor = nullptr;
+    for (const auto& descriptor : float_base_report.descriptors)
+        if (descriptor.binding == 4u &&
+            descriptor.kind == SpirvDescriptorKind::CombinedImageSampler)
+            float_base_descriptor = &descriptor;
+    if (float_base_spv.empty() || !float_base_descriptor ||
+        float_base_descriptor->image_dim != 1u || float_base_descriptor->image_arrayed ||
+        !float_base_report.ok() || !float_base_report.issues.empty()) {
+        printf("  [FAIL] ordinary DIM=2D read of layered Float32 T# lost its retained base-slice view "
+               "(words=%zu descriptor=%d arrayed=%d issues=%zu)\n",
+               float_base_spv.size(), float_base_descriptor != nullptr,
+               float_base_descriptor ? float_base_descriptor->image_arrayed : false,
+               float_base_report.issues.size());
+        return 1;
+    }
+
     const uint32_t ps_float_array_load[] = {
         0x7e000280u, 0x7e020280u, 0x7e040282u, // integer x=0, y=0, layer=2
         0xf0000f28u, 0x00000000u,

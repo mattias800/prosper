@@ -21,11 +21,10 @@ namespace prosper::gpu {
 // not block-compressed).
 uint32_t bc_block_bytes(DataFormat f);
 
-// #325: is this sampled T# one prosper uploads as a real Vulkan array, with the shader indexing its
-// layers? THE UPLOADER AND THE RECOMPILER MUST ANSWER THIS IDENTICALLY -- the uploader picks the
-// image view type from it and the recompiler picks OpTypeImage's Arrayed flag from it, and a
-// disagreement between the two is a descriptor mismatch rather than a wrong pixel. That is why it
-// is written once here instead of being spelled out at each site.
+// #325: can this sampled T# be uploaded as a real Vulkan array? BC graphics bindings use this
+// resource-wide shape. A layered Float32 graphics binding consumed only through DIM=2D instead
+// uses a base-slice 2D view, selected from reflection by live_renderer; a DIM=5 consumer uses
+// the full array. The shader declaration and selected uploader view must agree.
 //
 // BC arrays decode to RGBA8; Float32 arrays expand to RGBA32F without narrowing.
 // This is a descriptor-shape contract, independent of source residency or decode budget.

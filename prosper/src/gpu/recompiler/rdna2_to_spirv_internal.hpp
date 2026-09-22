@@ -1071,11 +1071,10 @@ struct SpirvCompute {
         return true;
     }
     // The sampling coordinate for `binding`, with the array layer appended when the binding was
-    // DECLARED arrayed. #325: arrayed-ness is a property of the RESOURCE (a guest 2D_ARRAY T#), not
-    // of the instruction, because the uploader chooses the view type from the resource and cannot
-    // see which opcode will sample it. So a non-array instruction reaching an array texture must
-    // still produce a three-component coordinate -- and layer 0 is exactly the base slice it used
-    // to get from the old base-slice 2D view, so behaviour is preserved where it was already right.
+    // DECLARED arrayed. #325: BC arrays use the resource-wide T# shape, so a non-array
+    // instruction reaching one gets layer zero. Layered Float32 graphics bindings may instead
+    // declare a 2D base-slice view for an ordinary 2D instruction; the renderer follows that
+    // declaration when choosing the actual view.
     bool tex_is_arrayed(uint32_t binding);
     uint32_t tex_coord_uv(uint32_t binding, uint32_t u_bits, uint32_t v_bits);
     uint32_t texture_vec4(uint32_t binding) {
