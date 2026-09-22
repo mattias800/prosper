@@ -103,3 +103,11 @@ Both headers take the variable's NAME as a literal argument, and `check_cached_e
 callee containing `env` as an environment WRITE — so a new reader here has to be added to that
 script's `ENV_READERS` set or it reads as an arming. That coupling is the one non-obvious thing about
 adding a function to this pair.
+
+`exit_reports.{hpp,cpp}` is always-reachable for the same reason. It is the registry for **end-of-run
+reports**: anything that summarises a run when it ends registers there instead of calling
+`std::atexit` directly. Almost no run here returns from `main()`. `prosper-app`, `tools/screenshot`,
+`boot_trace`'s host-exception path and the guest's own exit all terminate with `_Exit`/`_exit`, which
+skip atexit handlers, and each of them calls `flush_exit_reports()` first. Before #3353 a bare atexit
+report was silent on all of those paths, and the silence read as a zero. SIGTERM and signal-context
+exits are still not covered, so a number that must survive a killed run needs a periodic report too.

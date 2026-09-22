@@ -60,6 +60,37 @@ def check(name: str, got, want, extra: str = "") -> None:
         print(f"  FAIL {name}: got {got!r}, want {want!r} {extra}")
 
 
+def tree_of(t) -> str | None:
+    """The DIRECTORY a returned Worktree names, by identity -- or None when nothing was returned.
+
+    `git worktree list` records a worktree's path canonicalised, so `.path` is spelled with every
+    symlink resolved. Comparing that string against the path the test built its fixture under fails
+    whenever the scratch root has a symlink in it -- TMPDIR under `$HOME` on this box, where `/home`
+    is a symlink to `/var/home` -- even though the tool attributed to exactly the right tree. That
+    was #3730: the four failing arms were the four spelling comparisons, deterministically, and
+    "load" was the confound (the suite runs that failed had TMPDIR on real disk under $HOME, the
+    quiet reruns did not). The assertion is about WHICH tree, so compare identities.
+    """
+    return os.path.realpath(t.path) if t is not None else None
+
+
+def same_tree(p: Path) -> str:
+    return os.path.realpath(str(p))
+
+
+def wait_exit(proc: subprocess.Popen, timeout: float = 10.0):
+    """poll() until the process has exited or `timeout` elapses; returns the final poll().
+
+    A fixed sleep after sending a signal is a guess about how quickly a loaded box delivers it and
+    reaps the child. Waiting up to a bound is not weaker: a process that was never signalled still
+    reads as alive after the full timeout, so the assertion fails exactly as before.
+    """
+    deadline = time.monotonic() + timeout
+    while proc.poll() is None and time.monotonic() < deadline:
+        time.sleep(0.05)
+    return proc.poll()
+
+
 def git(repo: Path, *args: str) -> str:
     p = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True)
     if p.returncode != 0:
@@ -97,10 +128,10 @@ def test_attribution_separates_two_trees(root: Path) -> None:
     try:
         trees = list_worktrees(str(repo))
         mine = lanekill.my_worktree(trees, str(a))
-        check("run from wt-a attributes to wt-a", mine.path if mine else None, str(a))
+        check("run from wt-a attributes to wt-a", tree_of(mine), same_tree(a))
 
         other = lanekill.my_worktree(trees, str(b))
-        check("run from wt-b attributes to wt-b", other.path if other else None, str(b))
+        check("run from wt-b attributes to wt-b", tree_of(other), same_tree(b))
         check("the two trees are distinct", mine.real != other.real, True)
     finally:
         for p in procs:
@@ -124,8 +155,8 @@ def test_symlinked_cwd_still_attributes(root: Path) -> None:
     trees = list_worktrees(str(repo))
     via_real = lanekill.my_worktree(trees, str(wt))
     via_link = lanekill.my_worktree(trees, str(alias))
-    check("attributes via the real path", via_real.path if via_real else None, str(wt))
-    check("attributes via a symlinked path", via_link.path if via_link else None, str(wt))
+    check("attributes via the real path", tree_of(via_real), same_tree(wt))
+    check("attributes via a symlinked path", tree_of(via_link), same_tree(wt))
 
     # And the negative direction: a sibling directory that merely SHARES A PREFIX with the
     # worktree name must not attribute. `wt-real-extra` starts with `wt-real`, so a naive
@@ -295,7 +326,7 @@ def test_end_to_end_spares_the_other_lane(root: Path) -> None:
                              cwd=str(a), capture_output=True, text=True)
         time.sleep(0.5)
         check("--yes returns 1 having refused one", run.returncode, 1)
-        check("MY process was signalled", mine.poll() is not None, True)
+        check("MY process was signalled", wait_exit(mine) is not None, True)
         check("THE OTHER LANE'S process survived", other.poll(), None)
         check("output names the other lane", "ANOTHER LANE" in run.stdout, True)
         check("a LOOKALIKE name in my own tree is untouched", lookalike.poll(), None)
@@ -362,7 +393,7 @@ def test_any_tree_sweeps_undecidable_too(root: Path) -> None:
             [sys.executable, str(HERE / "lanekill.py"), "psplit", "--yes", "--any-tree"],
             cwd=str(a), capture_output=True, text=True)
         time.sleep(0.5)
-        check("--any-tree signals the undecidable match", proc.poll() is not None, True)
+        check("--any-tree signals the undecidable match", wait_exit(proc) is not None, True)
         check("--any-tree exits 0 having refused nothing", sweep.returncode, 0)
     finally:
         if proc.poll() is None:
