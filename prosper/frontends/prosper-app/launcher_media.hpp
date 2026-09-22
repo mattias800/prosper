@@ -518,4 +518,18 @@ inline float resolve_launcher_music_gain(const char* env, float fallback = kDefa
     return static_cast<float>(v);
 }
 
+// What the launcher music actually plays at, once prosper-app's `--volume` is applied (#3499).
+//
+// `--volume` is the PROCESS attenuator: it scales everything prosper-app emits, the title's audio-out
+// ports and the launcher's own music alike. It used to reach only the guest's ports (SDL device gain
+// on each sceAudioOut logical device), so `--volume 0` silenced the title and left the launcher
+// playing -- a flag named `--volume` that a user reasonably reads as "how loud is this program".
+// The launcher's own level (kDefaultMusicGain / PROSPER_LAUNCHER_MUSIC_VOLUME) is a mix choice made
+// UNDER that amplifier, so the two multiply rather than one replacing the other. Both factors clamp
+// to [0,1] and a NaN reads as silence, so no input can amplify or produce a non-finite gain.
+inline float launcher_music_output_gain(float music_gain, float process_volume) {
+    auto unit = [](float v) { return (v > 0.0f) ? (v < 1.0f ? v : 1.0f) : 0.0f; };   // NaN -> 0
+    return unit(music_gain) * unit(process_volume);
+}
+
 } // namespace prosper::frontend
