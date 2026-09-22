@@ -18,6 +18,7 @@
 #include <cstdarg>
 #include <cstring>
 #include <cstdio>
+#include <type_traits>
 #include <cstdlib>
 #include <functional>
 #include <map>
@@ -1980,6 +1981,72 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                                        b.ibin(Op_ShiftRightLogical, word, bit), b.uconst(1)),
                                 b.uconst(0));
                         }
+                    }
+                    // Name WHICH representation is missing. A wave-mask op that cannot resolve
+                    // an operand rejects the whole shader, and the reject line downstream says
+                    // only `mode=unresolved-operand` -- which cannot distinguish these states,
+                    // and they point at different places to look:
+                    //
+                    //   sreg_bool=0, sreg absent     no representation reached here. Could be lost mask
+                    //                                provenance, ordinary scalar data never classified, or a
+                    //                                genuinely undefined register -- this line does not
+                    //                                distinguish them.
+                    //   sreg present, proven         the words are definitely assigned. Necessary for a
+                    //                                scalar-pair projection and NOT sufficient: the wave/lane
+                    //                                contract is a separate question this line is silent on.
+                    //   sreg present, unproven       definite assignment is unproven SOMEWHERE in this
+                    //                                shader. The flag is a broad state property -- it cannot
+                    //                                say which register, which predecessor or which dynamic
+                    //                                path carries a placeholder, so on its own it does not
+                    //                                convict these operands.
+                    //
+                    // So this narrows the question rather than answering it. In particular a missing
+                    // `sreg_bool` entry is compatible with the operand HAVING originated from EXEC/VCC and the
+                    // provenance having been dropped: absence here is not evidence the source was never a mask.
+                    //
+                    // Sonic Frontiers' dropped HDR producer (#2790) reports the third row, which was
+                    // indistinguishable from the other two for a full investigation round. Ungated and deduped
+                    // like [mimg-unresolved] (further down this file): it fires only on a path that has already
+                    // failed, so its volume is bounded by the defect it reports.
+                    //
+                    // The dedup key includes program_address, which matters: every shader has a
+                    // pc 328, so a pc-only key would let the first program to reach one silence
+                    // every later program and attribute its line to a shader nobody is looking at.
+                    // `--retry-failed-stage` used to recompile through an entry point that left
+                    // that field 0, collapsing the key across programs; it now passes the real
+                    // address, so this attributes correctly on both the live and the replay path.
+                    {
+                        static std::mutex probe_mutex;
+                        static std::set<std::tuple<uint64_t, uint32_t, int>> probe_reported;
+                        bool first = false;
+                        {
+                            std::lock_guard lock(probe_mutex);
+                            // Capped like divloop_reject's set: a long-lived process compiling many
+                            // shaders must not grow this without bound. Past the cap the diagnostic
+                            // goes quiet rather than the set growing.
+                            if (probe_reported.size() < 4096)
+                                first = probe_reported.emplace(b.diagnostic.program_address, in.pc,
+                                                               o.value).second;
+                        }
+                        const char* stage_name = b.is_compute  ? "compute"
+                                               : b.is_fragment ? "fragment"
+                                                               : "vertex";
+                        if (first)
+                            std::fprintf(stderr,
+                                "[wave-mask-unresolved] program=0x%llx pc=%u operand=%d kind=%u "
+                                "sreg_bool=%d sreg=%d/%d sreg_input=%d/%d "
+                                "no_placeholders=%d stage=%s wave=%u native_sg=%u\n",
+                                static_cast<unsigned long long>(b.diagnostic.program_address),
+                                in.pc, o.value,
+                                static_cast<unsigned>(
+                                    static_cast<std::underlying_type_t<OperandKind>>(o.kind)),
+                                static_cast<int>(rs.sreg_bool.contains(o.value)),
+                                static_cast<int>(rs.sreg.contains(o.value)),
+                                static_cast<int>(rs.sreg.contains(o.value + 1)),
+                                static_cast<int>(rs.sreg_input.contains(o.value)),
+                                static_cast<int>(rs.sreg_input.contains(o.value + 1)),
+                                static_cast<int>(rs.scalar_presence_has_no_placeholders),
+                                stage_name, b.wave_size, b.native_subgroup_size);
                     }
                     return 0;
                 };
@@ -4996,6 +5063,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // existing s3=1 (one ES vertex, no GS primitive) ABI model.
                 vreg[in.dst.value] = val(in.src[1]);
             } else if ((in.opcode == 0x365 || in.opcode == 0x366) && allow_wave &&
+                       !(in.src[0].kind == OperandKind::InlineInt && in.src[0].value == -1) &&
                        (b.is_compute || b.is_fragment)) {
                 // v_mbcnt_lo/hi_u32_b32 (cross-lane): dst = src1 + count of lanes below this one whose mask
                 // bit (src0) is set, in the low/high 32. The per-lane "mask bit" comes from src0: EXEC
@@ -5024,6 +5092,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // min(L, 32) and HI contributes max(L - 32, 0). No other lane's state is read, so
                 // this form needs neither `allow_wave` nor a subgroup/LDS reduction and stays exact
                 // under divergent control flow — it is the ubiquitous "what is my lane id" idiom,
+                // including when `allow_wave` is true: a reduction counts participating invocations,
+                // whereas this literal mask counts physical bit positions, including inactive ones.
                 // and it is the scalar counterpart of the ngg_logical_lane branch above.
                 // (Sonic Racing: CrossWorlds' compute post chain emits `d7650001,000100c1` =
                 // `v_mbcnt_lo_u32_b32 v1, -1, 0` inside a structured region, where the compute

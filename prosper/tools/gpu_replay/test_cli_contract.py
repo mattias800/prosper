@@ -9,8 +9,10 @@
 #
 # It drives the real binary rather than grepping the source: the point is what an operator SEES.
 import os
+from pathlib import Path
 import subprocess
 import sys
+import tempfile
 
 REPLAY = os.environ.get("PROSPER_GPU_REPLAY_BIN")
 if not REPLAY or not os.path.exists(REPLAY):
@@ -31,12 +33,16 @@ def check(condition, message):
         failures.append(message)
 
 
-def run(args, env_extra=None):
+def run_result(args, env_extra=None):
     env = dict(os.environ)
     env.pop("PROSPER_SHADER_DUMP_SUCCESS", None)
     if env_extra:
         env.update(env_extra)
-    done = subprocess.run([REPLAY] + args, capture_output=True, text=True, env=env, timeout=120)
+    return subprocess.run([REPLAY] + args, capture_output=True, text=True, env=env, timeout=120)
+
+
+def run(args, env_extra=None):
+    done = run_result(args, env_extra)
     return done.stdout + done.stderr
 
 
@@ -79,19 +85,17 @@ check("alias" in raw_block and "--dump-realized-shader" in raw_block,
 compute_raw = legend_line("--dump-compute-raw")
 check("RDNA2" in compute_raw, "--dump-compute-raw is described as producing the guest RDNA2")
 
-# The legend must not restate the absolute claim the notice used to make.
-check("only in the modes that RECOMPILE" in usage,
-      "the usage legend scopes PROSPER_SHADER_DUMP_SUCCESS to the recompiling modes")
+# Direct graphics emitters bypass the executor cache's successful-shader dump hook.
+check("honoured by cached COMPUTE recompiles" in usage and
+      "Graphics recompiles bypass" in usage,
+      "the usage legend scopes PROSPER_SHADER_DUMP_SUCCESS to cached compute recompiles")
 
 # An armed-but-inert diagnostic must announce itself. An empty output directory otherwise reads as
 # "that program never compiled" -- the trap src/gpu/diagnostics/AGENTS.md warns about.
 #
-# But it is inert only in SOME modes, and the first version of this notice claimed it was inert
-# in all of them. --recompile-raw and --retry-failed-* recompile through compute_recompile.hpp ->
-# gpu::recompile_compute_shader_cached, which calls maybe_dump_successful_shader on every exit
-# path, so the variable genuinely works there. A notice that is wrong in one mode is the same
-# wrong-text-at-the-point-of-use defect this whole file exists to guard, one level up -- so both
-# directions are pinned below, not just the warning.
+# Compute --recompile-raw and --retry-failed-stage use recompile_compute_shader_cached, which
+# calls the hook. Graphics retries invoke direct emitters instead, so even successful translation
+# writes nothing through this variable. Pin both directions rather than equating all recompiles.
 
 def notice_block(text):
     """Just the PROSPER_SHADER_DUMP_SUCCESS notice, never the usage synopsis.
@@ -127,11 +131,76 @@ check("--recompile-raw" in armed,
 recompiling = run(["--recompile-raw", "no-such-capture.prgcap"],
                   {"PROSPER_SHADER_DUMP_SUCCESS": "honoured-on-this-path"})
 check(notice_block(recompiling) == "",
-      "--recompile-raw does NOT claim the variable is inert -- it honours it")
+      "--recompile-raw does not claim the variable is inert before knowing its compute stages")
+
+chain = run(["--retry-failed-chain", "0", "no-such-capture.prgcap"],
+            {"PROSPER_SHADER_DUMP_SUCCESS": "unused-for-graphics"})
+check("no file" in notice_block(chain) and "--retry-failed-stage-spv" in notice_block(chain),
+      "graphics chain retry identifies the inactive hook and names explicit SPIR-V export")
 
 quiet = run([])
 check(notice_block(quiet) == "",
       "the notice stays silent when the variable is unset")
+
+# A requested retry export must not be ignored or truncate an existing file on rejection.
+check("SPIR-V" in legend_line("--retry-failed-stage-spv"),
+      "retry export is described as producing SPIR-V")
+with tempfile.TemporaryDirectory(prefix="gpu-replay-retry-") as scratch:
+    directory = Path(scratch)
+    output = directory / "retry.spv"
+    sentinel = b"existing output must survive rejected retries"
+    output.write_bytes(sentinel)
+    export = ["--retry-failed-stage-spv", str(output)]
+    for args, diagnostic, message in [
+        (export, "requires --retry-failed-stage", "retry export requires its stage selector"),
+        (["--retry-failed-stage-spv"], "needs a PATH", "retry export rejects a missing path"),
+        (["--retry-failed-stage-spv", ""], "needs a PATH", "retry export rejects an empty path"),
+        (export + ["--retry-failed-stage", "0:0", "--bundle", "absent.prgbundle"],
+         "requires a standalone capture, not --bundle", "retry export rejects bundle replay"),
+        (export + ["--retry-failed-stage", "0:0", "--retry-failed-chain", "0"],
+         "cannot combine with another terminal diagnostic", "retry export cannot be bypassed by chain retry"),
+    ]:
+        result = run_result(args)
+        check(result.returncode == 2 and diagnostic in result.stderr and
+              output.read_bytes() == sentinel, message)
+
+    fixture_bin = os.environ.get("PROSPER_GPU_REPLAY_FIXTURE_BIN")
+    check(bool(fixture_bin and os.path.exists(fixture_bin)),
+          "CPU retry fixture generator is available")
+    if fixture_bin and os.path.exists(fixture_bin):
+        fixture = subprocess.run([fixture_bin, "--write-retry-fixture", scratch],
+                                 capture_output=True, text=True, timeout=120)
+        check(fixture.returncode == 0, "synthetic retry captures are written without Vulkan")
+        if fixture.returncode != 0:
+            print(fixture.stdout + fixture.stderr)
+        else:
+            args = ["--retry-failed-stage", "0:0"] + export
+            accepted = run_result(args + [str(directory / "accepted.prgcap")])
+            expected = (directory / "expected.spv").read_bytes()
+            check(accepted.returncode == 0 and "contract=accepted" in accepted.stderr and
+                  len(expected) > 20 and expected[:4] == b"\x03\x02\x23\x07" and
+                  output.read_bytes() == expected,
+                  "CPU retry exports the exact successful module before returning")
+            if accepted.returncode != 0:
+                print(accepted.stdout + accepted.stderr)
+            output.write_bytes(sentinel)
+            rejected = run_result(args + [str(directory / "rejected.prgcap")])
+            check(rejected.returncode == 1 and "refusing retry SPIR-V export" in rejected.stderr and
+                  output.read_bytes() == sentinel,
+                  "rejected retry refuses export and preserves existing output")
+            descriptor_rejected = run_result(args + [str(directory / "descriptor-rejected.prgcap")])
+            check(descriptor_rejected.returncode == 1 and
+                  "recompiled resources=1" in descriptor_rejected.stderr and
+                  "contract=rejected" in descriptor_rejected.stderr and
+                  "contract error=undersized buffer" in descriptor_rejected.stderr and
+                  "refusing retry SPIR-V export" in descriptor_rejected.stderr and
+                  output.read_bytes() == sentinel,
+                  "nonempty descriptor-rejected retry refuses export and preserves existing output")
+            unwritable = run_result(["--retry-failed-stage", "0:0", "--retry-failed-stage-spv",
+                                     str(directory / "absent" / "retry.spv"),
+                                     str(directory / "accepted.prgcap")])
+            check(unwritable.returncode == 2 and "cannot write retry SPIR-V" in unwritable.stderr,
+                  "retry export reports output file errors")
 
 print("%d failure(s)" % len(failures))
 sys.exit(1 if failures else 0)

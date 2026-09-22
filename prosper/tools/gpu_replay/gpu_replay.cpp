@@ -78,6 +78,7 @@ void usage(const char* argv0) {
                          "[--dump-failed-shader FAILURE:STAGE PATH] "
                          "[--retry-failed-chain FAILURE] "
                          "[--retry-failed-stage FAILURE:STAGE] "
+                         "[--retry-failed-stage-spv PATH] "
                          "[--dump-compute-resource N:BINDING PATH] "
                          "[--override-compute-resource N:BINDING PATH] "
                          "[--dump-post-compute-resource N:BINDING PATH] "
@@ -96,9 +97,12 @@ void usage(const char* argv0) {
                  "                                      --dump-realized-shader)\n"
                  "  --dump-compute N PATH               recompiled SPIR-V for dispatch N\n"
                  "  --dump-compute-raw N PATH           the guest's raw RDNA2 for dispatch N\n"
-                 "\nPROSPER_SHADER_DUMP_SUCCESS is honoured only in the modes that RECOMPILE\n"
-                 "(--recompile-raw, --retry-failed-*); a plain replay runs stored SPIR-V and\n"
-                 "writes nothing for it. Use the per-draw flags above.\n");
+                 "  --retry-failed-stage-spv PATH       retry output SPIR-V; requires\n"
+                 "                                      --retry-failed-stage and an accepted descriptor contract\n"
+                 "\nPROSPER_SHADER_DUMP_SUCCESS is honoured by cached COMPUTE recompiles in\n"
+                 "--recompile-raw and compute --retry-failed-stage. Graphics recompiles bypass\n"
+                 "this hook; use --retry-failed-stage-spv for graphics retry output.\n"
+                 "A plain replay runs stored SPIR-V and writes nothing for this variable.\n");
 }
 
 // Targets at or below this many texels get a native-typed dump alongside any image conversion.
@@ -2221,6 +2225,7 @@ int main(int argc, char** argv) {
     std::string post_compute_resource_spec, post_compute_resource_path;
     std::string failed_shader_spec, failed_shader_path;
     std::string retry_failed_chain_spec, retry_failed_stage_spec;
+    std::string retry_failed_stage_spv_path;
     std::string list_resources_spec;   // #2373
     std::string realized_shader_spec, realized_shader_path;
     std::string rtt_seed_path;
@@ -2454,35 +2459,53 @@ int main(int argc, char** argv) {
             retry_failed_chain_spec = argv[++i];
         else if (std::string(argv[i]) == "--retry-failed-stage" && i + 1 < argc)
             retry_failed_stage_spec = argv[++i];
+        else if (std::string(argv[i]) == "--retry-failed-stage-spv") {
+            if (i + 1 >= argc || !argv[i + 1][0] || argv[i + 1][0] == '-') {
+                std::fprintf(stderr, "gpu_replay: --retry-failed-stage-spv needs a PATH\n");
+                return 2;
+            }
+            retry_failed_stage_spv_path = argv[++i];
+        }
         else positional.push_back(argv[i]);
     }
     if (legacy_htile_before_stencil)
         set_environment("PROSPER_GPU_REPLAY_LEGACY_HTILE_BEFORE_STENCIL", "1");
-    // #3372, corrected in review: whether gpu_replay reaches maybe_dump_successful_shader()
-    // depends on the MODE, and the first version of this notice asserted it never does.
-    // A plain replay executes the capsule's STORED SPIR-V and recompiles nothing, so the hook
-    // is never called and the directory stays empty -- which reads as "that program never
-    // compiled", the trap src/gpu/diagnostics/AGENTS.md warns about. But --recompile-raw and
-    // --retry-failed-* DO recompile, through tools/gpu_replay/compute_recompile.hpp ->
-    // gpu::recompile_compute_shader_cached (gpu_executor.cpp), which calls the hook on every
-    // exit path -- so under those modes the variable works. Warn only when this invocation
-    // genuinely will not reach it; a notice that is wrong in one mode is the same defect at the
-    // point of use that this change exists to remove.
-    const bool replay_recompiles = recompile_raw || !retry_failed_chain_spec.empty() ||
-                                   !retry_failed_stage_spec.empty();
-    if (std::getenv("PROSPER_SHADER_DUMP_SUCCESS") && !replay_recompiles)
+    // #3372: a silent dump directory is not evidence that the shader never compiled. Only
+    // cached compute recompilation reaches maybe_dump_successful_shader(); the direct graphics
+    // emitters (including chain retries) bypass it. The selected retry stage is checked below.
+    const bool replay_may_dump_compute = recompile_raw || !retry_failed_stage_spec.empty();
+    if (std::getenv("PROSPER_SHADER_DUMP_SUCCESS") && !replay_may_dump_compute)
         std::fprintf(stderr,
-                     "[gpureplay] PROSPER_SHADER_DUMP_SUCCESS is set, but a plain replay runs the\n"
-                     "            capsule's STORED SPIR-V and recompiles nothing, so no file\n"
-                     "            will be written for it. --recompile-raw and --retry-failed-*\n"
-                     "            DO recompile and DO honour it. For one shader by draw, use\n"
-                     "            --dump-shader DRAW:vs|fs (recompiled SPIR-V) or\n"
-                     "            --dump-shader-raw DRAW:vs|vs-main|fs (guest RDNA2).\n");
+                     "[gpureplay] PROSPER_SHADER_DUMP_SUCCESS is set, but this mode does not use\n"
+                     "            cached COMPUTE recompilation, so no file will be written for it.\n"
+                     "            Compute --recompile-raw and compute --retry-failed-stage honour it.\n"
+                     "            Graphics retries use --retry-failed-stage-spv; stored draw modules\n"
+                     "            use --dump-shader DRAW:vs|fs (SPIR-V).\n");
     // An argument that silently does nothing is the class this PR spent three rounds removing.
     if (resource_override_submit_no && !resource_override_requested) {
         std::fprintf(stderr,
                      "gpu_replay: --override-submit requires --override-resource\n");
         return 2;
+    }
+    if (!retry_failed_stage_spv_path.empty()) {
+        if (retry_failed_stage_spec.empty()) {
+            std::fprintf(stderr,
+                         "gpu_replay: --retry-failed-stage-spv requires --retry-failed-stage\n");
+            return 2;
+        }
+        if (!bundle_path.empty()) {
+            std::fprintf(stderr,
+                         "gpu_replay: --retry-failed-stage-spv requires a standalone capture, not --bundle\n");
+            return 2;
+        }
+        // These modes can return before the retry block. Never report success while silently
+        // omitting an explicitly requested export, even when another diagnostic also succeeds.
+        if (graph_only || !list_resources_spec.empty() || !realized_shader_spec.empty() ||
+            !failed_shader_spec.empty() || !retry_failed_chain_spec.empty()) {
+            std::fprintf(stderr,
+                         "gpu_replay: --retry-failed-stage-spv cannot combine with another terminal diagnostic\n");
+            return 2;
+        }
     }
     if (!bundle_path.empty()) {
         if (bundle_ds_summary && bundle_find_ds_addr) { usage(argv[0]); return 2; }
@@ -3295,6 +3318,11 @@ int main(int argc, char** argv) {
         }
         const auto& stage = replay.failure_diagnostics[static_cast<size_t>(failure_index)]
                                 .stages[static_cast<size_t>(stage_index)];
+        if (std::getenv("PROSPER_SHADER_DUMP_SUCCESS") &&
+            stage.stage != prosper::gpu::ShaderProgramStage::Compute)
+            std::fprintf(stderr,
+                         "[gpureplay] PROSPER_SHADER_DUMP_SUCCESS does not dump graphics retries;\n"
+                         "            use --retry-failed-stage-spv PATH for this stage's SPIR-V.\n");
         if (stage.raw_shader_index >= replay.raw_shader_versions.size()) {
             std::fprintf(stderr, "gpu_replay: failed stage %s has no captured raw stream\n",
                          retry_failed_stage_spec.c_str());
@@ -3321,8 +3349,24 @@ int main(int argc, char** argv) {
                     raw.words.data(), raw.words.size(), resources);
                 break;
             case prosper::gpu::ShaderProgramStage::Fragment:
+                // Pass the REAL program address in the diagnostic context. Several recompiler
+                // diagnostics are gated on `program_address != 0` -- `[divloop-reject]` among
+                // them (`rdna2_cfg_support.hpp`) -- so a retry that left it 0 silently withheld
+                // the one line that names why a loop shape was refused, and the dedup keys of
+                // the ones that did print collapsed across programs. Other arguments retain their
+                // defaults. Normal compilation is unchanged; an explicitly armed program-specific
+                // PROSPER_CFG_TRIP_BOUND_PROGRAM selector now also sees this real address.
                 spirv = prosper::gpu::recompile_fragment(
-                    raw.words.data(), raw.words.size(), resources);
+                    raw.words.data(), raw.words.size(), resources,
+                    /*system_inputs=*/nullptr, /*pcrel_dispatch_target=*/UINT32_MAX,
+                    // `wave32=false` is this tool's DEFAULT, not the draw's wave size, and it
+                    // is not recoverable here: GpuCapturedStageDiagnostic records no wave size for
+                    // a graphics stage, and `ps_wave32` lives on RenderState rather than on the
+                    // captured pipeline state. So `wave=64` in any diagnostic printed from a retry
+                    // is an artefact of this line -- do not quote it as a measurement, and treat
+                    // any wave-size-dependent conclusion drawn from a retry as void.
+                    /*interpolation=*/nullptr, /*wave32=*/false,
+                    {prosper::gpu::RecompileDiagnosticStage::Fragment, stage.program_addr});
                 break;
             case prosper::gpu::ShaderProgramStage::Compute:
                 if (!prosper::tools::recompile_failed_compute_stage(
@@ -3350,6 +3394,30 @@ int main(int argc, char** argv) {
                          issue.binding,
                          static_cast<unsigned long long>(issue.required_bytes),
                          static_cast<unsigned long long>(issue.available_bytes));
+        }
+        if (!retry_failed_stage_spv_path.empty()) {
+            // Open only after admission, preserving any existing output on a failed retry.
+            // This checks the descriptor contract; offline spirv-val still validates the module.
+            if (spirv.empty() || !retry_contract.ok()) {
+                std::fprintf(stderr,
+                             "gpu_replay: refusing retry SPIR-V export: empty module or rejected descriptor contract\n");
+                return 1;
+            }
+            FILE* f = std::fopen(retry_failed_stage_spv_path.c_str(), "wb");
+            if (!f) {
+                std::fprintf(stderr, "gpu_replay: cannot write retry SPIR-V %s: %s\n",
+                             retry_failed_stage_spv_path.c_str(), std::strerror(errno));
+                return 2;
+            }
+            const size_t written = std::fwrite(spirv.data(), sizeof(uint32_t), spirv.size(), f);
+            const int closed = std::fclose(f);
+            if (written != spirv.size() || closed != 0) {
+                std::fprintf(stderr, "gpu_replay: cannot finish writing retry SPIR-V %s\n",
+                             retry_failed_stage_spv_path.c_str());
+                return 2;
+            }
+            std::fprintf(stderr, "[retry-failed-stage] wrote %zu SPIR-V dwords to %s\n",
+                         spirv.size(), retry_failed_stage_spv_path.c_str());
         }
         if (positional.size() == 1 && !inspect)
             return spirv.empty() || !retry_contract.ok() ? 1 : 0;
