@@ -7105,8 +7105,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     // bundle. None of these modes establishes the hardware clear predicate.
     static const int sonic_clear_probe = [] {
         const char* value = std::getenv("PROSPER_DIAG_CLEAR_OVERWRITE");
-        return value && value[1] == '\0' && (value[0] == '1' || value[0] == '2' ||
-                                              value[0] == '3' || value[0] == '4')
+        return value && value[0] >= '1' && value[0] <= '4' && value[1] == '\0'
             ? value[0] - '0' : 0;
     }();
     const auto effective_depth_clear = [](const prosper::gpu::ResolvedPipelineState* ps) {
@@ -7114,7 +7113,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             (ps->depth_compare_op == VK_COMPARE_OP_ALWAYS &&
              (sonic_clear_probe != 4 ||
               ((ps->db_shader_control & 0x31u) == 0u && ps->color_write_mask == 0u &&
-               ps->topology == 4u)));
+               ps->color1_write_mask == 0u && ps->topology == 4u)));
         return depth_clear_effective(ps->depth_clear_enable, ps->depth_test_enable,
                                      ps->depth_write_enable, ps->depth_compare_op) &&
                probe_admits;
