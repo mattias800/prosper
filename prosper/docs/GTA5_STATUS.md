@@ -125,13 +125,14 @@ verdicts and the dated census, not reproduced by building `2a2bcba8^` and `2a2bc
 same-binary A/B above is the measured half. The partial-wave tier supersedes the proof for this
 class -- it admits all 103 -- so the old reason-set admission does not need restoring.
 
-**The route selected `Performance RT`, not `Performance`, on a fresh save.** The snap taken on
-the Display page after the route's `Left` reads `Graphics Mode < Performance RT >`
-(`reach-performance-story.pad`, Windows/NVIDIA, fresh `PROSPER_SAVE0`). The route's own header and
-the 2026-09-11 verification screenshot show `< Performance >`, which was taken on a non-fresh save.
-Every arm above ran the same route with a fresh save, so the comparison is sound; but any claim
-that this route selects `Performance` should be checked against a Display-page capture from the run
-it is about.
+**The route does not select the same graphics mode every time.** On a fresh save, the Display-page
+snaps read `Graphics Mode < Performance RT >` in both arms of the tier on/off A/B, and
+`< Performance >` in the re-run on the rebased head (same route file, same binary family). The
+single `Left` lands on a different value from run to run, most likely through press timing against
+the title's own key repeat. The `main` arm's snaps skipped past the Display page, so its mode is
+**unknown**. So the clean comparison is the tier on/off pair: both Performance RT, black world
+against lit world. The lit bank rendered in both Performance and Performance RT. Any claim about
+a mode needs a Display-page capture from the run it is about.
 
 Route: `PROSPER_RENDER=1 PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_PAD_SCRIPT=@scripts/gta5/reach-performance-story.pad`,
 fresh `PROSPER_SAVE0` and `XDG_CACHE_HOME` per run, frames by `PROSPER_SNAP_AT_FLIPS`, `prosper-app`,

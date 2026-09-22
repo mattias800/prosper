@@ -32,8 +32,8 @@ waves that simply have their upper half empty. Same binary, same route, only tha
 ![GTA V on Windows/NVIDIA after: the bank lobby, masked gunman, security door and counter, lit](assets/screenshots/gta5-nvidia-partial-wave-after.webp)
 ![GTA V on Windows/NVIDIA after: the same lobby with the Go to the guard prompt](assets/screenshots/gta5-nvidia-partial-wave-after-guard.webp)
 
-On a fresh save the route lands on **Performance RT**, not Performance -- worth knowing before
-comparing against older captures.
+The route's graphics-mode press is not deterministic: these runs landed on **Performance RT**, and a
+later one on Performance. The world renders in both.
 
 ![GTA V Display settings on a fresh save: Graphics Mode reads Performance RT](assets/screenshots/gta5-route-fresh-save-performance-rt.webp)
 ## 2026-09-22
