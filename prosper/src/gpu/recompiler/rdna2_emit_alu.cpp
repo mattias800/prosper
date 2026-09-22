@@ -5063,6 +5063,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // existing s3=1 (one ES vertex, no GS primitive) ABI model.
                 vreg[in.dst.value] = val(in.src[1]);
             } else if ((in.opcode == 0x365 || in.opcode == 0x366) && allow_wave &&
+                       !(in.src[0].kind == OperandKind::InlineInt && in.src[0].value == -1) &&
                        (b.is_compute || b.is_fragment)) {
                 // v_mbcnt_lo/hi_u32_b32 (cross-lane): dst = src1 + count of lanes below this one whose mask
                 // bit (src0) is set, in the low/high 32. The per-lane "mask bit" comes from src0: EXEC
@@ -5091,6 +5092,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // min(L, 32) and HI contributes max(L - 32, 0). No other lane's state is read, so
                 // this form needs neither `allow_wave` nor a subgroup/LDS reduction and stays exact
                 // under divergent control flow — it is the ubiquitous "what is my lane id" idiom,
+                // including when `allow_wave` is true: a reduction counts participating invocations,
+                // whereas this literal mask counts physical bit positions, including inactive ones.
                 // and it is the scalar counterpart of the ngg_logical_lane branch above.
                 // (Sonic Racing: CrossWorlds' compute post chain emits `d7650001,000100c1` =
                 // `v_mbcnt_lo_u32_b32 v1, -1, 0` inside a structured region, where the compute

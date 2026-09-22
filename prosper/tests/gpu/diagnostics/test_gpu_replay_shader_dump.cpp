@@ -2,7 +2,10 @@
 #include "../tools/gpu_replay/compute_recompile.hpp"
 #include "gpu/diagnostics/diagnostic_selectors.hpp"
 
+#include <algorithm>
 #include <cstdio>
+#include <cstring>
+#include <filesystem>
 #include <type_traits>
 
 using namespace prosper;
@@ -37,7 +40,11 @@ static_assert(!std::is_convertible_v<prosper::tools::ItemIndex, prosper::tools::
 static_assert(prosper::tools::raw(prosper::tools::ItemIndex{7}) == 7u,
               "raw() round-trips the underlying value");
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc != 1 && (argc != 3 || std::strcmp(argv[1], "--write-retry-fixture") != 0)) {
+        std::fprintf(stderr, "usage: %s [--write-retry-fixture DIRECTORY]\n", argv[0]);
+        return 2;
+    }
     std::printf("== test_gpu_replay_shader_dump ==\n");
 
     tools::RealizedShaderSelector selector;
@@ -258,6 +265,89 @@ int main() {
               different_failed_compute, compute_raw, different_failed_compute_spirv, error) &&
               different_failed_compute_spirv != failed_compute_spirv,
           "failed compute retry consumes the captured local-size specialization");
+    if (argc == 3) {
+        // The CLI test uses the production capture writer rather than duplicating its versioned
+        // wire format. No Vulkan device or captured game bytes are needed for this fixture.
+        const std::filesystem::path directory(argv[2]);
+        gpu::GpuCaptureFile fixture;
+        fixture.metadata.width = fixture.metadata.height = 1;
+        fixture.failure_diagnostics_available = true;
+        fixture.raw_shader_versions = compute_raw;
+        auto& raw = fixture.raw_shader_versions[0];
+        raw.content_hash = gpu::gpu_capture_hash(
+            reinterpret_cast<const uint8_t*>(raw.words.data()), raw.words.size() * sizeof(uint32_t));
+        fixture.operations.push_back({gpu::SubmitOperationKind::Dispatch, 0, 0, false});
+        gpu::GpuCapturedOperationFailure failure;
+        failure.kind = gpu::SubmitOperationKind::Dispatch;
+        failure.reason = gpu::RealizationFailureReason::ShaderRecompile;
+        const auto& config = failed_compute.recompile_config;
+        failure.compute_launch.local_x = config.local_x;
+        failure.compute_launch.local_y = config.local_y;
+        failure.compute_launch.local_z = config.local_z;
+        failure.compute_launch.threads_x = config.threads_x;
+        failure.compute_launch.threads_y = config.threads_y;
+        failure.compute_launch.threads_z = config.threads_z;
+        auto stage = failed_compute;
+        stage.program_addr = 0x1000;
+        failure.stages.push_back(stage);
+        fixture.failure_diagnostics.push_back(failure);
+        CHECK(gpu::write_gpu_capture((directory / "accepted.prgcap").string(), fixture, error),
+              "CLI fixture writes a retryable failed-stage capture");
+        FILE* expected = std::fopen((directory / "expected.spv").string().c_str(), "wb");
+        bool written = expected && std::fwrite(
+            failed_compute_spirv.data(), sizeof(uint32_t), failed_compute_spirv.size(), expected) ==
+                failed_compute_spirv.size();
+        if (expected && std::fclose(expected) != 0) written = false;
+        CHECK(written, "CLI fixture writes the independently recompiled expected module");
+        raw.words = {0xffffffffu}; // Unknown instruction: translator must reject, not emit a stub.
+        raw.has_endpgm = false;
+        raw.content_hash = gpu::gpu_capture_hash(
+            reinterpret_cast<const uint8_t*>(raw.words.data()), raw.words.size() * sizeof(uint32_t));
+        std::vector<uint32_t> rejected;
+        CHECK(tools::recompile_failed_compute_stage(stage, fixture.raw_shader_versions, rejected, error) &&
+                  rejected.empty(),
+              "CLI rejection fixture reaches the translator and produces no module");
+        CHECK(gpu::write_gpu_capture((directory / "rejected.prgcap").string(), fixture, error),
+              "CLI fixture writes a rejected failed-stage capture");
+        // A successful translation is insufficient: this statically addressed dword needs 20
+        // bytes, while the captured buffer supplies four. Keep this separate from empty output.
+        raw.words = {0xf4200506u, 0xfa000010u, 0xbf810000u};
+        raw.has_endpgm = true; // s_buffer_load_dword s20, s[12:15], 16; s_endpgm
+        raw.content_hash = gpu::gpu_capture_hash(
+            reinterpret_cast<const uint8_t*>(raw.words.data()), raw.words.size() * sizeof(uint32_t));
+        gpu::GpuCapturedResource small_buffer;
+        small_buffer.resource.cls = gpu::ResourceClass::ConstantBuffer;
+        small_buffer.resource.format = gpu::DataFormat::Float32;
+        small_buffer.resource.num_components = 1;
+        small_buffer.resource.binding = 3;
+        small_buffer.resource.sgpr_base = 12;
+        small_buffer.resource.gpu_addr = 0x2000;
+        small_buffer.resource.size = small_buffer.resource.stride = 4;
+        stage.resource_table_present = stage.resource_table.present = true;
+        stage.resource_count = 1;
+        stage.resource_table.resources = {small_buffer};
+        fixture.failure_diagnostics[0].stages[0] = stage;
+        gpu::ShaderResourceTable small_table;
+        small_table.resources.push_back(small_buffer.resource);
+        std::vector<uint32_t> descriptor_rejected;
+        CHECK(tools::recompile_failed_compute_stage(
+                  stage, fixture.raw_shader_versions, descriptor_rejected, error) &&
+                  !descriptor_rejected.empty(),
+              "CLI descriptor fixture recompiles to a nonempty module");
+        const auto small_contract = tools::validate_recompiled_failed_stage_contract(
+            stage.stage, descriptor_rejected, &small_table);
+        CHECK(!small_contract.ok() && std::any_of(
+                  small_contract.issues.begin(), small_contract.issues.end(), [](const auto& issue) {
+                      return issue.error && issue.code == gpu::DescriptorIssueCode::UndersizedBuffer &&
+                          issue.required_bytes == 20 && issue.available_bytes == 4;
+                  }),
+              "CLI descriptor fixture rejects the exact 20-byte read from a four-byte buffer");
+        CHECK(gpu::write_gpu_capture(
+                  (directory / "descriptor-rejected.prgcap").string(), fixture, error),
+              "CLI fixture writes a nonempty descriptor-rejected failed-stage capture");
+        if (!error.empty()) std::fprintf(stderr, "fixture: %s\n", error.c_str());
+        return fails ? 1 : 0;
+    }
     failed_compute.recompile_config_available = false;
     CHECK(!tools::recompile_failed_compute_stage(
               failed_compute, compute_raw, failed_compute_spirv, error) &&

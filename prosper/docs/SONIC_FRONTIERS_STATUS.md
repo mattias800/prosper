@@ -23,6 +23,31 @@ This correct path may upload a full CPU snapshot where the stale-image path prev
 frame-time or FPS regression. Keeping it on the GPU is a separate optimization with the same
 content-authority contract.
 
+### Scalar-seeded fragment loop masks (2026-09-22, #3767)
+
+The retained 929-dword fragment program that declined at `s_andn2_b64` pc328 now recompiles
+with its captured 19 resources, and the resulting module passes `spirv-val`. A fresh routed live
+run also admits the pair in the structured loop and reports **guest wave64**; this live diagnostic,
+unlike the retry tool's wave-size default, establishes which mode that draw actually uses.
+
+The repair preserves the real scalar definition: pc2's `s_load_dwordx8 s[80:87]` supplies both
+words of s[84:85]. A static proof checks the pair's physical reads/writes and follows mask aliases
+through control-flow joins before projecting the loaded bits into the existing Boolean loop PHIs.
+Raw descriptor uses before the loop remain scalar. Unknown lifetimes, observable omitted bits,
+partial writes, and scalar reductions still decline; the general compute projection gate is unchanged.
+The earlier compile-only undefined-entry fixture remains a negative case, not the repair's witness.
+
+Terminating GPU fixtures cover both nested backedges and a zero-iteration path with different low
+and high seed words. Breaking either backedge's Boolean carry separately fails the pixel assertion.
+The zero-iteration fixture also exposed an existing all-ones MBCNT defect: counting participating
+invocations disagreed with physical lane position at edge pixels. The literal-mask path now uses
+the existing calculation from lane position, independently of whether wave operations are enabled.
+
+**This is not a claim that the world renders correctly.** The first live capture still shows a broad
+cyan surface obscuring most of the scene. Restoring this producer does not establish that its
+earlier rejection caused the final image defect. The comparison artifacts and compiled modules are
+retained in the private `sonic-astra-20260922` evidence checkpoint; #2790 remains open.
+
 ### Earlier black-world baseline
 
 

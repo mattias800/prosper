@@ -2659,15 +2659,17 @@ endif()
   target_link_libraries(test_gpu_replay_pixel_inputs PRIVATE prosper_core)
   add_test(NAME gpu_replay_pixel_inputs COMMAND test_gpu_replay_pixel_inputs)
 
-  # Native-typed readback formatting: the property asserted is the one an RGBA8 conversion
-  # destroys, so these arms fail if a scalar is ever routed through one again (#3765).
-  # #2790's dropped HDR producer as an executable fixture: an undef loop-carried mask accumulator
-  # must reach the divergent-loop emitter and reject AT the accumulator operand, not earlier on
-  # control flow. Seven of its dwords are byte-identical to the real shader.
+  # Compile-only synthetic reject-route guard for #2790; not an executable real-shader reproducer.
   add_executable(test_undef_loop_accumulator tests/gpu/recompiler/test_undef_loop_accumulator.cpp)
   target_link_libraries(test_undef_loop_accumulator PRIVATE prosper_core)
   add_test(NAME undef_loop_accumulator COMMAND test_undef_loop_accumulator)
 
+  add_executable(test_fragment_loop_mask tests/gpu/recompiler/test_fragment_loop_mask.cpp)
+  target_link_libraries(test_fragment_loop_mask PRIVATE prosper_core)
+  add_test(NAME fragment_loop_mask COMMAND test_fragment_loop_mask)
+
+  # Native-typed readback formatting: the property asserted is the one an RGBA8 conversion
+  # destroys, so these arms fail if a scalar is ever routed through one again (#3765).
   add_executable(test_gpu_replay_native_texels tests/test_gpu_replay_native_texels.cpp)
   target_link_libraries(test_gpu_replay_native_texels PRIVATE prosper_core)
   add_test(NAME gpu_replay_native_texels COMMAND test_gpu_replay_native_texels)
@@ -3540,6 +3542,12 @@ endif()
       target_include_directories(test_recompiled_fragment PRIVATE frontends)
       target_link_libraries(test_recompiled_fragment PRIVATE prosper_core Vulkan::Vulkan)
       add_test(NAME recompiled_fragment_render COMMAND test_recompiled_fragment)
+
+      add_executable(test_fragment_loop_mask_exec tests/gpu/execute/test_fragment_loop_mask_exec.cpp)
+      target_include_directories(test_fragment_loop_mask_exec PRIVATE tests frontends)
+      target_link_libraries(test_fragment_loop_mask_exec PRIVATE prosper_core Vulkan::Vulkan)
+      add_test(NAME fragment_loop_mask_exec COMMAND test_fragment_loop_mask_exec)
+      set_tests_properties(fragment_loop_mask_exec PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
 
       # Render a frame where BOTH vertex + pixel shaders are recompiled from RDNA2.
       add_executable(test_recompiled_shaders tests/gpu/recompiler/test_recompiled_shaders.cpp)
@@ -4767,7 +4775,8 @@ if(TARGET gpu_replay AND Python3_Interpreter_FOUND)
   # pass -- the tool needs Vulkan and is genuinely absent in some environments.
   set_tests_properties(gpu_replay_cli_contract PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
   set_property(TEST gpu_replay_cli_contract APPEND PROPERTY ENVIRONMENT
-    "PROSPER_GPU_REPLAY_BIN=$<TARGET_FILE:gpu_replay>")
+    "PROSPER_GPU_REPLAY_BIN=$<TARGET_FILE:gpu_replay>"
+    "PROSPER_GPU_REPLAY_FIXTURE_BIN=$<TARGET_FILE:test_gpu_replay_shader_dump>")
 endif()
 
 

@@ -28,6 +28,7 @@
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include "gpu/recompiler/rdna2_alu_support.hpp"
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
+#include "gpu/recompiler/fragment_loop_mask.hpp"
 
 namespace prosper::gpu {
 
@@ -6474,6 +6475,16 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
     // Cross-lane wave ops (mbcnt) emit LDS + barriers, which are only valid at wave-uniform points — so
     // they're allowed ONLY in the straight-line path (no divergent loop/if around them). Set true below.
     bool wave_ok = false;
+    // Populated only for the structured fragment-loop path. Seed in the branch-free prefix,
+    // after the real scalar definition, so even a branch that skips the loop retains its value.
+    std::map<int, uint32_t> fragment_mask_seed_pc;
+    std::set<int> promoted_fragment_masks;
+    const auto omit_promoted_scalar_phis = [&](std::set<int>& writes) {
+        for (int base : promoted_fragment_masks) {
+            writes.erase(base);
+            writes.erase(base + 1);
+        }
+    };
     auto emit_range = [&](uint32_t pc_lo, uint32_t pc_hi) -> bool {   // emit ins whose pc ∈ [pc_lo, pc_hi)
         for (; idx < ins.size(); ++idx) {
             const Rdna2Inst& in = ins[idx];
@@ -6489,6 +6500,28 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                 record_scalar_write(
                     rs, in,
                     allows_compute_scalar_vcc_bridge(b), saved_masks);
+            if (handled && ok) {
+                for (const auto& [base, seed_pc] : fragment_mask_seed_pc) {
+                    if (in.pc != seed_pc) continue;
+                    const auto low = rs.sreg.find(base), high = rs.sreg.find(base + 1);
+                    // The static definition proof and the actual lowering must both supply words.
+                    // Missing resource-backed loads must remain a visible refusal, never a zero seed.
+                    if (low == rs.sreg.end() || high == rs.sreg.end()) {
+                        log_recompile_diagnostic(b.diagnostic, "recompile-reject", "terminal",
+                            "fragment-loop-mask missing scalar definition s%d pc=%u", base, in.pc);
+                        return false;
+                    }
+                    const uint32_t lane = b.subgroup_local_id();
+                    const uint32_t word = b.sel(
+                        b.ucmp(Op_UGreaterThanEqual, lane, b.uconst(32)), high->second, low->second);
+                    const uint32_t bit = b.ibin(Op_BitwiseAnd, lane, b.uconst(31));
+                    rs.sreg_bool[base] = b.ucmp(Op_INotEqual,
+                        b.ibin(Op_BitwiseAnd, b.ibin(Op_ShiftRightLogical, word, bit), b.uconst(1)),
+                        b.uconst(0));
+                    rs.sreg_bool_narrowed[base] = true;
+                    promoted_fragment_masks.insert(base);
+                }
+            }
             // Shader I/O tap: snapshot this instruction's destination VGPR (+3) if it is the tapped PC.
             if (handled && ok && in.pc == b.tap_pc && in.dst.kind == OperandKind::VGPR) {
                 auto tv = [&](int r) { auto it = rs.vreg.find(r); return it == rs.vreg.end() ? b.uconst(0) : it->second; };
@@ -7347,6 +7380,28 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         // uses its exact guest-wave reduction paths. Either may enter/leave with EXEC narrowed, and
         // EXEC is phi'd across the merge like any other value.
         std::function<bool(uint32_t, uint32_t, uint32_t)> emit_structured;
+        if (b.is_fragment && b.wave_size == 64) {
+            std::set<int> considered;
+            for (const DivLoop& loop : Ls) {
+                for (const Rdna2Inst& in : ins) {
+                    if (in.pc < loop.header_pc || in.pc >= loop.backedge_pc ||
+                        in.fmt != Rdna2Format::SOP2 || in.opcode < 0x0f ||
+                        in.opcode > 0x1d || !(in.opcode & 1) ||
+                        in.dst.kind != OperandKind::SGPR || in.dst.value < 0 ||
+                        in.dst.value > 104 || (in.dst.value & 1) ||
+                        !considered.insert(in.dst.value).second)
+                        continue;
+                    const auto proof = prove_fragment_loop_mask(ins, in.dst.value, loop.header_pc);
+                    if (proof.admitted)
+                        fragment_mask_seed_pc.emplace(in.dst.value,
+                            std::max(proof.definition_pc[0], proof.definition_pc[1]));
+                    log_recompile_diagnostic(b.diagnostic, "fragment-loop-mask", "consequent",
+                        "s%d header=%u admitted=%d reason=%s pc=%u wave=%u",
+                        in.dst.value, loop.header_pc, proof.admitted, proof.reason,
+                        proof.blocker_pc, b.wave_size);
+                }
+            }
+        }
         // Emit one EXEC/VCC/SCC-exit loop (#273/#615/#1554) as structured SPIR-V. Same block shape as
         // the counted-loop path (hdr -> chk -> body -> cont -> hdr, exit chk->merge) with three
         // differences: (1) fragment votes the complete wave's EXEC/VCC after the header recompute
@@ -7366,6 +7421,8 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             std::set<int> cv, cs, condv, conds, scalar_may_writes;
             loop_written_regs(ins, L.header_pc, L.backedge_pc, cv, cs);
             loop_written_regs(ins, L.header_pc, L.exit_branch_pc, condv, conds);
+            omit_promoted_scalar_phis(cs);
+            omit_promoted_scalar_phis(conds);
             loop_scalar_may_writes(ins, L.header_pc, L.backedge_pc, scalar_may_writes);
             for (int reg : rs.sreg_bool_b32)
                 if (scalar_may_writes.contains(reg)) return false;
@@ -7595,6 +7652,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                 if (!F.has_else) {
                     std::set<int> ifv, ifs;
                     loop_written_regs(ins, F.branch_pc + 1, F.target_pc, ifv, ifs);
+                    omit_promoted_scalar_phis(ifs);
                     std::unordered_map<int,uint32_t> pre_v, pre_s;
                     for (int r : ifv) pre_v[r] = vget(r);
                     for (int r : ifs) pre_s[r] = sget(r);
@@ -7699,6 +7757,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     std::set<int> wv, ws;                   // regs written in EITHER arm
                     loop_written_regs(ins, F.branch_pc + 1, F.sb_pc, wv, ws);
                     loop_written_regs(ins, F.target_pc, else_hi, wv, ws);
+                    omit_promoted_scalar_phis(ws);
                     uint32_t thenL = b.id(), elseL = b.id(), mergeL = b.id();
                     b.emit_selmerge(mergeL); b.emit_condbranch(exec_cond, thenL, elseL);
                     b.emit_label(thenL);

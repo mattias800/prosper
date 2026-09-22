@@ -1,4 +1,4 @@
-// test_undef_loop_accumulator — the executable fixture for #2790's dropped HDR producer.
+// test_undef_loop_accumulator — compile-only unresolved-mask rejection fixture for #2790.
 //
 // WHAT THIS PINS TODAY: that a divergent-boolean accumulator with no reaching definition on the
 // loop-entry path reaches the divergent-loop emitter and is rejected AT THE ACCUMULATOR OPERAND,
@@ -6,12 +6,12 @@
 // repair belongs, and two rounds of analysis on the real shader got it wrong in both directions
 // before this fixture existed.
 //
-// It is deliberately a REJECT fixture. When the admission analysis lands, this file is where the
-// positive expectation goes; until then it exists so the reject is attributed, not assumed.
+// This pins an existing reject route, not the new diagnostic output or the real shader's semantics.
+// Any later admission must be justified independently; this fixture does not require admission.
 //
-// Provenance. Seven of the 23 dwords are byte-identical to Sonic Frontiers' own shader
-// (`0x200584ca00`, submit 138828, draw 0), which is the point — a fixture that merely resembles the
-// shape would not tell us the emitter takes the same route:
+// Selected instruction encodings also occur in Sonic Frontiers' shader
+// (`0x200584ca00`, submit 138828, draw 0). The assertions below identify the rejection site;
+// matching bytes alone do not prove equivalent control flow:
 //
 //   0xBED6047E  s_mov_b64 s[86:87], exec          the witness's pc=0280   (E := entry EXEC)
 //   0x8AC47E54  s_andn2_b64 s[68:69], s[84:85], exec          pc=0328     (THE REJECT)
@@ -37,22 +37,20 @@
 //   2. It does NOT reproduce the witness's CAUSE, only its reject. Here `s[84:85]` is genuinely
 //      never written before the loop. On the witness it IS written, by
 //      `pc=0002 s_load_dwordx8 s[80:87]` -- a wide load whose range covers the pair -- so that
-//      register is REUSED with dead prior contents rather than undefined. This was missed for
+//      register has a prior data definition rather than being undefined. This was missed for
 //      several rounds because a `dst=sgpr:84` search cannot see a write addressed at s80.
 //      Consequently the fixture's `sreg=1/0` and the witness's `sreg=1/1` have different origins:
 //      here the low word is a loop placeholder and the high word absent; there both come from the
 //      load.
 //
-// Matching instruction bytes establish that the emitter takes the same ROUTE. They do not establish
-// equivalent control flow or runtime semantics, and on the point that matters most -- why the
-// operand is unresolved -- this fixture and the witness differ.
+// The terminal reject identifies the unresolved operand, but does not establish equivalent
+// control flow or runtime semantics. This fixture and the witness have different prior definitions.
 //
 // KNOWN DIVERGENCE FROM THE WITNESS, recorded rather than smoothed over: the probe reports
 // `sreg=1/0` here against `sreg=1/1` on the real shader. `loop_written_regs`'s SOP2 case
 // (`rdna2_emit_cfg.cpp`) defaults to one word and widens only for opcodes 0x0b/0x1f/0x21, so
-// `s_or_b64` (0x11) contributes the base register alone. Why the witness also has the HIGH word
-// present is not yet explained. Anything that depends on both words of the pair being placeholdered
-// is therefore NOT exercised by this fixture, and must not be claimed to be.
+// `s_or_b64` (0x11) contributes the base register alone. The witness's high word comes from the
+// earlier wide load. A case with both scalar words present is not exercised here.
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 
 #include <cstdint>
@@ -103,7 +101,7 @@ int main() {
         UINT32_MAX, nullptr, /*wave32=*/false, {RecompileDiagnosticStage::Fragment, addr});
     const std::string reason = last_terminal_reject_reason(addr);
 
-    CHECK(frag.empty(), "today: the undef loop accumulator rejects (this flips when it is admitted)");
+    CHECK(frag.empty(), "the synthetic undefined loop accumulator rejects");
 
     // The load-bearing assertions. `frag.empty()` alone is satisfied by ANY malformed shader, which
     // is exactly how a fixture ends up proving nothing -- these name WHERE and WHY.
