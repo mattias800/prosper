@@ -16,15 +16,12 @@
 // A host without a VP9 decoder (a Windows Server CI image has no VP9 Video Extensions) is a
 // supported configuration; there the test asserts the refusal instead, and says so.
 
+#include "au_test_streams.hpp"
 #include "media_foundation_backend.hpp"
 
 #include "hle/dispatch/dispatch.hpp"
 #include "hle/video/video_backend.hpp"
-
-#include <windows.h>
-#include <combaseapi.h>
-#include <mfapi.h>
-#include <mftransform.h>
+#include "hle/video/videodec2_guest_abi.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -41,85 +38,18 @@ static int fails = 0;
 
 namespace {
 
-// Mirrors of the guest-facing structs, pinned by size exactly as test_videodec2_decode pins them.
-struct VdecConfig {
-    uint64_t size; uint32_t resource, codec, profile, max_level;
-    int32_t max_width, max_height, max_dpb; uint32_t input_depth;
-    uint64_t compute_queue, affinity; int32_t priority;
-    uint8_t optimize, check_memory, reserved0, reserved1; uint64_t extra;
-};
-struct VdecInput { uint64_t size, data, data_size, pts, dts, attached; };
-struct VdecFrame { uint64_t size, data, data_size; uint8_t accepted, pad[7]; };
-struct VdecOutput {
-    uint64_t size; uint8_t valid, error, pictures, discarded;
-    uint32_t codec, width, pitch, height; uint64_t frame, frame_size;
-    uint32_t format, pitch_bytes;
-};
-static_assert(sizeof(VdecConfig) == 72, "test VdecConfig must mirror the HLE layout");
-static_assert(sizeof(VdecInput) == 48, "test VdecInput must mirror the HLE layout");
-static_assert(sizeof(VdecFrame) == 32, "test VdecFrame must mirror the HLE layout");
-static_assert(sizeof(VdecOutput) == 56, "test VdecOutput must mirror the HLE layout");
+using namespace prosper::test::vdec;
+using namespace prosper::video::au_test;
 
-// Same values as test_video_mf.cpp's kVp9Expected: ffmpeg -i vp9_testpattern.ivf -f rawvideo
-// -pix_fmt nv12, FNV-1a-64 over each 21600-byte frame.
-const uint64_t kExpected[24] = {
-    0xc5d881f5ad18d6e3ull, 0x0a104ad23033be37ull, 0x0c671d7cbaffd853ull,
-    0xb050c7d781be8167ull, 0x30114c4d0db7d39dull, 0x64bde2949d311befull,
-    0x437df2ad43354a19ull, 0x75ba29d1fff0cd40ull, 0x19f7fb26cfc95d38ull,
-    0x3a15afbba23fda2eull, 0xbd6bfff70be35829ull, 0x762c1ff5bc183ce6ull,
-    0x3218d18e7619cc16ull, 0x5069861f5e6eb052ull, 0xbcb8cbd90ac03d32ull,
-    0xfcaab884215e640eull, 0xa8609984e0cd3d83ull, 0x895e7e704f12516aull,
-    0xb33fcf120f8f743full, 0x9b769661ad98990bull, 0x0dc8693197c79bcbull,
-    0x2ef06dd3c0b3d647ull, 0x4fee04f0e7dbf647ull, 0x82a50de1bd934ad4ull,
-};
-constexpr uint32_t kW = 160, kH = 90;
+constexpr uint32_t kW = kVp9Width, kH = kVp9Height;
 constexpr uint32_t kCodecVp9 = 2382845;   // what Dragon Quest VII's CreateDecoder passes (#2983)
-
-std::vector<uint8_t> read_file(const char* path) {
-    std::vector<uint8_t> bytes;
-    if (std::FILE* f = std::fopen(path, "rb")) {
-        std::fseek(f, 0, SEEK_END);
-        const long size = std::ftell(f);
-        std::fseek(f, 0, SEEK_SET);
-        if (size > 0) {
-            bytes.resize(static_cast<size_t>(size));
-            if (std::fread(bytes.data(), 1, bytes.size(), f) != bytes.size()) bytes.clear();
-        }
-        std::fclose(f);
-    }
-    return bytes;
-}
-
-bool host_has_vp9_decoder() {
-    const HRESULT com = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    MFT_REGISTER_TYPE_INFO input{MFMediaType_Video, MFVideoFormat_VP90};
-    IMFActivate** activates = nullptr;
-    UINT32 count = 0;
-    const HRESULT hr = MFTEnumEx(MFT_CATEGORY_VIDEO_DECODER,
-                                 MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_LOCALMFT |
-                                     MFT_ENUM_FLAG_SORTANDFILTER,
-                                 &input, nullptr, &activates, &count);
-    for (UINT32 i = 0; SUCCEEDED(hr) && i < count; ++i) activates[i]->Release();
-    CoTaskMemFree(activates);
-    if (SUCCEEDED(com)) CoUninitialize();
-    return SUCCEEDED(hr) && count > 0;
-}
 
 } // namespace
 
 int main() {
     std::puts("== test_videodec2_mf ==");
     const std::vector<uint8_t> ivf = read_file(PROSPER_TEST_VP9_AU_ASSET);
-    std::vector<std::pair<size_t, size_t>> units;
-    if (ivf.size() >= 32 && std::memcmp(ivf.data(), "DKIF", 4) == 0) {
-        for (size_t off = 32; off + 12 <= ivf.size();) {
-            const uint32_t n = ivf[off] | (ivf[off + 1] << 8) | (ivf[off + 2] << 16) |
-                               (static_cast<uint32_t>(ivf[off + 3]) << 24);
-            if (off + 12 + n > ivf.size()) break;
-            units.emplace_back(off + 12, n);
-            off += 12 + n;
-        }
-    }
+    const std::vector<Unit> units = split_ivf(ivf);
     CHECK(units.size() == 24, "the committed VP9 stream splits into 24 access units");
     if (units.size() != 24) return 1;
 
@@ -137,7 +67,7 @@ int main() {
     // The REAL backend, installed the way prosper-app, screenshot and boot_trace install it.
     video::set_backend(nullptr);
     CHECK(video::install_media_foundation_backend(), "the Media Foundation backend installs");
-    const bool have_vp9 = host_has_vp9_decoder();
+    const bool have_vp9 = host_has_decoder(MFVideoFormat_VP90);
     if (!have_vp9)
         std::puts("  [info] this host has no Media Foundation VP9 decoder (VP9 Video Extensions); "
                   "asserting the refusal instead of the decode");
@@ -195,7 +125,7 @@ int main() {
             if (guest_frame[k] != 0xCD) { guard_ok = false; break; }
         uint64_t h = 0xcbf29ce484222325ull;
         for (size_t k = 0; k < nv12; ++k) { h ^= guest_frame[k]; h *= 0x100000001b3ull; }
-        if (pictures <= 24 && h == kExpected[pictures - 1]) ++matched;
+        if (pictures <= 24 && h == kVp9Expected[pictures - 1]) ++matched;
     }
     std::printf("  [info] %u pictures from 24 guest access units, %u byte-exact\n", pictures, matched);
     if (have_vp9) {

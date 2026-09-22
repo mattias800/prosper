@@ -4479,6 +4479,7 @@ if(WIN32 AND TARGET prosper_core)
   # backend, with every guest picture hashed against the ffmpeg reference (#2983).
   add_executable(test_videodec2_mf frontends/video_mf/test_videodec2_mf.cpp)
   target_link_libraries(test_videodec2_mf PRIVATE prosper_video_mf)
+  target_include_directories(test_videodec2_mf PRIVATE tests)
   target_compile_definitions(test_videodec2_mf PRIVATE
     PROSPER_TEST_VP9_AU_ASSET="${CMAKE_CURRENT_SOURCE_DIR}/tests/assets/vp9_testpattern.ivf")
   add_test(NAME videodec2_media_foundation COMMAND test_videodec2_mf)

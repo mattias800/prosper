@@ -1,10 +1,6 @@
 #include "media_foundation_backend.hpp"
+#include "au_test_streams.hpp"
 #include "vp9_uncompressed_header.hpp"
-
-#include <windows.h>
-#include <combaseapi.h>
-#include <mfapi.h>
-#include <mftransform.h>
 
 #include <algorithm>
 #include <chrono>
@@ -39,49 +35,9 @@ int failures = 0;
 // video.
 namespace {
 
-std::vector<uint8_t> read_file(const char* path) {
-    std::vector<uint8_t> bytes;
-    if (std::FILE* f = std::fopen(path, "rb")) {
-        std::fseek(f, 0, SEEK_END);
-        const long size = std::ftell(f);
-        std::fseek(f, 0, SEEK_SET);
-        if (size > 0) {
-            bytes.resize(static_cast<size_t>(size));
-            if (std::fread(bytes.data(), 1, bytes.size(), f) != bytes.size()) bytes.clear();
-        }
-        std::fclose(f);
-    }
-    return bytes;
-}
-
-uint64_t fnv1a(const uint8_t* data, size_t bytes) {
-    uint64_t h = 0xcbf29ce484222325ull;
-    for (size_t i = 0; i < bytes; ++i) { h ^= data[i]; h *= 0x100000001b3ull; }
-    return h;
-}
+using namespace prosper::video::au_test;
 
 void set_software(bool on) { _putenv_s("PROSPER_VDEC2_MF_SOFTWARE", on ? "1" : ""); }
-
-// Whether THIS HOST has a synchronous Media Foundation decoder for the format, asked of Media
-// Foundation directly rather than of the code under test. Codecs are the host's: H.264 ships with
-// Windows, VP9 comes from the separately installed VP9 Video Extensions, and a Windows Server CI image
-// may have neither. A host without one is a supported configuration, so the decode assertions are
-// conditional on this -- and the refusal is asserted instead, so a skip is never silent and a
-// backend that fabricated a decoder where none exists would fail.
-bool host_has_decoder(const GUID& subtype) {
-    const HRESULT com = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    MFT_REGISTER_TYPE_INFO input{MFMediaType_Video, subtype};
-    IMFActivate** activates = nullptr;
-    UINT32 count = 0;
-    const HRESULT hr = MFTEnumEx(MFT_CATEGORY_VIDEO_DECODER,
-                                 MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_LOCALMFT |
-                                     MFT_ENUM_FLAG_SORTANDFILTER,
-                                 &input, nullptr, &activates, &count);
-    for (UINT32 i = 0; SUCCEEDED(hr) && i < count; ++i) activates[i]->Release();
-    CoTaskMemFree(activates);
-    if (SUCCEEDED(com)) CoUninitialize();
-    return SUCCEEDED(hr) && count > 0;
-}
 
 // The skip arm: with no decoder on the host, the codec must be REFUSED -- not opened into a decoder
 // that then reports "no picture" forever, which is #2270's shape.
@@ -92,8 +48,6 @@ void check_refused_without_decoder(const char* label, uint32_t codec) {
     CHECK(dec < 0, "with no host decoder installed, the codec is refused rather than faked");
     if (dec >= 0) backend()->close_decoder(dec);
 }
-
-using Unit = std::pair<size_t, size_t>;   // offset, length
 
 struct Stream {
     const char* label;
@@ -186,23 +140,6 @@ void check_stream_both_paths(const Stream& s) {
                     s.label);
 }
 
-// IVF: a 32-byte file header, then per frame a 12-byte header (u32 size, u64 pts) and the frame.
-// Each frame is one VP9 access unit exactly as a demuxer hands it on -- a superframe (hidden alt-ref
-// plus the frame it serves) stays ONE unit, which is how a guest demuxer would submit it.
-std::vector<Unit> split_ivf(const std::vector<uint8_t>& b) {
-    std::vector<Unit> units;
-    if (b.size() < 32 || std::memcmp(b.data(), "DKIF", 4) != 0) return units;
-    size_t off = 32;
-    while (off + 12 <= b.size()) {
-        const uint32_t size = b[off] | (b[off + 1] << 8) | (b[off + 2] << 16) |
-                              (static_cast<uint32_t>(b[off + 3]) << 24);
-        if (off + 12 + size > b.size()) break;
-        units.emplace_back(off + 12, size);
-        off += 12 + size;
-    }
-    return units;
-}
-
 // Access units begin with an access-unit delimiter, the framing a live guest submits.
 std::vector<Unit> split_annexb_aud(const std::vector<uint8_t>& b) {
     std::vector<Unit> units;
@@ -227,18 +164,6 @@ void test_access_unit_path() {
 
 #ifdef PROSPER_TEST_VP9_AU_ASSET
     {
-        // Produced by: ffmpeg -i vp9_testpattern.ivf -f rawvideo -pix_fmt nv12 ref.nv12, then
-        // FNV-1a-64 over each 160*90 + 2*80*45 = 21600-byte frame. All 24 differ.
-        static const uint64_t kVp9Expected[24] = {
-            0xc5d881f5ad18d6e3ull, 0x0a104ad23033be37ull, 0x0c671d7cbaffd853ull,
-            0xb050c7d781be8167ull, 0x30114c4d0db7d39dull, 0x64bde2949d311befull,
-            0x437df2ad43354a19ull, 0x75ba29d1fff0cd40ull, 0x19f7fb26cfc95d38ull,
-            0x3a15afbba23fda2eull, 0xbd6bfff70be35829ull, 0x762c1ff5bc183ce6ull,
-            0x3218d18e7619cc16ull, 0x5069861f5e6eb052ull, 0xbcb8cbd90ac03d32ull,
-            0xfcaab884215e640eull, 0xa8609984e0cd3d83ull, 0x895e7e704f12516aull,
-            0xb33fcf120f8f743full, 0x9b769661ad98990bull, 0x0dc8693197c79bcbull,
-            0x2ef06dd3c0b3d647ull, 0x4fee04f0e7dbf647ull, 0x82a50de1bd934ad4ull,
-        };
         Stream s{"VP9", 2382845, 160, 90, read_file(PROSPER_TEST_VP9_AU_ASSET), {}, kVp9Expected,
                  24};
         s.units = split_ivf(s.bytes);
