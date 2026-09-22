@@ -3306,9 +3306,27 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             reflected_binding->image_numeric_class !=
                                 prosper::gpu::SpirvImageNumericClass::Unknown;
                         uint32_t tw = r.width ? r.width : 4, th = r.height ? r.height : 4;
-                        const bool float32_array = r.cls == RC::Texture &&
+                        const bool float32_layered_texture = r.cls == RC::Texture &&
                             r.img_dim == 5u && r.depth > 1u &&
                             r.format == prosper::gpu::DataFormat::Float32;
+                        // A layered T# may be consumed by an ordinary DIM=2D instruction.
+                        // That shader selects the base slice and may use its current color RTT;
+                        // only an arrayed declaration requires every layer to be materialized.
+                        // Unknown or incompatible reflection is not proof of a base-slice view.
+                        if (float32_layered_texture &&
+                            (reflected_binding->kind !=
+                                 prosper::gpu::SpirvDescriptorKind::CombinedImageSampler ||
+                             reflected_binding->image_dim != 1u ||
+                             reflected_binding->image_multisampled ||
+                             reflected_binding->image_depth || !reflected_binding->sampled_float)) {
+                            std::fprintf(stderr,
+                                "[render-array-reject] binding=%u unsupported Float32 reflected image shape\n",
+                                r.binding);
+                            built.complete = false;
+                            continue;
+                        }
+                        const bool float32_array = float32_layered_texture &&
+                            reflected_binding->image_arrayed;
                         // AvPlayer exposes NV12 as an R8 luma plane followed by an RG8 UV plane.
                         // Which resource IS that chroma plane — and why a candidate was rejected —
                         // is decided by avplayer_plane_policy.hpp, which carries the reasoning and
@@ -4001,7 +4019,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         const bool guest_array =
                             prosper::gpu::guest_texture_is_uploaded_array(r.img_dim, r.depth,
                                                                           r.format) &&
-                            r.cls == RC::Texture;
+                            r.cls == RC::Texture &&
+                            (!float32_layered_texture || float32_array);
                         fr.guest_array = guest_array;
                         const bool is_array = guest_array &&
                             array_footprint <= array_budget_bytes;
