@@ -1443,37 +1443,63 @@ int main() {
         : prosper::test::run_compute(spv17d0, std::vector<float>(N, 0.0f), N, N);
     CHECK(got17d0 == std::vector<float>(N, 7.0f),
           "bottom-tested EXEC loop preserves its exit-iteration value and reconverges");
+    // The five variants below are shapes the PER-INVOCATION EXEC-loop model must not lower: an
+    // LDS access it cannot prove stable, or a latch with no fresh EXEC condition. They used to have
+    // no other route and were rejected outright. Since #2952 a barrier-phased compute program whose
+    // structured lowering declines is compiled PHASE BY PHASE through the CFG dispatcher, which
+    // emulates the guest wave exactly (per-lane EXEC, wave votes through workgroup scratch) and has
+    // no per-invocation approximation to protect. So the contract these arms pin is now: never the
+    // per-invocation loop model, always the dispatcher (an OpSwitch, with the guest barriers as
+    // OpControlBarrier BETWEEN phases), and -- for every variant that terminates -- the value the
+    // guest computes. Each terminating variant still stores 7 to every lane: the edits touch only
+    // LDS traffic and EXEC around it, never v2.
+    auto phased_dispatcher = [&](const std::vector<uint32_t>& spv) {
+        return !spv.empty() && count_spirv_opcode(spv, 251) >= 1 &&
+               count_spirv_opcode(spv, 224) >= 1;
+    };
+    auto runs_to_seven = [&](const std::vector<uint32_t>& spv) {
+        if (spv.empty()) return false;
+        return prosper::test::run_compute(spv, std::vector<float>(N, 0.0f), N, N) ==
+               std::vector<float>(N, 7.0f);
+    };
     std::vector<uint32_t> late_barrier17d0(std::begin(code17d0), std::end(code17d0));
     late_barrier17d0[12] = 0xbf800000u; // s_nop 0: reads no longer have a preceding phase boundary
     late_barrier17d0.insert(late_barrier17d0.end() - 2, 0xbf8a0000u);
-    CHECK(recompile_valu(late_barrier17d0.data(), late_barrier17d0.size(),
-                         1, /*out_vgpr*/2).empty(),
-          "EXEC-loop LDS reads reject when the proved barrier follows their phase");
+    const std::vector<uint32_t> spv_late17d0 = recompile_valu(
+        late_barrier17d0.data(), late_barrier17d0.size(), 1, /*out_vgpr*/2);
+    CHECK(phased_dispatcher(spv_late17d0) && runs_to_seven(spv_late17d0),
+          "EXEC-loop LDS reads before the proved barrier lower through the phased dispatcher, exactly");
     std::vector<uint32_t> write17d0(std::begin(code17d0), std::end(code17d0));
     write17d0[15] = 0xd8340000u; // ds_write_b32 v0,v3 in the post-barrier loop
     write17d0[16] = 0x00000300u;
-    CHECK(recompile_valu(write17d0.data(), write17d0.size(), 1, /*out_vgpr*/2).empty(),
-          "EXEC-loop LDS writes remain rejected even after a proved barrier");
+    const std::vector<uint32_t> spv_write17d0 = recompile_valu(
+        write17d0.data(), write17d0.size(), 1, /*out_vgpr*/2);
+    CHECK(phased_dispatcher(spv_write17d0) && runs_to_seven(spv_write17d0),
+          "EXEC-loop LDS writes after a proved barrier lower through the phased dispatcher, exactly");
     std::vector<uint32_t> inactive_read17d0(std::begin(code17d0), std::end(code17d0));
     inactive_read17d0[14] = 0xbf880005u; // shifted exit target: pc20
     inactive_read17d0.insert(inactive_read17d0.begin() + 15,
                              0xbefe0480u); // s_mov_b64 exec,0 before ds_read_b32
     inactive_read17d0[19] = 0xbf82fffau;   // shifted back-edge: pc14
-    CHECK(recompile_valu(inactive_read17d0.data(), inactive_read17d0.size(),
-                         1, /*out_vgpr*/2).empty(),
-          "EXEC-loop LDS reads reject when an intervening write can deactivate the lane");
+    const std::vector<uint32_t> spv_inactive17d0 = recompile_valu(
+        inactive_read17d0.data(), inactive_read17d0.size(), 1, /*out_vgpr*/2);
+    CHECK(phased_dispatcher(spv_inactive17d0) && runs_to_seven(spv_inactive17d0),
+          "an EXEC-loop LDS read behind a lane-deactivating write lowers through the phased dispatcher");
     std::vector<uint32_t> condition_read17d0(std::begin(code17d0), std::end(code17d0));
     condition_read17d0[13] = 0xbefe0480u; // enter this loop with EXEC clear
     condition_read17d0[14] = 0xd8d80000u; // move ds_read_b32 into the condition region
     condition_read17d0[15] = 0x03000000u;
     condition_read17d0[16] = 0xbf880002u; // s_cbranch_execz pc19 after the read
-    CHECK(recompile_valu(condition_read17d0.data(), condition_read17d0.size(),
-                         1, /*out_vgpr*/2).empty(),
-          "EXEC-loop LDS reads reject before the active-lane header test");
+    const std::vector<uint32_t> spv_condition17d0 = recompile_valu(
+        condition_read17d0.data(), condition_read17d0.size(), 1, /*out_vgpr*/2);
+    CHECK(phased_dispatcher(spv_condition17d0) && runs_to_seven(spv_condition17d0),
+          "an EXEC-loop LDS read ahead of the active-lane test lowers through the phased dispatcher");
+    // The stale latch never clears EXEC, so the outer loop does not terminate -- on hardware
+    // either. It is compiled faithfully and deliberately NOT executed here.
     std::vector<uint32_t> stale17d0(std::begin(code17d0), std::end(code17d0));
     stale17d0[9] = 0x7e060280u; // v_mov_b32 v3,0: no fresh EXEC condition at the latch
-    CHECK(recompile_valu(stale17d0.data(), stale17d0.size(), 1, /*out_vgpr*/2).empty(),
-          "bottom-tested EXEC loop rejects a stale entry mask at its back-edge");
+    CHECK(phased_dispatcher(recompile_valu(stale17d0.data(), stale17d0.size(), 1, /*out_vgpr*/2)),
+          "a bottom-tested EXEC loop with a stale latch mask is never given the per-invocation model");
 
     // Kernel 17d1: Astro's Wave32 BVH traversal turns a VOPC predicate into the first matching
     // lane with s_ff1_i32_b32, then immediately uses VCC_LO as ordinary scalar data. The first
