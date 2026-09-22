@@ -6,15 +6,20 @@
 // checks below are therefore written so they hold for ANY assignment of pixels to waves -- the one
 // thing no host reproduces -- and fail for a lowering that answers some other wave's question:
 //
-//   * every pixel's own bit is set in the ballot of its entry EXEC (the read-back GTA V uses to
-//     restore its non-helper lanes; a lane reading the wrong half, or a ballot reporting another
-//     group's lanes, clears it);
+//   * every pixel's own bit is set in the ballot of its entry EXEC (the read-back shape GTA V uses;
+//     a lane reading the wrong half, or a ballot reporting another group's lanes, clears it);
 //   * rank < population, and for each population size n the ranks 0..n-1 occur equally often -- each
 //     wave of n lanes contributes exactly one pixel of every rank, whatever the grouping, so a scan
 //     over a different set than the ballot counts breaks the histogram;
 //   * exactly one lane per wave has rank 0, and a vote over that per-lane predicate is true;
 //   * on a host of at most 32 lanes the high dword of EXEC is zero -- the wave really is partial,
 //     which is the premise of the admission, measured rather than assumed.
+//
+// What this does NOT cover, so nobody reads it as more: no helper lanes (the fullscreen draw covers
+// every quad), no subgroup that is less than full on NVIDIA (every wave here has 32), and no ballot
+// of a NARROWED EXEC. At S=32 the MBCNT_HI source is always zero, so only its lane>=32 gate is
+// exercised (the rank histogram does catch that gate being dropped). It tests the LOWERING; it
+// cannot test the premise that grouping does not matter -- its oracle is grouping-invariant.
 //
 // Source: tests/fixtures/fragment_partial_wave.s.
 #include "gpu/recompiler/rdna2_to_spirv.hpp"

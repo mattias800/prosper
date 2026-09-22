@@ -7,7 +7,7 @@
 //   R = my rank among the launched lanes (MBCNT over the entry EXEC)            / 255
 //   G = the number of launched lanes (V_BCNT over both halves of the entry EXEC) / 255
 //   B = flags / 255: bit0 my own bit is set in the saved entry EXEC (the ballot/lane-id
-//       read-back GTA V uses to restore its non-helper lanes); bit1 exactly one lane has
+//       read-back shape GTA V uses, here with no helper lanes present); bit1 exactly one lane has
 //       rank 0 (V_BCNT over a VOPC-written SGPR pair); bit2 a vote over that pair is true
 //   A = 1.0 when the HIGH dword of the entry EXEC is zero, else 0.5
 .text

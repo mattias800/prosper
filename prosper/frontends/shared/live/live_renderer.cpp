@@ -1414,7 +1414,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
     // Two of those titles are on the list although most or some of their modules do NOT clear. That
     // is safe BECAUSE the decision is per module: the 11 that cannot be proved keep the exact-width
     // contract and are refused individually. Admitting a title no longer means trusting all of its
-    // shaders, which is what made a title the wrong unit before.
+    // shaders, which is what made a title the wrong unit before. (On PPSA04263 alone the partial-wave
+    // tier below admits the modules this proof declines; on the other four it does not -- #3797.)
     //
     // NOT on this list: PPSA21564 (6 measured refusals, no dump and no after-arm yet). One survey
     // run away, and with the per-module proof the run is confirmation rather than a gamble.
@@ -1427,12 +1428,17 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
         !PROSPER_ENV_VALUE("PROSPER_STRICT_FRAGMENT_WAVE_WIDTH") &&
         std::any_of(std::begin(kNativeFragmentVoteTitles), std::end(kNativeFragmentVoteTitles),
                     [&](const char* id) { return title_id == id; });
-    // The partial-wave tier (#3464, rdna2_to_spirv.hpp kFragmentWavePartialWaveExactReasons) rides on
-    // the same title list for now, so every title it can change is one with a surveyed before/after
-    // route. Its argument does not depend on the title, which is why a later change can retire the
-    // list; that is a separate, cross-title decision. The opt-out isolates THIS tier for an A/B on one
-    // binary: set it and the renderer behaves exactly as it did before the tier existed.
-    const bool partial_wave_fragment = native_fragment_vote_width &&
+    // The partial-wave tier (#3464, rdna2_to_spirv.hpp kFragmentWavePartialWaveExactReasons) is scoped
+    // to GTA V, the one title measured with it on and off (same binary, same route: 188 refused and a
+    // black world, against 0 refused and the bank lit). Its argument does not depend on the title, but
+    // on the other four titles above it would admit exactly the modules the vote tier's proof declined,
+    // and nobody has surveyed those with it -- three are rung-6 snapshot-guarded. Extending it is
+    // #3797's before/after work, not a side effect of this line.
+    //
+    // Two switches turn it off: PROSPER_NO_PARTIAL_WAVE_FRAGMENT isolates THIS tier for an A/B on one
+    // binary (the renderer then behaves exactly as before the tier existed), and
+    // PROSPER_STRICT_FRAGMENT_WAVE_WIDTH, which disables both tiers through native_fragment_vote_width.
+    const bool partial_wave_fragment = native_fragment_vote_width && title_id == "PPSA04263" &&
         !PROSPER_ENV_VALUE("PROSPER_NO_PARTIAL_WAVE_FRAGMENT");
     // Create (and thereby PUBLISH) the renderer's Vulkan device up front so the compute backend can
     // adopt it (#1091). Compute initializes lazily on its first dispatch, and titles routinely

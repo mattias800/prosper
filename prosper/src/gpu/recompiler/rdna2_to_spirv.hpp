@@ -647,29 +647,38 @@ inline constexpr uint32_t kFragmentWaveReasonScalarReduce = 1u << 7;
 
 // Reasons whose lowering is exact on a PARTIALLY POPULATED guest wave (#3464).
 //
-// The fact this rests on: prosper has never reproduced the PS5's assignment of pixels to waves, on
-// any host. At a native 64-lane subgroup on RADV it is the HOST rasterizer that decides which pixels
-// share a wave, and at primitive edges it launches fewer than 64. So the contract every fragment
-// lowering already meets is "the guest wave is the host subgroup, and the guest lanes it did not
-// launch are unpopulated": EXEC starts as exactly the launched lanes, a ballot carries zero for the
-// others, a vote reduces over the launched ones. A host subgroup of S < 64 invocations is a guest
-// wave of that same kind whose lanes S..63 are unpopulated -- the wave a PS5 launches for any
-// primitive that does not fill one. Nothing the guest program can observe tells the two apart.
+// The premise, which is an ARGUMENT and not a measurement, in two parts:
+//   (i)  which pixels share a wave is the rasterizer's choice, not a program input. A correct guest
+//        pixel shader cannot depend on it -- the PS5 itself varies it with primitive shape, and
+//        launches partial waves wherever a primitive does not fill one.
+//   (ii) every host subgroup this path runs on is a composition the PS5 can launch: whole quads, at
+//        most 64 lanes, possibly partial. A host subgroup of S < 64 invocations is a guest Wave64
+//        whose lanes S..63 are unpopulated.
+// Under (i) and (ii) running the program on the host subgroup is running it on a wave the guest
+// could have been given. The native 64-lane path already relies on the same contract ("the guest
+// wave is the host subgroup; lanes it did not launch are unpopulated"): whether RADV at 64 groups
+// the pixels exactly as the PS5 does has never been compared, and nothing in prosper depends on it.
 //
-// The lowerings named below compute exactly that wave's answer, because their lane arithmetic never
-// names a lane outside [0, S): the lane id is SubgroupLocalInvocationId (< S); a lane below 32 reads
-// the LOW half of a 64-bit mask, and the HIGH half of a ballot over a subgroup of at most 32 is zero,
-// which is precisely the high half of that wave's EXEC; a vote and an MBCNT reduce or scan over the
-// same launched set the ballot reports. So the module runs as a correct guest Wave64 program; it is
-// the WAVE that is smaller, not the semantics that are approximate.
+// What is then required of the LOWERING -- and what fragment_partial_wave_exec tests on real hosts
+// -- is that it computes that wave's answer: its lane arithmetic never names a lane outside [0, S).
+// The lane id is SubgroupLocalInvocationId (< S); a lane below 32 reads the LOW half of a 64-bit
+// mask, and the HIGH half of a ballot over a subgroup of at most 32 is zero, which is precisely the
+// high half of that wave's EXEC; a vote reduces over the invocations the ballot reports. MBCNT is
+// the one that differs, and not by width: it excludes helper invocations (spirv/wave.cpp) while the
+// ballot and the entry EXEC (btrue(), rdna2_recompile_fragment.cpp) include them, where hardware's
+// entry EXEC is the live mask. That predates this tier and holds identically at 64.
 //
 // Why the counterexample that stopped #2404, #2410, #2984 and the first form of #3480 does not apply:
 // "let the predicate be true in the upper 32 lanes and false in the lower, then two 32-lane votes
-// disagree with one 64-lane vote" presupposes a particular set of 64 pixels that forms one wave. No
-// host reproduces that set -- RADV at 64 included -- so a result that depends on it is not reproduced
-// at 64 today either. What IS guaranteed at every width is that each subgroup answers as some wave
-// the guest could have been given. A guest program whose pixels depend on which pixels its
-// rasterizer happened to group has no single image to reproduce, on this host or any other.
+// disagree with one 64-lane vote" presupposes that one particular set of 64 pixels forms a wave and
+// the two subgroups are its halves. Under (ii) each subgroup is its own wave: a subgroup whose mask
+// is zero really has a zero mask, and one whose lanes all skipped a guarded block rightly skipped it.
+// A result that differs is a result that depends on grouping, which (i) excludes.
+//
+// A residual observable, stated so nobody mistakes it for covered: each wave is legal, but "every
+// wave at most half full" is not a population the PS5 launches. A shader that writes one record per
+// WAVE (an elected-lane atomic) writes about twice as many on a 32-lane host. Per-lane totals --
+// ballot + MBCNT appends -- are unaffected.
 //
 // Deliberately NOT here: DPP rows, PERMLANE, READLANE and shuffles read ANOTHER lane's register by
 // index, and below 64 lanes that index can name a lane outside the subgroup. SPIR-V returns an
@@ -679,9 +688,11 @@ inline constexpr uint32_t kFragmentWaveReasonScalarReduce = 1u << 7;
 //
 // A limitation this SHARES with the native path rather than introduces: a mask the guest builds from
 // a constant or by complement (`s_mov_b64 exec, -1`, `s_not_b64`) is represented per launched lane,
-// so its bits for unpopulated lanes read back as zero where hardware would read one. That already
-// held at 64 for every partially filled wave; below 64 it holds for every wave. CONFIDENCE: HIGH for
-// the lowerings above, MED for that shared constant-mask read-back.
+// so its bits for unpopulated lanes read back as zero where hardware would read one. At 64 that hit
+// only edge waves; below 64 it hits every wave. Exposure is limited because a Bool pair counted with
+// s_bcnt1_i32_b64 is rejected in fragment outright. CONFIDENCE: HIGH that the admitted lowerings
+// compute the partial wave's answer; MED for the premise's scope (a guest that does depend on
+// grouping renders differently) and for the constant-mask read-back.
 inline constexpr uint32_t kFragmentWavePartialWaveExactReasons =
     kFragmentWaveReasonLaneId | kFragmentWaveReasonWaveAny | kFragmentWaveReasonWaveBallot |
     kFragmentWaveReasonScalarReduce;

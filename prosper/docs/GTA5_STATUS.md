@@ -106,9 +106,10 @@ fragment shaders:
 | partial-wave tier, `PROSPER_NO_PARTIAL_WAVE_FRAGMENT=1` (same binary) | **188** (103 / 24 / 61) | 0 | black, HUD and radar only |
 | partial-wave tier, default | **0** | **186** | the bank lobby, lit |
 
-The tier (`kFragmentWavePartialWaveExactReasons`, `rdna2_to_spirv.hpp`) runs a module at the host's
+The tier (`kFragmentWavePartialWaveExactReasons`, `rdna2_to_spirv.hpp`; scoped to this title, extension
+tracked in #3797) runs a module at the host's
 width when every wave reason it records is exact on a partially populated guest wave. The argument,
-and what it leaves refused, is in `RECOMPILER_REMAINING.md` Â§ Ruled out (the partial-wave row).
+and what it leaves refused, is in `RECOMPILER_REMAINING.md` § Ruled out (the partial-wave row).
 
 **What turned the world black on this host is #3480, and it was not a bug in #3480's terms.**
 Before it (2026-09-08) GTA V's `wave-any` modules were admitted on the reason set alone, and a
