@@ -133,42 +133,78 @@ int main() {
               "coalesced user event retains its payload after the completion burst");
     }
 
-    // VideoOut flip event accessor (#394 F5): the producer stores the submitted flipArg raw in
-    // kevent.data, so GetEventData must preserve all 64 bits rather than decode a packed value.
+    // VideoOut flip event (#3668): the kernel event's data carries the flipArg in bits 16+, and
+    // sceVideoOutGetEventData decodes it with an ARITHMETIC `>> 16`. Pinned by the guest itself:
+    // Uncharted (PPSA05684) reads the raw word through sceKernelGetEventData, refuses it if it is
+    // negative or below 0x10000, and takes `sar data,0x10` as its completed-frame ordinal
+    // (eboot+0x15b3229..0x15b3279). With the flipArg stored verbatim (prosper's previous layout) that
+    // shift is 0 for every small ordinal and the title deadlocks after three flips. The expected
+    // values below are literals, not the producer's helper, so a producer that reverts to the
+    // verbatim layout fails here rather than agreeing with itself.
     auto vo_open   = Hle::lookup(nid_hash("sceVideoOutOpen"));
     auto addflip   = Hle::lookup(nid_hash("sceVideoOutAddFlipEvent"));
     auto submitflp = Hle::lookup(nid_hash("sceVideoOutSubmitFlip"));
+    auto k_evdata  = Hle::lookup(nid_hash("sceKernelGetEventData"));
     auto vo_evid   = Hle::lookup("U2JJtSqNKZI");
     auto vo_evdata = Hle::lookup("rWUTcKdkUzQ");
-    CHECK(vo_open && addflip && submitflp && vo_evid && vo_evdata,
+    CHECK(vo_open && addflip && submitflp && k_evdata && vo_evid && vo_evdata,
           "VideoOut flip event producer and accessors registered");
-    if (vo_open && addflip && submitflp && vo_evid && vo_evdata) {
+    if (vo_open && addflip && submitflp && k_evdata && vo_evid && vo_evdata) {
         const uint64_t handle = vo_open(0, 0, 0, 0, 0, 0);
-        constexpr uint64_t kFlipArg = 0x8000000000001234ull;
         constexpr uint64_t kFlipUdata = 0xFACEB00Cull;
         addflip(eq, handle, kFlipUdata, 0, 0, 0);
-        CHECK((uint32_t)submitflp(handle, (uint64_t)(int64_t)-2, 0, kFlipArg, 0, 0) ==
+        CHECK((uint32_t)submitflp(handle, (uint64_t)(int64_t)-2, 0, 1, 0, 0) ==
                   0x8029000au && getcount(eq, 0, 0, 0, 0, 0) == 0,
               "invalid low flip index does not post a VideoOut completion event");
-        CHECK((uint32_t)submitflp(handle, 16, 0, kFlipArg, 0, 0) == 0x8029000au &&
+        CHECK((uint32_t)submitflp(handle, 16, 0, 1, 0, 0) == 0x8029000au &&
                   getcount(eq, 0, 0, 0, 0, 0) == 0,
               "invalid high flip index does not post a VideoOut completion event");
-        submitflp(handle, 0, 0, kFlipArg, 0, 0);
-        CHECK(getcount(eq, 0, 0, 0, 0, 0) == 1,
-              "valid flip posts one VideoOut completion event");
 
-        KEvent fev{}; int32_t fout = -1; uint32_t fcap = 50000;
-        wait(eq, (uint64_t)(uintptr_t)&fev, 1, (uint64_t)(uintptr_t)&fout,
-             (uint64_t)(uintptr_t)&fcap, 0);
-        CHECK(fout == 1 && fev.ident == 0 && fev.filter == -13 && fev.udata == kFlipUdata,
-              "WaitEqueue returns the registered VideoOut flip event");
+        // Submit one flip carrying `flip_arg`, collect its event, return {raw kernel data, decoded}.
+        struct FlipSeen { bool ok; int64_t raw; int64_t decoded; };
+        auto flip_once = [&](int64_t flip_arg) -> FlipSeen {
+            submitflp(handle, 0, 0, (uint64_t)flip_arg, 0, 0);
+            if (getcount(eq, 0, 0, 0, 0, 0) != 1) return { false, 0, 0 };
+            KEvent fev{}; int32_t fout = -1; uint32_t fcap = 50000;
+            wait(eq, (uint64_t)(uintptr_t)&fev, 1, (uint64_t)(uintptr_t)&fout,
+                 (uint64_t)(uintptr_t)&fcap, 0);
+            if (!(fout == 1 && fev.ident == 0 && fev.filter == -13 && fev.udata == kFlipUdata))
+                return { false, 0, 0 };
+            if (vo_evid((uint64_t)(uintptr_t)&fev, 0, 0, 0, 0, 0) != 0) return { false, 0, 0 };
+            const int64_t raw = (int64_t)k_evdata((uint64_t)(uintptr_t)&fev, 0, 0, 0, 0, 0);
+            int64_t decoded = 0x5a5a5a5a5a5a5a5all;
+            if (vo_evdata((uint64_t)(uintptr_t)&fev, (uint64_t)(uintptr_t)&decoded, 0, 0, 0, 0) != 0)
+                return { false, 0, 0 };
+            return { true, raw, decoded };
+        };
+
+        // The guest's frame ordinals: small, positive, and advancing. The consumer's own tests.
+        bool ordinals_ok = true;
+        for (int64_t n = 1; n <= 4; ++n) {
+            const FlipSeen f = flip_once(n);
+            ordinals_ok &= f.ok && f.raw == (n << 16) && f.raw >= 0x10000 && (f.raw >> 16) == n &&
+                           f.decoded == n;
+        }
+        CHECK(ordinals_ok,
+              "flip event data is flipArg << 16: Uncharted's `sar data,0x10` reads its ordinal 1..4, "
+              "and sceVideoOutGetEventData returns the flipArg");
+
+        const FlipSeen neg = flip_once(-1);
+        CHECK(neg.ok && neg.raw == (int64_t)0xFFFFFFFFFFFF0000ull && neg.decoded == -1,
+              "a negative flipArg (-1) round-trips through the arithmetic decode");
+        const FlipSeen wide = flip_once(0x00007fffabcd1234ll);
+        CHECK(wide.ok && wide.raw == (int64_t)0x7fffabcd12340000ull &&
+                  wide.decoded == 0x00007fffabcd1234ll,
+              "a 47-bit flipArg round-trips through bits 16..63");
+        // Only the FLIP event is packed. Vblank posts its counter raw, and the accessor returns it
+        // as posted rather than applying the flip layout to a word nothing has shown to be packed.
+        KEvent vblank{}; vblank.ident = 1; vblank.filter = -13; vblank.data = 0x55;
         int64_t decoded = 0;
-        CHECK(vo_evid((uint64_t)(uintptr_t)&fev, 0, 0, 0, 0, 0) == 0 &&
-              vo_evdata((uint64_t)(uintptr_t)&fev, (uint64_t)(uintptr_t)&decoded,
-                        0, 0, 0, 0) == 0 &&
-              (uint64_t)decoded == kFlipArg,
-              "VideoOut accessors return flip id and the raw 64-bit flipArg");
+        CHECK(vo_evdata((uint64_t)(uintptr_t)&vblank, (uint64_t)(uintptr_t)&decoded,
+                        0, 0, 0, 0) == 0 && decoded == 0x55,
+              "GetEventData returns a non-flip VideoOut event's data as posted");
 
+        KEvent fev{}; fev.filter = -13; fev.ident = 0;
         decoded = 0x1122334455667788ll;
         CHECK((uint32_t)vo_evdata(0, (uint64_t)(uintptr_t)&decoded, 0, 0, 0, 0) ==
                   0x80290002u && decoded == 0x1122334455667788ll,
