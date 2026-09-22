@@ -1964,7 +1964,27 @@ HLE(k_add_ampr_event) {   // sceKernelAddAmprEvent(eq, id, udata)
 // --- SceKernelEvent field accessors (Kyty EventQueue.cpp:318-378: plain field reads). The APR
 // listener consumes its events EXCLUSIVELY through sceKernelGetEventData; unimplemented-0 here made
 // every event decode as ring 0 / counter 0 (a no-op for the range loop). ---
-HLE(k_get_event_data)    { return a0 ? (uint64_t)((const SceKEvent*)P(a0))->data   : 0; }
+// PROSPER_EVDATA_CENSUS=1 (default OFF, #3668): count sceKernelGetEventData calls on VideoOut
+// events (filter -13), which are the reads whose meaning the flip-event layout decides. Reports at
+// every power-of-two count, so a run of any length ends with a count within 2x of the true one and
+// the first read is always printed. Blind by construction to a title that reads SceKernelEvent.data
+// straight out of the struct -- this counts accessor calls, not field loads.
+static void evdata_census(const SceKEvent* ev) {
+    static const bool on = getenv("PROSPER_EVDATA_CENSUS") != nullptr;
+    if (!on || ev->filter != EVFILT_VIDEO_OUT) return;
+    static std::atomic<uint64_t> reads{0};
+    const uint64_t n = ++reads;
+    if ((n & (n - 1)) == 0)
+        fprintf(stderr, "[evdata-census] videoout reads=%llu last ident=%lld data=0x%llx udata=0x%llx\n",
+                (unsigned long long)n, (long long)ev->ident, (unsigned long long)ev->data,
+                (unsigned long long)ev->udata);
+}
+HLE(k_get_event_data) {
+    if (!a0) return 0;
+    const SceKEvent* ev = (const SceKEvent*)P(a0);
+    evdata_census(ev);
+    return (uint64_t)ev->data;
+}
 HLE(k_get_event_id)      { return a0 ? (uint64_t)((const SceKEvent*)P(a0))->ident  : 0; }
 HLE(k_get_event_filter)  { return a0 ? (uint64_t)(int64_t)((const SceKEvent*)P(a0))->filter : 0; }
 HLE(k_get_event_fflags)  { return a0 ? (uint64_t)((const SceKEvent*)P(a0))->fflags : 0; }
