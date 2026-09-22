@@ -164,6 +164,60 @@ int main() {
     CHECK(realized_draw.instance_count == 4,
           "draw realization retains the folded hardware instance count");
     {
+        // The live draw path must acquire one exact fragment version and share it across metadata
+        // and compilation, then acquire again for the next draw. Besides detecting a stale
+        // address-only shortcut, the acquisition count distinguishes the production fast path from
+        // the old sequence of independent consumed/interpolation/compile validations.
+        alignas(256) uint32_t versioned_ps[] = {
+            0x7e000280u, 0x7e0202f2u, 0x7e040280u, 0x7e0602f2u,
+            0xf800180fu, 0x03020100u, 0xbf810000u,
+        };
+        static const uint32_t replacement_ps[] = {
+            0x7e000280u, 0x7e020280u, 0x7e040280u, 0x7e0602f2u,
+            0xf800180fu, 0x03020100u, 0xbf810000u,
+        };
+        GpuState versioned = st;
+        set_pgm(versioned, P::SPI_SHADER_PGM_LO_PS, P::SPI_SHADER_PGM_HI_PS, versioned_ps);
+        clear_shader_recompile_cache();
+        clear_shader_analysis_cache();
+        DrawItem first_version;
+        const bool made_first = realize_draw_item(
+            versioned, &versioned.draws[0], versioned.draws[0].index_count,
+            0x10000u, false, first_version);
+        const ShaderAnalysisCacheStats first_analysis = shader_analysis_cache_stats();
+        const std::vector<uint32_t> expected_first = recompile_fragment(
+            versioned_ps, std::size(versioned_ps));
+        if (first_analysis.misses != 2 || first_analysis.hits != 0)
+            std::printf("  fragment analysis acquisitions: hits=%llu misses=%llu\n",
+                        static_cast<unsigned long long>(first_analysis.hits),
+                        static_cast<unsigned long long>(first_analysis.misses));
+        CHECK(made_first && first_analysis.misses == 2 && first_analysis.hits == 0,
+              "production draw shares one fragment analysis after stage-table construction");
+        std::copy(std::begin(replacement_ps), std::end(replacement_ps), versioned_ps);
+        DrawItem second_version;
+        const bool made_second = realize_draw_item(
+            versioned, &versioned.draws[0], versioned.draws[0].index_count,
+            0x10000u, false, second_version);
+        const ShaderAnalysisCacheStats second_analysis = shader_analysis_cache_stats();
+        const std::vector<uint32_t> expected_second = recompile_fragment(
+            replacement_ps, std::size(replacement_ps));
+        const bool rewrite_ok = made_first && made_second &&
+            first_version.fs_words() == expected_first &&
+            second_version.fs_words() == expected_second &&
+            first_version.fs_words() != second_version.fs_words() &&
+            second_analysis.invalidations == first_analysis.invalidations + 1;
+        if (!rewrite_ok)
+            std::printf("  fragment rewrite: made=%u/%u sizes=%zu/%zu expected=%zu/%zu "
+                        "invalidations=%llu/%llu\n",
+                        made_first, made_second, first_version.fs_words().size(),
+                        second_version.fs_words().size(), expected_first.size(),
+                        expected_second.size(),
+                        static_cast<unsigned long long>(first_analysis.invalidations),
+                        static_cast<unsigned long long>(second_analysis.invalidations));
+        CHECK(rewrite_ok,
+              "a later draw observes a same-address fragment rewrite without mixing versions");
+    }
+    {
         GpuState offset_state = st;
         offset_state.uc[P::GE_INDX_OFFSET] = 37;
         offset_state.draws[0].modifier = 0x1122334455667788ull;

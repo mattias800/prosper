@@ -993,7 +993,13 @@ std::shared_ptr<const ShaderCodeAnalysis> analyze_shader_code_cached(const uint3
         result->bounded_span = span < dwords;
         if (code && span) result->code.assign(code, code + span);
         result->code_hash = hash_shader_code(result->code);
-        result->pcrel_dispatch = rdna2_pcrel_dispatch_info(code, dwords);
+        // Every property in an analysis must describe the same owned byte version. Reading the
+        // guest pointer again here allowed a concurrent rewrite to pair new dispatch metadata with
+        // the old code copy even though later users retained this object as one immutable version.
+        const uint32_t* owned_code = result->code.empty() ? nullptr : result->code.data();
+        result->pcrel_dispatch = rdna2_pcrel_dispatch_info(owned_code, result->code.size());
+        result->fragment_color_export_mask =
+            fragment_color_export_mask(owned_code, result->code.size());
         result->bytes = static_cast<uint64_t>(result->code.size()) * sizeof(uint32_t) +
                         static_cast<uint64_t>(result->pcrel_dispatch.target_pcs.size()) *
                             sizeof(uint32_t) +
@@ -1158,7 +1164,8 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
                                          uint32_t vertex_lds_dwords = 0,
                                          const ComputeShaderConfig* compute_config = nullptr,
                                          bool fragment_wave32 = false,
-                                         bool capture_position = false) {
+                                         bool capture_position = false,
+                                         const SharedShaderAnalysis& captured_analysis = {}) {
     ShaderCompileKey key;
     key.resources = ShaderKeyResourceScratch::acquire();
     key.stage = stage;
@@ -1202,8 +1209,12 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
             compute_config->storage_buffer_int64_atomics;
         key.compute_packed_r11_storage = compute_config->packed_r11_storage;
     }
-    const std::shared_ptr<const ShaderCodeAnalysis> analysis =
-        code && dwords ? analyze_shader_code_cached(code, dwords) : nullptr;
+    // A live fragment draw may already own the exact byte-validated version used for its
+    // interpolation and export metadata. Reuse only that draw-local ownership; ordinary callers
+    // still validate by address here, and every later draw acquires afresh.
+    const SharedShaderAnalysis analysis =
+        stage == ShaderProgramStage::Fragment && captured_analysis ? captured_analysis
+        : code && dwords ? analyze_shader_code_cached(code, dwords) : nullptr;
     if (stage == ShaderProgramStage::Fragment && code && dwords && resources) {
         const PcrelDispatchSelection selection =
             select_pcrel_dispatch(code, dwords, resources, analysis.get());
@@ -1691,22 +1702,28 @@ void clear_shader_analysis_cache() {
     }
 }
 
-FragmentInterpolationLayout fragment_interpolation_layout_cached(
-        const uint32_t* code, size_t dwords,
+SharedShaderAnalysis acquire_shader_analysis(const uint32_t* code, size_t dwords) {
+    return analyze_shader_code_cached(code, dwords);
+}
+
+namespace {
+
+FragmentInterpolationLayout fragment_interpolation_layout_for_analysis(
+        const SharedShaderAnalysis& analysis,
         const PixelSystemInputMapping* system_inputs,
         const PixelInputMapping* pixel_inputs) {
-    const auto analysis = analyze_shader_code_cached(code, dwords);
-    if (!analysis || PROSPER_ENV_ON("PROSPER_NO_SHADER_ANALYSIS_CACHE"))
+    if (!analysis) return {};
+    const uint32_t* code = analysis->code.empty() ? nullptr : analysis->code.data();
+    const size_t dwords = analysis->code.size();
+    if (PROSPER_ENV_ON("PROSPER_NO_SHADER_ANALYSIS_CACHE"))
         return fragment_interpolation_layout(code, dwords, system_inputs, pixel_inputs);
 
     InterpolationCacheKey key;
-    // Use the immutable analysis version, without retaining its shader-byte allocation beyond the
-    // analysis cache's own memory bound. A same-address shader mutation receives a new identity.
     key.analysis_identity = analysis->identity;
     key.has_system_inputs = system_inputs != nullptr;
     if (system_inputs) key.system_inputs = *system_inputs;
     key.passthrough_mask = pixel_inputs ? pixel_inputs->effective_passthrough_mask() : 0u;
-    key.flat_mask = pixel_inputs ? pixel_inputs->effective_flat_mask() : 0u;   // #3051
+    key.flat_mask = pixel_inputs ? pixel_inputs->effective_flat_mask() : 0u;
     auto& cache = interpolation_cache();
     std::lock_guard lock(cache.mutex);
     auto found = cache.entries.find(key);
@@ -1727,12 +1744,13 @@ FragmentInterpolationLayout fragment_interpolation_layout_cached(
     return layout;
 }
 
-uint32_t fragment_consumed_attribute_mask_cached(const uint32_t* code, size_t dwords) {
-    static const bool no_cache = getenv("PROSPER_NO_SHADER_ANALYSIS_CACHE") != nullptr;
-    const auto analysis = no_cache ? nullptr : analyze_shader_code_cached(code, dwords);
-    if (!analysis) return fragment_consumed_attribute_mask(code, dwords);
-    // Keyed on the immutable analysis identity, not on the address: a same-address shader mutation
-    // receives a new identity, which is the property the interpolation cache next door relies on.
+uint32_t fragment_consumed_attribute_mask_for_analysis(
+        const SharedShaderAnalysis& analysis) {
+    if (!analysis) return 0;
+    const uint32_t* code = analysis->code.empty() ? nullptr : analysis->code.data();
+    const size_t dwords = analysis->code.size();
+    if (PROSPER_ENV_ON("PROSPER_NO_SHADER_ANALYSIS_CACHE"))
+        return fragment_consumed_attribute_mask(code, dwords);
     auto& state = consumed_attribute_mask_cache();
     auto& mutex = state.mutex;
     auto& masks = state.masks;
@@ -1743,12 +1761,50 @@ uint32_t fragment_consumed_attribute_mask_cached(const uint32_t* code, size_t dw
     }
     const uint32_t mask = fragment_consumed_attribute_mask(code, dwords);
     std::lock_guard lock(mutex);
-    // Cleared wholesale rather than aged; the entries are four bytes each and the bound exists only
-    // so a pathological run cannot grow it without limit.
     constexpr size_t max_entries = 4096;
     if (masks.size() >= max_entries) masks.clear();
     masks.emplace(analysis->identity, mask);
     return mask;
+}
+
+}  // namespace
+
+FragmentInterpolationLayout fragment_interpolation_layout_cached(
+        const uint32_t* code, size_t dwords,
+        const PixelSystemInputMapping* system_inputs,
+        const PixelInputMapping* pixel_inputs) {
+    const auto analysis = analyze_shader_code_cached(code, dwords);
+    return fragment_interpolation_layout_for_analysis(
+        analysis, system_inputs, pixel_inputs);
+}
+
+FragmentInterpolationLayout fragment_interpolation_layout_cached(
+        const SharedShaderAnalysis& analysis,
+        const PixelSystemInputMapping* system_inputs,
+        const PixelInputMapping* pixel_inputs) {
+    return fragment_interpolation_layout_for_analysis(
+        analysis, system_inputs, pixel_inputs);
+}
+
+uint32_t fragment_consumed_attribute_mask_cached(const uint32_t* code, size_t dwords) {
+    static const bool no_cache = getenv("PROSPER_NO_SHADER_ANALYSIS_CACHE") != nullptr;
+    const auto analysis = no_cache ? nullptr : analyze_shader_code_cached(code, dwords);
+    if (!analysis) return fragment_consumed_attribute_mask(code, dwords);
+    return fragment_consumed_attribute_mask_for_analysis(analysis);
+}
+
+uint32_t fragment_consumed_attribute_mask_cached(const SharedShaderAnalysis& analysis) {
+    return fragment_consumed_attribute_mask_for_analysis(analysis);
+}
+
+uint32_t fragment_color_export_mask_cached(const SharedShaderAnalysis& analysis) {
+    return analysis ? analysis->fragment_color_export_mask : 0u;
+}
+
+bool shader_analysis_has_prefix(const SharedShaderAnalysis& analysis,
+                                const uint32_t* words, size_t dwords) {
+    return analysis && words && analysis->code.size() >= dwords &&
+           std::equal(words, words + dwords, analysis->code.begin());
 }
 
 SharedShaderWords recompile_graphics_shader_cached_shared(
@@ -1756,11 +1812,13 @@ SharedShaderWords recompile_graphics_shader_cached_shared(
         const ShaderResourceTable* resources, const PixelInputMapping* pixel_inputs,
         const PixelSystemInputMapping* system_inputs, uint64_t* cache_identity,
         bool fragment_wave32, uint32_t vertex_lds_dwords,
-        bool vertex_capture_position) {
+        bool vertex_capture_position,
+        const SharedShaderAnalysis& captured_analysis) {
     ShaderCompileKey key = make_shader_compile_key(stage, code, dwords, resources, pixel_inputs,
                                                    system_inputs, nullptr, 0,
                                                    vertex_lds_dwords, nullptr,
-                                                   fragment_wave32, vertex_capture_position);
+                                                   fragment_wave32, vertex_capture_position,
+                                                   captured_analysis);
     // Guest memory is 1:1-mapped, so the caller's code pointer IS the guest program address; it must
     // be captured here because the key owns a copy of the words rather than pointing at them.
     const uint64_t program_address = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(code));
@@ -1815,10 +1873,11 @@ std::vector<uint32_t> recompile_graphics_shader_cached(
         const ShaderResourceTable* resources, const PixelInputMapping* pixel_inputs,
         const PixelSystemInputMapping* system_inputs, uint64_t* cache_identity,
         bool fragment_wave32, uint32_t vertex_lds_dwords,
-        bool vertex_capture_position) {
+        bool vertex_capture_position,
+        const SharedShaderAnalysis& captured_analysis) {
     SharedShaderWords words = recompile_graphics_shader_cached_shared(
         stage, code, dwords, resources, pixel_inputs, system_inputs, cache_identity,
-        fragment_wave32, vertex_lds_dwords, vertex_capture_position);
+        fragment_wave32, vertex_lds_dwords, vertex_capture_position, captured_analysis);
     return words ? *words : std::vector<uint32_t>{};
 }
 

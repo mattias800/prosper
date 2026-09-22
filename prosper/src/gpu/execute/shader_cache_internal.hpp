@@ -488,6 +488,7 @@ struct ShaderCodeAnalysis {
     std::vector<uint32_t> code;
     uint64_t code_hash = 0;
     PcrelDispatchInfo pcrel_dispatch;
+    uint32_t fragment_color_export_mask = 0;
     uint64_t identity = 0;
     size_t source_dwords = 0;
     bool bounded_span = false;
