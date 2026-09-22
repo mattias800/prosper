@@ -2129,9 +2129,9 @@ int main(int argc, char** argv) {
     // F8 and F9 are the richest diagnostics this project has, and the bundle grab could previously
     // be reached ONLY by a human pressing a key. Every agent here runs headless, so the best
     // instrument in the toolbox was the one nobody could aim -- and lanes built weaker ones instead.
-    // Both captures are now schedulable on either axis, because they answer different questions:
-    // "after N ms" aims at a wall-clock event (a movie starts, a frame rate collapses); "at frame N"
-    // aims at a reproducible ordinal already located with a cheap screenshot sweep.
+    // Both captures are schedulable on independent axes, because they answer different questions:
+    // "after N ms" aims at a wall-clock event; "at host frame N" aims at a presentation ordinal;
+    // and RenderDoc's pad-flip trigger aims at the route/input ordinal.
     //
     // All are one-shot and opt-in, and a malformed value disables its own trigger rather than firing
     // at an unintended moment -- see parse_* in capture_schedule.hpp / performance_capture_schedule.hpp.
@@ -2160,6 +2160,9 @@ int main(int argc, char** argv) {
     const uint64_t scheduledRdocFrame =
         prosper::frontend::parse_capture_frame(getenv("PROSPER_RENDERDOC_AT_FRAME"));
     bool scheduledRdocArmed = false;
+    const int64_t scheduledRdocPadFlip =
+        prosper::frontend::parse_capture_pad_flip(getenv("PROSPER_RENDERDOC_AT_PAD_FLIP"));
+    bool scheduledRdocPadFlipArmed = false;
     bool renderdocCaptureOpen = false;
     // A prosper "frame" is the GUEST's, not the app loop's, and conflating the two produces a
     // capture with no draws in it -- measured, not assumed (#3321). prosper submits the guest's GPU
@@ -2201,7 +2204,8 @@ int main(int argc, char** argv) {
                              "(expected a positive iteration count); using the default cap of "
                              "%llu\n",
                      mi, (unsigned long long)renderdocMaxIterations);
-    const bool renderdocWanted = scheduledRdocFrame != 0 || automaticRdocAfter.delay_ns() != 0;
+    const bool renderdocWanted = scheduledRdocFrame != 0 || scheduledRdocPadFlip != 0 ||
+                                 automaticRdocAfter.delay_ns() != 0;
     if (renderdocWanted) {
         auto& rdoc = prosper::frontend::RenderDocCapture::instance();
         if (!rdoc.available()) {
@@ -2219,6 +2223,10 @@ int main(int argc, char** argv) {
             if (scheduledRdocFrame)
                 std::fprintf(stderr, "[renderdoc] capture scheduled at host frame %llu (into %s)\n",
                              (unsigned long long)scheduledRdocFrame, grabDir.c_str());
+            if (scheduledRdocPadFlip)
+                std::fprintf(stderr, "[renderdoc] capture scheduled at guest pad flip %lld "
+                                     "(route/input axis; into %s)\n",
+                             static_cast<long long>(scheduledRdocPadFlip), grabDir.c_str());
             if (automaticRdocAfter.delay_ns())
                 std::fprintf(stderr, "[renderdoc] capture scheduled %llu ms into the app loop "
                                      "(into %s)\n",
@@ -2510,6 +2518,23 @@ int main(int argc, char** argv) {
             arm_frame_grab(true, "PROSPER_GRAB_BUNDLE_AFTER_MS");
         if (automaticRdocAfter.take_if_due(perfLoopStartNs, perfNow))
             arm_renderdoc_capture("PROSPER_RENDERDOC_AFTER_MS");
+        // This axis follows the same guest flip ordinal that anchors the scripted pad route, not
+        // the host swapchain. It must not establish that origin itself: an unavailable (-1)
+        // ordinal leaves the one-shot pending until the route has performed its first pad poll.
+        // Consume before attempting to arm, matching the elapsed/frame triggers, so an attempted
+        // capture never silently retries into a later scene. Avoid even querying the pad origin on
+        // the normal path: it is an external guest-state observation, not frontend frame state.
+        if (scheduledRdocPadFlip > 0 && !scheduledRdocPadFlipArmed) {
+            const int64_t nowPadFlip = prosper_pad_flip_ordinal();
+            if (prosper::frontend::capture_pad_flip_due(scheduledRdocPadFlip, nowPadFlip,
+                                                        scheduledRdocPadFlipArmed)) {
+                std::fprintf(stderr, "[renderdoc] pad-flip trigger due: requested %lld observed %lld\n",
+                             static_cast<long long>(scheduledRdocPadFlip),
+                             static_cast<long long>(nowPadFlip));
+                scheduledRdocPadFlipArmed = true;
+                arm_renderdoc_capture("PROSPER_RENDERDOC_AT_PAD_FLIP");
+            }
+        }
         openedThisBatch = rejectedThisBatch = false;
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
