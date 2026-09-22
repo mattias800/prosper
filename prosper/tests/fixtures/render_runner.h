@@ -4855,9 +4855,11 @@ inline uint64_t& persistent_ds_write_generation() {
     return generation;
 }
 
-// DB_RENDER_CONTROL.DEPTH_CLEAR_ENABLE substitutes the VALUE of depth writes (DB_DEPTH_CLEAR); it
-// does not create writes on its own — the write path still requires Z_ENABLE + Z_WRITE_ENABLE and a
-// compare that can pass. Real guest clear draws program exactly that shape (test+write+ALWAYS);
+// The current backend treats DB_RENDER_CONTROL.DEPTH_CLEAR_ENABLE as a requested clear only when
+// the depth write path is enabled. This is a conservative gate for the observed writes-disabled
+// Blue Prince case, not proof of the guest hardware's coverage or clear-value behavior. The
+// render loop below currently emits a full-scissor clear before the draw; that approximation
+// differs from per-fragment value substitution and is under investigation in #2790.
 // Blue Prince's per-light shadow loop instead issues a fullscreen rect with DEPTH_CLEAR_ENABLE set
 // and DB_DEPTH_CONTROL fully disabled immediately BEFORE sampling the plane its shadow casters
 // rendered — treating that as a clear/write destroyed the shadow map it is about to consume and
@@ -7097,10 +7099,11 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     // must not force a depth attachment, pick the clear value, or clear in-pass (#1287).
     // Investigation-only control for #2790. Mode 1 limits attachment clears to ALWAYS draws;
     // mode 2 additionally prevents those draws from overwriting the clear with their interpolated
-    // depth. Neither mode is a claim about the guest hardware's clear semantics.
+    // depth. Mode 3 instead writes the clear value through the draw's actual fragment coverage by
+    // collapsing its dynamic depth range. None is a claim about the hardware clear predicate.
     static const int sonic_clear_probe = [] {
         const char* value = std::getenv("PROSPER_DIAG_CLEAR_OVERWRITE");
-        return value && value[1] == '\0' && (value[0] == '1' || value[0] == '2')
+        return value && value[1] == '\0' && (value[0] == '1' || value[0] == '2' || value[0] == '3')
             ? value[0] - '0' : 0;
     }();
     const auto effective_depth_clear = [](const prosper::gpu::ResolvedPipelineState* ps) {
@@ -11995,8 +11998,11 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     // lines below. A submit whose draws carry a guest depth or stencil clear is therefore still
     // isolated against different depth contents from the pass it is naming a culprit in. Dynamic
     // state was the part the layer could see; this part it cannot, and it is not fixed here.
-    auto record_draw_dynamic_state = [](VkCommandBuffer command, const DV& v) {
-        vkCmdSetViewport(command, 0, 1, &v.viewport);
+    auto record_draw_dynamic_state = [&](VkCommandBuffer command, const DV& v, const prosper::gpu::ResolvedPipelineState* ps) {
+        VkViewport viewport = v.viewport;
+        if (sonic_clear_probe == 3 && ps && effective_depth_clear(ps))
+            viewport.minDepth = viewport.maxDepth = ps->depth_clear_value;
+        vkCmdSetViewport(command, 0, 1, &viewport);
         vkCmdSetScissor(command, 0, 1, &v.scissor);
         vkCmdSetLineWidth(command, v.line_width);
         vkCmdSetDepthBias(command, v.depth_bias_constant, v.depth_bias_clamp,
@@ -12038,7 +12044,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
              stencil_clear_effective(ps->stencil_clear_enable, ps->stencil_enable,
                                      ps->stencil_write_mask[0], ps->stencil_write_mask[1]))) {
             VkClearAttachment dsc{};
-            if (effective_depth_clear(ps)) dsc.aspectMask |= VK_IMAGE_ASPECT_DEPTH_BIT;
+            if (effective_depth_clear(ps) && sonic_clear_probe != 3)
+                dsc.aspectMask |= VK_IMAGE_ASPECT_DEPTH_BIT;
             if (stencil_clear_effective(ps->stencil_clear_enable, ps->stencil_enable,
                                         ps->stencil_write_mask[0], ps->stencil_write_mask[1]) &&
                 format_has_stencil)
@@ -12057,7 +12064,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                             ds_ctx.occlusion_precise ? VK_QUERY_CONTROL_PRECISE_BIT : 0);
         }
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, v.pipe);
-        record_draw_dynamic_state(cmd, v);
+        record_draw_dynamic_state(cmd, v, ps);
         if (v.use_desc) vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, v.layout, 0, v.n_sets, v.dsets.data(), 0, nullptr);
         const bool geom_here = geom_active && di == geom_item;
         if (geom_here) {
@@ -13061,7 +13068,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 vkCmdBeginRenderPass(c2, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
                 for (size_t di = 0; di < dv.size(); di++) { auto& v = dv[di]; if (!v.ok) continue; if ((int)di == kk) continue;
                     vkCmdBindPipeline(c2, VK_PIPELINE_BIND_POINT_GRAPHICS, v.pipe);
-                    record_draw_dynamic_state(c2, v);   // #3248: same state as the pass being isolated
+                    record_draw_dynamic_state(c2, v, draws[di].ps);   // #3248: same state as the pass being isolated
                     if (v.use_desc) vkCmdBindDescriptorSets(c2, VK_PIPELINE_BIND_POINT_GRAPHICS, v.layout, 0, v.n_sets, v.dsets.data(), 0, nullptr);
                     if (v.icount) { vkCmdBindIndexBuffer(c2, v.ibuf, v.ioffset, VK_INDEX_TYPE_UINT32); vkCmdDrawIndexed(c2, v.icount, v.instance_count, 0, v.vertex_offset, 0); }
                     else vkCmdDraw(c2, v.vcount, v.instance_count, static_cast<uint32_t>(v.vertex_offset), 0);
