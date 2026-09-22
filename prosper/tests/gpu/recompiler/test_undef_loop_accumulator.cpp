@@ -22,11 +22,30 @@
 //   0xBECC246A  s_and_saveexec_b64 s[76:77], vcc              pc=0373
 //   0x7D0200F9,0x0686DC13  the witness's own v_cmp -> s[92:93]  pc=0325
 //
-// Shape preserved from the witness: NESTED loops (the real one is an inner 324..369 inside an outer
-// 267..525); an EXEC-governed backedge (`s_cbranch_execnz`); an empty condition region at each
-// header (`s_cbranch_execz` is the first instruction, which `detect_divergent_loops` requires for an
-// execnz backedge); a VCC overwrite dominating the `s_cbranch_vccz`; and the post-loop mask by E
-// before `s_and_saveexec_b64`. `s[84:85]` is never written before the loop — that is the defect.
+// Control-flow shape taken from the witness: NESTED loops (the real one is an inner 324..369 inside
+// an outer 267..525); an EXEC-governed backedge (`s_cbranch_execnz`); an empty condition region at
+// each header (`s_cbranch_execz` first, which `detect_divergent_loops` requires for an execnz
+// backedge); a VCC overwrite dominating the `s_cbranch_vccz`; and the post-loop mask by E before
+// `s_and_saveexec_b64`.
+//
+// THIS IS A COMPILE-TIME REJECTION FIXTURE AND NOTHING MORE. Two limits, both load-bearing:
+//
+//   1. It is NOT safe to execute. The inner loop re-evaluates the same `v_cmp` inputs every
+//      iteration, so its condition never changes and the loop does not terminate. A terminating
+//      companion with evolving inputs and lanes that exit at different times is required before
+//      any GPU-execution claim, and does not exist yet.
+//   2. It does NOT reproduce the witness's CAUSE, only its reject. Here `s[84:85]` is genuinely
+//      never written before the loop. On the witness it IS written, by
+//      `pc=0002 s_load_dwordx8 s[80:87]` -- a wide load whose range covers the pair -- so that
+//      register is REUSED with dead prior contents rather than undefined. This was missed for
+//      several rounds because a `dst=sgpr:84` search cannot see a write addressed at s80.
+//      Consequently the fixture's `sreg=1/0` and the witness's `sreg=1/1` have different origins:
+//      here the low word is a loop placeholder and the high word absent; there both come from the
+//      load.
+//
+// Matching instruction bytes establish that the emitter takes the same ROUTE. They do not establish
+// equivalent control flow or runtime semantics, and on the point that matters most -- why the
+// operand is unresolved -- this fixture and the witness differ.
 //
 // KNOWN DIVERGENCE FROM THE WITNESS, recorded rather than smoothed over: the probe reports
 // `sreg=1/0` here against `sreg=1/1` on the real shader. `loop_written_regs`'s SOP2 case
