@@ -2105,6 +2105,12 @@ if(TARGET prosper_core)
   target_link_libraries(test_trip_bound_operation PRIVATE prosper_core)
   add_test(NAME trip_bound_operation COMMAND test_trip_bound_operation)
 
+  # #3745: CachedShader's hand-written copy pair suppressed its implicit moves, so every cache
+  # insertion copied. Asserts the move pair exists and transfers the SPIR-V shared_ptr.
+  add_executable(test_cached_shader_moves tests/gpu/execute/test_cached_shader_moves.cpp)
+  target_link_libraries(test_cached_shader_moves PRIVATE prosper_core)
+  add_test(NAME cached_shader_moves COMMAND test_cached_shader_moves)
+
   add_executable(test_shader_recompile_cache tests/gpu/execute/test_shader_recompile_cache.cpp)
   # Includes a shared fixture, which resolves from the `tests` root.
   target_include_directories(test_shader_recompile_cache PRIVATE tests)
