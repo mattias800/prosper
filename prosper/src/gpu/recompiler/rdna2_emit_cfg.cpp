@@ -1403,6 +1403,8 @@ bool region_defines_vcc_before_any_read(const std::vector<Rdna2Inst>& ins) {
         reads |= in.fmt == Rdna2Format::SOPP && (in.opcode == 0x06 || in.opcode == 0x07);
         reads |= in.fmt == Rdna2Format::VOP2 &&
                  (in.opcode == 0x01 || (in.opcode >= 0x28 && in.opcode <= 0x2a));
+        // Keep this implicit-read inventory in step with entry_block_defines_vcc_before_any_read:
+        // when V_DIV_FMAS (which reads VCC implicitly) is lowered, it belongs in BOTH lists.
         reads |= scalar_implicit_destination_read_width(in) != 0 && may_name_vcc(in.dst);
         // A conditional move into VCC keeps the old value on one outcome: that is a read.
         reads |= ((in.fmt == Rdna2Format::SOP1 &&
