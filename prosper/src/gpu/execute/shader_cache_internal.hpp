@@ -432,7 +432,26 @@ struct CachedShader {
     uint64_t bytes = 0;
     bool writes_trip_witness = false;
 
+    // std::atomic is neither copyable nor movable, so every special member that would touch
+    // last_use has to be written by hand. Declaring the copy pair suppresses the implicit move pair
+    // (#3745), so the move pair is spelled out too: without it every `emplace(std::move(value))`
+    // into ShaderCache::entries silently took the copy constructor. Moving transfers `spirv`
+    // (no refcount traffic) and snapshots last_use exactly as the copy does.
     CachedShader() = default;
+    CachedShader(CachedShader&& other) noexcept
+        : spirv(std::move(other.spirv)), identity(other.identity),
+          last_use(other.last_use.load(std::memory_order_relaxed)),
+          bytes(other.bytes), writes_trip_witness(other.writes_trip_witness) {}
+    CachedShader& operator=(CachedShader&& other) noexcept {
+        if (this != &other) {
+            spirv = std::move(other.spirv);
+            identity = other.identity;
+            last_use.store(other.last_use.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            bytes = other.bytes;
+            writes_trip_witness = other.writes_trip_witness;
+        }
+        return *this;
+    }
     CachedShader(const CachedShader& other)
         : spirv(other.spirv), identity(other.identity),
           last_use(other.last_use.load(std::memory_order_relaxed)),
