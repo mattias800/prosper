@@ -55,7 +55,8 @@ int main() {
         // hang on a splash it believes is playing, with nothing in any log. That failure is exactly
         // what this file exists for, and it is per-library now rather than per-file.
         "sceAvPlayerInit", "sceAvPlayerInitEx", "sceAvPlayerPostInit", "sceAvPlayerSetLogCallback",
-        "sceAvPlayerAddSource", "sceAvPlayerAddSourceEx", "sceAvPlayerStart", "sceAvPlayerIsActive",
+        "sceAvPlayerAddSource", "sceAvPlayerAddSourceEx", "sceAvPlayerStart", "sceAvPlayerStartEx",
+        "sceAvPlayerIsActive",
         "sceAvPlayerGetVideoData", "sceAvPlayerGetVideoDataEx", "sceAvPlayerGetAudioData",
         "sceAvPlayerStop", "sceAvPlayerClose",
         // libSceVideodec2 / libSceVdecsw, same reasoning, same entry point shape

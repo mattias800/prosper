@@ -203,6 +203,35 @@ int main() {
         check("every LiveTargetPixelFormat enumerator formats two texels", every);
     }
 
+    // CHOSEN POINTS of a larger target (#3765's follow-up): the first-N report cannot reach the
+    // inside of a defect region on a big buffer. Values are the linear index, so a wrong row
+    // stride or a swapped x/y produces a different, checkable number.
+    {
+        std::vector<float> values(4 * 3);
+        for (size_t i = 0; i < values.size(); ++i) values[i] = static_cast<float>(i) + 0.5f;
+        const auto bytes = f32_bytes(values);
+        const std::vector<NativeTexelPoint> points = {{3, 2}, {1, 0}, {0, 1}, {4, 0}, {0, 3}};
+        const std::string s =
+            format_native_texels_at(F::R32Float, bytes.data(), bytes.size(), 4, 3, points);
+        check("a point report names how many points it was asked for", has(s, "at 5 point(s)"));
+        check("(3,2) is linear index 11 on a 4-wide target", has(s, "texel[11] (3,2)") &&
+              has(s, "value=11.5"));
+        check("(1,0) and (0,1) are not confused", has(s, "texel[1] (1,0)") &&
+              has(s, "texel[4] (0,1)") && has(s, "value=4.5"));
+        check("a point past the width is reported, not dropped",
+              has(s, "(4,0) is outside the 4x3 extent"));
+        check("a point past the height is reported, not dropped",
+              has(s, "(0,3) is outside the 4x3 extent"));
+        check("points past the first-N limit are reachable", !has(s, "more texel(s) not shown"));
+        const std::string wrong =
+            format_native_texels_at(F::R32Float, bytes.data(), bytes.size() - 4, 4, 3, points);
+        check("a point report on a short readback says so",
+              has(wrong, "wants 48 bytes, readback has 44"));
+        const std::string bogus = format_native_texels_at(static_cast<F>(200), bytes.data(),
+                                                          bytes.size(), 4, 3, points);
+        check("a point report on an unhandled format says so", has(bogus, "not handled here"));
+    }
+
     std::printf("%s\n", failures ? "FAILURES PRESENT" : "all passed");
     return failures ? 1 : 0;
 }

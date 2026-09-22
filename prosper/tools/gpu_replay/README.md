@@ -866,6 +866,14 @@ render target written at guest address `ADDR` by semantic operation `OP`:
 tools/gpu_replay --output-target-after 6:0x2011800000 capture.prgcap resolved.bmp
 ```
 
+The image is an RGBA8 picture of the target, available for **every** capture format (single-channel
+formats render as gray, two-channel as R/G with B = 0; #3765). A picture clamps to 0..1, so for
+values add `--native-texel X,Y` (repeatable). It prints the named texels of that same target in
+its native type with raw bits, at any size, e.g. inside and outside a defect region on a 4K HDR
+buffer. A point outside the extent is reported rather than dropped, and the flag without
+`--output-target-after` is refused. Targets of at most 64 texels also get their first texels printed
+this way automatically.
+
 Selection is a write proof, not an address lookup. Ordinary draw attachments require a nonzero
 effective write mask. A fixed-function `CB_COLOR_CONTROL.MODE=RESOLVE` instead names raw color1 as
 its destination despite its zero shader mask; raw color0 is the resolve source and is rejected as

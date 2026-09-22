@@ -100,6 +100,7 @@ enum class FreeBsdErrno : uint32_t {
     EConnRefused    = 61,
     ELoop           = 62,
     ENameTooLong    = 63,
+    EHostDown       = 64,
     EHostUnreach    = 65,
     ENotEmpty       = 66,
     EDQuot          = 69,

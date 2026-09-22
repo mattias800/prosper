@@ -10,6 +10,7 @@
 #include "hle/util/hle_json2.hpp"
 #include "hle/dispatch/nid.hpp"
 #include "hle/kernel/sce_errno.hpp"   // libkernel error encoding (libSceRandom reject arms)
+#include "hle/net/sce_net_errors.hpp"  // libSceNet error encoding (#3545)
 #include "diagnostics/env_numeric.hpp"   // #3267: a typo must not unregister a default-ON NID family
 #include "hle/dispatch/callback_fs.hpp"
 #include "hle/input/ime_input.hpp"
@@ -199,7 +200,7 @@ std::atomic<int32_t> g_ssl_context_id{1};
 }
 HLE(s_net_pool_create) {
     svc_log("sceNetPoolCreate", a0,a1,a2,a3,a4,a5);
-    if (!svc_ptrish(a0) || (int32_t)a1 <= 0) return 0x80410118ull; // SCE_NET_ERROR_ENFILE
+    if (!svc_ptrish(a0) || (int32_t)a1 <= 0) return prosper::net::kNetErrorMFile; // errno 24 (EMFILE); see sce_net_errors.hpp
     return (uint64_t)(uint32_t)g_net_pool_id.fetch_add(1);
 }
 HLE(s_ssl_init) {

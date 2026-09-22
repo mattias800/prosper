@@ -19,6 +19,14 @@ from the tracker issues, and still gated, because it is a projection of state ra
 > title's current state — for that, read the tracker. Nothing is ever removed when a title moves on,
 > because the point of a blog is that it records *when* things happened.
 
+## 2026-09-22
+
+### Kena: Bridge of Spirits reaches its main menu
+
+We now reach the *Kena: Bridge of Spirits* main menu on Windows — its logo movie was waiting on an AvPlayer start call prosper had never registered. The 3D background behind the menu does not draw yet. [#3781](https://github.com/mattias800/prosper/issues/3781).
+
+![Kena: Bridge of Spirits main menu, Windows screenshot.exe default launch, t=60 s](assets/screenshots/kena-main-menu.webp)
+
 ## 2026-09-20
 
 ### hle_service.cpp was fifteen Sony libraries in one file; now it is five files

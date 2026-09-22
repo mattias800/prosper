@@ -1394,7 +1394,8 @@ int main(int argc, char** argv) {
         // arguments and needs the appended one to override whatever selected the current game.
         else if (a == "--dump" && i + 1 < argc) dump = argv[++i];                // boot the game at this app0 dir
         else if (a == "--volume" && i + 1 < argc) {
-            // Percent, 0-100. Clamped rather than rejected so a typo cannot deafen.
+            // Percent, 0-100. Clamped rather than rejected so a typo cannot deafen. It attenuates
+            // everything prosper-app plays: the title's audio-out ports and the launcher music (#3499).
             g_volume_percent = atoi(argv[++i]);
             if (g_volume_percent < 0) g_volume_percent = 0;
             if (g_volume_percent > 100) g_volume_percent = 100;
@@ -2324,6 +2325,7 @@ int main(int argc, char** argv) {
     };
     if (wantLibrary) {
         libraryUi.set_music_preference(appConfig.launcher_music);
+        libraryUi.set_output_volume(g_volume_percent / 100.0f);   // --volume covers the launcher too (#3499)
         if (libraryUi.init(win, vk.instance, vk.phys, vk.device, vk.qfamily, vk.queue, vk.swapchain,
                            vk.scFormat, vk.scImages, vk.scExtent)) {
             rescan_library();

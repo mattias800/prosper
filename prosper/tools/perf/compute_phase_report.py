@@ -388,15 +388,29 @@ def main():
     # here reads far too easily as "there was nothing there".
     print()
     # An aliased binding is emitted with only `ms` -- no sub-timers and no byte counts -- because it
-    # folded into an earlier binding and did no work. Counting those in `len(images)` divides every
+    # folded into an earlier binding's resource. Counting those in `len(images)` divides every
     # ms/binding by the wrong denominator (they are 64 % of Astro Bot's records) and dumps their whole
-    # `ms` into `unattributed`. Report them, do not average over them. Note this section must never
+    # `ms` into `unattributed`, so they stay out of the real-binding table. But "no sub-timers" is NOT
+    # "no work": an alias can spend real setup time before it discovers its canonical owner -- #3065's
+    # attribution has 660 alias records carrying 101.930 ms against 26.963 ms for the 60 real ones --
+    # so their count and MEASURED duration are always printed on a line of their own, never described
+    # as free and never added into the real-binding totals (#3388). Note this section must never
     # `return`: the top-programs table below is independent of it, and an all-alias log is ordinary.
     aliases = [i for i in images if i.get("alias", 0.0)]
     images = [i for i in images if not i.get("alias", 0.0)]
+    alias_ms = sum(i["ms"] for i in aliases)
+    all_wall = grand + sum(r["total_ms"] for r in failed)
+
+    def alias_line():
+        share = f" ({100.0 * alias_ms / all_wall:.1f}% of ALL dispatch wall)" if all_wall else ""
+        return (f"  alias bindings: {len(aliases)} record(s), {alias_ms:.3f} ms measured{share}; "
+                f"no sub-timers are emitted for an alias, so this time is UNDECOMPOSED, not free, "
+                f"and is not in the real-binding figures")
+
     if not images and aliases:
-        print(f"  setup image bindings: all {len(aliases)} records are aliased folds "
-              f"(no work, no sub-timers); nothing to decompose.")
+        print("  setup image bindings: 0 real bindings, all records are aliased folds; "
+              "nothing to decompose.")
+        print(alias_line())
     elif images:
         image_total = sum(i["ms"] for i in images)
         # `[compute-image]` carries no ok flag, so these records span FAILED dispatches as well --
@@ -404,12 +418,12 @@ def main():
         # succeeded-only total would therefore overstate their share (and can exceed 100%). Use the
         # wall time of every dispatch, and label it, so the two sections are not silently on
         # different bases.
-        base = grand + sum(r["total_ms"] for r in failed)
+        base = all_wall
         pct = lambda ms: (100.0 * ms / base) if base else 0.0
         print(f"  setup image bindings: {len(images)} real bindings, {image_total:.0f} ms "
-              f"({pct(image_total):.1f}% of ALL dispatch wall, succeeded + failed)"
-              + (f"; {len(aliases)} further records were aliased folds "
-                 f"({sum(i['ms'] for i in aliases):.0f} ms), excluded" if aliases else ""))
+              f"({pct(image_total):.1f}% of ALL dispatch wall, succeeded + failed)")
+        if aliases:
+            print(alias_line())
         print(f"  {'sub-phase':<26}{'ms':>12}{'% all':>10}{'ms/binding':>13}")
         print("  " + "-" * 61)
         def image_row(label, ms, depth=0):

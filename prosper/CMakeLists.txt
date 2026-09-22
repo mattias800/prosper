@@ -147,6 +147,12 @@ add_executable(test_compute_timing_selector tests/shared/compute/test_compute_ti
 target_include_directories(test_compute_timing_selector PRIVATE frontends)
 add_test(NAME compute_timing_selector_policy COMMAND test_compute_timing_selector)
 
+# execute_item()'s five CPU phases on a dispatch that breaks early (#3461): no negative interval,
+# no whole-item cleanup, and the parts still sum to the item.
+add_executable(test_compute_phase_attribution tests/shared/compute/test_compute_phase_attribution.cpp)
+target_include_directories(test_compute_phase_attribution PRIVATE frontends)
+add_test(NAME compute_phase_attribution COMMAND test_compute_phase_attribution)
+
 # Pure fail-closed policy for a behavior-neutral census of hypothetical deferred compute results.
 # It has no Vulkan dependency and does not change the live backend's synchronous writeback.
 add_executable(test_compute_authority_census tests/shared/compute/test_compute_authority_census.cpp)
@@ -544,6 +550,16 @@ if(Python3_Interpreter_FOUND)
   add_test(NAME flip_pacing_report_logic
            COMMAND "${Python3_EXECUTABLE}"
                    "${CMAKE_SOURCE_DIR}/tools/perf/test_flip_pacing_report.py")
+  # The two /proc samplers (#3400 / #3401). Both run against a /proc tree the test BUILDS, so they
+  # need no target process, no privileges and no sleeping: wait_profile's arms pin per-thread
+  # identity (same-name threads, TID reuse, renames, PID reuse), and lock_holder's pin that a run
+  # which could read no thread's syscall state is UNAVAILABLE (exit 2) rather than a negative.
+  add_test(NAME wait_profile_logic
+           COMMAND "${Python3_EXECUTABLE}"
+                   "${CMAKE_SOURCE_DIR}/tools/perf/test_wait_profile.py")
+  add_test(NAME lock_holder_logic
+           COMMAND "${Python3_EXECUTABLE}"
+                   "${CMAKE_SOURCE_DIR}/tools/perf/test_lock_holder.py")
   # The queue-depth timeline reader (#3033). Registered for a reason specific to this one: its
   # verdict is a DISCRIMINATOR that a pacer A/B rests on, and its first version could not tell a
   # port that was starved from a port that was merely silent -- both read queued=0. It reported a
@@ -909,6 +925,11 @@ if(TARGET prosper_core)
     add_executable(test_guest_tls_align tests/loader/test_guest_tls_align.cpp)
     target_link_libraries(test_guest_tls_align PRIVATE prosper_core)
     add_test(NAME guest_tls_align COMMAND test_guest_tls_align)
+    # #3635: a second guest_tls_activate_thread() on one thread keeps its guest TCB instead of
+    # installing a fresh zeroed block. The wrfsbase path is x86-64 Linux only; the test skips elsewhere.
+    add_executable(test_guest_tls_reactivate tests/host/tls/test_guest_tls_reactivate.cpp)
+    target_link_libraries(test_guest_tls_reactivate PRIVATE prosper_core)
+    add_test(NAME guest_tls_reactivate COMMAND test_guest_tls_reactivate)
   endif()
 
   # Cross-module TLS resolution (#136/#338): dynamic and initial-exec relocations resolve through
@@ -2084,6 +2105,12 @@ if(TARGET prosper_core)
   target_link_libraries(test_trip_bound_operation PRIVATE prosper_core)
   add_test(NAME trip_bound_operation COMMAND test_trip_bound_operation)
 
+  # #3745: CachedShader's hand-written copy pair suppressed its implicit moves, so every cache
+  # insertion copied. Asserts the move pair exists and transfers the SPIR-V shared_ptr.
+  add_executable(test_cached_shader_moves tests/gpu/execute/test_cached_shader_moves.cpp)
+  target_link_libraries(test_cached_shader_moves PRIVATE prosper_core)
+  add_test(NAME cached_shader_moves COMMAND test_cached_shader_moves)
+
   add_executable(test_shader_recompile_cache tests/gpu/execute/test_shader_recompile_cache.cpp)
   # Includes a shared fixture, which resolves from the `tests` root.
   target_include_directories(test_shader_recompile_cache PRIVATE tests)
@@ -2305,6 +2332,12 @@ endif()
   add_executable(test_guest_memory_search tests/host/memory/test_guest_memory_search.cpp)
   target_link_libraries(test_guest_memory_search PRIVATE prosper_core)
   add_test(NAME guest_memory_search COMMAND test_guest_memory_search)
+
+  # #3734: the single guest<->host copy policy every subsystem's helper forwards to -- never faults,
+  # exact vs prefix, NULL / wrap / zero-length, errno preserved -- against a mapping with a hole in it.
+  add_executable(test_guest_memory_copy tests/host/memory/test_guest_memory_copy.cpp)
+  target_link_libraries(test_guest_memory_copy PRIVATE prosper_core)
+  add_test(NAME guest_memory_copy COMMAND test_guest_memory_copy)
 
   add_executable(test_guest_read_cache_disabled tests/host/memory/test_guest_read_cache_disabled.cpp)
   target_link_libraries(test_guest_read_cache_disabled PRIVATE prosper_core)
@@ -2673,6 +2706,16 @@ endif()
   add_executable(test_gpu_replay_native_texels tests/test_gpu_replay_native_texels.cpp)
   target_link_libraries(test_gpu_replay_native_texels PRIVATE prosper_core)
   add_test(NAME gpu_replay_native_texels COMMAND test_gpu_replay_native_texels)
+
+  # The RGBA8 picture of a seed must cover every GpuCaptureColorFormat member (#3765: five were
+  # dropped to an empty image). -Werror=switch here as on gpu_replay, so the header's exhaustive
+  # switches fail the build for a new enumerator even in a configuration that skips gpu_replay.
+  add_executable(test_gpu_replay_rtt_seed_rgba8 tests/test_gpu_replay_rtt_seed_rgba8.cpp)
+  target_link_libraries(test_gpu_replay_rtt_seed_rgba8 PRIVATE prosper_core)
+  if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(test_gpu_replay_rtt_seed_rgba8 PRIVATE -Werror=switch)
+  endif()
+  add_test(NAME gpu_replay_rtt_seed_rgba8 COMMAND test_gpu_replay_rtt_seed_rgba8)
 
   add_executable(test_gpu_dependency_graph tests/gpu/execute/test_gpu_dependency_graph.cpp)
   target_link_libraries(test_gpu_dependency_graph PRIVATE prosper_core)

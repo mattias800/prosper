@@ -881,6 +881,47 @@ def main():
             f" {stall_at - filtered_at} earlier bursts were dropped -- a pointer into the log that"
             f" does not point at the thing (#3560)")
 
+    # 30. THE API FLIP PATH (#3564). `sceVideoOutSubmitFlip` advances the flip state exactly as
+    #     the in-stream packet does, and this parser read only `[ev] GpuFlip` -- so a title
+    #     flipping through the API reported "fewer than 2 flips -- nothing to pace" about a
+    #     paceable run. The positive instance is built HERE, not by the emitter the null came
+    #     from: 121 SubmitFlip lines at exactly 60 Hz, in the emitter's field order.
+    api = "".join(
+        f"[ev] SubmitFlip t={1.0 + i / 60.0:.6f} handle=0x1001 bufidx={i % 2} flipmode=0x1"
+        f" fl013arg=0x{i:x}\n" for i in range(121))
+    out, _ = run(api)
+    if "fewer than 2 flips" in out or "cannot be paced" in out:
+        failures.append(f"case 30: a SubmitFlip-only run was reported as unpaceable: {out!r}")
+    m = re.search(r"flips=(\d+) over [0-9.]+ s -> ([0-9.]+) fps", out)
+    if not m or int(m.group(1)) != 121 or abs(float(m.group(2)) - 60.0) > 0.5:
+        failures.append(f"case 30: expected 121 flips at 60.0 fps from the API path, got: {out!r}")
+    if "SubmitFlip=121" not in out:
+        failures.append(f"case 30: the report does not say the timeline came from SubmitFlip: {out!r}")
+    #     Mixed, in the shape the corpus actually holds: two API blank flips at boot, then GPU
+    #     flips. These five lines are verbatim prosper stderr (PROSPER_EVLOG=1, PPSA05684), the
+    #     domain arm for the new tag the way case 5 is for GpuFlip.
+    mixed_real = (
+        "[ev] SubmitFlip t=0.000000 handle=0x1001 bufidx=-1 flipmode=0x1 fl013arg=0xffffffffffffffff\n"
+        "[ev] SubmitFlip t=0.005005 handle=0x1001 bufidx=-1 flipmode=0x1 fl013arg=0x0\n"
+        "[ev] GpuFlip t=0.129640 handle=0x1001 bufidx=0 mode=0x1 fliparg=0x0\n"
+        "[ev] GpuFlip t=0.183581 handle=0x1001 bufidx=1 mode=0x1 fliparg=0x1\n"
+        "[ev] GpuFlip t=0.202183 handle=0x1001 bufidx=2 mode=0x1 fliparg=0x2\n")
+    out, _ = run(mixed_real)
+    if "flips=5 " not in out:
+        failures.append(f"case 30: a mixed run must pool both emitters into 5 flips: {out!r}")
+    if "GpuFlip=3 SubmitFlip=2" not in out:
+        failures.append(f"case 30: mixed run must name both emitter counts: {out!r}")
+    #     A SubmitFlip the emulator REJECTED (bufidx outside [-1, 15]) is printed before the
+    #     validation and never flips, so it must not become an interval.
+    rejected = api + "[ev] SubmitFlip t=9.000000 handle=0x1001 bufidx=16 flipmode=0x1 fl013arg=0x0\n"
+    out, _ = run(rejected)
+    if "flips=121 " not in out or "1 SubmitFlip call(s) with an out-of-range bufidx" not in out:
+        failures.append(f"case 30: a rejected SubmitFlip was counted as a flip or not named: {out!r}")
+    #     A GpuFlip-only log must print exactly what it printed before: no emitter line.
+    out, _ = run(real)
+    if "flip emitters:" in out:
+        failures.append(f"case 30: a GpuFlip-only log grew an emitter line: {out!r}")
+
     if failures:
         print("FAILURES:")
         for failure in failures:

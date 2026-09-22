@@ -4,6 +4,7 @@
 // them to the installed backend. The inherited AudioIn core provides deterministic paced silence.
 // prosper_core stays dependency-free; a concrete output frontend (SDL3, ...) installs itself via
 // audio_set_sink() from outside the core.
+#include "host/memory/guest_memory_copy.hpp"   // the one guest<->host copy policy (#3734)
 #include "hle/dispatch/dispatch.hpp"
 #include "host/abi/sysv_ms_bridge.hpp"   // #3246: kLegacyForwardedArgs, the fixed prologue's capacity
 #include "host/image/boot_program.hpp"   // #1659: shared guest-module labelling
@@ -1229,60 +1230,29 @@ static void audio2_reset() {
             if (close_sink[i]) sink->close(kA2SinkPortBase + (int)i);
 }
 
-// Fault-safe store to a guest out-pointer (same rationale as apr_write_guest_dst: a bad pointer
-// must fail the call, not SIGSEGV inside the HLE). WriteProcessMemory validates the complete
-// destination range before copying, matching the all-or-fail process_vm_writev contract here.
+// Guest-memory access for the audio libraries. Since #3734 these forward to the one shared policy in
+// host/memory/guest_memory_copy.hpp and keep their names for their ~70 call sites. That policy is
+// exactly what these already did -- never fault, a NULL guest address is refused at any length, and
+// otherwise zero bytes succeeds -- so no caller sees a difference.
+//
+// Fault-safe store to a guest out-pointer: a bad pointer must fail the call, not SIGSEGV inside the
+// HLE. False means the store did not (completely) land.
 bool audio_store_bytes(uint64_t dst, const void* src, size_t n) {
-    if (!dst || (!src && n)) return false;
-    if (!n) return true;
-#ifndef _WIN32
-    struct iovec l { const_cast<void*>(src), n }, r { (void*)(uintptr_t)dst, n };
-    return process_vm_writev(getpid(), &l, 1, &r, 1, 0) == (ssize_t)n;
-#else
-    SIZE_T written = 0;
-    return WriteProcessMemory(GetCurrentProcess(), (void*)(uintptr_t)dst, src, n, &written) &&
-           written == n;
-#endif
+    return host::guest_write_exact(dst, src, n);
 }
 
-// Fault-safe read from guest memory. Both platform paths require the complete range so callers
-// never consume a partially copied guest structure after an inaccessible-range failure.
+// Fault-safe read of a complete guest structure: callers never consume a partially copied struct
+// after an inaccessible-range failure.
 bool audio_read_bytes(uint64_t src, void* dst, size_t n) {
-    if (!src || (!dst && n)) return false;
-    if (!n) return true;
-#ifndef _WIN32
-    struct iovec l { dst, n }, r { (void*)(uintptr_t)src, n };
-    return process_vm_readv(getpid(), &l, 1, &r, 1, 0) == (ssize_t)n;
-#else
-    SIZE_T read = 0;
-    return ReadProcessMemory(GetCurrentProcess(), (const void*)(uintptr_t)src, dst, n, &read) &&
-           read == n;
-#endif
+    return host::guest_read_exact(src, dst, n);
 }
 
-// Best-effort read: copy as many leading bytes of [src, src+n) as are accessible, returning the
-// count actually read (0 on total failure). Unlike audio_read_bytes this tolerates a short/partial
-// guest range — the NGS2 mixer needs to consume whatever valid PCM a voice still has this render.
+// Best-effort read: as many leading bytes of [src, src+n) as are accessible (0 on total failure).
+// Unlike audio_read_bytes this tolerates a short guest range -- the NGS2 mixer consumes whatever
+// valid PCM a voice still has this render. The shared prefix form is exact to the byte, which the
+// binary search this used to carry was approximating.
 size_t audio_read_bytes_partial(uint64_t src, void* dst, size_t n) {
-    if (!src || !dst || !n) return 0;
-#ifndef _WIN32
-    struct iovec l { dst, n }, r { (void*)(uintptr_t)src, n };
-    ssize_t got = process_vm_readv(getpid(), &l, 1, &r, 1, 0);
-    if (got > 0) return (size_t)got;
-    // process_vm_readv is all-or-nothing per iovec; on failure, binary-search the readable prefix so a
-    // block that ends partway through the requested span still yields its valid head.
-    size_t lo = 0, hi = n;
-    while (lo < hi) {
-        size_t mid = lo + (hi - lo + 1) / 2;
-        struct iovec l2 { dst, mid }, r2 { (void*)(uintptr_t)src, mid };
-        if (process_vm_readv(getpid(), &l2, 1, &r2, 1, 0) == (ssize_t)mid) lo = mid; else hi = mid - 1;
-    }
-    return lo;
-#else
-    SIZE_T read = 0;
-    ReadProcessMemory(GetCurrentProcess(), (const void*)(uintptr_t)src, dst, n, &read);
-    return (size_t)read;
-#endif
+    return host::guest_read_prefix(src, dst, n);
 }
 
 bool a2_store_u32(uint64_t dst, uint32_t v) { return audio_store_bytes(dst, &v, sizeof v); }

@@ -3,15 +3,16 @@
 // Shared service-call helpers, lifted out of hle_service.cpp so the per-library files split
 // out of it can reach them: guest-memory read/write for marshalling in and out of a Sony API, and
 // the PROSPER_SVCLOG call trace they all log through.
-// The copy/write helpers are guest-memory access rather than anything service-specific, and this
-// is one of FOURTEEN files that open-code process_vm_readv/ReadProcessMemory for the same job. This
-// header is not that consolidation -- it is scoped to src/hle/service -- but it is where the service
-// half of it would land.
+// The copy/write helpers are guest-memory access rather than anything service-specific. Since #3734
+// they forward to host/memory/guest_memory_copy.hpp, which owns the one bounds policy; the names
+// stay so the per-library files still being split out of hle_service.cpp (#3735) do not all have to
+// change at once. New code should call host::guest_read_exact & co. directly.
 
 // The generated preamble was hle_service.cpp's own -- forty includes, for six helpers that need
 // eight. Trimmed by hand to what these definitions actually name, because a header included by
 // every per-library file is exactly where an over-broad preamble compounds.
 #include "host/platform/posix_shim.hpp"   // Darwin process_vm_readv shim + asm portability
+#include "host/memory/guest_memory_copy.hpp"   // the one guest<->host copy policy (#3734)
 #include <cinttypes>    // PRIx64 in the call trace
 #include <cstddef>      // size_t
 #include <cstdint>      // uint64_t, UINT64_MAX
@@ -34,42 +35,19 @@ namespace prosper {
 
 inline bool svclog() { static int v = getenv("PROSPER_SVCLOG") ? 1 : 0; return v; }
 inline bool svc_ptrish(uint64_t v) { return v >= 0x10000 && v < 0x7fffffffffffull; }
+// All-or-nothing marshalling of a guest structure. (Before #3734 these also refused bytes == 0;
+// every caller passes a nonzero sizeof or a length it has already checked, so the shared policy's
+// "zero bytes trivially succeeds" is not observable from any of them.)
 inline bool svc_copy_bytes(uint64_t src, void* dst, size_t bytes) {
-    if (!src || !dst || !bytes || src > UINT64_MAX - (bytes - 1)) return false;
-#ifdef _WIN32
-    SIZE_T copied = 0;
-    return ReadProcessMemory(GetCurrentProcess(), (const void*)(uintptr_t)src, dst, bytes, &copied) &&
-           copied == bytes;
-#else
-    iovec local{dst, bytes};
-    iovec remote{(void*)(uintptr_t)src, bytes};
-    return process_vm_readv(getpid(), &local, 1, &remote, 1, 0) == (ssize_t)bytes;
-#endif
+    return host::guest_read_exact(src, dst, bytes);
 }
 inline bool svc_write_bytes(uint64_t dst, const void* src, size_t bytes) {
-    if (!dst || !src || !bytes || dst > UINT64_MAX - (bytes - 1)) return false;
-#ifdef _WIN32
-    SIZE_T copied = 0;
-    return WriteProcessMemory(GetCurrentProcess(), (void*)(uintptr_t)dst, src, bytes, &copied) &&
-           copied == bytes;
-#else
-    iovec local{const_cast<void*>(src), bytes};
-    iovec remote{(void*)(uintptr_t)dst, bytes};
-    return process_vm_writev(getpid(), &local, 1, &remote, 1, 0) == (ssize_t)bytes;
-#endif
+    return host::guest_write_exact(dst, src, bytes);
 }
+// Whole words of the readable prefix -- the call trace's best-effort dump. It used to have no
+// overflow check at all; the shared prefix form clamps at the top of the address space.
 inline size_t svc_copy_words(uint64_t src, uint64_t* dst, size_t words) {
-    const size_t bytes = words * sizeof(uint64_t);
-#ifdef _WIN32
-    SIZE_T copied = 0;
-    ReadProcessMemory(GetCurrentProcess(), (const void*)(uintptr_t)src, dst, bytes, &copied);
-    return (size_t)copied / sizeof(uint64_t);
-#else
-    iovec local{dst, bytes};
-    iovec remote{(void*)(uintptr_t)src, bytes};
-    const ssize_t copied = process_vm_readv(getpid(), &local, 1, &remote, 1, 0);
-    return copied > 0 ? (size_t)copied / sizeof(uint64_t) : 0;
-#endif
+    return host::guest_read_prefix(src, dst, words * sizeof(uint64_t)) / sizeof(uint64_t);
 }
 inline void svc_log(const char* fn, uint64_t a0, uint64_t a1, uint64_t a2,
              uint64_t a3, uint64_t a4, uint64_t a5, int dump_words = 8) {

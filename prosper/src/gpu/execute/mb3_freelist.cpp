@@ -1,3 +1,4 @@
+#include "host/memory/guest_memory_copy.hpp"   // safe_read (#3734)
 #include "gpu/execute/mb3_freelist.hpp"
 #include "gpu/execute/gpu_execute.hpp"
 #include "host/image/boot_program.hpp"   // #1659: BOOT_EBOOT (the real mapped base)
@@ -34,22 +35,11 @@ std::atomic<uint32_t> g_pool_candidate_count{0};
 std::atomic<uint64_t> g_global_recycler_bin{0};
 
 bool safe_read(uint64_t addr, void* out, uint32_t bytes) {
-#if defined(__linux__)
-    // The allocator may decommit a candidate/node between a page-map probe and memcpy. Ask the
-    // kernel to copy from our own address space instead: process_vm_readv returns EFAULT for that
-    // race and never delivers SIGSEGV to the GPU worker.
-    struct iovec local { out, bytes };
-    struct iovec remote { (void*)(uintptr_t)addr, bytes };
-    return process_vm_readv(getpid(), &local, 1, &remote, 1, 0) == (ssize_t)bytes;
-#elif defined(_WIN32)
-    SIZE_T copied = 0;
-    return ReadProcessMemory(GetCurrentProcess(), (const void*)(uintptr_t)addr, out, bytes, &copied) &&
-           copied == bytes;
-#else
-    if (!guest_readable(addr, bytes)) return false;
-    memcpy(out, (const void*)(uintptr_t)addr, bytes);
-    return true;
-#endif
+    // The allocator may decommit a candidate/node between a page-map probe and memcpy, so this asks
+    // the kernel to copy instead, which reports that race rather than delivering SIGSEGV to the GPU
+    // worker. The shared policy (#3734) does exactly that on every host -- including macOS, which
+    // used to take a guest_readable() probe + memcpy and so was exposed to the same race.
+    return host::guest_read_exact(addr, out, bytes);
 }
 
 bool plausible_node(uint64_t addr) {

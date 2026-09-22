@@ -29,6 +29,11 @@ whatever ended up mapped, without any opinion on why.
   new one and forgetting that is silent by nature, so `PROSPER_WATCH_QUERY_AUDIT=1` re-derives every
   fast answer from the walk it replaced and reports disagreement; `guest_write_watch_index` builds a
   desynchronized state by hand to prove the audit fires rather than trusting its zero.
+- **`guest_memory_copy.{hpp,cpp}`** — the one way to copy bytes between a guest address and a host
+  buffer without faulting (#3734): an all-or-nothing form for marshalling structures and an exact
+  readable-prefix form for best-effort consumers, with one NULL / wrap / zero-length / errno policy.
+  Subsystem helpers (`svc_copy_bytes`, `audio_read_bytes`, …) forward here; new code calls it
+  directly rather than open-coding `process_vm_readv` or `ReadProcessMemory`.
 - **`guest_memory_search.{hpp,cpp}`** — "where else in the guest's address space do these exact bytes
   appear?". Used when an address stops holding what it held and the question becomes whether the
   guest *moved* the data or *consumed* it, which need opposite fixes. Its pure half owns the chunking

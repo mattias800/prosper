@@ -86,8 +86,9 @@ void guest_tls_set_templates(const TlsModuleDesc* descs, size_t count) {
 bool guest_tls_enabled() { return g_enabled && g_configured; }
 
 // Allocate + initialize this thread's guest TLS block and switch %fs to the guest TP. Returns the guest
-// TP (fs base), or 0 if disabled. Idempotent-ish: always makes a fresh block (called once per guest thread
-// at its entry). The block is intentionally leaked for the thread's lifetime (freed by process exit).
+// TP (fs base), or 0 if disabled. Idempotent on every platform: the first call on a thread allocates its
+// block, and any later call on that thread re-applies and returns the SAME TP rather than a fresh zeroed
+// one (#3635). The block is intentionally leaked for the thread's lifetime (freed by process exit).
 #ifdef __APPLE__
 // The current thread's guest thread-pointer (0 if this isn't a guest thread / trap mode off). Lives
 // in host TLS (%gs on Darwin — host libc's own TLS, untouched by the guest %fs emulation), so the
@@ -189,10 +190,26 @@ uint64_t guest_tls_own_tp() { return t_guest_tp; }
 
 uint64_t guest_tls_activate_thread() {
     if (!guest_tls_enabled()) return 0;
-    // NB: unlike the macOS and Windows paths this is NOT idempotent -- a second call on one thread
-    // mmaps a fresh zeroed block and installs it, discarding whatever the guest had stored in the
-    // first. No call site reaches here twice today, so it is latent rather than live; tracked
-    // separately rather than changed here, because nothing in this fix depends on it.
+    // Idempotent, like the macOS and Windows arms (#3635): one TCB per thread for its lifetime. A
+    // second call must NOT mmap a fresh zeroed block -- that would silently discard everything the
+    // guest stored in its static TLS since the first activation (initial-exec variables, libc.prx's
+    // allocator arena and tcache) and leak the old block. Re-apply %fs so the call still means
+    // "this thread now runs on its guest TCB".
+    //
+    // Precondition, shared with the allocating path below: called on the HOST %fs. t_guest_tp is an
+    // ordinary thread_local, resolved through %fs, and the allocating path stashes rd_fsbase() as
+    // this thread's host TCB. Every call site (hle_kernel.cpp thread entry, run_entry) runs on host %fs.
+    //
+    // Read t_guest_tp ONCE, before %fs moves, and return that copy. `wr_fsbase(t_guest_tp); return
+    // t_guest_tp;` is wrong on Linux (unlike Windows, where host TLS is %gs): the compiler may re-read
+    // the thread_local for the return -- an unoptimised build does -- and after wrfsbase that read
+    // resolves through the GUEST TCB and returns guest memory. The empty asm makes `own` opaque, so
+    // the compiler cannot replace it with a second load of t_guest_tp.
+    if (uint64_t own = t_guest_tp) {
+        __asm__ volatile("" : "+r"(own));
+        wr_fsbase(own);
+        return own;
+    }
     uint64_t host_fs = rd_fsbase();
     guest_tls_record_host_fs(host_fs);   // #3623: before any guest TCB exists for this thread
     size_t total = (size_t)g_total_below + TCB_SIZE;

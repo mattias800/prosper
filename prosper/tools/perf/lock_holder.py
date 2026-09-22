@@ -58,6 +58,17 @@ the value there is part of the internal futex/sequence state. This tool cannot t
 from the address alone, so a "plausible" TID read from a condvar would be pure noise. Guard: an
 owner is only reported when the value is a LIVE TID in this process. A stale or nonsense value is
 reported as unresolved rather than as a thread.
+
+A NEGATIVE NEEDS COVERAGE (#3401)
+---------------------------------
+"No thread was in a futex wait" is only a finding about threads whose syscall state was READ.
+The first version turned every OSError into the same None a readable non-futex sample returns,
+so a run denied /proc access printed `owner-word read failures: 0` -- true, the reader was never
+reached -- beside a confident "this process is not blocked on a lock", and exited 0. Every
+thread-sample is now one of: readable futex wait, readable non-futex, vanished mid-sweep (the
+thread exited; a race, not a failure), or unreadable (with its errno). Zero readable samples is
+UNAVAILABLE and exits 2; a partial run states what it could not see. And even a fully readable
+run supports only "none observed in these samples", which is how the negative is worded.
 """
 
 from __future__ import annotations
@@ -66,6 +77,7 @@ import argparse
 import collections
 import ctypes
 import ctypes.util
+import errno
 import os
 import struct
 import sys
@@ -73,25 +85,40 @@ import time
 
 PTHREAD_MUTEX_OWNER_OFFSET = 8      # x86-64 glibc; see module docstring
 NR_FUTEX = 202                      # x86-64
+# The /proc mount this reads. A constant so the self-test can build a process tree by hand.
+PROC_ROOT = "/proc"
+# A task file that stops existing between listing the tasks and reading it means the thread
+# EXITED -- an ordinary race, and not a gap in coverage the way a permission denial is.
+VANISHED = (errno.ENOENT, errno.ESRCH)
+
+
+def read_checked(path):
+    """(text, None) on success, (None, errno-name) on failure -- the failure is kept, not erased."""
+    try:
+        with open(path) as f:
+            return f.read().strip(), None
+    except OSError as e:
+        return None, (errno.errorcode.get(e.errno, str(e.errno)) if e.errno else type(e).__name__)
 
 
 def read(path):
+    return read_checked(path)[0]
+
+
+def thread_ids_checked(pid):
+    """(tids, None) or ([], errno-name). An empty list with no error is a process with no tasks."""
     try:
-        with open(path) as f:
-            return f.read().strip()
-    except OSError:
-        return None
+        return sorted(int(t) for t in os.listdir(f"{PROC_ROOT}/{pid}/task")), None
+    except OSError as e:
+        return [], (errno.errorcode.get(e.errno, str(e.errno)) if e.errno else type(e).__name__)
 
 
 def thread_ids(pid):
-    try:
-        return sorted(int(t) for t in os.listdir(f"/proc/{pid}/task"))
-    except OSError:
-        return []
+    return thread_ids_checked(pid)[0]
 
 
 def thread_name(pid, tid):
-    stat = read(f"/proc/{pid}/task/{tid}/stat")
+    stat = read(f"{PROC_ROOT}/{pid}/task/{tid}/stat")
     if not stat or "(" not in stat:
         return None
     return stat[stat.index("(") + 1:stat.rindex(")")]
@@ -118,14 +145,29 @@ def read_remote(pid, addr, size):
 
 
 def futex_wait_target(pid, tid):
-    """The futex uaddr this thread is blocked on, or None if it is not in a futex wait."""
-    sc = (read(f"/proc/{pid}/task/{tid}/syscall") or "").split()
-    if len(sc) < 2 or sc[0] != str(NR_FUTEX):
-        return None
+    """(uaddr, "futex") for a thread in a futex wait, else (None, status).
+
+    status is "not-futex" (READ, and not a futex wait), "vanished" (the thread exited between
+    enumeration and this read), "unreadable:<ERRNO>", or "malformed" (read, but not parseable).
+    Only the first two are observations; the rest are missing coverage and must not be counted
+    as a non-futex sample -- which is what made #3401's negative false."""
+    text, err = read_checked(f"{PROC_ROOT}/{pid}/task/{tid}/syscall")
+    if err is not None:
+        if err in (errno.errorcode[e] for e in VANISHED):
+            return None, "vanished"
+        return None, f"unreadable:{err}"
+    sc = text.split()
+    if not sc:
+        return None, "malformed"
+    if sc[0] != str(NR_FUTEX):
+        # "running", "-1 <sp> <pc>" (blocked outside a syscall), or another syscall number.
+        return None, "not-futex"
+    if len(sc) < 2:
+        return None, "malformed"
     try:
-        return int(sc[1], 16)
+        return int(sc[1], 16), "futex"
     except ValueError:
-        return None
+        return None, "malformed"
 
 
 def owner_of(pid, uaddr, live_tids):
@@ -157,7 +199,7 @@ def main() -> int:
     ap.add_argument("--top", type=int, default=8)
     args = ap.parse_args()
 
-    if not os.path.isdir(f"/proc/{args.pid}"):
+    if not os.path.isdir(f"{PROC_ROOT}/{args.pid}"):
         print(f"error: no process {args.pid}", file=sys.stderr)
         return 2
 
@@ -168,18 +210,39 @@ def main() -> int:
     contended_samples = collections.Counter()
     samples_taken = 0
     read_failures = 0
+    # Coverage, kept separately from the owner-word reads it used to be confused with.
+    observed = 0                          # thread-samples whose syscall state was READ
+    vanished = 0                          # thread exited mid-sweep: a race, not a gap
+    unreadable = collections.Counter()    # reason -> thread-samples we could NOT see
+    enum_failures = collections.Counter() # reason -> sweeps whose task list could not be read
+    stopped = ""
 
     for _ in range(args.samples):
-        tids = thread_ids(args.pid)
+        tids, enum_err = thread_ids_checked(args.pid)
+        if enum_err is not None:
+            if enum_err in (errno.errorcode[e] for e in VANISHED):
+                stopped = "target exited"
+                break
+            enum_failures[enum_err] += 1
+            time.sleep(args.interval)
+            continue
         if not tids:
+            stopped = "target has no threads (exited)"
             break
         live = set(tids)
         samples_taken += 1
         blocked_on = {}
         for tid in tids:
-            u = futex_wait_target(args.pid, tid)
-            if u:
+            u, status = futex_wait_target(args.pid, tid)
+            if status == "futex":
+                observed += 1
                 blocked_on.setdefault(u, []).append(tid)
+            elif status == "not-futex":
+                observed += 1
+            elif status == "vanished":
+                vanished += 1
+            else:
+                unreadable[status] += 1
 
         for uaddr, ts in blocked_on.items():
             contended_samples[uaddr] += 1
@@ -195,14 +258,41 @@ def main() -> int:
         time.sleep(args.interval)
 
     print(f"\nlock_holder: pid {args.pid}")
-    print(f"  samples: {samples_taken} of {args.samples} attempted"
-          f"{'' if samples_taken == args.samples else '  (target exited early)'}")
+    short = ""
+    if samples_taken != args.samples:
+        short = f"  ({stopped})" if stopped else "  (task list unreadable in the rest)"
+    print(f"  samples: {samples_taken} of {args.samples} attempted{short}")
+    if enum_failures:
+        print("  task-list read failures: " + ", ".join(
+            f"{why} x{n}" for why, n in enum_failures.most_common())
+            + "  <-- those sweeps saw no thread at all")
+    missing = sum(unreadable.values())
+    print(f"  syscall coverage: {observed} thread-sample(s) read, {missing} unreadable"
+          + (" (" + ", ".join(f"{why} x{n}" for why, n in unreadable.most_common()) + ")"
+             if missing else "")
+          + f", {vanished} vanished mid-sweep")
     print(f"  owner-word read failures: {read_failures}"
           f"{'  <-- check ptrace permission; every owner below would be missing' if read_failures else ''}")
+    if observed == 0:
+        # Nothing was SEEN, so nothing can be concluded -- in either direction. Exit 2, the
+        # "could not evaluate" status, so a script cannot read this as a clean negative.
+        print("\n  UNAVAILABLE: no thread's syscall state could be read in any sample, so this run"
+              "\n  says NOTHING about lock waits. Fix access (same user? ptrace_scope? container?)"
+              "\n  and re-run; do not record this as 'not blocked on a lock'.\n")
+        return 2
     if not contended_samples:
-        print("\n  No thread was in a futex wait in ANY sample. That is a real finding: this "
-              "process\n  is not blocked on a lock. It is NOT the same as 'the tool found nothing'.\n")
+        print(f"\n  No futex wait was observed in {observed} readable thread-sample(s) over"
+              f" {samples_taken} sweep(s).\n  That is an observation about THESE samples, not"
+              f" proof the process never blocks on a lock;\n  a wait shorter than --interval can"
+              f" fall between sweeps.")
+        if missing:
+            print(f"  PARTIAL: {missing} thread-sample(s) could not be read, and a waiter among"
+                  f" them would be invisible here.")
+        print()
         return 0
+    if missing:
+        print(f"\n  PARTIAL: {missing} thread-sample(s) could not be read; a lock whose waiters were"
+              f" all among them is missing below.")
 
     print(f"\n  {'lock (futex uaddr)':<20} {'contended':>9}  holder / waiters")
     print(f"  {'-'*20} {'-'*9}  {'-'*52}")

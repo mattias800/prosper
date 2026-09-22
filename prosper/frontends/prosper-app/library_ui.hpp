@@ -69,6 +69,10 @@ public:
     // app_config.hpp is layered. Has no effect once init() has run.
     void set_music_preference(bool on) { musicToggle_ = on; }
 
+    // prosper-app's `--volume`, as a linear factor in [0,1] (#3499). It attenuates the launcher music
+    // as well as the title (launcher_music_output_gain). Must be set before init(); no effect after.
+    void set_output_volume(float volume) { outputVolume_ = volume; }
+
     // Release every Vulkan object. Safe to call twice, and safe to call without a successful init.
     void shutdown();
 
@@ -171,6 +175,7 @@ private:
 
     LibraryMedia           media_;
     bool                   musicToggle_ = true;   // mirrors the persisted setting for the in-UI switch
+    float                  outputVolume_ = 1.0f;  // --volume, applied on top of the music's own level
 
     // PROSPER_LIBRARY_STATS=1: per-frame timing for the library view, reported at shutdown. A mean
     // cannot detect a stutter — a 40 ms frame among 5 ms ones averages away — so what is kept is the

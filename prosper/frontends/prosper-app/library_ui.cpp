@@ -187,7 +187,8 @@ bool LibraryUi::init(SDL_Window* window, VkInstance instance, VkPhysicalDevice p
     // the developer's desktop by default.
     const char* musicEnv = SDL_getenv("PROSPER_LAUNCHER_MUSIC");
     musicToggle_ = resolve_launcher_music(musicEnv, musicToggle_, /*automated=*/stats_);
-    const float gain = resolve_launcher_music_gain(SDL_getenv("PROSPER_LAUNCHER_MUSIC_VOLUME"));
+    const float gain = launcher_music_output_gain(
+        resolve_launcher_music_gain(SDL_getenv("PROSPER_LAUNCHER_MUSIC_VOLUME")), outputVolume_);
     if (!media_.init(phys_, device_, queue_, qfamily_, sampler_, &budget_, musicToggle_, gain))
         fprintf(stderr, "[library] background art and music unavailable\n");
     // Mirror the EFFECTIVE state, not the request: if the audio device could not be opened the checkbox

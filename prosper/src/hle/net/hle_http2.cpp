@@ -34,6 +34,7 @@
 // GetCookieStats, GetMemoryPoolStats) fail with out-parameters untouched. Answering SCE_OK there
 // would claim a store that does not exist, and a later read would contradict it.
 #include "hle/net/hle_http2.hpp"
+#include "hle/net/sce_net_errors.hpp"
 #include "hle/dispatch/dispatch.hpp"
 
 #include <cstddef>
@@ -334,7 +335,7 @@ HLE(h_http2_send_request) {
     Object* req = live(a0, Kind::Request);
     if (!req) return err(http2::kErrorInvalidId);
     req->send_attempted = true;
-    req->send_error = http2::kNetErrorNetUnreach;
+    req->send_error = net::kNetErrorNetUnreach;
     return err(req->send_error);
 }
 
