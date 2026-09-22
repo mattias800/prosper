@@ -151,7 +151,11 @@ def main():
         w = min(nwin - 1, int(elapsed / per_window))
         if not os.path.isdir(f"{PROC_ROOT}/{pid}"):
             lost = "the target process exited"; break
-        if process_starttime(pid) != pinned:
+        now_start = process_starttime(pid)
+        if now_start is None:
+            # Gone between the isdir() above and this read: an exit, not a reuse.
+            lost = "the target process exited"; break
+        if now_start != pinned:
             lost = "the PID now names a DIFFERENT process (its starttime changed)"; break
         for tid in thread_ids(pid):
             name, label, start = bucket(pid, tid)
