@@ -5697,6 +5697,14 @@ inline std::atomic<uint64_t>& backend_draw_iso_pass_count() {
     return count;
 }
 
+// Counts diagnostic depth-clear state actually selected for a draw. The dedicated CTest arms
+// each probe before process start and requires this to advance, so a clean Vulkan validation run
+// cannot silently pass without recording the new path.
+inline std::atomic<uint64_t>& backend_depth_clear_probe_armed_count() {
+    static std::atomic<uint64_t> count{0};
+    return count;
+}
+
 // CONTRACT: a pure TRANSFER_DST (readback) buffer may be backed by HOST_CACHED memory that is NOT
 // HOST_COHERENT. Call invalidate_mapped_readback() after mapping and before reading one, and do not
 // host-WRITE through such a mapping without a flush. Any usage including TRANSFER_SRC is always
@@ -9418,8 +9426,9 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             dss.depthWriteEnable = ps->depth_write_enable ? VK_TRUE : VK_FALSE;
             dss.depthCompareOp   = (VkCompareOp)ps->depth_compare_op;
             if ((sonic_clear_probe == 2 || sonic_clear_probe == 5) &&
-                ps->depth_compare_op == VK_COMPARE_OP_ALWAYS && effective_depth_clear(ps))
+                ps->depth_compare_op == VK_COMPARE_OP_ALWAYS && effective_depth_clear(ps)) {
                 dss.depthWriteEnable = VK_FALSE;
+            }
             // UE4 repeats its reverse-Z depth prepass in a separately translated base-pass shader.
             // A one-ULP position difference between those shaders makes exact EQUAL reject the whole
             // base pass, although the guest hardware accepts the pair. Preserve occlusion by relaxing
@@ -12041,8 +12050,10 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     // state was the part the layer could see; this part it cannot, and it is not fixed here.
     auto record_draw_dynamic_state = [&](VkCommandBuffer command, const DV& v, const prosper::gpu::ResolvedPipelineState* ps) {
         VkViewport viewport = v.viewport;
-        if ((sonic_clear_probe == 3 || sonic_clear_probe == 4) && ps && effective_depth_clear(ps))
+        if ((sonic_clear_probe == 3 || sonic_clear_probe == 4) && ps && effective_depth_clear(ps)) {
             viewport.minDepth = viewport.maxDepth = ps->depth_clear_value;
+            backend_depth_clear_probe_armed_count().fetch_add(1, std::memory_order_relaxed);
+        }
         vkCmdSetViewport(command, 0, 1, &viewport);
         vkCmdSetScissor(command, 0, 1, &v.scissor);
         vkCmdSetLineWidth(command, v.line_width);
@@ -12096,8 +12107,11 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             VkClearRect rect{v.scissor, 0, 1};
             // A fully clipped draw legitimately has a zero-area dynamic scissor, but Vulkan requires
             // vkCmdClearAttachments rectangles to have non-zero width and height (VUID 02682/02683).
-            if (dsc.aspectMask && rect.rect.extent.width && rect.rect.extent.height)
+            if (dsc.aspectMask && rect.rect.extent.width && rect.rect.extent.height) {
                 vkCmdClearAttachments(cmd, 1, &dsc, 1, &rect);
+                if (sonic_clear_probe == 1 && (dsc.aspectMask & VK_IMAGE_ASPECT_DEPTH_BIT))
+                    backend_depth_clear_probe_armed_count().fetch_add(1, std::memory_order_relaxed);
+            }
         }
         if (!v.ok) continue;
         if (ds_active) {
@@ -12107,6 +12121,10 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         }
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, v.pipe);
         record_draw_dynamic_state(cmd, v, ps);
+        if ((sonic_clear_probe == 2 || sonic_clear_probe == 5) && ps && effective_depth_clear(ps) &&
+            ps->depth_compare_op == VK_COMPARE_OP_ALWAYS && ps->depth_write_enable &&
+            !v.depth_write)
+            backend_depth_clear_probe_armed_count().fetch_add(1, std::memory_order_relaxed);
         if (v.use_desc) vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, v.layout, 0, v.n_sets, v.dsets.data(), 0, nullptr);
         const bool geom_here = geom_active && di == geom_item;
         if (geom_here) {
