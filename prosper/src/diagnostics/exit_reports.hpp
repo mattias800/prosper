@@ -28,9 +28,11 @@
 //     report as well (live_compute.cpp's censuses do this).
 #pragma once
 
+#include <functional>
+
 namespace prosper::diagnostics {
 
-using ExitReport = void (*)();
+using ExitReport = std::function<void()>;
 
 // Register `report` to run once at the end of the run. Safe to call from any thread and at any
 // time, including during static initialisation. A report registered after a flush runs at the

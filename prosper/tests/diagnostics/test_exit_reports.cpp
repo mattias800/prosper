@@ -11,10 +11,12 @@
 // ordinary return from main().
 #include "diagnostics/exit_reports.hpp"
 
+#include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <string_view>
 
 #ifdef _WIN32
 #define popen _popen
@@ -25,25 +27,38 @@ using namespace prosper::diagnostics;
 
 namespace {
 
-int failures = 0;
+// Counters live in functions, not in mutable globals: a report is a plain callable with no
+// captures, so it reaches its counter through the function that owns it.
+int& failures() { static int n = 0; return n; }
+int& a_runs() { static int n = 0; return n; }
+int& b_runs() { static int n = 0; return n; }
+int& c_runs() { static int n = 0; return n; }
+
 void check(const char* what, bool ok) {
-    std::printf("  %s  %s\n", ok ? "PASS" : "FAIL", what);
-    if (!ok) ++failures;
+    std::fputs(ok ? "  PASS  " : "  FAIL  ", stdout);
+    std::fputs(what, stdout);
+    std::fputs("\n", stdout);
+    if (!ok) ++failures();
 }
 
-int a_runs = 0, b_runs = 0, c_runs = 0;
-void report_a() { ++a_runs; }
-void report_b() { ++b_runs; }
-void report_c() { ++c_runs; }
-void report_marker() { std::fprintf(stderr, "EXIT-REPORT-MARKER-3353\n"); }
+bool has(std::string_view text, std::string_view needle) {
+    return text.find(needle) != std::string_view::npos;
+}
+
+constexpr std::string_view kMarker = "EXIT-REPORT-MARKER-3353";
+
+void report_a() { ++a_runs(); }
+void report_b() { ++b_runs(); }
+void report_c() { ++c_runs(); }
+void report_marker() { std::fputs("EXIT-REPORT-MARKER-3353\n", stderr); }
 
 std::string run_child(const char* self, const char* mode) {
     const std::string command = std::string("\"") + self + "\" " + mode + " 2>&1";
     FILE* pipe = popen(command.c_str(), "r");
     if (!pipe) return "<popen failed>";
     std::string out;
-    char buffer[256];
-    while (std::fgets(buffer, sizeof buffer, pipe)) out += buffer;
+    std::array<char, 256> buffer{};
+    while (std::fgets(buffer.data(), static_cast<int>(buffer.size()), pipe)) out += buffer.data();
     pclose(pipe);
     return out;
 }
@@ -60,38 +75,34 @@ int main(int argc, char** argv) {
         return 2;
     }
 
-    std::printf("exit report registry\n");
+    std::fputs("exit report registry\n", stdout);
 
     // In-process: each report runs at most once, in order, and a late registration is not lost.
     register_exit_report(&report_a);
     register_exit_report(&report_b);
     register_exit_report(nullptr);   // ignored, not a crash at flush
     flush_exit_reports();
-    check("both registered reports ran once", a_runs == 1 && b_runs == 1);
+    check("both registered reports ran once", a_runs() == 1 && b_runs() == 1);
     flush_exit_reports();
-    check("a second flush reruns nothing", a_runs == 1 && b_runs == 1);
+    check("a second flush reruns nothing", a_runs() == 1 && b_runs() == 1);
     register_exit_report(&report_c);
     flush_exit_reports();
     check("a report registered after a flush runs at the next one",
-          c_runs == 1 && a_runs == 1 && b_runs == 1);
+          c_runs() == 1 && a_runs() == 1 && b_runs() == 1);
 
     // Subprocesses: the exit paths themselves.
     const std::string noflush = run_child(argv[0], "--child-noflush");
     check("CONTROL: _Exit without a flush loses the report (atexit really is skipped)",
-          noflush.find("EXIT-REPORT-MARKER-3353") == std::string::npos &&
-          noflush.find("popen failed") == std::string::npos);
+          !has(noflush, kMarker) && !has(noflush, "popen failed"));
     const std::string flushed = run_child(argv[0], "--child-flush");
-    check("_Exit after flush_exit_reports() prints the report",
-          flushed.find("EXIT-REPORT-MARKER-3353") != std::string::npos);
+    check("_Exit after flush_exit_reports() prints the report", has(flushed, kMarker));
     const std::string returned = run_child(argv[0], "--child-return");
-    check("an ordinary return from main still prints it (atexit fallback)",
-          returned.find("EXIT-REPORT-MARKER-3353") != std::string::npos);
+    check("an ordinary return from main still prints it (atexit fallback)", has(returned, kMarker));
     const std::string twice = run_child(argv[0], "--child-twice");
-    const size_t first = twice.find("EXIT-REPORT-MARKER-3353");
+    const size_t first = twice.find(kMarker);
     check("an explicit flush followed by the atexit fallback prints it exactly once",
-          first != std::string::npos &&
-          twice.find("EXIT-REPORT-MARKER-3353", first + 1) == std::string::npos);
+          first != std::string::npos && !has(std::string_view(twice).substr(first + 1), kMarker));
 
-    std::printf("%s\n", failures ? "FAILURES PRESENT" : "all passed");
-    return failures ? 1 : 0;
+    std::fputs(failures() ? "FAILURES PRESENT\n" : "all passed\n", stdout);
+    return failures() ? 1 : 0;
 }
