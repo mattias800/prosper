@@ -3674,6 +3674,17 @@ endif()
                            storage_rtt_result_retention storage_rtt_result_retention_off
                            PROPERTIES TIMEOUT 60)
 
+      add_executable(test_compute_transfer_mip_chain
+                     tests/gpu/execute/test_compute_transfer_mip_chain.cpp)
+      target_include_directories(test_compute_transfer_mip_chain PRIVATE tests frontends)
+      target_link_libraries(test_compute_transfer_mip_chain PRIVATE
+                           prosper_live_renderer prosper_core Vulkan::Vulkan)
+      add_test(NAME compute_transfer_mip_chain COMMAND ${CMAKE_COMMAND} -E env
+               PROSPER_COMPUTE_IMAGE_CACHE_MIN_KB=0
+               PROSPER_COMPUTE_STORAGE_IMAGE_CACHE_MIN_KB=0
+               $<TARGET_FILE:test_compute_transfer_mip_chain>)
+      set_tests_properties(compute_transfer_mip_chain PROPERTIES TIMEOUT 60)
+
       add_executable(test_near_full_storage_authority
                      tests/gpu/execute/test_near_full_storage_authority.cpp)
       target_include_directories(test_near_full_storage_authority PRIVATE tests frontends)
