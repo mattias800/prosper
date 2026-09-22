@@ -1471,10 +1471,28 @@ int main(int argc, char** argv) {
               "60-byte D32S8 readback maps through the 64-byte allocation end before invalidation");
     }
 
+    // This bridge must survive an intervening guest-write notification. Numeric disjointness of
+    // fabricated addresses is no longer a physical-disjointness proof; map the three planes as
+    // distinct ranges in the real guest mapping table so the invalidator can preserve each aspect.
+    auto ds_map_flexible = prosper::Hle::lookup(
+        prosper::nid_hash("sceKernelMapNamedFlexibleMemory"));
+    auto ds_unmap = prosper::Hle::lookup(prosper::nid_hash("sceKernelMunmap"));
+    constexpr uint64_t DsMappingBytes = 0x50000;
+    uint64_t ds_guest_base = 0;
+    const bool ds_mapped = ds_map_flexible && ds_unmap &&
+        ds_map_flexible(reinterpret_cast<uint64_t>(&ds_guest_base), DsMappingBytes, 2, 0,
+                        reinterpret_cast<uint64_t>("depth-bit-bridge"), 0) == 0 && ds_guest_base;
+    CHECK(ds_mapped, "depth-bit bridge fixture has tracked independent guest planes");
+    if (!ds_mapped) return 1;
+    struct DsMappingCleanup {
+        prosper::HleFn unmap;
+        uint64_t base, size;
+        ~DsMappingCleanup() { unmap(base, size, 0, 0, 0, 0); }
+    } ds_mapping{ds_unmap, ds_guest_base, DsMappingBytes};
     GpuCaptureDsSeed ds_seed;
-    ds_seed.depth_read_base = ds_seed.depth_write_base = 0x810000;
-    ds_seed.stencil_read_base = ds_seed.stencil_write_base = 0x820000;
-    ds_seed.htile_data_base = 0x800000;
+    ds_seed.depth_read_base = ds_seed.depth_write_base = ds_guest_base + 0x20000;
+    ds_seed.stencil_read_base = ds_seed.stencil_write_base = ds_guest_base + 0x30000;
+    ds_seed.htile_data_base = ds_guest_base + 0x10000;
     ds_seed.width = 4; ds_seed.height = 3;
     ds_seed.format = GpuCaptureDsFormat::D32FloatS8;
     ds_seed.depth_valid = true; ds_seed.stencil_valid = true;
@@ -1529,10 +1547,14 @@ int main(int argc, char** argv) {
             resource.size = size;
             table.resources.push_back(resource);
         };
-        add_buffer(0, depth_lane_index.data(), sizeof(depth_lane_index));
-        add_buffer(1, depth_dummy.data(), sizeof(depth_dummy));
-        add_buffer(2, depth_dummy.data(), sizeof(depth_dummy));
-        add_buffer(3, depth_dummy.data(), sizeof(depth_dummy));
+        auto* mapped_lane = reinterpret_cast<uint8_t*>(ds_guest_base + 0x40100);
+        auto* mapped_dummy = reinterpret_cast<uint8_t*>(ds_guest_base + 0x40200);
+        std::memcpy(mapped_lane, depth_lane_index.data(), sizeof(depth_lane_index));
+        std::memcpy(mapped_dummy, depth_dummy.data(), sizeof(depth_dummy));
+        add_buffer(0, mapped_lane, sizeof(depth_lane_index));
+        add_buffer(1, mapped_dummy, sizeof(depth_dummy));
+        add_buffer(2, mapped_dummy, sizeof(depth_dummy));
+        add_buffer(3, mapped_dummy, sizeof(depth_dummy));
 
         ShaderResource source{};
         source.cls = ResourceClass::Texture;
@@ -1563,7 +1585,9 @@ int main(int argc, char** argv) {
         destination.width = ds_seed.width;
         destination.height = ds_seed.height;
         destination.depth = 1;
-        destination.gpu_addr = reinterpret_cast<uint64_t>(output.data());
+        // The compute writeback must also be tracked. A stack destination has unknown physical
+        // identity and would correctly revoke every retained DS plane under the alias rule.
+        destination.gpu_addr = ds_guest_base + 0x40000;
         destination.size = sizeof(output);
         table.resources.push_back(destination);
 
@@ -1579,7 +1603,10 @@ int main(int argc, char** argv) {
         compute.launch.local_y = compute.launch.local_z = 1;
         compute.launch.groups_y = compute.launch.groups_z = 1;
         compute.code_addr = code_addr;
-        return prosper::frontend::execute_live_compute_items({compute});
+        if (!prosper::frontend::execute_live_compute_items({compute})) return false;
+        std::memcpy(output.data(), reinterpret_cast<const void*>(destination.gpu_addr),
+                    sizeof(output));
+        return true;
     };
 
     std::array<uint32_t, DEPTH_TEXELS> guest_control{};

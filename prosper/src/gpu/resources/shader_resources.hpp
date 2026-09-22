@@ -1015,6 +1015,15 @@ struct SpirvDescriptorBinding {
     // failures into 15. Appending leaves the initializer's positions untouched and this member falls to
     // its default initializer, which is what an ordinary single-descriptor binding must report anyway.
     uint32_t descriptor_count = 1;
+    // An OpImageFetch uses a Lod that is not a literal zero. Resource preparation must
+    // supply the guest mip chain before selecting a base-only cache or retained image.
+    // This is demand, not proof that the resource can be materialized.
+    bool mip_fetch = false;
+    // Any OpImageFetch, including literal Lod zero. Missing-channel substitution on an
+    // out-of-bounds fetch can depend on the image format, so sampling-equivalent compact
+    // formats are not necessarily fetch-equivalent. An unresolved fetch origin conservatively
+    // marks every reflected image descriptor; false is a proof that no fetch was observed.
+    bool texel_fetch = false;
 };
 
 struct StorageBufferMaterializationPlan {

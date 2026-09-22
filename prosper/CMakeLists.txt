@@ -3265,6 +3265,12 @@ endif()
       target_include_directories(test_depth_array_source_snapshot PRIVATE frontends src tests)
       target_link_libraries(test_depth_array_source_snapshot PRIVATE prosper_core prosper_live_renderer Vulkan::Vulkan)
       add_test(NAME depth_array_source_snapshot COMMAND test_depth_array_source_snapshot)
+      add_test(NAME depth_array_source_snapshot_per_draw_control
+        COMMAND test_depth_array_source_snapshot --per-draw-control)
+      add_test(NAME depth_array_source_snapshot_expanded_control
+        COMMAND test_depth_array_source_snapshot --expanded-control)
+      add_test(NAME depth_array_source_snapshot_expanded_per_draw_control
+        COMMAND test_depth_array_source_snapshot --expanded-control --per-draw-control)
       add_executable(test_depth_only_attachment_extent tests/shared/live/test_depth_only_attachment_extent.cpp)
       target_include_directories(test_depth_only_attachment_extent PRIVATE frontends src tests)
       target_link_libraries(test_depth_only_attachment_extent PRIVATE prosper_core prosper_live_renderer Vulkan::Vulkan)
@@ -3582,6 +3588,11 @@ endif()
 
       # Texture sampling: a recompiled pixel shader does MIMG image_sample against a bound 2x2 texture.
       add_executable(test_texture_sample_render tests/gpu/test_texture_sample_render.cpp)
+      add_executable(test_float32_array_gather tests/gpu/execute/test_float32_array_gather.cpp)
+      target_include_directories(test_float32_array_gather PRIVATE tests frontends)
+      target_link_libraries(test_float32_array_gather PRIVATE prosper_core Vulkan::Vulkan)
+      add_test(NAME float32_array_gather_compile COMMAND test_float32_array_gather --compile-only)
+      add_test(NAME float32_array_gather COMMAND test_float32_array_gather)
       # Includes a shared fixture, which resolves from the `tests` root.
       target_include_directories(test_texture_sample_render PRIVATE tests)
       # Reaches `shared/...` through render_runner.h, which resolves from `frontends`.

@@ -4,12 +4,12 @@
 #include "host/memory/guest_memory_map.hpp"
 #include "host/memory/guest_write_watch.hpp"
 #include "shared/live/live_compute.hpp"
+#include "hle/dispatch/dispatch.hpp"
 #include <array>
 #include <csignal>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
-#include <sys/mman.h>
 #include <sys/ucontext.h>
 #include <unistd.h>
 
@@ -19,6 +19,7 @@ namespace {
 int failures = 0;
 volatile sig_atomic_t faults = 0;
 constexpr size_t bytes = 8192, words = bytes / 4;
+constexpr uint64_t depth_plane_offset = 2u * 1024u * 1024u;
 void check(bool ok, const char* message) {
     if (!ok) { std::fprintf(stderr, "FAIL: %s\n", message); ++failures; }
 }
@@ -87,7 +88,8 @@ void depth_clear(uint32_t* guest, uint32_t extent = bytes, bool cached_fill = fa
     writer.topology = 3; writer.color_write_mask = 15;
     writer.depth_test_enable = writer.depth_write_enable = true;
     writer.depth_compare_op = 7; writer.has_depth_clear = true; writer.depth_clear_value = 0;
-    writer.depth_read_base = writer.depth_write_base = 0x3407d00000ull;
+    writer.depth_read_base = writer.depth_write_base =
+        reinterpret_cast<uint64_t>(guest) + depth_plane_offset;
     writer.htile_data_base = reinterpret_cast<uint64_t>(guest) + (untouched_tail ? extent / 2 : 0);
     ResolvedPipelineState reader = writer;
     reader.depth_write_enable = false; reader.depth_compare_op = 6;
@@ -300,7 +302,8 @@ void overridden_fills(uint32_t* guest, uint32_t extent) {
 }
 int main(int argc, char** argv) {
     const bool override_mode = argc > 1 && std::strcmp(argv[1], "--cached-override") == 0;
-    const size_t mapping_bytes = 2u * 1024u * 1024u;
+    const size_t mapping_bytes = 4u * 1024u * 1024u;
+    const uint32_t work_bytes = 2u * 1024u * 1024u;
     static uint8_t stack_memory[256 * 1024];
     stack_t stack{}; stack.ss_sp = stack_memory; stack.ss_size = sizeof(stack_memory);
     struct sigaction action{};
@@ -308,23 +311,46 @@ int main(int argc, char** argv) {
     sigemptyset(&action.sa_mask);
     if (sigaltstack(&stack, nullptr) || sigaction(SIGSEGV, &action, nullptr)) return 2;
     guest_write_watch_set_fault_onstack(true);
-    FILE* backing = std::tmpfile();
-    if (!backing || ftruncate(fileno(backing), mapping_bytes)) return 2;
-    void* guest = mmap(nullptr, mapping_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fileno(backing), 0);
-    void* alias = mmap(nullptr, mapping_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fileno(backing), 0);
-    if (guest == MAP_FAILED || alias == MAP_FAILED) return 2;
-    constexpr uint64_t physical = 0x3407f0000ull;
-    guest_write_watch_notify_direct_mapping_added(reinterpret_cast<uint64_t>(guest), mapping_bytes, physical, 3);
-    guest_write_watch_notify_direct_mapping_added(reinterpret_cast<uint64_t>(alias), mapping_bytes, physical, 3);
+    prosper::register_builtin_hle();
+    const auto allocate = prosper::Hle::lookup(prosper::nid_hash("sceKernelAllocateDirectMemory"));
+    const auto map = prosper::Hle::lookup(prosper::nid_hash("sceKernelMapDirectMemory"));
+    const auto unmap = prosper::Hle::lookup(prosper::nid_hash("sceKernelMunmap"));
+    const auto release = prosper::Hle::lookup(prosper::nid_hash("sceKernelReleaseDirectMemory"));
+    if (!allocate || !map || !unmap || !release) return 2;
+    uint64_t physical = 0, guest_address = 0, alias_address = 0;
+    if (allocate(0, 0x200000000ull, mapping_bytes, 0x10000, 0,
+                 reinterpret_cast<uint64_t>(&physical)) != 0) return 2;
+    struct DirectMappingGuard {
+        prosper::HleFn unmap, release;
+        uint64_t physical, guest = 0, alias = 0, bytes;
+        ~DirectMappingGuard() {
+            if (alias) unmap(alias, bytes, 0, 0, 0, 0);
+            if (guest) unmap(guest, bytes, 0, 0, 0, 0);
+            release(physical, bytes, 0, 0, 0, 0);
+        }
+    } backing{unmap, release, physical, 0, 0, mapping_bytes};
+    if (map(reinterpret_cast<uint64_t>(&guest_address), mapping_bytes, 2, 0,
+            physical, 0x10000) != 0 || !guest_address) return 2;
+    backing.guest = guest_address;
+    if (map(reinterpret_cast<uint64_t>(&alias_address), mapping_bytes, 2, 0,
+            physical, 0x10000) != 0 || !alias_address) return 2;
+    backing.alias = alias_address;
+    auto* guest = reinterpret_cast<uint32_t*>(guest_address);
+    auto* alias = reinterpret_cast<uint32_t*>(alias_address);
+    check(prosper::guest_memory_topology_relation(
+              guest_address, work_bytes, alias_address, work_bytes) ==
+              prosper::GuestMemoryTopologyRelation::Overlap &&
+          prosper::guest_memory_topology_relation(
+              guest_address, work_bytes,
+              guest_address + depth_plane_offset, 64u * 64u * sizeof(float)) ==
+              prosper::GuestMemoryTopologyRelation::Disjoint,
+          "buffer aliases and retained depth have the intended tracked physical topology");
     check(prosper::test::render_vk_ctx().ok, "renderer device initializes before live compute fallback");
     if (!prosper::test::render_vk_ctx().ok) return 2;
     if (override_mode)
-        overridden_fills(static_cast<uint32_t*>(guest), mapping_bytes);
+        overridden_fills(guest, work_bytes);
     else
-        cached_fills(static_cast<uint32_t*>(guest), static_cast<uint32_t*>(alias), mapping_bytes);
-    guest_write_watch_notify_direct_mapping_removed(reinterpret_cast<uint64_t>(guest), mapping_bytes);
-    guest_write_watch_notify_direct_mapping_removed(reinterpret_cast<uint64_t>(alias), mapping_bytes);
-    munmap(guest, mapping_bytes); munmap(alias, mapping_bytes); std::fclose(backing);
+        cached_fills(guest, alias, work_bytes);
     guest_write_watch_set_fault_onstack(false);
     std::printf("cached_compute_fill: %d failures\n", failures);
     return failures != 0;

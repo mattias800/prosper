@@ -1,5 +1,6 @@
 // Retained depth arrays preserve Float32 contents and publish only complete, ordered snapshots.
 #include "fixtures/render_runner.h"
+#include "gpu/execute/gpu_execute.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "hle/dispatch/dispatch.hpp"
 #include "shared/live/live_renderer.hpp"
@@ -56,9 +57,56 @@ template<class Action> static std::string capture_stderr(Action action) {
     return text;
 }
 
-int main() {
+int main(int argc, char** argv) {
+    bool per_draw_control = false, expanded_control = false;
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--per-draw-control") == 0) per_draw_control = true;
+        else if (std::strcmp(argv[i], "--expanded-control") == 0) expanded_control = true;
+        else {
+            std::fprintf(stderr, "usage: %s [--per-draw-control] [--expanded-control]\n", argv[0]);
+            return 2;
+        }
+    }
+    // These production controls are cached at first use. Set them before ANY renderer callback;
+    // the separate process arm supplies the per-draw oracle without changing startup semantics.
+#ifdef _WIN32
+    _putenv_s("PROSPER_DEPTH_ARRAY_SNAPSHOT_CENSUS", "1");
+    _putenv_s("PROSPER_ARRAY_REJECT_LOG_ALL", "1");
+    if (per_draw_control) _putenv_s("PROSPER_NO_SUBMIT_DEPTH_ARRAY_SNAPSHOT_REUSE", "1");
+    if (expanded_control) _putenv_s("PROSPER_NO_COMPACT_DEPTH_ARRAY_SNAPSHOT", "1");
+#else
+    setenv("PROSPER_DEPTH_ARRAY_SNAPSHOT_CENSUS", "1", 1);
+    setenv("PROSPER_ARRAY_REJECT_LOG_ALL", "1", 1);
+    if (per_draw_control) setenv("PROSPER_NO_SUBMIT_DEPTH_ARRAY_SNAPSHOT_REUSE", "1", 1);
+    if (expanded_control) setenv("PROSPER_NO_COMPACT_DEPTH_ARRAY_SNAPSHOT", "1", 1);
+#endif
     constexpr uint32_t W = 8, H = 8, Layers = 4;
-    constexpr uint64_t Base = 0x7d400000;
+    // Numeric disjointness is not physical disjointness. Give the fixture's ordinary DS
+    // identities tracked private backing so the invalidator can prove their independence.
+    prosper::register_builtin_hle();
+    auto map_flexible = prosper::Hle::lookup(prosper::nid_hash("sceKernelMapNamedFlexibleMemory"));
+    auto map_direct = prosper::Hle::lookup(prosper::nid_hash("sceKernelMapDirectMemory"));
+    auto alloc_direct = prosper::Hle::lookup(prosper::nid_hash("sceKernelAllocateDirectMemory"));
+    auto unmap = prosper::Hle::lookup(prosper::nid_hash("sceKernelMunmap"));
+    auto release_direct = prosper::Hle::lookup(prosper::nid_hash("sceKernelReleaseDirectMemory"));
+    struct GuestBacking {
+        prosper::HleFn unmap, release;
+        std::vector<std::pair<uint64_t, uint64_t>> mappings, physical;
+        ~GuestBacking() {
+            for (auto [address, bytes] : mappings) unmap(address, bytes, 0, 0, 0, 0);
+            for (auto [address, bytes] : physical) release(address, bytes, 0, 0, 0, 0);
+        }
+    } backing{unmap, release_direct, {}, {}};
+    check(map_flexible && map_direct && alloc_direct && unmap && release_direct,
+          "guest mapping and physical-alias APIs available");
+    if (!map_flexible || !map_direct || !alloc_direct || !unmap || !release_direct) return 1;
+    uint64_t Base = 0;
+    constexpr uint64_t FixtureBytes = 0x2000000;
+    const bool base_mapped = map_flexible(reinterpret_cast<uint64_t>(&Base), FixtureBytes, 2, 0,
+        reinterpret_cast<uint64_t>("depth-array-identities"), 0) == 0 && Base;
+    check(base_mapped, "ordinary depth fixture has real tracked guest backing");
+    if (!base_mapped) return 1;
+    backing.mappings.emplace_back(Base, FixtureBytes);
     constexpr size_t Pixels = W * H;
     using Status = PersistentDsDepthArrayStatus;
     std::string error;
@@ -68,10 +116,11 @@ int main() {
               Status::NoIdentity && output == sentinel,
           "absent retained identity permits guest fallback without modifying output");
 
+    uint64_t seed_base = Base;
     auto seed_layer = [&](uint32_t layer, float value) {
         BackendPersistentResourceGuard guard;
         GpuCaptureDsSeed seed;
-        seed.depth_read_base = seed.depth_write_base = Base;
+        seed.depth_read_base = seed.depth_write_base = seed_base;
         seed.width = W; seed.height = H; seed.slice = layer;
         seed.format = GpuCaptureDsFormat::D32Float; seed.depth_valid = true;
         seed.depth.resize(Pixels * sizeof(float));
@@ -81,7 +130,7 @@ int main() {
         if (!ok) std::fprintf(stderr, "seed: %s\n", error.c_str());
         check(ok, "real Vulkan depth layer restored");
         if (ok) for (auto& [key, image] : persistent_ds_cache())
-            if (key.dr == Base && key.slice == layer)
+            if (key.dr == seed_base && key.slice == layer)
                 note_persistent_ds_depth_write(image, true, true);
         return ok;
     };
@@ -236,8 +285,19 @@ int main() {
 
     // Exercise the production resource builder as well as the backend helper. Captured guest
     // bytes intentionally disagree with every retained plane, and remain unchanged on rewrites.
-    prosper::register_builtin_hle();
     prosper::frontend::register_live_renderer(".", false);
+    VkFormatProperties compact_properties{};
+    vkGetPhysicalDeviceFormatProperties(render_vk_ctx().phys, VK_FORMAT_R32_SFLOAT, &compact_properties);
+    const auto payload_bpp = [&](bool linear) -> uint64_t {
+        const VkFormatFeatureFlags needed = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+            (linear ? VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT : 0u);
+        return !expanded_control && (compact_properties.optimalTilingFeatures & needed) == needed
+            ? sizeof(float) : 4 * sizeof(float);
+    };
+    const uint64_t snapshot_bpp = payload_bpp(false);
+    std::printf("[snapshot-fixture] representation=%s expected_bpp=%llu R32features=0x%x\n",
+                expanded_control ? "expanded-control" : "compact-with-feature-fallback",
+                (unsigned long long)snapshot_bpp, compact_properties.optimalTilingFeatures);
     std::vector<uint8_t> stale_guest(Pixels * Layers * sizeof(float), 0);
     auto live_table = std::make_shared<ShaderResourceTable>();
     texture.num_components = 1;
@@ -246,8 +306,9 @@ int main() {
     texture.layer_stride_bytes = Pixels * sizeof(float);
     texture.linear_row_pitch_bytes = W * sizeof(float);
     texture.mag_filter = texture.min_filter = 0;
-    texture.swizzle[0] = 4; texture.swizzle[1] = 0;
-    texture.swizzle[2] = 0; texture.swizzle[3] = 1;
+    // Identity view selectors make G/B/A come from real format substitution, not swizzle constants.
+    texture.swizzle[0] = 4; texture.swizzle[1] = 5;
+    texture.swizzle[2] = 6; texture.swizzle[3] = 7;
     live_table->resources.push_back(texture);
     DrawItem live_draw;
     live_draw.vs = producer.vs; live_draw.vertex_count = 3;
@@ -281,6 +342,92 @@ int main() {
         live_shader(layer);
         check(live_matches(), "production frontend selects retained depth over zero hosted bytes");
     }
+    // Exercise missing channels and view swizzling through the actual retained-array frontend.
+    // Gather taps are uniform within each seeded layer here; the separate gather fixture owns
+    // spatial tap-order coverage. This guard specifically binds format-dependent component values.
+    const auto component_shader = [&](bool gather, uint32_t component, float u,
+                                      const std::array<float, 4>& wanted, bool fetch = false) {
+        std::vector<uint32_t> words;
+        auto mov = [&](uint32_t reg, uint32_t value) {
+            words.insert(words.end(), {0x7e0002ffu | (reg << 17), value});
+        };
+        if (gather) {
+            mov(0, 0x3f01u); // signed offset (+1,-1), separate from the layer
+            mov(1, std::bit_cast<uint32_t>(u)); mov(2, 0x3f000000u); mov(3, 0x40000000u);
+            words.insert(words.end(), {0xf0000028u | (0x57u << 18) | (1u << (8 + component)),
+                                      0x00820c00u});
+        } else if (fetch) {
+            mov(0, UINT32_MAX); mov(1, 0u); mov(2, 2u);
+            words.insert(words.end(), {0xf0000f28u, 0x00020c00u});
+        } else {
+            mov(0, std::bit_cast<uint32_t>(u)); mov(1, 0x3f000000u);
+            mov(2, 0x40000000u); mov(3, 0u);
+            words.insert(words.end(), {0xf0900f28u, 0x00820c00u});
+        }
+        for (uint32_t c = 0; c < 4; ++c) {
+            const uint32_t reg = 12 + c;
+            words.insert(words.end(), {
+                0x080000ffu | (reg << 17) | (reg << 9), std::bit_cast<uint32_t>(wanted[c]),
+                0x100000ffu | (reg << 17) | (reg << 9), std::bit_cast<uint32_t>(65536.0f),
+                0x060000ffu | (reg << 17) | (reg << 9), 0x3f000000u});
+        }
+        words.insert(words.end(), {0xf800000fu, 0x0f0e0d0cu, 0xbf810000u});
+        live_draw.fs = recompile_fragment(words.data(), words.size(), live_table.get());
+        check(!live_draw.fs.empty(), "retained array component shader compiles");
+        live_draw.color0_base += 0x10000;
+    };
+    const std::array<float, 4> natural{expected[2], 0.0f, 0.0f, 1.0f};
+    for (uint32_t channel = 0; channel < 4; ++channel) {
+        component_shader(true, channel, 0.5f,
+            {natural[channel], natural[channel], natural[channel], natural[channel]});
+        check(live_matches(), "array gather preserves precise R and substituted G/B/A components");
+        check(backend_texture_upload_stats().upload_bytes == Pixels * Layers * snapshot_bpp,
+              "gather uses the expected compact or explicitly expanded payload size");
+    }
+    auto& component_resource = live_table->resources[0];
+    component_resource.swizzle[0] = 7; component_resource.swizzle[1] = 4;
+    component_resource.swizzle[2] = 5; component_resource.swizzle[3] = 6;
+    component_shader(false, 0, 0.5f, {1.0f, expected[2], 0.0f, 0.0f});
+    check(live_matches(), "array sampling applies view swizzle after missing-component substitution");
+    component_shader(true, 1, 0.5f, {expected[2], expected[2], expected[2], expected[2]});
+    check(live_matches(), "array gather selects the swizzled depth component");
+    component_resource.swizzle[0] = 4; component_resource.swizzle[1] = 5;
+    component_resource.swizzle[2] = 6; component_resource.swizzle[3] = 7;
+    VkFormatProperties expanded_properties{};
+    vkGetPhysicalDeviceFormatProperties(render_vk_ctx().phys, VK_FORMAT_R32G32B32A32_SFLOAT,
+                                        &expanded_properties);
+    if (expanded_properties.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) {
+        component_resource.mag_filter = component_resource.min_filter = 1;
+        component_shader(false, 0, 0.5f, natural);
+        check(live_matches(), "linear array sampler preserves exact uniform-layer components");
+        check(backend_texture_upload_stats().upload_bytes == Pixels * Layers * payload_bpp(true),
+              "R32 linear support is checked separately and otherwise retains expanded sampling");
+        component_resource.mag_filter = component_resource.min_filter = 0;
+    } else {
+        std::puts("[skip] existing RGBA32 array route cannot support the linear-sampler control");
+    }
+
+    // Border replacement precedes missing-component substitution and is format-sensitive.
+    // Preserve RGBA32 for border samplers: transparent A=0 and opaque-white G/B=1 differ in R32.
+    component_resource.addr_uvw[0] = 6;
+    for (uint32_t border : {0u, 2u}) {
+        component_resource.border_color_type = border;
+        const float border_value = border == 2 ? 1.0f : 0.0f;
+        component_shader(false, 0, -4.0f,
+            {border_value, border_value, border_value, border_value});
+        check(live_matches(), "border sampler preserves expanded RGBA channel values outside the image");
+        component_shader(true, border == 2 ? 1u : 3u, -4.0f,
+            {border_value, border_value, border_value, border_value});
+        check(live_matches(), "out-of-range gather preserves transparent alpha and opaque-white green");
+        check(backend_texture_upload_stats().upload_bytes == Pixels * Layers * 4 * sizeof(float),
+              "border-sensitive retained array deliberately keeps the expanded representation");
+    }
+    component_resource.addr_uvw[0] = 0; component_resource.border_color_type = 0;
+    component_shader(false, 0, 0.0f, {0.0f, 0.0f, 0.0f, 0.0f}, true);
+    check(live_matches(), "out-of-bounds array fetch preserves expanded robust zero including alpha");
+    check(backend_texture_upload_stats().upload_bytes == Pixels * Layers * 4 * sizeof(float),
+          "any image fetch keeps the expanded retained-array representation");
+
     expected[3] = 0.9376373291015625f;
     if (!seed_layer(3, expected[3])) return 1;
     live_shader(3);
@@ -346,5 +493,446 @@ int main() {
             matches &= pixels[center + c] >= 127 && pixels[center + c] <= 128;
         check(matches, "frontend batch forwards depth producer ordering through array materialization");
     }
+    // Keep every color and DS attachment identical: only the write enable differs. The
+    // consumer must be prepared after the producer, rather than reading the preceding generation
+    // while build_bds is still preparing their shared backend group.
+    for (unsigned generation = 0; generation < 2; ++generation) {
+        expected[1] = generation == 0 ? 0.1876373291015625f : 0.8126373291015625f;
+        live_producer.ps.min_depth = live_producer.ps.max_depth = expected[1];
+        live_producer.ps.color_write_mask = sample_state.color_write_mask;
+        live_draw.color0_base = live_producer.color0_base =
+            Base + 0x500000 + generation * 0x10000;
+        live_draw.ps.depth_read_base = live_producer.ps.depth_read_base;
+        live_draw.ps.depth_write_base = live_producer.ps.depth_write_base;
+        live_draw.ps.db_depth_view = live_producer.ps.db_depth_view;
+        live_draw.ps.depth_test_enable = true;
+        live_draw.ps.depth_write_enable = false;
+        live_draw.ps.depth_compare_op = VK_COMPARE_OP_ALWAYS;
+        live_shader(1);
+        const auto pixels = render_submit_items({live_producer, live_draw}, W, H);
+        const size_t center = (W * (H / 2) + W / 2) * 4;
+        bool matches = pixels.size() == Pixels * 4;
+        if (matches) for (size_t c = 0; c < 4; ++c)
+            matches &= pixels[center + c] >= 127 && pixels[center + c] <= 128;
+        check(matches, "same-attachment depth producer completes before array consumer preparation");
+    }
+
+    // Only the production resource builder can learn this descriptor's layer stride. A write
+    // into layer 2 must revoke that layer without falsely invalidating the other three planes.
+    check(ds_layer_stride_for(Base, W, H) == Pixels * sizeof(float),
+          "exact array consumer publishes its depth layer stride");
+    {
+        BackendPersistentResourceGuard guard;
+        check(invalidate_persistent_ds_guest_write(Base + 2 * Pixels * sizeof(float),
+                                                  sizeof(float)) == 1,
+              "nonzero array layer guest write invalidates precisely that retained layer");
+    }
+    const auto before_guest_write = output;
+    check(read_persistent_ds_depth_array(Base, W, H, 0, Layers, output, error) ==
+              Status::Unavailable && output == before_guest_write,
+          "array snapshot refuses a guest-invalidated nonzero layer");
+    if (!seed_layer(2, expected[2])) return 1;
+    check(read_persistent_ds_depth_array(Base, W, H, 0, Layers, output, error) ==
+              Status::Ready && exact(),
+          "renderer rewrite restores complete array after nonzero layer guest invalidation");
+    // A guest write may drain through a target query before the array is ever sampled. There
+    // is then no known stride for the ordinary invalidator to locate layer 2. First admission
+    // must not bless those old images merely by learning the stride afterward.
+    seed_base = Base + 0x800000;
+    live_table->resources[0].gpu_addr = seed_base;
+    live_draw.ps = sample_state;
+    live_draw.color0_base = seed_base + 0x100000;
+    for (uint32_t layer = 0; layer < Layers; ++layer)
+        if (!seed_layer(layer, expected[layer])) return 1;
+    check(ds_layer_stride_for(seed_base, W, H) == 0,
+          "fresh retained array has no previously learned consumer stride");
+    notify_guest_gpu_write_preserving_bytes(seed_base + 2 * Pixels * sizeof(float), sizeof(float));
+    (void)is_live_render_target(seed_base + 0x200000); // Drain before the first consumer.
+    // Exercise the ordinary publisher used by depth cubes before the array's own builder.
+    // Otherwise a cube could turn "unknown" into "known" and bypass an array-only history check.
+    note_ds_layer_stride(seed_base, W, H, Pixels * sizeof(float));
+    check(ds_layer_stride_for(seed_base, W, H) == Pixels * sizeof(float),
+          "ordinary cube stride publisher records the first consumer stride");
+    const auto before_cube_publication = output;
+    check(read_persistent_ds_depth_array(seed_base, W, H, 0, Layers, output, error) ==
+              Status::Unavailable && output == before_cube_publication,
+          "first cube stride publication cannot authorize depth older than an unknown-stride write");
+    live_shader(2);
+    const auto historical_diagnostic = capture_stderr([&] {
+        (void)render_submit_items({live_draw}, W, H);
+    });
+    check(historical_diagnostic.find("[render-array-reject] binding=4 retained depth: "
+          "retained depth array has missing or invalid layers") != std::string::npos,
+          "write drained before first stride refuses historically unproven array layers");
+    for (uint32_t layer = 0; layer < Layers; ++layer)
+        if (!seed_layer(layer, expected[layer])) return 1;
+    check(live_matches(), "renderer rewrites after historical write recover array admission");
+
+    // The watermark intentionally does not remember addresses. An unrelated intervening write
+    // also refuses an older unknown-stride array; this is conservative, never evidence of overlap.
+    seed_base = Base + 0xa00000;
+    live_table->resources[0].gpu_addr = seed_base;
+    live_draw.color0_base = seed_base + 0x100000;
+    for (uint32_t layer = 0; layer < Layers; ++layer)
+        if (!seed_layer(layer, expected[layer])) return 1;
+    notify_guest_gpu_write(Base + 0xf00000, sizeof(float));
+    (void)is_live_render_target(Base + 0xf00000);
+    const auto unrelated_diagnostic = capture_stderr([&] {
+        (void)render_submit_items({live_draw}, W, H);
+    });
+    check(unrelated_diagnostic.find("[render-array-reject] binding=4 retained depth: "
+          "retained depth array has missing or invalid layers") != std::string::npos,
+          "unrelated intervening write conservatively refuses unknown-stride history");
+
+    // A fresh renderer generation AFTER the last guest write does not need retrospective range
+    // knowledge, even when the process has an older watermark from a different allocation.
+    seed_base = Base + 0xc00000;
+    live_table->resources[0].gpu_addr = seed_base;
+    live_draw.color0_base = seed_base + 0x100000;
+    for (uint32_t layer = 0; layer < Layers; ++layer)
+        if (!seed_layer(layer, expected[layer])) return 1;
+    check(ds_layer_stride_for(seed_base, W, H) == 0 && live_matches(),
+          "untouched freshly rendered array admits its first exact consumer after older writes");
+    // A recycled write address can coexist with an unrelated old attachment. Neither a
+    // different extent nor a slice outside this consumer's range is one of its source planes.
+    // A rejected draw can return an earlier color image, so positive arms must also assert the
+    // specific decline is absent. The matching-alias negative arm below proves that lever logs.
+    const uint64_t saved_color_base = live_draw.color0_base;
+    const auto canonical_survives_alias = [&](const char* pixel_label, const char* log_label) {
+        bool pixels_match = false;
+        const auto diagnostic = capture_stderr([&] { pixels_match = live_matches(); });
+        check(pixels_match, pixel_label);
+        check(diagnostic.find("[render-array-reject] binding=4 unproven retained depth "
+              "write-base alias") == std::string::npos, log_label);
+    };
+    PersistentDsKey coexisting_alias{Base + 0xe00000, seed_base, 0, 0, 0,
+                                    W / 2, H / 2, VK_FORMAT_D32_SFLOAT, 0};
+    {
+        BackendPersistentResourceGuard guard;
+        persistent_ds_cache()[coexisting_alias] = {};
+    }
+    live_draw.color0_base = Base + 0x1400000;
+    canonical_survives_alias("different-extent alias preserves canonical pixels",
+                             "different-extent alias does not trigger noncanonical veto");
+    {
+        BackendPersistentResourceGuard guard;
+        persistent_ds_cache().erase(coexisting_alias);
+        coexisting_alias.w = W; coexisting_alias.h = H; coexisting_alias.slice = Layers;
+        persistent_ds_cache()[coexisting_alias] = {};
+    }
+    live_draw.color0_base = Base + 0x1410000;
+    canonical_survives_alias("out-of-range alias preserves canonical pixels",
+                             "out-of-range alias does not trigger noncanonical veto");
+    {
+        BackendPersistentResourceGuard guard;
+        persistent_ds_cache().erase(coexisting_alias);
+        coexisting_alias.slice = 0;
+        uint64_t canonical_generation = 0;
+        for (const auto& [key, image] : persistent_ds_cache())
+            if (key.dr == seed_base && key.w == W && key.h == H && key.slice == 0)
+                canonical_generation = std::max(canonical_generation, image.last_depth_write);
+        check(canonical_generation > 1, "canonical layer has a version newer than stale alias");
+        auto& old_alias = persistent_ds_cache()[coexisting_alias];
+        old_alias.last_depth_write = canonical_generation - 1;
+    }
+    live_draw.color0_base = Base + 0x1420000;
+    canonical_survives_alias("older same-shape alias preserves newer canonical pixels",
+                             "older same-shape alias does not trigger noncanonical veto");
+    {
+        BackendPersistentResourceGuard guard;
+        note_persistent_ds_depth_write(persistent_ds_cache()[coexisting_alias], true, true);
+    }
+    live_draw.color0_base = Base + 0x1430000;
+    const auto coexisting_diagnostic = capture_stderr([&] {
+        (void)render_submit_items({live_draw}, W, H);
+    });
+    check(coexisting_diagnostic.find("[render-array-reject] binding=4 unproven retained depth "
+          "write-base alias") != std::string::npos,
+          "newer matching write-base alias still refuses selected noncanonical source");
+    {
+        BackendPersistentResourceGuard guard;
+        persistent_ds_cache().erase(coexisting_alias);
+    }
+    live_draw.color0_base = Base + 0x1440000;
+    check(live_matches(), "canonical array recovers after matching alias is removed");
+    live_draw.color0_base = saved_color_base;
+    // Re-key the real images without duplicating their Vulkan ownership. Sampling a distinct
+    // write-base alias must not publish a stride that the read-base invalidator never consults.
+    const uint64_t write_alias = Base + 0x1000000;
+    {
+        BackendPersistentResourceGuard guard;
+        auto& cache = persistent_ds_cache();
+        std::vector<PersistentDsKey> keys;
+        for (const auto& [key, image] : cache)
+            if (key.dr == seed_base) keys.push_back(key);
+        for (const auto& key : keys) {
+            auto entry = cache.extract(key);
+            entry.key().dw = write_alias;
+            cache.insert(std::move(entry));
+        }
+    }
+    live_table->resources[0].gpu_addr = write_alias;
+    const auto alias_diagnostic = capture_stderr([&] {
+        (void)render_submit_items({live_draw}, W, H);
+    });
+    check(alias_diagnostic.find("[render-array-reject] binding=4 unproven retained depth "
+          "write-base alias") != std::string::npos,
+          "noncanonical write-base array alias is explicitly refused");
+    check(ds_layer_stride_for(write_alias, W, H) == 0,
+          "rejected write-base alias never publishes an unrelated stride identity");
+    live_table->resources[0].gpu_addr = seed_base;
+    check(live_matches(), "canonical read-base array remains usable after write-alias rejection");
+    {
+        BackendPersistentResourceGuard guard;
+        auto& cache = persistent_ds_cache();
+        std::vector<PersistentDsKey> keys;
+        for (const auto& [key, image] : cache)
+            if (key.dr == seed_base && key.dw == write_alias) keys.push_back(key);
+        for (const auto& key : keys) {
+            auto entry = cache.extract(key);
+            entry.key().dw = seed_base;
+            cache.insert(std::move(entry));
+        }
+    }
+
+    // Multiple bindings of one retained array must share one immutable payload/upload inside
+    // this draw. Their samplers and selected layers differ, so descriptor-state dedup alone
+    // cannot remove the repeated 64-MiB image/staging allocations seen with real shadow arrays.
+    const uint64_t shared_base = seed_base;
+    auto repeated_table = std::make_shared<ShaderResourceTable>();
+    for (uint32_t i = 0; i < 3; ++i) {
+        auto resource = live_table->resources[0];
+        resource.binding = 4 + i;
+        resource.sgpr_base = 8 + i * 8;
+        resource.addr_uvw[0] = i; // Distinct samplers; the interior coordinates still agree.
+        repeated_table->resources.push_back(resource);
+    }
+    live_draw.prt = repeated_table;
+    auto repeated_shader = [&](std::array<float, 3> expected_values) {
+        std::vector<uint32_t> words;
+        for (uint32_t i = 0; i < 3; ++i) {
+            const uint32_t reg = 20 + i;
+            const uint32_t layer = i == 2 && repeated_table->resources[i].depth == 2 ? 1u : i;
+            words.insert(words.end(), {0x7e0002ffu, 0x3f000000u, 0x7e0202ffu, 0x3f000000u,
+                0x7e0402ffu, std::bit_cast<uint32_t>(float(layer)), 0x7e060280u,
+                0xf0900128u, 0x00800000u | ((repeated_table->resources[i].sgpr_base / 4) << 16) |
+                                (reg << 8),
+                0x080000ffu | (reg << 17) | (reg << 9), std::bit_cast<uint32_t>(expected_values[i]),
+                0x100000ffu | (reg << 17) | (reg << 9), std::bit_cast<uint32_t>(65536.0f),
+                0x060000ffu | (reg << 17) | (reg << 9), 0x3f000000u});
+        }
+        words.insert(words.end(), {0xf800000fu, 0x14161514u, 0xbf810000u});
+        live_draw.fs = recompile_fragment(words.data(), words.size(), repeated_table.get());
+        check(!live_draw.fs.empty(), "three independent array consumers compile");
+    };
+    expected[1] = 0.3282623291015625f;
+    live_producer.ps.depth_read_base = live_producer.ps.depth_write_base = shared_base;
+    live_producer.ps.min_depth = live_producer.ps.max_depth = expected[1];
+    live_producer.ps.color_write_mask = 0;
+    live_producer.color0_base = 0;
+    repeated_shader({expected[0], expected[1], expected[2]});
+    live_draw.color0_base = Base + 0x1200000;
+    const auto shared_pixels = render_submit_items({live_producer, live_draw}, W, H);
+    const size_t shared_center = (W * (H / 2) + W / 2) * 4;
+    bool shared_matches = shared_pixels.size() == Pixels * 4;
+    if (shared_matches) for (size_t c = 0; c < 4; ++c)
+        shared_matches &= shared_pixels[shared_center + c] >= 127 &&
+                          shared_pixels[shared_center + c] <= 128;
+    check(shared_matches, "shared array payload preserves layers/samplers after pending producer flush");
+    auto uploads = backend_texture_upload_stats();
+    check(uploads.references == 3 && uploads.unique_uploads == 1 &&
+              uploads.upload_bytes == Pixels * Layers * snapshot_bpp,
+          "three array bindings produce one actual backend image/staging upload");
+
+    // Separate draws in one real callback share a stable retained generation. Distinct samplers
+    // still yield six references, while the immutable pixel owner permits one actual upload. The
+    // old draw-local memo makes two unique uploads here even when the final pixels happen to match.
+    live_draw.color0_base += 0x10000;
+    const auto cross_draw_pixels = render_submit_items({live_draw, live_draw}, W, H);
+    bool cross_draw_matches = cross_draw_pixels.size() == Pixels * 4;
+    if (cross_draw_matches) for (size_t c = 0; c < 4; ++c)
+        cross_draw_matches &= cross_draw_pixels[shared_center + c] >= 127 &&
+                              cross_draw_pixels[shared_center + c] <= 128;
+    check(cross_draw_matches, "two same-generation array consumers preserve exact sampled pixels");
+    uploads = backend_texture_upload_stats();
+    const uint64_t expected_uploads = per_draw_control ? 2u : 1u;
+    const auto report_uploads = [&](const char* arm) {
+        std::printf("[snapshot-fixture] arm=%s policy=%s refs=%llu uploads=%llu bytes=%llu\n",
+            arm, per_draw_control ? "per-draw" : "callback",
+            (unsigned long long)uploads.references, (unsigned long long)uploads.unique_uploads,
+            (unsigned long long)uploads.upload_bytes);
+    };
+    report_uploads("same-target");
+    check(uploads.references == 6, "two draws retain all six texture references");
+    check(uploads.unique_uploads == expected_uploads,
+          "callback policy shares one upload; startup per-draw control requires two");
+    check(uploads.upload_bytes == expected_uploads * Pixels * Layers * snapshot_bpp,
+          "actual uploaded bytes agree with the independently expected policy count");
+
+    // Different color targets force separate backend groups. Completing unrelated color work
+    // must retain an unchanged depth snapshot rather than turning every group boundary into a miss.
+    const DrawItem first_color_target = live_draw;
+    live_draw.color0_base += 0x10000;
+    std::vector<uint8_t> cross_group_pixels;
+    const auto cross_group_census = capture_stderr([&] {
+        cross_group_pixels = render_submit_items({first_color_target, live_draw}, W, H);
+    });
+    bool cross_group_matches = cross_group_pixels.size() == Pixels * 4;
+    if (cross_group_matches) for (size_t c = 0; c < 4; ++c)
+        cross_group_matches &= cross_group_pixels[shared_center + c] >= 127 &&
+                              cross_group_pixels[shared_center + c] <= 128;
+    check(cross_group_matches, "different color groups preserve exact sampled depth pixels");
+    const char* expected_group_census = per_draw_control
+        ? "scope=callback reads=2 reuses=4 " : "scope=callback reads=1 reuses=5 ";
+    check(cross_group_census.find(expected_group_census) != std::string::npos,
+          "different color groups use one callback read or two explicit control reads");
+
+    // Warm that same callback memo, then record an actual depth rewrite between consumers. The
+    // last consumer has a different expected depth; stale reuse cannot pass by keeping old pixels.
+    const DrawItem before_rewrite = live_draw;
+    expected[1] = 0.4532623291015625f;
+    live_producer.ps.min_depth = live_producer.ps.max_depth = expected[1];
+    repeated_shader({expected[0], expected[1], expected[2]});
+    live_draw.color0_base += 0x10000;
+    std::vector<uint8_t> rewritten_in_callback;
+    const auto rewritten_census = capture_stderr([&] {
+        rewritten_in_callback = render_submit_items({before_rewrite, live_producer, live_draw}, W, H);
+    });
+    bool rewritten_matches = rewritten_in_callback.size() == Pixels * 4;
+    if (rewritten_matches) for (size_t c = 0; c < 4; ++c)
+        rewritten_matches &= rewritten_in_callback[shared_center + c] >= 127 &&
+                             rewritten_in_callback[shared_center + c] <= 128;
+    check(rewritten_matches,
+          "depth producer between consumers replaces the earlier sampled pixels");
+    check(rewritten_census.find("scope=callback reads=2 reuses=4 ") != std::string::npos,
+          "both policies require two reads when a depth producer changes the generation");
+
+    // A different base in the SAME preparation scope must retain independent pixels.
+    seed_base = Base;
+    constexpr float different_value = 0.4376373291015625f;
+    if (!seed_layer(2, different_value)) return 1;
+    repeated_table->resources[2].gpu_addr = Base;
+    repeated_shader({expected[0], expected[1], different_value});
+    live_draw.color0_base += 0x10000;
+    check(live_matches(), "different retained array bases keep independent sampled values");
+    uploads = backend_texture_upload_stats();
+    check(uploads.references == 3 && uploads.unique_uploads == 2,
+          "different array base does not reuse the first snapshot/upload");
+
+    repeated_table->resources[2].gpu_addr = shared_base;
+    repeated_table->resources[2].depth = 2;
+    repeated_shader({expected[0], expected[1], expected[1]});
+    live_draw.color0_base += 0x10000;
+    check(live_matches(), "different array layer count retains the requested view");
+    uploads = backend_texture_upload_stats();
+    check(uploads.references == 3 && uploads.unique_uploads == 2 &&
+              uploads.upload_bytes == Pixels * (Layers + 2) * snapshot_bpp,
+          "different layer count owns a distinct correctly sized upload");
+
+    repeated_table->resources[2].depth = Layers;
+    repeated_table->resources[2].width = W + 1;
+    repeated_table->resources[2].layer_stride_bytes = (W + 1) * H * sizeof(float);
+    const auto extent_diagnostic = capture_stderr([&] {
+        (void)render_submit_items({live_draw}, W, H);
+    });
+    check(extent_diagnostic.find("[render-array-reject] binding=6 retained depth:") != std::string::npos,
+          "incompatible extent cannot borrow the earlier binding's complete array");
+    repeated_table->resources[2].width = W;
+    repeated_table->resources[2].layer_stride_bytes = Pixels * sizeof(float);
+
+    seed_base = shared_base;
+    expected[2] = 0.5626373291015625f;
+    if (!seed_layer(2, expected[2])) return 1;
+    repeated_shader({expected[0], expected[1], expected[2]});
+    live_draw.color0_base += 0x10000;
+    check(live_matches(), "later draw observes renderer rewrite rather than a prior draw's shared snapshot");
+    uploads = backend_texture_upload_stats();
+    check(uploads.references == 3 && uploads.unique_uploads == 1,
+          "new generation deduplicates only its own draw's bindings");
+    // Real direct-memory aliases: A and B are VA-disjoint views of the same physical bytes;
+    // C is another physical range. Warm an array through A before notifying a layer-2 write
+    // through B. Old numeric-only invalidation retains all four stale layers and this arm fails.
+    uint64_t physical = 0;
+    constexpr uint64_t MappingBytes = 0x10000;
+    const bool allocated = alloc_direct(0, 0x200000000ull, MappingBytes * 2, MappingBytes, 0,
+                                       reinterpret_cast<uint64_t>(&physical)) == 0;
+    check(allocated, "physical backing for actual A/B aliases allocated");
+    if (!allocated) return 1;
+    backing.physical.emplace_back(physical, MappingBytes * 2);
+    uint64_t alias_a = 0, alias_b = 0, unrelated = 0;
+    for (auto [address, offset] : {std::pair{&alias_a, physical}, std::pair{&alias_b, physical},
+                                  std::pair{&unrelated, physical + MappingBytes}}) {
+        const bool mapped = map_direct(reinterpret_cast<uint64_t>(address), MappingBytes, 2, 0,
+                                       offset, MappingBytes) == 0 && *address;
+        check(mapped, "actual guest direct-memory view mapped");
+        if (!mapped) return 1;
+        backing.mappings.emplace_back(*address, MappingBytes);
+    }
+    check(alias_a != alias_b && prosper::guest_memory_topology_relation(
+              alias_a, Pixels * Layers * sizeof(float), alias_b, Pixels * Layers * sizeof(float)) ==
+              prosper::GuestMemoryTopologyRelation::Overlap,
+          "A and B are numerically distinct but authoritatively physical aliases");
+    check(prosper::guest_memory_topology_relation(alias_a, Pixels * Layers * sizeof(float),
+              unrelated, Pixels * Layers * sizeof(float)) == prosper::GuestMemoryTopologyRelation::Disjoint,
+          "C is authoritatively disjoint from the retained array");
+    seed_base = alias_a;
+    live_draw.prt = live_table;
+    live_table->resources[0] = texture;
+    live_table->resources[0].gpu_addr = alias_a;
+    live_table->resources[0].host_data = nullptr;
+    live_table->resources[0].host_data_size = 0;
+    live_draw.ps = sample_state;
+    live_draw.color0_base = Base + 0x1800000;
+    for (uint32_t layer = 0; layer < Layers; ++layer)
+        if (!seed_layer(layer, expected[layer])) return 1;
+    live_shader(2);
+    check(live_matches() && ds_layer_stride_for(alias_a, W, H) == Pixels * sizeof(float),
+          "actual array A is warm and consumer stride established before alias writes");
+    const float changed = 0.3126373291015625f;
+    std::memcpy(reinterpret_cast<void*>(unrelated + 2 * Pixels * sizeof(float)), &changed, sizeof(changed));
+    notify_guest_gpu_write(unrelated + 2 * Pixels * sizeof(float), sizeof(changed));
+    check(live_matches(), "known nonalias C write preserves the warm A array and its pixels");
+    const uint64_t layer2_offset = 2 * Pixels * sizeof(float);
+    std::memcpy(reinterpret_cast<void*>(alias_b + layer2_offset), &changed, sizeof(changed));
+    float observed_alias = 0;
+    std::memcpy(&observed_alias, reinterpret_cast<const void*>(alias_a + layer2_offset), sizeof(observed_alias));
+    check(std::bit_cast<uint32_t>(observed_alias) == std::bit_cast<uint32_t>(changed),
+          "write through B actually changed guest bytes observed through A");
+    notify_guest_gpu_write(alias_b + layer2_offset, sizeof(changed));
+    const auto physical_alias_diagnostic = capture_stderr([&] {
+        (void)render_submit_items({live_draw}, W, H);
+    });
+    check(physical_alias_diagnostic.find("[render-array-reject] binding=4 retained depth: "
+          "retained depth array has missing or invalid layers") != std::string::npos,
+          "real frontend refuses warm A after layer-2 physical-alias B write");
+    {
+        BackendPersistentResourceGuard guard;
+        unsigned valid = 0, invalid = 0;
+        for (const auto& [key, image] : persistent_ds_cache()) if (key.dr == alias_a) {
+            valid += image.depth_valid;
+            invalid += !image.depth_valid && key.slice == 2;
+        }
+        check(valid == Layers - 1 && invalid == 1,
+              "physical alias invalidates only its known nonzero layer");
+    }
+    const auto retained_before_alias = output;
+    check(read_persistent_ds_depth_array(alias_a, W, H, 0, Layers, output, error) ==
+              Status::Unavailable && output == retained_before_alias,
+          "physical-alias invalidation cannot republish an old complete snapshot");
+    expected[2] = changed;
+    if (!seed_layer(2, expected[2])) return 1;
+    live_shader(2);
+    check(live_matches(), "actual renderer layer rewrite recovers A with new exact pixels");
+    // A notification without authoritative mapping coverage must not be treated as disjoint.
+    constexpr uint64_t UnknownWrite = 0x1000;
+    check(prosper::guest_memory_topology_relation(alias_a, Pixels * Layers * sizeof(float),
+              UnknownWrite, sizeof(float)) == prosper::GuestMemoryTopologyRelation::Unknown,
+          "untracked notification has no physical-disjointness proof");
+    notify_guest_gpu_write(UnknownWrite, sizeof(float));
+    (void)is_live_render_target(alias_a);
+    const auto before_unknown = output;
+    check(read_persistent_ds_depth_array(alias_a, W, H, 0, Layers, output, error) ==
+              Status::Unavailable && output == before_unknown,
+          "unknown mapping relation conservatively revokes retained array authority");
     return failures ? 1 : 0;
 }

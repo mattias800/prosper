@@ -8048,11 +8048,22 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // requested gradient-selected mip from the implicit-derivative result.
             const bool is_sample_d = (in.opcode == 0x22);
             // These array lowerings preserve the guest's layer operand. The older generic
-            // bias/gradient/offset/gather helpers default arrays to layer zero, so do not admit
+            // bias/gradient/sample-offset helpers default arrays to layer zero, so do not admit
             // those forms for the newly supported Float32 graphics representation.
             if (graphics_float_array && in.mimg_dim == 5u &&
                 (in.mimg_a16 || (!is_load && !is_sample && !is_sample_l &&
-                                 !is_sample_lz && !is_sample_c_lz))) {
+                                 !is_sample_lz && !is_sample_c_lz &&
+                                 !is_gather_lz && !is_gather_lz_o))) {
+                ok = false;
+                return true;
+            }
+            const bool float_array_gather = graphics_float_array &&
+                in.mimg_dim == 5u && (is_gather_lz || is_gather_lz_o);
+            // Only full-width coordinates and results are admitted here. Cache/status and
+            // reserved controls cannot be admitted by widening the array opcode list alone.
+            if (float_array_gather && (in.mimg_a16 || in.mimg_d16 || in.mimg_r128 || in.mimg_tfe ||
+                in.mimg_lwe || in.mimg_dlc || in.mimg_glc || in.mimg_slc ||
+                in.mimg_reserved || in.has_modifier)) {
                 ok = false;
                 return true;
             }
@@ -8406,17 +8417,22 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 if (!b.declare_texture(res->binding, Dim_2D, uint_texture, declared_arrayed)) {
                     ok = false; return true;
                 }
-                if (is_gather_lz_o)   // vaddr order for _o: [packed offset, u, v]
+                // Float32 arrays carry an independent floating-point layer after the spatial
+                // coordinates. cvg preserves both consecutive and NSA address layouts. The
+                // gather's signed spatial offset must not translate or normalize that layer.
+                const uint32_t layer = float_array_gather
+                    ? vread(cvg(is_gather_lz_o ? 3u : 2u)) : 0u;
+                if (is_gather_lz_o)   // vaddr order: [packed offset, u, v, optional layer]
                     b.image_gather_offset_2d(
                         res->binding,
                         normalized_spatial(vread(cvg(1)), res->width),
                         normalized_spatial(vread(cvg(2)), res->height),
-                        comp, vread(cvg(0)), out);
+                        comp, vread(cvg(0)), out, layer);
                 else
                     b.image_gather_2d(
                         res->binding,
                         normalized_spatial(vread(cvg(0)), res->width),
-                        normalized_spatial(vread(cvg(1)), res->height), comp, out);
+                        normalized_spatial(vread(cvg(1)), res->height), comp, out, layer);
                 int vd = in.dst.value;
                 if (in.mimg_d16) {
                     if (!d16_float_resource) { ok = false; return true; }

@@ -178,6 +178,22 @@ bool materialize_uniform_rtt(RttSurf& surface) {
 
 using RttCache = std::unordered_map<uint64_t, RttSurf>;
 
+// A failed array binding can recur on every draw. Bound routine diagnostics while preserving
+// the first rejection at each site; the opt-in full log remains available for investigation.
+bool log_array_rejection(uint32_t& count, const char* site) {
+    // Tests arm this between submits; a process-lifetime cache would make the arm vacuous.
+    const bool full_log = std::getenv("PROSPER_ARRAY_REJECT_LOG_ALL") != nullptr;
+    if (full_log) return true;
+    constexpr uint32_t Limit = 64;
+    if (count < Limit) { ++count; return true; }
+    if (count == Limit) {
+        ++count;
+        std::fprintf(stderr, "[render-array-reject] site=%s suppressed after %u messages; "
+            "set PROSPER_ARRAY_REJECT_LOG_ALL=1 for full logging\n", site, Limit);
+    }
+    return false;
+}
+
 // A queued guest write carries WHO made it. The origin is a thread-local set around
 // notify_guest_gpu_write, but DS/RTT invalidation runs later at drain time -- on whatever thread
 // drains, long after that thread-local was reset. So an invalidation diagnostic that reads the
@@ -551,6 +567,7 @@ void drain_guest_gpu_writes(RttCache& cache, bool invalidate_ds) {
         // default. Cleared afterwards so a queued origin never leaks into an unrelated later write.
         prosper::gpu::set_guest_gpu_write_origin(write.origin);
         if (invalidate_ds) {
+            const prosper::test::BackendPersistentResourceGuard guard;
             const auto invalidations =
                 prosper::test::invalidate_persistent_ds_guest_write(write.addr, write.size);
             if (census) census->ds_invalidations += invalidations;
@@ -3050,11 +3067,55 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 std::vector<uint32_t> order;
             };
             constexpr uint32_t kCompactBufferResourceBit = 0x80000000u;
+            // Immutable CPU snapshots live only for this renderer callback (not later spans or
+            // frames). Every lookup still proves the exact retained images/generations. Sharing the
+            // owner across draws also lets one backend group deduplicate its uploads by pointer.
+            using DepthPlaneIdentity = std::tuple<
+                uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
+                uint32_t, uint32_t, uint32_t, uint32_t, VkImage, uint64_t, bool, bool>;
+            struct DepthArraySnapshot {
+                uint64_t base, stride;
+                uint32_t width, height, layers;
+                VkFormat format;
+                std::vector<DepthPlaneIdentity> planes;
+                std::shared_ptr<const std::vector<uint8_t>> pixels;
+            };
+            struct DepthArraySnapshotCensus {
+                bool enabled;
+                uint64_t reads = 0, reuses = 0, payload_bytes = 0, producer_flushes = 0;
+                ~DepthArraySnapshotCensus() {
+                    if (enabled && (reads || reuses))
+                        std::fprintf(stderr,
+                            "[depth-array-snapshots] scope=callback reads=%llu reuses=%llu "
+                            "payload_bytes=%llu producer_flushes=%llu\n",
+                            (unsigned long long)reads, (unsigned long long)reuses,
+                            (unsigned long long)payload_bytes, (unsigned long long)producer_flushes);
+                }
+            } depth_array_census{std::getenv("PROSPER_DEPTH_ARRAY_SNAPSHOT_CENSUS") != nullptr};
+            std::vector<DepthArraySnapshot> depth_array_snapshots;
+            size_t depth_array_snapshot_bytes = 0;
+            bool depth_array_snapshot_admitted = false;
+            constexpr size_t kDepthArraySnapshotEntries = 16;
+            constexpr size_t kDepthArraySnapshotBytes = 128u * 1024u * 1024u;
+            const bool reuse_depth_arrays_across_draws =
+                std::getenv("PROSPER_NO_SUBMIT_DEPTH_ARRAY_SNAPSHOT_REUSE") == nullptr;
+            const bool compact_depth_array_snapshots =
+                std::getenv("PROSPER_NO_COMPACT_DEPTH_ARRAY_SNAPSHOT") == nullptr;
+            const auto clear_depth_array_snapshots = [&] {
+                depth_array_snapshots.clear();
+                depth_array_snapshot_bytes = 0;
+            };
             auto build_R = [&](const prosper::gpu::DrawItem& draw,
                                const prosper::gpu::ShaderResourceTable* vrt,
                                const prosper::gpu::ShaderResourceTable* prt,
                                prosper::test::BackendSubmissionBatch* producer_batch) {
               BuiltFrameResources built;
+              // Once this callback has admitted a snapshot, observe queued guest writes at every
+              // later draw, including draws with no array bindings. A callback-local latch keeps
+              // this boundary identical when the per-draw control clears its memo; failure/clear
+              // must not turn off subsequent notification processing.
+              if (depth_array_snapshot_admitted) drain_guest_gpu_writes(g_rtt, invalidate_ds);
+              if (!reuse_depth_arrays_across_draws) clear_depth_array_snapshots();
               auto add = [&](const prosper::gpu::ShaderResourceTable* t, uint32_t set,
                              const std::vector<uint32_t>& spirv,
                              prosper::gpu::SpirvShaderStage stage,
@@ -3707,9 +3768,11 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         // CPU snapshot as the complete Float32 array or replace renderer authority
                         // with stale guest bytes. Multi-layer color ownership needs a separate proof.
                         if (float32_array && live_rtt != g_rtt.end()) {
-                            std::fprintf(stderr,
-                                "[render-array-reject] binding=%u Float32 array aliases a single color RTT\n",
-                                r.binding);
+                            static thread_local uint32_t array_reject_logged = 0;
+                            if (log_array_rejection(array_reject_logged, "single-color-rtt"))
+                                std::fprintf(stderr,
+                                    "[render-array-reject] binding=%u Float32 array aliases a single color RTT addr=0x%llx\n",
+                                    r.binding, (unsigned long long)r.gpu_addr);
                             built.complete = false;
                             continue;
                         }
@@ -3915,17 +3978,20 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         if (float32_array && (!r.width || !r.height || r.depth > 2048u ||
                             (r.num_components != 1u && r.num_components != 2u && r.num_components != 4u) ||
                             array_footprint > array_budget_bytes)) {
-                            std::fprintf(stderr,
-                                "[render-array-reject] binding=%u Float32 %ux%ux%u components=%u "
-                                "compression=%u decoded-bytes=%llu budget=%llu\n",
-                                r.binding, r.width, r.height, r.depth, r.num_components,
-                                unsigned(r.compression_enabled),
-                                (unsigned long long)array_footprint,
-                                (unsigned long long)array_budget_bytes);
+                            static thread_local uint32_t array_reject_logged = 0;
+                            if (log_array_rejection(array_reject_logged, "shape-budget"))
+                                std::fprintf(stderr,
+                                    "[render-array-reject] binding=%u Float32 %ux%ux%u components=%u "
+                                    "compression=%u decoded-bytes=%llu budget=%llu addr=0x%llx\n",
+                                    r.binding, r.width, r.height, r.depth, r.num_components,
+                                    unsigned(r.compression_enabled),
+                                    (unsigned long long)array_footprint,
+                                    (unsigned long long)array_budget_bytes, (unsigned long long)r.gpu_addr);
                             built.complete = false;
                             continue;
                         }
                         std::shared_ptr<const std::vector<uint8_t>> retained_depth_array;
+                        VkFormat retained_depth_array_format = VK_FORMAT_R32G32B32A32_SFLOAT;
                         if (float32_array && !resource_compute_image_hit) {
                             const auto& array_ctx = prosper::test::render_vk_ctx();
                             VkFormatProperties array_properties{};
@@ -3937,20 +4003,47 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     ? VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT : 0u);
                             if (!array_ctx.ok ||
                                 (array_properties.optimalTilingFeatures & needed) != needed) {
-                                std::fprintf(stderr,
-                                    "[render-array-reject] binding=%u RGBA32F sampling unsupported\n",
-                                    r.binding);
+                                static thread_local uint32_t array_reject_logged = 0;
+                                if (log_array_rejection(array_reject_logged, "format-support"))
+                                    std::fprintf(stderr,
+                                        "[render-array-reject] binding=%u RGBA32F sampling unsupported addr=0x%llx\n",
+                                        r.binding, (unsigned long long)r.gpu_addr);
                                 built.complete = false;
                                 continue;
                             }
                             const bool depth_array_shape = r.num_components == 1u &&
                                 !r.in_mip_tail && r.layer_mip_offset_bytes == 0u;
+                            const bool border_addressing = std::any_of(
+                                std::begin(r.addr_uvw), std::end(r.addr_uvw),
+                                [](uint32_t mode) { return mode == 6u || mode == 7u; });
+                            if (depth_array_shape && compact_depth_array_snapshots && !border_addressing &&
+                                reflected_binding && !reflected_binding->texel_fetch) {
+                                // Interior missing components become (R,0,0,1) before view swizzle.
+                                // Border replacement applies only to PRESENT format components, so
+                                // R32 and RGBA32 borders can differ: keep the expanded border route.
+                                // Robust out-of-range OpImageFetch has the same alpha distinction,
+                                // independently of sampler state; all fetch users retain RGBA32.
+                                VkFormatProperties compact_properties{};
+                                vkGetPhysicalDeviceFormatProperties(array_ctx.phys,
+                                    VK_FORMAT_R32_SFLOAT, &compact_properties);
+                                if ((compact_properties.optimalTilingFeatures & needed) == needed)
+                                    retained_depth_array_format = VK_FORMAT_R32_SFLOAT;
+                            }
                             bool retained_exact = false;
                             bool retained_subview = false;
+                            bool retained_noncanonical = false;
                             {
                                 const prosper::test::BackendPersistentResourceGuard guard;
-                                for (const auto& [key, image] : prosper::test::persistent_ds_cache()) {
-                                    (void)image;
+                                const auto& ds_cache = prosper::test::persistent_ds_cache();
+                                std::vector<std::pair<uint32_t, uint64_t>> write_aliases;
+                                for (const auto& [key, image] : ds_cache) {
+                                    // Invalidation addresses layer strides by the read base when
+                                    // both bases exist. A consumer of a distinct write alias does
+                                    // not establish a stride for that canonical identity. Only a
+                                    // matching, selected layer can be an array source candidate.
+                                    if (key.dw == r.gpu_addr && key.dr && key.dr != r.gpu_addr &&
+                                        key.w == tw && key.h == th && key.slice < r.depth)
+                                        write_aliases.emplace_back(key.slice, image.last_depth_write);
                                     for (const uint64_t base : {key.dr, key.dw}) {
                                         if (!base) continue;
                                         if (base == r.gpu_addr) retained_exact = true;
@@ -3966,36 +4059,171 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                             retained_subview = true;
                                     }
                                 }
+                                // The readback selects the newest key for each layer. An older
+                                // write-base alias cannot veto a newer canonical read-base plane;
+                                // a selected or tied alias cannot prove the stride identity.
+                                // Do this extra scan only when an alias exists (normally none).
+                                for (const auto& [slice, alias_generation] : write_aliases) {
+                                    bool superseded = false;
+                                    for (const auto& [key, image] : ds_cache) {
+                                        if (key.dr == r.gpu_addr && key.w == tw && key.h == th &&
+                                            key.slice == slice &&
+                                            image.last_depth_write > alias_generation) {
+                                            superseded = true;
+                                            break;
+                                        }
+                                    }
+                                    if (!superseded) {
+                                        retained_noncanonical = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            if (retained_noncanonical) {
+                                static thread_local uint32_t array_reject_logged = 0;
+                                if (log_array_rejection(array_reject_logged, "noncanonical-depth"))
+                                    std::fprintf(stderr,
+                                        "[render-array-reject] binding=%u unproven retained depth write-base alias addr=0x%llx\n",
+                                        r.binding, (unsigned long long)r.gpu_addr);
+                                built.complete = false;
+                                continue;
                             }
                             if (retained_subview || (retained_exact && !depth_array_shape)) {
-                                std::fprintf(stderr,
-                                    "[render-array-reject] binding=%u unsupported retained depth view\n",
-                                    r.binding);
+                                static thread_local uint32_t array_reject_logged = 0;
+                                if (log_array_rejection(array_reject_logged, "depth-view"))
+                                    std::fprintf(stderr,
+                                        "[render-array-reject] binding=%u unsupported retained depth view addr=0x%llx\n",
+                                        r.binding, (unsigned long long)r.gpu_addr);
                                 built.complete = false;
                                 continue;
                             }
                             if (depth_array_shape) {
+                                // The exact, non-rebased consumer proves the depth-plane stride.
+                                // Without it a guest write to layer N > 0 is tested against layer
+                                // zero's bytes and leaves the retained image incorrectly valid.
+                                if (retained_exact) {
+                                    const prosper::test::BackendPersistentResourceGuard guard;
+                                    const uint64_t known_stride = prosper::test::ds_layer_stride_for(
+                                        r.gpu_addr, tw, th);
+                                    if (r.layer_stride_bytes <
+                                            static_cast<uint64_t>(tw) * th * sizeof(float) ||
+                                        (known_stride && known_stride != r.layer_stride_bytes)) {
+                                        static thread_local uint32_t array_reject_logged = 0;
+                                        if (log_array_rejection(array_reject_logged, "depth-stride"))
+                                            std::fprintf(stderr,
+                                                "[render-array-reject] binding=%u unproven retained depth stride addr=0x%llx\n",
+                                                r.binding, (unsigned long long)r.gpu_addr);
+                                        built.complete = false;
+                                        continue;
+                                    }
+                                    prosper::test::note_ds_layer_stride_locked(
+                                        r.gpu_addr, tw, th, r.layer_stride_bytes);
+                                }
+                                if (retained_exact && !depth_array_snapshots.empty() &&
+                                    producer_batch && producer_batch->pending()) {
+                                    // Complete earlier work before testing the source identity. An
+                                    // unrelated color pass need not discard an unchanged DS snapshot;
+                                    // a depth producer changes its generation and misses below.
+                                    bool completed = false;
+                                    {
+                                        const prosper::test::BackendPersistentResourceGuard guard;
+                                        const auto& ctx = prosper::test::render_vk_ctx();
+                                        if (ctx.ok && !prosper::test::backend_has_unproven_submission()) {
+                                            const auto result = producer_batch->submit_and_wait(
+                                                ctx.dev, ctx.queue, false);
+                                            completed = result.submit_result == VK_SUCCESS &&
+                                                        result.wait_result == VK_SUCCESS;
+                                        }
+                                    }
+                                    if (!completed) {
+                                        clear_depth_array_snapshots();
+                                        static thread_local uint32_t array_reject_logged = 0;
+                                        if (log_array_rejection(array_reject_logged, "producer-completion"))
+                                            std::fprintf(stderr,
+                                                "[render-array-reject] binding=%u retained depth producer did not complete addr=0x%llx\n",
+                                                r.binding, (unsigned long long)r.gpu_addr);
+                                        built.complete = false;
+                                        continue;
+                                    }
+                                    if (depth_array_census.enabled) ++depth_array_census.producer_flushes;
+                                }
+                                const auto source_identity = [&] {
+                                    const prosper::test::BackendPersistentResourceGuard guard;
+                                    std::vector<DepthPlaneIdentity> planes;
+                                    if (prosper::test::backend_has_unproven_submission()) return planes;
+                                    for (const auto& [key, image] : prosper::test::persistent_ds_cache()) {
+                                        if ((key.dr != r.gpu_addr && key.dw != r.gpu_addr) ||
+                                            key.w != tw || key.h != th || key.slice >= r.depth)
+                                            continue;
+                                        planes.emplace_back(key.dr, key.dw, key.sr, key.sw, key.htile,
+                                            key.w, key.h, key.fmt, key.slice, image.image,
+                                            image.last_depth_write, image.depth_valid,
+                                            image.layout_initialized);
+                                    }
+                                    return planes;
+                                };
+                                auto planes = source_identity();
+                                if (!planes.empty()) {
+                                    for (const auto& cached : depth_array_snapshots) {
+                                        if (cached.base == r.gpu_addr && cached.stride == r.layer_stride_bytes &&
+                                            cached.width == tw && cached.height == th && cached.layers == r.depth &&
+                                            cached.format == retained_depth_array_format && cached.planes == planes) {
+                                            retained_depth_array = cached.pixels;
+                                            if (depth_array_census.enabled) ++depth_array_census.reuses;
+                                            break;
+                                        }
+                                    }
+                                }
                                 std::vector<float> depth;
                                 std::string error;
-                                const auto status = prosper::test::read_persistent_ds_depth_array(
-                                    r.gpu_addr, tw, th, 0u, r.depth, depth, error, producer_batch);
+                                const auto status = retained_depth_array
+                                    ? prosper::test::PersistentDsDepthArrayStatus::Ready
+                                    : prosper::test::read_persistent_ds_depth_array(
+                                        r.gpu_addr, tw, th, 0u, r.depth, depth, error, producer_batch);
                                 if (status == prosper::test::PersistentDsDepthArrayStatus::Unavailable) {
-                                    std::fprintf(stderr,
-                                        "[render-array-reject] binding=%u retained depth: %s\n",
-                                        r.binding, error.c_str());
+                                    static thread_local uint32_t array_reject_logged = 0;
+                                    if (log_array_rejection(array_reject_logged, "depth-unavailable"))
+                                        std::fprintf(stderr,
+                                            "[render-array-reject] binding=%u retained depth: %s addr=0x%llx\n",
+                                            r.binding, error.c_str(), (unsigned long long)r.gpu_addr);
                                     built.complete = false;
                                     continue;
                                 }
-                                if (status == prosper::test::PersistentDsDepthArrayStatus::Ready) {
+                                if (status == prosper::test::PersistentDsDepthArrayStatus::Ready &&
+                                    !retained_depth_array) {
+                                    const bool compact = retained_depth_array_format == VK_FORMAT_R32_SFLOAT;
                                     auto pixels = std::make_shared<std::vector<uint8_t>>(
-                                        depth.size() * 4u * sizeof(float));
-                                    constexpr uint32_t defaults[4] = {0, 0, 0, 0x3f800000u};
-                                    for (size_t i = 0; i < depth.size(); ++i) {
-                                        auto* pixel = pixels->data() + i * sizeof(defaults);
-                                        std::memcpy(pixel, defaults, sizeof(defaults));
-                                        std::memcpy(pixel, &depth[i], sizeof(float));
+                                        depth.size() * (compact ? 1u : 4u) * sizeof(float));
+                                    if (compact) {
+                                        std::memcpy(pixels->data(), depth.data(), depth.size() * sizeof(float));
+                                    } else {
+                                        constexpr uint32_t defaults[4] = {0, 0, 0, 0x3f800000u};
+                                        for (size_t i = 0; i < depth.size(); ++i) {
+                                            auto* pixel = pixels->data() + i * sizeof(defaults);
+                                            std::memcpy(pixel, defaults, sizeof(defaults));
+                                            std::memcpy(pixel, &depth[i], sizeof(float));
+                                        }
                                     }
                                     retained_depth_array = std::move(pixels);
+                                    if (depth_array_census.enabled) {
+                                        ++depth_array_census.reads;
+                                        depth_array_census.payload_bytes += retained_depth_array->size();
+                                    }
+                                    // A concurrent writer may have changed the selection while the
+                                    // synchronous read was in progress. Such a result can serve this
+                                    // binding but must not be cached under a later source identity.
+                                    if (!planes.empty() && planes == source_identity() &&
+                                        depth_array_snapshots.size() < kDepthArraySnapshotEntries &&
+                                        retained_depth_array->size() <=
+                                            kDepthArraySnapshotBytes - depth_array_snapshot_bytes) {
+                                        depth_array_snapshot_bytes += retained_depth_array->size();
+                                        depth_array_snapshots.push_back({r.gpu_addr, r.layer_stride_bytes,
+                                            tw, th, r.depth, retained_depth_array_format,
+                                            std::move(planes), retained_depth_array});
+                                        depth_array_snapshot_admitted = true;
+                                    }
+                                }
+                                if (retained_depth_array) {
                                     resource_has_ds_live = true;
                                     if (PROSPER_ENV_ON("PROSPER_DSBRIDGE_LOG")) {
                                         static unsigned reports = 0;
@@ -4007,9 +4235,11 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 }
                             }
                             if (r.compression_enabled && !retained_depth_array) {
-                                std::fprintf(stderr,
-                                    "[render-array-reject] binding=%u compressed Float32 array has no retained depth\n",
-                                    r.binding);
+                                static thread_local uint32_t array_reject_logged = 0;
+                                if (log_array_rejection(array_reject_logged, "compressed-no-depth"))
+                                    std::fprintf(stderr,
+                                        "[render-array-reject] binding=%u compressed Float32 array has no retained depth addr=0x%llx\n",
+                                        r.binding, (unsigned long long)r.gpu_addr);
                                 built.complete = false;
                                 continue;
                             }
@@ -5135,7 +5365,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             fr.tex_rgba_owner = retained_depth_array;
                             fr.tex_rgba = retained_depth_array->data();
                             fr.tex_byte_size = retained_depth_array->size();
-                            fr.texture_format = VK_FORMAT_R32G32B32A32_SFLOAT;
+                            fr.texture_format = retained_depth_array_format;
                             fr.tw = tw;
                             fr.th = th;
                             fr.td = 1;
@@ -6408,9 +6638,11 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         if ((is_cube || is_array) && !cube_done && !rtt_hit && !dcc_fast_clear_done &&
                             !cube_depth_bridged) {
                             if (float32_array && r.compression_enabled) {
-                                std::fprintf(stderr,
-                                    "[render-array-reject] binding=%u compressed Float32 guest backing\n",
-                                    r.binding);
+                                static thread_local uint32_t array_reject_logged = 0;
+                                if (log_array_rejection(array_reject_logged, "compressed-guest"))
+                                    std::fprintf(stderr,
+                                        "[render-array-reject] binding=%u compressed Float32 guest backing addr=0x%llx\n",
+                                        r.binding, (unsigned long long)r.gpu_addr);
                                 built.complete = false;
                                 continue;
                             }
@@ -6621,10 +6853,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 }
                             }
                             if (float32_array && slice_short_count) {
-                                std::fprintf(stderr,
-                                    "[render-array-reject] binding=%u Float32 short backing: "
-                                    "%u/%u slices, first=%u\n", r.binding, slice_short_count,
-                                    slice_count, slice_short[0]);
+                                static thread_local uint32_t array_reject_logged = 0;
+                                if (log_array_rejection(array_reject_logged, "short-backing"))
+                                    std::fprintf(stderr,
+                                        "[render-array-reject] binding=%u Float32 short backing: "
+                                        "%u/%u slices, first=%u addr=0x%llx\n", r.binding, slice_short_count,
+                                        slice_count, slice_short[0], (unsigned long long)r.gpu_addr);
                                 built.complete = false;
                                 continue;
                             }
@@ -9246,9 +9480,36 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     // that whole rule -- keeping a resolve out of a scene group, and keeping two
                     // resolves with different destinations out of each other's (#3025) -- and its
                     // header states why each half exists.
+                    // Array snapshots are materialized by build_bds BEFORE this group's
+                    // commands are recorded. Flush a preceding writer as its own group before
+                    // preparing an aliased consumer, even when all attachment identities match.
+                    // The bridge can then submit the pending producer batch before reading it.
+                    bool pass_writes_depth = false;
+                    const auto samples_pass_depth_array = [&](const prosper::gpu::DrawItem& draw) {
+                        const auto aliases = [&](const prosper::gpu::ShaderResourceTable* table) {
+                            if (!table) return false;
+                            for (const auto& resource : table->resources) {
+                                if (resource.cls != RC::Texture || resource.img_dim != 5u ||
+                                    resource.depth <= 1u ||
+                                    resource.format != prosper::gpu::DataFormat::Float32 ||
+                                    !resource.gpu_addr)
+                                    continue;
+                                if (resource.gpu_addr == pass_head.ps.depth_read_base ||
+                                    resource.gpu_addr == pass_head.ps.depth_write_base)
+                                    return true;
+                            }
+                            return false;
+                        };
+                        return aliases(draw.vrt.get()) || aliases(draw.prt.get());
+                    };
                     while (pass_i < items.size() && same_targets(items[pass_i]) &&
                            prosper::frontend::mrt_same_resolve_pass(pass_head, items[pass_i])) {
-                        pass.push_back(&items[pass_i]); ++pass_i;
+                        const auto& draw = items[pass_i];
+                        if (pass_writes_depth && samples_pass_depth_array(draw)) break;
+                        pass.push_back(&draw); ++pass_i;
+                        pass_writes_depth |= prosper::test::persistent_ds_pass_may_write_depth(
+                            draw.ps.depth_clear_enable, draw.ps.depth_test_enable,
+                            draw.ps.depth_write_enable, draw.ps.depth_compare_op);
                     }
 
                     // CB_COLOR_CONTROL.MODE=RESOLVE(3): the guest resolves an MSAA color0 surface into a

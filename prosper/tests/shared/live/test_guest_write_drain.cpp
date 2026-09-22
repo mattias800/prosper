@@ -3,6 +3,7 @@
 // only: no fake Vulkan handles, draws or completion events are used as rendering evidence.
 #include "gpu/capture/gpu_capture.hpp"
 #include "gpu/execute/gpu_execute.hpp"
+#include "hle/dispatch/dispatch.hpp"
 #include "fixtures/render_runner.h"
 #include "fixtures/spirv_triangle.h"
 #include "shared/live/live_renderer.hpp"
@@ -20,7 +21,7 @@ void check(bool ok, const char* description) {
     std::printf("[%s] %s\n", ok ? "ok" : "FAIL", description);
     failures += !ok;
 }
-constexpr uint64_t A = 0x10000, B = 0x20000, Miss = 0x1000000;
+uint64_t A = 0, B = 0, Miss = 0;
 
 void seed(uint64_t address, uint32_t width = 4, uint32_t height = 4) {
     GpuCaptureRttSeed value;
@@ -69,6 +70,26 @@ void associate_metadata(uint64_t address, uint64_t metadata) {
 
 int main(int argc, char** argv) {
     const bool ordinary = argc == 2 && std::strcmp(argv[1], "--ordinary") == 0;
+    prosper::register_builtin_hle();
+    auto map_flexible = prosper::Hle::lookup(prosper::nid_hash("sceKernelMapNamedFlexibleMemory"));
+    auto unmap = prosper::Hle::lookup(prosper::nid_hash("sceKernelMunmap"));
+    constexpr uint64_t FixtureBytes = 0x200000;
+    uint64_t guest_base = 0;
+    check(map_flexible && unmap &&
+              map_flexible(reinterpret_cast<uint64_t>(&guest_base), FixtureBytes, 2, 0,
+                           reinterpret_cast<uint64_t>("guest-write-drain"), 0) == 0 && guest_base,
+          "independent guest planes have tracked mapping identity");
+    if (!guest_base) return 1;
+    struct MappingCleanup {
+        prosper::HleFn unmap;
+        uint64_t base, size;
+        ~MappingCleanup() { unmap(base, size, 0, 0, 0, 0); }
+    } mapping{unmap, guest_base, FixtureBytes};
+    // Only the disjointness guard needs mapping proof. Keep the older CPU RTT/DCC fixture at
+    // its synthetic addresses so mapping it cannot activate a different guest-backed producer.
+    A = 0x10000;
+    B = guest_base + 0x20000;
+    Miss = guest_base + 0x100000;
     prosper::frontend::register_live_renderer("", false);
     check(guest_write_drain_work_for_thread().observed, "census was armed at process startup");
     clear();
@@ -114,7 +135,9 @@ int main(int argc, char** argv) {
     const prosper::test::PersistentColorTargetKey color{B, 4, 4, VK_FORMAT_R8G8B8A8_UNORM};
     colors[color].valid = true;
     prosper::test::PersistentDsKey key;
-    key.dr = 0x30000; key.sr = 0x40000; key.htile = 0x50000;
+    key.dr = guest_base + 0x30000;
+    key.sr = guest_base + 0x40000;
+    key.htile = guest_base + 0x50000;
     key.w = key.h = 4;
     auto& ds = prosper::test::persistent_ds_cache();
     ds[key].depth_valid = ds[key].stencil_valid = true;

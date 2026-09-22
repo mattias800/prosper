@@ -7,6 +7,7 @@
 #include <thread>         // #3407: parallel_render_memcpy
 #include "host/memory/guest_write_watch.hpp"   // VA->phys for the #2932 target census
 #include "host/memory/guest_memory_map.hpp"    // mapping generation for opt-in range census
+#include "hle/memory/guest_memory_topology.hpp" // authoritative physical aliases for DS invalidation
 #include "shared/rtt/mrt_extent.hpp"
 #include <vulkan/vulkan.h>
 #include "gpu_detile_upload.h"
@@ -4774,30 +4775,6 @@ inline std::mutex& ds_layer_stride_mutex() {
     return mutex;
 }
 
-// Records a stride learned from a CONSUMER descriptor. With a complete identity, allocation reuse no
-// longer collides here at all -- a new surface at a recycled base has its own entry. A disagreement
-// that survives the identity is therefore a genuine decode error, not reuse, and is reported once.
-// The later value is taken, but that choice is arbitrary between two claims we cannot adjudicate:
-// the REPORT is the mitigation, not the pick.
-inline void note_ds_layer_stride(uint64_t base, uint32_t width, uint32_t height, uint64_t stride) {
-    if (!base || !stride) return;
-    const DsLayerStrideKey key{base, width, height};
-    std::lock_guard<std::mutex> lock(ds_layer_stride_mutex());
-    DsLayerStrideEntry& entry = ds_layer_stride_registry()[key];
-    if (entry.consumer_stride && entry.consumer_stride != stride) {
-        if (!entry.consumer_conflict_reported) {
-            entry.consumer_conflict_reported = true;
-            std::fprintf(stderr,
-                         "[ds-stride] consumer disagreement at base=0x%llx %ux%u: had %llu, now told "
-                         "%llu; taking the later value (identity already separates allocation reuse, "
-                         "so this is a decode error)\n",
-                         (unsigned long long)base, width, height,
-                         (unsigned long long)entry.consumer_stride, (unsigned long long)stride);
-        }
-    }
-    entry.consumer_stride = stride;
-}
-
 // Which of a DS surface's two depth bases identifies it in the stride registry.
 //
 // This binds every site that HAS both bases -- today that is the invalidation lookup, which reads
@@ -4949,6 +4926,70 @@ inline std::unordered_map<PersistentDsKey, PersistentDsImage, PersistentDsKeyHas
 persistent_ds_cache() {
     static std::unordered_map<PersistentDsKey, PersistentDsImage, PersistentDsKeyHash> cache;
     return cache;
+}
+
+// Before the first exact consumer supplies a DS layer stride, the ordinary invalidator
+// cannot locate writes to nonzero layers. Keep only an ordering watermark, not a range history:
+// an unknown-stride layer older than ANY intervening guest write is conservatively unproven.
+// This can refuse untouched layers after unrelated writes until their next renderer rewrite.
+// The state shares the backend resource guard's DS-cache lifetime and monotonic write generation;
+// an empty cache drops it. Generation regression with live entries fails closed.
+struct UnknownDsStrideWrites {
+    uint64_t last_generation = 0;
+    uint64_t write_generation = 0;
+    bool has_write = false;
+    bool generation_regressed = false;
+};
+inline UnknownDsStrideWrites& unknown_ds_stride_writes() {
+    static UnknownDsStrideWrites state;
+    if (persistent_ds_cache().empty()) state = {};
+    const uint64_t generation = persistent_ds_write_generation();
+    if (generation < state.last_generation) state.generation_regressed = true;
+    state.last_generation = generation;
+    return state;
+}
+
+// Called under BackendPersistentResourceGuard before publishing a first consumer stride.
+inline void revoke_unknown_ds_stride_history(uint64_t base, uint32_t width, uint32_t height) {
+    const auto& history = unknown_ds_stride_writes();
+    if (!history.has_write && !history.generation_regressed) return;
+    for (auto& [key, image] : persistent_ds_cache()) {
+        if ((key.dr != base && key.dw != base) || key.w != width || key.h != height) continue;
+        if (history.generation_regressed || !image.last_depth_write ||
+            image.last_depth_write <= history.write_generation)
+            image.depth_valid = false;
+    }
+}
+
+// First publication checks historical validity before any consumer can treat the stride as known.
+// Existing conflict reporting remains separate: conflicting descriptors are not proof of overlap.
+// Caller holds BackendPersistentResourceGuard. Lock order is resource domain -> stride map.
+inline void note_ds_layer_stride_locked(uint64_t base, uint32_t width, uint32_t height, uint64_t stride) {
+    if (!base || !stride) return;
+    const DsLayerStrideKey key{base, width, height};
+    std::lock_guard<std::mutex> lock(ds_layer_stride_mutex());
+    DsLayerStrideEntry& entry = ds_layer_stride_registry()[key];
+    if (!entry.consumer_stride)
+        revoke_unknown_ds_stride_history(base, width, height);
+    if (entry.consumer_stride && entry.consumer_stride != stride) {
+        if (!entry.consumer_conflict_reported) {
+            entry.consumer_conflict_reported = true;
+            std::fprintf(stderr,
+                         "[ds-stride] consumer disagreement at base=0x%llx %ux%u: had %llu, now told "
+                         "%llu; taking the later value (identity already separates allocation reuse, "
+                         "so this is a decode error)\n",
+                         (unsigned long long)base, width, height,
+                         (unsigned long long)entry.consumer_stride, (unsigned long long)stride);
+        }
+    }
+    entry.consumer_stride = stride;
+}
+
+// Public callers (cube consumers and metadata tests) do not already own the resource domain.
+inline void note_ds_layer_stride(uint64_t base, uint32_t width, uint32_t height, uint64_t stride) {
+    if (!base || !stride) return;
+    const BackendPersistentResourceGuard guard;
+    note_ds_layer_stride_locked(base, width, height, stride);
 }
 
 // Sampled depth-plane lookup (#1275): a shadow-map / depth-pyramid T# addresses the DEPTH plane of
@@ -5249,14 +5290,22 @@ inline bool guest_ranges_overlap(uint64_t a, uint64_t a_size, uint64_t b, uint64
 // depth and stencil have independent guest allocations and Vulkan load/store operations, and a
 // stencil-only compute update must not discard depth that a later pass samples. HTILE fast clears are
 // the exception because the metadata can describe both aspects; conservatively invalidate both.
+// Production callers hold BackendPersistentResourceGuard while updating cache validity/history.
 inline size_t invalidate_persistent_ds_guest_write(uint64_t addr, uint64_t size) {
     if (!addr || !size) return 0;
+    auto& history = unknown_ds_stride_writes();
+    if (!persistent_ds_cache().empty()) {
+        history.has_write = true;
+        history.write_generation = persistent_ds_write_generation();
+    }
     size_t invalidated = 0;
     for (auto& [key, image] : persistent_ds_cache()) {
-        const uint64_t depth_size = static_cast<uint64_t>(key.w) * key.h * 4;
-        const uint64_t stencil_size = static_cast<uint64_t>(key.w) * key.h;
-        const uint64_t htile_blocks = static_cast<uint64_t>((key.w + 7) / 8) *
-                                      ((key.h + 7) / 8);
+        const uint64_t pixels = static_cast<uint64_t>(key.w) * key.h;
+        const bool depth_extent_overflow = pixels > UINT64_MAX / 4;
+        const uint64_t depth_size = depth_extent_overflow ? UINT64_MAX : pixels * 4;
+        const uint64_t stencil_size = pixels;
+        const uint64_t htile_blocks = ((static_cast<uint64_t>(key.w) + 7) / 8) *
+                                      ((static_cast<uint64_t>(key.h) + 7) / 8);
         const uint64_t htile_size = (htile_blocks * 4 + 0x7fff) & ~0x7fffull;
         // Each slice owns its OWN bytes. Testing every face against the allocation's FIRST slice
         // meant one write evicted an entire cube -- and, symmetrically, a write to face 5's bytes
@@ -5270,15 +5319,27 @@ inline size_t invalidate_persistent_ds_guest_write(uint64_t addr, uint64_t size)
         // on the key was whatever the FIRST attachment saw, forever.
         const uint64_t learned =
             ds_layer_stride_for(ds_stride_identity_base(key.dr, key.dw), key.w, key.h);
-        const uint64_t slice_offset = learned ? static_cast<uint64_t>(key.slice) * learned : 0;
+        const bool slice_offset_overflow = learned && key.slice > UINT64_MAX / learned;
+        const uint64_t slice_offset = slice_offset_overflow ? 0 :
+            static_cast<uint64_t>(key.slice) * learned;
         const uint64_t slice_depth_bytes = learned ? learned : depth_size;
-        // Offset a base only when there IS one. `guest_ranges_overlap` refuses a zero base, but
-        // `0 + slice_offset` is not zero for any slice > 0, so adding first would slip a bogus low
-        // address past that guard and test it against a real write.
-        auto plane = [](uint64_t base, uint64_t offset) { return base ? base + offset : 0; };
+        // Distinct guest VAs can name the same physical bytes. Only an authoritative Disjoint
+        // answer preserves an aspect; unmapped, cross-mapping and malformed ranges are Unknown
+        // and conservatively revoke it. Never turn an absent plane into a low-address alias by
+        // adding the slice offset before checking its base. Caller owns the backend guard;
+        // the topology query takes its own mapping-table lock and performs no guest reads.
+        const auto plane_may_overlap = [&](uint64_t base, uint64_t offset, uint64_t bytes,
+                                           bool malformed = false) {
+            if (!base) return false;
+            if (malformed || base > UINT64_MAX - offset) return true;
+            return prosper::guest_memory_topology_relation(addr, size, base + offset, bytes) !=
+                   prosper::GuestMemoryTopologyRelation::Disjoint;
+        };
+        const bool malformed_depth = slice_offset_overflow || (!learned && depth_extent_overflow);
         const bool depth_overlap =
-            guest_ranges_overlap(addr, size, plane(key.dr, slice_offset), slice_depth_bytes) ||
-            guest_ranges_overlap(addr, size, plane(key.dw, slice_offset), slice_depth_bytes);
+            plane_may_overlap(key.dr, slice_offset, slice_depth_bytes, malformed_depth) ||
+            (key.dw != key.dr &&
+             plane_may_overlap(key.dw, slice_offset, slice_depth_bytes, malformed_depth));
         // STENCIL IS NOT OFFSET, and that is deliberate. `learned` is the DEPTH plane's layer
         // stride; stencil is a separate allocation with its own layout (1 byte/pixel against
         // depth's 4), so striding into it by depth's value lands roughly 4x too far out. That is the
@@ -5294,9 +5355,9 @@ inline size_t invalidate_persistent_ds_guest_write(uint64_t addr, uint64_t size)
         // unsafe direction -- it is simply not a gap this change introduces or widens, and adopting
         // the depth stride would have made it worse rather than better. #2670 carries it.
         const bool stencil_overlap =
-            guest_ranges_overlap(addr, size, key.sr, stencil_size) ||
-            guest_ranges_overlap(addr, size, key.sw, stencil_size);
-        const bool htile_overlap = guest_ranges_overlap(addr, size, key.htile, htile_size);
+            plane_may_overlap(key.sr, 0, stencil_size) ||
+            (key.sw != key.sr && plane_may_overlap(key.sw, 0, stencil_size));
+        const bool htile_overlap = plane_may_overlap(key.htile, 0, htile_size);
         if (!depth_overlap && !stencil_overlap && !htile_overlap) continue;
         // Which aspect a write actually hit, and the byte count that decided it. The count is the
         // interesting half: `slice_depth_bytes` comes from a LEARNED stride, so an over-large stride

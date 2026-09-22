@@ -1076,7 +1076,8 @@ struct SpirvCompute {
     // declare a 2D base-slice view for an ordinary 2D instruction; the renderer follows that
     // declaration when choosing the actual view.
     bool tex_is_arrayed(uint32_t binding);
-    uint32_t tex_coord_uv(uint32_t binding, uint32_t u_bits, uint32_t v_bits);
+    uint32_t tex_coord_uv(uint32_t binding, uint32_t u_bits, uint32_t v_bits,
+                          uint32_t layer_bits = 0);
     uint32_t texture_vec4(uint32_t binding) {
         return tex_binding_uint[binding] ? t_v4u() : t_v4f;
     }
@@ -1281,7 +1282,8 @@ struct SpirvCompute {
     // of one channel, in the DX/GL gather order ((0,1),(1,1),(1,0),(0,0)), which the AMD gather4
     // result order matches. Gather always samples the base level (== the _lz behavior). out[0..3] =
     // the four gathered values as raw bits.
-    void image_gather_2d(uint32_t binding, uint32_t u_bits, uint32_t v_bits, uint32_t comp, uint32_t out[4]);
+    void image_gather_2d(uint32_t binding, uint32_t u_bits, uint32_t v_bits, uint32_t comp,
+                         uint32_t out[4], uint32_t layer_bits = 0);
     // image_gather4_lz_o 2D: gather with the MIMG _o per-pixel OFFSET operand. The offset VGPR packs
     // signed 6-bit TEXEL offsets (x = bits[5:0], y = bits[13:8] — AMD RDNA2 ISA "offset" packing, the
     // same fields image_sample_*_o uses). SPIR-V's dynamic Offset image operand requires the
@@ -1291,7 +1293,7 @@ struct SpirvCompute {
     uint32_t t_v2i_cache = 0;
     uint32_t t_v2i() { if (!t_v2i_cache) { t_v2i_cache = id(); put(types, Op_TypeVector, {t_v2i_cache, t_i32, 2}); } return t_v2i_cache; }
     void image_gather_offset_2d(uint32_t binding, uint32_t u_bits, uint32_t v_bits, uint32_t comp,
-                                uint32_t off_bits, uint32_t out[4]);
+                                uint32_t off_bits, uint32_t out[4], uint32_t layer_bits = 0);
     // image_sample_lz_o 2D: explicit-LOD-0 sample with the MIMG _o packed texel offset (x = bits[5:0],
     // y = bits[13:8], signed 6-bit — same packing as gather4_lz_o). Vulkan forbids the dynamic Offset
     // image operand on OpImageSample* (it is gather-only), so fold the texel offset into the
