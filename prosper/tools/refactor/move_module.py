@@ -261,10 +261,13 @@ def main() -> int:
                     unresolved.append(f"{new_path.name}: {spelling}")
                 return m.group(0)
             try:
-                canonical = target.relative_to(src_dir.resolve())
+                # POSIX form: an include spelling is always forward-slashed, and on Windows the
+                # native form would write `#include "gpu\x.hpp"` -- an escape sequence in a string
+                # literal that happens to compile, and a path no other tool here can match.
+                canonical = target.relative_to(src_dir.resolve()).as_posix()
             except ValueError:
                 return m.group(0)          # outside src: leave it to the author
-            if str(canonical) == spelling:
+            if canonical == spelling:
                 return m.group(0)
             fixed_rel += 1
             return f'#include "{canonical}"'
@@ -291,8 +294,14 @@ def main() -> int:
     # no match is made. Anchoring on the TAIL means a `prosper/`-prefixed citation is rewritten by
     # the same rule, and so is a CMake source list -- which is why this replaces the CMake-only pass
     # it grew out of rather than sitting beside it.
-    path_rules = [(re.compile(re.escape(str(old.relative_to(root / "prosper"))) + r"\b"),
-                   str(new.relative_to(root / "prosper")))
+    #
+    # Both halves are spelled in POSIX form. A citation is always forward-slashed, and on Windows
+    # the native `frontends\shared\x.hpp` both matches none of them and, as a REPLACEMENT string,
+    # aborts the pass with `re.error: bad escape \s` -- the tool did nothing on Windows but crash
+    # after the move had already happened (#3699). The replacement is also passed through a
+    # function, so no path can ever be read as a regex template.
+    path_rules = [(re.compile(re.escape(old.relative_to(root / "prosper").as_posix()) + r"\b"),
+                   new.relative_to(root / "prosper").as_posix())
                   for old, new in moves]
     path_files = 0
     path_edits = 0
@@ -303,7 +312,7 @@ def main() -> int:
             continue
         new_text, edits = text, 0
         for rx, repl in path_rules:
-            new_text, n = rx.subn(repl, new_text)
+            new_text, n = rx.subn(lambda _m, repl=repl: repl, new_text)
             edits += n
         if edits:
             path_files += 1
