@@ -168,7 +168,7 @@ def main():
         image(alias=True, ms=0.01) for _ in range(99))
     code, out, err = run(log)
     check("aliases excluded from binding count", "1 real bindings" in out, out)
-    check("aliases still reported", "99 further records were aliased folds" in out, out)
+    check("aliases still reported", "alias bindings: 99 record(s), 0.990 ms measured" in out, out)
     check("ms/binding uses the real-binding denominator",
           image_row(out, "prepare upload")[1] == 9.000, image_row(out, "prepare upload"))
     # The alias records contribute 0.99 ms with no sub-timers, so if they are counted that whole
@@ -182,8 +182,28 @@ def main():
     # image section must say so and STILL print the top-programs table below it -- an early return
     # here silently truncated the report.
     code, out, err = run(phase(dispatch_ms=1) + image(alias=True, ms=0.5))
-    check("all-alias log reports the folds", "all 1 records are aliased folds" in out, out)
+    check("all-alias log reports the folds", "all records are aliased folds" in out, out)
     check("all-alias log still prints top programs", "top 1 programs by total cost" in out, out)
+
+    # #3388: an alias with NO sub-timers is not an alias that did no work. The issue's own control,
+    # built by hand: one alias-only binding carrying 3.5 ms, the whole of a 3.5 ms setup. Pre-fix
+    # the report called it "no work" and printed no duration at all.
+    log = (image(code=0x100, shader_hash=0xA, binding=26, image_class="storage", alias=True,
+                 addr=0x1000, persistent=1, upload_skipped=1, ms=3.5)
+           + phase(code=0x100, setup_ms=3.5))
+    code, out, err = run(log)
+    check("alias-only duration is retained", "alias bindings: 1 record(s), 3.500 ms measured" in out, out)
+    check("alias-only time is not called free", "no work" not in out, out)
+    check("alias-only time says why it is undecomposed", "UNDECOMPOSED, not free" in out, out)
+    # Mixed: the real-binding table is unchanged by the aliases beside it (no double-count), and the
+    # alias duration is printed on its own line rather than only as "excluded".
+    log = (phase(setup_ms=20, dispatch_ms=1) + image(ms=9, prepare_ms=9)
+           + image(alias=True, ms=7.25) + image(alias=True, ms=2.75))
+    code, out, err = run(log)
+    check("mixed: real binding count unchanged", "1 real bindings, 9 ms" in out, out)
+    check("mixed: alias duration retained", "alias bindings: 2 record(s), 10.000 ms measured" in out, out)
+    check("mixed: alias ms not folded into the real table",
+          abs(image_row(out, "unattributed")[0]) < 0.05, image_row(out, "unattributed"))
 
     # Storage cache validation happens after prepare_upload_start, unlike the sampled cache lookup.
     # It is therefore a CHILD of prepare_ms. Treating both as root siblings double-counts four ms and

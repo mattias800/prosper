@@ -68,7 +68,8 @@ def _need_clang() -> None:
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
 
 
-def inside_repo(path: pathlib.Path) -> pathlib.Path:
+def inside_repo(path: pathlib.Path, *, follow_leaf: bool = True,
+                root: pathlib.Path | None = None) -> pathlib.Path:
     """Resolve PATH and refuse it if it escapes the checkout.
 
     These tools are driven by AGENTS with generated arguments, not only by a human typing a known
@@ -79,14 +80,37 @@ def inside_repo(path: pathlib.Path) -> pathlib.Path:
 
     Containment is the whole fix and it costs one resolve() per path. A developer who genuinely
     wants to write outside the checkout can copy the file afterwards; nothing legitimate here needs
-    it, and the refusal names what it saw."""
-    resolved = path.expanduser().resolve()
+    it, and the refusal names what it saw.
+
+    `follow_leaf=False` resolves every component EXCEPT the last, for a path that is legitimately
+    a symlink out of the checkout: the build directory. `prosper/build-linux` pointing at a tmpfs
+    is the documented setup on at least one dev box (LOCAL.md), and resolving it fully would refuse
+    the default `--build`. The parent chain is still resolved physically, so `..` and a symlinked
+    ancestor are judged by where they really lead; only the leaf's own target is trusted, and a
+    `.`/`..` leaf is resolved like any other path because it names no link. `root` exists so the
+    self-test can build a fake checkout; callers leave it alone."""
+    root = REPO_ROOT if root is None else root
+    path = path.expanduser()
+    if follow_leaf or path.name in ("", ".", ".."):
+        resolved = path.resolve()
+    else:
+        resolved = path.parent.resolve() / path.name
     try:
-        resolved.relative_to(REPO_ROOT)
+        resolved.relative_to(root)
     except ValueError:
         sys.exit(f"refusing a path outside the checkout: {path}\n"
-                 f"  resolved to {resolved}\n  checkout is {REPO_ROOT}")
+                 f"  resolved to {resolved}\n  checkout is {root}")
     return resolved
+
+
+def build_dir(arg: str, root: pathlib.Path | None = None) -> str:
+    """The --build argument, contained like every other path this tool takes (#3751).
+
+    It is only ever READ (`compile_commands.json` beneath it), so an escape could not write
+    anything -- but a generated `--build ../../../x` produced a FileNotFoundError naming a path the
+    caller was not looking at, and it was the one argument exempt from the containment that makes
+    every other error here self-explanatory. The leaf may be a symlink out (see inside_repo)."""
+    return str(inside_repo(pathlib.Path(arg), follow_leaf=False, root=root))
 
 
 IDENT = r"[A-Za-z_][A-Za-z0-9_]*"
@@ -314,6 +338,63 @@ def selftest() -> int:
         except SystemExit:
             check(f"refuses {bad}", True, True)
 
+    print("-- build_dir (#3751: --build was the one path not contained) --")
+    # A fake checkout, so the symlinked-build-dir case is built BY HAND rather than depending on
+    # how the machine running the test happens to lay out its build tree.
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        fake = pathlib.Path(tmp).resolve() / "repo"
+        elsewhere = pathlib.Path(tmp).resolve() / "tmpfs-build"
+        (fake / "prosper").mkdir(parents=True)
+        elsewhere.mkdir()
+        try:
+            (fake / "prosper/build-linux").symlink_to(elsewhere, target_is_directory=True)
+            linked = True
+        except (OSError, NotImplementedError):
+            # Windows without the symlink privilege. Say so rather than pass silently; the
+            # containment arms below do not need the link except the one through it.
+            print("  [skip] no symlink privilege here: the symlinked-build-dir arms did not run")
+            (fake / "prosper/build-linux").mkdir()
+            linked = False
+        if linked:
+            check("a symlinked build dir inside the checkout is accepted",
+                  build_dir(str(fake / "prosper/build-linux"), root=fake),
+                  str(fake / "prosper/build-linux"))
+        check("a plain build dir inside the checkout is accepted",
+              build_dir(str(fake / "prosper/build-other"), root=fake),
+              str(fake / "prosper/build-other"))
+        for bad in (fake / "../../../somewhere",              # the issue's own example
+                    # '..' THROUGH the link. POSIX resolves it physically, on the link target's
+                    # side, so these escape. Win32 collapses '..' lexically before the path ever
+                    # reaches the filesystem, so on Windows they really do name a directory inside
+                    # the fake checkout and accepting them is correct; they are POSIX-only arms.
+                    *([fake / "prosper/build-linux/..",
+                       fake / "prosper/build-linux/../../x"]
+                      if linked and os.name != "nt" else []),
+                    elsewhere,                                 # the link target named directly
+                    pathlib.Path("/etc")):
+            try:
+                build_dir(str(bad), root=fake)
+                check(f"build_dir refuses {bad}", "accepted", "refused")
+            except SystemExit:
+                check(f"build_dir refuses {bad}", True, True)
+    # THE WIRING, not just the helper: main() must apply it. Run the tool itself with a valid
+    # --header and an escaping --build; the refusal must name --build's path before anything
+    # tries to open compile_commands.json beneath it.
+    import subprocess
+    escape = str(REPO_ROOT / "../../../somewhere-3751")
+    proc = subprocess.run([sys.executable, str(pathlib.Path(__file__).resolve()),
+                           "--header", str(REPO_ROOT / "prosper/tools/refactor/outline_methods.py"),
+                           "--class", "C", "--build", escape, "--list"],
+                          capture_output=True, text=True, cwd=str(REPO_ROOT))
+    check("main() refuses an escaping --build",
+          proc.returncode != 0 and "refusing a path outside the checkout" in proc.stderr
+          and "somewhere-3751" in proc.stderr, True)
+    # And the real checkout's default spelling, from REPO_ROOT (see the arm above for why).
+    check("the default --build under the real checkout is accepted",
+          pathlib.Path(build_dir(str(REPO_ROOT / "prosper/build-linux"))).parts[-2:],
+          ("prosper", "build-linux"))
+
     print("-- qualify_return_type --")
     check("nested return type is qualified",
           qualify_return_type("U64PairAdd foo(int)", "C", {"U64PairAdd"}), "C::U64PairAdd foo(int)")
@@ -376,6 +457,7 @@ def main() -> int:
         sys.exit("--header and --class are required")
 
     args.header = inside_repo(args.header)
+    args.build = build_dir(args.build)
     if args.out:
         args.out = inside_repo(args.out)
     text, picked, refused, nested = find_methods(args.header, args.cls, args.build, args.min_lines)

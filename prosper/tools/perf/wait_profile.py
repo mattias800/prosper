@@ -24,6 +24,17 @@ THE ONE DESIGN RULE, and it is the reason to trust the output
     (2026-08-08) because a total and its components came from different accountings; a partition
     that cannot express that error is worth more than a more precise one that can.
 
+A THREAD IS ITS IDENTITY, NOT ITS NAME (#3400)
+    Rows are keyed by (tid, starttime) -- the pair that names one thread for its whole life,
+    since a TID can be reused after exit -- and `comm` is only the display label. Keying by name
+    merged same-named threads into one population: one running thread beside fifteen idle
+    workers of the same name reported 6.25% RUNNING, a share that describes none of the sixteen.
+    Names collide routinely (a pool of `Job.Worker`, and `comm` is truncated to 15 bytes), so the
+    per-thread shares promised above were not per thread. When names do collide the report says
+    how many distinct threads share one, and a thread renamed mid-run shows its names.
+    The target process is pinned the same way: a PID whose starttime changes is a different
+    process, and sampling stops there rather than splicing two processes into one profile.
+
 WINDOWS, NOT AVERAGES
     Blue Prince has performance regimes differing ~50x and its phase boundary is sharp. An
     average across it is a fiction, so this reports per-window and refuses to print a grand mean
@@ -35,6 +46,10 @@ USAGE
 """
 import argparse, collections, os, sys, time
 
+# The /proc mount this reads. A constant rather than a literal so the self-test can build a
+# process tree BY HAND and never depend on what is running on the machine that runs it.
+PROC_ROOT = "/proc"
+
 # Linux x86-64 syscall numbers worth naming. Anything else prints as a number, which is still a
 # stable identifier -- a wrong name would be worse than a number.
 SYSCALLS = {
@@ -44,7 +59,7 @@ SYSCALLS = {
 }
 
 def thread_ids(pid):
-    try: return sorted(int(t) for t in os.listdir(f"/proc/{pid}/task"))
+    try: return sorted(int(t) for t in os.listdir(f"{PROC_ROOT}/{pid}/task"))
     except OSError: return []
 
 def read(path):
@@ -52,23 +67,35 @@ def read(path):
         with open(path, "rb") as f: return f.read().decode("utf-8", "replace").strip()
     except OSError: return ""
 
-def thread_name_and_state(pid, tid):
-    # `comm` can contain spaces and parentheses, so split on the LAST ')' rather than on spaces.
-    raw = read(f"/proc/{pid}/task/{tid}/stat")
-    if not raw: return None, None
+def parse_stat(raw):
+    """(comm, state, starttime) from a /proc stat line, or (None, None, None).
+
+    `comm` can contain spaces and parentheses, so split on the LAST ')' rather than on spaces.
+    starttime is field 22 (1-based) of proc(5), i.e. index 19 after the state field."""
+    if not raw: return None, None, None
     close = raw.rfind(")")
-    if close < 0: return None, None
+    if close < 0: return None, None, None
     name = raw[raw.find("(") + 1:close]
     rest = raw[close + 2:].split()
-    return name, (rest[0] if rest else None)
+    start = rest[19] if len(rest) > 19 else None
+    return name, (rest[0] if rest else None), start
+
+def process_starttime(pid):
+    return parse_stat(read(f"{PROC_ROOT}/{pid}/stat"))[2]
+
+def thread_name_and_state(pid, tid):
+    return parse_stat(read(f"{PROC_ROOT}/{pid}/task/{tid}/stat"))
 
 def bucket(pid, tid):
-    """The single bucket this sample belongs to. Never returns None for a live thread."""
-    name, state = thread_name_and_state(pid, tid)
-    if name is None: return None, None
-    if state == "R": return name, "RUNNING"
-    wchan = read(f"/proc/{pid}/task/{tid}/wchan") or "?"
-    sc = read(f"/proc/{pid}/task/{tid}/syscall").split()
+    """(name, bucket, starttime) for this sample. Never a None bucket for a live thread.
+
+    starttime is returned so the caller can key the sample by the thread's IDENTITY, not by its
+    name -- see the module docstring (#3400)."""
+    name, state, start = thread_name_and_state(pid, tid)
+    if name is None: return None, None, None
+    if state == "R": return name, "RUNNING", start
+    wchan = read(f"{PROC_ROOT}/{pid}/task/{tid}/wchan") or "?"
+    sc = read(f"{PROC_ROOT}/{pid}/task/{tid}/syscall").split()
     call, detail = "", ""
     if sc and sc[0] not in ("running", "-1", ""):
         try: n = int(sc[0]); call = SYSCALLS.get(n, f"syscall{n}")
@@ -84,7 +111,7 @@ def bucket(pid, tid):
         elif call in ("read", "write", "ioctl", "poll", "epoll_wait", "ppoll") and len(sc) > 1:
             detail = f" fd={int(sc[1], 16)}" if sc[1].startswith("0x") else f" fd={sc[1]}"
     label = f"{state}:{wchan}" + (f" [{call}{detail}]" if call else "")
-    return name, label
+    return name, label, start
 
 def main():
     ap = argparse.ArgumentParser(description="per-thread wait attribution from /proc")
@@ -100,30 +127,40 @@ def main():
     pid = a.pid
     if pid is None and a.name:
         for d in os.listdir("/proc"):
-            if d.isdigit() and read(f"/proc/{d}/comm") == a.name: pid = int(d); break
-    if not pid or not os.path.isdir(f"/proc/{pid}"):
+            if d.isdigit() and read(f"{PROC_ROOT}/{d}/comm") == a.name: pid = int(d); break
+    if not pid or not os.path.isdir(f"{PROC_ROOT}/{pid}"):
         print("wait_profile: no such process (use --pid or --name)", file=sys.stderr); return 2
 
     nwin = max(1, a.windows)
     per_window = a.seconds / nwin
     interval = 1.0 / a.hz
-    # samples[w][thread][bucket] -> count. Counts, not times: every sample is one tick of the same
-    # length, so a share is a count ratio and there is no weighting to get wrong.
+    # samples[w][identity][bucket] -> count, identity = (tid, starttime). Counts, not times: every
+    # sample is one tick of the same length, so a share is a count ratio and there is no weighting
+    # to get wrong. names[identity] keeps every comm seen, in order, for display only.
     samples = [collections.defaultdict(collections.Counter) for _ in range(nwin)]
     totals = [collections.Counter() for _ in range(nwin)]
+    names = collections.defaultdict(list)
     missed = 0
+    pinned = process_starttime(pid)
+    lost = ""
     t0 = time.time()
     while True:
         now = time.time()
         elapsed = now - t0
         if elapsed >= a.seconds: break
         w = min(nwin - 1, int(elapsed / per_window))
-        if not os.path.isdir(f"/proc/{pid}"): break
+        if not os.path.isdir(f"{PROC_ROOT}/{pid}"):
+            lost = "the target process exited"; break
+        if process_starttime(pid) != pinned:
+            lost = "the PID now names a DIFFERENT process (its starttime changed)"; break
         for tid in thread_ids(pid):
-            name, label = bucket(pid, tid)
+            name, label, start = bucket(pid, tid)
             if name is None: continue          # thread exited mid-sweep; not a bucket
-            samples[w][name][label] += 1
-            totals[w][name] += 1
+            ident = (tid, start)
+            if not names[ident] or names[ident][-1] != name:
+                names[ident].append(name)
+            samples[w][ident][label] += 1
+            totals[w][ident] += 1
         slept = time.time() - now
         if slept < interval: time.sleep(interval - slept)
         else: missed += 1
@@ -135,15 +172,29 @@ def main():
         print(f"  NOTE: {missed} sweeps overran the sample interval — lower --hz for an unbiased run")
     else:
         print("  sweeps overran: 0")
+    if lost:
+        print(f"  NOTE: sampling stopped early -- {lost}; later windows are empty for that reason")
+
+    def label_of(ident):
+        seen = names[ident]
+        shown = seen[-1] if len(seen) == 1 else " -> ".join(seen) + "  (renamed)"
+        return f"{shown}  tid={ident[0]}"
+
     for w in range(nwin):
         lo, hi = w * per_window, (w + 1) * per_window
         print(f"\n=== window {w}  t={lo:6.1f}..{hi:6.1f}s ===")
         if not totals[w]:
             print("  (no samples)"); continue
-        for name, n in totals[w].most_common():
-            print(f"  {name}  ({n} samples)")
+        # Say when a name covers several threads, so a reader who greps by name knows the rows
+        # below it are separate threads and not one thread's history.
+        by_name = collections.Counter(names[ident][-1] for ident in totals[w])
+        for shared, count in sorted(by_name.items()):
+            if count > 1:
+                print(f"  NOTE: {count} distinct threads are named {shared!r}; each is its own row")
+        for ident, n in totals[w].most_common():
+            print(f"  {label_of(ident)}  ({n} samples)")
             shown = 0.0
-            for label, c in samples[w][name].most_common(a.top):
+            for label, c in samples[w][ident].most_common(a.top):
                 share = 100.0 * c / n
                 if share < a.min_share: continue
                 shown += share

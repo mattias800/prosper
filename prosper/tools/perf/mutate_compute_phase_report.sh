@@ -79,9 +79,14 @@ run_mutation "alias per-binding denominator" "ms/binding uses the real-binding d
 # an alias; a broader "return on any alias" mutation kills five checks, so the per-check assertion is
 # then satisfied by a check that could not have caught the original defect.
 run_mutation "no early return on all-alias" "all-alias log still prints top programs" \
-  '              f"(no work, no sub-timers); nothing to decompose.")' \
-  '              f"(no work, no sub-timers); nothing to decompose.")
-        return 0' || bad=1
+  '        print(alias_line())
+    elif images:' \
+  '        print(alias_line())
+        return 0
+    elif images:' || bad=1
+run_mutation "alias duration dropped" "alias-only duration is retained" \
+  '    alias_ms = sum(i["ms"] for i in aliases)' \
+  '    alias_ms = 0.0' || bad=1
 run_mutation "parent-relative unattributed" "small parent keeps its unattributed remainder" \
   '            if parent_ms and abs(rest) / parent_ms > 0.01:' \
   '            if grand and abs(rest) / grand > 0.005:' || bad=1

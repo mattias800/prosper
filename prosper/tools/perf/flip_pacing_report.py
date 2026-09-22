@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Aggregate `[ev] GpuFlip t=<seconds>` lines into a guest frame-pacing report.
+"""Aggregate `[ev] GpuFlip`/`[ev] SubmitFlip` `t=<seconds>` lines into a guest frame-pacing report.
 
 WHY THIS EXISTS
 ---------------
@@ -39,10 +39,26 @@ import sys
 # unnoticed: this tool read zero flips from every real run for as long as it existed, and
 # reported that as "nothing to pace" (#3452). `.` excludes newline without DOTALL, so a match
 # cannot run past the end of one line.
-FLIP = re.compile(r"\[ev\] GpuFlip\b.*?\bt=([0-9.]+)")
+#
+# BOTH FLIP EMITTERS, read into one timeline (#3564). prosper flips through two alternative paths
+# and each advances the flip state on its own (`hle_graphics.cpp`): the in-stream AGC SetFlip
+# packet (`prosper_vo_flip_from_gpu`, `[ev] GpuFlip`) and the API call (`sceVideoOutSubmitFlip`,
+# `[ev] SubmitFlip`). Reading only the first left a title that flips through the API with no flips
+# at all -- "nothing to pace" about a paceable run, #3452's failure shape by a different route --
+# and silently dropped the API flips of every mixed run. Mixed runs are the measured case, not a
+# hypothetical: a 2026-09-22 sweep of the local PROSPER_EVLOG corpus found SubmitFlip in 24 logs
+# (Uncharted, Syberia, GRIS), every one beside GpuFlip lines. Pooling the two TAGS is safe where
+# pooling two SOURCES is not (see parse_flips): one process, one `evlog_seconds()` epoch, and one
+# flip is emitted by exactly one of the two paths.
+FLIP = re.compile(r"\[ev\] (GpuFlip|SubmitFlip)\b.*?\bt=([0-9.]+)")
 # Any line announcing a flip at all. Used only to tell 'this run had no flips' apart from
 # 'this tool could not read the flips this run recorded' -- the distinction #3452 turned on.
-FLIP_TAG = re.compile(r"\[ev\] GpuFlip\b")
+FLIP_TAG = re.compile(r"\[ev\] (GpuFlip|SubmitFlip)\b")
+# `g_vo_submitflip` prints its line BEFORE validating the buffer index and returns
+# SCE_VIDEO_OUT_ERROR_INVALID_INDEX for anything outside [-1, 15] without flipping. Such a line is
+# a rejected call, not a flip, so it must not become an interval. (-1 is a real blank flip.)
+SUBMIT_BUFIDX = re.compile(r"\bbufidx=(-?[0-9]+)")
+SUBMIT_BUFIDX_RANGE = (-1, 15)
 # The Win32 timer tick on dev boxes is 15.625 ms; quantized waits land on its multiples.
 TICK_MS = 15.625
 
@@ -83,7 +99,11 @@ CHANCE = min(1.0, 2.0 * BAND)
 
 
 def parse_flips(paths):
-    """Return one (path, timestamps, untimed) timeline PER SOURCE. Never pooled.
+    """Return one (path, timestamps, untimed, backsteps, emitters) timeline PER SOURCE. Never pooled.
+
+    `emitters` counts the timestamped flips per tag ("GpuFlip" / "SubmitFlip"), plus
+    "SubmitFlip rejected" for API calls the emulator refused (see SUBMIT_BUFIDX), so the report
+    can say which path the timeline came from.
 
     `untimed` exists so a parse failure cannot be reported as an empty run: a log full of flips
     the parser cannot read, and a log with no flips, are different facts, and this tool printed
@@ -100,18 +120,29 @@ def parse_flips(paths):
     for path in paths:
         stamps = []
         untimed = 0
+        emitters = collections.Counter()
         opened = None if path == "-" else open(path, encoding="utf-8", errors="replace")
         handle = sys.stdin if opened is None else opened
         try:
             for line in handle:
+                tag = FLIP_TAG.search(line)
+                if not tag:
+                    continue
+                if tag.group(1) == "SubmitFlip":
+                    idx = SUBMIT_BUFIDX.search(line)
+                    lo, hi = SUBMIT_BUFIDX_RANGE
+                    if idx and not lo <= int(idx.group(1)) <= hi:
+                        emitters["SubmitFlip rejected"] += 1
+                        continue
                 m = FLIP.search(line)
                 if m:
                     try:
-                        stamps.append(float(m.group(1)))
+                        stamps.append(float(m.group(2)))
+                        emitters[m.group(1)] += 1
                     except ValueError:
                         # A malformed number is an unreadable flip, not a missing one.
                         untimed += 1
-                elif FLIP_TAG.search(line):
+                else:
                     untimed += 1
         finally:
             if opened is not None:
@@ -125,7 +156,7 @@ def parse_flips(paths):
         # boundary are different facts, and a count cannot tell them apart (#3462).
         backsteps = [(a - b) * 1000.0 for a, b in zip(stamps, stamps[1:]) if b < a]
         stamps.sort()
-        timelines.append((path, stamps, untimed, backsteps))
+        timelines.append((path, stamps, untimed, backsteps, emitters))
     return timelines
 
 
@@ -238,7 +269,26 @@ def describe_backsteps(backsteps):
         f" the step before trusting any interval that crosses it.")
 
 
-def report(stamps, window_s, tick, untimed=0, backsteps=()):
+def describe_emitters(emitters):
+    """One line naming which flip path(s) the timeline came from, or "" when there is nothing.
+
+    Printed whenever the API path contributed anything, because a reader comparing two runs must
+    be able to see that one of them was paced (partly) by SubmitFlip -- the population this tool
+    could not see at all before #3564."""
+    if not emitters or not (emitters.get("SubmitFlip") or emitters.get("SubmitFlip rejected")):
+        return ""
+    line = (f"flip emitters: GpuFlip={emitters.get('GpuFlip', 0)}"
+            f" SubmitFlip={emitters.get('SubmitFlip', 0)} (both read into one timeline)")
+    if emitters.get("SubmitFlip rejected"):
+        line += (f"; {emitters['SubmitFlip rejected']} SubmitFlip call(s) with an out-of-range"
+                 f" bufidx were rejected by the emulator and are not flips")
+    return line
+
+
+def report(stamps, window_s, tick, untimed=0, backsteps=(), emitters=None):
+    emitter_line = describe_emitters(emitters)
+    if emitter_line:
+        print(emitter_line)
     # Report the unreadable population WHENEVER it exists, not only when nothing parsed. Two
     # readable flips among thousands of unreadable ones produced a confident distribution over
     # 0.06% of the data and said nothing about the rest -- #3452's own failure, one branch lower.
@@ -413,7 +463,7 @@ def report(stamps, window_s, tick, untimed=0, backsteps=()):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Aggregate [ev] GpuFlip timestamps into a guest frame-pacing report.")
+        description="Aggregate [ev] GpuFlip / SubmitFlip timestamps into a guest frame-pacing report.")
     parser.add_argument("logs", nargs="*", help="run logs (PROSPER_EVLOG=1); '-' = stdin")
     parser.add_argument("--window-s", type=float, default=10.0,
                         help="window length in seconds for the phase split (default 10)")
@@ -426,12 +476,12 @@ def main():
     # One report per source. Several logs are several runs, each with its own epoch, so they
     # are never merged -- see parse_flips. A header only when there is more than one, so the
     # single-log output a reader already knows is unchanged.
-    for index, (path, stamps, untimed, backsteps) in enumerate(timelines):
+    for index, (path, stamps, untimed, backsteps, emitters) in enumerate(timelines):
         if len(timelines) > 1:
             if index:
                 print("")
             print(f"=== {path} ===")
-        report(stamps, args.window_s, args.tick_ms, untimed, backsteps)
+        report(stamps, args.window_s, args.tick_ms, untimed, backsteps, emitters)
     return 0
 
 
