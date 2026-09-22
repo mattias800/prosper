@@ -695,31 +695,48 @@ int main() {
     // Depth and stencil live at separate guest addresses, so direct writes invalidate only the
     // corresponding Vulkan aspect; HTILE remains conservative because it can describe both.
     {
+        prosper::register_builtin_hle();
+        const auto map = prosper::Hle::lookup(prosper::nid_hash("sceKernelMapNamedFlexibleMemory"));
+        const auto unmap = prosper::Hle::lookup(prosper::nid_hash("sceKernelMunmap"));
+        CHECK(map && unmap, "tracked guest mapping APIs serve DS invalidation fixture");
+        if (!map || !unmap) return 1;
+        uint64_t mapped_base = 0;
+        constexpr uint64_t mapped_bytes = 0x400000;
+        CHECK(map(reinterpret_cast<uint64_t>(&mapped_base), mapped_bytes, 2, 0,
+                  reinterpret_cast<uint64_t>("gpu-execute-ds"), 0) == 0 && mapped_base,
+              "DS invalidation fixture has tracked disjoint guest ranges");
+        if (!mapped_base) return 1;
+        struct MappingGuard {
+            prosper::HleFn unmap;
+            uint64_t base, bytes;
+            ~MappingGuard() { unmap(base, bytes, 0, 0, 0, 0); }
+        } mapping{unmap, mapped_base, mapped_bytes};
         auto& cache = prosper::test::persistent_ds_cache();
         cache.clear();
         prosper::test::PersistentDsKey scene;
-        scene.dr = 0x100000; scene.dw = 0x100000;
-        scene.sr = 0x200000; scene.sw = 0x200000;
-        scene.htile = 0x300000; scene.w = 642; scene.h = 362; scene.fmt = 1;
+        scene.dr = scene.dw = mapped_base;
+        scene.sr = scene.sw = mapped_base + 0x100000;
+        scene.htile = mapped_base + 0x200000;
+        scene.w = 642; scene.h = 362; scene.fmt = 1;
         auto& image = cache[scene];
         image.depth_valid = true;
         image.stencil_valid = true;
         set_guest_gpu_write_observer([](uint64_t addr, uint64_t size, const char*) {
             prosper::test::invalidate_persistent_ds_guest_write(addr, size);
         });
-        notify_guest_gpu_write(0x300000, 0x8000);
+        notify_guest_gpu_write(scene.htile, 0x8000);
         CHECK(!image.depth_valid && !image.stencil_valid,
               "HTILE guest write invalidates both cached Vulkan DS planes");
         image.depth_valid = image.stencil_valid = true;
-        notify_guest_gpu_write(0x100100, 16);
+        notify_guest_gpu_write(scene.dr + 0x100, 16);
         CHECK(!image.depth_valid && image.stencil_valid,
               "partial depth-plane write preserves the independent cached stencil aspect");
         image.depth_valid = image.stencil_valid = true;
-        notify_guest_gpu_write(0x200100, 16);
+        notify_guest_gpu_write(scene.sr + 0x100, 16);
         CHECK(image.depth_valid && !image.stencil_valid,
               "partial stencil-plane write preserves depth for a later sampled-depth pass");
         image.depth_valid = image.stencil_valid = true;
-        notify_guest_gpu_write(0x400000, 0x8000);
+        notify_guest_gpu_write(mapped_base + 0x300000, 0x8000);
         CHECK(image.depth_valid && image.stencil_valid,
               "unrelated guest write preserves cached Vulkan DS planes");
         set_guest_gpu_write_observer({});

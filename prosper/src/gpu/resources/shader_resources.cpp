@@ -1014,6 +1014,10 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
     std::set<uint32_t> atomic_vars;
     std::set<uint32_t> normalized_sample_vars;
     std::set<uint32_t> texel_access_vars;
+    std::set<uint32_t> mip_fetch_vars;
+    std::set<uint32_t> texel_fetch_vars;
+    bool unresolved_texel_fetch = false;
+    bool unresolved_mip_fetch = false;
     std::unordered_map<uint32_t, PointerAccess> accesses;
     // Result id of OpLoad/OpSampledImage -> descriptor variable. An image descriptor load accesses
     // the descriptor object, not its texels; only the later image opcode establishes read/write data
@@ -1180,6 +1184,23 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
             const bool normalized = (in.opcode >= 87u && in.opcode <= 94u) ||
                                     in.opcode == 96u || in.opcode == 97u;
             mark_image_coordinate_contract(word(in, 2), normalized);
+            if (in.opcode == 95u) {
+                const auto origin = image_objects.find(word(in, 2));
+                if (origin != image_objects.end()) texel_fetch_vars.insert(origin->second);
+                else unresolved_texel_fetch = true;
+            }
+            if (in.opcode == 95u && n >= 5u && (word(in, 4) & 2u)) {
+                // Image Operands are ordered by bit. Bias precedes Lod (although Bias
+                // is not valid on ImageFetch); do not mistake another operand for Lod.
+                const uint32_t lod_index = 5u + ((word(in, 4) & 1u) ? 1u : 0u);
+                const auto lod = lod_index < n ? constants.find(word(in, lod_index))
+                                               : constants.end();
+                if (lod == constants.end() || lod->second != 0u) {
+                    const auto origin = image_objects.find(word(in, 2));
+                    if (origin != image_objects.end()) mip_fetch_vars.insert(origin->second);
+                    else unresolved_mip_fetch = true;
+                }
+            }
         } else if (in.opcode == 99u /* OpImageWrite */ && n >= 1) {
             mark_image(word(in, 0), false, true);
         } else if (in.opcode == 100u /* OpImage */ && n >= 3) {
@@ -1270,6 +1291,10 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
         // to it is how #2462 happened. Query-only means every image access was an OpImageQuery*.
         descriptor.query_only = image_query_vars.count(var) != 0 &&
                                 image_nonquery_vars.count(var) == 0;
+        descriptor.mip_fetch = image &&
+            (unresolved_mip_fetch || mip_fetch_vars.count(var) != 0);
+        descriptor.texel_fetch = image &&
+            (unresolved_texel_fetch || texel_fetch_vars.count(var) != 0);
         // Assigned here rather than added to the initializer above: that initializer is positional and
         // names no field, so extending it is how #2462 happens. See the note on the member.
         if (auto ai = descriptor_arities.find(var); ai != descriptor_arities.end())
@@ -1338,6 +1363,8 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
         // accident. Do not cite it as the reason `query_only` is safe; the reason is that every
         // texel-reading opcode records its variable in `image_nonquery_vars`.
         prior.query_only = prior.query_only && descriptor.query_only;
+        prior.mip_fetch |= descriptor.mip_fetch;
+        prior.texel_fetch |= descriptor.texel_fetch;
     }
     report.descriptors = std::move(coalesced);
     if (!spirv_descriptor_reflection_complete(report))

@@ -5,11 +5,13 @@
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "shared/live/live_compute.hpp"
 #include "fixtures/render_runner.h"
+#include "hle/dispatch/dispatch.hpp"
 
 #include <algorithm>
 #include <array>
 #include <cstdio>
 #include <cstring>
+#include <new>
 
 using namespace prosper::gpu;
 static int failures = 0;
@@ -58,9 +60,30 @@ int main() {
               "changed store addressing, branch or memory-completion waits are refused");
     }
 
-    constexpr uint64_t cb_address = 0x20000000u, target_address = 0x21000000u;
+    prosper::register_builtin_hle();
+    const auto map = prosper::Hle::lookup(prosper::nid_hash("sceKernelMapNamedFlexibleMemory"));
+    const auto unmap = prosper::Hle::lookup(prosper::nid_hash("sceKernelMunmap"));
+    check(map && unmap, "tracked guest mapping APIs serve metadata identity fixture");
+    if (!map || !unmap) return 1;
+    uint64_t mapped_base = 0;
+    constexpr uint64_t mapped_bytes = 0x100000;
+    check(map(reinterpret_cast<uint64_t>(&mapped_base), mapped_bytes, 2, 0,
+              reinterpret_cast<uint64_t>("broadcast-htile"), 0) == 0 && mapped_base,
+          "metadata and depth identities occupy tracked disjoint guest ranges");
+    if (!mapped_base) return 1;
+    struct MappingGuard {
+        prosper::HleFn unmap;
+        uint64_t base, bytes;
+        ~MappingGuard() { unmap(base, bytes, 0, 0, 0, 0); }
+    } mapping{unmap, mapped_base, mapped_bytes};
+    const uint64_t cb_address = mapped_base + 0x10000;
+    const uint64_t target_address = mapped_base + 0x20000;
     std::array<uint32_t, 4> constants{128, 0, 0, 0};
-    std::array<uint32_t, 128> metadata{};
+    auto& metadata = *new (reinterpret_cast<void*>(target_address)) std::array<uint32_t, 128>{};
+    check(prosper::guest_memory_topology_relation(target_address, sizeof(metadata),
+              mapped_base + 0x40000, 64u * 64u * 4u) ==
+              prosper::GuestMemoryTopologyRelation::Disjoint,
+          "metadata and retained depth have a proven disjoint mapping relation");
     ShaderResourceTable table;
     auto resource = [&](uint32_t binding, uint32_t pc, uint32_t sgpr, uint64_t addr,
                         uint32_t size, uint32_t stride, DataFormat fmt, uint32_t nc, void* host) {
@@ -170,7 +193,7 @@ int main() {
     writer.topology = 3; writer.color_write_mask = 15;
     writer.depth_test_enable = writer.depth_write_enable = true;
     writer.depth_compare_op = 7; writer.has_depth_clear = true; writer.depth_clear_value = 0;
-    writer.depth_read_base = writer.depth_write_base = 0x22000000;
+    writer.depth_read_base = writer.depth_write_base = mapped_base + 0x40000;
     writer.htile_data_base = target_address;
     ResolvedPipelineState reader = writer;
     reader.depth_write_enable = false; reader.depth_compare_op = 6; // GREATER_OR_EQUAL, reverse-Z
@@ -206,7 +229,10 @@ int main() {
     descriptor(identity.user_sgprs, 0, target_address, 4, metadata.size(), 20);
     identity.recompile_config.user_sgprs = identity.user_sgprs;
     identity.spirv = recompile_compute(code.data(), code.size(), identity.resources.get(), identity.recompile_config);
-    check(!identity.spirv.empty() && run(identity, 0) && preserving > 0 && !green_visible(),
+    const bool identity_compiled = !identity.spirv.empty();
+    const bool identity_executed = identity_compiled && run(identity, 0);
+    const bool depth_retained = !green_visible();
+    check(identity_compiled && identity_executed && preserving > 0 && depth_retained,
           "Vulkan identity metadata update preserves current-present rendered depth");
     constants[1] = 0;
     // Exercise the same clear through the public capture roundtrip: replay owns the snapshots

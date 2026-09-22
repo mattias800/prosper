@@ -297,6 +297,50 @@ static std::vector<uint32_t> image_sample_fetch_test_spirv() {
     return s;
 }
 
+// Reflection-only fixture, like image_fetch_test_spirv above. The final arm reads
+// a dynamic level and then level zero through the SAME descriptor: demand is a union.
+static std::vector<uint32_t> image_fetch_lod_test_spirv(unsigned mode) {
+    auto s = image_test_spirv();
+    s.resize(s.size() - 5u);
+    emit(s, 21, {11, 32, 0});              // uint
+    emit(s, 43, {11, 12, 0});              // zero
+    emit(s, 43, {11, 13, 1});              // one
+    emit(s, 128, {11, 14, 12, 13});        // value not in the literal constant map
+    emit(s, 100, {2, 9, 6});               // image extracted from sampled image
+    emit(s, 95, {1, 7, 9, 8, 2, mode == 0u ? 12u : mode == 1u ? 13u : 14u});
+    if (mode == 3u) emit(s, 95, {1, 10, 9, 8, 2, 12});
+    return s;
+}
+
+// Two bindings separate exact origin tracking from its conservative fallback. The existing
+// resolver follows OpImage, but not an image object's OpCopyObject/OpSelect aliases.
+// lod_mode is 0=literal zero, 1=literal nonzero, 2=dynamic.
+static std::vector<uint32_t> image_fetch_origin_test_spirv(unsigned mode, unsigned lod_mode) {
+    auto s = image_test_spirv();
+    s[3] = 32;
+    emit(s, 59, {4, 16, 0});
+    emit(s, 71, {16, 34, 1}); emit(s, 71, {16, 33, 5}); // second image: binding 5
+    emit(s, 61, {3, 17, 16});
+    emit(s, 87, {1, 18, 17, 8});                       // ordinary sample of binding 5
+    emit(s, 21, {11, 32, 0}); emit(s, 43, {11, 12, 0}); emit(s, 43, {11, 13, 1});
+    emit(s, 128, {11, 14, 12, 13});                      // nonliteral Lod
+    emit(s, 100, {2, 19, 6});                          // exact image alias of binding 4
+    uint32_t fetched = 19;
+    if (mode == 1u) {
+        emit(s, 83, {2, 20, 19});                      // unresolved OpCopyObject alias
+        fetched = 20;
+    } else if (mode == 2u) {
+        emit(s, 100, {2, 21, 17});
+        emit(s, 20, {22}); emit(s, 1, {22, 23});        // unknown bool (OpUndef)
+        emit(s, 169, {2, 24, 23, 19, 21});              // unresolved mixed-origin OpSelect
+        fetched = 24;
+    }
+    const uint32_t lod = lod_mode == 0u ? 12u : lod_mode == 1u ? 13u : 14u;
+    emit(s, 95, {1, 25, fetched, 8, 2, lod});            // explicit Lod fetch
+    emit(s, 87, {1, 26, 6, 8});                        // later sample cannot erase fetch
+    return s;
+}
+
 static std::vector<uint32_t> image_sample_query_test_spirv() {
     std::vector<uint32_t> s = image_test_spirv();
     emit(s, 100, {2, 9, 6});                               // %9 = OpImage %6
@@ -1070,6 +1114,56 @@ int main() {
               fetch_report.descriptors[0].texel_access &&
               fetch_report.descriptors[0].sampled_float,
           "OpImageFetch reflection requires the descriptor's exact texel extent");
+    CHECK(!ir.descriptors[0].mip_fetch && !fetch_report.descriptors[0].mip_fetch,
+          "ordinary sampling and a fetch without Lod do not demand an explicit guest mip chain");
+    CHECK(!ir.descriptors[0].texel_fetch && fetch_report.descriptors[0].texel_fetch,
+          "only the integer fetch vetoes sampling-equivalent format substitution");
+    const char* mip_messages[]{
+        "literal zero Lod retains the base-only resource path",
+        "literal nonzero Lod demands guest-authored mip content",
+        "nonliteral Lod demands guest-authored mip content",
+        "a later zero Lod does not erase earlier dynamic mip demand"};
+    for (unsigned mode = 0; mode < 4; ++mode) {
+        const auto mip_report = validate_spirv_descriptor_interface(
+            image_fetch_lod_test_spirv(mode), &image_table, 1, SpirvShaderStage::Fragment);
+        CHECK(mip_report.ok() && mip_report.descriptors.size() == 1 &&
+                  mip_report.descriptors[0].mip_fetch == (mode != 0u), mip_messages[mode]);
+        CHECK(mip_report.descriptors.size() == 1 && mip_report.descriptors[0].texel_fetch,
+              "every fetch including literal zero Lod retains the original image format contract");
+    }
+    auto two_image_table = image_table;
+    auto second_image = image; second_image.binding = 5;
+    two_image_table.resources.push_back(second_image);
+    struct OriginFetchCase {
+        unsigned origin_mode;
+        unsigned lod_mode;
+        bool fetched_binding_mip;
+        bool all_bindings_mip;
+        const char* message;
+    };
+    const OriginFetchCase origin_cases[]{
+        {0u, 1u, true, false,
+         "a known nonzero-Lod image alias marks only its fetched binding"},
+        {1u, 0u, false, false,
+         "an unresolved copied image with literal-zero Lod retains the base-only path"},
+        {1u, 1u, true, true,
+         "an unresolved copied image with nonzero Lod conservatively demands mips on all images"},
+        {2u, 2u, true, true,
+         "an unresolved selected image with dynamic Lod conservatively demands mips on all images"},
+    };
+    for (const auto& test_case : origin_cases) {
+        const auto origin_report = validate_spirv_descriptor_interface(
+            image_fetch_origin_test_spirv(test_case.origin_mode, test_case.lod_mode),
+            &two_image_table, 1, SpirvShaderStage::Fragment);
+        bool exact_flags = origin_report.ok() && origin_report.descriptors.size() == 2;
+        for (const auto& descriptor : origin_report.descriptors)
+            exact_flags &= descriptor.texel_fetch ==
+                               (descriptor.binding == 4u || test_case.origin_mode != 0u) &&
+                           descriptor.mip_fetch ==
+                               (test_case.all_bindings_mip ||
+                                (test_case.fetched_binding_mip && descriptor.binding == 4u));
+        CHECK(exact_flags, test_case.message);
+    }
     const auto uint_fetch_report = validate_spirv_descriptor_interface(
         image_fetch_test_spirv(false), &image_table, 1, SpirvShaderStage::Fragment);
     CHECK(uint_fetch_report.ok() && uint_fetch_report.descriptors.size() == 1 &&

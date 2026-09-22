@@ -361,6 +361,49 @@ No separate comparison baseline is created for this consumer source. The control
 `PROSPER_NO_RENDERER_SEEDED_RESULT_CACHE=1` disables this promotion; F8 writeback rows report
 `renderer-result-retained` separately from input cache hits.
 
+## Retained depth-array snapshots
+
+Float32 depth-array materialization memoizes immutable sampled pixels only within one live
+renderer callback, not across later callback spans or frames. Admission requires unchanged full
+retained-image identity before and after readback; reuse checks keys, image handles, depth-write
+generations, validity/layout state, selected payload format and exact base/stride/extent/layer count. Pending producer work
+must complete before lookup. Unrelated completed color work does not discard an unchanged depth
+snapshot, while a changed depth generation misses. Completion failure clears the memo and refuses
+the consumer. At most 16 entries and 128 MiB of CPU payloads are retained by the memo; active
+resource leases and backend image/staging allocations have separate lifetimes and budgets.
+
+`PROSPER_NO_SUBMIT_DEPTH_ARRAY_SNAPSHOT_REUSE=1` restores per-draw memo scope. After the first
+successful memo admission, a callback-local latch keeps guest-write draining active at every later
+resource-build boundary in both policies, including intervening draws without array bindings. The
+latch is not cleared with the memo. These switches use presence semantics and are cached at
+first use: launch a separate process for each control; setting a variable to `0` does not disable it.
+
+`PROSPER_DEPTH_ARRAY_SNAPSHOT_CENSUS=1` prints callback totals when that callback performed work.
+`reads` counts completed whole-array readbacks followed by payload construction; `reuses` counts
+binding lookups served by immutable owners, including reuse within one draw. `payload_bytes` counts
+the CPU payloads actually constructed, not guest traffic or Vulkan allocation bytes.
+`producer_flushes` counts only successful explicit flushes before memo lookup, excluding flushes
+inside the ordinary readback helper. These are operation counts, not timings, F8 windows or FPS.
+Sharing across draws can save CPU readback/expansion across backend groups, but sharing a Vulkan
+upload additionally requires the bindings to reach the same backend upload-deduplication scope.
+
+Single-component retained depth arrays can use R32_SFLOAT payloads instead of expanding to RGBA32F.
+The actual R32 sampled/linear-filter features must support that binding's sampler; otherwise retain
+RGBA32F. Missing interior components are substituted before view swizzle. Border samplers (address
+modes 6/7 on any axis) and bindings used by any OpImageFetch keep RGBA32F because missing-component
+substitution changes border/robust out-of-range values. Reflection includes literal-zero Lod fetches;
+`mip_fetch` alone is insufficient. The cache key includes representation. Ordinary guest-backed
+Float32 arrays are unchanged, and the existing array admission budget remains conservatively based
+on 16 bytes per texel. `PROSPER_NO_COMPACT_DEPTH_ARRAY_SNAPSHOT=1` restores expanded payloads.
+
+The production `depth_array_source_snapshot` fixture checks same-group upload counts, separate
+color-group read counts, exact sampled pixels and an interposed real depth rewrite. Its separate
+`--per-draw-control` process requires unchanged pixels with repeated reads/uploads. The separate
+`--expanded-control` uses the original representation; sample/swizzle/gather checks cover missing
+components, and border/fetch guards require the expanded byte count. Guest-write
+invalidation has other fixture arms; no test currently injects a queued guest write precisely between
+two resource builds after this callback's memo becomes warm. Do not claim that interleaving tested.
+
 ## Texture validation census
 
 `PROSPER_TEXTURE_VALIDATION_CENSUS=1` counts validation invocations in callbacks that observe

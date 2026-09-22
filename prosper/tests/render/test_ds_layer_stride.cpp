@@ -20,6 +20,7 @@
 // base-alone keying fails arms 1-3 outright, and collapsing the recorder/lookup identity fails arm 8; they are constructed by hand at this header's own production functions, which are
 // the ones the renderer calls.
 #include "fixtures/render_runner.h"
+#include "hle/dispatch/dispatch.hpp"
 
 #include <cstdio>
 #include <cstdint>
@@ -37,6 +38,26 @@ using prosper::test::PersistentDsKey;
 using prosper::test::PersistentDsKeyHash;
 
 int main() {
+    // Invalidation now checks physical mapping topology. Give the end-to-end cases one
+    // tracked guest allocation with disjoint subranges; synthetic VAs cannot prove that a
+    // write did not alias a retained depth or stencil plane.
+    prosper::register_builtin_hle();
+    auto map_flexible = prosper::Hle::lookup(prosper::nid_hash("sceKernelMapNamedFlexibleMemory"));
+    auto unmap = prosper::Hle::lookup(prosper::nid_hash("sceKernelMunmap"));
+    check(map_flexible && unmap, "guest mapping APIs available for topology checks");
+    if (!map_flexible || !unmap) return 1;
+    uint64_t mapped_base = 0;
+    constexpr uint64_t MappedBytes = 0x2000000;
+    check(map_flexible(reinterpret_cast<uint64_t>(&mapped_base), MappedBytes, 2, 0,
+                       reinterpret_cast<uint64_t>("ds-stride-topology"), 0) == 0 && mapped_base,
+          "depth and stencil test planes have tracked guest backing");
+    if (!mapped_base) return 1;
+    struct MappingGuard {
+        prosper::HleFn unmap;
+        uint64_t base, bytes;
+        ~MappingGuard() { unmap(base, bytes, 0, 0, 0, 0); }
+    } mapping{unmap, mapped_base, MappedBytes};
+
     // GTA V's cube-depth shape: one base, six layers, a consumer descriptor that carries the exact
     // layer stride. The second surface is a DIFFERENT allocation that the guest later maps at the
     // same address -- the case base-alone keying cannot express.
@@ -153,7 +174,7 @@ int main() {
     // is 262144 (tightly packed). An earlier revision used 16384, which is smaller than one slice
     // and therefore describes a layout that cannot exist -- the slices would overlap.
     {
-        constexpr uint64_t kBase = 0x20b0000000ull;
+        const uint64_t kBase = mapped_base;
         constexpr uint32_t kW = 256, kH = 256;
         constexpr uint64_t kSliceBytes = 262144ull;      // == kW * kH * 4, tightly packed
 
@@ -194,8 +215,8 @@ int main() {
     // stencil resident) and a write that belongs to no slice of this surface can be misattributed
     // to it. This arm pins the second half, which is the observable one.
     {
-        constexpr uint64_t kDepth = 0x20c0000000ull;
-        constexpr uint64_t kStencil = 0x20d0000000ull;   // far from depth, so ranges cannot alias
+        const uint64_t kDepth = mapped_base + 0x400000;
+        const uint64_t kStencil = mapped_base + 0x800000;
         constexpr uint32_t kW = 256, kH = 256;
         constexpr uint64_t kDepthSlice = 262144ull;      // depth layer stride
         constexpr uint64_t kStencilBytes = 65536ull;     // kW * kH, one byte per pixel
@@ -253,9 +274,9 @@ int main() {
     // to tell a clear from a refresh remains the real fix; until then this pins the behaviour that
     // is measured correct for both titles.
     {
-        constexpr uint64_t kDepth = 0x20e0000000ull;
-        constexpr uint64_t kStencil = 0x20f0000000ull;
-        constexpr uint64_t kHtile = 0x2100000000ull;
+        const uint64_t kDepth = mapped_base + 0xc00000;
+        const uint64_t kStencil = mapped_base + 0x1000000;
+        const uint64_t kHtile = mapped_base + 0x1400000;
         constexpr uint32_t kW = 256, kH = 256;
 
         prosper::gpu::ResolvedPipelineState ps;

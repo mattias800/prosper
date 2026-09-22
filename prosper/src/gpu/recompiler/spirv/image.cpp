@@ -15,11 +15,13 @@ bool SpirvCompute::tex_is_arrayed(uint32_t binding) {
         return it != tex_binding_arrayed.end() && it->second;
     }
 
-uint32_t SpirvCompute::tex_coord_uv(uint32_t binding, uint32_t u_bits, uint32_t v_bits) {
+uint32_t SpirvCompute::tex_coord_uv(uint32_t binding, uint32_t u_bits, uint32_t v_bits,
+                                    uint32_t layer_bits) {
         uint32_t c = id();
         if (tex_binding_arrayed.count(binding) && tex_binding_arrayed[binding])
             put(code, Op_CompositeConstruct,
-                {t_v3f(), c, bcf(u_bits), bcf(v_bits), fconstf(0.0f)});
+                {t_v3f(), c, bcf(u_bits), bcf(v_bits),
+                 layer_bits ? bcf(layer_bits) : fconstf(0.0f)});
         else
             put(code, Op_CompositeConstruct, {t_v2f(), c, bcf(u_bits), bcf(v_bits)});
         return c;
@@ -158,18 +160,19 @@ void SpirvCompute::image_sample_bias_2d(uint32_t binding, uint32_t u_bits, uint3
         unpack_texture_result(binding, res, out);
     }
 
-void SpirvCompute::image_gather_2d(uint32_t binding, uint32_t u_bits, uint32_t v_bits, uint32_t comp, uint32_t out[4]) {
+void SpirvCompute::image_gather_2d(uint32_t binding, uint32_t u_bits, uint32_t v_bits,
+                                   uint32_t comp, uint32_t out[4], uint32_t layer_bits) {
         uint32_t si    = id(); put(code, Op_Load, {tex_binding_simg[binding], si, tex_var[binding]});
-        uint32_t coord = tex_coord_uv(binding, u_bits, v_bits);
+        uint32_t coord = tex_coord_uv(binding, u_bits, v_bits, layer_bits);
         uint32_t res   = id(); put(code, Op_ImageGather, {texture_vec4(binding), res, si, coord, uconst(comp)});
         unpack_texture_result(binding, res, out);
     }
 
 void SpirvCompute::image_gather_offset_2d(uint32_t binding, uint32_t u_bits, uint32_t v_bits, uint32_t comp,
-                                uint32_t off_bits, uint32_t out[4]) {
+                                uint32_t off_bits, uint32_t out[4], uint32_t layer_bits) {
         if (!declared_gather_ext) { put(caps, Op_Capability, {Cap_ImageGatherExtended}); declared_gather_ext = true; }
         uint32_t si    = id(); put(code, Op_Load, {tex_binding_simg[binding], si, tex_var[binding]});
-        uint32_t coord = tex_coord_uv(binding, u_bits, v_bits);
+        uint32_t coord = tex_coord_uv(binding, u_bits, v_bits, layer_bits);
         // signed 6-bit texel offsets. NOTE: bfe_s takes SPIR-V IDs — raw integers here (the #296
         // original) emitted OpBitFieldSExtract with invalid operand IDs; never caught live because
         // the only gather4_lz_o user (DOLL's FXAA PS) still rejected upstream on its execz region.
