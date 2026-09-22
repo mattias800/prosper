@@ -30,6 +30,7 @@
 //                             positive control so it cannot pass vacuously on an empty listing.
 #include "hle/dispatch/dispatch.hpp"
 #include "hle/fs/save_paths.hpp"
+#include "fixtures/savedata_test_env.h"
 #include "fixtures/test_scratch.h"
 
 #include <algorithm>
@@ -38,12 +39,14 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
-#include <fstream>
+#include <fstream>   // the hand-made non-save file in arm 3
 #include <string>
 #include <vector>
 
 using namespace prosper;
 namespace fs = std::filesystem;
+using prosper_test::make_app0;
+using prosper_test::set_env;
 
 static int fails = 0;
 static int checks = 0;
@@ -51,25 +54,6 @@ static int checks = 0;
                          else       { printf("  [ok]   %s\n", m); } } while (0)
 
 namespace {
-
-void set_env(const char* name, const char* value) {
-#ifdef _WIN32
-    _putenv_s(name, value ? value : "");
-#else
-    if (value) setenv(name, value, 1); else unsetenv(name);
-#endif
-}
-
-std::string make_app0(const fs::path& base, const char* name, const std::string& title_id) {
-    const fs::path root = base / name;
-    std::error_code ec;
-    fs::remove_all(root, ec);
-    fs::create_directories(root / "sce_sys", ec);
-    std::ofstream p(root / "sce_sys" / "param.json", std::ios::binary);
-    p << "{\"titleId\":\"" << title_id << "\"}";
-    p.close();
-    return root.string();
-}
 
 // The ABI, stated independently of the implementation (PS4-inherited, pinned by DOLL's callsite —
 // see s_savedata_dirsearch):
