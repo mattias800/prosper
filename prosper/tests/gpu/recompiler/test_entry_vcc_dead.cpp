@@ -191,7 +191,9 @@ int main() {
         0xd7600002u, 0x00010100u, 0xBF8A0000u,
         0xBEEA0385u,                            // pc11: s_mov_b32 vcc_lo, 5   (b32, not the pair)
         0xBF068004u, 0xBF840001u, 0x7E040281u,
-        0xd7600002u, 0x00010100u, 0x4A020000u, 0xBF810000u,
+        0xd7600002u, 0x00010100u,
+        0x02060300u,                            // pc17: v_cndmask_b32_e32 — reads the WHOLE pair
+        0xBF810000u,
     };
 
     // THIRD NEGATIVE ARM — the define must be in the ENTRY block, not merely somewhere in the
@@ -206,7 +208,26 @@ int main() {
         0x7D860080u,                            // pc13: v_cmp_le_u32 vcc, 0, v0  (successor block)
         0x7E040281u,                            // pc14: v_mov_b32 v2, 1
         0xd7600002u, 0x00010100u,               // pc15: v_readlane_b32 s2, v0, 0
-        0x4A020000u,                            // pc17: v_add_nc_u32 v1, s0, v0
+        0x02060300u,                            // pc17: v_cndmask_b32_e32 — the taken edge from
+                                                //       pc12 reaches this read WITHOUT the define
+        0xBF810000u,                            // pc18: s_endpgm
+    };
+
+    // #2952 POSITIVE ARM — a define in a SUCCESSOR block that DOMINATES every read. The entry block
+    // (pc11..pc12) holds no define, so the block-0 proof above declines; the define at pc14 sits
+    // after the if's join, so every path to the VCC read at pc17 passes it and the entry value is
+    // dead on all of them. This is Metaphor: ReFantazio's 0x2281c74100 second phase in miniature,
+    // where VCC is first written as scalar scratch inside a loop body.
+    const uint32_t define_dominates_read[] = {
+        0xBE800385u, 0xBF068004u, 0xBF84000Fu, 0xBF8A0000u,
+        0xBEEA0385u, 0xBF068004u, 0xBF840001u, 0x7E040281u,
+        0xd7600002u, 0x00010100u, 0xBF8A0000u,
+        0xBF068004u,                            // pc11: s_cmp_eq_u32 s4, 0     entry block starts
+        0xBF840001u,                            // pc12: s_cbranch_scc0 -> pc14 entry block ends
+        0x7E040281u,                            // pc13: v_mov_b32 v2, 1
+        0x7D860080u,                            // pc14: v_cmp_le_u32 vcc, 0, v0  THE DEFINE (join)
+        0xd7600002u, 0x00010100u,               // pc15: v_readlane_b32 s2, v0, 0
+        0x02060300u,                            // pc17: v_cndmask_b32_e32 — a dominated read
         0xBF810000u,                            // pc18: s_endpgm
     };
 
@@ -220,6 +241,8 @@ int main() {
                                    std::size(half_pair_write_only), 0x32310004ull);
     const auto late_define = compile(define_after_entry_block,
                                      std::size(define_after_entry_block), 0x32310005ull);
+    const auto dominated = compile(define_dominates_read,
+                                   std::size(define_dominates_read), 0x32310006ull);
 
     // The control first: an arm whose control has not been read is a verdict with no denominator.
     CHECK(!control_a.empty(),
@@ -244,9 +267,19 @@ int main() {
           "#3231: the half-pair refusal is this gate as well");
 
     CHECK(late_define.empty(),
-          "#3231: a define in a SUCCESSOR block does not make the entry value dead");
-    CHECK(has(last_terminal_reject_reason(0x32310005ull), "missing-entry-vcc"),
-          "#3231: the successor-define refusal is this gate as well");
+          "#3231: a successor-block define that a VCC read can bypass does not make the entry dead");
+    // With a real VCC read after the join (#2952 added it, so the arm cannot pass merely because
+    // nothing reads VCC), the dispatcher's own block-entry mask analysis refuses the read first:
+    // one predecessor of pc17 carries the fresh mask and the other the retired scalar pair. Either
+    // refusal is the right outcome; what must never happen is that the region compiles.
+    {
+        const std::string why = last_terminal_reject_reason(0x32310005ull);
+        CHECK(has(why, "missing-entry-vcc") || has(why, "wave64-ambiguous-mask-read"),
+              "#3231: the bypassable-define refusal comes from a VCC-lifetime gate, not elsewhere");
+    }
+
+    CHECK(!dominated.empty() && has_opcode(dominated, kOpSwitch),
+          "#2952: a successor-block define that DOMINATES every VCC read compiles, via the dispatcher");
 
     if (fails) {
         printf("  [info] arm reject reason:           '%s'\n",
