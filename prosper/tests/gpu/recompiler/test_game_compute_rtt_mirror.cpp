@@ -256,6 +256,225 @@ static int run_destination_mirror_regression() {
               color_target->layout == source_layout,
           "failed same-image completion releases both leases at the saved layout");
 
+    // Native RGBA16F is a recurring renderer-publication format in GTA V. Exercise the exact
+    // eight-byte representation: the full write proves completed publication, while the partial
+    // write can preserve the lower rows only by seeding from the renderer's current GPU image.
+    const bool rgba16_mirror_disabled =
+        std::getenv("PROSPER_NO_RGBA16_COMPUTE_RTT_MIRROR") != nullptr;
+    std::vector<uint16_t> rgba16_words(W * H * 4, 0x7bffu);
+    const uint64_t rgba16_address = reinterpret_cast<uint64_t>(rgba16_words.data());
+    DrawItem rgba16_producer = producer;
+    rgba16_producer.color0_base = rgba16_address;
+    rgba16_producer.ps.color0_format = VK_FORMAT_R16G16B16A16_SFLOAT;
+    const uint16_t rgba16_sample[] = {0x4000u, 0xbc00u, 0x3800u, 0x3c00u};
+    static const uint32_t rgba16_ps_rdna[] = {
+        0x7E0002FFu, 0x40000000u, // v0 = 2.0
+        0x7E0202FFu, 0xBF800000u, // v1 = -1.0
+        0x7E0402FFu, 0x3F000000u, // v2 = 0.5
+        0x7E0602F2u,              // v3 = 1.0
+        0xF800000Fu, 0x03020100u, 0xBF810000u,
+    };
+    auto rgba16_producer_table = std::make_shared<ShaderResourceTable>();
+    rgba16_producer.prt = rgba16_producer_table;
+    rgba16_producer.fs = recompile_fragment(
+        rgba16_ps_rdna, std::size(rgba16_ps_rdna), rgba16_producer_table.get(), &positions);
+    CHECK(!rgba16_producer.fs.empty(), "RGBA16F renderer producer recompiles");
+    CHECK(!render(rgba16_producer).empty(),
+          "RGBA16F destination mirror producer materializes a renderer target");
+    auto rgba16_cpu_newer =
+        std::make_shared<std::vector<uint8_t>>(W * H * 8u, 0x53);
+    notify_live_render_target_image_written(
+        {rgba16_address, W, H, LiveTargetPixelFormat::Rgba16Float,
+         std::move(rgba16_cpu_newer)});
+    LiveTargetImageImport rgba16_source;
+    CHECK(!import_live_render_target_image(rgba16_address, source_request, rgba16_source),
+          "CPU-newer RGBA16F target is refused as a strict source before completion");
+
+    ShaderResource rgba16_output{};
+    rgba16_output.cls = ResourceClass::StorageImage;
+    rgba16_output.format = DataFormat::Float16;
+    rgba16_output.num_components = 4;
+    rgba16_output.binding = 5;
+    rgba16_output.sgpr_base = 8;
+    rgba16_output.img_dim = 1;
+    rgba16_output.width = W;
+    rgba16_output.height = H;
+    rgba16_output.depth = 1;
+    rgba16_output.gpu_addr = rgba16_address;
+    rgba16_output.size = static_cast<uint32_t>(rgba16_words.size() * sizeof(uint16_t));
+    ShaderResourceTable rgba16_table;
+    rgba16_table.resources.push_back(rgba16_output);
+    ComputeShaderConfig rgba16_config = config;
+    rgba16_config.local_y = H;
+    rgba16_config.native_storage_format_support =
+        native_storage_format_support_bit(DataFormat::Float16, 4);
+    const auto rgba16_spirv = recompile_compute(
+        store_black, std::size(store_black), &rgba16_table, rgba16_config);
+    CHECK(!rgba16_spirv.empty(), "native RGBA16F storage writer recompiles");
+    ComputeItem rgba16_full = item;
+    rgba16_full.spirv = rgba16_spirv;
+    rgba16_full.resources = std::make_shared<ShaderResourceTable>(rgba16_table);
+    rgba16_full.code_addr = 0x37310021u;
+    const auto rgba16_full_before =
+        prosper::frontend::live_compute_rtt_destination_mirror_counters();
+    CHECK(!rgba16_spirv.empty() &&
+              prosper::frontend::execute_live_compute_items({rgba16_full}),
+          "native RGBA16F full write completes");
+    const auto rgba16_full_after =
+        prosper::frontend::live_compute_rtt_destination_mirror_counters();
+    const uint16_t rgba16_black[] = {0u, 0u, 0u, 0x3c00u};
+    bool rgba16_expected = true;
+    for (size_t i = 0; i < rgba16_words.size(); ++i)
+        rgba16_expected &= rgba16_words[i] == rgba16_black[i % 4u];
+    CHECK(rgba16_expected,
+          "native RGBA16F guest writeback contains exact half-float black and alpha one");
+    if (rgba16_mirror_disabled) {
+        CHECK(rgba16_full_after.candidates == rgba16_full_before.candidates &&
+                  rgba16_full_after.borrowed == rgba16_full_before.borrowed &&
+                  rgba16_full_after.recorded == rgba16_full_before.recorded &&
+                  rgba16_full_after.published == rgba16_full_before.published &&
+                  !import_live_render_target_image(
+                      rgba16_address, source_request, rgba16_source),
+              "disabled RGBA16F admission uses ordinary CPU publication");
+        LiveTargetSnapshot rgba16_snapshot;
+        CHECK(read_live_render_target(rgba16_address, rgba16_snapshot) &&
+                  rgba16_snapshot.format == LiveTargetPixelFormat::Rgba16Float &&
+                  rgba16_snapshot.pixels &&
+                  rgba16_snapshot.pixels->size() == rgba16_words.size() * sizeof(uint16_t) &&
+                  std::memcmp(rgba16_snapshot.pixels->data(), rgba16_words.data(),
+                              rgba16_snapshot.pixels->size()) == 0,
+              "disabled RGBA16F path publishes exact fallback bytes");
+    } else {
+        CHECK(rgba16_full_after.candidates == rgba16_full_before.candidates + 1 &&
+                  rgba16_full_after.borrowed == rgba16_full_before.borrowed + 1 &&
+                  rgba16_full_after.recorded == rgba16_full_before.recorded + 1 &&
+                  rgba16_full_after.published == rgba16_full_before.published + 1 &&
+                  import_live_render_target_image(
+                      rgba16_address, source_request, rgba16_source) &&
+                  rgba16_source.valid() &&
+                  rgba16_source.format == LiveTargetPixelFormat::Rgba16Float &&
+                  rgba16_source.native_format == VK_FORMAT_R16G16B16A16_SFLOAT,
+              "completed RGBA16F write publishes the exact renderer image");
+        release_live_render_target_image(rgba16_address);
+        std::vector<uint8_t> rgba16_full_pixels;
+        std::string rgba16_readback_error;
+        CHECK(prosper::test::readback_persistent_color_target(
+                  rgba16_address, W, H, VK_FORMAT_R16G16B16A16_SFLOAT,
+                  rgba16_full_pixels, rgba16_readback_error) &&
+                  rgba16_full_pixels.size() == rgba16_words.size() * sizeof(uint16_t) &&
+                  std::memcmp(rgba16_full_pixels.data(), rgba16_words.data(),
+                              rgba16_full_pixels.size()) == 0,
+              "RGBA16F renderer destination equals guest writeback bit for bit");
+    }
+
+    CHECK(!render(rgba16_producer).empty(),
+          "RGBA16F renderer repaints its image before the partial write");
+    std::vector<uint8_t> rgba16_seed;
+    std::string rgba16_seed_error;
+    const bool rgba16_seed_valid = prosper::test::readback_persistent_color_target(
+        rgba16_address, W, H, VK_FORMAT_R16G16B16A16_SFLOAT,
+        rgba16_seed, rgba16_seed_error) &&
+        rgba16_seed.size() == rgba16_words.size() * sizeof(uint16_t);
+    bool rgba16_seed_expected = rgba16_seed_valid;
+    if (rgba16_seed_valid) {
+        std::vector<uint16_t> seed_words(rgba16_words.size());
+        std::memcpy(seed_words.data(), rgba16_seed.data(), rgba16_seed.size());
+        for (size_t i = 0; i < rgba16_words.size(); ++i)
+            rgba16_seed_expected &= seed_words[i] == rgba16_sample[i % 4u];
+    }
+    CHECK(rgba16_seed_expected,
+          "RGBA16F renderer seed preserves negative and greater-than-one half floats");
+    const auto* rgba16_target = prosper::test::find_persistent_color_target(
+        rgba16_address, W, H, VK_FORMAT_R16G16B16A16_SFLOAT);
+    const VkImage rgba16_image = rgba16_target ? rgba16_target->image : VK_NULL_HANDLE;
+    const VkImageLayout rgba16_layout =
+        rgba16_target ? rgba16_target->layout : VK_IMAGE_LAYOUT_UNDEFINED;
+    const uint32_t rgba16_renderer_pins = rgba16_target ? rgba16_target->pin_count : 0;
+    ComputeShaderConfig rgba16_partial_config = rgba16_config;
+    rgba16_partial_config.local_y = 1;
+    const auto rgba16_partial_spirv = recompile_compute(
+        store_black, std::size(store_black), &rgba16_table, rgba16_partial_config);
+    CHECK(!rgba16_partial_spirv.empty(), "native RGBA16F partial writer recompiles");
+    ComputeItem rgba16_partial = rgba16_full;
+    rgba16_partial.spirv = rgba16_partial_spirv;
+    rgba16_partial.launch.threads_y = 1;
+    rgba16_partial.launch.local_y = 1;
+    rgba16_partial.launch.groups_y = 1;
+    rgba16_partial.code_addr = 0x37310022u;
+    const auto rgba16_partial_before =
+        prosper::frontend::live_compute_rtt_destination_mirror_counters();
+    CHECK(prosper::frontend::execute_live_compute_items({rgba16_partial}),
+          "native RGBA16F partial write completes from renderer pixels");
+    const auto rgba16_partial_after =
+        prosper::frontend::live_compute_rtt_destination_mirror_counters();
+    CHECK(rgba16_seed_valid &&
+              std::memcmp(reinterpret_cast<const uint8_t*>(rgba16_words.data()) + W * 8u,
+                          rgba16_seed.data() + W * 8u,
+                          rgba16_seed.size() - W * 8u) == 0,
+          "RGBA16F partial writer preserves exact untouched renderer rows");
+    if (rgba16_mirror_disabled) {
+        CHECK(rgba16_partial_after.candidates == rgba16_partial_before.candidates &&
+                  rgba16_partial_after.borrowed == rgba16_partial_before.borrowed &&
+                  rgba16_partial_after.recorded == rgba16_partial_before.recorded &&
+                  rgba16_partial_after.published == rgba16_partial_before.published &&
+                  rgba16_partial_after.rgba16_source_seed_recorded ==
+                      rgba16_partial_before.rgba16_source_seed_recorded,
+              "disabled RGBA16F partial path refuses destination admission");
+        LiveTargetSnapshot rgba16_snapshot;
+        CHECK(read_live_render_target(rgba16_address, rgba16_snapshot) &&
+                  rgba16_snapshot.format == LiveTargetPixelFormat::Rgba16Float &&
+                  rgba16_snapshot.pixels &&
+                  rgba16_snapshot.pixels->size() == rgba16_words.size() * sizeof(uint16_t) &&
+                  std::memcmp(rgba16_snapshot.pixels->data(), rgba16_words.data(),
+                              rgba16_snapshot.pixels->size()) == 0,
+              "disabled RGBA16F partial path publishes exact fallback bytes");
+    } else {
+        CHECK(rgba16_partial_after.candidates == rgba16_partial_before.candidates + 1 &&
+                  rgba16_partial_after.borrowed == rgba16_partial_before.borrowed + 1 &&
+                  rgba16_partial_after.recorded == rgba16_partial_before.recorded + 1 &&
+                  rgba16_partial_after.published == rgba16_partial_before.published + 1 &&
+                  rgba16_partial_after.rgba16_source_seed_recorded ==
+                      rgba16_partial_before.rgba16_source_seed_recorded + 1,
+              "RGBA16F partial write seeds and publishes the same renderer image");
+        std::vector<uint8_t> rgba16_partial_pixels;
+        CHECK(prosper::test::readback_persistent_color_target(
+                  rgba16_address, W, H, VK_FORMAT_R16G16B16A16_SFLOAT,
+                  rgba16_partial_pixels, rgba16_seed_error) &&
+                  rgba16_partial_pixels.size() == rgba16_words.size() * sizeof(uint16_t) &&
+                  std::memcmp(rgba16_partial_pixels.data(), rgba16_words.data(),
+                              rgba16_partial_pixels.size()) == 0,
+              "RGBA16F partial destination equals guest writeback bit for bit");
+        rgba16_target = prosper::test::find_persistent_color_target(
+            rgba16_address, W, H, VK_FORMAT_R16G16B16A16_SFLOAT);
+        CHECK(rgba16_target && rgba16_target->image == rgba16_image &&
+                  rgba16_target->pin_count == rgba16_renderer_pins &&
+                  rgba16_target->layout == rgba16_layout,
+              "RGBA16F source and destination release their leases at the saved layout");
+
+        const auto rgba16_failure_before =
+            prosper::frontend::live_compute_rtt_destination_mirror_counters();
+        prosper::frontend::live_compute_fail_next_storage_readback_for_test();
+        CHECK(!prosper::frontend::execute_live_compute_items({rgba16_partial}),
+              "failed RGBA16F partial completion is reported");
+        const auto rgba16_failure_after =
+            prosper::frontend::live_compute_rtt_destination_mirror_counters();
+        CHECK(rgba16_failure_after.borrowed == rgba16_failure_before.borrowed + 1 &&
+                  rgba16_failure_after.recorded == rgba16_failure_before.recorded + 1 &&
+                  rgba16_failure_after.failed == rgba16_failure_before.failed + 1 &&
+                  rgba16_failure_after.published == rgba16_failure_before.published &&
+                  rgba16_failure_after.rgba16_source_seed_recorded ==
+                      rgba16_failure_before.rgba16_source_seed_recorded + 1 &&
+                  !import_live_render_target_image(
+                      rgba16_address, source_request, rgba16_source),
+              "failed RGBA16F completion revokes authority without publication");
+        rgba16_target = prosper::test::find_persistent_color_target(
+            rgba16_address, W, H, VK_FORMAT_R16G16B16A16_SFLOAT, false);
+        CHECK(rgba16_target && rgba16_target->image == rgba16_image &&
+                  rgba16_target->pin_count == rgba16_renderer_pins &&
+                  rgba16_target->layout == rgba16_layout,
+              "failed RGBA16F completion releases both leases at the saved layout");
+    }
+
     // Packed R11 is the primary destination-mirror shape. The first complete dispatch removes the
     // CPU snapshot; the second writes only row zero, so rows one through H-1 can survive only if
     // the new renderer-image -> canonical R32_UINT seed supplied their exact packed words.

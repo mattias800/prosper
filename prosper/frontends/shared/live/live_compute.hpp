@@ -443,10 +443,11 @@ uint64_t live_compute_queue_submit_attempts();
 int live_compute_timestamp_support_for_test(); // -1 unobserved, 0 unsupported, 1 supported
 
 // Monotonic exact-destination mirror census. A "published" increment means the ordered renderer
-// notification was emitted after successful guest writeback; tests also inspect image authority.
+// notification was emitted after successful guest writeback; source-seed fields mean that exact
+// renderer-to-compute image copy was recorded. Tests also inspect completion and image authority.
 struct LiveComputeRttDestinationMirrorCounters {
     uint64_t candidates = 0, borrowed = 0, recorded = 0, published = 0, failed = 0;
-    uint64_t r11_source_seed_recorded = 0;
+    uint64_t r11_source_seed_recorded = 0, rgba16_source_seed_recorded = 0;
 };
 LiveComputeRttDestinationMirrorCounters live_compute_rtt_destination_mirror_counters();
 
