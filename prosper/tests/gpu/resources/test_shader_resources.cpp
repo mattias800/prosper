@@ -1114,9 +1114,9 @@ int main() {
               "above is caused by the resource shape and not by the module");
 
         arrayed_table.resources[0].format = DataFormat::Float32;
-        CHECK(reported_at_binding_4(validate_spirv_descriptor_interface(
+        CHECK(!reported_at_binding_4(validate_spirv_descriptor_interface(
                   image_spv, &arrayed_table, 1, SpirvShaderStage::Fragment)),
-              "Float32 array rejects a plain 2D module regardless of source residency");
+              "Float32 graphics base-slice view accepts an ordinary 2D declaration");
         CHECK(!reported_at_binding_4(validate_spirv_descriptor_interface(
                   image_dim_test_spirv(1u, true), &arrayed_table, 1, SpirvShaderStage::Fragment)),
               "Float32 array accepts a matching array declaration");
