@@ -4,6 +4,7 @@
 // ATRAC9 tracks are not available and could not be committed anyway.
 #include "launcher_media.hpp"
 
+#include <cmath>
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -494,6 +495,21 @@ int main() {
         CHECK(resolve_launcher_music_gain("loud") == kDefaultMusicGain, "unparseable input keeps the default");
         CHECK(resolve_launcher_music_gain("0.5x") == kDefaultMusicGain, "so does trailing junk");
         CHECK(resolve_launcher_music_gain("") == kDefaultMusicGain, "so does an empty value");
+    }
+    {
+        // #3499: --volume is the process attenuator, so it scales the launcher music too. Expected
+        // values are products of exactly representable binary fractions, so == is exact.
+        CHECK(launcher_music_output_gain(0.5f, 1.0f) == 0.5f,
+              "--volume 100 leaves the launcher music at its own level");
+        CHECK(launcher_music_output_gain(0.5f, 0.0f) == 0.0f,
+              "--volume 0 silences the launcher music, not only the title");
+        CHECK(launcher_music_output_gain(0.5f, 0.25f) == 0.125f,
+              "--volume 25 attenuates the music's own level rather than replacing it");
+        CHECK(launcher_music_output_gain(1.0f, 0.5f) == 0.5f, "a full-scale track is halved at 50%");
+        CHECK(launcher_music_output_gain(0.5f, 2.0f) == 0.5f, "an over-range volume cannot amplify");
+        CHECK(launcher_music_output_gain(2.0f, 1.0f) == 1.0f, "nor can an over-range music level");
+        CHECK(launcher_music_output_gain(0.5f, -1.0f) == 0.0f, "a negative volume is silence");
+        CHECK(launcher_music_output_gain(0.5f, std::nanf("")) == 0.0f, "and a NaN is silence, not NaN");
     }
 
     if (fails) { std::printf("== FAIL: %d ==\n", fails); return 1; }
