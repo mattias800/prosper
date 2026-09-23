@@ -7,22 +7,37 @@ import subprocess
 from pathlib import Path
 
 
+def input_file(path: Path, root: Path) -> Path:
+    """Restrict report inputs to the caller's scratch tree, including symlinks."""
+    resolved = path.resolve(strict=True)
+    if not resolved.is_file() or not resolved.is_relative_to(root):
+        raise ValueError(f"probe input is outside the report root: {path}")
+    return resolved
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("control_output", type=Path)
     parser.add_argument("report", type=Path)
+    parser.add_argument("--root", type=Path, required=True,
+                        help="scratch directory containing both probe input files")
     parser.add_argument("--elf", choices=("EXEC", "DYN"), required=True)
     parser.add_argument("--space-path", action="store_true")
     parser.add_argument("--tab-path", action="store_true")
     args = parser.parse_args()
+    root = args.root.resolve(strict=True)
+    if not root.is_dir():
+        parser.error("--root must be a directory")
+    control_file = input_file(args.control_output, root)
+    report_file = input_file(args.report, root)
 
-    control = args.control_output.read_text(encoding="ascii").splitlines()[0]
+    control = control_file.read_text(encoding="ascii").splitlines()[0]
     match = re.fullmatch(r"main_tid=(\d+) worker_tid=(\d+) calls_per_site_per_tid=(\d+)", control)
     assert match, control
     main_tid, worker_tid, expected = map(int, match.groups())
     assert main_tid != worker_tid
 
-    lines = args.report.read_text(encoding="utf-8").splitlines()
+    lines = report_file.read_text(encoding="utf-8").splitlines()
     header = lines[0]
     assert re.search(r"\boverflow_calls=0\b", header), header
     assert re.search(r"\bresolution_failures=0\b", header), header

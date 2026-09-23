@@ -9,6 +9,8 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 #include <cerrno>
+#include <atomic>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
@@ -25,35 +27,41 @@ static_assert(kSlots >= 2 && (kSlots & (kSlots - 1)) == 0,
               "the fixed table must have a power-of-two capacity");
 constexpr unsigned kMaxProbes = kSlots < 128 ? kSlots : 128;
 struct Site {
-    unsigned state; // 0 empty, 1 being published, 2 ready
+    std::atomic<unsigned> state; // 0 empty, 1 being published, 2 ready
     unsigned tid;
     uintptr_t caller;
     unsigned kind; // 0 scalar, 1 array
-    uint64_t calls;
-    uint64_t bytes;
+    std::atomic<uint64_t> calls;
+    std::atomic<uint64_t> bytes;
 };
-static Site sites[kSlots];
-static uint64_t total_calls, total_bytes, overflow_calls, overflow_bytes;
-static uint64_t failed_calls, bootstrap_calls, resolution_failures;
-static uint64_t report_failures;
-static unsigned report_warning_emitted;
-static unsigned forked_child;
-static __thread bool inside_probe;
-static __thread unsigned cached_tid;
-static void* (*real_scalar)(size_t);
-static void* (*real_array)(size_t);
-static pthread_t report_thread;
-static bool report_thread_started;
-static unsigned stop_reporter;
-static char report_dir[768] = ".";
+Site sites[kSlots];
+std::atomic<uint64_t> total_calls, total_bytes, overflow_calls, overflow_bytes;
+std::atomic<uint64_t> failed_calls, bootstrap_calls, resolution_failures;
+std::atomic<uint64_t> report_failures;
+std::atomic<unsigned> report_warning_emitted;
+std::atomic<unsigned> forked_child;
+thread_local bool inside_probe;
+thread_local unsigned cached_tid;
+using NewFunction = void* (*)(size_t);
+static_assert(std::atomic<unsigned>::is_always_lock_free &&
+              std::atomic<uint64_t>::is_always_lock_free &&
+              std::atomic<NewFunction>::is_always_lock_free,
+              "the allocation interposer cannot fall back to allocating atomic locks");
+std::atomic<NewFunction> real_scalar, real_array;
+pthread_t report_thread;
+bool report_thread_started;
+std::atomic<unsigned> stop_reporter;
+char report_dir[768] = ".";
 
-#define READ(x) __atomic_load_n(&(x), __ATOMIC_RELAXED)
-#define ADD(x, value) __atomic_fetch_add(&(x), (value), __ATOMIC_RELAXED)
+#define READ(x) (x).load(std::memory_order_relaxed)
+#define ADD(x, value) (x).fetch_add((value), std::memory_order_relaxed)
 
 struct ProbeScope {
     bool previous;
     ProbeScope() : previous(inside_probe) { inside_probe = true; }
     ~ProbeScope() { inside_probe = previous; }
+    ProbeScope(const ProbeScope&) = delete;
+    ProbeScope& operator=(const ProbeScope&) = delete;
 };
 
 unsigned current_tid() {
@@ -64,20 +72,19 @@ unsigned current_tid() {
 // Only used while dlsym resolves the real C++ operator. This path obeys ordinary
 // throwing-new allocation and new_handler behavior; its calls are counted separately.
 extern "C" void* __libc_malloc(size_t);
-void* bootstrap_new(size_t bytes) {
+std::byte* bootstrap_new(size_t bytes) {
     ADD(bootstrap_calls, 1);
     for (;;) {
-        if (void* p = __libc_malloc(bytes ? bytes : 1)) return p;
+        if (auto* p = __libc_malloc(bytes ? bytes : 1)) return static_cast<std::byte*>(p);
         const std::new_handler handler = std::get_new_handler();
         if (!handler) throw std::bad_alloc();
         handler();
     }
 }
 
-using NewFunction = void* (*)(size_t);
 NewFunction resolve_real(unsigned kind) {
-    void* (*&real)(size_t) = kind ? real_array : real_scalar;
-    NewFunction fn = __atomic_load_n(&real, __ATOMIC_ACQUIRE);
+    auto& real = kind ? real_array : real_scalar;
+    NewFunction fn = real.load(std::memory_order_acquire);
     if (fn) return fn;
     if (inside_probe) return nullptr;
     ProbeScope scope;
@@ -86,7 +93,7 @@ NewFunction resolve_real(unsigned kind) {
         ADD(resolution_failures, 1);
         return nullptr;
     }
-    __atomic_store_n(&real, fn, __ATOMIC_RELEASE);
+    real.store(fn, std::memory_order_release);
     return fn;
 }
 
@@ -103,15 +110,15 @@ void record(uintptr_t caller, size_t bytes, unsigned kind) {
     hash ^= hash >> 33;
     for (unsigned n = 0; n < kMaxProbes; ++n) {
         Site& site = sites[(hash + n) & (kSlots - 1)];
-        unsigned state = __atomic_load_n(&site.state, __ATOMIC_ACQUIRE);
+        unsigned state = site.state.load(std::memory_order_acquire);
         if (state == 0) {
             unsigned expected = 0;
-            if (__atomic_compare_exchange_n(&site.state, &expected, 1, false,
-                                            __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+            if (site.state.compare_exchange_strong(expected, 1, std::memory_order_acq_rel,
+                                                   std::memory_order_acquire)) {
                 site.tid = tid;
                 site.caller = caller;
                 site.kind = kind;
-                __atomic_store_n(&site.state, 2, __ATOMIC_RELEASE);
+                site.state.store(2, std::memory_order_release);
                 state = 2;
             } else {
                 state = expected;
@@ -129,7 +136,7 @@ void record(uintptr_t caller, size_t bytes, unsigned kind) {
 
 void report_error(const char* operation, int error) {
     ADD(report_failures, 1);
-    if (__atomic_exchange_n(&report_warning_emitted, 1u, __ATOMIC_RELAXED) == 0) {
+    if (report_warning_emitted.exchange(1u, std::memory_order_relaxed) == 0) {
         fprintf(stderr, "[new-probe] REPORT FAILED at %s (errno=%d); "
                         "attribution file may be missing or stale\n", operation, error);
         fflush(stderr);
@@ -140,18 +147,19 @@ void report_error(const char* operation, int error) {
 // spaces intact while keeping every path and symbol within one TSV cell.
 void tsv_field(FILE* out, const char* text) {
     static constexpr char hex[] = "0123456789abcdef";
-    for (const unsigned char* p = reinterpret_cast<const unsigned char*>(text); *p; ++p) {
-        switch (*p) {
+    for (const char* p = text; *p; ++p) {
+        const auto ch = static_cast<unsigned char>(*p);
+        switch (ch) {
         case '\\': fputs("\\\\", out); break;
         case '\t': fputs("\\t", out); break;
         case '\n': fputs("\\n", out); break;
         case '\r': fputs("\\r", out); break;
         default:
-            if (*p < 0x20 || *p == 0x7f) {
+            if (ch < 0x20 || ch == 0x7f) {
                 fputc('\\', out); fputc('x', out);
-                fputc(hex[*p >> 4], out); fputc(hex[*p & 15], out);
+                fputc(hex[ch >> 4], out); fputc(hex[ch & 15], out);
             } else {
-                fputc(*p, out);
+                fputc(ch, out);
             }
         }
     }
@@ -186,7 +194,7 @@ void dump() {
                 static_cast<unsigned long long>(READ(report_failures)));
         fputs("# tid\tkind\tcaller\tcalls\trequested_bytes\tdso\tdso_offset\tsymbol\n", out);
         for (const Site& site : sites) {
-            if (__atomic_load_n(&site.state, __ATOMIC_ACQUIRE) != 2) continue;
+            if (site.state.load(std::memory_order_acquire) != 2) continue;
             Dl_info info{};
             const uintptr_t address = site.caller;
             const bool known = address && dladdr(reinterpret_cast<void*>(address - 1), &info);
@@ -216,8 +224,8 @@ void dump() {
 }
 
 void child_after_fork() {
-    __atomic_store_n(&forked_child, 1u, __ATOMIC_RELAXED);
-    __atomic_store_n(&report_warning_emitted, 0u, __ATOMIC_RELAXED);
+    forked_child.store(1u, std::memory_order_relaxed);
+    report_warning_emitted.store(0u, std::memory_order_relaxed);
     report_thread_started = false; // The parent's reporter thread no longer exists.
     static constexpr char message[] =
         "[new-probe] REFUSED forked child without exec: inherited attribution is invalid\n";
@@ -273,11 +281,12 @@ __attribute__((constructor)) void init() {
     }
     // Resolve before spawning the reporter. A recursive new during dlsym takes the
     // bootstrap path; normal calls delegate to the original libstdc++ operator.
-    __atomic_store_n(&real_scalar,
-                     reinterpret_cast<NewFunction>(dlsym(RTLD_NEXT, "_Znwm")), __ATOMIC_RELEASE);
-    __atomic_store_n(&real_array,
-                     reinterpret_cast<NewFunction>(dlsym(RTLD_NEXT, "_Znam")), __ATOMIC_RELEASE);
-    if (!real_scalar || !real_array) {
+    real_scalar.store(reinterpret_cast<NewFunction>(dlsym(RTLD_NEXT, "_Znwm")),
+                      std::memory_order_release);
+    real_array.store(reinterpret_cast<NewFunction>(dlsym(RTLD_NEXT, "_Znam")),
+                     std::memory_order_release);
+    if (!real_scalar.load(std::memory_order_acquire) ||
+        !real_array.load(std::memory_order_acquire)) {
         ADD(resolution_failures, 1);
         fputs("[new-probe] operator new resolution failed; attribution incomplete\n", stderr);
     }
@@ -293,13 +302,17 @@ __attribute__((constructor)) void init() {
 __attribute__((destructor)) void finish() {
     ProbeScope scope;
     if (READ(forked_child)) return; // Refusal was published by the atfork child hook.
-    __atomic_store_n(&stop_reporter, 1u, __ATOMIC_RELAXED);
+    stop_reporter.store(1u, std::memory_order_relaxed);
     if (report_thread_started) pthread_join(report_thread, nullptr);
     dump();
 }
 } // namespace
 
-__attribute__((noinline)) void* operator new(size_t bytes) {
+// The resolved operator new owns the allocation. Keep its original matching
+// delete visible through RTLD_NEXT; a probe-defined delete could use the wrong
+// allocator if a host replaces the C++ allocation pair. Sonar's matching-delete
+// rule does not model LD_PRELOAD delegation.
+__attribute__((noinline)) void* operator new(size_t bytes) { // NOSONAR
     const uintptr_t caller = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
     NewFunction real = resolve_real(0);
     if (!real) return bootstrap_new(bytes);
@@ -315,7 +328,7 @@ __attribute__((noinline)) void* operator new(size_t bytes) {
     }
 }
 
-__attribute__((noinline)) void* operator new[](size_t bytes) {
+__attribute__((noinline)) void* operator new[](size_t bytes) { // NOSONAR
     const uintptr_t caller = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
     NewFunction real = resolve_real(1);
     if (!real) return bootstrap_new(bytes);

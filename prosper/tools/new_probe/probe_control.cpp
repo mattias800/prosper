@@ -2,6 +2,7 @@
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <atomic>
 #include <cstdio>
 #include <cstdint>
 #include <new>
@@ -40,10 +41,10 @@ int main(int argc, char** argv) {
     if (pthread_create(&thread, nullptr, worker, &worker_tid) != 0) return 2;
     run_sites();
     if (pthread_join(thread, nullptr) != 0) return 3;
-    volatile size_t impossible = SIZE_MAX;
+    std::atomic<size_t> impossible{SIZE_MAX};
     bool failed_as_expected = false;
     try {
-        void* p = ::operator new(impossible);
+        void* p = ::operator new(impossible.load());
         ::operator delete(p);
     } catch (const std::bad_alloc&) {
         failed_as_expected = true;

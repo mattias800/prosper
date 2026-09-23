@@ -12,8 +12,18 @@ c++ -std=c++17 -O2 -g -no-pie -rdynamic -fno-inline -fno-ipa-icf \
 LD_PRELOAD="$scratch/new_probe.so" PROSPER_NEW_PROBE_DIR="$scratch" \
     "$scratch/control" > "$scratch/control.txt"
 report=$(find "$scratch" -maxdepth 1 -name 'new-sites-*.tsv' -print -quit)
-test -n "$report"
-python3 "$tool_dir/verify_report.py" "$scratch/control.txt" "$report" --elf EXEC
+[[ -n "$report" ]]
+python3 "$tool_dir/verify_report.py" "$scratch/control.txt" "$report" --root "$scratch" --elf EXEC
+
+# A caller-supplied path outside the explicit scratch root must be refused.
+mkdir "$scratch/restricted"
+if python3 "$tool_dir/verify_report.py" "$scratch/control.txt" "$report" \
+    --root "$scratch/restricted" --elf EXEC > "$scratch/path-check.txt" 2>&1; then
+    printf '%s\n' 'FAIL: verifier accepted inputs outside its root' >&2
+    exit 1
+fi
+[[ $(<"$scratch/path-check.txt") == *'outside the report root'* ]]
+printf '%s\n' 'PASS: report verifier refuses paths outside its root'
 
 # The app harness commonly ends through `timeout`/SIGTERM, bypassing exit
 # destructors. Require a report from a still-running control before killing it.
@@ -24,10 +34,10 @@ control_pid=$!
 sleep 2
 periodic="$scratch/periodic/new-sites-$control_pid.tsv"
 kill -0 "$control_pid"
-test -s "$periodic"
-python3 "$tool_dir/verify_report.py" "$scratch/periodic-control.txt" "$periodic" --elf EXEC
+[[ -s "$periodic" ]]
+python3 "$tool_dir/verify_report.py" "$scratch/periodic-control.txt" "$periodic" --root "$scratch" --elf EXEC
 kill -TERM "$control_pid"
-wait "$control_pid" || test "$?" -eq 143
+wait "$control_pid" || [[ "$?" -eq 143 ]]
 printf '%s\n' 'PASS: complete content exists before SIGTERM'
 
 # PIE must use the load-relative offset, and a path containing spaces must
@@ -39,7 +49,7 @@ LD_PRELOAD="$scratch/new_probe.so" PROSPER_NEW_PROBE_DIR="$scratch/with spaces" 
     "$scratch/with spaces/control pie" > "$scratch/pie-control.txt"
 pie_report=$(find "$scratch/with spaces" -maxdepth 1 -name 'new-sites-*.tsv' -print -quit)
 python3 "$tool_dir/verify_report.py" "$scratch/pie-control.txt" "$pie_report" \
-    --elf DYN --space-path
+    --root "$scratch" --elf DYN --space-path
 
 # A literal tab in the executable path must be escaped inside its TSV field.
 tab_dir="$scratch/with"$'\t'"tab"
@@ -49,7 +59,7 @@ LD_PRELOAD="$scratch/new_probe.so" PROSPER_NEW_PROBE_DIR="$tab_dir" \
     "$tab_dir/control" > "$scratch/tab-control.txt"
 tab_report=$(find "$tab_dir" -maxdepth 1 -name 'new-sites-*.tsv' -print -quit)
 python3 "$tool_dir/verify_report.py" "$scratch/tab-control.txt" "$tab_report" \
-    --elf DYN --tab-path
+    --root "$scratch" --elf DYN --tab-path
 
 # A fork without exec inherits the parent's counters and loses its reporter
 # thread. The child must refuse attribution rather than publish those counts.

@@ -3153,6 +3153,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                   (vrt ? vrt->resources.size() : 0) + (prt ? prt->resources.size() : 0);
               const size_t reserve_hint = reserve_frame_resources
                   ? std::min<size_t>(candidate_resources, 16) : 0;
+              const auto reserve_if_empty = [reserve_hint](auto& resources) {
+                  if (reserve_hint > 1 && resources.empty())
+                      resources.reserve(reserve_hint);
+              };
               // Once this callback has admitted a snapshot, observe queued guest writes at every
               // later draw, including draws with no array bindings. A callback-local latch keeps
               // this boundary identical when the per-draw control clears its memo; failure/clear
@@ -8528,20 +8532,16 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         }
                     }
                     if (full_resource) {
-                        if (built.full.empty() && reserve_hint > 1)
-                            built.full.reserve(reserve_hint);
+                        reserve_if_empty(built.full);
                         const uint32_t index = static_cast<uint32_t>(built.full.size());
                         built.full.push_back(std::move(*full_resource));
                         if (compact_buffer_resources) {
-                            if (built.order.empty() && reserve_hint > 1)
-                                built.order.reserve(reserve_hint);
+                            reserve_if_empty(built.order);
                             built.order.push_back(index);
                         }
                     } else {
-                        if (built.buffers.empty() && reserve_hint > 1)
-                            built.buffers.reserve(reserve_hint);
-                        if (built.order.empty() && reserve_hint > 1)
-                            built.order.reserve(reserve_hint);
+                        reserve_if_empty(built.buffers);
+                        reserve_if_empty(built.order);
                         const uint32_t index = static_cast<uint32_t>(built.buffers.size());
                         built.buffers.push_back(std::move(compact_resource));
                         built.order.push_back(kCompactBufferResourceBit | index);

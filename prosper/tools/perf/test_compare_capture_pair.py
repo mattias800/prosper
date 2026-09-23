@@ -167,6 +167,22 @@ class ComparePairTest(unittest.TestCase):
                     _, records, _, samples = load_run(directory)
                     self.assertEqual((records, samples), (['records'], 1))
 
+    def test_symlinked_capture_cannot_escape_selected_run(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            directory = root / 'run'
+            directory.mkdir()
+            (directory / 'run.json').write_text(json.dumps(manifest('0')))
+            (directory / 'child-result.json').write_text(json.dumps(
+                {'returncode': 124, 'validity_errors': [], 'peers_after': []}))
+            (directory / 'peer-samples.json').write_text(json.dumps([
+                {'peers': [], 'frozen_pids': [123]}]))
+            outside = root / 'foreign.prperf'
+            outside.write_text('foreign capture')
+            (directory / 'capture.prperf').symlink_to(outside)
+            with self.assertRaisesRegex(PairError, 'escapes the run directory'):
+                load_run(directory)
+
 
 if __name__ == '__main__':
     unittest.main()

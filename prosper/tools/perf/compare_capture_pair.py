@@ -140,22 +140,32 @@ def shape_weighted_estimates(control, candidate, min_records=20):
 
 
 def load_run(directory):
-    directory = Path(directory)
-    manifest = json.loads((directory / 'run.json').read_text())
-    result = json.loads((directory / 'child-result.json').read_text())
+    # The operator chooses each run directory. Refuse files that escape it through a symlink:
+    # a foreign manifest or capture would make an A/B result appear attributable to this run.
+    directory = Path(directory).resolve(strict=True)
+    require(directory.is_dir(), 'run path is not a directory')
+
+    def run_file(name):
+        path = (directory / name).resolve(strict=True)
+        require(path.is_relative_to(directory) and path.is_file(),
+                f'{name} escapes the run directory or is not a file')
+        return path
+
+    manifest = json.loads(run_file('run.json').read_text())  # NOSONAR: confined operator-selected run
+    result = json.loads(run_file('child-result.json').read_text())  # NOSONAR: same confinement
     require(result.get('returncode') in (0, 124), 'guest failed or timed out abnormally')
     require(result.get('validity_errors') == [],
             'run has validity errors or omits their audit')
     require(result.get('peers_after') == [],
             'run ended with peers or omits their audit')
-    samples = json.loads((directory / 'peer-samples.json').read_text())
+    samples = json.loads(run_file('peer-samples.json').read_text())  # NOSONAR: same confinement
     require(samples and all(row.get('peers') == [] and
                             'frozen_pids' in row and
                             not row.get('frozen_pid_error')
                             for row in samples), 'run has peer activity or peer-scan errors')
     captures = list(directory.glob('*.prperf'))
     require(len(captures) == 1, 'expected exactly one F8 capture')
-    records = load_capture(captures[0])
+    records = load_capture(run_file(captures[0].name))
     summary = summarize(records)
     require(summary.get('truncation') == 'detail not truncated',
             'F8 detail is truncated or incomplete')
