@@ -169,8 +169,11 @@ constexpr bool world_c2_alpha_pass_allowed(const WorldC2AlphaPassFact& fact) {
            fact.c1_binding_count == 1;
 }
 
-constexpr bool world_c2_funnel_allowed(const WorldC2AlphaPassFact& fact) {
-    return world_c2_alpha_pass_allowed(fact) && fact.terminal_pass;
+// A scoped query must complete in its own backend call. The caller may establish that by
+// flushing the ordered batch at this pass, even when later passes remain in the callback.
+constexpr bool world_c2_funnel_allowed(const WorldC2AlphaPassFact& fact,
+                                       bool pass_will_flush) {
+    return world_c2_alpha_pass_allowed(fact) && pass_will_flush;
 }
 
 // The old first-eight descriptor listing dropped facts relevant to the c2 handoff. This

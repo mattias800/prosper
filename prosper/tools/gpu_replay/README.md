@@ -455,21 +455,21 @@ PROSPER_DRAW_STATS=1 ./build-linux/gpu_replay /tmp/submit.prgcap /tmp/out.bmp
 ```
 
 Wraps every realized draw in Vulkan pipeline-statistics + occlusion queries and prints one line per draw
-showing **where its pixels vanished** — objective per-draw truth, no oracle needed. A GPU draw can only
-disappear in four places, and this pinpoints which:
+showing which pipeline stages executed and how many samples passed fragment tests. The counters
+narrow a missing draw without identifying every cause:
 
 - `prims>0, after_clip=0` → **GEOMETRY-VANISH**: every primitive was clipped/degenerate/off-screen (a
   vertex-shader / vertex-fetch / transform problem — the geometry never reached the rasteriser).
-- `after_clip>0, samples=0, fs_inv=0` → **NO-RASTER**: rasteriser produced no fragments (backface cull,
-  empty scissor, zero-area).
-- `after_clip>0, samples=0, fs_inv>0` → **TEST-KILLED**: fragments ran but the depth/stencil test rejected
-  every sample.
-- `samples>0` → **passed-samples**: colour and/or stencil was written (for a colour-write-disabled
-  stencil-only draw `fs_inv` is 0 because the fragment shader is optimised out, but `samples` still counts —
-  which is why `samples` is the ground truth for "survived", checked before `fs_inv`).
+- `after_clip>0, samples=0, fs_inv=0` → **NO-SAMPLES**: culling, scissor, zero-area coverage, or
+  early fragment tests can all produce this result. The counters alone cannot separate them.
+- `after_clip>0, samples=0, fs_inv>0` → **NO-SAMPLES**: invocations ran, but no samples passed; tests,
+  shader discard, and sample-mask behavior remain candidates.
+- `samples>0` → **passed-samples**: some samples passed fragment tests. This does not prove a colour
+  or stencil write. A colour-write-disabled draw can still have a nonzero sample count even when
+  its fragment shader is optimised out, so check `samples` before `fs_inv`.
 
-This is the fastest first-order triage for "why did this draw render nothing/wrong": it replaces manual
-`--through-operation` bisection with a single glance. Localised GTA V's menu black-wedge defect (a stencil-
+This is a fast first-order triage for "why did this draw render nothing/wrong". It can narrow manual
+`--through-operation` bisection. Localised GTA V's menu black-wedge defect (a stencil-
 counting clip whose first mask draw came back `GEOMETRY-VANISH`) in one run. Requires the device to advertise
 `pipelineStatisticsQuery`; inert (no output, no cost, byte-identical rendering) when the env var is unset.
 Works on both `gpu_replay` and the live app because it lives in the shared render path.

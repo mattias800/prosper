@@ -150,10 +150,11 @@ pre-blend fragment output, and final attachment output in a standard report. Exi
 
 **First triage: `PROSPER_DRAW_STATS=1` (the per-draw "fragment funnel").** Before even the visual filmstrip,
 run `PROSPER_DRAW_STATS=1 gpu_replay <capsule> out.bmp`: it wraps every draw in pipeline-statistics + occlusion
-queries and prints one line per draw classifying **where its pixels vanished** — `GEOMETRY-VANISH` (all
-primitives clipped/degenerate/off-screen → a vertex/fetch/transform bug), `NO-RASTER` (cull/scissor/zero-area),
-`TEST-KILLED` (depth/stencil rejected every sample), or `passed-samples` (colour/stencil written). This is
-objective, needs no oracle, and turns "why did this draw render nothing" into a glance instead of a manual
+queries and prints one line per draw narrowing **where its pixels vanished** — `GEOMETRY-VANISH` (no
+post-clipping primitives), `NO-SAMPLES` (cull/scissor/zero-area/early-test, or later test/discard),
+or `passed-samples` (samples passed fragment tests; an attachment write is not proved). These counters
+need no oracle, but zero fragment invocations cannot distinguish culling from early depth/stencil
+rejection. They narrow "why did this draw render nothing" before a manual
 bisection (it localised GTA V's menu black-wedge defect to a single `GEOMETRY-VANISH` mask draw in one run).
 See `tools/gpu_replay/README.md`. Use it to pick the suspect draw, *then* the filmstrip below to see it.
 

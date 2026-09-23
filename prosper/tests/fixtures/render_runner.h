@@ -13000,16 +13000,16 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 const uint64_t verts = sres[i * 5 + 0], prims = sres[i * 5 + 1],
                                clip = sres[i * 5 + 2], fs = sres[i * 5 + 3];
                 const uint64_t samp = ores[i * 2 + 1] ? ores[i * 2 + 0] : 0;
-                // Funnel classification, checked in pipeline order. `samples` (occlusion) is the ground
-                // truth for "survived the depth+stencil test" — it is counted even when the fragment
-                // shader is optimised out for a colour-write-disabled (stencil-only) draw, so it must be
-                // tested before fs_inv or such draws look falsely dead.
+                // Funnel classification, checked in pipeline order. `samples` counts fragment-test
+                // survivors, not attachment writes. It may be nonzero even when a disabled colour
+                // write lets the driver omit fragment shading. Zero shader invocations cannot
+                // distinguish cull/scissor/zero-area from early depth/stencil rejection.
                 const char* tag =
                     (prims == 0) ? "NO-GEOMETRY(no primitives)" :
                     (clip  == 0) ? "GEOMETRY-VANISH(clipped/degenerate/offscreen)" :
-                    (samp  >  0) ? "passed-samples(colour/stencil written)" :
-                    (fs    >  0) ? "TEST-KILLED(depth/stencil rejected all)" :
-                                   "NO-RASTER(cull/scissor/zero-area)";
+                    (samp  >  0) ? "passed-samples(fragment tests)" :
+                    (fs    >  0) ? "NO-SAMPLES(test/discard/sample-mask)" :
+                                   "NO-SAMPLES(cull/scissor/zero-area/early-test)";
                 const uint64_t draw_index = draws[i].draw_index != UINT64_MAX
                     ? draws[i].draw_index : i;
                 fprintf(stderr,

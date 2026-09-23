@@ -1126,6 +1126,50 @@ int main() {
                       deferred_stats_result.submit_result == VK_SUCCESS &&
                       deferred_stats_result.wait_result == VK_SUCCESS,
                   "scoped draw statistics decline a non-flushing backend call");
+            // The live Sonic diagnostic selects a nonterminal draw: an earlier producer is
+            // pending in the same ordered batch, then the sampled draw forces that batch to
+            // complete so its per-draw query is available before later callback passes.
+            prosper::test::BackendSubmissionBatch ordered_stats_batch;
+            prosper::test::BackendColorTarget queued_fp16_target{
+                fp16_target_id, false, false, VK_FORMAT_R16G16B16A16_SFLOAT};
+            (void)prosper::test::render_draws_rgba(
+                {producer}, W, H, nullptr, nullptr, false, &queued_fp16_target,
+                nullptr, nullptr, nullptr, &ordered_stats_batch, false, nullptr, false);
+            const bool ordered_producer_pending = ordered_stats_batch.pending();
+            constexpr uint64_t ordered_output_id = 0x7590000000000017ull;
+            prosper::test::BackendColorTarget ordered_output{
+                ordered_output_id, false, false, VK_FORMAT_R8G8B8A8_UNORM};
+            prosper::test::BackendDrawStatsObservation ordered_stats;
+            {
+                prosper::test::ScopedBackendDrawStatsObservation scope(ordered_stats);
+                (void)prosper::test::render_draws_rgba(
+                    {consumer}, W, H, nullptr, nullptr, false, &ordered_output,
+                    nullptr, nullptr, nullptr, &ordered_stats_batch, true, nullptr, false);
+            }
+            const bool ordered_batch_completed = !ordered_stats_batch.pending();
+            if (!ordered_batch_completed)
+                (void)ordered_stats_batch.submit_and_wait(
+                    prosper::test::render_vk_ctx().dev,
+                    prosper::test::render_vk_ctx().queue, false);
+            ordered_stats_batch.complete();
+            std::vector<uint8_t> ordered_pixels;
+            std::string ordered_error;
+            const bool ordered_readback = prosper::test::readback_persistent_color_target(
+                ordered_output_id, W, H, VK_FORMAT_R8G8B8A8_UNORM,
+                ordered_pixels, ordered_error);
+            CHECK(ordered_producer_pending && ordered_batch_completed && ordered_readback &&
+                      ordered_pixels == cpu_sampled,
+                  "nonterminal batch flush preserves ordered FP16 producer and sampled pixels");
+            if (prosper::test::render_vk_ctx().pipeline_stats_enabled)
+                CHECK(ordered_stats.calls == 1 && ordered_stats.flush_now &&
+                          ordered_stats.query_created && ordered_stats.batch_completed &&
+                          ordered_stats.available && ordered_stats.fragment_invocations > 0 &&
+                          ordered_stats.surviving_samples > 0,
+                      "nonterminal batch flush makes the scoped draw query available");
+            else
+                CHECK(ordered_stats.calls == 1 && ordered_stats.flush_now &&
+                          !ordered_stats.query_created && !ordered_stats.available,
+                      "nonterminal batch flush declines unsupported pipeline statistics");
             CHECK(gpu_sample_stats.sampled_hits == 1 && gpu_sampled == cpu_sampled,
                   "GPU-resident FP16 target sampling matches native CPU RTT round-trip");
             CHECK(fp16_audit.matches == 1 && fp16_audit.descriptor_prepared &&

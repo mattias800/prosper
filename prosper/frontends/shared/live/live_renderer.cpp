@@ -10972,6 +10972,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         c2_alpha_binding_scope;
                     std::optional<prosper::test::ScopedBackendDrawStatsObservation>
                         c2_funnel_scope;
+                    bool c2_funnel_force_flush = false;
                     if (world_depth_ab->c2_alpha_armed &&
                         world_depth_ab->c2_capture_complete &&
                         !world_depth_ab->c2_alpha_attempted && base == c2_base) {
@@ -11007,9 +11008,17 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             c2_alpha_binding.binding = 37;
                             c2_alpha_binding.expected_target = world_c1_base;
                             c2_alpha_binding_scope.emplace(c2_alpha_binding);
-                            if (world_depth_ab->c2_funnel_armed &&
-                                world_c2_funnel_allowed(alpha_fact))
-                                c2_funnel_scope.emplace(c2_funnel_stats);
+                            if (world_depth_ab->c2_funnel_armed) {
+                                // The order-12 alpha pass is followed by other passes in this
+                                // callback. Flush the already ordered batch at exactly this
+                                // boundary so its query can be read after proven completion.
+                                c2_funnel_force_flush = batch_backend_submits &&
+                                    !alpha_fact.terminal_pass;
+                                if (world_c2_funnel_allowed(alpha_fact,
+                                        !batch_backend_submits || alpha_fact.terminal_pass ||
+                                            c2_funnel_force_flush))
+                                    c2_funnel_scope.emplace(c2_funnel_stats);
+                            }
                             c2_alpha_pending = true;
                         } else {
                             std::fprintf(stderr,
@@ -11035,7 +11044,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             : (use_color1 ? render_pass.front()->ps.clear_color1 : nullptr),
                         nullptr,
                         batch_backend_submits ? &backend_submission : nullptr,
-                        pass_i == items.size(), &mrt_outputs,
+                        pass_i == items.size() || c2_funnel_force_flush, &mrt_outputs,
                         // #2283: only ask for colour pixels when something will read them.
                         //
                         // Keyed on the UNION of every bound slot, not on colour-0 alone. Review
