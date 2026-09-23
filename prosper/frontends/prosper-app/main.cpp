@@ -2294,9 +2294,11 @@ int main(int argc, char** argv) {
                 bundlePath, incomplete.target_source_flip);
             recordGrabScreenshot(bundlePath, incomplete);
             std::error_code ec;
-            if (std::filesystem::is_regular_file(pendingGrabScreenshot, ec) && !ec &&
-                std::filesystem::file_size(pendingGrabScreenshot, ec) == 0 && !ec)
-                std::filesystem::remove(pendingGrabScreenshot, ec);
+            if (std::filesystem::is_regular_file(pendingGrabScreenshot, ec) && !ec) {
+                const auto bytes = std::filesystem::file_size(pendingGrabScreenshot, ec);
+                if (!ec && bytes == 0)
+                    std::filesystem::remove(pendingGrabScreenshot, ec);
+            }
             std::fprintf(stderr, "[grab] F9 producer wait refused; no verified screenshot for %s\n",
                          pendingGrabScreenshot.c_str());
             clearPendingGrabScreenshot();
