@@ -743,6 +743,19 @@ int main(int argc, char** argv) {
     check(uploads.references == 3 && uploads.unique_uploads == 1 &&
               uploads.upload_bytes == Pixels * Layers * snapshot_bpp,
           "three array bindings produce one actual backend image/staging upload");
+    // A valid call is the positive control for this two-call diagnostic: the early compact-order
+    // refusal must publish zero texture work, not leave the previous call's plausible counters.
+    BackendDraw malformed_order;
+    malformed_order.B.push_back({});
+    const auto refusal = capture_stderr([&] {
+        const auto rejected = render_draws_rgba({malformed_order}, W, H);
+        check(rejected.empty(), "malformed compact order refuses before rendering");
+    });
+    check(refusal.find("compact resources require explicit order metadata") != std::string::npos,
+          "the preflight arm reached its intended early refusal");
+    uploads = backend_texture_upload_stats();
+    check(uploads.references == 0 && uploads.unique_uploads == 0 && uploads.upload_bytes == 0,
+          "preflight refusal clears the previous backend texture counters");
 
     // Separate draws in one real callback share a stable retained generation. Distinct samplers
     // still yield six references, while the immutable pixel owner permits one actual upload. The
@@ -768,6 +781,11 @@ int main(int argc, char** argv) {
           "callback policy shares one upload; startup per-draw control requires two");
     check(uploads.upload_bytes == expected_uploads * Pixels * Layers * snapshot_bpp,
           "actual uploaded bytes agree with the independently expected policy count");
+    const auto empty_pass = render_draw_pass_rgba(std::span<const BackendDraw>{}, W, H);
+    check(empty_pass.empty(), "empty direct backend pass exits before any Vulkan work");
+    uploads = backend_texture_upload_stats();
+    check(uploads.references == 0 && uploads.unique_uploads == 0 && uploads.upload_bytes == 0,
+          "empty direct backend pass clears the previous texture counters");
 
     // Different color targets force separate backend groups. Completing unrelated color work
     // must retain an unchanged depth snapshot rather than turning every group boundary into a miss.

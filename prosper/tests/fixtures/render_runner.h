@@ -6957,6 +6957,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     color_target_stats = {};
     BackendResourceReuseStats& resource_reuse_stats = backend_resource_reuse_stats_storage();
     resource_reuse_stats = {};
+    BackendTextureUploadStats& texture_stats = backend_texture_upload_stats_storage();
+    texture_stats = {}; // An empty or failed pass must not report the previous call's uploads.
     maybe_report_hash_stats();   // gated cumulative hashing economics (#1268)
     std::vector<uint8_t> out;
     if (out_rgba1) out_rgba1->clear();
@@ -11233,8 +11235,6 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         }
     }
 
-    BackendTextureUploadStats& texture_stats = backend_texture_upload_stats_storage();
-    texture_stats = {};
     texture_stats.references = texture_references;
     texture_stats.persistent_hits = persistent_texture_hits;
     texture_stats.persistent_misses = persistent_texture_misses;
@@ -13728,6 +13728,9 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                                               BackendMrtOutputs* mrt_outputs = nullptr,
                                               bool want_color_readback = true) {   // #2283
     const std::span<const BackendDraw> all(draws);
+    // The compact-resource preflight can refuse before entering render_draw_pass_rgba. Keep the
+    // per-thread texture result scoped to this logical call even on that early exit.
+    backend_texture_upload_stats_storage() = {};
     // One preflight over the logical batch, before splitting or any render-pass state. A malformed
     // later segment must not leave earlier producer work submitted or speculative cache state live.
     if (!backend_compact_resource_orders_valid(all)) return {};
