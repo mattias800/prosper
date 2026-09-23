@@ -68,12 +68,16 @@ def main() -> None:
         assert (" " in dso) == args.space_path, dso
         assert ("\\t" in dso) == args.tab_path, dso
         real_dso = dso.replace("\\t", "\t")
-        elf = subprocess.check_output(["readelf", "-hW", real_dso], text=True)
+        # Report text is data, not an executable selector. Its resolved ELF must live in
+        # the explicit scratch root, and `--` prevents option-looking paths becoming flags.
+        elf_file = input_file(Path(real_dso), root)
+        elf = subprocess.check_output(["readelf", "-hW", "--", str(elf_file)], text=True)  # NOSONAR
         assert re.search(rf"Type:\s+{args.elf}\b", elf), (args.elf, dso)
         mapped = int(caller, 16) - 1 if args.elf == "EXEC" else int(offset, 16) - 1
         assert mapped > 0
-        resolved = subprocess.check_output(
-            ["addr2line", "-e", real_dso, "-f", "-C", hex(mapped)], text=True
+        # Same confined ELF path and fixed argument vector; no shell is involved.
+        resolved = subprocess.check_output(  # NOSONAR
+            ["addr2line", "-e", str(elf_file), "-f", "-C", hex(mapped)], text=True
         ).splitlines()[0]
         assert resolved == symbol, (caller, offset, resolved, symbol)
 

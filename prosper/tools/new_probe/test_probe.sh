@@ -25,6 +25,31 @@ fi
 [[ $(<"$scratch/path-check.txt") == *'outside the report root'* ]]
 printf '%s\n' 'PASS: report verifier refuses paths outside its root'
 
+# The report is input data too: an injected ELF path must not make the verifier
+# inspect a file outside the caller's selected scratch tree.
+python3 - "$report" "$scratch/foreign-elf.tsv" <<'PY'
+from pathlib import Path
+import sys
+
+lines = Path(sys.argv[1]).read_text().splitlines()
+for index, line in enumerate(lines):
+    fields = line.split('\t')
+    if len(fields) == 8 and fields[7] == 'new_probe_scalar_site':
+        fields[5] = '/etc/passwd'
+        lines[index] = '\t'.join(fields)
+        break
+else:
+    raise AssertionError('scalar control row missing')
+Path(sys.argv[2]).write_text('\n'.join(lines) + '\n')
+PY
+if python3 "$tool_dir/verify_report.py" "$scratch/control.txt" "$scratch/foreign-elf.tsv" \
+    --root "$scratch" --elf EXEC > "$scratch/elf-check.txt" 2>&1; then
+    printf '%s\n' 'FAIL: verifier accepted an ELF outside its root' >&2
+    exit 1
+fi
+[[ $(<"$scratch/elf-check.txt") == *'outside the report root'* ]]
+printf '%s\n' 'PASS: report verifier refuses ELF paths outside its root'
+
 # The app harness commonly ends through `timeout`/SIGTERM, bypassing exit
 # destructors. Require a report from a still-running control before killing it.
 mkdir "$scratch/periodic"
@@ -60,6 +85,26 @@ LD_PRELOAD="$scratch/new_probe.so" PROSPER_NEW_PROBE_DIR="$tab_dir" \
 tab_report=$(find "$tab_dir" -maxdepth 1 -name 'new-sites-*.tsv' -print -quit)
 python3 "$tool_dir/verify_report.py" "$scratch/tab-control.txt" "$tab_report" \
     --root "$scratch" --elf DYN --tab-path
+
+# A literal backslash must be doubled in the TSV field. This catches an
+# escaping regression that neither the space nor tab path exercises.
+backslash_dir="$scratch/with\\slash"
+mkdir "$backslash_dir"
+cp "$scratch/with spaces/control pie" "$backslash_dir/control"
+LD_PRELOAD="$scratch/new_probe.so" PROSPER_NEW_PROBE_DIR="$backslash_dir" \
+    "$backslash_dir/control" > "$scratch/backslash-control.txt"
+backslash_report=$(find "$backslash_dir" -maxdepth 1 -name 'new-sites-*.tsv' -print -quit)
+python3 - "$backslash_report" <<'PY'
+import sys
+from pathlib import Path
+rows = [line.split("\t") for line in Path(sys.argv[1]).read_text().splitlines()[2:]]
+sites = [row for row in rows if len(row) == 8 and row[7] == "new_probe_scalar_site"]
+assert sites, rows
+for row in sites:
+    assert r"\\" in row[5], row[5]
+    assert Path(row[5].replace(r"\\", "\\")).is_file(), row[5]
+print("PASS: literal backslash remains doubled in one TSV field")
+PY
 
 # A fork without exec inherits the parent's counters and loses its reporter
 # thread. The child must refuse attribution rather than publish those counts.

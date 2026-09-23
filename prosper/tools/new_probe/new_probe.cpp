@@ -9,6 +9,7 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 #include <cerrno>
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdio>
@@ -17,13 +18,16 @@
 #include <cstring>
 #include <new>
 
+extern "C" void* __libc_malloc(size_t);
+
 namespace {
 #ifndef PROSPER_NEW_PROBE_TEST_SLOTS
 constexpr unsigned kSlots = 32768;
 #else
 constexpr unsigned kSlots = PROSPER_NEW_PROBE_TEST_SLOTS;
 #endif
-static_assert(kSlots >= 2 && (kSlots & (kSlots - 1)) == 0,
+// C++17 has no std::has_single_bit; this expression is its exact power-of-two test.
+static_assert(kSlots >= 2 && (kSlots & (kSlots - 1)) == 0, // NOSONAR
               "the fixed table must have a power-of-two capacity");
 constexpr unsigned kMaxProbes = kSlots < 128 ? kSlots : 128;
 struct Site {
@@ -34,31 +38,45 @@ struct Site {
     std::atomic<uint64_t> calls;
     std::atomic<uint64_t> bytes;
 };
-Site sites[kSlots];
-std::atomic<uint64_t> total_calls, total_bytes, overflow_calls, overflow_bytes;
-std::atomic<uint64_t> failed_calls, bootstrap_calls, resolution_failures;
-std::atomic<uint64_t> report_failures;
-std::atomic<unsigned> report_warning_emitted;
-std::atomic<unsigned> forked_child;
-thread_local bool inside_probe;
-thread_local unsigned cached_tid;
+// The interposer cannot allocate its own accounting state. These objects need
+// static storage and remain mutable: shared counters/flags are atomic, the
+// thread-local values guard recursive operator new, and the report directory
+// is set before the reporter thread starts. Sonar's global-const rule does not
+// model these mutations through atomics and process initialization.
+std::array<Site, kSlots> sites; // NOSONAR
+std::atomic<uint64_t> total_calls; // NOSONAR
+std::atomic<uint64_t> total_bytes; // NOSONAR
+std::atomic<uint64_t> overflow_calls; // NOSONAR
+std::atomic<uint64_t> overflow_bytes; // NOSONAR
+std::atomic<uint64_t> failed_calls; // NOSONAR
+std::atomic<uint64_t> bootstrap_calls; // NOSONAR
+std::atomic<uint64_t> resolution_failures; // NOSONAR
+std::atomic<uint64_t> report_failures; // NOSONAR
+std::atomic<unsigned> report_warning_emitted; // NOSONAR
+std::atomic<unsigned> forked_child; // NOSONAR
+thread_local bool inside_probe; // NOSONAR
+thread_local unsigned cached_tid; // NOSONAR
 using NewFunction = void* (*)(size_t);
 static_assert(std::atomic<unsigned>::is_always_lock_free &&
               std::atomic<uint64_t>::is_always_lock_free &&
               std::atomic<NewFunction>::is_always_lock_free,
               "the allocation interposer cannot fall back to allocating atomic locks");
-std::atomic<NewFunction> real_scalar, real_array;
+std::atomic<NewFunction> real_scalar; // NOSONAR
+std::atomic<NewFunction> real_array; // NOSONAR
 pthread_t report_thread;
 bool report_thread_started;
-std::atomic<unsigned> stop_reporter;
-char report_dir[768] = ".";
+std::atomic<unsigned> stop_reporter; // NOSONAR
+std::array<char, 768> report_dir{'.'}; // NOSONAR
 
+// Totals and stop/refusal flags carry no payload; relaxed access is enough.
+// Table keys and resolved function pointers use release/acquire publication.
+// A global seq_cst order adds probe overhead without strengthening either proof.
 #define READ(x) (x).load(std::memory_order_relaxed)
 #define ADD(x, value) (x).fetch_add((value), std::memory_order_relaxed)
 
 struct ProbeScope {
-    bool previous;
-    ProbeScope() : previous(inside_probe) { inside_probe = true; }
+    bool previous = inside_probe;
+    ProbeScope() { inside_probe = true; }
     ~ProbeScope() { inside_probe = previous; }
     ProbeScope(const ProbeScope&) = delete;
     ProbeScope& operator=(const ProbeScope&) = delete;
@@ -71,7 +89,6 @@ unsigned current_tid() {
 
 // Only used while dlsym resolves the real C++ operator. This path obeys ordinary
 // throwing-new allocation and new_handler behavior; its calls are counted separately.
-extern "C" void* __libc_malloc(size_t);
 std::byte* bootstrap_new(size_t bytes) {
     ADD(bootstrap_calls, 1);
     for (;;) {
@@ -84,7 +101,7 @@ std::byte* bootstrap_new(size_t bytes) {
 
 NewFunction resolve_real(unsigned kind) {
     auto& real = kind ? real_array : real_scalar;
-    NewFunction fn = real.load(std::memory_order_acquire);
+    NewFunction fn = real.load(std::memory_order_acquire); // NOSONAR
     if (fn) return fn;
     if (inside_probe) return nullptr;
     ProbeScope scope;
@@ -93,7 +110,7 @@ NewFunction resolve_real(unsigned kind) {
         ADD(resolution_failures, 1);
         return nullptr;
     }
-    real.store(fn, std::memory_order_release);
+    real.store(fn, std::memory_order_release); // NOSONAR
     return fn;
 }
 
@@ -110,15 +127,16 @@ void record(uintptr_t caller, size_t bytes, unsigned kind) {
     hash ^= hash >> 33;
     for (unsigned n = 0; n < kMaxProbes; ++n) {
         Site& site = sites[(hash + n) & (kSlots - 1)];
-        unsigned state = site.state.load(std::memory_order_acquire);
+        unsigned state = site.state.load(std::memory_order_acquire); // NOSONAR
         if (state == 0) {
             unsigned expected = 0;
-            if (site.state.compare_exchange_strong(expected, 1, std::memory_order_acq_rel,
-                                                   std::memory_order_acquire)) {
+            if (site.state.compare_exchange_strong(expected, 1, // NOSONAR
+                                                   std::memory_order_acq_rel, // NOSONAR
+                                                   std::memory_order_acquire)) { // NOSONAR
                 site.tid = tid;
                 site.caller = caller;
                 site.kind = kind;
-                site.state.store(2, std::memory_order_release);
+                site.state.store(2, std::memory_order_release); // NOSONAR
                 state = 2;
             } else {
                 state = expected;
@@ -136,7 +154,7 @@ void record(uintptr_t caller, size_t bytes, unsigned kind) {
 
 void report_error(const char* operation, int error) {
     ADD(report_failures, 1);
-    if (report_warning_emitted.exchange(1u, std::memory_order_relaxed) == 0) {
+    if (report_warning_emitted.exchange(1u, std::memory_order_relaxed) == 0) { // NOSONAR
         fprintf(stderr, "[new-probe] REPORT FAILED at %s (errno=%d); "
                         "attribution file may be missing or stale\n", operation, error);
         fflush(stderr);
@@ -150,7 +168,7 @@ void tsv_field(FILE* out, const char* text) {
     for (const char* p = text; *p; ++p) {
         const auto ch = static_cast<unsigned char>(*p);
         switch (ch) {
-        case '\\': fputs("\\\\", out); break;
+        case '\\': fputs(R"(\\)", out); break;
         case '\t': fputs("\\t", out); break;
         case '\n': fputs("\\n", out); break;
         case '\r': fputs("\\r", out); break;
@@ -167,16 +185,17 @@ void tsv_field(FILE* out, const char* text) {
 
 void dump() {
     if (!report_dir[0]) return; // Constructor already reported the invalid directory.
-    char path[1024], temporary[1024];
-    const int pid = static_cast<int>(getpid());
-    const int a = snprintf(path, sizeof(path), "%s/new-sites-%d.tsv", report_dir, pid);
-    const int b = snprintf(temporary, sizeof(temporary), "%s/.new-sites-%d.tmp", report_dir, pid);
-    if (a < 0 || b < 0 || a >= static_cast<int>(sizeof(path)) ||
-        b >= static_cast<int>(sizeof(temporary))) {
+    std::array<char, 1024> path;
+    std::array<char, 1024> temporary;
+    const auto pid = static_cast<int>(getpid());
+    const int a = snprintf(path.data(), path.size(), "%s/new-sites-%d.tsv", report_dir.data(), pid);
+    const int b = snprintf(temporary.data(), temporary.size(), "%s/.new-sites-%d.tmp", report_dir.data(), pid);
+    if (a < 0 || b < 0 || a >= static_cast<int>(path.size()) ||
+        b >= static_cast<int>(temporary.size())) {
         report_error("path construction", ENAMETOOLONG);
         return;
     }
-    FILE* out = fopen(temporary, "w");
+    FILE* out = fopen(temporary.data(), "w");
     if (!out) {
         report_error("open", errno);
         return;
@@ -194,7 +213,7 @@ void dump() {
                 static_cast<unsigned long long>(READ(report_failures)));
         fputs("# tid\tkind\tcaller\tcalls\trequested_bytes\tdso\tdso_offset\tsymbol\n", out);
         for (const Site& site : sites) {
-            if (site.state.load(std::memory_order_acquire) != 2) continue;
+            if (site.state.load(std::memory_order_acquire) != 2) continue; // NOSONAR
             Dl_info info{};
             const uintptr_t address = site.caller;
             const bool known = address && dladdr(reinterpret_cast<void*>(address - 1), &info);
@@ -211,21 +230,20 @@ void dump() {
             fputc('\n', out);
         }
     const int write_error = ferror(out) ? errno : 0;
-    const int close_result = fclose(out);
-    if (write_error || close_result != 0) {
+    if (const int close_result = fclose(out); write_error || close_result != 0) {
         report_error("write/close", write_error ? write_error : errno);
-        unlink(temporary);
+        unlink(temporary.data());
         return;
     }
-    if (rename(temporary, path) != 0) {
+    if (rename(temporary.data(), path.data()) != 0) {
         report_error("rename", errno);
-        unlink(temporary);
+        unlink(temporary.data());
     }
 }
 
 void child_after_fork() {
-    forked_child.store(1u, std::memory_order_relaxed);
-    report_warning_emitted.store(0u, std::memory_order_relaxed);
+    forked_child.store(1u, std::memory_order_relaxed); // NOSONAR
+    report_warning_emitted.store(0u, std::memory_order_relaxed); // NOSONAR
     report_thread_started = false; // The parent's reporter thread no longer exists.
     static constexpr char message[] =
         "[new-probe] REFUSED forked child without exec: inherited attribution is invalid\n";
@@ -233,26 +251,26 @@ void child_after_fork() {
     // An exit-time stdio/dladdr dump can deadlock after fork from a multithreaded
     // parent. Publish a refusal marker here using only async-signal-safe calls.
     if (!report_dir[0]) return;
-    char path[1024];
+    std::array<char, 1024> path;
     size_t used = 0;
-    for (const char* p = report_dir; *p && used + 1 < sizeof(path); ++p)
+    for (const char* p = report_dir.data(); *p && used + 1 < path.size(); ++p)
         path[used++] = *p;
     static constexpr char prefix[] = "/new-sites-";
-    for (size_t i = 0; i < sizeof(prefix) - 1 && used + 1 < sizeof(path); ++i)
+    for (size_t i = 0; i < sizeof(prefix) - 1 && used + 1 < path.size(); ++i)
         path[used++] = prefix[i];
-    char digits[16];
-    unsigned pid = static_cast<unsigned>(getpid());
+    std::array<char, 16> digits;
+    auto pid = static_cast<unsigned>(getpid());
     unsigned digit_count = 0;
     do { digits[digit_count++] = static_cast<char>('0' + pid % 10); pid /= 10; }
-    while (pid && digit_count < sizeof(digits));
-    while (digit_count && used + 1 < sizeof(path)) path[used++] = digits[--digit_count];
+    while (pid && digit_count < digits.size());
+    while (digit_count && used + 1 < path.size()) path[used++] = digits[--digit_count];
     static constexpr char suffix[] = ".tsv";
-    for (size_t i = 0; i < sizeof(suffix) - 1 && used + 1 < sizeof(path); ++i)
+    for (size_t i = 0; i < sizeof(suffix) - 1 && used + 1 < path.size(); ++i)
         path[used++] = suffix[i];
     path[used] = '\0';
     static constexpr char refusal[] =
         "# refused=forked-child inherited counters; launch a fresh process with exec\n";
-    const int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    const int fd = open(path.data(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
     if (fd >= 0) {
         write(fd, refusal, sizeof(refusal) - 1);
         close(fd);
@@ -273,20 +291,20 @@ __attribute__((constructor)) void init() {
     ProbeScope scope;
     const char* configured_dir = getenv("PROSPER_NEW_PROBE_DIR");
     if (configured_dir && *configured_dir) {
-        const int length = snprintf(report_dir, sizeof(report_dir), "%s", configured_dir);
-        if (length < 0 || length >= static_cast<int>(sizeof(report_dir))) {
+        const int length = snprintf(report_dir.data(), report_dir.size(), "%s", configured_dir);
+        if (length < 0 || length >= static_cast<int>(report_dir.size())) {
             report_dir[0] = '\0';
             report_error("configured directory", ENAMETOOLONG);
         }
     }
     // Resolve before spawning the reporter. A recursive new during dlsym takes the
     // bootstrap path; normal calls delegate to the original libstdc++ operator.
-    real_scalar.store(reinterpret_cast<NewFunction>(dlsym(RTLD_NEXT, "_Znwm")),
-                      std::memory_order_release);
-    real_array.store(reinterpret_cast<NewFunction>(dlsym(RTLD_NEXT, "_Znam")),
-                     std::memory_order_release);
-    if (!real_scalar.load(std::memory_order_acquire) ||
-        !real_array.load(std::memory_order_acquire)) {
+    real_scalar.store(reinterpret_cast<NewFunction>(dlsym(RTLD_NEXT, "_Znwm")), // NOSONAR
+                      std::memory_order_release); // NOSONAR
+    real_array.store(reinterpret_cast<NewFunction>(dlsym(RTLD_NEXT, "_Znam")), // NOSONAR
+                     std::memory_order_release); // NOSONAR
+    if (!real_scalar.load(std::memory_order_acquire) || // NOSONAR
+        !real_array.load(std::memory_order_acquire)) { // NOSONAR
         ADD(resolution_failures, 1);
         fputs("[new-probe] operator new resolution failed; attribution incomplete\n", stderr);
     }
@@ -302,7 +320,7 @@ __attribute__((constructor)) void init() {
 __attribute__((destructor)) void finish() {
     ProbeScope scope;
     if (READ(forked_child)) return; // Refusal was published by the atfork child hook.
-    stop_reporter.store(1u, std::memory_order_relaxed);
+    stop_reporter.store(1u, std::memory_order_relaxed); // NOSONAR
     if (report_thread_started) pthread_join(report_thread, nullptr);
     dump();
 }
@@ -319,7 +337,7 @@ __attribute__((noinline)) void* operator new(size_t bytes) { // NOSONAR
     if (inside_probe) return real(bytes);
     ProbeScope scope;
     try {
-        void* p = real(bytes);
+        auto* p = real(bytes);
         record(caller, bytes, 0);
         return p;
     } catch (...) {
@@ -335,7 +353,7 @@ __attribute__((noinline)) void* operator new[](size_t bytes) { // NOSONAR
     if (inside_probe) return real(bytes);
     ProbeScope scope;
     try {
-        void* p = real(bytes);
+        auto* p = real(bytes);
         record(caller, bytes, 1);
         return p;
     } catch (...) {

@@ -151,14 +151,14 @@ def load_run(directory):
                 f'{name} escapes the run directory or is not a file')
         return path
 
-    manifest = json.loads(run_file('run.json').read_text())  # NOSONAR: confined operator-selected run
-    result = json.loads(run_file('child-result.json').read_text())  # NOSONAR: same confinement
+    manifest = json.loads(run_file('run.json').read_text())
+    result = json.loads(run_file('child-result.json').read_text())
     require(result.get('returncode') in (0, 124), 'guest failed or timed out abnormally')
     require(result.get('validity_errors') == [],
             'run has validity errors or omits their audit')
     require(result.get('peers_after') == [],
             'run ended with peers or omits their audit')
-    samples = json.loads(run_file('peer-samples.json').read_text())  # NOSONAR: same confinement
+    samples = json.loads(run_file('peer-samples.json').read_text())
     require(samples and all(row.get('peers') == [] and
                             'frozen_pids' in row and
                             not row.get('frozen_pid_error')
