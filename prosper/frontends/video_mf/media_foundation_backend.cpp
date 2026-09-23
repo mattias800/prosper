@@ -1,4 +1,6 @@
 #include "media_foundation_backend.hpp"
+#include "mf_access_unit_decoder.hpp"
+#include "mf_com_ptr.hpp"
 
 #ifndef _WIN32
 #error "The Media Foundation backend is Windows-only"
@@ -52,32 +54,6 @@ void log_hresult(const char* operation, HRESULT hr, const std::string& path = {}
                      path.c_str(), static_cast<unsigned long>(hr));
     }
 }
-
-template <typename T>
-class ComPtr {
-public:
-    ComPtr() = default;
-    ~ComPtr() { reset(); }
-    ComPtr(const ComPtr&) = delete;
-    ComPtr& operator=(const ComPtr&) = delete;
-    ComPtr(ComPtr&& other) noexcept : ptr_(std::exchange(other.ptr_, nullptr)) {}
-    ComPtr& operator=(ComPtr&& other) noexcept {
-        if (this != &other) { reset(); ptr_ = std::exchange(other.ptr_, nullptr); }
-        return *this;
-    }
-
-    T* get() const { return ptr_; }
-    T** put() { reset(); return &ptr_; }
-    T* operator->() const { return ptr_; }
-    explicit operator bool() const { return ptr_ != nullptr; }
-    void reset(T* replacement = nullptr) {
-        if (ptr_) ptr_->Release();
-        ptr_ = replacement;
-    }
-
-private:
-    T* ptr_ = nullptr;
-};
 
 std::wstring utf8_to_wide(const std::string& input) {
     if (input.empty()) return {};
@@ -755,6 +731,20 @@ void MediaFoundationBackend::close(int id) {
     }
     stop_session(session);
 }
+
+int MediaFoundationBackend::open_decoder(uint32_t codec) {
+    return available() ? mf_au::open_decoder(codec) : -1;
+}
+
+VideoBackend::AuResult MediaFoundationBackend::decode_au(int id, const uint8_t* au, size_t bytes,
+                                                         uint8_t* dst, uint64_t dst_bytes,
+                                                         AuPicture& out) {
+    return mf_au::decode_au(id, au, bytes, dst, dst_bytes, out);
+}
+
+bool MediaFoundationBackend::reset_decoder(int id) { return mf_au::reset_decoder(id); }
+
+void MediaFoundationBackend::close_decoder(int id) { mf_au::close_decoder(id); }
 
 MediaFoundationBackend& shared_media_foundation_backend() {
     static MediaFoundationBackend backend;

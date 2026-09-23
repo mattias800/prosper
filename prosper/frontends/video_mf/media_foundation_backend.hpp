@@ -26,6 +26,16 @@ public:
     bool eof(int id) override;
     void close(int id) override;
 
+    // sceVideodec2's access-unit path (#2983). Forwarded to mf_access_unit_decoder, which drives a
+    // decoder MFT directly: the guest demuxes itself, so there is no file for the Source Reader to
+    // open. DXVA is requested and software is the fallback, as on Linux; AuPicture::hardware
+    // reports which one a picture actually came from.
+    int open_decoder(uint32_t codec) override;
+    AuResult decode_au(int id, const uint8_t* au, size_t bytes,
+                       uint8_t* dst, uint64_t dst_bytes, AuPicture& out) override;
+    bool reset_decoder(int id) override;
+    void close_decoder(int id) override;
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

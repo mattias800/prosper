@@ -9,6 +9,10 @@ your own legally obtained dump whose module segments are already unencrypted.
 - 64-bit Windows 10 or Windows 11 on an x86-64 CPU.
 - A Vulkan 1.1-capable graphics driver. Update the AMD, Intel, or NVIDIA driver if Windows cannot
   load `vulkan-1.dll` or the app reports that no Vulkan device is available.
+- In-game movies are decoded by Windows' own Media Foundation codecs, so nothing extra ships in the
+  archive. H.264 is built into Windows. VP9 movies (for example *Dragon Quest VII Reimagined*'s) need
+  Microsoft's free **VP9 Video Extensions** package, which most Windows 10/11 installs already have;
+  without it the log says `no Media Foundation VP9 decoder is installed` and those movies stay black.
 - An unpacked title directory conventionally named `<TITLE_ID>-app0`, containing `eboot.bin` and the
   title's other files.
 

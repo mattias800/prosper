@@ -37,6 +37,7 @@
 #include <vector>
 
 #include "fixtures/test_scratch.h"
+#include "hle/video/videodec2_guest_abi.hpp"
 #if !defined(_WIN32)
 #include <unistd.h>     // dup/dup2/close — the stderr capture in the banner-count arm
 #endif
@@ -49,25 +50,7 @@ static int fails = 0;
 
 namespace {
 
-// The guest-facing structs, mirrored from the handler's own definitions. static_assert on each size
-// so a silent divergence makes this file fail to compile rather than exercise a different ABI.
-struct VdecConfig {
-    uint64_t size; uint32_t resource, codec, profile, max_level;
-    int32_t max_width, max_height, max_dpb; uint32_t input_depth;
-    uint64_t compute_queue, affinity; int32_t priority;
-    uint8_t optimize, check_memory, reserved0, reserved1; uint64_t extra;
-};
-struct VdecInput { uint64_t size, data, data_size, pts, dts, attached; };
-struct VdecFrame { uint64_t size, data, data_size; uint8_t accepted, pad[7]; };
-struct VdecOutput {
-    uint64_t size; uint8_t valid, error, pictures, discarded;
-    uint32_t codec, width, pitch, height; uint64_t frame, frame_size;
-    uint32_t format, pitch_bytes;
-};
-static_assert(sizeof(VdecConfig) == 72, "test VdecConfig must mirror the HLE layout");
-static_assert(sizeof(VdecInput) == 48, "test VdecInput must mirror the HLE layout");
-static_assert(sizeof(VdecFrame) == 32, "test VdecFrame must mirror the HLE layout");
-static_assert(sizeof(VdecOutput) == 56, "test VdecOutput must mirror the HLE layout");
+using namespace prosper::test::vdec;
 
 // A backend that implements ONLY the access-unit entry points. Every stream method aborts the test
 // if reached: routing Videodec2 through the AvPlayer stream path would be a different bug wearing

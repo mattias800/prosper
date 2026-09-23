@@ -4542,14 +4542,34 @@ endif()
 # media dependency and so software fallback can never be selected merely because no frontend exists.
 if(WIN32 AND TARGET prosper_core)
   add_library(prosper_video_mf STATIC
-              frontends/video_mf/media_foundation_backend.cpp)
+              frontends/video_mf/media_foundation_backend.cpp
+              frontends/video_mf/mf_access_unit_decoder.cpp)
   target_include_directories(prosper_video_mf PUBLIC frontends/video_mf PRIVATE src)
   target_link_libraries(prosper_video_mf PUBLIC prosper_core
                          mfplat mfreadwrite mfuuid ole32 propsys d3d11 dxgi strmiids)
 
   add_executable(test_video_mf frontends/video_mf/test_video_mf.cpp)
   target_link_libraries(test_video_mf PRIVATE prosper_video_mf)
+  # sceVideodec2's access-unit path (#2983) decodes committed elementary streams with no container
+  # around the units: the Annex-B H.264 asset the Linux test uses, a second H.264 stream WITH
+  # B-frames and an SPS crop (so display order and the display aperture are tested), and a VP9 IVF (libvpx, two-pass, with
+  # hidden alt-ref frames packed into superframes). Expected per-frame hashes for all three come
+  # from an independent host `ffmpeg` decode.
+  target_compile_definitions(test_video_mf PRIVATE
+    PROSPER_TEST_H264_AU_ASSET="${CMAKE_CURRENT_SOURCE_DIR}/tests/assets/h264_annexb_testpattern.264"
+    PROSPER_TEST_VP9_AU_ASSET="${CMAKE_CURRENT_SOURCE_DIR}/tests/assets/vp9_testpattern.ivf"
+    PROSPER_TEST_H264_BFRAMES_AU_ASSET="${CMAKE_CURRENT_SOURCE_DIR}/tests/assets/h264_annexb_bframes.264")
   add_test(NAME video_media_foundation COMMAND test_video_mf)
+
+  # The join test_video_mf and test_videodec2_decode each stop short of: the guest's own Videodec2
+  # lifecycle (CreateDecoder with codec 2382845, Decode, DeleteDecoder) on the real Media Foundation
+  # backend, with every guest picture hashed against the ffmpeg reference (#2983).
+  add_executable(test_videodec2_mf frontends/video_mf/test_videodec2_mf.cpp)
+  target_link_libraries(test_videodec2_mf PRIVATE prosper_video_mf)
+  target_include_directories(test_videodec2_mf PRIVATE tests)
+  target_compile_definitions(test_videodec2_mf PRIVATE
+    PROSPER_TEST_VP9_AU_ASSET="${CMAKE_CURRENT_SOURCE_DIR}/tests/assets/vp9_testpattern.ivf")
+  add_test(NAME videodec2_media_foundation COMMAND test_videodec2_mf)
 
   if(TARGET boot_trace)
     target_link_libraries(boot_trace PRIVATE prosper_video_mf)
