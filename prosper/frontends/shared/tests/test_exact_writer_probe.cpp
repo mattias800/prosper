@@ -21,6 +21,27 @@ int main() {
     };
     for (const char* value : invalid)
         if (parse_exact_writer_probe(value).armed) return 2;
+    const auto second = parse_exact_writer_second_input("37:0x30ad4b0000");
+    if (!second.requested || !second.armed || second.binding != 37 ||
+        second.address != 0x30ad4b0000ull ||
+        parse_exact_writer_second_input(nullptr).requested) return 13;
+    const char* bad_second[] = {
+        "", "37", "37:30ad4b0000", "x:0x30ad4b0000", "37:0x0",
+        "37:0x30ad4b0000junk", "4294967296:0x30ad4b0000",
+        "37:0xfffffffffffffffff", "37:0x30ad4b0000:extra",
+    };
+    for (const char* value : bad_second)
+        if (parse_exact_writer_second_input(value).armed) return 14;
+    if (exact_writer_second_input_verdict(false, true, 12, 4) !=
+            ExactWriterSecondInputVerdict::MissingBinding ||
+        exact_writer_second_input_verdict(true, false, 12, 4) !=
+            ExactWriterSecondInputVerdict::MissingImage ||
+        exact_writer_second_input_verdict(true, true, 12, 0) !=
+            ExactWriterSecondInputVerdict::NoVisibleRgb ||
+        exact_writer_second_input_verdict(true, true, 0, 0) !=
+            ExactWriterSecondInputVerdict::NoVisibleRgb ||
+        exact_writer_second_input_verdict(true, true, 12, 4) !=
+            ExactWriterSecondInputVerdict::Ready) return 15;
     if (exact_writer_match(spec.ps, spec.output, 1, 1, true, spec) !=
             ExactWriterMatch::Exact ||
         exact_writer_match(spec.ps + 1, spec.output, 1, 1, true, spec) !=

@@ -1668,13 +1668,31 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
         return spec;
     }();
     static prosper::frontend::ExactWriterProbe g_exact_writer_probe;
+    // The screenshot frontend passes "." as its ordinary frame directory. This opt-in
+    // probe requires its own explicit disk artifact directory and uses that exact value.
+    static const char* const g_exact_writer_artifact_dir =
+        PROSPER_ENV_VALUE("PROSPER_FRAME_DIR");
+    static const auto g_exact_writer_second_spec =
+        prosper::frontend::parse_exact_writer_second_input(
+            PROSPER_ENV_VALUE("PROSPER_EXACT_WRITER_SECOND_INPUT"));
     static const auto g_exact_writer_spec = [] {
         const char* value = PROSPER_ENV_VALUE("PROSPER_EXACT_WRITER_PROBE");
         auto spec = prosper::frontend::parse_exact_writer_probe(value);
-        if (!spec.requested) return spec;
+        if (!spec.requested) {
+            if (g_exact_writer_second_spec.requested)
+                fprintf(stderr, "[exact-writer] second-input refused: main probe not requested\n");
+            return spec;
+        }
         const char* reason = nullptr;
         if (!spec.armed)
             reason = "expected 0xPS:0xINPUT:0xOUTPUT:ms:0..120000";
+        else if (g_exact_writer_second_spec.requested &&
+                 !g_exact_writer_second_spec.armed)
+            reason = "second input expected BINDING:0xADDRESS";
+        else if (g_exact_writer_second_spec.requested &&
+                 (g_exact_writer_second_spec.address == spec.input ||
+                  g_exact_writer_second_spec.address == spec.output))
+            reason = "second input must differ from primary input and output";
         else if (g_compute_present_spec.requested ||
                  PROSPER_ENV_VALUE("PROSPER_KENA_MENU_TRACE") ||
                  PROSPER_ENV_VALUE("PROSPER_DUMP_PERSISTENT"))
@@ -1699,11 +1717,16 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             reason = "normal persistent/batched target path disabled";
         if (reason) spec.armed = false;
         fprintf(stderr, "[exact-writer] %s ps=0x%llx input=0x%llx output=0x%llx "
-                        "after=%llu ms reason=%s (one draw, four candidates, "
+                        "after=%llu ms second=%s binding=%u addr=0x%llx reason=%s "
+                        "(one draw, four candidates, "
                         "160 MiB raw/128 MiB BMP caps)\n",
                 spec.armed ? "armed" : "refused", (unsigned long long)spec.ps,
                 (unsigned long long)spec.input, (unsigned long long)spec.output,
-                (unsigned long long)spec.after_ms, reason ? reason : "none");
+                (unsigned long long)spec.after_ms,
+                g_exact_writer_second_spec.requested ? "required" : "disabled",
+                g_exact_writer_second_spec.binding,
+                (unsigned long long)g_exact_writer_second_spec.address,
+                reason ? reason : "none");
         g_exact_writer_probe.configure(spec);
         return spec;
     }();
@@ -3426,6 +3449,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             bool exact_writer_input_bound = false;
             uint32_t exact_writer_input_binding = UINT32_MAX;
             const char* exact_writer_input_path = "missing";
+            bool exact_writer_second_bound = false;
+            const char* exact_writer_second_path = "missing";
             auto build_R = [&](const prosper::gpu::DrawItem& draw,
                                const prosper::gpu::ShaderResourceTable* vrt,
                                const prosper::gpu::ShaderResourceTable* prt,
@@ -5560,6 +5585,16 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                         sampled_source_addr == g_exact_writer_spec.input;
                                     exact_writer_input_binding = r.binding;
                                     exact_writer_input_path = path;
+                                }
+                                if (exact_writer_live &&
+                                    g_exact_writer_second_spec.requested &&
+                                    exact_writer_draw_index == draw.draw_index &&
+                                    r.binding == g_exact_writer_second_spec.binding &&
+                                    r.gpu_addr == g_exact_writer_second_spec.address) {
+                                    exact_writer_second_bound = has_gpu_live_rtt &&
+                                        sampled_source_addr ==
+                                            g_exact_writer_second_spec.address;
+                                    exact_writer_second_path = path;
                                 }
                                 const uint64_t row = ++g_bind_program_trace.observed_bindings;
                                 if (row <= 8192)
@@ -10658,6 +10693,11 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     bool writer_before_ok = false;
                     size_t writer_input_raw_nonzero = 0;
                     size_t writer_input_rgb_nonblack = 0;
+                    size_t writer_second_raw_nonzero = 0;
+                    size_t writer_second_rgb_nonblack = 0;
+                    bool writer_second_checked = false;
+                    auto writer_second_verdict =
+                        prosper::frontend::ExactWriterSecondInputVerdict::Ready;
                     std::vector<uint8_t> writer_output_before_raw;
                     std::vector<uint8_t> writer_output_after_raw;
                     std::function<bool(uint64_t, const char*, uint32_t, uint32_t,
@@ -10728,6 +10768,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             exact_writer_input_bound = false;
                             exact_writer_input_binding = UINT32_MAX;
                             exact_writer_input_path = "missing";
+                            exact_writer_second_bound = false;
+                            exact_writer_second_path = "missing";
                         }
                     }
                     auto backend_draws = build_bds(
@@ -10735,13 +10777,42 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             (batch_backend_submits ? &backend_submission : nullptr));
                     if (writer_attempt) {
                         bool backend_bound = false;
+                        size_t second_binding_resources = 0;
+                        size_t second_backend_matches = 0;
+                        uint32_t second_w = 0, second_h = 0;
+                        uint32_t second_mips = 0;
+                        float second_min_lod = 0.0f, second_max_lod = 0.0f;
+                        VkFormat second_format = VK_FORMAT_UNDEFINED;
                         if (backend_draws.size() == 1)
-                            for (const auto& resource : backend_draws.front().R)
+                            for (const auto& resource : backend_draws.front().R) {
                                 backend_bound |= resource.set == 1 &&
                                     resource.binding == exact_writer_input_binding &&
                                     resource.persistent_render_target_id ==
                                         g_exact_writer_spec.input;
+                                if (g_exact_writer_second_spec.requested &&
+                                    resource.set == 1 &&
+                                    resource.binding == g_exact_writer_second_spec.binding)
+                                    ++second_binding_resources;
+                                if (g_exact_writer_second_spec.requested &&
+                                    resource.set == 1 &&
+                                    resource.binding == g_exact_writer_second_spec.binding &&
+                                    resource.persistent_render_target_id ==
+                                        g_exact_writer_second_spec.address) {
+                                    ++second_backend_matches;
+                                    second_w = resource.tw;
+                                    second_h = resource.th;
+                                    second_mips = resource.declared_mip_levels;
+                                    second_min_lod = resource.min_lod;
+                                    second_max_lod = resource.max_lod;
+                                    second_format = resource.texture_format;
+                                }
+                            }
                         exact_writer_input_bound &= backend_bound;
+                        if (g_exact_writer_second_spec.requested)
+                            exact_writer_second_bound &= second_binding_resources == 1 &&
+                                second_backend_matches == 1 &&
+                                second_w && second_h &&
+                                second_format != VK_FORMAT_UNDEFINED;
                         fprintf(stderr, "[exact-writer] attempt=%u binding draw=%llu "
                                         "set=1 binding=%u addr=0x%llx path=%s "
                                         "gpu-retained=%d backend-resource=%d "
@@ -10753,6 +10824,23 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 exact_writer_input_path, exact_writer_input_bound ? 1 : 0,
                                 backend_bound ? 1 : 0,
                                 backend_draws.size());
+                        if (g_exact_writer_second_spec.requested)
+                            fprintf(stderr, "[exact-writer] attempt=%u second-binding "
+                                            "draw=%llu set=1 binding=%u addr=0x%llx "
+                                            "path=%s gpu-retained=%d backend-binding=%zu "
+                                            "backend-exact=%zu "
+                                            "extent=%ux%u fmt=%u mips=%u lod=%g..%g "
+                                            "readback=base-level-only\n",
+                                    writer_attempt,
+                                    (unsigned long long)exact_writer_draw_index,
+                                    g_exact_writer_second_spec.binding,
+                                    (unsigned long long)g_exact_writer_second_spec.address,
+                                    exact_writer_second_path,
+                                    exact_writer_second_bound ? 1 : 0,
+                                    second_binding_resources, second_backend_matches,
+                                    second_w, second_h,
+                                    (unsigned)second_format, second_mips,
+                                    (double)second_min_lod, (double)second_max_lod);
                         // Raw files preserve exact target bytes. BMPs are inspection views and
                         // can quantize HDR values, so neither one substitutes for the other.
                         writer_snapshot = [&](uint64_t addr, const char* label,
@@ -10814,10 +10902,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             }
                             char raw_path[512], bmp_path[512];
                             const int raw_len = std::snprintf(raw_path, sizeof raw_path,
-                                "%s/exact_writer_a%u_%s_%llx.bin", frame_dir.c_str(),
+                                "%s/exact_writer_a%u_%s_%llx.bin",
+                                g_exact_writer_artifact_dir,
                                 writer_attempt, label, (unsigned long long)addr);
                             const int bmp_len = std::snprintf(bmp_path, sizeof bmp_path,
-                                "%s/exact_writer_a%u_%s_%llx.bmp", frame_dir.c_str(),
+                                "%s/exact_writer_a%u_%s_%llx.bmp",
+                                g_exact_writer_artifact_dir,
                                 writer_attempt, label, (unsigned long long)addr);
                             if (raw_len <= 0 || (size_t)raw_len >= sizeof raw_path ||
                                 bmp_len <= 0 || (size_t)bmp_len >= sizeof bmp_path) {
@@ -10861,18 +10951,54 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             fprintf(stderr, "[exact-writer] attempt=%u verdict=void "
                                             "reason=missing-gpu-binding-or-backend-draw\n",
                                     writer_attempt);
+                        } else if (g_exact_writer_second_spec.requested &&
+                                   !exact_writer_second_bound) {
+                            writer_second_checked = true;
+                            writer_second_verdict =
+                                prosper::frontend::ExactWriterSecondInputVerdict::MissingBinding;
+                            fprintf(stderr, "[exact-writer] attempt=%u verdict=void "
+                                            "reason=%s\n", writer_attempt,
+                                    prosper::frontend::exact_writer_second_input_verdict_name(
+                                        writer_second_verdict));
                         } else if (writer_snapshot(g_exact_writer_spec.input, "input", 0, 0,
                                             VK_FORMAT_UNDEFINED, writer_input_raw_nonzero,
                                             writer_input_rgb_nonblack, nullptr) &&
                                    prosper::frontend::exact_writer_scene_input_visible(
                                        writer_input_raw_nonzero,
                                        writer_input_rgb_nonblack)) {
-                            size_t output_before_nonzero = 0;
-                            size_t output_before_rgb = 0;
-                            writer_before_ok = writer_snapshot(g_exact_writer_spec.output,
-                                "output-before", gw, gh, pass_format,
-                                output_before_nonzero, output_before_rgb,
-                                &writer_output_before_raw);
+                            if (g_exact_writer_second_spec.requested) {
+                                const bool second_readback_ok = writer_snapshot(
+                                    g_exact_writer_second_spec.address, "second-input",
+                                    second_w, second_h, second_format,
+                                    writer_second_raw_nonzero,
+                                    writer_second_rgb_nonblack, nullptr);
+                                writer_second_checked = true;
+                                writer_second_verdict =
+                                    prosper::frontend::exact_writer_second_input_verdict(
+                                        exact_writer_second_bound, second_readback_ok,
+                                        writer_second_raw_nonzero,
+                                        writer_second_rgb_nonblack);
+                                if (writer_second_verdict !=
+                                    prosper::frontend::ExactWriterSecondInputVerdict::Ready)
+                                    fprintf(stderr, "[exact-writer] attempt=%u verdict=void "
+                                                    "reason=second-input-%s raw-nonzero=%zu "
+                                                    "rgb-nonblack=%zu\n", writer_attempt,
+                                            prosper::frontend::
+                                                exact_writer_second_input_verdict_name(
+                                                    writer_second_verdict),
+                                            writer_second_raw_nonzero,
+                                            writer_second_rgb_nonblack);
+                            }
+                            if (!g_exact_writer_second_spec.requested ||
+                                writer_second_verdict ==
+                                    prosper::frontend::ExactWriterSecondInputVerdict::Ready) {
+                                size_t output_before_nonzero = 0;
+                                size_t output_before_rgb = 0;
+                                writer_before_ok = writer_snapshot(g_exact_writer_spec.output,
+                                    "output-before", gw, gh, pass_format,
+                                    output_before_nonzero, output_before_rgb,
+                                    &writer_output_before_raw);
+                            }
                         } else {
                             fprintf(stderr, "[exact-writer] attempt=%u verdict=void "
                                             "reason=input-missing-or-no-visible-RGB "
@@ -10935,6 +11061,29 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     const prosper::test::BackendColorTargetStats color_target_call =
                         prosper::test::backend_color_target_stats();
                     if (writer_attempt) {
+                        const auto& state = render_pass.front()->ps;
+                        const char* color0_load =
+                            color_target_call.color0_load_op == VK_ATTACHMENT_LOAD_OP_LOAD
+                                ? "load" :
+                            color_target_call.color0_load_op == VK_ATTACHMENT_LOAD_OP_CLEAR
+                                ? "clear" : "unknown";
+                        fprintf(stderr, "[exact-writer] attempt=%u attachment "
+                                        "color0-load=%s load-enum=%u seed-rtt=%d "
+                                        "gpu-seed=%d cpu-seed=%d uniform-clear=%d "
+                                        "write-mask=0x%x blend=%d src-color=%u dst-color=%u "
+                                        "color-op=%u src-alpha=%u dst-alpha=%u alpha-op=%u "
+                                        "logic-op=%d/%u cb-color-control=0x%x\n",
+                                writer_attempt, color0_load,
+                                color_target_call.color0_load_op,
+                                seed_rtt0 ? 1 : 0, gpu_seed_available ? 1 : 0,
+                                seed ? 1 : 0, retained_uniform_clear ? 1 : 0,
+                                state.color_write_mask, state.blend_enable ? 1 : 0,
+                                state.src_color_blend_factor,
+                                state.dst_color_blend_factor, state.color_blend_op,
+                                state.src_alpha_blend_factor,
+                                state.dst_alpha_blend_factor, state.alpha_blend_op,
+                                state.logic_op_enable ? 1 : 0, state.logic_op,
+                                state.cb_color_control);
                         const bool submitted = writer_completion.command_buffers == 1 &&
                             writer_completion.submit_result == VK_SUCCESS &&
                             writer_completion.wait_result == VK_SUCCESS &&
@@ -10966,6 +11115,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                         "backend-draws=%zu target-admitted=%llu "
                                         "submit=%d wait=%d command-buffers=%llu "
                                         "input-raw-nonzero=%zu input-rgb-nonblack=%zu "
+                                        "second=%s second-raw-nonzero=%zu "
+                                        "second-rgb-nonblack=%zu "
                                         "output-after-raw-nonzero=%zu output-after-rgb-nonblack=%zu "
                                         "output-change=%s capture=%s "
                                         "pipeline-and-draw-stats=check-bracketed-rows\n",
@@ -10977,6 +11128,11 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 (int)writer_completion.wait_result,
                                 (unsigned long long)writer_completion.command_buffers,
                                 writer_input_raw_nonzero, writer_input_rgb_nonblack,
+                                !g_exact_writer_second_spec.requested ? "disabled" :
+                                    !writer_second_checked ? "not-checked" :
+                                    prosper::frontend::exact_writer_second_input_verdict_name(
+                                        writer_second_verdict),
+                                writer_second_raw_nonzero, writer_second_rgb_nonblack,
                                 output_after_nonzero, output_after_rgb,
                                 output_change == prosper::frontend::ExactWriterOutputChange::Changed
                                     ? "changed" :
@@ -12502,7 +12658,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 if (cpu_pairable && bmp_bytes &&
                     g_exact_writer_probe.charge_bmp(*bmp_bytes)) {
                     const int length = std::snprintf(path, sizeof path,
-                        "%s/exact_writer_a%llu_final.bmp", frame_dir.c_str(),
+                        "%s/exact_writer_a%llu_final.bmp",
+                        g_exact_writer_artifact_dir,
                         (unsigned long long)attempt);
                     written = length > 0 && (size_t)length < sizeof path &&
                         prosper::test::dump_bmp(path, *selected_pixels, w, h);
