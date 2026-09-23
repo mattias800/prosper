@@ -491,8 +491,8 @@ int main() {
 
         // The order preflight belongs to the whole logical batch, ahead of depth-feedback
         // splitting. Put a malformed draw after a forced split and seed the timing stats with a
-        // value no real pass produces: segment-local validation would render the first segment and
-        // replace it, while whole-batch rejection leaves it untouched.
+        // value no real pass produces: segment-local validation would render the first segment,
+        // while whole-batch rejection clears the stale result without entering a Vulkan pass.
         constexpr uint64_t kPreflightDepth = 0x7f31000000ull;
         ResolvedPipelineState preflight_writer = opaque;
         preflight_writer.depth_test_enable = true;
@@ -525,7 +525,7 @@ int main() {
         CHECK(prosper::test::render_draws_rgba(
                   malformed_split, W, H, nullptr, nullptr,
                   /*persist_depth_stencil=*/true).empty() &&
-                  prosper::test::backend_render_timing_stats().calls == 123,
+                  prosper::test::backend_render_timing_stats().calls == 0,
               "a malformed later segment rejects the whole batch before the first Vulkan pass");
 
         const auto pool_before_capacity = prosper::test::render_host_buffer_pool_stats();

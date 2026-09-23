@@ -178,6 +178,18 @@ int main() {
         record.frontend_tex_other_compute_candidate = true;
         record.resolve_read_count = 3 + i;
         record.setup_resources_ms = 10 + i;
+        record.res_texture_ms = 8 + i;
+        record.res_texture_upload_ms = 1.25 + i;
+        record.res_texture_bind_ms = 2.5 + i;
+        record.backend_texture_refs = 4'294'967'296ull + 2000 + i;
+        record.backend_texture_uploads = 4'294'967'296ull + 2100 + i;
+        record.backend_texture_upload_bytes = 4'294'967'296ull + 2200 + i;
+        record.backend_texture_persistent_hits = 4'294'967'296ull + 2300 + i;
+        record.backend_texture_persistent_misses = 4'294'967'296ull + 2400 + i;
+        record.backend_texture_binding_refs = 4'294'967'296ull + 2500 + i;
+        record.backend_texture_binding_unique = 4'294'967'296ull + 2600 + i;
+        record.backend_texture_binding_persistent_hits = 4'294'967'296ull + 2700 + i;
+        record.backend_texture_binding_persistent_misses = 4'294'967'296ull + 2800 + i;
         // Distinct counters above 32 bits catch omitted/swapped/narrowed serialization without
         // pretending this CPU recorder test establishes actual backend copy or cache decisions.
         record.buffer_upload_bytes = 4'294'967'296ull + 0 + i;
@@ -306,6 +318,30 @@ int main() {
                        "compact buffer carriers preserve distinct 64-bit values and the renderer cap");
     check_counter_pair("frontend_buffer_full_resources", 4'294'969'196ULL,
                        "full buffer carriers preserve distinct 64-bit values and the renderer cap");
+    check(count_text(text, "\"res_texture_upload_ms\":") == 2 &&
+              text.find("\"res_texture_upload_ms\":1.25,") != std::string::npos &&
+              text.find("\"res_texture_upload_ms\":2.25,") != std::string::npos &&
+              text.find("\"res_texture_bind_ms\":2.5,") != std::string::npos &&
+              text.find("\"res_texture_bind_ms\":3.5,") != std::string::npos,
+          "texture upload/bind leaves serialize separately under the renderer cap");
+    check_counter_pair("backend_texture_refs", 4'294'969'296ULL,
+                       "backend texture references retain 64-bit values");
+    check_counter_pair("backend_texture_uploads", 4'294'969'396ULL,
+                       "backend unique uploads retain 64-bit values");
+    check_counter_pair("backend_texture_upload_bytes", 4'294'969'496ULL,
+                       "backend logical upload extents retain 64-bit values");
+    check_counter_pair("backend_texture_persistent_hits", 4'294'969'596ULL,
+                       "backend persistent image hits retain 64-bit values");
+    check_counter_pair("backend_texture_persistent_misses", 4'294'969'696ULL,
+                       "backend persistent image misses retain 64-bit values");
+    check_counter_pair("backend_texture_binding_refs", 4'294'969'796ULL,
+                       "backend binding references retain 64-bit values");
+    check_counter_pair("backend_texture_binding_unique", 4'294'969'896ULL,
+                       "backend unique bindings retain 64-bit values");
+    check_counter_pair("backend_texture_binding_persistent_hits", 4'294'969'996ULL,
+                       "backend persistent binding hits retain 64-bit values");
+    check_counter_pair("backend_texture_binding_persistent_misses", 4'294'970'096ULL,
+                       "backend persistent binding misses retain 64-bit values");
     check(count_text(text, "\"buffer_resident_hits\":") == 2 &&
               text.find("\"buffer_resident_hits\":4294967396,") != std::string::npos &&
               text.find("\"buffer_resident_hits\":4294967397,") != std::string::npos &&
