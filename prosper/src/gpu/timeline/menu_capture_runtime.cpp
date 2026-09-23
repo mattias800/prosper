@@ -418,7 +418,18 @@ public:
     MenuDrawCapture() : policy_({}, now_ms()) {
         const char* destination = std::getenv("PROSPER_MENU_DRAW_CAPTURE");
         if (!destination || !*destination) return;
+        const char* full_submit = std::getenv("PROSPER_MENU_FULL_SUBMIT_CAPTURE");
+        if (full_submit && std::strcmp(full_submit, "1") != 0) {
+            std::fprintf(stderr, "[menu-capture] refused: invalid full-submit opt-in\n");
+            return;
+        }
+        full_submit_ = full_submit != nullptr;
+        if (full_submit_)
+            policy_ = MenuCapturePolicy({.max_candidates = 1,
+                                         .max_total_candidate_bytes = 2ull << 30,
+                                         .max_after_menu_ms = 90000}, now_ms());
         path_ = destination;
+        candidate_path_ = path_ + ".unverified";
         uint32_t target_width = 0, target_height = 0;
         const char* target_text = std::getenv("PROSPER_MENU_DRAW_TARGET_ADDRESS");
         const bool auto_target = target_text && std::strcmp(target_text, "auto") == 0;
@@ -428,7 +439,8 @@ public:
             (!auto_target && !parse_positive_address(target_text, target_)) ||
             !parse_extent(std::getenv("PROSPER_MENU_DRAW_TARGET_DIM"),
                           target_width, target_height) ||
-            std::filesystem::exists(path_, fs_error) || fs_error) {
+            std::filesystem::exists(path_, fs_error) || fs_error ||
+            (full_submit_ && std::filesystem::exists(candidate_path_, fs_error)) || fs_error) {
             std::fprintf(stderr, "[menu-capture] refused: invalid gate, draw identity, or occupied path\n");
             return;
         }
@@ -436,10 +448,12 @@ public:
         target_height_ = target_height;
         configured_target_ = target_;
         active_ = true;
-        std::fprintf(stderr, "[menu-capture] armed path=%s ps=0x%llx target=%s0x%llx %ux%u\n",
+        std::fprintf(stderr, "[menu-capture] armed path=%s ps=0x%llx target=%s0x%llx %ux%u "
+                             "mode=%s\n",
                      path_.c_str(), static_cast<unsigned long long>(ps_),
                      auto_target ? "same-run-auto/" : "expected/",
-                     static_cast<unsigned long long>(target_), target_width_, target_height_);
+                     static_cast<unsigned long long>(target_), target_width_, target_height_,
+                     full_submit_ ? "full-submit" : "selected-draw");
         watchdog_ = std::jthread([this](std::stop_token stop) {
             while (!stop.stop_requested()) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -543,15 +557,17 @@ public:
             return;
         }
         std::string error;
-        if (prior_writer_to_selected(state, draws, selected, submit_no, error)) {
+        if (!full_submit_ && prior_writer_to_selected(state, draws, selected, submit_no, error)) {
             decline(MenuCaptureRefusal::SameSubmitDependency, error);
             return;
         }
         const uint64_t remaining = policy_.remaining_bytes();
-        const uint64_t resource_limit = std::min(kPerCandidateResourceLimit, remaining);
+        const uint64_t resource_limit = full_submit_
+            ? remaining : std::min(kPerCandidateResourceLimit, remaining);
         uint64_t planned_bytes = 0;
         if (!resource_limit ||
-            !preflight_gpu_capture_draw_resources(selected, resource_limit, planned_bytes, error)) {
+            (!full_submit_ && !preflight_gpu_capture_draw_resources(
+                selected, resource_limit, planned_bytes, error))) {
             decline(MenuCaptureRefusal::ByteBudget, error);
             return;
         }
@@ -564,8 +580,12 @@ public:
         annotate_gpu_capture_save_roots(metadata);
         annotate_gpu_capture_scanout(metadata);
         GpuCaptureFile capture;
-        if (!capture_gpustate_selected_draw(state, selected, metadata,
-                                            resource_limit, capture, error)) {
+        const bool captured = full_submit_
+            ? capture_gpustate_submit(state, submit_no, gate_.width, gate_.height,
+                                      metadata, capture, error, resource_limit)
+            : capture_gpustate_selected_draw(state, selected, metadata,
+                                             resource_limit, capture, error);
+        if (!captured) {
             decline(MenuCaptureRefusal::CaptureFailed, error);
             return;
         }
@@ -577,13 +597,34 @@ public:
             return;
         }
         candidate_ = std::move(capture);
-        std::fprintf(stderr,
-                     "[menu-capture] candidate submit=%llu draw=%zu resources=%llu seeds+blobs=%llu "
-                     "attempt=%u\n",
-                     static_cast<unsigned long long>(submit_no), matches.front(),
-                     static_cast<unsigned long long>(planned_bytes),
-                     static_cast<unsigned long long>(captured_bytes),
-                     policy_.attempted_candidates());
+        // A full submit may never receive a matching menu-positive publication. Preserve its
+        // ordered diagnostic data under an explicitly unverified name, while keeping the normal
+        // path's publication gate authoritative for the accepted filename.
+        if (full_submit_ && !write_gpu_capture(candidate_path_, *candidate_, error)) {
+            decline(MenuCaptureRefusal::WriteFailed, error);
+            candidate_.reset();
+            return;
+        }
+        if (full_submit_) {
+            std::fprintf(stderr,
+                         "[menu-capture] candidate submit=%llu draw=%zu mode=full-submit "
+                         "seeds+blobs=%llu attempt=%u\n",
+                         static_cast<unsigned long long>(submit_no), matches.front(),
+                         static_cast<unsigned long long>(captured_bytes),
+                         policy_.attempted_candidates());
+        } else {
+            std::fprintf(stderr,
+                         "[menu-capture] candidate submit=%llu draw=%zu mode=selected-draw "
+                         "resources=%llu seeds+blobs=%llu attempt=%u\n",
+                         static_cast<unsigned long long>(submit_no), matches.front(),
+                         static_cast<unsigned long long>(planned_bytes),
+                         static_cast<unsigned long long>(captured_bytes),
+                         policy_.attempted_candidates());
+        }
+        if (full_submit_)
+            std::fprintf(stderr,
+                         "[menu-capture] unverified ordered candidate written: %s "
+                         "(publication/parity not established)\n", candidate_path_.c_str());
     }
 
     void on_publication(const GpuState& state,
@@ -680,7 +721,18 @@ public:
         }
         if (exact_candidate && menu) {
             std::string error;
-            if (!candidate_ || !write_gpu_capture(path_, *candidate_, error)) {
+            bool written = false;
+            if (candidate_) {
+                if (full_submit_) {
+                    std::error_code rename_error;
+                    std::filesystem::rename(candidate_path_, path_, rename_error);
+                    if (rename_error) error = rename_error.message();
+                    else written = true;
+                } else {
+                    written = write_gpu_capture(path_, *candidate_, error);
+                }
+            }
+            if (!written) {
                 decline(MenuCaptureRefusal::WriteFailed, error);
                 candidate_.reset();
                 return;
@@ -709,6 +761,8 @@ public:
     }
 
 private:
+    bool full_submit_ = false;
+    std::string candidate_path_;
     MenuTargetChoice report_menu_source_writers(
         const GpuState& state, std::span<const MenuRealizedDrawIdentity> realized_draws,
         uint64_t execution_submit, uint64_t source_submit) {

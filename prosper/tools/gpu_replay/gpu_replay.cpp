@@ -72,7 +72,9 @@ void usage(const char* argv0) {
                          "[--list-resources DRAW:vs|ps] [--dump-resource DRAW:vs|ps:BINDING PATH] [--allow-mismatch] "
                          "[--override-resource DRAW:vs|ps:BINDING PATH] [--override-submit N] "
                          "[--dump-rtt-seed ADDR PATH] "
+                         "[--override-rtt-seed ADDR RAW-PATH] "
                          "[--dump-shader DRAW:vs|fs PATH] [--dump-compute N PATH] "
+                         "[--override-fragment-spv DRAW PATH] "
                          "[--dump-compute-raw N PATH] "
                          "[--dump-shader-raw DRAW:vs|vs-main|fs PATH] "
                          "[--override-compute-spv N PATH] "
@@ -2168,6 +2170,9 @@ int main(int argc, char** argv) {
     std::string compute_shader_spec, compute_shader_path;
     std::string compute_raw_spec, compute_raw_path;
     std::string compute_override_spec, compute_override_path;
+    uint64_t fragment_override_draw = 0;
+    bool fragment_override_requested = false;
+    std::string fragment_override_path;
     bool resource_override_requested = false;
     uint64_t resource_override_submit_no = 0;   // 0 = first matching submit (legacy behaviour)
     prosper::tools::ResourceOverrideSelector resource_override_selector;
@@ -2190,6 +2195,8 @@ int main(int argc, char** argv) {
     uint64_t bundle_extract_submit_no = 0;
     uint64_t bundle_find_ds_addr = 0;
     uint64_t rtt_seed_addr = 0;
+    uint64_t rtt_seed_override_addr = 0;
+    std::string rtt_seed_override_path;
     std::vector<const char*> positional;
     for (int i = 1; i < argc; ++i) {
         if (std::string(argv[i]) == "--inspect") inspect = true;
@@ -2352,6 +2359,22 @@ int main(int argc, char** argv) {
             if (!end || *end || !rtt_seed_addr) { usage(argv[0]); return 2; }
             rtt_seed_path = argv[++i];
         }
+        else if (std::string(argv[i]) == "--override-rtt-seed" && i + 2 < argc) {
+            if (rtt_seed_override_addr ||
+                !prosper::gpu::parse_diagnostic_uint64(argv[++i], rtt_seed_override_addr) ||
+                !rtt_seed_override_addr) {
+                usage(argv[0]); return 2;
+            }
+            rtt_seed_override_path = argv[++i];
+        }
+        else if (std::string(argv[i]) == "--override-fragment-spv" && i + 2 < argc) {
+            if (fragment_override_requested ||
+                !prosper::gpu::parse_diagnostic_draw_id(argv[++i], fragment_override_draw)) {
+                usage(argv[0]); return 2;
+            }
+            fragment_override_path = argv[++i];
+            fragment_override_requested = true;
+        }
         else if (std::string(argv[i]) == "--dump-shader" && i + 2 < argc) {
             shader_spec = argv[++i]; shader_path = argv[++i];
         }
@@ -2499,6 +2522,7 @@ int main(int argc, char** argv) {
             draw_selected || draw_with_compute_prefix || through_operation >= 0 ||
             compute_only >= 0 ||
             warmup_repeats || !dump_spec.empty() || rtt_seed_addr ||
+            rtt_seed_override_addr || fragment_override_requested ||
             !shader_spec.empty() || !compute_shader_spec.empty() ||
             !compute_raw_spec.empty() ||
             !realized_shader_spec.empty() ||
@@ -2552,6 +2576,14 @@ int main(int argc, char** argv) {
         usage(argv[0]); return 2;
     }
     if (positional.empty() || positional.size() > 2) { usage(argv[0]); return 2; }
+    if (rtt_seed_override_addr && !prepend_path.empty()) {
+        std::fprintf(stderr, "gpu_replay: --override-rtt-seed cannot combine with --prepend\n");
+        return 2;
+    }
+    if (fragment_override_requested && !prepend_path.empty()) {
+        std::fprintf(stderr, "gpu_replay: --override-fragment-spv cannot combine with --prepend\n");
+        return 2;
+    }
     if ((draw_selected && through_operation >= 0) ||
         (output_target_after_operation != SIZE_MAX &&
          (draw_selected || through_operation >= 0 || compute_only >= 0 ||
@@ -2599,6 +2631,63 @@ int main(int argc, char** argv) {
     prosper::gpu::GpuReplayFrame replay;
     if (!prosper::gpu::materialize_gpu_replay(capture, replay, error)) {
         std::fprintf(stderr, "gpu_replay: cannot materialize: %s\n", error.c_str()); return 2;
+    }
+    if (rtt_seed_override_addr) {
+        uint64_t original_hash = 0, replacement_hash = 0;
+        if (!prosper::tools::apply_rtt_seed_override_file(
+                replay, rtt_seed_override_addr, rtt_seed_override_path,
+                original_hash, replacement_hash, error)) {
+            std::fprintf(stderr, "gpu_replay: cannot override RTT seed: %s\n", error.c_str());
+            return 2;
+        }
+        allow_mismatch = true;
+        std::fprintf(stderr,
+                     "[rtt-seed-override] addr=0x%llx original-hash=%016llx "
+                     "new-hash=%016llx (replay-only; captured oracle unchanged)\n",
+                     static_cast<unsigned long long>(rtt_seed_override_addr),
+                     static_cast<unsigned long long>(original_hash),
+                     static_cast<unsigned long long>(replacement_hash));
+    }
+    if (fragment_override_requested) {
+        const auto index = prosper::tools::replay_item_index_for_draw(
+            replay, prosper::tools::DrawIndex{fragment_override_draw});
+        if (index == prosper::tools::kNoItemIndex) {
+            std::fprintf(stderr, "gpu_replay: fragment override draw is not realized\n");
+            return 2;
+        }
+        std::ifstream file(fragment_override_path, std::ios::binary | std::ios::ate);
+        const std::streampos end = file ? file.tellg() : std::streampos(-1);
+        if (end < 4 || end > (16 << 20) || static_cast<uint64_t>(end) % 4) {
+            std::fprintf(stderr, "gpu_replay: fragment override must be 4-byte-aligned SPIR-V <=16 MiB\n");
+            return 2;
+        }
+        std::vector<uint32_t> words(static_cast<size_t>(end) / 4);
+        file.seekg(0, std::ios::beg);
+        if (!file.read(reinterpret_cast<char*>(words.data()),
+                       static_cast<std::streamsize>(end)) || words[0] != 0x07230203u) {
+            std::fprintf(stderr, "gpu_replay: cannot read fragment override SPIR-V\n");
+            return 2;
+        }
+        auto& draw = replay.items[prosper::tools::raw(index)];
+        const auto interface = prosper::gpu::validate_spirv_descriptor_interface(
+            words, draw.prt.get(), 1, prosper::gpu::SpirvShaderStage::Fragment, true);
+        if (!interface.ok()) {
+            std::fprintf(stderr, "gpu_replay: fragment override descriptor interface rejected\n");
+            return 2;
+        }
+        const uint64_t original_hash = prosper::gpu::gpu_capture_hash(
+            reinterpret_cast<const uint8_t*>(draw.fs_words().data()),
+            draw.fs_words().size() * sizeof(uint32_t));
+        const uint64_t replacement_hash = prosper::gpu::gpu_capture_hash(
+            reinterpret_cast<const uint8_t*>(words.data()), words.size() * sizeof(uint32_t));
+        draw.set_fs(std::move(words));
+        allow_mismatch = true;
+        std::fprintf(stderr,
+                     "[fragment-override] draw=%llu original-hash=%016llx "
+                     "new-hash=%016llx (replay-only; captured oracle unchanged)\n",
+                     static_cast<unsigned long long>(fragment_override_draw),
+                     static_cast<unsigned long long>(original_hash),
+                     static_cast<unsigned long long>(replacement_hash));
     }
     prosper::tools::AppliedResourceOverride applied_resource_override;
     if (resource_override_requested) {
