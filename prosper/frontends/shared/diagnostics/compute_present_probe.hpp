@@ -20,36 +20,78 @@ inline uint64_t compute_probe_now_ms() {
 }
 
 struct ComputePresentProbeSpec {
+    enum class ParseFailure : uint8_t {
+        None, Prefix, Marker, Separators, Code, Deadline, Stride, Bounds
+    };
     bool requested = false;
     bool armed = false;
     uint64_t code = 0;
     uint64_t after_ms = 0;
     uint32_t stride = 0;
+    ParseFailure parse_failure = ParseFailure::None;
 };
 
+inline const char* compute_probe_parse_failure_name(ComputePresentProbeSpec::ParseFailure failure) {
+    using Failure = ComputePresentProbeSpec::ParseFailure;
+    switch (failure) {
+        case Failure::None: return "none";
+        case Failure::Prefix: return "prefix";
+        case Failure::Marker: return "marker";
+        case Failure::Separators: return "separators";
+        case Failure::Code: return "code";
+        case Failure::Deadline: return "deadline";
+        case Failure::Stride: return "stride";
+        case Failure::Bounds: return "bounds";
+    }
+    return "unknown";
+}
+
 // 0xCODE:ms:DEADLINE:STRIDE; all numeric fields must be exact and bounded.
+#if defined(__GNUC__) || defined(__clang__)
+[[gnu::noinline]]
+#endif
 inline ComputePresentProbeSpec parse_compute_present_probe(const char* value) {
     ComputePresentProbeSpec out;
     if (!value) return out;
     out.requested = true;
     const std::string_view s(value);
-    if (!s.starts_with("0x")) return out;
-    const auto code_end = s.find(':');
-    if (code_end == std::string_view::npos || !s.substr(code_end).starts_with(":ms:"))
+    if (!s.starts_with("0x")) {
+        out.parse_failure = ComputePresentProbeSpec::ParseFailure::Prefix;
         return out;
+    }
+    const auto code_end = s.find(':');
+    if (code_end == std::string_view::npos || !s.substr(code_end).starts_with(":ms:")) {
+        out.parse_failure = ComputePresentProbeSpec::ParseFailure::Marker;
+        return out;
+    }
     const auto deadline_end = s.find(':', code_end + 4);
     if (deadline_end == std::string_view::npos ||
-        s.find(':', deadline_end + 1) != std::string_view::npos) return out;
+        s.find(':', deadline_end + 1) != std::string_view::npos) {
+        out.parse_failure = ComputePresentProbeSpec::ParseFailure::Separators;
+        return out;
+    }
     const auto parse = [](std::string_view part, int base, uint64_t& result) {
         if (part.empty() || part.front() == '+' || part.front() == '-') return false;
         const auto [end, error] = std::from_chars(part.data(), part.data() + part.size(), result, base);
         return error == std::errc{} && end == part.data() + part.size();
     };
     uint64_t stride = 0;
-    if (!parse(s.substr(2, code_end - 2), 16, out.code) || !out.code ||
-        !parse(s.substr(code_end + 4, deadline_end - code_end - 4), 10, out.after_ms) ||
-        !parse(s.substr(deadline_end + 1), 10, stride) ||
-        out.after_ms > 120'000 || !stride || stride > 64) return out;
+    if (!parse(s.substr(2, code_end - 2), 16, out.code) || !out.code) {
+        out.parse_failure = ComputePresentProbeSpec::ParseFailure::Code;
+        return out;
+    }
+    if (!parse(s.substr(code_end + 4, deadline_end - code_end - 4), 10, out.after_ms)) {
+        out.parse_failure = ComputePresentProbeSpec::ParseFailure::Deadline;
+        return out;
+    }
+    if (!parse(s.substr(deadline_end + 1), 10, stride)) {
+        out.parse_failure = ComputePresentProbeSpec::ParseFailure::Stride;
+        return out;
+    }
+    if (out.after_ms > 120'000 || !stride || stride > 64) {
+        out.parse_failure = ComputePresentProbeSpec::ParseFailure::Bounds;
+        return out;
+    }
     out.stride = static_cast<uint32_t>(stride);
     out.armed = true;
     return out;

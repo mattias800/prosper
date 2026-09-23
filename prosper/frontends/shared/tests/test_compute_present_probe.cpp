@@ -1,16 +1,36 @@
 #include "shared/diagnostics/compute_present_probe.hpp"
+#include "diagnostics/env_cache.hpp"
 
 #include <cstdio>
 #include <atomic>
+#include <cstdlib>
+#include <cstring>
 #include <thread>
 #include <vector>
 
-int main() {
+int main(int argc, char** argv) {
     using namespace prosper::frontend;
     int failures = 0;
     const auto check = [&](bool ok, const char* why) {
         if (!ok) { std::fprintf(stderr, "FAIL: %s\n", why); ++failures; }
     };
+    if (argc == 2 && std::strcmp(argv[1], "--launch-env") == 0) {
+        const char* direct = std::getenv("PROSPER_COMPUTE_PRESENT_PROBE");
+        const char* cached = PROSPER_ENV_VALUE("PROSPER_COMPUTE_PRESENT_PROBE");
+        if (direct)
+            std::fprintf(stderr, "launch-env selector=\"%.64s\" length=%zu\n",
+                         direct, std::strlen(direct));
+        check(direct && cached && std::strcmp(direct, cached) == 0,
+              "cached frontend environment read matches inherited process value");
+        if (cached) {
+            const auto inherited = parse_compute_present_probe(cached);
+            check(inherited.armed && inherited.code == 0x300b220000 &&
+                  inherited.after_ms == 30000 && inherited.stride == 16,
+                  "inherited launch selector parses through cached frontend read");
+        }
+        return failures ? 1 : 0;
+    }
+    check(argc == 1, "unexpected test argument");
     check(!parse_compute_present_probe(nullptr).requested, "unset stays off");
     const auto spec = parse_compute_present_probe("0x300b220000:ms:30000:16");
     check(spec.armed && spec.code == 0x300b220000 && spec.after_ms == 30000 &&

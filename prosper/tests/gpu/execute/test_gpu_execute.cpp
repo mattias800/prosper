@@ -11,6 +11,7 @@
 #include "host/memory/guest_write_watch.hpp"
 #include "fixtures/render_runner.h"
 #include "fixtures/test_scratch.h"
+#include "shared/diagnostics/exact_writer_probe.hpp"
 
 // #2287 uses these to capture the validator's own stderr output; MSVC/MinGW spell the POSIX names
 // with a leading underscore.
@@ -37,6 +38,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -691,6 +693,44 @@ int main() {
               !cpu_result.frame.diagnostic_served_retained &&
               cpu_result.frame.bytes() == std::vector<uint8_t>(4, 0x31),
               "nonempty traced final span owns its CPU frame without a GPU publication");
+
+        // The real ordered executor calls both render spans synchronously on this thread.
+        // A writer bracket in the first span must remain PendingFinal through the intervening
+        // compute dispatch, then attach only the final span's CPU frame to its publish sequence.
+        prosper::frontend::ExactWriterProbe writer_probe;
+        writer_probe.configure(prosper::frontend::parse_exact_writer_probe(
+            "0x10:0x20:0x30:ms:0"));
+        uint32_t pending_attempt = 0;
+        std::thread::id writer_first_thread;
+        bool writer_final_same_thread = false;
+        const auto writer_result = execute_ordered_items(
+            operations, {first, second}, {split},
+            [&](const std::vector<DrawItem>&, uint32_t, uint32_t) {
+                RenderedFrame frame(std::vector<uint8_t>(4, 0x42));
+                const auto phase = live_render_phase();
+                if (phase.first_span && !phase.final_span) {
+                    writer_first_thread = std::this_thread::get_id();
+                    pending_attempt = writer_probe.claim(0);
+                    if (pending_attempt) writer_probe.mark_bracketed();
+                } else if (phase.final_span && pending_attempt &&
+                           writer_probe.charge_bmp(4) && writer_probe.finish_final(true)) {
+                    writer_final_same_thread =
+                        writer_first_thread == std::this_thread::get_id();
+                    frame.diagnostic_trace_id = pending_attempt;
+                    frame.diagnostic_exact_writer_probe = true;
+                    frame.diagnostic_source_kind = "writer-final";
+                }
+                return frame;
+            },
+            [](const std::vector<ComputeItem>&) { return true; }, 1, 1);
+        CHECK(writer_probe.complete() && writer_final_same_thread &&
+              writer_result.render_spans == 2 &&
+              writer_result.diagnostic_trace_id == 1 &&
+              writer_result.diagnostic_exact_writer_probe &&
+              writer_result.frame.diagnostic_trace_id == 1 &&
+              writer_result.frame.diagnostic_exact_writer_probe &&
+              writer_result.frame.bytes() == std::vector<uint8_t>(4, 0x42),
+              "exact writer trace survives the ordered submit's split graphics callbacks");
     }
 
 #if defined(__linux__)

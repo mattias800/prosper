@@ -18,6 +18,8 @@
 #include "gpu/execute/gpu_execute.hpp"          // GuestGpuWriteQuery — the in-submit mutation proof
 
 namespace prosper::frontend {
+// CPU-only parser check in the screenshot executable, before Vulkan initialization.
+int compute_present_selector_preflight();
 
 // Snapshot the initialized graphics driver cache before an _Exit frontend terminates.
 // Waits up to one second to acquire the compilation lock; cache extraction and disk I/O

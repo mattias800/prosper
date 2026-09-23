@@ -315,6 +315,8 @@ std::string route_label(const std::string& path) {
 extern "C" void prosper_vo_set_flip_pacing_unpaced_default();
 
 int main(int argc, char** argv) {
+    if (argc == 2 && strcmp(argv[1], "--compute-present-parser-preflight") == 0)
+        return prosper::frontend::compute_present_selector_preflight();
     prosper_vo_set_flip_pacing_unpaced_default();   // #3379: a capture sweep is not a console
     std::string dump, out = ".", manifest_path;
     int every = 60, count = 30, timeout = 900;
