@@ -1,6 +1,7 @@
 #include "gpu/timeline/menu_capture_runtime.hpp"
 
 #include "build_revision.hpp"
+#include "diagnostics/exit_reports.hpp"
 #include "gpu/capture/gpu_capture.hpp"
 #include "gpu/execute/gpu_dependency_graph.hpp"
 #include "gpu/state/render_state.hpp"
@@ -69,8 +70,23 @@ const char* refusal_name(MenuCaptureRefusal refusal) {
         case MenuCaptureRefusal::AmbiguousDraw: return "ambiguous-draw";
         case MenuCaptureRefusal::SameSubmitDependency: return "same-submit-dependency";
         case MenuCaptureRefusal::UnsupportedAttachment: return "unsupported-attachment";
+        case MenuCaptureRefusal::MenuTargetUnresolved: return "menu-target-unresolved";
         case MenuCaptureRefusal::CaptureFailed: return "capture-failed";
         case MenuCaptureRefusal::WriteFailed: return "write-failed";
+    }
+    return "unknown";
+}
+
+const char* target_reject_name(MenuTargetReject rejection) {
+    switch (rejection) {
+        case MenuTargetReject::None: return "none";
+        case MenuTargetReject::MissingScene: return "missing-scene";
+        case MenuTargetReject::UnrealizedFinalScene: return "unrealized-final-scene";
+        case MenuTargetReject::WrongSceneProgram: return "wrong-scene-program";
+        case MenuTargetReject::MissingScreen: return "missing-screen";
+        case MenuTargetReject::UnrealizedLaterWriter: return "unrealized-later-writer";
+        case MenuTargetReject::OtherWriterAfterScene: return "other-writer-after-scene";
+        case MenuTargetReject::TooManyDraws: return "too-many-draws";
     }
     return "unknown";
 }
@@ -147,10 +163,12 @@ public:
         if (!destination || !*destination) return;
         path_ = destination;
         uint32_t target_width = 0, target_height = 0;
+        const char* target_text = std::getenv("PROSPER_MENU_DRAW_TARGET_ADDRESS");
+        const bool auto_target = target_text && std::strcmp(target_text, "auto") == 0;
         std::error_code fs_error;
         if (!parse_menu_frame_gate_spec(std::getenv("PROSPER_MENU_FRAME_GATE"), gate_) ||
             !parse_positive_address(std::getenv("PROSPER_MENU_DRAW_FRAGMENT_PROGRAM"), ps_) ||
-            !parse_positive_address(std::getenv("PROSPER_MENU_DRAW_TARGET_ADDRESS"), target_) ||
+            (!auto_target && !parse_positive_address(target_text, target_)) ||
             !parse_extent(std::getenv("PROSPER_MENU_DRAW_TARGET_DIM"),
                           target_width, target_height) ||
             std::filesystem::exists(path_, fs_error) || fs_error) {
@@ -159,9 +177,11 @@ public:
         }
         target_width_ = target_width;
         target_height_ = target_height;
+        configured_target_ = target_;
         active_ = true;
-        std::fprintf(stderr, "[menu-capture] armed path=%s ps=0x%llx target=0x%llx %ux%u\n",
+        std::fprintf(stderr, "[menu-capture] armed path=%s ps=0x%llx target=%s0x%llx %ux%u\n",
                      path_.c_str(), static_cast<unsigned long long>(ps_),
+                     auto_target ? "same-run-auto/" : "expected/",
                      static_cast<unsigned long long>(target_), target_width_, target_height_);
         watchdog_ = std::jthread([this](std::stop_token stop) {
             while (!stop.stop_requested()) {
@@ -175,26 +195,37 @@ public:
                 report_refusal(before);
             }
         });
+        // screenshot and prosper-app deliberately bypass C++ static destructors on exit. Register
+        // the terminal census through their shared explicit exit path, and keep this diagnostic
+        // alive until process termination so an ordinary atexit flush cannot read a dead object.
+        prosper::diagnostics::register_exit_report([this] { report_exit(); });
     }
 
-    ~MenuDrawCapture() {
+    void report_exit() {
         if (!active_) return;
         watchdog_.request_stop();
-        std::lock_guard lock(mx_);
+        // The GPU submit thread may be copying a bounded but large capsule while a frontend
+        // exits. A diagnostic must not make exit wait for that copy to finish.
+        std::unique_lock lock(mx_, std::try_to_lock);
+        if (!lock.owns_lock()) {
+            std::fprintf(stderr,
+                         "[menu-capture] exit census unavailable: capture callback still active\n");
+            return;
+        }
         if (census_.phase() == MenuSourceCensusPhase::WaitingForNewSource)
             std::fprintf(stderr,
                          "[menu-capture] source census incomplete: process ended after %u "
-                         "menu-positive publications without an exact source callback\n",
-                         census_.attempts());
+                         "distinct known retained sources without an exact source callback\n",
+                         census_.distinct_retained_sources());
         std::fprintf(stderr,
                      "[menu-capture] post-menu census ps=%llu target=%llu extent=%llu exact=%llu "
-                     "attempts=%u phase=%u source-census=%u/%u\n",
+                     "attempts=%u phase=%u source-census-retained=%u source-census-phase=%u\n",
                      static_cast<unsigned long long>(ps_hits_),
                      static_cast<unsigned long long>(target_hits_),
                      static_cast<unsigned long long>(extent_hits_),
                      static_cast<unsigned long long>(exact_hits_),
                      policy_.attempted_candidates(), static_cast<unsigned>(policy_.phase()),
-                     census_.attempts(), static_cast<unsigned>(census_.phase()));
+                     census_.distinct_retained_sources(), static_cast<unsigned>(census_.phase()));
     }
 
     void on_submit(const GpuState& state, uint64_t submit_no) {
@@ -204,6 +235,10 @@ public:
         policy_.tick(now_ms());
         report_refusal(before);
         if (policy_.phase() != MenuCapturePhase::Armed) return;
+        // A guest address is run-local. The target is bound only by the exact menu-positive source
+        // submit's admitted scene-to-screen semantic chain below, even when an explicit address was
+        // supplied as an additional assertion.
+        if (!target_bound_) return;
         std::vector<size_t> matches;
         for (size_t i = 0; i < state.draws.size(); ++i) {
             const RenderState rs = extract_render_state(state.state_at_draw(i));
@@ -323,13 +358,37 @@ public:
             (frame.verdict == MenuFrameGateVerdict::MenuWithLogo ||
              frame.verdict == MenuFrameGateVerdict::MenuWithoutLogo);
         const MenuSourceCensusPhase observed_before = census_.phase();
-        if (census_.observe(execution_submit, source_submit, menu, publication_ms))
-            report_menu_source_writers(state, realized_draws, execution_submit, source_submit);
+        if (census_.observe(execution_submit, source_submit, menu, publication_ms)) {
+            const MenuTargetChoice choice = report_menu_source_writers(
+                state, realized_draws, execution_submit, source_submit);
+            if (!menu_capture_target_matches_request(choice, configured_target_)) {
+                std::fprintf(stderr,
+                             "[menu-capture] target choice refused source-submit=%llu "
+                             "reason=%s draw=%llu derived=0x%llx expected=0x%llx\n",
+                             static_cast<unsigned long long>(source_submit),
+                             target_reject_name(choice.rejection),
+                             static_cast<unsigned long long>(choice.draw_index),
+                             static_cast<unsigned long long>(choice.target_addr),
+                             static_cast<unsigned long long>(configured_target_));
+                decline(MenuCaptureRefusal::MenuTargetUnresolved,
+                        "exact menu source has no unique admitted final scene-to-screen candidate "
+                        "matching the configured target");
+            } else {
+                target_ = choice.target_addr;
+                target_bound_ = true;
+                std::fprintf(stderr,
+                             "[menu-capture] same-run target=0x%llx draw=%llu "
+                             "source-submit=%llu (candidate, not pixel-flow proof)\n",
+                             static_cast<unsigned long long>(target_),
+                             static_cast<unsigned long long>(choice.draw_index),
+                             static_cast<unsigned long long>(source_submit));
+            }
+        }
         else if (menu && observed_before == MenuSourceCensusPhase::WaitingForMenu &&
                  census_.phase() == MenuSourceCensusPhase::WaitingForNewSource)
             std::fprintf(stderr,
                          "[menu-capture] menu source-submit=%llu retained/unknown in execution=%llu; "
-                         "retrying exact source census (max 8 positives/30 s)\n",
+                         "retrying exact source census (max 8 distinct known sources/30 s)\n",
                          static_cast<unsigned long long>(source_submit),
                          static_cast<unsigned long long>(execution_submit));
         report_census_limit(observed_before);
@@ -378,7 +437,7 @@ public:
     }
 
 private:
-    void report_menu_source_writers(
+    MenuTargetChoice report_menu_source_writers(
         const GpuState& state, std::span<const MenuRealizedDrawIdentity> realized_draws,
         uint64_t execution_submit, uint64_t source_submit) {
         if (execution_submit != source_submit) {
@@ -387,7 +446,14 @@ private:
                          "exact source draw state unavailable\n",
                          static_cast<unsigned long long>(source_submit),
                          static_cast<unsigned long long>(execution_submit));
-            return;
+            return {};
+        }
+        if (state.draws.size() > 4096) {
+            std::fprintf(stderr,
+                         "[menu-capture] menu source-submit=%llu has %zu draws; "
+                         "source census exceeds 4096-draw bound\n",
+                         static_cast<unsigned long long>(source_submit), state.draws.size());
+            return {0, 0, MenuTargetReject::TooManyDraws};
         }
         struct Writer {
             size_t index = 0;
@@ -395,12 +461,23 @@ private:
             uint32_t width = 0, height = 0, format = 0, mask = 0;
         };
         std::array<Writer, 8> scene{}, screen{};
+        std::vector<MenuWriterEvidence> evidence;
+        evidence.reserve(state.draws.size());
         size_t scene_count = 0, screen_count = 0;
         for (size_t i = 0; i < state.draws.size(); ++i) {
             const RenderState rs = extract_render_state(state.state_at_draw(i));
             const Writer writer{i, rs.ps_addr, rs.color0_base, rs.color0_width,
                                 rs.color0_height, rs.color0_format,
                                 rs.cb_target_mask & rs.cb_shader_mask & 0xfu};
+            const auto found = std::find_if(realized_draws.begin(), realized_draws.end(),
+                [&](const MenuRealizedDrawIdentity& draw) { return draw.draw_index == i; });
+            const bool realized_exact = found != realized_draws.end() &&
+                found->fs_guest_addr == writer.ps && found->color0_base == writer.base &&
+                found->color0_width == writer.width &&
+                found->color0_height == writer.height;
+            evidence.push_back({i, writer.ps, writer.base, writer.width, writer.height,
+                                writer.format, writer.mask, realized_exact,
+                                found == realized_draws.end() ? 0 : found->write_mask});
             if (writer.width == target_width_ && writer.height == target_height_)
                 scene[scene_count++ % scene.size()] = writer;
             else if (writer.width == gate_.width && writer.height == gate_.height)
@@ -439,14 +516,16 @@ private:
         };
         print("scene", scene, scene_count);
         print("screen", screen, screen_count);
+        return menu_capture_select_target(evidence, ps_, target_width_, target_height_,
+                                          gate_.width, gate_.height);
     }
 
     void report_census_limit(MenuSourceCensusPhase before) {
         if (before == census_.phase()) return;
         if (census_.phase() == MenuSourceCensusPhase::AttemptLimit)
             std::fprintf(stderr,
-                         "[menu-capture] source census refused: eight menu-positive publications "
-                         "without exact same-submit pixels\n");
+                         "[menu-capture] source census refused: eight distinct known retained "
+                         "sources without exact same-submit pixels\n");
         else if (census_.phase() == MenuSourceCensusPhase::WaitExpired)
             std::fprintf(stderr,
                          "[menu-capture] source census refused: no exact same-submit menu "
@@ -468,7 +547,8 @@ private:
     bool active_ = false;
     std::string path_;
     MenuFrameGateSpec gate_;
-    uint64_t ps_ = 0, target_ = 0;
+    uint64_t ps_ = 0, target_ = 0, configured_target_ = 0;
+    bool target_bound_ = false;
     uint32_t target_width_ = 0, target_height_ = 0;
     MenuCapturePolicy policy_;
     MenuSourceCensusPolicy census_;
@@ -478,8 +558,8 @@ private:
 };
 
 MenuDrawCapture& menu_draw_capture() {
-    static MenuDrawCapture runtime;
-    return runtime;
+    static MenuDrawCapture* runtime = new MenuDrawCapture;
+    return *runtime;
 }
 } // namespace
 

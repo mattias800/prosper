@@ -2,14 +2,17 @@
 
 #include "gpu/timeline/menu_frame_gate.hpp"
 
+#include <array>
 #include <cstdint>
+#include <span>
 
 namespace prosper::gpu {
 
 enum class MenuCapturePhase : uint8_t { WaitingForMenu, Armed, Pending, Accepted, Refused };
 enum class MenuCaptureRefusal : uint8_t {
     None, WaitExpired, CandidateExpired, CandidateLimit, ByteBudget, MissingPresentation,
-    AmbiguousDraw, SameSubmitDependency, UnsupportedAttachment, CaptureFailed, WriteFailed,
+    AmbiguousDraw, SameSubmitDependency, UnsupportedAttachment, MenuTargetUnresolved,
+    CaptureFailed, WriteFailed,
 };
 
 struct MenuCaptureLimits {
@@ -41,7 +44,7 @@ enum class MenuSourceCensusPhase : uint8_t {
 };
 
 struct MenuSourceCensusLimits {
-    uint32_t max_positive_images = 8;
+    uint32_t max_distinct_sources = 8;
     uint64_t max_wait_ms = 30000;
 };
 
@@ -50,7 +53,7 @@ public:
     explicit MenuSourceCensusPolicy(MenuSourceCensusLimits limits = {}) : limits_(limits) {}
 
     MenuSourceCensusPhase phase() const { return phase_; }
-    uint32_t attempts() const { return attempts_; }
+    uint32_t distinct_retained_sources() const { return seen_count_; }
 
     void tick(uint64_t now_ms) {
         if (phase_ != MenuSourceCensusPhase::WaitingForNewSource) return;
@@ -68,12 +71,22 @@ public:
             phase_ = MenuSourceCensusPhase::WaitingForNewSource;
             started_ms_ = now_ms;
         }
-        ++attempts_;
         if (source_submit != 0 && source_submit == execution_submit) {
             phase_ = MenuSourceCensusPhase::Exact;
             return true;
         }
-        if (attempts_ >= limits_.max_positive_images)
+        // An unknown (zero) source can be delivered at presentation rate before a renderer-owned
+        // image exists. Repeated delivery of one older producer also gives no new opportunity.
+        // The wall deadline bounds both cases; the count bounds distinct known retained sources.
+        if (source_submit == 0) return false;
+        for (uint32_t i = 0; i < seen_count_; ++i)
+            if (seen_sources_[i] == source_submit) return false;
+        if (seen_count_ >= seen_sources_.size()) {
+            phase_ = MenuSourceCensusPhase::AttemptLimit;
+            return false;
+        }
+        seen_sources_[seen_count_++] = source_submit;
+        if (seen_count_ >= limits_.max_distinct_sources)
             phase_ = MenuSourceCensusPhase::AttemptLimit;
         return false;
     }
@@ -81,9 +94,75 @@ public:
 private:
     MenuSourceCensusLimits limits_;
     MenuSourceCensusPhase phase_ = MenuSourceCensusPhase::WaitingForMenu;
-    uint32_t attempts_ = 0;
+    uint32_t seen_count_ = 0;
     uint64_t started_ms_ = 0;
+    std::array<uint64_t, 8> seen_sources_{};
 };
+
+struct MenuWriterEvidence {
+    uint64_t draw_index = 0;
+    uint64_t ps_addr = 0, target_addr = 0;
+    uint32_t width = 0, height = 0, format = 0, raw_write_mask = 0;
+    bool realized_exact = false;
+    uint32_t realized_write_mask = 0;
+
+    constexpr bool semantic_write_candidate() const {
+        return target_addr && format && raw_write_mask;
+    }
+    constexpr bool active_candidate() const {
+        return semantic_write_candidate() && realized_exact &&
+               (raw_write_mask & realized_write_mask);
+    }
+};
+
+enum class MenuTargetReject : uint8_t {
+    None, MissingScene, UnrealizedFinalScene, WrongSceneProgram, MissingScreen,
+    UnrealizedLaterWriter, OtherWriterAfterScene, TooManyDraws,
+};
+
+struct MenuTargetChoice {
+    uint64_t target_addr = 0, draw_index = 0;
+    MenuTargetReject rejection = MenuTargetReject::MissingScene;
+};
+
+// Use the exact menu-positive source submit, not an address copied from another run. Inspect the
+// last semantically write-enabled scene-size draw even when realization failed; otherwise an
+// earlier admitted draw could be mislabeled as the final one. Only admitted screen-size writers may
+// follow. This identifies a diagnostic candidate, not proof those pixels reached scanout.
+inline MenuTargetChoice menu_capture_select_target(
+    std::span<const MenuWriterEvidence> draws, uint64_t expected_ps,
+    uint32_t scene_width, uint32_t scene_height,
+    uint32_t screen_width, uint32_t screen_height) {
+    const MenuWriterEvidence* last_scene = nullptr;
+    for (const auto& draw : draws)
+        if (draw.semantic_write_candidate() &&
+            draw.width == scene_width && draw.height == scene_height)
+            last_scene = &draw;
+    if (!last_scene) return {};
+    if (!last_scene->active_candidate())
+        return {0, last_scene->draw_index, MenuTargetReject::UnrealizedFinalScene};
+    if (last_scene->ps_addr != expected_ps)
+        return {0, last_scene->draw_index, MenuTargetReject::WrongSceneProgram};
+    bool screen_seen = false;
+    for (const auto& draw : draws) {
+        if (draw.draw_index <= last_scene->draw_index || !draw.semantic_write_candidate())
+            continue;
+        if (!draw.active_candidate())
+            return {0, last_scene->draw_index, MenuTargetReject::UnrealizedLaterWriter};
+        if (draw.width != screen_width || draw.height != screen_height)
+            return {0, last_scene->draw_index, MenuTargetReject::OtherWriterAfterScene};
+        screen_seen = true;
+    }
+    if (!screen_seen)
+        return {0, last_scene->draw_index, MenuTargetReject::MissingScreen};
+    return {last_scene->target_addr, last_scene->draw_index, MenuTargetReject::None};
+}
+
+constexpr bool menu_capture_target_matches_request(MenuTargetChoice choice,
+                                                    uint64_t configured_target) {
+    return choice.rejection == MenuTargetReject::None && choice.target_addr &&
+           (!configured_target || configured_target == choice.target_addr);
+}
 
 // This policy never invents a relationship between a menu frame and a candidate. The first
 // positive publication only arms future work; the candidate is accepted solely by its own exact
