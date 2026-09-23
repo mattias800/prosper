@@ -20,12 +20,21 @@ owner also observed the in-game world and described its rendering as almost corr
 roughly 2 FPS. This is a recognizable scene and supports rung 3; the short visual report is not a
 whole-game compatibility verdict or a measured speed comparison with PS5 hardware.
 
+The [first-person screenshot](../../assets/screenshots/outer-wilds-first-person-night.webp) is a
+lossless WebP of an unmodified 3840×2160 `prosper-app` F9 readback (zero changed pixels versus its
+BMP source). The source SHA-256 is `a9892511aa315ebb592152c1ffe2a8b526599fbac46908297f8731341873620f`;
+the readback was armed at guest present 1789 and written at present 1790. It shows the trees, launch
+tower, planet and Look Around / Move prompts without the later white artifact.
+
 **Known visual defects.** The game wordmark is absent on prosper's title frame and present in the
 PS5 title-screen oracle attached to [#3804](https://github.com/mattias800/prosper/issues/3804).
 A later interactive F9 screenshot shows a large nearly white blob over the right side of the wooded
-scene. Its bundle writer was interrupted before finishing, so that bad image has no replayable
-producer trace. Two later captures at nearby but nonidentical guest states were clean. Neither
-result identifies the blob's producing pass. No matching PS5 gameplay oracle has been captured.
+scene. The first such bundle writer was interrupted; a fresh live F9 at guest present 1891/1892
+completed both screenshot and replay bundle. The bundle's selected submit is 1889, so the screenshot
+and replay are nearby but not identical frames ([#3824](https://github.com/mattias800/prosper/issues/3824)).
+The replay retains the blob, and its pre-frame front-buffer seed already contains it. This proves
+persistence across the selected submit, not its first producer. No matching PS5 gameplay oracle has
+been captured.
 
 ## Reproduction and evidence
 

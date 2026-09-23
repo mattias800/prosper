@@ -773,6 +773,8 @@ the first ~130 s. After that the composite is a flat white 4K clear for the rema
 
 <p align="center"><img src="assets/screenshots/outer-wilds-title-start.webp" alt="Outer Wilds — PRESS X TO START over a starfield and a dim campfire/tree scene, captured on Linux at 60 seconds"></p>
 
+<p align="center"><img src="assets/screenshots/outer-wilds-first-person-night.webp" alt="Outer Wilds — unmodified Linux first-person night scene with trees, launch tower, planet and Look Around / Move prompts"></p>
+
 On a default no-input Linux run, the unmodified `tools/screenshot` frontend reaches the live
 “PRESS X TO START” prompt by about 40 seconds. A fresh-save route then accepts NEW EXPEDITION and
 the Square Wake Up prompt; by about 122 seconds the native frame shows a wooded first-person scene.
