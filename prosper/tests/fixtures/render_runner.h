@@ -7048,6 +7048,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     color_target_stats = {};
     BackendResourceReuseStats& resource_reuse_stats = backend_resource_reuse_stats_storage();
     resource_reuse_stats = {};
+    BackendTextureUploadStats& texture_stats = backend_texture_upload_stats_storage();
+    texture_stats = {}; // An empty or failed pass must not report the previous call's uploads.
     maybe_report_hash_stats();   // gated cumulative hashing economics (#1268)
     std::vector<uint8_t> out;
     if (out_rgba1) out_rgba1->clear();
@@ -11353,8 +11355,6 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         }
     }
 
-    BackendTextureUploadStats& texture_stats = backend_texture_upload_stats_storage();
-    texture_stats = {};
     texture_stats.references = texture_references;
     texture_stats.persistent_hits = persistent_texture_hits;
     texture_stats.persistent_misses = persistent_texture_misses;
@@ -13881,7 +13881,14 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     const std::span<const BackendDraw> all(draws);
     // One preflight over the logical batch, before splitting or any render-pass state. A malformed
     // later segment must not leave earlier producer work submitted or speculative cache state live.
-    if (!backend_compact_resource_orders_valid(all)) return {};
+    if (!backend_compact_resource_orders_valid(all)) {
+        // This refusal never enters render_draw_pass_rgba, where these per-call results normally
+        // reset. Do not let a preceding valid call masquerade as work done by this one.
+        backend_texture_upload_stats_storage() = {};
+        backend_resource_reuse_stats_storage() = {};
+        backend_render_timing_stats_storage() = {};
+        return {};
+    }
     if (!persist_depth_stencil ||
         depth_feedback_split_index(all, W, H) == all.size())
         return render_draw_pass_rgba(all, W, H, seed_rgba, clear_rgba,

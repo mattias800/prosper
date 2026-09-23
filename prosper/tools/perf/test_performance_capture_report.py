@@ -207,6 +207,60 @@ class PerformanceCaptureReportTests(unittest.TestCase):
         self.assertNotIn("buffer_residency", mixed)
         self.assertEqual(mixed["res_buffer_other"], 28)
 
+    def test_backend_texture_partition_counts_and_legacy_capture(self):
+        row = {"setup_resources_ms": 30, "res_texture_ms": 20,
+               "res_texture_upload_ms": 3, "res_texture_bind_ms": 4,
+               "res_buffer_ms": 8, "res_buffer_copy_ms": 2, "res_descriptor_ms": 1,
+               "backend_texture_refs": 100, "backend_texture_uploads": 8,
+               "backend_texture_upload_bytes": 2**53 + 7,
+               "backend_texture_persistent_hits": 4,
+               "backend_texture_persistent_misses": 2,
+               "backend_texture_binding_refs": 80,
+               "backend_texture_binding_unique": 7,
+               "backend_texture_binding_persistent_hits": 3,
+               "backend_texture_binding_persistent_misses": 1}
+        full = summarize(capture(SAMPLES, renderer=[row, row]))["resource_breakdown"]
+        self.assertTrue(full["texture_leaves_available"])
+        self.assertTrue(full["texture_counts_available"])
+        self.assertEqual((full["res_texture_upload"], full["res_texture_bind"],
+                          full["res_texture_other"]), (6, 8, 26))
+        self.assertEqual(full["texture_counts"]["backend_texture_upload_bytes"], 2**54 + 14)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            print_summary(summarize(capture(SAMPLES, renderer=[row, row])))
+        self.assertIn("upload=6.0ms bind=8.0ms other=+26.0ms", output.getvalue())
+        self.assertIn("refs=200 unique_uploads=16", output.getvalue())
+        overcounted = dict(row, res_texture_ms=5)
+        overcounted_summary = summarize(capture(SAMPLES, renderer=[overcounted]))
+        self.assertEqual(overcounted_summary["resource_breakdown"]["res_texture_other"], -2)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            print_summary(overcounted_summary)
+        self.assertIn("upload=3.0ms bind=4.0ms other=-2.0ms", output.getvalue())
+
+        # Old and partially populated captures have no measured split. Even one missing field
+        # must refuse the whole partition; .get(..., 0) would make this plausible but false.
+        for missing in ("res_texture_upload_ms", "backend_texture_upload_bytes"):
+            partial = dict(row)
+            del partial[missing]
+            result = summarize(capture(SAMPLES, renderer=[row, partial]))["resource_breakdown"]
+            self.assertEqual(result["texture_leaves_available"],
+                             missing != "res_texture_upload_ms")
+            self.assertEqual(result["texture_counts_available"],
+                             missing != "backend_texture_upload_bytes")
+        legacy = {key: value for key, value in row.items()
+                  if not key.startswith("backend_texture_") and
+                  key not in ("res_texture_upload_ms", "res_texture_bind_ms")}
+        legacy_summary = summarize(capture(SAMPLES, renderer=[legacy]))
+        legacy_result = legacy_summary["resource_breakdown"]
+        self.assertFalse(legacy_result["texture_leaves_available"])
+        self.assertFalse(legacy_result["texture_counts_available"])
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            print_summary(legacy_summary)
+        self.assertIn("backend texture upload/bind breakdown: UNAVAILABLE", output.getvalue())
+        self.assertIn("backend texture cache counts: UNAVAILABLE", output.getvalue())
+
     def test_texture_snapshot_totals_preserve_bytes_and_nested_timing(self):
         row = {"total_ms": 100, "build_resources_ms": 80, "frontend_texture_ms": 60,
                "frontend_tex_rtt_ms": 20, "frontend_tex_persist_invalid_ms": 30,

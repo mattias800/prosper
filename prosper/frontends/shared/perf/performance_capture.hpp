@@ -184,6 +184,24 @@ struct RendererTimingRecord {
     // derive invites the two to disagree. Without these an F8 capture cannot attribute its own
     // largest bucket, which is the reason both lanes spent a day reasoning from partial data.
     double res_texture_ms = 0;
+    // Children of res_texture_ms. Upload covers unique image materialization; bind covers
+    // creation/reuse of a unique image-view/sampler binding. Their signed remainder includes
+    // per-reference checks and any other steps outside those two scopes; it is not an additional
+    // independent cost.
+    double res_texture_upload_ms = 0;
+    double res_texture_bind_ms = 0;
+    // Backend-call counts, not frontend texture_bytes or physical transfer traffic. Upload bytes
+    // are logical image extents. Persistent hits/misses apply only where persistent sampled-texture
+    // admission was attempted.
+    uint64_t backend_texture_refs = 0;
+    uint64_t backend_texture_uploads = 0;
+    uint64_t backend_texture_upload_bytes = 0;
+    uint64_t backend_texture_persistent_hits = 0;
+    uint64_t backend_texture_persistent_misses = 0;
+    uint64_t backend_texture_binding_refs = 0;
+    uint64_t backend_texture_binding_unique = 0;
+    uint64_t backend_texture_binding_persistent_hits = 0;
+    uint64_t backend_texture_binding_persistent_misses = 0;
     double res_buffer_ms = 0;
     // Leaves of res_buffer_ms. `copy` is the one the perf work kept landing on (#2215/#2231), and on
     // its own it is badly misleading: measured on Blue Prince gameplay it was 25.82 ms against a

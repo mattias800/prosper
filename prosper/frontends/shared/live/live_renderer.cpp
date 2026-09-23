@@ -2614,6 +2614,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 // hit still pays per reference. res_descriptor is the per-draw set alloc/update.
                 double backend_res_texture_ms = 0, backend_res_texture_upload_ms = 0;
                 double backend_res_texture_bind_ms = 0, backend_res_buffer_ms = 0;
+                uint64_t backend_texture_refs = 0, backend_texture_uploads = 0;
+                uint64_t backend_texture_upload_bytes = 0;
+                uint64_t backend_texture_persistent_hits = 0, backend_texture_persistent_misses = 0;
+                uint64_t backend_texture_binding_refs = 0, backend_texture_binding_unique = 0;
+                uint64_t backend_texture_binding_persistent_hits = 0;
+                uint64_t backend_texture_binding_persistent_misses = 0;
                 double backend_res_buffer_range_plan_ms = 0;
                 double backend_res_buffer_acquire_ms = 0, backend_res_buffer_copy_ms = 0;
                 double backend_res_buffer_resident_ms = 0;
@@ -2862,6 +2868,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 ? RenderClock::now() : RenderClock::time_point{};
             auto record_backend_timing = [&]
                 (const prosper::test::BackendRenderTimingStats& backend,
+                 const prosper::test::BackendTextureUploadStats& textures,
                  const prosper::test::BackendPipelineCacheStats& pipelines,
                  const prosper::test::BackendResourceReuseStats& reuse) {
                 pending_timing.backend_calls += backend.calls;
@@ -2894,6 +2901,17 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 pending_timing.backend_res_texture_ms += backend.res_texture_ms;
                 pending_timing.backend_res_texture_upload_ms += backend.res_texture_upload_ms;
                 pending_timing.backend_res_texture_bind_ms += backend.res_texture_bind_ms;
+                pending_timing.backend_texture_refs += textures.references;
+                pending_timing.backend_texture_uploads += textures.unique_uploads;
+                pending_timing.backend_texture_upload_bytes += textures.upload_bytes;
+                pending_timing.backend_texture_persistent_hits += textures.persistent_hits;
+                pending_timing.backend_texture_persistent_misses += textures.persistent_misses;
+                pending_timing.backend_texture_binding_refs += reuse.texture_binding_references;
+                pending_timing.backend_texture_binding_unique += reuse.unique_texture_bindings;
+                pending_timing.backend_texture_binding_persistent_hits +=
+                    reuse.persistent_texture_binding_hits;
+                pending_timing.backend_texture_binding_persistent_misses +=
+                    reuse.persistent_texture_binding_misses;
                 pending_timing.backend_res_buffer_ms += backend.res_buffer_ms;
                 pending_timing.backend_res_buffer_acquire_ms += backend.res_buffer_acquire_ms;
                 pending_timing.backend_res_buffer_range_plan_ms += backend.res_buffer_range_plan_ms;
@@ -11080,6 +11098,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     const prosper::test::BackendRenderTimingStats backend_call_timing = timing_enabled
                         ? prosper::test::backend_render_timing_stats()
                         : prosper::test::BackendRenderTimingStats{};
+                    const prosper::test::BackendTextureUploadStats backend_texture_stats = timing_enabled
+                        ? prosper::test::backend_texture_upload_stats()
+                        : prosper::test::BackendTextureUploadStats{};
                     const prosper::test::BackendPipelineCacheStats backend_pipeline_stats = timing_enabled
                         ? prosper::test::backend_pipeline_cache_stats()
                         : prosper::test::BackendPipelineCacheStats{};
@@ -11103,8 +11124,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         pending_timing.pass_pre_ms +=
                             std::chrono::duration<double, std::milli>(build_start - group_start).count();
                         ++pending_timing.pass_groups;
-                        record_backend_timing(backend_call_timing, backend_pipeline_stats,
-                                          backend_reuse_stats);
+                        record_backend_timing(backend_call_timing, backend_texture_stats,
+                                              backend_pipeline_stats, backend_reuse_stats);
                         pending_timing.color_target_writes += color_target_call.writes;
                         pending_timing.color_target_write_hits += color_target_call.write_hits;
                         pending_timing.color_target_sample_hits += color_target_call.sampled_hits;
@@ -12512,6 +12533,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 const prosper::test::BackendRenderTimingStats backend_call_timing = timing_enabled
                     ? prosper::test::backend_render_timing_stats()
                     : prosper::test::BackendRenderTimingStats{};
+                const prosper::test::BackendTextureUploadStats backend_texture_stats = timing_enabled
+                    ? prosper::test::backend_texture_upload_stats()
+                    : prosper::test::BackendTextureUploadStats{};
                 const prosper::test::BackendPipelineCacheStats backend_pipeline_stats = timing_enabled
                     ? prosper::test::backend_pipeline_cache_stats()
                     : prosper::test::BackendPipelineCacheStats{};
@@ -12528,8 +12552,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         std::chrono::duration<double, std::milli>(build_done - build_start).count();
                     pending_timing.backend_ms +=
                         std::chrono::duration<double, std::milli>(backend_done - build_done).count();
-                    record_backend_timing(backend_call_timing, backend_pipeline_stats,
-                                          backend_reuse_stats);
+                    record_backend_timing(backend_call_timing, backend_texture_stats,
+                                          backend_pipeline_stats, backend_reuse_stats);
                 }
                 // RTT (#167): cache these rendered pixels under this submit's render-target base, so a later
                 // composite pass that samples that address gets the scene we drew (not empty guest memory).
@@ -13107,6 +13131,21 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     record.frontend_gpu_detile_2d_preparations = pending_timing.gpu_detile_2d_preparations;
                     record.frontend_gpu_detile_source_bytes = pending_timing.gpu_detile_source_bytes;
                     record.res_texture_ms = pending_timing.backend_res_texture_ms;
+                    record.res_texture_upload_ms = pending_timing.backend_res_texture_upload_ms;
+                    record.res_texture_bind_ms = pending_timing.backend_res_texture_bind_ms;
+                    record.backend_texture_refs = pending_timing.backend_texture_refs;
+                    record.backend_texture_uploads = pending_timing.backend_texture_uploads;
+                    record.backend_texture_upload_bytes = pending_timing.backend_texture_upload_bytes;
+                    record.backend_texture_persistent_hits =
+                        pending_timing.backend_texture_persistent_hits;
+                    record.backend_texture_persistent_misses =
+                        pending_timing.backend_texture_persistent_misses;
+                    record.backend_texture_binding_refs = pending_timing.backend_texture_binding_refs;
+                    record.backend_texture_binding_unique = pending_timing.backend_texture_binding_unique;
+                    record.backend_texture_binding_persistent_hits =
+                        pending_timing.backend_texture_binding_persistent_hits;
+                    record.backend_texture_binding_persistent_misses =
+                        pending_timing.backend_texture_binding_persistent_misses;
                     record.res_buffer_ms = pending_timing.backend_res_buffer_ms;
                     record.res_buffer_range_plan_ms = pending_timing.backend_res_buffer_range_plan_ms;
                     record.res_buffer_copy_ms = pending_timing.backend_res_buffer_copy_ms;
