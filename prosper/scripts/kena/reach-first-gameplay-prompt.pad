@@ -1,0 +1,24 @@
+# Kena: Bridge of Spirits (PPSA01802): main menu -> New Game -> difficulty -> brightness -> first level.
+#
+# Anchors are PAD READS ("pN"), not seconds. On Windows/NVIDIA this title polls the pad roughly once
+# per second at its menus, so a 300 ms time-anchored pulse usually lands between two reads and is
+# never seen (an exploratory seconds-based route delivered 2 of its 11 presses). Each press below is
+# a two-read window followed by a neutral gap, because the guest needs a neutral->pressed edge.
+#
+#   p54   New Game on the main menu (the default selection)
+#   p102  Next on "Choose Difficulty" (default: Spirit Guide)
+#   p160  Accept on the brightness calibration screen -> loading spinner -> first level
+#   p200+ presses during the intro narration; the first gameplay prompt appears after it
+#
+# Validated on Windows 11 / RTX 4090 with screenshot.exe (PROSPER_NULL_PAGE=1, PROSPER_GUEST_ARGS=
+# empty, fresh save roots) on main + #3814 + #3817: menu ~80 s, difficulty ~160 s, brightness ~170-220 s,
+# loading ~240 s, intro narration ~270-330 s, "Press ... to Pulse" from ~410 s to the end of a
+# 540 s run. The world behind that prompt does NOT render on a 32-wide device (#2147), so this
+# route ends at rung 2, not rung 3. See prosper/docs/KENA_STATUS.md.
+p54-55:cross
+p102-103:cross
+p160-161:cross
+p200-201:cross
+p240-241:cross
+p280-281:cross
+p330-331:cross

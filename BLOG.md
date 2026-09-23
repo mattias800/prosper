@@ -21,6 +21,16 @@ from the tracker issues, and still gated, because it is a projection of state ra
 
 ## 2026-09-23
 
+### Kena: Bridge of Spirits gets into its first level — and the world is not there yet
+
+We now get *Kena* on Windows through New Game, difficulty, brightness, the level load and the intro narration to its first gameplay prompt — but the world behind that prompt draws black. [#3787](https://github.com/mattias800/prosper/issues/3787).
+
+![Kena: Choose Difficulty, Windows screenshot.exe, scripts/kena/reach-first-gameplay-prompt.pad, t=160 s](assets/screenshots/kena-choose-difficulty.webp)
+![Kena: brightness calibration, same run, t=220 s](assets/screenshots/kena-brightness-calibration.webp)
+![Kena: intro narration after the first level loads, same run, t=290 s](assets/screenshots/kena-intro-narration.webp)
+![Kena: the first gameplay prompt over a black world, same run, t=540 s](assets/screenshots/kena-first-gameplay-prompt-black-world.webp)
+
+
 ### Metaphor: ReFantazio reaches its title screen
 
 We now reach the *Metaphor: ReFantazio* title screen and menu, and from there the storybook prologue. The stripes in the background are its movie layer, which does not decode correctly yet ([#3801](https://github.com/mattias800/prosper/issues/3801)). [#2876](https://github.com/mattias800/prosper/issues/2876).
