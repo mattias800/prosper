@@ -47,6 +47,7 @@
 #include "shared/present/guest_scanout_present.hpp"    // publishing the guest's own flipped buffer (#1968)
 #include "shared/diagnostics/diagnostic_window.hpp"        // census window by callback ordinal or by elapsed time
 #include "shared/diagnostics/kena_menu_trace_policy.hpp"    // one passive title-menu source trace
+#include "shared/diagnostics/compute_present_probe.hpp"      // bounded producer -> present observation
 #include "shared/diagnostics/persistent_readback_filter.hpp" // bounded retained-target readback
 #include "gpu/diagnostics/diag_ratelimit.hpp"       // ordinal + sparse tail for capped diagnostics
 #include "host/memory/guest_write_watch.hpp"
@@ -1587,7 +1588,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
         const char* spec = PROSPER_ENV_VALUE("PROSPER_DUMP_PERSISTENT_ADDRS");
         auto filter = prosper::frontend::parse_persistent_readback_filter(spec);
         if (!spec) return filter;
-        if (!PROSPER_ENV_ON("PROSPER_DUMP_PERSISTENT"))
+        if (!PROSPER_ENV_ON("PROSPER_DUMP_PERSISTENT") &&
+            !PROSPER_ENV_ON("PROSPER_COMPUTE_PRESENT_PROBE"))
             fprintf(stderr, "[persist] PROSPER_DUMP_PERSISTENT_ADDRS is a modifier; "
                             "PROSPER_DUMP_PERSISTENT is not armed -- no readback\n");
         if (filter.state == prosper::frontend::PersistentReadbackFilterState::Selected)
@@ -1600,6 +1602,38 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         ? "more than eight addresses" : "malformed 0x-prefixed list");
         return filter;
     }();
+    static const auto g_compute_present_spec = [] {
+        const char* value = PROSPER_ENV_VALUE("PROSPER_COMPUTE_PRESENT_PROBE");
+        auto spec = prosper::frontend::parse_compute_present_probe(value);
+        if (!spec.requested) return spec;
+        const char* reason = nullptr;
+        if (!spec.armed) reason = "expected 0xCODE:ms:0..120000:STRIDE (1..64)";
+        else if (!prosper::frontend::compute_probe_modes_compatible(
+                     PROSPER_ENV_ON("PROSPER_KENA_MENU_TRACE"),
+                     PROSPER_ENV_ON("PROSPER_DUMP_PERSISTENT")))
+            reason = "one-shot menu trace or broad persistent readback also requested";
+        else if (PROSPER_ENV_ON("PROSPER_NO_COMPUTE"))
+            reason = "live compute disabled";
+        else if (PROSPER_ENV_ON("PROSPER_GPU_CAPTURE") ||
+                 PROSPER_ENV_ON("PROSPER_RESOURCE_HASH_DIM"))
+            reason = "capture/hash mode disables the normal persistent target path";
+        else if (!g_bind_program_trace.filter.armed)
+            reason = "PROSPER_BIND_LOG_PROGRAM requires one exact PS code";
+        else if (g_persist_filter.state !=
+                     prosper::frontend::PersistentReadbackFilterState::Selected ||
+                 !prosper::frontend::compute_probe_targets_valid(g_persist_filter.addresses))
+            reason = "PROSPER_DUMP_PERSISTENT_ADDRS requires four distinct ordered targets";
+        else if (!PROSPER_ENV_VALUE("PROSPER_FRAME_DIR") ||
+                 !*PROSPER_ENV_VALUE("PROSPER_FRAME_DIR"))
+            reason = "PROSPER_FRAME_DIR required for bounded BMP evidence";
+        if (reason) spec.armed = false;
+        fprintf(stderr, "[compute-present] %s code=0x%llx after=%llu ms stride=%u: %s\n",
+                spec.armed ? "armed" : "refused", (unsigned long long)spec.code,
+                (unsigned long long)spec.after_ms, spec.stride,
+                reason ? reason : "one producer event, up to four scene probes and one full chain");
+        prosper::frontend::compute_present_probe().configure(spec);
+        return spec;
+    }();
     // Match boot_trace's progression-diagnostic contract: callers may register the graphics
     // renderer while deliberately leaving compute unregistered. This keeps semantic dispatches
     // visible without letting screenshot/prosper-app registration silently undo the A/B.
@@ -1609,6 +1643,15 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
     prosper::gpu::set_guest_gpu_write_observer(
         [](uint64_t addr, uint64_t size, const char* origin) {
             queue_guest_gpu_write(addr, size, origin);
+            if (!g_compute_present_spec.armed) return;
+            const auto invalidated = prosper::frontend::compute_present_probe().invalidate_write(
+                addr, size);
+            if (invalidated)
+                fprintf(stderr, "[compute-present] event=%llu invalidated by notified GPU "
+                                "write addr=0x%llx bytes=%llu origin=%s; CPU writes outside "
+                                "this observer are not covered\n",
+                        (unsigned long long)invalidated->id, (unsigned long long)addr,
+                        (unsigned long long)size, origin ? origin : "unknown");
         });
     // Resource tables are built before the submit reaches this callback. Publish the renderer's
     // default mode now so unmapped render-target descriptors remain available for RTT injection.
@@ -2323,9 +2366,11 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             static int g_render_last = getenv("PROSPER_RENDER_LAST") ? atoi(getenv("PROSPER_RENDER_LAST")) : INT_MAX;
             static thread_local int g_this_submit = -1;
             static thread_local bool g_force_this_submit = false;
+            static thread_local uint64_t g_compute_present_bound_id = 0;
             if (phase.first_span || g_this_submit < 0) {
                 g_this_submit = g_submit_idx++;
                 g_force_this_submit = false;
+                g_compute_present_bound_id = 0;
             }
             if (g_this_submit > g_render_last) return {};
             static const int g_rttlog_min_submit = getenv("PROSPER_RTTLOG_MIN_SUBMIT")
@@ -2836,6 +2881,30 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         (long long)elapsed_ms, g_this_submit);
             }
             if ((g_this_submit < g_render_first || before_delay) && !g_force_this_submit) return {};
+            uint64_t compute_present_final_id = 0;
+            if (g_compute_present_spec.armed && phase.final_span) {
+                auto& probe = prosper::frontend::compute_present_probe();
+                const uint64_t elapsed = diagnostic_elapsed_ms();
+                if (probe.arm_phase(elapsed))
+                    fprintf(stderr, "[compute-present] phase armed at admitted final callback "
+                                    "render-submit=%d\n", g_this_submit);
+                if (probe.expire_no_producer(elapsed))
+                    fprintf(stderr, "[compute-present] selector miss: no completed nonzero "
+                                    "producer in ten seconds after phase arm\n");
+                const uint64_t admitted = probe.admitted_callback();
+                if (const auto expired = probe.expire(
+                        prosper::frontend::compute_probe_now_ms(), admitted))
+                    fprintf(stderr, "[compute-present] event=%llu selector miss: expired before "
+                                    "four-target observation (ignored_publish_attempts=%llu)\n",
+                            (unsigned long long)expired->id,
+                            (unsigned long long)probe.ignored());
+            }
+            // Snapshot once before resource resolution. The mutex is released before any
+            // renderer registry, binding, or readback access; a mid-callback producer can only
+            // become eligible on a later callback.
+            const auto compute_present_callback_event = g_compute_present_spec.armed
+                ? prosper::frontend::compute_present_probe().pending()
+                : std::optional<prosper::frontend::ComputePresentEvent>{};
             // Both renderer admission gates have passed. Do not consume the one-shot menu trace
             // (or scan guest bytes) for a callback that cannot render a final source.
             const bool kena_render_admitted = g_this_submit <= g_render_last &&
@@ -5401,6 +5470,25 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 else if (row == 8193)
                                     fprintf(stderr, "[bind-program] capped at 8192 rows; later "
                                                     "matching bindings are not reported\n");
+                                if (g_compute_present_spec.armed &&
+                                    !g_compute_present_bound_id) {
+                                    const auto& event = compute_present_callback_event;
+                                    if (event && prosper::frontend::compute_probe_binding_matches(
+                                            *event, draw.fs_guest_addr,
+                                            g_bind_program_trace.filter.address, r.gpu_addr)) {
+                                        g_compute_present_bound_id = event->id;
+                                        fprintf(stderr, "[compute-present] event=%llu bound "
+                                                        "render-submit=%d cb=%llu draw=%llu "
+                                                        "order-local=%llu ps=0x%llx binding=%u "
+                                                        "addr=0x%llx path=%s\n",
+                                                (unsigned long long)event->id, g_this_submit,
+                                                (unsigned long long)at,
+                                                (unsigned long long)draw.draw_index,
+                                                (unsigned long long)draw.command_order,
+                                                (unsigned long long)draw.fs_guest_addr,
+                                                r.binding, (unsigned long long)r.gpu_addr, path);
+                                    }
+                                }
                             }
                         }
                         // Sampled depth bridge (#1275): the T# addresses the depth plane of a
@@ -11372,6 +11460,119 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                             (unsigned long long)addr);
                     }
                 }
+                if (g_compute_present_spec.armed && phase.final_span &&
+                    g_compute_present_bound_id) {
+                    auto& probe = prosper::frontend::compute_present_probe();
+                    // Take only a POD copy under the bridge mutex, then release it before any
+                    // retained-target lookup or GPU readback. A later notified write invalidates
+                    // the slot and is checked again before final-source publication.
+                    const auto event = probe.pending();
+                    if (event && event->id == g_compute_present_bound_id) {
+                        const auto scene_probe = probe.admit_scene_probe(event->id);
+                        if (scene_probe) {
+                            const char* dir = PROSPER_ENV_VALUE("PROSPER_FRAME_DIR");
+                            prosper::frontend::PersistentReadbackBudget budget;
+                            auto read_target = [&](uint64_t addr, unsigned stage,
+                                                   size_t& raw_nonzero) {
+                                raw_nonzero = 0;
+                                const auto found = g_rtt.find(addr);
+                                if (found == g_rtt.end() || !found->second.gpu_valid ||
+                                    !found->second.w || !found->second.h) {
+                                    fprintf(stderr, "[compute-present] event=%llu cb=%llu "
+                                                    "stage=%u addr=0x%llx readback=missing-or-invalid\n",
+                                            (unsigned long long)event->id,
+                                            (unsigned long long)g_pass_log_submit.load(), stage,
+                                            (unsigned long long)addr);
+                                    return false;
+                                }
+                                const RttSurf& target = found->second;
+                                const VkFormat fmt = prosper::test::backend_color_format(target.format);
+                                const uint32_t bpp = prosper::test::backend_color_bytes_per_pixel(fmt);
+                                uint64_t expected = 0;
+                                if (budget.admit(target.w, target.h, bpp, expected) !=
+                                    prosper::frontend::PersistentReadbackCharge::Admitted) {
+                                    fprintf(stderr, "[compute-present] event=%llu stage=%u "
+                                                    "addr=0x%llx readback=budget-or-size-refused\n",
+                                            (unsigned long long)event->id, stage,
+                                            (unsigned long long)addr);
+                                    return false;
+                                }
+                                if (!probe.charge_raw(event->id, expected)) {
+                                    fprintf(stderr, "[compute-present] event=%llu stage=%u "
+                                                    "readback=aggregate-160-MiB-cap\n",
+                                            (unsigned long long)event->id, stage);
+                                    return false;
+                                }
+                                std::vector<uint8_t> raw;
+                                std::string error;
+                                if (!prosper::test::readback_persistent_color_target(
+                                        addr, target.w, target.h, fmt, raw, error) ||
+                                    raw.size() != expected) {
+                                    fprintf(stderr, "[compute-present] event=%llu stage=%u "
+                                                    "addr=0x%llx readback=failed got=%zu "
+                                                    "expected=%llu reason=%s\n",
+                                            (unsigned long long)event->id, stage,
+                                            (unsigned long long)addr, raw.size(),
+                                            (unsigned long long)expected, error.c_str());
+                                    return false;
+                                }
+                                for (uint8_t byte : raw) raw_nonzero += byte != 0;
+                                const auto rgba = inspection_rgba8(raw, target.w, target.h, fmt);
+                                const auto bmp_bytes = prosper::frontend::compute_probe_bmp_bytes(
+                                    target.w, target.h);
+                                if (!bmp_bytes || !probe.charge_bmp(event->id, *bmp_bytes)) {
+                                    fprintf(stderr, "[compute-present] event=%llu stage=%u "
+                                                    "image=aggregate-256-MiB-cap\n",
+                                            (unsigned long long)event->id, stage);
+                                    return false;
+                                }
+                                char path[512];
+                                const int length = std::snprintf(path, sizeof path,
+                                    "%s/compute_present_e%llu_p%u_s%u_%llx.bmp", dir,
+                                    (unsigned long long)event->id, *scene_probe, stage,
+                                    (unsigned long long)addr);
+                                const bool written = length > 0 && (size_t)length < sizeof path &&
+                                    prosper::test::dump_bmp(path, rgba, target.w, target.h);
+                                fprintf(stderr, "[compute-present] event=%llu render-submit=%d "
+                                                "cb=%llu probe=%u stage=%u addr=0x%llx "
+                                                "raw_nonzero=%zu/%zu image=%s\n",
+                                        (unsigned long long)event->id, g_this_submit,
+                                        (unsigned long long)g_pass_log_submit.load(),
+                                        *scene_probe, stage, (unsigned long long)addr,
+                                        raw_nonzero, raw.size(), written ? path : "UNAVAILABLE");
+                                return written;
+                            };
+                            size_t scene_nonzero = 0;
+                            const bool scene_ok = read_target(g_persist_filter.addresses[0], 0,
+                                                              scene_nonzero);
+                            if (!scene_ok) {
+                                probe.finish(event->id);
+                                fprintf(stderr, "[compute-present] event=%llu verdict=void "
+                                                "reason=scene-readback-failed\n",
+                                        (unsigned long long)event->id);
+                            } else if (scene_nonzero) {
+                                bool chain_ok = true;
+                                for (unsigned stage = 1; stage < 4; ++stage) {
+                                    size_t ignored_nonzero = 0;
+                                    chain_ok = read_target(g_persist_filter.addresses[stage],
+                                                           stage, ignored_nonzero) && chain_ok;
+                                }
+                                if (chain_ok) compute_present_final_id = event->id;
+                                else {
+                                    probe.finish(event->id);
+                                    fprintf(stderr, "[compute-present] event=%llu verdict=void "
+                                                    "reason=downstream-readback-failed\n",
+                                            (unsigned long long)event->id);
+                                }
+                            } else if (*scene_probe == 4) {
+                                probe.finish(event->id);
+                                fprintf(stderr, "[compute-present] event=%llu selector miss: "
+                                                "four scene probes were raw zero\n",
+                                        (unsigned long long)event->id);
+                            }
+                        }
+                    }
+                }
             } else {
                 // Single-framebuffer path: render_draws_rgba composites every draw into ONE framebuffer.
                 std::vector<const prosper::gpu::DrawItem*> all; all.reserve(items.size());
@@ -11870,6 +12071,38 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         selected_pixels ? selected_pixels->size() : 0, rgb_nonblack,
                         final_written ? path : "UNAVAILABLE");
             }
+            if (compute_present_final_id) {
+                auto& probe = prosper::frontend::compute_present_probe();
+                const auto event = probe.pending();
+                const bool still_current = event && event->id == compute_present_final_id;
+                const bool cpu_pairable = !published_gpu && selected_pixels &&
+                    selected_pixels->size() == static_cast<size_t>(w) * h * 4u;
+                char path[512];
+                bool written = false;
+                if (still_current && cpu_pairable) {
+                    const char* dir = PROSPER_ENV_VALUE("PROSPER_FRAME_DIR");
+                    const auto bmp_bytes = prosper::frontend::compute_probe_bmp_bytes(w, h);
+                    const bool budgeted = bmp_bytes &&
+                        probe.charge_bmp(compute_present_final_id, *bmp_bytes);
+                    const int length = std::snprintf(path, sizeof path,
+                        "%s/compute_present_e%llu_final.bmp", dir,
+                        (unsigned long long)compute_present_final_id);
+                    written = budgeted && length > 0 && (size_t)length < sizeof path &&
+                        prosper::test::dump_bmp(path, *selected_pixels, w, h);
+                }
+                const bool completed = still_current && probe.finish(compute_present_final_id);
+                fprintf(stderr, "[compute-present] event=%llu final render-submit=%d "
+                                "source=%s addr=0x%llx gpu_publish=%d cpu_bytes=%zu "
+                                "image=%s verdict=%s\n",
+                        (unsigned long long)compute_present_final_id, g_this_submit,
+                        kena_final_source, (unsigned long long)kena_final_addr,
+                        published_gpu ? 1 : 0,
+                        selected_pixels ? selected_pixels->size() : 0,
+                        written ? path : "UNAVAILABLE",
+                        completed && cpu_pairable && written ? "await-cpu-publish-seq" : "void");
+                if (!completed || !cpu_pairable || !written)
+                    compute_present_final_id = 0;
+            }
             if (timing_enabled && phase.final_span)
                 pending_timing.output_copy_ms += std::chrono::duration<double, std::milli>(
                     RenderClock::now() - output_copy_start).count();
@@ -12075,8 +12308,11 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         pending_timing, timing_enabled, phase.final_span);
                     prosper::gpu::RenderedFrame frame(std::move(selected_pixels));
                     frame.origin = frame_origin;
-                    frame.diagnostic_trace_id = kena_trace_id;
-                    frame.diagnostic_gpu_published = kena_trace_this_callback && published_gpu;
+                    frame.diagnostic_trace_id = compute_present_final_id
+                        ? compute_present_final_id : kena_trace_id;
+                    frame.diagnostic_gpu_published =
+                        (kena_trace_this_callback || compute_present_final_id) && published_gpu;
+                    frame.diagnostic_compute_present_probe = compute_present_final_id != 0;
                     frame.diagnostic_source_kind = kena_final_source;
                     frame.diagnostic_source_address = kena_final_addr;
                     frame.diagnostic_served_retained = kena_served_retained;
@@ -13147,8 +13383,11 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             }
             prosper::gpu::RenderedFrame frame(std::move(selected_pixels));
             frame.origin = frame_origin;
-            frame.diagnostic_trace_id = kena_trace_id;
-            frame.diagnostic_gpu_published = kena_trace_this_callback && published_gpu;
+            frame.diagnostic_trace_id = compute_present_final_id
+                ? compute_present_final_id : kena_trace_id;
+            frame.diagnostic_gpu_published =
+                (kena_trace_this_callback || compute_present_final_id) && published_gpu;
+            frame.diagnostic_compute_present_probe = compute_present_final_id != 0;
             frame.diagnostic_source_kind = kena_final_source;
             frame.diagnostic_source_address = kena_final_addr;
             frame.diagnostic_served_retained = kena_served_retained;

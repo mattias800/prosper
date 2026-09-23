@@ -9261,6 +9261,7 @@ namespace {
 void observe_diagnostic_render(OrderedSubmitResult& result, const RenderedFrame& rendered) {
     if (!rendered.diagnostic_trace_id) return;
     result.diagnostic_trace_id = rendered.diagnostic_trace_id;
+    result.diagnostic_compute_present_probe = rendered.diagnostic_compute_present_probe;
     result.diagnostic_gpu_published = rendered.diagnostic_gpu_published;
 }
 
@@ -11975,15 +11976,20 @@ bool execute_ordered_and_present(const GpuState& st, uint32_t width, uint32_t he
             ? result.frame.diagnostic_source_address : 0;
         const bool cpu_served_retained = published_seq &&
             result.frame.diagnostic_served_retained;
-        std::fprintf(stderr, "[kena-menu] trace=%llu submit=%llu cpu_source_seq=%llu "
+        std::fprintf(stderr, "%s trace=%llu submit=%llu cpu_source_seq=%llu "
                              "cpu_frame_from=%s cpu_source=%s cpu_addr=0x%llx cpu_retained=%d "
-                             "cpu_bytes=%zu gpu_published=%d publish_gate=%d\n",
+                             "cpu_bytes=%zu gpu_published=%d publish_gate=%d join=%s\n",
+                     result.diagnostic_compute_present_probe
+                         ? "[compute-present]" : "[kena-menu]",
                      (unsigned long long)diagnostic_trace_id,
                      (unsigned long long)submit_no,
                      (unsigned long long)published_seq, frame_from, cpu_source,
                      (unsigned long long)cpu_source_address, cpu_served_retained ? 1 : 0,
                      px.size(),
-                     result.diagnostic_gpu_published ? 1 : 0, publish ? 1 : 0);
+                     result.diagnostic_gpu_published ? 1 : 0, publish ? 1 : 0,
+                     published_seq && !result.diagnostic_gpu_published &&
+                             result.frame.diagnostic_trace_id == diagnostic_trace_id
+                         ? "returned-final" : "refused");
     }
     if (timing_enabled) {
         const auto timing_done = TimingClock::now();
