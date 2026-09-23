@@ -207,5 +207,29 @@ int main(int argc, char** argv) {
         return 1;
     }
     std::printf("  [ok] seeded --recompile-raw restores RTT/DS and reaches renderer output\n");
+
+    const auto raw_seed_path = prosper_test::test_scratch_path("seeded-raw.rtt.bin");
+    const auto raw_output_path = prosper_test::test_scratch_path("seeded-raw-dump.bmp");
+    const auto raw_log_path = prosper_test::test_scratch_path("seeded-raw-dump.log");
+    std::error_code remove_error;
+    std::filesystem::remove(raw_seed_path, remove_error);
+    if (remove_error) {
+        std::fprintf(stderr, "[FAIL] cannot clear prior raw RTT dump: %s\n",
+                     remove_error.message().c_str());
+        return 1;
+    }
+    const std::string raw_command = quote(argv[1]) + " --dump-rtt-seed-raw 0x100000 " +
+        quote(raw_seed_path) + " " + quote(capsule_path) + " " + quote(raw_output_path) +
+        " > " + quote(raw_log_path) + " 2>&1";
+    const int raw_exit = child_exit_code(std::system(raw_command.c_str()));
+    std::vector<uint8_t> raw_seed;
+    const bool raw_read = read_file(raw_seed_path, raw_seed);
+    if (raw_exit != 0 || !raw_read || raw_seed != capture.rtt_seeds[0].rgba) {
+        std::fprintf(stderr,
+                     "[FAIL] raw RTT dump must preserve exact seed bytes (exit=%d read=%d bytes=%zu)\n",
+                     raw_exit, raw_read, raw_seed.size());
+        return 1;
+    }
+    std::printf("  [ok] raw RTT dump preserves exact seed bytes\n");
     return 0;
 }

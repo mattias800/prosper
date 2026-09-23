@@ -53,6 +53,7 @@
 #include "fixtures/render_runner.h"              // offscreen Vulkan backend (render_draws_rgba) + dump_bmp
 
 #include <atomic>
+#include <cerrno>
 #include <functional>
 #include <chrono>
 #include <climits>
@@ -113,6 +114,34 @@ bool flush_live_graphics_pipeline_cache() {
 // this the composite samples zeros and the frame is black. We cache each submit's rendered pixels under
 // its render-target base and inject them when a subsequent draw samples a texture at a matching base.
 namespace {
+bool parse_diagnostic_address(const char* spec, uint64_t& address) {
+    if (!spec) return true;
+    if (spec[0] != '0' || (spec[1] != 'x' && spec[1] != 'X') || !spec[2]) return false;
+    char* end = nullptr;
+    errno = 0;
+    const unsigned long long parsed = std::strtoull(spec, &end, 16);
+    if (errno || end == spec + 2 || *end || !parsed) return false;
+    address = parsed;
+    return true;
+}
+
+bool parse_diagnostic_extent(const char* spec, uint32_t& width, uint32_t& height) {
+    if (!spec) return true;
+    if (*spec < '0' || *spec > '9') return false;
+    char* separator = nullptr;
+    errno = 0;
+    const unsigned long w = std::strtoul(spec, &separator, 10);
+    if (errno || !separator || *separator != 'x' || !w || w > UINT32_MAX ||
+        separator[1] < '0' || separator[1] > '9') return false;
+    char* end = nullptr;
+    errno = 0;
+    const unsigned long h = std::strtoul(separator + 1, &end, 10);
+    if (errno || !end || *end || !h || h > UINT32_MAX) return false;
+    width = static_cast<uint32_t>(w);
+    height = static_cast<uint32_t>(h);
+    return true;
+}
+
 // Installed by the live-renderer registration below; called from the guest flip path through the
 // extern "C" entry at the bottom of this file, which that registration hands to core. Empty when
 // the live renderer is not registered.
@@ -1542,6 +1571,17 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     filter.state == prosper::frontend::PersistentReadbackFilterState::TooMany
                         ? "more than eight addresses" : "malformed 0x-prefixed list");
         return filter;
+    }();
+    static const std::pair<uint32_t, uint32_t> g_persist_extent = [] {
+        const char* spec = PROSPER_ENV_VALUE("PROSPER_DUMP_PERSISTENT_EXTENT");
+        if (!spec) return std::pair<uint32_t, uint32_t>{0, 0};
+        uint32_t width = 0, height = 0;
+        if (!parse_diagnostic_extent(spec, width, height)) {
+            std::fprintf(stderr, "[persist] extent selector refused: expected WxH\n");
+            return std::pair<uint32_t, uint32_t>{UINT32_MAX, UINT32_MAX};
+        }
+        std::fprintf(stderr, "[persist] extent selector armed on %ux%u\n", width, height);
+        return std::pair<uint32_t, uint32_t>{width, height};
     }();
     // Match boot_trace's progression-diagnostic contract: callers may register the graphics
     // renderer while deliberately leaving compute unregistered. This keeps semantic dispatches
@@ -8739,6 +8779,39 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     fprintf(stderr, "[fs-match] PROSPER_FS_SPV_MATCH='%s' invalid/unreadable -> applying NO "
                             "fragment file override (fail closed)\n", mp);
             }
+            // Optional second selector for a live exact-program experiment. A matching SPIR-V
+            // module can be reused by unrelated draws, so a shader-only A/B is not necessarily
+            // an exact draw substitution. Invalid input fails closed.
+            const char* fs_guest_addr_text = PROSPER_ENV_VALUE("PROSPER_FS_SPV_GUEST_ADDR");
+            uint64_t fs_guest_addr = 0;
+            const bool fs_guest_addr_valid =
+                parse_diagnostic_address(fs_guest_addr_text, fs_guest_addr);
+            if (!fs_guest_addr_valid) {
+                static std::atomic_flag warned = ATOMIC_FLAG_INIT;
+                if (!warned.test_and_set())
+                    std::fprintf(stderr,
+                                 "[fs-match] PROSPER_FS_SPV_GUEST_ADDR invalid -> no file override\n");
+            }
+            const char* fs_target_addr_text = PROSPER_ENV_VALUE("PROSPER_FS_SPV_TARGET_ADDR");
+            uint64_t fs_target_addr = 0;
+            const bool fs_target_addr_valid =
+                parse_diagnostic_address(fs_target_addr_text, fs_target_addr);
+            if (!fs_target_addr_valid) {
+                static std::atomic_flag warned = ATOMIC_FLAG_INIT;
+                if (!warned.test_and_set())
+                    std::fprintf(stderr,
+                                 "[fs-match] PROSPER_FS_SPV_TARGET_ADDR invalid -> no file override\n");
+            }
+            const char* fs_target_dim_text = PROSPER_ENV_VALUE("PROSPER_FS_SPV_TARGET_DIM");
+            uint32_t fs_target_width = 0, fs_target_height = 0;
+            const bool fs_target_dim_valid =
+                parse_diagnostic_extent(fs_target_dim_text, fs_target_width, fs_target_height);
+            if (!fs_target_dim_valid) {
+                static std::atomic_flag warned = ATOMIC_FLAG_INIT;
+                if (!warned.test_and_set())
+                    std::fprintf(stderr,
+                                 "[fs-match] PROSPER_FS_SPV_TARGET_DIM invalid -> no file override\n");
+            }
             // PROSPER_RENDER_TESTPS_MATCH=<file> is the geometry half of a per-shader A/B test: replace
             // only that exact guest PS with the known solid output while retaining its real VS, indices,
             // viewport, depth and raster state. As with FS_SPV_MATCH, a bad path fails closed.
@@ -8809,6 +8882,13 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         if (fs_match_mode == 1)      fs_ov = (it.fs_words() == fs_match);   // valid match -> exact only
                         else if (fs_match_mode == 2) fs_ov = false;                // requested-but-invalid -> off
                         // mode 0 -> legacy global file override (unchanged)
+                        if (!fs_guest_addr_valid || !fs_target_addr_valid || !fs_target_dim_valid ||
+                            (fs_guest_addr_text && it.fs_guest_addr != fs_guest_addr) ||
+                            (fs_target_addr_text && it.color0_base != fs_target_addr) ||
+                            (fs_target_dim_text &&
+                             (it.color0_width != fs_target_width ||
+                              it.color0_height != fs_target_height)))
+                            fs_ov = false;
                     }
                     if (fs_ov && ps_override_is_test) {
                         if (testps_match_mode == 1)      fs_ov = (it.fs_words() == testps_match);
@@ -11163,6 +11243,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         for (auto& kv : g_rtt) {
                             if (!g_persist_filter.allows(kv.first)) continue;
                             RttSurf& s = kv.second;
+                            if (g_persist_extent.first &&
+                                (s.w != g_persist_extent.first ||
+                                 s.h != g_persist_extent.second)) continue;
                             if (!s.gpu_valid || !s.w || !s.h ||
                                 static_cast<uint64_t>(s.w) * s.h < 64u * 64u) {
                                 if (g_persist_filter.state ==
@@ -11176,8 +11259,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             const VkFormat fmt = prosper::test::backend_color_format(s.format);
                             const uint32_t bpp = prosper::test::backend_color_bytes_per_pixel(fmt);
                             uint64_t expected = 0;
-                            if (g_persist_filter.state ==
-                                    prosper::frontend::PersistentReadbackFilterState::Selected) {
+                            if (g_persist_extent.first || g_persist_filter.state ==
+                                prosper::frontend::PersistentReadbackFilterState::Selected) {
                                 const auto charge = selected_readback_budget.admit(s.w, s.h, bpp,
                                                                                    expected);
                                 if (charge != prosper::frontend::PersistentReadbackCharge::Admitted) {

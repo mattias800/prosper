@@ -3,6 +3,7 @@
 #include <array>
 #include <cstdio>
 #include <limits>
+#include <string>
 #include <vector>
 
 using namespace prosper::gpu;
@@ -41,6 +42,9 @@ int main() {
               "4294967296x100:5,60,45,90:5,5,45,35:50,50:170,48,1000,1000", parsed) &&
               !parsed.valid(),
           "numeric overflow cannot wrap into an apparently valid ROI");
+    const std::string oversized_gate(257, '1');
+    CHECK(!parse_menu_frame_gate_spec(oversized_gate.c_str(), parsed) && !parsed.valid(),
+          "an oversized gate must refuse before parsing an unbounded input");
     std::vector<uint8_t> pixels(static_cast<size_t>(width) * height * 4, 0);
     auto paint = [&](MenuFrameRoi roi, uint32_t count) {
         for (uint32_t y = roi.y0; y < roi.y1; ++y)

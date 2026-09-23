@@ -15,7 +15,6 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
 #include <filesystem>
 #include <limits>
 #include <mutex>
@@ -51,9 +50,14 @@ bool parse_positive_address(const char* value, uint64_t& out) {
 bool parse_extent(const char* value, uint32_t& width, uint32_t& height) {
     width = height = 0;
     if (!value) return false;
-    const char* separator = std::strchr(value, 'x');
-    if (!separator) return false;
-    const char* end = value + std::strlen(value);
+    // Two decimal uint32 components and one separator require at most 21 bytes.
+    constexpr size_t kMaxExtentLength = 21;
+    size_t length = 0;
+    while (length <= kMaxExtentLength && value[length]) ++length;
+    if (!length || length > kMaxExtentLength) return false;
+    const char* end = value + length;
+    const char* separator = std::find(value, end, 'x');
+    if (separator == end) return false;
     const auto w = std::from_chars(value, separator, width);
     const auto h = std::from_chars(separator + 1, end, height);
     return w.ec == std::errc{} && w.ptr == separator &&

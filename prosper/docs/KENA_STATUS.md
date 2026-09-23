@@ -1,8 +1,8 @@
 # Kena: Bridge of Spirits (`PPSA01802`) — status
 
 Unreal Engine 4 (Ember Lab), one 28.5 GB `kena-ps5.pak` (no IoStore), Wwise, SDK `0x03000000`. Tracker
-[#3787](https://github.com/mattias800/prosper/issues/3787). Brought up on **Windows 11 / RTX 4090** only; no
-Linux/AMD run is on record yet.
+[#3787](https://github.com/mattias800/prosper/issues/3787). Brought up on Windows 11 / RTX 4090;
+Linux/AMD title-menu investigations are recorded below.
 
 ## Current state — rung 2, gameplay reached with the world absent (2026-09-23)
 
@@ -31,6 +31,30 @@ missing animated background is probably the same thing. Confirming it needs eith
 census of which draws in a gameplay frame are skipped; neither has been done.
 
 Every menu frame also alternates with a fully black composited frame in about half the samples; not investigated.
+
+### Linux/AMD title-menu boundary (2026-09-24)
+
+The live menu still shows its wordmark and UI over black. A retained 1600×900 RGBA16F target on the normal
+render path contains nonzero scene data (one observed target has every RGB channel at half-float maximum), while
+the later 3200×1800 compositor output is black. Other same-extent retained images contain recognizable forest
+content. The saturated target is not by itself evidence of the correct scene: raw half-float values and converted
+BMP previews have different meanings. The ordered submit capsule is explicitly **unverified** because it was not
+matched to its own presented frame; its draw/dispatch lineage is useful for localization, not a visual oracle.
+
+In that capsule, the final compositor samples a zero 32³ LUT at PS binding 39. The immediately preceding LUT
+producer is unrealized because its merged-NGG vertex chain hits the existing wave/mesh gate
+[#3135](https://github.com/mattias800/prosper/issues/3135). A one-instruction replacement of the compositor's
+final LUT sample with its existing lookup coordinates, preserving the rest of the fragment shader, leaves the
+**live** menu black by itself. An independent header-derived input-default probe also leaves it black by itself;
+together the probes expose a washed-out, blocky scene. This is diagnostic output, not a rendering fix, and the
+two controls are not a full same-binary 2×2 experiment. Neither substitution belongs in the default path.
+
+The fragment uses five input locations. Its paired vertex SPIR-V declares them but stores none; the captured
+vertex program exports PRIM/POS0 without PARAM exports. The guest writes `SPI_PS_INPUT_CNTL_0..4=0` through
+indirect **physical** register offsets (17,420 observed writes, none through the virtual AGC bank), while the AGC
+header derives constant-default metadata. That metadata does not override the explicit register value on the
+evidence available. The pair is a fused front shader, with no hidden linked back/chain body in this draw.
+Determine the PS5 behavior for this missing-PARAM interface before changing generic interpolation semantics.
 
 ## Reproduction
 
@@ -82,6 +106,16 @@ About 2 in 12 launches hang before their first frame (no raw scanout either). No
 - **Seconds-anchored pad pulses are enough for this title's menus** — false. An 11-press seconds-based route
   delivered 2 presses, because the guest reads the pad about once a second there and a 300 ms pulse mostly falls
   between reads; pad-read anchors (`pN`) deliver every press.
+- **The missing 3D LUT alone explains the black live title scene** — false as a complete explanation. Replacing
+  only its compositor sample with the existing lookup coordinates left the live menu black; combining that
+  diagnostic replacement with a fragment-input-default probe exposed a washed-out scene. The LUT producer is
+  still missing in the unverified capsule, so this does not exonerate the merged-NGG gap (#3135).
+- **The fragment inputs are zero because virtual AGC register translation dropped their writes** — false for
+  this frame. A path-labelled register watch observed 17,420 direct physical indirect-array writes to the five
+  controls and zero virtual-bank writes. The observed values are guest-supplied, not absent state (#3835).
+- **The vertex shader's missing PARAM stores are in an unlinked back half** — false for this draw. Exact-pair
+  logging names one fused front program, no chain, and no linked second body; its decoded entry ends without
+  a PARAM export (#3835).
 
 ## Next
 
@@ -89,8 +123,9 @@ About 2 in 12 launches hang before their first frame (no raw scanout either). No
   a per-draw skip census of a gameplay frame; if it is, the title waits on #2147.
   A Linux lane has since traced the menu scene ([#3813](https://github.com/mattias800/prosper/pull/3813)): the
   forest is present in a retained MRT3 image that a one-block fragment shader samples at binding 37 — so on Linux
-  the background scene is rendered somewhere, and that PR explicitly does not yet say where it is lost. Read it
-  before assuming the Windows black background is the wave64 skip.
+  the background scene is rendered somewhere. The Linux title-menu boundary above now narrows the later loss;
+  do not assume the Windows black background is solely the wave64 skip. Resolve the generic missing-PARAM
+  contract and merged-NGG LUT producer separately, then compare a live default-path image with the oracle.
 - Host-side renderer reads of never-mapped guest memory (#3820), and `SCE_KERNEL_MAP_NO_OVERWRITE` (#3819).
 - The invisible logo movie: 150 frames decoded and delivered, none visible; delivered at ~2x real time.
 - The early-boot hang (about 2 in 12 launches).

@@ -3,7 +3,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <charconv>
-#include <cstring>
 #include <limits>
 #include <span>
 #include <system_error>
@@ -44,7 +43,13 @@ inline bool parse_menu_frame_gate_spec(const char* text, MenuFrameGateSpec& out)
     out = {};
     if (!text || !*text) return false;
     const char* cursor = text;
-    const char* end = text + std::strlen(text);
+    // Sixteen numeric values, including two uint8 thresholds, and their separators fit below this
+    // bound. Refuse an oversized environment value before parsing or scanning it further.
+    constexpr size_t kMaxSpecLength = 256;
+    size_t length = 0;
+    while (length <= kMaxSpecLength && text[length]) ++length;
+    if (length > kMaxSpecLength) return false;
+    const char* end = text + length;
     auto read = [&](uint32_t& value, char delimiter) {
         const auto parsed = std::from_chars(cursor, end, value);
         if (parsed.ec != std::errc{} || parsed.ptr == cursor ||

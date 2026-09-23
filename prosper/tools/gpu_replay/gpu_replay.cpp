@@ -72,6 +72,7 @@ void usage(const char* argv0) {
                          "[--list-resources DRAW:vs|ps] [--dump-resource DRAW:vs|ps:BINDING PATH] [--allow-mismatch] "
                          "[--override-resource DRAW:vs|ps:BINDING PATH] [--override-submit N] "
                          "[--dump-rtt-seed ADDR PATH] "
+                         "[--dump-rtt-seed-raw ADDR PATH] "
                          "[--override-rtt-seed ADDR RAW-PATH] "
                          "[--dump-shader DRAW:vs|fs PATH] [--dump-compute N PATH] "
                          "[--override-fragment-spv DRAW PATH] "
@@ -2191,6 +2192,7 @@ int main(int argc, char** argv) {
     std::string list_resources_spec;   // #2373
     std::string realized_shader_spec, realized_shader_path;
     std::string rtt_seed_path;
+    std::string rtt_seed_raw_path;
     std::string graph_json_path, prepend_path;
     std::string bundle_path, bundle_compact_path;
     std::string bundle_final_capsule_path;
@@ -2198,6 +2200,7 @@ int main(int argc, char** argv) {
     uint64_t bundle_extract_submit_no = 0;
     uint64_t bundle_find_ds_addr = 0;
     uint64_t rtt_seed_addr = 0;
+    uint64_t rtt_seed_raw_addr = 0;
     uint64_t rtt_seed_override_addr = 0;
     std::string rtt_seed_override_path;
     std::vector<const char*> positional;
@@ -2361,6 +2364,15 @@ int main(int argc, char** argv) {
             rtt_seed_addr = std::strtoull(argv[++i], &end, 0);
             if (!end || *end || !rtt_seed_addr) { usage(argv[0]); return 2; }
             rtt_seed_path = argv[++i];
+        }
+        else if (std::string(argv[i]) == "--dump-rtt-seed-raw" && i + 2 < argc) {
+            if (rtt_seed_raw_addr ||
+                !prosper::gpu::parse_diagnostic_uint64(argv[++i], rtt_seed_raw_addr) ||
+                !rtt_seed_raw_addr) {
+                usage(argv[0]); return 2;
+            }
+            rtt_seed_raw_path = argv[++i];
+            if (rtt_seed_raw_path.empty()) { usage(argv[0]); return 2; }
         }
         else if (std::string(argv[i]) == "--override-rtt-seed" && i + 2 < argc) {
             if (rtt_seed_override_addr ||
@@ -2539,7 +2551,7 @@ int main(int argc, char** argv) {
         if (positional.size() > 1 || inspect || inspect_only || validate_only || graph_only ||
             draw_selected || draw_with_compute_prefix || through_operation >= 0 ||
             compute_only >= 0 ||
-            warmup_repeats || !dump_spec.empty() || rtt_seed_addr ||
+            warmup_repeats || !dump_spec.empty() || rtt_seed_addr || rtt_seed_raw_addr ||
             rtt_seed_override_addr || fragment_override_requested ||
             !shader_spec.empty() || !compute_shader_spec.empty() ||
             !compute_raw_spec.empty() ||
@@ -3153,6 +3165,27 @@ int main(int argc, char** argv) {
                      static_cast<unsigned long long>(seed->guest_addr), seed->width, seed->height,
                      prosper::gpu::replay_tool::rtt_seed_format_name(seed->format),
                      rtt_seed_path.c_str());
+    }
+    if (rtt_seed_raw_addr) {
+        const auto seed = std::find_if(replay.rtt_seeds.begin(), replay.rtt_seeds.end(),
+            [&](const auto& candidate) { return candidate.guest_addr == rtt_seed_raw_addr; });
+        if (seed == replay.rtt_seeds.end() || seed->rgba.empty()) {
+            std::fprintf(stderr, "gpu_replay: raw RTT seed %016llx not found or empty\n",
+                         static_cast<unsigned long long>(rtt_seed_raw_addr));
+            return 2;
+        }
+        FILE* f = std::fopen(rtt_seed_raw_path.c_str(), "wb");
+        const bool wrote = f && std::fwrite(seed->rgba.data(), 1, seed->rgba.size(), f) == seed->rgba.size();
+        const bool closed = f && std::fclose(f) == 0;
+        if (!wrote || !closed) {
+            std::fprintf(stderr, "gpu_replay: cannot write raw RTT seed %s\n",
+                         rtt_seed_raw_path.c_str());
+            return 2;
+        }
+        std::fprintf(stderr, "[gpureplay] dumped raw RTT seed %016llx %ux%u format=%s bytes=%zu -> %s\n",
+                     static_cast<unsigned long long>(seed->guest_addr), seed->width, seed->height,
+                     prosper::gpu::replay_tool::rtt_seed_format_name(seed->format), seed->rgba.size(),
+                     rtt_seed_raw_path.c_str());
     }
     if (graph_only) {
         prosper::gpu::GpuDependencyGraph graph;
