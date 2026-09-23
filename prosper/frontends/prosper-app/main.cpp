@@ -2054,10 +2054,14 @@ int main(int argc, char** argv) {
                                  replaced.c_str());
                     if (auto old = grabJoins.find(replaced); old != grabJoins.end()) {
                         std::error_code manifest_ec;
-                        if (std::filesystem::is_regular_file(old->second.manifest, manifest_ec) &&
-                            !manifest_ec && std::filesystem::file_size(
-                                old->second.manifest, manifest_ec) == 0 && !manifest_ec)
-                            std::filesystem::remove(old->second.manifest, manifest_ec);
+                        const bool regular = std::filesystem::is_regular_file(
+                            old->second.manifest, manifest_ec);
+                        if (regular && !manifest_ec) {
+                            const auto bytes = std::filesystem::file_size(
+                                old->second.manifest, manifest_ec);
+                            if (!manifest_ec && bytes == 0)
+                                std::filesystem::remove(old->second.manifest, manifest_ec);
+                        }
                         forgetGrabJoin(replaced);
                     }
                 }
