@@ -124,6 +124,18 @@ int main() {
         !check(!at_pad(true, false, 3930, 3930),
                "ordinary A/B capture entered metadata-only census"))
         return 1;
+    // The live caller supplies the renderer's active address for each slot. A c0/c1-only
+    // implementation passes the old detail-line check but misses these c3/c7 bindings.
+    const std::array<uint64_t, 8> active_targets{
+        config.color_base, 0, 0, 0x204f9a0000ull, 0, 0, 0, config.color_base};
+    int slot_reads = 0;
+    const auto target_slots = prosper::frontend::world_census_target_slots(
+        static_cast<uint32_t>(active_targets.size()), config.color_base, 0x204f9a0000ull,
+        [&](uint32_t slot) { ++slot_reads; return active_targets[slot]; });
+    if (!check(target_slots.world == 0x81u && target_slots.composite == 0x8u &&
+                   slot_reads == 8,
+               "world/composite slot scan missed an active c2..c7 binding"))
+        return 1;
     int pad_reads = 0;
     const auto read_pad = [&] { ++pad_reads; return int64_t{3930}; };
     if (!check(prosper::frontend::world_census_callback_pad(false, false, read_pad) == -1 &&
@@ -189,9 +201,67 @@ int main() {
                "two large world versions called a single producer"))
         return 1;
     census = {};
+    census.observe(true, true, false, WorldDepthPassKind::Geometry, 162);
+    census.observe(false, false, true, WorldDepthPassKind::Unrelated, 1);
+    if (!check(census.has_single_ordered_candidate(),
+               "second-world-group negative control did not first establish a candidate"))
+        return 1;
+    census.observe(true, true, false, WorldDepthPassKind::OtherWorld, 1);
+    if (!check(census.world_groups == 2 && census.large_world_groups == 1 &&
+                   !census.has_single_ordered_candidate(),
+               "a later one-draw world write still passed the single-version gate"))
+        return 1;
+    census = {};
+    census.observe(true, true, false, WorldDepthPassKind::OtherWorld, 1);
+    census.observe(true, true, false, WorldDepthPassKind::Geometry, 162);
+    census.observe(false, false, true, WorldDepthPassKind::Unrelated, 1);
+    if (!check(census.world_groups == 2 && census.large_world_groups == 1 &&
+                   !census.has_single_ordered_candidate(),
+               "an earlier one-draw world seed still passed the single-version gate"))
+        return 1;
+    census = {};
     census.observe(true, true, true, WorldDepthPassKind::Geometry, 162);
     if (!check(!census.has_single_ordered_candidate(),
                "world/composite bound in one unordered group counted as sequential"))
+        return 1;
+    census = {};
+    census.observe_guest_flip(3930);
+    census.observe(true, true, false, WorldDepthPassKind::Geometry, 162);
+    census.observe(false, false, true, WorldDepthPassKind::Unrelated, 1);
+    if (!check(census.has_single_ordered_candidate(),
+               "overlap negative control did not first establish an ordered candidate"))
+        return 1;
+    census = {};
+    census.observe_guest_flip(3930);
+    census.observe(true, true, true, WorldDepthPassKind::Geometry, 162);
+    census.observe(false, false, true, WorldDepthPassKind::Unrelated, 1);
+    if (!check(census.world_groups == 1 && census.large_world_groups == 1 &&
+                   census.composite_after_large_world == 1 &&
+                   census.world_composite_overlap_groups == 1 &&
+                   !census.has_single_ordered_candidate(),
+               "MRT world/composite overlap still authorized a single version join"))
+        return 1;
+    census = {};
+    census.observe_guest_flip(3930);
+    census.observe(true, true, false, WorldDepthPassKind::Geometry, 162);
+    census.observe(false, false, true, WorldDepthPassKind::Unrelated, 1);
+    if (!check(census.has_single_ordered_candidate(),
+               "guest-flip negative control did not first establish an ordered candidate"))
+        return 1;
+    census.observe_guest_flip(3931);
+    if (!check(census.unstable_guest_flips == 1 &&
+                   !census.has_single_ordered_candidate(),
+               "changed guest flip still authorized a single version join"))
+        return 1;
+    census = {};
+    census.observe(true, true, false, WorldDepthPassKind::Geometry, 162);
+    census.observe(false, false, true, WorldDepthPassKind::Unrelated, 1);
+    if (!check(census.has_single_ordered_candidate(),
+               "descriptor-overflow negative control did not first establish a candidate"))
+        return 1;
+    ++census.descriptor_overflow;
+    if (!check(!census.has_single_ordered_candidate(),
+               "truncated composite descriptors still authorized a version join"))
         return 1;
     census = {};
     for (uint64_t i = 0; i < prosper::frontend::WorldProducerCensus::kMaximumLines - 1; ++i)

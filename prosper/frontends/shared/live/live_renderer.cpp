@@ -9487,28 +9487,84 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         return;
                     constexpr uint64_t composite_base = 0x204f9a0000ull;
                     bool depth_bound = false, world_bound = false, composite_bound = false;
+                    uint32_t world_slots = 0, composite_slots = 0;
+                    size_t world_bound_draws = 0, composite_bound_draws = 0;
+                    size_t both_bound_draws = 0;
+                    size_t world_vs_descriptors = 0, world_ps_descriptors = 0;
+                    const uint64_t first_fs = group.front()->fs_guest_addr;
+                    bool mixed_fs = false;
                     for (const auto* draw : group) {
+                        bool draw_world_bound = false, draw_composite_bound = false;
                         depth_bound |= draw->ps.depth_write_base ==
                             world_depth_ab->config.depth_base;
+                        mixed_fs |= draw->fs_guest_addr != first_fs;
                         if (resolve) {
-                            world_bound |= draw->color1_base == world_depth_ab->config.color_base;
-                            composite_bound |= draw->color1_base == composite_base;
+                            draw_world_bound = draw->color1_base ==
+                                world_depth_ab->config.color_base;
+                            draw_composite_bound = draw->color1_base == composite_base;
+                            if (draw_world_bound) world_slots |= 1u << 1;
+                            if (draw_composite_bound) composite_slots |= 1u << 1;
                         } else {
-                            for (uint32_t slot = 0; slot < prosper::gpu::kColorTargetCount;
-                                 ++slot) {
-                                if (!prosper::frontend::mrt_write_mask(*draw, slot)) continue;
-                                const uint64_t target = color_binding(*draw, slot).base;
-                                world_bound |= target == world_depth_ab->config.color_base;
-                                composite_bound |= target == composite_base;
-                            }
+                            // The old census already exposed the group-level overlap. Its c0/c1
+                            // fields hid WHICH higher slot was bound, and whether the same draw
+                            // bound both targets. Use the renderer's active-attachment rule.
+                            const auto slots = world_census_target_slots(
+                                prosper::gpu::kColorTargetCount,
+                                world_depth_ab->config.color_base, composite_base,
+                                [&](uint32_t slot) { return active_color(*draw, slot); });
+                            world_slots |= slots.world;
+                            composite_slots |= slots.composite;
+                            draw_world_bound = slots.world != 0;
+                            draw_composite_bound = slots.composite != 0;
                         }
+                        world_bound |= draw_world_bound;
+                        composite_bound |= draw_composite_bound;
+                        world_bound_draws += draw_world_bound;
+                        composite_bound_draws += draw_composite_bound;
+                        both_bound_draws += draw_world_bound && draw_composite_bound;
+                        const auto count_world_descriptor = [&](const auto* table, size_t& count) {
+                            if (!table) return;
+                            for (const auto& r : table->resources)
+                                count += (r.cls == RC::Texture || r.cls == RC::StorageImage) &&
+                                    r.gpu_addr == world_depth_ab->config.color_base;
+                        };
+                        count_world_descriptor(draw->vrt.get(), world_vs_descriptors);
+                        count_world_descriptor(draw->prt.get(), world_ps_descriptors);
                     }
                     if (!depth_bound && !world_bound && !composite_bound) return;
+                    // A descriptor is evidence of a declared input, not proof that its shader
+                    // sampled it or that the backend served this exact retained image version.
+                    // Keep at most eight distinct image facts for groups that target only the
+                    // composite. Other groups already occupy the bounded census's line budget.
+                    using ImageFact = std::tuple<uint32_t, uint32_t, uint64_t,
+                                                 uint32_t, uint32_t, uint32_t, uint32_t>;
+                    std::set<ImageFact> image_facts;
+                    size_t image_fact_overflow = 0;
+                    if (composite_bound && !world_bound && !resolve) {
+                        for (const auto* draw : group) {
+                            const auto collect = [&](const auto* table, uint32_t stage) {
+                                if (!table) return;
+                                for (const auto& r : table->resources) {
+                                    if (r.cls != RC::Texture && r.cls != RC::StorageImage)
+                                        continue;
+                                    const ImageFact fact{stage, static_cast<uint32_t>(r.cls),
+                                        r.gpu_addr, r.binding, r.width, r.height, r.img_dim};
+                                    if (image_facts.contains(fact)) continue;
+                                    if (image_facts.size() < 8) image_facts.insert(fact);
+                                    else ++image_fact_overflow;
+                                }
+                            };
+                            collect(draw->vrt.get(), 0);
+                            collect(draw->prt.get(), 1);
+                        }
+                    }
                     auto& census = world_depth_ab->census;
                     if (!census.observe_at(world_depth_ab->armed, world_depth_ab->census_only,
                             world_depth_ab->config.capture_pad_flip, callback_pad,
                             depth_bound, world_bound, composite_bound, kind, group.size()))
                         return;
+                    const uint64_t observed_guest_flip = prosper_vo_flip_count();
+                    census.observe_guest_flip(observed_guest_flip);
                     if (!census.reserve_detail_line()) return;
                     const auto& head = *group.front();
                     const auto& ps = head.ps;
@@ -9520,15 +9576,23 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         "[world-producer-census] observation-pad=%lld observed-guest-flip=%llu "
                         "submit=%d "
                         "group=%zu..%zu order=%llu draws=%zu depth-bound=%d world-write-bound=%d "
-                        "composite-write-bound=%d "
+                        "composite-write-bound=%d world-slots=0x%x composite-slots=0x%x "
+                        "world-bound-draws=%zu composite-bound-draws=%zu both-bound-draws=%zu "
+                        "world-vs-descriptors=%zu world-ps-descriptors=%zu "
+                        "fs-first=0x%llx fs-mixed=%d image-facts=%zu image-overflow=%zu "
                         "kind=%s resolve=%d c0=0x%llx c1=0x%llx c0-mask=0x%x "
                         "depth=0x%llx read-depth=0x%llx scissor=%d,%d..%d,%d "
                         "native=%ux%u; target binding is not pixel-write or present provenance\n",
                         static_cast<long long>(callback_pad),
-                        static_cast<unsigned long long>(prosper_vo_flip_count()), g_this_submit,
+                        static_cast<unsigned long long>(observed_guest_flip), g_this_submit,
                         first_index, first_index + group.size() - 1,
                         static_cast<unsigned long long>(census.relevant_groups), group.size(),
-                        depth_bound, world_bound, composite_bound, kind_name, resolve,
+                        depth_bound, world_bound, composite_bound,
+                        world_slots, composite_slots, world_bound_draws, composite_bound_draws,
+                        both_bound_draws,
+                        world_vs_descriptors, world_ps_descriptors,
+                        static_cast<unsigned long long>(first_fs), mixed_fs,
+                        image_facts.size(), image_fact_overflow, kind_name, resolve,
                         static_cast<unsigned long long>(head.color0_base),
                         static_cast<unsigned long long>(head.color1_base),
                         prosper::frontend::mrt_write_mask(head, 0),
@@ -9536,6 +9600,21 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         static_cast<unsigned long long>(ps.depth_read_base),
                         ps.scissor_left, ps.scissor_top, ps.scissor_right, ps.scissor_bottom,
                         head.color0_width, head.color0_height);
+                    // Each row is on the SAME callback and pad as its group. A full table or
+                    // line-budget overflow makes a proposed version join fail closed.
+                    census.descriptor_overflow += image_fact_overflow;
+                    for (const auto& [stage, cls, addr, binding, width, height, dim] : image_facts) {
+                        if (!census.reserve_detail_line()) break;
+                        std::fprintf(stderr,
+                            "[world-producer-image] observation-pad=%lld submit=%d order=%llu "
+                            "stage=%s class=%s binding=%u base=0x%llx extent=%ux%u dim=%u; "
+                            "descriptor only, no executed-fetch or retained-version proof\n",
+                            static_cast<long long>(callback_pad), g_this_submit,
+                            static_cast<unsigned long long>(census.relevant_groups),
+                            stage ? "fs" : "vs",
+                            cls == static_cast<uint32_t>(RC::Texture) ? "texture" : "storage",
+                            binding, static_cast<unsigned long long>(addr), width, height, dim);
+                    }
                 };
                 if (timing_enabled)
                     pending_timing.pass_head_ms += std::chrono::duration<double, std::milli>(
@@ -11478,14 +11557,21 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     const int64_t callback_end_pad = prosper_pad_flip_ordinal();
                     if (callback_end_pad != callback_pad)
                         ++world_depth_ab->census.unstable_callbacks;
+                    const uint64_t callback_end_guest_flip = prosper_vo_flip_count();
+                    if (world_depth_ab->census.has_guest_flip &&
+                        callback_end_guest_flip != world_depth_ab->census.first_guest_flip)
+                        ++world_depth_ab->census.unstable_guest_flips;
                     if (world_depth_ab->census.reserve_detail_line())
                         std::fprintf(stderr,
                             "[world-producer-census] observation-pad=%lld callback-end-pad=%lld "
+                            "callback-end-guest-flip=%llu "
                             "submit=%d callback-selected=%s selected-bytes=%zu "
                             "requested-bytes=%zu; selected callback source is not a native "
                             "present join\n",
                             static_cast<long long>(callback_pad),
-                            static_cast<long long>(callback_end_pad), g_this_submit,
+                            static_cast<long long>(callback_end_pad),
+                            static_cast<unsigned long long>(callback_end_guest_flip),
+                            g_this_submit,
                             prosper::frontend::present_source_name(present_choice),
                             candidate_bytes(selected_pixels), present_extent_bytes);
                 }
@@ -11496,22 +11582,31 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     const auto& census = world_depth_ab->census;
                     std::fprintf(stderr,
                         "[world-producer-census] pad=%lld COMPLETE depth-groups=%llu "
-                        "world-groups=%llu max-world-draws=%llu large-world-groups=%llu "
+                        "world-groups=%llu total-world-draws=%llu max-world-draws=%llu "
+                        "large-world-groups=%llu "
                         "composite-groups=%llu composite-after-large=%llu "
-                        "detail-logged=%llu detail-omitted=%llu unstable-callbacks=%llu "
+                        "world-composite-overlap-groups=%llu "
+                        "detail-logged=%llu detail-omitted=%llu descriptor-overflow=%llu "
+                        "unstable-callbacks=%llu "
+                        "unstable-guest-flips=%llu first-guest-flip=%llu "
                         "single-ordered-candidate=%d total-line-cap=%llu; "
                         "no raw readback attempted; raster groups only, compute producers, "
                         "present join, and pixel writes unknown\n",
                         static_cast<long long>(world_depth_ab->config.capture_pad_flip),
                         static_cast<unsigned long long>(census.depth_groups),
                         static_cast<unsigned long long>(census.world_groups),
+                        static_cast<unsigned long long>(census.total_world_draws),
                         static_cast<unsigned long long>(census.max_world_draws),
                         static_cast<unsigned long long>(census.large_world_groups),
                         static_cast<unsigned long long>(census.composite_groups),
                         static_cast<unsigned long long>(census.composite_after_large_world),
+                        static_cast<unsigned long long>(census.world_composite_overlap_groups),
                         static_cast<unsigned long long>(census.reported_lines),
                         static_cast<unsigned long long>(census.omitted_lines),
+                        static_cast<unsigned long long>(census.descriptor_overflow),
                         static_cast<unsigned long long>(census.unstable_callbacks),
+                        static_cast<unsigned long long>(census.unstable_guest_flips),
+                        static_cast<unsigned long long>(census.first_guest_flip),
                         census.has_single_ordered_candidate(),
                         static_cast<unsigned long long>(WorldProducerCensus::kMaximumLines));
                 }

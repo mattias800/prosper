@@ -74,6 +74,26 @@ struct WorldDepthDrawFact {
 
 enum class WorldDepthPassKind { Unrelated, Clear, Geometry, OtherWorld, Ambiguous };
 
+struct WorldCensusTargetSlots {
+    uint32_t world = 0;
+    uint32_t composite = 0;
+};
+
+// The live caller supplies mrt_active_color for each slot. Keep the full-slot scan in one tested
+// function: a c2..c7 composite attachment was invisible in the old c0/c1 detail line.
+template <class ActiveColor>
+WorldCensusTargetSlots world_census_target_slots(uint32_t slot_count, uint64_t world_base,
+                                                uint64_t composite_base,
+                                                ActiveColor&& active_color) {
+    WorldCensusTargetSlots result;
+    for (uint32_t slot = 0; slot < slot_count && slot < 32; ++slot) {
+        const uint64_t base = active_color(slot);
+        if (base == world_base) result.world |= 1u << slot;
+        if (base == composite_base) result.composite |= 1u << slot;
+    }
+    return result;
+}
+
 // This is the pad value sampled at callback entry. It identifies when a group was observed;
 // it does not prove that its produced pixels reached a later native presentation.
 constexpr bool world_census_observation_allowed(bool armed, bool census_only,
@@ -99,8 +119,22 @@ struct WorldProducerCensus {
     static constexpr uint64_t kMaximumLines = 64;
     uint64_t depth_groups = 0, world_groups = 0, large_world_groups = 0, composite_groups = 0;
     uint64_t composite_after_large_world = 0, max_world_draws = 0;
+    uint64_t total_world_draws = 0;
+    uint64_t world_composite_overlap_groups = 0;
     uint64_t relevant_groups = 0, reported_lines = 0, omitted_lines = 0;
-    uint64_t unstable_callbacks = 0;
+    uint64_t descriptor_overflow = 0;
+    uint64_t unstable_callbacks = 0, unstable_guest_flips = 0;
+    uint64_t first_guest_flip = 0;
+    bool has_guest_flip = false;
+
+    void observe_guest_flip(uint64_t flip) {
+        if (!has_guest_flip) {
+            first_guest_flip = flip;
+            has_guest_flip = true;
+        } else if (first_guest_flip != flip) {
+            ++unstable_guest_flips;
+        }
+    }
 
     bool reserve_detail_line() {
         if (reported_lines < kMaximumLines - 1) {
@@ -117,6 +151,7 @@ struct WorldProducerCensus {
         if (depth_target_bound) ++depth_groups;
         if (world_target_bound) {
             ++world_groups;
+            total_world_draws += draws;
             if (draws > max_world_draws) max_world_draws = draws;
             if (kind == WorldDepthPassKind::Geometry && draws >= kMinimumWorldDraws)
                 ++large_world_groups;
@@ -125,6 +160,7 @@ struct WorldProducerCensus {
             ++composite_groups;
             if (large_preceded_this_group) ++composite_after_large_world;
         }
+        if (world_target_bound && composite_target_bound) ++world_composite_overlap_groups;
         if (depth_target_bound || world_target_bound || composite_target_bound) {
             ++relevant_groups;
         }
@@ -140,8 +176,11 @@ struct WorldProducerCensus {
     }
 
     bool has_single_ordered_candidate() const {
-        return large_world_groups == 1 && composite_after_large_world != 0 &&
-               omitted_lines == 0 && unstable_callbacks == 0;
+        return world_groups == 1 && large_world_groups == 1 &&
+               composite_after_large_world != 0 &&
+               world_composite_overlap_groups == 0 && omitted_lines == 0 &&
+               descriptor_overflow == 0 &&
+               unstable_callbacks == 0 && unstable_guest_flips == 0;
     }
 };
 
