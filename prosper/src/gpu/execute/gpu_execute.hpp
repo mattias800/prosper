@@ -2747,6 +2747,11 @@ struct RenderedFrame {
     uint64_t diagnostic_trace_id = 0;
     // GPU scanout publication is separate from the CPU frame sequence used by screenshots.
     bool diagnostic_gpu_published = false;
+    // Provenance belongs to storage, including when an earlier span's frame survives an empty
+    // terminal callback. These labels have static storage; unknown means no producer supplied one.
+    const char* diagnostic_source_kind = "unknown";
+    uint64_t diagnostic_source_address = 0;
+    bool diagnostic_served_retained = false;
     // Where these pixels came from, carried to the present layer so a consumer can tell a frame
     // prosper composited from the guest's own display buffer republished verbatim (#1968, #2044).
     // Defaults to Composited, which is what every producer other than the renderer's last-resort
