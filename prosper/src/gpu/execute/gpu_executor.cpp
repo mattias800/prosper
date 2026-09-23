@@ -8816,7 +8816,7 @@ static OrderedSubmitResult execute_ordered_gpustate(
     const GpuState& st, uint32_t width, uint32_t height, uint64_t submit_no,
     const LiveRenderFn& render, const LiveComputeFn& compute,
     OrderedGpustateCaptureTrace* capture_trace = nullptr,
-    const std::vector<DrawItem>* eager_draws = nullptr);
+    std::vector<DrawItem>* eager_draws = nullptr);
 
 bool execute_nonrender_submit_work(const GpuState& st, uint64_t submit_no) {
     if (st.dma_copies.empty() && (!g_compute || st.dispatches.empty())) return false;
@@ -10663,7 +10663,7 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                                                      const LiveRenderFn& render,
                                                      const LiveComputeFn& compute,
                                                      OrderedGpustateCaptureTrace* capture_trace,
-                                                     const std::vector<DrawItem>* eager_draws) {
+                                                     std::vector<DrawItem>* eager_draws) {
     GuestGpuWriteSubmitScope guest_gpu_write_scope;
     // The ordered path reaches build_stage_table through realize_retained_draw rather than through
     // realize_gpustate_draws, so it needs its own sampling window or its per-draw switches fall
@@ -10707,6 +10707,14 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
     if (eager_draws)
         for (size_t i = 0; i < eager_draws->size(); ++i)
             eager_draw_by_index[static_cast<size_t>((*eager_draws)[i].draw_index)] = i;
+    // The planner emits each semantic draw index once. The eager vector is only a realization
+    // cache for this ordered execution; capture materialization is deferred to capture_trace and
+    // the caller subsequently uses only its size. Transfer each shader/descriptor/index payload
+    // to the ordered span instead of copying the same large vectors once more per draw.
+    // Same-binary control: 0/absent moves; 1 (or malformed) retains the old copying behavior.
+    const char* eager_copy_env = eager_draws ? std::getenv("PROSPER_EAGER_DRAW_COPY") : nullptr;
+    const bool copy_eager_draws = eager_copy_env &&
+        !(eager_copy_env[0] == '0' && eager_copy_env[1] == '\0');
 
     size_t total_spans = 0;
     bool in_draw_span = false;
@@ -10976,7 +10984,7 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                 if (eager_draws) {
                     const auto found = eager_draw_by_index.find(operation.index);
                     if (found != eager_draw_by_index.end()) {
-                        item = (*eager_draws)[found->second];
+                        item = transfer_eager_draw((*eager_draws)[found->second], copy_eager_draws);
                         realized = true;
                     }
                 } else {

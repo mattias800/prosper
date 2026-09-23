@@ -36,6 +36,7 @@
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <tuple>
 #include <vector>
 #if defined(__linux__)
 #include <sys/mman.h>
@@ -141,6 +142,70 @@ int main() {
     source_draw.instance_count = 4;
     st.draws.push_back(source_draw);
     st.num_instances = 0; // later state must not rewrite the already-recorded draw in folded mode
+
+    // A mixed submit realizes graphics eagerly but executes it in PM4 order. That eager vector is
+    // consumed once per draw; both the transfer path and its same-binary copy control must hand the
+    // renderer the same shader and indexed-geometry payloads in the same order.
+    {
+        DrawItem source;
+        source.vs = {11, 12, 13};
+        source.gs = {21, 22};
+        source.fs = {31, 32, 33};
+        source.indices = {0, 1, 2};
+        const uint32_t* original_vs = source.vs.data();
+        const uint32_t* original_gs = source.gs.data();
+        const uint32_t* original_indices = source.indices.data();
+        DrawItem transferred = transfer_eager_draw(source, false);
+        CHECK(transferred.vs.data() == original_vs &&
+                  transferred.gs.data() == original_gs &&
+                  transferred.indices.data() == original_indices &&
+                  source.vs.empty() && source.gs.empty() && source.indices.empty(),
+              "eager draw transfer takes ownership of shader and index payloads");
+
+        DrawItem retained = transferred;
+        const uint32_t* retained_vs = retained.vs.data();
+        DrawItem copy_control_item = transfer_eager_draw(retained, true);
+        CHECK(retained.vs.data() == retained_vs &&
+                  copy_control_item.vs == retained.vs &&
+                  copy_control_item.vs.data() != retained_vs,
+              "eager draw copy control preserves the source allocation");
+
+        const uint16_t guest_indices[] = {0, 1, 2};
+        GpuState mixed = st;
+        mixed.index_type = 0;
+        mixed.draws[0].indexed = true;
+        mixed.draws[0].index_addr = reinterpret_cast<uint64_t>(guest_indices);
+        mixed.draws[0].command_order = 100;
+        mixed.draws.push_back(mixed.draws[0]);
+        mixed.draws[1].command_order = 300;
+        GpuState::Dispatch no_work;
+        no_work.command_order = 200;
+        mixed.dispatches.push_back(no_work); // selects ordered execution; dispatch launches no waves
+
+        using DrawWitness = std::tuple<uint32_t, std::vector<uint32_t>, std::vector<uint32_t>,
+                                       std::vector<uint32_t>, std::vector<uint32_t>>;
+        auto observe = [&](const char* copy_control) {
+            set_test_env("PROSPER_EAGER_DRAW_COPY", copy_control);
+            std::vector<DrawWitness> seen;
+            set_submit_renderer([&](const std::vector<DrawItem>& items, uint32_t, uint32_t) {
+                for (const DrawItem& item : items)
+                    seen.emplace_back(item.draw_index, item.vs_words(), item.gs,
+                                      item.fs_words(), item.indices);
+                return RenderedFrame{};
+            });
+            execute_ordered_and_present(mixed, W, H, 77, /*publish=*/false);
+            set_submit_renderer({});
+            return seen;
+        };
+        const auto copied = observe("1");
+        const auto moved = observe("0");
+        set_test_env("PROSPER_EAGER_DRAW_COPY", nullptr);
+        CHECK(copied.size() == 2 && moved == copied &&
+                  std::get<0>(copied[0]) == 0 && std::get<0>(copied[1]) == 1 &&
+                  !std::get<1>(copied[0]).empty() && !std::get<3>(copied[0]).empty() &&
+                  std::get<4>(copied[0]) == std::vector<uint32_t>({0, 1, 2}),
+              "ordered eager transfer preserves both shader programs and indexed draws");
+    }
 
     // The executor core, with the offscreen Vulkan renderer supplied as the backend (as the HLE will
     // supply the live-device renderer). execute_gpustate does recompile + resolve + render internally.
