@@ -63,18 +63,29 @@ inline FrameGrabMatch classify_frame_grab(const FrameGrabScreenshotEvidence& sho
     if (!shot.bmp_written || !bundle.serialized) return FrameGrabMatch::Incomplete;
     if (!shot.host_presented) return FrameGrabMatch::NotPresented;
     if (shot.source != FrameGrabSource::GpuScanout) return FrameGrabMatch::UnknownSource;
-    const auto frame = std::find(bundle.closed_source_flips.begin(),
-                                 bundle.closed_source_flips.end(), shot.source_seq);
-    if (!shot.source_seq || !bundle.opened_source_flip ||
-        shot.source_seq <= bundle.opened_source_flip ||
-        frame == bundle.closed_source_flips.end() ||
+    if (!shot.source_seq || !shot.target_source_flip || !bundle.opened_source_flip ||
+        bundle.closed_source_flips.empty() ||
+        shot.source_seq != shot.target_source_flip ||
+        shot.target_source_flip != bundle.closed_source_flips.back() ||
         bundle.closed_source_flips.size() != bundle.closed_presents.size() ||
         bundle.closed_submit_counts.size() != bundle.closed_source_flips.size())
         return FrameGrabMatch::UnmatchedFrame;
-    const uint64_t captured_through = bundle.closed_submit_counts[
-        static_cast<size_t>(frame - bundle.closed_source_flips.begin())];
-    if (captured_through > bundle.captured_submits.size())
-        return FrameGrabMatch::UnmatchedFrame;
+    // An interleaved later present must not relabel an older selected front as this bundle's
+    // closing picture. Fail closed if either boundary clock or captured-submit prefix reverses.
+    uint64_t previous_flip = bundle.opened_source_flip;
+    uint64_t previous_present = bundle.opened_present;
+    uint64_t previous_submit_count = 0;
+    for (size_t i = 0; i < bundle.closed_source_flips.size(); ++i) {
+        if (bundle.closed_source_flips[i] <= previous_flip ||
+            bundle.closed_presents[i] <= previous_present ||
+            bundle.closed_submit_counts[i] < previous_submit_count ||
+            bundle.closed_submit_counts[i] > bundle.captured_submits.size())
+            return FrameGrabMatch::UnmatchedFrame;
+        previous_flip = bundle.closed_source_flips[i];
+        previous_present = bundle.closed_presents[i];
+        previous_submit_count = bundle.closed_submit_counts[i];
+    }
+    const uint64_t captured_through = bundle.closed_submit_counts.back();
     if (!shot.producer.known() || !shot.producer.completed.source_submit)
         return FrameGrabMatch::UnknownProducer;
     if (std::find(bundle.captured_submits.begin(),

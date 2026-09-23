@@ -44,6 +44,10 @@ int main() {
     bundle.captured_submits = {87, 88, 89};
     CHECK(classify_frame_grab(shot, bundle) == FrameGrabMatch::ProducerCaptured,
           "exact completed producer and frame boundary join");
+    shot.target_source_flip = 0;
+    CHECK(classify_frame_grab(shot, bundle) == FrameGrabMatch::UnmatchedFrame,
+          "a coincidentally matching source without an owned closure token cannot certify a pair");
+    shot.target_source_flip = 42;
 
     // Deliberately delay readback while guest presents race ahead. The WRITE clock must never be
     // substituted for the leased screenshot source, including in the serialized event.
@@ -57,11 +61,10 @@ int main() {
     CHECK(classify_frame_grab(shot, bundle) == FrameGrabMatch::UnmatchedFrame,
           "the delayed write count is not accepted as a bundle frame boundary");
     shot.source_seq = 42;
-    bundle.closed_presents = {42};
+    bundle.closed_presents = {702};
     bundle.closed_source_flips = {43};
     CHECK(classify_frame_grab(shot, bundle) == FrameGrabMatch::UnmatchedFrame,
           "a failed selection retains the old front token, never joining the new flip by count");
-    bundle.closed_presents = {702};
     bundle.closed_source_flips = {42};
     bundle.opened_source_flip = 43;
     CHECK(classify_frame_grab(shot, bundle) == FrameGrabMatch::UnmatchedFrame,
@@ -73,9 +76,20 @@ int main() {
 
     bundle.closed_presents = {702, 703};
     bundle.closed_source_flips = {42, 43};
-    bundle.closed_submit_counts = {1, 3};
-    CHECK(classify_frame_grab(shot, bundle) == FrameGrabMatch::UnmatchedProducer,
-          "a producer captured after the screenshot frame's boundary is not joined to that frame");
+    bundle.closed_submit_counts = {2, 3}; // submit 88 is present even at the earlier boundary
+    CHECK(classify_frame_grab(shot, bundle) == FrameGrabMatch::UnmatchedFrame,
+          "an earlier closed frame with the same producer cannot replace the final target");
+    shot.source_seq = 43;
+    CHECK(classify_frame_grab(shot, bundle) == FrameGrabMatch::UnmatchedFrame,
+          "a final-frame BMP needs its own matching owned closure target");
+    shot.target_source_flip = 43;
+    CHECK(classify_frame_grab(shot, bundle) == FrameGrabMatch::ProducerCaptured,
+          "a BMP from the final target may join its captured producer");
+    bundle.closed_source_flips = {43, 42};
+    CHECK(classify_frame_grab(shot, bundle) == FrameGrabMatch::UnmatchedFrame,
+          "reversed selected-front boundaries cannot assert the last frame");
+    shot.source_seq = 42;
+    shot.target_source_flip = 42;
     bundle.closed_presents = {702};
     bundle.closed_source_flips = {42};
     bundle.closed_submit_counts.clear();
