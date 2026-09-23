@@ -409,6 +409,23 @@ render-state resolve, executor ordering, detile) — it is the right guard for c
   bundle, use `--bundle-ds-summary` / `--bundle-find-ds ADDR` for its identity and write history,
   and de-tile a captured copy with `prosper::gpu::detile_surface` for its contents.
 
+  A submit that creates a persistent depth image can also be inspected at ordered prefixes:
+  extract it with `--bundle-extract-submit N PATH`, confirm its `DS-seeds` and `operation[N]`
+  lines with `--inspect-only`, then run `PROSPER_DEPTH_DUMP=PREFIX gpu_replay
+  --through-operation N PATH output.bmp` in a fresh process for each prefix. The dump is a
+  quantized grayscale view; its log also reports the guest depth read/write bases, numeric
+  min/max and nonzero counts. The printed depth bases and extent are correlation hints, not a
+  persistent-DS identity: the key also includes stencil read/write bases, HTILE base, format and
+  depth-view slice. When aliases or slices coexist, confirm the full key from `PROSPER_DSLOG`
+  (including its new-entry slice line) and the captured DS seed/draw state; do not rely on the
+  run-local `ds0` index.
+  Require a later prefix known to change the depth plane as a positive control before treating
+  an earlier unchanged plane as evidence that a draw missed. A depth-only submit may print `Vulkan render
+  FAILED` and write zero *color* output because it has no presentation surface; the depth dump
+  and pipeline/draw counters must be assessed separately. `--inspect-only` prints `zrange=` for
+  each captured draw, so a clear strip and following caster can be checked against their actual
+  viewport depth ranges rather than inferred from the clip-space shader output.
+
 ### Two silent wrong answers when you bisect a MULTI-TARGET chain
 
 Both of these return a plausible number rather than an error, which is what makes them expensive.

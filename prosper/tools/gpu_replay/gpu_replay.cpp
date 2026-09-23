@@ -772,7 +772,7 @@ void inspect_frame(const prosper::gpu::GpuReplayFrame& replay, uint32_t format_v
         std::printf("draw[%llu] item=%zu target=%016llx extent=%ux%u fmt=%u cwm=%x "
                     "target1=%016llx extent1=%ux%u fmt1=%u cwm1=%x vcount=%u indices=%zu voffset=%d modifier=%016llx topo=%u%s "
                     "depth=%d/%d/%u stencil=%d blend=%d raster=%u/%u/%u bias=%u/%g/%g/%g "
-                    "viewport=%d %.1f,%.1f %.1fx%.1f "
+                    "viewport=%d %.1f,%.1f %.1fx%.1f zrange=%.9g..%.9g "
                     "scissor=%d [%d,%d)-[%d,%d) export=%08x downconvert=%08x "
                     "vs=%zu/%016llx/%s fs=%zu/%016llx/%s\n",
                     static_cast<unsigned long long>(d.draw_index), i,
@@ -787,6 +787,7 @@ void inspect_frame(const prosper::gpu::GpuReplayFrame& replay, uint32_t format_v
                     d.ps.depth_bias_enable, d.ps.depth_bias_constant, d.ps.depth_bias_slope,
                     d.ps.depth_bias_clamp,
                     d.ps.has_viewport, d.ps.viewport_x, d.ps.viewport_y, d.ps.viewport_w, d.ps.viewport_h,
+                    d.ps.min_depth, d.ps.max_depth,
                     d.ps.has_scissor, d.ps.scissor_left, d.ps.scissor_top,
                     d.ps.scissor_right, d.ps.scissor_bottom,
                     d.ps.spi_shader_col_format, d.ps.sx_ps_downconvert,
@@ -3910,8 +3911,11 @@ int main(int argc, char** argv) {
                               s.width, s.height);
                 prosper::test::dump_bmp(path, rgba, s.width, s.height);
                 std::fprintf(stderr,
-                             "[depth-dump] ds%zu %ux%u min=%g max=%g nonzero=%zu/%zu -> %s\n",
-                             si, s.width, s.height, dmin, dmax, nonzero, nz, path);
+                             "[depth-dump] ds%zu dr=%016llx dw=%016llx %ux%u "
+                             "min=%g max=%g nonzero=%zu/%zu -> %s\n",
+                             si, static_cast<unsigned long long>(s.depth_read_base),
+                             static_cast<unsigned long long>(s.depth_write_base),
+                             s.width, s.height, dmin, dmax, nonzero, nz, path);
             }
         } else {
             std::fprintf(stderr, "[depth-dump] snapshot failed: %s\n", derr.c_str());
