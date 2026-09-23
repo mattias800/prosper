@@ -213,11 +213,29 @@ inline std::string snap_actual_file_name(int64_t target_flip, int64_t actual_fli
     return buffer;
 }
 
+// The GPU handoff's publication ID and the CPU frame sequence have independent namespaces.
+// Record the path beside the numbers so a later analysis never joins them by number alone.
+enum class SnapActualPresentPath { gpu_scanout, gpu_cpu_fallback, cpu };
+inline const char* snap_actual_present_path_token(SnapActualPresentPath path) {
+    switch (path) {
+    case SnapActualPresentPath::gpu_scanout: return "gpu-scanout";
+    case SnapActualPresentPath::gpu_cpu_fallback: return "gpu-cpu-fallback";
+    case SnapActualPresentPath::cpu: return "cpu";
+    }
+    return "unknown";
+}
+struct SnapActualIdentity {
+    uint64_t source_seq = 0;       // guest flip handed to presentation
+    uint64_t publication_id = 0;   // GPU handoff ID or CPU frame sequence, per path
+    SnapActualPresentPath path = SnapActualPresentPath::cpu;
+};
+
 inline std::string snap_actual_record_line(int64_t target_flip,
                                            int64_t actual_flip,
                                            uint32_t width,
                                            uint32_t height,
-                                           const std::string& file) {
+                                           const std::string& file,
+                                           SnapActualIdentity identity) {
     std::string out = "{\"target_flip\":";
     out += std::to_string(target_flip);
     out += ",\"actual_flip\":";
@@ -226,6 +244,13 @@ inline std::string snap_actual_record_line(int64_t target_flip,
     out += std::to_string(width);
     out += ",\"height\":";
     out += std::to_string(height);
+    out += ",\"source_seq\":";
+    out += std::to_string(identity.source_seq);
+    out += ",\"publication_id\":";
+    out += std::to_string(identity.publication_id);
+    out += ",\"present_path\":\"";
+    out += snap_actual_present_path_token(identity.path);
+    out += "\"";
     out += ",\"file\":\"";
     out += snap_json_escape(file);
     out += "\"}";

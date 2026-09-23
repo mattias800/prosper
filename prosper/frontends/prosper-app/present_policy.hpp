@@ -40,6 +40,17 @@ enum class PresentAttempt {
     failed,       // device/synchronization recovery failed — stop instead of waiting forever
 };
 
+// A staged GPU readback is only a snapshot of a proposed frame until the swapchain accepts it.
+// Keep pending screenshots and authored/automatic snaps for a later attempt on every other result.
+// Own the callback invocation here so a test can prove a rejected attempt never consumes one.
+template <typename Capture>
+constexpr bool dispatch_presented_capture(PresentAttempt attempt, bool staged_pixels_ready,
+                                          Capture&& capture) {
+    if (attempt != PresentAttempt::presented || !staged_pixels_ready) return false;
+    capture();
+    return true;
+}
+
 // Every successful presentation path contributes to the same --frames budget.  Keep the count and
 // stop decision inseparable: a caller cannot increment the private counter while forgetting to apply
 // the limit, which was the CPU-fallback defect in #1858.  The source is explicit so focused tests can
