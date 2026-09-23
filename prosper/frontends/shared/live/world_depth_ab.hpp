@@ -81,6 +81,14 @@ constexpr bool world_census_observation_allowed(bool armed, bool census_only,
     return armed && census_only && requested_pad == callback_pad;
 }
 
+// The live pad reader takes g_flip_mx. Pass it as a callable so default-off callbacks never
+// evaluate it; passing an already-sampled integer would silently put a lock on every title.
+template <class PadReader>
+int64_t world_census_callback_pad(bool armed, bool census_only, PadReader&& read_pad) {
+    if (!armed || !census_only) return -1;
+    return read_pad();
+}
+
 // Metadata-only first-divergence preflight. A bound target is not proof of a pixel write, and a
 // same-address producer in another frame is not the version sampled by the present composite.
 // The state deliberately permits no readback decision; it only reports whether this pad contains

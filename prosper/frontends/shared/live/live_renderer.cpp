@@ -9464,7 +9464,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         });
                 }
                 size_t pass_i = 0;
-                const int64_t callback_pad = prosper_pad_flip_ordinal();
+                const int64_t callback_pad = world_census_callback_pad(
+                    world_depth_ab->armed, world_depth_ab->census_only,
+                    [] { return prosper_pad_flip_ordinal(); });
                 prosper::test::BackendSubmissionBatch backend_submission;
                 struct WorldCaptureCandidate {
                     bool seen = false, ambiguous = false;

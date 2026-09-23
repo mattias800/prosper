@@ -124,6 +124,18 @@ int main() {
         !check(!at_pad(true, false, 3930, 3930),
                "ordinary A/B capture entered metadata-only census"))
         return 1;
+    int pad_reads = 0;
+    const auto read_pad = [&] { ++pad_reads; return int64_t{3930}; };
+    if (!check(prosper::frontend::world_census_callback_pad(false, false, read_pad) == -1 &&
+                   pad_reads == 0,
+               "default-off callback sampled the pad and acquired the flip lock") ||
+        !check(prosper::frontend::world_census_callback_pad(true, false, read_pad) == -1 &&
+                   pad_reads == 0,
+               "ordinary depth A/B callback paid for metadata census") ||
+        !check(prosper::frontend::world_census_callback_pad(true, true, read_pad) == 3930 &&
+                   pad_reads == 1,
+               "armed metadata census failed to sample its callback pad"))
+        return 1;
     const auto ambiguous = prosper::frontend::world_depth_capture_pass_ambiguous;
     if (!check(!ambiguous(false, WorldDepthPassKind::Geometry, true, true),
                "first matching world geometry declined") ||
