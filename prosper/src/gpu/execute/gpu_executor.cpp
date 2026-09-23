@@ -9081,7 +9081,7 @@ void diagnose_resource_provenance(const GpuState& st, uint64_t submit_no) {
     // the second needs PROSPER_PROVENANCE_DIM. Returning early for both made the history silently
     // kind-incomplete under PROSPER_WRITER_PROVENANCE=1 — the switch documented as the explicit
     // "retain everything" request — so every `last_guest_write_overlap` consumer answered "no
-    // writer" for a range a colour target had in fact written, with nothing in the log to say the
+    // writer" for a range a colour target had in fact programmed, with nothing in the log to say the
     // recorder had never been armed. Measured on CrossWorlds: `color=0` recorded across a whole boot
     // with writer provenance explicitly on, against `compute-buffer=54` and `write-data=7`.
     const char* dim_env = PROSPER_ENV_VALUE("PROSPER_PROVENANCE_DIM");
@@ -9109,15 +9109,16 @@ void diagnose_resource_provenance(const GpuState& st, uint64_t submit_no) {
         return e ? static_cast<size_t>(strtoull(e, nullptr, 0)) : size_t{0};
     }();
 
-    struct ColorWrite {
+    struct ProgrammedColorTarget {
         uint64_t submit = 0;
         uint64_t draw_submit = 0;
         size_t draw = 0;
         uint64_t vs = 0, ps = 0;
         uint32_t width = 0, height = 0;
+        size_t slot = 0;
         GpuState::Draw draw_record{};
     };
-    static std::unordered_map<uint64_t, ColorWrite> last_color_write;
+    static std::unordered_map<uint64_t, ProgrammedColorTarget> last_programmed_color_target;
     static std::set<uint64_t> recorded_color_ranges;
     static uint64_t draw_submit_ordinal = 0;
     const uint64_t this_draw_submit = st.draws.empty() ? draw_submit_ordinal : draw_submit_ordinal++;
@@ -9159,78 +9160,70 @@ void diagnose_resource_provenance(const GpuState& st, uint64_t submit_no) {
                             (unsigned long long)r.gpu_addr,
                             (unsigned long long)resource_size);
                 }
-                auto it = last_color_write.find(r.gpu_addr);
-                if (it == last_color_write.end()) {
+                auto it = last_programmed_color_target.find(r.gpu_addr);
+                if (it == last_programmed_color_target.end()) {
                     fprintf(stderr,
-                            "[provenance] consumer submit=%llu draw=%zu ps=0x%llx samples "
+                            "[provenance] table-candidate submit=%llu draw=%zu ps=0x%llx lists "
                             "addr=0x%llx dims=%ux%u draw_submit=%llu order=%llu: "
-                            "no prior color-target write\n",
+                            "no prior programmed color target\n",
                             (unsigned long long)submit_no, i, (unsigned long long)rs.ps_addr,
                             (unsigned long long)r.gpu_addr, r.width, r.height,
                             (unsigned long long)this_draw_submit,
                             (unsigned long long)st.draws[i].command_order);
                 } else {
-                    const ColorWrite& w = it->second;
+                    const ProgrammedColorTarget& w = it->second;
                     fprintf(stderr,
-                            "[provenance] consumer submit=%llu draw=%zu ps=0x%llx samples "
+                            "[provenance] table-candidate submit=%llu draw=%zu ps=0x%llx lists "
                             "addr=0x%llx dims=%ux%u draw_submit=%llu order=%llu: "
-                            "last color write submit=%llu "
-                            "draw_submit=%llu draw=%zu target_extent=%ux%u "
+                            "last programmed color target submit=%llu "
+                            "draw_submit=%llu draw=%zu target_slot=%zu target_extent=%ux%u "
                             "vs=0x%llx ps=0x%llx\n",
                             (unsigned long long)submit_no, i, (unsigned long long)rs.ps_addr,
                             (unsigned long long)r.gpu_addr, r.width, r.height,
                             (unsigned long long)this_draw_submit,
                             (unsigned long long)st.draws[i].command_order,
                             (unsigned long long)w.submit,
-                            (unsigned long long)w.draw_submit, w.draw, w.width, w.height,
+                            (unsigned long long)w.draw_submit, w.draw, w.slot, w.width, w.height,
                             (unsigned long long)w.vs, (unsigned long long)w.ps);
                     static std::set<uint64_t> probed;
                     if (probed.insert(r.gpu_addr).second && w.draw_record.state) {
-                        DrawItem producer;
+                        DrawItem candidate_draw;
                         bool realized = realize_draw_item(*w.draw_record.state, &w.draw_record,
-                                                         w.draw_record.index_count, 0x10000, true, producer);
+                                                         w.draw_record.index_count, 0x10000, true,
+                                                         candidate_draw);
                         fprintf(stderr,
-                                "[provenance] producer-realize addr=0x%llx result=%s extent=%ux%u "
-                                "items-target=0x%llx\n",
+                                "[provenance] candidate-draw-realize addr=0x%llx result=%s slot=%zu "
+                                "extent=%ux%u items-target=0x%llx\n",
                                 (unsigned long long)r.gpu_addr, realized ? "success" : "dropped",
-                                producer.color0_width, producer.color0_height,
-                                (unsigned long long)producer.color0_base);
+                                w.slot,
+                                candidate_draw.color_targets[w.slot].width,
+                                candidate_draw.color_targets[w.slot].height,
+                                (unsigned long long)candidate_draw.color_targets[w.slot].base);
                     }
                 }
             }
         }
 
-        if (rs.color0_base) {
-            // Only the consumer diagnostic reads last_color_write, and its value retains a draw
-            // record (which pins a GpuState) for the process lifetime, one per distinct colour base.
+        for (size_t slot = 0; slot < rs.color_targets.size(); ++slot) {
+            const ColorTargetState& target = rs.color_targets[slot];
+            if (!target.base) continue;
+            // Only the table-candidate diagnostic reads last_programmed_color_target; each value
+            // retains a draw record (which pins a GpuState) for the process lifetime, one per base.
             // Record-only mode has no reader, so populating it there would leak that retention onto
             // every writer-provenance run for nothing.
             if (!record_only)
-                last_color_write[rs.color0_base] = {
+                last_programmed_color_target[target.base] = {
                     submit_no, this_draw_submit, i, rs.es_addr, rs.ps_addr,
-                    rs.color0_width, rs.color0_height, st.draws[i]
+                    target.width, target.height, slot, st.draws[i]
                 };
-            // The exact-address map above retains every latest color writer. The generic overlap
+            // The exact-address map above retains each latest programmed target. The generic overlap
             // history needs only one representative event per target range; recording every draw
             // adds millions of mutex/hash operations during Dead Cells' submit-heavy startup.
-            if (recorded_color_ranges.insert(rs.color0_base).second) {
-                const uint64_t bytes = static_cast<uint64_t>(rs.color0_width) * rs.color0_height * 4;
-                record_guest_write(GuestWriterKind::ColorTarget, rs.color0_base, bytes,
+            if (recorded_color_ranges.insert(target.base).second) {
+                const uint64_t bytes = static_cast<uint64_t>(target.width) * target.height * 4;
+                record_guest_write(GuestWriterKind::ColorTarget, target.base, bytes,
                                    submit_no, i, st.draws[i].command_order, rs.ps_addr,
-                                   rs.color0_width, rs.color0_height);
-            }
-        }
-        if (rs.color1_base) {
-            if (!record_only)
-                last_color_write[rs.color1_base] = {
-                    submit_no, this_draw_submit, i, rs.es_addr, rs.ps_addr,
-                    rs.color1_width, rs.color1_height, st.draws[i]
-                };
-            if (recorded_color_ranges.insert(rs.color1_base).second) {
-                const uint64_t bytes = static_cast<uint64_t>(rs.color1_width) * rs.color1_height * 4;
-                record_guest_write(GuestWriterKind::ColorTarget, rs.color1_base, bytes,
-                                   submit_no, i, st.draws[i].command_order, rs.ps_addr,
-                                   rs.color1_width, rs.color1_height);
+                                   target.width, target.height);
             }
         }
     }

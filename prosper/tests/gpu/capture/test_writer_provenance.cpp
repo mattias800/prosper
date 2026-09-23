@@ -1,9 +1,12 @@
 #include "gpu/capture/writer_provenance.hpp"
+#include "gpu/execute/gpu_execute.hpp"
+#include "gpu/pm4/pm4_registers.hpp"
 
 #include <cstdio>
 #include <string>
 
 using namespace prosper::gpu;
+namespace P = prosper::agc::Pm4;
 
 static int fails = 0;
 #define CHECK(c, msg) do { if (!(c)) { std::printf("FAIL: %s\n", msg); fails++; } } while (0)
@@ -85,6 +88,40 @@ int main() {
     CHECK(guest_write_history_size() == 0 &&
           guest_write_recorded_count(GuestWriterKind::DmaData) == 0,
           "test reset clears the events and the cumulative counts together");
+
+    // Kena's recognizable forest was retained in a third 3200x1800 color target, but the
+    // provenance probe previously recorded only MRT0/1 and falsely answered "no prior programmed
+    // color target" for later pixel-stage resource-table candidates. Drive the actual GpuState
+    // diagnostic with programmed MRT2 and MRT7; a direct call to record_guest_write would not
+    // cover that omission.
+    GpuState mrt_state;
+    constexpr uint64_t mrt_bases[] = {
+        0x180000000ull, 0x190000000ull, 0x1a0000000ull, 0, 0, 0, 0, 0x1f0000000ull};
+    for (uint32_t slot = 0; slot < 8; ++slot) {
+        if (!mrt_bases[slot]) continue;
+        mrt_state.cx[P::CB_COLOR0_BASE + slot * 0xfu] =
+            static_cast<uint32_t>(mrt_bases[slot] >> 8);
+        mrt_state.cx[P::CB_COLOR0_BASE_EXT + slot] =
+            static_cast<uint32_t>(mrt_bases[slot] >> 40);
+        mrt_state.cx[P::CB_COLOR0_INFO + slot * 0xfu] = 0xau;
+        mrt_state.cx[P::CB_COLOR0_ATTRIB2 + slot] =
+            ((3200u - 1u) << P::CB_COLOR0_ATTRIB2_MIP0_WIDTH_SHIFT) |
+            ((1800u - 1u) << P::CB_COLOR0_ATTRIB2_MIP0_HEIGHT_SHIFT);
+    }
+    GpuState::Draw mrt_draw;
+    mrt_draw.command_order = 77;
+    mrt_state.draws.push_back(mrt_draw);
+    diagnose_resource_provenance(mrt_state, 8080);
+    for (uint32_t slot : {0u, 1u, 2u, 7u}) {
+        const auto writer = last_guest_write_overlap(mrt_bases[slot], 4);
+        CHECK(writer && writer->kind == GuestWriterKind::ColorTarget &&
+              writer->addr == mrt_bases[slot] && writer->submit == 8080 &&
+              writer->item == 0 && writer->order == 77 &&
+              writer->width == 3200 && writer->height == 1800,
+              "the GpuState provenance probe records every programmed MRT slot");
+    }
+    CHECK(!last_guest_write_overlap(0x1b0000000ull, 4),
+          "an unprogrammed MRT slot creates no provenance event");
 
     if (fails) return 1;
     std::printf("== PASS ==\n");

@@ -2805,6 +2805,10 @@ endif()
   add_executable(test_writer_provenance tests/gpu/capture/test_writer_provenance.cpp)
   target_link_libraries(test_writer_provenance PRIVATE prosper_core)
   add_test(NAME writer_provenance_ranges COMMAND test_writer_provenance)
+  # The provenance switch is sampled once per process. Arm it before launch so this fixture
+  # cannot pass with a stale cached value from an earlier in-process read.
+  set_tests_properties(writer_provenance_ranges PROPERTIES
+                       ENVIRONMENT "PROSPER_PROVENANCE_DIM=3200x1800")
 
   # The init-fault report must survive a wild/null faulting RIP (#128). On Windows this also drives
   # the VEH recovery thunk and asserts its compiled-helper call obeys the Microsoft-x64 ABI (#633).
