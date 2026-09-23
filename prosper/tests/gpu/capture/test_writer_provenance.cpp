@@ -3,7 +3,6 @@
 #include "gpu/pm4/pm4_registers.hpp"
 
 #include <cstdio>
-#include <cstdlib>
 #include <string>
 
 using namespace prosper::gpu;
@@ -95,11 +94,6 @@ int main() {
     // color target" for later pixel-stage resource-table candidates. Drive the actual GpuState
     // diagnostic with programmed MRT2 and MRT7; a direct call to record_guest_write would not
     // cover that omission.
-#ifdef _WIN32
-    _putenv_s("PROSPER_PROVENANCE_DIM", "3200x1800");
-#else
-    setenv("PROSPER_PROVENANCE_DIM", "3200x1800", 1);
-#endif
     GpuState mrt_state;
     constexpr uint64_t mrt_bases[] = {
         0x180000000ull, 0x190000000ull, 0x1a0000000ull, 0, 0, 0, 0, 0x1f0000000ull};
