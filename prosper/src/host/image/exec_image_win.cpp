@@ -59,6 +59,11 @@
 // guest's rax. run_entry does the equivalent inline (it jmp's and never returns); this is the
 // call-and-return path used for the init/module_start functions.
 extern "C" uint64_t prosper_call_guest_sysv(uint64_t fn, uint64_t argc, uint64_t argp);
+// GPU write-attribution ring scanner (src/gpu/pm4/command_processor.cpp, same prosper_core source
+// set as this file). Used by the PROSPER_VEHLOG fault report.
+extern "C" int prosper_gpu_write_ring_scan(uint64_t lo, uint64_t hi, char* out, size_t cap);
+extern "C" int prosper_gpu_write_ring_find_qword(uint64_t qword, bool (*is_readable)(uint64_t),
+                                                 char* out, size_t cap);
 extern "C" uint64_t prosper_call_guest_sysv4(uint64_t fn, uint64_t a0, uint64_t a1,
                                                uint64_t a2, uint64_t a3);
 __asm__(
@@ -418,6 +423,50 @@ namespace {
             if (addr_readable(a)) fprintf(stderr, " %02x", *(const uint8_t*)(uintptr_t)a);
             else { fprintf(stderr, " (unmapped@0x%llx)", (unsigned long long)a); return; }
         }
+    }
+    // PROSPER_VEHLOG (#2982): name every recent prosper PM4 guest write (RELEASE_MEM / EVENT_WRITE /
+    // WRITE_DATA / DMA_DATA, the always-on attribution ring in command_processor.cpp) that landed near
+    // a register of the faulting context. The Linux worker-fault report has done this since #312; the
+    // Windows VEH printed registers only, so a UE pooled-allocator free-list fault here (Dragon Quest
+    // VII, `mov rax,[rcx]` with rcx = 0x30016000 / 0x2400100024001) could not be attributed to or
+    // cleared of a prosper label write. Each register gets +/-0x100; a 64 KiB-aligned-looking base
+    // (a per-thread bin table) gets its whole 64 KiB page. Diagnostic only, VEHLOG-gated, and only
+    // reached for a fault the handler is about to decline. Not async-signal-safe-sensitive here: the
+    // VEH runs on the faulting thread with the process still alive.
+    void vehlog_gpu_write_ring(const CONTEXT* c, uint64_t fault_addr) {
+        struct Reg { const char* nm; uint64_t v; };
+        const Reg regs[] = {{"rax", c->Rax}, {"rbx", c->Rbx}, {"rcx", c->Rcx}, {"rdx", c->Rdx},
+                            {"rsi", c->Rsi}, {"rdi", c->Rdi}, {"rbp", c->Rbp}, {"r8", c->R8},
+                            {"r9", c->R9},   {"r10", c->R10}, {"r11", c->R11}, {"r12", c->R12},
+                            {"r13", c->R13}, {"r14", c->R14}, {"r15", c->R15}};
+        static char out[16384];
+        unsigned total = 0;
+        for (const Reg& r : regs) {
+            // The guest heap and command memory sit far above the first 4 GiB; below that a register
+            // holds a count, a size or host data, and a ring window around it attributes nothing.
+            if (r.v < 0x100000000ull || r.v >= 0x100000000000ull) continue;
+            const bool page = (r.v & 0xffffull) == 0;
+            const uint64_t lo = page ? r.v : r.v - 0x100, hi = page ? r.v + 0x10000 : r.v + 0x100;
+            const int n = prosper_gpu_write_ring_scan(lo, hi, out, sizeof out);
+            fprintf(stderr, "[veh] gpuring %s=0x%llx window=[0x%llx,0x%llx) hits=%d\n", r.nm,
+                    (unsigned long long)r.v, (unsigned long long)lo, (unsigned long long)hi, n);
+            if (n > 0) fputs(out, stderr);
+            total += n > 0 ? (unsigned)n : 0u;
+        }
+        // A misaligned pop of a link forged to `hi<<32 | 1` reads the qword at `hi<<32 | 1`, i.e.
+        // the block's own first qword shifted down one byte: fault address 0x30016000 is the read
+        // of 0x2000000001 whose block holds 0x3001600000. Reconstruct the forged link from the
+        // fault address and look for the recorded write whose destination now holds it.
+        if (fault_addr >= 0x10000 && fault_addr < 0x100000000ull) {
+            const uint64_t forged = ((fault_addr << 8) & 0xffffffff00000000ull) | 1ull;
+            const int n = prosper_gpu_write_ring_find_qword(forged, addr_readable, out, sizeof out);
+            fprintf(stderr, "[veh] gpuring forged-link candidate=0x%llx (from fault addr 0x%llx) "
+                            "writes-now-holding-it=%d\n",
+                    (unsigned long long)forged, (unsigned long long)fault_addr, n);
+            if (n > 0) fputs(out, stderr);
+        }
+        fprintf(stderr, "[veh] gpuring total=%u (PM4 write paths only; compute writeback, the Vulkan "
+                        "backend and HLE writes are not in this ring)\n", total);
     }
     std::string trap_detail() {
         char b[256];
@@ -1127,6 +1176,7 @@ namespace {
                 }
                 fprintf(stderr, "\n");
                 dump_guest_exception_trace();
+                vehlog_gpu_write_ring(c, fa);
             }
         }
         if (!t_armed) return EXCEPTION_CONTINUE_SEARCH;   // worker thread with no recovery point

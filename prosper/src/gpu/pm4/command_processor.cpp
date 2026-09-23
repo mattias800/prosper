@@ -372,6 +372,38 @@ extern "C" int prosper_gpu_write_ring_scan(uint64_t lo, uint64_t hi, char* out, 
     if (off < cap) out[off] = 0;
     return found;
 }
+// #2982: find ring writes whose destination QWORD now holds `qword`. The UE pooled-allocator fault
+// family reads a free-list link whose low dword was replaced by 1 — the forged link is
+// `(high dword of a live pointer) << 32 | 1`, and it sits in a freed block whose address nobody
+// knows at fault time. Asking "which recorded write's qword now equals that value?" names the block
+// and the packet at once. `is_readable` is supplied by the caller (the fault handler owns the
+// platform's readability probe). A recorded write is compared at its own address and at the
+// enclosing 8-byte qword, because a 4-byte label at +4 alters the high half instead.
+extern "C" int prosper_gpu_write_ring_find_qword(uint64_t qword, bool (*is_readable)(uint64_t),
+                                                 char* out, size_t cap) {
+    size_t off = 0; int found = 0;
+    const uint32_t seq_now = g_write_seq.load(std::memory_order_relaxed);
+    const uint32_t n = seq_now < kWriteRingSize ? seq_now : kWriteRingSize;
+    for (uint32_t i = 0; i < n && off + 128 < cap; i++) {
+        const GpuWriteRec& r = g_write_ring[i & (kWriteRingSize - 1)];
+        if (!r.addr) continue;
+        const uint64_t q = r.addr & ~7ull;
+        if (!is_readable || !is_readable(q) || !is_readable(q + 7)) continue;
+        uint64_t now = 0;
+        memcpy(&now, (const void*)(uintptr_t)q, sizeof now);
+        if (now != qword) continue;
+        int m = snprintf(out + off, cap - off,
+                         "[gpuring] FORGED-QWORD seq=%u kind=%u addr=0x%llx size=%u value=0x%llx "
+                         "pkt=0x%llx qword@0x%llx=0x%llx (age=%u)\n",
+                         r.seq, r.kind, (unsigned long long)r.addr, r.size,
+                         (unsigned long long)r.value, (unsigned long long)r.pkt,
+                         (unsigned long long)q, (unsigned long long)now, seq_now - r.seq);
+        if (m > 0) off += (size_t)m;
+        found++;
+    }
+    if (off < cap) out[off] = 0;
+    return found;
+}
 
 // --- #312 fence BUILD journal: the timing-vs-wrong-target discriminator. -------------------------
 // The AGC builders/patchers record, per fence packet (keyed by the packet's guest address):
