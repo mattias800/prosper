@@ -172,6 +172,10 @@ int main() {
     {
         prosper::test::inject_render_texture_create_failure_once();
         uint8_t frgb[3];
+        // The opt-in census arm observes this real injected refusal in the same backend call.
+        // Without the skipped-resource marker its summary could falsely claim a complete row set.
+        const prosper::frontend::ScopedInteractivePerformanceTiming timing(
+            std::getenv("PROSPER_BACKEND_TEXTURE_PATH_CENSUS") != nullptr);
         bool okFail = sample_center(C075, C025, frgb);
         printf("  vkCreateImage-failure (0.75,0.25) center=(%u,%u,%u)\n",
                okFail?frgb[0]:0, okFail?frgb[1]:0, okFail?frgb[2]:0);

@@ -47,8 +47,10 @@
 #include <deque>
 #include <functional>
 #include <filesystem>
+#include <initializer_list>
 #include <mutex>
 #include <memory>
+#include <new>
 #include <optional>
 #include <list>
 #include <iterator>
@@ -713,6 +715,159 @@ inline BackendTextureUploadStats& backend_texture_upload_stats_storage() {
 inline BackendTextureUploadStats backend_texture_upload_stats() {
     return backend_texture_upload_stats_storage();
 }
+
+// Opt-in, bounded source-path census for one F8 window. These are backend metadata only: a
+// logical image extent is not a count of CPU copies, and no guest pointer is dereferenced here.
+// The first four F8-timed backend passes meeting the configured draw minimum each retain at most
+// 512 unique-key decisions. Declined calls and omitted rows remain visible, so a narrow or truncated
+// census cannot look like a complete population.
+struct BackendTexturePathCensusRow {
+    uint64_t persistent_id = 0, version = 0, logical_extent = 0;
+    uint64_t renderer_target_id = 0, depth_target_id = 0;
+    uint64_t cpu_copy_bytes = 0, cpu_zero_bytes = 0;
+    double prepare_ms = 0, cpu_copy_ms = 0;
+    uint32_t width = 0, height = 0, depth = 0, layers = 0, mips = 0;
+    int format = 0;
+    const char* cache = "unknown";
+    const char* path = "unknown";
+    bool extent_overflow = false;
+    bool image_created = false;
+    bool storage = false;
+};
+
+class BackendTexturePathCensus {
+public:
+    static constexpr uint32_t kMaxCalls = 4;
+    static constexpr size_t kMaxRows = 512;
+
+    explicit BackendTexturePathCensus(size_t draws) : draws_(draws) {
+        if (!draws || !PROSPER_ENV_ON("PROSPER_BACKEND_TEXTURE_PATH_CENSUS") ||
+            !prosper::frontend::interactive_performance_timing()) return;
+        const auto& config = configuration();
+        if (!config.valid) return;
+        State& counts = state();
+        counts.considered.fetch_add(1, std::memory_order_relaxed);
+        if (draws < config.min_draws) {
+            if (counts.below_threshold.fetch_add(1, std::memory_order_relaxed) == 0)
+                std::fprintf(stderr,
+                             "[texture-path] threshold-decline draws=%zu min_draws=%llu "
+                             "(later eligible calls may still be recorded)\n",
+                             draws, (unsigned long long)config.min_draws);
+            return;
+        }
+        uint32_t slot = counts.admitted.load(std::memory_order_relaxed);
+        while (slot < kMaxCalls && !counts.admitted.compare_exchange_weak(
+                   slot, slot + 1, std::memory_order_relaxed)) {}
+        if (slot >= kMaxCalls) {
+            if (counts.budget_refused.fetch_add(1, std::memory_order_relaxed) == 0)
+                std::fprintf(stderr,
+                             "[texture-path] budget-exhausted cap_calls=%u min_draws=%llu "
+                             "below_threshold=%llu\n",
+                             kMaxCalls, (unsigned long long)config.min_draws,
+                             (unsigned long long)counts.below_threshold.load());
+            return;
+        }
+        call_ = slot + 1;
+        min_draws_ = config.min_draws;
+        try {
+            rows_.reserve(kMaxRows);
+        } catch (const std::bad_alloc&) {
+            std::fprintf(stderr, "[texture-path] REFUSED call=%u row-buffer allocation failed\n",
+                         call_);
+            call_ = 0;
+        }
+    }
+
+    ~BackendTexturePathCensus() {
+        if (!call_) return;
+        const bool complete_population = resource_phase_reached_ && !skipped_resource_draws_ &&
+                                         !unknown_rows_ && !omitted_;
+        std::fprintf(stderr,
+                     "[texture-path] call=%u draws=%zu rows=%zu omitted=%llu "
+                     "complete_population=%u resource_phase_reached=%u "
+                     "skipped_resource_draws=%llu "
+                     "unknown_rows=%llu evictions=%llu min_draws=%llu considered=%llu "
+                     "below_threshold=%llu budget_refused=%llu cap_calls=%u cap_rows=%zu\n",
+                     call_, draws_, rows_.size(), (unsigned long long)omitted_,
+                     static_cast<unsigned>(complete_population),
+                     static_cast<unsigned>(resource_phase_reached_),
+                     (unsigned long long)skipped_resource_draws_,
+                     (unsigned long long)unknown_rows_,
+                     (unsigned long long)evictions_, (unsigned long long)min_draws_,
+                     (unsigned long long)state().considered.load(),
+                     (unsigned long long)state().below_threshold.load(),
+                     (unsigned long long)state().budget_refused.load(), kMaxCalls, kMaxRows);
+        for (size_t i = 0; i < rows_.size(); ++i) {
+            const auto& row = rows_[i];
+            std::fprintf(stderr,
+                         "[texture-path-row] call=%u row=%zu id=%llx version=%llu "
+                         "rtt=%llx ds=%llx storage=%u "
+                         "fmt=%d extent=%ux%ux%u layers=%u mips=%u logical_level0=%llu "
+                         "extent_overflow=%u cpu_copy=%llu cpu_zero=%llu prepare_ms=%.6f "
+                         "cpu_copy_ms=%.6f cache=%s path=%s "
+                         "image_created=%u\n",
+                         call_, i, (unsigned long long)row.persistent_id,
+                         (unsigned long long)row.version,
+                         (unsigned long long)row.renderer_target_id,
+                         (unsigned long long)row.depth_target_id,
+                         static_cast<unsigned>(row.storage), row.format, row.width, row.height,
+                         row.depth, row.layers, row.mips,
+                         (unsigned long long)row.logical_extent,
+                         static_cast<unsigned>(row.extent_overflow),
+                         (unsigned long long)row.cpu_copy_bytes,
+                         (unsigned long long)row.cpu_zero_bytes,
+                         row.prepare_ms, row.cpu_copy_ms, row.cache, row.path,
+                         static_cast<unsigned>(row.image_created));
+        }
+    }
+
+    BackendTexturePathCensus(const BackendTexturePathCensus&) = delete;
+    BackendTexturePathCensus& operator=(const BackendTexturePathCensus&) = delete;
+
+    bool active() const { return call_ != 0; }
+    void record(const BackendTexturePathCensusRow& row) {
+        if (!active()) return;
+        if (std::strcmp(row.path, "unknown") == 0) ++unknown_rows_;
+        if (rows_.size() < kMaxRows) rows_.push_back(row);
+        else ++omitted_;
+    }
+    void reached_resource_phase_end() { resource_phase_reached_ = true; }
+    void skipped_resource_draw() { if (active()) ++skipped_resource_draws_; }
+    void evicted() { if (active()) ++evictions_; }
+
+private:
+    struct Config { bool valid = true; uint64_t min_draws = 1; };
+    struct State {
+        std::atomic<uint32_t> admitted{0};
+        std::atomic<uint64_t> considered{0}, below_threshold{0}, budget_refused{0};
+    };
+    static const Config& configuration() {
+        static const Config config = [] {
+            Config out;
+            constexpr const char* name = "PROSPER_BACKEND_TEXTURE_PATH_CENSUS_MIN_DRAWS";
+            const char* text = std::getenv(name);
+            if (!text) return out;
+            uint64_t parsed = 0;
+            if (!prosper::diag::parse_u64_strict(text, &parsed) || parsed > SIZE_MAX) {
+                std::fprintf(stderr, "[texture-path] REFUSED %s='%s' (expected a non-negative "
+                                     "decimal draw count)\n", name, text);
+                out.valid = false;
+            } else {
+                out.min_draws = parsed;
+            }
+            return out;
+        }();
+        return config;
+    }
+    static State& state() { static State counts; return counts; }
+    uint32_t call_ = 0;
+    size_t draws_ = 0;
+    uint64_t min_draws_ = 0;
+    std::vector<BackendTexturePathCensusRow> rows_;
+    uint64_t omitted_ = 0, evictions_ = 0, skipped_resource_draws_ = 0;
+    uint64_t unknown_rows_ = 0;
+    bool resource_phase_reached_ = false;
+};
 
 // Per-call Vulkan objects that can be shared only when their complete immutable contracts match.
 // These counters make the optimization auditable without exposing backend implementation details to
@@ -7106,6 +7261,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     const prosper::frontend::PerformanceTimingMode timing_mode =
         prosper::frontend::performance_timing_mode(
             timing_log_enabled, prosper::frontend::interactive_performance_timing());
+    BackendTexturePathCensus texture_path_census(draws.size());
     const bool timing_enabled = timing_mode.measure;
     const auto timing_start = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
     if (timing_enabled) backend_render_timing_stats_storage() = {};
@@ -10411,6 +10567,12 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                     if (upload_index == SIZE_MAX) {
                         const ResourcePhaseTimer phase_upload(timing_enabled,
                                                               &res_texture_upload_ms);
+                        const auto census_prepare_begin = texture_path_census.active()
+                            ? TimingClock::now() : TimingClock::time_point{};
+                        const char* census_cache = "not_eligible";
+                        uint64_t census_cpu_copy_bytes = 0, census_cpu_zero_bytes = 0;
+                        double census_cpu_copy_ms = 0;
+                        bool census_image_created = false;
                         upload_index = texture_uploads.size();
                         texture_uploads.push_back({});
                         SharedTextureUpload& upload = texture_uploads.back();
@@ -10514,6 +10676,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                             !upload.borrowed_compute && !upload.borrowed_ds &&
                             persistent_textures_enabled &&
                             r.persistent_texture_id) {
+                            census_cache = "new_key";
                             auto cached = persistent_texture_images.find(persistent_key);
                             // A failed queued upload may have left this owned allocation in an
                             // unknown layout with undefined contents. The failure callback cannot
@@ -10536,6 +10699,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                 persistent_texture_binding_entries -= cached->second.bindings.size();
                                 persistent_texture_images.erase(cached);
                                 cached = persistent_texture_images.end();
+                                census_cache = "invalid_replaced";
                             }
                             if (cached != persistent_texture_images.end()) {
                                 cached->second.last_use = texture_generation;
@@ -10547,6 +10711,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                 if (upload.persistent_version &&
                                     cached->second.content_version !=
                                         upload.persistent_version) {
+                                    census_cache = "refresh";
                                     upload.persistent_refresh = true;
                                     cached->second.content_version =
                                         upload.persistent_version;
@@ -10559,6 +10724,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                         });
                                     ++persistent_texture_misses;
                                 } else {
+                                    census_cache = "hit";
                                     upload.persistent_hit = true;
                                     ++persistent_texture_hits;
                                 }
@@ -10616,6 +10782,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                     buffer_resources_ready = false;
                                     break;
                                 }
+                                census_image_created = true;
                                 VkMemoryRequirements tr;
                                 vkGetImageMemoryRequirements(dev, upload.image, &tr);
                                 upload.image_bytes = tr.size;
@@ -10686,8 +10853,14 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                             "bytes); skipping this upload\n", r.tw, r.th,
                                             (unsigned long long)tbytes);
                                 } else if (r.tex_rgba) {
+                                    const auto copy_begin = texture_path_census.active()
+                                        ? TimingClock::now() : TimingClock::time_point{};
                                     parallel_render_memcpy(sp, r.tex_rgba,
                                                            static_cast<size_t>(tbytes));
+                                    census_cpu_copy_bytes = tbytes;
+                                    if (texture_path_census.active())
+                                        census_cpu_copy_ms = std::chrono::duration<double, std::milli>(
+                                            TimingClock::now() - copy_begin).count();
                                 } else {
                                     // Only a declined/missed depth-plane borrow reaches the creation
                                     // path with no CPU pixels (#1275: the bridge deliberately carries
@@ -10696,6 +10869,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                     // lookup). Bind well-defined zeros — the value the guest-byte
                                     // decode of an unwritten depth address produced — and say so.
                                     std::memset(sp, 0, static_cast<size_t>(tbytes));
+                                    census_cpu_zero_bytes = tbytes;
                                     static int declined_logged = 0;
                                     if (declined_logged++ < 16)
                                         fprintf(stderr,
@@ -10705,6 +10879,51 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                                 r.tw, r.th);
                                 }
                             }
+                        }
+                        if (texture_path_census.active()) {
+                            BackendTexturePathCensusRow row{};
+                            row.persistent_id = r.persistent_texture_id;
+                            row.version = r.persistent_texture_version;
+                            row.renderer_target_id = r.persistent_render_target_id;
+                            row.depth_target_id = r.persistent_depth_target_id;
+                            row.storage = r.is_storage_image;
+                            row.width = r.tw;
+                            row.height = r.th;
+                            row.depth = r.td;
+                            row.layers = r.sample_count;
+                            row.mips = tex_mip_levels;
+                            row.format = static_cast<int>(backend_color_format(r.texture_format));
+                            row.cache = census_cache;
+                            row.cpu_copy_bytes = census_cpu_copy_bytes;
+                            row.cpu_zero_bytes = census_cpu_zero_bytes;
+                            row.prepare_ms = std::chrono::duration<double, std::milli>(
+                                TimingClock::now() - census_prepare_begin).count();
+                            row.cpu_copy_ms = census_cpu_copy_ms;
+                            row.image_created = census_image_created;
+                            uint64_t logical = backend_color_bytes_per_pixel(r.texture_format);
+                            for (const uint64_t factor : {uint64_t(r.tw), uint64_t(r.th),
+                                                          uint64_t(r.td), uint64_t(r.sample_count)}) {
+                                if (factor && logical > UINT64_MAX / factor) {
+                                    row.extent_overflow = true;
+                                    logical = 0;
+                                    break;
+                                }
+                                logical *= factor;
+                            }
+                            row.logical_extent = logical;
+                            row.path = upload.persistent_hit ? "persistent_hit"
+                                : upload.borrowed_target ? "borrowed_color"
+                                : upload.borrowed_compute ? "borrowed_compute"
+                                : upload.borrowed_ds ? "borrowed_depth"
+                                : upload.stacked_compute ? "stacked_compute"
+                                : upload.feedback_snapshot ? "feedback_snapshot"
+                                : upload.assembled_target_mips ? "assembled_mips"
+                                : upload.gpu_detile ? "gpu_detile"
+                                : upload.uniform_clear ? "uniform_clear"
+                                : census_cpu_copy_bytes ? "cpu_staging_copy"
+                                : census_cpu_zero_bytes ? "cpu_staging_zero"
+                                : "unknown";
+                            texture_path_census.record(row);
                         }
                     }
                     if (can_memo_slot) {
@@ -11121,7 +11340,10 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                     draw_wr[i].pBufferInfo = &draw_dbi[draw_dbi_offset[i]];
                 }
             }
-            if (!buffer_resources_ready) continue;
+            if (!buffer_resources_ready) {
+                texture_path_census.skipped_resource_draw();
+                continue;
+            }
             const ResourcePhaseTimer phase_descriptor(timing_enabled, &res_descriptor_ms);
             for (uint32_t s = 0; s < v.n_sets; s++) {
                 draw_slb.clear();
@@ -11598,6 +11820,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                       upload.key.depth * upload.key.sample_count *
                                       backend_color_bytes_per_pixel(upload.key.format);
     }
+    texture_path_census.reached_resource_phase_end();
 
     const auto timing_draws_ready = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
     // Each bound color slot has its own readback contract. The caller can decline all CPU
@@ -12999,6 +13222,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         persistent_texture_bytes -= victim->second.bytes;
         persistent_texture_binding_entries -= victim->second.bindings.size();
         persistent_texture_images.erase(victim);
+        texture_path_census.evicted();
         return true;
     };
     for (auto& upload : texture_uploads) {

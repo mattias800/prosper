@@ -7,6 +7,7 @@
 #include <bit>
 #include <cstdio>
 #include <cstring>
+#include <sstream>
 #ifdef _WIN32
 #include <io.h>
 #else
@@ -59,13 +60,68 @@ template<class Action> static std::string capture_stderr(Action action) {
 
 int main(int argc, char** argv) {
     bool per_draw_control = false, expanded_control = false;
+    bool texture_path_census = false, texture_path_census_budget = false;
+    bool texture_path_census_empty = false;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--per-draw-control") == 0) per_draw_control = true;
         else if (std::strcmp(argv[i], "--expanded-control") == 0) expanded_control = true;
+        else if (std::strcmp(argv[i], "--texture-path-census") == 0) texture_path_census = true;
+        else if (std::strcmp(argv[i], "--texture-path-census-budget") == 0)
+            texture_path_census_budget = true;
+        else if (std::strcmp(argv[i], "--texture-path-census-empty") == 0)
+            texture_path_census_empty = true;
         else {
-            std::fprintf(stderr, "usage: %s [--per-draw-control] [--expanded-control]\n", argv[0]);
+            std::fprintf(stderr, "usage: %s [--per-draw-control] [--expanded-control] "
+                                 "[--texture-path-census|--texture-path-census-budget|"
+                                 "--texture-path-census-empty]\n", argv[0]);
             return 2;
         }
+    }
+    if (texture_path_census_budget) {
+        check(std::getenv("PROSPER_BACKEND_TEXTURE_PATH_CENSUS") != nullptr,
+              "texture path budget arm is explicitly enabled before first backend use");
+        const char* min_draws_text = std::getenv("PROSPER_BACKEND_TEXTURE_PATH_CENSUS_MIN_DRAWS");
+        check(min_draws_text && std::strcmp(min_draws_text, "10") == 0,
+              "budget arm has a non-default minimum draw count");
+        const auto log = capture_stderr([&] {
+            prosper::frontend::ScopedInteractivePerformanceTiming timing(true);
+            for (unsigned below = 0; below < 3; ++below)
+                BackendTexturePathCensus subthreshold(1);
+            for (unsigned call = 0; call < BackendTexturePathCensus::kMaxCalls + 2; ++call) {
+                BackendTexturePathCensus census(10);
+                for (size_t row = 0; row < BackendTexturePathCensus::kMaxRows + 1; ++row)
+                    census.record({});
+                census.reached_resource_phase_end();
+            }
+        });
+        size_t calls = 0;
+        std::istringstream lines(log);
+        for (std::string line; std::getline(lines, line);)
+            calls += line.starts_with("[texture-path] call=");
+        check(calls == BackendTexturePathCensus::kMaxCalls,
+              "four-call budget refuses all later backend calls");
+        check(log.find("threshold-decline draws=1 min_draws=10") != std::string::npos &&
+                  log.find("min_draws=10 considered=4 below_threshold=3") != std::string::npos,
+              "subthreshold calls are counted but do not consume the first admitted slot");
+        check(log.find("budget-exhausted cap_calls=4 min_draws=10") != std::string::npos,
+              "the first over-budget eligible call reports its refusal");
+        check(log.find("rows=512 omitted=1 complete_population=0 resource_phase_reached=1") !=
+                  std::string::npos,
+              "row cap reports omitted unique-key decisions instead of silent truncation");
+        return failures ? 1 : 0;
+    }
+    if (texture_path_census_empty) {
+        const char* minimum = std::getenv("PROSPER_BACKEND_TEXTURE_PATH_CENSUS_MIN_DRAWS");
+        check(minimum && !*minimum, "empty-threshold arm passes an explicitly empty setting");
+        const auto log = capture_stderr([&] {
+            prosper::frontend::ScopedInteractivePerformanceTiming timing(true);
+            BackendTexturePathCensus census(10);
+        });
+        check(log.find("REFUSED PROSPER_BACKEND_TEXTURE_PATH_CENSUS_MIN_DRAWS=''") !=
+                  std::string::npos &&
+                  log.find("[texture-path] call=") == std::string::npos,
+              "explicitly empty threshold refuses the census instead of taking default admission");
+        return failures ? 1 : 0;
     }
     // These production controls are cached at first use. Set them before ANY renderer callback;
     // the separate process arm supplies the per-draw oracle without changing startup semantics.
@@ -734,7 +790,16 @@ int main(int argc, char** argv) {
     live_producer.color0_base = 0;
     repeated_shader({expected[0], expected[1], expected[2]});
     live_draw.color0_base = Base + 0x1200000;
-    const auto shared_pixels = render_submit_items({live_producer, live_draw}, W, H);
+    std::vector<uint8_t> shared_pixels;
+    std::string texture_path_log;
+    if (texture_path_census) {
+        texture_path_log = capture_stderr([&] {
+            prosper::frontend::ScopedInteractivePerformanceTiming timing(true);
+            shared_pixels = render_submit_items({live_producer, live_draw}, W, H);
+        });
+    } else {
+        shared_pixels = render_submit_items({live_producer, live_draw}, W, H);
+    }
     const size_t shared_center = (W * (H / 2) + W / 2) * 4;
     bool shared_matches = shared_pixels.size() == Pixels * 4;
     if (shared_matches) for (size_t c = 0; c < 4; ++c)
@@ -745,6 +810,30 @@ int main(int argc, char** argv) {
     check(uploads.references == 3 && uploads.unique_uploads == 1 &&
               uploads.upload_bytes == Pixels * Layers * snapshot_bpp,
           "three array bindings produce one actual backend image/staging upload");
+    if (texture_path_census) {
+        bool copied_row = false, complete_call = false;
+        std::istringstream lines(texture_path_log);
+        for (std::string line; std::getline(lines, line);) {
+            complete_call |= line.starts_with("[texture-path] call=") &&
+                             line.find("complete_population=1 resource_phase_reached=1 "
+                                       "skipped_resource_draws=0") !=
+                                 std::string::npos;
+            if (!line.starts_with("[texture-path-row] call=") ||
+                line.find("path=cpu_staging_copy") == std::string::npos ||
+                line.find("cpu_copy=" + std::to_string(Pixels * Layers * snapshot_bpp)) ==
+                    std::string::npos) continue;
+            const auto value_after = [&line](const char* key) {
+                const size_t pos = line.find(key);
+                return pos == std::string::npos ? -1.0
+                    : std::strtod(line.c_str() + pos + std::strlen(key), nullptr);
+            };
+            const double prepare = value_after("prepare_ms=");
+            const double copy = value_after("cpu_copy_ms=");
+            copied_row |= prepare > 0 && copy > 0 && prepare >= copy;
+        }
+        check(complete_call, "live backend census reaches resource-complete call site");
+        check(copied_row, "live unique-upload branch reports actual CPU staging-copy bytes");
+    }
     const auto valid_bindings = backend_resource_reuse_stats();
     const auto valid_timing = backend_render_timing_stats();
     check(valid_bindings.texture_binding_references >= 3 &&
