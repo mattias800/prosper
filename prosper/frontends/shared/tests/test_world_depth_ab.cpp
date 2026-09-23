@@ -35,6 +35,47 @@ int main() {
                    "malformed config admitted"))
             return 1;
 
+    WorldDepthAbConfig c2_config = config;
+    c2_config.mode = 0;
+    const auto c2_arm = prosper::frontend::world_c2_arm_allowed;
+    if (!check(c2_arm(true, true, c2_config, "1"),
+               "exact Sonic c2 diagnostic failed to arm") ||
+        !check(!c2_arm(false, true, c2_config, "1"),
+               "unarmed title/output directory entered c2 diagnostic") ||
+        !check(!c2_arm(true, false, c2_config, "1"),
+               "non-metadata run entered c2 diagnostic") ||
+        !check(!c2_arm(true, true, c2_config, "0"),
+               "wrong explicit c2 value entered diagnostic"))
+        return 1;
+    c2_config.mode = 4;
+    if (!check(!c2_arm(true, true, c2_config, "1"),
+               "depth override policy entered c2 content diagnostic"))
+        return 1;
+    c2_config = config;
+    c2_config.mode = 0;
+    --c2_config.capture_pad_flip;
+    if (!check(!c2_arm(true, true, c2_config, "1"),
+               "different pad entered c2 content diagnostic"))
+        return 1;
+    const auto c2_attempt = prosper::frontend::world_c2_should_attempt;
+    if (!check(c2_attempt(true, false, true),
+               "new exact callback did not authorize one c2 attempt") ||
+        !check(!c2_attempt(true, true, true),
+               "second c2 readback attempt authorized") ||
+        !check(!c2_attempt(true, false, false),
+               "wrong callback shape authorized c2 readback") ||
+        !check(!c2_attempt(false, false, true),
+               "default-off c2 readback authorized"))
+        return 1;
+    const auto metadata_range = prosper::frontend::world_c2_metadata_range_valid;
+    if (!check(metadata_range(0, 0) && metadata_range(0x1000, 0x100),
+               "valid absent/present c2 metadata declined") ||
+        !check(!metadata_range(0, 0x100) && !metadata_range(0x1000, 0),
+               "partial c2 metadata identity accepted") ||
+        !check(!metadata_range(UINT64_MAX - 3, 8),
+               "overflowing c2 metadata range accepted"))
+        return 1;
+
     WorldDepthDrawFact clear;
     clear.depth_read_base = clear.depth_write_base = 0x2053960000ull;
     clear.depth_width = 3840; clear.depth_height = 2160;
@@ -135,6 +176,91 @@ int main() {
     if (!check(target_slots.world == 0x81u && target_slots.composite == 0x8u &&
                    slot_reads == 8,
                "world/composite slot scan missed an active c2..c7 binding"))
+        return 1;
+    const auto world_c2_shape = [] {
+        prosper::frontend::WorldC2CallbackShape shape;
+        shape.observe(62, 0x1, 0x4, 62, 62, 62, 62, WorldDepthPassKind::Geometry, false);
+        shape.observe(1, 0x1, 0, 1, 1, 0, 0, WorldDepthPassKind::Geometry, false);
+        return shape;
+    };
+    auto c2_shape = world_c2_shape();
+    if (!check(c2_shape.ready(), "exact 62+1 c0-world/c2 callback shape refused"))
+        return 1;
+    c2_shape.observe(1, 0, 0x1, 0, 0, 1, 0, WorldDepthPassKind::Unrelated, false);
+    if (!check(!c2_shape.ready(), "later same-address c0 writer retained c2 capture gate"))
+        return 1;
+    c2_shape = {};
+    c2_shape.observe(1, 0x1, 0, 1, 1, 0, 0, WorldDepthPassKind::Geometry, false);
+    c2_shape.observe(62, 0x1, 0x4, 62, 62, 62, 62, WorldDepthPassKind::Geometry, false);
+    if (!check(!c2_shape.ready(), "reversed c2 callback shape authorized readback"))
+        return 1;
+    c2_shape = {};
+    c2_shape.observe(62, 0x1, 0x4, 62, 62, 62, 61, WorldDepthPassKind::Geometry, false);
+    c2_shape.observe(1, 0x1, 0, 1, 1, 0, 0, WorldDepthPassKind::Geometry, false);
+    if (!check(!c2_shape.ready(), "one draw missing c2 still authorized readback"))
+        return 1;
+    c2_shape = {};
+    c2_shape.observe(62, 0x1, 0x4, 62, 62, 62, 62, WorldDepthPassKind::Geometry, true);
+    c2_shape.observe(1, 0x1, 0, 1, 1, 0, 0, WorldDepthPassKind::Geometry, false);
+    if (!check(!c2_shape.ready(), "resolve group authorized c2 readback"))
+        return 1;
+    c2_shape = {};
+    c2_shape.observe(62, 0x1, 0x4, 62, 61, 62, 62, WorldDepthPassKind::Geometry, false);
+    c2_shape.observe(1, 0x1, 0, 1, 1, 0, 0, WorldDepthPassKind::Geometry, false);
+    if (!check(!c2_shape.ready(), "changed world c1 MRT binding authorized c2 readback"))
+        return 1;
+    const auto tail_ok = prosper::frontend::world_c2_tail_identity_allowed;
+    if (!check(tail_ok(3930, 3930, 3930, true, 3930, 3930, 0),
+               "exact callback tail refused c2 content probe") ||
+        !check(!tail_ok(3930, 3930, 3931, true, 3930, 3930, 0),
+               "pad drift authorized c2 content probe") ||
+        !check(!tail_ok(3930, 3930, 3930, true, 3929, 3930, 0),
+               "earlier guest version authorized c2 content probe") ||
+        !check(!tail_ok(3930, 3930, 3930, true, 3930, 3930, 1),
+               "guest-flip instability authorized c2 content probe") ||
+        !check(!tail_ok(3930, 3930, 3930, false, 3930, 3930, 0),
+               "missing guest-flip evidence authorized c2 content probe"))
+        return 1;
+
+    const auto later_inputs = prosper::frontend::world_c2_later_input_group;
+    if (!check(later_inputs(true, true, true, false, false),
+               "later c0 writer did not enter targeted descriptor census") ||
+        !check(!later_inputs(true, false, true, false, false),
+               "c2-only writer without exact producer shape entered later-input census") ||
+        !check(!later_inputs(true, true, true, true, false),
+               "62-draw world+c2 producer entered later-input census") ||
+        !check(!later_inputs(true, true, false, true, false),
+               "world-only group entered later-input census") ||
+        !check(!later_inputs(true, true, true, false, true),
+               "resolve group entered later-input census") ||
+        !check(!later_inputs(false, true, true, false, false),
+               "default-off callback entered later-input census"))
+        return 1;
+
+    prosper::frontend::WorldC2DescriptorCensus targets;
+    const uint64_t c2_base = 0x204f9a0000ull;
+    if (!check(decltype(targets)::target(config.color_base, config.color_base,
+                                         0x204b9e0000ull, c2_base) &&
+                   decltype(targets)::target(0x204b9e0000ull, config.color_base,
+                                             0x204b9e0000ull, c2_base) &&
+                   decltype(targets)::target(c2_base, config.color_base,
+                                             0x204b9e0000ull, c2_base) &&
+                   !decltype(targets)::target(0x1234, config.color_base,
+                                              0x204b9e0000ull, c2_base),
+               "three-address descriptor filter accepted or lost a target"))
+        return 1;
+    for (uint32_t binding = 0;
+         binding < static_cast<uint32_t>(targets.kMaximumFacts); ++binding)
+        targets.add({1, 0, c2_base, binding, 3840, 2160, 5});
+    targets.add({1, 0, c2_base, 0, 3840, 2160, 5}); // a duplicate is not overflow
+    if (!check(targets.complete() && targets.facts.size() == targets.kMaximumFacts &&
+                   targets.matches == targets.kMaximumFacts + 1,
+               "complete targeted descriptor census did not pass positive control"))
+        return 1;
+    targets.add({1, 0, c2_base, 99, 3840, 2160, 5});
+    if (!check(!targets.complete() && targets.overflow == 1 &&
+                   targets.matches == targets.kMaximumFacts + 2,
+               "thirteenth target descriptor was silently truncated"))
         return 1;
     int pad_reads = 0;
     const auto read_pad = [&] { ++pad_reads; return int64_t{3930}; };

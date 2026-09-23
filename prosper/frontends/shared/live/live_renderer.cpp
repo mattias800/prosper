@@ -1391,6 +1391,8 @@ struct WorldDepthAbRun {
     uint64_t clear_passes = 0, geometry_passes = 0, other_world_passes = 0;
     uint64_t ambiguous_passes = 0, shadow_like_passes = 0, capture_attempts = 0;
     WorldProducerCensus census{};
+    bool c2_capture_armed = false, c2_capture_attempted = false, c2_capture_complete = false;
+    uint64_t c2_callback_candidates = 0;
 };
 
 uint64_t world_depth_raw_hash(const void* data, size_t bytes) {
@@ -1482,6 +1484,42 @@ bool write_world_depth_pair(const WorldDepthAbRun& run, int64_t actual_pad_flip,
     }
     return true;
 }
+
+// This is one raw retained-image version at the end of the exact observed callback. It is not a
+// composited frame, pixel-write proof, or a successful-present join. Write the manifest last so a
+// partial raw file never looks like a complete observation.
+bool write_world_c2_raw(const WorldDepthAbRun& run, int64_t pad, uint64_t guest_flip,
+                        int submit, uint64_t c2_base, VkFormat format,
+                        const std::vector<uint8_t>& pixels) {
+    char stem[160];
+    std::snprintf(stem, sizeof stem, "world-c2-pad%lld-vo%llu-submit%d",
+                  static_cast<long long>(pad),
+                  static_cast<unsigned long long>(guest_flip), submit);
+    const std::string raw_name = std::string(stem) + ".color-raw";
+    const std::string raw_path = run.directory + "/" + raw_name;
+    if (!write_world_depth_raw(raw_path, pixels.data(), pixels.size())) return false;
+    char manifest[1024];
+    const int written = std::snprintf(manifest, sizeof manifest,
+        "{\"diagnostic\":\"sonic-world-c2-callback-tail\",\"pad\":%lld,"
+        "\"guest_flip\":%llu,\"renderer_submit\":%d,"
+        "\"target\":\"0x%llx\",\"source_slot\":2,\"width\":%u,\"height\":%u,"
+        "\"vk_format\":%u,\"bytes\":%zu,\"fnv64\":\"%016llx\","
+        "\"raw_file\":\"%s\",\"pixel_write_proven\":false,"
+        "\"same_callback_guest_write_journal\":\"unchanged\","
+        "\"prior_producer_versions_excluded\":false,\"present_join\":\"unknown\"}\n",
+        static_cast<long long>(pad), static_cast<unsigned long long>(guest_flip), submit,
+        static_cast<unsigned long long>(c2_base), run.config.width, run.config.height,
+        static_cast<unsigned>(format), pixels.size(),
+        static_cast<unsigned long long>(world_depth_raw_hash(pixels.data(), pixels.size())),
+        raw_name.c_str());
+    const std::string manifest_path = run.directory + "/" + stem + ".json";
+    if (written <= 0 || static_cast<size_t>(written) >= sizeof manifest ||
+        !write_world_depth_raw(manifest_path, manifest, static_cast<size_t>(written))) {
+        std::remove(raw_path.c_str());
+        return false;
+    }
+    return true;
+}
 } // namespace
 
 void register_live_renderer(const std::string& frame_dir, bool dump_bmps_requested,
@@ -1491,6 +1529,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
     const bool dump_bmps = frame_dump_request_allowed(
         dump_bmps_requested, PROSPER_ENV_VALUE("PROSPER_NO_FRAME_DUMPS"));
     auto world_depth_ab = std::make_shared<WorldDepthAbRun>();
+    const char* c2_requested = PROSPER_ENV_VALUE("PROSPER_SONIC_C2_CAPTURE");
     if (const char* setting = PROSPER_ENV_VALUE("PROSPER_SONIC_WORLD_DEPTH_AB")) {
         const char* directory = PROSPER_ENV_VALUE("PROSPER_SONIC_WORLD_DEPTH_AB_DIR");
         const char* meta_only = PROSPER_ENV_VALUE("PROSPER_SONIC_WORLD_META_ONLY");
@@ -1505,6 +1544,11 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
         if (world_depth_ab->armed) {
             world_depth_ab->directory = directory;
             world_depth_ab->census_only = meta_only != nullptr;
+            if (c2_requested) {
+                world_depth_ab->c2_capture_armed = world_c2_arm_allowed(
+                    world_depth_ab->armed, world_depth_ab->census_only,
+                    world_depth_ab->config, c2_requested);
+            }
             std::fprintf(stderr,
                 "[world-depth-ab] armed mode=%d pad=%lld ds=0x%llx color=0x%llx extent=%ux%u "
                 "dir=%s meta-only=%d; only structurally matching world passes can change policy\n",
@@ -1521,6 +1565,11 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 "PROSPER_DIAG_CLEAR_OVERWRITE\n");
         }
     }
+    if (c2_requested && !world_depth_ab->c2_capture_armed)
+        std::fprintf(stderr,
+            "[world-c2] REFUSED: requires Sonic, mode 0, pad 3930, exact "
+            "DS/color/3840x2160 identity, metadata-only census, an existing output directory, "
+            "PROSPER_SONIC_WORLD_DEPTH_AB, and PROSPER_SONIC_C2_CAPTURE=1\n");
     // Titles whose WaveAny-only fragment programs may run at the host's native Wave32.
     //
     // The classifier (render_runner.h) admits a reason set of EXACTLY kFragmentWaveReasonWaveAny --
@@ -9467,6 +9516,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 const int64_t callback_pad = world_census_callback_pad(
                     world_depth_ab->armed, world_depth_ab->census_only,
                     [] { return prosper_pad_flip_ordinal(); });
+                const auto c2_write_snapshot = world_depth_ab->c2_capture_armed &&
+                    callback_pad == world_depth_ab->config.capture_pad_flip
+                    ? prosper::gpu::guest_gpu_write_snapshot()
+                    : prosper::gpu::GuestGpuWriteSnapshot{};
                 prosper::test::BackendSubmissionBatch backend_submission;
                 struct WorldCaptureCandidate {
                     bool seen = false, ambiguous = false;
@@ -9475,9 +9528,13 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     prosper::test::BackendWorldDrawRecordStats recorded{};
                 } world_capture;
                 const uint64_t census_groups_before = world_depth_ab->census.relevant_groups;
+                constexpr uint64_t c2_base = 0x204f9a0000ull;
+                constexpr uint64_t world_c1_base = 0x204b9e0000ull;
+                WorldC2CallbackShape c2_callback_shape;
                 // The earlier raw pair selected an eight-draw character-only version of this
-                // address. Census *versions in order* before another expensive readback. This
-                // mode emits at most 64 metadata lines at the exact requested pad, no pixels.
+                // address. Census bindings in order before any optional c2 readback. Ordinary
+                // metadata mode emits at most 64 lines at the exact requested pad and no pixels;
+                // the separately armed c2 mode can add one bounded raw image at a verified tail.
                 auto census_world_group = [&](size_t first_index,
                                               const std::vector<const prosper::gpu::DrawItem*>& group,
                                               WorldDepthPassKind kind, bool resolve) {
@@ -9485,11 +9542,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             world_depth_ab->armed, world_depth_ab->census_only,
                             world_depth_ab->config.capture_pad_flip, callback_pad))
                         return;
-                    constexpr uint64_t composite_base = 0x204f9a0000ull;
                     bool depth_bound = false, world_bound = false, composite_bound = false;
                     uint32_t world_slots = 0, composite_slots = 0;
                     size_t world_bound_draws = 0, composite_bound_draws = 0;
-                    size_t both_bound_draws = 0;
+                    size_t both_bound_draws = 0, world_c1_bound_draws = 0;
                     size_t world_vs_descriptors = 0, world_ps_descriptors = 0;
                     const uint64_t first_fs = group.front()->fs_guest_addr;
                     bool mixed_fs = false;
@@ -9501,7 +9557,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         if (resolve) {
                             draw_world_bound = draw->color1_base ==
                                 world_depth_ab->config.color_base;
-                            draw_composite_bound = draw->color1_base == composite_base;
+                            draw_composite_bound = draw->color1_base == c2_base;
                             if (draw_world_bound) world_slots |= 1u << 1;
                             if (draw_composite_bound) composite_slots |= 1u << 1;
                         } else {
@@ -9510,7 +9566,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             // bound both targets. Use the renderer's active-attachment rule.
                             const auto slots = world_census_target_slots(
                                 prosper::gpu::kColorTargetCount,
-                                world_depth_ab->config.color_base, composite_base,
+                                world_depth_ab->config.color_base, c2_base,
                                 [&](uint32_t slot) { return active_color(*draw, slot); });
                             world_slots |= slots.world;
                             composite_slots |= slots.composite;
@@ -9522,6 +9578,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         world_bound_draws += draw_world_bound;
                         composite_bound_draws += draw_composite_bound;
                         both_bound_draws += draw_world_bound && draw_composite_bound;
+                        world_c1_bound_draws += !resolve &&
+                            active_color(*draw, 1) == world_c1_base;
                         const auto count_world_descriptor = [&](const auto* table, size_t& count) {
                             if (!table) return;
                             for (const auto& r : table->resources)
@@ -9532,6 +9590,11 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         count_world_descriptor(draw->prt.get(), world_ps_descriptors);
                     }
                     if (!depth_bound && !world_bound && !composite_bound) return;
+                    if (world_depth_ab->c2_capture_armed)
+                        c2_callback_shape.observe(group.size(), world_slots, composite_slots,
+                            world_bound_draws, world_c1_bound_draws,
+                            composite_bound_draws, both_bound_draws,
+                            kind, resolve);
                     // A descriptor is evidence of a declared input, not proof that its shader
                     // sampled it or that the backend served this exact retained image version.
                     // Keep at most eight distinct image facts for groups that target only the
@@ -9540,7 +9603,30 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                                  uint32_t, uint32_t, uint32_t, uint32_t>;
                     std::set<ImageFact> image_facts;
                     size_t image_fact_overflow = 0;
-                    if (composite_bound && !world_bound && !resolve) {
+                    WorldC2DescriptorCensus target_facts;
+                    // Only the later c0 writers (orders 12/13 in the retained trace) answer
+                    // which declared images THEY read. The 62-draw c0-world+c2 group is a
+                    // different producer-bound question; including it would flood this list.
+                    if (world_c2_later_input_group(world_depth_ab->c2_capture_armed,
+                            world_depth_ab->c2_callback_candidates != 0,
+                            composite_bound, world_bound, resolve)) {
+                        for (const auto* draw : group) {
+                            const auto collect = [&](const auto* table, uint32_t stage) {
+                                if (!table) return;
+                                for (const auto& r : table->resources) {
+                                    if ((r.cls != RC::Texture && r.cls != RC::StorageImage) ||
+                                        !WorldC2DescriptorCensus::target(r.gpu_addr,
+                                            world_depth_ab->config.color_base,
+                                            world_c1_base, c2_base))
+                                        continue;
+                                    target_facts.add({stage, static_cast<uint32_t>(r.cls),
+                                        r.gpu_addr, r.binding, r.width, r.height, r.img_dim});
+                                }
+                            };
+                            collect(draw->vrt.get(), 0);
+                            collect(draw->prt.get(), 1);
+                        }
+                    } else if (composite_bound && !world_bound && !resolve) {
                         for (const auto* draw : group) {
                             const auto collect = [&](const auto* table, uint32_t stage) {
                                 if (!table) return;
@@ -9577,9 +9663,11 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         "submit=%d "
                         "group=%zu..%zu order=%llu draws=%zu depth-bound=%d world-write-bound=%d "
                         "composite-write-bound=%d world-slots=0x%x composite-slots=0x%x "
-                        "world-bound-draws=%zu composite-bound-draws=%zu both-bound-draws=%zu "
+                        "world-bound-draws=%zu world-c1-bound-draws=%zu "
+                        "composite-bound-draws=%zu both-bound-draws=%zu "
                         "world-vs-descriptors=%zu world-ps-descriptors=%zu "
                         "fs-first=0x%llx fs-mixed=%d image-facts=%zu image-overflow=%zu "
+                        "target-matches=%llu target-facts=%zu target-overflow=%llu "
                         "kind=%s resolve=%d c0=0x%llx c1=0x%llx c0-mask=0x%x "
                         "depth=0x%llx read-depth=0x%llx scissor=%d,%d..%d,%d "
                         "native=%ux%u; target binding is not pixel-write or present provenance\n",
@@ -9588,11 +9676,16 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         first_index, first_index + group.size() - 1,
                         static_cast<unsigned long long>(census.relevant_groups), group.size(),
                         depth_bound, world_bound, composite_bound,
-                        world_slots, composite_slots, world_bound_draws, composite_bound_draws,
+                        world_slots, composite_slots, world_bound_draws, world_c1_bound_draws,
+                        composite_bound_draws,
                         both_bound_draws,
                         world_vs_descriptors, world_ps_descriptors,
                         static_cast<unsigned long long>(first_fs), mixed_fs,
-                        image_facts.size(), image_fact_overflow, kind_name, resolve,
+                        image_facts.size(), image_fact_overflow,
+                        static_cast<unsigned long long>(target_facts.matches),
+                        target_facts.facts.size(),
+                        static_cast<unsigned long long>(target_facts.overflow),
+                        kind_name, resolve,
                         static_cast<unsigned long long>(head.color0_base),
                         static_cast<unsigned long long>(head.color1_base),
                         prosper::frontend::mrt_write_mask(head, 0),
@@ -9602,13 +9695,26 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         head.color0_width, head.color0_height);
                     // Each row is on the SAME callback and pad as its group. A full table or
                     // line-budget overflow makes a proposed version join fail closed.
-                    census.descriptor_overflow += image_fact_overflow;
+                    census.descriptor_overflow += image_fact_overflow + target_facts.overflow;
                     for (const auto& [stage, cls, addr, binding, width, height, dim] : image_facts) {
                         if (!census.reserve_detail_line()) break;
                         std::fprintf(stderr,
                             "[world-producer-image] observation-pad=%lld submit=%d order=%llu "
                             "stage=%s class=%s binding=%u base=0x%llx extent=%ux%u dim=%u; "
                             "descriptor only, no executed-fetch or retained-version proof\n",
+                            static_cast<long long>(callback_pad), g_this_submit,
+                            static_cast<unsigned long long>(census.relevant_groups),
+                            stage ? "fs" : "vs",
+                            cls == static_cast<uint32_t>(RC::Texture) ? "texture" : "storage",
+                            binding, static_cast<unsigned long long>(addr), width, height, dim);
+                    }
+                    for (const auto& [stage, cls, addr, binding, width, height, dim] :
+                         target_facts.facts) {
+                        if (!census.reserve_detail_line()) break;
+                        std::fprintf(stderr,
+                            "[world-c2-input] observation-pad=%lld submit=%d order=%llu "
+                            "stage=%s class=%s binding=%u base=0x%llx extent=%ux%u dim=%u; "
+                            "exact-base declaration only, no executed-fetch or alias proof\n",
                             static_cast<long long>(callback_pad), g_this_submit,
                             static_cast<unsigned long long>(census.relevant_groups),
                             stage ? "fs" : "vs",
@@ -11426,6 +11532,119 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     pass_tail_measured_before =
                         pending_timing.build_resources_ms + pending_timing.backend_ms;
                 }
+                // A single opt-in raw c2 observation at the end of the exact pad-3930 62+1
+                // callback. The next callback may write this same address at c0; observing it
+                // later would silently mislabel that newer version as the world group's c2.
+                // This is content at an ordered boundary, not proof that any draw wrote pixels.
+                if (world_depth_ab->c2_capture_armed && c2_callback_shape.ready()) {
+                    ++world_depth_ab->c2_callback_candidates;
+                    if (world_c2_should_attempt(world_depth_ab->c2_capture_armed,
+                            world_depth_ab->c2_capture_attempted,
+                            c2_callback_shape.ready())) {
+                        world_depth_ab->c2_capture_attempted = true;
+                        std::string refusal;
+                        std::vector<uint8_t> pixels;
+                        const int64_t tail_pad = prosper_pad_flip_ordinal();
+                        const uint64_t tail_flip = prosper_vo_flip_count();
+                        const auto retained = g_rtt.find(c2_base);
+                        VkFormat format = VK_FORMAT_UNDEFINED;
+                        if (!world_c2_tail_identity_allowed(
+                                world_depth_ab->config.capture_pad_flip, callback_pad,
+                                tail_pad, world_depth_ab->census.has_guest_flip,
+                                world_depth_ab->census.first_guest_flip, tail_flip,
+                                world_depth_ab->census.unstable_guest_flips))
+                            refusal = "callback pad or guest flip changed before c2 readback";
+                        else if (retained == g_rtt.end() || !retained->second.gpu_valid ||
+                                 retained->second.w != world_depth_ab->config.width ||
+                                 retained->second.h != world_depth_ab->config.height)
+                            refusal = "c2 has no matching GPU-valid retained image";
+                        else {
+                            format = retained->second.format;
+                            const uint64_t texels =
+                                static_cast<uint64_t>(world_depth_ab->config.width) *
+                                world_depth_ab->config.height;
+                            const uint32_t bpp = prosper::test::backend_color_bytes_per_pixel(format);
+                            if (format == VK_FORMAT_UNDEFINED || !bpp ||
+                                texels > (64u << 20) / bpp ||
+                                !prosper::test::find_persistent_color_target(
+                                    c2_base, world_depth_ab->config.width,
+                                    world_depth_ab->config.height, format))
+                                refusal = "c2 format, size, or exact retained image is unsupported";
+                            else if (!world_c2_guest_range_valid(c2_base, texels * bpp) ||
+                                     retained->second.dcc_metadata_dirty ||
+                                     !world_c2_metadata_range_valid(
+                                         retained->second.dcc_metadata_addr,
+                                         retained->second.dcc_metadata_bytes))
+                                refusal = "c2 color/DCC guest range or authority is invalid";
+                            else {
+                                const auto writes = prosper::gpu::guest_gpu_writes_since(
+                                    c2_write_snapshot, c2_base, texels * bpp);
+                                if (writes == prosper::gpu::GuestGpuWriteQuery::Overlap)
+                                    refusal = "c2 guest-write journal records an overlap";
+                                else if (writes == prosper::gpu::GuestGpuWriteQuery::Unknown)
+                                    refusal = "c2 guest-write journal is unavailable or overflowed";
+                                if (refusal.empty() && retained->second.dcc_metadata_addr) {
+                                    const auto dcc_writes = prosper::gpu::guest_gpu_writes_since(
+                                        c2_write_snapshot,
+                                        retained->second.dcc_metadata_addr,
+                                        retained->second.dcc_metadata_bytes);
+                                    if (dcc_writes == prosper::gpu::GuestGpuWriteQuery::Overlap)
+                                        refusal = "c2 DCC guest-write journal records an overlap";
+                                    else if (dcc_writes == prosper::gpu::GuestGpuWriteQuery::Unknown)
+                                        refusal = "c2 DCC guest-write journal is unavailable or overflowed";
+                                }
+                            }
+                        }
+                        if (refusal.empty() && backend_submission.pending()) {
+                            const auto& ctx = prosper::test::render_vk_ctx();
+                            if (!ctx.ok)
+                                refusal = "Vulkan renderer unavailable before c2 completion";
+                            else {
+                                const auto completed = backend_submission.submit_and_wait(
+                                    ctx.dev, ctx.queue, false);
+                                if (completed.submit_result != VK_SUCCESS ||
+                                    completed.wait_result != VK_SUCCESS)
+                                    refusal = "c2 producer batch did not complete";
+                            }
+                        }
+                        if (refusal.empty()) {
+                            std::string error;
+                            const size_t expected =
+                                static_cast<size_t>(world_depth_ab->config.width) *
+                                world_depth_ab->config.height *
+                                prosper::test::backend_color_bytes_per_pixel(format);
+                            if (!prosper::test::readback_persistent_color_target(
+                                    c2_base, world_depth_ab->config.width,
+                                    world_depth_ab->config.height, format, pixels, error) ||
+                                pixels.size() != expected)
+                                refusal = "c2 readback refused: " + error;
+                        }
+                        if (refusal.empty() &&
+                            (prosper_pad_flip_ordinal() != tail_pad ||
+                             prosper_vo_flip_count() != tail_flip))
+                            refusal = "pad or guest flip advanced during c2 completion/readback";
+                        if (refusal.empty() && !write_world_c2_raw(
+                                *world_depth_ab, tail_pad, tail_flip, g_this_submit,
+                                c2_base, format, pixels))
+                            refusal = "cannot write complete c2 raw image and manifest";
+                        if (!refusal.empty())
+                            std::fprintf(stderr,
+                                "[world-c2] REFUSED pad=%lld submit=%d: %s\n",
+                                static_cast<long long>(tail_pad), g_this_submit, refusal.c_str());
+                        else {
+                            world_depth_ab->c2_capture_complete = true;
+                            std::fprintf(stderr,
+                                "[world-c2] COMPLETE pad=%lld guest-flip=%llu submit=%d "
+                                "target=0x%llx slot=2 bytes=%zu fnv64=%016llx; "
+                                "pixel writes, later versions and present join unknown\n",
+                                static_cast<long long>(tail_pad),
+                                static_cast<unsigned long long>(tail_flip), g_this_submit,
+                                static_cast<unsigned long long>(c2_base), pixels.size(),
+                                static_cast<unsigned long long>(
+                                    world_depth_raw_hash(pixels.data(), pixels.size())));
+                        }
+                    }
+                }
                 // One callback-local depth/color pair for the structurally selected world geometry
                 // group at the requested pad ordinal. Multiple groups or later attachment writes
                 // refuse this readback. A caller can join producer_guest_flip with
@@ -11566,14 +11785,17 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             "[world-producer-census] observation-pad=%lld callback-end-pad=%lld "
                             "callback-end-guest-flip=%llu "
                             "submit=%d callback-selected=%s selected-bytes=%zu "
-                            "requested-bytes=%zu; selected callback source is not a native "
+                            "requested-bytes=%zu c2-target-groups=%u c2-shape-ready=%d "
+                            "c2-shape-refused=%d; selected callback source is not a native "
                             "present join\n",
                             static_cast<long long>(callback_pad),
                             static_cast<long long>(callback_end_pad),
                             static_cast<unsigned long long>(callback_end_guest_flip),
                             g_this_submit,
                             prosper::frontend::present_source_name(present_choice),
-                            candidate_bytes(selected_pixels), present_extent_bytes);
+                            candidate_bytes(selected_pixels), present_extent_bytes,
+                            c2_callback_shape.target_groups, c2_callback_shape.ready(),
+                            c2_callback_shape.refused);
                 }
                 if (world_depth_ab->armed && world_depth_ab->census_only &&
                     !world_depth_ab->window_reported &&
@@ -11589,8 +11811,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         "detail-logged=%llu detail-omitted=%llu descriptor-overflow=%llu "
                         "unstable-callbacks=%llu "
                         "unstable-guest-flips=%llu first-guest-flip=%llu "
-                        "single-ordered-candidate=%d total-line-cap=%llu; "
-                        "no raw readback attempted; raster groups only, compute producers, "
+                        "single-ordered-candidate=%d total-line-cap=%llu "
+                        "c2-armed=%d c2-candidates=%llu c2-complete=%d; "
+                        "c2 readback is opt-in; raster groups only, compute producers, "
                         "present join, and pixel writes unknown\n",
                         static_cast<long long>(world_depth_ab->config.capture_pad_flip),
                         static_cast<unsigned long long>(census.depth_groups),
@@ -11608,7 +11831,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         static_cast<unsigned long long>(census.unstable_guest_flips),
                         static_cast<unsigned long long>(census.first_guest_flip),
                         census.has_single_ordered_candidate(),
-                        static_cast<unsigned long long>(WorldProducerCensus::kMaximumLines));
+                        static_cast<unsigned long long>(WorldProducerCensus::kMaximumLines),
+                        world_depth_ab->c2_capture_armed,
+                        static_cast<unsigned long long>(world_depth_ab->c2_callback_candidates),
+                        world_depth_ab->c2_capture_complete);
                 }
                 // #2283's blocking arm, measured rather than argued: is a pass whose colour target is
                 // DISABLED (CB_COLOR0_INFO.FORMAT == 0, CB_COLOR_INVALID) ever chosen as the frame

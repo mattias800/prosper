@@ -4,9 +4,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <set>
 #include <span>
 #include <string_view>
 #include <system_error>
+#include <tuple>
 
 namespace prosper::frontend {
 
@@ -78,6 +80,101 @@ struct WorldCensusTargetSlots {
     uint32_t world = 0;
     uint32_t composite = 0;
 };
+
+// One specifically observed callback shape, used only to authorize a bounded raw c2 diagnostic.
+// Requiring both groups in order avoids silently relabelling an earlier/later same-address version.
+struct WorldC2CallbackShape {
+    uint32_t target_groups = 0;
+    bool refused = false;
+
+    void observe(uint64_t draws, uint32_t world_slots, uint32_t c2_target_slots,
+                 uint64_t world_draws, uint64_t world_c1_draws,
+                 uint64_t c2_target_draws, uint64_t both_draws,
+                 WorldDepthPassKind kind, bool resolve) {
+        if (!world_slots && !c2_target_slots) return;
+        ++target_groups;
+        if (resolve || kind != WorldDepthPassKind::Geometry ||
+            (target_groups == 1 &&
+             (draws != 62 || world_slots != 0x1 || c2_target_slots != 0x4 ||
+              world_draws != 62 || world_c1_draws != 62 ||
+              c2_target_draws != 62 || both_draws != 62)) ||
+            (target_groups == 2 &&
+             (draws != 1 || world_slots != 0x1 || c2_target_slots != 0 ||
+              world_draws != 1 || world_c1_draws != 1 ||
+              c2_target_draws != 0 || both_draws != 0)) ||
+            target_groups > 2)
+            refused = true;
+    }
+
+    bool ready() const { return target_groups == 2 && !refused; }
+};
+
+constexpr bool world_c2_arm_allowed(bool base_armed, bool metadata_only,
+                                     const WorldDepthAbConfig& config,
+                                     std::string_view requested_value) {
+    return base_armed && metadata_only && requested_value == "1" &&
+           config.mode == 0 && config.capture_pad_flip == 3930 &&
+           config.depth_base == 0x2053960000ull &&
+           config.color_base == 0x2049a00000ull &&
+           config.width == 3840 && config.height == 2160;
+}
+
+constexpr bool world_c2_should_attempt(bool capture_armed, bool already_attempted,
+                                        bool exact_callback_shape) {
+    return capture_armed && !already_attempted && exact_callback_shape;
+}
+
+constexpr bool world_c2_guest_range_valid(uint64_t base, uint64_t bytes) {
+    return base != 0 && bytes != 0 && base <= UINT64_MAX - bytes;
+}
+
+constexpr bool world_c2_metadata_range_valid(uint64_t base, uint64_t bytes) {
+    return (base == 0 && bytes == 0) || world_c2_guest_range_valid(base, bytes);
+}
+
+constexpr bool world_c2_tail_identity_allowed(int64_t requested_pad, int64_t callback_pad,
+                                               int64_t tail_pad, bool has_guest_flip,
+                                               uint64_t first_guest_flip,
+                                               uint64_t tail_guest_flip,
+                                               uint64_t unstable_guest_flips) {
+    return callback_pad == requested_pad && tail_pad == callback_pad &&
+           has_guest_flip && !unstable_guest_flips && requested_pad >= 0 &&
+           first_guest_flip == static_cast<uint64_t>(requested_pad) &&
+           tail_guest_flip == first_guest_flip;
+}
+
+// The old first-eight descriptor listing dropped facts relevant to the c2 handoff. This
+// address-filtered census scans every resource, reports truncation explicitly, and declines an
+// exhaustive-input claim if a thirteenth distinct fact exists. Base equality is not alias proof.
+struct WorldC2DescriptorCensus {
+    using Fact = std::tuple<uint32_t, uint32_t, uint64_t, uint32_t,
+                            uint32_t, uint32_t, uint32_t>;
+    static constexpr size_t kMaximumFacts = 12;
+    std::set<Fact> facts;
+    uint64_t matches = 0;
+    uint64_t overflow = 0;
+
+    static constexpr bool target(uint64_t base, uint64_t world, uint64_t world_c1,
+                                 uint64_t c2) {
+        return base == world || base == world_c1 || base == c2;
+    }
+
+    void add(const Fact& fact) {
+        ++matches;
+        if (facts.contains(fact)) return;
+        if (facts.size() < kMaximumFacts) facts.insert(fact);
+        else ++overflow;
+    }
+
+    bool complete() const { return overflow == 0; }
+};
+
+// The descriptor question concerns the later c0 writer of the c2 address, not the earlier
+// 62-draw group that binds that same address at c2. Keep the selector shared with its tests.
+constexpr bool world_c2_later_input_group(bool capture_armed, bool exact_shape_seen,
+                                           bool c2_bound, bool world_bound, bool resolve) {
+    return capture_armed && exact_shape_seen && c2_bound && !world_bound && !resolve;
+}
 
 // The live caller supplies mrt_active_color for each slot. Keep the full-slot scan in one tested
 // function: a c2..c7 composite attachment was invisible in the old c0/c1 detail line.
