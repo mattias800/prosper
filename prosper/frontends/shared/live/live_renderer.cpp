@@ -46,6 +46,7 @@
 #include "shared/media/avplayer_plane_policy.hpp"    // which sampled resource is AvPlayer's NV12 chroma plane
 #include "shared/present/guest_scanout_present.hpp"    // publishing the guest's own flipped buffer (#1968)
 #include "shared/diagnostics/diagnostic_window.hpp"        // census window by callback ordinal or by elapsed time
+#include "shared/diagnostics/persistent_readback_filter.hpp" // bounded retained-target readback
 #include "gpu/diagnostics/diag_ratelimit.hpp"       // ordinal + sparse tail for capped diagnostics
 #include "host/memory/guest_write_watch.hpp"
 #include "fixtures/render_runner.h"              // offscreen Vulkan backend (render_draws_rgba) + dump_bmp
@@ -1514,6 +1515,23 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
         prosper::frontend::parse_diagnostic_window(PROSPER_ENV_VALUE("PROSPER_PASS_LOG"))};
     static prosper::frontend::DiagnosticWindow g_persist_window{
         prosper::frontend::parse_diagnostic_window(PROSPER_ENV_VALUE("PROSPER_DUMP_PERSISTENT"))};
+    static const auto g_persist_filter = [] {
+        const char* spec = PROSPER_ENV_VALUE("PROSPER_DUMP_PERSISTENT_ADDRS");
+        auto filter = prosper::frontend::parse_persistent_readback_filter(spec);
+        if (!spec) return filter;
+        if (!PROSPER_ENV_ON("PROSPER_DUMP_PERSISTENT"))
+            fprintf(stderr, "[persist] PROSPER_DUMP_PERSISTENT_ADDRS is a modifier; "
+                            "PROSPER_DUMP_PERSISTENT is not armed -- no readback\n");
+        if (filter.state == prosper::frontend::PersistentReadbackFilterState::Selected)
+            fprintf(stderr, "[persist] address selector armed on %zu target(s)\n",
+                    filter.addresses.size());
+        else
+            fprintf(stderr, "[persist] address selector refused (%s); no retained targets "
+                            "will be read back\n",
+                    filter.state == prosper::frontend::PersistentReadbackFilterState::TooMany
+                        ? "more than eight addresses" : "malformed 0x-prefixed list");
+        return filter;
+    }();
     // Match boot_trace's progression-diagnostic contract: callers may register the graphics
     // renderer while deliberately leaving compute unregistered. This keeps semantic dispatches
     // visible without letting screenshot/prosper-app registration silently undo the A/B.
@@ -11048,8 +11066,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     prosper::frontend::present_source_name(present_choice));
                     }
                 }
-                // PROSPER_DUMP_PERSISTENT=<min-submit>|ms:<millis>: read back and dump EVERY
-                // persistent color target after this submit's passes render. Unlike
+                // PROSPER_DUMP_PERSISTENT=<min-submit>|ms:<millis>: read back persistent color
+                // targets after this submit's passes render. The default is the original broad
+                // census; PROSPER_DUMP_PERSISTENT_ADDRS limits it to explicitly named addresses.
+                // Unlike
                 // PROSPER_RTT*/DUMP_*, this flag is NOT in the live_gpu_targets disable list
                 // (:1078-1085), so it observes the NORMAL persistent-render path (all other CPU-pixel
                 // diagnostics change that path -> #1103). readback_persistent_color_target restores
@@ -11062,6 +11082,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     const uint64_t sub = dp_submit.fetch_add(1);
                     if (g_persist_window.contains(sub, diagnostic_elapsed_ms())) {
                         const char* dd = getenv("PROSPER_FRAME_DIR");
+                        prosper::frontend::PersistentReadbackBudget selected_readback_budget;
                         fprintf(stderr, "[persist] submit=%llu present: front=%d/%d front_va=0x%llx "
                                 "selected=%s vo:", (unsigned long long)sub, vo_front, vo_n,
                                 (unsigned long long)front_va,
@@ -11070,16 +11091,51 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             fprintf(stderr, " [%d]=0x%llx", i, (unsigned long long)prosper_vo_buffer_addr(i));
                         fprintf(stderr, "\n");
                         for (auto& kv : g_rtt) {
+                            if (!g_persist_filter.allows(kv.first)) continue;
                             RttSurf& s = kv.second;
-                            if (!s.gpu_valid || !s.w || !s.h) continue;
-                            if (static_cast<uint64_t>(s.w) * s.h < 64u * 64u) continue;
+                            if (!s.gpu_valid || !s.w || !s.h ||
+                                static_cast<uint64_t>(s.w) * s.h < 64u * 64u) {
+                                if (g_persist_filter.state ==
+                                        prosper::frontend::PersistentReadbackFilterState::Selected)
+                                    fprintf(stderr, "[persist] submit=%llu addr=0x%llx "
+                                                    "not GPU-valid or below 64x64\n",
+                                            (unsigned long long)sub,
+                                            (unsigned long long)kv.first);
+                                continue;
+                            }
                             const VkFormat fmt = prosper::test::backend_color_format(s.format);
                             const uint32_t bpp = prosper::test::backend_color_bytes_per_pixel(fmt);
-                            const uint64_t expected = static_cast<uint64_t>(s.w) * s.h * bpp;
+                            uint64_t expected = 0;
+                            if (g_persist_filter.state ==
+                                    prosper::frontend::PersistentReadbackFilterState::Selected) {
+                                const auto charge = selected_readback_budget.admit(s.w, s.h, bpp,
+                                                                                   expected);
+                                if (charge != prosper::frontend::PersistentReadbackCharge::Admitted) {
+                                    const char* reason = "budget 256 MiB";
+                                    if (charge == prosper::frontend::PersistentReadbackCharge::InvalidSize)
+                                        reason = "invalid size";
+                                    else if (charge == prosper::frontend::PersistentReadbackCharge::SizeOverflow)
+                                        reason = "size overflow";
+                                    fprintf(stderr, "[persist] submit=%llu addr=0x%llx "
+                                                    "skipped: selected readback %s\n",
+                                            (unsigned long long)sub, (unsigned long long)kv.first,
+                                            reason);
+                                    continue;
+                                }
+                            } else
+                                expected = static_cast<uint64_t>(s.w) * s.h * bpp;
                             std::vector<uint8_t> px; std::string err;
                             if (!prosper::test::readback_persistent_color_target(
-                                    kv.first, s.w, s.h, fmt, px, err) || px.size() != expected)
+                                    kv.first, s.w, s.h, fmt, px, err) || px.size() != expected) {
+                                if (g_persist_filter.state ==
+                                        prosper::frontend::PersistentReadbackFilterState::Selected)
+                                    fprintf(stderr, "[persist] submit=%llu addr=0x%llx "
+                                                    "readback failed: %s (got=%zu expected=%llu)\n",
+                                            (unsigned long long)sub,
+                                            (unsigned long long)kv.first, err.c_str(), px.size(),
+                                            (unsigned long long)expected);
                                 continue;
+                            }
                             const std::vector<uint8_t> rgba = inspection_rgba8(px, s.w, s.h, fmt);
                             size_t rgbnz = 0;
                             for (size_t p = 0; p + 3 < rgba.size(); p += 4)
@@ -11135,6 +11191,14 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     (unsigned long long)kv.first, s.w, s.h, (unsigned)s.format,
                                     rgbnz, s.w * s.h, rawnz, px.size(), first_text);
                         }
+                        if (g_persist_filter.state ==
+                                prosper::frontend::PersistentReadbackFilterState::Selected)
+                            for (uint64_t addr : g_persist_filter.addresses)
+                                if (!g_rtt.contains(addr))
+                                    fprintf(stderr, "[persist] submit=%llu addr=0x%llx "
+                                                    "not retained by the renderer\n",
+                                            (unsigned long long)sub,
+                                            (unsigned long long)addr);
                     }
                 }
             } else {
