@@ -386,6 +386,18 @@ using CaptureDsSeedSnapshotReader =
 bool capture_draw_items(const std::vector<DrawItem>& items, const GpuCaptureMetadata& metadata,
                         const CaptureMemoryReader& reader, GpuCaptureFile& out, std::string& error,
                         const CaptureRttSeedReader& rtt_reader = {});
+// Use the same interval planner as capture_submit_items, without reading guest bytes. The returned
+// amount is the merged resource allocation footprint, including mip-chain prefixes when admitted.
+// A positive preflight authorizes only this one draw's guest-resource copy; it does not establish
+// producer/dependency closure or bound RTT/DS seed snapshots.
+bool preflight_gpu_capture_draw_resources(const DrawItem& draw, uint64_t resource_limit_bytes,
+                                          uint64_t& planned_bytes, std::string& error);
+// Pre-submit snapshot of exactly one already-realized draw. The caller must independently prove
+// that omitting other operations from the same submit does not change this draw's inputs/output.
+bool capture_gpustate_selected_draw(const GpuState& state, const DrawItem& draw,
+                                    const GpuCaptureMetadata& metadata,
+                                    uint64_t resource_limit_bytes,
+                                    GpuCaptureFile& out, std::string& error);
 bool capture_submit_items(const std::vector<DrawItem>& draws,
                           const std::vector<ComputeItem>& computes,
                           const std::vector<SubmitOperation>& operations,

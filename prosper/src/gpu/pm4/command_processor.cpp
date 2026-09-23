@@ -4366,9 +4366,10 @@ void GpuState::apply(const Pm4Command& c) {
                 // resolution here before applying the ordinary bounded-register-file guard.
                 uint32_t offset = regs[i].offset;
                 constexpr uint32_t kVirtualPsInputCntl0 = 0x10000000u;
-                if (c.reg_class == RegClass::Cx &&
+                const bool virtual_ps_input = c.reg_class == RegClass::Cx &&
                     offset >= kVirtualPsInputCntl0 &&
-                    offset < kVirtualPsInputCntl0 + 32u) {
+                    offset < kVirtualPsInputCntl0 + 32u;
+                if (virtual_ps_input) {
                     offset = prosper::agc::Pm4::SPI_PS_INPUT_CNTL_0 +
                              (offset - kVirtualPsInputCntl0);
                 }
@@ -4378,7 +4379,8 @@ void GpuState::apply(const Pm4Command& c) {
                 // reason as the direct path — a watched register whose only writes are dropped here
                 // is a different finding from one that is never written.
                 reg_watch_report(c.reg_class, offset, regs[i].value, 1u, nullptr,
-                                 "indirect", command_order);
+                                 virtual_ps_input ? "indirect-virtual" : "indirect",
+                                 command_order);
                 if (offset >= kRegOffsetLimit) {
                     if (bad++ == 0) first_bad = i;
                     static std::atomic<int> dropped_note{0};

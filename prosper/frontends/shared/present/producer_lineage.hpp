@@ -33,6 +33,12 @@ struct ProducerSource {
     constexpr bool known() const { return image_registration && completed.known(); }
 };
 
+// A target acquisition or readback is not a new image version. Presentation/capture attribution
+// must follow the exact completed producer carried by the image, or remain unknown.
+constexpr uint64_t completed_source_submit(ProducerSource source) {
+    return source.known() ? source.completed.source_submit : 0;
+}
+
 // Same-binary overhead control. Fixed at first use; disabled runs report unavailable F8 lineage
 // fields. The ordinary build enables accounting without requiring an option or driver feature.
 inline bool producer_lineage_enabled() {

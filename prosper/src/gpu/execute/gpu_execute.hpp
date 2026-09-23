@@ -2742,6 +2742,10 @@ inline std::vector<uint8_t> execute_gpustate(const GpuState& st, const RenderFn&
 // shape as RenderFn, plus (w,h).
 struct RenderedFrame {
     std::shared_ptr<const std::vector<uint8_t>> storage;
+    // Exact architectural submit that produced these selected pixels, when proven. A renderer
+    // callback may serve an earlier cached or retained image, so its current submit ordinal is not
+    // automatically the source. Zero means unknown, never "the first submit" in this live path.
+    uint64_t source_submit = 0;
     // Where these pixels came from, carried to the present layer so a consumer can tell a frame
     // prosper composited from the guest's own display buffer republished verbatim (#1968, #2044).
     // Defaults to Composited, which is what every producer other than the renderer's last-resort

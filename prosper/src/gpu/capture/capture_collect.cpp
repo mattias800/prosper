@@ -457,6 +457,26 @@ bool capture_failure_diagnostics(
 
 } // namespace
 
+bool preflight_gpu_capture_draw_resources(const DrawItem& draw, uint64_t resource_limit_bytes,
+                                          uint64_t& planned_bytes, std::string& error) {
+    planned_bytes = 0;
+    error.clear();
+    uint64_t effective_limit = 0;
+    if (!capture_resource_limit(effective_limit, error, resource_limit_bytes)) return false;
+    std::vector<Interval> intervals;
+    std::string chain_error;
+    if (!collect_intervals({draw}, {}, {}, effective_limit,
+                           /*own_mip_chain_allocations=*/true, intervals, chain_error)) {
+        intervals.clear();
+        if (!collect_intervals({draw}, {}, {}, effective_limit,
+                               /*own_mip_chain_allocations=*/false, intervals, error))
+            return false;
+    }
+    for (const Interval& interval : intervals)
+        planned_bytes += interval.end - interval.begin;
+    return true;
+}
+
 bool capture_submit_items(const std::vector<DrawItem>& draws,
                           const std::vector<ComputeItem>& computes,
                           const std::vector<SubmitOperation>& operations,
