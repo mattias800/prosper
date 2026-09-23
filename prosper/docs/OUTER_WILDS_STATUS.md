@@ -21,10 +21,12 @@ roughly 2 FPS. This is a recognizable scene and supports rung 3; the short visua
 whole-game compatibility verdict or a measured speed comparison with PS5 hardware.
 
 The [first-person screenshot](../../assets/screenshots/outer-wilds-first-person-night.webp) is a
-lossless WebP of an unmodified 3840×2160 `prosper-app` F9 readback (zero changed pixels versus its
-BMP source). The source SHA-256 is `a9892511aa315ebb592152c1ffe2a8b526599fbac46908297f8731341873620f`;
-the readback was armed at guest present 1789 and written at present 1790. It shows the trees, launch
-tower, planet and Look Around / Move prompts without the later white artifact.
+1920-wide WebP downscaled by `prosper/tools/screenshots/shrink.py` from an unmodified 3840×2160
+`prosper-app` F9 readback. The source BMP SHA-256 is
+`a9892511aa315ebb592152c1ffe2a8b526599fbac46908297f8731341873620f`; the committed WebP
+SHA-256 is `8647cf104fb3b12548de5d4dab8db440f056c697406c19341abef523bd2fee8f`.
+The readback was armed at guest present 1789 and written at present 1790. It shows the trees,
+launch tower, planet and Look Around / Move prompts without the later white artifact.
 
 **Known visual defects.** The game wordmark is absent on prosper's title frame and present in the
 PS5 title-screen oracle attached to [#3804](https://github.com/mattias800/prosper/issues/3804).

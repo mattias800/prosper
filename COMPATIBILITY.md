@@ -97,8 +97,8 @@ unmeasured title is never mistaken for a failing one; newly tracked titles start
 | Where the title stops | Titles |
 | --- | --- |
 | **Gameplay reached**, with the scene rendering (rung 3 or better) | 28 |
-| **Title screen or menu** reached, or gameplay reached without a rendered world (rung 2) | 17 |
-| **Below a title screen** — logo or splash only (rung 1) | 3 |
+| **Title screen or menu** reached, or gameplay reached without a rendered world (rung 2) | 18 |
+| **Below a title screen** — logo or splash only (rung 1) | 2 |
 | **Boots, but no frame with content** (rung 0) | 8 |
 | **Not yet booted** — tracked, no run attempted yet | 0 |
 | Total tracked | 56 |
@@ -139,15 +139,16 @@ worked. **A rung claim outside the title's own status doc is the copy most likel
 
 ### Where the titles accumulate
 
-The 17 titles at rung 2 — a title screen or menu, or gameplay reached without a rendered world — by
+The 18 titles at rung 2 — a title screen or menu, or gameplay reached without a rendered world — by
 the engine recorded in the table:
 
 | Engine | Titles |
 | --- | --- |
 | Unreal Engine — 11 × UE4, 1 × UE5, 1 unversioned | 13 |
 | Hedgehog Engine, Hedgehog Engine 2, Custom (Ancient), ASOBI — one each | 4 |
+| Atlus GFD — *Metaphor: ReFantazio* title menu | 1 |
 
-**Unreal dominates this group, and it no longer accounts for all of it.** Thirteen of the 17 rung-2
+**Unreal dominates this group, and it no longer accounts for all of it.** Thirteen of the 18 rung-2
 rows are Unreal, against 19 Unreal rows in the table overall — the other six are one at gameplay
 (*Dragon Quest VII Reimagined*, whose world renders), two at rung 1 (*Little Nightmares II* and
 *Beast of Reincarnation*) and three at rung 0 (*The Lord of the Rings: Gollum*, *The First Berserker:
@@ -156,8 +157,8 @@ is not true in either direction: one has passed it and five have not reached it.
 
 The distribution on the other side is the mirror image: the titles at gameplay are overwhelmingly
 Unity-family, now including *Outer Wilds*' routed wooded first-person scene. The rung-2 titles are
-thirteen Unreal titles plus *Sonic Origins*, *Earthion*, *Astro Bot*, and the one that reaches the
-game loop without a recognizable world, *Sonic Frontiers*.
+thirteen Unreal titles plus *Sonic Origins*, *Earthion*, *Astro Bot*, *Metaphor: ReFantazio*, and the
+one that reaches the game loop without a recognizable world, *Sonic Frontiers*.
 
 **This is an observation about where titles accumulate, not a claim that the thirteen Unreal titles
 share one root cause** — and this is no longer merely an untested hypothesis in either direction.
