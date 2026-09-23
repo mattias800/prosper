@@ -3,7 +3,9 @@
 #include "gpu/timeline/menu_frame_gate.hpp"
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <span>
 
 namespace prosper::gpu {
@@ -162,6 +164,35 @@ constexpr bool menu_capture_target_matches_request(MenuTargetChoice choice,
                                                     uint64_t configured_target) {
     return choice.rejection == MenuTargetReject::None && choice.target_addr &&
            (!configured_target || configured_target == choice.target_addr);
+}
+
+// VA-only diagnostic relation for declared byte ranges. An empty, missing, or overflowing range is
+// unknown, never disjoint. Physical aliases and indirect pointer dereferences remain outside this
+// predicate; callers must not use a disjoint result to admit an incomplete replay capsule.
+enum class MenuDeclaredRangeRelation : uint8_t { Overlap, Disjoint, Unknown };
+
+constexpr MenuDeclaredRangeRelation menu_declared_range_relation(
+    uint64_t left, uint64_t left_bytes, uint64_t right, uint64_t right_bytes) {
+    if (!left || !right || !left_bytes || !right_bytes ||
+        left_bytes > std::numeric_limits<uint64_t>::max() - left ||
+        right_bytes > std::numeric_limits<uint64_t>::max() - right)
+        return MenuDeclaredRangeRelation::Unknown;
+    return left < right + right_bytes && right < left + left_bytes
+        ? MenuDeclaredRangeRelation::Overlap : MenuDeclaredRangeRelation::Disjoint;
+}
+
+// The dependency census may call an effect "before" a draw only after the exact selected draw
+// exists in the ordered submit. Both index and command order are needed: a reused index from a
+// different packet is not the same operation.
+template <typename Operation, typename Kind>
+constexpr std::size_t menu_capture_selected_draw_position(
+    std::span<const Operation> operations, Kind draw_kind,
+    uint64_t draw_index, uint64_t command_order) {
+    for (std::size_t i = 0; i < operations.size(); ++i)
+        if (operations[i].kind == draw_kind && operations[i].index == draw_index &&
+            operations[i].command_order == command_order)
+            return i;
+    return std::numeric_limits<std::size_t>::max();
 }
 
 // This policy never invents a relationship between a menu frame and a candidate. The first

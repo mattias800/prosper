@@ -4,6 +4,7 @@
 #include "diagnostics/exit_reports.hpp"
 #include "gpu/capture/gpu_capture.hpp"
 #include "gpu/execute/gpu_dependency_graph.hpp"
+#include "gpu/resources/shader_resources.hpp"
 #include "gpu/state/render_state.hpp"
 #include "gpu/timeline/menu_capture_policy.hpp"
 
@@ -91,11 +92,173 @@ const char* target_reject_name(MenuTargetReject rejection) {
     return "unknown";
 }
 
+// One refused candidate only. This records a bounded metadata slice of the actual ordered submit;
+// it does not copy any shader, descriptor, or guest bytes. Declared VA overlap is useful for
+// choosing the next capture, but cannot establish execution, physical-alias, or indirect-pointer
+// dependencies and never changes the draw-only capsule's fail-closed admission decision.
+void report_prior_effect_census(const GpuState& state,
+                                std::span<const SubmitOperation> planned,
+                                size_t selected_position,
+                                const DrawItem& selected, uint64_t submit_no) {
+    struct InputRange {
+        const char* stage = nullptr;
+        uint32_t binding = 0;
+        uint64_t addr = 0, bytes = 0;
+    };
+    constexpr size_t kMaxInputRanges = 64, kMaxInputVisits = 512, kMaxEffects = 64;
+    std::array<InputRange, kMaxInputRanges> inputs{};
+    size_t input_count = 0, input_visits = 0, unknown_inputs = 0, input_truncated = 0;
+    uint64_t declared_bytes_sum = 0;
+    bool declared_bytes_overflow = false;
+    auto add_input = [&](const char* stage, uint32_t binding, uint64_t addr, uint64_t bytes) {
+        if (!addr || !bytes || bytes > UINT64_MAX - addr) { ++unknown_inputs; return; }
+        if (bytes > UINT64_MAX - declared_bytes_sum) declared_bytes_overflow = true;
+        else declared_bytes_sum += bytes;
+        if (input_count < inputs.size()) inputs[input_count++] = {stage, binding, addr, bytes};
+        else ++input_truncated;
+    };
+    auto add_table = [&](const char* stage, const ShaderResourceTable* table) {
+        if (!table) { ++unknown_inputs; return; }
+        for (const ShaderResource& resource : table->resources) {
+            if (++input_visits > kMaxInputVisits) { ++input_truncated; break; }
+            if (resource.cls == ResourceClass::Sampler) continue;
+            if (resource.table_index_count) {
+                if (resource.table_entries.size() != resource.table_index_count)
+                    ++unknown_inputs;
+                for (const ShaderBufferTableEntry& entry : resource.table_entries) {
+                    if (++input_visits > kMaxInputVisits) { ++input_truncated; break; }
+                    add_input(stage, resource.binding, entry.gpu_addr,
+                              std::max<uint64_t>(entry.size, entry.host_data_size));
+                }
+                continue;
+            }
+            uint64_t bytes = std::max<uint64_t>(resource.size, resource.host_data_size);
+            if (resource.scalar_buffer_dword_count)
+                bytes = std::max(bytes, shader_resource_buffer_binding_bytes(resource));
+            add_input(stage, resource.binding, resource.gpu_addr, bytes);
+        }
+    };
+    add_table("vs", selected.vrt.get());
+    add_table("ps", selected.prt.get());
+    bool indirect = false;
+    uint64_t indirect_addr = 0;
+    if (selected.draw_index < state.draws.size()) {
+        const auto& draw = state.draws[selected.draw_index];
+        indirect = draw.indirect;
+        indirect_addr = draw.indirect_args_addr;
+        if (indirect) add_input("indirect-args", UINT32_MAX, indirect_addr, 20);
+    } else {
+        ++unknown_inputs;
+    }
+    std::fprintf(stderr,
+                 "[menu-dependency] submit=%llu draw=%llu order=%llu vs=0x%llx ps=0x%llx "
+                 "target=0x%llx %ux%u indirect=%u args=0x%llx "
+                 "inputs-stored=%zu inputs-unknown=%zu inputs-truncated=%zu "
+                 "declared-bytes-sum=%llu sum-overflow=%u "
+                 "(pre-execution resource realization; not dependency closure)\n",
+                 static_cast<unsigned long long>(submit_no),
+                 static_cast<unsigned long long>(selected.draw_index),
+                 static_cast<unsigned long long>(selected.command_order),
+                 static_cast<unsigned long long>(selected.vs_guest_addr),
+                 static_cast<unsigned long long>(selected.fs_guest_addr),
+                 static_cast<unsigned long long>(selected.color0_base),
+                 selected.color0_width, selected.color0_height, indirect ? 1u : 0u,
+                 static_cast<unsigned long long>(indirect_addr), input_count,
+                 unknown_inputs, input_truncated,
+                 static_cast<unsigned long long>(declared_bytes_sum),
+                 declared_bytes_overflow ? 1u : 0u);
+    for (size_t i = 0; i < std::min(input_count, size_t{16}); ++i) {
+        const auto& input = inputs[i];
+        std::fprintf(stderr,
+                     "[menu-dependency] input stage=%s binding=%u addr=0x%llx bytes=%llu\n",
+                     input.stage, input.binding,
+                     static_cast<unsigned long long>(input.addr),
+                     static_cast<unsigned long long>(input.bytes));
+    }
+    if (input_count > 16)
+        std::fprintf(stderr, "[menu-dependency] inputs omitted=%zu\n", input_count - 16);
+
+    std::array<SubmitOperation, kMaxEffects> tail{};
+    size_t prior_draws = 0, prior_dispatches = 0, prior_dmas = 0, prior_effects = 0;
+    for (const SubmitOperation& operation : planned.first(selected_position)) {
+        if (operation.kind == SubmitOperationKind::Draw) { ++prior_draws; continue; }
+        if (operation.kind == SubmitOperationKind::Dispatch) ++prior_dispatches;
+        else ++prior_dmas;
+        tail[prior_effects++ % tail.size()] = operation;
+    }
+    std::fprintf(stderr,
+                 "[menu-dependency] before-selected draws=%zu dispatches=%zu dmas=%zu "
+                 "effects-shown=%zu effects-omitted=%zu\n",
+                 prior_draws, prior_dispatches, prior_dmas,
+                 std::min(prior_effects, tail.size()),
+                 prior_effects > tail.size() ? prior_effects - tail.size() : 0);
+    const size_t first = prior_effects > tail.size() ? prior_effects - tail.size() : 0;
+    for (size_t n = first; n < prior_effects; ++n) {
+        const SubmitOperation& operation = tail[n % tail.size()];
+        if (operation.kind == SubmitOperationKind::Dispatch) {
+            if (operation.index >= state.dispatches.size()) {
+                std::fprintf(stderr, "[menu-dependency] dispatch index=%zu missing\n",
+                             operation.index);
+                continue;
+            }
+            const auto& dispatch = state.dispatches[operation.index];
+            const uint64_t code = compute_dispatch_code_addr(state, dispatch);
+            std::fprintf(stderr,
+                         "[menu-dependency] dispatch index=%zu order=%llu program=0x%llx "
+                         "program-known=%u "
+                         "raw-dim=%u,%u,%u modifier=0x%llx indirect=%u args=0x%llx "
+                         "outputs=unknown\n",
+                         operation.index,
+                         static_cast<unsigned long long>(operation.command_order),
+                         static_cast<unsigned long long>(code), code ? 1u : 0u,
+                         dispatch.threads_x, dispatch.threads_y, dispatch.threads_z,
+                         static_cast<unsigned long long>(dispatch.modifier),
+                         dispatch.indirect ? 1u : 0u,
+                         static_cast<unsigned long long>(dispatch.indirect_args_addr));
+            continue;
+        }
+        if (operation.index >= state.dma_copies.size()) {
+            std::fprintf(stderr, "[menu-dependency] dma index=%zu missing\n", operation.index);
+            continue;
+        }
+        const auto& copy = state.dma_copies[operation.index];
+        bool declared_overlap = false, declared_unknown = unknown_inputs || input_truncated;
+        const bool guest_destination = (copy.sels & 0xffu) != 1u;
+        if (!guest_destination) declared_unknown = true;
+        if (guest_destination)
+            for (const auto& input : inputs) {
+                if (!input.addr) continue;
+                const auto relation = menu_declared_range_relation(
+                    copy.dst, copy.bytes, input.addr, input.bytes);
+                declared_overlap |= relation == MenuDeclaredRangeRelation::Overlap;
+                declared_unknown |= relation == MenuDeclaredRangeRelation::Unknown;
+            }
+        std::fprintf(stderr,
+                     "[menu-dependency] dma index=%zu order=%llu src=0x%llx dst=0x%llx "
+                     "bytes=%u sels=0x%x guest-dst=%u declared-overlap=%u "
+                     "declared-unknown=%u scope=declared-VA-only\n",
+                     operation.index,
+                     static_cast<unsigned long long>(operation.command_order),
+                     static_cast<unsigned long long>(copy.src),
+                     static_cast<unsigned long long>(copy.dst),
+                     copy.bytes, copy.sels, guest_destination ? 1u : 0u,
+                     declared_overlap ? 1u : 0u, declared_unknown ? 1u : 0u);
+    }
+}
+
 bool prior_writer_to_selected(const GpuState& state, std::vector<DrawItem> draws,
-                              const DrawItem& selected, std::string& error) {
+                              const DrawItem& selected, uint64_t submit_no,
+                              std::string& error) {
     GpuReplayFrame replay;
     replay.items = std::move(draws);
     const auto planned = plan_submit_operations(state);
+    const size_t selected_position = menu_capture_selected_draw_position(
+        std::span<const SubmitOperation>(planned), SubmitOperationKind::Draw,
+        selected.draw_index, selected.command_order);
+    if (selected_position == std::numeric_limits<size_t>::max()) {
+        error = "selected draw is absent from the ordered submit";
+        return true;
+    }
     std::unordered_set<uint64_t> realized_draws;
     for (const DrawItem& draw : replay.items) realized_draws.insert(draw.draw_index);
     uint32_t selected_operation = UINT32_MAX;
@@ -112,15 +275,12 @@ bool prior_writer_to_selected(const GpuState& state, std::vector<DrawItem> draws
         // draw-only capsule can reconstruct. Its absence from the materialized graphics list is
         // not a proof of non-interference.
         if (operation.kind != SubmitOperationKind::Draw) {
+            report_prior_effect_census(state, planned, selected_position, selected, submit_no);
             error = "dispatch or DMA precedes the selected draw in the same submit";
             return true;
         }
         replay.operations.push_back({operation.kind, operation.index, operation.command_order,
                                      realized_draws.contains(operation.index)});
-    }
-    if (selected_operation == UINT32_MAX) {
-        error = "selected draw is absent from the ordered submit";
-        return true;
     }
     GpuDependencyGraph graph;
     if (!build_gpu_dependency_graph(replay, graph, error)) return true;
@@ -286,7 +446,7 @@ public:
             return;
         }
         std::string error;
-        if (prior_writer_to_selected(state, draws, selected, error)) {
+        if (prior_writer_to_selected(state, draws, selected, submit_no, error)) {
             decline(MenuCaptureRefusal::SameSubmitDependency, error);
             return;
         }

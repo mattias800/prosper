@@ -1,6 +1,8 @@
 #include "gpu/timeline/menu_capture_policy.hpp"
 
+#include <array>
 #include <cstdio>
+#include <limits>
 #include <vector>
 
 using namespace prosper::gpu;
@@ -233,6 +235,30 @@ int main() {
               !menu_capture_target_matches_request(choose(chain), 0x999) &&
               !menu_capture_target_matches_request(choose(disabled_chain), 0),
           "an explicit address is an assertion on the run-local source, never a substitute");
+    CHECK(menu_declared_range_relation(100, 20, 110, 20) ==
+              MenuDeclaredRangeRelation::Overlap &&
+              menu_declared_range_relation(100, 20, 120, 20) ==
+              MenuDeclaredRangeRelation::Disjoint &&
+              menu_declared_range_relation(100, 20, 0, 20) ==
+              MenuDeclaredRangeRelation::Unknown &&
+              menu_declared_range_relation(UINT64_MAX - 4, 8, 100, 20) ==
+              MenuDeclaredRangeRelation::Unknown,
+          "dependency metadata cannot label missing or overflowing declared ranges disjoint");
+    enum class StubOperationKind { Draw, Dispatch };
+    struct StubOperation {
+        StubOperationKind kind;
+        size_t index;
+        uint64_t command_order;
+    };
+    const std::array ordered{StubOperation{StubOperationKind::Dispatch, 0, 8},
+                             StubOperation{StubOperationKind::Draw, 360, 9}};
+    const std::span<const StubOperation> ordered_span(ordered);
+    CHECK(menu_capture_selected_draw_position(ordered_span, StubOperationKind::Draw, 360, 9) == 1 &&
+              menu_capture_selected_draw_position(ordered_span, StubOperationKind::Draw, 360, 10) ==
+                  std::numeric_limits<size_t>::max() &&
+              menu_capture_selected_draw_position(ordered_span, StubOperationKind::Draw, 0, 8) ==
+                  std::numeric_limits<size_t>::max(),
+          "a prior effect is temporal evidence only when the exact selected draw exists later");
 
     std::printf("menu_frame_gate: %s\n", failures ? "FAIL" : "PASS");
     return failures ? 1 : 0;
