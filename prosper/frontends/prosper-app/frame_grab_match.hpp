@@ -18,7 +18,7 @@ namespace prosper::frontend {
 
 enum class FrameGrabSource { None, GpuScanout, GpuCpuFallback, Cpu };
 enum class FrameGrabNoBmpReason {
-    None, TargetSkipped, CandidateOverflow, NeverPresented, UnresolvedAtShutdown
+    None, TargetSkipped, CandidateOverflow, NeverPresented, UnresolvedAtShutdown, BundleRefused
 };
 
 struct FrameGrabScreenshotEvidence {
@@ -94,6 +94,11 @@ public:
         }
         return std::nullopt;
     }
+    const FrameGrabGpuCandidate* find_exact(uint64_t source_flip) const {
+        for (const auto& candidate : candidates_)
+            if (candidate.source.source_seq == source_flip) return &candidate;
+        return nullptr;
+    }
     uint64_t highest_presented_flip() const { return highest_presented_flip_; }
     bool overflowed() const { return overflowed_; }
     void clear() { candidates_.clear(); held_bytes_ = 0; highest_presented_flip_ = 0; overflowed_ = false; }
@@ -111,7 +116,7 @@ struct FrameGrabBundleEvidence {
     std::vector<uint64_t> closed_presents;
     uint64_t opened_source_flip = 0;
     std::vector<uint64_t> closed_source_flips;
-    std::vector<uint64_t> closed_submit_counts; // captured-submit prefix at each closed present
+    std::vector<uint64_t> closed_submit_counts; // captured prefix at closure (may follow guest flip)
     std::vector<uint64_t> captured_submits; // exact membership, not first..last approximation
 };
 
@@ -225,7 +230,9 @@ inline std::string frame_grab_screenshot_event(const FrameGrabScreenshotEvidence
                          shot.no_bmp_reason == FrameGrabNoBmpReason::CandidateOverflow ? "candidate_overflow" :
                          shot.no_bmp_reason == FrameGrabNoBmpReason::NeverPresented ? "never_presented" :
                          shot.no_bmp_reason == FrameGrabNoBmpReason::UnresolvedAtShutdown
-                             ? "unresolved_at_shutdown" : "none";
+                             ? "unresolved_at_shutdown" :
+                         shot.no_bmp_reason == FrameGrabNoBmpReason::BundleRefused
+                             ? "bundle_refused" : "none";
     return "{\"v\":1,\"event\":\"screenshot\",\"bmp_written\":" +
         std::string(shot.bmp_written ? "true" : "false") +
         ",\"host_presented\":" + (shot.host_presented ? "true" : "false") +

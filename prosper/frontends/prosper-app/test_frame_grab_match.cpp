@@ -3,19 +3,162 @@
 #include "present_policy.hpp"
 #include "fixtures/test_scratch.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <string>
+#include <string_view>
 
 using namespace prosper::frontend;
 
 static int failures = 0;
 #define CHECK(value, message) do { if (!(value)) { std::printf("FAIL: %s\n", message); ++failures; } } while (0)
 
+// This narrow source gate complements the behavior tests below. The app owns the actual
+// successful-host-present decision; removing that call site otherwise leaves every isolated
+// timeline/ring test green while reinstating #3828. Comments cannot satisfy the gate.
+static std::string active_app_source() {
+    std::ifstream file(PROSPER_APP_MAIN_SOURCE);
+    std::string line, active;
+    while (std::getline(file, line)) {
+        if (const size_t comment = line.find("//"); comment != std::string::npos)
+            line.resize(comment);
+        active += line + '\n';
+    }
+    return active;
+}
+
+static size_t matching_brace(std::string_view source, size_t open) {
+    if (open == std::string::npos || source[open] != '{') return std::string::npos;
+    size_t depth = 0;
+    char quote = 0;
+    bool escaped = false;
+    for (size_t i = open; i < source.size(); ++i) {
+        const char c = source[i];
+        if (quote) {
+            if (escaped) escaped = false;
+            else if (c == '\\') escaped = true;
+            else if (c == quote) quote = 0;
+        } else if (c == '"' || c == '\'') {
+            quote = c;
+        } else if (c == '{') {
+            ++depth;
+        } else if (c == '}' && --depth == 0) {
+            return i;
+        }
+    }
+    return std::string::npos;
+}
+
+static bool gpu_close_wired(const std::string& source) {
+    const size_t begin = source.find("\n        if (vk.gpu_present) {");
+    if (begin == std::string::npos) return false;
+    const size_t end = source.find("} else if (gpu::present_frame_seq() != lastFrameSeq)", begin);
+    if (end == std::string::npos) return false;
+    const std::string_view block(source.data() + begin, end - begin);
+    const size_t readback = block.find("frame_grab_needs_gpu_readback(");
+    const size_t staged = block.find("stagedGrabCandidates.stage(");
+    const size_t success = block.find("if (attempt == PresentAttempt::presented) {", staged);
+    if (readback == std::string::npos || staged == std::string::npos ||
+        readback >= staged || success == std::string::npos) return false;
+    const size_t body_open = block.find('{', success);
+    const size_t body_close = matching_brace(block, body_open);
+    if (body_close == std::string::npos) return false;
+    const std::string_view success_body = block.substr(body_open, body_close - body_open);
+    const size_t first = success_body.find("drainStagedGrabCandidate(gf.frame_seq);");
+    const size_t close = success_body.find("interactive_grab_on_host_presented_source(", first);
+    const size_t second = success_body.find("drainStagedGrabCandidate(gf.frame_seq);", close);
+    return first != std::string::npos && close != std::string::npos &&
+           second != std::string::npos;
+}
+
+static bool fallback_and_expiry_wired(const std::string& source) {
+    const size_t begin = source.find("} else if (gpu::present_frame_seq() != lastFrameSeq)");
+    const size_t end = source.find("} else {\n        bool newFrame", begin);
+    const size_t loop = source.find("while (running && !prosper_stop_requested()) {");
+    const size_t expiry = source.find("auto expirePendingGrabProducer = [&] {");
+    if (begin == std::string::npos || end == std::string::npos ||
+        loop == std::string::npos || expiry == std::string::npos) return false;
+    const std::string_view fallback(source.data() + begin, end - begin);
+    const size_t convert = fallback.find("interactive_grab_on_cpu_fallback(");
+    const size_t bmp = fallback.find("flushGrabScreenshot(cf.rgba->data()");
+    const std::string_view loop_entry(source.data() + loop,
+                                      std::min<size_t>(source.size() - loop, 250));
+    const size_t expiry_open = source.find('{', expiry);
+    const size_t expiry_close = matching_brace(source, expiry_open);
+    if (expiry_close == std::string::npos) return false;
+    const std::string_view expiry_body(source.data() + expiry_open,
+                                        expiry_close - expiry_open);
+    const size_t owned_poll = expiry_body.find("for (const auto& reservation : grabReservedBundles)");
+    const size_t expire_call = expiry_body.find("interactive_grab_expire_producer_wait(");
+    const size_t early_return = expiry_body.find("return;");
+    return convert != std::string::npos && bmp != std::string::npos && convert < bmp &&
+           loop_entry.find("expirePendingGrabProducer();") != std::string::npos &&
+           owned_poll != std::string::npos && expire_call > owned_poll &&
+           expire_call != std::string::npos &&
+           (early_return == std::string::npos || early_return > expire_call);
+}
+
 int main() {
+    const std::string app_source = active_app_source();
+    CHECK(!app_source.empty() && gpu_close_wired(app_source) &&
+          fallback_and_expiry_wired(app_source),
+          "#3828: live app paths invoke exact GPU closure, CPU downgrade, and expiry polling");
+    std::string omitted_gpu_close = app_source;
+    if (const size_t call = omitted_gpu_close.find("interactive_grab_on_host_presented_source(",
+            omitted_gpu_close.find("\n        if (vk.gpu_present) {")); call != std::string::npos)
+        omitted_gpu_close.replace(call, sizeof("interactive_grab_on_host_presented_source") - 1,
+                                  "omitted_host_present_closure");
+    CHECK(!gpu_close_wired(omitted_gpu_close),
+          "#3828: removing the live GPU closure call makes the wiring gate fail");
+    std::string outside_success = app_source;
+    const size_t gpu_block = outside_success.find("\n        if (vk.gpu_present) {");
+    const size_t guarded_success = outside_success.find(
+        "if (attempt == PresentAttempt::presented) {", gpu_block);
+    const size_t guarded_call = outside_success.find(
+        "(void)prosper::gpu::interactive_grab_on_host_presented_source(", guarded_success);
+    if (guarded_call != std::string::npos) {
+        const size_t statement_end = outside_success.find(';', guarded_call);
+        if (statement_end != std::string::npos) {
+            const std::string statement = outside_success.substr(
+                guarded_call, statement_end - guarded_call + 1);
+            outside_success.erase(guarded_call, statement.size());
+            const size_t success_open = outside_success.find('{', guarded_success);
+            const size_t success_close = matching_brace(outside_success, success_open);
+            if (success_close != std::string::npos)
+                outside_success.insert(success_close + 1, "\n" + statement + "\n");
+        }
+    }
+    CHECK(!gpu_close_wired(outside_success),
+          "#3828: moving producer closure after the successful-present guard fails the gate");
+    std::string omitted_readback = app_source;
+    if (const size_t call = omitted_readback.find("frame_grab_needs_gpu_readback(",
+            omitted_readback.find("\n        if (vk.gpu_present) {")); call != std::string::npos)
+        omitted_readback.replace(call, sizeof("frame_grab_needs_gpu_readback") - 1,
+                                 "omitted_gpu_readback_policy");
+    CHECK(!gpu_close_wired(omitted_readback),
+          "#3828: removing pre-closure readback makes the wiring gate fail");
+    std::string omitted_fallback = app_source;
+    if (const size_t call = omitted_fallback.find("interactive_grab_on_cpu_fallback(",
+            omitted_fallback.find("} else if (gpu::present_frame_seq() != lastFrameSeq)"));
+            call != std::string::npos)
+        omitted_fallback.replace(call, sizeof("interactive_grab_on_cpu_fallback") - 1,
+                                 "omitted_cpu_fallback");
+    CHECK(!fallback_and_expiry_wired(omitted_fallback),
+          "#3828: removing the live CPU fallback transition makes the wiring gate fail");
+    std::string bmp_gated_expiry = app_source;
+    if (const size_t expiry = bmp_gated_expiry.find("auto expirePendingGrabProducer = [&] {");
+            expiry != std::string::npos) {
+        const size_t body = bmp_gated_expiry.find('{', expiry);
+        if (body != std::string::npos)
+            bmp_gated_expiry.insert(body + 1,
+                                    "\nif (pendingGrabScreenshot.empty()) return;\n");
+    }
+    CHECK(!fallback_and_expiry_wired(bmp_gated_expiry),
+          "#3828: gating the owned bundle expiry on a cleared BMP path fails the gate");
     const uint8_t pixel[] = {7, 13, 19, 255};
     FrameGrabScreenshotEvidence candidate_source;
     candidate_source.host_presented = true;
@@ -31,6 +174,9 @@ int main() {
         staged_before_closure = delayed_closure.stage(candidate_source, pixel, 1, 1);
     });
     CHECK(staged_before_closure &&
+          delayed_closure.find_exact(42) &&
+          delayed_closure.find_exact(42)->source.producer.completed.source_submit == 88 &&
+          !delayed_closure.find_exact(41) &&
           frame_grab_resolve_candidate(delayed_closure, 0, 42).kind ==
               FrameGrabCandidateResolutionKind::Wait &&
           frame_grab_resolve_candidate(delayed_closure, 41, 42).kind ==

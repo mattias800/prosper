@@ -2013,7 +2013,10 @@ int main(int argc, char** argv) {
                 // no way to raise it without editing code — and one 3840x2160 frame of a deferred
                 // renderer exceeds that, which made F9 unusable on 4K UE titles.
                 const auto request =
-                    prosper::gpu::request_interactive_capture_bundle(grab.bundle, grabBundleMaxMb);
+                    prosper::gpu::request_interactive_capture_bundle(
+                        grab.bundle, grabBundleMaxMb, 0,
+                        vk.gpu_present ? prosper::gpu::InteractiveGrabClosure::PresentedGpuProducer
+                                       : prosper::gpu::InteractiveGrabClosure::GuestPresent);
                 if (!request.accepted) {
                     // These are this request's exclusive reservations, never the previous grab's.
                     for (const auto& path : {grab.bundle, grab.screenshot, grab.manifest}) {
@@ -2244,6 +2247,19 @@ int main(int argc, char** argv) {
     auto drainStagedGrabCandidate = [&](uint64_t newest_shown_flip = 0) {
         if (!pendingGrabReserved || pendingGrabScreenshot.empty() || pendingGrabBundlePath.empty())
             return;
+        // Host presentation can beat the guest-present callback that nominates F9's target.
+        // The ring owns that earlier image and its lineage. Close the bundle against that exact
+        // retained candidate before asking for the finalized screenshot token.
+        uint64_t pending_flip = 0;
+        if (prosper::gpu::interactive_grab_pending_source_flip(
+                pendingGrabBundlePath, pending_flip)) {
+            if (const auto* candidate = stagedGrabCandidates.find_exact(pending_flip)) {
+                const auto& producer = candidate->source.producer;
+                (void)prosper::gpu::interactive_grab_on_host_presented_source(
+                    pendingGrabBundlePath, pending_flip, producer.known(),
+                    producer.completed.source_submit);
+            }
+        }
         uint64_t target_flip = 0;
         if (!prosper::gpu::interactive_grab_closed_source_flip(
                 pendingGrabBundlePath, target_flip)) return;
@@ -2258,6 +2274,35 @@ int main(int argc, char** argv) {
         }
         if (result.kind == prosper::frontend::FrameGrabCandidateResolutionKind::Missed)
             missPendingGrabScreenshot(target_flip, result.newest_shown_flip);
+    };
+    auto expirePendingGrabProducer = [&] {
+        // The BMP may already have been written by CPU fallback, clearing pendingGrabBundlePath.
+        // The bundle reservation remains owned until its outcome arrives; poll it independently
+        // so a fallback before target nomination cannot strand an active capture indefinitely.
+        for (const auto& reservation : grabReservedBundles) {
+            const std::string& bundlePath = reservation.first;
+            if (!prosper::gpu::interactive_grab_expire_producer_wait(bundlePath) ||
+                !pendingGrabReserved || pendingGrabScreenshot.empty() ||
+                pendingGrabBundlePath != bundlePath) continue;
+            // A refused bundle has no certified closing image. Keep the sidecar, but remove only
+            // this frontend's zero-byte BMP reservation so it cannot pass as a screenshot.
+            prosper::frontend::FrameGrabScreenshotEvidence incomplete;
+            incomplete.armed_present = pendingGrabGuestPresent;
+            incomplete.written_present = gpu::present_count();
+            incomplete.no_bmp_reason = prosper::frontend::FrameGrabNoBmpReason::BundleRefused;
+            (void)prosper::gpu::interactive_grab_closed_source_flip(
+                bundlePath, incomplete.target_source_flip);
+            recordGrabScreenshot(bundlePath, incomplete);
+            std::error_code ec;
+            if (std::filesystem::is_regular_file(pendingGrabScreenshot, ec) && !ec) {
+                const auto bytes = std::filesystem::file_size(pendingGrabScreenshot, ec);
+                if (!ec && bytes == 0)
+                    std::filesystem::remove(pendingGrabScreenshot, ec);
+            }
+            std::fprintf(stderr, "[grab] F9 producer wait refused; no verified screenshot for %s\n",
+                         pendingGrabScreenshot.c_str());
+            clearPendingGrabScreenshot();
+        }
     };
     const uint64_t scheduledScreenshotFrame = prosper::frontend::parse_capture_frame(
         getenv("PROSPER_CAPTURE_SCREENSHOT_AT_FRAME"));
@@ -2586,6 +2631,8 @@ int main(int argc, char** argv) {
     // gives unattended routes one explicit, repeatable host-time origin without desktop input.
     const uint64_t perfLoopStartNs = prosper::perf::monotonic_now_ns();
     while (running && !prosper_stop_requested()) {
+        drainStagedGrabCandidate();
+        expirePendingGrabProducer();
         // Close a RenderDoc capture opened on the previous pass. Reporting the path is the whole
         // point of doing this here rather than firing and forgetting: an agent running headless has
         // no other way to learn where the capture went, and an abandoned capture (no API work
@@ -3276,8 +3323,18 @@ int main(int argc, char** argv) {
                                        {gf.frame_seq, gf.publication_id,
                                         prosper::frontend::SnapActualPresentPath::gpu_scanout});
                 });
-                if (attempt == PresentAttempt::presented)
+                if (attempt == PresentAttempt::presented) {
+                    // A prior successfully shown candidate may be the exact closing flip even
+                    // when this lease is newer. Give that retained image first claim; a newer
+                    // flip must not turn an earlier, valid target into a false skip.
                     drainStagedGrabCandidate(gf.frame_seq);
+                    if (pendingGrabReserved && !pendingGrabBundlePath.empty()) {
+                        (void)prosper::gpu::interactive_grab_on_host_presented_source(
+                            pendingGrabBundlePath, gf.frame_seq, gf.producer.known(),
+                            gf.producer.completed.source_submit);
+                        drainStagedGrabCandidate(gf.frame_seq);
+                    }
+                }
             } else if (gpu::present_frame_seq() != lastFrameSeq) {
                 // #1270 Finding 2: no GPU frame was published this iteration. On a publish MISS (front
                 // target evicted/invalidated, or no free slot) the renderer still did the CPU readback, so
@@ -3320,6 +3377,9 @@ int main(int argc, char** argv) {
                         source.source = prosper::frontend::FrameGrabSource::GpuCpuFallback;
                         source.source_seq = cf.guest_present_count;
                         source.publication_id = cf.frame_seq;
+                        if (pendingGrabReserved && !pendingGrabBundlePath.empty())
+                            (void)prosper::gpu::interactive_grab_on_cpu_fallback(
+                                pendingGrabBundlePath);
                         drainStagedGrabCandidate();
                         flushGrabScreenshot(cf.rgba->data(), cf.width, cf.height, source);
                         flushPendingSnap(cf.rgba->data(), cf.width, cf.height);
