@@ -4861,9 +4861,11 @@ inline uint64_t& persistent_ds_write_generation() {
     return generation;
 }
 
-// DB_RENDER_CONTROL.DEPTH_CLEAR_ENABLE substitutes the VALUE of depth writes (DB_DEPTH_CLEAR); it
-// does not create writes on its own — the write path still requires Z_ENABLE + Z_WRITE_ENABLE and a
-// compare that can pass. Real guest clear draws program exactly that shape (test+write+ALWAYS);
+// The current backend treats DB_RENDER_CONTROL.DEPTH_CLEAR_ENABLE as a requested clear only when
+// the depth write path is enabled. This is a conservative gate for the observed writes-disabled
+// Blue Prince case, not proof of the guest hardware's coverage or clear-value behavior. The
+// render loop below currently emits a full-scissor clear before the draw; that approximation
+// differs from per-fragment value substitution and is under investigation in #2790.
 // Blue Prince's per-light shadow loop instead issues a fullscreen rect with DEPTH_CLEAR_ENABLE set
 // and DB_DEPTH_CONTROL fully disabled immediately BEFORE sampling the plane its shadow casters
 // rendered — treating that as a clear/write destroyed the shadow map it is about to consume and
@@ -5691,6 +5693,14 @@ inline std::atomic<uint64_t>& backend_geom_probe_undeclared_count() {
 
 // One per PROSPER_DRAW_ISO re-render pass (the kill=-1 baseline plus one per killed draw).
 inline std::atomic<uint64_t>& backend_draw_iso_pass_count() {
+    static std::atomic<uint64_t> count{0};
+    return count;
+}
+
+// Counts diagnostic depth-clear state actually selected for a draw. The dedicated CTest arms
+// each probe before process start and requires this to advance, so a clean Vulkan validation run
+// cannot silently pass without recording the new path.
+inline std::atomic<uint64_t>& backend_depth_clear_probe_armed_count() {
     static std::atomic<uint64_t> count{0};
     return count;
 }
@@ -7101,9 +7111,29 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     // A DEPTH_CLEAR_ENABLE bit only acts through the enabled depth-write path (see
     // depth_clear_effective) — the writes-disabled Blue Prince light-loop shape is depth-inert and
     // must not force a depth attachment, pick the clear value, or clear in-pass (#1287).
+    // Investigation-only control for #2790. Mode 1 limits attachment clears to ALWAYS draws;
+    // mode 2 additionally prevents those draws from overwriting the clear with their interpolated
+    // depth. Mode 3 instead writes the clear value through the draw's actual fragment coverage by
+    // collapsing its dynamic depth range. Mode 4 narrows mode 3 to a clear-shaped depth-only
+    // late-Z strip without a shader Z export, to test the state split observed in a Sonic stage
+    // bundle. Mode 5 suppresses the ordinary write of ALWAYS clear draws like mode 2, but keeps
+    // the default full-scissor clear on every draw admitted by the default gate (the missing 2x2
+    // control).
+    // None of these modes establishes the hardware clear predicate.
+    static const int sonic_clear_probe = [] {
+        const char* value = std::getenv("PROSPER_DIAG_CLEAR_OVERWRITE");
+        return value && value[0] >= '1' && value[0] <= '5' && value[1] == '\0'
+            ? value[0] - '0' : 0;
+    }();
     const auto effective_depth_clear = [](const prosper::gpu::ResolvedPipelineState* ps) {
+        const bool probe_admits = sonic_clear_probe == 0 || sonic_clear_probe == 5 ||
+            (ps->depth_compare_op == VK_COMPARE_OP_ALWAYS &&
+             (sonic_clear_probe != 4 ||
+              ((ps->db_shader_control & 0x31u) == 0u && ps->color_write_mask == 0u &&
+               ps->color1_write_mask == 0u && ps->topology == 4u)));
         return depth_clear_effective(ps->depth_clear_enable, ps->depth_test_enable,
-                                     ps->depth_write_enable, ps->depth_compare_op);
+                                     ps->depth_write_enable, ps->depth_compare_op) &&
+               probe_admits;
     };
     for (const auto& d : draws) {
         if (!d.ps) continue;
@@ -9395,6 +9425,10 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             dss.depthTestEnable  = VK_TRUE;
             dss.depthWriteEnable = ps->depth_write_enable ? VK_TRUE : VK_FALSE;
             dss.depthCompareOp   = (VkCompareOp)ps->depth_compare_op;
+            if ((sonic_clear_probe == 2 || sonic_clear_probe == 5) &&
+                ps->depth_compare_op == VK_COMPARE_OP_ALWAYS && effective_depth_clear(ps)) {
+                dss.depthWriteEnable = VK_FALSE;
+            }
             // UE4 repeats its reverse-Z depth prepass in a separately translated base-pass shader.
             // A one-ULP position difference between those shaders makes exact EQUAL reject the whole
             // base pass, although the guest hardware accepts the pair. Preserve occlusion by relaxing
@@ -12014,12 +12048,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     // lines below. A submit whose draws carry a guest depth or stencil clear is therefore still
     // isolated against different depth contents from the pass it is naming a culprit in. Dynamic
     // state was the part the layer could see; this part it cannot, and it is not fixed here.
-    auto record_draw_dynamic_state = [](VkCommandBuffer command, const DV& v) {
-        vkCmdSetViewport(command, 0, 1, &v.viewport);
-        vkCmdSetScissor(command, 0, 1, &v.scissor);
-        vkCmdSetLineWidth(command, v.line_width);
-        vkCmdSetDepthBias(command, v.depth_bias_constant, v.depth_bias_clamp,
-                          v.depth_bias_slope);
+    auto record_stencil_dynamic_state = [](VkCommandBuffer command, const DV& v) {
         vkCmdSetStencilCompareMask(command, VK_STENCIL_FACE_FRONT_BIT,
                                    v.stencil_front.compareMask);
         vkCmdSetStencilCompareMask(command, VK_STENCIL_FACE_BACK_BIT,
@@ -12032,21 +12061,39 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                  v.stencil_front.reference);
         vkCmdSetStencilReference(command, VK_STENCIL_FACE_BACK_BIT,
                                  v.stencil_back.reference);
-        // These commands and states are required by core Vulkan 1.3, below our 1.4 floor.
-        vkCmdSetDepthTestEnable(command, v.depth_test);
-        vkCmdSetDepthWriteEnable(command, v.depth_write);
-        vkCmdSetDepthCompareOp(command, v.depth_compare);
-        vkCmdSetStencilTestEnable(command, v.stencil_test);
         vkCmdSetStencilOp(command, VK_STENCIL_FACE_FRONT_BIT, v.stencil_front.failOp,
                           v.stencil_front.passOp, v.stencil_front.depthFailOp,
                           v.stencil_front.compareOp);
         vkCmdSetStencilOp(command, VK_STENCIL_FACE_BACK_BIT, v.stencil_back.failOp,
                           v.stencil_back.passOp, v.stencil_back.depthFailOp,
                           v.stencil_back.compareOp);
+    };
+    auto record_pipeline_dynamic_state = [](VkCommandBuffer command, const DV& v) {
+        // These commands and states are required by core Vulkan 1.3, below our 1.4 floor.
+        vkCmdSetDepthTestEnable(command, v.depth_test);
+        vkCmdSetDepthWriteEnable(command, v.depth_write);
+        vkCmdSetDepthCompareOp(command, v.depth_compare);
+        vkCmdSetStencilTestEnable(command, v.stencil_test);
         vkCmdSetCullMode(command, v.cull_mode);
         vkCmdSetFrontFace(command, v.front_face);
         vkCmdSetPrimitiveTopology(command, v.topology);
         vkCmdSetPrimitiveRestartEnable(command, v.primitive_restart);
+    };
+    auto record_draw_dynamic_state = [&](VkCommandBuffer command, const DV& v,
+                                         const prosper::gpu::ResolvedPipelineState* ps) {
+        VkViewport viewport = v.viewport;
+        if ((sonic_clear_probe == 3 || sonic_clear_probe == 4) && ps && effective_depth_clear(ps)) {
+            viewport.minDepth = ps->depth_clear_value;
+            viewport.maxDepth = ps->depth_clear_value;
+            backend_depth_clear_probe_armed_count().fetch_add(1);
+        }
+        vkCmdSetViewport(command, 0, 1, &viewport);
+        vkCmdSetScissor(command, 0, 1, &v.scissor);
+        vkCmdSetLineWidth(command, v.line_width);
+        vkCmdSetDepthBias(command, v.depth_bias_constant, v.depth_bias_clamp,
+                          v.depth_bias_slope);
+        record_stencil_dynamic_state(command, v);
+        record_pipeline_dynamic_state(command, v);
     };
     vkCmdBeginRenderPass(cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
     for (size_t di = 0; di < dv.size(); di++) {
@@ -12057,7 +12104,9 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
              stencil_clear_effective(ps->stencil_clear_enable, ps->stencil_enable,
                                      ps->stencil_write_mask[0], ps->stencil_write_mask[1]))) {
             VkClearAttachment dsc{};
-            if (effective_depth_clear(ps)) dsc.aspectMask |= VK_IMAGE_ASPECT_DEPTH_BIT;
+            if (effective_depth_clear(ps) &&
+                (sonic_clear_probe <= 2 || sonic_clear_probe == 5))
+                dsc.aspectMask |= VK_IMAGE_ASPECT_DEPTH_BIT;
             if (stencil_clear_effective(ps->stencil_clear_enable, ps->stencil_enable,
                                         ps->stencil_write_mask[0], ps->stencil_write_mask[1]) &&
                 format_has_stencil)
@@ -12066,8 +12115,13 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             VkClearRect rect{v.scissor, 0, 1};
             // A fully clipped draw legitimately has a zero-area dynamic scissor, but Vulkan requires
             // vkCmdClearAttachments rectangles to have non-zero width and height (VUID 02682/02683).
-            if (dsc.aspectMask && rect.rect.extent.width && rect.rect.extent.height)
+            const bool clear_recorded = dsc.aspectMask && rect.rect.extent.width &&
+                                        rect.rect.extent.height;
+            if (clear_recorded)
                 vkCmdClearAttachments(cmd, 1, &dsc, 1, &rect);
+            if (clear_recorded && sonic_clear_probe == 1 &&
+                (dsc.aspectMask & VK_IMAGE_ASPECT_DEPTH_BIT))
+                backend_depth_clear_probe_armed_count().fetch_add(1);
         }
         if (!v.ok) continue;
         if (ds_active) {
@@ -12076,7 +12130,11 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                             ds_ctx.occlusion_precise ? VK_QUERY_CONTROL_PRECISE_BIT : 0);
         }
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, v.pipe);
-        record_draw_dynamic_state(cmd, v);
+        record_draw_dynamic_state(cmd, v, ps);
+        if ((sonic_clear_probe == 2 || sonic_clear_probe == 5) && ps && effective_depth_clear(ps) &&
+            ps->depth_compare_op == VK_COMPARE_OP_ALWAYS && ps->depth_write_enable &&
+            !v.depth_write)
+            backend_depth_clear_probe_armed_count().fetch_add(1);
         if (v.use_desc) vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, v.layout, 0, v.n_sets, v.dsets.data(), 0, nullptr);
         const bool geom_here = geom_active && di == geom_item;
         if (geom_here) {
@@ -13080,7 +13138,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 vkCmdBeginRenderPass(c2, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
                 for (size_t di = 0; di < dv.size(); di++) { auto& v = dv[di]; if (!v.ok) continue; if ((int)di == kk) continue;
                     vkCmdBindPipeline(c2, VK_PIPELINE_BIND_POINT_GRAPHICS, v.pipe);
-                    record_draw_dynamic_state(c2, v);   // #3248: same state as the pass being isolated
+                    record_draw_dynamic_state(c2, v, draws[di].ps);   // #3248: same state as the pass being isolated
                     if (v.use_desc) vkCmdBindDescriptorSets(c2, VK_PIPELINE_BIND_POINT_GRAPHICS, v.layout, 0, v.n_sets, v.dsets.data(), 0, nullptr);
                     if (v.icount) { vkCmdBindIndexBuffer(c2, v.ibuf, v.ioffset, VK_INDEX_TYPE_UINT32); vkCmdDrawIndexed(c2, v.icount, v.instance_count, 0, v.vertex_offset, 0); }
                     else vkCmdDraw(c2, v.vcount, v.instance_count, static_cast<uint32_t>(v.vertex_offset), 0);
