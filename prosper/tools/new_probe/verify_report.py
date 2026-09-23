@@ -15,9 +15,13 @@ def input_file(path: Path, root: Path) -> Path:
     candidate = Path(os.path.abspath(path))
     if not candidate.is_relative_to(root):
         raise ValueError(f"probe input is outside the report root: {path}")
-    resolved = candidate.resolve(strict=True)  # NOSONAR
-    if not resolved.is_file() or not resolved.is_relative_to(root):  # NOSONAR
+    # Resolve a symlink without probing whether its target exists. Containment
+    # must be decided before the file-type check, including for dangling links.
+    resolved = candidate.resolve(strict=False)  # NOSONAR
+    if not resolved.is_relative_to(root):
         raise ValueError(f"probe input is outside the report root: {path}")
+    if not resolved.is_file():  # NOSONAR
+        raise ValueError(f"probe input is not a file: {path}")
     return resolved
 
 

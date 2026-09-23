@@ -34,6 +34,24 @@ fi
 [[ $(<"$scratch/nonexistent-check.txt") == *'outside the report root'* ]]
 printf '%s\n' 'PASS: outside path is refused before existence check'
 
+# A link inside the allowed tree must not disclose whether its outside target
+# exists. Both targets must receive the same containment refusal.
+ln -s "$scratch/no-such-outside-target" "$scratch/restricted/dangling-link"
+if python3 "$tool_dir/verify_report.py" "$scratch/restricted/dangling-link" "$report" \
+    --root "$scratch/restricted" --elf EXEC > "$scratch/dangling-check.txt" 2>&1; then
+    printf '%s\n' 'FAIL: verifier accepted a dangling outside link' >&2
+    exit 1
+fi
+[[ $(<"$scratch/dangling-check.txt") == *'outside the report root'* ]]
+ln -s "$scratch/control.txt" "$scratch/restricted/existing-link"
+if python3 "$tool_dir/verify_report.py" "$scratch/restricted/existing-link" "$report" \
+    --root "$scratch/restricted" --elf EXEC > "$scratch/existing-link-check.txt" 2>&1; then
+    printf '%s\n' 'FAIL: verifier accepted an existing outside link' >&2
+    exit 1
+fi
+[[ $(<"$scratch/existing-link-check.txt") == *'outside the report root'* ]]
+printf '%s\n' 'PASS: dangling outside link is refused before existence check'
+
 # The report is input data too: an injected ELF path must not make the verifier
 # inspect a file outside the caller's selected scratch tree.
 python3 - "$report" "$scratch/foreign-elf.tsv" <<'PY'
