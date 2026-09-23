@@ -35,6 +35,37 @@ int main() {
           oversized.addresses.empty() && !oversized.allows(0x3080030000ull),
           "more than eight addresses refuse every readback");
 
+    uint64_t bytes = 123;
+    PersistentReadbackBudget exact_budget;
+    CHECK(exact_budget.admit(8192, 8192, 4, bytes) == PersistentReadbackCharge::Admitted &&
+          bytes == PersistentReadbackBudget::kMaxBytes &&
+          exact_budget.charged_bytes == PersistentReadbackBudget::kMaxBytes,
+          "an exactly 256 MiB selected readback is admitted and charged");
+    CHECK(exact_budget.admit(1, 1, 1, bytes) == PersistentReadbackCharge::OverBudget &&
+          bytes == 0 && exact_budget.charged_bytes == PersistentReadbackBudget::kMaxBytes,
+          "one byte after the exact boundary is refused without changing the charge");
+
+    PersistentReadbackBudget cumulative_budget;
+    CHECK(cumulative_budget.admit(4096, 8192, 4, bytes) == PersistentReadbackCharge::Admitted &&
+          bytes == PersistentReadbackBudget::kMaxBytes / 2,
+          "the first half-budget target is admitted");
+    CHECK(cumulative_budget.admit(4096, 8192, 4, bytes) == PersistentReadbackCharge::Admitted &&
+          bytes == PersistentReadbackBudget::kMaxBytes / 2 &&
+          cumulative_budget.charged_bytes == PersistentReadbackBudget::kMaxBytes,
+          "the second half-budget target reaches the exact cumulative limit");
+    CHECK(cumulative_budget.admit(1, 1, 4, bytes) == PersistentReadbackCharge::OverBudget &&
+          bytes == 0,
+          "a later target beyond the cumulative limit is refused");
+
+    PersistentReadbackBudget overflow_budget;
+    CHECK(overflow_budget.admit(UINT32_MAX, UINT32_MAX, 2, bytes) ==
+              PersistentReadbackCharge::SizeOverflow &&
+          bytes == 0 && overflow_budget.charged_bytes == 0,
+          "width times height times pixel stride overflow refuses without charging");
+    CHECK(overflow_budget.admit(1, 1, 0, bytes) == PersistentReadbackCharge::InvalidSize &&
+          bytes == 0 && overflow_budget.charged_bytes == 0,
+          "unknown zero-stride format refuses without charging");
+
     if (failures) return 1;
     std::printf("== PASS ==\n");
     return 0;

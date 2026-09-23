@@ -55,7 +55,6 @@
 #include <functional>
 #include <chrono>
 #include <climits>
-#include <limits>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -11083,8 +11082,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     const uint64_t sub = dp_submit.fetch_add(1);
                     if (g_persist_window.contains(sub, diagnostic_elapsed_ms())) {
                         const char* dd = getenv("PROSPER_FRAME_DIR");
-                        constexpr uint64_t kSelectedReadbackBudget = 256ull << 20;
-                        uint64_t selected_readback_bytes = 0;
+                        prosper::frontend::PersistentReadbackBudget selected_readback_budget;
                         fprintf(stderr, "[persist] submit=%llu present: front=%d/%d front_va=0x%llx "
                                 "selected=%s vo:", (unsigned long long)sub, vo_front, vo_n,
                                 (unsigned long long)front_va,
@@ -11107,29 +11105,25 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             }
                             const VkFormat fmt = prosper::test::backend_color_format(s.format);
                             const uint32_t bpp = prosper::test::backend_color_bytes_per_pixel(fmt);
-                            const uint64_t pixel_count = static_cast<uint64_t>(s.w) * s.h;
+                            uint64_t expected = 0;
                             if (g_persist_filter.state ==
                                     prosper::frontend::PersistentReadbackFilterState::Selected) {
-                                if (bpp && pixel_count > std::numeric_limits<uint64_t>::max() / bpp) {
+                                const auto charge = selected_readback_budget.admit(s.w, s.h, bpp,
+                                                                                   expected);
+                                if (charge != prosper::frontend::PersistentReadbackCharge::Admitted) {
+                                    const char* reason = "budget 256 MiB";
+                                    if (charge == prosper::frontend::PersistentReadbackCharge::InvalidSize)
+                                        reason = "invalid size";
+                                    else if (charge == prosper::frontend::PersistentReadbackCharge::SizeOverflow)
+                                        reason = "size overflow";
                                     fprintf(stderr, "[persist] submit=%llu addr=0x%llx "
-                                                    "skipped: selected readback size overflow\n",
-                                            (unsigned long long)sub,
-                                            (unsigned long long)kv.first);
+                                                    "skipped: selected readback %s\n",
+                                            (unsigned long long)sub, (unsigned long long)kv.first,
+                                            reason);
                                     continue;
                                 }
-                            }
-                            const uint64_t expected = pixel_count * bpp;
-                            if (g_persist_filter.state ==
-                                    prosper::frontend::PersistentReadbackFilterState::Selected) {
-                                if (expected > kSelectedReadbackBudget - selected_readback_bytes) {
-                                    fprintf(stderr, "[persist] submit=%llu addr=0x%llx "
-                                                    "skipped: selected readback budget 256 MiB\n",
-                                            (unsigned long long)sub,
-                                            (unsigned long long)kv.first);
-                                    continue;
-                                }
-                                selected_readback_bytes += expected;
-                            }
+                            } else
+                                expected = static_cast<uint64_t>(s.w) * s.h * bpp;
                             std::vector<uint8_t> px; std::string err;
                             if (!prosper::test::readback_persistent_color_target(
                                     kv.first, s.w, s.h, fmt, px, err) || px.size() != expected) {
