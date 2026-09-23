@@ -6,8 +6,8 @@ Linux/AMD run is on record yet.
 
 ## Current state — rung 2, gameplay reached with the world absent (2026-09-23)
 
-On `main` (which has [#3817](https://github.com/mattias800/prosper/pull/3817)) plus
-[#3814](https://github.com/mattias800/prosper/pull/3814), `screenshot.exe` with the route
+On `main` (which has both crash fixes, [#3817](https://github.com/mattias800/prosper/pull/3817) and
+[#3814](https://github.com/mattias800/prosper/pull/3814)), `screenshot.exe` with the route
 `prosper/scripts/kena/reach-first-gameplay-prompt.pad` reaches, in order:
 
 | t (one 540 s run) | what renders |
