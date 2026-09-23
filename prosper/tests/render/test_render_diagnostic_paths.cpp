@@ -92,7 +92,7 @@ const uint32_t kPlainModule[] = {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
     std::printf("== test_render_diagnostic_paths ==\n");
 
     // --- Arm 1: the arming predicate itself (no device, no render) ------------------------------
@@ -170,6 +170,36 @@ int main() {
                 static_cast<unsigned long long>(iso_passes() - before_iso));
     CHECK(iso_passes() == before_iso + 2,
           "draw isolation re-rendered the submit once as a baseline and once per killed draw");
+
+    // The five policies use different Vulkan mechanisms. A clear-shaped depth-only draw makes each
+    // CTest arm take its selected path; the counter prevents a valid-looking Vulkan scan of a
+    // fixture that never reaches the diagnostic. The mode is set by CTest before process start.
+    if (argc == 2) {
+        const char* const clear_probe = std::getenv("PROSPER_DIAG_CLEAR_OVERWRITE");
+        const std::string requested = argv[1];
+        CHECK((requested == "1" || requested == "2" || requested == "3" ||
+               requested == "4" || requested == "5") && clear_probe &&
+                  requested == clear_probe,
+              "depth-clear probe matches the CTest arm");
+        if (failures) return 1;
+        prosper::gpu::ResolvedPipelineState clear{};
+        clear.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+        clear.color_write_mask = 0;
+        clear.depth_test_enable = true;
+        clear.depth_write_enable = true;
+        clear.depth_compare_op = VK_COMPARE_OP_ALWAYS;
+        clear.depth_clear_enable = true;
+        clear.has_depth_clear = true;
+        clear.depth_clear_value = 0.0f;
+        auto clear_draws = one_triangle();
+        clear_draws[0].ps = &clear;
+        const uint64_t before_probe = prosper::test::backend_depth_clear_probe_armed_count().load();
+        const auto clear_pixels = prosper::test::render_draws_rgba(clear_draws, W, H);
+        CHECK(clear_pixels.size() == static_cast<size_t>(W) * H * 4,
+              "depth-clear diagnostic pass completed");
+        CHECK(prosper::test::backend_depth_clear_probe_armed_count().load() > before_probe,
+              "depth-clear diagnostic state was recorded for a draw");
+    }
 
     std::filesystem::remove_all(frame_dir, frame_dir_error);
     std::printf("== %s ==\n", failures ? "FAILED" : "PASSED");

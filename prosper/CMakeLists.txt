@@ -3618,6 +3618,15 @@ endif()
       set_tests_properties(render_diagnostic_paths PROPERTIES ENVIRONMENT
                            "PROSPER_GEOM_PROBE=0;PROSPER_DRAW_ISO=1;PROSPER_ISO_AT=16,16;PROSPER_FRAME_DIR=render_diagnostic_paths_frames")
 
+      # Exercise every opt-in depth-clear policy under Vulkan validation. The test asserts that
+      # the selected draw reached its path, so a clean layer log cannot be a vacuous pass.
+      foreach(clear_probe_mode IN ITEMS 1 2 3 4 5)
+        add_test(NAME render_diagnostic_paths_clear_${clear_probe_mode}
+                 COMMAND test_render_diagnostic_paths ${clear_probe_mode})
+        set_tests_properties(render_diagnostic_paths_clear_${clear_probe_mode} PROPERTIES ENVIRONMENT
+                             "PROSPER_GEOM_PROBE=0;PROSPER_DRAW_ISO=1;PROSPER_ISO_AT=16,16;PROSPER_FRAME_DIR=render_diagnostic_paths_frames_${clear_probe_mode};PROSPER_DIAG_CLEAR_OVERWRITE=${clear_probe_mode}")
+      endforeach()
+
       # The address-watch matcher's edge cases (exclusive end, empty range, UINT64_MAX wrap).
       add_executable(test_compute_address_watch tests/gpu/test_compute_address_watch.cpp)
       target_link_libraries(test_compute_address_watch PRIVATE prosper_core Vulkan::Vulkan)
