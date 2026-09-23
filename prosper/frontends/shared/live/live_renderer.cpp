@@ -11427,7 +11427,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     published_gpu, new_gpu_flip,
                     front >= 0 ? prosper_vo_buffer_addr(front) : 0, current_flip,
                     last_gpu_publication_id);
-                if (gpu_source.address) {
+                if (published_gpu) {
                     kena_final_source = gpu_source.kind;
                     kena_final_addr = gpu_source.address;
                     kena_gpu_flip = gpu_source.flip;
@@ -11746,9 +11746,11 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     final_written = length > 0 && static_cast<size_t>(length) < sizeof path &&
                                     prosper::test::dump_bmp(path, *selected_pixels, w, h);
                 }
+                // CPU source_seq belongs to present_snapshot; GPU frame_seq is the VideoOut flip
+                // passed into the blit, while publication_id names that separate handoff.
                 fprintf(stderr, "[kena-menu] trace=%llu final source=%s addr=0x%llx "
                                 "candidate=%s front=0x%llx retained=%d gpu_publish=%d "
-                                "gpu_flip=%llu gpu_publication=%llu cpu_bytes=%zu "
+                                "gpu_frame_seq=%llu gpu_blit_publication_id=%llu cpu_bytes=%zu "
                                 "cpu_rgb_nonblack=%zu image=%s\n",
                         (unsigned long long)kena_trace_id, kena_final_source,
                         (unsigned long long)kena_final_addr,
@@ -11967,6 +11969,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     prosper::gpu::RenderedFrame frame(std::move(selected_pixels));
                     frame.origin = frame_origin;
                     frame.diagnostic_trace_id = kena_trace_id;
+                    frame.diagnostic_gpu_published = kena_trace_this_callback && published_gpu;
                     return frame;
                 }
                 struct TimingTotals {
@@ -13035,6 +13038,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             prosper::gpu::RenderedFrame frame(std::move(selected_pixels));
             frame.origin = frame_origin;
             frame.diagnostic_trace_id = kena_trace_id;
+            frame.diagnostic_gpu_published = kena_trace_this_callback && published_gpu;
             return frame;
         });
     fprintf(stderr, "[render] live Vulkan submit renderer registered (dump=%d, frames -> %s)\n",

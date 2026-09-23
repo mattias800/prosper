@@ -9258,6 +9258,12 @@ std::vector<SubmitOperation> plan_submit_operations(const GpuState& st) {
 
 namespace {
 
+void observe_diagnostic_render(OrderedSubmitResult& result, const RenderedFrame& rendered) {
+    if (!rendered.diagnostic_trace_id) return;
+    result.diagnostic_trace_id = rendered.diagnostic_trace_id;
+    result.diagnostic_gpu_published = rendered.diagnostic_gpu_published;
+}
+
 template <typename DmaCopyRecord, typename ExecuteDma>
 OrderedSubmitResult execute_ordered_items_impl(const std::vector<SubmitOperation>& operations,
                                                const std::vector<DrawItem>& draws,
@@ -9325,6 +9331,7 @@ OrderedSubmitResult execute_ordered_items_impl(const std::vector<SubmitOperation
                         authoritative_readback};
         RenderedFrame rendered = render(span, width, height);
         g_live_phase = saved;
+        observe_diagnostic_render(result, rendered);
         if (!rendered.empty()) result.frame = std::move(rendered);
         span.clear();
         ++result.render_spans;
@@ -10745,6 +10752,7 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
         g_live_phase = {result.render_spans == 0, final_span, authoritative_readback};
         RenderedFrame rendered = render(span, width, height);
         g_live_phase = saved;
+        observe_diagnostic_render(result, rendered);
         if (!rendered.empty()) result.frame = std::move(rendered);
         span.clear();
         ++result.render_spans;
@@ -11486,6 +11494,7 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
         g_live_phase = {false, true, false};
         RenderedFrame rendered = render({}, width, height);
         g_live_phase = saved;
+        observe_diagnostic_render(result, rendered);
         if (!rendered.empty()) result.frame = std::move(rendered);
     }
     return result;
@@ -11952,18 +11961,21 @@ bool execute_ordered_and_present(const GpuState& st, uint32_t width, uint32_t he
                          n == 31 ? " [further reports suppressed]" : "");
     }
     const bool presented = frame_ready && publish;
-    if (presented) {
-        const uint64_t published_seq = present_write_frame(
-            result.frame.storage, width, height, result.frame.origin);
-        if (result.frame.diagnostic_trace_id)
-            std::fprintf(stderr, "[kena-menu] trace=%llu cpu-published submit=%llu source_seq=%llu\n",
-                         (unsigned long long)result.frame.diagnostic_trace_id,
-                         (unsigned long long)submit_no,
-                         (unsigned long long)published_seq);
-    } else if (result.frame.diagnostic_trace_id) {
-        std::fprintf(stderr, "[kena-menu] trace=%llu cpu-publication refused submit=%llu bytes=%zu\n",
-                     (unsigned long long)result.frame.diagnostic_trace_id,
-                     (unsigned long long)submit_no, px.size());
+    const uint64_t published_seq = presented
+        ? present_write_frame(result.frame.storage, width, height, result.frame.origin) : 0;
+    const uint64_t diagnostic_trace_id = result.diagnostic_trace_id
+        ? result.diagnostic_trace_id : result.frame.diagnostic_trace_id;
+    if (diagnostic_trace_id) {
+        const char* frame_from = !result.frame.empty()
+            ? (result.frame.diagnostic_trace_id == diagnostic_trace_id
+                   ? "traced-final" : "earlier-span")
+            : "none";
+        std::fprintf(stderr, "[kena-menu] trace=%llu submit=%llu cpu_source_seq=%llu "
+                             "cpu_frame_from=%s cpu_bytes=%zu gpu_published=%d publish_gate=%d\n",
+                     (unsigned long long)diagnostic_trace_id,
+                     (unsigned long long)submit_no,
+                     (unsigned long long)published_seq, frame_from, px.size(),
+                     result.diagnostic_gpu_published ? 1 : 0, publish ? 1 : 0);
     }
     if (timing_enabled) {
         const auto timing_done = TimingClock::now();

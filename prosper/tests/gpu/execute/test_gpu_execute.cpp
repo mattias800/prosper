@@ -621,6 +621,52 @@ int main() {
               "write journal snapshots cannot suppress validation after submit completion");
     }
 
+    // A traced terminal callback may publish no CPU bytes while an earlier graphics span did.
+    // Keep that observation separate from the frame retained by the ordered executor.
+    {
+        DrawItem first, second;
+        first.draw_index = 0;
+        second.draw_index = 1;
+        ComputeItem split;
+        split.dispatch_index = 0;
+        const std::vector<SubmitOperation> operations = {
+            {SubmitOperationKind::Draw, 0, 100},
+            {SubmitOperationKind::Dispatch, 0, 200},
+            {SubmitOperationKind::Draw, 1, 300},
+        };
+        const auto result = execute_ordered_items(
+            operations, {first, second}, {split},
+            [](const std::vector<DrawItem>&, uint32_t, uint32_t) {
+                RenderedFrame frame;
+                if (live_render_phase().final_span) {
+                    frame.diagnostic_trace_id = 37;
+                    frame.diagnostic_gpu_published = true;
+                } else {
+                    frame = RenderedFrame(std::vector<uint8_t>(4, 0x5A));
+                }
+                return frame;
+            },
+            [](const std::vector<ComputeItem>&) { return true; }, 1, 1);
+        CHECK(result.frame.bytes() == std::vector<uint8_t>(4, 0x5A) &&
+              result.frame.diagnostic_trace_id == 0 &&
+              result.diagnostic_trace_id == 37 && result.diagnostic_gpu_published,
+              "empty traced final span remains distinct from an earlier CPU frame and GPU blit");
+
+        const auto cpu_result = execute_ordered_items(
+            operations, {first, second}, {split},
+            [](const std::vector<DrawItem>&, uint32_t, uint32_t) {
+                RenderedFrame frame(std::vector<uint8_t>(4, 0x31));
+                if (live_render_phase().final_span) frame.diagnostic_trace_id = 38;
+                return frame;
+            },
+            [](const std::vector<ComputeItem>&) { return true; }, 1, 1);
+        CHECK(cpu_result.frame.diagnostic_trace_id == 38 &&
+              cpu_result.diagnostic_trace_id == 38 &&
+              !cpu_result.diagnostic_gpu_published &&
+              cpu_result.frame.bytes() == std::vector<uint8_t>(4, 0x31),
+              "nonempty traced final span owns its CPU frame without a GPU publication");
+    }
+
 #if defined(__linux__)
     // The in-submit journal expires by design. A persistent page watch must still become Dirty when
     // the same GPU/DMA notification occurs between submits, or a cross-submit decoded-texture cache
