@@ -3,8 +3,9 @@
 One honest, consistent answer to "is this console online and signed in?", which is **no**.
 
 - `np` — libSceNpManager (sign-in state and its callbacks), libSceNpTrophy2, libSceNetCtl,
-  libSceNpUniversalDataSystem, libSceShare / libSceGameLiveStreaming. Split out of
-  `hle/service/hle_service.cpp` in #3735.
+  libSceNpUniversalDataSystem, libSceShare / libSceGameLiveStreaming, and libSceSigninDialog —
+  the system sign-in prompt a signed-out console raises, which ends dismissed (#3784). Split out
+  of `hle/service/hle_service.cpp` in #3735.
 
 The libraries are together because they answer one question between them and must not disagree: a
 title that reads SIGNED_OUT from NpManager and then gets a connected state from NetCtl takes a path
