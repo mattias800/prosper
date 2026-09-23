@@ -274,7 +274,8 @@ bool gpu_timeline_capture_after_compute_gate_armed();
 bool begin_gpu_timeline_submit(uint64_t submit_no);
 void record_gpu_timeline_submit(const GpuState& state, uint64_t submit_no);
 void record_gpu_timeline_present(uint64_t present_count, int buffer_index, int64_t flip_arg,
-                                 uint32_t width, uint32_t height);
+                                 uint32_t width, uint32_t height,
+                                 uint64_t source_flip_seq = 0);
 void flush_gpu_timeline();
 void close_gpu_timeline();
 
@@ -293,9 +294,20 @@ struct InteractiveGrabRequest {
     std::string replaced_path;
     std::string error;
 };
+// F9's one-frame GPU path must retain submits until the selected flip's *presented* image
+// has a completed producer in this bundle. Other callers keep the guest-present boundary.
+enum class InteractiveGrabClosure : uint8_t { GuestPresent, PresentedGpuProducer };
+struct InteractiveGrabProducerLimits {
+    uint32_t wait_ms = 30'000;
+    uint32_t extra_submits = 256;
+    uint32_t extra_presents = 240;
+};
 [[nodiscard]] InteractiveGrabRequest request_interactive_capture_bundle(const std::string& path,
                                                              uint32_t max_mb = 0,
-                                                             uint32_t delay_presents = 0);
+                                                             uint32_t delay_presents = 0,
+                                                             InteractiveGrabClosure closure =
+                                                                 InteractiveGrabClosure::GuestPresent,
+                                                             InteractiveGrabProducerLimits limits = {});
 bool interactive_capture_bundle_active();
 // Stop admission, cancel an incomplete window, and drain completed owned work. No guest/Vulkan
 // access is performed by the writer. Call before deliberate _Exit; ordinary teardown also drains.
@@ -315,8 +327,37 @@ struct InteractiveGrabOutcome {
     std::string bundle_path;      // the .prgbundle that was, or would have been, written
     std::string error;            // empty when ok; otherwise the exact failure, budget numbers included
     uint64_t max_unique_bytes = 0;   // the budget in force, so a frontend can name the remedy
+    // Exact guest-present boundaries and submits actually serialized by this one window. The
+    // screenshot's source sequence and producer submit must be compared with these, not with the
+    // guest-present count at the later time its BMP write completes.
+    uint64_t opened_present = 0;
+    std::vector<uint64_t> closed_presents;
+    uint64_t opened_source_flip = 0;
+    std::vector<uint64_t> closed_source_flips;
+    std::vector<uint64_t> closed_submit_counts; // captured prefix at closure; GPU F9 closure may follow guest flip
+    std::vector<uint64_t> captured_submits;
 };
 bool take_interactive_grab_outcome(InteractiveGrabOutcome& out);
+// The final closing token is published synchronously, independently of the (possibly slow)
+// writer. Ordinary windows close at the guest flip; GPU F9 waits until the exact selected front
+// is host-presented and its producer submit is retained. The caller names the owned request path.
+// A failed buffer selection retains the old front token, so no new lease can match the target.
+bool interactive_grab_closed_source_flip(const std::string& bundle_path, uint64_t& source_flip);
+// The selected guest flip is provisional until a successfully host-presented lease proves its
+// exact producer submit was serialized. These calls are inert for ordinary/multi-frame grabs.
+bool interactive_grab_pending_source_flip(const std::string& bundle_path, uint64_t& source_flip);
+enum class InteractiveGrabProducerClose : uint8_t {
+    NotPending, WaitingForTarget, Captured, Refused
+};
+InteractiveGrabProducerClose interactive_grab_on_host_presented_source(
+    const std::string& bundle_path, uint64_t source_flip, bool producer_known,
+    uint64_t producer_submit);
+// A successfully presented CPU fallback has no GPU producer proof. Keep its BMP usable by
+// returning the bundle to a bounded guest-present closure; its join remains unknown_source.
+bool interactive_grab_on_cpu_fallback(const std::string& bundle_path);
+// Called from the app loop even when no guest flips or submits arrive. Also seals prior
+// present/submit-budget failures, returning true only for a newly finalized refusal.
+bool interactive_grab_expire_producer_wait(const std::string& bundle_path);
 
 // Optional guest-stdout phase gate for the same whole-frame bundle. When
 // PROSPER_CAPTURE_BUNDLE_AFTER_GUEST_LOG is configured together with the existing

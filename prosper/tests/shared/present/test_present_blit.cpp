@@ -17,6 +17,7 @@
 #include "shared/present/present_blit.hpp"
 #include "shared/perf/performance_capture.hpp"
 #include "gpu/execute/gpu_execute.hpp"
+#include "gpu/present/videoout_present.hpp"
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -462,6 +463,25 @@ int main() {
             CHECK(deliveries.presentation(true, fa.producer) == frontend::ProducerDelivery::New,
                   "lineage: first successful present delivers new completed work");
             frontend::present_blit_release(fa.slot);
+        }
+        // Deliberately supply a front identity that cannot be live. The copy still yields usable
+        // pixels and a source-flip token, but its completed producer must be revoked *after* the
+        // fence and *before* acquisition. Removing that post-copy check turns this arm green-to-red.
+        VideoOutBufferSnapshot stale_front;
+        stale_front.address = a;
+        stale_front.generation = UINT64_MAX;
+        stale_front.source_flip_seq = 4901;
+        stale_front.buffer_index = 0;
+        if (ta && ta->image) {
+            CHECK(frontend::present_blit_publish(
+                      ta->image, ta->layout, VK_FORMAT_R8G8B8A8_UNORM, W, H, 4901,
+                      first_a, &stale_front),
+                  "lineage: stale-front probe still publishes copied pixels");
+            frontend::GpuScanoutFrame stale_frame;
+            CHECK(frontend::present_blit_acquire(stale_frame) && stale_frame.frame_seq == 4901 &&
+                  !stale_frame.producer.known(),
+                  "lineage: changed VideoOut front revokes producer proof before lease acquisition");
+            if (stale_frame.valid()) frontend::present_blit_release(stale_frame.slot);
         }
         ta = render_target(a);
         const auto second_a = ta ? test::persistent_color_producer_source(*ta)

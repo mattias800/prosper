@@ -9077,6 +9077,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     const auto& it = *itp;
                     if (draw_is_skipped(it.draw_index)) continue;
                     prosper::test::BackendDraw bd;
+                    bd.source_submit = phase.source_submit;
                     if (refvs) {
                         bd.vs = refvs_spv;
                     } else if (it.vs_shared) {
@@ -12593,11 +12594,17 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     }
                     return surface.rgba && surface.rgba->size() == expected ? &surface : nullptr;
                 };
-                const int front = prosper::gpu::present_front_index();
+                prosper::VideoOutBufferSnapshot front_snapshot;
+                const bool have_front = prosper::videoout_front_snapshot(front_snapshot);
+                const int front = have_front ? front_snapshot.buffer_index : -1;
+                // Selection, address, registration generation, and originating HLE flip are one
+                // registry-locked snapshot. The global flip and present counters can cross-pair
+                // when guest and GPU flip submitters interleave, so neither may label this image.
+                const uint64_t front_flip = have_front ? front_snapshot.source_flip_seq : 0;
                 static uint64_t last_gpu_publish_flip = UINT64_MAX;
                 const uint64_t current_flip = prosper_vo_flip_count();
-                const bool new_gpu_flip = prosper::frontend::present_blit_has_new_flip(
-                    last_gpu_publish_flip, current_flip);
+                const bool new_gpu_flip = front_flip && prosper::frontend::present_blit_has_new_flip(
+                    last_gpu_publish_flip, front_flip);
                 PresentHandoffTrace handoff_trace(current_flip);
                 if (handoff_trace.active)
                     handoff_trace.emit(prosper::perf::PresentHandoffEvent::RendererGate, front, 0, prosper::gpu::present_count(),
@@ -12610,14 +12617,14 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 // through to the CPU readback below, which still publishes a CPU frame; prosper-app
                 // presents that CPU frame when no GPU frame was published (main.cpp), so a miss degrades to
                 // the CPU present path rather than freezing the window.
-                if (front >= 0 && prosper::gpu::gpu_present_active() && !new_gpu_flip) {
+                if (front >= 0 && front_flip && prosper::gpu::gpu_present_active() && !new_gpu_flip) {
                     // The previously published slot remains the correct scanout for this guest
                     // flip. Treat it as a successful GPU publication so intermediate render
                     // submissions do not fall through to the expensive CPU readback path.
                     published_gpu = true;
                     handoff_trace.emit(prosper::perf::PresentHandoffEvent::SameFlipSuppressed, 0, 0, last_gpu_publish_flip);
-                } else if (front >= 0 && prosper::gpu::gpu_present_active()) {
-                    const uint64_t front_va = prosper_vo_buffer_addr(front);
+                } else if (front >= 0 && front_flip && prosper::gpu::gpu_present_active()) {
+                    const uint64_t front_va = front_snapshot.address;
                     auto rit = g_rtt.find(front_va);
                     if (rit != g_rtt.end() && rit->second.gpu_valid && rit->second.w && rit->second.h) {
                         const VkFormat fmt = prosper::test::backend_color_format(rit->second.format);
@@ -12632,9 +12639,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         if (tgt && tgt->image && tgt->layout != VK_IMAGE_LAYOUT_UNDEFINED) {
                             published_gpu = prosper::frontend::present_blit_publish(
                                 tgt->image, tgt->layout, fmt, rit->second.w, rit->second.h,
-                                current_flip,
-                                prosper::test::persistent_color_producer_source(*tgt));
-                            if (published_gpu) last_gpu_publish_flip = current_flip;
+                                front_flip,
+                                prosper::test::persistent_color_producer_source(*tgt),
+                                &front_snapshot);
+                            if (published_gpu) last_gpu_publish_flip = front_flip;
                         }
                     }
                 }

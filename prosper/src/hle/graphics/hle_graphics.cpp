@@ -123,7 +123,7 @@ namespace {
     // previously displayed slot back to 0. Keep the storage stable for the process lifetime.
     alignas(uint64_t) uint64_t g_buffer_labels[16] = {};
     int32_t g_previous_buffer = -1;
-    void flip_advance(int32_t bufidx, int64_t flip_arg) {
+    uint64_t flip_advance(int32_t bufidx, int64_t flip_arg) {
         // The renderer completes flips synchronously, so submit and completion share one instant.
         // Sample before taking g_flip_mx: the deterministic guest clock reads the flip count.
         const uint64_t tsc = prosper_guest_tsc_ns();
@@ -140,6 +140,7 @@ namespace {
         g_last_flip_process_time = completion_tsc / 1000;
         g_last_flip_tsc = completion_tsc;
         g_last_submit_tsc = completion_tsc;
+        return g_flip_count;
     }
 
     // The one display we advertise, and the ONE place it is decided (#3017).
@@ -231,6 +232,7 @@ namespace {
         uint64_t next_generation = 0;
         int      front_index = -1;
         uint64_t front_generation = 0;
+        uint64_t front_flip_seq = 0;
         bool     configured = false;
     };
     DisplayConfig g_display;
@@ -418,6 +420,7 @@ bool videoout_front_snapshot_locked(VideoOutBufferSnapshot& out) {
         out = {};
         return false;
     }
+    out.source_flip_seq = g_display.front_flip_seq;
     return true;
 }
 
@@ -623,11 +626,14 @@ extern "C" void prosper_videoout_seed_stats(unsigned long long* calls, unsigned 
     if (total_ms) *total_ms = g_videoout_seed_ms;
 }
 
-bool videoout_select_buffer(int buffer_index, VideoOutBufferSnapshot& out) {
+bool videoout_select_buffer(int buffer_index, VideoOutBufferSnapshot& out,
+                            uint64_t source_flip_seq) {
     std::lock_guard<std::mutex> lk(g_display_mx);
     if (!videoout_buffer_snapshot_locked(buffer_index, out)) return false;
     g_display.front_index = buffer_index;
     g_display.front_generation = out.generation;
+    g_display.front_flip_seq = source_flip_seq;
+    out.source_flip_seq = source_flip_seq;
     return true;
 }
 
@@ -657,6 +663,7 @@ void videoout_reset_front() {
     std::lock_guard<std::mutex> lk(g_display_mx);
     g_display.front_index = -1;
     g_display.front_generation = 0;
+    g_display.front_flip_seq = 0;
 }
 
 bool videoout_copy_buffer(const VideoOutBufferSnapshot& expected, std::vector<uint8_t>& out) {
@@ -910,9 +917,9 @@ HLE(g_vo_submitflip)  {
     const int32_t buffer_index = (int32_t)a1;
     if (buffer_index < -1 || buffer_index > 15)
         return (uint64_t)(int64_t)(int32_t)0x8029000a;  // SCE_VIDEO_OUT_ERROR_INVALID_INDEX
-    flip_advance(buffer_index, (int64_t)a3);
+    const uint64_t source_flip_seq = flip_advance(buffer_index, (int64_t)a3);
     flip_pace_wait();                              // both halves pace: see flip_pace_wait
-    gpu::present_flip(buffer_index, (int64_t)a3);   // present the buffer (scanout front + count)
+    gpu::present_flip(buffer_index, (int64_t)a3, source_flip_seq);
     prosper_eq_trigger_flip((int64_t)a3);   // flip completed (synchronous): fire the flip event
     return 0;
 }
@@ -943,9 +950,9 @@ extern "C" void prosper_vo_flip_from_gpu(uint32_t handle, int32_t bufidx, uint32
     if (evlog()) fprintf(stderr, "[ev] GpuFlip t=%.6f handle=0x%x bufidx=%d mode=0x%x fliparg=0x%llx\n",
                          evlog_seconds(), handle, bufidx, flip_mode,
                          (unsigned long long)flip_arg);
-    flip_advance(bufidx, flip_arg);
+    const uint64_t source_flip_seq = flip_advance(bufidx, flip_arg);
     flip_pace_wait();                      // both halves pace: see flip_pace_wait
-    gpu::present_flip(bufidx, flip_arg);   // scanout bookkeeping, same as the API flip
+    gpu::present_flip(bufidx, flip_arg, source_flip_seq);
     // A title that composites with COMPUTE and never draws produces no graphics span, and every
     // publish decision — including the guest-scanout fallback written for exactly that case — sits
     // behind one. Give the flip itself a chance to publish. Null until a frontend registers, so a
@@ -1330,6 +1337,7 @@ HLE(g_vo_unregister_buffers) {
                 g_display.front_generation == g_display.buffer_generation[i]) {
                 g_display.front_index = -1;
                 g_display.front_generation = 0;
+                g_display.front_flip_seq = 0;
             }
             // A numeric slot can be registered again with a different backing surface. Retire the
             // old label identity now so a later flip cannot clear the new registration's label.

@@ -4,6 +4,7 @@
 #include "shared/present/present_handoff_trace.hpp"
 #include "fixtures/render_runner.h"            // render_vk_ctx()
 #include "gpu/execute/gpu_execute.hpp"        // shared_present_submit_mutex / shared_present_active
+#include "gpu/present/videoout_present.hpp"    // lock-coherent VideoOut front identity
 #include "host/platform/gpu_submit_gate.hpp"    // #3225: refuse submits once the frontend shuts down
 #include <mutex>
 #include <cstdio>
@@ -149,7 +150,8 @@ int pick_free_slot(PresentBlitState& s) {
 
 bool present_blit_publish(VkImage src, VkImageLayout src_layout, VkFormat src_format,
                           uint32_t w, uint32_t h, uint64_t frame_seq,
-                          ProducerSource producer) {
+                          ProducerSource producer,
+                          const VideoOutBufferSnapshot* expected_front) {
     if (!src || !w || !h) return false;
     PresentHandoffTrace trace(frame_seq);
     const auto lock_begin = trace.now();
@@ -240,6 +242,20 @@ bool present_blit_publish(VkImage src, VkImageLayout src_layout, VkFormat src_fo
                      static_cast<int>(wait_result));
         s.ok = false;
         return false;
+    }
+
+    // The source VkImage was pinned by the caller's renderer resource lock, but its VideoOut
+    // *selection* can change while this synchronous blit is in flight. Keep the shown pixels and
+    // flip token for ordinary presentation; revoke only the producer proof if the exact selected
+    // front (including registration generation) no longer exists. The slot is still private here,
+    // so the app cannot acquire a falsely certified lease before this check. A new selection after
+    // this check cannot change the pixels already copied into the private slot; its frame token
+    // continues to name that older copied image, not the later current front.
+    if (expected_front && producer.known()) {
+        VideoOutBufferSnapshot current;
+        if (!videoout_front_snapshot(current) ||
+            !videoout_same_front_identity(*expected_front, current))
+            producer = {};
     }
 
     sl.frame_seq = frame_seq;
