@@ -13728,12 +13728,16 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                                               BackendMrtOutputs* mrt_outputs = nullptr,
                                               bool want_color_readback = true) {   // #2283
     const std::span<const BackendDraw> all(draws);
-    // The compact-resource preflight can refuse before entering render_draw_pass_rgba. Keep the
-    // per-thread texture result scoped to this logical call even on that early exit.
-    backend_texture_upload_stats_storage() = {};
     // One preflight over the logical batch, before splitting or any render-pass state. A malformed
     // later segment must not leave earlier producer work submitted or speculative cache state live.
-    if (!backend_compact_resource_orders_valid(all)) return {};
+    if (!backend_compact_resource_orders_valid(all)) {
+        // This refusal never enters render_draw_pass_rgba, where these per-call results normally
+        // reset. Do not let a preceding valid call masquerade as work done by this one.
+        backend_texture_upload_stats_storage() = {};
+        backend_resource_reuse_stats_storage() = {};
+        backend_render_timing_stats_storage() = {};
+        return {};
+    }
     if (!persist_depth_stencil ||
         depth_feedback_split_index(all, W, H) == all.size())
         return render_draw_pass_rgba(all, W, H, seed_rgba, clear_rgba,

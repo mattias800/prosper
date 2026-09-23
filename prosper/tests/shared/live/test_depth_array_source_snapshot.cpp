@@ -72,11 +72,13 @@ int main(int argc, char** argv) {
 #ifdef _WIN32
     _putenv_s("PROSPER_DEPTH_ARRAY_SNAPSHOT_CENSUS", "1");
     _putenv_s("PROSPER_ARRAY_REJECT_LOG_ALL", "1");
+    _putenv_s("PROSPER_RENDER_TIMING", "1");
     if (per_draw_control) _putenv_s("PROSPER_NO_SUBMIT_DEPTH_ARRAY_SNAPSHOT_REUSE", "1");
     if (expanded_control) _putenv_s("PROSPER_NO_COMPACT_DEPTH_ARRAY_SNAPSHOT", "1");
 #else
     setenv("PROSPER_DEPTH_ARRAY_SNAPSHOT_CENSUS", "1", 1);
     setenv("PROSPER_ARRAY_REJECT_LOG_ALL", "1", 1);
+    setenv("PROSPER_RENDER_TIMING", "1", 1);
     if (per_draw_control) setenv("PROSPER_NO_SUBMIT_DEPTH_ARRAY_SNAPSHOT_REUSE", "1", 1);
     if (expanded_control) setenv("PROSPER_NO_COMPACT_DEPTH_ARRAY_SNAPSHOT", "1", 1);
 #endif
@@ -743,6 +745,13 @@ int main(int argc, char** argv) {
     check(uploads.references == 3 && uploads.unique_uploads == 1 &&
               uploads.upload_bytes == Pixels * Layers * snapshot_bpp,
           "three array bindings produce one actual backend image/staging upload");
+    const auto valid_bindings = backend_resource_reuse_stats();
+    const auto valid_timing = backend_render_timing_stats();
+    check(valid_bindings.texture_binding_references >= 3 &&
+              valid_bindings.unique_texture_bindings > 0,
+          "valid call populates backend texture binding counters before refusal");
+    check(valid_timing.res_texture_upload_ms > 0 && valid_timing.res_texture_bind_ms > 0,
+          "valid call populates backend texture subphase times before refusal");
     // A valid call is the positive control for this two-call diagnostic: the early compact-order
     // refusal must publish zero texture work, not leave the previous call's plausible counters.
     BackendDraw malformed_order;
@@ -756,6 +765,13 @@ int main(int argc, char** argv) {
     uploads = backend_texture_upload_stats();
     check(uploads.references == 0 && uploads.unique_uploads == 0 && uploads.upload_bytes == 0,
           "preflight refusal clears the previous backend texture counters");
+    const auto refused_bindings = backend_resource_reuse_stats();
+    const auto refused_timing = backend_render_timing_stats();
+    check(refused_bindings.texture_binding_references == 0 &&
+              refused_bindings.unique_texture_bindings == 0,
+          "preflight refusal clears the previous backend texture binding counters");
+    check(refused_timing.res_texture_upload_ms == 0 && refused_timing.res_texture_bind_ms == 0,
+          "preflight refusal clears the previous backend texture subphase times");
 
     // Separate draws in one real callback share a stable retained generation. Distinct samplers
     // still yield six references, while the immutable pixel owner permits one actual upload. The
