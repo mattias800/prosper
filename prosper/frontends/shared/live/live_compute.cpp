@@ -1,6 +1,7 @@
 #include "shared/live/live_compute.hpp"
 #include "shared/compute/storage_write_mask_spirv.hpp"
 #include "shared/diagnostics/trip_bound_witness.hpp"
+#include "shared/diagnostics/compute_present_probe.hpp"
 #include "shared/compute/compute_authority_live_census.hpp"
 #include "shared/compute/compute_image_borrow_census.hpp"
 #include "shared/compute/compute_timing_selector.hpp"
@@ -6488,6 +6489,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     if (override_applies || !write_masks.words.empty()) known_fill = nullptr;
     static const bool cached_fill_enabled = std::getenv("PROSPER_NO_CACHED_COMPUTE_FILL") == nullptr;
     const bool trace = trace_compute_item(item);
+    static const bool probe_requested = std::getenv("PROSPER_COMPUTE_PRESENT_PROBE") != nullptr;
+    const bool probe_compute = probe_requested &&
+        prosper::frontend::compute_present_probe().should_scan(item.code_addr);
     const bool perf_capture_timing =
         prosper::perf::interactive_performance_capture().detailed_timing_active();
     // Per-resource table dump for a traced program. The writeback line names a BINDING and the
@@ -12434,7 +12438,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             prosper::host::guest_write_watch_notify_host_write(
                 reinterpret_cast<uintptr_t>(destination), bi.guest_bytes);
             const auto watch_done = ComputeClock::now();
-            if (trace) {
+            if (trace || probe_compute) {
                 if (bi.exact_storage_bytes()) {
                     for (size_t t = 0; t < texels; ++t) {
                         const uint8_t* texel = native_texels + t * guest_texel;
@@ -12944,6 +12948,46 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         ok = true;
         phase_writeback = ComputeClock::now();
     } while (false);
+    // This observation is published only after the complete dispatch, including every
+    // architectural image writeback, succeeded. The event carries no guest pointer or Vk handle.
+    if (ok && probe_compute) {
+        for (const BoundImage& image : images) {
+            if (!prosper::frontend::compute_present_probe().publishable()) break;
+            if (!image.storage_writeback || image.alias_of != SIZE_MAX || !image.resource ||
+                !image.nonzero_channels) continue;
+            const uint8_t* guest = resource_bytes_for(image.resource, image.guest_bytes);
+            uint64_t guest_nonzero = 0;
+            for (size_t byte = 0; guest && byte < image.guest_bytes; ++byte)
+                guest_nonzero += guest[byte] != 0;
+            if (!guest_nonzero) {
+                std::fprintf(stderr, "[compute-present] producer submit=%llu dispatch=%llu "
+                                     "addr=0x%llx mapped_nonzero_ch=%llu guest_nonzero=0 "
+                                     "event=refused\n",
+                             (unsigned long long)item.submit_no,
+                             (unsigned long long)item.dispatch_index,
+                             (unsigned long long)image.resource->gpu_addr,
+                             (unsigned long long)image.nonzero_channels);
+                continue;
+            }
+            const auto event = prosper::frontend::compute_present_probe().publish({
+                0, item.code_addr, item.submit_no, item.dispatch_index, item.command_order,
+                image.resource->gpu_addr, image.guest_bytes, image.nonzero_channels,
+                guest_nonzero, prosper::frontend::compute_probe_now_ms(), 0});
+            if (event)
+                std::fprintf(stderr, "[compute-present] event=%llu producer submit=%llu "
+                                     "dispatch=%llu order-local=%llu code=0x%llx addr=0x%llx "
+                                     "bytes=%llu nonzero-ch=%llu guest_nonzero=%llu\n",
+                             (unsigned long long)event->id,
+                             (unsigned long long)event->submit,
+                             (unsigned long long)event->dispatch,
+                             (unsigned long long)event->command_order,
+                             (unsigned long long)event->code,
+                             (unsigned long long)event->address,
+                             (unsigned long long)event->bytes,
+                             (unsigned long long)event->nonzero_channels,
+                             (unsigned long long)event->guest_nonzero_bytes);
+        }
+    }
     // Where the phase chain stopped: equal to phase_writeback (to the clock's resolution) on both
     // success paths, and the end of the truncated phase on every early break.
     const auto phase_loop_exit = ComputeClock::now();

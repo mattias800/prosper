@@ -1523,6 +1523,12 @@ if(TARGET prosper_core)
   target_include_directories(test_kena_menu_trace_policy PRIVATE frontends)
   add_test(NAME kena_menu_trace_policy COMMAND test_kena_menu_trace_policy)
 
+  add_executable(test_compute_present_probe
+                 frontends/shared/tests/test_compute_present_probe.cpp)
+  target_include_directories(test_compute_present_probe PRIVATE frontends)
+  target_link_libraries(test_compute_present_probe PRIVATE Threads::Threads)
+  add_test(NAME compute_present_probe COMMAND test_compute_present_probe)
+
   # The optional retained-target selector bounds readback without changing the legacy broad
   # census. Malformed and oversized lists must decline every target rather than read them all.
   add_executable(test_persistent_readback_filter
