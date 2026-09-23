@@ -12,6 +12,7 @@
 #include "shared/diagnostics/diagnostic_window.hpp"
 
 #include <cstdio>
+#include <initializer_list>
 
 static int fails = 0;
 #define CHECK(cond, msg) do { if (!(cond)) { std::printf("  [FAIL] %s\n", msg); ++fails; } \
@@ -20,6 +21,8 @@ static int fails = 0;
 int main() {
     using prosper::frontend::DiagnosticWindow;
     using prosper::frontend::parse_diagnostic_window;
+    using prosper::frontend::parse_diagnostic_readback_sampling;
+    using prosper::frontend::parse_diagnostic_program_filter;
 
     // --- The ordinal form must be unchanged for every reachable value ---------------------------
     {
@@ -90,6 +93,39 @@ int main() {
         DiagnosticWindow w{parse_diagnostic_window("18446744073709551615")};
         CHECK(w.contains(UINT64_MAX, 0) && !w.contains(0, 0),
               "an ordinal at the top of the range does not wrap the window open");
+    }
+
+    {
+        const auto sampling = parse_diagnostic_readback_sampling("96:8");
+        CHECK(sampling.valid && sampling.span == 96 && sampling.stride == 8,
+              "bounded persistent-readback sampling parses span and stride");
+        DiagnosticWindow w{parse_diagnostic_window("ms:32000", sampling.span)};
+        CHECK(!w.contains_sample(100, 31999, sampling.stride) &&
+              w.contains_sample(101, 32000, sampling.stride) &&
+              !w.contains_sample(102, 32001, sampling.stride) &&
+              w.contains_sample(109, 32100, sampling.stride) &&
+              !w.contains_sample(197, 34000, sampling.stride),
+              "sampled time window latches, strides and closes");
+    }
+    CHECK(parse_diagnostic_readback_sampling(nullptr).valid &&
+          parse_diagnostic_readback_sampling(nullptr).span == 3,
+          "absent sampling modifier preserves the three-callback default");
+    for (const char* invalid : {"", "96", "0:1", "257:16", "96:0", "96:97",
+                                "96:5", "96:8junk", "96:8:1", "999999999999:1"})
+        CHECK(!parse_diagnostic_readback_sampling(invalid).valid,
+              "malformed or excessive readback sampling refuses");
+    {
+        const auto filter = parse_diagnostic_program_filter("0x300a4c0000");
+        CHECK(filter.requested && filter.armed && filter.address == 0x300a4c0000ull,
+              "program filter accepts one exact nonzero hex address");
+        CHECK(!parse_diagnostic_program_filter(nullptr).requested,
+              "absent program filter remains passive");
+    }
+    for (const char* invalid : {"", "300a4c0000", "0x", "0x0", "0x123junk",
+                                "0xfffffffffffffffff"}) {
+        const auto filter = parse_diagnostic_program_filter(invalid);
+        CHECK(filter.requested && !filter.armed,
+              "malformed program selector refuses without matching address zero");
     }
 
     std::printf(fails ? "test_diagnostic_window: %d FAILURE(S)\n" : "test_diagnostic_window: all ok\n",

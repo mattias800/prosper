@@ -1,9 +1,12 @@
 // diagnostic_window.hpp — selecting a short renderer-callback census window by ORDINAL or by TIME.
 #pragma once
 
+#include <charconv>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <string_view>
 
 namespace prosper::frontend {
 
@@ -34,6 +37,53 @@ struct DiagnosticWindowSpec {
     uint64_t value = 0;        // ordinal, or milliseconds since the first callback
     uint32_t span = 3;         // how many consecutive callbacks the window admits
 };
+
+// Extra persistent-readback coverage is explicit and capped at sixteen sampled callbacks over at most
+// 256 callbacks. A requested but malformed modifier refuses the census rather than falling back
+// to a deceptively valid three-callback sample.
+struct DiagnosticReadbackSampling {
+    bool valid = true;
+    uint32_t span = 3;
+    uint32_t stride = 1;
+};
+
+inline DiagnosticReadbackSampling parse_diagnostic_readback_sampling(const char* value) {
+    if (!value) return {};
+    const std::string_view spec(value);
+    const size_t colon = spec.find(':');
+    const auto parse_decimal = [](std::string_view text, uint32_t& out) {
+        if (text.empty()) return false;
+        const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), out);
+        return error == std::errc{} && end == text.data() + text.size();
+    };
+    DiagnosticReadbackSampling result;
+    if (colon == std::string_view::npos || spec.find(':', colon + 1) != std::string_view::npos ||
+        !parse_decimal(spec.substr(0, colon), result.span) ||
+        !parse_decimal(spec.substr(colon + 1), result.stride) ||
+        !result.span || result.span > 256 || !result.stride || result.stride > result.span ||
+        1u + (result.span - 1u) / result.stride > 16u)
+        return {false, 0, 0};
+    return result;
+}
+
+struct DiagnosticProgramFilter {
+    bool requested = false;
+    bool armed = false;
+    uint64_t address = 0;
+};
+
+inline DiagnosticProgramFilter parse_diagnostic_program_filter(const char* value) {
+    if (!value) return {};
+    const std::string_view spec(value);
+    if (spec.size() < 3 || spec.substr(0, 2) != "0x") return {true, false, 0};
+    const auto digits = spec.substr(2);
+    uint64_t address = 0;
+    const auto [end, error] = std::from_chars(
+        digits.data(), digits.data() + digits.size(), address, 16);
+    if (error != std::errc{} || end != digits.data() + digits.size() || !address)
+        return {true, false, 0};
+    return {true, true, address};
+}
 
 // Parse one environment value. A bare number keeps `strtoull(text, nullptr, 0)`'s historical
 // behaviour EXACTLY, including its treatment of junk as 0 — this switch has been aimed at ordinal 0
@@ -75,6 +125,12 @@ public:
             start_ordinal_ = ordinal;
         }
         return ordinal >= start_ordinal_ && ordinal - start_ordinal_ < spec_.span;
+    }
+
+    bool contains_sample(uint64_t ordinal, uint64_t elapsed_ms, uint32_t stride) {
+        if (!stride || !contains(ordinal, elapsed_ms)) return false;
+        const uint64_t start = spec_.by_time ? start_ordinal_ : spec_.value;
+        return (ordinal - start) % stride == 0;
     }
 
     const DiagnosticWindowSpec& spec() const { return spec_; }
