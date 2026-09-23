@@ -1542,27 +1542,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
     static prosper::frontend::DiagnosticWindow g_persist_window{
         prosper::frontend::parse_diagnostic_window(
             PROSPER_ENV_VALUE("PROSPER_DUMP_PERSISTENT"), g_persist_sampling.span)};
-    struct PersistentSampleCensus {
-        bool requested = false;
-        bool armed = false;
-        uint64_t selected_callbacks = 0;
-        uint64_t successful_targets = 0;
-        ~PersistentSampleCensus() {
-            if (!requested) return;
-            fprintf(stderr, "[persist] sample summary selected_callbacks=%llu "
-                            "successful_targets=%llu status=%s\n",
-                    (unsigned long long)selected_callbacks,
-                    (unsigned long long)successful_targets,
-                    !armed ? "refused" : !selected_callbacks ? "window-miss"
-                    : !successful_targets ? "target-miss-or-readback-failed" : "observed");
-        }
-    };
-    static PersistentSampleCensus g_persist_sample_census{
-        PROSPER_ENV_VALUE("PROSPER_DUMP_PERSISTENT_SAMPLE") != nullptr,
-        g_persist_sampling.valid};
     struct BindProgramTrace {
         prosper::frontend::DiagnosticProgramFilter filter;
-        uint64_t matching_draws = 0;
         uint64_t observed_bindings = 0;
         explicit BindProgramTrace(const char* value)
             : filter(prosper::frontend::parse_diagnostic_program_filter(value)) {
@@ -1571,17 +1552,6 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 "expected one 0x-prefixed nonzero hex address, max 8192 rows\n",
                         filter.armed ? "armed" : "refused",
                         (unsigned long long)filter.address);
-        }
-        ~BindProgramTrace() {
-            if (filter.requested)
-                fprintf(stderr, "[bind-program] summary program=0x%llx "
-                                "matching_draws=%llu observed_bindings=%llu "
-                                "status=%s\n",
-                        (unsigned long long)filter.address,
-                        (unsigned long long)matching_draws,
-                        (unsigned long long)observed_bindings,
-                        !filter.armed ? "refused" : !matching_draws ? "selector-miss"
-                        : !observed_bindings ? "matched-draw-no-reflected-texture" : "observed");
         }
     };
     static BindProgramTrace g_bind_program_trace{
@@ -3286,9 +3256,6 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                const prosper::gpu::ShaderResourceTable* vrt,
                                const prosper::gpu::ShaderResourceTable* prt,
                                prosper::test::BackendSubmissionBatch* producer_batch) {
-              if (g_bind_program_trace.filter.armed &&
-                  draw.fs_guest_addr == g_bind_program_trace.filter.address)
-                  ++g_bind_program_trace.matching_draws;
               BuiltFrameResources built;
               const size_t candidate_resources =
                   (vrt ? vrt->resources.size() : 0) + (prt ? prt->resources.size() : 0);
@@ -11278,7 +11245,6 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     if (g_persist_sampling.valid &&
                         g_persist_window.contains_sample(
                             sub, diagnostic_elapsed_ms(), g_persist_sampling.stride)) {
-                        ++g_persist_sample_census.selected_callbacks;
                         const char* dd = getenv("PROSPER_FRAME_DIR");
                         prosper::frontend::PersistentReadbackBudget selected_readback_budget;
                         fprintf(stderr, "[persist] submit=%llu render-submit=%d cb=%llu "
@@ -11337,7 +11303,6 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                             (unsigned long long)expected);
                                 continue;
                             }
-                            ++g_persist_sample_census.successful_targets;
                             const std::vector<uint8_t> rgba = inspection_rgba8(px, s.w, s.h, fmt);
                             size_t rgbnz = 0;
                             for (size_t p = 0; p + 3 < rgba.size(); p += 4)

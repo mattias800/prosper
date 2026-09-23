@@ -107,11 +107,20 @@ int main() {
               !w.contains_sample(197, 34000, sampling.stride),
               "sampled time window latches, strides and closes");
     }
+    {
+        const auto sampling = parse_diagnostic_readback_sampling("64:16");
+        DiagnosticWindow w{parse_diagnostic_window("1000", sampling.span)};
+        unsigned selected = 0;
+        for (uint64_t ordinal = 990; ordinal < 1070; ++ordinal)
+            selected += w.contains_sample(ordinal, 0, sampling.stride);
+        CHECK(sampling.valid && selected == 4,
+              "four-sample ordinal window admits exactly four selected callbacks");
+    }
     CHECK(parse_diagnostic_readback_sampling(nullptr).valid &&
           parse_diagnostic_readback_sampling(nullptr).span == 3,
           "absent sampling modifier preserves the three-callback default");
     for (const char* invalid : {"", "96", "0:1", "257:16", "96:0", "96:97",
-                                "96:5", "96:8junk", "96:8:1", "999999999999:1"})
+                                "33:2", "96:5", "96:8junk", "96:8:1", "999999999999:1"})
         CHECK(!parse_diagnostic_readback_sampling(invalid).valid,
               "malformed or excessive readback sampling refuses");
     {
