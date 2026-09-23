@@ -7,12 +7,19 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <deque>
+#include <new>
+#include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace prosper::frontend {
 
 enum class FrameGrabSource { None, GpuScanout, GpuCpuFallback, Cpu };
+enum class FrameGrabNoBmpReason {
+    None, TargetSkipped, CandidateOverflow, NeverPresented, UnresolvedAtShutdown
+};
 
 struct FrameGrabScreenshotEvidence {
     bool bmp_written = false;
@@ -24,6 +31,78 @@ struct FrameGrabScreenshotEvidence {
     ProducerSource producer;
     uint64_t armed_present = 0;
     uint64_t written_present = 0;  // timing only; must never select the bundle frame
+    FrameGrabNoBmpReason no_bmp_reason = FrameGrabNoBmpReason::None;
+};
+
+struct FrameGrabGpuCandidate {
+    FrameGrabScreenshotEvidence source;
+    uint32_t width = 0, height = 0;
+    std::vector<uint8_t> pixels;
+};
+
+// A selected front may become visible before the guest flip thread announces the F9 window's
+// closing token. Retain only successfully host-presented leases while that token is pending; once
+// it arrives, the app can write the exact candidate even if the staging buffer has been reused.
+// Overflow loses evidence, never guesses a replacement frame. Both limits are explicit because a
+// 4K candidate is tens of MiB and a multi-frame bundle can hold the window open for 240 flips.
+class FrameGrabCandidateRing {
+public:
+    explicit FrameGrabCandidateRing(size_t max_frames = 4,
+                                    size_t max_bytes = 128u * 1024u * 1024u)
+        : max_frames_(max_frames), max_bytes_(max_bytes) {}
+
+    void note_host_presented(uint64_t source_flip) {
+        highest_presented_flip_ = std::max(highest_presented_flip_, source_flip);
+    }
+
+    bool stage(FrameGrabScreenshotEvidence source, const uint8_t* rgba,
+               uint32_t width, uint32_t height) {
+        if (!source.host_presented || source.source != FrameGrabSource::GpuScanout ||
+            !source.source_seq || !rgba || !width || !height) return false;
+        note_host_presented(source.source_seq);
+        const uint64_t pixels = uint64_t{width} * height;
+        if (!max_frames_ || pixels > max_bytes_ / 4u) { overflowed_ = true; return false; }
+        const size_t bytes = static_cast<size_t>(pixels * 4u);
+        // Repeated representations of one flip cannot consume the bounded ring twice.
+        for (const auto& candidate : candidates_)
+            if (candidate.source.source_seq == source.source_seq) return true;
+        while (!candidates_.empty() &&
+               (candidates_.size() >= max_frames_ || held_bytes_ > max_bytes_ - bytes)) {
+            held_bytes_ -= candidates_.front().pixels.size();
+            candidates_.pop_front();
+            overflowed_ = true;
+        }
+        FrameGrabGpuCandidate candidate;
+        candidate.source = source;
+        candidate.width = width;
+        candidate.height = height;
+        try { candidate.pixels.assign(rgba, rgba + bytes); }
+        catch (const std::bad_alloc&) { overflowed_ = true; return false; }
+        try { candidates_.push_back(std::move(candidate)); }
+        catch (const std::bad_alloc&) { overflowed_ = true; return false; }
+        held_bytes_ += bytes;
+        return true;
+    }
+
+    std::optional<FrameGrabGpuCandidate> take_exact(uint64_t source_flip) {
+        for (auto it = candidates_.begin(); it != candidates_.end(); ++it) {
+            if (it->source.source_seq != source_flip) continue;
+            FrameGrabGpuCandidate candidate = std::move(*it);
+            held_bytes_ -= candidate.pixels.size();
+            candidates_.erase(it);
+            return candidate;
+        }
+        return std::nullopt;
+    }
+    uint64_t highest_presented_flip() const { return highest_presented_flip_; }
+    bool overflowed() const { return overflowed_; }
+    void clear() { candidates_.clear(); held_bytes_ = 0; highest_presented_flip_ = 0; overflowed_ = false; }
+
+private:
+    size_t max_frames_, max_bytes_, held_bytes_ = 0;
+    uint64_t highest_presented_flip_ = 0;
+    bool overflowed_ = false;
+    std::deque<FrameGrabGpuCandidate> candidates_;
 };
 
 struct FrameGrabBundleEvidence {
@@ -56,6 +135,32 @@ inline FrameGrabTargetDecision frame_grab_target_decision(uint64_t target_source
         observed_source_flip < target_source_flip) return FrameGrabTargetDecision::Wait;
     return observed_source_flip == target_source_flip ? FrameGrabTargetDecision::Capture
                                                       : FrameGrabTargetDecision::Missed;
+}
+
+inline bool frame_grab_needs_gpu_readback(bool screenshot_pending, bool owned_f9,
+                                          bool closure_known, FrameGrabTargetDecision decision) {
+    // The source image can be selected and host-presented before the guest flip thread closes the
+    // F9 window. Staging while closure is unknown is what lets the bounded ring recover that race.
+    return screenshot_pending &&
+           (!owned_f9 || !closure_known || decision == FrameGrabTargetDecision::Capture);
+}
+
+enum class FrameGrabCandidateResolutionKind { Wait, Candidate, Missed };
+struct FrameGrabCandidateResolution {
+    FrameGrabCandidateResolutionKind kind = FrameGrabCandidateResolutionKind::Wait;
+    std::optional<FrameGrabGpuCandidate> candidate;
+    uint64_t newest_shown_flip = 0;
+};
+
+inline FrameGrabCandidateResolution frame_grab_resolve_candidate(
+    FrameGrabCandidateRing& ring, uint64_t target_flip, uint64_t newest_shown_flip = 0) {
+    if (!target_flip) return {};
+    if (auto candidate = ring.take_exact(target_flip))
+        return {FrameGrabCandidateResolutionKind::Candidate, std::move(candidate), 0};
+    const uint64_t newest = std::max(newest_shown_flip, ring.highest_presented_flip());
+    if (newest > target_flip || (ring.overflowed() && newest >= target_flip))
+        return {FrameGrabCandidateResolutionKind::Missed, std::nullopt, newest};
+    return {};
 }
 
 inline FrameGrabMatch classify_frame_grab(const FrameGrabScreenshotEvidence& shot,
@@ -116,9 +221,15 @@ inline std::string frame_grab_screenshot_event(const FrameGrabScreenshotEvidence
     const char* source = shot.source == FrameGrabSource::GpuScanout ? "gpu_scanout" :
                          shot.source == FrameGrabSource::GpuCpuFallback ? "gpu_cpu_fallback" :
                          shot.source == FrameGrabSource::Cpu ? "cpu" : "none";
+    const char* reason = shot.no_bmp_reason == FrameGrabNoBmpReason::TargetSkipped ? "target_skipped" :
+                         shot.no_bmp_reason == FrameGrabNoBmpReason::CandidateOverflow ? "candidate_overflow" :
+                         shot.no_bmp_reason == FrameGrabNoBmpReason::NeverPresented ? "never_presented" :
+                         shot.no_bmp_reason == FrameGrabNoBmpReason::UnresolvedAtShutdown
+                             ? "unresolved_at_shutdown" : "none";
     return "{\"v\":1,\"event\":\"screenshot\",\"bmp_written\":" +
         std::string(shot.bmp_written ? "true" : "false") +
         ",\"host_presented\":" + (shot.host_presented ? "true" : "false") +
+        ",\"no_bmp_reason\":\"" + reason + "\"" +
         ",\"source\":\"" + source + "\",\"source_seq\":" + std::to_string(shot.source_seq) +
         ",\"target_source_flip\":" + std::to_string(shot.target_source_flip) +
         ",\"publication_id\":" + std::to_string(shot.publication_id) +
