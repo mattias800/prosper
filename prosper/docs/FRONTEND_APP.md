@@ -630,9 +630,18 @@ thread-local positive HLE mapping lookup can be disabled separately with
 When the `tables=` bucket is unexpectedly large, set `PROSPER_STAGE_FOLD_PROFILE=1`. It ranks the
 shader address and user-SGPR base pairs responsible for scalar table folding, including average and
 maximum time, decoded instructions, dynamic fetches, SRT uses, guest readability checks, and the
-decode/probe/interpreter split. It prints every 4096 folds by default; set
+decode/probe/interpreter split. Each thread prints its own window every 4096 folds by default; set
 `PROSPER_STAGE_FOLD_PROFILE_CALLS=<N>` to change that window. The profiler is intended for short
-diagnostic runs and takes no timing samples when disabled.
+diagnostic runs and takes no timing samples when disabled. Its aggregate `pcrel_*` fields isolate
+selected pixel-stage instruction copying, dispatch specialization setup, and local control-plan
+construction; `[stage-fold-pcrel]` ranks the busiest shader-address/user-base buckets by their
+combined preparation time. `targets` counts distinct selected PCs within a bucket and window,
+not distinct immutable shader versions: guest code at one address can change. The specialization
+time includes copying supplied dispatch metadata or analyzing it when the caller did not supply
+it. Profiling is intrusive; these absolute milliseconds are not an uninstrumented cost estimate.
+These preparation costs are already part of the reported
+`body` residual and must not be added to it. A `thread` tag identifies independent windows;
+sum matching windows explicitly before comparing against a whole-process measurement.
 
 Transient Vulkan memory uses a bounded, exact-requirements pool because every backend call waits for its
 fence before cleanup. The optional backend timing windows include `memory_pool` hits, misses, cached allocation count/bytes,
