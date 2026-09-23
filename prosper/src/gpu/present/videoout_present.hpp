@@ -32,6 +32,20 @@ struct VideoOutBufferSnapshot {
     uint32_t tiling_mode = 0;
 };
 
+// A GPU blit may outlive the lock-coherent snapshot that selected its source. A later flip or
+// unregister/re-register must not let that copy retain certified producer lineage under the old
+// selected-front token. This compares identity, not pixel contents.
+constexpr bool videoout_same_front_identity(const VideoOutBufferSnapshot& expected,
+                                            const VideoOutBufferSnapshot& current) {
+    return expected.address && expected.generation && expected.source_flip_seq &&
+           expected.address == current.address &&
+           expected.generation == current.generation &&
+           expected.source_flip_seq == current.source_flip_seq &&
+           expected.buffer_index == current.buffer_index &&
+           expected.width == current.width && expected.height == current.height &&
+           expected.pixel_format == current.pixel_format;
+}
+
 // Front-buffer selection and invalidation live under the registry mutex. A generation distinguishes
 // a newly registered buffer from an older registration that occupied the same numeric slot.
 bool videoout_select_buffer(int buffer_index, VideoOutBufferSnapshot& out,

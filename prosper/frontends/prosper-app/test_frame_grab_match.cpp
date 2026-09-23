@@ -134,6 +134,15 @@ int main() {
     CHECK(classify_frame_grab(shot, bundle) == FrameGrabMatch::Incomplete,
           "a failed BMP write cannot claim a pair");
     shot.bmp_written = true;
+    FrameGrabScreenshotEvidence unpresented;
+    unpresented.armed_present = 41;
+    unpresented.target_source_flip = 42;
+    CHECK(classify_frame_grab(unpresented, bundle) == FrameGrabMatch::Incomplete &&
+          frame_grab_screenshot_event(unpresented).find("\"source\":\"none\"") !=
+              std::string::npos &&
+          frame_grab_screenshot_event(unpresented).find("\"bmp_written\":false") !=
+              std::string::npos,
+          "shutdown's empty BMP reservation reports no source and no completed pair");
 
     const auto dir = prosper_test::test_scratch_dir() / "frame_grab_match_test";
     std::error_code ec;

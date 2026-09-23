@@ -11386,7 +11386,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             published_gpu = prosper::frontend::present_blit_publish(
                                 tgt->image, tgt->layout, fmt, rit->second.w, rit->second.h,
                                 front_flip,
-                                prosper::test::persistent_color_producer_source(*tgt));
+                                prosper::test::persistent_color_producer_source(*tgt),
+                                &front_snapshot);
                             if (published_gpu) last_gpu_publish_flip = front_flip;
                         }
                     }

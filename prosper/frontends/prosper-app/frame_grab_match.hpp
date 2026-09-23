@@ -12,12 +12,12 @@
 
 namespace prosper::frontend {
 
-enum class FrameGrabSource { GpuScanout, GpuCpuFallback, Cpu };
+enum class FrameGrabSource { None, GpuScanout, GpuCpuFallback, Cpu };
 
 struct FrameGrabScreenshotEvidence {
     bool bmp_written = false;
     bool host_presented = false;
-    FrameGrabSource source = FrameGrabSource::Cpu;
+    FrameGrabSource source = FrameGrabSource::None;
     uint64_t source_seq = 0;       // leased selected-front flip token, never a sampled global count
     uint64_t target_source_flip = 0; // synchronous closing token of this owned bundle, if observed
     uint64_t publication_id = 0;  // GPU scanout handoff or CPU publication, not producer work
@@ -114,7 +114,8 @@ inline const char* frame_grab_match_name(FrameGrabMatch match) {
 
 inline std::string frame_grab_screenshot_event(const FrameGrabScreenshotEvidence& shot) {
     const char* source = shot.source == FrameGrabSource::GpuScanout ? "gpu_scanout" :
-                         shot.source == FrameGrabSource::GpuCpuFallback ? "gpu_cpu_fallback" : "cpu";
+                         shot.source == FrameGrabSource::GpuCpuFallback ? "gpu_cpu_fallback" :
+                         shot.source == FrameGrabSource::Cpu ? "cpu" : "none";
     return "{\"v\":1,\"event\":\"screenshot\",\"bmp_written\":" +
         std::string(shot.bmp_written ? "true" : "false") +
         ",\"host_presented\":" + (shot.host_presented ? "true" : "false") +

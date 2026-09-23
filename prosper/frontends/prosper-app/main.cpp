@@ -3397,6 +3397,21 @@ int main(int argc, char** argv) {
     // Completed F9 jobs own all their bytes. Drain them before _Exit skips destructors; an
     // unfinished guest capture is cancelled explicitly rather than written as a complete frame.
     prosper::gpu::shutdown_interactive_capture_bundle();
+    if (!pendingGrabScreenshot.empty() && pendingGrabReserved && !pendingGrabBundlePath.empty()) {
+        // No successful host presentation supplied this press with pixels. Keep the reserved BMP
+        // untouched and state that fact in its owned sidecar; a later bundle outcome must never
+        // turn an empty screenshot reservation into an apparent matched pair.
+        prosper::frontend::FrameGrabScreenshotEvidence incomplete;
+        incomplete.armed_present = pendingGrabGuestPresent;
+        incomplete.written_present = gpu::present_count();
+        (void)prosper::gpu::interactive_grab_closed_source_flip(
+            pendingGrabBundlePath, incomplete.target_source_flip);
+        recordGrabScreenshot(pendingGrabBundlePath, incomplete);
+        std::fprintf(stderr, "[grab] no successfully presented screenshot for %s; "
+                             "empty reservation and incomplete sidecar retained\n",
+                     pendingGrabScreenshot.c_str());
+        clearPendingGrabScreenshot();
+    }
     reportGrabOutcome();
 
     // Unlike its F8 sibling below, this CLOSES rather than cancels. RenderDoc decides for itself

@@ -541,6 +541,20 @@ int main() {
               selected_front.address == (uint64_t)(uintptr_t)fb2 &&
               selected_front.source_flip_seq == first_flip_token,
           "selected front holds its exact HLE flip token with its buffer address");
+    CHECK(videoout_same_front_identity(selected_front, selected_front),
+          "a current selected-front snapshot preserves its own exact identity");
+    VideoOutBufferSnapshot stale_identity = selected_front;
+    ++stale_identity.generation;
+    CHECK(!videoout_same_front_identity(stale_identity, selected_front),
+          "same slot and address after re-registration cannot retain old lineage");
+    stale_identity = selected_front;
+    ++stale_identity.source_flip_seq;
+    CHECK(!videoout_same_front_identity(stale_identity, selected_front),
+          "an interleaved later flip cannot inherit the earlier front's lineage");
+    stale_identity = selected_front;
+    ++stale_identity.address;
+    CHECK(!videoout_same_front_identity(stale_identity, selected_front),
+          "same flip token paired with a different address cannot certify source pixels");
     VideoOutBufferSnapshot refused_front;
     CHECK(!videoout_select_buffer(-1, refused_front, first_flip_token + 1000) &&
               videoout_front_snapshot(refused_front) &&
