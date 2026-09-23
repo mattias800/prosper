@@ -1,0 +1,8 @@
+# Outer Wilds (PPSA08102): Wake Up prompt to the visible first-person scene.
+# The first two presses reach the centered Square Wake Up prompt by about 100 s.
+# On b77cffc83, Square cleared it and native captures showed the wooded scene
+# and Look Around / Move tutorial prompts through the 180 s cap.
+# Use a new isolated save root; do not reuse the first probe's save.
+50-50.5:cross
+70-70.5:cross
+110-111:square
