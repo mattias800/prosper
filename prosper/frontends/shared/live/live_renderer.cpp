@@ -1535,6 +1535,24 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     spec.armed ? value : "expected ms:0..120000");
         return spec;
     }();
+    static const auto g_kena_guest_peeks = [] {
+        std::vector<prosper::frontend::KenaGuestPeekRange> ranges;
+        const char* value = PROSPER_ENV_VALUE("PROSPER_KENA_MENU_GUEST_PEEK");
+        if (!value) return ranges;
+        if (!g_kena_menu_trace.armed) {
+            fprintf(stderr, "[kena-menu] guest peek refused: menu trace is not armed\n");
+            return ranges;
+        }
+        if (!prosper::frontend::parse_kena_guest_peek_ranges(value, ranges)) {
+            fprintf(stderr, "[kena-menu] guest peek refused: expected up to two "
+                            "0xADDRESS:0xBYTES ranges, each <=64 MiB, total <=96 MiB\n");
+            return ranges;
+        }
+        fprintf(stderr, "[kena-menu] guest peek armed on %zu bounded range(s); "
+                        "one-time CPU scan may race guest writers and is not a GPU snapshot\n",
+                ranges.size());
+        return ranges;
+    }();
     static const auto g_persist_filter = [] {
         const char* spec = PROSPER_ENV_VALUE("PROSPER_DUMP_PERSISTENT_ADDRS");
         auto filter = prosper::frontend::parse_persistent_readback_filter(spec);
@@ -2287,6 +2305,34 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             const uint64_t kena_trace_id = kena_trace_this_callback
                 ? g_pass_log_submit.load(std::memory_order_relaxed) + 1 : 0;
             if (kena_trace_this_callback) {
+                for (const auto& range : g_kena_guest_peeks) {
+                    if (!prosper::gpu::guest_readable(range.address, range.bytes)) {
+                        fprintf(stderr, "[kena-menu] trace=%llu guest addr=0x%llx "
+                                        "bytes=%u status=unreadable\n",
+                                (unsigned long long)kena_trace_id,
+                                (unsigned long long)range.address, range.bytes);
+                        continue;
+                    }
+                    const auto* bytes = reinterpret_cast<const uint8_t*>(
+                        static_cast<uintptr_t>(range.address));
+                    size_t nonzero = 0;
+                    size_t first_nonzero = range.bytes;
+                    uint64_t hash = 1469598103934665603ull;
+                    for (size_t i = 0; i < range.bytes; ++i) {
+                        const uint8_t one = bytes[i];
+                        if (one && first_nonzero == range.bytes) first_nonzero = i;
+                        nonzero += one != 0;
+                        hash = (hash ^ one) * 1099511628211ull;
+                    }
+                    fprintf(stderr, "[kena-menu] trace=%llu guest addr=0x%llx "
+                                    "bytes=%u status=readable nonzero=%zu first=%s "
+                                    "first_offset=%zu fnv64=%016llx\n",
+                            (unsigned long long)kena_trace_id,
+                            (unsigned long long)range.address, range.bytes, nonzero,
+                            first_nonzero == range.bytes ? "none" : "present",
+                            first_nonzero == range.bytes ? 0 : first_nonzero,
+                            (unsigned long long)hash);
+                }
                 g_kena_trace_fired = true;
                 fprintf(stderr, "[kena-menu] trace=%llu callback armed render_submit=%d\n",
                         (unsigned long long)kena_trace_id, g_this_submit);
