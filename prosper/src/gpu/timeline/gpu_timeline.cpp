@@ -2156,6 +2156,13 @@ struct InteractiveFrameBundle {
                                  // multi-frame window. Raise PROSPER_CAPTURE_FRAMES only to grab an
                                  // animation over several frames; each extra frame is a full heavy capture.
     uint32_t frames_seen = 0;    // presents observed while capturing
+    uint64_t window_open_present = 0;
+    std::vector<uint64_t> frame_end_presents;
+    uint64_t window_open_source_flip = 0;
+    std::vector<uint64_t> frame_end_source_flips;
+    std::vector<uint64_t> frame_end_submit_counts;
+    std::string closed_path;       // last window's owned request, never inferred from a global count
+    uint64_t closed_source_flip = 0; // published before its asynchronous writer begins
     uint64_t submits = 0;
     GpuCaptureBundle bundle;
 };
@@ -2199,6 +2206,8 @@ InteractiveGrabRequest request_interactive_capture_bundle(const std::string& pat
     }
     std::string replaced = std::move(b.armed_path);
     b.armed_path = path;
+    b.closed_path.clear();
+    b.closed_source_flip = 0;
     b.arm_delay_presents = delay_presents;
     if (max_mb)
         b.max_unique_bytes = static_cast<uint64_t>(std::clamp<uint32_t>(
@@ -3080,13 +3089,17 @@ void interactive_frame_bundle_on_submit(const GpuState& state, uint64_t submit_n
 }
 
 // Called per present: opens the window, then transfers its owned payload to the writer at closure.
-void interactive_frame_bundle_on_present() {
+void interactive_frame_bundle_on_present(uint64_t present_count,
+                                         uint64_t source_flip_seq) {
     if (!g_interactive_frame_active.load(std::memory_order_acquire)) return;
     InteractiveFrameBundle& b = interactive_frame_bundle();
     {
         std::lock_guard<std::mutex> lk(b.mx);
         if (b.capturing) {
             ++b.frames_seen;
+            b.frame_end_presents.push_back(present_count);
+            b.frame_end_source_flips.push_back(source_flip_seq);
+            b.frame_end_submit_counts.push_back(b.bundle.submits.size());
             if (!b.bundle.submits.empty())
                 std::fprintf(stderr,
                              "[grab] frame-bundle: frame %u ended at submit %llu\n",
@@ -3119,9 +3132,22 @@ void interactive_frame_bundle_on_present() {
                 (!wait_for_submits || b.submits > 0 ||
                  b.frames_seen >= kNoSubmitPresentCeiling);
             if (b.failed || window_complete) {   // window complete (or aborted)
+                // The app must choose pixels while this selected-front image is still available.
+                // Waiting for the writer outcome selects a later picture on slow bundles. The
+                // path is part of the signal: a second request cannot inherit this target.
+                b.closed_path = b.current_path;
+                b.closed_source_flip = source_flip_seq;
                 InteractiveFrameBundle::WriteJob work;
                 work.outcome.bundle_path = b.current_path;
                 work.outcome.max_unique_bytes = b.max_unique_bytes;
+                work.outcome.opened_present = b.window_open_present;
+                work.outcome.closed_presents = std::move(b.frame_end_presents);
+                work.outcome.opened_source_flip = b.window_open_source_flip;
+                work.outcome.closed_source_flips = std::move(b.frame_end_source_flips);
+                work.outcome.closed_submit_counts = std::move(b.frame_end_submit_counts);
+                work.outcome.captured_submits.reserve(b.bundle.submits.size());
+                for (const GpuCaptureBundleSubmit& submit : b.bundle.submits)
+                    work.outcome.captured_submits.push_back(submit.submit_index);
                 work.hook = b.writer_hook;
                 if (b.failed) {
                     std::fprintf(stderr, "[grab] frame-bundle aborted (see error above); not written\n");
@@ -3155,6 +3181,9 @@ void interactive_frame_bundle_on_present() {
                 b.wake.notify_one();
                 b.capturing = false; b.current_path.clear();
                 b.submits = 0; b.frames_seen = 0; b.failed = false;
+                b.window_open_present = 0; b.frame_end_presents.clear();
+                b.window_open_source_flip = 0; b.frame_end_source_flips.clear();
+                b.frame_end_submit_counts.clear();
                 b.pending_failure_error.clear();
                 if (b.armed_path.empty()) g_interactive_frame_active.store(false, std::memory_order_release);
             }
@@ -3162,6 +3191,11 @@ void interactive_frame_bundle_on_present() {
             --b.arm_delay_presents;
         } else if (!b.armed_path.empty()) {
             b.capturing = true; b.current_path = std::move(b.armed_path); b.armed_path.clear();
+            b.window_open_present = present_count;
+            b.frame_end_presents.clear();
+            b.window_open_source_flip = source_flip_seq;
+            b.frame_end_source_flips.clear();
+            b.frame_end_submit_counts.clear();
             b.arm_delay_presents = 0;
             g_grab_window_open_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -3183,6 +3217,14 @@ bool take_interactive_grab_outcome(InteractiveGrabOutcome& out) {
     if (!b.outcome_pending) return false;
     out = std::move(b.outcome);
     b.outcome_pending = false;
+    return true;
+}
+
+bool interactive_grab_closed_source_flip(const std::string& bundle_path, uint64_t& source_flip) {
+    InteractiveFrameBundle& b = interactive_frame_bundle();
+    std::lock_guard<std::mutex> lk(b.mx);
+    if (bundle_path.empty() || bundle_path != b.closed_path || !b.closed_source_flip) return false;
+    source_flip = b.closed_source_flip;
     return true;
 }
 
@@ -3783,7 +3825,8 @@ void record_gpu_timeline_submit(const GpuState& state, uint64_t submit_no) {
 }
 
 void record_gpu_timeline_present(uint64_t present_count, int buffer_index, int64_t flip_arg,
-                                 uint32_t width, uint32_t height) {
+                                 uint32_t width, uint32_t height,
+                                 uint64_t source_flip_seq) {
     // Latched so an automatic gate that never fired can report what the run actually reached rather
     // than only what was asked for ("you asked for present 5000; the run reached 812"). Two relaxed
     // atomics against the cost of a whole flip.
@@ -3843,7 +3886,7 @@ void record_gpu_timeline_present(uint64_t present_count, int buffer_index, int64
                              "never report: %s\n", replaced.c_str());
         }
     }
-    interactive_frame_bundle_on_present();
+    interactive_frame_bundle_on_present(present_count, source_flip_seq);
     static const bool requested = [] {
         const char* path = std::getenv("PROSPER_GPU_TIMELINE");
         return path && *path;

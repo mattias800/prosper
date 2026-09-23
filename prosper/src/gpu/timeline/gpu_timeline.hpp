@@ -274,7 +274,8 @@ bool gpu_timeline_capture_after_compute_gate_armed();
 bool begin_gpu_timeline_submit(uint64_t submit_no);
 void record_gpu_timeline_submit(const GpuState& state, uint64_t submit_no);
 void record_gpu_timeline_present(uint64_t present_count, int buffer_index, int64_t flip_arg,
-                                 uint32_t width, uint32_t height);
+                                 uint32_t width, uint32_t height,
+                                 uint64_t source_flip_seq = 0);
 void flush_gpu_timeline();
 void close_gpu_timeline();
 
@@ -315,8 +316,21 @@ struct InteractiveGrabOutcome {
     std::string bundle_path;      // the .prgbundle that was, or would have been, written
     std::string error;            // empty when ok; otherwise the exact failure, budget numbers included
     uint64_t max_unique_bytes = 0;   // the budget in force, so a frontend can name the remedy
+    // Exact guest-present boundaries and submits actually serialized by this one window. The
+    // screenshot's source sequence and producer submit must be compared with these, not with the
+    // guest-present count at the later time its BMP write completes.
+    uint64_t opened_present = 0;
+    std::vector<uint64_t> closed_presents;
+    uint64_t opened_source_flip = 0;
+    std::vector<uint64_t> closed_source_flips;
+    std::vector<uint64_t> closed_submit_counts; // captured-submit prefix at each corresponding boundary
+    std::vector<uint64_t> captured_submits;
 };
 bool take_interactive_grab_outcome(InteractiveGrabOutcome& out);
+// The closing selected-front flip is published synchronously at the capture boundary, before
+// renderer scanout publication and independently of the (possibly slow) bundle writer. A caller
+// must name the exact owned request path; a later F9 cannot adopt an older window's target.
+bool interactive_grab_closed_source_flip(const std::string& bundle_path, uint64_t& source_flip);
 
 // Optional guest-stdout phase gate for the same whole-frame bundle. When
 // PROSPER_CAPTURE_BUNDLE_AFTER_GUEST_LOG is configured together with the existing

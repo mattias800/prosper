@@ -2777,7 +2777,8 @@ OrderedSubmitResult execute_ordered_items(const std::vector<SubmitOperation>& op
                                           const std::vector<GpuState::DmaCopy>& dma_copies,
                                           const LiveRenderFn& render,
                                           const LiveComputeFn& compute,
-                                          uint32_t width, uint32_t height);
+                                          uint32_t width, uint32_t height,
+                                          uint64_t source_submit = 0);
 OrderedSubmitResult execute_ordered_items(const std::vector<SubmitOperation>& operations,
                                           const std::vector<DrawItem>& draws,
                                           const std::vector<ComputeItem>& computes,
@@ -2803,6 +2804,7 @@ struct LiveRenderPhase {
     // The next ordered operation reads render-target bytes on the CPU. Persistent Vulkan targets
     // must synchronously read back this span instead of deferring their authoritative pixels.
     bool authoritative_readback = false;
+    uint64_t source_submit = 0; // zero for direct/replay callbacks without a live guest submit
 
     bool allows_deferred_scanout_readback() const {
         return !final_span && !authoritative_readback;

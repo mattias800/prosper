@@ -66,15 +66,15 @@ uint64_t present_frame_seq() { return g_frame_seq.load(std::memory_order_relaxed
 
 bool present_has_frame() { return g_have_frame.load(std::memory_order_acquire); }
 
-void present_flip(int buffer_index, int64_t flip_arg) {
+void present_flip(int buffer_index, int64_t flip_arg, uint64_t source_flip_seq) {
     // Only accept a buffer the game actually registered; otherwise leave the front unchanged (an
     // invalid index shouldn't corrupt scanout state).
     VideoOutBufferSnapshot selected;
-    if (!videoout_select_buffer(buffer_index, selected))
+    if (!videoout_select_buffer(buffer_index, selected, source_flip_seq))
         current_scanout(selected);
     uint64_t n = g_present_count.fetch_add(1, std::memory_order_relaxed);
     record_gpu_timeline_present(n + 1, buffer_index, flip_arg,
-                                selected.width, selected.height);
+                                selected.width, selected.height, source_flip_seq);
     // PROSPER_DUMP_SCANOUT=<dir>: dump the RAW guest display buffer the game just flipped (what the game
     // actually puts on screen — vs our execute_and_present composite render). First 8 flips + every 60th.
     // Written as raw w*h*4 bytes; convert offline. This reveals whether the game's real display holds the

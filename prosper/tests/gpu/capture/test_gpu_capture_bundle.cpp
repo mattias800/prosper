@@ -3,10 +3,12 @@
 #include "gpu/texture/tile.hpp"
 
 #include <chrono>
+#include <atomic>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <thread>
 #include "fixtures/test_scratch.h"
 #include "fixtures/interactive_capture_wait.h"
 
@@ -266,6 +268,12 @@ int main() {
     CHECK(wait_for_interactive_grab(first_empty) && !first_empty.ok &&
           first_empty.bundle_path.find("prosper_frame_grab_unit.prgbundle") != std::string::npos,
           "the first empty window reports its own failure before rearming");
+    CHECK(first_empty.opened_present == 2 && first_empty.closed_presents ==
+              std::vector<uint64_t>({3}) && first_empty.closed_submit_counts ==
+              std::vector<uint64_t>({0}) && first_empty.captured_submits.empty() &&
+              first_empty.opened_source_flip == 0 &&
+              first_empty.closed_source_flips == std::vector<uint64_t>({0}),
+          "an empty interrupted window reports boundaries but no fabricated source identity");
     (void)request_interactive_capture_bundle(prosper_test::test_scratch_file("prosper_frame_grab_unit2.prgbundle"));
     CHECK(interactive_capture_bundle_active(), "the grab can be re-armed for another press");
     record_gpu_timeline_present(4, 0, 0, 1920, 1080);
@@ -335,13 +343,20 @@ int main() {
             ++ds_snapshots; seeds = {ds_seed}; return true;
         });
     (void)request_interactive_capture_bundle(ds_bundle_path.string());
-    record_gpu_timeline_present(6, 0, 0, 1920, 1080);
+    record_gpu_timeline_present(6, 0, 0, 1920, 1080, 1006);
     GpuState empty_submit;
     record_gpu_timeline_submit(empty_submit, 77);
     record_gpu_timeline_submit(empty_submit, 78);
-    record_gpu_timeline_present(7, 0, 0, 1920, 1080);
+    record_gpu_timeline_present(7, 0, 0, 1920, 1080, 1007);
     InteractiveGrabOutcome ok_outcome;
     CHECK(wait_for_interactive_grab(ok_outcome), "owned DS bundle writer completes");
+    CHECK(ok_outcome.ok && ok_outcome.opened_present == 6 &&
+              ok_outcome.closed_presents == std::vector<uint64_t>({7}) &&
+              ok_outcome.opened_source_flip == 1006 &&
+              ok_outcome.closed_source_flips == std::vector<uint64_t>({1007}) &&
+              ok_outcome.closed_submit_counts == std::vector<uint64_t>({2}) &&
+              ok_outcome.captured_submits == std::vector<uint64_t>({77, 78}),
+          "successful writer reports exact selected-flip IDs and serialized submit prefix");
     GpuCaptureBundle ds_bundle;
     GpuCaptureFile ds_first, ds_second;
     CHECK(ds_snapshots == 1 && read_gpu_capture_bundle(ds_bundle_path.string(), ds_bundle, error) &&
@@ -364,6 +379,64 @@ int main() {
     }
     set_gpu_capture_ds_seed_snapshot_reader({});
     std::filesystem::remove(ds_bundle_path, ec);
+
+    // The app must pick the closing selected-front image before the async writer finishes. Hold
+    // that writer deliberately: polling its outcome would already be too late to choose pixels.
+    std::atomic<bool> release_writer{false};
+    CHECK(set_interactive_bundle_writer_hook_for_test([&] {
+        while (!release_writer.load(std::memory_order_acquire))
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }), "the closure test owns an idle interactive writer");
+    const auto closure_path = prosper_test::test_scratch_file("prosper_f9_closure.prgbundle");
+    (void)request_interactive_capture_bundle(closure_path);
+    uint64_t closed_flip = 0;
+    record_gpu_timeline_present(3001, 0, 0, 1920, 1080, 4001);
+    CHECK(!interactive_grab_closed_source_flip(closure_path, closed_flip),
+          "opening a one-frame window cannot nominate the opening image as its screenshot");
+    record_gpu_timeline_present(3002, 0, 0, 1920, 1080, 4002);
+    CHECK(interactive_grab_closed_source_flip(closure_path, closed_flip) && closed_flip == 4002 &&
+          !interactive_grab_closed_source_flip(closure_path + ".other", closed_flip),
+          "the owned closing flip is available while the writer is held; another path cannot adopt it");
+    InteractiveGrabOutcome premature;
+    CHECK(!take_interactive_grab_outcome(premature),
+          "the synchronous target is independent of delayed bundle serialization");
+    release_writer.store(true, std::memory_order_release);
+    InteractiveGrabOutcome closed_outcome;
+    CHECK(wait_for_interactive_grab(closed_outcome) &&
+          closed_outcome.closed_source_flips == std::vector<uint64_t>({4002}),
+          "the eventual writer outcome agrees with the synchronous closing target");
+    CHECK(set_interactive_bundle_writer_hook_for_test({}),
+          "the delayed-writer test restores ordinary writing");
+
+    // A two-frame bundle must nominate its final boundary, never its first closed frame. A new
+    // request resets the old path's token even while retaining that previous outcome in the test.
+#ifdef _WIN32
+    _putenv_s("PROSPER_CAPTURE_FRAMES", "2");
+#else
+    setenv("PROSPER_CAPTURE_FRAMES", "2", 1);
+#endif
+    const auto multi_path = prosper_test::test_scratch_file("prosper_f9_multi_closure.prgbundle");
+    (void)request_interactive_capture_bundle(multi_path);
+    CHECK(!interactive_grab_closed_source_flip(closure_path, closed_flip),
+          "a later request cannot see the earlier request's closing flip");
+    record_gpu_timeline_present(3003, 0, 0, 1920, 1080, 4003);
+    record_gpu_timeline_present(3004, 0, 0, 1920, 1080, 4004);
+    CHECK(!interactive_grab_closed_source_flip(multi_path, closed_flip),
+          "an intermediate boundary does not choose a multi-frame screenshot");
+    record_gpu_timeline_present(3005, 0, 0, 1920, 1080, 4005);
+    CHECK(interactive_grab_closed_source_flip(multi_path, closed_flip) && closed_flip == 4005,
+          "the final selected-front flip chooses the multi-frame screenshot");
+    InteractiveGrabOutcome multi_outcome;
+    CHECK(wait_for_interactive_grab(multi_outcome) &&
+          multi_outcome.closed_source_flips == std::vector<uint64_t>({4004, 4005}),
+          "the multi-frame writer retains both exact boundaries");
+#ifdef _WIN32
+    _putenv_s("PROSPER_CAPTURE_FRAMES", "1");
+#else
+    setenv("PROSPER_CAPTURE_FRAMES", "1", 1);
+#endif
+    std::filesystem::remove(closure_path, ec);
+    std::filesystem::remove(multi_path, ec);
 
     if (fails) { std::printf("== FAIL: %d ==\n", fails); return 1; }
     std::printf("== PASS ==\n"); return 0;
