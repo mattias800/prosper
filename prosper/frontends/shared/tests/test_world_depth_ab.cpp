@@ -121,5 +121,40 @@ int main() {
         !check(!ambiguous(true, WorldDepthPassKind::Unrelated, false, false),
                "independent later pass invalidated world capture"))
         return 1;
+
+    // The retained pad-3930 A/B selected an eight-draw character version of this address. An
+    // earlier unrelated frame had a 162-draw world version. Only a large producer followed by a
+    // composite at this SAME pad can qualify for a later, separately reviewed readback probe.
+    prosper::frontend::WorldProducerCensus census;
+    census.observe(true, true, false, WorldDepthPassKind::Geometry, 8);
+    census.observe(false, false, true, WorldDepthPassKind::Unrelated, 2);
+    if (!check(!census.has_single_ordered_candidate() && census.max_world_draws == 8,
+               "small character-only producer authorized follow-up"))
+        return 1;
+    census = {};
+    census.observe(false, false, true, WorldDepthPassKind::Unrelated, 2);
+    census.observe(true, true, false, WorldDepthPassKind::Geometry, 162);
+    if (!check(!census.has_single_ordered_candidate(),
+               "composite before world producer counted as downstream"))
+        return 1;
+    census.observe(false, false, true, WorldDepthPassKind::Unrelated, 2);
+    if (!check(census.has_single_ordered_candidate(),
+               "ordered large world producer failed positive control"))
+        return 1;
+    census.observe(true, true, false, WorldDepthPassKind::Geometry, 120);
+    if (!check(!census.has_single_ordered_candidate(),
+               "two large world versions called a single producer"))
+        return 1;
+    census = {};
+    census.observe(true, true, true, WorldDepthPassKind::Geometry, 162);
+    if (!check(!census.has_single_ordered_candidate(),
+               "world/composite bound in one unordered group counted as sequential"))
+        return 1;
+    census = {};
+    for (uint64_t i = 0; i <= prosper::frontend::WorldProducerCensus::kMaximumLines; ++i)
+        census.observe(true, true, false, WorldDepthPassKind::OtherWorld, 1);
+    if (!check(census.omitted_lines == 1 && !census.has_single_ordered_candidate(),
+               "metadata line cap failed closed"))
+        return 1;
     return 0;
 }

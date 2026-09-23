@@ -74,6 +74,43 @@ struct WorldDepthDrawFact {
 
 enum class WorldDepthPassKind { Unrelated, Clear, Geometry, OtherWorld, Ambiguous };
 
+// Metadata-only first-divergence preflight. A bound target is not proof of a pixel write, and a
+// same-address producer in another frame is not the version sampled by the present composite.
+// The state deliberately permits no readback decision; it only reports whether this pad contains
+// an ordered, single large world candidate worth tracing further.
+struct WorldProducerCensus {
+    static constexpr uint64_t kMinimumWorldDraws = 100;
+    static constexpr uint64_t kMaximumLines = 64;
+    uint64_t depth_groups = 0, world_groups = 0, large_world_groups = 0, composite_groups = 0;
+    uint64_t composite_after_large_world = 0, max_world_draws = 0;
+    uint64_t reported_lines = 0, omitted_lines = 0;
+
+    void observe(bool depth_target_bound, bool world_target_bound, bool composite_target_bound,
+                 WorldDepthPassKind kind, uint64_t draws) {
+        const bool large_preceded_this_group = large_world_groups != 0;
+        if (depth_target_bound) ++depth_groups;
+        if (world_target_bound) {
+            ++world_groups;
+            if (draws > max_world_draws) max_world_draws = draws;
+            if (kind == WorldDepthPassKind::Geometry && draws >= kMinimumWorldDraws)
+                ++large_world_groups;
+        }
+        if (composite_target_bound) {
+            ++composite_groups;
+            if (large_preceded_this_group) ++composite_after_large_world;
+        }
+        if (depth_target_bound || world_target_bound || composite_target_bound) {
+            if (reported_lines < kMaximumLines) ++reported_lines;
+            else ++omitted_lines;
+        }
+    }
+
+    bool has_single_ordered_candidate() const {
+        return large_world_groups == 1 && composite_after_large_world != 0 &&
+               omitted_lines == 0;
+    }
+};
+
 constexpr bool world_depth_scope_allowed(WorldDepthPassKind kind) {
     return kind == WorldDepthPassKind::Clear || kind == WorldDepthPassKind::Geometry;
 }

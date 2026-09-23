@@ -1387,9 +1387,10 @@ namespace {
 struct WorldDepthAbRun {
     WorldDepthAbConfig config{};
     std::string directory;
-    bool armed = false, captured = false, window_reported = false;
+    bool armed = false, captured = false, window_reported = false, census_only = false;
     uint64_t clear_passes = 0, geometry_passes = 0, other_world_passes = 0;
     uint64_t ambiguous_passes = 0, shadow_like_passes = 0, capture_attempts = 0;
+    WorldProducerCensus census{};
 };
 
 uint64_t world_depth_raw_hash(const void* data, size_t bytes) {
@@ -1492,28 +1493,32 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
     auto world_depth_ab = std::make_shared<WorldDepthAbRun>();
     if (const char* setting = PROSPER_ENV_VALUE("PROSPER_SONIC_WORLD_DEPTH_AB")) {
         const char* directory = PROSPER_ENV_VALUE("PROSPER_SONIC_WORLD_DEPTH_AB_DIR");
+        const char* meta_only = PROSPER_ENV_VALUE("PROSPER_SONIC_WORLD_META_ONLY");
         std::error_code directory_error;
         const bool output_directory_exists = directory && *directory &&
             std::filesystem::is_directory(directory, directory_error) && !directory_error;
         world_depth_ab->armed = title_id == "PPSA03831" && directory && *directory &&
             output_directory_exists &&
+            (!meta_only || std::string_view(meta_only) == "1") &&
             !PROSPER_ENV_VALUE("PROSPER_DIAG_CLEAR_OVERWRITE") &&
             parse_world_depth_ab(setting, world_depth_ab->config);
         if (world_depth_ab->armed) {
             world_depth_ab->directory = directory;
+            world_depth_ab->census_only = meta_only != nullptr;
             std::fprintf(stderr,
                 "[world-depth-ab] armed mode=%d pad=%lld ds=0x%llx color=0x%llx extent=%ux%u "
-                "dir=%s; only structurally matching world passes can change policy\n",
+                "dir=%s meta-only=%d; only structurally matching world passes can change policy\n",
                 world_depth_ab->config.mode,
                 static_cast<long long>(world_depth_ab->config.capture_pad_flip),
                 static_cast<unsigned long long>(world_depth_ab->config.depth_base),
                 static_cast<unsigned long long>(world_depth_ab->config.color_base),
                 world_depth_ab->config.width, world_depth_ab->config.height,
-                world_depth_ab->directory.c_str());
+                world_depth_ab->directory.c_str(), world_depth_ab->census_only);
         } else {
             std::fprintf(stderr,
                 "[world-depth-ab] REFUSED: require Sonic title ID, strict mode:pad:0xDS:0xCOLOR:WxH, "
-                "an existing output directory, and no global PROSPER_DIAG_CLEAR_OVERWRITE\n");
+                "an existing output directory, optional META_ONLY=1, and no global "
+                "PROSPER_DIAG_CLEAR_OVERWRITE\n");
         }
     }
     // Titles whose WaveAny-only fragment programs may run at the host's native Wave32.
@@ -9466,6 +9471,65 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     uint64_t requested_draws = 0;
                     prosper::test::BackendWorldDrawRecordStats recorded{};
                 } world_capture;
+                const uint64_t census_groups_before = world_depth_ab->census.reported_lines +
+                    world_depth_ab->census.omitted_lines;
+                // The earlier raw pair selected an eight-draw character-only version of this
+                // address. Census *versions in order* before another expensive readback. This
+                // mode emits at most 64 metadata lines at the exact requested pad, no pixels.
+                auto census_world_group = [&](size_t first_index,
+                                              const std::vector<const prosper::gpu::DrawItem*>& group,
+                                              WorldDepthPassKind kind, bool resolve) {
+                    if (!world_depth_ab->armed || !world_depth_ab->census_only || group.empty() ||
+                        prosper_pad_flip_ordinal() != world_depth_ab->config.capture_pad_flip)
+                        return;
+                    constexpr uint64_t composite_base = 0x204f9a0000ull;
+                    bool depth_bound = false, world_bound = false, composite_bound = false;
+                    for (const auto* draw : group) {
+                        depth_bound |= draw->ps.depth_write_base ==
+                            world_depth_ab->config.depth_base;
+                        if (resolve) {
+                            world_bound |= draw->color1_base == world_depth_ab->config.color_base;
+                            composite_bound |= draw->color1_base == composite_base;
+                        } else {
+                            for (uint32_t slot = 0; slot < prosper::gpu::kColorTargetCount;
+                                 ++slot) {
+                                if (!prosper::frontend::mrt_write_mask(*draw, slot)) continue;
+                                const uint64_t target = color_binding(*draw, slot).base;
+                                world_bound |= target == world_depth_ab->config.color_base;
+                                composite_bound |= target == composite_base;
+                            }
+                        }
+                    }
+                    if (!depth_bound && !world_bound && !composite_bound) return;
+                    auto& census = world_depth_ab->census;
+                    census.observe(depth_bound, world_bound, composite_bound, kind, group.size());
+                    if (census.omitted_lines) return;
+                    const auto& head = *group.front();
+                    const auto& ps = head.ps;
+                    const char* kind_name = kind == WorldDepthPassKind::Geometry ? "geometry" :
+                        kind == WorldDepthPassKind::Clear ? "clear" :
+                        kind == WorldDepthPassKind::OtherWorld ? "other-world" :
+                        kind == WorldDepthPassKind::Ambiguous ? "ambiguous" : "unrelated";
+                    std::fprintf(stderr,
+                        "[world-producer-census] pad=%lld guest-flip=%llu submit=%d "
+                        "group=%zu..%zu order=%llu draws=%zu depth-bound=%d world-write-bound=%d "
+                        "composite-write-bound=%d "
+                        "kind=%s resolve=%d c0=0x%llx c1=0x%llx c0-mask=0x%x "
+                        "depth=0x%llx read-depth=0x%llx scissor=%d,%d..%d,%d "
+                        "native=%ux%u; target binding is not pixel-write or present provenance\n",
+                        static_cast<long long>(prosper_pad_flip_ordinal()),
+                        static_cast<unsigned long long>(prosper_vo_flip_count()), g_this_submit,
+                        first_index, first_index + group.size() - 1,
+                        static_cast<unsigned long long>(census.reported_lines), group.size(),
+                        depth_bound, world_bound, composite_bound, kind_name, resolve,
+                        static_cast<unsigned long long>(head.color0_base),
+                        static_cast<unsigned long long>(head.color1_base),
+                        prosper::frontend::mrt_write_mask(head, 0),
+                        static_cast<unsigned long long>(ps.depth_write_base),
+                        static_cast<unsigned long long>(ps.depth_read_base),
+                        ps.scissor_left, ps.scissor_top, ps.scissor_right, ps.scissor_bottom,
+                        head.color0_width, head.color0_height);
+                };
                 if (timing_enabled)
                     pending_timing.pass_head_ms += std::chrono::duration<double, std::milli>(
                         RenderClock::now() - pass_timing_start).count();
@@ -9474,6 +9538,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 const double pass_loop_measured_before = timing_enabled
                     ? pending_timing.build_resources_ms + pending_timing.backend_ms : 0.0;
                 while (pass_i < items.size()) {
+                    const size_t pass_start = pass_i;
                     const auto group_start = timing_enabled
                         ? RenderClock::now() : RenderClock::time_point{};
                     // Counted at the TOP, before any `continue` can skip it -- so the difference
@@ -9747,6 +9812,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     }
                     static const bool no_resolve = getenv("PROSPER_NO_RESOLVE") != nullptr;
                     if (!pass.empty() && pass.front()->ps.cb_resolve && !no_resolve) {
+                        if (world_depth_ab->census_only)
+                            census_world_group(pass_start, pass, WorldDepthPassKind::Unrelated, true);
                         const uint64_t rsrc = pass.front()->color0_base;
                         // A later fixed-function resolve may replace the selected world's color
                         // before the end-of-callback readback. Refuse rather than label it world.
@@ -10177,6 +10244,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 ++world_depth_ab->shadow_like_passes;
                         }
                         world_pass_kind = classify_world_depth_pass(world_depth_ab->config, facts);
+                        if (world_depth_ab->census_only)
+                            census_world_group(pass_start, pass, world_pass_kind, false);
                         switch (world_pass_kind) {
                             case WorldDepthPassKind::Clear: ++world_depth_ab->clear_passes; break;
                             case WorldDepthPassKind::Geometry: ++world_depth_ab->geometry_passes; break;
@@ -10205,7 +10274,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     bool gpu_seed_available = false;
                     const bool seed_rtt0 = seed_target(base);
                     const VkFormat pass_format = format0;
-                    if (world_depth_ab->armed && !world_depth_ab->captured &&
+                    if (world_depth_ab->armed && !world_depth_ab->census_only &&
+                        !world_depth_ab->captured &&
                         prosper_pad_flip_ordinal() == world_depth_ab->config.capture_pad_flip) {
                         const bool surface_match =
                             base == world_depth_ab->config.color_base &&
@@ -11272,7 +11342,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 // refuse this readback. A caller can join producer_guest_flip with
                 // the app's successful-present source_seq; without that equality the manifest
                 // deliberately says present_join=unknown. Neither file is an HDR visualization.
-                if (world_depth_ab->armed && world_capture.seen &&
+                if (world_depth_ab->armed && !world_depth_ab->census_only && world_capture.seen &&
                     !world_capture.ambiguous && !world_depth_ab->captured &&
                     world_depth_ab->capture_attempts < 3) {
                     ++world_depth_ab->capture_attempts;
@@ -11356,7 +11426,32 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             static_cast<unsigned long long>(world_capture.recorded.color0_write_recorded));
                     }
                 }
-                if (world_depth_ab->armed && !world_depth_ab->captured &&
+                if (world_depth_ab->armed && world_depth_ab->census_only &&
+                    !world_depth_ab->window_reported &&
+                    prosper_pad_flip_ordinal() > world_depth_ab->config.capture_pad_flip) {
+                    world_depth_ab->window_reported = true;
+                    const auto& census = world_depth_ab->census;
+                    std::fprintf(stderr,
+                        "[world-producer-census] pad=%lld COMPLETE depth-groups=%llu "
+                        "world-groups=%llu "
+                        "max-world-draws=%llu large-world-groups=%llu composite-groups=%llu "
+                        "composite-after-large=%llu logged=%llu omitted=%llu "
+                        "single-ordered-candidate=%d; no raw readback attempted; "
+                        "raster groups only, compute producers, present join, and pixel writes "
+                        "unknown\n",
+                        static_cast<long long>(world_depth_ab->config.capture_pad_flip),
+                        static_cast<unsigned long long>(census.depth_groups),
+                        static_cast<unsigned long long>(census.world_groups),
+                        static_cast<unsigned long long>(census.max_world_draws),
+                        static_cast<unsigned long long>(census.large_world_groups),
+                        static_cast<unsigned long long>(census.composite_groups),
+                        static_cast<unsigned long long>(census.composite_after_large_world),
+                        static_cast<unsigned long long>(census.reported_lines),
+                        static_cast<unsigned long long>(census.omitted_lines),
+                        census.has_single_ordered_candidate());
+                }
+                if (world_depth_ab->armed && !world_depth_ab->census_only &&
+                    !world_depth_ab->captured &&
                     !world_depth_ab->window_reported &&
                     prosper_pad_flip_ordinal() > world_depth_ab->config.capture_pad_flip) {
                     world_depth_ab->window_reported = true;
@@ -11390,6 +11485,17 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 : present_choice == PresentSourceChoice::Vo    ? px_vo
                                 : present_choice == PresentSourceChoice::Last  ? px_last
                                 : nullptr;
+                if (world_depth_ab->armed && world_depth_ab->census_only &&
+                    prosper_pad_flip_ordinal() == world_depth_ab->config.capture_pad_flip &&
+                    world_depth_ab->census.reported_lines +
+                            world_depth_ab->census.omitted_lines > census_groups_before) {
+                    std::fprintf(stderr,
+                        "[world-producer-census] pad=%lld submit=%d callback-selected=%s "
+                        "selected-bytes=%zu requested-bytes=%zu; native present join unknown\n",
+                        static_cast<long long>(prosper_pad_flip_ordinal()), g_this_submit,
+                        prosper::frontend::present_source_name(present_choice),
+                        candidate_bytes(selected_pixels), present_extent_bytes);
+                }
                 // #2283's blocking arm, measured rather than argued: is a pass whose colour target is
                 // DISABLED (CB_COLOR0_INFO.FORMAT == 0, CB_COLOR_INVALID) ever chosen as the frame
                 // that gets published? The proposed fix stops forcing a readback on such a pass, and
