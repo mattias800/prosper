@@ -42,3 +42,10 @@ a raw storage format cannot round-trip every guest encoding. It preserves contro
 actual image stores, including stores whose converted value equals the input. It does not own mask
 memory or authorize guest bytes; allocation, seeding, synchronization and untouched-byte restoration
 belong to the live backend. Unsupported provenance is an explicit error.
+
+`compute_buffer_bytes.hpp` is the one file here that is not a decision or a census: the exact
+byte comparison and copy the live backend's buffer uploads and writebacks run on host memory, and
+the bounded worker split they share with its storage-image conversions. It lives here rather than
+in `live/` because it touches no device, which is what lets its exactness test run on every
+platform (#3699). `compute_buffers_diff_span` is not diagnostic: the upload copies ONLY the extent
+it reports, so its answer must stay exact, never approximate.

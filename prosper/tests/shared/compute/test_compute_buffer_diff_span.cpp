@@ -15,7 +15,7 @@
 // **copying only the reported span reproduces a full copy, byte for byte.** Every case below checks
 // that directly against a reference full copy, in addition to the span's own bounds.
 
-#include "shared/live/live_compute.hpp"
+#include "shared/compute/compute_buffer_bytes.hpp"
 
 #include <cstdint>
 #include <cstdio>
@@ -39,7 +39,7 @@ void check_case(const std::string& name, std::vector<uint8_t> dst, const std::ve
     const std::vector<uint8_t> before = dst;
     size_t first = SIZE_MAX, last = SIZE_MAX;
     const bool equal =
-        prosper::frontend::compute_buffer_diff_span_for_test(dst.data(), src.data(), dst.size(),
+        prosper::frontend::compute_buffers_diff_span(dst.data(), src.data(), dst.size(),
                                                              &first, &last);
     check(equal == expect_equal, name + ": equality reported correctly");
     if (equal) {
@@ -141,7 +141,7 @@ int main() {
     {
         std::vector<uint8_t> empty;
         size_t first = SIZE_MAX, last = SIZE_MAX;
-        check(prosper::frontend::compute_buffer_diff_span_for_test(nullptr, nullptr, 0,
+        check(prosper::frontend::compute_buffers_diff_span(nullptr, nullptr, 0,
                                                                   &first, &last),
               "zero bytes compares equal");
     }
