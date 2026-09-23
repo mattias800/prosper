@@ -9161,23 +9161,27 @@ void diagnose_resource_provenance(const GpuState& st, uint64_t submit_no) {
                             (unsigned long long)resource_size);
                 }
                 auto it = last_programmed_color_target.find(r.gpu_addr);
+                // This draw's programmed MRT0 helps locate its next pass. It is not a pixel-write
+                // claim: emitted output locations and the final color write mask are separate gates.
                 if (it == last_programmed_color_target.end()) {
                     fprintf(stderr,
                             "[provenance] table-candidate submit=%llu draw=%zu ps=0x%llx lists "
                             "addr=0x%llx binding=%u cls=%u fetch_pc=%u dims=%ux%u "
-                            "draw_submit=%llu order=%llu: "
+                            "draw_submit=%llu order=%llu programmed_dst0=0x%llx/%ux%u: "
                             "no prior programmed color target\n",
                             (unsigned long long)submit_no, i, (unsigned long long)rs.ps_addr,
                             (unsigned long long)r.gpu_addr, r.binding,
                             static_cast<unsigned>(r.cls), r.fetch_pc, r.width, r.height,
                             (unsigned long long)this_draw_submit,
-                            (unsigned long long)st.draws[i].command_order);
+                            (unsigned long long)st.draws[i].command_order,
+                            (unsigned long long)rs.color_targets[0].base,
+                            rs.color_targets[0].width, rs.color_targets[0].height);
                 } else {
                     const ProgrammedColorTarget& w = it->second;
                     fprintf(stderr,
                             "[provenance] table-candidate submit=%llu draw=%zu ps=0x%llx lists "
                             "addr=0x%llx binding=%u cls=%u fetch_pc=%u dims=%ux%u "
-                            "draw_submit=%llu order=%llu: "
+                            "draw_submit=%llu order=%llu programmed_dst0=0x%llx/%ux%u: "
                             "last programmed color target submit=%llu "
                             "draw_submit=%llu draw=%zu target_slot=%zu target_extent=%ux%u "
                             "vs=0x%llx ps=0x%llx\n",
@@ -9186,6 +9190,8 @@ void diagnose_resource_provenance(const GpuState& st, uint64_t submit_no) {
                             static_cast<unsigned>(r.cls), r.fetch_pc, r.width, r.height,
                             (unsigned long long)this_draw_submit,
                             (unsigned long long)st.draws[i].command_order,
+                            (unsigned long long)rs.color_targets[0].base,
+                            rs.color_targets[0].width, rs.color_targets[0].height,
                             (unsigned long long)w.submit,
                             (unsigned long long)w.draw_submit, w.draw, w.slot, w.width, w.height,
                             (unsigned long long)w.vs, (unsigned long long)w.ps);
