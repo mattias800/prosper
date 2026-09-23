@@ -2544,6 +2544,34 @@ struct ScopedBackendTargetBindingObservation {
     ScopedBackendTargetBindingObservation& operator=(const ScopedBackendTargetBindingObservation&) = delete;
 };
 
+// Scoped alternative to the route-wide PROSPER_DRAW_STATS switch. Query values are populated only
+// after a successful flush with both query results available; zero values are then real zeros.
+struct BackendDrawStatsObservation {
+    uint32_t calls = 0;
+    bool flush_now = false, query_created = false, batch_completed = false;
+    bool available = false;
+    uint64_t vertices = 0, primitives = 0, after_clip = 0;
+    uint64_t fragment_invocations = 0, surviving_samples = 0;
+};
+
+inline BackendDrawStatsObservation*& active_backend_draw_stats_observation() {
+    static thread_local BackendDrawStatsObservation* observation = nullptr;
+    return observation;
+}
+
+struct ScopedBackendDrawStatsObservation {
+    BackendDrawStatsObservation* previous = nullptr;
+    explicit ScopedBackendDrawStatsObservation(BackendDrawStatsObservation& observation)
+        : previous(active_backend_draw_stats_observation()) {
+        active_backend_draw_stats_observation() = &observation;
+    }
+    ~ScopedBackendDrawStatsObservation() {
+        active_backend_draw_stats_observation() = previous;
+    }
+    ScopedBackendDrawStatsObservation(const ScopedBackendDrawStatsObservation&) = delete;
+    ScopedBackendDrawStatsObservation& operator=(const ScopedBackendDrawStatsObservation&) = delete;
+};
+
 inline void invalidate_color_producer(PersistentColorTargetImage& image) {
     if (!prosper::frontend::producer_lineage_enabled()) return;
     ++image.mutation;
@@ -11985,11 +12013,17 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     }
     // Per-draw "fragment funnel" (PROSPER_DRAW_STATS): wrap each recorded draw in pipeline-statistics
     // + occlusion queries to show WHERE its pixels vanish (geometry clipped away, never rasterized,
-    // depth/stencil-rejected, or survived) — objective per-draw truth, no oracle needed. Read-only, and
-    // only active with the env var AND a real flush in THIS call (so the results are ready to read back).
+    // depth/stencil-rejected, or survived) — objective per-draw truth, no oracle needed. Read-only,
+    // opt-in by the env var or one scoped observer, and only active with a real flush in THIS call.
     // Query-pool RESET must be recorded outside a render pass, so it happens here.
     const RenderVkCtx& ds_ctx = render_vk_ctx();
-    const bool draw_stats = PROSPER_ENV_ON("PROSPER_DRAW_STATS") && ds_ctx.pipeline_stats_enabled &&
+    auto* scoped_draw_stats = active_backend_draw_stats_observation();
+    if (scoped_draw_stats) {
+        ++scoped_draw_stats->calls;
+        scoped_draw_stats->flush_now = flush_now;
+    }
+    const bool draw_stats = (PROSPER_ENV_ON("PROSPER_DRAW_STATS") || scoped_draw_stats) &&
+                            ds_ctx.pipeline_stats_enabled &&
                             !dv.empty() && flush_now;
     VkQueryPool ds_stats_pool = VK_NULL_HANDLE, ds_occ_pool = VK_NULL_HANDLE;
     if (draw_stats) {
@@ -12013,6 +12047,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         }
     }
     const bool ds_active = ds_stats_pool != VK_NULL_HANDLE && ds_occ_pool != VK_NULL_HANDLE;
+    if (scoped_draw_stats) scoped_draw_stats->query_created = ds_active;
 
     // Geometry probe (PROSPER_GEOM_PROBE=N): capture draw N's post-transform clip-space vertices via
     // transform feedback and report where they land (degenerate / off-screen / behind-camera / NaN).
@@ -12923,12 +12958,24 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         if (batch_completed) {
             std::vector<uint64_t> sres(static_cast<size_t>(nq) * 5, 0);  // 4 statistics + availability
             std::vector<uint64_t> ores(static_cast<size_t>(nq) * 2, 0);  // occlusion samples + availability
-            vkGetQueryPoolResults(dev, ds_stats_pool, 0, nq, sres.size() * sizeof(uint64_t), sres.data(),
-                                  5 * sizeof(uint64_t),
-                                  VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
-            vkGetQueryPoolResults(dev, ds_occ_pool, 0, nq, ores.size() * sizeof(uint64_t), ores.data(),
-                                  2 * sizeof(uint64_t),
-                                  VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+            const VkResult stats_result = vkGetQueryPoolResults(
+                dev, ds_stats_pool, 0, nq, sres.size() * sizeof(uint64_t), sres.data(),
+                5 * sizeof(uint64_t),
+                VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+            const VkResult occ_result = vkGetQueryPoolResults(
+                dev, ds_occ_pool, 0, nq, ores.size() * sizeof(uint64_t), ores.data(),
+                2 * sizeof(uint64_t),
+                VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+            if (scoped_draw_stats && scoped_draw_stats->calls == 1 && nq == 1 &&
+                stats_result == VK_SUCCESS && occ_result == VK_SUCCESS &&
+                sres[4] && ores[1]) {
+                scoped_draw_stats->available = true;
+                scoped_draw_stats->vertices = sres[0];
+                scoped_draw_stats->primitives = sres[1];
+                scoped_draw_stats->after_clip = sres[2];
+                scoped_draw_stats->fragment_invocations = sres[3];
+                scoped_draw_stats->surviving_samples = ores[0];
+            }
             for (uint32_t i = 0; i < nq; i++) {
                 if (!sres[i * 5 + 4]) continue;  // unavailable -> draw was skipped (v.ok == false)
                 const uint64_t verts = sres[i * 5 + 0], prims = sres[i * 5 + 1],
@@ -12954,6 +13001,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             }
         }
     }
+    if (scoped_draw_stats) scoped_draw_stats->batch_completed = batch_completed;
 
     // Geometry-probe readback: report where the probed draw's post-transform clip-space vertices landed.
     // geom_active implies flush_now (same gate as buffer creation), so `cmd` has completed here.

@@ -157,6 +157,7 @@ struct WorldC2AlphaPassFact {
     uint32_t color_mask = 0;
     uint64_t fragment_program = 0;
     size_t c1_binding_count = 0;
+    bool terminal_pass = false;
 };
 
 constexpr bool world_c2_alpha_pass_allowed(const WorldC2AlphaPassFact& fact) {
@@ -166,6 +167,10 @@ constexpr bool world_c2_alpha_pass_allowed(const WorldC2AlphaPassFact& fact) {
            fact.color_count == 1 && fact.color_base == 0x204f9a0000ull &&
            fact.color_mask == 0x8u && fact.fragment_program == 0x20059c8b00ull &&
            fact.c1_binding_count == 1;
+}
+
+constexpr bool world_c2_funnel_allowed(const WorldC2AlphaPassFact& fact) {
+    return world_c2_alpha_pass_allowed(fact) && fact.terminal_pass;
 }
 
 // The old first-eight descriptor listing dropped facts relevant to the c2 handoff. This

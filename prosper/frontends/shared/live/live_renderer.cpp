@@ -1402,6 +1402,7 @@ struct WorldDepthAbRun {
     bool c2_capture_armed = false, c2_capture_attempted = false, c2_capture_complete = false;
     uint64_t c2_callback_candidates = 0;
     bool c2_alpha_armed = false, c2_alpha_attempted = false, c2_alpha_complete = false;
+    bool c2_funnel_armed = false, c2_funnel_complete = false;
     uint64_t c2_before_guest_flip = 0;
     int c2_before_submit = -1;
     WorldC2RetainedVersion c2_before_version{}, c1_before_version{};
@@ -1541,6 +1542,7 @@ bool write_world_c2_raw(const WorldDepthAbRun& run, int64_t pad, uint64_t guest_
 bool write_world_c2_alpha_after(const WorldDepthAbRun& run, int64_t pad,
                                 uint64_t guest_flip, int submit,
                                 const prosper::test::BackendTargetBindingObservation& binding,
+                                const prosper::test::BackendDrawStatsObservation& funnel,
                                 const prosper::test::PersistentColorTargetImage& after_target,
                                 const std::vector<uint8_t>& alpha, uint64_t changed,
                                 uint64_t changed_in_scissor, uint32_t min_x, uint32_t min_y,
@@ -1572,7 +1574,10 @@ bool write_world_c2_alpha_after(const WorldDepthAbRun& run, int64_t pad,
         "\"c2_after_producer_work\":%llu,"
         "\"backend_borrowed_target\":%s,\"backend_image_matches_retained\":%s,"
         "\"descriptor_updated\":%s,\"draw_recorded\":%s,"
-        "\"depth_or_fragment_coverage_proven\":false,\"present_join\":\"unknown\"}\n",
+        "\"funnel_available\":%s,\"input_vertices\":%llu,"
+        "\"input_primitives\":%llu,\"clipping_primitives\":%llu,"
+        "\"fragment_invocations\":%llu,"
+        "\"surviving_samples\":%llu,\"present_join\":\"unknown\"}\n",
         static_cast<long long>(pad), static_cast<unsigned long long>(guest_flip),
         run.c2_before_submit, submit, before_stem, alpha_name.c_str(),
         run.config.width, run.config.height,
@@ -1598,7 +1603,13 @@ bool write_world_c2_alpha_after(const WorldDepthAbRun& run, int64_t pad,
         binding.borrowed_target ? "true" : "false",
         binding.image_matches_retained ? "true" : "false",
         binding.descriptor_updated ? "true" : "false",
-        binding.draw_recorded ? "true" : "false");
+        binding.draw_recorded ? "true" : "false",
+        funnel.available ? "true" : "false",
+        static_cast<unsigned long long>(funnel.vertices),
+        static_cast<unsigned long long>(funnel.primitives),
+        static_cast<unsigned long long>(funnel.after_clip),
+        static_cast<unsigned long long>(funnel.fragment_invocations),
+        static_cast<unsigned long long>(funnel.surviving_samples));
     const std::string manifest_path = run.directory + "/" + stem + ".json";
     if (written <= 0 || static_cast<size_t>(written) >= sizeof manifest ||
         !write_world_depth_raw(manifest_path, manifest, static_cast<size_t>(written))) {
@@ -1618,6 +1629,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
     auto world_depth_ab = std::make_shared<WorldDepthAbRun>();
     const char* c2_requested = PROSPER_ENV_VALUE("PROSPER_SONIC_C2_CAPTURE");
     const char* c2_alpha_requested = PROSPER_ENV_VALUE("PROSPER_SONIC_C2_ALPHA_AUDIT");
+    const char* c2_funnel_requested = PROSPER_ENV_VALUE("PROSPER_SONIC_C2_FUNNEL");
     if (const char* setting = PROSPER_ENV_VALUE("PROSPER_SONIC_WORLD_DEPTH_AB")) {
         const char* directory = PROSPER_ENV_VALUE("PROSPER_SONIC_WORLD_DEPTH_AB_DIR");
         const char* meta_only = PROSPER_ENV_VALUE("PROSPER_SONIC_WORLD_META_ONLY");
@@ -1639,6 +1651,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             }
             world_depth_ab->c2_alpha_armed = world_depth_ab->c2_capture_armed &&
                 c2_alpha_requested && std::string_view(c2_alpha_requested) == "1";
+            world_depth_ab->c2_funnel_armed = world_depth_ab->c2_alpha_armed &&
+                c2_funnel_requested && std::string_view(c2_funnel_requested) == "1";
             std::fprintf(stderr,
                 "[world-depth-ab] armed mode=%d pad=%lld ds=0x%llx color=0x%llx extent=%ux%u "
                 "dir=%s meta-only=%d; only structurally matching world passes can change policy\n",
@@ -1664,6 +1678,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
         std::fprintf(stderr,
             "[world-c2-alpha] REFUSED: requires the exact Sonic c2 capture settings and "
             "PROSPER_SONIC_C2_ALPHA_AUDIT=1\n");
+    if (c2_funnel_requested && !world_depth_ab->c2_funnel_armed)
+        std::fprintf(stderr,
+            "[world-c2-funnel] REFUSED: requires the exact Sonic c2 alpha settings and "
+            "PROSPER_SONIC_C2_FUNNEL=1\n");
     // Titles whose WaveAny-only fragment programs may run at the host's native Wave32.
     //
     // The classifier (render_runner.h) admits a reason set of EXACTLY kFragmentWaveReasonWaveAny --
@@ -9626,6 +9644,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 constexpr uint64_t world_c1_base = 0x204b9e0000ull;
                 WorldC2CallbackShape c2_callback_shape;
                 prosper::test::BackendTargetBindingObservation c2_alpha_binding;
+                prosper::test::BackendDrawStatsObservation c2_funnel_stats;
                 bool c2_alpha_pending = false;
                 uint32_t c2_alpha_writer_groups = 0;
                 // The earlier raw pair selected an eight-draw character-only version of this
@@ -10950,6 +10969,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         world_mode_scope.emplace(world_depth_ab->config.mode);
                     std::optional<prosper::test::ScopedBackendTargetBindingObservation>
                         c2_alpha_binding_scope;
+                    std::optional<prosper::test::ScopedBackendDrawStatsObservation>
+                        c2_funnel_scope;
                     if (world_depth_ab->c2_alpha_armed &&
                         world_depth_ab->c2_capture_complete &&
                         !world_depth_ab->c2_alpha_attempted && base == c2_base) {
@@ -10973,7 +10994,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 ? prosper::frontend::mrt_write_mask(*render_pass.front(), 0)
                                 : 0,
                             render_pass.size() == 1 ? render_pass.front()->fs_guest_addr : 0,
-                            exact_input_count};
+                            exact_input_count, pass_i == items.size()};
                         world_depth_ab->c2_alpha_attempted = true;
                         const bool exact_pass = world_c2_alpha_pass_allowed(alpha_fact) &&
                             backend_draws.size() == 1 &&
@@ -10985,13 +11006,16 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             c2_alpha_binding.binding = 37;
                             c2_alpha_binding.expected_target = world_c1_base;
                             c2_alpha_binding_scope.emplace(c2_alpha_binding);
+                            if (world_depth_ab->c2_funnel_armed &&
+                                world_c2_funnel_allowed(alpha_fact))
+                                c2_funnel_scope.emplace(c2_funnel_stats);
                             c2_alpha_pending = true;
                         } else {
                             std::fprintf(stderr,
                                 "[world-c2-alpha] REFUSED pad=%lld submit=%d: first later c2 "
                                 "pass differs from exact one-draw alpha/FS/c1 descriptor shape "
                                 "(draws=%zu backend=%zu mrt=%u mask=0x%x fs=0x%llx "
-                                "c1-bindings=%zu)\n",
+                                "c1-bindings=%zu terminal=%d)\n",
                                 static_cast<long long>(callback_pad), g_this_submit,
                                 render_pass.size(), backend_draws.size(), mrt_count,
                                 render_pass.size() == 1
@@ -10999,7 +11023,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     : 0,
                                 static_cast<unsigned long long>(render_pass.size() == 1
                                     ? render_pass.front()->fs_guest_addr : 0),
-                                exact_input_count);
+                                exact_input_count, pass_i == items.size());
                         }
                     }
                     std::vector<uint8_t> gpx = prosper::test::render_draws_rgba(
@@ -11033,6 +11057,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         // title could legally mix a colour-writing draw into a pass that has a base.
                         /*want_color_readback=*/any_slot_bound);
                     c2_alpha_binding_scope.reset();
+                    c2_funnel_scope.reset();
                     if (world_depth_ab->armed && !world_depth_ab->census_only &&
                         world_pass_kind == WorldDepthPassKind::Geometry &&
                         world_capture.seen && !world_capture.ambiguous)
@@ -11864,6 +11889,37 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     }
                 }
                 if (c2_alpha_pending) {
+                    if (world_depth_ab->c2_funnel_armed) {
+                        const bool funnel_ready = c2_funnel_stats.calls == 1 &&
+                            c2_funnel_stats.flush_now && c2_funnel_stats.query_created &&
+                            c2_funnel_stats.batch_completed && c2_funnel_stats.available &&
+                            c2_alpha_binding.draw_recorded;
+                        world_depth_ab->c2_funnel_complete = funnel_ready;
+                        if (funnel_ready)
+                            std::fprintf(stderr,
+                                "[world-c2-funnel] COMPLETE pad=%lld submit=%d "
+                                "verts=%llu prims=%llu after-clip=%llu fs-inv=%llu "
+                                "samples=%llu; query counts are not pixel-write proof\n",
+                                static_cast<long long>(callback_pad), g_this_submit,
+                                static_cast<unsigned long long>(c2_funnel_stats.vertices),
+                                static_cast<unsigned long long>(c2_funnel_stats.primitives),
+                                static_cast<unsigned long long>(c2_funnel_stats.after_clip),
+                                static_cast<unsigned long long>(
+                                    c2_funnel_stats.fragment_invocations),
+                                static_cast<unsigned long long>(
+                                    c2_funnel_stats.surviving_samples));
+                        else
+                            std::fprintf(stderr,
+                                "[world-c2-funnel] REFUSED pad=%lld submit=%d "
+                                "calls=%u flush=%d query=%d batch=%d available=%d "
+                                "draw-recorded=%d\n",
+                                static_cast<long long>(callback_pad), g_this_submit,
+                                c2_funnel_stats.calls, c2_funnel_stats.flush_now,
+                                c2_funnel_stats.query_created,
+                                c2_funnel_stats.batch_completed,
+                                c2_funnel_stats.available,
+                                c2_alpha_binding.draw_recorded);
+                    }
                     std::string refusal;
                     std::vector<uint8_t> after_pixels;
                     const int64_t tail_pad = prosper_pad_flip_ordinal();
@@ -12015,7 +12071,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         }
                         if (!write_world_c2_alpha_after(
                                 *world_depth_ab, tail_pad, tail_flip, g_this_submit,
-                                c2_alpha_binding, *completed_c2_target, after_alpha, changed,
+                                c2_alpha_binding, c2_funnel_stats,
+                                *completed_c2_target, after_alpha, changed,
                                 changed_in_scissor, min_x, min_y, max_x, max_y))
                             refusal = "cannot write complete post-order12 alpha and manifest";
                         else {
@@ -12210,7 +12267,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         "unstable-guest-flips=%llu first-guest-flip=%llu "
                         "single-ordered-candidate=%d total-line-cap=%llu "
                         "c2-armed=%d c2-candidates=%llu c2-complete=%d "
-                        "c2-alpha-armed=%d c2-alpha-attempted=%d c2-alpha-complete=%d; "
+                        "c2-alpha-armed=%d c2-alpha-attempted=%d c2-alpha-complete=%d "
+                        "c2-funnel-armed=%d c2-funnel-complete=%d; "
                         "c2 readback is opt-in; raster groups only, compute producers, "
                         "present join, and pixel writes unknown\n",
                         static_cast<long long>(world_depth_ab->config.capture_pad_flip),
@@ -12235,7 +12293,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         world_depth_ab->c2_capture_complete,
                         world_depth_ab->c2_alpha_armed,
                         world_depth_ab->c2_alpha_attempted,
-                        world_depth_ab->c2_alpha_complete);
+                        world_depth_ab->c2_alpha_complete,
+                        world_depth_ab->c2_funnel_armed,
+                        world_depth_ab->c2_funnel_complete);
                 }
                 // #2283's blocking arm, measured rather than argued: is a pass whose colour target is
                 // DISABLED (CB_COLOR0_INFO.FORMAT == 0, CB_COLOR_INVALID) ever chosen as the frame

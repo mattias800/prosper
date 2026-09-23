@@ -1057,12 +1057,56 @@ int main() {
             prosper::test::BackendTargetBindingObservation fp16_audit;
             fp16_audit.set = 1; fp16_audit.binding = 4;
             fp16_audit.expected_target = fp16_target_id;
+            auto* prior_stats_observer =
+                prosper::test::active_backend_draw_stats_observation();
+            prosper::test::BackendDrawStatsObservation flushed_stats;
             std::vector<uint8_t> gpu_sampled;
             {
                 prosper::test::ScopedBackendTargetBindingObservation scope(fp16_audit);
+                prosper::test::ScopedBackendDrawStatsObservation stats_scope(flushed_stats);
                 gpu_sampled = prosper::test::render_draws_rgba({consumer}, W, H);
             }
+            CHECK(prosper::test::active_backend_draw_stats_observation() ==
+                      prior_stats_observer,
+                  "scoped draw statistics restore the previous observer after the flushed call");
             const auto gpu_sample_stats = prosper::test::backend_color_target_stats();
+            if (prosper::test::render_vk_ctx().pipeline_stats_enabled)
+                CHECK(flushed_stats.calls == 1 && flushed_stats.flush_now &&
+                          flushed_stats.query_created && flushed_stats.batch_completed &&
+                          flushed_stats.available && flushed_stats.primitives > 0 &&
+                          flushed_stats.after_clip > 0 &&
+                          flushed_stats.fragment_invocations > 0 &&
+                          flushed_stats.surviving_samples > 0,
+                      "scoped draw statistics report a flushed, surviving sampled draw");
+            else
+                CHECK(flushed_stats.calls == 1 && flushed_stats.flush_now &&
+                          !flushed_stats.query_created && !flushed_stats.available,
+                      "scoped draw statistics decline an unsupported optional feature");
+            prosper::test::BackendSubmissionBatch deferred_stats_batch;
+            prosper::test::BackendDrawStatsObservation deferred_stats_observation;
+            {
+                prosper::test::ScopedBackendDrawStatsObservation stats_scope(
+                    deferred_stats_observation);
+                (void)prosper::test::render_draws_rgba(
+                    {consumer}, W, H, nullptr, nullptr, false, nullptr,
+                    nullptr, nullptr, nullptr, &deferred_stats_batch, false,
+                    nullptr, false);
+            }
+            CHECK(prosper::test::active_backend_draw_stats_observation() ==
+                      prior_stats_observer,
+                  "scoped draw statistics restore the previous observer after a deferred call");
+            const bool deferred_work_pending = deferred_stats_batch.pending();
+            const auto deferred_stats_result = deferred_stats_batch.submit_and_wait(
+                prosper::test::render_vk_ctx().dev,
+                prosper::test::render_vk_ctx().queue, false);
+            deferred_stats_batch.complete();
+            CHECK(deferred_work_pending && deferred_stats_observation.calls == 1 &&
+                      !deferred_stats_observation.flush_now &&
+                      !deferred_stats_observation.query_created &&
+                      !deferred_stats_observation.available &&
+                      deferred_stats_result.submit_result == VK_SUCCESS &&
+                      deferred_stats_result.wait_result == VK_SUCCESS,
+                  "scoped draw statistics decline a non-flushing backend call");
             CHECK(gpu_sample_stats.sampled_hits == 1 && gpu_sampled == cpu_sampled,
                   "GPU-resident FP16 target sampling matches native CPU RTT round-trip");
             CHECK(fp16_audit.matches == 1 && fp16_audit.descriptor_prepared &&

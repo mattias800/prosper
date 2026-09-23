@@ -80,8 +80,10 @@ int main() {
     const auto alpha_allowed = prosper::frontend::world_c2_alpha_pass_allowed;
     const WorldC2AlphaPassFact exact_alpha{
         true, true, false, 3930, 3930, 3930, 3930, 1, 1,
-        0x204f9a0000ull, 0x8u, 0x20059c8b00ull, 1};
-    if (!check(alpha_allowed(exact_alpha), "exact c2 alpha pass declined")) return 1;
+        0x204f9a0000ull, 0x8u, 0x20059c8b00ull, 1, true};
+    const auto funnel_allowed = prosper::frontend::world_c2_funnel_allowed;
+    if (!check(alpha_allowed(exact_alpha) && funnel_allowed(exact_alpha),
+               "exact c2 alpha pass or scoped funnel declined")) return 1;
     const auto rejects_alpha_mutation = [&](auto mutate, const char* reason) {
         WorldC2AlphaPassFact variant = exact_alpha;
         mutate(variant);
@@ -111,6 +113,11 @@ int main() {
                                 "missing c1 input admitted") ||
         !rejects_alpha_mutation([](auto& f) { f.c1_binding_count = 2; },
                                 "ambiguous c1 inputs admitted"))
+        return 1;
+    WorldC2AlphaPassFact nonterminal_alpha = exact_alpha;
+    nonterminal_alpha.terminal_pass = false;
+    if (!check(alpha_allowed(nonterminal_alpha) && !funnel_allowed(nonterminal_alpha),
+               "non-terminal pass retains alpha audit but declines scoped funnel"))
         return 1;
 
     WorldDepthDrawFact clear;
