@@ -107,6 +107,23 @@ int main() {
         !check(!prosper::frontend::world_depth_scope_allowed(WorldDepthPassKind::Unrelated),
                "shadow or unrelated pass gained an override"))
         return 1;
+    const auto override_enabled = prosper::frontend::world_depth_override_enabled;
+    if (!check(override_enabled(true, false, WorldDepthPassKind::Geometry),
+               "selected A/B geometry cannot override depth policy") ||
+        !check(!override_enabled(true, true, WorldDepthPassKind::Geometry),
+               "metadata-only geometry still overrides depth policy") ||
+        !check(!override_enabled(true, true, WorldDepthPassKind::Clear),
+               "metadata-only clear still overrides depth policy") ||
+        !check(!override_enabled(false, false, WorldDepthPassKind::Geometry),
+               "unarmed geometry overrides depth policy"))
+        return 1;
+    const auto at_pad = prosper::frontend::world_census_observation_allowed;
+    if (!check(at_pad(true, true, 3930, 3930), "exact-pad census declined") ||
+        !check(!at_pad(true, true, 3930, 3929),
+               "prior pad was treated as requested observation time") ||
+        !check(!at_pad(true, false, 3930, 3930),
+               "ordinary A/B capture entered metadata-only census"))
+        return 1;
     const auto ambiguous = prosper::frontend::world_depth_capture_pass_ambiguous;
     if (!check(!ambiguous(false, WorldDepthPassKind::Geometry, true, true),
                "first matching world geometry declined") ||
@@ -126,7 +143,16 @@ int main() {
     // earlier unrelated frame had a 162-draw world version. Only a large producer followed by a
     // composite at this SAME pad can qualify for a later, separately reviewed readback probe.
     prosper::frontend::WorldProducerCensus census;
-    census.observe(true, true, false, WorldDepthPassKind::Geometry, 8);
+    if (!check(!census.observe_at(true, true, 3930, 3929, true, true, false,
+                                  WorldDepthPassKind::Geometry, 162) &&
+                   census.relevant_groups == 0,
+               "prior-pad producer entered the exact-pad census"))
+        return 1;
+    if (!check(census.observe_at(true, true, 3930, 3930, true, true, false,
+                                 WorldDepthPassKind::Geometry, 8) &&
+                   census.relevant_groups == 1,
+               "matching callback observation did not activate census"))
+        return 1;
     census.observe(false, false, true, WorldDepthPassKind::Unrelated, 2);
     if (!check(!census.has_single_ordered_candidate() && census.max_world_draws == 8,
                "small character-only producer authorized follow-up"))
@@ -141,6 +167,11 @@ int main() {
     if (!check(census.has_single_ordered_candidate(),
                "ordered large world producer failed positive control"))
         return 1;
+    ++census.unstable_callbacks;
+    if (!check(!census.has_single_ordered_candidate(),
+               "pad shift inside callback retained a false candidate"))
+        return 1;
+    --census.unstable_callbacks;
     census.observe(true, true, false, WorldDepthPassKind::Geometry, 120);
     if (!check(!census.has_single_ordered_candidate(),
                "two large world versions called a single producer"))
@@ -151,10 +182,12 @@ int main() {
                "world/composite bound in one unordered group counted as sequential"))
         return 1;
     census = {};
-    for (uint64_t i = 0; i <= prosper::frontend::WorldProducerCensus::kMaximumLines; ++i)
-        census.observe(true, true, false, WorldDepthPassKind::OtherWorld, 1);
-    if (!check(census.omitted_lines == 1 && !census.has_single_ordered_candidate(),
-               "metadata line cap failed closed"))
+    for (uint64_t i = 0; i < prosper::frontend::WorldProducerCensus::kMaximumLines - 1; ++i)
+        if (!check(census.reserve_detail_line(), "detail line under cap refused")) return 1;
+    census.observe(true, true, false, WorldDepthPassKind::OtherWorld, 1);
+    if (!check(!census.reserve_detail_line() && census.reported_lines == 63 &&
+                   census.omitted_lines == 1 && !census.has_single_ordered_candidate(),
+               "shared group/callback detail cap failed closed with one summary row reserved"))
         return 1;
     return 0;
 }

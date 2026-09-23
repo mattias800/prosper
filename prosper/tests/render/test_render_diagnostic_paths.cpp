@@ -31,6 +31,7 @@
 #include "fixtures/render_runner.h"
 #include "fixtures/spirv_triangle.h"
 #include "gpu/diagnostics/geometry_probe_arming.hpp"
+#include "shared/live/world_depth_ab.hpp"
 
 #include <cstdint>
 #include <cstdio>
@@ -214,15 +215,30 @@ int main(int argc, char** argv) {
             }
             const uint64_t after_control = prosper::test::backend_depth_clear_probe_armed_count().load();
             CHECK(after_control == after_global, "scoped mode 0 suppresses the global clear probe");
-            {
+            if (prosper::frontend::world_depth_override_enabled(
+                    true, false, prosper::frontend::WorldDepthPassKind::Clear)) {
                 prosper::test::ScopedDepthClearProbeMode world_candidate(4);
                 render_clear();
                 const auto recorded = prosper::test::backend_world_draw_record_stats();
                 CHECK(recorded.recorded == 1 && recorded.color0_write_recorded == 0,
                       "selected depth-only pass records one admitted command without color");
-            }
+            } else render_clear();
             const uint64_t after_candidate = prosper::test::backend_depth_clear_probe_armed_count().load();
             CHECK(after_candidate > after_control, "scoped mode 4 executes the selected backend path");
+            {
+                // Metadata-only runs must sample pass structure without changing the backend
+                // clear predicate. The outer mode 0 makes a leaked mode 4 observable: its
+                // counter would rise even though this path is census-only.
+                prosper::test::ScopedDepthClearProbeMode neutral(0);
+                const uint64_t before_meta = prosper::test::backend_depth_clear_probe_armed_count().load();
+                if (prosper::frontend::world_depth_override_enabled(
+                        true, true, prosper::frontend::WorldDepthPassKind::Clear)) {
+                    prosper::test::ScopedDepthClearProbeMode leaked_candidate(4);
+                    render_clear();
+                } else render_clear();
+                CHECK(prosper::test::backend_depth_clear_probe_armed_count().load() == before_meta,
+                      "metadata-only selected clear did not change backend depth policy");
+            }
             render_clear();
             CHECK(prosper::test::backend_depth_clear_probe_armed_count().load() > after_candidate,
                   "unrelated passes return to the process policy after scope");

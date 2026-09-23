@@ -74,16 +74,34 @@ struct WorldDepthDrawFact {
 
 enum class WorldDepthPassKind { Unrelated, Clear, Geometry, OtherWorld, Ambiguous };
 
+// This is the pad value sampled at callback entry. It identifies when a group was observed;
+// it does not prove that its produced pixels reached a later native presentation.
+constexpr bool world_census_observation_allowed(bool armed, bool census_only,
+                                                 int64_t requested_pad, int64_t callback_pad) {
+    return armed && census_only && requested_pad == callback_pad;
+}
+
 // Metadata-only first-divergence preflight. A bound target is not proof of a pixel write, and a
 // same-address producer in another frame is not the version sampled by the present composite.
 // The state deliberately permits no readback decision; it only reports whether this pad contains
-// an ordered, single large world candidate worth tracing further.
+// an ordered, single large world candidate worth tracing further. One line is reserved for the
+// final summary, so all group and callback rows together can never exceed kMaximumLines - 1.
 struct WorldProducerCensus {
     static constexpr uint64_t kMinimumWorldDraws = 100;
     static constexpr uint64_t kMaximumLines = 64;
     uint64_t depth_groups = 0, world_groups = 0, large_world_groups = 0, composite_groups = 0;
     uint64_t composite_after_large_world = 0, max_world_draws = 0;
-    uint64_t reported_lines = 0, omitted_lines = 0;
+    uint64_t relevant_groups = 0, reported_lines = 0, omitted_lines = 0;
+    uint64_t unstable_callbacks = 0;
+
+    bool reserve_detail_line() {
+        if (reported_lines < kMaximumLines - 1) {
+            ++reported_lines;
+            return true;
+        }
+        ++omitted_lines;
+        return false;
+    }
 
     void observe(bool depth_target_bound, bool world_target_bound, bool composite_target_bound,
                  WorldDepthPassKind kind, uint64_t draws) {
@@ -100,16 +118,30 @@ struct WorldProducerCensus {
             if (large_preceded_this_group) ++composite_after_large_world;
         }
         if (depth_target_bound || world_target_bound || composite_target_bound) {
-            if (reported_lines < kMaximumLines) ++reported_lines;
-            else ++omitted_lines;
+            ++relevant_groups;
         }
+    }
+
+    bool observe_at(bool armed, bool census_only, int64_t requested_pad, int64_t callback_pad,
+                    bool depth_target_bound, bool world_target_bound, bool composite_target_bound,
+                    WorldDepthPassKind kind, uint64_t draws) {
+        if (!world_census_observation_allowed(armed, census_only, requested_pad, callback_pad))
+            return false;
+        observe(depth_target_bound, world_target_bound, composite_target_bound, kind, draws);
+        return true;
     }
 
     bool has_single_ordered_candidate() const {
         return large_world_groups == 1 && composite_after_large_world != 0 &&
-               omitted_lines == 0;
+               omitted_lines == 0 && unstable_callbacks == 0;
     }
 };
+
+constexpr bool world_depth_override_enabled(bool armed, bool census_only,
+                                            WorldDepthPassKind kind) {
+    return armed && !census_only &&
+           (kind == WorldDepthPassKind::Clear || kind == WorldDepthPassKind::Geometry);
+}
 
 constexpr bool world_depth_scope_allowed(WorldDepthPassKind kind) {
     return kind == WorldDepthPassKind::Clear || kind == WorldDepthPassKind::Geometry;
