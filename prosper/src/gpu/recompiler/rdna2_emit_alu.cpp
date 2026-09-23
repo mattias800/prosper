@@ -1796,8 +1796,18 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 const uint32_t offset = b.ibin(Op_BitwiseAnd, val(in.src[1]), b.uconst(63));
                 // Vertex NGG is the same one-lane approximation as the inline-mask helpers: its
                 // represented guest lane is lane zero and it has no compute LocalInvocationIndex.
+                //
+                // Everything else takes the guest lane from guest_lane_id(), NOT linear_localid.
+                // linear_localid is a compute-only value: in a fragment shader it is never
+                // assigned and stays 0, which is the "no id" sentinel, so the lane test below was
+                // emitted as `OpBitwiseAnd %uint %0 %63` -- an operand naming id 0. spirv-val
+                // rejects that module ("Id is 0"), and NVIDIA's driver dereferences it while
+                // compiling the pipeline: Kena: Bridge of Spirits (PPSA01802) died inside
+                // nvoglv64.dll on its first level load, on `s_bfm_b64 <mask>, 12, 44`.
+                // guest_lane_id() is the fragment lane from SubgroupLocalInvocationId (and records
+                // the exact-wave-width contract that lane id carries), linear_localid for compute.
                 const uint32_t lane = b.ngg_one_lane ? b.uconst(0) :
-                    b.ibin(Op_BitwiseAnd, b.linear_localid, b.uconst(b.wave_size - 1));
+                    b.ibin(Op_BitwiseAnd, b.guest_lane_id(), b.uconst(b.wave_size - 1));
                 const uint32_t at_or_after = b.ucmp(Op_UGreaterThanEqual, lane, offset);
                 const uint32_t within_width = b.ucmp(
                     Op_ULessThan, b.ibin(Op_ISub, lane, offset), width);
