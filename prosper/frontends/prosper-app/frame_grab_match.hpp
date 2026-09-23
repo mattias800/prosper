@@ -46,9 +46,9 @@ enum class FrameGrabMatch {
     ProducerCaptured,
 };
 
-// This is an exact selected-front flip, not a present count. A target is published by the capture
-// window before the async writer runs. Earlier frames must leave F9 pending; later frames prove the
-// target was skipped by this host presenter and cannot be silently substituted for it.
+// The target is the capture window's exact closing guest flip, not a present count. Only a GPU
+// scanout lease carrying that token proves the selected front matched. Earlier frames leave F9
+// pending; later frames prove this host presenter skipped the target.
 enum class FrameGrabTargetDecision { Wait, Capture, Missed };
 inline FrameGrabTargetDecision frame_grab_target_decision(uint64_t target_source_flip,
                                                           uint64_t observed_source_flip) {

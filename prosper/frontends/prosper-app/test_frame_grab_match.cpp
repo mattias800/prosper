@@ -1,5 +1,6 @@
 #include "frame_grab_match.hpp"
 #include "frame_grab_naming.hpp"
+#include "fixtures/test_scratch.h"
 
 #include <chrono>
 #include <cstdio>
@@ -134,7 +135,7 @@ int main() {
           "a failed BMP write cannot claim a pair");
     shot.bmp_written = true;
 
-    const auto dir = std::filesystem::path("frame_grab_match_test");
+    const auto dir = prosper_test::test_scratch_dir() / "frame_grab_match_test";
     std::error_code ec;
     std::filesystem::remove_all(dir, ec);
     const FrameGrabPaths paths = reserve_frame_grab(

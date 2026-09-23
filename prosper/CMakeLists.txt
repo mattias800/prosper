@@ -1400,7 +1400,7 @@ if(TARGET prosper_core)
   add_test(NAME prosper_app_frame_grab_naming COMMAND test_prosper_app_frame_grab_naming)
 
   add_executable(test_prosper_app_frame_grab_match frontends/prosper-app/test_frame_grab_match.cpp)
-  target_include_directories(test_prosper_app_frame_grab_match PRIVATE frontends)
+  target_include_directories(test_prosper_app_frame_grab_match PRIVATE frontends tests)
   add_test(NAME prosper_app_frame_grab_match COMMAND test_prosper_app_frame_grab_match)
 
   # F8's pre-trigger ring and post-trigger timing artifact: pure state machine + filesystem test,

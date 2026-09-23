@@ -327,9 +327,10 @@ struct InteractiveGrabOutcome {
     std::vector<uint64_t> captured_submits;
 };
 bool take_interactive_grab_outcome(InteractiveGrabOutcome& out);
-// The closing selected-front flip is published synchronously at the capture boundary, before
+// The closing guest flip token is published synchronously at the capture boundary, before
 // renderer scanout publication and independently of the (possibly slow) bundle writer. A caller
-// must name the exact owned request path; a later F9 cannot adopt an older window's target.
+// must name the exact owned request path. A failed buffer selection retains the OLD front token,
+// so no GPU scanout lease can match this target and the frame join stays incomplete.
 bool interactive_grab_closed_source_flip(const std::string& bundle_path, uint64_t& source_flip);
 
 // Optional guest-stdout phase gate for the same whole-frame bundle. When
