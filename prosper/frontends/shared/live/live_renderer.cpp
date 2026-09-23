@@ -48,6 +48,7 @@
 #include "shared/diagnostics/diagnostic_window.hpp"        // census window by callback ordinal or by elapsed time
 #include "shared/diagnostics/kena_menu_trace_policy.hpp"    // one passive title-menu source trace
 #include "shared/diagnostics/compute_present_probe.hpp"      // bounded producer -> present observation
+#include "shared/diagnostics/exact_writer_probe.hpp"         // bounded single graphics-writer bracket
 #include "shared/diagnostics/persistent_readback_filter.hpp" // bounded retained-target readback
 #include "gpu/diagnostics/diag_ratelimit.hpp"       // ordinal + sparse tail for capped diagnostics
 #include "host/memory/guest_write_watch.hpp"
@@ -106,6 +107,17 @@ namespace prosper::frontend {
 
 bool flush_live_graphics_pipeline_cache() {
     return prosper::test::flush_graphics_pipeline_cache();
+}
+
+int compute_present_selector_preflight() {
+    const char* value = PROSPER_ENV_VALUE("PROSPER_COMPUTE_PRESENT_PROBE");
+    const auto spec = parse_compute_present_probe(value);
+    fprintf(stderr, "[compute-present] app-parser-preflight requested=%u armed=%u "
+                    "code=0x%llx after=%llu stride=%u parse_failure=%s\n",
+            spec.requested ? 1u : 0u, spec.armed ? 1u : 0u,
+            (unsigned long long)spec.code, (unsigned long long)spec.after_ms, spec.stride,
+            compute_probe_parse_failure_name(spec.parse_failure));
+    return spec.armed ? 0 : 1;
 }
 
 // Render-to-texture surface cache (#167): CB_COLOR0_BASE -> the RGBA pixels we last rendered into it.
@@ -1604,6 +1616,23 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
     }();
     static const auto g_compute_present_spec = [] {
         const char* value = PROSPER_ENV_VALUE("PROSPER_COMPUTE_PRESENT_PROBE");
+        // Print only a bounded, safe alphabet: a malformed selector must be visible at the
+        // actual frontend read, without letting an arbitrary environment value inject log lines.
+        if (value) {
+            char quoted[65]{};
+            size_t length = 0;
+            bool redacted = false;
+            for (; length < 64 && value[length]; ++length) {
+                const char c = value[length];
+                const bool safe = (c >= '0' && c <= '9') ||
+                                  (c >= 'a' && c <= 'z') ||
+                                  (c >= 'A' && c <= 'Z') || c == ':';
+                quoted[length] = safe ? c : '?';
+                redacted |= !safe;
+            }
+            fprintf(stderr, "[compute-present] selector raw=\"%s\" length=%s%zu redacted=%u\n",
+                    quoted, value[length] ? ">" : "", length, redacted ? 1u : 0u);
+        }
         auto spec = prosper::frontend::parse_compute_present_probe(value);
         if (!spec.requested) return spec;
         const char* reason = nullptr;
@@ -1631,7 +1660,51 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 spec.armed ? "armed" : "refused", (unsigned long long)spec.code,
                 (unsigned long long)spec.after_ms, spec.stride,
                 reason ? reason : "one producer event, up to four scene probes and one full chain");
+        if (!spec.armed && spec.parse_failure !=
+                               prosper::frontend::ComputePresentProbeSpec::ParseFailure::None)
+            fprintf(stderr, "[compute-present] parser failure=%s\n",
+                    prosper::frontend::compute_probe_parse_failure_name(spec.parse_failure));
         prosper::frontend::compute_present_probe().configure(spec);
+        return spec;
+    }();
+    static prosper::frontend::ExactWriterProbe g_exact_writer_probe;
+    static const auto g_exact_writer_spec = [] {
+        const char* value = PROSPER_ENV_VALUE("PROSPER_EXACT_WRITER_PROBE");
+        auto spec = prosper::frontend::parse_exact_writer_probe(value);
+        if (!spec.requested) return spec;
+        const char* reason = nullptr;
+        if (!spec.armed)
+            reason = "expected 0xPS:0xINPUT:0xOUTPUT:ms:0..120000";
+        else if (g_compute_present_spec.requested ||
+                 PROSPER_ENV_VALUE("PROSPER_KENA_MENU_TRACE") ||
+                 PROSPER_ENV_VALUE("PROSPER_DUMP_PERSISTENT"))
+            reason = "another frame/readback probe also requested";
+        else if (!g_bind_program_trace.filter.armed ||
+                 g_bind_program_trace.filter.address != spec.ps)
+            reason = "PROSPER_BIND_LOG_PROGRAM must select the same PS";
+        else if (!PROSPER_ENV_ON("PROSPER_PIPELOG") ||
+                 !PROSPER_ENV_ON("PROSPER_DRAW_STATS"))
+            reason = "PROSPER_PIPELOG and PROSPER_DRAW_STATS required for draw evidence";
+        else if (!PROSPER_ENV_VALUE("PROSPER_FRAME_DIR") ||
+                 !*PROSPER_ENV_VALUE("PROSPER_FRAME_DIR"))
+            reason = "PROSPER_FRAME_DIR required";
+        else if (PROSPER_ENV_VALUE("PROSPER_NO_LIVE_PERSISTENT_COLOR_TARGETS") ||
+                 PROSPER_ENV_VALUE("PROSPER_NO_BACKEND_BATCH_SUBMITS") ||
+                 PROSPER_ENV_VALUE("PROSPER_GPU_CAPTURE") ||
+                 PROSPER_ENV_VALUE("PROSPER_GPU_REPLAY_EXPORT_RTT") ||
+                 PROSPER_ENV_VALUE("PROSPER_DUMP_DRAWSTEPS") ||
+                 PROSPER_ENV_VALUE("PROSPER_DUMP_RTGROUPS") ||
+                 PROSPER_ENV_VALUE("PROSPER_RESOURCE_HASH_DIM") ||
+                 PROSPER_ENV_VALUE("PROSPER_RTTLOG"))
+            reason = "normal persistent/batched target path disabled";
+        if (reason) spec.armed = false;
+        fprintf(stderr, "[exact-writer] %s ps=0x%llx input=0x%llx output=0x%llx "
+                        "after=%llu ms reason=%s (one draw, four candidates, "
+                        "160 MiB raw/128 MiB BMP caps)\n",
+                spec.armed ? "armed" : "refused", (unsigned long long)spec.ps,
+                (unsigned long long)spec.input, (unsigned long long)spec.output,
+                (unsigned long long)spec.after_ms, reason ? reason : "none");
+        g_exact_writer_probe.configure(spec);
         return spec;
     }();
     // Match boot_trace's progression-diagnostic contract: callers may register the graphics
@@ -2189,6 +2262,11 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
     // command buffers in one batch by default. Keep a direct recovery/A-B switch for driver issues.
     static const bool batch_backend_submits = live_gpu_targets &&
         !PROSPER_ENV_VALUE("PROSPER_NO_BACKEND_BATCH_SUBMITS");
+    const bool exact_writer_live = g_exact_writer_spec.armed && live_gpu_targets &&
+        batch_backend_submits;
+    if (g_exact_writer_spec.armed && !exact_writer_live)
+        fprintf(stderr, "[exact-writer] refused: normal persistent/batched target path "
+                        "was not admitted by renderer\n");
     if (live_gpu_targets)
         fprintf(stderr, "[render] persistent GPU color targets enabled (experimental%s)\n",
                 replay_live_targets ? ", replay parity" : "");
@@ -2196,6 +2274,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
         fprintf(stderr, "[render] backend target-submit batching enabled (experimental)\n");
     prosper::gpu::set_submit_renderer(
         [frame_dir, dump_bmps, invalidate_ds, native_fragment_vote_width,
+         exact_writer_live,
          partial_wave_fragment](const std::vector<prosper::gpu::DrawItem>& items,
                                uint32_t w, uint32_t h) -> prosper::gpu::RenderedFrame {
             using RC = prosper::gpu::ResourceClass;
@@ -2367,10 +2446,21 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             static thread_local int g_this_submit = -1;
             static thread_local bool g_force_this_submit = false;
             static thread_local uint64_t g_compute_present_bound_id = 0;
+            // execute_ordered_items_impl::flush_span invokes every graphics span in one ordered
+            // submit synchronously on this thread. This ID crosses only those spans; the policy
+            // state and byte budgets remain process-wide for separate submits/threads.
+            static thread_local uint64_t g_exact_writer_trace_id = 0;
             if (phase.first_span || g_this_submit < 0) {
+                if (exact_writer_live && g_exact_writer_trace_id) {
+                    g_exact_writer_probe.finish_final(false);
+                    fprintf(stderr, "[exact-writer] attempt=%llu verdict=void "
+                                    "reason=no-pairable-final-span-before-next-submit\n",
+                            (unsigned long long)g_exact_writer_trace_id);
+                }
                 g_this_submit = g_submit_idx++;
                 g_force_this_submit = false;
                 g_compute_present_bound_id = 0;
+                g_exact_writer_trace_id = 0;
             }
             if (g_this_submit > g_render_last) return {};
             static const int g_rttlog_min_submit = getenv("PROSPER_RTTLOG_MIN_SUBMIT")
@@ -2882,6 +2972,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             }
             if ((g_this_submit < g_render_first || before_delay) && !g_force_this_submit) return {};
             uint64_t compute_present_final_id = 0;
+            uint64_t exact_writer_final_id = 0;
             if (g_compute_present_spec.armed && phase.final_span) {
                 auto& probe = prosper::frontend::compute_present_probe();
                 const uint64_t elapsed = diagnostic_elapsed_ms();
@@ -2905,6 +2996,11 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             const auto compute_present_callback_event = g_compute_present_spec.armed
                 ? prosper::frontend::compute_present_probe().pending()
                 : std::optional<prosper::frontend::ComputePresentEvent>{};
+            if (exact_writer_live && phase.final_span &&
+                g_exact_writer_probe.expired(diagnostic_elapsed_ms()))
+                fprintf(stderr, "[exact-writer] selector miss: no admitted exact writer "
+                                "within ten seconds of threshold (attempts=%u)\n",
+                        g_exact_writer_probe.attempts());
             // Both renderer admission gates have passed. Do not consume the one-shot menu trace
             // (or scan guest bytes) for a callback that cannot render a final source.
             const bool kena_render_admitted = g_this_submit <= g_render_last &&
@@ -3325,6 +3421,11 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 depth_array_snapshots.clear();
                 depth_array_snapshot_bytes = 0;
             };
+            // Reset for each selected pass before build_bds resolves its reflected PS resources.
+            uint64_t exact_writer_draw_index = UINT64_MAX;
+            bool exact_writer_input_bound = false;
+            uint32_t exact_writer_input_binding = UINT32_MAX;
+            const char* exact_writer_input_path = "missing";
             auto build_R = [&](const prosper::gpu::DrawItem& draw,
                                const prosper::gpu::ShaderResourceTable* vrt,
                                const prosper::gpu::ShaderResourceTable* prt,
@@ -5452,6 +5553,14 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                         live_rtt != g_rtt.end() ? (int)(bool)live_rtt->second.rgba
                                                                 : -1);
                             if (selected_program) {
+                                if (exact_writer_live &&
+                                    exact_writer_draw_index == draw.draw_index &&
+                                    r.gpu_addr == g_exact_writer_spec.input) {
+                                    exact_writer_input_bound = has_gpu_live_rtt &&
+                                        sampled_source_addr == g_exact_writer_spec.input;
+                                    exact_writer_input_binding = r.binding;
+                                    exact_writer_input_path = path;
+                                }
                                 const uint64_t row = ++g_bind_program_trace.observed_bindings;
                                 if (row <= 8192)
                                     fprintf(stderr,
@@ -10545,8 +10654,233 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         backend_target.load_existing_slots[slot] = seed_target(pass_bases[slot]);
                         backend_target.readback_slots[slot] = pass_bases[slot] != 0 && !defer_readback_slots[slot];
                     }
+                    uint32_t writer_attempt = 0;
+                    bool writer_before_ok = false;
+                    size_t writer_input_raw_nonzero = 0;
+                    size_t writer_input_rgb_nonblack = 0;
+                    std::vector<uint8_t> writer_output_before_raw;
+                    std::vector<uint8_t> writer_output_after_raw;
+                    std::function<bool(uint64_t, const char*, uint32_t, uint32_t,
+                                       VkFormat, size_t&, size_t&,
+                                       std::vector<uint8_t>*)> writer_snapshot;
+                    const uint64_t writer_ps = render_pass.empty()
+                        ? 0 : render_pass.front()->fs_guest_addr;
+                    const auto writer_match = exact_writer_live
+                        ? prosper::frontend::exact_writer_match(
+                              writer_ps, base, pass.size(), render_pass.size(),
+                              !pass.empty() && active_color(*pass.front(), 0) == base && base,
+                              g_exact_writer_spec)
+                        : prosper::frontend::ExactWriterMatch::WrongPs;
+                    if (exact_writer_live &&
+                        diagnostic_elapsed_ms() >= g_exact_writer_spec.after_ms &&
+                        !g_exact_writer_probe.bracketed()) {
+                        // Wrong-PS/target observations never consume a candidate. Only a single
+                        // exact pass can be detached from the shared submission batch safely.
+                        static uint32_t writer_misses = 0;
+                        if (writer_ps == g_exact_writer_spec.ps &&
+                            writer_match != prosper::frontend::ExactWriterMatch::Exact &&
+                            writer_misses++ < 8)
+                            fprintf(stderr, "[exact-writer] rejected pass render-submit=%d "
+                                            "draw=%llu ps=0x%llx target=0x%llx "
+                                            "original=%zu adjusted=%zu mask=0x%x reason=%s\n",
+                                    g_this_submit,
+                                    (unsigned long long)(pass.empty() ? 0 : pass.front()->draw_index),
+                                    (unsigned long long)writer_ps, (unsigned long long)base,
+                                    pass.size(), render_pass.size(),
+                                    pass.empty() ? 0 : pass.front()->ps.color_write_mask,
+                                    writer_match == prosper::frontend::ExactWriterMatch::WrongTarget
+                                        ? "wrong-target" :
+                                    writer_match == prosper::frontend::ExactWriterMatch::MultiDraw
+                                        ? "multi-draw" : "no-color0-write");
+                        writer_attempt = prosper::frontend::claim_exact_writer(
+                            g_exact_writer_probe, writer_match, diagnostic_elapsed_ms());
+                    }
+                    if (writer_attempt) {
+                        const auto& ctx = prosper::test::render_vk_ctx();
+                        const bool pending = backend_submission.pending();
+                        const auto prior = ctx.ok
+                            ? backend_submission.submit_and_wait(ctx.dev, ctx.queue, false)
+                            : prosper::test::BackendSubmissionBatchResult{
+                                  VK_ERROR_INITIALIZATION_FAILED, VK_ERROR_INITIALIZATION_FAILED};
+                        fprintf(stderr, "[exact-writer] attempt=%u begin render-submit=%d "
+                                        "cb-before=%llu draw=%llu order=%llu ps=0x%llx "
+                                        "output=0x%llx extent=%ux%u fmt=%u prior-pending=%d "
+                                        "prior-submit=%d prior-wait=%d draw-query-supported=%d\n",
+                                writer_attempt, g_this_submit,
+                                (unsigned long long)g_pass_log_submit.load(),
+                                (unsigned long long)pass.front()->draw_index,
+                                (unsigned long long)pass.front()->command_order,
+                                (unsigned long long)writer_ps, (unsigned long long)base,
+                                gw, gh, (unsigned)pass_format, pending ? 1 : 0,
+                                (int)prior.submit_result, (int)prior.wait_result,
+                                ctx.pipeline_stats_enabled ? 1 : 0);
+                        if (!ctx.ok || prior.submit_result != VK_SUCCESS ||
+                            prior.wait_result != VK_SUCCESS ||
+                            prosper::test::backend_has_unproven_submission()) {
+                            g_exact_writer_probe.finish_failed_attempt();
+                            fprintf(stderr, "[exact-writer] attempt=%u verdict=void "
+                                            "reason=preceding-batch-completion-unproven\n",
+                                    writer_attempt);
+                            writer_attempt = 0;
+                        }
+                        if (writer_attempt) {
+                            exact_writer_draw_index = pass.front()->draw_index;
+                            exact_writer_input_bound = false;
+                            exact_writer_input_binding = UINT32_MAX;
+                            exact_writer_input_path = "missing";
+                        }
+                    }
                     auto backend_draws = build_bds(
-                        render_pass, batch_backend_submits ? &backend_submission : nullptr);
+                        render_pass, writer_attempt ? nullptr :
+                            (batch_backend_submits ? &backend_submission : nullptr));
+                    if (writer_attempt) {
+                        bool backend_bound = false;
+                        if (backend_draws.size() == 1)
+                            for (const auto& resource : backend_draws.front().R)
+                                backend_bound |= resource.set == 1 &&
+                                    resource.binding == exact_writer_input_binding &&
+                                    resource.persistent_render_target_id ==
+                                        g_exact_writer_spec.input;
+                        exact_writer_input_bound &= backend_bound;
+                        fprintf(stderr, "[exact-writer] attempt=%u binding draw=%llu "
+                                        "set=1 binding=%u addr=0x%llx path=%s "
+                                        "gpu-retained=%d backend-resource=%d "
+                                        "backend-draws=%zu\n",
+                                writer_attempt,
+                                (unsigned long long)exact_writer_draw_index,
+                                exact_writer_input_binding,
+                                (unsigned long long)g_exact_writer_spec.input,
+                                exact_writer_input_path, exact_writer_input_bound ? 1 : 0,
+                                backend_bound ? 1 : 0,
+                                backend_draws.size());
+                        // Raw files preserve exact target bytes. BMPs are inspection views and
+                        // can quantize HDR values, so neither one substitutes for the other.
+                        writer_snapshot = [&](uint64_t addr, const char* label,
+                                            uint32_t required_w, uint32_t required_h,
+                                            VkFormat required_format,
+                                            size_t& raw_nonzero, size_t& rgb_nonblack,
+                                            std::vector<uint8_t>* exact_bytes) {
+                            raw_nonzero = 0;
+                            rgb_nonblack = 0;
+                            const auto it = g_rtt.find(addr);
+                            if (it == g_rtt.end() || !it->second.gpu_valid ||
+                                !it->second.w || !it->second.h ||
+                                (required_w && it->second.w != required_w) ||
+                                (required_h && it->second.h != required_h) ||
+                                (required_format != VK_FORMAT_UNDEFINED &&
+                                 it->second.format != required_format) ||
+                                !prosper::test::find_persistent_color_target(
+                                    addr, it->second.w, it->second.h, it->second.format)) {
+                                fprintf(stderr, "[exact-writer] attempt=%u %s=unknown "
+                                                "reason=missing-or-invalid-exact-target "
+                                                "addr=0x%llx\n", writer_attempt, label,
+                                        (unsigned long long)addr);
+                                return false;
+                            }
+                            const RttSurf& surface = it->second;
+                            const VkFormat format = prosper::test::backend_color_format(surface.format);
+                            const uint32_t bpp = prosper::test::backend_color_bytes_per_pixel(format);
+                            const uint64_t texels = (uint64_t)surface.w * surface.h;
+                            if (!bpp || texels > SIZE_MAX / bpp ||
+                                !g_exact_writer_probe.charge_raw(texels * bpp)) {
+                                fprintf(stderr, "[exact-writer] attempt=%u %s=unknown "
+                                                "reason=raw-size-or-160-MiB-cap\n",
+                                        writer_attempt, label);
+                                return false;
+                            }
+                            std::vector<uint8_t> raw;
+                            std::string error;
+                            if (!prosper::test::readback_persistent_color_target(
+                                    addr, surface.w, surface.h, format, raw, error) ||
+                                raw.size() != texels * bpp) {
+                                fprintf(stderr, "[exact-writer] attempt=%u %s=unknown "
+                                                "reason=readback-failed error=%s got=%zu "
+                                                "expected=%llu\n", writer_attempt, label,
+                                        error.c_str(), raw.size(),
+                                        (unsigned long long)(texels * bpp));
+                                return false;
+                            }
+                            uint64_t hash = 1469598103934665603ull;
+                            for (uint8_t byte : raw) {
+                                raw_nonzero += byte != 0;
+                                hash = (hash ^ byte) * 1099511628211ull;
+                            }
+                            const auto bmp_bytes = prosper::frontend::compute_probe_bmp_bytes(
+                                surface.w, surface.h);
+                            if (!bmp_bytes || !g_exact_writer_probe.charge_bmp(*bmp_bytes)) {
+                                fprintf(stderr, "[exact-writer] attempt=%u %s=unknown "
+                                                "reason=128-MiB-BMP-cap\n", writer_attempt, label);
+                                return false;
+                            }
+                            char raw_path[512], bmp_path[512];
+                            const int raw_len = std::snprintf(raw_path, sizeof raw_path,
+                                "%s/exact_writer_a%u_%s_%llx.bin", frame_dir.c_str(),
+                                writer_attempt, label, (unsigned long long)addr);
+                            const int bmp_len = std::snprintf(bmp_path, sizeof bmp_path,
+                                "%s/exact_writer_a%u_%s_%llx.bmp", frame_dir.c_str(),
+                                writer_attempt, label, (unsigned long long)addr);
+                            if (raw_len <= 0 || (size_t)raw_len >= sizeof raw_path ||
+                                bmp_len <= 0 || (size_t)bmp_len >= sizeof bmp_path) {
+                                fprintf(stderr, "[exact-writer] attempt=%u %s=unknown "
+                                                "reason=artifact-path-too-long\n",
+                                        writer_attempt, label);
+                                return false;
+                            }
+                            FILE* raw_file = std::fopen(raw_path, "wb");
+                            bool raw_written = false;
+                            if (raw_file) {
+                                raw_written = std::fwrite(raw.data(), 1, raw.size(), raw_file)
+                                    == raw.size();
+                                raw_written = std::fclose(raw_file) == 0 && raw_written;
+                            }
+                            if (!raw_written) {
+                                if (raw_file) std::remove(raw_path);
+                                fprintf(stderr, "[exact-writer] attempt=%u %s=unknown "
+                                                "reason=raw-artifact-write-failed\n",
+                                        writer_attempt, label);
+                                return false;
+                            }
+                            const auto rgba = inspection_rgba8(raw, surface.w, surface.h, format);
+                            const bool bmp_written = prosper::test::dump_bmp(
+                                bmp_path, rgba, surface.w, surface.h);
+                            for (size_t p = 0; p + 3 < rgba.size(); p += 4)
+                                rgb_nonblack += rgba[p] || rgba[p + 1] || rgba[p + 2];
+                            fprintf(stderr, "[exact-writer] attempt=%u %s addr=0x%llx "
+                                            "extent=%ux%u fmt=%u raw_nonzero=%zu/%zu "
+                                            "raw_fnv=%016llx rgb_nonblack=%zu/%llu "
+                                            "raw=%s bmp=%s\n",
+                                    writer_attempt, label, (unsigned long long)addr,
+                                    surface.w, surface.h, (unsigned)format,
+                                    raw_nonzero, raw.size(), (unsigned long long)hash,
+                                    rgb_nonblack, (unsigned long long)texels,
+                                    raw_path, bmp_written ? bmp_path : "UNAVAILABLE");
+                            if (bmp_written && exact_bytes) *exact_bytes = std::move(raw);
+                            return bmp_written;
+                        };
+                        if (!exact_writer_input_bound || backend_draws.size() != 1) {
+                            fprintf(stderr, "[exact-writer] attempt=%u verdict=void "
+                                            "reason=missing-gpu-binding-or-backend-draw\n",
+                                    writer_attempt);
+                        } else if (writer_snapshot(g_exact_writer_spec.input, "input", 0, 0,
+                                            VK_FORMAT_UNDEFINED, writer_input_raw_nonzero,
+                                            writer_input_rgb_nonblack, nullptr) &&
+                                   prosper::frontend::exact_writer_scene_input_visible(
+                                       writer_input_raw_nonzero,
+                                       writer_input_rgb_nonblack)) {
+                            size_t output_before_nonzero = 0;
+                            size_t output_before_rgb = 0;
+                            writer_before_ok = writer_snapshot(g_exact_writer_spec.output,
+                                "output-before", gw, gh, pass_format,
+                                output_before_nonzero, output_before_rgb,
+                                &writer_output_before_raw);
+                        } else {
+                            fprintf(stderr, "[exact-writer] attempt=%u verdict=void "
+                                            "reason=input-missing-or-no-visible-RGB "
+                                            "raw-nonzero=%zu rgb-nonblack=%zu\n",
+                                    writer_attempt, writer_input_raw_nonzero,
+                                    writer_input_rgb_nonblack);
+                        }
+                    }
                     const auto build_done = timing_enabled
                         ? RenderClock::now() : RenderClock::time_point{};
                     prosper::test::BackendMrtOutputs mrt_outputs;
@@ -10562,6 +10896,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     const bool any_slot_bound = prosper::frontend::mrt_any_slot_bound(
                         pass_bases.data(),
                         static_cast<uint32_t>(std::min<size_t>(mrt_count, pass_bases.size())));
+                    prosper::test::BackendSubmissionBatchResult writer_completion{
+                        VK_NOT_READY, VK_NOT_READY};
                     std::vector<uint8_t> gpx = prosper::test::render_draws_rgba(
                         backend_draws, gw, gh, seed,
                         retained_uniform_clear ? retained_uniform_clear : clear_for(render_pass), true,
@@ -10569,7 +10905,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         seed1, retained_uniform_clear1 ? retained_uniform_clear1
                             : (use_color1 ? render_pass.front()->ps.clear_color1 : nullptr),
                         nullptr,
-                        batch_backend_submits ? &backend_submission : nullptr,
+                        writer_attempt ? nullptr :
+                            (batch_backend_submits ? &backend_submission : nullptr),
                         pass_i == items.size(), &mrt_outputs,
                         // #2283: only ask for colour pixels when something will read them.
                         //
@@ -10591,11 +10928,63 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         // Keyed on the base rather than the draws' colour write masks for the
                         // separate reason that 457/457 is evidence about THIS route, and a future
                         // title could legally mix a colour-writing draw into a pass that has a base.
-                        /*want_color_readback=*/any_slot_bound);
+                        /*want_color_readback=*/any_slot_bound,
+                        writer_attempt ? &writer_completion : nullptr);
                     const auto backend_done = timing_enabled
                         ? RenderClock::now() : RenderClock::time_point{};
                     const prosper::test::BackendColorTargetStats color_target_call =
                         prosper::test::backend_color_target_stats();
+                    if (writer_attempt) {
+                        const bool submitted = writer_completion.command_buffers == 1 &&
+                            writer_completion.submit_result == VK_SUCCESS &&
+                            writer_completion.wait_result == VK_SUCCESS &&
+                            !prosper::test::backend_has_unproven_submission();
+                        size_t output_after_nonzero = 0;
+                        size_t output_after_rgb = 0;
+                        const bool output_after_ok = writer_before_ok && submitted &&
+                            color_target_call.writes > 0 &&
+                            writer_snapshot(g_exact_writer_spec.output, "output-after",
+                                            gw, gh, pass_format, output_after_nonzero,
+                                            output_after_rgb, &writer_output_after_raw);
+                        const auto output_change = output_after_ok
+                            ? prosper::frontend::exact_writer_output_change(
+                                  writer_output_before_raw, writer_output_after_raw)
+                            : prosper::frontend::ExactWriterOutputChange::Unknown;
+                        const bool captured = output_after_ok &&
+                            output_change != prosper::frontend::ExactWriterOutputChange::Unknown &&
+                            exact_writer_input_bound && backend_draws.size() == 1;
+                        const bool bracketed = captured &&
+                            g_exact_writer_probe.mark_bracketed();
+                        if (bracketed)
+                            g_exact_writer_trace_id = writer_attempt;
+                        else
+                            g_exact_writer_probe.finish_failed_attempt();
+                        if (!bracketed && g_exact_writer_probe.exhausted())
+                            fprintf(stderr, "[exact-writer] selector exhausted: four "
+                                            "admitted candidates produced no complete bracket\n");
+                        fprintf(stderr, "[exact-writer] attempt=%u draw=%llu "
+                                        "backend-draws=%zu target-admitted=%llu "
+                                        "submit=%d wait=%d command-buffers=%llu "
+                                        "input-raw-nonzero=%zu input-rgb-nonblack=%zu "
+                                        "output-after-raw-nonzero=%zu output-after-rgb-nonblack=%zu "
+                                        "output-change=%s capture=%s "
+                                        "pipeline-and-draw-stats=check-bracketed-rows\n",
+                                writer_attempt,
+                                (unsigned long long)exact_writer_draw_index,
+                                backend_draws.size(),
+                                (unsigned long long)color_target_call.writes,
+                                (int)writer_completion.submit_result,
+                                (int)writer_completion.wait_result,
+                                (unsigned long long)writer_completion.command_buffers,
+                                writer_input_raw_nonzero, writer_input_rgb_nonblack,
+                                output_after_nonzero, output_after_rgb,
+                                output_change == prosper::frontend::ExactWriterOutputChange::Changed
+                                    ? "changed" :
+                                output_change == prosper::frontend::ExactWriterOutputChange::Identical
+                                    ? "byte-identical" : "unknown",
+                                bracketed ? "await-final" : "void");
+                        exact_writer_draw_index = UINT64_MAX;
+                    }
                     const prosper::test::BackendRenderTimingStats backend_call_timing = timing_enabled
                         ? prosper::test::backend_render_timing_stats()
                         : prosper::test::BackendRenderTimingStats{};
@@ -12103,6 +12492,39 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 if (!completed || !cpu_pairable || !written)
                     compute_present_final_id = 0;
             }
+            if (exact_writer_live && phase.final_span && g_exact_writer_trace_id) {
+                const uint64_t attempt = g_exact_writer_trace_id;
+                const bool cpu_pairable = !published_gpu && selected_pixels &&
+                    selected_pixels->size() == static_cast<size_t>(w) * h * 4u;
+                const auto bmp_bytes = prosper::frontend::compute_probe_bmp_bytes(w, h);
+                char path[512]{};
+                bool written = false;
+                if (cpu_pairable && bmp_bytes &&
+                    g_exact_writer_probe.charge_bmp(*bmp_bytes)) {
+                    const int length = std::snprintf(path, sizeof path,
+                        "%s/exact_writer_a%llu_final.bmp", frame_dir.c_str(),
+                        (unsigned long long)attempt);
+                    written = length > 0 && (size_t)length < sizeof path &&
+                        prosper::test::dump_bmp(path, *selected_pixels, w, h);
+                }
+                size_t rgb_nonblack = 0;
+                if (cpu_pairable)
+                    for (size_t p = 0; p + 3 < selected_pixels->size(); p += 4)
+                        rgb_nonblack += (*selected_pixels)[p] || (*selected_pixels)[p + 1] ||
+                                        (*selected_pixels)[p + 2];
+                fprintf(stderr, "[exact-writer] attempt=%llu endpoint render-submit=%d "
+                                "source=%s addr=0x%llx gpu-published=%d "
+                                "cpu-bytes=%zu rgb-nonblack=%zu image=%s "
+                                "output-to-present-lineage=unproven verdict=%s\n",
+                        (unsigned long long)attempt, g_this_submit, kena_final_source,
+                        (unsigned long long)kena_final_addr, published_gpu ? 1 : 0,
+                        selected_pixels ? selected_pixels->size() : 0,
+                        rgb_nonblack, written ? path : "UNAVAILABLE",
+                        written ? "await-cpu-publish-seq" : "void");
+                if (g_exact_writer_probe.finish_final(written))
+                    exact_writer_final_id = attempt;
+                g_exact_writer_trace_id = 0;
+            }
             if (timing_enabled && phase.final_span)
                 pending_timing.output_copy_ms += std::chrono::duration<double, std::milli>(
                     RenderClock::now() - output_copy_start).count();
@@ -12308,11 +12730,14 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         pending_timing, timing_enabled, phase.final_span);
                     prosper::gpu::RenderedFrame frame(std::move(selected_pixels));
                     frame.origin = frame_origin;
-                    frame.diagnostic_trace_id = compute_present_final_id
-                        ? compute_present_final_id : kena_trace_id;
+                    frame.diagnostic_trace_id = exact_writer_final_id
+                        ? exact_writer_final_id :
+                          (compute_present_final_id ? compute_present_final_id : kena_trace_id);
                     frame.diagnostic_gpu_published =
-                        (kena_trace_this_callback || compute_present_final_id) && published_gpu;
+                        (kena_trace_this_callback || compute_present_final_id ||
+                         exact_writer_final_id) && published_gpu;
                     frame.diagnostic_compute_present_probe = compute_present_final_id != 0;
+                    frame.diagnostic_exact_writer_probe = exact_writer_final_id != 0;
                     frame.diagnostic_source_kind = kena_final_source;
                     frame.diagnostic_source_address = kena_final_addr;
                     frame.diagnostic_served_retained = kena_served_retained;
@@ -13383,11 +13808,14 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             }
             prosper::gpu::RenderedFrame frame(std::move(selected_pixels));
             frame.origin = frame_origin;
-            frame.diagnostic_trace_id = compute_present_final_id
-                ? compute_present_final_id : kena_trace_id;
+            frame.diagnostic_trace_id = exact_writer_final_id
+                ? exact_writer_final_id :
+                  (compute_present_final_id ? compute_present_final_id : kena_trace_id);
             frame.diagnostic_gpu_published =
-                (kena_trace_this_callback || compute_present_final_id) && published_gpu;
+                (kena_trace_this_callback || compute_present_final_id ||
+                 exact_writer_final_id) && published_gpu;
             frame.diagnostic_compute_present_probe = compute_present_final_id != 0;
+            frame.diagnostic_exact_writer_probe = exact_writer_final_id != 0;
             frame.diagnostic_source_kind = kena_final_source;
             frame.diagnostic_source_address = kena_final_addr;
             frame.diagnostic_served_retained = kena_served_retained;

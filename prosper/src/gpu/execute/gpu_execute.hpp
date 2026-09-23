@@ -2746,6 +2746,7 @@ struct RenderedFrame {
     // publication can be joined to a screenshot manifest's source_seq.
     uint64_t diagnostic_trace_id = 0;
     bool diagnostic_compute_present_probe = false;
+    bool diagnostic_exact_writer_probe = false;
     // GPU scanout publication is separate from the CPU frame sequence used by screenshots.
     bool diagnostic_gpu_published = false;
     // Provenance belongs to storage, including when an earlier span's frame survives an empty
@@ -2782,6 +2783,7 @@ struct OrderedSubmitResult {
     // The final callback can be empty while an earlier span's frame remains publishable.
     uint64_t diagnostic_trace_id = 0;
     bool diagnostic_compute_present_probe = false;
+    bool diagnostic_exact_writer_probe = false;
     bool diagnostic_gpu_published = false;
     size_t render_spans = 0;
     bool compute_executed = false;

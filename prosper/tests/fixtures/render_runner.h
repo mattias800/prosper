@@ -6930,7 +6930,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                                   // vector is the only way to get results, which is
                                                   // how every offscreen test asserts. Defaults true so
                                                   // every existing caller is bit-identical.
-                                                  bool want_color_readback = true) {
+                                                  bool want_color_readback = true,
+                                                  BackendSubmissionBatchResult* diagnostic_completion = nullptr) {
     using TimingClock = std::chrono::steady_clock;
     const bool timing_log_enabled = getenv("PROSPER_RENDER_TIMING") != nullptr;
     const prosper::frontend::PerformanceTimingMode timing_mode =
@@ -12785,6 +12786,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     BackendSubmissionBatchResult batch_result;
     if (flush_now)
         batch_result = active_submission.submit_and_wait(dev, queue, backend_trace);
+    if (diagnostic_completion) *diagnostic_completion = batch_result;
     if (echo_mapped) {
         const uint8_t* bytes = static_cast<const uint8_t*>(echo_mapped);
         for (size_t i = 0; i < echo_count; ++i) {
@@ -13707,7 +13709,8 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                                               BackendSubmissionBatch* submission_batch = nullptr,
                                               bool flush_submission_batch = true,
                                               BackendMrtOutputs* mrt_outputs = nullptr,
-                                              bool want_color_readback = true) {   // #2283
+                                              bool want_color_readback = true,
+                                              BackendSubmissionBatchResult* diagnostic_completion = nullptr) {   // #2283
     const std::span<const BackendDraw> all(draws);
     // One preflight over the logical batch, before splitting or any render-pass state. A malformed
     // later segment must not leave earlier producer work submitted or speculative cache state live.
@@ -13718,7 +13721,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                                      persist_depth_stencil, color_target, seed_rgba1,
                                      clear_rgba1, out_rgba1, submission_batch,
                                      flush_submission_batch, {}, mrt_outputs,
-                                     want_color_readback);
+                                     want_color_readback, diagnostic_completion);
 
     BackendColorTargetStats aggregate_color{};
     BackendTextureUploadStats aggregate_textures{};

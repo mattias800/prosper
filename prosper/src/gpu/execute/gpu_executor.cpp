@@ -9262,6 +9262,7 @@ void observe_diagnostic_render(OrderedSubmitResult& result, const RenderedFrame&
     if (!rendered.diagnostic_trace_id) return;
     result.diagnostic_trace_id = rendered.diagnostic_trace_id;
     result.diagnostic_compute_present_probe = rendered.diagnostic_compute_present_probe;
+    result.diagnostic_exact_writer_probe = rendered.diagnostic_exact_writer_probe;
     result.diagnostic_gpu_published = rendered.diagnostic_gpu_published;
 }
 
@@ -11979,6 +11980,7 @@ bool execute_ordered_and_present(const GpuState& st, uint32_t width, uint32_t he
         std::fprintf(stderr, "%s trace=%llu submit=%llu cpu_source_seq=%llu "
                              "cpu_frame_from=%s cpu_source=%s cpu_addr=0x%llx cpu_retained=%d "
                              "cpu_bytes=%zu gpu_published=%d publish_gate=%d join=%s\n",
+                     result.diagnostic_exact_writer_probe ? "[exact-writer]" :
                      result.diagnostic_compute_present_probe
                          ? "[compute-present]" : "[kena-menu]",
                      (unsigned long long)diagnostic_trace_id,

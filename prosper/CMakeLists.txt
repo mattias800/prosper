@@ -1525,9 +1525,18 @@ if(TARGET prosper_core)
 
   add_executable(test_compute_present_probe
                  frontends/shared/tests/test_compute_present_probe.cpp)
-  target_include_directories(test_compute_present_probe PRIVATE frontends)
+  target_include_directories(test_compute_present_probe PRIVATE frontends src)
   target_link_libraries(test_compute_present_probe PRIVATE Threads::Threads)
   add_test(NAME compute_present_probe COMMAND test_compute_present_probe)
+  add_executable(test_exact_writer_probe
+                 frontends/shared/tests/test_exact_writer_probe.cpp)
+  target_include_directories(test_exact_writer_probe PRIVATE frontends)
+  target_link_libraries(test_exact_writer_probe PRIVATE Threads::Threads)
+  add_test(NAME exact_writer_probe COMMAND test_exact_writer_probe)
+  add_test(NAME compute_present_probe_launch_env
+           COMMAND ${CMAKE_COMMAND} -E env
+                   "PROSPER_COMPUTE_PRESENT_PROBE=0x300b220000:ms:30000:16"
+                   $<TARGET_FILE:test_compute_present_probe> --launch-env)
 
   # The optional retained-target selector bounds readback without changing the legacy broad
   # census. Malformed and oversized lists must decline every target rather than read them all.
@@ -4502,6 +4511,13 @@ if(TARGET prosper_live_renderer AND TARGET Vulkan::Vulkan)
       message(STATUS "zlib not found — skipping the screenshot tool")
     endif()
   endif()
+endif()
+
+if(BUILD_TESTING AND TARGET screenshot)
+  add_test(NAME compute_present_probe_screenshot_parser
+           COMMAND ${CMAKE_COMMAND} -E env
+                   "PROSPER_COMPUTE_PRESENT_PROBE=0x300b220000:ms:30000:16"
+                   $<TARGET_FILE:screenshot> --compute-present-parser-preflight)
 endif()
 
 # Optional FFmpeg AJM codec backend (#1347). Keep it outside prosper_core so core-only/headless
