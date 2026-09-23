@@ -2214,6 +2214,13 @@ if(TARGET prosper_core)
   target_include_directories(test_dynfetch_fold PRIVATE tests)
   target_link_libraries(test_dynfetch_fold PRIVATE prosper_core)
   add_test(NAME dynfetch_fold COMMAND test_dynfetch_fold)
+  # The ordinary test checks selected-dispatch results. This second arm proves the opt-in
+  # stage-fold profiler actually counts that selected path, so a zero game census is meaningful.
+  if(Python3_Interpreter_FOUND)
+    add_test(NAME dynfetch_fold_profile COMMAND "${Python3_EXECUTABLE}"
+      "${CMAKE_SOURCE_DIR}/tests/gpu/recompiler/test_dynfetch_fold_profile.py"
+      "$<TARGET_FILE:test_dynfetch_fold>")
+  endif()
   add_executable(fold_replay tools/fold_replay/main.cpp)
 target_link_libraries(fold_replay PRIVATE prosper_core)
 

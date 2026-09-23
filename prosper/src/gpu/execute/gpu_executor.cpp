@@ -44,6 +44,7 @@
 #include <bitset>
 #include <condition_variable>
 #include <filesystem>
+#include <functional>
 #include <iterator>
 #include <map>
 #include <mutex>
@@ -650,9 +651,18 @@ struct StageFoldProfileEntry {
     uint64_t srt_uses = 0;
     uint64_t code_dwords = 0;
     uint64_t guest_probes = 0;
+    // PC-relative dispatch selects one arm of a pixel shader. These are invocation-local even
+    // when decode/control metadata for the ordinary stream came from an exact-byte cache hit.
+    uint64_t pcrel_calls = 0;
+    uint64_t pcrel_failed_specializations = 0;
+    uint64_t pcrel_copied_instructions = 0;
+    std::unordered_set<uint32_t> pcrel_targets;
     double total_ms = 0.0;
     double decode_ms = 0.0;
     double guest_probe_ms = 0.0;
+    double pcrel_copy_ms = 0.0;
+    double pcrel_specialize_ms = 0.0;
+    double pcrel_plan_ms = 0.0;
     double max_ms = 0.0;
 };
 
@@ -670,21 +680,26 @@ struct StageFoldProfileKeyHash {
 };
 
 struct StageFoldProfiler {
-    std::mutex mutex;
     std::unordered_map<StageFoldProfileKey, StageFoldProfileEntry,
                        StageFoldProfileKeyHash> window;
     uint64_t calls = 0;
 };
 
 StageFoldProfiler& stage_fold_profiler() {
-    static StageFoldProfiler profiler;
+    // Profiling is opt-in. Per-thread windows avoid serializing renderer workers on every fold;
+    // the thread tag in each report keeps independent windows distinguishable in a merged log.
+    static thread_local StageFoldProfiler profiler;
     return profiler;
 }
 
 void record_stage_fold_profile(uint64_t code, uint32_t user_base, size_t code_dwords,
                                size_t instructions, size_t dynamic_fetches, size_t srt_uses,
                                uint64_t guest_probes, double elapsed_ms, double decode_ms,
-                               double guest_probe_ms, bool cached_control, uint64_t control_bytes,
+                               double guest_probe_ms, uint32_t pcrel_target,
+                               bool pcrel_specialization_succeeded,
+                               size_t pcrel_copied_instructions, double pcrel_copy_ms,
+                               double pcrel_specialize_ms, double pcrel_plan_ms,
+                               bool cached_control, uint64_t control_bytes,
                                uint64_t snapshot_slots, uint64_t snapshot_captures,
                                uint64_t snapshot_restores, uint64_t snapshot_bytes) {
     // snapshot_bytes is sizeof(FoldStateSnapshot), passed in because that type is declared inside
@@ -700,7 +715,6 @@ void record_stage_fold_profile(uint64_t code, uint32_t user_base, size_t code_dw
         return end != value && parsed > 0 ? parsed : 4096ull;
     }();
     StageFoldProfiler& profiler = stage_fold_profiler();
-    std::lock_guard lock(profiler.mutex);
     StageFoldProfileEntry& entry = profiler.window[{code, user_base}];
     entry.code = code;
     entry.user_base = user_base;
@@ -718,6 +732,15 @@ void record_stage_fold_profile(uint64_t code, uint32_t user_base, size_t code_dw
     entry.total_ms += elapsed_ms;
     entry.decode_ms += decode_ms;
     entry.guest_probe_ms += guest_probe_ms;
+    if (pcrel_target != UINT32_MAX) {
+        ++entry.pcrel_calls;
+        entry.pcrel_failed_specializations += !pcrel_specialization_succeeded;
+        entry.pcrel_copied_instructions += pcrel_copied_instructions;
+        entry.pcrel_targets.insert(pcrel_target);
+        entry.pcrel_copy_ms += pcrel_copy_ms;
+        entry.pcrel_specialize_ms += pcrel_specialize_ms;
+        entry.pcrel_plan_ms += pcrel_plan_ms;
+    }
     entry.max_ms = std::max(entry.max_ms, elapsed_ms);
     if (++profiler.calls < interval) return;
 
@@ -728,10 +751,18 @@ void record_stage_fold_profile(uint64_t code, uint32_t user_base, size_t code_dw
         return a.total_ms > b.total_ms;
     });
     double total = 0.0, decode = 0.0, probe = 0.0;
+    double pcrel_copy = 0.0, pcrel_specialize = 0.0, pcrel_plan = 0.0;
     uint64_t cached_calls = 0, instruction_total = 0;
+    uint64_t pcrel_calls = 0, pcrel_failed = 0, pcrel_copied = 0;
     uint64_t slots_total = 0, captures_total = 0, restores_total = 0;
     for (const auto& item : ranked) {
         total += item.total_ms; decode += item.decode_ms; probe += item.guest_probe_ms;
+        pcrel_copy += item.pcrel_copy_ms;
+        pcrel_specialize += item.pcrel_specialize_ms;
+        pcrel_plan += item.pcrel_plan_ms;
+        pcrel_calls += item.pcrel_calls;
+        pcrel_failed += item.pcrel_failed_specializations;
+        pcrel_copied += item.pcrel_copied_instructions;
         cached_calls += item.cached_control_calls; instruction_total += item.instructions;
         slots_total += item.snapshot_slots; captures_total += item.snapshot_captures;
         restores_total += item.snapshot_restores;
@@ -739,12 +770,17 @@ void record_stage_fold_profile(uint64_t code, uint32_t user_base, size_t code_dw
     // A snapshot is sizeof(FoldStateSnapshot) bytes, so `slots` is what the walk RESERVES and
     // `captures` what it uses. Their difference, times that size, is storage created for a save
     // that never happens -- the quantity this line exists to make visible.
-    std::fprintf(stderr, "[stage-fold-profile] calls=%llu shaders=%zu total=%.6f "
+    const size_t thread_tag = std::hash<std::thread::id>{}(std::this_thread::get_id());
+    std::fprintf(stderr, "[stage-fold-profile] thread=%zx calls=%llu shaders=%zu total=%.6f "
                         "decode=%.6f probe=%.6f body=%.6f instructions=%llu "
+                        "pcrel_calls=%llu pcrel_failed=%llu pcrel_copy_ins=%llu "
+                        "pcrel_copy=%.6f pcrel_specialize=%.6f pcrel_plan=%.6f "
                         "control_cached=%llu snapshot_slots=%llu captures=%llu restores=%llu "
                         "slot_bytes=%llu capture_bytes=%llu top-by-total-ms:\n",
-                 (unsigned long long)profiler.calls, ranked.size(), total, decode, probe,
+                 thread_tag, (unsigned long long)profiler.calls, ranked.size(), total, decode, probe,
                  total - decode - probe, (unsigned long long)instruction_total,
+                 (unsigned long long)pcrel_calls, (unsigned long long)pcrel_failed,
+                 (unsigned long long)pcrel_copied, pcrel_copy, pcrel_specialize, pcrel_plan,
                  (unsigned long long)cached_calls, (unsigned long long)slots_total,
                  (unsigned long long)captures_total, (unsigned long long)restores_total,
                  (unsigned long long)(slots_total * snapshot_bytes),
@@ -753,11 +789,11 @@ void record_stage_fold_profile(uint64_t code, uint32_t user_base, size_t code_dw
         const StageFoldProfileEntry& item = ranked[i];
         const double calls = static_cast<double>(item.calls);
         std::fprintf(stderr,
-                     "[stage-fold-profile] code=0x%llx base=%u calls=%llu total=%.6f avg=%.6f "
+                     "[stage-fold-profile] thread=%zx code=0x%llx base=%u calls=%llu total=%.6f avg=%.6f "
                      "max=%.6f decode=%.6f probe=%.6f body=%.6f dw/call=%.1f ins/call=%.1f "
                      "probes/call=%.1f dyn/call=%.1f srt/call=%.1f slots/call=%.1f "
                      "captures/call=%.2f control_cached=%llu control_bytes=%llu\n",
-                     (unsigned long long)item.code, item.user_base,
+                     thread_tag, (unsigned long long)item.code, item.user_base,
                      (unsigned long long)item.calls, item.total_ms, item.total_ms / calls,
                      item.max_ms, item.decode_ms / calls, item.guest_probe_ms / calls,
                      (item.total_ms - item.decode_ms - item.guest_probe_ms) / calls,
@@ -766,6 +802,23 @@ void record_stage_fold_profile(uint64_t code, uint32_t user_base, size_t code_dw
                      item.snapshot_slots / calls, item.snapshot_captures / calls,
                      (unsigned long long)item.cached_control_calls,
                      (unsigned long long)item.control_bytes);
+    }
+    std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) {
+        return (a.pcrel_copy_ms + a.pcrel_specialize_ms + a.pcrel_plan_ms) >
+               (b.pcrel_copy_ms + b.pcrel_specialize_ms + b.pcrel_plan_ms);
+    });
+    for (size_t i = 0, printed = 0; i < ranked.size() && printed < 8; ++i) {
+        const StageFoldProfileEntry& item = ranked[i];
+        if (!item.pcrel_calls) break;
+        ++printed;
+        std::fprintf(stderr,
+                     "[stage-fold-pcrel] thread=%zx code=0x%llx base=%u calls=%llu targets=%zu "
+                     "failed=%llu copy_ins=%llu copy=%.6f specialize=%.6f plan=%.6f\n",
+                     thread_tag, (unsigned long long)item.code, item.user_base,
+                     (unsigned long long)item.pcrel_calls, item.pcrel_targets.size(),
+                     (unsigned long long)item.pcrel_failed_specializations,
+                     (unsigned long long)item.pcrel_copied_instructions,
+                     item.pcrel_copy_ms, item.pcrel_specialize_ms, item.pcrel_plan_ms);
     }
     profiler.window.clear();
     profiler.calls = 0;
@@ -2941,14 +2994,30 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
     const auto decoded = decode_shader_cached(code, dwords);
     if (reader) reader->decoded_dwords = static_cast<uint32_t>(decoded->code.size());
     const auto decode_done = profile_fold ? FoldClock::now() : FoldClock::time_point{};
+    double pcrel_copy_ms = 0.0;
+    double pcrel_specialize_ms = 0.0;
+    double pcrel_plan_ms = 0.0;
+    size_t pcrel_copied_instructions = 0;
+    bool pcrel_specialization_succeeded = false;
     std::vector<Rdna2Inst> specialized;
     const std::vector<Rdna2Inst>* fold_instructions = &decoded->instructions;
     if (pcrel_dispatch_target != UINT32_MAX) {
+        const auto copy_start = profile_fold ? FoldClock::now() : FoldClock::time_point{};
         specialized = decoded->instructions;
+        if (profile_fold) {
+            pcrel_copy_ms = std::chrono::duration<double, std::milli>(
+                FoldClock::now() - copy_start).count();
+            pcrel_copied_instructions = specialized.size();
+        }
+        const auto specialize_start = profile_fold ? FoldClock::now() : FoldClock::time_point{};
         const PcrelDispatchInfo dispatch = pcrel_dispatch
             ? *pcrel_dispatch : rdna2_pcrel_dispatch_info(code, dwords);
-        if (!rdna2_specialize_pcrel_dispatch(specialized, dispatch,
-                                             pcrel_dispatch_target)) {
+        pcrel_specialization_succeeded = rdna2_specialize_pcrel_dispatch(
+            specialized, dispatch, pcrel_dispatch_target);
+        if (profile_fold)
+            pcrel_specialize_ms = std::chrono::duration<double, std::milli>(
+                FoldClock::now() - specialize_start).count();
+        if (!pcrel_specialization_succeeded) {
             // The fragment recompiler will reject the same unprovable specialization. Do not walk all
             // alternatives here: doing so would fabricate resource provenance for code that cannot run.
             specialized.clear();
@@ -2974,7 +3043,12 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
              fold_instructions == &decoded->shader_constant_instructions)
         control_plan = &decoded->shader_constant_control_plan;
     else {
+        const auto plan_start = profile_fold && pcrel_dispatch_target != UINT32_MAX
+            ? FoldClock::now() : FoldClock::time_point{};
         local_control_plan = build_fold_control_plan(ins);
+        if (profile_fold && pcrel_dispatch_target != UINT32_MAX)
+            pcrel_plan_ms = std::chrono::duration<double, std::milli>(
+                FoldClock::now() - plan_start).count();
         control_plan = &local_control_plan;
     }
     static const bool default_branch_exclusive_disabled =
@@ -5610,7 +5684,9 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
             srt_uses ? srt_uses->size() - srt_before : 0, guest_probe_calls,
             std::chrono::duration<double, std::milli>(FoldClock::now() - fold_start).count(),
             std::chrono::duration<double, std::milli>(decode_done - fold_start).count(),
-            guest_probe_ms, control_plan != &local_control_plan, control_plan->allocated_bytes(),
+            guest_probe_ms, pcrel_dispatch_target, pcrel_specialization_succeeded,
+            pcrel_copied_instructions, pcrel_copy_ms, pcrel_specialize_ms, pcrel_plan_ms,
+            control_plan != &local_control_plan, control_plan->allocated_bytes(),
             saved_at_branch.size(), snapshot_captures, snapshot_restores,
             sizeof(FoldStateSnapshot));
     return out;
