@@ -49,7 +49,7 @@ constexpr bool videoout_same_front_identity(const VideoOutBufferSnapshot& expect
 // Front-buffer selection and invalidation live under the registry mutex. A generation distinguishes
 // a newly registered buffer from an older registration that occupied the same numeric slot.
 bool videoout_select_buffer(int buffer_index, VideoOutBufferSnapshot& out,
-                            uint64_t source_flip_seq = 0);
+                            uint64_t source_flip_seq);
 bool videoout_front_snapshot(VideoOutBufferSnapshot& out);
 bool videoout_display_snapshot(VideoOutBufferSnapshot& out);
 int videoout_front_index();
@@ -133,7 +133,7 @@ struct PresentFrameLease {
 
 // Present the display buffer `buffer_index` (from sceVideoOutSubmitFlip). Records it as the front
 // buffer and bumps the present counter. `flip_arg` is the guest's flip label (echoed in flip status).
-void present_flip(int buffer_index, int64_t flip_arg, uint64_t source_flip_seq = 0);
+void present_flip(int buffer_index, int64_t flip_arg, uint64_t source_flip_seq);
 
 // Receiving side of the present path: the back-half renderer hands its finished frame (w*h pixels,
 // 4 bytes/pixel) to the present layer. present_readback then returns THIS frame — the real rendered
