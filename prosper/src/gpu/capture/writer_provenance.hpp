@@ -62,14 +62,14 @@ uint64_t guest_write_recorded_count(GuestWriterKind kind);
 //   * RELEASE_MEM / EOP label writes and EVENT_WRITE timestamps (command_processor.cpp) — GPU-side,
 //     so the CPU caveat above does not cover them, and they are 4-8 byte writes to exactly the kind
 //     of address a PROSPER_PROVENANCE_ADDR watch is pointed at;
-//   * a colour attachment that was bound but received no pixel write: the semantic provenance
-//     recorder sees the programmed target and draw, not the shader's final per-pixel output;
 //   * colour targets after the first draw to a given base — deduped deliberately, so the history
 //     holds one representative event per range rather than a write log;
 //   * a SKIPPED compute dispatch — it executes nothing, so it records nothing however the switches
 //     are set;
 //   * DMA destinations written by the capture/replay execute_ordered_items overload, which does not
 //     record while the live path does.
+// A ColorTarget event records a programmed attachment and draw; it cannot establish whether that
+// attachment received a pixel write. Interpret positive color history with that limit as well.
 // Do not try to make any one diagnostic line enumerate this; state scope and cite this list. #2111.
 const char* guest_write_recorder_summary();
 

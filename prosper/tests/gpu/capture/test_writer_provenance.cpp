@@ -91,9 +91,10 @@ int main() {
           "test reset clears the events and the cumulative counts together");
 
     // Kena's recognizable forest was retained in a third 3200x1800 color target, but the
-    // provenance probe previously recorded only MRT0/1 and falsely answered "no prior color-target
-    // write" for every consumer of that surface. Drive the actual GpuState diagnostic with a
-    // programmed MRT2 and MRT7; a direct call to record_guest_write would not cover that omission.
+    // provenance probe previously recorded only MRT0/1 and falsely answered "no prior programmed
+    // color target" for later pixel-stage resource-table candidates. Drive the actual GpuState
+    // diagnostic with programmed MRT2 and MRT7; a direct call to record_guest_write would not
+    // cover that omission.
 #ifdef _WIN32
     _putenv_s("PROSPER_PROVENANCE_DIM", "3200x1800");
 #else
