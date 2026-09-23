@@ -6,8 +6,8 @@ Linux/AMD run is on record yet.
 
 ## Current state — rung 2, gameplay reached with the world absent (2026-09-23)
 
-On `main` plus [#3814](https://github.com/mattias800/prosper/pull/3814) and
-[#3817](https://github.com/mattias800/prosper/pull/3817), `screenshot.exe` with the route
+On `main` (which has [#3817](https://github.com/mattias800/prosper/pull/3817)) plus
+[#3814](https://github.com/mattias800/prosper/pull/3814), `screenshot.exe` with the route
 `prosper/scripts/kena/reach-first-gameplay-prompt.pad` reaches, in order:
 
 | t (one 540 s run) | what renders |
@@ -87,5 +87,10 @@ About 2 in 12 launches hang before their first frame (no raw scanout either). No
 
 - Confirm that the black gameplay world (and the menu background) is the wave64 skip, on a 64-wide device or with
   a per-draw skip census of a gameplay frame; if it is, the title waits on #2147.
+  A Linux lane has since traced the menu scene ([#3813](https://github.com/mattias800/prosper/pull/3813)): the
+  forest is present in a retained MRT3 image that a one-block fragment shader samples at binding 37 — so on Linux
+  the background scene is rendered somewhere, and that PR explicitly does not yet say where it is lost. Read it
+  before assuming the Windows black background is the wave64 skip.
+- Host-side renderer reads of never-mapped guest memory (#3820), and `SCE_KERNEL_MAP_NO_OVERWRITE` (#3819).
 - The invisible logo movie: 150 frames decoded and delivered, none visible; delivered at ~2x real time.
 - The early-boot hang (about 2 in 12 launches).
