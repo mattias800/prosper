@@ -4,11 +4,13 @@
 #include <cstdio>
 #include <initializer_list>
 #include <string_view>
+#include <vector>
 
 int main() {
     using prosper::frontend::parse_kena_menu_trace;
     using prosper::frontend::kena_menu_trace_callback;
     using prosper::frontend::kena_menu_gpu_source;
+    using prosper::frontend::parse_kena_guest_peek_ranges;
     int failures = 0;
     const auto check = [&](bool condition, const char* message) {
         if (!condition) { std::fprintf(stderr, "FAIL: %s\n", message); ++failures; }
@@ -27,6 +29,22 @@ int main() {
     for (const char* invalid : {"", "21000", "ms:", "ms:-1", "ms:1x", "ms:120001",
                                 "ms:18446744073709551616"})
         check(!parse_kena_menu_trace(invalid).armed, "malformed or late deadline refuses");
+
+    std::vector<prosper::frontend::KenaGuestPeekRange> ranges;
+    check(parse_kena_guest_peek_ranges("0x3000:0x2d50000,0x4000:0x1770000", ranges) &&
+          ranges.size() == 2 && ranges[0].address == 0x3000 &&
+          ranges[0].bytes == 0x2d50000 && ranges[1].address == 0x4000 &&
+          ranges[1].bytes == 0x1770000,
+          "two explicit guest ranges parse without truncation");
+    for (const char* invalid : {"", "3000:0x100", "0x3000:100", "0x0:0x100",
+                                "0x3000:0x0", "0x3000:0x4000001", "0x3000:0x1,",
+                                "0x3000:0x1,,0x4000:0x1",
+                                "0x3000:0x1,0x4000:0x1,0x5000:0x1",
+                                "0x3000:0xffffffffffffffff", "0x3000:0x1junk",
+                                "0xfffffffffffffff0:0x11"}) {
+        check(!parse_kena_guest_peek_ranges(invalid, ranges) && ranges.empty(),
+              "malformed or oversized guest peek refuses every range");
+    }
 
     const auto gpu_new = kena_menu_gpu_source(true, true, 0x1000, 91, 17);
     check(std::string_view(gpu_new.kind) == "gpu-front" && gpu_new.address == 0x1000 &&
