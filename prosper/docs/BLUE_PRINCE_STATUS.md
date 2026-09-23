@@ -42,6 +42,12 @@ reviewed live capture is published as `assets/screenshots/blue-prince-hall.webp`
 
 ## Landed fixes this arc (evidence on the linked issues/PRs)
 
+- **#3797 (2026-09-23, Windows/NVIDIA only)** — on a 32-wide host the hall lost the table bouquet and the
+  screen-edge lens fringe, and `blue-prince-hall` failed (13,609 colours against its 40,000 floor, and all 96
+  window samples byte-identical where the tier-on run has 96 distinct). Four `wave-any` fragment modules that #3480's width-independence proof declines were refused,
+  dropping 2.5% of the 1080p draws and 0.5% at 512x512. The partial-wave tier (#3794) now admits them on
+  this title: same binary, tier on vs `PROSPER_NO_PARTIAL_WAVE_FRAGMENT=1`, the guard fails 2 of 2 runs
+  off and passes on, with the bouquet back as the PS5 oracle shows it. Native-wave64 hosts are unaffected.
 - **#1335/#1344** — the Day One frozen/blown frame: ONE stale arena slot folded
   `(PA_SC_SCREEN_SCISSOR_BR, 0)`; degenerate-SCREEN-pair recovery in the scissor combine.
 - **#1349/#1350** — `PA_SU_POLY_OFFSET` depth bias decoded + applied (capture v29 retains it;

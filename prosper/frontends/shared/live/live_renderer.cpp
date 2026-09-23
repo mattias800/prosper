@@ -1413,10 +1413,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
     //   PPSA04263 Grand Theft Auto V         the original reviewed bank route
     //
     // Two of those titles are on the list although most or some of their modules do NOT clear. That
-    // is safe BECAUSE the decision is per module: the 11 that cannot be proved keep the exact-width
-    // contract and are refused individually. Admitting a title no longer means trusting all of its
-    // shaders, which is what made a title the wrong unit before. (On PPSA04263 alone the partial-wave
-    // tier below admits the modules this proof declines; on the other four it does not -- #3797.)
+    // is safe BECAUSE the decision is per module: under THIS tier the 11 that cannot be proved keep
+    // the exact-width contract and are refused individually. Admitting a title no longer means trusting
+    // all of its shaders, which is what made a title the wrong unit before. (The partial-wave tier
+    // below admits those 11 on its own, different argument; measured on all five titles, #3797.)
     //
     // NOT on this list: PPSA21564 (6 measured refusals, no dump and no after-arm yet). One survey
     // run away, and with the per-module proof the run is confirmation rather than a gamble.
@@ -1429,17 +1429,27 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
         !PROSPER_ENV_VALUE("PROSPER_STRICT_FRAGMENT_WAVE_WIDTH") &&
         std::any_of(std::begin(kNativeFragmentVoteTitles), std::end(kNativeFragmentVoteTitles),
                     [&](const char* id) { return title_id == id; });
-    // The partial-wave tier (#3464, rdna2_to_spirv.hpp kFragmentWavePartialWaveExactReasons) is scoped
-    // to GTA V, the one title measured with it on and off (same binary, same route: 188 refused and a
-    // black world, against 0 refused and the bank lit). Its argument does not depend on the title, but
-    // on the other four titles above it would admit exactly the modules the vote tier's proof declined,
-    // and nobody has surveyed those with it -- three are rung-6 snapshot-guarded. Extending it is
-    // #3797's before/after work, not a side effect of this line.
+    // The partial-wave tier (#3464, rdna2_to_spirv.hpp kFragmentWavePartialWaveExactReasons) runs on
+    // every title above. Its argument does not depend on the title, but each title was still measured
+    // before joining, because on these titles it admits exactly the modules the vote tier's proof
+    // declined. Same binary, tier on vs PROSPER_NO_PARTIAL_WAVE_FRAGMENT=1, fresh saves, the reviewed
+    // snapshot routes on Windows/NVIDIA (32..32):
+    //   PPSA04263 GTA V          188 refused -> 0; the bank world renders instead of black (#3794)
+    //   PPSA25009 Blue Prince      4 refused -> 0 on the hall route; the bouquet and the edge lens
+    //                              fringe return and blue-prince-hall passes (it FAILS with the tier
+    //                              off: 13,609 colours against a 40,000 floor) (#3797)
+    //   PPSA01885 Evergate         4 refused -> 0 on the gameplay route; the save-slot portals show
+    //                              their world preview instead of being empty (#3797)
+    //   PPSA13579 Blasphemous 2    7 refused -> 0 (about 5% of gameplay draws, at a 640x360 target); the
+    //                              composite does not change beyond frame-to-frame noise (#3797)
+    //   PPSA02664 Alex Kidd DX     0 refused either way; the tier changes no admission (#3797)
+    // Every guard passes with the tier on. It stays a title list, not a rule: the other titles have
+    // no before/after, and a title joins with one survey run.
     //
     // Two switches turn it off: PROSPER_NO_PARTIAL_WAVE_FRAGMENT isolates THIS tier for an A/B on one
     // binary (the renderer then behaves exactly as before the tier existed), and
     // PROSPER_STRICT_FRAGMENT_WAVE_WIDTH, which disables both tiers through native_fragment_vote_width.
-    const bool partial_wave_fragment = native_fragment_vote_width && title_id == "PPSA04263" &&
+    const bool partial_wave_fragment = native_fragment_vote_width &&
         !PROSPER_ENV_VALUE("PROSPER_NO_PARTIAL_WAVE_FRAGMENT");
     // Create (and thereby PUBLISH) the renderer's Vulkan device up front so the compute backend can
     // adopt it (#1091). Compute initializes lazily on its first dispatch, and titles routinely
