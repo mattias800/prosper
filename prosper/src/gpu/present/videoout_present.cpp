@@ -34,17 +34,17 @@ bool current_scanout(VideoOutBufferSnapshot& out, int* index = nullptr) {
 }
 }
 
-void present_write_frame(const void* pixels, uint32_t w, uint32_t h, PresentFrameOrigin origin) {
-    if (!pixels || !w || !h) return;
+uint64_t present_write_frame(const void* pixels, uint32_t w, uint32_t h, PresentFrameOrigin origin) {
+    if (!pixels || !w || !h) return 0;
     size_t bytes = (size_t)w * h * 4;
     auto owned = std::make_shared<std::vector<uint8_t>>(bytes);
     std::memcpy(owned->data(), pixels, bytes);
-    present_write_frame(std::move(owned), w, h, origin);
+    return present_write_frame(std::move(owned), w, h, origin);
 }
 
-void present_write_frame(std::shared_ptr<const std::vector<uint8_t>> pixels,
-                         uint32_t w, uint32_t h, PresentFrameOrigin origin) {
-    if (!pixels || !w || !h || pixels->size() != (size_t)w * h * 4) return;
+uint64_t present_write_frame(std::shared_ptr<const std::vector<uint8_t>> pixels,
+                             uint32_t w, uint32_t h, PresentFrameOrigin origin) {
+    if (!pixels || !w || !h || pixels->size() != (size_t)w * h * 4) return 0;
     // Count this publication AND whether it carried new content, before the present mutex. A
     // framerate derived from g_frame_seq alone reads full speed for a title whose every frame is the
     // renderer's re-served retained one -- the R-Type Delta (#2783) shape, and instrument trap 90.
@@ -59,7 +59,7 @@ void present_write_frame(std::shared_ptr<const std::vector<uint8_t>> pixels,
     // number, so a consumer can never pair one publication's bytes with another's provenance.
     g_frame_origin = origin;
     g_have_frame.store(true, std::memory_order_release);
-    g_frame_seq.fetch_add(1, std::memory_order_relaxed);
+    return g_frame_seq.fetch_add(1, std::memory_order_relaxed) + 1;
 }
 
 uint64_t present_frame_seq() { return g_frame_seq.load(std::memory_order_relaxed); }

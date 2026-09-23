@@ -123,11 +123,12 @@ void present_flip(int buffer_index, int64_t flip_arg);
 // 4 bytes/pixel) to the present layer. present_readback then returns THIS frame — the real rendered
 // pixels — instead of the raw guest display buffer, closing the loop shader → render →
 // present_write_frame → present_readback. Thread-safe (renderer writes, present reads).
-void present_write_frame(const void* pixels, uint32_t w, uint32_t h,
-                         PresentFrameOrigin origin = PresentFrameOrigin::Composited);
-void present_write_frame(std::shared_ptr<const std::vector<uint8_t>> pixels,
-                         uint32_t w, uint32_t h,
-                         PresentFrameOrigin origin = PresentFrameOrigin::Composited);
+// Returns the exact published sequence while holding the frame mutex, or 0 on refusal.
+uint64_t present_write_frame(const void* pixels, uint32_t w, uint32_t h,
+                             PresentFrameOrigin origin = PresentFrameOrigin::Composited);
+uint64_t present_write_frame(std::shared_ptr<const std::vector<uint8_t>> pixels,
+                             uint32_t w, uint32_t h,
+                             PresentFrameOrigin origin = PresentFrameOrigin::Composited);
 
 // True once a rendered frame has been handed in (readback returns rendered pixels, not the guest buffer).
 bool present_has_frame();

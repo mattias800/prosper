@@ -170,7 +170,7 @@ int main() {
     CHECK(!gpu::present_has_frame(), "no rendered frame before the renderer hands one in");
     std::vector<uint8_t> rendered(FB_BYTES);
     for (size_t i = 0; i < FB_BYTES; i++) rendered[i] = (uint8_t)(i & 0xff);   // a distinctive gradient
-    gpu::present_write_frame(rendered.data(), W, H);
+    const uint64_t rendered_seq = gpu::present_write_frame(rendered.data(), W, H);
     CHECK(gpu::present_has_frame(), "present_has_frame after write");
     std::fill(out.begin(), out.end(), 0xEE);
     size_t rb = gpu::present_readback(out.data(), out.size());
@@ -178,8 +178,11 @@ int main() {
     CHECK(memcmp(out.data(), rendered.data(), FB_BYTES) == 0, "readback returns the exact rendered pixels");
     gpu::PresentSnapshot snap;
     CHECK(gpu::present_snapshot(snap), "atomic present snapshot is available");
-    CHECK(snap.source == gpu::PresentSource::Rendered && snap.source_seq == gpu::present_frame_seq(),
-          "snapshot identifies the rendered publication");
+    CHECK(snap.source == gpu::PresentSource::Rendered && snap.source_seq == rendered_seq,
+          "the write returns the exact sequence carried by the rendered snapshot");
+    CHECK(gpu::present_write_frame(nullptr, W, H) == 0 &&
+          gpu::present_frame_seq() == rendered_seq,
+          "a refused publication has no sequence and does not advance the counter");
     CHECK(snap.width == W && snap.height == H && snap.rgba == rendered,
           "snapshot metadata and pixels describe the same frame");
 

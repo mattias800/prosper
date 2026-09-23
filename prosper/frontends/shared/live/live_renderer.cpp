@@ -46,6 +46,7 @@
 #include "shared/media/avplayer_plane_policy.hpp"    // which sampled resource is AvPlayer's NV12 chroma plane
 #include "shared/present/guest_scanout_present.hpp"    // publishing the guest's own flipped buffer (#1968)
 #include "shared/diagnostics/diagnostic_window.hpp"        // census window by callback ordinal or by elapsed time
+#include "shared/diagnostics/kena_menu_trace_policy.hpp"    // one passive title-menu source trace
 #include "shared/diagnostics/persistent_readback_filter.hpp" // bounded retained-target readback
 #include "gpu/diagnostics/diag_ratelimit.hpp"       // ordinal + sparse tail for capped diagnostics
 #include "host/memory/guest_write_watch.hpp"
@@ -1525,6 +1526,15 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
         prosper::frontend::parse_diagnostic_window(PROSPER_ENV_VALUE("PROSPER_PASS_LOG"))};
     static prosper::frontend::DiagnosticWindow g_persist_window{
         prosper::frontend::parse_diagnostic_window(PROSPER_ENV_VALUE("PROSPER_DUMP_PERSISTENT"))};
+    static const auto g_kena_menu_trace = [] {
+        const char* value = PROSPER_ENV_VALUE("PROSPER_KENA_MENU_TRACE");
+        const auto spec = prosper::frontend::parse_kena_menu_trace(value);
+        if (value)
+            fprintf(stderr, "[kena-menu] %s %s (one final callback, passive source trace)\n",
+                    spec.armed ? "armed" : "refused",
+                    spec.armed ? value : "expected ms:0..120000");
+        return spec;
+    }();
     static const auto g_persist_filter = [] {
         const char* spec = PROSPER_ENV_VALUE("PROSPER_DUMP_PERSISTENT_ADDRS");
         auto filter = prosper::frontend::parse_persistent_readback_filter(spec);
@@ -2268,6 +2278,18 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             if (phase.first_span || g_this_submit < 0) {
                 g_this_submit = g_submit_idx++;
                 g_force_this_submit = false;
+            }
+            static bool g_kena_trace_fired = false;
+            const bool kena_trace_this_callback = prosper::frontend::kena_menu_trace_callback(
+                g_kena_menu_trace,
+                g_kena_menu_trace.armed ? diagnostic_elapsed_ms() : 0,
+                g_kena_trace_fired, phase.final_span);
+            const uint64_t kena_trace_id = kena_trace_this_callback
+                ? g_pass_log_submit.load(std::memory_order_relaxed) + 1 : 0;
+            if (kena_trace_this_callback) {
+                g_kena_trace_fired = true;
+                fprintf(stderr, "[kena-menu] trace=%llu callback armed render_submit=%d\n",
+                        (unsigned long long)kena_trace_id, g_this_submit);
             }
             if (g_this_submit > g_render_last) return {};
             static const int g_rttlog_min_submit = getenv("PROSPER_RTTLOG_MIN_SUBMIT")
@@ -9169,6 +9191,11 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             // available rather than only that nothing was.
             prosper::frontend::PresentSourceChoice present_choice =
                 prosper::frontend::PresentSourceChoice::None;
+            const char* kena_final_source = "none";
+            uint64_t kena_final_addr = 0;
+            uint64_t kena_gpu_flip = 0;
+            uint64_t kena_gpu_publication_id = 0;
+            bool kena_served_retained = false;
             uint32_t px_front_w = 0, px_front_h = 0;
             uint32_t px_vo_w = 0, px_vo_h = 0;
             uint32_t px_last_w = 0, px_last_h = 0;
@@ -11043,6 +11070,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 : present_choice == PresentSourceChoice::Vo    ? px_vo
                                 : present_choice == PresentSourceChoice::Last  ? px_last
                                 : nullptr;
+                if (selected_pixels) {
+                    kena_final_source = prosper::frontend::present_source_name(present_choice);
+                    kena_final_addr = present_choice == PresentSourceChoice::Front ? px_front_base
+                                    : present_choice == PresentSourceChoice::Vo    ? px_vo_base
+                                    : present_choice == PresentSourceChoice::Last  ? px_last_base : 0;
+                }
                 // #2283's blocking arm, measured rather than argued: is a pass whose colour target is
                 // DISABLED (CB_COLOR0_INFO.FORMAT == 0, CB_COLOR_INVALID) ever chosen as the frame
                 // that gets published? The proposed fix stops forcing a readback on such a pass, and
@@ -11341,6 +11374,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 };
                 const int front = prosper::gpu::present_front_index();
                 static uint64_t last_gpu_publish_flip = UINT64_MAX;
+                static uint64_t last_gpu_publication_id = 0;
                 const uint64_t current_flip = prosper_vo_flip_count();
                 const bool new_gpu_flip = prosper::frontend::present_blit_has_new_flip(
                     last_gpu_publish_flip, current_flip);
@@ -11376,20 +11410,43 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             prosper::test::find_persistent_color_target(
                                 front_va, rit->second.w, rit->second.h, fmt);
                         if (tgt && tgt->image && tgt->layout != VK_IMAGE_LAYOUT_UNDEFINED) {
+                            uint64_t publication_id = 0;
                             published_gpu = prosper::frontend::present_blit_publish(
                                 tgt->image, tgt->layout, fmt, rit->second.w, rit->second.h,
                                 current_flip,
-                                prosper::test::persistent_color_producer_source(*tgt));
-                            if (published_gpu) last_gpu_publish_flip = current_flip;
+                                prosper::test::persistent_color_producer_source(*tgt),
+                                &publication_id);
+                            if (published_gpu) {
+                                last_gpu_publish_flip = current_flip;
+                                last_gpu_publication_id = publication_id;
+                            }
                         }
                     }
+                }
+                const auto gpu_source = prosper::frontend::kena_menu_gpu_source(
+                    published_gpu, new_gpu_flip,
+                    front >= 0 ? prosper_vo_buffer_addr(front) : 0, current_flip,
+                    last_gpu_publication_id);
+                if (gpu_source.address) {
+                    kena_final_source = gpu_source.kind;
+                    kena_final_addr = gpu_source.address;
+                    kena_gpu_flip = gpu_source.flip;
+                    kena_gpu_publication_id = gpu_source.publication_id;
                 }
                 if (!published_gpu) handoff_trace.emit(prosper::perf::PresentHandoffEvent::CpuFallbackNeeded);
                 const RttSurf* scanout = (!published_gpu && front >= 0)
                     ? cached_scanout(prosper_vo_buffer_addr(front)) : nullptr;
+                if (scanout) {
+                    kena_final_source = "cached-front";
+                    kena_final_addr = prosper_vo_buffer_addr(front);
+                }
                 if (!published_gpu && !scanout) {
                     for (int i = 0; i < prosper_vo_buffer_count(); ++i)
-                        if ((scanout = cached_scanout(prosper_vo_buffer_addr(i)))) break;
+                        if ((scanout = cached_scanout(prosper_vo_buffer_addr(i)))) {
+                            kena_final_source = "cached-alternate-vo";
+                            kena_final_addr = prosper_vo_buffer_addr(i);
+                            break;
+                        }
                 }
                 if (scanout) selected_pixels = scanout->rgba;
                 // Last resort before the retained frame: the flipped buffer's own guest memory.
@@ -11510,6 +11567,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     if (guest_scanout_pixels && guest_scanout_pixels->size() == present_extent_bytes) {
                         selected_pixels = guest_scanout_pixels;
                         frame_origin = prosper::gpu::PresentFrameOrigin::GuestScanout;
+                        kena_final_source = "guest-scanout";
+                        kena_final_addr = prosper::gpu::present_front_address();
                     }
                 }
                 // Hold the last good scanout across VideoOut buffer rotation. Bendy (PPSA27616) rapidly
@@ -11528,6 +11587,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 // the same predicate as publishing, so a frame prosper could not publish can never
                 // become the frame it serves later.
                 static std::shared_ptr<const std::vector<uint8_t>> last_scanout_present;
+                static uint64_t last_scanout_source_addr = 0;
+                static const char* last_scanout_source_kind = "none";
                 // Provenance is a property of the RETAINED frame, not of the submit that re-serves
                 // it. Post-wall, Frontiers re-serves one retained frame thousands of times (fresh +1
                 // against retained +2,048 between two shortfall ordinals), so a label that reset on
@@ -11543,6 +11604,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 current_bytes, retained_bytes, present_extent_bytes)) {
                         case prosper::frontend::RetainedFrameAction::StoreCurrent:
                             last_scanout_present = selected_pixels;
+                            last_scanout_source_addr = kena_final_addr;
+                            last_scanout_source_kind = kena_final_source;
                             last_scanout_present_from_guest =
                                 frame_origin == prosper::gpu::PresentFrameOrigin::GuestScanout;
                             present_frames_stored.fetch_add(1, std::memory_order_relaxed);
@@ -11624,9 +11687,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             break;
                         case prosper::frontend::RetainedFrameAction::ServeRetained:
                             selected_pixels = last_scanout_present;
+                            kena_served_retained = true;
                             frame_origin = last_scanout_present_from_guest
                                 ? prosper::gpu::PresentFrameOrigin::GuestScanout
                                 : prosper::gpu::PresentFrameOrigin::Composited;
+                            kena_final_source = last_scanout_source_kind;
+                            kena_final_addr = last_scanout_source_addr;
                             present_frames_served.fetch_add(1, std::memory_order_relaxed);
                             // A stale-but-correct frame IS what the guest sees, so say so rather than
                             // letting a silent substitution read as a healthy present. Under no extent
@@ -11662,6 +11728,38 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             front, (unsigned long long)(front >= 0 ? prosper_vo_buffer_addr(front) : 0),
                             scanout ? "HIT" : "MISS", nb);
                 }
+            }
+            if (kena_trace_this_callback) {
+                size_t rgb_nonblack = 0;
+                if (selected_pixels)
+                    for (size_t p = 0; p + 3 < selected_pixels->size(); p += 4)
+                        rgb_nonblack += (*selected_pixels)[p] || (*selected_pixels)[p + 1] ||
+                                        (*selected_pixels)[p + 2];
+                const char* dir = getenv("PROSPER_FRAME_DIR");
+                char path[512];
+                bool final_written = false;
+                if (dir && *dir && !published_gpu && selected_pixels &&
+                    selected_pixels->size() == static_cast<size_t>(w) * h * 4u) {
+                    const int length = std::snprintf(path, sizeof path,
+                                                     "%s/kena_trace_%llu_final.bmp", dir,
+                                                     (unsigned long long)kena_trace_id);
+                    final_written = length > 0 && static_cast<size_t>(length) < sizeof path &&
+                                    prosper::test::dump_bmp(path, *selected_pixels, w, h);
+                }
+                fprintf(stderr, "[kena-menu] trace=%llu final source=%s addr=0x%llx "
+                                "candidate=%s front=0x%llx retained=%d gpu_publish=%d "
+                                "gpu_flip=%llu gpu_publication=%llu cpu_bytes=%zu "
+                                "cpu_rgb_nonblack=%zu image=%s\n",
+                        (unsigned long long)kena_trace_id, kena_final_source,
+                        (unsigned long long)kena_final_addr,
+                        prosper::frontend::present_source_name(present_choice),
+                        (unsigned long long)prosper::gpu::present_front_address(),
+                        kena_served_retained ? 1 : 0,
+                        published_gpu ? 1 : 0,
+                        (unsigned long long)kena_gpu_flip,
+                        (unsigned long long)kena_gpu_publication_id,
+                        selected_pixels ? selected_pixels->size() : 0, rgb_nonblack,
+                        final_written ? path : "UNAVAILABLE");
             }
             if (timing_enabled && phase.final_span)
                 pending_timing.output_copy_ms += std::chrono::duration<double, std::milli>(
@@ -11868,6 +11966,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         pending_timing, timing_enabled, phase.final_span);
                     prosper::gpu::RenderedFrame frame(std::move(selected_pixels));
                     frame.origin = frame_origin;
+                    frame.diagnostic_trace_id = kena_trace_id;
                     return frame;
                 }
                 struct TimingTotals {
@@ -12935,6 +13034,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             }
             prosper::gpu::RenderedFrame frame(std::move(selected_pixels));
             frame.origin = frame_origin;
+            frame.diagnostic_trace_id = kena_trace_id;
             return frame;
         });
     fprintf(stderr, "[render] live Vulkan submit renderer registered (dump=%d, frames -> %s)\n",
