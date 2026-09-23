@@ -1,4 +1,5 @@
 #include "gpu/timeline/gpu_timeline.hpp"
+#include "gpu/timeline/menu_capture_runtime.hpp"
 
 #include "build_revision.hpp"
 #include "diagnostics/exit_reports.hpp"
@@ -3435,6 +3436,7 @@ void record_gpu_timeline_submit(const GpuState& state, uint64_t submit_no) {
     // increment for the grab hook, so the marginal cost of this one is not measurable.
     g_timeline_submit_hook_reached.fetch_add(1, std::memory_order_relaxed);
     interactive_frame_bundle_on_submit(state, submit_no);
+    menu_draw_capture_on_submit(state, submit_no);
     if (!gpu_timeline_requested()) return;
     GpuTimelineWriter* writer = runtime_recorder().get();
     if (!writer) return;

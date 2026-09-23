@@ -14,6 +14,7 @@
 #include "shared/rtt/mrt_extent.hpp"
 #include "shared/rtt/mrt_binding.hpp"               // which MRT slot may join a pass (measured extents only)
 #include "shared/present/readback_policy.hpp"
+#include "shared/present/selected_source_identity.hpp"
 #include "shared/diagnostics/capture_renderer_policy.hpp"
 #include "shared/texture/write_watch_policy.hpp"
 #include "shared/texture/validation_census.hpp"
@@ -9149,6 +9150,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 pending_timing.prelude_ms += std::chrono::duration<double, std::milli>(
                     pass_timing_start - callback_timing_start).count();
             std::shared_ptr<const std::vector<uint8_t>> selected_pixels;
+            uint64_t selected_source_submit = 0;
             // Provenance of whatever `selected_pixels` ends up holding. It travels with the frame to
             // the present layer so a verification gate can tell a composited frame from a
             // republished guest scanout — `--require-composited-frame` asserts prosper rendered
@@ -9174,6 +9176,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             uint32_t px_vo_w = 0, px_vo_h = 0;
             uint32_t px_last_w = 0, px_last_h = 0;
             uint64_t px_front_base = 0, px_vo_base = 0, px_last_base = 0;
+            // Provenance belongs to each candidate's immutable pixels, not the final callback.
+            // A retained image can be served by a later submit, and its source must travel with it.
+            uint64_t px_front_source_submit = 0, px_vo_source_submit = 0,
+                     px_last_source_submit = 0;
             // The raw CB_COLOR0_INFO.FORMAT of the pass that produced each present candidate, so the
             // SELECTED one's format can be reported (#2283). UINT32_MAX is "no candidate recorded",
             // deliberately not 0: 0 is CB_COLOR_INVALID, a real and meaningful value here, and the
@@ -10874,13 +10880,19 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         if (base && base == front_va) {                          // the flipped buffer
                             px_front = pass_pixels; px_front_w = gw; px_front_h = gh;
                             px_front_base = base; px_front_fmt = candidate_fmt;
+                            px_front_source_submit =
+                                color_target_call.writes ? phase.source_submit : 0;
                         }
                         if (is_vo) {                                            // any registered scanout
                             px_vo = pass_pixels; px_vo_w = gw; px_vo_h = gh;
                             px_vo_base = base; px_vo_fmt = candidate_fmt;
+                            px_vo_source_submit =
+                                color_target_call.writes ? phase.source_submit : 0;
                         }
                         px_last = pass_pixels;                                  // last non-empty (fallback)
                         px_last_w = gw; px_last_h = gh; px_last_base = base; px_last_fmt = candidate_fmt;
+                        px_last_source_submit =
+                            color_target_call.writes ? phase.source_submit : 0;
                     } else if (!explicit_depth_extent && !rendered_pixels.empty() &&
                                prefix_inspect_publish()) {
                         // #1330: under gpu_replay's ordered-prefix inspection (--draw/--draw-steps/
@@ -10893,6 +10905,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             inspection_rgba8(rendered_pixels, gw, gh, pass_format);
                         if (!converted.empty())
                             px_last = std::make_shared<const std::vector<uint8_t>>(std::move(converted));
+                        px_last_source_submit = 0; // inspection conversion is not the native pixels
                     }
                     // PROSPER_PASS_LOG=<min-submit>|ms:<millis>: per-pass publish provenance for 3
                     // submits — which pass produced pixels, its target identity, and the defer
@@ -11044,6 +11057,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 : present_choice == PresentSourceChoice::Vo    ? px_vo
                                 : present_choice == PresentSourceChoice::Last  ? px_last
                                 : nullptr;
+                selected_source_submit = prosper::frontend::selected_source_submit(
+                    selected_pixels, {{{px_front, px_front_source_submit},
+                                       {px_vo, px_vo_source_submit},
+                                       {px_last, px_last_source_submit}}});
                 // #2283's blocking arm, measured rather than argued: is a pass whose colour target is
                 // DISABLED (CB_COLOR0_INFO.FORMAT == 0, CB_COLOR_INVALID) ever chosen as the frame
                 // that gets published? The proposed fix stops forcing a readback on such a pass, and
@@ -11271,6 +11288,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 // RTT (#167): cache these rendered pixels under this submit's render-target base, so a later
                 // composite pass that samples that address gets the scene we drew (not empty guest memory).
                 selected_pixels = std::make_shared<const std::vector<uint8_t>>(std::move(rendered));
+                selected_source_submit = !items.empty() ? phase.source_submit : 0;
                 if (rtt_on && !selected_pixels->empty()) {
                     uint64_t tgt = 0;
                     for (const auto& it : items) if (it.color0_base) { tgt = it.color0_base; break; }
@@ -11399,7 +11417,16 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     for (int i = 0; i < prosper_vo_buffer_count(); ++i)
                         if ((scanout = cached_scanout(prosper_vo_buffer_addr(i)))) break;
                 }
-                if (scanout) selected_pixels = scanout->rgba;
+                if (scanout) {
+                    const auto prior_selected_pixels = selected_pixels;
+                    const uint64_t prior_source_submit = selected_source_submit;
+                    selected_pixels = scanout->rgba;
+                    // Only the same immutable allocation from this callback's completed pass
+                    // inherits its submit. A cached/materialized surface with the same address but
+                    // different storage has no source proof here.
+                    selected_source_submit = selected_pixels && selected_pixels == prior_selected_pixels
+                        ? prior_source_submit : 0;
+                }
                 // Last resort before the retained frame: the flipped buffer's own guest memory.
                 // The decision itself lives in guest_scanout_present.hpp so it can be unit-tested;
                 // read that header for why each condition is there. Only the mechanism is here.
@@ -11518,6 +11545,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     if (guest_scanout_pixels && guest_scanout_pixels->size() == present_extent_bytes) {
                         selected_pixels = guest_scanout_pixels;
                         frame_origin = prosper::gpu::PresentFrameOrigin::GuestScanout;
+                        selected_source_submit = 0;
                     }
                 }
                 // Hold the last good scanout across VideoOut buffer rotation. Bendy (PPSA27616) rapidly
@@ -11543,6 +11571,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 // first of them — and `--require-composited-frame` would pass on the strength of the
                 // copies.
                 static bool last_scanout_present_from_guest = false;
+                static uint64_t last_scanout_source_submit = 0;
                 if (!published_gpu) {
                     const size_t current_bytes = selected_pixels ? selected_pixels->size() : 0u;
                     const size_t retained_bytes =
@@ -11553,6 +11582,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             last_scanout_present = selected_pixels;
                             last_scanout_present_from_guest =
                                 frame_origin == prosper::gpu::PresentFrameOrigin::GuestScanout;
+                            last_scanout_source_submit = selected_source_submit;
                             present_frames_stored.fetch_add(1, std::memory_order_relaxed);
                             // `retained_frame_action` decides on BYTE SIZES ALONE -- by design, since
                             // it cannot know what a frame should look like. The consequence is that a
@@ -11635,6 +11665,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             frame_origin = last_scanout_present_from_guest
                                 ? prosper::gpu::PresentFrameOrigin::GuestScanout
                                 : prosper::gpu::PresentFrameOrigin::Composited;
+                            selected_source_submit = last_scanout_source_submit;
                             present_frames_served.fetch_add(1, std::memory_order_relaxed);
                             // A stale-but-correct frame IS what the guest sees, so say so rather than
                             // letting a silent substitution read as a healthy present. Under no extent
@@ -11876,6 +11907,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         pending_timing, timing_enabled, phase.final_span);
                     prosper::gpu::RenderedFrame frame(std::move(selected_pixels));
                     frame.origin = frame_origin;
+                    frame.source_submit = selected_source_submit;
                     return frame;
                 }
                 struct TimingTotals {
@@ -12943,6 +12975,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             }
             prosper::gpu::RenderedFrame frame(std::move(selected_pixels));
             frame.origin = frame_origin;
+            frame.source_submit = selected_source_submit;
             return frame;
         });
     fprintf(stderr, "[render] live Vulkan submit renderer registered (dump=%d, frames -> %s)\n",

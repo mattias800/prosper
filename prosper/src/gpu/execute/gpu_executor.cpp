@@ -19,6 +19,7 @@
 #include "gpu/diagnostics/shader_dump_filter.hpp"  // PROSPER_SHADER_DUMP_PROGRAM address filter
 #include "gpu/diagnostics/compute_tree_watch.hpp"
 #include "gpu/present/videoout_present.hpp"   // present_write_frame
+#include "gpu/timeline/menu_capture_runtime.hpp"
 #include "gpu/agc/agc_shader_layout.hpp"  // AgcShaderHeader + build_shader_resources
 #include "gpu/resources/mip_chain_plan.hpp"  // shader_resource_compute_mip_chain_levels (#3048)
 #include "gpu/pm4/pm4_registers.hpp"      // SPI_SHADER_USER_DATA_* offsets
@@ -8816,7 +8817,8 @@ static OrderedSubmitResult execute_ordered_gpustate(
     const GpuState& st, uint32_t width, uint32_t height, uint64_t submit_no,
     const LiveRenderFn& render, const LiveComputeFn& compute,
     OrderedGpustateCaptureTrace* capture_trace = nullptr,
-    std::vector<DrawItem>* eager_draws = nullptr);
+    std::vector<DrawItem>* eager_draws = nullptr,
+    std::vector<MenuRealizedDrawIdentity>* menu_realized_draws = nullptr);
 
 bool execute_nonrender_submit_work(const GpuState& st, uint64_t submit_no) {
     if (st.dma_copies.empty() && (!g_compute || st.dispatches.empty())) return false;
@@ -10666,7 +10668,8 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                                                      const LiveRenderFn& render,
                                                      const LiveComputeFn& compute,
                                                      OrderedGpustateCaptureTrace* capture_trace,
-                                                     std::vector<DrawItem>* eager_draws) {
+                                                     std::vector<DrawItem>* eager_draws,
+                                                     std::vector<MenuRealizedDrawIdentity>* menu_realized_draws) {
     GuestGpuWriteSubmitScope guest_gpu_write_scope;
     // The ordered path reaches build_stage_table through realize_retained_draw rather than through
     // realize_gpustate_draws, so it needs its own sampling window or its per-draw switches fall
@@ -11019,6 +11022,10 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                 }
                 if (realized) {
                     notify_compute_authority_draw_resources(item, submit_no);
+                    if (menu_realized_draws)
+                        menu_realized_draws->push_back({item.draw_index, item.fs_guest_addr,
+                            item.color0_base, item.color0_width, item.color0_height,
+                            item.ps.color_write_mask});
                     if (capture_trace) {
                         snapshot_pending_gpu_capture_draw_resource(
                             capture_trace->pending_capture, item, {}, &st);
@@ -11891,13 +11898,24 @@ bool execute_ordered_and_present(const GpuState& st, uint32_t width, uint32_t he
         pending_capture.get(), g_compute_gds.data(), g_compute_gds.size());
     OrderedGpustateCaptureTrace capture_trace;
     capture_trace.pending_capture = pending_capture.get();
+    static const bool menu_capture_requested = [] {
+        const char* path = std::getenv("PROSPER_MENU_DRAW_CAPTURE");
+        return path && *path;
+    }();
+    std::vector<MenuRealizedDrawIdentity> menu_realized_draws;
     OrderedSubmitResult result = needs_ordered_realization
         ? execute_ordered_gpustate(st, width, height, submit_no, g_live, g_compute,
                                    pending_capture ? &capture_trace : nullptr,
-                                   can_eagerly_realize_draws ? &draws : nullptr)
+                                   can_eagerly_realize_draws ? &draws : nullptr,
+                                   menu_capture_requested ? &menu_realized_draws : nullptr)
         : execute_ordered_items(operations, draws, computes,
                                 std::vector<GpuState::DmaCopy>{}, g_live, g_compute,
                                 width, height, submit_no);
+    if (menu_capture_requested && !needs_ordered_realization)
+        for (const DrawItem& draw : draws)
+            menu_realized_draws.push_back({draw.draw_index, draw.fs_guest_addr,
+                draw.color0_base, draw.color0_width, draw.color0_height,
+                draw.ps.color_write_mask});
     check_null_image_source_probes(null_image_source_probes, submit_no);
     const auto timing_backend_done = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
     const std::vector<uint8_t>& px = result.frame.bytes();
@@ -11960,6 +11978,10 @@ bool execute_ordered_and_present(const GpuState& st, uint32_t width, uint32_t he
     }
     const bool presented = frame_ready && publish;
     if (presented) present_write_frame(result.frame.storage, width, height, result.frame.origin);
+    menu_draw_capture_on_publication(st, menu_realized_draws,
+                                     submit_no, result.frame.source_submit, presented,
+                                     result.frame.origin,
+                                     px, width, height);
     if (timing_enabled) {
         const auto timing_done = TimingClock::now();
         auto ms = [](auto begin, auto end) {

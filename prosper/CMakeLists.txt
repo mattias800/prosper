@@ -2688,6 +2688,10 @@ endif()
   target_link_libraries(test_gpu_timeline PRIVATE prosper_core)
   add_test(NAME gpu_timeline_roundtrip COMMAND test_gpu_timeline)
 
+  add_executable(test_menu_frame_gate tests/gpu/timeline/test_menu_frame_gate.cpp)
+  target_link_libraries(test_menu_frame_gate PRIVATE prosper_core)
+  add_test(NAME menu_frame_gate COMMAND test_menu_frame_gate)
+
   add_executable(test_gpu_timeline_capture_exit tests/gpu/test_gpu_timeline_capture_exit.cpp)
   # Includes a shared fixture, which resolves from the `tests` root.
   target_include_directories(test_gpu_timeline_capture_exit PRIVATE tests)
