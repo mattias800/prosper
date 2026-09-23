@@ -2243,6 +2243,9 @@ if(TARGET prosper_core)
   target_include_directories(test_dynfetch_fold PRIVATE tests)
   target_link_libraries(test_dynfetch_fold PRIVATE prosper_core)
   add_test(NAME dynfetch_fold COMMAND test_dynfetch_fold)
+  add_executable(test_folded_stride_zero tests/gpu/recompiler/test_folded_stride_zero.cpp)
+  target_link_libraries(test_folded_stride_zero PRIVATE prosper_core)
+  add_test(NAME folded_stride_zero COMMAND test_folded_stride_zero)
   # The ordinary test checks selected-dispatch results. This second arm proves the opt-in
   # stage-fold profiler actually counts that selected path, so a zero game census is meaningful.
   if(Python3_Interpreter_FOUND)
