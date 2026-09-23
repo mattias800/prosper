@@ -2327,46 +2327,6 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 g_this_submit = g_submit_idx++;
                 g_force_this_submit = false;
             }
-            static bool g_kena_trace_fired = false;
-            const bool kena_trace_this_callback = prosper::frontend::kena_menu_trace_callback(
-                g_kena_menu_trace,
-                g_kena_menu_trace.armed ? diagnostic_elapsed_ms() : 0,
-                g_kena_trace_fired, phase.final_span);
-            const uint64_t kena_trace_id = kena_trace_this_callback
-                ? g_pass_log_submit.load(std::memory_order_relaxed) + 1 : 0;
-            if (kena_trace_this_callback) {
-                for (const auto& range : g_kena_guest_peeks) {
-                    if (!prosper::gpu::guest_readable(range.address, range.bytes)) {
-                        fprintf(stderr, "[kena-menu] trace=%llu guest addr=0x%llx "
-                                        "bytes=%u status=unreadable\n",
-                                (unsigned long long)kena_trace_id,
-                                (unsigned long long)range.address, range.bytes);
-                        continue;
-                    }
-                    const auto* bytes = reinterpret_cast<const uint8_t*>(
-                        static_cast<uintptr_t>(range.address));
-                    size_t nonzero = 0;
-                    size_t first_nonzero = range.bytes;
-                    uint64_t hash = 1469598103934665603ull;
-                    for (size_t i = 0; i < range.bytes; ++i) {
-                        const uint8_t one = bytes[i];
-                        if (one && first_nonzero == range.bytes) first_nonzero = i;
-                        nonzero += one != 0;
-                        hash = (hash ^ one) * 1099511628211ull;
-                    }
-                    fprintf(stderr, "[kena-menu] trace=%llu guest addr=0x%llx "
-                                    "bytes=%u status=readable nonzero=%zu first=%s "
-                                    "first_offset=%zu fnv64=%016llx\n",
-                            (unsigned long long)kena_trace_id,
-                            (unsigned long long)range.address, range.bytes, nonzero,
-                            first_nonzero == range.bytes ? "none" : "present",
-                            first_nonzero == range.bytes ? 0 : first_nonzero,
-                            (unsigned long long)hash);
-                }
-                g_kena_trace_fired = true;
-                fprintf(stderr, "[kena-menu] trace=%llu callback armed render_submit=%d\n",
-                        (unsigned long long)kena_trace_id, g_this_submit);
-            }
             if (g_this_submit > g_render_last) return {};
             static const int g_rttlog_min_submit = getenv("PROSPER_RTTLOG_MIN_SUBMIT")
                 ? std::max(0, atoi(PROSPER_ENV_VALUE("PROSPER_RTTLOG_MIN_SUBMIT"))) : 0;
@@ -2876,6 +2836,50 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         (long long)elapsed_ms, g_this_submit);
             }
             if ((g_this_submit < g_render_first || before_delay) && !g_force_this_submit) return {};
+            // Both renderer admission gates have passed. Do not consume the one-shot menu trace
+            // (or scan guest bytes) for a callback that cannot render a final source.
+            const bool kena_render_admitted = g_this_submit <= g_render_last &&
+                ((g_this_submit >= g_render_first && !before_delay) || g_force_this_submit);
+            static bool g_kena_trace_fired = false;
+            const bool kena_trace_this_callback = prosper::frontend::kena_menu_trace_callback(
+                g_kena_menu_trace,
+                g_kena_menu_trace.armed ? diagnostic_elapsed_ms() : 0,
+                g_kena_trace_fired, phase.final_span, kena_render_admitted);
+            const uint64_t kena_trace_id = kena_trace_this_callback
+                ? g_pass_log_submit.load(std::memory_order_relaxed) + 1 : 0;
+            if (kena_trace_this_callback) {
+                for (const auto& range : g_kena_guest_peeks) {
+                    if (!prosper::gpu::guest_readable(range.address, range.bytes)) {
+                        fprintf(stderr, "[kena-menu] trace=%llu guest addr=0x%llx "
+                                        "bytes=%u status=unreadable\n",
+                                (unsigned long long)kena_trace_id,
+                                (unsigned long long)range.address, range.bytes);
+                        continue;
+                    }
+                    const auto* bytes = reinterpret_cast<const uint8_t*>(
+                        static_cast<uintptr_t>(range.address));
+                    size_t nonzero = 0;
+                    size_t first_nonzero = range.bytes;
+                    uint64_t hash = 1469598103934665603ull;
+                    for (size_t i = 0; i < range.bytes; ++i) {
+                        const uint8_t one = bytes[i];
+                        if (one && first_nonzero == range.bytes) first_nonzero = i;
+                        nonzero += one != 0;
+                        hash = (hash ^ one) * 1099511628211ull;
+                    }
+                    fprintf(stderr, "[kena-menu] trace=%llu guest addr=0x%llx "
+                                    "bytes=%u status=readable nonzero=%zu first=%s "
+                                    "first_offset=%zu fnv64=%016llx\n",
+                            (unsigned long long)kena_trace_id,
+                            (unsigned long long)range.address, range.bytes, nonzero,
+                            first_nonzero == range.bytes ? "none" : "present",
+                            first_nonzero == range.bytes ? 0 : first_nonzero,
+                            (unsigned long long)hash);
+                }
+                g_kena_trace_fired = true;
+                fprintf(stderr, "[kena-menu] trace=%llu callback armed render_submit=%d\n",
+                        (unsigned long long)kena_trace_id, g_this_submit);
+            }
             // Dump the FIRST item's recompiled SPIR-V (diagnostic; survives a mid-render crash).
             if (PROSPER_ENV_ON("PROSPER_SHADER_DUMP") && !items.empty()) {
                 std::string d = PROSPER_ENV_VALUE("PROSPER_SHADER_DUMP");

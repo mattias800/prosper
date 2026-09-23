@@ -30,8 +30,10 @@ inline KenaMenuTraceSpec parse_kena_menu_trace(const char* value) {
 }
 
 inline bool kena_menu_trace_callback(KenaMenuTraceSpec spec, uint64_t elapsed_ms,
-                                     bool already_fired, bool final_span) {
-    return spec.armed && final_span && !already_fired && elapsed_ms >= spec.after_ms;
+                                     bool already_fired, bool final_span,
+                                     bool render_admitted) {
+    return spec.armed && render_admitted && final_span && !already_fired &&
+           elapsed_ms >= spec.after_ms;
 }
 
 struct KenaGuestPeekRange {

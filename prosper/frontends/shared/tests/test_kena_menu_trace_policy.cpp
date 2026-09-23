@@ -22,10 +22,26 @@ int main() {
           "a bounded menu window activates");
     check(parse_kena_menu_trace("ms:120000").armed, "latest permitted deadline activates");
     const auto spec = parse_kena_menu_trace("ms:21000");
-    check(!kena_menu_trace_callback(spec, 20999, false, true), "early callback refuses");
-    check(!kena_menu_trace_callback(spec, 21000, false, false), "intermediate span refuses");
-    check(kena_menu_trace_callback(spec, 21000, false, true), "first final menu callback activates");
-    check(!kena_menu_trace_callback(spec, 21001, true, true), "later callbacks refuse");
+    check(!kena_menu_trace_callback(spec, 20999, false, true, true), "early callback refuses");
+    check(!kena_menu_trace_callback(spec, 21000, false, false, true), "intermediate span refuses");
+    check(kena_menu_trace_callback(spec, 21000, false, true, true),
+          "first admitted final menu callback activates");
+    check(!kena_menu_trace_callback(spec, 21001, true, true, true), "later callbacks refuse");
+    bool fired = false;
+    unsigned observations = 0;
+    const auto observe = [&](uint64_t elapsed, bool admitted) {
+        if (kena_menu_trace_callback(spec, elapsed, fired, true, admitted)) {
+            fired = true;
+            ++observations;
+        }
+    };
+    observe(21000, false);
+    observe(21001, false);
+    check(!fired && observations == 0, "skipped final callbacks do not consume the trace");
+    observe(21002, true);
+    observe(21003, true);
+    check(fired && observations == 1,
+          "first admitted final callback fires once after skipped callbacks");
     for (const char* invalid : {"", "21000", "ms:", "ms:-1", "ms:1x", "ms:120001",
                                 "ms:18446744073709551616"})
         check(!parse_kena_menu_trace(invalid).armed, "malformed or late deadline refuses");
