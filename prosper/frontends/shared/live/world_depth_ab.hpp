@@ -82,7 +82,8 @@ struct WorldCensusTargetSlots {
 };
 
 // One specifically observed callback shape, used only to authorize a bounded raw c2 diagnostic.
-// Requiring both groups in order avoids silently relabelling an earlier/later same-address version.
+// The terminal draw carries a c1 address but does not activate that slot. Requiring both groups
+// in order avoids silently relabelling an earlier/later same-address version.
 struct WorldC2CallbackShape {
     uint32_t target_groups = 0;
     bool refused = false;
@@ -100,7 +101,7 @@ struct WorldC2CallbackShape {
               c2_target_draws != 62 || both_draws != 62)) ||
             (target_groups == 2 &&
              (draws != 1 || world_slots != 0x1 || c2_target_slots != 0 ||
-              world_draws != 1 || world_c1_draws != 1 ||
+              world_draws != 1 || world_c1_draws != 0 ||
               c2_target_draws != 0 || both_draws != 0)) ||
             target_groups > 2)
             refused = true;

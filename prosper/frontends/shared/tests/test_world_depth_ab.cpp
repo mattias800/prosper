@@ -180,33 +180,42 @@ int main() {
     const auto world_c2_shape = [] {
         prosper::frontend::WorldC2CallbackShape shape;
         shape.observe(62, 0x1, 0x4, 62, 62, 62, 62, WorldDepthPassKind::Geometry, false);
-        shape.observe(1, 0x1, 0, 1, 1, 0, 0, WorldDepthPassKind::Geometry, false);
+        shape.observe(1, 0x1, 0, 1, 0, 0, 0, WorldDepthPassKind::Geometry, false);
         return shape;
     };
     auto c2_shape = world_c2_shape();
     if (!check(c2_shape.ready(), "exact 62+1 c0-world/c2 callback shape refused"))
         return 1;
+    c2_shape = {};
+    c2_shape.observe(62, 0x1, 0x4, 62, 62, 62, 62,
+                     WorldDepthPassKind::Geometry, false);
+    c2_shape.observe(1, 0x1, 0, 1, 1, 0, 0,
+                     WorldDepthPassKind::Geometry, false);
+    if (!check(!c2_shape.ready(),
+               "terminal world-only draw unexpectedly active on c1 was accepted"))
+        return 1;
+    c2_shape = world_c2_shape();
     c2_shape.observe(1, 0, 0x1, 0, 0, 1, 0, WorldDepthPassKind::Unrelated, false);
     if (!check(!c2_shape.ready(), "later same-address c0 writer retained c2 capture gate"))
         return 1;
     c2_shape = {};
-    c2_shape.observe(1, 0x1, 0, 1, 1, 0, 0, WorldDepthPassKind::Geometry, false);
+    c2_shape.observe(1, 0x1, 0, 1, 0, 0, 0, WorldDepthPassKind::Geometry, false);
     c2_shape.observe(62, 0x1, 0x4, 62, 62, 62, 62, WorldDepthPassKind::Geometry, false);
     if (!check(!c2_shape.ready(), "reversed c2 callback shape authorized readback"))
         return 1;
     c2_shape = {};
     c2_shape.observe(62, 0x1, 0x4, 62, 62, 62, 61, WorldDepthPassKind::Geometry, false);
-    c2_shape.observe(1, 0x1, 0, 1, 1, 0, 0, WorldDepthPassKind::Geometry, false);
+    c2_shape.observe(1, 0x1, 0, 1, 0, 0, 0, WorldDepthPassKind::Geometry, false);
     if (!check(!c2_shape.ready(), "one draw missing c2 still authorized readback"))
         return 1;
     c2_shape = {};
     c2_shape.observe(62, 0x1, 0x4, 62, 62, 62, 62, WorldDepthPassKind::Geometry, true);
-    c2_shape.observe(1, 0x1, 0, 1, 1, 0, 0, WorldDepthPassKind::Geometry, false);
+    c2_shape.observe(1, 0x1, 0, 1, 0, 0, 0, WorldDepthPassKind::Geometry, false);
     if (!check(!c2_shape.ready(), "resolve group authorized c2 readback"))
         return 1;
     c2_shape = {};
     c2_shape.observe(62, 0x1, 0x4, 62, 61, 62, 62, WorldDepthPassKind::Geometry, false);
-    c2_shape.observe(1, 0x1, 0, 1, 1, 0, 0, WorldDepthPassKind::Geometry, false);
+    c2_shape.observe(1, 0x1, 0, 1, 0, 0, 0, WorldDepthPassKind::Geometry, false);
     if (!check(!c2_shape.ready(), "changed world c1 MRT binding authorized c2 readback"))
         return 1;
     const auto tail_ok = prosper::frontend::world_c2_tail_identity_allowed;
