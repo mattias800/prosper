@@ -1421,7 +1421,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
     // NOT on this list: PPSA21564 (6 measured refusals, no dump and no after-arm yet). One survey
     // run away, and with the per-module proof the run is confirmation rather than a gamble.
     static const char* const kNativeFragmentVoteTitles[] = {
-        "PPSA01885", "PPSA02664", "PPSA04263", "PPSA13579", "PPSA25009",
+        "PPSA01802", "PPSA01885", "PPSA02664", "PPSA04263", "PPSA13579", "PPSA25009",
     };
     // The opt-out exists so the A/B stays reproducible, following PROSPER_NO_GUEST_FS: a default-on
     // behaviour whose disable switch is for bisection, not for routine use.
@@ -1439,7 +1439,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
     // Two switches turn it off: PROSPER_NO_PARTIAL_WAVE_FRAGMENT isolates THIS tier for an A/B on one
     // binary (the renderer then behaves exactly as before the tier existed), and
     // PROSPER_STRICT_FRAGMENT_WAVE_WIDTH, which disables both tiers through native_fragment_vote_width.
-    const bool partial_wave_fragment = native_fragment_vote_width && title_id == "PPSA04263" &&
+    const bool partial_wave_fragment = native_fragment_vote_width && (title_id == "PPSA04263" || title_id == "PPSA01802") &&
         !PROSPER_ENV_VALUE("PROSPER_NO_PARTIAL_WAVE_FRAGMENT");
     // Create (and thereby PUBLISH) the renderer's Vulkan device up front so the compute backend can
     // adopt it (#1091). Compute initializes lazily on its first dispatch, and titles routinely
