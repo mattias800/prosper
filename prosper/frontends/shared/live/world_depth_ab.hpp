@@ -74,6 +74,10 @@ struct WorldDepthDrawFact {
 
 enum class WorldDepthPassKind { Unrelated, Clear, Geometry, OtherWorld, Ambiguous };
 
+constexpr bool world_depth_scope_allowed(WorldDepthPassKind kind) {
+    return kind == WorldDepthPassKind::Clear || kind == WorldDepthPassKind::Geometry;
+}
+
 // The callback-tail readback is attributable to one selected geometry group only if no other
 // group can replace either attachment afterward. Surface_match includes color base and extent;
 // conservative attachment identity counts as "touch" even when pipeline admission is unknown.

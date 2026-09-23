@@ -96,6 +96,17 @@ int main() {
                    WorldDepthPassKind::Ambiguous,
                "mixed clear and scene scissor armed as one pass"))
         return 1;
+    if (!check(prosper::frontend::world_depth_scope_allowed(WorldDepthPassKind::Clear),
+               "selected world clear lost its override") ||
+        !check(prosper::frontend::world_depth_scope_allowed(WorldDepthPassKind::Geometry),
+               "selected world geometry lost its override") ||
+        !check(!prosper::frontend::world_depth_scope_allowed(WorldDepthPassKind::OtherWorld),
+               "unproven same-depth pass gained an override") ||
+        !check(!prosper::frontend::world_depth_scope_allowed(WorldDepthPassKind::Ambiguous),
+               "mixed pass gained an override") ||
+        !check(!prosper::frontend::world_depth_scope_allowed(WorldDepthPassKind::Unrelated),
+               "shadow or unrelated pass gained an override"))
+        return 1;
     const auto ambiguous = prosper::frontend::world_depth_capture_pass_ambiguous;
     if (!check(!ambiguous(false, WorldDepthPassKind::Geometry, true, true),
                "first matching world geometry declined") ||

@@ -10185,10 +10185,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             case WorldDepthPassKind::Unrelated: break;
                         }
                         const uint64_t activations = world_depth_ab->clear_passes +
-                            world_depth_ab->geometry_passes + world_depth_ab->other_world_passes;
+                            world_depth_ab->geometry_passes;
                         if (activations && (activations & (activations - 1)) == 0 &&
-                            world_pass_kind != WorldDepthPassKind::Unrelated &&
-                            world_pass_kind != WorldDepthPassKind::Ambiguous)
+                            world_depth_scope_allowed(world_pass_kind))
                             std::fprintf(stderr,
                                 "[world-depth-ab] activation=%llu clear=%llu geometry=%llu other=%llu "
                                 "ambiguous=%llu shadow-lookalikes=%llu renderer-submit=%d pad=%lld\n",
@@ -10583,9 +10582,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         pass_bases.data(),
                         static_cast<uint32_t>(std::min<size_t>(mrt_count, pass_bases.size())));
                     std::optional<prosper::test::ScopedDepthClearProbeMode> world_mode_scope;
-                    if (world_depth_ab->armed &&
-                        world_pass_kind != WorldDepthPassKind::Unrelated &&
-                        world_pass_kind != WorldDepthPassKind::Ambiguous)
+                    if (world_depth_ab->armed && world_depth_scope_allowed(world_pass_kind))
                         world_mode_scope.emplace(world_depth_ab->config.mode);
                     std::vector<uint8_t> gpx = prosper::test::render_draws_rgba(
                         backend_draws, gw, gh, seed,
