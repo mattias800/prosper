@@ -394,13 +394,6 @@ uint64_t live_compute_image_result_snapshot_bytes();
 bool cold_storage_result_snapshot_can_defer(bool host_data, bool full_overwrite,
                                             size_t guest_bytes, size_t minimum_bytes);
 
-// Exact byte comparison that also reports the inclusive [first,last] differing extent. Returns true
-// when equal. This is the proof obligation behind the differential upload: the copy writes only that
-// extent, so a span that is too NARROW silently leaves a stale byte in a GPU buffer. Exposed so that
-// property can be tested directly against a full copy rather than only through a live dispatch.
-bool compute_buffer_diff_span_for_test(const void* lhs, const void* rhs, size_t bytes,
-                                       size_t* first, size_t* last);
-
 // Deterministic failure injection for the storage-image recovery regression test. The next storage
 // readback fails after dispatch, exercising retained-image invalidation without a Vulkan fault.
 void live_compute_fail_next_storage_readback_for_test();
