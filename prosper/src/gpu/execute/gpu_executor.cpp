@@ -9266,6 +9266,7 @@ OrderedSubmitResult execute_ordered_items_impl(const std::vector<SubmitOperation
                                                const LiveRenderFn& render,
                                                const LiveComputeFn& compute,
                                                uint32_t width, uint32_t height,
+                                               uint64_t source_submit,
                                                ExecuteDma&& execute_dma) {
     GuestGpuWriteSubmitScope guest_gpu_write_scope;
     std::unordered_map<size_t, size_t> draw_by_index, compute_by_index;
@@ -9323,6 +9324,7 @@ OrderedSubmitResult execute_ordered_items_impl(const std::vector<SubmitOperation
         LiveRenderPhase saved = g_live_phase;
         g_live_phase = {result.render_spans == 0, result.render_spans + 1 == total_spans,
                         authoritative_readback};
+        g_live_phase.source_submit = source_submit;
         RenderedFrame rendered = render(span, width, height);
         g_live_phase = saved;
         if (!rendered.empty()) result.frame = std::move(rendered);
@@ -9352,9 +9354,10 @@ OrderedSubmitResult execute_ordered_items(const std::vector<SubmitOperation>& op
                                           const std::vector<GpuState::DmaCopy>& dma_copies,
                                           const LiveRenderFn& render,
                                           const LiveComputeFn& compute,
-                                          uint32_t width, uint32_t height) {
+                                          uint32_t width, uint32_t height,
+                                          uint64_t source_submit) {
     return execute_ordered_items_impl(
-        operations, draws, computes, dma_copies, render, compute, width, height,
+        operations, draws, computes, dma_copies, render, compute, width, height, source_submit,
         [](const GpuState::DmaCopy& copy) {
             std::vector<uint8_t> current_source;
             const LiveTargetByteReadResult source_result = read_live_render_target_bytes(
@@ -9381,7 +9384,7 @@ OrderedSubmitResult execute_ordered_items(const std::vector<SubmitOperation>& op
                                           const LiveComputeFn& compute,
                                           uint32_t width, uint32_t height) {
     return execute_ordered_items_impl(
-        operations, draws, computes, dma_copies, render, compute, width, height,
+        operations, draws, computes, dma_copies, render, compute, width, height, 0,
         [](const ReplayDmaCopy& copy) {
             const uint32_t source_selector = (copy.sels >> 8u) & 0xffu;
             const uint32_t destination_selector = copy.sels & 0xffu;
@@ -10743,6 +10746,7 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
         LiveRenderPhase saved = g_live_phase;
         const bool final_span = result.render_spans + 1 == total_spans;
         g_live_phase = {result.render_spans == 0, final_span, authoritative_readback};
+        g_live_phase.source_submit = submit_no;
         RenderedFrame rendered = render(span, width, height);
         g_live_phase = saved;
         if (!rendered.empty()) result.frame = std::move(rendered);
@@ -11484,6 +11488,7 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
     if (render && result.render_spans && !final_callback_sent) {
         LiveRenderPhase saved = g_live_phase;
         g_live_phase = {false, true, false};
+        g_live_phase.source_submit = submit_no;
         RenderedFrame rendered = render({}, width, height);
         g_live_phase = saved;
         if (!rendered.empty()) result.frame = std::move(rendered);
@@ -11890,7 +11895,9 @@ bool execute_ordered_and_present(const GpuState& st, uint32_t width, uint32_t he
         ? execute_ordered_gpustate(st, width, height, submit_no, g_live, g_compute,
                                    pending_capture ? &capture_trace : nullptr,
                                    can_eagerly_realize_draws ? &draws : nullptr)
-        : execute_ordered_items(operations, draws, computes, g_live, g_compute, width, height);
+        : execute_ordered_items(operations, draws, computes,
+                                std::vector<GpuState::DmaCopy>{}, g_live, g_compute,
+                                width, height, submit_no);
     check_null_image_source_probes(null_image_source_probes, submit_no);
     const auto timing_backend_done = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
     const std::vector<uint8_t>& px = result.frame.bytes();

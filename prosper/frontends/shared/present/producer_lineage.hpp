@@ -17,6 +17,10 @@ namespace prosper::frontend {
 struct CompletedProducer {
     uint64_t registration = 0;
     uint64_t work = 0;
+    // The architectural submit that recorded this image write. Zero is unavailable: the first
+    // live AGC submit is numbered 1, while direct backend calls and replay have no live submit.
+    // A representation-only copy retains the original submit with the work identity.
+    uint64_t source_submit = 0;
     constexpr bool known() const { return registration && work; }
     constexpr bool operator==(const CompletedProducer&) const = default;
 };

@@ -41,7 +41,8 @@
 #include "window_controls.hpp"           // debounced app-window shortcuts, pure regression seam
 #include "game_path.hpp"                 // dropped/picked path -> app0 root + open action, pure seam
 #include "game_library.hpp"              // scan a games dir -> titles + metadata, pure seam
-#include "frame_grab_naming.hpp"         // one stamp + one exclusively claimed name pair per F9 grab
+#include "frame_grab_naming.hpp"         // one stamp + exclusively claimed F9 artifact names
+#include "frame_grab_match.hpp"          // completed producer and frame-boundary join for F9
 #include "shared/perf/performance_capture.hpp"        // bounded F8 pre/post performance artifact
 #include "shared/present/present_handoff_trace.hpp"
 #include "performance_capture_schedule.hpp" // unattended elapsed-time trigger for the same artifact
@@ -105,6 +106,8 @@ static int g_volume_percent = kDefaultVolumePercent;   // set by --volume before
 #include <cstdint>
 #include <vector>
 #include <string>
+#include <optional>
+#include <unordered_map>
 #include <algorithm>
 #include <cmath>
 #include <chrono>
@@ -559,8 +562,7 @@ static bool write_frame_bmp(const std::string& path, const uint8_t* rgba, uint32
     FILE* fp = fopen(path.c_str(), "wb");
     if (!fp) return false;
     const bool ok = fwrite(f.data(), 1, f.size(), fp) == f.size();
-    fclose(fp);
-    return ok;
+    return fclose(fp) == 0 && ok;
 }
 
 // Present one guest RGBA frame (w*h, 4 bytes/pixel) to the window, scaling to the swapchain extent.
@@ -1658,7 +1660,8 @@ int main(int argc, char** argv) {
     fprintf(stderr, "[app] keyboard: WASD/Arrows=move  J/Space=Cross(jump)  K=Square(attack)  L=Circle  "
                     "I=Triangle  U/O=L1/R1  Y/H=L2/R2  Enter=Options  "
                     "Pause/F10=pause  F11/Alt+Enter=fullscreen  Esc=quit\n");
-    fprintf(stderr, "[app] F9 = grab the current frame: writes a replayable .prgbundle + a .bmp "
+    fprintf(stderr, "[app] F9 = grab the current frame: writes a replayable .prgbundle, a .bmp, "
+                    "and an .f9.jsonl source-identity sidecar "
                     "screenshot named frame_grab_<titleId>_<date>-<time>-<ms>.* (to "
                     "PROSPER_CAPTURE_DIR, default cwd) for gpu_replay debugging "
                     "(brief hitch on press; PROSPER_CAPTURE_FRAMES>1 grabs an animation).\n");
@@ -1687,7 +1690,7 @@ int main(int argc, char** argv) {
     int gpuPrevSlot = -1;   // #1270: the GPU scanout slot presented last frame (released after its read)
     unsigned timedDumpCount = 0;
     // Interactive frame grab (F9): output dir plus the namer that claims one stamped, title-tagged
-    // name pair per press (frame_grab_naming.hpp). The old per-process counter (frame_grab_001) let a
+    // artifact stem per press (frame_grab_naming.hpp). The old per-process counter (frame_grab_001) let a
     // second title played in the same directory overwrite the first title's captures, and let an
     // aborted grab's .bmp sit beside a same-named .prgbundle from an earlier boot.
     const std::string grabDir = getenv("PROSPER_CAPTURE_DIR") ? getenv("PROSPER_CAPTURE_DIR") : ".";
@@ -1813,16 +1816,60 @@ int main(int argc, char** argv) {
     std::string grabNotice;   // transient window-title notice for the last completed F9 grab (#1587)
     std::chrono::steady_clock::time_point grabNoticeUntil{};
     std::string pendingGrabScreenshot;   // non-empty => write the next presented CPU frame to this path
+    std::string pendingGrabBundlePath;   // non-empty only for this frontend's F9 pair
     uint64_t pendingGrabGuestPresent = 0;
     unsigned pendingGrabSuffix = 0;      // the collision suffix this capture owns, 0 when it needed none
     bool pendingGrabReserved = false;    // the pending screenshot path came from a reservation (F9),
                                          // not from PROSPER_CAPTURE_SCREENSHOT* (a configured path)
+    prosper::frontend::FrameGrabCandidateRing stagedGrabCandidates;
     // The bundle names THIS frontend reserved, with the collision suffix each one owns. It is an
     // ownership record first and a suffix lookup second: the same outcome channel also reports the
     // env-driven captures (PROSPER_CAPTURE_BUNDLE / …_AT_PRESENT / …_AFTER_GUEST_LOG), whose paths
     // this frontend never created and must not delete or describe as reserved.
     // Bounded: a capture that never reports (the process died) must not accumulate here.
     std::vector<std::pair<std::string, unsigned>> grabReservedBundles;
+    struct FrameGrabJoinState {
+        std::string manifest;
+        std::optional<prosper::frontend::FrameGrabScreenshotEvidence> screenshot;
+        std::optional<prosper::frontend::FrameGrabBundleEvidence> bundle;
+        bool screenshot_event_written = false;
+        bool bundle_event_written = false;
+    };
+    std::unordered_map<std::string, FrameGrabJoinState> grabJoins;
+    std::vector<std::string> grabJoinOrder; // bounded outstanding F9 sidecars, oldest first
+    auto forgetGrabJoin = [&](const std::string& bundlePath) {
+        grabJoins.erase(bundlePath);
+        std::erase(grabJoinOrder, bundlePath);
+    };
+    auto finishGrabJoin = [&](const std::string& bundlePath) {
+        auto it = grabJoins.find(bundlePath);
+        if (it == grabJoins.end() || !it->second.screenshot || !it->second.bundle) return;
+        if (it->second.screenshot_event_written && it->second.bundle_event_written) {
+            const auto verdict = prosper::frontend::classify_frame_grab(
+                *it->second.screenshot, *it->second.bundle);
+            if (prosper::frontend::append_frame_grab_event(
+                    it->second.manifest, prosper::frontend::frame_grab_join_event(verdict)))
+                std::fprintf(stderr, "[grab] frame/producer join=%s -> %s\n",
+                             prosper::frontend::frame_grab_match_name(verdict),
+                             it->second.manifest.c_str());
+            else
+                std::fprintf(stderr, "[grab] frame/producer manifest final write FAILED: %s\n",
+                             it->second.manifest.c_str());
+        } else {
+            std::fprintf(stderr, "[grab] frame/producer manifest event write FAILED: %s\n",
+                         it->second.manifest.c_str());
+        }
+        forgetGrabJoin(bundlePath);
+    };
+    auto recordGrabScreenshot = [&](const std::string& bundlePath,
+                                    const prosper::frontend::FrameGrabScreenshotEvidence& evidence) {
+        auto it = grabJoins.find(bundlePath);
+        if (it == grabJoins.end()) return;
+        it->second.screenshot = evidence;
+        it->second.screenshot_event_written = prosper::frontend::append_frame_grab_event(
+            it->second.manifest, prosper::frontend::frame_grab_screenshot_event(evidence));
+        finishGrabJoin(bundlePath);
+    };
     // Returns whether THIS frontend reserved `path`, and if so its suffix. "Absent" and "found with
     // suffix 0" are different answers and must not collapse into one.
     auto take_bundle_reservation = [&](const std::string& path, unsigned& suffix) -> bool {
@@ -1843,6 +1890,20 @@ int main(int argc, char** argv) {
             // Not every outcome is a frame grab's: the same channel reports the env-driven
             // captures, whose path this frontend never created.
             const bool reservedHere = take_bundle_reservation(grab.bundle_path, bundleSuffix);
+            if (auto it = grabJoins.find(grab.bundle_path); it != grabJoins.end()) {
+                prosper::frontend::FrameGrabBundleEvidence evidence;
+                evidence.serialized = grab.ok;
+                evidence.opened_present = grab.opened_present;
+                evidence.closed_presents = grab.closed_presents;
+                evidence.opened_source_flip = grab.opened_source_flip;
+                evidence.closed_source_flips = grab.closed_source_flips;
+                evidence.closed_submit_counts = grab.closed_submit_counts;
+                evidence.captured_submits = grab.captured_submits;
+                it->second.bundle = evidence;
+                it->second.bundle_event_written = prosper::frontend::append_frame_grab_event(
+                    it->second.manifest, prosper::frontend::frame_grab_bundle_event(evidence));
+                finishGrabJoin(grab.bundle_path);
+            }
             if (grab.ok) {
                 // The file exists now, so this line may name it.
                 std::fprintf(stderr, "%s\n",
@@ -1955,7 +2016,7 @@ int main(int argc, char** argv) {
                     prosper::gpu::request_interactive_capture_bundle(grab.bundle, grabBundleMaxMb);
                 if (!request.accepted) {
                     // These are this request's exclusive reservations, never the previous grab's.
-                    for (const auto& path : {grab.bundle, grab.screenshot}) {
+                    for (const auto& path : {grab.bundle, grab.screenshot, grab.manifest}) {
                         std::error_code ec;
                         if (std::filesystem::is_regular_file(path, ec) && !ec &&
                             std::filesystem::file_size(path, ec) == 0 && !ec)
@@ -1991,12 +2052,30 @@ int main(int argc, char** argv) {
                                                  : "its output path was configured, not reserved, "
                                                    "and was left alone"),
                                  replaced.c_str());
+                    if (auto old = grabJoins.find(replaced); old != grabJoins.end()) {
+                        std::error_code manifest_ec;
+                        const bool regular = std::filesystem::is_regular_file(
+                            old->second.manifest, manifest_ec);
+                        if (regular && !manifest_ec) {
+                            const auto bytes = std::filesystem::file_size(
+                                old->second.manifest, manifest_ec);
+                            if (!manifest_ec && bytes == 0)
+                                std::filesystem::remove(old->second.manifest, manifest_ec);
+                        }
+                        forgetGrabJoin(replaced);
+                    }
                 }
                 // A pending screenshot is dropped by this press whichever kind it is, but the two
                 // kinds cannot share a sentence: one is a name this frontend reserved and can
                 // account for, the other a configured path it never created.
                 if (!pendingGrabScreenshot.empty()) {
                     if (pendingGrabReserved) {
+                        if (!pendingGrabBundlePath.empty()) {
+                            prosper::frontend::FrameGrabScreenshotEvidence dropped;
+                            dropped.armed_present = pendingGrabGuestPresent;
+                            dropped.written_present = gpu::present_count();
+                            recordGrabScreenshot(pendingGrabBundlePath, dropped);
+                        }
                         std::error_code ec;
                         const bool removed =
                             std::filesystem::exists(pendingGrabScreenshot, ec) && !ec &&
@@ -2016,11 +2095,21 @@ int main(int argc, char** argv) {
                     }
                 }
                 pendingGrabScreenshot = grab.screenshot;
+                stagedGrabCandidates.clear();
+                pendingGrabBundlePath = grab.bundle;
                 pendingGrabGuestPresent = gpu::present_count();
                 pendingGrabSuffix = grab.suffix;
                 pendingGrabReserved = true;
                 if (grabReservedBundles.size() >= 32) grabReservedBundles.erase(grabReservedBundles.begin());
                 grabReservedBundles.emplace_back(grab.bundle, grab.suffix);
+                if (grabJoinOrder.size() >= 32) {
+                    grabJoins.erase(grabJoinOrder.front());
+                    grabJoinOrder.erase(grabJoinOrder.begin());
+                }
+                FrameGrabJoinState join;
+                join.manifest = grab.manifest;
+                grabJoins.emplace(grab.bundle, std::move(join));
+                grabJoinOrder.push_back(grab.bundle);
                 return;
     };
 
@@ -2086,9 +2175,52 @@ int main(int argc, char** argv) {
                      static_cast<long long>(target), static_cast<long long>(actual), name.c_str());
     };
 
-    auto flushGrabScreenshot = [&](const uint8_t* rgba, uint32_t w, uint32_t h) {
+    auto clearPendingGrabScreenshot = [&] {
+        stagedGrabCandidates.clear();
+        pendingGrabScreenshot.clear();
+        pendingGrabBundlePath.clear();
+        pendingGrabGuestPresent = 0;
+        pendingGrabSuffix = 0;
+        pendingGrabReserved = false;
+    };
+    auto missPendingGrabScreenshot = [&](uint64_t target_flip, uint64_t observed_flip) {
+        if (pendingGrabScreenshot.empty() || pendingGrabBundlePath.empty()) return;
+        prosper::frontend::FrameGrabScreenshotEvidence missed;
+        missed.host_presented = true;
+        missed.source = prosper::frontend::FrameGrabSource::GpuScanout;
+        missed.source_seq = observed_flip;
+        missed.target_source_flip = target_flip;
+        missed.no_bmp_reason = stagedGrabCandidates.overflowed()
+            ? prosper::frontend::FrameGrabNoBmpReason::CandidateOverflow
+            : prosper::frontend::FrameGrabNoBmpReason::TargetSkipped;
+        missed.armed_present = pendingGrabGuestPresent;
+        missed.written_present = gpu::present_count();
+        recordGrabScreenshot(pendingGrabBundlePath, missed);
+        std::fprintf(stderr,
+                     "[grab] screenshot target flip %llu has no retained pixels (%s); "
+                     "newest shown flip %llu; no BMP written for %s\n",
+                     static_cast<unsigned long long>(target_flip),
+                     stagedGrabCandidates.overflowed() ? "candidate ring overflowed"
+                                                      : "target skipped by host presenter",
+                     static_cast<unsigned long long>(observed_flip),
+                     pendingGrabScreenshot.c_str());
+        // The zero-byte reservation is owned by this frontend. Preserve the sidecar and bundle:
+        // together they explain why this pair cannot certify a rendered frame.
+        std::error_code ec;
+        if (pendingGrabReserved && std::filesystem::file_size(pendingGrabScreenshot, ec) == 0 && !ec)
+            std::filesystem::remove(pendingGrabScreenshot, ec);
+        clearPendingGrabScreenshot();
+    };
+    auto flushGrabScreenshot = [&](
+            const uint8_t* rgba, uint32_t w, uint32_t h,
+            prosper::frontend::FrameGrabScreenshotEvidence source) {
         if (pendingGrabScreenshot.empty()) return;
         const bool ok = write_frame_bmp(pendingGrabScreenshot, rgba, w, h);
+        source.bmp_written = ok;
+        source.armed_present = pendingGrabGuestPresent;
+        source.written_present = gpu::present_count();
+        if (!pendingGrabBundlePath.empty())
+            recordGrabScreenshot(pendingGrabBundlePath, source);
         char detail[128];
         std::snprintf(detail, sizeof detail, "armed at guest present %llu, written at guest present %llu",
                       static_cast<unsigned long long>(pendingGrabGuestPresent),
@@ -2107,10 +2239,25 @@ int main(int argc, char** argv) {
                                              : "nothing was written to the configured path",
                          pendingGrabScreenshot.c_str());
         }
-        pendingGrabScreenshot.clear();
-        pendingGrabGuestPresent = 0;
-        pendingGrabSuffix = 0;
-        pendingGrabReserved = false;
+        clearPendingGrabScreenshot();
+    };
+    auto drainStagedGrabCandidate = [&](uint64_t newest_shown_flip = 0) {
+        if (!pendingGrabReserved || pendingGrabScreenshot.empty() || pendingGrabBundlePath.empty())
+            return;
+        uint64_t target_flip = 0;
+        if (!prosper::gpu::interactive_grab_closed_source_flip(
+                pendingGrabBundlePath, target_flip)) return;
+        auto result = prosper::frontend::frame_grab_resolve_candidate(
+            stagedGrabCandidates, target_flip, newest_shown_flip);
+        if (result.kind == prosper::frontend::FrameGrabCandidateResolutionKind::Candidate) {
+            auto& candidate = *result.candidate;
+            candidate.source.target_source_flip = target_flip;
+            flushGrabScreenshot(candidate.pixels.data(), candidate.width, candidate.height,
+                                candidate.source);
+            return;
+        }
+        if (result.kind == prosper::frontend::FrameGrabCandidateResolutionKind::Missed)
+            missPendingGrabScreenshot(target_flip, result.newest_shown_flip);
     };
     const uint64_t scheduledScreenshotFrame = prosper::frontend::parse_capture_frame(
         getenv("PROSPER_CAPTURE_SCREENSHOT_AT_FRAME"));
@@ -2945,6 +3092,7 @@ int main(int argc, char** argv) {
         if (pendingGrabScreenshot.empty() && prosper::frontend::capture_frame_due(
                 scheduledScreenshotFrame, shown, scheduledScreenshotArmed)) {
             pendingGrabScreenshot = scheduledScreenshotPath;
+            pendingGrabBundlePath.clear();
             pendingGrabGuestPresent = gpu::present_count();
             // Both halves of "what is pending" are set here: an explicitly configured path is not a
             // claimed frame-grab name, so it has no suffix and this frontend does not own it.
@@ -2969,6 +3117,7 @@ int main(int argc, char** argv) {
         // block the render loop mid-capture.
         {
             reportGrabOutcome();
+            drainStagedGrabCandidate();
             if (!grabNotice.empty() && std::chrono::steady_clock::now() >= grabNoticeUntil) {
                 grabNotice.clear();
                 if (win) SDL_SetWindowTitle(win, title.c_str());
@@ -3028,12 +3177,22 @@ int main(int argc, char** argv) {
                     continue;
                 }
                 bool grabReady = false;
+                uint64_t grabTargetFlip = 0;
+                const bool ownedGrabTarget = pendingGrabReserved && !pendingGrabBundlePath.empty() &&
+                    prosper::gpu::interactive_grab_closed_source_flip(
+                        pendingGrabBundlePath, grabTargetFlip);
+                const auto grabTargetDecision = ownedGrabTarget
+                    ? prosper::frontend::frame_grab_target_decision(grabTargetFlip, gf.frame_seq)
+                    : prosper::frontend::FrameGrabTargetDecision::Wait;
+                const bool grabReadback = prosper::frontend::frame_grab_needs_gpu_readback(
+                    !pendingGrabScreenshot.empty(), pendingGrabReserved, ownedGrabTarget,
+                    grabTargetDecision);
                 // A pending snap needs the presented pixels just as a grab screenshot does, so it
                 // must also request the readback -- without this the GPU path never stages them and
                 // F6/F7 would silently do nothing on the fast path.
                 PresentAttempt attempt = present_frame_gpu(
                     vk, gf, gpuPrevSlot,
-                    !pendingGrabScreenshot.empty() || pendingSnapVerdict.has_value() ||
+                    grabReadback || pendingSnapVerdict.has_value() ||
                         pendingActualTarget.has_value(), grabReady,
                     showFps, fpsForPresent);
                 prosper::frontend::producer_lineage_counters().presentation(
@@ -3087,14 +3246,38 @@ int main(int argc, char** argv) {
                 // The staging copy may have completed even when the swapchain rejected this frame.
                 // Commit all three capture requests only after a successful present; otherwise keep
                 // them pending for the next attempt. The policy is exercised by focused refusal arms.
+                if (attempt == PresentAttempt::presented && pendingGrabReserved &&
+                    !pendingGrabScreenshot.empty())
+                    stagedGrabCandidates.note_host_presented(gf.frame_seq);
                 prosper::frontend::dispatch_presented_capture(attempt, grabReady, [&] {
                     const auto* pixels = static_cast<const uint8_t*>(vk.stageMapped);
-                    flushGrabScreenshot(pixels, gf.width, gf.height);
+                    prosper::frontend::FrameGrabScreenshotEvidence source;
+                    source.source = prosper::frontend::FrameGrabSource::GpuScanout;
+                    source.host_presented = true;
+                    source.source_seq = gf.frame_seq;
+                    source.target_source_flip = grabTargetFlip;
+                    source.publication_id = gf.publication_id;
+                    source.producer = gf.producer;
+                    if (grabReadback) {
+                        if (pendingGrabReserved && !pendingGrabBundlePath.empty()) {
+                            source.armed_present = pendingGrabGuestPresent;
+                            source.written_present = gpu::present_count();
+                            if (!stagedGrabCandidates.stage(source, pixels, gf.width, gf.height) &&
+                                stagedGrabCandidates.overflowed())
+                                std::fprintf(stderr,
+                                             "[grab] bounded GPU screenshot candidate storage overflowed; "
+                                             "frame/producer match will fail closed if target was lost\n");
+                        } else {
+                            flushGrabScreenshot(pixels, gf.width, gf.height, source);
+                        }
+                    }
                     flushPendingSnap(pixels, gf.width, gf.height);
                     flushPendingActual(pixels, gf.width, gf.height,
                                        {gf.frame_seq, gf.publication_id,
                                         prosper::frontend::SnapActualPresentPath::gpu_scanout});
                 });
+                if (attempt == PresentAttempt::presented)
+                    drainStagedGrabCandidate(gf.frame_seq);
             } else if (gpu::present_frame_seq() != lastFrameSeq) {
                 // #1270 Finding 2: no GPU frame was published this iteration. On a publish MISS (front
                 // target evicted/invalidated, or no free slot) the renderer still did the CPU readback, so
@@ -3132,7 +3315,13 @@ int main(int argc, char** argv) {
                         lastFrameProgress = std::chrono::steady_clock::now();
                         havePresentedGuestFlip = true;
                         lastPresentedGuestFlip = cf.guest_present_count;
-                        flushGrabScreenshot(cf.rgba->data(), cf.width, cf.height);
+                        prosper::frontend::FrameGrabScreenshotEvidence source;
+                        source.host_presented = true;
+                        source.source = prosper::frontend::FrameGrabSource::GpuCpuFallback;
+                        source.source_seq = cf.guest_present_count;
+                        source.publication_id = cf.frame_seq;
+                        drainStagedGrabCandidate();
+                        flushGrabScreenshot(cf.rgba->data(), cf.width, cf.height, source);
                         flushPendingSnap(cf.rgba->data(), cf.width, cf.height);
                         flushPendingActual(cf.rgba->data(), cf.width, cf.height,
                                            {cf.guest_present_count, cf.frame_seq,
@@ -3169,7 +3358,13 @@ int main(int argc, char** argv) {
                     lastFrameSeq = frame.frame_seq;
                     shown.record(prosper::frontend::PresentedFrameSource::Cpu, running);
                     lastFrameProgress = std::chrono::steady_clock::now();
-                    flushGrabScreenshot(frame.rgba->data(), w, h);
+                    prosper::frontend::FrameGrabScreenshotEvidence source;
+                    source.host_presented = true;
+                    source.source = prosper::frontend::FrameGrabSource::Cpu;
+                    source.source_seq = frame.guest_present_count;
+                    source.publication_id = frame.frame_seq;
+                    drainStagedGrabCandidate();
+                    flushGrabScreenshot(frame.rgba->data(), w, h, source);
                     flushPendingSnap(frame.rgba->data(), w, h);
                     flushPendingActual(frame.rgba->data(), w, h,
                                        {frame.guest_present_count, frame.frame_seq,
@@ -3248,6 +3443,27 @@ int main(int argc, char** argv) {
     // Completed F9 jobs own all their bytes. Drain them before _Exit skips destructors; an
     // unfinished guest capture is cancelled explicitly rather than written as a complete frame.
     prosper::gpu::shutdown_interactive_capture_bundle();
+    drainStagedGrabCandidate();
+    if (!pendingGrabScreenshot.empty() && pendingGrabReserved && !pendingGrabBundlePath.empty()) {
+        // No verified closing-frame candidate supplied this press with pixels. Other GPU frames
+        // may have been presented and staged. Keep the reserved BMP untouched and state the exact
+        // incomplete reason; a later bundle outcome cannot turn an empty reservation into a pair.
+        prosper::frontend::FrameGrabScreenshotEvidence incomplete;
+        incomplete.armed_present = pendingGrabGuestPresent;
+        incomplete.written_present = gpu::present_count();
+        incomplete.no_bmp_reason = stagedGrabCandidates.overflowed()
+            ? prosper::frontend::FrameGrabNoBmpReason::CandidateOverflow
+            : stagedGrabCandidates.highest_presented_flip()
+                ? prosper::frontend::FrameGrabNoBmpReason::UnresolvedAtShutdown
+                : prosper::frontend::FrameGrabNoBmpReason::NeverPresented;
+        (void)prosper::gpu::interactive_grab_closed_source_flip(
+            pendingGrabBundlePath, incomplete.target_source_flip);
+        recordGrabScreenshot(pendingGrabBundlePath, incomplete);
+        std::fprintf(stderr, "[grab] no verified closing-frame screenshot for %s; "
+                             "empty reservation and incomplete sidecar retained\n",
+                     pendingGrabScreenshot.c_str());
+        clearPendingGrabScreenshot();
+    }
     reportGrabOutcome();
 
     // Unlike its F8 sibling below, this CLOSES rather than cancels. RenderDoc decides for itself

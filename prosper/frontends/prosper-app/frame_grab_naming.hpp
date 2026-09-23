@@ -2,9 +2,10 @@
 // frame_grab_naming.hpp — names the files ONE F9 frame grab writes, and claims those names before
 // the capture starts producing them.
 //
-// A grab writes two files at two different moments: the .bmp screenshot is armed at one present and
-// written at a later one, while the .prgbundle is written on the render thread when the capture
-// window closes. Two incidents came out of naming them independently of each other and of the run
+// A grab writes a .bmp screenshot and .prgbundle at different moments, plus a .f9.jsonl identity
+// sidecar. The screenshot is armed at one present and written at a later one, while the bundle is
+// written when the capture window closes. Two incidents came out of naming the image and bundle
+// independently of each other and of the run
 // (#1693):
 //
 //   * The old name was a per-process counter (frame_grab_001) in the cwd, so a second title played in
@@ -21,13 +22,13 @@
 //   1. One stamp per capture, read ONCE when the grab is armed (FrameGrabNamer::reserve). A capture
 //      that takes seconds cannot produce two different stamps, because there is only ever one.
 //   2. The title id is in the name, so two titles in one directory cannot collide at all.
-//   3. Both names are claimed together with an EXCLUSIVE create (O_CREAT|O_EXCL). Never overwriting
+//   3. All three names are claimed together with an EXCLUSIVE create (O_CREAT|O_EXCL). Never overwriting
 //      is a property of the syscall, not of a check-then-write — the app does run twice on one box.
 //      A collision suffix applies to the WHOLE capture: choosing it per file would push a bundle to
 //      "-2" while its screenshot stayed unsuffixed, which is incident 2 rebuilt out of the mechanism
 //      meant to prevent it.
 //
-//   frame_grab_<TITLEID>_<YYYYMMDD>-<HHMMSS>-<mmm>[-<N>].{prgbundle,bmp}
+//   frame_grab_<TITLEID>_<YYYYMMDD>-<HHMMSS>-<mmm>[-<N>].{prgbundle,bmp,f9.jsonl}
 //
 // A capture that aborts therefore leaves a zero-byte artifact rather than nothing. That is the
 // intended behaviour: it is visibly incomplete and it unambiguously belongs to its own capture,
@@ -138,13 +139,14 @@ inline std::string format_frame_grab_stamp(std::chrono::system_clock::time_point
     return buf;
 }
 
-// The names one capture owns. `ok` means both were created exclusively and belong to this capture
+// The names one capture owns. `ok` means all three were created exclusively and belong to this capture
 // alone; every path in here is real on disk from that moment on (zero bytes until written).
 struct FrameGrabPaths {
     bool ok = false;
     std::string stem;         // "frame_grab_PPSA25009_20260801-142233-471" (no directory, no extension)
     std::string bundle;       // <dir>/<stem>.prgbundle
     std::string screenshot;   // <dir>/<stem>.bmp
+    std::string manifest;     // <dir>/<stem>.f9.jsonl (independent evidence, then a joined verdict)
     unsigned suffix = 0;      // 0 = the preferred name was free; 2.. = a collision forced this suffix
     unsigned index = 0;       // this session's Nth grab — for the log line, never for the filename
     std::string error;        // why !ok
@@ -171,11 +173,11 @@ inline bool create_file_exclusive(const std::string& path) {
     return true;
 }
 
-// Claim both names for one capture armed at `armed_at`. The stamp is a parameter, not a call to
+// Claim all artifact names for one capture armed at `armed_at`. The stamp is a parameter, not a call to
 // now(), precisely so a caller cannot accidentally take one per file.
 //
-// Both files are created, or neither is: a bundle name that was free but whose screenshot name was
-// taken is released again and the suffix advances, so the two artifacts always share one stem.
+// All names are created, or none is: any collision releases earlier reservations and advances the
+// suffix, so an old sidecar can never be mistaken for this capture's identity proof.
 inline FrameGrabPaths reserve_frame_grab(const std::string& dir, const std::string& title_id,
                                          std::chrono::system_clock::time_point armed_at,
                                          unsigned max_suffix = 999) {
@@ -197,6 +199,7 @@ inline FrameGrabPaths reserve_frame_grab(const std::string& dir, const std::stri
         if (n) stem += "-" + std::to_string(n + 1);      // first collision reads "-2", not "-1"
         const std::string bundle = base_dir + "/" + stem + ".prgbundle";
         const std::string shot = base_dir + "/" + stem + ".bmp";
+        const std::string manifest = base_dir + "/" + stem + ".f9.jsonl";
         errno = 0;
         if (!create_file_exclusive(bundle)) {
             if (errno == EEXIST) continue;
@@ -206,7 +209,7 @@ inline FrameGrabPaths reserve_frame_grab(const std::string& dir, const std::stri
         errno = 0;
         if (!create_file_exclusive(shot)) {
             const int err = errno;                    // captured BEFORE remove(), which clobbers errno
-            // Release the half-claim. This capture owns both names or neither; leaving the bundle
+            // Release the partial claim. This capture owns all names or none; leaving the bundle
             // behind would strand an empty file that no capture is going to write.
             std::filesystem::remove(bundle, ec);
             if (ec)
@@ -216,10 +219,25 @@ inline FrameGrabPaths reserve_frame_grab(const std::string& dir, const std::stri
             out.error = "cannot create " + shot + ": " + std::strerror(err);
             return out;
         }
+        errno = 0;
+        if (!create_file_exclusive(manifest)) {
+            const int err = errno;
+            std::filesystem::remove(bundle, ec);
+            if (ec) out.warning = "could not remove the released reservation " + bundle +
+                                  ": " + ec.message();
+            ec.clear();
+            std::filesystem::remove(shot, ec);
+            if (ec) out.warning += " could not remove the released reservation " + shot +
+                                   ": " + ec.message();
+            if (err == EEXIST) continue;
+            out.error = "cannot create " + manifest + ": " + std::strerror(err);
+            return out;
+        }
         out.ok = true;
         out.stem = std::move(stem);
         out.bundle = bundle;
         out.screenshot = shot;
+        out.manifest = manifest;
         out.suffix = n ? n + 1 : 0;
         return out;
     }

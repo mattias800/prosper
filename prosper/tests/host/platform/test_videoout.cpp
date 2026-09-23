@@ -535,6 +535,39 @@ int main() {
               *(int32_t*)(fs + 0x34) == 0,
           "synchronous flip reports zero reserved and pending-queue fields");
     CHECK(*(int32_t*) (fs + 0x38) == 2, "flip status reports the submitted currentBuffer");
+    VideoOutBufferSnapshot selected_front;
+    const uint64_t first_flip_token = prosper_vo_flip_count();
+    CHECK(videoout_front_snapshot(selected_front) &&
+              selected_front.address == (uint64_t)(uintptr_t)fb2 &&
+              selected_front.source_flip_seq == first_flip_token,
+          "selected front holds its exact HLE flip token with its buffer address");
+    CHECK(videoout_same_front_identity(selected_front, selected_front),
+          "a current selected-front snapshot preserves its own exact identity");
+    VideoOutBufferSnapshot stale_identity = selected_front;
+    ++stale_identity.generation;
+    CHECK(!videoout_same_front_identity(stale_identity, selected_front),
+          "same slot and address after re-registration cannot retain old lineage");
+    stale_identity = selected_front;
+    ++stale_identity.source_flip_seq;
+    CHECK(!videoout_same_front_identity(stale_identity, selected_front),
+          "an interleaved later flip cannot inherit the earlier front's lineage");
+    stale_identity = selected_front;
+    ++stale_identity.address;
+    CHECK(!videoout_same_front_identity(stale_identity, selected_front),
+          "same flip token paired with a different address cannot certify source pixels");
+    VideoOutBufferSnapshot refused_front;
+    CHECK(!videoout_select_buffer(-1, refused_front, first_flip_token + 1000) &&
+              videoout_front_snapshot(refused_front) &&
+              refused_front.source_flip_seq == first_flip_token,
+          "a refused front selection never labels the retained buffer with a newer flip");
+    VideoOutBufferSnapshot reordered_front;
+    CHECK(videoout_select_buffer(0, reordered_front, first_flip_token + 1000) &&
+              videoout_front_snapshot(reordered_front) &&
+              reordered_front.address == (uint64_t)(uintptr_t)fb0 &&
+              reordered_front.source_flip_seq == first_flip_token + 1000,
+          "front identity follows the selected buffer rather than the global flip count");
+    CHECK(videoout_select_buffer(2, reordered_front, first_flip_token),
+          "the original front identity can be restored for later VideoOut checks");
 
     // Range validation: out-of-range buffer counts are rejected.
     CHECK(regb2(handle, 2, 0, (uint64_t)(uintptr_t)buffers, 99, (uint64_t)(uintptr_t)attr) != 0,
