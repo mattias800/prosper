@@ -55,6 +55,7 @@
 #include <functional>
 #include <chrono>
 #include <climits>
+#include <limits>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -11066,8 +11067,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     prosper::frontend::present_source_name(present_choice));
                     }
                 }
-                // PROSPER_DUMP_PERSISTENT=<min-submit>|ms:<millis>: read back and dump EVERY
-                // persistent color target after this submit's passes render. Unlike
+                // PROSPER_DUMP_PERSISTENT=<min-submit>|ms:<millis>: read back persistent color
+                // targets after this submit's passes render. The default is the original broad
+                // census; PROSPER_DUMP_PERSISTENT_ADDRS limits it to explicitly named addresses.
+                // Unlike
                 // PROSPER_RTT*/DUMP_*, this flag is NOT in the live_gpu_targets disable list
                 // (:1078-1085), so it observes the NORMAL persistent-render path (all other CPU-pixel
                 // diagnostics change that path -> #1103). readback_persistent_color_target restores
@@ -11104,7 +11107,18 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             }
                             const VkFormat fmt = prosper::test::backend_color_format(s.format);
                             const uint32_t bpp = prosper::test::backend_color_bytes_per_pixel(fmt);
-                            const uint64_t expected = static_cast<uint64_t>(s.w) * s.h * bpp;
+                            const uint64_t pixel_count = static_cast<uint64_t>(s.w) * s.h;
+                            if (g_persist_filter.state ==
+                                    prosper::frontend::PersistentReadbackFilterState::Selected) {
+                                if (bpp && pixel_count > std::numeric_limits<uint64_t>::max() / bpp) {
+                                    fprintf(stderr, "[persist] submit=%llu addr=0x%llx "
+                                                    "skipped: selected readback size overflow\n",
+                                            (unsigned long long)sub,
+                                            (unsigned long long)kv.first);
+                                    continue;
+                                }
+                            }
+                            const uint64_t expected = pixel_count * bpp;
                             if (g_persist_filter.state ==
                                     prosper::frontend::PersistentReadbackFilterState::Selected) {
                                 if (expected > kSelectedReadbackBudget - selected_readback_bytes) {
