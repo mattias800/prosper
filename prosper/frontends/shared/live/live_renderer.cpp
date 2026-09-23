@@ -3102,8 +3102,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             // These vectors are rebuilt for every draw. A bounded hint avoids repeated
             // growth for ordinary reflected resource sets without allocating for draws
             // that have no accepted resources. The control permits same-binary timing.
-            static const bool reserve_frame_resources =
-                std::getenv("PROSPER_NO_FRAME_RESOURCE_RESERVE") == nullptr;
+            static const bool reserve_frame_resources = [] {
+                const char* setting = std::getenv("PROSPER_FRAME_RESOURCE_RESERVE");
+                return !setting || std::strcmp(setting, "0") != 0;
+            }();
             // Immutable CPU snapshots live only for this renderer callback (not later spans or
             // frames). Every lookup still proves the exact retained images/generations. Sharing the
             // owner across draws also lets one backend group deduplicate its uploads by pointer.
