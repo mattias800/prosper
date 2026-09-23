@@ -48,6 +48,22 @@ The T+180 frame retains the wooded scene and displays `Look Around` and `Move` c
 prompts. This establishes a live, recognizable in-world scene under `tools/screenshot`.
 The image is very dark; no matching PS5 hardware capture or direct draw census was taken.
 
+To reproduce that second run, use a **new** private save and cache root; in particular, do not
+reuse the `new-expedition-01` directory from the first command:
+
+```bash
+PROSPER_GAME_ROOT=<DUMP_ROOT> \
+PROSPER_SAVE0=<EVIDENCE_ROOT>/PPSA08102/wake-up-02/save0 \
+PROSPER_SAVEDATA_DIR=<EVIDENCE_ROOT>/PPSA08102/wake-up-02/savedata-mem \
+XDG_CACHE_HOME=<EVIDENCE_ROOT>/PPSA08102/wake-up-02/xdg-cache \
+MESA_SHADER_CACHE_DIR=<EVIDENCE_ROOT>/PPSA08102/wake-up-02/mesa-cache \
+PROSPER_PAD_SCRIPT=@prosper/scripts/outer-wilds-PPSA08102/probe-wake-up.pad \
+PROSPER_PAD_SCRIPT_LOG=1 \
+  <BUILD>/screenshot <DUMP_ROOT>/PPSA08102-app0 \
+    --seconds 2 --count 90 --timeout 195 \
+    --out <EVIDENCE_ROOT>/PPSA08102/wake-up-02/shots
+```
+
 That second run completed 90/90 samples through T+180, with 87 composited samples, 74
 pixel-distinct samples, `guest=running`, and `status=ok`. The private log SHA-256 is
 `0c8b5d788f439ed1e6e037560ba5df42e891c55fee544b7a2573f8762d34d897`;

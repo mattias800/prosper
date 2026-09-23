@@ -2,7 +2,7 @@
 
 Tracker: [#3804](https://github.com/mattias800/prosper/issues/3804). Engine: Unity 2019.4.39f1 / IL2CPP.
 
-**Rung 2 — a live title-start prompt renders on a default Linux launch.** On `main`
+**Rung 3 — a routed first-person scene renders on Linux.** On `main`
 `ce84f7f7d305` (2026-09-23), the unmodified `tools/screenshot` frontend showed the Annapurna and
 Mobius Digital opening logos, then a “PRESS X TO START” prompt by about 40 seconds. An animated
 starfield and a dim campfire/tree scene render behind the prompt. The guest was still running when
@@ -12,10 +12,20 @@ is a 1920-wide WebP derived with `prosper/tools/screenshots/shrink.py` (SHA-256
 3840×2160 frontend PNG is retained privately under `<EVIDENCE_ROOT>/outer-wilds-20260923/`
 (SHA-256 `40e847af6c3855341de10e3a0fcf479d1b422d037f1cad124aa9faf7433024be`).
 
-**Visual fidelity is unverified.** The game wordmark is absent in the sampled prompt frames; this
-is a candidate difference, not an established PS5 defect without a hardware oracle. No input was
-sent, so main-menu interaction and gameplay are untested. The 50% speed goal has not been measured
-on a stable scene against PS5 hardware.
+The fresh-save route in [`prosper/scripts/outer-wilds-PPSA08102/`](../scripts/outer-wilds-PPSA08102/)
+presses Cross at 50 and 70 seconds, then Square at 110 seconds. The first two presses reach and
+accept NEW EXPEDITION; the Square press clears the Wake Up prompt. On `b77cffc831de`, the native
+T+122 frame shows a wooded first-person scene and T+180 shows its Look Around / Move prompts. The
+owner also observed the in-game world and described its rendering as almost correct, while reporting
+roughly 2 FPS. This is a recognizable scene and supports rung 3; the short visual report is not a
+whole-game compatibility verdict or a measured speed comparison with PS5 hardware.
+
+**Known visual defects.** The game wordmark is absent on prosper's title frame and present in the
+PS5 title-screen oracle attached to [#3804](https://github.com/mattias800/prosper/issues/3804).
+A later interactive F9 screenshot shows a large nearly white blob over the right side of the wooded
+scene. Its bundle writer was interrupted before finishing, so that bad image has no replayable
+producer trace. Two later captures at nearby but nonidentical guest states were clean. Neither
+result identifies the blob's producing pass. No matching PS5 gameplay oracle has been captured.
 
 ## Reproduction and evidence
 
@@ -41,8 +51,16 @@ dump and found no match (highest informative overlap 0.01%). That check cannot i
 inside asset containers or certify correct 3D rendering. The visible prompt and continuing
 animation are the progression evidence; frame counts alone would not establish the scene.
 
+For the fresh-save Wake Up run, the route's README records both input-read timestamps and artifact
+hashes. The native capture completed 90/90 samples through T+180, with 87 composited and 74
+pixel-distinct samples, and ended `guest=running`, `status=ok`. Those counts establish continuing
+publication; the in-world image and controller prompts establish the gameplay milestone. The owner
+manually inspected a later live run. Performance work uses the same route with isolated saves and
+counts completed producer versions rather than treating repeated presentations as new frames.
+
 ## Next checks
 
-Obtain a PS5 reference for this title revision to assess the wordmark and scene lighting. A
-separate bounded Cross route can then test whether the start prompt advances to a menu. Measure
-speed only on a named stable scene with an uncontended GPU window and a PS5 comparison.
+Capture a complete F9 bundle while the white blob is visible, then isolate its first wrong producer
+in replay. Compare a matched gameplay frame with PS5 hardware for lighting and visual fidelity.
+Measure speed on a named stable scene in an uncontended GPU window, with completed producer cadence
+separate from repeated presentation and from the PS5 comparison.
