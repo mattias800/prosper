@@ -1416,6 +1416,8 @@ if(TARGET prosper_core)
   if(Python3_Interpreter_FOUND)
     add_test(NAME performance_capture_report_logic
       COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/perf/test_performance_capture_report.py")
+    add_test(NAME compare_capture_pair_logic
+      COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/perf/test_compare_capture_pair.py")
   endif()
 
   # Library grid selection movement (#1471): arithmetic only, so the navigation rules are covered in

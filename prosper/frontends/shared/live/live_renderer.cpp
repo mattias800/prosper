@@ -3099,6 +3099,13 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 std::vector<uint32_t> order;
             };
             constexpr uint32_t kCompactBufferResourceBit = 0x80000000u;
+            // These vectors are rebuilt for every draw. A bounded hint avoids repeated
+            // growth for ordinary reflected resource sets without allocating for draws
+            // that have no accepted resources. The control permits same-binary timing.
+            static const bool reserve_frame_resources = [] {
+                const char* setting = std::getenv("PROSPER_FRAME_RESOURCE_RESERVE");
+                return !setting || std::strcmp(setting, "0") != 0;
+            }();
             // Immutable CPU snapshots live only for this renderer callback (not later spans or
             // frames). Every lookup still proves the exact retained images/generations. Sharing the
             // owner across draws also lets one backend group deduplicate its uploads by pointer.
@@ -3142,6 +3149,14 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                const prosper::gpu::ShaderResourceTable* prt,
                                prosper::test::BackendSubmissionBatch* producer_batch) {
               BuiltFrameResources built;
+              const size_t candidate_resources =
+                  (vrt ? vrt->resources.size() : 0) + (prt ? prt->resources.size() : 0);
+              const size_t reserve_hint = reserve_frame_resources
+                  ? std::min<size_t>(candidate_resources, 16) : 0;
+              const auto reserve_if_empty = [reserve_hint](auto& resources) {
+                  if (reserve_hint > 1 && resources.empty())
+                      resources.reserve(reserve_hint);
+              };
               // Once this callback has admitted a snapshot, observe queued guest writes at every
               // later draw, including draws with no array bindings. A callback-local latch keeps
               // this boundary identical when the per-draw control clears its memo; failure/clear
@@ -8517,10 +8532,16 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         }
                     }
                     if (full_resource) {
+                        reserve_if_empty(built.full);
                         const uint32_t index = static_cast<uint32_t>(built.full.size());
                         built.full.push_back(std::move(*full_resource));
-                        if (compact_buffer_resources) built.order.push_back(index);
+                        if (compact_buffer_resources) {
+                            reserve_if_empty(built.order);
+                            built.order.push_back(index);
+                        }
                     } else {
+                        reserve_if_empty(built.buffers);
+                        reserve_if_empty(built.order);
                         const uint32_t index = static_cast<uint32_t>(built.buffers.size());
                         built.buffers.push_back(std::move(compact_resource));
                         built.order.push_back(kCompactBufferResourceBit | index);

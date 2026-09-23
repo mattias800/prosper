@@ -26,3 +26,7 @@ matching charge totals; malformed, truncated, duplicate or reset-context evidenc
 Full materialization keys distinguish owners. Observed last-use changes and access-clock ages
 are neither elapsed time nor future reuse predictions. A resident owner with no observed accesses
 is a candidate for investigation, not proof that evicting it is profitable.
+
+`compare_capture_pair.py` checks routed F8 A/B run identities and balanced environment keys before
+computing the mean of recurring-shape renderer medians. Its weights and matching coverage stay visible; they are
+local recorded work, not equal-input proof or newly rendered FPS. See `COMPARE_CAPTURE_PAIR.md`.
