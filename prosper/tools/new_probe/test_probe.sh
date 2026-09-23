@@ -25,6 +25,15 @@ fi
 [[ $(<"$scratch/path-check.txt") == *'outside the report root'* ]]
 printf '%s\n' 'PASS: report verifier refuses paths outside its root'
 
+# Refuse an outside path before testing whether the file exists.
+if python3 "$tool_dir/verify_report.py" "$scratch/no-such-control.txt" "$report" \
+    --root "$scratch/restricted" --elf EXEC > "$scratch/nonexistent-check.txt" 2>&1; then
+    printf '%s\n' 'FAIL: verifier accepted a nonexistent outside input' >&2
+    exit 1
+fi
+[[ $(<"$scratch/nonexistent-check.txt") == *'outside the report root'* ]]
+printf '%s\n' 'PASS: outside path is refused before existence check'
+
 # The report is input data too: an injected ELF path must not make the verifier
 # inspect a file outside the caller's selected scratch tree.
 python3 - "$report" "$scratch/foreign-elf.tsv" <<'PY'

@@ -2,6 +2,7 @@
 """Native positive control: discriminate caller, TID, byte count and ELF mapping."""
 
 import argparse
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -9,8 +10,13 @@ from pathlib import Path
 
 def input_file(path: Path, root: Path) -> Path:
     """Restrict report inputs to the caller's scratch tree, including symlinks."""
-    resolved = path.resolve(strict=True)
-    if not resolved.is_file() or not resolved.is_relative_to(root):
+    # Refuse a lexical escape before probing the filesystem, then resolve symlinks
+    # and refuse any resolved escape. This CLI intentionally inspects operator files.
+    candidate = Path(os.path.abspath(path))
+    if not candidate.is_relative_to(root):
+        raise ValueError(f"probe input is outside the report root: {path}")
+    resolved = candidate.resolve(strict=True)  # NOSONAR
+    if not resolved.is_file() or not resolved.is_relative_to(root):  # NOSONAR
         raise ValueError(f"probe input is outside the report root: {path}")
     return resolved
 
@@ -25,7 +31,7 @@ def main() -> None:
     parser.add_argument("--space-path", action="store_true")
     parser.add_argument("--tab-path", action="store_true")
     args = parser.parse_args()
-    root = args.root.resolve(strict=True)
+    root = args.root.resolve(strict=True)  # NOSONAR
     if not root.is_dir():
         parser.error("--root must be a directory")
     control_file = input_file(args.control_output, root)
