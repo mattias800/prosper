@@ -231,5 +231,23 @@ int main(int argc, char** argv) {
         return 1;
     }
     std::printf("  [ok] raw RTT dump preserves exact seed bytes\n");
+
+    const auto conflict_path = prosper_test::test_scratch_path("seeded-raw-conflict.bin");
+    std::filesystem::remove(conflict_path, remove_error);
+    if (remove_error) return 1;
+    const std::string conflict_command = quote(argv[1]) +
+        " --dump-rtt-seed-raw 0x100000 " + quote(conflict_path) +
+        " --override-rtt-seed 0x100000 " + quote(raw_seed_path) + " " +
+        quote(capsule_path) + " " + quote(raw_output_path) +
+        " > " + quote(raw_log_path) + " 2>&1";
+    const int conflict_exit = child_exit_code(std::system(conflict_command.c_str()));
+    read_file(raw_log_path, log_bytes);
+    const std::string conflict_log(log_bytes.begin(), log_bytes.end());
+    if (conflict_exit != 2 || std::filesystem::exists(conflict_path) ||
+        conflict_log.find("cannot combine with --override-rtt-seed") == std::string::npos) {
+        std::fprintf(stderr, "[FAIL] captured raw RTT dump must refuse seed overrides\n");
+        return 1;
+    }
+    std::printf("  [ok] raw RTT dump refuses a replay-only seed override\n");
     return 0;
 }

@@ -816,6 +816,27 @@ int main() {
                   batched_source_image->completed_producer.source_submit == 17,
               "batched representation copy publishes the exact completed producer after the fence");
 
+        // A cached target may be acquired for LOAD even when its only draw is declined. The
+        // acquisition counter still rises; it cannot certify that this pass produced the pixels.
+        prosper::test::BackendDraw declined = cpu_sample;
+        declined.ps = &opaque;
+        declined.source_submit = 18;
+        prosper::test::BackendColorTarget load_without_draw{batched_target_id, true, true};
+        prosper::test::inject_render_texture_create_failure_once();
+        const auto loaded_pixels = prosper::test::render_draws_rgba(
+            {declined}, W, H, nullptr, nullptr, false, &load_without_draw);
+        const auto load_stats = prosper::test::backend_color_target_stats();
+        batched_source_image = prosper::test::find_persistent_color_target(
+            batched_target_id, W, H, VK_FORMAT_R8G8B8A8_UNORM);
+        const uint64_t loaded_source_submit = batched_source_image
+            ? prosper::frontend::completed_source_submit(
+                  prosper::test::persistent_color_producer_source(*batched_source_image))
+            : 0;
+        CHECK(loaded_pixels == first && load_stats.writes > 0 &&
+                  load_stats.write_hits == 1 &&
+                  loaded_source_submit != 18,
+              "LOAD with a declined draw cannot claim the current submit from target acquisition");
+
         // Capture-by-value matters when the source is rendered twice in one batch. The resolve sits
         // between those writes in queue order, so its destination must inherit the first version,
         // even though the source advertises only the second version after the common fence.

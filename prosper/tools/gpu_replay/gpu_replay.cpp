@@ -2514,6 +2514,12 @@ int main(int argc, char** argv) {
                      "gpu_replay: --override-submit requires --override-resource\n");
         return 2;
     }
+    if (rtt_seed_raw_addr && rtt_seed_override_addr) {
+        std::fprintf(stderr,
+                     "gpu_replay: --dump-rtt-seed-raw cannot combine with --override-rtt-seed "
+                     "(the dump must retain captured bytes)\n");
+        return 2;
+    }
     if (!g_native_texel_points.empty() && output_target_after_operation == SIZE_MAX) {
         std::fprintf(stderr,
                      "gpu_replay: --native-texel requires --output-target-after (it reads back "

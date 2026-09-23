@@ -10531,6 +10531,13 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         PROSPER_ENV_VALUE("PROSPER_DUMP_PASS_EVERY")
                             ? std::max(1, atoi(getenv("PROSPER_DUMP_PASS_EVERY"))) : 60;
                     auto pass_pixels = std::make_shared<const std::vector<uint8_t>>(std::move(gpx));
+                    const auto* completed_target = base
+                        ? prosper::test::find_persistent_color_target(base, gw, gh, pass_format)
+                        : nullptr;
+                    const uint64_t pass_source_submit = completed_target
+                        ? prosper::frontend::completed_source_submit(
+                              prosper::test::persistent_color_producer_source(*completed_target))
+                        : 0;
                     if (base && color_target_call.writes) {
                         RttSurf& surface = g_rtt[base];
                         surface.w = gw;
@@ -10981,19 +10988,16 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         if (base && base == front_va) {                          // the flipped buffer
                             px_front = pass_pixels; px_front_w = gw; px_front_h = gh;
                             px_front_base = base; px_front_fmt = candidate_fmt;
-                            px_front_source_submit =
-                                color_target_call.writes ? phase.source_submit : 0;
+                            px_front_source_submit = pass_source_submit;
                         }
                         if (is_vo) {                                            // any registered scanout
                             px_vo = pass_pixels; px_vo_w = gw; px_vo_h = gh;
                             px_vo_base = base; px_vo_fmt = candidate_fmt;
-                            px_vo_source_submit =
-                                color_target_call.writes ? phase.source_submit : 0;
+                            px_vo_source_submit = pass_source_submit;
                         }
                         px_last = pass_pixels;                                  // last non-empty (fallback)
                         px_last_w = gw; px_last_h = gh; px_last_base = base; px_last_fmt = candidate_fmt;
-                        px_last_source_submit =
-                            color_target_call.writes ? phase.source_submit : 0;
+                        px_last_source_submit = pass_source_submit;
                     } else if (!explicit_depth_extent && !rendered_pixels.empty() &&
                                prefix_inspect_publish()) {
                         // #1330: under gpu_replay's ordered-prefix inspection (--draw/--draw-steps/

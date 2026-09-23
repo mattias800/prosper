@@ -437,16 +437,27 @@ public:
         uint32_t target_width = 0, target_height = 0;
         const char* target_text = std::getenv("PROSPER_MENU_DRAW_TARGET_ADDRESS");
         const bool auto_target = target_text && std::strcmp(target_text, "auto") == 0;
-        std::error_code fs_error;
         if (!parse_menu_frame_gate_spec(std::getenv("PROSPER_MENU_FRAME_GATE"), gate_) ||
             !parse_positive_address(std::getenv("PROSPER_MENU_DRAW_FRAGMENT_PROGRAM"), ps_) ||
             (!auto_target && !parse_positive_address(target_text, target_)) ||
             !parse_extent(std::getenv("PROSPER_MENU_DRAW_TARGET_DIM"),
-                          target_width, target_height) ||
-            std::filesystem::exists(path_, fs_error) || fs_error ||
-            (full_submit_ && std::filesystem::exists(candidate_path_, fs_error)) || fs_error) {
-            std::fprintf(stderr, "[menu-capture] refused: invalid gate, draw identity, or occupied path\n");
+                          target_width, target_height)) {
+            std::fprintf(stderr, "[menu-capture] refused: invalid gate or draw identity\n");
             return;
+        }
+        std::error_code fs_error;
+        const bool output_exists = std::filesystem::exists(path_, fs_error);
+        if (output_exists || fs_error) {
+            std::fprintf(stderr, "[menu-capture] refused: occupied or unreadable output path\n");
+            return;
+        }
+        if (full_submit_) {
+            const bool candidate_exists = std::filesystem::exists(candidate_path_, fs_error);
+            if (candidate_exists || fs_error) {
+                std::fprintf(stderr,
+                             "[menu-capture] refused: occupied or unreadable candidate path\n");
+                return;
+            }
         }
         target_width_ = target_width;
         target_height_ = target_height;

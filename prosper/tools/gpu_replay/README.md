@@ -797,7 +797,8 @@ the selected submit executes, and the inspection conversion is not a pixel oracl
 `--dump-rtt-seed-raw ADDR PATH` writes the same seed's serialized texel bytes without BMP conversion or
 channel loss. Its byte length and format are printed; interpret the bytes using that format and extent.
 This is useful for alpha and HDR values that the BMP cannot preserve. It is still an input seed, not a
-readback after any operation.
+readback after any operation. It refuses combination with `--override-rtt-seed`, which would otherwise
+replace the captured bytes before the dump.
 
 For a normal live GPU-target path, `PROSPER_DUMP_PERSISTENT=ms:N` opens a three-callback
 readback window. `PROSPER_DUMP_PERSISTENT_EXTENT=WxH` limits it to retained images of that size

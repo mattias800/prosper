@@ -49,12 +49,15 @@ final LUT sample with its existing lookup coordinates, preserving the rest of th
 together the probes expose a washed-out, blocky scene. This is diagnostic output, not a rendering fix, and the
 two controls are not a full same-binary 2×2 experiment. Neither substitution belongs in the default path.
 
-The fragment uses five input locations. Its paired vertex SPIR-V declares them but stores none; the captured
-vertex program exports PRIM/POS0 without PARAM exports. The guest writes `SPI_PS_INPUT_CNTL_0..4=0` through
-indirect **physical** register offsets (17,420 observed writes, none through the virtual AGC bank), while the AGC
-header derives constant-default metadata. That metadata does not override the explicit register value on the
-evidence available. The pair is a fused front shader, with no hidden linked back/chain body in this draw.
-Determine the PS5 behavior for this missing-PARAM interface before changing generic interpolation semantics.
+The input-default probe logged changes to earlier fragment programs `0x3007c60000` and `0x3007c80000`
+paired with vertex program `0x3007060000`; it did **not** change the final compositor's input wiring.
+A separate pair trace of `0x3007060000` with fragment `0x30096e0000` found five guest-programmed
+`SPI_PS_INPUT_CNTL_0..4=0` values and header-derived constant defaults. The guest writes these registers
+through indirect **physical** offsets (17,420 observed writes, none through the virtual AGC bank).
+That vertex program exports PRIM/POS0 without PARAM exports; it is a fused front shader, with no hidden
+linked back/chain body. This traced pair is also **not** the final compositor. The captured compositor
+vertex SPIR-V stores Locations 0–3. Trace the exact earlier pass changed by the probe and establish its
+PS5 input contract before changing generic interpolation semantics.
 
 ## Reproduction
 
@@ -110,12 +113,12 @@ About 2 in 12 launches hang before their first frame (no raw scanout either). No
   only its compositor sample with the existing lookup coordinates left the live menu black; combining that
   diagnostic replacement with a fragment-input-default probe exposed a washed-out scene. The LUT producer is
   still missing in the unverified capsule, so this does not exonerate the merged-NGG gap (#3135).
-- **The fragment inputs are zero because virtual AGC register translation dropped their writes** — false for
-  this frame. A path-labelled register watch observed 17,420 direct physical indirect-array writes to the five
-  controls and zero virtual-bank writes. The observed values are guest-supplied, not absent state (#3835).
-- **The vertex shader's missing PARAM stores are in an unlinked back half** — false for this draw. Exact-pair
-  logging names one fused front program, no chain, and no linked second body; its decoded entry ends without
-  a PARAM export (#3835).
+- **The traced earlier fragment inputs are zero because virtual AGC register translation dropped their writes**
+  — false for the traced `0x30096e0000` pair. A path-labelled register watch observed 17,420 direct physical
+  indirect-array writes to the controls and zero virtual-bank writes (#3835).
+- **The traced earlier vertex program's missing PARAM stores are in an unlinked back half** — false for its
+  `0x30096e0000` pair. Exact-pair logging names one fused front program, no chain, and no linked second body;
+  its decoded entry ends without a PARAM export. This says nothing about the separate final compositor pair (#3835).
 
 ## Next
 
