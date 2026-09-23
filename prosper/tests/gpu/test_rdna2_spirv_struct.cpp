@@ -2005,6 +2005,52 @@ int main() {
 
     // The other direction, so that moving the wrong call site cannot pass: a module whose only
     // cross-lane form is a branch-guard vote must NOT claim a ballot raised its contract.
+    // s_bfm_b64 in a FRAGMENT shader must build its lane test from a real lane id. It used
+    // linear_localid, which only compute assigns; in a fragment module that is id 0, and the
+    // emitted `OpBitwiseAnd %uint %0 %63` is invalid SPIR-V ("Id is 0") that crashed NVIDIA's
+    // driver in Kena: Bridge of Spirits (PPSA01802). The shape below is Kena's own operand pair:
+    // width 12, offset 44, i.e. lanes [44, 56).
+    {
+        const uint32_t bfm_fragment[] = {
+            0x92EAAC8Cu,              // s_bfm_b64 vcc, 12, 44
+            0x7E0202F2u,              // v_mov_b32 v1, 1.0
+            0x02000280u,              // v_cndmask_b32 v0, 0, v1, vcc
+            0x7E040280u, 0x7E0602F2u, // v_mov_b32 v2, 0 ; v_mov_b32 v3, 1.0
+            0xF800000Fu, 0x03020100u, // exp mrt0 v0,v1,v2,v3
+            0xBF810000u,
+        };
+        const auto bfm_spv = recompile_fragment(bfm_fragment, std::size(bfm_fragment));
+        if (bfm_spv.empty()) {
+            printf("  [FAIL] fragment s_bfm_b64 did not recompile\n");
+            return 1;
+        }
+        // Walk the function body: no value instruction may name id 0 as an operand. (Literal
+        // operands only occur in the declaration section and OpCompositeExtract/Insert indices, so
+        // restrict the check to the integer ALU and comparison opcodes the lane test emits.)
+        bool zero_operand = false;
+        for (size_t i = 5; i < bfm_spv.size();) {
+            const uint32_t op = bfm_spv[i] & 0xffffu, wc = bfm_spv[i] >> 16;
+            if (!wc) break;
+            const bool alu = (op >= 128 && op <= 136) || (op >= 164 && op <= 179) ||
+                             (op >= 194 && op <= 200);
+            if (alu)
+                for (uint32_t k = 3; k < wc && i + k < bfm_spv.size(); ++k)
+                    zero_operand |= bfm_spv[i + k] == 0;
+            i += wc;
+        }
+        if (zero_operand) {
+            printf("  [FAIL] fragment s_bfm_b64 emitted an ALU operand naming id 0 (invalid SPIR-V)\n");
+            return 1;
+        }
+        if (fragment_spirv_required_subgroup_size(bfm_spv) != 64 ||
+            !(fragment_spirv_required_subgroup_reasons(bfm_spv) &
+              prosper::gpu::kFragmentWaveReasonLaneId)) {
+            printf("  [FAIL] fragment s_bfm_b64 did not record its lane-id wave64 contract\n");
+            return 1;
+        }
+        printf("  [ok]   fragment s_bfm_b64 tests a real lane id and records the wave64 contract\n");
+    }
+
     const uint32_t execz_vote_fragment[] = {
         0x7e020280u,              // v_mov_b32 v1, 0
         0x7c2200f0u,              // v_cmp_* -> VCC
