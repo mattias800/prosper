@@ -24,6 +24,7 @@
 #include "shared/live/depth_cube_source_snapshot.hpp"
 #include "shared/live/decode_scratch.hpp"     // pooled full-surface decode intermediates
 #include "shared/live/live_target_format.hpp"       // the one LiveTargetPixelFormat mapping (exhaustive)
+#include "shared/live/world_depth_ab.hpp"            // opt-in #2790 exact world attachment A/B
 #include "shared/perf/performance_capture.hpp"      // bounded F8 post-trigger renderer timing
 #include "shared/present/present_handoff_trace.hpp"
 #include "shared/perf/performance_timing_gate.hpp"  // turn on render_runner's existing backend clocks
@@ -53,6 +54,7 @@
 
 #include <atomic>
 #include <functional>
+#include <filesystem>
 #include <chrono>
 #include <climits>
 #include <cmath>
@@ -62,7 +64,9 @@
 #include <algorithm>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
+#include <system_error>
 #include <vector>
 #include <set>
 #include <utility>
@@ -77,7 +81,11 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <fcntl.h>
+#include <io.h>
+#include <sys/stat.h>
 #else
+#include <fcntl.h>
 #include <unistd.h>
 #endif
 
@@ -99,6 +107,7 @@ extern "C" int prosper_try_commit_dmem(uint64_t addr, uint64_t len, int write);
 extern "C" int      prosper_vo_buffer_count();
 extern "C" uint64_t prosper_vo_buffer_addr(int i);
 extern "C" uint64_t prosper_vo_flip_count();
+extern "C" int64_t prosper_pad_flip_ordinal();
 
 namespace prosper::frontend {
 
@@ -1374,12 +1383,139 @@ extern "C" int prosper_thread_in_renderer_callback(unsigned long native_tid) {
     return prosper::frontend::tid_is_in_renderer_callback(native_tid) ? 1 : 0;
 }
 
+namespace {
+struct WorldDepthAbRun {
+    WorldDepthAbConfig config{};
+    std::string directory;
+    bool armed = false, captured = false, window_reported = false;
+    uint64_t clear_passes = 0, geometry_passes = 0, other_world_passes = 0;
+    uint64_t ambiguous_passes = 0, shadow_like_passes = 0, capture_attempts = 0;
+};
+
+uint64_t world_depth_raw_hash(const void* data, size_t bytes) {
+    uint64_t hash = 1469598103934665603ull;
+    const auto* first = static_cast<const uint8_t*>(data);
+    for (size_t i = 0; i < bytes; ++i) {
+        hash ^= first[i];
+        hash *= 1099511628211ull;
+    }
+    return hash;
+}
+
+bool write_world_depth_raw(const std::string& path, const void* data, size_t bytes) {
+    // A second arm must never overwrite an earlier capture with the same mode/flip/submit label.
+#ifdef _WIN32
+    const int fd = _open(path.c_str(), _O_WRONLY | _O_CREAT | _O_EXCL | _O_BINARY,
+                         _S_IREAD | _S_IWRITE);
+    FILE* file = fd < 0 ? nullptr : _fdopen(fd, "wb");
+    if (fd >= 0 && !file) _close(fd);
+#else
+    const int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0644);
+    FILE* file = fd < 0 ? nullptr : fdopen(fd, "wb");
+    if (fd >= 0 && !file) close(fd);
+#endif
+    if (!file) return false;
+    const bool complete = std::fwrite(data, 1, bytes, file) == bytes;
+    const bool closed = std::fclose(file) == 0;
+    if (!complete || !closed) {
+        std::remove(path.c_str());
+        return false;
+    }
+    return true;
+}
+
+// The manifest is written LAST. An incomplete depth or color file has no completed-pair record;
+// failures delete both owned files. This is an exact raw-value capture, not an RGBA8 visualization.
+bool write_world_depth_pair(const WorldDepthAbRun& run, int64_t actual_pad_flip,
+                            uint64_t guest_flip, int render_submit,
+                            VkFormat color_format, uint64_t requested_draws,
+                            const prosper::test::BackendWorldDrawRecordStats& recorded,
+                            const std::vector<float>& depth,
+                            const std::vector<uint8_t>& color) {
+    char stem[160];
+    std::snprintf(stem, sizeof stem, "world-depth-m%d-pad%lld-vo%llu-submit%d",
+                  run.config.mode, static_cast<long long>(actual_pad_flip),
+                  static_cast<unsigned long long>(guest_flip), render_submit);
+    const std::string depth_name = std::string(stem) + ".depth-f32le";
+    const std::string color_name = std::string(stem) + ".color-raw";
+    const std::string depth_path = run.directory + "/" + depth_name;
+    const std::string color_path = run.directory + "/" + color_name;
+    const size_t depth_bytes = depth.size() * sizeof(float);
+    if (!write_world_depth_raw(depth_path, depth.data(), depth_bytes)) return false;
+    if (!write_world_depth_raw(color_path, color.data(), color.size())) {
+        std::remove(depth_path.c_str());
+        return false;
+    }
+    char manifest_text[1600];
+    const int written = std::snprintf(manifest_text, sizeof manifest_text,
+        "{\"mode\":%d,\"requested_pad_flip\":%lld,\"actual_pad_flip\":%lld,"
+        "\"producer_guest_flip\":%llu,\"renderer_submit\":%d,"
+        "\"depth_base\":\"0x%llx\",\"color_base\":\"0x%llx\","
+        "\"width\":%u,\"height\":%u,\"color_vk_format\":%u,"
+        "\"depth_bytes\":%zu,\"color_bytes\":%zu,"
+        "\"requested_draws\":%llu,\"recorded_draws\":%llu,"
+        "\"depth_write_commands\":%llu,\"color_write_commands\":%llu,"
+        "\"pixel_write_proven\":false,"
+        "\"depth_fnv64\":\"%016llx\",\"color_fnv64\":\"%016llx\","
+        "\"depth_file\":\"%s\",\"color_file\":\"%s\","
+        "\"present_join\":\"unknown\"}\n",
+        run.config.mode, static_cast<long long>(run.config.capture_pad_flip),
+        static_cast<long long>(actual_pad_flip), static_cast<unsigned long long>(guest_flip),
+        render_submit, static_cast<unsigned long long>(run.config.depth_base),
+        static_cast<unsigned long long>(run.config.color_base), run.config.width,
+        run.config.height, static_cast<unsigned>(color_format), depth_bytes, color.size(),
+        static_cast<unsigned long long>(requested_draws),
+        static_cast<unsigned long long>(recorded.recorded),
+        static_cast<unsigned long long>(recorded.depth_write_recorded),
+        static_cast<unsigned long long>(recorded.color0_write_recorded),
+        static_cast<unsigned long long>(world_depth_raw_hash(depth.data(), depth_bytes)),
+        static_cast<unsigned long long>(world_depth_raw_hash(color.data(), color.size())),
+        depth_name.c_str(), color_name.c_str());
+    const std::string manifest_path = run.directory + "/" + stem + ".json";
+    if (written <= 0 || static_cast<size_t>(written) >= sizeof manifest_text ||
+        !write_world_depth_raw(manifest_path, manifest_text,
+                               static_cast<size_t>(written))) {
+        std::remove(depth_path.c_str());
+        std::remove(color_path.c_str());
+        return false;
+    }
+    return true;
+}
+} // namespace
+
 void register_live_renderer(const std::string& frame_dir, bool dump_bmps_requested,
                             const std::string& title_id) {
     // Keep the legacy global disable authoritative for every frontend, including callers with their
     // own explicit opt-in such as PROSPER_APP_DUMP_FRAMES.
     const bool dump_bmps = frame_dump_request_allowed(
         dump_bmps_requested, PROSPER_ENV_VALUE("PROSPER_NO_FRAME_DUMPS"));
+    auto world_depth_ab = std::make_shared<WorldDepthAbRun>();
+    if (const char* setting = PROSPER_ENV_VALUE("PROSPER_SONIC_WORLD_DEPTH_AB")) {
+        const char* directory = PROSPER_ENV_VALUE("PROSPER_SONIC_WORLD_DEPTH_AB_DIR");
+        std::error_code directory_error;
+        const bool output_directory_exists = directory && *directory &&
+            std::filesystem::is_directory(directory, directory_error) && !directory_error;
+        world_depth_ab->armed = title_id == "PPSA03831" && directory && *directory &&
+            output_directory_exists &&
+            !PROSPER_ENV_VALUE("PROSPER_DIAG_CLEAR_OVERWRITE") &&
+            parse_world_depth_ab(setting, world_depth_ab->config);
+        if (world_depth_ab->armed) {
+            world_depth_ab->directory = directory;
+            std::fprintf(stderr,
+                "[world-depth-ab] armed mode=%d pad=%lld ds=0x%llx color=0x%llx extent=%ux%u "
+                "dir=%s; only structurally matching world passes can change policy\n",
+                world_depth_ab->config.mode,
+                static_cast<long long>(world_depth_ab->config.capture_pad_flip),
+                static_cast<unsigned long long>(world_depth_ab->config.depth_base),
+                static_cast<unsigned long long>(world_depth_ab->config.color_base),
+                world_depth_ab->config.width, world_depth_ab->config.height,
+                world_depth_ab->directory.c_str());
+        } else {
+            std::fprintf(stderr,
+                "[world-depth-ab] REFUSED: require Sonic title ID, strict mode:pad:0xDS:0xCOLOR:WxH, "
+                "an existing output directory, and no global PROSPER_DIAG_CLEAR_OVERWRITE\n");
+        }
+    }
     // Titles whose WaveAny-only fragment programs may run at the host's native Wave32.
     //
     // The classifier (render_runner.h) admits a reason set of EXACTLY kFragmentWaveReasonWaveAny --
@@ -2095,7 +2231,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
         fprintf(stderr, "[render] backend target-submit batching enabled (experimental)\n");
     prosper::gpu::set_submit_renderer(
         [frame_dir, dump_bmps, invalidate_ds, native_fragment_vote_width,
-         partial_wave_fragment](const std::vector<prosper::gpu::DrawItem>& items,
+         partial_wave_fragment, world_depth_ab](const std::vector<prosper::gpu::DrawItem>& items,
                                uint32_t w, uint32_t h) -> prosper::gpu::RenderedFrame {
             using RC = prosper::gpu::ResourceClass;
             // #2215 instrument: publish which thread is inside a submit-render callback right
@@ -9324,6 +9460,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 }
                 size_t pass_i = 0;
                 prosper::test::BackendSubmissionBatch backend_submission;
+                struct WorldCaptureCandidate {
+                    bool seen = false, ambiguous = false;
+                    VkFormat format = VK_FORMAT_UNDEFINED;
+                    uint64_t requested_draws = 0;
+                    prosper::test::BackendWorldDrawRecordStats recorded{};
+                } world_capture;
                 if (timing_enabled)
                     pending_timing.pass_head_ms += std::chrono::duration<double, std::milli>(
                         RenderClock::now() - pass_timing_start).count();
@@ -9606,6 +9748,11 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     static const bool no_resolve = getenv("PROSPER_NO_RESOLVE") != nullptr;
                     if (!pass.empty() && pass.front()->ps.cb_resolve && !no_resolve) {
                         const uint64_t rsrc = pass.front()->color0_base;
+                        // A later fixed-function resolve may replace the selected world's color
+                        // before the end-of-callback readback. Refuse rather than label it world.
+                        if (world_capture.seen &&
+                            pass.front()->color1_base == world_depth_ab->config.color_base)
+                            world_capture.ambiguous = true;
                         const uint64_t rdst = pass.front()->color1_base;
                         auto src_it = rsrc ? g_rtt.find(rsrc) : g_rtt.end();
                         if (src_it != g_rtt.end() && src_it->second.has_uniform_color)
@@ -9981,11 +10128,101 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             }
                         }
                     }
+                    WorldDepthPassKind world_pass_kind = WorldDepthPassKind::Unrelated;
+                    bool world_target_touched = false;
+                    if (world_depth_ab->armed) {
+                        std::vector<WorldDepthDrawFact> facts;
+                        facts.reserve(pass.size());
+                        for (const auto* draw : pass) {
+                            const auto& ps = draw->ps;
+                            // Observe every attachment identity, even when the state below does
+                            // not classify as world geometry. A later pass can replace the raw
+                            // bytes that the callback-tail readback would otherwise mislabel.
+                            world_target_touched |=
+                                ps.depth_write_base == world_depth_ab->config.depth_base;
+                            for (uint32_t slot = 0; slot < prosper::gpu::kColorTargetCount; ++slot)
+                                world_target_touched |=
+                                    color_binding(*draw, slot).base == world_depth_ab->config.color_base;
+                            WorldDepthDrawFact fact;
+                            fact.depth_read_base = ps.depth_read_base;
+                            fact.depth_write_base = ps.depth_write_base;
+                            fact.htile_base = ps.htile_data_base;
+                            fact.color_base = draw->color0_base;
+                            if (ps.db_depth_size_xy) {
+                                fact.depth_width = PM4_FIELD(ps.db_depth_size_xy, DB_DEPTH_SIZE_XY, X_MAX) + 1u;
+                                fact.depth_height = PM4_FIELD(ps.db_depth_size_xy, DB_DEPTH_SIZE_XY, Y_MAX) + 1u;
+                            }
+                            fact.compare_op = ps.depth_compare_op;
+                            fact.topology = ps.topology;
+                            fact.shader_control = ps.db_shader_control;
+                            fact.vertex_count = draw->vertex_count;
+                            fact.index_count = static_cast<uint32_t>(draw->indices.size());
+                            fact.color_write_mask = prosper::frontend::mrt_write_mask(*draw, 0);
+                            for (uint32_t slot = 0; slot < prosper::gpu::kColorTargetCount; ++slot)
+                                fact.all_color_write_masks |=
+                                    prosper::frontend::mrt_write_mask(*draw, slot);
+                            fact.depth_test = ps.depth_test_enable;
+                            fact.depth_write = ps.depth_write_enable;
+                            fact.clear_enable = ps.depth_clear_enable;
+                            fact.has_scissor = ps.has_scissor;
+                            fact.scissor_left = ps.scissor_left;
+                            fact.scissor_top = ps.scissor_top;
+                            fact.scissor_right = ps.scissor_right;
+                            fact.scissor_bottom = ps.scissor_bottom;
+                            facts.push_back(fact);
+                            if (ps.depth_clear_enable && ps.depth_write_base &&
+                                ps.depth_write_base != world_depth_ab->config.depth_base &&
+                                ps.depth_compare_op == VK_COMPARE_OP_ALWAYS &&
+                                ps.topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP)
+                                ++world_depth_ab->shadow_like_passes;
+                        }
+                        world_pass_kind = classify_world_depth_pass(world_depth_ab->config, facts);
+                        switch (world_pass_kind) {
+                            case WorldDepthPassKind::Clear: ++world_depth_ab->clear_passes; break;
+                            case WorldDepthPassKind::Geometry: ++world_depth_ab->geometry_passes; break;
+                            case WorldDepthPassKind::OtherWorld: ++world_depth_ab->other_world_passes; break;
+                            case WorldDepthPassKind::Ambiguous: ++world_depth_ab->ambiguous_passes; break;
+                            case WorldDepthPassKind::Unrelated: break;
+                        }
+                        const uint64_t activations = world_depth_ab->clear_passes +
+                            world_depth_ab->geometry_passes + world_depth_ab->other_world_passes;
+                        if (activations && (activations & (activations - 1)) == 0 &&
+                            world_pass_kind != WorldDepthPassKind::Unrelated &&
+                            world_pass_kind != WorldDepthPassKind::Ambiguous)
+                            std::fprintf(stderr,
+                                "[world-depth-ab] activation=%llu clear=%llu geometry=%llu other=%llu "
+                                "ambiguous=%llu shadow-lookalikes=%llu renderer-submit=%d pad=%lld\n",
+                                static_cast<unsigned long long>(activations),
+                                static_cast<unsigned long long>(world_depth_ab->clear_passes),
+                                static_cast<unsigned long long>(world_depth_ab->geometry_passes),
+                                static_cast<unsigned long long>(world_depth_ab->other_world_passes),
+                                static_cast<unsigned long long>(world_depth_ab->ambiguous_passes),
+                                static_cast<unsigned long long>(world_depth_ab->shadow_like_passes),
+                                g_this_submit,
+                                static_cast<long long>(prosper_pad_flip_ordinal()));
+                    }
                     const uint8_t* seed = nullptr;
                     const float* retained_uniform_clear = nullptr;
                     bool gpu_seed_available = false;
                     const bool seed_rtt0 = seed_target(base);
                     const VkFormat pass_format = format0;
+                    if (world_depth_ab->armed && !world_depth_ab->captured &&
+                        prosper_pad_flip_ordinal() == world_depth_ab->config.capture_pad_flip) {
+                        const bool surface_match =
+                            base == world_depth_ab->config.color_base &&
+                            gw == world_depth_ab->config.width &&
+                            gh == world_depth_ab->config.height;
+                        world_capture.ambiguous |= world_depth_capture_pass_ambiguous(
+                            world_capture.seen, world_pass_kind, world_target_touched,
+                            surface_match);
+                        if (world_pass_kind == WorldDepthPassKind::Geometry) {
+                            if (surface_match) {
+                                world_capture.seen = true;
+                                world_capture.format = pass_format;
+                                world_capture.requested_draws = render_pass.size();
+                            }
+                        }
+                    }
                     uint32_t mrt_count = requested_color_count;
                     if (PROSPER_ENV_ON("PROSPER_NO_MRT1") || PROSPER_ENV_ON("PROSPER_NO_MRT")) mrt_count = 1;
                     if (!render_pass.empty()) {
@@ -10345,6 +10582,11 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     const bool any_slot_bound = prosper::frontend::mrt_any_slot_bound(
                         pass_bases.data(),
                         static_cast<uint32_t>(std::min<size_t>(mrt_count, pass_bases.size())));
+                    std::optional<prosper::test::ScopedDepthClearProbeMode> world_mode_scope;
+                    if (world_depth_ab->armed &&
+                        world_pass_kind != WorldDepthPassKind::Unrelated &&
+                        world_pass_kind != WorldDepthPassKind::Ambiguous)
+                        world_mode_scope.emplace(world_depth_ab->config.mode);
                     std::vector<uint8_t> gpx = prosper::test::render_draws_rgba(
                         backend_draws, gw, gh, seed,
                         retained_uniform_clear ? retained_uniform_clear : clear_for(render_pass), true,
@@ -10375,6 +10617,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         // separate reason that 457/457 is evidence about THIS route, and a future
                         // title could legally mix a colour-writing draw into a pass that has a base.
                         /*want_color_readback=*/any_slot_bound);
+                    if (world_depth_ab->armed && world_pass_kind == WorldDepthPassKind::Geometry &&
+                        world_capture.seen && !world_capture.ambiguous)
+                        world_capture.recorded = prosper::test::backend_world_draw_record_stats();
+                    world_mode_scope.reset();
                     const auto backend_done = timing_enabled
                         ? RenderClock::now() : RenderClock::time_point{};
                     const prosper::test::BackendColorTargetStats color_target_call =
@@ -11023,6 +11269,110 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     pass_tail_start = RenderClock::now();
                     pass_tail_measured_before =
                         pending_timing.build_resources_ms + pending_timing.backend_ms;
+                }
+                // One callback-local depth/color pair for the structurally selected world geometry
+                // group at the requested pad ordinal. Multiple groups or later attachment writes
+                // refuse this readback. A caller can join producer_guest_flip with
+                // the app's successful-present source_seq; without that equality the manifest
+                // deliberately says present_join=unknown. Neither file is an HDR visualization.
+                if (world_depth_ab->armed && world_capture.seen &&
+                    !world_capture.ambiguous && !world_depth_ab->captured &&
+                    world_depth_ab->capture_attempts < 3) {
+                    ++world_depth_ab->capture_attempts;
+                    std::string refusal;
+                    std::vector<float> depth;
+                    std::vector<uint8_t> color;
+                    const int64_t actual_pad = prosper_pad_flip_ordinal();
+                    const uint64_t guest_flip = prosper_vo_flip_count();
+                    const auto retained = g_rtt.find(world_depth_ab->config.color_base);
+                    const uint64_t texels = static_cast<uint64_t>(world_depth_ab->config.width) *
+                        world_depth_ab->config.height;
+                    const uint32_t bpp = prosper::test::backend_color_bytes_per_pixel(
+                        world_capture.format);
+                    if (actual_pad != world_depth_ab->config.capture_pad_flip)
+                        refusal = "pad ordinal advanced before completed readback";
+                    else if (world_capture.recorded.recorded == 0 ||
+                             world_capture.recorded.depth_write_recorded == 0 ||
+                             world_capture.recorded.color0_write_recorded == 0)
+                        refusal = "selected world pass recorded no depth/color draw commands";
+                    else if (world_capture.format == VK_FORMAT_UNDEFINED || !bpp ||
+                             texels * bpp > (128u << 20))
+                        refusal = "world color format or readback size is unsupported";
+                    else if (retained == g_rtt.end() || !retained->second.gpu_valid ||
+                             retained->second.w != world_depth_ab->config.width ||
+                             retained->second.h != world_depth_ab->config.height ||
+                             retained->second.format != world_capture.format)
+                        refusal = "world color has no matching completed GPU authority";
+                    else if (backend_submission.pending()) {
+                        const auto& ctx = prosper::test::render_vk_ctx();
+                        if (!ctx.ok)
+                            refusal = "Vulkan renderer unavailable before batch completion";
+                        else {
+                            const auto completed = backend_submission.submit_and_wait(
+                                ctx.dev, ctx.queue, false);
+                            if (completed.submit_result != VK_SUCCESS ||
+                                completed.wait_result != VK_SUCCESS)
+                                refusal = "world producer batch did not complete";
+                        }
+                    }
+                    if (refusal.empty()) {
+                        std::string error;
+                        const auto status = prosper::test::read_persistent_ds_depth_array(
+                            world_depth_ab->config.depth_base, world_depth_ab->config.width,
+                            world_depth_ab->config.height, 0, 1, depth, error);
+                        if (status != prosper::test::PersistentDsDepthArrayStatus::Ready ||
+                            depth.size() != texels)
+                            refusal = "world depth readback refused: " + error;
+                    }
+                    if (refusal.empty()) {
+                        std::string error;
+                        if (!prosper::test::readback_persistent_color_target(
+                                world_depth_ab->config.color_base,
+                                world_depth_ab->config.width,
+                                world_depth_ab->config.height, world_capture.format,
+                                color, error) || color.size() != texels * bpp)
+                            refusal = "world color readback refused: " + error;
+                    }
+                    if (refusal.empty() && !write_world_depth_pair(
+                            *world_depth_ab, actual_pad, guest_flip, g_this_submit,
+                            world_capture.format, world_capture.requested_draws,
+                            world_capture.recorded, depth, color))
+                        refusal = "cannot write complete raw pair and manifest";
+                    if (!refusal.empty())
+                        std::fprintf(stderr,
+                            "[world-depth-ab] capture REFUSED attempt=%llu pad=%lld submit=%d: %s\n",
+                            static_cast<unsigned long long>(world_depth_ab->capture_attempts),
+                            static_cast<long long>(actual_pad), g_this_submit, refusal.c_str());
+                    else {
+                        world_depth_ab->captured = true;
+                        std::fprintf(stderr,
+                            "[world-depth-ab] completed pair mode=%d pad=%lld guest-flip=%llu "
+                            "submit=%d depth=%zu bytes color=%zu bytes "
+                            "requested=%llu recorded=%llu depth-commands=%llu color-commands=%llu; "
+                            "pixel writes and present join unproven\n",
+                            world_depth_ab->config.mode, static_cast<long long>(actual_pad),
+                            static_cast<unsigned long long>(guest_flip), g_this_submit,
+                            depth.size() * sizeof(float), color.size(),
+                            static_cast<unsigned long long>(world_capture.requested_draws),
+                            static_cast<unsigned long long>(world_capture.recorded.recorded),
+                            static_cast<unsigned long long>(world_capture.recorded.depth_write_recorded),
+                            static_cast<unsigned long long>(world_capture.recorded.color0_write_recorded));
+                    }
+                }
+                if (world_depth_ab->armed && !world_depth_ab->captured &&
+                    !world_depth_ab->window_reported &&
+                    prosper_pad_flip_ordinal() > world_depth_ab->config.capture_pad_flip) {
+                    world_depth_ab->window_reported = true;
+                    std::fprintf(stderr,
+                        "[world-depth-ab] requested pad passed without a completed pair: "
+                        "clear=%llu geometry=%llu other-world=%llu ambiguous=%llu "
+                        "shadow-lookalikes=%llu capture-attempts=%llu\n",
+                        static_cast<unsigned long long>(world_depth_ab->clear_passes),
+                        static_cast<unsigned long long>(world_depth_ab->geometry_passes),
+                        static_cast<unsigned long long>(world_depth_ab->other_world_passes),
+                        static_cast<unsigned long long>(world_depth_ab->ambiguous_passes),
+                        static_cast<unsigned long long>(world_depth_ab->shadow_like_passes),
+                        static_cast<unsigned long long>(world_depth_ab->capture_attempts));
                 }
                 // Present priority: the flipped front buffer > any registered scanout target > the
                 // legacy "last group" fallback (unchanged behavior when no group targets a VO buffer).

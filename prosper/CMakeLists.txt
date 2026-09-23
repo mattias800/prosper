@@ -1579,6 +1579,12 @@ if(TARGET prosper_core)
   target_link_libraries(test_texture_decode_diagnostic PRIVATE prosper_core)
   add_test(NAME texture_decode_diagnostic COMMAND test_texture_decode_diagnostic)
 
+  # Source-only classifier for the opt-in Sonic world-depth A/B. It must reject a shadow-map
+  # lookalike before a backend mode override is permitted; no Vulkan or game dump is required.
+  add_executable(test_world_depth_ab frontends/shared/tests/test_world_depth_ab.cpp)
+  target_include_directories(test_world_depth_ab PRIVATE frontends)
+  add_test(NAME world_depth_ab COMMAND test_world_depth_ab)
+
   # Bounded-acquire present classification (#1182). Needs Vulkan HEADERS only (VkResult enum), no loader
   # call — link Vulkan::Vulkan purely for its include dirs. Guarded so a headers-less host skips it
   # gracefully; every platform that builds prosper-app has Vulkan available.
@@ -3645,6 +3651,10 @@ endif()
         set_tests_properties(render_diagnostic_paths_clear_${clear_probe_mode} PROPERTIES ENVIRONMENT
                              "PROSPER_GEOM_PROBE=0;PROSPER_DRAW_ISO=1;PROSPER_ISO_AT=16,16;PROSPER_FRAME_DIR=render_diagnostic_paths_frames_${clear_probe_mode};PROSPER_DIAG_CLEAR_OVERWRITE=${clear_probe_mode}")
       endforeach()
+      add_test(NAME render_diagnostic_paths_world_scope
+               COMMAND test_render_diagnostic_paths world-scope)
+      set_tests_properties(render_diagnostic_paths_world_scope PROPERTIES ENVIRONMENT
+                           "PROSPER_GEOM_PROBE=0;PROSPER_DRAW_ISO=1;PROSPER_ISO_AT=16,16;PROSPER_FRAME_DIR=render_diagnostic_paths_frames_world_scope;PROSPER_DIAG_CLEAR_OVERWRITE=5")
 
       # The address-watch matcher's edge cases (exclusive end, empty range, UINT64_MAX wrap).
       add_executable(test_compute_address_watch tests/gpu/test_compute_address_watch.cpp)

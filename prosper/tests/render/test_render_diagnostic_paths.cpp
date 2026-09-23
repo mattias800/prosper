@@ -177,9 +177,11 @@ int main(int argc, char** argv) {
     if (argc == 2) {
         const char* const clear_probe = std::getenv("PROSPER_DIAG_CLEAR_OVERWRITE");
         const std::string requested = argv[1];
-        CHECK((requested == "1" || requested == "2" || requested == "3" ||
-               requested == "4" || requested == "5") && clear_probe &&
-                  requested == clear_probe,
+        const bool world_scope = requested == "world-scope";
+        CHECK((world_scope ? clear_probe && std::string(clear_probe) == "5"
+                           : (requested == "1" || requested == "2" || requested == "3" ||
+                              requested == "4" || requested == "5") && clear_probe &&
+                                 requested == clear_probe),
               "depth-clear probe matches the CTest arm");
         if (failures) return 1;
         prosper::gpu::ResolvedPipelineState clear{};
@@ -193,12 +195,57 @@ int main(int argc, char** argv) {
         clear.depth_clear_value = 0.0f;
         auto clear_draws = one_triangle();
         clear_draws[0].ps = &clear;
-        const uint64_t before_probe = prosper::test::backend_depth_clear_probe_armed_count().load();
-        const auto clear_pixels = prosper::test::render_draws_rgba(clear_draws, W, H);
-        CHECK(clear_pixels.size() == static_cast<size_t>(W) * H * 4,
-              "depth-clear diagnostic pass completed");
-        CHECK(prosper::test::backend_depth_clear_probe_armed_count().load() > before_probe,
-              "depth-clear diagnostic state was recorded for a draw");
+        auto render_clear = [&] {
+            const auto pixels = prosper::test::render_draws_rgba(clear_draws, W, H);
+            CHECK(pixels.size() == static_cast<size_t>(W) * H * 4,
+                  "depth-clear diagnostic pass completed");
+        };
+        if (world_scope) {
+            // A process-wide mode 5 stands in for a shadow pass: the selected world call must be
+            // able to override it, then restore it when the scope closes. Without the backend's
+            // scoped-mode read, the mode-0 arm below increments and fails at its own assertion.
+            const uint64_t before_global = prosper::test::backend_depth_clear_probe_armed_count().load();
+            render_clear();
+            const uint64_t after_global = prosper::test::backend_depth_clear_probe_armed_count().load();
+            CHECK(after_global > before_global, "unscoped control really arms global mode 5");
+            {
+                prosper::test::ScopedDepthClearProbeMode world_control(0);
+                render_clear();
+            }
+            const uint64_t after_control = prosper::test::backend_depth_clear_probe_armed_count().load();
+            CHECK(after_control == after_global, "scoped mode 0 suppresses the global clear probe");
+            {
+                prosper::test::ScopedDepthClearProbeMode world_candidate(4);
+                render_clear();
+                const auto recorded = prosper::test::backend_world_draw_record_stats();
+                CHECK(recorded.recorded == 1 && recorded.color0_write_recorded == 0,
+                      "selected depth-only pass records one admitted command without color");
+            }
+            const uint64_t after_candidate = prosper::test::backend_depth_clear_probe_armed_count().load();
+            CHECK(after_candidate > after_control, "scoped mode 4 executes the selected backend path");
+            render_clear();
+            CHECK(prosper::test::backend_depth_clear_probe_armed_count().load() > after_candidate,
+                  "unrelated passes return to the process policy after scope");
+            auto world_geometry = one_triangle();
+            prosper::gpu::ResolvedPipelineState geometry = clear;
+            geometry.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+            geometry.depth_compare_op = VK_COMPARE_OP_GREATER_OR_EQUAL;
+            geometry.color_write_mask = 0xf;
+            world_geometry[0].ps = &geometry;
+            {
+                prosper::test::ScopedDepthClearProbeMode selected_geometry(4);
+                prosper::test::render_draws_rgba(world_geometry, W, H);
+                const auto recorded = prosper::test::backend_world_draw_record_stats();
+                CHECK(recorded.recorded == 1 && recorded.depth_write_recorded == 1 &&
+                          recorded.color0_write_recorded == 1,
+                      "selected geometry records admitted depth and color commands");
+            }
+        } else {
+            const uint64_t before_probe = prosper::test::backend_depth_clear_probe_armed_count().load();
+            render_clear();
+            CHECK(prosper::test::backend_depth_clear_probe_armed_count().load() > before_probe,
+                  "depth-clear diagnostic state was recorded for a draw");
+        }
     }
 
     std::filesystem::remove_all(frame_dir, frame_dir_error);

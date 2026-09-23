@@ -4876,6 +4876,37 @@ constexpr bool depth_clear_effective(bool clear_enabled, bool test_enabled, bool
     return clear_enabled && test_enabled && write_enabled && compare_op != VK_COMPARE_OP_NEVER;
 }
 
+// A live #2790 A/B can restrict an existing diagnostic mode to one verified world attachment.
+// The override is scoped to one backend call and defaults to -1; direct tests and replay retain
+// PROSPER_DIAG_CLEAR_OVERWRITE's original process-wide behavior.
+inline int& scoped_depth_clear_probe_mode() {
+    static thread_local int mode = -1;
+    return mode;
+}
+
+struct ScopedDepthClearProbeMode {
+    int previous;
+    explicit ScopedDepthClearProbeMode(int mode)
+        : previous(std::exchange(scoped_depth_clear_probe_mode(), mode)) {}
+    ~ScopedDepthClearProbeMode() { scoped_depth_clear_probe_mode() = previous; }
+    ScopedDepthClearProbeMode(const ScopedDepthClearProbeMode&) = delete;
+    ScopedDepthClearProbeMode& operator=(const ScopedDepthClearProbeMode&) = delete;
+};
+
+// #2790: command recording evidence for the one opt-in world-pass A/B call. These are admitted
+// draw commands, not fragment/attachment write counts. A completed readback can still carry old
+// pixels if all fragments fail depth or coverage; the manifest must not call that a proven producer.
+struct BackendWorldDrawRecordStats {
+    uint64_t recorded = 0, depth_write_recorded = 0, color0_write_recorded = 0;
+};
+inline BackendWorldDrawRecordStats& backend_world_draw_record_stats_storage() {
+    static thread_local BackendWorldDrawRecordStats stats;
+    return stats;
+}
+inline BackendWorldDrawRecordStats backend_world_draw_record_stats() {
+    return backend_world_draw_record_stats_storage();
+}
+
 constexpr bool persistent_ds_pass_may_write_depth(bool clear_enabled, bool test_enabled,
                                                   bool write_enabled, uint32_t compare_op) {
     (void)clear_enabled;   // an effective clear already satisfies the write-path clause below
@@ -7120,12 +7151,15 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     // the default full-scissor clear on every draw admitted by the default gate (the missing 2x2
     // control).
     // None of these modes establishes the hardware clear predicate.
-    static const int sonic_clear_probe = [] {
+    static const int requested_clear_probe = [] {
         const char* value = std::getenv("PROSPER_DIAG_CLEAR_OVERWRITE");
         return value && value[0] >= '1' && value[0] <= '5' && value[1] == '\0'
             ? value[0] - '0' : 0;
     }();
-    const auto effective_depth_clear = [](const prosper::gpu::ResolvedPipelineState* ps) {
+    const int sonic_clear_probe = scoped_depth_clear_probe_mode() >= 0
+        ? scoped_depth_clear_probe_mode() : requested_clear_probe;
+    const bool world_draw_recording = scoped_depth_clear_probe_mode() >= 0;
+    const auto effective_depth_clear = [sonic_clear_probe](const prosper::gpu::ResolvedPipelineState* ps) {
         const bool probe_admits = sonic_clear_probe == 0 || sonic_clear_probe == 5 ||
             (ps->depth_compare_op == VK_COMPARE_OP_ALWAYS &&
              (sonic_clear_probe != 4 ||
@@ -12192,6 +12226,12 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             vkCmdDraw(cmd, v.vcount, v.instance_count,
                       static_cast<uint32_t>(v.vertex_offset), 0);
         }
+        if (world_draw_recording) {
+            auto& world_record = backend_world_draw_record_stats_storage();
+            ++world_record.recorded;
+            if (v.depth_test && v.depth_write) ++world_record.depth_write_recorded;
+            if (ps && ps->color_write_mask) ++world_record.color0_write_recorded;
+        }
         if (geom_here) { VkDeviceSize coff = 0; p_endxfb(cmd, 0, 1, &geom_counter, &coff); }
         if (ds_active) {
             vkCmdEndQuery(cmd, ds_occ_pool, static_cast<uint32_t>(di));
@@ -13708,6 +13748,8 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                                               bool flush_submission_batch = true,
                                               BackendMrtOutputs* mrt_outputs = nullptr,
                                               bool want_color_readback = true) {   // #2283
+    if (scoped_depth_clear_probe_mode() >= 0)
+        backend_world_draw_record_stats_storage() = {};
     const std::span<const BackendDraw> all(draws);
     // One preflight over the logical batch, before splitting or any render-pass state. A malformed
     // later segment must not leave earlier producer work submitted or speculative cache state live.
