@@ -43,16 +43,17 @@ alignas(256) static const uint32_t kDiagnosticCompute[] = {
     0xbf810000u, // s_endpgm
 };
 
-// Reflection-only fixture: the first buffer is read by the vertex stage, while binding 33 is
-// declared in the same module but has no data access. This need not execute on Vulkan; capture
-// must agree with the renderer's reflected binding set before deciding which backing to own.
-static std::vector<uint32_t> capture_graphics_binding_fixture(uint32_t used_binding) {
+// Reflection-only fixture: the first buffer is read by the selected graphics stage, while binding
+// 33 is declared in the same module but has no data access. This need not execute on Vulkan;
+// capture must agree with the renderer's reflected binding set before deciding which backing to own.
+static std::vector<uint32_t> capture_graphics_binding_fixture(uint32_t used_binding,
+                                                              bool fragment = false) {
     std::vector<uint32_t> words = {0x07230203u, 0x00010000u, 0u, 32u, 0u};
     auto emit = [&](uint16_t opcode, std::initializer_list<uint32_t> operands) {
         words.push_back((static_cast<uint32_t>(operands.size() + 1u) << 16u) | opcode);
         words.insert(words.end(), operands.begin(), operands.end());
     };
-    emit(15, {0, 20, 0x6e69616d, 0});             // OpEntryPoint Vertex %20 "main"
+    emit(15, {fragment ? 4u : 0u, 20, 0x6e69616d, 0}); // OpEntryPoint %20 "main"
     emit(21, {1, 32, 0});                          // u32
     emit(29, {2, 1});                              // runtime array of u32
     emit(30, {3, 2});                              // storage-buffer block
@@ -60,8 +61,8 @@ static std::vector<uint32_t> capture_graphics_binding_fixture(uint32_t used_bind
     emit(43, {1, 6, 0});                           // constant zero
     emit(59, {4, 8, 12}); emit(59, {4, 11, 12});  // used and inactive declarations
     emit(71, {2, 6, 4}); emit(72, {3, 0, 35, 0}); // ArrayStride and member Offset
-    emit(71, {8, 34, 0}); emit(71, {8, 33, used_binding});
-    emit(71, {11, 34, 0}); emit(71, {11, 33, 33u});
+    emit(71, {8, 34, fragment ? 1u : 0u}); emit(71, {8, 33, used_binding});
+    emit(71, {11, 34, fragment ? 1u : 0u}); emit(71, {11, 33, 33u});
     emit(65, {5, 9, 8, 6, 6});                     // access used[0]
     emit(61, {1, 10, 9});                          // load: genuine data access
     return words;
@@ -871,6 +872,38 @@ int main(int argc, char** argv) {
                                     reflected_reader, used_huge_capture, error) &&
                   error.find("reflection=unavailable") != std::string::npos,
               "unreflected geometry stage preserves full vertex-table backing");
+
+        // Kena's observed blocker is a fragment binding, whose descriptor set is 1. Exercise
+        // that call site separately: a vertex-only fixture cannot catch a wrong set or stage here.
+        DrawItem fragment_draw;
+        fragment_draw.fs = capture_graphics_binding_fixture(9, true);
+        fragment_draw.prt = reflected_table;
+        fragment_draw.draw_index = 19;
+        fragment_draw.command_order = 19;
+        const std::vector<SubmitOperation> fragment_operations = {
+            {SubmitOperationKind::Draw, 19, 19},
+        };
+        used_reads = 0;
+        GpuCaptureFile fragment_capture;
+        CHECK(capture_submit_items({fragment_draw}, {}, fragment_operations, meta,
+                                   reflected_reader, fragment_capture, error) &&
+                  used_reads == 1 && fragment_capture.blobs.size() == 1 &&
+                  fragment_capture.draws.size() == 1 &&
+                  fragment_capture.draws[0].prt.resources.size() == 2 &&
+                  fragment_capture.draws[0].prt.resources[1].blob_index == UINT32_MAX,
+              "unused fragment-set binding is omitted while used fragment data is exact");
+        fragment_draw.fs = capture_graphics_binding_fixture(33, true);
+        CHECK(!capture_submit_items({fragment_draw}, {}, fragment_operations, meta,
+                                    reflected_reader, used_huge_capture, error) &&
+                  error.find("draw ordinal=0 index=19 order=19 stage=fragment") !=
+                      std::string::npos &&
+                  error.find("binding=33") != std::string::npos,
+              "used oversized fragment binding fails closed with fragment context");
+        fragment_draw.fs = capture_graphics_binding_fixture(9);
+        CHECK(!capture_submit_items({fragment_draw}, {}, fragment_operations, meta,
+                                    reflected_reader, used_huge_capture, error) &&
+                  error.find("reflection=unavailable") != std::string::npos,
+              "vertex-stage module cannot authorize a fragment-set omission");
     }
 
     // #636: a descriptor-looking scalar quartet with no matching MUBUF instruction is not a compute
