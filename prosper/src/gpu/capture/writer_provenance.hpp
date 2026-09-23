@@ -62,8 +62,8 @@ uint64_t guest_write_recorded_count(GuestWriterKind kind);
 //   * RELEASE_MEM / EOP label writes and EVENT_WRITE timestamps (command_processor.cpp) — GPU-side,
 //     so the CPU caveat above does not cover them, and they are 4-8 byte writes to exactly the kind
 //     of address a PROSPER_PROVENANCE_ADDR watch is pointed at;
-//   * colour targets beyond MRT1 — RenderState carries only color0_base/color1_base, so a third or
-//     later target has no base to record;
+//   * a colour attachment that was bound but received no pixel write: the semantic provenance
+//     recorder sees the programmed target and draw, not the shader's final per-pixel output;
 //   * colour targets after the first draw to a given base — deduped deliberately, so the history
 //     holds one representative event per range rather than a write log;
 //   * a SKIPPED compute dispatch — it executes nothing, so it records nothing however the switches
