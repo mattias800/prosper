@@ -42,8 +42,10 @@ struct KenaMenuGpuSource {
 inline KenaMenuGpuSource kena_menu_gpu_source(bool published, bool new_flip,
                                               uint64_t front_address, uint64_t flip,
                                               uint64_t publication_id) {
-    if (!published || !front_address || !publication_id) return {};
-    return {new_flip ? "gpu-front" : "gpu-front-existing-slot", front_address, flip,
+    if (!published) return {};
+    if (!front_address || !publication_id)
+        return {"gpu-source-unknown", 0, flip, publication_id};
+    return {new_flip ? "gpu-front" : "gpu-front-same-flip", front_address, flip,
             publication_id};
 }
 

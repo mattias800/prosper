@@ -2742,9 +2742,11 @@ inline std::vector<uint8_t> execute_gpustate(const GpuState& st, const RenderFn&
 // shape as RenderFn, plus (w,h).
 struct RenderedFrame {
     std::shared_ptr<const std::vector<uint8_t>> storage;
-    // Zero except for an opt-in renderer observation. Carried through ordered submits so the
-    // publication sequence can be joined to a screenshot manifest's source_seq.
+    // Zero except for an opt-in renderer observation. Carried through ordered submits so a CPU
+    // publication can be joined to a screenshot manifest's source_seq.
     uint64_t diagnostic_trace_id = 0;
+    // GPU scanout publication is separate from the CPU frame sequence used by screenshots.
+    bool diagnostic_gpu_published = false;
     // Where these pixels came from, carried to the present layer so a consumer can tell a frame
     // prosper composited from the guest's own display buffer republished verbatim (#1968, #2044).
     // Defaults to Composited, which is what every producer other than the renderer's last-resort
@@ -2771,6 +2773,9 @@ using LiveRenderFn = std::function<RenderedFrame(const std::vector<DrawItem>& it
 
 struct OrderedSubmitResult {
     RenderedFrame frame;
+    // The final callback can be empty while an earlier span's frame remains publishable.
+    uint64_t diagnostic_trace_id = 0;
+    bool diagnostic_gpu_published = false;
     size_t render_spans = 0;
     bool compute_executed = false;
 };

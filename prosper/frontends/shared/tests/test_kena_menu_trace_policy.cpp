@@ -33,14 +33,19 @@ int main() {
           gpu_new.flip == 91 && gpu_new.publication_id == 17,
           "successful GPU blit carries front address, exact flip, and publication id");
     const auto gpu_reused = kena_menu_gpu_source(true, false, 0x1000, 91, 17);
-    check(std::string_view(gpu_reused.kind) == "gpu-front-existing-slot" &&
+    check(std::string_view(gpu_reused.kind) == "gpu-front-same-flip" &&
           gpu_reused.flip == 91 && gpu_reused.publication_id == 17,
-          "same-flip GPU presentation names its existing publication");
+          "same-flip GPU suppression names its prior publication");
     const auto gpu_refused = kena_menu_gpu_source(false, true, 0x1000, 91, 17);
     check(std::string_view(gpu_refused.kind) == "none" && gpu_refused.publication_id == 0,
           "failed GPU blit cannot claim a visible source");
-    check(std::string_view(kena_menu_gpu_source(true, true, 0x1000, 91, 0).kind) == "none",
-          "a GPU source without a proven publication id refuses");
+    const auto gpu_unknown = kena_menu_gpu_source(true, true, 0x1000, 91, 0);
+    check(std::string_view(gpu_unknown.kind) == "gpu-source-unknown" &&
+          gpu_unknown.address == 0 && gpu_unknown.flip == 91,
+          "a GPU publication without identity cannot reuse a stale CPU candidate");
+    check(std::string_view(kena_menu_gpu_source(true, true, 0, 91, 17).kind) ==
+              "gpu-source-unknown",
+          "a GPU publication without a front address is explicit unknown");
 
     std::printf("kena_menu_trace_policy: %d failure(s)\n", failures);
     return failures ? 1 : 0;
