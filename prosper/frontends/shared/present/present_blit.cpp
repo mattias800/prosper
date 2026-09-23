@@ -149,7 +149,8 @@ int pick_free_slot(PresentBlitState& s) {
 
 bool present_blit_publish(VkImage src, VkImageLayout src_layout, VkFormat src_format,
                           uint32_t w, uint32_t h, uint64_t frame_seq,
-                          ProducerSource producer) {
+                          ProducerSource producer, uint64_t* published_id) {
+    if (published_id) *published_id = 0;
     if (!src || !w || !h) return false;
     PresentHandoffTrace trace(frame_seq);
     const auto lock_begin = trace.now();
@@ -259,6 +260,7 @@ bool present_blit_publish(VkImage src, VkImageLayout src_layout, VkFormat src_fo
     s.latest_taken = false;
     trace.emit(prosper::perf::PresentHandoffEvent::Published);
     producer_lineage_counters().publication(producer);
+    if (published_id) *published_id = sl.publication_id;
     return true;
 }
 

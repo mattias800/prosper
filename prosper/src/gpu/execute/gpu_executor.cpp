@@ -11952,7 +11952,19 @@ bool execute_ordered_and_present(const GpuState& st, uint32_t width, uint32_t he
                          n == 31 ? " [further reports suppressed]" : "");
     }
     const bool presented = frame_ready && publish;
-    if (presented) present_write_frame(result.frame.storage, width, height, result.frame.origin);
+    if (presented) {
+        const uint64_t published_seq = present_write_frame(
+            result.frame.storage, width, height, result.frame.origin);
+        if (result.frame.diagnostic_trace_id)
+            std::fprintf(stderr, "[kena-menu] trace=%llu cpu-published submit=%llu source_seq=%llu\n",
+                         (unsigned long long)result.frame.diagnostic_trace_id,
+                         (unsigned long long)submit_no,
+                         (unsigned long long)published_seq);
+    } else if (result.frame.diagnostic_trace_id) {
+        std::fprintf(stderr, "[kena-menu] trace=%llu cpu-publication refused submit=%llu bytes=%zu\n",
+                     (unsigned long long)result.frame.diagnostic_trace_id,
+                     (unsigned long long)submit_no, px.size());
+    }
     if (timing_enabled) {
         const auto timing_done = TimingClock::now();
         auto ms = [](auto begin, auto end) {
