@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -63,7 +64,64 @@ def diagnosis(command, proc):
     ])
 
 
+# The arms below hold the configured hook to Claude Code's own budget, HOOK["timeout"]. That budget
+# is for the hook's WORK, and on a freshly built CI runner it is not the work that gets measured the
+# first time. Measured on twelve replicas of the Windows MinGW job (#3583): the first hook of the run
+# took 0.86-11.7 s where every later one took 0.13-0.76 s, and ALL of the excess elapsed before
+# session_start.py ran its first statement -- while cmd.exe, the py launcher and the interpreter
+# were started for the first time after a full build. The check itself, git work included, took
+# about 0.6 s even inside the 11.7 s call. Six CI failures in 300 runs were exactly that first
+# launch overrunning the cap; none was ever one of the five later hooks.
+#
+# So the launch chain is started once per class, outside every measured call, before any arm times
+# it. The warm-up runs the configured command verbatim; only the directory differs, and it is not a
+# repository, so the check reports UNVERIFIED at its first git call and does no other work.
+WARMUP_CAP = 300  # seconds. Generous on purpose: it bounds a hang, it is not a performance claim.
+
+
+def warm_hook_chain():
+    """Start the configured hook once and return how long that took, in seconds."""
+    with tempfile.TemporaryDirectory(prefix="session start warm-up ") as empty:
+        command, shell = hook_command(empty)
+        # A ceiling stops git discovering a repository ABOVE the temporary directory, which would
+        # turn the warm-up into a real check of some unrelated checkout (with a network ls-remote).
+        env = dict(os.environ, GIT_CEILING_DIRECTORIES=str(Path(empty).parent))
+        start = time.monotonic()
+        try:
+            subprocess.run(command, shell=shell, input="{}", capture_output=True, text=True,
+                           timeout=WARMUP_CAP, env=env)
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError("Starting the configured SessionStart hook once, against an empty "
+                               "directory, did not finish within " + str(WARMUP_CAP) + " s. That "
+                               "launch does no git work to speak of, so this host cannot start the "
+                               "hook's interpreter chain at all (#3583).") from exc
+        return time.monotonic() - start
+
+
+def overrun(command, exc, elapsed, warmup):
+    """Say how long the hook really took and what it printed, not merely that a cap was hit."""
+    output = exc.stdout if isinstance(exc.stdout, str) else (exc.stdout or b"").decode(errors="replace")
+    return "\n".join([
+        "The SessionStart hook did not finish inside its configured " + str(HOOK["timeout"])
+        + " s budget.",
+        "  configured: " + (command if isinstance(command, str) else " ".join(command)),
+        # run() kills only the process it started -- the shell -- and then reads until the pipes
+        # close, which is when the interpreter that shell started has exited. So this figure is the
+        # hook's real duration, not the cap. A CTest entry far longer than the cap is that wait.
+        "  subprocess.run returned after %.1f s; the untimed warm-up launch took %.1f s." % (
+            elapsed, warmup),
+        "  stdout: " + (output.strip() or "(none)"),
+        "A verdict on stdout means the hook was slow, not wrong; no stdout means it never got as "
+        "far as printing. The check itself bounds its git work at 12 s, so a duration well past "
+        "that was spent starting the interpreter, not checking (#3583).",
+    ])
+
+
 class StartupTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.warmup_seconds = warm_hook_chain()
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix="session start ")
         self.addCleanup(self.tmp.cleanup)
@@ -103,8 +161,12 @@ class StartupTest(unittest.TestCase):
         # Execute what Claude Code executes: the command exactly as configured, in the form it is
         # configured in, with the documented project-dir substitution.
         command, shell = hook_command(str(repo or self.repo))
-        proc = subprocess.run(command, shell=shell, input="{}", capture_output=True, text=True,
-                              timeout=HOOK["timeout"])
+        start = time.monotonic()
+        try:
+            proc = subprocess.run(command, shell=shell, input="{}", capture_output=True, text=True,
+                                  timeout=HOOK["timeout"])
+        except subprocess.TimeoutExpired as exc:
+            self.fail(overrun(command, exc, time.monotonic() - start, self.warmup_seconds))
         self.assertEqual(proc.returncode, 0, diagnosis(command, proc))
         output = json.loads(proc.stdout)["hookSpecificOutput"]
         self.assertEqual(output["hookEventName"], "SessionStart")
@@ -246,6 +308,20 @@ class StartupTest(unittest.TestCase):
         # Self-invalidating control: an interpreter reached despite the emptied PATH would make
         # this arm vacuous, and reporting the real check's verdict is how that shows up.
         self.assertNotIn("OK:", proc.stdout)
+
+    def test_hook_overrun_names_its_duration_and_output(self):
+        # The next overrun has to be a diagnosis rather than a cross-check against main (#3583):
+        # the report must carry how long the hook really ran and whatever it printed, because
+        # those two facts are what separate "slow to start" from "hung" and from "wrong". Built by
+        # hand, since a real overrun is exactly what this file no longer produces on purpose.
+        verdict = json.dumps({"hookSpecificOutput": {"additionalContext": "OK: current"}})
+        for stdout in (verdict, verdict.encode(), None):
+            with self.subTest(stdout=type(stdout).__name__):
+                exc = subprocess.TimeoutExpired("hook", HOOK["timeout"], output=stdout)
+                report = overrun("hook", exc, 47.3, 0.5)
+                self.assertIn("returned after 47.3 s", report)
+                self.assertIn("warm-up launch took 0.5 s", report)
+                self.assertIn("OK: current" if stdout else "stdout: (none)", report)
 
     def test_root_is_found_from_a_subdirectory(self):
         # The relative derivation that replaced --show-toplevel still has to climb: this is the
