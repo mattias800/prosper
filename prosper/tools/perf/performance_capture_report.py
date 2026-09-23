@@ -386,6 +386,29 @@ def _resource_breakdown(renderer):
             "res_buffer_copy": _total(renderer, "res_buffer_copy_ms"),
             "res_descriptor": _total(renderer, "res_descriptor_ms"),
         })
+        texture_leaf_fields = ("res_texture_upload_ms", "res_texture_bind_ms")
+        breakdown["texture_leaves_available"] = all(
+            field in row for row in renderer for field in texture_leaf_fields)
+        if breakdown["texture_leaves_available"]:
+            breakdown["res_texture_upload"] = _total(renderer, "res_texture_upload_ms")
+            breakdown["res_texture_bind"] = _total(renderer, "res_texture_bind_ms")
+            # Signed: overlapping or misplaced timers must be visible, not clamped away.
+            breakdown["res_texture_other"] = (breakdown["res_texture"] -
+                                               breakdown["res_texture_upload"] -
+                                               breakdown["res_texture_bind"])
+        texture_count_fields = ("backend_texture_refs", "backend_texture_uploads",
+                                "backend_texture_upload_bytes",
+                                "backend_texture_persistent_hits",
+                                "backend_texture_persistent_misses",
+                                "backend_texture_binding_refs",
+                                "backend_texture_binding_unique",
+                                "backend_texture_binding_persistent_hits",
+                                "backend_texture_binding_persistent_misses")
+        breakdown["texture_counts_available"] = all(
+            field in row for row in renderer for field in texture_count_fields)
+        if breakdown["texture_counts_available"]:
+            breakdown["texture_counts"] = {
+                field: sum(row[field] for row in renderer) for field in texture_count_fields}
         # Same rule as have_backend, one level down and for the same reason. A capture predating the
         # buffer leaves must report them UNAVAILABLE, never 0 -- with 0 the remainder below would
         # absorb every leaf it is missing and print a large residual, which is precisely the false
@@ -1370,6 +1393,28 @@ def print_summary(summary):
                           " create/index_find/index_insert/hash UNAVAILABLE") + ")"
                   f" descriptor={breakdown['res_descriptor']:.1f}"
                   f" other={breakdown['res_other']:.1f}]")
+            if breakdown["texture_leaves_available"]:
+                print("    included in backend texture:"
+                      f" upload={breakdown['res_texture_upload']:.1f}ms"
+                      f" bind={breakdown['res_texture_bind']:.1f}ms"
+                      f" other={breakdown['res_texture_other']:+.1f}ms")
+            else:
+                print("    backend texture upload/bind breakdown: UNAVAILABLE")
+            if breakdown["texture_counts_available"]:
+                textures = breakdown["texture_counts"]
+                print("    backend textures:"
+                      f" refs={textures['backend_texture_refs']}"
+                      f" unique_uploads={textures['backend_texture_uploads']}"
+                      f" upload_extent={textures['backend_texture_upload_bytes'] / (1024*1024):.1f}MiB"
+                      f" persistent_hit/miss={textures['backend_texture_persistent_hits']}/"
+                      f"{textures['backend_texture_persistent_misses']}"
+                      f" binding_refs/unique={textures['backend_texture_binding_refs']}/"
+                      f"{textures['backend_texture_binding_unique']}"
+                      f" binding_persistent_hit/miss="
+                      f"{textures['backend_texture_binding_persistent_hits']}/"
+                      f"{textures['backend_texture_binding_persistent_misses']}")
+            else:
+                print("    backend texture cache counts: UNAVAILABLE")
             if breakdown["buffer_range_sharing_available"]:
                 ranges = breakdown["buffer_range_sharing"]
                 print(f"    buffer ranges: uploads={ranges['buffer_range_uploads']}"
