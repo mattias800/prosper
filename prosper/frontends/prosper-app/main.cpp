@@ -2061,7 +2061,8 @@ int main(int argc, char** argv) {
                      prosper::frontend::snap_author_line(index, verdict, mode, flip, name).c_str());
     };
 
-    auto flushPendingActual = [&](const uint8_t* rgba, uint32_t w, uint32_t h) {
+    auto flushPendingActual = [&](const uint8_t* rgba, uint32_t w, uint32_t h,
+                                  prosper::frontend::SnapActualIdentity identity) {
         if (!pendingActualTarget) return;
         const int64_t target = *pendingActualTarget;
         pendingActualTarget.reset();
@@ -2078,7 +2079,7 @@ int main(int argc, char** argv) {
             (std::filesystem::path(snapDir) / "actuals.jsonl").string();
         if (FILE* f = fopen(manifest.c_str(), "a")) {
             std::fprintf(f, "%s\n", prosper::frontend::snap_actual_record_line(
-                target, actual, w, h, name).c_str());
+                target, actual, w, h, name, identity).c_str());
             fclose(f);
         }
         std::fprintf(stderr, "[snap] captured anchor %lld at pad flip %lld -> %s\n",
@@ -3039,14 +3040,6 @@ int main(int argc, char** argv) {
                     attempt == PresentAttempt::presented, gf.producer);
                 trace.emit(prosper::perf::PresentHandoffEvent::GpuAttemptResult, static_cast<int>(attempt));
                 gpuPresentedW = gf.width; gpuPresentedH = gf.height;
-                if (grabReady) {
-                    flushGrabScreenshot(static_cast<const uint8_t*>(vk.stageMapped),
-                                        gf.width, gf.height);
-                    flushPendingSnap(static_cast<const uint8_t*>(vk.stageMapped),
-                                     gf.width, gf.height);
-                    flushPendingActual(static_cast<const uint8_t*>(vk.stageMapped),
-                                       gf.width, gf.height);
-                }
                 if (attempt == PresentAttempt::out_of_date) {
                     swapchainDirty = true;
                 } else if (attempt == PresentAttempt::skipped) {
@@ -3091,6 +3084,17 @@ int main(int argc, char** argv) {
                         t0 = now; mark = shown;
                     }
                 }
+                // The staging copy may have completed even when the swapchain rejected this frame.
+                // Commit all three capture requests only after a successful present; otherwise keep
+                // them pending for the next attempt. The policy is exercised by focused refusal arms.
+                prosper::frontend::dispatch_presented_capture(attempt, grabReady, [&] {
+                    const auto* pixels = static_cast<const uint8_t*>(vk.stageMapped);
+                    flushGrabScreenshot(pixels, gf.width, gf.height);
+                    flushPendingSnap(pixels, gf.width, gf.height);
+                    flushPendingActual(pixels, gf.width, gf.height,
+                                       {gf.frame_seq, gf.publication_id,
+                                        prosper::frontend::SnapActualPresentPath::gpu_scanout});
+                });
             } else if (gpu::present_frame_seq() != lastFrameSeq) {
                 // #1270 Finding 2: no GPU frame was published this iteration. On a publish MISS (front
                 // target evicted/invalidated, or no free slot) the renderer still did the CPU readback, so
@@ -3130,7 +3134,9 @@ int main(int argc, char** argv) {
                         lastPresentedGuestFlip = cf.guest_present_count;
                         flushGrabScreenshot(cf.rgba->data(), cf.width, cf.height);
                         flushPendingSnap(cf.rgba->data(), cf.width, cf.height);
-                        flushPendingActual(cf.rgba->data(), cf.width, cf.height);
+                        flushPendingActual(cf.rgba->data(), cf.width, cf.height,
+                                           {cf.guest_present_count, cf.frame_seq,
+                                            prosper::frontend::SnapActualPresentPath::gpu_cpu_fallback});
                     }
                 } else {
                     std::this_thread::sleep_for(std::chrono::milliseconds(2));
@@ -3165,7 +3171,9 @@ int main(int argc, char** argv) {
                     lastFrameProgress = std::chrono::steady_clock::now();
                     flushGrabScreenshot(frame.rgba->data(), w, h);
                     flushPendingSnap(frame.rgba->data(), w, h);
-                    flushPendingActual(frame.rgba->data(), w, h);
+                    flushPendingActual(frame.rgba->data(), w, h,
+                                       {frame.guest_present_count, frame.frame_seq,
+                                        prosper::frontend::SnapActualPresentPath::cpu});
                     // Periodic present-rate log (every 60 presented frames).
                     static auto t0 = std::chrono::steady_clock::now(); static uint64_t mark = 0;
                     if (shown - mark >= 60) {

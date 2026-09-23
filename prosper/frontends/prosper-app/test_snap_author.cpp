@@ -15,6 +15,7 @@ using prosper::frontend::snap_record_line;
 using prosper::frontend::parse_snap_flip_list;
 using prosper::frontend::snap_actual_file_name;
 using prosper::frontend::snap_actual_record_line;
+using prosper::frontend::SnapActualPresentPath;
 using prosper::frontend::snap_verdict_token;
 
 static int failures = 0;
@@ -158,9 +159,29 @@ int main() {
         check(overshot == "actual_f1200_at1204.bmp", "an overshoot is visible in the file name");
         check(exact != overshot, "the two cases cannot be confused");
 
-        const std::string line = snap_actual_record_line(1200, 1204, 1920, 1080, overshot);
+        const std::string line = snap_actual_record_line(
+            1200, 1204, 1920, 1080, overshot,
+            {9876, 42, SnapActualPresentPath::gpu_scanout});
         check(contains(line, "\"target_flip\":1200") && contains(line, "\"actual_flip\":1204"),
               "the actual record carries the requested and reached anchors separately");
+        check(contains(line, "\"source_seq\":9876") &&
+                  contains(line, "\"publication_id\":42") &&
+                  contains(line, "\"present_path\":\"gpu-scanout\""),
+              "direct GPU snapshots carry their guest source and GPU handoff identity");
+        const std::string fallback = snap_actual_record_line(
+            1200, 1204, 1920, 1080, overshot,
+            {9876, 17, SnapActualPresentPath::gpu_cpu_fallback});
+        check(contains(fallback, "\"source_seq\":9876") &&
+                  contains(fallback, "\"publication_id\":17") &&
+                  contains(fallback, "\"present_path\":\"gpu-cpu-fallback\""),
+              "GPU CPU fallback uses the separate CPU publication namespace");
+        const std::string cpu = snap_actual_record_line(
+            0, 0, 640, 360, "actual_f0_at0.bmp",
+            {0, 1, SnapActualPresentPath::cpu});
+        check(contains(cpu, "\"source_seq\":0") &&
+                  contains(cpu, "\"publication_id\":1") &&
+                  contains(cpu, "\"present_path\":\"cpu\""),
+              "ordinary CPU snapshots preserve a legitimate first guest flip");
     }
 
     // ---- 11. Scan mode is carried, and distinguishable -----------------------------------
