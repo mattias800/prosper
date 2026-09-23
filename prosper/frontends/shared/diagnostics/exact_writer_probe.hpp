@@ -20,6 +20,61 @@ struct ExactWriterProbeSpec {
     uint64_t after_ms = 0;
 };
 
+struct ExactWriterSecondInputSpec {
+    bool requested = false;
+    bool armed = false;
+    uint32_t binding = 0;
+    uint64_t address = 0;
+};
+
+// BINDING:0xADDRESS. The binding names one reflected pixel resource, not just
+// any descriptor whose guest range happens to overlap the requested image.
+inline ExactWriterSecondInputSpec parse_exact_writer_second_input(const char* value) {
+    ExactWriterSecondInputSpec spec;
+    if (!value) return spec;
+    spec.requested = true;
+    const std::string_view text(value);
+    const size_t colon = text.find(':');
+    if (colon == std::string_view::npos || !colon ||
+        !text.substr(colon + 1).starts_with("0x")) return spec;
+    const auto binding = text.substr(0, colon);
+    const auto address = text.substr(colon + 3);
+    if (address.empty()) return spec;
+    const auto [binding_end, binding_error] = std::from_chars(
+        binding.data(), binding.data() + binding.size(), spec.binding, 10);
+    const auto [address_end, address_error] = std::from_chars(
+        address.data(), address.data() + address.size(), spec.address, 16);
+    spec.armed = binding_error == std::errc{} &&
+                 binding_end == binding.data() + binding.size() &&
+                 address_error == std::errc{} &&
+                 address_end == address.data() + address.size() && spec.address;
+    return spec;
+}
+
+enum class ExactWriterSecondInputVerdict : uint8_t {
+    Ready, MissingBinding, MissingImage, NoVisibleRgb
+};
+
+inline ExactWriterSecondInputVerdict exact_writer_second_input_verdict(
+    bool exact_gpu_binding, bool readback_ok, size_t raw_nonzero, size_t rgb_nonblack) {
+    if (!exact_gpu_binding) return ExactWriterSecondInputVerdict::MissingBinding;
+    if (!readback_ok) return ExactWriterSecondInputVerdict::MissingImage;
+    if (!raw_nonzero || !rgb_nonblack)
+        return ExactWriterSecondInputVerdict::NoVisibleRgb;
+    return ExactWriterSecondInputVerdict::Ready;
+}
+
+inline const char* exact_writer_second_input_verdict_name(
+    ExactWriterSecondInputVerdict verdict) {
+    switch (verdict) {
+    case ExactWriterSecondInputVerdict::Ready: return "ready";
+    case ExactWriterSecondInputVerdict::MissingBinding: return "missing-exact-gpu-binding";
+    case ExactWriterSecondInputVerdict::MissingImage: return "missing-or-unreadable-exact-image";
+    case ExactWriterSecondInputVerdict::NoVisibleRgb: return "no-visible-RGB";
+    }
+    return "unknown";
+}
+
 // 0xPS:0xINPUT:0xOUTPUT:ms:AFTER. Every field is exact; a partial parse must refuse.
 inline ExactWriterProbeSpec parse_exact_writer_probe(const char* value) {
     ExactWriterProbeSpec spec;

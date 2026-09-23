@@ -569,6 +569,9 @@ struct BackendColorTargetStats {
     uint64_t readbacks = 0;
     uint64_t cached_bytes = 0;
     uint64_t cached_entries = 0;
+    // Diagnostic observation from the actual render-pass attachment, not an inference from
+    // target admission or retained-cache presence. UINT32_MAX means no color0 attachment.
+    uint32_t color0_load_op = UINT32_MAX;
 };
 
 inline BackendColorTargetStats& backend_color_target_stats_storage() {
@@ -7905,6 +7908,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     // Seeded or persistent: the attachment already holds valid pixels before this pass, so LOAD them.
     att[0].loadOp = (seed_rgba || load_cached_color) ? VK_ATTACHMENT_LOAD_OP_LOAD
                                                      : VK_ATTACHMENT_LOAD_OP_CLEAR;
+    color_target_stats.color0_load_op = static_cast<uint32_t>(att[0].loadOp);
     att[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
     att[0].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE; att[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
     att[0].initialLayout = (seed_rgba || load_cached_color)
@@ -13743,6 +13747,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         aggregate_color.readbacks += color.readbacks;
         aggregate_color.cached_bytes = color.cached_bytes;
         aggregate_color.cached_entries = color.cached_entries;
+        aggregate_color.color0_load_op = color.color0_load_op;
 
         const BackendTextureUploadStats textures = backend_texture_upload_stats();
         aggregate_textures.references += textures.references;
