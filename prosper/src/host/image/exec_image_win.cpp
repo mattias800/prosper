@@ -1030,6 +1030,16 @@ namespace {
                 return EXCEPTION_CONTINUE_EXECUTION;
             if (a >= 0x1000000000ull && prosper_reserved_range_state(a) == 1) {
                 void* page = (void*)(uintptr_t)(a & ~(uint64_t)0x3fff);
+                {
+                    static volatile LONG diag_n = 0;
+                    const LONG k = InterlockedIncrement(&diag_n);
+                    const bool guest_rip = c->Rip >= 0x400000000ull && c->Rip < 0x800000000ull;
+                    if (k <= 60 || (k & 1023) == 0)
+                        fprintf(stderr, "[kena-lazy] #%ld addr=0x%llx rip=0x%llx %s tid=%lu write=%d" "\n",
+                                (long)k, (unsigned long long)a, (unsigned long long)c->Rip,
+                                guest_rip ? "GUEST" : "HOST", (unsigned long)GetCurrentThreadId(),
+                                (int)ep->ExceptionRecord->ExceptionInformation[0]);
+                }
                 if (prosper_try_commit_reserved_placeholder(
                         (uint64_t)(uintptr_t)page, 0x4000) ||
                     VirtualAlloc(page, 0x4000, MEM_COMMIT, PAGE_READWRITE))
