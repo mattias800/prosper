@@ -85,6 +85,7 @@ void usage(const char* argv0) {
                          "[--dump-compute-resource N:BINDING PATH] "
                          "[--override-compute-resource N:BINDING PATH] "
                          "[--dump-post-compute-resource N:BINDING PATH] "
+                         "[--dump-post-compute-resource-unverified N:BINDING PATH.unverified] "
                          "[--require-post-change] [--expect-post-hash HASH] "
                          "[--legacy-htile-before-stencil] "
                          "<capture.prgcap> [output.bmp]\n", argv0);
@@ -2182,6 +2183,8 @@ int main(int argc, char** argv) {
     std::string compute_resource_override_path;
     std::string compute_resource_spec, compute_resource_path;
     std::string post_compute_resource_spec, post_compute_resource_path;
+    bool post_compute_dump_requested = false;
+    bool post_compute_unverified = false;
     std::string failed_shader_spec, failed_shader_path;
     std::string retry_failed_chain_spec, retry_failed_stage_spec;
     std::string retry_failed_stage_spv_path;
@@ -2414,8 +2417,23 @@ int main(int argc, char** argv) {
             compute_resource_override_requested = true;
         }
         else if (std::string(argv[i]) == "--dump-post-compute-resource" && i + 2 < argc) {
+            if (post_compute_dump_requested) {
+                std::fprintf(stderr, "gpu_replay: duplicate post-compute dump selector\n");
+                return 2;
+            }
+            post_compute_dump_requested = true;
             post_compute_resource_spec = argv[++i];
             post_compute_resource_path = argv[++i];
+        }
+        else if (std::string(argv[i]) == "--dump-post-compute-resource-unverified" && i + 2 < argc) {
+            if (post_compute_dump_requested) {
+                std::fprintf(stderr, "gpu_replay: duplicate post-compute dump selector\n");
+                return 2;
+            }
+            post_compute_dump_requested = true;
+            post_compute_resource_spec = argv[++i];
+            post_compute_resource_path = argv[++i];
+            post_compute_unverified = true;
         }
         else if (std::string(argv[i]) == "--require-post-change")
             require_post_change = true;
@@ -2595,6 +2613,12 @@ int main(int argc, char** argv) {
     if ((require_post_change || expected_post_hash_set) &&
         post_compute_resource_spec.empty()) {
         usage(argv[0]); return 2;
+    }
+    if (post_compute_unverified &&
+        !post_compute_resource_path.ends_with(".unverified")) {
+        std::fprintf(stderr,
+                     "gpu_replay: unverified post-compute output path must end in .unverified\n");
+        return 2;
     }
     if (!post_compute_resource_spec.empty() &&
         (inspect_only || validate_only || graph_only || draw_selected ||
@@ -3859,7 +3883,7 @@ int main(int argc, char** argv) {
                          post_compute_dump.error.c_str());
             return 1;
         }
-        if (post_compute_dump.prefix_compute_failures) {
+        if (post_compute_dump.prefix_compute_failures && !post_compute_unverified) {
             std::fprintf(stderr,
                          "gpu_replay: post-compute prefix had %zu failed compute dispatches "
                          "among %zu executions\n",
@@ -3867,6 +3891,12 @@ int main(int argc, char** argv) {
                          post_compute_dump.prefix_compute_executions);
             return 1;
         }
+        if (post_compute_unverified)
+            std::fprintf(stderr,
+                         "[post-compute-resource] UNVERIFIED prefix-failures=%zu/%zu; "
+                         "selected success does not validate preceding inputs or this output\n",
+                         post_compute_dump.prefix_compute_failures,
+                         post_compute_dump.prefix_compute_executions);
         FILE* file = std::fopen(post_compute_resource_path.c_str(), "wb");
         if (!file ||
             std::fwrite(post_compute_dump.after.linear.data(), 1,

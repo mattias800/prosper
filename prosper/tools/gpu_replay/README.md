@@ -767,6 +767,13 @@ descriptor-visible linear hash fail, while `--expect-post-hash HASH` requires an
 raw/backing hash. Those gates prove the requested execution and observation lever moved; the output file
 itself is always linearized, not tiled.
 This mode initializes Vulkan and is not an inspect-only command.
+`--dump-post-compute-resource-unverified COMPUTE:BINDING PATH.unverified` is a separate,
+explicit diagnostic for a capture whose prefix has failed dispatches. It still requires the
+selected dispatch to execute exactly once and succeed, but writes its linear output even when
+earlier dispatches failed. The `.unverified` suffix is mandatory and the log prints the failed
+prefix count. Its bytes can show where an offline replay diverges; they cannot establish that the
+guest's complete preceding computation or the live presented frame was correct. The strict flag
+above keeps refusing such a prefix.
 `--compute-only N` retains just that realized dispatch and
 its captured resources, making a driver or recompiler failure deterministic without running unrelated draws
 or dispatches. `--override-compute-spv N PATH` replaces that dispatch's module after capture materialization;

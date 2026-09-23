@@ -202,5 +202,33 @@ with tempfile.TemporaryDirectory(prefix="gpu-replay-retry-") as scratch:
             check(unwritable.returncode == 2 and "cannot write retry SPIR-V" in unwritable.stderr,
                   "retry export reports output file errors")
 
+# A failed-prefix compute snapshot must never land at an ordinary-looking path. These parser
+# controls run before capture loading and preserve the output sentinel; the retained Kena capsule
+# separately exercises strict refusal versus the opt-in unverified write after five failed prefix
+# dispatches.
+with tempfile.TemporaryDirectory(prefix="gpu-replay-post-unverified-") as scratch:
+    directory = Path(scratch)
+    plain = directory / "post.linear"
+    plain.write_bytes(b"do not overwrite verified-looking output")
+    bad_suffix = run_result(["--dump-post-compute-resource-unverified", "0:1",
+                             str(plain), "absent.prgcap"])
+    check(bad_suffix.returncode == 2 and "must end in .unverified" in bad_suffix.stderr and
+          plain.read_bytes() == b"do not overwrite verified-looking output",
+          "unverified compute dump refuses a verified-looking path before reading the capture")
+
+    unverified = directory / "post.linear.unverified"
+    duplicate = run_result(["--dump-post-compute-resource", "", str(plain),
+                            "--dump-post-compute-resource-unverified", "0:1",
+                            str(unverified), "absent.prgcap"])
+    check(duplicate.returncode == 2 and "duplicate post-compute dump selector" in duplicate.stderr and
+          not unverified.exists() and plain.read_bytes() == b"do not overwrite verified-looking output",
+          "duplicate selector cannot hide behind an empty first selector or write either path")
+
+    accepted = run_result(["--dump-post-compute-resource-unverified", "0:1",
+                           str(unverified), "absent.prgcap"])
+    check(accepted.returncode == 2 and "absent.prgcap" in accepted.stderr and
+          "must end in .unverified" not in accepted.stderr and not unverified.exists(),
+          "a suffixed opt-in reaches capture loading without fabricating an output")
+
 print("%d failure(s)" % len(failures))
 sys.exit(1 if failures else 0)
