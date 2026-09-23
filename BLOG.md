@@ -21,6 +21,16 @@ from the tracker issues, and still gated, because it is a projection of state ra
 
 ## 2026-09-23
 
+### Metaphor: ReFantazio reaches its title screen
+
+We now reach the *Metaphor: ReFantazio* title screen and menu, and from there the storybook prologue. The stripes in the background are its movie layer, which does not decode correctly yet ([#3801](https://github.com/mattias800/prosper/issues/3801)). [#2876](https://github.com/mattias800/prosper/issues/2876).
+
+![Metaphor: ReFantazio title screen with the NEW GAME / LOAD GAME / SYSTEM menu, tools/screenshot, scripts/metaphor/reach-title-screen.pad with the setup saved, t=40 s](assets/screenshots/metaphor-title-screen.webp)
+
+![Metaphor: ReFantazio storybook prologue after NEW GAME, tools/screenshot, same route, t=65 s](assets/screenshots/metaphor-prologue.webp)
+
+![Metaphor: ReFantazio SYSTEM page, "Unable to connect to the PlayStation Network", tools/screenshot, first-boot setup](assets/screenshots/metaphor-system-offline.webp)
+
 ### Outer Wilds reaches a title-start prompt
 
 On a default Linux launch, *Outer Wilds* reaches “PRESS X TO START” over an animated starfield and
@@ -43,6 +53,7 @@ The route's graphics-mode press is not deterministic: these runs landed on **Per
 later one on Performance. The world renders in both.
 
 ![GTA V Display settings on a fresh save: Graphics Mode reads Performance RT](assets/screenshots/gta5-route-fresh-save-performance-rt.webp)
+
 ## 2026-09-22
 
 ### Kena: Bridge of Spirits reaches its main menu
