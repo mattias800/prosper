@@ -11970,6 +11970,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     frame.origin = frame_origin;
                     frame.diagnostic_trace_id = kena_trace_id;
                     frame.diagnostic_gpu_published = kena_trace_this_callback && published_gpu;
+                    frame.diagnostic_source_kind = kena_final_source;
+                    frame.diagnostic_source_address = kena_final_addr;
+                    frame.diagnostic_served_retained = kena_served_retained;
                     return frame;
                 }
                 struct TimingTotals {
@@ -13039,6 +13042,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             frame.origin = frame_origin;
             frame.diagnostic_trace_id = kena_trace_id;
             frame.diagnostic_gpu_published = kena_trace_this_callback && published_gpu;
+            frame.diagnostic_source_kind = kena_final_source;
+            frame.diagnostic_source_address = kena_final_addr;
+            frame.diagnostic_served_retained = kena_served_retained;
             return frame;
         });
     fprintf(stderr, "[render] live Vulkan submit renderer registered (dump=%d, frames -> %s)\n",

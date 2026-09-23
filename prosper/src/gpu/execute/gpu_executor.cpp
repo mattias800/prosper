@@ -11970,11 +11970,19 @@ bool execute_ordered_and_present(const GpuState& st, uint32_t width, uint32_t he
             ? (result.frame.diagnostic_trace_id == diagnostic_trace_id
                    ? "traced-final" : "earlier-span")
             : "none";
+        const char* cpu_source = published_seq ? result.frame.diagnostic_source_kind : "none";
+        const uint64_t cpu_source_address = published_seq
+            ? result.frame.diagnostic_source_address : 0;
+        const bool cpu_served_retained = published_seq &&
+            result.frame.diagnostic_served_retained;
         std::fprintf(stderr, "[kena-menu] trace=%llu submit=%llu cpu_source_seq=%llu "
-                             "cpu_frame_from=%s cpu_bytes=%zu gpu_published=%d publish_gate=%d\n",
+                             "cpu_frame_from=%s cpu_source=%s cpu_addr=0x%llx cpu_retained=%d "
+                             "cpu_bytes=%zu gpu_published=%d publish_gate=%d\n",
                      (unsigned long long)diagnostic_trace_id,
                      (unsigned long long)submit_no,
-                     (unsigned long long)published_seq, frame_from, px.size(),
+                     (unsigned long long)published_seq, frame_from, cpu_source,
+                     (unsigned long long)cpu_source_address, cpu_served_retained ? 1 : 0,
+                     px.size(),
                      result.diagnostic_gpu_published ? 1 : 0, publish ? 1 : 0);
     }
     if (timing_enabled) {

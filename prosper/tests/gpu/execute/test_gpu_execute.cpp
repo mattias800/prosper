@@ -36,6 +36,7 @@
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -641,28 +642,53 @@ int main() {
                 if (live_render_phase().final_span) {
                     frame.diagnostic_trace_id = 37;
                     frame.diagnostic_gpu_published = true;
+                    frame.diagnostic_source_kind = "none";
                 } else {
                     frame = RenderedFrame(std::vector<uint8_t>(4, 0x5A));
+                    frame.diagnostic_source_kind = "source-A";
+                    frame.diagnostic_source_address = 0xA;
+                    frame.diagnostic_served_retained = true;
                 }
                 return frame;
             },
             [](const std::vector<ComputeItem>&) { return true; }, 1, 1);
         CHECK(result.frame.bytes() == std::vector<uint8_t>(4, 0x5A) &&
               result.frame.diagnostic_trace_id == 0 &&
+              std::string_view(result.frame.diagnostic_source_kind) == "source-A" &&
+              result.frame.diagnostic_source_address == 0xA &&
+              result.frame.diagnostic_served_retained &&
               result.diagnostic_trace_id == 37 && result.diagnostic_gpu_published,
-              "empty traced final span remains distinct from an earlier CPU frame and GPU blit");
+              "empty traced final span preserves earlier source A and its retained provenance");
+        present_reset();
+        const uint64_t source_a_seq = present_write_frame(result.frame.storage, 1, 1,
+                                                          result.frame.origin);
+        PresentSnapshot source_a_snapshot;
+        CHECK(source_a_seq != 0 && present_snapshot(source_a_snapshot) &&
+              source_a_snapshot.source_seq == source_a_seq &&
+              source_a_snapshot.rgba == std::vector<uint8_t>(4, 0x5A) &&
+              std::string_view(result.frame.diagnostic_source_kind) == "source-A" &&
+              result.frame.diagnostic_source_address == 0xA,
+              "the final CPU publication retains source A despite an empty traced final span");
+        present_reset();
 
         const auto cpu_result = execute_ordered_items(
             operations, {first, second}, {split},
             [](const std::vector<DrawItem>&, uint32_t, uint32_t) {
                 RenderedFrame frame(std::vector<uint8_t>(4, 0x31));
-                if (live_render_phase().final_span) frame.diagnostic_trace_id = 38;
+                if (live_render_phase().final_span) {
+                    frame.diagnostic_trace_id = 38;
+                    frame.diagnostic_source_kind = "source-B";
+                    frame.diagnostic_source_address = 0xB;
+                }
                 return frame;
             },
             [](const std::vector<ComputeItem>&) { return true; }, 1, 1);
         CHECK(cpu_result.frame.diagnostic_trace_id == 38 &&
               cpu_result.diagnostic_trace_id == 38 &&
               !cpu_result.diagnostic_gpu_published &&
+              std::string_view(cpu_result.frame.diagnostic_source_kind) == "source-B" &&
+              cpu_result.frame.diagnostic_source_address == 0xB &&
+              !cpu_result.frame.diagnostic_served_retained &&
               cpu_result.frame.bytes() == std::vector<uint8_t>(4, 0x31),
               "nonempty traced final span owns its CPU frame without a GPU publication");
     }
