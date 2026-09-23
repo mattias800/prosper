@@ -18,6 +18,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <initializer_list>
 #include <iterator>
 #include <string>
 #include <utility>
@@ -41,6 +42,30 @@ alignas(256) static const uint32_t kDiagnosticBadPs[] = {
 alignas(256) static const uint32_t kDiagnosticCompute[] = {
     0xbf810000u, // s_endpgm
 };
+
+// Reflection-only fixture: the first buffer is read by the vertex stage, while binding 33 is
+// declared in the same module but has no data access. This need not execute on Vulkan; capture
+// must agree with the renderer's reflected binding set before deciding which backing to own.
+static std::vector<uint32_t> capture_graphics_binding_fixture(uint32_t used_binding) {
+    std::vector<uint32_t> words = {0x07230203u, 0x00010000u, 0u, 32u, 0u};
+    auto emit = [&](uint16_t opcode, std::initializer_list<uint32_t> operands) {
+        words.push_back((static_cast<uint32_t>(operands.size() + 1u) << 16u) | opcode);
+        words.insert(words.end(), operands.begin(), operands.end());
+    };
+    emit(15, {0, 20, 0x6e69616d, 0});             // OpEntryPoint Vertex %20 "main"
+    emit(21, {1, 32, 0});                          // u32
+    emit(29, {2, 1});                              // runtime array of u32
+    emit(30, {3, 2});                              // storage-buffer block
+    emit(32, {4, 12, 3}); emit(32, {5, 12, 1});   // block and element pointers
+    emit(43, {1, 6, 0});                           // constant zero
+    emit(59, {4, 8, 12}); emit(59, {4, 11, 12});  // used and inactive declarations
+    emit(71, {2, 6, 4}); emit(72, {3, 0, 35, 0}); // ArrayStride and member Offset
+    emit(71, {8, 34, 0}); emit(71, {8, 33, used_binding});
+    emit(71, {11, 34, 0}); emit(71, {11, 33, 33u});
+    emit(65, {5, 9, 8, 6, 6});                     // access used[0]
+    emit(61, {1, 10, 9});                          // load: genuine data access
+    return words;
+}
 
 // Astro Bot's fullscreen VS addresses a 72-byte table after S_ENDPGM through an s_getpc_b64-built
 // V#. Captures must retain that proven table span: raw replay otherwise sees only the first 45 words
@@ -759,6 +784,94 @@ int main(int argc, char** argv) {
               shared_shader_capture.draws[0].vs == draw.vs &&
               shared_shader_capture.draws[0].fs == draw.fs,
           "live capture materializes shared shader words without dropping SPIR-V");
+
+    // #3807: the used buffer must be exact while an unused 0xffffffff-byte table candidate
+    // remains unbacked. A live read of that huge binding, or unreflectable SPIR-V, must still
+    // refuse the capture instead of manufacturing a replayable but incomplete frame.
+    {
+        auto reflected_table = std::make_shared<ShaderResourceTable>();
+        ShaderResource used{};
+        used.cls = ResourceClass::ConstantBuffer;
+        used.binding = 9;
+        used.gpu_addr = 0x1000;
+        used.size = 64;
+        used.stride = 4;
+        used.format = DataFormat::Float32;
+        used.num_components = 2;
+        ShaderResource huge = used;
+        huge.binding = 33;
+        huge.gpu_addr = 0x30d72b00;
+        huge.size = UINT32_MAX;
+        reflected_table->resources = {used, huge};
+        DrawItem reflected_draw;
+        reflected_draw.vs = capture_graphics_binding_fixture(9);
+        reflected_draw.vrt = reflected_table;
+        reflected_draw.draw_index = 17;
+        reflected_draw.command_order = 17;
+        const std::vector<SubmitOperation> reflected_operations = {
+            {SubmitOperationKind::Draw, 17, 17},
+        };
+        std::array<uint8_t, 64> used_bytes{};
+        for (size_t i = 0; i < used_bytes.size(); ++i)
+            used_bytes[i] = static_cast<uint8_t>(i + 1u);
+        size_t used_reads = 0;
+        const auto reflected_reader = [&](uint64_t address, uint8_t* destination,
+                                          size_t length) -> size_t {
+            if (address != used.gpu_addr || length != used_bytes.size()) return 0;
+            std::memcpy(destination, used_bytes.data(), length);
+            ++used_reads;
+            return length;
+        };
+        GpuCaptureFile reflected_capture;
+        const bool unused_ok = capture_submit_items(
+            {reflected_draw}, {}, reflected_operations, meta, reflected_reader,
+            reflected_capture, error);
+        CHECK(unused_ok && used_reads == 1 && reflected_capture.blobs.size() == 1 &&
+                  reflected_capture.blobs[0].bytes.size() == used_bytes.size() &&
+                  std::equal(reflected_capture.blobs[0].bytes.begin(),
+                             reflected_capture.blobs[0].bytes.end(), used_bytes.begin()) &&
+                  reflected_capture.blobs[0].content_hash ==
+                      gpu_capture_hash(reflected_capture.blobs[0].bytes) &&
+                  reflected_capture.draws.size() == 1 &&
+                  reflected_capture.draws[0].vrt.resources.size() == 2 &&
+                  reflected_capture.draws[0].vrt.resources[1].blob_index == UINT32_MAX,
+              "unused oversized graphics descriptor cannot block an exact used-buffer capture");
+        std::vector<uint8_t> reflected_bytes;
+        GpuCaptureFile reflected_loaded;
+        CHECK(unused_ok && serialize_gpu_capture(reflected_capture, reflected_bytes, error) &&
+                  deserialize_gpu_capture(reflected_bytes, reflected_loaded, error) &&
+                  reflected_loaded.blobs.size() == 1 &&
+                  reflected_loaded.blobs[0].bytes == reflected_capture.blobs[0].bytes &&
+                  reflected_loaded.draws.size() == 1 &&
+                  reflected_loaded.draws[0].vrt.resources[1].blob_index == UINT32_MAX,
+              "unused oversized graphics descriptor remains unbacked after a capture round trip");
+
+        reflected_draw.vs = capture_graphics_binding_fixture(33);
+        GpuCaptureFile used_huge_capture;
+        CHECK(!capture_submit_items({reflected_draw}, {}, reflected_operations, meta,
+                                    reflected_reader, used_huge_capture, error) &&
+                  error.find("draw ordinal=0 index=17 order=17 stage=vertex") !=
+                      std::string::npos &&
+                  error.find("binding=33") != std::string::npos,
+              "used oversized graphics descriptor fails closed with draw and stage context");
+        reflected_draw.vs = {0x07230203u, 1u, 2u};
+        CHECK(!capture_submit_items({reflected_draw}, {}, reflected_operations, meta,
+                                    reflected_reader, used_huge_capture, error) &&
+                  error.find("reflection=unavailable") != std::string::npos,
+              "malformed graphics reflection cannot authorize omission of an oversized descriptor");
+        reflected_draw.vs = capture_graphics_binding_fixture(9);
+        reflected_draw.vs[6] = 4u;  // OpEntryPoint Fragment, but this is the vertex module
+        CHECK(!capture_submit_items({reflected_draw}, {}, reflected_operations, meta,
+                                    reflected_reader, used_huge_capture, error) &&
+                  error.find("reflection=unavailable") != std::string::npos,
+              "wrong-stage reflection cannot authorize omission of an oversized descriptor");
+        reflected_draw.vs = capture_graphics_binding_fixture(9);
+        reflected_draw.gs = {0x07230203u};
+        CHECK(!capture_submit_items({reflected_draw}, {}, reflected_operations, meta,
+                                    reflected_reader, used_huge_capture, error) &&
+                  error.find("reflection=unavailable") != std::string::npos,
+              "unreflected geometry stage preserves full vertex-table backing");
+    }
 
     // #636: a descriptor-looking scalar quartet with no matching MUBUF instruction is not a compute
     // resource. The capture path must therefore neither probe its guest address nor retain a blob.

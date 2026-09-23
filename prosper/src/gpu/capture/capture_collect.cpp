@@ -53,6 +53,64 @@
 namespace prosper::gpu {
 namespace {
 
+// Unlike a runtime table, a stage's reflected SPIR-V interface contains only bindings that the
+// emitted shader can access. A malformed or mismatched module supplies no omission authority.
+bool capture_graphics_reflected_bindings(const std::vector<uint32_t>& spirv,
+                                         const ShaderResourceTable* table,
+                                         uint32_t expected_set,
+                                         SpirvShaderStage expected_stage,
+                                         std::set<uint32_t>& bindings) {
+    bindings.clear();
+    if (spirv.empty()) return false;
+    const DescriptorValidationReport report = validate_spirv_descriptor_interface(
+        spirv, table, expected_set, expected_stage, false);
+    if (!spirv_descriptor_reflection_complete(report) || !report.ok()) return false;
+    for (const SpirvDescriptorBinding& descriptor : report.descriptors)
+        bindings.insert(descriptor.binding);
+    return true;
+}
+
+void annotate_draw_capture_error(std::string& error, size_t ordinal,
+                                 uint64_t draw_index, uint64_t command_order,
+                                 const char* stage, uint64_t program,
+                                 bool reflected) {
+    char context[224];
+    std::snprintf(context, sizeof(context),
+                  "draw ordinal=%zu index=%llu order=%llu stage=%s "
+                  "program=0x%llx reflection=%s: ",
+                  ordinal, static_cast<unsigned long long>(draw_index),
+                  static_cast<unsigned long long>(command_order), stage,
+                  static_cast<unsigned long long>(program),
+                  reflected ? "complete" : "unavailable");
+    error.insert(0, context);
+}
+
+void log_unbacked_oversized_candidates(const ShaderResourceTable* table,
+                                       const std::set<uint32_t>* used_bindings,
+                                       size_t ordinal, uint64_t draw_index,
+                                       uint64_t command_order, const char* stage,
+                                       uint64_t program) {
+    if (!table || !used_bindings) return;
+    for (const ShaderResource& resource : table->resources) {
+        if (!valid_shader_buffer_table_contract(resource) ||
+            used_bindings->contains(resource.binding) ||
+            capture_authority_requires_backing(table, resource) ||
+            resource_footprint(resource) <= max_blob_bytes())
+            continue;
+        std::fprintf(stderr,
+                     "[gpu-capture-unused] draw-ordinal=%zu index=%llu order=%llu "
+                     "stage=%s program=0x%llx "
+                     "binding=%u class=%u addr=0x%llx declared=%llu "
+                     "reason=absent-from-reflected-interface\n",
+                     ordinal, static_cast<unsigned long long>(draw_index),
+                     static_cast<unsigned long long>(command_order), stage,
+                     static_cast<unsigned long long>(program),
+                     resource.binding, static_cast<unsigned>(resource.cls),
+                     static_cast<unsigned long long>(resource.gpu_addr),
+                     static_cast<unsigned long long>(resource.size));
+    }
+}
+
 
 // `own_mip_chain_allocations` extends a materializable mip chain's range to the WHOLE guest
 // allocation (#3202). A tiled chain stores level zero last, so the other levels sit BELOW the
@@ -152,9 +210,37 @@ bool collect_intervals(const std::vector<DrawItem>& draws,
         }
         return true;
     };
-    for (const auto& d : draws)
-        if (!add_table(d.vrt.get(), nullptr) || !add_table(d.prt.get(), nullptr))
+    for (size_t ordinal = 0; ordinal < draws.size(); ++ordinal) {
+        const DrawItem& d = draws[ordinal];
+        std::set<uint32_t> vertex_bindings, fragment_bindings;
+        // Generated geometry stages currently have no resource table of their own. Until their
+        // descriptor contract is reflected too, keep the vertex table's historical full backing.
+        const bool vertex_reflected = d.gs_words().empty() &&
+            capture_graphics_reflected_bindings(
+                d.vs_words(), d.vrt.get(), 0u, SpirvShaderStage::Vertex,
+                vertex_bindings);
+        const bool fragment_reflected = capture_graphics_reflected_bindings(
+            d.fs_words(), d.prt.get(), 1u, SpirvShaderStage::Fragment,
+            fragment_bindings);
+        log_unbacked_oversized_candidates(
+            d.vrt.get(), vertex_reflected ? &vertex_bindings : nullptr,
+            ordinal, d.draw_index, d.command_order, "vertex", d.vs_guest_addr);
+        log_unbacked_oversized_candidates(
+            d.prt.get(), fragment_reflected ? &fragment_bindings : nullptr,
+            ordinal, d.draw_index, d.command_order, "fragment", d.fs_guest_addr);
+        if (!add_table(d.vrt.get(), vertex_reflected ? &vertex_bindings : nullptr)) {
+            annotate_draw_capture_error(error, ordinal, d.draw_index,
+                                        d.command_order, "vertex", d.vs_guest_addr,
+                                        vertex_reflected);
             return false;
+        }
+        if (!add_table(d.prt.get(), fragment_reflected ? &fragment_bindings : nullptr)) {
+            annotate_draw_capture_error(error, ordinal, d.draw_index,
+                                        d.command_order, "fragment", d.fs_guest_addr,
+                                        fragment_reflected);
+            return false;
+        }
+    }
     for (const auto& c : computes) {
         std::set<uint32_t> compute_bindings;
         const bool compute_reflected = capture_reflected_bindings(
@@ -544,10 +630,20 @@ bool capture_submit_items(const std::vector<DrawItem>& draws,
         c.system_inputs = d.system_inputs;
         c.has_pixel_inputs = d.has_pixel_inputs;
         c.has_system_inputs = d.has_system_inputs;
+        std::set<uint32_t> vertex_bindings, fragment_bindings;
+        const bool vertex_reflected = d.gs_words().empty() &&
+            capture_graphics_reflected_bindings(
+                d.vs_words(), d.vrt.get(), 0u, SpirvShaderStage::Vertex,
+                vertex_bindings);
+        const bool fragment_reflected = capture_graphics_reflected_bindings(
+            d.fs_words(), d.prt.get(), 1u, SpirvShaderStage::Fragment,
+            fragment_bindings);
         if (!capture_table(d.vrt.get(), intervals, include_resource_data, false,
-                           c.vrt, error) ||
+                           c.vrt, error,
+                           vertex_reflected ? &vertex_bindings : nullptr) ||
             !capture_table(d.prt.get(), intervals, include_resource_data, false,
-                           c.prt, error))
+                           c.prt, error,
+                           fragment_reflected ? &fragment_bindings : nullptr))
             return false;
         out.draws.push_back(std::move(c));
     }
