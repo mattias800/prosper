@@ -6776,16 +6776,26 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // isn't fully modeled and folds to a constant, so every vertex would read record 0 -> a
             // degenerate single point that rasterizes nothing (the whole scene stayed the blue clear).
             // (2) The resolved V# base ALREADY includes this attribute's byte offset within the
-            // interleaved record, so the shader's inst-offset + SOFFSET must NOT be added again
+            // interleaved record, so the shader's instruction OFFSET + SOFFSET must NOT be added again
             // (double-counting pushes the read OOB -> robustBufferAccess 0, the same collapse). So use
-            // gl_VertexIndex*stride and drop the shader's VADDR/offset/SOFFSET; everything else keeps the
-            // faithful address (incl. #148's idxen+offen both-terms fix). CONFIDENCE: HIGH — makes
+            // gl_VertexIndex*stride and drop the shader's element-index/constant offset terms. The
+            // zero-stride specialization below is limited to !OFFEN: packed-format alignment does
+            // not yet account for OFFEN's potentially unaligned dynamic byte offset. Zero-stride OFFEN
+            // stays on the prior path; non-folded fetches keep the faithful address (incl. #148's
+            // idxen+offen both-terms fix). CONFIDENCE: HIGH — makes
             // PPSA01885 (Unity/IL2CPP) render real geometry instead of a degenerate collapse.
-            if (folded_vfetch && idxen && stride) {
-                const uint32_t element = dyn_vfetch ? b.load_vertex_index()
-                                       : instance_vfetch ? b.load_instance_index()
-                                                         : val(in.src[0]);
-                addr = b.ibin(Op_IMul, element, b.uconst(stride));
+            if (folded_vfetch && idxen && (stride || !offen)) {
+                // A zero-stride V# still has its OFFSET/SOFFSET folded into the bound base.
+                // With !OFFEN and stride zero, no dynamic address term remains. Adding
+                // SOFFSET here would apply it twice.
+                if (stride) {
+                    const uint32_t element = dyn_vfetch ? b.load_vertex_index()
+                                           : instance_vfetch ? b.load_instance_index()
+                                                             : val(in.src[0]);
+                    addr = b.ibin(Op_IMul, element, b.uconst(stride));
+                } else {
+                    addr = b.uconst(0);
+                }
             } else {
                 addr = b.uconst(offset);
                 if (idxen && stride) addr = b.ibin(Op_IAdd, addr, b.ibin(Op_IMul, val(in.src[0]), b.uconst(stride)));

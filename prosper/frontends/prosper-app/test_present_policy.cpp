@@ -107,6 +107,22 @@ int main() {
     CHECK(classify_present(VK_ERROR_OUT_OF_DATE_KHR) == PresentAttempt::out_of_date);
     CHECK(classify_present(VK_ERROR_DEVICE_LOST) == PresentAttempt::failed);
 
+    // A readback can complete before vkQueuePresentKHR reports an unusable swapchain. No pending
+    // screenshot or snap may be consumed for that frame, including the bounded-acquire skip.
+    bool grab_pending = true, verdict_pending = true, actual_pending = true;
+    unsigned committed = 0;
+    auto commit = [&] {
+        grab_pending = verdict_pending = actual_pending = false;
+        ++committed;
+    };
+    CHECK(!dispatch_presented_capture(PresentAttempt::skipped, true, commit));
+    CHECK(!dispatch_presented_capture(PresentAttempt::out_of_date, true, commit));
+    CHECK(!dispatch_presented_capture(PresentAttempt::failed, true, commit));
+    CHECK(!dispatch_presented_capture(PresentAttempt::presented, false, commit));
+    CHECK(grab_pending && verdict_pending && actual_pending && committed == 0);
+    CHECK(dispatch_presented_capture(PresentAttempt::presented, true, commit));
+    CHECK(!grab_pending && !verdict_pending && !actual_pending && committed == 1);
+
     // A recoverable submit failure replaces synchronization once; device loss stops immediately.
     CHECK(classify_submit_failure(VK_ERROR_OUT_OF_DATE_KHR) == PresentAttempt::out_of_date);
     CHECK(classify_submit_failure(VK_ERROR_DEVICE_LOST) == PresentAttempt::failed);
