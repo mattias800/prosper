@@ -80,6 +80,7 @@ Last updated: 2026-09-23
 | *Beast of Reincarnation* | `PPSA29343` | Unreal Engine 5 | 🔬 Rung 1 — the GAME FREAK logo and the game's own Digital Deluxe bonus dialog render at 4K, but only with `PROSPER_CB_EFC_NO_COLOR=1`: on a default launch prosper's unmodelled ELIMINATE_FAST_CLEAR passes paint over the composite and every frame is a flat clear ([#1588](https://github.com/mattias800/prosper/issues/1588)). The pixel shader that writes both scanout buffers now recompiles | [#2916](https://github.com/mattias800/prosper/issues/2916) |
 | *Tomb Raider I-III Remastered* | `PPSA16901` | Custom (Saber) | 🚧 Rung 3 — a pad route clears the title's own 40-page EULA gate (Cross is inert until page 40), reaches the rendered title screen, and enters **Croft Manor**, which now renders with correct geometry — steps, walls, hedges, trees, Lara and Winston all correctly shaped and animating. **The world now renders correctly textured** — Croft Manor's assault course draws its brickwork, sandstone, mossy platforms, gravel and foliage, with Lara and Winston (screenshot: `assets/screenshots/tomb-raider-croft-manor-assault-course.webp`, a genuine render confirmed against the dump's own picture assets). The wrong-texture defect is fixed ([#2998](https://github.com/mattias800/prosper/issues/2998)): the decode cache validated one surface of a 256-layer array — 0.29% of the atlas — so a decode taken while it was nearly empty was reused all run; some text draws the wrong glyphs ([#2999](https://github.com/mattias800/prosper/issues/2999)). The shattered world was one defect: the title's 32-bit index buffers are never announced and were read as 16-bit. Route: `prosper/scripts/tomb-raider-PPSA16901/` | [#2990](https://github.com/mattias800/prosper/issues/2990) |
 | *Outer Wilds* | `PPSA08102` | Unity 2019.4 / IL2CPP | 🚧 Rung 2 — a default Linux launch reaches a live “PRESS X TO START” prompt by about 40 s, over an animated starfield and campfire. [Visual fidelity, gameplay and speed remain unverified.](prosper/docs/OUTER_WILDS_STATUS.md) | [#3804](https://github.com/mattias800/prosper/issues/3804) |
+| *Kena: Bridge of Spirits* | `PPSA01802` | Unreal Engine 4 | 🔬 Rung 2 — on Windows/NVIDIA a pad route reaches the main menu, the difficulty picker, the brightness calibration screen, the first level load, the full intro narration and the first gameplay prompt (*"Press … to Pulse"*, the button drawn as a pad glyph) — but **the world behind the prompt does not draw**: every sampled gameplay frame is black apart from the prompt. The leading suspect is the title's wave64 fragment shaders, which a 32-wide NVIDIA device skips ([#2147](https://github.com/mattias800/prosper/issues/2147)), but that is not established per draw, and a Linux trace of the menu scene ([#3813](https://github.com/mattias800/prosper/pull/3813)) is a reason to check composition first. The two crashes before this point are fixed on `main` ([#3814](https://github.com/mattias800/prosper/pull/3814), [#3817](https://github.com/mattias800/prosper/pull/3817)). Route: `prosper/scripts/kena/` | [#3787](https://github.com/mattias800/prosper/issues/3787) |
 
 ## At a glance
 
@@ -96,11 +97,11 @@ unmeasured title is never mistaken for a failing one; newly tracked titles start
 | Where the title stops | Titles |
 | --- | --- |
 | **Gameplay reached**, with the scene rendering (rung 3 or better) | 27 |
-| **Title screen or menu** reached, or gameplay reached without a rendered world (rung 2) | 17 |
+| **Title screen or menu** reached, or gameplay reached without a rendered world (rung 2) | 18 |
 | **Below a title screen** — logo or splash only (rung 1) | 3 |
 | **Boots, but no frame with content** (rung 0) | 8 |
 | **Not yet booted** — tracked, no run attempted yet | 0 |
-| Total tracked | 55 |
+| Total tracked | 56 |
 
 Every figure above is re-derived from the rows each time this table is touched, and the buckets now
 sum to the total. They did not before: **rung 0 had no row at all**, so the titles that boot and
@@ -138,17 +139,17 @@ worked. **A rung claim outside the title's own status doc is the copy most likel
 
 ### Where the titles accumulate
 
-The 17 titles at rung 2 — a title screen or menu, or gameplay reached without a rendered world — by
+The 18 titles at rung 2 — a title screen or menu, or gameplay reached without a rendered world — by
 the engine recorded in the table:
 
 | Engine | Titles |
 | --- | --- |
-| Unreal Engine — 10 × UE4, 1 × UE5, 1 unversioned | 12 |
+| Unreal Engine — 11 × UE4, 1 × UE5, 1 unversioned | 13 |
 | Hedgehog Engine, Hedgehog Engine 2, Custom (Ancient), ASOBI — one each | 4 |
 | Unity / IL2CPP | 1 |
 
-**Unreal dominates this group, and it no longer accounts for all of it.** Twelve of the 17 rung-2
-rows are Unreal, against 18 Unreal rows in the table overall — the other six are one at gameplay
+**Unreal dominates this group, and it no longer accounts for all of it.** Thirteen of the 18 rung-2
+rows are Unreal, against 19 Unreal rows in the table overall — the other six are one at gameplay
 (*Dragon Quest VII Reimagined*, whose world renders), two at rung 1 (*Little Nightmares II* and
 *Beast of Reincarnation*) and three at rung 0 (*The Lord of the Rings: Gollum*, *The First Berserker:
 Khazan* and *Sifu*). So "every Unreal title stops at a title screen", which this section used to say,
@@ -156,10 +157,10 @@ is not true in either direction: one has passed it and five have not reached it.
 
 The distribution on the other side is the mirror image: the titles at gameplay are overwhelmingly
 Unity-family. *Outer Wilds* is the one Unity title in the rung-2 group and has not yet been routed
-past its start prompt. The others are twelve Unreal titles plus *Sonic Origins*, *Earthion*,
+past its start prompt. The others are thirteen Unreal titles plus *Sonic Origins*, *Earthion*,
 *Astro Bot*, and the one that reaches the game loop without a world, *Sonic Frontiers*.
 
-**This is an observation about where titles accumulate, not a claim that the twelve Unreal titles
+**This is an observation about where titles accumulate, not a claim that the thirteen Unreal titles
 share one root cause** — and this is no longer merely an untested hypothesis in either direction.
 [#2747](https://github.com/mattias800/prosper/issues/2747) is a census over eight of them showing
 that four lose the *same* UE volumetric-fog compute pass to one recompiler gap and **none of them is
@@ -779,6 +780,17 @@ through the 90-second capture. This establishes a title-start prompt, not verifi
 the game wordmark is absent in sampled prompt frames, and no PS5 comparison is on record. Gameplay
 and speed are untested. See the [status record](prosper/docs/OUTER_WILDS_STATUS.md) and
 [tracker](https://github.com/mattias800/prosper/issues/3804).
+
+## Kena: Bridge of Spirits — `PPSA01802`
+
+<p align="center"><img src="assets/screenshots/kena-main-menu.webp" alt="Kena: Bridge of Spirits — the main menu: New Game, Load Game, Options over black"></p>
+<p align="center"><img src="assets/screenshots/kena-intro-narration.webp" alt="Kena: Bridge of Spirits — the intro narration about wooden masks and Spirit Guides, white and blue text on black"></p>
+
+Direct, unmodified Windows `screenshot.exe` captures (RTX 4090) on the route in `prosper/scripts/kena/`. The main menu
+and every menu after it render over black — the animated background never draws — and after the intro narration the
+first gameplay prompt appears over an **absent world**, so this is rung 2. See
+[`prosper/docs/KENA_STATUS.md`](prosper/docs/KENA_STATUS.md) and the
+[tracker](https://github.com/mattias800/prosper/issues/3787).
 
 ## Reproducible routes
 
