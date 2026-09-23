@@ -33,6 +33,58 @@ constexpr bool menu_capture_exact_candidate(
            pending_submit == image_source_submit;
 }
 
+// A menu image may be a retained publication from an older callback. Inspect its draw state only
+// when the same callback owns the source submit; otherwise retry for a bounded number of positive
+// images and a bounded interval. This is a diagnostic census, not capture admission.
+enum class MenuSourceCensusPhase : uint8_t {
+    WaitingForMenu, WaitingForNewSource, Exact, AttemptLimit, WaitExpired,
+};
+
+struct MenuSourceCensusLimits {
+    uint32_t max_positive_images = 8;
+    uint64_t max_wait_ms = 30000;
+};
+
+class MenuSourceCensusPolicy {
+public:
+    explicit MenuSourceCensusPolicy(MenuSourceCensusLimits limits = {}) : limits_(limits) {}
+
+    MenuSourceCensusPhase phase() const { return phase_; }
+    uint32_t attempts() const { return attempts_; }
+
+    void tick(uint64_t now_ms) {
+        if (phase_ != MenuSourceCensusPhase::WaitingForNewSource) return;
+        if (now_ms < started_ms_ || now_ms - started_ms_ > limits_.max_wait_ms)
+            phase_ = MenuSourceCensusPhase::WaitExpired;
+    }
+
+    bool observe(uint64_t execution_submit, uint64_t source_submit,
+                 bool menu_positive, uint64_t now_ms) {
+        tick(now_ms);
+        if (!menu_positive || phase_ == MenuSourceCensusPhase::Exact ||
+            phase_ == MenuSourceCensusPhase::AttemptLimit ||
+            phase_ == MenuSourceCensusPhase::WaitExpired) return false;
+        if (phase_ == MenuSourceCensusPhase::WaitingForMenu) {
+            phase_ = MenuSourceCensusPhase::WaitingForNewSource;
+            started_ms_ = now_ms;
+        }
+        ++attempts_;
+        if (source_submit != 0 && source_submit == execution_submit) {
+            phase_ = MenuSourceCensusPhase::Exact;
+            return true;
+        }
+        if (attempts_ >= limits_.max_positive_images)
+            phase_ = MenuSourceCensusPhase::AttemptLimit;
+        return false;
+    }
+
+private:
+    MenuSourceCensusLimits limits_;
+    MenuSourceCensusPhase phase_ = MenuSourceCensusPhase::WaitingForMenu;
+    uint32_t attempts_ = 0;
+    uint64_t started_ms_ = 0;
+};
+
 // This policy never invents a relationship between a menu frame and a candidate. The first
 // positive publication only arms future work; the candidate is accepted solely by its own exact
 // completed producer submit and a separately classified image published by that submit.

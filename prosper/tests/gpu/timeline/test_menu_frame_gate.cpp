@@ -144,6 +144,31 @@ int main() {
     CHECK(submit_zero.phase() == MenuCapturePhase::WaitingForMenu,
           "live source submit zero is reserved for unknown and cannot arm a capture");
 
+    MenuSourceCensusPolicy source_retry({.max_positive_images = 3, .max_wait_ms = 100});
+    CHECK(!source_retry.observe(11, 10, false, 1) && source_retry.attempts() == 0,
+          "a non-menu image cannot spend the source-census budget");
+    CHECK(!source_retry.observe(11, 10, true, 2) &&
+              source_retry.phase() == MenuSourceCensusPhase::WaitingForNewSource &&
+              source_retry.attempts() == 1,
+          "a retained first menu image must not certify current draw state");
+    CHECK(source_retry.observe(12, 12, true, 3) &&
+              source_retry.phase() == MenuSourceCensusPhase::Exact &&
+              source_retry.attempts() == 2,
+          "a later exact menu publication provides the source-draw census");
+    CHECK(!source_retry.observe(13, 13, true, 4) && source_retry.attempts() == 2,
+          "the exact census runs only once");
+    MenuSourceCensusPolicy source_limit({.max_positive_images = 2, .max_wait_ms = 100});
+    CHECK(!source_limit.observe(10, 0, true, 0) &&
+              !source_limit.observe(11, 10, true, 1) &&
+              source_limit.phase() == MenuSourceCensusPhase::AttemptLimit,
+          "unknown and retained positives exhaust a bounded attempt budget");
+    MenuSourceCensusPolicy source_expiry({.max_positive_images = 3, .max_wait_ms = 100});
+    CHECK(!source_expiry.observe(10, 9, true, 0), "retained image starts the census clock");
+    source_expiry.tick(101);
+    CHECK(source_expiry.phase() == MenuSourceCensusPhase::WaitExpired &&
+              !source_expiry.observe(11, 11, true, 102),
+          "a late exact image cannot revive an expired census");
+
     std::printf("menu_frame_gate: %s\n", failures ? "FAIL" : "PASS");
     return failures ? 1 : 0;
 }

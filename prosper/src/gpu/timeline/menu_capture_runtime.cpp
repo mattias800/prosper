@@ -167,6 +167,9 @@ public:
             while (!stop.stop_requested()) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
                 std::lock_guard lock(mx_);
+                const MenuSourceCensusPhase census_before = census_.phase();
+                census_.tick(now_ms());
+                report_census_limit(census_before);
                 const MenuCapturePhase before = policy_.phase();
                 policy_.tick(now_ms());
                 report_refusal(before);
@@ -178,14 +181,20 @@ public:
         if (!active_) return;
         watchdog_.request_stop();
         std::lock_guard lock(mx_);
+        if (census_.phase() == MenuSourceCensusPhase::WaitingForNewSource)
+            std::fprintf(stderr,
+                         "[menu-capture] source census incomplete: process ended after %u "
+                         "menu-positive publications without an exact source callback\n",
+                         census_.attempts());
         std::fprintf(stderr,
                      "[menu-capture] post-menu census ps=%llu target=%llu extent=%llu exact=%llu "
-                     "attempts=%u phase=%u\n",
+                     "attempts=%u phase=%u source-census=%u/%u\n",
                      static_cast<unsigned long long>(ps_hits_),
                      static_cast<unsigned long long>(target_hits_),
                      static_cast<unsigned long long>(extent_hits_),
                      static_cast<unsigned long long>(exact_hits_),
-                     policy_.attempted_candidates(), static_cast<unsigned>(policy_.phase()));
+                     policy_.attempted_candidates(), static_cast<unsigned>(policy_.phase()),
+                     census_.attempts(), static_cast<unsigned>(census_.phase()));
     }
 
     void on_submit(const GpuState& state, uint64_t submit_no) {
@@ -294,15 +303,11 @@ public:
         std::lock_guard lock(mx_);
         const MenuCapturePhase before = policy_.phase();
         const uint64_t publication_ms = now_ms();
+        const MenuSourceCensusPhase census_before = census_.phase();
+        census_.tick(publication_ms);
+        report_census_limit(census_before);
         policy_.tick(publication_ms);
-        if (policy_.phase() == MenuCapturePhase::Refused) {
-            candidate_.reset();
-            report_refusal(before);
-            return;
-        }
-        if (!published || (policy_.phase() == MenuCapturePhase::Pending &&
-                           policy_.pending_submit() == execution_submit &&
-                           source_submit != execution_submit)) {
+        if (!published) {
             policy_.missing_presentation(execution_submit, publication_ms);
             if (before == MenuCapturePhase::Pending && policy_.phase() != before)
                 candidate_.reset();
@@ -317,8 +322,31 @@ public:
         const bool menu = composited &&
             (frame.verdict == MenuFrameGateVerdict::MenuWithLogo ||
              frame.verdict == MenuFrameGateVerdict::MenuWithoutLogo);
-        if (before == MenuCapturePhase::WaitingForMenu && menu && source_submit != 0)
+        const MenuSourceCensusPhase observed_before = census_.phase();
+        if (census_.observe(execution_submit, source_submit, menu, publication_ms))
             report_menu_source_writers(state, realized_draws, execution_submit, source_submit);
+        else if (menu && observed_before == MenuSourceCensusPhase::WaitingForMenu &&
+                 census_.phase() == MenuSourceCensusPhase::WaitingForNewSource)
+            std::fprintf(stderr,
+                         "[menu-capture] menu source-submit=%llu retained/unknown in execution=%llu; "
+                         "retrying exact source census (max 8 positives/30 s)\n",
+                         static_cast<unsigned long long>(source_submit),
+                         static_cast<unsigned long long>(execution_submit));
+        report_census_limit(observed_before);
+        if (policy_.phase() == MenuCapturePhase::Refused) {
+            candidate_.reset();
+            report_refusal(before);
+            return;
+        }
+        if (policy_.phase() == MenuCapturePhase::Pending &&
+            policy_.pending_submit() == execution_submit &&
+            source_submit != execution_submit) {
+            policy_.missing_presentation(execution_submit, publication_ms);
+            if (before == MenuCapturePhase::Pending && policy_.phase() != before)
+                candidate_.reset();
+            report_refusal(before);
+            return;
+        }
         if (exact_candidate && menu) {
             std::string error;
             if (!candidate_ || !write_gpu_capture(path_, *candidate_, error)) {
@@ -364,14 +392,14 @@ private:
         struct Writer {
             size_t index = 0;
             uint64_t ps = 0, base = 0;
-            uint32_t width = 0, height = 0, mask = 0;
+            uint32_t width = 0, height = 0, format = 0, mask = 0;
         };
         std::array<Writer, 8> scene{}, screen{};
         size_t scene_count = 0, screen_count = 0;
         for (size_t i = 0; i < state.draws.size(); ++i) {
             const RenderState rs = extract_render_state(state.state_at_draw(i));
             const Writer writer{i, rs.ps_addr, rs.color0_base, rs.color0_width,
-                                rs.color0_height,
+                                rs.color0_height, rs.color0_format,
                                 rs.cb_target_mask & rs.cb_shader_mask & 0xfu};
             if (writer.width == target_width_ && writer.height == target_height_)
                 scene[scene_count++ % scene.size()] = writer;
@@ -380,7 +408,8 @@ private:
         }
         std::fprintf(stderr,
                      "[menu-capture] menu source-submit=%llu semantic=%zu realized=%zu "
-                     "scene-size=%zu screen-size=%zu (last eight of each follow)\n",
+                     "scene-size=%zu screen-size=%zu (last eight semantic target candidates "
+                     "of each; realization is not pixel-write proof)\n",
                      static_cast<unsigned long long>(source_submit), state.draws.size(),
                      realized_draws.size(), scene_count, screen_count);
         auto print = [&](const char* kind, const auto& writers, size_t count) {
@@ -397,17 +426,31 @@ private:
                     found->color0_width == writer.width &&
                     found->color0_height == writer.height ? "exact" : "diverged";
                 std::fprintf(stderr,
-                             "[menu-capture] menu-writer=%s draw=%zu ps=0x%llx target=0x%llx "
-                             "%ux%u raw-mask=%x realized=%s realized-mask=%x\n",
+                             "[menu-capture] menu-candidate=%s draw=%zu ps=0x%llx target=0x%llx "
+                             "%ux%u fmt=%u raw-mask=%x raw-active=%d realized=%s "
+                             "realized-mask=%x\n",
                              kind, writer.index,
                              static_cast<unsigned long long>(writer.ps),
                              static_cast<unsigned long long>(writer.base),
-                             writer.width, writer.height, writer.mask, agreement,
+                             writer.width, writer.height, writer.format, writer.mask,
+                             writer.base && writer.format && writer.mask, agreement,
                              found == realized_draws.end() ? 0 : found->write_mask);
             }
         };
         print("scene", scene, scene_count);
         print("screen", screen, screen_count);
+    }
+
+    void report_census_limit(MenuSourceCensusPhase before) {
+        if (before == census_.phase()) return;
+        if (census_.phase() == MenuSourceCensusPhase::AttemptLimit)
+            std::fprintf(stderr,
+                         "[menu-capture] source census refused: eight menu-positive publications "
+                         "without exact same-submit pixels\n");
+        else if (census_.phase() == MenuSourceCensusPhase::WaitExpired)
+            std::fprintf(stderr,
+                         "[menu-capture] source census refused: no exact same-submit menu "
+                         "publication within 30 s\n");
     }
 
     void report_refusal(MenuCapturePhase before) {
@@ -428,6 +471,7 @@ private:
     uint64_t ps_ = 0, target_ = 0;
     uint32_t target_width_ = 0, target_height_ = 0;
     MenuCapturePolicy policy_;
+    MenuSourceCensusPolicy census_;
     std::optional<GpuCaptureFile> candidate_;
     uint64_t ps_hits_ = 0, target_hits_ = 0, extent_hits_ = 0, exact_hits_ = 0;
     std::jthread watchdog_;
