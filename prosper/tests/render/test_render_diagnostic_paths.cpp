@@ -193,13 +193,11 @@ int main(int argc, char** argv) {
         clear.depth_clear_value = 0.0f;
         auto clear_draws = one_triangle();
         clear_draws[0].ps = &clear;
-        const uint64_t before_probe = prosper::test::backend_depth_clear_probe_armed_count()
-            .load(std::memory_order_relaxed);
+        const uint64_t before_probe = prosper::test::backend_depth_clear_probe_armed_count().load();
         const auto clear_pixels = prosper::test::render_draws_rgba(clear_draws, W, H);
         CHECK(clear_pixels.size() == static_cast<size_t>(W) * H * 4,
               "depth-clear diagnostic pass completed");
-        CHECK(prosper::test::backend_depth_clear_probe_armed_count()
-                  .load(std::memory_order_relaxed) > before_probe,
+        CHECK(prosper::test::backend_depth_clear_probe_armed_count().load() > before_probe,
               "depth-clear diagnostic state was recorded for a draw");
     }
 

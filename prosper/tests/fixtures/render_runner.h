@@ -12048,17 +12048,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     // lines below. A submit whose draws carry a guest depth or stencil clear is therefore still
     // isolated against different depth contents from the pass it is naming a culprit in. Dynamic
     // state was the part the layer could see; this part it cannot, and it is not fixed here.
-    auto record_draw_dynamic_state = [&](VkCommandBuffer command, const DV& v, const prosper::gpu::ResolvedPipelineState* ps) {
-        VkViewport viewport = v.viewport;
-        if ((sonic_clear_probe == 3 || sonic_clear_probe == 4) && ps && effective_depth_clear(ps)) {
-            viewport.minDepth = viewport.maxDepth = ps->depth_clear_value;
-            backend_depth_clear_probe_armed_count().fetch_add(1, std::memory_order_relaxed);
-        }
-        vkCmdSetViewport(command, 0, 1, &viewport);
-        vkCmdSetScissor(command, 0, 1, &v.scissor);
-        vkCmdSetLineWidth(command, v.line_width);
-        vkCmdSetDepthBias(command, v.depth_bias_constant, v.depth_bias_clamp,
-                          v.depth_bias_slope);
+    auto record_stencil_dynamic_state = [](VkCommandBuffer command, const DV& v) {
         vkCmdSetStencilCompareMask(command, VK_STENCIL_FACE_FRONT_BIT,
                                    v.stencil_front.compareMask);
         vkCmdSetStencilCompareMask(command, VK_STENCIL_FACE_BACK_BIT,
@@ -12071,21 +12061,39 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                  v.stencil_front.reference);
         vkCmdSetStencilReference(command, VK_STENCIL_FACE_BACK_BIT,
                                  v.stencil_back.reference);
-        // These commands and states are required by core Vulkan 1.3, below our 1.4 floor.
-        vkCmdSetDepthTestEnable(command, v.depth_test);
-        vkCmdSetDepthWriteEnable(command, v.depth_write);
-        vkCmdSetDepthCompareOp(command, v.depth_compare);
-        vkCmdSetStencilTestEnable(command, v.stencil_test);
         vkCmdSetStencilOp(command, VK_STENCIL_FACE_FRONT_BIT, v.stencil_front.failOp,
                           v.stencil_front.passOp, v.stencil_front.depthFailOp,
                           v.stencil_front.compareOp);
         vkCmdSetStencilOp(command, VK_STENCIL_FACE_BACK_BIT, v.stencil_back.failOp,
                           v.stencil_back.passOp, v.stencil_back.depthFailOp,
                           v.stencil_back.compareOp);
+    };
+    auto record_pipeline_dynamic_state = [](VkCommandBuffer command, const DV& v) {
+        // These commands and states are required by core Vulkan 1.3, below our 1.4 floor.
+        vkCmdSetDepthTestEnable(command, v.depth_test);
+        vkCmdSetDepthWriteEnable(command, v.depth_write);
+        vkCmdSetDepthCompareOp(command, v.depth_compare);
+        vkCmdSetStencilTestEnable(command, v.stencil_test);
         vkCmdSetCullMode(command, v.cull_mode);
         vkCmdSetFrontFace(command, v.front_face);
         vkCmdSetPrimitiveTopology(command, v.topology);
         vkCmdSetPrimitiveRestartEnable(command, v.primitive_restart);
+    };
+    auto record_draw_dynamic_state = [&](VkCommandBuffer command, const DV& v,
+                                         const prosper::gpu::ResolvedPipelineState* ps) {
+        VkViewport viewport = v.viewport;
+        if ((sonic_clear_probe == 3 || sonic_clear_probe == 4) && ps && effective_depth_clear(ps)) {
+            viewport.minDepth = ps->depth_clear_value;
+            viewport.maxDepth = ps->depth_clear_value;
+            backend_depth_clear_probe_armed_count().fetch_add(1);
+        }
+        vkCmdSetViewport(command, 0, 1, &viewport);
+        vkCmdSetScissor(command, 0, 1, &v.scissor);
+        vkCmdSetLineWidth(command, v.line_width);
+        vkCmdSetDepthBias(command, v.depth_bias_constant, v.depth_bias_clamp,
+                          v.depth_bias_slope);
+        record_stencil_dynamic_state(command, v);
+        record_pipeline_dynamic_state(command, v);
     };
     vkCmdBeginRenderPass(cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
     for (size_t di = 0; di < dv.size(); di++) {
@@ -12107,11 +12115,13 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             VkClearRect rect{v.scissor, 0, 1};
             // A fully clipped draw legitimately has a zero-area dynamic scissor, but Vulkan requires
             // vkCmdClearAttachments rectangles to have non-zero width and height (VUID 02682/02683).
-            if (dsc.aspectMask && rect.rect.extent.width && rect.rect.extent.height) {
+            const bool clear_recorded = dsc.aspectMask && rect.rect.extent.width &&
+                                        rect.rect.extent.height;
+            if (clear_recorded)
                 vkCmdClearAttachments(cmd, 1, &dsc, 1, &rect);
-                if (sonic_clear_probe == 1 && (dsc.aspectMask & VK_IMAGE_ASPECT_DEPTH_BIT))
-                    backend_depth_clear_probe_armed_count().fetch_add(1, std::memory_order_relaxed);
-            }
+            if (clear_recorded && sonic_clear_probe == 1 &&
+                (dsc.aspectMask & VK_IMAGE_ASPECT_DEPTH_BIT))
+                backend_depth_clear_probe_armed_count().fetch_add(1);
         }
         if (!v.ok) continue;
         if (ds_active) {
@@ -12124,7 +12134,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         if ((sonic_clear_probe == 2 || sonic_clear_probe == 5) && ps && effective_depth_clear(ps) &&
             ps->depth_compare_op == VK_COMPARE_OP_ALWAYS && ps->depth_write_enable &&
             !v.depth_write)
-            backend_depth_clear_probe_armed_count().fetch_add(1, std::memory_order_relaxed);
+            backend_depth_clear_probe_armed_count().fetch_add(1);
         if (v.use_desc) vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, v.layout, 0, v.n_sets, v.dsets.data(), 0, nullptr);
         const bool geom_here = geom_active && di == geom_item;
         if (geom_here) {
