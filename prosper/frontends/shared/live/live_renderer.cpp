@@ -3081,6 +3081,11 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 std::vector<uint32_t> order;
             };
             constexpr uint32_t kCompactBufferResourceBit = 0x80000000u;
+            // These vectors are rebuilt for every draw. A bounded hint avoids repeated
+            // growth for ordinary reflected resource sets without allocating for draws
+            // that have no accepted resources. The control permits same-binary timing.
+            static const bool reserve_frame_resources =
+                std::getenv("PROSPER_NO_FRAME_RESOURCE_RESERVE") == nullptr;
             // Immutable CPU snapshots live only for this renderer callback (not later spans or
             // frames). Every lookup still proves the exact retained images/generations. Sharing the
             // owner across draws also lets one backend group deduplicate its uploads by pointer.
@@ -3124,6 +3129,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                const prosper::gpu::ShaderResourceTable* prt,
                                prosper::test::BackendSubmissionBatch* producer_batch) {
               BuiltFrameResources built;
+              const size_t candidate_resources =
+                  (vrt ? vrt->resources.size() : 0) + (prt ? prt->resources.size() : 0);
+              const size_t reserve_hint = reserve_frame_resources
+                  ? std::min<size_t>(candidate_resources, 16) : 0;
               // Once this callback has admitted a snapshot, observe queued guest writes at every
               // later draw, including draws with no array bindings. A callback-local latch keeps
               // this boundary identical when the per-draw control clears its memo; failure/clear
@@ -8499,10 +8508,20 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         }
                     }
                     if (full_resource) {
+                        if (built.full.empty() && reserve_hint > 1)
+                            built.full.reserve(reserve_hint);
                         const uint32_t index = static_cast<uint32_t>(built.full.size());
                         built.full.push_back(std::move(*full_resource));
-                        if (compact_buffer_resources) built.order.push_back(index);
+                        if (compact_buffer_resources) {
+                            if (built.order.empty() && reserve_hint > 1)
+                                built.order.reserve(reserve_hint);
+                            built.order.push_back(index);
+                        }
                     } else {
+                        if (built.buffers.empty() && reserve_hint > 1)
+                            built.buffers.reserve(reserve_hint);
+                        if (built.order.empty() && reserve_hint > 1)
+                            built.order.reserve(reserve_hint);
                         const uint32_t index = static_cast<uint32_t>(built.buffers.size());
                         built.buffers.push_back(std::move(compact_resource));
                         built.order.push_back(kCompactBufferResourceBit | index);
