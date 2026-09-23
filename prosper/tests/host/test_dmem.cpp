@@ -659,6 +659,57 @@ int main() {
                       *(volatile uint32_t*)host == 0x33334444u,
                   "#3812 control: the refused map released neither the guest page nor the host memory");
         }
+        // Partial-overlap refusal (review B1 on #3814): a fixed map over only PART of a private
+        // placeholder view -- here direct memory over the head of the guest's own flexible heap --
+        // cannot be made replaceable (a partial release is a MEM_DECOMMIT, which leaves a private
+        // reservation MEM_REPLACE_PLACEHOLDER never takes). It must fail exactly as before the
+        // release path existed and touch NOTHING: the flexible pages inside and outside the map's
+        // range stay committed, readable and unchanged. Without the "wholly inside" gate the
+        // release decommits the inside half first and the map fails anyway.
+        const uint64_t rva3 = 0x31000200000ull;
+        uint64_t got3 = rva3;
+        const bool reserved3 =
+            reserve((uint64_t)(uintptr_t)&got3, 0x80000, 0x10, 0x10000, 0, 0) == 0 && got3 == rva3;
+        uint64_t heap = rva3 + 0x20000;
+        const bool heap_mapped = reserved3 &&
+            flexible((uint64_t)(uintptr_t)&heap, 0x40000, 0x2, 0x10 /* MAP_FIXED */,
+                     (uint64_t)(uintptr_t)"b1-heap", 0) == 0 && heap == rva3 + 0x20000;
+        MEMORY_BASIC_INFORMATION heap_in{}, heap_out{};
+        if (heap_mapped) {
+            *(volatile uint64_t*)(uintptr_t)(rva3 + 0x30100) = 0xB1B1000011112222ull;  // inside
+            *(volatile uint64_t*)(uintptr_t)(rva3 + 0x50100) = 0xB1B1333344445555ull;  // outside
+            VirtualQuery((void*)(uintptr_t)(rva3 + 0x30000), &heap_in, sizeof(heap_in));
+            VirtualQuery((void*)(uintptr_t)(rva3 + 0x50000), &heap_out, sizeof(heap_out));
+        }
+        CHECK(heap_mapped && heap_in.State == MEM_COMMIT && heap_in.Type == MEM_PRIVATE &&
+                  heap_out.State == MEM_COMMIT && heap_out.Type == MEM_PRIVATE,
+              "#3812 B1 precondition: a flexible heap straddles the fixed map's end");
+        if (heap_mapped && have_phys) {
+            // [rva3, rva3+0x40000) covers the heap's first half only.
+            BatchEntry e{rva3, dphys, 0x40000, 0x3, 0, 0, 0};
+            int32_t done = -1;
+            CHECK((uint32_t)batch((uint64_t)(uintptr_t)&e, 1, (uint64_t)(uintptr_t)&done, 0, 0,
+                                  0) == 0x8002000cu && done == 0,
+                  "#3812 B1: a fixed map over part of a flexible heap still fails");
+            MEMORY_BASIC_INFORMATION in_after{}, out_after{};
+            VirtualQuery((void*)(uintptr_t)(rva3 + 0x30000), &in_after, sizeof(in_after));
+            VirtualQuery((void*)(uintptr_t)(rva3 + 0x50000), &out_after, sizeof(out_after));
+            const bool still_committed = in_after.State == MEM_COMMIT &&
+                                         out_after.State == MEM_COMMIT;
+            CHECK(still_committed,
+                  "#3812 B1: the refused map decommitted neither half of the heap");
+            CHECK(still_committed &&
+                      *(volatile uint64_t*)(uintptr_t)(rva3 + 0x30100) == 0xB1B1000011112222ull &&
+                      *(volatile uint64_t*)(uintptr_t)(rva3 + 0x50100) == 0xB1B1333344445555ull,
+                  "#3812 B1: the heap's bytes inside and outside the range are unchanged");
+            uint8_t info[0x48]{};
+            CHECK(query(rva3 + 0x30000, 0, (uint64_t)(uintptr_t)info, sizeof(info), 0, 0) == 0 &&
+                      *(uint64_t*)(info + 0x00) <= rva3 + 0x20000 &&
+                      *(uint64_t*)(info + 0x08) >= rva3 + 0x60000,
+                  "#3812 B1: the tracker still reports the whole flexible heap");
+        }
+        if (heap_mapped) unmap(rva3 + 0x20000, 0x40000, 0, 0, 0, 0);
+        if (reserved3) unmap(rva3, 0x80000, 0, 0, 0, 0);
         if (host) VirtualFree(host, 0, MEM_RELEASE);
         if (reserved2) unmap(rva2, 0x10000, 0, 0, 0, 0);
         if (have_phys) release(dphys, kSpan, 0, 0, 0, 0);

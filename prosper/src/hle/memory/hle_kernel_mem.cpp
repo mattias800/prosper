@@ -5783,15 +5783,27 @@ namespace {
 
     bool win_unmap(uint64_t addr, uint64_t len);   // defined below
 
-    // Does [base, base+len) overlap private pages prosper put into a guest placeholder? Those are
-    // the lazy-commit pages the VEH creates on first touch (prosper_try_commit_reserved_placeholder)
-    // and flexible-memory commits; MapViewOfFile3 cannot replace either with a section view.
-    bool range_overlaps_private_placeholder_view(uint64_t base, uint64_t len) {
+    // Does [base, base+len) hold private pages prosper put into a guest placeholder, and could a
+    // release make the range replaceable? Those are the lazy-commit pages the VEH creates on first
+    // touch (prosper_try_commit_reserved_placeholder) and flexible-memory commits; MapViewOfFile3
+    // cannot replace either with a section view.
+    //
+    // True only when at least one private view overlaps AND every overlapping one lies WHOLLY
+    // inside the range. A partly-covered private view (a fixed map over the middle or tail of the
+    // guest's own flexible heap) can only be released by MEM_DECOMMIT, which leaves a private
+    // reservation MEM_REPLACE_PLACEHOLDER can never take -- so the retry would be certain to fail
+    // after the release had already decommitted guest pages and handed guest placeholders to the
+    // free pool. That shape must fail exactly as it did before this path existed, touching nothing.
+    bool range_private_views_replaceable(uint64_t base, uint64_t len) {
         const uint64_t end = base + len;
+        bool any = false;
         std::lock_guard<std::mutex> lk(g_dview_mx);
-        for (const PrivatePlaceholderView& view : g_private_placeholder_views)
-            if (view.base < end && base < view.base + view.size) return true;
-        return false;
+        for (const PrivatePlaceholderView& view : g_private_placeholder_views) {
+            if (!(view.base < end && base < view.base + view.size)) continue;
+            if (view.base < base || view.base + view.size > end) return false;
+            any = true;
+        }
+        return any;
     }
 
     void* win_map_phys(uint64_t hint, uint64_t len, int hp, uint64_t phys, uint64_t align,
@@ -5841,10 +5853,14 @@ namespace {
         // refuses unless the registries prove every byte of the range is guest-owned (private
         // placeholder views, guest/free placeholders, direct views), so an untracked host
         // allocation is never released. Narrowly gated on the range actually holding such private
-        // pages, so the existing shapes (#2424's tail repair below, fragmentation above) are not
-        // touched. If the retry still fails the guest gets ENOMEM as before; the pages it loses were
-        // going to be replaced by this map anyway.
-        if (fixed && hint && len && range_overlaps_private_placeholder_view(hint, len)) {
+        // pages, and only when each of them lies wholly inside the range (see
+        // range_private_views_replaceable), so the existing shapes (#2424's tail repair below,
+        // fragmentation above) and a partial overlap of a flexible heap are not touched. If the
+        // retry still fails after a release, the guest gets ENOMEM and the released range is
+        // untracked (below): its old contents are gone, as after a failed Linux MAP_FIXED.
+        //
+        // Not honoured here or anywhere else yet: SCE_KERNEL_MAP_NO_OVERWRITE (#3819).
+        if (fixed && hint && len && range_private_views_replaceable(hint, len)) {
             if (win_unmap(hint, len)) {
                 // Announced rather than silent (capped, and the cap says so): this path discards
                 // pages, and a log that cannot show it ran cannot show it was the fix either.
@@ -5863,10 +5879,20 @@ namespace {
                 if (void* p = map_section_view(hint, len, hp, phys, align)) return announce(p);
                 if (normalize_fragmented_guest_placeholder_range(hint, len))
                     if (void* p = map_section_view(hint, len, hp, phys, align)) return announce(p);
-                MLOG("map_dmem FIXED over private pages: released 0x%llx +0x%llx but the view still "
-                     "failed (error=%lu)\n",
-                     (unsigned long long)hint, (unsigned long long)len,
-                     (unsigned long)GetLastError());
+                // The release succeeded and the view still failed (a concurrent zero-hint map took
+                // the freed placeholders, or the view's commit/protect step failed). The guest's
+                // old contents are gone either way -- the same outcome as a failed Linux
+                // mmap(MAP_FIXED) -- so the tracker must say so rather than keep reporting the
+                // released direct/flexible/reservation entries over memory that no longer exists.
+                const DWORD err = GetLastError();
+                untrack(hint, len);
+                std::fprintf(stderr,
+                             "[memhle] fixed MAP_DIRECT 0x%llx +0x%llx: released the range's "
+                             "private pages but the view still failed (error=%lu); range "
+                             "untracked, guest gets ENOMEM (#3812)\n",
+                             (unsigned long long)hint, (unsigned long long)len,
+                             (unsigned long)err);
+                SetLastError(err);
             } else {
                 MLOG("map_dmem FIXED over private pages: 0x%llx +0x%llx is not provably guest-owned; "
                      "not released\n",
