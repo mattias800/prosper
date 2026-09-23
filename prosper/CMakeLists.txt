@@ -1502,6 +1502,14 @@ if(TARGET prosper_core)
   target_include_directories(test_diagnostic_window PRIVATE frontends)
   add_test(NAME diagnostic_window COMMAND test_diagnostic_window)
 
+  # The optional retained-target selector bounds readback without changing the legacy broad
+  # census. Malformed and oversized lists must decline every target rather than read them all.
+  add_executable(test_persistent_readback_filter
+                 frontends/shared/tests/test_persistent_readback_filter.cpp)
+  target_include_directories(test_persistent_readback_filter PRIVATE frontends src)
+  target_link_libraries(test_persistent_readback_filter PRIVATE prosper_core)
+  add_test(NAME persistent_readback_filter COMMAND test_persistent_readback_filter)
+
   # boot_trace periodic BMPs are opt-in, with the legacy disable taking priority. This exercises the
   # exact environment-name lookup and registrar forwarding without constructing Vulkan or writing files.
   add_executable(test_frame_dump_policy frontends/shared/tests/test_frame_dump_policy.cpp)
