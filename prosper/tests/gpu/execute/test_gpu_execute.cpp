@@ -36,6 +36,8 @@
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <tuple>
+#include <utility>
 #include <vector>
 #if defined(__linux__)
 #include <sys/mman.h>
@@ -72,6 +74,9 @@ alignas(256) static const uint32_t kDccPs[] = {
     0x7E000280u, 0xF8001803u, 0x00000000u, 0xBF810000u,
 };
 alignas(256) static const uint32_t kNoopCs[] = {0xBF810000u};
+// Distinct code identity: a later fixture registers kNoopCs with its own header. Mutable storage
+// prevents link-time merging of two byte-identical const shader arrays.
+alignas(256) static uint32_t kOrderedNoopCs[] = {0xBF810000u};
 alignas(256) static const uint32_t kRealizeZeroMipCs[] = {
     0xf40c0500u, 0xfa000000u,                // s_load_dwordx8 s[20:27], s[0:1], 0
     0x7e040207u,                             // v_mov_b32 v2, s7
@@ -141,6 +146,119 @@ int main() {
     source_draw.instance_count = 4;
     st.draws.push_back(source_draw);
     st.num_instances = 0; // later state must not rewrite the already-recorded draw in folded mode
+
+    // A mixed submit realizes graphics eagerly but executes it in PM4 order. That eager vector is
+    // consumed once per draw; both the transfer path and its same-binary copy control must hand the
+    // renderer the same shader and indexed-geometry payloads in the same order.
+    {
+        DrawItem source;
+        source.vs = {11, 12, 13};
+        source.gs = {21, 22};
+        source.fs = {31, 32, 33};
+        source.indices = {0, 1, 2};
+        const uint32_t* original_vs = source.vs.data();
+        const uint32_t* original_gs = source.gs.data();
+        const uint32_t* original_indices = source.indices.data();
+        DrawItem transferred = transfer_eager_draw(source, false);
+        CHECK(transferred.vs.data() == original_vs &&
+                  transferred.gs.data() == original_gs &&
+                  transferred.indices.data() == original_indices &&
+                  source.vs.empty() && source.gs.empty() && source.indices.empty(),
+              "eager draw transfer takes ownership of shader and index payloads");
+
+        DrawItem retained = transferred;
+        const uint32_t* retained_vs = retained.vs.data();
+        DrawItem copy_control_item = transfer_eager_draw(retained, true);
+        CHECK(retained.vs.data() == retained_vs &&
+                  copy_control_item.vs == retained.vs &&
+                  copy_control_item.vs.data() != retained_vs,
+              "eager draw copy control preserves the source allocation");
+
+        const uint16_t guest_indices[] = {0, 1, 2};
+        GpuState mixed = st;
+        mixed.index_type = 0;
+        mixed.draws[0].indexed = true;
+        mixed.draws[0].index_addr = reinterpret_cast<uint64_t>(guest_indices);
+        mixed.draws[0].command_order = 100;
+        mixed.draws.push_back(mixed.draws[0]);
+        mixed.draws[1].command_order = 300;
+        auto create_shader = prosper::Hle::lookup("f3dg2CSgRKY");
+        static ShaderReg ordered_compute_registers[2] = {
+            {P::COMPUTE_PGM_LO, 0}, {P::COMPUTE_PGM_HI, 0},
+        };
+        static AgcShaderHeader ordered_compute_header{};
+        ordered_compute_header.file_header = 0x34333231u;
+        ordered_compute_header.version = 0x18;
+        ordered_compute_header.sh_registers = ordered_compute_registers;
+        ordered_compute_header.shader_size = sizeof(kOrderedNoopCs);
+        ordered_compute_header.type = 0;
+        ordered_compute_header.num_sh_registers = 2;
+        void* registered_shader = nullptr;
+        const bool registered = create_shader &&
+            create_shader(reinterpret_cast<uint64_t>(&registered_shader),
+                          reinterpret_cast<uint64_t>(&ordered_compute_header),
+                          reinterpret_cast<uint64_t>(kOrderedNoopCs), 0, 0, 0) == 0 &&
+            registered_shader == &ordered_compute_header;
+        CHECK(registered, "register the interleaved ordered compute shader");
+        set_pgm(mixed, P::COMPUTE_PGM_LO, P::COMPUTE_PGM_HI, kOrderedNoopCs);
+        GpuState::Dispatch dispatch;
+        dispatch.threads_x = dispatch.threads_y = dispatch.threads_z = 1;
+        dispatch.command_order = 200;
+        mixed.dispatches.push_back(dispatch);
+
+        using DrawWitness = std::tuple<uint32_t, std::vector<uint32_t>, std::vector<uint32_t>,
+                                       std::vector<uint32_t>, std::vector<uint32_t>>;
+        struct OrderedWitness {
+            std::vector<DrawWitness> draws;
+            std::vector<std::pair<long, long>> shader_refs;
+            std::vector<char> schedule;
+        };
+        auto observe = [&](const char* copy_control) {
+            set_test_env("PROSPER_EAGER_DRAW_COPY", copy_control);
+            OrderedWitness seen;
+            set_submit_renderer([&](const std::vector<DrawItem>& items, uint32_t, uint32_t) {
+                seen.schedule.push_back('R');
+                for (const DrawItem& item : items) {
+                    seen.draws.emplace_back(item.draw_index, item.vs_words(), item.gs,
+                                            item.fs_words(), item.indices);
+                    seen.shader_refs.emplace_back(item.vs_shared.use_count(),
+                                                  item.fs_shared.use_count());
+                }
+                return RenderedFrame{};
+            });
+            set_submit_compute([&](const std::vector<ComputeItem>& items) {
+                if (items.size() == 1) seen.schedule.push_back('C');
+                return items.size() == 1;
+            });
+            execute_ordered_and_present(mixed, W, H, 77, /*publish=*/false);
+            set_submit_renderer({});
+            set_submit_compute({});
+            return seen;
+        };
+        // Warm the shared-shader cache so reference counts compare the handoff rather than cache
+        // admission. A copy leaves one extra shared owner in the eager vector during rendering.
+        (void)observe(nullptr);
+        const auto copied = observe("1");
+        const auto moved = observe("0");
+        const auto defaulted = observe(nullptr);
+        set_test_env("PROSPER_EAGER_DRAW_COPY", nullptr);
+        CHECK(copied.draws.size() == 2 && moved.draws == copied.draws &&
+                  defaulted.draws == copied.draws &&
+                  std::get<0>(copied.draws[0]) == 0 &&
+                  std::get<0>(copied.draws[1]) == 1 &&
+                  !std::get<1>(copied.draws[0]).empty() &&
+                  !std::get<3>(copied.draws[0]).empty() &&
+                  std::get<4>(copied.draws[0]) == std::vector<uint32_t>({0, 1, 2}) &&
+                  copied.schedule == std::vector<char>({'R', 'C', 'R'}) &&
+                  moved.schedule == copied.schedule && defaulted.schedule == copied.schedule,
+              "ordered draw-compute-draw preserves shader, index, and execution order");
+        CHECK(copied.shader_refs.size() == 2 && moved.shader_refs.size() == 2 &&
+                  defaulted.shader_refs.size() == 2 &&
+                  copied.shader_refs[0].first > moved.shader_refs[0].first &&
+                  moved.shader_refs == defaulted.shader_refs &&
+                  moved.shader_refs[0].first > 0,
+              "production ordered handoff moves shared shader ownership by default");
+    }
 
     // The executor core, with the offscreen Vulkan renderer supplied as the backend (as the HLE will
     // supply the live-device renderer). execute_gpustate does recompile + resolve + render internally.

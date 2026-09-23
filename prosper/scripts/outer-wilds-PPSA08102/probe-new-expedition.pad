@@ -1,0 +1,8 @@
+# Outer Wilds (PPSA08102): title prompt to the Wake Up prompt.
+# Times are seconds since the first pad poll, not screenshot capture times.
+# The first Cross reached a stable menu with NEW EXPEDITION selected by about 56 s
+# on the verified 2026-09-23 fresh-save screenshot route (tracker #3804).
+# On b77cffc83, the second Cross starts loading, then reaches a Square Wake Up
+# prompt over black. This route does not yet display gameplay.
+50-50.5:cross
+70-70.5:cross

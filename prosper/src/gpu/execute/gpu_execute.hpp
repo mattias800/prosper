@@ -32,6 +32,7 @@
 #include <mutex>
 #include <tuple>
 #include <memory>
+#include <utility>
 #include <vector>
 #include <set>
 
@@ -155,6 +156,12 @@ struct DrawItem {
         return (vs_shared && !vs.empty()) || (fs_shared && !fs.empty());
     }
 };
+
+// Ordered execution consumes each eagerly realized draw once. Keep this transfer explicit so its
+// ownership contract can be tested independently of renderer output (which is identical for a copy).
+inline DrawItem transfer_eager_draw(DrawItem& source, bool copy) {
+    return copy ? DrawItem(source) : DrawItem(std::move(source));
+}
 
 // The pluggable Vulkan backend: render the submit's draw items into one image and return W*H*4 RGBA8
 // pixels (or {} on failure). Empty list -> {} (nothing to draw).
