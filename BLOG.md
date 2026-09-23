@@ -21,6 +21,24 @@ from the tracker issues, and still gated, because it is a projection of state ra
 
 ## 2026-09-23
 
+### Blue Prince and Evergate get back pixels NVIDIA was dropping
+
+On a 32-lane NVIDIA GPU some of these titles' 64-lane pixel shaders were still being skipped; they now
+run as 64-lane waves with the upper half empty, as GTA V's already did. Blue Prince's hall gets its
+bouquet back and Evergate's save-slot portals show their world. Each pair is the same binary with only
+that switch changed. [#3797](https://github.com/mattias800/prosper/issues/3797).
+
+![Blue Prince hall on Windows/NVIDIA, tier off: the table stands empty, tools/screenshot, blue-prince-hall route, t=501 s](assets/screenshots/blue-prince-hall-nvidia-partial-wave-off.webp)
+![Blue Prince hall on Windows/NVIDIA, tier on: the bouquet is on the table, same route and time](assets/screenshots/blue-prince-hall-nvidia-partial-wave-on.webp)
+![Evergate save slots on Windows/NVIDIA, tier off: empty portal frames, tools/screenshot, evergate-gameplay route sampled every second, t=25 s](assets/screenshots/evergate-save-slots-nvidia-partial-wave-off.webp)
+![Evergate save slots on Windows/NVIDIA, tier on: each portal shows the crimson world, same route and time](assets/screenshots/evergate-save-slots-nvidia-partial-wave-on.webp)
+
+Blasphemous 2 also stops dropping about one draw in twenty, and its picture does not change, which is what the
+guard run wanted to see.
+
+![Blasphemous 2 on Windows/NVIDIA, tier off, tools/screenshot, blasphemous2-gameplay route, t=445 s](assets/screenshots/blasphemous2-nvidia-partial-wave-off.webp)
+![Blasphemous 2 on Windows/NVIDIA, tier on, same route and time](assets/screenshots/blasphemous2-nvidia-partial-wave-on.webp)
+
 ### Kena: Bridge of Spirits gets into its first level — and the world is not there yet
 
 We now get *Kena* on Windows through New Game, difficulty, brightness, the level load and the intro narration to its first gameplay prompt — but the world behind that prompt draws black. [#3787](https://github.com/mattias800/prosper/issues/3787).
