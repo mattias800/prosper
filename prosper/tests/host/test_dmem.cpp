@@ -574,6 +574,95 @@ int main() {
             VirtualFree(foreign, 0, MEM_RELEASE);
         }
     }
+    // #3812: a fixed BatchMap MAP_DIRECT into the guest's own reservation must REPLACE pages prosper
+    // lazily committed there, as mmap(MAP_FIXED) does on Linux and a fixed map does on PS5. Kena:
+    // Bridge of Spirits (PPSA01802) died on exactly this: host-side reads first-touched reserved
+    // pages, the VEH replaced those placeholder pieces with private memory, and the later
+    // MapViewOfFile3(MEM_REPLACE_PLACEHOLDER) failed with ERROR_INVALID_ADDRESS -> ENOMEM -> UE4
+    // abort. Pre-fix, the positive arm below fails with done == 0 and ret 0x8002000c.
+    {
+        struct BatchEntry { uint64_t start, phys, len; uint8_t prot, type; uint16_t pad; int32_t op; };
+        static_assert(sizeof(BatchEntry) == 0x20, "sceKernelBatchMap entry is 0x20 bytes");
+        constexpr uint64_t kSpan = 0x40000;
+        const uint64_t rva = 0x31000000000ull;
+        uint64_t got_va = rva;
+        const bool reserved_ok =
+            reserve((uint64_t)(uintptr_t)&got_va, kSpan, 0x10 /* MAP_FIXED */, 0x10000, 0, 0) == 0 &&
+            got_va == rva;
+        CHECK(reserved_ok, "#3812: reserve a fixed 256 KiB guest range");
+        // First touch of a page at each END, the way the VEH commits a page a host reader faults on.
+        const bool lazy = reserved_ok &&
+            prosper_try_commit_reserved_placeholder(rva, 0x4000) == 1 &&
+            prosper_try_commit_reserved_placeholder(rva + kSpan - 0x4000, 0x4000) == 1;
+        MEMORY_BASIC_INFORMATION lo_before{}, hi_before{};
+        if (lazy) {
+            VirtualQuery((void*)(uintptr_t)rva, &lo_before, sizeof(lo_before));
+            VirtualQuery((void*)(uintptr_t)(rva + kSpan - 1), &hi_before, sizeof(hi_before));
+        }
+        // Self-invalidating precondition: the arm is only evidence if both ends really are private
+        // committed pages, which is the shape VirtualQuery reported at Kena's failing map.
+        CHECK(lazy && lo_before.State == MEM_COMMIT && lo_before.Type == MEM_PRIVATE &&
+                  hi_before.State == MEM_COMMIT && hi_before.Type == MEM_PRIVATE,
+              "#3812 precondition: both ends of the reservation are lazily committed private pages");
+        uint64_t dphys = 0;
+        const bool have_phys =
+            alloc(0, kEnd, kSpan, 0x10000, 0, (uint64_t)(uintptr_t)&dphys) == 0;
+        CHECK(have_phys, "#3812: allocate direct memory for the fixed map");
+        if (lazy && have_phys) {
+            BatchEntry e{rva, dphys, kSpan, 0x3 /* CPU RW */, 0, 0, 0 /* MAP_DIRECT */};
+            int32_t done = -1;
+            const uint64_t ret = batch((uint64_t)(uintptr_t)&e, 1, (uint64_t)(uintptr_t)&done,
+                                       0, 0, 0);
+            CHECK(ret == 0 && done == 1,
+                  "#3812: fixed MAP_DIRECT over lazily committed pages succeeds (pre-fix: ENOMEM)");
+            MEMORY_BASIC_INFORMATION lo{}, hi{};
+            VirtualQuery((void*)(uintptr_t)rva, &lo, sizeof(lo));
+            VirtualQuery((void*)(uintptr_t)(rva + kSpan - 1), &hi, sizeof(hi));
+            CHECK(ret == 0 && lo.Type == MEM_MAPPED && hi.Type == MEM_MAPPED,
+                  "#3812: both ends are now the shared direct-memory section, not private pages");
+            // The map must be a real alias of the physical range, not private memory that merely
+            // reports success: a second view of the same offset sees the write.
+            uint64_t alias = 0;
+            if (ret == 0 && map((uint64_t)(uintptr_t)&alias, kSpan, 0x3, 0, dphys, 0x10000) == 0 &&
+                alias) {
+                *(volatile uint64_t*)(uintptr_t)(rva + kSpan - 0x10) = 0x3812CAFE3812CAFEull;
+                CHECK(*(volatile uint64_t*)(uintptr_t)(alias + kSpan - 0x10) ==
+                          0x3812CAFE3812CAFEull,
+                      "#3812: the replacing map aliases its physical range");
+                unmap(alias, kSpan, 0, 0, 0, 0);
+            } else {
+                CHECK(false, "#3812: the replacing map aliases its physical range");
+            }
+            unmap(rva, kSpan, 0, 0, 0, 0);
+        }
+        // Fail-closed control: the release must refuse a range it cannot prove guest-owned. Put an
+        // UNTRACKED host allocation directly above a lazily committed guest page and map across
+        // both. The map must still fail, and neither side's contents may be discarded.
+        const uint64_t rva2 = 0x31000100000ull;
+        uint64_t got2 = rva2;
+        const bool reserved2 =
+            reserve((uint64_t)(uintptr_t)&got2, 0x10000, 0x10, 0x10000, 0, 0) == 0 && got2 == rva2 &&
+            prosper_try_commit_reserved_placeholder(rva2, 0x4000) == 1;
+        void* host = reserved2 ? VirtualAlloc((void*)(uintptr_t)(rva2 + 0x10000), 0x10000,
+                                              MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+                               : nullptr;
+        CHECK(reserved2 && host, "#3812 control: a lazily committed guest page below untracked host memory");
+        if (reserved2 && host && have_phys) {
+            *(volatile uint32_t*)(uintptr_t)rva2 = 0x11112222u;
+            *(volatile uint32_t*)host = 0x33334444u;
+            BatchEntry e{rva2, dphys, 0x20000, 0x3, 0, 0, 0};
+            int32_t done = -1;
+            CHECK((uint32_t)batch((uint64_t)(uintptr_t)&e, 1, (uint64_t)(uintptr_t)&done, 0, 0,
+                                  0) == 0x8002000cu && done == 0,
+                  "#3812 control: a fixed map over untracked host memory still fails");
+            CHECK(*(volatile uint32_t*)(uintptr_t)rva2 == 0x11112222u &&
+                      *(volatile uint32_t*)host == 0x33334444u,
+                  "#3812 control: the refused map released neither the guest page nor the host memory");
+        }
+        if (host) VirtualFree(host, 0, MEM_RELEASE);
+        if (reserved2) unmap(rva2, 0x10000, 0, 0, 0, 0);
+        if (have_phys) release(dphys, kSpan, 0, 0, 0, 0);
+    }
     // #2144 F1: the tracker snapshot win_protect works from must be the COMPLETE coverage of the
     // span, not the prefix before the first untracked hole. #2117 made the caller read that vector
     // as coverage, so a span BEGINNING in an untracked page produced an EMPTY vector and every

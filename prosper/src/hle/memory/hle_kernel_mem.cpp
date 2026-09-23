@@ -5781,6 +5781,19 @@ namespace {
         return false;
     }
 
+    bool win_unmap(uint64_t addr, uint64_t len);   // defined below
+
+    // Does [base, base+len) overlap private pages prosper put into a guest placeholder? Those are
+    // the lazy-commit pages the VEH creates on first touch (prosper_try_commit_reserved_placeholder)
+    // and flexible-memory commits; MapViewOfFile3 cannot replace either with a section view.
+    bool range_overlaps_private_placeholder_view(uint64_t base, uint64_t len) {
+        const uint64_t end = base + len;
+        std::lock_guard<std::mutex> lk(g_dview_mx);
+        for (const PrivatePlaceholderView& view : g_private_placeholder_views)
+            if (view.base < end && base < view.base + view.size) return true;
+        return false;
+    }
+
     void* win_map_phys(uint64_t hint, uint64_t len, int hp, uint64_t phys, uint64_t align,
                        bool fixed) {
         // MAP_FIXED is replacement semantics on the guest. RAGE also uses it idempotently: GTA V
@@ -5813,6 +5826,53 @@ namespace {
         // Normalize only ranges whose complete ownership the registries prove, then retry once.
         if (fixed && normalize_fragmented_guest_placeholder_range(hint, len))
             if (void* p = map_section_view(hint, len, hp, phys, align)) return p;
+        // FIXED MAP_DIRECT over private pages inside the guest's own reservation (#3812). A fixed
+        // map REPLACES whatever is mapped there -- on PS5 (a non-overwriting map has to ask for
+        // SCE_KERNEL_MAP_NO_OVERWRITE) and on Linux, where mmap(MAP_FIXED) discards the anonymous
+        // pages prosper's SIGSEGV handler lazily committed. On Windows those pages are private
+        // allocations that replaced placeholder pieces, and MapViewOfFile3(MEM_REPLACE_PLACEHOLDER)
+        // cannot place a view over them: ERROR_INVALID_ADDRESS, ENOMEM to the guest, and UE4 aborts
+        // (`sceKernelBatchMap failed with error code: 0x8002000c`, Kena: Bridge of Spirits PPSA01802).
+        // Kena's pages were committed by HOST reads (every lazy commit in a measured run had a host
+        // RIP), and the guest never mapped anything there before the fatal MAP_DIRECT.
+        //
+        // The repair is the Windows half of MAP_FIXED: release the range's guest-owned contents with
+        // the ordinary unmap transaction, then retry the view once. win_unmap fails closed -- it
+        // refuses unless the registries prove every byte of the range is guest-owned (private
+        // placeholder views, guest/free placeholders, direct views), so an untracked host
+        // allocation is never released. Narrowly gated on the range actually holding such private
+        // pages, so the existing shapes (#2424's tail repair below, fragmentation above) are not
+        // touched. If the retry still fails the guest gets ENOMEM as before; the pages it loses were
+        // going to be replaced by this map anyway.
+        if (fixed && hint && len && range_overlaps_private_placeholder_view(hint, len)) {
+            if (win_unmap(hint, len)) {
+                // Announced rather than silent (capped, and the cap says so): this path discards
+                // pages, and a log that cannot show it ran cannot show it was the fix either.
+                auto announce = [&](void* p) {
+                    static std::atomic<unsigned> seen{0};
+                    const unsigned n = seen.fetch_add(1, std::memory_order_relaxed);
+                    if (n < 4)
+                        std::fprintf(stderr,
+                                     "[memhle] fixed MAP_DIRECT 0x%llx +0x%llx replaced private pages "
+                                     "prosper had committed in the guest reservation (#3812)\n",
+                                     (unsigned long long)hint, (unsigned long long)len);
+                    else if (n == 4)
+                        std::fprintf(stderr, "[memhle] further #3812 replacements not logged\n");
+                    return p;
+                };
+                if (void* p = map_section_view(hint, len, hp, phys, align)) return announce(p);
+                if (normalize_fragmented_guest_placeholder_range(hint, len))
+                    if (void* p = map_section_view(hint, len, hp, phys, align)) return announce(p);
+                MLOG("map_dmem FIXED over private pages: released 0x%llx +0x%llx but the view still "
+                     "failed (error=%lu)\n",
+                     (unsigned long long)hint, (unsigned long long)len,
+                     (unsigned long)GetLastError());
+            } else {
+                MLOG("map_dmem FIXED over private pages: 0x%llx +0x%llx is not provably guest-owned; "
+                     "not released\n",
+                     (unsigned long long)hint, (unsigned long long)len);
+            }
+        }
         // FIXED MAP_DIRECT over a placeholder too small for it (#2424). The guest maps a range,
         // unmaps it, then remaps the SAME base with a LARGER length -- GTA V (PPSA04263) does exactly
         // this at 0x1550880000: 0x40000, unmap, then 0x80000. The unmap leaves a free placeholder of
