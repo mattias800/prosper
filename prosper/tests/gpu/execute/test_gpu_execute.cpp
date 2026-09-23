@@ -614,6 +614,18 @@ int main() {
         CHECK(phases[0].allows_deferred_scanout_readback() &&
               !phases[1].allows_deferred_scanout_readback(),
               "only a non-final graphics span may defer scanout readback across compute");
+        CHECK(phases[0].source_submit == 0 && phases[1].source_submit == 0,
+              "direct ordered execution has no live architectural submit identity");
+        std::vector<uint64_t> live_submit_ids;
+        execute_ordered_items(operations, {first, second}, {fill},
+                              std::vector<GpuState::DmaCopy>{},
+                              [&](const std::vector<DrawItem>&, uint32_t, uint32_t) {
+                                  live_submit_ids.push_back(live_render_phase().source_submit);
+                                  return RenderedFrame{};
+                              }, mutate, 1, 1, 77);
+        CHECK(live_submit_ids == std::vector<uint64_t>({77, 77}) &&
+              live_render_phase().source_submit == 0,
+              "both live ordered spans carry their exact submit identity without leaking it");
         CHECK(overlapping == GuestGpuWriteQuery::Overlap &&
               unrelated == GuestGpuWriteQuery::Unchanged,
               "write journal distinguishes overlapping and unrelated in-submit GPU writes");
