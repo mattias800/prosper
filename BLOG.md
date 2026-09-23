@@ -51,6 +51,14 @@ We now reach the *Kena: Bridge of Spirits* main menu on Windows — its logo mov
 
 ![Kena: Bridge of Spirits main menu, Windows screenshot.exe default launch, t=60 s](assets/screenshots/kena-main-menu.webp)
 
+### Windows can now decode the movies titles feed it one frame at a time
+
+No picture yet, and that is the honest part. `sceVideodec2` on Windows used to refuse every stream,
+so *Dragon Quest VII*'s VP9 movies could only ever be black; it now decodes VP9 and H.264 through
+Windows' own codecs, byte-identical to ffmpeg on test streams. On this Windows box the title itself
+still dies before its first movie in every run, so the in-game frame is still owed.
+[#2983](https://github.com/mattias800/prosper/issues/2983).
+
 ## 2026-09-20
 
 ### hle_service.cpp was fifteen Sony libraries in one file; now it is five files
