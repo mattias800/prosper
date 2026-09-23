@@ -96,8 +96,8 @@ unmeasured title is never mistaken for a failing one; newly tracked titles start
 
 | Where the title stops | Titles |
 | --- | --- |
-| **Gameplay reached**, with the scene rendering (rung 3 or better) | 27 |
-| **Title screen or menu** reached, or gameplay reached without a rendered world (rung 2) | 18 |
+| **Gameplay reached**, with the scene rendering (rung 3 or better) | 28 |
+| **Title screen or menu** reached, or gameplay reached without a rendered world (rung 2) | 17 |
 | **Below a title screen** — logo or splash only (rung 1) | 3 |
 | **Boots, but no frame with content** (rung 0) | 8 |
 | **Not yet booted** — tracked, no run attempted yet | 0 |
@@ -139,14 +139,13 @@ worked. **A rung claim outside the title's own status doc is the copy most likel
 
 ### Where the titles accumulate
 
-The 18 titles at rung 2 — a title screen or menu, or gameplay reached without a rendered world — by
+The 17 titles at rung 2 — a title screen or menu, or gameplay reached without a rendered world — by
 the engine recorded in the table:
 
 | Engine | Titles |
 | --- | --- |
 | Unreal Engine — 11 × UE4, 1 × UE5, 1 unversioned | 13 |
 | Hedgehog Engine, Hedgehog Engine 2, Custom (Ancient), ASOBI — one each | 4 |
-| Unity / IL2CPP | 1 |
 
 **Unreal dominates this group, and it no longer accounts for all of it.** Thirteen of the 17 rung-2
 rows are Unreal, against 19 Unreal rows in the table overall — the other six are one at gameplay
