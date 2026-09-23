@@ -438,6 +438,213 @@ int main() {
     std::filesystem::remove(closure_path, ec);
     std::filesystem::remove(multi_path, ec);
 
+    // #3828: the guest closing flip can run before the final renderer callback has reached the
+    // capture hook. Outer Wilds closed flip 1648 at submit 58376, then displayed that same flip
+    // with completed producer 58377. The owned GPU F9 mode must retain the later submit before
+    // serialization; a guest-present-only closure fails this exact arm.
+    using prosper::gpu::InteractiveGrabClosure;
+    using prosper::gpu::InteractiveGrabProducerClose;
+    using prosper::gpu::InteractiveGrabProducerLimits;
+    using prosper::gpu::interactive_grab_pending_source_flip;
+    using prosper::gpu::interactive_grab_on_host_presented_source;
+    using prosper::gpu::interactive_grab_on_cpu_fallback;
+    using prosper::gpu::interactive_grab_expire_producer_wait;
+    const auto late_path = prosper_test::test_scratch_file("prosper_f9_late_producer.prgbundle");
+    CHECK(request_interactive_capture_bundle(
+              late_path, 0, 0, InteractiveGrabClosure::PresentedGpuProducer).accepted,
+          "#3828: the owned GPU F9 mode arms a one-frame bundle");
+    record_gpu_timeline_present(4100, 0, 0, 1920, 1080, 1647);
+    record_gpu_timeline_submit(empty_submit, 58376);
+    record_gpu_timeline_present(4101, 0, 0, 1920, 1080, 1648);
+    uint64_t pending_flip = 0;
+    CHECK(interactive_capture_bundle_active() &&
+              interactive_grab_pending_source_flip(late_path, pending_flip) &&
+              pending_flip == 1648 &&
+              !interactive_grab_closed_source_flip(late_path, closed_flip),
+          "#3828: guest flip 1648 nominates, but cannot serialize before its producer arrives");
+    record_gpu_timeline_submit(empty_submit, 58377);
+    CHECK(interactive_grab_on_host_presented_source(late_path, 1648, true, 58377) ==
+              InteractiveGrabProducerClose::Captured,
+          "#3828: exact host-presented flip closes only after producer 58377 reaches the hook");
+    InteractiveGrabOutcome late_outcome;
+    CHECK(wait_for_interactive_grab(late_outcome) && late_outcome.ok &&
+              late_outcome.closed_source_flips == std::vector<uint64_t>({1648}) &&
+              late_outcome.closed_submit_counts == std::vector<uint64_t>({2}) &&
+              late_outcome.captured_submits == std::vector<uint64_t>({58376, 58377}),
+          "#3828: serialized bundle contains the exact completed producer after the guest flip");
+    GpuCaptureBundle late_bundle;
+    CHECK(read_gpu_capture_bundle(late_path, late_bundle, error) &&
+              late_bundle.submits.size() == 2 &&
+              late_bundle.submits.back().submit_index == 58377,
+          "#3828: on-disk submit membership agrees with the closure outcome");
+    std::filesystem::remove(late_path, ec);
+
+    const auto unknown_path = prosper_test::test_scratch_file("prosper_f9_unknown_producer.prgbundle");
+    CHECK(request_interactive_capture_bundle(
+              unknown_path, 0, 0, InteractiveGrabClosure::PresentedGpuProducer).accepted,
+          "#3828: unknown-producer refusal arms");
+    record_gpu_timeline_present(4200, 0, 0, 1920, 1080, 2001);
+    record_gpu_timeline_submit(empty_submit, 58400);
+    record_gpu_timeline_present(4201, 0, 0, 1920, 1080, 2002);
+    CHECK(interactive_grab_on_host_presented_source(unknown_path, 2002, false, 0) ==
+              InteractiveGrabProducerClose::Refused,
+          "#3828: the exact flip without known producer cannot certify the bundle");
+    InteractiveGrabOutcome unknown_outcome;
+    CHECK(wait_for_interactive_grab(unknown_outcome) && !unknown_outcome.ok &&
+              unknown_outcome.error.find("without known producer") != std::string::npos,
+          "#3828: unknown lineage produces an explicit incomplete result");
+
+    const auto skipped_path = prosper_test::test_scratch_file("prosper_f9_skipped_flip.prgbundle");
+    CHECK(request_interactive_capture_bundle(
+              skipped_path, 0, 0, InteractiveGrabClosure::PresentedGpuProducer).accepted,
+          "#3828: skipped-flip refusal arms");
+    record_gpu_timeline_present(4300, 0, 0, 1920, 1080, 3001);
+    record_gpu_timeline_submit(empty_submit, 58410);
+    record_gpu_timeline_present(4301, 0, 0, 1920, 1080, 3002);
+    CHECK(interactive_grab_on_host_presented_source(skipped_path, 3003, true, 58410) ==
+              InteractiveGrabProducerClose::Refused,
+          "#3828: a newer host-presented flip cannot inherit the target's producer");
+    InteractiveGrabOutcome skipped_outcome;
+    CHECK(wait_for_interactive_grab(skipped_outcome) && !skipped_outcome.ok &&
+              skipped_outcome.error.find("skipped") != std::string::npos,
+          "#3828: skipped host presentation is explicit and does not serialize");
+
+    const auto expiry_path = prosper_test::test_scratch_file("prosper_f9_producer_expiry.prgbundle");
+    CHECK(request_interactive_capture_bundle(
+              expiry_path, 0, 0, InteractiveGrabClosure::PresentedGpuProducer,
+              InteractiveGrabProducerLimits{1, 2, 2}).accepted,
+          "#3828: bounded never-presented test arms");
+    record_gpu_timeline_present(4400, 0, 0, 1920, 1080, 4001);
+    record_gpu_timeline_submit(empty_submit, 58420);
+    record_gpu_timeline_present(4401, 0, 0, 1920, 1080, 4002);
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    CHECK(interactive_grab_expire_producer_wait(expiry_path),
+          "#3828: a target never shown by the host expires without another guest event");
+    InteractiveGrabOutcome expired_outcome;
+    CHECK(wait_for_interactive_grab(expired_outcome) && !expired_outcome.ok &&
+              expired_outcome.error.find("wall-clock budget") != std::string::npos,
+          "#3828: deadline expiry reports an explicit incomplete result");
+
+    const auto submit_limit_path = prosper_test::test_scratch_file("prosper_f9_submit_limit.prgbundle");
+    CHECK(request_interactive_capture_bundle(
+              submit_limit_path, 0, 0, InteractiveGrabClosure::PresentedGpuProducer,
+              InteractiveGrabProducerLimits{30'000, 1, 2}).accepted,
+          "#3828: post-flip submit-budget test arms");
+    record_gpu_timeline_present(4500, 0, 0, 1920, 1080, 5001);
+    record_gpu_timeline_submit(empty_submit, 58430);
+    record_gpu_timeline_present(4501, 0, 0, 1920, 1080, 5002);
+    record_gpu_timeline_submit(empty_submit, 58431);
+    record_gpu_timeline_submit(empty_submit, 58432);
+    CHECK(interactive_grab_expire_producer_wait(submit_limit_path),
+          "#3828: a late producer cannot silently extend the bounded submit window");
+    InteractiveGrabOutcome submit_limit_outcome;
+    CHECK(wait_for_interactive_grab(submit_limit_outcome) && !submit_limit_outcome.ok &&
+              submit_limit_outcome.error.find("submit budget") != std::string::npos &&
+              submit_limit_outcome.captured_submits == std::vector<uint64_t>({58430, 58431}),
+          "#3828: the submit-budget refusal names only work actually retained");
+
+    const auto present_limit_path = prosper_test::test_scratch_file("prosper_f9_present_limit.prgbundle");
+    CHECK(request_interactive_capture_bundle(
+              present_limit_path, 0, 0, InteractiveGrabClosure::PresentedGpuProducer,
+              InteractiveGrabProducerLimits{30'000, 4, 2}).accepted,
+          "#3828: post-target present-budget test arms");
+    record_gpu_timeline_present(4600, 0, 0, 1920, 1080, 6001);
+    record_gpu_timeline_submit(empty_submit, 58440);
+    record_gpu_timeline_present(4601, 0, 0, 1920, 1080, 6002);
+    record_gpu_timeline_present(4602, 0, 0, 1920, 1080, 6003);
+    record_gpu_timeline_present(4603, 0, 0, 1920, 1080, 6004);
+    CHECK(interactive_grab_expire_producer_wait(present_limit_path),
+          "#3828: unrelated guest flips cannot keep the target window open forever");
+    InteractiveGrabOutcome present_limit_outcome;
+    CHECK(wait_for_interactive_grab(present_limit_outcome) && !present_limit_outcome.ok &&
+              present_limit_outcome.error.find("guest-present budget") != std::string::npos &&
+              present_limit_outcome.closed_source_flips == std::vector<uint64_t>({6002}),
+          "#3828: present-budget refusal retains the original target, not a later flip");
+
+    // CPU fallback may be the first successfully shown image before target nomination. The app
+    // writes its BMP immediately, then clears its pending screenshot path. The bundle therefore
+    // cannot rely on that path for closure; it must downgrade to bounded ordinary guest closure.
+    const auto fallback_path = prosper_test::test_scratch_file("prosper_f9_cpu_fallback.prgbundle");
+    CHECK(request_interactive_capture_bundle(
+              fallback_path, 0, 0, InteractiveGrabClosure::PresentedGpuProducer).accepted,
+          "#3828: fallback-before-target test arms producer closure");
+    record_gpu_timeline_present(4700, 0, 0, 1920, 1080, 7001);
+    record_gpu_timeline_submit(empty_submit, 58450);
+    CHECK(interactive_grab_on_cpu_fallback(fallback_path) &&
+              !interactive_grab_pending_source_flip(fallback_path, pending_flip),
+          "#3828: successful CPU fallback before nomination changes the closure policy");
+    record_gpu_timeline_present(4701, 0, 0, 1920, 1080, 7002);
+    InteractiveGrabOutcome fallback_outcome;
+    CHECK(wait_for_interactive_grab(fallback_outcome) && fallback_outcome.ok &&
+              fallback_outcome.closed_source_flips == std::vector<uint64_t>({7002}) &&
+              fallback_outcome.captured_submits == std::vector<uint64_t>({58450}),
+          "#3828: CPU BMP path closes a real bundle without any later GPU producer callback");
+    std::filesystem::remove(fallback_path, ec);
+
+    const auto fallback_after_path =
+        prosper_test::test_scratch_file("prosper_f9_cpu_fallback_after_target.prgbundle");
+    CHECK(request_interactive_capture_bundle(
+              fallback_after_path, 0, 0, InteractiveGrabClosure::PresentedGpuProducer).accepted,
+          "#3828: fallback-after-target test arms producer closure");
+    record_gpu_timeline_present(4750, 0, 0, 1920, 1080, 7501);
+    record_gpu_timeline_submit(empty_submit, 58455);
+    record_gpu_timeline_present(4751, 0, 0, 1920, 1080, 7502);
+    CHECK(interactive_grab_on_cpu_fallback(fallback_after_path),
+          "#3828: CPU fallback after the target guest flip closes the retained prefix");
+    InteractiveGrabOutcome fallback_after_outcome;
+    CHECK(wait_for_interactive_grab(fallback_after_outcome) && fallback_after_outcome.ok &&
+              fallback_after_outcome.closed_source_flips == std::vector<uint64_t>({7502}) &&
+              fallback_after_outcome.captured_submits == std::vector<uint64_t>({58455}),
+          "#3828: late CPU fallback preserves a real serialized bundle for unknown_source");
+    std::filesystem::remove(fallback_after_path, ec);
+
+    const auto fallback_expiry_path =
+        prosper_test::test_scratch_file("prosper_f9_cpu_fallback_expiry.prgbundle");
+    CHECK(request_interactive_capture_bundle(
+              fallback_expiry_path, 0, 0, InteractiveGrabClosure::PresentedGpuProducer,
+              InteractiveGrabProducerLimits{1, 2, 2}).accepted &&
+              interactive_grab_on_cpu_fallback(fallback_expiry_path),
+          "#3828: CPU fallback while the grab is still armed starts a bounded wait");
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    CHECK(interactive_grab_expire_producer_wait(fallback_expiry_path),
+          "#3828: the armed CPU fallback expires even after the BMP path is cleared");
+    InteractiveGrabOutcome fallback_expired;
+    CHECK(prosper::gpu::take_interactive_grab_outcome(fallback_expired) &&
+              !fallback_expired.ok &&
+              fallback_expired.error.find("CPU fallback") != std::string::npos,
+          "#3828: armed fallback refusal publishes an explicit owned outcome");
+
+    // F9 requests the producer mode even when an operator asks for a multi-frame bundle. That
+    // request must downgrade to the established guest-present contract, which does not require
+    // one GPU producer callback for every additional frame.
+#ifdef _WIN32
+    _putenv_s("PROSPER_CAPTURE_FRAMES", "2");
+#else
+    setenv("PROSPER_CAPTURE_FRAMES", "2", 1);
+#endif
+    const auto producer_multi_path =
+        prosper_test::test_scratch_file("prosper_f9_producer_multi.prgbundle");
+    CHECK(request_interactive_capture_bundle(
+              producer_multi_path, 0, 0, InteractiveGrabClosure::PresentedGpuProducer).accepted,
+          "#3828: an F9 producer-mode request with two frames arms");
+    record_gpu_timeline_present(4800, 0, 0, 1920, 1080, 8001);
+    record_gpu_timeline_submit(empty_submit, 58460);
+    record_gpu_timeline_present(4801, 0, 0, 1920, 1080, 8002);
+    CHECK(interactive_capture_bundle_active(),
+          "#3828: the first of two requested frames does not close the window");
+    record_gpu_timeline_present(4802, 0, 0, 1920, 1080, 8003);
+    InteractiveGrabOutcome producer_multi_outcome;
+    CHECK(wait_for_interactive_grab(producer_multi_outcome) && producer_multi_outcome.ok &&
+              producer_multi_outcome.closed_source_flips ==
+                  std::vector<uint64_t>({8002, 8003}),
+          "#3828: multi-frame F9 closes at guest boundary without a producer callback");
+#ifdef _WIN32
+    _putenv_s("PROSPER_CAPTURE_FRAMES", "1");
+#else
+    setenv("PROSPER_CAPTURE_FRAMES", "1", 1);
+#endif
+    std::filesystem::remove(producer_multi_path, ec);
+
     if (fails) { std::printf("== FAIL: %d ==\n", fails); return 1; }
     std::printf("== PASS ==\n"); return 0;
 }

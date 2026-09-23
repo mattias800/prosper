@@ -1401,6 +1401,8 @@ if(TARGET prosper_core)
 
   add_executable(test_prosper_app_frame_grab_match frontends/prosper-app/test_frame_grab_match.cpp)
   target_include_directories(test_prosper_app_frame_grab_match PRIVATE frontends tests)
+  target_compile_definitions(test_prosper_app_frame_grab_match PRIVATE
+    PROSPER_APP_MAIN_SOURCE="${CMAKE_CURRENT_SOURCE_DIR}/frontends/prosper-app/main.cpp")
   add_test(NAME prosper_app_frame_grab_match COMMAND test_prosper_app_frame_grab_match)
 
   # F8's pre-trigger ring and post-trigger timing artifact: pure state machine + filesystem test,
