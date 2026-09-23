@@ -21,6 +21,13 @@ from the tracker issues, and still gated, because it is a projection of state ra
 
 ## 2026-09-23
 
+### Outer Wilds reaches a title-start prompt
+
+On a default Linux launch, *Outer Wilds* reaches “PRESS X TO START” over an animated starfield and
+campfire scene. Visual fidelity, gameplay and speed remain unverified. [#3804](https://github.com/mattias800/prosper/issues/3804).
+
+![Outer Wilds title-start prompt, unmodified Linux screenshot frontend capture at 60 seconds](assets/screenshots/outer-wilds-title-start.png)
+
 ### GTA V's world renders on NVIDIA again
 
 On Windows/NVIDIA the prologue bank was a HUD over black: the GPU runs 32 lanes where the game's
