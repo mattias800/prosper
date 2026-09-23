@@ -6,9 +6,11 @@ Tracker: [#3804](https://github.com/mattias800/prosper/issues/3804). Engine: Uni
 `ce84f7f7d305` (2026-09-23), the unmodified `tools/screenshot` frontend showed the Annapurna and
 Mobius Digital opening logos, then a “PRESS X TO START” prompt by about 40 seconds. An animated
 starfield and a dim campfire/tree scene render behind the prompt. The guest was still running when
-the 90-second capture ended. The [T+60 screenshot](../../assets/screenshots/outer-wilds-title-start.png)
-is an exact copy of the frontend PNG (SHA-256
-`40e847af6c3855341de10e3a0fcf479d1b422d037f1cad124aa9faf7433024be`).
+the 90-second capture ended. The [T+60 screenshot](../../assets/screenshots/outer-wilds-title-start.webp)
+is a 1920-wide WebP derived with `prosper/tools/screenshots/shrink.py` (SHA-256
+`dc18471330cf77e204fcd8dc98877deb76ec58dd8cbec62c0aa79aa5bffd828b`). The unmodified
+3840×2160 frontend PNG is retained privately under `<EVIDENCE_ROOT>/outer-wilds-20260923/`
+(SHA-256 `40e847af6c3855341de10e3a0fcf479d1b422d037f1cad124aa9faf7433024be`).
 
 **Visual fidelity is unverified.** The game wordmark is absent in the sampled prompt frames; this
 is a candidate difference, not an established PS5 defect without a hardware oracle. No input was
