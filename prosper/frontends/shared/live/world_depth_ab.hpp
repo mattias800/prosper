@@ -144,6 +144,30 @@ constexpr bool world_c2_tail_identity_allowed(int64_t requested_pad, int64_t cal
            tail_guest_flip == first_guest_flip;
 }
 
+// Only the first later c0 write to the previously captured c2 allocation can be compared with
+// that snapshot. Bind this diagnostic to the exact one-draw alpha pass and its single declared c1
+// input; the backend independently proves which image the descriptor actually receives.
+struct WorldC2AlphaPassFact {
+    bool armed = false, before_complete = false, attempted = false;
+    int64_t requested_pad = -1, callback_pad = -1;
+    uint64_t guest_flip = 0, before_guest_flip = 0;
+    size_t draws = 0;
+    uint32_t color_count = 0;
+    uint64_t color_base = 0;
+    uint32_t color_mask = 0;
+    uint64_t fragment_program = 0;
+    size_t c1_binding_count = 0;
+};
+
+constexpr bool world_c2_alpha_pass_allowed(const WorldC2AlphaPassFact& fact) {
+    return fact.armed && fact.before_complete && !fact.attempted &&
+           fact.requested_pad == 3930 && fact.callback_pad == fact.requested_pad &&
+           fact.guest_flip == fact.before_guest_flip && fact.draws == 1 &&
+           fact.color_count == 1 && fact.color_base == 0x204f9a0000ull &&
+           fact.color_mask == 0x8u && fact.fragment_program == 0x20059c8b00ull &&
+           fact.c1_binding_count == 1;
+}
+
 // The old first-eight descriptor listing dropped facts relevant to the c2 handoff. This
 // address-filtered census scans every resource, reports truncation explicitly, and declines an
 // exhaustive-input claim if a thirteenth distinct fact exists. Base equality is not alias proof.

@@ -76,6 +76,43 @@ int main() {
                "overflowing c2 metadata range accepted"))
         return 1;
 
+    using prosper::frontend::WorldC2AlphaPassFact;
+    const auto alpha_allowed = prosper::frontend::world_c2_alpha_pass_allowed;
+    const WorldC2AlphaPassFact exact_alpha{
+        true, true, false, 3930, 3930, 3930, 3930, 1, 1,
+        0x204f9a0000ull, 0x8u, 0x20059c8b00ull, 1};
+    if (!check(alpha_allowed(exact_alpha), "exact c2 alpha pass declined")) return 1;
+    const auto rejects_alpha_mutation = [&](auto mutate, const char* reason) {
+        WorldC2AlphaPassFact variant = exact_alpha;
+        mutate(variant);
+        return check(!alpha_allowed(variant), reason);
+    };
+    if (!rejects_alpha_mutation([](auto& f) { f.armed = false; },
+                                "default-off alpha audit admitted") ||
+        !rejects_alpha_mutation([](auto& f) { f.before_complete = false; },
+                                "alpha audit admitted without pre-version") ||
+        !rejects_alpha_mutation([](auto& f) { f.attempted = true; },
+                                "second alpha attempt admitted") ||
+        !rejects_alpha_mutation([](auto& f) { --f.callback_pad; },
+                                "other callback pad admitted") ||
+        !rejects_alpha_mutation([](auto& f) { ++f.guest_flip; },
+                                "drifted guest flip admitted") ||
+        !rejects_alpha_mutation([](auto& f) { f.draws = 2; },
+                                "multi-draw alpha pass admitted") ||
+        !rejects_alpha_mutation([](auto& f) { f.color_count = 3; },
+                                "MRT alpha pass admitted") ||
+        !rejects_alpha_mutation([](auto& f) { f.color_base ^= 0x1000; },
+                                "other target admitted") ||
+        !rejects_alpha_mutation([](auto& f) { f.color_mask = 0xf; },
+                                "RGB-writing pass admitted") ||
+        !rejects_alpha_mutation([](auto& f) { f.fragment_program ^= 0x100; },
+                                "other fragment program admitted") ||
+        !rejects_alpha_mutation([](auto& f) { f.c1_binding_count = 0; },
+                                "missing c1 input admitted") ||
+        !rejects_alpha_mutation([](auto& f) { f.c1_binding_count = 2; },
+                                "ambiguous c1 inputs admitted"))
+        return 1;
+
     WorldDepthDrawFact clear;
     clear.depth_read_base = clear.depth_write_base = 0x2053960000ull;
     clear.depth_width = 3840; clear.depth_height = 2160;

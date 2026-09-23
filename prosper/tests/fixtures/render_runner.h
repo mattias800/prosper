@@ -2512,6 +2512,38 @@ struct PersistentColorTargetImage {
     prosper::frontend::CompletedProducer planned_producer;
 };
 
+// One-call, metadata-only diagnostic for a sampled retained target. The frontend supplies the
+// exact draw/callback gate; this records what the backend actually put in the descriptor, including
+// the retained allocation generation. An address in a T# alone is not proof of a Vulkan binding.
+struct BackendTargetBindingObservation {
+    uint32_t set = 0, binding = 0;
+    uint64_t expected_target = 0;
+    uint32_t matches = 0;
+    bool descriptor_prepared = false, descriptor_updated = false, draw_recorded = false;
+    bool borrowed_target = false, feedback_snapshot = false, image_matches_retained = false;
+    VkImage image = VK_NULL_HANDLE;
+    uint64_t registration = 0, mutation = 0;
+    prosper::frontend::CompletedProducer completed_producer{};
+};
+
+inline BackendTargetBindingObservation*& active_backend_target_binding_observation() {
+    static thread_local BackendTargetBindingObservation* observation = nullptr;
+    return observation;
+}
+
+struct ScopedBackendTargetBindingObservation {
+    BackendTargetBindingObservation* previous = nullptr;
+    explicit ScopedBackendTargetBindingObservation(BackendTargetBindingObservation& observation)
+        : previous(active_backend_target_binding_observation()) {
+        active_backend_target_binding_observation() = &observation;
+    }
+    ~ScopedBackendTargetBindingObservation() {
+        active_backend_target_binding_observation() = previous;
+    }
+    ScopedBackendTargetBindingObservation(const ScopedBackendTargetBindingObservation&) = delete;
+    ScopedBackendTargetBindingObservation& operator=(const ScopedBackendTargetBindingObservation&) = delete;
+};
+
 inline void invalidate_color_producer(PersistentColorTargetImage& image) {
     if (!prosper::frontend::producer_lineage_enabled()) return;
     ++image.mutation;
@@ -10735,6 +10767,28 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                               shared_texture_bindings[binding_index].view, image_layout};
                     draw_wr[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}; draw_wr[i].dstBinding = r.binding; draw_wr[i].descriptorCount = 1;
                     draw_wr[i].descriptorType = draw_lb[i].descriptorType; draw_wr[i].pImageInfo = &draw_dii[i];
+                    if (auto* observation = active_backend_target_binding_observation();
+                        observation && r.set == observation->set &&
+                        r.binding == observation->binding) {
+                        ++observation->matches;
+                        observation->descriptor_prepared = draw_dii[i].imageView != VK_NULL_HANDLE;
+                        observation->borrowed_target = descriptor_upload.borrowed_target;
+                        observation->feedback_snapshot = descriptor_upload.feedback_snapshot;
+                        observation->image = descriptor_upload.image;
+                        if (r.persistent_render_target_id == observation->expected_target) {
+                            const auto* retained = find_persistent_color_target(
+                                observation->expected_target, r.tw, r.th,
+                                backend_color_format(r.texture_format), false);
+                            if (retained) {
+                                observation->image_matches_retained =
+                                    descriptor_upload.image != VK_NULL_HANDLE &&
+                                    descriptor_upload.image == retained->image;
+                                observation->registration = retained->registration;
+                                observation->mutation = retained->mutation;
+                                observation->completed_producer = retained->completed_producer;
+                            }
+                        }
+                    }
                 } else {
                     const FrameBufferResource& r = common;
                     const ResourcePhaseTimer phase_buffer(timing_enabled, &res_buffer_ms);
@@ -10905,6 +10959,10 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             for (size_t i = 0; i < R.size(); i++)
                 draw_wr[i].dstSet = v.dsets[R[i].common().set];
             vkUpdateDescriptorSets(dev, static_cast<uint32_t>(draw_wr.size()), draw_wr.data(), 0, nullptr);
+            if (auto* observation = active_backend_target_binding_observation();
+                observation && draws.size() == 1 && di == 0 &&
+                descriptor_alloc == VK_SUCCESS && observation->matches == 1)
+                observation->descriptor_updated = true;
         }
         const auto setup_resources_ready = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
         if (timing_enabled) setup_resources_ms += setup_elapsed_ms(setup_fixed_ready, setup_resources_ready);
@@ -12226,6 +12284,9 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             vkCmdDraw(cmd, v.vcount, v.instance_count,
                       static_cast<uint32_t>(v.vertex_offset), 0);
         }
+        if (auto* observation = active_backend_target_binding_observation();
+            observation && draws.size() == 1 && di == 0)
+            observation->draw_recorded = true;
         if (world_draw_recording) {
             auto& world_record = backend_world_draw_record_stats_storage();
             ++world_record.recorded;

@@ -1054,11 +1054,43 @@ int main() {
             gpu_fp16_resource.tex_rgba = nullptr;
             gpu_fp16_resource.persistent_render_target_id = fp16_target_id;
             consumer.R = {gpu_fp16_resource};
-            std::vector<uint8_t> gpu_sampled = prosper::test::render_draws_rgba(
-                {consumer}, W, H);
+            prosper::test::BackendTargetBindingObservation fp16_audit;
+            fp16_audit.set = 1; fp16_audit.binding = 4;
+            fp16_audit.expected_target = fp16_target_id;
+            std::vector<uint8_t> gpu_sampled;
+            {
+                prosper::test::ScopedBackendTargetBindingObservation scope(fp16_audit);
+                gpu_sampled = prosper::test::render_draws_rgba({consumer}, W, H);
+            }
             const auto gpu_sample_stats = prosper::test::backend_color_target_stats();
             CHECK(gpu_sample_stats.sampled_hits == 1 && gpu_sampled == cpu_sampled,
                   "GPU-resident FP16 target sampling matches native CPU RTT round-trip");
+            CHECK(fp16_audit.matches == 1 && fp16_audit.descriptor_prepared &&
+                      fp16_audit.descriptor_updated && fp16_audit.draw_recorded &&
+                      fp16_audit.borrowed_target && !fp16_audit.feedback_snapshot &&
+                      fp16_audit.image_matches_retained &&
+                      fp16_audit.completed_producer.known(),
+                  "binding audit observes the realized retained FP16 image and completed producer");
+            auto bad_target_audit = fp16_audit;
+            bad_target_audit.expected_target ^= 0x1000;
+            bad_target_audit.matches = 0;
+            bad_target_audit.image_matches_retained = false;
+            {
+                prosper::test::ScopedBackendTargetBindingObservation scope(bad_target_audit);
+                (void)prosper::test::render_draws_rgba({consumer}, W, H);
+            }
+            CHECK(bad_target_audit.matches == 1 &&
+                      !bad_target_audit.image_matches_retained,
+                  "binding audit refuses an address-only false retained join");
+            auto bad_binding_audit = fp16_audit;
+            bad_binding_audit.binding = 5;
+            bad_binding_audit.matches = 0;
+            {
+                prosper::test::ScopedBackendTargetBindingObservation scope(bad_binding_audit);
+                (void)prosper::test::render_draws_rgba({consumer}, W, H);
+            }
+            CHECK(bad_binding_audit.matches == 0,
+                  "binding audit does not accept a different descriptor slot");
 
             auto* borrowed_fp16_fixture = prosper::test::find_persistent_color_target(
                 fp16_target_id, W, H, VK_FORMAT_R16G16B16A16_SFLOAT);
