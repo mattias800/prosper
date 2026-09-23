@@ -1,0 +1,42 @@
+# Metaphor: ReFantazio (PPSA20800) -- boot to the title screen. Verified 2026-09-23 with
+# tools/screenshot at 3840x2160, Linux / Radeon 8060S (RADV), on the branch that added this file
+# (#3784 sign-in dialog, #3791 glyph advance).
+#
+# The route depends on the title's SYSTEM save (<save root>/PPSA20800/SYSTEM), which the first-boot
+# setup writes.
+#
+# From a CLEAN save (no PPSA20800 save directory):
+#   ~20 s  language select            -> Cross (English is already highlighted)
+#   ~25 s  "Proceed with English?"    -> Cross (Yes is the default)
+#   ~45 s  "A network connection will enable some in-game features. Connect?"
+#                                     -> Down, Cross = No. Answering Yes opens the PSN sign-in
+#                                        dialog, which prosper dismisses (a signed-out console,
+#                                        #3784), then "Cannot connect to network. Retry?", whose
+#                                        default is Yes -- a Cross-only route loops there forever.
+#   ~60 s  brightness page, then "Confirm this brightness?" (Yes default) -> Cross, Cross
+#   ~90 s  warning, fiction and photosensitivity notices, ATLUS / Studio Zero / middleware logos
+#   ~150 s the opening movie. It could not be skipped on a first boot in any run tried.
+#   ~340 s TITLE SCREEN ("PRESS ANY BUTTON", then NEW GAME / LOAD GAME / SYSTEM), held until the
+#          attract loop restarts the logos ~60 s later.
+#
+# With the SYSTEM save present, the same presses skip the setup and the movie: the title screen is
+# up by ~40 s, and the later Cross presses select NEW GAME, which plays the storybook prologue and
+# stops at name entry ("Who are you, who shall guide the protagonist?").
+#
+# Wall-clock timings on one machine. The presses are spaced so an early or late boot of a few
+# seconds lands on the same screens; a much slower boot can shift the Down onto the language list.
+20-21:cross
+26-27:cross
+32-33:cross
+38-39:cross
+44-45:cross
+50-50.15:down
+52-53:cross
+58-59:cross
+64-65:cross
+70-71:cross
+76-77:cross
+82-83:cross
+88-89:cross
+94-95:cross
+100-101:cross

@@ -445,8 +445,70 @@ namespace {
 // other split library uses (#3735).
 HLE(s_np_ok) { return 0; }
 
+// --- libSceSigninDialog: the system "sign in to PlayStation Network" dialog (#3784). -------------
+// A signed-out console (above) is what makes a title raise this dialog, and on real hardware the
+// user can decline it; the title then continues offline. The honest headless answer is therefore
+// the dialog's normal lifecycle ending with the user having closed it: Initialize -> INITIALIZED,
+// Open -> (the system UI runs and is dismissed) -> FINISHED, Terminate -> NONE. The status enum is
+// the shared SceCommonDialogStatus (NONE=0, INITIALIZED=1, RUNNING=2, FINISHED=3), and
+// UpdateStatus/GetStatus RETURN it rather than writing an out-parameter.
+//
+// Evidence, all from guest code (the 3.20 stub table gives names and NIDs only):
+//   * Metaphor: ReFantazio polls `sceSigninDialogUpdateStatus` at eboot+0x863e89, compares the
+//     RETURNED value with 3 (`cmp ecx,3`) and only then calls sceSigninDialogTerminate and its own
+//     completion callback. Unregistered, the dispatcher's `return 0` read as NONE forever, so the
+//     title sat on a black screen after its SYSTEM settings page with the guest still running.
+//     Its Open argument is a 16-byte block built on the stack: { u32 size = 0x10; s32 userId;
+//     u64 reserved = 0 } (eboot+0x862cae..0x862cbd).
+//   * A census of every local dump with `tools/re/nid_gate_scan.py --nid Bw31liTFT3A` finds ten
+//     titles importing UpdateStatus, and every classified call site compares the return with a
+//     constant: `cmp eax,3` in Grand Theft Auto V and in PPSA21564 (twice), `cmp r14d,2` (RUNNING)
+//     in Sonic Frontiers. No site treats the value as an error code.
+// Metaphor imports only Initialize/Open/UpdateStatus/Terminate. GetResult stays UNREGISTERED on
+// purpose: its result struct is not pinned by any local call site, and writing a guessed layout
+// would be worse than the fail-visible unimplemented line. Close and GetStatus share the lifecycle
+// above and need no layout.
+// CONFIDENCE: HIGH on the lifecycle and the returned-status convention (guest compare sites in
+// three independent titles); MED that no error returns are needed for out-of-order calls, which no
+// local title exercises.
+namespace {
+std::atomic<int>& signin_dialog_status() {
+    static std::atomic<int> status{0 /*NONE*/};
+    return status;
+}
+}
+HLE(s_signin_dialog_init) {
+    signin_dialog_status().store(1 /*INITIALIZED*/);
+    return 0;
+}
+HLE(s_signin_dialog_open) {
+    int32_t user = 0;
+    if (svc_ptrish(a0)) user = *(const int32_t*)((const char*)PW(a0) + 4);
+    fprintf(stderr, "[svc] sceSigninDialogOpen(userId=%d) -> headless: dismissed, FINISHED\n", user);
+    signin_dialog_status().store(3 /*FINISHED*/);
+    return 0;
+}
+HLE(s_signin_dialog_status) {
+    return (uint64_t)(unsigned)signin_dialog_status().load();
+}
+HLE(s_signin_dialog_close) {
+    signin_dialog_status().store(3 /*FINISHED*/);
+    return 0;
+}
+HLE(s_signin_dialog_term) {
+    signin_dialog_status().store(0 /*NONE*/);
+    return 0;
+}
+
 void register_np_hle() {
     #define R(str, fn) Hle::register_fn(nid_hash(str), (HleFn)(fn), str)
+    // libSceSigninDialog (#3784); NIDs from the PS5 3.20 libSceSigninDialog stub table.
+    Hle::register_fn("mlYGfmqE3fQ", (HleFn)s_signin_dialog_init,   "sceSigninDialogInitialize");
+    Hle::register_fn("JlpJVoRWv7U", (HleFn)s_signin_dialog_open,   "sceSigninDialogOpen");
+    Hle::register_fn("Bw31liTFT3A", (HleFn)s_signin_dialog_status, "sceSigninDialogUpdateStatus");
+    Hle::register_fn("2m077aeC+PA", (HleFn)s_signin_dialog_status, "sceSigninDialogGetStatus");
+    Hle::register_fn("M3OkENHcyiU", (HleFn)s_signin_dialog_close,  "sceSigninDialogClose");
+    Hle::register_fn("LXlmS6PvJdU", (HleFn)s_signin_dialog_term,   "sceSigninDialogTerminate");
     Hle::register_fn("obuxdTiwkF8", (HleFn)s_netctl_getinfo, "sceNetCtlGetInfo");  // NOT_CONNECTED
     Hle::register_fn("0cBgduPRR+M", (HleFn)s_netctl_getresult, "sceNetCtlGetResult");
     // libSceHttp2 lives in src/hle/net/hle_http2.cpp now, sceHttp2Init with it (#2894): the
