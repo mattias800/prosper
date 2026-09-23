@@ -19,7 +19,7 @@ see [`PROGRESS_TRACKER.md`](PROGRESS_TRACKER.md), which is **generated from the 
 and kept in step with them by CI. Neither file is authoritative over a tracker; when this page and
 a tracker disagree, the tracker wins.
 
-Last updated: 2026-08-28
+Last updated: 2026-09-23
 
 ## Summary
 
@@ -79,6 +79,7 @@ Last updated: 2026-08-28
 | *PGA TOUR 2K25* | `PPSA17952` | Unity 6 / IL2CPP | 🔬 Rung 0 — boots in 437 ms, streams its Unity assets and submits real draws, but every frame is black and a worker thread dies parsing a NULL HTTP response header ([#2894](https://github.com/mattias800/prosper/issues/2894)). The PSN `module_start` handshake that killed it at 1.2 s is fixed | [#2895](https://github.com/mattias800/prosper/issues/2895) |
 | *Beast of Reincarnation* | `PPSA29343` | Unreal Engine 5 | 🔬 Rung 1 — the GAME FREAK logo and the game's own Digital Deluxe bonus dialog render at 4K, but only with `PROSPER_CB_EFC_NO_COLOR=1`: on a default launch prosper's unmodelled ELIMINATE_FAST_CLEAR passes paint over the composite and every frame is a flat clear ([#1588](https://github.com/mattias800/prosper/issues/1588)). The pixel shader that writes both scanout buffers now recompiles | [#2916](https://github.com/mattias800/prosper/issues/2916) |
 | *Tomb Raider I-III Remastered* | `PPSA16901` | Custom (Saber) | 🚧 Rung 3 — a pad route clears the title's own 40-page EULA gate (Cross is inert until page 40), reaches the rendered title screen, and enters **Croft Manor**, which now renders with correct geometry — steps, walls, hedges, trees, Lara and Winston all correctly shaped and animating. **The world now renders correctly textured** — Croft Manor's assault course draws its brickwork, sandstone, mossy platforms, gravel and foliage, with Lara and Winston (screenshot: `assets/screenshots/tomb-raider-croft-manor-assault-course.webp`, a genuine render confirmed against the dump's own picture assets). The wrong-texture defect is fixed ([#2998](https://github.com/mattias800/prosper/issues/2998)): the decode cache validated one surface of a 256-layer array — 0.29% of the atlas — so a decode taken while it was nearly empty was reused all run; some text draws the wrong glyphs ([#2999](https://github.com/mattias800/prosper/issues/2999)). The shattered world was one defect: the title's 32-bit index buffers are never announced and were read as 16-bit. Route: `prosper/scripts/tomb-raider-PPSA16901/` | [#2990](https://github.com/mattias800/prosper/issues/2990) |
+| *Outer Wilds* | `PPSA08102` | Unity 2019.4 / IL2CPP | 🚧 Rung 2 — a default Linux launch reaches a live “PRESS X TO START” prompt by about 40 s, over an animated starfield and campfire. [Visual fidelity, gameplay and speed remain unverified.](prosper/docs/OUTER_WILDS_STATUS.md) | [#3804](https://github.com/mattias800/prosper/issues/3804) |
 
 ## At a glance
 
@@ -95,11 +96,11 @@ unmeasured title is never mistaken for a failing one; newly tracked titles start
 | Where the title stops | Titles |
 | --- | --- |
 | **Gameplay reached**, with the scene rendering (rung 3 or better) | 27 |
-| **Title screen or menu** reached, or gameplay reached without a rendered world (rung 2) | 16 |
+| **Title screen or menu** reached, or gameplay reached without a rendered world (rung 2) | 17 |
 | **Below a title screen** — logo or splash only (rung 1) | 3 |
 | **Boots, but no frame with content** (rung 0) | 8 |
 | **Not yet booted** — tracked, no run attempted yet | 0 |
-| Total tracked | 54 |
+| Total tracked | 55 |
 
 Every figure above is re-derived from the rows each time this table is touched, and the buckets now
 sum to the total. They did not before: **rung 0 had no row at all**, so the titles that boot and
@@ -137,15 +138,16 @@ worked. **A rung claim outside the title's own status doc is the copy most likel
 
 ### Where the titles accumulate
 
-The 16 titles at rung 2 — a title screen or menu, or gameplay reached without a rendered world — by
+The 17 titles at rung 2 — a title screen or menu, or gameplay reached without a rendered world — by
 the engine recorded in the table:
 
 | Engine | Titles |
 | --- | --- |
 | Unreal Engine — 10 × UE4, 1 × UE5, 1 unversioned | 12 |
 | Hedgehog Engine, Hedgehog Engine 2, Custom (Ancient), ASOBI — one each | 4 |
+| Unity / IL2CPP | 1 |
 
-**Unreal dominates this group, and it no longer accounts for all of it.** Twelve of the 16 rung-2
+**Unreal dominates this group, and it no longer accounts for all of it.** Twelve of the 17 rung-2
 rows are Unreal, against 18 Unreal rows in the table overall — the other six are one at gameplay
 (*Dragon Quest VII Reimagined*, whose world renders), two at rung 1 (*Little Nightmares II* and
 *Beast of Reincarnation*) and three at rung 0 (*The Lord of the Rings: Gollum*, *The First Berserker:
@@ -153,9 +155,9 @@ Khazan* and *Sifu*). So "every Unreal title stops at a title screen", which this
 is not true in either direction: one has passed it and five have not reached it.
 
 The distribution on the other side is the mirror image: the titles at gameplay are overwhelmingly
-Unity-family, and **no Unity title remains at rung 2 for want of a rendered world.** The rung-2 group
-is twelve Unreal titles plus *Sonic Origins*, *Earthion*, *Astro Bot*, and the one that reaches the
-game loop without a world, *Sonic Frontiers*.
+Unity-family. *Outer Wilds* is the one Unity title in the rung-2 group and has not yet been routed
+past its start prompt. The others are twelve Unreal titles plus *Sonic Origins*, *Earthion*,
+*Astro Bot*, and the one that reaches the game loop without a world, *Sonic Frontiers*.
 
 **This is an observation about where titles accumulate, not a claim that the twelve Unreal titles
 share one root cause** — and this is no longer merely an untested hypothesis in either direction.
@@ -766,6 +768,17 @@ the first ~130 s. After that the composite is a flat white 4K clear for the rema
 ([#2932](https://github.com/mattias800/prosper/issues/2932)). See
 [`prosper/docs/NEVER_BOOTED_SURVEY_2026_08.md`](prosper/docs/NEVER_BOOTED_SURVEY_2026_08.md) and the
 [tracker](https://github.com/mattias800/prosper/issues/2884).
+
+## Outer Wilds — `PPSA08102`
+
+<p align="center"><img src="assets/screenshots/outer-wilds-title-start.webp" alt="Outer Wilds — PRESS X TO START over a starfield and a dim campfire/tree scene, captured on Linux at 60 seconds"></p>
+
+On a default no-input Linux run, the unmodified `tools/screenshot` frontend reaches the live
+“PRESS X TO START” prompt by about 40 seconds; the starfield and campfire scene continue changing
+through the 90-second capture. This establishes a title-start prompt, not verified visual fidelity:
+the game wordmark is absent in sampled prompt frames, and no PS5 comparison is on record. Gameplay
+and speed are untested. See the [status record](prosper/docs/OUTER_WILDS_STATUS.md) and
+[tracker](https://github.com/mattias800/prosper/issues/3804).
 
 ## Reproducible routes
 
