@@ -177,7 +177,6 @@ void report_prior_effect_census(const GpuState& state,
     }
     if (input_count > 16)
         std::fprintf(stderr, "[menu-dependency] inputs omitted=%zu\n", input_count - 16);
-
     std::array<SubmitOperation, kMaxEffects> tail{};
     size_t prior_draws = 0, prior_dispatches = 0, prior_dmas = 0, prior_effects = 0;
     for (const SubmitOperation& operation : planned.first(selected_position)) {
@@ -246,6 +245,102 @@ void report_prior_effect_census(const GpuState& state,
     }
 }
 
+// Diagnostic only: use the existing conservative dependency graph to rank the producers that
+// may feed the selected draw. This neither admits the draw-only capture nor proves a dynamically
+// sampled value; failed or unmaterialized operations leave the graph incomplete.
+void report_prior_effect_graph(const GpuState& state, GpuReplayFrame replay,
+                               std::span<const SubmitOperation> planned,
+                               size_t selected_position, const DrawItem& selected_draw,
+                               uint64_t submit_no) {
+    constexpr size_t kMaxOperations = 512, kMaxReported = 24;
+    if (selected_position >= kMaxOperations || state.dispatches.size() > 128) {
+        std::fprintf(stderr, "[menu-graph] refused: operation bound exceeded\n");
+        return;
+    }
+    std::vector<OperationRealizationFailure> failures;
+    replay.computes = realize_compute_dispatches(state, submit_no, &failures);
+    std::unordered_set<uint64_t> draw_indices, compute_indices;
+    for (const DrawItem& draw : replay.items) draw_indices.insert(draw.draw_index);
+    for (const ComputeItem& compute : replay.computes)
+        compute_indices.insert(compute.dispatch_index);
+    replay.dma_copies.resize(state.dma_copies.size());
+    for (size_t i = 0; i < state.dma_copies.size(); ++i) {
+        const auto& source = state.dma_copies[i];
+        replay.dma_copies[i] = {source.dst, source.src, source.bytes,
+                                source.sels, source.command_order, source.packet_addr};
+    }
+    // The caller has already accumulated a prefix while checking for prior non-draw work.
+    // Rebuild from operation zero so selected_position still names the selected draw.
+    replay.operations.clear();
+    for (const SubmitOperation& operation : planned.first(selected_position + 1)) {
+        const bool realized = operation.kind == SubmitOperationKind::Draw
+            ? draw_indices.contains(operation.index)
+            : operation.kind == SubmitOperationKind::Dispatch
+                ? compute_indices.contains(operation.index)
+                : operation.index < replay.dma_copies.size();
+        replay.operations.push_back({operation.kind, operation.index,
+                                     operation.command_order, realized});
+    }
+    const auto& selected_operation = replay.operations[selected_position];
+    if (selected_operation.kind != SubmitOperationKind::Draw ||
+        selected_operation.source_index != selected_draw.draw_index ||
+        selected_operation.command_order != selected_draw.command_order ||
+        !selected_operation.realized) {
+        std::fprintf(stderr, "[menu-graph] refused: selected operation identity mismatch\n");
+        return;
+    }
+    GpuDependencyGraph graph;
+    std::string graph_error;
+    if (!build_gpu_dependency_graph(replay, graph, graph_error)) {
+        std::fprintf(stderr, "[menu-graph] failed: %s\n", graph_error.c_str());
+        return;
+    }
+    const uint32_t selected = static_cast<uint32_t>(selected_position);
+    size_t incoming = 0, external = 0;
+    for (const auto& edge : graph.edges) incoming += edge.consumer_operation == selected;
+    for (const auto& leaf : graph.external_leaves)
+        external += std::find(leaf.consumer_operations.begin(),
+                              leaf.consumer_operations.end(), selected) !=
+                    leaf.consumer_operations.end();
+    std::fprintf(stderr,
+                 "[menu-graph] submit=%llu selected-op=%u draw=%llu order=%llu "
+                 "realized-compute=%zu "
+                 "compute-failures=%zu incoming=%zu external=%zu "
+                 "scope=declared-resource-graph-only\n",
+                 static_cast<unsigned long long>(submit_no), selected,
+                 static_cast<unsigned long long>(selected_draw.draw_index),
+                 static_cast<unsigned long long>(selected_draw.command_order),
+                 replay.computes.size(), failures.size(), incoming, external);
+    size_t printed = 0;
+    for (const auto& edge : graph.edges) {
+        if (edge.consumer_operation != selected || printed++ >= kMaxReported) continue;
+        const auto& producer = graph.nodes[edge.producer_operation];
+        std::fprintf(stderr,
+                     "[menu-graph] input stage=%s binding=%u addr=0x%llx "
+                     "producer=%u kind=%u source-index=%llu order=%llu\n",
+                     edge.access.stage.c_str(), edge.access.binding,
+                     static_cast<unsigned long long>(edge.access.addr),
+                     edge.producer_operation, static_cast<unsigned>(producer.kind),
+                     static_cast<unsigned long long>(producer.source_index),
+                     static_cast<unsigned long long>(producer.command_order));
+    }
+    if (incoming > kMaxReported)
+        std::fprintf(stderr, "[menu-graph] inputs omitted=%zu\n", incoming - kMaxReported);
+    printed = 0;
+    for (const auto& leaf : graph.external_leaves) {
+        if (std::find(leaf.consumer_operations.begin(), leaf.consumer_operations.end(),
+                      selected) == leaf.consumer_operations.end() || printed++ >= kMaxReported)
+            continue;
+        std::fprintf(stderr,
+                     "[menu-graph] external stage=%s binding=%u addr=0x%llx bytes=%llu\n",
+                     leaf.access.stage.c_str(), leaf.access.binding,
+                     static_cast<unsigned long long>(leaf.access.addr),
+                     static_cast<unsigned long long>(leaf.access.size));
+    }
+    if (external > kMaxReported)
+        std::fprintf(stderr, "[menu-graph] external omitted=%zu\n", external - kMaxReported);
+}
+
 bool prior_writer_to_selected(const GpuState& state, std::vector<DrawItem> draws,
                               const DrawItem& selected, uint64_t submit_no,
                               std::string& error) {
@@ -276,6 +371,8 @@ bool prior_writer_to_selected(const GpuState& state, std::vector<DrawItem> draws
         // not a proof of non-interference.
         if (operation.kind != SubmitOperationKind::Draw) {
             report_prior_effect_census(state, planned, selected_position, selected, submit_no);
+            report_prior_effect_graph(state, std::move(replay), planned,
+                                      selected_position, selected, submit_no);
             error = "dispatch or DMA precedes the selected draw in the same submit";
             return true;
         }
@@ -518,7 +615,22 @@ public:
             (frame.verdict == MenuFrameGateVerdict::MenuWithLogo ||
              frame.verdict == MenuFrameGateVerdict::MenuWithoutLogo);
         const MenuSourceCensusPhase observed_before = census_.phase();
-        if (census_.observe(execution_submit, source_submit, menu, publication_ms)) {
+        const bool exact_source = source_submit != 0 && source_submit == execution_submit;
+        bool has_selected_scene = false;
+        if (menu && exact_source &&
+            (census_.phase() == MenuSourceCensusPhase::WaitingForMenu ||
+             census_.phase() == MenuSourceCensusPhase::WaitingForNewSource)) {
+            for (size_t i = 0; i < state.draws.size(); ++i) {
+                const RenderState rs = extract_render_state(state.state_at_draw(i));
+                if (rs.ps_addr == ps_ && rs.color0_width == target_width_ &&
+                    rs.color0_height == target_height_) {
+                    has_selected_scene = true;
+                    break;
+                }
+            }
+        }
+        if (census_.observe(execution_submit, source_submit, menu, publication_ms,
+                            !exact_source || has_selected_scene)) {
             const MenuTargetChoice choice = report_menu_source_writers(
                 state, realized_draws, execution_submit, source_submit);
             if (!menu_capture_target_matches_request(choice, configured_target_)) {

@@ -64,7 +64,8 @@ public:
     }
 
     bool observe(uint64_t execution_submit, uint64_t source_submit,
-                 bool menu_positive, uint64_t now_ms) {
+                 bool menu_positive, uint64_t now_ms,
+                 bool exact_source_has_selected_scene = true) {
         tick(now_ms);
         if (!menu_positive || phase_ == MenuSourceCensusPhase::Exact ||
             phase_ == MenuSourceCensusPhase::AttemptLimit ||
@@ -73,6 +74,11 @@ public:
             phase_ = MenuSourceCensusPhase::WaitingForNewSource;
             started_ms_ = now_ms;
         }
+        // A menu source can contain only UI over a retained scene. It proves the pixels are
+        // current, but cannot identify the requested scene writer in this submit. Keep the
+        // bounded census open until a menu-positive source actually contains that writer.
+        if (source_submit != 0 && source_submit == execution_submit &&
+            !exact_source_has_selected_scene) return false;
         if (source_submit != 0 && source_submit == execution_submit) {
             phase_ = MenuSourceCensusPhase::Exact;
             return true;

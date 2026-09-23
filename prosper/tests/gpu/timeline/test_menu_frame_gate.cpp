@@ -167,6 +167,15 @@ int main() {
     CHECK(!source_retry.observe(31, 31, true, 31) &&
               source_retry.distinct_retained_sources() == 1,
           "the exact census runs only once");
+    MenuSourceCensusPolicy ui_only_source({.max_distinct_sources = 2, .max_wait_ms = 100});
+    CHECK(!ui_only_source.observe(10, 0, true, 1) &&
+              !ui_only_source.observe(11, 11, true, 2, false) &&
+              !ui_only_source.observe(12, 12, true, 3, false) &&
+              ui_only_source.phase() == MenuSourceCensusPhase::WaitingForNewSource &&
+              ui_only_source.distinct_retained_sources() == 0 &&
+              ui_only_source.observe(13, 13, true, 4, true) &&
+              ui_only_source.phase() == MenuSourceCensusPhase::Exact,
+          "UI-only exact sources must not prevent a later scene-bearing source census");
     MenuSourceCensusPolicy source_limit({.max_distinct_sources = 2, .max_wait_ms = 100});
     CHECK(!source_limit.observe(10, 0, true, 0) &&
               !source_limit.observe(11, 10, true, 1) &&
