@@ -12788,8 +12788,30 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                        r->depth == 1 && !r->in_mip_tail &&
                        !r->layer_mip_offset_bytes && !r->mip_chain_base_level) {
                 if (const auto target_format = storage_target_format(*r)) {
+                    // This snapshot is distinct from architectural guest writeback. Count its
+                    // exact shape and isolated copy time without arming F8's intrusive image dump.
+                    static const bool publication_census =
+                        std::getenv("PROSPER_CPU_RTT_PUBLICATION_CENSUS") != nullptr;
+                    const auto publication_start = publication_census
+                        ? ComputeClock::now() : ComputeClock::time_point{};
                     auto pixels = std::make_shared<std::vector<uint8_t>>(
                         layout_source, layout_source + linear_bytes);
+                    if (publication_census) {
+                        const auto copy_ms = std::chrono::duration<double, std::milli>(
+                            ComputeClock::now() - publication_start).count();
+                        std::fprintf(stderr,
+                                     "[compute-cpu-rtt-publication] code=0x%llx submit=%llu "
+                                     "dispatch=%llu binding=%u addr=0x%llx fmt=%u comps=%u tile=%u "
+                                     "extent=%ux%u linear-bytes=%zu guest-bytes=%zu "
+                                     "gpu-retile=%u direct-retile=%u copy_ms=%.3f\n",
+                                     (unsigned long long)item.code_addr,
+                                     (unsigned long long)item.submit_no,
+                                     (unsigned long long)item.dispatch_index, bi.binding, (unsigned long long)r->gpu_addr,
+                                     (unsigned)r->format, r->num_components, r->tile_mode,
+                                     r->width, r->height, linear_bytes, bi.guest_bytes,
+                                     bi.retile_buffer ? 1u : 0u, bi.direct_retile ? 1u : 0u,
+                                     copy_ms);
+                    }
                     notify_live_render_target_image_written({
                         r->gpu_addr, r->width, r->height, *target_format, std::move(pixels)});
                     if (trace)
