@@ -414,7 +414,11 @@ render-state resolve, executor ordering, detile) — it is the right guard for c
   lines with `--inspect-only`, then run `PROSPER_DEPTH_DUMP=PREFIX gpu_replay
   --through-operation N PATH output.bmp` in a fresh process for each prefix. The dump is a
   quantized grayscale view; its log also reports the guest depth read/write bases, numeric
-  min/max and nonzero counts. Match the bases rather than relying on the run-local `ds0` index.
+  min/max and nonzero counts. The printed depth bases and extent are correlation hints, not a
+  persistent-DS identity: the key also includes stencil read/write bases, HTILE base, format and
+  depth-view slice. When aliases or slices coexist, confirm the full key from `PROSPER_DSLOG`
+  (including its new-entry slice line) and the captured DS seed/draw state; do not rely on the
+  run-local `ds0` index.
   Require a later prefix known to change the depth plane as a positive control before treating
   an earlier unchanged plane as evidence that a draw missed. A depth-only submit may print `Vulkan render
   FAILED` and write zero *color* output because it has no presentation surface; the depth dump
