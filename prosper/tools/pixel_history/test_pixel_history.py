@@ -996,7 +996,7 @@ class ReplaySelection(unittest.TestCase):
             ph.select_history_target(ctl, rd, 0, "ResourceId::9")
         self.assertEqual(tex.resourceId, 9)
         self.assertEqual(source, "explicit capture-local resource id")
-        self.assertEqual((targets, draws, selected_eid, end_eid), (1, 2, 20, 30))
+        self.assertEqual((targets, draws, selected_eid, end_eid), (1, 2, None, 30))
         self.assertEqual(ctl.selected, [(30, True)])
 
     def test_missing_explicit_resource_is_refused_before_replay(self):

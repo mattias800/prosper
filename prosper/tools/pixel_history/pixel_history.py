@@ -517,8 +517,10 @@ def select_history_target(ctl, rd, target_index, resource_id=None):
             raise RuntimeError(f"resource {resource_id} is absent from this capture; "
                                "RenderDoc IDs are capture-local")
         ctl.SetFrameEvent(history_eid, True)
+        # No draw established this identity. Keep the report's selection event null even
+        # when unrelated draws exist elsewhere in the capture.
         return (targets[0], "explicit capture-local resource id", 1,
-                len(draws), last_draw_eid, history_eid)
+                len(draws), None, history_eid)
 
     ctl.SetFrameEvent(last_draw_eid, True)
 
