@@ -2039,6 +2039,10 @@ if(TARGET prosper_core)
   target_link_libraries(test_retrack_reservation PRIVATE prosper_core)
   add_test(NAME retrack_reservation COMMAND test_retrack_reservation)
 
+  add_executable(test_guest_memory_topology tests/hle/memory/test_guest_memory_topology.cpp)
+  target_link_libraries(test_guest_memory_topology PRIVATE prosper_core)
+  add_test(NAME guest_memory_topology COMMAND test_guest_memory_topology)
+
   # Hinted map must not clobber a live mapping (#137): MAP_FIXED_NOREPLACE unless the hint is our
   # own uncommitted reservation. Drives the real map HLE handlers. Linux-only (mmap semantics).
   if(UNIX)

@@ -7,8 +7,8 @@ namespace prosper {
 
 // Relationship between two guest virtual ranges after consulting the kernel-memory mapping table.
 // `Unknown` is intentionally distinct from `Disjoint`: consumers that need an ordering proof must
-// keep fail-closed behavior when either range is untracked, uncommitted, malformed, or crosses a
-// mapping boundary.
+// keep fail-closed behavior when either range is untracked, uncommitted, malformed, or has a
+// mapping gap. Contiguous committed segments are resolved using each segment's own backing.
 enum class GuestMemoryTopologyRelation : uint8_t {
     Unknown,
     Disjoint,
