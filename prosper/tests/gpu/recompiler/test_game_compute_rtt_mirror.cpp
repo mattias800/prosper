@@ -367,6 +367,53 @@ static int run_destination_mirror_regression() {
               "RGBA16F renderer destination equals guest writeback bit for bit");
     }
 
+    // A plain 2D T# can be written through a one-layer DIM=2D_ARRAY instruction.
+    // This is the reflected shape of Outer Wilds' full-resolution Float16 output:
+    // the private storage view must be arrayed, but the renderer and guest surface
+    // remain ordinary 2D. Repaint first so an unchanged-result skip cannot satisfy
+    // the publication assertion without recording this writer.
+    CHECK(!render(rgba16_producer).empty(),
+          "RGBA16F renderer repaints before the one-layer array writer");
+    static const uint32_t store_black_array[] = {
+        0x7E080300u, 0x7E0A0301u, 0x7E0C0280u, // v4=x, v5=y, v6=layer zero
+        0x7E000280u, 0x7E020280u, 0x7E040280u, 0x7E0602F2u,
+        0xF0200F28u, 0x00020004u, 0xBF810000u,
+    };
+    const auto rgba16_array_spirv = recompile_compute(
+        store_black_array, std::size(store_black_array), &rgba16_table, rgba16_config);
+    CHECK(!rgba16_array_spirv.empty(),
+          "one-layer array instruction recompiles for a 2D Float16 descriptor");
+    ComputeItem rgba16_array_full = rgba16_full;
+    rgba16_array_full.spirv = rgba16_array_spirv;
+    rgba16_array_full.code_addr = 0x37310023u;
+    const auto rgba16_array_before =
+        prosper::frontend::live_compute_rtt_destination_mirror_counters();
+    CHECK(!rgba16_array_spirv.empty() &&
+              prosper::frontend::execute_live_compute_items({rgba16_array_full}),
+          "one-layer array writer completes into the ordinary 2D guest surface");
+    const auto rgba16_array_after =
+        prosper::frontend::live_compute_rtt_destination_mirror_counters();
+    bool rgba16_array_expected = true;
+    for (size_t i = 0; i < rgba16_words.size(); ++i)
+        rgba16_array_expected &= rgba16_words[i] == rgba16_black[i % 4u];
+    CHECK(rgba16_array_expected,
+          "one-layer array writer publishes exact half-float guest bytes");
+    if (!rgba16_mirror_disabled) {
+        CHECK(rgba16_array_after.candidates == rgba16_array_before.candidates + 1 &&
+                  rgba16_array_after.recorded == rgba16_array_before.recorded + 1 &&
+                  rgba16_array_after.published == rgba16_array_before.published + 1,
+              "completed one-layer array writer publishes through the renderer mirror");
+        std::vector<uint8_t> rgba16_array_pixels;
+        std::string rgba16_array_error;
+        CHECK(prosper::test::readback_persistent_color_target(
+                  rgba16_address, W, H, VK_FORMAT_R16G16B16A16_SFLOAT,
+                  rgba16_array_pixels, rgba16_array_error) &&
+                  rgba16_array_pixels.size() == rgba16_words.size() * sizeof(uint16_t) &&
+                  std::memcmp(rgba16_array_pixels.data(), rgba16_words.data(),
+                              rgba16_array_pixels.size()) == 0,
+              "one-layer array mirror pixels equal exact guest half-float writeback");
+    }
+
     CHECK(!render(rgba16_producer).empty(),
           "RGBA16F renderer repaints its image before the partial write");
     std::vector<uint8_t> rgba16_seed;

@@ -7630,9 +7630,15 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // raw guest memory (empty/stale — the Dead Cells 642x362 lesson).
             const bool dim_1d = r->img_dim == 0;
             const bool dim_3d = r->img_dim == 2;
-            const bool dim_2d_array = r->img_dim == 5 &&
-                                      image_descriptors[i].image_dim == 1u &&
-                                      image_descriptors[i].image_arrayed;
+            // Some one-layer 2D descriptors are written by a DIM=2D_ARRAY instruction.
+            // The reflected module still needs a 2D-array view, while guest tiling and
+            // writeback remain the ordinary one-layer 2D layout.
+            const bool dim_2d_array = image_descriptors[i].image_dim == 1u &&
+                                      image_descriptors[i].image_arrayed &&
+                                      (r->img_dim == 5 ||
+                                       (bi.storage && r->img_dim == 1 && r->depth == 1 &&
+                                        !r->depth_compare &&
+                                        !image_descriptors[i].image_multisampled));
             // A cube T# bound as a 2D-ARRAY STORAGE image -- Sonic Frontiers' Cyber Space compute
             // `0x200581bb00`, guest `dim=3` 32x32x6 against `shader{dim=1 arrayed=1 storage=1}` --
             // is deliberately NOT admitted here, and stays in the skip. Binding it is the easy

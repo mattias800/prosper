@@ -570,7 +570,7 @@ void inspect_table(const char* stage, const prosper::gpu::ShaderResourceTable* t
         });
         std::printf("  %s %-7s b=%u addr=%016llx declared=%u footprint=%llu captured=%llu "
                     "nz=%zu hash=%016llx first=%08x "
-                    "fmt=%u nc=%u stride=%u %ux%ux%u tile=%u row-pitch=%u layer=%u+%u "
+                    "fmt=%u nc=%u stride=%u %ux%ux%u dim=%u srgb=%u tile=%u row-pitch=%u layer=%u+%u "
                     "mip-levels=%u in-tail=%u tail-off=%u tail-bytes=%u tail-xy=%u,%u "
                     "addr=%u%u%u swz=%u%u%u%u filt=%u/%u/%u "
                     "dcc=%u meta=%016llx meta-bytes=%llu/%llu meta-nz=%zu meta-unique=%zu "
@@ -583,7 +583,8 @@ void inspect_table(const char* stage, const prosper::gpu::ShaderResourceTable* t
                     static_cast<unsigned long long>(r.host_data_size), nz,
                     static_cast<unsigned long long>(hash), first,
                     static_cast<unsigned>(r.format), r.num_components, r.stride,
-                    r.width, r.height, r.depth, r.tile_mode, r.linear_row_pitch_bytes,
+                    r.width, r.height, r.depth, r.img_dim, static_cast<unsigned>(r.srgb),
+                    r.tile_mode, r.linear_row_pitch_bytes,
                     r.layer_stride_bytes, r.layer_mip_offset_bytes,
                     // A packed mip tail resolves the level's origin INSIDE a shared block, so a
                     // level's real texels are at tail-xy, not (0,0). #1578 was a wrong element
@@ -966,8 +967,12 @@ void inspect_frame(const prosper::gpu::GpuReplayFrame& replay, uint32_t format_v
                     static_cast<unsigned long long>(prosper::gpu::gpu_capture_hash(
                         reinterpret_cast<const uint8_t*>(c.spirv.data()), c.spirv.size() * 4)),
                     raw_available ? "yes" : "no");
-        if (c.recompile_config_available)
+        if (c.recompile_config_available) {
+            std::printf("    compute-contract program=%016llx native-storage-formats=%08x\n",
+                        static_cast<unsigned long long>(c.code_addr),
+                        c.recompile_config.native_storage_format_support);
             print_user_sgprs(c.code_addr, "realized", c.recompile_config.user_sgprs);
+        }
         inspect_table("CS", c.resources.get(), replay.rtt_seeds);
     }
     for (size_t i = 0; i < replay.dma_copies.size(); ++i) {
