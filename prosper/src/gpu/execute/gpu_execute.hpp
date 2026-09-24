@@ -128,9 +128,28 @@ struct DrawItem {
         uint64_t base = 0;
         uint32_t width = 0, height = 0;
         // A zero depth means the capture/draw has no proven 3D attachment shape. These fields
-        // describe the allocation and the bounded, inclusive guest view independently.
-        uint32_t volume_depth = 0, first_slice = 0, slice_count = 0;
+        // describe the selected mip's physical depth and bounded guest view independently.
+        uint32_t selected_mip_depth = 0, first_slice = 0, slice_count = 0;
         uint32_t programmed_slice_max = 0; // raw inclusive VIEW endpoint, even if out of range
+
+        constexpr void mirror_named_identity(uint64_t named_base, uint32_t named_width,
+                                             uint32_t named_height) {
+            if (base != named_base || width != named_width || height != named_height)
+                *this = {}; // a stale array entry cannot lend its volume view to another surface
+            base = named_base;
+            width = named_width;
+            height = named_height;
+        }
+
+        constexpr bool volume_view_consistent() const {
+            if (!selected_mip_depth)
+                return !first_slice && !slice_count && !programmed_slice_max;
+            if (first_slice >= selected_mip_depth || programmed_slice_max < first_slice)
+                return slice_count == 0u;
+            const uint32_t last = programmed_slice_max < selected_mip_depth
+                ? programmed_slice_max : selected_mip_depth - 1u;
+            return slice_count == last - first_slice + 1u;
+        }
     };
     std::array<ColorTargetBinding, kColorTargetCount> color_targets{};
     uint64_t draw_index = 0;
@@ -1737,18 +1756,16 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
             binding.width = rs.color_targets[slot].width;
             binding.height = rs.color_targets[slot].height;
             const auto volume = color_target_volume_view(rs.color_targets[slot]);
-            binding.volume_depth = volume.allocation_depth;
+            binding.selected_mip_depth = volume.selected_mip_depth;
             binding.first_slice = volume.first_slice;
             binding.slice_count = volume.slice_count;
-            binding.programmed_slice_max = volume.slice_count
+            binding.programmed_slice_max = volume.selected_mip_depth
                 ? rs.color_targets[slot].slice_max : 0u;
         }
-        failure->color_targets[0].base = failure->color0_base;
-        failure->color_targets[0].width = failure->color0_width;
-        failure->color_targets[0].height = failure->color0_height;
-        failure->color_targets[1].base = failure->color1_base;
-        failure->color_targets[1].width = failure->color1_width;
-        failure->color_targets[1].height = failure->color1_height;
+        failure->color_targets[0].mirror_named_identity(
+            failure->color0_base, failure->color0_width, failure->color0_height);
+        failure->color_targets[1].mirror_named_identity(
+            failure->color1_base, failure->color1_width, failure->color1_height);
         failure->vertex_count = vcount_hint;
         failure->instance_count = draw ? draw->instance_count : ds.num_instances;
     }
@@ -2609,19 +2626,17 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
         binding.width = rs.color_targets[slot].width;
         binding.height = rs.color_targets[slot].height;
         const auto volume = color_target_volume_view(rs.color_targets[slot]);
-        binding.volume_depth = volume.allocation_depth;
+        binding.selected_mip_depth = volume.selected_mip_depth;
         binding.first_slice = volume.first_slice;
         binding.slice_count = volume.slice_count;
-        binding.programmed_slice_max = volume.slice_count
+        binding.programmed_slice_max = volume.selected_mip_depth
             ? rs.color_targets[slot].slice_max : 0u;
     }
     // Preserve direct/synthetic callers that still populate only the named aliases.
-    out.color_targets[0].base = out.color0_base;
-    out.color_targets[0].width = out.color0_width;
-    out.color_targets[0].height = out.color0_height;
-    out.color_targets[1].base = out.color1_base;
-    out.color_targets[1].width = out.color1_width;
-    out.color_targets[1].height = out.color1_height;
+    out.color_targets[0].mirror_named_identity(out.color0_base, out.color0_width,
+                                               out.color0_height);
+    out.color_targets[1].mirror_named_identity(out.color1_base, out.color1_width,
+                                               out.color1_height);
     return true;
 }
 

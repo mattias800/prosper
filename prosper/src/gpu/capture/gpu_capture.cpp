@@ -432,12 +432,10 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
         d.color1_base = x.color1_base;
         d.color1_width = x.color1_width; d.color1_height = x.color1_height;
         d.color_targets = x.color_targets;
-        d.color_targets[0].base = d.color0_base;
-        d.color_targets[0].width = d.color0_width;
-        d.color_targets[0].height = d.color0_height;
-        d.color_targets[1].base = d.color1_base;
-        d.color_targets[1].width = d.color1_width;
-        d.color_targets[1].height = d.color1_height;
+        d.color_targets[0].mirror_named_identity(d.color0_base, d.color0_width,
+                                                  d.color0_height);
+        d.color_targets[1].mirror_named_identity(d.color1_base, d.color1_width,
+                                                  d.color1_height);
         d.draw_index = x.draw_index; d.command_order = x.command_order;
         d.vs_raw_shader_index = x.vs_raw_shader_index;
         d.fs_raw_shader_index = x.fs_raw_shader_index;

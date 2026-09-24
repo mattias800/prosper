@@ -1036,26 +1036,45 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
     // a fixed-size record so failed producer draws can be inspected as well as realized draws.
     auto write_volume_views = [&](const auto& bindings) {
         for (const auto& binding : bindings) {
-            if ((!binding.volume_depth && (binding.first_slice || binding.slice_count ||
-                 binding.programmed_slice_max)) ||
-                (binding.volume_depth && (!binding.slice_count ||
-                 binding.first_slice >= binding.volume_depth ||
-                 binding.slice_count > binding.volume_depth - binding.first_slice ||
-                 binding.programmed_slice_max < binding.first_slice))) {
+            if (!binding.volume_view_consistent()) {
                 error = "invalid color-target volume view";
                 return false;
             }
-            w.u32(binding.volume_depth);
+            w.u32(binding.selected_mip_depth);
             w.u32(binding.first_slice);
             w.u32(binding.slice_count);
             w.u32(binding.programmed_slice_max);
         }
         return true;
     };
+    auto volume_alias_valid = [&](const auto& bindings, uint64_t base0, uint32_t width0,
+                                  uint32_t height0, uint64_t base1, uint32_t width1,
+                                  uint32_t height1) {
+        for (uint32_t slot = 0; slot < 2u; ++slot) {
+            const auto& binding = bindings[slot];
+            if (!binding.selected_mip_depth) continue;
+            const uint64_t named_base = slot ? base1 : base0;
+            const uint32_t named_width = slot ? width1 : width0;
+            const uint32_t named_height = slot ? height1 : height0;
+            if (binding.base != named_base || binding.width != named_width ||
+                binding.height != named_height) {
+                error = "invalid color-target volume alias";
+                return false;
+            }
+        }
+        return true;
+    };
     for (const auto& draw : c.draws)
-        if (!write_volume_views(draw.color_targets)) return false;
+        if (!volume_alias_valid(draw.color_targets, draw.color0_base, draw.color0_width,
+                                draw.color0_height, draw.color1_base, draw.color1_width,
+                                draw.color1_height) ||
+            !write_volume_views(draw.color_targets)) return false;
     for (const auto& diagnostic : c.failure_diagnostics)
-        if (!write_volume_views(diagnostic.color_targets)) return false;
+        if (!volume_alias_valid(diagnostic.color_targets, diagnostic.color0_base,
+                                diagnostic.color0_width, diagnostic.color0_height,
+                                diagnostic.color1_base, diagnostic.color1_width,
+                                diagnostic.color1_height) ||
+            !write_volume_views(diagnostic.color_targets)) return false;
     // Re-check the ceiling AFTER the final tail. The bound above was enforced before this tail
     // existed, so a capture sitting just under the maximum could serialize successfully into a file
     // that read_gpu_capture then rejects as oversized -- a write that reports success and produces

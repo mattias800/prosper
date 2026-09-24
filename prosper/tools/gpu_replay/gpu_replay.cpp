@@ -605,6 +605,18 @@ void inspect_table(const char* stage, const prosper::gpu::ShaderResourceTable* t
 }
 
 void inspect_frame(const prosper::gpu::GpuReplayFrame& replay, uint32_t format_version) {
+    auto print_volume_views = [](const auto& bindings) {
+        for (uint32_t slot = 0; slot < bindings.size(); ++slot) {
+            const auto& target = bindings[slot];
+            if (!target.selected_mip_depth) continue;
+            // The bounded range is physical image coverage, not proof that a guest producer
+            // actually exported every layer. Keep the raw inclusive endpoint visible beside it.
+            std::printf("  target-volume slot=%u mip-depth=%u raw-start=%u raw-max=%u "
+                        "bounded-start=%u bounded-count=%u\n",
+                        slot, target.selected_mip_depth, target.first_slice,
+                        target.programmed_slice_max, target.first_slice, target.slice_count);
+        }
+    };
     for (const auto& provenance : replay.resource_provenance) {
         const auto& realization = replay.blobs[provenance.realization_blob_index];
         const auto& post = replay.blobs[provenance.post_blob_index];
@@ -802,6 +814,7 @@ void inspect_frame(const prosper::gpu::GpuReplayFrame& replay, uint32_t format_v
                     fs.words->size(), static_cast<unsigned long long>(prosper::gpu::gpu_capture_hash(
                         reinterpret_cast<const uint8_t*>(fs.words->data()), fs.words->size() * 4)),
                     fs.shared ? "shared" : "owned");
+        print_volume_views(d.color_targets);
         // Blend detail: UI compositing correctness hangs on the exact color AND alpha factor
         // programming (a separate-alpha UI backdrop writes a different alpha than its color
         // factors imply — #320's dialogue overlay), so make the full equation inspectable.
@@ -1009,6 +1022,7 @@ void inspect_frame(const prosper::gpu::GpuReplayFrame& replay, uint32_t format_v
                                 failure.pipeline.stencil_op_val[1]);
             }
             std::printf("\n");
+            print_volume_views(failure.color_targets);
             // #1459: a suppressed draw is usually suppressed BECAUSE its resolved write mask is
             // zero, so the raw registers behind that mask are exactly what this population needs to
             // explain. Realized draws print the same line; without it here the no-effect draws --

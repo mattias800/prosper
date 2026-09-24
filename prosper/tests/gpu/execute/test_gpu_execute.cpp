@@ -289,7 +289,7 @@ int main() {
         const bool made = realize_draw_item(volume, &volume.draws[0],
                                             volume.draws[0].index_count, 0x10000u,
                                             false, volume_draw);
-        CHECK(made && volume_draw.color_targets[0].volume_depth == 32u &&
+        CHECK(made && volume_draw.color_targets[0].selected_mip_depth == 32u &&
                   volume_draw.color_targets[0].first_slice == 0u &&
                   volume_draw.color_targets[0].slice_count == 32u &&
                   volume_draw.color_targets[0].programmed_slice_max == 32u,
@@ -2224,7 +2224,7 @@ int main() {
             CHECK(read && reason == RealizationFailureReason::MissingProgram,
                   "#1636: an unbound shader program records reason=missing-program");
             CHECK(read && captured.failure_diagnostics.size() == 1u &&
-                      captured.failure_diagnostics[0].color_targets[0].volume_depth == 32u &&
+                      captured.failure_diagnostics[0].color_targets[0].selected_mip_depth == 32u &&
                       captured.failure_diagnostics[0].color_targets[0].first_slice == 0u &&
                       captured.failure_diagnostics[0].color_targets[0].slice_count == 32u &&
                       captured.failure_diagnostics[0].color_targets[0].programmed_slice_max == 32u,

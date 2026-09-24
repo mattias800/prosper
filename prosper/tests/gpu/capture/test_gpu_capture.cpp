@@ -1224,7 +1224,7 @@ int main(int argc, char** argv) {
         GpuCaptureFile volume_view_loaded;
         CHECK(serialize_gpu_capture(volume_view, volume_view_bytes, error) &&
                   deserialize_gpu_capture(volume_view_bytes, volume_view_loaded, error) &&
-                  volume_view_loaded.draws[0].color_targets[0].volume_depth == 32u &&
+                  volume_view_loaded.draws[0].color_targets[0].selected_mip_depth == 32u &&
                   volume_view_loaded.draws[0].color_targets[0].slice_count == 32u &&
                   volume_view_loaded.draws[0].color_targets[0].programmed_slice_max == 32u &&
                   volume_view_loaded.draws[0].color_targets[2].first_slice == 8u &&
@@ -1235,20 +1235,59 @@ int main(int argc, char** argv) {
         old_view_bytes[8] = 58u;
         GpuCaptureFile old_view_loaded;
         CHECK(deserialize_gpu_capture(old_view_bytes, old_view_loaded, error) &&
-                  old_view_loaded.draws[0].color_targets[0].volume_depth == 0u &&
+                  old_view_loaded.draws[0].color_targets[0].selected_mip_depth == 0u &&
                   old_view_loaded.draws[0].color_targets[0].programmed_slice_max == 0u &&
                   old_view_loaded.draws[0].color_targets[2].slice_count == 0u,
               "v58 captures reopen without inventing a layered color-target view");
+        DrawItem divergent_draw = tail_draw;
+        divergent_draw.color0_base = target.color0_base;
+        divergent_draw.color0_width = divergent_draw.color0_height = 32u;
+        divergent_draw.color_targets[0] = {
+            target.color0_base + 0x10000u, 32u, 32u, 32u, 0u, 32u, 31u};
+        GpuCaptureFile normalized_divergent;
+        CHECK(capture_draw_items({divergent_draw}, meta, tail_reader,
+                                 normalized_divergent, error) &&
+                  normalized_divergent.draws.size() == 1u &&
+                  normalized_divergent.draws[0].color_targets[0].base == target.color0_base &&
+                  normalized_divergent.draws[0].color_targets[0].selected_mip_depth == 0u,
+              "capture collection does not lend a stale array view to the named target");
+        GpuCaptureFile invalid_alias = volume_view;
+        invalid_alias.draws[0].color_targets[0].base += 0x10000u;
+        CHECK(!serialize_gpu_capture(invalid_alias, volume_view_bytes, error) &&
+                  error == "invalid color-target volume alias",
+              "direct capture writer refuses a divergent named/array volume alias");
+        GpuCaptureFile out_of_bounds_view = volume_view;
+        out_of_bounds_view.draws[0].color_targets[0] = {
+            target.color0_base, 32u, 32u, 32u, 32u, 0u, 32u};
+        std::vector<uint8_t> out_of_bounds_bytes;
+        GpuCaptureFile out_of_bounds_loaded;
+        CHECK(serialize_gpu_capture(out_of_bounds_view, out_of_bounds_bytes, error) &&
+                  deserialize_gpu_capture(out_of_bounds_bytes, out_of_bounds_loaded, error) &&
+                  out_of_bounds_loaded.draws[0].color_targets[0].selected_mip_depth == 32u &&
+                  out_of_bounds_loaded.draws[0].color_targets[0].first_slice == 32u &&
+                  out_of_bounds_loaded.draws[0].color_targets[0].slice_count == 0u &&
+                  out_of_bounds_loaded.draws[0].color_targets[0].programmed_slice_max == 32u,
+              "v59 preserves an out-of-bounds raw view without inventing a renderable slice");
         std::vector<uint8_t> invalid_view_bytes = volume_view_bytes;
         const size_t count_offset = invalid_view_bytes.size() - v59_tail(volume_view) + 8u;
         invalid_view_bytes[count_offset] = 33u;
         CHECK(!deserialize_gpu_capture(invalid_view_bytes, volume_view_loaded, error) &&
                   error == "invalid color-target volume view",
               "v59 reader rejects an overlarge view from an on-disk capture");
+        invalid_view_bytes = volume_view_bytes;
+        invalid_view_bytes[count_offset + 4u] = 0u; // raw max 32 -> 0, count stays 32
+        CHECK(!deserialize_gpu_capture(invalid_view_bytes, volume_view_loaded, error) &&
+                  error == "invalid color-target volume view",
+              "v59 reader rejects a bounded view wider than its raw programmed endpoint");
         volume_view.draws[0].color_targets[0].slice_count = 33u;
         CHECK(!serialize_gpu_capture(volume_view, volume_view_bytes, error) &&
                   error == "invalid color-target volume view",
               "v59 writer rejects a view that exceeds its allocation");
+        volume_view.draws[0].color_targets[0].slice_count = 32u;
+        volume_view.draws[0].color_targets[0].programmed_slice_max = 0u;
+        CHECK(!serialize_gpu_capture(volume_view, volume_view_bytes, error) &&
+                  error == "invalid color-target volume view",
+              "v59 writer rejects a bounded view wider than its raw programmed endpoint");
     }
     {
         const ShaderResource& tail_chain = tail_loaded.draws[0].vrt.resources[0].resource;

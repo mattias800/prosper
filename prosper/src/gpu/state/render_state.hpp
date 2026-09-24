@@ -50,28 +50,33 @@ struct ColorTargetState {
 };
 
 struct ColorTargetVolumeView {
-    uint32_t allocation_depth = 0;
+    uint32_t selected_mip_depth = 0; // physical depth after selecting CB_COLORn_VIEW.MIP_LEVEL
     uint32_t first_slice = 0;
     uint32_t slice_count = 0; // zero means no proven renderable volume view
-    bool clipped_to_allocation = false;
+    bool clipped_to_mip = false;
 };
 
 // GFX10's 3D CB view uses inclusive SLICE_MAX (PAL's 3D color-target setup writes
-// start + extent - 1), but a programmed maximum can exceed ATTRIB3's allocation depth.
+// start + extent - 1), but a programmed maximum can exceed the selected mip's depth.
 // The physical image bounds the renderable range: do not invent a slice beyond it, and keep
 // the clipping observable for callers. An absent register or impossible interval declines.
 constexpr ColorTargetVolumeView color_target_volume_view(const ColorTargetState& target) {
     ColorTargetVolumeView view;
-    if (!target.has_view || !target.has_attrib3 || target.resource_type != 2u ||
-        target.slice_max < target.slice_start)
+    if (!target.has_view || !target.has_attrib3 || target.resource_type != 2u)
         return view;
-    view.allocation_depth = (target.mip0_depth + 1u) >> target.mip_level;
-    if (!view.allocation_depth) view.allocation_depth = 1u;
-    if (target.slice_start >= view.allocation_depth) return {};
+    view.selected_mip_depth = (target.mip0_depth + 1u) >> target.mip_level;
+    if (!view.selected_mip_depth) view.selected_mip_depth = 1u;
     view.first_slice = target.slice_start;
-    view.clipped_to_allocation = target.slice_max >= view.allocation_depth;
-    const uint32_t last = view.clipped_to_allocation
-        ? view.allocation_depth - 1u : target.slice_max;
+    // Keep malformed or wholly out-of-allocation programming observable. No slices from either
+    // interval may be rendered, but dropping the raw view here would hide why the draw declined.
+    if (target.slice_max < target.slice_start ||
+        target.slice_start >= view.selected_mip_depth) {
+        view.clipped_to_mip = target.slice_start >= view.selected_mip_depth;
+        return view;
+    }
+    view.clipped_to_mip = target.slice_max >= view.selected_mip_depth;
+    const uint32_t last = view.clipped_to_mip
+        ? view.selected_mip_depth - 1u : target.slice_max;
     view.slice_count = last - view.first_slice + 1u;
     return view;
 }

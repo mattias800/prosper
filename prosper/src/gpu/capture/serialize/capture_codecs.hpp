@@ -299,12 +299,10 @@ inline bool read_color_target_pipeline(Reader& r, ResolvedPipelineState::ColorTa
 }
 
 inline void restore_legacy_color_target_aliases(GpuCapturedDraw& draw) {
-    draw.color_targets[0].base = draw.color0_base;
-    draw.color_targets[0].width = draw.color0_width;
-    draw.color_targets[0].height = draw.color0_height;
-    draw.color_targets[1].base = draw.color1_base;
-    draw.color_targets[1].width = draw.color1_width;
-    draw.color_targets[1].height = draw.color1_height;
+    draw.color_targets[0].mirror_named_identity(draw.color0_base, draw.color0_width,
+                                                 draw.color0_height);
+    draw.color_targets[1].mirror_named_identity(draw.color1_base, draw.color1_width,
+                                                 draw.color1_height);
     auto& target0 = draw.ps.color_targets[0];
     target0.format = draw.ps.color0_format; target0.has_clear = draw.ps.has_clear_color;
     std::copy(std::begin(draw.ps.clear_color), std::end(draw.ps.clear_color), target0.clear);
@@ -330,12 +328,10 @@ inline void restore_legacy_color_target_aliases(GpuCapturedDraw& draw) {
 }
 
 inline void restore_legacy_color_target_aliases(GpuCapturedOperationFailure& diagnostic) {
-    diagnostic.color_targets[0].base = diagnostic.color0_base;
-    diagnostic.color_targets[0].width = diagnostic.color0_width;
-    diagnostic.color_targets[0].height = diagnostic.color0_height;
-    diagnostic.color_targets[1].base = diagnostic.color1_base;
-    diagnostic.color_targets[1].width = diagnostic.color1_width;
-    diagnostic.color_targets[1].height = diagnostic.color1_height;
+    diagnostic.color_targets[0].mirror_named_identity(
+        diagnostic.color0_base, diagnostic.color0_width, diagnostic.color0_height);
+    diagnostic.color_targets[1].mirror_named_identity(
+        diagnostic.color1_base, diagnostic.color1_width, diagnostic.color1_height);
     if (!diagnostic.pipeline_present) return;
     GpuCapturedDraw aliases;
     aliases.ps = diagnostic.pipeline;
