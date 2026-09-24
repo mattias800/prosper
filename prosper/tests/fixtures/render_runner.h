@@ -7565,9 +7565,10 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     // late-Z strip without a shader Z export, to test the state split observed in a Sonic stage
     // bundle. Mode 5 suppresses the ordinary write of ALWAYS clear draws like mode 2, but keeps
     // the default full-scissor clear on every draw admitted by the default gate (the missing 2x2
-    // control). Mode 6 substitutes the programmed value only through fragment coverage on EVERY
-    // default-gate draw. It tests whether the full-scissor operation alone flattens caster depth;
-    // it does not assert that sticky-bit casters are hardware clear draws.
+    // control). Mode 6 collapses viewport depth on EVERY default-gate draw. This confines depth
+    // writes to fragment coverage, but the constant also participates in the depth test, so mode 6
+    // does not isolate a hypothetical write-only clear-value substitution. It does not assert that
+    // sticky-bit casters are hardware clear draws.
     // None of these modes establishes the hardware clear predicate.
     static const int sonic_clear_probe = [] {
         const char* value = std::getenv("PROSPER_DIAG_CLEAR_OVERWRITE");
