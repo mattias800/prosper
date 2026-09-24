@@ -1075,6 +1075,43 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
                                 diagnostic.color1_base, diagnostic.color1_width,
                                 diagnostic.color1_height) ||
             !write_volume_views(diagnostic.color_targets)) return false;
+    // v60 tail: a failed vertex chain needs the same graphics ABI that the live compiler saw.
+    // The presence byte keeps early failures (and old captures) visibly distinct from defaults.
+    for (const auto& diagnostic : c.failure_diagnostics) {
+        const bool available = diagnostic.vertex_retry_config_available;
+        if ((!available && (diagnostic.vertex_lds_dwords || diagnostic.has_pixel_inputs ||
+                            diagnostic.pixel_inputs.valid_mask ||
+                            diagnostic.pixel_inputs.passthrough_mask ||
+                            diagnostic.pixel_inputs.consumed_mask ||
+                            diagnostic.pixel_inputs.consumed_known ||
+                            diagnostic.capture_vertex_position)) ||
+            (available && (diagnostic.kind != SubmitOperationKind::Draw ||
+            diagnostic.vertex_lds_dwords > 16384u ||
+            (diagnostic.has_pixel_inputs && !diagnostic.pixel_inputs.valid_mask) ||
+            (!diagnostic.has_pixel_inputs &&
+             (diagnostic.pixel_inputs.valid_mask ||
+              diagnostic.pixel_inputs.passthrough_mask ||
+              diagnostic.pixel_inputs.consumed_mask ||
+              diagnostic.pixel_inputs.consumed_known)) ||
+            (diagnostic.pixel_inputs.passthrough_mask &
+             ~diagnostic.pixel_inputs.valid_mask)))) {
+            error = "invalid failed-draw vertex retry config";
+            return false;
+        }
+        w.u8(available ? 1u : 0u);
+        if (!available) continue;
+        w.u32(diagnostic.vertex_lds_dwords);
+        const uint8_t flags = (diagnostic.has_pixel_inputs ? 1u : 0u) |
+                              (diagnostic.capture_vertex_position ? 2u : 0u);
+        w.u8(flags);
+        if (diagnostic.has_pixel_inputs) {
+            w.u32(diagnostic.pixel_inputs.valid_mask);
+            w.u32(diagnostic.pixel_inputs.passthrough_mask);
+            for (uint32_t control : diagnostic.pixel_inputs.controls) w.u32(control);
+            w.u32(diagnostic.pixel_inputs.consumed_mask);
+            w.u8(diagnostic.pixel_inputs.consumed_known ? 1u : 0u);
+        }
+    }
     // Re-check the ceiling AFTER the final tail. The bound above was enforced before this tail
     // existed, so a capture sitting just under the maximum could serialize successfully into a file
     // that read_gpu_capture then rejects as oversized -- a write that reports success and produces

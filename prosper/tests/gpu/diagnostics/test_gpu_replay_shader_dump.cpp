@@ -1,6 +1,7 @@
 #include "../tools/gpu_replay/realized_shader_dump.hpp"
 #include "../tools/gpu_replay/compute_recompile.hpp"
 #include "gpu/diagnostics/diagnostic_selectors.hpp"
+#include "gpu/recompiler/rdna2_to_spirv.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -362,13 +363,164 @@ int main(int argc, char** argv) {
         draw_fixture.failure_diagnostics[0].instance_count = 32;
         draw_fixture.failure_diagnostics[0].reason = gpu::RealizationFailureReason::ShaderRecompile;
         auto& layered = draw_fixture.failure_diagnostics[0];
+        layered.pipeline_present = true;
+        layered.pipeline.color_targets[0].write_mask = 0xf;
         layered.color0_base = 0x309cbf0000ull;
         layered.color0_width = layered.color0_height = 32u;
         layered.color_targets[0] = {
             layered.color0_base, 32u, 32u, 32u, 0u, 32u, 32u};
+        // The next slot retains a programmed 3D view but has no color writes. The inspector
+        // must display that distinction; view presence alone does not prove a second producer.
+        layered.color1_base = 0x304edd0000ull;
+        layered.color1_width = layered.color1_height = 64u;
+        layered.color_targets[1] = {
+            layered.color1_base, 64u, 64u, 64u, 0u, 64u, 64u};
         CHECK(gpu::write_gpu_capture((directory / "known-instances.prgcap").string(),
                                      draw_fixture, error),
-              "CLI fixture writes a failed draw with 32 instances and a 3D target view");
+              "CLI fixture writes a failed draw with active and inactive 3D target views");
+        // A real split NGG chain whose all-ones MBCNT must still reject in the one-lane vertex
+        // route. This guards the retry tool's terminal-reason plumbing, not shader admission.
+        gpu::GpuCaptureFile chain_fixture;
+        chain_fixture.metadata.width = chain_fixture.metadata.height = 1;
+        chain_fixture.failure_diagnostics_available = true;
+        chain_fixture.operations.push_back({gpu::SubmitOperationKind::Draw, 0, 1, false});
+        gpu::GpuCaptureRawShaderVersion chain_prolog;
+        chain_prolog.words = {0xBFA00003u, 0x4A0A0A81u, 0xBE802006u,
+                              0xBF9F0000u, 0xBF9F0000u};
+        chain_prolog.content_hash = gpu::gpu_capture_hash(
+            reinterpret_cast<const uint8_t*>(chain_prolog.words.data()),
+            chain_prolog.words.size() * sizeof(uint32_t));
+        gpu::GpuCaptureRawShaderVersion chain_main;
+        chain_main.words = {
+            0xBEEA03FFu, 0x00080000u, 0x94FE6AC1u, 0xBEFE04C1u,
+            0xBEEA03FFu, 0x00080000u, 0x94EA6AC1u, 0xBEFE046Au, 0xBEFE04C1u,
+            0xD7650007u, 0x000100C1u, 0xD7660009u, 0x00020EC1u,
+            0x93EAFF03u, 0x00080008u, 0x876BFF03u, 0x000000FFu, 0x8F6A8C6Au,
+            0x887C6A6Bu, 0xBF900009u, 0x906A8803u, 0x81EA6A80u, 0x90FE6AC1u,
+            0xF8000941u, 0x00000000u, 0x81EA0380u, 0x90FE6AC1u,
+            0x34040A81u, 0x36060AC2u, 0x7E000280u, 0x7E0202F2u,
+            0x36040482u, 0x4A0606C1u, 0x4A0404C1u, 0x7E060B03u, 0x7E040B02u,
+            0xF80008CFu, 0x01000302u, 0xBF810000u};
+        chain_main.has_endpgm = true;
+        chain_main.content_hash = gpu::gpu_capture_hash(
+            reinterpret_cast<const uint8_t*>(chain_main.words.data()),
+            chain_main.words.size() * sizeof(uint32_t));
+        chain_fixture.raw_shader_versions = {chain_prolog, chain_main};
+        gpu::GpuCapturedOperationFailure chain_failure;
+        chain_failure.kind = gpu::SubmitOperationKind::Draw;
+        chain_failure.command_order = 1;
+        chain_failure.reason = gpu::RealizationFailureReason::ShaderRecompile;
+        gpu::GpuCapturedStageDiagnostic prolog_stage;
+        prolog_stage.stage = gpu::ShaderProgramStage::Vertex;
+        prolog_stage.program_addr = 0x1000u;
+        prolog_stage.raw_shader_index = 0;
+        gpu::GpuCapturedStageDiagnostic main_stage = prolog_stage;
+        main_stage.program_addr = 0x2000u;
+        main_stage.raw_shader_index = 1;
+        chain_failure.stages = {prolog_stage, main_stage};
+        chain_fixture.failure_diagnostics.push_back(chain_failure);
+        CHECK(gpu::write_gpu_capture((directory / "rejected-chain.prgcap").string(),
+                                     chain_fixture, error),
+              "CLI fixture writes a split vertex chain with a cross-lane refusal");
+        auto& exact_retry = chain_fixture.failure_diagnostics[0];
+        exact_retry.vertex_retry_config_available = true;
+        exact_retry.vertex_lds_dwords = 2176u;
+        exact_retry.has_pixel_inputs = true;
+        exact_retry.pixel_inputs.valid_mask = 1u;
+        exact_retry.pixel_inputs.controls[0] = 0x21u;
+        exact_retry.capture_vertex_position = true;
+        CHECK(gpu::write_gpu_capture((directory / "rejected-chain-exact.prgcap").string(),
+                                     chain_fixture, error),
+              "CLI fixture writes a split vertex chain with captured graphics retry inputs");
+        // A real split no-GS fixture from test_recompiled_shaders: its producer writes a seven-
+        // dword private record and its wrapper exports that record. Zero LDS refuses; seven dwords
+        // compile. This makes CLI admission depend on the recompile ARGUMENT, not on the printed
+        // config label. It is still a one-lane projection fixture, not Kena's wave-wide program.
+        const std::vector<uint32_t> lds_prolog = {
+            0xD765000Au, 0x000100C1u, 0xD766000Au, 0x000214C1u,
+            0x34040A81u, 0x36060AC2u, 0x7E000280u, 0x7E0202F2u,
+            0x36040482u, 0x4A0606C1u, 0x4A0404C1u, 0x7E0C0280u,
+            0x7E0E0280u, 0x7E1002F2u, 0xD8380100u, 0x00080706u,
+            0xD8380302u, 0x00030206u, 0xD8380504u, 0x00010006u,
+            0x7E12030Au, 0xD8340018u, 0x00000906u, 0xBF8A0000u, 0xBE802006u,
+        };
+        const std::vector<uint32_t> lds_main = {
+            0xBF900009u, 0xF8000941u, 0x00000000u,
+            0xD5430000u, 0x03FE249Cu, 0x00000728u,
+            0xD5430002u, 0x03FE249Cu, 0x00000730u,
+            0xD8DC0100u, 0x00000000u, 0xD8DC0100u, 0x02000002u,
+            0xF80000CFu, 0x03020100u,
+            0xD5430000u, 0x03FE249Cu, 0x00000720u,
+            0xD8DC0100u, 0x00000000u, 0xF8000203u, 0x00000100u,
+            0x1608249Cu, 0xD8D80738u, 0x04000004u,
+            0xF8000211u, 0x00000004u, 0xBF810000u,
+        };
+        gpu::ShaderResourceTable lds_table;
+        lds_table.vertices_per_instance = 3u;
+        const auto lds_positive = gpu::recompile_vertex_chain(
+            lds_prolog.data(), lds_prolog.size(), lds_main.data(), lds_main.size(),
+            &lds_table, nullptr, false, 7u);
+        const auto lds_negative = gpu::recompile_vertex_chain(
+            lds_prolog.data(), lds_prolog.size(), lds_main.data(), lds_main.size(),
+            &lds_table, nullptr, false, 0u);
+        CHECK(!lds_positive.empty() && lds_negative.empty(),
+              "retry fixture itself distinguishes captured LDS from the old default");
+        gpu::GpuCaptureFile lds_fixture = chain_fixture;
+        lds_fixture.raw_shader_versions.clear();
+        auto add_raw = [&](const std::vector<uint32_t>& words) {
+            gpu::GpuCaptureRawShaderVersion raw;
+            raw.words = words;
+            raw.has_endpgm = !words.empty() && words.back() == 0xBF810000u;
+            raw.content_hash = gpu::gpu_capture_hash(
+                reinterpret_cast<const uint8_t*>(words.data()), words.size() * sizeof(uint32_t));
+            lds_fixture.raw_shader_versions.push_back(std::move(raw));
+        };
+        add_raw(lds_prolog);
+        add_raw(lds_main);
+        auto& lds_failure = lds_fixture.failure_diagnostics[0];
+        lds_failure.vertex_count = 3u;
+        lds_failure.vertex_lds_dwords = 7u;
+        lds_failure.has_pixel_inputs = false;
+        lds_failure.pixel_inputs = {};
+        lds_failure.capture_vertex_position = false;
+        lds_failure.stages[0].resource_table_present = true;
+        lds_failure.stages[0].resource_table.present = true;
+        CHECK(gpu::write_gpu_capture((directory / "lds-chain-exact.prgcap").string(),
+                                     lds_fixture, error),
+              "CLI fixture writes a chain whose admission requires its captured LDS");
+        // A known fragment-consumption mask suppresses a sticky default-value output; unknown
+        // consumption must keep it. Both arms use the same shader bytes, LDS and register map.
+        // This distinguishes replay passing PixelInputMapping to the actual chain compiler from
+        // merely reporting pixel-inputs=1 in its diagnostic line.
+        gpu::GpuCaptureFile input_fixture = lds_fixture;
+        auto& input_failure = input_fixture.failure_diagnostics[0];
+        input_failure.has_pixel_inputs = true;
+        input_failure.pixel_inputs.valid_mask = 3u;
+        input_failure.pixel_inputs.controls[0] = 0x20u;
+        input_failure.pixel_inputs.controls[1] = 0x20u;
+        input_failure.pixel_inputs.consumed_mask = 1u;
+        input_failure.pixel_inputs.consumed_known = true;
+        const auto known_inputs = gpu::recompile_vertex_chain(
+            lds_prolog.data(), lds_prolog.size(), lds_main.data(), lds_main.size(),
+            &lds_table, &input_failure.pixel_inputs, false, 7u);
+        CHECK(gpu::write_gpu_capture((directory / "lds-inputs-known.prgcap").string(),
+                                     input_fixture, error),
+              "CLI fixture writes known fragment consumption for a successful chain");
+        input_failure.pixel_inputs.consumed_known = false;
+        const auto unknown_inputs = gpu::recompile_vertex_chain(
+            lds_prolog.data(), lds_prolog.size(), lds_main.data(), lds_main.size(),
+            &lds_table, &input_failure.pixel_inputs, false, 7u);
+        CHECK(!known_inputs.empty() && !unknown_inputs.empty() &&
+              known_inputs.size() != unknown_inputs.size(),
+              "fixture distinguishes known and unknown consumption in compiled SPIR-V size");
+        CHECK(gpu::write_gpu_capture((directory / "lds-inputs-unknown.prgcap").string(),
+                                     input_fixture, error),
+              "CLI fixture writes unknown consumption with otherwise identical graphics ABI");
+        lds_failure.vertex_retry_config_available = false;
+        lds_failure.vertex_lds_dwords = 0u;
+        CHECK(gpu::write_gpu_capture((directory / "lds-chain-default.prgcap").string(),
+                                     lds_fixture, error),
+              "CLI fixture writes the same chain with graphics retry config unavailable");
         if (!error.empty()) std::fprintf(stderr, "fixture: %s\n", error.c_str());
         return fails ? 1 : 0;
     }

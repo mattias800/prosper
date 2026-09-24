@@ -10,6 +10,7 @@
 # It drives the real binary rather than grepping the source: the point is what an operator SEES.
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -183,9 +184,50 @@ with tempfile.TemporaryDirectory(prefix="gpu-replay-retry-") as scratch:
                   "a v58 failed draw prints its positive instance count")
             check(known_instances.returncode == 0 and
                   "target-volume slot=0 mip-depth=32 raw-start=0 raw-max=32 "
-                  "bounded-start=0 bounded-count=32" in known_instances.stdout and
+                  "bounded-start=0 bounded-count=32 base=000000309cbf0000 mask=f"
+                  in known_instances.stdout and
+                  "target-volume slot=1 mip-depth=64 raw-start=0 raw-max=64 "
+                  "bounded-start=0 bounded-count=64 base=000000304edd0000 mask=0"
+                  in known_instances.stdout and
                   "target-volume" not in unknown_instances.stdout,
-                  "inspect keeps the raw 3D view endpoint distinct from physical slice coverage")
+                  "inspect distinguishes active volume output from sticky inactive view state")
+            chain = run_result(["--retry-failed-chain", "0",
+                                str(directory / "rejected-chain.prgcap")],
+                               {"PROSPER_DBG_PROGRAM": "0x2000"})
+            check(chain.returncode == 1 and
+                  "config=defaults lds=0 pixel-inputs=0 capture-position=0 reason=" in chain.stderr and
+                  "reason=mbcnt-cross-lane" in chain.stderr and
+                  "program=0x2000" in chain.stderr,
+                  "split vertex retry names its terminal cross-lane refusal with default config")
+            exact_chain = run_result(["--retry-failed-chain", "0",
+                                      str(directory / "rejected-chain-exact.prgcap")],
+                                     {"PROSPER_DBG_PROGRAM": "0x2000"})
+            check(exact_chain.returncode == 1 and
+                  "config=captured lds=2176 pixel-inputs=1 capture-position=1" in exact_chain.stderr and
+                  "reason=mbcnt-cross-lane" in exact_chain.stderr and
+                  "program=0x2000" in exact_chain.stderr,
+                  "split vertex retry uses the captured graphics ABI and names its refusal")
+            lds_exact = run_result(["--retry-failed-chain", "0",
+                                    str(directory / "lds-chain-exact.prgcap")])
+            lds_default = run_result(["--retry-failed-chain", "0",
+                                      str(directory / "lds-chain-default.prgcap")])
+            check(lds_exact.returncode == 0 and "recompiled" in lds_exact.stderr and
+                  "config=captured lds=7" in lds_exact.stderr and
+                  lds_default.returncode == 1 and "rejected" in lds_default.stderr and
+                  "config=defaults lds=0" in lds_default.stderr,
+                  "captured LDS changes real chain admission while identical default-config bytes reject")
+            input_known = run_result(["--retry-failed-chain", "0",
+                                      str(directory / "lds-inputs-known.prgcap")])
+            input_unknown = run_result(["--retry-failed-chain", "0",
+                                        str(directory / "lds-inputs-unknown.prgcap")])
+            known_words = re.search(r"spirv-dwords=(\d+)", input_known.stderr)
+            unknown_words = re.search(r"spirv-dwords=(\d+)", input_unknown.stderr)
+            check(input_known.returncode == 0 and input_unknown.returncode == 0 and
+                  "config=captured lds=7 pixel-inputs=1" in input_known.stderr and
+                  "config=captured lds=7 pixel-inputs=1" in input_unknown.stderr and
+                  known_words is not None and unknown_words is not None and
+                  int(known_words.group(1)) != int(unknown_words.group(1)),
+                  "captured fragment consumption reaches successful vertex-chain recompilation")
             args = ["--retry-failed-stage", "0:0"] + export
             accepted = run_result(args + [str(directory / "accepted.prgcap")])
             expected = (directory / "expected.spv").read_bytes()

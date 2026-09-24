@@ -399,6 +399,11 @@ bool capture_failure_diagnostics(
             diagnostic.color1_base, diagnostic.color1_width, diagnostic.color1_height);
         diagnostic.vertex_count = failure.vertex_count;
         diagnostic.instance_count = failure.instance_count;
+        diagnostic.vertex_retry_config_available = failure.vertex_retry_config_available;
+        diagnostic.vertex_lds_dwords = failure.vertex_lds_dwords;
+        diagnostic.pixel_inputs = failure.pixel_inputs;
+        diagnostic.has_pixel_inputs = failure.has_pixel_inputs;
+        diagnostic.capture_vertex_position = failure.capture_vertex_position;
         diagnostic.compute_launch = failure.compute_launch;
         for (const auto& runtime_stage : failure.stages) {
             GpuCapturedStageDiagnostic stage;

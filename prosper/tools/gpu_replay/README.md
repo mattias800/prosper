@@ -746,7 +746,13 @@ captured resource table. For split vertex programs, `--retry-failed-chain FAILUR
 first two retained vertex stages as one prolog/main chain and calls the production chain recompiler. Both modes
 exit successfully only when SPIR-V is produced and avoid Vulkan rendering, so they are the fast feedback path
 after a translator change. Chain retry requires the exact resource metadata added in capture v35 and rejects
-older or incomplete diagnostics explicitly. Failed compute retry additionally requires capture v42, which
+older or incomplete resource diagnostics explicitly. Capture v60 additionally retains the failed
+draw's vertex LDS allocation, pixel-input mapping, and position-capture selection; chain retry
+prints `config=captured` when those inputs were available at the live compile. Older captures and
+failures before that configuration was resolved still print `config=defaults`, so their refusal is
+only an offline boundary. Even a captured-config retry proves compilation, not guest execution or
+correct pixels. Standalone fragment-stage retries still lack the complete live graphics ABI.
+Failed compute retry additionally requires capture v42, which
 retains the exact launch dimensions, user SGPR values, wave/LDS state, and subgroup/storage specialization used
 by the rejected translator invocation. Older or incomplete failed-compute diagnostics are refused explicitly;
 the tool never substitutes default compute ABI state.
