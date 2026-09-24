@@ -180,12 +180,30 @@ int main(int argc, char** argv) {
         0,0,255,255,   255,255,255,255,
     };
     if (pressure_fixture) {
-        CHECK(std::getenv("PROSPER_BACKEND_TEXTURE_CACHE_MB") &&
-                  std::strcmp(std::getenv("PROSPER_BACKEND_TEXTURE_CACHE_MB"), "2") == 0,
-              "pressure fixture uses a two MiB backend image budget");
+        CHECK(!std::getenv("PROSPER_BACKEND_TEXTURE_CACHE_MB"),
+              "pressure fixture sets an exact image-requirement budget after device creation");
         const bool expect_flush =
             std::getenv("PROSPER_BACKEND_TEXTURE_PRESSURE_FLUSH") != nullptr;
         constexpr uint32_t TW = 768, TH = 512;
+        const auto& vk = prosper::test::render_vk_ctx();
+        CHECK(vk.ok, "pressure fixture has a Vulkan device");
+        if (!vk.ok) return 1;
+        VkImageCreateInfo image_info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        image_info.imageType = VK_IMAGE_TYPE_2D;
+        image_info.format = VK_FORMAT_R8G8B8A8_UNORM;
+        image_info.extent = {TW, TH, 1};
+        image_info.mipLevels = image_info.arrayLayers = 1;
+        image_info.samples = VK_SAMPLE_COUNT_1_BIT;
+        image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+        image_info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        VkImage budget_image = VK_NULL_HANDLE;
+        CHECK(vkCreateImage(vk.dev, &image_info, nullptr, &budget_image) == VK_SUCCESS &&
+                  budget_image, "pressure fixture can query the actual sampled-image allocation");
+        if (!budget_image) return 1;
+        VkMemoryRequirements image_requirements{};
+        vkGetImageMemoryRequirements(vk.dev, budget_image, &image_requirements);
+        vkDestroyImage(vk.dev, budget_image, nullptr);
+        prosper::test::persistent_texture_cache_device_budget() = image_requirements.size;
         std::vector<uint8_t> red(size_t(TW) * TH * 4, 0);
         std::vector<uint8_t> green(red.size(), 0);
         for (size_t i = 0; i < red.size(); i += 4) {
@@ -207,47 +225,103 @@ int main(int argc, char** argv) {
         draw_a.vs = draw_b.vs = vert;
         draw_a.fs = draw_b.fs = frag;
         draw_a.vcount = draw_b.vcount = 3;
+        draw_a.source_submit = 17;
+        draw_b.source_submit = 18;
         draw_a.R = {a}; draw_b.R = {b};
         const auto warm = prosper::test::render_draws_rgba({draw_a}, W, H);
         CHECK(warm.size() == size_t(W) * H * 4 &&
                   warm[(size_t(H / 2) * W + W / 2) * 4] == 255,
               "first image is rendered and retained before the pending batch");
         prosper::test::BackendSubmissionBatch batch;
-        prosper::test::BackendColorTarget target{0x7020000000000201ull, false, false};
+        constexpr uint64_t target_a_id = 0x7020000000000201ull;
+        prosper::test::BackendColorTarget target_a{target_a_id, false, false};
+        prosper::test::BackendColorTarget target_b{target_a_id + 1, false, true};
         const auto pending_a = prosper::test::render_draws_rgba(
-            {draw_a}, W, H, nullptr, nullptr, false, &target,
+            {draw_a}, W, H, nullptr, nullptr, false, &target_a,
             nullptr, nullptr, nullptr, &batch, false);
         CHECK(pending_a.empty() && batch.pending(),
               "first batched pass holds a live command using the resident image");
+        std::vector<uint8_t> pressure_pixels;
         const auto pressure_log = capture_stderr([&] {
-            (void)prosper::test::render_draws_rgba(
-                {draw_b}, W, H, nullptr, nullptr, false, &target,
-                nullptr, nullptr, nullptr, &batch, false);
+            pressure_pixels = prosper::test::render_draws_rgba(
+                {draw_b}, W, H, nullptr, nullptr, false, &target_b,
+                nullptr, nullptr, nullptr, &batch, true);
         });
-        CHECK(batch.pending() &&
+        CHECK(!batch.pending() &&
                   (pressure_log.find("[texture-cache-pressure] completed") !=
                        std::string::npos) == expect_flush,
               "pressure control changes only the selective batch completion");
+        const size_t center = (size_t(H / 2) * W + W / 2) * 4;
+        CHECK(pressure_pixels.size() == size_t(W) * H * 4 &&
+                  pressure_pixels[center] == 0 && pressure_pixels[center + 1] == 255,
+              "batched B samples green across the optional submission split");
         const auto pressure_timing = prosper::test::backend_render_timing_stats();
         CHECK(pressure_timing.flush_cache_pressure == uint64_t(expect_flush) &&
-                  pressure_timing.queue_submits == uint64_t(expect_flush) &&
-                  pressure_timing.fence_waits == uint64_t(expect_flush) &&
+                  pressure_timing.queue_submits == 1u + uint64_t(expect_flush) &&
+                  pressure_timing.fence_waits == 1u + uint64_t(expect_flush) &&
                   (!expect_flush || pressure_timing.cache_pressure_ms > 0.0),
               "timing includes the selective submission and its nested wait");
-        const auto& context = prosper::test::render_vk_ctx();
-        const auto result = batch.submit_and_wait(context.dev, context.queue, false);
-        CHECK(result.submit_result == VK_SUCCESS && result.wait_result == VK_SUCCESS,
-              "remaining texture consumer commands complete successfully");
-        batch.complete();
+        std::vector<uint8_t> prior_pixels;
+        std::string readback_error;
+        const bool prior_ok = prosper::test::readback_persistent_color_target(
+            target_a_id, W, H, VK_FORMAT_R8G8B8A8_UNORM, prior_pixels, readback_error);
+        const auto* prior_target = prosper::test::find_persistent_color_target(
+            target_a_id, W, H, VK_FORMAT_R8G8B8A8_UNORM);
+        CHECK(prior_ok && prior_pixels.size() == size_t(W) * H * 4 &&
+                  prior_pixels[center] == 255 && prior_pixels[center + 1] == 0 &&
+                  prior_target && prior_target->completed_producer.known() &&
+                  prior_target->completed_producer.source_submit == 17,
+              "earlier batched A keeps red pixels and exact producer after completion");
         const auto second = prosper::test::render_draws_rgba({draw_b}, W, H);
         const auto stats = prosper::test::backend_texture_upload_stats();
-        const size_t center = (size_t(H / 2) * W + W / 2) * 4;
         CHECK(second.size() == size_t(W) * H * 4 && second[center] == 0 &&
                   second[center + 1] == 255,
               "texture B remains green after the batch and subsequent reuse");
         CHECK((stats.persistent_hits == 1 && stats.unique_uploads == 0) == expect_flush &&
                   (stats.persistent_misses == 1 && stats.unique_uploads == 1) != expect_flush,
               "completed pressure flush retains B while the control repeats its upload");
+
+        // A second batch writes the SAME target on both sides of the selective split. If B issues
+        // its mutation ticket before completing pending A, A's completion is silently discarded.
+        // The one-shot observer samples the metadata at the exact boundary, before B may supersede
+        // it. Checking only B's final producer would pass with the old ordering.
+        const auto warm_a_again = prosper::test::render_draws_rgba({draw_a}, W, H);
+        CHECK(warm_a_again.size() == size_t(W) * H * 4 &&
+                  warm_a_again[center] == 255,
+              "same-target arm restores A as the resident image");
+        constexpr uint64_t shared_target_id = target_a_id + 2;
+        prosper::test::BackendColorTarget shared_a{shared_target_id, false, false};
+        prosper::test::BackendColorTarget shared_b{shared_target_id, true, true};
+        // The observer captures these by reference. They must outlive the batch even if a failed
+        // render leaves work for its destructor to finish.
+        uint32_t observed_completion_count = 0;
+        uint64_t producer_after_first_completion = 0;
+        prosper::test::BackendSubmissionBatch same_target_batch;
+        const auto shared_pending_a = prosper::test::render_draws_rgba(
+            {draw_a}, W, H, nullptr, nullptr, false, &shared_a,
+            nullptr, nullptr, nullptr, &same_target_batch, false);
+        CHECK(shared_pending_a.empty() && same_target_batch.pending(),
+              "same-target A has an uncompleted write before pressure");
+        same_target_batch.set_completion_observer([&] {
+            ++observed_completion_count;
+            const auto* image = prosper::test::find_persistent_color_target(
+                shared_target_id, W, H, VK_FORMAT_R8G8B8A8_UNORM);
+            producer_after_first_completion = image && image->completed_producer.known()
+                ? image->completed_producer.source_submit : 0;
+        });
+        const auto shared_final_b = prosper::test::render_draws_rgba(
+            {draw_b}, W, H, nullptr, nullptr, false, &shared_b,
+            nullptr, nullptr, nullptr, &same_target_batch, true);
+        const auto* shared_final_target = prosper::test::find_persistent_color_target(
+            shared_target_id, W, H, VK_FORMAT_R8G8B8A8_UNORM);
+        CHECK(observed_completion_count == 1 &&
+                  (!expect_flush || producer_after_first_completion == 17),
+              "selective split publishes A's completed producer before B mutates the same target");
+        CHECK(shared_final_b.size() == size_t(W) * H * 4 &&
+                  shared_final_b[center] == 0 && shared_final_b[center + 1] == 255 &&
+                  shared_final_target && shared_final_target->completed_producer.known() &&
+                  shared_final_target->completed_producer.source_submit == 18,
+              "same-target B keeps green pixels and its completed producer");
         return fails ? 1 : 0;
     }
     prosper::test::TexDesc td{ /*binding*/4, /*w*/2, /*h*/2, texels };

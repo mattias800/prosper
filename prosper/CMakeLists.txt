@@ -3786,13 +3786,13 @@ endif()
           --unset=PROSPER_BACKEND_TEXTURE_PATH_CENSUS_MIN_DRAWS
           PROSPER_BACKEND_TEXTURE_PATH_CENSUS=1 $<TARGET_FILE:test_texture_sample_render>)
       add_test(NAME backend_texture_pressure_flush COMMAND ${CMAKE_COMMAND} -E env
-          PROSPER_BACKEND_TEXTURE_CACHE_MB=2
+          --unset=PROSPER_BACKEND_TEXTURE_CACHE_MB
           PROSPER_BACKEND_TEXTURE_PRESSURE_FLUSH=1
           PROSPER_RENDER_TIMING=1
           $<TARGET_FILE:test_texture_sample_render> --cache-pressure)
       add_test(NAME backend_texture_pressure_control COMMAND ${CMAKE_COMMAND} -E env
           --unset=PROSPER_BACKEND_TEXTURE_PRESSURE_FLUSH
-          PROSPER_BACKEND_TEXTURE_CACHE_MB=2
+          --unset=PROSPER_BACKEND_TEXTURE_CACHE_MB
           PROSPER_RENDER_TIMING=1
           $<TARGET_FILE:test_texture_sample_render> --cache-pressure)
 

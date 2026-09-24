@@ -2567,10 +2567,18 @@ public:
             overflow_completions_.push_back(completion);
     }
 
+    // One-shot observer of a proven batch completion, after retained producer metadata is
+    // published and before the caller can begin recording the next batch. Used by the focused
+    // pressure test to distinguish a completed prior write from a later mutation of that target.
+    void set_completion_observer(std::function<void()> observer) {
+        completed_observer_ = std::move(observer);
+    }
+
     void discard() {
         commands_.clear();
         release_gpu_timestamp();
         finish_persistent_state(false);
+        completed_observer_ = {};
     }
 
     // Completion could not be proven after a successful submit. Invalidate speculative state, but
@@ -2586,6 +2594,7 @@ public:
         // resources; destroying it after unproven completion would violate object lifetime.
         gpu_timestamp_ = {};
         finish_persistent_state(false);
+        completed_observer_ = {};
         pending_resources_abandoned_ = true;
         backend_mark_unproven_submission();
         if (!cleanups_.empty()) {
@@ -2700,6 +2709,11 @@ public:
             vkDestroyFence(dev, fence, nullptr);
             commands_.clear();
             finish_persistent_state(state == BackendSubmissionState::Complete);
+            if (state == BackendSubmissionState::Complete && completed_observer_) {
+                auto observer = std::move(completed_observer_);
+                completed_observer_ = {};
+                observer();
+            } else if (state != BackendSubmissionState::Complete) completed_observer_ = {};
         } else {
             // Neither wait proved completion, so every command buffer and object captured by its
             // cleanup may still be in use. Retain the callbacks without invoking or destroying
@@ -2756,6 +2770,7 @@ private:
     GpuTimestamp gpu_timestamp_;
     std::vector<std::function<void()>> cleanups_;
     std::vector<std::function<void()>> failure_cleanups_;
+    std::function<void()> completed_observer_;
     std::array<ColorProducerCompletion, prosper::gpu::kColorTargetCount> inline_completions_{};
     size_t inline_completion_count_ = 0;
     std::vector<ColorProducerCompletion> overflow_completions_;
@@ -8436,38 +8451,6 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         att[slot].finalLayout = cached_extra[slot] ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
                                                    : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
     }
-    // A retained image may be LOADed without any colour write (for example a depth-only pass).
-    // Such a pass preserves its producer. A CLEAR writes the whole attachment even when the
-    // resulting pixels match the previous version. A partial draw over unknown seeded pixels
-    // remains unknown; only CLEAR or a completed retained source establishes full-image lineage.
-    std::array<ColorProducerTicket, prosper::gpu::kColorTargetCount> producer_tickets{};
-    std::array<bool, prosper::gpu::kColorTargetCount> producer_lineage_proven{};
-    auto retained_color_at = [&](uint32_t slot) -> PersistentColorTargetImage* {
-        if (slot == 0) return cached_color;
-        if (slot == 1) return cached_color1;
-        return cached_extra[slot];
-    };
-    for (uint32_t slot = 0; slot < color_count; ++slot) {
-        PersistentColorTargetImage* retained = retained_color_at(slot);
-        if (!retained) continue;
-        const bool cleared = att[slot].loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR;
-        const bool draw_writes = std::any_of(draws.begin(), draws.end(), [&](const BackendDraw& d) {
-            if (!d.ps) return true;
-            if (slot == 0) return d.ps->color_write_mask != 0;
-            if (slot == 1) return d.ps->color1_write_mask != 0;
-            return d.ps->color_targets[slot].write_mask != 0;
-        });
-        if (!cleared && !draw_writes) continue;
-        // A CPU seed replaces the old image contents before the pass. Its provenance is unknown
-        // even when the same allocation previously held a completed renderer version.
-        const bool loaded_known_image =
-            color_producer_for_batch(*retained, active_submission).known() &&
-            (slot == 0 ? load_cached_color :
-             slot == 1 ? load_cached_color1 :
-             load_extra[slot] && !(color_target && color_target->seed_slots[slot]));
-        producer_lineage_proven[slot] = cleared || loaded_known_image;
-        producer_tickets[slot] = begin_color_producer_write(*retained);
-    }
     att[ds_attachment].format = DFMT; att[ds_attachment].samples = VK_SAMPLE_COUNT_1_BIT;
     // A guest-identified DS surface survives calls. New attachments get a defined initial value;
     // existing ones LOAD. Explicit DB_RENDER_CONTROL clears execute at their draw below, preserving
@@ -8825,21 +8808,47 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         persistent_textures_enabled && submission_batch && active_submission.pending() &&
         !backend_has_unproven_submission() && persistent_texture_limit &&
         persistent_texture_bytes >= persistent_texture_limit - persistent_texture_limit / 4) {
-        std::unordered_set<uint64_t> resident_ids;
-        resident_ids.reserve(persistent_texture_images.size());
+        // The exact cache lookup also keys mip count, which is derived later during resource
+        // setup. Match its other shape fields here; a mip-only re-key may conservatively miss
+        // this opportunity, while the authoritative lookup below still decides reuse.
+        std::unordered_set<PersistentTextureKey, PersistentTextureKeyHash> resident_shapes;
+        resident_shapes.reserve(persistent_texture_images.size());
         for (const auto& [key, image] : persistent_texture_images)
-            if (image.content_valid) resident_ids.insert(key.id);
+            if (image.content_valid) {
+                auto shape = key;
+                shape.mip_levels = 0;
+                resident_shapes.insert(shape);
+            }
         constexpr uint64_t min_miss_bytes = 1024ull * 1024ull;
+        const uint64_t available_bytes = persistent_texture_bytes < persistent_texture_limit
+            ? persistent_texture_limit - persistent_texture_bytes : 0;
         bool sizeable_miss = false;
         for (const BackendDraw& draw : draws) {
             for (const FrameResource& resource : draw.R) {
                 if (!resource.persistent_texture_id || !resource.tex_rgba ||
                     resource.is_storage_image || resource.persistent_render_target_id ||
-                    resource.persistent_depth_target_id || resource.borrowed_compute_image ||
-                    resident_ids.contains(resource.persistent_texture_id)) continue;
+                    resource.persistent_depth_target_id || resource.borrowed_compute_image) continue;
+                const PersistentTextureKey shape{
+                    resource.persistent_texture_id, resource.tw, resource.th, resource.td,
+                    resource.img_dim, resource.sample_count, 0,
+                    backend_color_format(resource.texture_format)};
+                if (resident_shapes.contains(shape)) continue;
                 const uint64_t bpp = backend_color_bytes_per_pixel(resource.texture_format);
-                const uint64_t texels = uint64_t(resource.tw) * resource.th;
-                if (bpp && texels >= min_miss_bytes / bpp) {
+                const auto saturated_product = [](uint64_t lhs, uint64_t rhs) {
+                    return rhs && lhs > UINT64_MAX / rhs ? UINT64_MAX : lhs * rhs;
+                };
+                const uint64_t texels = saturated_product(
+                    saturated_product(
+                        saturated_product(resource.tw, resource.th),
+                        std::max(resource.td, 1u)),
+                    std::max(resource.sample_count, 1u));
+                // This is only a lower-bound pressure hint. Mips and driver allocation padding
+                // can still make an image larger than the remaining space; the authoritative
+                // admission below uses VkMemoryRequirements and may conservatively refuse it.
+                // The 1024-owner cap is a separate pressure limit this opt-in policy does not solve.
+                const uint64_t level0_bytes = saturated_product(texels, bpp);
+                if (bpp && level0_bytes >= min_miss_bytes &&
+                    level0_bytes > available_bytes) {
                     sizeable_miss = true;
                     break;
                 }
@@ -8867,6 +8876,40 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                              (unsigned long long)persistent_texture_limit,
                              persistent_texture_images.size());
         }
+    }
+    // A retained image may be LOADed without any colour write (for example a depth-only pass).
+    // Such a pass preserves its producer. A CLEAR writes the whole attachment even when the
+    // resulting pixels match the previous version. A partial draw over unknown seeded pixels
+    // remains unknown; only CLEAR or a completed retained source establishes full-image lineage.
+    // Issue these tickets AFTER the optional pressure flush: that flush completes earlier passes
+    // on this batch, and a new mutation here would otherwise supersede their pending completions.
+    std::array<ColorProducerTicket, prosper::gpu::kColorTargetCount> producer_tickets{};
+    std::array<bool, prosper::gpu::kColorTargetCount> producer_lineage_proven{};
+    auto retained_color_at = [&](uint32_t slot) -> PersistentColorTargetImage* {
+        if (slot == 0) return cached_color;
+        if (slot == 1) return cached_color1;
+        return cached_extra[slot];
+    };
+    for (uint32_t slot = 0; slot < color_count; ++slot) {
+        PersistentColorTargetImage* retained = retained_color_at(slot);
+        if (!retained) continue;
+        const bool cleared = att[slot].loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR;
+        const bool draw_writes = std::any_of(draws.begin(), draws.end(), [&](const BackendDraw& d) {
+            if (!d.ps) return true;
+            if (slot == 0) return d.ps->color_write_mask != 0;
+            if (slot == 1) return d.ps->color1_write_mask != 0;
+            return d.ps->color_targets[slot].write_mask != 0;
+        });
+        if (!cleared && !draw_writes) continue;
+        // A CPU seed replaces the old image contents before the pass. Its provenance is unknown
+        // even when the same allocation previously held a completed renderer version.
+        const bool loaded_known_image =
+            color_producer_for_batch(*retained, active_submission).known() &&
+            (slot == 0 ? load_cached_color :
+             slot == 1 ? load_cached_color1 :
+             load_extra[slot] && !(color_target && color_target->seed_slots[slot]));
+        producer_lineage_proven[slot] = cleared || loaded_known_image;
+        producer_tickets[slot] = begin_color_producer_write(*retained);
     }
     const bool share_backend_resources =
         getenv("PROSPER_NO_BACKEND_RESOURCE_SHARE") == nullptr;
