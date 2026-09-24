@@ -222,6 +222,30 @@ with tempfile.TemporaryDirectory(prefix="gpu-replay-retry-") as scratch:
         if fixture.returncode != 0:
             print(fixture.stdout + fixture.stderr)
         else:
+            failed_input = directory / "failed-input-snapshot.prgcap"
+            dumped_input = directory / "failed-input.bin"
+            dumped_input.write_bytes(b"old output")
+            present_input = run_result(["--dump-failed-resource", "0:0:7",
+                                        str(dumped_input), str(failed_input)])
+            check(present_input.returncode == 0 and
+                  dumped_input.read_bytes() == bytes([0x42, 0x19, 0x7f, 0xa5]),
+                  "failed-stage resource export writes exact captured bytes")
+            dumped_input.write_bytes(b"old output")
+            absent_input = run_result(["--dump-failed-resource", "0:0:8",
+                                       str(dumped_input), str(failed_input)])
+            check(absent_input.returncode == 2 and "metadata but no captured bytes" in absent_input.stderr and
+                  dumped_input.read_bytes() == b"old output",
+                  "metadata-only failed input refuses export and preserves existing output")
+            missing_input = run_result(["--dump-failed-resource", "0:0:9",
+                                        str(dumped_input), str(failed_input)])
+            check(missing_input.returncode == 2 and "no captured binding" in missing_input.stderr and
+                  dumped_input.read_bytes() == b"old output",
+                  "absent failed input is distinct from metadata-only input")
+            combined_input = run_result(["--inspect-only", "--dump-failed-resource", "0:0:7",
+                                         str(dumped_input), str(failed_input)])
+            check(combined_input.returncode == 2 and "cannot combine with another mode" in combined_input.stderr and
+                  dumped_input.read_bytes() == b"old output",
+                  "failed-input export cannot silently consume a second terminal mode")
             unknown_instances = run_result(["--inspect-only", str(directory / "unknown-instances.prgcap")])
             known_instances = run_result(["--inspect-only", str(directory / "known-instances.prgcap")])
             check(unknown_instances.returncode == 0 and "instances=?" in unknown_instances.stdout and

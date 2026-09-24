@@ -268,9 +268,9 @@ struct GpuCapturedStageDiagnostic {
     // v35: the exact descriptor metadata supplied to the failed recompiler invocation. Earlier
     // captures retained only presence/count, which was enough to describe the failure but not to
     // retry it offline: table-dependent SMEM/MUBUF/MIMG lowering rejected before reaching the real
-    // unsupported instruction. Resource bytes remain deliberately absent from this diagnostic
-    // table; once a fix realizes the operation, an ordinary follow-up capture retains its renderable
-    // resource closure through GpuCapturedDraw/GpuCapturedCompute.
+    // unsupported instruction. Resource bytes are normally absent from this diagnostic table;
+    // the v60 opt-in failed-input snapshot can retain bounded capture-time buffer bytes. That
+    // snapshot does not make the failed operation renderable or establish post-draw contents.
     GpuCapturedTable resource_table;
     // v42: exact semantic launch/user-SGPR inputs supplied to a failed compute recompile. Resource
     // state alone cannot reproduce compute translation; graphics stages and older captures leave

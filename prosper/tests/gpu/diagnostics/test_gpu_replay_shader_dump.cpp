@@ -294,6 +294,32 @@ int main(int argc, char** argv) {
         fixture.failure_diagnostics.push_back(failure);
         CHECK(gpu::write_gpu_capture((directory / "accepted.prgcap").string(), fixture, error),
               "CLI fixture writes a retryable failed-stage capture");
+        gpu::GpuCaptureFile input_snapshot = fixture;
+        gpu::GpuCaptureBlob input_blob;
+        input_blob.guest_addr = 0x3000;
+        input_blob.bytes = {0xff, 0xee, 0xdd, 0x42, 0x19, 0x7f, 0xa5, 0xcc};
+        input_blob.bytes_read = input_blob.bytes.size();
+        input_blob.content_hash = gpu::gpu_capture_hash(
+            input_blob.bytes.data(), input_blob.bytes.size());
+        input_snapshot.blobs.push_back(input_blob);
+        gpu::GpuCapturedResource present_input;
+        present_input.resource.cls = gpu::ResourceClass::ConstantBuffer;
+        present_input.resource.binding = 7;
+        present_input.resource.gpu_addr = input_blob.guest_addr + 3;
+        present_input.resource.size = 4;
+        present_input.captured_size = 4;
+        present_input.blob_index = 0;
+        present_input.blob_offset = 3;
+        gpu::GpuCapturedResource absent_input = present_input;
+        absent_input.resource.binding = 8;
+        absent_input.blob_index = UINT32_MAX;
+        auto& input_stage = input_snapshot.failure_diagnostics[0].stages[0];
+        input_stage.resource_table_present = input_stage.resource_table.present = true;
+        input_stage.resource_table.resources = {present_input, absent_input};
+        input_stage.resource_count = 2;
+        CHECK(gpu::write_gpu_capture((directory / "failed-input-snapshot.prgcap").string(),
+                                     input_snapshot, error),
+              "CLI fixture writes captured bytes and metadata-only bindings for a failed stage");
         FILE* expected = std::fopen((directory / "expected.spv").string().c_str(), "wb");
         bool written = expected && std::fwrite(
             failed_compute_spirv.data(), sizeof(uint32_t), failed_compute_spirv.size(), expected) ==
