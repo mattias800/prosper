@@ -41,7 +41,8 @@ int main() {
             ctx.phys, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_TYPE_3D,
             VK_IMAGE_TILING_OPTIMAL, usage, VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT,
             &format_properties) != VK_SUCCESS ||
-        ctx.mesh_shader_properties.maxMeshOutputLayers < kDepth) return 77;
+        ctx.mesh_shader_properties.maxMeshOutputLayers < 8 ||
+        format_properties.maxExtent.depth < 32) return 77;
 
     const std::vector<uint32_t> mesh_shader(
         std::begin(prosper::test::volume_fixture::mesh),
@@ -263,6 +264,68 @@ int main() {
                                        VK_FORMAT_R8G8B8A8_UNORM)) {
         std::fprintf(stderr, "same-address volume resize left stale shape authority\n");
         return 1;
+    }
+    // A device with only eight mesh output layers can still retain a 32-slice 3D image through
+    // four bounded attachment views. This verifies the backend's range handoff; it does not
+    // establish a guest merged-NGG primitive/layer partition.
+    constexpr uint32_t large_depth = 32, partition = 8;
+    {
+        constexpr uint64_t large_id = kTarget + 0x900000u;
+        VkImage large_image = VK_NULL_HANDLE;
+        for (uint32_t group = 0; group < large_depth / partition; ++group) {
+            if (!produce(large_id, large_depth, group * partition, partition,
+                         group & 1u ? green_shader : red_shader)) {
+                std::fprintf(stderr, "bounded volume partition %u failed\n", group);
+                return 1;
+            }
+            auto* retained_slice = find_persistent_volume_target(
+                large_id, kWidth, kHeight, large_depth, VK_FORMAT_R8G8B8A8_UNORM,
+                false);
+            if (!retained_slice || !retained_slice->image ||
+                (large_image && retained_slice->image != large_image)) {
+                std::fprintf(stderr, "partition %u replaced retained image\n", group);
+                return 1;
+            }
+            large_image = retained_slice->image;
+            auto* image = find_persistent_volume_target(
+                large_id, kWidth, kHeight, large_depth, VK_FORMAT_R8G8B8A8_UNORM);
+            if (group != large_depth / partition - 1) {
+                if (image) {
+                    std::fprintf(stderr, "incomplete 32-slice volume became sampleable\n");
+                    return 1;
+                }
+            } else if (!image || !image->valid || image->image != large_image) {
+                std::fprintf(stderr, "completed partitions lost retained image identity\n");
+                return 1;
+            }
+        }
+        const auto sampled = consume(large_id, large_depth);
+        if (backend_color_target_stats().sampled_hits != 1 ||
+            !red(pixel(sampled, 8))) {
+            std::fprintf(stderr, "completed 32-slice image was not sampled directly\n");
+            return 1;
+        }
+        volume_bytes.clear();
+        if (!readback_persistent_color_target(large_id, kWidth, kHeight,
+                                              VK_FORMAT_R8G8B8A8_UNORM, volume_bytes,
+                                              readback_error, large_depth) ||
+            volume_bytes.size() != static_cast<size_t>(kWidth) * kHeight * large_depth * 4) {
+            std::fprintf(stderr, "32-slice volume readback failed: %s\n",
+                         readback_error.c_str());
+            return 1;
+        }
+        for (uint32_t z = 0; z < large_depth; ++z) {
+            const size_t at = (static_cast<size_t>(z) * kWidth * kHeight +
+                               static_cast<size_t>(kHeight / 2) * kWidth + kWidth / 2) * 4;
+            const std::array<uint8_t, 4> texel{
+                volume_bytes[at], volume_bytes[at + 1],
+                volume_bytes[at + 2], volume_bytes[at + 3]};
+            if ((z / partition) & 1u ? !green(texel) : !red(texel)) {
+                std::fprintf(stderr, "32-slice partition lost slice %u\n", z);
+                return 1;
+            }
+        }
+        std::puts("32-slice retained volume passed four eight-layer views");
     }
     std::puts("retained volume writes, partial update, direct 3D sample and invalidation passed");
     return 0;
