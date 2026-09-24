@@ -87,6 +87,7 @@ void usage(const char* argv0) {
                          "[--probe-ngg-packed-offsets (with --probe-ngg-workgroup-s3; compile only)] "
                          "[--probe-ngg-full-four-wave (with --retry-failed-chain; compile only)] "
                          "[--probe-ngg-native-wave64 (with --probe-ngg-full-four-wave; compile only)] "
+                         "[--probe-ngg-trace=PC:VGPR (native ordinary-ALU probe)] "
                          "[--retry-failed-stage FAILURE:STAGE] "
                          "[--retry-failed-stage-spv PATH] "
                          "[--dump-compute-resource N:BINDING PATH] "
@@ -2232,6 +2233,8 @@ int main(int argc, char** argv) {
     bool probe_ngg_packed_offsets = false;
     bool probe_ngg_full_four_wave = false;
     bool probe_ngg_native_wave64 = false;
+    uint32_t probe_ngg_trace_pc = UINT32_MAX;
+    uint32_t probe_ngg_trace_vgpr = UINT32_MAX;
     std::string retry_failed_stage_spv_path;
     std::string retry_failed_chain_spv_path;
     std::string list_resources_spec;   // #2373
@@ -2544,6 +2547,29 @@ int main(int argc, char** argv) {
             probe_ngg_full_four_wave = true;
         else if (std::string(argv[i]) == "--probe-ngg-native-wave64")
             probe_ngg_native_wave64 = true;
+        else if (std::strncmp(argv[i], "--probe-ngg-trace=", 18) == 0) {
+            if (probe_ngg_trace_pc != UINT32_MAX) {
+                std::fprintf(stderr, "gpu_replay: duplicate NGG trace selector\n");
+                return 2;
+            }
+            const char* spec = argv[i] + 18;
+            char* end = nullptr;
+            errno = 0;
+            const unsigned long pc = std::strtoul(spec, &end, 0);
+            if (errno || end == spec || !end || *end != ':' || pc >= UINT32_MAX) {
+                std::fprintf(stderr, "gpu_replay: expected --probe-ngg-trace=PC:VGPR\n");
+                return 2;
+            }
+            const char* reg = end + 1;
+            errno = 0;
+            const unsigned long vgpr = std::strtoul(reg, &end, 0);
+            if (errno || end == reg || !end || *end || vgpr > 255u) {
+                std::fprintf(stderr, "gpu_replay: expected --probe-ngg-trace=PC:VGPR\n");
+                return 2;
+            }
+            probe_ngg_trace_pc = static_cast<uint32_t>(pc);
+            probe_ngg_trace_vgpr = static_cast<uint32_t>(vgpr);
+        }
         else if (std::string(argv[i]) == "--retry-failed-stage" && i + 1 < argc)
             retry_failed_stage_spec = argv[++i];
         else if (std::string(argv[i]) == "--retry-failed-stage-spv") {
@@ -2576,6 +2602,11 @@ int main(int argc, char** argv) {
     if (probe_ngg_native_wave64 && !probe_ngg_full_four_wave) {
         std::fprintf(stderr,
                      "gpu_replay: --probe-ngg-native-wave64 requires --probe-ngg-full-four-wave\n");
+        return 2;
+    }
+    if (probe_ngg_trace_pc != UINT32_MAX && !probe_ngg_native_wave64) {
+        std::fprintf(stderr,
+                     "gpu_replay: --probe-ngg-trace requires --probe-ngg-native-wave64\n");
         return 2;
     }
     if (!retry_failed_chain_spv_path.empty() &&
@@ -3559,7 +3590,8 @@ int main(int argc, char** argv) {
                 resources, failure.vertex_count, provisional_s3,
                 {prosper::gpu::RecompileDiagnosticStage::Vertex, main_stage.program_addr},
                 probe_ngg_packed_offsets || probe_ngg_full_four_wave,
-                probe_ngg_full_four_wave, probe_ngg_native_wave64);
+                probe_ngg_full_four_wave, probe_ngg_native_wave64,
+                probe_ngg_trace_pc, probe_ngg_trace_vgpr);
         } else {
             spirv = prosper::gpu::recompile_vertex_chain(
                 prolog.words.data(), prolog.words.size(), main.words.data(), main.words.size(),
@@ -3583,9 +3615,11 @@ int main(int argc, char** argv) {
         if (probe_ngg_full_four_wave)
             std::fprintf(stderr,
                          "[ngg-workgroup-probe] COMPILE ONLY, not a raster/ABI proof; "
-                         "full-four-wave=1 native-wave64=%d s3=unbound-launch-input "
+                         "full-four-wave=1 native-wave64=%d trace-pc=%u trace-vgpr=%u "
+                         "s3=unbound-launch-input "
                          "linked-dwords=%zu result=%s\n",
-                         probe_ngg_native_wave64, linked_dwords,
+                         probe_ngg_native_wave64, probe_ngg_trace_pc,
+                         probe_ngg_trace_vgpr, linked_dwords,
                          spirv.empty() ? "rejected" : "module-emitted");
         else if (!probe_ngg_workgroup_s3_spec.empty())
             std::fprintf(stderr,

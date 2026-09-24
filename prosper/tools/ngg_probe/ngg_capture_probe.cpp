@@ -15,6 +15,7 @@
 #include <iterator>
 #include <set>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace {
@@ -67,24 +68,27 @@ bool exact_probe_local_size(const std::vector<uint32_t>& words, uint32_t expecte
     return entry && found_mode && mode_entry == entry;
 }
 
-bool exact_native_wave64_marker(const std::vector<uint32_t>& words) {
-    constexpr char kMarker[] = "Prosper.NggProbeExactSubgroup=64";
-    if (words.size() < 5 || words[0] != 0x07230203u) return false;
-    uint32_t matches = 0;
+int module_marker_count(const std::vector<uint32_t>& words, std::string_view marker) {
+    if (words.size() < 5 || words[0] != 0x07230203u) return -1;
+    int matches = 0;
     for (size_t at = 5; at < words.size();) {
         const uint32_t count = words[at] >> 16u;
-        if (!count || at + count > words.size()) return false;
+        if (!count || at + count > words.size()) return -1;
         if ((words[at] & 0xffffu) == 330u && count >= 2u) {
             const char* value = reinterpret_cast<const char*>(words.data() + at + 1u);
             const size_t bytes = static_cast<size_t>(count - 1u) * sizeof(uint32_t);
             const void* end = std::memchr(value, '\0', bytes);
-            if (end && static_cast<const char*>(end) - value == sizeof(kMarker) - 1u &&
-                std::memcmp(value, kMarker, sizeof(kMarker)) == 0)
+            if (end && static_cast<const char*>(end) - value == marker.size() &&
+                std::memcmp(value, marker.data(), marker.size()) == 0)
                 ++matches;
         }
         at += count;
     }
-    return matches == 1u;
+    return matches;
+}
+
+bool exact_native_wave64_marker(const std::vector<uint32_t>& words) {
+    return module_marker_count(words, "Prosper.NggProbeExactSubgroup=64") == 1;
 }
 
 bool selftest() {
@@ -137,6 +141,16 @@ bool selftest() {
     module.push_back((static_cast<uint32_t>(payload.size() + 1u) << 16u) | 330u);
     module.insert(module.end(), payload.begin(), payload.end());
     if (!exact_native_wave64_marker(module)) return false;
+    constexpr char kTraceMarker[] = "Prosper.NggTraceWord13Hit14";
+    std::vector<uint32_t> trace_payload((sizeof(kTraceMarker) + 3u) / 4u);
+    std::memcpy(trace_payload.data(), kTraceMarker, sizeof(kTraceMarker));
+    module.push_back((static_cast<uint32_t>(trace_payload.size() + 1u) << 16u) | 330u);
+    module.insert(module.end(), trace_payload.begin(), trace_payload.end());
+    if (module_marker_count(module, kTraceMarker) != 1) return false;
+    auto duplicate_trace = module;
+    duplicate_trace.push_back((static_cast<uint32_t>(trace_payload.size() + 1u) << 16u) | 330u);
+    duplicate_trace.insert(duplicate_trace.end(), trace_payload.begin(), trace_payload.end());
+    if (module_marker_count(duplicate_trace, kTraceMarker) != 2) return false;
     module[marker_instruction + 1u] ^= 1u; // mutate 'P', not trailing padding
     return !exact_native_wave64_marker(module);
 }
@@ -208,6 +222,14 @@ int main(int argc, char** argv) {
         return 2;
     }
     const bool full_launch = !full_inputs_path.empty();
+    const int trace_markers = module_marker_count(module, "Prosper.NggTraceWord13Hit14");
+    const int old_trace_markers = module_marker_count(module, "Prosper.NggTraceWord13");
+    if (trace_markers < 0 || trace_markers > 1 || old_trace_markers != 0 ||
+        (trace_markers && !full_launch)) {
+        std::fprintf(stderr,
+                     "ngg_capture_probe: trace marker requires one native full launch\n");
+        return 2;
+    }
     if (full_launch &&
         (!exact_probe_local_size(module, 256u) || !exact_native_wave64_marker(module))) {
         std::fprintf(stderr,
@@ -325,7 +347,8 @@ int main(int argc, char** argv) {
         std::fill(buffers[zero_binding - 2u].begin(),
                   buffers[zero_binding - 2u].end(), 0u);
     const uint32_t lanes = full_launch ? 256u : failure.vertex_count * failure.instance_count;
-    constexpr uint32_t kWords = prosper::gpu::kNggExportProbeWords;
+    const uint32_t kWords = trace_markers ? prosper::gpu::kNggTraceProbeWords
+                                          : prosper::gpu::kNggExportProbeWords;
     const std::array<std::vector<uint32_t>, 3> extra{
         buffers[2], buffers[3], buffers[4]};
     std::vector<float> launch_inputs(full_launch ? static_cast<size_t>(lanes) * 10u : lanes,

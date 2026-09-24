@@ -465,13 +465,15 @@ std::vector<uint32_t> recompile_ngg_exports_for_test(
     const ShaderResourceTable* resources, uint32_t vertices_per_instance,
     uint32_t provisional_merged_wave_info, RecompileDiagnosticContext diagnostic,
     bool packed_gs_offsets_from_inputs, bool full_four_wave_launch_inputs,
-    bool native_wave64) {
+    bool native_wave64, uint32_t trace_pc, uint32_t trace_vgpr) {
+    const bool trace = trace_pc != UINT32_MAX || trace_vgpr != UINT32_MAX;
     if (!code || !dwords || num_inputs > 32 || lds_bytes > 65536u ||
         (packed_gs_offsets_from_inputs && !vertices_per_instance) ||
         (full_four_wave_launch_inputs &&
          (!packed_gs_offsets_from_inputs || num_inputs != 10u)) ||
         (!full_four_wave_launch_inputs && packed_gs_offsets_from_inputs && num_inputs != 2u) ||
-        (native_wave64 && !full_four_wave_launch_inputs))
+        (native_wave64 && !full_four_wave_launch_inputs) ||
+        (trace && (!native_wave64 || trace_pc >= dwords || trace_vgpr > 255u)))
         return {};
     if (resources && std::any_of(resources->resources.begin(), resources->resources.end(),
                                  [](const ShaderResource& r) { return r.binding < 2u; }))
@@ -497,6 +499,10 @@ std::vector<uint32_t> recompile_ngg_exports_for_test(
     SpirvCompute b;
     b.diagnostic = diagnostic;
     b.ngg_workgroup_export_probe = true;
+    if (trace) {
+        b.ngg_probe_trace_pc = trace_pc;
+        b.ngg_probe_trace_vgpr = trace_vgpr;
+    }
     b.vertices_per_instance = vertices_per_instance;
     if (lds_bytes) b.lds_dwords = std::max(1u, (lds_bytes + 3u) / 4u);
     // Only an explicit compile-only experiment may use native Wave64. The resulting module needs
@@ -507,6 +513,11 @@ std::vector<uint32_t> recompile_ngg_exports_for_test(
     if (native_wave64) {
         std::vector<uint32_t> marker;
         b.pstr(marker, "Prosper.NggProbeExactSubgroup=64");
+        b.putv(b.debug, Op_ModuleProcessed, marker);
+    }
+    if (trace) {
+        std::vector<uint32_t> marker;
+        b.pstr(marker, "Prosper.NggTraceWord13Hit14");
         b.putv(b.debug, Op_ModuleProcessed, marker);
     }
     b.declare_guest_scratch(analyze_static_scratch(ins));
@@ -557,7 +568,8 @@ std::vector<uint32_t> recompile_ngg_exports_for_test(
             bool resolved = true;
             const uint32_t bits = operand_bits(b, state, in, in.src[channel], &resolved);
             if (!resolved) return false;
-            b.store_output_word(bits, kNggExportProbeWords, base + channel,
+            b.store_output_word(bits, trace ? kNggTraceProbeWords : kNggExportProbeWords,
+                                base + channel,
                                 state.exec_narrowed ? state.exec : 0);
         }
         return true;
@@ -568,6 +580,13 @@ std::vector<uint32_t> recompile_ngg_exports_for_test(
                    /*allow_smem*/resources != nullptr, export_word, code, dwords,
                    nullptr, true, 0, force_phases_for_dpp) || !saw_export)
         return {};
+    if (trace && !b.ngg_probe_trace_seen) {
+        // Special dispatcher events such as bounded DPP bypass emit_alu. Refuse their PCs
+        // explicitly rather than returning a plausible all-zero trace for an emitted op.
+        log_recompile_diagnostic(diagnostic, "ngg-trace-reject", "terminal",
+                                 "pc=%u no-ordinary-alu-milestone", trace_pc);
+        return {};
+    }
     return b.finish();
 }
 

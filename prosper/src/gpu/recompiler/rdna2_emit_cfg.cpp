@@ -4602,6 +4602,9 @@ bool emit_cfg_state_machine(
                     }
                 }
                 bool ok = true;
+                // CMPX may narrow EXEC while emitting this instruction. A reached-lane trace
+                // records the post-instruction VGPR under the entry EXEC, not the new mask.
+                const uint32_t trace_entry_exec = state.exec_narrowed ? state.exec : 0;
                 const SavedB64MaskSnapshot saved_masks = snapshot_saved_b64_masks(state, in);
                 const bool handled = emit_alu(b, state, in, ok, allow_exec_update, &safe,
                                               allow_smem, rt, /*allow_wave*/false);
@@ -4609,6 +4612,16 @@ bool emit_cfg_state_machine(
                     record_scalar_write(
                         state, in,
                         allows_compute_scalar_vcc_bridge(b), saved_masks);
+                if (handled && ok && in.pc == b.ngg_probe_trace_pc) {
+                    const auto value = state.vreg.find(static_cast<int>(b.ngg_probe_trace_vgpr));
+                    if (value == state.vreg.end())
+                        return reject_cfg(in.pc, "ngg trace missing VGPR");
+                    b.store_output_word(value->second, kNggTraceProbeWords,
+                                        kNggTraceValueWord, trace_entry_exec);
+                    b.store_output_word(b.uconst(1), kNggTraceProbeWords,
+                                        kNggTraceHitWord, trace_entry_exec);
+                    b.ngg_probe_trace_seen = true;
+                }
                 if (!handled || !ok) {
                     // NOT gated on PROSPER_DBG. log_recompile_diagnostic gates its own PRINTING
                     // on that variable and additionally RECORDS the reason for the unconditional
@@ -4979,6 +4992,9 @@ bool emit_cfg_state_machine(
                 bounded ? dpp_add_row_shr->src[0].value : dst);
             const uint32_t source_value =
                 source == state.vreg.end() ? zero : source->second;
+            const auto previous_destination = state.vreg.find(dst);
+            const uint32_t old_destination = previous_destination == state.vreg.end()
+                ? zero : previous_destination->second;
             const uint32_t amount = b.uconst(bounded
                 ? 0x100u | static_cast<uint32_t>(dpp_add_row_shr->dpp_ctrl - 0x110u)
                 : static_cast<uint32_t>(dpp_add_row_shr->dpp_ctrl - 0x110u));
@@ -4988,10 +5004,19 @@ bool emit_cfg_state_machine(
                 // disables a destination whose shifted source lane is inactive.
                 uint32_t valid_source = 0;
                 const uint32_t shifted = b.subgroup_row_shr_dynamic(
-                    source_value, state.exec, amount, 0, &valid_source);
-                const uint32_t result = b.ibin(Op_IAdd, source_value, shifted);
+                    source_value, state.exec,
+                    bounded ? b.uconst(static_cast<uint32_t>(dpp_add_row_shr->dpp_ctrl - 0x110u))
+                            : amount,
+                    0, &valid_source);
+                // The 0x100 bit is this emitter's BOUND_CTRL marker, not a shift amount.
+                // Bounded DPP adds zero for an unavailable source but still writes VDST;
+                // the ordinary unbounded path retains its existing validity rule.
+                const uint32_t result = b.ibin(
+                    Op_IAdd, source_value,
+                    bounded ? b.sel(valid_source, shifted, zero) : shifted);
                 state.vreg[dst] = b.sel(
-                    b.land(state.exec, valid_source), result, source_value);
+                    bounded ? state.exec : b.land(state.exec, valid_source),
+                    result, old_destination);
                 for (auto& vg : state.vgpr_lane_slots)
                     if (vg.first == dst) for (auto& slot : vg.second) slot.second = zero;
                 for (auto& vg : state.vgpr_lane_mask_slots)
@@ -6658,6 +6683,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             if (dead_masks.count(in.pc)) continue;
             if (in.fmt == Rdna2Format::EXP) { if (!exp_fn(rs, in)) return false; continue; }
             bool ok = true;
+            const uint32_t trace_entry_exec = rs.exec_narrowed ? rs.exec : 0;
             const SavedB64MaskSnapshot saved_masks = snapshot_saved_b64_masks(rs, in);
             const bool handled = emit_alu(
                 b, rs, in, ok, allow_exec_update, &effective_safe, allow_smem, rt, wave_ok);
@@ -6691,6 +6717,20 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             if (handled && ok && in.pc == b.tap_pc && in.dst.kind == OperandKind::VGPR) {
                 auto tv = [&](int r) { auto it = rs.vreg.find(r); return it == rs.vreg.end() ? b.uconst(0) : it->second; };
                 b.set_tap(tv(in.dst.value), tv(in.dst.value + 1), tv(in.dst.value + 2), tv(in.dst.value + 3));
+            }
+            if (handled && ok && in.pc == b.ngg_probe_trace_pc) {
+                const auto value = rs.vreg.find(static_cast<int>(b.ngg_probe_trace_vgpr));
+                if (value == rs.vreg.end()) {
+                    log_recompile_diagnostic(b.diagnostic, "ngg-trace-reject", "terminal",
+                                             "pc=%u missing-vgpr=%u", in.pc,
+                                             b.ngg_probe_trace_vgpr);
+                    return false;
+                }
+                b.store_output_word(value->second, kNggTraceProbeWords,
+                                    kNggTraceValueWord, trace_entry_exec);
+                b.store_output_word(b.uconst(1), kNggTraceProbeWords,
+                                    kNggTraceHitWord, trace_entry_exec);
+                b.ngg_probe_trace_seen = true;
             }
             if (!handled || !ok) {
                 // PROSPER_DBG (gated, off by default): report the instruction that fails recompilation —
