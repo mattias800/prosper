@@ -3634,7 +3634,7 @@ int main(int argc, char** argv) {
           rewritten_v58_failure.format_version == 58u &&
           rewritten_v58_failure.failure_diagnostics.size() == 1u &&
           rewritten_v58_failure.failure_diagnostics[0].instance_count == 0u,
-          "rewriting a v57 capture as v58 cannot turn an unavailable count into a known zero");
+          "v57-to-v58 rewrite preserves the zero sentinel for an unavailable count");
     const auto loaded_failed_stage = std::find_if(
         failed_loaded.failure_diagnostics[0].stages.begin(),
         failed_loaded.failure_diagnostics[0].stages.end(), [](const auto& stage) {
