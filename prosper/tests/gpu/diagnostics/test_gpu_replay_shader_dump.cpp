@@ -365,6 +365,11 @@ int main(int argc, char** argv) {
         auto& layered = draw_fixture.failure_diagnostics[0];
         layered.pipeline_present = true;
         layered.pipeline.color_targets[0].write_mask = 0xf;
+        // Distinct non-default raster fields make the failed-draw inspector's culling contract
+        // observable after capture serialization, rather than merely asserting a printed zero.
+        layered.pipeline.cull_mode = 2;   // VkCullModeFlagBits::BACK_BIT
+        layered.pipeline.front_face = 1;  // VkFrontFace::CLOCKWISE
+        layered.pipeline.polygon_mode = 1; // VkPolygonMode::LINE
         layered.color0_base = 0x309cbf0000ull;
         layered.color0_width = layered.color0_height = 32u;
         layered.color_targets[0] = {

@@ -229,6 +229,8 @@ with tempfile.TemporaryDirectory(prefix="gpu-replay-retry-") as scratch:
                   "a v58 pre-realization failure prints unknown rather than a fabricated zero")
             check(known_instances.returncode == 0 and "instances=32" in known_instances.stdout,
                   "a v58 failed draw prints its positive instance count")
+            check(known_instances.returncode == 0 and "raster=2/1/1" in known_instances.stdout,
+                  "a failed draw preserves cull, front-face and polygon state across capture")
             check(known_instances.returncode == 0 and
                   "target-volume slot=0 mip-depth=32 raw-start=0 raw-max=32 "
                   "bounded-start=0 bounded-count=32 base=000000309cbf0000 mask=f"

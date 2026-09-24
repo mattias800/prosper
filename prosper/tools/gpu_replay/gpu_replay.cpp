@@ -1013,12 +1013,14 @@ void inspect_frame(const prosper::gpu::GpuReplayFrame& replay, uint32_t format_v
                 std::printf("?");
             std::printf(" pipeline=%s", failure.pipeline_present ? "yes" : "no");
             if (failure.pipeline_present) {
-                std::printf(" fmt=%u cwm=%x topo=%u depth=%d/%d/%u stencil=%d blend=%d",
+                std::printf(" fmt=%u cwm=%x topo=%u depth=%d/%d/%u stencil=%d blend=%d"
+                            " raster=%u/%u/%u",
                             failure.pipeline.color0_format, failure.pipeline.color_write_mask,
                             failure.pipeline.topology,
                             failure.pipeline.depth_test_enable, failure.pipeline.depth_write_enable,
                             failure.pipeline.depth_compare_op, failure.pipeline.stencil_enable,
-                            failure.pipeline.blend_enable);
+                            failure.pipeline.blend_enable, failure.pipeline.cull_mode,
+                            failure.pipeline.front_face, failure.pipeline.polygon_mode);
                 // A no-effect verdict hinges on the exact per-face stencil program — print it so a
                 // wrongly-skipped stencil writer is visible from the summary alone.
                 if (failure.pipeline.stencil_enable)

@@ -101,6 +101,16 @@ records `GE_CNTL=0x00008040` (both programmed group-size fields are 64),
 actual subgroup split. The original program-only diagnostic filled its eight-line cap on other
 draws using the same shader, which is why the extent/instance filter is needed.
 
+An offline raster check follows the 9-bit indices of every PRIM record in the two **supplied**
+16-instance groups. It finds two opposite-winding, full-screen triangles on each candidate layer
+0–31, with no uncovered 32×32 pixel sample centers and PARAM.xy matching the normalized screen
+coordinates at every referenced vertex. The captured failed draw has `raster=0/0/0` (no culling,
+CCW front, fill), so the opposite windings do not by themselves discard half the lookup. A
+wrong packed-offset input fails this checker with mixed-layer primitives. This is candidate
+geometry only: the actual hardware launch, fragment output, and live title pixels are still
+unverified. The raster-field print is included for failed draws in `gpu_replay --inspect-only`,
+which previously printed it only for realized draws (#3135).
+
 The input-default probe logged changes to earlier fragment programs `0x3007c60000` and `0x3007c80000`
 paired with vertex program `0x3007060000`; it did **not** change the final compositor's input wiring.
 A separate pair trace of `0x3007060000` with fragment `0x30096e0000` found five guest-programmed
