@@ -187,6 +187,28 @@ bool capture_gpustate_submit(const GpuState& state, uint64_t submit_no,
     std::vector<OperationRealizationFailure> failures, compute_failures;
     if (caplog) std::fprintf(stderr, "[cap] realize_gpustate_draws...\n");
     std::vector<DrawItem> draws = realize_gpustate_draws(state, 0x10000, 1.0f, 1.0f, &failures);
+    // Menu full-submit capture reconstructs the failed draws in this callback rather than using
+    // the ordered executor's capture trace. Sample immediately after that realization, with a
+    // distinct log label: these bytes are from capture time, not proven draw-execution time.
+    if (const char* spec = std::getenv("PROSPER_CAPTURE_FAILED_INPUTS_PROGRAM")) {
+        char* end = nullptr;
+        errno = 0;
+        const unsigned long long program = std::strtoull(spec, &end, 0);
+        if (!errno && end && end != spec && !*end && program) {
+            for (auto& failure : failures) {
+                const bool matches = std::any_of(
+                    failure.stages.begin(), failure.stages.end(),
+                    [program](const auto& stage) { return stage.program_addr == program; });
+                if (!matches) continue;
+                const bool complete = snapshot_failed_draw_input_buffers(failure, program);
+                std::fprintf(stderr,
+                             "[failed-input-snapshot] capture-time submit=%llu draw=%zu "
+                             "program=0x%llx %s\n",
+                             static_cast<unsigned long long>(submit_no), failure.index,
+                             program, complete ? "captured" : "declined");
+            }
+        }
+    }
     if (caplog) std::fprintf(stderr, "[cap] realize draws=%zu; realize_compute_dispatches...\n", draws.size());
     std::vector<ComputeItem> computes = realize_compute_dispatches(state, submit_no, &compute_failures);
     if (caplog) std::fprintf(stderr, "[cap] realize computes=%zu; plan_submit_operations...\n", computes.size());

@@ -974,6 +974,9 @@ struct ShaderRealizationDiagnostic {
     std::shared_ptr<ShaderResourceTable> resources;
     RecompileCoverage coverage;
     bool recompiled = false;
+    // Opt-in call-point snapshot of small input buffers for a failed draw. The capture collector
+    // serializes these owned bytes as ordinary blob references; absence remains metadata-only.
+    bool input_bytes_snapshotted = false;
     uint32_t descriptor_issue_count = 0;
     uint32_t first_descriptor_issue = 0xFFFFFFFFu;
     // Failed compute recompilation depends on the complete dispatch ABI, not only the raw program
@@ -1008,6 +1011,63 @@ struct OperationRealizationFailure {
     ComputeLaunchDimensions compute_launch;
     std::vector<ShaderRealizationDiagnostic> stages;
 };
+
+inline bool snapshot_failed_draw_input_buffers(OperationRealizationFailure& failure,
+                                                uint64_t program_addr) {
+    constexpr size_t kMaxOneBuffer = 4096;
+    constexpr size_t kMaxTotalBytes = 64 * 1024;
+    const auto target = std::find_if(failure.stages.begin(), failure.stages.end(),
+                                     [program_addr](const auto& stage) {
+                                         return stage.program_addr == program_addr;
+                                     });
+    if (target == failure.stages.end()) return false;
+    // A chained vertex program shares its resource table across prolog and main. Retain both
+    // stages so a retry can inspect the actual input side, without snapshotting an unrelated PS.
+    const bool vertex_chain = target->stage == ShaderProgramStage::Vertex;
+    size_t total = 0;
+    std::vector<std::shared_ptr<ShaderResourceTable>> snapshots;
+    snapshots.reserve(failure.stages.size());
+    for (const auto& stage : failure.stages) {
+        if (!stage.resources ||
+            (vertex_chain ? stage.stage != ShaderProgramStage::Vertex
+                          : stage.program_addr != program_addr)) {
+            snapshots.push_back({});
+            continue;
+        }
+        auto table = std::make_shared<ShaderResourceTable>(*stage.resources);
+        for (auto& resource : table->resources) {
+            if (resource.cls != ResourceClass::ConstantBuffer &&
+                resource.cls != ResourceClass::VertexBuffer)
+                continue;
+            if (!resource.size || resource.size > kMaxOneBuffer ||
+                total > kMaxTotalBytes - resource.size || resource.table_index_count ||
+                resource.host_data_prefix_bytes)
+                return false;
+            const uint8_t* source = nullptr;
+            if (resource.host_data && resource.host_data_size >= resource.size)
+                source = resource.host_data;
+            else if (!resource.host_data && resource.gpu_addr &&
+                     guest_readable(resource.gpu_addr, resource.size))
+                source = reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(resource.gpu_addr));
+            if (!source) return false;
+            auto bytes = std::make_shared<std::vector<uint8_t>>(
+                source, source + resource.size);
+            resource.host_data = bytes->data();
+            resource.host_data_size = bytes->size();
+            resource.host_data_prefix_bytes = 0;
+            table->owned_host_data.push_back(std::move(bytes));
+            total += resource.size;
+        }
+        snapshots.push_back(std::move(table));
+    }
+    if (!total) return false;
+    for (size_t i = 0; i < failure.stages.size(); ++i)
+        if (snapshots[i]) {
+            failure.stages[i].resources = std::move(snapshots[i]);
+            failure.stages[i].input_bytes_snapshotted = true;
+        }
+    return true;
+}
 
 using LiveComputeFn = std::function<bool(const std::vector<ComputeItem>& items)>;
 
