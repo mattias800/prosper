@@ -72,6 +72,21 @@ These are still **supplied** launch inputs, not validated hardware subgroups, pr
 fix. The captured blobs are callback-time copies and the live renderer still rejects the producer. #3135
 remains open.
 
+The LUT fragment program has a separate missing input. A live exact-program trace records
+`SPI_PS_INPUT_ENA=SPI_PS_INPUT_ADDR=0x2020`, enabling fields 5 and 13. Its first vector instruction,
+`v_bfe_u32 v3, v2, 16, 11`, extracts the array index from the ancillary VGPR (v2 after field 5's
+two VGPRs). The fragment recompiler previously reserved that register but left it at zero, and a
+private execution of the exact live fragment module with supplied full-screen geometry produced
+32 byte-identical LUT slices. A controlled fragment `Layer` input and view-base specialization
+produced 32 distinct slices in that fixture; neither result establishes the correct guest LUT.
+
+The four eight-slice batches were **fixture-only**, not production behavior. Live Kena passes one
+32-slice view to the backend, which refuses mesh draws exceeding this device's
+`maxMeshOutputLayers`; live draw construction does not yet wire the guest NGG chain into MeshEXT.
+Partitioning will need a proved mapping for guest workgroups, primitive layer output and side
+effects. The guest view's starting slice and an internal host batch offset must remain distinct;
+the fixture's base values cannot be copied into production without that contract.
+
 A targeted live state log for that same producer records `SPI_SHADER_PGM_RSRC2_GS=0x008b0000`
 (2,176 LDS dwords, 8.5 KiB), `VGT_GS_ONCHIP_CNTL=0x10020040`
 (64 ES vertices, 64 GS primitives and 64 instanced primitives per subgroup using the

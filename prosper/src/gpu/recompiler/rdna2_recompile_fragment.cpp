@@ -492,6 +492,8 @@ static std::vector<uint32_t> recompile_fragment_impl(
                     }
                 } else if (field >= 8 && field <= 11) {
                     rs.vreg[(int)vgpr] = b.fragcoord_component(field - 8);
+                } else if (field == 13) {
+                    rs.vreg[(int)vgpr] = b.fragment_ancillary_layer_bits();
                 }
             }
             vgpr += widths[field];

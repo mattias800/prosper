@@ -1280,6 +1280,7 @@ struct RenderVkCtx {
     bool aniso_enabled = false; float max_aniso_limit = 1.0f;
     bool depth_bias_clamp_enabled = false;   // VkPhysicalDeviceFeatures::depthBiasClamp (#1349)
     bool logic_op_enabled = false; bool ok = false;
+    bool geometry_shader_enabled = false;
     bool fragment_stores_atomics = false;
     // Per-draw "fragment funnel" diagnostic (PROSPER_DRAW_STATS): pipeline-statistics + precise
     // occlusion queries. Enabled at device creation only when advertised; inert otherwise.
@@ -1598,6 +1599,7 @@ inline const RenderVkCtx& render_vk_ctx() {
         // lack explicit vertex-parameter fragment extensions. Core geometryShader is available on
         // the Linux llvmpipe headless target and the desktop Vulkan drivers we support.
         feats.geometryShader = supported.geometryShader;
+        r.geometry_shader_enabled = supported.geometryShader;
         // Storage-image shaders declare the format-free read/write capabilities. Enable every
         // corresponding core feature advertised by the device; fragment/vertex stores additionally
         // need their pipeline-stage store features.
@@ -9209,6 +9211,28 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         const std::vector<uint32_t>& bd_gs = bd.gs_words();
         const std::vector<uint32_t>& bd_fs = bd.fs_words();
         DV& v = dv[di];
+        if (!ctx.geometry_shader_enabled && bd_fs.size() >= 5 &&
+            bd_fs[0] == 0x07230203u) {
+            // Fragment BuiltIn Layer declares the Geometry SPIR-V capability even
+            // without a geometry stage. Skip cleanly on portability devices that
+            // did not advertise the optional core geometryShader feature.
+            bool needs_geometry = false;
+            for (size_t word = 5; word < bd_fs.size();) {
+                const uint32_t count = bd_fs[word] >> 16;
+                if (!count || count > bd_fs.size() - word) break;
+                if ((bd_fs[word] & 0xffffu) == 17u && count >= 2u &&
+                    bd_fs[word + 1] == 2u) {
+                    needs_geometry = true;
+                    break;
+                }
+                word += count;
+            }
+            if (needs_geometry) {
+                std::fprintf(stderr,
+                    "[render] draw=%zu fragment Geometry capability unavailable; skipped\n", di);
+                continue;
+            }
+        }
         if (bd.mesh_draw) {
             const uint64_t groups_xy =
                 static_cast<uint64_t>(bd.mesh_groups[0]) * bd.mesh_groups[1];

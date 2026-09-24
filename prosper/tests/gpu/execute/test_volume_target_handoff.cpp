@@ -3,6 +3,7 @@
 // readback/upload. The shader colors and pixel expectations are independent of cache metadata.
 #include "fixtures/render_runner.h"
 #include "volume_target_spirv.h"
+#include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include <array>
 #include <cstdint>
 #include <cstdio>
@@ -122,6 +123,70 @@ int main() {
         !red(pixel(initial, 40)) || !red(pixel(initial, 56))) {
         std::fprintf(stderr, "3D consumer did not sample every red producer slice\n");
         return 1;
+    }
+
+    // The first instruction is byte-identical to Kena's LUT pixel shader:
+    // v_bfe_u32 v3, v2, 16, 11. Field 5 consumes v0-v1; field 13 (ANCILLARY)
+    // occupies v2. Export its extracted layer as red/8, so four layer outputs
+    // stay distinguishable in RGBA8. The disabled control reserves v2 but must
+    // retain its old zero value; an unconditional gl_Layer read would fail it.
+    const uint32_t ancillary_ps[] = {
+        0xd5480003u, 0x022d2102u, // v_bfe_u32 v3, v2, 16, 11
+        0x7e000d03u,              // v_cvt_f32_u32 v0, v3
+        0x100000ffu, 0x3e000000u, // v_mul_f32 v0, 0.125, v0
+        0x7e020280u, 0x7e040280u, 0x7e0602f2u,
+        0xf800080fu, 0x03020100u, 0xbf810000u,
+    };
+    prosper::gpu::PixelSystemInputMapping ancillary_inputs{};
+    ancillary_inputs.addr = (1u << 5) | (1u << 13);
+    ancillary_inputs.ena = ancillary_inputs.addr;
+    const auto ancillary_frag = prosper::gpu::recompile_fragment(
+        ancillary_ps, std::size(ancillary_ps), nullptr, &ancillary_inputs);
+    ancillary_inputs.ena = 1u << 5;
+    const auto disabled_frag = prosper::gpu::recompile_fragment(
+        ancillary_ps, std::size(ancillary_ps), nullptr, &ancillary_inputs);
+    if (ancillary_frag.empty() || disabled_frag.empty()) {
+        std::fprintf(stderr, "ancillary pixel-system fixture did not recompile\n");
+        return 1;
+    }
+    VkPhysicalDeviceFeatures supported_features{};
+    vkGetPhysicalDeviceFeatures(ctx.phys, &supported_features);
+    if (supported_features.geometryShader) {
+        auto check_layers = [&](uint64_t id, const std::vector<uint32_t>& fragment,
+                                bool enabled) {
+            if (!produce(id, kDepth, 0, kDepth, fragment)) return false;
+            std::vector<uint8_t> bytes;
+            std::string error;
+            if (!readback_persistent_color_target(id, kWidth, kHeight,
+                    VK_FORMAT_R8G8B8A8_UNORM, bytes, error, kDepth)) return false;
+            for (uint32_t layer = 0; layer < kDepth; ++layer) {
+                const size_t at = (static_cast<size_t>(layer) * kWidth * kHeight +
+                                   static_cast<size_t>(kHeight / 2) * kWidth + kWidth / 2) * 4;
+                if (bytes.size() < at + 4) return false;
+                const uint32_t expected = enabled ? layer * 32u : 0u;
+                const uint32_t actual = bytes[at];
+                if (actual + 2u < expected || actual > expected + 2u ||
+                    bytes[at + 3] < 250u) return false;
+            }
+            return true;
+        };
+        if (!check_layers(kTarget + 0x500000u, ancillary_frag, true) ||
+            !check_layers(kTarget + 0x600000u, disabled_frag, false)) {
+            std::fprintf(stderr, "ancillary layer input or disabled control rendered incorrectly\n");
+            return 1;
+        }
+        BackendDraw flat_ancillary;
+        flat_ancillary.vs = vertex;
+        flat_ancillary.fs = ancillary_frag;
+        const auto flat_pixels = render_draws_rgba({flat_ancillary}, kWidth, kHeight);
+        const size_t flat_at =
+            (static_cast<size_t>(kHeight / 2) * kWidth + kWidth / 2) * 4;
+        if (flat_pixels.size() < flat_at + 4 || flat_pixels[flat_at] != 0u ||
+            flat_pixels[flat_at + 2] != 0u || flat_pixels[flat_at + 3] < 250u) {
+            std::fprintf(stderr, "single-layer ancillary draw did not use layer zero\n");
+            return 1;
+        }
+        std::fprintf(stderr, "ancillary layer input, disabled slot, and 2D default passed\n");
     }
 
     if (!produce(kTarget, kDepth, 2, 2, green_shader)) {

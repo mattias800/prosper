@@ -196,6 +196,24 @@ uint32_t SpirvCompute::fragcoord_component(uint32_t component) {
         return bcu(scalar);
     }
 
+uint32_t SpirvCompute::fragment_ancillary_layer_bits() {
+        // Layer is a fragment Input. SPIR-V requires Geometry capability for this
+        // BuiltIn even when the preceding stage is a mesh shader. This is emitted
+        // only for programs whose pixel-system ENA and ADDR both select ancillary.
+        put(caps, Op_Capability, {Cap_Geometry});
+        const uint32_t pointer_type = id();
+        const uint32_t layer = id();
+        put(types, Op_TypePointer, {pointer_type, SC_Input, t_i32});
+        put(types, Op_Variable, {pointer_type, layer, SC_Input});
+        put(deco, Op_Decorate, {layer, Dec_BuiltIn, BI_Layer});
+        put(deco, Op_Decorate, {layer, Dec_Flat});
+        iface.push_back(layer);
+        const uint32_t raw = id();
+        put(code, Op_Load, {t_i32, raw, layer});
+        return ibin(Op_ShiftLeftLogical,
+                    ibin(Op_BitwiseAnd, i2u(raw), uconst(0x7ffu)), uconst(16u));
+    }
+
 uint32_t SpirvCompute::vtx_output(uint32_t loc) {
         auto it = out_varying.find(loc); if (it != out_varying.end()) return it->second;
         uint32_t v = id(); put(types, Op_Variable, {t_ptr_out_v4f, v, SC_Output});

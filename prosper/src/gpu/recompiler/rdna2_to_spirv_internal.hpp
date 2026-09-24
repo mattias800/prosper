@@ -287,7 +287,7 @@ enum : uint32_t {
     Dec_DescriptorSet=34, Dec_Offset=35, Dec_XfbBuffer=36, Dec_XfbStride=37,
     // Decoration 5300 -- descriptor indexing's NonUniform, unrelated to the GroupNonUniform ops.
     Dec_NonUniform=5300,
-    BI_Position=0, BI_FragCoord=15, BI_SampleMask=20, BI_FragDepth=22, BI_HelperInvocation=23,
+    BI_Position=0, BI_Layer=9, BI_FragCoord=15, BI_SampleMask=20, BI_FragDepth=22, BI_HelperInvocation=23,
     BI_WorkgroupId=26, BI_LocalInvocationId=27,
     BI_GlobalInvocationId=28, BI_SubgroupId=40, BI_SubgroupLocalInvocationId=41,
     BI_VertexIndex=42, BI_InstanceIndex=43,
@@ -2296,6 +2296,9 @@ struct SpirvCompute {
     uint32_t v_fragcoord = 0;
     uint32_t fragcoord_var();
     uint32_t fragcoord_component(uint32_t component);
+    // SPI_PS_INPUT_ENA.ANCILLARY_ENA places the rasterized primitive's render-target
+    // array index in bits 26:16 of its one VGPR. Other ancillary fields remain zero.
+    uint32_t fragment_ancillary_layer_bits();
     // DPP16 quad_perm (#273 — DOLL's manual ddx/ddy in its sharpen/AA PSs): the value of `x` at quad
     // lane t = QP[my_lane] is reconstructed as x + (tx-px)·dPdx(x) + (ty-py)·dPdy(x), where (px,py) =
     // (int(gl_FragCoord.xy) & 1) is this invocation's quad position and (tx,ty) = (t&1, t>>1). Exact
