@@ -58,6 +58,21 @@ per-vertex shortcut rejects it. A mesh/workgroup execution path must preserve it
 lifting the vertex `v_mbcnt` gate would not do that. The ordered captures remain unverified against their own
 presented frame. The live same-draw bracket establishes the bound zero LUT and black output independently.
 
+A targeted live state log for that same producer records `SPI_SHADER_PGM_RSRC2_GS=0x008b0000`
+(2,176 LDS dwords, 8.5 KiB), `VGT_GS_ONCHIP_CNTL=0x10020040`
+(64 ES vertices, 64 GS primitives and 64 instanced primitives per subgroup using the
+[gfx10 register layout](https://chromium.googlesource.com/chromiumos/third_party/mesa/+/refs/heads/stabilize-13982.70.B-chromeos-amd/src/amd/registers/gfx10.json)),
+`GE_NGG_SUBGRP_CNTL=1`, `VGT_GS_MAX_VERT_OUT=3`,
+`CB_COLOR0_VIEW=0x00040000`, and `CB_COLOR0_ATTRIB3=0x4606c01f`. The latter's
+`MIP0_DEPTH=31` encodes 32 slices and its resource-type field is 2; the immediately following
+consumer binds the same address as a 32³ texture. The present Vulkan backend allocates
+ordinary color attachments as one-layer 2D images. That is a separate missing output path, even if
+the shader starts compiling. The slice-max register is recorded raw rather than interpreted as a
+layer count until its boundary convention is established. On this AMD host, a standalone mesh draw
+rendered 32 layers in four eight-layer batches with Khronos validation loaded and no reported
+errors. This proves only that the host API route exists: the guest wave/primitive mapping, layered
+renderer publication, and correct LUT values still need implementation and game verification.
+
 The input-default probe logged changes to earlier fragment programs `0x3007c60000` and `0x3007c80000`
 paired with vertex program `0x3007060000`; it did **not** change the final compositor's input wiring.
 A separate pair trace of `0x3007060000` with fragment `0x30096e0000` found five guest-programmed

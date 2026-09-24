@@ -974,7 +974,7 @@ void inspect_frame(const prosper::gpu::GpuReplayFrame& replay, uint32_t format_v
             std::printf("  target=%016llx extent=%ux%u vertices=%u instances=",
                         static_cast<unsigned long long>(failure.color0_base),
                         failure.color0_width, failure.color0_height, failure.vertex_count);
-            if (failure.instance_count)
+            if (format_version >= 58u)
                 std::printf("%u", failure.instance_count);
             else
                 std::printf("?");
