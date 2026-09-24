@@ -56,16 +56,26 @@ int main() {
     const std::vector<uint32_t> sample_shader(
         std::begin(prosper::test::volume_fixture::sample),
         std::end(prosper::test::volume_fixture::sample));
+    const std::vector<uint32_t> param_mesh(
+        std::begin(prosper::test::volume_fixture::param_mesh),
+        std::end(prosper::test::volume_fixture::param_mesh));
+    const std::vector<uint32_t> wrong_param_mesh(
+        std::begin(prosper::test::volume_fixture::wrong_param_mesh),
+        std::end(prosper::test::volume_fixture::wrong_param_mesh));
+    const std::vector<uint32_t> param_fragment(
+        std::begin(prosper::test::volume_fixture::param_fragment),
+        std::end(prosper::test::volume_fixture::param_fragment));
     #include "../tools/boot_trace/refvs.inc"
     const std::vector<uint32_t> vertex(kRefVs, kRefVs + sizeof(kRefVs) / 4);
 
     auto produce = [&](uint64_t id, uint32_t depth, uint32_t first, uint32_t count,
                        const std::vector<uint32_t>& fragment,
-                       uint32_t width = kWidth, uint32_t height = kHeight) {
+                       uint32_t width = kWidth, uint32_t height = kHeight,
+                       const std::vector<uint32_t>* mesh_override = nullptr) {
         BackendDraw draw;
         draw.mesh_draw = true;
         draw.mesh_groups = {count, 1, 1};
-        draw.vs = mesh_shader;
+        draw.vs = mesh_override ? *mesh_override : mesh_shader;
         draw.fs = fragment;
         BackendColorTarget target;
         target.persistent_id = id;
@@ -326,6 +336,85 @@ int main() {
             }
         }
         std::puts("32-slice retained volume passed four eight-layer views");
+    }
+    // The guest producer exports an interpolated PARAM as well as a primitive layer. Constant
+    // fragment colors above cannot detect a lost or mislinked PARAM on the MeshEXT handoff.
+    {
+        constexpr uint64_t param_id = kTarget + 0xa00000u;
+        for (uint32_t group = 0; group < large_depth / partition; ++group) {
+            if (!produce(param_id, large_depth, group * partition, partition,
+                         param_fragment, kWidth, kHeight, &param_mesh)) {
+                std::fprintf(stderr, "layered PARAM producer group %u failed\n", group);
+                return 1;
+            }
+        }
+        const auto delivered = consume(param_id, large_depth);
+        if (backend_color_target_stats().sampled_hits != 1 ||
+            pixel(delivered, 24)[0] < 33 || pixel(delivered, 24)[0] > 40 ||
+            pixel(delivered, 56)[0] < 106 || pixel(delivered, 56)[0] > 113) {
+            std::fprintf(stderr, "layered PARAM image was not sampled directly\n");
+            return 1;
+        }
+        volume_bytes.clear();
+        if (!readback_persistent_color_target(param_id, kWidth, kHeight,
+                                              VK_FORMAT_R8G8B8A8_UNORM, volume_bytes,
+                                              readback_error, large_depth)) {
+            std::fprintf(stderr, "layered PARAM readback failed: %s\n",
+                         readback_error.c_str());
+            return 1;
+        }
+        auto texel = [&](const std::vector<uint8_t>& bytes, uint32_t z, uint32_t x) {
+            const size_t at = (static_cast<size_t>(z) * kWidth * kHeight +
+                               static_cast<size_t>(kHeight / 2) * kWidth + x) * 4;
+            if (bytes.size() < at + 4) return std::array<uint8_t, 4>{};
+            return std::array<uint8_t, 4>{bytes[at], bytes[at + 1],
+                                          bytes[at + 2], bytes[at + 3]};
+        };
+        auto matches = [&](const std::vector<uint8_t>& bytes, uint32_t z) {
+            const auto left = texel(bytes, z, 8);
+            const auto center = texel(bytes, z, kWidth / 2);
+            const auto right = texel(bytes, z, 56);
+            const uint32_t expected_red = ((z % partition) * 255u + 3u) / 7u;
+            const auto red_near = [&](uint8_t actual) {
+                return actual + 3u >= expected_red && actual <= expected_red + 3u;
+            };
+            return red_near(left[0]) && red_near(center[0]) && red_near(right[0]) &&
+                   left[1] < 32 && center[1] > 55 && center[1] < 75 &&
+                   right[1] > 96 && center[2] > 55 && center[2] < 75 &&
+                   center[3] > 250;
+        };
+        if (volume_bytes.size() != static_cast<size_t>(kWidth) * kHeight * large_depth * 4)
+            return 1;
+        for (uint32_t z = 0; z < large_depth; ++z) {
+            if (!matches(volume_bytes, z)) {
+                const auto center = texel(volume_bytes, z, kWidth / 2);
+                std::fprintf(stderr, "layered PARAM slice %u center=%u,%u,%u,%u\n",
+                             z, center[0], center[1], center[2], center[3]);
+                return 1;
+            }
+        }
+        // Same geometry/layer output, deliberately wrong PARAM. If the positive assertion were
+        // accidentally tied only to the render target rather than the fragment input, it would
+        // accept this independently rendered image too.
+        constexpr uint64_t wrong_id = param_id + 0x100000u;
+        if (!produce(wrong_id, partition, 0, partition, param_fragment,
+                     kWidth, kHeight, &wrong_param_mesh)) return 1;
+        std::vector<uint8_t> wrong_bytes;
+        if (!readback_persistent_color_target(wrong_id, kWidth, kHeight,
+                                              VK_FORMAT_R8G8B8A8_UNORM, wrong_bytes,
+                                              readback_error, partition) ||
+            wrong_bytes.size() != static_cast<size_t>(kWidth) * kHeight * partition * 4) {
+            std::fprintf(stderr, "wrong PARAM control did not render\n");
+            return 1;
+        }
+        const auto wrong_center = texel(wrong_bytes, partition - 1, kWidth / 2);
+        if (wrong_center[0] < 200 || wrong_center[1] > 50 ||
+            wrong_center[2] < 200 || wrong_center[3] < 200 ||
+            matches(wrong_bytes, partition - 1)) {
+            std::fprintf(stderr, "wrong PARAM control passed the layer guard\n");
+            return 1;
+        }
+        std::puts("32-slice mesh PARAM interpolation and wrong-PARAM control passed");
     }
     std::puts("retained volume writes, partial update, direct 3D sample and invalidation passed");
     return 0;

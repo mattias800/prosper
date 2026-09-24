@@ -3,6 +3,9 @@
 layout(local_size_x = 32) in;
 layout(triangles) out;
 layout(max_vertices = 3, max_primitives = 1) out;
+#ifdef PARAM_COLOR
+layout(location = 0) out vec4 layer_param[];
+#endif
 
 void main() {
     uint lane = gl_LocalInvocationIndex;
@@ -11,6 +14,17 @@ void main() {
         vec2 p = lane == 0 ? vec2(-1.0, -1.0) :
                  lane == 1 ? vec2(3.0, -1.0) : vec2(-1.0, 3.0);
         gl_MeshVerticesEXT[lane].gl_Position = vec4(p, 0.0, 1.0);
+#ifdef PARAM_COLOR
+        // The red channel identifies the local layer. Green and blue vary over the triangle,
+        // so a constant or missing PARAM export cannot pass the readback guard.
+#ifdef WRONG_PARAM
+        layer_param[lane] = vec4(1.0, 0.0, 1.0, 1.0);
+#else
+        layer_param[lane] = vec4(float(gl_WorkGroupID.x) / 7.0,
+                                 lane == 1 ? 1.0 : 0.0,
+                                 lane == 2 ? 1.0 : 0.0, 1.0);
+#endif
+#endif
     }
     if (lane == 0) {
         gl_PrimitiveTriangleIndicesEXT[0] = uvec3(0, 1, 2);
