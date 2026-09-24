@@ -45,6 +45,68 @@ inline constexpr uint64_t kHugeReserveLen = 0x2000000000ull;   // 128 GiB
 
 namespace {
 std::atomic<uint64_t> g_guest_memory_gpu_write_successes{0};
+
+// A protection change or a partial remap splits one guest allocation into several mapping
+// records. Physical-alias queries must examine every covered segment: the first record's extent
+// and physical offset say nothing about its neighbors. The caller holds the mapping-table lock.
+template <typename Mapping>
+GuestMemoryTopologyRelation mapped_topology_relation(
+        const std::vector<Mapping>& maps, uint32_t direct_flag,
+        uint64_t first_address, uint64_t first_end,
+        uint64_t second_address, uint64_t second_end) {
+    const auto at_or_before = [&](uint64_t address) {
+        auto after = std::upper_bound(
+            maps.begin(), maps.end(), address,
+            [](uint64_t value, const Mapping& mapping) { return value < mapping.base; });
+        return after == maps.begin() ? maps.end() : std::prev(after);
+    };
+    const auto covered = [&](auto it, uint64_t address, uint64_t end) {
+        while (address < end) {
+            if (it == maps.end() || !it->committed || it->base > address ||
+                it->size > UINT64_MAX - it->base ||
+                address - it->base >= it->size) return false;
+            address = std::min(end, it->base + it->size);
+            ++it;
+        }
+        return true;
+    };
+    const auto first_begin = at_or_before(first_address);
+    const auto second_begin = at_or_before(second_address);
+    if (!covered(first_begin, first_address, first_end) ||
+        !covered(second_begin, second_address, second_end))
+        return GuestMemoryTopologyRelation::Unknown;
+
+    for (auto first = first_begin;
+         first != maps.end() && first->base < first_end; ++first) {
+        if (!(first->query_flags & direct_flag)) continue;
+        const uint64_t first_start = std::max(first_address, first->base);
+        const uint64_t first_stop = std::min(first_end, first->base + first->size);
+        const uint64_t first_delta = first_start - first->base;
+        const uint64_t first_bytes = first_stop - first_start;
+        if (first->offset > UINT64_MAX - first_delta)
+            return GuestMemoryTopologyRelation::Unknown;
+        const uint64_t first_physical = first->offset + first_delta;
+        if (first_physical > UINT64_MAX - first_bytes)
+            return GuestMemoryTopologyRelation::Unknown;
+        for (auto second = second_begin;
+             second != maps.end() && second->base < second_end; ++second) {
+            if (!(second->query_flags & direct_flag)) continue;
+            const uint64_t second_start = std::max(second_address, second->base);
+            const uint64_t second_stop = std::min(second_end, second->base + second->size);
+            const uint64_t second_delta = second_start - second->base;
+            const uint64_t second_bytes = second_stop - second_start;
+            if (second->offset > UINT64_MAX - second_delta)
+                return GuestMemoryTopologyRelation::Unknown;
+            const uint64_t second_physical = second->offset + second_delta;
+            if (second_physical > UINT64_MAX - second_bytes)
+                return GuestMemoryTopologyRelation::Unknown;
+            if (first_physical < second_physical + second_bytes &&
+                second_physical < first_physical + first_bytes)
+                return GuestMemoryTopologyRelation::Overlap;
+        }
+    }
+    return GuestMemoryTopologyRelation::Disjoint;
+}
 }
 
 uint64_t guest_memory_gpu_write_successes_for_test() {
@@ -3614,44 +3676,9 @@ GuestMemoryTopologyRelation guest_memory_topology_relation(
         return GuestMemoryTopologyRelation::Overlap;
 
     std::lock_guard<std::mutex> lock(g_mx);
-    const auto resolve = [](uint64_t address, uint64_t size, const Mapping*& result) {
-        const auto after = std::upper_bound(
-            g_maps.begin(), g_maps.end(), address,
-            [](uint64_t value, const Mapping& mapping) { return value < mapping.base; });
-        if (after == g_maps.begin()) return false;
-        const Mapping& mapping = *std::prev(after);
-        if (!mapping.committed || address < mapping.base ||
-            address - mapping.base >= mapping.size ||
-            size > mapping.size - (address - mapping.base))
-            return false;
-        result = &mapping;
-        return true;
-    };
-    const Mapping* first = nullptr;
-    const Mapping* second = nullptr;
-    if (!resolve(first_address, first_size, first) ||
-        !resolve(second_address, second_size, second))
-        return GuestMemoryTopologyRelation::Unknown;
-
-    const bool first_direct = (first->query_flags & kVirtualQueryDirect) != 0;
-    const bool second_direct = (second->query_flags & kVirtualQueryDirect) != 0;
-    if (first_direct != second_direct || !first_direct)
-        return GuestMemoryTopologyRelation::Disjoint;
-
-    const uint64_t first_delta = first_address - first->base;
-    const uint64_t second_delta = second_address - second->base;
-    if (first_delta > UINT64_MAX - first->offset ||
-        second_delta > UINT64_MAX - second->offset)
-        return GuestMemoryTopologyRelation::Unknown;
-    const uint64_t first_physical = first->offset + first_delta;
-    const uint64_t second_physical = second->offset + second_delta;
-    if (first_physical > UINT64_MAX - first_size ||
-        second_physical > UINT64_MAX - second_size)
-        return GuestMemoryTopologyRelation::Unknown;
-    return first_physical < second_physical + second_size &&
-                   second_physical < first_physical + first_size
-               ? GuestMemoryTopologyRelation::Overlap
-               : GuestMemoryTopologyRelation::Disjoint;
+    return mapped_topology_relation(
+        g_maps, kVirtualQueryDirect, first_address, first_end,
+        second_address, second_end);
 }
 
 bool guest_memory_gpu_write_supported(uint64_t destination, size_t bytes) {
@@ -7946,44 +7973,9 @@ GuestMemoryTopologyRelation guest_memory_topology_relation(
         return GuestMemoryTopologyRelation::Overlap;
 
     std::lock_guard<std::mutex> lock(g_mx);
-    const auto resolve = [](uint64_t address, uint64_t size, const Mapping*& result) {
-        const auto after = std::upper_bound(
-            g_maps.begin(), g_maps.end(), address,
-            [](uint64_t value, const Mapping& mapping) { return value < mapping.base; });
-        if (after == g_maps.begin()) return false;
-        const Mapping& mapping = *std::prev(after);
-        if (!mapping.committed || address < mapping.base ||
-            address - mapping.base >= mapping.size ||
-            size > mapping.size - (address - mapping.base))
-            return false;
-        result = &mapping;
-        return true;
-    };
-    const Mapping* first = nullptr;
-    const Mapping* second = nullptr;
-    if (!resolve(first_address, first_size, first) ||
-        !resolve(second_address, second_size, second))
-        return GuestMemoryTopologyRelation::Unknown;
-
-    const bool first_direct = (first->query_flags & kVirtualQueryDirect) != 0;
-    const bool second_direct = (second->query_flags & kVirtualQueryDirect) != 0;
-    if (first_direct != second_direct || !first_direct)
-        return GuestMemoryTopologyRelation::Disjoint;
-
-    const uint64_t first_delta = first_address - first->base;
-    const uint64_t second_delta = second_address - second->base;
-    if (first_delta > UINT64_MAX - first->offset ||
-        second_delta > UINT64_MAX - second->offset)
-        return GuestMemoryTopologyRelation::Unknown;
-    const uint64_t first_physical = first->offset + first_delta;
-    const uint64_t second_physical = second->offset + second_delta;
-    if (first_physical > UINT64_MAX - first_size ||
-        second_physical > UINT64_MAX - second_size)
-        return GuestMemoryTopologyRelation::Unknown;
-    return first_physical < second_physical + second_size &&
-                   second_physical < first_physical + first_size
-               ? GuestMemoryTopologyRelation::Overlap
-               : GuestMemoryTopologyRelation::Disjoint;
+    return mapped_topology_relation(
+        g_maps, kVirtualQueryDirect, first_address, first_end,
+        second_address, second_end);
 }
 
 bool guest_memory_gpu_write_supported(uint64_t destination, size_t bytes) {
