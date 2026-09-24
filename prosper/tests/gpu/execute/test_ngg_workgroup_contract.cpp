@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <string>
 #include <vector>
 
 using prosper::gpu::recompile_valu;
@@ -377,6 +378,91 @@ int main() {
     };
     if (!count_matches(count_output(count_guest), 1u)) {
         std::fprintf(stderr, "portable saved-mask count missed lane 40 or its other consumers\n");
+        return 1;
+    }
+    // Native Wave64 is optional. Where Vulkan 1.3 can require four complete 64-lane subgroups,
+    // check that each guest wave gets its own saved-mask count inside one 256-lane LDS workgroup.
+    // The ordinary runner cannot substitute its advertised/default subgroup width for this test.
+    if (prosper::test::default_compute_required_subgroup_supported(64u, 255u)) {
+        std::fprintf(stderr, "native Wave64 gate accepted an incomplete workgroup\n");
+        return 1;
+    }
+    auto native_count_guest = count_guest;
+    native_count_guest.insert(native_count_guest.begin() + 5, 0xbf8a0000u); // safe phase barrier
+    const auto native_module = recompile_ngg_exports_for_test(
+        native_count_guest.data(), native_count_guest.size(), 10, 0, nullptr, 4, 0,
+        {}, true, true, true);
+    if (native_module.empty()) {
+        std::fprintf(stderr, "native four-wave saved-mask program did not compile\n");
+        return 1;
+    }
+    if (prosper::test::default_compute_required_subgroup_supported(64u, 256u)) {
+        std::vector<float> native_inputs(256u * 10u, 0.0f);
+        for (uint32_t lane = 0; lane < 256u; ++lane)
+            native_inputs[static_cast<size_t>(lane) * 10u] =
+                static_cast<float>((lane % 64u) * 4u);
+        const auto run_native = [&](const std::vector<float>& input) {
+            return prosper::test::run_compute(
+                native_module, input, 256u,
+                256u * prosper::gpu::kNggExportProbeWords,
+                {}, {}, nullptr, 256u, nullptr, nullptr, nullptr, 64u);
+        };
+        const auto native_matches = [&](const std::vector<float>& output,
+                                        uint32_t wave_one_count) {
+            if (output.size() != 256u * prosper::gpu::kNggExportProbeWords) return false;
+            for (uint32_t lane = 0; lane < 256u; ++lane) {
+                const uint32_t expected = lane / 64u == 1u ? wave_one_count : 1u;
+                if (std::bit_cast<uint32_t>(
+                        output[static_cast<size_t>(lane) * prosper::gpu::kNggExportProbeWords])
+                    != expected) return false;
+            }
+            return true;
+        };
+        if (!native_matches(run_native(native_inputs), 1u)) {
+            std::fprintf(stderr, "native four-wave saved-mask count crossed a wave boundary\n");
+            return 1;
+        }
+        native_inputs[static_cast<size_t>(64u + 40u) * 10u] = 0.0f;
+        if (!native_matches(run_native(native_inputs), 0u)) {
+            std::fprintf(stderr, "native Wave64 one-wave mutation was not isolated\n");
+            return 1;
+        }
+    } else {
+        std::fprintf(stderr, "native Wave64 execution skipped: exact full subgroup unavailable\n");
+    }
+    constexpr std::array<uint32_t, 5> skipped_barrier_guest = {
+        0xbf840001u,              // s_cbranch_scc0 skips the barrier
+        0xbf8a0000u,              // unsafe for a 256-lane workgroup
+        0xf8000941u, 0x00000000u, // EXP PRIM, v0
+        0xbf810000u,
+    };
+    constexpr uint64_t kSkippedBarrierAddress = 0x3135000000ull;
+    if (!recompile_ngg_exports_for_test(
+            skipped_barrier_guest.data(), skipped_barrier_guest.size(),
+            10, 0, nullptr, 4, 0,
+            {prosper::gpu::RecompileDiagnosticStage::Vertex, kSkippedBarrierAddress},
+            true, true, true).empty() ||
+        prosper::gpu::last_terminal_reject_reason(kSkippedBarrierAddress).find(
+            "reason=barrier-phase-proof") == std::string::npos) {
+        std::fprintf(stderr, "native four-wave probe admitted a skipped barrier\n");
+        return 1;
+    }
+    constexpr std::array<uint32_t, 5> per_wave_guard_guest = {
+        0xbe800380u, // s_mov_b32 s0, 0
+        0xbf060003u, // s_cmp_eq_u32 s3, s0: s3 may differ between guest waves
+        0xbf840001u, // s_cbranch_scc0 -> terminal s_endpgm
+        0xbf8a0000u, // s_barrier, reached only by some waves
+        0xbf810000u,
+    };
+    constexpr uint64_t kPerWaveGuardAddress = 0x3135000001ull;
+    if (!recompile_ngg_exports_for_test(
+            per_wave_guard_guest.data(), per_wave_guard_guest.size(),
+            10, 0, nullptr, 4, 0,
+            {prosper::gpu::RecompileDiagnosticStage::Vertex, kPerWaveGuardAddress},
+            true, true, true).empty() ||
+        prosper::gpu::last_terminal_reject_reason(kPerWaveGuardAddress).find(
+            "reason=per-wave-terminal-guard") == std::string::npos) {
+        std::fprintf(stderr, "native four-wave probe admitted a per-wave barrier guard\n");
         return 1;
     }
     count_guest[2] = 161u; // no lane matches; an any()/constant-one substitute must fail

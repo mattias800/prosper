@@ -17,7 +17,7 @@ namespace prosper::test {
 
 // FLOAT CONTROLS: this fixture deliberately does NOT publish a SignedZeroInfNanPreserve verdict to
 // the recompiler (#3479/#3561), so modules run here carry the neutral, undeclared form. The device
-// below is created on a Vulkan 1.1 instance, and VUID-VkShaderModuleCreateInfo-pCode-08742 requires
+// below is created on a Vulkan 1.1 instance by default, and VUID-VkShaderModuleCreateInfo-pCode-08742 requires
 // 1.2 or VK_KHR_shader_float_controls before the extension may be declared at all -- declaring it
 // here is what produced 2 VUIDs x475 across four binaries in CI while every test passed. Publishing
 // nothing is not an oversight to repair: it is the fail-safe state, and the property this fixture's
@@ -38,6 +38,61 @@ struct ComputeSubgroupProperties {
     VkShaderStageFlags stages = 0;
     VkSubgroupFeatureFlags operations = 0;
 };
+
+// The optional native-wave fixture requires Vulkan 1.3's exact compute subgroup contract. Keep
+// this separate from the ordinary 1.1 runner: a Wave32-only device must skip, not execute Wave64
+// SPIR-V with a silently different subgroup width. This is a supported core feature, not a driver
+// experiment flag.
+inline bool compute_required_subgroup_supported(VkPhysicalDevice phys, uint32_t subgroup_size,
+                                                uint32_t local_size_x) {
+    if (!subgroup_size || !local_size_x || local_size_x % subgroup_size) return false;
+    VkPhysicalDeviceProperties basic{};
+    vkGetPhysicalDeviceProperties(phys, &basic);
+    if (basic.apiVersion < VK_API_VERSION_1_3 ||
+        local_size_x > basic.limits.maxComputeWorkGroupSize[0] ||
+        local_size_x > basic.limits.maxComputeWorkGroupInvocations) return false;
+    VkPhysicalDeviceVulkan13Features available{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+    VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+    features.pNext = &available;
+    vkGetPhysicalDeviceFeatures2(phys, &features);
+    VkPhysicalDeviceSubgroupProperties subgroup{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
+    VkPhysicalDeviceVulkan13Properties properties13{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_PROPERTIES};
+    properties13.pNext = &subgroup;
+    VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+    properties.pNext = &properties13;
+    vkGetPhysicalDeviceProperties2(phys, &properties);
+    constexpr VkSubgroupFeatureFlags kNeeded = VK_SUBGROUP_FEATURE_ARITHMETIC_BIT |
+        VK_SUBGROUP_FEATURE_BALLOT_BIT | VK_SUBGROUP_FEATURE_VOTE_BIT |
+        VK_SUBGROUP_FEATURE_SHUFFLE_BIT;
+    return available.subgroupSizeControl && available.computeFullSubgroups &&
+        properties13.minSubgroupSize <= subgroup_size &&
+        subgroup_size <= properties13.maxSubgroupSize &&
+        (properties13.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT) &&
+        local_size_x / subgroup_size <= properties13.maxComputeWorkgroupSubgroups &&
+        (subgroup.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT) &&
+        (subgroup.supportedOperations & kNeeded) == kNeeded;
+}
+
+inline bool default_compute_required_subgroup_supported(uint32_t subgroup_size,
+                                                         uint32_t local_size_x) {
+    VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
+    app.apiVersion = VK_API_VERSION_1_3;
+    VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
+    ici.pApplicationInfo = &app;
+    VkInstance instance = VK_NULL_HANDLE;
+    if (vkCreateInstance(&ici, nullptr, &instance) != VK_SUCCESS || !instance) return false;
+    uint32_t count = 0;
+    vkEnumeratePhysicalDevices(instance, &count, nullptr);
+    bool supported = false;
+    if (count) {
+        std::vector<VkPhysicalDevice> devices(count);
+        vkEnumeratePhysicalDevices(instance, &count, devices.data());
+        supported = compute_required_subgroup_supported(devices[0], subgroup_size, local_size_x);
+    }
+    vkDestroyInstance(instance, nullptr);
+    return supported;
+}
 
 // Query the same first physical device run_compute() uses. Tests for native subgroup lowering can
 // then distinguish a valid host-width result from the stricter guest architectural requirement.
@@ -123,14 +178,16 @@ inline std::vector<float> run_compute(const std::vector<uint32_t>& spirv, const 
                                       // confidently its assertions print. Pass this to read the buffer
                                       // back; leave it null to bind the storage and ignore it.
                                       std::vector<uint32_t>* gds_out = nullptr,
-                                      const std::array<std::vector<uint32_t>, 3>* extra_cbufs = nullptr) {
+                                      const std::array<std::vector<uint32_t>, 3>* extra_cbufs = nullptr,
+                                      uint32_t required_subgroup_size = 0) {
     const uint32_t IN_N = (uint32_t)input.size();
     if (invocations == 0) invocations = IN_N;
     if (out_count == 0)   out_count = IN_N;
     std::vector<float> out;
     if (!IN_N || !out_count || !invocations || !local_size_x) return out;
 
-    VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO}; app.apiVersion = VK_API_VERSION_1_1;
+    VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
+    app.apiVersion = required_subgroup_size ? VK_API_VERSION_1_3 : VK_API_VERSION_1_1;
     VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO}; ici.pApplicationInfo = &app;
     VkInstance inst = VK_NULL_HANDLE;
     if (vkCreateInstance(&ici, nullptr, &inst) != VK_SUCCESS || !inst) return out;
@@ -139,6 +196,11 @@ inline std::vector<float> run_compute(const std::vector<uint32_t>& spirv, const 
     if (!ndev) { vkDestroyInstance(inst, nullptr); return out; }
     std::vector<VkPhysicalDevice> devs(ndev); vkEnumeratePhysicalDevices(inst, &ndev, devs.data());
     VkPhysicalDevice phys = devs[0];
+    if (required_subgroup_size &&
+        !compute_required_subgroup_supported(phys, required_subgroup_size, local_size_x)) {
+        vkDestroyInstance(inst, nullptr);
+        return out;
+    }
 
     uint32_t nqf = 0; vkGetPhysicalDeviceQueueFamilyProperties(phys, &nqf, nullptr);
     std::vector<VkQueueFamilyProperties> qf(nqf);
@@ -185,6 +247,15 @@ inline std::vector<float> run_compute(const std::vector<uint32_t>& spirv, const 
             device_extensions.push_back(VK_KHR_SHADER_ATOMIC_INT64_EXTENSION_NAME);
         }
         break;
+    }
+    VkPhysicalDeviceVulkan13Features required_subgroup_features{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+    if (required_subgroup_size) {
+        required_subgroup_features.subgroupSizeControl = VK_TRUE;
+        required_subgroup_features.computeFullSubgroups = VK_TRUE;
+        if (dci.pNext == &atomic_int64_features)
+            required_subgroup_features.pNext = &atomic_int64_features;
+        dci.pNext = &required_subgroup_features;
     }
     dci.enabledExtensionCount = static_cast<uint32_t>(device_extensions.size());
     dci.ppEnabledExtensionNames = device_extensions.empty() ? nullptr : device_extensions.data();
@@ -270,7 +341,9 @@ inline std::vector<float> run_compute(const std::vector<uint32_t>& spirv, const 
         }
     void* p = nullptr;
     if (!map_buffer(inMem, inBytes, &p)) return decline_setup("input mapping failed");
-    for (uint32_t i = 0; i < IN_N; i++) ((float*)p)[i] = input[i];
+    // Probe inputs may carry raw guest register words, including NaN payloads. Moving the float
+    // values one by one may alter their representation; publish their bytes unchanged.
+    std::memcpy(p, input.data(), inBytes);
     vkUnmapMemory(dev, inMem);
     void* cp = nullptr;
     if (!map_buffer(cbMem, cbBytes, &cp)) return decline_setup("constant buffer mapping failed");
@@ -360,6 +433,13 @@ inline std::vector<float> run_compute(const std::vector<uint32_t>& spirv, const 
     VkComputePipelineCreateInfo cpci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
     cpci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
     cpci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT; cpci.stage.module = sm; cpci.stage.pName = "main";
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo required_stage{
+        VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO};
+    if (required_subgroup_size) {
+        required_stage.requiredSubgroupSize = required_subgroup_size;
+        cpci.stage.pNext = &required_stage;
+        cpci.stage.flags |= VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT;
+    }
     cpci.layout = layout;
     VkPipeline pipe;
     if (vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &cpci, nullptr, &pipe) != VK_SUCCESS) return out;
@@ -403,7 +483,7 @@ inline std::vector<float> run_compute(const std::vector<uint32_t>& spirv, const 
     void* op = nullptr;
     if (map_buffer(outMem, outBytes, &op)) {
         out.resize(out_count);
-        for (uint32_t i = 0; i < out_count; i++) out[i] = ((float*)op)[i];
+        std::memcpy(out.data(), op, outBytes);
         vkUnmapMemory(dev, outMem);
     } else {
         std::fprintf(stderr, "compute_runner: output readback mapping failed\n");

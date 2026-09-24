@@ -148,6 +148,10 @@ check(missing_s3.returncode == 2 and "requires --probe-ngg-workgroup-s3" in miss
 missing_full_chain = run_result(["--probe-ngg-full-four-wave", "no-such-capture.prgcap"])
 check(missing_full_chain.returncode == 2 and "requires a chain retry" in missing_full_chain.stderr,
       "full launch probe cannot silently run outside a failed-chain retry")
+missing_full_native = run_result(["--probe-ngg-native-wave64", "no-such-capture.prgcap"])
+check(missing_full_native.returncode == 2 and
+      "requires --probe-ngg-full-four-wave" in missing_full_native.stderr,
+      "native Wave64 selector cannot silently run outside the full launch probe")
 
 quiet = run([])
 check(notice_block(quiet) == "",
@@ -272,6 +276,19 @@ with tempfile.TemporaryDirectory(prefix="gpu-replay-retry-") as scratch:
                   full_output.read_bytes()[:4] == b"\x03\x02\x23\x07" and
                   full_output.read_bytes() != packed_output.read_bytes(),
                   "full four-wave selector compiles a distinct workgroup module")
+            native_output = directory / "four-wave-native64.spv"
+            native_module = run_result(["--retry-failed-chain", "0",
+                                        "--probe-ngg-full-four-wave",
+                                        "--probe-ngg-native-wave64",
+                                        "--retry-failed-chain-spv", str(native_output),
+                                        probe_capture])
+            check(native_module.returncode == 0 and
+                  "native-wave64=1" in native_module.stderr and
+                  native_output.exists() and
+                  native_output.read_bytes()[:4] == b"\x03\x02\x23\x07" and
+                  b"Prosper.NggProbeExactSubgroup=64" in native_output.read_bytes() and
+                  native_output.read_bytes() != full_output.read_bytes(),
+                  "native Wave64 selector compiles a distinct full-workgroup module")
             rejected_export = run_result(["--retry-failed-chain", "0",
                                           "--retry-failed-chain-spv", str(chain_output),
                                           str(directory / "rejected-chain.prgcap")])
