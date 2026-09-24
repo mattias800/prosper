@@ -578,9 +578,15 @@ std::vector<uint32_t> recompile_ngg_exports_for_test(
         ins.begin(), ins.end(), is_vadd_nc_u32_dpp_row_shr_bounded);
     if (!emit_body(b, rs, ins, safe_branches, resources, /*allow_exec_update*/true,
                    /*allow_smem*/resources != nullptr, export_word, code, dwords,
-                   nullptr, true, 0, force_phases_for_dpp) || !saw_export ||
-        (trace && !b.ngg_probe_trace_seen))
+                   nullptr, true, 0, force_phases_for_dpp) || !saw_export)
         return {};
+    if (trace && !b.ngg_probe_trace_seen) {
+        // Special dispatcher events such as bounded DPP bypass emit_alu. Refuse their PCs
+        // explicitly rather than returning a plausible all-zero trace for an emitted op.
+        log_recompile_diagnostic(diagnostic, "ngg-trace-reject", "terminal",
+                                 "pc=%u no-ordinary-alu-milestone", trace_pc);
+        return {};
+    }
     return b.finish();
 }
 

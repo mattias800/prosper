@@ -537,6 +537,91 @@ int main() {
             return 1;
         }
     }
+    // A distinct VDST must survive an EXEC-off DPP instruction. Restore EXEC and export it to
+    // expose a wrong SRC0 fallback; trace the intervening ordinary ALU so skipped lanes must
+    // retain a zero hit even when their old destination value is nonzero.
+    constexpr std::array<uint32_t, 12> masked_dpp_guest = {
+        0x7e140300u,              // v_mov_b32 v10,v0 (DPP source)
+        0x7e160301u,              // v_mov_b32 v11,v1 (old, distinct destination)
+        0xbf8a0000u,              // s_barrier: force phased dispatcher
+        0xbe80047eu,              // s_mov_b64 s[0:1],exec
+        0x7da20900u,              // v_cmpx_lt_u32 v0,v4: only wave lanes 0..31
+        0x4a1614fau, 0xff09110au, // Kena bounded ROW_SHR:1 into v11
+        0x7e18030bu,              // v_mov_b32 v12,v11: ordinary ALU trace PC 7
+        0xbefe0400u,              // s_mov_b64 exec,s[0:1]
+        0xf8000941u, 0x0000000bu, // EXP PRIM,v11
+        0xbf810000u,              // s_endpgm
+    };
+    constexpr uint64_t kDppTraceAddress = 0x3135000002ull;
+    const auto masked_dpp_module = recompile_ngg_exports_for_test(
+        masked_dpp_guest.data(), masked_dpp_guest.size(), 10, 0, nullptr, 4, 0,
+        {}, true, true, true, 7u, 12u);
+    const auto cmpx_entry_trace = recompile_ngg_exports_for_test(
+        masked_dpp_guest.data(), masked_dpp_guest.size(), 10, 0, nullptr, 4, 0,
+        {}, true, true, true, 4u, 11u);
+    const auto special_dpp_trace = recompile_ngg_exports_for_test(
+        masked_dpp_guest.data(), masked_dpp_guest.size(), 10, 0, nullptr, 4, 0,
+        {prosper::gpu::RecompileDiagnosticStage::Vertex, kDppTraceAddress},
+        true, true, true, 5u, 11u);
+    if (masked_dpp_module.empty() || cmpx_entry_trace.empty() ||
+        !special_dpp_trace.empty() ||
+        prosper::gpu::last_terminal_reject_reason(kDppTraceAddress).find(
+            "no-ordinary-alu-milestone") == std::string::npos) {
+        std::fprintf(stderr, "native bounded DPP trace accepted a special phase or lost ALU PC\n");
+        return 1;
+    }
+    if (prosper::test::default_compute_required_subgroup_supported(64u, 256u)) {
+        constexpr uint32_t old_destination = 0x76543210u;
+        std::vector<float> input(256u * 10u, 0.0f);
+        for (uint32_t lane = 0; lane < 256u; ++lane) {
+            const size_t base = static_cast<size_t>(lane) * 10u;
+            input[base] = std::bit_cast<float>(lane % 64u);
+            input[base + 1u] = std::bit_cast<float>(old_destination);
+            input[base + 4u] = std::bit_cast<float>(32u);
+        }
+        const auto output = prosper::test::run_compute(
+            masked_dpp_module, input, 256u,
+            256u * prosper::gpu::kNggTraceProbeWords,
+            {}, {}, nullptr, 256u, nullptr, nullptr, nullptr, 64u);
+        const auto cmpx_output = prosper::test::run_compute(
+            cmpx_entry_trace, input, 256u,
+            256u * prosper::gpu::kNggTraceProbeWords,
+            {}, {}, nullptr, 256u, nullptr, nullptr, nullptr, 64u);
+        if (output.size() != 256u * prosper::gpu::kNggTraceProbeWords) {
+            std::fprintf(stderr, "native masked DPP dispatch failed\n");
+            return 1;
+        }
+        if (cmpx_output.size() != output.size()) {
+            std::fprintf(stderr, "native CMPX entry trace dispatch failed\n");
+            return 1;
+        }
+        for (uint32_t lane = 0; lane < 256u; ++lane) {
+            const size_t base = static_cast<size_t>(lane) *
+                                prosper::gpu::kNggTraceProbeWords;
+            if (lane % 64u >= 32u &&
+                std::bit_cast<uint32_t>(output[base]) != old_destination) {
+                std::fprintf(stderr, "native masked DPP lost old VDST lane %u\n", lane);
+                return 1;
+            }
+            if (lane % 64u >= 32u &&
+                std::bit_cast<uint32_t>(
+                    output[base + prosper::gpu::kNggTraceHitWord]) != 0u) {
+                std::fprintf(stderr, "native NGG trace marked skipped lane %u\n", lane);
+                return 1;
+            }
+            if (lane % 64u < 32u &&
+                std::bit_cast<uint32_t>(
+                    output[base + prosper::gpu::kNggTraceHitWord]) != 1u) {
+                std::fprintf(stderr, "native masked DPP missed active trace lane %u\n", lane);
+                return 1;
+            }
+            if (std::bit_cast<uint32_t>(
+                    cmpx_output[base + prosper::gpu::kNggTraceHitWord]) != 1u) {
+                std::fprintf(stderr, "native CMPX trace lost entry-active lane %u\n", lane);
+                return 1;
+            }
+        }
+    }
     constexpr std::array<uint32_t, 5> skipped_barrier_guest = {
         0xbf840001u,              // s_cbranch_scc0 skips the barrier
         0xbf8a0000u,              // unsafe for a 256-lane workgroup

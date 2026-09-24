@@ -87,7 +87,7 @@ void usage(const char* argv0) {
                          "[--probe-ngg-packed-offsets (with --probe-ngg-workgroup-s3; compile only)] "
                          "[--probe-ngg-full-four-wave (with --retry-failed-chain; compile only)] "
                          "[--probe-ngg-native-wave64 (with --probe-ngg-full-four-wave; compile only)] "
-                         "[--probe-ngg-trace=PC:VGPR (native compile-only probe)] "
+                         "[--probe-ngg-trace=PC:VGPR (native ordinary-ALU probe)] "
                          "[--retry-failed-stage FAILURE:STAGE] "
                          "[--retry-failed-stage-spv PATH] "
                          "[--dump-compute-resource N:BINDING PATH] "

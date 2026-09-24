@@ -4602,6 +4602,9 @@ bool emit_cfg_state_machine(
                     }
                 }
                 bool ok = true;
+                // CMPX may narrow EXEC while emitting this instruction. A reached-lane trace
+                // records the post-instruction VGPR under the entry EXEC, not the new mask.
+                const uint32_t trace_entry_exec = state.exec_narrowed ? state.exec : 0;
                 const SavedB64MaskSnapshot saved_masks = snapshot_saved_b64_masks(state, in);
                 const bool handled = emit_alu(b, state, in, ok, allow_exec_update, &safe,
                                               allow_smem, rt, /*allow_wave*/false);
@@ -4614,11 +4617,9 @@ bool emit_cfg_state_machine(
                     if (value == state.vreg.end())
                         return reject_cfg(in.pc, "ngg trace missing VGPR");
                     b.store_output_word(value->second, kNggTraceProbeWords,
-                                        kNggTraceValueWord,
-                                        state.exec_narrowed ? state.exec : 0);
+                                        kNggTraceValueWord, trace_entry_exec);
                     b.store_output_word(b.uconst(1), kNggTraceProbeWords,
-                                        kNggTraceHitWord,
-                                        state.exec_narrowed ? state.exec : 0);
+                                        kNggTraceHitWord, trace_entry_exec);
                     b.ngg_probe_trace_seen = true;
                 }
                 if (!handled || !ok) {
@@ -4991,6 +4992,9 @@ bool emit_cfg_state_machine(
                 bounded ? dpp_add_row_shr->src[0].value : dst);
             const uint32_t source_value =
                 source == state.vreg.end() ? zero : source->second;
+            const auto previous_destination = state.vreg.find(dst);
+            const uint32_t old_destination = previous_destination == state.vreg.end()
+                ? zero : previous_destination->second;
             const uint32_t amount = b.uconst(bounded
                 ? 0x100u | static_cast<uint32_t>(dpp_add_row_shr->dpp_ctrl - 0x110u)
                 : static_cast<uint32_t>(dpp_add_row_shr->dpp_ctrl - 0x110u));
@@ -5012,7 +5016,7 @@ bool emit_cfg_state_machine(
                     bounded ? b.sel(valid_source, shifted, zero) : shifted);
                 state.vreg[dst] = b.sel(
                     bounded ? state.exec : b.land(state.exec, valid_source),
-                    result, source_value);
+                    result, old_destination);
                 for (auto& vg : state.vgpr_lane_slots)
                     if (vg.first == dst) for (auto& slot : vg.second) slot.second = zero;
                 for (auto& vg : state.vgpr_lane_mask_slots)
@@ -6679,6 +6683,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             if (dead_masks.count(in.pc)) continue;
             if (in.fmt == Rdna2Format::EXP) { if (!exp_fn(rs, in)) return false; continue; }
             bool ok = true;
+            const uint32_t trace_entry_exec = rs.exec_narrowed ? rs.exec : 0;
             const SavedB64MaskSnapshot saved_masks = snapshot_saved_b64_masks(rs, in);
             const bool handled = emit_alu(
                 b, rs, in, ok, allow_exec_update, &effective_safe, allow_smem, rt, wave_ok);
@@ -6722,11 +6727,9 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     return false;
                 }
                 b.store_output_word(value->second, kNggTraceProbeWords,
-                                    kNggTraceValueWord,
-                                    rs.exec_narrowed ? rs.exec : 0);
+                                    kNggTraceValueWord, trace_entry_exec);
                 b.store_output_word(b.uconst(1), kNggTraceProbeWords,
-                                    kNggTraceHitWord,
-                                    rs.exec_narrowed ? rs.exec : 0);
+                                    kNggTraceHitWord, trace_entry_exec);
                 b.ngg_probe_trace_seen = true;
             }
             if (!handled || !ok) {
