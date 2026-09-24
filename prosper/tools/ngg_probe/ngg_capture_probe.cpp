@@ -28,6 +28,25 @@ bool eligible_buffer(const prosper::gpu::ShaderResource& resource, uint32_t slot
            resource.size && resource.size <= 4096u && resource.size % sizeof(uint32_t) == 0;
 }
 
+bool exact_probe_local_size(const std::vector<uint32_t>& words, uint32_t expected_x) {
+    // SPIR-V OpExecutionMode (16), LocalSize (17): the runner binds one 64-lane group.
+    // A compile-only four-wave module must never be dispatched as two unrelated groups here.
+    if (words.size() < 5 || words[0] != 0x07230203u) return false;
+    bool found = false;
+    for (size_t at = 5; at < words.size();) {
+        const uint32_t count = words[at] >> 16u;
+        if (!count || at + count > words.size()) return false;
+        if ((words[at] & 0xffffu) == 16u && count == 6u && words[at + 2u] == 17u) {
+            if (found || words[at + 3u] != expected_x ||
+                words[at + 4u] != 1u || words[at + 5u] != 1u)
+                return false;
+            found = true;
+        }
+        at += count;
+    }
+    return found;
+}
+
 bool selftest() {
     using prosper::gpu::ResourceClass;
     prosper::gpu::ShaderResource resource;
@@ -50,7 +69,14 @@ bool selftest() {
     resource.size = 4097;
     if (eligible_buffer(resource, 0)) return false;
     resource.size = 0;
-    return !eligible_buffer(resource, 0) && !eligible_buffer(resource, 5);
+    if (eligible_buffer(resource, 0) || eligible_buffer(resource, 5)) return false;
+    std::vector<uint32_t> module = {
+        0x07230203u, 0x00010300u, 0u, 8u, 0u,
+        (6u << 16u) | 16u, 1u, 17u, 64u, 1u, 1u,
+    };
+    if (!exact_probe_local_size(module, 64u)) return false;
+    module[8] = 256u; // full four-wave module must be refused by the 64-lane runner
+    return !exact_probe_local_size(module, 64u) && exact_probe_local_size(module, 256u);
 }
 } // namespace
 
@@ -176,6 +202,12 @@ int main(int argc, char** argv) {
     if (!module_file.read(reinterpret_cast<char*>(module.data()), module_bytes) ||
         module[0] != 0x07230203u) {
         std::fprintf(stderr, "ngg_capture_probe: cannot read SPIR-V file\n");
+        return 2;
+    }
+    if (!exact_probe_local_size(module, 64u)) {
+        std::fprintf(stderr,
+                     "ngg_capture_probe: module must declare one 64x1x1 workgroup; "
+                     "four-wave modules are compile-only here\n");
         return 2;
     }
     const uint32_t lanes = failure.vertex_count * failure.instance_count;

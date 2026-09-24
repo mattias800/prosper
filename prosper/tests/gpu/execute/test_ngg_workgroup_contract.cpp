@@ -152,6 +152,47 @@ int main() {
         return 1;
     }
 
+    // Four 64-lane guest waves can belong to one merged-NGG threadgroup. Exercise the shell's
+    // shared LDS across wave boundaries before trusting any Kena launch model that needs it.
+    // A separate 64-invocation dispatch for each wave cannot pass this arm.
+    std::vector<uint32_t> cross_wave_guest = {
+        0x7e000f00u,              // v_cvt_u32_f32 v0,v0: byte address = lane * 4
+        0x4a0200c0u,              // v_add_nc_u32 v1,64,v0
+        0xd8340000u, 0x00000100u, // ds_write_b32 v0,v1
+        0xbf8a0000u,              // s_barrier across the full 256-invocation workgroup
+        0x3a0400ffu, 0x00000100u, // v_xor_b32 v2,256,v0: read another wave
+        0xd8d80000u, 0x03000002u, // ds_read_b32 v3,v2
+        0xbf8cc07fu,              // s_waitcnt lgkmcnt(0)
+        0x7e000d03u,              // v_cvt_f32_u32 v0,v3
+        0xbf810000u,
+    };
+    const auto cross_wave_output = [&](const std::vector<uint32_t>& code) {
+        const auto module = recompile_valu(
+            code.data(), code.size(), 1, 0, nullptr, 0,
+            prosper::gpu::kDefaultComputePgmRsrc1, false, 256);
+        if (module.empty()) return std::vector<float>{};
+        std::vector<float> input(256);
+        for (uint32_t lane = 0; lane < 256; ++lane)
+            input[lane] = static_cast<float>(lane * 4u);
+        return prosper::test::run_compute(module, input, 256, 256, {}, {}, nullptr, 256);
+    };
+    const auto cross_wave_matches = [&](const std::vector<float>& output) {
+        if (output.size() != 256) return false;
+        for (uint32_t lane = 0; lane < 256; ++lane)
+            if (output[lane] != static_cast<float>(64u + ((lane ^ 64u) * 4u)))
+                return false;
+        return true;
+    };
+    if (!cross_wave_matches(cross_wave_output(cross_wave_guest))) {
+        std::fprintf(stderr, "four guest waves did not exchange LDS across one workgroup\n");
+        return 1;
+    }
+    cross_wave_guest[6] = 4u; // wrong peer: stays in the same wave
+    if (cross_wave_matches(cross_wave_output(cross_wave_guest))) {
+        std::fprintf(stderr, "cross-wave LDS negative control did not distinguish workgroups\n");
+        return 1;
+    }
+
     // Kena's captured merged-NGG program narrows EXEC through a VCC mask and SAVEEXEC, rather than
     // through CMPX. Use the integer VOPC encoding (0x7d82), not the float compare (0x7c02): the
     // latter can flush our small integer bit patterns as subnormal floats and vacate the mask.
@@ -231,6 +272,65 @@ int main() {
         std::swap(packed_inputs[lane * 2u], packed_inputs[lane * 2u + 1u]);
     if (packed_matches(packed_readback(packed_inputs))) {
         std::fprintf(stderr, "packed-offset swapped-field control did not distinguish inputs\n");
+        return 1;
+    }
+    // A complete four-wave launch supplies the nine initial VGPRs and a wave-uniform s3. The
+    // synthetic stream reads the registers before defining them, so this checks the actual module
+    // input path rather than only its declared input-buffer size.
+    constexpr std::array<uint32_t, 6> full_launch_guest = {
+        0x7e080203u,              // v_mov_b32 v4,s3
+        0xf80000cfu, 0x03020100u, // EXP POS0, initial v0..v3
+        0xf80008d4u, 0x00040000u, // EXP POS1.z, s3 copied to v4
+        0xbf810000u,
+    };
+    if (!recompile_ngg_exports_for_test(full_launch_guest.data(), full_launch_guest.size(),
+                                        2, 0, nullptr, 4, 0, {}, true, true).empty()) {
+        std::fprintf(stderr, "four-wave probe accepted an incomplete launch record\n");
+        return 1;
+    }
+    const auto full_module = recompile_ngg_exports_for_test(
+        full_launch_guest.data(), full_launch_guest.size(), 10, 0, nullptr, 4, 0,
+        {}, true, true);
+    if (full_module.empty()) {
+        std::fprintf(stderr, "four-wave launch probe did not compile\n");
+        return 1;
+    }
+    constexpr uint32_t kFullLanes = 256;
+    std::vector<float> full_inputs(kFullLanes * 10u);
+    for (uint32_t lane = 0; lane < kFullLanes; ++lane) {
+        const size_t base = static_cast<size_t>(lane) * 10u;
+        for (uint32_t reg = 0; reg < 9u; ++reg)
+            full_inputs[base + reg] = std::bit_cast<float>(0x3f000000u + lane * 16u + reg);
+        full_inputs[base + 9u] =
+            std::bit_cast<float>(0x40004040u | ((lane / 64u) << 24u));
+    }
+    const auto full_readback = [&](const std::vector<float>& input) {
+        return prosper::test::run_compute(
+            full_module, input, kFullLanes,
+            kFullLanes * prosper::gpu::kNggExportProbeWords,
+            {}, {}, nullptr, kFullLanes);
+    };
+    const auto full_matches = [&](const std::vector<float>& output) {
+        if (output.size() != kFullLanes * prosper::gpu::kNggExportProbeWords) return false;
+        for (uint32_t lane = 0; lane < kFullLanes; ++lane) {
+            const size_t base = static_cast<size_t>(lane) * prosper::gpu::kNggExportProbeWords;
+            for (uint32_t reg = 0; reg < 4u; ++reg)
+                if (std::bit_cast<uint32_t>(output[base + 1u + reg]) !=
+                    0x3f000000u + lane * 16u + reg)
+                    return false;
+            if (std::bit_cast<uint32_t>(output[base + 7u]) !=
+                (0x40004040u | ((lane / 64u) << 24u)))
+                return false;
+        }
+        return true;
+    };
+    if (!full_matches(full_readback(full_inputs))) {
+        std::fprintf(stderr, "four-wave launch lost initial VGPRs or per-wave s3\n");
+        return 1;
+    }
+    std::swap(full_inputs[0], full_inputs[1]);
+    if (full_matches(full_readback(full_inputs))) {
+        std::fprintf(stderr, "four-wave launch swapped-VGPR control did not distinguish input\n");
         return 1;
     }
     // Kena's main program counts a VOPC-saved s[6:7] mask. One 64-invocation workgroup is one

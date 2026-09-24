@@ -464,9 +464,12 @@ std::vector<uint32_t> recompile_ngg_exports_for_test(
     const uint32_t* code, size_t dwords, uint32_t num_inputs, uint32_t lds_bytes,
     const ShaderResourceTable* resources, uint32_t vertices_per_instance,
     uint32_t provisional_merged_wave_info, RecompileDiagnosticContext diagnostic,
-    bool packed_gs_offsets_from_inputs) {
+    bool packed_gs_offsets_from_inputs, bool full_four_wave_launch_inputs) {
     if (!code || !dwords || num_inputs > 32 || lds_bytes > 65536u ||
-        (packed_gs_offsets_from_inputs && (num_inputs != 2u || !vertices_per_instance)))
+        (packed_gs_offsets_from_inputs && !vertices_per_instance) ||
+        (full_four_wave_launch_inputs &&
+         (!packed_gs_offsets_from_inputs || num_inputs != 10u)) ||
+        (!full_four_wave_launch_inputs && packed_gs_offsets_from_inputs && num_inputs != 2u))
         return {};
     if (resources && std::any_of(resources->resources.begin(), resources->resources.end(),
                                  [](const ShaderResource& r) { return r.binding < 2u; }))
@@ -478,26 +481,37 @@ std::vector<uint32_t> recompile_ngg_exports_for_test(
     b.ngg_workgroup_export_probe = true;
     b.vertices_per_instance = vertices_per_instance;
     if (lds_bytes) b.lds_dwords = std::max(1u, (lds_bytes + 3u) / 4u);
-    b.begin(num_inputs ? num_inputs : 1, resources, 64, 1, 1, 64, 0, true);
+    b.begin(num_inputs ? num_inputs : 1, resources,
+            full_four_wave_launch_inputs ? 256u : 64u, 1, 1, 64, 0, true);
     b.declare_guest_scratch(analyze_static_scratch(ins));
     RegState rs; rs.vcc = b.bfalse(); rs.scc = b.bfalse(); rs.exec = b.btrue();
     seed_smem_pointer_provenance(rs, ins);
-    for (uint32_t k = 0; k < num_inputs; ++k) rs.vreg[static_cast<int>(k)] = b.load_input(k);
+    for (uint32_t k = 0; k < (full_four_wave_launch_inputs ? 9u : num_inputs); ++k)
+        rs.vreg[static_cast<int>(k)] = b.load_input(k);
     if (vertices_per_instance) {
-        // Compile-only probe of the existing vertex shell's flattened draw ABI. The caller must
-        // supply s3 explicitly: #2072 documents that today's descriptor fold and vertex emitter
-        // disagree on it, so this must never be inferred as the hardware value or executed live.
-        const uint32_t vertex = b.ibin(Op_UMod, b.gidx, b.uconst(vertices_per_instance));
-        const uint32_t instance = b.ibin(Op_UDiv, b.gidx, b.uconst(vertices_per_instance));
+        // Compile-only launch probes. The old shell derives vertex/instance from a flattened draw
+        // and uses an explicit provisional s3; the full launch takes all three from binding 0.
+        // #2072 documents a conflicting live s3 model, so neither probe admits a live draw.
+        const uint32_t vertex = full_four_wave_launch_inputs
+            ? rs.vreg[5]
+            : b.ibin(Op_UMod, b.gidx, b.uconst(vertices_per_instance));
+        const uint32_t instance = full_four_wave_launch_inputs
+            ? rs.vreg[8]
+            : b.ibin(Op_UDiv, b.gidx, b.uconst(vertices_per_instance));
         b.ngg_vertex_index_value = vertex;
         b.ngg_instance_index_value = instance;
-        // For an explicit launch-layout experiment, binding 0 supplies raw initial v0/v1 per
-        // lane. Keep the synthetic vertex/instance IDs for the ES fetch path, but do not overwrite
-        // the packed GS offsets. This is not a hardware ABI choice or a live renderer path.
+        // An offset-input experiment keeps synthetic ES indices; a full launch supplies v0..v8.
         if (!packed_gs_offsets_from_inputs) rs.vreg[0] = vertex;
-        rs.vreg[3] = instance;
-        rs.vreg[5] = vertex; rs.vreg[8] = instance;
-        rs.sreg[3] = b.uconst(provisional_merged_wave_info);
+        if (full_four_wave_launch_inputs) {
+            // Ten raw words per lane: initial v0..v8, then proposed wave-uniform s3. No
+            // captured-input runner for this mode exists until uniformity and barrier arrival
+            // are checked. This is an explicit candidate, not a live draw ABI.
+            rs.sreg[3] = b.load_input(9);
+        } else {
+            rs.vreg[3] = instance;
+            rs.vreg[5] = vertex; rs.vreg[8] = instance;
+            rs.sreg[3] = b.uconst(provisional_merged_wave_info);
+        }
     }
     auto safe_branches = safe_execz_branches(ins);
     for (uint32_t pc : waterfall_branches(ins)) safe_branches.insert(pc);

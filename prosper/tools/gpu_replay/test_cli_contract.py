@@ -145,6 +145,9 @@ check(missing_chain.returncode == 2 and "requires --retry-failed-chain" in missi
 missing_s3 = run_result(["--probe-ngg-packed-offsets", "no-such-capture.prgcap"])
 check(missing_s3.returncode == 2 and "requires --probe-ngg-workgroup-s3" in missing_s3.stderr,
       "explicit GS offset input cannot silently run outside the workgroup probe")
+missing_full_chain = run_result(["--probe-ngg-full-four-wave", "no-such-capture.prgcap"])
+check(missing_full_chain.returncode == 2 and "requires a chain retry" in missing_full_chain.stderr,
+      "full launch probe cannot silently run outside a failed-chain retry")
 
 quiet = run([])
 check(notice_block(quiet) == "",
@@ -258,6 +261,17 @@ with tempfile.TemporaryDirectory(prefix="gpu-replay-retry-") as scratch:
                   packed_output.read_bytes()[:4] == b"\x03\x02\x23\x07" and
                   packed_output.read_bytes() != chain_output.read_bytes(),
                   "GS offset input changes the actual compiled probe module")
+            full_output = directory / "four-wave.spv"
+            full_module = run_result(["--retry-failed-chain", "0",
+                                      "--probe-ngg-full-four-wave",
+                                      "--retry-failed-chain-spv", str(full_output),
+                                      probe_capture])
+            check(full_module.returncode == 0 and
+                  "full-four-wave=1" in full_module.stderr and
+                  full_output.exists() and
+                  full_output.read_bytes()[:4] == b"\x03\x02\x23\x07" and
+                  full_output.read_bytes() != packed_output.read_bytes(),
+                  "full four-wave selector compiles a distinct workgroup module")
             rejected_export = run_result(["--retry-failed-chain", "0",
                                           "--retry-failed-chain-spv", str(chain_output),
                                           str(directory / "rejected-chain.prgcap")])
