@@ -3682,14 +3682,6 @@ HLE(k_batch_map) {
     return ret;
 }
 
-GuestMemoryTopologyRelation guest_memory_topology_relation(
-        uint64_t first_address, uint64_t first_size,
-        uint64_t second_address, uint64_t second_size) {
-    return checked_topology_relation(g_maps, g_mx, kVirtualQueryDirect,
-                                     first_address, first_size,
-                                     second_address, second_size);
-}
-
 bool guest_memory_gpu_write_supported(uint64_t destination, size_t bytes) {
     if (!destination || !bytes || destination > UINT64_MAX - bytes)
         return false;
@@ -7970,14 +7962,6 @@ HLE(k_wake_by_address) {
     return 0;
 }
 
-GuestMemoryTopologyRelation guest_memory_topology_relation(
-        uint64_t first_address, uint64_t first_size,
-        uint64_t second_address, uint64_t second_size) {
-    return checked_topology_relation(g_maps, g_mx, kVirtualQueryDirect,
-                                     first_address, first_size,
-                                     second_address, second_size);
-}
-
 bool guest_memory_gpu_write_supported(uint64_t destination, size_t bytes) {
     if (!destination || !bytes || destination > UINT64_MAX - bytes)
         return false;
@@ -8182,3 +8166,15 @@ int dmem_caller_scan_slots_for_test(const volatile uint64_t* frame, int want) {
 
 } // namespace prosper
 #endif
+
+// Both platform implementations keep their mapping table and lock under these same names.
+// Resolve the public topology query here so one contract serves either platform.
+namespace prosper {
+GuestMemoryTopologyRelation guest_memory_topology_relation(
+        uint64_t first_address, uint64_t first_size,
+        uint64_t second_address, uint64_t second_size) {
+    return checked_topology_relation(g_maps, g_mx, kVirtualQueryDirect,
+                                     first_address, first_size,
+                                     second_address, second_size);
+}
+} // namespace prosper
