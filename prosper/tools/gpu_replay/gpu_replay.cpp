@@ -974,7 +974,10 @@ void inspect_frame(const prosper::gpu::GpuReplayFrame& replay, uint32_t format_v
             std::printf("  target=%016llx extent=%ux%u vertices=%u instances=",
                         static_cast<unsigned long long>(failure.color0_base),
                         failure.color0_width, failure.color0_height, failure.vertex_count);
-            if (format_version >= 58u)
+            // Some early failures never reach draw realization, and a v57 capture can be
+            // rewritten in v58 format without acquiring the missing count. Zero is the
+            // unknown sentinel in both cases, not proof of a zero-instance draw.
+            if (failure.instance_count)
                 std::printf("%u", failure.instance_count);
             else
                 std::printf("?");

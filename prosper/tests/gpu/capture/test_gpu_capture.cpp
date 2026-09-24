@@ -3627,6 +3627,14 @@ int main(int argc, char** argv) {
           pre_v58_failure.failure_diagnostics.size() == 1u &&
           pre_v58_failure.failure_diagnostics[0].instance_count == 0u,
           "v57 failed draw reopens with unknown, not fabricated, instance count");
+    GpuCaptureFile rewritten_v58_failure;
+    std::vector<uint8_t> rewritten_v58_bytes;
+    CHECK(serialize_gpu_capture(pre_v58_failure, rewritten_v58_bytes, error) &&
+          deserialize_gpu_capture(rewritten_v58_bytes, rewritten_v58_failure, error) &&
+          rewritten_v58_failure.format_version == 58u &&
+          rewritten_v58_failure.failure_diagnostics.size() == 1u &&
+          rewritten_v58_failure.failure_diagnostics[0].instance_count == 0u,
+          "rewriting a v57 capture as v58 cannot turn an unavailable count into a known zero");
     const auto loaded_failed_stage = std::find_if(
         failed_loaded.failure_diagnostics[0].stages.begin(),
         failed_loaded.failure_diagnostics[0].stages.end(), [](const auto& stage) {

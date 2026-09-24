@@ -295,7 +295,7 @@ struct GpuCapturedOperationFailure {
     // v34: complete failed-draw target identity. Slots 0/1 mirror the named legacy fields.
     std::array<DrawItem::ColorTargetBinding, kColorTargetCount> color_targets{};
     uint32_t vertex_count = 0;
-    uint32_t instance_count = 0; // v58; zero for legacy captures
+    uint32_t instance_count = 0; // v58; zero means unknown (or a known zero count)
     ComputeLaunchDimensions compute_launch;
     std::vector<GpuCapturedStageDiagnostic> stages;
 };
