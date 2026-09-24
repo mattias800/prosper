@@ -222,6 +222,40 @@ with tempfile.TemporaryDirectory(prefix="gpu-replay-retry-") as scratch:
         if fixture.returncode != 0:
             print(fixture.stdout + fixture.stderr)
         else:
+            failed_input = directory / "failed-input-snapshot.prgcap"
+            dumped_input = directory / "failed-input.bin"
+            dumped_input.write_bytes(b"old output")
+            present_input = run_result(["--dump-failed-resource", "0:0:7",
+                                        str(dumped_input), str(failed_input)])
+            check(present_input.returncode == 0 and
+                  dumped_input.read_bytes() == bytes([0x42, 0x19, 0x7f, 0xa5]),
+                  "failed-stage resource export writes exact captured bytes")
+            dumped_input.write_bytes(b"old output")
+            absent_input = run_result(["--dump-failed-resource", "0:0:8",
+                                       str(dumped_input), str(failed_input)])
+            check(absent_input.returncode == 2 and "metadata but no captured bytes" in absent_input.stderr and
+                  dumped_input.read_bytes() == b"old output",
+                  "metadata-only failed input refuses export and preserves existing output")
+            missing_input = run_result(["--dump-failed-resource", "0:0:9",
+                                        str(dumped_input), str(failed_input)])
+            check(missing_input.returncode == 2 and "no captured binding" in missing_input.stderr and
+                  dumped_input.read_bytes() == b"old output",
+                  "absent failed input is distinct from metadata-only input")
+            combined_input = run_result(["--inspect-only", "--dump-failed-resource", "0:0:7",
+                                         str(dumped_input), str(failed_input)])
+            check(combined_input.returncode == 2 and "cannot combine with another mode" in combined_input.stderr and
+                  dumped_input.read_bytes() == b"old output",
+                  "failed-input export cannot silently consume a second terminal mode")
+            for selector, diagnostic, message in [
+                ("", "needs a selector and PATH", "empty failed-input selector cannot become ordinary replay"),
+                ("0:0:10", "invalid blob bounds", "unreadable blob suffix is not captured input"),
+                ("0:0:11", "ambiguous binding", "duplicate failed-stage bindings refuse export"),
+            ]:
+                dumped_input.write_bytes(b"old output")
+                rejected_input = run_result(["--dump-failed-resource", selector,
+                                             str(dumped_input), str(failed_input)])
+                check(rejected_input.returncode == 2 and diagnostic in rejected_input.stderr and
+                      dumped_input.read_bytes() == b"old output", message)
             unknown_instances = run_result(["--inspect-only", str(directory / "unknown-instances.prgcap")])
             known_instances = run_result(["--inspect-only", str(directory / "known-instances.prgcap")])
             check(unknown_instances.returncode == 0 and "instances=?" in unknown_instances.stdout and
@@ -229,6 +263,8 @@ with tempfile.TemporaryDirectory(prefix="gpu-replay-retry-") as scratch:
                   "a v58 pre-realization failure prints unknown rather than a fabricated zero")
             check(known_instances.returncode == 0 and "instances=32" in known_instances.stdout,
                   "a v58 failed draw prints its positive instance count")
+            check(known_instances.returncode == 0 and "raster=2/1/1" in known_instances.stdout,
+                  "a failed draw preserves cull, front-face and polygon state across capture")
             check(known_instances.returncode == 0 and
                   "target-volume slot=0 mip-depth=32 raw-start=0 raw-max=32 "
                   "bounded-start=0 bounded-count=32 base=000000309cbf0000 mask=f"

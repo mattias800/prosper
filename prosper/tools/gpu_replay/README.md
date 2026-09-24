@@ -741,6 +741,13 @@ launch, but current runtime capture enriches that failure from its retained regi
 compute program and descriptor metadata remain inspectable and dumpable. It does not invent the missing launch
 specialization; failed-compute retry still requires a later capture whose dispatch arguments were resolved.
 
+`--dump-failed-resource FAILURE:STAGE:BINDING PATH` writes one resource's captured bytes from a
+failed stage, when the opt-in failed-input snapshot retained them. The selector names the zero-based
+failure and stage plus the resource binding printed by `--inspect-only`. It exits 2 without touching
+the output if the binding is absent, ambiguous, metadata-only, or extends past the readable blob prefix.
+These are **capture-time input
+bytes**, not a rendered result; this terminal command cannot be combined with replay or inspection.
+
 `--retry-failed-stage FAILURE:STAGE` reruns one retained stage through the current recompiler with its exact
 captured resource table. For split vertex programs, `--retry-failed-chain FAILURE` instead reconstructs the
 first two retained vertex stages as one prolog/main chain and calls the production chain recompiler. Both modes
