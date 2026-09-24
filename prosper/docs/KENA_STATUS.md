@@ -156,3 +156,13 @@ About 2 in 12 launches hang before their first frame (no raw scanout either). No
 - Host-side renderer reads of never-mapped guest memory (#3820), and `SCE_KERNEL_MAP_NO_OVERWRITE` (#3819).
 - The invisible logo movie: 150 frames decoded and delivered, none visible; delivered at ~2x real time.
 - The early-boot hang (about 2 in 12 launches).
+- The merged-NGG LUT producer now has a compile-only captured-input probe (`ngg_capture_probe`). An explicit
+  packed-GS-offset input reproduces the earlier speculative shader-patch output byte for byte, while a wrong-unit
+  control changes it. This validates the diagnostic input path, not the guest launch layout: the probe still
+  flattens 4×32 ES vertices into 128 lanes with a provisional uniform `s3`, and the ES/GS partition is unresolved.
+  Do not admit the draw or claim 32-slice output from its 22 distinct final POS1.z readback words (#3135, #2072).
+- A separate compile-only four-wave probe now emits a module expecting initial v0..v8 and per-wave s3 values in
+  one 256-lane LDS workgroup. A synthetic cross-wave LDS exchange and launch-register test pass, but Kena's captured
+  chain refuses the saved-mask count at linked pc356 (`s_bcnt1_i32_b64 s107,s[6:7]`): its portable reduction
+  requires a one-wave workgroup. Widening that guard without proving every wave reaches the workgroup barriers
+  is unsafe. The captured-input runner rejects 256-lane modules, so no unproved four-wave shader was executed.

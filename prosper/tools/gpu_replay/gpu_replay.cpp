@@ -84,6 +84,8 @@ void usage(const char* argv0) {
                          "[--retry-failed-chain FAILURE] "
                          "[--retry-failed-chain-spv PATH] "
                          "[--probe-ngg-workgroup-s3 0xVALUE (with --retry-failed-chain; compile only)] "
+                         "[--probe-ngg-packed-offsets (with --probe-ngg-workgroup-s3; compile only)] "
+                         "[--probe-ngg-full-four-wave (with --retry-failed-chain; compile only)] "
                          "[--retry-failed-stage FAILURE:STAGE] "
                          "[--retry-failed-stage-spv PATH] "
                          "[--dump-compute-resource N:BINDING PATH] "
@@ -2226,6 +2228,8 @@ int main(int argc, char** argv) {
     std::string failed_shader_spec, failed_shader_path;
     std::string retry_failed_chain_spec, retry_failed_stage_spec;
     std::string probe_ngg_workgroup_s3_spec;
+    bool probe_ngg_packed_offsets = false;
+    bool probe_ngg_full_four_wave = false;
     std::string retry_failed_stage_spv_path;
     std::string retry_failed_chain_spv_path;
     std::string list_resources_spec;   // #2373
@@ -2532,6 +2536,10 @@ int main(int argc, char** argv) {
         }
         else if (std::string(argv[i]) == "--probe-ngg-workgroup-s3" && i + 1 < argc)
             probe_ngg_workgroup_s3_spec = argv[++i];
+        else if (std::string(argv[i]) == "--probe-ngg-packed-offsets")
+            probe_ngg_packed_offsets = true;
+        else if (std::string(argv[i]) == "--probe-ngg-full-four-wave")
+            probe_ngg_full_four_wave = true;
         else if (std::string(argv[i]) == "--retry-failed-stage" && i + 1 < argc)
             retry_failed_stage_spec = argv[++i];
         else if (std::string(argv[i]) == "--retry-failed-stage-spv") {
@@ -2546,6 +2554,19 @@ int main(int argc, char** argv) {
     if (!probe_ngg_workgroup_s3_spec.empty() && retry_failed_chain_spec.empty()) {
         std::fprintf(stderr,
                      "gpu_replay: --probe-ngg-workgroup-s3 requires --retry-failed-chain\n");
+        return 2;
+    }
+    if (probe_ngg_packed_offsets && probe_ngg_workgroup_s3_spec.empty()) {
+        std::fprintf(stderr,
+                     "gpu_replay: --probe-ngg-packed-offsets requires --probe-ngg-workgroup-s3\n");
+        return 2;
+    }
+    if (probe_ngg_full_four_wave &&
+        (!probe_ngg_workgroup_s3_spec.empty() || probe_ngg_packed_offsets ||
+         retry_failed_chain_spec.empty())) {
+        std::fprintf(stderr,
+                     "gpu_replay: --probe-ngg-full-four-wave requires a chain retry and "
+                     "cannot combine with synthetic s3/offset probes\n");
         return 2;
     }
     if (!retry_failed_chain_spv_path.empty() &&
@@ -2629,6 +2650,7 @@ int main(int argc, char** argv) {
             !compute_resource_spec.empty() || !post_compute_resource_spec.empty() ||
             require_post_change || expected_post_hash_set || !failed_shader_spec.empty() ||
             !retry_failed_chain_spec.empty() || !probe_ngg_workgroup_s3_spec.empty() ||
+            probe_ngg_full_four_wave ||
             // These three are read only AFTER the `return replay_bundle(...)` below, so a bundle
             // run that passed one used to execute the ordinary replay and exit 0 having silently
             // ignored it -- the void experiment the sibling guard below is careful to make loud.
@@ -3485,21 +3507,28 @@ int main(int argc, char** argv) {
         std::vector<uint32_t> spirv;
         uint32_t provisional_s3 = 0;
         size_t linked_dwords = 0;
-        if (!probe_ngg_workgroup_s3_spec.empty()) {
-            const char* s3_text = probe_ngg_workgroup_s3_spec.c_str();
-            char* s3_end = nullptr;
-            errno = 0;
-            const unsigned long long parsed = std::strtoull(s3_text, &s3_end, 0);
-            if (probe_ngg_workgroup_s3_spec.size() < 3 || s3_text[0] != '0' ||
-                (s3_text[1] != 'x' && s3_text[1] != 'X') || !s3_end || *s3_end ||
-                errno == ERANGE || parsed > UINT32_MAX || !exact || !resources ||
-                !failure.vertex_count || failure.vertex_lds_dwords > 16384u) {
+        if (!probe_ngg_workgroup_s3_spec.empty() || probe_ngg_full_four_wave) {
+            if (!exact || !resources || !failure.vertex_count ||
+                failure.vertex_lds_dwords > 16384u) {
                 std::fprintf(stderr,
-                             "gpu_replay: workgroup compile probe requires explicit 0xS3 and "
-                             "captured resources, vertex count and LDS settings\n");
+                             "gpu_replay: workgroup compile probe requires captured resources, "
+                             "vertex count and LDS settings\n");
                 return 2;
             }
-            provisional_s3 = static_cast<uint32_t>(parsed);
+            if (!probe_ngg_full_four_wave) {
+                const char* s3_text = probe_ngg_workgroup_s3_spec.c_str();
+                char* s3_end = nullptr;
+                errno = 0;
+                const unsigned long long parsed = std::strtoull(s3_text, &s3_end, 0);
+                if (probe_ngg_workgroup_s3_spec.size() < 3 || s3_text[0] != '0' ||
+                    (s3_text[1] != 'x' && s3_text[1] != 'X') || !s3_end || *s3_end ||
+                    errno == ERANGE || parsed > UINT32_MAX) {
+                    std::fprintf(stderr,
+                                 "gpu_replay: workgroup compile probe requires explicit 0xS3\n");
+                    return 2;
+                }
+                provisional_s3 = static_cast<uint32_t>(parsed);
+            }
             const auto info = prosper::gpu::rdna2_vertex_prolog_info(
                 prolog.words.data(), prolog.words.size());
             const size_t main_span = prosper::gpu::rdna2_recompile_code_span(
@@ -3515,9 +3544,13 @@ int main(int argc, char** argv) {
             linked.insert(linked.end(), main.words.begin(), main.words.begin() + main_span);
             linked_dwords = linked.size();
             spirv = prosper::gpu::recompile_ngg_exports_for_test(
-                linked.data(), linked.size(), 0, failure.vertex_lds_dwords * 4u,
+                linked.data(), linked.size(), probe_ngg_full_four_wave ? 10u :
+                    (probe_ngg_packed_offsets ? 2u : 0u),
+                failure.vertex_lds_dwords * 4u,
                 resources, failure.vertex_count, provisional_s3,
-                {prosper::gpu::RecompileDiagnosticStage::Vertex, main_stage.program_addr});
+                {prosper::gpu::RecompileDiagnosticStage::Vertex, main_stage.program_addr},
+                probe_ngg_packed_offsets || probe_ngg_full_four_wave,
+                probe_ngg_full_four_wave);
         } else {
             spirv = prosper::gpu::recompile_vertex_chain(
                 prolog.words.data(), prolog.words.size(), main.words.data(), main.words.size(),
@@ -3538,11 +3571,16 @@ int main(int argc, char** argv) {
                      exact && failure.has_pixel_inputs,
                      exact && failure.capture_vertex_position,
                      reason.empty() ? "unrecorded" : reason.c_str());
-        if (!probe_ngg_workgroup_s3_spec.empty())
+        if (probe_ngg_full_four_wave)
             std::fprintf(stderr,
                          "[ngg-workgroup-probe] COMPILE ONLY, not a raster/ABI proof; "
-                         "provisional-s3=0x%08x linked-dwords=%zu result=%s\n",
-                         provisional_s3, linked_dwords,
+                         "full-four-wave=1 s3=unbound-launch-input linked-dwords=%zu result=%s\n",
+                         linked_dwords, spirv.empty() ? "rejected" : "module-emitted");
+        else if (!probe_ngg_workgroup_s3_spec.empty())
+            std::fprintf(stderr,
+                         "[ngg-workgroup-probe] COMPILE ONLY, not a raster/ABI proof; "
+                         "provisional-s3=0x%08x packed-offsets=%d linked-dwords=%zu result=%s\n",
+                         provisional_s3, probe_ngg_packed_offsets, linked_dwords,
                          spirv.empty() ? "rejected" : "module-emitted");
         if (!retry_failed_chain_spv_path.empty()) {
             if (spirv.empty()) {

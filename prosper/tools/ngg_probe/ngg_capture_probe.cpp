@@ -28,6 +28,45 @@ bool eligible_buffer(const prosper::gpu::ShaderResource& resource, uint32_t slot
            resource.size && resource.size <= 4096u && resource.size % sizeof(uint32_t) == 0;
 }
 
+bool exact_probe_local_size(const std::vector<uint32_t>& words, uint32_t expected_x) {
+    // The runner dispatches the single GLCompute entry named "main" as a 64-lane group.
+    // LocalSizeId or BuiltIn WorkgroupSize can override a literal LocalSize, so reject both.
+    // A compile-only four-wave module must never be dispatched as unrelated 64-lane groups.
+    if (words.size() < 5 || words[0] != 0x07230203u) return false;
+    uint32_t entry = 0;
+    uint32_t mode_entry = 0;
+    bool found_mode = false;
+    for (size_t at = 5; at < words.size();) {
+        const uint32_t count = words[at] >> 16u;
+        if (!count || at + count > words.size()) return false;
+        const uint32_t op = words[at] & 0xffffu;
+        if (op == 15u) { // OpEntryPoint GLCompute %id "main"
+            if (entry || count < 5u || words[at + 1u] != 5u || !words[at + 2u] ||
+                words[at + 3u] != 0x6e69616du || words[at + 4u] != 0u)
+                return false;
+            entry = words[at + 2u];
+        } else if (op == 16u && count >= 3u && words[at + 2u] == 17u) {
+            if (found_mode || count != 6u || words[at + 3u] != expected_x ||
+                words[at + 4u] != 1u || words[at + 5u] != 1u)
+                return false;
+            found_mode = true;
+            mode_entry = words[at + 1u];
+        } else if (op == 331u || op == 332u || (op >= 73u && op <= 75u)) {
+            // OpExecutionModeId, OpDecorateId, and decoration groups are not emitted by this
+            // probe. Refuse their alternate size/decorating paths rather than parsing a subset.
+            return false;
+        } else if ((op == 71u && count >= 4u && words[at + 2u] == 11u &&
+                    words[at + 3u] == 25u) ||
+                   (op == 72u && count >= 5u && words[at + 3u] == 11u &&
+                    words[at + 4u] == 25u)) {
+            // OpDecorate/OpMemberDecorate BuiltIn WorkgroupSize takes precedence over LocalSize.
+            return false;
+        }
+        at += count;
+    }
+    return entry && found_mode && mode_entry == entry;
+}
+
 bool selftest() {
     using prosper::gpu::ResourceClass;
     prosper::gpu::ShaderResource resource;
@@ -50,28 +89,62 @@ bool selftest() {
     resource.size = 4097;
     if (eligible_buffer(resource, 0)) return false;
     resource.size = 0;
-    return !eligible_buffer(resource, 0) && !eligible_buffer(resource, 5);
+    if (eligible_buffer(resource, 0) || eligible_buffer(resource, 5)) return false;
+    std::vector<uint32_t> module = {
+        0x07230203u, 0x00010300u, 0u, 8u, 0u,
+        (5u << 16u) | 15u, 5u, 1u, 0x6e69616du, 0u,
+        (6u << 16u) | 16u, 1u, 17u, 64u, 1u, 1u,
+    };
+    if (!exact_probe_local_size(module, 64u)) return false;
+    auto wrong_size = module;
+    wrong_size[13] = 256u;
+    if (exact_probe_local_size(wrong_size, 64u) ||
+        !exact_probe_local_size(wrong_size, 256u)) return false;
+    auto wrong_entry = module;
+    wrong_entry[11] = 2u;
+    if (exact_probe_local_size(wrong_entry, 64u)) return false;
+    auto override_size = module;
+    override_size.insert(override_size.end(), {(4u << 16u) | 71u, 3u, 11u, 25u});
+    if (exact_probe_local_size(override_size, 64u)) return false;
+    auto id_size = module;
+    id_size.insert(id_size.end(), {(6u << 16u) | 331u, 1u, 38u, 3u, 4u, 5u});
+    return !exact_probe_local_size(id_size, 64u);
 }
 } // namespace
 
 int main(int argc, char** argv) {
     if (argc == 2 && std::strcmp(argv[1], "--selftest") == 0)
         return selftest() ? 0 : 1;
-    const bool zero_inputs = argc == 6 && std::strcmp(argv[5], "--zero-inputs") == 0;
-    uint32_t zero_binding = 0;
-    if (argc == 6 && !zero_inputs &&
-        std::strncmp(argv[5], "--zero-binding=", 15) == 0) {
-        char* binding_end = nullptr;
-        const unsigned long parsed = std::strtoul(argv[5] + 15, &binding_end, 10);
-        if (binding_end && !*binding_end && parsed >= 2 && parsed <= 6)
-            zero_binding = static_cast<uint32_t>(parsed);
-    }
-    if (argc != 5 && !zero_inputs && !zero_binding) {
+    if (argc < 5 || argc > 7) {
         std::fprintf(stderr,
                      "usage: %s CAPTURE FAILURE COMPILE_ONLY_MODULE.spv OUTPUT.bin "
-                     "[--zero-inputs|--zero-binding=2..6]\n",
+                     "[--zero-inputs|--zero-binding=2..6] [--packed-offsets=FILE]\n",
                      argv[0]);
         return 2;
+    }
+    bool zero_inputs = false;
+    uint32_t zero_binding = 0;
+    std::string packed_offsets_path;
+    for (int i = 5; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--zero-inputs") == 0 && !zero_inputs && !zero_binding) {
+            zero_inputs = true;
+        } else if (std::strncmp(argv[i], "--zero-binding=", 15) == 0 &&
+                   !zero_inputs && !zero_binding) {
+            char* binding_end = nullptr;
+            errno = 0;
+            const unsigned long parsed = std::strtoul(argv[i] + 15, &binding_end, 10);
+            if (errno || !binding_end || *binding_end || parsed < 2 || parsed > 6) {
+                std::fprintf(stderr, "ngg_capture_probe: invalid zero binding\n");
+                return 2;
+            }
+            zero_binding = static_cast<uint32_t>(parsed);
+        } else if (std::strncmp(argv[i], "--packed-offsets=", 17) == 0 &&
+                   argv[i][17] && packed_offsets_path.empty()) {
+            packed_offsets_path = argv[i] + 17;
+        } else {
+            std::fprintf(stderr, "ngg_capture_probe: invalid or duplicate option %s\n", argv[i]);
+            return 2;
+        }
     }
     char* end = nullptr;
     errno = 0;
@@ -163,12 +236,38 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "ngg_capture_probe: cannot read SPIR-V file\n");
         return 2;
     }
+    if (!exact_probe_local_size(module, 64u)) {
+        std::fprintf(stderr,
+                     "ngg_capture_probe: module must declare one 64x1x1 workgroup; "
+                     "four-wave modules are compile-only here\n");
+        return 2;
+    }
     const uint32_t lanes = failure.vertex_count * failure.instance_count;
     constexpr uint32_t kWords = prosper::gpu::kNggExportProbeWords;
     const std::array<std::vector<uint32_t>, 3> extra{
         buffers[2], buffers[3], buffers[4]};
+    std::vector<float> launch_inputs(lanes, 0.0f);
+    if (!packed_offsets_path.empty()) {
+        const size_t expected_bytes = static_cast<size_t>(lanes) * 2u * sizeof(uint32_t);
+        std::ifstream offsets(packed_offsets_path, std::ios::binary | std::ios::ate);
+        if (!offsets || offsets.tellg() != static_cast<std::streampos>(expected_bytes)) {
+            std::fprintf(stderr,
+                         "ngg_capture_probe: packed offsets require exactly %zu bytes\n",
+                         expected_bytes);
+            return 2;
+        }
+        std::vector<uint32_t> raw_offsets(static_cast<size_t>(lanes) * 2u);
+        offsets.seekg(0);
+        if (!offsets.read(reinterpret_cast<char*>(raw_offsets.data()), expected_bytes)) {
+            std::fprintf(stderr, "ngg_capture_probe: cannot read packed offsets\n");
+            return 2;
+        }
+        launch_inputs.resize(raw_offsets.size());
+        for (size_t i = 0; i < raw_offsets.size(); ++i)
+            launch_inputs[i] = std::bit_cast<float>(raw_offsets[i]);
+    }
     const auto result = prosper::test::run_compute(
-        module, std::vector<float>(lanes, 0.0f), lanes, lanes * kWords,
+        module, launch_inputs, lanes, lanes * kWords,
         buffers[0], buffers[1], nullptr, 64, nullptr, nullptr, &extra);
     if (result.size() != static_cast<size_t>(lanes) * kWords) {
         std::fprintf(stderr, "ngg_capture_probe: Vulkan dispatch failed or timed out\n");
@@ -196,8 +295,10 @@ int main(int argc, char** argv) {
     }
     std::fprintf(stderr,
                  "[ngg-capture-probe] COMPILE-ONLY MODULE EXECUTION; lanes=%u words/lane=%u "
-                 "nonzero-prim=%u distinct-pos1-z=%zu inputs=%s zero-binding=%u output=%s\n",
+                 "nonzero-prim=%u distinct-pos1-z=%zu inputs=%s zero-binding=%u "
+                 "packed-offsets=%s output=%s\n",
                  lanes, kWords, emitted, layers.size(),
-                 zero_inputs ? "zeroed-control" : "captured", zero_binding, argv[4]);
+                 zero_inputs ? "zeroed-control" : "captured", zero_binding,
+                 packed_offsets_path.empty() ? "none" : packed_offsets_path.c_str(), argv[4]);
     return 0;
 }
