@@ -300,6 +300,41 @@ int main() {
               "realized draw carries Kena's bounded 3D view and native layout proof");
     }
     {
+        // Synthesized layered volume producer pass: when a 32-slice volume target has an un-recompiled
+        // vertex stage (e.g. unsupported NGG/LDS) but a valid fragment stage without custom interpolants,
+        // realize_draw_item synthesizes kLayeredVolumeVs and kLayeredVolumeGs to render all 32 slices in 1 draw.
+        alignas(256) static const uint32_t invalid_vs[] = { 0xdeadbeefu, 0xbf810000u };
+        GpuState layered_vol = st;
+        layered_vol.cx[P::CB_COLOR0_VIEW] = 0x00040000u;
+        layered_vol.cx[P::CB_COLOR0_ATTRIB3] = 0x4606c01fu;
+        layered_vol.draws[0].instance_count = 32u;
+        set_pgm(layered_vol, P::SPI_SHADER_PGM_LO_ES, P::SPI_SHADER_PGM_HI_ES, invalid_vs);
+        DrawItem layered_item;
+        OperationRealizationFailure fail{};
+        const bool made_layered = realize_draw_item(
+            layered_vol, &layered_vol.draws[0], 4u, 0x10000u, false, layered_item, &fail);
+        CHECK(made_layered, "layered volume producer realizes successfully when vertex recompile fails");
+        CHECK(layered_item.vs.size() == prosper::gpu::kLayeredVolumeVs.size() &&
+              layered_item.gs.size() == prosper::gpu::kLayeredVolumeGs.size(),
+              "realized draw carries synthesized layered VS and GS SPIR-V modules");
+        CHECK(layered_item.vertex_count == 3u && layered_item.indices.empty(),
+              "synthesized layered draw uses 3 non-indexed procedural vertices");
+        CHECK(layered_item.instance_count == 32u,
+              "synthesized layered draw renders 32 instances for the 32 volume slices");
+        CHECK(layered_item.ps.topology == 3u && layered_item.ps.cull_mode == 0u,
+              "synthesized layered draw sets TriangleList topology and disables culling");
+
+        // Control: when disabled via PROSPER_NO_LAYERED_VOLUME, it declines with ShaderRecompile.
+        setenv("PROSPER_NO_LAYERED_VOLUME", "1", 1);
+        DrawItem disabled_item;
+        OperationRealizationFailure disabled_fail{};
+        const bool made_disabled = realize_draw_item(
+            layered_vol, &layered_vol.draws[0], 4u, 0x10000u, false, disabled_item, &disabled_fail);
+        unsetenv("PROSPER_NO_LAYERED_VOLUME");
+        CHECK(!made_disabled && disabled_fail.reason == RealizationFailureReason::ShaderRecompile,
+              "disabling layered volume bypass causes the draw to fail with ShaderRecompile");
+    }
+    {
         // The live draw path must acquire one exact fragment version and share it across metadata
         // and compilation, then acquire again for the next draw. Besides detecting a stale
         // address-only shortcut, the acquisition count distinguishes the production fast path from
