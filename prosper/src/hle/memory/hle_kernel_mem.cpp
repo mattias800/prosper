@@ -107,6 +107,24 @@ GuestMemoryTopologyRelation mapped_topology_relation(
     }
     return GuestMemoryTopologyRelation::Disjoint;
 }
+
+template <typename Mapping>
+GuestMemoryTopologyRelation checked_topology_relation(
+        const std::vector<Mapping>& maps, std::mutex& mapping_mutex, uint32_t direct_flag,
+        uint64_t first_address, uint64_t first_size,
+        uint64_t second_address, uint64_t second_size) {
+    if (!first_address || !first_size || first_address > UINT64_MAX - first_size ||
+        !second_address || !second_size || second_address > UINT64_MAX - second_size)
+        return GuestMemoryTopologyRelation::Unknown;
+    const uint64_t first_end = first_address + first_size;
+    const uint64_t second_end = second_address + second_size;
+    if (first_address < second_end && second_address < first_end)
+        return GuestMemoryTopologyRelation::Overlap;
+
+    std::lock_guard<std::mutex> lock(mapping_mutex);
+    return mapped_topology_relation(maps, direct_flag, first_address, first_end,
+                                    second_address, second_end);
+}
 }
 
 uint64_t guest_memory_gpu_write_successes_for_test() {
@@ -3667,18 +3685,9 @@ HLE(k_batch_map) {
 GuestMemoryTopologyRelation guest_memory_topology_relation(
         uint64_t first_address, uint64_t first_size,
         uint64_t second_address, uint64_t second_size) {
-    if (!first_address || !first_size || first_address > UINT64_MAX - first_size ||
-        !second_address || !second_size || second_address > UINT64_MAX - second_size)
-        return GuestMemoryTopologyRelation::Unknown;
-    const uint64_t first_end = first_address + first_size;
-    const uint64_t second_end = second_address + second_size;
-    if (first_address < second_end && second_address < first_end)
-        return GuestMemoryTopologyRelation::Overlap;
-
-    std::lock_guard<std::mutex> lock(g_mx);
-    return mapped_topology_relation(
-        g_maps, kVirtualQueryDirect, first_address, first_end,
-        second_address, second_end);
+    return checked_topology_relation(g_maps, g_mx, kVirtualQueryDirect,
+                                     first_address, first_size,
+                                     second_address, second_size);
 }
 
 bool guest_memory_gpu_write_supported(uint64_t destination, size_t bytes) {
@@ -7964,18 +7973,9 @@ HLE(k_wake_by_address) {
 GuestMemoryTopologyRelation guest_memory_topology_relation(
         uint64_t first_address, uint64_t first_size,
         uint64_t second_address, uint64_t second_size) {
-    if (!first_address || !first_size || first_address > UINT64_MAX - first_size ||
-        !second_address || !second_size || second_address > UINT64_MAX - second_size)
-        return GuestMemoryTopologyRelation::Unknown;
-    const uint64_t first_end = first_address + first_size;
-    const uint64_t second_end = second_address + second_size;
-    if (first_address < second_end && second_address < first_end)
-        return GuestMemoryTopologyRelation::Overlap;
-
-    std::lock_guard<std::mutex> lock(g_mx);
-    return mapped_topology_relation(
-        g_maps, kVirtualQueryDirect, first_address, first_end,
-        second_address, second_end);
+    return checked_topology_relation(g_maps, g_mx, kVirtualQueryDirect,
+                                     first_address, first_size,
+                                     second_address, second_size);
 }
 
 bool guest_memory_gpu_write_supported(uint64_t destination, size_t bytes) {
