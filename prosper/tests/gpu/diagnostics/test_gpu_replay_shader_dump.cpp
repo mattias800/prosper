@@ -488,6 +488,34 @@ int main(int argc, char** argv) {
         CHECK(gpu::write_gpu_capture((directory / "lds-chain-exact.prgcap").string(),
                                      lds_fixture, error),
               "CLI fixture writes a chain whose admission requires its captured LDS");
+        // A known fragment-consumption mask suppresses a sticky default-value output; unknown
+        // consumption must keep it. Both arms use the same shader bytes, LDS and register map.
+        // This distinguishes replay passing PixelInputMapping to the actual chain compiler from
+        // merely reporting pixel-inputs=1 in its diagnostic line.
+        gpu::GpuCaptureFile input_fixture = lds_fixture;
+        auto& input_failure = input_fixture.failure_diagnostics[0];
+        input_failure.has_pixel_inputs = true;
+        input_failure.pixel_inputs.valid_mask = 3u;
+        input_failure.pixel_inputs.controls[0] = 0x20u;
+        input_failure.pixel_inputs.controls[1] = 0x20u;
+        input_failure.pixel_inputs.consumed_mask = 1u;
+        input_failure.pixel_inputs.consumed_known = true;
+        const auto known_inputs = gpu::recompile_vertex_chain(
+            lds_prolog.data(), lds_prolog.size(), lds_main.data(), lds_main.size(),
+            &lds_table, &input_failure.pixel_inputs, false, 7u);
+        CHECK(gpu::write_gpu_capture((directory / "lds-inputs-known.prgcap").string(),
+                                     input_fixture, error),
+              "CLI fixture writes known fragment consumption for a successful chain");
+        input_failure.pixel_inputs.consumed_known = false;
+        const auto unknown_inputs = gpu::recompile_vertex_chain(
+            lds_prolog.data(), lds_prolog.size(), lds_main.data(), lds_main.size(),
+            &lds_table, &input_failure.pixel_inputs, false, 7u);
+        CHECK(!known_inputs.empty() && !unknown_inputs.empty() &&
+              known_inputs.size() != unknown_inputs.size(),
+              "fixture distinguishes known and unknown consumption in compiled SPIR-V size");
+        CHECK(gpu::write_gpu_capture((directory / "lds-inputs-unknown.prgcap").string(),
+                                     input_fixture, error),
+              "CLI fixture writes unknown consumption with otherwise identical graphics ABI");
         lds_failure.vertex_retry_config_available = false;
         lds_failure.vertex_lds_dwords = 0u;
         CHECK(gpu::write_gpu_capture((directory / "lds-chain-default.prgcap").string(),

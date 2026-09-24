@@ -10,6 +10,7 @@
 # It drives the real binary rather than grepping the source: the point is what an operator SEES.
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -215,6 +216,18 @@ with tempfile.TemporaryDirectory(prefix="gpu-replay-retry-") as scratch:
                   lds_default.returncode == 1 and "rejected" in lds_default.stderr and
                   "config=defaults lds=0" in lds_default.stderr,
                   "captured LDS changes real chain admission while identical default-config bytes reject")
+            input_known = run_result(["--retry-failed-chain", "0",
+                                      str(directory / "lds-inputs-known.prgcap")])
+            input_unknown = run_result(["--retry-failed-chain", "0",
+                                        str(directory / "lds-inputs-unknown.prgcap")])
+            known_words = re.search(r"spirv-dwords=(\d+)", input_known.stderr)
+            unknown_words = re.search(r"spirv-dwords=(\d+)", input_unknown.stderr)
+            check(input_known.returncode == 0 and input_unknown.returncode == 0 and
+                  "config=captured lds=7 pixel-inputs=1" in input_known.stderr and
+                  "config=captured lds=7 pixel-inputs=1" in input_unknown.stderr and
+                  known_words is not None and unknown_words is not None and
+                  int(known_words.group(1)) != int(unknown_words.group(1)),
+                  "captured fragment consumption reaches successful vertex-chain recompilation")
             args = ["--retry-failed-stage", "0:0"] + export
             accepted = run_result(args + [str(directory / "accepted.prgcap")])
             expected = (directory / "expected.spv").read_bytes()
