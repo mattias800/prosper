@@ -3679,7 +3679,7 @@ endif()
 
       # Exercise every opt-in depth-clear policy under Vulkan validation. The test asserts that
       # the selected draw reached its path, so a clean layer log cannot be a vacuous pass.
-      foreach(clear_probe_mode IN ITEMS 1 2 3 4 5)
+      foreach(clear_probe_mode IN ITEMS 1 2 3 4 5 6)
         add_test(NAME render_diagnostic_paths_clear_${clear_probe_mode}
                  COMMAND test_render_diagnostic_paths ${clear_probe_mode})
         set_tests_properties(render_diagnostic_paths_clear_${clear_probe_mode} PROPERTIES ENVIRONMENT

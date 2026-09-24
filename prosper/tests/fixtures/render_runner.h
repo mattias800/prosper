@@ -7565,15 +7565,18 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     // late-Z strip without a shader Z export, to test the state split observed in a Sonic stage
     // bundle. Mode 5 suppresses the ordinary write of ALWAYS clear draws like mode 2, but keeps
     // the default full-scissor clear on every draw admitted by the default gate (the missing 2x2
-    // control).
+    // control). Mode 6 substitutes the programmed value only through fragment coverage on EVERY
+    // default-gate draw. It tests whether the full-scissor operation alone flattens caster depth;
+    // it does not assert that sticky-bit casters are hardware clear draws.
     // None of these modes establishes the hardware clear predicate.
     static const int sonic_clear_probe = [] {
         const char* value = std::getenv("PROSPER_DIAG_CLEAR_OVERWRITE");
-        return value && value[0] >= '1' && value[0] <= '5' && value[1] == '\0'
+        return value && value[0] >= '1' && value[0] <= '6' && value[1] == '\0'
             ? value[0] - '0' : 0;
     }();
     const auto effective_depth_clear = [](const prosper::gpu::ResolvedPipelineState* ps) {
         const bool probe_admits = sonic_clear_probe == 0 || sonic_clear_probe == 5 ||
+            sonic_clear_probe == 6 ||
             (ps->depth_compare_op == VK_COMPARE_OP_ALWAYS &&
              (sonic_clear_probe != 4 ||
               ((ps->db_shader_control & 0x31u) == 0u && ps->color_write_mask == 0u &&
@@ -12802,7 +12805,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     auto record_draw_dynamic_state = [&](VkCommandBuffer command, const DV& v,
                                          const prosper::gpu::ResolvedPipelineState* ps) {
         VkViewport viewport = v.viewport;
-        if ((sonic_clear_probe == 3 || sonic_clear_probe == 4) && ps && effective_depth_clear(ps)) {
+        if ((sonic_clear_probe == 3 || sonic_clear_probe == 4 || sonic_clear_probe == 6) &&
+            ps && effective_depth_clear(ps)) {
             viewport.minDepth = ps->depth_clear_value;
             viewport.maxDepth = ps->depth_clear_value;
             backend_depth_clear_probe_armed_count().fetch_add(1);

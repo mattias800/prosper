@@ -171,14 +171,14 @@ int main(int argc, char** argv) {
     CHECK(iso_passes() == before_iso + 2,
           "draw isolation re-rendered the submit once as a baseline and once per killed draw");
 
-    // The five policies use different Vulkan mechanisms. A clear-shaped depth-only draw makes each
+    // The six policies use different Vulkan mechanisms. A clear-shaped depth-only draw makes each
     // CTest arm take its selected path; the counter prevents a valid-looking Vulkan scan of a
     // fixture that never reaches the diagnostic. The mode is set by CTest before process start.
     if (argc == 2) {
         const char* const clear_probe = std::getenv("PROSPER_DIAG_CLEAR_OVERWRITE");
         const std::string requested = argv[1];
         CHECK((requested == "1" || requested == "2" || requested == "3" ||
-               requested == "4" || requested == "5") && clear_probe &&
+               requested == "4" || requested == "5" || requested == "6") && clear_probe &&
                   requested == clear_probe,
               "depth-clear probe matches the CTest arm");
         if (failures) return 1;
