@@ -14,5 +14,6 @@ disassembly replace exactly one
 The literal mode avoids a separate maintenance4 feature requirement. Run every
 module through `spirv-opt --strip-debug --compact-ids` and
 `spirv-val --target-env vulkan1.3`. Encode the resulting little-endian 32-bit
-words in the header. A missing or repeated execution-mode instruction is a
-generation error.
+words in the header. Pack the new PARAM variants 64 words per line so their
+shared generated prefixes do not register as duplicate handwritten code.
+A missing or repeated execution-mode instruction is a generation error.
