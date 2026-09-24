@@ -17,7 +17,46 @@
 #include <string>
 #include <vector>
 
+namespace {
+bool eligible_buffer(const prosper::gpu::ShaderResource& resource, uint32_t slot) {
+    using prosper::gpu::ResourceClass;
+    constexpr std::array<ResourceClass, 5> kExpectedClasses = {
+        ResourceClass::ConstantBuffer, ResourceClass::VertexBuffer,
+        ResourceClass::VertexBuffer, ResourceClass::ConstantBuffer,
+        ResourceClass::ConstantBuffer};
+    return slot < kExpectedClasses.size() && resource.cls == kExpectedClasses[slot] &&
+           resource.size && resource.size <= 4096u && resource.size % sizeof(uint32_t) == 0;
+}
+
+bool selftest() {
+    using prosper::gpu::ResourceClass;
+    prosper::gpu::ShaderResource resource;
+    resource.size = 16;
+    for (uint32_t slot = 0; slot < 5; ++slot) {
+        resource.cls = slot == 1 || slot == 2 ? ResourceClass::VertexBuffer
+                                              : ResourceClass::ConstantBuffer;
+        if (!eligible_buffer(resource, slot)) return false;
+        resource.cls = resource.cls == ResourceClass::VertexBuffer
+                           ? ResourceClass::ConstantBuffer : ResourceClass::VertexBuffer;
+        if (eligible_buffer(resource, slot)) return false;
+        resource.cls = ResourceClass::Texture;
+        if (eligible_buffer(resource, slot)) return false;
+        resource.cls = ResourceClass::StorageImage;
+        if (eligible_buffer(resource, slot)) return false;
+    }
+    resource.cls = ResourceClass::ConstantBuffer;
+    resource.size = 15;
+    if (eligible_buffer(resource, 0)) return false;
+    resource.size = 4097;
+    if (eligible_buffer(resource, 0)) return false;
+    resource.size = 0;
+    return !eligible_buffer(resource, 0) && !eligible_buffer(resource, 5);
+}
+} // namespace
+
 int main(int argc, char** argv) {
+    if (argc == 2 && std::strcmp(argv[1], "--selftest") == 0)
+        return selftest() ? 0 : 1;
     const bool zero_inputs = argc == 6 && std::strcmp(argv[5], "--zero-inputs") == 0;
     uint32_t zero_binding = 0;
     if (argc == 6 && !zero_inputs &&
@@ -70,6 +109,7 @@ int main(int argc, char** argv) {
     }
     std::array<std::vector<uint32_t>, 5> buffers;
     std::array<bool, 5> seen{};
+    std::array<prosper::gpu::ResourceClass, 5> classes{};
     for (const auto& captured : failure.stages[0].resource_table.resources) {
         const auto& r = captured.resource;
         if (r.binding < 2u || r.binding > 6u) continue;
@@ -77,14 +117,17 @@ int main(int argc, char** argv) {
         const bool valid_blob = captured.blob_index < capture.blobs.size() &&
             captured.blob_offset <= capture.blobs[captured.blob_index].bytes.size() &&
             r.size <= capture.blobs[captured.blob_index].bytes.size() - captured.blob_offset;
-        if (seen[slot] || !valid_blob || !r.size || r.size > 4096u) {
+        if (seen[slot] || !valid_blob || !eligible_buffer(r, slot)) {
             std::fprintf(stderr,
-                         "ngg_capture_probe: incomplete binding %u size=%u blob=%u duplicate=%d\n",
-                         r.binding, r.size, captured.blob_index, seen[slot]);
+                         "ngg_capture_probe: incomplete/non-buffer binding %u class=%u "
+                         "size=%u blob=%u duplicate=%d\n",
+                         r.binding, static_cast<uint32_t>(r.cls), r.size,
+                         captured.blob_index, seen[slot]);
             return 2;
         }
         seen[slot] = true;
-        buffers[slot].resize((r.size + 3u) / 4u);
+        classes[slot] = r.cls;
+        buffers[slot].resize(r.size / sizeof(uint32_t));
         const auto& blob = capture.blobs[captured.blob_index].bytes;
         std::memcpy(buffers[slot].data(), blob.data() + captured.blob_offset, r.size);
     }
@@ -95,8 +138,8 @@ int main(int argc, char** argv) {
         }
     for (uint32_t slot = 0; slot < buffers.size(); ++slot) {
         const auto& words = buffers[slot];
-        std::fprintf(stderr, "[ngg-input] binding=%u words=%zu first=", slot + 2u,
-                     words.size());
+        std::fprintf(stderr, "[ngg-input] binding=%u class=%u words=%zu first=",
+                     slot + 2u, static_cast<uint32_t>(classes[slot]), words.size());
         for (size_t index = 0; index < std::min<size_t>(words.size(), 16); ++index)
             std::fprintf(stderr, "%s%08x", index ? "," : "", words[index]);
         std::fprintf(stderr, "\n");

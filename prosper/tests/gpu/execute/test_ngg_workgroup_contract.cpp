@@ -2,6 +2,7 @@
 // neighbour, reconverges after an EXEC-narrowed prefix count, and preserves the result. The current
 // compute shell supplies the workgroup semantics; this does not admit a graphics program by itself.
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include "gpu/execute/host_read_barrier.hpp"
 #include "fixtures/compute_runner.h"
 #include <algorithm>
 #include <array>
@@ -137,7 +138,13 @@ uint32_t export_mismatches(const std::vector<float>& actual, bool report = false
 
 int main() {
     bool portable_wave = false;
+    const uint64_t host_barriers_before =
+        prosper::gpu::backend_host_read_barrier_count().load();
     const auto actual = run(kGuest, &portable_wave);
+    if (prosper::gpu::backend_host_read_barrier_count().load() - host_barriers_before != 1) {
+        std::fprintf(stderr, "compute output did not record its host-read barrier\n");
+        return 1;
+    }
     const uint32_t positive_bad = mismatches(actual, true);
     if (positive_bad || !portable_wave) {
         std::fprintf(stderr, "guest wave peer-LDS/EXEC-prefix mismatches=%u, size=%zu "
