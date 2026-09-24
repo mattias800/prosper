@@ -11040,6 +11040,30 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                     // synthesized an empty Unknown record for the unrealized operation (#1636).
                     if (failure_known) {
                         failure.command_order = operation.command_order;
+                        // A failed draw normally retains descriptor metadata only. For a named
+                        // program, freeze its small buffer inputs NOW, while the failed operation
+                        // still owns the guest mapping; a later post-submit read could observe a
+                        // different version. The bounded copy is entirely opt-in.
+                        if (const char* spec = std::getenv(
+                                "PROSPER_CAPTURE_FAILED_INPUTS_PROGRAM")) {
+                            char* end = nullptr;
+                            errno = 0;
+                            const unsigned long long program = std::strtoull(spec, &end, 0);
+                            if (!errno && end && end != spec && !*end && program &&
+                                std::any_of(failure.stages.begin(), failure.stages.end(),
+                                            [program](const auto& stage) {
+                                                return stage.program_addr == program;
+                                            })) {
+                                const bool complete =
+                                    snapshot_failed_draw_input_buffers(failure, program);
+                                std::fprintf(stderr,
+                                             "[failed-input-snapshot] submit=%llu draw=%zu "
+                                             "program=0x%llx %s\n",
+                                             static_cast<unsigned long long>(submit_no),
+                                             operation.index, program,
+                                             complete ? "captured" : "declined");
+                            }
+                        }
                         capture_trace->failures.push_back(std::move(failure));
                     } else {
                         // Eager path: realize_gpustate_draws DOES have a failures out-parameter,

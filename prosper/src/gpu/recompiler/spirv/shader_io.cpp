@@ -10,6 +10,26 @@ void     SpirvCompute::store_output(uint32_t bits) {
         put(code, Op_Store, {p, bcf(bits)});
     }
 
+void SpirvCompute::store_output_word(uint32_t bits, uint32_t word_stride,
+                                     uint32_t word_offset, uint32_t exec_bool) {
+        const uint32_t index = ibin(Op_IAdd,
+            ibin(Op_IMul, gidx, uconst(word_stride)), uconst(word_offset));
+        const uint32_t p = id();
+        putv(code, Op_AccessChain,
+             {raw_output_words ? t_ptr_sb_u32 : t_ptr_sb_f32,
+              p, v_out, uconst(0), index});
+        const uint32_t stored = raw_output_words ? bits : bcf(bits);
+        if (!exec_bool) {
+            put(code, Op_Store, {p, stored});
+            return;
+        }
+        const uint32_t value_type = raw_output_words ? t_u32 : t_f32;
+        const uint32_t old = id(); put(code, Op_Load, {value_type, old, p});
+        const uint32_t selected = id();
+        put(code, Op_Select, {value_type, selected, exec_bool, stored, old});
+        put(code, Op_Store, {p, selected});
+    }
+
 void     SpirvCompute::store_output_pred(uint32_t bits, uint32_t exec_bool) {
         uint32_t p = id(); putv(code, Op_AccessChain, {t_ptr_sb_f32, p, v_out, uconst(0), gidx});
         uint32_t old = id(); put(code, Op_Load, {t_f32, old, p});

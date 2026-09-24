@@ -397,7 +397,53 @@ uint32_t SpirvCompute::guest_wave_any(uint32_t active_bool) {
         uint32_t result = id();
         put(code, Op_Load, {t_u32, result, result_ptr_all});
         return ucmp(Op_INotEqual, result, zero);
+}
+
+uint32_t SpirvCompute::guest_wave_popcount(uint32_t active_bool) {
+    // Portable whole-guest-wave reduction. Every invocation in the guest wave must reach both
+    // barriers; callers must establish a uniform control-flow site before executing this module.
+    declare_wave_lds();
+    const uint32_t zero = uconst(0);
+    const uint32_t bit = sel(active_bool, uconst(1), zero);
+    uint32_t slot = id();
+    putv(code, Op_AccessChain, {t_ptr_wg_u32b, slot, lds_wave, linear_localid});
+    put(code, Op_Store, {slot, bit});
+    barrier();
+
+    const uint32_t shift = wave_size == 32 ? 5u : 6u;
+    const uint32_t wave_index = ibin(Op_ShiftRightLogical, linear_localid, uconst(shift));
+    const uint32_t wave_base = ibin(Op_ShiftLeftLogical, wave_index, uconst(shift));
+    const uint32_t lane = ibin(Op_BitwiseAnd, linear_localid, uconst(wave_size - 1));
+    const uint32_t leader = id(), done = id();
+    const uint32_t is_leader = ucmp(Op_IEqual, lane, zero);
+    emit_selmerge(done);
+    emit_condbranch(is_leader, leader, done);
+    emit_label(leader);
+    uint32_t count = zero;
+    for (uint32_t i = 0; i < wave_size; ++i) {
+        const uint32_t index = ibin(Op_IAdd, wave_base, uconst(i));
+        const uint32_t valid = ucmp(Op_ULessThan, index, uconst(local_count));
+        const uint32_t safe_index = sel(valid, index, zero);
+        uint32_t ptr = id();
+        putv(code, Op_AccessChain, {t_ptr_wg_u32b, ptr, lds_wave, safe_index});
+        uint32_t value = id();
+        put(code, Op_Load, {t_u32, value, ptr});
+        count = ibin(Op_IAdd, count, sel(valid, value, zero));
     }
+    const uint32_t result_index = ibin(Op_IAdd, uconst(local_count), wave_index);
+    uint32_t result_ptr = id();
+    putv(code, Op_AccessChain, {t_ptr_wg_u32b, result_ptr, lds_wave, result_index});
+    put(code, Op_Store, {result_ptr, count});
+    emit_branch(done);
+    emit_label(done);
+    barrier();
+    const uint32_t read_index = ibin(Op_IAdd, uconst(local_count), wave_index);
+    uint32_t read_ptr = id();
+    putv(code, Op_AccessChain, {t_ptr_wg_u32b, read_ptr, lds_wave, read_index});
+    uint32_t result = id();
+    put(code, Op_Load, {t_u32, result, read_ptr});
+    return result;
+}
 
 uint32_t SpirvCompute::guest_wave_readlane(uint32_t source_value, uint32_t selector) {
         declare_wave_lds();

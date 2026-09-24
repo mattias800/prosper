@@ -514,6 +514,17 @@ std::vector<uint32_t> recompile_valu(const uint32_t* code, size_t dwords,
                                      uint32_t local_x_for_test = 64,
                                      uint32_t threads_x_for_test = 0);
 
+// Compile a 64-lane guest workgroup into the portable compute shell and retain its raw EXP
+// operands in a 13-word record per lane: PRIM, POS0.xyzw, POS1.xyzw, PARAM0.xyzw. This is a
+// translator/execution test hook only. It does not assemble primitives, route layers, or create a
+// graphics pipeline, and it refuses any other export target rather than silently discarding it.
+inline constexpr uint32_t kNggExportProbeWords = 13;
+std::vector<uint32_t> recompile_ngg_exports_for_test(
+    const uint32_t* code, size_t dwords, uint32_t num_inputs,
+    uint32_t lds_bytes = 0, const ShaderResourceTable* resources = nullptr,
+    uint32_t vertices_per_instance = 0, uint32_t provisional_merged_wave_info = 0,
+    RecompileDiagnosticContext diagnostic = {RecompileDiagnosticStage::Vertex, 0});
+
 // Register and launch state for a real compute program. User SGPR values are supplied as one
 // push-constant dword per register; enabled system SGPRs follow them in hardware order. TIDIG_COMP_CNT
 // controls whether local IDs seed v0 only (0), v0-v1 (1), or v0-v2 (2+).

@@ -348,6 +348,18 @@ inline bool is_inplace_vadd_nc_u32_dpp_row_shr(const Rdna2Inst& in) {
         in.dst.value == in.src[1].value;
 }
 
+// Kena's merged-NGG packer adds a bounded ROW_SHR:N source to the current lane's SRC1 and
+// writes a distinct destination. BOUND_CTRL=1 substitutes zero at the 16-lane row edge.
+// GTA's unbounded in-place reduction above has a different invalid-source write rule.
+inline bool is_vadd_nc_u32_dpp_row_shr_bounded(const Rdna2Inst& in) {
+    return in.fmt == Rdna2Format::VOP2 && in.opcode == 0x25 && in.has_dpp &&
+        in.dpp_bound_ctrl && in.dpp_ctrl >= 0x111u && in.dpp_ctrl <= 0x11fu &&
+        in.dpp_row_mask == 0xfu && in.dpp_bank_mask == 0xfu &&
+        in.dst.kind == OperandKind::VGPR && in.src[0].kind == OperandKind::VGPR &&
+        in.src[1].kind == OperandKind::VGPR &&
+        in.src[0].value == in.src[1].value;
+}
+
 enum class DppRowRor8Op : uint32_t {
     None = 0,
     MovB32 = 1,

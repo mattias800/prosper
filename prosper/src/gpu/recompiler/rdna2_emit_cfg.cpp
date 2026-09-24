@@ -1439,6 +1439,44 @@ bool emit_cfg_state_machine(
         return false;
     };
     if ((!b.is_compute && !graphics) || ins.empty()) return false;
+    if (b.ngg_workgroup_export_probe && b.is_compute && b.local_count == 64 &&
+        std::all_of(ins.begin(), ins.end(), [](const Rdna2Inst& in) {
+            if (in.is_end) return true;
+            if (in.fmt == Rdna2Format::SOPP &&
+                ((in.opcode >= 0x02u && in.opcode <= 0x09u) || in.opcode == 0x12u))
+                return false;
+            if (in.fmt == Rdna2Format::SOP1 &&
+                in.opcode >= kSop1OpcodeSetpcB64 && in.opcode <= kSop1OpcodeRfeB64)
+                return false;
+            return in.fmt != Rdna2Format::SOPK ||
+                (in.opcode != kSopkOpcodeCallB64 &&
+                 in.opcode != kSopkOpcodeSubvectorLoopBegin &&
+                 in.opcode != kSopkOpcodeSubvectorLoopEnd);
+        })) {
+        // This entire barrier-free phase follows one uniform dispatcher route. A direct LDS
+        // reduction inside a case is legal here; a region with any possible guest edge keeps the
+        // existing refusal because different lanes could reach its barriers at different times.
+        for (const auto& in : ins)
+            if (in.fmt == Rdna2Format::SOP1 && in.opcode == kSop1OpcodeBcnt1I32B64)
+                b.ngg_uniform_wave_reduction_pcs.insert(in.pc);
+    }
+    if (b.ngg_workgroup_export_probe && b.is_compute && b.wave_size == 64 &&
+        !initial.vcc && initial.terminal_wave64_scalar_words.contains(106) &&
+        initial.terminal_wave64_scalar_words.contains(107) &&
+        initial.sreg.contains(106) && initial.sreg.contains(107)) {
+        // A barrier does not erase the architectural VCC bits. The preceding CFG phase proved
+        // both physical words are scalar data on every terminal path; reconstruct this lane's
+        // mask bit instead of propagating a missing Bool-domain value. Keep the bridge confined
+        // to the compile-only NGG probe until its full workgroup ABI is validated.
+        const uint32_t lane = b.ibin(Op_BitwiseAnd, b.guest_lane_id(), b.uconst(63));
+        const uint32_t word = b.sel(
+            b.ucmp(Op_UGreaterThanEqual, lane, b.uconst(32)),
+            initial.sreg.at(107), initial.sreg.at(106));
+        const uint32_t bit = b.ibin(Op_BitwiseAnd,
+            b.ibin(Op_ShiftRightLogical, word,
+                   b.ibin(Op_BitwiseAnd, lane, b.uconst(31))), b.uconst(1));
+        initial.vcc = b.ucmp(Op_INotEqual, bit, b.uconst(0));
+    }
     // `safe` branches have already been proven equivalent to straight-line predication by the
     // stage-specific analysis (fragment alpha-test wave early-outs, safe EXECZ regions, and the
     // bounded NGG terminal export gate).  The compact SSA emitter feeds them to emit_alu, which
@@ -1619,7 +1657,10 @@ bool emit_cfg_state_machine(
     // portable dispatcher publishes it as an event below because a host subgroup may be narrower
     // than Wave64 and another guest wave can be parked at a different static instruction.
     auto compute_dpp_add_row_shr = [&](const Rdna2Inst& in) {
-        return b.is_compute && is_inplace_vadd_nc_u32_dpp_row_shr(in);
+        return b.is_compute &&
+            (is_inplace_vadd_nc_u32_dpp_row_shr(in) ||
+             (b.ngg_workgroup_export_probe &&
+              is_vadd_nc_u32_dpp_row_shr_bounded(in)));
     };
 
     // GTA V's MOV/MIN/MAX ROW_ROR:8 family has the same synchronization requirement as the add
@@ -2891,6 +2932,20 @@ bool emit_cfg_state_machine(
                         scalar_words.contains(in.dst.value + static_cast<int>(word));
             }
             const bool scalar_alu_result = scalar_sources && implicit_scalar_source;
+            const bool vcc_pack_scalar_pair = b.is_compute && b.wave_size == 64 &&
+                in.fmt == Rdna2Format::SOP2 && in.opcode >= 0x32 &&
+                in.opcode <= 0x34 && in.dst.value == 106 &&
+                scalar_alu_result && scalar_words.contains(107);
+            if (record_compare && vcc_pack_scalar_pair)
+                b.vcc_pack_scalar_pair_pcs.insert(in.pc);
+            if (record_compare && in.fmt == Rdna2Format::SOP2 &&
+                in.opcode == kSop2OpcodeBfeU64 &&
+                (in.dst.value == 106 || in.dst.value == 107)) {
+                if (scalar_alu_result)
+                    b.vcc_bfe_u64_scalar_result_pcs.insert(in.pc);
+                else
+                    b.vcc_bfe_u64_scalar_result_pcs.erase(in.pc);
+            }
 
             const bool wave64_vcc_b32_mask_not =
                 in.fmt == Rdna2Format::SOP1 && in.opcode == kSop1OpcodeNotB32 &&
@@ -2918,7 +2973,7 @@ bool emit_cfg_state_machine(
                          in.opcode == kSop1OpcodeOrn1SaveexecB64 || exact_quadmask)
                     mask_write = in.dst.value;
             } else if (in.fmt == Rdna2Format::SOP2 && in.dst.value <= 107) {
-                if (b32_vcc_complete_scalar_pair)
+                if (vcc_pack_scalar_pair || b32_vcc_complete_scalar_pair)
                     mask_write = 106;
                 else if (in.opcode == kSop2OpcodeBfmB64)
                     mask_write = in.dst.value;
@@ -3016,7 +3071,8 @@ bool emit_cfg_state_machine(
                 const bool quadmask_native_ballot = exact_quadmask;
                 const bool dual_domain_scalar_write =
                     mov_dual_domain || cselect_scalar_branch || logical_native_ballot ||
-                    quadmask_native_ballot || b32_vcc_complete_scalar_pair;
+                    quadmask_native_ballot || b32_vcc_complete_scalar_pair ||
+                    vcc_pack_scalar_pair;
                 if (dual_domain_scalar_write && valid_scc_read) {
                     for (const auto& [base, width] : scalar_writes)
                         for (uint32_t word = 0; word < width; ++word)
@@ -3063,7 +3119,6 @@ bool emit_cfg_state_machine(
                     scalar_scc = scalar_scc && scalar_sources;
                 else if (in.opcode == kSop2OpcodeBfeU64)
                     scalar_scc = scalar_sources &&
-                        in.dst.value != 106 && in.dst.value != 107 &&
                         in.dst.value != 126 && in.dst.value != 127;
                 else if (!preserves_scc)
                     // `mask_write < 0` is what keeps a B64 logical's cross-lane
@@ -3891,8 +3946,19 @@ bool emit_cfg_state_machine(
         (entry_block_defines_vcc_before_any_read(
              ins, starts.front(), starts.size() > 1 ? starts[1] : UINT32_MAX) ||
          region_defines_vcc_before_any_read(ins));
-    if (!initial.vcc && !proven_wave32_masks && !entry_vcc_dead)
+    if (!initial.vcc && !proven_wave32_masks && !entry_vcc_dead) {
+        if (getenv("PROSPER_DBG"))
+            std::fprintf(stderr,
+                         "[missing-entry-vcc] pc=%u scalar-lo=%d scalar-hi=%d "
+                         "input-lo=%d input-hi=%d bool-lo=%d bool-hi=%d "
+                         "active=%d terminal-scalar-hi=%d\n",
+                         ins.front().pc, initial.sreg.contains(106),
+                         initial.sreg.contains(107), initial.sreg_input.contains(106),
+                         initial.sreg_input.contains(107), initial.sreg_bool.contains(106),
+                         initial.sreg_bool.contains(107), initial_active != 0,
+                         initial.terminal_wave64_scalar_words.contains(107));
         return reject_cfg(ins.front().pc, "missing-entry-vcc");
+    }
     b.store_function(vcc_var, initial.vcc ? initial.vcc : no);
     b.store_function(exec_var, initial.exec);
     b.store_function(pc_var, b.uconst(0));
@@ -4104,6 +4170,10 @@ bool emit_cfg_state_machine(
                 else
                     ++it;
             }
+            if (dispatch == UINT32_MAX)
+                for (int word : *entry_wave64_scalar_words)
+                    if (state.sreg.contains(word))
+                        state.terminal_wave64_scalar_words.insert(word);
         }
         if (entry_b32) {
             for (int reg : *entry_b32) {
@@ -4904,11 +4974,14 @@ bool emit_cfg_state_machine(
             if (event == compute_dpp_add_event_for_pc.end())
                 return reject_cfg(dpp_add_row_shr->pc, "dpp-add-row-shr-event");
             const int dst = dpp_add_row_shr->dst.value;
-            const auto source = state.vreg.find(dst);
+            const bool bounded = is_vadd_nc_u32_dpp_row_shr_bounded(*dpp_add_row_shr);
+            const auto source = state.vreg.find(
+                bounded ? dpp_add_row_shr->src[0].value : dst);
             const uint32_t source_value =
                 source == state.vreg.end() ? zero : source->second;
-            const uint32_t amount = b.uconst(
-                static_cast<uint32_t>(dpp_add_row_shr->dpp_ctrl - 0x110u));
+            const uint32_t amount = b.uconst(bounded
+                ? 0x100u | static_cast<uint32_t>(dpp_add_row_shr->dpp_ctrl - 0x110u)
+                : static_cast<uint32_t>(dpp_add_row_shr->dpp_ctrl - 0x110u));
             if (b.native_subgroup_size) {
                 // One exact native subgroup is one guest wave, and the scalar dispatcher selector
                 // is subgroup-uniform. The source EXEC bit still matters: FI=0/BOUND_CTRL=0
@@ -5746,7 +5819,14 @@ bool emit_cfg_state_machine(
         dpp_metadata);
     b.barrier();
 
-    const uint32_t dpp_amount = b.load_function(b.t_u32, dpp_add_amount_var);
+    const uint32_t dpp_control = b.load_function(b.t_u32, dpp_add_amount_var);
+    // The bounded form belongs to the compile-only NGG probe. Preserve the established GTA
+    // unbounded reduction's generated graph and invalid-source write rule outside that probe.
+    const uint32_t dpp_bounded = b.ngg_workgroup_export_probe
+        ? b.ucmp(Op_INotEqual, b.ibin(Op_BitwiseAnd, dpp_control, b.uconst(0x100)), zero)
+        : no;
+    const uint32_t dpp_amount = b.ngg_workgroup_export_probe
+        ? b.ibin(Op_BitwiseAnd, dpp_control, b.uconst(0xf)) : dpp_control;
     const uint32_t dpp_row_lane = b.ibin(
         Op_BitwiseAnd, b.linear_localid, b.uconst(15));
     const uint32_t dpp_in_bounds = b.ucmp(
@@ -5770,9 +5850,12 @@ bool emit_cfg_state_machine(
         dpp_in_bounds, dpp_source_active);
     dpp_valid_source = b.land(
         dpp_valid_source, b.ucmp(Op_IEqual, dpp_source_event, dpp_event));
-    const uint32_t dpp_result = b.ibin(Op_IAdd, dpp_source, dpp_shifted);
-    const uint32_t dpp_write = b.land(
-        b.land(dpp_pending, dpp_active), dpp_valid_source);
+    const uint32_t dpp_result = b.ibin(Op_IAdd, dpp_source,
+        b.ngg_workgroup_export_probe
+            ? b.sel(dpp_valid_source, dpp_shifted, zero) : dpp_shifted);
+    const uint32_t dpp_write = b.land(b.land(dpp_pending, dpp_active),
+        b.ngg_workgroup_export_probe
+            ? b.lor(dpp_bounded, dpp_valid_source) : dpp_valid_source);
     const uint32_t dpp_dst = b.load_function(b.t_u32, dpp_add_dst_var);
     for (int reg : compute_dpp_add_row_shr_dsts) {
         const auto kv = vv.find(reg);
@@ -6439,8 +6522,10 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                 const uint32_t padded_lanes = wave_count * b.wave_size;
                 const bool has_portable_dpp = std::any_of(
                     ins.begin(), ins.begin() + phased.end_index,
-                    [](const Rdna2Inst& in) {
+                    [&b](const Rdna2Inst& in) {
                         return is_inplace_vadd_nc_u32_dpp_row_shr(in) ||
+                            (b.ngg_workgroup_export_probe &&
+                             is_vadd_nc_u32_dpp_row_shr_bounded(in)) ||
                             dpp_row_ror8_op(in) != DppRowRor8Op::None;
                     });
                 const uint32_t scratch_dwords = padded_lanes +

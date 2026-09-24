@@ -7,6 +7,7 @@
 #include "gpu/diagnostics/diagnostic_selectors.hpp"
 #include "gpu/execute/gpu_execute.hpp"
 #include "gpu/resources/shader_resources.hpp"
+#include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "shared/live/live_renderer.hpp"
 #include "shared/live/live_target_format.hpp"
 #include "replay_output_extent.hpp"
@@ -81,6 +82,8 @@ void usage(const char* argv0) {
                          "[--override-compute-spv N PATH] "
                          "[--dump-failed-shader FAILURE:STAGE PATH] "
                          "[--retry-failed-chain FAILURE] "
+                         "[--retry-failed-chain-spv PATH] "
+                         "[--probe-ngg-workgroup-s3 0xVALUE (with --retry-failed-chain; compile only)] "
                          "[--retry-failed-stage FAILURE:STAGE] "
                          "[--retry-failed-stage-spv PATH] "
                          "[--dump-compute-resource N:BINDING PATH] "
@@ -104,6 +107,8 @@ void usage(const char* argv0) {
                  "  --dump-compute-raw N PATH           the guest's raw RDNA2 for dispatch N\n"
                  "  --retry-failed-stage-spv PATH       retry output SPIR-V; requires\n"
                  "                                      --retry-failed-stage and an accepted descriptor contract\n"
+                 "  --retry-failed-chain-spv PATH       compile-only chain retry SPIR-V;\n"
+                 "                                      requires --retry-failed-chain\n"
                  "\nPROSPER_SHADER_DUMP_SUCCESS is honoured by cached COMPUTE recompiles in\n"
                  "--recompile-raw and compute --retry-failed-stage. Graphics recompiles bypass\n"
                  "this hook; use --retry-failed-stage-spv for graphics retry output.\n"
@@ -2220,7 +2225,9 @@ int main(int argc, char** argv) {
     bool post_compute_unverified = false;
     std::string failed_shader_spec, failed_shader_path;
     std::string retry_failed_chain_spec, retry_failed_stage_spec;
+    std::string probe_ngg_workgroup_s3_spec;
     std::string retry_failed_stage_spv_path;
+    std::string retry_failed_chain_spv_path;
     std::string list_resources_spec;   // #2373
     std::string realized_shader_spec, realized_shader_path;
     std::string rtt_seed_path;
@@ -2516,6 +2523,15 @@ int main(int argc, char** argv) {
         }
         else if (std::string(argv[i]) == "--retry-failed-chain" && i + 1 < argc)
             retry_failed_chain_spec = argv[++i];
+        else if (std::string(argv[i]) == "--retry-failed-chain-spv") {
+            if (i + 1 >= argc || !argv[i + 1][0] || argv[i + 1][0] == '-') {
+                std::fprintf(stderr, "gpu_replay: --retry-failed-chain-spv needs a PATH\n");
+                return 2;
+            }
+            retry_failed_chain_spv_path = argv[++i];
+        }
+        else if (std::string(argv[i]) == "--probe-ngg-workgroup-s3" && i + 1 < argc)
+            probe_ngg_workgroup_s3_spec = argv[++i];
         else if (std::string(argv[i]) == "--retry-failed-stage" && i + 1 < argc)
             retry_failed_stage_spec = argv[++i];
         else if (std::string(argv[i]) == "--retry-failed-stage-spv") {
@@ -2526,6 +2542,20 @@ int main(int argc, char** argv) {
             retry_failed_stage_spv_path = argv[++i];
         }
         else positional.push_back(argv[i]);
+    }
+    if (!probe_ngg_workgroup_s3_spec.empty() && retry_failed_chain_spec.empty()) {
+        std::fprintf(stderr,
+                     "gpu_replay: --probe-ngg-workgroup-s3 requires --retry-failed-chain\n");
+        return 2;
+    }
+    if (!retry_failed_chain_spv_path.empty() &&
+        (retry_failed_chain_spec.empty() || !bundle_path.empty() ||
+         !retry_failed_stage_spec.empty() || graph_only ||
+         !list_resources_spec.empty() || !realized_shader_spec.empty() ||
+         !failed_shader_spec.empty())) {
+        std::fprintf(stderr,
+                     "gpu_replay: --retry-failed-chain-spv requires a standalone chain retry without another terminal diagnostic\n");
+        return 2;
     }
     if (legacy_htile_before_stencil)
         set_environment("PROSPER_GPU_REPLAY_LEGACY_HTILE_BEFORE_STENCIL", "1");
@@ -2598,7 +2628,7 @@ int main(int argc, char** argv) {
             compute_resource_override_requested ||
             !compute_resource_spec.empty() || !post_compute_resource_spec.empty() ||
             require_post_change || expected_post_hash_set || !failed_shader_spec.empty() ||
-            !retry_failed_chain_spec.empty() ||
+            !retry_failed_chain_spec.empty() || !probe_ngg_workgroup_s3_spec.empty() ||
             // These three are read only AFTER the `return replay_bundle(...)` below, so a bundle
             // run that passed one used to execute the ordinary replay and exit 0 having silently
             // ignored it -- the void experiment the sibling guard below is careful to make loud.
@@ -3452,11 +3482,49 @@ int main(int argc, char** argv) {
         const bool exact = failure.vertex_retry_config_available;
         const prosper::gpu::PixelInputMapping* pixel_inputs =
             exact && failure.has_pixel_inputs ? &failure.pixel_inputs : nullptr;
-        const std::vector<uint32_t> spirv = prosper::gpu::recompile_vertex_chain(
-            prolog.words.data(), prolog.words.size(), main.words.data(), main.words.size(),
-            resources, pixel_inputs, exact && failure.capture_vertex_position,
-            exact ? failure.vertex_lds_dwords : 0u,
-            {prosper::gpu::RecompileDiagnosticStage::Vertex, main_stage.program_addr});
+        std::vector<uint32_t> spirv;
+        uint32_t provisional_s3 = 0;
+        size_t linked_dwords = 0;
+        if (!probe_ngg_workgroup_s3_spec.empty()) {
+            const char* s3_text = probe_ngg_workgroup_s3_spec.c_str();
+            char* s3_end = nullptr;
+            errno = 0;
+            const unsigned long long parsed = std::strtoull(s3_text, &s3_end, 0);
+            if (probe_ngg_workgroup_s3_spec.size() < 3 || s3_text[0] != '0' ||
+                (s3_text[1] != 'x' && s3_text[1] != 'X') || !s3_end || *s3_end ||
+                errno == ERANGE || parsed > UINT32_MAX || !exact || !resources ||
+                !failure.vertex_count || failure.vertex_lds_dwords > 16384u) {
+                std::fprintf(stderr,
+                             "gpu_replay: workgroup compile probe requires explicit 0xS3 and "
+                             "captured resources, vertex count and LDS settings\n");
+                return 2;
+            }
+            provisional_s3 = static_cast<uint32_t>(parsed);
+            const auto info = prosper::gpu::rdna2_vertex_prolog_info(
+                prolog.words.data(), prolog.words.size());
+            const size_t main_span = prosper::gpu::rdna2_recompile_code_span(
+                main.words.data(), main.words.size());
+            if (!info.valid || !main_span || info.prefix_dwords > SIZE_MAX - main_span) {
+                std::fprintf(stderr, "gpu_replay: workgroup compile probe cannot link this chain\n");
+                return 2;
+            }
+            std::vector<uint32_t> linked;
+            linked.reserve(info.prefix_dwords + main_span);
+            linked.insert(linked.end(), prolog.words.begin(),
+                          prolog.words.begin() + info.prefix_dwords);
+            linked.insert(linked.end(), main.words.begin(), main.words.begin() + main_span);
+            linked_dwords = linked.size();
+            spirv = prosper::gpu::recompile_ngg_exports_for_test(
+                linked.data(), linked.size(), 0, failure.vertex_lds_dwords * 4u,
+                resources, failure.vertex_count, provisional_s3,
+                {prosper::gpu::RecompileDiagnosticStage::Vertex, main_stage.program_addr});
+        } else {
+            spirv = prosper::gpu::recompile_vertex_chain(
+                prolog.words.data(), prolog.words.size(), main.words.data(), main.words.size(),
+                resources, pixel_inputs, exact && failure.capture_vertex_position,
+                exact ? failure.vertex_lds_dwords : 0u,
+                {prosper::gpu::RecompileDiagnosticStage::Vertex, main_stage.program_addr});
+        }
         const std::string reason = spirv.empty()
             ? prosper::gpu::last_terminal_reject_reason(main_stage.program_addr) : "";
         std::fprintf(stderr,
@@ -3470,6 +3538,34 @@ int main(int argc, char** argv) {
                      exact && failure.has_pixel_inputs,
                      exact && failure.capture_vertex_position,
                      reason.empty() ? "unrecorded" : reason.c_str());
+        if (!probe_ngg_workgroup_s3_spec.empty())
+            std::fprintf(stderr,
+                         "[ngg-workgroup-probe] COMPILE ONLY, not a raster/ABI proof; "
+                         "provisional-s3=0x%08x linked-dwords=%zu result=%s\n",
+                         provisional_s3, linked_dwords,
+                         spirv.empty() ? "rejected" : "module-emitted");
+        if (!retry_failed_chain_spv_path.empty()) {
+            if (spirv.empty()) {
+                std::fprintf(stderr,
+                             "gpu_replay: refusing chain SPIR-V export: empty module\n");
+                return 1;
+            }
+            FILE* f = std::fopen(retry_failed_chain_spv_path.c_str(), "wb");
+            if (!f) {
+                std::fprintf(stderr, "gpu_replay: cannot write chain SPIR-V %s: %s\n",
+                             retry_failed_chain_spv_path.c_str(), std::strerror(errno));
+                return 2;
+            }
+            const size_t written = std::fwrite(spirv.data(), sizeof(uint32_t), spirv.size(), f);
+            const int closed = std::fclose(f);
+            if (written != spirv.size() || closed != 0) {
+                std::fprintf(stderr, "gpu_replay: cannot finish writing chain SPIR-V %s\n",
+                             retry_failed_chain_spv_path.c_str());
+                return 2;
+            }
+            std::fprintf(stderr, "[retry-failed-chain] wrote %zu SPIR-V dwords to %s\n",
+                         spirv.size(), retry_failed_chain_spv_path.c_str());
+        }
         if (positional.size() == 1 && !inspect) return spirv.empty() ? 1 : 0;
     }
     if (!retry_failed_stage_spec.empty()) {

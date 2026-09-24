@@ -785,6 +785,23 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         reduced_wave_mask = true;
                     }
                 }
+                if (!reduced_wave_mask && b.ngg_workgroup_export_probe &&
+                    b.wave_size == 64 && b.local_count == 64 &&
+                    (allow_wave || b.ngg_uniform_wave_reduction_pcs.contains(in.pc)) &&
+                    in.src[0].kind == OperandKind::SGPR &&
+                    mask != rs.sreg_bool.end() &&
+                    !rs.sreg.contains(in.src[0].value) &&
+                    !rs.sreg.contains(in.src[0].value + 1) &&
+                    !rs.sreg_input.contains(in.src[0].value) &&
+                    !rs.sreg_input.contains(in.src[0].value + 1)) {
+                    // This test-only workgroup shell has one complete guest Wave64. Its LDS
+                    // reduction can count a saved VOPC mask without a native Wave64 subgroup.
+                    // The compact walk supplies allow_wave only for straight-line execution; the
+                    // dispatcher has a separate branch-free region proof. A production graphics
+                    // path still needs a workgroup/draw ABI proof before executing this module.
+                    result = b.guest_wave_popcount(mask->second);
+                    reduced_wave_mask = true;
+                }
                 if (!reduced_wave_mask && !b.is_compute && !b.is_fragment && b.ngg_one_lane &&
                            mask != rs.sreg_bool.end()) {
                     result = b.sel(mask->second, b.uconst(1), b.uconst(0));
@@ -1779,6 +1796,23 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 const uint32_t result = b.ibin(Op_BitwiseOr, lo, hi);
                 rs.sreg[in.dst.value] = result;
                 rs.sreg_srt.erase(in.dst.value);
+                if (b.vcc_pack_scalar_pair_pcs.contains(in.pc)) {
+                    const auto high = rs.sreg.find(107);
+                    if (high == rs.sreg.end()) { ok = false; return true; }
+                    const uint32_t lane = b.ibin(
+                        Op_BitwiseAnd, b.guest_lane_id(), b.uconst(63));
+                    const uint32_t word = b.sel(
+                        b.ucmp(Op_UGreaterThanEqual, lane, b.uconst(32)),
+                        high->second, result);
+                    const uint32_t bit = b.ibin(
+                        Op_BitwiseAnd,
+                        b.ibin(Op_ShiftRightLogical, word,
+                               b.ibin(Op_BitwiseAnd, lane, b.uconst(31))),
+                        b.uconst(1));
+                    rs.vcc = b.ucmp(Op_INotEqual, bit, b.uconst(0));
+                    rs.sreg_bool[106] = rs.vcc;
+                    rs.sreg_bool_narrowed[106] = true;
+                }
                 if (!b.is_compute && !b.is_fragment && in.dst.value == 106) {
                     const uint32_t bit = b.ibin(Op_BitwiseAnd, result, b.uconst(1));
                     rs.vcc = b.ucmp(Op_INotEqual, bit, b.uconst(0));
@@ -2209,11 +2243,33 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     b.u64_from_lohi(source_lo, source_hi), offset, width);
                 const bool writes_exec = in.dst.value == 126 || in.dst.value == 127;
                 const bool writes_vcc = in.dst.value == 106 || in.dst.value == 107;
+                const auto has_scalar_word = [&](int reg) {
+                    return rs.sreg.contains(reg) || rs.sreg_input.contains(reg);
+                };
+                const auto has_scalar_source = [&](const Operand& operand, bool wide) {
+                    if (operand.kind == OperandKind::InlineInt ||
+                        operand.kind == OperandKind::Literal) return true;
+                    if (operand.kind != OperandKind::SGPR &&
+                        operand.kind != OperandKind::Special) return false;
+                    return has_scalar_word(operand.value) &&
+                        (!wide || has_scalar_word(operand.value + 1));
+                };
+                const bool retain_vcc_scalar = writes_vcc &&
+                    has_scalar_source(in.src[0], true) &&
+                    has_scalar_source(in.src[1], false) &&
+                    (rs.scalar_presence_has_no_placeholders ||
+                     b.vcc_bfe_u64_scalar_result_pcs.contains(in.pc));
                 if (writes_exec || writes_vcc) {
                     uint32_t lane = b.guest_lane_id();
                     lane = b.ibin(Op_BitwiseAnd, lane, b.uconst(b.wave_size - 1));
                     const uint32_t mask_bit = b.u64_bit(result, lane);
-                    rs.scc = 0;   // poison: SCC=(complete mask != 0) is a guest-wave reduction
+                    // The exact 64-bit scalar result can carry SCC and both VCC data words.
+                    // A mask-only source cannot: its per-lane predicate is not a 64-bit value.
+                    rs.scc = retain_vcc_scalar
+                        ? b.ucmp(Op_INotEqual,
+                                 b.ibin(Op_BitwiseOr, b.u64_lo(result), b.u64_hi(result)),
+                                 b.uconst(0))
+                        : 0;
                     if (writes_exec) {
                         rs.exec = mask_bit;
                         rs.exec_narrowed = true;
@@ -2223,6 +2279,10 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         rs.sreg_bool_narrowed[in.dst.value] = true;
                     }
                     mask_write_clobbers_pair(rs, in.dst.value);
+                    if (retain_vcc_scalar) {
+                        rs.sreg[in.dst.value] = b.u64_lo(result);
+                        rs.sreg[in.dst.value + 1] = b.u64_hi(result);
+                    }
                 } else {
                     const uint32_t lo = b.u64_lo(result), hi = b.u64_hi(result);
                     rs.sreg[in.dst.value] = lo;

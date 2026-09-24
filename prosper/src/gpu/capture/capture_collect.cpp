@@ -429,6 +429,30 @@ bool capture_failure_diagnostics(
                 runtime_stage.stage == ShaderProgramStage::Compute;
             if (!capture_table(runtime_stage.resources.get(), {}, false, compute_stage,
                                stage.resource_table, error)) return false;
+            if (runtime_stage.input_bytes_snapshotted && runtime_stage.resources) {
+                const auto& source = runtime_stage.resources->resources;
+                for (size_t index = 0; index < source.size(); ++index) {
+                    const ShaderResource& resource = source[index];
+                    if (resource.cls != ResourceClass::ConstantBuffer &&
+                        resource.cls != ResourceClass::VertexBuffer)
+                        continue;
+                    if (!resource.host_data || resource.host_data_size < resource.size ||
+                        !resource.size || capture.blobs.size() >= kMaxResources) {
+                        error = "failed input snapshot lost its exact-point buffer bytes";
+                        return false;
+                    }
+                    GpuCaptureBlob blob;
+                    blob.guest_addr = resource.gpu_addr;
+                    blob.bytes_read = resource.size;
+                    blob.bytes.assign(resource.host_data,
+                                      resource.host_data + resource.size);
+                    blob.content_hash = gpu_capture_hash(blob.bytes);
+                    auto& captured = stage.resource_table.resources[index];
+                    captured.blob_index = static_cast<uint32_t>(capture.blobs.size());
+                    captured.blob_offset = 0;
+                    capture.blobs.push_back(std::move(blob));
+                }
+            }
             if (!capture_raw_shader_version(stage.program_addr, reader, capture, raw_words,
                                             raw_shader_index_by_address,
                                             stage.raw_shader_index, error)) return false;

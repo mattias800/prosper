@@ -3438,6 +3438,92 @@ int main(int argc, char** argv) {
               reinterpret_cast<const uint8_t*>(kDiagnosticBadPs), sizeof(kDiagnosticBadPs)),
           "failed stage retains the exact content-addressed raw stream through s_endpgm");
 
+    // A failed shader normally carries descriptor metadata, not resource contents. The opt-in
+    // exact-point snapshot must own small input bytes before the guest can rewrite them, and the
+    // ordinary capture format must retain those bytes through serialization without a new version.
+    std::array<uint8_t, 8> failed_input_bytes{1, 2, 3, 4, 5, 6, 7, 8};
+    ShaderResource failed_input;
+    failed_input.cls = ResourceClass::ConstantBuffer;
+    failed_input.binding = 2;
+    failed_input.gpu_addr = 0x5008d00000ull;
+    failed_input.size = static_cast<uint32_t>(failed_input_bytes.size());
+    failed_input.host_data = failed_input_bytes.data();
+    failed_input.host_data_size = failed_input_bytes.size();
+    OperationRealizationFailure input_failure;
+    input_failure.kind = SubmitOperationKind::Draw;
+    input_failure.index = 0;
+    input_failure.command_order = 778;
+    input_failure.reason = RealizationFailureReason::ShaderRecompile;
+    input_failure.vertex_count = 3;
+    ShaderRealizationDiagnostic input_stage;
+    input_stage.stage = ShaderProgramStage::Vertex;
+    input_stage.program_addr = reinterpret_cast<uint64_t>(kDiagnosticVs);
+    input_stage.resources = std::make_shared<ShaderResourceTable>();
+    input_stage.resources->resources.push_back(failed_input);
+    input_failure.stages.push_back(input_stage);
+    OperationRealizationFailure partial_input = input_failure;
+    partial_input.stages[0].resources =
+        std::make_shared<ShaderResourceTable>(*input_stage.resources);
+    ShaderResource unavailable_input = failed_input;
+    unavailable_input.binding = 3;
+    unavailable_input.host_data = nullptr;
+    partial_input.stages[0].resources->resources.push_back(unavailable_input);
+    const auto* original_table = partial_input.stages[0].resources.get();
+    CHECK(!snapshot_failed_draw_input_buffers(partial_input, input_stage.program_addr) &&
+              partial_input.stages[0].resources.get() == original_table &&
+              !partial_input.stages[0].input_bytes_snapshotted,
+          "failed-draw input snapshot declines incomplete resources atomically");
+    OperationRealizationFailure prefixed_input = input_failure;
+    prefixed_input.stages[0].resources =
+        std::make_shared<ShaderResourceTable>(*input_stage.resources);
+    prefixed_input.stages[0].resources->resources[0].host_data_prefix_bytes = 4;
+    CHECK(!snapshot_failed_draw_input_buffers(prefixed_input, input_stage.program_addr) &&
+              !prefixed_input.stages[0].input_bytes_snapshotted,
+          "failed-draw snapshot declines a buffer whose prefix it cannot retain");
+    OperationRealizationFailure mapped_input = input_failure;
+    mapped_input.stages[0].resources =
+        std::make_shared<ShaderResourceTable>(*input_stage.resources);
+    mapped_input.stages[0].resources->resources[0].gpu_addr =
+        reinterpret_cast<uint64_t>(failed_input_bytes.data());
+    mapped_input.stages[0].resources->resources[0].host_data = nullptr;
+    mapped_input.stages[0].resources->resources[0].host_data_size = 0;
+    CHECK(snapshot_failed_draw_input_buffers(mapped_input, input_stage.program_addr) &&
+              mapped_input.stages[0].resources->resources[0].host_data != nullptr &&
+              mapped_input.stages[0].resources->resources[0].host_data[0] == 1,
+          "failed-draw snapshot reads a mapped guest buffer when host backing is absent");
+    CHECK(!snapshot_failed_draw_input_buffers(input_failure, input_stage.program_addr + 4) &&
+              !input_failure.stages[0].input_bytes_snapshotted,
+          "failed-draw snapshot refuses a program-selector miss");
+    CHECK(snapshot_failed_draw_input_buffers(input_failure, input_stage.program_addr) &&
+              input_failure.stages[0].input_bytes_snapshotted,
+          "failed-draw input snapshot accepts a complete bounded buffer");
+    failed_input_bytes.fill(0xEE);
+    GpuCaptureFile captured_input_failure;
+    const std::vector<SubmitOperation> failed_input_operations = {
+        {SubmitOperationKind::Draw, 0, 778},
+    };
+    CHECK(capture_submit_items({}, {}, failed_input_operations, meta, reader,
+                               captured_input_failure, error, {}, {input_failure}) &&
+              captured_input_failure.failure_diagnostics.size() == 1 &&
+              captured_input_failure.failure_diagnostics[0].stages.size() == 1 &&
+              captured_input_failure.failure_diagnostics[0].stages[0]
+                  .resource_table.resources.size() == 1,
+          "failed-draw capture collects owned exact-point buffer bytes");
+    std::vector<uint8_t> captured_input_serialized;
+    GpuCaptureFile captured_input_loaded;
+    CHECK(serialize_gpu_capture(captured_input_failure, captured_input_serialized, error) &&
+              deserialize_gpu_capture(captured_input_serialized, captured_input_loaded, error) &&
+              captured_input_loaded.failure_diagnostics.size() == 1 &&
+              captured_input_loaded.failure_diagnostics[0].stages.size() == 1 &&
+              captured_input_loaded.failure_diagnostics[0].stages[0]
+                  .resource_table.resources.size() == 1 &&
+              captured_input_loaded.failure_diagnostics[0].stages[0]
+                  .resource_table.resources[0].blob_index < captured_input_loaded.blobs.size() &&
+              captured_input_loaded.blobs[captured_input_loaded.failure_diagnostics[0].stages[0]
+                  .resource_table.resources[0].blob_index].bytes ==
+                  std::vector<uint8_t>({1, 2, 3, 4, 5, 6, 7, 8}),
+          "failed-draw input bytes survive guest mutation and capture round-trip");
+
     OperationRealizationFailure compute_failure;
     compute_failure.kind = SubmitOperationKind::Dispatch;
     compute_failure.index = 8;

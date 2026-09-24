@@ -2288,11 +2288,17 @@ int main() {
           "Wave64 scalar BFE_U64 publishes exact SCC across a dispatcher reload");
     std::vector<uint32_t> code17d1_bfe_u64_vcc = code17d1_bfe_u64_scc;
     code17d1_bfe_u64_vcc[2] =
-        0x94eaff00u;              // same BFE site targets VCC and poisons SCC
-    CHECK(recompile_compute(code17d1_bfe_u64_vcc.data(),
-                            code17d1_bfe_u64_vcc.size(), nullptr,
+        0x94eaff00u;              // same BFE site targets VCC; both source words are scalar
+    CHECK(!recompile_compute(code17d1_bfe_u64_vcc.data(),
+                             code17d1_bfe_u64_vcc.size(), nullptr,
+                             native_linear_cfg17d).empty(),
+          "Wave64 scalar BFE_U64 into VCC retains exact SCC across a dispatcher reload");
+    std::vector<uint32_t> code17d1_bfe_u64_vcc_missing = code17d1_bfe_u64_vcc;
+    code17d1_bfe_u64_vcc_missing[1] = 0xbf800000u; // remove the high source-word definition
+    CHECK(recompile_compute(code17d1_bfe_u64_vcc_missing.data(),
+                            code17d1_bfe_u64_vcc_missing.size(), nullptr,
                             native_linear_cfg17d).empty(),
-          "same-site VCC BFE_U64 mutation cannot publish a scalar SCC fact");
+          "same-site VCC BFE_U64 cannot invent an absent source half");
 
     // Ordinary scalar S_NOT writes exact SCC, but the supported Wave64 self-VCC form writes only a
     // mask half and deliberately poisons SCC/scalar-data state. The reload plus following B32 VCC
@@ -12483,6 +12489,30 @@ int main() {
         if (gotA7c[i] != ((i & 63u) < 8u ? 1.0f : 0.0f)) ++badA7c;
     CHECK(gotA7c.size() == N && badA7c == 0,
           "A7c: s_bfe_u64 updates VCC and a later mask consumer observes it");
+
+    // Kena's merged-NGG fetch prolog writes a complete B64 scalar extract into physical VCC,
+    // then uses VCC_LO as the data arm of S_CSELECT_B32. The predicate view alone loses that
+    // 32-bit value. Bits [39:32] of 0x0000005a12345678 are 0x5a; SCC is deliberately false so
+    // the select must read the extracted VCC_LO, not its other input.
+    const uint32_t codeA7d[] = {
+        0xbe8e03ffu, 0x12345678u, // s_mov_b32 s14, literal
+        0xbe8f03ffu, 0x0000005au, // s_mov_b32 s15, literal
+        0xbeea03ffu, 0x00080020u, // s_mov_b32 vcc_lo, width=8 offset=32
+        0x94ea6a0eu,              // s_bfe_u64 vcc, s[14:15], vcc_lo
+        0xbe8b0391u,              // s_mov_b32 s11, 17
+        0xbf06800eu,              // s_cmp_eq_u32 s14, 0 -> SCC=false
+        0x850b6a0bu,              // s_cselect_b32 s11, s11, vcc_lo
+        0x7e02020bu,              // v_mov_b32 v1, s11
+        0xbf810000u,
+    };
+    const std::vector<uint32_t> spvA7d = recompile_valu(codeA7d, std::size(codeA7d), 1, 1);
+    CHECK(!spvA7d.empty(), "A7d: scalar BFE-to-VCC followed by data select recompiles");
+    const std::vector<float> gotA7d = prosper::test::run_compute(spvA7d, inX, N, N);
+    uint32_t badA7d = 0;
+    for (uint32_t lane = 0; lane < N && gotA7d.size() == N; ++lane)
+        badA7d += bits_of(gotA7d[lane]) != 0x5au;
+    CHECK(gotA7d.size() == N && badA7d == 0,
+          "A7d: BFE-to-VCC retains exact scalar bits through S_CSELECT_B32");
 
     // A8 (#880): an inline float constant in a 16-bit operand supplies the f16 encoding.
     // v_cvt_f32_f16_e32 v1, 1.0 must produce 1.0f (the old raw-f32-pattern unpack gave 0.0).
