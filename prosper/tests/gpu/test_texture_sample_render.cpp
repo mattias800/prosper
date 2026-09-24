@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
+#include <iterator>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -192,7 +193,8 @@ int main(int argc, char** argv) {
         image_info.imageType = VK_IMAGE_TYPE_2D;
         image_info.format = VK_FORMAT_R8G8B8A8_UNORM;
         image_info.extent = {TW, TH, 1};
-        image_info.mipLevels = image_info.arrayLayers = 1;
+        image_info.mipLevels = 1;
+        image_info.arrayLayers = 1;
         image_info.samples = VK_SAMPLE_COUNT_1_BIT;
         image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
         image_info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
@@ -207,24 +209,29 @@ int main(int argc, char** argv) {
         std::vector<uint8_t> red(size_t(TW) * TH * 4, 0);
         std::vector<uint8_t> green(red.size(), 0);
         for (size_t i = 0; i < red.size(); i += 4) {
-            red[i] = red[i + 3] = green[i + 1] = green[i + 3] = 255;
+            red[i] = 255;
+            red[i + 3] = 255;
+            green[i + 1] = 255;
+            green[i + 3] = 255;
         }
-        auto words = std::vector<uint32_t>(ps_template,
-            ps_template + sizeof(ps_template) / sizeof(ps_template[0]));
+        auto words = std::vector<uint32_t>(ps_template, ps_template + std::size(ps_template));
         const auto frag = recompile_fragment(words.data(), words.size(), &rt);
         CHECK(!frag.empty(), "pressure fixture fragment shader compiles");
         prosper::test::FrameResource a;
         a.binding = 4; a.set = 1; a.tw = TW; a.th = TH;
         a.tex_rgba = red.data(); a.tex_byte_size = red.size();
-        a.persistent_texture_id = 0x7020000000000101ull;
+        a.persistent_texture_id = 0x7020000000000101ULL;
         a.persistent_texture_version = 1;
         auto b = a;
         b.tex_rgba = green.data();
         b.persistent_texture_id++;
         prosper::test::BackendDraw draw_a, draw_b;
-        draw_a.vs = draw_b.vs = vert;
-        draw_a.fs = draw_b.fs = frag;
-        draw_a.vcount = draw_b.vcount = 3;
+        draw_a.vs = vert;
+        draw_b.vs = vert;
+        draw_a.fs = frag;
+        draw_b.fs = frag;
+        draw_a.vcount = 3;
+        draw_b.vcount = 3;
         draw_a.source_submit = 17;
         draw_b.source_submit = 18;
         draw_a.R = {a}; draw_b.R = {b};
@@ -233,7 +240,7 @@ int main(int argc, char** argv) {
                   warm[(size_t(H / 2) * W + W / 2) * 4] == 255,
               "first image is rendered and retained before the pending batch");
         prosper::test::BackendSubmissionBatch batch;
-        constexpr uint64_t target_a_id = 0x7020000000000201ull;
+        constexpr uint64_t target_a_id = 0x7020000000000201ULL;
         prosper::test::BackendColorTarget target_a{target_a_id, false, false};
         prosper::test::BackendColorTarget target_b{target_a_id + 1, false, true};
         const auto pending_a = prosper::test::render_draws_rgba(
@@ -242,7 +249,7 @@ int main(int argc, char** argv) {
         CHECK(pending_a.empty() && batch.pending(),
               "first batched pass holds a live command using the resident image");
         std::vector<uint8_t> pressure_pixels;
-        const auto pressure_log = capture_stderr([&] {
+        const auto pressure_log = capture_stderr([&pressure_pixels, &draw_b, &target_b, &batch, W, H] {
             pressure_pixels = prosper::test::render_draws_rgba(
                 {draw_b}, W, H, nullptr, nullptr, false, &target_b,
                 nullptr, nullptr, nullptr, &batch, true);
@@ -302,7 +309,8 @@ int main(int argc, char** argv) {
             nullptr, nullptr, nullptr, &same_target_batch, false);
         CHECK(shared_pending_a.empty() && same_target_batch.pending(),
               "same-target A has an uncompleted write before pressure");
-        same_target_batch.set_completion_observer([&] {
+        same_target_batch.set_completion_observer([
+            &observed_completion_count, &producer_after_first_completion, shared_target_id, W, H] {
             ++observed_completion_count;
             const auto* image = prosper::test::find_persistent_color_target(
                 shared_target_id, W, H, VK_FORMAT_R8G8B8A8_UNORM);

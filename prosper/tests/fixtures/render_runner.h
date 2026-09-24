@@ -38,6 +38,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -8813,48 +8814,47 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         // this opportunity, while the authoritative lookup below still decides reuse.
         std::unordered_set<PersistentTextureKey, PersistentTextureKeyHash> resident_shapes;
         resident_shapes.reserve(persistent_texture_images.size());
-        for (const auto& [key, image] : persistent_texture_images)
-            if (image.content_valid) {
-                auto shape = key;
-                shape.mip_levels = 0;
-                resident_shapes.insert(shape);
-            }
-        constexpr uint64_t min_miss_bytes = 1024ull * 1024ull;
+        for (const auto& [key, image] : persistent_texture_images) {
+            if (!image.content_valid) continue;
+            auto shape = key;
+            shape.mip_levels = 0;
+            resident_shapes.insert(shape);
+        }
+        constexpr uint64_t min_miss_bytes = 1024ULL * 1024ULL;
         const uint64_t available_bytes = persistent_texture_bytes < persistent_texture_limit
             ? persistent_texture_limit - persistent_texture_bytes : 0;
-        bool sizeable_miss = false;
-        for (const BackendDraw& draw : draws) {
-            for (const FrameResource& resource : draw.R) {
-                if (!resource.persistent_texture_id || !resource.tex_rgba ||
-                    resource.is_storage_image || resource.persistent_render_target_id ||
-                    resource.persistent_depth_target_id || resource.borrowed_compute_image) continue;
-                const PersistentTextureKey shape{
-                    resource.persistent_texture_id, resource.tw, resource.th, resource.td,
-                    resource.img_dim, resource.sample_count, 0,
-                    backend_color_format(resource.texture_format)};
-                if (resident_shapes.contains(shape)) continue;
-                const uint64_t bpp = backend_color_bytes_per_pixel(resource.texture_format);
-                const auto saturated_product = [](uint64_t lhs, uint64_t rhs) {
-                    return rhs && lhs > UINT64_MAX / rhs ? UINT64_MAX : lhs * rhs;
-                };
-                const uint64_t texels = saturated_product(
-                    saturated_product(
-                        saturated_product(resource.tw, resource.th),
-                        std::max(resource.td, 1u)),
-                    std::max(resource.sample_count, 1u));
-                // This is only a lower-bound pressure hint. Mips and driver allocation padding
-                // can still make an image larger than the remaining space; the authoritative
-                // admission below uses VkMemoryRequirements and may conservatively refuse it.
-                // The 1024-owner cap is a separate pressure limit this opt-in policy does not solve.
-                const uint64_t level0_bytes = saturated_product(texels, bpp);
-                if (bpp && level0_bytes >= min_miss_bytes &&
-                    level0_bytes > available_bytes) {
-                    sizeable_miss = true;
-                    break;
-                }
-            }
-            if (sizeable_miss) break;
-        }
+        const auto saturated_product = [](uint64_t lhs, uint64_t rhs) {
+            return rhs && lhs > UINT64_MAX / rhs ? UINT64_MAX : lhs * rhs;
+        };
+        const auto needs_cache_room = [&resident_shapes, available_bytes, &saturated_product](
+                const FrameResource& resource) {
+            if (!resource.persistent_texture_id || !resource.tex_rgba ||
+                resource.is_storage_image || resource.persistent_render_target_id ||
+                resource.persistent_depth_target_id || resource.borrowed_compute_image)
+                return false;
+            const PersistentTextureKey shape{
+                resource.persistent_texture_id, resource.tw, resource.th, resource.td,
+                resource.img_dim, resource.sample_count, 0,
+                backend_color_format(resource.texture_format)};
+            if (resident_shapes.contains(shape)) return false;
+            const uint64_t bpp = backend_color_bytes_per_pixel(resource.texture_format);
+            const uint64_t texels = saturated_product(
+                saturated_product(
+                    saturated_product(resource.tw, resource.th),
+                    std::max(resource.td, 1U)),
+                std::max(resource.sample_count, 1U));
+            // This is only a lower-bound pressure hint. Mips and driver allocation padding
+            // can still make an image larger than the remaining space; the authoritative
+            // admission below uses VkMemoryRequirements and may conservatively refuse it.
+            // The 1024-owner cap is a separate pressure limit this opt-in policy does not solve.
+            const uint64_t level0_bytes = saturated_product(texels, bpp);
+            return bpp && level0_bytes >= min_miss_bytes &&
+                level0_bytes > available_bytes;
+        };
+        const bool sizeable_miss = std::any_of(draws.begin(), draws.end(),
+            [&needs_cache_room](const BackendDraw& draw) {
+                return std::any_of(draw.R.begin(), draw.R.end(), needs_cache_room);
+            });
         if (sizeable_miss) {
             const auto flush_begin = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
             pressure_batch_result = active_submission.submit_and_wait(
@@ -8866,8 +8866,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 pressure_batch_result.wait_result != VK_SUCCESS) return out;
             avoid_cache_eviction = false;
             static std::atomic<uint64_t> pressure_flushes{0};
-            const uint64_t count = pressure_flushes.fetch_add(1, std::memory_order_relaxed) + 1;
-            if (count <= 16 || (count & (count - 1)) == 0)
+            const uint64_t count = pressure_flushes.fetch_add(1) + 1;
+            if (count <= 16 || std::has_single_bit(count))
                 std::fprintf(stderr,
                              "[texture-cache-pressure] completed earlier backend commands "
                              "count=%llu resident=%llu/%llu bytes entries=%zu\n",
