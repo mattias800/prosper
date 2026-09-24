@@ -1268,6 +1268,12 @@ struct RenderVkCtx {
     // Geometry-probe (PROSPER_GEOM_PROBE): transform feedback for final clip-space positions.
     bool transform_feedback_enabled = false;
     bool subgroup_size_control = false;
+    // Optional workgroup-based pre-rasterization path for merged NGG/GS programs. A native
+    // subgroup of 64 is not required: guest wave64 can span multiple host subgroups.
+    bool mesh_shader_enabled = false;
+    VkPhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_PROPERTIES_EXT};
+    PFN_vkCmdDrawMeshTasksEXT cmd_draw_mesh_tasks = nullptr;
     // Runtime-selected storage buffers (#2412). Successful contracts are bounded fixed arrays, so the
     // only descriptor-indexing feature they require is non-uniform storage-buffer array indexing.
     //
@@ -1598,6 +1604,8 @@ inline const RenderVkCtx& render_vk_ctx() {
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES};
         VkPhysicalDeviceShaderAtomicInt64Features atomic_int64_features{
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_INT64_FEATURES};
+        VkPhysicalDeviceMeshShaderFeaturesEXT mesh_features{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT};
         // These features are core in Vulkan 1.2/1.3. Query the feature bits directly;
         // promoted extensions need not still be advertised by a Vulkan 1.4 device.
         //
@@ -1704,6 +1712,24 @@ inline const RenderVkCtx& render_vk_ctx() {
                       r.transform_feedback_enabled = true;
                   }
               }
+              if (!strcmp(de[i].extensionName, VK_EXT_MESH_SHADER_EXTENSION_NAME)) {
+                  VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+                  f2.pNext = &mesh_features;
+                  vkGetPhysicalDeviceFeatures2(r.phys, &f2);
+                  if (mesh_features.meshShader) {
+                      VkPhysicalDeviceProperties2 p2{
+                          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+                      p2.pNext = &r.mesh_shader_properties;
+                      vkGetPhysicalDeviceProperties2(r.phys, &p2);
+                      // The task stage and mesh queries are separate optional features. This
+                      // backend needs neither for direct mesh workgroup draws.
+                      mesh_features = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT};
+                      mesh_features.meshShader = VK_TRUE;
+                      mesh_features.pNext = const_cast<void*>(dci.pNext);
+                      dci.pNext = &mesh_features;
+                      dev_exts.push_back(VK_EXT_MESH_SHADER_EXTENSION_NAME);
+                  }
+              }
               // Present unification (#1270): the swapchain device-extension, only when the instance is
               // surface-capable. Enabling it on the headless render device is harmless (no swapchain is
               // ever created there by tests/screenshot); prosper-app needs it to create its swapchain on
@@ -1722,6 +1748,21 @@ inline const RenderVkCtx& render_vk_ctx() {
         dci.enabledExtensionCount = (uint32_t)dev_exts.size();
         dci.ppEnabledExtensionNames = dev_exts.empty() ? nullptr : dev_exts.data();
         if (vkCreateDevice(r.phys, &dci, nullptr, &r.dev) != VK_SUCCESS || !r.dev) return r;
+        if (mesh_features.meshShader) {
+            r.cmd_draw_mesh_tasks = reinterpret_cast<PFN_vkCmdDrawMeshTasksEXT>(
+                vkGetDeviceProcAddr(r.dev, "vkCmdDrawMeshTasksEXT"));
+            r.mesh_shader_enabled = r.cmd_draw_mesh_tasks != nullptr;
+            if (PROSPER_ENV_ON("PROSPER_GFXLOG")) {
+                std::fprintf(stderr,
+                    "[vk] mesh shader %s: invocations=%u shared=%u outputs=%u/%u layers=%u\n",
+                    r.mesh_shader_enabled ? "ENABLED" : "entry point missing",
+                    r.mesh_shader_properties.maxMeshWorkGroupInvocations,
+                    r.mesh_shader_properties.maxMeshSharedMemorySize,
+                    r.mesh_shader_properties.maxMeshOutputVertices,
+                    r.mesh_shader_properties.maxMeshOutputPrimitives,
+                    r.mesh_shader_properties.maxMeshOutputLayers);
+            }
+        }
         // #3533: the heap layout the memory budget resolves every allocation against. It has to be
         // HERE, at device creation, rather than beside the first render call: an allocation that
         // arrives before the layout is known cannot be attributed to a heap, so the budget drops it,

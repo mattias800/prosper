@@ -1739,6 +1739,31 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
                               bool retain_shared_shader_words = false,
                               const char* const* hoisted_validate_mode = nullptr) {
     RenderState rs = extract_render_state(ds);
+    // A volume color target alone does not tell the mesh translator which ancillary POS export
+    // selects the destination layer. Keep this opt-in register witness at the draw snapshot, not
+    // at end-of-submit state, where a later pipeline can replace all three selectors.
+    static const bool volume_output_log = PROSPER_ENV_ON("PROSPER_VOLUME_OUTPUT_LOG");
+    if (volume_output_log) {
+        const auto volume = color_target_volume_view(rs.color_targets[0]);
+        if (volume.selected_mip_depth > 1) {
+            static std::atomic<uint32_t> volume_output_lines{0};
+            if (volume_output_lines.fetch_add(1, std::memory_order_relaxed) < 16) {
+                const auto& output = rs.position_output;
+                const auto config = ds.cx.find(prosper::agc::Pm4::SPI_VS_OUT_CONFIG);
+                std::fprintf(stderr,
+                    "[volume-output] target=%llx depth=%u first=%u max=%u "
+                    "posfmt=%08x vsout=%08x vsconfig=%08x present=%u%u%u route=%u\n",
+                    static_cast<unsigned long long>(rs.color_targets[0].base),
+                    volume.selected_mip_depth, volume.first_slice,
+                    rs.color_targets[0].slice_max,
+                    output.pos_format, output.vs_out_control,
+                    config == ds.cx.end() ? 0u : config->second,
+                    output.has_pos_format, output.has_vs_out_control,
+                    config != ds.cx.end(),
+                    static_cast<unsigned>(output.layer_route()));
+            }
+        }
+    }
     if (failure) {
         *failure = {};
         failure->kind = SubmitOperationKind::Draw;

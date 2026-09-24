@@ -8,7 +8,10 @@
 #include "gpu/execute/gpu_execute.hpp"
 #include "fixtures/render_runner.h"
 #include "shared/live/live_renderer.hpp"
+#include <algorithm>
+#include <cstring>
 #include <string>
+#include <vector>
 #include <cstdio>
 
 static int fails = 0;
@@ -185,6 +188,44 @@ int main() {
           "buffer int64 atomic admission follows both required core bits");
     CHECK(ctx.subgroup_size_control == (core13.subgroupSizeControl == VK_TRUE),
           "subgroup size admission follows the core feature bit");
+    uint32_t extension_count = 0;
+    vkEnumerateDeviceExtensionProperties(ctx.phys, nullptr, &extension_count, nullptr);
+    std::vector<VkExtensionProperties> extensions(extension_count);
+    if (extension_count)
+        vkEnumerateDeviceExtensionProperties(ctx.phys, nullptr, &extension_count,
+                                             extensions.data());
+    const bool mesh_extension = std::any_of(extensions.begin(), extensions.end(),
+        [](const VkExtensionProperties& extension) {
+            return std::strcmp(extension.extensionName, VK_EXT_MESH_SHADER_EXTENSION_NAME) == 0;
+        });
+    if (mesh_extension) {
+        VkPhysicalDeviceMeshShaderFeaturesEXT mesh_features{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT};
+        VkPhysicalDeviceFeatures2 mesh_query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+        mesh_query.pNext = &mesh_features;
+        vkGetPhysicalDeviceFeatures2(ctx.phys, &mesh_query);
+        CHECK(ctx.mesh_shader_enabled == (mesh_features.meshShader == VK_TRUE),
+              "mesh path requires the extension and the advertised meshShader feature");
+        if (ctx.mesh_shader_enabled) {
+            CHECK(ctx.cmd_draw_mesh_tasks != nullptr,
+                  "enabled mesh path resolves vkCmdDrawMeshTasksEXT");
+            VkPhysicalDeviceMeshShaderPropertiesEXT mesh_properties{
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_PROPERTIES_EXT};
+            VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+            properties.pNext = &mesh_properties;
+            vkGetPhysicalDeviceProperties2(ctx.phys, &properties);
+            CHECK(ctx.mesh_shader_properties.maxMeshWorkGroupInvocations ==
+                      mesh_properties.maxMeshWorkGroupInvocations &&
+                  ctx.mesh_shader_properties.maxMeshSharedMemorySize ==
+                      mesh_properties.maxMeshSharedMemorySize &&
+                  ctx.mesh_shader_properties.maxMeshOutputLayers ==
+                      mesh_properties.maxMeshOutputLayers,
+                  "mesh workgroup and layer limits reflect the physical device");
+        }
+    } else {
+        CHECK(!ctx.mesh_shader_enabled && ctx.cmd_draw_mesh_tasks == nullptr,
+              "a device without VK_EXT_mesh_shader retains the ordinary draw path");
+    }
     CHECK(shared.valid(), "renderer publishes a valid shared context once initialized");
     CHECK(shared.device == static_cast<void*>(ctx.dev), "published device is the renderer's device");
     CHECK(shared.queue == static_cast<void*>(ctx.queue), "published queue is the renderer's queue");
