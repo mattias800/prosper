@@ -60,19 +60,18 @@ template<class Action> static std::string capture_stderr(Action action) {
 
 int main(int argc, char** argv) {
     bool per_draw_control = false, expanded_control = false;
-    bool texture_path_census = false, texture_path_census_budget = false;
+    bool texture_path_census_budget = false;
     bool texture_path_census_empty = false;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--per-draw-control") == 0) per_draw_control = true;
         else if (std::strcmp(argv[i], "--expanded-control") == 0) expanded_control = true;
-        else if (std::strcmp(argv[i], "--texture-path-census") == 0) texture_path_census = true;
         else if (std::strcmp(argv[i], "--texture-path-census-budget") == 0)
             texture_path_census_budget = true;
         else if (std::strcmp(argv[i], "--texture-path-census-empty") == 0)
             texture_path_census_empty = true;
         else {
             std::fprintf(stderr, "usage: %s [--per-draw-control] [--expanded-control] "
-                                 "[--texture-path-census|--texture-path-census-budget|"
+                                 "[--texture-path-census-budget|"
                                  "--texture-path-census-empty]\n", argv[0]);
             return 2;
         }
@@ -790,16 +789,7 @@ int main(int argc, char** argv) {
     live_producer.color0_base = 0;
     repeated_shader({expected[0], expected[1], expected[2]});
     live_draw.color0_base = Base + 0x1200000;
-    std::vector<uint8_t> shared_pixels;
-    std::string texture_path_log;
-    if (texture_path_census) {
-        texture_path_log = capture_stderr([&] {
-            prosper::frontend::ScopedInteractivePerformanceTiming timing(true);
-            shared_pixels = render_submit_items({live_producer, live_draw}, W, H);
-        });
-    } else {
-        shared_pixels = render_submit_items({live_producer, live_draw}, W, H);
-    }
+    const auto shared_pixels = render_submit_items({live_producer, live_draw}, W, H);
     const size_t shared_center = (W * (H / 2) + W / 2) * 4;
     bool shared_matches = shared_pixels.size() == Pixels * 4;
     if (shared_matches) for (size_t c = 0; c < 4; ++c)
@@ -810,30 +800,6 @@ int main(int argc, char** argv) {
     check(uploads.references == 3 && uploads.unique_uploads == 1 &&
               uploads.upload_bytes == Pixels * Layers * snapshot_bpp,
           "three array bindings produce one actual backend image/staging upload");
-    if (texture_path_census) {
-        bool copied_row = false, complete_call = false;
-        std::istringstream lines(texture_path_log);
-        for (std::string line; std::getline(lines, line);) {
-            complete_call |= line.starts_with("[texture-path] call=") &&
-                             line.find("complete_population=1 resource_phase_reached=1 "
-                                       "skipped_resource_draws=0") !=
-                                 std::string::npos;
-            if (!line.starts_with("[texture-path-row] call=") ||
-                line.find("path=cpu_staging_copy") == std::string::npos ||
-                line.find("cpu_copy=" + std::to_string(Pixels * Layers * snapshot_bpp)) ==
-                    std::string::npos) continue;
-            const auto value_after = [&line](const char* key) {
-                const size_t pos = line.find(key);
-                return pos == std::string::npos ? -1.0
-                    : std::strtod(line.c_str() + pos + std::strlen(key), nullptr);
-            };
-            const double prepare = value_after("prepare_ms=");
-            const double copy = value_after("cpu_copy_ms=");
-            copied_row |= prepare > 0 && copy > 0 && prepare >= copy;
-        }
-        check(complete_call, "live backend census reaches resource-complete call site");
-        check(copied_row, "live unique-upload branch reports actual CPU staging-copy bytes");
-    }
     const auto valid_bindings = backend_resource_reuse_stats();
     const auto valid_timing = backend_render_timing_stats();
     check(valid_bindings.texture_binding_references >= 3 &&

@@ -14,13 +14,57 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
+#include <cstring>
+#include <sstream>
+#include <string>
 #include <vector>
+#ifdef _WIN32
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
 
 using namespace prosper::gpu;
 
 static int fails = 0;
 #define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
                          else       { printf("  [ok]   %s\n", m); } } while (0)
+
+template<class Action> static std::string capture_stderr(Action action) {
+#ifdef _WIN32
+    const auto fd = &_fileno;
+    const auto duplicate = &_dup;
+    const auto redirect = &_dup2;
+    const auto close_fd = &_close;
+#else
+    const auto fd = &fileno;
+    const auto duplicate = &dup;
+    const auto redirect = &dup2;
+    const auto close_fd = &close;
+#endif
+    FILE* capture = std::tmpfile();
+    if (!capture) { CHECK(false, "census diagnostic file opens"); return {}; }
+    std::fflush(stderr);
+    const int saved = duplicate(fd(stderr));
+    if (saved < 0 || redirect(fd(capture), fd(stderr)) < 0) {
+        CHECK(false, "census diagnostic redirects stderr");
+        if (saved >= 0) close_fd(saved);
+        std::fclose(capture);
+        return {};
+    }
+    action();
+    std::fflush(stderr);
+    CHECK(redirect(saved, fd(stderr)) >= 0, "census diagnostic restores stderr");
+    close_fd(saved);
+    std::rewind(capture);
+    std::string text;
+    char buffer[1024];
+    while (const size_t count = std::fread(buffer, 1, sizeof(buffer), capture))
+        text.append(buffer, count);
+    std::fclose(capture);
+    std::fputs(text.c_str(), stderr);
+    return text;
+}
 
 int main() {
     printf("== test_texture_sample_render ==\n");
@@ -44,6 +88,7 @@ int main() {
         std::fprintf(stderr, "texture sample test requires PROSPER_BACKEND_TEXTURE_CACHE_MB absent\n");
         return 2;
     }
+    const bool path_census = std::getenv("PROSPER_BACKEND_TEXTURE_PATH_CENSUS") != nullptr;
     const uint32_t W = 64, H = 64;
     const auto center_red_at = [](const std::vector<uint8_t>& pixels,
                                   uint32_t width, uint32_t height) -> uint8_t {
@@ -152,7 +197,29 @@ int main() {
     CHECK(recompile_fragment(ps_template, sizeof(ps_template)/sizeof(ps_template[0]), nullptr).empty(),
           "image_sample PS is rejected without a resource table");
 
-    bool ok0 = sample_center(C025, C025, rgb);
+    bool ok0 = false;
+    std::string census_first;
+    if (path_census) {
+        census_first = capture_stderr([&] {
+            prosper::frontend::ScopedInteractivePerformanceTiming timing(true);
+            ok0 = sample_center(C025, C025, rgb);
+        });
+        bool complete = false, copied = false;
+        std::istringstream lines(census_first);
+        for (std::string line; std::getline(lines, line);) {
+            complete |= line.starts_with("[texture-path] call=") &&
+                        line.find("complete_population=1 resource_phase_reached=1 "
+                                  "skipped_draws=0") != std::string::npos;
+            copied |= line.starts_with("[texture-path-row] call=") &&
+                      line.find("path=cpu_staging_copy") != std::string::npos &&
+                      line.find("cpu_copy=16") != std::string::npos &&
+                      line.find("image_created=1") != std::string::npos;
+        }
+        CHECK(complete, "direct backend census reports a complete successful texture pass");
+        CHECK(copied, "live texture upload reports the actual sixteen copied bytes");
+    } else {
+        ok0 = sample_center(C025, C025, rgb);
+    }
     printf("  (0.25,0.25) center=(%u,%u,%u)\n", ok0?rgb[0]:0, ok0?rgb[1]:0, ok0?rgb[2]:0);
     CHECK(ok0 && rgb[0] > 0x80 && rgb[1] < 0x40 && rgb[2] < 0x40, "sampling texel (0,0) yields RED");
 
@@ -174,9 +241,19 @@ int main() {
         uint8_t frgb[3];
         // The opt-in census arm observes this real injected refusal in the same backend call.
         // Without the skipped-resource marker its summary could falsely claim a complete row set.
-        const prosper::frontend::ScopedInteractivePerformanceTiming timing(
-            std::getenv("PROSPER_BACKEND_TEXTURE_PATH_CENSUS") != nullptr);
-        bool okFail = sample_center(C075, C025, frgb);
+        bool okFail = false;
+        std::string refusal_log;
+        if (path_census) {
+            refusal_log = capture_stderr([&] {
+                prosper::frontend::ScopedInteractivePerformanceTiming timing(true);
+                okFail = sample_center(C075, C025, frgb);
+            });
+            CHECK(refusal_log.find("complete_population=0 resource_phase_reached=1 "
+                                   "skipped_draws=1") != std::string::npos,
+                  "injected image creation failure marks the census incomplete");
+        } else {
+            okFail = sample_center(C075, C025, frgb);
+        }
         printf("  vkCreateImage-failure (0.75,0.25) center=(%u,%u,%u)\n",
                okFail?frgb[0]:0, okFail?frgb[1]:0, okFail?frgb[2]:0);
         CHECK(okFail && frgb[2] > 0x80 && frgb[0] < 0x40 && frgb[1] < 0x40,

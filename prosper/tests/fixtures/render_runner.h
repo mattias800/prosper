@@ -780,18 +780,18 @@ public:
 
     ~BackendTexturePathCensus() {
         if (!call_) return;
-        const bool complete_population = resource_phase_reached_ && !skipped_resource_draws_ &&
+        const bool complete_population = resource_phase_reached_ && !skipped_draws_ &&
                                          !unknown_rows_ && !omitted_;
         std::fprintf(stderr,
                      "[texture-path] call=%u draws=%zu rows=%zu omitted=%llu "
                      "complete_population=%u resource_phase_reached=%u "
-                     "skipped_resource_draws=%llu "
+                     "skipped_draws=%llu "
                      "unknown_rows=%llu evictions=%llu min_draws=%llu considered=%llu "
                      "below_threshold=%llu budget_refused=%llu cap_calls=%u cap_rows=%zu\n",
                      call_, draws_, rows_.size(), (unsigned long long)omitted_,
                      static_cast<unsigned>(complete_population),
                      static_cast<unsigned>(resource_phase_reached_),
-                     (unsigned long long)skipped_resource_draws_,
+                     (unsigned long long)skipped_draws_,
                      (unsigned long long)unknown_rows_,
                      (unsigned long long)evictions_, (unsigned long long)min_draws_,
                      (unsigned long long)state().considered.load(),
@@ -832,7 +832,7 @@ public:
         else ++omitted_;
     }
     void reached_resource_phase_end() { resource_phase_reached_ = true; }
-    void skipped_resource_draw() { if (active()) ++skipped_resource_draws_; }
+    void skipped_draw() { if (active()) ++skipped_draws_; }
     void evicted() { if (active()) ++evictions_; }
 
 private:
@@ -864,7 +864,7 @@ private:
     size_t draws_ = 0;
     uint64_t min_draws_ = 0;
     std::vector<BackendTexturePathCensusRow> rows_;
-    uint64_t omitted_ = 0, evictions_ = 0, skipped_resource_draws_ = 0;
+    uint64_t omitted_ = 0, evictions_ = 0, skipped_draws_ = 0;
     uint64_t unknown_rows_ = 0;
     bool resource_phase_reached_ = false;
 };
@@ -9386,6 +9386,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             if (needs_geometry) {
                 std::fprintf(stderr,
                     "[render] draw=%zu fragment Geometry capability unavailable; skipped\n", di);
+                texture_path_census.skipped_draw();
                 continue;
             }
         }
@@ -9402,6 +9403,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 (groups_xy && bd.mesh_groups[2] >
                     ctx.mesh_shader_properties.maxMeshWorkGroupTotalCount / groups_xy)) {
                 std::fprintf(stderr, "[mesh] draw=%zu unsupported device or group shape; skipped\n", di);
+                texture_path_census.skipped_draw();
                 continue;
             }
             v.mesh_draw = true;
@@ -9659,6 +9661,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 if (uses_internal_gds && !ctx.fragment_stores_atomics)                   reason_mask |= 0x40;
                 wave64_stats.note_skip(W, H, reason_mask);
             }
+            texture_path_census.skipped_draw();
             continue;
         }
         if (uses_internal_gds && !render_internal_gds_buffer().buffer) {
@@ -9667,6 +9670,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 std::fprintf(stderr,
                              "[render] skip draw: failed to allocate persistent GDS buffer\n");
             });
+            texture_path_census.skipped_draw();
             continue;
         }
         if (backend_trace) {
@@ -11341,7 +11345,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 }
             }
             if (!buffer_resources_ready) {
-                texture_path_census.skipped_resource_draw();
+                texture_path_census.skipped_draw();
                 continue;
             }
             const ResourcePhaseTimer phase_descriptor(timing_enabled, &res_descriptor_ms);
@@ -11737,6 +11741,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 if (timing_enabled)
                     setup_pipeline_ms += setup_elapsed_ms(
                         setup_resources_ready, setup_pipeline_key_ready);
+                texture_path_census.skipped_draw();
                 continue;   // rejected SPIR-V -> skip this draw
             }
             st[0].module = v.vs;
