@@ -297,7 +297,7 @@ int main(int argc, char** argv) {
         gpu::GpuCaptureFile input_snapshot = fixture;
         gpu::GpuCaptureBlob input_blob;
         input_blob.guest_addr = 0x3000;
-        input_blob.bytes = {0xff, 0xee, 0xdd, 0x42, 0x19, 0x7f, 0xa5, 0xcc};
+        input_blob.bytes = {0xff, 0xee, 0xdd, 0x42, 0x19, 0x7f, 0xa5, 0x00};
         // The final byte is intentionally unreadable. A descriptor whose captured span
         // crosses that byte must not export the zero-filled suffix as guest data.
         input_blob.bytes_read = input_blob.bytes.size() - 1;
@@ -317,6 +317,8 @@ int main(int argc, char** argv) {
         absent_input.blob_index = UINT32_MAX;
         gpu::GpuCapturedResource unreadable_input = present_input;
         unreadable_input.resource.binding = 10;
+        unreadable_input.resource.gpu_addr = input_blob.guest_addr + 6;
+        unreadable_input.resource.size = 2;
         unreadable_input.blob_offset = 6;
         unreadable_input.captured_size = 2;
         gpu::GpuCapturedResource duplicate_input = present_input;
