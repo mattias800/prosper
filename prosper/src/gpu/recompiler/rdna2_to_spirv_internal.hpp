@@ -500,10 +500,13 @@ struct SpirvCompute {
     uint32_t vertex_general_mask_mbcnt_pc = UINT32_MAX;
     bool     allow_b32_masks=0;                      // proven Wave32 or byte-exact graphics exception
     bool     ngg_one_lane=0;                         // exact GS_ALLOC_REQ wrapper: one guest lane/invocation
+    bool     ngg_workgroup_export_probe=false;       // test-only 64-lane guest wave/export shell
+    std::unordered_set<uint32_t> ngg_uniform_wave_reduction_pcs;
     bool     ngg_logical_lane=0;                     // proven wave64 no-GS producer uses flattened guest lane
     bool     ngg_private_lds=0;                      // exact captured wrapper whose LDS projection is known
     uint32_t ngg_vertex_index_read_pc = UINT32_MAX;   // NGG wave/LDS prologue handoff -> host VertexIndex
     uint32_t ngg_vertex_index_value = 0;
+    uint32_t ngg_instance_index_value = 0;
     bool     is_compute=0;                            // true in the compute shell (gates LDS / s_barrier)
     bool     uses_barrier=0;                          // guest or synthesized workgroup barrier emitted
     // Ordinary LDS writes that feed a synthesized float-atomic publication boundary are emitted as
@@ -569,6 +572,13 @@ struct SpirvCompute {
     // are scalar words on every path reaching that exact PC. Dispatcher Function variables exist
     // for mask-only lifetimes too, so map membership alone must never select the scalar lowering.
     std::unordered_set<uint32_t> vcc_b32_scalar_result_pcs;
+    // S_BFE_U64 may write VCC as both a scalar pair and a per-lane predicate. In a CFG
+    // dispatcher, the sreg variables can contain fabricated zero placeholders, so only the
+    // MUST-scalar source proof permits retaining its complete scalar result.
+    std::unordered_set<uint32_t> vcc_bfe_u64_scalar_result_pcs;
+    // A scalar halfword pack into VCC_LO restores its complete predicate only when both
+    // sources and the untouched VCC_HI word are MUST-scalar at this dispatcher PC.
+    std::unordered_set<uint32_t> vcc_pack_scalar_pair_pcs;
     // Exact structured-CFG consumers whose source pair is a saved Wave64 VCC mask on every
     // incoming path. S_MOV_B64 also materializes ballot words, so emit_alu needs this separate
     // lifetime fact to select the Bool-domain value at the consumer without guessing from maps.
@@ -1788,6 +1798,7 @@ struct SpirvCompute {
     // The first barrier publishes lane bits and the second publishes wave results. The caller proves
     // the site is outside wave-divergent structured control flow.
     uint32_t guest_wave_any(uint32_t active_bool);
+    uint32_t guest_wave_popcount(uint32_t active_bool);
     // V_READLANE_B32 at a workgroup-uniform site. Publish every invocation's source value and
     // address the selected lane within this invocation's own guest wave. This is exact at any
     // host subgroup width; unlike a native subgroup shuffle it does not require a Wave64 guest
@@ -2237,8 +2248,16 @@ struct SpirvCompute {
         function_var_insert = code.size();
     }
     // Load gl_VertexIndex as raw bits (VGPR v0 for a vertex shader).
-    uint32_t load_vertex_index() { uint32_t r = id(); put(code, Op_Load, {t_i32, r, v_vid}); return i2u(r); }
-    uint32_t load_instance_index() { uint32_t r = id(); put(code, Op_Load, {t_i32, r, v_iid}); return i2u(r); }
+    uint32_t load_vertex_index() {
+        if (ngg_workgroup_export_probe && ngg_vertex_index_value)
+            return ngg_vertex_index_value;
+        uint32_t r = id(); put(code, Op_Load, {t_i32, r, v_vid}); return i2u(r);
+    }
+    uint32_t load_instance_index() {
+        if (ngg_workgroup_export_probe && ngg_instance_index_value)
+            return ngg_instance_index_value;
+        uint32_t r = id(); put(code, Op_Load, {t_i32, r, v_iid}); return i2u(r);
+    }
     // Hardware packs consecutive vertex/instance invocations into merged guest waves. VertexIndex
     // repeats for each instance, so flatten it with the captured per-instance vertex count before
     // deriving lane and wave IDs. Standalone fixtures retain their historical vertex-only ID.
@@ -2696,6 +2715,10 @@ struct RegState {
     // provenance is independent of `sreg`: an unrepresentable write deliberately erases its SSA
     // value, but must still invalidate an entry-time direct descriptor stored in that register.
     std::unordered_set<int> sreg_written;
+    // At a Wave64 CFG terminal, these scalar words have a MUST reaching definition on every
+    // incoming path. Unlike sreg presence, this excludes Function-variable zero placeholders.
+    // Only the terminal snapshot sets this; it is consumed at the next barrier phase's entry.
+    std::unordered_set<int> terminal_wave64_scalar_words;
     // Scalar registers currently holding the ENTRY value of M0 -- the value the driver left before
     // this shader wrote M0 -- as an OPAQUE token rather than as data (#3133). Membership is not a
     // value: the register has no `sreg` entry, so every ordinary consumer still rejects it exactly

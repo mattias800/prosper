@@ -179,6 +179,155 @@ int main() {
         std::fprintf(stderr, "guest PRIM/POS0/POS1.z/PARAM0 exports did not survive the wave\n");
         return 1;
     }
+    // Kena's main program counts a VOPC-saved s[6:7] mask. One 64-invocation workgroup is one
+    // guest wave, independent of the driver's native subgroup width. The export makes the count
+    // observable without relying on an image or the game's resource table.
+    std::vector<uint32_t> count_guest = {
+        0x7e000f00u,              // v_cvt_u32_f32 v0,v0: input is lane * 4
+        0x7e0202ffu, 160u,        // v_mov_b32 v1,160: only lane 40 matches
+        0x7d8402f9u, 0x06068600u, // v_cmp_eq_u32_sdwa s[6:7],v0,v1
+        0xbe841006u,              // s_bcnt1_i32_b64 s4,s[6:7]
+        0x7e0c0204u,              // v_mov_b32 v6,s4
+        0xf8000941u, 0x00000006u, // EXP PRIM,v6
+        0xbf810000u,
+    };
+    const auto count_output = [&](const std::vector<uint32_t>& code) {
+        const auto module = recompile_ngg_exports_for_test(code.data(), code.size(), 1);
+        if (module.empty()) return std::vector<float>{};
+        std::vector<float> input(kWaveSize);
+        for (uint32_t lane = 0; lane < kWaveSize; ++lane)
+            input[lane] = static_cast<float>(lane * 4);
+        return prosper::test::run_compute(
+            module, input, kWaveSize, kWaveSize * prosper::gpu::kNggExportProbeWords);
+    };
+    const auto count_matches = [&](const std::vector<float>& output, uint32_t value) {
+        if (output.size() != kWaveSize * prosper::gpu::kNggExportProbeWords) return false;
+        for (uint32_t lane = 0; lane < kWaveSize; ++lane)
+            if (std::bit_cast<uint32_t>(output[lane * prosper::gpu::kNggExportProbeWords]) != value) {
+                std::fprintf(stderr, "count lane=%u got=%u expected=%u\n", lane,
+                             std::bit_cast<uint32_t>(
+                                 output[lane * prosper::gpu::kNggExportProbeWords]), value);
+                return false;
+            }
+        return true;
+    };
+    if (!count_matches(count_output(count_guest), 1u)) {
+        std::fprintf(stderr, "portable saved-mask count missed lane 40 or its other consumers\n");
+        return 1;
+    }
+    count_guest[2] = 161u; // no lane matches; an any()/constant-one substitute must fail
+    if (!count_matches(count_output(count_guest), 0u)) {
+        std::fprintf(stderr, "portable saved-mask zero-count control failed\n");
+        return 1;
+    }
+    count_guest[1] = 0x7e020300u; // v_mov_b32 v1,v0 (VGPR sources start at 0x100)
+    count_guest.erase(count_guest.begin() + 2);
+    count_guest[2] = 0x7d8400f9u; // v_cmp_eq_u32_sdwa s[6:7],v0,v0: all lanes match
+    if (!count_matches(count_output(count_guest), 64u)) {
+        std::fprintf(stderr, "portable saved-mask full-wave count control failed\n");
+        return 1;
+    }
+    std::vector<uint32_t> row_guest = {
+        0x7e000f00u,              // v_cvt_u32_f32 v0,v0
+        0x7e140300u,              // v_mov_b32 v10,v0
+        0xbf8a0000u,              // barrier forces a separate dispatcher phase
+        0x4a1614fau,0xff09110au, // Kena: v_add_nc_u32_dpp v11,v10,v10 row_shr:1 BC1
+        0xf8000941u,0x0000000bu, // EXP PRIM,v11
+        0xbf810000u,
+    };
+    const auto row_output = count_output(row_guest);
+    uint32_t row_bad = 0;
+    if (row_output.size() == kWaveSize * prosper::gpu::kNggExportProbeWords)
+        for (uint32_t lane = 0; lane < kWaveSize; ++lane) {
+            const uint32_t peer = (lane & 15u) ? lane - 1u : 0u;
+            const uint32_t expected = lane * 4u +
+                ((lane & 15u) ? peer * 4u : 0u);
+            const uint32_t got = std::bit_cast<uint32_t>(
+                row_output[lane * prosper::gpu::kNggExportProbeWords]);
+            if (got != expected && row_bad < 4u)
+                std::fprintf(stderr, "ROW_SHR lane=%u got=%u expected=%u\n",
+                             lane, got, expected);
+            row_bad += got != expected;
+        }
+    else row_bad = kWaveSize;
+    if (row_bad) {
+        std::fprintf(stderr, "portable bounded ROW_SHR:1 mismatches=%u\n", row_bad);
+        return 1;
+    }
+    row_guest[4] = 0xff09120au; // ROW_SHR:2 instead of ROW_SHR:1
+    const auto wrong_row = count_output(row_guest);
+    uint32_t distinguished = 0;
+    if (wrong_row.size() == row_output.size())
+        for (uint32_t lane = 0; lane < kWaveSize; ++lane)
+            distinguished += wrong_row[lane * prosper::gpu::kNggExportProbeWords] !=
+                row_output[lane * prosper::gpu::kNggExportProbeWords];
+    if (distinguished < 20u) {
+        std::fprintf(stderr, "ROW_SHR amount control distinguished only %u lanes\n", distinguished);
+        return 1;
+    }
+    row_guest[4] = 0xff09000au; // control outside the admitted ROW_SHR family
+    if (!recompile_ngg_exports_for_test(row_guest.data(), row_guest.size(), 1).empty()) {
+        std::fprintf(stderr, "unsupported DPP control was silently accepted\n");
+        return 1;
+    }
+    // The captured producer ends one CFG phase with scalar data in both physical VCC words,
+    // crosses a barrier, then reads VCC_HI as scalar data. This smaller fixture uses a B32 select
+    // so the untouched high word is observable at an implicit v_cndmask read. The terminal
+    // scalar MUST proof must carry both words; merely retaining a Function-variable load would
+    // turn a missing high word into a silently accepted zero mask.
+    std::vector<uint32_t> scalar_vcc_phase = {
+        0x7e000f00u,              // v_cvt_u32_f32 v0,v0: lane * 4
+        0x7e0202c0u,              // v_mov_b32 v1,64
+        0x7e140300u,              // v_mov_b32 v10,v0
+        0x4a1614fau,0xff09110au, // bounded DPP: forces barrier-phase dispatcher
+        0xbe8003c1u,              // s_mov_b32 s0,-1
+        0xbeea0380u,              // s_mov_b32 vcc_lo,0
+        0xbeeb0380u,              // s_mov_b32 vcc_hi,0
+        0xbf8a0000u,              // barrier
+        0xbf0000c1u,              // s_cmp_eq_u32 -1,s0: SCC true
+        0x856a8000u,              // s_cselect_b32 vcc_lo,s0,0
+        0x02060300u,              // v_cndmask_b32 v3,v0,v1
+        0xf8000941u,0x00000003u, // EXP PRIM,v3
+        0xbf810000u,
+    };
+    const auto phase_output = count_output(scalar_vcc_phase);
+    uint32_t phase_bad = 0;
+    if (phase_output.size() == kWaveSize * prosper::gpu::kNggExportProbeWords)
+        for (uint32_t lane = 0; lane < kWaveSize; ++lane) {
+            const uint32_t got = std::bit_cast<uint32_t>(
+                phase_output[lane * prosper::gpu::kNggExportProbeWords]);
+            const uint32_t expected = lane < 32u ? 64u : lane * 4u;
+            if (got != expected && phase_bad < 4u)
+                std::fprintf(stderr, "scalar-VCC lane=%u got=%u expected=%u\n",
+                             lane, got, expected);
+            phase_bad += got != expected;
+        }
+    else phase_bad = kWaveSize;
+    if (phase_bad) {
+        std::fprintf(stderr, "barrier scalar-VCC reconstruction mismatches=%u\n", phase_bad);
+        return 1;
+    }
+    scalar_vcc_phase[7] = 0xbe810380u; // write s1, not VCC_HI: no complete pair proof
+    if (!recompile_ngg_exports_for_test(
+            scalar_vcc_phase.data(), scalar_vcc_phase.size(), 1).empty()) {
+        std::fprintf(stderr, "missing terminal VCC_HI scalar proof was admitted\n");
+        return 1;
+    }
+    scalar_vcc_phase[7] = 0xbeeb03c1u; // VCC_HI=-1: the high half now selects v1
+    const auto high_output = count_output(scalar_vcc_phase);
+    if (high_output.size() != phase_output.size()) {
+        std::fprintf(stderr, "high-half scalar-VCC control did not execute\n");
+        return 1;
+    }
+    uint32_t high_distinguished = 0;
+    for (uint32_t lane = 32; lane < kWaveSize; ++lane)
+        high_distinguished += high_output[lane * prosper::gpu::kNggExportProbeWords] !=
+            phase_output[lane * prosper::gpu::kNggExportProbeWords];
+    if (high_distinguished < 24u) {
+        std::fprintf(stderr, "high-half scalar-VCC control distinguished only %u lanes\n",
+                     high_distinguished);
+        return 1;
+    }
     auto wrong_layer = exports;
     wrong_layer[24] = 0x00060000u; // POS1.z reads v6, not the prefix in v5
     const auto layer_output = run_exports(wrong_layer);

@@ -138,6 +138,10 @@ chain = run(["--retry-failed-chain", "0", "no-such-capture.prgcap"],
             {"PROSPER_SHADER_DUMP_SUCCESS": "unused-for-graphics"})
 check("no file" in notice_block(chain) and "--retry-failed-stage-spv" in notice_block(chain),
       "graphics chain retry identifies the inactive hook and names explicit SPIR-V export")
+missing_chain = run_result(["--probe-ngg-workgroup-s3", "0x40004040",
+                            "no-such-capture.prgcap"])
+check(missing_chain.returncode == 2 and "requires --retry-failed-chain" in missing_chain.stderr,
+      "workgroup compile probe refuses to become an ignored standalone selector")
 
 quiet = run([])
 check(notice_block(quiet) == "",
@@ -146,11 +150,25 @@ check(notice_block(quiet) == "",
 # A requested retry export must not be ignored or truncate an existing file on rejection.
 check("SPIR-V" in legend_line("--retry-failed-stage-spv"),
       "retry export is described as producing SPIR-V")
+check("SPIR-V" in legend_line("--retry-failed-chain-spv"),
+      "chain retry export is described as producing SPIR-V")
 with tempfile.TemporaryDirectory(prefix="gpu-replay-retry-") as scratch:
     directory = Path(scratch)
     output = directory / "retry.spv"
     sentinel = b"existing output must survive rejected retries"
     output.write_bytes(sentinel)
+    chain_output = directory / "chain.spv"
+    chain_output.write_bytes(sentinel)
+    chain_export = ["--retry-failed-chain-spv", str(chain_output)]
+    for args, diagnostic, message in [
+        (chain_export, "requires a standalone chain retry", "chain export requires its selector"),
+        (["--retry-failed-chain-spv"], "needs a PATH", "chain export rejects a missing path"),
+        (chain_export + ["--retry-failed-chain", "0", "--bundle", "absent.prgbundle"],
+         "requires a standalone chain retry", "chain export rejects bundle replay"),
+    ]:
+        result = run_result(args)
+        check(result.returncode == 2 and diagnostic in result.stderr and
+              chain_output.read_bytes() == sentinel, message)
     export = ["--retry-failed-stage-spv", str(output)]
     for args, diagnostic, message in [
         (export, "requires --retry-failed-stage", "retry export requires its stage selector"),
@@ -207,6 +225,36 @@ with tempfile.TemporaryDirectory(prefix="gpu-replay-retry-") as scratch:
                   "reason=mbcnt-cross-lane" in exact_chain.stderr and
                   "program=0x2000" in exact_chain.stderr,
                   "split vertex retry uses the captured graphics ABI and names its refusal")
+            probe_capture = str(directory / "ngg-probe-chain-exact.prgcap")
+            workgroup_probe = run_result(["--retry-failed-chain", "0",
+                                          "--probe-ngg-workgroup-s3", "0x40004040",
+                                          probe_capture])
+            check(workgroup_probe.returncode == 0 and
+                  "[ngg-workgroup-probe] COMPILE ONLY" in workgroup_probe.stderr and
+                  "provisional-s3=0x40004040" in workgroup_probe.stderr and
+                  "result=module-emitted" in workgroup_probe.stderr,
+                  "captured workgroup probe actually emits the supported guest export stream")
+            chain_module = run_result(["--retry-failed-chain", "0",
+                                       "--probe-ngg-workgroup-s3", "0x40004040",
+                                       "--retry-failed-chain-spv", str(chain_output),
+                                       probe_capture])
+            word_count = re.search(r"spirv-dwords=(\d+)", chain_module.stderr)
+            check(chain_module.returncode == 0 and word_count and
+                  len(chain_output.read_bytes()) == int(word_count.group(1)) * 4 and
+                  chain_output.read_bytes()[:4] == b"\x03\x02\x23\x07",
+                  "accepted chain export writes the exact reported SPIR-V module")
+            rejected_export = run_result(["--retry-failed-chain", "0",
+                                          "--retry-failed-chain-spv", str(chain_output),
+                                          str(directory / "rejected-chain.prgcap")])
+            check(rejected_export.returncode == 1 and
+                  "refusing chain SPIR-V export" in rejected_export.stderr and
+                  chain_output.read_bytes()[:4] == b"\x03\x02\x23\x07",
+                  "rejected chain leaves the prior module intact")
+            bad_s3 = run_result(["--retry-failed-chain", "0",
+                                 "--probe-ngg-workgroup-s3", "not-hex", probe_capture])
+            check(bad_s3.returncode == 2 and "explicit 0xS3" in bad_s3.stderr and
+                  "[ngg-workgroup-probe]" not in bad_s3.stderr,
+                  "workgroup probe refuses an unreviewable implicit merged-wave seed")
             lds_exact = run_result(["--retry-failed-chain", "0",
                                     str(directory / "lds-chain-exact.prgcap")])
             lds_default = run_result(["--retry-failed-chain", "0",

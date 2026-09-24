@@ -876,6 +876,21 @@ int main(int argc, char** argv) {
       dump(dir, "ngg_workgroup_exports",
            recompile_ngg_exports_for_test(c, std::size(c), 1),
            "recompile_ngg_exports_for_test"); }
+    { const uint32_t c[] = {
+          0x7e000f00u,0x7e0202ffu,160u,
+          0x7d8402f9u,0x06068600u, // save one VOPC lane in s[6:7]
+          0xbe841006u,0x7e0c0204u, // portable whole-wave BCNT -> v6
+          0xf8000941u,0x00000006u,0xbf810000u};
+      dump(dir, "ngg_workgroup_saved_mask_count",
+           recompile_ngg_exports_for_test(c, std::size(c), 1),
+           "recompile_ngg_exports_for_test"); }
+    { const uint32_t c[] = {
+          0x7e000f00u,0x7e140300u,0xbf8a0000u,
+          0x4a1614fau,0xff09110au,
+          0xf8000941u,0x0000000bu,0xbf810000u};
+      dump(dir, "ngg_workgroup_bounded_row_shr",
+           recompile_ngg_exports_for_test(c, std::size(c), 1),
+           "recompile_ngg_exports_for_test"); }
     // Generated interpolation geometry stage: AMD's explicit-parameter form publishes P0/P10/P20
     // plus perspective-center I/J from a synthesised Geometry entry point.
     { const uint32_t ps[] = {0xc80e0000u,0xc8120001u,0xc8160002u,

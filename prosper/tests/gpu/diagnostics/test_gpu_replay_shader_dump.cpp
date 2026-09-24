@@ -432,6 +432,28 @@ int main(int argc, char** argv) {
         CHECK(gpu::write_gpu_capture((directory / "rejected-chain-exact.prgcap").string(),
                                      chain_fixture, error),
               "CLI fixture writes a split vertex chain with captured graphics retry inputs");
+        // A compile-only NGG probe positive control. It links the same bounded transfer prolog to
+        // a workgroup stream with LDS exchange and the four export targets the probe preserves.
+        // The fixture is NOT a runnable draw: its synthetic v0 input is not the captured ES ABI.
+        gpu::GpuCaptureFile ngg_probe_fixture = chain_fixture;
+        auto& ngg_failure = ngg_probe_fixture.failure_diagnostics[0];
+        ngg_failure.vertex_count = 4u;
+        ngg_failure.stages[0].resource_table_present = true;
+        ngg_failure.stages[0].resource_table.present = true;
+        auto& ngg_main = ngg_probe_fixture.raw_shader_versions[1];
+        ngg_main.words = {
+            0x7e000f00u,0x4a0200c0u,0xd8340000u,0x00000100u,0xbf8a0000u,
+            0x3a040084u,0xd8d80000u,0x03000002u,0x7e0802c0u,0x7e0a0280u,
+            0xbe80047eu,0x7da20900u,0xd7650005u,0x0001007eu,0xd7660005u,
+            0x00020a7fu,0xbefe0400u,0x4a0c0b03u,0x7e000d06u,
+            0xf8000941u,0x00000006u,0xf80000cfu,0x03020100u,
+            0xf80008d4u,0x00050000u,0xf800020fu,0x00050603u,0xbf810000u};
+        ngg_main.content_hash = gpu::gpu_capture_hash(
+            reinterpret_cast<const uint8_t*>(ngg_main.words.data()),
+            ngg_main.words.size() * sizeof(uint32_t));
+        CHECK(gpu::write_gpu_capture((directory / "ngg-probe-chain-exact.prgcap").string(),
+                                     ngg_probe_fixture, error),
+              "CLI fixture writes a positive compile-only guest workgroup chain");
         // A real split no-GS fixture from test_recompiled_shaders: its producer writes a seven-
         // dword private record and its wrapper exports that record. Zero LDS refuses; seven dwords
         // compile. This makes CLI admission depend on the recompile ARGUMENT, not on the printed

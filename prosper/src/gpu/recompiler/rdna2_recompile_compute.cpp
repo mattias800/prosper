@@ -461,17 +461,37 @@ std::vector<uint32_t> recompile_valu(const uint32_t* code, size_t dwords,
 }
 
 std::vector<uint32_t> recompile_ngg_exports_for_test(
-    const uint32_t* code, size_t dwords, uint32_t num_inputs, uint32_t lds_bytes) {
+    const uint32_t* code, size_t dwords, uint32_t num_inputs, uint32_t lds_bytes,
+    const ShaderResourceTable* resources, uint32_t vertices_per_instance,
+    uint32_t provisional_merged_wave_info, RecompileDiagnosticContext diagnostic) {
     if (!code || !dwords || num_inputs > 32 || lds_bytes > 65536u) return {};
+    if (resources && std::any_of(resources->resources.begin(), resources->resources.end(),
+                                 [](const ShaderResource& r) { return r.binding < 2u; }))
+        return {}; // bindings 0/1 are this probe's input/export buffers
     std::vector<Rdna2Inst> ins;
     rdna2_walk(code, dwords, ins);
     SpirvCompute b;
+    b.diagnostic = diagnostic;
+    b.ngg_workgroup_export_probe = true;
+    b.vertices_per_instance = vertices_per_instance;
     if (lds_bytes) b.lds_dwords = std::max(1u, (lds_bytes + 3u) / 4u);
-    b.begin(num_inputs ? num_inputs : 1, nullptr, 64, 1, 1, 64, 0, true);
+    b.begin(num_inputs ? num_inputs : 1, resources, 64, 1, 1, 64, 0, true);
     b.declare_guest_scratch(analyze_static_scratch(ins));
     RegState rs; rs.vcc = b.bfalse(); rs.scc = b.bfalse(); rs.exec = b.btrue();
     seed_smem_pointer_provenance(rs, ins);
     for (uint32_t k = 0; k < num_inputs; ++k) rs.vreg[static_cast<int>(k)] = b.load_input(k);
+    if (vertices_per_instance) {
+        // Compile-only probe of the existing vertex shell's flattened draw ABI. The caller must
+        // supply s3 explicitly: #2072 documents that today's descriptor fold and vertex emitter
+        // disagree on it, so this must never be inferred as the hardware value or executed live.
+        const uint32_t vertex = b.ibin(Op_UMod, b.gidx, b.uconst(vertices_per_instance));
+        const uint32_t instance = b.ibin(Op_UDiv, b.gidx, b.uconst(vertices_per_instance));
+        b.ngg_vertex_index_value = vertex;
+        b.ngg_instance_index_value = instance;
+        rs.vreg[0] = vertex; rs.vreg[3] = instance;
+        rs.vreg[5] = vertex; rs.vreg[8] = instance;
+        rs.sreg[3] = b.uconst(provisional_merged_wave_info);
+    }
     auto safe_branches = safe_execz_branches(ins);
     for (uint32_t pc : waterfall_branches(ins)) safe_branches.insert(pc);
     bool saw_export = false;
@@ -495,8 +515,11 @@ std::vector<uint32_t> recompile_ngg_exports_for_test(
         }
         return true;
     };
-    if (!emit_body(b, rs, ins, safe_branches, nullptr, /*allow_exec_update*/true,
-                   /*allow_smem*/false, export_word, code, dwords) || !saw_export)
+    const bool force_phases_for_dpp = std::any_of(
+        ins.begin(), ins.end(), is_vadd_nc_u32_dpp_row_shr_bounded);
+    if (!emit_body(b, rs, ins, safe_branches, resources, /*allow_exec_update*/true,
+                   /*allow_smem*/resources != nullptr, export_word, code, dwords,
+                   nullptr, true, 0, force_phases_for_dpp) || !saw_export)
         return {};
     return b.finish();
 }
