@@ -472,9 +472,13 @@ int main(int argc, char** argv) {
                 resources += stage.resource_table.resources.size();
         return 4u + resources * sizeof(uint32_t);
     };
+    auto v59_tail = [](const GpuCaptureFile& f) -> size_t {
+        return (f.draws.size() + f.failure_diagnostics.size()) *
+               kColorTargetCount * 4u * sizeof(uint32_t);
+    };
     // v57 appends five dwords per resource (the allocation-wide mip placement, #3048) with no
-    // count prefix. Every offset measured backwards from the end of the stream has to skip it.
-    auto v57_tail = [](const GpuCaptureFile& f) -> size_t {
+    // count prefix. Backward offsets and downgrade fixtures also skip the later v59 view records.
+    auto v57_tail = [&](const GpuCaptureFile& f) -> size_t {
         size_t resources = 0;
         for (const auto& draw : f.draws)
             resources += draw.vrt.resources.size() + draw.prt.resources.size();
@@ -483,7 +487,7 @@ int main(int argc, char** argv) {
         for (const auto& diagnostic : f.failure_diagnostics)
             for (const auto& stage : diagnostic.stages)
                 resources += stage.resource_table.resources.size();
-        return resources * 5u * sizeof(uint32_t);
+        return resources * 5u * sizeof(uint32_t) + v59_tail(f);
     };
     auto v58_tail = [](const GpuCaptureFile& f) -> size_t {
         return f.failure_diagnostics.size() * sizeof(uint32_t);
@@ -862,7 +866,7 @@ int main(int argc, char** argv) {
     GpuReplayFrame descriptor_array_replay;
     CHECK(serialize_gpu_capture(descriptor_array_capture, descriptor_array_bytes, error) &&
               deserialize_gpu_capture(descriptor_array_bytes, descriptor_array_loaded, error) &&
-              descriptor_array_loaded.format_version == 58 &&
+              descriptor_array_loaded.format_version == 59 &&
               materialize_gpu_replay(descriptor_array_loaded, descriptor_array_replay, error) &&
               descriptor_array_replay.computes.size() == 1 &&
               descriptor_array_replay.computes[0].resources &&
@@ -1210,6 +1214,82 @@ int main(int argc, char** argv) {
     CHECK(tail_loaded.draws[0].vrt.resources[0].resource.declared_mip_levels == 5,
           "#1280: v24 capture round-trips the T#-declared mip-chain length (was silently defaulting to 1)");
     {
+        GpuCaptureFile volume_view = tail_capture;
+        auto& target = volume_view.draws[0];
+        target.color0_base = 0x309cbf0000ull;
+        target.color0_width = target.color0_height = 32u;
+        target.color_targets[0] = {target.color0_base, 32u, 32u, 32u, 0u, 32u, 32u};
+        target.color_targets[2] = {0x309cc00000ull, 32u, 32u, 32u, 8u, 8u, 15u};
+        std::vector<uint8_t> volume_view_bytes;
+        GpuCaptureFile volume_view_loaded;
+        CHECK(serialize_gpu_capture(volume_view, volume_view_bytes, error) &&
+                  deserialize_gpu_capture(volume_view_bytes, volume_view_loaded, error) &&
+                  volume_view_loaded.draws[0].color_targets[0].selected_mip_depth == 32u &&
+                  volume_view_loaded.draws[0].color_targets[0].slice_count == 32u &&
+                  volume_view_loaded.draws[0].color_targets[0].programmed_slice_max == 32u &&
+                  volume_view_loaded.draws[0].color_targets[2].first_slice == 8u &&
+                  volume_view_loaded.draws[0].color_targets[2].slice_count == 8u,
+              "v59 retains full and subrange volume views through named aliases and MRT slots");
+        std::vector<uint8_t> old_view_bytes = volume_view_bytes;
+        old_view_bytes.resize(old_view_bytes.size() - v59_tail(volume_view));
+        old_view_bytes[8] = 58u;
+        GpuCaptureFile old_view_loaded;
+        CHECK(deserialize_gpu_capture(old_view_bytes, old_view_loaded, error) &&
+                  old_view_loaded.draws[0].color_targets[0].selected_mip_depth == 0u &&
+                  old_view_loaded.draws[0].color_targets[0].programmed_slice_max == 0u &&
+                  old_view_loaded.draws[0].color_targets[2].slice_count == 0u,
+              "v58 captures reopen without inventing a layered color-target view");
+        DrawItem divergent_draw = tail_draw;
+        divergent_draw.color0_base = target.color0_base;
+        divergent_draw.color0_width = divergent_draw.color0_height = 32u;
+        divergent_draw.color_targets[0] = {
+            target.color0_base + 0x10000u, 32u, 32u, 32u, 0u, 32u, 31u};
+        GpuCaptureFile normalized_divergent;
+        CHECK(capture_draw_items({divergent_draw}, meta, tail_reader,
+                                 normalized_divergent, error) &&
+                  normalized_divergent.draws.size() == 1u &&
+                  normalized_divergent.draws[0].color_targets[0].base == target.color0_base &&
+                  normalized_divergent.draws[0].color_targets[0].selected_mip_depth == 0u,
+              "capture collection does not lend a stale array view to the named target");
+        GpuCaptureFile invalid_alias = volume_view;
+        invalid_alias.draws[0].color_targets[0].base += 0x10000u;
+        CHECK(!serialize_gpu_capture(invalid_alias, volume_view_bytes, error) &&
+                  error == "invalid color-target volume alias",
+              "direct capture writer refuses a divergent named/array volume alias");
+        GpuCaptureFile out_of_bounds_view = volume_view;
+        out_of_bounds_view.draws[0].color_targets[0] = {
+            target.color0_base, 32u, 32u, 32u, 32u, 0u, 32u};
+        std::vector<uint8_t> out_of_bounds_bytes;
+        GpuCaptureFile out_of_bounds_loaded;
+        CHECK(serialize_gpu_capture(out_of_bounds_view, out_of_bounds_bytes, error) &&
+                  deserialize_gpu_capture(out_of_bounds_bytes, out_of_bounds_loaded, error) &&
+                  out_of_bounds_loaded.draws[0].color_targets[0].selected_mip_depth == 32u &&
+                  out_of_bounds_loaded.draws[0].color_targets[0].first_slice == 32u &&
+                  out_of_bounds_loaded.draws[0].color_targets[0].slice_count == 0u &&
+                  out_of_bounds_loaded.draws[0].color_targets[0].programmed_slice_max == 32u,
+              "v59 preserves an out-of-bounds raw view without inventing a renderable slice");
+        std::vector<uint8_t> invalid_view_bytes = volume_view_bytes;
+        const size_t count_offset = invalid_view_bytes.size() - v59_tail(volume_view) + 8u;
+        invalid_view_bytes[count_offset] = 33u;
+        CHECK(!deserialize_gpu_capture(invalid_view_bytes, volume_view_loaded, error) &&
+                  error == "invalid color-target volume view",
+              "v59 reader rejects an overlarge view from an on-disk capture");
+        invalid_view_bytes = volume_view_bytes;
+        invalid_view_bytes[count_offset + 4u] = 0u; // raw max 32 -> 0, count stays 32
+        CHECK(!deserialize_gpu_capture(invalid_view_bytes, volume_view_loaded, error) &&
+                  error == "invalid color-target volume view",
+              "v59 reader rejects a bounded view wider than its raw programmed endpoint");
+        volume_view.draws[0].color_targets[0].slice_count = 33u;
+        CHECK(!serialize_gpu_capture(volume_view, volume_view_bytes, error) &&
+                  error == "invalid color-target volume view",
+              "v59 writer rejects a view that exceeds its allocation");
+        volume_view.draws[0].color_targets[0].slice_count = 32u;
+        volume_view.draws[0].color_targets[0].programmed_slice_max = 0u;
+        CHECK(!serialize_gpu_capture(volume_view, volume_view_bytes, error) &&
+                  error == "invalid color-target volume view",
+              "v59 writer rejects a bounded view wider than its raw programmed endpoint");
+    }
+    {
         const ShaderResource& tail_chain = tail_loaded.draws[0].vrt.resources[0].resource;
         CHECK(tail_chain.mip_chain_element_width == 60 &&
                   tail_chain.mip_chain_element_height == 33 &&
@@ -1220,7 +1300,8 @@ int main(int argc, char** argv) {
         // A pre-v57 file has no placement at all, and every consumer must read that as "not
         // modelled" rather than as a zero-extent allocation it could try to place levels in.
         std::vector<uint8_t> v56_tail_bytes = tail_bytes;
-        const size_t v57_bytes = tail_loaded.draws[0].vrt.resources.size() * 5u * sizeof(uint32_t);
+        const size_t v57_bytes = tail_loaded.draws[0].vrt.resources.size() * 5u *
+            sizeof(uint32_t) + v59_tail(tail_capture);
         GpuCaptureFile v56_tail_loaded;
         CHECK(v56_tail_bytes.size() > v57_bytes, "v57 mip-placement tail is removable");
         if (v56_tail_bytes.size() > v57_bytes) {
@@ -1299,7 +1380,7 @@ int main(int argc, char** argv) {
         deserialize_gpu_capture(msaa_bytes, msaa_loaded, error);
     if (!msaa_deserialized) std::printf("  [diag] MSAA capture deserialization: %s\n", error.c_str());
     CHECK(msaa_deserialized &&
-              msaa_loaded.format_version == 58 &&
+              msaa_loaded.format_version == 59 &&
               msaa_loaded.draws[0].vrt.resources[0].resource.sample_count == 4 &&
               msaa_loaded.blobs.size() == 2 &&
               msaa_loaded.blobs[1].bytes.size() == 32768u &&
@@ -1425,7 +1506,7 @@ int main(int argc, char** argv) {
     };
     GpuCaptureFile video_capture;
     CHECK(capture_draw_items({video_draw}, meta, video_reader, video_capture, error) &&
-              video_capture.format_version == 58 && video_capture.blobs.size() == 1 &&
+              video_capture.format_version == 59 && video_capture.blobs.size() == 1 &&
               video_capture.blobs[0].bytes.size() == video_memory.size() &&
               video_capture.draws[0].prt.resources[0].captured_size == video_memory.size() &&
               video_capture.draws[0].prt.resources[0].resource.linear_row_pitch_bytes == 2048,
@@ -1436,7 +1517,7 @@ int main(int argc, char** argv) {
     GpuReplayFrame video_replay;
     CHECK(serialize_gpu_capture(video_capture, video_capture_bytes, error) &&
               deserialize_gpu_capture(video_capture_bytes, video_loaded, error) &&
-              video_loaded.format_version == 58 &&
+              video_loaded.format_version == 59 &&
               video_loaded.draws[0].prt.resources[0].resource.proven_zero_mip &&
               video_loaded.draws[0].prt.resources[0].captured_size == video_memory.size() &&
               video_loaded.draws[0].prt.resources[0].resource.linear_row_pitch_bytes == 2048 &&
@@ -1480,7 +1561,7 @@ int main(int argc, char** argv) {
     GpuReplayFrame upgraded_video_replay;
     CHECK(serialize_gpu_capture(legacy_video, upgraded_video_bytes, error) &&
               deserialize_gpu_capture(upgraded_video_bytes, upgraded_video, error) &&
-              upgraded_video.format_version == 58 &&
+              upgraded_video.format_version == 59 &&
               upgraded_video.draws[0].prt.resources[0].captured_size == video_chroma.size &&
               upgraded_video.draws[0].prt.resources[0].resource.linear_row_pitch_bytes == 2048 &&
               materialize_gpu_replay(upgraded_video, upgraded_video_replay, error) &&
@@ -1562,7 +1643,7 @@ int main(int argc, char** argv) {
           "Plucky RGBA16 32-cubed S3 capture uses its four true 3D macroblocks");
     CHECK(serialize_gpu_capture(array_layout_capture, array_layout_bytes, error) &&
               deserialize_gpu_capture(array_layout_bytes, array_layout_loaded, error) &&
-              array_layout_loaded.format_version == 58 &&
+              array_layout_loaded.format_version == 59 &&
               array_layout_loaded.draws[0].vrt.resources[0].resource.layer_stride_bytes == 720896u &&
               array_layout_loaded.draws[0].vrt.resources[0].resource.layer_mip_offset_bytes == 65536u,
           "v32 capture round-trips thin-array slice stride and selected-mip offset");
@@ -1790,7 +1871,7 @@ int main(int argc, char** argv) {
     CHECK(write_gpu_capture(path.string(), captured, error), "versioned capture writes atomically");
     GpuCaptureFile loaded;
     CHECK(read_gpu_capture(path.string(), loaded, error), "versioned capture reads back");
-    CHECK(loaded.format_version == 58 &&
+    CHECK(loaded.format_version == 59 &&
               loaded.draws[0].vrt.resources[1].resource.size == 16u &&
               loaded.draws[0].vrt.resources[1].resource.scalar_buffer_dword_count == 4u &&
               shader_resource_buffer_binding_bytes(
@@ -3386,7 +3467,7 @@ int main(int argc, char** argv) {
     GpuCaptureFile failed_compute_loaded;
     CHECK(serialize_gpu_capture(failed_compute_capture, failed_compute_bytes, error) &&
               deserialize_gpu_capture(failed_compute_bytes, failed_compute_loaded, error) &&
-              failed_compute_loaded.format_version == 58 &&
+              failed_compute_loaded.format_version == 59 &&
               failed_compute_loaded.failure_diagnostics[0].compute_launch.threads_x == 37 &&
               failed_compute_loaded.failure_diagnostics[0].stages[0]
                       .recompile_config.user_sgprs ==
@@ -3614,9 +3695,10 @@ int main(int argc, char** argv) {
     std::vector<uint8_t> pre_v58_failure_bytes;
     GpuCaptureFile pre_v58_failure;
     CHECK(serialize_gpu_capture(failed_capture, pre_v58_failure_bytes, error) &&
-          pre_v58_failure_bytes.size() >= v58_tail(failed_capture) + 12u,
+          pre_v58_failure_bytes.size() >= v58_tail(failed_capture) + v59_tail(failed_capture) + 12u,
           "failed-draw instance-count tail is present");
-    if (pre_v58_failure_bytes.size() >= v58_tail(failed_capture) + 12u) {
+    if (pre_v58_failure_bytes.size() >= v58_tail(failed_capture) + v59_tail(failed_capture) + 12u) {
+        pre_v58_failure_bytes.resize(pre_v58_failure_bytes.size() - v59_tail(failed_capture));
         pre_v58_failure_bytes.resize(pre_v58_failure_bytes.size() - v58_tail(failed_capture));
         pre_v58_failure_bytes[8] = 57u;
         pre_v58_failure_bytes[9] = pre_v58_failure_bytes[10] =
@@ -3631,10 +3713,10 @@ int main(int argc, char** argv) {
     std::vector<uint8_t> rewritten_v58_bytes;
     CHECK(serialize_gpu_capture(pre_v58_failure, rewritten_v58_bytes, error) &&
           deserialize_gpu_capture(rewritten_v58_bytes, rewritten_v58_failure, error) &&
-          rewritten_v58_failure.format_version == 58u &&
+          rewritten_v58_failure.format_version == 59u &&
           rewritten_v58_failure.failure_diagnostics.size() == 1u &&
           rewritten_v58_failure.failure_diagnostics[0].instance_count == 0u,
-          "v57-to-v58 rewrite preserves the zero sentinel for an unavailable count");
+          "v57-to-current rewrite preserves the zero sentinel for an unavailable count");
     const auto loaded_failed_stage = std::find_if(
         failed_loaded.failure_diagnostics[0].stages.begin(),
         failed_loaded.failure_diagnostics[0].stages.end(), [](const auto& stage) {
@@ -3650,7 +3732,7 @@ int main(int argc, char** argv) {
                 loaded_failed_msaa = &resource;
         }
     }
-    CHECK(failed_loaded.format_version == 58 && loaded_shadow &&
+    CHECK(failed_loaded.format_version == 59 && loaded_shadow &&
           loaded_shadow->resource.depth == 4 &&
           loaded_shadow->resource.max_uncompressed_block_size == 2 &&
           loaded_shadow->resource.max_compressed_block_size == 1 &&
@@ -3938,9 +4020,9 @@ int main(int argc, char** argv) {
     CHECK(deserialize_gpu_capture(legacy_bytes, legacy_loaded, error) &&
           !legacy_loaded.failure_diagnostics_available && legacy_loaded.failure_diagnostics.empty(),
           "v6 capture reopens with failed-operation diagnostics reported unavailable");
-    if (legacy_bytes.size() >= 12) legacy_bytes[8] = 59;   // kVersion + 1: a future version
+    if (legacy_bytes.size() >= 12) legacy_bytes[8] = 60;   // kVersion + 1: a future version
     CHECK(!deserialize_gpu_capture(legacy_bytes, legacy_loaded, error) &&
-          error == "unsupported capture version 59",
+          error == "unsupported capture version 60",
           "future capture versions fail with a concrete version error");
 
     GpuCaptureFile bad_hash = mixed;

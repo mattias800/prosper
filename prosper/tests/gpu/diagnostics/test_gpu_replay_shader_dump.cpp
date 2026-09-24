@@ -361,9 +361,14 @@ int main(int argc, char** argv) {
               "CLI fixture writes a v58 pre-realization draw with unknown instance count");
         draw_fixture.failure_diagnostics[0].instance_count = 32;
         draw_fixture.failure_diagnostics[0].reason = gpu::RealizationFailureReason::ShaderRecompile;
+        auto& layered = draw_fixture.failure_diagnostics[0];
+        layered.color0_base = 0x309cbf0000ull;
+        layered.color0_width = layered.color0_height = 32u;
+        layered.color_targets[0] = {
+            layered.color0_base, 32u, 32u, 32u, 0u, 32u, 32u};
         CHECK(gpu::write_gpu_capture((directory / "known-instances.prgcap").string(),
                                      draw_fixture, error),
-              "CLI fixture writes a v58 failed draw with 32 instances");
+              "CLI fixture writes a failed draw with 32 instances and a 3D target view");
         if (!error.empty()) std::fprintf(stderr, "fixture: %s\n", error.c_str());
         return fails ? 1 : 0;
     }

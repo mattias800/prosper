@@ -38,9 +38,48 @@ struct ColorTargetState {
     // allocation programming needed to diagnose packed-tail aliases and reconstruct full chains.
     uint64_t allocation_base = 0;
     uint32_t mip_level = 0, max_mip = 0, color_sw_mode = 0;
+    // The color view's programmed slice range and image shape are distinct. In particular,
+    // MIP0_DEPTH is the allocation extent minus one, while VIEW selects a renderable subset.
+    // Retain both raw decodes (and register presence) until the renderer proves a layered view;
+    // a missing register must not be mistaken for a one-slice view.
+    bool has_view = false, has_attrib3 = false;
+    uint32_t slice_start = 0, slice_max = 0;
+    uint32_t mip0_depth = 0, resource_type = 0;
     bool in_mip_tail = false;
     uint32_t mip_tail_offset = 0, mip_tail_x = 0, mip_tail_y = 0;
 };
+
+struct ColorTargetVolumeView {
+    uint32_t selected_mip_depth = 0; // physical depth after selecting CB_COLORn_VIEW.MIP_LEVEL
+    uint32_t first_slice = 0;
+    uint32_t slice_count = 0; // zero means no proven renderable volume view
+    bool clipped_to_mip = false;
+};
+
+// GFX10's 3D CB view uses inclusive SLICE_MAX (PAL's 3D color-target setup writes
+// start + extent - 1), but a programmed maximum can exceed the selected mip's depth.
+// The physical image bounds the renderable range: do not invent a slice beyond it, and keep
+// the clipping observable for callers. An absent register or impossible interval declines.
+constexpr ColorTargetVolumeView color_target_volume_view(const ColorTargetState& target) {
+    ColorTargetVolumeView view;
+    if (!target.has_view || !target.has_attrib3 || target.resource_type != 2u)
+        return view;
+    view.selected_mip_depth = (target.mip0_depth + 1u) >> target.mip_level;
+    if (!view.selected_mip_depth) view.selected_mip_depth = 1u;
+    view.first_slice = target.slice_start;
+    // Keep malformed or wholly out-of-allocation programming observable. No slices from either
+    // interval may be rendered, but dropping the raw view here would hide why the draw declined.
+    if (target.slice_max < target.slice_start ||
+        target.slice_start >= view.selected_mip_depth) {
+        view.clipped_to_mip = target.slice_start >= view.selected_mip_depth;
+        return view;
+    }
+    view.clipped_to_mip = target.slice_max >= view.selected_mip_depth;
+    const uint32_t last = view.clipped_to_mip
+        ? view.selected_mip_depth - 1u : target.slice_max;
+    view.slice_count = last - view.first_slice + 1u;
+    return view;
+}
 
 struct RenderState {
     std::array<ColorTargetState, kColorTargetCount> color_targets{};

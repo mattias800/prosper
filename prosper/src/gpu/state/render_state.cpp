@@ -428,7 +428,12 @@ RenderState extract_render_state(const GpuState& st) {
         target.format = PM4_FIELD(info, CB_COLOR0_INFO, FORMAT);
         target.number_type = PM4_FIELD(info, CB_COLOR0_INFO, NUMBER_TYPE);
         target.comp_swap = PM4_FIELD(info, CB_COLOR0_INFO, COMP_SWAP);
-        const uint32_t view = rd(st.cx, P::CB_COLOR0_VIEW + slot * kColorRegisterStride);
+        const uint32_t view_reg = P::CB_COLOR0_VIEW + slot * kColorRegisterStride;
+        const auto view_it = st.cx.find(view_reg);
+        const uint32_t view = view_it == st.cx.end() ? 0u : view_it->second;
+        target.has_view = view_it != st.cx.end();
+        target.slice_start = PM4_FIELD(view, CB_COLOR0_VIEW, SLICE_START);
+        target.slice_max = PM4_FIELD(view, CB_COLOR0_VIEW, SLICE_MAX);
         target.mip_level = PM4_FIELD(view, CB_COLOR0_VIEW, MIP_LEVEL);
         const auto attrib2 = st.cx.find(P::CB_COLOR0_ATTRIB2 + slot);
         if (attrib2 != st.cx.end()) {
@@ -437,7 +442,11 @@ RenderState extract_render_state(const GpuState& st) {
             target.height = PM4_FIELD(attrib2->second, CB_COLOR0_ATTRIB2, MIP0_HEIGHT) + 1u;
             target.max_mip = PM4_FIELD(attrib2->second, CB_COLOR0_ATTRIB2, MAX_MIP);
         }
-        const uint32_t attrib3 = rd(st.cx, P::CB_COLOR0_ATTRIB3 + slot);
+        const auto attrib3_it = st.cx.find(P::CB_COLOR0_ATTRIB3 + slot);
+        const uint32_t attrib3 = attrib3_it == st.cx.end() ? 0u : attrib3_it->second;
+        target.has_attrib3 = attrib3_it != st.cx.end();
+        target.mip0_depth = PM4_FIELD(attrib3, CB_COLOR0_ATTRIB3, MIP0_DEPTH);
+        target.resource_type = PM4_FIELD(attrib3, CB_COLOR0_ATTRIB3, RESOURCE_TYPE);
         target.color_sw_mode = PM4_FIELD(attrib3, CB_COLOR0_ATTRIB3, COLOR_SW_MODE);
 
         // The CB base is the allocation origin, not necessarily the address of the selected view.

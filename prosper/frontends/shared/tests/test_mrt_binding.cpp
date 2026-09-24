@@ -326,12 +326,19 @@ int main() {
         auto mirrored = make_draw();
         mirrored.color0_base = 0x300000ull;
         mirrored.color0_width = 32u; mirrored.color0_height = 2u;
-        mirrored.color_targets[0] = {0x300000ull, 32u, 2u};
+        mirrored.color_targets[0] = {0x300000ull, 32u, 2u, 32u, 0u, 32u, 32u};
         mirrored.color1_base = 0x310000ull;
         mirrored.color1_width = 32u; mirrored.color1_height = 2u;
         mirrored.color_targets[1] = {0x310000ull, 32u, 2u};
         CHECK(mrt_color_alias_mirrored(mirrored, 0) && mrt_color_alias_mirrored(mirrored, 1));
         CHECK(readers_agree(mirrored, 0) && readers_agree(mirrored, 1));
+        CHECK(mrt_pass_color_binding(mirrored, 0).selected_mip_depth == 32u &&
+              mrt_pass_color_binding(mirrored, 0).slice_count == 32u &&
+              mrt_pass_color_binding(mirrored, 0).programmed_slice_max == 32u);
+        auto different_named = mirrored;
+        different_named.color0_base = 0x320000ull;
+        CHECK(mrt_pass_color_binding(different_named, 0).selected_mip_depth == 0u &&
+              mrt_pass_color_binding(different_named, 0).base == 0x320000ull);
 
         // Shape 2: the array ABSENT and the named triple authoritative -- captures through v33, and
         // the direct/synthetic callers the render fixtures are. The fallback repairs it, so the

@@ -173,7 +173,10 @@ constexpr char kMagic[8] = {'P','R','G','P','C','A','P','\0'};
 // carried instance counts since v20; omitting them on recompile failure hid Kena's draw shape.
 // Zero means unavailable, including on older captures and failures before draw realization. A
 // known guest count of zero cannot be distinguished from unavailable in this version.
-constexpr uint32_t kVersion = 58;
+// v59: per-color-target 3D selected-mip depth, bounded attachment view, and raw programmed slice
+// maximum. The v34 base/extent records remain unchanged; older captures have no proven volume
+// shape and keep all four values zero.
+constexpr uint32_t kVersion = 59;
 constexpr uint32_t kEndian = 0x01020304u;
 constexpr uint64_t kMaxFileBytes = 4ull << 30;
 constexpr uint64_t kMaxBlobDefaultBytes = 1ull << 30;
