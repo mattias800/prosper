@@ -605,16 +605,24 @@ void inspect_table(const char* stage, const prosper::gpu::ShaderResourceTable* t
 }
 
 void inspect_frame(const prosper::gpu::GpuReplayFrame& replay, uint32_t format_version) {
-    auto print_volume_views = [](const auto& bindings) {
+    auto print_volume_views = [](const auto& bindings,
+                                 const prosper::gpu::ResolvedPipelineState* pipeline) {
         for (uint32_t slot = 0; slot < bindings.size(); ++slot) {
             const auto& target = bindings[slot];
             if (!target.selected_mip_depth) continue;
             // The bounded range is physical image coverage, not proof that a guest producer
-            // actually exported every layer. Keep the raw inclusive endpoint visible beside it.
+            // actually exported every layer. A slot may also retain a programmed view while its
+            // write mask is zero; print its base and mask so sticky state cannot be mistaken for
+            // a second active output.
             std::printf("  target-volume slot=%u mip-depth=%u raw-start=%u raw-max=%u "
-                        "bounded-start=%u bounded-count=%u\n",
+                        "bounded-start=%u bounded-count=%u base=%016llx mask=",
                         slot, target.selected_mip_depth, target.first_slice,
-                        target.programmed_slice_max, target.first_slice, target.slice_count);
+                        target.programmed_slice_max, target.first_slice, target.slice_count,
+                        static_cast<unsigned long long>(target.base));
+            if (pipeline)
+                std::printf("%x\n", pipeline->color_targets[slot].write_mask);
+            else
+                std::printf("?\n");
         }
     };
     for (const auto& provenance : replay.resource_provenance) {
@@ -814,7 +822,7 @@ void inspect_frame(const prosper::gpu::GpuReplayFrame& replay, uint32_t format_v
                     fs.words->size(), static_cast<unsigned long long>(prosper::gpu::gpu_capture_hash(
                         reinterpret_cast<const uint8_t*>(fs.words->data()), fs.words->size() * 4)),
                     fs.shared ? "shared" : "owned");
-        print_volume_views(d.color_targets);
+        print_volume_views(d.color_targets, &d.ps);
         // Blend detail: UI compositing correctness hangs on the exact color AND alpha factor
         // programming (a separate-alpha UI backdrop writes a different alpha than its color
         // factors imply — #320's dialogue overlay), so make the full equation inspectable.
@@ -1023,7 +1031,8 @@ void inspect_frame(const prosper::gpu::GpuReplayFrame& replay, uint32_t format_v
                                 failure.pipeline.stencil_op_val[1]);
             }
             std::printf("\n");
-            print_volume_views(failure.color_targets);
+            print_volume_views(failure.color_targets,
+                               failure.pipeline_present ? &failure.pipeline : nullptr);
             // #1459: a suppressed draw is usually suppressed BECAUSE its resolved write mask is
             // zero, so the raw registers behind that mask are exactly what this population needs to
             // explain. Realized draws print the same line; without it here the no-effect draws --
@@ -3438,12 +3447,17 @@ int main(int argc, char** argv) {
             prolog_stage.resource_table.present ? &table : nullptr;
         const std::vector<uint32_t> spirv = prosper::gpu::recompile_vertex_chain(
             prolog.words.data(), prolog.words.size(), main.words.data(), main.words.size(),
-            resources);
+            resources, /*pixel_inputs=*/nullptr, /*capture_position=*/false,
+            /*virtual_lds_dwords=*/0,
+            {prosper::gpu::RecompileDiagnosticStage::Vertex, main_stage.program_addr});
+        const std::string reason = spirv.empty()
+            ? prosper::gpu::last_terminal_reject_reason(main_stage.program_addr) : "";
         std::fprintf(stderr,
-                     "[retry-failed-chain] %s %s resources=%zu spirv-dwords=%zu\n",
+                     "[retry-failed-chain] %s %s resources=%zu spirv-dwords=%zu "
+                     "config=defaults reason=%s\n",
                      retry_failed_chain_spec.c_str(),
                      spirv.empty() ? "rejected" : "recompiled", table.resources.size(),
-                     spirv.size());
+                     spirv.size(), reason.empty() ? "unrecorded" : reason.c_str());
         if (positional.size() == 1 && !inspect) return spirv.empty() ? 1 : 0;
     }
     if (!retry_failed_stage_spec.empty()) {

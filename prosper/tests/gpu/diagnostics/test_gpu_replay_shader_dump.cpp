@@ -362,13 +362,65 @@ int main(int argc, char** argv) {
         draw_fixture.failure_diagnostics[0].instance_count = 32;
         draw_fixture.failure_diagnostics[0].reason = gpu::RealizationFailureReason::ShaderRecompile;
         auto& layered = draw_fixture.failure_diagnostics[0];
+        layered.pipeline_present = true;
+        layered.pipeline.color_targets[0].write_mask = 0xf;
         layered.color0_base = 0x309cbf0000ull;
         layered.color0_width = layered.color0_height = 32u;
         layered.color_targets[0] = {
             layered.color0_base, 32u, 32u, 32u, 0u, 32u, 32u};
+        // The next slot retains a programmed 3D view but has no color writes. The inspector
+        // must display that distinction; view presence alone does not prove a second producer.
+        layered.color1_base = 0x304edd0000ull;
+        layered.color1_width = layered.color1_height = 64u;
+        layered.color_targets[1] = {
+            layered.color1_base, 64u, 64u, 64u, 0u, 64u, 64u};
         CHECK(gpu::write_gpu_capture((directory / "known-instances.prgcap").string(),
                                      draw_fixture, error),
-              "CLI fixture writes a failed draw with 32 instances and a 3D target view");
+              "CLI fixture writes a failed draw with active and inactive 3D target views");
+        // A real split NGG chain whose all-ones MBCNT must still reject in the one-lane vertex
+        // route. This guards the retry tool's terminal-reason plumbing, not shader admission.
+        gpu::GpuCaptureFile chain_fixture;
+        chain_fixture.metadata.width = chain_fixture.metadata.height = 1;
+        chain_fixture.failure_diagnostics_available = true;
+        chain_fixture.operations.push_back({gpu::SubmitOperationKind::Draw, 0, 1, false});
+        gpu::GpuCaptureRawShaderVersion chain_prolog;
+        chain_prolog.words = {0xBFA00003u, 0x4A0A0A81u, 0xBE802006u,
+                              0xBF9F0000u, 0xBF9F0000u};
+        chain_prolog.content_hash = gpu::gpu_capture_hash(
+            reinterpret_cast<const uint8_t*>(chain_prolog.words.data()),
+            chain_prolog.words.size() * sizeof(uint32_t));
+        gpu::GpuCaptureRawShaderVersion chain_main;
+        chain_main.words = {
+            0xBEEA03FFu, 0x00080000u, 0x94FE6AC1u, 0xBEFE04C1u,
+            0xBEEA03FFu, 0x00080000u, 0x94EA6AC1u, 0xBEFE046Au, 0xBEFE04C1u,
+            0xD7650007u, 0x000100C1u, 0xD7660009u, 0x00020EC1u,
+            0x93EAFF03u, 0x00080008u, 0x876BFF03u, 0x000000FFu, 0x8F6A8C6Au,
+            0x887C6A6Bu, 0xBF900009u, 0x906A8803u, 0x81EA6A80u, 0x90FE6AC1u,
+            0xF8000941u, 0x00000000u, 0x81EA0380u, 0x90FE6AC1u,
+            0x34040A81u, 0x36060AC2u, 0x7E000280u, 0x7E0202F2u,
+            0x36040482u, 0x4A0606C1u, 0x4A0404C1u, 0x7E060B03u, 0x7E040B02u,
+            0xF80008CFu, 0x01000302u, 0xBF810000u};
+        chain_main.has_endpgm = true;
+        chain_main.content_hash = gpu::gpu_capture_hash(
+            reinterpret_cast<const uint8_t*>(chain_main.words.data()),
+            chain_main.words.size() * sizeof(uint32_t));
+        chain_fixture.raw_shader_versions = {chain_prolog, chain_main};
+        gpu::GpuCapturedOperationFailure chain_failure;
+        chain_failure.kind = gpu::SubmitOperationKind::Draw;
+        chain_failure.command_order = 1;
+        chain_failure.reason = gpu::RealizationFailureReason::ShaderRecompile;
+        gpu::GpuCapturedStageDiagnostic prolog_stage;
+        prolog_stage.stage = gpu::ShaderProgramStage::Vertex;
+        prolog_stage.program_addr = 0x1000u;
+        prolog_stage.raw_shader_index = 0;
+        gpu::GpuCapturedStageDiagnostic main_stage = prolog_stage;
+        main_stage.program_addr = 0x2000u;
+        main_stage.raw_shader_index = 1;
+        chain_failure.stages = {prolog_stage, main_stage};
+        chain_fixture.failure_diagnostics.push_back(chain_failure);
+        CHECK(gpu::write_gpu_capture((directory / "rejected-chain.prgcap").string(),
+                                     chain_fixture, error),
+              "CLI fixture writes a split vertex chain with a cross-lane refusal");
         if (!error.empty()) std::fprintf(stderr, "fixture: %s\n", error.c_str());
         return fails ? 1 : 0;
     }

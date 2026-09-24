@@ -746,7 +746,11 @@ captured resource table. For split vertex programs, `--retry-failed-chain FAILUR
 first two retained vertex stages as one prolog/main chain and calls the production chain recompiler. Both modes
 exit successfully only when SPIR-V is produced and avoid Vulkan rendering, so they are the fast feedback path
 after a translator change. Chain retry requires the exact resource metadata added in capture v35 and rejects
-older or incomplete diagnostics explicitly. Failed compute retry additionally requires capture v42, which
+older or incomplete diagnostics explicitly. Graphics failures retain the resource table but not the
+original graphics recompile configuration (including the vertex LDS allocation and fragment wave
+width); a chain retry now names its first terminal refusal and prints `config=defaults`. Treat that
+refusal as an offline boundary, not proof of the exact live refusal or of successful guest execution.
+Failed compute retry additionally requires capture v42, which
 retains the exact launch dimensions, user SGPR values, wave/LDS state, and subgroup/storage specialization used
 by the rejected translator invocation. Older or incomplete failed-compute diagnostics are refused explicitly;
 the tool never substitutes default compute ABI state.
