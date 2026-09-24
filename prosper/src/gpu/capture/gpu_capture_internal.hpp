@@ -178,7 +178,9 @@ constexpr char kMagic[8] = {'P','R','G','P','C','A','P','\0'};
 // shape and keep all four values zero.
 // v60: failed graphics draws carry their exact vertex LDS and pixel-input retry ABI, rather than
 // silently recompiling a retained shader under default graphics settings.
-constexpr uint32_t kVersion = 60;
+// v61: failed graphics draws also carry the fragment system-input mapping and wave width. The
+// existing v60 pixel-input mapping supplies the remaining interpolation dependency.
+constexpr uint32_t kVersion = 61;
 constexpr uint32_t kEndian = 0x01020304u;
 constexpr uint64_t kMaxFileBytes = 4ull << 30;
 constexpr uint64_t kMaxBlobDefaultBytes = 1ull << 30;
