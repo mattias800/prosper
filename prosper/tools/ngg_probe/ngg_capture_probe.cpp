@@ -29,7 +29,7 @@ bool eligible_buffer(const prosper::gpu::ShaderResource& resource, uint32_t slot
 }
 
 bool exact_probe_local_size(const std::vector<uint32_t>& words, uint32_t expected_x) {
-    // The runner dispatches the single GLCompute entry named "main" as a 64-lane group.
+    // The runner dispatches the single GLCompute entry named "main" at the requested size.
     // LocalSizeId or BuiltIn WorkgroupSize can override a literal LocalSize, so reject both.
     // A compile-only four-wave module must never be dispatched as unrelated 64-lane groups.
     if (words.size() < 5 || words[0] != 0x07230203u) return false;
@@ -65,6 +65,26 @@ bool exact_probe_local_size(const std::vector<uint32_t>& words, uint32_t expecte
         at += count;
     }
     return entry && found_mode && mode_entry == entry;
+}
+
+bool exact_native_wave64_marker(const std::vector<uint32_t>& words) {
+    constexpr char kMarker[] = "Prosper.NggProbeExactSubgroup=64";
+    if (words.size() < 5 || words[0] != 0x07230203u) return false;
+    uint32_t matches = 0;
+    for (size_t at = 5; at < words.size();) {
+        const uint32_t count = words[at] >> 16u;
+        if (!count || at + count > words.size()) return false;
+        if ((words[at] & 0xffffu) == 330u && count >= 2u) {
+            const char* value = reinterpret_cast<const char*>(words.data() + at + 1u);
+            const size_t bytes = static_cast<size_t>(count - 1u) * sizeof(uint32_t);
+            const void* end = std::memchr(value, '\0', bytes);
+            if (end && static_cast<const char*>(end) - value == sizeof(kMarker) - 1u &&
+                std::memcmp(value, kMarker, sizeof(kMarker)) == 0)
+                ++matches;
+        }
+        at += count;
+    }
+    return matches == 1u;
 }
 
 bool selftest() {
@@ -108,7 +128,17 @@ bool selftest() {
     if (exact_probe_local_size(override_size, 64u)) return false;
     auto id_size = module;
     id_size.insert(id_size.end(), {(6u << 16u) | 331u, 1u, 38u, 3u, 4u, 5u});
-    return !exact_probe_local_size(id_size, 64u);
+    if (exact_probe_local_size(id_size, 64u) || exact_native_wave64_marker(module))
+        return false;
+    constexpr char kMarker[] = "Prosper.NggProbeExactSubgroup=64";
+    std::vector<uint32_t> payload((sizeof(kMarker) + 3u) / 4u);
+    std::memcpy(payload.data(), kMarker, sizeof(kMarker));
+    const size_t marker_instruction = module.size();
+    module.push_back((static_cast<uint32_t>(payload.size() + 1u) << 16u) | 330u);
+    module.insert(module.end(), payload.begin(), payload.end());
+    if (!exact_native_wave64_marker(module)) return false;
+    module[marker_instruction + 1u] ^= 1u; // mutate 'P', not trailing padding
+    return !exact_native_wave64_marker(module);
 }
 } // namespace
 
@@ -118,13 +148,15 @@ int main(int argc, char** argv) {
     if (argc < 5 || argc > 7) {
         std::fprintf(stderr,
                      "usage: %s CAPTURE FAILURE COMPILE_ONLY_MODULE.spv OUTPUT.bin "
-                     "[--zero-inputs|--zero-binding=2..6] [--packed-offsets=FILE]\n",
+                     "[--zero-inputs|--zero-binding=2..6] "
+                     "[--packed-offsets=FILE|--full-inputs=FILE]\n",
                      argv[0]);
         return 2;
     }
     bool zero_inputs = false;
     uint32_t zero_binding = 0;
     std::string packed_offsets_path;
+    std::string full_inputs_path;
     for (int i = 5; i < argc; ++i) {
         if (std::strcmp(argv[i], "--zero-inputs") == 0 && !zero_inputs && !zero_binding) {
             zero_inputs = true;
@@ -141,16 +173,86 @@ int main(int argc, char** argv) {
         } else if (std::strncmp(argv[i], "--packed-offsets=", 17) == 0 &&
                    argv[i][17] && packed_offsets_path.empty()) {
             packed_offsets_path = argv[i] + 17;
+        } else if (std::strncmp(argv[i], "--full-inputs=", 14) == 0 &&
+                   argv[i][14] && full_inputs_path.empty()) {
+            full_inputs_path = argv[i] + 14;
         } else {
             std::fprintf(stderr, "ngg_capture_probe: invalid or duplicate option %s\n", argv[i]);
             return 2;
         }
+    }
+    if (!packed_offsets_path.empty() && !full_inputs_path.empty()) {
+        std::fprintf(stderr, "ngg_capture_probe: launch input modes are mutually exclusive\n");
+        return 2;
     }
     char* end = nullptr;
     errno = 0;
     const unsigned long failure_index = std::strtoul(argv[2], &end, 0);
     if (errno || !end || *end || failure_index > UINT32_MAX) {
         std::fprintf(stderr, "ngg_capture_probe: invalid failure index\n");
+        return 2;
+    }
+    // Captures can exceed a gigabyte. Reject a mismatched module or device before reading one.
+    std::ifstream module_file(argv[3], std::ios::binary | std::ios::ate);
+    const std::streampos module_bytes = module_file ? module_file.tellg() : std::streampos(-1);
+    if (module_bytes < 20 || module_bytes > (1 << 20) ||
+        static_cast<uint64_t>(module_bytes) % sizeof(uint32_t)) {
+        std::fprintf(stderr, "ngg_capture_probe: invalid SPIR-V file\n");
+        return 2;
+    }
+    std::vector<uint32_t> module(static_cast<size_t>(module_bytes) / sizeof(uint32_t));
+    module_file.seekg(0);
+    if (!module_file.read(reinterpret_cast<char*>(module.data()), module_bytes) ||
+        module[0] != 0x07230203u) {
+        std::fprintf(stderr, "ngg_capture_probe: cannot read SPIR-V file\n");
+        return 2;
+    }
+    const bool full_launch = !full_inputs_path.empty();
+    if (full_launch &&
+        (!exact_probe_local_size(module, 256u) || !exact_native_wave64_marker(module))) {
+        std::fprintf(stderr,
+                     "ngg_capture_probe: full launch requires a 256x1x1 native-Wave64 probe module\n");
+        return 2;
+    }
+    if (!full_launch &&
+        (!exact_probe_local_size(module, 64u) || exact_native_wave64_marker(module))) {
+        std::fprintf(stderr,
+                     "ngg_capture_probe: module must declare one 64x1x1 workgroup; "
+                     "four-wave modules require explicit full inputs and native Wave64\n");
+        return 2;
+    }
+    std::vector<uint32_t> full_input_words;
+    if (full_launch) {
+        constexpr size_t kExpectedBytes = 256u * 10u * sizeof(uint32_t);
+        std::ifstream inputs(full_inputs_path, std::ios::binary | std::ios::ate);
+        if (!inputs || inputs.tellg() != static_cast<std::streampos>(kExpectedBytes)) {
+            std::fprintf(stderr,
+                         "ngg_capture_probe: full launch requires exactly %zu bytes\n",
+                         kExpectedBytes);
+            return 2;
+        }
+        full_input_words.resize(256u * 10u);
+        inputs.seekg(0);
+        if (!inputs.read(reinterpret_cast<char*>(full_input_words.data()), kExpectedBytes)) {
+            std::fprintf(stderr, "ngg_capture_probe: cannot read full launch inputs\n");
+            return 2;
+        }
+        for (uint32_t wave = 0; wave < 4u; ++wave) {
+            const uint32_t s3 = full_input_words[static_cast<size_t>(wave) * 64u * 10u + 9u];
+            for (uint32_t lane = 1; lane < 64u; ++lane)
+                if (full_input_words[(static_cast<size_t>(wave) * 64u + lane) * 10u + 9u]
+                    != s3) {
+                    std::fprintf(stderr,
+                                 "ngg_capture_probe: s3 must be uniform within guest wave %u\n",
+                                 wave);
+                    return 2;
+                }
+        }
+    }
+    if (full_launch &&
+        !prosper::test::default_compute_required_subgroup_supported(64u, 256u)) {
+        std::fprintf(stderr,
+                     "ngg_capture_probe: full launch requires supported exact 64-lane full subgroups\n");
         return 2;
     }
     prosper::gpu::GpuCaptureFile capture;
@@ -222,32 +324,17 @@ int main(int argc, char** argv) {
     else if (zero_binding)
         std::fill(buffers[zero_binding - 2u].begin(),
                   buffers[zero_binding - 2u].end(), 0u);
-    std::ifstream module_file(argv[3], std::ios::binary | std::ios::ate);
-    const std::streampos module_bytes = module_file ? module_file.tellg() : std::streampos(-1);
-    if (module_bytes < 20 || module_bytes > (1 << 20) ||
-        static_cast<uint64_t>(module_bytes) % sizeof(uint32_t)) {
-        std::fprintf(stderr, "ngg_capture_probe: invalid SPIR-V file\n");
-        return 2;
-    }
-    std::vector<uint32_t> module(static_cast<size_t>(module_bytes) / sizeof(uint32_t));
-    module_file.seekg(0);
-    if (!module_file.read(reinterpret_cast<char*>(module.data()), module_bytes) ||
-        module[0] != 0x07230203u) {
-        std::fprintf(stderr, "ngg_capture_probe: cannot read SPIR-V file\n");
-        return 2;
-    }
-    if (!exact_probe_local_size(module, 64u)) {
-        std::fprintf(stderr,
-                     "ngg_capture_probe: module must declare one 64x1x1 workgroup; "
-                     "four-wave modules are compile-only here\n");
-        return 2;
-    }
-    const uint32_t lanes = failure.vertex_count * failure.instance_count;
+    const uint32_t lanes = full_launch ? 256u : failure.vertex_count * failure.instance_count;
     constexpr uint32_t kWords = prosper::gpu::kNggExportProbeWords;
     const std::array<std::vector<uint32_t>, 3> extra{
         buffers[2], buffers[3], buffers[4]};
-    std::vector<float> launch_inputs(lanes, 0.0f);
-    if (!packed_offsets_path.empty()) {
+    std::vector<float> launch_inputs(full_launch ? static_cast<size_t>(lanes) * 10u : lanes,
+                                     0.0f);
+    if (full_launch) {
+        static_assert(sizeof(float) == sizeof(uint32_t));
+        std::memcpy(launch_inputs.data(), full_input_words.data(),
+                    full_input_words.size() * sizeof(uint32_t));
+    } else if (!packed_offsets_path.empty()) {
         const size_t expected_bytes = static_cast<size_t>(lanes) * 2u * sizeof(uint32_t);
         std::ifstream offsets(packed_offsets_path, std::ios::binary | std::ios::ate);
         if (!offsets || offsets.tellg() != static_cast<std::streampos>(expected_bytes)) {
@@ -268,7 +355,8 @@ int main(int argc, char** argv) {
     }
     const auto result = prosper::test::run_compute(
         module, launch_inputs, lanes, lanes * kWords,
-        buffers[0], buffers[1], nullptr, 64, nullptr, nullptr, &extra);
+        buffers[0], buffers[1], nullptr, full_launch ? 256u : 64u,
+        nullptr, nullptr, &extra, full_launch ? 64u : 0u);
     if (result.size() != static_cast<size_t>(lanes) * kWords) {
         std::fprintf(stderr, "ngg_capture_probe: Vulkan dispatch failed or timed out\n");
         return 1;
@@ -296,9 +384,10 @@ int main(int argc, char** argv) {
     std::fprintf(stderr,
                  "[ngg-capture-probe] COMPILE-ONLY MODULE EXECUTION; lanes=%u words/lane=%u "
                  "nonzero-prim=%u distinct-pos1-z=%zu inputs=%s zero-binding=%u "
-                 "packed-offsets=%s output=%s\n",
+                 "packed-offsets=%s full-inputs=%s output=%s\n",
                  lanes, kWords, emitted, layers.size(),
                  zero_inputs ? "zeroed-control" : "captured", zero_binding,
-                 packed_offsets_path.empty() ? "none" : packed_offsets_path.c_str(), argv[4]);
+                 packed_offsets_path.empty() ? "none" : packed_offsets_path.c_str(),
+                 full_inputs_path.empty() ? "none" : full_inputs_path.c_str(), argv[4]);
     return 0;
 }

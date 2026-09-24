@@ -464,25 +464,51 @@ std::vector<uint32_t> recompile_ngg_exports_for_test(
     const uint32_t* code, size_t dwords, uint32_t num_inputs, uint32_t lds_bytes,
     const ShaderResourceTable* resources, uint32_t vertices_per_instance,
     uint32_t provisional_merged_wave_info, RecompileDiagnosticContext diagnostic,
-    bool packed_gs_offsets_from_inputs, bool full_four_wave_launch_inputs) {
+    bool packed_gs_offsets_from_inputs, bool full_four_wave_launch_inputs,
+    bool native_wave64) {
     if (!code || !dwords || num_inputs > 32 || lds_bytes > 65536u ||
         (packed_gs_offsets_from_inputs && !vertices_per_instance) ||
         (full_four_wave_launch_inputs &&
          (!packed_gs_offsets_from_inputs || num_inputs != 10u)) ||
-        (!full_four_wave_launch_inputs && packed_gs_offsets_from_inputs && num_inputs != 2u))
+        (!full_four_wave_launch_inputs && packed_gs_offsets_from_inputs && num_inputs != 2u) ||
+        (native_wave64 && !full_four_wave_launch_inputs))
         return {};
     if (resources && std::any_of(resources->resources.begin(), resources->resources.end(),
                                  [](const ShaderResource& r) { return r.binding < 2u; }))
         return {}; // bindings 0/1 are this probe's input/export buffers
     std::vector<Rdna2Inst> ins;
     rdna2_walk(code, dwords, ins);
+    const bool has_barrier = native_wave64 && std::any_of(
+        ins.begin(), ins.end(), [](const Rdna2Inst& in) {
+            return in.fmt == Rdna2Format::SOPP && in.opcode == 0x0au;
+        });
+    if (has_barrier) {
+        const BarrierPhasedCompute phases = analyze_barrier_phased_compute(ins);
+        if (!phases.found || phases.guarded) {
+            // The ordinary compute proof treats launch SGPRs as workgroup-uniform. This probe
+            // supplies s3 separately to each guest wave, so a scalar terminal guard can let
+            // only some of the four waves reach a Vulkan workgroup barrier.
+            log_recompile_diagnostic(diagnostic, "ngg-native-reject", "terminal",
+                                     phases.guarded ? "reason=per-wave-terminal-guard"
+                                                    : "reason=barrier-phase-proof");
+            return {};
+        }
+    }
     SpirvCompute b;
     b.diagnostic = diagnostic;
     b.ngg_workgroup_export_probe = true;
     b.vertices_per_instance = vertices_per_instance;
     if (lds_bytes) b.lds_dwords = std::max(1u, (lds_bytes + 3u) / 4u);
+    // Only an explicit compile-only experiment may use native Wave64. The resulting module needs
+    // a pipeline requesting exact 64-lane full subgroups; the old capture runner refuses it.
+    b.native_subgroup_size = native_wave64 ? 64u : 0u;
     b.begin(num_inputs ? num_inputs : 1, resources,
             full_four_wave_launch_inputs ? 256u : 64u, 1, 1, 64, 0, true);
+    if (native_wave64) {
+        std::vector<uint32_t> marker;
+        b.pstr(marker, "Prosper.NggProbeExactSubgroup=64");
+        b.putv(b.debug, Op_ModuleProcessed, marker);
+    }
     b.declare_guest_scratch(analyze_static_scratch(ins));
     RegState rs; rs.vcc = b.bfalse(); rs.scc = b.bfalse(); rs.exec = b.btrue();
     seed_smem_pointer_provenance(rs, ins);
@@ -536,7 +562,7 @@ std::vector<uint32_t> recompile_ngg_exports_for_test(
         }
         return true;
     };
-    const bool force_phases_for_dpp = std::any_of(
+    const bool force_phases_for_dpp = has_barrier || std::any_of(
         ins.begin(), ins.end(), is_vadd_nc_u32_dpp_row_shr_bounded);
     if (!emit_body(b, rs, ins, safe_branches, resources, /*allow_exec_update*/true,
                    /*allow_smem*/resources != nullptr, export_word, code, dwords,

@@ -4994,6 +4994,10 @@ if(TARGET gpu_replay AND Python3_Interpreter_FOUND)
   set_property(TEST gpu_replay_cli_contract APPEND PROPERTY ENVIRONMENT
     "PROSPER_GPU_REPLAY_BIN=$<TARGET_FILE:gpu_replay>"
     "PROSPER_GPU_REPLAY_FIXTURE_BIN=$<TARGET_FILE:test_gpu_replay_shader_dump>")
+  if(TARGET ngg_capture_probe)
+    set_property(TEST gpu_replay_cli_contract APPEND PROPERTY ENVIRONMENT
+      "PROSPER_NGG_CAPTURE_PROBE_BIN=$<TARGET_FILE:ngg_capture_probe>")
+  endif()
 endif()
 
 

@@ -166,3 +166,11 @@ About 2 in 12 launches hang before their first frame (no raw scanout either). No
   chain refuses the saved-mask count at linked pc356 (`s_bcnt1_i32_b64 s107,s[6:7]`): its portable reduction
   requires a one-wave workgroup. Widening that guard without proving every wave reaches the workgroup barriers
   is unsafe. The captured-input runner rejects 256-lane modules, so no unproved four-wave shader was executed.
+- An opt-in native-Wave64 diagnostic can compile that captured chain through linked pc356: 20,073 SPIR-V dwords
+  pass `spirv-val`. Its six guest barriers have an unguarded phase proof; the diagnostic rejects terminal guards
+  because `s3` may differ across guest waves. A synthetic 256-lane execution test requests four exact 64-lane
+  subgroups and isolates a saved-mask mutation to one guest wave. Device, module-marker, and input-shape checks
+  protect the offline runner. Two **speculative** launch files (128 ES, 64 GS, with the GS work assigned to
+  wave 0 or 1) both produced zero PRIM exports and only one nonzero POS0 record. They yield different raw bytes,
+  but neither proves a guest launch layout or a renderer defect: the actual ES/GS partition and initial VGPRs
+  are still unknown. No live shader admission or title improvement is claimed.

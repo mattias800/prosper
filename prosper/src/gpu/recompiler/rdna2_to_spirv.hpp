@@ -524,7 +524,8 @@ std::vector<uint32_t> recompile_ngg_exports_for_test(
     uint32_t lds_bytes = 0, const ShaderResourceTable* resources = nullptr,
     uint32_t vertices_per_instance = 0, uint32_t provisional_merged_wave_info = 0,
     RecompileDiagnosticContext diagnostic = {RecompileDiagnosticStage::Vertex, 0},
-    bool packed_gs_offsets_from_inputs = false, bool full_four_wave_launch_inputs = false);
+    bool packed_gs_offsets_from_inputs = false, bool full_four_wave_launch_inputs = false,
+    bool native_wave64 = false);
 
 // Register and launch state for a real compute program. User SGPR values are supplied as one
 // push-constant dword per register; enabled system SGPRs follow them in hardware order. TIDIG_COMP_CNT

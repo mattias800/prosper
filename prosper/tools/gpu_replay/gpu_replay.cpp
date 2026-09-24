@@ -86,6 +86,7 @@ void usage(const char* argv0) {
                          "[--probe-ngg-workgroup-s3 0xVALUE (with --retry-failed-chain; compile only)] "
                          "[--probe-ngg-packed-offsets (with --probe-ngg-workgroup-s3; compile only)] "
                          "[--probe-ngg-full-four-wave (with --retry-failed-chain; compile only)] "
+                         "[--probe-ngg-native-wave64 (with --probe-ngg-full-four-wave; compile only)] "
                          "[--retry-failed-stage FAILURE:STAGE] "
                          "[--retry-failed-stage-spv PATH] "
                          "[--dump-compute-resource N:BINDING PATH] "
@@ -2230,6 +2231,7 @@ int main(int argc, char** argv) {
     std::string probe_ngg_workgroup_s3_spec;
     bool probe_ngg_packed_offsets = false;
     bool probe_ngg_full_four_wave = false;
+    bool probe_ngg_native_wave64 = false;
     std::string retry_failed_stage_spv_path;
     std::string retry_failed_chain_spv_path;
     std::string list_resources_spec;   // #2373
@@ -2540,6 +2542,8 @@ int main(int argc, char** argv) {
             probe_ngg_packed_offsets = true;
         else if (std::string(argv[i]) == "--probe-ngg-full-four-wave")
             probe_ngg_full_four_wave = true;
+        else if (std::string(argv[i]) == "--probe-ngg-native-wave64")
+            probe_ngg_native_wave64 = true;
         else if (std::string(argv[i]) == "--retry-failed-stage" && i + 1 < argc)
             retry_failed_stage_spec = argv[++i];
         else if (std::string(argv[i]) == "--retry-failed-stage-spv") {
@@ -2567,6 +2571,11 @@ int main(int argc, char** argv) {
         std::fprintf(stderr,
                      "gpu_replay: --probe-ngg-full-four-wave requires a chain retry and "
                      "cannot combine with synthetic s3/offset probes\n");
+        return 2;
+    }
+    if (probe_ngg_native_wave64 && !probe_ngg_full_four_wave) {
+        std::fprintf(stderr,
+                     "gpu_replay: --probe-ngg-native-wave64 requires --probe-ngg-full-four-wave\n");
         return 2;
     }
     if (!retry_failed_chain_spv_path.empty() &&
@@ -2650,7 +2659,7 @@ int main(int argc, char** argv) {
             !compute_resource_spec.empty() || !post_compute_resource_spec.empty() ||
             require_post_change || expected_post_hash_set || !failed_shader_spec.empty() ||
             !retry_failed_chain_spec.empty() || !probe_ngg_workgroup_s3_spec.empty() ||
-            probe_ngg_full_four_wave ||
+            probe_ngg_full_four_wave || probe_ngg_native_wave64 ||
             // These three are read only AFTER the `return replay_bundle(...)` below, so a bundle
             // run that passed one used to execute the ordinary replay and exit 0 having silently
             // ignored it -- the void experiment the sibling guard below is careful to make loud.
@@ -3550,7 +3559,7 @@ int main(int argc, char** argv) {
                 resources, failure.vertex_count, provisional_s3,
                 {prosper::gpu::RecompileDiagnosticStage::Vertex, main_stage.program_addr},
                 probe_ngg_packed_offsets || probe_ngg_full_four_wave,
-                probe_ngg_full_four_wave);
+                probe_ngg_full_four_wave, probe_ngg_native_wave64);
         } else {
             spirv = prosper::gpu::recompile_vertex_chain(
                 prolog.words.data(), prolog.words.size(), main.words.data(), main.words.size(),
@@ -3574,8 +3583,10 @@ int main(int argc, char** argv) {
         if (probe_ngg_full_four_wave)
             std::fprintf(stderr,
                          "[ngg-workgroup-probe] COMPILE ONLY, not a raster/ABI proof; "
-                         "full-four-wave=1 s3=unbound-launch-input linked-dwords=%zu result=%s\n",
-                         linked_dwords, spirv.empty() ? "rejected" : "module-emitted");
+                         "full-four-wave=1 native-wave64=%d s3=unbound-launch-input "
+                         "linked-dwords=%zu result=%s\n",
+                         probe_ngg_native_wave64, linked_dwords,
+                         spirv.empty() ? "rejected" : "module-emitted");
         else if (!probe_ngg_workgroup_s3_spec.empty())
             std::fprintf(stderr,
                          "[ngg-workgroup-probe] COMPILE ONLY, not a raster/ABI proof; "
