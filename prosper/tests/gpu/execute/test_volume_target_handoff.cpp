@@ -41,7 +41,8 @@ int main() {
             ctx.phys, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_TYPE_3D,
             VK_IMAGE_TILING_OPTIMAL, usage, VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT,
             &format_properties) != VK_SUCCESS ||
-        ctx.mesh_shader_properties.maxMeshOutputLayers < kDepth) return 77;
+        ctx.mesh_shader_properties.maxMeshOutputLayers < 8 ||
+        format_properties.maxExtent.depth < 32) return 77;
 
     const std::vector<uint32_t> mesh_shader(
         std::begin(prosper::test::volume_fixture::mesh),
@@ -268,8 +269,7 @@ int main() {
     // four bounded attachment views. This verifies the backend's range handoff; it does not
     // establish a guest merged-NGG primitive/layer partition.
     constexpr uint32_t large_depth = 32, partition = 8;
-    if (ctx.mesh_shader_properties.maxMeshOutputLayers >= partition &&
-        format_properties.maxExtent.depth >= large_depth) {
+    {
         constexpr uint64_t large_id = kTarget + 0x900000u;
         VkImage large_image = VK_NULL_HANDLE;
         for (uint32_t group = 0; group < large_depth / partition; ++group) {
