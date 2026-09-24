@@ -282,6 +282,20 @@ int main() {
     CHECK(realized_draw.instance_count == 4,
           "draw realization retains the folded hardware instance count");
     {
+        GpuState volume = st;
+        volume.cx[P::CB_COLOR0_VIEW] = 0x00040000u;
+        volume.cx[P::CB_COLOR0_ATTRIB3] = 0x4606c01fu;
+        DrawItem volume_draw;
+        const bool made = realize_draw_item(volume, &volume.draws[0],
+                                            volume.draws[0].index_count, 0x10000u,
+                                            false, volume_draw);
+        CHECK(made && volume_draw.color_targets[0].volume_depth == 32u &&
+                  volume_draw.color_targets[0].first_slice == 0u &&
+                  volume_draw.color_targets[0].slice_count == 32u &&
+                  volume_draw.color_targets[0].programmed_slice_max == 32u,
+              "realized draw carries Kena's bounded 3D view and its distinct raw maximum");
+    }
+    {
         // The live draw path must acquire one exact fragment version and share it across metadata
         // and compilation, then acquire again for the next draw. Besides detecting a stale
         // address-only shortcut, the acquisition count distinguishes the production fast path from
@@ -2180,6 +2194,9 @@ int main() {
             no_program.sh[P::SPI_SHADER_PGM_HI_PS] = 0;
             no_program.sh[P::SPI_SHADER_PGM_LO_ES] = 0;
             no_program.sh[P::SPI_SHADER_PGM_HI_ES] = 0;
+            no_program.cx[P::CB_COLOR0_BASE] = 0x001000u;
+            no_program.cx[P::CB_COLOR0_VIEW] = 0x00040000u;
+            no_program.cx[P::CB_COLOR0_ATTRIB3] = 0x4606c01fu;
             GpuState::Draw plain;
             plain.index_count = 3;
             plain.command_order = 310;
@@ -2206,6 +2223,12 @@ int main() {
                   "#1636: ...and forwards realize_draw_item's specific reason rather than Unknown");
             CHECK(read && reason == RealizationFailureReason::MissingProgram,
                   "#1636: an unbound shader program records reason=missing-program");
+            CHECK(read && captured.failure_diagnostics.size() == 1u &&
+                      captured.failure_diagnostics[0].color_targets[0].volume_depth == 32u &&
+                      captured.failure_diagnostics[0].color_targets[0].first_slice == 0u &&
+                      captured.failure_diagnostics[0].color_targets[0].slice_count == 32u &&
+                      captured.failure_diagnostics[0].color_targets[0].programmed_slice_max == 32u,
+                  "failed draw retains its bounded 3D target shape through capture");
         }
 
         // (c) The new reasons must have names, or gpu_replay --inspect-only prints "unknown" for them

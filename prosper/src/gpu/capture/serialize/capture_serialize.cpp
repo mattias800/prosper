@@ -1032,6 +1032,30 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
             write_mip_chain_provenance(stage.resource_table);
     // v58 tail: old failure records did not carry instance count, although realized draws did.
     for (const auto& diagnostic : c.failure_diagnostics) w.u32(diagnostic.instance_count);
+    // v59 keeps the allocation depth distinct from the renderable 3D color view. Every slot has
+    // a fixed-size record so failed producer draws can be inspected as well as realized draws.
+    auto write_volume_views = [&](const auto& bindings) {
+        for (const auto& binding : bindings) {
+            if ((!binding.volume_depth && (binding.first_slice || binding.slice_count ||
+                 binding.programmed_slice_max)) ||
+                (binding.volume_depth && (!binding.slice_count ||
+                 binding.first_slice >= binding.volume_depth ||
+                 binding.slice_count > binding.volume_depth - binding.first_slice ||
+                 binding.programmed_slice_max < binding.first_slice))) {
+                error = "invalid color-target volume view";
+                return false;
+            }
+            w.u32(binding.volume_depth);
+            w.u32(binding.first_slice);
+            w.u32(binding.slice_count);
+            w.u32(binding.programmed_slice_max);
+        }
+        return true;
+    };
+    for (const auto& draw : c.draws)
+        if (!write_volume_views(draw.color_targets)) return false;
+    for (const auto& diagnostic : c.failure_diagnostics)
+        if (!write_volume_views(diagnostic.color_targets)) return false;
     // Re-check the ceiling AFTER the final tail. The bound above was enforced before this tail
     // existed, so a capture sitting just under the maximum could serialize successfully into a file
     // that read_gpu_capture then rejects as oversized -- a write that reports success and produces

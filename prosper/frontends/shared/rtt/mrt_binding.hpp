@@ -50,13 +50,21 @@ namespace prosper::frontend {
 // named alias and answer with an empty binding; every caller in this header guards that.
 inline prosper::gpu::DrawItem::ColorTargetBinding mrt_named_color_alias(
     const prosper::gpu::DrawItem& draw, uint32_t slot) {
+    prosper::gpu::DrawItem::ColorTargetBinding named;
     if (slot == 0)
-        return prosper::gpu::DrawItem::ColorTargetBinding{
-            draw.color0_base, draw.color0_width, draw.color0_height};
-    if (slot == 1)
-        return prosper::gpu::DrawItem::ColorTargetBinding{
-            draw.color1_base, draw.color1_width, draw.color1_height};
-    return prosper::gpu::DrawItem::ColorTargetBinding{};
+        named = {draw.color0_base, draw.color0_width, draw.color0_height};
+    else if (slot == 1)
+        named = {draw.color1_base, draw.color1_width, draw.color1_height};
+    else
+        return named;
+    // The named fields remain authoritative for identity. Retain the array's volume shape only
+    // when it describes that same target; a divergent hand-built draw must not lend its shape to
+    // another address.
+    const auto& carried = draw.color_targets[slot];
+    if (carried.base == named.base && carried.width == named.width &&
+        carried.height == named.height)
+        return carried;
+    return named;
 }
 
 inline prosper::gpu::DrawItem::ColorTargetBinding mrt_color_binding(

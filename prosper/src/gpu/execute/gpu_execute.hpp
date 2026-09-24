@@ -127,6 +127,10 @@ struct DrawItem {
     struct ColorTargetBinding {
         uint64_t base = 0;
         uint32_t width = 0, height = 0;
+        // A zero depth means the capture/draw has no proven 3D attachment shape. These fields
+        // describe the allocation and the bounded, inclusive guest view independently.
+        uint32_t volume_depth = 0, first_slice = 0, slice_count = 0;
+        uint32_t programmed_slice_max = 0; // raw inclusive VIEW endpoint, even if out of range
     };
     std::array<ColorTargetBinding, kColorTargetCount> color_targets{};
     uint64_t draw_index = 0;
@@ -1728,14 +1732,23 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
         failure->color1_width = rs.color1_width;
         failure->color1_height = rs.color1_height;
         for (uint32_t slot = 0; slot < failure->color_targets.size(); ++slot) {
-            failure->color_targets[slot].base = rs.color_targets[slot].base;
-            failure->color_targets[slot].width = rs.color_targets[slot].width;
-            failure->color_targets[slot].height = rs.color_targets[slot].height;
+            auto& binding = failure->color_targets[slot];
+            binding.base = rs.color_targets[slot].base;
+            binding.width = rs.color_targets[slot].width;
+            binding.height = rs.color_targets[slot].height;
+            const auto volume = color_target_volume_view(rs.color_targets[slot]);
+            binding.volume_depth = volume.allocation_depth;
+            binding.first_slice = volume.first_slice;
+            binding.slice_count = volume.slice_count;
+            binding.programmed_slice_max = volume.slice_count
+                ? rs.color_targets[slot].slice_max : 0u;
         }
-        failure->color_targets[0] = {
-            failure->color0_base, failure->color0_width, failure->color0_height};
-        failure->color_targets[1] = {
-            failure->color1_base, failure->color1_width, failure->color1_height};
+        failure->color_targets[0].base = failure->color0_base;
+        failure->color_targets[0].width = failure->color0_width;
+        failure->color_targets[0].height = failure->color0_height;
+        failure->color_targets[1].base = failure->color1_base;
+        failure->color_targets[1].width = failure->color1_width;
+        failure->color_targets[1].height = failure->color1_height;
         failure->vertex_count = vcount_hint;
         failure->instance_count = draw ? draw->instance_count : ds.num_instances;
     }
@@ -2591,13 +2604,24 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     out.color1_base = rs.color1_base;
     out.color1_width = rs.color1_width; out.color1_height = rs.color1_height;
     for (uint32_t slot = 0; slot < out.color_targets.size(); ++slot) {
-        out.color_targets[slot].base = rs.color_targets[slot].base;
-        out.color_targets[slot].width = rs.color_targets[slot].width;
-        out.color_targets[slot].height = rs.color_targets[slot].height;
+        auto& binding = out.color_targets[slot];
+        binding.base = rs.color_targets[slot].base;
+        binding.width = rs.color_targets[slot].width;
+        binding.height = rs.color_targets[slot].height;
+        const auto volume = color_target_volume_view(rs.color_targets[slot]);
+        binding.volume_depth = volume.allocation_depth;
+        binding.first_slice = volume.first_slice;
+        binding.slice_count = volume.slice_count;
+        binding.programmed_slice_max = volume.slice_count
+            ? rs.color_targets[slot].slice_max : 0u;
     }
     // Preserve direct/synthetic callers that still populate only the named aliases.
-    out.color_targets[0] = {out.color0_base, out.color0_width, out.color0_height};
-    out.color_targets[1] = {out.color1_base, out.color1_width, out.color1_height};
+    out.color_targets[0].base = out.color0_base;
+    out.color_targets[0].width = out.color0_width;
+    out.color_targets[0].height = out.color0_height;
+    out.color_targets[1].base = out.color1_base;
+    out.color_targets[1].width = out.color1_width;
+    out.color_targets[1].height = out.color1_height;
     return true;
 }
 

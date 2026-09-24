@@ -393,10 +393,12 @@ bool capture_failure_diagnostics(
         diagnostic.color1_width = failure.color1_width;
         diagnostic.color1_height = failure.color1_height;
         diagnostic.color_targets = failure.color_targets;
-        diagnostic.color_targets[0] = {
-            diagnostic.color0_base, diagnostic.color0_width, diagnostic.color0_height};
-        diagnostic.color_targets[1] = {
-            diagnostic.color1_base, diagnostic.color1_width, diagnostic.color1_height};
+        diagnostic.color_targets[0].base = diagnostic.color0_base;
+        diagnostic.color_targets[0].width = diagnostic.color0_width;
+        diagnostic.color_targets[0].height = diagnostic.color0_height;
+        diagnostic.color_targets[1].base = diagnostic.color1_base;
+        diagnostic.color_targets[1].width = diagnostic.color1_width;
+        diagnostic.color_targets[1].height = diagnostic.color1_height;
         diagnostic.vertex_count = failure.vertex_count;
         diagnostic.instance_count = failure.instance_count;
         diagnostic.compute_launch = failure.compute_launch;
@@ -548,8 +550,12 @@ bool capture_submit_items(const std::vector<DrawItem>& draws,
         c.color1_base = d.color1_base;
         c.color1_width = d.color1_width; c.color1_height = d.color1_height;
         c.color_targets = d.color_targets;
-        c.color_targets[0] = {c.color0_base, c.color0_width, c.color0_height};
-        c.color_targets[1] = {c.color1_base, c.color1_width, c.color1_height};
+        c.color_targets[0].base = c.color0_base;
+        c.color_targets[0].width = c.color0_width;
+        c.color_targets[0].height = c.color0_height;
+        c.color_targets[1].base = c.color1_base;
+        c.color_targets[1].width = c.color1_width;
+        c.color_targets[1].height = c.color1_height;
         c.draw_index = d.draw_index; c.command_order = d.command_order;
         if (!capture_raw_shader_version(d.vs_guest_addr, reader, out, raw_shader_words,
                                         raw_shader_index_by_address,

@@ -1461,6 +1461,29 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
     if (version >= 58)
         for (auto& diagnostic : c.failure_diagnostics)
             if (!r.u32(diagnostic.instance_count)) return false;
+    if (version >= 59) {
+        auto read_volume_views = [&](auto& bindings) {
+            for (auto& binding : bindings) {
+                if (!r.u32(binding.volume_depth) || !r.u32(binding.first_slice) ||
+                    !r.u32(binding.slice_count) || !r.u32(binding.programmed_slice_max))
+                    return false;
+                if ((!binding.volume_depth && (binding.first_slice || binding.slice_count ||
+                     binding.programmed_slice_max)) ||
+                    (binding.volume_depth && (!binding.slice_count ||
+                     binding.first_slice >= binding.volume_depth ||
+                     binding.slice_count > binding.volume_depth - binding.first_slice ||
+                     binding.programmed_slice_max < binding.first_slice))) {
+                    error = "invalid color-target volume view";
+                    return false;
+                }
+            }
+            return true;
+        };
+        for (auto& draw : c.draws)
+            if (!read_volume_views(draw.color_targets)) return false;
+        for (auto& diagnostic : c.failure_diagnostics)
+            if (!read_volume_views(diagnostic.color_targets)) return false;
+    }
     // DS seed identity is checked HERE, not in the record loop, because the slice arrives in the
     // tail above: a per-record check would compare incomplete identities and reject two faces of one
     // cube that differ only in slice -- which is exactly the capture this version exists to allow.
