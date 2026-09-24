@@ -787,7 +787,10 @@ public:
                      "complete_population=%u resource_phase_reached=%u "
                      "skipped_draws=%llu "
                      "unknown_rows=%llu evictions=%llu min_draws=%llu considered=%llu "
-                     "below_threshold=%llu budget_refused=%llu cap_calls=%u cap_rows=%zu\n",
+                     "below_threshold=%llu budget_refused=%llu cap_calls=%u cap_rows=%zu "
+                     "cache_before=%zu/%llu cache_after=%zu/%llu cache_limit=%llu "
+                     "retain_attempts=%llu retained=%llu duplicate=%llu "
+                     "refused_entries=%llu refused_bytes=%llu allocation_failed=%llu\n",
                      call_, draws_, rows_.size(), (unsigned long long)omitted_,
                      static_cast<unsigned>(complete_population),
                      static_cast<unsigned>(resource_phase_reached_),
@@ -796,7 +799,15 @@ public:
                      (unsigned long long)evictions_, (unsigned long long)min_draws_,
                      (unsigned long long)state().considered.load(),
                      (unsigned long long)state().below_threshold.load(),
-                     (unsigned long long)state().budget_refused.load(), kMaxCalls, kMaxRows);
+                     (unsigned long long)state().budget_refused.load(), kMaxCalls, kMaxRows,
+                     cache_before_entries_, (unsigned long long)cache_before_bytes_,
+                     cache_after_entries_, (unsigned long long)cache_after_bytes_,
+                     (unsigned long long)cache_limit_,
+                     (unsigned long long)retain_attempts_, (unsigned long long)retained_,
+                     (unsigned long long)duplicate_,
+                     (unsigned long long)refused_entries_,
+                     (unsigned long long)refused_bytes_,
+                     (unsigned long long)allocation_failed_);
         for (size_t i = 0; i < rows_.size(); ++i) {
             const auto& row = rows_[i];
             std::fprintf(stderr,
@@ -834,6 +845,26 @@ public:
     void reached_resource_phase_end() { resource_phase_reached_ = true; }
     void skipped_draw() { if (active()) ++skipped_draws_; }
     void evicted() { if (active()) ++evictions_; }
+    void cache_before(size_t entries, uint64_t bytes, uint64_t limit) {
+        if (!active()) return;
+        cache_before_entries_ = entries;
+        cache_before_bytes_ = bytes;
+        cache_limit_ = limit;
+    }
+    void cache_after(size_t entries, uint64_t bytes) {
+        if (!active()) return;
+        cache_after_entries_ = entries;
+        cache_after_bytes_ = bytes;
+    }
+    void retention_attempt() { if (active()) ++retain_attempts_; }
+    void retention_inserted() { if (active()) ++retained_; }
+    void retention_duplicate() { if (active()) ++duplicate_; }
+    void retention_refused(bool entries, bool bytes) {
+        if (!active()) return;
+        refused_entries_ += entries;
+        refused_bytes_ += bytes;
+    }
+    void retention_allocation_failed() { if (active()) ++allocation_failed_; }
 
 private:
     struct Config { bool valid = true; uint64_t min_draws = 1; };
@@ -866,6 +897,10 @@ private:
     std::vector<BackendTexturePathCensusRow> rows_;
     uint64_t omitted_ = 0, evictions_ = 0, skipped_draws_ = 0;
     uint64_t unknown_rows_ = 0;
+    size_t cache_before_entries_ = 0, cache_after_entries_ = 0;
+    uint64_t cache_before_bytes_ = 0, cache_after_bytes_ = 0, cache_limit_ = 0;
+    uint64_t retain_attempts_ = 0, retained_ = 0, duplicate_ = 0;
+    uint64_t refused_entries_ = 0, refused_bytes_ = 0, allocation_failed_ = 0;
     bool resource_phase_reached_ = false;
 };
 
@@ -8773,6 +8808,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     const bool persistent_textures_enabled =
         getenv("PROSPER_NO_BACKEND_PERSISTENT_TEXTURES") == nullptr;
     const VkDeviceSize persistent_texture_limit = persistent_texture_cache_limit();
+    texture_path_census.cache_before(persistent_texture_images.size(),
+                                     persistent_texture_bytes, persistent_texture_limit);
     const bool share_backend_resources =
         getenv("PROSPER_NO_BACKEND_RESOURCE_SHARE") == nullptr;
     const bool reuse_host_buffers = render_host_buffer_pool_enabled();
@@ -10801,6 +10838,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                         VK_SUCCESS)
                                     upload.direct_memory = true;
                                 if (!upload.memory) {
+                                    if (retain) texture_path_census.retention_allocation_failed();
                                     upload.persistent_id = 0;
                                     upload.memory = allocate_transient_render_memory(
                                         dev, tai.allocationSize, tai.memoryTypeIndex);
@@ -13233,6 +13271,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     for (auto& upload : texture_uploads) {
         if (!upload.direct_memory || !upload.persistent_id || upload.persistent_hit ||
             upload.persistent_refresh) continue;
+        texture_path_census.retention_attempt();
         const PersistentTextureKey key{upload.persistent_id, upload.key.width, upload.key.height,
                                        upload.key.depth, upload.key.img_dim,
                                        upload.key.sample_count, upload.key.mip_levels,
@@ -13249,6 +13288,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 key, PersistentTextureImage{upload.image, upload.memory, upload.image_bytes,
                                             texture_generation, upload.persistent_version, true});
             if (inserted) {
+                texture_path_census.retention_inserted();
                 active_submission.add_failure_cleanup([key]() {
                     auto found = persistent_texture_images.find(key);
                     if (found != persistent_texture_images.end())
@@ -13257,12 +13297,21 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 persistent_texture_bytes += upload.image_bytes;
                 upload.image = VK_NULL_HANDLE;
                 upload.memory = VK_NULL_HANDLE;
+            } else {
+                texture_path_census.retention_duplicate();
             }
+        } else {
+            texture_path_census.retention_refused(
+                persistent_texture_images.size() >= persistent_texture_max_entries,
+                upload.image_bytes > persistent_texture_limit ||
+                persistent_texture_bytes > persistent_texture_limit - upload.image_bytes);
         }
     }
     if (!avoid_cache_eviction)
         while (persistent_texture_bytes > persistent_texture_limit &&
                evict_persistent_texture()) {}
+    texture_path_census.cache_after(persistent_texture_images.size(),
+                                    persistent_texture_bytes);
     resource_reuse_stats.persistent_texture_binding_entries = persistent_texture_binding_entries;
     texture_stats.persistent_cached_bytes = persistent_texture_bytes;
 

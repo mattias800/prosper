@@ -440,11 +440,34 @@ int main() {
               "a discarded first versioned upload is rebuilt before reuse");
         prosper::test::invalidate_persistent_color_target(failed_target_id);
 
-        std::vector<uint8_t> first = prosper::test::render_draws_rgba({draw}, W, H);
+        std::vector<uint8_t> first;
+        if (path_census) {
+            const auto first_log = capture_stderr([&] {
+                prosper::frontend::ScopedInteractivePerformanceTiming timing(true);
+                first = prosper::test::render_draws_rgba({draw}, W, H);
+            });
+            CHECK(first_log.find("retain_attempts=1 retained=1 duplicate=0 "
+                                 "refused_entries=0 refused_bytes=0 allocation_failed=0") !=
+                      std::string::npos,
+                  "first persistent texture upload records successful backend retention");
+        } else {
+            first = prosper::test::render_draws_rgba({draw}, W, H);
+        }
         const auto first_stats = prosper::test::backend_texture_upload_stats();
         CHECK(prosper::test::backend_resource_reuse_stats().persistent_texture_binding_entries == 0,
               "publishing a new image does not count its transient first-use binding");
-        std::vector<uint8_t> reused = prosper::test::render_draws_rgba({draw}, W, H);
+        std::vector<uint8_t> reused;
+        if (path_census) {
+            const auto reused_log = capture_stderr([&] {
+                prosper::frontend::ScopedInteractivePerformanceTiming timing(true);
+                reused = prosper::test::render_draws_rgba({draw}, W, H);
+            });
+            CHECK(reused_log.find("path=persistent_hit") != std::string::npos &&
+                      reused_log.find("retain_attempts=0 retained=0") != std::string::npos,
+                  "retained texture reuse records a hit with no new allocation");
+        } else {
+            reused = prosper::test::render_draws_rgba({draw}, W, H);
+        }
         const auto reused_stats = prosper::test::backend_texture_upload_stats();
         const auto first_binding_stats = prosper::test::backend_resource_reuse_stats();
         std::vector<uint8_t> reused_again = prosper::test::render_draws_rgba({draw}, W, H);
