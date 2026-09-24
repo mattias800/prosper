@@ -1,6 +1,9 @@
 #version 460
 layout(location = 0) out vec4 color;
-#if defined(SAMPLE_VOLUME)
+#if defined(PARAM_COLOR)
+layout(location = 0) in vec4 layer_param;
+void main() { color = layer_param; }
+#elif defined(SAMPLE_VOLUME)
 layout(set = 1, binding = 4) uniform sampler3D source_volume;
 void main() {
     int slice = clamp(int(gl_FragCoord.x / 16.0), 0, 3);
