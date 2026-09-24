@@ -218,6 +218,65 @@ int main() {
               "CB_COLOR0_VIEW selects distinct reverse/tail-first mip target views");
     }
 
+    // Kena's 3D LUT target exposes a distinction the 2D path never needed: ATTRIB3 gives a
+    // 32-slice allocation, while VIEW names a raw max of 32. Preserve the discrepancy until the
+    // guest layer/export contract is known; deriving 32 or 33 layers here would hide it.
+    {
+        GpuState volume;
+        volume.cx[P::CB_COLOR0_VIEW] = 0x00040000u;
+        volume.cx[P::CB_COLOR0_ATTRIB3] = 0x4606c01fu;
+        const RenderState volume_render = extract_render_state(volume);
+        const ColorTargetState& target = volume_render.color_targets[0];
+        CHECK(target.has_view && target.has_attrib3 && target.slice_start == 0u &&
+                  target.slice_max == 32u && target.mip0_depth == 31u &&
+                  target.resource_type == 2u,
+              "3D color target retains distinct raw view maximum and allocation depth");
+        const ColorTargetVolumeView kena_view = color_target_volume_view(target);
+        CHECK(kena_view.allocation_depth == 32u && kena_view.first_slice == 0u &&
+                  kena_view.slice_count == 32u && kena_view.clipped_to_allocation,
+              "3D view clips Kena's inclusive maximum to its 32-slice allocation");
+        const RenderState absent_render = extract_render_state(GpuState{});
+        const ColorTargetState& absent = absent_render.color_targets[0];
+        CHECK(!absent.has_view && !absent.has_attrib3 &&
+                  color_target_volume_view(absent).slice_count == 0u,
+              "absent color view registers do not imply a programmed one-slice target");
+        ColorTargetState ordinary = target;
+        ordinary.mip0_depth = 7u;
+        ordinary.slice_start = 3u;
+        ordinary.slice_max = 6u;
+        const ColorTargetVolumeView subview = color_target_volume_view(ordinary);
+        CHECK(subview.allocation_depth == 8u && subview.first_slice == 3u &&
+                  subview.slice_count == 4u && !subview.clipped_to_allocation,
+              "a valid 3D subview keeps its inclusive guest slice range");
+        ordinary.slice_start = 8u;
+        CHECK(color_target_volume_view(ordinary).slice_count == 0u,
+              "a 3D view starting beyond its allocation declines");
+        ordinary.slice_start = 0u;
+        ordinary.slice_max = 31u;
+        ordinary.mip0_depth = 31u;
+        ordinary.mip_level = 2u;
+        CHECK(color_target_volume_view(ordinary).allocation_depth == 8u &&
+                  color_target_volume_view(ordinary).slice_count == 8u,
+              "3D view bounds slices to the selected mip's depth");
+        // ATTRIB3 is dense across MRT slots; VIEW uses the 0xf-register color slot stride.
+        volume.cx.erase(P::CB_COLOR0_VIEW);
+        volume.cx.erase(P::CB_COLOR0_ATTRIB3);
+        volume.cx[P::CB_COLOR0_VIEW + 0xfu] =
+            (5u << P::CB_COLOR0_VIEW_SLICE_START_SHIFT) |
+            (7u << P::CB_COLOR0_VIEW_SLICE_MAX_SHIFT);
+        volume.cx[P::CB_COLOR0_ATTRIB3 + 1u] =
+            (7u << P::CB_COLOR0_ATTRIB3_MIP0_DEPTH_SHIFT) |
+            (1u << P::CB_COLOR0_ATTRIB3_RESOURCE_TYPE_SHIFT);
+        const RenderState mrt = extract_render_state(volume);
+        CHECK(!mrt.color_targets[0].has_view && !mrt.color_targets[0].has_attrib3 &&
+                  mrt.color_targets[1].has_view && mrt.color_targets[1].has_attrib3 &&
+                  mrt.color_targets[1].slice_start == 5u &&
+                  mrt.color_targets[1].slice_max == 7u &&
+                  mrt.color_targets[1].mip0_depth == 7u &&
+                  mrt.color_targets[1].resource_type == 1u,
+              "MRT1 layered-view registers stay independent of absent MRT0 state");
+    }
+
     CHECK(rs.ps_addr == rdna2_addr(0x00ABCDEFu, 0x12u), "PS shader addr = (LO<<8)|(HI<<40)");
     CHECK(rs.es_addr == rdna2_addr(0x00111111u, 0x34u), "ES shader addr = (LO<<8)|(HI<<40)");
     CHECK(rs.gs_addr == 0 && rs.hs_addr == 0, "unset GS/HS shader addrs are 0");
