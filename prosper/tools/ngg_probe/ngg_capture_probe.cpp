@@ -209,11 +209,9 @@ int main(int argc, char** argv) {
     }
     const bool full_launch = !full_inputs_path.empty();
     if (full_launch &&
-        (!exact_probe_local_size(module, 256u) || !exact_native_wave64_marker(module) ||
-         !prosper::test::default_compute_required_subgroup_supported(64u, 256u))) {
+        (!exact_probe_local_size(module, 256u) || !exact_native_wave64_marker(module))) {
         std::fprintf(stderr,
-                     "ngg_capture_probe: full launch requires a 256x1x1 native-Wave64 probe "
-                     "module and supported exact 64-lane full subgroups\n");
+                     "ngg_capture_probe: full launch requires a 256x1x1 native-Wave64 probe module\n");
         return 2;
     }
     if (!full_launch &&
@@ -250,6 +248,12 @@ int main(int argc, char** argv) {
                     return 2;
                 }
         }
+    }
+    if (full_launch &&
+        !prosper::test::default_compute_required_subgroup_supported(64u, 256u)) {
+        std::fprintf(stderr,
+                     "ngg_capture_probe: full launch requires supported exact 64-lane full subgroups\n");
+        return 2;
     }
     prosper::gpu::GpuCaptureFile capture;
     std::string error;

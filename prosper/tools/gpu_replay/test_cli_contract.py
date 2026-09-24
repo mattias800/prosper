@@ -289,6 +289,57 @@ with tempfile.TemporaryDirectory(prefix="gpu-replay-retry-") as scratch:
                   b"Prosper.NggProbeExactSubgroup=64" in native_output.read_bytes() and
                   native_output.read_bytes() != full_output.read_bytes(),
                   "native Wave64 selector compiles a distinct full-workgroup module")
+            capture_probe = os.environ.get("PROSPER_NGG_CAPTURE_PROBE_BIN")
+            if capture_probe:
+                check(os.path.exists(capture_probe),
+                      "captured-input probe binary is available")
+                if os.path.exists(capture_probe) and native_output.exists():
+                    absent_capture = str(directory / "absent.prgcap")
+                    probe_output = directory / "unexpected-probe-output.bin"
+                    valid_inputs = directory / "full-inputs.bin"
+                    valid_inputs.write_bytes(bytes(256 * 10 * 4))
+
+                    def run_full_probe(module, inputs):
+                        return subprocess.run(
+                            [capture_probe, absent_capture, "0", str(module),
+                             str(probe_output), "--full-inputs=" + str(inputs)],
+                            capture_output=True, text=True, timeout=30)
+
+                    short_inputs = directory / "short-inputs.bin"
+                    short_inputs.write_bytes(valid_inputs.read_bytes()[:-4])
+                    long_inputs = directory / "long-inputs.bin"
+                    long_inputs.write_bytes(valid_inputs.read_bytes() + bytes(4))
+                    for malformed in (short_inputs, long_inputs):
+                        refused = run_full_probe(native_output, malformed)
+                        check(refused.returncode == 2 and
+                              "requires exactly 10240 bytes" in refused.stderr and
+                              "capture:" not in refused.stderr and
+                              not probe_output.exists(),
+                              "full launch rejects " + malformed.name + " before loading capture")
+                    nonuniform_inputs = directory / "nonuniform-inputs.bin"
+                    nonuniform = bytearray(valid_inputs.read_bytes())
+                    nonuniform[(10 + 9) * 4] = 1  # lane 1, s3, wave 0
+                    nonuniform_inputs.write_bytes(nonuniform)
+                    refused = run_full_probe(native_output, nonuniform_inputs)
+                    check(refused.returncode == 2 and
+                          "s3 must be uniform within guest wave 0" in refused.stderr and
+                          "capture:" not in refused.stderr and
+                          not probe_output.exists(),
+                          "full launch rejects one-lane s3 mutation before loading capture")
+                    wrong_module = run_full_probe(full_output, valid_inputs)
+                    check(wrong_module.returncode == 2 and
+                          "requires a 256x1x1 native-Wave64 probe module" in wrong_module.stderr and
+                          "capture:" not in wrong_module.stderr and
+                          not probe_output.exists(),
+                          "full launch rejects an unmarked 256-lane module")
+                    valid_shape = run_full_probe(native_output, valid_inputs)
+                    check(valid_shape.returncode == 2 and
+                          ("requires supported exact 64-lane full subgroups" in valid_shape.stderr or
+                           "capture:" in valid_shape.stderr) and
+                          "requires exactly" not in valid_shape.stderr and
+                          "s3 must be uniform" not in valid_shape.stderr and
+                          not probe_output.exists(),
+                          "full launch accepts the input shape before device or capture refusal")
             rejected_export = run_result(["--retry-failed-chain", "0",
                                           "--retry-failed-chain-spv", str(chain_output),
                                           str(directory / "rejected-chain.prgcap")])
