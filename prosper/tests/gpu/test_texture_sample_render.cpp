@@ -66,7 +66,10 @@ template<class Action> static std::string capture_stderr(Action action) {
     return text;
 }
 
-int main() {
+int main(int argc, char** argv) {
+    const bool pressure_fixture = argc == 2 &&
+        std::strcmp(argv[1], "--cache-pressure") == 0;
+    if (argc != 1 && !pressure_fixture) return 2;
     printf("== test_texture_sample_render ==\n");
     {
         prosper::test::BackendDraw a, b;
@@ -84,7 +87,7 @@ int main() {
                   std::span<const prosper::test::BackendDraw>(&a, 1)) == 0,
               "direct and replay draws have no live submit provenance");
     }
-    if (std::getenv("PROSPER_BACKEND_TEXTURE_CACHE_MB")) {
+    if (!pressure_fixture && std::getenv("PROSPER_BACKEND_TEXTURE_CACHE_MB")) {
         std::fprintf(stderr, "texture sample test requires PROSPER_BACKEND_TEXTURE_CACHE_MB absent\n");
         return 2;
     }
@@ -176,6 +179,77 @@ int main() {
         255,0,0,255,   0,255,0,255,
         0,0,255,255,   255,255,255,255,
     };
+    if (pressure_fixture) {
+        CHECK(std::getenv("PROSPER_BACKEND_TEXTURE_CACHE_MB") &&
+                  std::strcmp(std::getenv("PROSPER_BACKEND_TEXTURE_CACHE_MB"), "2") == 0,
+              "pressure fixture uses a two MiB backend image budget");
+        const bool expect_flush =
+            std::getenv("PROSPER_BACKEND_TEXTURE_PRESSURE_FLUSH") != nullptr;
+        constexpr uint32_t TW = 768, TH = 512;
+        std::vector<uint8_t> red(size_t(TW) * TH * 4, 0);
+        std::vector<uint8_t> green(red.size(), 0);
+        for (size_t i = 0; i < red.size(); i += 4) {
+            red[i] = red[i + 3] = green[i + 1] = green[i + 3] = 255;
+        }
+        auto words = std::vector<uint32_t>(ps_template,
+            ps_template + sizeof(ps_template) / sizeof(ps_template[0]));
+        const auto frag = recompile_fragment(words.data(), words.size(), &rt);
+        CHECK(!frag.empty(), "pressure fixture fragment shader compiles");
+        prosper::test::FrameResource a;
+        a.binding = 4; a.set = 1; a.tw = TW; a.th = TH;
+        a.tex_rgba = red.data(); a.tex_byte_size = red.size();
+        a.persistent_texture_id = 0x7020000000000101ull;
+        a.persistent_texture_version = 1;
+        auto b = a;
+        b.tex_rgba = green.data();
+        b.persistent_texture_id++;
+        prosper::test::BackendDraw draw_a, draw_b;
+        draw_a.vs = draw_b.vs = vert;
+        draw_a.fs = draw_b.fs = frag;
+        draw_a.vcount = draw_b.vcount = 3;
+        draw_a.R = {a}; draw_b.R = {b};
+        const auto warm = prosper::test::render_draws_rgba({draw_a}, W, H);
+        CHECK(warm.size() == size_t(W) * H * 4 &&
+                  warm[(size_t(H / 2) * W + W / 2) * 4] == 255,
+              "first image is rendered and retained before the pending batch");
+        prosper::test::BackendSubmissionBatch batch;
+        prosper::test::BackendColorTarget target{0x7020000000000201ull, false, false};
+        const auto pending_a = prosper::test::render_draws_rgba(
+            {draw_a}, W, H, nullptr, nullptr, false, &target,
+            nullptr, nullptr, nullptr, &batch, false);
+        CHECK(pending_a.empty() && batch.pending(),
+              "first batched pass holds a live command using the resident image");
+        const auto pressure_log = capture_stderr([&] {
+            (void)prosper::test::render_draws_rgba(
+                {draw_b}, W, H, nullptr, nullptr, false, &target,
+                nullptr, nullptr, nullptr, &batch, false);
+        });
+        CHECK(batch.pending() &&
+                  (pressure_log.find("[texture-cache-pressure] completed") !=
+                       std::string::npos) == expect_flush,
+              "pressure control changes only the selective batch completion");
+        const auto pressure_timing = prosper::test::backend_render_timing_stats();
+        CHECK(pressure_timing.flush_cache_pressure == uint64_t(expect_flush) &&
+                  pressure_timing.queue_submits == uint64_t(expect_flush) &&
+                  pressure_timing.fence_waits == uint64_t(expect_flush) &&
+                  (!expect_flush || pressure_timing.cache_pressure_ms > 0.0),
+              "timing includes the selective submission and its nested wait");
+        const auto& context = prosper::test::render_vk_ctx();
+        const auto result = batch.submit_and_wait(context.dev, context.queue, false);
+        CHECK(result.submit_result == VK_SUCCESS && result.wait_result == VK_SUCCESS,
+              "remaining texture consumer commands complete successfully");
+        batch.complete();
+        const auto second = prosper::test::render_draws_rgba({draw_b}, W, H);
+        const auto stats = prosper::test::backend_texture_upload_stats();
+        const size_t center = (size_t(H / 2) * W + W / 2) * 4;
+        CHECK(second.size() == size_t(W) * H * 4 && second[center] == 0 &&
+                  second[center + 1] == 255,
+              "texture B remains green after the batch and subsequent reuse");
+        CHECK((stats.persistent_hits == 1 && stats.unique_uploads == 0) == expect_flush &&
+                  (stats.persistent_misses == 1 && stats.unique_uploads == 1) != expect_flush,
+              "completed pressure flush retains B while the control repeats its upload");
+        return fails ? 1 : 0;
+    }
     prosper::test::TexDesc td{ /*binding*/4, /*w*/2, /*h*/2, texels };
 
     auto sample_center = [&](uint32_t u_bits, uint32_t v_bits, uint8_t out_rgb[3]) -> bool {

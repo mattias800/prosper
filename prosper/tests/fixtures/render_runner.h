@@ -1308,6 +1308,9 @@ struct BackendRenderTimingStats {
     uint64_t flush_readback = 0;
     uint64_t flush_storage_writeback = 0;
     uint64_t flush_explicit = 0;
+    uint64_t flush_cache_pressure = 0;
+    // Nested inside draw_setup_ms: a completed earlier batch permits safe texture eviction.
+    double cache_pressure_ms = 0;
     uint64_t gpu_timestamp_samples = 0;
     double target_ms = 0;
     double draw_setup_ms = 0;
@@ -7391,8 +7394,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     BackendSubmissionBatch direct_submission;
     BackendSubmissionBatch& active_submission = submission_batch
         ? *submission_batch : direct_submission;
-    const bool avoid_cache_eviction = active_submission.pending() ||
-                                      backend_has_unproven_submission();
+    bool avoid_cache_eviction = active_submission.pending() ||
+                                backend_has_unproven_submission();
     const bool persistent_color_targets_enabled =
         getenv("PROSPER_NO_BACKEND_PERSISTENT_COLOR_TARGETS") == nullptr;
     const bool persistent_color_enabled = persistent_color_targets_enabled && color_target &&
@@ -8810,6 +8813,61 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     const VkDeviceSize persistent_texture_limit = persistent_texture_cache_limit();
     texture_path_census.cache_before(persistent_texture_images.size(),
                                      persistent_texture_bytes, persistent_texture_limit);
+    BackendSubmissionBatchResult pressure_batch_result;
+    double pressure_flush_ms = 0;
+    // An ordered backend batch may have filled the resident image budget in earlier passes.
+    // Eviction must not release images those pending commands still read, so later hot images
+    // otherwise become temporary uploads on every frame. At substantial pressure, a sizeable
+    // exact-identity miss justifies completing the earlier commands once before recording this
+    // pass. The existing LRU policy can then replace idle images safely. This is an opt-in
+    // control until cross-title timing and visuals establish the net cost of the extra fence.
+    if (PROSPER_ENV_ON("PROSPER_BACKEND_TEXTURE_PRESSURE_FLUSH") &&
+        persistent_textures_enabled && submission_batch && active_submission.pending() &&
+        !backend_has_unproven_submission() && persistent_texture_limit &&
+        persistent_texture_bytes >= persistent_texture_limit - persistent_texture_limit / 4) {
+        std::unordered_set<uint64_t> resident_ids;
+        resident_ids.reserve(persistent_texture_images.size());
+        for (const auto& [key, image] : persistent_texture_images)
+            if (image.content_valid) resident_ids.insert(key.id);
+        constexpr uint64_t min_miss_bytes = 1024ull * 1024ull;
+        bool sizeable_miss = false;
+        for (const BackendDraw& draw : draws) {
+            for (const FrameResource& resource : draw.R) {
+                if (!resource.persistent_texture_id || !resource.tex_rgba ||
+                    resource.is_storage_image || resource.persistent_render_target_id ||
+                    resource.persistent_depth_target_id || resource.borrowed_compute_image ||
+                    resident_ids.contains(resource.persistent_texture_id)) continue;
+                const uint64_t bpp = backend_color_bytes_per_pixel(resource.texture_format);
+                const uint64_t texels = uint64_t(resource.tw) * resource.th;
+                if (bpp && texels >= min_miss_bytes / bpp) {
+                    sizeable_miss = true;
+                    break;
+                }
+            }
+            if (sizeable_miss) break;
+        }
+        if (sizeable_miss) {
+            const auto flush_begin = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
+            pressure_batch_result = active_submission.submit_and_wait(
+                dev, queue, PROSPER_ENV_ON("PROSPER_BACKEND_TRACE"));
+            if (timing_enabled)
+                pressure_flush_ms = std::chrono::duration<double, std::milli>(
+                    TimingClock::now() - flush_begin).count();
+            if (pressure_batch_result.submit_result != VK_SUCCESS ||
+                pressure_batch_result.wait_result != VK_SUCCESS) return out;
+            avoid_cache_eviction = false;
+            static std::atomic<uint64_t> pressure_flushes{0};
+            const uint64_t count = pressure_flushes.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (count <= 16 || (count & (count - 1)) == 0)
+                std::fprintf(stderr,
+                             "[texture-cache-pressure] completed earlier backend commands "
+                             "count=%llu resident=%llu/%llu bytes entries=%zu\n",
+                             (unsigned long long)count,
+                             (unsigned long long)persistent_texture_bytes,
+                             (unsigned long long)persistent_texture_limit,
+                             persistent_texture_images.size());
+        }
+    }
     const bool share_backend_resources =
         getenv("PROSPER_NO_BACKEND_RESOURCE_SHARE") == nullptr;
     const bool reuse_host_buffers = render_host_buffer_pool_enabled();
@@ -14016,19 +14074,25 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         BackendRenderTimingStats& call_timing = backend_render_timing_stats_storage();
         call_timing.calls = 1;
         call_timing.draws = draws.size();
-        call_timing.command_buffers = batch_result.command_buffers;
-        call_timing.queue_submits = batch_result.queue_submits;
+        call_timing.command_buffers = pressure_batch_result.command_buffers +
+                                      batch_result.command_buffers;
+        call_timing.queue_submits = pressure_batch_result.queue_submits +
+                                    batch_result.queue_submits;
         call_timing.flush_no_batch = flush_reason_no_batch;
         call_timing.flush_readback = flush_reason_readback;
         call_timing.flush_storage_writeback = flush_reason_storage;
         call_timing.flush_explicit = flush_reason_explicit;
-        call_timing.fence_waits = batch_result.fence_waits;
-        call_timing.gpu_timestamp_samples = batch_result.gpu_timestamp_samples;
+        call_timing.flush_cache_pressure = pressure_batch_result.queue_submits;
+        call_timing.cache_pressure_ms = pressure_flush_ms;
+        call_timing.fence_waits = pressure_batch_result.fence_waits + batch_result.fence_waits;
+        call_timing.gpu_timestamp_samples = pressure_batch_result.gpu_timestamp_samples +
+                                            batch_result.gpu_timestamp_samples;
         call_timing.target_ms = ms(timing_start, timing_target_ready);
         call_timing.draw_setup_ms = ms(timing_target_ready, timing_draws_ready);
         call_timing.record_upload_ms = ms(timing_draws_ready, timing_recorded);
         call_timing.gpu_wait_ms = ms(timing_recorded, timing_gpu_done);
-        call_timing.gpu_device_ms = batch_result.gpu_device_ms;
+        call_timing.gpu_device_ms = pressure_batch_result.gpu_device_ms +
+                                     batch_result.gpu_device_ms;
         call_timing.readback_ms = ms(timing_gpu_done, timing_readback_done);
         call_timing.cleanup_ms = ms(timing_readback_done, timing_done);
         call_timing.setup_shader_ms = setup_shader_ms;
@@ -14062,6 +14126,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         struct TimingTotals {
             uint64_t calls = 0, draws = 0;
             uint64_t command_buffers = 0, queue_submits = 0, fence_waits = 0;
+            uint64_t cache_pressure_flushes = 0;
+            double cache_pressure_ms = 0;
             uint64_t gpu_timestamp_samples = 0;
             uint64_t texture_references = 0, texture_uploads = 0, texture_upload_bytes = 0;
             uint64_t persistent_hits = 0, persistent_misses = 0, persistent_cached_bytes = 0;
@@ -14083,6 +14149,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             timing.command_buffers += call_timing.command_buffers;
             timing.queue_submits += call_timing.queue_submits;
             timing.fence_waits += call_timing.fence_waits;
+            timing.cache_pressure_flushes += call_timing.flush_cache_pressure;
+            timing.cache_pressure_ms += call_timing.cache_pressure_ms;
             timing.gpu_timestamp_samples += call_timing.gpu_timestamp_samples;
             timing.texture_references += texture_stats.references;
             timing.texture_uploads += texture_stats.unique_uploads;
@@ -14137,11 +14205,13 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                     totals.readback / n, totals.cleanup / n);
             fprintf(stderr,
                     "[render-timing] backend synchronization command_buffers=%llu queue_submits=%llu "
-                    "fence_waits=%llu gpu_timestamps=%llu\n",
+                    "fence_waits=%llu gpu_timestamps=%llu cache_pressure=%llu %.2f ms\n",
                     (unsigned long long)totals.command_buffers,
                     (unsigned long long)totals.queue_submits,
                     (unsigned long long)totals.fence_waits,
-                    (unsigned long long)totals.gpu_timestamp_samples);
+                    (unsigned long long)totals.gpu_timestamp_samples,
+                    (unsigned long long)totals.cache_pressure_flushes,
+                    totals.cache_pressure_ms);
             fprintf(stderr,
                     "[render-timing] draw_setup avg_ms: shaders=%.2f fixed=%.2f resources=%.2f pipeline=%.2f\n",
                     totals.setup_shader / n, totals.setup_fixed / n,
@@ -14195,9 +14265,10 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                     window.readback / wn, window.cleanup / wn);
             fprintf(stderr,
                     "[render-window] backend synchronization command_buffers=%.1f queue_submits=%.1f "
-                    "fence_waits=%.1f gpu_timestamps=%.1f\n",
+                    "fence_waits=%.1f gpu_timestamps=%.1f cache_pressure=%.1f %.2f ms\n",
                     window.command_buffers / wn, window.queue_submits / wn,
-                    window.fence_waits / wn, window.gpu_timestamp_samples / wn);
+                    window.fence_waits / wn, window.gpu_timestamp_samples / wn,
+                    window.cache_pressure_flushes / wn, window.cache_pressure_ms / wn);
             fprintf(stderr,
                     "[render-window] draw_setup avg_ms: shaders=%.2f fixed=%.2f resources=%.2f pipeline=%.2f\n",
                     window.setup_shader / wn, window.setup_fixed / wn,
@@ -14485,6 +14556,8 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
             PROSPER_SUM_TIMING_STAT(command_buffers);
             PROSPER_SUM_TIMING_STAT(queue_submits);
             PROSPER_SUM_TIMING_STAT(fence_waits);
+            PROSPER_SUM_TIMING_STAT(flush_cache_pressure);
+            PROSPER_SUM_TIMING_STAT(cache_pressure_ms);
             PROSPER_SUM_TIMING_STAT(gpu_timestamp_samples);
             PROSPER_SUM_TIMING_STAT(target_ms);
             PROSPER_SUM_TIMING_STAT(draw_setup_ms);
