@@ -3794,10 +3794,11 @@ int main(int argc, char** argv) {
                     : prosper::gpu::FragmentInterpolationLayout{};
                 std::fprintf(stderr,
                              "[retry-failed-stage] fragment-abi=%s pixel-inputs=%u "
-                             "system-inputs=%u wave=%u\n",
+                             "system-inputs=%u wave=%s\n",
                              failure.fragment_retry_config_available ? "captured" : "unknown/defaults",
                              pixel_inputs ? 1u : 0u, system_inputs ? 1u : 0u,
-                             failure.fragment_retry_config_available && failure.ps_wave32 ? 32u : 64u);
+                             !failure.fragment_retry_config_available ? "unknown(default=64)" :
+                                 (failure.ps_wave32 ? "32" : "64"));
                 // Preserve the real program address in rejection diagnostics and deduplication.
                 spirv = prosper::gpu::recompile_fragment(
                     raw.words.data(), raw.words.size(), resources,

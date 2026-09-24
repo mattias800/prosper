@@ -475,7 +475,8 @@ with tempfile.TemporaryDirectory(prefix="gpu-replay-retry-") as scratch:
             legacy_fragment = run_result([
                 "--retry-failed-stage", "0:0", str(directory / "fragment-v60.prgcap")])
             check(legacy_fragment.returncode == 1 and
-                  "fragment-abi=unknown/defaults" in legacy_fragment.stderr,
+                  "fragment-abi=unknown/defaults" in legacy_fragment.stderr and
+                  "wave=unknown(default=64)" in legacy_fragment.stderr,
                   "v60 failed fragment remains readable and reports its unknown ABI")
             exact_interp = run_result([
                 "--retry-failed-stage", "0:0", "--retry-failed-stage-spv", str(output),
