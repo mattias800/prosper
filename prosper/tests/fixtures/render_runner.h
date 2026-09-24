@@ -1762,7 +1762,9 @@ inline const RenderVkCtx& render_vk_ctx() {
             r.cmd_draw_mesh_tasks = reinterpret_cast<PFN_vkCmdDrawMeshTasksEXT>(
                 vkGetDeviceProcAddr(r.dev, "vkCmdDrawMeshTasksEXT"));
             r.mesh_shader_enabled = r.cmd_draw_mesh_tasks != nullptr;
-            if (PROSPER_ENV_ON("PROSPER_GFXLOG")) {
+            // This device-init diagnostic is outside the hot path. Keep the read live because
+            // tests arm GFXLOG after other backend entry points have already run.
+            if (getenv("PROSPER_GFXLOG")) {
                 std::fprintf(stderr,
                     "[vk] mesh shader %s: invocations=%u shared=%u outputs=%u/%u layers=%u\n",
                     r.mesh_shader_enabled ? "ENABLED" : "entry point missing",
