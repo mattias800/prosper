@@ -998,6 +998,13 @@ struct OperationRealizationFailure {
     std::array<DrawItem::ColorTargetBinding, kColorTargetCount> color_targets{};
     uint32_t vertex_count = 0;
     uint32_t instance_count = 0; // zero means unavailable to capture diagnostics
+    // Exact arguments of a graphics vertex retry. Early failures leave this unavailable rather
+    // than letting offline replay silently substitute a zero LDS allocation or empty PS mapping.
+    bool vertex_retry_config_available = false;
+    uint32_t vertex_lds_dwords = 0;
+    PixelInputMapping pixel_inputs{};
+    bool has_pixel_inputs = false;
+    bool capture_vertex_position = false;
     ComputeLaunchDimensions compute_launch;
     std::vector<ShaderRealizationDiagnostic> stages;
 };
@@ -2058,6 +2065,13 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     const bool capture_vertex_position = PROSPER_ENV_ON("PROSPER_GEOM_PROBE") &&
                                          !interpolation.requires_geometry &&
                                          !rect_list_synthesis;
+    if (failure) {
+        failure->vertex_retry_config_available = true;
+        failure->vertex_lds_dwords = vertex_lds_dwords;
+        failure->has_pixel_inputs = pixel_input_ptr != nullptr;
+        if (pixel_input_ptr) failure->pixel_inputs = *pixel_input_ptr;
+        failure->capture_vertex_position = capture_vertex_position;
+    }
     uint64_t vs_identity = 0, fs_identity = 0;
     SharedShaderWords vs_shared, fs_shared;
     std::vector<uint32_t> vs, fs;

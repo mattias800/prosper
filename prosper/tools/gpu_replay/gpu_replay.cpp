@@ -3441,23 +3441,35 @@ int main(int argc, char** argv) {
         table.resources.reserve(prolog_stage.resource_table.resources.size());
         for (const auto& captured : prolog_stage.resource_table.resources)
             table.resources.push_back(captured.resource);
+        // build_stage_table installed the draw's vertex count in the vertex table before the
+        // live chain compile. The captured table serializes descriptors only; reconstruct this
+        // non-descriptor compile argument from the failed draw's own packet count.
+        table.vertices_per_instance = failure.vertex_count;
         const auto& prolog = replay.raw_shader_versions[prolog_stage.raw_shader_index];
         const auto& main = replay.raw_shader_versions[main_stage.raw_shader_index];
         const prosper::gpu::ShaderResourceTable* resources =
             prolog_stage.resource_table.present ? &table : nullptr;
+        const bool exact = failure.vertex_retry_config_available;
+        const prosper::gpu::PixelInputMapping* pixel_inputs =
+            exact && failure.has_pixel_inputs ? &failure.pixel_inputs : nullptr;
         const std::vector<uint32_t> spirv = prosper::gpu::recompile_vertex_chain(
             prolog.words.data(), prolog.words.size(), main.words.data(), main.words.size(),
-            resources, /*pixel_inputs=*/nullptr, /*capture_position=*/false,
-            /*virtual_lds_dwords=*/0,
+            resources, pixel_inputs, exact && failure.capture_vertex_position,
+            exact ? failure.vertex_lds_dwords : 0u,
             {prosper::gpu::RecompileDiagnosticStage::Vertex, main_stage.program_addr});
         const std::string reason = spirv.empty()
             ? prosper::gpu::last_terminal_reject_reason(main_stage.program_addr) : "";
         std::fprintf(stderr,
-                     "[retry-failed-chain] %s %s resources=%zu spirv-dwords=%zu "
-                     "config=defaults reason=%s\n",
+                     "[retry-failed-chain] %s %s resources=%zu vertices=%u spirv-dwords=%zu "
+                     "config=%s lds=%u pixel-inputs=%d capture-position=%d reason=%s\n",
                      retry_failed_chain_spec.c_str(),
                      spirv.empty() ? "rejected" : "recompiled", table.resources.size(),
-                     spirv.size(), reason.empty() ? "unrecorded" : reason.c_str());
+                     table.vertices_per_instance, spirv.size(),
+                     exact ? "captured" : "defaults",
+                     exact ? failure.vertex_lds_dwords : 0u,
+                     exact && failure.has_pixel_inputs,
+                     exact && failure.capture_vertex_position,
+                     reason.empty() ? "unrecorded" : reason.c_str());
         if (positional.size() == 1 && !inspect) return spirv.empty() ? 1 : 0;
     }
     if (!retry_failed_stage_spec.empty()) {

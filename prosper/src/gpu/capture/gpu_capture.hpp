@@ -296,6 +296,12 @@ struct GpuCapturedOperationFailure {
     std::array<DrawItem::ColorTargetBinding, kColorTargetCount> color_targets{};
     uint32_t vertex_count = 0;
     uint32_t instance_count = 0; // v58; zero means unknown (or a known zero count)
+    // v60: exact graphics retry inputs. Absent on earlier files and early failures.
+    bool vertex_retry_config_available = false;
+    uint32_t vertex_lds_dwords = 0;
+    PixelInputMapping pixel_inputs{};
+    bool has_pixel_inputs = false;
+    bool capture_vertex_position = false;
     ComputeLaunchDimensions compute_launch;
     std::vector<GpuCapturedStageDiagnostic> stages;
 };

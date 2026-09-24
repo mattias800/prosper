@@ -1,6 +1,7 @@
 #include "../tools/gpu_replay/realized_shader_dump.hpp"
 #include "../tools/gpu_replay/compute_recompile.hpp"
 #include "gpu/diagnostics/diagnostic_selectors.hpp"
+#include "gpu/recompiler/rdna2_to_spirv.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -421,6 +422,77 @@ int main(int argc, char** argv) {
         CHECK(gpu::write_gpu_capture((directory / "rejected-chain.prgcap").string(),
                                      chain_fixture, error),
               "CLI fixture writes a split vertex chain with a cross-lane refusal");
+        auto& exact_retry = chain_fixture.failure_diagnostics[0];
+        exact_retry.vertex_retry_config_available = true;
+        exact_retry.vertex_lds_dwords = 2176u;
+        exact_retry.has_pixel_inputs = true;
+        exact_retry.pixel_inputs.valid_mask = 1u;
+        exact_retry.pixel_inputs.controls[0] = 0x21u;
+        exact_retry.capture_vertex_position = true;
+        CHECK(gpu::write_gpu_capture((directory / "rejected-chain-exact.prgcap").string(),
+                                     chain_fixture, error),
+              "CLI fixture writes a split vertex chain with captured graphics retry inputs");
+        // A real split no-GS fixture from test_recompiled_shaders: its producer writes a seven-
+        // dword private record and its wrapper exports that record. Zero LDS refuses; seven dwords
+        // compile. This makes CLI admission depend on the recompile ARGUMENT, not on the printed
+        // config label. It is still a one-lane projection fixture, not Kena's wave-wide program.
+        const std::vector<uint32_t> lds_prolog = {
+            0xD765000Au, 0x000100C1u, 0xD766000Au, 0x000214C1u,
+            0x34040A81u, 0x36060AC2u, 0x7E000280u, 0x7E0202F2u,
+            0x36040482u, 0x4A0606C1u, 0x4A0404C1u, 0x7E0C0280u,
+            0x7E0E0280u, 0x7E1002F2u, 0xD8380100u, 0x00080706u,
+            0xD8380302u, 0x00030206u, 0xD8380504u, 0x00010006u,
+            0x7E12030Au, 0xD8340018u, 0x00000906u, 0xBF8A0000u, 0xBE802006u,
+        };
+        const std::vector<uint32_t> lds_main = {
+            0xBF900009u, 0xF8000941u, 0x00000000u,
+            0xD5430000u, 0x03FE249Cu, 0x00000728u,
+            0xD5430002u, 0x03FE249Cu, 0x00000730u,
+            0xD8DC0100u, 0x00000000u, 0xD8DC0100u, 0x02000002u,
+            0xF80000CFu, 0x03020100u,
+            0xD5430000u, 0x03FE249Cu, 0x00000720u,
+            0xD8DC0100u, 0x00000000u, 0xF8000203u, 0x00000100u,
+            0x1608249Cu, 0xD8D80738u, 0x04000004u,
+            0xF8000211u, 0x00000004u, 0xBF810000u,
+        };
+        gpu::ShaderResourceTable lds_table;
+        lds_table.vertices_per_instance = 3u;
+        const auto lds_positive = gpu::recompile_vertex_chain(
+            lds_prolog.data(), lds_prolog.size(), lds_main.data(), lds_main.size(),
+            &lds_table, nullptr, false, 7u);
+        const auto lds_negative = gpu::recompile_vertex_chain(
+            lds_prolog.data(), lds_prolog.size(), lds_main.data(), lds_main.size(),
+            &lds_table, nullptr, false, 0u);
+        CHECK(!lds_positive.empty() && lds_negative.empty(),
+              "retry fixture itself distinguishes captured LDS from the old default");
+        gpu::GpuCaptureFile lds_fixture = chain_fixture;
+        lds_fixture.raw_shader_versions.clear();
+        auto add_raw = [&](const std::vector<uint32_t>& words) {
+            gpu::GpuCaptureRawShaderVersion raw;
+            raw.words = words;
+            raw.has_endpgm = !words.empty() && words.back() == 0xBF810000u;
+            raw.content_hash = gpu::gpu_capture_hash(
+                reinterpret_cast<const uint8_t*>(words.data()), words.size() * sizeof(uint32_t));
+            lds_fixture.raw_shader_versions.push_back(std::move(raw));
+        };
+        add_raw(lds_prolog);
+        add_raw(lds_main);
+        auto& lds_failure = lds_fixture.failure_diagnostics[0];
+        lds_failure.vertex_count = 3u;
+        lds_failure.vertex_lds_dwords = 7u;
+        lds_failure.has_pixel_inputs = false;
+        lds_failure.pixel_inputs = {};
+        lds_failure.capture_vertex_position = false;
+        lds_failure.stages[0].resource_table_present = true;
+        lds_failure.stages[0].resource_table.present = true;
+        CHECK(gpu::write_gpu_capture((directory / "lds-chain-exact.prgcap").string(),
+                                     lds_fixture, error),
+              "CLI fixture writes a chain whose admission requires its captured LDS");
+        lds_failure.vertex_retry_config_available = false;
+        lds_failure.vertex_lds_dwords = 0u;
+        CHECK(gpu::write_gpu_capture((directory / "lds-chain-default.prgcap").string(),
+                                     lds_fixture, error),
+              "CLI fixture writes the same chain with graphics retry config unavailable");
         if (!error.empty()) std::fprintf(stderr, "fixture: %s\n", error.c_str());
         return fails ? 1 : 0;
     }

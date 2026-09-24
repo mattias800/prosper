@@ -476,6 +476,18 @@ int main(int argc, char** argv) {
         return (f.draws.size() + f.failure_diagnostics.size()) *
                kColorTargetCount * 4u * sizeof(uint32_t);
     };
+    auto v60_tail = [](const GpuCaptureFile& f) -> size_t {
+        size_t bytes = 0;
+        for (const auto& failure : f.failure_diagnostics) {
+            ++bytes; // presence byte, including early failures
+            if (!failure.vertex_retry_config_available) continue;
+            bytes += sizeof(uint32_t) + 1u; // LDS and flags
+            if (failure.has_pixel_inputs)
+                bytes += 2u * sizeof(uint32_t) +
+                         failure.pixel_inputs.controls.size() * sizeof(uint32_t);
+        }
+        return bytes;
+    };
     // v57 appends five dwords per resource (the allocation-wide mip placement, #3048) with no
     // count prefix. Backward offsets and downgrade fixtures also skip the later v59 view records.
     auto v57_tail = [&](const GpuCaptureFile& f) -> size_t {
@@ -487,7 +499,7 @@ int main(int argc, char** argv) {
         for (const auto& diagnostic : f.failure_diagnostics)
             for (const auto& stage : diagnostic.stages)
                 resources += stage.resource_table.resources.size();
-        return resources * 5u * sizeof(uint32_t) + v59_tail(f);
+        return resources * 5u * sizeof(uint32_t) + v59_tail(f) + v60_tail(f);
     };
     auto v58_tail = [](const GpuCaptureFile& f) -> size_t {
         return f.failure_diagnostics.size() * sizeof(uint32_t);
@@ -866,7 +878,7 @@ int main(int argc, char** argv) {
     GpuReplayFrame descriptor_array_replay;
     CHECK(serialize_gpu_capture(descriptor_array_capture, descriptor_array_bytes, error) &&
               deserialize_gpu_capture(descriptor_array_bytes, descriptor_array_loaded, error) &&
-              descriptor_array_loaded.format_version == 59 &&
+              descriptor_array_loaded.format_version == 60 &&
               materialize_gpu_replay(descriptor_array_loaded, descriptor_array_replay, error) &&
               descriptor_array_replay.computes.size() == 1 &&
               descriptor_array_replay.computes[0].resources &&
@@ -1231,7 +1243,8 @@ int main(int argc, char** argv) {
                   volume_view_loaded.draws[0].color_targets[2].slice_count == 8u,
               "v59 retains full and subrange volume views through named aliases and MRT slots");
         std::vector<uint8_t> old_view_bytes = volume_view_bytes;
-        old_view_bytes.resize(old_view_bytes.size() - v59_tail(volume_view));
+        old_view_bytes.resize(old_view_bytes.size() - v60_tail(volume_view) -
+                              v59_tail(volume_view));
         old_view_bytes[8] = 58u;
         GpuCaptureFile old_view_loaded;
         CHECK(deserialize_gpu_capture(old_view_bytes, old_view_loaded, error) &&
@@ -1269,7 +1282,8 @@ int main(int argc, char** argv) {
                   out_of_bounds_loaded.draws[0].color_targets[0].programmed_slice_max == 32u,
               "v59 preserves an out-of-bounds raw view without inventing a renderable slice");
         std::vector<uint8_t> invalid_view_bytes = volume_view_bytes;
-        const size_t count_offset = invalid_view_bytes.size() - v59_tail(volume_view) + 8u;
+        const size_t count_offset = invalid_view_bytes.size() - v60_tail(volume_view) -
+                                    v59_tail(volume_view) + 8u;
         invalid_view_bytes[count_offset] = 33u;
         CHECK(!deserialize_gpu_capture(invalid_view_bytes, volume_view_loaded, error) &&
                   error == "invalid color-target volume view",
@@ -1301,7 +1315,7 @@ int main(int argc, char** argv) {
         // modelled" rather than as a zero-extent allocation it could try to place levels in.
         std::vector<uint8_t> v56_tail_bytes = tail_bytes;
         const size_t v57_bytes = tail_loaded.draws[0].vrt.resources.size() * 5u *
-            sizeof(uint32_t) + v59_tail(tail_capture);
+            sizeof(uint32_t) + v59_tail(tail_capture) + v60_tail(tail_capture);
         GpuCaptureFile v56_tail_loaded;
         CHECK(v56_tail_bytes.size() > v57_bytes, "v57 mip-placement tail is removable");
         if (v56_tail_bytes.size() > v57_bytes) {
@@ -1380,7 +1394,7 @@ int main(int argc, char** argv) {
         deserialize_gpu_capture(msaa_bytes, msaa_loaded, error);
     if (!msaa_deserialized) std::printf("  [diag] MSAA capture deserialization: %s\n", error.c_str());
     CHECK(msaa_deserialized &&
-              msaa_loaded.format_version == 59 &&
+              msaa_loaded.format_version == 60 &&
               msaa_loaded.draws[0].vrt.resources[0].resource.sample_count == 4 &&
               msaa_loaded.blobs.size() == 2 &&
               msaa_loaded.blobs[1].bytes.size() == 32768u &&
@@ -1506,7 +1520,7 @@ int main(int argc, char** argv) {
     };
     GpuCaptureFile video_capture;
     CHECK(capture_draw_items({video_draw}, meta, video_reader, video_capture, error) &&
-              video_capture.format_version == 59 && video_capture.blobs.size() == 1 &&
+              video_capture.format_version == 60 && video_capture.blobs.size() == 1 &&
               video_capture.blobs[0].bytes.size() == video_memory.size() &&
               video_capture.draws[0].prt.resources[0].captured_size == video_memory.size() &&
               video_capture.draws[0].prt.resources[0].resource.linear_row_pitch_bytes == 2048,
@@ -1517,7 +1531,7 @@ int main(int argc, char** argv) {
     GpuReplayFrame video_replay;
     CHECK(serialize_gpu_capture(video_capture, video_capture_bytes, error) &&
               deserialize_gpu_capture(video_capture_bytes, video_loaded, error) &&
-              video_loaded.format_version == 59 &&
+              video_loaded.format_version == 60 &&
               video_loaded.draws[0].prt.resources[0].resource.proven_zero_mip &&
               video_loaded.draws[0].prt.resources[0].captured_size == video_memory.size() &&
               video_loaded.draws[0].prt.resources[0].resource.linear_row_pitch_bytes == 2048 &&
@@ -1561,7 +1575,7 @@ int main(int argc, char** argv) {
     GpuReplayFrame upgraded_video_replay;
     CHECK(serialize_gpu_capture(legacy_video, upgraded_video_bytes, error) &&
               deserialize_gpu_capture(upgraded_video_bytes, upgraded_video, error) &&
-              upgraded_video.format_version == 59 &&
+              upgraded_video.format_version == 60 &&
               upgraded_video.draws[0].prt.resources[0].captured_size == video_chroma.size &&
               upgraded_video.draws[0].prt.resources[0].resource.linear_row_pitch_bytes == 2048 &&
               materialize_gpu_replay(upgraded_video, upgraded_video_replay, error) &&
@@ -1643,7 +1657,7 @@ int main(int argc, char** argv) {
           "Plucky RGBA16 32-cubed S3 capture uses its four true 3D macroblocks");
     CHECK(serialize_gpu_capture(array_layout_capture, array_layout_bytes, error) &&
               deserialize_gpu_capture(array_layout_bytes, array_layout_loaded, error) &&
-              array_layout_loaded.format_version == 59 &&
+              array_layout_loaded.format_version == 60 &&
               array_layout_loaded.draws[0].vrt.resources[0].resource.layer_stride_bytes == 720896u &&
               array_layout_loaded.draws[0].vrt.resources[0].resource.layer_mip_offset_bytes == 65536u,
           "v32 capture round-trips thin-array slice stride and selected-mip offset");
@@ -1871,7 +1885,7 @@ int main(int argc, char** argv) {
     CHECK(write_gpu_capture(path.string(), captured, error), "versioned capture writes atomically");
     GpuCaptureFile loaded;
     CHECK(read_gpu_capture(path.string(), loaded, error), "versioned capture reads back");
-    CHECK(loaded.format_version == 59 &&
+    CHECK(loaded.format_version == 60 &&
               loaded.draws[0].vrt.resources[1].resource.size == 16u &&
               loaded.draws[0].vrt.resources[1].resource.scalar_buffer_dword_count == 4u &&
               shader_resource_buffer_binding_bytes(
@@ -3386,6 +3400,8 @@ int main(int argc, char** argv) {
     failed_state.draws.push_back({3});
     failed_state.draws.back().command_order = 777;
     failed_state.draws.back().instance_count = 7;
+    failed_state.sh[P::SPI_SHADER_PGM_RSRC2_GS] =
+        17u << P::SPI_SHADER_PGM_RSRC2_GS_LDS_SIZE_SHIFT; // 2176 dwords
     GpuCaptureFile failed_capture;
     CHECK(capture_gpustate_submit(failed_state, 99, 640, 360, meta, failed_capture, error),
           "actual realization path captures a deliberately failed synthetic draw");
@@ -3400,6 +3416,7 @@ int main(int argc, char** argv) {
     CHECK(failed.reason == RealizationFailureReason::ShaderRecompile && failed.pipeline_present &&
           failed.pipeline.color_write_mask == 0xf && failed.vertex_count == 3 &&
           failed.instance_count == 7 &&
+          failed.vertex_retry_config_available && failed.vertex_lds_dwords == 2176u &&
           failed.pipeline.logic_op_enable && failed.pipeline.logic_op == 6 &&
           failed.pipeline.has_scissor && failed.pipeline.scissor_left == 9 &&
           failed.pipeline.scissor_top == 10 && failed.pipeline.scissor_right == 30 &&
@@ -3467,7 +3484,7 @@ int main(int argc, char** argv) {
     GpuCaptureFile failed_compute_loaded;
     CHECK(serialize_gpu_capture(failed_compute_capture, failed_compute_bytes, error) &&
               deserialize_gpu_capture(failed_compute_bytes, failed_compute_loaded, error) &&
-              failed_compute_loaded.format_version == 59 &&
+              failed_compute_loaded.format_version == 60 &&
               failed_compute_loaded.failure_diagnostics[0].compute_launch.threads_x == 37 &&
               failed_compute_loaded.failure_diagnostics[0].stages[0]
                       .recompile_config.user_sgprs ==
@@ -3673,6 +3690,14 @@ int main(int argc, char** argv) {
         mutable_failed_stage->resource_table_present = true;
         mutable_failed_stage->resource_count = 2;
     }
+    // The failed fragment in this synthetic draw has no live PS input mapping. Add one to the
+    // serialized fixture to discriminate the v60 variable-length graphics retry tail.
+    auto& retry_failure = failed_capture.failure_diagnostics[0];
+    retry_failure.has_pixel_inputs = true;
+    retry_failure.pixel_inputs.valid_mask = 1u;
+    retry_failure.pixel_inputs.passthrough_mask = 1u;
+    retry_failure.pixel_inputs.controls[0] = 0x21u;
+    retry_failure.capture_vertex_position = true;
     CHECK(write_gpu_capture(failed_path.string(), failed_capture, error),
           "failed-operation diagnostic capture writes linked vertex programs");
     GpuCaptureFile failed_loaded;
@@ -3684,6 +3709,13 @@ int main(int argc, char** argv) {
           failed_loaded.failure_diagnostics[0].pipeline.logic_op_enable &&
           failed_loaded.failure_diagnostics[0].pipeline.logic_op == 6 &&
           failed_loaded.failure_diagnostics[0].instance_count == 7 &&
+          failed_loaded.failure_diagnostics[0].vertex_retry_config_available &&
+          failed_loaded.failure_diagnostics[0].vertex_lds_dwords == 2176u &&
+          failed_loaded.failure_diagnostics[0].has_pixel_inputs &&
+          failed_loaded.failure_diagnostics[0].pixel_inputs.valid_mask == 1u &&
+          failed_loaded.failure_diagnostics[0].pixel_inputs.passthrough_mask == 1u &&
+          failed_loaded.failure_diagnostics[0].pixel_inputs.controls[0] == 0x21u &&
+          failed_loaded.failure_diagnostics[0].capture_vertex_position &&
           failed_loaded.failure_diagnostics[0].pipeline.cb_resolve &&
           failed_loaded.failure_diagnostics[0].stages.size() == 3 &&
           failed_loaded.failure_diagnostics[0].stages[0].stage == ShaderProgramStage::Vertex &&
@@ -3691,13 +3723,50 @@ int main(int argc, char** argv) {
           failed_loaded.failure_diagnostics[0].stages[0].program_addr !=
               failed_loaded.failure_diagnostics[0].stages[2].program_addr &&
           failed_loaded.failure_diagnostics[0].stages[1].coverage.first_bad_pc == 1,
-          "linked stage state, coverage, and raw shader versions round-trip offline");
+          "linked stage, raw shader, and exact failed-vertex retry ABI round-trip offline");
     std::vector<uint8_t> pre_v58_failure_bytes;
     GpuCaptureFile pre_v58_failure;
     CHECK(serialize_gpu_capture(failed_capture, pre_v58_failure_bytes, error) &&
-          pre_v58_failure_bytes.size() >= v58_tail(failed_capture) + v59_tail(failed_capture) + 12u,
+          pre_v58_failure_bytes.size() >= v58_tail(failed_capture) + v59_tail(failed_capture) +
+              v60_tail(failed_capture) + 12u,
           "failed-draw instance-count tail is present");
-    if (pre_v58_failure_bytes.size() >= v58_tail(failed_capture) + v59_tail(failed_capture) + 12u) {
+    std::vector<uint8_t> pre_v60_failure_bytes = pre_v58_failure_bytes;
+    GpuCaptureFile pre_v60_failure;
+    if (pre_v60_failure_bytes.size() >= v60_tail(failed_capture) + 12u) {
+        pre_v60_failure_bytes.resize(pre_v60_failure_bytes.size() - v60_tail(failed_capture));
+        pre_v60_failure_bytes[8] = 59u;
+        pre_v60_failure_bytes[9] = pre_v60_failure_bytes[10] =
+            pre_v60_failure_bytes[11] = 0u;
+    }
+    CHECK(deserialize_gpu_capture(pre_v60_failure_bytes, pre_v60_failure, error) &&
+          pre_v60_failure.format_version == 59u &&
+          pre_v60_failure.failure_diagnostics.size() == 1u &&
+          !pre_v60_failure.failure_diagnostics[0].vertex_retry_config_available &&
+          pre_v60_failure.failure_diagnostics[0].instance_count == 7u,
+          "v59 failed draw reopens without inventing graphics retry settings");
+    if (pre_v58_failure_bytes.size() >= v60_tail(failed_capture) + 6u) {
+        const size_t retry_tail = pre_v58_failure_bytes.size() - v60_tail(failed_capture);
+        std::vector<uint8_t> corrupt_retry = pre_v58_failure_bytes;
+        corrupt_retry[retry_tail] = 2u;
+        GpuCaptureFile rejected_retry;
+        CHECK(!deserialize_gpu_capture(corrupt_retry, rejected_retry, error) &&
+              error.find("retry presence") != std::string::npos,
+              "v60 reader refuses an invented retry-presence encoding");
+        corrupt_retry = pre_v58_failure_bytes;
+        corrupt_retry[retry_tail + 5u] = 4u;
+        CHECK(!deserialize_gpu_capture(corrupt_retry, rejected_retry, error) &&
+              error.find("vertex retry config") != std::string::npos,
+              "v60 reader refuses reserved graphics retry flags");
+    }
+    GpuCaptureFile oversized_retry = failed_capture;
+    oversized_retry.failure_diagnostics[0].vertex_lds_dwords = 16385u;
+    std::vector<uint8_t> rejected_retry_bytes;
+    CHECK(!serialize_gpu_capture(oversized_retry, rejected_retry_bytes, error) &&
+          error.find("vertex retry config") != std::string::npos,
+          "v60 writer refuses an impossible graphics LDS allocation");
+    if (pre_v58_failure_bytes.size() >= v58_tail(failed_capture) + v59_tail(failed_capture) +
+            v60_tail(failed_capture) + 12u) {
+        pre_v58_failure_bytes.resize(pre_v58_failure_bytes.size() - v60_tail(failed_capture));
         pre_v58_failure_bytes.resize(pre_v58_failure_bytes.size() - v59_tail(failed_capture));
         pre_v58_failure_bytes.resize(pre_v58_failure_bytes.size() - v58_tail(failed_capture));
         pre_v58_failure_bytes[8] = 57u;
@@ -3713,7 +3782,7 @@ int main(int argc, char** argv) {
     std::vector<uint8_t> rewritten_v58_bytes;
     CHECK(serialize_gpu_capture(pre_v58_failure, rewritten_v58_bytes, error) &&
           deserialize_gpu_capture(rewritten_v58_bytes, rewritten_v58_failure, error) &&
-          rewritten_v58_failure.format_version == 59u &&
+          rewritten_v58_failure.format_version == 60u &&
           rewritten_v58_failure.failure_diagnostics.size() == 1u &&
           rewritten_v58_failure.failure_diagnostics[0].instance_count == 0u,
           "v57-to-current rewrite preserves the zero sentinel for an unavailable count");
@@ -3732,7 +3801,7 @@ int main(int argc, char** argv) {
                 loaded_failed_msaa = &resource;
         }
     }
-    CHECK(failed_loaded.format_version == 59 && loaded_shadow &&
+    CHECK(failed_loaded.format_version == 60 && loaded_shadow &&
           loaded_shadow->resource.depth == 4 &&
           loaded_shadow->resource.max_uncompressed_block_size == 2 &&
           loaded_shadow->resource.max_compressed_block_size == 1 &&
@@ -4020,9 +4089,9 @@ int main(int argc, char** argv) {
     CHECK(deserialize_gpu_capture(legacy_bytes, legacy_loaded, error) &&
           !legacy_loaded.failure_diagnostics_available && legacy_loaded.failure_diagnostics.empty(),
           "v6 capture reopens with failed-operation diagnostics reported unavailable");
-    if (legacy_bytes.size() >= 12) legacy_bytes[8] = 60;   // kVersion + 1: a future version
+    if (legacy_bytes.size() >= 12) legacy_bytes[8] = 61;   // kVersion + 1: a future version
     CHECK(!deserialize_gpu_capture(legacy_bytes, legacy_loaded, error) &&
-          error == "unsupported capture version 60",
+          error == "unsupported capture version 61",
           "future capture versions fail with a concrete version error");
 
     GpuCaptureFile bad_hash = mixed;

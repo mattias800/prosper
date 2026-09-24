@@ -1492,6 +1492,38 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
             if (!read_volume_views(diagnostic.color_targets)) return false;
         }
     }
+    if (version >= 60) {
+        for (auto& diagnostic : c.failure_diagnostics) {
+            uint8_t available = 0;
+            if (!r.u8(available) || available > 1u) {
+                error = "invalid failed-draw retry presence";
+                return false;
+            }
+            diagnostic.vertex_retry_config_available = available != 0;
+            if (!available) continue;
+            uint8_t flags = 0;
+            if (diagnostic.kind != SubmitOperationKind::Draw ||
+                !r.u32(diagnostic.vertex_lds_dwords) || !r.u8(flags) ||
+                diagnostic.vertex_lds_dwords > 16384u || (flags & ~3u)) {
+                error = "invalid failed-draw vertex retry config";
+                return false;
+            }
+            diagnostic.has_pixel_inputs = (flags & 1u) != 0;
+            diagnostic.capture_vertex_position = (flags & 2u) != 0;
+            if (diagnostic.has_pixel_inputs) {
+                if (!r.u32(diagnostic.pixel_inputs.valid_mask) ||
+                    !r.u32(diagnostic.pixel_inputs.passthrough_mask)) return false;
+                for (uint32_t& control : diagnostic.pixel_inputs.controls)
+                    if (!r.u32(control)) return false;
+                if (!diagnostic.pixel_inputs.valid_mask ||
+                    (diagnostic.pixel_inputs.passthrough_mask &
+                     ~diagnostic.pixel_inputs.valid_mask)) {
+                    error = "invalid failed-draw pixel inputs";
+                    return false;
+                }
+            }
+        }
+    }
     // DS seed identity is checked HERE, not in the record loop, because the slice arrives in the
     // tail above: a per-record check would compare incomplete identities and reject two faces of one
     // cube that differ only in slice -- which is exactly the capture this version exists to allow.
