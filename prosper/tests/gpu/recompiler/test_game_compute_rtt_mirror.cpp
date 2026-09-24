@@ -5,6 +5,7 @@
 #include "shared/live/live_compute.hpp"
 #include "shared/live/live_renderer.hpp"
 #include "shared/live/gpu_retile.hpp"
+#include "shared/compute/storage_image_alias_plan.hpp"
 #include "fixtures/render_runner.h"
 #include "gpu/texture/tile.hpp"
 
@@ -412,6 +413,144 @@ static int run_destination_mirror_regression() {
                   std::memcmp(rgba16_array_pixels.data(), rgba16_words.data(),
                               rgba16_array_pixels.size()) == 0,
               "one-layer array mirror pixels equal exact guest half-float writeback");
+    }
+
+    CHECK(!render(rgba16_producer).empty(),
+          "RGBA16F renderer repaints before the partial one-layer array write");
+    std::vector<uint8_t> rgba16_array_seed;
+    std::string rgba16_array_seed_error;
+    const bool rgba16_array_seed_valid = prosper::test::readback_persistent_color_target(
+        rgba16_address, W, H, VK_FORMAT_R16G16B16A16_SFLOAT,
+        rgba16_array_seed, rgba16_array_seed_error) &&
+        rgba16_array_seed.size() == rgba16_words.size() * sizeof(uint16_t);
+    bool rgba16_array_seed_expected = rgba16_array_seed_valid;
+    if (rgba16_array_seed_valid) {
+        for (size_t i = 0; i < rgba16_words.size(); ++i) {
+            uint16_t pixel;
+            std::memcpy(&pixel, rgba16_array_seed.data() + i * sizeof(pixel), sizeof(pixel));
+            rgba16_array_seed_expected &= pixel == rgba16_sample[i % 4u] &&
+                                         rgba16_words[i] == rgba16_black[i % 4u];
+        }
+    }
+    CHECK(rgba16_array_seed_expected,
+          "partial-array fixture has nonblack renderer pixels and stale black guest bytes");
+    ComputeShaderConfig rgba16_array_partial_config = rgba16_config;
+    rgba16_array_partial_config.local_y = 1;
+    const auto rgba16_array_partial_spirv = recompile_compute(
+        store_black_array, std::size(store_black_array), &rgba16_table,
+        rgba16_array_partial_config);
+    CHECK(!rgba16_array_partial_spirv.empty(),
+          "partial one-layer array writer recompiles");
+    ComputeItem rgba16_array_partial = rgba16_array_full;
+    rgba16_array_partial.spirv = rgba16_array_partial_spirv;
+    rgba16_array_partial.launch.threads_y = 1;
+    rgba16_array_partial.launch.local_y = 1;
+    rgba16_array_partial.launch.groups_y = 1;
+    rgba16_array_partial.code_addr = 0x37310024u;
+    const auto rgba16_array_partial_before =
+        prosper::frontend::live_compute_rtt_destination_mirror_counters();
+    CHECK(!rgba16_array_partial_spirv.empty() &&
+              prosper::frontend::execute_live_compute_items({rgba16_array_partial}),
+          "partial one-layer array writer completes");
+    const auto rgba16_array_partial_after =
+        prosper::frontend::live_compute_rtt_destination_mirror_counters();
+    const size_t rgba16_row_bytes = W * 4u * sizeof(uint16_t);
+    bool rgba16_array_first_row_black = true;
+    for (size_t i = 0; i < W * 4u; ++i)
+        rgba16_array_first_row_black &= rgba16_words[i] == rgba16_black[i % 4u];
+    CHECK(rgba16_array_seed_valid &&
+              rgba16_array_first_row_black &&
+              std::memcmp(reinterpret_cast<const uint8_t*>(rgba16_words.data()) + rgba16_row_bytes,
+                          rgba16_array_seed.data() + rgba16_row_bytes,
+                          rgba16_array_seed.size() - rgba16_row_bytes) == 0,
+          "partial array writer preserves untouched renderer rows in guest writeback");
+    if (!rgba16_mirror_disabled) {
+        CHECK(rgba16_array_partial_after.rgba16_source_seed_recorded ==
+                  rgba16_array_partial_before.rgba16_source_seed_recorded + 1 &&
+                  rgba16_array_partial_after.published ==
+                      rgba16_array_partial_before.published + 1,
+              "partial array writer seeds from and publishes to the renderer image");
+        std::vector<uint8_t> rgba16_array_partial_pixels;
+        CHECK(prosper::test::readback_persistent_color_target(
+                  rgba16_address, W, H, VK_FORMAT_R16G16B16A16_SFLOAT,
+                  rgba16_array_partial_pixels, rgba16_array_seed_error) &&
+                  rgba16_array_partial_pixels.size() == rgba16_array_seed.size() &&
+                  std::memcmp(rgba16_array_partial_pixels.data(), rgba16_words.data(),
+                              rgba16_array_partial_pixels.size()) == 0,
+              "partial array renderer pixels equal exact guest writeback");
+    }
+
+    // A single guest image may be named by both 2D and 2D_ARRAY storage
+    // declarations. Reusing either sibling's VkImageView for the other is invalid;
+    // making two writable images would lose one store at whole-image writeback.
+    // The separate-address control proves this shader otherwise executes.
+    static const uint32_t mixed_array_store[] = {
+        0x7E080300u, 0x7E0A0301u, 0x7E0C0280u,
+        0x7E000280u, 0x7E020280u, 0x7E040280u, 0x7E0602F2u,
+        0xF0200F28u, 0x00020004u, // 2D_ARRAY store through s[8:15]
+        0xF0200F08u, 0x00040004u, // ordinary 2D store through s[16:23]
+        0xBF810000u,
+    };
+    std::vector<uint16_t> distinct_words(rgba16_words.size(), 0x3555u);
+    for (bool reverse : {false, true}) {
+        std::fill(rgba16_words.begin(), rgba16_words.end(), 0x3555u);
+        std::fill(distinct_words.begin(), distinct_words.end(), 0x3555u);
+        CHECK(!render(rgba16_producer).empty(),
+              "mixed-view positive control repaints the first renderer destination");
+        ShaderResourceTable mixed_table = rgba16_table;
+        ShaderResource sibling = rgba16_output;
+        sibling.binding = 6;
+        sibling.sgpr_base = reverse ? 8 : 16;
+        sibling.gpu_addr = reinterpret_cast<uint64_t>(distinct_words.data());
+        if (reverse) mixed_table.resources[0].sgpr_base = 16;
+        mixed_table.resources.push_back(sibling);
+        ComputeShaderConfig mixed_config = rgba16_config;
+        mixed_config.user_sgprs.resize(24);
+        const auto mixed_spirv = recompile_compute(
+            mixed_array_store, std::size(mixed_array_store), &mixed_table, mixed_config);
+        const auto mixed_report = validate_spirv_descriptor_interface(
+            mixed_spirv, &mixed_table, 0, SpirvShaderStage::Compute, false);
+        const auto* first = find_spirv_descriptor_binding(mixed_report, 0, 5);
+        const auto* second = find_spirv_descriptor_binding(mixed_report, 0, 6);
+        CHECK(!mixed_spirv.empty() && mixed_report.ok() && first && second &&
+                  first->kind == SpirvDescriptorKind::StorageImage &&
+                  second->kind == SpirvDescriptorKind::StorageImage &&
+                  first->image_arrayed != second->image_arrayed &&
+                  first->writable && second->writable,
+              "mixed-view fixture reflects two distinct writable Vulkan view types");
+        if (mixed_spirv.empty() || !mixed_report.ok() || !first || !second) continue;
+        ComputeItem mixed_item = rgba16_array_full;
+        mixed_item.spirv = mixed_spirv;
+        mixed_item.resources = std::make_shared<ShaderResourceTable>(mixed_table);
+        mixed_item.code_addr = reverse ? 0x37310026u : 0x37310025u;
+        CHECK(prosper::frontend::execute_live_compute_items({mixed_item}),
+              "mixed-view shader executes when its two outputs have distinct guest addresses");
+        bool separate_outputs_black = true;
+        for (size_t i = 0; i < distinct_words.size(); ++i)
+            separate_outputs_black &= rgba16_words[i] == rgba16_black[i % 4u] &&
+                                      distinct_words[i] == rgba16_black[i % 4u];
+        std::vector<uint8_t> mixed_renderer_pixels;
+        std::string mixed_renderer_error;
+        const bool first_renderer_black = prosper::test::readback_persistent_color_target(
+            rgba16_address, W, H, VK_FORMAT_R16G16B16A16_SFLOAT,
+            mixed_renderer_pixels, mixed_renderer_error) &&
+            mixed_renderer_pixels.size() == rgba16_words.size() * sizeof(uint16_t) &&
+            std::memcmp(mixed_renderer_pixels.data(), rgba16_words.data(),
+                        mixed_renderer_pixels.size()) == 0;
+        CHECK(separate_outputs_black && (rgba16_mirror_disabled || first_renderer_black),
+              "both distinct-view stores change their respective output images to black");
+        mixed_table.resources[1].gpu_addr = rgba16_address;
+        const auto mixed_plan = prosper::frontend::plan_storage_image_aliases(
+            mixed_report.descriptors, mixed_table);
+        CHECK(!mixed_plan.valid && mixed_plan.decline_reason &&
+                  std::strcmp(mixed_plan.decline_reason,
+                              "storage-alias-mixed-array-view") == 0,
+              "same-address mixed storage views name the intended early decline");
+        const auto before_mixed_decline = rgba16_words;
+        mixed_item.resources = std::make_shared<ShaderResourceTable>(mixed_table);
+        CHECK(!prosper::frontend::execute_live_compute_items({mixed_item}) &&
+                  rgba16_words == before_mixed_decline,
+              "same-address mixed-view shader declines without changing guest pixels");
     }
 
     CHECK(!render(rgba16_producer).empty(),

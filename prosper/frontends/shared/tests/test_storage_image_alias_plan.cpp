@@ -5,6 +5,7 @@
 #include <array>
 #include <cstdio>
 #include <initializer_list>
+#include <string_view>
 #include <vector>
 
 using namespace prosper::gpu;
@@ -187,6 +188,38 @@ int main() {
     CHECK((plan.group_for_image == std::vector<size_t>{0, 1}));
     shape_pair[0].image_arrayed = true;
     CHECK(plan_storage_image_aliases(shape_pair, table).groups.size() == 1);
+
+    // An ordinary 2D guest surface needs two different VkImageView types when the
+    // reflected declarations disagree on Arrayed. A writable pair cannot simply
+    // split into two images: the later whole-image writeback would erase one writer.
+    table = pair_resources();
+    for (bool reverse : {false, true}) {
+        for (bool first_writes : {false, true}) {
+            context = "mixed 2D/2D_ARRAY writable aliases decline in either order";
+            auto mixed = std::array{descriptor(5, !first_writes, first_writes),
+                                    descriptor(26, first_writes, !first_writes)};
+            mixed[1].image_arrayed = true;
+            if (reverse) std::swap(mixed[0], mixed[1]);
+            plan = plan_storage_image_aliases(mixed, table);
+            CHECK(!plan.valid);
+            CHECK(plan.decline_reason &&
+                  std::string_view(plan.decline_reason) == "storage-alias-mixed-array-view");
+        }
+    }
+    context = "mixed read-only 2D/2D_ARRAY views also decline before binding";
+    auto read_only_mixed = std::array{descriptor(5, true, false),
+                                      descriptor(26, true, false)};
+    read_only_mixed[1].image_arrayed = true;
+    plan = plan_storage_image_aliases(read_only_mixed, table);
+    CHECK(!plan.valid);
+    CHECK(plan.decline_reason &&
+          std::string_view(plan.decline_reason) == "storage-alias-mixed-array-view");
+    context = "identical one-layer array storage declarations still alias";
+    read_only_mixed[0].image_arrayed = true;
+    read_only_mixed[0].writable = true;
+    plan = plan_storage_image_aliases(read_only_mixed, table);
+    CHECK(plan.valid && plan.groups.size() == 1);
+    group(plan, 0, 0, {5, 26}, true, true, false, false);
 
     context = "3D shape is metadata, not allocation validation";
     auto volume = resource(5);

@@ -6301,7 +6301,10 @@ PreparedStorageWriteMasks prepare_storage_write_masks(
             images.push_back(descriptor);
     }
     const auto aliases = prosper::frontend::plan_storage_image_aliases(images, *resources);
-    if (!aliases.valid) { out.error = "write-mask-alias-resource"; return out; }
+    if (!aliases.valid) {
+        out.error = aliases.decline_reason ? aliases.decline_reason : "write-mask-alias-resource";
+        return out;
+    }
     out.masks.reserve(aliases.groups.size());
     std::vector<StorageWriteMaskTarget> targets;
     for (const auto& group : aliases.groups) {
@@ -6816,7 +6819,10 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     const auto image_alias_plan = resources
         ? prosper::frontend::plan_storage_image_aliases(image_descriptors, *resources)
         : prosper::frontend::StorageImageAliasPlan{};
-    if (!image_alias_plan.valid) return decline("storage-alias-resource-missing");
+    if (!image_alias_plan.valid)
+        return decline(image_alias_plan.decline_reason
+                           ? image_alias_plan.decline_reason
+                           : "storage-alias-resource-missing");
     const LiveComputeBufferDescriptorPlan buffer_plan =
         plan_live_compute_buffer_descriptors(
             descriptors, resources.get(), ctx.descriptor_indexing_support);
@@ -7639,6 +7645,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                        (bi.storage && r->img_dim == 1 && r->depth == 1 &&
                                         !r->depth_compare &&
                                         !image_descriptors[i].image_multisampled));
+            const bool one_layer_2d_storage_array_view =
+                bi.storage && r->img_dim == 1 && r->depth == 1 && dim_2d_array;
             // A cube T# bound as a 2D-ARRAY STORAGE image -- Sonic Frontiers' Cyber Space compute
             // `0x200581bb00`, guest `dim=3` 32x32x6 against `shader{dim=1 arrayed=1 storage=1}` --
             // is deliberately NOT admitted here, and stays in the skip. Binding it is the easy
@@ -7802,7 +7810,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 std::getenv("PROSPER_NO_UNORM_RTT_VALUE_REUSE") == nullptr &&
                 // Preserve the recovery switch published with the normalized-sampling first step.
                 std::getenv("PROSPER_NO_NORMALIZED_UNORM_RTT_BIND") == nullptr;
-            if (renderer_owned && (dim_3d || dim_2d_array || r->depth != 1)) {
+            if (renderer_owned &&
+                (dim_3d || (dim_2d_array && !one_layer_2d_storage_array_view) ||
+                 r->depth != 1)) {
                 // The renderer cache represents one concrete 2D color image. An address match from
                 // a 3D/layered descriptor is therefore a resource-lifetime alias, not that cached
                 // surface: Vulkan/guest allocators routinely recycle one base across incompatible
@@ -8033,7 +8043,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 const bool exact_view = (exact_rgba8 || exact_rgba16 || exact_packed_r11) &&
                     !bi.storage_write_mask &&
                     image_descriptors[i].image_dim == 1 &&
-                    !image_descriptors[i].image_arrayed &&
+                    (!image_descriptors[i].image_arrayed ||
+                     one_layer_2d_storage_array_view) &&
                     !image_descriptors[i].image_multisampled &&
                     !image_descriptors[i].image_depth && r->depth == 1 &&
                     bi.array_layers == 1 && bi.texel_depth == 1 &&
