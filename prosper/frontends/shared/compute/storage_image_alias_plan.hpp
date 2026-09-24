@@ -99,8 +99,8 @@ inline StorageImageAliasPlan plan_storage_image_aliases(
                 // sibling's ordinary 2D declaration. Splitting writable aliases into two
                 // images would also lose one sibling's stores at whole-image writeback.
                 if (resource->img_dim == 1 && resource->depth == 1 &&
-                    (descriptors[owner].image_dim != descriptor.image_dim ||
-                     descriptors[owner].image_arrayed != descriptor.image_arrayed)) {
+                    descriptors[owner].image_dim == 1 && descriptor.image_dim == 1 &&
+                    descriptors[owner].image_arrayed != descriptor.image_arrayed) {
                     plan.valid = false;
                     plan.decline_reason = "storage-alias-mixed-array-view";
                     return plan;
