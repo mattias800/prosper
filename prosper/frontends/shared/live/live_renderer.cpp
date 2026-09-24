@@ -14,6 +14,7 @@
 #include "shared/rtt/mrt_extent.hpp"
 #include "shared/rtt/mrt_binding.hpp"               // which MRT slot may join a pass (measured extents only)
 #include "shared/present/readback_policy.hpp"
+#include "shared/present/selected_source_identity.hpp"
 #include "shared/diagnostics/capture_renderer_policy.hpp"
 #include "shared/texture/write_watch_policy.hpp"
 #include "shared/texture/validation_census.hpp"
@@ -55,6 +56,7 @@
 #include "fixtures/render_runner.h"              // offscreen Vulkan backend (render_draws_rgba) + dump_bmp
 
 #include <atomic>
+#include <cerrno>
 #include <functional>
 #include <chrono>
 #include <climits>
@@ -126,6 +128,34 @@ int compute_present_selector_preflight() {
 // this the composite samples zeros and the frame is black. We cache each submit's rendered pixels under
 // its render-target base and inject them when a subsequent draw samples a texture at a matching base.
 namespace {
+bool parse_diagnostic_address(const char* spec, uint64_t& address) {
+    if (!spec) return true;
+    if (spec[0] != '0' || (spec[1] != 'x' && spec[1] != 'X') || !spec[2]) return false;
+    char* end = nullptr;
+    errno = 0;
+    const unsigned long long parsed = std::strtoull(spec, &end, 16);
+    if (errno || end == spec + 2 || *end || !parsed) return false;
+    address = parsed;
+    return true;
+}
+
+bool parse_diagnostic_extent(const char* spec, uint32_t& width, uint32_t& height) {
+    if (!spec) return true;
+    if (*spec < '0' || *spec > '9') return false;
+    char* separator = nullptr;
+    errno = 0;
+    const unsigned long w = std::strtoul(spec, &separator, 10);
+    if (errno || !separator || *separator != 'x' || !w || w > UINT32_MAX ||
+        separator[1] < '0' || separator[1] > '9') return false;
+    char* end = nullptr;
+    errno = 0;
+    const unsigned long h = std::strtoul(separator + 1, &end, 10);
+    if (errno || !end || *end || !h || h > UINT32_MAX) return false;
+    width = static_cast<uint32_t>(w);
+    height = static_cast<uint32_t>(h);
+    return true;
+}
+
 // Installed by the live-renderer registration below; called from the guest flip path through the
 // extern "C" entry at the bottom of this file, which that registration hands to core. Empty when
 // the live renderer is not registered.
@@ -1734,6 +1764,17 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
         g_exact_writer_probe.configure(spec);
         return spec;
     }();
+    static const std::pair<uint32_t, uint32_t> g_persist_extent = [] {
+        const char* spec = PROSPER_ENV_VALUE("PROSPER_DUMP_PERSISTENT_EXTENT");
+        if (!spec) return std::pair<uint32_t, uint32_t>{0, 0};
+        uint32_t width = 0, height = 0;
+        if (!parse_diagnostic_extent(spec, width, height)) {
+            std::fprintf(stderr, "[persist] extent selector refused: expected WxH\n");
+            return std::pair<uint32_t, uint32_t>{UINT32_MAX, UINT32_MAX};
+        }
+        std::fprintf(stderr, "[persist] extent selector armed on %ux%u\n", width, height);
+        return std::pair<uint32_t, uint32_t>{width, height};
+    }();
     // Match boot_trace's progression-diagnostic contract: callers may register the graphics
     // renderer while deliberately leaving compute unregistered. This keeps semantic dispatches
     // visible without letting screenshot/prosper-app registration silently undo the A/B.
@@ -2532,6 +2573,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 // hit still pays per reference. res_descriptor is the per-draw set alloc/update.
                 double backend_res_texture_ms = 0, backend_res_texture_upload_ms = 0;
                 double backend_res_texture_bind_ms = 0, backend_res_buffer_ms = 0;
+                uint64_t backend_texture_refs = 0, backend_texture_uploads = 0;
+                uint64_t backend_texture_upload_bytes = 0;
+                uint64_t backend_texture_persistent_hits = 0, backend_texture_persistent_misses = 0;
+                uint64_t backend_texture_binding_refs = 0, backend_texture_binding_unique = 0;
+                uint64_t backend_texture_binding_persistent_hits = 0;
+                uint64_t backend_texture_binding_persistent_misses = 0;
                 double backend_res_buffer_range_plan_ms = 0;
                 double backend_res_buffer_acquire_ms = 0, backend_res_buffer_copy_ms = 0;
                 double backend_res_buffer_resident_ms = 0;
@@ -2780,6 +2827,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 ? RenderClock::now() : RenderClock::time_point{};
             auto record_backend_timing = [&]
                 (const prosper::test::BackendRenderTimingStats& backend,
+                 const prosper::test::BackendTextureUploadStats& textures,
                  const prosper::test::BackendPipelineCacheStats& pipelines,
                  const prosper::test::BackendResourceReuseStats& reuse) {
                 pending_timing.backend_calls += backend.calls;
@@ -2812,6 +2860,17 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 pending_timing.backend_res_texture_ms += backend.res_texture_ms;
                 pending_timing.backend_res_texture_upload_ms += backend.res_texture_upload_ms;
                 pending_timing.backend_res_texture_bind_ms += backend.res_texture_bind_ms;
+                pending_timing.backend_texture_refs += textures.references;
+                pending_timing.backend_texture_uploads += textures.unique_uploads;
+                pending_timing.backend_texture_upload_bytes += textures.upload_bytes;
+                pending_timing.backend_texture_persistent_hits += textures.persistent_hits;
+                pending_timing.backend_texture_persistent_misses += textures.persistent_misses;
+                pending_timing.backend_texture_binding_refs += reuse.texture_binding_references;
+                pending_timing.backend_texture_binding_unique += reuse.unique_texture_bindings;
+                pending_timing.backend_texture_binding_persistent_hits +=
+                    reuse.persistent_texture_binding_hits;
+                pending_timing.backend_texture_binding_persistent_misses +=
+                    reuse.persistent_texture_binding_misses;
                 pending_timing.backend_res_buffer_ms += backend.res_buffer_ms;
                 pending_timing.backend_res_buffer_acquire_ms += backend.res_buffer_acquire_ms;
                 pending_timing.backend_res_buffer_range_plan_ms += backend.res_buffer_range_plan_ms;
@@ -9082,6 +9141,39 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     fprintf(stderr, "[fs-match] PROSPER_FS_SPV_MATCH='%s' invalid/unreadable -> applying NO "
                             "fragment file override (fail closed)\n", mp);
             }
+            // Optional second selector for a live exact-program experiment. A matching SPIR-V
+            // module can be reused by unrelated draws, so a shader-only A/B is not necessarily
+            // an exact draw substitution. Invalid input fails closed.
+            const char* fs_guest_addr_text = PROSPER_ENV_VALUE("PROSPER_FS_SPV_GUEST_ADDR");
+            uint64_t fs_guest_addr = 0;
+            const bool fs_guest_addr_valid =
+                parse_diagnostic_address(fs_guest_addr_text, fs_guest_addr);
+            if (!fs_guest_addr_valid) {
+                static std::atomic_flag warned = ATOMIC_FLAG_INIT;
+                if (!warned.test_and_set())
+                    std::fprintf(stderr,
+                                 "[fs-match] PROSPER_FS_SPV_GUEST_ADDR invalid -> no file override\n");
+            }
+            const char* fs_target_addr_text = PROSPER_ENV_VALUE("PROSPER_FS_SPV_TARGET_ADDR");
+            uint64_t fs_target_addr = 0;
+            const bool fs_target_addr_valid =
+                parse_diagnostic_address(fs_target_addr_text, fs_target_addr);
+            if (!fs_target_addr_valid) {
+                static std::atomic_flag warned = ATOMIC_FLAG_INIT;
+                if (!warned.test_and_set())
+                    std::fprintf(stderr,
+                                 "[fs-match] PROSPER_FS_SPV_TARGET_ADDR invalid -> no file override\n");
+            }
+            const char* fs_target_dim_text = PROSPER_ENV_VALUE("PROSPER_FS_SPV_TARGET_DIM");
+            uint32_t fs_target_width = 0, fs_target_height = 0;
+            const bool fs_target_dim_valid =
+                parse_diagnostic_extent(fs_target_dim_text, fs_target_width, fs_target_height);
+            if (!fs_target_dim_valid) {
+                static std::atomic_flag warned = ATOMIC_FLAG_INIT;
+                if (!warned.test_and_set())
+                    std::fprintf(stderr,
+                                 "[fs-match] PROSPER_FS_SPV_TARGET_DIM invalid -> no file override\n");
+            }
             // PROSPER_RENDER_TESTPS_MATCH=<file> is the geometry half of a per-shader A/B test: replace
             // only that exact guest PS with the known solid output while retaining its real VS, indices,
             // viewport, depth and raster state. As with FS_SPV_MATCH, a bad path fails closed.
@@ -9137,6 +9229,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     const auto& it = *itp;
                     if (draw_is_skipped(it.draw_index)) continue;
                     prosper::test::BackendDraw bd;
+                    bd.source_submit = phase.source_submit;
                     if (refvs) {
                         bd.vs = refvs_spv;
                     } else if (it.vs_shared) {
@@ -9151,6 +9244,13 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         if (fs_match_mode == 1)      fs_ov = (it.fs_words() == fs_match);   // valid match -> exact only
                         else if (fs_match_mode == 2) fs_ov = false;                // requested-but-invalid -> off
                         // mode 0 -> legacy global file override (unchanged)
+                        if (!fs_guest_addr_valid || !fs_target_addr_valid || !fs_target_dim_valid ||
+                            (fs_guest_addr_text && it.fs_guest_addr != fs_guest_addr) ||
+                            (fs_target_addr_text && it.color0_base != fs_target_addr) ||
+                            (fs_target_dim_text &&
+                             (it.color0_width != fs_target_width ||
+                              it.color0_height != fs_target_height)))
+                            fs_ov = false;
                         if (fs_exact_writer_only && fs_match_mode != 1) fs_ov = false;
                         if (fs_ov) fs_ov = prosper::frontend::exact_writer_file_override_selected(
                             fs_exact_writer_only, exact_writer_live, it.draw_index,
@@ -9514,6 +9614,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 pending_timing.prelude_ms += std::chrono::duration<double, std::milli>(
                     pass_timing_start - callback_timing_start).count();
             std::shared_ptr<const std::vector<uint8_t>> selected_pixels;
+            uint64_t selected_source_submit = 0;
             // Provenance of whatever `selected_pixels` ends up holding. It travels with the frame to
             // the present layer so a verification gate can tell a composited frame from a
             // republished guest scanout — `--require-composited-frame` asserts prosper rendered
@@ -9544,6 +9645,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             uint32_t px_vo_w = 0, px_vo_h = 0;
             uint32_t px_last_w = 0, px_last_h = 0;
             uint64_t px_front_base = 0, px_vo_base = 0, px_last_base = 0;
+            // Provenance belongs to each candidate's immutable pixels, not the final callback.
+            // A retained image can be served by a later submit, and its source must travel with it.
+            uint64_t px_front_source_submit = 0, px_vo_source_submit = 0,
+                     px_last_source_submit = 0;
             // The raw CB_COLOR0_INFO.FORMAT of the pass that produced each present candidate, so the
             // SELECTED one's format can be reported (#2283). UINT32_MAX is "no candidate recorded",
             // deliberately not 0: 0 is CB_COLOR_INVALID, a real and meaningful value here, and the
@@ -11191,6 +11296,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     const prosper::test::BackendRenderTimingStats backend_call_timing = timing_enabled
                         ? prosper::test::backend_render_timing_stats()
                         : prosper::test::BackendRenderTimingStats{};
+                    const prosper::test::BackendTextureUploadStats backend_texture_stats = timing_enabled
+                        ? prosper::test::backend_texture_upload_stats()
+                        : prosper::test::BackendTextureUploadStats{};
                     const prosper::test::BackendPipelineCacheStats backend_pipeline_stats = timing_enabled
                         ? prosper::test::backend_pipeline_cache_stats()
                         : prosper::test::BackendPipelineCacheStats{};
@@ -11214,8 +11322,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         pending_timing.pass_pre_ms +=
                             std::chrono::duration<double, std::milli>(build_start - group_start).count();
                         ++pending_timing.pass_groups;
-                        record_backend_timing(backend_call_timing, backend_pipeline_stats,
-                                          backend_reuse_stats);
+                        record_backend_timing(backend_call_timing, backend_texture_stats,
+                                              backend_pipeline_stats, backend_reuse_stats);
                         pending_timing.color_target_writes += color_target_call.writes;
                         pending_timing.color_target_write_hits += color_target_call.write_hits;
                         pending_timing.color_target_sample_hits += color_target_call.sampled_hits;
@@ -11232,6 +11340,13 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         PROSPER_ENV_VALUE("PROSPER_DUMP_PASS_EVERY")
                             ? std::max(1, atoi(getenv("PROSPER_DUMP_PASS_EVERY"))) : 60;
                     auto pass_pixels = std::make_shared<const std::vector<uint8_t>>(std::move(gpx));
+                    const auto* completed_target = base
+                        ? prosper::test::find_persistent_color_target(base, gw, gh, pass_format)
+                        : nullptr;
+                    const uint64_t pass_source_submit = completed_target
+                        ? prosper::frontend::completed_source_submit(
+                              prosper::test::persistent_color_producer_source(*completed_target))
+                        : 0;
                     if (base && color_target_call.writes) {
                         RttSurf& surface = g_rtt[base];
                         surface.w = gw;
@@ -11682,13 +11797,16 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         if (base && base == front_va) {                          // the flipped buffer
                             px_front = pass_pixels; px_front_w = gw; px_front_h = gh;
                             px_front_base = base; px_front_fmt = candidate_fmt;
+                            px_front_source_submit = pass_source_submit;
                         }
                         if (is_vo) {                                            // any registered scanout
                             px_vo = pass_pixels; px_vo_w = gw; px_vo_h = gh;
                             px_vo_base = base; px_vo_fmt = candidate_fmt;
+                            px_vo_source_submit = pass_source_submit;
                         }
                         px_last = pass_pixels;                                  // last non-empty (fallback)
                         px_last_w = gw; px_last_h = gh; px_last_base = base; px_last_fmt = candidate_fmt;
+                        px_last_source_submit = pass_source_submit;
                     } else if (!explicit_depth_extent && !rendered_pixels.empty() &&
                                prefix_inspect_publish()) {
                         // #1330: under gpu_replay's ordered-prefix inspection (--draw/--draw-steps/
@@ -11701,6 +11819,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             inspection_rgba8(rendered_pixels, gw, gh, pass_format);
                         if (!converted.empty())
                             px_last = std::make_shared<const std::vector<uint8_t>>(std::move(converted));
+                        px_last_source_submit = 0; // inspection conversion is not the native pixels
                     }
                     // PROSPER_PASS_LOG=<min-submit>|ms:<millis>: per-pass publish provenance for 3
                     // submits — which pass produced pixels, its target identity, and the defer
@@ -11852,6 +11971,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 : present_choice == PresentSourceChoice::Vo    ? px_vo
                                 : present_choice == PresentSourceChoice::Last  ? px_last
                                 : nullptr;
+                selected_source_submit = prosper::frontend::selected_source_submit(
+                    selected_pixels, {{{px_front, px_front_source_submit},
+                                       {px_vo, px_vo_source_submit},
+                                       {px_last, px_last_source_submit}}});
                 if (selected_pixels) {
                     kena_final_source = prosper::frontend::present_source_name(present_choice);
                     kena_final_addr = present_choice == PresentSourceChoice::Front ? px_front_base
@@ -11944,6 +12067,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         for (auto& kv : g_rtt) {
                             if (!g_persist_filter.allows(kv.first)) continue;
                             RttSurf& s = kv.second;
+                            if (g_persist_extent.first &&
+                                (s.w != g_persist_extent.first ||
+                                 s.h != g_persist_extent.second)) continue;
                             if (!s.gpu_valid || !s.w || !s.h ||
                                 static_cast<uint64_t>(s.w) * s.h < 64u * 64u) {
                                 if (g_persist_filter.state ==
@@ -11957,8 +12083,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             const VkFormat fmt = prosper::test::backend_color_format(s.format);
                             const uint32_t bpp = prosper::test::backend_color_bytes_per_pixel(fmt);
                             uint64_t expected = 0;
-                            if (g_persist_filter.state ==
-                                    prosper::frontend::PersistentReadbackFilterState::Selected) {
+                            if (g_persist_extent.first || g_persist_filter.state ==
+                                prosper::frontend::PersistentReadbackFilterState::Selected) {
                                 const auto charge = selected_readback_budget.admit(s.w, s.h, bpp,
                                                                                    expected);
                                 if (charge != prosper::frontend::PersistentReadbackCharge::Admitted) {
@@ -12181,6 +12307,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 const prosper::test::BackendRenderTimingStats backend_call_timing = timing_enabled
                     ? prosper::test::backend_render_timing_stats()
                     : prosper::test::BackendRenderTimingStats{};
+                const prosper::test::BackendTextureUploadStats backend_texture_stats = timing_enabled
+                    ? prosper::test::backend_texture_upload_stats()
+                    : prosper::test::BackendTextureUploadStats{};
                 const prosper::test::BackendPipelineCacheStats backend_pipeline_stats = timing_enabled
                     ? prosper::test::backend_pipeline_cache_stats()
                     : prosper::test::BackendPipelineCacheStats{};
@@ -12197,12 +12326,13 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         std::chrono::duration<double, std::milli>(build_done - build_start).count();
                     pending_timing.backend_ms +=
                         std::chrono::duration<double, std::milli>(backend_done - build_done).count();
-                    record_backend_timing(backend_call_timing, backend_pipeline_stats,
-                                          backend_reuse_stats);
+                    record_backend_timing(backend_call_timing, backend_texture_stats,
+                                          backend_pipeline_stats, backend_reuse_stats);
                 }
                 // RTT (#167): cache these rendered pixels under this submit's render-target base, so a later
                 // composite pass that samples that address gets the scene we drew (not empty guest memory).
                 selected_pixels = std::make_shared<const std::vector<uint8_t>>(std::move(rendered));
+                selected_source_submit = !items.empty() ? phase.source_submit : 0;
                 if (rtt_on && !selected_pixels->empty()) {
                     uint64_t tgt = 0;
                     for (const auto& it : items) if (it.color0_base) { tgt = it.color0_base; break; }
@@ -12272,12 +12402,18 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     }
                     return surface.rgba && surface.rgba->size() == expected ? &surface : nullptr;
                 };
-                const int front = prosper::gpu::present_front_index();
+                prosper::VideoOutBufferSnapshot front_snapshot;
+                const bool have_front = prosper::videoout_front_snapshot(front_snapshot);
+                const int front = have_front ? front_snapshot.buffer_index : -1;
+                // Selection, address, registration generation, and originating HLE flip are one
+                // registry-locked snapshot. The global flip and present counters can cross-pair
+                // when guest and GPU flip submitters interleave, so neither may label this image.
+                const uint64_t front_flip = have_front ? front_snapshot.source_flip_seq : 0;
                 static uint64_t last_gpu_publish_flip = UINT64_MAX;
                 static uint64_t last_gpu_publication_id = 0;
                 const uint64_t current_flip = prosper_vo_flip_count();
-                const bool new_gpu_flip = prosper::frontend::present_blit_has_new_flip(
-                    last_gpu_publish_flip, current_flip);
+                const bool new_gpu_flip = front_flip && prosper::frontend::present_blit_has_new_flip(
+                    last_gpu_publish_flip, front_flip);
                 PresentHandoffTrace handoff_trace(current_flip);
                 if (handoff_trace.active)
                     handoff_trace.emit(prosper::perf::PresentHandoffEvent::RendererGate, front, 0, prosper::gpu::present_count(),
@@ -12290,14 +12426,14 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 // through to the CPU readback below, which still publishes a CPU frame; prosper-app
                 // presents that CPU frame when no GPU frame was published (main.cpp), so a miss degrades to
                 // the CPU present path rather than freezing the window.
-                if (front >= 0 && prosper::gpu::gpu_present_active() && !new_gpu_flip) {
+                if (front >= 0 && front_flip && prosper::gpu::gpu_present_active() && !new_gpu_flip) {
                     // The previously published slot remains the correct scanout for this guest
                     // flip. Treat it as a successful GPU publication so intermediate render
                     // submissions do not fall through to the expensive CPU readback path.
                     published_gpu = true;
                     handoff_trace.emit(prosper::perf::PresentHandoffEvent::SameFlipSuppressed, 0, 0, last_gpu_publish_flip);
-                } else if (front >= 0 && prosper::gpu::gpu_present_active()) {
-                    const uint64_t front_va = prosper_vo_buffer_addr(front);
+                } else if (front >= 0 && front_flip && prosper::gpu::gpu_present_active()) {
+                    const uint64_t front_va = front_snapshot.address;
                     auto rit = g_rtt.find(front_va);
                     if (rit != g_rtt.end() && rit->second.gpu_valid && rit->second.w && rit->second.h) {
                         const VkFormat fmt = prosper::test::backend_color_format(rit->second.format);
@@ -12313,11 +12449,11 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             uint64_t publication_id = 0;
                             published_gpu = prosper::frontend::present_blit_publish(
                                 tgt->image, tgt->layout, fmt, rit->second.w, rit->second.h,
-                                current_flip,
+                                front_flip,
                                 prosper::test::persistent_color_producer_source(*tgt),
-                                &publication_id);
+                                &front_snapshot, &publication_id);
                             if (published_gpu) {
-                                last_gpu_publish_flip = current_flip;
+                                last_gpu_publish_flip = front_flip;
                                 last_gpu_publication_id = publication_id;
                             }
                         }
@@ -12325,7 +12461,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 }
                 const auto gpu_source = prosper::frontend::kena_menu_gpu_source(
                     published_gpu, new_gpu_flip,
-                    front >= 0 ? prosper_vo_buffer_addr(front) : 0, current_flip,
+                    have_front ? front_snapshot.address : 0, front_flip,
                     last_gpu_publication_id);
                 if (published_gpu) {
                     kena_final_source = gpu_source.kind;
@@ -12348,7 +12484,16 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             break;
                         }
                 }
-                if (scanout) selected_pixels = scanout->rgba;
+                if (scanout) {
+                    const auto prior_selected_pixels = selected_pixels;
+                    const uint64_t prior_source_submit = selected_source_submit;
+                    selected_pixels = scanout->rgba;
+                    // Only the same immutable allocation from this callback's completed pass
+                    // inherits its submit. A cached/materialized surface with the same address but
+                    // different storage has no source proof here.
+                    selected_source_submit = selected_pixels && selected_pixels == prior_selected_pixels
+                        ? prior_source_submit : 0;
+                }
                 // Last resort before the retained frame: the flipped buffer's own guest memory.
                 // The decision itself lives in guest_scanout_present.hpp so it can be unit-tested;
                 // read that header for why each condition is there. Only the mechanism is here.
@@ -12467,6 +12612,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     if (guest_scanout_pixels && guest_scanout_pixels->size() == present_extent_bytes) {
                         selected_pixels = guest_scanout_pixels;
                         frame_origin = prosper::gpu::PresentFrameOrigin::GuestScanout;
+                        selected_source_submit = 0;
                         kena_final_source = "guest-scanout";
                         kena_final_addr = prosper::gpu::present_front_address();
                     }
@@ -12496,6 +12642,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 // first of them — and `--require-composited-frame` would pass on the strength of the
                 // copies.
                 static bool last_scanout_present_from_guest = false;
+                static uint64_t last_scanout_source_submit = 0;
                 if (!published_gpu) {
                     const size_t current_bytes = selected_pixels ? selected_pixels->size() : 0u;
                     const size_t retained_bytes =
@@ -12508,6 +12655,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             last_scanout_source_kind = kena_final_source;
                             last_scanout_present_from_guest =
                                 frame_origin == prosper::gpu::PresentFrameOrigin::GuestScanout;
+                            last_scanout_source_submit = selected_source_submit;
                             present_frames_stored.fetch_add(1, std::memory_order_relaxed);
                             // `retained_frame_action` decides on BYTE SIZES ALONE -- by design, since
                             // it cannot know what a frame should look like. The consequence is that a
@@ -12591,6 +12739,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             frame_origin = last_scanout_present_from_guest
                                 ? prosper::gpu::PresentFrameOrigin::GuestScanout
                                 : prosper::gpu::PresentFrameOrigin::Composited;
+                            selected_source_submit = last_scanout_source_submit;
                             kena_final_source = last_scanout_source_kind;
                             kena_final_addr = last_scanout_source_addr;
                             present_frames_served.fetch_add(1, std::memory_order_relaxed);
@@ -12902,6 +13051,21 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     record.frontend_gpu_detile_2d_preparations = pending_timing.gpu_detile_2d_preparations;
                     record.frontend_gpu_detile_source_bytes = pending_timing.gpu_detile_source_bytes;
                     record.res_texture_ms = pending_timing.backend_res_texture_ms;
+                    record.res_texture_upload_ms = pending_timing.backend_res_texture_upload_ms;
+                    record.res_texture_bind_ms = pending_timing.backend_res_texture_bind_ms;
+                    record.backend_texture_refs = pending_timing.backend_texture_refs;
+                    record.backend_texture_uploads = pending_timing.backend_texture_uploads;
+                    record.backend_texture_upload_bytes = pending_timing.backend_texture_upload_bytes;
+                    record.backend_texture_persistent_hits =
+                        pending_timing.backend_texture_persistent_hits;
+                    record.backend_texture_persistent_misses =
+                        pending_timing.backend_texture_persistent_misses;
+                    record.backend_texture_binding_refs = pending_timing.backend_texture_binding_refs;
+                    record.backend_texture_binding_unique = pending_timing.backend_texture_binding_unique;
+                    record.backend_texture_binding_persistent_hits =
+                        pending_timing.backend_texture_binding_persistent_hits;
+                    record.backend_texture_binding_persistent_misses =
+                        pending_timing.backend_texture_binding_persistent_misses;
                     record.res_buffer_ms = pending_timing.backend_res_buffer_ms;
                     record.res_buffer_range_plan_ms = pending_timing.backend_res_buffer_range_plan_ms;
                     record.res_buffer_copy_ms = pending_timing.backend_res_buffer_copy_ms;
@@ -12934,6 +13098,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         pending_timing, timing_enabled, phase.final_span);
                     prosper::gpu::RenderedFrame frame(std::move(selected_pixels));
                     frame.origin = frame_origin;
+                    frame.source_submit = selected_source_submit;
                     frame.diagnostic_trace_id = exact_writer_final_id
                         ? exact_writer_final_id :
                           (compute_present_final_id ? compute_present_final_id : kena_trace_id);
@@ -14012,6 +14177,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             }
             prosper::gpu::RenderedFrame frame(std::move(selected_pixels));
             frame.origin = frame_origin;
+            frame.source_submit = selected_source_submit;
             frame.diagnostic_trace_id = exact_writer_final_id
                 ? exact_writer_final_id :
                   (compute_present_final_id ? compute_present_final_id : kena_trace_id);

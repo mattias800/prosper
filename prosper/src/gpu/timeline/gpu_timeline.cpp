@@ -1,4 +1,5 @@
 #include "gpu/timeline/gpu_timeline.hpp"
+#include "gpu/timeline/menu_capture_runtime.hpp"
 
 #include "build_revision.hpp"
 #include "diagnostics/exit_reports.hpp"
@@ -2156,6 +2157,20 @@ struct InteractiveFrameBundle {
                                  // multi-frame window. Raise PROSPER_CAPTURE_FRAMES only to grab an
                                  // animation over several frames; each extra frame is a full heavy capture.
     uint32_t frames_seen = 0;    // presents observed while capturing
+    InteractiveGrabClosure closure = InteractiveGrabClosure::GuestPresent;
+    InteractiveGrabProducerLimits producer_limits{};
+    uint64_t producer_target_flip = 0; // first one-frame closing flip, before host confirmation
+    uint64_t producer_target_submits = 0;
+    uint32_t producer_extra_presents = 0;
+    std::chrono::steady_clock::time_point producer_wait_started{};
+    bool producer_cpu_fallback = false;
+    uint64_t window_open_present = 0;
+    std::vector<uint64_t> frame_end_presents;
+    uint64_t window_open_source_flip = 0;
+    std::vector<uint64_t> frame_end_source_flips;
+    std::vector<uint64_t> frame_end_submit_counts;
+    std::string closed_path;       // last window's owned request, never inferred from a global count
+    uint64_t closed_source_flip = 0; // published before its asynchronous writer begins
     uint64_t submits = 0;
     GpuCaptureBundle bundle;
 };
@@ -2185,13 +2200,17 @@ bool append_capture_to_frame_bundle(GpuCaptureBundle& bundle, const GpuCaptureFi
 }  // namespace
 
 InteractiveGrabRequest request_interactive_capture_bundle(const std::string& path, uint32_t max_mb,
-                                                          uint32_t delay_presents) {
+                                                          uint32_t delay_presents,
+                                                          InteractiveGrabClosure closure,
+                                                          InteractiveGrabProducerLimits limits) {
     InteractiveFrameBundle& b = interactive_frame_bundle();
     std::lock_guard<std::mutex> lk(b.mx);
     if (b.stopping) return {false, {}, "capture writer is shutting down"};
     if (b.capturing || b.writing || b.outcome_pending)
         return {false, {}, "previous capture is collecting, writing, or awaiting its result"};
     if (path.empty()) return {false, {}, "capture path is empty"};
+    if (!limits.wait_ms || !limits.extra_submits || !limits.extra_presents)
+        return {false, {}, "producer closure limits must all be positive"};
     // Start before admitting any guest collection. Failure leaves the previous unstarted arm intact.
     if (!b.writer.joinable()) {
         try { b.writer = std::thread([&b] { b.run_writer(); }); }
@@ -2199,11 +2218,21 @@ InteractiveGrabRequest request_interactive_capture_bundle(const std::string& pat
     }
     std::string replaced = std::move(b.armed_path);
     b.armed_path = path;
+    b.closed_path.clear();
+    b.closed_source_flip = 0;
     b.arm_delay_presents = delay_presents;
+    b.producer_target_flip = 0;
+    b.producer_target_submits = 0;
+    b.producer_extra_presents = 0;
+    b.producer_wait_started = {};
+    b.producer_cpu_fallback = false;
+    b.producer_limits = limits;
     if (max_mb)
         b.max_unique_bytes = static_cast<uint64_t>(std::clamp<uint32_t>(
                                  max_mb, kInteractiveBundleMinMb, kInteractiveBundleMaxMb)) << 20;
-    if (std::getenv("PROSPER_CAPTURE_FRAMES")) b.frames_wanted = resolve_capture_frames();
+    b.frames_wanted = std::getenv("PROSPER_CAPTURE_FRAMES") ? resolve_capture_frames() : 1;
+    b.closure = closure == InteractiveGrabClosure::PresentedGpuProducer && b.frames_wanted == 1
+        ? closure : InteractiveGrabClosure::GuestPresent;
     g_interactive_frame_active.store(true, std::memory_order_release);
     g_interactive_capture_ever_armed.store(true, std::memory_order_release);
     return {true, std::move(replaced), {}};
@@ -2962,6 +2991,71 @@ FrameBundleWindowCounters frame_bundle_window_report(
             delta(totals_now.not_capturing, baseline.not_capturing)};
 }
 
+// Called with b.mx held. The selected-front token is published before the asynchronous writer;
+// for F9 GPU closure, the captured-submit prefix is finalized only after host presentation.
+void finish_interactive_frame_bundle_locked(InteractiveFrameBundle& b,
+                                            uint64_t source_flip_seq) {
+    // The app must choose pixels while this selected-front image is still available.
+    // Waiting for the writer outcome selects a later picture on slow bundles. The
+    // path is part of the signal: a second request cannot inherit this target.
+    b.closed_path = b.current_path;
+    b.closed_source_flip = source_flip_seq;
+    InteractiveFrameBundle::WriteJob work;
+    work.outcome.bundle_path = b.current_path;
+    work.outcome.max_unique_bytes = b.max_unique_bytes;
+    work.outcome.opened_present = b.window_open_present;
+    work.outcome.closed_presents = std::move(b.frame_end_presents);
+    work.outcome.opened_source_flip = b.window_open_source_flip;
+    work.outcome.closed_source_flips = std::move(b.frame_end_source_flips);
+    work.outcome.closed_submit_counts = std::move(b.frame_end_submit_counts);
+    work.outcome.captured_submits.reserve(b.bundle.submits.size());
+    for (const GpuCaptureBundleSubmit& submit : b.bundle.submits)
+        work.outcome.captured_submits.push_back(submit.submit_index);
+    work.hook = b.writer_hook;
+    if (b.failed) {
+        std::fprintf(stderr, "[grab] frame-bundle aborted (see error above); not written\n");
+        work.outcome.error = b.pending_failure_error.empty() ? std::string("grab aborted")
+                                                         : b.pending_failure_error;
+    } else if (!b.submits) {
+        // Names no key: this path is reached by the scheduled triggers too (#2233), where there is
+        // no operator. It also points at the actual fix rather than at a repeat -- a
+        // single-present window on a title that presents faster than it submits catches
+        // zero legitimately, and re-arming the same width is a coin flip (trap 101).
+        std::fprintf(stderr, "[grab] frame-bundle: window had no submits; widen it with "
+                             "PROSPER_CAPTURE_FRAMES=N (1..240) or re-arm\n");
+        const FrameBundleWindowCounters window =
+            frame_bundle_window_report(grab_hook_totals_now(), g_grab_hook_at_open);
+        std::fprintf(stderr,
+                     "[grab] frame-bundle: during this window the submit hook was "
+                     "reached=%llu, %llu while inactive, %llu while not capturing; "
+                     "window was open %lld ms for %u presents\n",
+                     (unsigned long long)window.reached,
+                     (unsigned long long)window.inactive,
+                     (unsigned long long)window.not_capturing,
+                     (long long)(std::chrono::duration_cast<std::chrono::milliseconds>(
+                         std::chrono::steady_clock::now().time_since_epoch()).count() -
+                         g_grab_window_open_ms),
+                     b.frames_seen);
+        work.outcome.error = "the capture window contained no GPU submits";
+    }
+    work.bundle = std::move(b.bundle);
+    b.job = std::move(work);
+    b.writing = true;
+    b.wake.notify_one();
+    b.capturing = false; b.current_path.clear();
+    b.submits = 0; b.frames_seen = 0; b.failed = false;
+    b.window_open_present = 0; b.frame_end_presents.clear();
+    b.window_open_source_flip = 0; b.frame_end_source_flips.clear();
+    b.frame_end_submit_counts.clear();
+    b.producer_target_flip = 0;
+    b.producer_target_submits = 0;
+    b.producer_extra_presents = 0;
+    b.producer_wait_started = {};
+    b.producer_cpu_fallback = false;
+    b.pending_failure_error.clear();
+    if (b.armed_path.empty()) g_interactive_frame_active.store(false, std::memory_order_release);
+}
+
 void interactive_frame_bundle_on_submit(const GpuState& state, uint64_t submit_no) {
     g_grab_hook_reached.fetch_add(1, std::memory_order_relaxed);
     if (!g_interactive_frame_active.load(std::memory_order_acquire)) {
@@ -2972,6 +3066,15 @@ void interactive_frame_bundle_on_submit(const GpuState& state, uint64_t submit_n
     std::lock_guard<std::mutex> lk(b.mx);
     if (!b.capturing || b.failed) {
         g_grab_hook_not_capturing.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    if ((b.producer_target_flip || b.producer_cpu_fallback) &&
+        b.submits - b.producer_target_submits >= b.producer_limits.extra_submits) {
+        b.failed = true;
+        b.pending_failure_error = b.producer_cpu_fallback
+            ? "F9 CPU fallback bundle did not close within the submit budget"
+            : "F9 target producer did not arrive within the post-flip submit budget";
+        std::fprintf(stderr, "[grab] frame-bundle: %s\n", b.pending_failure_error.c_str());
         return;
     }
     // PROSPER_CAPTURE_MAX_SUBMITS=N — stop appending after N submits, keeping what was captured.
@@ -3062,6 +3165,10 @@ void interactive_frame_bundle_on_submit(const GpuState& state, uint64_t submit_n
     });
     switch (outcome) {
         case FrameBundleAppendOutcome::Capped: {
+            if (b.producer_target_flip) {
+                b.failed = true;
+                b.pending_failure_error = "F9 target producer was not retained before the configured submit cap";
+            }
             static std::atomic<int> capped{0};
             if (capped.fetch_add(1) < 2)
                 std::fprintf(stderr,
@@ -3075,18 +3182,34 @@ void interactive_frame_bundle_on_submit(const GpuState& state, uint64_t submit_n
         case FrameBundleAppendOutcome::Failed:
             break;
     }
-    b.failed = append.failed;
+    b.failed = b.failed || append.failed;
     b.submits = append.submits_appended;
 }
 
 // Called per present: opens the window, then transfers its owned payload to the writer at closure.
-void interactive_frame_bundle_on_present() {
+void interactive_frame_bundle_on_present(uint64_t present_count,
+                                         uint64_t source_flip_seq) {
     if (!g_interactive_frame_active.load(std::memory_order_acquire)) return;
     InteractiveFrameBundle& b = interactive_frame_bundle();
     {
         std::lock_guard<std::mutex> lk(b.mx);
         if (b.capturing) {
+            if (b.producer_target_flip) {
+                // The first closing flip remains the screenshot target. Later guest flips must
+                // never relabel it; they only spend the bounded host-presentation wait budget.
+                if (++b.producer_extra_presents >= b.producer_limits.extra_presents && !b.failed) {
+                    b.failed = true;
+                    b.pending_failure_error =
+                        "F9 target flip was not host-presented within the guest-present budget";
+                    std::fprintf(stderr, "[grab] frame-bundle: %s\n",
+                                 b.pending_failure_error.c_str());
+                }
+                return;
+            }
             ++b.frames_seen;
+            b.frame_end_presents.push_back(present_count);
+            b.frame_end_source_flips.push_back(source_flip_seq);
+            b.frame_end_submit_counts.push_back(b.bundle.submits.size());
             if (!b.bundle.submits.empty())
                 std::fprintf(stderr,
                              "[grab] frame-bundle: frame %u ended at submit %llu\n",
@@ -3116,52 +3239,41 @@ void interactive_frame_bundle_on_present() {
                 std::getenv("PROSPER_CAPTURE_WAIT_FOR_SUBMITS") != nullptr;
             const bool window_complete =
                 b.frames_seen >= b.frames_wanted &&
-                (!wait_for_submits || b.submits > 0 ||
+                (b.closure == InteractiveGrabClosure::PresentedGpuProducer ||
+                 b.producer_cpu_fallback ||
+                 !wait_for_submits || b.submits > 0 ||
                  b.frames_seen >= kNoSubmitPresentCeiling);
-            if (b.failed || window_complete) {   // window complete (or aborted)
-                InteractiveFrameBundle::WriteJob work;
-                work.outcome.bundle_path = b.current_path;
-                work.outcome.max_unique_bytes = b.max_unique_bytes;
-                work.hook = b.writer_hook;
-                if (b.failed) {
-                    std::fprintf(stderr, "[grab] frame-bundle aborted (see error above); not written\n");
-                    work.outcome.error = b.pending_failure_error.empty() ? std::string("grab aborted")
-                                                                     : b.pending_failure_error;
-                } else if (!b.submits) {
-                    // Names no key: this path is reached by the scheduled triggers too (#2233), where there is
-                    // no operator. It also points at the actual fix rather than at a repeat -- a
-                    // single-present window on a title that presents faster than it submits catches
-                    // zero legitimately, and re-arming the same width is a coin flip (trap 101).
-                    std::fprintf(stderr, "[grab] frame-bundle: window had no submits; widen it with "
-                                         "PROSPER_CAPTURE_FRAMES=N (1..240) or re-arm\n");
-                    const FrameBundleWindowCounters window =
-                        frame_bundle_window_report(grab_hook_totals_now(), g_grab_hook_at_open);
+            if (b.closure == InteractiveGrabClosure::PresentedGpuProducer &&
+                window_complete && !b.failed) {
+                if (!source_flip_seq || source_flip_seq <= b.window_open_source_flip) {
+                    b.failed = true;
+                    b.pending_failure_error = "F9 target has no distinct selected-front flip";
+                } else {
+                    b.producer_target_flip = source_flip_seq;
+                    b.producer_target_submits = b.submits;
+                    b.producer_wait_started = std::chrono::steady_clock::now();
                     std::fprintf(stderr,
-                                 "[grab] frame-bundle: during this window the submit hook was "
-                                 "reached=%llu, %llu while inactive, %llu while not capturing; "
-                                 "window was open %lld ms for %u presents\n",
-                                 (unsigned long long)window.reached,
-                                 (unsigned long long)window.inactive,
-                                 (unsigned long long)window.not_capturing,
-                                 (long long)(std::chrono::duration_cast<std::chrono::milliseconds>(
-                                     std::chrono::steady_clock::now().time_since_epoch()).count() -
-                                     g_grab_window_open_ms),
-                                 b.frames_seen);
-                    work.outcome.error = "the capture window contained no GPU submits";
+                                 "[grab] frame-bundle: target flip %llu waits for its host-presented "
+                                 "producer after submit %llu\n",
+                                 static_cast<unsigned long long>(source_flip_seq),
+                                 static_cast<unsigned long long>(
+                                     b.bundle.submits.empty() ? 0 :
+                                     b.bundle.submits.back().submit_index));
+                    return;
                 }
-                work.bundle = std::move(b.bundle);
-                b.job = std::move(work);
-                b.writing = true;
-                b.wake.notify_one();
-                b.capturing = false; b.current_path.clear();
-                b.submits = 0; b.frames_seen = 0; b.failed = false;
-                b.pending_failure_error.clear();
-                if (b.armed_path.empty()) g_interactive_frame_active.store(false, std::memory_order_release);
+            }
+            if (b.failed || window_complete) {   // ordinary window complete (or aborted)
+                finish_interactive_frame_bundle_locked(b, source_flip_seq);
             }
         } else if (!b.armed_path.empty() && b.arm_delay_presents) {
             --b.arm_delay_presents;
         } else if (!b.armed_path.empty()) {
             b.capturing = true; b.current_path = std::move(b.armed_path); b.armed_path.clear();
+            b.window_open_present = present_count;
+            b.frame_end_presents.clear();
+            b.window_open_source_flip = source_flip_seq;
+            b.frame_end_source_flips.clear();
+            b.frame_end_submit_counts.clear();
             b.arm_delay_presents = 0;
             g_grab_window_open_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -3186,6 +3298,135 @@ bool take_interactive_grab_outcome(InteractiveGrabOutcome& out) {
     return true;
 }
 
+bool interactive_grab_closed_source_flip(const std::string& bundle_path, uint64_t& source_flip) {
+    InteractiveFrameBundle& b = interactive_frame_bundle();
+    std::lock_guard<std::mutex> lk(b.mx);
+    if (bundle_path.empty() || bundle_path != b.closed_path || !b.closed_source_flip) return false;
+    source_flip = b.closed_source_flip;
+    return true;
+}
+
+bool interactive_grab_pending_source_flip(const std::string& bundle_path,
+                                          uint64_t& source_flip) {
+    InteractiveFrameBundle& b = interactive_frame_bundle();
+    std::lock_guard<std::mutex> lk(b.mx);
+    if (!b.capturing || bundle_path.empty() || bundle_path != b.current_path ||
+        !b.producer_target_flip) return false;
+    source_flip = b.producer_target_flip;
+    return true;
+}
+
+namespace {
+bool producer_wait_expired_locked(const InteractiveFrameBundle& b) {
+    return (b.producer_target_flip || b.producer_cpu_fallback) &&
+        std::chrono::steady_clock::now() - b.producer_wait_started >=
+            std::chrono::milliseconds(b.producer_limits.wait_ms);
+}
+
+void finish_presented_producer_wait_locked(InteractiveFrameBundle& b) {
+    // For this F9-only mode the prefix is measured at host-presented producer closure, not at
+    // the earlier guest flip. That distinction is the exact #3828 race this path resolves.
+    if (!b.frame_end_submit_counts.empty())
+        b.frame_end_submit_counts.back() = b.bundle.submits.size();
+    finish_interactive_frame_bundle_locked(b, b.producer_target_flip);
+}
+}  // namespace
+
+InteractiveGrabProducerClose interactive_grab_on_host_presented_source(
+    const std::string& bundle_path, uint64_t source_flip, bool producer_known,
+    uint64_t producer_submit) {
+    InteractiveFrameBundle& b = interactive_frame_bundle();
+    std::lock_guard<std::mutex> lk(b.mx);
+    if (!b.capturing || b.closure != InteractiveGrabClosure::PresentedGpuProducer ||
+        bundle_path.empty() || bundle_path != b.current_path || !b.producer_target_flip)
+        return InteractiveGrabProducerClose::NotPending;
+    if (b.failed || producer_wait_expired_locked(b)) {
+        if (!b.failed) {
+            b.failed = true;
+            b.pending_failure_error = "F9 target producer wait exceeded its wall-clock budget";
+        }
+        std::fprintf(stderr, "[grab] frame-bundle: %s\n", b.pending_failure_error.c_str());
+        finish_presented_producer_wait_locked(b);
+        return InteractiveGrabProducerClose::Refused;
+    }
+    if (source_flip < b.producer_target_flip)
+        return InteractiveGrabProducerClose::WaitingForTarget;
+    if (source_flip > b.producer_target_flip) {
+        b.failed = true;
+        b.pending_failure_error = "F9 target flip was skipped by host presentation";
+    } else if (!producer_known || !producer_submit) {
+        b.failed = true;
+        b.pending_failure_error = "F9 target was host-presented without known producer lineage";
+    } else if (std::none_of(b.bundle.submits.begin(), b.bundle.submits.end(),
+                            [producer_submit](const GpuCaptureBundleSubmit& submit) {
+                                return submit.submit_index == producer_submit;
+                            })) {
+        b.failed = true;
+        b.pending_failure_error = "F9 target producer submit " + std::to_string(producer_submit) +
+            " was not retained in its bundle";
+    }
+    if (b.failed)
+        std::fprintf(stderr, "[grab] frame-bundle: %s\n", b.pending_failure_error.c_str());
+    const bool captured = !b.failed;
+    finish_presented_producer_wait_locked(b);
+    return captured ? InteractiveGrabProducerClose::Captured
+                    : InteractiveGrabProducerClose::Refused;
+}
+
+bool interactive_grab_on_cpu_fallback(const std::string& bundle_path) {
+    InteractiveFrameBundle& b = interactive_frame_bundle();
+    std::lock_guard<std::mutex> lk(b.mx);
+    if (bundle_path.empty() || b.closure != InteractiveGrabClosure::PresentedGpuProducer ||
+        (bundle_path != b.current_path && bundle_path != b.armed_path)) return false;
+    // The CPU BMP remains useful, but it cannot certify GPU scanout lineage. If this request is
+    // still armed or collecting, let its ordinary one-frame guest boundary produce a bundle; if
+    // the guest boundary has already occurred, close now with the prefix actually captured.
+    b.closure = InteractiveGrabClosure::GuestPresent;
+    b.producer_cpu_fallback = true;
+    b.producer_wait_started = std::chrono::steady_clock::now();
+    b.producer_target_submits = b.submits;
+    std::fprintf(stderr, "[grab] frame-bundle: CPU fallback; waiting for bounded guest closure\n");
+    if (b.capturing && b.producer_target_flip)
+        finish_interactive_frame_bundle_locked(b, b.producer_target_flip);
+    return true;
+}
+
+bool interactive_grab_expire_producer_wait(const std::string& bundle_path) {
+    InteractiveFrameBundle& b = interactive_frame_bundle();
+    std::lock_guard<std::mutex> lk(b.mx);
+    const bool collecting = b.capturing && bundle_path == b.current_path;
+    const bool armed_fallback = b.producer_cpu_fallback && !b.armed_path.empty() &&
+                                bundle_path == b.armed_path;
+    if (bundle_path.empty() || (!collecting && !armed_fallback) ||
+        (!b.producer_target_flip && !b.producer_cpu_fallback) ||
+        (!b.failed && !producer_wait_expired_locked(b))) return false;
+    if (!b.failed) {
+        b.failed = true;
+        b.pending_failure_error = b.producer_cpu_fallback
+            ? "F9 CPU fallback bundle did not reach a guest close within its wall-clock budget"
+            : "F9 target producer wait exceeded its wall-clock budget";
+    }
+    std::fprintf(stderr, "[grab] frame-bundle: %s\n", b.pending_failure_error.c_str());
+    if (armed_fallback) {
+        InteractiveGrabOutcome outcome;
+        outcome.bundle_path = b.armed_path;
+        outcome.max_unique_bytes = b.max_unique_bytes;
+        outcome.error = b.pending_failure_error;
+        b.outcome = std::move(outcome);
+        b.outcome_pending = true;
+        b.armed_path.clear();
+        b.producer_cpu_fallback = false;
+        b.pending_failure_error.clear();
+        g_interactive_frame_active.store(false, std::memory_order_release);
+    } else if (b.producer_cpu_fallback) {
+        finish_interactive_frame_bundle_locked(
+            b, b.frame_end_source_flips.empty() ? 0 : b.frame_end_source_flips.back());
+    } else {
+        finish_presented_producer_wait_locked(b);
+    }
+    return true;
+}
+
 void record_gpu_timeline_submit(const GpuState& state, uint64_t submit_no) {
     // Latched before every early return, so the exit report can separate "the run produced no GPU
     // submits at all" from "it submitted plenty and the timeline was never recording" (#2564). Those
@@ -3195,6 +3436,7 @@ void record_gpu_timeline_submit(const GpuState& state, uint64_t submit_no) {
     // increment for the grab hook, so the marginal cost of this one is not measurable.
     g_timeline_submit_hook_reached.fetch_add(1, std::memory_order_relaxed);
     interactive_frame_bundle_on_submit(state, submit_no);
+    menu_draw_capture_on_submit(state, submit_no);
     if (!gpu_timeline_requested()) return;
     GpuTimelineWriter* writer = runtime_recorder().get();
     if (!writer) return;
@@ -3783,7 +4025,8 @@ void record_gpu_timeline_submit(const GpuState& state, uint64_t submit_no) {
 }
 
 void record_gpu_timeline_present(uint64_t present_count, int buffer_index, int64_t flip_arg,
-                                 uint32_t width, uint32_t height) {
+                                 uint32_t width, uint32_t height,
+                                 uint64_t source_flip_seq) {
     // Latched so an automatic gate that never fired can report what the run actually reached rather
     // than only what was asked for ("you asked for present 5000; the run reached 812"). Two relaxed
     // atomics against the cost of a whole flip.
@@ -3843,7 +4086,7 @@ void record_gpu_timeline_present(uint64_t present_count, int buffer_index, int64
                              "never report: %s\n", replaced.c_str());
         }
     }
-    interactive_frame_bundle_on_present();
+    interactive_frame_bundle_on_present(present_count, source_flip_seq);
     static const bool requested = [] {
         const char* path = std::getenv("PROSPER_GPU_TIMELINE");
         return path && *path;

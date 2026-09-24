@@ -620,6 +620,7 @@ struct BackendDraw {
     // Stable semantic draw ID from DrawItem::draw_index. Diagnostics must not use this backend
     // vector's pass-local offset: target/compute splitting can make that offset differ per pass.
     uint64_t draw_index = UINT64_MAX;
+    uint64_t source_submit = 0; // live architectural submit, zero for replay/direct callers
     // Global PM4 ordinal. Unlike draw_index this is comparable with interleaved compute operations
     // and therefore identifies which retained attachment layer is newer than a compute image.
     uint64_t command_order = 0;
@@ -2585,10 +2586,12 @@ inline void queue_color_producer_completion(
 
 inline void queue_color_producer_write(BackendSubmissionBatch& batch,
                                        PersistentColorTargetImage& image,
-                                       ColorProducerTicket ticket, bool lineage_proven) {
+                                       ColorProducerTicket ticket, bool lineage_proven,
+                                       uint64_t source_submit = 0) {
     prosper::frontend::CompletedProducer producer;
     if (lineage_proven && ticket.registration)
-        producer = {ticket.registration, prosper::frontend::next_producer_identity()};
+        producer = {ticket.registration, prosper::frontend::next_producer_identity(),
+                    source_submit};
     queue_color_producer_completion(batch, image, ticket, producer);
 }
 
@@ -6914,6 +6917,17 @@ inline bool backend_compact_resource_orders_valid(std::span<const BackendDraw> d
 // readback may return after recording; `flush_submission_batch` submits every accumulated command
 // buffer in order, waits once, and releases all retained resources. Omitting the batch preserves the
 // synchronous test/replay contract.
+// A retained image can outlive the submit that produced it. Attribution is valid only when every
+// draw in this backend pass came from the same live architectural submit; replay and direct tests
+// leave source_submit zero. A mixed or unlabelled pass still renders, but cannot certify an F9 join.
+inline uint64_t backend_pass_source_submit(std::span<const BackendDraw> draws) {
+    if (draws.empty() || !draws.front().source_submit) return 0;
+    const uint64_t source = draws.front().source_submit;
+    for (const BackendDraw& draw : draws)
+        if (draw.source_submit != source) return 0;
+    return source;
+}
+
 inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> draws,
                                                   uint32_t W, uint32_t H,
                                                   const uint8_t* seed_rgba = nullptr,
@@ -6947,6 +6961,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     color_target_stats = {};
     BackendResourceReuseStats& resource_reuse_stats = backend_resource_reuse_stats_storage();
     resource_reuse_stats = {};
+    BackendTextureUploadStats& texture_stats = backend_texture_upload_stats_storage();
+    texture_stats = {}; // An empty or failed pass must not report the previous call's uploads.
     maybe_report_hash_stats();   // gated cumulative hashing economics (#1268)
     std::vector<uint8_t> out;
     if (out_rgba1) out_rgba1->clear();
@@ -11224,8 +11240,6 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         }
     }
 
-    BackendTextureUploadStats& texture_stats = backend_texture_upload_stats_storage();
-    texture_stats = {};
     texture_stats.references = texture_references;
     texture_stats.persistent_hits = persistent_texture_hits;
     texture_stats.persistent_misses = persistent_texture_misses;
@@ -12764,8 +12778,10 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         retained->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     }
     uint32_t realized_color_mask = 0;
-    if (std::any_of(producer_tickets.begin(), producer_tickets.begin() + color_count,
-                    [](ColorProducerTicket ticket) { return ticket.registration != 0; }))
+    const bool has_color_producer = std::any_of(
+        producer_tickets.begin(), producer_tickets.begin() + color_count,
+        [](ColorProducerTicket ticket) { return ticket.registration != 0; });
+    if (has_color_producer)
         for (size_t i = 0; i < draws.size(); ++i) {
             if (!dv[i].ok) continue;
             const auto* ps = draws[i].ps;
@@ -12775,6 +12791,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 if (!ps || ps->color_targets[slot].write_mask)
                     realized_color_mask |= 1u << slot;
         }
+    const uint64_t source_submit = has_color_producer
+        ? backend_pass_source_submit(draws) : 0;
     for (uint32_t slot = 0; slot < color_count; ++slot) {
         const ColorProducerTicket ticket = producer_tickets[slot];
         if (!ticket.registration) continue;
@@ -12785,7 +12803,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         const bool realized_write = att[slot].loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR ||
                                     (realized_color_mask & (1u << slot));
         const bool lineage_proven = producer_lineage_proven[slot] && realized_write;
-        queue_color_producer_write(active_submission, *retained, ticket, lineage_proven);
+        queue_color_producer_write(active_submission, *retained, ticket, lineage_proven,
+                                   source_submit);
     }
     BackendSubmissionBatchResult batch_result;
     if (flush_now)
@@ -13718,7 +13737,14 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     const std::span<const BackendDraw> all(draws);
     // One preflight over the logical batch, before splitting or any render-pass state. A malformed
     // later segment must not leave earlier producer work submitted or speculative cache state live.
-    if (!backend_compact_resource_orders_valid(all)) return {};
+    if (!backend_compact_resource_orders_valid(all)) {
+        // This refusal never enters render_draw_pass_rgba, where these per-call results normally
+        // reset. Do not let a preceding valid call masquerade as work done by this one.
+        backend_texture_upload_stats_storage() = {};
+        backend_resource_reuse_stats_storage() = {};
+        backend_render_timing_stats_storage() = {};
+        return {};
+    }
     if (!persist_depth_stencil ||
         depth_feedback_split_index(all, W, H) == all.size())
         return render_draw_pass_rgba(all, W, H, seed_rgba, clear_rgba,

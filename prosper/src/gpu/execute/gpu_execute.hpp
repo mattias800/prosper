@@ -2742,6 +2742,10 @@ inline std::vector<uint8_t> execute_gpustate(const GpuState& st, const RenderFn&
 // shape as RenderFn, plus (w,h).
 struct RenderedFrame {
     std::shared_ptr<const std::vector<uint8_t>> storage;
+    // Exact architectural submit that produced these selected pixels, when proven. A renderer
+    // callback may serve an earlier cached or retained image, so its current submit ordinal is not
+    // automatically the source. Zero means unknown, never "the first submit" in this live path.
+    uint64_t source_submit = 0;
     // Zero except for an opt-in renderer observation. Carried through ordered submits so a CPU
     // publication can be joined to a screenshot manifest's source_seq.
     uint64_t diagnostic_trace_id = 0;
@@ -2794,7 +2798,8 @@ OrderedSubmitResult execute_ordered_items(const std::vector<SubmitOperation>& op
                                           const std::vector<GpuState::DmaCopy>& dma_copies,
                                           const LiveRenderFn& render,
                                           const LiveComputeFn& compute,
-                                          uint32_t width, uint32_t height);
+                                          uint32_t width, uint32_t height,
+                                          uint64_t source_submit = 0);
 OrderedSubmitResult execute_ordered_items(const std::vector<SubmitOperation>& operations,
                                           const std::vector<DrawItem>& draws,
                                           const std::vector<ComputeItem>& computes,
@@ -2820,6 +2825,7 @@ struct LiveRenderPhase {
     // The next ordered operation reads render-target bytes on the CPU. Persistent Vulkan targets
     // must synchronously read back this span instead of deferring their authoritative pixels.
     bool authoritative_readback = false;
+    uint64_t source_submit = 0; // zero for direct/replay callbacks without a live guest submit
 
     bool allows_deferred_scanout_readback() const {
         return !final_span && !authoritative_readback;

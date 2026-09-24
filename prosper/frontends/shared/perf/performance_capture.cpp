@@ -536,6 +536,21 @@ void InteractivePerformanceCapture::publish_completed(std::unique_ptr<PendingCap
                 << ",\"frontend_indices_ms\":" << record.frontend_indices_ms
                 << ",\"frontend_reflect_ms\":" << record.frontend_reflect_ms
                 << ",\"res_texture_ms\":" << record.res_texture_ms
+                << ",\"res_texture_upload_ms\":" << record.res_texture_upload_ms
+                << ",\"res_texture_bind_ms\":" << record.res_texture_bind_ms
+                << ",\"backend_texture_refs\":" << record.backend_texture_refs
+                << ",\"backend_texture_uploads\":" << record.backend_texture_uploads
+                << ",\"backend_texture_upload_bytes\":" << record.backend_texture_upload_bytes
+                << ",\"backend_texture_persistent_hits\":"
+                << record.backend_texture_persistent_hits
+                << ",\"backend_texture_persistent_misses\":"
+                << record.backend_texture_persistent_misses
+                << ",\"backend_texture_binding_refs\":" << record.backend_texture_binding_refs
+                << ",\"backend_texture_binding_unique\":" << record.backend_texture_binding_unique
+                << ",\"backend_texture_binding_persistent_hits\":"
+                << record.backend_texture_binding_persistent_hits
+                << ",\"backend_texture_binding_persistent_misses\":"
+                << record.backend_texture_binding_persistent_misses
                 << ",\"res_buffer_ms\":" << record.res_buffer_ms
                 << ",\"res_buffer_range_plan_ms\":" << record.res_buffer_range_plan_ms
                 << ",\"res_buffer_copy_ms\":" << record.res_buffer_copy_ms

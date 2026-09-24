@@ -18,6 +18,7 @@
 // because it is a real path — gpu_replay's ordered-prefix inspection and the render_submit_items
 // tests consume the last pass at its own extent — not a degenerate one.
 #include "shared/present/present_extent.hpp"
+#include "shared/present/selected_source_identity.hpp"
 
 #include <cstdio>
 #include <string_view>
@@ -132,6 +133,23 @@ int main() {
               present_source_name(PresentSourceChoice::Last) == std::string_view("px_last") &&
               present_source_name(PresentSourceChoice::None) == std::string_view("none"),
           "each candidate keeps the name the renderer's provenance diagnostics already used");
+
+    auto fresh = std::make_shared<const std::vector<uint8_t>>(4, 17);
+    auto byte_equal_old = std::make_shared<const std::vector<uint8_t>>(4, 17);
+    using prosper::frontend::PixelSourceCandidate;
+    using prosper::frontend::selected_source_submit;
+    std::array<PixelSourceCandidate, 3> sources{{{fresh, 941}, {}, {}}};
+    CHECK(selected_source_submit(fresh, sources) == 941,
+          "a selected immutable candidate carries its completed source submit");
+    CHECK(selected_source_submit(byte_equal_old, sources) == 0,
+          "byte-equal retained pixels cannot inherit the current candidate's submit");
+    sources[1] = {fresh, 940};
+    CHECK(selected_source_submit(fresh, sources) == 0,
+          "conflicting aliases cannot certify an image source");
+    sources[1] = {};
+    sources[0].source_submit = 0;
+    CHECK(selected_source_submit(fresh, sources) == 0,
+          "a rendered image with unknown producer remains unknown");
 
     std::printf(fails ? "test_present_extent: %d FAILURE(S)\n" : "test_present_extent: all ok\n",
                 fails);

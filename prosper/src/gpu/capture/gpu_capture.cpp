@@ -167,6 +167,17 @@ bool capture_draw_items(const std::vector<DrawItem>& items, const GpuCaptureMeta
     return capture_submit_items(items, {}, operations, metadata, reader, out, error, rtt_reader);
 }
 
+bool capture_gpustate_selected_draw(const GpuState& state, const DrawItem& draw,
+                                    const GpuCaptureMetadata& metadata,
+                                    uint64_t resource_limit_bytes,
+                                    GpuCaptureFile& out, std::string& error) {
+    const std::vector<SubmitOperation> operations{
+        {SubmitOperationKind::Draw, static_cast<size_t>(draw.draw_index), draw.command_order}};
+    return capture_submit_items({draw}, {}, operations, metadata,
+                                ordered_gpustate_capture_reader(state), out, error,
+                                g_rtt_seed_reader, {}, {}, resource_limit_bytes);
+}
+
 bool capture_gpustate_submit(const GpuState& state, uint64_t submit_no,
                              uint32_t width, uint32_t height,
                              const GpuCaptureMetadata& metadata,

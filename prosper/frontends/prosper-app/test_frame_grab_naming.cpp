@@ -150,7 +150,7 @@ int main() {
         CHECK(read_file(a.bundle) == "blue-prince-bundle",
               "the second title's capture did not overwrite the first title's");
         const std::set<std::string> names = listing(dir);
-        CHECK(names.size() == 4, "four files on disk: two captures, two artifacts each");
+        CHECK(names.size() == 6, "six files on disk: two captures, three reserved artifacts each");
         std::filesystem::remove_all(dir, ec); std::filesystem::create_directories(dir, ec);
     }
 
@@ -169,6 +169,8 @@ int main() {
         CHECK(clock_reads == 1, "the clock is read exactly once per capture, at arm time");
         CHECK(stem_of(grab.bundle) == stem_of(grab.screenshot),
               "the bundle and the screenshot share one stem even as the clock moves on");
+        CHECK(grab.manifest == dir + "/" + stem_of(grab.bundle) + ".f9.jsonl",
+              "the manifest uses the same exclusively reserved capture stem");
         // Now write them at genuinely different times, bmp first, bundle much later — the real order
         // and the real gap. The names must be the ones reserved at arm time, not what the clock says
         // at each write.
@@ -178,9 +180,10 @@ int main() {
         (void)advancing();
         const std::set<std::string> names = listing(dir);
         CHECK(names.count(stem_of(grab.bundle) + ".bmp") == 1 &&
-              names.count(stem_of(grab.bundle) + ".prgbundle") == 1,
-              "both files landed on the stem reserved at arm time");
-        CHECK(names.size() == 2, "a capture whose writes are 51 minutes apart still writes two files");
+              names.count(stem_of(grab.bundle) + ".prgbundle") == 1 &&
+              names.count(stem_of(grab.bundle) + ".f9.jsonl") == 1,
+              "all files landed on the stem reserved at arm time");
+        CHECK(names.size() == 3, "a capture whose writes are 51 minutes apart owns three files");
         // A later capture in the same session is a different capture, and says so.
         const FrameGrabPaths later = namer.reserve();
         CHECK(later.ok && stem_of(later.bundle) != stem_of(grab.bundle),
@@ -214,7 +217,7 @@ int main() {
         CHECK(read_file(b.bundle).empty(),
               "the later capture's unwritten bundle is empty, not the earlier capture's");
         const std::set<std::string> names = listing(dir);
-        CHECK(names.size() == 4, "each capture owns exactly its own two names");
+        CHECK(names.size() == 6, "each capture owns exactly its own three names");
         std::filesystem::remove_all(dir, ec); std::filesystem::create_directories(dir, ec);
     }
 
@@ -235,7 +238,7 @@ int main() {
         write_file(b.screenshot, "second-shot");
         CHECK(read_file(a.bundle) == "first-bundle" && read_file(a.screenshot) == "first-shot",
               "both files of the first capture survive the second capture");
-        CHECK(listing(dir).size() == 4, "both captures are on disk in full");
+        CHECK(listing(dir).size() == 6, "both captures are on disk in full");
 
         // The log line is the only way anyone finds these files. Parse the path back out of the line
         // and check it against the directory — not against the string that was formatted.
@@ -272,7 +275,7 @@ int main() {
               "the pre-existing file still holds its bytes: nothing was truncated");
         CHECK(!std::filesystem::exists(dir + "/frame_grab_PPSA13579_" + stamp + ".prgbundle"),
               "the released half-claim leaves no orphan bundle behind");
-        CHECK(listing(dir).size() == 3, "the pre-existing file plus the new capture's two");
+        CHECK(listing(dir).size() == 4, "the pre-existing file plus the new capture's three");
         std::filesystem::remove_all(dir, ec); std::filesystem::create_directories(dir, ec);
     }
 
@@ -290,7 +293,25 @@ int main() {
               "the pre-existing bundle still holds its bytes");
         CHECK(!std::filesystem::exists(dir + "/frame_grab_PPSA17942_" + stamp + ".bmp"),
               "the free screenshot name at the taken stem is never created");
-        CHECK(listing(dir).size() == 3, "the pre-existing file plus the new capture's two");
+        CHECK(listing(dir).size() == 4, "the pre-existing file plus the new capture's three");
+        std::filesystem::remove_all(dir, ec); std::filesystem::create_directories(dir, ec);
+    }
+
+    // --- the capture directory need not exist yet ------------------------------------------------
+    // An old sidecar alone must also take the stem. Otherwise a new BMP and bundle could inherit
+    // a stale successful producer-join verdict from an interrupted prior process.
+    {
+        const auto t = at_epoch_ms(1'722'517'353'471LL);
+        const std::string stamp = format_frame_grab_stamp(t);
+        const std::string taken = dir + "/frame_grab_PPSA25009_" + stamp + ".f9.jsonl";
+        write_file(taken, "OLD JOIN");
+        const FrameGrabPaths grab = reserve_frame_grab(dir, "PPSA25009", t);
+        CHECK(grab.ok && grab.suffix == 2, "a taken manifest moves the whole capture to -2");
+        CHECK(read_file(taken) == "OLD JOIN", "an existing manifest is never replaced");
+        CHECK(!std::filesystem::exists(dir + "/frame_grab_PPSA25009_" + stamp + ".prgbundle") &&
+              !std::filesystem::exists(dir + "/frame_grab_PPSA25009_" + stamp + ".bmp"),
+              "manifest collision releases both earlier claims");
+        CHECK(listing(dir).size() == 4, "old manifest plus three new artifacts");
         std::filesystem::remove_all(dir, ec); std::filesystem::create_directories(dir, ec);
     }
 
@@ -300,7 +321,7 @@ int main() {
         const FrameGrabPaths grab = reserve_frame_grab(nested, "PPSA25009",
                                                        at_epoch_ms(1'722'517'353'471LL));
         CHECK(grab.ok, "PROSPER_CAPTURE_DIR is created when it is absent");
-        CHECK(listing(nested).size() == 2, "both files land in the created directory");
+        CHECK(listing(nested).size() == 3, "all three artifacts land in the created directory");
         std::filesystem::remove_all(dir, ec); std::filesystem::create_directories(dir, ec);
     }
 

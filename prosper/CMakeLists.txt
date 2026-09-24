@@ -1399,6 +1399,12 @@ if(TARGET prosper_core)
   target_include_directories(test_prosper_app_frame_grab_naming PRIVATE frontends/prosper-app)
   add_test(NAME prosper_app_frame_grab_naming COMMAND test_prosper_app_frame_grab_naming)
 
+  add_executable(test_prosper_app_frame_grab_match frontends/prosper-app/test_frame_grab_match.cpp)
+  target_include_directories(test_prosper_app_frame_grab_match PRIVATE frontends tests)
+  target_compile_definitions(test_prosper_app_frame_grab_match PRIVATE
+    PROSPER_APP_MAIN_SOURCE="${CMAKE_CURRENT_SOURCE_DIR}/frontends/prosper-app/main.cpp")
+  add_test(NAME prosper_app_frame_grab_match COMMAND test_prosper_app_frame_grab_match)
+
   # F8's pre-trigger ring and post-trigger timing artifact: pure state machine + filesystem test,
   # including bounded overflow accounting and temporary-to-final atomic publication.
   add_executable(test_texture_source_snapshot frontends/shared/tests/test_texture_source_snapshot.cpp)
@@ -2701,6 +2707,10 @@ endif()
   target_include_directories(test_gpu_timeline PRIVATE tests)
   target_link_libraries(test_gpu_timeline PRIVATE prosper_core)
   add_test(NAME gpu_timeline_roundtrip COMMAND test_gpu_timeline)
+
+  add_executable(test_menu_frame_gate tests/gpu/timeline/test_menu_frame_gate.cpp)
+  target_link_libraries(test_menu_frame_gate PRIVATE prosper_core)
+  add_test(NAME menu_frame_gate COMMAND test_menu_frame_gate)
 
   add_executable(test_gpu_timeline_capture_exit tests/gpu/test_gpu_timeline_capture_exit.cpp)
   # Includes a shared fixture, which resolves from the `tests` root.

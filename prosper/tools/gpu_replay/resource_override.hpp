@@ -5,6 +5,7 @@
 #include "realized_shader_dump.hpp"
 #include "replay_indices.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <fstream>
 #include <limits>
@@ -207,6 +208,54 @@ inline bool read_exact_resource_override_file(const std::string& path, uint64_t 
     }
     error.clear();
     return true;
+}
+
+// Renderer-owned images bypass ShaderResource::host_data. A resource override cannot test their
+// sampled values, so replace the exact retained seed instead. This changes replay only; the source
+// capture and its oracle remain immutable, and callers must report that parity is no longer tested.
+inline bool apply_rtt_seed_override(gpu::GpuReplayFrame& replay, uint64_t guest_addr,
+                                    std::vector<uint8_t> replacement,
+                                    uint64_t& original_hash, uint64_t& replacement_hash,
+                                    std::string& error) {
+    auto selected = replay.rtt_seeds.end();
+    for (auto it = replay.rtt_seeds.begin(); it != replay.rtt_seeds.end(); ++it) {
+        if (it->guest_addr != guest_addr) continue;
+        if (selected != replay.rtt_seeds.end()) {
+            error = "ambiguous RTT seed address";
+            return false;
+        }
+        selected = it;
+    }
+    if (!guest_addr || selected == replay.rtt_seeds.end()) {
+        error = "RTT seed address not found";
+        return false;
+    }
+    if (replacement.empty() || replacement.size() != selected->rgba.size()) {
+        error = "RTT seed override byte count differs from captured seed";
+        return false;
+    }
+    original_hash = gpu::gpu_capture_hash(selected->rgba);
+    replacement_hash = gpu::gpu_capture_hash(replacement);
+    selected->rgba = std::move(replacement);
+    error.clear();
+    return true;
+}
+
+inline bool apply_rtt_seed_override_file(gpu::GpuReplayFrame& replay, uint64_t guest_addr,
+                                         const std::string& path,
+                                         uint64_t& original_hash, uint64_t& replacement_hash,
+                                         std::string& error) {
+    const auto found = std::find_if(replay.rtt_seeds.begin(), replay.rtt_seeds.end(),
+        [&](const auto& seed) { return seed.guest_addr == guest_addr; });
+    if (found == replay.rtt_seeds.end()) {
+        error = "RTT seed address not found";
+        return false;
+    }
+    std::vector<uint8_t> replacement;
+    if (!read_exact_resource_override_file(path, found->rgba.size(), replacement, error))
+        return false;
+    return apply_rtt_seed_override(replay, guest_addr, std::move(replacement),
+                                   original_hash, replacement_hash, error);
 }
 
 inline bool apply_resource_override(gpu::GpuReplayFrame& replay,

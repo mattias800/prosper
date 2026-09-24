@@ -762,7 +762,7 @@ bool read_gpu_capture_bundle(const std::string& path, GpuCaptureBundle& bundle,
                              std::string& error) {
     error.clear(); bundle = {};
     std::error_code ec; const uint64_t file_size = std::filesystem::file_size(path, ec);
-    // An EMPTY file gets its own message. The F9 frame grab claims its two output names up front with
+    // An EMPTY file gets its own message. The F9 frame grab claims its output names up front with
     // an exclusive create, so a grab that is killed (or whose bundle never completes) leaves a
     // zero-byte .prgbundle behind. That file must be unmistakable to the TOOL, not merely to someone
     // reading `ls -la`: "invalid bundle file size" reads like a corrupt or truncated capture and

@@ -32,6 +32,8 @@
 #include <cstdint>
 #include "shared/present/producer_lineage.hpp"
 
+namespace prosper { struct VideoOutBufferSnapshot; }
+
 namespace prosper::frontend {
 
 // A published GPU scanout frame handed to the consumer. The image is fully written and stable (in
@@ -52,7 +54,9 @@ struct GpuScanoutFrame {
 // the caller keeps the CPU present path. `frame_seq` is echoed back in the published frame for identity.
 bool present_blit_publish(VkImage src, VkImageLayout src_layout, VkFormat src_format,
                           uint32_t w, uint32_t h, uint64_t frame_seq,
-                          ProducerSource producer = {}, uint64_t* published_id = nullptr);
+                          ProducerSource producer = {},
+                          const VideoOutBufferSnapshot* expected_front = nullptr,
+                          uint64_t* published_id = nullptr);
 
 // Consumer side. Fetch the newest published frame not already taken; false if nothing new is available.
 // The caller owns the returned slot until it calls present_blit_release(out.slot).

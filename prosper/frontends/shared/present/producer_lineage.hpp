@@ -17,6 +17,10 @@ namespace prosper::frontend {
 struct CompletedProducer {
     uint64_t registration = 0;
     uint64_t work = 0;
+    // The architectural submit that recorded this image write. Zero is unavailable: the first
+    // live AGC submit is numbered 1, while direct backend calls and replay have no live submit.
+    // A representation-only copy retains the original submit with the work identity.
+    uint64_t source_submit = 0;
     constexpr bool known() const { return registration && work; }
     constexpr bool operator==(const CompletedProducer&) const = default;
 };
@@ -28,6 +32,12 @@ struct ProducerSource {
     CompletedProducer completed;
     constexpr bool known() const { return image_registration && completed.known(); }
 };
+
+// A target acquisition or readback is not a new image version. Presentation/capture attribution
+// must follow the exact completed producer carried by the image, or remain unknown.
+constexpr uint64_t completed_source_submit(ProducerSource source) {
+    return source.known() ? source.completed.source_submit : 0;
+}
 
 // Same-binary overhead control. Fixed at first use; disabled runs report unavailable F8 lineage
 // fields. The ordinary build enables accounting without requiring an option or driver feature.

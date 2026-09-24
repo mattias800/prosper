@@ -767,6 +767,13 @@ descriptor-visible linear hash fail, while `--expect-post-hash HASH` requires an
 raw/backing hash. Those gates prove the requested execution and observation lever moved; the output file
 itself is always linearized, not tiled.
 This mode initializes Vulkan and is not an inspect-only command.
+`--dump-post-compute-resource-unverified COMPUTE:BINDING PATH.unverified` is a separate,
+explicit diagnostic for a capture whose prefix has failed dispatches. It still requires the
+selected dispatch to execute exactly once and succeed, but writes its linear output even when
+earlier dispatches failed. The `.unverified` suffix is mandatory and the log prints the failed
+prefix count. Its bytes can show where an offline replay diverges; they cannot establish that the
+guest's complete preceding computation or the live presented frame was correct. The strict flag
+above keeps refusing such a prefix.
 `--compute-only N` retains just that realized dispatch and
 its captured resources, making a driver or recompiler failure deterministic without running unrelated draws
 or dispatches. `--override-compute-spv N PATH` replaces that dispatch's module after capture materialization;
@@ -787,6 +794,25 @@ program address and storage-buffer byte size. Either filter may be used alone.
 seeds retain their bytes; RGBA16F seeds are clamped to 0..1 and converted to RGBA8 for viewing. The address
 is the `guest_addr` printed by `--inspect-only`. This exposes the input to operation zero, not the surface after
 the selected submit executes, and the inspection conversion is not a pixel oracle for HDR values.
+`--dump-rtt-seed-raw ADDR PATH` writes the same seed's serialized texel bytes without BMP conversion or
+channel loss. Its byte length and format are printed; interpret the bytes using that format and extent.
+This is useful for alpha and HDR values that the BMP cannot preserve. It is still an input seed, not a
+readback after any operation. It refuses combination with `--override-rtt-seed`, which would otherwise
+replace the captured bytes before the dump.
+
+For a normal live GPU-target path, `PROSPER_DUMP_PERSISTENT=ms:N` opens a three-callback
+readback window. `PROSPER_DUMP_PERSISTENT_EXTENT=WxH` limits it to retained images of that size
+and applies the selected-readback budget; it can be combined with
+`PROSPER_DUMP_PERSISTENT_ADDRS=0x...`. An exact guest address can move between launches, so an
+extent is the more reliable selector for a cross-run comparison. The converted BMP is an
+inspection view; the log also reports raw nonzero bytes and the first nonzero texel.
+
+Live `PROSPER_FS_SPV=PATH` can be restricted by `PROSPER_FS_SPV_MATCH=ORIGINAL.spv` (exact
+recompiled words), and then by `PROSPER_FS_SPV_GUEST_ADDR=0x...`,
+`PROSPER_FS_SPV_TARGET_ADDR=0x...`, or `PROSPER_FS_SPV_TARGET_DIM=WxH`. Each added selector
+must match; malformed selectors disable the file override. A program may write several targets,
+and a target may move between launches, so the `[fs-match]` application log and a visual control
+are both needed before attributing an output change.
 
 Live runs can narrow intermediate-target dumps with
 `PROSPER_DUMP_RTGROUPS=<min-nonzero-bytes> PROSPER_DUMP_RTGROUPS_ADDR=0x...`; since #2680 the address is matched against **every MRT slot**, not only slot 0 (the report names which slot matched, and the dumped pixels remain slot 0's). Only a target whose guest base

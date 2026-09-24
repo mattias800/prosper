@@ -321,6 +321,37 @@ int main() {
               "a table copy retains the replacement by shared ownership");
     }
 
+    {
+        gpu::GpuReplayFrame seeds;
+        seeds.rtt_seeds.push_back({.guest_addr = 0xabc000,
+                                   .width = 1, .height = 1,
+                                   .format = gpu::GpuCaptureColorFormat::Rgba8Unorm,
+                                   .rgba = {0, 0, 0, 0}});
+        uint64_t old_hash = 0, new_hash = 0;
+        std::string seed_error;
+        CHECK(!tools::apply_rtt_seed_override(seeds, 0xdef000, {255, 255, 255, 255},
+                                              old_hash, new_hash, seed_error) &&
+                  seeds.rtt_seeds[0].rgba == std::vector<uint8_t>({0, 0, 0, 0}),
+              "a missing retained image cannot be invented by an override");
+        CHECK(!tools::apply_rtt_seed_override(seeds, 0xabc000, {255, 255, 255},
+                                              old_hash, new_hash, seed_error) &&
+                  seeds.rtt_seeds[0].rgba == std::vector<uint8_t>({0, 0, 0, 0}),
+              "a partial retained image override cannot change the seed");
+        seeds.rtt_seeds.push_back(seeds.rtt_seeds.front());
+        CHECK(!tools::apply_rtt_seed_override(seeds, 0xabc000, {255, 255, 255, 255},
+                                              old_hash, new_hash, seed_error) &&
+                  seeds.rtt_seeds[0].rgba == std::vector<uint8_t>({0, 0, 0, 0}),
+              "duplicate retained-image identities refuse before mutation");
+        seeds.rtt_seeds.pop_back();
+        CHECK(tools::apply_rtt_seed_override(seeds, 0xabc000, {255, 255, 255, 255},
+                                             old_hash, new_hash, seed_error) &&
+                  old_hash == gpu::gpu_capture_hash(std::vector<uint8_t>({0, 0, 0, 0})) &&
+                  new_hash == gpu::gpu_capture_hash(seeds.rtt_seeds[0].rgba) &&
+                  old_hash != new_hash &&
+                  seeds.rtt_seeds[0].rgba == std::vector<uint8_t>({255, 255, 255, 255}),
+              "the exact retained image seed, rather than unused host bytes, changes in replay");
+    }
+
     std::printf("%s\n", fails ? "FAILED" : "ALL TESTS PASSED");
     return fails ? 1 : 0;
 }
