@@ -3713,6 +3713,17 @@ endif()
       target_link_libraries(test_recompiled_shaders PRIVATE prosper_core Vulkan::Vulkan)
       add_test(NAME recompiled_shaders_render COMMAND test_recompiled_shaders)
 
+      # Host-side workgroup/mesh execution boundary for merged NGG. On devices without the
+      # optional extension the same fixture asserts that the draw leaves the clear image intact.
+      add_executable(test_mesh_backend tests/gpu/recompiler/test_mesh_backend.cpp)
+      target_include_directories(test_mesh_backend PRIVATE tests frontends)
+      target_link_libraries(test_mesh_backend PRIVATE prosper_core Vulkan::Vulkan)
+      add_test(NAME mesh_backend_workgroup COMMAND test_mesh_backend)
+      set_tests_properties(mesh_backend_workgroup PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+      add_test(NAME mesh_backend_feature_off COMMAND test_mesh_backend)
+      set_tests_properties(mesh_backend_feature_off PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60
+        ENVIRONMENT "PROSPER_NO_MESH_SHADER=1")
+
       # Vertex fetch: a VS that pulls positions from a bound vertex buffer via buffer_load_format,
       # keyed by a ShaderResourceTable — real game vertex shaders work this way.
       add_executable(test_vertex_fetch_render tests/gpu/test_vertex_fetch_render.cpp)

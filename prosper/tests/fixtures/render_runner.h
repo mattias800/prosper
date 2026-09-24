@@ -598,6 +598,11 @@ inline BackendColorTargetStats backend_color_target_stats() {
 // that requires an ordered pass boundary. render_triangle_rgba is a thin single-draw wrapper (below).
 struct BackendDraw {
     std::vector<uint32_t> vs, gs, fs;
+    // For a mesh draw, `vs` carries a MeshEXT module instead of a vertex module. The group counts
+    // are draw-time state, not pipeline identity. The backend refuses this path unless the optional
+    // device feature and command entry point were both acquired.
+    bool mesh_draw = false;
+    std::array<uint32_t, 3> mesh_groups{1, 1, 1};
     prosper::gpu::SharedShaderWords vs_shared, fs_shared;
     uint64_t vs_identity = 0, fs_identity = 0;
     // Whether the backend may run a WaveAny-only fragment program at the host's native wave width.
@@ -1268,6 +1273,12 @@ struct RenderVkCtx {
     // Geometry-probe (PROSPER_GEOM_PROBE): transform feedback for final clip-space positions.
     bool transform_feedback_enabled = false;
     bool subgroup_size_control = false;
+    // Optional workgroup-based pre-rasterization path for merged NGG/GS programs. A native
+    // subgroup of 64 is not required: guest wave64 can span multiple host subgroups.
+    bool mesh_shader_enabled = false;
+    VkPhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_PROPERTIES_EXT};
+    PFN_vkCmdDrawMeshTasksEXT cmd_draw_mesh_tasks = nullptr;
     // Runtime-selected storage buffers (#2412). Successful contracts are bounded fixed arrays, so the
     // only descriptor-indexing feature they require is non-uniform storage-buffer array indexing.
     //
@@ -1598,6 +1609,8 @@ inline const RenderVkCtx& render_vk_ctx() {
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES};
         VkPhysicalDeviceShaderAtomicInt64Features atomic_int64_features{
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_INT64_FEATURES};
+        VkPhysicalDeviceMeshShaderFeaturesEXT mesh_features{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT};
         // These features are core in Vulkan 1.2/1.3. Query the feature bits directly;
         // promoted extensions need not still be advertised by a Vulkan 1.4 device.
         //
@@ -1704,6 +1717,29 @@ inline const RenderVkCtx& render_vk_ctx() {
                       r.transform_feedback_enabled = true;
                   }
               }
+              if (!strcmp(de[i].extensionName, VK_EXT_MESH_SHADER_EXTENSION_NAME)) {
+                  VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+                  f2.pNext = &mesh_features;
+                  vkGetPhysicalDeviceFeatures2(r.phys, &f2);
+                  if (mesh_features.meshShader &&
+                      !PROSPER_ENV_ON("PROSPER_NO_MESH_SHADER")) {
+                      VkPhysicalDeviceProperties2 p2{
+                          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+                      p2.pNext = &r.mesh_shader_properties;
+                      vkGetPhysicalDeviceProperties2(r.phys, &p2);
+                      // The task stage and mesh queries are separate optional features. This
+                      // backend needs neither for direct mesh workgroup draws.
+                      mesh_features = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT};
+                      mesh_features.meshShader = VK_TRUE;
+                      mesh_features.pNext = const_cast<void*>(dci.pNext);
+                      dci.pNext = &mesh_features;
+                      dev_exts.push_back(VK_EXT_MESH_SHADER_EXTENSION_NAME);
+                  } else {
+                      // Keep the feature-chain object disarmed as well as the extension list. The
+                      // opt-out is a deterministic unsupported-device arm on feature-rich hosts.
+                      mesh_features = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT};
+                  }
+              }
               // Present unification (#1270): the swapchain device-extension, only when the instance is
               // surface-capable. Enabling it on the headless render device is harmless (no swapchain is
               // ever created there by tests/screenshot); prosper-app needs it to create its swapchain on
@@ -1722,6 +1758,23 @@ inline const RenderVkCtx& render_vk_ctx() {
         dci.enabledExtensionCount = (uint32_t)dev_exts.size();
         dci.ppEnabledExtensionNames = dev_exts.empty() ? nullptr : dev_exts.data();
         if (vkCreateDevice(r.phys, &dci, nullptr, &r.dev) != VK_SUCCESS || !r.dev) return r;
+        if (mesh_features.meshShader) {
+            r.cmd_draw_mesh_tasks = reinterpret_cast<PFN_vkCmdDrawMeshTasksEXT>(
+                vkGetDeviceProcAddr(r.dev, "vkCmdDrawMeshTasksEXT"));
+            r.mesh_shader_enabled = r.cmd_draw_mesh_tasks != nullptr;
+            // This device-init diagnostic is outside the hot path. Keep the read live because
+            // tests arm GFXLOG after other backend entry points have already run.
+            if (getenv("PROSPER_GFXLOG")) {
+                std::fprintf(stderr,
+                    "[vk] mesh shader %s: invocations=%u shared=%u outputs=%u/%u layers=%u\n",
+                    r.mesh_shader_enabled ? "ENABLED" : "entry point missing",
+                    r.mesh_shader_properties.maxMeshWorkGroupInvocations,
+                    r.mesh_shader_properties.maxMeshSharedMemorySize,
+                    r.mesh_shader_properties.maxMeshOutputVertices,
+                    r.mesh_shader_properties.maxMeshOutputPrimitives,
+                    r.mesh_shader_properties.maxMeshOutputLayers);
+            }
+        }
         // #3533: the heap layout the memory budget resolves every allocation against. It has to be
         // HERE, at device creation, rather than beside the first render call: an allocation that
         // arrives before the layout is known cannot be attributed to a heap, so the budget drops it,
@@ -7030,6 +7083,12 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     const BackendPersistentResourceGuard persistent_resource_guard;
     const RenderVkCtx& ctx = render_vk_ctx();
     if (!ctx.ok) return out;
+    // Every graphics shader resource dependency must include the optional mesh stage when the
+    // device enabled it. The stage bit is invalid on devices without that feature, so keep this
+    // mask tied to the feature actually requested at device creation.
+    const VkPipelineStageFlags graphics_shader_stages =
+        VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+        (ctx.mesh_shader_enabled ? VK_PIPELINE_STAGE_MESH_SHADER_BIT_EXT : 0u);
     for (const auto& draw : draws)
         for (const auto& resource : draw.R)
             if (resource.gpu_detile &&
@@ -8168,6 +8227,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         VkBool32 depth_test = VK_FALSE, depth_write = VK_FALSE, stencil_test = VK_FALSE;
         VkCompareOp depth_compare = VK_COMPARE_OP_NEVER;
         uint32_t n_sets = 1, vcount = 3, icount = 0, instance_count = 1;
+        bool mesh_draw = false;
+        std::array<uint32_t, 3> mesh_groups{1, 1, 1};
         int32_t vertex_offset = 0;
         bool use_desc = false, ok = false, pipeline_cached = false;
     };
@@ -8920,6 +8981,24 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         const std::vector<uint32_t>& bd_gs = bd.gs_words();
         const std::vector<uint32_t>& bd_fs = bd.fs_words();
         DV& v = dv[di];
+        if (bd.mesh_draw) {
+            const uint64_t groups_xy =
+                static_cast<uint64_t>(bd.mesh_groups[0]) * bd.mesh_groups[1];
+            if (!ctx.mesh_shader_enabled || !ctx.cmd_draw_mesh_tasks || !bd_gs.empty() ||
+                bd.index_count() || !bd.mesh_groups[0] || !bd.mesh_groups[1] ||
+                !bd.mesh_groups[2] ||
+                bd.mesh_groups[0] > ctx.mesh_shader_properties.maxMeshWorkGroupCount[0] ||
+                bd.mesh_groups[1] > ctx.mesh_shader_properties.maxMeshWorkGroupCount[1] ||
+                bd.mesh_groups[2] > ctx.mesh_shader_properties.maxMeshWorkGroupCount[2] ||
+                groups_xy > ctx.mesh_shader_properties.maxMeshWorkGroupTotalCount ||
+                (groups_xy && bd.mesh_groups[2] >
+                    ctx.mesh_shader_properties.maxMeshWorkGroupTotalCount / groups_xy)) {
+                std::fprintf(stderr, "[mesh] draw=%zu unsupported device or group shape; skipped\n", di);
+                continue;
+            }
+            v.mesh_draw = true;
+            v.mesh_groups = bd.mesh_groups;
+        }
         const auto subgroup_scan_begin =
             timing_enabled ? TimingClock::now() : TimingClock::time_point{};
         // Both of these walk the ENTIRE SPIR-V module, and build_bds calls them once per draw on a
@@ -9284,7 +9363,9 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         VkPipelineShaderStageCreateInfo st[3]{};
         VkPipelineShaderStageRequiredSubgroupSizeCreateInfo required_fragment_subgroup{
             VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO};
-        st[0] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}; st[0].stage = VK_SHADER_STAGE_VERTEX_BIT; st[0].module = v.vs; st[0].pName = "main";
+        st[0] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+        st[0].stage = bd.mesh_draw ? VK_SHADER_STAGE_MESH_BIT_EXT : VK_SHADER_STAGE_VERTEX_BIT;
+        st[0].module = v.vs; st[0].pName = "main";
         const uint32_t fragment_stage_index = bd_gs.empty() ? 1u : 2u;
         if (!bd_gs.empty()) {
             st[1] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
@@ -9344,7 +9425,10 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE,
         };
         VkPipelineDynamicStateCreateInfo dynamic_state{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
-        dynamic_state.dynamicStateCount = static_cast<uint32_t>(std::size(dynamic_states));
+        // Mesh pipelines get topology from their shader execution mode. Vulkan forbids the two
+        // vertex-input dynamic states at the tail of this list for a mesh pipeline (07065/07066).
+        dynamic_state.dynamicStateCount = static_cast<uint32_t>(
+            std::size(dynamic_states) - (bd.mesh_draw ? 2u : 0u));
         dynamic_state.pDynamicStates = dynamic_states;
         VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
         rs.polygonMode = VK_POLYGON_MODE_FILL; rs.cullMode = VK_CULL_MODE_NONE; rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE; rs.lineWidth = 1.0f;
@@ -9930,7 +10014,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                     // VERTEX_BIT — a fragment-only hardcode made set-0 textures invisible to the VS,
                     // yielding undefined samples / a validation error (#376). Match the storage-buffer path.
                     draw_lb[i].stageFlags = (r.set == 0)
-                        ? (VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT)
+                        ? ((bd.mesh_draw ? VK_SHADER_STAGE_MESH_BIT_EXT : VK_SHADER_STAGE_VERTEX_BIT) |
+                           VK_SHADER_STAGE_FRAGMENT_BIT)
                         : VK_SHADER_STAGE_FRAGMENT_BIT;
                     texture_references++;
                     // Every ACTIVE bound slot, not just 0 and 1. A sampled renderer mip chain must
@@ -10720,7 +10805,10 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 } else {
                     const FrameBufferResource& r = common;
                     const ResourcePhaseTimer phase_buffer(timing_enabled, &res_buffer_ms);
-                    draw_lb[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; draw_lb[i].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+                    draw_lb[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                    draw_lb[i].stageFlags = (bd.mesh_draw ? VK_SHADER_STAGE_MESH_BIT_EXT
+                                                         : VK_SHADER_STAGE_VERTEX_BIT) |
+                                             VK_SHADER_STAGE_FRAGMENT_BIT;
                     if (r.is_internal_gds) {
                         const RenderHostBuffer& gds = render_internal_gds_buffer();
                         draw_dbi[i] = {gds.buffer, 0, 64u * 1024u};
@@ -10982,7 +11070,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         }
         VkGraphicsPipelineCreateInfo gp{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
         gp.stageCount = bd_gs.empty() ? 2u : 3u; gp.pStages = st;
-        gp.pVertexInputState = &vin; gp.pInputAssemblyState = &ia;
+        gp.pVertexInputState = bd.mesh_draw ? nullptr : &vin;
+        gp.pInputAssemblyState = bd.mesh_draw ? nullptr : &ia;
         gp.pViewportState = &vpst; gp.pRasterizationState = &rs; gp.pMultisampleState = &ms;
         gp.pColorBlendState = &cb; gp.pDynamicState = &dynamic_state;
         gp.layout = v.layout; gp.renderPass = rp; gp.subpass = 0;
@@ -11008,7 +11097,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 memcpy(&word, &value, sizeof word);
                 append(word);
             };
-            append(13); // core dynamic depth/stencil/cull/topology; retain topology class (#3419)
+            append(13); // retain existing vertex pipeline keys byte-for-byte
+            if (bd.mesh_draw) append(0x4D455348u); // MeshEXT differs from a vertex module
             append(W); append(H); append(color_count);
             for (uint32_t slot = 0; slot < color_count; ++slot)
                 append(static_cast<uint32_t>(color_formats[slot]));
@@ -11063,7 +11153,9 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                                       : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
                     const auto& common = R[i].common();
                     const VkShaderStageFlags stage_flags = !texture || common.set == 0
-                        ? (VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT)
+                        ? ((bd.mesh_draw ? VK_SHADER_STAGE_MESH_BIT_EXT
+                                         : VK_SHADER_STAGE_VERTEX_BIT) |
+                           VK_SHADER_STAGE_FRAGMENT_BIT)
                         : VK_SHADER_STAGE_FRAGMENT_BIT;
                     append(common.set); append(common.binding); append(descriptor_type);
                     append(stage_flags);   // count already keyed above, for both branches
@@ -11151,7 +11243,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 fprintf(stderr, "[backend-trace] draw=%zu create-shaders begin\n", di);
                 fflush(stderr);
             }
-            v.vs = mkmod(bd_vs, "vs", bd.vs_identity);
+            v.vs = mkmod(bd_vs, bd.mesh_draw ? "ms" : "vs", bd.vs_identity);
             v.gs = bd_gs.empty() ? VK_NULL_HANDLE : mkmod(bd_gs, "gs", 0);
             v.fs = mkmod(bd_fs, "fs", bd.fs_identity);
             if (backend_trace) {
@@ -11368,8 +11460,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                              VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
         vkCmdPipelineBarrier(cmd,
                              VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
-                                 VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
-                                 VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                                 graphics_shader_stages |
                                  VK_PIPELINE_STAGE_TRANSFER_BIT,
                              VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
                              0, 0, nullptr, 0, nullptr, 1, &load);
@@ -11391,8 +11482,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                              VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
         vkCmdPipelineBarrier(cmd,
                              VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
-                                 VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
-                                 VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                                 graphics_shader_stages |
                                  VK_PIPELINE_STAGE_TRANSFER_BIT,
                              VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
                              0, 0, nullptr, 0, nullptr, 1, &load);
@@ -11409,8 +11499,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                              VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
         vkCmdPipelineBarrier(cmd,
                              VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
-                                 VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
-                                 VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                                 graphics_shader_stages |
                                  VK_PIPELINE_STAGE_TRANSFER_BIT,
                              VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
                              0, 0, nullptr, 0, nullptr, 1, &load);
@@ -11547,7 +11636,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         vkCmdPipelineBarrier(
             cmd,
             upload.persistent_refresh
-                ? (VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT)
+                ? graphics_shader_stages
                 : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b0);
         if (upload.feedback_snapshot) {
@@ -11567,8 +11656,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             vkCmdPipelineBarrier(
                 cmd,
                 VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
-                    VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
-                    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                    graphics_shader_stages |
                     VK_PIPELINE_STAGE_TRANSFER_BIT,
                 VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
                 0, nullptr, 0, nullptr, 1, &source_to_copy);
@@ -11593,8 +11681,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             vkCmdPipelineBarrier(
                 cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
                 VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
-                    VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
-                    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                    graphics_shader_stages,
                 0, 0, nullptr, 0, nullptr, 1, &source_restore);
         } else if (upload.stacked_compute) {
             VkImageMemoryBarrier source_to_copy{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
@@ -11690,8 +11777,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                     vkCmdPipelineBarrier(
                         cmd,
                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
-                            VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
-                            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                            graphics_shader_stages |
                             VK_PIPELINE_STAGE_TRANSFER_BIT,
                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
                         0, nullptr, 0, nullptr, 1, &source_to_copy);
@@ -11718,8 +11804,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                         VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
                     vkCmdPipelineBarrier(
                         cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                        VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
-                            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                        graphics_shader_stages |
                             VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
                         0, 0, nullptr, 0, nullptr, 1, &source_restore);
                 }
@@ -11784,13 +11869,12 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         b1.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         b1.dstAccessMask = VK_ACCESS_SHADER_READ_BIT |
             (upload.key.storage_image ? VK_ACCESS_SHADER_WRITE_BIT : 0);
-        // The dst stage must cover EVERY stage that samples this image. #376 made set-0 textures
-        // VS-visible (stageFlags VERTEX|FRAGMENT), so a vertex texture fetch reads it in the VERTEX
-        // stage — a FRAGMENT-only barrier leaves the transfer-write→shader-read dependency unordered
-        // for that stage (SYNC-HAZARD-READ-AFTER-WRITE; garbage vertex fetch on GPUs that don't
-        // over-synchronize). Include the vertex stage to match the binding's stageFlags (#454).
+        // The dst stage must cover every stage that samples this image. Set-0 textures are visible
+        // to the vertex or mesh stage as well as fragment; a fragment-only barrier leaves those
+        // reads unordered after the transfer write (SYNC-HAZARD-READ-AFTER-WRITE). Match the
+        // enabled binding stages, including optional mesh shaders (#454).
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                             VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                             graphics_shader_stages,
                              0, 0, nullptr, 0, nullptr, 1, &b1);
     }
     // Compute-owned typed storage results rest in GENERAL. Borrow each exact image once per call,
@@ -11816,8 +11900,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         vkCmdPipelineBarrier(cmd,
                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
                                  VK_PIPELINE_STAGE_TRANSFER_BIT,
-                             VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
-                                 VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                             graphics_shader_stages,
                              0, 0, nullptr, 0, nullptr, 1, &to_sampled);
     }
     // Same-pass depth feedback (#1186): make prior attachment writes visible to the shader and
@@ -11839,8 +11922,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         vkCmdPipelineBarrier(cmd,
                              VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
                                  VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
-                             VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
-                                 VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                             graphics_shader_stages |
                                  VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
                                  VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
                              0, 0, nullptr, 0, nullptr, 1, &to_feedback);
@@ -11869,8 +11951,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         vkCmdPipelineBarrier(cmd,
                              VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
                                  VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
-                             VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
-                                 VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                             graphics_shader_stages,
                              0, 0, nullptr, 0, nullptr, 1, &to_sampled);
     }
     // Clear color: the caller's clear_rgba (game fast-clear / black on the live path), else the
@@ -12090,8 +12171,10 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         vkCmdSetStencilTestEnable(command, v.stencil_test);
         vkCmdSetCullMode(command, v.cull_mode);
         vkCmdSetFrontFace(command, v.front_face);
-        vkCmdSetPrimitiveTopology(command, v.topology);
-        vkCmdSetPrimitiveRestartEnable(command, v.primitive_restart);
+        if (!v.mesh_draw) {
+            vkCmdSetPrimitiveTopology(command, v.topology);
+            vkCmdSetPrimitiveRestartEnable(command, v.primitive_restart);
+        }
     };
     auto record_draw_dynamic_state = [&](VkCommandBuffer command, const DV& v,
                                          const prosper::gpu::ResolvedPipelineState* ps) {
@@ -12199,7 +12282,9 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             std::fprintf(stderr, "\n");
             std::fflush(stderr);
         }
-        if (v.icount) {
+        if (v.mesh_draw) {
+            ctx.cmd_draw_mesh_tasks(cmd, v.mesh_groups[0], v.mesh_groups[1], v.mesh_groups[2]);
+        } else if (v.icount) {
             vkCmdBindIndexBuffer(cmd, v.ibuf, v.ioffset, VK_INDEX_TYPE_UINT32);
             vkCmdDrawIndexed(cmd, v.icount, v.instance_count, 0, v.vertex_offset, 0);
         } else {
@@ -12323,8 +12408,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                     VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
                                     VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-                             VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
-                                 VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                             graphics_shader_stages |
                                  VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
                              0, 0, nullptr, 0, nullptr, 1, &color_ready);
     };
@@ -12372,8 +12456,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         to_ds.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
                               VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
         vkCmdPipelineBarrier(cmd,
-                             VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
-                                 VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                             graphics_shader_stages,
                              VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
                                  VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
                              0, 0, nullptr, 0, nullptr, 1, &to_ds);
@@ -12389,8 +12472,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         restore.image = borrowed;
         restore.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         vkCmdPipelineBarrier(cmd,
-                             VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
-                                 VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                             graphics_shader_stages,
                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
                                  VK_PIPELINE_STAGE_TRANSFER_BIT,
                              0, 0, nullptr, 0, nullptr, 1, &restore);
@@ -12411,8 +12493,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         to_readback.srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
         to_readback.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
         vkCmdPipelineBarrier(cmd,
-                             VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
-                                 VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                             graphics_shader_stages,
                              VK_PIPELINE_STAGE_TRANSFER_BIT,
                              0, 0, nullptr, 0, nullptr, 1, &to_readback);
         VkBufferImageCopy copy{};
@@ -12429,8 +12510,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         to_general.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
         to_general.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                             VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
-                                 VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                             graphics_shader_stages,
                              0, 0, nullptr, 0, nullptr, 1, &to_general);
     }
     if (readback_requested) {
@@ -12501,8 +12581,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                       VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
                                       VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
             vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                 VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
-                                     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                                 graphics_shader_stages |
                                      VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
                                  0, 0, nullptr, 0, nullptr, 1, &to_sample);
         };
@@ -13159,7 +13238,9 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                     vkCmdBindPipeline(c2, VK_PIPELINE_BIND_POINT_GRAPHICS, v.pipe);
                     record_draw_dynamic_state(c2, v, draws[di].ps);   // #3248: same state as the pass being isolated
                     if (v.use_desc) vkCmdBindDescriptorSets(c2, VK_PIPELINE_BIND_POINT_GRAPHICS, v.layout, 0, v.n_sets, v.dsets.data(), 0, nullptr);
-                    if (v.icount) { vkCmdBindIndexBuffer(c2, v.ibuf, v.ioffset, VK_INDEX_TYPE_UINT32); vkCmdDrawIndexed(c2, v.icount, v.instance_count, 0, v.vertex_offset, 0); }
+                    if (v.mesh_draw) ctx.cmd_draw_mesh_tasks(
+                        c2, v.mesh_groups[0], v.mesh_groups[1], v.mesh_groups[2]);
+                    else if (v.icount) { vkCmdBindIndexBuffer(c2, v.ibuf, v.ioffset, VK_INDEX_TYPE_UINT32); vkCmdDrawIndexed(c2, v.icount, v.instance_count, 0, v.vertex_offset, 0); }
                     else vkCmdDraw(c2, v.vcount, v.instance_count, static_cast<uint32_t>(v.vertex_offset), 0);
                 }
                 vkCmdEndRenderPass(c2);

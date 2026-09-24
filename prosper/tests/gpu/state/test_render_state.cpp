@@ -235,6 +235,31 @@ int main() {
         CHECK(kena_view.selected_mip_depth == 32u && kena_view.first_slice == 0u &&
                   kena_view.slice_count == 32u && kena_view.clipped_to_mip,
               "3D view clips Kena's inclusive maximum to its 32-slice allocation");
+        volume.cx[P::SPI_SHADER_POS_FORMAT] = 0x00000044u;
+        volume.cx[P::PA_CL_VS_OUT_CNTL] = 0x01240000u;
+        const PositionOutputState kena_output = extract_render_state(volume).position_output;
+        CHECK(kena_output.has_pos_format && kena_output.has_vs_out_control &&
+                  kena_output.pos_format == 0x44u &&
+                  kena_output.vs_out_control == 0x01240000u &&
+                  kena_output.layer_route() == LayerOutputRoute::Pos1Z,
+              "Kena's programmed POS1.z is the render-target array-index route");
+        volume.cx[P::PA_CL_VS_OUT_CNTL] &= ~(1u << 18);
+        CHECK(extract_render_state(volume).position_output.layer_route() ==
+                  LayerOutputRoute::None,
+              "an unconsumed POS1.z is not a layer export");
+        volume.cx[P::PA_CL_VS_OUT_CNTL] = 0x01240000u & ~(1u << 21);
+        CHECK(extract_render_state(volume).position_output.layer_route() ==
+                  LayerOutputRoute::Unsupported,
+              "a requested layer without the misc vector remains unresolved");
+        volume.cx[P::PA_CL_VS_OUT_CNTL] = 0x01240000u;
+        volume.cx[P::SPI_SHADER_POS_FORMAT] = 0x00000014u;
+        CHECK(extract_render_state(volume).position_output.layer_route() ==
+                  LayerOutputRoute::Unsupported,
+              "a one-component POS1 cannot silently supply its z channel");
+        volume.cx.erase(P::SPI_SHADER_POS_FORMAT);
+        CHECK(extract_render_state(volume).position_output.layer_route() ==
+                  LayerOutputRoute::Unsupported,
+              "an absent position format cannot authorize a layered shader");
         const RenderState absent_render = extract_render_state(GpuState{});
         const ColorTargetState& absent = absent_render.color_targets[0];
         CHECK(!absent.has_view && !absent.has_attrib3 &&

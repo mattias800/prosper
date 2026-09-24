@@ -647,6 +647,10 @@ RenderState extract_render_state(const GpuState& st) {
         ? rd(st.cx, P::SPI_SHADER_COL_FORMAT) : 0u;
     rs.sx_ps_downconvert = st.cx.count(P::SX_PS_DOWNCONVERT)
         ? rd(st.cx, P::SX_PS_DOWNCONVERT) : 0u;
+    rs.position_output.has_pos_format = st.cx.count(P::SPI_SHADER_POS_FORMAT) != 0;
+    rs.position_output.has_vs_out_control = st.cx.count(P::PA_CL_VS_OUT_CNTL) != 0;
+    rs.position_output.pos_format = rd(st.cx, P::SPI_SHADER_POS_FORMAT);
+    rs.position_output.vs_out_control = rd(st.cx, P::PA_CL_VS_OUT_CNTL);
 
     // Viewport 0 transform (guest floats; all-zero when never programmed).
     rs.vport_xscale  = flt(rd(st.cx, P::PA_CL_VPORT_XSCALE));

@@ -81,8 +81,32 @@ constexpr ColorTargetVolumeView color_target_volume_view(const ColorTargetState&
     return view;
 }
 
+enum class LayerOutputRoute : uint8_t { None, Pos1Z, Unsupported };
+
+// The position export format and the primitive assembler's use bits are separate registers.
+// PA_CL_VS_OUT_CNTL[18] consumes render-target array index from VS_OUT_MISC_VEC.z, while [21]
+// enables that vector. Kena programs POS0/POS1 as four-component exports (0x44) and writes
+// POS1.z. Keep raw values and presence: a programmed but unsupported shape must not turn into
+// layer zero merely because a host shader interface cannot express it yet.
+struct PositionOutputState {
+    bool has_pos_format = false, has_vs_out_control = false;
+    uint32_t pos_format = 0, vs_out_control = 0;
+
+    constexpr LayerOutputRoute layer_route() const {
+        constexpr uint32_t kUseRenderTargetIndex = 1u << 18;
+        constexpr uint32_t kMiscVectorEnable = 1u << 21;
+        if (!has_vs_out_control || !(vs_out_control & kUseRenderTargetIndex))
+            return LayerOutputRoute::None;
+        if (has_pos_format && (vs_out_control & kMiscVectorEnable) &&
+            (pos_format & 0xFu) == 4u && ((pos_format >> 4) & 0xFu) == 4u)
+            return LayerOutputRoute::Pos1Z;
+        return LayerOutputRoute::Unsupported;
+    }
+};
+
 struct RenderState {
     std::array<ColorTargetState, kColorTargetCount> color_targets{};
+    PositionOutputState position_output{};
     // Shader program GPU addresses per stage (byte address; 0 if that stage's PGM regs were unset).
     uint64_t ps_addr = 0;   // pixel  (SPI_SHADER_PGM_{LO,HI}_PS)
     uint64_t gs_addr = 0;   // geometry (…_GS)

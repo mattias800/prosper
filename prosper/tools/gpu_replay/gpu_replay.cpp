@@ -996,8 +996,9 @@ void inspect_frame(const prosper::gpu::GpuReplayFrame& replay, uint32_t format_v
                 std::printf("?");
             std::printf(" pipeline=%s", failure.pipeline_present ? "yes" : "no");
             if (failure.pipeline_present) {
-                std::printf(" fmt=%u cwm=%x depth=%d/%d/%u stencil=%d blend=%d",
+                std::printf(" fmt=%u cwm=%x topo=%u depth=%d/%d/%u stencil=%d blend=%d",
                             failure.pipeline.color0_format, failure.pipeline.color_write_mask,
+                            failure.pipeline.topology,
                             failure.pipeline.depth_test_enable, failure.pipeline.depth_write_enable,
                             failure.pipeline.depth_compare_op, failure.pipeline.stencil_enable,
                             failure.pipeline.blend_enable);

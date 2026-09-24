@@ -1,0 +1,51 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+layout(local_size_x = 64) in;
+layout(triangles) out;
+layout(max_vertices = 3, max_primitives = 1) out;
+#ifdef TEXTURE_INPUT
+layout(set = 0, binding = 4) uniform sampler2D input_tex;
+#endif
+
+// The center pixel exists only if another invocation's shared write becomes visible.
+// A one-lane/private-LDS projection sees zero in the peer slot and collapses the triangle.
+shared uint peer[64];
+shared uint lane_active[64];
+
+void main() {
+    uint lane = gl_LocalInvocationIndex;
+    peer[lane] = lane + 1;
+    lane_active[lane] = (lane % 3) != 0 ? 1 : 0;
+    barrier();
+
+    uint prefix = 0;
+    for (uint i = 0; i < lane; ++i) prefix += lane_active[i];
+#ifdef WRONG_PREFIX
+    prefix = lane;
+#endif
+#ifdef ONE_LANE_PROJECTION
+    uint neighbor = peer[lane];
+#else
+    uint neighbor = peer[lane ^ 1u];
+#endif
+    SetMeshOutputsEXT(3, 1);
+    if (lane < 3) {
+        // For lanes 0,1,2: prefix = 0,0,1 and neighbor = 2,1,4.
+        bool exact = (lane == 0 && prefix == 0 && neighbor == 2) ||
+                     (lane == 1 && prefix == 0 && neighbor == 1) ||
+                     (lane == 2 && prefix == 1 && neighbor == 4);
+#ifdef TEXTURE_INPUT
+        exact = exact && texelFetch(input_tex, ivec2(0), 0).r > 0.5;
+#endif
+        vec2 p = lane == 0 ? vec2(-1.0, -1.0) :
+                 lane == 1 ? vec2(3.0, -1.0) : vec2(-1.0, 3.0);
+        gl_MeshVerticesEXT[lane].gl_Position = exact
+            ? vec4(p, 0.0, 1.0) : vec4(2.0, 2.0, 0.0, 1.0);
+    }
+    if (lane == 0) {
+        gl_PrimitiveTriangleIndicesEXT[0] = uvec3(0, 1, 2);
+#ifdef LAYER_OUTPUT
+        gl_MeshPrimitivesEXT[0].gl_Layer = int(gl_WorkGroupID.x);
+#endif
+    }
+}
