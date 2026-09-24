@@ -425,6 +425,7 @@ struct SpirvCompute {
     std::unordered_map<uint32_t, uint32_t> fconst_cache, uconst_cache;
     uint32_t next_id = 1;
     uint32_t stride = 1;
+    bool raw_output_words = false;
     // fixed ids (set in begin()):
     uint32_t t_void=0, t_fn=0, t_f32=0, t_u32=0, t_i32=0, t_v3u=0, t_bool=0, t_ptr_sb_f32=0;
     uint32_t v_gid=0, v_groupid=0, v_in=0, v_out=0, gidx=0, f_main=0, glsl=0, bconst_false=0;
@@ -1979,6 +1980,10 @@ struct SpirvCompute {
     }
     // Store a VGPR (bits) as one float per invocation: b[gid.x] (stride 1), independent of input stride.
     void     store_output(uint32_t bits);
+    // Guest merged-geometry execution probe: retain each enabled EXP word in a fixed per-lane
+    // uint32 record. This is not renderer publication or a substitute for primitive assembly.
+    void     store_output_word(uint32_t bits, uint32_t word_stride, uint32_t word_offset,
+                               uint32_t exec_bool = 0);
     // EXEC-predicated store: lanes with exec=false keep the output slot's prior value. Modeled with
     // OpSelect (no control flow needed) — load old, pick new-vs-old by the per-lane exec bool, store.
     // Correct for the straight-line "conditional write / discard" pattern (v_cmpx narrows EXEC).
@@ -1991,8 +1996,10 @@ struct SpirvCompute {
 
     void begin(uint32_t input_stride, const ShaderResourceTable* rt = nullptr,
                uint32_t local_x = 64, uint32_t local_y = 1, uint32_t local_z = 1,
-               uint32_t hardware_wave_size = 64, uint32_t push_constant_dwords = 0) {
+               uint32_t hardware_wave_size = 64, uint32_t push_constant_dwords = 0,
+               bool raw_word_output = false) {
         stride = input_stride;
+        raw_output_words = raw_word_output;
         push_constant_dword_count = push_constant_dwords;
         local_count = local_x * local_y * local_z;
         wave_size = hardware_wave_size;
@@ -2059,9 +2066,15 @@ struct SpirvCompute {
         put(types, Op_TypeStruct, {t_struct, t_rta});
         put(types, Op_TypePointer, {t_ptr_sb_struct, SC_StorageBuffer, t_struct});
         declare_external_storage_buffer(t_ptr_sb_struct, v_in);
-        declare_external_storage_buffer(t_ptr_sb_struct, v_out);
         put(types, Op_TypePointer, {t_ptr_sb_f32, SC_StorageBuffer, t_f32});
-        declare_cbufs(rt); // scalar-memory buffers, including table-assigned bindings beyond 2/3
+        if (raw_output_words) {
+            declare_cbufs(rt); // supplies the uint32 Block type used by the raw export sink
+            declare_external_storage_buffer(t_ptr_sb_struct_u, v_out);
+        } else {
+            // Preserve the declaration order (and byte identity) of every existing compute module.
+            declare_external_storage_buffer(t_ptr_sb_struct, v_out);
+            declare_cbufs(rt); // scalar-memory buffers, including table-assigned bindings beyond 2/3
+        }
         put(code, Op_Function, {t_void, f_main, FC_None, t_fn});
         put(code, Op_Label, {lbl}); cur_block = lbl;
         function_var_insert = code.size();

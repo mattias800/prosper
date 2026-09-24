@@ -864,6 +864,18 @@ int main(int argc, char** argv) {
            recompile_vertex_chain(producer, sizeof(producer)/4, wrapper, sizeof(wrapper)/4,
                                   &rt, nullptr, false, 7),
            "recompile_vertex_chain"); }
+    // Portable guest-wave execution with explicit primitive, position, layer and parameter exports.
+    // The target is a compute test sink, not a rasterizing graphics module.
+    { const uint32_t c[] = {
+          0x7e000f00u,0x4a0200c0u,0xd8340000u,0x00000100u,0xbf8a0000u,
+          0x3a040084u,0xd8d80000u,0x03000002u,0x7e0802c0u,0x7e0a0280u,
+          0xbe80047eu,0x7da20900u,0xd7650005u,0x0001007eu,0xd7660005u,
+          0x00020a7fu,0xbefe0400u,0x4a0c0b03u,0x7e000d06u,
+          0xf8000941u,0x00000006u,0xf80000cfu,0x03020100u,
+          0xf80008d4u,0x00050000u,0xf800020fu,0x00050603u,0xbf810000u};
+      dump(dir, "ngg_workgroup_exports",
+           recompile_ngg_exports_for_test(c, std::size(c), 1),
+           "recompile_ngg_exports_for_test"); }
     // Generated interpolation geometry stage: AMD's explicit-parameter form publishes P0/P10/P20
     // plus perspective-center I/J from a synthesised Geometry entry point.
     { const uint32_t ps[] = {0xc80e0000u,0xc8120001u,0xc8160002u,
