@@ -404,6 +404,10 @@ bool capture_failure_diagnostics(
         diagnostic.pixel_inputs = failure.pixel_inputs;
         diagnostic.has_pixel_inputs = failure.has_pixel_inputs;
         diagnostic.capture_vertex_position = failure.capture_vertex_position;
+        diagnostic.fragment_retry_config_available = failure.fragment_retry_config_available;
+        diagnostic.system_inputs = failure.system_inputs;
+        diagnostic.has_system_inputs = failure.has_system_inputs;
+        diagnostic.ps_wave32 = failure.ps_wave32;
         diagnostic.compute_launch = failure.compute_launch;
         for (const auto& runtime_stage : failure.stages) {
             GpuCapturedStageDiagnostic stage;

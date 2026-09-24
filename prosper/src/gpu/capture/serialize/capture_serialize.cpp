@@ -1112,6 +1112,29 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
             w.u8(diagnostic.pixel_inputs.consumed_known ? 1u : 0u);
         }
     }
+    // v61 tail: a fragment retry needs the live PS system-VGPR allocation and Wave32 bit in
+    // addition to v60's pixel-input map. Early failures carry an explicit unavailable byte.
+    for (const auto& diagnostic : c.failure_diagnostics) {
+        const bool available = diagnostic.fragment_retry_config_available;
+        if ((!available && (diagnostic.has_system_inputs || diagnostic.system_inputs.ena ||
+                            diagnostic.system_inputs.addr || diagnostic.ps_wave32)) ||
+            (available && (diagnostic.kind != SubmitOperationKind::Draw ||
+                           !diagnostic.vertex_retry_config_available ||
+                           (diagnostic.has_system_inputs !=
+                            (diagnostic.system_inputs.ena || diagnostic.system_inputs.addr))))) {
+            error = "invalid failed-draw fragment retry config";
+            return false;
+        }
+        w.u8(available ? 1u : 0u);
+        if (!available) continue;
+        const uint8_t flags = (diagnostic.has_system_inputs ? 1u : 0u) |
+                              (diagnostic.ps_wave32 ? 2u : 0u);
+        w.u8(flags);
+        if (diagnostic.has_system_inputs) {
+            w.u32(diagnostic.system_inputs.ena);
+            w.u32(diagnostic.system_inputs.addr);
+        }
+    }
     // Re-check the ceiling AFTER the final tail. The bound above was enforced before this tail
     // existed, so a capture sitting just under the maximum could serialize successfully into a file
     // that read_gpu_capture then rejects as oversized -- a write that reports success and produces

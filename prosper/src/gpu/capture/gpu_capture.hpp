@@ -302,6 +302,11 @@ struct GpuCapturedOperationFailure {
     PixelInputMapping pixel_inputs{};
     bool has_pixel_inputs = false;
     bool capture_vertex_position = false;
+    // v61: exact fragment system-input mapping and wave width for failed-stage retries.
+    bool fragment_retry_config_available = false;
+    PixelSystemInputMapping system_inputs{};
+    bool has_system_inputs = false;
+    bool ps_wave32 = false;
     ComputeLaunchDimensions compute_launch;
     std::vector<GpuCapturedStageDiagnostic> stages;
 };
