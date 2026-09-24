@@ -25,6 +25,11 @@ What lives here:
   the per-event detail behind it. It refuses to report at all if the replay driver says it
   has no pixel-history support, because an empty history and an unsupported driver look
   identical and mean opposite things.
+  `--resource-id ResourceId::N` selects a specific image in the current capture, including
+  compute outputs and targets before the last draw; `--target N` retains the last-draw
+  attachment behavior. RenderDoc IDs change between captures. If a retained image already
+  contains pixels at capture start, its visible content is not evidence that any recorded
+  draw produced those pixels; read the event history before assigning a producer.
 - `control.c` + `shaders/` — a construction with a **known answer**, in seven regions producing
   **five different verdicts**: the draw sequence (`PIXEL_WAS_WRITTEN`), a passing draw that
   computes black (`SHADER_WROTE_BLACK`), a passing draw through a `colorWriteMask=0` pipeline

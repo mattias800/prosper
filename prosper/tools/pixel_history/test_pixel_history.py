@@ -915,11 +915,15 @@ class ReplaySelection(unittest.TestCase):
         def action(eid, flags=0, children=()):
             return SimpleNamespace(eventId=eid, flags=flags, children=children)
 
+        class FakeId(int):
+            def __str__(self):
+                return f"ResourceId::{int(self)}"
+
         rd = SimpleNamespace(ActionFlags=SimpleNamespace(Drawcall=1),
                              TextureCategory=SimpleNamespace(ColorTarget=1),
                              ResourceId=SimpleNamespace(Null=lambda: 0))
-        target = SimpleNamespace(resourceId=7, creationFlags=1)
-        unrelated = SimpleNamespace(resourceId=9, creationFlags=1)
+        target = SimpleNamespace(resourceId=FakeId(7), creationFlags=1)
+        unrelated = SimpleNamespace(resourceId=FakeId(9), creationFlags=1)
 
         class Controller:
             def __init__(self):
@@ -985,6 +989,29 @@ class ReplaySelection(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "out of range"):
             ph.select_history_target(ctl, rd, 1)
         self.assertEqual(ctl.selected, [(20, True)])
+
+    def test_explicit_resource_ignores_last_draw_attachment(self):
+        ctl, rd = self.fixture()
+        tex, source, targets, draws, selected_eid, end_eid = \
+            ph.select_history_target(ctl, rd, 0, "ResourceId::9")
+        self.assertEqual(tex.resourceId, 9)
+        self.assertEqual(source, "explicit capture-local resource id")
+        self.assertEqual((targets, draws, selected_eid, end_eid), (1, 2, 20, 30))
+        self.assertEqual(ctl.selected, [(30, True)])
+
+    def test_missing_explicit_resource_is_refused_before_replay(self):
+        ctl, rd = self.fixture()
+        with self.assertRaisesRegex(RuntimeError, "capture-local"):
+            ph.select_history_target(ctl, rd, 0, "ResourceId::99")
+        self.assertEqual(ctl.selected, [])
+
+    def test_explicit_compute_resource_needs_no_draw(self):
+        ctl, rd = self.fixture()
+        ctl.roots[0].children = ctl.roots[0].children[-1:]
+        tex, _, _, draws, selected_eid, end_eid = \
+            ph.select_history_target(ctl, rd, 0, "ResourceId::9")
+        self.assertEqual((tex.resourceId, draws, selected_eid, end_eid), (9, 0, None, 30))
+        self.assertEqual(ctl.selected, [(30, True)])
 
 
 if __name__ == "__main__":

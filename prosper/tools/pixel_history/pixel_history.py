@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 """Answer "why is this pixel this colour" from an RDC, in one call.
 
-Usage: pixel_history.py CAPTURE --output NEW_DIRECTORY [--pixel X,Y] [--target N]
-                        [--expect-control]
+Usage: pixel_history.py CAPTURE --output NEW_DIRECTORY [--pixel X,Y]
+                        [--target N | --resource-id ResourceId::N] [--expect-control]
+
+--resource-id selects any texture in this one capture, including a compute output or an
+earlier render target; --target selects an attachment at the last draw. RenderDoc resource
+IDs are capture-local. A retained image may contain pixels written before capture began:
+its visible content alone does not prove a draw in this capture produced it.
 
 Verdicts, each steering a different investigation:
 
@@ -477,8 +482,8 @@ def classify(events):
         f"resource binding, textures, uniforms or the shader itself." + note)
 
 
-def select_history_target(ctl, rd, target_index):
-    """Select the last draw's output, then replay that resource through capture end.
+def select_history_target(ctl, rd, target_index, resource_id=None):
+    """Select an explicit resource or the last draw's output, then replay to capture end.
 
     PixelHistory includes only usages at or before the current replay event. The bound
     output identifies the image at the last draw, but later transfers/clears still belong
@@ -497,10 +502,24 @@ def select_history_target(ctl, rd, target_index):
                 leaves.append(int(action.eventId))
 
     walk(ctl.GetRootActions())
-    if not draws:
+    if not draws and resource_id is None:
         raise RuntimeError("no draw actions in capture")
-    last_draw_eid = max(int(action.eventId) for action in draws)
+    if not leaves:
+        raise RuntimeError("no leaf actions in capture")
+    last_draw_eid = max((int(action.eventId) for action in draws), default=None)
     history_eid = max(leaves)
+    if resource_id is not None:
+        # The last graphics attachment is often an effects target. Explicit selection also
+        # admits compute-only resources, whose content has no identifying draw attachment.
+        targets = [texture for texture in ctl.GetTextures()
+                   if str(texture.resourceId) == resource_id]
+        if not targets:
+            raise RuntimeError(f"resource {resource_id} is absent from this capture; "
+                               "RenderDoc IDs are capture-local")
+        ctl.SetFrameEvent(history_eid, True)
+        return (targets[0], "explicit capture-local resource id", 1,
+                len(draws), last_draw_eid, history_eid)
+
     ctl.SetFrameEvent(last_draw_eid, True)
 
     # TextureCategory.ColorTarget can include transient attachments, so prefer outputs
@@ -549,7 +568,7 @@ def embedded():
                 "would be indistinguishable from 'nothing drew', so refusing to report one")
 
         tex, source, target_count, draw_count, last_draw_eid, history_eid = \
-            select_history_target(ctl, rd, req["target"])
+            select_history_target(ctl, rd, req["target"], req.get("resource_id"))
 
         # Save the target first: selection needs to see the image, and the image is also
         # the evidence a reader wants beside the verdict.
@@ -852,12 +871,20 @@ def main():
     parser.add_argument("capture", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--pixel", help="X,Y; default is the brightest pixel in the target")
-    parser.add_argument("--target", type=int, default=0, help="colour target index")
+    target = parser.add_mutually_exclusive_group()
+    target.add_argument("--target", type=int, default=0, help="colour target index")
+    target.add_argument("--resource-id", help="exact capture-local RenderDoc ResourceId::N")
     parser.add_argument("--expect-control", action="store_true",
                         help="check this tool's reading against pixel_history_control")
     args = parser.parse_args()
     if not args.capture.is_file():
         parser.error("capture does not exist")
+    if args.resource_id is not None:
+        prefix = "ResourceId::"
+        number = args.resource_id.removeprefix(prefix)
+        if not number.isdecimal() or int(number) == 0:
+            parser.error("--resource-id must be ResourceId::N or a positive integer")
+        args.resource_id = prefix + str(int(number))
     if not shutil.which("qrenderdoc"):
         parser.error("qrenderdoc is not installed in this environment")
     pixel = None
@@ -875,6 +902,7 @@ def main():
 
     request = {"capture": str(args.capture.resolve()), "output": str(output),
                "pixel": pixel, "target": args.target,
+               "resource_id": args.resource_id,
                "expect_control": args.expect_control}
     request_path = output / "request.json"
     request_path.write_text(json.dumps(request, indent=2) + "\n")
