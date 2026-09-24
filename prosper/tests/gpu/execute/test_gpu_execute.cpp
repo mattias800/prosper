@@ -292,8 +292,12 @@ int main() {
         CHECK(made && volume_draw.color_targets[0].selected_mip_depth == 32u &&
                   volume_draw.color_targets[0].first_slice == 0u &&
                   volume_draw.color_targets[0].slice_count == 32u &&
-                  volume_draw.color_targets[0].programmed_slice_max == 32u,
-              "realized draw carries Kena's bounded 3D view and its distinct raw maximum");
+                  volume_draw.color_targets[0].programmed_slice_max == 32u &&
+                  volume_draw.color_targets[0].native_layout_known &&
+                  volume_draw.color_targets[0].tile_mode == 27u &&
+                  volume_draw.color_targets[0].mip_level == 0u &&
+                  !volume_draw.color_targets[0].in_mip_tail,
+              "realized draw carries Kena's bounded 3D view and native layout proof");
     }
     {
         // The live draw path must acquire one exact fragment version and share it across metadata

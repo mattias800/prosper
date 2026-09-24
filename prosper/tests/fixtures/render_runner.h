@@ -390,7 +390,22 @@ struct BackendColorTarget {
     // -- losing MRT1 on every non-final segment. The claim that "slots 0 and 1 already carry" was
     // true only of the legacy explicit-out_rgba1 API.
     const uint8_t* seed_rgba1_slot = nullptr;
+    // Slot 0 may address a bounded view of one persistent 3D allocation. A zero depth keeps the
+    // established 2D contract. The allocation identity includes the complete depth; the view
+    // range does not, so later draws can fill other slices without replacing the image.
+    uint32_t volume_depth = 0;
+    uint32_t volume_first_slice = 0;
+    uint32_t volume_slice_count = 0;
+    uint64_t volume_guest_bytes = 0; // native tiled footprint, supplied by the live producer
 };
+
+inline bool backend_color_volume_view_valid(const BackendColorTarget& target) {
+    if (!target.volume_depth)
+        return !target.volume_first_slice && !target.volume_slice_count;
+    return target.volume_slice_count &&
+           target.volume_first_slice < target.volume_depth &&
+           target.volume_slice_count <= target.volume_depth - target.volume_first_slice;
+}
 
 // Optional complete-MRT readback contract. `color_count` is the active Vulkan attachment prefix
 // (1..8); slots 1..count-1 receive their native-format bytes after rendering. Slot 0 remains the
@@ -1276,6 +1291,9 @@ struct RenderVkCtx {
     // Optional workgroup-based pre-rasterization path for merged NGG/GS programs. A native
     // subgroup of 64 is not required: guest wave64 can span multiple host subgroups.
     bool mesh_shader_enabled = false;
+    // A 3D image's 2D-array attachment view is core on ordinary Vulkan 1.1+ devices, but
+    // portability-subset implementations may decline this particular image-view operation.
+    bool image_view_2d_on_3d = true;
     VkPhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_PROPERTIES_EXT};
     PFN_vkCmdDrawMeshTasksEXT cmd_draw_mesh_tasks = nullptr;
@@ -1700,6 +1718,10 @@ inline const RenderVkCtx& render_vk_ctx() {
             }
         }
 
+#if defined(__APPLE__) && defined(VK_ENABLE_BETA_EXTENSIONS)
+        VkPhysicalDevicePortabilitySubsetFeaturesKHR portability_features{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PORTABILITY_SUBSET_FEATURES_KHR};
+#endif
         { uint32_t ne = 0; vkEnumerateDeviceExtensionProperties(r.phys, nullptr, &ne, nullptr);
           std::vector<VkExtensionProperties> de(ne);
           vkEnumerateDeviceExtensionProperties(r.phys, nullptr, &ne, de.data());
@@ -1752,7 +1774,27 @@ inline const RenderVkCtx& render_vk_ctx() {
               }
 #ifdef __APPLE__
               // Spec-mandated: must be enabled when advertised (MoltenVK always advertises it).
-              if (!strcmp(de[i].extensionName, "VK_KHR_portability_subset")) dev_exts.push_back("VK_KHR_portability_subset");
+              if (!strcmp(de[i].extensionName, "VK_KHR_portability_subset")) {
+                  dev_exts.push_back("VK_KHR_portability_subset");
+#ifdef VK_ENABLE_BETA_EXTENSIONS
+                  VkPhysicalDeviceFeatures2 features2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+                  features2.pNext = &portability_features;
+                  vkGetPhysicalDeviceFeatures2(r.phys, &features2);
+                  r.image_view_2d_on_3d =
+                      portability_features.imageView2DOn3DImage == VK_TRUE;
+                  if (r.image_view_2d_on_3d) {
+                      portability_features = {
+                          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PORTABILITY_SUBSET_FEATURES_KHR};
+                      portability_features.imageView2DOn3DImage = VK_TRUE;
+                      portability_features.pNext = const_cast<void*>(dci.pNext);
+                      dci.pNext = &portability_features;
+                  }
+#else
+                  // The portability feature struct is in Vulkan's beta headers. If this build
+                  // cannot query/enable it, decline 2D attachment views of 3D images.
+                  r.image_view_2d_on_3d = false;
+#endif
+              }
 #endif
           } }
         dci.enabledExtensionCount = (uint32_t)dev_exts.size();
@@ -2529,6 +2571,7 @@ struct PersistentColorTargetKey {
     uint64_t id = 0;
     uint32_t width = 0, height = 0;
     VkFormat format = VK_FORMAT_UNDEFINED;
+    uint32_t volume_depth = 0; // zero means a 2D image, including a one-layer 2D target
     bool operator==(const PersistentColorTargetKey&) const = default;
 };
 
@@ -2539,6 +2582,7 @@ struct PersistentColorTargetKeyHash {
             h ^= static_cast<size_t>(value) + 0x9e3779b9u + (h << 6) + (h >> 2);
         };
         mix(key.width); mix(key.height); mix(static_cast<uint32_t>(key.format));
+        mix(key.volume_depth);
         return h;
     }
 };
@@ -2546,12 +2590,18 @@ struct PersistentColorTargetKeyHash {
 struct PersistentColorTargetImage {
     VkImage image = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
+    // 2D: attachment view. 3D: sampled view of the entire allocation; each render call owns a
+    // short-lived 2D-array attachment view over its bounded slice range until GPU completion.
     VkImageView view = VK_NULL_HANDLE;
     VkDeviceSize bytes = 0;
     VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
     uint64_t last_use = 0;
     uint32_t pin_count = 0;
     bool valid = false;
+    // A partial volume pass establishes only the slices in its attachment view. Direct 3D
+    // sampling requires every slice; an invalidated or discarded pass clears the whole proof.
+    std::vector<uint8_t> valid_volume_slices;
+    uint64_t volume_guest_bytes = 0;
     // Separate from speculative `valid`: an image can be referenced by a later command buffer
     // before its producer batch has completed. Mutation invalidates public lineage immediately;
     // only a completed submission may install a producer token.
@@ -2802,13 +2852,21 @@ inline size_t persistent_color_target_count_ceiling(bool eviction_deferred) {
 }
 
 inline PersistentColorTargetImage* find_persistent_color_target(
-    uint64_t id, uint32_t width, uint32_t height, VkFormat format, bool require_valid = true) {
+    uint64_t id, uint32_t width, uint32_t height, VkFormat format, bool require_valid = true,
+    uint32_t volume_depth = 0) {
     if (!id) return nullptr;
     format = backend_color_format(format);
     auto& cache = persistent_color_target_cache();
-    auto found = cache.find({id, width, height, format});
+    auto found = cache.find({id, width, height, format, volume_depth});
     if (found == cache.end() || (require_valid && !found->second.valid)) return nullptr;
     return &found->second;
+}
+
+inline PersistentColorTargetImage* find_persistent_volume_target(
+    uint64_t id, uint32_t width, uint32_t height, uint32_t depth, VkFormat format,
+    bool require_valid = true) {
+    return depth ? find_persistent_color_target(
+        id, width, height, format, require_valid, depth) : nullptr;
 }
 
 // Ordered frontend spans may need a GPU-only target to survive later backend calls until the submit's
@@ -2851,8 +2909,24 @@ inline void invalidate_persistent_color_target(uint64_t id) {
     for (auto& [key, target] : persistent_color_target_cache())
         if (key.id == id) {
             target.valid = false;
+            std::fill(target.valid_volume_slices.begin(), target.valid_volume_slices.end(), 0u);
             invalidate_color_producer(target);
         }
+}
+
+inline void invalidate_persistent_color_target_dimension_aliases(
+    uint64_t id, uint32_t width, uint32_t height, VkFormat format,
+    uint32_t volume_depth) {
+    if (!id) return;
+    format = backend_color_format(format);
+    for (auto& [key, target] : persistent_color_target_cache()) {
+        if (key.id != id || (!key.volume_depth && !volume_depth) ||
+            (key.volume_depth == volume_depth && key.width == width &&
+             key.height == height && key.format == format)) continue;
+        target.valid = false;
+        std::fill(target.valid_volume_slices.begin(), target.valid_volume_slices.end(), 0u);
+        invalidate_color_producer(target);
+    }
 }
 
 // Returns overlapping entries, including entries already invalid before this write.
@@ -2861,11 +2935,22 @@ inline size_t invalidate_persistent_color_target_guest_write(uint64_t addr, uint
     size_t overlaps = 0;
     const uint64_t end = size > UINT64_MAX - addr ? UINT64_MAX : addr + size;
     for (auto& [key, target] : persistent_color_target_cache()) {
-        const uint64_t bytes = static_cast<uint64_t>(key.width) * key.height *
-                               backend_color_bytes_per_pixel(key.format);
+        const uint64_t layer_bytes = static_cast<uint64_t>(key.width) * key.height *
+                                     backend_color_bytes_per_pixel(key.format);
+        const uint64_t depth = key.volume_depth ? key.volume_depth : 1u;
+        const uint64_t linear_bytes = layer_bytes > UINT64_MAX / depth
+            ? UINT64_MAX : layer_bytes * depth;
+        const uint64_t bytes = key.volume_depth
+            ? std::max(linear_bytes, target.volume_guest_bytes) : linear_bytes;
         const uint64_t target_end = bytes > UINT64_MAX - key.id ? UINT64_MAX : key.id + bytes;
-        if (addr < target_end && key.id < end) {
+        const bool logical_overlap = addr < target_end && key.id < end;
+        const bool volume_may_alias = key.volume_depth && !logical_overlap &&
+            ::prosper::guest_memory_topology_relation(
+                key.id, bytes, addr, size) !=
+                ::prosper::GuestMemoryTopologyRelation::Disjoint;
+        if (logical_overlap || volume_may_alias) {
             target.valid = false;
+            std::fill(target.valid_volume_slices.begin(), target.valid_volume_slices.end(), 0u);
             invalidate_color_producer(target);
             ++overlaps;
         }
@@ -2878,6 +2963,7 @@ inline size_t invalidate_persistent_color_target_guest_write(uint64_t addr, uint
 // becomes stale; only the image proven to have received that result may then regain authority.
 inline bool restore_persistent_color_target_after_mirrored_write(
     uint64_t id, uint32_t width, uint32_t height, VkFormat format) {
+    invalidate_persistent_color_target_dimension_aliases(id, width, height, format, 0u);
     PersistentColorTargetImage* target = find_persistent_color_target(
         id, width, height, backend_color_format(format), false);
     if (!target || !target->image || target->layout == VK_IMAGE_LAYOUT_UNDEFINED) return false;
@@ -2899,7 +2985,7 @@ inline void destroy_persistent_color_target(const RenderVkCtx& ctx,
 
 inline bool readback_persistent_color_target(uint64_t id, uint32_t width, uint32_t height,
                                              VkFormat format, std::vector<uint8_t>& output,
-                                             std::string& error);
+                                             std::string& error, uint32_t volume_depth = 0);
 
 // With deferred RTT readback (#1284) a valid persistent target can hold the ONLY copy of its
 // rendered pixels. Eviction must hand those pixels back to the frontend's CPU cache before the
@@ -2918,6 +3004,14 @@ inline bool evict_persistent_color_target(const RenderVkCtx& ctx, uint64_t curre
     auto victim = cache.end();
     for (auto it = cache.begin(); it != cache.end(); ++it) {
         if (it->second.last_use == current_generation || it->second.pin_count) continue;
+        // A valid volume may be the only copy of slices never written to guest memory. The
+        // current CPU RTT eviction sink represents one 2D plane; dropping a volume through it
+        // would silently replace later 3D samples with stale guest bytes. Keep the bounded image
+        // resident until invalidation or explicit volume materialization is available.
+        if (it->first.volume_depth &&
+            std::any_of(it->second.valid_volume_slices.begin(),
+                        it->second.valid_volume_slices.end(),
+                        [](uint8_t slice) { return slice != 0; })) continue;
         if (victim == cache.end() || it->second.last_use < victim->second.last_use)
             victim = it;
     }
@@ -3258,6 +3352,7 @@ enum class RenderVkObjectCreateSite : uint32_t {
     RenderPass,               // the pass's own vkCreateRenderPass
     Framebuffer,              // vkCreateFramebuffer over the attachment views
     DepthStencilView,         // the depth/stencil attachment's view
+    VolumeAttachmentView,     // bounded 2D-array view of a retained 3D color image
     TextureViewPersistent,    // a sampled-texture view created for the persistent binding cache
     TextureSamplerPersistent, // ...and its sampler
     TextureView,              // a sampled/storage view created for a transient binding
@@ -3272,6 +3367,7 @@ inline const char* render_vk_object_site_name(RenderVkObjectCreateSite site) {
         case RenderVkObjectCreateSite::RenderPass:               return "render-pass";
         case RenderVkObjectCreateSite::Framebuffer:              return "framebuffer";
         case RenderVkObjectCreateSite::DepthStencilView:         return "ds-view";
+        case RenderVkObjectCreateSite::VolumeAttachmentView:     return "volume-attachment-view";
         case RenderVkObjectCreateSite::TextureViewPersistent:    return "texture-view-persistent";
         case RenderVkObjectCreateSite::TextureSamplerPersistent: return "texture-sampler-persistent";
         case RenderVkObjectCreateSite::TextureView:              return "texture-view";
@@ -5919,7 +6015,7 @@ inline BackendSubmissionState submit_persistent_ds_transfer(
 // synchronizing only at that consumer preserves both the persistent-target contract and DMA versioning.
 inline bool readback_persistent_color_target(uint64_t id, uint32_t width, uint32_t height,
                                              VkFormat format, std::vector<uint8_t>& output,
-                                             std::string& error) {
+                                             std::string& error, uint32_t volume_depth) {
     output.clear(); error.clear();
     if (backend_has_unproven_submission()) {
         error = "Vulkan submission completion is unproven";
@@ -5927,19 +6023,21 @@ inline bool readback_persistent_color_target(uint64_t id, uint32_t width, uint32
     }
     format = backend_color_format(format);
     PersistentColorTargetImage* target = find_persistent_color_target(
-        id, width, height, format);
+        id, width, height, format, true, volume_depth);
     if (!target || !target->image || target->layout == VK_IMAGE_LAYOUT_UNDEFINED) {
         error = "persistent color target is unavailable";
         return false;
     }
     target->last_use = ++persistent_color_target_generation();
-    const uint64_t texels = static_cast<uint64_t>(width) * height;
+    const uint64_t plane_texels = static_cast<uint64_t>(width) * height;
+    const uint64_t depth = volume_depth ? volume_depth : 1u;
     const uint64_t bpp = backend_color_bytes_per_pixel(format);
-    if (!width || !height || !bpp || texels > UINT64_MAX / bpp || texels * bpp > SIZE_MAX) {
+    if (!width || !height || !bpp || plane_texels > UINT64_MAX / depth ||
+        plane_texels * depth > UINT64_MAX / bpp || plane_texels * depth * bpp > SIZE_MAX) {
         error = "persistent color target byte size is invalid";
         return false;
     }
-    const VkDeviceSize bytes = static_cast<VkDeviceSize>(texels * bpp);
+    const VkDeviceSize bytes = static_cast<VkDeviceSize>(plane_texels * depth * bpp);
     const RenderVkCtx& ctx = render_vk_ctx();
     if (!ctx.ok) { error = "Vulkan renderer is unavailable"; return false; }
 
@@ -5979,7 +6077,8 @@ inline bool readback_persistent_color_target(uint64_t id, uint32_t width, uint32
     barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.image = target->image;
-    barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0,
+                                volume_depth ? VK_REMAINING_ARRAY_LAYERS : 1u};
     barrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
                             VK_ACCESS_TRANSFER_WRITE_BIT;
     barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
@@ -5988,7 +6087,7 @@ inline bool readback_persistent_color_target(uint64_t id, uint32_t width, uint32
                          0, nullptr, 0, nullptr, 1, &barrier);
     VkBufferImageCopy copy{};
     copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    copy.imageExtent = {width, height, 1};
+    copy.imageExtent = {width, height, static_cast<uint32_t>(depth)};
     vkCmdCopyImageToBuffer(command, target->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                            buffer, 1, &copy);
     record_host_read_barrier(command, buffer);   // #2944
@@ -6070,6 +6169,8 @@ inline bool copy_persistent_color_target(uint64_t src_id, uint64_t dst_id, uint3
     src->last_use = ++persistent_color_target_generation();
 
     PersistentColorTargetKey dst_key{dst_id, width, height, format};
+    invalidate_persistent_color_target_dimension_aliases(
+        dst_id, width, height, format, 0u);
     auto [dst_it, dst_inserted] = persistent_color_target_cache().try_emplace(dst_key);
     (void)dst_inserted;
     PersistentColorTargetImage* dst = &dst_it->second;
@@ -7103,6 +7204,27 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         getenv("PROSPER_NO_BACKEND_PERSISTENT_COLOR_TARGETS") == nullptr;
     const bool persistent_color_enabled = persistent_color_targets_enabled && color_target &&
                                           color_target->persistent_id;
+    const bool volume_color = color_target && color_target->volume_depth;
+    // A failed attempt to replace any part of a retained volume cannot leave an earlier LUT
+    // authoritative under the same guest identity. Completion/discard callbacks cover work that
+    // reached a command buffer; this guard covers every earlier refusal and Vulkan create error.
+    struct VolumeAttemptGuard {
+        uint64_t id = 0;
+        ~VolumeAttemptGuard() {
+            if (id) invalidate_persistent_color_target(id);
+        }
+        void release() { id = 0; }
+    } volume_attempt{volume_color ? color_target->persistent_id : 0u};
+    if (color_target && !backend_color_volume_view_valid(*color_target)) return out;
+    // A volume cannot be represented by the historical transient 2D fallback. It must retain
+    // one exact allocation through the later 3D sample, or the caller sees an explicit refusal.
+    if (volume_color && !persistent_color_enabled) return out;
+    if (volume_color)
+        for (const BackendDraw& draw : draws)
+            for (const FrameResource& resource : draw.R)
+                if (resource.persistent_render_target_id == color_target->persistent_id &&
+                    resource.img_dim == 2u)
+                    return out; // same-pass 3D feedback has no prior-version snapshot yet
     const uint64_t color_target_generation = ++persistent_color_target_generation();
     VkInstance inst = ctx.inst; (void)inst; VkPhysicalDevice phys = ctx.phys;
     VkDevice dev = ctx.dev; VkQueue queue = ctx.queue; uint32_t qfi = ctx.qfi;
@@ -7127,6 +7249,9 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     const uint32_t color_count = mrt_outputs
         ? std::clamp(mrt_outputs->color_count, 1u, prosper::gpu::kColorTargetCount)
         : (use_color1 ? 2u : 1u);
+    // Layered MRT and a layer-one DS attachment need a separate common-layer contract. Admit
+    // only the proven single-color shape while the volume path is established.
+    if (volume_color && (color_count != 1u || seed_rgba)) return out;
     const auto first_pipeline_format = [&](uint32_t slot) {
         for (const auto& draw : draws) {
             if (!draw.ps) continue;
@@ -7141,6 +7266,40 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     const VkFormat FMT = color_target && color_target->format != VK_FORMAT_UNDEFINED
         ? backend_color_format(color_target->format)
         : first_pipeline_format(0);
+    const uint32_t volume_depth = volume_color ? color_target->volume_depth : 0u;
+    const uint32_t volume_first_slice = volume_color ? color_target->volume_first_slice : 0u;
+    const uint32_t volume_slice_count = volume_color ? color_target->volume_slice_count : 1u;
+    if (volume_color) {
+        VkPhysicalDeviceProperties properties{};
+        vkGetPhysicalDeviceProperties(phys, &properties);
+        VkImageFormatProperties image_properties{};
+        constexpr VkImageUsageFlags volume_usage =
+            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+            VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        const bool mesh_draw = std::any_of(draws.begin(), draws.end(),
+            [](const BackendDraw& draw) { return draw.mesh_draw; });
+        if (!ctx.image_view_2d_on_3d ||
+            vkGetPhysicalDeviceImageFormatProperties(
+                phys, FMT, VK_IMAGE_TYPE_3D, VK_IMAGE_TILING_OPTIMAL,
+                volume_usage, VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT,
+                &image_properties) != VK_SUCCESS ||
+            W > image_properties.maxExtent.width || H > image_properties.maxExtent.height ||
+            volume_depth > image_properties.maxExtent.depth ||
+            volume_slice_count > properties.limits.maxFramebufferLayers ||
+            (mesh_draw && (!ctx.mesh_shader_enabled ||
+                           volume_slice_count > ctx.mesh_shader_properties.maxMeshOutputLayers))) {
+            static uint32_t warned = 0;
+            if (warned++ < 8u)
+                std::fprintf(stderr,
+                    "[render-volume] target refused: %ux%ux%u view=%u+%u fmt=%d "
+                    "mesh=%d mesh-layers=%u view-capable=%d\n",
+                    W, H, volume_depth, volume_first_slice, volume_slice_count,
+                    static_cast<int>(FMT), mesh_draw,
+                    ctx.mesh_shader_properties.maxMeshOutputLayers,
+                    ctx.image_view_2d_on_3d);
+            return out;
+        }
+    }
     std::array<VkFormat, prosper::gpu::kColorTargetCount> color_formats{};
     std::array<VkDeviceSize, prosper::gpu::kColorTargetCount> color_bytes{};
     std::array<VkDeviceSize, prosper::gpu::kColorTargetCount> color_offsets{};
@@ -7152,6 +7311,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             color_formats[slot] = backend_color_format(color_target->format1);
         color_offsets[slot] = readback_bytes;
         color_bytes[slot] = static_cast<VkDeviceSize>(W) * H *
+            (slot == 0 && volume_color ? volume_depth : 1u) *
             backend_color_bytes_per_pixel(color_formats[slot]);
         readback_bytes += color_bytes[slot];
     }
@@ -7345,6 +7505,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     if (getenv("PROSPER_NO_DEPTH"))   use_depth = false;     // diag: isolate depth-test rejection
     if (getenv("PROSPER_NO_STENCIL")) use_stencil = false;   // diag: isolate stencil masking
     const bool use_ds = use_depth || use_stencil;
+    if (volume_color && use_ds) return out;
     // Use a stencil-capable depth format ONLY when a draw actually uses stencil (a UI mask). The
     // depth-only path keeps the original D32 depth-only format + aspect, so existing render tests are
     // byte-identical (#264).
@@ -7504,7 +7665,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             if (persistent_color_targets_enabled && resource.persistent_render_target_id) {
                 if (auto* sampled = find_persistent_color_target(
                         resource.persistent_render_target_id, resource.tw, resource.th,
-                        backend_color_format(resource.texture_format)))
+                        backend_color_format(resource.texture_format), true,
+                        resource.img_dim == 2u ? resource.td : 0u))
                     sampled->last_use = color_target_generation;
                 const uint32_t mip_count = std::min<uint32_t>(
                     resource.persistent_render_target_mip_count,
@@ -7524,7 +7686,9 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     PersistentColorTargetKey color_key{};
     PersistentColorTargetImage* cached_color = nullptr;
     if (persistent_color) {
-        color_key = {color_target->persistent_id, W, H, FMT};
+        invalidate_persistent_color_target_dimension_aliases(
+            color_target->persistent_id, W, H, FMT, volume_depth);
+        color_key = {color_target->persistent_id, W, H, FMT, volume_depth};
         // PROSPER_TARGET_PHYS (#2932): print each colour target's guest VA and the physical address
         // it maps to, to test whether any target ALIASES the page a title flips to the display. On
         // Stray the answer is no -- and the same census answered a question it was not built for,
@@ -7569,15 +7733,38 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         }
         auto [found, inserted] = persistent_color_target_cache().try_emplace(color_key);
         cached_color = &found->second;
+        if (volume_color) {
+            const uint64_t guest_bytes = color_target->volume_guest_bytes;
+            if (cached_color->volume_guest_bytes && guest_bytes &&
+                cached_color->volume_guest_bytes != guest_bytes) {
+                cached_color->valid = false;
+                std::fill(cached_color->valid_volume_slices.begin(),
+                          cached_color->valid_volume_slices.end(), 0u);
+                invalidate_color_producer(*cached_color);
+            }
+            cached_color->volume_guest_bytes = guest_bytes;
+        }
         cached_color->last_use = color_target_generation;
     }
 
     VkImage img = cached_color ? cached_color->image : VK_NULL_HANDLE;
     VkDeviceMemory imem = cached_color ? cached_color->memory : VK_NULL_HANDLE;
-    VkImageView view = cached_color ? cached_color->view : VK_NULL_HANDLE;
+    VkImageView view = cached_color && !volume_color ? cached_color->view : VK_NULL_HANDLE;
+    // The 3D sampled view belongs to the retained allocation; its 2D-array attachment view
+    // belongs to this render call, including when the same allocation is reused for another range.
+    struct VolumeAttachmentViewGuard {
+        VkDevice device = VK_NULL_HANDLE;
+        VkImageView view = VK_NULL_HANDLE;
+        ~VolumeAttachmentViewGuard() {
+            if (view) vkDestroyImageView(device, view, nullptr);
+        }
+        void release() { view = VK_NULL_HANDLE; }
+    } volume_attachment_view{dev};
     if (!img) {
         VkImageCreateInfo imgci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-        imgci.imageType = VK_IMAGE_TYPE_2D; imgci.format = FMT; imgci.extent = {W, H, 1};
+        imgci.imageType = volume_color ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
+        imgci.flags = volume_color ? VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT : 0u;
+        imgci.format = FMT; imgci.extent = {W, H, volume_color ? volume_depth : 1u};
         imgci.mipLevels = 1; imgci.arrayLayers = 1; imgci.samples = VK_SAMPLE_COUNT_1_BIT;
         imgci.tiling = VK_IMAGE_TILING_OPTIMAL;
         imgci.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
@@ -7614,6 +7801,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 persistent_color_target_cache().erase(color_key);
                 cached_color = nullptr;
                 persistent_color = false;
+                if (volume_color) return out;
                 imgci.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
                               (seed_rgba ? VK_IMAGE_USAGE_TRANSFER_DST_BIT : 0u);
                 if (create_color_target_image(dev, imgci,
@@ -7627,15 +7815,19 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         if (!imem)
             imem = allocate_transient_render_memory(dev, iai.allocationSize, iai.memoryTypeIndex);
         VkImageViewCreateInfo ivci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-        ivci.image = img; ivci.viewType = VK_IMAGE_VIEW_TYPE_2D; ivci.format = FMT;
+        ivci.image = img;
+        ivci.viewType = volume_color ? VK_IMAGE_VIEW_TYPE_3D : VK_IMAGE_VIEW_TYPE_2D;
+        ivci.format = FMT;
         ivci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        VkImageView allocated_view = VK_NULL_HANDLE;
         const bool target_ready = imem &&
             vkBindImageMemory(dev, img, imem, 0) == VK_SUCCESS &&
-            vkCreateImageView(dev, &ivci, nullptr, &view) == VK_SUCCESS && view;
+            vkCreateImageView(dev, &ivci, nullptr, &allocated_view) == VK_SUCCESS &&
+            allocated_view;
         if (!target_ready) {
             // Caching a half-created target (null view / unbound memory) would break every
             // later LOAD of this identity (#1383): drop it fail-visibly instead.
-            if (view) vkDestroyImageView(dev, view, nullptr);
+            if (allocated_view) vkDestroyImageView(dev, allocated_view, nullptr);
             vkDestroyImage(dev, img, nullptr);
             if (cached_color) {
                 if (cached_color->bytes) persistent_color_target_bytes() -= cached_color->bytes;
@@ -7649,14 +7841,44 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         if (cached_color) {
             cached_color->image = img;
             cached_color->memory = imem;
-            cached_color->view = view;
+            cached_color->view = allocated_view;
+            if (volume_color)
+                cached_color->valid_volume_slices.assign(volume_depth, 0u);
             cached_color->registration = prosper::frontend::next_producer_identity();
             cached_color->mutation = 0;
             cached_color->completed_producer = {};
         }
+        if (!volume_color) view = allocated_view;
     }
-    const bool load_cached_color = cached_color && cached_color->valid &&
-                                   color_target->load_existing && !seed_rgba;
+    if (volume_color) {
+        VkImageViewCreateInfo attachment{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        attachment.image = img;
+        attachment.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+        attachment.format = FMT;
+        attachment.subresourceRange = {
+            VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, volume_first_slice, volume_slice_count};
+        if (create_render_image_view_checked(
+                dev, attachment, RenderVkObjectCreateSite::VolumeAttachmentView,
+                &view) != VK_SUCCESS)
+            return out;
+        volume_attachment_view.view = view;
+    }
+    const bool load_cached_color = cached_color && color_target->load_existing && !seed_rgba &&
+        (volume_color
+            ? cached_color->valid_volume_slices.size() == volume_depth &&
+              std::all_of(cached_color->valid_volume_slices.begin() + volume_first_slice,
+                          cached_color->valid_volume_slices.begin() +
+                              volume_first_slice + volume_slice_count,
+                          [](uint8_t slice) { return slice != 0; })
+            : cached_color->valid);
+    // Without maintenance9, a 2D-array view of a 3D image shares one layout across the whole
+    // mip. CLEARing a new slice range must still transition from the retained image's real layout
+    // whenever any other range is valid. An UNDEFINED initial layout could discard those slices.
+    const bool volume_existing_content = volume_color && cached_color &&
+        std::any_of(cached_color->valid_volume_slices.begin(),
+                    cached_color->valid_volume_slices.end(),
+                    [](uint8_t slice) { return slice != 0; });
+    const bool transition_cached_color = load_cached_color || volume_existing_content;
     if (cached_color) {
         ++color_target_stats.writes;
         color_target_stats.write_hits = load_cached_color ? 1 : 0;
@@ -7683,6 +7905,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     PersistentColorTargetKey color_key1{};
     PersistentColorTargetImage* cached_color1 = nullptr;
     if (persistent_color1) {
+        invalidate_persistent_color_target_dimension_aliases(
+            color_target->persistent_id1, W, H, FMT1, 0u);
         color_key1 = {color_target->persistent_id1, W, H, FMT1};
         auto [found, inserted] = persistent_color_target_cache().try_emplace(color_key1);
         cached_color1 = &found->second;
@@ -7789,6 +8013,9 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     // loses accumulation on those slots rather than failing to render.
     for (uint32_t slot = 2; slot < color_count; ++slot) {
         const uint64_t slot_id = color_target ? color_target->persistent_id_slots[slot] : 0;
+        if (slot_id)
+            invalidate_persistent_color_target_dimension_aliases(
+                slot_id, W, H, color_formats[slot], 0u);
         const bool want_persistent = persistent_color_targets_enabled && slot_id;
         if (want_persistent) {
             extra_keys[slot] = {slot_id, W, H, color_formats[slot]};
@@ -7981,7 +8208,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                                      : VK_ATTACHMENT_LOAD_OP_CLEAR;
     att[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
     att[0].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE; att[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    att[0].initialLayout = (seed_rgba || load_cached_color)
+    att[0].initialLayout = (seed_rgba || transition_cached_color)
         ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED;
     att[0].finalLayout = persistent_color ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
                                           : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
@@ -8164,7 +8391,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     if (use_ds) fbviews[ds_attachment] = dview;
     VkFramebufferCreateInfo fbci{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
     fbci.renderPass = rp; fbci.attachmentCount = color_count + (use_ds ? 1u : 0u);
-    fbci.pAttachments = fbviews.data(); fbci.width = W; fbci.height = H; fbci.layers = 1;
+    fbci.pAttachments = fbviews.data(); fbci.width = W; fbci.height = H;
+    fbci.layers = volume_color ? volume_slice_count : 1u;
     VkFramebuffer fb = VK_NULL_HANDLE;
     if (create_framebuffer_checked(dev, fbci, &fb) != VK_SUCCESS) {
         // `rp` is owned entirely by this scope and nothing references it yet, so unlike the wider
@@ -10193,11 +10421,14 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                         if (!upload.borrowed_compute && !r.is_storage_image &&
                             !upload.assembled_target_mips && persistent_color_targets_enabled &&
                             r.persistent_render_target_id &&
-                            prosper::frontend::rtt_single_layer_sample_shape(
-                                r.img_dim, r.td, r.sample_count)) {
+                            (prosper::frontend::rtt_single_layer_sample_shape(
+                                 r.img_dim, r.td, r.sample_count) ||
+                             (r.img_dim == 2u && r.td && r.sample_count == 1u &&
+                              !target_feedback))) {
                             if (auto* target = find_persistent_color_target(
                                     r.persistent_render_target_id, r.tw, r.th,
-                                    backend_color_format(r.texture_format))) {
+                                    backend_color_format(r.texture_format), true,
+                                    r.img_dim == 2u ? r.td : 0u)) {
                                 target->last_use = color_target_generation;
                                 if (target_feedback) {
                                     upload.feedback_snapshot = true;
@@ -11445,12 +11676,13 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     if (timing_enabled)
         active_submission.begin_gpu_timestamp(
             dev, cmd, ctx.timestamp_period_ns, ctx.timestamp_valid_bits);
-    if (load_cached_color) {
+    if (transition_cached_color) {
         VkImageMemoryBarrier load{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
         load.oldLayout = cached_color->layout;
         load.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
         load.image = img;
-        load.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        load.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0,
+                                 volume_color ? VK_REMAINING_ARRAY_LAYERS : 1u};
         // A previous target pass may be an earlier command buffer in the same queue submission.
         // Command-buffer order does not itself make its attachment writes visible, so include the
         // producer access/stage as well as the layouts in which an already-flushed target can rest.
@@ -12396,13 +12628,15 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     // any later command buffer in the queue can sample or LOAD them without relying on driver-wide
     // serialization. The final render-pass layouts are already correct; these same-layout barriers
     // supply the missing availability/visibility dependency.
-    auto publish_persistent_color = [&](bool persistent, bool readback, VkImage image) {
+    auto publish_persistent_color = [&](bool persistent, bool readback, VkImage image,
+                                        bool volume = false) {
         if (!persistent || readback) return;
         VkImageMemoryBarrier color_ready{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
         color_ready.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         color_ready.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         color_ready.image = image;
-        color_ready.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        color_ready.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0,
+                                        volume ? VK_REMAINING_ARRAY_LAYERS : 1u};
         color_ready.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
         color_ready.dstAccessMask = VK_ACCESS_SHADER_READ_BIT |
                                     VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
@@ -12412,7 +12646,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                  VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
                              0, 0, nullptr, 0, nullptr, 1, &color_ready);
     };
-    publish_persistent_color(persistent_color, readback_color0, img);
+    publish_persistent_color(persistent_color, readback_color0, img, volume_color);
     publish_persistent_color(persistent_color1, readback_color1, img1);
     // Retained higher slots need the same availability/visibility barrier when no readback copy
     // performed it. Keyed on whether THIS slot's readback path actually ran, since the new public
@@ -12514,20 +12748,22 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                              0, 0, nullptr, 0, nullptr, 1, &to_general);
     }
     if (readback_requested) {
-        auto transition_color_to_readback = [&](bool persistent, bool readback, VkImage image) {
+        auto transition_color_to_readback = [&](bool persistent, bool readback, VkImage image,
+                                                bool volume = false) {
             if (!persistent || !readback) return;
             VkImageMemoryBarrier to_readback{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
             to_readback.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
             to_readback.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
             to_readback.image = image;
-            to_readback.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            to_readback.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0,
+                                            volume ? VK_REMAINING_ARRAY_LAYERS : 1u};
             to_readback.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
             to_readback.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
             vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
                                  VK_PIPELINE_STAGE_TRANSFER_BIT,
                                  0, 0, nullptr, 0, nullptr, 1, &to_readback);
         };
-        transition_color_to_readback(persistent_color, readback_color0, img);
+        transition_color_to_readback(persistent_color, readback_color0, img, volume_color);
         transition_color_to_readback(persistent_color1, readback_color1, img1);
         for (uint32_t slot = 2; slot < color_count; ++slot) {
             const bool persistent_slot = cached_extra[slot] != nullptr;
@@ -12542,7 +12778,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         }
         VkBufferImageCopy cp{};
         cp.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-        cp.imageExtent = {W, H, 1};
+        cp.imageExtent = {W, H, volume_color ? volume_depth : 1u};
         if (readback_color0)
             vkCmdCopyImageToBuffer(
                 cmd, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, rb, 1, &cp);
@@ -12569,13 +12805,15 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         // #2944: one whole-buffer dependency covers every colour slot copied above -- they are
         // offsets into one allocation, which the host maps and reads once the batch completes.
         record_host_read_barrier(cmd, rb);
-        auto restore_persistent_color = [&](bool persistent, bool readback, VkImage image) {
+        auto restore_persistent_color = [&](bool persistent, bool readback, VkImage image,
+                                            bool volume = false) {
             if (!persistent || !readback) return;
             VkImageMemoryBarrier to_sample{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
             to_sample.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
             to_sample.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
             to_sample.image = image;
-            to_sample.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            to_sample.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0,
+                                          volume ? VK_REMAINING_ARRAY_LAYERS : 1u};
             to_sample.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
             to_sample.dstAccessMask = VK_ACCESS_SHADER_READ_BIT |
                                       VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
@@ -12585,7 +12823,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                      VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
                                  0, 0, nullptr, 0, nullptr, 1, &to_sample);
         };
-        restore_persistent_color(persistent_color, readback_color0, img);
+        restore_persistent_color(persistent_color, readback_color0, img, volume_color);
         restore_persistent_color(persistent_color1, readback_color1, img1);
         for (uint32_t slot = 2; slot < color_count; ++slot)
             restore_persistent_color(
@@ -12829,8 +13067,23 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     if (cached_color) {
         active_submission.add_failure_cleanup([cached_color]() {
             cached_color->valid = false;
+            std::fill(cached_color->valid_volume_slices.begin(),
+                      cached_color->valid_volume_slices.end(), 0u);
         });
-        cached_color->valid = true;
+        if (volume_color) {
+            // CLEAR initializes every pixel in the selected slices; a raster draw alone is not a
+            // whole-slice proof. LOAD preserves slices already established by an earlier call.
+            if (att[0].loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR)
+                std::fill(cached_color->valid_volume_slices.begin() + volume_first_slice,
+                          cached_color->valid_volume_slices.begin() +
+                              volume_first_slice + volume_slice_count, 1u);
+            cached_color->valid = std::all_of(
+                cached_color->valid_volume_slices.begin(),
+                cached_color->valid_volume_slices.end(),
+                [](uint8_t slice) { return slice != 0; });
+        } else {
+            cached_color->valid = true;
+        }
         cached_color->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     }
     if (cached_color1) {
@@ -12876,7 +13129,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         // a completed producer that never reached the command buffer.
         const bool realized_write = att[slot].loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR ||
                                     (realized_color_mask & (1u << slot));
-        const bool lineage_proven = producer_lineage_proven[slot] && realized_write;
+        const bool lineage_proven = producer_lineage_proven[slot] && realized_write &&
+            (!volume_color || slot != 0 || retained->valid);
         queue_color_producer_write(active_submission, *retained, ticket, lineage_proven,
                                    source_submit);
     }
@@ -13334,7 +13588,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
          shared_buffer_arenas = std::move(shared_buffer_arenas),
          texture_uploads = std::move(texture_uploads), seedbuf, seedmem, seedbuf1, seedmem1,
          extra_seedbufs, extra_seedmems,
-         rb, bmem, fb, rp, transient_color, view, img, imem, transient_color1, view1, img1,
+         rb, bmem, fb, rp, transient_color, volume_color, view, img, imem,
+         transient_color1, view1, img1,
          transient_extra,
          imem1, color_count, extra_views, extra_images, extra_memories,
          transient_ds, dview, dimg, dmem, ds_stats_pool, ds_occ_pool,
@@ -13420,6 +13675,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             if (bmem) release_transient_render_memory(dev, bmem);
             vkDestroyFramebuffer(dev, fb, nullptr);
             vkDestroyRenderPass(dev, rp, nullptr);
+            if (volume_color && !transient_color)
+                vkDestroyImageView(dev, view, nullptr);
             if (transient_color) {
                 vkDestroyImageView(dev, view, nullptr);
                 vkDestroyImage(dev, img, nullptr);
@@ -13446,7 +13703,9 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                     persistent_color_target_bytes() > persistent_color_target_limit()) &&
                    evict_persistent_color_target(*ctx_ptr, color_target_generation)) {}
         });
+    volume_attachment_view.release();
     if (flush_now) active_submission.complete();
+    if (!flush_now || batch_completed) volume_attempt.release();
     if (timing_enabled) {
         const auto timing_done = TimingClock::now();
         auto ms = [](auto begin, auto end) {

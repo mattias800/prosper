@@ -131,6 +131,9 @@ struct DrawItem {
         // describe the selected mip's physical depth and bounded guest view independently.
         uint32_t selected_mip_depth = 0, first_slice = 0, slice_count = 0;
         uint32_t programmed_slice_max = 0; // raw inclusive VIEW endpoint, even if out of range
+        uint32_t tile_mode = 0, mip_level = 0;
+        bool in_mip_tail = false;
+        bool native_layout_known = false; // old captures carry no CB_COLOR tiling proof
 
         constexpr void mirror_named_identity(uint64_t named_base, uint32_t named_width,
                                              uint32_t named_height) {
@@ -1213,6 +1216,11 @@ void set_metadata_kind_query(MetadataKindQueryFn fn);
 CompressionMetadataKind classify_compression_metadata_kind(const MetadataKindRequest& request);
 void set_live_target_query(LiveTargetQueryFn fn);
 bool is_live_render_target(uint64_t gpu_addr);
+// A renderer-produced volume can remain unpublished to guest memory after a 2D alias replaces
+// its current image. Layered compute cannot use the ordinary guest-byte fallback in that case.
+using UnpublishedVolumeQueryFn = std::function<bool(uint64_t gpu_addr, uint64_t bytes)>;
+void set_unpublished_volume_query(UnpublishedVolumeQueryFn fn);
+bool overlaps_unpublished_renderer_volume(uint64_t gpu_addr, uint64_t bytes);
 enum class LiveTargetPixelFormat : uint8_t {
     Rgba8Unorm,
     Rgba16Float,
@@ -1853,6 +1861,10 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
             binding.slice_count = volume.slice_count;
             binding.programmed_slice_max = volume.selected_mip_depth
                 ? rs.color_targets[slot].slice_max : 0u;
+            binding.tile_mode = rs.color_targets[slot].color_sw_mode;
+            binding.mip_level = rs.color_targets[slot].mip_level;
+            binding.in_mip_tail = rs.color_targets[slot].in_mip_tail;
+            binding.native_layout_known = rs.color_targets[slot].has_attrib3;
         }
         failure->color_targets[0].mirror_named_identity(
             failure->color0_base, failure->color0_width, failure->color0_height);
@@ -2730,6 +2742,10 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
         binding.slice_count = volume.slice_count;
         binding.programmed_slice_max = volume.selected_mip_depth
             ? rs.color_targets[slot].slice_max : 0u;
+        binding.tile_mode = rs.color_targets[slot].color_sw_mode;
+        binding.mip_level = rs.color_targets[slot].mip_level;
+        binding.in_mip_tail = rs.color_targets[slot].in_mip_tail;
+        binding.native_layout_known = rs.color_targets[slot].has_attrib3;
     }
     // Preserve direct/synthetic callers that still populate only the named aliases.
     out.color_targets[0].mirror_named_identity(out.color0_base, out.color0_width,

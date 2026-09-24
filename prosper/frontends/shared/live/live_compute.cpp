@@ -7742,6 +7742,13 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             bool renderer_owned = !r->in_mip_tail && is_live_render_target(r->gpu_addr);
             query_ms = std::chrono::duration<double, std::milli>(
                 ComputeClock::now() - query_start).count();
+            const uint64_t resource_bytes = std::max<uint64_t>(
+                1u, gpu_capture_resource_footprint(*r));
+            if (overlaps_unpublished_renderer_volume(r->gpu_addr, resource_bytes) &&
+                (dim_3d || dim_2d_array || r->depth > 1u || !renderer_owned)) {
+                skip_image(r, "renderer volume has no complete guest publication");
+                break;
+            }
             // Exact write-only storage aliases already have a fully prepared canonical image.
             // Fold before requesting a second RTT snapshot: the owner supplies current inputs
             // and publishes the combined result, so the duplicate needs no separate preparation.
