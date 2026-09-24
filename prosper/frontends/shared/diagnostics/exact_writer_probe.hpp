@@ -17,6 +17,11 @@ struct ExactWriterProbeSpec {
     uint64_t ps = 0;
     uint64_t input = 0;
     uint64_t output = 0;
+    // A moving guest allocation may be selected by exact extent, but only when the shader,
+    // input binding, one-draw shape, and color write also match.
+    bool output_by_extent = false;
+    uint32_t output_width = 0;
+    uint32_t output_height = 0;
     uint64_t after_ms = 0;
 };
 
@@ -75,7 +80,8 @@ inline const char* exact_writer_second_input_verdict_name(
     return "unknown";
 }
 
-// 0xPS:0xINPUT:0xOUTPUT:ms:AFTER. Every field is exact; a partial parse must refuse.
+// 0xPS:0xINPUT:0xOUTPUT:ms:AFTER or 0xPS:0xINPUT:auto:WxH:ms:AFTER.
+// Every field is exact; a partial parse must refuse.
 inline ExactWriterProbeSpec parse_exact_writer_probe(const char* value) {
     ExactWriterProbeSpec spec;
     if (!value) return spec;
@@ -91,8 +97,27 @@ inline ExactWriterProbeSpec parse_exact_writer_probe(const char* value) {
         rest.remove_prefix(end + 1);
         return error == std::errc{} && last == part.data() + part.size() && output;
     };
-    if (!hex(spec.ps) || !hex(spec.input) || !hex(spec.output) ||
-        spec.input == spec.output || !rest.starts_with("ms:")) return spec;
+    if (!hex(spec.ps) || !hex(spec.input)) return spec;
+    if (rest.starts_with("auto:")) {
+        spec.output_by_extent = true;
+        rest.remove_prefix(5);
+        const size_t x = rest.find('x');
+        const size_t colon = rest.find(':');
+        if (x == std::string_view::npos || colon == std::string_view::npos ||
+            x == 0 || x + 1 >= colon) return spec;
+        const auto width = rest.substr(0, x);
+        const auto height = rest.substr(x + 1, colon - x - 1);
+        const auto [width_end, width_error] = std::from_chars(
+            width.data(), width.data() + width.size(), spec.output_width);
+        const auto [height_end, height_error] = std::from_chars(
+            height.data(), height.data() + height.size(), spec.output_height);
+        if (width_error != std::errc{} || width_end != width.data() + width.size() ||
+            height_error != std::errc{} || height_end != height.data() + height.size() ||
+            !spec.output_width || !spec.output_height ||
+            spec.output_width > 8192 || spec.output_height > 8192) return spec;
+        rest.remove_prefix(colon + 1);
+    } else if (!hex(spec.output) || spec.input == spec.output) return spec;
+    if (!rest.starts_with("ms:")) return spec;
     rest.remove_prefix(3);
     if (rest.empty() || rest.front() == '+' || rest.front() == '-') return spec;
     const auto [last, error] = std::from_chars(rest.data(), rest.data() + rest.size(),
@@ -107,10 +132,14 @@ enum class ExactWriterMatch : uint8_t {
 };
 
 inline ExactWriterMatch exact_writer_match(uint64_t actual_ps, uint64_t actual_target,
+                                           uint32_t actual_width, uint32_t actual_height,
                                            size_t original_draws, size_t adjusted_draws,
                                            bool color0_write, const ExactWriterProbeSpec& spec) {
     if (actual_ps != spec.ps) return ExactWriterMatch::WrongPs;
-    if (actual_target != spec.output) return ExactWriterMatch::WrongTarget;
+    if (!actual_target || actual_target == spec.input ||
+        (spec.output_by_extent
+             ? actual_width != spec.output_width || actual_height != spec.output_height
+             : actual_target != spec.output)) return ExactWriterMatch::WrongTarget;
     if (original_draws != 1 || adjusted_draws != 1) return ExactWriterMatch::MultiDraw;
     if (!color0_write) return ExactWriterMatch::NoColorWrite;
     return ExactWriterMatch::Exact;
@@ -118,6 +147,14 @@ inline ExactWriterMatch exact_writer_match(uint64_t actual_ps, uint64_t actual_t
 
 inline bool exact_writer_scene_input_visible(size_t raw_nonzero, size_t rgb_nonblack) {
     return raw_nonzero != 0 && rgb_nonblack != 0;
+}
+
+// A saved module can be valid for one draw yet wrong for earlier pipeline variants of the same
+// guest program. When requested, admit it only while the exact-writer probe owns that draw.
+inline bool exact_writer_file_override_selected(bool gated, bool probe_armed,
+                                                uint64_t draw_index, uint64_t selected_index) {
+    return !gated || (probe_armed && selected_index != UINT64_MAX &&
+                      draw_index == selected_index);
 }
 
 enum class ExactWriterOutputChange : uint8_t { Unknown, Identical, Changed };

@@ -1685,13 +1685,13 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
         }
         const char* reason = nullptr;
         if (!spec.armed)
-            reason = "expected 0xPS:0xINPUT:0xOUTPUT:ms:0..120000";
+            reason = "expected 0xPS:0xINPUT:(0xOUTPUT|auto:WxH):ms:0..120000";
         else if (g_exact_writer_second_spec.requested &&
                  !g_exact_writer_second_spec.armed)
             reason = "second input expected BINDING:0xADDRESS";
         else if (g_exact_writer_second_spec.requested &&
                  (g_exact_writer_second_spec.address == spec.input ||
-                  g_exact_writer_second_spec.address == spec.output))
+                 (!spec.output_by_extent && g_exact_writer_second_spec.address == spec.output)))
             reason = "second input must differ from primary input and output";
         else if (g_compute_present_spec.requested ||
                  PROSPER_ENV_VALUE("PROSPER_KENA_MENU_TRACE") ||
@@ -1716,12 +1716,16 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                  PROSPER_ENV_VALUE("PROSPER_RTTLOG"))
             reason = "normal persistent/batched target path disabled";
         if (reason) spec.armed = false;
-        fprintf(stderr, "[exact-writer] %s ps=0x%llx input=0x%llx output=0x%llx "
+        fprintf(stderr, "[exact-writer] %s ps=0x%llx input=0x%llx output=%s0x%llx "
+                        "extent=%ux%u "
                         "after=%llu ms second=%s binding=%u addr=0x%llx reason=%s "
                         "(one draw, four candidates, "
                         "160 MiB raw/128 MiB BMP caps)\n",
                 spec.armed ? "armed" : "refused", (unsigned long long)spec.ps,
-                (unsigned long long)spec.input, (unsigned long long)spec.output,
+                (unsigned long long)spec.input,
+                spec.output_by_extent ? "auto/actual-" : "",
+                (unsigned long long)spec.output,
+                spec.output_width, spec.output_height,
                 (unsigned long long)spec.after_ms,
                 g_exact_writer_second_spec.requested ? "required" : "disabled",
                 g_exact_writer_second_spec.binding,
@@ -9060,6 +9064,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 if (load_spv_file(fsp, m)) { ps_override = std::move(m); ps_override_is_file = true; }
                 else fprintf(stderr, "[fs-spv] PROSPER_FS_SPV='%s' invalid/unreadable -> no file override\n", fsp);
             }
+            const bool fs_exact_writer_only =
+                PROSPER_ENV_ON("PROSPER_FS_SPV_EXACT_WRITER_ONLY");
             // PROSPER_FS_SPV_MATCH=<file>: restrict the PROSPER_FS_SPV *file* override to draws whose
             // recompiled fragment SPIR-V EXACTLY equals this file (a per-draw A/B substitution that does
             // not touch draws with a different descriptor contract). FAILS CLOSED: if requested but the
@@ -9145,6 +9151,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         if (fs_match_mode == 1)      fs_ov = (it.fs_words() == fs_match);   // valid match -> exact only
                         else if (fs_match_mode == 2) fs_ov = false;                // requested-but-invalid -> off
                         // mode 0 -> legacy global file override (unchanged)
+                        if (fs_exact_writer_only && fs_match_mode != 1) fs_ov = false;
+                        if (fs_ov) fs_ov = prosper::frontend::exact_writer_file_override_selected(
+                            fs_exact_writer_only, exact_writer_live, it.draw_index,
+                            exact_writer_draw_index);
                     }
                     if (fs_ov && ps_override_is_test) {
                         if (testps_match_mode == 1)      fs_ov = (it.fs_words() == testps_match);
@@ -10707,7 +10717,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         ? 0 : render_pass.front()->fs_guest_addr;
                     const auto writer_match = exact_writer_live
                         ? prosper::frontend::exact_writer_match(
-                              writer_ps, base, pass.size(), render_pass.size(),
+                              writer_ps, base, gw, gh, pass.size(), render_pass.size(),
                               !pass.empty() && active_color(*pass.front(), 0) == base && base,
                               g_exact_writer_spec)
                         : prosper::frontend::ExactWriterMatch::WrongPs;
@@ -10785,6 +10795,43 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         VkFormat second_format = VK_FORMAT_UNDEFINED;
                         if (backend_draws.size() == 1)
                             for (const auto& resource : backend_draws.front().R) {
+                                if (resource.set == 1 && resource.binding == 39) {
+                                    const uint64_t extent_bytes =
+                                        uint64_t{resource.tw} * resource.th * resource.td * 4u;
+                                    const size_t owner_bytes = resource.tex_rgba_owner
+                                        ? resource.tex_rgba_owner->size() : 0;
+                                    const bool extent_derived = !resource.tex_byte_size &&
+                                        resource.texture_format == VK_FORMAT_R8G8B8A8_UNORM &&
+                                        resource.td > 1 && extent_bytes &&
+                                        extent_bytes <= (1u << 20);
+                                    const size_t inspected_bytes = resource.tex_byte_size
+                                        ? resource.tex_byte_size
+                                        : (extent_derived ? static_cast<size_t>(extent_bytes) : 0);
+                                    const bool readable = resource.tex_rgba && inspected_bytes &&
+                                        inspected_bytes <= (1u << 20) &&
+                                        (!owner_bytes || owner_bytes >= inspected_bytes);
+                                    size_t nonzero = 0;
+                                    uint64_t hash = 1469598103934665603ull;
+                                    if (readable)
+                                        for (size_t i = 0; i < inspected_bytes; ++i) {
+                                            const uint8_t byte = resource.tex_rgba[i];
+                                            nonzero += byte != 0;
+                                            hash = (hash ^ byte) * 1099511628211ull;
+                                        }
+                                    fprintf(stderr, "[exact-writer] attempt=%u lut-binding39 "
+                                                    "extent=%ux%ux%u fmt=%u bytes=%zu "
+                                                    "owner-bytes=%zu source=%s readable=%d "
+                                                    "nonzero=%zu fnv=%016llx gpu-detile=%d "
+                                                    "persistent=0x%llx\n",
+                                            writer_attempt, resource.tw, resource.th, resource.td,
+                                            (unsigned)resource.texture_format,
+                                            inspected_bytes, owner_bytes,
+                                            extent_derived ? "extent-derived" : "explicit",
+                                            readable ? 1 : 0,
+                                            nonzero, (unsigned long long)hash,
+                                            resource.gpu_detile ? 1 : 0,
+                                            (unsigned long long)resource.persistent_render_target_id);
+                                }
                                 backend_bound |= resource.set == 1 &&
                                     resource.binding == exact_writer_input_binding &&
                                     resource.persistent_render_target_id ==
@@ -10994,7 +11041,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     prosper::frontend::ExactWriterSecondInputVerdict::Ready) {
                                 size_t output_before_nonzero = 0;
                                 size_t output_before_rgb = 0;
-                                writer_before_ok = writer_snapshot(g_exact_writer_spec.output,
+                                writer_before_ok = writer_snapshot(base,
                                     "output-before", gw, gh, pass_format,
                                     output_before_nonzero, output_before_rgb,
                                     &writer_output_before_raw);
@@ -11092,7 +11139,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         size_t output_after_rgb = 0;
                         const bool output_after_ok = writer_before_ok && submitted &&
                             color_target_call.writes > 0 &&
-                            writer_snapshot(g_exact_writer_spec.output, "output-after",
+                            writer_snapshot(base, "output-after",
                                             gw, gh, pass_format, output_after_nonzero,
                                             output_after_rgb, &writer_output_after_raw);
                         const auto output_change = output_after_ok

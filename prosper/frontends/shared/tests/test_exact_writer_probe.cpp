@@ -18,6 +18,11 @@ int main() {
         "0x300bbc0000:0x30a9830000:0x309abc0000:ms:120001",
         "0x300bbc0000:0x30a9830000:0x309abc0000:ms:30000junk",
         "0x300bbc0000:0x30a9830000:0x309abc0000:30000",
+        "0x300bbc0000:0x30a9830000:auto:0x1800:ms:30000",
+        "0x300bbc0000:0x30a9830000:auto:3200x0:ms:30000",
+        "0x300bbc0000:0x30a9830000:auto:3200x1800junk:ms:30000",
+        "0x300bbc0000:0x30a9830000:auto:8193x1800:ms:30000",
+        "0x300bbc0000:0x30a9830000:auto:3200x1800:ms:120001",
     };
     for (const char* value : invalid)
         if (parse_exact_writer_probe(value).armed) return 2;
@@ -42,18 +47,35 @@ int main() {
             ExactWriterSecondInputVerdict::NoVisibleRgb ||
         exact_writer_second_input_verdict(true, true, 12, 4) !=
             ExactWriterSecondInputVerdict::Ready) return 15;
-    if (exact_writer_match(spec.ps, spec.output, 1, 1, true, spec) !=
+    if (exact_writer_match(spec.ps, spec.output, 3200, 1800, 1, 1, true, spec) !=
             ExactWriterMatch::Exact ||
-        exact_writer_match(spec.ps + 1, spec.output, 1, 1, true, spec) !=
+        exact_writer_match(spec.ps + 1, spec.output, 3200, 1800, 1, 1, true, spec) !=
             ExactWriterMatch::WrongPs ||
-        exact_writer_match(spec.ps, spec.output + 1, 1, 1, true, spec) !=
+        exact_writer_match(spec.ps, spec.output + 1, 3200, 1800, 1, 1, true, spec) !=
             ExactWriterMatch::WrongTarget ||
-        exact_writer_match(spec.ps, spec.output, 2, 2, true, spec) !=
+        exact_writer_match(spec.ps, spec.output, 3200, 1800, 2, 2, true, spec) !=
             ExactWriterMatch::MultiDraw ||
-        exact_writer_match(spec.ps, spec.output, 1, 2, true, spec) !=
+        exact_writer_match(spec.ps, spec.output, 3200, 1800, 1, 2, true, spec) !=
             ExactWriterMatch::MultiDraw ||
-        exact_writer_match(spec.ps, spec.output, 1, 1, false, spec) !=
+        exact_writer_match(spec.ps, spec.output, 3200, 1800, 1, 1, false, spec) !=
             ExactWriterMatch::NoColorWrite) return 3;
+    const auto by_extent = parse_exact_writer_probe(
+        "0x300bbc0000:0x30a9830000:auto:3200x1800:ms:30000");
+    if (!by_extent.armed || !by_extent.output_by_extent || by_extent.output ||
+        by_extent.output_width != 3200 || by_extent.output_height != 1800 ||
+        exact_writer_match(by_extent.ps, 0x309afc0000, 3200, 1800, 1, 1, true,
+                           by_extent) != ExactWriterMatch::Exact ||
+        exact_writer_match(by_extent.ps, 0x309afc0000, 3200, 1080, 1, 1, true,
+                           by_extent) != ExactWriterMatch::WrongTarget ||
+        exact_writer_match(by_extent.ps, by_extent.input, 3200, 1800, 1, 1, true,
+                           by_extent) != ExactWriterMatch::WrongTarget ||
+        exact_writer_match(by_extent.ps, 0, 3200, 1800, 1, 1, true,
+                           by_extent) != ExactWriterMatch::WrongTarget) return 16;
+    if (!exact_writer_file_override_selected(true, true, 348, 348) ||
+        exact_writer_file_override_selected(true, true, 347, 348) ||
+        exact_writer_file_override_selected(true, true, 348, UINT64_MAX) ||
+        exact_writer_file_override_selected(true, false, 348, 348) ||
+        !exact_writer_file_override_selected(false, false, 347, UINT64_MAX)) return 17;
     const uint8_t same_a[] = {0, 0, 0, 255};
     const uint8_t same_b[] = {0, 0, 0, 255};
     const uint8_t different[] = {1, 0, 0, 255};
