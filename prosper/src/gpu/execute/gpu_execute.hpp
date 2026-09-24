@@ -24,6 +24,7 @@
 #include "gpu/present/videoout_present.hpp"    // PresentFrameOrigin: a rendered frame carries its provenance
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -1975,6 +1976,91 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     const auto* chain_header = chain_addr
         ? static_cast<const AgcShaderHeader*>(prosper_agc_shader_header_for_code(chain_addr))
         : nullptr;
+    // Inspect the register state at the draw's realization boundary. A failed NGG draw is absent
+    // from ordinary capture draw records, while its raw ES/GS launch registers determine whether
+    // an offline wave probe is exercising the same contract. Keep this exact-program diagnostic
+    // bounded: a title can submit the same program thousands of times before reaching its menu.
+    struct NggLaunchStateFilter {
+        uint64_t program = 0, target = 0, extent = 0, instances = 0;
+        bool valid = true;
+    };
+    static const NggLaunchStateFilter launch_filter = [] {
+        NggLaunchStateFilter filter;
+        const auto parse = [&](const char* name, uint64_t& result) {
+            const char* value = std::getenv(name); // this whole initializer runs once
+            if (!value) return;
+            errno = 0;
+            char* end = nullptr;
+            const auto parsed = std::strtoull(value, &end, 0);
+            if (!*value || *value == '-' || errno || end == value || *end) {
+                std::fprintf(stderr, "[ngg-launch-state] invalid %s=%s; disabled\n", name, value);
+                filter.valid = false;
+            } else {
+                result = parsed;
+            }
+        };
+        parse("PROSPER_NGG_LAUNCH_STATE_PROGRAM", filter.program);
+        parse("PROSPER_NGG_LAUNCH_STATE_TARGET", filter.target);
+        parse("PROSPER_NGG_LAUNCH_STATE_EXTENT", filter.extent);
+        parse("PROSPER_NGG_LAUNCH_STATE_INSTANCES", filter.instances);
+        if (filter.valid && filter.program)
+            std::fprintf(stderr,
+                "[ngg-launch-state] armed program=%llx target=%llx extent=%llu "
+                "instances=%llu cap=8\n",
+                static_cast<unsigned long long>(filter.program),
+                static_cast<unsigned long long>(filter.target),
+                static_cast<unsigned long long>(filter.extent),
+                static_cast<unsigned long long>(filter.instances));
+        return filter;
+    }();
+    if (launch_filter.valid && launch_filter.program &&
+        (launch_filter.program == rs.es_addr || launch_filter.program == chain_addr) &&
+        (!launch_filter.target || launch_filter.target == rs.color0_base) &&
+        (!launch_filter.extent || (rs.color0_width == launch_filter.extent &&
+                                  rs.color0_height == launch_filter.extent)) &&
+        (!launch_filter.instances ||
+         launch_filter.instances == (draw ? draw->instance_count : ds.num_instances))) {
+        static std::atomic<uint32_t> launch_state_lines{0};
+        if (launch_state_lines.fetch_add(1, std::memory_order_relaxed) < 8) {
+            namespace P = prosper::agc::Pm4;
+            uint32_t present = 0;
+            const auto cx = [&](uint32_t reg, uint32_t bit) {
+                const auto it = ds.cx.find(reg);
+                if (it == ds.cx.end()) return 0u;
+                present |= 1u << bit;
+                return it->second;
+            };
+            const auto sh = [&](uint32_t reg, uint32_t bit) {
+                const auto it = ds.sh.find(reg);
+                if (it == ds.sh.end()) return 0u;
+                present |= 1u << bit;
+                return it->second;
+            };
+            const uint32_t rsrc1 = sh(P::SPI_SHADER_PGM_RSRC1_GS, 0);
+            const uint32_t rsrc2 = sh(P::SPI_SHADER_PGM_RSRC2_GS, 1);
+            const uint32_t onchip = cx(P::VGT_GS_ONCHIP_CNTL, 2);
+            const uint32_t esgs_itemsize = cx(P::VGT_ESGS_RING_ITEMSIZE, 3);
+            const uint32_t ge_cntl = cx(P::GE_CNTL, 4);
+            const uint32_t subgroup = cx(P::GE_NGG_SUBGRP_CNTL, 5);
+            const uint32_t stages = cx(P::VGT_SHADER_STAGES_EN, 6);
+            const uint32_t primitive = cx(P::VGT_PRIMITIVE_TYPE, 7);
+            const uint32_t gs_instance = cx(P::VGT_GS_INSTANCE_CNT, 8);
+            const uint32_t gs_max_out = cx(P::VGT_GS_MAX_VERT_OUT, 9);
+            std::fprintf(stderr,
+                "[ngg-launch-state] es=%llx chain=%llx target=%llx order=%llu "
+                "vertices=%u instances=%u topo=%u present=%03x rsrc1=%08x rsrc2=%08x "
+                "onchip=%08x esgs-itemsize=%08x ge-cntl=%08x subgroup=%08x "
+                "stages=%08x primitive=%08x gs-instance=%08x gs-max-out=%08x\n",
+                static_cast<unsigned long long>(rs.es_addr),
+                static_cast<unsigned long long>(chain_addr),
+                static_cast<unsigned long long>(rs.color0_base),
+                static_cast<unsigned long long>(draw ? draw->command_order : 0),
+                vcount_hint, draw ? draw->instance_count : ds.num_instances,
+                rs.prim_type, present,
+                rsrc1, rsrc2, onchip, esgs_itemsize, ge_cntl, subgroup, stages,
+                primitive, gs_instance, gs_max_out);
+        }
+    }
     auto bounded_shader_dwords = [&](uint64_t address, const AgcShaderHeader* header) -> size_t {
         if (!address || !header || !header->shader_size) return 0;
         const size_t dwords = std::min<size_t>(max_shader_dwords, header->shader_size / sizeof(uint32_t));

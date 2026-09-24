@@ -4,6 +4,7 @@
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "fixtures/compute_runner.h"
 
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <cerrno>
@@ -13,6 +14,7 @@
 #include <cstring>
 #include <fstream>
 #include <iterator>
+#include <optional>
 #include <set>
 #include <string>
 #include <string_view>
@@ -91,6 +93,53 @@ bool exact_native_wave64_marker(const std::vector<uint32_t>& words) {
     return module_marker_count(words, "Prosper.NggProbeExactSubgroup=64") == 1;
 }
 
+struct IndexedExportSummary {
+    uint32_t indexed_primitives = 0;
+    uint32_t consistent_layer_primitives = 0;
+    uint32_t mixed_layer_primitives = 0;
+    uint32_t out_of_range_primitives = 0;
+    uint32_t null_primitives = 0;
+    std::set<uint32_t> referenced_vertices;
+    std::set<uint32_t> candidate_layers;
+};
+
+std::optional<IndexedExportSummary> summarize_indexed_exports(
+    const std::vector<uint32_t>& raw, uint32_t lanes, uint32_t words_per_lane) {
+    if (words_per_lane < 8u || raw.size() != static_cast<size_t>(lanes) * words_per_lane)
+        return std::nullopt;
+    IndexedExportSummary result;
+    for (uint32_t lane = 0; lane < lanes; ++lane) {
+        const uint32_t primitive = raw[static_cast<size_t>(lane) * words_per_lane];
+        if (!primitive) continue; // no PRIM export in this output slot
+        if (primitive & 0x80000000u) {
+            ++result.null_primitives;
+            continue;
+        }
+        const std::array<uint32_t, 3> vertices = {
+            primitive & 0x3ffu, (primitive >> 10u) & 0x3ffu,
+            (primitive >> 20u) & 0x3ffu};
+        if (std::any_of(vertices.begin(), vertices.end(),
+                        [lanes](uint32_t index) { return index >= lanes; })) {
+            ++result.out_of_range_primitives;
+            continue;
+        }
+        ++result.indexed_primitives;
+        for (uint32_t index : vertices) result.referenced_vertices.insert(index);
+        const uint32_t layer = raw[static_cast<size_t>(vertices[0]) * words_per_lane + 7u];
+        const bool same_layer = std::all_of(vertices.begin() + 1, vertices.end(),
+            [&](uint32_t index) {
+                return raw[static_cast<size_t>(index) * words_per_lane + 7u] == layer;
+            });
+        if (!same_layer) {
+            ++result.mixed_layer_primitives;
+            continue;
+        }
+        ++result.consistent_layer_primitives;
+        result.candidate_layers.insert(layer);
+    }
+    return result;
+}
+
 bool selftest() {
     using prosper::gpu::ResourceClass;
     prosper::gpu::ShaderResource resource;
@@ -152,7 +201,33 @@ bool selftest() {
     duplicate_trace.insert(duplicate_trace.end(), trace_payload.begin(), trace_payload.end());
     if (module_marker_count(duplicate_trace, kTraceMarker) != 2) return false;
     module[marker_instruction + 1u] ^= 1u; // mutate 'P', not trailing padding
-    return !exact_native_wave64_marker(module);
+    if (exact_native_wave64_marker(module)) return false;
+
+    // PRIM lives in one lane, but its three vertex records can live in other lanes. A census
+    // over PRIM lanes alone missed Kena's later output vertices and undercounted its layers.
+    std::vector<uint32_t> exports(4u * 13u);
+    exports[0] = 1u | (2u << 10u) | (3u << 20u);
+    for (uint32_t vertex = 1; vertex <= 3; ++vertex)
+        exports[static_cast<size_t>(vertex) * 13u + 7u] = 7u;
+    const auto good = summarize_indexed_exports(exports, 4u, 13u);
+    if (!good || good->indexed_primitives != 1u ||
+        good->consistent_layer_primitives != 1u ||
+        good->referenced_vertices.size() != 3u ||
+        good->candidate_layers != std::set<uint32_t>{7u}) return false;
+    exports[3u * 13u + 7u] = 8u;
+    const auto mixed = summarize_indexed_exports(exports, 4u, 13u);
+    if (!mixed || mixed->indexed_primitives != 1u ||
+        mixed->mixed_layer_primitives != 1u || !mixed->candidate_layers.empty()) return false;
+    exports[0] = 1u | (2u << 10u) | (5u << 20u);
+    const auto outside = summarize_indexed_exports(exports, 4u, 13u);
+    if (!outside || outside->out_of_range_primitives != 1u ||
+        outside->indexed_primitives != 0u) return false;
+    exports[0] |= 0x80000000u;
+    const auto null_primitive = summarize_indexed_exports(exports, 4u, 13u);
+    if (!null_primitive || null_primitive->null_primitives != 1u ||
+        null_primitive->out_of_range_primitives != 0u) return false;
+    return !summarize_indexed_exports(std::vector<uint32_t>(4u * 7u), 4u, 7u) &&
+           !summarize_indexed_exports(exports, 5u, 13u);
 }
 } // namespace
 
@@ -404,11 +479,28 @@ int main(int argc, char** argv) {
         emitted += words[0] != 0;
         layers.insert(words[7]); // POS1.z: captured guest layer route, still unvalidated
     }
+    const auto indexed = summarize_indexed_exports(raw, lanes, kWords);
+    if (!indexed) {
+        std::fprintf(stderr, "ngg_capture_probe: invalid export record shape\n");
+        return 2;
+    }
+    const std::string layer_range = indexed->candidate_layers.empty()
+        ? "none"
+        : std::to_string(*indexed->candidate_layers.begin()) + ".." +
+          std::to_string(*indexed->candidate_layers.rbegin());
     std::fprintf(stderr,
                  "[ngg-capture-probe] COMPILE-ONLY MODULE EXECUTION; lanes=%u words/lane=%u "
-                 "nonzero-prim=%u distinct-pos1-z=%zu inputs=%s zero-binding=%u "
+                 "nonzero-prim=%u distinct-pos1-z=%zu indexed-prims=%u "
+                 "referenced-vertices=%zu consistent-layer-prims=%u candidate-layers=%zu "
+                 "candidate-layer-range=%s "
+                 "mixed-layer-prims=%u out-of-range-prims=%u null-prims=%u "
+                 "inputs=%s zero-binding=%u "
                  "packed-offsets=%s full-inputs=%s output=%s\n",
-                 lanes, kWords, emitted, layers.size(),
+                 lanes, kWords, emitted, layers.size(), indexed->indexed_primitives,
+                 indexed->referenced_vertices.size(), indexed->consistent_layer_primitives,
+                 indexed->candidate_layers.size(), layer_range.c_str(),
+                 indexed->mixed_layer_primitives,
+                 indexed->out_of_range_primitives, indexed->null_primitives,
                  zero_inputs ? "zeroed-control" : "captured", zero_binding,
                  packed_offsets_path.empty() ? "none" : packed_offsets_path.c_str(),
                  full_inputs_path.empty() ? "none" : full_inputs_path.c_str(), argv[4]);

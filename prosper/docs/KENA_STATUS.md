@@ -63,9 +63,14 @@ instruction. On a **speculative** one-subgroup input for this producer, it expos
 in the probe's native Wave64 dispatcher: a `BOUND_CTRL` marker was passed as part of the lane shift, so the
 reduction never collected neighboring lanes. With that corrected, the same input changes from zero to 32
 nonzero raw PRIM records. A byte-matched two-instruction synthetic test guards the reduction and wave isolation.
-These records are not validated primitives or pixels; the captured blobs are callback-time copies, and the
-input does not establish Kena's actual multi-subgroup ES/GS partition or output assembly. The live renderer
-still rejects this producer. #3135 remains open.
+The referenced vertex slots clarify those records: their packed indices cover 96 distinct slots, with
+nondegenerate clip-space triangles and two candidate triangles on each of layers 0–15. Supplying instance
+indices 16–31 to a second otherwise-identical offline subgroup produces the corresponding layers 16–31;
+changing only the proposed primitive IDs leaves the readback byte-identical. The earlier count of just six
+POS1.z values examined only lanes carrying PRIM records and missed the vertex records they reference.
+These are still **supplied** launch inputs, not validated hardware subgroups, primitives, pixels, or a title
+fix. The captured blobs are callback-time copies and the live renderer still rejects the producer. #3135
+remains open.
 
 A targeted live state log for that same producer records `SPI_SHADER_PGM_RSRC2_GS=0x008b0000`
 (2,176 LDS dwords, 8.5 KiB), `VGT_GS_ONCHIP_CNTL=0x10020040`
@@ -74,13 +79,24 @@ A targeted live state log for that same producer records `SPI_SHADER_PGM_RSRC2_G
 `GE_NGG_SUBGRP_CNTL=1`, `VGT_GS_MAX_VERT_OUT=3`,
 `CB_COLOR0_VIEW=0x00040000`, and `CB_COLOR0_ATTRIB3=0x4606c01f`. The latter's
 `MIP0_DEPTH=31` encodes 32 slices and its resource-type field is 2; the immediately following
-consumer binds the same address as a 32³ texture. The present Vulkan backend allocates
-ordinary color attachments as one-layer 2D images. That is a separate missing output path, even if
-the shader starts compiling. The slice-max register is recorded raw rather than interpreted as a
-layer count until its boundary convention is established. On this AMD host, a standalone mesh draw
-rendered 32 layers in four eight-layer batches with Khronos validation loaded and no reported
-errors. This proves only that the host API route exists: the guest wave/primitive mapping, layered
-renderer publication, and correct LUT values still need implementation and game verification.
+consumer binds the same address as a 32³ texture. PR #3842 added a generic retained 3D color-target
+path; the shader and draw launch still need to produce valid layered output for it. The slice-max
+register is recorded raw rather than interpreted as a layer count until its boundary convention is
+established. On this AMD host, a standalone mesh draw rendered 32 layers in four eight-layer batches
+with Khronos validation loaded and no reported errors. This proves only that the host API route exists:
+the guest wave/primitive mapping and correct LUT values still need implementation and game verification.
+
+An exact-program-and-output-shape live witness on the 32×32, 32-instance LUT draw reported the same
+state eight times: `SPI_SHADER_PGM_RSRC1_GS=0x622c0047`, `RSRC2_GS=0x008b0000`,
+`VGT_GS_ONCHIP_CNTL=0x10020040`, `VGT_ESGS_RING_ITEMSIZE=4`, and `GE_NGG_SUBGRP_CNTL=1`.
+The `GS_VGPR_COMP_CNT` and `ES_VGPR_COMP_CNT` fields are both 3, so the hardware loads v0–v3 and
+v5–v8. The separately guessed packed GS offsets use units of four, matching this programmed ring
+item size; this does not validate the exact lane allocation. `GE_CNTL` and `VGT_PRIMITIVE_TYPE` were
+**absent** from the draw's context-register map, rather than programmed zeroes. The resolved guest
+primitive type was 6 (the capture reports Vulkan triangle strip), and `VGT_GS_MAX_VERT_OUT=3`
+was present. The original
+program-only diagnostic filled its eight-line cap on other draws using the same shader, which is why
+the extent/instance filter is needed.
 
 The input-default probe logged changes to earlier fragment programs `0x3007c60000` and `0x3007c80000`
 paired with vertex program `0x3007060000`; it did **not** change the final compositor's input wiring.
@@ -165,21 +181,11 @@ About 2 in 12 launches hang before their first frame (no raw scanout either). No
 - Host-side renderer reads of never-mapped guest memory (#3820), and `SCE_KERNEL_MAP_NO_OVERWRITE` (#3819).
 - The invisible logo movie: 150 frames decoded and delivered, none visible; delivered at ~2x real time.
 - The early-boot hang (about 2 in 12 launches).
-- The merged-NGG LUT producer now has a compile-only captured-input probe (`ngg_capture_probe`). An explicit
-  packed-GS-offset input reproduces the earlier speculative shader-patch output byte for byte, while a wrong-unit
-  control changes it. This validates the diagnostic input path, not the guest launch layout: the probe still
-  flattens 4×32 ES vertices into 128 lanes with a provisional uniform `s3`, and the ES/GS partition is unresolved.
-  Do not admit the draw or claim 32-slice output from its 22 distinct final POS1.z readback words (#3135, #2072).
-- A separate compile-only four-wave probe now emits a module expecting initial v0..v8 and per-wave s3 values in
-  one 256-lane LDS workgroup. A synthetic cross-wave LDS exchange and launch-register test pass, but Kena's captured
-  chain refuses the saved-mask count at linked pc356 (`s_bcnt1_i32_b64 s107,s[6:7]`): its portable reduction
-  requires a one-wave workgroup. Widening that guard without proving every wave reaches the workgroup barriers
-  is unsafe. The captured-input runner rejects 256-lane modules, so no unproved four-wave shader was executed.
-- An opt-in native-Wave64 diagnostic can compile that captured chain through linked pc356: 20,073 SPIR-V dwords
-  pass `spirv-val`. Its six guest barriers have an unguarded phase proof; the diagnostic rejects terminal guards
-  because `s3` may differ across guest waves. A synthetic 256-lane execution test requests four exact 64-lane
-  subgroups and isolates a saved-mask mutation to one guest wave. Device, module-marker, and input-shape checks
-  protect the offline runner. Two **speculative** launch files (128 ES, 64 GS, with the GS work assigned to
-  wave 0 or 1) both produced zero PRIM exports and only one nonzero POS0 record. They yield different raw bytes,
-  but neither proves a guest launch layout or a renderer defect: the actual ES/GS partition and initial VGPRs
-  are still unknown. No live shader admission or title improvement is claimed.
+- Derive the actual ES/GS subgroup allocation and every per-wave `s3`/v0..v8 value for the 4×32 draw.
+  The current source-bounded **candidate** uses two 64-ES/32-GS subgroups and produces two offline triangles
+  on each of 32 candidate layers. An output pattern that fits the target is not a hardware launch oracle;
+  require a wrong-partition control and independent ABI evidence before live shader admission (#3135, #2072).
+- Lower the proved output into MeshEXT with the existing retained 3D target path, preserving the 96 indexed
+  vertex slots and 32 primitive records **per candidate subgroup**, then compare the live default-path
+  title frame with the oracle. Devices without the optional subgroup/mesh features must continue to decline
+  safely. The separate scene/interpolation defect (#3835) may still affect visual correctness.
