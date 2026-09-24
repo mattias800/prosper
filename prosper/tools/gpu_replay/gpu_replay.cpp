@@ -3749,8 +3749,8 @@ int main(int argc, char** argv) {
                          retry_failed_stage_spec.c_str());
             return 2;
         }
-        const auto& stage = replay.failure_diagnostics[static_cast<size_t>(failure_index)]
-                                .stages[static_cast<size_t>(stage_index)];
+        const auto& failure = replay.failure_diagnostics[static_cast<size_t>(failure_index)];
+        const auto& stage = failure.stages[static_cast<size_t>(stage_index)];
         if (std::getenv("PROSPER_SHADER_DUMP_SUCCESS") &&
             stage.stage != prosper::gpu::ShaderProgramStage::Compute)
             std::fprintf(stderr,
@@ -3781,26 +3781,32 @@ int main(int argc, char** argv) {
                 spirv = prosper::gpu::recompile_vertex(
                     raw.words.data(), raw.words.size(), resources);
                 break;
-            case prosper::gpu::ShaderProgramStage::Fragment:
-                // Pass the REAL program address in the diagnostic context. Several recompiler
-                // diagnostics are gated on `program_address != 0` -- `[divloop-reject]` among
-                // them (`rdna2_cfg_support.hpp`) -- so a retry that left it 0 silently withheld
-                // the one line that names why a loop shape was refused, and the dedup keys of
-                // the ones that did print collapsed across programs. Other arguments retain their
-                // defaults. Normal compilation is unchanged; an explicitly armed program-specific
-                // PROSPER_CFG_TRIP_BOUND_PROGRAM selector now also sees this real address.
+            case prosper::gpu::ShaderProgramStage::Fragment: {
+                // v61 carries the same pixel/system-input and wave ABI used by live compilation.
+                // Older files remain retryable but their default ABI is explicitly unverified.
+                const auto* pixel_inputs = failure.fragment_retry_config_available &&
+                        failure.has_pixel_inputs ? &failure.pixel_inputs : nullptr;
+                const auto* system_inputs = failure.fragment_retry_config_available &&
+                        failure.has_system_inputs ? &failure.system_inputs : nullptr;
+                const auto interpolation = failure.fragment_retry_config_available
+                    ? prosper::gpu::fragment_interpolation_layout(
+                          raw.words.data(), raw.words.size(), system_inputs, pixel_inputs)
+                    : prosper::gpu::FragmentInterpolationLayout{};
+                std::fprintf(stderr,
+                             "[retry-failed-stage] fragment-abi=%s pixel-inputs=%u "
+                             "system-inputs=%u wave=%u\n",
+                             failure.fragment_retry_config_available ? "captured" : "unknown/defaults",
+                             pixel_inputs ? 1u : 0u, system_inputs ? 1u : 0u,
+                             failure.fragment_retry_config_available && failure.ps_wave32 ? 32u : 64u);
+                // Preserve the real program address in rejection diagnostics and deduplication.
                 spirv = prosper::gpu::recompile_fragment(
                     raw.words.data(), raw.words.size(), resources,
-                    /*system_inputs=*/nullptr, /*pcrel_dispatch_target=*/UINT32_MAX,
-                    // `wave32=false` is this tool's DEFAULT, not the draw's wave size, and it
-                    // is not recoverable here: GpuCapturedStageDiagnostic records no wave size for
-                    // a graphics stage, and `ps_wave32` lives on RenderState rather than on the
-                    // captured pipeline state. So `wave=64` in any diagnostic printed from a retry
-                    // is an artefact of this line -- do not quote it as a measurement, and treat
-                    // any wave-size-dependent conclusion drawn from a retry as void.
-                    /*interpolation=*/nullptr, /*wave32=*/false,
+                    system_inputs, /*pcrel_dispatch_target=*/UINT32_MAX,
+                    failure.fragment_retry_config_available ? &interpolation : nullptr,
+                    failure.fragment_retry_config_available && failure.ps_wave32,
                     {prosper::gpu::RecompileDiagnosticStage::Fragment, stage.program_addr});
                 break;
+            }
             case prosper::gpu::ShaderProgramStage::Compute:
                 if (!prosper::tools::recompile_failed_compute_stage(
                         stage, replay.raw_shader_versions, spirv, error)) {

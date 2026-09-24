@@ -758,7 +758,11 @@ draw's vertex LDS allocation, pixel-input mapping, and position-capture selectio
 prints `config=captured` when those inputs were available at the live compile. Older captures and
 failures before that configuration was resolved still print `config=defaults`, so their refusal is
 only an offline boundary. Even a captured-config retry proves compilation, not guest execution or
-correct pixels. Standalone fragment-stage retries still lack the complete live graphics ABI.
+correct pixels. Capture v61 also retains the failed fragment stage's system-input mapping and PS
+wave width. Standalone fragment retries reconstruct the interpolation layout from those settings
+and v60's pixel-input mapping. They print `fragment-abi=captured` when this is available, or
+`fragment-abi=unknown/defaults` for older captures and early failures. A captured ABI does not
+prove that resource bytes were observed at the draw instant or that the resulting pixels are correct.
 Failed compute retry additionally requires capture v42, which
 retains the exact launch dimensions, user SGPR values, wave/LDS state, and subgroup/storage specialization used
 by the rejected translator invocation. Older or incomplete failed-compute diagnostics are refused explicitly;

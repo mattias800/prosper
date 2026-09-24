@@ -1012,6 +1012,11 @@ struct OperationRealizationFailure {
     PixelInputMapping pixel_inputs{};
     bool has_pixel_inputs = false;
     bool capture_vertex_position = false;
+    // Exact fragment ABI is available only after draw-state decoding. Keep early failures unknown.
+    bool fragment_retry_config_available = false;
+    PixelSystemInputMapping system_inputs{};
+    bool has_system_inputs = false;
+    bool ps_wave32 = false;
     ComputeLaunchDimensions compute_launch;
     std::vector<ShaderRealizationDiagnostic> stages;
 };
@@ -2241,6 +2246,10 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
         failure->has_pixel_inputs = pixel_input_ptr != nullptr;
         if (pixel_input_ptr) failure->pixel_inputs = *pixel_input_ptr;
         failure->capture_vertex_position = capture_vertex_position;
+        failure->fragment_retry_config_available = true;
+        failure->has_system_inputs = system_input_ptr != nullptr;
+        if (system_input_ptr) failure->system_inputs = *system_input_ptr;
+        failure->ps_wave32 = rs.ps_wave32;
     }
     uint64_t vs_identity = 0, fs_identity = 0;
     SharedShaderWords vs_shared, fs_shared;

@@ -1528,6 +1528,32 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
             }
         }
     }
+    if (version >= 61) {
+        for (auto& diagnostic : c.failure_diagnostics) {
+            uint8_t available = 0;
+            if (!r.u8(available) || available > 1u) {
+                error = "invalid failed-draw fragment retry presence";
+                return false;
+            }
+            diagnostic.fragment_retry_config_available = available != 0;
+            if (!available) continue;
+            uint8_t flags = 0;
+            if (diagnostic.kind != SubmitOperationKind::Draw ||
+                !diagnostic.vertex_retry_config_available || !r.u8(flags) || (flags & ~3u)) {
+                error = "invalid failed-draw fragment retry config";
+                return false;
+            }
+            diagnostic.has_system_inputs = (flags & 1u) != 0;
+            diagnostic.ps_wave32 = (flags & 2u) != 0;
+            if (diagnostic.has_system_inputs &&
+                (!r.u32(diagnostic.system_inputs.ena) ||
+                 !r.u32(diagnostic.system_inputs.addr) ||
+                 (!diagnostic.system_inputs.ena && !diagnostic.system_inputs.addr))) {
+                error = "invalid failed-draw fragment system inputs";
+                return false;
+            }
+        }
+    }
     // DS seed identity is checked HERE, not in the record loop, because the slice arrives in the
     // tail above: a per-record check would compare incomplete identities and reject two faces of one
     // cube that differ only in slice -- which is exactly the capture this version exists to allow.

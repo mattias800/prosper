@@ -455,6 +455,47 @@ with tempfile.TemporaryDirectory(prefix="gpu-replay-retry-") as scratch:
                                      str(directory / "accepted.prgcap")])
             check(unwritable.returncode == 2 and "cannot write retry SPIR-V" in unwritable.stderr,
                   "retry export reports output file errors")
+            exact_fragment = run_result([
+                "--retry-failed-stage", "0:0", "--retry-failed-stage-spv", str(output),
+                str(directory / "fragment-wave32.prgcap")])
+            expected_fragment = (directory / "expected-fragment.spv").read_bytes()
+            check(exact_fragment.returncode == 0 and
+                  "fragment-abi=captured pixel-inputs=0 system-inputs=1 wave=32" in
+                  exact_fragment.stderr and output.read_bytes() == expected_fragment and
+                  len(expected_fragment) > 20,
+                  "failed fragment retry uses the captured Wave32 and system-input ABI")
+            output.write_bytes(sentinel)
+            wrong_wave = run_result([
+                "--retry-failed-stage", "0:0", "--retry-failed-stage-spv", str(output),
+                str(directory / "fragment-wave64.prgcap")])
+            check(wrong_wave.returncode == 1 and
+                  "fragment-abi=captured pixel-inputs=0 system-inputs=1 wave=64" in
+                  wrong_wave.stderr and output.read_bytes() == sentinel,
+                  "same fragment is rejected under a captured Wave64 negative control")
+            legacy_fragment = run_result([
+                "--retry-failed-stage", "0:0", str(directory / "fragment-v60.prgcap")])
+            check(legacy_fragment.returncode == 1 and
+                  "fragment-abi=unknown/defaults" in legacy_fragment.stderr,
+                  "v60 failed fragment remains readable and reports its unknown ABI")
+            exact_interp = run_result([
+                "--retry-failed-stage", "0:0", "--retry-failed-stage-spv", str(output),
+                str(directory / "fragment-interp.prgcap")])
+            expected_interp = (directory / "expected-interp.spv").read_bytes()
+            check(exact_interp.returncode == 0 and
+                  "fragment-abi=captured pixel-inputs=1 system-inputs=1 wave=64" in
+                  exact_interp.stderr and output.read_bytes() == expected_interp and
+                  len(expected_interp) > 20,
+                  "failed fragment retry reconstructs captured explicit interpolation")
+            absent_spv = directory / "absent-system.spv"
+            absent_system = run_result([
+                "--retry-failed-stage", "0:0", "--retry-failed-stage-spv", str(absent_spv),
+                str(directory / "fragment-no-system.prgcap")])
+            check("fragment-abi=captured pixel-inputs=1 system-inputs=0 wave=64" in
+                  absent_system.stderr and
+                  (absent_system.returncode == 1 or
+                   (absent_system.returncode == 0 and
+                    absent_spv.read_bytes() != expected_interp)),
+                  "removing captured barycentrics cannot reproduce the exact fragment module")
 
 # A failed-prefix compute snapshot must never land at an ordinary-looking path. These parser
 # controls run before capture loading and preserve the output sentinel; the retained Kena capsule

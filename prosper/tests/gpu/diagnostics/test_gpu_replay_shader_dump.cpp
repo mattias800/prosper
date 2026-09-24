@@ -422,6 +422,130 @@ int main(int argc, char** argv) {
         CHECK(gpu::write_gpu_capture((directory / "known-instances.prgcap").string(),
                                      draw_fixture, error),
               "CLI fixture writes a failed draw with active and inactive 3D target views");
+        // This fragment's EXEC_LO/VCC_LO operations are valid only under the captured Wave32
+        // graphics mode. A retry that silently defaults to Wave64 produces no module.
+        const uint32_t wave32_fragment[] = {
+            0xbe80037eu, 0xbeea037eu, 0xbefe0300u,
+            0x7e000280u, 0x7e020280u, 0x7e040280u, 0x7e0602f2u,
+            0xf800000fu, 0x03020100u, 0xbf810000u,
+        };
+        gpu::GpuCaptureFile fragment_fixture;
+        fragment_fixture.metadata.width = fragment_fixture.metadata.height = 1;
+        fragment_fixture.failure_diagnostics_available = true;
+        fragment_fixture.operations.push_back({gpu::SubmitOperationKind::Draw, 0, 1, false});
+        gpu::GpuCaptureRawShaderVersion fragment_raw;
+        fragment_raw.words.assign(std::begin(wave32_fragment), std::end(wave32_fragment));
+        fragment_raw.has_endpgm = true;
+        fragment_raw.content_hash = gpu::gpu_capture_hash(
+            reinterpret_cast<const uint8_t*>(fragment_raw.words.data()),
+            fragment_raw.words.size() * sizeof(uint32_t));
+        fragment_fixture.raw_shader_versions.push_back(fragment_raw);
+        gpu::GpuCapturedOperationFailure fragment_failure;
+        fragment_failure.kind = gpu::SubmitOperationKind::Draw;
+        fragment_failure.command_order = 1;
+        fragment_failure.reason = gpu::RealizationFailureReason::ShaderRecompile;
+        fragment_failure.vertex_retry_config_available = true;
+        fragment_failure.fragment_retry_config_available = true;
+        fragment_failure.has_system_inputs = true;
+        fragment_failure.system_inputs = {1u, 3u};
+        fragment_failure.ps_wave32 = true;
+        gpu::GpuCapturedStageDiagnostic fragment_stage;
+        fragment_stage.stage = gpu::ShaderProgramStage::Fragment;
+        fragment_stage.program_addr = 0x3000u;
+        fragment_stage.raw_shader_index = 0;
+        fragment_failure.stages.push_back(fragment_stage);
+        fragment_fixture.failure_diagnostics.push_back(fragment_failure);
+        const auto exact_interpolation = gpu::fragment_interpolation_layout(
+            fragment_raw.words.data(), fragment_raw.words.size(),
+            &fragment_failure.system_inputs, nullptr);
+        const auto exact_fragment = gpu::recompile_fragment(
+            fragment_raw.words.data(), fragment_raw.words.size(), nullptr,
+            &fragment_failure.system_inputs, UINT32_MAX, &exact_interpolation, true);
+        const auto wrong_wave_fragment = gpu::recompile_fragment(
+            fragment_raw.words.data(), fragment_raw.words.size(), nullptr,
+            &fragment_failure.system_inputs, UINT32_MAX, &exact_interpolation, false);
+        CHECK(!exact_fragment.empty() && wrong_wave_fragment.empty(),
+              "failed-fragment fixture distinguishes live Wave32 from a Wave64 default");
+        CHECK(gpu::write_gpu_capture((directory / "fragment-wave32.prgcap").string(),
+                                     fragment_fixture, error),
+              "CLI fixture writes the exact captured failed-fragment ABI");
+        std::vector<uint8_t> legacy_fragment_bytes;
+        CHECK(gpu::serialize_gpu_capture(fragment_fixture, legacy_fragment_bytes, error) &&
+              legacy_fragment_bytes.size() > 22u,
+              "CLI fixture serializes a v61 fragment retry for a legacy downgrade");
+        if (legacy_fragment_bytes.size() > 22u) {
+            legacy_fragment_bytes.resize(legacy_fragment_bytes.size() - 10u);
+            legacy_fragment_bytes[8] = 60u;
+            FILE* legacy_fragment = std::fopen(
+                (directory / "fragment-v60.prgcap").string().c_str(), "wb");
+            bool legacy_written = legacy_fragment && std::fwrite(
+                legacy_fragment_bytes.data(), 1, legacy_fragment_bytes.size(), legacy_fragment) ==
+                    legacy_fragment_bytes.size();
+            if (legacy_fragment && std::fclose(legacy_fragment) != 0) legacy_written = false;
+            CHECK(legacy_written, "CLI fixture writes an old fragment capture without the v61 tail");
+        }
+        FILE* fragment_expected = std::fopen(
+            (directory / "expected-fragment.spv").string().c_str(), "wb");
+        bool fragment_written = fragment_expected && std::fwrite(
+            exact_fragment.data(), sizeof(uint32_t), exact_fragment.size(), fragment_expected) ==
+                exact_fragment.size();
+        if (fragment_expected && std::fclose(fragment_expected) != 0) fragment_written = false;
+        CHECK(fragment_written, "CLI fixture writes independently compiled fragment SPIR-V");
+        fragment_fixture.failure_diagnostics[0].ps_wave32 = false;
+        CHECK(gpu::write_gpu_capture((directory / "fragment-wave64.prgcap").string(),
+                                     fragment_fixture, error),
+              "CLI fixture writes the wrong-wave negative control");
+        // Explicit P0/P10/P20 interpolation needs the live PS barycentric system input. A
+        // metadata-only capture without that mapping can recompile a different interface.
+        const uint32_t explicit_fragment[] = {
+            0xc80e0000u, 0xc8120001u, 0xc8160002u,
+            0xd54b0003u, 0x04160103u, 0xd54b0003u, 0x040e0304u,
+            0x7e080280u, 0x7e0a0280u, 0x7e0c02f2u,
+            0xf800000fu, 0x06050403u, 0xbf810000u,
+        };
+        fragment_fixture.raw_shader_versions[0].words.assign(
+            std::begin(explicit_fragment), std::end(explicit_fragment));
+        auto& explicit_raw = fragment_fixture.raw_shader_versions[0];
+        explicit_raw.content_hash = gpu::gpu_capture_hash(
+            reinterpret_cast<const uint8_t*>(explicit_raw.words.data()),
+            explicit_raw.words.size() * sizeof(uint32_t));
+        auto& explicit_failure = fragment_fixture.failure_diagnostics[0];
+        explicit_failure.ps_wave32 = false;
+        explicit_failure.system_inputs = {2u, 2u};
+        explicit_failure.has_pixel_inputs = true;
+        explicit_failure.pixel_inputs.valid_mask = 1u;
+        explicit_failure.pixel_inputs.consumed_mask = 1u;
+        explicit_failure.pixel_inputs.consumed_known = true;
+        const auto explicit_layout = gpu::fragment_interpolation_layout(
+            explicit_raw.words.data(), explicit_raw.words.size(),
+            &explicit_failure.system_inputs, &explicit_failure.pixel_inputs);
+        const auto exact_explicit = gpu::recompile_fragment(
+            explicit_raw.words.data(), explicit_raw.words.size(), nullptr,
+            &explicit_failure.system_inputs, UINT32_MAX, &explicit_layout, false);
+        const auto wrong_layout = gpu::fragment_interpolation_layout(
+            explicit_raw.words.data(), explicit_raw.words.size(), nullptr,
+            &explicit_failure.pixel_inputs);
+        const auto wrong_explicit = gpu::recompile_fragment(
+            explicit_raw.words.data(), explicit_raw.words.size(), nullptr,
+            nullptr, UINT32_MAX, &wrong_layout, false);
+        CHECK(explicit_layout.valid && explicit_layout.requires_geometry &&
+              !exact_explicit.empty() && exact_explicit != wrong_explicit,
+              "captured barycentric mapping changes the explicit-interpolation module");
+        CHECK(gpu::write_gpu_capture((directory / "fragment-interp.prgcap").string(),
+                                     fragment_fixture, error),
+              "CLI fixture writes the captured pixel and system-input mapping");
+        FILE* explicit_expected = std::fopen(
+            (directory / "expected-interp.spv").string().c_str(), "wb");
+        bool explicit_written = explicit_expected && std::fwrite(
+            exact_explicit.data(), sizeof(uint32_t), exact_explicit.size(), explicit_expected) ==
+                exact_explicit.size();
+        if (explicit_expected && std::fclose(explicit_expected) != 0) explicit_written = false;
+        CHECK(explicit_written, "CLI fixture writes independently compiled interpolation SPIR-V");
+        explicit_failure.has_system_inputs = false;
+        explicit_failure.system_inputs = {};
+        CHECK(gpu::write_gpu_capture((directory / "fragment-no-system.prgcap").string(),
+                                     fragment_fixture, error),
+              "CLI fixture writes the absent-system-input negative control");
         // A real split NGG chain whose all-ones MBCNT must still reject in the one-lane vertex
         // route. This guards the retry tool's terminal-reason plumbing, not shader admission.
         gpu::GpuCaptureFile chain_fixture;
