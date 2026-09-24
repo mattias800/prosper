@@ -345,6 +345,25 @@ int main(int argc, char** argv) {
         CHECK(gpu::write_gpu_capture(
                   (directory / "descriptor-rejected.prgcap").string(), fixture, error),
               "CLI fixture writes a nonempty descriptor-rejected failed-stage capture");
+        // A failure before draw realization has no instance count even in a v58 file. The CLI
+        // must display unknown, while a positive failed-draw count stays visible.
+        gpu::GpuCaptureFile draw_fixture;
+        draw_fixture.metadata.width = draw_fixture.metadata.height = 1;
+        draw_fixture.failure_diagnostics_available = true;
+        draw_fixture.operations.push_back({gpu::SubmitOperationKind::Draw, 0, 1, false});
+        gpu::GpuCapturedOperationFailure draw_failure;
+        draw_failure.kind = gpu::SubmitOperationKind::Draw;
+        draw_failure.command_order = 1;
+        draw_failure.reason = gpu::RealizationFailureReason::IndirectArguments;
+        draw_fixture.failure_diagnostics.push_back(draw_failure);
+        CHECK(gpu::write_gpu_capture((directory / "unknown-instances.prgcap").string(),
+                                     draw_fixture, error),
+              "CLI fixture writes a v58 pre-realization draw with unknown instance count");
+        draw_fixture.failure_diagnostics[0].instance_count = 32;
+        draw_fixture.failure_diagnostics[0].reason = gpu::RealizationFailureReason::ShaderRecompile;
+        CHECK(gpu::write_gpu_capture((directory / "known-instances.prgcap").string(),
+                                     draw_fixture, error),
+              "CLI fixture writes a v58 failed draw with 32 instances");
         if (!error.empty()) std::fprintf(stderr, "fixture: %s\n", error.c_str());
         return fails ? 1 : 0;
     }

@@ -174,6 +174,13 @@ with tempfile.TemporaryDirectory(prefix="gpu-replay-retry-") as scratch:
         if fixture.returncode != 0:
             print(fixture.stdout + fixture.stderr)
         else:
+            unknown_instances = run_result(["--inspect-only", str(directory / "unknown-instances.prgcap")])
+            known_instances = run_result(["--inspect-only", str(directory / "known-instances.prgcap")])
+            check(unknown_instances.returncode == 0 and "instances=?" in unknown_instances.stdout and
+                  "instances=0" not in unknown_instances.stdout,
+                  "a v58 pre-realization failure prints unknown rather than a fabricated zero")
+            check(known_instances.returncode == 0 and "instances=32" in known_instances.stdout,
+                  "a v58 failed draw prints its positive instance count")
             args = ["--retry-failed-stage", "0:0"] + export
             accepted = run_result(args + [str(directory / "accepted.prgcap")])
             expected = (directory / "expected.spv").read_bytes()

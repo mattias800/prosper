@@ -2161,6 +2161,9 @@ int main() {
                   "#1636: an unresolvable indirect draw records reason=indirect-arguments");
             CHECK(read && reason != RealizationFailureReason::Unknown,
                   "#1636: ...and specifically NOT the old synthesized Unknown");
+            CHECK(read && captured.failure_diagnostics.size() == 1 &&
+                      captured.failure_diagnostics[0].instance_count == 0,
+                  "an early indirect-argument failure leaves instance count unavailable");
         }
 
         // (b) A draw whose realization genuinely fails inside realize_draw_item must FORWARD that

@@ -783,7 +783,8 @@ void inspect_frame(const prosper::gpu::GpuReplayFrame& replay, uint32_t format_v
                     static_cast<unsigned long long>(d.color0_base), d.color0_width, d.color0_height,
                     d.ps.color0_format, d.ps.color_write_mask,
                     static_cast<unsigned long long>(d.color1_base), d.color1_width, d.color1_height,
-                    d.ps.color1_format, d.ps.color1_write_mask, d.vertex_count, d.indices.size(),
+                    d.ps.color1_format, d.ps.color1_write_mask, d.vertex_count,
+                    d.indices.size(),
                     d.vertex_offset, static_cast<unsigned long long>(d.raw_draw_modifier),
                     d.ps.topology, rawtag, d.ps.depth_test_enable,
                     d.ps.depth_write_enable, d.ps.depth_compare_op, d.ps.stencil_enable, d.ps.blend_enable,
@@ -970,10 +971,17 @@ void inspect_frame(const prosper::gpu::GpuReplayFrame& replay, uint32_t format_v
                     prosper::gpu::realization_failure_reason_name(failure.reason),
                     failure.stages.size());
         if (failure.kind == prosper::gpu::SubmitOperationKind::Draw) {
-            std::printf("  target=%016llx extent=%ux%u vertices=%u pipeline=%s",
+            std::printf("  target=%016llx extent=%ux%u vertices=%u instances=",
                         static_cast<unsigned long long>(failure.color0_base),
-                        failure.color0_width, failure.color0_height, failure.vertex_count,
-                        failure.pipeline_present ? "yes" : "no");
+                        failure.color0_width, failure.color0_height, failure.vertex_count);
+            // Some early failures never reach draw realization, and a v57 capture can be
+            // rewritten in v58 format without acquiring the missing count. Zero is the
+            // unknown sentinel in both cases, not proof of a zero-instance draw.
+            if (failure.instance_count)
+                std::printf("%u", failure.instance_count);
+            else
+                std::printf("?");
+            std::printf(" pipeline=%s", failure.pipeline_present ? "yes" : "no");
             if (failure.pipeline_present) {
                 std::printf(" fmt=%u cwm=%x depth=%d/%d/%u stencil=%d blend=%d",
                             failure.pipeline.color0_format, failure.pipeline.color_write_mask,

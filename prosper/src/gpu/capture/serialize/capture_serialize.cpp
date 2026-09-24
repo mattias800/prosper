@@ -1030,6 +1030,8 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
     for (const auto& diagnostic : c.failure_diagnostics)
         for (const auto& stage : diagnostic.stages)
             write_mip_chain_provenance(stage.resource_table);
+    // v58 tail: old failure records did not carry instance count, although realized draws did.
+    for (const auto& diagnostic : c.failure_diagnostics) w.u32(diagnostic.instance_count);
     // Re-check the ceiling AFTER the final tail. The bound above was enforced before this tail
     // existed, so a capture sitting just under the maximum could serialize successfully into a file
     // that read_gpu_capture then rejects as oversized -- a write that reports success and produces
