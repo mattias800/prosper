@@ -24,6 +24,7 @@
 #include "shared/live/resolve_submission_policy.hpp"
 #include "shared/live/texture_source_snapshot.hpp"
 #include "shared/live/depth_cube_source_snapshot.hpp"
+#include "shared/live/depth_cube_quantize.hpp"
 #include "shared/live/decode_scratch.hpp"     // pooled full-surface decode intermediates
 #include "shared/live/live_target_format.hpp"       // the one LiveTargetPixelFormat mapping (exhaustive)
 #include "shared/perf/performance_capture.hpp"      // bounded F8 post-trigger renderer timing
@@ -6770,21 +6771,14 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                         const size_t count = use_mapped_depth_cube
                                             ? mapped_faces[face].count : faces[face].size();
                                         const size_t pixels = std::min(static_cast<size_t>(tw) * th, count);
-                                        auto quantize = [&](auto read_depth) {
-                                            for (size_t i = 0; i < pixels; ++i) {
-                                                float d = read_depth(i);
-                                                d = d < 0.0f ? 0.0f : (d > 1.0f ? 1.0f : d);
-                                                const uint8_t q = static_cast<uint8_t>(d * 255.0f + 0.5f);
-                                                dst[i * 4 + 0] = q;
-                                                dst[i * 4 + 1] = q;
-                                                dst[i * 4 + 2] = q;
-                                                dst[i * 4 + 3] = 0xffu;
-                                            }
-                                        };
                                         if (use_mapped_depth_cube)
-                                            quantize([&](size_t i) { return mapped_faces[face].at(i); });
+                                            quantize_depth_cube_rgba8(
+                                                dst, static_cast<const uint8_t*>(mapped_faces[face].mapped),
+                                                pixels);
                                         else
-                                            quantize([&](size_t i) { return faces[face][i]; });
+                                            quantize_depth_cube_rgba8(
+                                                dst, reinterpret_cast<const uint8_t*>(faces[face].data()),
+                                                pixels);
                                     } else {
                                         const uint32_t source_bpt = bpt ? bpt : 2u;
                                         const size_t linear_bytes = static_cast<size_t>(tw) * th * source_bpt;
