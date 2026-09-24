@@ -277,10 +277,11 @@ int main() {
     // A complete four-wave launch supplies the nine initial VGPRs and a wave-uniform s3. The
     // synthetic stream reads the registers before defining them, so this checks the actual module
     // input path rather than only its declared input-buffer size.
-    constexpr std::array<uint32_t, 6> full_launch_guest = {
-        0x7e080203u,              // v_mov_b32 v4,s3
+    constexpr std::array<uint32_t, 8> full_launch_guest = {
+        0x7e120203u,              // v_mov_b32 v9,s3
         0xf80000cfu, 0x03020100u, // EXP POS0, initial v0..v3
-        0xf80008d4u, 0x00040000u, // EXP POS1.z, s3 copied to v4
+        0xf80008dfu, 0x07060504u, // EXP POS1, initial v4..v7
+        0xf8000203u, 0x00000908u, // EXP PARAM0.xy, initial v8 and s3 copied to v9
         0xbf810000u,
     };
     if (!recompile_ngg_exports_for_test(full_launch_guest.data(), full_launch_guest.size(),
@@ -314,11 +315,13 @@ int main() {
         if (output.size() != kFullLanes * prosper::gpu::kNggExportProbeWords) return false;
         for (uint32_t lane = 0; lane < kFullLanes; ++lane) {
             const size_t base = static_cast<size_t>(lane) * prosper::gpu::kNggExportProbeWords;
-            for (uint32_t reg = 0; reg < 4u; ++reg)
+            for (uint32_t reg = 0; reg < 8u; ++reg)
                 if (std::bit_cast<uint32_t>(output[base + 1u + reg]) !=
                     0x3f000000u + lane * 16u + reg)
                     return false;
-            if (std::bit_cast<uint32_t>(output[base + 7u]) !=
+            if (std::bit_cast<uint32_t>(output[base + 9u]) !=
+                    0x3f000000u + lane * 16u + 8u ||
+                std::bit_cast<uint32_t>(output[base + 10u]) !=
                 (0x40004040u | ((lane / 64u) << 24u)))
                 return false;
         }
@@ -328,10 +331,17 @@ int main() {
         std::fprintf(stderr, "four-wave launch lost initial VGPRs or per-wave s3\n");
         return 1;
     }
-    std::swap(full_inputs[0], full_inputs[1]);
-    if (full_matches(full_readback(full_inputs))) {
-        std::fprintf(stderr, "four-wave launch swapped-VGPR control did not distinguish input\n");
-        return 1;
+    for (uint32_t reg = 0; reg < 10u; ++reg) {
+        auto changed = full_inputs;
+        const uint32_t lanes_to_change = reg == 9u ? 64u : 1u; // keep s3 wave-uniform
+        for (uint32_t lane = 0; lane < lanes_to_change; ++lane) {
+            const size_t slot = static_cast<size_t>(lane) * 10u + reg;
+            changed[slot] = std::bit_cast<float>(std::bit_cast<uint32_t>(changed[slot]) ^ 1u);
+        }
+        if (full_matches(full_readback(changed))) {
+            std::fprintf(stderr, "four-wave launch did not distinguish input word %u\n", reg);
+            return 1;
+        }
     }
     // Kena's main program counts a VOPC-saved s[6:7] mask. One 64-invocation workgroup is one
     // guest wave, independent of the driver's native subgroup width. The export makes the count

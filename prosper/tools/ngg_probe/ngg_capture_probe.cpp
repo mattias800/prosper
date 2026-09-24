@@ -29,22 +29,42 @@ bool eligible_buffer(const prosper::gpu::ShaderResource& resource, uint32_t slot
 }
 
 bool exact_probe_local_size(const std::vector<uint32_t>& words, uint32_t expected_x) {
-    // SPIR-V OpExecutionMode (16), LocalSize (17): the runner binds one 64-lane group.
-    // A compile-only four-wave module must never be dispatched as two unrelated groups here.
+    // The runner dispatches the single GLCompute entry named "main" as a 64-lane group.
+    // LocalSizeId or BuiltIn WorkgroupSize can override a literal LocalSize, so reject both.
+    // A compile-only four-wave module must never be dispatched as unrelated 64-lane groups.
     if (words.size() < 5 || words[0] != 0x07230203u) return false;
-    bool found = false;
+    uint32_t entry = 0;
+    uint32_t mode_entry = 0;
+    bool found_mode = false;
     for (size_t at = 5; at < words.size();) {
         const uint32_t count = words[at] >> 16u;
         if (!count || at + count > words.size()) return false;
-        if ((words[at] & 0xffffu) == 16u && count == 6u && words[at + 2u] == 17u) {
-            if (found || words[at + 3u] != expected_x ||
+        const uint32_t op = words[at] & 0xffffu;
+        if (op == 15u) { // OpEntryPoint GLCompute %id "main"
+            if (entry || count < 5u || words[at + 1u] != 5u || !words[at + 2u] ||
+                words[at + 3u] != 0x6e69616du || words[at + 4u] != 0u)
+                return false;
+            entry = words[at + 2u];
+        } else if (op == 16u && count >= 3u && words[at + 2u] == 17u) {
+            if (found_mode || count != 6u || words[at + 3u] != expected_x ||
                 words[at + 4u] != 1u || words[at + 5u] != 1u)
                 return false;
-            found = true;
+            found_mode = true;
+            mode_entry = words[at + 1u];
+        } else if (op == 331u || op == 332u || (op >= 73u && op <= 75u)) {
+            // OpExecutionModeId, OpDecorateId, and decoration groups are not emitted by this
+            // probe. Refuse their alternate size/decorating paths rather than parsing a subset.
+            return false;
+        } else if ((op == 71u && count >= 4u && words[at + 2u] == 11u &&
+                    words[at + 3u] == 25u) ||
+                   (op == 72u && count >= 5u && words[at + 3u] == 11u &&
+                    words[at + 4u] == 25u)) {
+            // OpDecorate/OpMemberDecorate BuiltIn WorkgroupSize takes precedence over LocalSize.
+            return false;
         }
         at += count;
     }
-    return found;
+    return entry && found_mode && mode_entry == entry;
 }
 
 bool selftest() {
@@ -72,11 +92,23 @@ bool selftest() {
     if (eligible_buffer(resource, 0) || eligible_buffer(resource, 5)) return false;
     std::vector<uint32_t> module = {
         0x07230203u, 0x00010300u, 0u, 8u, 0u,
+        (5u << 16u) | 15u, 5u, 1u, 0x6e69616du, 0u,
         (6u << 16u) | 16u, 1u, 17u, 64u, 1u, 1u,
     };
     if (!exact_probe_local_size(module, 64u)) return false;
-    module[8] = 256u; // full four-wave module must be refused by the 64-lane runner
-    return !exact_probe_local_size(module, 64u) && exact_probe_local_size(module, 256u);
+    auto wrong_size = module;
+    wrong_size[13] = 256u;
+    if (exact_probe_local_size(wrong_size, 64u) ||
+        !exact_probe_local_size(wrong_size, 256u)) return false;
+    auto wrong_entry = module;
+    wrong_entry[11] = 2u;
+    if (exact_probe_local_size(wrong_entry, 64u)) return false;
+    auto override_size = module;
+    override_size.insert(override_size.end(), {(4u << 16u) | 71u, 3u, 11u, 25u});
+    if (exact_probe_local_size(override_size, 64u)) return false;
+    auto id_size = module;
+    id_size.insert(id_size.end(), {(6u << 16u) | 331u, 1u, 38u, 3u, 4u, 5u});
+    return !exact_probe_local_size(id_size, 64u);
 }
 } // namespace
 
