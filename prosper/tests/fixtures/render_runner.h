@@ -598,6 +598,11 @@ inline BackendColorTargetStats backend_color_target_stats() {
 // that requires an ordered pass boundary. render_triangle_rgba is a thin single-draw wrapper (below).
 struct BackendDraw {
     std::vector<uint32_t> vs, gs, fs;
+    // For a mesh draw, `vs` carries a MeshEXT module instead of a vertex module. The group counts
+    // are draw-time state, not pipeline identity. The backend refuses this path unless the optional
+    // device feature and command entry point were both acquired.
+    bool mesh_draw = false;
+    std::array<uint32_t, 3> mesh_groups{1, 1, 1};
     prosper::gpu::SharedShaderWords vs_shared, fs_shared;
     uint64_t vs_identity = 0, fs_identity = 0;
     // Whether the backend may run a WaveAny-only fragment program at the host's native wave width.
@@ -1716,7 +1721,8 @@ inline const RenderVkCtx& render_vk_ctx() {
                   VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
                   f2.pNext = &mesh_features;
                   vkGetPhysicalDeviceFeatures2(r.phys, &f2);
-                  if (mesh_features.meshShader) {
+                  if (mesh_features.meshShader &&
+                      !PROSPER_ENV_ON("PROSPER_NO_MESH_SHADER")) {
                       VkPhysicalDeviceProperties2 p2{
                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
                       p2.pNext = &r.mesh_shader_properties;
@@ -1728,6 +1734,10 @@ inline const RenderVkCtx& render_vk_ctx() {
                       mesh_features.pNext = const_cast<void*>(dci.pNext);
                       dci.pNext = &mesh_features;
                       dev_exts.push_back(VK_EXT_MESH_SHADER_EXTENSION_NAME);
+                  } else {
+                      // Keep the feature-chain object disarmed as well as the extension list. The
+                      // opt-out is a deterministic unsupported-device arm on feature-rich hosts.
+                      mesh_features = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT};
                   }
               }
               // Present unification (#1270): the swapchain device-extension, only when the instance is
@@ -8209,6 +8219,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         VkBool32 depth_test = VK_FALSE, depth_write = VK_FALSE, stencil_test = VK_FALSE;
         VkCompareOp depth_compare = VK_COMPARE_OP_NEVER;
         uint32_t n_sets = 1, vcount = 3, icount = 0, instance_count = 1;
+        bool mesh_draw = false;
+        std::array<uint32_t, 3> mesh_groups{1, 1, 1};
         int32_t vertex_offset = 0;
         bool use_desc = false, ok = false, pipeline_cached = false;
     };
@@ -8961,6 +8973,24 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         const std::vector<uint32_t>& bd_gs = bd.gs_words();
         const std::vector<uint32_t>& bd_fs = bd.fs_words();
         DV& v = dv[di];
+        if (bd.mesh_draw) {
+            const uint64_t groups_xy =
+                static_cast<uint64_t>(bd.mesh_groups[0]) * bd.mesh_groups[1];
+            if (!ctx.mesh_shader_enabled || !ctx.cmd_draw_mesh_tasks || !bd_gs.empty() ||
+                bd.index_count() || !bd.mesh_groups[0] || !bd.mesh_groups[1] ||
+                !bd.mesh_groups[2] ||
+                bd.mesh_groups[0] > ctx.mesh_shader_properties.maxMeshWorkGroupCount[0] ||
+                bd.mesh_groups[1] > ctx.mesh_shader_properties.maxMeshWorkGroupCount[1] ||
+                bd.mesh_groups[2] > ctx.mesh_shader_properties.maxMeshWorkGroupCount[2] ||
+                groups_xy > ctx.mesh_shader_properties.maxMeshWorkGroupTotalCount ||
+                (groups_xy && bd.mesh_groups[2] >
+                    ctx.mesh_shader_properties.maxMeshWorkGroupTotalCount / groups_xy)) {
+                std::fprintf(stderr, "[mesh] draw=%zu unsupported device or group shape; skipped\n", di);
+                continue;
+            }
+            v.mesh_draw = true;
+            v.mesh_groups = bd.mesh_groups;
+        }
         const auto subgroup_scan_begin =
             timing_enabled ? TimingClock::now() : TimingClock::time_point{};
         // Both of these walk the ENTIRE SPIR-V module, and build_bds calls them once per draw on a
@@ -9325,7 +9355,9 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         VkPipelineShaderStageCreateInfo st[3]{};
         VkPipelineShaderStageRequiredSubgroupSizeCreateInfo required_fragment_subgroup{
             VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO};
-        st[0] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}; st[0].stage = VK_SHADER_STAGE_VERTEX_BIT; st[0].module = v.vs; st[0].pName = "main";
+        st[0] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+        st[0].stage = bd.mesh_draw ? VK_SHADER_STAGE_MESH_BIT_EXT : VK_SHADER_STAGE_VERTEX_BIT;
+        st[0].module = v.vs; st[0].pName = "main";
         const uint32_t fragment_stage_index = bd_gs.empty() ? 1u : 2u;
         if (!bd_gs.empty()) {
             st[1] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
@@ -9385,7 +9417,10 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE,
         };
         VkPipelineDynamicStateCreateInfo dynamic_state{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
-        dynamic_state.dynamicStateCount = static_cast<uint32_t>(std::size(dynamic_states));
+        // Mesh pipelines get topology from their shader execution mode. Vulkan forbids the two
+        // vertex-input dynamic states at the tail of this list for a mesh pipeline (07065/07066).
+        dynamic_state.dynamicStateCount = static_cast<uint32_t>(
+            std::size(dynamic_states) - (bd.mesh_draw ? 2u : 0u));
         dynamic_state.pDynamicStates = dynamic_states;
         VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
         rs.polygonMode = VK_POLYGON_MODE_FILL; rs.cullMode = VK_CULL_MODE_NONE; rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE; rs.lineWidth = 1.0f;
@@ -9971,7 +10006,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                     // VERTEX_BIT — a fragment-only hardcode made set-0 textures invisible to the VS,
                     // yielding undefined samples / a validation error (#376). Match the storage-buffer path.
                     draw_lb[i].stageFlags = (r.set == 0)
-                        ? (VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT)
+                        ? ((bd.mesh_draw ? VK_SHADER_STAGE_MESH_BIT_EXT : VK_SHADER_STAGE_VERTEX_BIT) |
+                           VK_SHADER_STAGE_FRAGMENT_BIT)
                         : VK_SHADER_STAGE_FRAGMENT_BIT;
                     texture_references++;
                     // Every ACTIVE bound slot, not just 0 and 1. A sampled renderer mip chain must
@@ -10761,7 +10797,10 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 } else {
                     const FrameBufferResource& r = common;
                     const ResourcePhaseTimer phase_buffer(timing_enabled, &res_buffer_ms);
-                    draw_lb[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; draw_lb[i].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+                    draw_lb[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                    draw_lb[i].stageFlags = (bd.mesh_draw ? VK_SHADER_STAGE_MESH_BIT_EXT
+                                                         : VK_SHADER_STAGE_VERTEX_BIT) |
+                                             VK_SHADER_STAGE_FRAGMENT_BIT;
                     if (r.is_internal_gds) {
                         const RenderHostBuffer& gds = render_internal_gds_buffer();
                         draw_dbi[i] = {gds.buffer, 0, 64u * 1024u};
@@ -11023,7 +11062,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         }
         VkGraphicsPipelineCreateInfo gp{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
         gp.stageCount = bd_gs.empty() ? 2u : 3u; gp.pStages = st;
-        gp.pVertexInputState = &vin; gp.pInputAssemblyState = &ia;
+        gp.pVertexInputState = bd.mesh_draw ? nullptr : &vin;
+        gp.pInputAssemblyState = bd.mesh_draw ? nullptr : &ia;
         gp.pViewportState = &vpst; gp.pRasterizationState = &rs; gp.pMultisampleState = &ms;
         gp.pColorBlendState = &cb; gp.pDynamicState = &dynamic_state;
         gp.layout = v.layout; gp.renderPass = rp; gp.subpass = 0;
@@ -11049,7 +11089,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 memcpy(&word, &value, sizeof word);
                 append(word);
             };
-            append(13); // core dynamic depth/stencil/cull/topology; retain topology class (#3419)
+            append(13); // retain existing vertex pipeline keys byte-for-byte
+            if (bd.mesh_draw) append(0x4D455348u); // MeshEXT differs from a vertex module
             append(W); append(H); append(color_count);
             for (uint32_t slot = 0; slot < color_count; ++slot)
                 append(static_cast<uint32_t>(color_formats[slot]));
@@ -11104,7 +11145,9 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                                       : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
                     const auto& common = R[i].common();
                     const VkShaderStageFlags stage_flags = !texture || common.set == 0
-                        ? (VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT)
+                        ? ((bd.mesh_draw ? VK_SHADER_STAGE_MESH_BIT_EXT
+                                         : VK_SHADER_STAGE_VERTEX_BIT) |
+                           VK_SHADER_STAGE_FRAGMENT_BIT)
                         : VK_SHADER_STAGE_FRAGMENT_BIT;
                     append(common.set); append(common.binding); append(descriptor_type);
                     append(stage_flags);   // count already keyed above, for both branches
@@ -11192,7 +11235,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 fprintf(stderr, "[backend-trace] draw=%zu create-shaders begin\n", di);
                 fflush(stderr);
             }
-            v.vs = mkmod(bd_vs, "vs", bd.vs_identity);
+            v.vs = mkmod(bd_vs, bd.mesh_draw ? "ms" : "vs", bd.vs_identity);
             v.gs = bd_gs.empty() ? VK_NULL_HANDLE : mkmod(bd_gs, "gs", 0);
             v.fs = mkmod(bd_fs, "fs", bd.fs_identity);
             if (backend_trace) {
@@ -12131,8 +12174,10 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         vkCmdSetStencilTestEnable(command, v.stencil_test);
         vkCmdSetCullMode(command, v.cull_mode);
         vkCmdSetFrontFace(command, v.front_face);
-        vkCmdSetPrimitiveTopology(command, v.topology);
-        vkCmdSetPrimitiveRestartEnable(command, v.primitive_restart);
+        if (!v.mesh_draw) {
+            vkCmdSetPrimitiveTopology(command, v.topology);
+            vkCmdSetPrimitiveRestartEnable(command, v.primitive_restart);
+        }
     };
     auto record_draw_dynamic_state = [&](VkCommandBuffer command, const DV& v,
                                          const prosper::gpu::ResolvedPipelineState* ps) {
@@ -12240,7 +12285,9 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             std::fprintf(stderr, "\n");
             std::fflush(stderr);
         }
-        if (v.icount) {
+        if (v.mesh_draw) {
+            ctx.cmd_draw_mesh_tasks(cmd, v.mesh_groups[0], v.mesh_groups[1], v.mesh_groups[2]);
+        } else if (v.icount) {
             vkCmdBindIndexBuffer(cmd, v.ibuf, v.ioffset, VK_INDEX_TYPE_UINT32);
             vkCmdDrawIndexed(cmd, v.icount, v.instance_count, 0, v.vertex_offset, 0);
         } else {
@@ -13200,7 +13247,9 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                     vkCmdBindPipeline(c2, VK_PIPELINE_BIND_POINT_GRAPHICS, v.pipe);
                     record_draw_dynamic_state(c2, v, draws[di].ps);   // #3248: same state as the pass being isolated
                     if (v.use_desc) vkCmdBindDescriptorSets(c2, VK_PIPELINE_BIND_POINT_GRAPHICS, v.layout, 0, v.n_sets, v.dsets.data(), 0, nullptr);
-                    if (v.icount) { vkCmdBindIndexBuffer(c2, v.ibuf, v.ioffset, VK_INDEX_TYPE_UINT32); vkCmdDrawIndexed(c2, v.icount, v.instance_count, 0, v.vertex_offset, 0); }
+                    if (v.mesh_draw) ctx.cmd_draw_mesh_tasks(
+                        c2, v.mesh_groups[0], v.mesh_groups[1], v.mesh_groups[2]);
+                    else if (v.icount) { vkCmdBindIndexBuffer(c2, v.ibuf, v.ioffset, VK_INDEX_TYPE_UINT32); vkCmdDrawIndexed(c2, v.icount, v.instance_count, 0, v.vertex_offset, 0); }
                     else vkCmdDraw(c2, v.vcount, v.instance_count, static_cast<uint32_t>(v.vertex_offset), 0);
                 }
                 vkCmdEndRenderPass(c2);
