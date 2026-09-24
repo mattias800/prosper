@@ -1986,13 +1986,16 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     };
     static const NggLaunchStateFilter launch_filter = [] {
         NggLaunchStateFilter filter;
-        const auto parse = [&](const char* name, uint64_t& result) {
+        const auto parse = [&](const char* name, uint64_t& result, uint64_t max = UINT64_MAX) {
             const char* value = std::getenv(name); // this whole initializer runs once
             if (!value) return;
             errno = 0;
             char* end = nullptr;
             const auto parsed = std::strtoull(value, &end, 0);
-            if (!*value || *value == '-' || errno || end == value || *end) {
+            // strtoull accepts leading spaces and signed text, which can turn a typo into
+            // a seemingly armed selector that can never match a draw.
+            if (*value < '0' || *value > '9' || errno || end == value || *end ||
+                parsed > max) {
                 std::fprintf(stderr, "[ngg-launch-state] invalid %s=%s; disabled\n", name, value);
                 filter.valid = false;
             } else {
@@ -2001,8 +2004,8 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
         };
         parse("PROSPER_NGG_LAUNCH_STATE_PROGRAM", filter.program);
         parse("PROSPER_NGG_LAUNCH_STATE_TARGET", filter.target);
-        parse("PROSPER_NGG_LAUNCH_STATE_EXTENT", filter.extent);
-        parse("PROSPER_NGG_LAUNCH_STATE_INSTANCES", filter.instances);
+        parse("PROSPER_NGG_LAUNCH_STATE_EXTENT", filter.extent, UINT32_MAX);
+        parse("PROSPER_NGG_LAUNCH_STATE_INSTANCES", filter.instances, UINT32_MAX);
         if (filter.valid && filter.program)
             std::fprintf(stderr,
                 "[ngg-launch-state] armed program=%llx target=%llx extent=%llu "
@@ -2036,21 +2039,30 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
                 present |= 1u << bit;
                 return it->second;
             };
+            const auto uc = [&](uint32_t reg, uint32_t bit) {
+                const auto it = ds.uc.find(reg);
+                if (it == ds.uc.end()) return 0u;
+                present |= 1u << bit;
+                return it->second;
+            };
             const uint32_t rsrc1 = sh(P::SPI_SHADER_PGM_RSRC1_GS, 0);
             const uint32_t rsrc2 = sh(P::SPI_SHADER_PGM_RSRC2_GS, 1);
             const uint32_t onchip = cx(P::VGT_GS_ONCHIP_CNTL, 2);
             const uint32_t esgs_itemsize = cx(P::VGT_ESGS_RING_ITEMSIZE, 3);
-            const uint32_t ge_cntl = cx(P::GE_CNTL, 4);
+            const uint32_t ge_cntl = uc(P::GE_CNTL, 4);
             const uint32_t subgroup = cx(P::GE_NGG_SUBGRP_CNTL, 5);
             const uint32_t stages = cx(P::VGT_SHADER_STAGES_EN, 6);
-            const uint32_t primitive = cx(P::VGT_PRIMITIVE_TYPE, 7);
+            const uint32_t primitive = uc(P::VGT_PRIMITIVE_TYPE, 7);
             const uint32_t gs_instance = cx(P::VGT_GS_INSTANCE_CNT, 8);
             const uint32_t gs_max_out = cx(P::VGT_GS_MAX_VERT_OUT, 9);
+            const uint32_t max_output = cx(P::GE_MAX_OUTPUT_PER_SUBGROUP, 10);
+            const uint32_t out_prim = cx(P::VGT_GS_OUT_PRIM_TYPE, 11);
             std::fprintf(stderr,
                 "[ngg-launch-state] es=%llx chain=%llx target=%llx order=%llu "
                 "vertices=%u instances=%u topo=%u present=%03x rsrc1=%08x rsrc2=%08x "
                 "onchip=%08x esgs-itemsize=%08x ge-cntl=%08x subgroup=%08x "
-                "stages=%08x primitive=%08x gs-instance=%08x gs-max-out=%08x\n",
+                "stages=%08x primitive=%08x gs-instance=%08x gs-max-out=%08x "
+                "max-output=%08x out-prim=%08x\n",
                 static_cast<unsigned long long>(rs.es_addr),
                 static_cast<unsigned long long>(chain_addr),
                 static_cast<unsigned long long>(rs.color0_base),
@@ -2058,7 +2070,7 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
                 vcount_hint, draw ? draw->instance_count : ds.num_instances,
                 rs.prim_type, present,
                 rsrc1, rsrc2, onchip, esgs_itemsize, ge_cntl, subgroup, stages,
-                primitive, gs_instance, gs_max_out);
+                primitive, gs_instance, gs_max_out, max_output, out_prim);
         }
     }
     auto bounded_shader_dwords = [&](uint64_t address, const AgcShaderHeader* header) -> size_t {

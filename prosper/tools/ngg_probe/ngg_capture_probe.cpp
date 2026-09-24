@@ -115,9 +115,12 @@ std::optional<IndexedExportSummary> summarize_indexed_exports(
             ++result.null_primitives;
             continue;
         }
+        // GFX10 PRIM uses three 10-bit slots; the high bit in each is an edge flag,
+        // not part of its 9-bit vertex index. Masking all ten bits invents vertex
+        // indices >= 512 whenever an edge flag is set.
         const std::array<uint32_t, 3> vertices = {
-            primitive & 0x3ffu, (primitive >> 10u) & 0x3ffu,
-            (primitive >> 20u) & 0x3ffu};
+            primitive & 0x1ffu, (primitive >> 10u) & 0x1ffu,
+            (primitive >> 20u) & 0x1ffu};
         if (std::any_of(vertices.begin(), vertices.end(),
                         [lanes](uint32_t index) { return index >= lanes; })) {
             ++result.out_of_range_primitives;
@@ -214,6 +217,13 @@ bool selftest() {
         good->consistent_layer_primitives != 1u ||
         good->referenced_vertices.size() != 3u ||
         good->candidate_layers != std::set<uint32_t>{7u}) return false;
+    exports[0] |= (1u << 9u) | (1u << 19u) | (1u << 29u);
+    const auto with_edge_flags = summarize_indexed_exports(exports, 4u, 13u);
+    if (!with_edge_flags || with_edge_flags->indexed_primitives != 1u ||
+        with_edge_flags->out_of_range_primitives != 0u ||
+        with_edge_flags->referenced_vertices != good->referenced_vertices ||
+        with_edge_flags->candidate_layers != good->candidate_layers) return false;
+    exports[0] &= ~((1u << 9u) | (1u << 19u) | (1u << 29u));
     exports[3u * 13u + 7u] = 8u;
     const auto mixed = summarize_indexed_exports(exports, 4u, 13u);
     if (!mixed || mixed->indexed_primitives != 1u ||

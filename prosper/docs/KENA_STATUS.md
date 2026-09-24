@@ -90,13 +90,16 @@ An exact-program-and-output-shape live witness on the 32×32, 32-instance LUT dr
 state eight times: `SPI_SHADER_PGM_RSRC1_GS=0x622c0047`, `RSRC2_GS=0x008b0000`,
 `VGT_GS_ONCHIP_CNTL=0x10020040`, `VGT_ESGS_RING_ITEMSIZE=4`, and `GE_NGG_SUBGRP_CNTL=1`.
 The `GS_VGPR_COMP_CNT` and `ES_VGPR_COMP_CNT` fields are both 3, so the hardware loads v0–v3 and
-v5–v8. The separately guessed packed GS offsets use units of four, matching this programmed ring
-item size; this does not validate the exact lane allocation. `GE_CNTL` and `VGT_PRIMITIVE_TYPE` were
-**absent** from the draw's context-register map, rather than programmed zeroes. The resolved guest
-primitive type was 6 (the capture reports Vulkan triangle strip), and `VGT_GS_MAX_VERT_OUT=3`
-was present. The original
-program-only diagnostic filled its eight-line cap on other draws using the same shader, which is why
-the extent/instance filter is needed.
+v5–v8. `VGT_SHADER_STAGES_EN=0x2030` has `GS_W32_EN=0`, selecting Wave64. The separately guessed
+packed GS offsets use units of four, matching this programmed ring item size; this does not validate
+the exact lane allocation. An independent review found the first logger wrongly read `GE_CNTL` and
+`VGT_PRIMITIVE_TYPE` from the context file: both are **UCONFIG** registers. A corrected live run
+records `GE_CNTL=0x00008040` (both programmed group-size fields are 64),
+`VGT_PRIMITIVE_TYPE=6` (the capture reports Vulkan triangle strip),
+`GE_MAX_OUTPUT_PER_SUBGROUP=0x000000c0` (192), `VGT_GS_MAX_VERT_OUT=3`, and raw
+`VGT_GS_OUT_PRIM_TYPE=2`, all present. These are programmed bounds and types, not proof of the
+actual subgroup split. The original program-only diagnostic filled its eight-line cap on other
+draws using the same shader, which is why the extent/instance filter is needed.
 
 The input-default probe logged changes to earlier fragment programs `0x3007c60000` and `0x3007c80000`
 paired with vertex program `0x3007060000`; it did **not** change the final compositor's input wiring.
