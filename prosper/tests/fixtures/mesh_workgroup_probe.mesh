@@ -3,6 +3,9 @@
 layout(local_size_x = 64) in;
 layout(triangles) out;
 layout(max_vertices = 3, max_primitives = 1) out;
+#ifdef TEXTURE_INPUT
+layout(set = 0, binding = 4) uniform sampler2D input_tex;
+#endif
 
 // The center pixel exists only if another invocation's shared write becomes visible.
 // A one-lane/private-LDS projection sees zero in the peer slot and collapses the triangle.
@@ -31,6 +34,9 @@ void main() {
         bool exact = (lane == 0 && prefix == 0 && neighbor == 2) ||
                      (lane == 1 && prefix == 0 && neighbor == 1) ||
                      (lane == 2 && prefix == 1 && neighbor == 4);
+#ifdef TEXTURE_INPUT
+        exact = exact && texelFetch(input_tex, ivec2(0), 0).r > 0.5;
+#endif
         vec2 p = lane == 0 ? vec2(-1.0, -1.0) :
                  lane == 1 ? vec2(3.0, -1.0) : vec2(-1.0, 3.0);
         gl_MeshVerticesEXT[lane].gl_Position = exact
@@ -38,6 +44,8 @@ void main() {
     }
     if (lane == 0) {
         gl_PrimitiveTriangleIndicesEXT[0] = uvec3(0, 1, 2);
+#ifdef LAYER_OUTPUT
         gl_MeshPrimitivesEXT[0].gl_Layer = int(gl_WorkGroupID.x);
+#endif
     }
 }
