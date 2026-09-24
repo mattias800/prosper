@@ -6108,12 +6108,16 @@ int main() {
             transfer_producer_dst.size = static_cast<uint32_t>(transfer_guest_bytes);
             ShaderResource transfer_multilayer = transfer_producer_dst;
             transfer_multilayer.depth = 2;
+            ShaderResource transfer_plain_2d = transfer_producer_dst;
+            transfer_plain_2d.img_dim = 1;
             CHECK(shader_resource_uses_ordinary_2d_image(
                       transfer_producer_dst, true, false, false) &&
                       !shader_resource_uses_ordinary_2d_image(
                           transfer_producer_dst, true, true, false) &&
                       shader_resource_uses_native_2d_storage_image(
                           transfer_producer_dst, true, true, false) &&
+                      shader_resource_uses_native_2d_storage_image(
+                          transfer_plain_2d, true, true, false) &&
                       !shader_resource_uses_ordinary_2d_image(
                           transfer_producer_dst, true, false, true) &&
                       !shader_resource_uses_native_2d_storage_image(

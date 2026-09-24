@@ -722,6 +722,10 @@ gpu_replay --inspect-only --dump-compute-raw 29 /tmp/cs.bin /tmp/submit.prgcap
 llvm-mc -arch=amdgcn -mcpu=gfx1030 -disassemble -show-encoding < <(hexdump-of /tmp/cs.bin)
 ```
 
+`--inspect-only` also prints each image resource's guest `dim` and `srgb`, and a realized compute's
+captured `native-storage-formats` mask. Compare those with the raw instruction's dimension when
+investigating a native-storage refusal; width, height and depth alone do not identify the view type.
+
 Two things to know. **Pass `--inspect-only`** unless you want a full Vulkan replay as well — the flag
 does not by itself select a non-rendering mode. And its precondition is *weaker* than the `raw=` column
 in `--inspect-only` output: that column reports whether the capture retained a raw stream for a

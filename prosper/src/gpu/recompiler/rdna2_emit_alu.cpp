@@ -7867,12 +7867,25 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     ok = false;
                     return true;
                 }
+                // Same-binary control for the one-layer 2D descriptor / 2D_ARRAY instruction
+                // extension. Sample once per process: changing the mode within a shader-cache
+                // lifetime would otherwise reuse a module compiled under the other policy.
+                static const bool single_layer_array_native_disabled =
+                    std::getenv("PROSPER_NO_NATIVE_SINGLE_LAYER_ARRAY_STORAGE") != nullptr;
+                const bool single_layer_array_from_2d =
+                    dim == Dim_2D && arrayed && !ms &&
+                    res->img_dim == 1 && res->depth == 1;
+                const bool single_layer_array_native_allowed =
+                    !single_layer_array_from_2d ||
+                    (b.is_compute && !single_layer_array_native_disabled);
                 const bool native_2d_storage =
                     shader_resource_uses_native_2d_storage_image(
-                        *res, dim == Dim_2D, arrayed, ms);
+                        *res, dim == Dim_2D, arrayed, ms) &&
+                    single_layer_array_native_allowed;
                 const bool native_uint_2d_storage =
                     shader_resource_uses_native_uint_2d_storage_image(
-                        *res, dim == Dim_2D, arrayed, ms);
+                        *res, dim == Dim_2D, arrayed, ms) &&
+                    single_layer_array_native_allowed;
                 const bool ordinary_3d = in.mimg_dim == SQ_DIM_3D && res->img_dim == 2 &&
                                          res->depth && !arrayed && !ms &&
                                          !res->depth_compare;

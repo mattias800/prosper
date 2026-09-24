@@ -615,12 +615,12 @@ constexpr bool shader_resource_uses_ordinary_2d_image(
            (resource.img_dim == 1 || resource.img_dim == 5);
 }
 
-// Vulkan permits a VK_IMAGE_VIEW_TYPE_2D_ARRAY view with one array layer. That view is not an
-// ordinary 2D shader type, but its sole subresource has the same texel bytes and transfer extent as
-// the non-arrayed base-slice view above. Admit it only for native typed STORAGE: the producer keeps
-// its reflected layer coordinate and one-layer array view, while a later ordinary sampled image may
-// receive the exact retained result through a distinct one-layer VkImage copy. Multi-layer, MSAA,
-// depth, and descriptor/view mismatches remain unsupported and fail visibly.
+// Vulkan permits a VK_IMAGE_VIEW_TYPE_2D_ARRAY view with one array layer. A one-layer guest surface
+// may be declared as either 2D or 2D_ARRAY while its storage instruction retains an array coordinate.
+// Its sole subresource has the same texel bytes and transfer extent as the ordinary 2D base slice.
+// Admit this only for native typed STORAGE: the backend creates the reflected array view, while a
+// later ordinary sampled image may receive the exact result through a distinct one-layer copy.
+// Multi-layer, MSAA, depth, and other descriptor/view mismatches remain unsupported.
 constexpr bool shader_resource_uses_native_2d_storage_image(
     const ShaderResource& resource,
     bool shader_2d,
@@ -629,7 +629,8 @@ constexpr bool shader_resource_uses_native_2d_storage_image(
     return shader_resource_uses_ordinary_2d_image(
                resource, shader_2d, shader_arrayed, shader_multisampled) ||
            (shader_2d && shader_arrayed && !shader_multisampled &&
-            resource.img_dim == 5 && resource.depth == 1 &&
+            (resource.img_dim == 1 || resource.img_dim == 5) &&
+            resource.depth == 1 &&
             !resource.depth_compare);
 }
 
