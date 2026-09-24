@@ -298,7 +298,9 @@ int main(int argc, char** argv) {
         gpu::GpuCaptureBlob input_blob;
         input_blob.guest_addr = 0x3000;
         input_blob.bytes = {0xff, 0xee, 0xdd, 0x42, 0x19, 0x7f, 0xa5, 0xcc};
-        input_blob.bytes_read = input_blob.bytes.size();
+        // The final byte is intentionally unreadable. A descriptor whose captured span
+        // crosses that byte must not export the zero-filled suffix as guest data.
+        input_blob.bytes_read = input_blob.bytes.size() - 1;
         input_blob.content_hash = gpu::gpu_capture_hash(
             input_blob.bytes.data(), input_blob.bytes.size());
         input_snapshot.blobs.push_back(input_blob);
@@ -313,10 +315,19 @@ int main(int argc, char** argv) {
         gpu::GpuCapturedResource absent_input = present_input;
         absent_input.resource.binding = 8;
         absent_input.blob_index = UINT32_MAX;
+        gpu::GpuCapturedResource unreadable_input = present_input;
+        unreadable_input.resource.binding = 10;
+        unreadable_input.blob_offset = 6;
+        unreadable_input.captured_size = 2;
+        gpu::GpuCapturedResource duplicate_input = present_input;
+        duplicate_input.resource.binding = 11;
+        gpu::GpuCapturedResource duplicate_input_second = duplicate_input;
+        duplicate_input_second.blob_index = UINT32_MAX;
         auto& input_stage = input_snapshot.failure_diagnostics[0].stages[0];
         input_stage.resource_table_present = input_stage.resource_table.present = true;
-        input_stage.resource_table.resources = {present_input, absent_input};
-        input_stage.resource_count = 2;
+        input_stage.resource_table.resources = {present_input, absent_input, unreadable_input,
+                                                duplicate_input, duplicate_input_second};
+        input_stage.resource_count = input_stage.resource_table.resources.size();
         CHECK(gpu::write_gpu_capture((directory / "failed-input-snapshot.prgcap").string(),
                                      input_snapshot, error),
               "CLI fixture writes captured bytes and metadata-only bindings for a failed stage");

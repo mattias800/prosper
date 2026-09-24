@@ -1127,7 +1127,7 @@ void inspect_frame(const prosper::gpu::GpuReplayFrame& replay, uint32_t format_v
                 const auto& resource = captured.resource;
                 std::printf("    resource[%zu] cls=%u binding=%u addr=%016llx size=%u "
                             "stride=%u fmt=%u comps=%u srt=%08x sgpr=%08x fetch=%08x "
-                            "index-mode=%u captured-bytes=%llu blob=%s\n",
+                            "index-mode=%u span-bytes=%llu blob=%s\n",
                             resource_index, static_cast<unsigned>(resource.cls),
                             resource.binding,
                             static_cast<unsigned long long>(resource.gpu_addr),
@@ -2233,6 +2233,7 @@ int main(int argc, char** argv) {
     bool post_compute_dump_requested = false;
     bool post_compute_unverified = false;
     std::string failed_shader_spec, failed_shader_path;
+    bool failed_resource_requested = false;
     std::string failed_resource_spec, failed_resource_path;
     std::string retry_failed_chain_spec, retry_failed_stage_spec;
     std::string probe_ngg_workgroup_s3_spec;
@@ -2461,6 +2462,7 @@ int main(int argc, char** argv) {
             compute_raw_spec = argv[++i]; compute_raw_path = argv[++i];
         }
         else if (std::string(argv[i]) == "--dump-failed-resource" && i + 2 < argc) {
+            failed_resource_requested = true;
             failed_resource_spec = argv[++i]; failed_resource_path = argv[++i];
         }
         else if (std::string(argv[i]) == "--override-compute-spv" && i + 2 < argc) {
@@ -2697,7 +2699,7 @@ int main(int argc, char** argv) {
             !compute_override_spec.empty() ||
             compute_resource_override_requested ||
             !compute_resource_spec.empty() || !post_compute_resource_spec.empty() ||
-            !failed_resource_spec.empty() ||
+            failed_resource_requested ||
             require_post_change || expected_post_hash_set || !failed_shader_spec.empty() ||
             !retry_failed_chain_spec.empty() || !probe_ngg_workgroup_s3_spec.empty() ||
             probe_ngg_full_four_wave || probe_ngg_native_wave64 ||
@@ -2748,9 +2750,14 @@ int main(int argc, char** argv) {
     if (positional.empty() || positional.size() > 2) { usage(argv[0]); return 2; }
     // This export is a terminal capture-time diagnostic. Reject any extra switch rather than
     // silently skipping an inspection or replay that the caller also requested.
-    if (!failed_resource_spec.empty() && (argc != 5 || positional.size() != 1)) {
+    if (failed_resource_requested && (argc != 5 || positional.size() != 1)) {
         std::fprintf(stderr,
                      "gpu_replay: --dump-failed-resource cannot combine with another mode\n");
+        return 2;
+    }
+    if (failed_resource_requested && (failed_resource_spec.empty() ||
+                                      failed_resource_path.empty())) {
+        std::fprintf(stderr, "gpu_replay: --dump-failed-resource needs a selector and PATH\n");
         return 2;
     }
     if (rtt_seed_override_addr && !prepend_path.empty()) {
@@ -2804,7 +2811,7 @@ int main(int argc, char** argv) {
     if (!prosper::gpu::read_gpu_capture(positional[0], capture, error)) {
         std::fprintf(stderr, "gpu_replay: %s: %s\n", positional[0], error.c_str()); return 2;
     }
-    if (!failed_resource_spec.empty()) {
+    if (failed_resource_requested) {
         // A failed operation has no realized draw whose resource table --dump-resource can read.
         // The opt-in failed-input snapshot is capture-time evidence, never a post-draw result.
         unsigned long long failure_index = 0, stage_index = 0, binding = 0;
@@ -2827,14 +2834,21 @@ int main(int argc, char** argv) {
                          failed_resource_spec.c_str());
             return 2;
         }
+        if (std::find_if(std::next(it), table.resources.end(),
+                         [&](const auto& r) { return r.resource.binding == binding; }) !=
+            table.resources.end()) {
+            std::fprintf(stderr, "gpu_replay: failed resource %s has ambiguous binding\n",
+                         failed_resource_spec.c_str());
+            return 2;
+        }
         if (it->blob_index == UINT32_MAX || it->captured_size == 0) {
             std::fprintf(stderr, "gpu_replay: failed resource %s has metadata but no captured bytes\n",
                          failed_resource_spec.c_str());
             return 2;
         }
         if (it->blob_index >= capture.blobs.size() ||
-            it->blob_offset > capture.blobs[it->blob_index].bytes.size() ||
-            it->captured_size > capture.blobs[it->blob_index].bytes.size() - it->blob_offset) {
+            it->blob_offset > capture.blobs[it->blob_index].bytes_read ||
+            it->captured_size > capture.blobs[it->blob_index].bytes_read - it->blob_offset) {
             std::fprintf(stderr, "gpu_replay: failed resource %s has invalid blob bounds\n",
                          failed_resource_spec.c_str());
             return 2;

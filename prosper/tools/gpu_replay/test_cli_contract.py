@@ -246,6 +246,16 @@ with tempfile.TemporaryDirectory(prefix="gpu-replay-retry-") as scratch:
             check(combined_input.returncode == 2 and "cannot combine with another mode" in combined_input.stderr and
                   dumped_input.read_bytes() == b"old output",
                   "failed-input export cannot silently consume a second terminal mode")
+            for selector, diagnostic, message in [
+                ("", "needs a selector and PATH", "empty failed-input selector cannot become ordinary replay"),
+                ("0:0:10", "invalid blob bounds", "unreadable blob suffix is not captured input"),
+                ("0:0:11", "ambiguous binding", "duplicate failed-stage bindings refuse export"),
+            ]:
+                dumped_input.write_bytes(b"old output")
+                rejected_input = run_result(["--dump-failed-resource", selector,
+                                             str(dumped_input), str(failed_input)])
+                check(rejected_input.returncode == 2 and diagnostic in rejected_input.stderr and
+                      dumped_input.read_bytes() == b"old output", message)
             unknown_instances = run_result(["--inspect-only", str(directory / "unknown-instances.prgcap")])
             known_instances = run_result(["--inspect-only", str(directory / "known-instances.prgcap")])
             check(unknown_instances.returncode == 0 and "instances=?" in unknown_instances.stdout and
