@@ -3,11 +3,15 @@
 #include "hle/dispatch/dispatch.hpp"
 #include "hle/dispatch/nid.hpp"
 #include "shared/live/buffer_source_gate.hpp"
+#include "shared/live/guest_source_read.hpp"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <cstdio>
 #include <thread>
+#include <vector>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -156,6 +160,8 @@ int main() {
               "OS-readable memory remains absent from the guest tracker");
         check(!tracked(address),
               "readability cache does not authorize renderer tracked membership");
+        check(prosper_renderer_guest_mapped_readable_prefix(address, page) == 0,
+              "untracked host memory cannot become a renderer guest source");
     }
     if (host_page) unmap_untracked_page(host_page, page);
 
@@ -223,6 +229,8 @@ int main() {
 #endif
     check(base_mapped, "create a multi-page tracked readable mapping");
     if (base_mapped) {
+        check(prosper_renderer_guest_mapped_readable_prefix(base, span) == span,
+              "committed guest mapping covers the requested source");
         check(prosper_renderer_guest_address_tracked(base) ==
                   ProsperRendererTrackedMappingResult::AuthoritativeTracked &&
                   prosper_renderer_guest_address_tracked(base + page) ==
@@ -241,6 +249,9 @@ int main() {
         check(unmap_result == 0, "partially unmap the middle page on another thread");
         check(tracked(base) && !tracked(base + page) && tracked(base + 2 * page),
               "first post-mutation query sees the hole and preserves both neighbors");
+        check(prosper_renderer_guest_mapped_readable_prefix(base + page - 0x44c,
+                                                            page) == 0x44c,
+              "readable prefix stops at a split mapping hole");
 
         uint64_t hole = base + page;
 #ifdef _WIN32
@@ -256,6 +267,9 @@ int main() {
         check(prosper_renderer_guest_address_tracked(hole) ==
                   ProsperRendererTrackedMappingResult::AuthoritativeTracked,
               "address reuse invalidates the miss and admits the replacement mapping");
+        check(prosper_renderer_guest_mapped_readable_prefix(base + page - 0x44c,
+                                                            page) == page,
+              "adjacent committed records restore the complete readable range");
 
         check(unmap(base, span, 0, 0, 0, 0) == 0,
               "remove the remapped three-page range");
@@ -276,8 +290,70 @@ int main() {
         check(tracked(unreadable) &&
                   prosper_reserved_range_state(unreadable) != 0,
               "unreadable tracked mappings retain the numeric gate decision");
+        check(prosper_renderer_guest_mapped_readable_prefix(unreadable, page) == 0,
+              "no-access guest mapping is not a readable source");
         check(unmap(unreadable, page, 0, 0, 0, 0) == 0,
               "remove the no-access mapping");
+    }
+
+    uint64_t split = 0;
+    check(reserve(reinterpret_cast<uint64_t>(&split), 2 * page, 0, page, 0, 0) == 0 &&
+              split, "reserve a committed-source/empty-tail pair");
+    if (split) {
+        uint64_t first = split;
+        const bool first_mapped =
+            flexible(reinterpret_cast<uint64_t>(&first), page, 0x2, 0, 0, 0) == 0 &&
+            first == split;
+        check(first_mapped && prosper_reserved_range_state(split + page) == 1,
+              "first page is committed and adjacent page remains reserved");
+        if (first_mapped) {
+            check(protect(split + page, page, 0x1, 0, 0, 0) == 0 &&
+                      prosper_reserved_range_state(split + page) == 1,
+                  "read-protected reservation still has no committed source bytes");
+            constexpr size_t available = 0x44c;
+            constexpr size_t requested = 0x1000;
+            const uint64_t source = split + page - available;
+            std::memset(reinterpret_cast<void*>(source), 0x5a, available);
+            std::vector<uint8_t> copied(requested, 0);
+            const size_t count = frontend::copy_guest_source(
+                copied.data(), source, requested, gpu::guest_readable);
+            check(count == available &&
+                      std::all_of(copied.begin(), copied.begin() + available,
+                                  [](uint8_t byte) { return byte == 0x5a; }) &&
+                      std::all_of(copied.begin() + available, copied.end(),
+                                  [](uint8_t byte) { return byte == 0; }) &&
+                      prosper_reserved_range_state(split + page) == 1,
+                  "overdeclared copy preserves its zero tail without committing reservation");
+            size_t compared = 0;
+            check(frontend::equal_guest_source_prefix(
+                      copied.data(), source, requested, compared, gpu::guest_readable) &&
+                      compared == available && prosper_reserved_range_state(split + page) == 1,
+                  "validation compares only the mapped source prefix");
+            copied[0] ^= 1;
+            check(!frontend::equal_guest_source_prefix(
+                      copied.data(), source, requested, compared, gpu::guest_readable),
+                  "mutated readable bytes fail exact validation");
+
+            uint64_t second = split + page;
+            const bool second_mapped =
+                flexible(reinterpret_cast<uint64_t>(&second), page, 0x2, 0, 0, 0) == 0 &&
+                second == split + page;
+            check(second_mapped,
+                  "commit adjacent page without changing the source address");
+            if (second_mapped) {
+                std::memset(reinterpret_cast<void*>(second), 0x33, requested - available);
+                std::fill(copied.begin(), copied.end(), 0);
+                check(frontend::copy_guest_source(
+                          copied.data(), source, requested, gpu::guest_readable) == requested &&
+                          std::all_of(copied.begin(), copied.begin() + available,
+                                      [](uint8_t byte) { return byte == 0x5a; }) &&
+                          std::all_of(copied.begin() + available, copied.end(),
+                                      [](uint8_t byte) { return byte == 0x33; }),
+                      "newly committed neighbor becomes readable without reusing old zeros");
+            }
+        }
+        check(unmap(split, 2 * page, 0, 0, 0, 0) == 0,
+              "remove committed-source/empty-tail pair");
     }
 
     if (test.failures) {

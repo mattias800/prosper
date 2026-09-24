@@ -20,6 +20,7 @@
 #include "shared/texture/validation_census.hpp"
 #include "shared/live/live_compute.hpp"
 #include "shared/live/buffer_source_gate.hpp"
+#include "shared/live/guest_source_read.hpp"
 #include "shared/live/resolve_submission_policy.hpp"
 #include "shared/live/texture_source_snapshot.hpp"
 #include "shared/live/depth_cube_source_snapshot.hpp"
@@ -92,9 +93,6 @@ extern "C" void prosper_frontend_flip_publish_guest_scanout(uint64_t flip);
 
 // Classify a guest address: 0 => not within a reserved/committed guest mapping (see hle_kernel_mem).
 extern "C" int prosper_reserved_range_state(uint64_t addr);
-#ifdef _WIN32
-extern "C" int prosper_try_commit_dmem(uint64_t addr, uint64_t len, int write);
-#endif
 // VideoOut scanout registry (hle_graphics.cpp) — which guest buffer the game most recently FLIPPED
 // to screen. The flip fires during the Dcb fold (agc_dcb_set_flip -> prosper_vo_flip_from_gpu),
 // BEFORE the submit's execute_and_present, so at render time these identify this frame's scanout VA.
@@ -2952,42 +2950,15 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 if (FILE* f = fopen((d + "/frame_fs.spv").c_str(), "wb")) { fwrite(dump_fs.data(), 4, dump_fs.size(), f); fclose(f); }
                 fprintf(stderr, "[render] dumped SPIR-V vs=%zu fs=%zu dwords\n", dump_vs.size(), dump_fs.size()); fflush(stderr);
             }
-            // Copy [a, a+n) into dst, but stop at the first 64KB block that is NOT within a reserved guest
-            // mapping (prosper_reserved_range_state == 0). A resource's declared size (e.g. a 2048x1024
-            // atlas = 8 MB) can run past its real committed backing; an unguarded memcpy then walks off
-            // the mapping and SIGSEGVs the render thread mid-copy — /dev/null-write "readable" can't catch
-            // it because /dev/null discards without faulting. Returns bytes copied; dst is pre-zeroed so a
-            // short copy just leaves a transparent/black tail (only the missing region degrades).
-            // How many LEADING bytes of [a, a+n) are mapped, i.e. exactly how many `safe_copy` will
-            // deliver. Split out of `safe_copy` so a caller that needs all n of them can read guest
-            // memory IN PLACE instead of staging a full-surface copy first (see
-            // `direct_resource_source`): the two then cannot disagree about what "readable" means,
-            // which they would within a week if the walk were written twice.
-            //
-            // `safe_copy` used to interleave the per-chunk mapping check with a per-chunk memcpy;
-            // this proves the whole prefix first and then copies it in one call. The set of checks
-            // and the set of bytes copied are identical -- a mapping that changes mid-walk was
-            // equally fatal before -- and one 64 MiB memcpy beats a thousand 64 KiB ones.
+            // A declared resource can extend past its real committed guest mapping. The shared
+            // prefix helper checks exact mapping boundaries before a host read can lazy-commit a
+            // reservation; it also prepares Windows sparse direct pages within the proven extent.
+            // Callers keep their existing zero-filled short-read fallback.
             auto safe_span = [](uint64_t a, size_t n) -> size_t {
-                if (!n) return 0;
-                const size_t PG = 0x10000;   // lazy-commit granularity (64 KB)
-#ifdef _WIN32
-                // Prepare a complete sparse direct-memory resource once. The per-chunk mapping
-                // checks below still stop an over-declared resource at its real guest boundary.
-                if (prosper_try_commit_dmem(a, n, 0)) return n;
-#endif
-                size_t done = 0;
-                while (done < n) {
-                    uint64_t cur = a + done;
-                    if (cur < 0x1000 || prosper_reserved_range_state(cur) == 0) break;
-                    done += std::min(n - done, PG - (size_t)(cur & (PG - 1)));
-                }
-                return done;
+                return guest_source_readable_prefix(a, n, prosper::gpu::guest_readable);
             };
-            auto safe_copy = [safe_span](uint8_t* dst, uint64_t a, size_t n) -> size_t {
-                const size_t done = safe_span(a, n);
-                if (done) std::memcpy(dst, (const void*)(uintptr_t)a, done);
-                return done;
+            auto safe_copy = [](uint8_t* dst, uint64_t a, size_t n) -> size_t {
+                return copy_guest_source(dst, a, n, prosper::gpu::guest_readable);
             };
             // A uniform DCC clear is self-contained in metadata. If the ordered compute span dirtied
             // a retained target's metadata, materialize that clear now so the following graphics pass
@@ -3092,25 +3063,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             }
             auto safe_equal = [](const uint8_t* expected, uint64_t a, size_t n,
                                  size_t& compared) -> bool {
-                const size_t PG = 0x10000;
-#ifdef _WIN32
-                if (prosper_try_commit_dmem(a, n, 0)) {
-                    compared = n;
-                    return std::memcmp(expected, (const void*)(uintptr_t)a, n) == 0;
-                }
-#endif
-                compared = 0;
-                while (compared < n) {
-                    const uint64_t cur = a + compared;
-                    if (cur < 0x1000 || prosper_reserved_range_state(cur) == 0) return true;
-                    const size_t chunk = std::min(
-                        n - compared, PG - static_cast<size_t>(cur & (PG - 1)));
-                    if (std::memcmp(expected + compared,
-                                    reinterpret_cast<const void*>(static_cast<uintptr_t>(cur)),
-                                    chunk)) return false;
-                    compared += chunk;
-                }
-                return true;
+                return equal_guest_source_prefix(
+                    expected, a, n, compared, prosper::gpu::guest_readable);
             };
             // Keep decoded texture storage alive across callbacks. The old clear()+emplace(size, 0)
             // released and zero-filled tens of MiB every submit even though the decode paths overwrite
@@ -3569,7 +3523,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         }
                         // Reuse the executor's submit-scoped range cache; on Windows the same guard
                         // also materializes sparse direct-memory pages when necessary.
-                        if (n > UINT32_MAX ||
+                        if (n > UINT32_MAX || safe_span(addr, n) != n ||
                             !prosper::gpu::guest_readable(addr, static_cast<uint32_t>(n)))
                             return nullptr;
                         return reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(addr));

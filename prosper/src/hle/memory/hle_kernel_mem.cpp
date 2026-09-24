@@ -46,6 +46,30 @@ inline constexpr uint64_t kHugeReserveLen = 0x2000000000ull;   // 128 GiB
 namespace {
 std::atomic<uint64_t> g_guest_memory_gpu_write_successes{0};
 
+// Renderer reads must stop at the first reserved or unreadable guest byte. Mapping records can
+// split at a 16 KiB guest page, so sampling one address per 64 KiB can silently cross a hole.
+// Adjacent committed records remain one readable prefix even when protection split them.
+template <typename Mapping>
+uint64_t mapped_readable_prefix(const std::vector<Mapping>& maps, std::mutex& mapping_mutex,
+                                uint64_t address, uint64_t bytes, int read_protection) {
+    if (address < 0x1000 || !bytes || address > UINT64_MAX - bytes) return 0;
+    std::lock_guard<std::mutex> lock(mapping_mutex);
+    const auto after = std::upper_bound(
+        maps.begin(), maps.end(), address,
+        [](uint64_t value, const Mapping& mapping) { return value < mapping.base; });
+    auto mapping = after == maps.begin() ? maps.end() : std::prev(after);
+    uint64_t cursor = address;
+    const uint64_t end = address + bytes;
+    while (cursor < end && mapping != maps.end()) {
+        if (mapping->base > cursor || cursor - mapping->base >= mapping->size ||
+            mapping->size > UINT64_MAX - mapping->base || !mapping->committed ||
+            !(mapping->prot & read_protection)) break;
+        cursor = std::min(end, mapping->base + mapping->size);
+        ++mapping;
+    }
+    return cursor - address;
+}
+
 // A protection change or a partial remap splits one guest allocation into several mapping
 // records. Physical-alias queries must examine every covered segment: the first record's extent
 // and physical offset say nothing about its neighbors. The caller holds the mapping-table lock.
@@ -3561,6 +3585,11 @@ prosper_renderer_guest_address_tracked(uint64_t addr) {
     return detail::renderer_guest_address_tracked(addr, g_mx, g_maps);
 }
 
+extern "C" uint64_t prosper_renderer_guest_mapped_readable_prefix(
+        uint64_t addr, uint64_t bytes) {
+    return mapped_readable_prefix(g_maps, g_mx, addr, bytes, PROT_READ);
+}
+
 // sceKernelBatchMap(SceKernelBatchMapEntry* entries, int numberOfEntries, int* numberOfEntriesOut)
 // Entry (0x20 bytes, Orbis ABI): start@0x00, physOffset@0x08, length@0x10, protection@0x18 (char),
 // type@0x19 (char), operation@0x1c (int). Operations: 0=MAP_DIRECT, 1=UNMAP, 2=PROTECT,
@@ -6879,6 +6908,11 @@ extern "C" int prosper_reserved_range_state(uint64_t addr) {
 extern "C" ProsperRendererTrackedMappingResult
 prosper_renderer_guest_address_tracked(uint64_t addr) {
     return detail::renderer_guest_address_tracked(addr, g_mx, g_maps);
+}
+
+extern "C" uint64_t prosper_renderer_guest_mapped_readable_prefix(
+        uint64_t addr, uint64_t bytes) {
+    return mapped_readable_prefix(g_maps, g_mx, addr, bytes, HP_R);
 }
 
 // --- Handlers: Win32 versions of the Linux memory HLE, same Sony contracts -------------------
