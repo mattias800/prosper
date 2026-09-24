@@ -57,21 +57,36 @@ bool selftest() {
 int main(int argc, char** argv) {
     if (argc == 2 && std::strcmp(argv[1], "--selftest") == 0)
         return selftest() ? 0 : 1;
-    const bool zero_inputs = argc == 6 && std::strcmp(argv[5], "--zero-inputs") == 0;
-    uint32_t zero_binding = 0;
-    if (argc == 6 && !zero_inputs &&
-        std::strncmp(argv[5], "--zero-binding=", 15) == 0) {
-        char* binding_end = nullptr;
-        const unsigned long parsed = std::strtoul(argv[5] + 15, &binding_end, 10);
-        if (binding_end && !*binding_end && parsed >= 2 && parsed <= 6)
-            zero_binding = static_cast<uint32_t>(parsed);
-    }
-    if (argc != 5 && !zero_inputs && !zero_binding) {
+    if (argc < 5 || argc > 7) {
         std::fprintf(stderr,
                      "usage: %s CAPTURE FAILURE COMPILE_ONLY_MODULE.spv OUTPUT.bin "
-                     "[--zero-inputs|--zero-binding=2..6]\n",
+                     "[--zero-inputs|--zero-binding=2..6] [--packed-offsets=FILE]\n",
                      argv[0]);
         return 2;
+    }
+    bool zero_inputs = false;
+    uint32_t zero_binding = 0;
+    std::string packed_offsets_path;
+    for (int i = 5; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--zero-inputs") == 0 && !zero_inputs && !zero_binding) {
+            zero_inputs = true;
+        } else if (std::strncmp(argv[i], "--zero-binding=", 15) == 0 &&
+                   !zero_inputs && !zero_binding) {
+            char* binding_end = nullptr;
+            errno = 0;
+            const unsigned long parsed = std::strtoul(argv[i] + 15, &binding_end, 10);
+            if (errno || !binding_end || *binding_end || parsed < 2 || parsed > 6) {
+                std::fprintf(stderr, "ngg_capture_probe: invalid zero binding\n");
+                return 2;
+            }
+            zero_binding = static_cast<uint32_t>(parsed);
+        } else if (std::strncmp(argv[i], "--packed-offsets=", 17) == 0 &&
+                   argv[i][17] && packed_offsets_path.empty()) {
+            packed_offsets_path = argv[i] + 17;
+        } else {
+            std::fprintf(stderr, "ngg_capture_probe: invalid or duplicate option %s\n", argv[i]);
+            return 2;
+        }
     }
     char* end = nullptr;
     errno = 0;
@@ -167,8 +182,28 @@ int main(int argc, char** argv) {
     constexpr uint32_t kWords = prosper::gpu::kNggExportProbeWords;
     const std::array<std::vector<uint32_t>, 3> extra{
         buffers[2], buffers[3], buffers[4]};
+    std::vector<float> launch_inputs(lanes, 0.0f);
+    if (!packed_offsets_path.empty()) {
+        const size_t expected_bytes = static_cast<size_t>(lanes) * 2u * sizeof(uint32_t);
+        std::ifstream offsets(packed_offsets_path, std::ios::binary | std::ios::ate);
+        if (!offsets || offsets.tellg() != static_cast<std::streampos>(expected_bytes)) {
+            std::fprintf(stderr,
+                         "ngg_capture_probe: packed offsets require exactly %zu bytes\n",
+                         expected_bytes);
+            return 2;
+        }
+        std::vector<uint32_t> raw_offsets(static_cast<size_t>(lanes) * 2u);
+        offsets.seekg(0);
+        if (!offsets.read(reinterpret_cast<char*>(raw_offsets.data()), expected_bytes)) {
+            std::fprintf(stderr, "ngg_capture_probe: cannot read packed offsets\n");
+            return 2;
+        }
+        launch_inputs.resize(raw_offsets.size());
+        for (size_t i = 0; i < raw_offsets.size(); ++i)
+            launch_inputs[i] = std::bit_cast<float>(raw_offsets[i]);
+    }
     const auto result = prosper::test::run_compute(
-        module, std::vector<float>(lanes, 0.0f), lanes, lanes * kWords,
+        module, launch_inputs, lanes, lanes * kWords,
         buffers[0], buffers[1], nullptr, 64, nullptr, nullptr, &extra);
     if (result.size() != static_cast<size_t>(lanes) * kWords) {
         std::fprintf(stderr, "ngg_capture_probe: Vulkan dispatch failed or timed out\n");
@@ -196,8 +231,10 @@ int main(int argc, char** argv) {
     }
     std::fprintf(stderr,
                  "[ngg-capture-probe] COMPILE-ONLY MODULE EXECUTION; lanes=%u words/lane=%u "
-                 "nonzero-prim=%u distinct-pos1-z=%zu inputs=%s zero-binding=%u output=%s\n",
+                 "nonzero-prim=%u distinct-pos1-z=%zu inputs=%s zero-binding=%u "
+                 "packed-offsets=%s output=%s\n",
                  lanes, kWords, emitted, layers.size(),
-                 zero_inputs ? "zeroed-control" : "captured", zero_binding, argv[4]);
+                 zero_inputs ? "zeroed-control" : "captured", zero_binding,
+                 packed_offsets_path.empty() ? "none" : packed_offsets_path.c_str(), argv[4]);
     return 0;
 }

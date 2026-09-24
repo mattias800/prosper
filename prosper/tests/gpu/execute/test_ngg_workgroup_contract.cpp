@@ -186,6 +186,53 @@ int main() {
         std::fprintf(stderr, "guest PRIM/POS0/POS1.z/PARAM0 exports did not survive the wave\n");
         return 1;
     }
+    // The Kena launch experiment must preserve both raw initial GS offset VGPRs. Test the
+    // compile-only input contract with deliberately distinct lane words, then swap the fields:
+    // a hardwired vertex ID or an input-stride mistake must fail the per-lane comparison.
+    constexpr std::array<uint32_t, 3> packed_export = {
+        0xf80000c3u, 0x03020100u, // EXP POS0.xy, initial v0/v1
+        0xbf810000u,
+    };
+    if (!recompile_ngg_exports_for_test(packed_export.data(), packed_export.size(), 0,
+                                        0, nullptr, 4, 0, {}, true).empty()) {
+        std::fprintf(stderr, "packed-offset probe accepted missing per-lane inputs\n");
+        return 1;
+    }
+    const auto packed_module = recompile_ngg_exports_for_test(
+        packed_export.data(), packed_export.size(), 2, 0, nullptr, 4, 0, {}, true);
+    if (packed_module.empty()) {
+        std::fprintf(stderr, "packed-offset probe did not compile\n");
+        return 1;
+    }
+    std::vector<float> packed_inputs(kWaveSize * 2u);
+    for (uint32_t lane = 0; lane < kWaveSize; ++lane) {
+        packed_inputs[lane * 2u] = std::bit_cast<float>(0x10000u + lane * 7u);
+        packed_inputs[lane * 2u + 1u] = std::bit_cast<float>(0x20000u + lane * 11u);
+    }
+    const auto packed_readback = [&](const std::vector<float>& input) {
+        return prosper::test::run_compute(packed_module, input, kWaveSize,
+                                          kWaveSize * prosper::gpu::kNggExportProbeWords);
+    };
+    const auto packed_matches = [&](const std::vector<float>& output) {
+        if (output.size() != kWaveSize * prosper::gpu::kNggExportProbeWords) return false;
+        for (uint32_t lane = 0; lane < kWaveSize; ++lane) {
+            const size_t base = static_cast<size_t>(lane) * prosper::gpu::kNggExportProbeWords;
+            if (std::bit_cast<uint32_t>(output[base + 1u]) != 0x10000u + lane * 7u ||
+                std::bit_cast<uint32_t>(output[base + 2u]) != 0x20000u + lane * 11u)
+                return false;
+        }
+        return true;
+    };
+    if (!packed_matches(packed_readback(packed_inputs))) {
+        std::fprintf(stderr, "packed-offset probe lost the two per-lane input words\n");
+        return 1;
+    }
+    for (uint32_t lane = 0; lane < kWaveSize; ++lane)
+        std::swap(packed_inputs[lane * 2u], packed_inputs[lane * 2u + 1u]);
+    if (packed_matches(packed_readback(packed_inputs))) {
+        std::fprintf(stderr, "packed-offset swapped-field control did not distinguish inputs\n");
+        return 1;
+    }
     // Kena's main program counts a VOPC-saved s[6:7] mask. One 64-invocation workgroup is one
     // guest wave, independent of the driver's native subgroup width. The export makes the count
     // observable without relying on an image or the game's resource table.

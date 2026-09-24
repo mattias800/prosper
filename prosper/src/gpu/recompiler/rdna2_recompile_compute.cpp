@@ -463,8 +463,11 @@ std::vector<uint32_t> recompile_valu(const uint32_t* code, size_t dwords,
 std::vector<uint32_t> recompile_ngg_exports_for_test(
     const uint32_t* code, size_t dwords, uint32_t num_inputs, uint32_t lds_bytes,
     const ShaderResourceTable* resources, uint32_t vertices_per_instance,
-    uint32_t provisional_merged_wave_info, RecompileDiagnosticContext diagnostic) {
-    if (!code || !dwords || num_inputs > 32 || lds_bytes > 65536u) return {};
+    uint32_t provisional_merged_wave_info, RecompileDiagnosticContext diagnostic,
+    bool packed_gs_offsets_from_inputs) {
+    if (!code || !dwords || num_inputs > 32 || lds_bytes > 65536u ||
+        (packed_gs_offsets_from_inputs && (num_inputs != 2u || !vertices_per_instance)))
+        return {};
     if (resources && std::any_of(resources->resources.begin(), resources->resources.end(),
                                  [](const ShaderResource& r) { return r.binding < 2u; }))
         return {}; // bindings 0/1 are this probe's input/export buffers
@@ -488,7 +491,11 @@ std::vector<uint32_t> recompile_ngg_exports_for_test(
         const uint32_t instance = b.ibin(Op_UDiv, b.gidx, b.uconst(vertices_per_instance));
         b.ngg_vertex_index_value = vertex;
         b.ngg_instance_index_value = instance;
-        rs.vreg[0] = vertex; rs.vreg[3] = instance;
+        // For an explicit launch-layout experiment, binding 0 supplies raw initial v0/v1 per
+        // lane. Keep the synthetic vertex/instance IDs for the ES fetch path, but do not overwrite
+        // the packed GS offsets. This is not a hardware ABI choice or a live renderer path.
+        if (!packed_gs_offsets_from_inputs) rs.vreg[0] = vertex;
+        rs.vreg[3] = instance;
         rs.vreg[5] = vertex; rs.vreg[8] = instance;
         rs.sreg[3] = b.uconst(provisional_merged_wave_info);
     }

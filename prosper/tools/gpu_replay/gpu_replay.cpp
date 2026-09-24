@@ -84,6 +84,7 @@ void usage(const char* argv0) {
                          "[--retry-failed-chain FAILURE] "
                          "[--retry-failed-chain-spv PATH] "
                          "[--probe-ngg-workgroup-s3 0xVALUE (with --retry-failed-chain; compile only)] "
+                         "[--probe-ngg-packed-offsets (with --probe-ngg-workgroup-s3; compile only)] "
                          "[--retry-failed-stage FAILURE:STAGE] "
                          "[--retry-failed-stage-spv PATH] "
                          "[--dump-compute-resource N:BINDING PATH] "
@@ -2226,6 +2227,7 @@ int main(int argc, char** argv) {
     std::string failed_shader_spec, failed_shader_path;
     std::string retry_failed_chain_spec, retry_failed_stage_spec;
     std::string probe_ngg_workgroup_s3_spec;
+    bool probe_ngg_packed_offsets = false;
     std::string retry_failed_stage_spv_path;
     std::string retry_failed_chain_spv_path;
     std::string list_resources_spec;   // #2373
@@ -2532,6 +2534,8 @@ int main(int argc, char** argv) {
         }
         else if (std::string(argv[i]) == "--probe-ngg-workgroup-s3" && i + 1 < argc)
             probe_ngg_workgroup_s3_spec = argv[++i];
+        else if (std::string(argv[i]) == "--probe-ngg-packed-offsets")
+            probe_ngg_packed_offsets = true;
         else if (std::string(argv[i]) == "--retry-failed-stage" && i + 1 < argc)
             retry_failed_stage_spec = argv[++i];
         else if (std::string(argv[i]) == "--retry-failed-stage-spv") {
@@ -2546,6 +2550,11 @@ int main(int argc, char** argv) {
     if (!probe_ngg_workgroup_s3_spec.empty() && retry_failed_chain_spec.empty()) {
         std::fprintf(stderr,
                      "gpu_replay: --probe-ngg-workgroup-s3 requires --retry-failed-chain\n");
+        return 2;
+    }
+    if (probe_ngg_packed_offsets && probe_ngg_workgroup_s3_spec.empty()) {
+        std::fprintf(stderr,
+                     "gpu_replay: --probe-ngg-packed-offsets requires --probe-ngg-workgroup-s3\n");
         return 2;
     }
     if (!retry_failed_chain_spv_path.empty() &&
@@ -3515,9 +3524,11 @@ int main(int argc, char** argv) {
             linked.insert(linked.end(), main.words.begin(), main.words.begin() + main_span);
             linked_dwords = linked.size();
             spirv = prosper::gpu::recompile_ngg_exports_for_test(
-                linked.data(), linked.size(), 0, failure.vertex_lds_dwords * 4u,
+                linked.data(), linked.size(), probe_ngg_packed_offsets ? 2u : 0u,
+                failure.vertex_lds_dwords * 4u,
                 resources, failure.vertex_count, provisional_s3,
-                {prosper::gpu::RecompileDiagnosticStage::Vertex, main_stage.program_addr});
+                {prosper::gpu::RecompileDiagnosticStage::Vertex, main_stage.program_addr},
+                probe_ngg_packed_offsets);
         } else {
             spirv = prosper::gpu::recompile_vertex_chain(
                 prolog.words.data(), prolog.words.size(), main.words.data(), main.words.size(),
@@ -3541,8 +3552,8 @@ int main(int argc, char** argv) {
         if (!probe_ngg_workgroup_s3_spec.empty())
             std::fprintf(stderr,
                          "[ngg-workgroup-probe] COMPILE ONLY, not a raster/ABI proof; "
-                         "provisional-s3=0x%08x linked-dwords=%zu result=%s\n",
-                         provisional_s3, linked_dwords,
+                         "provisional-s3=0x%08x packed-offsets=%d linked-dwords=%zu result=%s\n",
+                         provisional_s3, probe_ngg_packed_offsets, linked_dwords,
                          spirv.empty() ? "rejected" : "module-emitted");
         if (!retry_failed_chain_spv_path.empty()) {
             if (spirv.empty()) {

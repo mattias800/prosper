@@ -156,3 +156,8 @@ About 2 in 12 launches hang before their first frame (no raw scanout either). No
 - Host-side renderer reads of never-mapped guest memory (#3820), and `SCE_KERNEL_MAP_NO_OVERWRITE` (#3819).
 - The invisible logo movie: 150 frames decoded and delivered, none visible; delivered at ~2x real time.
 - The early-boot hang (about 2 in 12 launches).
+- The merged-NGG LUT producer now has a compile-only captured-input probe (`ngg_capture_probe`). An explicit
+  packed-GS-offset input reproduces the earlier speculative shader-patch output byte for byte, while a wrong-unit
+  control changes it. This validates the diagnostic input path, not the guest launch layout: the probe still
+  flattens 4×32 ES vertices into 128 lanes with a provisional uniform `s3`, and the ES/GS partition is unresolved.
+  Do not admit the draw or claim 32-slice output from its 22 distinct final POS1.z readback words (#3135, #2072).
