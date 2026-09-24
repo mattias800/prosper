@@ -3410,6 +3410,20 @@ endif()
         COMMAND test_depth_array_source_snapshot --expanded-control)
       add_test(NAME depth_array_source_snapshot_expanded_per_draw_control
         COMMAND test_depth_array_source_snapshot --expanded-control --per-draw-control)
+      add_test(NAME backend_texture_path_census_budget
+        COMMAND test_depth_array_source_snapshot --texture-path-census-budget)
+      # Windows environment APIs erase a variable assigned the empty string, so this distinct
+      # empty-vs-unset contract has an executable arm only where the process can observe it.
+      if(NOT WIN32)
+        add_test(NAME backend_texture_path_census_empty COMMAND ${CMAKE_COMMAND} -E env
+          PROSPER_BACKEND_TEXTURE_PATH_CENSUS=1
+          PROSPER_BACKEND_TEXTURE_PATH_CENSUS_MIN_DRAWS=
+          $<TARGET_FILE:test_depth_array_source_snapshot> --texture-path-census-empty)
+      endif()
+      set_tests_properties(backend_texture_path_census_budget
+        PROPERTIES ENVIRONMENT "PROSPER_BACKEND_TEXTURE_PATH_CENSUS=1")
+      set_tests_properties(backend_texture_path_census_budget PROPERTIES ENVIRONMENT
+        "PROSPER_BACKEND_TEXTURE_PATH_CENSUS=1;PROSPER_BACKEND_TEXTURE_PATH_CENSUS_MIN_DRAWS=10")
       add_executable(test_depth_only_attachment_extent tests/shared/live/test_depth_only_attachment_extent.cpp)
       target_include_directories(test_depth_only_attachment_extent PRIVATE frontends src tests)
       target_link_libraries(test_depth_only_attachment_extent PRIVATE prosper_core prosper_live_renderer Vulkan::Vulkan)
@@ -3767,6 +3781,20 @@ endif()
       target_link_libraries(test_texture_sample_render PRIVATE prosper_core Vulkan::Vulkan)
       add_test(NAME texture_sample_render COMMAND ${CMAKE_COMMAND} -E env
           --unset=PROSPER_BACKEND_TEXTURE_CACHE_MB $<TARGET_FILE:test_texture_sample_render>)
+      add_test(NAME backend_texture_path_census_live COMMAND ${CMAKE_COMMAND} -E env
+          --unset=PROSPER_BACKEND_TEXTURE_CACHE_MB
+          --unset=PROSPER_BACKEND_TEXTURE_PATH_CENSUS_MIN_DRAWS
+          PROSPER_BACKEND_TEXTURE_PATH_CENSUS=1 $<TARGET_FILE:test_texture_sample_render>)
+      add_test(NAME backend_texture_pressure_flush COMMAND ${CMAKE_COMMAND} -E env
+          --unset=PROSPER_BACKEND_TEXTURE_CACHE_MB
+          PROSPER_BACKEND_TEXTURE_PRESSURE_FLUSH=1
+          PROSPER_RENDER_TIMING=1
+          $<TARGET_FILE:test_texture_sample_render> --cache-pressure)
+      add_test(NAME backend_texture_pressure_control COMMAND ${CMAKE_COMMAND} -E env
+          --unset=PROSPER_BACKEND_TEXTURE_PRESSURE_FLUSH
+          --unset=PROSPER_BACKEND_TEXTURE_CACHE_MB
+          PROSPER_RENDER_TIMING=1
+          $<TARGET_FILE:test_texture_sample_render> --cache-pressure)
 
       # Multi-draw backend: N draws composited into ONE cleared-once framebuffer (red opaque + green
       # additive -> yellow center proves accumulation into a single target).

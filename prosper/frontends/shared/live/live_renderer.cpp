@@ -2437,6 +2437,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 // the flush count, so the arithmetic is checkable from the printed line alone.
                 uint64_t flush_no_batch = 0, flush_readback = 0;
                 uint64_t flush_storage_writeback = 0, flush_explicit = 0;
+                uint64_t flush_cache_pressure = 0;
+                double cache_pressure_ms = 0;
                 uint64_t backend_gpu_timestamp_samples = 0;
                 double backend_target_ms = 0, backend_draw_setup_ms = 0;
                 double backend_record_upload_ms = 0, backend_gpu_wait_ms = 0;
@@ -2723,6 +2725,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 pending_timing.flush_readback += backend.flush_readback;
                 pending_timing.flush_storage_writeback += backend.flush_storage_writeback;
                 pending_timing.flush_explicit += backend.flush_explicit;
+                pending_timing.flush_cache_pressure += backend.flush_cache_pressure;
+                pending_timing.cache_pressure_ms += backend.cache_pressure_ms;
                 pending_timing.backend_gpu_timestamp_samples += backend.gpu_timestamp_samples;
                 pending_timing.backend_target_ms += backend.target_ms;
                 pending_timing.backend_draw_setup_ms += backend.draw_setup_ms;
@@ -12331,6 +12335,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     uint64_t backend_fence_waits = 0;
                     uint64_t flush_no_batch = 0, flush_readback = 0;
                     uint64_t flush_storage_writeback = 0, flush_explicit = 0;
+                    uint64_t flush_cache_pressure = 0;
+                    double cache_pressure_ms = 0;
                     uint64_t backend_gpu_timestamp_samples = 0;
                     double backend_target_ms = 0, backend_draw_setup_ms = 0;
                     double backend_record_upload_ms = 0, backend_gpu_wait_ms = 0;
@@ -12451,6 +12457,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     timing.flush_readback += pending_timing.flush_readback;
                     timing.flush_storage_writeback += pending_timing.flush_storage_writeback;
                     timing.flush_explicit += pending_timing.flush_explicit;
+                    timing.flush_cache_pressure += pending_timing.flush_cache_pressure;
+                    timing.cache_pressure_ms += pending_timing.cache_pressure_ms;
                     timing.backend_gpu_timestamp_samples += pending_timing.backend_gpu_timestamp_samples;
                     timing.backend_target_ms += pending_timing.backend_target_ms;
                     timing.backend_draw_setup_ms += pending_timing.backend_draw_setup_ms;
@@ -12707,7 +12715,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             "[render-timing] backend-submit synchronization command_buffers=%.2f "
                             "queue_submits=%.2f fence_waits=%.2f timestamps=%.2f  "
                             "flush{readback=%.2f storage_wb=%.2f explicit=%.2f "
-                            "no_batch=%.2f}\n",
+                            "no_batch=%.2f cache_pressure=%.2f} cache_pressure_ms=%.2f\n",
                             totals.backend_command_buffers / nsub,
                             totals.backend_queue_submits / nsub,
                             totals.backend_fence_waits / nsub,
@@ -12715,7 +12723,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             (double)totals.flush_readback / nsub,
                             (double)totals.flush_storage_writeback / nsub,
                             (double)totals.flush_explicit / nsub,
-                            (double)totals.flush_no_batch / nsub);
+                            (double)totals.flush_no_batch / nsub,
+                            (double)totals.flush_cache_pressure / nsub,
+                            totals.cache_pressure_ms / nsub);
                     fprintf(stderr,
                             // draw_setup is the PARENT one line above; these four are its leaves
                             // and they did not add up to it -- 75.16 against 82.46 in the window
@@ -13244,7 +13254,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             "[render-window] backend-submit synchronization command_buffers=%.2f "
                             "queue_submits=%.2f fence_waits=%.2f timestamps=%.2f  "
                             "flush{readback=%.2f storage_wb=%.2f explicit=%.2f "
-                            "no_batch=%.2f}\n",
+                            "no_batch=%.2f cache_pressure=%.2f} cache_pressure_ms=%.2f\n",
                             window.backend_command_buffers / wn,
                             window.backend_queue_submits / wn,
                             window.backend_fence_waits / wn,
@@ -13252,7 +13262,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             (double)window.flush_readback / wn,
                             (double)window.flush_storage_writeback / wn,
                             (double)window.flush_explicit / wn,
-                            (double)window.flush_no_batch / wn);
+                            (double)window.flush_no_batch / wn,
+                            (double)window.flush_cache_pressure / wn,
+                            window.cache_pressure_ms / wn);
                     fprintf(stderr,
                             "[render-window] backend-submit draw_setup avg_ms: shaders=%.2f fixed=%.2f "
                             "resources=%.2f pipeline=%.2f other=%+.2f  fixed{index_upload=%.2f blend=%.2f "
