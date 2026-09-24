@@ -1081,11 +1081,18 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
         const bool available = diagnostic.vertex_retry_config_available;
         if ((!available && (diagnostic.vertex_lds_dwords || diagnostic.has_pixel_inputs ||
                             diagnostic.pixel_inputs.valid_mask ||
+                            diagnostic.pixel_inputs.passthrough_mask ||
+                            diagnostic.pixel_inputs.consumed_mask ||
+                            diagnostic.pixel_inputs.consumed_known ||
                             diagnostic.capture_vertex_position)) ||
             (available && (diagnostic.kind != SubmitOperationKind::Draw ||
             diagnostic.vertex_lds_dwords > 16384u ||
             (diagnostic.has_pixel_inputs && !diagnostic.pixel_inputs.valid_mask) ||
-            (!diagnostic.has_pixel_inputs && diagnostic.pixel_inputs.valid_mask) ||
+            (!diagnostic.has_pixel_inputs &&
+             (diagnostic.pixel_inputs.valid_mask ||
+              diagnostic.pixel_inputs.passthrough_mask ||
+              diagnostic.pixel_inputs.consumed_mask ||
+              diagnostic.pixel_inputs.consumed_known)) ||
             (diagnostic.pixel_inputs.passthrough_mask &
              ~diagnostic.pixel_inputs.valid_mask)))) {
             error = "invalid failed-draw vertex retry config";
@@ -1101,6 +1108,8 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
             w.u32(diagnostic.pixel_inputs.valid_mask);
             w.u32(diagnostic.pixel_inputs.passthrough_mask);
             for (uint32_t control : diagnostic.pixel_inputs.controls) w.u32(control);
+            w.u32(diagnostic.pixel_inputs.consumed_mask);
+            w.u8(diagnostic.pixel_inputs.consumed_known ? 1u : 0u);
         }
     }
     // Re-check the ceiling AFTER the final tail. The bound above was enforced before this tail

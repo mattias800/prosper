@@ -484,7 +484,8 @@ int main(int argc, char** argv) {
             bytes += sizeof(uint32_t) + 1u; // LDS and flags
             if (failure.has_pixel_inputs)
                 bytes += 2u * sizeof(uint32_t) +
-                         failure.pixel_inputs.controls.size() * sizeof(uint32_t);
+                         failure.pixel_inputs.controls.size() * sizeof(uint32_t) +
+                         sizeof(uint32_t) + 1u; // consumption mask and known flag
         }
         return bytes;
     };
@@ -3694,9 +3695,12 @@ int main(int argc, char** argv) {
     // serialized fixture to discriminate the v60 variable-length graphics retry tail.
     auto& retry_failure = failed_capture.failure_diagnostics[0];
     retry_failure.has_pixel_inputs = true;
-    retry_failure.pixel_inputs.valid_mask = 1u;
+    retry_failure.pixel_inputs.valid_mask = 3u;
     retry_failure.pixel_inputs.passthrough_mask = 1u;
     retry_failure.pixel_inputs.controls[0] = 0x21u;
+    retry_failure.pixel_inputs.controls[1] = 0x22u;
+    retry_failure.pixel_inputs.consumed_mask = 1u;
+    retry_failure.pixel_inputs.consumed_known = true;
     retry_failure.capture_vertex_position = true;
     CHECK(write_gpu_capture(failed_path.string(), failed_capture, error),
           "failed-operation diagnostic capture writes linked vertex programs");
@@ -3712,9 +3716,14 @@ int main(int argc, char** argv) {
           failed_loaded.failure_diagnostics[0].vertex_retry_config_available &&
           failed_loaded.failure_diagnostics[0].vertex_lds_dwords == 2176u &&
           failed_loaded.failure_diagnostics[0].has_pixel_inputs &&
-          failed_loaded.failure_diagnostics[0].pixel_inputs.valid_mask == 1u &&
+          failed_loaded.failure_diagnostics[0].pixel_inputs.valid_mask == 3u &&
           failed_loaded.failure_diagnostics[0].pixel_inputs.passthrough_mask == 1u &&
           failed_loaded.failure_diagnostics[0].pixel_inputs.controls[0] == 0x21u &&
+          failed_loaded.failure_diagnostics[0].pixel_inputs.controls[1] == 0x22u &&
+          failed_loaded.failure_diagnostics[0].pixel_inputs.consumed_mask == 1u &&
+          failed_loaded.failure_diagnostics[0].pixel_inputs.consumed_known &&
+          failed_loaded.failure_diagnostics[0].pixel_inputs.consumes(0) &&
+          !failed_loaded.failure_diagnostics[0].pixel_inputs.consumes(1) &&
           failed_loaded.failure_diagnostics[0].capture_vertex_position &&
           failed_loaded.failure_diagnostics[0].pipeline.cb_resolve &&
           failed_loaded.failure_diagnostics[0].stages.size() == 3 &&
@@ -3730,6 +3739,18 @@ int main(int argc, char** argv) {
           pre_v58_failure_bytes.size() >= v58_tail(failed_capture) + v59_tail(failed_capture) +
               v60_tail(failed_capture) + 12u,
           "failed-draw instance-count tail is present");
+    // The live vertex emitter uses this distinction to suppress sticky, unread PS inputs. Pin
+    // both sides of consumes() after serialization, with the same register map in each arm.
+    GpuCaptureFile unknown_consumption = failed_capture;
+    unknown_consumption.failure_diagnostics[0].pixel_inputs.consumed_known = false;
+    std::vector<uint8_t> unknown_consumption_bytes;
+    GpuCaptureFile unknown_consumption_loaded;
+    CHECK(serialize_gpu_capture(unknown_consumption, unknown_consumption_bytes, error) &&
+          deserialize_gpu_capture(unknown_consumption_bytes, unknown_consumption_loaded, error) &&
+          unknown_consumption_loaded.failure_diagnostics[0].pixel_inputs.consumed_mask == 1u &&
+          !unknown_consumption_loaded.failure_diagnostics[0].pixel_inputs.consumed_known &&
+          unknown_consumption_loaded.failure_diagnostics[0].pixel_inputs.consumes(1),
+          "v60 retry distinguishes analysed consumption from unknown sticky inputs");
     std::vector<uint8_t> pre_v60_failure_bytes = pre_v58_failure_bytes;
     GpuCaptureFile pre_v60_failure;
     if (pre_v60_failure_bytes.size() >= v60_tail(failed_capture) + 12u) {
@@ -3757,6 +3778,11 @@ int main(int argc, char** argv) {
         CHECK(!deserialize_gpu_capture(corrupt_retry, rejected_retry, error) &&
               error.find("vertex retry config") != std::string::npos,
               "v60 reader refuses reserved graphics retry flags");
+        corrupt_retry = pre_v58_failure_bytes;
+        corrupt_retry[retry_tail + v60_tail(failed_capture) - 1u] = 2u;
+        CHECK(!deserialize_gpu_capture(corrupt_retry, rejected_retry, error) &&
+              error.find("pixel inputs") != std::string::npos,
+              "v60 reader refuses non-boolean fragment-consumption provenance");
     }
     GpuCaptureFile oversized_retry = failed_capture;
     oversized_retry.failure_diagnostics[0].vertex_lds_dwords = 16385u;

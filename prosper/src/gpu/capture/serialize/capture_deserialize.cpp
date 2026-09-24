@@ -1515,12 +1515,16 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
                     !r.u32(diagnostic.pixel_inputs.passthrough_mask)) return false;
                 for (uint32_t& control : diagnostic.pixel_inputs.controls)
                     if (!r.u32(control)) return false;
+                uint8_t consumed_known = 0;
+                if (!r.u32(diagnostic.pixel_inputs.consumed_mask) ||
+                    !r.u8(consumed_known)) return false;
                 if (!diagnostic.pixel_inputs.valid_mask ||
                     (diagnostic.pixel_inputs.passthrough_mask &
-                     ~diagnostic.pixel_inputs.valid_mask)) {
+                     ~diagnostic.pixel_inputs.valid_mask) || consumed_known > 1u) {
                     error = "invalid failed-draw pixel inputs";
                     return false;
                 }
+                diagnostic.pixel_inputs.consumed_known = consumed_known != 0;
             }
         }
     }
