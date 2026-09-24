@@ -23,6 +23,10 @@ using prosper::frontend::live_rtt_gpu_importable;
 using prosper::frontend::live_rtt_uniform_uses_cpu_diagnostic_path;
 using prosper::frontend::LiveRttGuestWriteEffect;
 using prosper::frontend::live_rtt_guest_write_effect;
+using prosper::frontend::live_rtt_color_footprint_bytes;
+using prosper::frontend::live_rtt_complete_guest_overwrite;
+using prosper::frontend::live_rtt_ranges_overlap;
+using prosper::frontend::live_rtt_unpublished_volume_blocks_sample;
 using prosper::frontend::live_rtt_compute_mirror_eligible;
 using prosper::frontend::live_rtt_mirror_identity_matches;
 
@@ -145,6 +149,34 @@ int main() {
               metadata, metadata_bytes,
               std::numeric_limits<uint64_t>::max() - 1, 1) ==
           LiveRttGuestWriteEffect::color_plane);
+    // A 3D producer never wrote ordinary guest bytes. Ordered DMA must decline a read from its
+    // last Z slice, or a range that starts just before the allocation and crosses into it.
+    constexpr uint64_t volume_base = 0x70000000ull;
+    constexpr uint64_t volume_bytes = live_rtt_color_footprint_bytes(64, 64, 4, 4);
+    CHECK(volume_bytes == 65536u);
+    CHECK(live_rtt_color_footprint_bytes(64, 64, 0, 4) == 16384u);
+    // A later 2D pass at the same base can serve its 2D view, but cannot justify reading the
+    // older volume's other slices from guest memory. A failed/partially invalidated 2D alias
+    // cannot serve either shape until a proven allocation reset or new producer restores it.
+    CHECK(!live_rtt_unpublished_volume_blocks_sample(volume_bytes, true, true, false));
+    CHECK(live_rtt_unpublished_volume_blocks_sample(volume_bytes, true, false, true));
+    CHECK(!live_rtt_unpublished_volume_blocks_sample(volume_bytes, false, false, true));
+    CHECK(live_rtt_unpublished_volume_blocks_sample(volume_bytes, false, false, false));
+    CHECK(!live_rtt_unpublished_volume_blocks_sample(0, true, false, false));
+    CHECK(live_rtt_ranges_overlap(volume_base, volume_bytes,
+                                  volume_base + 3u * 16384u, 4u));
+    CHECK(live_rtt_ranges_overlap(volume_base, volume_bytes,
+                                  volume_base - 1u, 2u));
+    CHECK(!live_rtt_ranges_overlap(volume_base, volume_bytes,
+                                   volume_base + volume_bytes, 1u));
+    CHECK(!live_rtt_complete_guest_overwrite(
+        volume_base, volume_bytes, volume_base + 3u * 16384u, 16384u));
+    CHECK(live_rtt_complete_guest_overwrite(
+        volume_base, volume_bytes, volume_base, volume_bytes));
+    CHECK(!live_rtt_complete_guest_overwrite(
+        volume_base, volume_bytes, volume_base, volume_bytes - 1u));
+    CHECK(live_rtt_color_footprint_bytes(UINT32_MAX, UINT32_MAX, UINT32_MAX, 16) ==
+          UINT64_MAX);
 
     if (failures == 0) std::printf("rtt_scale: OK\n");
     return failures == 0 ? 0 : 1;

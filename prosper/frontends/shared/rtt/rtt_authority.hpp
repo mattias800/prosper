@@ -66,6 +66,46 @@ constexpr bool live_rtt_ranges_overlap(uint64_t lhs_address, uint64_t lhs_bytes,
            rhs_address < live_rtt_range_end(lhs_address, lhs_bytes);
 }
 
+// A retained 3D color target is one allocation, even when separate passes render disjoint Z
+// ranges. Guest-write invalidation and ordered DMA must cover its whole physical depth. Zero
+// depth retains the 2D convention; arithmetic saturates so an impossible shape never wraps into
+// a small, apparently safe alias range.
+constexpr uint64_t live_rtt_color_footprint_bytes(
+    uint32_t width, uint32_t height, uint32_t depth, uint32_t bytes_per_pixel) {
+    if (!bytes_per_pixel) return 0;
+    const uint64_t plane = static_cast<uint64_t>(width) * height;
+    const uint64_t layers = depth ? depth : 1u;
+    if (plane > std::numeric_limits<uint64_t>::max() / layers)
+        return std::numeric_limits<uint64_t>::max();
+    const uint64_t texels = plane * layers;
+    return texels > std::numeric_limits<uint64_t>::max() / bytes_per_pixel
+        ? std::numeric_limits<uint64_t>::max() : texels * bytes_per_pixel;
+}
+
+// Use this only after the producer's native tiling mode and full physical extent are known.
+// Equality with a linear pixel count is not a complete-overwrite proof for a tiled allocation.
+constexpr bool live_rtt_complete_guest_overwrite(uint64_t target_address,
+                                                 uint64_t target_bytes,
+                                                 uint64_t write_address,
+                                                 uint64_t write_bytes) {
+    if (!target_address || !target_bytes || !write_address || !write_bytes ||
+        target_bytes > std::numeric_limits<uint64_t>::max() - target_address ||
+        write_bytes > std::numeric_limits<uint64_t>::max() - write_address)
+        return false;
+    return write_address <= target_address &&
+           write_address + write_bytes >= target_address + target_bytes;
+}
+
+// A 2D alias can have valid current pixels while older renderer-produced volume slices remain
+// unpublished in guest memory. Only an exact retained 3D image may serve a layered view;
+// ordinary 2D views can still use their current 2D GPU/CPU representation.
+constexpr bool live_rtt_unpublished_volume_blocks_sample(
+    uint64_t unpublished_volume_bytes, bool layered_view,
+    bool exact_volume_gpu, bool current_2d_representation) {
+    if (!unpublished_volume_bytes) return false;
+    return layered_view ? !exact_volume_gpu : !current_2d_representation;
+}
+
 constexpr LiveRttGuestWriteEffect live_rtt_guest_write_effect(
     uint64_t target_address, uint64_t target_bytes,
     uint64_t metadata_address, uint64_t metadata_bytes,

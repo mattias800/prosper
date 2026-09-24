@@ -11551,6 +11551,13 @@ void set_live_target_query(LiveTargetQueryFn fn) { g_live_target_query = std::mo
 bool is_live_render_target(uint64_t gpu_addr) {
     return g_live_target_query && g_live_target_query(gpu_addr);
 }
+static UnpublishedVolumeQueryFn g_unpublished_volume_query;
+void set_unpublished_volume_query(UnpublishedVolumeQueryFn fn) {
+    g_unpublished_volume_query = std::move(fn);
+}
+bool overlaps_unpublished_renderer_volume(uint64_t gpu_addr, uint64_t bytes) {
+    return g_unpublished_volume_query && g_unpublished_volume_query(gpu_addr, bytes);
+}
 static LiveTargetReaderFn g_live_target_reader;
 void set_live_target_reader(LiveTargetReaderFn fn) { g_live_target_reader = std::move(fn); }
 

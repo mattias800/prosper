@@ -3733,6 +3733,12 @@ endif()
       set_tests_properties(mesh_backend_feature_off PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60
         ENVIRONMENT "PROSPER_NO_MESH_SHADER=1")
 
+      add_executable(test_volume_target_handoff tests/gpu/execute/test_volume_target_handoff.cpp)
+      target_include_directories(test_volume_target_handoff PRIVATE tests frontends)
+      target_link_libraries(test_volume_target_handoff PRIVATE prosper_core Vulkan::Vulkan)
+      add_test(NAME volume_target_handoff COMMAND test_volume_target_handoff)
+      set_tests_properties(volume_target_handoff PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+
       # Vertex fetch: a VS that pulls positions from a bound vertex buffer via buffer_load_format,
       # keyed by a ShaderResourceTable — real game vertex shaders work this way.
       add_executable(test_vertex_fetch_render tests/gpu/test_vertex_fetch_render.cpp)
