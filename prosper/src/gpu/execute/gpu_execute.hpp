@@ -974,6 +974,7 @@ struct OperationRealizationFailure {
     uint32_t color1_height = 0;
     std::array<DrawItem::ColorTargetBinding, kColorTargetCount> color_targets{};
     uint32_t vertex_count = 0;
+    uint32_t instance_count = 0; // zero means unavailable to capture diagnostics
     ComputeLaunchDimensions compute_launch;
     std::vector<ShaderRealizationDiagnostic> stages;
 };
@@ -1736,6 +1737,7 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
         failure->color_targets[1] = {
             failure->color1_base, failure->color1_width, failure->color1_height};
         failure->vertex_count = vcount_hint;
+        failure->instance_count = draw ? draw->instance_count : ds.num_instances;
     }
     auto add_stage_diagnostic = [&](ShaderProgramStage stage, uint64_t addr,
                                     const std::shared_ptr<ShaderResourceTable>& resources,

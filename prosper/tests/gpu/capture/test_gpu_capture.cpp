@@ -485,6 +485,9 @@ int main(int argc, char** argv) {
                 resources += stage.resource_table.resources.size();
         return resources * 5u * sizeof(uint32_t);
     };
+    auto v58_tail = [](const GpuCaptureFile& f) -> size_t {
+        return f.failure_diagnostics.size() * sizeof(uint32_t);
+    };
     // Every fixture that truncates "the v50 tail" is recovering a pre-v50 prefix from a CURRENT
     // file. Include the later v52/v54 suffixes so the downgrade arithmetic stays exact.
     auto v50_tail = [&](const GpuCaptureFile& f) -> size_t {
@@ -494,7 +497,8 @@ int main(int argc, char** argv) {
         for (const auto& diagnostic : f.failure_diagnostics)
             for (const auto& stage : diagnostic.stages)
                 configs += stage.recompile_config_available;
-        return 4u + configs * sizeof(uint32_t) + v52_tail(f) + v54_tail(f) + v57_tail(f);
+        return 4u + configs * sizeof(uint32_t) + v52_tail(f) + v54_tail(f) +
+               v57_tail(f) + v58_tail(f);
     };
 
     // The fixed v46 tail is 4 bytes of count plus 100 bytes per selected witness. Mutate the
@@ -858,7 +862,7 @@ int main(int argc, char** argv) {
     GpuReplayFrame descriptor_array_replay;
     CHECK(serialize_gpu_capture(descriptor_array_capture, descriptor_array_bytes, error) &&
               deserialize_gpu_capture(descriptor_array_bytes, descriptor_array_loaded, error) &&
-              descriptor_array_loaded.format_version == 57 &&
+              descriptor_array_loaded.format_version == 58 &&
               materialize_gpu_replay(descriptor_array_loaded, descriptor_array_replay, error) &&
               descriptor_array_replay.computes.size() == 1 &&
               descriptor_array_replay.computes[0].resources &&
@@ -1295,7 +1299,7 @@ int main(int argc, char** argv) {
         deserialize_gpu_capture(msaa_bytes, msaa_loaded, error);
     if (!msaa_deserialized) std::printf("  [diag] MSAA capture deserialization: %s\n", error.c_str());
     CHECK(msaa_deserialized &&
-              msaa_loaded.format_version == 57 &&
+              msaa_loaded.format_version == 58 &&
               msaa_loaded.draws[0].vrt.resources[0].resource.sample_count == 4 &&
               msaa_loaded.blobs.size() == 2 &&
               msaa_loaded.blobs[1].bytes.size() == 32768u &&
@@ -1421,7 +1425,7 @@ int main(int argc, char** argv) {
     };
     GpuCaptureFile video_capture;
     CHECK(capture_draw_items({video_draw}, meta, video_reader, video_capture, error) &&
-              video_capture.format_version == 57 && video_capture.blobs.size() == 1 &&
+              video_capture.format_version == 58 && video_capture.blobs.size() == 1 &&
               video_capture.blobs[0].bytes.size() == video_memory.size() &&
               video_capture.draws[0].prt.resources[0].captured_size == video_memory.size() &&
               video_capture.draws[0].prt.resources[0].resource.linear_row_pitch_bytes == 2048,
@@ -1432,7 +1436,7 @@ int main(int argc, char** argv) {
     GpuReplayFrame video_replay;
     CHECK(serialize_gpu_capture(video_capture, video_capture_bytes, error) &&
               deserialize_gpu_capture(video_capture_bytes, video_loaded, error) &&
-              video_loaded.format_version == 57 &&
+              video_loaded.format_version == 58 &&
               video_loaded.draws[0].prt.resources[0].resource.proven_zero_mip &&
               video_loaded.draws[0].prt.resources[0].captured_size == video_memory.size() &&
               video_loaded.draws[0].prt.resources[0].resource.linear_row_pitch_bytes == 2048 &&
@@ -1476,7 +1480,7 @@ int main(int argc, char** argv) {
     GpuReplayFrame upgraded_video_replay;
     CHECK(serialize_gpu_capture(legacy_video, upgraded_video_bytes, error) &&
               deserialize_gpu_capture(upgraded_video_bytes, upgraded_video, error) &&
-              upgraded_video.format_version == 57 &&
+              upgraded_video.format_version == 58 &&
               upgraded_video.draws[0].prt.resources[0].captured_size == video_chroma.size &&
               upgraded_video.draws[0].prt.resources[0].resource.linear_row_pitch_bytes == 2048 &&
               materialize_gpu_replay(upgraded_video, upgraded_video_replay, error) &&
@@ -1558,7 +1562,7 @@ int main(int argc, char** argv) {
           "Plucky RGBA16 32-cubed S3 capture uses its four true 3D macroblocks");
     CHECK(serialize_gpu_capture(array_layout_capture, array_layout_bytes, error) &&
               deserialize_gpu_capture(array_layout_bytes, array_layout_loaded, error) &&
-              array_layout_loaded.format_version == 57 &&
+              array_layout_loaded.format_version == 58 &&
               array_layout_loaded.draws[0].vrt.resources[0].resource.layer_stride_bytes == 720896u &&
               array_layout_loaded.draws[0].vrt.resources[0].resource.layer_mip_offset_bytes == 65536u,
           "v32 capture round-trips thin-array slice stride and selected-mip offset");
@@ -1786,7 +1790,7 @@ int main(int argc, char** argv) {
     CHECK(write_gpu_capture(path.string(), captured, error), "versioned capture writes atomically");
     GpuCaptureFile loaded;
     CHECK(read_gpu_capture(path.string(), loaded, error), "versioned capture reads back");
-    CHECK(loaded.format_version == 57 &&
+    CHECK(loaded.format_version == 58 &&
               loaded.draws[0].vrt.resources[1].resource.size == 16u &&
               loaded.draws[0].vrt.resources[1].resource.scalar_buffer_dword_count == 4u &&
               shader_resource_buffer_binding_bytes(
@@ -3300,6 +3304,7 @@ int main(int argc, char** argv) {
     failed_state.cx[P::PA_SC_SCREEN_SCISSOR_BR] = 0x0028001Eu;
     failed_state.draws.push_back({3});
     failed_state.draws.back().command_order = 777;
+    failed_state.draws.back().instance_count = 7;
     GpuCaptureFile failed_capture;
     CHECK(capture_gpustate_submit(failed_state, 99, 640, 360, meta, failed_capture, error),
           "actual realization path captures a deliberately failed synthetic draw");
@@ -3313,6 +3318,7 @@ int main(int argc, char** argv) {
     });
     CHECK(failed.reason == RealizationFailureReason::ShaderRecompile && failed.pipeline_present &&
           failed.pipeline.color_write_mask == 0xf && failed.vertex_count == 3 &&
+          failed.instance_count == 7 &&
           failed.pipeline.logic_op_enable && failed.pipeline.logic_op == 6 &&
           failed.pipeline.has_scissor && failed.pipeline.scissor_left == 9 &&
           failed.pipeline.scissor_top == 10 && failed.pipeline.scissor_right == 30 &&
@@ -3380,7 +3386,7 @@ int main(int argc, char** argv) {
     GpuCaptureFile failed_compute_loaded;
     CHECK(serialize_gpu_capture(failed_compute_capture, failed_compute_bytes, error) &&
               deserialize_gpu_capture(failed_compute_bytes, failed_compute_loaded, error) &&
-              failed_compute_loaded.format_version == 57 &&
+              failed_compute_loaded.format_version == 58 &&
               failed_compute_loaded.failure_diagnostics[0].compute_launch.threads_x == 37 &&
               failed_compute_loaded.failure_diagnostics[0].stages[0]
                       .recompile_config.user_sgprs ==
@@ -3596,6 +3602,7 @@ int main(int argc, char** argv) {
           failed_loaded.failure_diagnostics[0].pipeline.scissor_left == 9 &&
           failed_loaded.failure_diagnostics[0].pipeline.logic_op_enable &&
           failed_loaded.failure_diagnostics[0].pipeline.logic_op == 6 &&
+          failed_loaded.failure_diagnostics[0].instance_count == 7 &&
           failed_loaded.failure_diagnostics[0].pipeline.cb_resolve &&
           failed_loaded.failure_diagnostics[0].stages.size() == 3 &&
           failed_loaded.failure_diagnostics[0].stages[0].stage == ShaderProgramStage::Vertex &&
@@ -3604,6 +3611,22 @@ int main(int argc, char** argv) {
               failed_loaded.failure_diagnostics[0].stages[2].program_addr &&
           failed_loaded.failure_diagnostics[0].stages[1].coverage.first_bad_pc == 1,
           "linked stage state, coverage, and raw shader versions round-trip offline");
+    std::vector<uint8_t> pre_v58_failure_bytes;
+    GpuCaptureFile pre_v58_failure;
+    CHECK(serialize_gpu_capture(failed_capture, pre_v58_failure_bytes, error) &&
+          pre_v58_failure_bytes.size() >= v58_tail(failed_capture) + 12u,
+          "failed-draw instance-count tail is present");
+    if (pre_v58_failure_bytes.size() >= v58_tail(failed_capture) + 12u) {
+        pre_v58_failure_bytes.resize(pre_v58_failure_bytes.size() - v58_tail(failed_capture));
+        pre_v58_failure_bytes[8] = 57u;
+        pre_v58_failure_bytes[9] = pre_v58_failure_bytes[10] =
+            pre_v58_failure_bytes[11] = 0u;
+    }
+    CHECK(deserialize_gpu_capture(pre_v58_failure_bytes, pre_v58_failure, error) &&
+          pre_v58_failure.format_version == 57u &&
+          pre_v58_failure.failure_diagnostics.size() == 1u &&
+          pre_v58_failure.failure_diagnostics[0].instance_count == 0u,
+          "v57 failed draw reopens with unknown, not fabricated, instance count");
     const auto loaded_failed_stage = std::find_if(
         failed_loaded.failure_diagnostics[0].stages.begin(),
         failed_loaded.failure_diagnostics[0].stages.end(), [](const auto& stage) {
@@ -3619,7 +3642,7 @@ int main(int argc, char** argv) {
                 loaded_failed_msaa = &resource;
         }
     }
-    CHECK(failed_loaded.format_version == 57 && loaded_shadow &&
+    CHECK(failed_loaded.format_version == 58 && loaded_shadow &&
           loaded_shadow->resource.depth == 4 &&
           loaded_shadow->resource.max_uncompressed_block_size == 2 &&
           loaded_shadow->resource.max_compressed_block_size == 1 &&
@@ -3907,9 +3930,9 @@ int main(int argc, char** argv) {
     CHECK(deserialize_gpu_capture(legacy_bytes, legacy_loaded, error) &&
           !legacy_loaded.failure_diagnostics_available && legacy_loaded.failure_diagnostics.empty(),
           "v6 capture reopens with failed-operation diagnostics reported unavailable");
-    if (legacy_bytes.size() >= 12) legacy_bytes[8] = 58;   // kVersion + 1: a future version
+    if (legacy_bytes.size() >= 12) legacy_bytes[8] = 59;   // kVersion + 1: a future version
     CHECK(!deserialize_gpu_capture(legacy_bytes, legacy_loaded, error) &&
-          error == "unsupported capture version 58",
+          error == "unsupported capture version 59",
           "future capture versions fail with a concrete version error");
 
     GpuCaptureFile bad_hash = mixed;

@@ -43,11 +43,20 @@ matched to its own presented frame; its draw/dispatch lineage is useful for loca
 
 In that capsule, the final compositor samples a zero 32³ LUT at PS binding 39. The immediately preceding LUT
 producer is unrealized because its merged-NGG vertex chain hits the existing wave/mesh gate
-[#3135](https://github.com/mattias800/prosper/issues/3135). A one-instruction replacement of the compositor's
-final LUT sample with its existing lookup coordinates, preserving the rest of the fragment shader, leaves the
-**live** menu black by itself. An independent header-derived input-default probe also leaves it black by itself;
-together the probes expose a washed-out, blocky scene. This is diagnostic output, not a rendering fix, and the
-two controls are not a full same-binary 2×2 experiment. Neither substitution belongs in the default path.
+[#3135](https://github.com/mattias800/prosper/issues/3135). A corrected **one-draw-only** live bracket
+confirms the boundary on current main: the final compositor's retained scene and half-resolution inputs have
+visible content, its bound LUT has 0/131,072 nonzero decoded bytes, and the executed draw turns its 3200×1800
+target black. Replacing only that draw's LUT sample with a constant or its final output with its existing scene
+sample makes the menu endpoint nonblack. Those are diagnostic interventions, not rendering fixes: the constant
+produces an almost white image, and the direct sample is a distorted gradient. The earlier saved-module override
+changed over a hundred draws and its black result was not an isolated LUT experiment.
+
+A fresh same-binary v58 ordered capture of the missing producer records **4 vertices × 32 instances**. The
+old capture omitted failed-draw instance count and now reports it as unknown when opened by current replay.
+The producer's terminal PARAM output is transformed after shared-memory reads, so prosper's proven no-GS
+per-vertex shortcut rejects it. A mesh/workgroup execution path must preserve its cross-lane and LDS behavior;
+lifting the vertex `v_mbcnt` gate would not do that. The ordered captures remain unverified against their own
+presented frame. The live same-draw bracket establishes the bound zero LUT and black output independently.
 
 The input-default probe logged changes to earlier fragment programs `0x3007c60000` and `0x3007c80000`
 paired with vertex program `0x3007060000`; it did **not** change the final compositor's input wiring.
@@ -109,10 +118,10 @@ About 2 in 12 launches hang before their first frame (no raw scanout either). No
 - **Seconds-anchored pad pulses are enough for this title's menus** — false. An 11-press seconds-based route
   delivered 2 presses, because the guest reads the pad about once a second there and a 300 ms pulse mostly falls
   between reads; pad-read anchors (`pN`) deliver every press.
-- **The missing 3D LUT alone explains the black live title scene** — false as a complete explanation. Replacing
-  only its compositor sample with the existing lookup coordinates left the live menu black; combining that
-  diagnostic replacement with a fragment-input-default probe exposed a washed-out scene. The LUT producer is
-  still missing in the unverified capsule, so this does not exonerate the merged-NGG gap (#3135).
+- **Any nonzero 3D LUT makes the title oracle-correct** — false. An exact one-draw constant-LUT control changes
+  the live compositor and menu endpoint, but the result is nearly white. Directly outputting the already bound
+  scene sample instead gives a distorted gradient. The LUT producer is a real blocked dependency; the scene
+  feeding it is also spatially wrong, so both paths need separate repairs (#3135, #3835).
 - **The traced earlier fragment inputs are zero because virtual AGC register translation dropped their writes**
   — false for the traced `0x30096e0000` pair. A path-labelled register watch observed 17,420 direct physical
   indirect-array writes to the controls and zero virtual-bank writes (#3835).

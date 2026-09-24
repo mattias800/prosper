@@ -1458,6 +1458,9 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
                     return false;
                 }
     }
+    if (version >= 58)
+        for (auto& diagnostic : c.failure_diagnostics)
+            if (!r.u32(diagnostic.instance_count)) return false;
     // DS seed identity is checked HERE, not in the record loop, because the slice arrives in the
     // tail above: a per-record check would compare incomplete identities and reject two faces of one
     // cube that differ only in slice -- which is exactly the capture this version exists to allow.

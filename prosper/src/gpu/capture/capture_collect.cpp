@@ -398,6 +398,7 @@ bool capture_failure_diagnostics(
         diagnostic.color_targets[1] = {
             diagnostic.color1_base, diagnostic.color1_width, diagnostic.color1_height};
         diagnostic.vertex_count = failure.vertex_count;
+        diagnostic.instance_count = failure.instance_count;
         diagnostic.compute_launch = failure.compute_launch;
         for (const auto& runtime_stage : failure.stages) {
             GpuCapturedStageDiagnostic stage;

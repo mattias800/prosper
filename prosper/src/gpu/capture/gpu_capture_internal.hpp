@@ -169,7 +169,10 @@ constexpr char kMagic[8] = {'P','R','G','P','C','A','P','\0'};
 // the chain must keep declining visibly rather than fetching levels it does not own. Pre-v57 files
 // leave all five placement fields zero, read everywhere as "not modelled", and decline earlier
 // still.
-constexpr uint32_t kVersion = 57;
+// v58 (#3135): retain the instance count of failed graphics draws. Realized draws have carried
+// this since v1; omitting it only when recompilation fails hides the guest's mesh launch shape.
+// Zero on older captures means unavailable, not one instance.
+constexpr uint32_t kVersion = 58;
 constexpr uint32_t kEndian = 0x01020304u;
 constexpr uint64_t kMaxFileBytes = 4ull << 30;
 constexpr uint64_t kMaxBlobDefaultBytes = 1ull << 30;

@@ -259,7 +259,7 @@ Create a capsule with the native-speed workflow in
 
 ## Raw-vs-realized draw check — `raw=` on each `--inspect-only` draw line (#1256)
 
-Each `draw[ID] item=I … vcount=N indices=M voffset=V modifier=D topo=T raw=…` line reports the **raw
+Each `draw[ID] item=I … vcount=N instances=K indices=M voffset=V modifier=D topo=T raw=…` line reports the **raw
 draw-packet state** the guest submitted, decoded BEFORE realization. `raw=` is available in capture
 v23+, while `voffset=` and `modifier=` are available in capture v27+:
 
@@ -277,6 +277,8 @@ draw[12] … vcount=1024 indices=0 topo=3 raw=6 [INFLATED] # realized swept more
 - `voffset=V` is the signed `GE_INDX_OFFSET` applied as Vulkan `firstVertex` for non-indexed draws or
   `vertexOffset` for indexed draws. Pre-v27 captures report zero because they did not retain it.
 - `modifier=D` is the raw 64-bit `ShaderDrawModifier`, retained for offline decode diagnostics in v27+.
+- `instances=K` is the realized guest instance count. Failed draws also print this in capture v58+;
+  `instances=?` on an older failed-draw capture means the value was not stored, not one instance.
 
 This makes a whole class of decode/realization-divergence bug — where prosper renders geometry the guest did
 not ask for — visible **offline** from a capsule, without a live boot. It was added because #1163 (the black
@@ -706,6 +708,9 @@ executor cannot realize. `--inspect-only` prints the failure reason, decoded tar
 state, every referenced stage address, resource-table presence/count, descriptor issues, recompile coverage,
 and the first rejected opcode/format at its exact dword PC. It also prints the raw RDNA2 content hash, byte
 count, and whether the retained stream reached `s_endpgm`.
+Capture v58+ also retains `instances=` for a failed draw. This is necessary to distinguish, for
+example, a four-vertex draw instanced 32 times from a four-invocation draw when deciding whether a
+merged guest wave can be represented by a workgroup-capable backend.
 
 `--dump-compute-raw N PATH` writes the **guest RDNA2 stream** of a *realized* compute — the input the
 recompiler saw, where `--dump-compute` writes its output. Use it to ask whether the guest uses an
