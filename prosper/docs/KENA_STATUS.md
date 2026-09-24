@@ -58,6 +58,15 @@ per-vertex shortcut rejects it. A mesh/workgroup execution path must preserve it
 lifting the vertex `v_mbcnt` gate would not do that. The ordered captures remain unverified against their own
 presented frame. The live same-draw bracket establishes the bound zero LUT and black output independently.
 
+The compile-only four-wave NGG probe now offers a raw VGPR value plus execution-hit trace at a selected linked
+instruction. On a **speculative** one-subgroup input for this producer, it exposed a bounded DPP reduction bug
+in the probe's native Wave64 dispatcher: a `BOUND_CTRL` marker was passed as part of the lane shift, so the
+reduction never collected neighboring lanes. With that corrected, the same input changes from zero to 32
+nonzero raw PRIM records. A byte-matched two-instruction synthetic test guards the reduction and wave isolation.
+These records are not validated primitives or pixels; the captured blobs are callback-time copies, and the
+input does not establish Kena's actual multi-subgroup ES/GS partition or output assembly. The live renderer
+still rejects this producer. #3135 remains open.
+
 A targeted live state log for that same producer records `SPI_SHADER_PGM_RSRC2_GS=0x008b0000`
 (2,176 LDS dwords, 8.5 KiB), `VGT_GS_ONCHIP_CNTL=0x10020040`
 (64 ES vertices, 64 GS primitives and 64 instanced primitives per subgroup using the

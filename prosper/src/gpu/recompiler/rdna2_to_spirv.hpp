@@ -519,13 +519,17 @@ std::vector<uint32_t> recompile_valu(const uint32_t* code, size_t dwords,
 // translator/execution test hook only. It does not assemble primitives, route layers, or create a
 // graphics pipeline, and it refuses any other export target rather than silently discarding it.
 inline constexpr uint32_t kNggExportProbeWords = 13;
+inline constexpr uint32_t kNggTraceValueWord = kNggExportProbeWords;
+inline constexpr uint32_t kNggTraceHitWord = kNggExportProbeWords + 1;
+inline constexpr uint32_t kNggTraceProbeWords = kNggExportProbeWords + 2;
 std::vector<uint32_t> recompile_ngg_exports_for_test(
     const uint32_t* code, size_t dwords, uint32_t num_inputs,
     uint32_t lds_bytes = 0, const ShaderResourceTable* resources = nullptr,
     uint32_t vertices_per_instance = 0, uint32_t provisional_merged_wave_info = 0,
     RecompileDiagnosticContext diagnostic = {RecompileDiagnosticStage::Vertex, 0},
     bool packed_gs_offsets_from_inputs = false, bool full_four_wave_launch_inputs = false,
-    bool native_wave64 = false);
+    bool native_wave64 = false, uint32_t trace_pc = UINT32_MAX,
+    uint32_t trace_vgpr = UINT32_MAX);
 
 // Register and launch state for a real compute program. User SGPR values are supplied as one
 // push-constant dword per register; enabled system SGPRs follow them in hardware order. TIDIG_COMP_CNT

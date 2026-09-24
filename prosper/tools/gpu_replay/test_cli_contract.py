@@ -152,6 +152,25 @@ missing_full_native = run_result(["--probe-ngg-native-wave64", "no-such-capture.
 check(missing_full_native.returncode == 2 and
       "requires --probe-ngg-full-four-wave" in missing_full_native.stderr,
       "native Wave64 selector cannot silently run outside the full launch probe")
+missing_trace_native = run_result(["--probe-ngg-trace=7:6", "no-such-capture.prgcap"])
+check(missing_trace_native.returncode == 2 and
+      "requires --probe-ngg-native-wave64" in missing_trace_native.stderr,
+      "NGG trace cannot silently run outside the native compile-only probe")
+for invalid in ("bad:6", "7:256", "7:"):
+    result = run_result([f"--probe-ngg-trace={invalid}", "no-such-capture.prgcap"])
+    check(result.returncode == 2 and "expected --probe-ngg-trace=PC:VGPR" in result.stderr,
+          f"NGG trace rejects malformed selector {invalid}")
+duplicate_trace = run_result(["--probe-ngg-trace=7:6", "--probe-ngg-trace=8:6",
+                              "no-such-capture.prgcap"])
+check(duplicate_trace.returncode == 2 and "duplicate NGG trace" in duplicate_trace.stderr,
+      "NGG trace refuses duplicate selectors")
+armed_trace = run_result(["--retry-failed-chain", "0", "--probe-ngg-full-four-wave",
+                          "--probe-ngg-native-wave64", "--probe-ngg-trace=7:6",
+                          "no-such-capture.prgcap"])
+check(armed_trace.returncode == 2 and
+      ("no file" in armed_trace.stderr or "invalid capture file size" in armed_trace.stderr) and
+      "expected --probe-ngg-trace" not in armed_trace.stderr,
+      "valid NGG trace selector reaches capture loading")
 
 quiet = run([])
 check(notice_block(quiet) == "",

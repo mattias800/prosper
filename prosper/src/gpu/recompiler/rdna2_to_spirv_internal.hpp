@@ -501,6 +501,9 @@ struct SpirvCompute {
     bool     allow_b32_masks=0;                      // proven Wave32 or byte-exact graphics exception
     bool     ngg_one_lane=0;                         // exact GS_ALLOC_REQ wrapper: one guest lane/invocation
     bool     ngg_workgroup_export_probe=false;       // test-only 64-lane guest wave/export shell
+    uint32_t ngg_probe_trace_pc = UINT32_MAX;        // optional offline VGPR milestone
+    uint32_t ngg_probe_trace_vgpr = UINT32_MAX;
+    bool     ngg_probe_trace_seen = false;
     std::unordered_set<uint32_t> ngg_uniform_wave_reduction_pcs;
     bool     ngg_logical_lane=0;                     // proven wave64 no-GS producer uses flattened guest lane
     bool     ngg_private_lds=0;                      // exact captured wrapper whose LDS projection is known
