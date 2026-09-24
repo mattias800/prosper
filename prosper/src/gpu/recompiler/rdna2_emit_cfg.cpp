@@ -4974,10 +4974,11 @@ bool emit_cfg_state_machine(
             if (event == compute_dpp_add_event_for_pc.end())
                 return reject_cfg(dpp_add_row_shr->pc, "dpp-add-row-shr-event");
             const int dst = dpp_add_row_shr->dst.value;
-            const auto source = state.vreg.find(dpp_add_row_shr->src[0].value);
+            const bool bounded = is_vadd_nc_u32_dpp_row_shr_bounded(*dpp_add_row_shr);
+            const auto source = state.vreg.find(
+                bounded ? dpp_add_row_shr->src[0].value : dst);
             const uint32_t source_value =
                 source == state.vreg.end() ? zero : source->second;
-            const bool bounded = is_vadd_nc_u32_dpp_row_shr_bounded(*dpp_add_row_shr);
             const uint32_t amount = b.uconst(bounded
                 ? 0x100u | static_cast<uint32_t>(dpp_add_row_shr->dpp_ctrl - 0x110u)
                 : static_cast<uint32_t>(dpp_add_row_shr->dpp_ctrl - 0x110u));
@@ -5819,9 +5820,13 @@ bool emit_cfg_state_machine(
     b.barrier();
 
     const uint32_t dpp_control = b.load_function(b.t_u32, dpp_add_amount_var);
-    const uint32_t dpp_bounded = b.ucmp(
-        Op_INotEqual, b.ibin(Op_BitwiseAnd, dpp_control, b.uconst(0x100)), zero);
-    const uint32_t dpp_amount = b.ibin(Op_BitwiseAnd, dpp_control, b.uconst(0xf));
+    // The bounded form belongs to the compile-only NGG probe. Preserve the established GTA
+    // unbounded reduction's generated graph and invalid-source write rule outside that probe.
+    const uint32_t dpp_bounded = b.ngg_workgroup_export_probe
+        ? b.ucmp(Op_INotEqual, b.ibin(Op_BitwiseAnd, dpp_control, b.uconst(0x100)), zero)
+        : no;
+    const uint32_t dpp_amount = b.ngg_workgroup_export_probe
+        ? b.ibin(Op_BitwiseAnd, dpp_control, b.uconst(0xf)) : dpp_control;
     const uint32_t dpp_row_lane = b.ibin(
         Op_BitwiseAnd, b.linear_localid, b.uconst(15));
     const uint32_t dpp_in_bounds = b.ucmp(
@@ -5845,10 +5850,12 @@ bool emit_cfg_state_machine(
         dpp_in_bounds, dpp_source_active);
     dpp_valid_source = b.land(
         dpp_valid_source, b.ucmp(Op_IEqual, dpp_source_event, dpp_event));
-    const uint32_t dpp_result = b.ibin(
-        Op_IAdd, dpp_source, b.sel(dpp_valid_source, dpp_shifted, zero));
-    const uint32_t dpp_write = b.land(
-        b.land(dpp_pending, dpp_active), b.lor(dpp_bounded, dpp_valid_source));
+    const uint32_t dpp_result = b.ibin(Op_IAdd, dpp_source,
+        b.ngg_workgroup_export_probe
+            ? b.sel(dpp_valid_source, dpp_shifted, zero) : dpp_shifted);
+    const uint32_t dpp_write = b.land(b.land(dpp_pending, dpp_active),
+        b.ngg_workgroup_export_probe
+            ? b.lor(dpp_bounded, dpp_valid_source) : dpp_valid_source);
     const uint32_t dpp_dst = b.load_function(b.t_u32, dpp_add_dst_var);
     for (int reg : compute_dpp_add_row_shr_dsts) {
         const auto kv = vv.find(reg);
