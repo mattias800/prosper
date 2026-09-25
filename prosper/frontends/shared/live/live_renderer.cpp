@@ -1980,31 +1980,47 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
         [invalidate_ds, direct_bind](uint64_t addr,
                         const prosper::gpu::LiveTargetImageDestinationRequest& request,
                         prosper::gpu::LiveTargetImageImport& destination) {
-            if (!direct_bind) return false;
+            static const bool diagnose = std::getenv("PROSPER_RTT_DEST_BORROW_DIAG") != nullptr;
+            auto decline = [&](const char* reason) {
+                if (diagnose)
+                    std::fprintf(stderr,
+                                 "[rtt-dest-borrow] addr=0x%llx extent=%ux%u format=%u reason=%s\n",
+                                 (unsigned long long)addr, request.width, request.height,
+                                 static_cast<unsigned>(request.format), reason);
+                return false;
+            };
+            if (!direct_bind) return decline("direct-bind-off");
             drain_guest_gpu_writes(g_rtt, invalidate_ds);
             auto it = g_rtt.find(addr);
-            if (it == g_rtt.end() || !request.width || !request.height ||
+            if (it == g_rtt.end()) return decline("no-rtt-entry");
+            if (!request.width || !request.height ||
                 it->second.w != request.width || it->second.h != request.height)
-                return false;
+                return decline("extent-mismatch");
             const VkFormat format = prosper::frontend::live_target_pixel_format_vk(request.format);
-            if (format == VK_FORMAT_UNDEFINED ||
-                prosper::test::backend_color_format(it->second.format) != format)
-                return false;
+            if (format == VK_FORMAT_UNDEFINED) return decline("unsupported-format");
+            if (prosper::test::backend_color_format(it->second.format) != format)
+                return decline("format-mismatch");
             const prosper::test::RenderVkCtx& ctx = prosper::test::render_vk_ctx();
-            if (!ctx.ok) return false;
+            if (!ctx.ok) return decline("renderer-context-unavailable");
             auto* target = prosper::test::find_persistent_color_target(
                 addr, request.width, request.height, format, false);
-            if (!target || !target->image || target->layout == VK_IMAGE_LAYOUT_UNDEFINED ||
-                !prosper::test::pin_persistent_color_target_for_overwrite(
+            if (!target || !target->image) return decline("no-persistent-image");
+            if (target->layout == VK_IMAGE_LAYOUT_UNDEFINED) return decline("undefined-layout");
+            if (!prosper::test::pin_persistent_color_target_for_overwrite(
                     addr, request.width, request.height, format))
-                return false;
+                return decline("pin-denied");
             PinnedImport& pin = pinned_imports[addr];
             if (pin.count && (pin.width != request.width || pin.height != request.height ||
                               pin.format != format)) {
                 prosper::test::unpin_persistent_color_target(addr, request.width,
                                                                request.height, format);
-                return false;
+                return decline("conflicting-pin");
             }
+            if (diagnose)
+                std::fprintf(stderr,
+                             "[rtt-dest-borrow] addr=0x%llx extent=%ux%u format=%u reason=acquired\n",
+                             (unsigned long long)addr, request.width, request.height,
+                             static_cast<unsigned>(request.format));
             pin = {request.width, request.height, format, pin.count + 1};
             destination.width = request.width;
             destination.height = request.height;
