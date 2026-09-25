@@ -2041,6 +2041,14 @@ if(TARGET prosper_core)
   target_include_directories(test_draw_disposition PRIVATE src)
   add_test(NAME draw_disposition COMMAND test_draw_disposition)
 
+  # Pass-break classification: keeps the per-reason distribution separable, because the reason
+  # that ends the most passes is not the reason holding the mean down.
+  add_executable(test_pass_break_census tests/gpu/diagnostics/test_pass_break_census.cpp
+                 src/gpu/diagnostics/pass_break_census.cpp
+                 src/diagnostics/exit_reports.cpp)
+  target_include_directories(test_pass_break_census PRIVATE src)
+  add_test(NAME pass_break_census COMMAND test_pass_break_census)
+
   # IME keyboard event delivery (issue #1093): sceImeUpdate must invoke the guest handler
   # per queued key event; the old stub delivered none.
   add_executable(test_ime_input tests/hle/input/test_ime_input.cpp)
