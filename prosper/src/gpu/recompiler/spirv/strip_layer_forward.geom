@@ -9,6 +9,11 @@ layout(triangle_strip, max_vertices = 3) out;
 layout(location = 0) in vec4 source_param0[];
 layout(location = 1) in vec4 source_layer_bits[];
 layout(location = 0) out vec4 forwarded_param0;
+// The recompiled vertex stage's output block carries only gl_Position. Vulkan requires a
+// Block-decorated interface shared between two stages to match member for member, so redeclare
+// both sides of this stage with exactly that member rather than the implicit four-member block.
+in gl_PerVertex { vec4 gl_Position; } gl_in[];
+out gl_PerVertex { vec4 gl_Position; };
 
 void main() {
     int layer = floatBitsToInt(source_layer_bits[0].x);
