@@ -1564,6 +1564,13 @@ if(TARGET prosper_core)
   set_tests_properties(decode_scratch_poisoned PROPERTIES
     ENVIRONMENT "PROSPER_DECODE_SCRATCH_POISON=1")
 
+  add_executable(test_depth_cube_quantize frontends/shared/tests/test_depth_cube_quantize.cpp)
+  target_include_directories(test_depth_cube_quantize PRIVATE frontends)
+  add_test(NAME depth_cube_quantize COMMAND test_depth_cube_quantize)
+  add_test(NAME depth_cube_quantize_scalar COMMAND test_depth_cube_quantize --control)
+  set_tests_properties(depth_cube_quantize_scalar PROPERTIES
+    ENVIRONMENT "PROSPER_NO_DEPTH_CUBE_SIMD=1")
+
   # #3307 compute->graphics image borrow census. Header-only and device-free: the load-bearing arm
   # is the 2048-case equivalence between the importer's precondition classifier and the `||` chain
   # it replaced, which needs no Vulkan and must never be skipped on a host without it.
@@ -3396,10 +3403,13 @@ endif()
       target_link_libraries(test_depth_cube_source_snapshot PRIVATE prosper_core prosper_live_renderer Vulkan::Vulkan)
       add_test(NAME depth_cube_source_snapshot COMMAND test_depth_cube_source_snapshot)
       add_test(NAME depth_cube_source_snapshot_control COMMAND test_depth_cube_source_snapshot --control)
+      add_test(NAME depth_cube_source_snapshot_scalar COMMAND test_depth_cube_source_snapshot)
       set_tests_properties(depth_cube_source_snapshot PROPERTIES
         ENVIRONMENT "PROSPER_GPU_REPLAY_DS_SEEDS=1")
       set_tests_properties(depth_cube_source_snapshot_control PROPERTIES
         ENVIRONMENT "PROSPER_GPU_REPLAY_DS_SEEDS=1;PROSPER_NO_CUBE_SOURCE_SNAPSHOT_PRUNING=1")
+      set_tests_properties(depth_cube_source_snapshot_scalar PROPERTIES
+        ENVIRONMENT "PROSPER_GPU_REPLAY_DS_SEEDS=1;PROSPER_NO_DEPTH_CUBE_SIMD=1")
       add_executable(test_depth_array_source_snapshot tests/shared/live/test_depth_array_source_snapshot.cpp)
       target_include_directories(test_depth_array_source_snapshot PRIVATE frontends src tests)
       target_link_libraries(test_depth_array_source_snapshot PRIVATE prosper_core prosper_live_renderer Vulkan::Vulkan)
