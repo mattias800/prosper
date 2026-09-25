@@ -1,6 +1,7 @@
 #include "gpu/diagnostics/draw_disposition.hpp"
 
 #include "gpu/diagnostics/diag_ratelimit.hpp"
+#include "diagnostics/exit_reports.hpp"
 
 #include <atomic>
 #include <array>
@@ -25,6 +26,16 @@ constexpr std::array<const char*, kReasonCount> kNames{
 };
 static_assert(kNames.size() == kReasonCount,
               "every DrawDrop needs a stable name; logs are grepped by these strings");
+
+// Print EVERY pass, healthy or not. This exists because a silent instrument and an instrument
+// that was never reached are indistinguishable from outside -- the failure mode the charter's
+// instrument-trap list keeps recording. Verifying this census on a new title starts here: if a
+// verbose run prints nothing, the draw path does not go through this function and no conclusion
+// may be drawn from the quiet default.
+bool verbose_enabled() {
+    static const bool enabled = std::getenv("PROSPER_DRAW_DISPOSITION_VERBOSE") != nullptr;
+    return enabled;
+}
 
 bool reporting_enabled() {
     // Default ON. A diagnostic you have to know to enable is one nobody enables; the only switch
@@ -131,6 +142,7 @@ void DrawDispositionCensus::report_pass() {
         ordinal[i] = s.printed[i].fetch_add(1, std::memory_order_relaxed) + 1;
         if (diag_should_print(ordinal[i])) print = true;
     }
+    if (verbose_enabled()) print = true;
     if (!print) return;
 
     std::fprintf(stderr, "[draw-disposition] seen=%llu recorded=%llu",
@@ -154,8 +166,44 @@ void DrawDispositionCensus::report_pass() {
     std::fflush(stderr);
 }
 
+void DrawDispositionCensus::report_totals() {
+    auto& s = state();
+    const uint64_t total_seen = s.seen.load(std::memory_order_relaxed);
+    if (!reporting_enabled() || total_seen == 0) return;
+    const uint64_t total_recorded = s.recorded.load(std::memory_order_relaxed);
+    uint64_t total_dropped = 0;
+    for (size_t i = 0; i < kReasonCount; i++)
+        total_dropped += s.dropped[i].load(std::memory_order_relaxed);
+    std::fprintf(stderr, "[draw-disposition] RUN TOTAL seen=%llu recorded=%llu dropped=%llu",
+                 static_cast<unsigned long long>(total_seen),
+                 static_cast<unsigned long long>(total_recorded),
+                 static_cast<unsigned long long>(total_dropped));
+    for (size_t i = 0; i < kReasonCount; i++) {
+        const uint64_t n = s.dropped[i].load(std::memory_order_relaxed);
+        if (n) std::fprintf(stderr, " %s=%llu", kNames[i], static_cast<unsigned long long>(n));
+    }
+    if (total_recorded + total_dropped != total_seen)
+        std::fprintf(stderr, "  UNACCOUNTED=%lld",
+                     static_cast<long long>(static_cast<int64_t>(total_seen) -
+                                            static_cast<int64_t>(total_recorded) -
+                                            static_cast<int64_t>(total_dropped)));
+    std::fprintf(stderr, "\n");
+    std::fflush(stderr);
+}
+
 DrawDispositionCensus& draw_disposition_census() {
     static DrawDispositionCensus census;
+    // Registered on first use so a process that never renders prints nothing at all. NOT
+    // std::atexit: every frontend here leaves through _exit()/_Exit(), which skips atexit
+    // entirely (#3353), and a missing end-of-run line is indistinguishable from a zero. The
+    // census state is atomics in a leaked function-local static, so it satisfies the
+    // "no non-trivial destructors" requirement in exit_reports.hpp.
+    static const bool once = [] {
+        prosper::diagnostics::register_exit_report(
+            [] { draw_disposition_census().report_totals(); });
+        return true;
+    }();
+    (void)once;
     return census;
 }
 

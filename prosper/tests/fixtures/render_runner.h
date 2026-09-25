@@ -9511,6 +9511,9 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         }
     }
 
+    // Reports this pass on every exit from here on, including the early returns below -- see
+    // DrawDispositionPassScope for why this is a guard and not a call at the end.
+    const prosper::gpu::DrawDispositionPassScope draw_disposition_scope;
     for (size_t di = 0; di < draws.size(); di++) {
         // Denominator: every draw this pass considers, recorded before any skip path can divert it.
         if (wave64_census) wave64_stats.note_draw(W, H);
@@ -14161,7 +14164,6 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                    evict_persistent_color_target(*ctx_ptr, color_target_generation)) {}
         });
     volume_attachment_view.release();
-    prosper::gpu::draw_disposition_census().report_pass();
     if (flush_now) active_submission.complete();
     if (!flush_now || batch_completed) volume_attempt.release();
     if (timing_enabled) {

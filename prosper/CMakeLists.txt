@@ -2036,7 +2036,8 @@ if(TARGET prosper_core)
   # silent. Pins that a healthy pass stays quiet, that a drop names its mechanism, and that the
   # census reports an unnamed drop path as UNACCOUNTED rather than absorbing it.
   add_executable(test_draw_disposition tests/gpu/diagnostics/test_draw_disposition.cpp
-                 src/gpu/diagnostics/draw_disposition.cpp)
+                 src/gpu/diagnostics/draw_disposition.cpp
+                 src/diagnostics/exit_reports.cpp)
   target_include_directories(test_draw_disposition PRIVATE src)
   add_test(NAME draw_disposition COMMAND test_draw_disposition)
 

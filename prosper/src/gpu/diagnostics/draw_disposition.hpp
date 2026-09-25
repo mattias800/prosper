@@ -51,6 +51,11 @@
 // A pass that records ZERO draws while having seen some is always reported, regardless of the
 // per-reason budget: that is a black pass, and it is the observation the instrument exists for.
 //
+// `PROSPER_DRAW_DISPOSITION_VERBOSE=1` prints every pass including healthy ones. Verifying this
+// census on a new title starts there: a silent instrument and one that was never reached look
+// identical from outside, so a quiet default may only be read as "no drops" once a verbose run on
+// the same route has shown the reporting path is live.
+//
 // `PROSPER_NO_DRAW_DISPOSITION=1` silences the reporting (the counters keep running, so a
 // programmatic reader still works). There is deliberately no variable that turns the census ON,
 // because a diagnostic you must know to enable is one nobody enables.
@@ -89,6 +94,14 @@ public:
     // always prints when the two independent routes disagree.
     void report_pass();
 
+    // One process-lifetime summary line, printed at end of run when any draw was seen, via
+    // `register_exit_report` -- NOT std::atexit, which every frontend here skips (#3353). This is a
+    // COMPLEMENT to report_pass(), never a replacement: a run that ends in a device loss may never
+    // reach it, which is exactly why the per-pass report is the primary and this is the
+    // convenience. It also separates the two states the per-pass report cannot distinguish by its
+    // silence -- "every pass was healthy" and "no pass ever ran" both print nothing per-pass.
+    void report_totals();
+
     // Programmatic readers (tests, tools). Totals are process-lifetime, not per pass.
     uint64_t seen() const;
     uint64_t recorded() const;
@@ -101,5 +114,19 @@ private:
 };
 
 DrawDispositionCensus& draw_disposition_census();
+
+// Reports the pass on EVERY exit from the scope it is declared in -- normal return, early return,
+// or exception. A pass that returns early otherwise leaves its counters standing, and they are
+// then charged to the NEXT pass, which reads as an accounting gap in a pass that did nothing
+// wrong. That is not hypothetical: the explicit end-of-function call this replaces produced
+// `UNACCOUNTED=1` on an Astro Bot run, and the unaccounted draw belonged to a different pass
+// entirely. A guard is used rather than auditing the 48 `return` statements in the enclosing
+// function because the next `return` added would silently reintroduce the leak.
+struct DrawDispositionPassScope {
+    DrawDispositionPassScope() = default;
+    DrawDispositionPassScope(const DrawDispositionPassScope&) = delete;
+    DrawDispositionPassScope& operator=(const DrawDispositionPassScope&) = delete;
+    ~DrawDispositionPassScope() { draw_disposition_census().report_pass(); }
+};
 
 }  // namespace prosper::gpu
