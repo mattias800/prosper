@@ -4080,6 +4080,12 @@ endif()
       target_include_directories(test_indexed_render PRIVATE frontends)
       target_link_libraries(test_indexed_render PRIVATE prosper_core Vulkan::Vulkan)
       add_test(NAME indexed_render COMMAND test_indexed_render)
+      add_test(NAME indexed_render_no_index_copy_batch COMMAND test_indexed_render)
+      set_tests_properties(indexed_render_no_index_copy_batch PROPERTIES
+        ENVIRONMENT "PROSPER_NO_INDEX_COPY_BATCH=1")
+      add_test(NAME indexed_render_no_index_arena COMMAND test_indexed_render)
+      set_tests_properties(indexed_render_no_index_arena PROPERTIES
+        ENVIRONMENT "PROSPER_NO_INDEX_ARENA=1")
 
       add_executable(test_descriptor_array_render tests/gpu/state/test_descriptor_array_render.cpp)
       # Includes a shared fixture, which resolves from the `tests` root.

@@ -14,6 +14,8 @@
 #include "gpu/resources/shader_resources.hpp"
 #include "gpu/state/render_state.hpp"
 #include "fixtures/render_runner.h"
+#include <algorithm>
+#include <cstdlib>
 #include <cstdio>
 #include <cstdint>
 #include <vector>
@@ -107,11 +109,48 @@ int main() {
     const std::vector<uint8_t> px_borrowed = prosper::test::render_draws_rgba({borrowed}, W, H);
     CHECK(px_borrowed == px_tri,
           "borrowed index words override conflicting owned words and select records 1..3");
+    const auto borrowed_stats = prosper::test::backend_resource_reuse_stats();
+    const bool batch_disabled = std::getenv("PROSPER_NO_INDEX_COPY_BATCH") != nullptr;
+    const bool arena_disabled = std::getenv("PROSPER_NO_INDEX_ARENA") != nullptr ||
+        std::getenv("PROSPER_NO_BACKEND_BUFFER_ARENA") != nullptr;
+    const uint64_t expected_batch = !batch_disabled && !arena_disabled ? 1u : 0u;
+    CHECK(borrowed_stats.index_copy_batches == expected_batch &&
+          borrowed_stats.index_copy_spans == expected_batch &&
+          borrowed_stats.index_copy_bytes == expected_batch * 12u,
+          "indexed upload uses the selected deferred or immediate path");
     borrowed_indices[0] = borrowed_indices[1] = borrowed_indices[2] = 0;
     const std::vector<uint8_t> px_borrowed_mutated =
         prosper::test::render_draws_rgba({borrowed}, W, H);
     CHECK(px_borrowed_mutated.size() == (size_t)W*H*4 && px_borrowed_mutated != px_borrowed,
           "same-address borrowed index mutation is observed by the next backend call");
+
+    // Two borrowed index lists must remain independent when their uploads are deferred until
+    // resource construction finishes. Each quad covers one half of the image; changing only the
+    // left list must leave the right half intact on the next call.
+    const std::vector<uint32_t> left_quad = {
+        f(-1.f), f(-1.f), f(-1.f), f(1.f), f(0.f), f(1.f), f(0.f), f(-1.f)};
+    const std::vector<uint32_t> right_quad = {
+        f(0.f), f(-1.f), f(0.f), f(1.f), f(1.f), f(1.f), f(1.f), f(-1.f)};
+    std::vector<uint32_t> left_indices = {0, 1, 2, 2, 3, 0};
+    std::vector<uint32_t> right_indices = {0, 1, 2, 2, 3, 0};
+    auto left = draw_of(left_quad, &list_ps, 4, {0, 0, 0, 0, 0, 0});
+    auto right = draw_of(right_quad, &list_ps, 4, {0, 0, 0, 0, 0, 0});
+    left.borrow_indices(left_indices);
+    right.borrow_indices(right_indices);
+    const auto both_halves = prosper::test::render_draws_rgba({left, right}, W, H);
+    CHECK(both_halves.size() == (size_t)W*H*4 &&
+          isGreen(both_halves, W/4, H/2) && isGreen(both_halves, 3*W/4, H/2),
+          "two independently borrowed index lists render both halves");
+    const auto two_stats = prosper::test::backend_resource_reuse_stats();
+    CHECK(two_stats.index_copy_batches == expected_batch &&
+          two_stats.index_copy_spans == 2u * expected_batch &&
+          two_stats.index_copy_bytes == 48u * expected_batch,
+          "both arena index uploads take the selected deferred or immediate path");
+    std::fill(left_indices.begin(), left_indices.end(), 0u);
+    const auto right_only = prosper::test::render_draws_rgba({left, right}, W, H);
+    CHECK(right_only.size() == (size_t)W*H*4 &&
+          !isGreen(right_only, W/4, H/2) && isGreen(right_only, 3*W/4, H/2),
+          "changing one borrowed list affects only its own indexed draw");
 
     // --- Case C: GE_INDX_OFFSET reaches both Vulkan draw variants. The same shared pool can select
     // records 1..3 either with non-indexed firstVertex=1 or indexed vertexOffset=1.
