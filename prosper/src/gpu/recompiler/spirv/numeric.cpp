@@ -181,10 +181,53 @@ uint32_t SpirvCompute::pack_half2x16(uint32_t a, uint32_t b) {
     }
 
 uint32_t SpirvCompute::pack_half2x16_rtz(uint32_t a, uint32_t b) {
-        const uint32_t hi = bcu(fconstf(65504.0f)), lo = bcu(fconstf(-65504.0f));
-        uint32_t ca = fext2(Glsl_FMax, fext2(Glsl_FMin, a, hi), lo);
-        uint32_t cb = fext2(Glsl_FMax, fext2(Glsl_FMin, b, hi), lo);
-        return pack_half2x16(ca, cb);
+        // GLSL PackHalf2x16 does not guarantee RTZ, and its preceding floating-point min/max can
+        // turn a NaN or true infinity into a finite endpoint. V_CVT_PKRTZ_F16_F32 always rounds
+        // finite operands toward zero. Work on the source bits so host float controls and GLSL
+        // exceptional-value min/max do not change the input class.
+        const auto half_rtz = [&](uint32_t bits) {
+            const uint32_t sign = ibin(Op_BitwiseAnd,
+                                       ibin(Op_ShiftRightLogical, bits, uconst(16)),
+                                       uconst(0x8000u));
+            const uint32_t exponent = ibin(Op_BitwiseAnd,
+                                           ibin(Op_ShiftRightLogical, bits, uconst(23)),
+                                           uconst(0xffu));
+            const uint32_t fraction = ibin(Op_BitwiseAnd, bits, uconst(0x7fffffu));
+
+            const uint32_t normal_exponent = ibin(
+                Op_ShiftLeftLogical, ibin(Op_ISub, exponent, uconst(112)), uconst(10));
+            const uint32_t normal_fraction = ibin(Op_ShiftRightLogical, fraction, uconst(13));
+            const uint32_t normal = ibin(Op_BitwiseOr, normal_exponent, normal_fraction);
+
+            // For f32 exponents 103..112, the hidden bit contributes to a half subnormal.
+            // The shift expression is evaluated in SSA for every input, including exponents
+            // outside that range. Bound it before OpShiftRightLogical (shift >= 32 is undefined).
+            const uint32_t sub_shift = uext2(
+                Glsl_UMin, ibin(Op_ISub, uconst(126), exponent), uconst(31));
+            const uint32_t subnormal = ibin(
+                Op_ShiftRightLogical,
+                ibin(Op_BitwiseOr, fraction, uconst(0x800000u)), sub_shift);
+            const uint32_t has_subnormal = land(
+                ucmp(Op_UGreaterThanEqual, exponent, uconst(103)),
+                ucmp(Op_ULessThan, exponent, uconst(113)));
+            uint32_t magnitude = sel(has_subnormal, subnormal, uconst(0));
+            const uint32_t has_normal = land(
+                ucmp(Op_UGreaterThanEqual, exponent, uconst(113)),
+                ucmp(Op_ULessThan, exponent, uconst(143)));
+            magnitude = sel(has_normal, normal, magnitude);
+            const uint32_t finite_overflow = land(
+                ucmp(Op_UGreaterThanEqual, exponent, uconst(143)),
+                ucmp(Op_ULessThan, exponent, uconst(255)));
+            magnitude = sel(finite_overflow, uconst(0x7bffu), magnitude);
+            // True infinities stay infinite; NaN payloads become a signed quiet half NaN.
+            const uint32_t special = sel(
+                ucmp(Op_INotEqual, fraction, uconst(0)),
+                uconst(0x7e00u), uconst(0x7c00u));
+            magnitude = sel(ucmp(Op_IEqual, exponent, uconst(255)), special, magnitude);
+            return ibin(Op_BitwiseOr, sign, magnitude);
+        };
+        return ibin(Op_BitwiseOr, half_rtz(a),
+                    ibin(Op_ShiftLeftLogical, half_rtz(b), uconst(16)));
     }
 
 uint32_t SpirvCompute::unpack_norm(uint32_t dword, uint32_t bit_off, uint32_t bits, bool is_signed, float norm) {
