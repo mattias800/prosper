@@ -115,6 +115,41 @@ int main() {
     prosper::register_agc_hle();
     const uint32_t W = 64, H = 64;
 
+    StripLayerDrawState layer_state;
+    layer_state.vertex_count = 4;
+    layer_state.instance_count = 32;
+    layer_state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+    layer_state.modifier = 0x80000000ull;
+    layer_state.target_width = layer_state.target_height = 32;
+    layer_state.volume_depth = layer_state.slice_count = layer_state.slice_max = 32;
+    layer_state.attribute_mask = 1;
+    layer_state.pixel_valid_mask = 1;
+    layer_state.ps_input_ena = layer_state.ps_input_addr = 0x2020u;
+    CHECK(strip_layer_draw_admitted(layer_state),
+          "exact layered strip admits the physically clipped 32-slice view");
+    auto rejects_layer_mutation = [&](auto mutate) {
+        StripLayerDrawState changed = layer_state;
+        mutate(changed);
+        return !strip_layer_draw_admitted(changed);
+    };
+    CHECK(rejects_layer_mutation([](auto& s) { s.vertex_count = 3; }) &&
+              rejects_layer_mutation([](auto& s) { s.instance_count = 31; }) &&
+              rejects_layer_mutation([](auto& s) { s.vertex_offset = 1; }) &&
+              rejects_layer_mutation([](auto& s) { s.indexed = true; }) &&
+              rejects_layer_mutation([](auto& s) { s.modifier = 0; }),
+          "layered strip rejects launch and modifier changes");
+    CHECK(rejects_layer_mutation([](auto& s) { s.slice_count = 31; }) &&
+              rejects_layer_mutation([](auto& s) { s.slice_max = 31; }) &&
+              rejects_layer_mutation([](auto& s) { s.first_slice = 1; }) &&
+              rejects_layer_mutation([](auto& s) { s.target_width = 64; }),
+          "layered strip rejects changed target coverage");
+    CHECK(rejects_layer_mutation([](auto& s) { s.cull_mode = 1; }) &&
+              rejects_layer_mutation([](auto& s) { s.depth_test = true; }) &&
+              rejects_layer_mutation([](auto& s) { s.flat_mask = 1; }) &&
+              rejects_layer_mutation([](auto& s) { s.pixel_control0 = 0x20; }) &&
+              rejects_layer_mutation([](auto& s) { s.ps_input_addr = 0; }),
+          "layered strip rejects order-sensitive raster or fragment wiring");
+
     uint64_t occurrence = 0;
     CHECK(should_log_recompile_reject(0xfeed0001, 0xfeed0002, 0, 0, 0, &occurrence) &&
           occurrence == 1,

@@ -5,9 +5,14 @@
 // and run through a real Vulkan pipeline. The fullscreen triangle covers the whole viewport, so we
 // assert every sampled pixel is GREEN — proving RDNA2 vertex+pixel -> our SPIR-V -> rendered frame.
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include "gpu/recompiler/spirv/strip_layer_forward_spv.hpp"
 #include "fixtures/render_runner.h"
+#include "fixtures/test_data.h"
+#include "../execute/volume_target_spirv.h"
+#include <array>
 #include <cstdio>
 #include <cstdint>
+#include <filesystem>
 #include <iterator>
 #include <vector>
 
@@ -16,6 +21,21 @@ using namespace prosper::gpu;
 static int fails = 0;
 #define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
                          else       { printf("  [ok]   %s\n", m); } } while (0)
+
+static std::vector<uint32_t> load_words(const std::filesystem::path& path) {
+    FILE* file = std::fopen(path.string().c_str(), "rb");
+    if (!file) return {};
+    if (std::fseek(file, 0, SEEK_END) != 0) { std::fclose(file); return {}; }
+    const long bytes = std::ftell(file);
+    if (bytes <= 0 || bytes % 4 != 0 || std::fseek(file, 0, SEEK_SET) != 0) {
+        std::fclose(file);
+        return {};
+    }
+    std::vector<uint32_t> words(static_cast<size_t>(bytes) / 4u);
+    const size_t read = std::fread(words.data(), 4, words.size(), file);
+    std::fclose(file);
+    return read == words.size() ? words : std::vector<uint32_t>{};
+}
 
 int main() {
     printf("== test_recompiled_shaders ==\n");
@@ -382,6 +402,171 @@ int main() {
         vcc_data_prolog, std::size(vcc_data_prolog), nggvs, std::size(nggvs));
     CHECK(vcc_data_chain.empty(),
           "split-stage scalar mask plumbing does not bypass the NGG wave proof");
+
+    // This merged ES/GS chain writes one seven-dword record per logical vertex. Its wrapper
+    // copies the records into two strip primitives and publishes their shared instance layer.
+    // Keep both code bodies in the admission proof: the same guest address can be overwritten.
+    const auto data = prosper::test::tests_root(__FILE__) / "data";
+    auto layer_prolog = load_words(data / "strip_layer_prolog.bin");
+    auto layer_wrapper = load_words(data / "strip_layer_wrapper.bin");
+    CHECK(layer_prolog.size() == 102u && layer_wrapper.size() == 413u,
+          "strip-layer guest ES and GS code fixtures are complete");
+    if (layer_prolog.size() == 102u && layer_wrapper.size() == 413u) {
+        CHECK(rdna2_proven_strip_layer_chain(layer_prolog.data(), layer_prolog.size(),
+                                              layer_wrapper.data(), layer_wrapper.size()),
+              "complete current code pair admits the source-record projection");
+        ShaderResourceTable layer_rt;
+        layer_rt.vertices_per_instance = 4;
+        auto add_resource = [&](ResourceClass cls, uint32_t binding, uint32_t size,
+                                uint32_t stride, uint32_t components, uint32_t fetch_pc,
+                                uint32_t sgpr) {
+            ShaderResource resource;
+            resource.cls = cls;
+            resource.binding = binding;
+            resource.size = size;
+            resource.stride = stride;
+            resource.format = DataFormat::Float32;
+            resource.num_components = components;
+            resource.fetch_pc = fetch_pc;
+            resource.sgpr_base = sgpr;
+            if (cls == ResourceClass::VertexBuffer)
+                resource.fetch_index_mode = VertexFetchIndexMode::Vertex;
+            layer_rt.resources.push_back(resource);
+        };
+        add_resource(ResourceClass::ConstantBuffer, 2, 32, 16, 4, UINT32_MAX, 8);
+        add_resource(ResourceClass::VertexBuffer, 3, 64, 16, 2, 0x34, 8);
+        add_resource(ResourceClass::VertexBuffer, 4, 64, 16, 2, 0x5b, 8);
+        add_resource(ResourceClass::ConstantBuffer, 5, 32, 16, 4, 0x0c, UINT32_MAX);
+        add_resource(ResourceClass::ConstantBuffer, 6, 32, 16, 4, 0x1a, UINT32_MAX);
+        const auto layer_vs = recompile_vertex_chain(
+            layer_prolog.data(), layer_prolog.size(), layer_wrapper.data(),
+            layer_wrapper.size(), &layer_rt, nullptr, false, 2176);
+        CHECK(!layer_vs.empty() && layer_vs[0] == 0x07230203u,
+              "admitted chain actually recompiles its current ES fetches and layered record");
+        const auto& ctx = prosper::test::render_vk_ctx();
+        if (!layer_vs.empty() && ctx.geometry_shader_enabled && ctx.image_view_2d_on_3d) {
+            VkImageFormatProperties image_properties{};
+            constexpr VkImageUsageFlags usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+            if (vkGetPhysicalDeviceImageFormatProperties(
+                    ctx.phys, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_TYPE_3D,
+                    VK_IMAGE_TILING_OPTIMAL, usage,
+                    VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT, &image_properties) == VK_SUCCESS &&
+                image_properties.maxExtent.depth >= 32u) {
+                using namespace prosper::test;
+                // POS.xy and PARAM.xy occupy distinct halves of each current vertex record.
+                // The latter is deliberately mutated below while the former stays fixed.
+                std::array<uint32_t, 18> backing = {
+                    0x3f800000u, 0xbf800000u, 0x3f800000u, 0x3f800000u,
+                    0x3f800000u, 0x3f800000u, 0x3f800000u, 0x00000000u,
+                    0xbf800000u, 0xbf800000u, 0x00000000u, 0x3f800000u,
+                    0xbf800000u, 0x3f800000u, 0x00000000u, 0x00000000u,
+                    0u, 0u,
+                };
+                constexpr std::array<uint32_t, 8> constants = {
+                    0u, 0x3b11a2b4u, 0x43c80000u, 0xc3610000u,
+                    0x3f800000u, 0x3f800000u, 0u, 0u,
+                };
+                ResolvedPipelineState pipeline;
+                pipeline.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+                auto render_layered = [&](uint64_t target_id, bool forward_layer = true,
+                                          uint32_t instances = 32u) {
+                    BackendDraw draw;
+                    draw.vs = layer_vs;
+                    if (forward_layer)
+                        draw.gs.assign(kStripLayerForwardSpv.begin(),
+                                       kStripLayerForwardSpv.end());
+                    draw.fs.assign(std::begin(volume_fixture::param_fragment),
+                                   std::end(volume_fixture::param_fragment));
+                    draw.ps = &pipeline;
+                    draw.vcount = 4;
+                    draw.instance_count = instances;
+                    auto add_buffer = [&](uint32_t binding, const uint32_t* begin,
+                                          size_t count) {
+                        FrameResource resource;
+                        resource.set = 0;
+                        resource.binding = binding;
+                        resource.dwords.assign(begin, begin + count);
+                        draw.R.push_back(std::move(resource));
+                    };
+                    add_buffer(2, constants.data(), constants.size());
+                    add_buffer(3, backing.data() + 2, 16);
+                    add_buffer(4, backing.data(), 16);
+                    add_buffer(5, constants.data(), constants.size());
+                    add_buffer(6, constants.data(), constants.size());
+                    BackendColorTarget target;
+                    target.persistent_id = target_id;
+                    target.format = VK_FORMAT_R8G8B8A8_UNORM;
+                    target.volume_depth = target.volume_slice_count = 32;
+                    target.readback = true;
+                    return render_draws_rgba({std::move(draw)}, 32, 32, nullptr, nullptr,
+                                             false, &target);
+                };
+                const auto initial = render_layered(0x4c41594552000001ull);
+                auto center = [](const std::vector<uint8_t>& image, uint32_t layer) {
+                    const size_t offset = ((static_cast<size_t>(layer) * 32u + 16u) * 32u +
+                                           16u) * 4u;
+                    return offset + 3 < image.size()
+                        ? std::array<uint8_t, 4>{image[offset], image[offset + 1],
+                                                 image[offset + 2], image[offset + 3]}
+                        : std::array<uint8_t, 4>{};
+                };
+                CHECK(initial.size() == 32u * 32u * 32u * 4u,
+                      "source ES and forwarding GS complete a readable 32-slice image");
+                bool all_layers = initial.size() == 32u * 32u * 32u * 4u;
+                for (uint32_t layer = 0; layer < 32u && all_layers; ++layer) {
+                    const auto p = center(initial, layer);
+                    all_layers = p[0] >= 110u && p[0] <= 145u &&
+                                 p[1] >= 110u && p[1] <= 145u;
+                }
+                CHECK(all_layers, "all 32 layers receive independently fetched PARAM0 geometry");
+                const auto without_gs = render_layered(0x4c41594552000003ull, false);
+                CHECK(without_gs.size() == initial.size() &&
+                          center(without_gs, 0)[0] >= 110u &&
+                          center(without_gs, 31)[0] == 0u,
+                      "removing the forwarding GS leaves the last layer unwritten");
+                const auto one_instance = render_layered(0x4c41594552000004ull, true, 1u);
+                CHECK(one_instance.size() == initial.size() &&
+                          center(one_instance, 0)[0] >= 110u &&
+                          center(one_instance, 31)[0] == 0u,
+                      "one ES instance cannot impersonate 32 completed layer producers");
+                for (uint32_t vertex = 0; vertex < 4u; ++vertex)
+                    backing[vertex * 4u + 3u] = 0x3e800000u; // PARAM.y = 0.25
+                const auto changed = render_layered(0x4c41594552000002ull);
+                bool changed_param_only = changed.size() == initial.size();
+                for (uint32_t layer : {0u, 15u, 31u}) {
+                    const auto before = center(initial, layer);
+                    const auto after = center(changed, layer);
+                    changed_param_only &= before[0] == after[0] &&
+                        after[1] >= 55u && after[1] <= 75u &&
+                        before[1] > after[1] + 40u;
+                }
+                CHECK(changed_param_only,
+                      "a current PARAM mutation changes output without changing POS or layer");
+            }
+        }
+
+        auto changed_prolog = layer_prolog;
+        changed_prolog[0] ^= 1u;
+        CHECK(!rdna2_proven_strip_layer_chain(changed_prolog.data(), changed_prolog.size(),
+                                               layer_wrapper.data(), layer_wrapper.size()),
+              "same-address ES code mutation revokes the projection");
+        auto changed_wrapper = layer_wrapper;
+        changed_wrapper[20] ^= 1u;
+        CHECK(!rdna2_proven_strip_layer_chain(layer_prolog.data(), layer_prolog.size(),
+                                               changed_wrapper.data(), changed_wrapper.size()),
+              "same-address GS code mutation revokes the projection");
+        CHECK(recompile_vertex_chain(layer_prolog.data(), layer_prolog.size(),
+                                     changed_wrapper.data(), changed_wrapper.size(),
+                                     &layer_rt, nullptr, false, 2176).empty(),
+              "mutated wrapper cannot continue through the specialized vertex compiler");
+        CHECK(!rdna2_proven_strip_layer_chain(layer_prolog.data(), 100,
+                                               layer_wrapper.data(), layer_wrapper.size()) &&
+                  !rdna2_proven_strip_layer_chain(layer_prolog.data(), layer_prolog.size(),
+                                                   layer_wrapper.data(), 412),
+              "truncated linked code cannot authorize the projection");
+    }
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;

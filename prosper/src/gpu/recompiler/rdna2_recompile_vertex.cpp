@@ -83,6 +83,25 @@ static bool is_astro_bot_ngg_one_lane_wrapper(const uint32_t* code, size_t dword
            (program_dwords == 3917 && hash == 0x7f5f2349e2816f5eull);
 }
 
+bool rdna2_proven_strip_layer_chain(const uint32_t* prolog, size_t prolog_dwords,
+                                    const uint32_t* main, size_t main_dwords) {
+    if (!prolog || !main || prolog_dwords < 102u || main_dwords < 413u) return false;
+    // Many other draws share a fetch prolog. Check the bounded content identities before the
+    // decoder/CFG proof so they incur only two short reads on the common refusal path.
+    if (shader_program_hash(prolog, 101u) != 0x813c21106a687632ull ||
+        shader_program_hash(main, 413u) != 0x3d66efac7a7dbffdull)
+        return false;
+    const VertexPrologInfo info = rdna2_vertex_prolog_info(prolog, prolog_dwords);
+    if (!info.valid || info.prefix_dwords != 101u ||
+        rdna2_recompile_code_span(main, 413u) != 413u)
+        return false;
+    // The two complete machine-code bodies establish the seven-dword ES record and the GS
+    // wrapper's two strip primitives per instance. A same-address mutation must lose this
+    // projection. Shader resources remain current draw values; these hashes never authorize
+    // retaining guest bytes. The supported draw state is checked separately at realization.
+    return true;
+}
+
 VertexPrologInfo rdna2_vertex_prolog_info(const uint32_t* code, size_t dwords) {
     VertexPrologInfo result;
     if (!code || !dwords) return result;
@@ -156,6 +175,7 @@ namespace {
 // between independent Vulkan vertex invocations.
 struct NggPassthroughLayout {
     bool valid = false;
+    bool layer_varying = false;
     uint32_t producer_base_vgpr = 0;
     uint32_t producer_base_byte = 0;
     uint32_t record_stride_bytes = 0;
@@ -842,6 +862,10 @@ static std::vector<uint32_t> recompile_vertex_impl(const uint32_t* code, size_t 
                 const int32_t dword = passthrough->params[source][component];
                 value[component] = dword >= 0 ? record_load(dword) : b.uconst(0u);
             }
+            if (passthrough->layer_varying && source == 1u) {
+                b.export_param(1u, value[0], value[1], value[2], value[3]);
+                continue;
+            }
             if (!pixel_inputs || !(pixel_inputs->valid_mask & (1u << source))) {
                 if (!pixel_inputs || pixel_inputs->consumes(source))   // #2945
                     b.export_param(source, value[0], value[1], value[2], value[3]);
@@ -935,6 +959,21 @@ std::vector<uint32_t> recompile_vertex_chain(const uint32_t* prolog, size_t prol
     if (passthrough.valid) {
         return recompile_vertex_impl(prolog, info.prefix_dwords, rt, pixel_inputs,
                                      capture_position, virtual_lds_dwords, &passthrough, false,
+                                     false, diagnostic);
+    }
+    if (rdna2_proven_strip_layer_chain(prolog, prolog_dwords, main, main_dwords)) {
+        NggPassthroughLayout record;
+        record.valid = true;
+        record.producer_base_vgpr = 5u;
+        record.producer_base_byte = 0u;
+        record.record_stride_bytes = 28u;
+        record.position = {2, 3, 4, 5};
+        record.params[0] = {0, 1, -1, -1};
+        record.params[1] = {6, -1, -1, -1};
+        record.param_mask = 3u;
+        record.layer_varying = true;
+        return recompile_vertex_impl(prolog, info.prefix_dwords, rt, pixel_inputs,
+                                     capture_position, virtual_lds_dwords, &record, false,
                                      false, diagnostic);
     }
     std::vector<uint32_t> linked;
