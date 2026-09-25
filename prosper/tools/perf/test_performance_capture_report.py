@@ -40,6 +40,50 @@ SAMPLES = [
 
 
 class PerformanceCaptureReportTests(unittest.TestCase):
+    def test_renderer_spans_separate_callback_time_from_enclosing_wall_and_gaps(self):
+        # Multi-callback semantic submits: end minus summed callback duration is not their start.
+        rows = [dict(t_ns=end, span_start_t_ns=start, callbacks=2, total_ms=callback)
+                for start, end, callback in (
+                    (0, 10_000_000, 6), (15_000_000, 25_000_000, 7),
+                    (20_000_000, 30_000_000, 3), (40_000_000, 45_000_000, 2))]
+        span = summarize(capture(SAMPLES, renderer=rows))['renderer_span']
+        self.assertTrue(span['complete'])
+        self.assertEqual(span['callback_sum_ms'], 18)
+        self.assertEqual(span['span_sum_ms'], 35)
+        self.assertEqual(span['within_span_noncallback_sum_ms'], 17)
+        self.assertEqual(span['between_span_gap_count'], 2)
+        self.assertEqual(span['between_span_gap_sum_ms'], 15)
+        self.assertEqual(span['between_span_gap_median_ms'], 7.5)
+        self.assertEqual(span['between_span_gap_max_ms'], 10)
+        self.assertEqual(span['overlapping_spans'], 1)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            print_summary(summarize(capture(SAMPLES, renderer=rows)))
+        self.assertIn('within-span noncallback residual=+17.0ms', output.getvalue())
+        self.assertIn('neither is idle time or fresh-render FPS', output.getvalue())
+        one = summarize(capture(SAMPLES, renderer=rows[:1]))['renderer_span']
+        self.assertTrue(one['complete'])
+        self.assertIsNone(one['between_span_gap_count'])
+        first_partial = [dict(rows[0], span_start_t_ns=None), *rows[1:]]
+        interior = summarize(capture(SAMPLES, renderer=first_partial))['renderer_span']
+        self.assertFalse(interior['complete'])
+        self.assertTrue(interior['boundary_censored'])
+        self.assertTrue(interior['available'])
+        self.assertEqual(interior['between_span_gap_sum_ms'], 10)
+
+        # Older, partial, truncated, or inconsistent populations cannot silently become gaps.
+        for altered, dropped, expected in (
+                ([dict(rows[0]), dict(rows[1], span_start_t_ns=None), *rows[2:]],
+                 (0, 0), 'missing'),
+                (rows, (1, 0), 'dropped'),
+                ([dict(rows[0], span_start_t_ns='0'), *rows[1:]], (0, 0), 'invalid'),
+                ([dict(rows[0], total_ms=11), *rows[1:]], (0, 0), 'invalid')):
+            with self.subTest(expected=expected):
+                result = summarize(capture(SAMPLES, renderer=altered, dropped=dropped))['renderer_span']
+                self.assertFalse(result['available'])
+                self.assertGreater(result[expected], 0)
+                self.assertIsNone(result['between_span_gap_sum_ms'])
+
     def test_pending_queue_observations_keep_signed_deadlines_and_missing_samples(self):
         queue = dict(queued=123, active_submits=2, inflight_batches=1, front_item_age_ns=456,
                      release_delay_ns=-789, scope_begins=12, scope_ends=10, deadline_resets=3)
