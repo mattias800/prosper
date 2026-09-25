@@ -2332,10 +2332,10 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     }
     const bool vs_words_empty_pre = vs_shared ? vs_shared->empty() : vs.empty();
     const bool fs_words_empty_pre = fs_shared ? fs_shared->empty() : fs.empty();
-    const bool is_layered_volume_producer = !PROSPER_ENV_ON("PROSPER_NO_LAYERED_VOLUME") &&
-        is_layered_volume_producer_candidate(
-            LayeredVolumeCandidateContext{rs, ds, draw, vs_words_empty_pre, fs_words_empty_pre,
-                                          interpolation, pixel_input_ptr, vcount_hint});
+    const bool is_layered_volume_producer = is_layered_volume_producer_candidate(
+        LayeredVolumeCandidateContext{rs, ds, draw, vs_words_empty_pre, fs_words_empty_pre,
+                                      interpolation, pixel_input_ptr, vcount_hint,
+                                      PROSPER_ENV_ON("PROSPER_NO_LAYERED_VOLUME")});
     if (is_layered_volume_producer) {
         synthesize_layered_volume_producer(
             rs, draw ? draw->instance_count : ds.num_instances,

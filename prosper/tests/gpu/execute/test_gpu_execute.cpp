@@ -311,18 +311,42 @@ int main() {
         set_pgm(layered_vol, P::SPI_SHADER_PGM_LO_ES, P::SPI_SHADER_PGM_HI_ES, invalid_vs.data());
         DrawItem layered_item;
         OperationRealizationFailure fail{};
-        const bool made_layered = realize_draw_item(
-            layered_vol, &layered_vol.draws[0], 4u, 0x10000u, false, layered_item, &fail);
-        CHECK(made_layered, "layered volume producer realizes successfully when vertex recompile fails");
-        CHECK(layered_item.vs.size() == prosper::gpu::kLayeredVolumeVs.size() &&
-              layered_item.gs.size() == prosper::gpu::kLayeredVolumeGs.size(),
-              "realized draw carries synthesized layered VS and GS SPIR-V modules");
-        CHECK(layered_item.vertex_count == 3u && layered_item.indices.empty(),
-              "synthesized layered draw uses 3 non-indexed procedural vertices");
-        CHECK(layered_item.instance_count == 32u,
-              "synthesized layered draw renders 32 instances for the 32 volume slices");
-        CHECK(layered_item.ps.topology == 3u && layered_item.ps.cull_mode == 0u,
-              "synthesized layered draw sets TriangleList topology and disables culling");
+        const bool opt_out_active = PROSPER_ENV_ON("PROSPER_NO_LAYERED_VOLUME");
+        if (opt_out_active) {
+            CHECK(!made_layered && fail.reason == RealizationFailureReason::ShaderRecompile,
+                  "PROSPER_NO_LAYERED_VOLUME causes layered volume draw to fail with ShaderRecompile");
+        } else {
+            CHECK(made_layered, "layered volume producer realizes successfully when vertex recompile fails");
+            CHECK(layered_item.vs.size() == prosper::gpu::kLayeredVolumeVs.size() &&
+                  layered_item.gs.size() == prosper::gpu::kLayeredVolumeGs.size(),
+                  "realized draw carries synthesized layered VS and GS SPIR-V modules");
+            CHECK(layered_item.vertex_count == 3u && layered_item.indices.empty(),
+                  "synthesized layered draw uses 3 non-indexed procedural vertices");
+            CHECK(layered_item.instance_count == 32u,
+                  "synthesized layered draw renders 32 instances for the 32 volume slices");
+            CHECK(layered_item.ps.topology == 3u && layered_item.ps.cull_mode == 0u,
+                  "synthesized layered draw sets TriangleList topology and disables culling");
+        }
+
+        // Direct candidate predicate check exercising bypass_disabled explicitly.
+        const RenderState rs_candidate = parse_render_state(layered_vol);
+        FragmentInterpolationLayout candidate_interp{};
+        candidate_interp.valid = true;
+        candidate_interp.attribute_mask = 1u;
+        PixelInputMapping candidate_inputs{};
+        candidate_inputs.consumed_known = true;
+        candidate_inputs.consumed_mask = 1u;
+        LayeredVolumeCandidateContext candidate_ctx{
+            rs_candidate, layered_vol, &layered_vol.draws[0],
+            /*vs_empty=*/true, /*fs_empty=*/false,
+            candidate_interp, &candidate_inputs, /*vcount_hint=*/3u,
+            /*bypass_disabled=*/false
+        };
+        CHECK(is_layered_volume_producer_candidate(candidate_ctx),
+              "is_layered_volume_producer_candidate accepts valid volume context when bypass is not disabled");
+        candidate_ctx.bypass_disabled = true;
+        CHECK(!is_layered_volume_producer_candidate(candidate_ctx),
+              "is_layered_volume_producer_candidate declines when bypass_disabled is true");
 
         // Control: a non-volume 2D target (slice_count == 1) does not qualify for the layered volume
         // bypass, so it declines with ShaderRecompile when the vertex stage fails to recompile.

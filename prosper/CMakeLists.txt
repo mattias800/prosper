@@ -4211,6 +4211,9 @@ endif()
       target_include_directories(test_gpu_execute PRIVATE frontends)
       target_link_libraries(test_gpu_execute PRIVATE prosper_core Vulkan::Vulkan)
       add_test(NAME gpu_execute COMMAND test_gpu_execute)
+      add_test(NAME gpu_execute_no_layered_volume COMMAND test_gpu_execute)
+      set_tests_properties(gpu_execute_no_layered_volume PROPERTIES
+        ENVIRONMENT "PROSPER_NO_LAYERED_VOLUME=1")
 
       # Payoff demo: recompile the GAME'S OWN embedded shaders and render them on real Vulkan.
       # Needs both Vulkan and the (gitignored) game dump, so it's gated on HAVE_GAME_DUMP.
