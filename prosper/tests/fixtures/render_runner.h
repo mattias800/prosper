@@ -18,6 +18,7 @@
 #include "gpu/execute/host_read_barrier.hpp"   // the availability half of a readback (#2944/#3249)
 #include "gpu/execute/float_controls_probe.hpp" // #3479: the device gate on SignedZeroInfNanPreserve
 #include "gpu/diagnostics/diagnostic_selectors.hpp"
+#include "gpu/diagnostics/draw_disposition.hpp"  // why a draw did not reach the GPU
 #include "gpu/diagnostics/geometry_probe_arming.hpp"
 #include "gpu/diagnostics/vk_object_names.hpp"   // #3578: name guest shaders for RenderDoc/RGP
 #include "diagnostics/env_cache.hpp"       // PROSPER_ENV_ON / _VALUE: cached reads on per-draw paths
@@ -9513,6 +9514,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     for (size_t di = 0; di < draws.size(); di++) {
         // Denominator: every draw this pass considers, recorded before any skip path can divert it.
         if (wave64_census) wave64_stats.note_draw(W, H);
+        prosper::gpu::draw_disposition_census().note_seen();
         const auto setup_begin = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
         const BackendDraw& bd = draws[di];
         const std::vector<uint32_t>& bd_vs = bd.vs_words();
@@ -9539,6 +9541,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 std::fprintf(stderr,
                     "[render] draw=%zu fragment Geometry capability unavailable; skipped\n", di);
                 texture_path_census.skipped_draw();
+                prosper::gpu::draw_disposition_census().note_dropped(
+                    prosper::gpu::DrawDrop::GeometryCapability);
                 continue;
             }
         }
@@ -9556,6 +9560,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                     ctx.mesh_shader_properties.maxMeshWorkGroupTotalCount / groups_xy)) {
                 std::fprintf(stderr, "[mesh] draw=%zu unsupported device or group shape; skipped\n", di);
                 texture_path_census.skipped_draw();
+                prosper::gpu::draw_disposition_census().note_dropped(
+                    prosper::gpu::DrawDrop::MeshShape);
                 continue;
             }
             v.mesh_draw = true;
@@ -9814,6 +9820,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 wave64_stats.note_skip(W, H, reason_mask);
             }
             texture_path_census.skipped_draw();
+            prosper::gpu::draw_disposition_census().note_dropped(
+                prosper::gpu::DrawDrop::SubgroupFeatures);
             continue;
         }
         if (uses_internal_gds && !render_internal_gds_buffer().buffer) {
@@ -9823,6 +9831,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                              "[render] skip draw: failed to allocate persistent GDS buffer\n");
             });
             texture_path_census.skipped_draw();
+            prosper::gpu::draw_disposition_census().note_dropped(
+                prosper::gpu::DrawDrop::GdsAllocation);
             continue;
         }
         if (backend_trace) {
@@ -11504,6 +11514,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             }
             if (!buffer_resources_ready) {
                 texture_path_census.skipped_draw();
+                prosper::gpu::draw_disposition_census().note_dropped(
+                    prosper::gpu::DrawDrop::BufferResources);
                 continue;
             }
             const ResourcePhaseTimer phase_descriptor(timing_enabled, &res_descriptor_ms);
@@ -11900,6 +11912,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                     setup_pipeline_ms += setup_elapsed_ms(
                         setup_resources_ready, setup_pipeline_key_ready);
                 texture_path_census.skipped_draw();
+                prosper::gpu::draw_disposition_census().note_dropped(
+                    prosper::gpu::DrawDrop::ShaderRejected);
                 continue;   // rejected SPIR-V -> skip this draw
             }
             st[0].module = v.vs;
@@ -12878,7 +12892,11 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 (dsc.aspectMask & VK_IMAGE_ASPECT_DEPTH_BIT))
                 backend_depth_clear_probe_armed_count().fetch_add(1);
         }
-        if (!v.ok) continue;
+        if (!v.ok) {
+            prosper::gpu::draw_disposition_census().note_dropped(
+                prosper::gpu::DrawDrop::PipelineCreation);
+            continue;
+        }
         if (ds_active) {
             vkCmdBeginQuery(cmd, ds_stats_pool, static_cast<uint32_t>(di), 0);
             vkCmdBeginQuery(cmd, ds_occ_pool, static_cast<uint32_t>(di),
@@ -12940,6 +12958,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             std::fprintf(stderr, "\n");
             std::fflush(stderr);
         }
+        prosper::gpu::draw_disposition_census().note_recorded();
         if (v.mesh_draw) {
             ctx.cmd_draw_mesh_tasks(cmd, v.mesh_groups[0], v.mesh_groups[1], v.mesh_groups[2]);
         } else if (v.icount) {
@@ -14142,6 +14161,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                    evict_persistent_color_target(*ctx_ptr, color_target_generation)) {}
         });
     volume_attachment_view.release();
+    prosper::gpu::draw_disposition_census().report_pass();
     if (flush_now) active_submission.complete();
     if (!flush_now || batch_completed) volume_attempt.release();
     if (timing_enabled) {

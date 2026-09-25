@@ -2032,6 +2032,14 @@ if(TARGET prosper_core)
   target_include_directories(test_diag_ratelimit PRIVATE src)
   add_test(NAME diag_ratelimit COMMAND test_diag_ratelimit)
 
+  # Classified draw disposition: six involuntary drop paths folded into one counter, two of them
+  # silent. Pins that a healthy pass stays quiet, that a drop names its mechanism, and that the
+  # census reports an unnamed drop path as UNACCOUNTED rather than absorbing it.
+  add_executable(test_draw_disposition tests/gpu/diagnostics/test_draw_disposition.cpp
+                 src/gpu/diagnostics/draw_disposition.cpp)
+  target_include_directories(test_draw_disposition PRIVATE src)
+  add_test(NAME draw_disposition COMMAND test_draw_disposition)
+
   # IME keyboard event delivery (issue #1093): sceImeUpdate must invoke the guest handler
   # per queued key event; the old stub delivered none.
   add_executable(test_ime_input tests/hle/input/test_ime_input.cpp)
