@@ -19,6 +19,15 @@ from the tracker issues, and still gated, because it is a projection of state ra
 > title's current state — for that, read the tracker. Nothing is ever removed when a title moves on,
 > because the point of a blog is that it records *when* things happened.
 
+## 2026-09-25
+
+### Kena: Bridge of Spirits draws its 3D shrine behind the title menu
+
+On a default Linux launch, the forest shrine, stones and lanterns now render behind the *Kena* main menu instead of black. It does not hold yet: watched live, the background cycles between this scene, black and other backgrounds, so this is progress toward the title screen, not a finished one. [#3857](https://github.com/mattias800/prosper/pull/3857).
+
+![Kena: Bridge of Spirits main menu before: the menu options draw over a black background](assets/screenshots/kena-main-menu.webp)
+![Kena: Bridge of Spirits main menu after: the forest shrine, stones, lanterns and trees behind New Game / Load Game / Options; tools/screenshot, default launch, no pad route, t=72 s, Linux RADV](assets/screenshots/kena-main-menu-shrine-default.webp)
+
 ## 2026-09-23
 
 ### Blue Prince and Evergate get back pixels NVIDIA was dropping

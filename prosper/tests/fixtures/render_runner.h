@@ -9519,6 +9519,12 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         const std::vector<uint32_t>& bd_gs = bd.gs_words();
         const std::vector<uint32_t>& bd_fs = bd.fs_words();
         DV& v = dv[di];
+        if (!ctx.geometry_shader_enabled && !bd_gs.empty()) {
+            std::fprintf(stderr,
+                "[render] draw=%zu geometry stage unavailable; skipped\n", di);
+            texture_path_census.skipped_draw();
+            continue;
+        }
         if (!ctx.geometry_shader_enabled && bd_fs.size() >= 5 &&
             bd_fs[0] == 0x07230203u) {
             // Fragment BuiltIn Layer declares the Geometry SPIR-V capability even

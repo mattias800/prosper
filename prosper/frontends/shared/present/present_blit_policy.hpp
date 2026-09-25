@@ -32,4 +32,13 @@ constexpr bool present_source_is_newer(bool have_presented_source,
     return !have_presented_source || candidate_flip > last_presented_flip;
 }
 
+// GPU scanout frames acquired from the ring buffer represent newly completed GPU blits.
+// A GPU publication is displayable if it is newer than or updates the currently displayed
+// guest flip. Only strictly older flips (reordered/stale) are rejected.
+constexpr bool gpu_present_frame_is_newer(bool have_presented_source,
+                                          uint64_t last_presented_flip,
+                                          uint64_t candidate_flip) {
+    return !have_presented_source || candidate_flip >= last_presented_flip;
+}
+
 } // namespace prosper::frontend

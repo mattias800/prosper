@@ -18,6 +18,8 @@
 #include "gpu/pm4/pm4_registers.hpp"        // CB_COLOR_CONTROL operation decode
 #include <cstring>                 // memcpy: aliasing-safe index-buffer fingerprint loads
 #include "gpu/recompiler/rdna2_to_spirv.hpp"      // recompile_vertex / recompile_fragment
+#include "gpu/execute/layered_volume_target.hpp"
+#include "gpu/recompiler/spirv/strip_layer_forward_spv.hpp"
 #include "gpu/resources/shader_resources.hpp"    // ShaderResourceTable
 #include "gpu/resources/compressed_source_authority.hpp"  // CompressionMetadataKind
 #include "gpu/agc/agc_shader_layout.hpp"   // DecodedBufferDescriptor (DynFetch)
@@ -44,6 +46,44 @@ extern "C" uint64_t prosper_agc_shader_continuation_for_code(uint64_t code_addr)
 namespace prosper::gpu {
 
 struct ShaderResourceTable;   // fwd (shader_resources.hpp); passed to the backend so it can bind resources
+
+// Exact draw-side admission for the proved seven-dword ES/GS record. The shader-code match
+// establishes the record and wrapper; this separate state proof establishes that a host strip
+// plus a forwarding geometry stage has the same visible primitives and layer. Keep the shape
+// serializable so raw-shader replay can make the same decision from the captured draw.
+struct StripLayerDrawState {
+    uint32_t vertex_count = 0, instance_count = 0, topology = 0;
+    bool indexed = false;
+    uint64_t modifier = 0;
+    int64_t vertex_offset = 0;
+    uint32_t target_width = 0, target_height = 0;
+    uint32_t volume_depth = 0, first_slice = 0, slice_count = 0, slice_max = 0;
+    uint32_t cull_mode = 0;
+    bool depth_test = false, depth_write = false, stencil = false;
+    bool other_geometry = false, rect_synthesis = false;
+    uint32_t attribute_mask = 0, flat_mask = 0, passthrough_mask = 0;
+    uint32_t pixel_valid_mask = 0, pixel_control0 = 0;
+    uint32_t ps_input_ena = 0, ps_input_addr = 0;
+};
+
+constexpr bool strip_layer_draw_admitted(const StripLayerDrawState& state) {
+    // Modifier bit 31 is carried verbatim by the current AGC packet path. Its full guest meaning
+    // is not decoded, so accept only the complete value observed with this exact code and state;
+    // no other modifier bits gain an equivalence claim. The effective vertex/instance offsets
+    // and all render-visible state are checked independently.
+    return state.vertex_count == 4u && state.instance_count == 32u &&
+           state.topology == 4u && !state.indexed &&
+           state.modifier == 0x80000000ull && state.vertex_offset == 0 &&
+           state.target_width == 32u && state.target_height == 32u &&
+           state.volume_depth == 32u && state.first_slice == 0u &&
+           state.slice_count == 32u && state.slice_max == 32u &&
+           !state.cull_mode && !state.depth_test && !state.depth_write &&
+           !state.stencil && !state.other_geometry && !state.rect_synthesis &&
+           (state.attribute_mask & ~1u) == 0u && !state.flat_mask &&
+           !state.passthrough_mask && (state.pixel_valid_mask & 1u) &&
+           state.pixel_control0 == 0u &&
+           state.ps_input_ena == 0x2020u && state.ps_input_addr == 0x2020u;
+}
 
 // Generation-scoped host-readability guard used while a synchronous GPU submit is active. Positive
 // mapping ranges are cached for that submit only and discarded before guest code can reuse an address.
@@ -2318,8 +2358,6 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
         fs = kNullExportFragment;
         fs_identity = 0;
     }
-    const std::vector<uint32_t>& vs_words = vs_shared ? *vs_shared : vs;
-    const std::vector<uint32_t>& fs_words = fs_shared ? *fs_shared : fs;
     std::vector<uint32_t> gs;
     if ((interpolation.requires_geometry || rect_list_synthesis) && interpolation.valid) {
         // Geometry `Triangles` accepts list, strip, and fan input assembly. Points/lines cannot
@@ -2331,6 +2369,79 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
                 interpolation, PROSPER_ENV_ON("PROSPER_GEOM_PROBE"),
                 rect_list_synthesis);
     }
+    const bool diagnostic_layered_volume =
+        (PROSPER_ENV_ON("PROSPER_LAYERED_VOLUME_FALLBACK") ||
+         PROSPER_ENV_ON("PROSPER_SYNTHESIZE_LAYERED_VOLUME")) &&
+        !PROSPER_ENV_ON("PROSPER_NO_LAYERED_VOLUME");
+    const bool strip_layer_chain = vertex_chain && rdna2_proven_strip_layer_chain(
+        reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(rs.es_addr)), vertex_dwords,
+        reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(chain_addr)), chain_dwords);
+    if (strip_layer_chain && diagnostic_layered_volume) {
+        // Same-binary A/B: the diagnostic fixed-triangle fallback below takes this draw instead
+        // of the source-record projection, so both LUT producers can be compared on one route.
+        vs.clear();
+        vs_shared.reset();
+        vs_identity = 0;
+    } else if (strip_layer_chain) {
+        const auto view = color_target_volume_view(rs.color_targets[0]);
+        // The proved wrapper produces two triangles from four logical vertices per instance.
+        // Its record layer is constant-buffer word 0 plus the instance index; admission cannot
+        // see that CB value, so a nonzero base would push layers past the 32-slice view (#3868).
+        // Other topology, offsets, view bases and consumers need a different primitive/layer
+        // proof and keep the prior visible reject.
+        // Vulkan may rotate a geometry shader's three input vertices, but smooth PARAM0
+        // interpolation is permutation-invariant. Reject cull/flat/front-face-sensitive state.
+        StripLayerDrawState layer_state;
+        layer_state.vertex_count = vcount_hint;
+        layer_state.instance_count = draw ? draw->instance_count : ds.num_instances;
+        layer_state.topology = resolved_pipeline.topology;
+        layer_state.indexed = draw && draw->indexed;
+        layer_state.modifier = draw ? draw->modifier : 0;
+        layer_state.vertex_offset = draw && draw->has_vertex_offset_override
+            ? static_cast<int64_t>(draw->indirect_vertex_offset)
+            : static_cast<int64_t>(rs.ge_indx_offset);
+        layer_state.target_width = rs.color_targets[0].width;
+        layer_state.target_height = rs.color_targets[0].height;
+        layer_state.volume_depth = view.selected_mip_depth;
+        layer_state.first_slice = view.first_slice;
+        layer_state.slice_count = view.slice_count;
+        layer_state.slice_max = rs.color_targets[0].slice_max;
+        layer_state.cull_mode = resolved_pipeline.cull_mode;
+        layer_state.depth_test = resolved_pipeline.depth_test_enable;
+        layer_state.depth_write = resolved_pipeline.depth_write_enable;
+        layer_state.stencil = resolved_pipeline.stencil_enable;
+        layer_state.other_geometry = interpolation.requires_geometry;
+        layer_state.rect_synthesis = rect_list_synthesis;
+        layer_state.attribute_mask = interpolation.attribute_mask;
+        layer_state.flat_mask = interpolation.flat_mask;
+        layer_state.passthrough_mask = interpolation.passthrough_mask;
+        layer_state.pixel_valid_mask = pixel_inputs.valid_mask;
+        layer_state.pixel_control0 = pixel_inputs.controls[0];
+        layer_state.ps_input_ena = rs.ps_input_ena;
+        layer_state.ps_input_addr = rs.ps_input_addr;
+        if (!draw || draw->indirect || draw->has_vertex_offset_override ||
+            !strip_layer_draw_admitted(layer_state)) {
+            if (failure) failure->reason = RealizationFailureReason::ShaderRecompile;
+            if (log) std::fprintf(stderr,
+                                  "[exec] skip draw: proved strip-layer chain has unsupported draw state\n");
+            return false;
+        }
+        gs.assign(kStripLayerForwardSpv.begin(), kStripLayerForwardSpv.end());
+    }
+    const bool vs_words_empty_pre = vs_shared ? vs_shared->empty() : vs.empty();
+    const bool fs_words_empty_pre = fs_shared ? fs_shared->empty() : fs.empty();
+    const bool is_layered_volume_producer = is_layered_volume_producer_candidate(
+        LayeredVolumeCandidateContext{rs, ds, draw, vs_words_empty_pre, fs_words_empty_pre,
+                                      interpolation, pixel_input_ptr, vcount_hint,
+                                      resolved_pipeline.topology, resolved_pipeline.cull_mode,
+                                      diagnostic_layered_volume});
+    if (is_layered_volume_producer) {
+        synthesize_layered_volume_producer(
+            rs, draw ? draw->instance_count : ds.num_instances,
+            LayeredVolumeSynthesisOutput{vs, gs, vs_shared, vs_identity, vrt}, log);
+    }
+    const std::vector<uint32_t>& vs_words = vs_shared ? *vs_shared : vs;
+    const std::vector<uint32_t>& fs_words = fs_shared ? *fs_shared : fs;
     if (phase_timing) {
         const auto shader_done = std::chrono::steady_clock::now();
         record_draw_realization_phases(
@@ -2479,6 +2590,10 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
         return false;
     }
     ResolvedPipelineState ps = resolved_pipeline;
+    if (is_layered_volume_producer) {
+        ps.topology = 3u; // VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST
+        ps.cull_mode = 0u; // VK_CULL_MODE_NONE
+    }
     // EXP.EN is the final per-component gate after CB_TARGET_MASK and CB_SHADER_MASK. Vulkan exposes
     // the same preservation semantics through colorWriteMask: disabled attachment components retain
     // their old values even though the fragment output itself is a full vec4.
@@ -2710,6 +2825,10 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
         vertex_count = 4u;
         if (log) fprintf(stderr, "[exec] RectList: expanded procedural 3-vertex rectangle to 4-vertex strip\n");
     }
+    if (is_layered_volume_producer) {
+        vertex_count = 3u;
+        out.indices.clear();
+    }
     // Bindless per-glyph vertex fetch (#257): the fetch-shader patches a SMALL per-glyph V# (num_records=4
     // = one glyph's 4 corners, size=304). But the draw indexes ALL vertices (gl_VertexIndex 0..N-1) out of
     // the CONTIGUOUS vertex pool that begins at that base — so uploading only num_records*stride bytes
@@ -2826,14 +2945,24 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     // #1256: record the raw draw-packet state (pre-realization) so a capture can be checked offline for
     // realization divergence. vcount_hint is the DrawIndexAuto/DrawIndex index_count decoded from the guest.
     out.raw_draw_count = vcount_hint; out.raw_indexed = (draw && draw->indexed);
-    out.rect_list_synthesis = rect_list_synthesis;
     out.raw_draw_modifier = draw ? draw->modifier : 0;
-    out.vertex_offset = draw && draw->has_vertex_offset_override
-        ? draw->indirect_vertex_offset
-        : static_cast<int32_t>(rs.ge_indx_offset);
+    out.rect_list_synthesis = rect_list_synthesis;
+    int32_t vertex_offset = static_cast<int32_t>(rs.ge_indx_offset);
+    if (draw && draw->has_vertex_offset_override) {
+        vertex_offset = draw->indirect_vertex_offset;
+    }
+    if (is_layered_volume_producer) {
+        vertex_offset = 0;
+    }
+    out.vertex_offset = vertex_offset;
     // The draw record is authoritative even in folded mode: register state may change after the
     // last draw, while IT_NUM_INSTANCES belongs to the draw at the moment it executes.
-    out.instance_count = draw ? draw->instance_count : ds.num_instances;
+    uint32_t instance_count = draw ? draw->instance_count : ds.num_instances;
+    if (is_layered_volume_producer) {
+        instance_count = std::max(instance_count,
+                                  color_target_volume_view(rs.color_targets[0]).slice_count);
+    }
+    out.instance_count = instance_count;
     out.color0_base = rs.color0_base;   // render-to-texture: the target this draw writes into (#167)
     out.color0_width = rs.color0_width; out.color0_height = rs.color0_height; // per-target extent (#526)
     out.color1_base = rs.color1_base;

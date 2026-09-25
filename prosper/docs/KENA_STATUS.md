@@ -136,6 +136,32 @@ linked back/chain body. This traced pair is also **not** the final compositor. T
 vertex SPIR-V stores Locations 0–3. Trace the exact earlier pass changed by the probe and establish its
 PS5 input contract before changing generic interpolation semantics.
 
+### Title-menu 3D scene on a default launch (2026-09-25, #3857)
+
+The 32³ colour-grading LUT producer now executes on a default Linux/RADV launch. It is lowered as a
+**source-record strip**: the merged ES prolog is recompiled normally, so it fetches the draw's current
+POS/PARAM bindings. The GS body, which only copies each seven-dword record into two strip primitives
+and exports the instance as the layer, is replaced by a direct projection of that record plus a
+forwarding geometry stage. Admission requires both complete code bodies (content, never address) and
+the exact observed draw state; anything else keeps the `ShaderRecompile` refusal.
+
+- **The LUT is the reference LUT.** A live 131,072-byte readback of the 32³ target is byte-identical
+  under this lowering and under the diagnostic fixed-triangle producer
+  (`PROSPER_LAYERED_VOLUME_FALLBACK=1`), and matches an earlier run of this lowering's source-driven precursor. The
+  red, green and blue ramps follow x, y and z, corner 000 is black, and the far corner is near white.
+- **The menu scene renders on the unmodified default route.** Three `tools/screenshot` runs of the
+  exact committed binary, with no pad route and the UE4 recipe: one showed the full forest shrine
+  (t=72 s), one a dim version of it, and one no scene but a single near-white frame. Every run still
+  alternates with fully black composited frames, the pre-existing defect noted above. The near-white
+  frame is unexplained and also appeared in an earlier run of the same lowering.
+- **Watched live in `prosper-app`, the background does not hold.** It cycles between the shrine scene,
+  black and other backgrounds. This is visible and **release-blocking**, though not merge-blocking for
+  the LUT lowering, whose LUT is byte-identical to the reference. The next Kena work is to
+  characterise the cycle with F9 bundles: which images alternate, and whether the compositor's
+  inputs or its LUT change between them.
+- This does not touch the gameplay world, the 64³ volume producers (their instance counts are not
+  admitted), or the #3835 scene/interpolant contract.
+
 ## Reproduction
 
 ```bash
@@ -197,6 +223,12 @@ About 2 in 12 launches hang before their first frame (no raw scanout either). No
   `0x30096e0000` pair. Exact-pair logging names one fused front program, no chain, and no linked second body;
   its decoded entry ends without a PARAM export. This says nothing about the separate final compositor pair (#3835).
 
+- **The source-record strip lowering produces a different 32³ LUT from the fixed-triangle reference**
+  — false. Live readbacks of `0x309d3f0000` are byte-identical (131,072 bytes, 90,212 nonzero) in
+  both arms of one binary, and identical to an earlier run of the lowering's precursor (#3857).
+- **The title-menu forest appears only because the persistent-readback diagnostic serializes the
+  frame** — false. Runs with no diagnostic environment render the shrine: the committed binary at
+  t=72 s, and a binary that also carried the unarmed readback code at t=42 s (#3857).
 ## Next
 
 - Confirm that the black gameplay world (and the menu background) is the wave64 skip, on a 64-wide device or with

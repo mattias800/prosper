@@ -170,6 +170,7 @@ struct RttSurf {
     // Consumers need this to compose their T# DST_SEL with the host image's component order.
     VkFormat guest_format = VK_FORMAT_UNDEFINED;
     bool gpu_valid = false;
+    uint64_t gpu_mutation = 0;
     // A color target can be cleared by a compute write to its DCC metadata rather than by a
     // color-plane write. Remember the sampled descriptor's metadata range so that write can
     // invalidate the retained CPU/GPU target just like a write to the color plane itself.
@@ -9440,6 +9441,23 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         (unsigned long long)present_frames_stored.load(std::memory_order_relaxed),
                         (unsigned long long)present_frames_served.load(std::memory_order_relaxed));
             };
+            const int      vo_n     = prosper_vo_buffer_count();
+            const int      vo_front = prosper::gpu::present_front_index();
+            prosper::VideoOutBufferSnapshot front_snapshot;
+            const bool     have_front = prosper::videoout_front_snapshot(front_snapshot);
+            const int      front    = have_front ? front_snapshot.buffer_index : vo_front;
+            const uint64_t front_va = have_front ? front_snapshot.address
+                : (vo_front >= 0 ? prosper_vo_buffer_addr(vo_front) : 0);
+            const uint64_t front_flip = have_front ? front_snapshot.source_flip_seq : 0;
+            bool submit_wrote_front = false;
+            bool submit_wrote_vo = false;
+            auto is_vo_target = [&](uint64_t addr) {
+                if (!addr) return false;
+                for (int i = 0; i < vo_n; ++i) {
+                    if (prosper_vo_buffer_addr(i) == addr) return true;
+                }
+                return false;
+            };
             if (pertarget) {
                 // PER-TARGET RTT: a real frame is a sequence of passes, each rendering into a specific
                 // color target (CB_COLOR0_BASE), and a final composite pass SAMPLES the earlier targets.
@@ -9462,12 +9480,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 // screen, i.e. the RTT group whose color-target VA is a registered VideoOut buffer
                 // (preferring the CURRENT front buffer — the in-stream SetFlip fires during the Dcb
                 // fold, before this render, so present_front_index() is this frame's scanout choice).
-                const int      vo_n     = prosper_vo_buffer_count();
-                const int      vo_front = prosper::gpu::present_front_index();
-                const uint64_t front_va = vo_front >= 0 ? prosper_vo_buffer_addr(vo_front) : 0;
                 if (rtt_log) {
                     fprintf(stderr, "[rtt] flip state: front=%d va=0x%llx of %d registered:",
-                            vo_front, (unsigned long long)front_va, vo_n);
+                            front, (unsigned long long)front_va, vo_n);
                     for (int i = 0; i < vo_n && i < 8; i++)
                         fprintf(stderr, " [%d]=0x%llx", i, (unsigned long long)prosper_vo_buffer_addr(i));
                     fprintf(stderr, "\n");
@@ -10818,6 +10833,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                               prosper::test::persistent_color_producer_source(*completed_target))
                         : 0;
                     if (base && color_target_call.writes) {
+                        if (base == front_va || (have_front && base == front_snapshot.address))
+                            submit_wrote_front = true;
+                        if (is_vo) submit_wrote_vo = true;
                         RttSurf& surface = g_rtt[base];
                         surface.w = gw;
                         surface.h = gh;
@@ -10836,6 +10854,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         surface.gpu_valid = prosper::test::find_persistent_color_target(
                             base, gw, gh, pass_format, true,
                             backend_target.volume_depth) != nullptr;
+                        surface.gpu_mutation = completed_target ? completed_target->mutation : 0;
                         if (!pass_pixels->empty()) surface.rgba = pass_pixels;
                         else surface.rgba.reset();
                         // GTA V builds its packed-HDR bloom pyramid as separate CB_COLOR targets,
@@ -10861,10 +10880,14 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     std::vector<uint8_t> materialized;
                                     std::string error;
                                     if (prosper::test::readback_persistent_color_target(
-                                            base, gw, gh, pass_format, materialized, error))
+                                            base, gw, gh, pass_format, materialized, error)) {
                                         surface.rgba =
                                             std::make_shared<const std::vector<uint8_t>>(
                                                 std::move(materialized));
+                                        const auto* ct = prosper::test::find_persistent_color_target(
+                                            base, gw, gh, pass_format);
+                                        surface.gpu_mutation = ct ? ct->mutation : 0;
+                                    }
                                 }
                             }
                         }
@@ -10888,6 +10911,13 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     for (uint32_t slot = 1; slot < mrt_count; ++slot) {
                         auto& pixels = mrt_outputs.colors[slot];
                         if (!pass_bases[slot]) continue;  // transient attachment for a sparse export hole
+                        if (color_target_call.writes) {
+                            if (pass_bases[slot] == front_va ||
+                                (have_front && pass_bases[slot] == front_snapshot.address))
+                                submit_wrote_front = true;
+                            if (is_vo_target(pass_bases[slot]))
+                                submit_wrote_vo = true;
+                        }
                         if (rtt_log && !pixels.empty()) {
                             size_t nz = 0, rgb_nz = 0;
                             for (uint8_t byte : pixels) nz += byte != 0;
@@ -10952,6 +10982,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         surface.gpu_valid =
                             prosper::test::find_persistent_color_target(
                                 pass_bases[slot], gw, gh, pass_formats[slot]) != nullptr;
+                        const auto* ct = prosper::test::find_persistent_color_target(
+                            pass_bases[slot], gw, gh, pass_formats[slot]);
+                        surface.gpu_mutation = ct ? ct->mutation : 0;
                         pin_renderer_mip_target(pass_bases[slot], gw, gh, pass_formats[slot],
                                                 surface.gpu_valid);
                         if (!pixels.empty())
@@ -11738,7 +11771,11 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     if ((!surface.rgba || surface.rgba->size() != expected) &&
                         surface.has_uniform_color)
                         materialize_uniform_rtt(surface);
-                    if ((!surface.rgba || surface.rgba->size() != expected) && surface.gpu_valid) {
+                    const auto* tgt = surface.gpu_valid
+                        ? prosper::test::find_persistent_color_target(addr, w, h, surface.format)
+                        : nullptr;
+                    const bool mutation_changed = tgt && tgt->mutation != surface.gpu_mutation;
+                    if ((!surface.rgba || surface.rgba->size() != expected || mutation_changed) && surface.gpu_valid) {
                         std::vector<uint8_t> materialized;
                         std::string error;
                         if (prosper::test::readback_persistent_color_target(
@@ -11746,6 +11783,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             materialized.size() == expected) {
                             surface.rgba = std::make_shared<const std::vector<uint8_t>>(
                                 std::move(materialized));
+                            surface.gpu_mutation = tgt ? tgt->mutation : 0;
                         } else {
                             static std::atomic<int> warned{0};
                             if (warned.fetch_add(1) < 24)
@@ -11759,13 +11797,6 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     }
                     return surface.rgba && surface.rgba->size() == expected ? &surface : nullptr;
                 };
-                prosper::VideoOutBufferSnapshot front_snapshot;
-                const bool have_front = prosper::videoout_front_snapshot(front_snapshot);
-                const int front = have_front ? front_snapshot.buffer_index : -1;
-                // Selection, address, registration generation, and originating HLE flip are one
-                // registry-locked snapshot. The global flip and present counters can cross-pair
-                // when guest and GPU flip submitters interleave, so neither may label this image.
-                const uint64_t front_flip = have_front ? front_snapshot.source_flip_seq : 0;
                 static uint64_t last_gpu_publish_flip = UINT64_MAX;
                 const uint64_t current_flip = prosper_vo_flip_count();
                 const bool new_gpu_flip = front_flip && prosper::frontend::present_blit_has_new_flip(
@@ -11774,25 +11805,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 if (handoff_trace.active)
                     handoff_trace.emit(prosper::perf::PresentHandoffEvent::RendererGate, front, 0, prosper::gpu::present_count(),
                                        front >= 0 ? prosper_vo_buffer_addr(front) : 0);
-                // GPU present (#1270): when prosper-app has adopted this device and is consuming the
-                // front-buffer image directly, blit it into a scanout slot on the GPU and SKIP the CPU
-                // readback+reupload entirely. gpu_present_active() is false in every headless/test/
-                // screenshot process, so this whole branch is inert there and the CPU path below is
-                // byte-for-byte unchanged. On a MISS (image not resident/valid this frame) this falls
-                // through to the CPU readback below, which still publishes a CPU frame; prosper-app
-                // presents that CPU frame when no GPU frame was published (main.cpp), so a miss degrades to
-                // the CPU present path rather than freezing the window.
-                if (front >= 0 && front_flip && prosper::gpu::gpu_present_active() && !new_gpu_flip) {
-                    // The previously published slot remains the correct scanout for this guest
-                    // flip. Treat it as a successful GPU publication so intermediate render
-                    // submissions do not fall through to the expensive CPU readback path.
-                    published_gpu = true;
-                    handoff_trace.emit(prosper::perf::PresentHandoffEvent::SameFlipSuppressed, 0, 0, last_gpu_publish_flip);
-                } else if (front >= 0 && front_flip && prosper::gpu::gpu_present_active()) {
-                    const uint64_t front_va = front_snapshot.address;
-                    auto rit = g_rtt.find(front_va);
-                    if (rit != g_rtt.end() && !rit->second.volume_depth &&
-                        rit->second.gpu_valid && rit->second.w && rit->second.h) {
+                auto rit = front_va ? g_rtt.find(front_va) : g_rtt.end();
+                const bool renderer_owns_front = rit != g_rtt.end() && !rit->second.volume_depth &&
+                    rit->second.gpu_valid && rit->second.w && rit->second.h;
+
+                if (front >= 0 && front_flip && prosper::gpu::gpu_present_active() && renderer_owns_front) {
+                    if (submit_wrote_front) {
                         const VkFormat fmt = prosper::test::backend_color_format(rit->second.format);
                         // The cache key is only a lookup hint. Hold its resource-domain lock from
                         // the exact image/provenance snapshot through the synchronous scanout copy;
@@ -11808,8 +11826,23 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 front_flip,
                                 prosper::test::persistent_color_producer_source(*tgt),
                                 &front_snapshot);
-                            if (published_gpu) last_gpu_publish_flip = front_flip;
+                            if (published_gpu) {
+                                last_gpu_publish_flip = front_flip;
+                                selected_pixels.reset();
+                            }
                         }
+                    } else if (!new_gpu_flip) {
+                        // The previously published slot remains the correct scanout for this guest
+                        // flip. Treat it as a successful GPU publication so intermediate render
+                        // submissions do not fall through to the expensive CPU readback path.
+                        published_gpu = true;
+                        selected_pixels.reset();
+                        handoff_trace.emit(prosper::perf::PresentHandoffEvent::SameFlipSuppressed, 0, 0, last_gpu_publish_flip);
+                    } else {
+                        // A new guest flip was queued, but this submit has not drawn to front_va yet.
+                        // Wait for the submit that renders to the front buffer; suppress premature CPU fallback.
+                        published_gpu = true;
+                        selected_pixels.reset();
                     }
                 }
                 if (!published_gpu) handoff_trace.emit(prosper::perf::PresentHandoffEvent::CpuFallbackNeeded);

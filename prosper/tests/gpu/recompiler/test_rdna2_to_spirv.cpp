@@ -2202,6 +2202,92 @@ int main() {
                             native_linear_cfg17d).empty(),
           "a true VCC PAIR read at the same site stays refused while the high half is ambiguous");
 
+    // Kena: Bridge of Spirits compute program 0x3008ec0000 saves entry-M0 into an SGPR (s21),
+    // updates M0 for LDS operations, and restores M0 from that SGPR. When the SGPR aliases the high
+    // half of an ambiguous Wave64 mask pair (s[20:21]), S_MOV_B32 s21, m0 writes one scalar dword.
+    // M0 is architecturally a 32-bit scalar register that can never hold a wave mask; recognizing
+    // M0 as a scalar source ensures s21 is certified as a scalar word and the following restore
+    // S_MOV_B32 m0, s21 does not decline with wave64-ambiguous-mask-read.
+    const std::vector<uint32_t> kena_m0_save_restore_ambiguous_scalar = {
+        0x7d8402f9u, 0x06069400u, // v_cmp_eq_u32_sdwa s[20:21], v0, v1 -> s[20:21] is a real Wave64 mask
+        0xbf880001u,              // s_cbranch_execz +1: two edges reach the next block
+        0xbe940380u,              // s_mov_b32 s20, 0 -> scalar on the fall-through path only
+        0xbe95037cu,              // join block: s_mov_b32 s21, m0 (save entry M0 into s21)
+        0xbefc0380u,              // s_mov_b32 m0, 0 (use M0 for local operations)
+        0xbefc0315u,              // s_mov_b32 m0, s21 (restore entry M0 from s21)
+        0xbe940480u,              // s_mov_b64 s[20:21], 0 (complete replacement of s[20:21])
+    };
+    std::vector<uint32_t> kena_m0_save_restore_accept = kena_m0_save_restore_ambiguous_scalar;
+    kena_m0_save_restore_accept.insert(
+        kena_m0_save_restore_accept.end(), std::begin(code17d), std::end(code17d));
+    CHECK(!recompile_compute(kena_m0_save_restore_accept.data(),
+                             kena_m0_save_restore_accept.size(), nullptr,
+                             native_linear_cfg17d).empty(),
+          "Wave64 dispatcher preserves scalar provenance across entry-M0 save and restore");
+
+    std::vector<uint32_t> kena_m0_pair_read = kena_m0_save_restore_ambiguous_scalar;
+    kena_m0_pair_read[6] = 0xbe960414u; // s_mov_b64 s[22:23], s[20:21] reads full pair
+    kena_m0_pair_read.insert(
+        kena_m0_pair_read.end(), std::begin(code17d), std::end(code17d));
+    CHECK(recompile_compute(kena_m0_pair_read.data(),
+                            kena_m0_pair_read.size(), nullptr,
+                            native_linear_cfg17d).empty(),
+          "reading the full pair at the same site stays refused while base 20 is ambiguous");
+
+    // Writing M0 does not make an ambiguous read safe. s20 is still the low half of a mask on
+    // the branch edge, so `s_mov_b32 m0, s20` must refuse like any other scalar copy of it; an
+    // exemption for M0 destinations would hand M0 the dispatcher's unproven-scalar zero.
+    std::vector<uint32_t> kena_m0_from_ambiguous = kena_m0_save_restore_ambiguous_scalar;
+    kena_m0_from_ambiguous[6] = 0xbefc0314u; // s_mov_b32 m0, s20
+    kena_m0_from_ambiguous.insert(
+        kena_m0_from_ambiguous.end(), std::begin(code17d), std::end(code17d));
+    CHECK(recompile_compute(kena_m0_from_ambiguous.data(),
+                            kena_m0_from_ambiguous.size(), nullptr,
+                            native_linear_cfg17d).empty(),
+          "an M0 destination does not exempt an ambiguous Wave64 mask-half read");
+
+    std::vector<uint32_t> kena_sgpr_from_ambiguous = kena_m0_save_restore_ambiguous_scalar;
+    kena_sgpr_from_ambiguous[6] = 0xbe970314u; // s_mov_b32 s23, s20 (same read, SGPR dest)
+    kena_sgpr_from_ambiguous.insert(
+        kena_sgpr_from_ambiguous.end(), std::begin(code17d), std::end(code17d));
+    CHECK(recompile_compute(kena_sgpr_from_ambiguous.data(),
+                            kena_sgpr_from_ambiguous.size(), nullptr,
+                            native_linear_cfg17d).empty(),
+          "control: the same ambiguous read into an SGPR is refused at the same site");
+
+    // The entry-M0 save certifies its copy only while M0 still holds its block-entry value or a
+    // proven scalar. Here s30 is written on the fall-through edge only, so at the join it is not an
+    // ambiguous mask pair but also not a proven scalar. `s_mov_b32 m0, s30` therefore gives M0 the
+    // dispatcher's unproven-scalar zero, and the following save must not vouch for it: the restore
+    // then reads the still-ambiguous s21 and must refuse.
+    std::vector<uint32_t> kena_m0_unproven_write = {
+        0x7d8402f9u, 0x06069400u, // v_cmp_eq_u32_sdwa s[20:21], v0, v1 -> s[20:21] is a real Wave64 mask
+        0xbf880002u,              // s_cbranch_execz +2
+        0xbe940380u,              // s_mov_b32 s20, 0 -> s[20:21] ambiguous at the join
+        0xbe9e0380u,              // s_mov_b32 s30, 0 -> s30 defined on the fall-through edge only
+        0xbefc031eu,              // join block: s_mov_b32 m0, s30 (unproven source)
+        0xbe95037cu,              // s_mov_b32 s21, m0
+        0xbefc0315u,              // s_mov_b32 m0, s21
+        0xbe940480u,              // s_mov_b64 s[20:21], 0
+    };
+    std::vector<uint32_t> kena_m0_proven_write = kena_m0_unproven_write;
+    // Control: define s30 before the branch, so the same join writes M0 from a proven scalar.
+    kena_m0_proven_write.insert(kena_m0_proven_write.begin(), 0xbe9e0380u);
+    kena_m0_proven_write[5] = 0xbf800000u; // s_nop replaces the fall-through-only s30 write
+    kena_m0_unproven_write.insert(
+        kena_m0_unproven_write.end(), std::begin(code17d), std::end(code17d));
+    kena_m0_proven_write.insert(
+        kena_m0_proven_write.end(), std::begin(code17d), std::end(code17d));
+    CHECK(recompile_compute(kena_m0_unproven_write.data(),
+                            kena_m0_unproven_write.size(), nullptr,
+                            native_linear_cfg17d).empty(),
+          "an in-block M0 write from an unproven scalar does not certify its saved copy");
+    CHECK(!recompile_compute(kena_m0_proven_write.data(),
+                             kena_m0_proven_write.size(), nullptr,
+                             native_linear_cfg17d).empty(),
+          "control: the same save after an in-block M0 write from a proven scalar is accepted");
+
+
     // An invalid SCC must not regain scalar provenance indirectly. S_CSELECT publishes its chosen
     // dword and ADDC/SUBB publish both a dword and a new SCC, but all three first consume the old
     // SCC. A dispatcher placeholder at that read makes the instruction itself unrepresentable;

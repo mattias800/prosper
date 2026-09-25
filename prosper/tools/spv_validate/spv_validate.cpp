@@ -20,6 +20,7 @@
 // declared emitter this run did not actually emit a validated module from, and an absent spirv-val
 // is a hard failure rather than a pass.
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include "gpu/recompiler/spirv/strip_layer_forward_spv.hpp"
 #include "gpu/resources/shader_resources.hpp"
 #include "gpu/recompiler/spirv_builder.hpp"
 #include <algorithm>
@@ -914,6 +915,10 @@ int main(int argc, char** argv) {
            recompile_interpolation_geometry(layout, /*capture_position=*/false,
                                             /*synthesize_rect=*/true),
            "recompile_interpolation_geometry"); }
+    // The source-driven merged ES/GS projection uses a checked-in Geometry module to carry
+    // PARAM0 and the instance layer to a 3D attachment. Validate the shipped words too.
+    dump(dir, "geometry_strip_layer_forward",
+         std::vector<uint32_t>(kStripLayerForwardSpv.begin(), kStripLayerForwardSpv.end()));
 
     fails += check_emitter_coverage(src_root);
 

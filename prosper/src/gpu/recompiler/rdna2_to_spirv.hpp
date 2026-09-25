@@ -823,6 +823,14 @@ std::vector<uint32_t> recompile_vertex_chain(const uint32_t* prolog, size_t prol
                                              RecompileDiagnosticContext diagnostic = {
                                                  RecompileDiagnosticStage::Vertex, 0});
 
+// A narrowly proved merged ES/GS chain whose ES writes one seven-dword record per logical
+// vertex and whose GS copies those records into two strip primitives per instance. This
+// checks both current code bodies, never their guest addresses or mutable resource values.
+// The caller must also check the draw topology, instance/vertex counts, image view and
+// fragment linkage before attaching its layer-forwarding geometry stage.
+bool rdna2_proven_strip_layer_chain(const uint32_t* prolog, size_t prolog_dwords,
+                                    const uint32_t* main, size_t main_dwords);
+
 // Test hook: allow a tiny synthetic NGG shader to reach the terminal EXEC-gated export lowering so
 // Vulkan tests can execute both active and inactive outcomes. Production recompile_vertex keeps that
 // exception restricted to the byte-exact observed Astro wrapper.
