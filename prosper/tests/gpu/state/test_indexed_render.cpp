@@ -14,6 +14,7 @@
 #include "gpu/resources/shader_resources.hpp"
 #include "gpu/state/render_state.hpp"
 #include "fixtures/render_runner.h"
+#include <cstdlib>
 #include <cstdio>
 #include <cstdint>
 #include <vector>
@@ -107,6 +108,15 @@ int main() {
     const std::vector<uint8_t> px_borrowed = prosper::test::render_draws_rgba({borrowed}, W, H);
     CHECK(px_borrowed == px_tri,
           "borrowed index words override conflicting owned words and select records 1..3");
+    const auto borrowed_stats = prosper::test::backend_resource_reuse_stats();
+    const bool batch_disabled = std::getenv("PROSPER_NO_INDEX_COPY_BATCH") != nullptr;
+    const bool arena_disabled = std::getenv("PROSPER_NO_INDEX_ARENA") != nullptr ||
+        std::getenv("PROSPER_NO_BACKEND_BUFFER_ARENA") != nullptr;
+    const uint64_t expected_batch = !batch_disabled && !arena_disabled ? 1u : 0u;
+    CHECK(borrowed_stats.index_copy_batches == expected_batch &&
+          borrowed_stats.index_copy_spans == expected_batch &&
+          borrowed_stats.index_copy_bytes == expected_batch * 12u,
+          "indexed upload uses the selected deferred or immediate path");
     borrowed_indices[0] = borrowed_indices[1] = borrowed_indices[2] = 0;
     const std::vector<uint8_t> px_borrowed_mutated =
         prosper::test::render_draws_rgba({borrowed}, W, H);
