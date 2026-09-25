@@ -1,50 +1,45 @@
 # Renderer architecture gaps (2026-09-25)
 
-A structural review of prosper's GPU translation layer, written after the question "why are heavy
-3D titles single-digit fps, and why does GTA V reach gameplay with no world?" It is deliberately
+A structural review of what prosper's render path COSTS per frame. It began from the question "why are heavy
+3D titles single-digit fps?" -- the correctness half of that framing is withdrawn in § 0. It is deliberately
 *not* another leaf profile: #3770 and `PERFORMANCE_ROADMAP_HANDOFF_2026_09_23.md` already show
 leaves being shaved for single-digit percentages, and two of those attempts measured *backwards*.
-The claim here is that one architectural decision sets both ceilings, and that the performance
-question and the correctness question have the same answer.
+The claim here is that a handful of costs are paid by EVERY title on EVERY path, and that removing
+one of those is the only kind of performance work that compounds across the corpus.
 
 Every prosper-side figure below is from prosper's own code, profile, or status docs, and every
 `file:line` was verified against the tree on 2026-09-25. The designs named — buffer device
 addresses, timeline semaphores, page-granular write tracking — are published Khronos/OS
 capabilities, not anyone's proprietary work.
 
-## 0. The finding in one paragraph
+## 0. WITHDRAWN: "the addressing model is the shared root cause"
 
-**prosper resolves every shader resource reference on the CPU, before the draw, by statically
-proving what address the shader will use. The alternative is to let the shader do the load itself
-on the GPU.** prosper has no buffer-device-address path at all: `grep -rn
-'PhysicalStorageBuffer\|bufferDeviceAddress\|ConvertUToPtr' src/ tests/fixtures/ frontends/`
-returns **nothing**. Instead, `src/gpu/recompiler/indirect/rdna2_indirect_pointer_descriptor_range.cpp`
-(1,106 lines) performs VGPR/SGPR live-range analysis and address-pair recovery to reconstruct, at
-recompile time, the addresses a shader will dereference at run time. That is a strictly harder
-problem than performing the load, it is undecidable in general, and every draw pays for the
-reconstruction again on the CPU.
+The first two revisions of this document led with a claim that prosper's CPU-side static address
+resolution (`src/gpu/recompiler/indirect/rdna2_indirect_pointer_descriptor_range.cpp`, 1,106 lines
+of VGPR/SGPR live-range analysis) set *both* the performance and the correctness ceiling, and cited
+GTA V's absent world as the correctness evidence.
 
-This one decision produces both symptoms:
+**The correctness half is false and is withdrawn.** It was written from a `CLAUDE.md` in a shared
+checkout 397 commits behind `origin/main`. Current `COMPATIBILITY.md` records GTA V at **rung 3** —
+the prologue bank heist rendering in full colour on a default launch — and *Sonic Frontiers* with
+the world rendering and 84% of the frame lit. prosper's static resolution demonstrably does handle
+the shapes those titles use. Any future argument that prosper cannot express a resource-addressing
+shape must be made from a specific failing draw, not from this document.
 
-- **Correctness.** A shader whose resource address is genuinely dynamic — bindless, a descriptor
-  array indexed by a GPU-computed value, a per-draw table walked by the shader — cannot be
-  statically resolved. The resource then cannot be bound, and the draw produces nothing. This is
-  the shape of GTA V's absent world (`docs/GTA5_STATUS.md`, tracker #1873) and of the general
-  "unsupported program" population.
-- **Performance.** Doing the reconstruction per draw on the CPU is what `resolve_dynamic_fetch`
-  (4.69% self), `find_spirv_descriptor_binding` (1.91%) and 2,485,440 shader-resource-key equality
-  calls are, in the 2026-09-23 profile.
+Two things follow, and the second is the useful one:
 
-The published alternative is `SPV_KHR_physical_storage_buffer` (core Vulkan 1.2+; prosper has been
-on 1.4 since #3418, so it is available today at no cost): map guest memory into the GPU's address
-space behind a resident page table, hand the shader the guest address, and let it do
-`OpConvertUToPtr` + `OpLoad`. Residency misses are reported by the shader into a fault buffer that
-the CPU drains afterwards, creating what was missing. Pointer chases then *work*, rather than
-needing to be proven.
+- The remaining per-draw cost of CPU-side resolution (`resolve_dynamic_fetch` 4.69%,
+  `find_spirv_descriptor_binding` 1.91%) is an ordinary single-digit-percent perf item. It is
+  recorded in § 4 and is **not** a frontier.
+- **The comparison this document came from is now a controlled one, which makes it sharper rather
+  than weaker.** Both prosper and the implementations it was compared against produce correct
+  rendering on these titles. The output is therefore held constant and the only remaining variable
+  is what the render path *costs*. That is exactly the comparison §§ 1-3 are about, and none of
+  those three findings depended on the withdrawn claim: each is measured from prosper's own code,
+  its own profile, or its own status docs.
 
-CONFIDENCE: HIGH that prosper has no BDA path and that the static analysis exists as described —
-both are direct reads. MED on attributing GTA V's absent world specifically to this; that is an
-inference from the mechanism and needs the discriminator in § 5.
+Recorded rather than deleted so the next reader does not re-derive it. The general lesson is the
+charter's own: a status quoted from a stale checkout reads exactly like a current one.
 
 ## 1. The GPU is idle inside long submits — barriers, not shading
 
@@ -129,14 +124,21 @@ Three independent discriminators, cheapest first. Each is falsifiable and none r
    utilisation and 30–45 ms/submit, § 1 is wrong and the stall is elsewhere.
 2. **Submission (§ 2).** Change *only* `submit_and_wait` to a timeline tick plus deferred
    retirement, keeping every existing copy and compare. If frame time does not move, § 2 is wrong.
-3. **Addressing (§ 0).** Take one shader that today fails static address recovery, emit the BDA
-   path for it alone behind a flag, and see whether its draw produces content. This is the
-   correctness discriminator and it does not need the full architecture — one shader is enough to
-   decide whether the mechanism is real.
+3. **Residency (§ 3).** Arm the existing write-watch permanently for one buffer class instead of
+   disabling it after two dirty queries, and compare `buffer_resident_compared_bytes` against the
+   frame time. If removing 1.63 GB / 30 s of comparison does not move the frame, § 3 is wrong.
 
 **A positive control is mandatory and must not come from the same route** (charter, same-source
 control rule): a title already known to be GPU-bound rather than submit-bound should *not* improve
 under (2). If everything improves uniformly, the instrument is measuring itself.
+
+**Each of these is PATH-shaped, and that is the selection criterion.** A fix that makes one title
+faster by steering it onto a different branch does not compound: the next title lands on a
+different branch and arrives at the same frame rate. Measured 2026-09-25, the GPU/render layer
+reads **501** distinct `PROSPER_*` switches — 77 diagnostics, 108 `PROSPER_NO_*` A/B opt-outs, and
+**316 behaviour-changing**. That is the size of the space a title-shaped fix searches, and the
+reason per-title performance results have not transferred. Prefer a change that deletes a cost
+every path pays over one that finds a cheaper path.
 
 ## Ruled out
 
