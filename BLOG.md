@@ -19,6 +19,15 @@ from the tracker issues, and still gated, because it is a projection of state ra
 > title's current state — for that, read the tracker. Nothing is ever removed when a title moves on,
 > because the point of a blog is that it records *when* things happened.
 
+## 2026-09-25
+
+### Kena: Bridge of Spirits renders its 3D title screen forest
+
+The 3D forest behind the *Kena: Bridge of Spirits* main menu now renders instead of drawing black, showing the canopy, stone shrine and lanterns behind the menu options under `PROSPER_LAYERED_VOLUME_FALLBACK=1`. The scene renders darker than on hardware, but the complete 3D environment now passes through tone mapping. [#3857](https://github.com/mattias800/prosper/pull/3857).
+
+![Kena: Bridge of Spirits main menu before: the menu options draw over a black background](assets/screenshots/kena-main-menu.webp)
+![Kena: Bridge of Spirits main menu after: the 3D forest canopy, stone shrine, lanterns and trees render behind the menu, PROSPER_LAYERED_VOLUME_FALLBACK=1, t=45 s](assets/screenshots/kena-main-menu-3d-world.webp)
+
 ## 2026-09-23
 
 ### Blue Prince and Evergate get back pixels NVIDIA was dropping
