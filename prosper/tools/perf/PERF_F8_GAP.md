@@ -30,3 +30,14 @@ On the 2026-09-25 Outer Wilds investigation, the first recording lost a perf chu
 the second ended before the F8 window, and the third overlapped a Kena build. All
 three were discarded for source attribution; these are the failure modes this
 reader's explicit clock, coverage check, and external peer audit are meant to catch.
+
+For a Linux-only scheduler question, start `schedstat_probe.py --pid PID --seconds 20
+--hz 200 --out sched.json` beside the monotonic perf recording. It samples threads
+named `prosper-app` at bounded intervals and records each `/proc` read bracket. After
+identifying the primary TID in the process-scoped perf export, run
+`schedstat_f8.py capture.prperf sched.json --pid PID --tid TID`. The join counts
+only adjacent observations whose full read brackets lie inside the same renderer
+span or gap. Inspect coverage, sampler overruns, thread identity, process/build
+identity, peer audit, and perf/F8 overlap before interpreting the result. The
+signed sleep/unknown remainder includes all time neither recorded as execution
+nor runnable wait; it is not a cause attribution or a whole-game FPS estimate.

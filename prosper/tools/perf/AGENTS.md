@@ -16,6 +16,11 @@ renderer-submit spans. It refuses partial interval overlap and mixed process IDs
 peer contention remain external validity checks. Samples in a wall-time gap are CPU observations,
 not an allocation of that gap's elapsed time. See `PERF_F8_GAP.md`.
 
+`schedstat_probe.py` is an opt-in Linux `/proc` sampler for a selected process; `schedstat_f8.py`
+joins one recorded TID to F8 spans using complete read brackets. It separates scheduler runtime,
+runnable wait, and a signed sleep/unknown residual, with explicit coverage. The probe is a
+measurement aid, not a game FPS benchmark; see `PERF_F8_GAP.md`.
+
 Keep missing measurements distinct from measured zeros, and retain signed timing residuals.
 Nested CPU timers and GPU intervals cannot be added as independent work. Buffer comparison byte
 counts are requested spans, not physical memory traffic or the bytes an early-exiting comparison
