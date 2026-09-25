@@ -49,6 +49,12 @@ struct ProcessSample {
 // compact structured form only during F8's post-trigger window.
 struct RendererTimingRecord {
     uint64_t monotonic_ns = 0;
+    // First callback entry in this ordered semantic submit. Zero means F8 did not observe its
+    // first span, so a wall-span/gap analysis must treat this record as boundary-censored.
+    uint64_t span_start_monotonic_ns = 0;
+    // Internal admission token, not serialized. A submit that spans two F8 captures cannot
+    // publish its earlier capture's timings into the later one.
+    uint64_t capture_generation = 0;
     uint64_t callbacks = 0;
     uint64_t draws = 0;
     uint64_t texture_bytes = 0;
@@ -405,7 +411,10 @@ public:
                          std::chrono::system_clock::time_point wall_clock);
 
     bool detailed_timing_active() const {
-        return detailed_active_.load(std::memory_order_relaxed);
+        return active_generation() != 0;
+    }
+    uint64_t active_generation() const {
+        return active_generation_.load(std::memory_order_relaxed);
     }
     void record_renderer(RendererTimingRecord record);
     void record_compute(ComputeTimingRecord record);
@@ -426,10 +435,11 @@ private:
     mutable std::mutex mutex_;
     std::deque<ProcessSample> ring_;
     std::atomic<uint64_t> next_sample_ns_{0};
-    std::atomic<bool> detailed_active_{false};
+    std::atomic<uint64_t> active_generation_{0};
     std::unique_ptr<PendingCapture> pending_;
     std::optional<CaptureOutcome> outcome_;
     unsigned arm_count_ = 0;
+    uint64_t generation_count_ = 0;
 };
 
 InteractivePerformanceCapture& interactive_performance_capture();

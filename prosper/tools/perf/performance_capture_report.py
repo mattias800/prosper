@@ -10,6 +10,7 @@ import argparse
 import collections
 import json
 import math
+import statistics
 import sys
 
 # ResourceClass in gpu/resources/shader_resources.hpp. Unknown future values stay numeric.
@@ -261,6 +262,78 @@ def _counter_rate(samples, field, seconds):
 def _total(records, field):
     return sum(float(record.get(field, 0.0)) for record in records
                if math.isfinite(float(record.get(field, 0.0))))
+
+
+def _renderer_span_summary(renderer, dropped):
+    """Bound renderer callback work and the wall intervals enclosing semantic submits.
+
+    `total_ms` sums measured callbacks. A submit can contain interleaved compute/DMA between
+    callbacks, so subtracting total_ms from its completion timestamp does not locate its start.
+    The first F8 record may start before F8 and lack an entry timestamp. It can be excluded only
+    when its completion precedes every valid span; a missing interior record or an overflow forbids
+    an inter-submit gap claim.
+    """
+    spans = []
+    missing_ends = []
+    missing = invalid = 0
+    for row in renderer:
+        start, end, callback_ms = (row.get("span_start_t_ns"), row.get("t_ns"),
+                                   row.get("total_ms"))
+        if start is None:
+            missing += 1
+            missing_ends.append(end)
+            continue
+        if (type(start) is not int or type(end) is not int or
+                type(callback_ms) not in (int, float) or
+                not math.isfinite(callback_ms) or callback_ms < 0 or end < start or
+                type(row.get("callbacks")) is not int or row["callbacks"] < 1):
+            invalid += 1
+            continue
+        span_ms = (end - start) / 1e6
+        # The end timestamp is taken after the last callback timer. A material negative
+        # residual means these clocks/populations cannot safely be compared.
+        if callback_ms - span_ms > 0.1:
+            invalid += 1
+            continue
+        spans.append((start, end, float(callback_ms)))
+    complete = bool(spans) and not (missing or invalid or dropped)
+    first_start = min((start for start, _, _ in spans), default=None)
+    boundary_censored = bool(spans) and missing > 0 and not (invalid or dropped) and all(
+        type(end) is int and end <= first_start
+        for end in missing_ends)
+    available = complete or boundary_censored
+    result = {"records": len(renderer), "timestamped": len(spans), "missing": missing,
+              "invalid": invalid, "dropped": dropped, "complete": complete,
+              "boundary_censored": boundary_censored, "available": available,
+              "callback_sum_ms": None, "span_sum_ms": None,
+              "within_span_noncallback_sum_ms": None,
+              "between_span_gap_sum_ms": None, "between_span_gap_median_ms": None,
+              "between_span_gap_max_ms": None, "between_span_gap_count": None,
+              "overlapping_spans": None}
+    if not available:
+        return result
+    result["callback_sum_ms"] = sum(callback_ms for _, _, callback_ms in spans)
+    result["span_sum_ms"] = sum((end - start) / 1e6 for start, end, _ in spans)
+    result["within_span_noncallback_sum_ms"] = (
+        result["span_sum_ms"] - result["callback_sum_ms"])
+    if len(spans) < 2:
+        return result
+    gaps = []
+    overlaps = 0
+    last_end = None
+    for start, end, _ in sorted(spans):
+        if last_end is not None:
+            if start < last_end:
+                overlaps += 1
+            elif start > last_end:
+                gaps.append((start - last_end) / 1e6)
+        last_end = end if last_end is None else max(last_end, end)
+    result["between_span_gap_sum_ms"] = sum(gaps)
+    result["between_span_gap_median_ms"] = statistics.median(gaps) if gaps else 0.0
+    result["between_span_gap_max_ms"] = max(gaps, default=0.0)
+    result["between_span_gap_count"] = len(gaps)
+    result["overlapping_spans"] = overlaps
+    return result
 
 
 def _resource_breakdown(renderer):
@@ -1039,6 +1112,7 @@ def summarize(records):
         "rates": rates,
         "producer_lineage": producer_lineage,
         "graphics_total_ms": graphics_total,
+        "renderer_span": _renderer_span_summary(renderer, footer["renderer_dropped"]),
         "compute_total_ms": compute_total,
         "compute_cpu_phases": _phase_totals(compute, COMPUTE_CPU_PHASES),
         "compute_gpu_brackets": _phase_totals(compute, COMPUTE_GPU_BRACKETS),
@@ -1217,6 +1291,34 @@ def print_summary(summary):
     print(f"measured totals: graphics={summary['graphics_total_ms']:.1f} ms "
           f"compute={summary['compute_total_ms']:.1f} ms "
           f"(ALL retained records, not clipped to the sample window)")
+    span = summary["renderer_span"]
+    if not span["available"]:
+        print("renderer semantic-submit spans: unavailable "
+              f"({span['timestamped']}/{span['records']} valid starts, "
+              f"missing={span['missing']} invalid={span['invalid']} "
+              f"dropped={span['dropped']})")
+    else:
+        scope = (f"{span['timestamped']}/{span['records']} complete retained records; "
+                 f"{span['missing']} earlier boundary-censored"
+                 if span["boundary_censored"] else "all retained records complete")
+        print(f"renderer semantic-submit spans ({scope}): "
+              f"callback-sum={span['callback_sum_ms']:.1f}ms "
+              f"enclosing-span-sum={span['span_sum_ms']:.1f}ms "
+              f"within-span noncallback residual={span['within_span_noncallback_sum_ms']:+.1f}ms")
+        if span["between_span_gap_count"] is None:
+            print("  between-span gaps: unavailable (fewer than two complete submits)")
+        else:
+            print("  between-span gaps: "
+                  f"{span['between_span_gap_count']} totaling "
+                  f"{span['between_span_gap_sum_ms']:.1f}ms "
+                  f"(median={span['between_span_gap_median_ms']:.2f}ms "
+                  f"max={span['between_span_gap_max_ms']:.2f}ms; "
+                  f"overlaps={span['overlapping_spans']})")
+        print("  residual includes callback work before legacy timers and interleaved work; "
+              "span sums can overlap across threads; gaps may contain compute, guest work, "
+              "waits or pacing; neither is idle time or fresh-render FPS")
+        print("  F8 can omit a submit crossing its trigger; these are retained complete-submit "
+              "intervals, not a count of every guest submit")
     if summary["coverage"] is None:
         print(f"window coverage: unavailable -- {summary['coverage_status']}, so no ratio between "
               "them is meaningful")

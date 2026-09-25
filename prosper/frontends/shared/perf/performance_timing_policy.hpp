@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdint>
+
 namespace prosper::frontend {
 
 struct PerformanceTimingMode {
@@ -18,6 +20,13 @@ inline PerformanceTimingMode performance_timing_mode(bool environment_logging,
 // must retain the accumulated timing; only its final span consumes and clears that population.
 inline bool should_reset_performance_timing_after_span(bool timing_enabled, bool final_span) {
     return timing_enabled && final_span;
+}
+
+// F8 can start or finish between callbacks of one semantic submit. Only the capture that measured
+// its first callback may publish the accumulated final-span timing.
+inline bool complete_renderer_span_belongs_to_capture(uint64_t first_generation,
+                                                      uint64_t final_generation) {
+    return first_generation != 0 && first_generation == final_generation;
 }
 
 template <typename Timing>

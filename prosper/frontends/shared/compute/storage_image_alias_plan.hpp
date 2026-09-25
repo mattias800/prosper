@@ -60,6 +60,7 @@ struct StorageImageAliasGroup {
 
 struct StorageImageAliasPlan {
     bool valid = true;
+    const char* decline_reason = nullptr;
     // Non-storage descriptors have no group. Indices refer to the supplied descriptor order.
     std::vector<size_t> group_for_image;
     std::vector<StorageImageAliasGroup> groups;
@@ -82,6 +83,7 @@ inline StorageImageAliasPlan plan_storage_image_aliases(
         const auto* resource = resources.by_binding(descriptor.binding);
         if (!resource) {
             plan.valid = false;
+            plan.decline_reason = "storage-alias-resource-missing";
             continue;
         }
         resolved[i] = resource;
@@ -91,8 +93,20 @@ inline StorageImageAliasPlan plan_storage_image_aliases(
             const size_t owner = plan.groups[group_index].owner_index;
             if (prosper::gpu::shader_resource_same_view(
                     *resolved[owner], *resource,
-                    compute_image_alias_shape(*resolved[owner], descriptors[owner]), shape, true))
+                    compute_image_alias_shape(*resolved[owner], descriptors[owner]), shape, true)) {
+                // Equal guest bytes and layer counts do not imply equal Vulkan view types.
+                // In particular, a one-layer 2D_ARRAY storage view cannot be bound to a
+                // sibling's ordinary 2D declaration. Splitting writable aliases into two
+                // images would also lose one sibling's stores at whole-image writeback.
+                if (resource->img_dim == 1 && resource->depth == 1 &&
+                    descriptors[owner].image_dim == 1 && descriptor.image_dim == 1 &&
+                    descriptors[owner].image_arrayed != descriptor.image_arrayed) {
+                    plan.valid = false;
+                    plan.decline_reason = "storage-alias-mixed-array-view";
+                    return plan;
+                }
                 break;
+            }
         }
         if (group_index == plan.groups.size()) {
             plan.groups.emplace_back();

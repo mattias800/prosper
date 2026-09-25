@@ -24,6 +24,7 @@
 #include "shared/live/resolve_submission_policy.hpp"
 #include "shared/live/texture_source_snapshot.hpp"
 #include "shared/live/depth_cube_source_snapshot.hpp"
+#include "shared/live/depth_cube_quantize.hpp"
 #include "shared/live/decode_scratch.hpp"     // pooled full-surface decode intermediates
 #include "shared/live/live_target_format.hpp"       // the one LiveTargetPixelFormat mapping (exhaustive)
 #include "shared/perf/performance_capture.hpp"      // bounded F8 post-trigger renderer timing
@@ -2243,6 +2244,11 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
          partial_wave_fragment](const std::vector<prosper::gpu::DrawItem>& items,
                                uint32_t w, uint32_t h) -> prosper::gpu::RenderedFrame {
             using RC = prosper::gpu::ResourceClass;
+            const uint64_t callback_capture_generation =
+                prosper::perf::interactive_performance_capture().active_generation();
+            const bool perf_capture_timing = callback_capture_generation != 0;
+            const uint64_t callback_entry_ns = perf_capture_timing
+                ? prosper::perf::monotonic_now_ns() : 0;
             // #2215 instrument: publish which thread is inside a submit-render callback right
             // now, so the thread sampler can attribute its samples EXACTLY instead of guessing
             // from a six-frame host-stack walk (a sample taken deep in ucrtbase loses the
@@ -2644,8 +2650,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             };
             static thread_local RenderTiming pending_timing;
             static thread_local std::vector<RttTimingRecord> pending_rtt_timing;
-            const bool perf_capture_timing =
-                prosper::perf::interactive_performance_capture().detailed_timing_active();
+            static thread_local uint64_t pending_span_start_ns = 0;
+            static thread_local uint64_t pending_capture_generation = 0;
             // The timing bool is sampled per callback, not a capture ID or completion proof.
             // Keep cumulative per-thread populations across captures; a falling edge is only
             // an observed inactive callback. This diagnostic does not change realization policy.
@@ -2705,9 +2711,13 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             const bool lightweight_rtt_timing = timing_mode.log && PROSPER_ENV_VALUE("PROSPER_RTT_TIMING");
             static const uint64_t rtt_timing_min_draws = getenv("PROSPER_RTT_TIMING_MIN_DRAWS")
                 ? strtoull(PROSPER_ENV_VALUE("PROSPER_RTT_TIMING_MIN_DRAWS"), nullptr, 0) : 0;
-            if (timing_enabled && phase.first_span) {
-                pending_timing = {};
-                pending_rtt_timing.clear();
+            if (phase.first_span) {
+                pending_capture_generation = timing_enabled ? callback_capture_generation : 0;
+                pending_span_start_ns = pending_capture_generation ? callback_entry_ns : 0;
+                if (timing_enabled) {
+                    pending_timing = {};
+                    pending_rtt_timing.clear();
+                }
             }
             const auto callback_timing_start = timing_enabled
                 ? RenderClock::now() : RenderClock::time_point{};
@@ -6770,21 +6780,14 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                         const size_t count = use_mapped_depth_cube
                                             ? mapped_faces[face].count : faces[face].size();
                                         const size_t pixels = std::min(static_cast<size_t>(tw) * th, count);
-                                        auto quantize = [&](auto read_depth) {
-                                            for (size_t i = 0; i < pixels; ++i) {
-                                                float d = read_depth(i);
-                                                d = d < 0.0f ? 0.0f : (d > 1.0f ? 1.0f : d);
-                                                const uint8_t q = static_cast<uint8_t>(d * 255.0f + 0.5f);
-                                                dst[i * 4 + 0] = q;
-                                                dst[i * 4 + 1] = q;
-                                                dst[i * 4 + 2] = q;
-                                                dst[i * 4 + 3] = 0xffu;
-                                            }
-                                        };
                                         if (use_mapped_depth_cube)
-                                            quantize([&](size_t i) { return mapped_faces[face].at(i); });
+                                            quantize_depth_cube_rgba8(
+                                                dst, static_cast<const uint8_t*>(mapped_faces[face].mapped),
+                                                pixels);
                                         else
-                                            quantize([&](size_t i) { return faces[face][i]; });
+                                            quantize_depth_cube_rgba8(
+                                                dst, reinterpret_cast<const uint8_t*>(faces[face].data()),
+                                                pixels);
                                     } else {
                                         const uint32_t source_bpt = bpt ? bpt : 2u;
                                         const size_t linear_bytes = static_cast<size_t>(tw) * th * source_bpt;
@@ -12164,8 +12167,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 // One record per complete semantic submit. A submit may be split into several
                 // graphics spans by interleaved compute/DMA; recording every callback would count
                 // the growing pending total repeatedly and make the capture itself misattribute time.
-                if (perf_capture_timing && phase.final_span) {
+                if (perf_capture_timing && phase.final_span &&
+                    prosper::frontend::complete_renderer_span_belongs_to_capture(
+                        pending_capture_generation, callback_capture_generation)) {
                     prosper::perf::RendererTimingRecord record;
+                    record.span_start_monotonic_ns = pending_span_start_ns;
+                    record.capture_generation = pending_capture_generation;
                     record.callbacks = pending_timing.callbacks;
                     record.draws = pending_timing.backend_draws;
                     record.texture_bytes = pending_timing.texture_bytes;
@@ -12319,6 +12326,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     // lifetime aggregates or their large periodic stderr summaries.
                     prosper::frontend::reset_performance_timing_after_span(
                         pending_timing, timing_enabled, phase.final_span);
+                    pending_span_start_ns = 0;
+                    pending_capture_generation = 0;
                     prosper::gpu::RenderedFrame frame(std::move(selected_pixels));
                     frame.origin = frame_origin;
                     frame.source_submit = selected_source_submit;
@@ -13395,6 +13404,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 prosper::frontend::reset_performance_timing_after_span(
                     pending_timing, timing_enabled, phase.final_span);
             }
+            pending_span_start_ns = 0;
+            pending_capture_generation = 0;
             prosper::gpu::RenderedFrame frame(std::move(selected_pixels));
             frame.origin = frame_origin;
             frame.source_submit = selected_source_submit;

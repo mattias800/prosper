@@ -107,6 +107,10 @@ int main() {
     }
     check(!prosper::frontend::interactive_performance_timing(),
           "interactive backend timing cannot leak beyond the live callback scope");
+    check(prosper::frontend::complete_renderer_span_belongs_to_capture(7, 7) &&
+          !prosper::frontend::complete_renderer_span_belongs_to_capture(0, 7) &&
+          !prosper::frontend::complete_renderer_span_belongs_to_capture(7, 8),
+          "only a submit measured from its first span by the same F8 capture can publish timing");
     const auto f8_only = prosper::frontend::performance_timing_mode(false, true);
     check(f8_only.measure && !f8_only.log,
           "F8-only timing measures structured data without enabling periodic stderr logs");
@@ -156,6 +160,8 @@ int main() {
     for (uint64_t i = 0; i < 3; ++i) {
         prosper::perf::RendererTimingRecord record;
         record.monotonic_ns = 501 + i;
+        record.capture_generation = capture.active_generation();
+        if (i == 0) record.span_start_monotonic_ns = 490;
         record.callbacks = 1;
         record.draws = 100 + i;
         record.total_ms = 20 + i;
@@ -421,6 +427,9 @@ int main() {
     check(count_text(text, "\"type\":\"renderer\"") == 2 &&
           count_text(text, "\"type\":\"compute\"") == 1,
           "serialized detail counts match the bounded retained records");
+    check(count_text(text, "\"span_start_t_ns\":-10") == 1 &&
+          count_text(text, "\"span_start_t_ns\":null") == 1,
+          "renderer span start distinguishes pre-trigger time from unavailable");
     check(text.find("\"gpu_timestamp_samples\":2") != std::string::npos,
           "renderer records serialize the GPU timestamp availability discriminator");
     check(text.find("\"pass_loop_ms\":7") != std::string::npos &&
@@ -471,6 +480,48 @@ int main() {
     for (const auto& entry : fs::directory_iterator(dir))
         part_files += entry.path().extension() == ".part";
     check(part_files == 0, "graceful cancellation removes the unfinished private part");
+
+    {
+        // A split submit can outlive F8 A and finish after F8 B arms. Its A-tagged record must
+        // never be admitted into B merely because detailed timing is active again.
+        InteractivePerformanceCapture generations(config);
+        check(generations.arm(dir.string(), "generation", "generation", "test", 2000, wall).ok,
+              "first generation control arms");
+        const uint64_t first_generation = generations.active_generation();
+        check(first_generation != 0, "an active capture exposes a nonzero generation");
+        generations.observe_sample(sample(2300, 1));
+        check(generations.active_generation() == 0, "completed capture clears its generation");
+        check(generations.arm(dir.string(), "generation", "generation", "test", 2300,
+                              wall + std::chrono::milliseconds(2)).ok,
+              "second generation control arms");
+        const uint64_t second_generation = generations.active_generation();
+        check(second_generation != 0 && second_generation != first_generation,
+              "successive captures have distinct admission generations");
+        prosper::perf::RendererTimingRecord stale;
+        stale.monotonic_ns = 2301;
+        stale.span_start_monotonic_ns = 2001;
+        stale.capture_generation = first_generation;
+        stale.callbacks = 2;
+        generations.record_renderer(stale);
+        auto untagged = stale;
+        untagged.capture_generation = 0;
+        generations.record_renderer(untagged);
+        prosper::perf::RendererTimingRecord current = stale;
+        current.monotonic_ns = 2302;
+        current.span_start_monotonic_ns = 2300;
+        current.capture_generation = second_generation;
+        generations.record_renderer(current);
+        generations.observe_sample(sample(2600, 2));
+        prosper::perf::CaptureOutcome admitted;
+        check(generations.take_outcome(admitted) && admitted.ok &&
+              admitted.renderer_records == 1 && admitted.renderer_dropped == 0,
+              "new capture rejects stale and untagged records without a false overflow");
+        std::ifstream admitted_file(admitted.path);
+        const std::string admitted_text((std::istreambuf_iterator<char>(admitted_file)), {});
+        check(count_text(admitted_text, "\"type\":\"renderer\"") == 1 &&
+              admitted_text.find("\"span_start_t_ns\":0") != std::string::npos,
+              "serialized second capture contains only the new generation's span");
+    }
 
     // The live host sampler, on whatever platform this test is running. Every check above feeds the
     // ring synthetic samples, so the suite stayed green for as long as the real sampler returned an

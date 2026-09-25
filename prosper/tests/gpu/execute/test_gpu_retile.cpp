@@ -280,7 +280,9 @@ int run_case(int argc, char** argv) {
     uint64_t code = 0x34070000;
     for (uint32_t mode : modes) for (auto format : formats)
     for (auto [width, height] : extents)
-    for (uint32_t view = 0; view < ((volume || mixed || array16) ? 1u : 3u); ++view) {
+    for (uint32_t view = 0; view < ((volume || mixed || array16) ? 1u : 4u); ++view) {
+        if (view == 3 && format.format != DataFormat::Float16 &&
+            format.format != DataFormat::Uint32) continue;
         if (mixed && !array16 && format.format != DataFormat::Float16) continue;
         // Integer 3D images still use the existing raw interchange path. Its packing fallback
         // remains covered; this retile change does not broaden native storage declarations.
@@ -291,12 +293,15 @@ int run_case(int argc, char** argv) {
         const bool native_array = !array16 || format.format == DataFormat::Uint16;
         const bool packed_row = !subword ||
             (width % (4 / format.bpe) == 0 && !(mode == 24 && format.bpe == 1));
-        const bool gpu = !cpu && !shape_refusal && packed_row && native_array && (!volume || native_volume);
+        const bool single_layer_array_native_disabled =
+            std::getenv("PROSPER_NO_NATIVE_SINGLE_LAYER_ARRAY_STORAGE") != nullptr;
+        const bool gpu = !cpu && !shape_refusal && packed_row && native_array &&
+            (!volume || native_volume) && !(view == 3 && single_layer_array_native_disabled);
         if (fault_mode && !gpu) continue;
         // A one-layer array descriptor may be consumed through either a plain
         // 2D instruction or an array instruction retaining its layer coordinate.
-        const uint32_t resource_dim = volume ? 2u : (array16 || view) ? 5u : 1u;
-        const uint32_t instruction_dim = volume ? 2u : (array16 || view == 2) ? 5u : 1u;
+        const uint32_t resource_dim = volume ? 2u : (array16 || view == 1 || view == 2) ? 5u : 1u;
+        const uint32_t instruction_dim = volume ? 2u : (array16 || view == 2 || view == 3) ? 5u : 1u;
         const uint32_t depth = array16 ? 6u : volume ? (width == 67 ? 21u : 32u) : 1u;
         const size_t linear_bytes = size_t(width) * height * depth * format.bpe;
         const size_t tile_slice = tiled_surface_bytes(width, height, mode, 0, format.bpe);
@@ -401,10 +406,33 @@ int run_case(int argc, char** argv) {
             for (const auto& descriptor : reflection.descriptors)
                 if (descriptor.kind == SpirvDescriptorKind::StorageImage &&
                     (descriptor.binding == 4 || descriptor.binding == 5) &&
-                    descriptor.image_dim == (volume ? 2u : 1u) && descriptor.image_arrayed == (array16 || view == 2))
+                    descriptor.image_dim == (volume ? 2u : 1u) &&
+                    descriptor.image_arrayed == (array16 || view == 2 || view == 3))
                     ++matching_views;
             check(reflection.ok() && matching_views == 2,
                   "both storage views reflect the intended ordinary or array shader type");
+            if (view == 3) {
+                size_t matching_numeric_classes = 0;
+                size_t matching_storage_formats = 0;
+                for (const auto& descriptor : reflection.descriptors)
+                    if (descriptor.kind == SpirvDescriptorKind::StorageImage &&
+                        (descriptor.binding == 4 || descriptor.binding == 5)) {
+                        if (descriptor.image_numeric_class ==
+                            ((single_layer_array_native_disabled || format.format == DataFormat::Uint32)
+                                 ? SpirvImageNumericClass::Uint : SpirvImageNumericClass::Float))
+                            ++matching_numeric_classes;
+                        if (format.format == DataFormat::Uint32 &&
+                            descriptor.storage_image_format ==
+                                (single_layer_array_native_disabled ? 0u
+                                                                    : kSpirvImageFormatR32ui))
+                            ++matching_storage_formats;
+                    }
+                check(matching_numeric_classes == 2,
+                      "one-layer array control changes both storage images between raw and typed");
+                if (format.format == DataFormat::Uint32)
+                    check(matching_storage_formats == 2,
+                          "one-layer array control changes both integer storage formats");
+            }
             if (array16) {
                 size_t matching_formats = 0;
                 for (const auto& descriptor : reflection.descriptors)

@@ -153,6 +153,7 @@ void write_optional(std::ostream& out, const std::optional<uint64_t>& value) {
 } // namespace
 
 struct InteractivePerformanceCapture::PendingCapture {
+    uint64_t generation = 0;
     std::string final_path;
     std::string part_path;
     std::string title_id;
@@ -257,6 +258,7 @@ CaptureArmResult InteractivePerformanceCapture::arm(
     pending_->revision = revision;
     pending_->wall_clock = iso_local_time(wall_clock);
     pending_->trigger_ns = monotonic_ns;
+    pending_->generation = ++generation_count_;
     if (config_.present_handoffs) pending_->present.reserve(config_.max_present_records);
     const uint64_t cutoff = monotonic_ns > config_.pre_window_ns
         ? monotonic_ns - config_.pre_window_ns : 0;
@@ -264,7 +266,7 @@ CaptureArmResult InteractivePerformanceCapture::arm(
         if (sample.monotonic_ns >= cutoff && sample.monotonic_ns <= monotonic_ns)
             pending_->pre_samples.push_back(sample);
     }
-    detailed_active_.store(true, std::memory_order_relaxed);
+    active_generation_.store(pending_->generation, std::memory_order_relaxed);
     result.ok = true;
     result.pre_samples = pending_->pre_samples.size();
     result.post_seconds = static_cast<double>(config_.post_window_ns) / 1e9;
@@ -276,6 +278,7 @@ void InteractivePerformanceCapture::record_renderer(RendererTimingRecord record)
     if (!record.monotonic_ns) record.monotonic_ns = monotonic_now_ns();
     std::lock_guard lock(mutex_);
     if (!pending_) return;
+    if (record.capture_generation != pending_->generation) return;
     if (pending_->renderer.size() < config_.max_renderer_records)
         pending_->renderer.push_back(record);
     else
@@ -310,7 +313,7 @@ InteractivePerformanceCapture::finish_if_due_locked(uint64_t monotonic_ns) {
     if (!pending_ || monotonic_ns < pending_->trigger_ns ||
         monotonic_ns - pending_->trigger_ns < config_.post_window_ns)
         return {};
-    detailed_active_.store(false, std::memory_order_relaxed);
+    active_generation_.store(0, std::memory_order_relaxed);
     return std::move(pending_);
 }
 
@@ -418,6 +421,10 @@ void InteractivePerformanceCapture::publish_completed(std::unique_ptr<PendingCap
         for (const RendererTimingRecord& record : capture->renderer) {
             out << "{\"type\":\"renderer\",\"t_ns\":"
                 << relative_ns(record.monotonic_ns, capture->trigger_ns)
+                << ",\"span_start_t_ns\":"
+                << (record.span_start_monotonic_ns
+                    ? std::to_string(relative_ns(record.span_start_monotonic_ns,
+                                                 capture->trigger_ns)) : "null")
                 << ",\"callbacks\":" << record.callbacks << ",\"draws\":" << record.draws
                 << ",\"texture_bytes\":" << record.texture_bytes
                 << ",\"frontend_gpu_detile_preparations\":" << record.frontend_gpu_detile_preparations
@@ -653,7 +660,7 @@ void InteractivePerformanceCapture::cancel() {
     std::string part;
     {
         std::lock_guard lock(mutex_);
-        detailed_active_.store(false, std::memory_order_relaxed);
+        active_generation_.store(0, std::memory_order_relaxed);
         if (pending_) part = pending_->part_path;
         pending_.reset();
     }
