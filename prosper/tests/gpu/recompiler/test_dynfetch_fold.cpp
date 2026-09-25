@@ -6127,6 +6127,123 @@ int main() {
               k11_fetch[0].desc.base == ((uint64_t)(uintptr_t)k6_vbuf & 0xFFFFFFFFFFFFull),
           "#2202 B3: a target that is itself the next target's predecessor saves the RESTORED state");
 
+    // A two-word raw load can supply ordinary scalar data. Both words must be read as B32
+    // values before a branch. The exact-PC resource supplies
+    // current guest bytes to the compiled load; its identity is the consuming instruction,
+    // not a shader-address or user-register convention.
+    const auto smem = [](uint32_t op, uint32_t dst, uint32_t base) {
+        return 0xf4000000u | (op << 18) | (dst << 6) | (base >> 1);
+    };
+    const auto sop2 = [](uint32_t op, uint32_t dst, uint32_t src0, uint32_t src1) {
+        return 0x80000000u | (op << 23) | (dst << 16) | (src1 << 8) | src0;
+    };
+    const uint32_t raw_x2_data[] = {
+        smem(1, 20, 0), 0xfa000000u,       // pc0: s_load_dwordx2 s[20:21], s[0:1], 0
+        sop2(0x27, 22, 20, 128),           // pc2: s_bfe_u32 s22, s20, 0
+        sop2(0x1e, 23, 21, 132),           // pc3: s_lshl_b32 s23, s21, 4
+        0xbf810000u,
+    };
+    alignas(8) static uint32_t raw_x2_data_backing[2] = {0x2020u, 0x22020u};
+    const uint64_t raw_x2_data_ptr = reinterpret_cast<uint64_t>(raw_x2_data_backing);
+    const uint32_t raw_x2_seed[2] = {
+        static_cast<uint32_t>(raw_x2_data_ptr), static_cast<uint32_t>(raw_x2_data_ptr >> 32)};
+    std::vector<Rdna2Inst> raw_x2_decoded;
+    rdna2_walk(raw_x2_data, std::size(raw_x2_data), raw_x2_decoded);
+    const auto data_proof = rdna2_proven_raw_x2_data_loads(raw_x2_decoded);
+    CHECK(data_proof.size() == 1 && data_proof[0] == 0u,
+          "raw x2 scalar pair is admitted by its two ordinary B32 data uses");
+    std::vector<SrtUse> raw_x2_uses;
+    resolve_dynamic_fetch(raw_x2_data, std::size(raw_x2_data), raw_x2_seed,
+                          std::size(raw_x2_seed), 0, &raw_x2_uses);
+    CHECK(raw_x2_uses.size() == 1 && raw_x2_uses[0].kind == 1 &&
+              raw_x2_uses[0].key == 0xffffffffu && raw_x2_uses[0].use_pc == 0u &&
+              raw_x2_uses[0].required_size == 8u &&
+              raw_x2_uses[0].v4[0] == raw_x2_seed[0] &&
+              raw_x2_uses[0].v4[1] == raw_x2_seed[1],
+          "raw x2 data publishes exactly the current pointer and eight-byte span at its load PC");
+    ShaderResourceTable raw_x2_table;
+    add_compute_buffer_resources(raw_x2_table, raw_x2_data, std::size(raw_x2_data),
+                                 raw_x2_seed, std::size(raw_x2_seed));
+    assign_convention_bindings(raw_x2_table, 2);
+    ComputeShaderConfig raw_x2_config;
+    raw_x2_config.user_sgprs.assign(std::begin(raw_x2_seed), std::end(raw_x2_seed));
+    raw_x2_config.local_x = raw_x2_config.local_y = raw_x2_config.local_z = 1;
+    const ShaderResource* raw_x2_resource = raw_x2_table.by_fetch_pc(0);
+    CHECK(raw_x2_resource && raw_x2_resource->gpu_addr == raw_x2_data_ptr &&
+              raw_x2_resource->size == 8u &&
+              !recompile_compute(raw_x2_data, std::size(raw_x2_data), &raw_x2_table,
+                                 raw_x2_config).empty(),
+          "production resource handoff binds the exact x2 range and compiled scalar load");
+    const uint32_t raw_x2_unrelated_load[] = {
+        smem(1, 20, 0), 0xfa000000u,
+        sop2(0x27, 22, 20, 128),
+        sop2(0x1e, 23, 21, 132),
+        smem(0, 24, 2), 0xfa000000u,       // no resource at this different load PC
+        0xbf810000u,
+    };
+    ShaderResourceTable raw_x2_unrelated_table;
+    add_compute_buffer_resources(raw_x2_unrelated_table, raw_x2_unrelated_load,
+                                 std::size(raw_x2_unrelated_load), raw_x2_seed,
+                                 std::size(raw_x2_seed));
+    assign_convention_bindings(raw_x2_unrelated_table, 2);
+    CHECK(raw_x2_unrelated_table.by_fetch_pc(0) &&
+              !raw_x2_unrelated_table.by_fetch_pc(4) &&
+              recompile_compute(raw_x2_unrelated_load, std::size(raw_x2_unrelated_load),
+                                &raw_x2_unrelated_table, raw_x2_config).empty(),
+          "an exact-PC x2 binding cannot satisfy an unrelated unresolved scalar load");
+
+    const uint32_t raw_x2_pointer[] = {
+        smem(1, 20, 0), 0xfa000000u,
+        smem(2, 8, 20), 0xfa000000u,       // use the pair as a table pointer
+        0xbf810000u,
+    };
+    std::vector<Rdna2Inst> raw_x2_pointer_decoded;
+    rdna2_walk(raw_x2_pointer, std::size(raw_x2_pointer), raw_x2_pointer_decoded);
+    std::vector<SrtUse> raw_x2_pointer_uses;
+    resolve_dynamic_fetch(raw_x2_pointer, std::size(raw_x2_pointer), raw_x2_seed,
+                          std::size(raw_x2_seed), 0, &raw_x2_pointer_uses);
+    CHECK(rdna2_proven_raw_x2_data_loads(raw_x2_pointer_decoded).empty() &&
+              std::none_of(raw_x2_pointer_uses.begin(), raw_x2_pointer_uses.end(),
+                           [](const SrtUse& use) { return use.use_pc == 0u; }),
+          "raw x2 pointer chase retains descriptor provenance rather than data publication");
+    const uint32_t raw_x2_branch[] = {
+        smem(1, 20, 0), 0xfa000000u,
+        sop2(0x27, 22, 20, 128),
+        0xbf820001u,                       // branch over the remaining data use
+        sop2(0x1e, 23, 21, 132),
+        0xbf810000u,
+    };
+    std::vector<Rdna2Inst> raw_x2_branch_decoded;
+    rdna2_walk(raw_x2_branch, std::size(raw_x2_branch), raw_x2_branch_decoded);
+    CHECK(rdna2_proven_raw_x2_data_loads(raw_x2_branch_decoded).empty(),
+          "control transfer before both scalar reads refuses x2 data admission");
+    const uint32_t raw_x2_redefinition[] = {
+        smem(1, 20, 0), 0xfa000000u,
+        sop2(0x27, 22, 20, 128),
+        sop2(0x1e, 23, 21, 132),
+        0xbe940380u,                       // s_mov_b32 s20, 0
+        0xbe950380u,                       // s_mov_b32 s21, 0
+        sop2(0x00, 22, 20, 129),           // both words are now unrelated to the load
+        0xbf810000u,
+    };
+    std::vector<Rdna2Inst> raw_x2_redefinition_decoded;
+    rdna2_walk(raw_x2_redefinition, std::size(raw_x2_redefinition),
+               raw_x2_redefinition_decoded);
+    CHECK(rdna2_proven_raw_x2_data_loads(raw_x2_redefinition_decoded) == data_proof,
+          "later SGPR reuse does not extend the loaded pair's lifetime");
+    const uint32_t raw_x2_transfer[] = {
+        smem(1, 20, 0), 0xfa000000u,
+        sop2(0x27, 22, 20, 128),
+        sop2(0x1e, 23, 21, 132),
+        0xbe802006u,                       // s_setpc_b64 s[6:7]
+        smem(2, 8, 20), 0xfa000000u,       // not part of this local instruction stream
+        0xbf810000u,
+    };
+    std::vector<Rdna2Inst> raw_x2_transfer_decoded;
+    rdna2_walk(raw_x2_transfer, std::size(raw_x2_transfer), raw_x2_transfer_decoded);
+    CHECK(rdna2_proven_raw_x2_data_loads(raw_x2_transfer_decoded) == data_proof,
+          "direct scalar observation before SETPC still requires current x2 bytes");
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;
