@@ -154,6 +154,11 @@ the exact observed draw state; anything else keeps the `ShaderRecompile` refusal
   (t=72 s), one a dim version of it, and one no scene but a single near-white frame. Every run still
   alternates with fully black composited frames, the pre-existing defect noted above. The near-white
   frame is unexplained and also appeared in an earlier run of the same lowering.
+- **Watched live in `prosper-app`, the background does not hold.** It cycles between the shrine scene,
+  black and other backgrounds. This is visible and **release-blocking**, though not merge-blocking for
+  the LUT lowering, whose LUT is byte-identical to the reference. The next Kena work is to
+  characterise the cycle with F9 bundles: which images alternate, and whether the compositor's
+  inputs or its LUT change between them.
 - This does not touch the gameplay world, the 64³ volume producers (their instance counts are not
   admitted), or the #3835 scene/interpolant contract.
 

@@ -23,7 +23,7 @@ from the tracker issues, and still gated, because it is a projection of state ra
 
 ### Kena: Bridge of Spirits draws its 3D shrine behind the title menu
 
-On a default Linux launch, the forest shrine, stones and lanterns now render behind the *Kena* main menu instead of black. The menu still alternates with fully black frames, and one run in three showed no scene. [#3857](https://github.com/mattias800/prosper/pull/3857).
+On a default Linux launch, the forest shrine, stones and lanterns now render behind the *Kena* main menu instead of black. It does not hold yet: watched live, the background cycles between this scene, black and other backgrounds, so this is progress toward the title screen, not a finished one. [#3857](https://github.com/mattias800/prosper/pull/3857).
 
 ![Kena: Bridge of Spirits main menu before: the menu options draw over a black background](assets/screenshots/kena-main-menu.webp)
 ![Kena: Bridge of Spirits main menu after: the forest shrine, stones, lanterns and trees behind New Game / Load Game / Options; tools/screenshot, default launch, no pad route, t=72 s, Linux RADV](assets/screenshots/kena-main-menu-shrine-default.webp)

@@ -2385,8 +2385,10 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     } else if (strip_layer_chain) {
         const auto view = color_target_volume_view(rs.color_targets[0]);
         // The proved wrapper produces two triangles from four logical vertices per instance.
-        // Its record layer is the logical instance index. Other topology, offsets, view bases
-        // and consumers need a different primitive/layer proof and keep the prior visible reject.
+        // Its record layer is constant-buffer word 0 plus the instance index; admission cannot
+        // see that CB value, so a nonzero base would push layers past the 32-slice view (#3868).
+        // Other topology, offsets, view bases and consumers need a different primitive/layer
+        // proof and keep the prior visible reject.
         // Vulkan may rotate a geometry shader's three input vertices, but smooth PARAM0
         // interpolation is permutation-invariant. Reject cull/flat/front-face-sensitive state.
         StripLayerDrawState layer_state;
