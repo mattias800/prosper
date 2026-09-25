@@ -21,12 +21,12 @@ from the tracker issues, and still gated, because it is a projection of state ra
 
 ## 2026-09-25
 
-### Kena: Bridge of Spirits renders its 3D title screen forest
+### Kena: Bridge of Spirits' title forest appears, with a diagnostic stand-in for its colour LUT
 
-The 3D forest behind the *Kena: Bridge of Spirits* main menu now renders instead of drawing black, showing the canopy, stone shrine and lanterns behind the menu options under `PROSPER_LAYERED_VOLUME_FALLBACK=1`. The scene renders darker than on hardware, but the complete 3D environment now passes through tone mapping. [#3857](https://github.com/mattias800/prosper/pull/3857).
+With the off-by-default diagnostic `PROSPER_LAYERED_VOLUME_FALLBACK=1` standing in for the colour-grading LUT pass prosper cannot translate yet, the forest, shrine and lanterns behind the *Kena* main menu come through tone mapping; a default launch still draws the background black, and the real fix is the merged NGG lowering (#3135). [#3857](https://github.com/mattias800/prosper/pull/3857).
 
-![Kena: Bridge of Spirits main menu before: the menu options draw over a black background](assets/screenshots/kena-main-menu.webp)
-![Kena: Bridge of Spirits main menu after: the 3D forest canopy, stone shrine, lanterns and trees render behind the menu, PROSPER_LAYERED_VOLUME_FALLBACK=1, t=45 s](assets/screenshots/kena-main-menu-3d-world.webp)
+![Kena: Bridge of Spirits main menu on a default launch: the menu options draw over a black background](assets/screenshots/kena-main-menu.webp)
+![Kena: Bridge of Spirits main menu with the diagnostic PROSPER_LAYERED_VOLUME_FALLBACK=1 (not a default launch): the forest canopy, stone shrine, lanterns and trees render behind the menu, t=45 s](assets/screenshots/kena-main-menu-3d-world.webp)
 
 ## 2026-09-23
 
