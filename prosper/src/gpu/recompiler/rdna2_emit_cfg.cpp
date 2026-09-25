@@ -2700,8 +2700,6 @@ bool emit_cfg_state_machine(
         // from the same resource-table ranges used by the emitter's direct-descriptor fallback.
         for (int reg : direct_descriptor_sregs)
             if (reg <= 124) wave64_scalar_word_in.front().insert(reg);
-        // M0 is architecturally a 32-bit scalar register that can never hold a wave mask.
-        wave64_scalar_word_in.front().insert(124);
         wave64_scalar_scc_valid_in.front() = initial.scc != 0;
         wave64_b64_reachable.front() = true;
 
@@ -2761,7 +2759,6 @@ bool emit_cfg_state_machine(
                     case OperandKind::SGPR:
                         return scalar_words.contains(source.value);
                     case OperandKind::Special:
-                        if (source.value == 124) return true; // M0 is a 32-bit scalar register
                         if (source.value == 125) return true; // SGPR_NULL
                         if (source.value == 253) return scalar_scc;
                         return source.value >= 106 && source.value <= 124 &&
@@ -2839,6 +2836,8 @@ bool emit_cfg_state_machine(
                 if (b64_logical_mask_source || mbcnt_mask_source) continue;
                 const ScalarSourceRead read = scalar_source_read(in, source);
                 if (read == ScalarSourceRead::None) continue;
+                if (in.fmt == Rdna2Format::SOP1 && in.opcode == 0x03 && in.dst.value == 124)
+                    continue;
                 const int first = operand.value;
                 const int last = first + static_cast<int>(read);
                 for (int base : ambiguous) {
@@ -2908,8 +2907,6 @@ bool emit_cfg_state_machine(
                 if (source.kind != OperandKind::SGPR &&
                     source.kind != OperandKind::Special)
                     return false;
-                if (source.kind == OperandKind::Special && source.value == 124)
-                    return width == 1; // M0 is architecturally a 32-bit scalar register
                 if (source.kind == OperandKind::Special && source.value == 125)
                     return true; // SGPR_NULL
                 if (source.kind == OperandKind::Special && source.value == 253)
@@ -3087,11 +3084,14 @@ bool emit_cfg_state_machine(
                         for (uint32_t word = 0; word < width; ++word)
                             scalar_words.erase(base + static_cast<int>(word));
                 }
+            const bool entry_m0_save = in.fmt == Rdna2Format::SOP1 && in.opcode == 0x03 &&
+                in.src[0].kind == OperandKind::Special && in.src[0].value == 124 &&
+                in.dst.value <= 105;
             } else if (valid_scc_read &&
                        ((in.fmt != Rdna2Format::SOP1 &&
                          in.fmt != Rdna2Format::SOP2 &&
                          in.fmt != Rdna2Format::SOPK) || scalar_alu_result ||
-                        exact_mask_reduction)) {
+                        exact_mask_reduction || entry_m0_save)) {
                 for (const auto& [base, width] : scalar_writes)
                     for (uint32_t word = 0; word < width; ++word)
                         scalar_words.insert(base + static_cast<int>(word));

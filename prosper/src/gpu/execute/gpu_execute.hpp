@@ -2846,6 +2846,7 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     // #1256: record the raw draw-packet state (pre-realization) so a capture can be checked offline for
     // realization divergence. vcount_hint is the DrawIndexAuto/DrawIndex index_count decoded from the guest.
     out.raw_draw_count = vcount_hint; out.raw_indexed = (draw && draw->indexed);
+    out.raw_draw_modifier = draw ? draw->modifier : 0;
     out.rect_list_synthesis = rect_list_synthesis;
     int32_t vertex_offset = static_cast<int32_t>(rs.ge_indx_offset);
     if (draw && draw->has_vertex_offset_override) {
