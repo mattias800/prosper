@@ -3967,6 +3967,31 @@ int main() {
     printf("  kernel20 mismatches=%u (out[0]=%g expect=50)\n", bad20, got20.size()==N?got20[0]:-1);
     CHECK(got20.size()==N && bad20==0, "recompiled kernel 20 (SMEM: cbuf[1]+cbuf[2] from constant buffer) correct");
 
+    // An admitted raw x2 scalar load must read both CURRENT words from the bound range. The
+    // code and binding stay fixed while the backing changes; a compile-time fold of the two
+    // words, or a placeholder pointer value, fails the second arm.
+    const uint32_t code20x2[] = {
+        0xf4040001u, 0xfa000000u, // s_load_dwordx2 s[0:1], s[2:3], 0
+        0x8f008000u,             // s_lshl_b32 s0, s0, 0: direct B32 use of low word
+        0x8f018001u,             // s_lshl_b32 s1, s1, 0: direct B32 use of high word
+        0x80000100u,             // s_add_u32 s0, s0, s1
+        0x7e000c00u,             // v_cvt_f32_u32 v0, s0
+        0xbf810000u,
+    };
+    std::vector<Rdna2Inst> code20x2_decoded;
+    rdna2_walk(code20x2, std::size(code20x2), code20x2_decoded);
+    CHECK(rdna2_proven_raw_x2_data_loads(code20x2_decoded) == std::vector<uint32_t>{0u},
+          "Vulkan x2 kernel enters the newly admitted raw scalar-data path");
+    const auto spv20x2 = recompile_valu(code20x2, std::size(code20x2), 1, 0);
+    CHECK(!spv20x2.empty(), "raw x2 scalar data load recompiles");
+    const auto got20x2_a = prosper::test::run_compute(
+        spv20x2, in20, N, N, std::vector<uint32_t>{10u, 20u});
+    const auto got20x2_b = prosper::test::run_compute(
+        spv20x2, in20, N, N, std::vector<uint32_t>{40u, 60u});
+    CHECK(got20x2_a.size() == N && got20x2_b.size() == N &&
+              got20x2_a[0] == 30.0f && got20x2_b[0] == 100.0f,
+          "raw x2 uses changed bytes at the same binding on the next invocation");
+
     // Kernel 20b (#149): a register-SOFFSET s_buffer_load must be REJECTED, not silently translated
     // with the immediate alone (the register offset is unmodeled). s_buffer_load_dword s0, s[..], s8.
     // Same first-load prefix as kernel 20 so the difference is purely the register SOFFSET.

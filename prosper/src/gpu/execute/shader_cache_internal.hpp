@@ -492,6 +492,8 @@ struct DecodedShader {
     std::vector<uint32_t> code;
     std::vector<Rdna2Inst> instructions;
     std::vector<Rdna2Inst> shader_constant_instructions;
+    // Code-byte-only proof, computed on the full decoded stream before fold compaction.
+    std::vector<uint32_t> raw_x2_data_load_pcs;
     // Full-stream inventory: specialization may remove a spill but cannot introduce one.
     std::bitset<256> scalar_spill_written_vgprs;
     size_t source_dwords = 0;

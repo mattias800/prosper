@@ -946,6 +946,7 @@ std::shared_ptr<const DecodedShader> decode_shader_cached(const uint32_t* code, 
         // their original order and PCs. Prove shader-constant branches against the FULL decoded
         // stream first: the compact fold stream intentionally omits most VALU, including implicit
         // VCC writers that must invalidate a scalar-data proof through s106:s107.
+        result->raw_x2_data_load_pcs = rdna2_proven_raw_x2_data_loads(decoded);
         retain_fold_instructions(decoded, result->instructions);
         std::vector<Rdna2Inst> shader_constant_decoded = decoded;
         result->shader_constant_specialized =
@@ -964,7 +965,8 @@ std::shared_ptr<const DecodedShader> decode_shader_cached(const uint32_t* code, 
                                               result->shader_constant_instructions.size()) *
                             sizeof(Rdna2Inst) + sizeof(result->scalar_spill_written_vgprs) +
                         result->control_plan.allocated_bytes() +
-                        result->shader_constant_control_plan.allocated_bytes();
+                        result->shader_constant_control_plan.allocated_bytes() +
+                        result->raw_x2_data_load_pcs.capacity() * sizeof(uint32_t);
         return result;
     };
 
@@ -4386,14 +4388,15 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 // performs, never for a slot that merely parses. A declaration-driven version of this
                 // idea was tried in build_shader_resources and regressed the frame (#2412) precisely
                 // because it lacked that condition.
-                // SINGLE-DWORD loads only. `s_load_dword` reads one scalar of DATA; every wider form
-                // is a pointer or descriptor fetch whose result the fold already tracks as V#/T#/BVH
-                // provenance, and publishing a ConstantBuffer for those shadows the uses those paths
-                // exist to produce. `dynfetch_fold` establishes the bound empirically: at `n <= 2` its
-                // three BVH-root cases fail (a BVH root is a two-dword pointer load), and at `n <= 16`
-                // six cases fail including the x16 T#/S# publications. This is the widest form that
-                // is unambiguously data.
-                if (srt_uses && !is_buffer && n == 1 &&
+                // Wider raw loads usually carry pointer/descriptor provenance. An x2 pair is
+                // admitted only when the full decoded stream observes both words directly
+                // through supported B32 scalar operations before control transfer. The
+                // cache owns that immutable analysis; this fold still supplies the CURRENT base,
+                // offset and guest bytes for the exact invocation.
+                const bool raw_scalar_data = n == 1 ||
+                    (n == 2 && std::binary_search(decoded->raw_x2_data_load_pcs.begin(),
+                                                   decoded->raw_x2_data_load_pcs.end(), in.pc));
+                if (srt_uses && !is_buffer && raw_scalar_data &&
                     valid_reg(sbase) && valid_reg(sbase + 1) &&
                     val_known.test((size_t)sbase) && val_known.test((size_t)(sbase + 1))) {
                     const uint64_t ptr = (uint64_t)val[(size_t)sbase] |

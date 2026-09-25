@@ -195,6 +195,11 @@ bool spirv_writes_trip_witness(const std::vector<uint32_t>& spirv);
 struct ShaderResourceTable;   // resource-binding contract (shader_resources.hpp); optional to recompile_valu
 struct Rdna2Inst;
 
+// PCs of immediate raw S_LOAD_DWORDX2 instructions whose two words are directly read by
+// supported B32 scalar operations before control transfer. This proves that the emitted
+// shader needs actual current bytes; it does not classify all later derived values.
+std::vector<uint32_t> rdna2_proven_raw_x2_data_loads(const std::vector<Rdna2Inst>& instructions);
+
 // Per-invocation provenance for fail-visible shader diagnostics. This is observation-only metadata:
 // it must travel beside the translation inputs rather than participate in compiled-module identity,
 // because the same program bytes and semantic configuration produce the same SPIR-V at every guest

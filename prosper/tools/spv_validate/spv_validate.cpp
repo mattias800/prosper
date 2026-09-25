@@ -133,6 +133,9 @@ static const NotAnEmitter kNotEmitters[] = {
     {"structured_execz_branches_for_test", "returns analyzed RDNA2 branch PCs, not SPIR-V"},
     {"mask_test_branches_for_test",  "returns a transformed RDNA2 instruction stream, not SPIR-V"},
     {"cselect_b64_low_only_pcs_for_test", "returns CFG-proven instruction PCs, not SPIR-V"},
+    {"rdna2_proven_raw_x2_data_loads",
+     "returns decoded instruction PCs, not SPIR-V; dynfetch_fold covers positive, branch, "
+     "pointer-only and SGPR-lifetime cases, and rdna2_to_spirv_exec validates a consuming module"},
     {"recompile_graphics_shader_cached",
      "caching wrapper; ctest shader_recompile_cache asserts its words are byte-identical to the "
      "direct emitter, which is validated here"},
