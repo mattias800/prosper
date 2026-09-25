@@ -2000,18 +2000,19 @@ HLE(agc_create_prim_state) {  // (cx_regs, uc_regs, hs, gs, prim_type)
 }
 
 // sceAgcCreateInterpolantMapping — build the 32 SPI_PS_INPUT_CNTL_* registers wiring
-// PS inputs to GS/VS output parameter slots. Generalized beyond Kyty (which asserts Unity's exact
-// identity layout): match each PS input to the GS output with the same semantic id and use that
-// output's parameter slot, with the flat-shade bit (0x400) from the PS side. Falls back to the
-// identity mapping (slot i) when there is nothing to match — which reproduces Kyty's behaviour on
-// the layouts Kyty supports.
-HLE(agc_create_interpolant_mapping) {  // (ShaderRegister regs[32], const Shader* gs, const Shader* ps)
-    pipetrace("CreateInterpolantMapping", a0, a1, a2, a3, a4, a5);
-    auto* regs = (AgcShaderRegister*)(uintptr_t)a0;
-    auto* gs   = (const AgcShader*)(uintptr_t)a1;
-    auto* ps   = (const AgcShader*)(uintptr_t)a2;
-    if (!regs || !gs) return kAgcErrInvalidArg;
+// PS inputs to GS/VS output parameter slots. The older HV4j revision initializes all entries to
+// their own PARAM slot when PS is absent or declares no inputs. With a PS, its unconsumed tail is
+// identity too. Keep the other revisions' previously modeled tail until they are verified.
+static uint64_t write_interpolant_mapping(AgcShaderRegister* regs, const AgcShader* gs,
+                                           const AgcShader* ps, bool identity_unused) {
+    if (!regs) return kAgcErrInvalidArg;
     using namespace prosper::agc::Pm4;
+    if (identity_unused && (!ps || !ps->num_input_semantics)) {
+        for (uint32_t i = 0; i < 32; ++i)
+            regs[i] = {SPI_PS_INPUT_CNTL_0 + i, i};
+        return 0;
+    }
+    if (!gs) return kAgcErrInvalidArg;
     uint32_t n = ps ? ps->num_input_semantics : (uint32_t)gs->num_output_semantics;
     if (getenv("PROSPER_PIPETRACE"))
         fprintf(stderr, "  [interp] gs.num_out=%u ps=%p ps.num_in=%u -> mapping %u interpolants\n",
@@ -2024,9 +2025,24 @@ HLE(agc_create_interpolant_mapping) {  // (ShaderRegister regs[32], const Shader
         reinterpret_cast<const prosper::gpu::AgcShaderHeader*>(ps));
     for (uint32_t i = 0; i < 32; i++) {
         regs[i].offset = SPI_PS_INPUT_CNTL_0 + i;
-        regs[i].value = (mapping.valid_mask & (1u << i)) ? mapping.controls[i] : 0u;
+        regs[i].value = (mapping.valid_mask & (1u << i)) ? mapping.controls[i]
+            : (identity_unused ? i : 0u);
     }
     return 0;
+}
+
+HLE(agc_create_interpolant_mapping) {  // (ShaderRegister regs[32], const Shader* gs, const Shader* ps)
+    pipetrace("CreateInterpolantMapping", a0, a1, a2, a3, a4, a5);
+    return write_interpolant_mapping(
+        (AgcShaderRegister*)(uintptr_t)a0, (const AgcShader*)(uintptr_t)a1,
+        (const AgcShader*)(uintptr_t)a2, false);
+}
+
+HLE(agc_create_interpolant_mapping_old) {
+    pipetrace("CreateInterpolantMapping", a0, a1, a2, a3, a4, a5);
+    return write_interpolant_mapping(
+        (AgcShaderRegister*)(uintptr_t)a0, (const AgcShader*)(uintptr_t)a1,
+        (const AgcShader*)(uintptr_t)a2, true);
 }
 
 // The SDK-revision export dbOlWdppb4o has two live title-visible argument shapes. Cobra passes
@@ -2040,8 +2056,11 @@ HLE(agc_create_interpolant_mapping_sdk_alias) {
         gpu::guest_readable(a2, sizeof(AgcShader))) {
         const auto* producer = reinterpret_cast<const AgcShader*>(static_cast<uintptr_t>(a1));
         const auto* pixel = reinterpret_cast<const AgcShader*>(static_cast<uintptr_t>(a2));
-        if (producer->type == 2 && pixel->type == 1)
-            return agc_create_interpolant_mapping(a0, a1, a2, a3, a4, a5);
+        if (producer->type == 2 && pixel->type == 1) {
+            pipetrace("CreateInterpolantMapping", a0, a1, a2, a3, a4, a5);
+            return write_interpolant_mapping(
+                (AgcShaderRegister*)(uintptr_t)a0, producer, pixel, false);
+        }
     }
     return agc_build_interpolant_mapping(a0, a1, a2, a3, a4, a5);
 }
@@ -3827,7 +3846,7 @@ void register_agc_hle() {
     // made coincidental junk offsets program real registers.
     RN("pdEV7bI6COI", agc_create_interpolant_mapping);       // PS5 3.20
     RN("dbOlWdppb4o", agc_create_interpolant_mapping_sdk_alias); // Cobra/DQ SDK revision
-    RN("HV4j+E0MBHE", agc_create_interpolant_mapping);       // older observed revision
+    RN("HV4j+E0MBHE", agc_create_interpolant_mapping_old);   // older observed revision
     RN("TRO721eVt4g", agc_dcb_reset_queue);
     RN("+kSrjIVxKFE", agc_dcb_push_marker);
     RN("QhCbS4X9Rl8", agc_dcb_push_marker);  // sceAgcDcbSetMarker (same native marker packet)
