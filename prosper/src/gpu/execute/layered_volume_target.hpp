@@ -1,10 +1,16 @@
 #pragma once
 
+#include "diagnostics/env_cache.hpp"
 #include "gpu/pm4/command_processor.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include "gpu/resources/shader_resources.hpp"
 #include "gpu/state/render_state.hpp"
 #include <array>
 #include <cstdint>
+#include <memory>
+#include <mutex>
+#include <set>
+#include <vector>
 
 namespace prosper::gpu {
 
@@ -132,13 +138,6 @@ constexpr std::array<uint32_t, 452> kLayeredVolumeGs = {
     0x00000016u, 0x000100dbu, 0x000100fdu, 0x00010038u
 };
 
-#include "diagnostics/env_cache.hpp"
-#include "gpu/resources/shader_resources.hpp"
-#include <memory>
-#include <mutex>
-#include <set>
-#include <vector>
-
 struct LayeredVolumeCandidateContext {
     const RenderState& rs;
     const GpuState& ds;
@@ -148,22 +147,29 @@ struct LayeredVolumeCandidateContext {
     const FragmentInterpolationLayout& interp;
     const PixelInputMapping* pixel_inputs;
     uint32_t vcount_hint;
+    bool bypass_disabled = false;
 };
 
 inline bool is_layered_volume_producer_candidate(const LayeredVolumeCandidateContext& ctx) {
+    if (ctx.bypass_disabled) return false;
     if (!ctx.vs_empty || ctx.fs_empty) return false;
+    if (!ctx.interp.valid || ctx.interp.requires_geometry) return false;
+    // Layered procedural volume pass provides procedural fullscreen quad UVs at Location 0 only.
+    // The fragment stage must have a complete, verified interpolant contract:
+    // 1. Fragment interpolation layout must not require attributes beyond Location 0 or raw pass-through.
+    // 2. When pixel inputs are present, consumption must be proved known and bounded to Location 0.
+    // 3. When pixel inputs are absent, the fragment stage must consume no attributes at all.
+    if ((ctx.interp.attribute_mask & ~1u) != 0u || ctx.interp.passthrough_mask != 0u) return false;
+    if (ctx.pixel_inputs) {
+        if (!ctx.pixel_inputs->consumed_known || (ctx.pixel_inputs->consumed_mask & ~1u) != 0u)
+            return false;
+    } else {
+        if (ctx.interp.attribute_mask != 0u) return false;
+    }
     const auto volume0 = color_target_volume_view(ctx.rs.color_targets[0]);
     if (volume0.selected_mip_depth <= 1u || volume0.slice_count <= 1u) return false;
     if (const uint32_t instances = ctx.draw ? ctx.draw->instance_count : ctx.ds.num_instances;
         instances < volume0.slice_count || instances <= 1u) {
-        return false;
-    }
-    if (ctx.interp.requires_geometry) return false;
-    // Layered procedural volume pass provides procedural fullscreen quad UVs at Location 0.
-    // Fragment shaders requiring custom vertex interpolants beyond Location 0 cannot use this path.
-    if ((ctx.interp.attribute_mask & ~1u) != 0u || ctx.interp.passthrough_mask != 0u) return false;
-    if (ctx.pixel_inputs && ctx.pixel_inputs->consumed_known &&
-        (ctx.pixel_inputs->consumed_mask & ~1u) != 0u) {
         return false;
     }
     if (ctx.vcount_hint > 4u) return false;

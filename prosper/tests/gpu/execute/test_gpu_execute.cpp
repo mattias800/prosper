@@ -324,15 +324,16 @@ int main() {
         CHECK(layered_item.ps.topology == 3u && layered_item.ps.cull_mode == 0u,
               "synthesized layered draw sets TriangleList topology and disables culling");
 
-        // Control: when disabled via PROSPER_NO_LAYERED_VOLUME, it declines with ShaderRecompile.
-        setenv("PROSPER_NO_LAYERED_VOLUME", "1", 1);
-        DrawItem disabled_item;
-        OperationRealizationFailure disabled_fail{};
-        const bool made_disabled = realize_draw_item(
-            layered_vol, &layered_vol.draws[0], 4u, 0x10000u, false, disabled_item, &disabled_fail);
-        unsetenv("PROSPER_NO_LAYERED_VOLUME");
-        CHECK(!made_disabled && disabled_fail.reason == RealizationFailureReason::ShaderRecompile,
-              "disabling layered volume bypass causes the draw to fail with ShaderRecompile");
+        // Control: a non-volume 2D target (slice_count == 1) does not qualify for the layered volume
+        // bypass, so it declines with ShaderRecompile when the vertex stage fails to recompile.
+        GpuState non_volume = layered_vol;
+        non_volume.cx[P::CB_COLOR0_VIEW] = 0u;
+        DrawItem non_volume_item;
+        OperationRealizationFailure non_volume_fail{};
+        const bool made_non_volume = realize_draw_item(
+            non_volume, &non_volume.draws[0], 4u, 0x10000u, false, non_volume_item, &non_volume_fail);
+        CHECK(!made_non_volume && non_volume_fail.reason == RealizationFailureReason::ShaderRecompile,
+              "non-volume draw fails closed with ShaderRecompile when vertex recompile fails");
     }
     {
         // The live draw path must acquire one exact fragment version and share it across metadata
