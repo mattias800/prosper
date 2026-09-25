@@ -180,7 +180,7 @@ struct LayeredVolumeSynthesisOutput {
     std::vector<uint32_t>& vs;
     std::vector<uint32_t>& gs;
     std::shared_ptr<const std::vector<uint32_t>>& vs_shared;
-    uint32_t& vs_identity;
+    uint64_t& vs_identity;
     std::shared_ptr<ShaderResourceTable>& vrt;
 };
 
