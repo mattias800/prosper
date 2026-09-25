@@ -303,12 +303,12 @@ int main() {
         // Synthesized layered volume producer pass: when a 32-slice volume target has an un-recompiled
         // vertex stage (e.g. unsupported NGG/LDS) but a valid fragment stage without custom interpolants,
         // realize_draw_item synthesizes kLayeredVolumeVs and kLayeredVolumeGs to render all 32 slices in 1 draw.
-        alignas(256) static const uint32_t invalid_vs[] = { 0xdeadbeefu, 0xbf810000u };
+        alignas(256) static const std::array<uint32_t, 2> invalid_vs = { 0xdeadbeefu, 0xbf810000u };
         GpuState layered_vol = st;
         layered_vol.cx[P::CB_COLOR0_VIEW] = 0x00040000u;
         layered_vol.cx[P::CB_COLOR0_ATTRIB3] = 0x4606c01fu;
         layered_vol.draws[0].instance_count = 32u;
-        set_pgm(layered_vol, P::SPI_SHADER_PGM_LO_ES, P::SPI_SHADER_PGM_HI_ES, invalid_vs);
+        set_pgm(layered_vol, P::SPI_SHADER_PGM_LO_ES, P::SPI_SHADER_PGM_HI_ES, invalid_vs.data());
         DrawItem layered_item;
         OperationRealizationFailure fail{};
         const bool made_layered = realize_draw_item(

@@ -2332,33 +2332,14 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     }
     const bool vs_words_empty_pre = vs_shared ? vs_shared->empty() : vs.empty();
     const bool fs_words_empty_pre = fs_shared ? fs_shared->empty() : fs.empty();
-    const bool no_layered_volume = getenv("PROSPER_NO_LAYERED_VOLUME") != nullptr;
-    const bool is_layered_volume_producer = !no_layered_volume &&
+    const bool is_layered_volume_producer = !PROSPER_ENV_ON("PROSPER_NO_LAYERED_VOLUME") &&
         is_layered_volume_producer_candidate(
-            rs, ds, draw, vs_words_empty_pre, fs_words_empty_pre,
-            interpolation, pixel_input_ptr, vcount_hint);
+            LayeredVolumeCandidateContext{rs, ds, draw, vs_words_empty_pre, fs_words_empty_pre,
+                                          interpolation, pixel_input_ptr, vcount_hint});
     if (is_layered_volume_producer) {
-        vs.assign(std::begin(kLayeredVolumeVs), std::end(kLayeredVolumeVs));
-        gs.assign(std::begin(kLayeredVolumeGs), std::end(kLayeredVolumeGs));
-        vs_shared.reset();
-        vs_identity = 0;
-        vrt = std::make_shared<ShaderResourceTable>();
-        static std::set<uint64_t> announced_targets;
-        static std::mutex announced_mu;
-        bool should_log = log || PROSPER_ENV_ON("PROSPER_LAYERED_VOLUME_LOG");
-        if (!should_log) {
-            std::lock_guard lock(announced_mu);
-            should_log = announced_targets.insert(rs.color0_base).second;
-        }
-        if (should_log) {
-            const auto volume_info = color_target_volume_view(rs.color_targets[0]);
-            std::fprintf(stderr,
-                "[exec] synthesized layered volume producer: target=0x%llx extent=%ux%u slices=%u instances=%u\n",
-                static_cast<unsigned long long>(rs.color0_base),
-                rs.color0_width, rs.color0_height,
-                volume_info.slice_count,
-                draw ? draw->instance_count : ds.num_instances);
-        }
+        synthesize_layered_volume_producer(
+            rs, draw ? draw->instance_count : ds.num_instances,
+            LayeredVolumeSynthesisOutput{vs, gs, vs_shared, vs_identity, vrt}, log);
     }
     const std::vector<uint32_t>& vs_words = vs_shared ? *vs_shared : vs;
     const std::vector<uint32_t>& fs_words = fs_shared ? *fs_shared : fs;
@@ -2866,16 +2847,22 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     // realization divergence. vcount_hint is the DrawIndexAuto/DrawIndex index_count decoded from the guest.
     out.raw_draw_count = vcount_hint; out.raw_indexed = (draw && draw->indexed);
     out.rect_list_synthesis = rect_list_synthesis;
-    out.raw_draw_modifier = draw ? draw->modifier : 0;
-    out.vertex_offset = is_layered_volume_producer ? 0 : (draw && draw->has_vertex_offset_override
-        ? draw->indirect_vertex_offset
-        : static_cast<int32_t>(rs.ge_indx_offset));
+    int32_t vertex_offset = static_cast<int32_t>(rs.ge_indx_offset);
+    if (draw && draw->has_vertex_offset_override) {
+        vertex_offset = draw->indirect_vertex_offset;
+    }
+    if (is_layered_volume_producer) {
+        vertex_offset = 0;
+    }
+    out.vertex_offset = vertex_offset;
     // The draw record is authoritative even in folded mode: register state may change after the
     // last draw, while IT_NUM_INSTANCES belongs to the draw at the moment it executes.
-    out.instance_count = is_layered_volume_producer
-        ? std::max(draw ? draw->instance_count : ds.num_instances,
-                   color_target_volume_view(rs.color_targets[0]).slice_count)
-        : (draw ? draw->instance_count : ds.num_instances);
+    uint32_t instance_count = draw ? draw->instance_count : ds.num_instances;
+    if (is_layered_volume_producer) {
+        instance_count = std::max(instance_count,
+                                  color_target_volume_view(rs.color_targets[0]).slice_count);
+    }
+    out.instance_count = instance_count;
     out.color0_base = rs.color0_base;   // render-to-texture: the target this draw writes into (#167)
     out.color0_width = rs.color0_width; out.color0_height = rs.color0_height; // per-target extent (#526)
     out.color1_base = rs.color1_base;

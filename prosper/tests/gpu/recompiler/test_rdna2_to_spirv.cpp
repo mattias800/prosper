@@ -2202,6 +2202,39 @@ int main() {
                             native_linear_cfg17d).empty(),
           "a true VCC PAIR read at the same site stays refused while the high half is ambiguous");
 
+    // Kena: Bridge of Spirits compute program 0x3008ec0000 saves entry-M0 into an SGPR (s21),
+    // updates M0 for LDS operations, and restores M0 from that SGPR. When the SGPR aliases the high
+    // half of an ambiguous Wave64 mask pair (s[20:21]), S_MOV_B32 s21, m0 writes one scalar dword.
+    // M0 is architecturally a 32-bit scalar register that can never hold a wave mask; recognizing
+    // M0 as a scalar source ensures s21 is certified as a scalar word and the following restore
+    // S_MOV_B32 m0, s21 does not decline with wave64-ambiguous-mask-read.
+    const std::vector<uint32_t> kena_m0_save_restore_ambiguous_scalar = {
+        0x7d8402f9u, 0x06069400u, // v_cmp_eq_u32_sdwa s[20:21], v0, v1 -> s[20:21] is a real Wave64 mask
+        0xbf880001u,              // s_cbranch_execz +1: two edges reach the next block
+        0xbe940380u,              // s_mov_b32 s20, 0 -> scalar on the fall-through path only
+        0xbe95037cu,              // join block: s_mov_b32 s21, m0 (save entry M0 into s21)
+        0xbefc0380u,              // s_mov_b32 m0, 0 (use M0 for local operations)
+        0xbefc0315u,              // s_mov_b32 m0, s21 (restore entry M0 from s21)
+        0xbe940480u,              // s_mov_b64 s[20:21], 0 (complete replacement of s[20:21])
+    };
+    std::vector<uint32_t> kena_m0_save_restore_accept = kena_m0_save_restore_ambiguous_scalar;
+    kena_m0_save_restore_accept.insert(
+        kena_m0_save_restore_accept.end(), std::begin(code17d), std::end(code17d));
+    CHECK(!recompile_compute(kena_m0_save_restore_accept.data(),
+                             kena_m0_save_restore_accept.size(), nullptr,
+                             native_linear_cfg17d).empty(),
+          "Wave64 dispatcher preserves scalar provenance across entry-M0 save and restore");
+
+    std::vector<uint32_t> kena_m0_pair_read = kena_m0_save_restore_ambiguous_scalar;
+    kena_m0_pair_read[6] = 0xbe960414u; // s_mov_b64 s[22:23], s[20:21] reads full pair
+    kena_m0_pair_read.insert(
+        kena_m0_pair_read.end(), std::begin(code17d), std::end(code17d));
+    CHECK(recompile_compute(kena_m0_pair_read.data(),
+                            kena_m0_pair_read.size(), nullptr,
+                            native_linear_cfg17d).empty(),
+          "reading the full pair at the same site stays refused while base 20 is ambiguous");
+
+
     // An invalid SCC must not regain scalar provenance indirectly. S_CSELECT publishes its chosen
     // dword and ADDC/SUBB publish both a dword and a new SCC, but all three first consume the old
     // SCC. A dispatcher placeholder at that read makes the instruction itself unrepresentable;

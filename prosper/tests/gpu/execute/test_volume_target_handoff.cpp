@@ -425,15 +425,15 @@ int main() {
         target.volume_depth = depth32;
         target.volume_first_slice = 0;
         target.volume_slice_count = depth32;
-        const auto cpu = render_draws_rgba({draw}, kWidth, kHeight, nullptr, nullptr,
+        if (const auto cpu = render_draws_rgba({draw}, kWidth, kHeight, nullptr, nullptr,
                                            false, &target);
-        if (!cpu.empty() || backend_color_target_stats().writes != 1) {
+            !cpu.empty() || backend_color_target_stats().writes != 1) {
             std::fprintf(stderr, "single-pass 32-slice layered volume producer failed to reach retained path\n");
             return 1;
         }
         std::vector<uint8_t> layered_bytes;
-        std::string read_err;
-        if (!readback_persistent_color_target(layered_id, kWidth, kHeight,
+        if (std::string read_err;
+            !readback_persistent_color_target(layered_id, kWidth, kHeight,
                                               VK_FORMAT_R8G8B8A8_UNORM, layered_bytes,
                                               read_err, depth32) ||
             layered_bytes.size() != static_cast<size_t>(kWidth) * kHeight * depth32 * 4) {
@@ -451,8 +451,8 @@ int main() {
                 return 1;
             }
         }
-        const auto sampled = consume(layered_id, depth32);
-        if (backend_color_target_stats().sampled_hits != 1 ||
+        if (const auto sampled = consume(layered_id, depth32);
+            backend_color_target_stats().sampled_hits != 1 ||
             !red(pixel(sampled, 8)) || !red(pixel(sampled, 24)) ||
             !red(pixel(sampled, 40)) || !red(pixel(sampled, 56))) {
             std::fprintf(stderr, "32-slice layered volume was not sampled directly\n");

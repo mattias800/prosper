@@ -14,44 +14,44 @@ namespace prosper::gpu {
 // and samples no custom vertex interpolants beyond procedural fullscreen UV coordinates (Location 0),
 // we synthesize a standard Vulkan vertex + geometry stage.
 //
-// VS emits a fullscreen triangle covering [-1, 1] x [-1, 1], exports out_uv = vec4(pos * 0.5 + 0.5, 0, 1)
+// VS emits a fullscreen triangle covering [-1, 1] x [-1, 1], exports out_uv = vec4(pos.x * 0.5 + 0.5, (1.0 - pos.y) * 0.5, 0, 1)
 // at Location 0, and out_layer = gl_InstanceIndex at Location 1.
 // GS routes in_layer[0] to gl_Layer and in_uv to out_uv (Location 0), emitting all slices in a single instanced draw.
 
-// Size: 374 words (1496 bytes)
-constexpr std::array<uint32_t, 374> kLayeredVolumeVs = {
-    0x07230203u, 0x00010000u, 0x0008000bu, 0x00000036u, 0x00000000u, 0x00020011u, 0x00000001u, 0x0006000bu,
+// Size: 388 words (1552 bytes)
+constexpr std::array<uint32_t, 388> kLayeredVolumeVs = {
+    0x07230203u, 0x00010000u, 0x0008000bu, 0x0000003au, 0x00000000u, 0x00020011u, 0x00000001u, 0x0006000bu,
     0x00000001u, 0x4c534c47u, 0x6474732eu, 0x3035342eu, 0x00000000u, 0x0003000eu, 0x00000000u, 0x00000001u,
     0x000a000fu, 0x00000000u, 0x00000004u, 0x6e69616du, 0x00000000u, 0x0000000cu, 0x0000001fu, 0x00000029u,
-    0x00000033u, 0x00000034u, 0x00030003u, 0x00000002u, 0x000001c2u, 0x00040005u, 0x00000004u, 0x6e69616du,
+    0x00000037u, 0x00000038u, 0x00030003u, 0x00000002u, 0x000001c2u, 0x00040005u, 0x00000004u, 0x6e69616du,
     0x00000000u, 0x00030005u, 0x00000009u, 0x00736f70u, 0x00060005u, 0x0000000cu, 0x565f6c67u, 0x65747265u,
     0x646e4978u, 0x00007865u, 0x00060005u, 0x0000001du, 0x505f6c67u, 0x65567265u, 0x78657472u, 0x00000000u,
     0x00060006u, 0x0000001du, 0x00000000u, 0x505f6c67u, 0x7469736fu, 0x006e6f69u, 0x00070006u, 0x0000001du,
     0x00000001u, 0x505f6c67u, 0x746e696fu, 0x657a6953u, 0x00000000u, 0x00070006u, 0x0000001du, 0x00000002u,
     0x435f6c67u, 0x4470696cu, 0x61747369u, 0x0065636eu, 0x00070006u, 0x0000001du, 0x00000003u, 0x435f6c67u,
     0x446c6c75u, 0x61747369u, 0x0065636eu, 0x00030005u, 0x0000001fu, 0x00000000u, 0x00040005u, 0x00000029u,
-    0x5f74756fu, 0x00007675u, 0x00050005u, 0x00000033u, 0x5f74756fu, 0x6579616cu, 0x00000072u, 0x00070005u,
-    0x00000034u, 0x495f6c67u, 0x6174736eu, 0x4965636eu, 0x7865646eu, 0x00000000u, 0x00040047u, 0x0000000cu,
+    0x5f74756fu, 0x00007675u, 0x00050005u, 0x00000037u, 0x5f74756fu, 0x6579616cu, 0x00000072u, 0x00070005u,
+    0x00000038u, 0x495f6c67u, 0x6174736eu, 0x4965636eu, 0x7865646eu, 0x00000000u, 0x00040047u, 0x0000000cu,
     0x0000000bu, 0x0000002au, 0x00030047u, 0x0000001du, 0x00000002u, 0x00050048u, 0x0000001du, 0x00000000u,
     0x0000000bu, 0x00000000u, 0x00050048u, 0x0000001du, 0x00000001u, 0x0000000bu, 0x00000001u, 0x00050048u,
     0x0000001du, 0x00000002u, 0x0000000bu, 0x00000003u, 0x00050048u, 0x0000001du, 0x00000003u, 0x0000000bu,
-    0x00000004u, 0x00040047u, 0x00000029u, 0x0000001eu, 0x00000000u, 0x00030047u, 0x00000033u, 0x0000000eu,
-    0x00040047u, 0x00000033u, 0x0000001eu, 0x00000001u, 0x00040047u, 0x00000034u, 0x0000000bu, 0x0000002bu,
-    0x00020013u, 0x00000002u, 0x00030021u, 0x00000003u, 0x00000002u, 0x00030016u, 0x00000006u, 0x00000020u,
-    0x00040017u, 0x00000007u, 0x00000006u, 0x00000002u, 0x00040020u, 0x00000008u, 0x00000007u, 0x00000007u,
-    0x00040015u, 0x0000000au, 0x00000020u, 0x00000001u, 0x00040020u, 0x0000000bu, 0x00000001u, 0x0000000au,
-    0x0004003bu, 0x0000000bu, 0x0000000cu, 0x00000001u, 0x0004002bu, 0x0000000au, 0x0000000eu, 0x00000001u,
-    0x00020014u, 0x0000000fu, 0x0004002bu, 0x00000006u, 0x00000011u, 0x40400000u, 0x0004002bu, 0x00000006u,
-    0x00000012u, 0xbf800000u, 0x0004002bu, 0x0000000au, 0x00000015u, 0x00000002u, 0x00040017u, 0x00000019u,
-    0x00000006u, 0x00000004u, 0x00040015u, 0x0000001au, 0x00000020u, 0x00000000u, 0x0004002bu, 0x0000001au,
-    0x0000001bu, 0x00000001u, 0x0004001cu, 0x0000001cu, 0x00000006u, 0x0000001bu, 0x0006001eu, 0x0000001du,
-    0x00000019u, 0x00000006u, 0x0000001cu, 0x0000001cu, 0x00040020u, 0x0000001eu, 0x00000003u, 0x0000001du,
-    0x0004003bu, 0x0000001eu, 0x0000001fu, 0x00000003u, 0x0004002bu, 0x0000000au, 0x00000020u, 0x00000000u,
-    0x0004002bu, 0x00000006u, 0x00000022u, 0x00000000u, 0x0004002bu, 0x00000006u, 0x00000023u, 0x3f800000u,
-    0x00040020u, 0x00000027u, 0x00000003u, 0x00000019u, 0x0004003bu, 0x00000027u, 0x00000029u, 0x00000003u,
-    0x0004002bu, 0x00000006u, 0x0000002bu, 0x3f000000u, 0x0005002cu, 0x00000007u, 0x0000002du, 0x0000002bu,
-    0x0000002bu, 0x00040020u, 0x00000032u, 0x00000003u, 0x0000000au, 0x0004003bu, 0x00000032u, 0x00000033u,
-    0x00000003u, 0x0004003bu, 0x0000000bu, 0x00000034u, 0x00000001u, 0x00050036u, 0x00000002u, 0x00000004u,
+    0x00000004u, 0x00040047u, 0x00000029u, 0x0000001eu, 0x00000000u, 0x00040047u, 0x00000037u, 0x0000001eu,
+    0x00000001u, 0x00040047u, 0x00000038u, 0x0000000bu, 0x0000002bu, 0x00020013u, 0x00000002u, 0x00030021u,
+    0x00000003u, 0x00000002u, 0x00030016u, 0x00000006u, 0x00000020u, 0x00040017u, 0x00000007u, 0x00000006u,
+    0x00000002u, 0x00040020u, 0x00000008u, 0x00000007u, 0x00000007u, 0x00040015u, 0x0000000au, 0x00000020u,
+    0x00000001u, 0x00040020u, 0x0000000bu, 0x00000001u, 0x0000000au, 0x0004003bu, 0x0000000bu, 0x0000000cu,
+    0x00000001u, 0x0004002bu, 0x0000000au, 0x0000000eu, 0x00000001u, 0x00020014u, 0x0000000fu, 0x0004002bu,
+    0x00000006u, 0x00000011u, 0x40400000u, 0x0004002bu, 0x00000006u, 0x00000012u, 0xbf800000u, 0x0004002bu,
+    0x0000000au, 0x00000015u, 0x00000002u, 0x00040017u, 0x00000019u, 0x00000006u, 0x00000004u, 0x00040015u,
+    0x0000001au, 0x00000020u, 0x00000000u, 0x0004002bu, 0x0000001au, 0x0000001bu, 0x00000001u, 0x0004001cu,
+    0x0000001cu, 0x00000006u, 0x0000001bu, 0x0006001eu, 0x0000001du, 0x00000019u, 0x00000006u, 0x0000001cu,
+    0x0000001cu, 0x00040020u, 0x0000001eu, 0x00000003u, 0x0000001du, 0x0004003bu, 0x0000001eu, 0x0000001fu,
+    0x00000003u, 0x0004002bu, 0x0000000au, 0x00000020u, 0x00000000u, 0x0004002bu, 0x00000006u, 0x00000022u,
+    0x00000000u, 0x0004002bu, 0x00000006u, 0x00000023u, 0x3f800000u, 0x00040020u, 0x00000027u, 0x00000003u,
+    0x00000019u, 0x0004003bu, 0x00000027u, 0x00000029u, 0x00000003u, 0x0004002bu, 0x0000001au, 0x0000002au,
+    0x00000000u, 0x00040020u, 0x0000002bu, 0x00000007u, 0x00000006u, 0x0004002bu, 0x00000006u, 0x0000002eu,
+    0x3f000000u, 0x00040020u, 0x00000036u, 0x00000003u, 0x0000000au, 0x0004003bu, 0x00000036u, 0x00000037u,
+    0x00000003u, 0x0004003bu, 0x0000000bu, 0x00000038u, 0x00000001u, 0x00050036u, 0x00000002u, 0x00000004u,
     0x00000000u, 0x00000003u, 0x000200f8u, 0x00000005u, 0x0004003bu, 0x00000008u, 0x00000009u, 0x00000007u,
     0x0004003du, 0x0000000au, 0x0000000du, 0x0000000cu, 0x000500aau, 0x0000000fu, 0x00000010u, 0x0000000du,
     0x0000000eu, 0x000600a9u, 0x00000006u, 0x00000013u, 0x00000010u, 0x00000011u, 0x00000012u, 0x0004003du,
@@ -61,12 +61,14 @@ constexpr std::array<uint32_t, 374> kLayeredVolumeVs = {
     0x00000021u, 0x00000009u, 0x00050051u, 0x00000006u, 0x00000024u, 0x00000021u, 0x00000000u, 0x00050051u,
     0x00000006u, 0x00000025u, 0x00000021u, 0x00000001u, 0x00070050u, 0x00000019u, 0x00000026u, 0x00000024u,
     0x00000025u, 0x00000022u, 0x00000023u, 0x00050041u, 0x00000027u, 0x00000028u, 0x0000001fu, 0x00000020u,
-    0x0003003eu, 0x00000028u, 0x00000026u, 0x0004003du, 0x00000007u, 0x0000002au, 0x00000009u, 0x0005008eu,
-    0x00000007u, 0x0000002cu, 0x0000002au, 0x0000002bu, 0x00050081u, 0x00000007u, 0x0000002eu, 0x0000002cu,
-    0x0000002du, 0x00050051u, 0x00000006u, 0x0000002fu, 0x0000002eu, 0x00000000u, 0x00050051u, 0x00000006u,
-    0x00000030u, 0x0000002eu, 0x00000001u, 0x00070050u, 0x00000019u, 0x00000031u, 0x0000002fu, 0x00000030u,
-    0x00000022u, 0x00000023u, 0x0003003eu, 0x00000029u, 0x00000031u, 0x0004003du, 0x0000000au, 0x00000035u,
-    0x00000034u, 0x0003003eu, 0x00000033u, 0x00000035u, 0x000100fdu, 0x00010038u
+    0x0003003eu, 0x00000028u, 0x00000026u, 0x00050041u, 0x0000002bu, 0x0000002cu, 0x00000009u, 0x0000002au,
+    0x0004003du, 0x00000006u, 0x0000002du, 0x0000002cu, 0x00050085u, 0x00000006u, 0x0000002fu, 0x0000002du,
+    0x0000002eu, 0x00050081u, 0x00000006u, 0x00000030u, 0x0000002fu, 0x0000002eu, 0x00050041u, 0x0000002bu,
+    0x00000031u, 0x00000009u, 0x0000001bu, 0x0004003du, 0x00000006u, 0x00000032u, 0x00000031u, 0x00050083u,
+    0x00000006u, 0x00000033u, 0x00000023u, 0x00000032u, 0x00050085u, 0x00000006u, 0x00000034u, 0x00000033u,
+    0x0000002eu, 0x00070050u, 0x00000019u, 0x00000035u, 0x00000030u, 0x00000034u, 0x00000022u, 0x00000023u,
+    0x0003003eu, 0x00000029u, 0x00000035u, 0x0004003du, 0x0000000au, 0x00000039u, 0x00000038u, 0x0003003eu,
+    0x00000037u, 0x00000039u, 0x000100fdu, 0x00010038u,
 };
 
 // Size: 452 words (1808 bytes)
@@ -130,27 +132,78 @@ constexpr std::array<uint32_t, 452> kLayeredVolumeGs = {
     0x00000016u, 0x000100dbu, 0x000100fdu, 0x00010038u
 };
 
-inline bool is_layered_volume_producer_candidate(
-    const RenderState& rs,
-    const GpuState& ds,
-    const GpuState::Draw* draw,
-    bool vs_empty,
-    bool fs_empty,
-    const FragmentInterpolationLayout& interp,
-    const PixelInputMapping* pixel_inputs,
-    uint32_t vcount_hint) {
-    if (!vs_empty || fs_empty) return false;
-    const auto volume0 = color_target_volume_view(rs.color_targets[0]);
+#include "diagnostics/env_cache.hpp"
+#include "gpu/resources/shader_resources.hpp"
+#include <memory>
+#include <mutex>
+#include <set>
+#include <vector>
+
+struct LayeredVolumeCandidateContext {
+    const RenderState& rs;
+    const GpuState& ds;
+    const GpuState::Draw* draw;
+    bool vs_empty;
+    bool fs_empty;
+    const FragmentInterpolationLayout& interp;
+    const PixelInputMapping* pixel_inputs;
+    uint32_t vcount_hint;
+};
+
+inline bool is_layered_volume_producer_candidate(const LayeredVolumeCandidateContext& ctx) {
+    if (!ctx.vs_empty || ctx.fs_empty) return false;
+    const auto volume0 = color_target_volume_view(ctx.rs.color_targets[0]);
     if (volume0.selected_mip_depth <= 1u || volume0.slice_count <= 1u) return false;
-    const uint32_t instances = draw ? draw->instance_count : ds.num_instances;
-    if (instances < volume0.slice_count || instances <= 1u) return false;
-    if (interp.requires_geometry) return false;
+    if (const uint32_t instances = ctx.draw ? ctx.draw->instance_count : ctx.ds.num_instances;
+        instances < volume0.slice_count || instances <= 1u) {
+        return false;
+    }
+    if (ctx.interp.requires_geometry) return false;
     // Layered procedural volume pass provides procedural fullscreen quad UVs at Location 0.
     // Fragment shaders requiring custom vertex interpolants beyond Location 0 cannot use this path.
-    if ((interp.attribute_mask & ~1u) != 0u || interp.passthrough_mask != 0u) return false;
-    if (pixel_inputs && pixel_inputs->consumed_known && (pixel_inputs->consumed_mask & ~1u) != 0u) return false;
-    if (vcount_hint > 4u) return false;
+    if ((ctx.interp.attribute_mask & ~1u) != 0u || ctx.interp.passthrough_mask != 0u) return false;
+    if (ctx.pixel_inputs && ctx.pixel_inputs->consumed_known &&
+        (ctx.pixel_inputs->consumed_mask & ~1u) != 0u) {
+        return false;
+    }
+    if (ctx.vcount_hint > 4u) return false;
     return true;
+}
+
+struct LayeredVolumeSynthesisOutput {
+    std::vector<uint32_t>& vs;
+    std::vector<uint32_t>& gs;
+    std::shared_ptr<const std::vector<uint32_t>>& vs_shared;
+    uint32_t& vs_identity;
+    std::shared_ptr<ShaderResourceTable>& vrt;
+};
+
+inline void synthesize_layered_volume_producer(
+    const RenderState& rs,
+    uint32_t instances,
+    LayeredVolumeSynthesisOutput out,
+    bool log) {
+    out.vs.assign(std::begin(kLayeredVolumeVs), std::end(kLayeredVolumeVs));
+    out.gs.assign(std::begin(kLayeredVolumeGs), std::end(kLayeredVolumeGs));
+    out.vs_shared.reset();
+    out.vs_identity = 0;
+    out.vrt = std::make_shared<ShaderResourceTable>();
+    static std::set<uint64_t> announced_targets;
+    static std::mutex announced_mu;
+    bool should_log = log || PROSPER_ENV_ON("PROSPER_LAYERED_VOLUME_LOG");
+    if (!should_log) {
+        std::lock_guard lock(announced_mu);
+        should_log = announced_targets.insert(rs.color0_base).second;
+    }
+    if (should_log) {
+        const auto volume_info = color_target_volume_view(rs.color_targets[0]);
+        std::fprintf(stderr,
+            "[exec] synthesized layered volume producer: target=0x%llx extent=%ux%u slices=%u instances=%u\n",
+            static_cast<unsigned long long>(rs.color0_base),
+            rs.color0_width, rs.color0_height,
+            volume_info.slice_count,
+            instances);
+    }
 }
 
 } // namespace prosper::gpu
