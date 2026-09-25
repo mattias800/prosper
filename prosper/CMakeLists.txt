@@ -1564,9 +1564,12 @@ if(TARGET prosper_core)
   set_tests_properties(decode_scratch_poisoned PROPERTIES
     ENVIRONMENT "PROSPER_DECODE_SCRATCH_POISON=1")
 
+  # The pool's reuse census reports at end of run through diagnostics/exit_reports, so this
+  # target needs `src` on its include path and that translation unit linked in.
   add_executable(test_cpu_rtt_snapshot_pool
-    frontends/shared/tests/test_cpu_rtt_snapshot_pool.cpp)
-  target_include_directories(test_cpu_rtt_snapshot_pool PRIVATE frontends)
+    frontends/shared/tests/test_cpu_rtt_snapshot_pool.cpp
+    src/diagnostics/exit_reports.cpp)
+  target_include_directories(test_cpu_rtt_snapshot_pool PRIVATE frontends src)
   target_link_libraries(test_cpu_rtt_snapshot_pool PRIVATE Threads::Threads)
   add_test(NAME cpu_rtt_snapshot_pool COMMAND test_cpu_rtt_snapshot_pool)
 

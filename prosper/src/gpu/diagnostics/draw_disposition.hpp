@@ -102,7 +102,17 @@ public:
     // silence -- "every pass was healthy" and "no pass ever ran" both print nothing per-pass.
     void report_totals();
 
+    // Records one completed pass's wall time against how many draws it held. Bucketed by draw
+    // count, because the question this answers is not "how long is a pass" but "how much of a
+    // pass is FIXED" -- the cost a pass pays whether it holds one draw or fifty. The mean
+    // duration of a one-draw pass is that fixed cost plus a single draw's variable cost, so the
+    // bucket series is the measurement and no curve needs to be assumed. A regression would have
+    // to assume linearity; buckets show the shape and let it be false.
+    void note_pass_duration(uint64_t draws, uint64_t nanoseconds);
+
     // Programmatic readers (tests, tools). Totals are process-lifetime, not per pass.
+    // The current pass's seen count, for the scope guard to read before report_pass() resets it.
+    uint64_t pass_seen_for_scope() const;
     uint64_t seen() const;
     uint64_t recorded() const;
     uint64_t dropped(DrawDrop reason) const;
@@ -123,10 +133,13 @@ DrawDispositionCensus& draw_disposition_census();
 // entirely. A guard is used rather than auditing the 48 `return` statements in the enclosing
 // function because the next `return` added would silently reintroduce the leak.
 struct DrawDispositionPassScope {
-    DrawDispositionPassScope() = default;
+    DrawDispositionPassScope();
     DrawDispositionPassScope(const DrawDispositionPassScope&) = delete;
     DrawDispositionPassScope& operator=(const DrawDispositionPassScope&) = delete;
-    ~DrawDispositionPassScope() { draw_disposition_census().report_pass(); }
+    ~DrawDispositionPassScope();
+
+private:
+    uint64_t start_ns_ = 0;
 };
 
 }  // namespace prosper::gpu

@@ -84,18 +84,26 @@ static void test_budget_and_resolution_change(Checks& checks) {
     transition.pixels.reset();
     checks.expect(resolution_change.retained_bytes() == 15, "two old sizes occupy the budget");
 
+    // A SMALLER extent now borrows a retained buffer whose capacity already holds it. The arm
+    // here used to assert the opposite ("a different size cannot borrow old pages"), which
+    // recorded the old exact-size policy rather than a correctness requirement: what reuse must
+    // avoid is the reallocation, and a big-enough buffer avoids it. Insisting on an exact match
+    // refused every merely-sufficient buffer and cost a render-target-sized allocation per
+    // publication on a title cycling through extents.
     auto newer = resolution_change.copy(new_source.data(), new_source.size());
-    checks.expect(!newer.reused, "a different size cannot borrow old pages");
+    checks.expect(newer.reused, "a smaller extent borrows a retained buffer that can hold it");
+    // THE arm that guards the risk this change introduces. Reusing a larger buffer must publish
+    // the REQUESTED length, not the donor's: a consumer reads pixels->size(). If assign() were
+    // ever replaced by a memcpy that left the donor's size standing, this goes red and nothing
+    // else here would.
+    checks.expect(newer.pixels->size() == new_source.size(),
+                  "a reused larger buffer publishes the requested size, not the donor's");
+    checks.expect(std::ranges::equal(*newer.pixels, new_source),
+                  "a reused larger buffer publishes byte-exact content");
     newer.pixels.reset();
-    // These three arms failed on the former policy: it refused the new active size forever.
-    checks.expect(resolution_change.retained_bytes() == 12 &&
-                  resolution_change.retained_buffers() == 2,
-                  "new-size release evicts only idle old pages within the budget");
     auto next = resolution_change.copy(new_source.data(), new_source.size());
     checks.expect(next.reused, "new recurring extent becomes reusable");
     checks.expect(std::ranges::equal(*next.pixels, new_source), "new extent retains byte-exact content");
-    checks.expect(!resolution_change.copy(old_source.data(), old_source.size()).reused,
-                  "evicted old extent is not reused");
 
     CpuRttSnapshotPool count_bounded(16, 1);
     auto one = count_bounded.copy(old_source.data(), old_source.size());

@@ -7320,6 +7320,11 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         prosper::frontend::performance_timing_mode(
             timing_log_enabled, prosper::frontend::interactive_performance_timing());
     BackendTexturePathCensus texture_path_census(draws.size());
+    // Declared at the TOP of the body, not next to the draw loop. It reports this pass on every
+    // exit including the early returns below, and it times the pass -- and the first version of
+    // this sat ~2,200 lines lower, so it measured only the tail of each pass and under-reported
+    // the renderer's share of the run. Anything moving it down again silently reintroduces that.
+    const prosper::gpu::DrawDispositionPassScope draw_disposition_scope;
     const bool timing_enabled = timing_mode.measure;
     const auto timing_start = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
     if (timing_enabled) backend_render_timing_stats_storage() = {};
@@ -9511,9 +9516,6 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         }
     }
 
-    // Reports this pass on every exit from here on, including the early returns below -- see
-    // DrawDispositionPassScope for why this is a guard and not a call at the end.
-    const prosper::gpu::DrawDispositionPassScope draw_disposition_scope;
     for (size_t di = 0; di < draws.size(); di++) {
         // Denominator: every draw this pass considers, recorded before any skip path can divert it.
         if (wave64_census) wave64_stats.note_draw(W, H);
