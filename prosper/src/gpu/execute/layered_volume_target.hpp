@@ -20,6 +20,13 @@ namespace prosper::gpu {
 // and samples no custom vertex interpolants beyond procedural fullscreen UV coordinates (Location 0),
 // we synthesize a standard Vulkan vertex + geometry stage.
 //
+// DIAGNOSTIC ONLY:
+// Default admission is rejected (fail-closed) because synthesis replaces the guest vertex stage and
+// vertex resource table with an unindexed fullscreen triangle, which diverges if the guest pass
+// reads bound vertex buffers, uses non-triangle-list topology / odd-strip winding, nonzero vertex
+// offsets, or culling. Enable explicitly via PROSPER_LAYERED_VOLUME_FALLBACK=1 or
+// PROSPER_SYNTHESIZE_LAYERED_VOLUME=1 for diagnostic evaluation.
+//
 // VS emits a fullscreen triangle covering [-1, 1] x [-1, 1], exports out_uv = vec4(pos.x * 0.5 + 0.5, (1.0 - pos.y) * 0.5, 0, 1)
 // at Location 0, and out_layer = gl_InstanceIndex at Location 1.
 // GS routes in_layer[0] to gl_Layer and in_uv to out_uv (Location 0), emitting all slices in a single instanced draw.
@@ -147,13 +154,32 @@ struct LayeredVolumeCandidateContext {
     const FragmentInterpolationLayout& interp;
     const PixelInputMapping* pixel_inputs;
     uint32_t vcount_hint;
-    bool bypass_disabled = false;
+    uint32_t topology = 3u;
+    uint32_t cull_mode = 0u;
+    bool diagnostic_enabled = false;
 };
 
 inline bool is_layered_volume_producer_candidate(const LayeredVolumeCandidateContext& ctx) {
-    if (ctx.bypass_disabled) return false;
+    // Diagnostic-only fallback: default admission is rejected until a bounded translation
+    // preserving guest vertex inputs or complete producer class proof is implemented.
+    if (!ctx.diagnostic_enabled) return false;
     if (!ctx.vs_empty || ctx.fs_empty) return false;
     if (!ctx.interp.valid || ctx.interp.requires_geometry) return false;
+
+    // Topology must be TriangleList (VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST = 3).
+    // Odd strip winding (e.g. TriangleStrip = 4) and line/point topologies are not admitted.
+    if (ctx.topology != 3u) return false;
+
+    // Culling must be disabled; a fullscreen procedural triangle cannot tolerate face culling.
+    if (ctx.cull_mode != 0u) return false;
+
+    // Indexed draws, vertex offsets, and indirect vertex offset overrides are not admitted
+    // by the fixed unindexed procedural triangle.
+    if (ctx.draw && ctx.draw->indexed) return false;
+    if (ctx.rs.ge_indx_offset != 0) return false;
+    if (ctx.draw && ctx.draw->has_vertex_offset_override && ctx.draw->indirect_vertex_offset != 0)
+        return false;
+
     // Layered procedural volume pass provides procedural fullscreen quad UVs at Location 0 only.
     // The fragment stage must have a complete, verified interpolant contract:
     // 1. Fragment interpolation layout must not require attributes beyond Location 0 or raw pass-through.
@@ -204,7 +230,7 @@ inline void synthesize_layered_volume_producer(
     if (should_log) {
         const auto volume_info = color_target_volume_view(rs.color_targets[0]);
         std::fprintf(stderr,
-            "[exec] synthesized layered volume producer: target=0x%llx extent=%ux%u slices=%u instances=%u\n",
+            "[exec] synthesized layered volume producer (diagnostic): target=0x%llx extent=%ux%u slices=%u instances=%u\n",
             static_cast<unsigned long long>(rs.color0_base),
             rs.color0_width, rs.color0_height,
             volume_info.slice_count,

@@ -302,7 +302,9 @@ int main() {
     {
         // Synthesized layered volume producer pass: when a 32-slice volume target has an un-recompiled
         // vertex stage (e.g. unsupported NGG/LDS) but a valid fragment stage without custom interpolants,
-        // realize_draw_item synthesizes kLayeredVolumeVs and kLayeredVolumeGs to render all 32 slices in 1 draw.
+        // realize_draw_item synthesizes kLayeredVolumeVs and kLayeredVolumeGs to render all 32 slices in 1 draw
+        // ONLY under explicit diagnostic enablement (PROSPER_LAYERED_VOLUME_FALLBACK / PROSPER_SYNTHESIZE_LAYERED_VOLUME).
+        // By default, admission is rejected (fail closed with ShaderRecompile).
         alignas(256) static const std::array<uint32_t, 2> invalid_vs = { 0xdeadbeefu, 0xbf810000u };
         GpuState layered_vol = st;
         layered_vol.cx[P::CB_COLOR0_VIEW] = 0x00040000u;
@@ -313,12 +315,11 @@ int main() {
         OperationRealizationFailure fail{};
         const bool made_layered = realize_draw_item(
             layered_vol, &layered_vol.draws[0], 4u, 0x10000u, false, layered_item, &fail);
-        const bool opt_out_active = PROSPER_ENV_ON("PROSPER_NO_LAYERED_VOLUME");
-        if (opt_out_active) {
-            CHECK(!made_layered && fail.reason == RealizationFailureReason::ShaderRecompile,
-                  "PROSPER_NO_LAYERED_VOLUME causes layered volume draw to fail with ShaderRecompile");
-        } else {
-            CHECK(made_layered, "layered volume producer realizes successfully when vertex recompile fails");
+        const bool diag_active = (PROSPER_ENV_ON("PROSPER_LAYERED_VOLUME_FALLBACK") ||
+                                  PROSPER_ENV_ON("PROSPER_SYNTHESIZE_LAYERED_VOLUME")) &&
+                                 !PROSPER_ENV_ON("PROSPER_NO_LAYERED_VOLUME");
+        if (diag_active) {
+            CHECK(made_layered, "layered volume producer realizes successfully when diagnostic fallback is enabled");
             CHECK(layered_item.vs.size() == prosper::gpu::kLayeredVolumeVs.size() &&
                   layered_item.gs.size() == prosper::gpu::kLayeredVolumeGs.size(),
                   "realized draw carries synthesized layered VS and GS SPIR-V modules");
@@ -328,9 +329,12 @@ int main() {
                   "synthesized layered draw renders 32 instances for the 32 volume slices");
             CHECK(layered_item.ps.topology == 3u && layered_item.ps.cull_mode == 0u,
                   "synthesized layered draw sets TriangleList topology and disables culling");
+        } else {
+            CHECK(!made_layered && fail.reason == RealizationFailureReason::ShaderRecompile,
+                  "default admission rejects unproven volume fallback and fails closed with ShaderRecompile");
         }
 
-        // Direct candidate predicate check exercising bypass_disabled explicitly.
+        // Direct candidate predicate checks exercising diagnostic_enabled, topology, culling, indexed draws, and vertex offsets.
         const RenderState rs_candidate = extract_render_state(layered_vol);
         FragmentInterpolationLayout candidate_interp{};
         candidate_interp.valid = true;
@@ -342,13 +346,83 @@ int main() {
             rs_candidate, layered_vol, &layered_vol.draws[0],
             /*vs_empty=*/true, /*fs_empty=*/false,
             candidate_interp, &candidate_inputs, /*vcount_hint=*/3u,
-            /*bypass_disabled=*/false
+            /*topology=*/3u, /*cull_mode=*/0u,
+            /*diagnostic_enabled=*/false
         };
-        CHECK(is_layered_volume_producer_candidate(candidate_ctx),
-              "is_layered_volume_producer_candidate accepts valid volume context when bypass is not disabled");
-        candidate_ctx.bypass_disabled = true;
+        // 1. By default (diagnostic_enabled == false), candidate is declined!
         CHECK(!is_layered_volume_producer_candidate(candidate_ctx),
-              "is_layered_volume_producer_candidate declines when bypass_disabled is true");
+              "is_layered_volume_producer_candidate declines when diagnostic_enabled is false (default)");
+
+        // 2. When diagnostic_enabled is true, valid volume candidate is accepted.
+        candidate_ctx.diagnostic_enabled = true;
+        CHECK(is_layered_volume_producer_candidate(candidate_ctx),
+              "is_layered_volume_producer_candidate accepts valid volume context when diagnostic_enabled is true");
+
+        // 3. Negative control: indexed draw must be rejected.
+        GpuState::Draw indexed_draw = layered_vol.draws[0];
+        indexed_draw.indexed = true;
+        candidate_ctx.draw = &indexed_draw;
+        CHECK(!is_layered_volume_producer_candidate(candidate_ctx),
+              "is_layered_volume_producer_candidate rejects indexed draws");
+        candidate_ctx.draw = &layered_vol.draws[0];
+
+        // 4. Negative control: nonzero vertex offset (ge_indx_offset) must be rejected.
+        {
+            RenderState offset_rs = rs_candidate;
+            offset_rs.ge_indx_offset = 8u;
+            LayeredVolumeCandidateContext ctx_with_offset{
+                offset_rs, layered_vol, &layered_vol.draws[0],
+                /*vs_empty=*/true, /*fs_empty=*/false,
+                candidate_interp, &candidate_inputs, /*vcount_hint=*/3u,
+                /*topology=*/3u, /*cull_mode=*/0u,
+                /*diagnostic_enabled=*/true
+            };
+            CHECK(!is_layered_volume_producer_candidate(ctx_with_offset),
+                  "is_layered_volume_producer_candidate rejects nonzero ge_indx_offset");
+        }
+
+        // 5. Negative control: indirect vertex offset override must be rejected.
+        {
+            GpuState::Draw draw_with_offset = layered_vol.draws[0];
+            draw_with_offset.has_vertex_offset_override = true;
+            draw_with_offset.indirect_vertex_offset = 4;
+            LayeredVolumeCandidateContext ctx_with_indirect_offset{
+                rs_candidate, layered_vol, &draw_with_offset,
+                /*vs_empty=*/true, /*fs_empty=*/false,
+                candidate_interp, &candidate_inputs, /*vcount_hint=*/3u,
+                /*topology=*/3u, /*cull_mode=*/0u,
+                /*diagnostic_enabled=*/true
+            };
+            CHECK(!is_layered_volume_producer_candidate(ctx_with_indirect_offset),
+                  "is_layered_volume_producer_candidate rejects nonzero indirect vertex offset override");
+        }
+
+        // 6. Negative control: culling enabled must be rejected.
+        {
+            LayeredVolumeCandidateContext ctx_with_cull{
+                rs_candidate, layered_vol, &layered_vol.draws[0],
+                /*vs_empty=*/true, /*fs_empty=*/false,
+                candidate_interp, &candidate_inputs, /*vcount_hint=*/3u,
+                /*topology=*/3u, /*cull_mode=*/2u, // VK_CULL_MODE_BACK_BIT
+                /*diagnostic_enabled=*/true
+            };
+            CHECK(!is_layered_volume_producer_candidate(ctx_with_cull),
+                  "is_layered_volume_producer_candidate rejects enabled culling");
+        }
+
+        // 7. Negative control: non-triangle-list topology / odd strip winding must be rejected.
+        {
+            LayeredVolumeCandidateContext ctx_with_strip{
+                rs_candidate, layered_vol, &layered_vol.draws[0],
+                /*vs_empty=*/true, /*fs_empty=*/false,
+                candidate_interp, &candidate_inputs, /*vcount_hint=*/3u,
+                /*topology=*/4u, // VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP
+                /*cull_mode=*/0u,
+                /*diagnostic_enabled=*/true
+            };
+            CHECK(!is_layered_volume_producer_candidate(ctx_with_strip),
+                  "is_layered_volume_producer_candidate rejects triangle strip topology (odd strip winding)");
+        }
 
         // Control: a non-volume 2D target (slice_count == 1) does not qualify for the layered volume
         // bypass, so it declines with ShaderRecompile when the vertex stage fails to recompile.
