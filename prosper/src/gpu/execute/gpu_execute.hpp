@@ -14,6 +14,7 @@
 #include "diagnostics/env_cache.hpp"         // PROSPER_ENV_ON / _VALUE: process-lifetime reads
 #include "diagnostics/env_submit.hpp"        // PROSPER_ENV_ON_PER_SUBMIT: re-sampled each submit
 #include "gpu/pm4/command_processor.hpp"   // GpuState
+#include "gpu/execute/index_expand.hpp"    // validated 16-bit index copy and maximum
 #include "gpu/state/render_state.hpp"        // extract_render_state / resolve_pipeline_state / ResolvedPipelineState
 #include "gpu/pm4/pm4_registers.hpp"        // CB_COLOR_CONTROL operation decode
 #include <cstring>                 // memcpy: aliasing-safe index-buffer fingerprint loads
@@ -2662,7 +2663,7 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
             uint32_t max_index = 0;
             if (esz == 2) {
                 const uint16_t* src = (const uint16_t*)(uintptr_t)index_addr;
-                for (uint32_t i = 0; i < n; i++) { out.indices[i] = src[i]; max_index = std::max(max_index, out.indices[i]); }
+                max_index = copy_indices_u16_max(out.indices.data(), src, n);
             } else {
                 const uint32_t* src = (const uint32_t*)(uintptr_t)index_addr;
                 for (uint32_t i = 0; i < n; i++) { out.indices[i] = src[i]; max_index = std::max(max_index, out.indices[i]); }

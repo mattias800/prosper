@@ -4220,6 +4220,10 @@ endif()
       target_link_libraries(test_gpu_execute PRIVATE prosper_core Vulkan::Vulkan)
       add_test(NAME gpu_execute COMMAND test_gpu_execute)
 
+      add_executable(test_index_expand tests/gpu/execute/test_index_expand.cpp)
+      target_include_directories(test_index_expand PRIVATE src)
+      add_test(NAME index_expand COMMAND test_index_expand)
+
       # Payoff demo: recompile the GAME'S OWN embedded shaders and render them on real Vulkan.
       # Needs both Vulkan and the (gitignored) game dump, so it's gated on HAVE_GAME_DUMP.
       if(HAVE_GAME_DUMP)
