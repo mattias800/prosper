@@ -2940,8 +2940,6 @@ bool emit_cfg_state_machine(
                 if (b64_logical_mask_source || mbcnt_mask_source) continue;
                 const ScalarSourceRead read = scalar_source_read(in, source);
                 if (read == ScalarSourceRead::None) continue;
-                if (in.fmt == Rdna2Format::SOP1 && in.opcode == 0x03 && in.dst.value == 124)
-                    continue;
                 const int first = operand.value;
                 const int last = first + static_cast<int>(read);
                 for (int base : ambiguous) {
@@ -3150,6 +3148,11 @@ bool emit_cfg_state_machine(
                 scalar_words.erase(106);
                 scalar_words.erase(107);
             }
+            // `s_mov_b32 sN, m0` writes one 32-bit scalar dword: M0 is never a wave mask. This is
+            // sound only because every register read that WRITES M0 still passes the ambiguous-pair
+            // check above, so M0 holds either its entry value or a proven scalar. Do not exempt
+            // `s_mov_b32 m0, <src>` from that check: an ambiguous source would reach M0 as the
+            // dispatcher's unproven-scalar zero, and this rule would then certify the copy.
             const bool entry_m0_save = in.fmt == Rdna2Format::SOP1 && in.opcode == 0x03 &&
                 in.src[0].kind == OperandKind::Special && in.src[0].value == 124 &&
                 in.dst.value <= 105;

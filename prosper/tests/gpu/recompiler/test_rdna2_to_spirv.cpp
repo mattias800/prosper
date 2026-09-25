@@ -2234,6 +2234,27 @@ int main() {
                             native_linear_cfg17d).empty(),
           "reading the full pair at the same site stays refused while base 20 is ambiguous");
 
+    // Writing M0 does not make an ambiguous read safe. s20 is still the low half of a mask on
+    // the branch edge, so `s_mov_b32 m0, s20` must refuse like any other scalar copy of it; an
+    // exemption for M0 destinations would hand M0 the dispatcher's unproven-scalar zero.
+    std::vector<uint32_t> kena_m0_from_ambiguous = kena_m0_save_restore_ambiguous_scalar;
+    kena_m0_from_ambiguous[6] = 0xbefc0314u; // s_mov_b32 m0, s20
+    kena_m0_from_ambiguous.insert(
+        kena_m0_from_ambiguous.end(), std::begin(code17d), std::end(code17d));
+    CHECK(recompile_compute(kena_m0_from_ambiguous.data(),
+                            kena_m0_from_ambiguous.size(), nullptr,
+                            native_linear_cfg17d).empty(),
+          "an M0 destination does not exempt an ambiguous Wave64 mask-half read");
+
+    std::vector<uint32_t> kena_sgpr_from_ambiguous = kena_m0_save_restore_ambiguous_scalar;
+    kena_sgpr_from_ambiguous[6] = 0xbe970314u; // s_mov_b32 s23, s20 (same read, SGPR dest)
+    kena_sgpr_from_ambiguous.insert(
+        kena_sgpr_from_ambiguous.end(), std::begin(code17d), std::end(code17d));
+    CHECK(recompile_compute(kena_sgpr_from_ambiguous.data(),
+                            kena_sgpr_from_ambiguous.size(), nullptr,
+                            native_linear_cfg17d).empty(),
+          "control: the same ambiguous read into an SGPR is refused at the same site");
+
 
     // An invalid SCC must not regain scalar provenance indirectly. S_CSELECT publishes its chosen
     // dword and ADDC/SUBB publish both a dword and a new SCC, but all three first consume the old
