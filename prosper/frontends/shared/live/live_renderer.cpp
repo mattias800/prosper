@@ -2087,6 +2087,16 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 prosper::test::invalidate_persistent_color_target_dimension_aliases(
                     write.gpu_addr, write.width, write.height, format, 0u);
                 RttSurf& published = g_rtt[write.gpu_addr];
+                static const bool lifetime_diag =
+                    std::getenv("PROSPER_CPU_RTT_POOL_LIFETIME_DIAG") != nullptr;
+                if (lifetime_diag)
+                    std::fprintf(stderr,
+                                 "[cpu-rtt-snapshot-replace] addr=0x%llx old-bytes=%zu "
+                                 "old-owners=%ld new-bytes=%zu\n",
+                                 (unsigned long long)write.gpu_addr,
+                                 published.rgba ? published.rgba->size() : 0,
+                                 published.rgba ? published.rgba.use_count() : 0L,
+                                 write.linear_pixels->size());
                 published.rgba = write.linear_pixels;
                 published.has_uniform_color = false;
                 published.w = write.width;

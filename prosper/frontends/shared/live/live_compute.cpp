@@ -12684,7 +12684,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                             std::getenv("PROSPER_CPU_RTT_SNAPSHOT_POOL_MB"), 128ull,
                             SIZE_MAX / (1024ull * 1024ull), "MiB");
                         return static_cast<size_t>(mib * 1024ull * 1024ull);
-                    }());
+                    }(), 4, std::getenv("PROSPER_CPU_RTT_POOL_LIFETIME_DIAG") != nullptr);
                     CpuRttSnapshot snapshot;
                     if (snapshot_pool_enabled)
                         snapshot = snapshot_pool.copy(layout_source, linear_bytes);

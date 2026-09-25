@@ -69,6 +69,33 @@ int main() {
         two.pixels.reset();
         CHECK(bounded.retained_buffers() == 1 && bounded.retained_bytes() <= 16);
     }
+    {
+        // A one-off extent between two recurring resolutions must not strand the budget.
+        // The former policy refused every new-size release while older free buffers occupied it.
+        CpuRttSnapshotPool resolution_change(16, 4);
+        const std::array<uint8_t, 7> transition_source{3, 3, 3, 3, 3, 3, 3};
+        const std::array<uint8_t, 5> new_source{6, 6, 6, 6, 6};
+        auto old = resolution_change.copy(original_first.data(), original_first.size());
+        auto transition = resolution_change.copy(transition_source.data(),
+                                                 transition_source.size());
+        old.pixels.reset();
+        transition.pixels.reset();
+        CHECK(resolution_change.retained_bytes() == 15);
+        auto newer = resolution_change.copy(new_source.data(), new_source.size());
+        CHECK(!newer.reused);
+        newer.pixels.reset();
+        CHECK(resolution_change.retained_bytes() == 12 &&
+              resolution_change.retained_buffers() == 2);
+        auto next = resolution_change.copy(small_source.data(), small_source.size());
+        CHECK(next.reused);
+        CHECK(std::equal(next.pixels->begin(), next.pixels->end(),
+                         small_source.begin(), small_source.end()));
+        CHECK(!resolution_change.copy(original_first.data(), original_first.size()).reused);
+        CpuRttSnapshotPool no_entries(32, 0);
+        auto discarded = no_entries.copy(original_first.data(), original_first.size());
+        discarded.pixels.reset();
+        CHECK(no_entries.retained_buffers() == 0);
+    }
 
     // Destruction of the wrapper cannot invalidate a snapshot released by another thread.
     std::shared_ptr<const std::vector<uint8_t>> outliving_snapshot;
