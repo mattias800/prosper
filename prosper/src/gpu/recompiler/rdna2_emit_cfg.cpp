@@ -416,6 +416,104 @@ std::unordered_set<uint32_t> proven_smem_pointer_loads(const std::vector<Rdna2In
     return proven;
 }
 
+// A raw x2 load often supplies pointer/descriptor provenance; merely having a known SBASE
+// does not justify adding a data binding. Admit one when BOTH loaded words are directly read
+// by supported B32 scalar operations before a control transfer. Those reads require actual
+// current bytes. This is not a claim that derivatives cannot later form descriptors or
+// pointers: loading the same bytes remains correct for those paths too. Original-word
+// lifetimes use the emitter's complete scalar-write inventory, including secondary writes.
+// Branches before the candidate load do not affect its own observation window.
+std::vector<uint32_t> proven_raw_x2_data_loads_impl(const std::vector<Rdna2Inst>& ins) {
+    std::vector<uint32_t> proven;
+    for (size_t load_index = 0; load_index < ins.size(); ++load_index) {
+        const Rdna2Inst& load = ins[load_index];
+        if (load.fmt != Rdna2Format::SMEM || load.opcode != kSmemOpcodeLoadDwordX2 ||
+            load.dst.kind != OperandKind::SGPR || load.dst.value < 0 || load.dst.value > 104 ||
+            load.src[1].kind != OperandKind::Special || load.src[1].value != 125 ||
+            static_cast<int32_t>(load.literal) < 0)
+            continue;
+
+        const int first = load.dst.value;
+        bool live[2] = {true, true};
+        bool used[2] = {false, false};
+        bool valid = true;
+        auto touches_live = [&](int base, uint32_t width) {
+            if (base < 0 || !width) return false;
+            for (int word = 0; word < 2; ++word)
+                if (live[word] && base <= first + word &&
+                    static_cast<uint32_t>(first + word - base) < width)
+                    return true;
+            return false;
+        };
+        for (size_t index = load_index + 1; index < ins.size() && valid; ++index) {
+            const Rdna2Inst& in = ins[index];
+            if (in.fmt == Rdna2Format::Unknown || in.len_dwords == 0) {
+                valid = false;
+                break;
+            }
+            if (in.is_end) break;
+            // WAITCNT, NOP and CLAUSE are the only SOPP instructions allowed while the
+            // loaded pair is live. A branch could re-enter a use without this load.
+            if (in.fmt == Rdna2Format::SOPP && in.opcode != 0x00 &&
+                in.opcode != 0x0c && in.opcode != 0x20) {
+                valid = false;
+                break;
+            }
+            // SETPC/SWAPPC/RFE leave this local instruction stream. Direct scalar
+            // observations already made before this transfer still need current bytes;
+            // make no claim about their derivatives or later uses.
+            const bool indirect_transfer = in.fmt == Rdna2Format::SOP1 &&
+                in.opcode >= 0x20 && in.opcode <= 0x22;
+            if (scalar_implicit_destination_read_width(in) &&
+                touches_live(in.dst.value, scalar_implicit_destination_read_width(in))) {
+                valid = false;
+                break;
+            }
+            const bool scalar_data_op = in.fmt == Rdna2Format::SOP2 &&
+                (in.opcode == 0x1e || in.opcode == 0x27);
+            for (uint32_t source = 0; source < in.n_src; ++source) {
+                const Operand& operand = in.src[source];
+                if (operand.kind != OperandKind::SGPR &&
+                    !(operand.kind == OperandKind::Special && operand.value >= 106 &&
+                      operand.value <= 124))
+                    continue;
+                uint32_t width = 1;
+                if (in.fmt == Rdna2Format::SMEM && source == 0)
+                    width = in.opcode >= 8 ? 4 : 2;
+                else if (in.fmt == Rdna2Format::MIMG && source == 1)
+                    width = 8;
+                else if (in.fmt == Rdna2Format::MIMG && source == 2)
+                    width = 4;
+                else if ((in.fmt == Rdna2Format::MUBUF || in.fmt == Rdna2Format::MTBUF) &&
+                         source == 1)
+                    width = 4;
+                else if (!scalar_data_op &&
+                         (in.fmt == Rdna2Format::SOP1 || in.fmt == Rdna2Format::SOP2 ||
+                          in.fmt == Rdna2Format::SOPC || in.fmt == Rdna2Format::VOP3))
+                    width = 2; // conservative for B64 forms
+                if (!touches_live(operand.value, width)) continue;
+                if (!scalar_data_op) {
+                    valid = false;
+                    break;
+                }
+                for (int word = 0; word < 2; ++word)
+                    if (live[word] && operand.value == first + word) used[word] = true;
+            }
+            if (!valid) break;
+            if (indirect_transfer) break;
+            for_each_scalar_write(in, [&](int base, uint32_t width) {
+                for (int word = 0; word < 2; ++word)
+                    if (base >= 0 && base <= first + word &&
+                        static_cast<uint32_t>(first + word - base) < width)
+                        live[word] = false;
+            });
+            if (!live[0] && !live[1]) break;
+        }
+        if (valid && used[0] && used[1]) proven.push_back(load.pc);
+    }
+    return proven;
+}
+
 // Prove S_LOAD_DWORDX2 descriptor-fragment shapes. The load supplies one or two live words of a
 // four-dword V#; scalar code fills or replaces the other words before MUBUF, MTBUF, or S_BUFFER_LOAD
 // consumes the complete live descriptor. The front half has already read the guest words and
@@ -1089,6 +1187,10 @@ bool has_unpersisted_b32_mask_lifetime(const std::vector<Rdna2Inst>& ins,
 
 } // namespace
 
+std::vector<uint32_t> rdna2_proven_raw_x2_data_loads(const std::vector<Rdna2Inst>& ins) {
+    return proven_raw_x2_data_loads_impl(ins);
+}
+
 int shader_max_vgpr(const std::vector<Rdna2Inst>& ins) {
     int highest = 0;
     for (const auto& in : ins) {
@@ -1421,6 +1523,8 @@ bool region_defines_vcc_before_any_read(const std::vector<Rdna2Inst>& ins) {
 void seed_smem_pointer_provenance(RegState& rs, const std::vector<Rdna2Inst>& ins) {
     if (rs.smem_pointer_analysis_done) return;
     rs.smem_pointer_loads = proven_smem_pointer_loads(ins);
+    const auto raw_x2_data = proven_raw_x2_data_loads_impl(ins);
+    rs.smem_raw_x2_data_loads.insert(raw_x2_data.begin(), raw_x2_data.end());
     rs.smem_pointer_analysis_done = true;
 }
 
@@ -4030,6 +4134,7 @@ bool emit_cfg_state_machine(
         state.smem_x16_descriptor_loads = initial.smem_x16_descriptor_loads;
         state.smem_x16_descriptor_analysis_done = initial.smem_x16_descriptor_analysis_done;
         state.smem_pointer_loads = initial.smem_pointer_loads;
+        state.smem_raw_x2_data_loads = initial.smem_raw_x2_data_loads;
         state.smem_pointer_analysis_done = initial.smem_pointer_analysis_done;
         state.smem_x2_descriptor_fragment_loads =
             initial.smem_x2_descriptor_fragment_loads;
