@@ -9,6 +9,7 @@
 #include "shared/compute/compute_transfer_gate_census.hpp"
 #include "shared/compute/storage_image_alias_plan.hpp"
 #include "shared/live/decode_scratch.hpp"  // pooled full-surface intermediates (#3309's mechanism)
+#include "shared/live/cpu_rtt_snapshot_pool.hpp"
 #include "shared/live/live_target_format.hpp"
 #include "shared/live/packed_rtt_conversion.hpp"
 #include "shared/live/gpu_retile.hpp"
@@ -12675,8 +12676,21 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         std::getenv("PROSPER_CPU_RTT_PUBLICATION_CENSUS") != nullptr;
                     const auto publication_start = publication_census
                         ? ComputeClock::now() : ComputeClock::time_point{};
-                    auto pixels = std::make_shared<std::vector<uint8_t>>(
-                        layout_source, layout_source + linear_bytes);
+                    static const bool snapshot_pool_enabled =
+                        std::getenv("PROSPER_NO_CPU_RTT_SNAPSHOT_POOL") == nullptr;
+                    static CpuRttSnapshotPool snapshot_pool([] {
+                        const uint64_t mib = prosper::diag::env_u64_or_default_capped(
+                            "PROSPER_CPU_RTT_SNAPSHOT_POOL_MB",
+                            std::getenv("PROSPER_CPU_RTT_SNAPSHOT_POOL_MB"), 128ULL,
+                            SIZE_MAX / (1024ULL * 1024ULL), "MiB");
+                        return static_cast<size_t>(mib * 1024ULL * 1024ULL);
+                    }());
+                    CpuRttSnapshot snapshot;
+                    if (snapshot_pool_enabled)
+                        snapshot = snapshot_pool.copy(layout_source, linear_bytes);
+                    else
+                        snapshot.pixels = std::make_shared<std::vector<uint8_t>>(
+                            layout_source, layout_source + linear_bytes);
                     if (publication_census) {
                         const auto materialize_ms = std::chrono::duration<double, std::milli>(
                             ComputeClock::now() - publication_start).count();
@@ -12684,7 +12698,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                      "[compute-cpu-rtt-publication] code=0x%llx submit=%llu "
                                      "dispatch=%llu binding=%u addr=0x%llx fmt=%u comps=%u tile=%u "
                                      "extent=%ux%u linear-bytes=%zu guest-bytes=%zu "
-                                     "gpu-retile=%u direct-retile=%u materialize_ms=%.3f\n",
+                                     "gpu-retile=%u direct-retile=%u pool-enabled=%u pool-hit=%u "
+                                     "materialize_ms=%.3f\n",
                                      (unsigned long long)item.code_addr,
                                      (unsigned long long)item.submit_no,
                                      (unsigned long long)item.dispatch_index, bi.binding,
@@ -12692,10 +12707,12 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                      (unsigned)r->format, r->num_components, r->tile_mode,
                                      r->width, r->height, linear_bytes, bi.guest_bytes,
                                      bi.retile_buffer ? 1u : 0u, bi.direct_retile ? 1u : 0u,
+                                     snapshot_pool_enabled ? 1u : 0u, snapshot.reused ? 1u : 0u,
                                      materialize_ms);
                     }
                     notify_live_render_target_image_written({
-                        r->gpu_addr, r->width, r->height, *target_format, std::move(pixels)});
+                        r->gpu_addr, r->width, r->height, *target_format,
+                        std::move(snapshot.pixels)});
                     if (trace)
                         std::fprintf(stderr,
                                      "[compute]   published linear storage result into renderer RTT "

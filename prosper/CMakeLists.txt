@@ -1564,6 +1564,12 @@ if(TARGET prosper_core)
   set_tests_properties(decode_scratch_poisoned PROPERTIES
     ENVIRONMENT "PROSPER_DECODE_SCRATCH_POISON=1")
 
+  add_executable(test_cpu_rtt_snapshot_pool
+    frontends/shared/tests/test_cpu_rtt_snapshot_pool.cpp)
+  target_include_directories(test_cpu_rtt_snapshot_pool PRIVATE frontends)
+  target_link_libraries(test_cpu_rtt_snapshot_pool PRIVATE Threads::Threads)
+  add_test(NAME cpu_rtt_snapshot_pool COMMAND test_cpu_rtt_snapshot_pool)
+
   add_executable(test_depth_cube_quantize frontends/shared/tests/test_depth_cube_quantize.cpp)
   target_include_directories(test_depth_cube_quantize PRIVATE frontends)
   add_test(NAME depth_cube_quantize COMMAND test_depth_cube_quantize)
