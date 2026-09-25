@@ -961,6 +961,49 @@ int main() {
     printf("  kernel14b mismatches=%u\n", bad14b);
     CHECK(got14b.size()==N && bad14b==0, "recompiled kernel 14b (pkrtz e64 / VOP3 0x12f) packs f16 bit-exactly");
 
+    // The f16-exact inputs above cannot distinguish RNE from RTZ. Feed raw f32 bits through
+    // the production Vulkan runner and check both instruction encodings. Each expected dword
+    // is independent of the SPIR-V converter and includes both lanes and signs.
+    struct PkrtzCase { uint32_t lo, hi, packed; };
+    constexpr PkrtzCase pkrtz_cases[] = {
+        {0x3f801000u, 0xbf801000u, 0xbc003c00u}, // halfway: RTZ, not RNE
+        {0x3f801001u, 0xbf801001u, 0xbc003c00u}, // above halfway: still RTZ
+        {0x3f803000u, 0xbf803000u, 0xbc013c01u},
+        {0x47c35000u, 0xc7c35000u, 0xfbff7bffu}, // finite overflow
+        {0x7f800000u, 0xff800000u, 0xfc007c00u}, // true infinities
+        {0x7fc00000u, 0xffc00000u, 0xfe007e00u}, // signed quiet NaNs
+        {0x7f800001u, 0xff800001u, 0xfe007e00u}, // signaling NaNs quieted
+        {0x00000000u, 0x80000000u, 0x80000000u}, // signed zero
+        {0x33800000u, 0xb3800000u, 0x80010001u}, // smallest half subnormal
+        {0x33000000u, 0xb3000000u, 0x80000000u}, // below half subnormal
+        {0x387fffffu, 0xb87fffffu, 0x83ff03ffu}, // largest half subnormal
+        {0x38800000u, 0xb8800000u, 0x84000400u}, // smallest half normal
+        {0x7fc00001u, 0x3f800000u, 0x3c007e00u}, // no lane cross-contamination
+    };
+    std::vector<float> pkrtz_inputs(N * 2, 0.0f);
+    for (size_t i = 0; i < std::size(pkrtz_cases); ++i) {
+        std::memcpy(&pkrtz_inputs[i * 2], &pkrtz_cases[i].lo, 4);
+        std::memcpy(&pkrtz_inputs[i * 2 + 1], &pkrtz_cases[i].hi, 4);
+    }
+    const auto check_pkrtz_cases = [&](const std::vector<uint32_t>& module) {
+        const auto output = prosper::test::run_compute(module, pkrtz_inputs, N, N);
+        if (output.size() != N) return false;
+        for (size_t i = 0; i < std::size(pkrtz_cases); ++i)
+            if (bits_of(output[i]) != pkrtz_cases[i].packed) {
+                printf("  pkrtz case %zu got=%08x expected=%08x\n",
+                       i, bits_of(output[i]), pkrtz_cases[i].packed);
+                return false;
+            }
+        return true;
+    };
+    CHECK(check_pkrtz_cases(spv14), "pkrtz e32 rounds finite lanes toward zero and retains exceptional classes");
+    CHECK(check_pkrtz_cases(spv14b), "pkrtz e64 rounds finite lanes toward zero and retains exceptional classes");
+    // VOP3 CLAMP on this packed result has a separate modifier contract. The production ALU
+    // tail rejects an unhandled CLAMP instead of silently publishing an unclamped packed word.
+    const uint32_t code14b_clamped[] = { 0xd52f8000u, 0x00020300u, 0xbf810000u };
+    CHECK(recompile_valu(code14b_clamped, std::size(code14b_clamped), 2, 0).empty(),
+          "pkrtz e64 with unmodeled CLAMP fails closed rather than ignoring saturation");
+
     // Kernel 15: v_bfrev_b32 (VOP1 0x38). u0=(uint)a0; out_bits = bitreverse(u0). Bit-exact.
     const uint32_t code15[] = { 0x7e000f00u, 0x7e007100u, 0xbf810000u };
     std::vector<uint32_t> spv15 = recompile_valu(code15, sizeof(code15)/sizeof(code15[0]), 1, 0);
