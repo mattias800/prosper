@@ -12681,10 +12681,10 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     static CpuRttSnapshotPool snapshot_pool([] {
                         const uint64_t mib = prosper::diag::env_u64_or_default_capped(
                             "PROSPER_CPU_RTT_SNAPSHOT_POOL_MB",
-                            std::getenv("PROSPER_CPU_RTT_SNAPSHOT_POOL_MB"), 128ull,
-                            SIZE_MAX / (1024ull * 1024ull), "MiB");
-                        return static_cast<size_t>(mib * 1024ull * 1024ull);
-                    }(), 4, std::getenv("PROSPER_CPU_RTT_POOL_LIFETIME_DIAG") != nullptr);
+                            std::getenv("PROSPER_CPU_RTT_SNAPSHOT_POOL_MB"), 128ULL,
+                            SIZE_MAX / (1024ULL * 1024ULL), "MiB");
+                        return static_cast<size_t>(mib * 1024ULL * 1024ULL);
+                    }());
                     CpuRttSnapshot snapshot;
                     if (snapshot_pool_enabled)
                         snapshot = snapshot_pool.copy(layout_source, linear_bytes);
