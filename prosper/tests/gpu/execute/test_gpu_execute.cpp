@@ -311,6 +311,8 @@ int main() {
         set_pgm(layered_vol, P::SPI_SHADER_PGM_LO_ES, P::SPI_SHADER_PGM_HI_ES, invalid_vs.data());
         DrawItem layered_item;
         OperationRealizationFailure fail{};
+        const bool made_layered = realize_draw_item(
+            layered_vol, &layered_vol.draws[0], 4u, 0x10000u, false, layered_item, &fail);
         const bool opt_out_active = PROSPER_ENV_ON("PROSPER_NO_LAYERED_VOLUME");
         if (opt_out_active) {
             CHECK(!made_layered && fail.reason == RealizationFailureReason::ShaderRecompile,
@@ -329,7 +331,7 @@ int main() {
         }
 
         // Direct candidate predicate check exercising bypass_disabled explicitly.
-        const RenderState rs_candidate = parse_render_state(layered_vol);
+        const RenderState rs_candidate = extract_render_state(layered_vol);
         FragmentInterpolationLayout candidate_interp{};
         candidate_interp.valid = true;
         candidate_interp.attribute_mask = 1u;

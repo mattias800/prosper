@@ -3046,6 +3046,9 @@ bool emit_cfg_state_machine(
                 scalar_words.erase(106);
                 scalar_words.erase(107);
             }
+            const bool entry_m0_save = in.fmt == Rdna2Format::SOP1 && in.opcode == 0x03 &&
+                in.src[0].kind == OperandKind::Special && in.src[0].value == 124 &&
+                in.dst.value <= 105;
             if (mask_write >= 0) {
                 masks.insert(mask_write);
                 ambiguous.erase(mask_write);
@@ -3084,9 +3087,6 @@ bool emit_cfg_state_machine(
                         for (uint32_t word = 0; word < width; ++word)
                             scalar_words.erase(base + static_cast<int>(word));
                 }
-            const bool entry_m0_save = in.fmt == Rdna2Format::SOP1 && in.opcode == 0x03 &&
-                in.src[0].kind == OperandKind::Special && in.src[0].value == 124 &&
-                in.dst.value <= 105;
             } else if (valid_scc_read &&
                        ((in.fmt != Rdna2Format::SOP1 &&
                          in.fmt != Rdna2Format::SOP2 &&
