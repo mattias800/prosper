@@ -1570,6 +1570,7 @@ if(TARGET prosper_core)
     frontends/shared/tests/test_cpu_rtt_snapshot_pool.cpp
     src/diagnostics/exit_reports.cpp)
   target_include_directories(test_cpu_rtt_snapshot_pool PRIVATE frontends src)
+  target_sources(test_cpu_rtt_snapshot_pool PRIVATE src/diagnostics/worker_spawn_census.cpp)
   target_link_libraries(test_cpu_rtt_snapshot_pool PRIVATE Threads::Threads)
   add_test(NAME cpu_rtt_snapshot_pool COMMAND test_cpu_rtt_snapshot_pool)
 

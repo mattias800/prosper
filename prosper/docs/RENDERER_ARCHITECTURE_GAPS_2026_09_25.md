@@ -140,6 +140,53 @@ reads **501** distinct `PROSPER_*` switches — 77 diagnostics, 108 `PROSPER_NO_
 reason per-title performance results have not transferred. Prefer a change that deletes a cost
 every path pays over one that finds a cheaper path.
 
+## Findings from the 2026-09-25/26 measurement pass
+
+Recorded here rather than only in commits, because two of the three are negative and a negative
+result that lives in a commit body is one the next agent re-derives at full cost.
+
+**LANDED: the CPU RTT snapshot pool matched on exact size instead of capacity.**
+`CpuRttSnapshotPool::copy` reused a retained buffer only when its `size()` equalled the request, so
+every buffer that was merely big enough was refused and the publication fell to `assign()`, which
+allocates. Nothing counted whether the pool worked -- `CpuRttSnapshot::reused` was read only by its
+own unit test. Measured on Astro Bot, headless, ~120 s, all arms inside a verified-clean window:
+
+| | copies | hit | allocated |
+|---|---:|---:|---:|
+| before | 14,089 | 38.5% | 56,543 MiB |
+| after | 15,519 | 99.5% | 1,096 MiB |
+
+Throughput over the same wall clock went 10,323 passes (before, n=1 at matched instrumentation) to
+10,906 / 11,075 / 11,313 (after, n=3). Non-overlapping, so read the direction as established and
+the magnitude as roughly 5-9%.
+
+**FALSIFIED: "small render passes are what make heavy titles slow."** This document's own § 1-2
+motivated a pass-batching change. The pass-cost census measured it instead: Astro Bot spends
+**7.8% of its wall clock inside `render_draw_pass_rgba` at all**, so collapsing passes could not
+have moved it whatever the pass count. The Messenger, which runs well, spends 63.8%. Pass length is
+real (Astro Bot's passes hold a mean of 1.00 draws, 100% single-draw) and it is not this title's
+frontier. Do not restart pass batching without first showing the renderer is a large share of the
+target title's wall clock.
+
+**UNDECIDED, and previously recorded wrongly: per-call worker-thread creation.**
+`parallel_compute_texels` and `parallel_rows` each create a fresh set of `std::jthread`s per call
+and join them. Measured volume on Astro Bot: **19,738 calls creating 200,809 OS threads** in ~120 s,
+with `pthread_create` at 11.4% of the busiest thread's non-idle samples and `mmap`/`munmap`
+alongside. A persistent `WorkerPool` was built, TSan-clean and passing a 7-arm contract test, and
+measured **~50% slower** -- so it was reverted and the slowdown written into a code comment as
+established fact.
+
+**That measurement was invalid and the conclusion is withdrawn.** A peer agent's `prosper-app`
+running Kena started at 00:39:07 and held ~387% CPU; every worker-pool arm was taken after 00:43,
+and the reverted build re-measured at 4,451-4,825 passes against a 10,906-11,313 baseline taken
+before 00:39 -- i.e. the "regression" reproduced with the change absent. The honest state is that
+the pool is **untested**, not refuted. The plausible mechanism for a real slowdown is still worth
+knowing if anyone retries: glibc caches thread stacks, so a warm `pthread_create` may cost about
+what a condvar wakeup costs, which would make the pool's shared queue pure overhead. Retry only on
+a box verified idle for the whole A/B, with both arms interleaved rather than run in sequence.
+
+The shipped helpers are byte-identical to what they were; only the volume census was added.
+
 ## Ruled out
 
 - **"The recompiler or shader quality is the frontier."** Not for this cost class: the profile's

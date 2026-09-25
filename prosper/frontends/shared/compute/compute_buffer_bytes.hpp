@@ -15,6 +15,8 @@
 #include <cstring>
 #include <system_error>
 #include <thread>
+#include "diagnostics/worker_spawn_census.hpp"
+
 #include <vector>
 
 namespace prosper::frontend {
@@ -43,6 +45,12 @@ void parallel_compute_texels(size_t count, size_t work_bytes, Body&& body,
     if (threads <= 1) {
         body(size_t{0}, count);
         return;
+    }
+    {
+        // Volume only. Whether this per-call spawn is worth replacing is UNDECIDED -- see the
+        // status doc's "Ruled out"; the one experiment run so far was invalidated.
+        static prosper::diagnostics::WorkerSpawnSite site("compute-texels");
+        site.note(threads, work_bytes);
     }
     const size_t chunk = (count + threads - 1) / threads;
     // jthread makes a partially-created set exception-safe: if the next OS thread cannot be
