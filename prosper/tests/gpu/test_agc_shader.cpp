@@ -102,11 +102,12 @@ int main() {
     HleFn fuse_halves_old = Hle::lookup("fd5Bp5tGTgo");
     HleFn create_interp = Hle::lookup("dbOlWdppb4o");
     HleFn create_interp_320 = Hle::lookup("pdEV7bI6COI");
+    HleFn create_interp_old = Hle::lookup("HV4j+E0MBHE");
     CHECK(create_shader != nullptr, "sceAgcCreateShader registered");
     CHECK(fused_size != nullptr && fused_size_320 != nullptr &&
           fuse_halves != nullptr && fuse_halves_old != nullptr,
           "fused-shader size query and SDK aliases registered");
-    CHECK(create_interp != nullptr && create_interp_320 != nullptr,
+    CHECK(create_interp != nullptr && create_interp_320 != nullptr && create_interp_old != nullptr,
           "CreateInterpolantMapping SDK aliases registered");
     if (!create_shader) return 1;
 
@@ -219,6 +220,63 @@ int main() {
             complete = complete && regs[i].offset == prosper::agc::Pm4::SPI_PS_INPUT_CNTL_0 + i &&
                        regs[i].value == 0;
         CHECK(complete, "Cobra interpolant builder initializes all 32 advertised Cx records");
+    }
+
+    // The older HV4j ABI initializes the full array to the identity PARAM selection when no
+    // pixel shader is supplied. It does this even if the producer declares output semantics;
+    // the producer's declarations do not become an implicit consumer-input list.
+    if (create_interp_old) {
+        using namespace prosper::agc::Pm4;
+        Shader producer{};
+        producer.type = 2;
+        producer.num_output_semantics = 5;
+        ShaderRegister regs[32];
+        for (auto& reg : regs) reg = {0xDEADBEEFu, 0xA5A5A5A5u};
+        uint64_t interp_rc = create_interp_old((uint64_t)(uintptr_t)regs,
+                                               (uint64_t)(uintptr_t)&producer,
+                                               0, 0, 0, 0);
+        bool identity = interp_rc == 0;
+        for (uint32_t i = 0; i < 32; ++i)
+            identity = identity && regs[i].offset == SPI_PS_INPUT_CNTL_0 + i &&
+                       regs[i].value == i;
+        CHECK(identity, "older interpolant ABI writes all 32 identity controls without a PS");
+
+        for (auto& reg : regs) reg = {0xDEADBEEFu, 0xA5A5A5A5u};
+        interp_rc = create_interp_old((uint64_t)(uintptr_t)regs, 0, 0, 0, 0, 0);
+        identity = interp_rc == 0;
+        for (uint32_t i = 0; i < 32; ++i)
+            identity = identity && regs[i].offset == SPI_PS_INPUT_CNTL_0 + i &&
+                       regs[i].value == i;
+        CHECK(identity, "older no-PS ABI does not read a producer shader");
+
+        Shader pixel{};
+        pixel.type = 1;
+        for (auto& reg : regs) reg = {0xDEADBEEFu, 0xA5A5A5A5u};
+        interp_rc = create_interp_old((uint64_t)(uintptr_t)regs,
+                                      (uint64_t)(uintptr_t)&producer,
+                                      (uint64_t)(uintptr_t)&pixel, 0, 0, 0);
+        identity = interp_rc == 0;
+        for (uint32_t i = 0; i < 32; ++i)
+            identity = identity && regs[i].offset == SPI_PS_INPUT_CNTL_0 + i &&
+                       regs[i].value == i;
+        CHECK(identity, "older interpolant ABI writes identity controls for a zero-input PS");
+
+        // An explicit consumer input still uses the current semantic resolution. Only the
+        // unconsumed tail comes from the older ABI's identity initialization.
+        uint32_t input_semantic = 7;
+        pixel.input_semantics = &input_semantic;
+        pixel.num_input_semantics = 1;
+        producer.num_output_semantics = 0;
+        for (auto& reg : regs) reg = {0xDEADBEEFu, 0xA5A5A5A5u};
+        interp_rc = create_interp_old((uint64_t)(uintptr_t)regs,
+                                      (uint64_t)(uintptr_t)&producer,
+                                      (uint64_t)(uintptr_t)&pixel, 0, 0, 0);
+        bool tail_identity = interp_rc == 0 && regs[0].offset == SPI_PS_INPUT_CNTL_0 &&
+                             regs[0].value == 0x20u;
+        for (uint32_t i = 1; i < 32; ++i)
+            tail_identity = tail_identity && regs[i].offset == SPI_PS_INPUT_CNTL_0 + i &&
+                            regs[i].value == i;
+        CHECK(tail_identity, "older interpolant ABI retains explicit input and initializes its tail");
     }
 
     size_t count0 = prosper_agc_shader_count();
