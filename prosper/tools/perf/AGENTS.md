@@ -11,6 +11,11 @@ unobserved selectors are not proof of absent work. Event/thread denominators rem
 See `PERF_CALLER_REPORT.md` for commands and limits. A valid parse does not establish build identity,
 complete unwinding, a complete recording, worker coverage or low profiler overhead.
 
+`perf_f8_gap.py` joins a process-scoped monotonic `cpu-clock:u` export to complete F8
+renderer-submit spans. It refuses partial interval overlap and mixed process IDs; perf loss and
+peer contention remain external validity checks. Samples in a wall-time gap are CPU observations,
+not an allocation of that gap's elapsed time. See `PERF_F8_GAP.md`.
+
 Keep missing measurements distinct from measured zeros, and retain signed timing residuals.
 Nested CPU timers and GPU intervals cannot be added as independent work. Buffer comparison byte
 counts are requested spans, not physical memory traffic or the bytes an early-exiting comparison

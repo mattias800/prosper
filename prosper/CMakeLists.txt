@@ -1422,6 +1422,8 @@ if(TARGET prosper_core)
   if(Python3_Interpreter_FOUND)
     add_test(NAME performance_capture_report_logic
       COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/perf/test_performance_capture_report.py")
+    add_test(NAME perf_f8_gap_logic
+      COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/perf/test_perf_f8_gap.py")
     add_test(NAME compare_capture_pair_logic
       COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/perf/test_compare_capture_pair.py")
   endif()
