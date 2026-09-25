@@ -2778,6 +2778,9 @@ struct RegState {
     // chases an SRT pointer to reach the table the real V#/T#/S# lives in. Admitted by a
     // whole-stream use proof (proven_smem_pointer_loads); load PCs, not SRT keys.
     std::unordered_set<uint32_t> smem_pointer_loads;
+    // Raw x2 loads with direct scalar observations. Their exact-PC resource must not turn an
+    // unrelated unresolved scalar load into a binding-2 fallback success.
+    std::unordered_set<uint32_t> smem_raw_x2_data_loads;
     bool smem_pointer_analysis_done = false;
     // Register-offset S_LOAD_DWORDX2 is likewise typeless. GTA V uses it to fetch the first two
     // words of a V#, then replaces/fills the remaining words before an exact-PC buffer consumer.
