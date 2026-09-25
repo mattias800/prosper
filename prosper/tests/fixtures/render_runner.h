@@ -956,6 +956,9 @@ struct BackendResourceReuseStats {
     uint64_t buffer_range_bound_bytes = 0;
     uint64_t buffer_range_copy_batches = 0;
     uint64_t buffer_range_copy_spans = 0;
+    uint64_t index_copy_batches = 0;
+    uint64_t index_copy_spans = 0;
+    uint64_t index_copy_bytes = 0;
     uint64_t buffer_upload_bytes = 0;           // bytes actually memcpy'd into mapped staging
     uint64_t buffer_resident_hits = 0;
     uint64_t buffer_resident_compared_bytes = 0; // requested comparison spans, not bytes read
@@ -9244,6 +9247,17 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     };
     std::vector<BufferRangeUpload> buffer_range_uploads(buffer_range_groups.size());
     std::vector<RenderCopySpan> buffer_range_copy_jobs;
+    std::vector<RenderCopySpan> index_copy_jobs;
+    bool batch_index_copies = !PROSPER_ENV_ON("PROSPER_NO_INDEX_COPY_BATCH");
+    if (batch_index_copies) {
+        try {
+            // Each draw contributes at most one index span. A failed reservation keeps every
+            // index upload on the established immediate path.
+            index_copy_jobs.reserve(draws.size());
+        } catch (...) {
+            batch_index_copies = false;
+        }
+    }
     bool batch_buffer_range_copies =
         !PROSPER_ENV_ON("PROSPER_NO_BACKEND_BUFFER_COPY_BATCH");
     if (batch_buffer_range_copies) {
@@ -9879,8 +9893,13 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 SharedBufferUpload islice;
                 if (acquire_buffer_arena_slice(isz, islice) && islice.arena && islice.mapped &&
                     (islice.offset % 4) == 0) {
-                    std::memcpy(static_cast<uint8_t*>(islice.mapped) + islice.offset,
-                                draw_indices.data(), (size_t)isz);
+                    void* const index_destination =
+                        static_cast<uint8_t*>(islice.mapped) + islice.offset;
+                    if (batch_index_copies)
+                        index_copy_jobs.push_back({index_destination, draw_indices.data(),
+                                                   static_cast<size_t>(isz)});
+                    else
+                        std::memcpy(index_destination, draw_indices.data(), (size_t)isz);
                     v.ibuf = islice.buffer;
                     v.ioffset = islice.offset;
                     v.iarena = true;
@@ -11945,6 +11964,22 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             res_buffer_copy_ms += elapsed;
             res_buffer_ms += elapsed;
             setup_resources_ms += elapsed;
+        }
+    }
+    // The frontend lends index words only for this synchronous backend call. All arena slices
+    // are disjoint and remain mapped; finish every deferred copy before recording any draw.
+    // Dedicated-buffer fallback and an unreserved job list still copy immediately above.
+    if (!index_copy_jobs.empty()) {
+        const auto copy_begin = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
+        parallel_render_memcpy_batch(index_copy_jobs);
+        ++resource_reuse_stats.index_copy_batches;
+        resource_reuse_stats.index_copy_spans += index_copy_jobs.size();
+        for (const RenderCopySpan& job : index_copy_jobs)
+            resource_reuse_stats.index_copy_bytes += job.bytes;
+        if (timing_enabled) {
+            const double elapsed = setup_elapsed_ms(copy_begin, TimingClock::now());
+            res_fixed_index_upload_ms += elapsed;
+            setup_fixed_ms += elapsed;
         }
     }
 
@@ -14566,6 +14601,9 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         PROSPER_SUM_RESOURCE_STAT(buffer_range_bound_bytes);
         PROSPER_SUM_RESOURCE_STAT(buffer_range_copy_batches);
         PROSPER_SUM_RESOURCE_STAT(buffer_range_copy_spans);
+        PROSPER_SUM_RESOURCE_STAT(index_copy_batches);
+        PROSPER_SUM_RESOURCE_STAT(index_copy_spans);
+        PROSPER_SUM_RESOURCE_STAT(index_copy_bytes);
         PROSPER_SUM_RESOURCE_STAT(buffer_upload_bytes);
         PROSPER_SUM_RESOURCE_STAT(buffer_resident_hits);
         PROSPER_SUM_RESOURCE_STAT(buffer_resident_compared_bytes);
