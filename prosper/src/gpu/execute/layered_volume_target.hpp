@@ -166,12 +166,13 @@ inline bool is_layered_volume_producer_candidate(const LayeredVolumeCandidateCon
     if (!ctx.vs_empty || ctx.fs_empty) return false;
     if (!ctx.interp.valid || ctx.interp.requires_geometry) return false;
 
-    // Topology must be TriangleList (VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST = 3).
-    // Odd strip winding (e.g. TriangleStrip = 4) and line/point topologies are not admitted.
-    if (ctx.topology != 3u) return false;
+    // Topology must be a triangle primitive (TriangleList=3, TriangleStrip=4, TriangleFan=5).
+    // Points and lines cannot represent a fullscreen surface.
+    if (ctx.topology < 3u || ctx.topology > 5u) return false;
 
-    // Culling must be disabled; a fullscreen procedural triangle cannot tolerate face culling.
-    if (ctx.cull_mode != 0u) return false;
+    // Culling must not discard front-facing geometry (VK_CULL_MODE_FRONT_BIT = 1,
+    // VK_CULL_MODE_FRONT_AND_BACK = 3).
+    if ((ctx.cull_mode & 1u) != 0u) return false;
 
     // Indexed draws, vertex offsets, and indirect vertex offset overrides are not admitted
     // by the fixed unindexed procedural triangle.

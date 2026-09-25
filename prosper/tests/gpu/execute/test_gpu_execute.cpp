@@ -397,31 +397,31 @@ int main() {
                   "is_layered_volume_producer_candidate rejects nonzero indirect vertex offset override");
         }
 
-        // 6. Negative control: culling enabled must be rejected.
+        // 6. Negative control: front culling (which would discard the front-facing triangle) must be rejected.
         {
-            LayeredVolumeCandidateContext ctx_with_cull{
+            LayeredVolumeCandidateContext ctx_with_front_cull{
                 rs_candidate, layered_vol, &layered_vol.draws[0],
                 /*vs_empty=*/true, /*fs_empty=*/false,
                 candidate_interp, &candidate_inputs, /*vcount_hint=*/3u,
-                /*topology=*/3u, /*cull_mode=*/2u, // VK_CULL_MODE_BACK_BIT
+                /*topology=*/3u, /*cull_mode=*/1u, // VK_CULL_MODE_FRONT_BIT
                 /*diagnostic_enabled=*/true
             };
-            CHECK(!is_layered_volume_producer_candidate(ctx_with_cull),
-                  "is_layered_volume_producer_candidate rejects enabled culling");
+            CHECK(!is_layered_volume_producer_candidate(ctx_with_front_cull),
+                  "is_layered_volume_producer_candidate rejects front culling");
         }
 
-        // 7. Negative control: non-triangle-list topology / odd strip winding must be rejected.
+        // 7. Negative control: non-triangle topologies (points, lines) must be rejected.
         {
-            LayeredVolumeCandidateContext ctx_with_strip{
+            LayeredVolumeCandidateContext ctx_with_point_topology{
                 rs_candidate, layered_vol, &layered_vol.draws[0],
                 /*vs_empty=*/true, /*fs_empty=*/false,
                 candidate_interp, &candidate_inputs, /*vcount_hint=*/3u,
-                /*topology=*/4u, // VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP
+                /*topology=*/1u, // VK_PRIMITIVE_TOPOLOGY_POINT_LIST
                 /*cull_mode=*/0u,
                 /*diagnostic_enabled=*/true
             };
-            CHECK(!is_layered_volume_producer_candidate(ctx_with_strip),
-                  "is_layered_volume_producer_candidate rejects triangle strip topology (odd strip winding)");
+            CHECK(!is_layered_volume_producer_candidate(ctx_with_point_topology),
+                  "is_layered_volume_producer_candidate rejects point list topology");
         }
 
         // Control: a non-volume 2D target (slice_count == 1) does not qualify for the layered volume
