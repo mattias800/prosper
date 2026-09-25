@@ -2852,6 +2852,7 @@ bool emit_cfg_state_machine(
                                             std::set<int>& ambiguous,
                                             std::set<int>& scalar_words,
                                             bool& scalar_scc,
+                                            bool& m0_written_in_block,
                                             const Rdna2Inst& in,
                                             bool record_compare) {
             auto source_is_scalar_word = [&](const Operand& source) {
@@ -3148,14 +3149,16 @@ bool emit_cfg_state_machine(
                 scalar_words.erase(106);
                 scalar_words.erase(107);
             }
-            // `s_mov_b32 sN, m0` writes one 32-bit scalar dword: M0 is never a wave mask. This is
-            // sound only because every register read that WRITES M0 still passes the ambiguous-pair
-            // check above, so M0 holds either its entry value or a proven scalar. Do not exempt
-            // `s_mov_b32 m0, <src>` from that check: an ambiguous source would reach M0 as the
-            // dispatcher's unproven-scalar zero, and this rule would then certify the copy.
+            // `s_mov_b32 sN, m0` writes one 32-bit scalar dword: M0 is never a wave mask. The copy
+            // is certified only while M0 still holds its block-entry value or a proven scalar. A
+            // block-entry M0 without a proven value reloads as the #3133 entry-M0 token, which
+            // refuses every data read of the saved register. An in-block write from a source that
+            // is merely non-ambiguous (not proven) would instead materialize the dispatcher's
+            // unproven-scalar zero in M0, and certifying its copy would vouch for that zero.
             const bool entry_m0_save = in.fmt == Rdna2Format::SOP1 && in.opcode == 0x03 &&
                 in.src[0].kind == OperandKind::Special && in.src[0].value == 124 &&
-                in.dst.value <= 105;
+                in.dst.value <= 105 &&
+                (!m0_written_in_block || scalar_words.contains(124));
             if (mask_write >= 0) {
                 masks.insert(mask_write);
                 ambiguous.erase(mask_write);
@@ -3213,6 +3216,9 @@ bool emit_cfg_state_machine(
             // Function variables contain zero placeholders for absent domains.
             if (b32_vcc_scalar_write && !b32_vcc_scalar_result)
                 scalar_words.erase(in.dst.value);
+            for (const auto& [base, width] : scalar_writes)
+                if (base <= 124 && 124 < base + static_cast<int>(width))
+                    m0_written_in_block = true;
 
             // SCC is persisted through a dispatcher Function variable without a runtime validity
             // tag. A scalar SOPC establishes a real Boolean, while the three exact whole-wave mask
@@ -3340,12 +3346,13 @@ bool emit_cfg_state_machine(
             std::set<int> ambiguous = wave64_b64_ambiguous_in[block];
             std::set<int> scalar_words = wave64_scalar_word_in[block];
             bool scalar_scc = wave64_scalar_scc_valid_in[block];
+            bool m0_written_in_block = false;
             const uint32_t lo = starts[block];
             const uint32_t hi = block + 1 < starts.size() ? starts[block + 1] : UINT32_MAX;
             for (const auto& in : ins) {
                 if (in.pc < lo || in.pc >= hi || in.is_end) continue;
                 if (!advance_wave64_b64_masks(
-                        masks, ambiguous, scalar_words, scalar_scc, in,
+                        masks, ambiguous, scalar_words, scalar_scc, m0_written_in_block, in,
                         /*record_compare*/false))
                     return false;
             }
@@ -3399,12 +3406,13 @@ bool emit_cfg_state_machine(
             std::set<int> ambiguous = wave64_b64_ambiguous_in[block];
             std::set<int> scalar_words = wave64_scalar_word_in[block];
             bool scalar_scc = wave64_scalar_scc_valid_in[block];
+            bool m0_written_in_block = false;
             const uint32_t lo = starts[block];
             const uint32_t hi = block + 1 < starts.size() ? starts[block + 1] : UINT32_MAX;
             for (const auto& in : ins) {
                 if (in.pc < lo || in.pc >= hi || in.is_end) continue;
                 if (!advance_wave64_b64_masks(
-                        masks, ambiguous, scalar_words, scalar_scc, in,
+                        masks, ambiguous, scalar_words, scalar_scc, m0_written_in_block, in,
                         /*record_compare*/true))
                     return false;
             }

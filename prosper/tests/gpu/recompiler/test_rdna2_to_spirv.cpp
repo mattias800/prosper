@@ -2255,6 +2255,38 @@ int main() {
                             native_linear_cfg17d).empty(),
           "control: the same ambiguous read into an SGPR is refused at the same site");
 
+    // The entry-M0 save certifies its copy only while M0 still holds its block-entry value or a
+    // proven scalar. Here s30 is written on the fall-through edge only, so at the join it is not an
+    // ambiguous mask pair but also not a proven scalar. `s_mov_b32 m0, s30` therefore gives M0 the
+    // dispatcher's unproven-scalar zero, and the following save must not vouch for it: the restore
+    // then reads the still-ambiguous s21 and must refuse.
+    std::vector<uint32_t> kena_m0_unproven_write = {
+        0x7d8402f9u, 0x06069400u, // v_cmp_eq_u32_sdwa s[20:21], v0, v1 -> s[20:21] is a real Wave64 mask
+        0xbf880002u,              // s_cbranch_execz +2
+        0xbe940380u,              // s_mov_b32 s20, 0 -> s[20:21] ambiguous at the join
+        0xbe9e0380u,              // s_mov_b32 s30, 0 -> s30 defined on the fall-through edge only
+        0xbefc031eu,              // join block: s_mov_b32 m0, s30 (unproven source)
+        0xbe95037cu,              // s_mov_b32 s21, m0
+        0xbefc0315u,              // s_mov_b32 m0, s21
+        0xbe940480u,              // s_mov_b64 s[20:21], 0
+    };
+    std::vector<uint32_t> kena_m0_proven_write = kena_m0_unproven_write;
+    // Control: define s30 before the branch, so the same join writes M0 from a proven scalar.
+    kena_m0_proven_write.insert(kena_m0_proven_write.begin(), 0xbe9e0380u);
+    kena_m0_proven_write[5] = 0xbf800000u; // s_nop replaces the fall-through-only s30 write
+    kena_m0_unproven_write.insert(
+        kena_m0_unproven_write.end(), std::begin(code17d), std::end(code17d));
+    kena_m0_proven_write.insert(
+        kena_m0_proven_write.end(), std::begin(code17d), std::end(code17d));
+    CHECK(recompile_compute(kena_m0_unproven_write.data(),
+                            kena_m0_unproven_write.size(), nullptr,
+                            native_linear_cfg17d).empty(),
+          "an in-block M0 write from an unproven scalar does not certify its saved copy");
+    CHECK(!recompile_compute(kena_m0_proven_write.data(),
+                             kena_m0_proven_write.size(), nullptr,
+                             native_linear_cfg17d).empty(),
+          "control: the same save after an in-block M0 write from a proven scalar is accepted");
+
 
     // An invalid SCC must not regain scalar provenance indirectly. S_CSELECT publishes its chosen
     // dword and ADDC/SUBB publish both a dword and a new SCC, but all three first consume the old
