@@ -3217,7 +3217,7 @@ int main(int argc, char** argv) {
             prosper::frontend::GpuScanoutFrame gf;
             if (prosper::frontend::present_blit_acquire(gf)) {
                 prosper::frontend::PresentHandoffTrace trace(gf.frame_seq, gf.publication_id, gf.slot);
-                if (!prosper::frontend::present_source_is_newer(
+                if (!prosper::frontend::gpu_present_frame_is_newer(
                         havePresentedGuestFlip, lastPresentedGuestFlip, gf.frame_seq)) {
                     trace.emit(prosper::perf::PresentHandoffEvent::GpuStale, 0, 0, lastPresentedGuestFlip);
                     prosper::frontend::present_blit_release(gf.slot);
