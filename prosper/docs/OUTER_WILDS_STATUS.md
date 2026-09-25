@@ -12,13 +12,21 @@ is a 1920-wide WebP derived with `prosper/tools/screenshots/shrink.py` (SHA-256
 3840×2160 frontend PNG is retained privately under `<EVIDENCE_ROOT>/outer-wilds-20260923/`
 (SHA-256 `40e847af6c3855341de10e3a0fcf479d1b422d037f1cad124aa9faf7433024be`).
 
-The fresh-save route in [`prosper/scripts/outer-wilds-PPSA08102/`](../scripts/outer-wilds-PPSA08102/)
+The historical fresh-save route in [`prosper/scripts/outer-wilds-PPSA08102/`](../scripts/outer-wilds-PPSA08102/)
 presses Cross at 50 and 70 seconds, then Square at 110 seconds. The first two presses reach and
-accept NEW EXPEDITION; the Square press clears the Wake Up prompt. On `b77cffc831de`, the native
+accept NEW EXPEDITION; the Square press cleared the Wake Up prompt on `b77cffc831de`. The native
 T+122 frame shows a wooded first-person scene and T+180 shows its Look Around / Move prompts. The
 owner also observed the in-game world and described its rendering as almost correct, while reporting
 roughly 2 FPS. This is a recognizable scene and supports rung 3; the short visual report is not a
 whole-game compatibility verdict or a measured speed comparison with PS5 hardware.
+
+On main after #3863, Square at 110 seconds arrived before the Wake Up prompt. A new
+[`reach-first-person.pad`](../scripts/outer-wilds-PPSA08102/reach-first-person.pad) retries
+Square at 135–137 seconds. On the #3864 source-equivalent binary with opt-in
+`PROSPER_BACKEND_TEXTURE_PRESSURE_FLUSH=1`, its 200-second screenshot
+reached the first-person wooded scene; a quiet in-world F8 window at 230 seconds recorded
+47 known-new deliveries in roughly five seconds. These observations establish route progression
+and a short-window completed-version count, not whole-game FPS.
 
 The [first-person screenshot](../../assets/screenshots/outer-wilds-first-person-night.webp) is a
 1920-wide WebP downscaled by `prosper/tools/screenshots/shrink.py` from an unmodified 3840×2160
