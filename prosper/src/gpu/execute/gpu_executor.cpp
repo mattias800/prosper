@@ -11596,9 +11596,17 @@ CompressionMetadataKind classify_compression_metadata_kind(const MetadataKindReq
 bool import_live_render_target_image(uint64_t gpu_addr, const LiveTargetImageRequest& request,
                                      LiveTargetImageImport& import) {
     import = LiveTargetImageImport{};
-    if (!g_live_target_image_import) return false;
+    if (!g_live_target_image_import) {
+        import.refusal = LiveTargetImageImport::Refusal::NoImporter;
+        return false;
+    }
     if (!g_live_target_image_import(gpu_addr, request, import)) {
+        // Reset the handles but KEEP the reason. Clearing the whole struct here is what made every
+        // decline indistinguishable at the call site; the caller's fallback for a refused import is
+        // a full CPU round trip, so the reason is the only thing that says which one to fix.
+        const auto refusal = import.refusal;
         import = LiveTargetImageImport{};
+        import.refusal = refusal;
         return false;
     }
     if (!import.valid()) {
@@ -11606,6 +11614,7 @@ bool import_live_render_target_image(uint64_t gpu_addr, const LiveTargetImageReq
         // permanently un-evictable cache entry if a future importer breaks the contract.
         release_live_render_target_image(gpu_addr);
         import = LiveTargetImageImport{};
+        import.refusal = LiveTargetImageImport::Refusal::ImporterReturnedInvalid;
         return false;
     }
     return true;
@@ -11614,14 +11623,21 @@ bool borrow_live_render_target_image_destination(
     uint64_t gpu_addr, const LiveTargetImageDestinationRequest& request,
     LiveTargetImageImport& destination) {
     destination = LiveTargetImageImport{};
-    if (!g_live_target_image_destination) return false;
+    if (!g_live_target_image_destination) {
+        destination.refusal = LiveTargetImageImport::Refusal::NoImporter;
+        return false;
+    }
     if (!g_live_target_image_destination(gpu_addr, request, destination)) {
+        // Same contract as the source import above: reset the handles, keep the reason.
+        const auto refusal = destination.refusal;
         destination = LiveTargetImageImport{};
+        destination.refusal = refusal;
         return false;
     }
     if (!destination.valid()) {
         release_live_render_target_image(gpu_addr);
         destination = LiveTargetImageImport{};
+        destination.refusal = LiveTargetImageImport::Refusal::ImporterReturnedInvalid;
         return false;
     }
     return true;

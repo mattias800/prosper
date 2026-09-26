@@ -111,3 +111,29 @@ reports**: anything that summarises a run when it ends registers there instead o
 skip atexit handlers, and each of them calls `flush_exit_reports()` first. Before #3353 a bare atexit
 report was silent on all of those paths, and the silence read as a zero. SIGTERM and signal-context
 exits are still not covered, so a number that must survive a killed run needs a periodic report too.
+
+`exit_census.{hpp,cpp}` sits on top of that registry and is what a new **census** should use:
+`register_census(disable_env, report)` owns the end-of-run hook and the opt-out variable, and hands
+formatting back to the caller because a per-reason distribution, a bucket series and a per-site
+table are not the same report. The censuses themselves —
+`transfer_pressure`, `readback_reason_census`, `worker_spawn_census`, `persistent_target_census` —
+are separate files rather than one shared counter type on purpose; what was worth de-duplicating is
+the part where a mistake is silent, not the counting.
+
+**Register on first use, never at namespace-scope static initialisation**, and this is the one that
+bites somebody else rather than you. `register_exit_report` installs its `std::atexit` fallback on
+the *first* registration in the process, and `atexit` runs LIFO against `__cxa_atexit`'s static
+destructors — so a census that registers during static init becomes the earliest atexit entry,
+which makes the flush the **latest** thing to run, after the function-local statics that other
+censuses read. Adding one file with a namespace-scope registration took this suite from green to
+eleven failures: a SIGSEGV in `game_compute_exec` *after* its `[storage-materialize]` line printed,
+plus three timeouts, none of them in the new census and none in code it touches. Pair it with the
+other half: any object a report reads should be **never-destroyed** (the no-destroy idiom
+`exit_reports.cpp` uses for its own registry), because no registration site controls that ordering.
+
+The rule that decides whether a census belongs here at all: **it must be able to distinguish "this
+did not happen" from "this was not counted".** Both of those print zero, and the second one reads
+as a finding. `persistent_target_census` exists because a colour-target cache with no entry for a
+key looks identical whether it evicted one or never made one, and the env-var A/B that would
+separate them cannot show its own lever moved (instrument trap 288) — so it reports residency and
+evictions directly instead, and says in one clause which of the two states it is in.

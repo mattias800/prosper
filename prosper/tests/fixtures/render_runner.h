@@ -20,6 +20,8 @@
 #include "gpu/diagnostics/diagnostic_selectors.hpp"
 #include "gpu/diagnostics/draw_disposition.hpp"  // why a draw did not reach the GPU
 #include "diagnostics/readback_reason_census.hpp"  // why a colour target is copied back
+#include "diagnostics/exit_census.hpp"       // one-line end-of-run reports
+#include "diagnostics/persistent_target_census.hpp"  // is the colour-target cache at its bound?
 #include "gpu/diagnostics/geometry_probe_arming.hpp"
 #include "gpu/diagnostics/vk_object_names.hpp"   // #3578: name guest shaders for RenderDoc/RGP
 #include "diagnostics/env_cache.hpp"       // PROSPER_ENV_ON / _VALUE: cached reads on per-draw paths
@@ -3073,6 +3075,11 @@ inline PersistentColorTargetImage* find_persistent_color_target(
     if (!id) return nullptr;
     format = backend_color_format(format);
     auto& cache = persistent_color_target_cache();
+    // Residency, sampled where the question is actually asked. Two relaxed stores against an
+    // unordered_map lookup, and it is the only reading that is current at the moment a caller is
+    // told "there is no persistent image for this target".
+    prosper::diagnostics::note_persistent_target_residency(
+        cache.size(), persistent_color_target_bytes(), persistent_color_target_limit());
     auto found = cache.find({id, width, height, format, volume_depth});
     if (found == cache.end() || (require_valid && !found->second.valid)) return nullptr;
     return &found->second;
@@ -3215,6 +3222,7 @@ persistent_color_target_evict_sink() {
 }
 
 inline bool evict_persistent_color_target(const RenderVkCtx& ctx, uint64_t current_generation) {
+    prosper::diagnostics::note_persistent_target_eviction_attempt();
     if (backend_has_unproven_submission()) return false;
     auto& cache = persistent_color_target_cache();
     auto victim = cache.end();
@@ -3245,6 +3253,7 @@ inline bool evict_persistent_color_target(const RenderVkCtx& ctx, uint64_t curre
         }
     }
     persistent_color_target_bytes() -= victim->second.bytes;
+    prosper::diagnostics::note_persistent_target_evicted(victim->second.bytes);
     destroy_persistent_color_target(ctx, victim->second);
     cache.erase(victim);
     return true;

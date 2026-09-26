@@ -1264,6 +1264,39 @@ bool read_live_render_target(uint64_t gpu_addr, LiveTargetSnapshot& snapshot);
 // evicting the entry mid-dispatch. Handles stay opaque so this layer keeps no Vulkan dependency.
 struct LiveTargetImageImport {
     enum class Kind : uint8_t { Color, Depth };
+    // WHY a failed import failed. Every decline in the renderer's importer used to be a bare
+    // `return false`, so a consumer could report only that the renderer "would not hand it over"
+    // -- and the consumer's fallback is a full CPU round trip of the image, per dispatch. Measured
+    // on one title: 7,929 such fallbacks moving 28.2 GiB in 74 s, with no way to tell which of the
+    // importer's twelve declines produced them.
+    //
+    // This rides back on the out-param rather than living in a side census so the reason is exact
+    // per CALL SITE. The importer has two callers with different requests, and a process-wide
+    // counter would mix them.
+    enum class Refusal : uint8_t {
+        None = 0,          // not refused (or never asked)
+        NoImporter,        // no renderer registered an importer at all
+        DirectBindDisabled,// PROSPER_NO_DIRECT_RTT_BIND
+        NoRttEntry,        // this address is not a known render target
+        ZeroExtent,
+        VolumeDepth,       // 3D target; image import is a 2D contract
+        UnmappedFormat,    // backend format has no LiveTargetPixelFormat
+        TexelOverflow,
+        CpuOnlyAuthority,  // the renderer holds these pixels on the CPU, not on the GPU
+        NoAuthority,       // the entry survives with identity/metadata alone
+        NoRenderContext,
+        NoPersistentImage, // no retained GPU allocation for this target, or an undefined layout
+        PinRefused,        // the persistent-target cache would not pin it
+        PinKeyMismatch,
+        ImporterReturnedInvalid,
+        // Destination-borrow only. The borrow never reads the old image, so it has no authority
+        // requirement -- these are the shape checks that stand between a compute result and the
+        // renderer's device image.
+        ExtentMismatch,
+        FormatMismatch,
+        Count,
+    };
+    Refusal refusal = Refusal::None;
     uint32_t width = 0, height = 0;
     LiveTargetPixelFormat format = LiveTargetPixelFormat::Rgba8Unorm;
     Kind kind = Kind::Color;
@@ -1280,6 +1313,31 @@ struct LiveTargetImageImport {
     bool transfer_src = false;
     bool valid() const { return image && device && width && height; }
 };
+
+constexpr const char* live_target_import_refusal_name(LiveTargetImageImport::Refusal refusal) {
+    switch (refusal) {
+        case LiveTargetImageImport::Refusal::None: return "none";
+        case LiveTargetImageImport::Refusal::NoImporter: return "no-importer";
+        case LiveTargetImageImport::Refusal::DirectBindDisabled: return "direct-bind-disabled";
+        case LiveTargetImageImport::Refusal::NoRttEntry: return "no-rtt-entry";
+        case LiveTargetImageImport::Refusal::ZeroExtent: return "zero-extent";
+        case LiveTargetImageImport::Refusal::VolumeDepth: return "volume-depth";
+        case LiveTargetImageImport::Refusal::UnmappedFormat: return "unmapped-format";
+        case LiveTargetImageImport::Refusal::TexelOverflow: return "texel-overflow";
+        case LiveTargetImageImport::Refusal::CpuOnlyAuthority: return "cpu-only-authority";
+        case LiveTargetImageImport::Refusal::NoAuthority: return "no-authority";
+        case LiveTargetImageImport::Refusal::NoRenderContext: return "no-render-context";
+        case LiveTargetImageImport::Refusal::NoPersistentImage: return "no-persistent-image";
+        case LiveTargetImageImport::Refusal::PinRefused: return "pin-refused";
+        case LiveTargetImageImport::Refusal::PinKeyMismatch: return "pin-key-mismatch";
+        case LiveTargetImageImport::Refusal::ImporterReturnedInvalid: return "importer-invalid";
+        case LiveTargetImageImport::Refusal::ExtentMismatch: return "extent-mismatch";
+        case LiveTargetImageImport::Refusal::FormatMismatch: return "format-mismatch";
+        case LiveTargetImageImport::Refusal::Count: break;   // not a reason
+    }
+    return "unknown";
+}
+
 struct LiveTargetImageRequest {
     uint32_t width = 0, height = 0;
     uint32_t render_scale = 1;

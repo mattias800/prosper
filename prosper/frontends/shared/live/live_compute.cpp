@@ -484,6 +484,56 @@ struct RttMirrorCounter {
     uint64_t add() { return count.fetch_add(1, std::memory_order_relaxed) + 1; }
     uint64_t value() const { return count.load(std::memory_order_relaxed); }
 };
+// WHY the GPU seed path refused, counted WHERE THE HOST COPY HAPPENS and weighted by the bytes
+// that copy moves.
+//
+// `bi.standalone_seed_decision` already names the reason with ten distinct values, but only on the
+// per-binding `[compute-rtt-seed]` trace line -- which is unusable at volume, and which nobody
+// reads when the symptom is "the game is slow" rather than "this binding looks wrong". The
+// aggregate is the difference between knowing the seed path is narrow and knowing WHICH of its
+// conditions to widen.
+//
+// Weighted by bytes rather than by count on purpose: a reason that refuses many small bindings is
+// not the one to widen, and a count-only histogram cannot tell the two apart.
+struct SeedRefusalCensus {
+    std::mutex mutex;
+    std::map<std::string, std::pair<uint64_t, uint64_t>> rows;   // reason -> {copies, bytes}
+};
+
+// Never destroyed, deliberately. `exit_census.hpp`'s contract is that a report must not read an
+// object with a non-trivial destructor: the flush runs from `std::atexit`, which interleaves with
+// `__cxa_atexit` static destruction in an order no registration site controls. A `std::map` and a
+// `std::mutex` destroyed before the flush are a use-after-destruction in the report. Leaking one
+// fixed-size object per process is the standard no-destroy idiom and is what the exit-report
+// registry itself does.
+inline SeedRefusalCensus& destination_refusal_census() {
+    static SeedRefusalCensus* census = new SeedRefusalCensus();
+    return *census;
+}
+
+inline void note_destination_refusal(const char* reason, uint64_t bytes) {
+    auto& c = destination_refusal_census();
+    std::lock_guard<std::mutex> lock(c.mutex);
+    if (c.rows.size() >= 64 && c.rows.find(reason ? reason : "null") == c.rows.end()) return;
+    auto& row = c.rows[reason ? reason : "null"];
+    row.first += 1;
+    row.second += bytes;
+}
+
+inline SeedRefusalCensus& seed_refusal_census() {
+    static SeedRefusalCensus* census = new SeedRefusalCensus();   // see above: never destroyed
+    return *census;
+}
+
+inline void note_seed_refusal(const char* reason, uint64_t bytes) {
+    auto& c = seed_refusal_census();
+    std::lock_guard<std::mutex> lock(c.mutex);
+    if (c.rows.size() >= 64 && c.rows.find(reason ? reason : "null") == c.rows.end()) return;
+    auto& row = c.rows[reason ? reason : "null"];
+    row.first += 1;
+    row.second += bytes;
+}
+
 struct RttDestinationCensus {
     RttMirrorCounter candidates, borrowed, recorded, published, failed;
     RttMirrorCounter r11_source_seed_recorded, rgba16_source_seed_recorded;
@@ -495,6 +545,48 @@ struct RttDestinationCensus {
 };
 RttDestinationCensus& rtt_destination_census() {
     static constinit RttDestinationCensus census{};
+    // The destination borrow is the ONLY way a render target that has fallen to CPU-only authority
+    // regains GPU authority: the seed import requires `gpu_valid`, and the mirror-back that would
+    // set it requires the seed import, so without this path the state is a latch. Its counters
+    // existed already but printed only under an active F8 perf capture, every sixteenth candidate
+    // -- so on an ordinary run nothing could say whether the escape hatch was ever attempted.
+    static const bool once = [] {
+        prosper::diagnostics::register_census("PROSPER_NO_RTT_DESTINATION_CENSUS", [] {
+            const auto t = rtt_destination_census().snapshot();
+            if (!t.candidates) return false;
+            std::fprintf(stderr,
+                "[rtt-destination] RUN TOTAL candidates=%llu borrowed=%llu recorded=%llu "
+                "published=%llu failed=%llu\n",
+                (unsigned long long)t.candidates, (unsigned long long)t.borrowed,
+                (unsigned long long)t.recorded, (unsigned long long)t.published,
+                (unsigned long long)t.failed);
+            {
+                auto& dc = destination_refusal_census();
+                std::vector<std::pair<std::string, std::pair<uint64_t, uint64_t>>> rows;
+                {
+                    std::lock_guard<std::mutex> lock(dc.mutex);
+                    rows.assign(dc.rows.begin(), dc.rows.end());
+                }
+                if (!rows.empty()) {
+                    std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) {
+                        return a.second.second > b.second.second;
+                    });
+                    std::fprintf(stderr,
+                        "[rtt-destination-refused] RUN TOTAL why a compute result could not go "
+                        "back into the renderer's device image:");
+                    for (const auto& row : rows)
+                        std::fprintf(stderr, "  %s=%.1fMiB/%lluc", row.first.c_str(),
+                                     row.second.second / (1024.0 * 1024.0),
+                                     (unsigned long long)row.second.first);
+                    std::fprintf(stderr, "\n");
+                }
+            }
+            std::fflush(stderr);
+            return true;
+        });
+        return true;
+    }();
+    (void)once;
     return census;
 }
 thread_local uint64_t g_perf_compute_gpu_timestamp_samples = 0;
@@ -4090,6 +4182,7 @@ struct StorageMaterializeCounters {
     std::atomic<uint64_t> exact_n{0}, exact_b{0}, unpack_n{0}, unpack_b{0}, seed_n{0}, seed_b{0};
     // Bounded so a streaming title cannot turn a census into an unbounded allocation.
     std::atomic<uint64_t> not_persistent{0}, persistent_not_skipped{0};
+    std::atomic<uint64_t> not_candidate{0}, candidate_refused{0}, not_candidate_owned{0};
     std::mutex distinct_mutex;
     std::set<std::pair<uint64_t, uint64_t>> distinct;
 };
@@ -8084,7 +8177,11 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         if (time_seed)
                             import_ms += std::chrono::duration<double, std::milli>(
                                 ComputeClock::now() - seed_start).count();
-                        bi.standalone_seed_decision = "import-unavailable";
+                        // Not a flat "the renderer said no": the importer now reports WHICH of its
+                        // declines fired, and the consumer's fallback for any of them is a full CPU
+                        // round trip of the image. A bare reason here cost a measurement pass.
+                        bi.standalone_seed_decision =
+                            prosper::gpu::live_target_import_refusal_name(source.refusal);
                         if (available) {
                             const char* reason = !source.valid() ? "invalid-import"
                                 : source.kind != LiveTargetImageImport::Kind::Color ? "not-color"
@@ -9342,7 +9439,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                     "exact-copy=%llu (%.1f%%, %.1f MiB) "
                                     "texel-unpack=%llu (%.1f%%, %.1f MiB) "
                                     "seed-copy=%llu (%.1f MiB) distinct-sources=%llu "
-                                    "not-persistent=%llu persistent-not-skipped=%llu\n",
+                                    "not-persistent=%llu (never-asked=%llu of which renderer-owned=%llu, "
+                                    "cache-refused=%llu) "
+                                    "persistent-not-skipped=%llu\n",
                                     (unsigned long long)(en + un),
                                     (unsigned long long)en, 100.0 * en / (en + un),
                                     c.exact_b.load(std::memory_order_relaxed) / MiB,
@@ -9355,8 +9454,38 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                         return c.distinct.size();
                                     }(),
                                     (unsigned long long)c.not_persistent.load(std::memory_order_relaxed),
+                                    (unsigned long long)c.not_candidate.load(std::memory_order_relaxed),
+                                    (unsigned long long)c.not_candidate_owned.load(std::memory_order_relaxed),
+                                    (unsigned long long)c.candidate_refused.load(std::memory_order_relaxed),
                                     (unsigned long long)c.persistent_not_skipped.load(
                                         std::memory_order_relaxed));
+                                // Name WHY the GPU seed path refused, biggest first. This is the
+                                // actionable half: the line above says how much is copied, this
+                                // one says which condition to widen to stop copying it.
+                                {
+                                    auto& sc = seed_refusal_census();
+                                    std::vector<std::pair<std::string, std::pair<uint64_t, uint64_t>>>
+                                        rows;
+                                    {
+                                        std::lock_guard<std::mutex> lock(sc.mutex);
+                                        rows.assign(sc.rows.begin(), sc.rows.end());
+                                    }
+                                    if (!rows.empty()) {
+                                        std::sort(rows.begin(), rows.end(),
+                                                  [](const auto& a, const auto& b) {
+                                                      return a.second.second > b.second.second;
+                                                  });
+                                        std::fprintf(stderr,
+                                            "[gpu-seed-refused] RUN TOTAL why the renderer-owned "
+                                            "bindings took a CPU round trip:");
+                                        for (const auto& row : rows)
+                                            std::fprintf(stderr, "  %s=%.1fMiB/%lluc",
+                                                         row.first.c_str(),
+                                                         row.second.second / MiB,
+                                                         (unsigned long long)row.second.first);
+                                        std::fprintf(stderr, "\n");
+                                    }
+                                }
                                 std::fflush(stderr);
                                 return true;
                             });
@@ -9395,8 +9524,42 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         // entire fix.
                         {
                             auto& d = storage_materialize_counters();
-                            if (!bi.persistent) d.not_persistent.fetch_add(1, std::memory_order_relaxed);
-                            else d.persistent_not_skipped.fetch_add(1, std::memory_order_relaxed);
+                            if (!bi.persistent) {
+                                d.not_persistent.fetch_add(1, std::memory_order_relaxed);
+                                // Split the 76%: never asked (an eligibility predicate refused
+                                // before the cache was consulted) against asked-and-refused (the
+                                // cache did not hold it, or held it unusably). These have
+                                // different fixes -- widen a predicate, or raise capacity / fix a
+                                // key -- and the aggregate cannot tell them apart.
+                                if (!bi.cache_candidate) {
+                                    d.not_candidate.fetch_add(1, std::memory_order_relaxed);
+                                    // `!renderer_owned` is one of the candidate gate's six terms,
+                                    // and the gate census says it is the one that refuses most
+                                    // often. Counting it HERE, at the copy, is what turns that
+                                    // into a claim about the traffic: the gate census evaluates
+                                    // every binding, while only some of them reach a copy. This
+                                    // arm is reached from inside `!bi.has_renderer_seed()`, so a
+                                    // hit means the renderer owns the image and supplied no seed
+                                    // -- excluded from the compute cache on the assumption the
+                                    // renderer would provide it, then copied from guest memory
+                                    // anyway, every dispatch.
+                                    if (renderer_owned) {
+                                        d.not_candidate_owned.fetch_add(1, std::memory_order_relaxed);
+                                        // Name the condition. This arm is renderer-owned WITHOUT a
+                                        // renderer seed, so the bytes below came off a CPU render
+                                        // target snapshot and are about to be uploaded back to the
+                                        // same device they were read from. `standalone_seed_decision`
+                                        // says which term of the GPU seed path refused to keep them
+                                        // there.
+                                        note_seed_refusal(bi.standalone_seed_decision,
+                                                          static_cast<uint64_t>(texels) * guest_texel);
+                                    }
+                                } else {
+                                    d.candidate_refused.fetch_add(1, std::memory_order_relaxed);
+                                }
+                            } else {
+                                d.persistent_not_skipped.fetch_add(1, std::memory_order_relaxed);
+                            }
                         }
                         if (bi.exact_storage_bytes()) {
                             c.exact_n.fetch_add(1, std::memory_order_relaxed);
@@ -11036,8 +11199,15 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             const prosper::gpu::LiveTargetImageDestinationRequest request{
                 r->width, r->height, *format};
             prosper::gpu::LiveTargetImageImport destination;
-            if (!borrow_live_render_target_image_destination(r->gpu_addr, request, destination))
+            if (!borrow_live_render_target_image_destination(r->gpu_addr, request, destination)) {
+                // The census's `failed` counter never saw these: the old `continue` left before
+                // anything was recorded, so 8,268 of 11,621 candidates on one title vanished
+                // between "candidate" and "borrowed" with no reason and no count.
+                note_destination_refusal(
+                    prosper::gpu::live_target_import_refusal_name(destination.refusal),
+                    static_cast<uint64_t>(staging_bytes[i]));
                 continue;
+            }
             const VkFormat expected = live_target_pixel_format_vk(*format);
             // One dispatch may first seed its private writable image from the current renderer
             // target, then copy its completed result back into that SAME target. Keep two leases:

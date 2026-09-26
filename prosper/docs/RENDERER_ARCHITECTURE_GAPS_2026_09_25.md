@@ -510,3 +510,128 @@ today and still the second largest), `detile` (26.2 GiB), and compute buffer bin
 which reports `cache=ineligible total-watch-chunks=0` -- no write-watch at all, so a full compare
 and a full upload on every dispatch. prosper copies guest data host-side without dirty tracking, in
 several places, and each site was found separately at full cost. That is the thing to fix once.
+
+### The bottom of the chain, 2026-09-26: a GPU→CPU→GPU round trip, and it is a LATCH
+
+The step above ended on a question about cache admission. That question was the wrong one, and the
+answer is better: **nothing here is a cache miss.** The copies are the CPU leg of a round trip
+between two compute dispatches that run on the same device.
+
+#### The mechanism, traced end to end
+
+At `live_compute.cpp:9079` the guest pointer `src` is set to `nullptr` whenever `renderer_owned`,
+and the copy at `:9249` reads `live_target.pixels` instead — the renderer's **CPU-side render-target
+snapshot**. That snapshot is published by `CpuRttSnapshotPool::copy` at `:12827` from
+`layout_source`, which is the **mapped staging buffer holding a compute dispatch's own result**,
+read off the GPU at `:12678`. So:
+
+```
+dispatch N    (GPU)  writes a storage image
+                     -> vkCmdCopyImageToBuffer into host-visible staging      GPU -> CPU
+                     -> map, pack/detile, tile into the guest mirror          (legitimate writeback)
+                     -> publish a CPU render-target snapshot                  [rtt-snapshot]
+dispatch N+1  (GPU)  binds the same address; renderer-owned, no GPU seed
+                     -> memcpy out of that CPU snapshot into staging          [storage-materialize]
+                     -> vkCmdCopyBufferToImage                                CPU -> GPU
+```
+
+The two largest host-copy categories are the two legs of that trip. The cache gate's
+`!renderer_owned` term is **correct** and should not be widened: the guest range is not the
+authority for these bytes, so neither the guest write-watch nor the submit journal can validate
+them.
+
+#### Why it never recovers
+
+Three gates, each measured at the site where it fires, on a 74 s Astro Bot run (shipped windowed
+frontend, GPU present confirmed adopted, idle box):
+
+```
+[gpu-seed-refused]         cpu-only-authority=28051.9MiB/7885c   view-ineligible=944.8MiB/1184c
+[rtt-destination]          candidates=11660 borrowed=3363 recorded=3363 published=3362 failed=0
+[rtt-destination-refused]  no-persistent-image=24291.1MiB/6103c  no-rtt-entry=4504.7MiB/750c
+                           extent-mismatch=481.2MiB/10c          format-mismatch=152.3MiB/6c
+```
+
+1. **`cpu-only-authority` — 87% of the renderer-owned copies, 97% of their bytes.** The GPU seed
+   import (`live_renderer.cpp:1948`) requires `live_rtt_gpu_importable`, which requires
+   `surface.gpu_valid`. These targets have a correctly-sized CPU snapshot and no valid GPU image.
+2. **`gpu_valid` is cleared by the publication itself.** `live_renderer.cpp:2100`: when a compute
+   result is published with `linear_pixels`, the notifier sets `published.gpu_valid = false`. Its
+   own comment says why — *"A linear snapshot means no device mirror received this result"*.
+3. **The only path back is refused.** The mirror-back that sets `gpu_valid = true` (`:2120`)
+   requires `bi.mirror_result_to_imported`, which is set only alongside `bi.seed_from_imported`
+   (`live_compute.cpp:8060`) — i.e. only if the dispatch imported the image in the first place,
+   which step 1 just refused. The destination borrow at `:11140` is the escape hatch, and it is
+   refused for **8,297 of 11,660 candidates**, overwhelmingly with `no-persistent-image`.
+
+**So it is a latch.** One transition to CPU-only authority is permanent for that target: no
+dispatch can import it, so no dispatch can mirror back, so it never regains GPU authority, and
+every subsequent dispatch pays a full round trip. That is consistent with Astro Bot running at
+~5 fps from the very first splash screen rather than degrading into it.
+
+#### The root, and it is one predicate
+
+`no-persistent-image` is `find_persistent_color_target(addr, w, h, format, /*require_valid=*/false)`
+returning null, or an entry whose layout is `VK_IMAGE_LAYOUT_UNDEFINED`. The cache
+(`tests/fixtures/render_runner.h:3070`) is keyed on the exact 5-tuple
+`{id, width, height, format, volume_depth}` and bounded by
+`persistent_color_target_limit()` — **4096 MiB on this machine** (heap/4, clamped;
+`[render] persistent color-target residency budget = 4096 MiB (device-local heap 44197 MiB)`).
+
+#### Every decline on this path used to be a bare `return false`
+
+This is the reason the chain took a day rather than an hour, and it is the generalisable part. The
+importer had twelve declines and the destination borrower six, all spelled `return false`, so a
+consumer could report only *"the renderer would not hand it over"* — while its fallback for any of
+them is a full CPU round trip of the image, per dispatch. The `[rtt-destination]` counters existed
+but printed only under an active F8 perf capture, every sixteenth candidate, and the census's
+`failed` counter read **0** while 8,297 candidates were being dropped by a `continue` placed before
+it. A zero that means "not counted" is indistinguishable from a zero that means "did not happen".
+
+Both paths now carry a `LiveTargetImageImport::Refusal` on the out-param they already fill, and
+both report at exit by default.
+
+#### It is not capacity — and the obvious A/B could not have told us
+
+The natural experiment is `PROSPER_BACKEND_TARGET_CACHE_MB`. It was run, interleaved, two rounds,
+and it is **VOID rather than negative**: the only line prosper prints about this budget comes from
+`init_persistent_color_target_device_budget`, which never consults the variable, so it read
+`4096 MiB` in both arms. The arms' numbers were also indistinguishable — `no-persistent-image` of
+5,758 / 5,585 / 5,499 / 5,344 in run order A, B, A, B, monotone in *time* and unmoved by *arm* —
+but with no way to show the lever moved, that is not evidence.
+
+Residency answers it directly, with no lever at all:
+
+```
+[persistent-targets] RUN TOTAL resident=96 entries / 1540.0 MiB of 4096.0 MiB (37.6% of budget)
+                     eviction-attempts=0 evicted=0 (0.0 MiB)
+```
+
+**Zero eviction attempts, 62% of the budget unused, 96 entries against a 256 limit.** The cache
+never came under pressure, so nothing it held was thrown away. `no-persistent-image` means the
+entry for `{addr, width, height, format, volume_depth}` was **never created** — no graphics pass
+ever made a persistent device image at that key, and the compute path does not make one either.
+
+#### The fix this implies
+
+> When a compute dispatch publishes a result for a render-target address with no persistent device
+> image, **create one and write the result into it**, instead of publishing CPU pixels and latching
+> the target to CPU-only authority.
+
+That converts the publication at `live_renderer.cpp:2090` from the `linear_pixels` branch
+(`gpu_valid = false`) to the mirrored branch (`gpu_valid = true`), which unlatches the target: the
+next dispatch's seed import succeeds, it keeps the mirror-back obligation, and both legs of the
+round trip disappear for every later dispatch on that address. The budget and eviction policy it
+would allocate into already exist and are 62% idle.
+
+**Why it compounds.** Nothing above is title-specific — no format, no extent, no program hash, no
+title id. It is one predicate on the publication path that every title's compute stage crosses.
+The same architecture is already recorded independently on two other titles by two other lanes:
+#3683 measures the producer leg on *Sonic Frontiers* (6.5 s of `retile_copy` plus 8.0 s of
+write-watch on one route) and #3450 measures the consumer leg on *Grand Theft Auto V* (88.5% of
+per-dispatch GPU time in prosper's own storage copy, crossing PCIe on a discrete GPU). Neither had
+the middle of the chain, which is why each read as a separate cost.
+
+**Independent corroboration of #3157 from a third title**: the compute-items census reports
+`calls=30276 items=30276` — exactly one item per call over 30,276 calls, so the batching that
+issue's correction says does not happen, measurably does not happen here either.
