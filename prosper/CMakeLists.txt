@@ -167,8 +167,13 @@ add_test(NAME compute_authority_census_policy COMMAND test_compute_authority_cen
 # Do NOT read that as race coverage for the eight std::thread workers and their atomic combine:
 # `Host TSan` in .github/workflows/ci.yml configures `-S prosper/tools/doctor`, a separate CMake
 # project that does not build prosper, so this code is not under TSan.
-add_executable(test_compute_buffer_diff_span tests/shared/compute/test_compute_buffer_diff_span.cpp)
-target_include_directories(test_compute_buffer_diff_span PRIVATE frontends)
+# compute_buffer_bytes.hpp counts parallel-worker spawn volume, so it reaches into
+# src/diagnostics; any target including it needs `src` and that translation unit.
+add_executable(test_compute_buffer_diff_span tests/shared/compute/test_compute_buffer_diff_span.cpp
+               src/diagnostics/worker_spawn_census.cpp
+               src/diagnostics/exit_census.cpp
+               src/diagnostics/exit_reports.cpp)
+target_include_directories(test_compute_buffer_diff_span PRIVATE frontends src)
 find_package(Threads REQUIRED)
 target_link_libraries(test_compute_buffer_diff_span PRIVATE Threads::Threads)
 add_test(NAME compute_buffer_diff_span COMMAND test_compute_buffer_diff_span)
@@ -1570,7 +1575,8 @@ if(TARGET prosper_core)
     frontends/shared/tests/test_cpu_rtt_snapshot_pool.cpp
     src/diagnostics/exit_reports.cpp)
   target_include_directories(test_cpu_rtt_snapshot_pool PRIVATE frontends src)
-  target_sources(test_cpu_rtt_snapshot_pool PRIVATE src/diagnostics/worker_spawn_census.cpp)
+  target_sources(test_cpu_rtt_snapshot_pool PRIVATE src/diagnostics/worker_spawn_census.cpp
+                                                    src/diagnostics/exit_census.cpp)
   target_link_libraries(test_cpu_rtt_snapshot_pool PRIVATE Threads::Threads)
   add_test(NAME cpu_rtt_snapshot_pool COMMAND test_cpu_rtt_snapshot_pool)
 
@@ -2045,6 +2051,7 @@ if(TARGET prosper_core)
   # census reports an unnamed drop path as UNACCOUNTED rather than absorbing it.
   add_executable(test_draw_disposition tests/gpu/diagnostics/test_draw_disposition.cpp
                  src/gpu/diagnostics/draw_disposition.cpp
+                 src/diagnostics/exit_census.cpp
                  src/diagnostics/exit_reports.cpp)
   target_include_directories(test_draw_disposition PRIVATE src)
   add_test(NAME draw_disposition COMMAND test_draw_disposition)
@@ -2053,6 +2060,7 @@ if(TARGET prosper_core)
   # that ends the most passes is not the reason holding the mean down.
   add_executable(test_pass_break_census tests/gpu/diagnostics/test_pass_break_census.cpp
                  src/gpu/diagnostics/pass_break_census.cpp
+                 src/diagnostics/exit_census.cpp
                  src/diagnostics/exit_reports.cpp)
   target_include_directories(test_pass_break_census PRIVATE src)
   add_test(NAME pass_break_census COMMAND test_pass_break_census)

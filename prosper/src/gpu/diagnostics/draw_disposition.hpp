@@ -100,7 +100,8 @@ public:
     // reach it, which is exactly why the per-pass report is the primary and this is the
     // convenience. It also separates the two states the per-pass report cannot distinguish by its
     // silence -- "every pass was healthy" and "no pass ever ran" both print nothing per-pass.
-    void report_totals();
+    // Returns false when no draw was seen; see diagnostics/exit_census.hpp.
+    bool report_totals();
 
     // Records one completed pass's wall time against how many draws it held. Bucketed by draw
     // count, because the question this answers is not "how long is a pass" but "how much of a

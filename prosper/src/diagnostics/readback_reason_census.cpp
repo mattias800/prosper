@@ -1,6 +1,6 @@
 #include "diagnostics/readback_reason_census.hpp"
 
-#include "diagnostics/exit_reports.hpp"
+#include "diagnostics/exit_census.hpp"
 #include "../../frontends/shared/present/readback_policy.hpp"
 
 #include <array>
@@ -35,12 +35,11 @@ struct State {
 State& state() {
     static State s;
     static const bool once = [] {
-        register_exit_report([] {
-            if (std::getenv("PROSPER_NO_READBACK_REASON_CENSUS")) return;
+        register_census("PROSPER_NO_READBACK_REASON_CENSUS", [] {
             State& v = state();
             uint64_t total = 0;
             for (size_t i = 0; i < kCount; i++) total += v.hits[i].load(std::memory_order_relaxed);
-            if (!total) return;
+            if (!total) return false;
             std::fprintf(stderr, "[readback-reason] RUN TOTAL slots=%llu",
                          static_cast<unsigned long long>(total));
             for (size_t i = 0; i < kCount; i++) {
@@ -65,6 +64,7 @@ State& state() {
             }
             std::fprintf(stderr, "\n");
             std::fflush(stderr);
+            return true;
         });
         return true;
     }();

@@ -1,6 +1,6 @@
 #include "gpu/diagnostics/pass_break_census.hpp"
 
-#include "diagnostics/exit_reports.hpp"
+#include "diagnostics/exit_census.hpp"
 
 #include <array>
 #include <atomic>
@@ -16,11 +16,6 @@ constexpr std::array<const char*, kCount> kNames{
     "targets-changed", "mrt-resolve-differs", "depth-feedback", "end-of-items",
 };
 static_assert(kNames.size() == kCount, "every PassBreak needs a stable name");
-
-bool enabled() {
-    static const bool on = std::getenv("PROSPER_NO_PASS_BREAK_CENSUS") == nullptr;
-    return on;
-}
 
 }  // namespace
 
@@ -58,14 +53,14 @@ uint64_t PassBreakCensus::draws(PassBreak reason) const {
     return i < kCount ? state().draws[i].load(std::memory_order_relaxed) : 0;
 }
 
-void PassBreakCensus::report_totals() {
+bool PassBreakCensus::report_totals() {
     auto& s = state();
     uint64_t total_passes = 0, total_draws = 0;
     for (size_t i = 0; i < kCount; i++) {
         total_passes += s.passes[i].load(std::memory_order_relaxed);
         total_draws += s.draws[i].load(std::memory_order_relaxed);
     }
-    if (!enabled() || total_passes == 0) return;
+    if (total_passes == 0) return false;
     std::fprintf(stderr, "[pass-break] RUN TOTAL passes=%llu draws=%llu mean=%.2f",
                  static_cast<unsigned long long>(total_passes),
                  static_cast<unsigned long long>(total_draws),
@@ -84,12 +79,14 @@ void PassBreakCensus::report_totals() {
     }
     std::fprintf(stderr, "\n");
     std::fflush(stderr);
+    return true;
 }
 
 PassBreakCensus& pass_break_census() {
     static PassBreakCensus census;
     static const bool once = [] {
-        prosper::diagnostics::register_exit_report([] { pass_break_census().report_totals(); });
+        prosper::diagnostics::register_census(
+            "PROSPER_NO_PASS_BREAK_CENSUS", [] { return pass_break_census().report_totals(); });
         return true;
     }();
     (void)once;

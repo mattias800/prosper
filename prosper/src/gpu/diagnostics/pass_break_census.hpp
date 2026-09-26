@@ -56,7 +56,8 @@ public:
     // `draws` is how many draws the pass that just ended accepted, so a reason can be judged by
     // the pass length it produced rather than only by how often it fires.
     void note_break(PassBreak reason, uint64_t draws);
-    void report_totals();
+    // Returns false when nothing was counted; see diagnostics/exit_census.hpp.
+    bool report_totals();
 
     uint64_t passes(PassBreak reason) const;
     uint64_t draws(PassBreak reason) const;

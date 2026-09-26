@@ -1,6 +1,7 @@
 #include "shared/present/readback_policy.hpp"
 
 #include <cstdio>
+#include <initializer_list>
 
 using prosper::frontend::can_defer_scanout_readback;
 using prosper::frontend::is_color_target_readback_wanted;

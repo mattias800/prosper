@@ -1,7 +1,7 @@
 #include "gpu/diagnostics/draw_disposition.hpp"
 
 #include "gpu/diagnostics/diag_ratelimit.hpp"
-#include "diagnostics/exit_reports.hpp"
+#include "diagnostics/exit_census.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -40,7 +40,9 @@ bool verbose_enabled() {
 
 bool reporting_enabled() {
     // Default ON. A diagnostic you have to know to enable is one nobody enables; the only switch
-    // is an opt-OUT, so a log that is silent about drops really did have none.
+    // is an opt-OUT, so a log that is silent about drops really did have none. The end-of-run
+    // line gates on the same variable through register_census; this one also gates the PER-PASS
+    // report, which has no exit hook to gate it.
     static const bool enabled = std::getenv("PROSPER_NO_DRAW_DISPOSITION") == nullptr;
     return enabled;
 }
@@ -217,10 +219,10 @@ DrawDispositionPassScope::~DrawDispositionPassScope() {
     census.report_pass();
 }
 
-void DrawDispositionCensus::report_totals() {
+bool DrawDispositionCensus::report_totals() {
     auto& s = state();
     const uint64_t total_seen = s.seen.load(std::memory_order_relaxed);
-    if (!reporting_enabled() || total_seen == 0) return;
+    if (total_seen == 0) return false;
     const uint64_t total_recorded = s.recorded.load(std::memory_order_relaxed);
     uint64_t total_dropped = 0;
     for (size_t i = 0; i < kReasonCount; i++)
@@ -266,6 +268,7 @@ void DrawDispositionCensus::report_totals() {
         std::fprintf(stderr, "\n");
     }
     std::fflush(stderr);
+    return true;
 }
 
 DrawDispositionCensus& draw_disposition_census() {
@@ -276,8 +279,9 @@ DrawDispositionCensus& draw_disposition_census() {
     // census state is atomics in a leaked function-local static, so it satisfies the
     // "no non-trivial destructors" requirement in exit_reports.hpp.
     static const bool once = [] {
-        prosper::diagnostics::register_exit_report(
-            [] { draw_disposition_census().report_totals(); });
+        prosper::diagnostics::register_census(
+            "PROSPER_NO_DRAW_DISPOSITION",
+            [] { return draw_disposition_census().report_totals(); });
         return true;
     }();
     (void)once;
