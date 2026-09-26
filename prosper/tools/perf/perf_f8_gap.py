@@ -42,9 +42,15 @@ def load_spans(path):
             raise ValueError('F8 renderer span lacks two nonnegative integer endpoints')
     spans = sorted((trigger + r['span_start_t_ns'], trigger + r['t_ns'])
                    for r in renderer)
-    # Touching spans (`a[1] == b[0]`) pass deliberately: submits that abut leave a zero-length
-    # gap, which is an observation about the capture rather than a malformed record. Consumers
-    # must therefore tolerate a gap zone of zero expected wall time -- see `schedstat_f8.join`.
+    # Touching spans (`a[1] == b[0]`) pass this validator deliberately: submits that abut leave a
+    # zero-length gap, which is an observation about the capture rather than a malformed record.
+    #
+    # Passing HERE is not the same as being usable by every consumer, and the difference is worth
+    # stating because the refusal it produces looks like a recording fault. `summarize()` below
+    # still declines a capture whose spans ALL touch, at the zero-samples check -- correctly, since
+    # no sample can land in `between-spans` and there is then nothing to compare. The consumer that
+    # genuinely tolerates a zero-length gap is `schedstat_f8.join`, which reports its coverage as
+    # null rather than dividing by zero.
     if len(spans) < 2 or any(a >= b for a, b in spans) or any(a[1] > b[0] for a, b in zip(spans, spans[1:])):
         raise ValueError('need at least two complete, nonoverlapping renderer spans')
     return trigger, spans

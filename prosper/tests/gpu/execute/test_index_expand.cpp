@@ -75,7 +75,11 @@ bool check_one(size_t count, size_t source_offset, size_t output_offset, size_t 
     if (prosper::gpu::index_expand_avx2_available()) {
         std::fill(output.begin(), output.end(), guard);
         if (!check_output(prosper::gpu::copy_indices_u16_max_avx2(dst, src, count))) return false;
-        exercised_avx2 = true;
+        // Latch only where the VECTOR BODY ran. Below 8 the kernel executes just its tail loop,
+        // and at count == 0 it executes nothing at all -- so latching on the first sweep
+        // iteration (which IS count == 0) would let the guard in main() attest that the kernels
+        // were compared on the strength of a call that did no work.
+        if (count >= 8) exercised_avx2 = true;
     }
 #endif
     return true;
@@ -111,7 +115,10 @@ bool check_mapping_edge() {
             if (prosper::gpu::index_expand_avx2_available()) {
                 std::fill(dst.begin(), dst.end(), 0xfeedfaceu);
                 valid &= check(prosper::gpu::copy_indices_u16_max_avx2(dst.data(), src, count), dst);
-                exercised_edge_avx2 = true;
+                // Same rule, and here it is the whole point: only at count >= 8 does the wide
+                // 16-byte load run at all, and not crossing the PROT_NONE edge is what this arm
+                // exists to prove.
+                if (count >= 8) exercised_edge_avx2 = true;
             }
 #endif
         }
