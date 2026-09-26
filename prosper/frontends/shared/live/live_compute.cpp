@@ -4,6 +4,7 @@
 #include "shared/compute/compute_authority_live_census.hpp"
 #include "shared/compute/compute_image_borrow_census.hpp"
 #include "shared/compute/compute_timing_selector.hpp"
+#include "diagnostics/exit_census.hpp"
 #include "shared/compute/compute_phase_attribution.hpp"
 #include "shared/compute/compute_buffer_timing.hpp"
 #include "shared/compute/compute_transfer_gate_census.hpp"
@@ -14021,7 +14022,76 @@ void sampled_float16_to_unorm8_range(const uint8_t* source, uint32_t components,
 // TripBoundWitnessScope lives in trip_bound_witness.hpp so its save/restore contract can be
 // exercised by a regression test rather than only by a routed run.
 
+// Wall time spent executing compute items, against wall time overall.
+//
+// This exists because the two instruments that already measure the render path DISAGREE about how
+// much of a run it accounts for, and the gap is this function. On a windowed Astro Bot run the
+// per-submit report gives backend=35.30 of total=35.36 ms -- about 58% of wall -- while the
+// pass-cost census puts time inside render_draw_pass_rgba at 8.5%. Both are right: roughly half
+// the run is in backend code that is not drawing, and compute-item execution is the candidate.
+// Nothing measured it, so the share was inferred from profile leaves (parallel_compute_texels,
+// half_to_float, the retile binds) rather than counted. This counts it.
+//
+// Reports wall time and call count at end of run, on by default, silent when no item ever ran.
+// `PROSPER_NO_COMPUTE_ITEMS_CENSUS=1` silences it.
+namespace {
+struct ComputeItemsCensus {
+    std::atomic<uint64_t> calls{0};
+    std::atomic<uint64_t> items{0};
+    std::atomic<uint64_t> nanoseconds{0};
+    std::atomic<uint64_t> first_ns{0};
+    std::atomic<uint64_t> last_ns{0};
+};
+ComputeItemsCensus& compute_items_census() {
+    static ComputeItemsCensus census;
+    static const bool once = [] {
+        prosper::diagnostics::register_census("PROSPER_NO_COMPUTE_ITEMS_CENSUS", [] {
+            auto& c = compute_items_census();
+            const uint64_t calls = c.calls.load(std::memory_order_relaxed);
+            if (!calls) return false;
+            const uint64_t first = c.first_ns.load(std::memory_order_relaxed);
+            const uint64_t last = c.last_ns.load(std::memory_order_relaxed);
+            const double busy_ms = c.nanoseconds.load(std::memory_order_relaxed) / 1e6;
+            const double span_ms = last > first ? (last - first) / 1e6 : 0.0;
+            std::fprintf(stderr,
+                         "[compute-items] RUN TOTAL calls=%llu items=%llu in-compute=%.1fms "
+                         "span=%.1fms (%.1f%% of span) mean=%.3fms/call\n",
+                         static_cast<unsigned long long>(calls),
+                         static_cast<unsigned long long>(c.items.load(std::memory_order_relaxed)),
+                         busy_ms, span_ms, span_ms > 0 ? 100.0 * busy_ms / span_ms : 0.0,
+                         busy_ms / static_cast<double>(calls));
+            std::fflush(stderr);
+            return true;
+        });
+        return true;
+    }();
+    (void)once;
+    return census;
+}
+uint64_t compute_items_now_ns() {
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+// Reports on every exit, including the fail-closed returns below.
+struct ComputeItemsScope {
+    uint64_t start = compute_items_now_ns();
+    size_t count = 0;
+    explicit ComputeItemsScope(size_t n) : count(n) {}
+    ~ComputeItemsScope() {
+        auto& c = compute_items_census();
+        const uint64_t end = compute_items_now_ns();
+        c.calls.fetch_add(1, std::memory_order_relaxed);
+        c.items.fetch_add(count, std::memory_order_relaxed);
+        c.nanoseconds.fetch_add(end - start, std::memory_order_relaxed);
+        uint64_t expected = 0;
+        c.first_ns.compare_exchange_strong(expected, start, std::memory_order_relaxed);
+        c.last_ns.store(end, std::memory_order_relaxed);
+    }
+};
+}  // namespace
+
 bool execute_live_compute_items(const std::vector<prosper::gpu::ComputeItem>& items) {
+    const ComputeItemsScope compute_items_scope(items.size());
     const prosper::gpu::TileCensusScope tile_census_scope("compute");
     auto fail_closed_items = [&]() {
         for (const auto& item : items)
