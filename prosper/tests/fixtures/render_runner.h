@@ -7689,6 +7689,143 @@ inline uint64_t backend_pass_source_submit(std::span<const BackendDraw> draws) {
         PersistentPipelineKey key;
         PersistentPipeline* entry = nullptr;
     };
+
+// ---------------------------------------------------------------------------------------------
+// The pass's capture-free helpers.
+//
+// Each of these was a lambda inside `render_draw_pass_rgba` that captured nothing. A lambda that
+// captures nothing is a free function that has not been written down as one, and while it was
+// written that way it could only be called from inside the pass -- so every block that used one
+// was pinned in the body with it. They are ordinary functions now, and nothing else changed.
+// ---------------------------------------------------------------------------------------------
+
+// Investigation-only control for #2790. Mode 1 limits attachment clears to ALWAYS draws;
+// mode 2 additionally prevents those draws from overwriting the clear with their interpolated
+// depth. Mode 3 instead writes the clear value through the draw's actual fragment coverage by
+// collapsing its dynamic depth range. Mode 4 narrows mode 3 to a clear-shaped depth-only
+// late-Z strip without a shader Z export, to test the state split observed in a Sonic stage
+// bundle. Mode 5 suppresses the ordinary write of ALWAYS clear draws like mode 2, but keeps
+// the default full-scissor clear on every draw admitted by the default gate (the missing 2x2
+// control).
+// None of these modes establishes the hardware clear predicate.
+inline int sonic_clear_probe() {
+    // An accessor rather than a namespace-scope object on purpose: a function-local static of
+    // an inline function is ONE instance program-wide, initialized on the first call -- exactly
+    // where the static inside the render pass was initialized. A namespace-scope `static` in a
+    // header would be one copy per translation unit, each initialized before main, so a test
+    // that sets the variable and then renders would read a different answer than it does today.
+    static const int probe = [] {
+        const char* value = std::getenv("PROSPER_DIAG_CLEAR_OVERWRITE");
+        return value && value[0] >= '1' && value[0] <= '5' && value[1] == '\0'
+            ? value[0] - '0' : 0;
+    }();
+    return probe;
+}
+
+// A DEPTH_CLEAR_ENABLE bit only acts through the enabled depth-write path (see
+// depth_clear_effective) — the writes-disabled Blue Prince light-loop shape is depth-inert and
+// must not force a depth attachment, pick the clear value, or clear in-pass (#1287).
+inline bool effective_depth_clear(const prosper::gpu::ResolvedPipelineState* ps) {
+    const bool probe_admits = sonic_clear_probe() == 0 || sonic_clear_probe() == 5 ||
+        (ps->depth_compare_op == VK_COMPARE_OP_ALWAYS &&
+         (sonic_clear_probe() != 4 ||
+          ((ps->db_shader_control & 0x31u) == 0u && ps->color_write_mask == 0u &&
+           ps->color1_write_mask == 0u && ps->topology == 4u)));
+    return depth_clear_effective(ps->depth_clear_enable, ps->depth_test_enable,
+                                 ps->depth_write_enable, ps->depth_compare_op) &&
+           probe_admits;
+}
+
+// A Vulkan handle widened to 64 bits for use as part of a cache key. Generic because the
+// dispatchable and non-dispatchable handle types are not the same width on every build.
+inline uint64_t handle_bits(auto handle) {
+    uint64_t bits = 0;
+    static_assert(sizeof(handle) <= sizeof(bits));
+    std::memcpy(&bits, &handle, sizeof(handle));
+    return bits;
+}
+
+// The IEEE bit pattern of a float, likewise for use as part of a cache key.
+inline uint32_t float_bits(float value) {
+    uint32_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+// Whether a buffer resource can be uploaded as a direct guest range rather than through the
+// generic word copy: it must be a plain, large, contiguous guest buffer whose identity,
+// guest address and host pointer all agree.
+inline bool direct_range_eligible(const FrameBufferResource& r) {
+    return !r.is_internal_gds && r.table_entries.empty() &&
+        r.dwords.empty() && r.direct_guest_buffer_addr != 0 &&
+        r.direct_guest_buffer_addr == r.buffer_identity &&
+        r.direct_guest_buffer_addr == reinterpret_cast<uintptr_t>(r.buffer_words_data()) &&
+        r.buffer_word_count() >= 1024 && r.buffer_word_count() <= UINT64_MAX / 4;
+}
+
+// Elapsed milliseconds between two clock points, as a double.
+inline double setup_elapsed_ms(auto begin, auto end) {
+    return std::chrono::duration<double, std::milli>(end - begin).count();
+}
+
+// The stencil masks, reference and ops, set dynamically so one pipeline serves draws that
+// differ only in these.
+inline void record_stencil_dynamic_state(VkCommandBuffer command, const DV& v) {
+    vkCmdSetStencilCompareMask(command, VK_STENCIL_FACE_FRONT_BIT,
+                               v.stencil_front.compareMask);
+    vkCmdSetStencilCompareMask(command, VK_STENCIL_FACE_BACK_BIT,
+                               v.stencil_back.compareMask);
+    vkCmdSetStencilWriteMask(command, VK_STENCIL_FACE_FRONT_BIT,
+                             v.stencil_front.writeMask);
+    vkCmdSetStencilWriteMask(command, VK_STENCIL_FACE_BACK_BIT,
+                             v.stencil_back.writeMask);
+    vkCmdSetStencilReference(command, VK_STENCIL_FACE_FRONT_BIT,
+                             v.stencil_front.reference);
+    vkCmdSetStencilReference(command, VK_STENCIL_FACE_BACK_BIT,
+                             v.stencil_back.reference);
+    vkCmdSetStencilOp(command, VK_STENCIL_FACE_FRONT_BIT, v.stencil_front.failOp,
+                      v.stencil_front.passOp, v.stencil_front.depthFailOp,
+                      v.stencil_front.compareOp);
+    vkCmdSetStencilOp(command, VK_STENCIL_FACE_BACK_BIT, v.stencil_back.failOp,
+                      v.stencil_back.passOp, v.stencil_back.depthFailOp,
+                      v.stencil_back.compareOp);
+}
+
+// The rasterizer and depth/stencil enables, for the same reason.
+inline void record_pipeline_dynamic_state(VkCommandBuffer command, const DV& v) {
+    // These commands and states are required by core Vulkan 1.3, below our 1.4 floor.
+    vkCmdSetDepthTestEnable(command, v.depth_test);
+    vkCmdSetDepthWriteEnable(command, v.depth_write);
+    vkCmdSetDepthCompareOp(command, v.depth_compare);
+    vkCmdSetStencilTestEnable(command, v.stencil_test);
+    vkCmdSetCullMode(command, v.cull_mode);
+    vkCmdSetFrontFace(command, v.front_face);
+    if (!v.mesh_draw) {
+        vkCmdSetPrimitiveTopology(command, v.topology);
+        vkCmdSetPrimitiveRestartEnable(command, v.primitive_restart);
+    }
+}
+
+// Everything a draw sets dynamically. The only one of the three that consults the guest
+// pipeline state, because the clear-overwrite probe collapses the dynamic depth range onto
+// the clear value -- a diagnostic mode, never the default.
+inline void record_draw_dynamic_state(VkCommandBuffer command, const DV& v,
+                                      const prosper::gpu::ResolvedPipelineState* ps) {
+    VkViewport viewport = v.viewport;
+    if ((sonic_clear_probe() == 3 || sonic_clear_probe() == 4) && ps && effective_depth_clear(ps)) {
+        viewport.minDepth = ps->depth_clear_value;
+        viewport.maxDepth = ps->depth_clear_value;
+        backend_depth_clear_probe_armed_count().fetch_add(1);
+    }
+    vkCmdSetViewport(command, 0, 1, &viewport);
+    vkCmdSetScissor(command, 0, 1, &v.scissor);
+    vkCmdSetLineWidth(command, v.line_width);
+    vkCmdSetDepthBias(command, v.depth_bias_constant, v.depth_bias_clamp,
+                      v.depth_bias_slope);
+    record_stencil_dynamic_state(command, v);
+    record_pipeline_dynamic_state(command, v);
+}
+
 inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> draws,
                                                   uint32_t W, uint32_t H,
                                                   const uint8_t* seed_rgba = nullptr,
@@ -7944,33 +8081,6 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     float    depth_clear   = 1.0f;
     uint32_t stencil_clear = 0;
     bool     got_depth_clear = false, got_stencil_clear = false;
-    // A DEPTH_CLEAR_ENABLE bit only acts through the enabled depth-write path (see
-    // depth_clear_effective) — the writes-disabled Blue Prince light-loop shape is depth-inert and
-    // must not force a depth attachment, pick the clear value, or clear in-pass (#1287).
-    // Investigation-only control for #2790. Mode 1 limits attachment clears to ALWAYS draws;
-    // mode 2 additionally prevents those draws from overwriting the clear with their interpolated
-    // depth. Mode 3 instead writes the clear value through the draw's actual fragment coverage by
-    // collapsing its dynamic depth range. Mode 4 narrows mode 3 to a clear-shaped depth-only
-    // late-Z strip without a shader Z export, to test the state split observed in a Sonic stage
-    // bundle. Mode 5 suppresses the ordinary write of ALWAYS clear draws like mode 2, but keeps
-    // the default full-scissor clear on every draw admitted by the default gate (the missing 2x2
-    // control).
-    // None of these modes establishes the hardware clear predicate.
-    static const int sonic_clear_probe = [] {
-        const char* value = std::getenv("PROSPER_DIAG_CLEAR_OVERWRITE");
-        return value && value[0] >= '1' && value[0] <= '5' && value[1] == '\0'
-            ? value[0] - '0' : 0;
-    }();
-    const auto effective_depth_clear = [](const prosper::gpu::ResolvedPipelineState* ps) {
-        const bool probe_admits = sonic_clear_probe == 0 || sonic_clear_probe == 5 ||
-            (ps->depth_compare_op == VK_COMPARE_OP_ALWAYS &&
-             (sonic_clear_probe != 4 ||
-              ((ps->db_shader_control & 0x31u) == 0u && ps->color_write_mask == 0u &&
-               ps->color1_write_mask == 0u && ps->topology == 4u)));
-        return depth_clear_effective(ps->depth_clear_enable, ps->depth_test_enable,
-                                     ps->depth_write_enable, ps->depth_compare_op) &&
-               probe_admits;
-    };
     for (const auto& d : draws) {
         if (!d.ps) continue;
         if (d.ps->depth_test_enable || effective_depth_clear(d.ps)) use_depth = true;
@@ -9224,17 +9334,6 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         upload.arena = true;
         return true;
     };
-    auto handle_bits = [](auto handle) {
-        uint64_t bits = 0;
-        static_assert(sizeof(handle) <= sizeof(bits));
-        std::memcpy(&bits, &handle, sizeof(handle));
-        return bits;
-    };
-    auto float_bits = [](float value) {
-        uint32_t bits = 0;
-        std::memcpy(&bits, &value, sizeof(bits));
-        return bits;
-    };
     std::vector<DV> dv(draws.size());
     std::vector<FrameBufferResource> synthetic_gds(draws.size());
     std::vector<std::vector<EffectiveResource>> effective_resources(draws.size());
@@ -9261,13 +9360,6 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             effective.push_back({nullptr, &gds});
         }
     }
-    auto direct_range_eligible = [](const FrameBufferResource& r) {
-        return !r.is_internal_gds && r.table_entries.empty() &&
-            r.dwords.empty() && r.direct_guest_buffer_addr != 0 &&
-            r.direct_guest_buffer_addr == r.buffer_identity &&
-            r.direct_guest_buffer_addr == reinterpret_cast<uintptr_t>(r.buffer_words_data()) &&
-            r.buffer_word_count() >= 1024 && r.buffer_word_count() <= UINT64_MAX / 4;
-    };
     std::vector<BufferRangeGroup> buffer_range_groups;
     double res_buffer_range_plan_ms = 0;
     bool readonly_buffer_pass = share_backend_resources && reuse_host_buffers &&
@@ -9366,9 +9458,6 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     double res_buffer_index_insert_ms = 0.0;
     double res_buffer_hash_ms = 0.0;
     double res_descriptor_ms = 0.0;
-    auto setup_elapsed_ms = [](auto begin, auto end) {
-        return std::chrono::duration<double, std::milli>(end - begin).count();
-    };
     BackendPipelineCacheStats& pipeline_stats = backend_pipeline_cache_stats_storage();
     pipeline_stats = {};
     auto& pipeline_cache = persistent_pipeline_cache();
@@ -10112,7 +10201,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             dss.depthTestEnable  = VK_TRUE;
             dss.depthWriteEnable = ps->depth_write_enable ? VK_TRUE : VK_FALSE;
             dss.depthCompareOp   = (VkCompareOp)ps->depth_compare_op;
-            if ((sonic_clear_probe == 2 || sonic_clear_probe == 5) &&
+            if ((sonic_clear_probe() == 2 || sonic_clear_probe() == 5) &&
                 ps->depth_compare_op == VK_COMPARE_OP_ALWAYS && effective_depth_clear(ps)) {
                 dss.depthWriteEnable = VK_FALSE;
             }
@@ -12819,55 +12908,6 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     // lines below. A submit whose draws carry a guest depth or stencil clear is therefore still
     // isolated against different depth contents from the pass it is naming a culprit in. Dynamic
     // state was the part the layer could see; this part it cannot, and it is not fixed here.
-    auto record_stencil_dynamic_state = [](VkCommandBuffer command, const DV& v) {
-        vkCmdSetStencilCompareMask(command, VK_STENCIL_FACE_FRONT_BIT,
-                                   v.stencil_front.compareMask);
-        vkCmdSetStencilCompareMask(command, VK_STENCIL_FACE_BACK_BIT,
-                                   v.stencil_back.compareMask);
-        vkCmdSetStencilWriteMask(command, VK_STENCIL_FACE_FRONT_BIT,
-                                 v.stencil_front.writeMask);
-        vkCmdSetStencilWriteMask(command, VK_STENCIL_FACE_BACK_BIT,
-                                 v.stencil_back.writeMask);
-        vkCmdSetStencilReference(command, VK_STENCIL_FACE_FRONT_BIT,
-                                 v.stencil_front.reference);
-        vkCmdSetStencilReference(command, VK_STENCIL_FACE_BACK_BIT,
-                                 v.stencil_back.reference);
-        vkCmdSetStencilOp(command, VK_STENCIL_FACE_FRONT_BIT, v.stencil_front.failOp,
-                          v.stencil_front.passOp, v.stencil_front.depthFailOp,
-                          v.stencil_front.compareOp);
-        vkCmdSetStencilOp(command, VK_STENCIL_FACE_BACK_BIT, v.stencil_back.failOp,
-                          v.stencil_back.passOp, v.stencil_back.depthFailOp,
-                          v.stencil_back.compareOp);
-    };
-    auto record_pipeline_dynamic_state = [](VkCommandBuffer command, const DV& v) {
-        // These commands and states are required by core Vulkan 1.3, below our 1.4 floor.
-        vkCmdSetDepthTestEnable(command, v.depth_test);
-        vkCmdSetDepthWriteEnable(command, v.depth_write);
-        vkCmdSetDepthCompareOp(command, v.depth_compare);
-        vkCmdSetStencilTestEnable(command, v.stencil_test);
-        vkCmdSetCullMode(command, v.cull_mode);
-        vkCmdSetFrontFace(command, v.front_face);
-        if (!v.mesh_draw) {
-            vkCmdSetPrimitiveTopology(command, v.topology);
-            vkCmdSetPrimitiveRestartEnable(command, v.primitive_restart);
-        }
-    };
-    auto record_draw_dynamic_state = [&](VkCommandBuffer command, const DV& v,
-                                         const prosper::gpu::ResolvedPipelineState* ps) {
-        VkViewport viewport = v.viewport;
-        if ((sonic_clear_probe == 3 || sonic_clear_probe == 4) && ps && effective_depth_clear(ps)) {
-            viewport.minDepth = ps->depth_clear_value;
-            viewport.maxDepth = ps->depth_clear_value;
-            backend_depth_clear_probe_armed_count().fetch_add(1);
-        }
-        vkCmdSetViewport(command, 0, 1, &viewport);
-        vkCmdSetScissor(command, 0, 1, &v.scissor);
-        vkCmdSetLineWidth(command, v.line_width);
-        vkCmdSetDepthBias(command, v.depth_bias_constant, v.depth_bias_clamp,
-                          v.depth_bias_slope);
-        record_stencil_dynamic_state(command, v);
-        record_pipeline_dynamic_state(command, v);
-    };
     vkCmdBeginRenderPass(cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
     for (size_t di = 0; di < dv.size(); di++) {
         auto& v = dv[di];
@@ -12878,7 +12918,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                      ps->stencil_write_mask[0], ps->stencil_write_mask[1]))) {
             VkClearAttachment dsc{};
             if (effective_depth_clear(ps) &&
-                (sonic_clear_probe <= 2 || sonic_clear_probe == 5))
+                (sonic_clear_probe() <= 2 || sonic_clear_probe() == 5))
                 dsc.aspectMask |= VK_IMAGE_ASPECT_DEPTH_BIT;
             if (stencil_clear_effective(ps->stencil_clear_enable, ps->stencil_enable,
                                         ps->stencil_write_mask[0], ps->stencil_write_mask[1]) &&
@@ -12892,7 +12932,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                         rect.rect.extent.height;
             if (clear_recorded)
                 vkCmdClearAttachments(cmd, 1, &dsc, 1, &rect);
-            if (clear_recorded && sonic_clear_probe == 1 &&
+            if (clear_recorded && sonic_clear_probe() == 1 &&
                 (dsc.aspectMask & VK_IMAGE_ASPECT_DEPTH_BIT))
                 backend_depth_clear_probe_armed_count().fetch_add(1);
         }
@@ -12904,7 +12944,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         }
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, v.pipe);
         record_draw_dynamic_state(cmd, v, ps);
-        if ((sonic_clear_probe == 2 || sonic_clear_probe == 5) && ps && effective_depth_clear(ps) &&
+        if ((sonic_clear_probe() == 2 || sonic_clear_probe() == 5) && ps && effective_depth_clear(ps) &&
             ps->depth_compare_op == VK_COMPARE_OP_ALWAYS && ps->depth_write_enable &&
             !v.depth_write)
             backend_depth_clear_probe_armed_count().fetch_add(1);
