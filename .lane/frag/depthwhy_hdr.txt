@@ -1,0 +1,9 @@
+// PROSPER_DEPTH_CLEAR_WHY: how a pass's fresh-image depth value was derived, next to what its
+// draws actually compare with. The latch that produced `depth_clear` is FIRST-DRAW-WINS, so one
+// draw fixes the initial value for every later draw in the pass -- #457 fixed one instance of
+// that class on the stencil side, and this reports whether it is happening again on the depth
+// side, which the derived float alone cannot show. A pass whose draws are predominantly GREATER
+// but whose value came out 1.0 is rejecting its own geometry.
+inline void report_depth_clear_derivation(std::span<const BackendDraw> logical_draws,
+                                          const BackendColorTarget* color_target,
+                                          float depth_clear) {

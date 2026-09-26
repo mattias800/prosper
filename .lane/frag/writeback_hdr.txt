@@ -1,0 +1,5 @@
+// Read each storage upload's staging block back through the writeback callbacks the resource
+// layer registered on it. The caller reaches this only once the submit has completed, which is
+// what makes the bytes the ones the shader wrote rather than the ones it was seeded with.
+inline void writeback_storage_textures(std::vector<SharedTextureUpload>& texture_uploads,
+                                       VkDevice dev) {

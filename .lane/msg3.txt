@@ -1,0 +1,49 @@
+refactor: lift render_draw_pass_rgba's seven reporting blocks out of the pass
+
+Seven blocks in the body of `render_draw_pass_rgba` exist only to report. None of them affects what
+is rendered: each reads state the pass has already decided, or bytes and query results the device
+has already produced, and writes to stderr. Between them they were about a tenth of the function.
+
+  report_depth_clear_derivation    PROSPER_DEPTH_CLEAR_WHY -- how the fresh-image depth value was
+                                   derived, against what the pass's draws actually compare with
+  report_backend_ds_state          PROSPER_DSLOG -- the pass's depth/stencil decision, then the
+                                   guest state per draw
+  report_backend_buffer_verify     PROSPER_BUFVERIFY -- the end-of-pass re-read of every uploaded
+                                   storage buffer, and its aimable mutation control
+  report_ds_slice_census           PROSPER_DS_SLICE_CENSUS -- per (base, slice), how many passes
+                                   attached it against how many claimed a depth write
+  report_draw_stats_funnel         PROSPER_DRAW_STATS -- the fragment funnel, one line per
+                                   realized draw saying where its pixels vanished
+  report_geometry_probe_readback   PROSPER_GEOM_PROBE -- where the probed draw's post-transform
+                                   clip-space vertices landed, plus the geometry-health metrics
+  accumulate_backend_render_timing PROSPER_RENDER_TIMING's lifetime aggregates and the periodic
+                                   windows behind PROSPER_BACKEND_TIMING_WINDOWS
+
+Each moves verbatim apart from a uniform dedent, and each call site keeps the condition that
+already guarded it. Two details are worth naming because they are the only text that is not simply
+relocated:
+
+* The timing block ended the function, so its `if (!timing_mode.log) return out;` stays at the call
+  site and the extracted function returns void. `out` is not touched between there and the
+  `return out;` that follows, so the same value is returned.
+* The geometry readback was `if (geom_active) { if (batch_completed) { ... } }` with no else on
+  either, and the call site folds that to `if (geom_active && batch_completed)`. The draw-stats
+  funnel has the same shape with a declaration between the two conditions, so there
+  `batch_completed` is passed in instead and the inner `if` moves with the body.
+
+Every `static` in the moved code -- the two `TimingTotals` accumulators, DSLOG's call counter, the
+slice tally -- stays `static` inside an inline function, which is one instance program-wide. That
+is the property they had as statics of the pass and the one that makes a cumulative total mean
+anything.
+
+This was only possible after the type vocabulary came out: `report_backend_buffer_verify` takes
+`BufferVerifyRecord` and `SharedBufferUpload` and `report_draw_stats_funnel` takes `DV`, all of
+which were local classes two commits ago and could not be named in any signature.
+
+  render_draw_pass_rgba: 6,613 -> 6,006 lines, 44.6% -> 40.3% of the file
+
+Verification (Linux, RelWithDebInfo, RADV):
+  cmake --build build-linux -j3                exit 0
+  ctest --no-tests=error -j3                   651/651 passed, exit 0
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>

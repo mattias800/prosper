@@ -8516,6 +8516,315 @@ inline void accumulate_backend_render_timing(const BackendRenderTimingStats& cal
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// Texture upload recording, and the storage writeback that reads the result back.
+//
+// Both were loops in the body of `render_draw_pass_rgba` over the same `texture_uploads` vector.
+// The first RECORDS into `cmd` -- barriers, buffer-to-image copies, mip assembly, the borrowed
+// depth and compute sources -- and the second runs after the submit has completed, reading each
+// staging block back through the writeback callbacks the resource layer registered. Keeping them
+// next to each other is the point: the second is only meaningful for uploads the first recorded.
+// ---------------------------------------------------------------------------------------------
+
+// Record every distinct texture upload into `cmd`. Draw descriptors may use separate views and
+// samplers over the same image, preserving per-binding swizzle and sampler state without
+// duplicating pixel storage, which is why this is once per upload rather than once per binding.
+inline void record_texture_uploads(const std::vector<SharedTextureUpload>& texture_uploads,
+                                   VkCommandBuffer cmd,
+                                   VkPipelineStageFlags graphics_shader_stages) {
+    for (const auto& upload : texture_uploads) {
+        if (!upload.staging && !upload.gpu_detile && !upload.uniform_clear && !upload.assembled_target_mips &&
+            !upload.stacked_compute && !upload.feedback_snapshot)
+            continue;  // exact-validated persistent image already has shader-read layout
+        if (upload.gpu_detile) upload.gpu_detile->record(cmd);
+        VkImageMemoryBarrier b0{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        b0.oldLayout = upload.persistent_refresh
+            ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED;
+        b0.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        b0.image = upload.image;
+        b0.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, upload.key.mip_levels,
+                               0, upload.key.sample_count};
+        b0.srcAccessMask = upload.persistent_refresh ? VK_ACCESS_SHADER_READ_BIT : 0;
+        b0.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        vkCmdPipelineBarrier(
+            cmd,
+            upload.persistent_refresh
+                ? graphics_shader_stages
+                : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b0);
+        if (upload.feedback_snapshot) {
+            VkImageMemoryBarrier source_to_copy{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+            source_to_copy.oldLayout = upload.feedback_source_layout;
+            source_to_copy.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            source_to_copy.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+                                           VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                                           VK_ACCESS_SHADER_READ_BIT |
+                                           VK_ACCESS_TRANSFER_READ_BIT |
+                                           VK_ACCESS_TRANSFER_WRITE_BIT;
+            source_to_copy.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            source_to_copy.srcQueueFamilyIndex = source_to_copy.dstQueueFamilyIndex =
+                VK_QUEUE_FAMILY_IGNORED;
+            source_to_copy.image = upload.feedback_source;
+            source_to_copy.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            vkCmdPipelineBarrier(
+                cmd,
+                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                    graphics_shader_stages |
+                    VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                0, nullptr, 0, nullptr, 1, &source_to_copy);
+            VkImageCopy copy{};
+            copy.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            copy.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            copy.extent = {upload.key.width, upload.key.height, 1};
+            vkCmdCopyImage(
+                cmd, upload.feedback_source, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                upload.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+            VkImageMemoryBarrier source_restore{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+            source_restore.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            source_restore.newLayout = upload.feedback_source_layout;
+            source_restore.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            source_restore.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+                                           VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                                           VK_ACCESS_SHADER_READ_BIT;
+            source_restore.srcQueueFamilyIndex = source_restore.dstQueueFamilyIndex =
+                VK_QUEUE_FAMILY_IGNORED;
+            source_restore.image = upload.feedback_source;
+            source_restore.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            vkCmdPipelineBarrier(
+                cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                    graphics_shader_stages,
+                0, 0, nullptr, 0, nullptr, 1, &source_restore);
+        } else if (upload.stacked_compute) {
+            VkImageMemoryBarrier source_to_copy{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+            source_to_copy.oldLayout = upload.borrowed_compute_layout;
+            source_to_copy.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            source_to_copy.srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
+                                           VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+            source_to_copy.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            source_to_copy.srcQueueFamilyIndex = source_to_copy.dstQueueFamilyIndex =
+                VK_QUEUE_FAMILY_IGNORED;
+            source_to_copy.image = upload.stacked_compute_source;
+            source_to_copy.subresourceRange = {
+                VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, upload.stacked_compute_layers};
+            vkCmdPipelineBarrier(
+                cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &source_to_copy);
+            const uint32_t face_height = upload.stacked_compute_layers
+                ? upload.key.height / upload.stacked_compute_layers : 0u;
+            std::vector<VkImageCopy> regions(upload.stacked_compute_layers);
+            for (uint32_t layer = 0; layer < upload.stacked_compute_layers; ++layer) {
+                VkImageCopy& copy = regions[layer];
+                copy.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, layer, 1};
+                copy.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                copy.dstOffset = {0, static_cast<int32_t>(layer * face_height), 0};
+                copy.extent = {upload.key.width, face_height, 1};
+            }
+            vkCmdCopyImage(
+                cmd, upload.stacked_compute_source, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                upload.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                static_cast<uint32_t>(regions.size()), regions.data());
+            VkImageMemoryBarrier source_restore{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+            source_restore.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            source_restore.newLayout = upload.borrowed_compute_layout;
+            source_restore.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            source_restore.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
+                                           VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+            source_restore.srcQueueFamilyIndex = source_restore.dstQueueFamilyIndex =
+                VK_QUEUE_FAMILY_IGNORED;
+            source_restore.image = upload.stacked_compute_source;
+            source_restore.subresourceRange = {
+                VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, upload.stacked_compute_layers};
+            vkCmdPipelineBarrier(
+                cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                0, 0, nullptr, 0, nullptr, 1, &source_restore);
+        } else if (upload.uniform_clear) {
+            const VkImageSubresourceRange range{
+                VK_IMAGE_ASPECT_COLOR_BIT, 0, upload.key.mip_levels,
+                0, upload.key.sample_count};
+            vkCmdClearColorImage(cmd, upload.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                 &upload.uniform_color, 1, &range);
+        } else if (!upload.assembled_target_mips) {
+            VkBufferImageCopy tc{};
+            tc.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0,
+                                   upload.key.sample_count};
+            tc.imageExtent = {upload.key.width, upload.key.height, upload.key.depth};
+            vkCmdCopyBufferToImage(cmd, upload.gpu_detile ? upload.gpu_detile->output : upload.staging, upload.image,
+                                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &tc);
+        }
+        if (upload.assembled_target_mips) {
+            // Each source is an independent one-level persistent color target resting in its
+            // recorded cache layout. Zero the destination first, then copy only levels the guest
+            // actually rendered and restore every source immediately. A missing level must remain
+            // unavailable/black: deriving it from a neighbour invents guest output and amplified
+            // GTA V's incomplete bloom chain into a full-screen glare.
+            const VkClearColorValue missing_level_clear{};
+            const VkImageSubresourceRange missing_level_range{
+                VK_IMAGE_ASPECT_COLOR_BIT, 0, upload.key.mip_levels, 0, 1};
+            vkCmdClearColorImage(cmd, upload.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                 &missing_level_clear, 1, &missing_level_range);
+            // #3248: the clear and the per-level copies below both WRITE this image, and every
+            // barrier inside the loop names the copy SOURCE. Ordering the two writes needs a memory
+            // dependency on the DESTINATION -- see record_transfer_write_after_write_barrier for why
+            // the resulting corruption is invisible in the output.
+            record_transfer_write_after_write_barrier(cmd, upload.image, missing_level_range);
+            for (uint32_t level = 0; level < upload.key.mip_levels; ++level) {
+                const uint32_t level_w = std::max(upload.key.width >> level, 1u);
+                const uint32_t level_h = std::max(upload.key.height >> level, 1u);
+                if (upload.target_mip_images[level]) {
+                    VkImageMemoryBarrier source_to_copy{
+                        VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+                    source_to_copy.oldLayout = upload.target_mip_layouts[level];
+                    source_to_copy.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+                    source_to_copy.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                                                   VK_ACCESS_SHADER_READ_BIT |
+                                                   VK_ACCESS_TRANSFER_READ_BIT;
+                    source_to_copy.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+                    source_to_copy.srcQueueFamilyIndex = source_to_copy.dstQueueFamilyIndex =
+                        VK_QUEUE_FAMILY_IGNORED;
+                    source_to_copy.image = upload.target_mip_images[level];
+                    source_to_copy.subresourceRange = {
+                        VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                    vkCmdPipelineBarrier(
+                        cmd,
+                        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                            graphics_shader_stages |
+                            VK_PIPELINE_STAGE_TRANSFER_BIT,
+                        VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                        0, nullptr, 0, nullptr, 1, &source_to_copy);
+                    VkImageCopy copy{};
+                    copy.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                    copy.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, 0, 1};
+                    copy.extent = {level_w, level_h, 1};
+                    vkCmdCopyImage(
+                        cmd, upload.target_mip_images[level],
+                        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, upload.image,
+                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+                    VkImageMemoryBarrier source_restore{
+                        VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+                    source_restore.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+                    source_restore.newLayout = upload.target_mip_layouts[level];
+                    source_restore.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+                    source_restore.dstAccessMask = VK_ACCESS_SHADER_READ_BIT |
+                                                   VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+                                                   VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+                    source_restore.srcQueueFamilyIndex = source_restore.dstQueueFamilyIndex =
+                        VK_QUEUE_FAMILY_IGNORED;
+                    source_restore.image = upload.target_mip_images[level];
+                    source_restore.subresourceRange = {
+                        VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                    vkCmdPipelineBarrier(
+                        cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                        graphics_shader_stages |
+                            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                        0, 0, nullptr, 0, nullptr, 1, &source_restore);
+                }
+            }
+        }
+        // #1272: generate levels 1..N-1 with a linear-filtered blit cascade (GPU-side, once per
+        // upload — a CPU box filter here collapsed titles that re-upload large textures per frame).
+        // Each source level transitions DST->SRC before feeding the next; the final barrier below
+        // then flips the whole chain to shader-read. RGBA8 linear-blit support is mandatory Vulkan.
+        for (uint32_t l = 1; !upload.uniform_clear && !upload.assembled_target_mips &&
+             !upload.stacked_compute && !upload.feedback_snapshot &&
+             l < upload.key.mip_levels; l++) {
+            VkImageMemoryBarrier bs{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+            bs.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            bs.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            bs.image = upload.image;
+            bs.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, l - 1, 1,
+                                   0, upload.key.sample_count};
+            bs.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            bs.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                 0, 0, nullptr, 0, nullptr, 1, &bs);
+            const int32_t sw = (int32_t)(upload.key.width >> (l - 1) ? upload.key.width >> (l - 1) : 1u);
+            const int32_t sh = (int32_t)(upload.key.height >> (l - 1) ? upload.key.height >> (l - 1) : 1u);
+            const int32_t dw = (int32_t)(upload.key.width >> l ? upload.key.width >> l : 1u);
+            const int32_t dh = (int32_t)(upload.key.height >> l ? upload.key.height >> l : 1u);
+            VkImageBlit blit{};
+            blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, l - 1, 0,
+                                   upload.key.sample_count};
+            blit.srcOffsets[1] = {sw, sh, 1};
+            blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, l, 0,
+                                   upload.key.sample_count};
+            blit.dstOffsets[1] = {dw, dh, 1};
+            vkCmdBlitImage(cmd, upload.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           upload.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
+                           VK_FILTER_LINEAR);
+        }
+        if (!upload.uniform_clear && !upload.assembled_target_mips &&
+            !upload.stacked_compute && !upload.feedback_snapshot &&
+            upload.key.mip_levels > 1) {
+            // Levels 0..N-2 sit in TRANSFER_SRC after feeding the cascade; return them to
+            // TRANSFER_DST so the single final-layout barrier below covers the whole chain.
+            VkImageMemoryBarrier br{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+            br.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            br.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            br.image = upload.image;
+            br.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0,
+                                   upload.key.mip_levels - 1, 0,
+                                   upload.key.sample_count};
+            br.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            br.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                 0, 0, nullptr, 0, nullptr, 1, &br);
+        }
+        VkImageMemoryBarrier b1{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        b1.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        b1.newLayout = upload.key.storage_image
+            ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        b1.image = upload.image;
+        b1.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, upload.key.mip_levels,
+                               0, upload.key.sample_count};
+        b1.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        b1.dstAccessMask = VK_ACCESS_SHADER_READ_BIT |
+            (upload.key.storage_image ? VK_ACCESS_SHADER_WRITE_BIT : 0);
+        // The dst stage must cover every stage that samples this image. Set-0 textures are visible
+        // to the vertex or mesh stage as well as fragment; a fragment-only barrier leaves those
+        // reads unordered after the transfer write (SYNC-HAZARD-READ-AFTER-WRITE). Match the
+        // enabled binding stages, including optional mesh shaders (#454).
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             graphics_shader_stages,
+                             0, 0, nullptr, 0, nullptr, 1, &b1);
+    }
+}
+
+// Read each storage upload's staging block back through the writeback callbacks the resource
+// layer registered on it. The caller reaches this only once the submit has completed, which is
+// what makes the bytes the ones the shader wrote rather than the ones it was seeded with.
+inline void writeback_storage_textures(std::vector<SharedTextureUpload>& texture_uploads,
+                                       VkDevice dev) {
+    for (SharedTextureUpload& upload : texture_uploads) {
+        if (upload.storage_writebacks.empty() || !upload.staging ||
+            !upload.staging_memory)
+            continue;
+        const size_t storage_bytes = static_cast<size_t>(upload.key.width) *
+            upload.key.height * upload.key.depth * upload.key.sample_count *
+            backend_color_bytes_per_pixel(upload.key.format);
+        // #3405: this staging block is already mapped for its whole life. Re-mapping it
+        // fails with VK_ERROR_MEMORY_MAP_FAILED, and the vkUnmapMemory that used to follow
+        // would tear down the retained mapping and leave the cached pointer dangling for
+        // the next reuse -- which is precisely how the first attempt at this change
+        // segfaulted texture_sample_render. Read through the retained pointer instead, and
+        // only map (and unmap) when the block is not one of ours.
+        void* mapped = upload.staging_mapped;
+        const bool borrowed_mapping = mapped != nullptr;
+        if (!storage_bytes) continue;
+        if (!borrowed_mapping &&
+            (vkMapMemory(dev, upload.staging_memory, 0, storage_bytes, 0,
+                         &mapped) != VK_SUCCESS ||
+             !mapped))
+            continue;
+        const auto* pixels = static_cast<const uint8_t*>(mapped);
+        for (const auto& writeback : upload.storage_writebacks)
+            writeback(pixels, storage_bytes);
+        if (!borrowed_mapping) vkUnmapMemory(dev, upload.staging_memory);
+    }
+}
+
 inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> draws,
                                                   uint32_t W, uint32_t H,
                                                   const uint8_t* seed_rgba = nullptr,
@@ -12981,264 +13290,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     }
     // Upload each distinct texture once. Draw descriptors may use separate views/samplers over the
     // same image, preserving per-binding swizzle and sampler state without duplicating pixel storage.
-    for (const auto& upload : texture_uploads) {
-        if (!upload.staging && !upload.gpu_detile && !upload.uniform_clear && !upload.assembled_target_mips &&
-            !upload.stacked_compute && !upload.feedback_snapshot)
-            continue;  // exact-validated persistent image already has shader-read layout
-        if (upload.gpu_detile) upload.gpu_detile->record(cmd);
-        VkImageMemoryBarrier b0{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-        b0.oldLayout = upload.persistent_refresh
-            ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED;
-        b0.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-        b0.image = upload.image;
-        b0.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, upload.key.mip_levels,
-                               0, upload.key.sample_count};
-        b0.srcAccessMask = upload.persistent_refresh ? VK_ACCESS_SHADER_READ_BIT : 0;
-        b0.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        vkCmdPipelineBarrier(
-            cmd,
-            upload.persistent_refresh
-                ? graphics_shader_stages
-                : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-            VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b0);
-        if (upload.feedback_snapshot) {
-            VkImageMemoryBarrier source_to_copy{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-            source_to_copy.oldLayout = upload.feedback_source_layout;
-            source_to_copy.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-            source_to_copy.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
-                                           VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
-                                           VK_ACCESS_SHADER_READ_BIT |
-                                           VK_ACCESS_TRANSFER_READ_BIT |
-                                           VK_ACCESS_TRANSFER_WRITE_BIT;
-            source_to_copy.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-            source_to_copy.srcQueueFamilyIndex = source_to_copy.dstQueueFamilyIndex =
-                VK_QUEUE_FAMILY_IGNORED;
-            source_to_copy.image = upload.feedback_source;
-            source_to_copy.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-            vkCmdPipelineBarrier(
-                cmd,
-                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
-                    graphics_shader_stages |
-                    VK_PIPELINE_STAGE_TRANSFER_BIT,
-                VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
-                0, nullptr, 0, nullptr, 1, &source_to_copy);
-            VkImageCopy copy{};
-            copy.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-            copy.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-            copy.extent = {upload.key.width, upload.key.height, 1};
-            vkCmdCopyImage(
-                cmd, upload.feedback_source, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                upload.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
-            VkImageMemoryBarrier source_restore{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-            source_restore.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-            source_restore.newLayout = upload.feedback_source_layout;
-            source_restore.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-            source_restore.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
-                                           VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
-                                           VK_ACCESS_SHADER_READ_BIT;
-            source_restore.srcQueueFamilyIndex = source_restore.dstQueueFamilyIndex =
-                VK_QUEUE_FAMILY_IGNORED;
-            source_restore.image = upload.feedback_source;
-            source_restore.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-            vkCmdPipelineBarrier(
-                cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
-                    graphics_shader_stages,
-                0, 0, nullptr, 0, nullptr, 1, &source_restore);
-        } else if (upload.stacked_compute) {
-            VkImageMemoryBarrier source_to_copy{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-            source_to_copy.oldLayout = upload.borrowed_compute_layout;
-            source_to_copy.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-            source_to_copy.srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
-                                           VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
-            source_to_copy.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-            source_to_copy.srcQueueFamilyIndex = source_to_copy.dstQueueFamilyIndex =
-                VK_QUEUE_FAMILY_IGNORED;
-            source_to_copy.image = upload.stacked_compute_source;
-            source_to_copy.subresourceRange = {
-                VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, upload.stacked_compute_layers};
-            vkCmdPipelineBarrier(
-                cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
-                VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &source_to_copy);
-            const uint32_t face_height = upload.stacked_compute_layers
-                ? upload.key.height / upload.stacked_compute_layers : 0u;
-            std::vector<VkImageCopy> regions(upload.stacked_compute_layers);
-            for (uint32_t layer = 0; layer < upload.stacked_compute_layers; ++layer) {
-                VkImageCopy& copy = regions[layer];
-                copy.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, layer, 1};
-                copy.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-                copy.dstOffset = {0, static_cast<int32_t>(layer * face_height), 0};
-                copy.extent = {upload.key.width, face_height, 1};
-            }
-            vkCmdCopyImage(
-                cmd, upload.stacked_compute_source, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                upload.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                static_cast<uint32_t>(regions.size()), regions.data());
-            VkImageMemoryBarrier source_restore{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-            source_restore.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-            source_restore.newLayout = upload.borrowed_compute_layout;
-            source_restore.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-            source_restore.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
-                                           VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
-            source_restore.srcQueueFamilyIndex = source_restore.dstQueueFamilyIndex =
-                VK_QUEUE_FAMILY_IGNORED;
-            source_restore.image = upload.stacked_compute_source;
-            source_restore.subresourceRange = {
-                VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, upload.stacked_compute_layers};
-            vkCmdPipelineBarrier(
-                cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
-                0, 0, nullptr, 0, nullptr, 1, &source_restore);
-        } else if (upload.uniform_clear) {
-            const VkImageSubresourceRange range{
-                VK_IMAGE_ASPECT_COLOR_BIT, 0, upload.key.mip_levels,
-                0, upload.key.sample_count};
-            vkCmdClearColorImage(cmd, upload.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                                 &upload.uniform_color, 1, &range);
-        } else if (!upload.assembled_target_mips) {
-            VkBufferImageCopy tc{};
-            tc.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0,
-                                   upload.key.sample_count};
-            tc.imageExtent = {upload.key.width, upload.key.height, upload.key.depth};
-            vkCmdCopyBufferToImage(cmd, upload.gpu_detile ? upload.gpu_detile->output : upload.staging, upload.image,
-                                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &tc);
-        }
-        if (upload.assembled_target_mips) {
-            // Each source is an independent one-level persistent color target resting in its
-            // recorded cache layout. Zero the destination first, then copy only levels the guest
-            // actually rendered and restore every source immediately. A missing level must remain
-            // unavailable/black: deriving it from a neighbour invents guest output and amplified
-            // GTA V's incomplete bloom chain into a full-screen glare.
-            const VkClearColorValue missing_level_clear{};
-            const VkImageSubresourceRange missing_level_range{
-                VK_IMAGE_ASPECT_COLOR_BIT, 0, upload.key.mip_levels, 0, 1};
-            vkCmdClearColorImage(cmd, upload.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                                 &missing_level_clear, 1, &missing_level_range);
-            // #3248: the clear and the per-level copies below both WRITE this image, and every
-            // barrier inside the loop names the copy SOURCE. Ordering the two writes needs a memory
-            // dependency on the DESTINATION -- see record_transfer_write_after_write_barrier for why
-            // the resulting corruption is invisible in the output.
-            record_transfer_write_after_write_barrier(cmd, upload.image, missing_level_range);
-            for (uint32_t level = 0; level < upload.key.mip_levels; ++level) {
-                const uint32_t level_w = std::max(upload.key.width >> level, 1u);
-                const uint32_t level_h = std::max(upload.key.height >> level, 1u);
-                if (upload.target_mip_images[level]) {
-                    VkImageMemoryBarrier source_to_copy{
-                        VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-                    source_to_copy.oldLayout = upload.target_mip_layouts[level];
-                    source_to_copy.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-                    source_to_copy.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
-                                                   VK_ACCESS_SHADER_READ_BIT |
-                                                   VK_ACCESS_TRANSFER_READ_BIT;
-                    source_to_copy.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-                    source_to_copy.srcQueueFamilyIndex = source_to_copy.dstQueueFamilyIndex =
-                        VK_QUEUE_FAMILY_IGNORED;
-                    source_to_copy.image = upload.target_mip_images[level];
-                    source_to_copy.subresourceRange = {
-                        VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-                    vkCmdPipelineBarrier(
-                        cmd,
-                        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
-                            graphics_shader_stages |
-                            VK_PIPELINE_STAGE_TRANSFER_BIT,
-                        VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
-                        0, nullptr, 0, nullptr, 1, &source_to_copy);
-                    VkImageCopy copy{};
-                    copy.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-                    copy.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, 0, 1};
-                    copy.extent = {level_w, level_h, 1};
-                    vkCmdCopyImage(
-                        cmd, upload.target_mip_images[level],
-                        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, upload.image,
-                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
-                    VkImageMemoryBarrier source_restore{
-                        VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-                    source_restore.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-                    source_restore.newLayout = upload.target_mip_layouts[level];
-                    source_restore.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-                    source_restore.dstAccessMask = VK_ACCESS_SHADER_READ_BIT |
-                                                   VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
-                                                   VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-                    source_restore.srcQueueFamilyIndex = source_restore.dstQueueFamilyIndex =
-                        VK_QUEUE_FAMILY_IGNORED;
-                    source_restore.image = upload.target_mip_images[level];
-                    source_restore.subresourceRange = {
-                        VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-                    vkCmdPipelineBarrier(
-                        cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                        graphics_shader_stages |
-                            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-                        0, 0, nullptr, 0, nullptr, 1, &source_restore);
-                }
-            }
-        }
-        // #1272: generate levels 1..N-1 with a linear-filtered blit cascade (GPU-side, once per
-        // upload — a CPU box filter here collapsed titles that re-upload large textures per frame).
-        // Each source level transitions DST->SRC before feeding the next; the final barrier below
-        // then flips the whole chain to shader-read. RGBA8 linear-blit support is mandatory Vulkan.
-        for (uint32_t l = 1; !upload.uniform_clear && !upload.assembled_target_mips &&
-             !upload.stacked_compute && !upload.feedback_snapshot &&
-             l < upload.key.mip_levels; l++) {
-            VkImageMemoryBarrier bs{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-            bs.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-            bs.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-            bs.image = upload.image;
-            bs.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, l - 1, 1,
-                                   0, upload.key.sample_count};
-            bs.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-            bs.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                 0, 0, nullptr, 0, nullptr, 1, &bs);
-            const int32_t sw = (int32_t)(upload.key.width >> (l - 1) ? upload.key.width >> (l - 1) : 1u);
-            const int32_t sh = (int32_t)(upload.key.height >> (l - 1) ? upload.key.height >> (l - 1) : 1u);
-            const int32_t dw = (int32_t)(upload.key.width >> l ? upload.key.width >> l : 1u);
-            const int32_t dh = (int32_t)(upload.key.height >> l ? upload.key.height >> l : 1u);
-            VkImageBlit blit{};
-            blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, l - 1, 0,
-                                   upload.key.sample_count};
-            blit.srcOffsets[1] = {sw, sh, 1};
-            blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, l, 0,
-                                   upload.key.sample_count};
-            blit.dstOffsets[1] = {dw, dh, 1};
-            vkCmdBlitImage(cmd, upload.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                           upload.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
-                           VK_FILTER_LINEAR);
-        }
-        if (!upload.uniform_clear && !upload.assembled_target_mips &&
-            !upload.stacked_compute && !upload.feedback_snapshot &&
-            upload.key.mip_levels > 1) {
-            // Levels 0..N-2 sit in TRANSFER_SRC after feeding the cascade; return them to
-            // TRANSFER_DST so the single final-layout barrier below covers the whole chain.
-            VkImageMemoryBarrier br{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-            br.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-            br.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-            br.image = upload.image;
-            br.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0,
-                                   upload.key.mip_levels - 1, 0,
-                                   upload.key.sample_count};
-            br.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-            br.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                 0, 0, nullptr, 0, nullptr, 1, &br);
-        }
-        VkImageMemoryBarrier b1{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-        b1.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-        b1.newLayout = upload.key.storage_image
-            ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        b1.image = upload.image;
-        b1.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, upload.key.mip_levels,
-                               0, upload.key.sample_count};
-        b1.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        b1.dstAccessMask = VK_ACCESS_SHADER_READ_BIT |
-            (upload.key.storage_image ? VK_ACCESS_SHADER_WRITE_BIT : 0);
-        // The dst stage must cover every stage that samples this image. Set-0 textures are visible
-        // to the vertex or mesh stage as well as fragment; a fragment-only barrier leaves those
-        // reads unordered after the transfer write (SYNC-HAZARD-READ-AFTER-WRITE). Match the
-        // enabled binding stages, including optional mesh shaders (#454).
-        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                             graphics_shader_stages,
-                             0, 0, nullptr, 0, nullptr, 1, &b1);
-    }
+    record_texture_uploads(texture_uploads, cmd, graphics_shader_stages);
     // Compute-owned typed storage results rest in GENERAL. Borrow each exact image once per call,
     // make the completed compute/transfer writes visible to graphics sampling, and restore GENERAL
     // after the pass so the compute cache's layout contract remains true.
@@ -14128,34 +14180,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         report_geometry_probe_readback(dev, geom_counter_mem, geom_mem, geom_cap,
                                        geom_target_label);
 
-    if (storage_writeback_requested && batch_completed) {
-        for (SharedTextureUpload& upload : texture_uploads) {
-            if (upload.storage_writebacks.empty() || !upload.staging ||
-                !upload.staging_memory)
-                continue;
-            const size_t storage_bytes = static_cast<size_t>(upload.key.width) *
-                upload.key.height * upload.key.depth * upload.key.sample_count *
-                backend_color_bytes_per_pixel(upload.key.format);
-            // #3405: this staging block is already mapped for its whole life. Re-mapping it
-            // fails with VK_ERROR_MEMORY_MAP_FAILED, and the vkUnmapMemory that used to follow
-            // would tear down the retained mapping and leave the cached pointer dangling for
-            // the next reuse -- which is precisely how the first attempt at this change
-            // segfaulted texture_sample_render. Read through the retained pointer instead, and
-            // only map (and unmap) when the block is not one of ours.
-            void* mapped = upload.staging_mapped;
-            const bool borrowed_mapping = mapped != nullptr;
-            if (!storage_bytes) continue;
-            if (!borrowed_mapping &&
-                (vkMapMemory(dev, upload.staging_memory, 0, storage_bytes, 0,
-                             &mapped) != VK_SUCCESS ||
-                 !mapped))
-                continue;
-            const auto* pixels = static_cast<const uint8_t*>(mapped);
-            for (const auto& writeback : upload.storage_writebacks)
-                writeback(pixels, storage_bytes);
-            if (!borrowed_mapping) vkUnmapMemory(dev, upload.staging_memory);
-        }
-    }
+    if (storage_writeback_requested && batch_completed)
+        writeback_storage_textures(texture_uploads, dev);
     if (readback_requested && batch_completed) {
         void* mp = nullptr; vkMapMemory(dev, bmem, 0, readback_bytes, 0, &mp);
         const auto* readback = static_cast<const uint8_t*>(mp);

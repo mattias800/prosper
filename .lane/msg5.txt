@@ -1,0 +1,17 @@
+tools/refactor: register hoist_spans.py's selftest as a ctest case
+
+Its three siblings -- split_file, map_symbols, survey_sizes, and now census_bodies and
+outline_methods -- are all registered, and the reason given for split_file applies here word for
+word: an unregistered selftest is one somebody remembers to run. hoist_spans is the tool the last
+four commits moved 1,400 lines with, so its inverse round trip and the three corrupted outputs it
+must REJECT are worth a gate rather than a habit.
+
+Textual and dependency-free on purpose, like outline_methods': no libclang, so it runs everywhere
+rather than being skipped on a runner without one.
+
+This takes the registered test count from 651 to 652.
+
+Verification (Linux, RelWithDebInfo, RADV):
+  ctest --no-tests=error -j3                   652/652 passed, exit 0
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>

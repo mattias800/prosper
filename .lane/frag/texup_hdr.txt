@@ -1,0 +1,16 @@
+// ---------------------------------------------------------------------------------------------
+// Texture upload recording, and the storage writeback that reads the result back.
+//
+// Both were loops in the body of `render_draw_pass_rgba` over the same `texture_uploads` vector.
+// The first RECORDS into `cmd` -- barriers, buffer-to-image copies, mip assembly, the borrowed
+// depth and compute sources -- and the second runs after the submit has completed, reading each
+// staging block back through the writeback callbacks the resource layer registered. Keeping them
+// next to each other is the point: the second is only meaningful for uploads the first recorded.
+// ---------------------------------------------------------------------------------------------
+
+// Record every distinct texture upload into `cmd`. Draw descriptors may use separate views and
+// samplers over the same image, preserving per-binding swizzle and sampler state without
+// duplicating pixel storage, which is why this is once per upload rather than once per binding.
+inline void record_texture_uploads(const std::vector<SharedTextureUpload>& texture_uploads,
+                                   VkCommandBuffer cmd,
+                                   VkPipelineStageFlags graphics_shader_stages) {

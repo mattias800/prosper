@@ -1,0 +1,13 @@
+// The backend's LIFETIME timing aggregates, and the periodic stderr windows behind
+// PROSPER_BACKEND_TIMING_WINDOWS. `render_draw_pass_rgba` reaches this only after it has filled
+// `call_timing` for the F8 caller, and only when PROSPER_RENDER_TIMING also asked for the log --
+// so nothing here runs on a default boot. The two totals are `static` for the same reason they
+// were statics of that function: they accumulate across calls, and one instance of an inline
+// function's static is shared by every translation unit, which is the property being preserved.
+//
+// Read the numbers with the charter's warning in mind: which harness produced a rate, and when.
+inline void accumulate_backend_render_timing(const BackendRenderTimingStats& call_timing,
+                                             std::span<const BackendDraw> draws,
+                                             const BackendTextureUploadStats& texture_stats,
+                                             const BackendResourceReuseStats& resource_reuse_stats,
+                                             const BackendPipelineCacheStats& pipeline_stats) {

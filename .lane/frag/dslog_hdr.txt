@@ -1,0 +1,8 @@
+// PROSPER_DSLOG: one line for the pass's depth/stencil decision, then one per draw for the guest
+// state it was derived from. Reporting only -- it reads what the pass already decided and writes
+// nothing back, which is why it can sit outside the pass at all.
+inline void report_backend_ds_state(uint32_t W, uint32_t H, std::span<const BackendDraw> draws,
+                                    bool use_depth, bool use_stencil, bool persistent_ds,
+                                    bool ds_layout_initialized, bool depth_was_valid,
+                                    bool stencil_was_valid, const PersistentDsKey& ds_key,
+                                    float depth_clear, uint32_t stencil_clear) {

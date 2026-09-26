@@ -1,0 +1,7 @@
+// Geometry-probe readback: report where the probed draw's post-transform clip-space vertices
+// landed. The caller reaches this only with `geom_active && batch_completed`, so the transform
+// feedback buffers exist and the submit that filled them has completed -- both halves matter,
+// because mapping either buffer before completion reads whatever was there before.
+inline void report_geometry_probe_readback(VkDevice dev, VkDeviceMemory geom_counter_mem,
+                                           VkDeviceMemory geom_mem, uint32_t geom_cap,
+                                           unsigned long long geom_target_label) {

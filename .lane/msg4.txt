@@ -1,0 +1,27 @@
+refactor: move the texture-upload loops out of render_draw_pass_rgba
+
+Two loops over the pass's `texture_uploads` vector, 286 lines between them, become
+`record_texture_uploads` and `writeback_storage_textures`.
+
+The first records every distinct upload into the command buffer -- layout barriers, buffer-to-image
+copies, GPU detile, uniform clears, mip assembly from independent renderer targets, the borrowed
+compute and depth sources, the colour-attachment feedback snapshot -- and reads nothing from the
+pass but the uploads themselves, the command buffer, and the graphics shader-stage mask. The
+second runs after the submit has completed and pushes each storage upload's staging bytes back
+through the writeback callbacks the resource layer registered on it. They are kept adjacent
+because the second is only meaningful for uploads the first recorded.
+
+Verbatim moves; the call sites keep the conditions that already guarded them.
+
+Both were unmovable until `SharedTextureUpload` left the function body: a 258-line loop with three
+free variables could not be extracted while its element type had no name outside the pass. The
+three free variables are not an estimate -- they are what the compiler named when the loop was cut
+into a parameterless function, which is how the parameter lists in this series were derived.
+
+  render_draw_pass_rgba: 6,006 -> 5,723 lines, 40.3% -> 38.3% of the file
+
+Verification (Linux, RelWithDebInfo, RADV):
+  cmake --build build-linux -j3                exit 0
+  ctest --no-tests=error -j3                   651/651 passed, exit 0
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>

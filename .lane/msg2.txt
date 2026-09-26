@@ -1,0 +1,44 @@
+refactor: make render_draw_pass_rgba's capture-free lambdas free functions
+
+Nine helpers inside `render_draw_pass_rgba` were lambdas that captured nothing. A lambda that
+captures nothing is a free function that has not been written down as one -- and while it is
+written that way, it can only be called from inside the enclosing function, so every block that
+used one was pinned in the body with it. `record_draw_dynamic_state` alone is used by the record
+loop and by the PROSPER_DRAW_ISO diagnostic; `effective_depth_clear` by six sites.
+
+Moved verbatim to namespace scope, with each lambda's head and `};` replaced by a signature and a
+`}`, and any comment run above it moved along:
+
+  sonic_clear_probe, effective_depth_clear, handle_bits, float_bits, direct_range_eligible,
+  setup_elapsed_ms, record_stencil_dynamic_state, record_pipeline_dynamic_state,
+  record_draw_dynamic_state
+
+One of the nine needed a shape change rather than a move. `sonic_clear_probe` was a function-local
+`static const int`, which the moved helpers can no longer see, so it becomes an accessor whose own
+function-local static holds the value. That is deliberate and not cosmetic: a namespace-scope
+`static` in a header is one copy PER TRANSLATION UNIT, each initialized before main, whereas a
+function-local static of an inline function is one instance program-wide initialized on the first
+call -- which is where the static inside the pass was initialized. A test that sets
+PROSPER_DIAG_CLEAR_OVERWRITE and then renders would read a different answer under the first
+spelling. The seven call sites become calls; the initialization point can only move later within
+the same pass, and the value is derived from getenv, so no call can observe the difference.
+
+Two of the nine (`handle_bits`, `setup_elapsed_ms`) took `auto` parameters and are abbreviated
+function templates now, deducing exactly as the generic lambdas did.
+
+No behaviour change otherwise: same bodies, same call order, same values.
+
+  render_draw_pass_rgba: 6,710 -> 6,613 lines, 45.4% -> 44.6% of the file
+
+Verification (Linux, RelWithDebInfo, RADV):
+  cmake --build build-linux -j3                exit 0
+  ctest --no-tests=error -j3                   651/651 passed, exit 0
+
+The first full run of that suite reported 650/651 with `profiling_access` (Timeout). That case has
+a 30 s ctest TIMEOUT and reads perf_event_paranoid; it touches nothing in this diff. Another lane
+was building and running its own suite at the time (box load average 65), and the case passes in
+1.64 s on a targeted re-run and in the clean full run quoted above. Recorded rather than dropped,
+because "re-run until green" is not a method -- the discriminator here is that the case is
+unrelated to the diff AND fast in isolation, not merely that a second run was greener.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>

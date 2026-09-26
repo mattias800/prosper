@@ -1,0 +1,7 @@
+// PROSPER_BUFVERIFY's end-of-pass check, and its aimable mutation control. Runs just before the
+// pass is submitted, which is the placement that makes a post-memcpy clobber visible at all; the
+// scope it can and cannot speak to is stated where `buffer_verify_records` is declared, and the
+// body below repeats it rather than leaving the caveat behind at the call site.
+inline void report_backend_buffer_verify(
+    const std::vector<BufferVerifyRecord>& buffer_verify_records,
+    const std::vector<SharedBufferUpload>& shared_buffers) {

@@ -1,0 +1,42 @@
+refactor: hoist render_draw_pass_rgba's local type vocabulary to namespace scope
+
+`render_draw_pass_rgba` in tests/fixtures/render_runner.h is 7,088 lines, 48% of the file
+(`tools/refactor/survey_sizes.py --roots tests`). Despite the directory it lives in, it is the
+production Vulkan backend: frontends/shared/live/live_renderer.cpp calls it on every rendered
+pass.
+
+Thirty-two `struct` declarations sat INSIDE that function, and they are what pinned everything
+else there. A local class cannot be named from outside the function that declares it, so every
+block touching an upload, a binding, a memo slot or a per-draw record was unmovable while its
+types were local -- the vocabulary had to come out before anything using it could.
+
+This moves them, verbatim, to namespace scope immediately above the function, together with the
+`using TimingClock` alias and `kMaxDescriptorSets` that two of them name. Their relative order is
+unchanged, which is already dependency order. The `static` objects TYPED by them (the persistent
+texture cache, the three slot memos, the wave64 census) deliberately stay in the function: they
+are the pass's state, not its vocabulary, and a function-local static of an inline function is one
+instance program-wide either way.
+
+Two of the thirty-two were written as `struct X { ... } var{...};`. Those lines are split into a
+declaration and a definition so the struct is whole lines; that is the only text in the diff that
+was not simply relocated.
+
+No behaviour change. C++ already forbids a local class from naming an automatic variable of its
+enclosing function, so none of these ever read the surrounding scope.
+
+Tooling: this needed a primitive the refactor toolbox did not have, so it adds
+`tools/refactor/hoist_spans.py` -- move exact line spans to an earlier anchor in the same file and
+prove it by INVERSE: read the result back from disk, cut each moved span out of the destination,
+re-insert it at its original index, and require the original file back byte for byte. Its
+`--selftest` covers nine cases including three corrupted outputs that must be REJECTED, because a
+verifier that cannot fail is not a verifier. What it does not prove is that the result compiles --
+the same caveat split_file.py carries -- which is what the build below is for.
+
+  render_draw_pass_rgba: 7,088 -> 6,710 lines (380 moved), 48.0% -> 45.4% of the file
+
+Verification (Linux, RelWithDebInfo, RADV):
+  cmake --build build-linux -j3                exit 0
+  ctest --no-tests=error -j3                   651/651 passed, exit 0
+  hoist_spans.py --selftest                    OK (9 cases)
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>

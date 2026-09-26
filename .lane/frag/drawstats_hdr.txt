@@ -1,0 +1,7 @@
+// PROSPER_DRAW_STATS, the fragment funnel: one line per realized draw saying where its pixels
+// vanished. The caller reaches this only with `ds_active`, which implies the pass flushed, so the
+// query pools have results; `batch_completed` says whether that flush actually finished, and an
+// unfinished one must read nothing rather than read stale numbers.
+inline void report_draw_stats_funnel(VkDevice dev, VkQueryPool ds_stats_pool,
+                                     VkQueryPool ds_occ_pool, const std::vector<DV>& dv,
+                                     std::span<const BackendDraw> draws, bool batch_completed) {

@@ -1,0 +1,5 @@
+// PROSPER_DS_SLICE_CENSUS, per (base, slice): how many passes attached it, and how many of those
+// actually claimed a depth write. A slice whose entry exists but never becomes valid is either
+// never really written or is having its write disclaimed, and those are different defects.
+inline void report_ds_slice_census(const PersistentDsKey& ds_key, bool use_depth,
+                                   bool depth_used_meaningfully) {

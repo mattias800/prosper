@@ -1,0 +1,16 @@
+// ---------------------------------------------------------------------------------------------
+// The render pass's own vocabulary.
+//
+// Every type below was declared INSIDE `render_draw_pass_rgba`, and every one is used only by that
+// pass and by the helpers carved out of it. They live at namespace scope because a local class
+// cannot be NAMED from outside the function that declares it: while these sat in the body, no part
+// of the pass that touches an upload, a binding, a memo slot or a per-draw record could be moved
+// out at all, which is most of what the pass does.
+//
+// Hoisting them changes nothing. C++ already forbids a local class from naming an automatic
+// variable of its enclosing function, so none of these ever depended on the surrounding scope --
+// their declaration order here is the order they appeared in, which is already dependency order.
+// The `static` objects typed by them (the persistent texture cache, the slot memos, the wave64
+// census) deliberately stay in the function: they are the pass's state, not its vocabulary.
+// ---------------------------------------------------------------------------------------------
+
