@@ -21,13 +21,20 @@ from the tracker issues, and still gated, because it is a projection of state ra
 
 ## 2026-09-26
 
-### The renderer copies every sampled render target back to the CPU
+### The Messenger runs at 59.9 fps on the shipped path, and the renderer is 6.7% of it
 
-No picture — a measurement, and it moved the frontier. Readback is 68.5% of a backend call and forces
-one of every two flushes, so *that* is why submits block, not the submit model. One fix landed: the CPU
-snapshot pool matched on exact size instead of capacity, so Astro Bot's 56,543 MiB of allocate-and-copy
-per two minutes is now 1,096 MiB. Shared code, no title in it. Collapsing small passes and pooling
-worker threads were both measured and ruled out.
+No picture — measurements. Two numbers worth having: on the real windowed frontend with GPU
+present active, The Messenger holds **59.9 fps** over 8,880 frames with only **6.7%** of wall clock
+inside the renderer, and Astro Bot spends **9.4%**. So for both, the renderer is not the frontier.
+
+One fix landed: the CPU render-target snapshot pool matched on exact size instead of capacity.
+Re-measured on the shipped windowed path, Astro Bot does 24,991 pool copies at a **99.5%** hit rate
+against 61.5% misses before. Shared code, no title in it.
+
+Also a retraction, because it is the more useful half: an earlier finding here said readback was
+68.5% of a backend call and forced half the flushes. That was measured on two harnesses that both
+had GPU present *inactive*, and their agreement was mistaken for independence. On the shipped path
+readback is 1 slot in 36,897.
 [`RENDERER_ARCHITECTURE_GAPS_2026_09_25.md`](prosper/docs/RENDERER_ARCHITECTURE_GAPS_2026_09_25.md).
 
 ## 2026-09-23

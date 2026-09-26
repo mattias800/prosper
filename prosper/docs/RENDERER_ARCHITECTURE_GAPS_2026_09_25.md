@@ -196,44 +196,45 @@ that the unarm path is on the critical path -- the same discriminator this docum
 pass batching, and the one that killed it.
 
 
-### §§ 1-3 have ONE root cause: readback, measured on the shipped path
+### WITHDRAWN: "§§ 1-3 have one root cause: readback"
 
-The three costs this document opened with -- barriers, the blocking submit, the byte-compare
-residency -- are not three problems. Measured 2026-09-26 on The Messenger, a title whose renderer
-IS a meaningful share of its wall clock:
+This section claimed readback was 68.5% of a backend call on the shipped frontend and forced one of
+every two flushes, making it the reason submits block. **Both figures came from runs where GPU
+present was INACTIVE, and the conclusion is withdrawn.**
+
+`tools/screenshot` never calls `set_gpu_present_active` — the charter says so, and it is still true.
+The run that was supposed to be the control, `prosper-app` under `SDL_VIDEODRIVER=offscreen`, logged
 
 ```
-tools/screenshot   readback=1.90 of measured=2.42 ms   78.5% of backend time
-prosper-app        readback=2.04 of measured=2.98 ms   68.5% of backend time
+[app] GPU present: surface on shared instance failed
+      (VK_EXT_headless_surface extension is not enabled); using own device
 ```
 
-**Readback dominates the backend call on BOTH harnesses.** That matters because the charter warns
-`tools/screenshot` never calls `set_gpu_present_active` -- still true, one call site,
-`frontends/prosper-app/main.cpp:694` -- so the obvious reading is "readback is a screenshot
-artifact". It is not. The shipped frontend shows the same shape.
+and so never reached `set_gpu_present_active(true)` either. Two different harnesses, the same
+forced-readback path, and the agreement between them was read as evidence that the shipped path
+behaved the same way. It does not.
 
-And it explains § 2 rather than competing with it. The synchronization line reports
-`flush{readback=1.00 explicit=1.00}`: of two flushes per backend call, one is *forced by the
-readback*. prosper blocks on the GPU because it needs pixels on the CPU. It needs pixels on the CPU
-because a render target that a later draw samples is served from a CPU-side cache -- the same
-machinery `CpuRttSnapshotPool` exists to feed. So:
+**Measured on the real windowed path, GPU present confirmed adopted:**
 
-> The blocking submit (§ 2) is a SYMPTOM. A timeline semaphore cannot remove a wait whose purpose
-> is to deliver bytes the next draw is about to read. Fix the readback and § 2 dissolves; fix § 2
-> alone and it cannot work.
+| title | readback slots | renderer share of wall clock | rate |
+|---|---|---:|---|
+| The Messenger | **1 of 36,897** (100.0% not-wanted) | 6.7% | 59.9 fps, 8,880 frames |
+| Astro Bot | 293 of 19,233 (98.5% not-wanted), 8.9 GiB | 9.4% | single-digit |
 
-This retargets the plan. Do not start the timeline-semaphore change as an independent piece of
-work: establish first how much of the readback is avoidable. A partial GPU-retained path already
-exists (`rtt_gpu_seed_import_extent_compatible`, `retain_gpu_result_baseline`,
-`renderer_result_retained` in `live_compute.cpp`), so the question is not "can render targets stay
-on the GPU" -- some already do -- but which passes still demand a CPU copy and why.
+So readback is **not** the render path's dominant cost, the submit does **not** block because of it,
+and § 2's timeline-semaphore idea is neither blocked by it nor rescued by it. What remains true is
+narrower and still worth knowing: Astro Bot really does copy 8.9 GiB back under `no-color-target`,
+which is a caller-shape question, not a residency one.
 
-**Measured wall-clock context, so nobody over-reads the above.** On `prosper-app` The Messenger
-runs ~59 fps with only **14.1%** of wall clock inside `render_draw_pass_rgba`, against 63.8-80.9%
-under `tools/screenshot`. Readback is the dominant cost *within* the renderer on both; the
-renderer's share *of the run* is far smaller on the shipped path. Quote the frontend with any
-figure from this section -- the two differ by more than 4x on the same title.
+**The general lesson is the expensive half.** A harness artifact was ruled out by comparing two
+harnesses, and both had the same artifact. *Agreement between instruments is not independence.*
+Check the mechanism directly — one `grep` for the log line that says the path activated — rather
+than inferring it from two measurements that agree.
 
+**What this does NOT withdraw:** the CPU RTT snapshot-pool fix, which was re-measured on the
+windowed path and stands. Astro Bot performs **24,991** pool copies there at a **99.5%** hit rate
+with 113 misses; before the capacity-matching change the same workload missed 61.5%. The pool is
+genuinely exercised on the shipped path, so that fix is real.
 
 ### Which readbacks are avoidable — measured, and it is not the obvious one
 
@@ -268,7 +269,19 @@ the architecture: **a render target that a later draw in the same submit samples
 bytes**, so the pixels must exist on the CPU before that draw records. That is what
 `CpuRttSnapshotPool` feeds and what forces the flush.
 
-**The frontier is therefore GPU-side resolution of sampled render targets, not readback tuning.**
+**CORRECTION, from the windowed measurement above.** The paragraph that followed named
+`cpu_needed_same_batch` as what defeats the deferral. It is not: `PROSPER_READBACK_WHY=1` reports
+`same_batch_cpu=0` and `same_batch_reasons=storage:0,dimension:0,extent:0,feedback:0` on BOTH
+frontends. What actually fills the bucket is `vo_final` — 53,399 of 53,400 under `tools/screenshot`
+and 11,599 of 11,600 under offscreen `prosper-app` — and `vo_final` fires precisely because
+`final_gpu_present` requires `gpu_present_active()`, which neither of those runs had. On the real
+windowed path the whole bucket collapses to 1 slot in 36,897.
+
+So there is no sampled-render-target round trip to remove on the shipped path, and the sentence
+below is withdrawn with the section above. It is kept, struck, because the reasoning was sound and
+only the input was wrong — the trap was reading agreement between two harnesses as independence.
+
+~~**The frontier is therefore GPU-side resolution of sampled render targets, not readback tuning.**~~
 Partial machinery already exists (`rtt_gpu_seed_import_extent_compatible`,
 `retain_gpu_result_baseline`, `renderer_result_retained`). The measurable target is
 `cpu_needed_same_batch`: every pass where it is true is a pass that cannot defer, and counting
