@@ -414,3 +414,57 @@ round trip), and the GPU retile census shows 1,606 of 4,818 images declining wit
 **Do not read this as "fix Astro Bot".** The Messenger runs the same code at 0.005 ms/call. What
 differs is how much of its work lands on a path that materialises CPU-side, and that path is
 general.
+
+### Inside the 74.9%: two size thresholds tested, both NOT the cost
+
+The gate census named `persistent` as the one failing term, so the obvious reading is that a
+residency size threshold excludes the common case. Two such thresholds exist and **both were
+tested and neither is the cost.** Recorded because each looks compelling and each is wrong.
+
+**Storage images, 4 KiB threshold (`live_compute.hpp:56`) -- FALSIFIED on an interleaved A/B.**
+`persistent_compute_image_enabled` returns `bytes >= 4 KiB`, and the pyramid levels below that
+(1x1, 7x4, 15x8, 30x16) report `persistent=0 CANDIDATE=0`, so they can never take the GPU path.
+`PROSPER_COMPUTE_STORAGE_IMAGE_CACHE_MIN_KB=0` is a same-binary control. Three interleaved rounds:
+
+| arm | frames | compute-items share |
+|---|---|---|
+| default (4 KiB) | 321 / 313 / 305 | 76.1% / 75.7% / 76.3% |
+| MIN_KB=0 | 311 / 301 / 306 | 75.8% / 76.0% / 76.0% |
+
+**The lever demonstrably moved** -- `7x4` and `15x8` went `persistent=0 CANDIDATE=0` to
+`persistent=186 CANDIDATE=186`, verified by re-running the gate census under both arms -- and
+nothing changed. So candidacy is not what forces the CPU work, and those images are genuinely
+cheap. This is a negative result with a verified lever, not a void one.
+
+**Compute buffers, 1 MiB threshold (`live_compute.cpp:1139`) -- real, but an order of magnitude too
+small.** `persistent_compute_buffer_enabled` returns `bytes >= 1 MiB`, above a comment reading
+*"Small bindings are cheap and numerous."* Measured over ~45 s with
+`PROSPER_COMPUTE_BUFFER_TIMING=1`:
+
+```
+31,280 binding records, 89.6% below 1 MiB, median binding 192 B
+compared 2.12 GiB total, 1.10 GiB (51.7%) from sub-1MiB
+uploaded 0.73 GiB total, 0.42 GiB (57.6%) from sub-1MiB
+```
+
+Sub-threshold bindings really are the majority of compare traffic, and every one reports
+`cache=ineligible persistent=0 total-watch-chunks=0 upload-skipped=0` -- no write-watch, so a full
+compare and a full upload on every dispatch even when nothing changed. But **1.10 GiB over 45 s is
+24 MiB/s**, and the thing to explain is ~3 GiB/s. Worth fixing on its own terms; not the frontier.
+
+### So the cost is the unpacking itself
+
+What remains, and what the profile pointed at from the start, is
+`execute_item -> storage_unpack_range -> parallel_compute_texels`: **storage-image texels
+materialised into RGBA32 quads on the CPU before a dispatch.** The worker-spawn census puts that at
+roughly 240 GiB of `count x (src_stride + 16)` work in 39 s -- about 120 GiB of real texel data,
+~3 GiB/s, on a screen that is not changing.
+
+That is not a threshold to retune. It is the compute path binding storage images by materialising
+them host-side rather than as GPU storage images, and `live_compute.cpp`'s own comment prices it at
+**~56 ms per image-bearing dispatch against 0.39 ms of actual GPU dispatch**.
+
+**Next question, and it is the architectural one:** under what conditions does a compute dispatch
+take the native storage-image path rather than materialising, and what fraction of dispatches on a
+real title can take it? The gate census answers the first half already; nobody has asked the
+second.
