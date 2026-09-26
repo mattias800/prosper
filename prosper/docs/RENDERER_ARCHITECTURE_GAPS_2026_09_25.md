@@ -201,6 +201,42 @@ invisible without it.
 The shipped helpers are byte-identical to main (git diff shows additions only); only the
 volume census was kept, because the volume is the input to any future batching question.
 
+### Where Astro Bot's time actually goes, and the next frontier
+
+Established by measurement on 2026-09-26, so the next reader starts from facts rather than from
+§§ 1-4's hypotheses:
+
+- **Not the renderer.** 7.8% of wall clock inside `render_draw_pass_rgba`.
+- **Not GPU-bound.** Of 89 threads, exactly ONE sits in `drm_syncobj_array_wait_timeout`.
+- **Not idle, and not parallel.** 147.5 CPU-seconds in 51.8 elapsed -- about 2.85 of 16 cores.
+- **Not blocked on prosper.** 86 of 89 threads park in `futex_do_wait`, and their stacks are
+  overwhelmingly GUEST primitives: `k_sce_cond_wait`, `k_sema_wait`, `k_posix_sem_wait`,
+  `k_ef_wait`. That is Astro Bot's own worker pool idling, not a prosper defect. Do not re-derive
+  this from the thread count: 89 threads and 96.8% "blocked" looks alarming and means nothing.
+- **Not thread creation.** Ruled out above on an interleaved A/B.
+
+What is left, with numbers, is the guest write-watch. Over ~120 s:
+
+```
+query=152,436  unchanged=145,008 (95.1%)  dirty=7,131  faults=5,684
+rearms=73,260  host_write=53,008 notifies
+pages_hit=50,816,105        (~959 watched pages unarmed PER notify)
+page_protect=28,801 calls / 140,038 MiB of range re-protected
+```
+
+Read those two halves in opposite directions. The **query** side is working: 95.1% of queries
+answer "unchanged" and avoid a copy, which is the mechanism § 3 argues for extending. The
+**notification** side is where the cost is -- `guest_write_watch_notify_host_write` unarms about a
+thousand pages per call, 53,008 times, and `mprotect` appeared in 4 of 14 active profile samples.
+With 89 live threads each `mprotect` also carries a TLB shootdown to every core, so its cost scales
+with the guest's thread count rather than with the range.
+
+**This is measured volume, NOT a demonstrated defect.** A notify's page count is proportional to
+the range the host actually wrote, so much of it may be irreducible. Before optimising it, show
+that the unarm path is on the critical path -- the same discriminator this document demanded for
+pass batching, and the one that killed it.
+
+
 ## Ruled out
 
 - **"The recompiler or shader quality is the frontier."** Not for this cost class: the profile's
