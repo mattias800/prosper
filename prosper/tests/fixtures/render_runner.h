@@ -7293,6 +7293,402 @@ inline uint64_t backend_pass_source_submit(std::span<const BackendDraw> draws) {
     return source;
 }
 
+// ---------------------------------------------------------------------------------------------
+// The render pass's own vocabulary.
+//
+// Every type below was declared INSIDE `render_draw_pass_rgba`, and every one is used only by that
+// pass and by the helpers carved out of it. They live at namespace scope because a local class
+// cannot be NAMED from outside the function that declares it: while these sat in the body, no part
+// of the pass that touches an upload, a binding, a memo slot or a per-draw record could be moved
+// out at all, which is most of what the pass does.
+//
+// Hoisting them changes nothing. C++ already forbids a local class from naming an automatic
+// variable of its enclosing function, so none of these ever depended on the surrounding scope --
+// their declaration order here is the order they appeared in, which is already dependency order.
+// The `static` objects typed by them (the persistent texture cache, the slot memos, the wave64
+// census) deliberately stay in the function: they are the pass's state, not its vocabulary.
+// ---------------------------------------------------------------------------------------------
+
+    using TimingClock = std::chrono::steady_clock;
+    // A failed attempt to replace any part of a retained volume cannot leave an earlier LUT
+    // authoritative under the same guest identity. Completion/discard callbacks cover work that
+    // reached a command buffer; this guard covers every earlier refusal and Vulkan create error.
+    struct VolumeAttemptGuard {
+        uint64_t id = 0;
+        ~VolumeAttemptGuard() {
+            if (id) invalidate_persistent_color_target(id);
+        }
+        void release() { id = 0; }
+    };
+    // The 3D sampled view belongs to the retained allocation; its 2D-array attachment view
+    // belongs to this render call, including when the same allocation is reused for another range.
+    struct VolumeAttachmentViewGuard {
+        VkDevice device = VK_NULL_HANDLE;
+        VkImageView view = VK_NULL_HANDLE;
+        ~VolumeAttachmentViewGuard() {
+            if (view) vkDestroyImageView(device, view, nullptr);
+        }
+        void release() { view = VK_NULL_HANDLE; }
+    };
+    constexpr size_t kMaxDescriptorSets = 8;
+    struct DV {
+        VkShaderModule vs = VK_NULL_HANDLE, gs = VK_NULL_HANDLE, fs = VK_NULL_HANDLE;
+        std::array<VkDescriptorSet, kMaxDescriptorSets> dsets{};
+        VkPipelineLayout layout = VK_NULL_HANDLE; VkPipeline pipe = VK_NULL_HANDLE;
+        VkBuffer ibuf = VK_NULL_HANDLE; VkDeviceMemory ibmem = VK_NULL_HANDLE;   // index buffer (indexed draws)
+        // Non-zero when the index data lives in a shared arena slice rather than a dedicated
+        // allocation. `iarena` decides ownership at teardown: an arena slice is owned by the arena
+        // and must NOT be destroyed per draw, which is the one way this optimisation corrupts
+        // rather than merely slows (#2253). Mirrors SharedBufferUpload::arena on the storage path.
+        VkDeviceSize ioffset = 0;
+        bool iarena = false;
+        // PROSPER_INDEX_ECHO diagnostic only: the host-visible address the index bytes were written
+        // to, so the record loop can read back exactly what the GPU will fetch from (v.ibuf,
+        // v.ioffset). Never read outside the diagnostic.
+        const void* imapped = nullptr;
+        VkViewport viewport{};
+        VkRect2D scissor{};
+        float line_width = 1.0f;
+        float depth_bias_constant = 0.0f;
+        float depth_bias_clamp = 0.0f;
+        float depth_bias_slope = 0.0f;
+        VkStencilOpState stencil_front{};
+        VkStencilOpState stencil_back{};
+        VkPrimitiveTopology topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        VkBool32 primitive_restart = VK_FALSE;
+        VkCullModeFlags cull_mode = VK_CULL_MODE_NONE;
+        VkFrontFace front_face = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+        VkBool32 depth_test = VK_FALSE, depth_write = VK_FALSE, stencil_test = VK_FALSE;
+        VkCompareOp depth_compare = VK_COMPARE_OP_NEVER;
+        uint32_t n_sets = 1, vcount = 3, icount = 0, instance_count = 1;
+        bool mesh_draw = false;
+        std::array<uint32_t, 3> mesh_groups{1, 1, 1};
+        int32_t vertex_offset = 0;
+        bool use_desc = false, ok = false, pipeline_cached = false;
+    };
+    static_assert(std::is_trivially_destructible_v<DV>,
+                  "DV must remain trivially destructible to avoid per-draw cleanup overhead");
+    struct TextureUploadKey {
+        const uint8_t* pixels = nullptr;
+        uint64_t render_target_id = 0;
+        void* borrowed_compute_image = nullptr;
+        uint32_t width = 0, height = 0, depth = 1;
+        uint32_t img_dim = 1;
+        uint32_t sample_count = 1;
+        uint32_t mip_levels = 1;   // effective uploaded chain length (#1272)
+        VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;
+        bool storage_image = false;
+        std::array<uint32_t, 4> uniform_color_bits{};
+        const GpuDetileUpload* gpu_detile = nullptr;
+        bool operator==(const TextureUploadKey& other) const {
+            return pixels == other.pixels && render_target_id == other.render_target_id &&
+                   borrowed_compute_image == other.borrowed_compute_image &&
+                   width == other.width && height == other.height && depth == other.depth &&
+                   img_dim == other.img_dim && sample_count == other.sample_count &&
+                   mip_levels == other.mip_levels &&
+                   format == other.format && storage_image == other.storage_image &&
+                   uniform_color_bits == other.uniform_color_bits && gpu_detile == other.gpu_detile;
+        }
+    };
+    struct TextureUploadKeyHash {
+        size_t operator()(const TextureUploadKey& key) const {
+            size_t h = std::hash<const uint8_t*>{}(key.pixels);
+            h ^= std::hash<const GpuDetileUpload*>{}(key.gpu_detile) + 0x9e3779b9u + (h << 6) + (h >> 2);
+            h ^= std::hash<uint64_t>{}(key.render_target_id) + 0x9e3779b9u + (h << 6) + (h >> 2);
+            h ^= std::hash<void*>{}(key.borrowed_compute_image) +
+                 0x9e3779b9u + (h << 6) + (h >> 2);
+            h ^= static_cast<size_t>(key.width) + 0x9e3779b9u + (h << 6) + (h >> 2);
+            h ^= static_cast<size_t>(key.height) + 0x9e3779b9u + (h << 6) + (h >> 2);
+            h ^= static_cast<size_t>(key.depth) + 0x9e3779b9u + (h << 6) + (h >> 2);
+            h ^= static_cast<size_t>(key.img_dim) + 0x9e3779b9u + (h << 6) + (h >> 2);
+            h ^= static_cast<size_t>(key.sample_count) + 0x9e3779b9u + (h << 6) + (h >> 2);
+            h ^= static_cast<size_t>(key.mip_levels) + 0x9e3779b9u + (h << 6) + (h >> 2);
+            h ^= static_cast<size_t>(key.format) + 0x9e3779b9u + (h << 6) + (h >> 2);
+            h ^= static_cast<size_t>(key.storage_image) + 0x9e3779b9u + (h << 6) + (h >> 2);
+            for (uint32_t bits : key.uniform_color_bits)
+                h ^= static_cast<size_t>(bits) + 0x9e3779b9u + (h << 6) + (h >> 2);
+            return h;
+        }
+    };
+    struct TextureBindingKey {
+        std::array<uint64_t, 22> words{};
+        bool operator==(const TextureBindingKey&) const = default;
+    };
+    struct TextureBindingKeyHash {
+        size_t operator()(const TextureBindingKey& key) const {
+            uint64_t h0 = 1469598103934665603ull;
+            uint64_t h1 = 0xcbf29ce484222325ull;
+            constexpr uint64_t prime = 1099511628211ull;
+            for (size_t i = 0; i < key.words.size(); i += 2) {
+                h0 = (h0 ^ key.words[i + 0]) * prime;
+                h1 = (h1 ^ key.words[i + 1]) * prime;
+            }
+            return static_cast<size_t>(h0 ^ (h1 * prime));
+        }
+    };
+    struct SharedTextureUpload {
+        TextureUploadKey key;
+        VkImage image = VK_NULL_HANDLE;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        VkBuffer staging = VK_NULL_HANDLE;
+        VkDeviceMemory staging_memory = VK_NULL_HANDLE;
+        void* staging_mapped = nullptr; // retained with the block, never unmapped here
+        uint64_t staging_lease = 0;
+        std::shared_ptr<GpuDetileUpload> gpu_detile;
+        uint64_t persistent_id = 0;
+        uint64_t persistent_version = 0;
+        VkDeviceSize image_bytes = 0;
+        bool persistent_hit = false;
+        bool persistent_refresh = false;
+        bool uniform_clear = false;
+        VkClearColorValue uniform_color{};
+        bool borrowed_target = false;
+        // Color-attachment feedback cannot borrow the attachment image itself. Snapshot its
+        // pre-pass contents into this upload's distinct sampled image with a queue-ordered GPU copy.
+        bool feedback_snapshot = false;
+        VkImage feedback_source = VK_NULL_HANDLE;
+        VkImageLayout feedback_source_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+        // Independent one-level renderer targets copied into this upload's mip levels. Sources
+        // retain their persistent-cache layout after the copy; a zero image is generated from the
+        // preceding destination level.
+        bool assembled_target_mips = false;
+        std::array<VkImage, 16> target_mip_images{};
+        std::array<VkImageLayout, 16> target_mip_layouts{};
+        bool borrowed_compute = false;
+        bool stacked_compute = false;
+        VkImage stacked_compute_source = VK_NULL_HANDLE;
+        uint32_t stacked_compute_layers = 0;
+        VkImageLayout borrowed_compute_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+        std::shared_ptr<void> borrowed_compute_lease;
+        // Sampled depth bridge (#1275): image borrowed from the persistent DS cache. The view uses
+        // the DEPTH aspect of ds_format, and the call transitions the image DS-attachment ->
+        // shader-read around its passes.
+        bool borrowed_ds = false;
+        bool borrowed_ds_stencil = false;   // sample the stencil plane rather than the depth plane
+        bool borrowed_ds_feedback = false; // same image is this pass's read-only depth attachment
+        VkFormat ds_format = VK_FORMAT_UNDEFINED;
+        bool direct_memory = false;
+        std::vector<std::function<void(const uint8_t*, size_t)>> storage_writebacks;
+        size_t last_binding_index = SIZE_MAX;
+        TextureBindingKey last_binding_key{};
+    };
+    struct PersistentTextureKey {
+        uint64_t id = 0;
+        uint32_t width = 0, height = 0, depth = 1, img_dim = 1, sample_count = 1;
+        uint32_t mip_levels = 1;   // a cached image must match the requested chain length (#1272)
+        VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;
+        bool operator==(const PersistentTextureKey&) const = default;
+    };
+    struct PersistentTextureKeyHash {
+        size_t operator()(const PersistentTextureKey& key) const {
+            size_t h = std::hash<uint64_t>{}(key.id);
+            auto mix = [&](uint32_t value) {
+                h ^= static_cast<size_t>(value) + 0x9e3779b9u + (h << 6) + (h >> 2);
+            };
+            mix(key.width); mix(key.height); mix(key.depth); mix(key.img_dim);
+            mix(key.sample_count);
+            mix(key.mip_levels);
+            mix(static_cast<uint32_t>(key.format));
+            return h;
+        }
+    };
+    struct PersistentTextureBinding {
+        VkImageView view = VK_NULL_HANDLE;
+        VkSampler sampler = VK_NULL_HANDLE;
+        uint64_t last_use = 0;
+    };
+    struct PersistentTextureImage {
+        VkImage image = VK_NULL_HANDLE;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        VkDeviceSize bytes = 0;
+        uint64_t last_use = 0;
+        uint64_t content_version = 0;
+        bool content_valid = true;
+        std::unordered_map<TextureBindingKey, PersistentTextureBinding,
+                           TextureBindingKeyHash> bindings;
+    };
+    struct SharedBufferKey {
+        const uint32_t* words = nullptr;
+        size_t count = 0;
+        uint64_t identity = 0;
+        uint64_t hash = 0;
+        uint64_t unique_tag = 0;
+        bool operator==(const SharedBufferKey& other) const {
+            return identity == other.identity && hash == other.hash &&
+                   unique_tag == other.unique_tag &&
+                   count == other.count &&
+                   (words == other.words || !count ||
+                    std::memcmp(words, other.words, count * sizeof(uint32_t)) == 0);
+        }
+    };
+    struct SharedBufferKeyHash {
+        size_t operator()(const SharedBufferKey& key) const {
+            return static_cast<size_t>(key.hash ^ key.identity ^
+                (key.unique_tag * 0x9e3779b97f4a7c15ull));
+        }
+    };
+    struct SharedBufferUpload {
+        VkBuffer buffer = VK_NULL_HANDLE;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        void* mapped = nullptr;
+        VkDeviceSize offset = 0;
+        VkDeviceSize range = 0;
+        VkDeviceSize bytes = 0;
+        VkDeviceSize allocation_bytes = 0;
+        bool pooled = false;
+        bool arena = false;
+        std::shared_ptr<ResidentRenderBuffer> resident;
+    };
+    struct SharedBufferArena {
+        RenderHostBuffer buffer;
+        VkDeviceSize used = 0;
+    };
+    struct SharedTextureBinding {
+        VkImageView view = VK_NULL_HANDLE;
+        VkSampler sampler = VK_NULL_HANDLE;
+        bool persistent = false;
+    };
+    struct SharedDescriptorSetLayout {
+        VkDescriptorSetLayout handle = VK_NULL_HANDLE;
+        bool persistent = false;
+    };
+    struct SharedPipelineLayout {
+        VkPipelineLayout handle = VK_NULL_HANDLE;
+        bool persistent = false;
+    };
+    struct BufferVerifyRecord {
+        const uint32_t* words = nullptr;
+        size_t word_count = 0;
+        uint64_t identity = 0;
+        uint32_t set = 0;
+        uint32_t binding = 0;
+        size_t upload_index = 0;
+    };
+    struct BufferRefMemoKey {
+        const uint32_t* words = nullptr;
+        size_t count = 0;
+        uint64_t identity = 0;
+        bool operator==(const BufferRefMemoKey& other) const {
+            return words == other.words && count == other.count && identity == other.identity;
+        }
+    };
+    struct BufferRefMemoKeyHash {
+        size_t operator()(const BufferRefMemoKey& key) const {
+            return static_cast<size_t>((reinterpret_cast<uintptr_t>(key.words) >> 2) ^
+                (key.count * 0x9e3779b97f4a7c15ull) ^ key.identity);
+        }
+    };
+    struct BufferUploadSlotMemo {
+        uint32_t pass_id0 = 0;
+        uint32_t pass_id1 = 0;
+        BufferRefMemoKey key0{};
+        size_t index0 = SIZE_MAX;
+        BufferRefMemoKey key1{};
+        size_t index1 = SIZE_MAX;
+    };
+    struct TextureUploadSlotMemo {
+        uint32_t pass_id0 = 0;
+        uint32_t pass_id1 = 0;
+        TextureUploadKey key0{};
+        size_t index0 = SIZE_MAX;
+        TextureUploadKey key1{};
+        size_t index1 = SIZE_MAX;
+    };
+    struct TextureBindingSlotMemo {
+        uint32_t pass_id0 = 0;
+        uint32_t pass_id1 = 0;
+        TextureBindingKey key0{};
+        size_t index0 = SIZE_MAX;
+        TextureBindingKey key1{};
+        size_t index1 = SIZE_MAX;
+    };
+    struct LastDescriptorSetMemo {
+        bool valid = false;
+        std::vector<VkDescriptorSetLayoutBinding> bindings;
+        std::vector<uint64_t> layout_key;
+        VkDescriptorSetLayout layout = VK_NULL_HANDLE;
+    };
+    struct LastPipelineLayoutMemo {
+        bool valid = false;
+        bool use_desc = false;
+        uint32_t n_sets = 0;
+        std::array<VkDescriptorSetLayout, kMaxDescriptorSets> dsls{};
+        VkPipelineLayout layout = VK_NULL_HANDLE;
+    };
+    // Preserve the frontend's exact descriptor order while borrowing either the complete resource or
+    // its compact buffer-only carrier. The references are synchronous: every pointed-to vector belongs
+    // to `draws`, which outlives this call. Synthetic GDS entries are owned alongside these views.
+    struct EffectiveResource {
+        const FrameResource* full = nullptr;
+        const FrameBufferResource* buffer = nullptr;
+        const FrameBufferResource& common() const { return full ? *full : *buffer; }
+        bool is_texture() const { return full && full->is_texture(); }
+    };
+    // Scope-guard timer, so a bucket stays correct across the `continue`/`break` exits the resource
+    // loop already uses. Reads the clock only when timing is enabled; the whole sub-attribution is
+    // inert (two predictable branches per resource) on a default run.
+    struct ResourcePhaseTimer {
+        bool enabled;
+        double* sink;
+        TimingClock::time_point begin;
+        ResourcePhaseTimer(bool en, double* s)
+            : enabled(en), sink(s),
+              begin(en ? TimingClock::now() : TimingClock::time_point{}) {}
+        ResourcePhaseTimer(const ResourcePhaseTimer&) = delete;
+        ResourcePhaseTimer& operator=(const ResourcePhaseTimer&) = delete;
+        ~ResourcePhaseTimer() {
+            if (enabled)
+                *sink += std::chrono::duration<double, std::milli>(TimingClock::now() - begin)
+                             .count();
+        }
+    };
+    struct BufferRangeUpload {
+        SharedBufferUpload upload;
+        bool attempted = false;
+        bool resident_attempted = false;
+    };
+    struct Wave64Census {
+        std::mutex mx;
+        std::unordered_map<uint64_t, uint64_t> seen;
+        std::unordered_map<uint64_t, std::unordered_map<uint32_t, uint64_t>> skipped;
+        uint64_t observations = 0;
+        static uint64_t key(uint32_t w, uint32_t h) { return (uint64_t(w) << 32) | h; }
+        void report_locked() {
+            std::vector<uint64_t> keys;
+            keys.reserve(seen.size());
+            for (const auto& kv : seen) keys.push_back(kv.first);
+            std::sort(keys.begin(), keys.end());
+            for (uint64_t k : keys) {
+                uint64_t dropped = 0;
+                auto it = skipped.find(k);
+                if (it != skipped.end())
+                    for (const auto& rm : it->second) dropped += rm.second;
+                std::fprintf(stderr, "[wave64-census] %ux%u draws=%llu skipped=%llu\n",
+                             (uint32_t)(k >> 32), (uint32_t)(k & 0xffffffffu),
+                             (unsigned long long)seen[k], (unsigned long long)dropped);
+                if (it != skipped.end())
+                    for (const auto& rm : it->second)
+                        std::fprintf(stderr, "[wave64-census]   %ux%u reason=0x%02x n=%llu\n",
+                                     (uint32_t)(k >> 32), (uint32_t)(k & 0xffffffffu),
+                                     rm.first, (unsigned long long)rm.second);
+            }
+        }
+        void note_draw(uint32_t w, uint32_t h) {
+            std::lock_guard<std::mutex> lk(mx);
+            ++seen[key(w, h)];
+            ++observations;
+            if (observations == 100 || (observations % 5000) == 0) report_locked();
+        }
+        void note_skip(uint32_t w, uint32_t h, uint32_t reason_mask) {
+            std::lock_guard<std::mutex> lk(mx);
+            ++skipped[key(w, h)][reason_mask];
+        }
+    };
+    struct LastPipelineMemo {
+        bool valid = false;
+        PersistentPipelineKey key;
+        PersistentPipeline* entry = nullptr;
+    };
 inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> draws,
                                                   uint32_t W, uint32_t H,
                                                   const uint8_t* seed_rgba = nullptr,
@@ -7313,7 +7709,6 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                                   // how every offscreen test asserts. Defaults true so
                                                   // every existing caller is bit-identical.
                                                   bool want_color_readback = true) {
-    using TimingClock = std::chrono::steady_clock;
     const bool timing_log_enabled = getenv("PROSPER_RENDER_TIMING") != nullptr;
     const prosper::frontend::PerformanceTimingMode timing_mode =
         prosper::frontend::performance_timing_mode(
@@ -7420,16 +7815,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     const bool persistent_color_enabled = persistent_color_targets_enabled && color_target &&
                                           color_target->persistent_id;
     const bool volume_color = color_target && color_target->volume_depth;
-    // A failed attempt to replace any part of a retained volume cannot leave an earlier LUT
-    // authoritative under the same guest identity. Completion/discard callbacks cover work that
-    // reached a command buffer; this guard covers every earlier refusal and Vulkan create error.
-    struct VolumeAttemptGuard {
-        uint64_t id = 0;
-        ~VolumeAttemptGuard() {
-            if (id) invalidate_persistent_color_target(id);
-        }
-        void release() { id = 0; }
-    } volume_attempt{volume_color ? color_target->persistent_id : 0u};
+    VolumeAttemptGuard volume_attempt{volume_color ? color_target->persistent_id : 0u};
     if (color_target && !backend_color_volume_view_valid(*color_target)) return out;
     // A volume cannot be represented by the historical transient 2D fallback. It must retain
     // one exact allocation through the later 3D sample, or the caller sees an explicit refusal.
@@ -7965,16 +8351,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     VkImage img = cached_color ? cached_color->image : VK_NULL_HANDLE;
     VkDeviceMemory imem = cached_color ? cached_color->memory : VK_NULL_HANDLE;
     VkImageView view = cached_color && !volume_color ? cached_color->view : VK_NULL_HANDLE;
-    // The 3D sampled view belongs to the retained allocation; its 2D-array attachment view
-    // belongs to this render call, including when the same allocation is reused for another range.
-    struct VolumeAttachmentViewGuard {
-        VkDevice device = VK_NULL_HANDLE;
-        VkImageView view = VK_NULL_HANDLE;
-        ~VolumeAttachmentViewGuard() {
-            if (view) vkDestroyImageView(device, view, nullptr);
-        }
-        void release() { view = VK_NULL_HANDLE; }
-    } volume_attachment_view{dev};
+    VolumeAttachmentViewGuard volume_attachment_view{dev};
     if (!img) {
         VkImageCreateInfo imgci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
         imgci.imageType = volume_color ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
@@ -8607,183 +8984,6 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         return m; };
     // Per-draw Vulkan objects stay alive until the call or explicit submission batch completes.
     const auto timing_target_ready = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
-    constexpr size_t kMaxDescriptorSets = 8;
-    struct DV {
-        VkShaderModule vs = VK_NULL_HANDLE, gs = VK_NULL_HANDLE, fs = VK_NULL_HANDLE;
-        std::array<VkDescriptorSet, kMaxDescriptorSets> dsets{};
-        VkPipelineLayout layout = VK_NULL_HANDLE; VkPipeline pipe = VK_NULL_HANDLE;
-        VkBuffer ibuf = VK_NULL_HANDLE; VkDeviceMemory ibmem = VK_NULL_HANDLE;   // index buffer (indexed draws)
-        // Non-zero when the index data lives in a shared arena slice rather than a dedicated
-        // allocation. `iarena` decides ownership at teardown: an arena slice is owned by the arena
-        // and must NOT be destroyed per draw, which is the one way this optimisation corrupts
-        // rather than merely slows (#2253). Mirrors SharedBufferUpload::arena on the storage path.
-        VkDeviceSize ioffset = 0;
-        bool iarena = false;
-        // PROSPER_INDEX_ECHO diagnostic only: the host-visible address the index bytes were written
-        // to, so the record loop can read back exactly what the GPU will fetch from (v.ibuf,
-        // v.ioffset). Never read outside the diagnostic.
-        const void* imapped = nullptr;
-        VkViewport viewport{};
-        VkRect2D scissor{};
-        float line_width = 1.0f;
-        float depth_bias_constant = 0.0f;
-        float depth_bias_clamp = 0.0f;
-        float depth_bias_slope = 0.0f;
-        VkStencilOpState stencil_front{};
-        VkStencilOpState stencil_back{};
-        VkPrimitiveTopology topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-        VkBool32 primitive_restart = VK_FALSE;
-        VkCullModeFlags cull_mode = VK_CULL_MODE_NONE;
-        VkFrontFace front_face = VK_FRONT_FACE_COUNTER_CLOCKWISE;
-        VkBool32 depth_test = VK_FALSE, depth_write = VK_FALSE, stencil_test = VK_FALSE;
-        VkCompareOp depth_compare = VK_COMPARE_OP_NEVER;
-        uint32_t n_sets = 1, vcount = 3, icount = 0, instance_count = 1;
-        bool mesh_draw = false;
-        std::array<uint32_t, 3> mesh_groups{1, 1, 1};
-        int32_t vertex_offset = 0;
-        bool use_desc = false, ok = false, pipeline_cached = false;
-    };
-    static_assert(std::is_trivially_destructible_v<DV>,
-                  "DV must remain trivially destructible to avoid per-draw cleanup overhead");
-    struct TextureUploadKey {
-        const uint8_t* pixels = nullptr;
-        uint64_t render_target_id = 0;
-        void* borrowed_compute_image = nullptr;
-        uint32_t width = 0, height = 0, depth = 1;
-        uint32_t img_dim = 1;
-        uint32_t sample_count = 1;
-        uint32_t mip_levels = 1;   // effective uploaded chain length (#1272)
-        VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;
-        bool storage_image = false;
-        std::array<uint32_t, 4> uniform_color_bits{};
-        const GpuDetileUpload* gpu_detile = nullptr;
-        bool operator==(const TextureUploadKey& other) const {
-            return pixels == other.pixels && render_target_id == other.render_target_id &&
-                   borrowed_compute_image == other.borrowed_compute_image &&
-                   width == other.width && height == other.height && depth == other.depth &&
-                   img_dim == other.img_dim && sample_count == other.sample_count &&
-                   mip_levels == other.mip_levels &&
-                   format == other.format && storage_image == other.storage_image &&
-                   uniform_color_bits == other.uniform_color_bits && gpu_detile == other.gpu_detile;
-        }
-    };
-    struct TextureUploadKeyHash {
-        size_t operator()(const TextureUploadKey& key) const {
-            size_t h = std::hash<const uint8_t*>{}(key.pixels);
-            h ^= std::hash<const GpuDetileUpload*>{}(key.gpu_detile) + 0x9e3779b9u + (h << 6) + (h >> 2);
-            h ^= std::hash<uint64_t>{}(key.render_target_id) + 0x9e3779b9u + (h << 6) + (h >> 2);
-            h ^= std::hash<void*>{}(key.borrowed_compute_image) +
-                 0x9e3779b9u + (h << 6) + (h >> 2);
-            h ^= static_cast<size_t>(key.width) + 0x9e3779b9u + (h << 6) + (h >> 2);
-            h ^= static_cast<size_t>(key.height) + 0x9e3779b9u + (h << 6) + (h >> 2);
-            h ^= static_cast<size_t>(key.depth) + 0x9e3779b9u + (h << 6) + (h >> 2);
-            h ^= static_cast<size_t>(key.img_dim) + 0x9e3779b9u + (h << 6) + (h >> 2);
-            h ^= static_cast<size_t>(key.sample_count) + 0x9e3779b9u + (h << 6) + (h >> 2);
-            h ^= static_cast<size_t>(key.mip_levels) + 0x9e3779b9u + (h << 6) + (h >> 2);
-            h ^= static_cast<size_t>(key.format) + 0x9e3779b9u + (h << 6) + (h >> 2);
-            h ^= static_cast<size_t>(key.storage_image) + 0x9e3779b9u + (h << 6) + (h >> 2);
-            for (uint32_t bits : key.uniform_color_bits)
-                h ^= static_cast<size_t>(bits) + 0x9e3779b9u + (h << 6) + (h >> 2);
-            return h;
-        }
-    };
-    struct TextureBindingKey {
-        std::array<uint64_t, 22> words{};
-        bool operator==(const TextureBindingKey&) const = default;
-    };
-    struct TextureBindingKeyHash {
-        size_t operator()(const TextureBindingKey& key) const {
-            uint64_t h0 = 1469598103934665603ull;
-            uint64_t h1 = 0xcbf29ce484222325ull;
-            constexpr uint64_t prime = 1099511628211ull;
-            for (size_t i = 0; i < key.words.size(); i += 2) {
-                h0 = (h0 ^ key.words[i + 0]) * prime;
-                h1 = (h1 ^ key.words[i + 1]) * prime;
-            }
-            return static_cast<size_t>(h0 ^ (h1 * prime));
-        }
-    };
-    struct SharedTextureUpload {
-        TextureUploadKey key;
-        VkImage image = VK_NULL_HANDLE;
-        VkDeviceMemory memory = VK_NULL_HANDLE;
-        VkBuffer staging = VK_NULL_HANDLE;
-        VkDeviceMemory staging_memory = VK_NULL_HANDLE;
-        void* staging_mapped = nullptr; // retained with the block, never unmapped here
-        uint64_t staging_lease = 0;
-        std::shared_ptr<GpuDetileUpload> gpu_detile;
-        uint64_t persistent_id = 0;
-        uint64_t persistent_version = 0;
-        VkDeviceSize image_bytes = 0;
-        bool persistent_hit = false;
-        bool persistent_refresh = false;
-        bool uniform_clear = false;
-        VkClearColorValue uniform_color{};
-        bool borrowed_target = false;
-        // Color-attachment feedback cannot borrow the attachment image itself. Snapshot its
-        // pre-pass contents into this upload's distinct sampled image with a queue-ordered GPU copy.
-        bool feedback_snapshot = false;
-        VkImage feedback_source = VK_NULL_HANDLE;
-        VkImageLayout feedback_source_layout = VK_IMAGE_LAYOUT_UNDEFINED;
-        // Independent one-level renderer targets copied into this upload's mip levels. Sources
-        // retain their persistent-cache layout after the copy; a zero image is generated from the
-        // preceding destination level.
-        bool assembled_target_mips = false;
-        std::array<VkImage, 16> target_mip_images{};
-        std::array<VkImageLayout, 16> target_mip_layouts{};
-        bool borrowed_compute = false;
-        bool stacked_compute = false;
-        VkImage stacked_compute_source = VK_NULL_HANDLE;
-        uint32_t stacked_compute_layers = 0;
-        VkImageLayout borrowed_compute_layout = VK_IMAGE_LAYOUT_UNDEFINED;
-        std::shared_ptr<void> borrowed_compute_lease;
-        // Sampled depth bridge (#1275): image borrowed from the persistent DS cache. The view uses
-        // the DEPTH aspect of ds_format, and the call transitions the image DS-attachment ->
-        // shader-read around its passes.
-        bool borrowed_ds = false;
-        bool borrowed_ds_stencil = false;   // sample the stencil plane rather than the depth plane
-        bool borrowed_ds_feedback = false; // same image is this pass's read-only depth attachment
-        VkFormat ds_format = VK_FORMAT_UNDEFINED;
-        bool direct_memory = false;
-        std::vector<std::function<void(const uint8_t*, size_t)>> storage_writebacks;
-        size_t last_binding_index = SIZE_MAX;
-        TextureBindingKey last_binding_key{};
-    };
-    struct PersistentTextureKey {
-        uint64_t id = 0;
-        uint32_t width = 0, height = 0, depth = 1, img_dim = 1, sample_count = 1;
-        uint32_t mip_levels = 1;   // a cached image must match the requested chain length (#1272)
-        VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;
-        bool operator==(const PersistentTextureKey&) const = default;
-    };
-    struct PersistentTextureKeyHash {
-        size_t operator()(const PersistentTextureKey& key) const {
-            size_t h = std::hash<uint64_t>{}(key.id);
-            auto mix = [&](uint32_t value) {
-                h ^= static_cast<size_t>(value) + 0x9e3779b9u + (h << 6) + (h >> 2);
-            };
-            mix(key.width); mix(key.height); mix(key.depth); mix(key.img_dim);
-            mix(key.sample_count);
-            mix(key.mip_levels);
-            mix(static_cast<uint32_t>(key.format));
-            return h;
-        }
-    };
-    struct PersistentTextureBinding {
-        VkImageView view = VK_NULL_HANDLE;
-        VkSampler sampler = VK_NULL_HANDLE;
-        uint64_t last_use = 0;
-    };
-    struct PersistentTextureImage {
-        VkImage image = VK_NULL_HANDLE;
-        VkDeviceMemory memory = VK_NULL_HANDLE;
-        VkDeviceSize bytes = 0;
-        uint64_t last_use = 0;
-        uint64_t content_version = 0;
-        bool content_valid = true;
-        std::unordered_map<TextureBindingKey, PersistentTextureBinding,
-                           TextureBindingKeyHash> bindings;
-    };
     static std::unordered_map<PersistentTextureKey, PersistentTextureImage,
                               PersistentTextureKeyHash> persistent_texture_images;
     static VkDeviceSize persistent_texture_bytes = 0;
@@ -8918,55 +9118,6 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         getenv("PROSPER_NO_BACKEND_RESOURCE_SHARE") == nullptr;
     const bool reuse_host_buffers = render_host_buffer_pool_enabled();
     const bool buffer_verify_enabled = getenv("PROSPER_BUFVERIFY") != nullptr;
-    struct SharedBufferKey {
-        const uint32_t* words = nullptr;
-        size_t count = 0;
-        uint64_t identity = 0;
-        uint64_t hash = 0;
-        uint64_t unique_tag = 0;
-        bool operator==(const SharedBufferKey& other) const {
-            return identity == other.identity && hash == other.hash &&
-                   unique_tag == other.unique_tag &&
-                   count == other.count &&
-                   (words == other.words || !count ||
-                    std::memcmp(words, other.words, count * sizeof(uint32_t)) == 0);
-        }
-    };
-    struct SharedBufferKeyHash {
-        size_t operator()(const SharedBufferKey& key) const {
-            return static_cast<size_t>(key.hash ^ key.identity ^
-                (key.unique_tag * 0x9e3779b97f4a7c15ull));
-        }
-    };
-    struct SharedBufferUpload {
-        VkBuffer buffer = VK_NULL_HANDLE;
-        VkDeviceMemory memory = VK_NULL_HANDLE;
-        void* mapped = nullptr;
-        VkDeviceSize offset = 0;
-        VkDeviceSize range = 0;
-        VkDeviceSize bytes = 0;
-        VkDeviceSize allocation_bytes = 0;
-        bool pooled = false;
-        bool arena = false;
-        std::shared_ptr<ResidentRenderBuffer> resident;
-    };
-    struct SharedBufferArena {
-        RenderHostBuffer buffer;
-        VkDeviceSize used = 0;
-    };
-    struct SharedTextureBinding {
-        VkImageView view = VK_NULL_HANDLE;
-        VkSampler sampler = VK_NULL_HANDLE;
-        bool persistent = false;
-    };
-    struct SharedDescriptorSetLayout {
-        VkDescriptorSetLayout handle = VK_NULL_HANDLE;
-        bool persistent = false;
-    };
-    struct SharedPipelineLayout {
-        VkPipelineLayout handle = VK_NULL_HANDLE;
-        bool persistent = false;
-    };
     const size_t estimated_backend_resources = std::min<size_t>(draws.size() * 4, 1024);
     std::vector<SharedBufferUpload> shared_buffers;
     shared_buffers.reserve(std::min<size_t>(draws.size() * 4, 4096));
@@ -8981,14 +9132,6 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     // does detect is the destination being clobbered after the memcpy and before submission: an
     // overlapping arena slice, a stray write, a pooled buffer handed out twice. End-of-pass placement
     // is what makes that case visible; verifying at upload time would miss all of it.
-    struct BufferVerifyRecord {
-        const uint32_t* words = nullptr;
-        size_t word_count = 0;
-        uint64_t identity = 0;
-        uint32_t set = 0;
-        uint32_t binding = 0;
-        size_t upload_index = 0;
-    };
     std::vector<BufferVerifyRecord> buffer_verify_records;
     std::vector<SharedBufferArena> shared_buffer_arenas;
     static const bool use_buffer_lookup_arena =
@@ -9005,49 +9148,11 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     // nondeterministic on real hardware (the GPU samples the buffer once per draw at execution),
     // so resolving a repeated (words, count, identity) reference to the first upload is within the
     // same latitude the hardware has. First reference still hashes + memcmps as before.
-    struct BufferRefMemoKey {
-        const uint32_t* words = nullptr;
-        size_t count = 0;
-        uint64_t identity = 0;
-        bool operator==(const BufferRefMemoKey& other) const {
-            return words == other.words && count == other.count && identity == other.identity;
-        }
-    };
-    struct BufferRefMemoKeyHash {
-        size_t operator()(const BufferRefMemoKey& key) const {
-            return static_cast<size_t>((reinterpret_cast<uintptr_t>(key.words) >> 2) ^
-                (key.count * 0x9e3779b97f4a7c15ull) ^ key.identity);
-        }
-    };
     prosper::frontend::PassBufferLookupMap<BufferRefMemoKey, BufferRefMemoKeyHash>
         buffer_ref_memo(buffer_lookup_memory.allocator<BufferRefMemoKey>());
     buffer_ref_memo.reserve(estimated_backend_resources);
-    struct BufferUploadSlotMemo {
-        uint32_t pass_id0 = 0;
-        uint32_t pass_id1 = 0;
-        BufferRefMemoKey key0{};
-        size_t index0 = SIZE_MAX;
-        BufferRefMemoKey key1{};
-        size_t index1 = SIZE_MAX;
-    };
     static std::array<std::array<BufferUploadSlotMemo, 64>, 4> buffer_upload_slot_memo;
-    struct TextureUploadSlotMemo {
-        uint32_t pass_id0 = 0;
-        uint32_t pass_id1 = 0;
-        TextureUploadKey key0{};
-        size_t index0 = SIZE_MAX;
-        TextureUploadKey key1{};
-        size_t index1 = SIZE_MAX;
-    };
     static std::array<std::array<TextureUploadSlotMemo, 64>, 4> texture_upload_slot_memo;
-    struct TextureBindingSlotMemo {
-        uint32_t pass_id0 = 0;
-        uint32_t pass_id1 = 0;
-        TextureBindingKey key0{};
-        size_t index0 = SIZE_MAX;
-        TextureBindingKey key1{};
-        size_t index1 = SIZE_MAX;
-    };
     static std::array<std::array<TextureBindingSlotMemo, 64>, 4> texture_binding_slot_memo;
     static uint32_t backend_pass_generation = 0;
     if (++backend_pass_generation == 0) {
@@ -9066,20 +9171,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         shared_descriptor_set_layouts;
     std::unordered_map<std::vector<uint64_t>, SharedPipelineLayout, BackendWordVectorHash>
         shared_pipeline_layouts;
-    struct LastDescriptorSetMemo {
-        bool valid = false;
-        std::vector<VkDescriptorSetLayoutBinding> bindings;
-        std::vector<uint64_t> layout_key;
-        VkDescriptorSetLayout layout = VK_NULL_HANDLE;
-    };
     std::array<LastDescriptorSetMemo, kMaxDescriptorSets> last_descriptor_set_memo{};
-    struct LastPipelineLayoutMemo {
-        bool valid = false;
-        bool use_desc = false;
-        uint32_t n_sets = 0;
-        std::array<VkDescriptorSetLayout, kMaxDescriptorSets> dsls{};
-        VkPipelineLayout layout = VK_NULL_HANDLE;
-    };
     LastPipelineLayoutMemo last_pipeline_layout_memo{};
     uint64_t resource_unique_tag = 0;
     const uint32_t zero_buffer_word = 0;
@@ -9144,15 +9236,6 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         return bits;
     };
     std::vector<DV> dv(draws.size());
-    // Preserve the frontend's exact descriptor order while borrowing either the complete resource or
-    // its compact buffer-only carrier. The references are synchronous: every pointed-to vector belongs
-    // to `draws`, which outlives this call. Synthetic GDS entries are owned alongside these views.
-    struct EffectiveResource {
-        const FrameResource* full = nullptr;
-        const FrameBufferResource* buffer = nullptr;
-        const FrameBufferResource& common() const { return full ? *full : *buffer; }
-        bool is_texture() const { return full && full->is_texture(); }
-    };
     std::vector<FrameBufferResource> synthetic_gds(draws.size());
     std::vector<std::vector<EffectiveResource>> effective_resources(draws.size());
     for (size_t i = 0; i < draws.size(); ++i) {
@@ -9178,24 +9261,6 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             effective.push_back({nullptr, &gds});
         }
     }
-    // Scope-guard timer, so a bucket stays correct across the `continue`/`break` exits the resource
-    // loop already uses. Reads the clock only when timing is enabled; the whole sub-attribution is
-    // inert (two predictable branches per resource) on a default run.
-    struct ResourcePhaseTimer {
-        bool enabled;
-        double* sink;
-        TimingClock::time_point begin;
-        ResourcePhaseTimer(bool en, double* s)
-            : enabled(en), sink(s),
-              begin(en ? TimingClock::now() : TimingClock::time_point{}) {}
-        ResourcePhaseTimer(const ResourcePhaseTimer&) = delete;
-        ResourcePhaseTimer& operator=(const ResourcePhaseTimer&) = delete;
-        ~ResourcePhaseTimer() {
-            if (enabled)
-                *sink += std::chrono::duration<double, std::milli>(TimingClock::now() - begin)
-                             .count();
-        }
-    };
     auto direct_range_eligible = [](const FrameBufferResource& r) {
         return !r.is_internal_gds && r.table_entries.empty() &&
             r.dwords.empty() && r.direct_guest_buffer_addr != 0 &&
@@ -9240,11 +9305,6 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     }
     const bool readonly_buffer_watch =
         getenv("PROSPER_NO_BACKEND_BUFFER_WRITE_WATCH") == nullptr;
-    struct BufferRangeUpload {
-        SharedBufferUpload upload;
-        bool attempted = false;
-        bool resident_attempted = false;
-    };
     std::vector<BufferRangeUpload> buffer_range_uploads(buffer_range_groups.size());
     std::vector<RenderCopySpan> buffer_range_copy_jobs;
     std::vector<RenderCopySpan> index_copy_jobs;
@@ -9436,43 +9496,6 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     // silence is indistinguishable from the variable being unset, from a typo, and from this code never
     // running. That is the defect this instrument was rejected for in review, and the shape of #2456.
     static const bool wave64_census = getenv("PROSPER_WAVE64_SKIP_CENSUS") != nullptr;
-    struct Wave64Census {
-        std::mutex mx;
-        std::unordered_map<uint64_t, uint64_t> seen;
-        std::unordered_map<uint64_t, std::unordered_map<uint32_t, uint64_t>> skipped;
-        uint64_t observations = 0;
-        static uint64_t key(uint32_t w, uint32_t h) { return (uint64_t(w) << 32) | h; }
-        void report_locked() {
-            std::vector<uint64_t> keys;
-            keys.reserve(seen.size());
-            for (const auto& kv : seen) keys.push_back(kv.first);
-            std::sort(keys.begin(), keys.end());
-            for (uint64_t k : keys) {
-                uint64_t dropped = 0;
-                auto it = skipped.find(k);
-                if (it != skipped.end())
-                    for (const auto& rm : it->second) dropped += rm.second;
-                std::fprintf(stderr, "[wave64-census] %ux%u draws=%llu skipped=%llu\n",
-                             (uint32_t)(k >> 32), (uint32_t)(k & 0xffffffffu),
-                             (unsigned long long)seen[k], (unsigned long long)dropped);
-                if (it != skipped.end())
-                    for (const auto& rm : it->second)
-                        std::fprintf(stderr, "[wave64-census]   %ux%u reason=0x%02x n=%llu\n",
-                                     (uint32_t)(k >> 32), (uint32_t)(k & 0xffffffffu),
-                                     rm.first, (unsigned long long)rm.second);
-            }
-        }
-        void note_draw(uint32_t w, uint32_t h) {
-            std::lock_guard<std::mutex> lk(mx);
-            ++seen[key(w, h)];
-            ++observations;
-            if (observations == 100 || (observations % 5000) == 0) report_locked();
-        }
-        void note_skip(uint32_t w, uint32_t h, uint32_t reason_mask) {
-            std::lock_guard<std::mutex> lk(mx);
-            ++skipped[key(w, h)][reason_mask];
-        }
-    };
     static Wave64Census wave64_stats;
     std::vector<VkDescriptorSetLayout> draw_dsls;
     std::vector<const std::vector<uint64_t>*> draw_layout_key_ptrs;
@@ -9485,11 +9508,6 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     std::vector<VkDescriptorSetLayoutBinding> draw_slb;
     std::vector<uint64_t> draw_pipeline_layout_key;
 
-    struct LastPipelineMemo {
-        bool valid = false;
-        PersistentPipelineKey key;
-        PersistentPipeline* entry = nullptr;
-    };
     LastPipelineMemo last_pipeline_memo;
 
     uint64_t pass_feedback_bases[prosper::gpu::kColorTargetCount]{};
