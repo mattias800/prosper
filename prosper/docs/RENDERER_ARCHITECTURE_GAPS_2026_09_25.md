@@ -237,6 +237,45 @@ that the unarm path is on the critical path -- the same discriminator this docum
 pass batching, and the one that killed it.
 
 
+### §§ 1-3 have ONE root cause: readback, measured on the shipped path
+
+The three costs this document opened with -- barriers, the blocking submit, the byte-compare
+residency -- are not three problems. Measured 2026-09-26 on The Messenger, a title whose renderer
+IS a meaningful share of its wall clock:
+
+```
+tools/screenshot   readback=1.90 of measured=2.42 ms   78.5% of backend time
+prosper-app        readback=2.04 of measured=2.98 ms   68.5% of backend time
+```
+
+**Readback dominates the backend call on BOTH harnesses.** That matters because the charter warns
+`tools/screenshot` never calls `set_gpu_present_active` -- still true, one call site,
+`frontends/prosper-app/main.cpp:694` -- so the obvious reading is "readback is a screenshot
+artifact". It is not. The shipped frontend shows the same shape.
+
+And it explains § 2 rather than competing with it. The synchronization line reports
+`flush{readback=1.00 explicit=1.00}`: of two flushes per backend call, one is *forced by the
+readback*. prosper blocks on the GPU because it needs pixels on the CPU. It needs pixels on the CPU
+because a render target that a later draw samples is served from a CPU-side cache -- the same
+machinery `CpuRttSnapshotPool` exists to feed. So:
+
+> The blocking submit (§ 2) is a SYMPTOM. A timeline semaphore cannot remove a wait whose purpose
+> is to deliver bytes the next draw is about to read. Fix the readback and § 2 dissolves; fix § 2
+> alone and it cannot work.
+
+This retargets the plan. Do not start the timeline-semaphore change as an independent piece of
+work: establish first how much of the readback is avoidable. A partial GPU-retained path already
+exists (`rtt_gpu_seed_import_extent_compatible`, `retain_gpu_result_baseline`,
+`renderer_result_retained` in `live_compute.cpp`), so the question is not "can render targets stay
+on the GPU" -- some already do -- but which passes still demand a CPU copy and why.
+
+**Measured wall-clock context, so nobody over-reads the above.** On `prosper-app` The Messenger
+runs ~59 fps with only **14.1%** of wall clock inside `render_draw_pass_rgba`, against 63.8-80.9%
+under `tools/screenshot`. Readback is the dominant cost *within* the renderer on both; the
+renderer's share *of the run* is far smaller on the shipped path. Quote the frontend with any
+figure from this section -- the two differ by more than 4x on the same title.
+
+
 ## Ruled out
 
 - **"The recompiler or shader quality is the frontier."** Not for this cost class: the profile's
