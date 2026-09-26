@@ -72,6 +72,17 @@ class PerfF8GapTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'multiple processes'):
             summarize(self.f8, self.perf)
 
+    def test_touching_renderer_spans_are_accepted_not_refused(self):
+        # Two submits that abut leave a zero-length gap. That is an observation about the
+        # capture, not a malformed record, and `schedstat_f8.join`'s null-coverage branch exists
+        # precisely to handle it — so tightening this guard from `>` to `>=` would both discard a
+        # valid capture and make that branch unreachable. The decision is pinned here rather than
+        # only asserted in a comment.
+        write_capture(self.f8, spans=((0, 1_000_000_000), (1_000_000_000, 2_000_000_000)))
+        _, spans = load_spans(self.f8)
+        self.assertEqual(spans, [(TRIGGER, TRIGGER + 1_000_000_000),
+                                 (TRIGGER + 1_000_000_000, TRIGGER + 2_000_000_000)])
+
     def test_missing_renderer_start_refuses(self):
         records = [json.loads(line) for line in self.f8.read_text().splitlines()]
         del records[1]['span_start_t_ns']

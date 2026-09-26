@@ -18,15 +18,26 @@
 #include <string>
 #include <vector>
 
-#if defined(__linux__)
-#include <sys/mman.h>
-#include <unistd.h>
-#endif
-
 #if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
 #define TEST_HAS_AVX2_KERNEL 1
 #else
 #define TEST_HAS_AVX2_KERNEL 0
+#endif
+
+// The mapping-edge arm needs `mmap`/`mprotect`, so it compiles on Linux only. This test is
+// registered on EVERY platform (it links nothing and needs no Vulkan), so the completeness guard
+// in main() must ask for the edge arm only where the edge arm exists -- otherwise an AVX2 Windows
+// or macOS host fails for having skipped a check it could never run. Spelled as a macro rather
+// than repeating `defined(__linux__)` so the guard and the arm cannot drift apart.
+#if defined(__linux__)
+#define TEST_HAS_MAPPING_EDGE 1
+#else
+#define TEST_HAS_MAPPING_EDGE 0
+#endif
+
+#if TEST_HAS_MAPPING_EDGE
+#include <sys/mman.h>
+#include <unistd.h>
 #endif
 
 namespace {
@@ -70,7 +81,7 @@ bool check_one(size_t count, size_t source_offset, size_t output_offset, size_t 
     return true;
 }
 
-#if defined(__linux__)
+#if TEST_HAS_MAPPING_EDGE
 // The guest index range is validated by `guest_readable(index_addr, n * esz)` and nothing more,
 // so a legitimate range can end exactly at a mapping edge. Read one byte past it and a valid
 // draw faults. Both kernels are driven here; the AVX2 one is the interesting case, because the
@@ -195,7 +206,7 @@ int main(int argc, char** argv) {
                                      count, source_offset, output_offset, peak);
                         return 1;
                     }
-#if defined(__linux__)
+#if TEST_HAS_MAPPING_EDGE
     if (!check_mapping_edge()) {
         std::fputs("index expansion crossed a validated guest mapping edge\n", stderr);
         return 1;
@@ -208,7 +219,8 @@ int main(int argc, char** argv) {
 #if TEST_HAS_AVX2_KERNEL
     // Not a failure: an AVX2-less host is a legitimate target. Say so, so a green run is never
     // read as having compared the two kernels when it could not.
-    if (prosper::gpu::index_expand_avx2_available() && !(exercised_avx2 && exercised_edge_avx2)) {
+    if (prosper::gpu::index_expand_avx2_available() &&
+        !(exercised_avx2 && (exercised_edge_avx2 || !TEST_HAS_MAPPING_EDGE))) {
         std::fputs("AVX2 is available but its kernel was not compared\n", stderr);
         return 1;
     }
