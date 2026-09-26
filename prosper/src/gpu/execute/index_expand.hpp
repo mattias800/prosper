@@ -64,6 +64,10 @@ inline bool index_expand_avx2_available() {
 // is reduced from the SAME widened register that is stored, so a concurrent guest rewrite can
 // never yield a stored index above the returned maximum -- the caller sizes the vertex buffer
 // from that maximum.
+//
+// CONFIDENCE: HIGH that this agrees with the loop above. The same test compares them value by
+// value across 19 lengths x 3 source offsets x 3 output offsets x 5 peak positions, and again
+// against a `PROT_NONE` page so the wide load is checked at the mapping edge it must not cross.
 __attribute__((target("avx2")))
 inline uint32_t copy_indices_u16_max_avx2(uint32_t* dst, const uint16_t* src, size_t count) {
     __m256i vector_max = _mm256_setzero_si256();
