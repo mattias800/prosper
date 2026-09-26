@@ -83,3 +83,73 @@ Capture a complete F9 bundle while the white blob is visible, then isolate its f
 in replay. Compare a matched gameplay frame with PS5 hardware for lighting and visual fidelity.
 Measure speed on a named stable scene in an uncontended GPU window, with completed producer cadence
 separate from repeated presentation and from the PS5 comparison.
+
+## Ruled out
+
+One line per falsified hypothesis, the evidence that killed it, and the link. Read this before
+forming a performance hypothesis on this title — every row here cost a session to establish.
+
+- **An AVX2 kernel for 16-bit index expansion is a speedup worth defaulting on** — falsified
+  2026-09-26 (#3866). Three independent reasons, any one of which is sufficient:
+  1. **The portable loop was never scalar.** GCC 16.1.1 at the project's `-O2` compiles
+     `copy_indices_u16_max_scalar` into an SSE2 loop handling **8 indices per iteration**
+     (`movdqu` → `punpcklwd`/`punpckhwd` → two `movups`) — the same granularity as the
+     hand-written kernel. There was no one-index-per-iteration baseline to beat.
+  2. **Given the same ISA the compiler beats the intrinsics.** With `-march=x86-64-v3`, or with
+     nothing but `__attribute__((target("avx2")))` on the *identical* portable loop, GCC emits
+     exactly the instructions the hand kernel uses (`vpmovzxwd`, `vpmaxud`, 32-byte stores) and
+     goes **wider — 16 indices per iteration against the kernel's 8**. Measured interleaved in
+     one binary and one process, minimum of 60 batched samples per arm, the hand kernel is
+     **1.21×–1.78× slower than its own source loop given the same ISA** at every size ≥ 384,
+     and **exactly equal to it at n = 64**, where eight iterations leave both dominated by
+     prologue and epilogue. So even where the idea is right, the implementation is dominated by
+     a compiler flag.
+  3. **The scale cannot reach the deficit.** The SSE2→AVX2 gap is real and large — **3.8×–6.1×**,
+     because SSE2 has no `pmaxud` and GCC emits a six-instruction sign-flip blend per four lanes
+     — but a large multiple of a small number is a small number. Across three runs and five
+     sizes the shipped path costs **0.141–0.282 ns/index** and the kernel **0.030–0.070**, so
+     each index saves **0.103–0.213 ns**. Recovering **1 ms of a frame therefore needs
+     4.7–9.7 million 16-bit indices expanded in that frame**, and covering this route's
+     **39 ms/frame** deficit would need **183–378 million** — order 60–126 million triangles per
+     frame. Put as a rate instead of per frame, which is the form that does not need a frame
+     count: at the shipped cost, **every 1 M indices/s is 0.014–0.028% of wall clock**, and the
+     kernel can return at most three quarters of that. The prior end-to-end A/B could not
+     resolve it either: 10.932 vs 11.144 completed versions/s over six recurring-shape records
+     per arm.
+
+  **How the numbers were taken**, because the box is shared with two other lanes and a
+  contended measurement here is worthless: arms **interleaved** (A,B,A,B) within one process,
+  never all-of-A then all-of-B; one binary and one set of buffers for every arm; **load average
+  recorded per run** — 39.30, 31.60 and 17.48. Absolute times moved 5–15% across those loads
+  while the **ratios moved under 3%**, except at n = 24576 (1.36× vs 1.78×), which is the size
+  whose working set straddles L2. Every per-index figure was derived **twice by independent
+  routes**, a three-arm scratch benchmark and the committed `--bench` arm. The first draft of
+  this row quoted "about 4×" and "1.35×–1.5×"; recomputing from the raw samples gave
+  3.8×–6.1× and 1.21×–1.78×, so both were wrong in both directions — the second derivation
+  is what caught it.
+
+  The kernel is retained behind `PROSPER_INDEX_EXPAND_SIMD=1`, **default off**, for the same
+  reason `PROSPER_UD_TAIL_ALIGN` is retained and left off: so the A/B that falsified it stays
+  reproducible in one binary. Do not turn it on as an optimization.
+  **What would reopen this:** `PROSPER_INDEX_EXPAND_STATS=1` prints the emulator's actual
+  16-bit and 32-bit index volume per second (`src/gpu/execute/index_expand.hpp`), and
+  `test_index_expand --bench` prints the per-index cost of each kernel with interleaved arms.
+  Multiply the two. If a route really does expand millions of indices per second, there are two
+  levers and neither is a hand-written kernel: raise the **build's ISA baseline** (a
+  project-wide `-march` decision that drops pre-2013 hosts, so it needs measuring against every
+  title, not just this one), or keep the runtime dispatch exactly as it is and replace the
+  intrinsics body with the **portable loop under `__attribute__((target("avx2")))`**, which is
+  what measured fastest here. The dispatch cost is identical either way; only the kernel body
+  differs. `CONFIDENCE: HIGH` for reasons 1 and 2, which are properties of the emitted code and
+  reproduce from a single compile. `CONFIDENCE: MED` for reason 3's threshold: the per-index
+  costs are measured, but they are **cache-warm**, which overstates the kernel's advantage
+  against guest memory the renderer has not just touched, and the index volume itself **has not
+  been measured on this route** — the instrument to measure it is the one named above. Both of
+  those biases point the same way, toward the kernel mattering less rather than more.
+
+- **The `8.33 ms` backend buffer-copy figure on this route predates a landed fix, and is not a
+  current number.** It was taken before `CpuRttSnapshotPool` was changed to match a free-list
+  entry on **capacity** rather than exact size; on one title that took allocate-and-copy from
+  56,543 MiB to 1,096 MiB per ~120 s and the pool hit rate from 38.5% to 99.5%. Re-baseline
+  before attributing anything on this route to buffer copy. Not re-measured here: the fix was not
+  on `main` at this checkpoint, so the comparison would have been against an unlanded branch.

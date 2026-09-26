@@ -2661,6 +2661,7 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
         } else {
             out.indices.resize(n);
             uint32_t max_index = 0;
+            index_expand_record(n, esz);
             if (esz == 2) {
                 const uint16_t* src = (const uint16_t*)(uintptr_t)index_addr;
                 max_index = copy_indices_u16_max(out.indices.data(), src, n);
