@@ -115,9 +115,13 @@ inline uint32_t copy_indices_u16_max(uint32_t* dst, const uint16_t* src, size_t 
 // a kernel speedup of any size converts to an unknown end-to-end effect.
 //
 // The 16- and 32-bit element widths are counted separately because only the 16-bit volume is
-// a candidate for the kernel above, and a title can be entirely one or the other. Both are
-// always reported, so a run that expands nothing says so rather than printing nothing -- a
-// census that stays silent on a zero is indistinguishable from one that is not armed.
+// a candidate for the kernel above, and a title can be entirely one or the other. Both widths
+// are printed on every line, so a title that expands only 32-bit indices still reports an
+// explicit 16-bit zero instead of looking unarmed.
+//
+// The blind spot that leaves, stated rather than papered over: this is called from the draw
+// path, so a run with NO indexed draws at all prints nothing, and nothing is exactly what an
+// unarmed census prints. Confirm the run rendered before reading silence as a measured zero.
 //
 // Volume only, deliberately: timing each call would need two clock reads per indexed draw,
 // which on a small draw is comparable to the work being timed. Counters are relaxed atomics

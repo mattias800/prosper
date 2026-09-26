@@ -147,9 +147,14 @@ forming a performance hypothesis on this title — every row here cost a session
   been measured on this route** — the instrument to measure it is the one named above. Both of
   those biases point the same way, toward the kernel mattering less rather than more.
 
-- **The `8.33 ms` backend buffer-copy figure on this route predates a landed fix, and is not a
-  current number.** It was taken before `CpuRttSnapshotPool` was changed to match a free-list
-  entry on **capacity** rather than exact size; on one title that took allocate-and-copy from
-  56,543 MiB to 1,096 MiB per ~120 s and the pool hit rate from 38.5% to 99.5%. Re-baseline
-  before attributing anything on this route to buffer copy. Not re-measured here: the fix was not
-  on `main` at this checkpoint, so the comparison would have been against an unlanded branch.
+- **The `8.33 ms` backend buffer-copy figure on this route is superseded before it was ever
+  used, and is not a current number.** It was taken with `CpuRttSnapshotPool` matching a
+  free-list entry on **exact size**; changing that to match on **capacity** took allocate-and-copy
+  from 56,543 MiB to 1,096 MiB per ~120 s on one title, and the pool hit rate from 38.5% to
+  99.5%. **That change was on another lane's branch and not on `main`** as of 2026-09-26, so it
+  is not yet a property of this title's baseline — check whether it has merged before quoting
+  either number. Deliberately not re-measured here: the only available comparison would have
+  been against an unmerged branch. Re-baseline before attributing anything on this route to
+  buffer copy. `CONFIDENCE: MED` — the pool figures are another lane's measurement on another
+  title, restated here so this route's own number is not read as current, and not independently
+  reproduced.
