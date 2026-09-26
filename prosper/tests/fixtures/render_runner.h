@@ -18,6 +18,8 @@
 #include "gpu/execute/host_read_barrier.hpp"   // the availability half of a readback (#2944/#3249)
 #include "gpu/execute/float_controls_probe.hpp" // #3479: the device gate on SignedZeroInfNanPreserve
 #include "gpu/diagnostics/diagnostic_selectors.hpp"
+#include "gpu/diagnostics/draw_disposition.hpp"  // why a draw did not reach the GPU
+#include "diagnostics/readback_reason_census.hpp"  // why a colour target is copied back
 #include "gpu/diagnostics/geometry_probe_arming.hpp"
 #include "gpu/diagnostics/vk_object_names.hpp"   // #3578: name guest shaders for RenderDoc/RGP
 #include "diagnostics/env_cache.hpp"       // PROSPER_ENV_ON / _VALUE: cached reads on per-draw paths
@@ -7319,6 +7321,11 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         prosper::frontend::performance_timing_mode(
             timing_log_enabled, prosper::frontend::interactive_performance_timing());
     BackendTexturePathCensus texture_path_census(draws.size());
+    // Declared at the TOP of the body, not next to the draw loop. It reports this pass on every
+    // exit including the early returns below, and it times the pass -- and the first version of
+    // this sat ~2,200 lines lower, so it measured only the tail of each pass and under-reported
+    // the renderer's share of the run. Anything moving it down again silently reintroduces that.
+    const prosper::gpu::DrawDispositionPassScope draw_disposition_scope;
     const bool timing_enabled = timing_mode.measure;
     const auto timing_start = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
     if (timing_enabled) backend_render_timing_stats_storage() = {};
@@ -9513,6 +9520,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     for (size_t di = 0; di < draws.size(); di++) {
         // Denominator: every draw this pass considers, recorded before any skip path can divert it.
         if (wave64_census) wave64_stats.note_draw(W, H);
+        prosper::gpu::draw_disposition_census().note_seen();
         const auto setup_begin = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
         const BackendDraw& bd = draws[di];
         const std::vector<uint32_t>& bd_vs = bd.vs_words();
@@ -9539,6 +9547,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 std::fprintf(stderr,
                     "[render] draw=%zu fragment Geometry capability unavailable; skipped\n", di);
                 texture_path_census.skipped_draw();
+                prosper::gpu::draw_disposition_census().note_dropped(
+                    prosper::gpu::DrawDrop::GeometryCapability);
                 continue;
             }
         }
@@ -9556,6 +9566,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                     ctx.mesh_shader_properties.maxMeshWorkGroupTotalCount / groups_xy)) {
                 std::fprintf(stderr, "[mesh] draw=%zu unsupported device or group shape; skipped\n", di);
                 texture_path_census.skipped_draw();
+                prosper::gpu::draw_disposition_census().note_dropped(
+                    prosper::gpu::DrawDrop::MeshShape);
                 continue;
             }
             v.mesh_draw = true;
@@ -9814,6 +9826,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 wave64_stats.note_skip(W, H, reason_mask);
             }
             texture_path_census.skipped_draw();
+            prosper::gpu::draw_disposition_census().note_dropped(
+                prosper::gpu::DrawDrop::SubgroupFeatures);
             continue;
         }
         if (uses_internal_gds && !render_internal_gds_buffer().buffer) {
@@ -9823,6 +9837,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                              "[render] skip draw: failed to allocate persistent GDS buffer\n");
             });
             texture_path_census.skipped_draw();
+            prosper::gpu::draw_disposition_census().note_dropped(
+                prosper::gpu::DrawDrop::GdsAllocation);
             continue;
         }
         if (backend_trace) {
@@ -11504,6 +11520,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             }
             if (!buffer_resources_ready) {
                 texture_path_census.skipped_draw();
+                prosper::gpu::draw_disposition_census().note_dropped(
+                    prosper::gpu::DrawDrop::BufferResources);
                 continue;
             }
             const ResourcePhaseTimer phase_descriptor(timing_enabled, &res_descriptor_ms);
@@ -11900,6 +11918,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                     setup_pipeline_ms += setup_elapsed_ms(
                         setup_resources_ready, setup_pipeline_key_ready);
                 texture_path_census.skipped_draw();
+                prosper::gpu::draw_disposition_census().note_dropped(
+                    prosper::gpu::DrawDrop::ShaderRejected);
                 continue;   // rejected SPIR-V -> skip this draw
             }
             st[0].module = v.vs;
@@ -11921,6 +11941,12 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                         "[backend-trace] draw=%zu create-pipeline end result=%d pipeline=%p\n",
                         di, (int)pipeline_result, (void*)v.pipe);
                 fflush(stderr);
+            }
+            if (pipeline_result != VK_SUCCESS) {
+                // The only place a draw that survived setup fails to reach the GPU. Disjoint from
+                // the six reasons above by construction: each of those `continue`s before here.
+                prosper::gpu::draw_disposition_census().note_dropped(
+                    prosper::gpu::DrawDrop::PipelineCreation);
             }
             if (pipeline_result == VK_SUCCESS) {
                 v.ok = true;
@@ -12004,11 +12030,19 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     const auto timing_draws_ready = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
     // Each bound color slot has its own readback contract. The caller can decline all CPU
     // color results, including the transient color attachment used by a depth-only live pass.
-    const bool readback_color0_wanted = prosper::frontend::is_color_target_readback_wanted(
+    // Slot 0 is the one worth attributing: it is the scanout/primary target, it is present on
+    // every pass, and readback is the dominant cost inside this call. The reason is taken from the
+    // same call the verdict comes from, so the census cannot drift from the decision.
+    const auto readback_color0_reason = prosper::frontend::color_target_readback_reason(
         color_target != nullptr,
         color_target ? color_target->persistent_id : 0,
         persistent_color,
         color_target ? color_target->readback : false);
+    prosper::diagnostics::note_readback_reason(
+        static_cast<prosper::diagnostics::ReadbackReasonSlot>(readback_color0_reason),
+        color_bytes[0]);
+    const bool readback_color0_wanted =
+        readback_color0_reason != prosper::frontend::ColorReadbackReason::NotWanted;
     const bool readback_color1_wanted = use_color1 &&
         prosper::frontend::is_color_target_readback_wanted(
             color_target != nullptr,
@@ -12878,6 +12912,12 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 (dsc.aspectMask & VK_IMAGE_ASPECT_DEPTH_BIT))
                 backend_depth_clear_probe_armed_count().fetch_add(1);
         }
+        // NOT a census site. Every setup-loop drop `continue`s before `v.ok` is set, so those
+        // draws arrive here too and counting them would double-count each one -- once under its
+        // real reason and once as pipeline-creation, which would then absorb every other reason's
+        // population and make the self-validation report a NEGATIVE unaccounted value on a
+        // correctly accounted pass. A genuine pipeline-creation failure is counted where it
+        // happens, at the vkCreateGraphicsPipelines result below.
         if (!v.ok) continue;
         if (ds_active) {
             vkCmdBeginQuery(cmd, ds_stats_pool, static_cast<uint32_t>(di), 0);
@@ -12940,6 +12980,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             std::fprintf(stderr, "\n");
             std::fflush(stderr);
         }
+        prosper::gpu::draw_disposition_census().note_recorded();
         if (v.mesh_draw) {
             ctx.cmd_draw_mesh_tasks(cmd, v.mesh_groups[0], v.mesh_groups[1], v.mesh_groups[2]);
         } else if (v.icount) {

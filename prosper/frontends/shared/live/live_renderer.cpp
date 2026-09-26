@@ -6,6 +6,7 @@
 #include "gpu/resources/metadata_kind_correlation.hpp"  // positive metadata-kind correlation (pure, tested)
 #include "gpu/diagnostics/watch_list.hpp"                 // strict 0x-only watch parsing
 #include "gpu/diagnostics/draw_program_skip.hpp"          // PROSPER_SKIP_DRAW_PROGRAM / census
+#include "gpu/diagnostics/pass_break_census.hpp"         // why a pass stopped accepting draws
 #include "gpu/diagnostics/link_list_census.hpp"          // PROSPER_DRAW_LINKSCAN
 #include "gpu/capture/writer_provenance.hpp"              // who last wrote a censused range
 #include "shared/rtt/rtt_authority.hpp"
@@ -9808,15 +9809,33 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         };
                         return aliases(draw.vrt.get()) || aliases(draw.prt.get());
                     };
-                    while (pass_i < items.size() && same_targets(items[pass_i]) &&
-                           prosper::frontend::mrt_same_resolve_pass(pass_head, items[pass_i])) {
+                    // Same four conditions in the same short-circuit order as before; the only
+                    // change is that the loop now records WHICH one ended the pass. Pass length
+                    // sets what every fixed per-pass cost actually costs over a run, and the
+                    // aggregate cannot distinguish an irreducible target change from an
+                    // over-strict predicate. See pass_break_census.hpp.
+                    const size_t pass_begin = pass_i;
+                    prosper::gpu::PassBreak pass_break = prosper::gpu::PassBreak::EndOfItems;
+                    while (true) {
+                        if (pass_i >= items.size()) {
+                            pass_break = prosper::gpu::PassBreak::EndOfItems; break;
+                        }
+                        if (!same_targets(items[pass_i])) {
+                            pass_break = prosper::gpu::PassBreak::TargetsChanged; break;
+                        }
+                        if (!prosper::frontend::mrt_same_resolve_pass(pass_head, items[pass_i])) {
+                            pass_break = prosper::gpu::PassBreak::MrtResolveDiffers; break;
+                        }
                         const auto& draw = items[pass_i];
-                        if (pass_writes_depth && samples_pass_depth_array(draw)) break;
+                        if (pass_writes_depth && samples_pass_depth_array(draw)) {
+                            pass_break = prosper::gpu::PassBreak::DepthFeedback; break;
+                        }
                         pass.push_back(&draw); ++pass_i;
                         pass_writes_depth |= prosper::test::persistent_ds_pass_may_write_depth(
                             draw.ps.depth_clear_enable, draw.ps.depth_test_enable,
                             draw.ps.depth_write_enable, draw.ps.depth_compare_op);
                     }
+                    prosper::gpu::pass_break_census().note_break(pass_break, pass_i - pass_begin);
 
                     // CB_COLOR_CONTROL.MODE=RESOLVE(3): the guest resolves an MSAA color0 surface into a
                     // single-sample color1 destination (Blue Prince PPSA25009 resolves its 4x-MSAA scene
