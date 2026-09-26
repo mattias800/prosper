@@ -1,0 +1,9 @@
+# Outer Wilds (PPSA08102): current-main first-person route, verified 2026-09-25.
+# Times are seconds since the first pad poll. On main after #3863, the 110 s
+# Square press landed before the Wake Up prompt; it was still visible at 119 s.
+# The retry at 135-137 s cleared it and the first-person world was visible
+# at the 200 s visual checkpoint. Keep both presses to retain this exact route.
+50-50.5:cross
+70-70.5:cross
+110-111:square
+135-137:square

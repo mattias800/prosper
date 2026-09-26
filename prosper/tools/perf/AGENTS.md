@@ -11,6 +11,20 @@ unobserved selectors are not proof of absent work. Event/thread denominators rem
 See `PERF_CALLER_REPORT.md` for commands and limits. A valid parse does not establish build identity,
 complete unwinding, a complete recording, worker coverage or low profiler overhead.
 
+`perf_f8_gap.py` joins a process-scoped monotonic `cpu-clock:u` export to complete F8
+renderer-submit spans. It refuses partial interval overlap and mixed process IDs; perf loss and
+peer contention remain external validity checks. Samples in a wall-time gap are CPU observations,
+not an allocation of that gap's elapsed time. Application frames are selected by DSO basename
+(`--binary`, default `prosper-app`), and a recording that names none of them is refused rather
+than reported as absent application work. See `PERF_F8_GAP.md`.
+
+`schedstat_probe.py` is an opt-in Linux `/proc` sampler for a selected process; `schedstat_f8.py`
+joins one recorded TID to F8 spans using complete read brackets. It separates scheduler runtime,
+runnable wait, and a signed sleep/unknown residual, with explicit coverage. A zone with nothing
+attributable reports zeros for every field; `coverage` is null only where the zone's expected
+wall time is itself zero, which touching renderer spans produce and which is unmeasurable rather
+than zero. The probe is a measurement aid, not a game FPS benchmark; see `PERF_F8_GAP.md`.
+
 Keep missing measurements distinct from measured zeros, and retain signed timing residuals.
 Nested CPU timers and GPU intervals cannot be added as independent work. Buffer comparison byte
 counts are requested spans, not physical memory traffic or the bytes an early-exiting comparison

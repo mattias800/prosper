@@ -1427,6 +1427,12 @@ if(TARGET prosper_core)
   if(Python3_Interpreter_FOUND)
     add_test(NAME performance_capture_report_logic
       COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/perf/test_performance_capture_report.py")
+    add_test(NAME perf_f8_gap_logic
+      COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/perf/test_perf_f8_gap.py")
+    add_test(NAME schedstat_f8_logic
+      COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/perf/test_schedstat_f8.py")
+    add_test(NAME schedstat_probe_logic
+      COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/perf/test_schedstat_probe.py")
     add_test(NAME compare_capture_pair_logic
       COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/perf/test_compare_capture_pair.py")
   endif()
@@ -2571,6 +2577,13 @@ endif()
   add_executable(test_index_size_detect tests/gpu/execute/test_index_size_detect.cpp)
   target_link_libraries(test_index_size_detect PRIVATE prosper_core)
   add_test(NAME index_size_detect COMMAND test_index_size_detect)
+
+  # 16-bit index expansion: equivalence against the retained (uncalled) AVX2 kernel and the
+  # PROT_NONE mapping edge. Header-only, links nothing, and needs no Vulkan — registered here
+  # rather than beside the GPU-execution tests so a host without Vulkan still runs it.
+  add_executable(test_index_expand tests/gpu/execute/test_index_expand.cpp)
+  target_include_directories(test_index_expand PRIVATE src)
+  add_test(NAME index_expand COMMAND test_index_expand)
 
   # shader_histo: data-driven recompiler-coverage report over the game's real embedded RDNA2 shaders.
   add_executable(shader_histo tools/shader_histo/shader_histo.cpp)
