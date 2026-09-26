@@ -4,6 +4,8 @@
 
 using prosper::frontend::can_defer_scanout_readback;
 using prosper::frontend::is_color_target_readback_wanted;
+using prosper::frontend::color_target_readback_reason;
+using prosper::frontend::ColorReadbackReason;
 
 static int failures = 0;
 #define CHECK(cond) do { if (!(cond)) { \
@@ -63,5 +65,29 @@ int main() {
     CHECK(compute_active_readback_bytes<4>(4, offsets, bytes, [](size_t) { return false; }) == 0);
 
     if (!failures) std::printf("readback_policy: OK\n");
+    
+    // The reason, not just the verdict. These matter because the three reasons have different
+    // fixes and a measured distribution chooses between them: on two live titles
+    // BoundNonPersistent never fired, which is what ruled out "make more targets persistent"
+    // before anyone built it. A reason mislabelled here would have pointed at the wrong work.
+    CHECK(color_target_readback_reason(false, 0, false, false) ==
+          ColorReadbackReason::NoColorTarget);
+    CHECK(color_target_readback_reason(true, 7, true, true) ==
+          ColorReadbackReason::ExplicitRequest);
+    CHECK(color_target_readback_reason(true, 7, false, false) ==
+          ColorReadbackReason::BoundNonPersistent);
+    CHECK(color_target_readback_reason(true, 7, true, false) == ColorReadbackReason::NotWanted);
+    CHECK(color_target_readback_reason(true, 0, false, false) == ColorReadbackReason::NotWanted);
+
+    // The verdict is DEFINED as "reason != NotWanted", so the two can never disagree. Asserted
+    // over the whole input space rather than at samples: the point is the invariant, not cases.
+    for (int has = 0; has < 2; has++)
+        for (uint64_t id : {uint64_t{0}, uint64_t{7}})
+            for (int persistent = 0; persistent < 2; persistent++)
+                for (int req = 0; req < 2; req++)
+                    CHECK(is_color_target_readback_wanted(has, id, persistent, req) ==
+                          (color_target_readback_reason(has, id, persistent, req) !=
+                           ColorReadbackReason::NotWanted));
+
     return failures ? 1 : 0;
 }

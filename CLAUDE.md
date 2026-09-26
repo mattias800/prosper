@@ -187,7 +187,7 @@ The standing warnings that are **not** title-specific:
 - **Before quoting an FPS number from this project, check which harness produced it — and when.**
   Three ways to get a wrong one, and a single run can hit all three:
   - **`tools/screenshot` never calls `set_gpu_present_active`** (the sole call site is
-    `frontends/prosper-app/main.cpp:668`), so in that harness the renderer copies every scanout frame
+    `frontends/prosper-app/main.cpp:694`), so in that harness the renderer copies every scanout frame
     back to the CPU. Its rate describes the forced-readback path, not the shipped one. **This applies
     only to figures measured after 2026-07-24** — before #1270 there was no GPU-present path, so
     every harness took the readback and the old figures are honest measurements of what then shipped.

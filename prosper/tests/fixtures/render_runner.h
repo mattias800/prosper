@@ -19,6 +19,7 @@
 #include "gpu/execute/float_controls_probe.hpp" // #3479: the device gate on SignedZeroInfNanPreserve
 #include "gpu/diagnostics/diagnostic_selectors.hpp"
 #include "gpu/diagnostics/draw_disposition.hpp"  // why a draw did not reach the GPU
+#include "diagnostics/readback_reason_census.hpp"  // why a colour target is copied back
 #include "gpu/diagnostics/geometry_probe_arming.hpp"
 #include "gpu/diagnostics/vk_object_names.hpp"   // #3578: name guest shaders for RenderDoc/RGP
 #include "diagnostics/env_cache.hpp"       // PROSPER_ENV_ON / _VALUE: cached reads on per-draw paths
@@ -12023,11 +12024,19 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     const auto timing_draws_ready = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
     // Each bound color slot has its own readback contract. The caller can decline all CPU
     // color results, including the transient color attachment used by a depth-only live pass.
-    const bool readback_color0_wanted = prosper::frontend::is_color_target_readback_wanted(
+    // Slot 0 is the one worth attributing: it is the scanout/primary target, it is present on
+    // every pass, and readback is the dominant cost inside this call. The reason is taken from the
+    // same call the verdict comes from, so the census cannot drift from the decision.
+    const auto readback_color0_reason = prosper::frontend::color_target_readback_reason(
         color_target != nullptr,
         color_target ? color_target->persistent_id : 0,
         persistent_color,
         color_target ? color_target->readback : false);
+    prosper::diagnostics::note_readback_reason(
+        static_cast<prosper::diagnostics::ReadbackReasonSlot>(readback_color0_reason),
+        color_bytes[0]);
+    const bool readback_color0_wanted =
+        readback_color0_reason != prosper::frontend::ColorReadbackReason::NotWanted;
     const bool readback_color1_wanted = use_color1 &&
         prosper::frontend::is_color_target_readback_wanted(
             color_target != nullptr,

@@ -2036,6 +2036,10 @@ if(TARGET prosper_core)
   target_include_directories(test_diag_ratelimit PRIVATE src)
   add_test(NAME diag_ratelimit COMMAND test_diag_ratelimit)
 
+  # Readback-reason policy: the verdict is expressed in terms of the reason, so a future edit
+  # cannot change what is counted without changing what is decided.
+  target_sources(test_cpu_rtt_snapshot_pool PRIVATE src/diagnostics/readback_reason_census.cpp)
+
   # Classified draw disposition: six involuntary drop paths folded into one counter, two of them
   # silent. Pins that a healthy pass stays quiet, that a drop names its mechanism, and that the
   # census reports an unnamed drop path as UNACCOUNTED rather than absorbing it.

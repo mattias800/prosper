@@ -276,6 +276,46 @@ renderer's share *of the run* is far smaller on the shipped path. Quote the fron
 figure from this section -- the two differ by more than 4x on the same title.
 
 
+### Which readbacks are avoidable — measured, and it is not the obvious one
+
+The readback finding above raises one question: which of `readback_policy.hpp`'s three reasons
+dominates. They have different fixes, and only a per-reason count can choose between them. Measured
+2026-09-26 on colour slot 0, ~120 s each:
+
+| title | not-wanted | explicit-request | bound-non-persistent |
+|---|---:|---:|---:|
+| The Messenger | 49.4% | **50.6%** | **0** |
+| Astro Bot | 97.4% | 0 | **0** |
+
+**`bound-non-persistent` never fires.** So "make more render targets persistent", which is the
+obvious first move and the one this document would otherwise have recommended, buys exactly
+nothing. That is the whole reason the census was built before the fix.
+
+Tracing the remaining half is the useful part, and it ends somewhere specific:
+
+1. `BackendColorTarget::readback` **defaults to `true`** (`render_runner.h:362`), and the live
+   renderer sets it `false` in exactly one narrow volume case. So "explicit request" is mostly the
+   *default* surviving, not a caller asking.
+2. But slot 0 is not un-deferred: `live_renderer.cpp:10675` builds the target with
+   `base != 0 && !defer_readback`, and `defer_readback` (`:10547`) goes through
+   `can_defer_scanout_readback`.
+3. Both gates on that path are **default-on** -- `live_gpu_targets` and `defer_rtt_readback` are
+   each a chain of `!PROSPER_*` opt-OUTs. Nothing is switched off.
+4. What defeats the deferral is `cpu_needed_same_batch`: a consumer later in the SAME submit needs
+   authoritative bytes, so deferring would make it observe the previous submit.
+
+So the readback that remains is not a missing switch, a stale default, or a residency gap. It is
+the architecture: **a render target that a later draw in the same submit samples is served from CPU
+bytes**, so the pixels must exist on the CPU before that draw records. That is what
+`CpuRttSnapshotPool` feeds and what forces the flush.
+
+**The frontier is therefore GPU-side resolution of sampled render targets, not readback tuning.**
+Partial machinery already exists (`rtt_gpu_seed_import_extent_compatible`,
+`retain_gpu_result_baseline`, `renderer_result_retained`). The measurable target is
+`cpu_needed_same_batch`: every pass where it is true is a pass that cannot defer, and counting
+*why* a consumer is CPU-needed is the next census, not the next fix.
+
+
 ## Ruled out
 
 - **"The recompiler or shader quality is the frontier."** Not for this cost class: the profile's
