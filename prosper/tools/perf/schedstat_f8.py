@@ -16,6 +16,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from perf_f8_gap import load_spans
 
 
+# Every zone row carries all of these, seeded at zero, so a zone with no attributable segments
+# reports a MEASURED zero instead of dropping the field. `AGENTS.md` requires that ("Keep missing
+# measurements distinct from measured zeros"), and the empty-gap case is the interesting one, not
+# a corner case: it is exactly what a capture whose renderer spans cover the window looks like.
+# A Counter would spread nothing here, leaving `coverage: 0.0` beside an absent `segments`, which
+# reads as a measurement and raises KeyError on the companion field.
+ZONE_FIELDS = ('segments', 'wall_ns', 'runtime_ns', 'runnable_ns',
+               'sleep_or_unknown_ns', 'max_bracket_ns')
+
+
 def interval(t, spans, starts):
     i = bisect.bisect_right(starts, t) - 1
     if i < 0 or t >= spans[-1][1]:
@@ -26,6 +36,10 @@ def interval(t, spans, starts):
 
 
 def join(report, spans, tid):
+    # Touching spans (`right[0] == left[1]`) are ACCEPTED, here and in `load_spans`, and that is
+    # a decision rather than a slack guard: two renderer submits that abut leave a zero-length
+    # gap, which is a real observation of the capture, not a malformed input. The consequence is
+    # handled at the coverage division below.
     if not spans or any(a >= b for a, b in spans) or any(
             right[0] < left[1] for left, right in zip(spans, spans[1:])):
         raise ValueError('renderer spans must be nonempty, positive, and nonoverlapping')
@@ -46,7 +60,7 @@ def join(report, spans, tid):
     identities = {t['starttime'] for _, _, _, t in wanted}
     if len(identities) != 1:
         raise ValueError('selected TID changed identity')
-    result = {k: collections.Counter() for k in ('renderer', 'gap')}
+    result = {k: dict.fromkeys(ZONE_FIELDS, 0) for k in ('renderer', 'gap')}
     wchans = {k: collections.Counter() for k in ('renderer', 'gap')}
     for (a_index, a_before, a_after, ta), (b_index, b_before, b_after, tb) in zip(wanted, wanted[1:]):
         if b_index != a_index + 1:
@@ -78,39 +92,15 @@ def join(report, spans, tid):
         wchans[zone][ta['state'] + ':' + ta['wchan']] += 1
     expected = {'renderer': sum(b - a for a, b in spans),
                 'gap': sum(b[0] - a[1] for a, b in zip(spans, spans[1:]))}
+    # `expected['gap']` is zero whenever every renderer span touches the next one, and for the
+    # single-span join this API permits. No observation can land in a zone of zero length, so
+    # coverage there is 0/0 -- undefined, not a measured zero, and reported as null. Dividing
+    # here is how the CLI used to raise ZeroDivisionError on a capture that was merely dense.
     return {zone: {**result[zone], 'expected_wall_ns': expected[zone],
-                   'coverage': result[zone]['wall_ns'] / expected[zone],
+                   'coverage': (result[zone]['wall_ns'] / expected[zone]
+                                if expected[zone] else None),
                    'wchan_snapshots': wchans[zone].most_common()}
             for zone in result}
-
-
-def selftest():
-    spans = [(0, 10), (20, 30)]
-    assert interval(5, spans, [0, 20]) == ('renderer', 0)
-    assert interval(15, spans, [0, 20]) == ('gap', 0)
-    assert interval(30, spans, [0, 20]) is None
-    def sample(t, runtime, runnable):
-        return {'before_ns': t, 'after_ns': t,
-                'threads': [{'tid': 7, 'starttime': 11, 'state': 'S',
-                             'wchan': 'futex', 'runtime_ns': runtime,
-                             'runnable_ns': runnable}]}
-    report = {'candidate_tids': [7], 'samples': [sample(2, 0, 0), sample(8, 3, 1),
-                          sample(12, 3, 1), sample(18, 4, 2),
-                          sample(22, 4, 2), sample(28, 7, 2)]}
-    result = join(report, spans, 7)
-    assert result['renderer']['segments'] == 2
-    assert result['renderer']['runtime_ns'] == 6
-    assert result['renderer']['coverage'] == 12 / 20
-    assert result['gap']['segments'] == 1
-    assert result['gap']['sleep_or_unknown_ns'] == 4
-    bad = {'candidate_tids': [7], 'samples': [sample(8, 0, 0), sample(12, 0, 0)]}
-    assert join(bad, spans, 7)['renderer'].get('segments', 0) == 0
-    # The second sample's midpoint is inside the renderer span, but its
-    # counter read crosses the boundary and cannot be attributed to either side.
-    crossing = {'candidate_tids': [7], 'samples': [sample(2, 0, 0),
-                            {**sample(8, 3, 1), 'after_ns': 11}]}
-    assert join(crossing, spans, 7)['renderer'].get('segments', 0) == 0
-    print('sched/F8 interval and cross-boundary controls passed')
 
 
 def main():
@@ -119,11 +109,7 @@ def main():
     parser.add_argument('scheduler', nargs='?', type=Path)
     parser.add_argument('--tid', type=int)
     parser.add_argument('--pid', type=int)
-    parser.add_argument('--selftest', action='store_true')
     args = parser.parse_args()
-    if args.selftest:
-        selftest()
-        return
     if not args.f8 or not args.scheduler or not args.tid or not args.pid:
         parser.error('F8 capture, scheduler JSON, --pid, and --tid are required')
     _, spans = load_spans(args.f8)

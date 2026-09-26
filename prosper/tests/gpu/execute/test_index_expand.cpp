@@ -1,9 +1,10 @@
 // Equivalence and boundary checks for the 16-bit index expansion, plus an opt-in `--bench`
-// arm that measures the two kernels against each other.
+// arm that measures the shipped loop against the retained AVX2 kernel.
 //
-// The AVX2 kernel is NOT enabled by default (see `index_expand.hpp`). The correctness checks
-// below therefore call it directly rather than through the dispatcher, so they exercise it
-// whatever `PROSPER_INDEX_EXPAND_SIMD` says in the environment ctest happens to run under.
+// `copy_indices_u16_max` is the only path the emulator takes. `copy_indices_u16_max_avx2` has
+// no production caller at all (see `index_expand.hpp`): it survives so that the falsification
+// in `docs/OUTER_WILDS_STATUS.md` § Ruled out stays executable, which means this file is the
+// only thing keeping it honest. Both are therefore called by name here.
 
 #include "gpu/execute/index_expand.hpp"
 
@@ -33,7 +34,7 @@ namespace {
 // Set by the checks that actually ran, and printed at the end. A green run must be able to say
 // which kernels it compared; "passed" on a host where the AVX2 arm silently never ran says
 // nothing about the AVX2 arm.
-bool exercised_scalar = false;
+bool exercised_shipped = false;
 bool exercised_avx2 = false;
 bool exercised_edge_avx2 = false;
 
@@ -57,24 +58,23 @@ bool check_one(size_t count, size_t source_offset, size_t output_offset, size_t 
         }
         return true;
     };
-    if (!check_output(prosper::gpu::copy_indices_u16_max_scalar(dst, src, count))) return false;
-    exercised_scalar = true;
-    std::fill(output.begin(), output.end(), guard);
+    if (!check_output(prosper::gpu::copy_indices_u16_max(dst, src, count))) return false;
+    exercised_shipped = true;
 #if TEST_HAS_AVX2_KERNEL
     if (prosper::gpu::index_expand_avx2_available()) {
+        std::fill(output.begin(), output.end(), guard);
         if (!check_output(prosper::gpu::copy_indices_u16_max_avx2(dst, src, count))) return false;
         exercised_avx2 = true;
-        std::fill(output.begin(), output.end(), guard);
     }
 #endif
-    return check_output(prosper::gpu::copy_indices_u16_max(dst, src, count));
+    return true;
 }
 
 #if defined(__linux__)
 // The guest index range is validated by `guest_readable(index_addr, n * esz)` and nothing more,
 // so a legitimate range can end exactly at a mapping edge. Read one byte past it and a valid
-// draw faults. Both kernels are driven here, and the AVX2 one directly: routing this through
-// the dispatcher would quietly skip it whenever the SIMD path is off, which is the default.
+// draw faults. Both kernels are driven here; the AVX2 one is the interesting case, because the
+// wide load is where a future rewrite would most plausibly read past `count`.
 bool check_mapping_edge() {
     const long page_size = sysconf(_SC_PAGESIZE);
     if (page_size <= 0) return false;
@@ -95,8 +95,6 @@ bool check_mapping_edge() {
                 return good;
             };
             std::vector<uint32_t> dst(count + 1, 0xfeedfaceu);
-            valid &= check(prosper::gpu::copy_indices_u16_max_scalar(dst.data(), src, count), dst);
-            std::fill(dst.begin(), dst.end(), 0xfeedfaceu);
             valid &= check(prosper::gpu::copy_indices_u16_max(dst.data(), src, count), dst);
 #if TEST_HAS_AVX2_KERNEL
             if (prosper::gpu::index_expand_avx2_available()) {
@@ -111,35 +109,6 @@ bool check_mapping_edge() {
     return valid;
 }
 #endif
-
-// The default is OFF, and that is the whole point of this table: only the exact string "1"
-// opts in. A change that made an unset variable, an empty string, or "0" enable the kernel
-// would silently re-ship an unjustified default, which is what this case exists to catch.
-bool check_enable_policy() {
-    struct Case { const char* setting; bool requested; };
-    static constexpr std::array<Case, 10> cases = {{
-        {nullptr, false}, {"", false}, {"0", false}, {"1", true}, {"10", false},
-        {"01", false}, {"1 ", false}, {" 1", false}, {"true", false}, {"yes", false},
-    }};
-    bool valid = true;
-    for (const Case& one : cases) {
-        const bool actual = prosper::gpu::index_expand_simd_requested(one.setting);
-        if (actual != one.requested) {
-            std::fprintf(stderr, "index expansion opt-in wrong for \"%s\": %d expected %d\n",
-                         one.setting ? one.setting : "(unset)", actual, one.requested);
-            valid = false;
-        }
-    }
-    // The live accessor must agree with the policy applied to this process's own environment.
-    const bool expected = prosper::gpu::index_expand_simd_requested(
-                              std::getenv("PROSPER_INDEX_EXPAND_SIMD")) &&
-                          prosper::gpu::index_expand_avx2_available();
-    if (prosper::gpu::index_expand_simd_enabled() != expected) {
-        std::fputs("index expansion enablement disagrees with its own opt-in policy\n", stderr);
-        valid = false;
-    }
-    return valid;
-}
 
 // Opt-in measurement arm.
 //
@@ -159,10 +128,10 @@ void run_benchmark() {
                 "min approximates the kernel, mean includes the box)\n");
 #if TEST_HAS_AVX2_KERNEL
     if (!prosper::gpu::index_expand_avx2_available())
-        std::printf("  AVX2 unavailable on this host -- scalar arm only\n");
+        std::printf("  AVX2 unavailable on this host -- shipped arm only\n");
     const bool have_simd = prosper::gpu::index_expand_avx2_available();
 #else
-    std::printf("  no AVX2 kernel compiled for this target -- scalar arm only\n");
+    std::printf("  no AVX2 kernel compiled for this target -- shipped arm only\n");
     const bool have_simd = false;
 #endif
     std::mt19937 generator(20260926u);
@@ -174,17 +143,17 @@ void run_benchmark() {
         constexpr size_t samples = 40;
         const size_t batch = std::max<size_t>(8, 2000000u / (count + 1));
 
-        double scalar_min = 1e30, scalar_total = 0, simd_min = 1e30, simd_total = 0;
+        double shipped_min = 1e30, shipped_total = 0, simd_min = 1e30, simd_total = 0;
         for (size_t sample = 0; sample < samples; ++sample) {
             auto start = std::chrono::steady_clock::now();
             for (size_t call = 0; call < batch; ++call) {
-                sink += prosper::gpu::copy_indices_u16_max_scalar(destination.data(), source.data(), count);
+                sink += prosper::gpu::copy_indices_u16_max(destination.data(), source.data(), count);
                 sink += destination[count / 2];
             }
-            const double scalar_ns = std::chrono::duration<double, std::nano>(
+            const double shipped_ns = std::chrono::duration<double, std::nano>(
                 std::chrono::steady_clock::now() - start).count() / double(batch);
-            scalar_min = std::min(scalar_min, scalar_ns);
-            scalar_total += scalar_ns;
+            shipped_min = std::min(shipped_min, shipped_ns);
+            shipped_total += shipped_ns;
 #if TEST_HAS_AVX2_KERNEL
             if (have_simd) {
                 start = std::chrono::steady_clock::now();
@@ -199,12 +168,12 @@ void run_benchmark() {
             }
 #endif
         }
-        std::printf("  n=%-7zu batch %-6zu scalar min %9.1f ns (%.4f ns/index) mean %9.1f",
-                    count, batch, scalar_min, scalar_min / double(count), scalar_total / samples);
+        std::printf("  n=%-7zu batch %-6zu shipped min %9.1f ns (%.4f ns/index) mean %9.1f",
+                    count, batch, shipped_min, shipped_min / double(count), shipped_total / samples);
         if (have_simd)
             std::printf(" | avx2 min %9.1f ns (%.4f ns/index) mean %9.1f | min-vs-min saved %+.1f ns/call (%+.1f%%)",
                         simd_min, simd_min / double(count), simd_total / samples,
-                        scalar_min - simd_min, 100.0 * (scalar_min - simd_min) / scalar_min);
+                        shipped_min - simd_min, 100.0 * (shipped_min - simd_min) / shipped_min);
         std::printf("\n");
     }
     std::printf("  [sink %llu]\n", static_cast<unsigned long long>(sink & 0xffu));
@@ -214,8 +183,6 @@ void run_benchmark() {
 
 int main(int argc, char** argv) {
     const bool benchmark = argc > 1 && std::string(argv[1]) == "--bench";
-
-    if (!check_enable_policy()) return 1;
 
     constexpr std::array<size_t, 19> sizes = {
         0, 1, 2, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 255, 256, 257, 8193};
@@ -234,7 +201,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 #endif
-    if (!exercised_scalar) {
+    if (!exercised_shipped) {
         std::fputs("index expansion checked no kernel at all\n", stderr);
         return 1;
     }
@@ -246,10 +213,9 @@ int main(int argc, char** argv) {
         return 1;
     }
 #endif
-    std::printf("index expansion and maximum controls passed (scalar%s%s, SIMD opt-in %s)\n",
+    std::printf("index expansion and maximum controls passed (shipped loop%s%s)\n",
                 exercised_avx2 ? " + avx2" : " only",
-                exercised_edge_avx2 ? " + avx2 mapping edge" : "",
-                prosper::gpu::index_expand_simd_enabled() ? "ON" : "off");
+                exercised_edge_avx2 ? " + avx2 mapping edge" : "");
 
     if (benchmark) run_benchmark();
     return 0;

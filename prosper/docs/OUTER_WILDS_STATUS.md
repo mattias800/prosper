@@ -92,9 +92,11 @@ forming a performance hypothesis on this title — every row here cost a session
 - **An AVX2 kernel for 16-bit index expansion is a speedup worth defaulting on** — falsified
   2026-09-26 (#3866). Three independent reasons, any one of which is sufficient:
   1. **The portable loop was never scalar.** GCC 16.1.1 at the project's `-O2` compiles
-     `copy_indices_u16_max_scalar` into an SSE2 loop handling **8 indices per iteration**
+     `copy_indices_u16_max` (then named `…_scalar`) into an SSE2 loop handling **8 indices per iteration**
      (`movdqu` → `punpcklwd`/`punpckhwd` → two `movups`) — the same granularity as the
-     hand-written kernel. There was no one-index-per-iteration baseline to beat.
+     hand-written kernel. There was no one-index-per-iteration baseline to beat. An independent
+     reviewer reproduced the same signature on GCC **16.2.1** outside the container, so the
+     codegen claim is not a property of one toolchain version.
   2. **Given the same ISA the compiler beats the intrinsics.** With `-march=x86-64-v3`, or with
      nothing but `__attribute__((target("avx2")))` on the *identical* portable loop, GCC emits
      exactly the instructions the hand kernel uses (`vpmovzxwd`, `vpmaxud`, 32-byte stores) and
@@ -128,9 +130,17 @@ forming a performance hypothesis on this title — every row here cost a session
   3.8×–6.1× and 1.21×–1.78×, so both were wrong in both directions — the second derivation
   is what caught it.
 
-  The kernel is retained behind `PROSPER_INDEX_EXPAND_SIMD=1`, **default off**, for the same
-  reason `PROSPER_UD_TAIL_ALIGN` is retained and left off: so the A/B that falsified it stays
-  reproducible in one binary. Do not turn it on as an optimization.
+  **The kernel survives; the switch does not.** `copy_indices_u16_max_avx2` is still in
+  `src/gpu/execute/index_expand.hpp` with **no production caller at all**, purely so that
+  `test_index_expand --bench` can re-run the interleaved A/B above — the measurement reason 3
+  rests on — in seconds rather than at a session's cost. There is no environment variable and no
+  dispatcher branch: an earlier revision of this branch had `PROSPER_INDEX_EXPAND_SIMD=1`,
+  default off, and it was removed on review (#3866). The `PROSPER_UD_TAIL_ALIGN` precedent does
+  **not** transfer — that gates behaviour observable only end-to-end in a live title, so a
+  runtime switch is the only way to A/B it, whereas index expansion is a pure function of
+  `(dst, src, count)` that a unit test A/Bs directly. A switch here could only ever have selected
+  the option reasons 1 and 2 rule out. Do not reintroduce one to "measure it properly"; run the
+  bench arm.
   **What would reopen this:** `PROSPER_INDEX_EXPAND_STATS=1` prints the emulator's actual
   16-bit and 32-bit index volume per second (`src/gpu/execute/index_expand.hpp`), and
   `test_index_expand --bench` prints the per-index cost of each kernel with interleaved arms.

@@ -22,11 +22,13 @@ namespace prosper::gpu {
 // dst is a separately allocated host vector; src is the guest's validated 16-bit index range.
 // Read exactly count indices so a valid range ending at a guest mapping boundary stays valid.
 //
-// The compiler already vectorizes this loop at the project's optimization level: the widening
-// u16->u32 store and the unsigned-max reduction are both idioms GCC recognizes, so the shipped
-// "scalar" path is the machine's baseline SSE width, not one index per iteration. Check the
-// emitted code before assuming a hand-written kernel below has anything to beat.
-inline uint32_t copy_indices_u16_max_scalar(uint32_t* dst, const uint16_t* src, size_t count) {
+// This is the ONLY path the emulator takes, and it is not scalar despite looking like it: the
+// compiler already vectorizes this loop at the project's optimization level, because the widening
+// u16->u32 store and the unsigned-max reduction are both idioms GCC recognizes. At plain `-O2` it
+// emits `movdqu` -> `punpcklwd`/`punpckhwd` -> two `movups`, i.e. 8 indices per iteration; given
+// AVX2 it goes to 16. Check the emitted code before assuming a hand-written kernel has anything
+// to beat -- see `docs/OUTER_WILDS_STATUS.md` § Ruled out, where one already lost.
+inline uint32_t copy_indices_u16_max(uint32_t* dst, const uint16_t* src, size_t count) {
     uint32_t maximum = 0;
     for (size_t i = 0; i < count; ++i) {
         const uint32_t index = src[i];
@@ -37,11 +39,26 @@ inline uint32_t copy_indices_u16_max_scalar(uint32_t* dst, const uint16_t* src, 
 }
 
 #if PROSPER_INDEX_EXPAND_AVX2
+// Only `tests/gpu/execute/test_index_expand.cpp` calls this.
 inline bool index_expand_avx2_available() {
     static const bool available = __builtin_cpu_supports("avx2");
     return available;
 }
 
+// NOT CALLED BY THE EMULATOR, and that is deliberate rather than an oversight.
+//
+// It is retained as the executable half of the falsification in `docs/OUTER_WILDS_STATUS.md`
+// § Ruled out: `test_index_expand --bench` interleaves it against the loop above in one binary
+// and prints each kernel's per-index cost, which is the measurement that row's third reason
+// rests on. Anyone re-opening "should index expansion be hand-vectorized?" can re-run that in
+// seconds instead of re-deriving it.
+//
+// There is no environment variable and no dispatcher branch. An earlier revision of this file
+// had both; they were removed on review (#3866) because a runtime switch could only ever select
+// the option the measurement rules out, and because index expansion is a pure function of
+// (dst, src, count) -- fully A/B-able in a unit test, unlike a gate such as
+// `PROSPER_UD_TAIL_ALIGN` whose effect is only observable end-to-end in a live title.
+//
 // Each iteration loads exactly 8 indices (16 bytes) and stores exactly 8 (32 bytes), so the
 // read never passes `src + count` even when that address is a guest mapping edge. The maximum
 // is reduced from the SAME widened register that is stored, so a concurrent guest rewrite can
@@ -72,40 +89,6 @@ inline uint32_t copy_indices_u16_max_avx2(uint32_t* dst, const uint16_t* src, si
 #else
 inline bool index_expand_avx2_available() { return false; }
 #endif
-
-// Split out from the cached accessor below so both directions of the default are testable
-// without a second process: the accessor answers once per process, so one test run could
-// otherwise only ever observe one environment.
-inline bool index_expand_simd_requested(const char* setting) {
-    return setting && setting[0] == '1' && setting[1] == '\0';
-}
-
-// DEFAULT OFF. `PROSPER_INDEX_EXPAND_SIMD=1` opts a capable x86 host into the AVX2 kernel;
-// anything else, including unset, takes the compiler-vectorized path above.
-//
-// The hand-written kernel is retained only so the A/B that found no end-to-end effect stays
-// reproducible in one binary -- the same reason `PROSPER_UD_TAIL_ALIGN` is kept and left off.
-// It is NOT a shipped optimization: see `docs/OUTER_WILDS_STATUS.md` § Ruled out. Turning it
-// on changes which instructions expand every indexed draw's index buffer in the whole
-// emulator, so it is a measurement control, not a per-title setting. CONFIDENCE: HIGH that the
-// two kernels agree -- `tests/gpu/execute/test_index_expand.cpp` compares them value by value,
-// including across a guest mapping edge.
-inline bool index_expand_simd_enabled() {
-#if PROSPER_INDEX_EXPAND_AVX2
-    static const bool enabled = index_expand_simd_requested(std::getenv("PROSPER_INDEX_EXPAND_SIMD")) &&
-                                index_expand_avx2_available();
-    return enabled;
-#else
-    return false;
-#endif
-}
-
-inline uint32_t copy_indices_u16_max(uint32_t* dst, const uint16_t* src, size_t count) {
-#if PROSPER_INDEX_EXPAND_AVX2
-    if (count >= 8 && index_expand_simd_enabled()) return copy_indices_u16_max_avx2(dst, src, count);
-#endif
-    return copy_indices_u16_max_scalar(dst, src, count);
-}
 
 // `PROSPER_INDEX_EXPAND_STATS=1`: how many indices this emulator actually expands per second.
 //

@@ -49,8 +49,10 @@ def select_threads(root, wanted_name):
     return sorted(selected)
 
 
-def collect(pid, name, seconds, hz):
-    root = Path('/proc') / str(pid)
+# `proc_root` exists so the pacing, identity and failure paths can be driven against a synthetic
+# tree in `test_schedstat_probe.py`. Nothing but the test passes it; production is always /proc.
+def collect(pid, name, seconds, hz, proc_root=Path('/proc')):
+    root = Path(proc_root) / str(pid)
     _, process_starttime = stat_fields((root / 'stat').read_text())
     # Select once. The target has been running for minutes by the measurement window;
     # scanning every task's comm on every tick would itself perturb a small gap.

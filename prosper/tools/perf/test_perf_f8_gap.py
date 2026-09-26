@@ -23,8 +23,8 @@ def write_capture(path, spans=((0, 1_000_000_000), (2_000_000_000, 3_000_000_000
     path.write_text(''.join(json.dumps(r) + '\n' for r in records))
 
 
-def flat(pid, tid, time, symbol='work', period=10):
-    return f'prosper-app {pid}/{tid} {time}: {period} cpu-clock:u: 1234 {symbol} (/tmp/prosper-app)\n'
+def flat(pid, tid, time, symbol='work', period=10, dso='/tmp/prosper-app'):
+    return f'prosper-app {pid}/{tid} {time}: {period} cpu-clock:u: 1234 {symbol} ({dso})\n'
 
 
 class PerfF8GapTests(unittest.TestCase):
@@ -88,6 +88,21 @@ class PerfF8GapTests(unittest.TestCase):
                          [100_000_000_001, 101_500_000_000])
         self.assertEqual(samples[0]['frames'][0]['symbol'], 'draw+0x1')
         self.assertEqual(samples[1]['frames'], [])
+
+    def test_recording_of_another_frontend_refuses_instead_of_reporting_no_app_work(self):
+        # Under `tools/screenshot` or `boot_trace` every sample would otherwise fall into
+        # `no_named_app_frame`, leaving three empty `top_app_frames` that read as "the
+        # application did nothing" rather than "this reader was given the wrong binary name".
+        lines = ''.join((flat(42, 43, '100.100000000', dso='/opt/screenshot'),
+                         flat(42, 44, '101.500000000', dso='/opt/screenshot'),
+                         flat(42, 43, '102.900000000', dso='/opt/screenshot')))
+        self.perf.write_text(lines)
+        with self.assertRaisesRegex(ValueError, "no sample in any zone carries a named frame"):
+            summarize(self.f8, self.perf)
+        named = summarize(self.f8, self.perf, 'screenshot')
+        self.assertEqual(named['app_binary'], 'screenshot')
+        self.assertEqual(named['zones']['renderer-span']['top_app_frames'], [('work', 2)])
+        self.assertEqual(named['zones']['renderer-span']['no_named_app_frame_samples'], 0)
 
     def test_zone_edges_include_start_and_exclude_end(self):
         spans = [(100, 200), (300, 400)]

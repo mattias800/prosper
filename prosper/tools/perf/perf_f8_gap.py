@@ -42,6 +42,9 @@ def load_spans(path):
             raise ValueError('F8 renderer span lacks two nonnegative integer endpoints')
     spans = sorted((trigger + r['span_start_t_ns'], trigger + r['t_ns'])
                    for r in renderer)
+    # Touching spans (`a[1] == b[0]`) pass deliberately: submits that abut leave a zero-length
+    # gap, which is an observation about the capture rather than a malformed record. Consumers
+    # must therefore tolerate a gap zone of zero expected wall time -- see `schedstat_f8.join`.
     if len(spans) < 2 or any(a >= b for a, b in spans) or any(a[1] > b[0] for a, b in zip(spans, spans[1:])):
         raise ValueError('need at least two complete, nonoverlapping renderer spans')
     return trigger, spans
@@ -100,7 +103,7 @@ def require_window_coverage(first_perf, last_perf, spans, edge_slack_ns=500_000_
                          f'perf=[{first_perf},{last_perf}] F8=[{spans[0][0]},{spans[-1][1]}]')
 
 
-def summarize(f8, perf_script):
+def summarize(f8, perf_script, binary='prosper-app'):
     trigger, spans = load_spans(f8)
     starts = [start for start, _ in spans]
     rows = {name: {'samples': 0, 'period_ns': 0,
@@ -127,7 +130,7 @@ def summarize(f8, perf_script):
         else:
             row['no_stack'] += 1
         app_frame = next((frame for frame in sample['frames']
-                          if Path(frame['dso']).name == 'prosper-app' and
+                          if Path(frame['dso']).name == binary and
                           not frame['symbol'].startswith('[unknown]')), None)
         if app_frame:
             row['app_frames'][app_frame['symbol']] += 1
@@ -136,8 +139,18 @@ def summarize(f8, perf_script):
     require_window_coverage(first_perf, last_perf, spans)
     if not rows['renderer-span']['samples'] or not rows['between-spans']['samples']:
         raise ValueError('perf/F8 overlap lacks samples in one of the two comparison zones')
+    # The application-frame selector is a NAME, and the wrong name fails silently: every sample
+    # lands in `no_named_app_frame` and `top_app_frames` is empty in all three zones, which reads
+    # as "no application work" rather than "this reader was looking for the wrong binary". A
+    # recording made under `tools/screenshot` or `boot_trace` hits that on the default. Refuse.
+    if not any(row['app_frames'] for row in rows.values()):
+        raise ValueError(
+            f'no sample in any zone carries a named frame from {binary!r}: the recording is of a '
+            'different binary, or it has no resolvable symbols. Pass --binary <name> (for example '
+            'screenshot or boot_trace) and check the export resolved symbols at all')
     return {
         'pid': next(iter(pids)),
+        'app_binary': binary,
         'trigger_monotonic_ns': trigger,
         'f8_spans': len(spans),
         'f8_first_span_ns': spans[0][0], 'f8_last_span_ns': spans[-1][1],
@@ -155,5 +168,8 @@ if __name__ == '__main__':
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('f8', type=Path)
     ap.add_argument('perf_script', type=Path)
+    ap.add_argument('--binary', default='prosper-app',
+                    help='DSO basename whose named frames are reported as application work '
+                         '(default: prosper-app; use screenshot or boot_trace for those frontends)')
     args = ap.parse_args()
-    print(json.dumps(summarize(args.f8, args.perf_script), indent=2))
+    print(json.dumps(summarize(args.f8, args.perf_script, args.binary), indent=2))

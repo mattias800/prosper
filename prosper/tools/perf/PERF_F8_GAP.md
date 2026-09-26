@@ -17,8 +17,18 @@ python3 tools/perf/perf_f8_gap.py capture.prperf perf-flat.txt > gap.json
 ```
 
 The parser refuses incomplete or dropped F8 detail, missing/overlapping renderer
-spans, multiple recorded processes, and perf samples that do not cover both ends of
-the F8 span interval (within 0.5 s). It keeps samples outside the interval separate.
+spans, multiple recorded processes, perf samples that do not cover both ends of
+the F8 span interval (within 0.5 s), a zone pair where either comparison zone has no
+samples at all, and a recording in which **no** sample carries a named frame from the
+selected binary. It keeps samples outside the interval separate.
+
+Application frames are selected by DSO **basename**, `prosper-app` by default. A recording
+made under another frontend needs `--binary screenshot` or `--binary boot_trace`; without it
+every sample would land in `no_named_app_frame` and all three `top_app_frames` lists would be
+empty, which reads as "no application work" rather than "wrong binary name" — hence the
+refusal above. The name actually used is echoed back as `app_binary`. Renderer spans that
+**touch** (one submit span ending exactly where the next begins) are accepted: that is an
+observation about the capture, and it leaves the gap zone with zero expected wall time.
 Inspect **perf recording loss**, the exact game binary and route, and concurrent
 build/game processes independently; neither this reader nor a successful `perf
 script` export establishes those conditions. A low or zero sample count on a
@@ -31,13 +41,19 @@ the second ended before the F8 window, and the third overlapped a Kena build. Al
 three were discarded for source attribution; these are the failure modes this
 reader's explicit clock, coverage check, and external peer audit are meant to catch.
 
-For a Linux-only scheduler question, start `schedstat_probe.py --pid PID --seconds 20
---hz 200 --out sched.json` beside the monotonic perf recording. It samples threads
-named `prosper-app` at bounded intervals and records each `/proc` read bracket. After
-identifying the primary TID in the process-scoped perf export, run
-`schedstat_f8.py capture.prperf sched.json --pid PID --tid TID`. The join counts
-only adjacent observations whose full read brackets lie inside the same renderer
+For a Linux-only scheduler question, start `python3 tools/perf/schedstat_probe.py --pid PID
+--seconds 20 --hz 200 --out sched.json` beside the monotonic perf recording. It samples threads
+named `prosper-app` (`--name` for another frontend) at bounded intervals and records each
+`/proc` read bracket. After identifying the primary TID in the process-scoped perf export, run
+`python3 tools/perf/schedstat_f8.py capture.prperf sched.json --pid PID --tid TID`. The join
+counts only adjacent observations whose full read brackets lie inside the same renderer
 span or gap. Inspect coverage, sampler overruns, thread identity, process/build
 identity, peer audit, and perf/F8 overlap before interpreting the result. The
 signed sleep/unknown remainder includes all time neither recorded as execution
 nor runnable wait; it is not a cause attribution or a whole-game FPS estimate.
+
+Every zone in that join always carries `segments`, `wall_ns`, `runtime_ns`, `runnable_ns`,
+`sleep_or_unknown_ns` and `max_bracket_ns`, seeded at zero, so a zone with nothing attributable
+reports a measured zero rather than an absent key — the expected shape when renderer spans
+cover the sampled window. `coverage` is the one field that can be **null**: a gap zone of zero
+expected wall time (touching spans, or a single span) is unmeasurable rather than zero.

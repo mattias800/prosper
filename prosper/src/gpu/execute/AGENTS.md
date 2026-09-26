@@ -22,11 +22,12 @@ comparisons; `compute_witness_analyses` counts actual cache-entry-point parser i
   an allocation from the returned maximum. And the read must stop exactly at `count`: the range is
   validated only as `guest_readable(addr, n * esz)`, so a legitimate draw can end on a mapping
   edge, which `tests/gpu/execute/test_index_expand.cpp` drives against a `PROT_NONE` page.
-  The AVX2 kernel here is **not** an optimization and is **default off** — the portable loop is
-  already auto-vectorized, and given the same ISA the compiler produces a wider loop than the
-  intrinsics do. It survives only so the A/B stays reproducible; see `docs/OUTER_WILDS_STATUS.md`
-  § Ruled out before spending any time here. `PROSPER_INDEX_EXPAND_STATS=1` reports the index
-  volume that would have to be large for any of this to matter.
+  The AVX2 kernel beside it is **not** an optimization and **nothing in the emulator calls it** —
+  the portable loop is already auto-vectorized, and given the same ISA the compiler produces a
+  wider loop than the intrinsics do. It survives only so that `test_index_expand --bench` keeps
+  the falsifying A/B executable; see `docs/OUTER_WILDS_STATUS.md` § Ruled out before spending any
+  time here. `PROSPER_INDEX_EXPAND_STATS=1` reports the index volume that would have to be large
+  for any of this to matter.
 - `gpu_dependency_graph` — ordering and dependencies between submitted work.
 - `host_read_barrier` — the availability half of a GPU→CPU readback: the `HOST_READ`/`HOST_BIT`
   dependency that a fence wait does **not** perform (#2944/#3249). Header-only and deliberately
