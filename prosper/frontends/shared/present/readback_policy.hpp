@@ -32,6 +32,7 @@ enum class ColorReadbackReason : unsigned char {
     NoColorTarget,        // no color target object at all -- the caller passed none
     ExplicitRequest,      // the caller or a split carrier asked for it
     BoundNonPersistent,   // a bound target that is not persistent, so its pixels are not retained
+    Count,                // not a reason; pinned against the census's own count -- see below
 };
 
 // When target_readback is true, readback was explicitly requested (by the caller or a split carrier).
@@ -65,6 +66,7 @@ constexpr const char* color_readback_reason_name(ColorReadbackReason reason) {
         case ColorReadbackReason::NoColorTarget: return "no-color-target";
         case ColorReadbackReason::ExplicitRequest: return "explicit-request";
         case ColorReadbackReason::BoundNonPersistent: return "bound-non-persistent";
+        case ColorReadbackReason::Count: break;   // not a reason; falls through to "unknown"
     }
     return "unknown";
 }

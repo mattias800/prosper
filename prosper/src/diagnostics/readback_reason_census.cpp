@@ -26,12 +26,18 @@ static_assert(static_cast<int>(prosper::frontend::ColorReadbackReason::BoundNonP
               static_cast<int>(ReadbackReasonSlot::BoundNonPersistent));
 static_assert(static_cast<int>(prosper::frontend::ColorReadbackReason::NotWanted) ==
               static_cast<int>(ReadbackReasonSlot::NotWanted));
-// Pinning the four values is not enough on its own: an enumerator APPENDED to the policy enum
-// leaves all four equal and is then silently dropped at runtime, because the cast produces a slot
-// index past the end. Pinning the COUNT is what makes adding a reason to one enum a build error.
+// Pinning the four values is not enough on its own, and pinning only ONE count is not either.
+// An enumerator appended to whichever enum is unpinned leaves all four value assertions equal, and
+// the cast at the call site then produces an index the other side has no slot for -- silently
+// dropped at runtime, with nothing but -Werror=switch in one unrelated translation unit to catch
+// it. Pinning BOTH counts against each other is what makes appending to either side a build error
+// here, which is where a reader of this census would look.
+static_assert(static_cast<int>(prosper::frontend::ColorReadbackReason::Count) ==
+                  static_cast<int>(ReadbackReasonSlot::Count),
+              "a reason was added to one of ColorReadbackReason / ReadbackReasonSlot but not the "
+              "other; add it to both, to kNames, and to the value assertions above");
 static_assert(static_cast<int>(ReadbackReasonSlot::Count) == 4,
-              "a reason was added to ReadbackReasonSlot; add it to ColorReadbackReason, kNames "
-              "and the value assertions above");
+              "both enums grew together; extend kNames and the value assertions above");
 
 struct State {
     std::array<std::atomic<uint64_t>, kCount> hits{};
