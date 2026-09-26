@@ -7826,6 +7826,696 @@ inline void record_draw_dynamic_state(VkCommandBuffer command, const DV& v,
     record_pipeline_dynamic_state(command, v);
 }
 
+// ---------------------------------------------------------------------------------------------
+// The pass's reporting, lifted out of it.
+//
+// Each of these was a block inside `render_draw_pass_rgba` gated on an environment variable, or
+// on the timing mode. None of them affects what is rendered: they read what the pass already
+// decided or what the device already produced, and write to stderr. They sat in the body only
+// because the locals they read were there, and they were a fifth of it.
+// ---------------------------------------------------------------------------------------------
+
+// PROSPER_DEPTH_CLEAR_WHY: how a pass's fresh-image depth value was derived, next to what its
+// draws actually compare with. The latch that produced `depth_clear` is FIRST-DRAW-WINS, so one
+// draw fixes the initial value for every later draw in the pass -- #457 fixed one instance of
+// that class on the stencil side, and this reports whether it is happening again on the depth
+// side, which the derived float alone cannot show. A pass whose draws are predominantly GREATER
+// but whose value came out 1.0 is rejecting its own geometry.
+inline void report_depth_clear_derivation(std::span<const BackendDraw> logical_draws,
+                                          const BackendColorTarget* color_target,
+                                          float depth_clear) {
+    uint32_t greater = 0, less = 0, other = 0, explicit_clear = 0;
+    uint32_t greater_colour = 0, less_colour = 0;
+    uint32_t reversed_viewports = 0, forward_viewports = 0;
+    float vp_min = -1.0f, vp_max = -1.0f;
+    int first_op = -1;
+    // What DB_DEPTH_CLEAR actually holds, whether or not a draw enables it. #371 forbids
+    // CONSUMING it without an explicit enable -- Astro Bot leaves packed 1920x1080 max
+    // coordinates in the register, which read as 2.15e-36 and rejected whole scenes -- but
+    // reading it here is free and says whether a plausible clear value is even present on the
+    // passes that need one. A surface fast-cleared through HTILE metadata sets no draw's
+    // depth_clear_enable, so the value it was cleared to is invisible to the latch above.
+    float first_clear_value = -1.0f;
+    for (const auto& d : logical_draws) {
+        if (!d.ps) continue;
+        if (!(d.ps->depth_test_enable || effective_depth_clear(d.ps))) continue;
+        if (first_op < 0) {
+            first_op = static_cast<int>(d.ps->depth_compare_op);
+            first_clear_value = d.ps->depth_clear_value;
+        }
+        // The viewport depth range, which is how a reverse-Z surface declares itself: a guest
+        // using near=1/far=0 programs min_depth=1, max_depth=0. If the range is the ordinary
+        // 0..1 while the compares are GREATER, the reversal lives in the projection matrix
+        // instead and the stored values are what the shader emits.
+        if (d.ps->has_viewport) {
+            if (d.ps->min_depth > d.ps->max_depth) ++reversed_viewports;
+            else ++forward_viewports;
+            vp_min = d.ps->min_depth; vp_max = d.ps->max_depth;
+        }
+        if (d.ps->depth_clear_enable) ++explicit_clear;
+        // Split by whether the draw WRITES COLOUR. The initial value should serve the draws
+        // whose output is lost when they fail, and a depth-only or mask draw loses nothing
+        // visible. Plain majority ignored this and reproduced the old answer on exactly the
+        // passes that matter (7 vs 7, and 6 vs 7 the wrong way).
+        const bool writes_colour = std::any_of(
+            d.ps->color_targets.begin(), d.ps->color_targets.end(),
+            [](const auto& t) { return t.write_mask != 0; });
+        switch (d.ps->depth_compare_op) {
+            case VK_COMPARE_OP_GREATER: case VK_COMPARE_OP_GREATER_OR_EQUAL:
+                ++greater; if (writes_colour) ++greater_colour; break;
+            case VK_COMPARE_OP_LESS: case VK_COMPARE_OP_LESS_OR_EQUAL:
+                ++less; if (writes_colour) ++less_colour; break;
+            default: ++other; break;
+        }
+    }
+    static std::mutex why_mutex;
+    static std::map<std::tuple<uint64_t, float, uint32_t, uint32_t, uint32_t>, uint64_t> seen;
+    std::lock_guard lock(why_mutex);
+    const uint64_t n = ++seen[{color_target ? color_target->persistent_id : 0ull,
+                               depth_clear, greater, less, other}];
+    if ((n & (n - 1)) == 0)
+        fprintf(stderr,
+                "[depth-clear-why] target=0x%llx derived=%.3f reg_clear=%.6g first_op=%d "
+                "explicit=%u compares{greater=%u less=%u other=%u} "
+                "colour{greater=%u less=%u} vp{min=%g max=%g rev=%u fwd=%u} "
+                "draws=%zu (x%llu)\n",
+                (unsigned long long)(color_target ? color_target->persistent_id : 0ull),
+                depth_clear, first_clear_value, first_op, explicit_clear, greater, less, other,
+                greater_colour, less_colour, vp_min, vp_max, reversed_viewports,
+                forward_viewports, logical_draws.size(), (unsigned long long)n);
+}
+
+// PROSPER_DSLOG: one line for the pass's depth/stencil decision, then one per draw for the guest
+// state it was derived from. Reporting only -- it reads what the pass already decided and writes
+// nothing back, which is why it can sit outside the pass at all.
+inline void report_backend_ds_state(uint32_t W, uint32_t H, std::span<const BackendDraw> draws,
+                                    bool use_depth, bool use_stencil, bool persistent_ds,
+                                    bool ds_layout_initialized, bool depth_was_valid,
+                                    bool stencil_was_valid, const PersistentDsKey& ds_key,
+                                    float depth_clear, uint32_t stencil_clear) {
+    static uint64_t call_id = 0;
+    const uint64_t id = ++call_id;
+    fprintf(stderr,
+            "[ds] call=%llu size=%ux%u draws=%zu use=%d/%d persistent=%d valid=%d/%d/%d "
+            "key=%llx/%llx/%llx/%llx htile=%llx fmt=%u initial=%g/%u\n",
+            (unsigned long long)id, W, H, draws.size(), (int)use_depth, (int)use_stencil,
+            (int)persistent_ds, (int)ds_layout_initialized,
+            (int)depth_was_valid, (int)stencil_was_valid,
+            (unsigned long long)ds_key.dr, (unsigned long long)ds_key.dw,
+            (unsigned long long)ds_key.sr, (unsigned long long)ds_key.sw,
+            (unsigned long long)ds_key.htile, ds_key.fmt, depth_clear, stencil_clear);
+    for (size_t i = 0; i < draws.size(); ++i) {
+        const auto* ps = draws[i].ps;
+        if (!ps) {
+            fprintf(stderr, "[ds] call=%llu draw=%zu state=none\n",
+                    (unsigned long long)id, i);
+            continue;
+        }
+        fprintf(stderr,
+                "[ds] call=%llu draw=%zu bases=%llx/%llx/%llx/%llx "
+                "depth=%d/%d/op%u clear=%d/%g stencil=%d clear=%d/%u "
+                "view=%08x htile=%llx hsurf=%08x info=%08x/%08x/%08x "
+                "size=%08x/%08x/%08x\n",
+                (unsigned long long)id, i,
+                (unsigned long long)ps->depth_read_base,
+                (unsigned long long)ps->depth_write_base,
+                (unsigned long long)ps->stencil_read_base,
+                (unsigned long long)ps->stencil_write_base,
+                (int)ps->depth_test_enable, (int)ps->depth_write_enable,
+                ps->depth_compare_op, (int)ps->depth_clear_enable, ps->depth_clear_value,
+                (int)ps->stencil_enable, (int)ps->stencil_clear_enable,
+                ps->stencil_clear_value, ps->db_depth_view,
+                (unsigned long long)ps->htile_data_base, ps->db_htile_surface,
+                ps->db_depth_info, ps->db_z_info, ps->db_stencil_info,
+                ps->db_depth_size_xy, ps->db_depth_size, ps->db_depth_slice);
+    }
+}
+
+// PROSPER_BUFVERIFY's end-of-pass check, and its aimable mutation control. Runs just before the
+// pass is submitted, which is the placement that makes a post-memcpy clobber visible at all; the
+// scope it can and cannot speak to is stated where `buffer_verify_records` is declared, and the
+// body below repeats it rather than leaving the caveat behind at the call site.
+inline void report_backend_buffer_verify(
+    const std::vector<BufferVerifyRecord>& buffer_verify_records,
+    const std::vector<SharedBufferUpload>& shared_buffers) {
+    // Compare the mapped allocation against the source words. A mismatch names the first
+    // differing BYTE, because what this is used to localize is an offset, not a boolean.
+    //
+    // WHAT IT CAN AND CANNOT SEE, precisely, because the difference decides what a zero from it
+    // is allowed to retire. On the branch this examines, `upload.range` is assigned the same
+    // `bytes` that drove the memcpy and that `word_count` describes, so `source_bytes` and
+    // `device_bytes` are equal BY CONSTRUCTION: a short upload is structurally inexpressible
+    // here and this check can never observe one. What it does observe is the destination range
+    // being CLOBBERED after the memcpy and before the pass is submitted -- an overlapping arena
+    // slice, a stray write, a pooled buffer handed out twice. Truncation is BUFLOG's and
+    // `[buffer-truncated]`'s question; do not quote a zero from here against it.
+    //
+    // The other direction is a false POSITIVE: `#1268` above deliberately tolerates cross-thread
+    // guest writes to the source words, so a guest that rewrites them after the memcpy produces
+    // a MISMATCH that is not a prosper defect. Check the guest before blaming the upload.
+    uint64_t parsed = 0;
+    bool arming_rejected = false;
+    auto strict = [&](const char* name, size_t& out, size_t unset) {
+        const char* text = getenv(name);
+        if (!text || !*text) { out = unset; return; }
+        // The UINT32_MAX bound is not pedantry: `binding` is compared as uint32_t below, so a
+        // value above it would truncate and aim the control at a DIFFERENT binding while still
+        // printing a confident MUTATED line -- the same silent-misaim this strict parse exists
+        // to prevent, one range check further out.
+        if (prosper::diag::parse_u64_auto_base(text, &parsed) && parsed <= UINT32_MAX) {
+            out = (size_t)parsed;
+            return;
+        }
+        std::fprintf(stderr,
+                     "[bufverify] %s=\"%s\" is not a number in [0, 4294967295] (decimal or 0x "
+                     "hex); the control is DISARMED rather than aimed somewhere unintended\n",
+                     name, text);
+        arming_rejected = true;
+        out = unset;
+    };
+    size_t mutate_offset = SIZE_MAX, mutate_min_bytes = 0, mutate_binding = SIZE_MAX;
+    strict("PROSPER_BUFVERIFY_MUTATE", mutate_offset, SIZE_MAX);
+    strict("PROSPER_BUFVERIFY_MUTATE_BINDING", mutate_binding, SIZE_MAX);
+    strict("PROSPER_BUFVERIFY_MUTATE_MINBYTES", mutate_min_bytes, 0);
+    if (arming_rejected) mutate_offset = SIZE_MAX;
+
+    // The control. A clean zero from the comparison is worth exactly what its ability to report a
+    // dirty one is worth, and nothing in the normal path ever exercises the mismatch branch.
+    // PROSPER_BUFVERIFY_MUTATE corrupts one byte of a device copy so the very next line must name
+    // that offset. It is AIMABLE because a control on a 128-byte uniform buffer says nothing
+    // about a 7 KiB vertex buffer: a control drawn from a different size class than the null
+    // tests the discriminator, not the domain.
+    const BufferVerifyRecord* mutate_target = nullptr;
+    for (const BufferVerifyRecord& cand : buffer_verify_records) {
+        if (mutate_binding != SIZE_MAX && cand.binding != (uint32_t)mutate_binding) continue;
+        if (cand.word_count * sizeof(uint32_t) < mutate_min_bytes) continue;
+        if (cand.upload_index >= shared_buffers.size()) continue;
+        if (!shared_buffers[cand.upload_index].mapped) continue;
+        if (mutate_offset >= (size_t)shared_buffers[cand.upload_index].range) continue;
+        mutate_target = &cand;
+        break;
+    }
+    if (mutate_offset != SIZE_MAX && mutate_target) {
+        const SharedBufferUpload& up = shared_buffers[mutate_target->upload_index];
+        uint8_t* device = static_cast<uint8_t*>(up.mapped) + (size_t)up.offset;
+        device[mutate_offset] = (uint8_t)(device[mutate_offset] ^ 0xFF);
+        std::fprintf(stderr,
+                     "[bufverify] MUTATED device byte %zu of set=%u binding=%u source_bytes=%zu "
+                     "-- the next line must report a mismatch at exactly that offset\n",
+                     mutate_offset, mutate_target->set, mutate_target->binding,
+                     mutate_target->word_count * sizeof(uint32_t));
+    } else if (mutate_offset != SIZE_MAX) {
+        // Silence here is indistinguishable from a clean run, which is the whole failure this
+        // control exists to prevent. Say so.
+        std::fprintf(stderr,
+                     "[bufverify] CONTROL DID NOT FIRE: no recorded buffer matched "
+                     "binding=%s minbytes=%zu with a host mapping and offset %zu in range. "
+                     "The \"0 mismatched\" below is UNVALIDATED\n",
+                     mutate_binding == SIZE_MAX ? "any" : std::to_string(mutate_binding).c_str(),
+                     mutate_min_bytes, mutate_offset);
+    }
+
+    size_t checked = 0, mismatched = 0, skipped_unmapped = 0;
+    for (const BufferVerifyRecord& rec : buffer_verify_records) {
+        if (rec.upload_index >= shared_buffers.size()) { ++skipped_unmapped; continue; }
+        const SharedBufferUpload& up = shared_buffers[rec.upload_index];
+        // A transient (non-arena, non-pooled) upload unmaps its memory before returning, so it
+        // has no host mapping to re-read and is skipped. That is a WHOLE CLASS, not an oddity:
+        // PROSPER_NO_BACKEND_BUFFER_POOL sends every upload down that path, and without the
+        // count below such a run would print an authoritative-looking "0 mismatched" having
+        // verified nothing at all.
+        if (!up.mapped || !rec.words || !rec.word_count) { ++skipped_unmapped; continue; }
+        const size_t source_bytes = rec.word_count * sizeof(uint32_t);
+        const size_t device_bytes = (size_t)up.range;
+        const uint8_t* device = static_cast<const uint8_t*>(up.mapped) + (size_t)up.offset;
+        const uint8_t* source = reinterpret_cast<const uint8_t*>(rec.words);
+        ++checked;
+        const size_t common = source_bytes < device_bytes ? source_bytes : device_bytes;
+        if (std::memcmp(device, source, common) == 0 && source_bytes == device_bytes) continue;
+        size_t first_bad = SIZE_MAX;
+        for (size_t b = 0; b < common; ++b)
+            if (device[b] != source[b]) { first_bad = b; break; }
+        ++mismatched;
+        if (mismatched <= 32)
+            std::fprintf(stderr,
+                         "[bufverify] MISMATCH set=%u binding=%u id=%llx source_bytes=%zu "
+                         "device_bytes=%zu first_differing_byte=%s (vertex %s at stride 32)\n",
+                         rec.set, rec.binding, (unsigned long long)rec.identity,
+                         source_bytes, device_bytes,
+                         first_bad == SIZE_MAX ? "none (size differs only)"
+                                               : std::to_string(first_bad).c_str(),
+                         first_bad == SIZE_MAX ? "-" : std::to_string(first_bad / 32).c_str());
+    }
+    if (!checked && !buffer_verify_records.empty())
+        std::fprintf(stderr,
+                     "[bufverify] NOTHING WAS VERIFIED: all %zu recorded buffer(s) lack a host "
+                     "mapping (transient uploads). A zero from this run means the check never "
+                     "ran, not that the uploads are correct\n",
+                     buffer_verify_records.size());
+    std::fprintf(stderr,
+                 "[bufverify] %zu buffer(s) re-read from device memory, %zu mismatched, "
+                 "%zu skipped (no host mapping)\n", checked, mismatched, skipped_unmapped);
+}
+
+// PROSPER_DS_SLICE_CENSUS, per (base, slice): how many passes attached it, and how many of those
+// actually claimed a depth write. A slice whose entry exists but never becomes valid is either
+// never really written or is having its write disclaimed, and those are different defects.
+inline void report_ds_slice_census(const PersistentDsKey& ds_key, bool use_depth,
+                                   bool depth_used_meaningfully) {
+    static std::mutex mutex;
+    struct SliceTally { uint64_t passes = 0, claimed = 0, used_depth = 0, meaningful = 0; };
+    static std::map<std::pair<uint64_t, uint32_t>, SliceTally> tally;
+    static uint64_t n = 0;
+    std::lock_guard lock(mutex);
+    auto& row = tally[{ds_key.dr, ds_key.slice}];
+    ++row.passes;
+    if (use_depth) ++row.used_depth;
+    if (depth_used_meaningfully) ++row.meaningful;
+    if (use_depth && depth_used_meaningfully) ++row.claimed;
+    // Increment SEQUENCED before the test -- see the same fix in live_renderer.cpp.
+    // `(++n) & (n - 1)` has no sequencing between the operands of `&`, so this
+    // throttle's cadence was undefined. Do not fold these back together.
+    ++n;
+    if ((n & (n - 1)) == 0 && n >= 256) {
+        fprintf(stderr, "[ds-slice] after %llu DS passes:\n", (unsigned long long)n);
+        for (const auto& e : tally)
+            fprintf(stderr,
+                    "[ds-slice]   base=0x%llx slice=%u passes=%llu use_depth=%llu "
+                    "meaningful=%llu claimed_valid=%llu%s\n",
+                    (unsigned long long)e.first.first, e.first.second,
+                    (unsigned long long)e.second.passes,
+                    (unsigned long long)e.second.used_depth,
+                    (unsigned long long)e.second.meaningful,
+                    (unsigned long long)e.second.claimed,
+                    e.second.claimed ? "" : "   <-- never claims a depth write");
+    }
+}
+
+// PROSPER_DRAW_STATS, the fragment funnel: one line per realized draw saying where its pixels
+// vanished. The caller reaches this only with `ds_active`, which implies the pass flushed, so the
+// query pools have results; `batch_completed` says whether that flush actually finished, and an
+// unfinished one must read nothing rather than read stale numbers.
+inline void report_draw_stats_funnel(VkDevice dev, VkQueryPool ds_stats_pool,
+                                     VkQueryPool ds_occ_pool, const std::vector<DV>& dv,
+                                     std::span<const BackendDraw> draws, bool batch_completed) {
+    const uint32_t nq = static_cast<uint32_t>(dv.size());
+    if (batch_completed) {
+        std::vector<uint64_t> sres(static_cast<size_t>(nq) * 5, 0);  // 4 statistics + availability
+        std::vector<uint64_t> ores(static_cast<size_t>(nq) * 2, 0);  // occlusion samples + availability
+        vkGetQueryPoolResults(dev, ds_stats_pool, 0, nq, sres.size() * sizeof(uint64_t), sres.data(),
+                              5 * sizeof(uint64_t),
+                              VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+        vkGetQueryPoolResults(dev, ds_occ_pool, 0, nq, ores.size() * sizeof(uint64_t), ores.data(),
+                              2 * sizeof(uint64_t),
+                              VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+        for (uint32_t i = 0; i < nq; i++) {
+            if (!sres[i * 5 + 4]) continue;  // unavailable -> draw was skipped (v.ok == false)
+            const uint64_t verts = sres[i * 5 + 0], prims = sres[i * 5 + 1],
+                           clip = sres[i * 5 + 2], fs = sres[i * 5 + 3];
+            const uint64_t samp = ores[i * 2 + 1] ? ores[i * 2 + 0] : 0;
+            // Funnel classification, checked in pipeline order. `samples` (occlusion) is the ground
+            // truth for "survived the depth+stencil test" — it is counted even when the fragment
+            // shader is optimised out for a colour-write-disabled (stencil-only) draw, so it must be
+            // tested before fs_inv or such draws look falsely dead.
+            const char* tag =
+                (prims == 0) ? "NO-GEOMETRY(no primitives)" :
+                (clip  == 0) ? "GEOMETRY-VANISH(clipped/degenerate/offscreen)" :
+                (samp  >  0) ? "passed-samples(colour/stencil written)" :
+                (fs    >  0) ? "TEST-KILLED(depth/stencil rejected all)" :
+                               "NO-RASTER(cull/scissor/zero-area)";
+            const uint64_t draw_index = draws[i].draw_index != UINT64_MAX
+                ? draws[i].draw_index : i;
+            fprintf(stderr,
+                    "[draw-stats] draw=%llu verts=%llu prims=%llu after_clip=%llu fs_inv=%llu samples=%llu %s\n",
+                    (unsigned long long)draw_index,
+                    (unsigned long long)verts, (unsigned long long)prims,
+                    (unsigned long long)clip, (unsigned long long)fs, (unsigned long long)samp, tag);
+        }
+    }
+}
+
+// Geometry-probe readback: report where the probed draw's post-transform clip-space vertices
+// landed. The caller reaches this only with `geom_active && batch_completed`, so the transform
+// feedback buffers exist and the submit that filled them has completed -- both halves matter,
+// because mapping either buffer before completion reads whatever was there before.
+inline void report_geometry_probe_readback(VkDevice dev, VkDeviceMemory geom_counter_mem,
+                                           VkDeviceMemory geom_mem, uint32_t geom_cap,
+                                           unsigned long long geom_target_label) {
+    // The counter buffer holds the byte count transform feedback actually wrote; read only that
+    // many vertices so the uninitialized tail of the (3x-oversized) buffer never pollutes stats.
+    uint32_t written = 0;
+    void* cp = nullptr;
+    if (vkMapMemory(dev, geom_counter_mem, 0, 16, 0, &cp) == VK_SUCCESS) {
+        uint32_t bytes = 0; std::memcpy(&bytes, cp, sizeof bytes);
+        written = std::min(bytes / 16u, geom_cap);
+        vkUnmapMemory(dev, geom_counter_mem);
+    }
+    void* gp = nullptr;
+    if (written && vkMapMemory(dev, geom_mem, 0, static_cast<VkDeviceSize>(written) * 16, 0, &gp) == VK_SUCCESS) {
+        const float* pos = static_cast<const float*>(gp);
+        float minx=1e30f,maxx=-1e30f,miny=1e30f,maxy=-1e30f,minz=1e30f,maxz=-1e30f,minw=1e30f,maxw=-1e30f;
+        uint32_t nan=0, wle0=0, offscreen=0, clipped=0, finite=0;
+        bool all_same = written > 0;
+        for (uint32_t i = 0; i < written; i++) {
+            const float x=pos[i*4+0], y=pos[i*4+1], z=pos[i*4+2], w=pos[i*4+3];
+            if (!std::isfinite(x)||!std::isfinite(y)||!std::isfinite(z)||!std::isfinite(w)) { nan++; continue; }
+            finite++;
+            minx=std::min(minx,x); maxx=std::max(maxx,x); miny=std::min(miny,y); maxy=std::max(maxy,y);
+            minz=std::min(minz,z); maxz=std::max(maxz,z); minw=std::min(minw,w); maxw=std::max(maxw,w);
+            if (w <= 0.0f) wle0++;
+            if (std::fabs(x) > std::fabs(w) || std::fabs(y) > std::fabs(w)) offscreen++;
+            // A vertex is on-screen only if it is in front of the camera (w>0) and inside the
+            // clip cube (|x|,|y| <= w). Everything else is clipped and cannot rasterize.
+            if (!(w > 0.0f && std::fabs(x) <= w && std::fabs(y) <= w)) clipped++;
+            if (i && (x!=pos[0]||y!=pos[1]||z!=pos[2]||w!=pos[3])) all_same = false;
+        }
+        const uint32_t onscreen = finite - clipped;
+        // Classification is descriptive (read it WITH the funnel, which owns the vanishes verdict):
+        // a large quad whose verts sit just outside the cube still rasterizes via clipping, so
+        // "all verts outside" is not the same as "renders nothing" — the bbox tells them apart.
+        const char* tag =
+            finite == 0             ? "ALL-NAN/INF(numeric defect)" :
+            all_same                ? "DEGENERATE(all verts collapse to one clip point)" :
+            wle0 == finite          ? "ALL-BEHIND-CAMERA(w<=0: transform/w defect)" :
+            clipped == finite       ? "ALL-VERTS-OUTSIDE-CLIP-CUBE(see bbox: off-screen shift or oversized quad)" :
+            onscreen * 20u < finite ? "MOSTLY-OUTSIDE(<5% verts on-screen; see bbox)" :
+                                      "on-screen(geometry spread across clip space)";
+        // Shader I/O tap mode (PROSPER_SHADER_TAP): the captured "positions" are actually the tapped
+        // intermediate VGPR (dst..dst+3) at that PC, so print the raw hex too (values are often
+        // integers/bitfields, not clip floats) and skip the meaningless clip classification.
+        // Gated on the REQUEST, not on whether the redirect happened -- and those differ
+        // (#2064). tap_vec is set only when the instruction at tap_pc is walked, so a
+        // tap_pc after this shader's EXP POS0 exports the REAL clip position while this
+        // header still says "the tapped VGPR". The recompiler now prints
+        // `[shader-tap] NOT APPLIED ...` naming the PC in that case, so the two lines
+        // must be read together: this header states what was ASKED FOR, and the ABSENCE
+        // of a NOT APPLIED line is what says it was delivered.
+        const bool is_tap = PROSPER_ENV_ON("PROSPER_SHADER_TAP");
+        if (is_tap)
+            fprintf(stderr, "[geom-probe] draw=%llu SHADER-TAP REQUESTED (see any [shader-tap] NOT APPLIED line for this shader, which means these are the REAL clip positions -- #2064): values below are the tapped VGPR "
+                            "(dst+3) at that PC, not clip positions (bbox/tags meaningless)\n",
+                    geom_target_label);
+        else
+            fprintf(stderr, "[geom-probe] draw=%llu verts-written=%u finite=%u on-screen=%u clipped=%u "
+                            "(offscreen=%u w<=0=%u nan/inf=%u)\n"
+                            "[geom-probe]   clip-bbox x[%g,%g] y[%g,%g] z[%g,%g] w[%g,%g] -> %s\n",
+                    geom_target_label, written, finite, onscreen, clipped, offscreen, wle0, nan,
+                    minx,maxx, miny,maxy, minz,maxz, minw,maxw, tag);
+        for (uint32_t i = 0; i < written && i < (is_tap ? 8u : 4u); i++) {
+            if (is_tap) {
+                uint32_t h[4]; std::memcpy(h, &pos[i*4], 16);
+                fprintf(stderr, "[geom-probe]   v%u = float(%g, %g, %g, %g) hex(%08x %08x %08x %08x)\n",
+                        i, pos[i*4+0], pos[i*4+1], pos[i*4+2], pos[i*4+3], h[0], h[1], h[2], h[3]);
+            } else {
+                fprintf(stderr, "[geom-probe]   v%u = (%g, %g, %g, %g)\n",
+                        i, pos[i*4+0], pos[i*4+1], pos[i*4+2], pos[i*4+3]);
+            }
+        }
+        // Geometry-health metrics (#1257): the transform-feedback buffer already holds every
+        // post-transform vertex in primitive-assembly order, so consecutive triples ARE the
+        // rasterized triangles (TF decomposes strips/fans into triangles). Report the tells that
+        // localize a geometry/vertex-fetch bug — the exact signals that cracked GTA #1163's
+        // vertex-count inflation: how many DISTINCT positions the draw really has (a shared VB pool
+        // read past its real range collapses most verts onto a few points), what fraction of
+        // triangles are DEGENERATE (zero-area stitching / collapsed fetch), and how many triangles
+        // are exact DUPLICATES (the same triangle rasterized N times = pure overdraw). Overdraw
+        // itself is the funnel's job (occlusion samples > covered pixels): read this WITH
+        // PROSPER_DRAW_STATS. Skipped in tap mode (pos holds VGPR values, not positions).
+        if (!is_tap && written >= 3) {
+            std::vector<std::array<float, 4>> verts;   // finite positions, for unique/multiplicity
+            verts.reserve(written);
+            for (uint32_t i = 0; i < written; i++) {
+                const float x = pos[i*4+0], y = pos[i*4+1], z = pos[i*4+2], w = pos[i*4+3];
+                if (std::isfinite(x) && std::isfinite(y) && std::isfinite(z) && std::isfinite(w))
+                    verts.push_back({x, y, z, w});
+            }
+            std::sort(verts.begin(), verts.end());
+            uint32_t unique_pos = 0, max_mult = 0, run = 0;
+            for (size_t i = 0; i < verts.size(); i++) {
+                if (i == 0 || verts[i] != verts[i-1]) { unique_pos++; run = 1; } else run++;
+                max_mult = std::max(max_mult, run);
+            }
+            // Per-triangle (over FINITE triangles only): degenerate (near-zero NDC area) + exact
+            // duplicates (canonical key). Non-finite triangles are a numeric defect already reported
+            // by the probe's nan/inf count, and are skipped here so no NaN enters std::sort (a NaN
+            // breaks the strict-weak-ordering -> UB); their vertices are also excluded from `verts`.
+            const uint32_t ntri = written / 3u;
+            uint32_t degenerate = 0, finite_tri = 0;
+            std::vector<std::array<float, 12>> tris;
+            tris.reserve(ntri);
+            for (uint32_t t = 0; t < ntri; t++) {
+                const float* p = &pos[t*3*4];
+                bool fin = true;
+                for (int k = 0; k < 12; k++) if (!std::isfinite(p[k])) { fin = false; break; }
+                if (!fin) continue;
+                finite_tri++;
+                auto ndc = [&](int k, int c) {   // p[k*4+3] is finite here
+                    float v = p[k*4+c], w = p[k*4+3];
+                    return w != 0.0f ? v / w : v;
+                };
+                const float ax = ndc(0,0), ay = ndc(0,1), bx = ndc(1,0), by = ndc(1,1),
+                            cx = ndc(2,0), cy = ndc(2,1);
+                const float area2 = (bx-ax)*(cy-ay) - (cx-ax)*(by-ay);
+                if (std::fabs(area2) < 1e-10f) degenerate++;
+                // Canonical key: the triangle's three (x,y,z,w) vertices sorted, so a duplicate
+                // triangle in any winding/rotation collides.
+                std::array<std::array<float,4>,3> v3 = {{
+                    {p[0],p[1],p[2],p[3]}, {p[4],p[5],p[6],p[7]}, {p[8],p[9],p[10],p[11]} }};
+                std::sort(v3.begin(), v3.end());
+                tris.push_back({v3[0][0],v3[0][1],v3[0][2],v3[0][3],
+                                v3[1][0],v3[1][1],v3[1][2],v3[1][3],
+                                v3[2][0],v3[2][1],v3[2][2],v3[2][3]});
+            }
+            std::sort(tris.begin(), tris.end());
+            uint32_t dup_tri = 0;
+            for (size_t i = 1; i < tris.size(); i++) if (tris[i] == tris[i-1]) dup_tri++;
+            const uint32_t real_tri = finite_tri - degenerate;
+            const char* health =
+                finite && unique_pos <= 2                      ? "COLLAPSED(<=2 distinct positions - fetch/transform returns a constant)" :
+                finite_tri && degenerate * 5u >= finite_tri*4u ? "DEGENERATE-HEAVY(>=80% zero-area - strip-stitching read as list, or wrong count/stride)" :
+                dup_tri && dup_tri * 4u >= real_tri            ? "DUPLICATE-TRIANGLES(exact repeats = pure overdraw - likely over-count/wrong vertex range)" :
+                                                                 "ok(check PROSPER_DRAW_STATS for overdraw: samples>pixels)";
+            fprintf(stderr, "[geom-health] draw=%llu verts=%u unique-pos=%u (max-mult=%u) "
+                            "triangles=%u degenerate=%u(%.0f%%) real=%u duplicate-tri=%u -> %s\n",
+                    geom_target_label, (unsigned)verts.size(), unique_pos, max_mult, finite_tri, degenerate,
+                    finite_tri ? 100.0 * degenerate / finite_tri : 0.0, real_tri, dup_tri, health);
+        }
+        // PROSPER_GEOM_PROBE_DUMP=path (gated, off by default): write EVERY post-transform vertex
+        // (x,y,z,w in primitive-assembly order — for a triangle list, consecutive triples are the
+        // rasterized triangles) as CSV, so per-triangle overlap/degeneracy can be analyzed offline
+        // (e.g. GTA #1163's stencil over-count from self-overlapping mask triangles).
+        if (const char* dp = PROSPER_ENV_VALUE("PROSPER_GEOM_PROBE_DUMP")) {
+            if (FILE* f = fopen(dp, "w")) {
+                fprintf(f, "i,x,y,z,w\n");
+                for (uint32_t i = 0; i < written; i++)
+                    fprintf(f, "%u,%.7g,%.7g,%.7g,%.7g\n",
+                            i, pos[i*4+0], pos[i*4+1], pos[i*4+2], pos[i*4+3]);
+                fclose(f);
+                fprintf(stderr, "[geom-probe]   wrote %u verts -> %s\n", written, dp);
+            }
+        }
+        vkUnmapMemory(dev, geom_mem);
+    } else if (!written) {
+        // Supportable only because arming proved OpExecutionMode Xfb is present on the last
+        // pre-rasterization stage (#3248); without that check this line was a wrong answer
+        // rather than a null one.
+        fprintf(stderr, "[geom-probe] draw=%llu: transform feedback wrote 0 vertices "
+                        "(the capture was declared, so the draw produced no primitives)\n",
+                geom_target_label);
+    }
+}
+
+// The backend's LIFETIME timing aggregates, and the periodic stderr windows behind
+// PROSPER_BACKEND_TIMING_WINDOWS. `render_draw_pass_rgba` reaches this only after it has filled
+// `call_timing` for the F8 caller, and only when PROSPER_RENDER_TIMING also asked for the log --
+// so nothing here runs on a default boot. The two totals are `static` for the same reason they
+// were statics of that function: they accumulate across calls, and one instance of an inline
+// function's static is shared by every translation unit, which is the property being preserved.
+//
+// Read the numbers with the charter's warning in mind: which harness produced a rate, and when.
+inline void accumulate_backend_render_timing(const BackendRenderTimingStats& call_timing,
+                                             std::span<const BackendDraw> draws,
+                                             const BackendTextureUploadStats& texture_stats,
+                                             const BackendResourceReuseStats& resource_reuse_stats,
+                                             const BackendPipelineCacheStats& pipeline_stats) {
+    struct TimingTotals {
+        uint64_t calls = 0, draws = 0;
+        uint64_t command_buffers = 0, queue_submits = 0, fence_waits = 0;
+        uint64_t cache_pressure_flushes = 0;
+        double cache_pressure_ms = 0;
+        uint64_t gpu_timestamp_samples = 0;
+        uint64_t texture_references = 0, texture_uploads = 0, texture_upload_bytes = 0;
+        uint64_t persistent_hits = 0, persistent_misses = 0, persistent_cached_bytes = 0;
+        uint64_t texture_binding_references = 0, unique_texture_bindings = 0;
+        uint64_t buffer_references = 0, unique_buffers = 0;
+        uint64_t descriptor_layout_references = 0, unique_descriptor_layouts = 0;
+        uint64_t pipeline_layout_references = 0, unique_pipeline_layouts = 0;
+        uint64_t pipeline_references = 0, pipeline_hits = 0, pipeline_misses = 0;
+        uint64_t pipeline_bypasses = 0, pipeline_entries = 0, pipeline_evictions = 0;
+        double target = 0, draw_setup = 0, record = 0, gpu_wait = 0, gpu_device = 0;
+        double readback = 0, cleanup = 0;
+        double setup_shader = 0, setup_fixed = 0, setup_resources = 0, setup_pipeline = 0;
+    };
+    static TimingTotals totals;
+    static TimingTotals window;
+    auto accumulate = [&](TimingTotals& timing) {
+        timing.calls++;
+        timing.draws += draws.size();
+        timing.command_buffers += call_timing.command_buffers;
+        timing.queue_submits += call_timing.queue_submits;
+        timing.fence_waits += call_timing.fence_waits;
+        timing.cache_pressure_flushes += call_timing.flush_cache_pressure;
+        timing.cache_pressure_ms += call_timing.cache_pressure_ms;
+        timing.gpu_timestamp_samples += call_timing.gpu_timestamp_samples;
+        timing.texture_references += texture_stats.references;
+        timing.texture_uploads += texture_stats.unique_uploads;
+        timing.texture_upload_bytes += texture_stats.upload_bytes;
+        timing.persistent_hits += texture_stats.persistent_hits;
+        timing.persistent_misses += texture_stats.persistent_misses;
+        timing.persistent_cached_bytes = texture_stats.persistent_cached_bytes;
+        timing.texture_binding_references += resource_reuse_stats.texture_binding_references;
+        timing.unique_texture_bindings += resource_reuse_stats.unique_texture_bindings;
+        timing.buffer_references += resource_reuse_stats.buffer_references;
+        timing.unique_buffers += resource_reuse_stats.unique_buffers;
+        timing.descriptor_layout_references +=
+            resource_reuse_stats.descriptor_set_layout_references;
+        timing.unique_descriptor_layouts +=
+            resource_reuse_stats.unique_descriptor_set_layouts;
+        timing.pipeline_layout_references += resource_reuse_stats.pipeline_layout_references;
+        timing.unique_pipeline_layouts += resource_reuse_stats.unique_pipeline_layouts;
+        timing.pipeline_references += pipeline_stats.references;
+        timing.pipeline_hits += pipeline_stats.hits;
+        timing.pipeline_misses += pipeline_stats.misses;
+        timing.pipeline_bypasses += pipeline_stats.bypasses;
+        timing.pipeline_entries = pipeline_stats.entries;
+        timing.pipeline_evictions += pipeline_stats.evictions;
+        timing.target += call_timing.target_ms;
+        timing.draw_setup += call_timing.draw_setup_ms;
+        timing.record += call_timing.record_upload_ms;
+        timing.gpu_wait += call_timing.gpu_wait_ms;
+        timing.gpu_device += call_timing.gpu_device_ms;
+        timing.readback += call_timing.readback_ms;
+        timing.cleanup += call_timing.cleanup_ms;
+        timing.setup_shader += call_timing.setup_shader_ms;
+        timing.setup_fixed += call_timing.setup_fixed_ms;
+        timing.setup_resources += call_timing.setup_resources_ms;
+        timing.setup_pipeline += call_timing.setup_pipeline_ms;
+    };
+    accumulate(totals);
+    accumulate(window);
+    static const bool print_backend_timing_windows =
+        getenv("PROSPER_BACKEND_TIMING_WINDOWS") != nullptr;
+    if (print_backend_timing_windows && totals.calls % 25 == 0) {
+        const double n = static_cast<double>(totals.calls);
+        const double total = totals.target + totals.draw_setup + totals.record +
+                             totals.gpu_wait + totals.readback + totals.cleanup;
+        fprintf(stderr,
+                "[render-timing] backend calls=%llu draws=%llu avg_ms: total=%.2f target=%.2f "
+                "draw_setup=%.2f record_upload=%.2f gpu_wait=%.2f gpu_device=%.2f "
+                "gpu_overhead=%.2f readback=%.2f cleanup=%.2f\n",
+                (unsigned long long)totals.calls, (unsigned long long)totals.draws, total / n,
+                totals.target / n, totals.draw_setup / n, totals.record / n,
+                totals.gpu_wait / n, totals.gpu_device / n,
+                std::max(0.0, totals.gpu_wait - totals.gpu_device) / n,
+                totals.readback / n, totals.cleanup / n);
+        fprintf(stderr,
+                "[render-timing] backend synchronization command_buffers=%llu queue_submits=%llu "
+                "fence_waits=%llu gpu_timestamps=%llu cache_pressure=%llu %.2f ms\n",
+                (unsigned long long)totals.command_buffers,
+                (unsigned long long)totals.queue_submits,
+                (unsigned long long)totals.fence_waits,
+                (unsigned long long)totals.gpu_timestamp_samples,
+                (unsigned long long)totals.cache_pressure_flushes,
+                totals.cache_pressure_ms);
+        fprintf(stderr,
+                "[render-timing] draw_setup avg_ms: shaders=%.2f fixed=%.2f resources=%.2f pipeline=%.2f\n",
+                totals.setup_shader / n, totals.setup_fixed / n,
+                totals.setup_resources / n, totals.setup_pipeline / n);
+        fprintf(stderr,
+                "[render-timing] backend textures refs=%llu uploads=%llu %.1f MiB "
+                "persistent=%llu/%llu cache=%.1f MiB\n",
+                (unsigned long long)totals.texture_references,
+                (unsigned long long)totals.texture_uploads,
+                totals.texture_upload_bytes / (1024.0 * 1024.0),
+                (unsigned long long)totals.persistent_hits,
+                (unsigned long long)totals.persistent_misses,
+                totals.persistent_cached_bytes / (1024.0 * 1024.0));
+        fprintf(stderr,
+                "[render-timing] backend pipelines refs=%llu hits=%llu misses=%llu bypass=%llu "
+                "entries=%llu evictions=%llu\n",
+                (unsigned long long)totals.pipeline_references,
+                (unsigned long long)totals.pipeline_hits,
+                (unsigned long long)totals.pipeline_misses,
+                (unsigned long long)totals.pipeline_bypasses,
+                (unsigned long long)totals.pipeline_entries,
+                (unsigned long long)totals.pipeline_evictions);
+        const RenderMemoryPoolStats pool = render_memory_pool_stats();
+        fprintf(stderr,
+                "[render-timing] memory_pool hits=%llu misses=%llu cached=%zu %.1f MiB "
+                "discarded=%llu\n",
+                (unsigned long long)pool.hits, (unsigned long long)pool.misses,
+                pool.cached_allocations,
+                static_cast<double>(pool.cached_bytes) / (1024.0 * 1024.0),
+                (unsigned long long)pool.discarded);
+        const RenderHostBufferPoolStats buffer_pool = render_host_buffer_pool_stats();
+        fprintf(stderr,
+                "[render-timing] backend_buffer_pool hits=%llu misses=%llu cached=%zu %.1f MiB "
+                "evictions=%llu\n",
+                (unsigned long long)buffer_pool.hits,
+                (unsigned long long)buffer_pool.misses,
+                buffer_pool.cached_buffers,
+                static_cast<double>(buffer_pool.cached_bytes) / (1024.0 * 1024.0),
+                (unsigned long long)buffer_pool.evictions);
+        const double wn = static_cast<double>(window.calls);
+        const double window_total = window.target + window.draw_setup + window.record +
+                                    window.gpu_wait + window.readback + window.cleanup;
+        fprintf(stderr,
+                "[render-window] backend calls=%llu draws=%.1f avg_ms: total=%.2f target=%.2f "
+                "draw_setup=%.2f record_upload=%.2f gpu_wait=%.2f gpu_device=%.2f "
+                "gpu_overhead=%.2f readback=%.2f cleanup=%.2f\n",
+                (unsigned long long)window.calls, window.draws / wn, window_total / wn,
+                window.target / wn, window.draw_setup / wn, window.record / wn,
+                window.gpu_wait / wn, window.gpu_device / wn,
+                std::max(0.0, window.gpu_wait - window.gpu_device) / wn,
+                window.readback / wn, window.cleanup / wn);
+        fprintf(stderr,
+                "[render-window] backend synchronization command_buffers=%.1f queue_submits=%.1f "
+                "fence_waits=%.1f gpu_timestamps=%.1f cache_pressure=%.1f %.2f ms\n",
+                window.command_buffers / wn, window.queue_submits / wn,
+                window.fence_waits / wn, window.gpu_timestamp_samples / wn,
+                window.cache_pressure_flushes / wn, window.cache_pressure_ms / wn);
+        fprintf(stderr,
+                "[render-window] draw_setup avg_ms: shaders=%.2f fixed=%.2f resources=%.2f pipeline=%.2f\n",
+                window.setup_shader / wn, window.setup_fixed / wn,
+                window.setup_resources / wn, window.setup_pipeline / wn);
+        fprintf(stderr,
+                "[render-window] backend textures refs=%.1f uploads=%.1f %.1f MiB "
+                "persistent=%.1f/%.1f cache=%.1f MiB\n",
+                window.texture_references / wn, window.texture_uploads / wn,
+                window.texture_upload_bytes / (wn * 1024.0 * 1024.0),
+                window.persistent_hits / wn, window.persistent_misses / wn,
+                window.persistent_cached_bytes / (1024.0 * 1024.0));
+        fprintf(stderr,
+                "[render-window] backend resources texture_bindings=%.1f/%.1f "
+                "buffers=%.1f/%.1f descriptor_layouts=%.1f/%.1f "
+                "pipeline_layouts=%.1f/%.1f\n",
+                window.texture_binding_references / wn,
+                window.unique_texture_bindings / wn,
+                window.buffer_references / wn, window.unique_buffers / wn,
+                window.descriptor_layout_references / wn,
+                window.unique_descriptor_layouts / wn,
+                window.pipeline_layout_references / wn,
+                window.unique_pipeline_layouts / wn);
+        fprintf(stderr,
+                "[render-window] backend pipelines refs=%.1f hits=%.1f misses=%.1f bypass=%.1f "
+                "entries=%llu evictions=%.1f\n",
+                window.pipeline_references / wn, window.pipeline_hits / wn,
+                window.pipeline_misses / wn, window.pipeline_bypasses / wn,
+                (unsigned long long)window.pipeline_entries, window.pipeline_evictions / wn);
+        window = {};
+    }
+}
+
 inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> draws,
                                                   uint32_t W, uint32_t H,
                                                   const uint8_t* seed_rgba = nullptr,
@@ -8150,67 +8840,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     // wrong reverse-Z depth value); this reports whether it is happening again on the depth side,
     // which the derived float alone cannot show. A pass whose draws are predominantly GREATER but
     // whose value came out 1.0 is rejecting its own geometry.
-    if (PROSPER_ENV_ON("PROSPER_DEPTH_CLEAR_WHY") && use_depth) {
-        uint32_t greater = 0, less = 0, other = 0, explicit_clear = 0;
-        uint32_t greater_colour = 0, less_colour = 0;
-        uint32_t reversed_viewports = 0, forward_viewports = 0;
-        float vp_min = -1.0f, vp_max = -1.0f;
-        int first_op = -1;
-        // What DB_DEPTH_CLEAR actually holds, whether or not a draw enables it. #371 forbids
-        // CONSUMING it without an explicit enable -- Astro Bot leaves packed 1920x1080 max
-        // coordinates in the register, which read as 2.15e-36 and rejected whole scenes -- but
-        // reading it here is free and says whether a plausible clear value is even present on the
-        // passes that need one. A surface fast-cleared through HTILE metadata sets no draw's
-        // depth_clear_enable, so the value it was cleared to is invisible to the latch above.
-        float first_clear_value = -1.0f;
-        for (const auto& d : logical_draws) {
-            if (!d.ps) continue;
-            if (!(d.ps->depth_test_enable || effective_depth_clear(d.ps))) continue;
-            if (first_op < 0) {
-                first_op = static_cast<int>(d.ps->depth_compare_op);
-                first_clear_value = d.ps->depth_clear_value;
-            }
-            // The viewport depth range, which is how a reverse-Z surface declares itself: a guest
-            // using near=1/far=0 programs min_depth=1, max_depth=0. If the range is the ordinary
-            // 0..1 while the compares are GREATER, the reversal lives in the projection matrix
-            // instead and the stored values are what the shader emits.
-            if (d.ps->has_viewport) {
-                if (d.ps->min_depth > d.ps->max_depth) ++reversed_viewports;
-                else ++forward_viewports;
-                vp_min = d.ps->min_depth; vp_max = d.ps->max_depth;
-            }
-            if (d.ps->depth_clear_enable) ++explicit_clear;
-            // Split by whether the draw WRITES COLOUR. The initial value should serve the draws
-            // whose output is lost when they fail, and a depth-only or mask draw loses nothing
-            // visible. Plain majority ignored this and reproduced the old answer on exactly the
-            // passes that matter (7 vs 7, and 6 vs 7 the wrong way).
-            const bool writes_colour = std::any_of(
-                d.ps->color_targets.begin(), d.ps->color_targets.end(),
-                [](const auto& t) { return t.write_mask != 0; });
-            switch (d.ps->depth_compare_op) {
-                case VK_COMPARE_OP_GREATER: case VK_COMPARE_OP_GREATER_OR_EQUAL:
-                    ++greater; if (writes_colour) ++greater_colour; break;
-                case VK_COMPARE_OP_LESS: case VK_COMPARE_OP_LESS_OR_EQUAL:
-                    ++less; if (writes_colour) ++less_colour; break;
-                default: ++other; break;
-            }
-        }
-        static std::mutex why_mutex;
-        static std::map<std::tuple<uint64_t, float, uint32_t, uint32_t, uint32_t>, uint64_t> seen;
-        std::lock_guard lock(why_mutex);
-        const uint64_t n = ++seen[{color_target ? color_target->persistent_id : 0ull,
-                                   depth_clear, greater, less, other}];
-        if ((n & (n - 1)) == 0)
-            fprintf(stderr,
-                    "[depth-clear-why] target=0x%llx derived=%.3f reg_clear=%.6g first_op=%d "
-                    "explicit=%u compares{greater=%u less=%u other=%u} "
-                    "colour{greater=%u less=%u} vp{min=%g max=%g rev=%u fwd=%u} "
-                    "draws=%zu (x%llu)\n",
-                    (unsigned long long)(color_target ? color_target->persistent_id : 0ull),
-                    depth_clear, first_clear_value, first_op, explicit_clear, greater, less, other,
-                    greater_colour, less_colour, vp_min, vp_max, reversed_viewports,
-                    forward_viewports, logical_draws.size(), (unsigned long long)n);
-    }
+    if (PROSPER_ENV_ON("PROSPER_DEPTH_CLEAR_WHY") && use_depth)
+        report_depth_clear_derivation(logical_draws, color_target, depth_clear);
     if (const char* v = PROSPER_ENV_VALUE("PROSPER_DEPTH_CLEAR"))
         depth_clear = strtof(v, nullptr);
     if (getenv("PROSPER_NO_DEPTH"))   use_depth = false;     // diag: isolate depth-test rejection
@@ -8331,44 +8962,10 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     const VkImageLayout self_depth_layout = format_has_stencil && stencil_may_be_written
         ? VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_STENCIL_ATTACHMENT_OPTIMAL
         : VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
-    if (PROSPER_ENV_ON("PROSPER_DSLOG")) {
-        static uint64_t call_id = 0;
-        const uint64_t id = ++call_id;
-        fprintf(stderr,
-                "[ds] call=%llu size=%ux%u draws=%zu use=%d/%d persistent=%d valid=%d/%d/%d "
-                "key=%llx/%llx/%llx/%llx htile=%llx fmt=%u initial=%g/%u\n",
-                (unsigned long long)id, W, H, draws.size(), (int)use_depth, (int)use_stencil,
-                (int)persistent_ds, (int)ds_layout_initialized,
-                (int)depth_was_valid, (int)stencil_was_valid,
-                (unsigned long long)ds_key.dr, (unsigned long long)ds_key.dw,
-                (unsigned long long)ds_key.sr, (unsigned long long)ds_key.sw,
-                (unsigned long long)ds_key.htile, ds_key.fmt, depth_clear, stencil_clear);
-        for (size_t i = 0; i < draws.size(); ++i) {
-            const auto* ps = draws[i].ps;
-            if (!ps) {
-                fprintf(stderr, "[ds] call=%llu draw=%zu state=none\n",
-                        (unsigned long long)id, i);
-                continue;
-            }
-            fprintf(stderr,
-                    "[ds] call=%llu draw=%zu bases=%llx/%llx/%llx/%llx "
-                    "depth=%d/%d/op%u clear=%d/%g stencil=%d clear=%d/%u "
-                    "view=%08x htile=%llx hsurf=%08x info=%08x/%08x/%08x "
-                    "size=%08x/%08x/%08x\n",
-                    (unsigned long long)id, i,
-                    (unsigned long long)ps->depth_read_base,
-                    (unsigned long long)ps->depth_write_base,
-                    (unsigned long long)ps->stencil_read_base,
-                    (unsigned long long)ps->stencil_write_base,
-                    (int)ps->depth_test_enable, (int)ps->depth_write_enable,
-                    ps->depth_compare_op, (int)ps->depth_clear_enable, ps->depth_clear_value,
-                    (int)ps->stencil_enable, (int)ps->stencil_clear_enable,
-                    ps->stencil_clear_value, ps->db_depth_view,
-                    (unsigned long long)ps->htile_data_base, ps->db_htile_surface,
-                    ps->db_depth_info, ps->db_z_info, ps->db_stencil_info,
-                    ps->db_depth_size_xy, ps->db_depth_size, ps->db_depth_slice);
-        }
-    }
+    if (PROSPER_ENV_ON("PROSPER_DSLOG"))
+        report_backend_ds_state(W, H, draws, use_depth, use_stencil, persistent_ds,
+                                ds_layout_initialized, depth_was_valid, stencil_was_valid,
+                                ds_key, depth_clear, stencil_clear);
 
     // Protect every GPU target sampled by this call from LRU eviction while its descriptors are built.
     for (const auto& draw : draws)
@@ -13316,125 +13913,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     }
     if (timing_enabled && flush_now)
         active_submission.end_gpu_timestamp(cmd);
-    if (buffer_verify_enabled) {
-        // Compare the mapped allocation against the source words. A mismatch names the first
-        // differing BYTE, because what this is used to localize is an offset, not a boolean.
-        //
-        // WHAT IT CAN AND CANNOT SEE, precisely, because the difference decides what a zero from it
-        // is allowed to retire. On the branch this examines, `upload.range` is assigned the same
-        // `bytes` that drove the memcpy and that `word_count` describes, so `source_bytes` and
-        // `device_bytes` are equal BY CONSTRUCTION: a short upload is structurally inexpressible
-        // here and this check can never observe one. What it does observe is the destination range
-        // being CLOBBERED after the memcpy and before the pass is submitted -- an overlapping arena
-        // slice, a stray write, a pooled buffer handed out twice. Truncation is BUFLOG's and
-        // `[buffer-truncated]`'s question; do not quote a zero from here against it.
-        //
-        // The other direction is a false POSITIVE: `#1268` above deliberately tolerates cross-thread
-        // guest writes to the source words, so a guest that rewrites them after the memcpy produces
-        // a MISMATCH that is not a prosper defect. Check the guest before blaming the upload.
-        uint64_t parsed = 0;
-        bool arming_rejected = false;
-        auto strict = [&](const char* name, size_t& out, size_t unset) {
-            const char* text = getenv(name);
-            if (!text || !*text) { out = unset; return; }
-            // The UINT32_MAX bound is not pedantry: `binding` is compared as uint32_t below, so a
-            // value above it would truncate and aim the control at a DIFFERENT binding while still
-            // printing a confident MUTATED line -- the same silent-misaim this strict parse exists
-            // to prevent, one range check further out.
-            if (prosper::diag::parse_u64_auto_base(text, &parsed) && parsed <= UINT32_MAX) {
-                out = (size_t)parsed;
-                return;
-            }
-            std::fprintf(stderr,
-                         "[bufverify] %s=\"%s\" is not a number in [0, 4294967295] (decimal or 0x "
-                         "hex); the control is DISARMED rather than aimed somewhere unintended\n",
-                         name, text);
-            arming_rejected = true;
-            out = unset;
-        };
-        size_t mutate_offset = SIZE_MAX, mutate_min_bytes = 0, mutate_binding = SIZE_MAX;
-        strict("PROSPER_BUFVERIFY_MUTATE", mutate_offset, SIZE_MAX);
-        strict("PROSPER_BUFVERIFY_MUTATE_BINDING", mutate_binding, SIZE_MAX);
-        strict("PROSPER_BUFVERIFY_MUTATE_MINBYTES", mutate_min_bytes, 0);
-        if (arming_rejected) mutate_offset = SIZE_MAX;
-
-        // The control. A clean zero from the comparison is worth exactly what its ability to report a
-        // dirty one is worth, and nothing in the normal path ever exercises the mismatch branch.
-        // PROSPER_BUFVERIFY_MUTATE corrupts one byte of a device copy so the very next line must name
-        // that offset. It is AIMABLE because a control on a 128-byte uniform buffer says nothing
-        // about a 7 KiB vertex buffer: a control drawn from a different size class than the null
-        // tests the discriminator, not the domain.
-        const BufferVerifyRecord* mutate_target = nullptr;
-        for (const BufferVerifyRecord& cand : buffer_verify_records) {
-            if (mutate_binding != SIZE_MAX && cand.binding != (uint32_t)mutate_binding) continue;
-            if (cand.word_count * sizeof(uint32_t) < mutate_min_bytes) continue;
-            if (cand.upload_index >= shared_buffers.size()) continue;
-            if (!shared_buffers[cand.upload_index].mapped) continue;
-            if (mutate_offset >= (size_t)shared_buffers[cand.upload_index].range) continue;
-            mutate_target = &cand;
-            break;
-        }
-        if (mutate_offset != SIZE_MAX && mutate_target) {
-            const SharedBufferUpload& up = shared_buffers[mutate_target->upload_index];
-            uint8_t* device = static_cast<uint8_t*>(up.mapped) + (size_t)up.offset;
-            device[mutate_offset] = (uint8_t)(device[mutate_offset] ^ 0xFF);
-            std::fprintf(stderr,
-                         "[bufverify] MUTATED device byte %zu of set=%u binding=%u source_bytes=%zu "
-                         "-- the next line must report a mismatch at exactly that offset\n",
-                         mutate_offset, mutate_target->set, mutate_target->binding,
-                         mutate_target->word_count * sizeof(uint32_t));
-        } else if (mutate_offset != SIZE_MAX) {
-            // Silence here is indistinguishable from a clean run, which is the whole failure this
-            // control exists to prevent. Say so.
-            std::fprintf(stderr,
-                         "[bufverify] CONTROL DID NOT FIRE: no recorded buffer matched "
-                         "binding=%s minbytes=%zu with a host mapping and offset %zu in range. "
-                         "The \"0 mismatched\" below is UNVALIDATED\n",
-                         mutate_binding == SIZE_MAX ? "any" : std::to_string(mutate_binding).c_str(),
-                         mutate_min_bytes, mutate_offset);
-        }
-
-        size_t checked = 0, mismatched = 0, skipped_unmapped = 0;
-        for (const BufferVerifyRecord& rec : buffer_verify_records) {
-            if (rec.upload_index >= shared_buffers.size()) { ++skipped_unmapped; continue; }
-            const SharedBufferUpload& up = shared_buffers[rec.upload_index];
-            // A transient (non-arena, non-pooled) upload unmaps its memory before returning, so it
-            // has no host mapping to re-read and is skipped. That is a WHOLE CLASS, not an oddity:
-            // PROSPER_NO_BACKEND_BUFFER_POOL sends every upload down that path, and without the
-            // count below such a run would print an authoritative-looking "0 mismatched" having
-            // verified nothing at all.
-            if (!up.mapped || !rec.words || !rec.word_count) { ++skipped_unmapped; continue; }
-            const size_t source_bytes = rec.word_count * sizeof(uint32_t);
-            const size_t device_bytes = (size_t)up.range;
-            const uint8_t* device = static_cast<const uint8_t*>(up.mapped) + (size_t)up.offset;
-            const uint8_t* source = reinterpret_cast<const uint8_t*>(rec.words);
-            ++checked;
-            const size_t common = source_bytes < device_bytes ? source_bytes : device_bytes;
-            if (std::memcmp(device, source, common) == 0 && source_bytes == device_bytes) continue;
-            size_t first_bad = SIZE_MAX;
-            for (size_t b = 0; b < common; ++b)
-                if (device[b] != source[b]) { first_bad = b; break; }
-            ++mismatched;
-            if (mismatched <= 32)
-                std::fprintf(stderr,
-                             "[bufverify] MISMATCH set=%u binding=%u id=%llx source_bytes=%zu "
-                             "device_bytes=%zu first_differing_byte=%s (vertex %s at stride 32)\n",
-                             rec.set, rec.binding, (unsigned long long)rec.identity,
-                             source_bytes, device_bytes,
-                             first_bad == SIZE_MAX ? "none (size differs only)"
-                                                   : std::to_string(first_bad).c_str(),
-                             first_bad == SIZE_MAX ? "-" : std::to_string(first_bad / 32).c_str());
-        }
-        if (!checked && !buffer_verify_records.empty())
-            std::fprintf(stderr,
-                         "[bufverify] NOTHING WAS VERIFIED: all %zu recorded buffer(s) lack a host "
-                         "mapping (transient uploads). A zero from this run means the check never "
-                         "ran, not that the uploads are correct\n",
-                         buffer_verify_records.size());
-        std::fprintf(stderr,
-                     "[bufverify] %zu buffer(s) re-read from device memory, %zu mismatched, "
-                     "%zu skipped (no host mapping)\n", checked, mismatched, skipped_unmapped);
-    }
+    if (buffer_verify_enabled)
+        report_backend_buffer_verify(buffer_verify_records, shared_buffers);
 
     vkEndCommandBuffer(cmd);
 
@@ -13522,35 +14002,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         // valid is either never really written or is having its write disclaimed here, and those
         // are different defects. GTA V's cube shadows show exactly that shape: every face has a
         // cache entry, and slice 0 is never valid.
-        if (PROSPER_ENV_ON("PROSPER_DS_SLICE_CENSUS")) {
-            static std::mutex mutex;
-            struct SliceTally { uint64_t passes = 0, claimed = 0, used_depth = 0, meaningful = 0; };
-            static std::map<std::pair<uint64_t, uint32_t>, SliceTally> tally;
-            static uint64_t n = 0;
-            std::lock_guard lock(mutex);
-            auto& row = tally[{ds_key.dr, ds_key.slice}];
-            ++row.passes;
-            if (use_depth) ++row.used_depth;
-            if (depth_used_meaningfully) ++row.meaningful;
-            if (use_depth && depth_used_meaningfully) ++row.claimed;
-            // Increment SEQUENCED before the test -- see the same fix in live_renderer.cpp.
-            // `(++n) & (n - 1)` has no sequencing between the operands of `&`, so this
-            // throttle's cadence was undefined. Do not fold these back together.
-            ++n;
-            if ((n & (n - 1)) == 0 && n >= 256) {
-                fprintf(stderr, "[ds-slice] after %llu DS passes:\n", (unsigned long long)n);
-                for (const auto& e : tally)
-                    fprintf(stderr,
-                            "[ds-slice]   base=0x%llx slice=%u passes=%llu use_depth=%llu "
-                            "meaningful=%llu claimed_valid=%llu%s\n",
-                            (unsigned long long)e.first.first, e.first.second,
-                            (unsigned long long)e.second.passes,
-                            (unsigned long long)e.second.used_depth,
-                            (unsigned long long)e.second.meaningful,
-                            (unsigned long long)e.second.claimed,
-                            e.second.claimed ? "" : "   <-- never claims a depth write");
-            }
-        }
+        if (PROSPER_ENV_ON("PROSPER_DS_SLICE_CENSUS"))
+            report_ds_slice_census(ds_key, use_depth, depth_used_meaningfully);
         cached_ds->layout_initialized = true;
         cached_ds->depth_valid |= use_depth && depth_used_meaningfully;
         cached_ds->stencil_valid |= use_stencil;
@@ -13665,211 +14118,15 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     // Fragment-funnel readback (PROSPER_DRAW_STATS): one line per realized draw showing where its
     // pixels vanished. ds_active implies flush_now (the pool-creation gate above uses the same flush
     // condition), so `cmd` has completed and the results are ready. Pools are destroyed unconditionally.
-    if (ds_active) {
-        const uint32_t nq = static_cast<uint32_t>(dv.size());
-        if (batch_completed) {
-            std::vector<uint64_t> sres(static_cast<size_t>(nq) * 5, 0);  // 4 statistics + availability
-            std::vector<uint64_t> ores(static_cast<size_t>(nq) * 2, 0);  // occlusion samples + availability
-            vkGetQueryPoolResults(dev, ds_stats_pool, 0, nq, sres.size() * sizeof(uint64_t), sres.data(),
-                                  5 * sizeof(uint64_t),
-                                  VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
-            vkGetQueryPoolResults(dev, ds_occ_pool, 0, nq, ores.size() * sizeof(uint64_t), ores.data(),
-                                  2 * sizeof(uint64_t),
-                                  VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
-            for (uint32_t i = 0; i < nq; i++) {
-                if (!sres[i * 5 + 4]) continue;  // unavailable -> draw was skipped (v.ok == false)
-                const uint64_t verts = sres[i * 5 + 0], prims = sres[i * 5 + 1],
-                               clip = sres[i * 5 + 2], fs = sres[i * 5 + 3];
-                const uint64_t samp = ores[i * 2 + 1] ? ores[i * 2 + 0] : 0;
-                // Funnel classification, checked in pipeline order. `samples` (occlusion) is the ground
-                // truth for "survived the depth+stencil test" — it is counted even when the fragment
-                // shader is optimised out for a colour-write-disabled (stencil-only) draw, so it must be
-                // tested before fs_inv or such draws look falsely dead.
-                const char* tag =
-                    (prims == 0) ? "NO-GEOMETRY(no primitives)" :
-                    (clip  == 0) ? "GEOMETRY-VANISH(clipped/degenerate/offscreen)" :
-                    (samp  >  0) ? "passed-samples(colour/stencil written)" :
-                    (fs    >  0) ? "TEST-KILLED(depth/stencil rejected all)" :
-                                   "NO-RASTER(cull/scissor/zero-area)";
-                const uint64_t draw_index = draws[i].draw_index != UINT64_MAX
-                    ? draws[i].draw_index : i;
-                fprintf(stderr,
-                        "[draw-stats] draw=%llu verts=%llu prims=%llu after_clip=%llu fs_inv=%llu samples=%llu %s\n",
-                        (unsigned long long)draw_index,
-                        (unsigned long long)verts, (unsigned long long)prims,
-                        (unsigned long long)clip, (unsigned long long)fs, (unsigned long long)samp, tag);
-            }
-        }
-    }
+    if (ds_active)
+        report_draw_stats_funnel(dev, ds_stats_pool, ds_occ_pool, dv, draws,
+                                 batch_completed);
 
     // Geometry-probe readback: report where the probed draw's post-transform clip-space vertices landed.
     // geom_active implies flush_now (same gate as buffer creation), so `cmd` has completed here.
-    if (geom_active) {
-        if (batch_completed) {
-            // The counter buffer holds the byte count transform feedback actually wrote; read only that
-            // many vertices so the uninitialized tail of the (3x-oversized) buffer never pollutes stats.
-            uint32_t written = 0;
-            void* cp = nullptr;
-            if (vkMapMemory(dev, geom_counter_mem, 0, 16, 0, &cp) == VK_SUCCESS) {
-                uint32_t bytes = 0; std::memcpy(&bytes, cp, sizeof bytes);
-                written = std::min(bytes / 16u, geom_cap);
-                vkUnmapMemory(dev, geom_counter_mem);
-            }
-            void* gp = nullptr;
-            if (written && vkMapMemory(dev, geom_mem, 0, static_cast<VkDeviceSize>(written) * 16, 0, &gp) == VK_SUCCESS) {
-                const float* pos = static_cast<const float*>(gp);
-                float minx=1e30f,maxx=-1e30f,miny=1e30f,maxy=-1e30f,minz=1e30f,maxz=-1e30f,minw=1e30f,maxw=-1e30f;
-                uint32_t nan=0, wle0=0, offscreen=0, clipped=0, finite=0;
-                bool all_same = written > 0;
-                for (uint32_t i = 0; i < written; i++) {
-                    const float x=pos[i*4+0], y=pos[i*4+1], z=pos[i*4+2], w=pos[i*4+3];
-                    if (!std::isfinite(x)||!std::isfinite(y)||!std::isfinite(z)||!std::isfinite(w)) { nan++; continue; }
-                    finite++;
-                    minx=std::min(minx,x); maxx=std::max(maxx,x); miny=std::min(miny,y); maxy=std::max(maxy,y);
-                    minz=std::min(minz,z); maxz=std::max(maxz,z); minw=std::min(minw,w); maxw=std::max(maxw,w);
-                    if (w <= 0.0f) wle0++;
-                    if (std::fabs(x) > std::fabs(w) || std::fabs(y) > std::fabs(w)) offscreen++;
-                    // A vertex is on-screen only if it is in front of the camera (w>0) and inside the
-                    // clip cube (|x|,|y| <= w). Everything else is clipped and cannot rasterize.
-                    if (!(w > 0.0f && std::fabs(x) <= w && std::fabs(y) <= w)) clipped++;
-                    if (i && (x!=pos[0]||y!=pos[1]||z!=pos[2]||w!=pos[3])) all_same = false;
-                }
-                const uint32_t onscreen = finite - clipped;
-                // Classification is descriptive (read it WITH the funnel, which owns the vanishes verdict):
-                // a large quad whose verts sit just outside the cube still rasterizes via clipping, so
-                // "all verts outside" is not the same as "renders nothing" — the bbox tells them apart.
-                const char* tag =
-                    finite == 0             ? "ALL-NAN/INF(numeric defect)" :
-                    all_same                ? "DEGENERATE(all verts collapse to one clip point)" :
-                    wle0 == finite          ? "ALL-BEHIND-CAMERA(w<=0: transform/w defect)" :
-                    clipped == finite       ? "ALL-VERTS-OUTSIDE-CLIP-CUBE(see bbox: off-screen shift or oversized quad)" :
-                    onscreen * 20u < finite ? "MOSTLY-OUTSIDE(<5% verts on-screen; see bbox)" :
-                                              "on-screen(geometry spread across clip space)";
-                // Shader I/O tap mode (PROSPER_SHADER_TAP): the captured "positions" are actually the tapped
-                // intermediate VGPR (dst..dst+3) at that PC, so print the raw hex too (values are often
-                // integers/bitfields, not clip floats) and skip the meaningless clip classification.
-                // Gated on the REQUEST, not on whether the redirect happened -- and those differ
-                // (#2064). tap_vec is set only when the instruction at tap_pc is walked, so a
-                // tap_pc after this shader's EXP POS0 exports the REAL clip position while this
-                // header still says "the tapped VGPR". The recompiler now prints
-                // `[shader-tap] NOT APPLIED ...` naming the PC in that case, so the two lines
-                // must be read together: this header states what was ASKED FOR, and the ABSENCE
-                // of a NOT APPLIED line is what says it was delivered.
-                const bool is_tap = PROSPER_ENV_ON("PROSPER_SHADER_TAP");
-                if (is_tap)
-                    fprintf(stderr, "[geom-probe] draw=%llu SHADER-TAP REQUESTED (see any [shader-tap] NOT APPLIED line for this shader, which means these are the REAL clip positions -- #2064): values below are the tapped VGPR "
-                                    "(dst+3) at that PC, not clip positions (bbox/tags meaningless)\n",
-                            geom_target_label);
-                else
-                    fprintf(stderr, "[geom-probe] draw=%llu verts-written=%u finite=%u on-screen=%u clipped=%u "
-                                    "(offscreen=%u w<=0=%u nan/inf=%u)\n"
-                                    "[geom-probe]   clip-bbox x[%g,%g] y[%g,%g] z[%g,%g] w[%g,%g] -> %s\n",
-                            geom_target_label, written, finite, onscreen, clipped, offscreen, wle0, nan,
-                            minx,maxx, miny,maxy, minz,maxz, minw,maxw, tag);
-                for (uint32_t i = 0; i < written && i < (is_tap ? 8u : 4u); i++) {
-                    if (is_tap) {
-                        uint32_t h[4]; std::memcpy(h, &pos[i*4], 16);
-                        fprintf(stderr, "[geom-probe]   v%u = float(%g, %g, %g, %g) hex(%08x %08x %08x %08x)\n",
-                                i, pos[i*4+0], pos[i*4+1], pos[i*4+2], pos[i*4+3], h[0], h[1], h[2], h[3]);
-                    } else {
-                        fprintf(stderr, "[geom-probe]   v%u = (%g, %g, %g, %g)\n",
-                                i, pos[i*4+0], pos[i*4+1], pos[i*4+2], pos[i*4+3]);
-                    }
-                }
-                // Geometry-health metrics (#1257): the transform-feedback buffer already holds every
-                // post-transform vertex in primitive-assembly order, so consecutive triples ARE the
-                // rasterized triangles (TF decomposes strips/fans into triangles). Report the tells that
-                // localize a geometry/vertex-fetch bug — the exact signals that cracked GTA #1163's
-                // vertex-count inflation: how many DISTINCT positions the draw really has (a shared VB pool
-                // read past its real range collapses most verts onto a few points), what fraction of
-                // triangles are DEGENERATE (zero-area stitching / collapsed fetch), and how many triangles
-                // are exact DUPLICATES (the same triangle rasterized N times = pure overdraw). Overdraw
-                // itself is the funnel's job (occlusion samples > covered pixels): read this WITH
-                // PROSPER_DRAW_STATS. Skipped in tap mode (pos holds VGPR values, not positions).
-                if (!is_tap && written >= 3) {
-                    std::vector<std::array<float, 4>> verts;   // finite positions, for unique/multiplicity
-                    verts.reserve(written);
-                    for (uint32_t i = 0; i < written; i++) {
-                        const float x = pos[i*4+0], y = pos[i*4+1], z = pos[i*4+2], w = pos[i*4+3];
-                        if (std::isfinite(x) && std::isfinite(y) && std::isfinite(z) && std::isfinite(w))
-                            verts.push_back({x, y, z, w});
-                    }
-                    std::sort(verts.begin(), verts.end());
-                    uint32_t unique_pos = 0, max_mult = 0, run = 0;
-                    for (size_t i = 0; i < verts.size(); i++) {
-                        if (i == 0 || verts[i] != verts[i-1]) { unique_pos++; run = 1; } else run++;
-                        max_mult = std::max(max_mult, run);
-                    }
-                    // Per-triangle (over FINITE triangles only): degenerate (near-zero NDC area) + exact
-                    // duplicates (canonical key). Non-finite triangles are a numeric defect already reported
-                    // by the probe's nan/inf count, and are skipped here so no NaN enters std::sort (a NaN
-                    // breaks the strict-weak-ordering -> UB); their vertices are also excluded from `verts`.
-                    const uint32_t ntri = written / 3u;
-                    uint32_t degenerate = 0, finite_tri = 0;
-                    std::vector<std::array<float, 12>> tris;
-                    tris.reserve(ntri);
-                    for (uint32_t t = 0; t < ntri; t++) {
-                        const float* p = &pos[t*3*4];
-                        bool fin = true;
-                        for (int k = 0; k < 12; k++) if (!std::isfinite(p[k])) { fin = false; break; }
-                        if (!fin) continue;
-                        finite_tri++;
-                        auto ndc = [&](int k, int c) {   // p[k*4+3] is finite here
-                            float v = p[k*4+c], w = p[k*4+3];
-                            return w != 0.0f ? v / w : v;
-                        };
-                        const float ax = ndc(0,0), ay = ndc(0,1), bx = ndc(1,0), by = ndc(1,1),
-                                    cx = ndc(2,0), cy = ndc(2,1);
-                        const float area2 = (bx-ax)*(cy-ay) - (cx-ax)*(by-ay);
-                        if (std::fabs(area2) < 1e-10f) degenerate++;
-                        // Canonical key: the triangle's three (x,y,z,w) vertices sorted, so a duplicate
-                        // triangle in any winding/rotation collides.
-                        std::array<std::array<float,4>,3> v3 = {{
-                            {p[0],p[1],p[2],p[3]}, {p[4],p[5],p[6],p[7]}, {p[8],p[9],p[10],p[11]} }};
-                        std::sort(v3.begin(), v3.end());
-                        tris.push_back({v3[0][0],v3[0][1],v3[0][2],v3[0][3],
-                                        v3[1][0],v3[1][1],v3[1][2],v3[1][3],
-                                        v3[2][0],v3[2][1],v3[2][2],v3[2][3]});
-                    }
-                    std::sort(tris.begin(), tris.end());
-                    uint32_t dup_tri = 0;
-                    for (size_t i = 1; i < tris.size(); i++) if (tris[i] == tris[i-1]) dup_tri++;
-                    const uint32_t real_tri = finite_tri - degenerate;
-                    const char* health =
-                        finite && unique_pos <= 2                      ? "COLLAPSED(<=2 distinct positions - fetch/transform returns a constant)" :
-                        finite_tri && degenerate * 5u >= finite_tri*4u ? "DEGENERATE-HEAVY(>=80% zero-area - strip-stitching read as list, or wrong count/stride)" :
-                        dup_tri && dup_tri * 4u >= real_tri            ? "DUPLICATE-TRIANGLES(exact repeats = pure overdraw - likely over-count/wrong vertex range)" :
-                                                                         "ok(check PROSPER_DRAW_STATS for overdraw: samples>pixels)";
-                    fprintf(stderr, "[geom-health] draw=%llu verts=%u unique-pos=%u (max-mult=%u) "
-                                    "triangles=%u degenerate=%u(%.0f%%) real=%u duplicate-tri=%u -> %s\n",
-                            geom_target_label, (unsigned)verts.size(), unique_pos, max_mult, finite_tri, degenerate,
-                            finite_tri ? 100.0 * degenerate / finite_tri : 0.0, real_tri, dup_tri, health);
-                }
-                // PROSPER_GEOM_PROBE_DUMP=path (gated, off by default): write EVERY post-transform vertex
-                // (x,y,z,w in primitive-assembly order — for a triangle list, consecutive triples are the
-                // rasterized triangles) as CSV, so per-triangle overlap/degeneracy can be analyzed offline
-                // (e.g. GTA #1163's stencil over-count from self-overlapping mask triangles).
-                if (const char* dp = PROSPER_ENV_VALUE("PROSPER_GEOM_PROBE_DUMP")) {
-                    if (FILE* f = fopen(dp, "w")) {
-                        fprintf(f, "i,x,y,z,w\n");
-                        for (uint32_t i = 0; i < written; i++)
-                            fprintf(f, "%u,%.7g,%.7g,%.7g,%.7g\n",
-                                    i, pos[i*4+0], pos[i*4+1], pos[i*4+2], pos[i*4+3]);
-                        fclose(f);
-                        fprintf(stderr, "[geom-probe]   wrote %u verts -> %s\n", written, dp);
-                    }
-                }
-                vkUnmapMemory(dev, geom_mem);
-            } else if (!written) {
-                // Supportable only because arming proved OpExecutionMode Xfb is present on the last
-                // pre-rasterization stage (#3248); without that check this line was a wrong answer
-                // rather than a null one.
-                fprintf(stderr, "[geom-probe] draw=%llu: transform feedback wrote 0 vertices "
-                                "(the capture was declared, so the draw produced no primitives)\n",
-                        geom_target_label);
-            }
-        }
-    }
+    if (geom_active && batch_completed)
+        report_geometry_probe_readback(dev, geom_counter_mem, geom_mem, geom_cap,
+                                       geom_target_label);
 
     if (storage_writeback_requested && batch_completed) {
         for (SharedTextureUpload& upload : texture_uploads) {
@@ -14259,182 +14516,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         // The live F8 caller consumes call_timing above. Only the explicit environment switch owns
         // the backend lifetime aggregates and optional periodic stderr windows below.
         if (!timing_mode.log) return out;
-        struct TimingTotals {
-            uint64_t calls = 0, draws = 0;
-            uint64_t command_buffers = 0, queue_submits = 0, fence_waits = 0;
-            uint64_t cache_pressure_flushes = 0;
-            double cache_pressure_ms = 0;
-            uint64_t gpu_timestamp_samples = 0;
-            uint64_t texture_references = 0, texture_uploads = 0, texture_upload_bytes = 0;
-            uint64_t persistent_hits = 0, persistent_misses = 0, persistent_cached_bytes = 0;
-            uint64_t texture_binding_references = 0, unique_texture_bindings = 0;
-            uint64_t buffer_references = 0, unique_buffers = 0;
-            uint64_t descriptor_layout_references = 0, unique_descriptor_layouts = 0;
-            uint64_t pipeline_layout_references = 0, unique_pipeline_layouts = 0;
-            uint64_t pipeline_references = 0, pipeline_hits = 0, pipeline_misses = 0;
-            uint64_t pipeline_bypasses = 0, pipeline_entries = 0, pipeline_evictions = 0;
-            double target = 0, draw_setup = 0, record = 0, gpu_wait = 0, gpu_device = 0;
-            double readback = 0, cleanup = 0;
-            double setup_shader = 0, setup_fixed = 0, setup_resources = 0, setup_pipeline = 0;
-        };
-        static TimingTotals totals;
-        static TimingTotals window;
-        auto accumulate = [&](TimingTotals& timing) {
-            timing.calls++;
-            timing.draws += draws.size();
-            timing.command_buffers += call_timing.command_buffers;
-            timing.queue_submits += call_timing.queue_submits;
-            timing.fence_waits += call_timing.fence_waits;
-            timing.cache_pressure_flushes += call_timing.flush_cache_pressure;
-            timing.cache_pressure_ms += call_timing.cache_pressure_ms;
-            timing.gpu_timestamp_samples += call_timing.gpu_timestamp_samples;
-            timing.texture_references += texture_stats.references;
-            timing.texture_uploads += texture_stats.unique_uploads;
-            timing.texture_upload_bytes += texture_stats.upload_bytes;
-            timing.persistent_hits += texture_stats.persistent_hits;
-            timing.persistent_misses += texture_stats.persistent_misses;
-            timing.persistent_cached_bytes = texture_stats.persistent_cached_bytes;
-            timing.texture_binding_references += resource_reuse_stats.texture_binding_references;
-            timing.unique_texture_bindings += resource_reuse_stats.unique_texture_bindings;
-            timing.buffer_references += resource_reuse_stats.buffer_references;
-            timing.unique_buffers += resource_reuse_stats.unique_buffers;
-            timing.descriptor_layout_references +=
-                resource_reuse_stats.descriptor_set_layout_references;
-            timing.unique_descriptor_layouts +=
-                resource_reuse_stats.unique_descriptor_set_layouts;
-            timing.pipeline_layout_references += resource_reuse_stats.pipeline_layout_references;
-            timing.unique_pipeline_layouts += resource_reuse_stats.unique_pipeline_layouts;
-            timing.pipeline_references += pipeline_stats.references;
-            timing.pipeline_hits += pipeline_stats.hits;
-            timing.pipeline_misses += pipeline_stats.misses;
-            timing.pipeline_bypasses += pipeline_stats.bypasses;
-            timing.pipeline_entries = pipeline_stats.entries;
-            timing.pipeline_evictions += pipeline_stats.evictions;
-            timing.target += call_timing.target_ms;
-            timing.draw_setup += call_timing.draw_setup_ms;
-            timing.record += call_timing.record_upload_ms;
-            timing.gpu_wait += call_timing.gpu_wait_ms;
-            timing.gpu_device += call_timing.gpu_device_ms;
-            timing.readback += call_timing.readback_ms;
-            timing.cleanup += call_timing.cleanup_ms;
-            timing.setup_shader += call_timing.setup_shader_ms;
-            timing.setup_fixed += call_timing.setup_fixed_ms;
-            timing.setup_resources += call_timing.setup_resources_ms;
-            timing.setup_pipeline += call_timing.setup_pipeline_ms;
-        };
-        accumulate(totals);
-        accumulate(window);
-        static const bool print_backend_timing_windows =
-            getenv("PROSPER_BACKEND_TIMING_WINDOWS") != nullptr;
-        if (print_backend_timing_windows && totals.calls % 25 == 0) {
-            const double n = static_cast<double>(totals.calls);
-            const double total = totals.target + totals.draw_setup + totals.record +
-                                 totals.gpu_wait + totals.readback + totals.cleanup;
-            fprintf(stderr,
-                    "[render-timing] backend calls=%llu draws=%llu avg_ms: total=%.2f target=%.2f "
-                    "draw_setup=%.2f record_upload=%.2f gpu_wait=%.2f gpu_device=%.2f "
-                    "gpu_overhead=%.2f readback=%.2f cleanup=%.2f\n",
-                    (unsigned long long)totals.calls, (unsigned long long)totals.draws, total / n,
-                    totals.target / n, totals.draw_setup / n, totals.record / n,
-                    totals.gpu_wait / n, totals.gpu_device / n,
-                    std::max(0.0, totals.gpu_wait - totals.gpu_device) / n,
-                    totals.readback / n, totals.cleanup / n);
-            fprintf(stderr,
-                    "[render-timing] backend synchronization command_buffers=%llu queue_submits=%llu "
-                    "fence_waits=%llu gpu_timestamps=%llu cache_pressure=%llu %.2f ms\n",
-                    (unsigned long long)totals.command_buffers,
-                    (unsigned long long)totals.queue_submits,
-                    (unsigned long long)totals.fence_waits,
-                    (unsigned long long)totals.gpu_timestamp_samples,
-                    (unsigned long long)totals.cache_pressure_flushes,
-                    totals.cache_pressure_ms);
-            fprintf(stderr,
-                    "[render-timing] draw_setup avg_ms: shaders=%.2f fixed=%.2f resources=%.2f pipeline=%.2f\n",
-                    totals.setup_shader / n, totals.setup_fixed / n,
-                    totals.setup_resources / n, totals.setup_pipeline / n);
-            fprintf(stderr,
-                    "[render-timing] backend textures refs=%llu uploads=%llu %.1f MiB "
-                    "persistent=%llu/%llu cache=%.1f MiB\n",
-                    (unsigned long long)totals.texture_references,
-                    (unsigned long long)totals.texture_uploads,
-                    totals.texture_upload_bytes / (1024.0 * 1024.0),
-                    (unsigned long long)totals.persistent_hits,
-                    (unsigned long long)totals.persistent_misses,
-                    totals.persistent_cached_bytes / (1024.0 * 1024.0));
-            fprintf(stderr,
-                    "[render-timing] backend pipelines refs=%llu hits=%llu misses=%llu bypass=%llu "
-                    "entries=%llu evictions=%llu\n",
-                    (unsigned long long)totals.pipeline_references,
-                    (unsigned long long)totals.pipeline_hits,
-                    (unsigned long long)totals.pipeline_misses,
-                    (unsigned long long)totals.pipeline_bypasses,
-                    (unsigned long long)totals.pipeline_entries,
-                    (unsigned long long)totals.pipeline_evictions);
-            const RenderMemoryPoolStats pool = render_memory_pool_stats();
-            fprintf(stderr,
-                    "[render-timing] memory_pool hits=%llu misses=%llu cached=%zu %.1f MiB "
-                    "discarded=%llu\n",
-                    (unsigned long long)pool.hits, (unsigned long long)pool.misses,
-                    pool.cached_allocations,
-                    static_cast<double>(pool.cached_bytes) / (1024.0 * 1024.0),
-                    (unsigned long long)pool.discarded);
-            const RenderHostBufferPoolStats buffer_pool = render_host_buffer_pool_stats();
-            fprintf(stderr,
-                    "[render-timing] backend_buffer_pool hits=%llu misses=%llu cached=%zu %.1f MiB "
-                    "evictions=%llu\n",
-                    (unsigned long long)buffer_pool.hits,
-                    (unsigned long long)buffer_pool.misses,
-                    buffer_pool.cached_buffers,
-                    static_cast<double>(buffer_pool.cached_bytes) / (1024.0 * 1024.0),
-                    (unsigned long long)buffer_pool.evictions);
-            const double wn = static_cast<double>(window.calls);
-            const double window_total = window.target + window.draw_setup + window.record +
-                                        window.gpu_wait + window.readback + window.cleanup;
-            fprintf(stderr,
-                    "[render-window] backend calls=%llu draws=%.1f avg_ms: total=%.2f target=%.2f "
-                    "draw_setup=%.2f record_upload=%.2f gpu_wait=%.2f gpu_device=%.2f "
-                    "gpu_overhead=%.2f readback=%.2f cleanup=%.2f\n",
-                    (unsigned long long)window.calls, window.draws / wn, window_total / wn,
-                    window.target / wn, window.draw_setup / wn, window.record / wn,
-                    window.gpu_wait / wn, window.gpu_device / wn,
-                    std::max(0.0, window.gpu_wait - window.gpu_device) / wn,
-                    window.readback / wn, window.cleanup / wn);
-            fprintf(stderr,
-                    "[render-window] backend synchronization command_buffers=%.1f queue_submits=%.1f "
-                    "fence_waits=%.1f gpu_timestamps=%.1f cache_pressure=%.1f %.2f ms\n",
-                    window.command_buffers / wn, window.queue_submits / wn,
-                    window.fence_waits / wn, window.gpu_timestamp_samples / wn,
-                    window.cache_pressure_flushes / wn, window.cache_pressure_ms / wn);
-            fprintf(stderr,
-                    "[render-window] draw_setup avg_ms: shaders=%.2f fixed=%.2f resources=%.2f pipeline=%.2f\n",
-                    window.setup_shader / wn, window.setup_fixed / wn,
-                    window.setup_resources / wn, window.setup_pipeline / wn);
-            fprintf(stderr,
-                    "[render-window] backend textures refs=%.1f uploads=%.1f %.1f MiB "
-                    "persistent=%.1f/%.1f cache=%.1f MiB\n",
-                    window.texture_references / wn, window.texture_uploads / wn,
-                    window.texture_upload_bytes / (wn * 1024.0 * 1024.0),
-                    window.persistent_hits / wn, window.persistent_misses / wn,
-                    window.persistent_cached_bytes / (1024.0 * 1024.0));
-            fprintf(stderr,
-                    "[render-window] backend resources texture_bindings=%.1f/%.1f "
-                    "buffers=%.1f/%.1f descriptor_layouts=%.1f/%.1f "
-                    "pipeline_layouts=%.1f/%.1f\n",
-                    window.texture_binding_references / wn,
-                    window.unique_texture_bindings / wn,
-                    window.buffer_references / wn, window.unique_buffers / wn,
-                    window.descriptor_layout_references / wn,
-                    window.unique_descriptor_layouts / wn,
-                    window.pipeline_layout_references / wn,
-                    window.unique_pipeline_layouts / wn);
-            fprintf(stderr,
-                    "[render-window] backend pipelines refs=%.1f hits=%.1f misses=%.1f bypass=%.1f "
-                    "entries=%llu evictions=%.1f\n",
-                    window.pipeline_references / wn, window.pipeline_hits / wn,
-                    window.pipeline_misses / wn, window.pipeline_bypasses / wn,
-                    (unsigned long long)window.pipeline_entries, window.pipeline_evictions / wn);
-            window = {};
-        }
+        accumulate_backend_render_timing(call_timing, draws, texture_stats,
+                                         resource_reuse_stats, pipeline_stats);
     }
     // NB: dev/instance are the persistent RenderVkCtx — do NOT destroy them here (reused across calls).
     return out;
