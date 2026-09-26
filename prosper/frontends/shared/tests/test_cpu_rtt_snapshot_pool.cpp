@@ -90,8 +90,17 @@ static void test_budget_and_resolution_change(Checks& checks) {
     // avoid is the reallocation, and a big-enough buffer avoids it. Insisting on an exact match
     // refused every merely-sufficient buffer and cost a render-target-sized allocation per
     // publication on a title cycling through extents.
+    const size_t retained_before_reuse = resolution_change.retained_bytes();
     auto newer = resolution_change.copy(new_source.data(), new_source.size());
     checks.expect(newer.reused, "a smaller extent borrows a retained buffer that can hold it");
+    // The budget must be credited the borrowed buffer's CAPACITY, not the request size. Stated as
+    // a strict inequality rather than a magic number so it discriminates without pinning the
+    // pool's internal capacities: the buffer taken can hold `new_source` and is strictly larger
+    // than it, so a correct accounting removes strictly more than the request. Mutating the
+    // subtraction to `-= bytes` makes the delta exactly the request and turns this red -- the
+    // suite previously had no arm that could tell those two apart.
+    checks.expect(retained_before_reuse - resolution_change.retained_bytes() > new_source.size(),
+                  "reuse credits the budget the borrowed buffer's capacity, not the request size");
     // THE arm that guards the risk this change introduces. Reusing a larger buffer must publish
     // the REQUESTED length, not the donor's: a consumer reads pixels->size(). If assign() were
     // ever replaced by a memcpy that left the donor's size standing, this goes red and nothing

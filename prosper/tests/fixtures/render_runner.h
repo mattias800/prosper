@@ -11942,6 +11942,12 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                         di, (int)pipeline_result, (void*)v.pipe);
                 fflush(stderr);
             }
+            if (pipeline_result != VK_SUCCESS) {
+                // The only place a draw that survived setup fails to reach the GPU. Disjoint from
+                // the six reasons above by construction: each of those `continue`s before here.
+                prosper::gpu::draw_disposition_census().note_dropped(
+                    prosper::gpu::DrawDrop::PipelineCreation);
+            }
             if (pipeline_result == VK_SUCCESS) {
                 v.ok = true;
                 bool retain = pipeline_cache_enabled && pipeline_cache_limit;
@@ -12906,11 +12912,13 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 (dsc.aspectMask & VK_IMAGE_ASPECT_DEPTH_BIT))
                 backend_depth_clear_probe_armed_count().fetch_add(1);
         }
-        if (!v.ok) {
-            prosper::gpu::draw_disposition_census().note_dropped(
-                prosper::gpu::DrawDrop::PipelineCreation);
-            continue;
-        }
+        // NOT a census site. Every setup-loop drop `continue`s before `v.ok` is set, so those
+        // draws arrive here too and counting them would double-count each one -- once under its
+        // real reason and once as pipeline-creation, which would then absorb every other reason's
+        // population and make the self-validation report a NEGATIVE unaccounted value on a
+        // correctly accounted pass. A genuine pipeline-creation failure is counted where it
+        // happens, at the vkCreateGraphicsPipelines result below.
+        if (!v.ok) continue;
         if (ds_active) {
             vkCmdBeginQuery(cmd, ds_stats_pool, static_cast<uint32_t>(di), 0);
             vkCmdBeginQuery(cmd, ds_occ_pool, static_cast<uint32_t>(di),

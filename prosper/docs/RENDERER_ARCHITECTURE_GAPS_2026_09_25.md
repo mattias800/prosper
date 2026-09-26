@@ -160,47 +160,6 @@ Throughput over the same wall clock went 10,323 passes (before, n=1 at matched i
 10,906 / 11,075 / 11,313 (after, n=3). Non-overlapping, so read the direction as established and
 the magnitude as roughly 5-9%.
 
-**FALSIFIED: "small render passes are what make heavy titles slow."** This document's own § 1-2
-motivated a pass-batching change. The pass-cost census measured it instead: Astro Bot spends
-**7.8% of its wall clock inside `render_draw_pass_rgba` at all**, so collapsing passes could not
-have moved it whatever the pass count. The Messenger, which runs well, spends 63.8%. Pass length is
-real (Astro Bot's passes hold a mean of 1.00 draws, 100% single-draw) and it is not this title's
-frontier. Do not restart pass batching without first showing the renderer is a large share of the
-target title's wall clock.
-
-**RULED OUT: replacing per-call worker-thread creation with a persistent pool.**
-`parallel_compute_texels` and `parallel_rows` each create a fresh set of `std::jthread`s per call
-and join them. Measured volume on Astro Bot: **19,738 calls creating 200,809 OS threads** in ~120 s,
-with `pthread_create` at 11.4% of the busiest thread's non-idle samples and `mmap`/`munmap`
-alongside. That looks like an obvious win and is not one.
-
-A `WorkerPool` was built (TSan-clean, seven-arm contract test) and adopted behind a runtime gate so
-both arms lived in ONE binary. Interleaved A/B on a freed box, three rounds each:
-
-| arm | runs (passes per ~120 s) | mean |
-|---|---|---:|
-| per-call jthreads | 11,019 / 8,984 / 10,088 | 10,030 |
-| pooled dispatch | 10,345 / 10,039 / 10,625 | 10,336 |
-
-The ranges overlap heavily -- the jthread arm holds both the best and the worst run, and its worst
-started at load 7.70. **No difference is detectable at n=3 against this variance**, so the pool was
-removed rather than shipped as a 317th switch for no measured benefit. The mechanism is worth
-knowing: glibc caches thread stacks, so a warm `pthread_create` costs about what a condvar wakeup
-costs, and a pool's shared queue is then pure added contention. **Do not restart this from the
-thread count alone** -- 200,809 creations is a real number and it buys nothing.
-
-**A sequential A/B of the same question first measured "~50% slower", and that was an artifact.**
-A peer agent's `prosper-app` started mid-session holding ~387% CPU; every pooled arm landed after
-it started, and the reverted build then re-measured at 4,451-4,825 passes against a 10,906-11,313
-baseline taken before it -- the "regression" reproduced with the change absent. It had already been
-written into a code comment as established fact before the revert failed to restore the baseline
-and exposed it. **Interleave A/B arms rather than running them in sequence**, and record the load
-at each run's start: this whole episode is visible in one column of the results table and was
-invisible without it.
-
-The shipped helpers are byte-identical to main (git diff shows additions only); only the
-volume census was kept, because the volume is the input to any future batching question.
-
 ### Where Astro Bot's time actually goes, and the next frontier
 
 Established by measurement on 2026-09-26, so the next reader starts from facts rather than from
@@ -317,6 +276,48 @@ Partial machinery already exists (`rtt_gpu_seed_import_extent_compatible`,
 
 
 ## Ruled out
+
+**FALSIFIED: "small render passes are what make heavy titles slow."** This document's own § 1-2
+motivated a pass-batching change. The pass-cost census measured it instead: Astro Bot spends
+**7.8% of its wall clock inside `render_draw_pass_rgba` at all**, so collapsing passes could not
+have moved it whatever the pass count. The Messenger, which runs well, spends 63.8%. Pass length is
+real (Astro Bot's passes hold a mean of 1.00 draws, 100% single-draw) and it is not this title's
+frontier. Do not restart pass batching without first showing the renderer is a large share of the
+target title's wall clock.
+
+**RULED OUT: replacing per-call worker-thread creation with a persistent pool.**
+`parallel_compute_texels` and `parallel_rows` each create a fresh set of `std::jthread`s per call
+and join them. Measured volume on Astro Bot: **19,738 calls creating 200,809 OS threads** in ~120 s,
+with `pthread_create` at 11.4% of the busiest thread's non-idle samples and `mmap`/`munmap`
+alongside. That looks like an obvious win and is not one.
+
+A `WorkerPool` was built (TSan-clean, seven-arm contract test) and adopted behind a runtime gate so
+both arms lived in ONE binary. Interleaved A/B on a freed box, three rounds each:
+
+| arm | runs (passes per ~120 s) | mean |
+|---|---|---:|
+| per-call jthreads | 11,019 / 8,984 / 10,088 | 10,030 |
+| pooled dispatch | 10,345 / 10,039 / 10,625 | 10,336 |
+
+The ranges overlap heavily -- the jthread arm holds both the best and the worst run, and its worst
+started at load 7.70. **No difference is detectable at n=3 against this variance**, so the pool was
+removed rather than shipped as a 317th switch for no measured benefit. The mechanism is worth
+knowing: glibc caches thread stacks, so a warm `pthread_create` costs about what a condvar wakeup
+costs, and a pool's shared queue is then pure added contention. **Do not restart this from the
+thread count alone** -- 200,809 creations is a real number and it buys nothing.
+
+**A sequential A/B of the same question first measured "~50% slower", and that was an artifact.**
+A peer agent's `prosper-app` started mid-session holding ~387% CPU; every pooled arm landed after
+it started, and the reverted build then re-measured at 4,451-4,825 passes against a 10,906-11,313
+baseline taken before it -- the "regression" reproduced with the change absent. It had already been
+written into a code comment as established fact before the revert failed to restore the baseline
+and exposed it. **Interleave A/B arms rather than running them in sequence**, and record the load
+at each run's start: this whole episode is visible in one column of the results table and was
+invisible without it.
+
+The shipped helpers are byte-identical to main (git diff shows additions only); only the
+volume census was kept, because the volume is the input to any future batching question.
+
 
 - **"The recompiler or shader quality is the frontier."** Not for this cost class: the profile's
   top self shares are `memmove`, `malloc` and `memcmp`, none of which is shader work.

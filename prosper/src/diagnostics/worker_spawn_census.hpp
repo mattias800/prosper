@@ -10,8 +10,14 @@
 //
 // What could not be answered from the profile is the VOLUME: a helper that spawns 15 workers ten
 // times a second and one that spawns them ten thousand times a second look identical in a leaf
-// histogram, and only the second is worth a persistent pool. The profile says the cost is real;
-// this says whether it is worth removing, and for which site.
+// histogram. The profile says the lifecycle is visible; this says how often it happens.
+//
+// THAT QUESTION HAS BEEN ANSWERED, AND THE ANSWER WAS NO. A persistent worker pool was built for
+// these sites and measured on an interleaved A/B: no detectable difference, because glibc caches
+// thread stacks, so a warm pthread_create costs about what a condvar wakeup costs. The pool was
+// removed. See the status doc's "Ruled out". This census remains because the volume is the input
+// to any FUTURE batching question -- it is no longer evidence of a defect, and a reader should
+// not take a large number here as one.
 //
 // Deliberately counts per SITE. The helpers have different work gates (both skip below 512 KiB,
 // but on different units), so a pooled total would average a hot site against a cold one and

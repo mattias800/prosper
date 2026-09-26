@@ -26,6 +26,12 @@ static_assert(static_cast<int>(prosper::frontend::ColorReadbackReason::BoundNonP
               static_cast<int>(ReadbackReasonSlot::BoundNonPersistent));
 static_assert(static_cast<int>(prosper::frontend::ColorReadbackReason::NotWanted) ==
               static_cast<int>(ReadbackReasonSlot::NotWanted));
+// Pinning the four values is not enough on its own: an enumerator APPENDED to the policy enum
+// leaves all four equal and is then silently dropped at runtime, because the cast produces a slot
+// index past the end. Pinning the COUNT is what makes adding a reason to one enum a build error.
+static_assert(static_cast<int>(ReadbackReasonSlot::Count) == 4,
+              "a reason was added to ReadbackReasonSlot; add it to ColorReadbackReason, kNames "
+              "and the value assertions above");
 
 struct State {
     std::array<std::atomic<uint64_t>, kCount> hits{};

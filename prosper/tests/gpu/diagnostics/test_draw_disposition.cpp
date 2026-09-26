@@ -93,6 +93,24 @@ int main() {
               "an unnamed drop path is reported as UNACCOUNTED, not absorbed into the total");
     }
 
+    // --- double counting must be VISIBLE, not plausible ------------------------------------
+    // The defect this guards shipped once: a seventh census site was added that was not disjoint
+    // from the six, so every setup-loop drop was counted twice -- once under its real reason and
+    // once as pipeline-creation. It survived review of two live titles because both happened to
+    // drop zero draws, so the census reported clean totals on the only runs anyone looked at.
+    // Here the arithmetic is forced: 4 seen, 2 recorded, 3 dropped. A census that merely summed
+    // would print a tidy-looking total; this one must report the overcount as NEGATIVE.
+    c.note_seen(4);
+    c.note_recorded(2);
+    c.note_dropped(DrawDrop::SubgroupFeatures);
+    c.note_dropped(DrawDrop::ShaderRejected);
+    c.note_dropped(DrawDrop::PipelineCreation);
+    {
+        const std::string out = capture_pass();
+        check(out.find("UNACCOUNTED=-1") != std::string::npos,
+              "counting one drop under two reasons reports a negative unaccounted, not a total");
+    }
+
     // --- a black pass is always reported --------------------------------------------------
     c.note_seen(5);
     for (int i = 0; i < 5; i++) c.note_dropped(DrawDrop::ShaderRejected);
@@ -105,16 +123,16 @@ int main() {
     }
 
     // --- totals are process-lifetime ------------------------------------------------------
-    check(c.seen() == 22 && c.recorded() == 13,
+    check(c.seen() == 26 && c.recorded() == 15,
           "process-lifetime seen/recorded totals survive per-pass resets");
     // Split so a failure localizes: 1 (pass 3) + 5 (pass 4) shader-rejected, and
     // 1 subgroup + 1 shader + 1 buffer + 5 shader = 8 drops overall.
-    check(c.dropped(DrawDrop::ShaderRejected) == 6,
+    check(c.dropped(DrawDrop::ShaderRejected) == 7,
           "per-reason drop totals accumulate across passes");
-    check(c.dropped(DrawDrop::SubgroupFeatures) == 1 &&
+    check(c.dropped(DrawDrop::SubgroupFeatures) == 2 &&
           c.dropped(DrawDrop::BufferResources) == 1,
           "drops are attributed to the reason that was named, not pooled");
-    check(c.dropped_total() == 8, "aggregate drop total is the sum of the per-reason totals");
+    check(c.dropped_total() == 11, "aggregate drop total is the sum of the per-reason totals");
 
     printf("%s\n", failures ? "FAILURES" : "ALL PASS");
     return failures ? 1 : 0;
