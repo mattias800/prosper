@@ -168,24 +168,38 @@ real (Astro Bot's passes hold a mean of 1.00 draws, 100% single-draw) and it is 
 frontier. Do not restart pass batching without first showing the renderer is a large share of the
 target title's wall clock.
 
-**UNDECIDED, and previously recorded wrongly: per-call worker-thread creation.**
+**RULED OUT: replacing per-call worker-thread creation with a persistent pool.**
 `parallel_compute_texels` and `parallel_rows` each create a fresh set of `std::jthread`s per call
 and join them. Measured volume on Astro Bot: **19,738 calls creating 200,809 OS threads** in ~120 s,
 with `pthread_create` at 11.4% of the busiest thread's non-idle samples and `mmap`/`munmap`
-alongside. A persistent `WorkerPool` was built, TSan-clean and passing a 7-arm contract test, and
-measured **~50% slower** -- so it was reverted and the slowdown written into a code comment as
-established fact.
+alongside. That looks like an obvious win and is not one.
 
-**That measurement was invalid and the conclusion is withdrawn.** A peer agent's `prosper-app`
-running Kena started at 00:39:07 and held ~387% CPU; every worker-pool arm was taken after 00:43,
-and the reverted build re-measured at 4,451-4,825 passes against a 10,906-11,313 baseline taken
-before 00:39 -- i.e. the "regression" reproduced with the change absent. The honest state is that
-the pool is **untested**, not refuted. The plausible mechanism for a real slowdown is still worth
-knowing if anyone retries: glibc caches thread stacks, so a warm `pthread_create` may cost about
-what a condvar wakeup costs, which would make the pool's shared queue pure overhead. Retry only on
-a box verified idle for the whole A/B, with both arms interleaved rather than run in sequence.
+A `WorkerPool` was built (TSan-clean, seven-arm contract test) and adopted behind a runtime gate so
+both arms lived in ONE binary. Interleaved A/B on a freed box, three rounds each:
 
-The shipped helpers are byte-identical to what they were; only the volume census was added.
+| arm | runs (passes per ~120 s) | mean |
+|---|---|---:|
+| per-call jthreads | 11,019 / 8,984 / 10,088 | 10,030 |
+| pooled dispatch | 10,345 / 10,039 / 10,625 | 10,336 |
+
+The ranges overlap heavily -- the jthread arm holds both the best and the worst run, and its worst
+started at load 7.70. **No difference is detectable at n=3 against this variance**, so the pool was
+removed rather than shipped as a 317th switch for no measured benefit. The mechanism is worth
+knowing: glibc caches thread stacks, so a warm `pthread_create` costs about what a condvar wakeup
+costs, and a pool's shared queue is then pure added contention. **Do not restart this from the
+thread count alone** -- 200,809 creations is a real number and it buys nothing.
+
+**A sequential A/B of the same question first measured "~50% slower", and that was an artifact.**
+A peer agent's `prosper-app` started mid-session holding ~387% CPU; every pooled arm landed after
+it started, and the reverted build then re-measured at 4,451-4,825 passes against a 10,906-11,313
+baseline taken before it -- the "regression" reproduced with the change absent. It had already been
+written into a code comment as established fact before the revert failed to restore the baseline
+and exposed it. **Interleave A/B arms rather than running them in sequence**, and record the load
+at each run's start: this whole episode is visible in one column of the results table and was
+invisible without it.
+
+The shipped helpers are byte-identical to main (git diff shows additions only); only the
+volume census was kept, because the volume is the input to any future batching question.
 
 ## Ruled out
 

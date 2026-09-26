@@ -47,8 +47,8 @@ void parallel_compute_texels(size_t count, size_t work_bytes, Body&& body,
         return;
     }
     {
-        // Volume only. Whether this per-call spawn is worth replacing is UNDECIDED -- see the
-        // status doc's "Ruled out"; the one experiment run so far was invalidated.
+        // Volume only; the per-call spawn was measured and is not a measurable cost. See the
+        // status doc's "Ruled out".
         static prosper::diagnostics::WorkerSpawnSite site("compute-texels");
         site.note(threads, work_bytes);
     }

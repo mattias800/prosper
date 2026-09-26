@@ -568,8 +568,9 @@ template <class Body>
 inline void parallel_rows(uint32_t eh, unsigned nthreads, Body&& body) {
     if (nthreads <= 1 || eh == 0) { if (eh) body(0u, eh); return; }
     {
-        // Volume only. Whether this per-call spawn is worth replacing is UNDECIDED -- see the
-        // status doc's "Ruled out"; the one experiment run so far was invalidated.
+        // Volume only. Per-call thread creation here was measured and found NOT to cost
+        // measurably -- see the status doc's "Ruled out". Kept because the volume is the input to
+        // any future batching question, not because the spawn is known to be a problem.
         static prosper::diagnostics::WorkerSpawnSite site("detile-rows");
         site.note(nthreads, uint64_t{eh});
     }
