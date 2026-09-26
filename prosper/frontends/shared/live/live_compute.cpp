@@ -4088,6 +4088,10 @@ void storage_unpack_texel(const uint8_t* src, prosper::gpu::DataFormat f, uint32
 // against each other at runtime.
 struct StorageMaterializeCounters {
     std::atomic<uint64_t> exact_n{0}, exact_b{0}, unpack_n{0}, unpack_b{0}, seed_n{0}, seed_b{0};
+    // Bounded so a streaming title cannot turn a census into an unbounded allocation.
+    std::atomic<uint64_t> not_persistent{0}, persistent_not_skipped{0};
+    std::mutex distinct_mutex;
+    std::set<std::pair<uint64_t, uint64_t>> distinct;
 };
 inline StorageMaterializeCounters& storage_materialize_counters() {
     static StorageMaterializeCounters c;
@@ -9337,14 +9341,22 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                     "[storage-materialize] RUN TOTAL bindings=%llu "
                                     "exact-copy=%llu (%.1f%%, %.1f MiB) "
                                     "texel-unpack=%llu (%.1f%%, %.1f MiB) "
-                                    "seed-copy=%llu (%.1f MiB)\n",
+                                    "seed-copy=%llu (%.1f MiB) distinct-sources=%llu "
+                                    "not-persistent=%llu persistent-not-skipped=%llu\n",
                                     (unsigned long long)(en + un),
                                     (unsigned long long)en, 100.0 * en / (en + un),
                                     c.exact_b.load(std::memory_order_relaxed) / MiB,
                                     (unsigned long long)un, 100.0 * un / (en + un),
                                     c.unpack_b.load(std::memory_order_relaxed) / MiB,
                                     (unsigned long long)c.seed_n.load(std::memory_order_relaxed),
-                                    c.seed_b.load(std::memory_order_relaxed) / MiB);
+                                    c.seed_b.load(std::memory_order_relaxed) / MiB,
+                                    (unsigned long long)[&]{
+                                        std::lock_guard<std::mutex> lock(c.distinct_mutex);
+                                        return c.distinct.size();
+                                    }(),
+                                    (unsigned long long)c.not_persistent.load(std::memory_order_relaxed),
+                                    (unsigned long long)c.persistent_not_skipped.load(
+                                        std::memory_order_relaxed));
                                 std::fflush(stderr);
                                 return true;
                             });
@@ -9360,6 +9372,32 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         prosper::diagnostics::note_transfer(
                             prosper::diagnostics::Transfer::StorageMaterialize,
                             static_cast<uint64_t>(texels) * guest_texel);
+                        // How much of this copying is REPEAT copying of the same source. The copy
+                        // is legitimate the first time a guest-owned image is materialised; every
+                        // later copy of an unchanged source is pure waste, and nothing here has a
+                        // write-watch to tell the difference (the buffer path reports
+                        // total-watch-chunks=0 on every binding). Distinct (address, size) pairs
+                        // against total copies sizes the headroom without paying for a hash.
+                        {
+                            auto& d = storage_materialize_counters();
+                            std::lock_guard<std::mutex> lock(d.distinct_mutex);
+                            if (d.distinct.size() < 200000)
+                                d.distinct.insert({r->gpu_addr,
+                                                   static_cast<uint64_t>(texels) * guest_texel});
+                        }
+                        // WHY the cache did not skip this copy. The guard above is
+                        // `!(bi.persistent && bi.upload_skipped)`, and those two terms have
+                        // completely different fixes: not-persistent is a cache-admission problem
+                        // (key, eligibility, capacity), while persistent-but-not-skipped is a
+                        // write-watch problem (the watch says dirty or unknown for data that has
+                        // not changed). 8,993 copies from 84 distinct sources means ~99% of this
+                        // traffic is repeat copying, so which of the two terms fails decides the
+                        // entire fix.
+                        {
+                            auto& d = storage_materialize_counters();
+                            if (!bi.persistent) d.not_persistent.fetch_add(1, std::memory_order_relaxed);
+                            else d.persistent_not_skipped.fetch_add(1, std::memory_order_relaxed);
+                        }
                         if (bi.exact_storage_bytes()) {
                             c.exact_n.fetch_add(1, std::memory_order_relaxed);
                             c.exact_b.fetch_add(static_cast<uint64_t>(texels) * guest_texel,

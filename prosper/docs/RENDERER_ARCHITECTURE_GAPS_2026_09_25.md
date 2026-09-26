@@ -468,3 +468,45 @@ them host-side rather than as GPU storage images, and `live_compute.cpp`'s own c
 take the native storage-image path rather than materialising, and what fraction of dispatches on a
 real title can take it? The gate census answers the first half already; nobody has asked the
 second.
+
+### The whole chain, measured end to end (2026-09-26)
+
+Every step below is a measurement on the shipped windowed frontend with GPU present confirmed
+adopted, not an inference from a profile leaf.
+
+```
+1. compute-item execution        74.9% of wall   (renderer: 8.8%)
+2. host-copy transfer pressure   2,058 MiB/s     (a title at 59 fps: 4 MiB/s)
+3. largest category              storage-materialize, 39.4 GiB in 49 s
+4. of those copies               8,993 copies from 84 DISTINCT SOURCES
+5. why the cache did not skip    not-persistent 6,430 (76%) / persistent-but-watch-dirty 1,984 (24%)
+```
+
+**~99% of the largest host-copy category is re-copying images that did not change.** 39.4 GiB of
+copying carries at most ~378 MiB of distinct data (84 sources averaging 4.5 MiB).
+
+**The machinery to avoid it already exists and is already respected.** `acquire_cached_image` holds
+a `GuestWriteWatch` and returns `upload_skipped`, and the copy site guards on
+`!(bi.persistent && bi.upload_skipped)`. So this is not a missing mechanism; it is a cache that is
+not admitting the working set. **76% of the copies are of images that are not persistent at all**,
+which is an admission question -- key, eligibility, or capacity -- and only 24% are images the
+cache holds but whose watch reports dirty or unknown.
+
+Those two terms have completely different fixes, which is why the split is the useful number and
+the aggregate was not.
+
+**What this is NOT.** It is not a residency *threshold* problem: the images here average 4.5 MiB,
+three orders of magnitude above the 4 KiB eligibility floor, and the A/B on that floor is recorded
+above as falsified with a verified lever. Do not start there.
+
+**The next question, and it is one measurement away:** for the 6,430 non-persistent copies, does
+admission fail on the cache key, on an eligibility predicate other than size, or on capacity and
+eviction? `acquire_cached_image`'s early `image_cache.end()` return distinguishes the first from
+the other two.
+
+**Why this generalises.** The same shape appears at three independent sites, which is what makes it
+architectural rather than a bug: `rtt-snapshot` (34.7 GiB, fixed for the exact-size case earlier
+today and still the second largest), `detile` (26.2 GiB), and compute buffer bindings, every one of
+which reports `cache=ineligible total-watch-chunks=0` -- no write-watch at all, so a full compare
+and a full upload on every dispatch. prosper copies guest data host-side without dirty tracking, in
+several places, and each site was found separately at full cost. That is the thing to fix once.
