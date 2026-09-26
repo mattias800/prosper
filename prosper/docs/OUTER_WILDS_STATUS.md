@@ -147,10 +147,11 @@ forming a performance hypothesis on this title — every row here cost a session
   Multiply the two. If a route really does expand millions of indices per second, there are two
   levers and neither is a hand-written kernel: raise the **build's ISA baseline** (a
   project-wide `-march` decision that drops pre-2013 hosts, so it needs measuring against every
-  title, not just this one), or keep the runtime dispatch exactly as it is and replace the
-  intrinsics body with the **portable loop under `__attribute__((target("avx2")))`**, which is
-  what measured fastest here. The dispatch cost is identical either way; only the kernel body
-  differs. `CONFIDENCE: HIGH` for reasons 1 and 2, which are properties of the emitted code and
+  title, not just this one), or add a runtime dispatch whose kernel body is the **portable loop
+  under `__attribute__((target("avx2")))`** — not the intrinsics, which is the body that lost.
+  There is no dispatch in the tree today, so that second lever means adding one; if it needs an
+  A/B, the A/B belongs in `test_index_expand`, which already has both arms, and not in a new
+  environment variable. `CONFIDENCE: HIGH` for reasons 1 and 2, which are properties of the emitted code and
   reproduce from a single compile. `CONFIDENCE: MED` for reason 3's threshold: the per-index
   costs are measured, but they are **cache-warm**, which overstates the kernel's advantage
   against guest memory the renderer has not just touched, and the index volume itself **has not
