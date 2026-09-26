@@ -343,3 +343,74 @@ volume census was kept, because the volume is the input to any future batching q
 - **"prosper is naive about dynamic state."** It is not: `render_runner.h:9979`–`9995` enables 16
   dynamic states including extended-dynamic-state depth/stencil/cull/topology. Pipeline-key
   explosion from baked dynamic state is not a live hypothesis here.
+
+## The frontier, found 2026-09-26: compute-item execution, not the renderer
+
+Everything above measures the render path. It was the wrong place to look, and the census that
+settled it is in this PR's own instrumentation.
+
+**Measured on the shipped windowed frontend, GPU present confirmed adopted:**
+
+| | compute-items | renderer (pass-cost) | rate |
+|---|---|---:|---|
+| Astro Bot | **74.9% of wall**, 66,028 calls, **1.917 ms/call** | 8.8% | ~5 fps |
+| The Messenger | 0.1% of wall, 20,055 calls, **0.005 ms/call** | 4.3% | ~59 fps |
+
+Comparable call counts, **383x the per-call cost**. The renderer is a single-digit share on both, and
+the *faster* title spends a smaller absolute share there. Two earlier instruments disagreed about
+the render path's share -- 58% from the per-submit report against 8.5% from pass-cost -- and the gap
+was this: compute items reach the backend through the **ACB submit path**, which the per-submit
+render report does not count. The largest consumer of the frame had no instrument at all.
+
+### What the 1.9 ms is
+
+A 39 s run that never leaves the static "Sony Interactive Entertainment" splash:
+
+```
+[compute-items] calls=15115 in-compute=29526ms (75.9% of span) mean=1.953ms/call
+[worker-spawn]  compute-texels ~9,712 calls at 20-35 MiB each; detile-rows 2,419 calls
+205 presented frames -> 5.3 fps
+```
+
+**About 240 GiB of CPU texel conversion in 39 seconds -- roughly 6 GiB/s -- on a screen that is not
+changing.** CPU detiling is only 0.7% of bytes moved; the conversion dominates. The path is
+`execute_item -> storage_unpack_range -> parallel_compute_texels`, which materialises storage-image
+texels into RGBA32 quads on the CPU before a dispatch.
+
+**The magnitude was already documented in the code** and nobody had connected it to a frame rate.
+`live_compute.cpp`'s comment above `storage_unpack_range` records **~56 ms per image-bearing
+dispatch against 0.39 ms of actual GPU dispatch** -- a ~143x ratio -- measured on a different title.
+
+### Why the GPU path is not taken, from the gate's own census
+
+`PROSPER_COMPUTE_STORAGE_GATE_CENSUS=1`, same splash, shows a mip/bloom pyramid evaluated hundreds
+of times per geometry:
+
+```
+  1x1   bpe=16  evaluated=219   persistent=0     CANDIDATE=0
+  7x4   bpe=4   evaluated=186   persistent=0     CANDIDATE=0
+ 15x8   bpe=4   evaluated=186   persistent=0     CANDIDATE=0
+ 30x16  bpe=4   evaluated=371   persistent=0     CANDIDATE=0
+240x135 bpe=8   evaluated=1027  persistent=1027  CANDIDATE=660
+```
+
+Every geometry with `persistent=0` is `CANDIDATE=0`: it can never take the GPU path and always
+materialises on the CPU. `dcc_safe`, `exact` and `write_only` are satisfied almost everywhere, so
+**persistence is the binding constraint**, not correctness of the shape.
+
+### Why this is the compounding target
+
+It is shared code with no title in it, and the cost is per-call rather than per-pixel -- which is
+exactly the shape the project owner reported from the keyboard: single-digit fps from the very
+first frame, identical on a static splash and on an FMV. Scene complexity does not behave that way;
+a per-call constant does.
+
+**The question to answer next is why these images are not persistent**, since that is the one gate
+term that fails. A secondary, independently useful item: `GpuRetilePipeline::bind` creates AND
+destroys a `VkDescriptorPool` per call (31,262 times on this route, ~43 per frame, each a kernel
+round trip), and the GPU retile census shows 1,606 of 4,818 images declining with
+`mip-tail-or-offset` and falling back to CPU detiling.
+
+**Do not read this as "fix Astro Bot".** The Messenger runs the same code at 0.005 ms/call. What
+differs is how much of its work lands on a path that materialises CPU-side, and that path is
+general.
