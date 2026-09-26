@@ -19,6 +19,17 @@ from the tracker issues, and still gated, because it is a projection of state ra
 > title's current state — for that, read the tracker. Nothing is ever removed when a title moves on,
 > because the point of a blog is that it records *when* things happened.
 
+## 2026-09-26
+
+### The renderer copies every sampled render target back to the CPU
+
+No picture — a measurement, and it moved the frontier. Readback is 68.5% of a backend call and forces
+one of every two flushes, so *that* is why submits block, not the submit model. One fix landed: the CPU
+snapshot pool matched on exact size instead of capacity, so Astro Bot's 56,543 MiB of allocate-and-copy
+per two minutes is now 1,096 MiB. Shared code, no title in it. Collapsing small passes and pooling
+worker threads were both measured and ruled out.
+[`RENDERER_ARCHITECTURE_GAPS_2026_09_25.md`](prosper/docs/RENDERER_ARCHITECTURE_GAPS_2026_09_25.md).
+
 ## 2026-09-23
 
 ### Blue Prince and Evergate get back pixels NVIDIA was dropping
