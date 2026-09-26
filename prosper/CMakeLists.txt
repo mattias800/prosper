@@ -172,6 +172,7 @@ add_test(NAME compute_authority_census_policy COMMAND test_compute_authority_cen
 add_executable(test_compute_buffer_diff_span tests/shared/compute/test_compute_buffer_diff_span.cpp
                src/diagnostics/worker_spawn_census.cpp
                src/diagnostics/exit_census.cpp
+               src/diagnostics/transfer_pressure.cpp
                src/diagnostics/exit_reports.cpp)
 target_include_directories(test_compute_buffer_diff_span PRIVATE frontends src)
 find_package(Threads REQUIRED)
@@ -1582,7 +1583,8 @@ if(TARGET prosper_core)
     src/diagnostics/exit_reports.cpp)
   target_include_directories(test_cpu_rtt_snapshot_pool PRIVATE frontends src)
   target_sources(test_cpu_rtt_snapshot_pool PRIVATE src/diagnostics/worker_spawn_census.cpp
-                                                    src/diagnostics/exit_census.cpp)
+                                                    src/diagnostics/exit_census.cpp
+                                                    src/diagnostics/transfer_pressure.cpp)
   target_link_libraries(test_cpu_rtt_snapshot_pool PRIVATE Threads::Threads)
   add_test(NAME cpu_rtt_snapshot_pool COMMAND test_cpu_rtt_snapshot_pool)
 
@@ -2051,6 +2053,15 @@ if(TARGET prosper_core)
   # Readback-reason policy: the verdict is expressed in terms of the reason, so a future edit
   # cannot change what is counted without changing what is decided.
   target_sources(test_cpu_rtt_snapshot_pool PRIVATE src/diagnostics/readback_reason_census.cpp)
+
+  # Transfer pressure: host bytes/second, default-on. Pins that categories stay separable, that a
+  # zero-byte call is not an event, and that an out-of-range category cannot corrupt a neighbour.
+  add_executable(test_transfer_pressure tests/gpu/diagnostics/test_transfer_pressure.cpp
+                 src/diagnostics/transfer_pressure.cpp
+                 src/diagnostics/exit_census.cpp
+                 src/diagnostics/exit_reports.cpp)
+  target_include_directories(test_transfer_pressure PRIVATE src)
+  add_test(NAME transfer_pressure COMMAND test_transfer_pressure)
 
   # Classified draw disposition: six involuntary drop paths folded into one counter, two of them
   # silent. Pins that a healthy pass stays quiet, that a drop names its mechanism, and that the

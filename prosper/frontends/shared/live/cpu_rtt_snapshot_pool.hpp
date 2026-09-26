@@ -1,6 +1,7 @@
 #pragma once
 
 #include "diagnostics/exit_reports.hpp"
+#include "diagnostics/transfer_pressure.hpp"
 
 #include <atomic>
 #include <cstdio>
@@ -163,6 +164,8 @@ public:
         // the search above has already ruled out on the reuse path, and it never zero-fills. The
         // previous split existed because the reuse path was guaranteed an exact size; with
         // capacity matching, `assign` is what sets the published `size()` correctly.
+        prosper::diagnostics::note_transfer(
+            prosper::diagnostics::Transfer::RenderTargetSnapshot, bytes);
         pixels.assign(source, source + bytes);
 
         auto allocated = std::make_unique<std::vector<uint8_t>>(std::move(pixels));

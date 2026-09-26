@@ -5,6 +5,7 @@
 #include "shared/compute/compute_image_borrow_census.hpp"
 #include "shared/compute/compute_timing_selector.hpp"
 #include "diagnostics/exit_census.hpp"
+#include "diagnostics/transfer_pressure.hpp"
 #include "shared/compute/compute_phase_attribution.hpp"
 #include "shared/compute/compute_buffer_timing.hpp"
 #include "shared/compute/compute_transfer_gate_census.hpp"
@@ -4085,6 +4086,14 @@ void storage_unpack_texel(const uint8_t* src, prosper::gpu::DataFormat f, uint32
 // Every specialized path is bit-identical to storage_unpack_texel by construction; formats without a
 // specialization fall through to the per-texel helper, and PROSPER_VERIFY_UNPACK=1 checks the two
 // against each other at runtime.
+struct StorageMaterializeCounters {
+    std::atomic<uint64_t> exact_n{0}, exact_b{0}, unpack_n{0}, unpack_b{0}, seed_n{0}, seed_b{0};
+};
+inline StorageMaterializeCounters& storage_materialize_counters() {
+    static StorageMaterializeCounters c;
+    return c;
+}
+
 void storage_unpack_range(const uint8_t* src, size_t src_stride, prosper::gpu::DataFormat f,
                           uint32_t ncomp, size_t count, uint32_t* out) {
     using DF = prosper::gpu::DataFormat;
@@ -9303,6 +9312,64 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     unpack_source = src;
                 }
                 if (!bi.has_renderer_seed()) {
+                    // Which of the two host-side materialisation paths a storage binding takes,
+                    // and how many bytes each moves. The expensive one is the per-texel unpack to
+                    // RGBA32; the cheap one is a straight copy. live_compute.cpp already prices an
+                    // image-bearing dispatch at ~56 ms against 0.39 ms of actual GPU dispatch, and
+                    // compute-item execution is 74.9% of wall on a slow title -- but nothing said
+                    // how the population splits between the two, so "teach the cheap path more
+                    // formats" and "stop materialising at all" could not be ranked against each
+                    // other. The seed copy is counted separately because it is unconditional on
+                    // the write-mask path and nobody counts it at all.
+                    {
+                        static std::atomic<uint64_t> exact_n{0}, exact_b{0};
+                        static std::atomic<uint64_t> unpack_n{0}, unpack_b{0};
+                        static std::atomic<uint64_t> seed_n{0}, seed_b{0};
+                        static const bool once = [] {
+                            prosper::diagnostics::register_census(
+                                "PROSPER_NO_STORAGE_MATERIALIZE_CENSUS", [] {
+                                auto& c = storage_materialize_counters();
+                                const uint64_t en = c.exact_n.load(std::memory_order_relaxed);
+                                const uint64_t un = c.unpack_n.load(std::memory_order_relaxed);
+                                if (!(en + un)) return false;
+                                const double MiB = 1024.0 * 1024.0;
+                                std::fprintf(stderr,
+                                    "[storage-materialize] RUN TOTAL bindings=%llu "
+                                    "exact-copy=%llu (%.1f%%, %.1f MiB) "
+                                    "texel-unpack=%llu (%.1f%%, %.1f MiB) "
+                                    "seed-copy=%llu (%.1f MiB)\n",
+                                    (unsigned long long)(en + un),
+                                    (unsigned long long)en, 100.0 * en / (en + un),
+                                    c.exact_b.load(std::memory_order_relaxed) / MiB,
+                                    (unsigned long long)un, 100.0 * un / (en + un),
+                                    c.unpack_b.load(std::memory_order_relaxed) / MiB,
+                                    (unsigned long long)c.seed_n.load(std::memory_order_relaxed),
+                                    c.seed_b.load(std::memory_order_relaxed) / MiB);
+                                std::fflush(stderr);
+                                return true;
+                            });
+                            return true;
+                        }();
+                        (void)once; (void)exact_n; (void)exact_b; (void)unpack_n;
+                        (void)unpack_b; (void)seed_n; (void)seed_b;
+                        auto& c = storage_materialize_counters();
+                        if (bi.storage_write_mask) {
+                            c.seed_n.fetch_add(1, std::memory_order_relaxed);
+                            c.seed_b.fetch_add(linear_guest_bytes, std::memory_order_relaxed);
+                        }
+                        prosper::diagnostics::note_transfer(
+                            prosper::diagnostics::Transfer::StorageMaterialize,
+                            static_cast<uint64_t>(texels) * guest_texel);
+                        if (bi.exact_storage_bytes()) {
+                            c.exact_n.fetch_add(1, std::memory_order_relaxed);
+                            c.exact_b.fetch_add(static_cast<uint64_t>(texels) * guest_texel,
+                                                std::memory_order_relaxed);
+                        } else {
+                            c.unpack_n.fetch_add(1, std::memory_order_relaxed);
+                            c.unpack_b.fetch_add(static_cast<uint64_t>(texels) * guest_texel,
+                                                 std::memory_order_relaxed);
+                        }
+                    }
                     if (bi.storage_write_mask)
                         bi.untouched_seed.assign(unpack_source, unpack_source + linear_guest_bytes);
                     if (bi.exact_storage_bytes()) {
