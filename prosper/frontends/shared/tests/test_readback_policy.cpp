@@ -66,7 +66,7 @@ int main() {
     CHECK(compute_active_readback_bytes<4>(4, offsets, bytes, [](size_t) { return false; }) == 0);
 
     if (!failures) std::printf("readback_policy: OK\n");
-    
+
     // The reason, not just the verdict. These matter because the three reasons have different
     // fixes and a measured distribution chooses between them: on two live titles
     // BoundNonPersistent never fired, which is what ruled out "make more targets persistent"
