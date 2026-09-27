@@ -11,9 +11,18 @@ namespace {
 std::atomic<uint64_t> g_attempts{0};
 std::atomic<uint64_t> g_evicted{0};
 std::atomic<uint64_t> g_evicted_bytes{0};
-std::atomic<uint64_t> g_entries{0};
-std::atomic<uint64_t> g_resident_bytes{0};
+std::atomic<uint64_t> g_entries{0};          // high-water mark
+std::atomic<uint64_t> g_entry_limit{0};
+std::atomic<uint64_t> g_resident_bytes{0};  // high-water mark
 std::atomic<uint64_t> g_limit_bytes{0};
+
+void raise_to(std::atomic<uint64_t>& peak, uint64_t value) {
+    uint64_t seen = peak.load(std::memory_order_relaxed);
+    while (value > seen &&
+           !peak.compare_exchange_weak(seen, value, std::memory_order_relaxed,
+                                       std::memory_order_relaxed)) {
+    }
+}
 
 bool report() {
     const uint64_t attempts = g_attempts.load(std::memory_order_relaxed);
@@ -22,20 +31,24 @@ bool report() {
     const double MiB = 1024.0 * 1024.0;
     const uint64_t limit = g_limit_bytes.load(std::memory_order_relaxed);
     const uint64_t resident = g_resident_bytes.load(std::memory_order_relaxed);
+    const uint64_t entry_limit = g_entry_limit.load(std::memory_order_relaxed);
+    const uint64_t evicted = g_evicted.load(std::memory_order_relaxed);
+    // The verdict must clear BOTH bounds, because either refuses a target on its own, and it must
+    // rest on the peaks rather than on `evicted`: the admission paths skip eviction entirely while
+    // a submission batch is pending, so a capacity refusal can leave every eviction counter at 0.
+    const bool bytes_clear = limit && resident * 2 < limit;
+    const bool entries_clear = entry_limit && entries * 2 < entry_limit;
     std::fprintf(stderr,
-                 "[persistent-targets] RUN TOTAL resident=%llu entries / %.1f MiB of %.1f MiB "
+                 "[persistent-targets] PEAK residency %llu of %llu entries, %.1f of %.1f MiB "
                  "(%.1f%% of budget)  eviction-attempts=%llu evicted=%llu (%.1f MiB)%s\n",
-                 (unsigned long long)entries, resident / MiB, limit / MiB,
+                 (unsigned long long)entries, (unsigned long long)entry_limit,
+                 resident / MiB, limit / MiB,
                  limit ? 100.0 * static_cast<double>(resident) / static_cast<double>(limit) : 0.0,
-                 (unsigned long long)attempts,
-                 (unsigned long long)g_evicted.load(std::memory_order_relaxed),
+                 (unsigned long long)attempts, (unsigned long long)evicted,
                  g_evicted_bytes.load(std::memory_order_relaxed) / MiB,
-                 // The one-line verdict, because the whole point is to stop a reader having to
-                 // work out which of the two states this is.
-                 (!g_evicted.load(std::memory_order_relaxed) && limit &&
-                  resident * 2 < limit)
-                     ? "  <- far below budget with nothing evicted: a missing persistent target "
-                       "here is NOT a capacity problem"
+                 (bytes_clear && entries_clear && !evicted)
+                     ? "  <- peaked far below BOTH bounds and evicted nothing: a missing "
+                       "persistent target here is NOT a capacity problem"
                      : "");
     std::fflush(stderr);
     return true;
@@ -72,10 +85,12 @@ void note_persistent_target_evicted(uint64_t bytes) {
     g_evicted_bytes.fetch_add(bytes, std::memory_order_relaxed);
 }
 
-void note_persistent_target_residency(uint64_t entries, uint64_t bytes, uint64_t limit_bytes) {
+void note_persistent_target_residency(uint64_t entries, uint64_t entry_limit,
+                                      uint64_t bytes, uint64_t limit_bytes) {
     ensure_registered();
-    g_entries.store(entries, std::memory_order_relaxed);
-    g_resident_bytes.store(bytes, std::memory_order_relaxed);
+    raise_to(g_entries, entries);
+    raise_to(g_resident_bytes, bytes);
+    g_entry_limit.store(entry_limit, std::memory_order_relaxed);
     g_limit_bytes.store(limit_bytes, std::memory_order_relaxed);
 }
 

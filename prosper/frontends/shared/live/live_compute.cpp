@@ -484,54 +484,67 @@ struct RttMirrorCounter {
     uint64_t add() { return count.fetch_add(1, std::memory_order_relaxed) + 1; }
     uint64_t value() const { return count.load(std::memory_order_relaxed); }
 };
-// WHY the GPU seed path refused, counted WHERE THE HOST COPY HAPPENS and weighted by the bytes
-// that copy moves.
+// WHY a path that could have stayed on the GPU refused, counted WHERE THE HOST COPY HAPPENS and
+// weighted by the bytes that copy moves.
 //
-// `bi.standalone_seed_decision` already names the reason with ten distinct values, but only on the
-// per-binding `[compute-rtt-seed]` trace line -- which is unusable at volume, and which nobody
-// reads when the symptom is "the game is slow" rather than "this binding looks wrong". The
-// aggregate is the difference between knowing the seed path is narrow and knowing WHICH of its
-// conditions to widen.
+// Two sites use this, and they answer two halves of one question: why a compute dispatch could not
+// SEED from the renderer's device image, and why its result could not go BACK into one. Both
+// already named the reason on a per-binding trace line, and neither had an aggregate -- which is
+// the difference between knowing a path is narrow and knowing WHICH of its conditions to widen.
 //
 // Weighted by bytes rather than by count on purpose: a reason that refuses many small bindings is
 // not the one to widen, and a count-only histogram cannot tell the two apart.
-struct SeedRefusalCensus {
+struct RefusalCensus {
+    // Bounded so an unexpected flood of distinct reasons cannot turn a census into an unbounded
+    // allocation. Reasons come from a fixed set of string literals; the cap is a backstop.
+    static constexpr size_t kMaxReasons = 64;
+
     std::mutex mutex;
     std::map<std::string, std::pair<uint64_t, uint64_t>> rows;   // reason -> {copies, bytes}
+
+    void note(const char* reason, uint64_t bytes) {
+        const std::string key = reason ? reason : "null";
+        std::lock_guard<std::mutex> lock(mutex);
+        if (rows.size() >= kMaxReasons && rows.find(key) == rows.end()) return;
+        auto& row = rows[key];
+        row.first += 1;
+        row.second += bytes;
+    }
+
+    // Biggest first, because that is the order somebody acts in. Prints nothing when empty, so a
+    // run that never reached the path stays silent instead of reporting a zero.
+    void report(const char* headline) {
+        std::vector<std::pair<std::string, std::pair<uint64_t, uint64_t>>> snapshot;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            snapshot.assign(rows.begin(), rows.end());
+        }
+        if (snapshot.empty()) return;
+        std::sort(snapshot.begin(), snapshot.end(),
+                  [](const auto& a, const auto& b) { return a.second.second > b.second.second; });
+        std::fputs(headline, stderr);
+        for (const auto& row : snapshot)
+            std::fprintf(stderr, "  %s=%.1fMiB/%lluc", row.first.c_str(),
+                         row.second.second / (1024.0 * 1024.0),
+                         (unsigned long long)row.second.first);
+        std::fputc('\n', stderr);
+    }
 };
 
-// Never destroyed, deliberately. `exit_census.hpp`'s contract is that a report must not read an
-// object with a non-trivial destructor: the flush runs from `std::atexit`, which interleaves with
-// `__cxa_atexit` static destruction in an order no registration site controls. A `std::map` and a
-// `std::mutex` destroyed before the flush are a use-after-destruction in the report. Leaking one
-// fixed-size object per process is the standard no-destroy idiom and is what the exit-report
-// registry itself does.
-inline SeedRefusalCensus& destination_refusal_census() {
-    static SeedRefusalCensus* census = new SeedRefusalCensus();
+// Never destroyed, deliberately, and this is a contract rather than a preference. `exit_census.hpp`
+// requires that a report not read an object with a non-trivial destructor: the flush runs from
+// `std::atexit`, which interleaves with `__cxa_atexit` static destruction in an order no
+// registration site controls. One `std::map` member is enough to register a destructor for the
+// whole object, and the report then reads a destroyed container. Leaking one fixed-size object per
+// process is the no-destroy idiom the exit-report registry itself uses.
+inline RefusalCensus& seed_refusal_census() {
+    static RefusalCensus* census = new RefusalCensus();
     return *census;
 }
 
-inline void note_destination_refusal(const char* reason, uint64_t bytes) {
-    auto& c = destination_refusal_census();
-    std::lock_guard<std::mutex> lock(c.mutex);
-    if (c.rows.size() >= 64 && c.rows.find(reason ? reason : "null") == c.rows.end()) return;
-    auto& row = c.rows[reason ? reason : "null"];
-    row.first += 1;
-    row.second += bytes;
-}
-
-inline SeedRefusalCensus& seed_refusal_census() {
-    static SeedRefusalCensus* census = new SeedRefusalCensus();   // see above: never destroyed
+inline RefusalCensus& destination_refusal_census() {
+    static RefusalCensus* census = new RefusalCensus();
     return *census;
-}
-
-inline void note_seed_refusal(const char* reason, uint64_t bytes) {
-    auto& c = seed_refusal_census();
-    std::lock_guard<std::mutex> lock(c.mutex);
-    if (c.rows.size() >= 64 && c.rows.find(reason ? reason : "null") == c.rows.end()) return;
-    auto& row = c.rows[reason ? reason : "null"];
-    row.first += 1;
-    row.second += bytes;
 }
 
 struct RttDestinationCensus {
@@ -560,27 +573,9 @@ RttDestinationCensus& rtt_destination_census() {
                 (unsigned long long)t.candidates, (unsigned long long)t.borrowed,
                 (unsigned long long)t.recorded, (unsigned long long)t.published,
                 (unsigned long long)t.failed);
-            {
-                auto& dc = destination_refusal_census();
-                std::vector<std::pair<std::string, std::pair<uint64_t, uint64_t>>> rows;
-                {
-                    std::lock_guard<std::mutex> lock(dc.mutex);
-                    rows.assign(dc.rows.begin(), dc.rows.end());
-                }
-                if (!rows.empty()) {
-                    std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) {
-                        return a.second.second > b.second.second;
-                    });
-                    std::fprintf(stderr,
-                        "[rtt-destination-refused] RUN TOTAL why a compute result could not go "
-                        "back into the renderer's device image:");
-                    for (const auto& row : rows)
-                        std::fprintf(stderr, "  %s=%.1fMiB/%lluc", row.first.c_str(),
-                                     row.second.second / (1024.0 * 1024.0),
-                                     (unsigned long long)row.second.first);
-                    std::fprintf(stderr, "\n");
-                }
-            }
+            destination_refusal_census().report(
+                "[rtt-destination-refused] RUN TOTAL why a compute result could not go back "
+                "into the renderer's device image:");
             std::fflush(stderr);
             return true;
         });
@@ -4186,9 +4181,23 @@ struct StorageMaterializeCounters {
     std::mutex distinct_mutex;
     std::set<std::pair<uint64_t, uint64_t>> distinct;
 };
+// Never destroyed, for the reason `exit_reports.hpp` states and this file's own report proves:
+// the `[storage-materialize]` report takes `distinct_mutex` and reads `distinct` at exit, and the
+// flush runs from `std::atexit`, which is LIFO against the `__cxa_atexit` entry this static
+// registers.
+//
+// It is the `std::set` specifically, not the whole struct: the atomics are trivially destructible
+// and `std::mutex`'s destructor is trivial too, so a struct holding only those registers no
+// destructor at all. One member with a non-trivial destructor registers one for the object, and
+// then the report reads a destroyed container. It survives today only because the report happens
+// to touch `size()` and libstdc++ leaves the node count intact -- which stops being true the
+// moment the report iterates, or the build defines `_GLIBCXX_ASSERTIONS`.
+//
+// Lazy registration alone does NOT fix this. It changes which report runs after which destructor,
+// and no registration site controls that ordering. (#3872 review.)
 inline StorageMaterializeCounters& storage_materialize_counters() {
-    static StorageMaterializeCounters c;
-    return c;
+    static StorageMaterializeCounters* c = new StorageMaterializeCounters();
+    return *c;
 }
 
 void storage_unpack_range(const uint8_t* src, size_t src_stride, prosper::gpu::DataFormat f,
@@ -9423,9 +9432,6 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     // other. The seed copy is counted separately because it is unconditional on
                     // the write-mask path and nobody counts it at all.
                     {
-                        static std::atomic<uint64_t> exact_n{0}, exact_b{0};
-                        static std::atomic<uint64_t> unpack_n{0}, unpack_b{0};
-                        static std::atomic<uint64_t> seed_n{0}, seed_b{0};
                         static const bool once = [] {
                             prosper::diagnostics::register_census(
                                 "PROSPER_NO_STORAGE_MATERIALIZE_CENSUS", [] {
@@ -9462,37 +9468,15 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                 // Name WHY the GPU seed path refused, biggest first. This is the
                                 // actionable half: the line above says how much is copied, this
                                 // one says which condition to widen to stop copying it.
-                                {
-                                    auto& sc = seed_refusal_census();
-                                    std::vector<std::pair<std::string, std::pair<uint64_t, uint64_t>>>
-                                        rows;
-                                    {
-                                        std::lock_guard<std::mutex> lock(sc.mutex);
-                                        rows.assign(sc.rows.begin(), sc.rows.end());
-                                    }
-                                    if (!rows.empty()) {
-                                        std::sort(rows.begin(), rows.end(),
-                                                  [](const auto& a, const auto& b) {
-                                                      return a.second.second > b.second.second;
-                                                  });
-                                        std::fprintf(stderr,
-                                            "[gpu-seed-refused] RUN TOTAL why the renderer-owned "
-                                            "bindings took a CPU round trip:");
-                                        for (const auto& row : rows)
-                                            std::fprintf(stderr, "  %s=%.1fMiB/%lluc",
-                                                         row.first.c_str(),
-                                                         row.second.second / MiB,
-                                                         (unsigned long long)row.second.first);
-                                        std::fprintf(stderr, "\n");
-                                    }
-                                }
+                                seed_refusal_census().report(
+                                    "[gpu-seed-refused] RUN TOTAL why the renderer-owned bindings took a "
+                                    "CPU round trip:");
                                 std::fflush(stderr);
                                 return true;
                             });
                             return true;
                         }();
-                        (void)once; (void)exact_n; (void)exact_b; (void)unpack_n;
-                        (void)unpack_b; (void)seed_n; (void)seed_b;
+                        (void)once;
                         auto& c = storage_materialize_counters();
                         if (bi.storage_write_mask) {
                             c.seed_n.fetch_add(1, std::memory_order_relaxed);
@@ -9551,8 +9535,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                         // same device they were read from. `standalone_seed_decision`
                                         // says which term of the GPU seed path refused to keep them
                                         // there.
-                                        note_seed_refusal(bi.standalone_seed_decision,
-                                                          static_cast<uint64_t>(texels) * guest_texel);
+                                        seed_refusal_census().note(
+                                            bi.standalone_seed_decision,
+                                            static_cast<uint64_t>(texels) * guest_texel);
                                     }
                                 } else {
                                     d.candidate_refused.fetch_add(1, std::memory_order_relaxed);
@@ -11203,7 +11188,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 // The census's `failed` counter never saw these: the old `continue` left before
                 // anything was recorded, so 8,268 of 11,621 candidates on one title vanished
                 // between "candidate" and "borrowed" with no reason and no count.
-                note_destination_refusal(
+                destination_refusal_census().note(
                     prosper::gpu::live_target_import_refusal_name(destination.refusal),
                     static_cast<uint64_t>(staging_bytes[i]));
                 continue;

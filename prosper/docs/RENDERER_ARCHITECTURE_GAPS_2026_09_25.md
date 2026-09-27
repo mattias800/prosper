@@ -603,14 +603,21 @@ but with no way to show the lever moved, that is not evidence.
 Residency answers it directly, with no lever at all:
 
 ```
-[persistent-targets] RUN TOTAL resident=96 entries / 1540.0 MiB of 4096.0 MiB (37.6% of budget)
+[persistent-targets] PEAK residency 97 of 256 entries, 1604.1 of 4096.0 MiB (39.2% of budget)
                      eviction-attempts=0 evicted=0 (0.0 MiB)
 ```
 
-**Zero eviction attempts, 62% of the budget unused, 96 entries against a 256 limit.** The cache
-never came under pressure, so nothing it held was thrown away. `no-persistent-image` means the
-entry for `{addr, width, height, format, volume_depth}` was **never created** — no graphics pass
-ever made a persistent device image at that key, and the compute path does not make one either.
+**Peaked far below both bounds and evicted nothing.** Read the peaks, not the eviction counter:
+the admission paths skip the eviction loop entirely while a submission batch is pending
+(`avoid_cache_eviction` / `eviction_deferred`), so a target *can* be refused for capacity with
+every eviction counter still reading zero (#3872 review). And the gate has **two** bounds — a byte
+budget and a 256-entry count — either of which refuses a target on its own, so clearing one proves
+nothing. At a high-water mark of 39.2% of the byte budget and 97 of 256 entries, neither could
+have bound.
+
+So `no-persistent-image` means the entry for `{addr, width, height, format, volume_depth}` was
+**never created** — no graphics pass ever made a persistent device image at that key, and the
+compute path does not make one either.
 
 #### The fix this implies
 

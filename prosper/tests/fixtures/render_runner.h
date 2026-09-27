@@ -3079,7 +3079,8 @@ inline PersistentColorTargetImage* find_persistent_color_target(
     // unordered_map lookup, and it is the only reading that is current at the moment a caller is
     // told "there is no persistent image for this target".
     prosper::diagnostics::note_persistent_target_residency(
-        cache.size(), persistent_color_target_bytes(), persistent_color_target_limit());
+        cache.size(), persistent_color_target_count_limit(),
+        persistent_color_target_bytes(), persistent_color_target_limit());
     auto found = cache.find({id, width, height, format, volume_depth});
     if (found == cache.end() || (require_valid && !found->second.valid)) return nullptr;
     return &found->second;

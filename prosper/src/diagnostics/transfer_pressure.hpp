@@ -21,8 +21,10 @@
 // nobody was computing: **bytes per second**. 770 MiB/s of host copying on a static splash screen
 // is self-evidently wrong the moment anyone sees the number, and nobody had to see it.
 //
-// So this is deliberately NOT another opt-in census. It runs by default, costs two relaxed atomic
-// adds per site, and prints one line at end of run. A number nobody is looking at is not a
+// So this is deliberately NOT another opt-in census. It runs by default and prints one line at end
+// of run. Its per-site cost is two relaxed `fetch_add`s plus a `clock_gettime` and two more relaxed
+// operations to maintain the window -- the clock read dominates, so call it once per transfer, not
+// once per row or per texel. A number nobody is looking at is not a
 // measurement, and the four defects above are what that costs.
 //
 // WHAT IT IS NOT. It does not measure GPU traffic, DMA, or anything the guest does -- only bytes
@@ -51,7 +53,8 @@ enum class Transfer : unsigned char {
 
 const char* transfer_name(Transfer category);
 
-// Two relaxed atomic adds. Safe from any thread and during static initialisation.
+// Two relaxed atomic adds, a monotonic clock read, and two more relaxed operations for the window.
+// Safe from any thread and during static initialisation.
 void note_transfer(Transfer category, uint64_t bytes);
 
 // Process-lifetime totals, for tests and tools.
