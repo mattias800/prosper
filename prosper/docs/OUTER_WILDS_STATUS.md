@@ -169,3 +169,24 @@ forming a performance hypothesis on this title — every row here cost a session
   buffer copy. `CONFIDENCE: MED` — the pool figures are another lane's measurement on another
   title, restated here so this route's own number is not read as current, and not independently
   reproduced.
+
+- **The first-person route's per-frame `vkAllocateMemory` churn is a pool-size or allocator
+  problem** — falsified 2026-09-27 (#3873). The route made ~690 `vkAllocateMemory` + as many
+  `vkFreeMemory` per second (an `LD_PRELOAD` interposer on the hot thread, 5 s windows), and the
+  obvious reading is that an exact-size pool misses or a budget is too small. Neither is it:
+  raising `PROSPER_MEMORY_POOL_MB` to 4096 or `PROSPER_BACKEND_TEXTURE_CACHE_MB` to 12288 left the
+  rate unchanged (n=1 each, perf-arch lane B). The opt-in texture-path census named the cause:
+  the resident-texture cache sat at 4294846464 of 4294967296 bytes with **0 evictions**, and every
+  one of the big pass's 59 misses was a stable, version-1 texture refused admission for lack of
+  room (`refused_bytes=59`, `retained=0`). Eviction was skipped whenever an earlier command buffer
+  of the ordered batch was pending, which in the batched live renderer is nearly always — so a
+  cache filled during the load could never admit anything again, and ~60 textures a frame were
+  uploaded into a fresh image, allocation and staging block and freed at completion. A larger
+  budget only moves the point at which it fills. The fix is completion-gated eviction of images no
+  pass of the pending batch has used. With it the same census reports 129 of 129 eligible
+  references as hits, and allocations fall from ~690/s to 70-94/s. Four interleaved arms on one
+  binary (off, on, off, on) give F8 guest flips/s of 5.18, 9.97, 5.58, 10.16, and backend texture
+  upload drops from ~1400 to 172-191 ms per 5 s window. Prosper-held device memory stays level:
+  steady state rises ~300 MiB and the peak falls ~500 MiB. The GTA V control moved 6.37/7.17 to
+  6.92/7.96, which is inside that route's drift, so treat it as neutral. #3873.
+  `PROSPER_NO_DEFERRED_TEXTURE_EVICTION=1` reproduces the old rule in the same binary.
