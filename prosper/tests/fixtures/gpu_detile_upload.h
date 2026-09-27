@@ -4,6 +4,7 @@
 #include "gpu/texture/tile.hpp"
 #include "diagnostics/env_cache.hpp"
 #include "mapped_staging.h"
+#include "vk_object_recycling.h"
 #include <vulkan/vulkan.h>
 #include <array>
 #include <atomic>
@@ -96,12 +97,15 @@ struct GpuDetileUpload {
     // A writable storage consumer needs a separate completed-result mapping. It
     // never overwrites the immutable input or aliases the device conversion output.
     MappedStagingBlock readback{};
-    VkDescriptorPool pool = VK_NULL_HANDLE;
+    // From the shared bounded free list: a pool per upload used to be a driver buffer object
+    // created and destroyed per upload (render_runner.h's per-pass pools had the same shape).
+    RenderDescriptorPoolLease pool{};
     VkDescriptorSet descriptors = VK_NULL_HANDLE;
     uint32_t width = 0, height = 0, faces = 0, count = 0;
     VkDeviceSize source_bytes = 0, output_bytes = 0;
     ~GpuDetileUpload() {
-        if (pool) vkDestroyDescriptorPool(device, pool, nullptr);
+        // Completion-gated like everything else here: see the comment just below.
+        release_render_descriptor_pool(device, pool);
         // Submission cleanup retains this object until completion is proven. Reuse
         // is safe only here, after the LAST owner releases the immutable snapshot.
         if (!release_mapped_staging(device, input, input_memory, input_mapped, input_lease,
@@ -272,13 +276,11 @@ inline std::shared_ptr<GpuDetileUpload> prepare_gpu_detile_upload(
         copied = copy_source(static_cast<uint8_t*>(mapped) + 80 + face * face_bytes,
                              first + face * face_stride, face_bytes) == face_bytes;
     if (!copied) return {};
-    const VkDescriptorPoolSize pool_size{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2};
-    VkDescriptorPoolCreateInfo pci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-    pci.maxSets = 1; pci.poolSizeCount = 1; pci.pPoolSizes = &pool_size;
-    if (vkCreateDescriptorPool(program.device, &pci, nullptr, &upload->pool) != VK_SUCCESS)
-        return {};
+    upload->pool = acquire_render_descriptor_pool(program.device,
+                                                  RenderDescriptorPoolCapacity{1, 2, 0, 0});
+    if (!upload->pool) return {};
     VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-    dai.descriptorPool = upload->pool; dai.descriptorSetCount = 1;
+    dai.descriptorPool = upload->pool.pool; dai.descriptorSetCount = 1;
     dai.pSetLayouts = &program.descriptors;
     if (vkAllocateDescriptorSets(program.device, &dai, &upload->descriptors) != VK_SUCCESS)
         return {};

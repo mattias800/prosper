@@ -1,14 +1,16 @@
-// test_descriptor_pool_reuse — the bounded VkDescriptorPool free list behind every render pass.
+// test_vk_object_recycling — the bounded free lists behind every render pass and batch
+// (tests/fixtures/vk_object_recycling.h): descriptor pools, batch fences, batch timestamp pools.
 //
+// DESCRIPTOR POOLS.
 // The property under test is that a retired pool is RESET AND HANDED BACK rather than destroyed and
 // rebuilt, that a pool in use is never handed to a second caller, that a handed-back pool really is
 // empty (its full capacity allocatable again), that a pool too small for a request is never handed
 // out for it, and that what is retained is BOUNDED. Rendering correctness is covered by the existing
 // render tests, which all allocate their descriptor sets from this list.
 //
-// Runs twice from CMake: once normally, once with PROSPER_NO_DESCRIPTOR_POOL_REUSE=1. The second
-// run is the negative control, and it is a separate PROCESS because the switch is read once into a
-// function-local static.
+// Runs twice from CMake: once normally, once with PROSPER_NO_RENDER_DESCRIPTOR_POOL_REUSE=1 and
+// PROSPER_NO_RENDER_SYNC_OBJECT_REUSE=1. The second run is the negative control, and it is a separate
+// PROCESS because the switches are read once into function-local statics.
 #include "fixtures/render_runner.h"
 #include <cstdlib>
 #include <set>
@@ -28,8 +30,8 @@ int main() {
         std::printf("[skip] no Vulkan device\n");
         return 0;
     }
-    const bool reuse = std::getenv("PROSPER_NO_DESCRIPTOR_POOL_REUSE") == nullptr;
-    std::printf("== test_descriptor_pool_reuse (reuse %s) ==\n", reuse ? "ENABLED" : "DISABLED");
+    const bool reuse = std::getenv("PROSPER_NO_RENDER_DESCRIPTOR_POOL_REUSE") == nullptr;
+    std::printf("== test_vk_object_recycling (reuse %s) ==\n", reuse ? "ENABLED" : "DISABLED");
     check(render_descriptor_pool_reuse_enabled() == reuse,
           "the mode under test is the mode the switch reports");
 
@@ -148,6 +150,41 @@ int main() {
 
     drain_render_descriptor_pool_cache(ctx.dev);
     check(render_descriptor_pool_stats().cached == 0, "draining empties the list for this device");
+
+    // BATCH FENCES. A recycled fence must come back UNSIGNALED: a fence handed back still signaled
+    // would make the next batch's vkWaitForFences return at once, and its cleanups would destroy or
+    // recycle resources the GPU is still using. That is the arm that pins the reset.
+    check(render_sync_object_reuse_enabled() == reuse, "the sync-object switch matches the mode");
+    auto submit_empty = [&](VkFence fence) {
+        return vkQueueSubmit(ctx.queue, 0, nullptr, fence) == VK_SUCCESS &&
+               vkWaitForFences(ctx.dev, 1, &fence, VK_TRUE, UINT64_MAX) == VK_SUCCESS;
+    };
+    VkFence fence_a = acquire_render_batch_fence(ctx.dev);
+    check(fence_a != VK_NULL_HANDLE, "a batch fence is acquired");
+    check(vkGetFenceStatus(ctx.dev, fence_a) == VK_NOT_READY, "...unsignaled");
+    check(submit_empty(fence_a), "...and it signals through a real submit");
+    check(vkGetFenceStatus(ctx.dev, fence_a) == VK_SUCCESS, "...so it is signaled before release");
+    release_render_batch_fence(ctx.dev, fence_a);
+    VkFence fence_b = acquire_render_batch_fence(ctx.dev);
+    if (reuse) check(fence_b == fence_a, "a released fence is handed back, not rebuilt");
+    check(vkGetFenceStatus(ctx.dev, fence_b) == VK_NOT_READY,
+          "a handed-back fence is UNSIGNALED, so the next wait really waits");
+    VkFence fence_c = acquire_render_batch_fence(ctx.dev);
+    check(fence_c && fence_c != fence_b, "a fence in use is never handed to a second batch");
+    check(submit_empty(fence_b), "the recycled fence signals through a real submit again");
+    release_render_batch_fence(ctx.dev, fence_b);
+    release_render_batch_fence(ctx.dev, fence_c);
+
+    // BATCH TIMESTAMP POOLS: recycled as-is; the batch records vkCmdResetQueryPool before use.
+    VkQueryPool pool_a = acquire_render_timestamp_pool(ctx.dev);
+    check(pool_a != VK_NULL_HANDLE, "a timestamp pool is acquired");
+    release_render_timestamp_pool(ctx.dev, pool_a);
+    VkQueryPool pool_b = acquire_render_timestamp_pool(ctx.dev);
+    if (reuse) check(pool_b == pool_a, "a released timestamp pool is handed back, not rebuilt");
+    VkQueryPool pool_c = acquire_render_timestamp_pool(ctx.dev);
+    check(pool_c && pool_c != pool_b, "a timestamp pool in use is never handed out twice");
+    release_render_timestamp_pool(ctx.dev, pool_b);
+    release_render_timestamp_pool(ctx.dev, pool_c);
     vkDestroyDescriptorSetLayout(ctx.dev, layout, nullptr);
     std::printf("== %s (%d failure%s) ==\n", failures ? "FAIL" : "PASS", failures,
                 failures == 1 ? "" : "s");

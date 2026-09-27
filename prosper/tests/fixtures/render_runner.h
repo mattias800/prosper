@@ -12,6 +12,7 @@
 #include <vulkan/vulkan.h>
 #include "gpu_detile_upload.h"
 #include "mapped_staging.h"
+#include "vk_object_recycling.h"
 #include "buffer_range_plan.h"
 #include "gpu/capture/gpu_capture.hpp"
 #include "gpu/diagnostics/gpu_memory_budget_vk.hpp"  // #3533: count what we hold on each heap
@@ -2519,12 +2520,8 @@ public:
         if (pending_resources_abandoned_ || !commands_.empty() || gpu_timestamp_.pool ||
             !dev || !command || period_ns <= 0.0 || !valid_bits)
             return;
-        VkQueryPoolCreateInfo query_info{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
-        query_info.queryType = VK_QUERY_TYPE_TIMESTAMP;
-        query_info.queryCount = 2;
-        VkQueryPool pool = VK_NULL_HANDLE;
-        if (vkCreateQueryPool(dev, &query_info, nullptr, &pool) != VK_SUCCESS || !pool)
-            return;
+        const VkQueryPool pool = acquire_render_timestamp_pool(dev);
+        if (!pool) return;
         gpu_timestamp_ = {dev, pool, period_ns, valid_bits, false};
         vkCmdResetQueryPool(command, pool, 0, 2);
         vkCmdWriteTimestamp(command, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, pool, 0);
@@ -2631,9 +2628,8 @@ public:
         VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
         submit.commandBufferCount = static_cast<uint32_t>(commands_.size());
         submit.pCommandBuffers = commands_.data();
-        VkFenceCreateInfo fence_info{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-        VkFence fence = VK_NULL_HANDLE;
-        if (vkCreateFence(dev, &fence_info, nullptr, &fence) != VK_SUCCESS || !fence) {
+        const VkFence fence = acquire_render_batch_fence(dev);
+        if (!fence) {
             result.submit_result = VK_ERROR_INITIALIZATION_FAILED;
             discard();
             return result;
@@ -2712,7 +2708,9 @@ public:
             // against each other on identical work rather than across a run (#2333).
             backend_pass_timing_report(state == BackendSubmissionState::Complete,
                                        result.gpu_timestamp_samples ? result.gpu_device_ms : -1.0);
-            vkDestroyFence(dev, fence, nullptr);
+            // Reached only when the state is not Pending: either completion was proven or the
+            // submit itself failed, so no queue operation can still signal this fence.
+            release_render_batch_fence(dev, fence);
             commands_.clear();
             finish_persistent_state(state == BackendSubmissionState::Complete);
             if (state == BackendSubmissionState::Complete && completed_observer_) {
@@ -2747,8 +2745,7 @@ private:
     };
 
     void release_gpu_timestamp() {
-        if (gpu_timestamp_.pool)
-            vkDestroyQueryPool(gpu_timestamp_.dev, gpu_timestamp_.pool, nullptr);
+        release_render_timestamp_pool(gpu_timestamp_.dev, gpu_timestamp_.pool);
         gpu_timestamp_ = {};
     }
 
@@ -3762,177 +3759,6 @@ inline RenderCommandPoolStats render_command_pool_stats() {
     std::lock_guard<std::mutex> lock(cache.mutex);
     return RenderCommandPoolStats{cache.hits, cache.misses, cache.retired, cache.destroyed,
                                   cache.available.size()};
-}
-
-// ---------------------------------------------------------------------------------------------
-// Bounded VkDescriptorPool free list -- the descriptor-pool twin of the command-pool list above.
-//
-// Every render pass used to create one descriptor pool sized exactly to its draws and destroy it
-// when the pass completed. On RADV each pool is a kernel buffer object: create, GPU-VA map, CPU map,
-// and on destroy the reverse. Measured on the routed Grand Theft Auto V window (2026-09-27, strace
-// of the submitting thread): ~13,100 BO creates and as many closes per 10 s, most of them 48-464
-// byte descriptor-pool buffers, and the BO lifecycle at ~9% of that thread's CPU. The per-pass pool
-// was the largest single caller.
-//
-// A retired pool is RESET (which releases its sets but keeps its buffer object) and handed to the
-// next pass whose requirement it covers. Capacities are rounded up to a power of two at creation so
-// passes with slightly different draw counts share pools instead of each needing an exact fit.
-//
-// Retirement is completion-gated exactly like the command pool: the pass's cleanup, which runs only
-// after the GPU has signalled the pass complete, is the only caller of release. vkResetDescriptorPool
-// requires that no command buffer using its sets is still pending, which that ordering guarantees.
-//
-// BOUNDED: each retained pool keeps its buffer object, so the list is capped
-// (PROSPER_DESCRIPTOR_POOL_CACHE, default 32). PROSPER_NO_DESCRIPTOR_POOL_REUSE restores the old
-// exact-size create/destroy behaviour and is the negative control the test uses.
-struct RenderDescriptorPoolCapacity {
-    uint32_t sets = 0;
-    uint32_t storage_buffers = 0;
-    uint32_t sampled_images = 0;
-    uint32_t storage_images = 0;
-    bool covers(const RenderDescriptorPoolCapacity& need) const {
-        return sets >= need.sets && storage_buffers >= need.storage_buffers &&
-               sampled_images >= need.sampled_images && storage_images >= need.storage_images;
-    }
-    uint64_t total() const {
-        return uint64_t(sets) + storage_buffers + sampled_images + storage_images;
-    }
-};
-
-struct RenderDescriptorPoolLease {
-    VkDescriptorPool pool = VK_NULL_HANDLE;
-    RenderDescriptorPoolCapacity capacity{};
-    explicit operator bool() const { return pool != VK_NULL_HANDLE; }
-};
-
-struct RenderDescriptorPoolEntry {
-    VkDevice device = VK_NULL_HANDLE;
-    RenderDescriptorPoolLease lease{};
-};
-
-struct RenderDescriptorPoolCache {
-    std::mutex mutex;
-    std::vector<RenderDescriptorPoolEntry> available;
-    uint64_t hits = 0, misses = 0, retired = 0, destroyed = 0;
-};
-
-struct RenderDescriptorPoolStats {
-    uint64_t hits = 0, misses = 0, retired = 0, destroyed = 0;
-    size_t cached = 0;
-};
-
-inline RenderDescriptorPoolCache& render_descriptor_pool_cache() {
-    static RenderDescriptorPoolCache cache;
-    return cache;
-}
-
-inline bool render_descriptor_pool_reuse_enabled() {
-    static const bool enabled = getenv("PROSPER_NO_DESCRIPTOR_POOL_REUSE") == nullptr;
-    return enabled;
-}
-
-inline size_t render_descriptor_pool_cache_limit() {
-    static const size_t limit = []() -> size_t {
-        const char* value = getenv("PROSPER_DESCRIPTOR_POOL_CACHE");
-        return static_cast<size_t>(prosper::diag::env_u64_or_default_capped(
-            "PROSPER_DESCRIPTOR_POOL_CACHE", value, 32ull, 256ull, "pools"));
-    }();
-    return limit;
-}
-
-// Round a requirement up so neighbouring passes can share one pool. The floor keeps tiny passes
-// (one or two draws) from each minting their own size class.
-inline uint32_t render_descriptor_pool_round_up(uint32_t value) {
-    uint32_t rounded = 16;
-    while (rounded < value && rounded < (1u << 30)) rounded <<= 1;
-    return rounded;
-}
-
-inline RenderDescriptorPoolStats render_descriptor_pool_stats() {
-    RenderDescriptorPoolCache& cache = render_descriptor_pool_cache();
-    std::lock_guard<std::mutex> lock(cache.mutex);
-    return RenderDescriptorPoolStats{cache.hits, cache.misses, cache.retired, cache.destroyed,
-                                     cache.available.size()};
-}
-
-// Returns a pool whose capacity covers `need`, with no sets allocated from it. A null lease means
-// vkCreateDescriptorPool failed; the caller treats that exactly like the old failed create.
-inline RenderDescriptorPoolLease acquire_render_descriptor_pool(
-        VkDevice device, const RenderDescriptorPoolCapacity& need) {
-    const bool reuse = render_descriptor_pool_reuse_enabled();
-    if (reuse) {
-        RenderDescriptorPoolCache& cache = render_descriptor_pool_cache();
-        std::lock_guard<std::mutex> lock(cache.mutex);
-        // Smallest covering pool, so one oversized pool is not spent on a one-draw pass while a
-        // large pass that needs it creates another.
-        size_t best = cache.available.size();
-        for (size_t i = 0; i < cache.available.size(); ++i) {
-            const RenderDescriptorPoolEntry& entry = cache.available[i];
-            if (entry.device != device || !entry.lease.capacity.covers(need)) continue;
-            if (best == cache.available.size() ||
-                entry.lease.capacity.total() < cache.available[best].lease.capacity.total())
-                best = i;
-        }
-        if (best != cache.available.size()) {
-            const RenderDescriptorPoolLease lease = cache.available[best].lease;
-            cache.available[best] = cache.available.back();
-            cache.available.pop_back();
-            ++cache.hits;
-            return lease;
-        }
-        ++cache.misses;
-    }
-    RenderDescriptorPoolCapacity capacity = need;
-    if (reuse) {
-        capacity.sets = render_descriptor_pool_round_up(need.sets);
-        capacity.storage_buffers = render_descriptor_pool_round_up(need.storage_buffers);
-        capacity.sampled_images = render_descriptor_pool_round_up(need.sampled_images);
-        capacity.storage_images = render_descriptor_pool_round_up(need.storage_images);
-    }
-    VkDescriptorPoolSize sizes[3] = {
-        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, std::max<uint32_t>(capacity.storage_buffers, 1)},
-        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, std::max<uint32_t>(capacity.sampled_images, 1)},
-        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, std::max<uint32_t>(capacity.storage_images, 1)},
-    };
-    VkDescriptorPoolCreateInfo info{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-    info.maxSets = std::max<uint32_t>(capacity.sets, 1);
-    info.poolSizeCount = 3;
-    info.pPoolSizes = sizes;
-    VkDescriptorPool pool = VK_NULL_HANDLE;
-    if (vkCreateDescriptorPool(device, &info, nullptr, &pool) != VK_SUCCESS || !pool) return {};
-    return RenderDescriptorPoolLease{pool, capacity};
-}
-
-// Completion-gated: call only once no pending command buffer references a set from this pool.
-inline void release_render_descriptor_pool(VkDevice device,
-                                           const RenderDescriptorPoolLease& lease) {
-    if (!lease.pool) return;
-    if (render_descriptor_pool_reuse_enabled()) {
-        RenderDescriptorPoolCache& cache = render_descriptor_pool_cache();
-        std::lock_guard<std::mutex> lock(cache.mutex);
-        if (cache.available.size() < render_descriptor_pool_cache_limit() &&
-            vkResetDescriptorPool(device, lease.pool, 0) == VK_SUCCESS) {
-            cache.available.push_back(RenderDescriptorPoolEntry{device, lease});
-            ++cache.retired;
-            return;
-        }
-        ++cache.destroyed;
-    }
-    vkDestroyDescriptorPool(device, lease.pool, nullptr);
-}
-
-// Destroys every retained pool for `device`. The device owner calls this before vkDestroyDevice;
-// tests use it to start from a known-empty list.
-inline void drain_render_descriptor_pool_cache(VkDevice device) {
-    RenderDescriptorPoolCache& cache = render_descriptor_pool_cache();
-    std::lock_guard<std::mutex> lock(cache.mutex);
-    for (size_t i = cache.available.size(); i-- > 0;) {
-        if (cache.available[i].device != device) continue;
-        vkDestroyDescriptorPool(device, cache.available[i].lease.pool, nullptr);
-        cache.available[i] = cache.available.back();
-        cache.available.pop_back();
-        ++cache.destroyed;
-    }
 }
 
 inline VkDeviceMemory allocate_transient_render_memory(VkDevice device, VkDeviceSize bytes,
