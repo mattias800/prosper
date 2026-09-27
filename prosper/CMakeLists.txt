@@ -4463,6 +4463,16 @@ if(TARGET prosper_core AND TARGET Vulkan::Vulkan)
   set_tests_properties(command_pool_reuse_disabled PROPERTIES
                        ENVIRONMENT "PROSPER_NO_COMMAND_POOL_REUSE=1")
 
+  # The bounded VkDescriptorPool free list behind every render pass. Registered twice like the
+  # command-pool list above: the second run is the PROSPER_NO_DESCRIPTOR_POOL_REUSE negative control.
+  add_executable(test_descriptor_pool_reuse tests/gpu/execute/test_descriptor_pool_reuse.cpp)
+  target_include_directories(test_descriptor_pool_reuse PRIVATE tests frontends)
+  target_link_libraries(test_descriptor_pool_reuse PRIVATE prosper_core Vulkan::Vulkan)
+  add_test(NAME descriptor_pool_reuse COMMAND test_descriptor_pool_reuse)
+  add_test(NAME descriptor_pool_reuse_disabled COMMAND test_descriptor_pool_reuse)
+  set_tests_properties(descriptor_pool_reuse_disabled PROPERTIES
+                       ENVIRONMENT "PROSPER_NO_DESCRIPTOR_POOL_REUSE=1")
+
   add_executable(test_mapped_staging tests/gpu/execute/test_mapped_staging.cpp)
   target_include_directories(test_mapped_staging PRIVATE tests frontends)
   target_link_libraries(test_mapped_staging PRIVATE prosper_core Vulkan::Vulkan)
