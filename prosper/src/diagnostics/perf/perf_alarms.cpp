@@ -126,7 +126,7 @@ std::vector<AlarmFiring> AlarmEngine::close_window(const WindowSample& w, double
         }
         if (config_.log && prosper::diag_should_print(ordinal, kPrintFirstN)) {
             char cost[48] = "";
-            if (a.cost_ms >= 0) std::snprintf(cost, sizeof cost, " cost≈%.0fms", a.cost_ms);
+            if (a.cost_ms >= 0) std::snprintf(cost, sizeof cost, " cost~%.0fms", a.cost_ms);
             std::fprintf(config_.log,
                          "[perf-alarm] #%llu rule=%s t=%.0fs window=%.1fs value=%.2f %s "
                          "threshold=%.2f%s %s hint=%s\n",

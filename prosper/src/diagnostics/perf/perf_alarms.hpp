@@ -6,7 +6,7 @@
 // the title's own frame budget, and the next instrument to reach for.
 //
 // Output, all default-on:
-//   * stderr: `[perf-alarm] #<n> rule=<r> window=<s>s value=<v> <unit> threshold=<t> cost≈<ms>
+//   * stderr: `[perf-alarm] #<n> rule=<r> window=<s>s value=<v> <unit> threshold=<t> cost~<ms>
 //     <detail> hint=<...>`. De-duplicated per rule on diag_ratelimit's contract: the first three
 //     firings, then powers of two, each carrying its 1-based ordinal -- so the last ordinal is a
 //     lower bound on how many windows fired, and the line count never is.
