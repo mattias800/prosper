@@ -12,6 +12,7 @@
 // site that has slipped past this, and a ctest case runs it.
 #pragma once
 #include "gpu/diagnostics/gpu_memory_budget.hpp"
+#include "diagnostics/perf/perf_ledger.hpp"   // #3891: allocation churn beside the texture alarm
 
 #include <vulkan/vulkan.h>
 
@@ -40,6 +41,7 @@ inline VkResult allocate_device_memory(VkDevice device, const VkMemoryAllocateIn
                                        VkDeviceMemory* out) {
     const VkResult status = vkAllocateMemory(device, info, nullptr, out);
     if (status == VK_SUCCESS) {
+        prosper::diagnostics::perf::add(prosper::diagnostics::perf::Counter::DeviceAllocations);
         if (info)
             note_device_alloc((uint64_t)*out, info->memoryTypeIndex,
                               (uint64_t)info->allocationSize);

@@ -19,6 +19,7 @@
 #include "gpu/execute/gpu_execute.hpp"         // shared_vulkan_context / gpu-present activation (#1270)
 #include "gpu/capture/gpu_capture.hpp"         // request_interactive_gpu_capture (F9 frame grab)
 #include "gpu/diagnostics/gpu_memory_budget_vk.hpp"  // #3533: count what we hold on each heap
+#include "diagnostics/perf/perf_ledger.hpp"  // #3891: present-cpu-overhead alarm
 #include "gpu/timeline/gpu_timeline.hpp"        // request_interactive_capture_bundle (F9 whole-frame grab)
 #include "capture_schedule.hpp"        // exact host-frame screenshot calibration trigger
 #include "shared/present/present_blit.hpp"           // GPU scanout handoff: acquire/release the renderer's front image
@@ -735,6 +736,9 @@ prosper::frontend::PresentAttempt present_frame_gpu(Vk& vk, const prosper::front
     // readable here at no cost. Signing it one frame late is invisible in a rate: the counter needs
     // the interval between distinct frames, not the frame's own timestamp.
     if (vk.samplePending) {
+        // #3891: the present thread's CPU work outside its GPU waits -- present-cpu-overhead.
+        const prosper::diagnostics::perf::CostScope perf_present(
+            prosper::diagnostics::perf::Cost::PresentCpu);
         vk.samplePending = false;
         gpu::note_present_publication_signature(
             gpu::dense_content_signature(static_cast<const uint8_t*>(vk.sampleMapped),

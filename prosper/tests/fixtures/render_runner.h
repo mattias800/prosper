@@ -21,6 +21,7 @@
 #include "gpu/diagnostics/diagnostic_selectors.hpp"
 #include "gpu/diagnostics/draw_disposition.hpp"  // why a draw did not reach the GPU
 #include "diagnostics/readback_reason_census.hpp"  // why a colour target is copied back
+#include "diagnostics/perf/perf_ledger.hpp"         // #3891: always-on alarm ledger
 #include "diagnostics/exit_census.hpp"       // one-line end-of-run reports
 #include "diagnostics/persistent_target_census.hpp"  // is the colour-target cache at its bound?
 #include "gpu/diagnostics/geometry_probe_arming.hpp"
@@ -6527,6 +6528,9 @@ inline bool readback_persistent_color_target(uint64_t id, uint32_t width, uint32
                                              VkFormat format, std::vector<uint8_t>& output,
                                              std::string& error, uint32_t volume_depth) {
     output.clear(); error.clear();
+    // #3891: a CPU readback of a GPU surface (outermost scope only; nested helpers are one event).
+    const prosper::diagnostics::perf::CostScope perf_readback(
+        prosper::diagnostics::perf::Cost::SurfaceReadback);
     if (backend_has_unproven_submission()) {
         error = "Vulkan submission completion is unproven";
         return false;
@@ -6958,6 +6962,9 @@ struct PersistentDsDepthReadback {
 
     bool acquire(PersistentDsImage& image, uint32_t width, uint32_t height,
                  std::string& error) {
+        // #3891: a CPU readback of a GPU surface (outermost scope only; nested helpers are one event).
+        const prosper::diagnostics::perf::CostScope perf_readback(
+            prosper::diagnostics::perf::Cost::SurfaceReadback);
         error.clear();
         if (!image.image || !image.layout_initialized || !image.depth_valid) {
             error = "retained DS image has no readable depth plane";
@@ -7136,6 +7143,9 @@ inline PersistentDsDepthArrayStatus read_persistent_ds_depth_array(
         BackendSubmissionBatch* producer_batch = nullptr) {
     const BackendPersistentResourceGuard guard;
     int fail_after = depth_array_readback_failure_after_layers();
+    // #3891: a CPU readback of a GPU surface (outermost scope only; nested helpers are one event).
+    const prosper::diagnostics::perf::CostScope perf_readback(
+        prosper::diagnostics::perf::Cost::SurfaceReadback);
     depth_array_readback_failure_after_layers() = -1;
     std::vector<PersistentDsImage*> selected;
     uint32_t format = VK_FORMAT_UNDEFINED;
@@ -13824,6 +13834,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         persistent_texture_deferred_eviction_enabled() && active_submission.pending() &&
         !backend_has_unproven_submission();
     const bool texture_eviction_allowed = !avoid_cache_eviction || defer_texture_eviction;
+    // #3891 perf ledger: per-pass counts, flushed once after admission (texture-cache-thrash).
+    uint64_t perf_texture_evictions = 0, perf_texture_refusals = 0, perf_texture_refused_bytes = 0;
     auto evict_persistent_texture = [&]() {
         const uint64_t protected_from = defer_texture_eviction
             ? persistent_texture_batch_floor : texture_generation;
@@ -13864,6 +13876,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         persistent_texture_binding_entries -= victim->second.bindings.size();
         persistent_texture_images.erase(victim);
         texture_path_census.evicted();
+        ++perf_texture_evictions;
         return true;
     };
     for (auto& upload : texture_uploads) {
@@ -13903,11 +13916,26 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 persistent_texture_images.size() >= persistent_texture_max_entries,
                 upload.image_bytes > persistent_texture_limit ||
                 persistent_texture_bytes > persistent_texture_limit - upload.image_bytes);
+            // Refused for lack of ROOM, not for being larger than the whole budget: only the first
+            // is a cache that should have evicted.
+            if (upload.image_bytes <= persistent_texture_limit) {
+                ++perf_texture_refusals;
+                perf_texture_refused_bytes += upload.image_bytes;
+            }
         }
     }
     if (texture_eviction_allowed)
         while (persistent_texture_bytes > persistent_texture_limit &&
                evict_persistent_texture()) {}
+    if (prosper::diagnostics::perf::enabled()) {
+        namespace perf = prosper::diagnostics::perf;
+        perf::add(perf::Counter::TextureCacheMisses, persistent_texture_misses);
+        perf::add(perf::Counter::TextureCacheRefusals, perf_texture_refusals);
+        perf::add(perf::Counter::TextureCacheRefusedBytes, perf_texture_refused_bytes);
+        perf::add(perf::Counter::TextureCacheEvictions, perf_texture_evictions);
+        perf::set(perf::Gauge::TextureCacheBytes, persistent_texture_bytes);
+        perf::set(perf::Gauge::TextureCacheLimit, persistent_texture_limit);
+    }
     texture_path_census.cache_after(persistent_texture_images.size(),
                                     persistent_texture_bytes);
     resource_reuse_stats.persistent_texture_binding_entries = persistent_texture_binding_entries;

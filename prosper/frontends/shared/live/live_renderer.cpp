@@ -57,6 +57,7 @@
 #include "gpu/diagnostics/diag_ratelimit.hpp"       // ordinal + sparse tail for capped diagnostics
 #include "host/memory/guest_write_watch.hpp"
 #include "fixtures/render_runner.h"              // offscreen Vulkan backend (render_draws_rgba) + dump_bmp
+#include "diagnostics/perf/perf_ledger.hpp"       // #3891: always-on alarm ledger
 #include "fixtures/retained_depth_array_gpu.h"   // GPU-resident retained depth-array snapshots
 
 #include <atomic>
@@ -3574,6 +3575,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     if (!reflected_binding) continue;
                     const auto resource_timing_start = timing_enabled
                         ? RenderClock::now() : RenderClock::time_point{};
+                    if (r.cls == RC::Texture)   // #3891 ledger: a plain thread-local tally
+                        ++prosper::diagnostics::perf::thread_texture_references();
                     // PROSPER_TEXREF_CENSUS: null unless the census is armed for this reference.
                     prosper::frontend::TextureReferenceCensus* const texref_census =
                         prosper::frontend::TextureReferenceCensus::enabled() &&
@@ -9616,6 +9619,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     // residual, where it reads as unattributed work -- the exact defect this
                     // partition exists to make visible.
                     if (!built_resources.complete || !contract_ok) {
+                        // #3891: a dropped draw is a correctness alarm, not only a timing bucket.
+                        prosper::diagnostics::perf::add(
+                            prosper::diagnostics::perf::Counter::DroppedDrawsFrontend);
                         if (timing_enabled) ++pending_timing.build_rejected;
                         continue;
                     }
@@ -11212,7 +11218,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 first ? first->color1_width : 0u,
                                 first ? first->color1_height : 0u, native_w, native_h);
                     }
-                    const auto build_start = timing_enabled
+                    // #3891: one clock pair per pass group feeds the always-on ledger too.
+                    const bool perf_build_clock = prosper::diagnostics::perf::enabled();
+                    const auto build_start = timing_enabled || perf_build_clock
                         ? RenderClock::now() : RenderClock::time_point{};
                     prosper::test::BackendColorTarget backend_target{
                         base, seed_rtt0, base != 0 && !defer_readback, pass_format};
@@ -11259,8 +11267,15 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     }
                     auto backend_draws = build_bds(
                         render_pass, batch_backend_submits ? &backend_submission : nullptr);
-                    const auto build_done = timing_enabled
+                    const auto build_done = timing_enabled || perf_build_clock
                         ? RenderClock::now() : RenderClock::time_point{};
+                    if (perf_build_clock) {
+                        prosper::diagnostics::perf::add_cost(
+                            prosper::diagnostics::perf::Cost::FrontendBuild,
+                            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                build_done - build_start).count()));
+                        prosper::diagnostics::perf::flush_thread_texture_references();
+                    }
                     prosper::test::BackendMrtOutputs mrt_outputs;
                     mrt_outputs.color_count = mrt_count;
                     // The colour target is passed whenever ANY slot is bound, not colour-0 alone.
@@ -12228,11 +12243,19 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 // Single-framebuffer path: render_draws_rgba composites every draw into ONE framebuffer.
                 std::vector<const prosper::gpu::DrawItem*> all; all.reserve(items.size());
                 for (const auto& it : items) all.push_back(&it);
-                const auto build_start = timing_enabled
+                const bool perf_build_clock = prosper::diagnostics::perf::enabled();   // #3891
+                const auto build_start = timing_enabled || perf_build_clock
                     ? RenderClock::now() : RenderClock::time_point{};
                 auto backend_draws = build_bds(all);
-                const auto build_done = timing_enabled
+                const auto build_done = timing_enabled || perf_build_clock
                     ? RenderClock::now() : RenderClock::time_point{};
+                if (perf_build_clock) {
+                    prosper::diagnostics::perf::add_cost(
+                        prosper::diagnostics::perf::Cost::FrontendBuild,
+                        static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            build_done - build_start).count()));
+                    prosper::diagnostics::perf::flush_thread_texture_references();
+                }
                 auto rendered = prosper::test::render_draws_rgba(
                     backend_draws, w, h, nullptr, clear_for(all), true);
                 const auto backend_done = timing_enabled
