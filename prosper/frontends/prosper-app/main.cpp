@@ -436,8 +436,17 @@ bool ensure_fps_sample(Vk& vk) {
     VkMemoryRequirements mr; vkGetBufferMemoryRequirements(vk.device, vk.sampleBuf, &mr);
     VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     ai.allocationSize = mr.size;
+    // HOST_CACHED first: the CPU reads and hashes all 147 KB of this buffer on EVERY present. From
+    // uncached (write-combined) memory those reads crawl -- measured 2026-09-27 at ~3 ms per present
+    // on the Radeon 8060S, which was 65% of process CPU on a static Messenger screen and 1.2-1.4% of
+    // the heavy titles, so --fps was capping the very rate it reported (#3873). Coherent is kept, so
+    // no invalidate is needed; fall back to plain host-visible memory where no cached type exists.
     ai.memoryTypeIndex = find_mem(vk.phys, mr.memoryTypeBits,
-                                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+                                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+                                  VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+    if (ai.memoryTypeIndex == UINT32_MAX)
+        ai.memoryTypeIndex = find_mem(vk.phys, mr.memoryTypeBits,
+                                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     if (prosper::gpu::allocate_device_memory(vk.device, &ai, &vk.sampleMem) != VK_SUCCESS) goto fail;
     vkBindBufferMemory(vk.device, vk.sampleBuf, vk.sampleMem, 0);
     if (vkMapMemory(vk.device, vk.sampleMem, 0, kFpsSampleBytes, 0, &vk.sampleMapped) != VK_SUCCESS)
