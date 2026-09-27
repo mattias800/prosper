@@ -21,9 +21,9 @@
 // the printed line names prosper explicitly.
 //
 // The honest upgrade is `VK_EXT_memory_budget`, whose `heapUsage` is process-wide and whose
-// `heapBudget` is what the driver will actually grant. That extension is not enabled on the device
-// today; enabling it is a separate change and this header is deliberately independent of it, so the
-// instrument exists now rather than after that plumbing lands.
+// `heapBudget` is what the driver will actually grant. Since #3873 the render device enables that
+// extension when advertised and the texture-cache budget (gpu/memory/texture_cache_budget.hpp)
+// reads it, combining it with `device_bytes_held` below; this header stays independent of it.
 //
 // THE GROWTH LINE REPORTS A HIGH-WATER MARK, NOT CURRENT GROWTH. Each heap's step threshold only
 // ever ratchets up, so a workload that climbs to 3 GiB, frees it, and climbs to 3 GiB again prints

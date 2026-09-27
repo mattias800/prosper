@@ -14,6 +14,7 @@ something belongs:
 | `texture/` | guest texture memory: tiling, block compression, layout |
 | `execute/` | building and submitting the actual GPU work |
 | `present/` | scanout |
+| `memory/` | device-memory residency policy — how many bytes a renderer cache may hold |
 | `capture/` | serializing a frame for offline replay |
 | `timeline/` | frame timelines and bundles |
 | `diagnostics/` | observation only — nothing here is on a rendering path |

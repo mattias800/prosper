@@ -15,6 +15,7 @@
 #include "buffer_range_plan.h"
 #include "gpu/capture/gpu_capture.hpp"
 #include "gpu/diagnostics/gpu_memory_budget_vk.hpp"  // #3533: count what we hold on each heap
+#include "gpu/memory/texture_cache_budget.hpp"  // #3873: texture budget from live headroom
 #include "gpu/execute/host_read_barrier.hpp"   // the availability half of a readback (#2944/#3249)
 #include "gpu/execute/float_controls_probe.hpp" // #3479: the device gate on SignedZeroInfNanPreserve
 #include "gpu/diagnostics/diagnostic_selectors.hpp"
@@ -1576,6 +1577,11 @@ struct RenderVkCtx {
     // uploads additionally require per-format optimal-tiling support; see
     // backend_native_bc_sampled_supported().
     bool texture_compression_bc = false;
+    // VK_EXT_memory_budget, enabled when advertised (#3873): lets the texture-cache budget follow the
+    // driver's live heapBudget/heapUsage instead of a fixed fraction of the heap size. `unified_memory`
+    // is true for any device that is not a discrete GPU, whose device-local heap is system RAM.
+    bool memory_budget_enabled = false;
+    bool unified_memory = false;
     VkPhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_PROPERTIES_EXT};
     PFN_vkCmdDrawMeshTasksEXT cmd_draw_mesh_tasks = nullptr;
@@ -1832,6 +1838,10 @@ inline const RenderVkCtx& render_vk_ctx() {
                      selection.properties.deviceName,
                      prosper::frontend::vulkan_device_type_name(selection.properties.deviceType));
         prosper::frontend::log_vulkan_runtime_device("render", r.phys, selection.properties);
+        // #3873: the texture-cache budget treats every non-discrete device's device-local heap as
+        // system RAM. See texture_cache_budget.hpp for why this is not read off the memory types.
+        r.unified_memory =
+            selection.properties.deviceType != VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU;
         // Present unification (#1270): if the graphics family exposes a second queue, dedicate index 1
         // to prosper-app's present so the app's blit/present submits never contend the render queue's
         // external-synchronization. On a single-queue family (RADV STRIX_HALO is queueCount==1) the app
@@ -2055,6 +2065,12 @@ inline const RenderVkCtx& render_vk_ctx() {
                       // opt-out is a deterministic unsupported-device arm on feature-rich hosts.
                       mesh_features = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT};
                   }
+              }
+              // #3873: live per-heap budget/usage for the texture-cache budget. A query-only extension
+              // with no features and no effect on anything else; add-if-available like the rest.
+              if (!strcmp(de[i].extensionName, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) {
+                  dev_exts.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+                  r.memory_budget_enabled = true;
               }
               // Present unification (#1270): the swapchain device-extension, only when the instance is
               // surface-capable. Enabling it on the headless render device is harmless (no swapchain is
@@ -3087,6 +3103,29 @@ inline VkDeviceSize persistent_color_target_limit() {
     return dev ? dev : static_cast<VkDeviceSize>(256ull * 1024ull * 1024ull);
 }
 
+// PROSPER_NO_VRAM_BUDGET=1 keeps the old heap/8 rule even where VK_EXT_memory_budget is available
+// (the A/B arm). PROSPER_FAKE_HEAP_BUDGET_MB=<n> is TEST-ONLY: it pretends the texture heap is a
+// DISCRETE heap of n MiB whose driver budget is also n MiB (usage stays the real figure), so a
+// discrete card's budget can be exercised on a machine without one. With both set, the old rule is
+// evaluated against the faked heap size -- which is what an n-MiB card got before #3873. The fake
+// also sizes the colour-target residency budget (heap / 4), because that cache fills to its own
+// budget and is the largest non-texture consumer the texture budget yields to: leaving it at the
+// real heap's figure would simulate a card whose render targets may hold 4 GiB of an 8 GiB heap.
+inline bool texture_cache_budget_overridden() {
+    static const bool overridden = getenv("PROSPER_BACKEND_TEXTURE_CACHE_MB") != nullptr;
+    return overridden;
+}
+inline bool vram_budget_disabled() {
+    static const bool disabled = getenv("PROSPER_NO_VRAM_BUDGET") != nullptr;
+    return disabled;
+}
+inline uint64_t fake_heap_budget_bytes() {
+    static const uint64_t bytes = prosper::diag::env_u64_or_default_capped(
+        "PROSPER_FAKE_HEAP_BUDGET_MB", getenv("PROSPER_FAKE_HEAP_BUDGET_MB"), 0ull,
+        UINT64_MAX / (1024ull * 1024ull), "MiB") * 1024ull * 1024ull;
+    return bytes;
+}
+
 // Size the default residency budget to a quarter of the largest device-local heap, clamped to
 // [256 MiB, 4 GiB]. On an integrated GPU (shared system RAM, a very large heap) this lands at the 4 GiB
 // ceiling; on a small discrete GPU it stays proportional so we never claim more than ~25% of VRAM.
@@ -3099,6 +3138,7 @@ inline void init_persistent_color_target_device_budget(
     for (uint32_t i = 0; i < memp.memoryHeapCount; i++)
         if (memp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
             heap = std::max(heap, memp.memoryHeaps[i].size);
+    if (fake_heap_budget_bytes()) heap = fake_heap_budget_bytes();  // test-only (#3873)
     VkDeviceSize budget = heap / 4;
     budget = std::max<VkDeviceSize>(budget, 256ull * 1024ull * 1024ull);
     budget = std::min<VkDeviceSize>(budget, 4096ull * 1024ull * 1024ull);
@@ -3114,13 +3154,24 @@ inline void init_persistent_color_target_device_budget(
 // expansion), so the historical fixed 1 GiB image budget can continuously evict the rest of a hot
 // set. Keep small GPUs at that old bound while allowing capable devices up to 4 GiB. Unlike an
 // allocation, this is only a ceiling; memory is committed on exact-version cache insertion.
+//
+// That heap-size rule is now only the fallback: with VK_EXT_memory_budget the budget follows the
+// driver's live headroom (refresh_persistent_texture_cache_device_budget below, policy in
+// gpu/memory/texture_cache_budget.hpp, #3873).
 inline VkDeviceSize persistent_texture_cache_budget_for_heap(VkDeviceSize heap) {
-    constexpr VkDeviceSize min_bytes = 1024ull * 1024ull * 1024ull;
-    constexpr VkDeviceSize max_bytes = 4096ull * 1024ull * 1024ull;
-    return std::clamp<VkDeviceSize>(heap / 8u, min_bytes, max_bytes);
+    return prosper::gpu::texture_cache_heuristic_budget(heap);
 }
 
 inline VkDeviceSize& persistent_texture_cache_device_budget() {
+    static VkDeviceSize budget = 0;
+    return budget;
+}
+
+// The value the budget POLICY last wrote into persistent_texture_cache_device_budget(). The live
+// refresh below only ever replaces a value it owns: when anything else has written the device budget
+// (the texture fixtures pin an exact image-requirement budget), the two differ and the refresh leaves
+// it alone until the owner restores it.
+inline VkDeviceSize& persistent_texture_cache_policy_budget() {
     static VkDeviceSize budget = 0;
     return budget;
 }
@@ -3134,11 +3185,104 @@ inline void init_persistent_texture_cache_device_budget(
             heap = std::max(heap, memp.memoryHeaps[i].size);
     persistent_texture_cache_device_budget() =
         persistent_texture_cache_budget_for_heap(heap);
+    persistent_texture_cache_policy_budget() = persistent_texture_cache_device_budget();
     fprintf(stderr, "[render] persistent texture-image residency budget = %llu MiB "
             "(device-local heap %llu MiB)\n",
             (unsigned long long)(persistent_texture_cache_device_budget() /
                                  (1024ull * 1024ull)),
             (unsigned long long)(heap / (1024ull * 1024ull)));
+}
+
+// The heap persistent texture images really allocate from, recorded at the first retained
+// allocation (its memory type's heapIndex). UINT32_MAX until then; the budget uses the largest
+// device-local heap meanwhile, which is also what the pre-#3873 rule always used.
+inline std::atomic<uint32_t>& persistent_texture_heap_index() {
+    static std::atomic<uint32_t> heap{UINT32_MAX};
+    return heap;
+}
+
+// Re-derive the texture budget from the driver's live figures, at most every 250 ms (one
+// vkGetPhysicalDeviceMemoryProperties2 call). Called once per backend pass, inside the persistent
+// resource guard, with the cache's current byte total. A budget that SHRINKS takes effect through
+// the pass's ordinary end-of-pass trim, which evicts only images no pending command references and
+// hands them to the batch's completion cleanup -- nothing here waits on the GPU.
+inline void refresh_persistent_texture_cache_device_budget(const RenderVkCtx& ctx,
+                                                           VkDeviceSize texture_bytes) {
+    using Clock = std::chrono::steady_clock;
+    static Clock::time_point next_eval{};
+    static bool evaluated = false;
+    VkDeviceSize& applied = persistent_texture_cache_device_budget();
+    if (applied != persistent_texture_cache_policy_budget()) return;  // pinned by someone else
+    const Clock::time_point now = Clock::now();
+    if (evaluated && now < next_eval) return;
+    next_eval = now + std::chrono::milliseconds(250);
+
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT budget_props{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+    VkPhysicalDeviceMemoryProperties2 props2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};
+    const bool query_budget = ctx.memory_budget_enabled;
+    if (query_budget) props2.pNext = &budget_props;
+    vkGetPhysicalDeviceMemoryProperties2(ctx.phys, &props2);
+    const VkPhysicalDeviceMemoryProperties& memp = props2.memoryProperties;
+
+    // Only a DEVICE-LOCAL recorded heap is trusted; see texture_cache_budget_heap for why.
+    uint64_t heap_sizes[VK_MAX_MEMORY_HEAPS] = {};
+    bool heap_device_local[VK_MAX_MEMORY_HEAPS] = {};
+    const uint32_t heap_count = std::min<uint32_t>(memp.memoryHeapCount, VK_MAX_MEMORY_HEAPS);
+    for (uint32_t i = 0; i < heap_count; ++i) {
+        heap_sizes[i] = memp.memoryHeaps[i].size;
+        heap_device_local[i] = (memp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0;
+    }
+    const uint32_t heap = prosper::gpu::texture_cache_budget_heap(
+        heap_sizes, heap_device_local, heap_count,
+        persistent_texture_heap_index().load(std::memory_order_relaxed));
+    if (heap == UINT32_MAX) return;
+
+    prosper::gpu::TextureCacheBudgetInputs in;
+    in.heap_size = memp.memoryHeaps[heap].size;
+    in.have_budget = query_budget && !vram_budget_disabled();
+    in.heap_budget = query_budget ? budget_props.heapBudget[heap] : 0;
+    in.heap_usage = query_budget ? budget_props.heapUsage[heap] : 0;
+    in.prosper_held = prosper::gpu::device_bytes_held(heap);
+    // A deferred eviction lowers texture_bytes at once while its memory stays in usage/held until
+    // the batch completes, so for up to one period it reads as non-texture usage and can shrink the
+    // next answer a little further. That errs conservative, and the hysteresis bounds it.
+    in.texture_bytes = texture_bytes;
+    in.unified = ctx.unified_memory;
+    const uint64_t fake = fake_heap_budget_bytes();
+    if (fake) {
+        in.heap_size = fake;
+        in.heap_budget = fake;
+        in.unified = false;
+        in.have_budget = !vram_budget_disabled();
+    }
+    const prosper::gpu::TextureCacheBudget chosen = prosper::gpu::texture_cache_budget(in);
+    if (evaluated && !prosper::gpu::texture_cache_budget_changed_materially(applied, chosen.bytes))
+        return;
+    const bool first = !evaluated;
+    evaluated = true;
+    applied = chosen.bytes;
+    persistent_texture_cache_policy_budget() = chosen.bytes;
+    constexpr uint64_t mib = 1024ull * 1024ull;
+    std::fprintf(stderr,
+                 "[vram-budget] texture cache budget %s %llu MiB (%s): heap %u size=%llu MiB "
+                 "budget=%llu MiB usage=%llu MiB prosper=%llu MiB textures=%llu MiB "
+                 "non-texture=%llu MiB target=%llu MiB%s%s%s%s\n",
+                 first ? "=" : "->", (unsigned long long)(chosen.bytes / mib),
+                 prosper::gpu::texture_cache_budget_source_name(chosen.source), heap,
+                 (unsigned long long)(in.heap_size / mib),
+                 (unsigned long long)(in.heap_budget / mib),
+                 (unsigned long long)(in.heap_usage / mib),
+                 (unsigned long long)(in.prosper_held / mib),
+                 (unsigned long long)(texture_bytes / mib),
+                 (unsigned long long)(chosen.non_texture / mib),
+                 (unsigned long long)(chosen.target / mib),
+                 in.unified ? " unified" : " discrete",
+                 query_budget ? "" : " (no VK_EXT_memory_budget)",
+                 fake ? " [FAKED heap: PROSPER_FAKE_HEAP_BUDGET_MB]"
+                      : (vram_budget_disabled() ? " [PROSPER_NO_VRAM_BUDGET]" : ""),
+                 texture_cache_budget_overridden()
+                     ? " -- OVERRIDDEN: PROSPER_BACKEND_TEXTURE_CACHE_MB is enforced instead" : "");
 }
 
 inline VkDeviceSize persistent_texture_cache_limit() {
@@ -3150,9 +3294,8 @@ inline VkDeviceSize persistent_texture_cache_limit() {
             UINT64_MAX / (1024ull * 1024ull), "MiB");
         return static_cast<VkDeviceSize>(mib) * 1024ull * 1024ull;
     }();
-    if (have_env) return env_limit;
-    const VkDeviceSize device_budget = persistent_texture_cache_device_budget();
-    return device_budget ? device_budget : 1024ull * 1024ull * 1024ull;
+    return prosper::gpu::resolve_texture_cache_limit(have_env, env_limit,
+                                                     persistent_texture_cache_device_budget());
 }
 
 // #3873: completion-gated eviction of the persistent texture-image cache while an ordered batch is
@@ -8985,6 +9128,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     if (!active_submission.pending()) persistent_texture_batch_floor = texture_generation;
     const bool persistent_textures_enabled =
         getenv("PROSPER_NO_BACKEND_PERSISTENT_TEXTURES") == nullptr;
+    refresh_persistent_texture_cache_device_budget(ctx, persistent_texture_bytes);
     const VkDeviceSize persistent_texture_limit = persistent_texture_cache_limit();
     texture_path_census.cache_before(persistent_texture_images.size(),
                                      persistent_texture_bytes, persistent_texture_limit);
@@ -11182,8 +11326,14 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                     tr.size <= persistent_texture_limit;
                                 if (retain &&
                                     prosper::gpu::allocate_device_memory(dev, &tai, &upload.memory) ==
-                                        VK_SUCCESS)
+                                        VK_SUCCESS) {
                                     upload.direct_memory = true;
+                                    // #3873: the budget follows THIS heap from now on.
+                                    if (tai.memoryTypeIndex < memp.memoryTypeCount)
+                                        persistent_texture_heap_index().store(
+                                            memp.memoryTypes[tai.memoryTypeIndex].heapIndex,
+                                            std::memory_order_relaxed);
+                                }
                                 if (!upload.memory) {
                                     if (retain) texture_path_census.retention_allocation_failed();
                                     upload.persistent_id = 0;
