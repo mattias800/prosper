@@ -96,6 +96,16 @@ constexpr bool live_rtt_complete_guest_overwrite(uint64_t target_address,
            write_address + write_bytes >= target_address + target_bytes;
 }
 
+// Whether a renderer-produced volume may claim authority over its guest footprint. Only a volume
+// the renderer can actually serve -- a retained image proven complete -- may; otherwise every sample
+// of that address would be refused (see live_rtt_unpublished_volume_blocks_sample) and its draw
+// dropped, with guest memory never allowed to stand in. GTA V's colour-grading LUT is rendered by
+// uncleared draws, never proves complete, and blacked out every GTA V menu when this was claimed
+// unconditionally (#3842 regression). Without a servable image, guest memory stays authoritative.
+constexpr bool live_rtt_volume_claims_authority(bool volume_target, bool renderer_image_valid) {
+    return volume_target && renderer_image_valid;
+}
+
 // A 2D alias can have valid current pixels while older renderer-produced volume slices remain
 // unpublished in guest memory. Only an exact retained 3D image may serve a layered view;
 // ordinary 2D views can still use their current 2D GPU/CPU representation.

@@ -160,6 +160,13 @@ int main() {
     // cannot serve either shape until a proven allocation reset or new producer restores it.
     CHECK(!live_rtt_unpublished_volume_blocks_sample(volume_bytes, true, true, false));
     CHECK(live_rtt_unpublished_volume_blocks_sample(volume_bytes, true, false, true));
+    // #3842 regression (GTA V black menus): a volume may claim authority -- and so block samples --
+    // only when the renderer holds a valid image for it. An unproven volume (uncleared draws) or a
+    // refused one must leave guest memory authoritative; a 2D target never claims volume authority.
+    CHECK(prosper::frontend::live_rtt_volume_claims_authority(true, true));
+    CHECK(!prosper::frontend::live_rtt_volume_claims_authority(true, false));
+    CHECK(!prosper::frontend::live_rtt_volume_claims_authority(false, true));
+    CHECK(!prosper::frontend::live_rtt_volume_claims_authority(false, false));
     CHECK(!live_rtt_unpublished_volume_blocks_sample(volume_bytes, false, false, true));
     CHECK(live_rtt_unpublished_volume_blocks_sample(volume_bytes, false, false, false));
     CHECK(!live_rtt_unpublished_volume_blocks_sample(0, true, false, false));
