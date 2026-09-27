@@ -15,6 +15,8 @@
 #include "diagnostics/perf/perf_alarms.hpp"
 #include "diagnostics/perf/perf_ledger.hpp"
 
+#include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -140,6 +142,13 @@ void test_surface_readback() {
     set_cost(second_order, Cost::SurfaceReadback, 75.0, 440, 1.0);
     check("GTA-like 11%-of-budget readbacks are quiet", evaluate_rules(second_order, kDefault).empty());
 
+    // Boundary on kReadbackBudgetShare (25%): 40 flips of a 33.3 ms budget is 1333 ms.
+    WindowSample edge = bad;
+    set_cost(edge, Cost::SurfaceReadback, 1333.33 * 0.249, 65, 10.0);
+    check("24.9% of budget is quiet", evaluate_rules(edge, kDefault).empty());
+    set_cost(edge, Cost::SurfaceReadback, 1333.34 * 0.25, 65, 10.0);
+    check("25.0% of budget fires", fired(evaluate_rules(edge, kDefault), "surface-readback"));
+
     // Frequent but cheap: 100 readbacks at 0.1 ms each is 0.25 ms per flip, <1% of a 33 ms budget.
     WindowSample cheap = bad;
     set_cost(cheap, Cost::SurfaceReadback, 10.0, 100, 0.2);
@@ -182,6 +191,13 @@ void test_texture_reference_cost() {
     set_texrefs(heavy, 900000, 1.17);
     check("a heavy population that is fast per reference is quiet",
           evaluate_rules(heavy, kDefault).empty());
+
+    // Boundary on kTextureReferenceNs (4 us), at a population large enough that share is not the gate.
+    WindowSample edge = bad;
+    set_texrefs(edge, 150000, 3.99);
+    check("3.99 us/ref is quiet", evaluate_rules(edge, kDefault).empty());
+    set_texrefs(edge, 150000, 4.0);
+    check("4.00 us/ref fires", fired(evaluate_rules(edge, kDefault), "texture-reference-cost"));
 
     // Too few samples for a mean: 50 in 5 s against a 20/s floor.
     WindowSample sparse = bad;
@@ -226,6 +242,12 @@ void test_present_cpu_overhead() {
     WindowSample good = bad;
     set_cost(good, Cost::PresentCpu, 0.05 * 600, 600, 0.1);
     check("post-#3875 window (0.05 ms/present) is quiet", evaluate_rules(good, kDefault).empty());
+
+    WindowSample edge = bad;
+    set_cost(edge, Cost::PresentCpu, 0.99 * 600, 600, 1.2);
+    check("0.99 ms/present is quiet", evaluate_rules(edge, kDefault).empty());
+    set_cost(edge, Cost::PresentCpu, 1.0 * 600, 600, 1.2);
+    check("1.00 ms/present fires", fired(evaluate_rules(edge, kDefault), "present-cpu-overhead"));
 
     WindowSample rare = bad;
     set_cost(rare, Cost::PresentCpu, 3.0 * 20, 20, 4.0);  // 4 presents/s
@@ -292,28 +314,52 @@ void test_texture_reference_sample() {
     const size_t rb = static_cast<size_t>(Cost::SurfaceReadback);
     const size_t refs = static_cast<size_t>(Counter::TextureReferences);
     flush_thread_texture_references();
-    const uint64_t refs0 = l.counters[refs].load(), samples0 = l.cost_events[ts].load();
-    const uint64_t sample_ns0 = l.cost_ns[ts].load(), readback_ns0 = l.cost_ns[rb].load();
+
+    // Rate and slot coverage: 16,384 references laid out as draws of 8. A counter with period 32
+    // would time slot 7 of every fourth draw and NEVER slots 0-6 (#3894 review); the sampler must
+    // reach every slot at roughly 1 in 32.
+    uint64_t refs0 = l.counters[refs].load();
+    uint64_t samples0 = l.cost_events[ts].load();
     { TextureReferenceSample not_a_texture(false); not_a_texture.finish(); }
-    for (uint64_t i = 0; i < 2 * kTextureRefSamplePeriod; ++i) {
+    constexpr uint64_t kRefs = 16384, kSlots = 8;
+    uint64_t per_slot[kSlots] = {};
+    for (uint64_t i = 0; i < kRefs; ++i) {
+        const uint64_t before = l.cost_events[ts].load();
+        TextureReferenceSample ref(true);
+        ref.finish();
+        if (l.cost_events[ts].load() != before) ++per_slot[i % kSlots];
+    }
+    flush_thread_texture_references();
+    const uint64_t sampled = l.cost_events[ts].load() - samples0;
+    check("every texture reference is counted, non-textures are not",
+          l.counters[refs].load() - refs0 == kRefs);
+    check("about one reference in kTextureRefSamplePeriod is timed (16384/32 = 512, within 25%)",
+          sampled >= 384 && sampled <= 640);
+    bool every_slot = true;
+    for (uint64_t k = 0; k < kSlots; ++k) every_slot = every_slot && per_slot[k] >= 20;
+    check("every slot of an 8-reference draw is sampled (no aliasing)", every_slot);
+
+    // Nested readback: until two references have been sampled, each resolving through a 0.5 ms
+    // readback. The readback time must go to surface-readback and NOT to the reference.
+    samples0 = l.cost_events[ts].load();
+    const uint64_t sample_ns0 = l.cost_ns[ts].load(), readback_ns0 = l.cost_ns[rb].load();
+    uint64_t iterations = 0;
+    while (l.cost_events[ts].load() - samples0 < 2 && iterations < 4000) {
+        ++iterations;
         TextureReferenceSample ref(true);
         {
-            // A depth readback nested inside the reference's resolution: 2 ms charged to readback.
             CostScope readback(Cost::SurfaceReadback);
-            const uint64_t until = now_ns() + 2'000'000;
+            const uint64_t until = now_ns() + 500'000;
             while (now_ns() < until) {}
         }
         ref.finish();
     }
     flush_thread_texture_references();
-    check("every texture reference is counted, non-textures are not",
-          l.counters[refs].load() - refs0 == 2 * kTextureRefSamplePeriod);
-    check("one reference in kTextureRefSamplePeriod is timed",
-          l.cost_events[ts].load() - samples0 == 2);
     const double readback_ms = (l.cost_ns[rb].load() - readback_ns0) / 1e6;
     const double sampled_ms = (l.cost_ns[ts].load() - sample_ns0) / 1e6;
-    check("the nested readback is charged to surface-readback", readback_ms >= 2.0 * 2 * kTextureRefSamplePeriod);
-    check("...and subtracted from the sampled reference (one cause, one alarm)", sampled_ms < 1.0);
+    check("two references with a nested readback were sampled", l.cost_events[ts].load() - samples0 >= 2);
+    check("the nested readback is charged to surface-readback", readback_ms >= 0.5 * iterations);
+    check("...and subtracted from the sampled reference (one cause, one alarm)", sampled_ms < 0.5);
 }
 
 std::string slurp(const std::string& path) {
@@ -332,8 +378,12 @@ size_t count_of(const std::string& text, const std::string& needle) {
 void test_engine() {
     std::puts("engine");
     const std::string dir = std::getenv("TMPDIR") ? std::getenv("TMPDIR") : ".";
-    const std::string jsonl = dir + "/test_perf_alarms.jsonl";
-    const std::string logp = dir + "/test_perf_alarms.log";
+    // Unique per run: concurrent ctest invocations share TMPDIR.
+    const std::string tag = std::to_string(
+        std::chrono::steady_clock::now().time_since_epoch().count()) + "_" +
+        std::to_string(reinterpret_cast<uintptr_t>(&dir) & 0xffffff);
+    const std::string jsonl = dir + "/test_perf_alarms_" + tag + ".jsonl";
+    const std::string logp = dir + "/test_perf_alarms_" + tag + ".log";
     FILE* log = std::fopen(logp.c_str(), "w+");
     {
         EngineConfig config;
@@ -437,7 +487,12 @@ void test_engine() {
         check("an evaluated, quiet engine prints a summary", engine.write_summary(s));
     }
     std::fflush(s);
-    check("...saying no rule fired", slurp(logp).find("no rule fired in 1 windows") != std::string::npos);
+    const std::string quiet = slurp(logp);
+    check("...saying no rule fired", quiet.find("no rule fired in 1 windows") != std::string::npos);
+    check("...and listing the rules that had no data as NOT quiet",
+          quiet.find("4 of 6 rules had data") != std::string::npos &&
+              quiet.find("NO DATA (not measured in any window, so not quiet): "
+                         "texture-reference-cost,present-cpu-overhead") != std::string::npos);
     std::fclose(s);
     std::remove(jsonl.c_str());
     std::remove(logp.c_str());

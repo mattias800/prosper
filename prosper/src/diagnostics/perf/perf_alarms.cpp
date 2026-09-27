@@ -106,6 +106,7 @@ std::vector<AlarmFiring> AlarmEngine::close_window(const WindowSample& w, double
     ++windows_;
     std::vector<AlarmFiring> fired;
     for (auto& [name, state] : rules_) {
+        if (rule_has_data(name, w)) ++state.windows_with_data;
         bool held = false;
         for (AlarmFiring& a : candidates)
             if (std::strcmp(a.rule, name) == 0) {
@@ -200,10 +201,20 @@ bool AlarmEngine::write_summary(FILE* out) const {
                      name, (unsigned long long)s.fired, (unsigned long long)windows_, s.first_t,
                      s.worst_value, s.worst_t, s.worst_detail.c_str());
     }
+    std::string no_data;
+    size_t with_data = 0;
+    for (const auto& [name, s] : rules_) {
+        if (s.windows_with_data) { ++with_data; continue; }
+        if (!no_data.empty()) no_data += ",";
+        no_data += name;
+    }
     if (!any)
         std::fprintf(out, "[perf-alarm] summary: no rule fired in %llu windows of %.1fs "
-                          "(%zu rules evaluated)\n",
-                     (unsigned long long)windows_, config_.window_ns / 1e9, rule_names().size());
+                          "(%zu of %zu rules had data)\n",
+                     (unsigned long long)windows_, config_.window_ns / 1e9, with_data, rules_.size());
+    if (!no_data.empty())
+        std::fprintf(out, "[perf-alarm] summary: NO DATA (not measured in any window, so not "
+                          "quiet): %s\n", no_data.c_str());
     return true;
 }
 

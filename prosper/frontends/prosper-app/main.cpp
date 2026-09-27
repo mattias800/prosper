@@ -735,10 +735,13 @@ prosper::frontend::PresentAttempt present_frame_gpu(Vk& vk, const prosper::front
     // The wait above is the same fence that guarded last present's sample copy, so the sample is
     // readable here at no cost. Signing it one frame late is invisible in a rate: the counter needs
     // the interval between distinct frames, not the frame's own timestamp.
+    // #3891 present-cpu-overhead: the present thread's CPU work outside its waits, measured on
+    // every present (not only under --fps): this span (content signature, slot release, staging)
+    // plus command recording below. The fence wait, the acquire and the queue lock are excluded.
+    namespace perf = prosper::diagnostics::perf;
+    const bool perf_on = perf::enabled();
+    const uint64_t perf_span_begin = perf_on ? perf::now_ns() : 0;
     if (vk.samplePending) {
-        // #3891: the present thread's CPU work outside its GPU waits -- present-cpu-overhead.
-        const prosper::diagnostics::perf::CostScope perf_present(
-            prosper::diagnostics::perf::Cost::PresentCpu);
         vk.samplePending = false;
         gpu::note_present_publication_signature(
             gpu::dense_content_signature(static_cast<const uint8_t*>(vk.sampleMapped),
@@ -751,6 +754,7 @@ prosper::frontend::PresentAttempt present_frame_gpu(Vk& vk, const prosper::front
         return prosper::frontend::PresentAttempt::failed;
     }
 
+    const uint64_t perf_pre_acquire_ns = perf_on ? perf::now_ns() - perf_span_begin : 0;
     uint32_t imgIndex = 0;
     constexpr uint64_t kAcquireTimeoutNs = 100ull * 1000 * 1000;
     const auto acquire_begin = trace.now();
@@ -766,6 +770,7 @@ prosper::frontend::PresentAttempt present_frame_gpu(Vk& vk, const prosper::front
         prosper::frontend::present_blit_release(gf.slot); return prosper::frontend::PresentAttempt::failed;
     case prosper::frontend::AcquireAction::proceed: break;
     }
+    const uint64_t perf_record_begin = perf_on ? perf::now_ns() : 0;
     vkResetFences(vk.device, 1, &vk.inFlight);
     vkResetCommandBuffer(vk.cmd, 0);
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
@@ -855,6 +860,9 @@ prosper::frontend::PresentAttempt present_frame_gpu(Vk& vk, const prosper::front
     VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
     pi.waitSemaphoreCount = 1; pi.pWaitSemaphores = &vk.presentSem;
     pi.swapchainCount = 1; pi.pSwapchains = &vk.swapchain; pi.pImageIndices = &imgIndex;
+    if (perf_on)
+        perf::add_cost(perf::Cost::PresentCpu,
+                       perf_pre_acquire_ns + (perf::now_ns() - perf_record_begin));
     VkResult submitResult;
     VkResult pr = VK_SUCCESS;
     {

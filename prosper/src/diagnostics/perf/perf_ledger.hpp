@@ -42,7 +42,11 @@ enum class Cost : uint8_t {
     // Time a guest thread spent blocked acquiring an HLE lock held by another thread. Only the
     // contended path is timed (an uncontended try_lock costs no clock read).
     HleBlockingWait,
-    // CPU work on the host present thread per presented frame, outside the GPU waits.
+    // CPU work on the host present thread per GPU-presented frame, outside its waits (fence,
+    // acquire, queue lock): the --fps content signature when it is on, slot release, and command
+    // recording. Measured on every present in prosper-app's GPU-present path; frontends without
+    // that path (tools/screenshot, the CPU present fallback) record nothing, which the exit
+    // summary reports as "no data" rather than as quiet.
     PresentCpu,
     // Frontend resource materialisation (build_bds) per backend pass group.
     FrontendBuild,
@@ -144,10 +148,23 @@ inline uint64_t& thread_cost_ns(Cost c) {
     return ns[static_cast<size_t>(c)];
 }
 
-// One in this many texture references is timed. Per-reference clock reads on every reference are
-// exactly what PROSPER_RENDER_TIMING pays ~9% for; one in 32 costs a thirty-second of that and the
-// sampled mean is unbiased for a population of tens of thousands per window.
+// On average one in this many texture references is timed. Per-reference clock reads on every
+// reference are exactly what PROSPER_RENDER_TIMING pays ~9% for; one in 32 costs a thirty-second
+// of that. The choice is a per-thread xorshift, NOT a counter: a counter with period 32 always
+// samples the same slot of a draw with 4, 8 or 16 texture references, so an expensive reference in
+// another slot would never be timed. Random selection keeps the mean unbiased for any layout.
 constexpr uint64_t kTextureRefSamplePeriod = 32;
+static_assert((kTextureRefSamplePeriod & (kTextureRefSamplePeriod - 1)) == 0,
+              "the sampler masks with period-1");
+
+inline bool sample_texture_reference() {
+    static thread_local uint32_t x = 0x9e3779b9u ^
+        static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&x) >> 4);  // distinct per thread
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    return (x & (kTextureRefSamplePeriod - 1)) == 0;
+}
 
 // Counts one frontend texture reference and times it when it is the sampled one. finish() at the
 // end of resolution records it; a reference that leaves early (a dropped draw) is not recorded.
@@ -156,8 +173,7 @@ public:
     explicit TextureReferenceSample(bool texture) {
         if (!texture) return;
         ++thread_texture_references();
-        static thread_local uint64_t phase = 0;
-        sampled_ = enabled() && ++phase % kTextureRefSamplePeriod == 0;
+        sampled_ = enabled() && sample_texture_reference();
         if (sampled_) {
             nested_ns_ = thread_cost_ns(Cost::SurfaceReadback);
             begin_ = now_ns();

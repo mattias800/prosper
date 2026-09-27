@@ -20,6 +20,8 @@
 //   * at exit (register_exit_report): one summary line per rule that fired (windows fired, worst
 //     value, when), or a line saying no rule fired in N evaluated windows. The second form exists so
 //     "nothing fired" cannot be confused with "the engine never ran": the latter prints nothing.
+//     Either form also lists any rule that had NO DATA in every window (rule_has_data), so a rule
+//     that could not have fired is not counted as quiet.
 //
 // Knobs: PROSPER_NO_PERF_ALARMS=1 (off, and the ledger hooks skip their clocks);
 // PROSPER_PERF_ALARM_WINDOW_MS (default 5000); PROSPER_PERF_ALARM_THRESHOLD_PCT (default 100; lower
@@ -69,6 +71,7 @@ public:
 private:
     struct RuleState {
         uint32_t streak = 0;   // consecutive windows the condition has held, reported or not
+        uint64_t windows_with_data = 0;   // windows that carried this rule's input (rule_has_data)
         uint64_t fired = 0;
         double worst_value = 0;
         double worst_t = 0;

@@ -47,9 +47,10 @@ constexpr double kFrontendBuildBudgetShare = 0.25;
 // ...over enough samples for the mean to mean something (20/s is 100 per 5 s window).
 constexpr double kTextureReferenceMinPerSecond = 20.0;
 
-// hle-blocking-wait: a fifth of one thread's wall time spent blocked on a lock another thread holds.
-// The Messenger before #3879: its main thread blocked 85% of the time in sceVideoOutSetFlipRate
-// behind a flipper sleeping with the VideoOut handle lock held.
+// hle-blocking-wait: blocked time on an HLE lock another thread holds, SUMMED over every blocked
+// thread, as a share of wall time -- so 20% is a fifth of one thread-equivalent, and several
+// threads can together exceed 100%. The Messenger before #3879: 75-90%, almost all of it its main
+// thread blocked in sceVideoOutSetFlipRate behind a flipper sleeping with the handle lock held.
 constexpr double kHleBlockedThreadShare = 0.20;
 
 // present-cpu-overhead: CPU work per presented frame on the host present thread, outside GPU waits.
@@ -128,6 +129,11 @@ struct AlarmFiring {
 
 // Every rule name, in evaluation order. Stable kebab-case: these are grepped.
 const std::vector<const char*>& rule_names();
+
+// Whether `w` carries the input `rule` reads at all. A rule without it cannot fire, and a run whose
+// every window lacked it has "no data" for that rule, which the summary must not call quiet
+// (present-cpu-overhead in a frontend without GPU present, for instance).
+bool rule_has_data(const char* rule, const WindowSample& w);
 
 // Consecutive windows `rule` must hold before it is reported (see kSustainWindows).
 uint32_t sustain_windows(const char* rule);

@@ -44,6 +44,15 @@ const std::vector<const char*>& rule_names() {
     return names;
 }
 
+bool rule_has_data(const char* rule, const WindowSample& w) {
+    const std::string r = rule ? rule : "";
+    if (r == "present-cpu-overhead") return w.events(Cost::PresentCpu) != 0;
+    if (r == "texture-reference-cost") return w.events(Cost::TextureRefSample) != 0;
+    // The others measure events whose ABSENCE is the healthy answer: no readback, no contended
+    // lock, no refusal, no dropped draw. Zero there is data.
+    return true;
+}
+
 uint32_t sustain_windows(const char* rule) {
     const std::string r = rule ? rule : "";
     if (r == "dropped-draws") return kCorrectnessSustainWindows;
@@ -146,10 +155,11 @@ std::vector<AlarmFiring> evaluate_rules(const WindowSample& w, const RuleThresho
             AlarmFiring a;
             a.rule = "hle-blocking-wait";
             a.value = thread_share * 100.0;
-            a.unit = "%thread";
+            a.unit = "%wall(all-threads)";
             a.threshold = t.hle_blocked_thread_share * 100.0;
             a.cost_ms = blocked_ms;
-            a.detail = format("lock=\"%s\" blocked-calls=%llu avg=%.2fms max=%.2fms",
+            a.detail = format("lock=\"%s\" blocked-calls=%llu avg=%.2fms max=%.2fms "
+                              "(blocked time summed over threads; 100%% = one thread-equivalent)",
                               label ? label : "?", (unsigned long long)n, blocked_ms / n,
                               w.cost_max_ns[static_cast<size_t>(Cost::HleBlockingWait)] / 1e6);
             a.hint = "a guest thread is blocked on an HLE lock another thread holds (often across a "
@@ -174,9 +184,9 @@ std::vector<AlarmFiring> evaluate_rules(const WindowSample& w, const RuleThresho
             a.cost_ms = cpu_ms;
             a.detail = format("presents=%llu max=%.2fms", (unsigned long long)presents,
                               w.cost_max_ns[static_cast<size_t>(Cost::PresentCpu)] / 1e6);
-            a.hint = "the host present thread spends CPU per frame outside its GPU waits (the --fps "
-                     "content signature reads a mapped sample buffer); next: perf record -t on the "
-                     "present thread, check the sample buffer is HOST_CACHED; cf. #3875";
+            a.hint = "the host present thread spends CPU per frame outside its waits (content "
+                     "signature under --fps, slot release, command recording); next: perf record -t "
+                     "on the present thread, check any CPU-read buffer is HOST_CACHED; cf. #3875";
             out.push_back(std::move(a));
         }
     }
@@ -198,7 +208,8 @@ std::vector<AlarmFiring> evaluate_rules(const WindowSample& w, const RuleThresho
                               (unsigned long long)backend);
             a.hint = "draws prosper wanted to issue were dropped: a run can look faster AND render "
                      "wrong; next: [draw-disposition] lines (PROSPER_DRAW_DISPOSITION_VERBOSE=1) "
-                     "for backend drops; for frontend-unresolved, [volume-sample-drop] lines and "
+                     "for backend drops; for frontend-unresolved, [render-array-reject] and "
+                     "[volume-sample-drop] lines and "
                      "PROSPER_RENDER_TIMING build_rejected; for frontend-contract, "
                      "PROSPER_DESCRIPTOR_VALIDATE; cf. #3889";
             out.push_back(std::move(a));

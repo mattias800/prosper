@@ -146,7 +146,6 @@ namespace {
     alignas(uint64_t) uint64_t g_buffer_labels[16] = {};
     int32_t g_previous_buffer = -1;
     uint64_t flip_advance(int32_t bufidx, int64_t flip_arg) {
-        prosper::diagnostics::perf::on_guest_flip();   // #3891: close the alarm window when due
         // The renderer completes flips synchronously, so submit and completion share one instant.
         // Sample before taking g_flip_mx: the deterministic guest clock reads the flip count.
         const uint64_t tsc = prosper_guest_tsc_ns();
@@ -943,6 +942,10 @@ HLE(g_vo_set_flip_rate) {
     return 0;
 }
 HLE(g_vo_submitflip)  {
+    // #3891: close the alarm window BEFORE any VideoOut lock. A window close evaluates rules and
+    // writes stderr/JSONL; under g_vo_handle_mx that would block every other VideoOut call (the
+    // #3879 class) and charge the engine's own I/O to hle-blocking-wait.
+    prosper::diagnostics::perf::on_guest_flip();
     std::lock_guard<std::mutex> flip_serial(g_flip_pace_mx);   // first: see g_flip_pace_mx
     VideoOutHandleGuard handle(a0);
     if (!handle.valid()) return kVoErrorInvalidHandle;
@@ -988,6 +991,7 @@ extern "C" void prosper_vo_set_flip_publish_hook(void (*fn)(uint64_t)) {
     g_flip_publish_hook.store(fn, std::memory_order_release);
 }
 extern "C" void prosper_vo_flip_from_gpu(uint32_t handle, int32_t bufidx, uint32_t flip_mode, int64_t flip_arg) {
+    prosper::diagnostics::perf::on_guest_flip();   // #3891: before any VideoOut lock (see SubmitFlip)
     std::lock_guard<std::mutex> flip_serial(g_flip_pace_mx);   // first: see g_flip_pace_mx
     VideoOutHandleGuard live_handle(handle);
     if (!live_handle.valid()) return;
