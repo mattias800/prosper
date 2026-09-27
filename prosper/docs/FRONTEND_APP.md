@@ -738,7 +738,14 @@ image remain resident with that image, under a 32-contract per-image bound; set
 bindings for an A/B. Its default byte ceiling is one eighth of the largest device-local heap,
 clamped to 1-2 GiB, with at most 1024 allocations. Set
 `PROSPER_BACKEND_TEXTURE_CACHE_MB=<MiB>` to change the byte budget or
-`PROSPER_NO_BACKEND_PERSISTENT_TEXTURES=1` for a forced-upload A/B. Backend timing reports
+`PROSPER_NO_BACKEND_PERSISTENT_TEXTURES=1` for a forced-upload A/B. When the budget is full, the
+least-recently-used image is evicted even while earlier command buffers of the same ordered batch
+are still pending, provided no pass of that batch has used it; its image, memory, views and
+samplers are destroyed by the batch's completion cleanup, not at eviction (#3873). Before that, a
+pending batch blocked eviction entirely, so a cache filled during a load never admitted another
+texture and every non-resident texture was re-uploaded into a fresh allocation each frame. Set
+`PROSPER_NO_DEFERRED_TEXTURE_EVICTION=1` to restore the old skip-while-pending rule for an A/B.
+Backend timing reports
 `persistent=hits/misses` and the current cache bytes. The frontend decoded-pixel budget and backend
 device-image budget are separate: a hot immutable atlas can occupy space in both, trading bounded
 residency for lower frame time.
