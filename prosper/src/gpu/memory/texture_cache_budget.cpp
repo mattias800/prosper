@@ -50,6 +50,16 @@ bool texture_cache_budget_changed_materially(uint64_t current, uint64_t proposed
     return delta >= std::max<uint64_t>(128ull * kTextureCacheMiB, current / 16);
 }
 
+uint32_t texture_cache_budget_heap(const uint64_t* heap_sizes, const bool* heap_device_local,
+                                   uint32_t heap_count, uint32_t recorded_heap) {
+    if (recorded_heap < heap_count && heap_device_local[recorded_heap]) return recorded_heap;
+    uint32_t best = UINT32_MAX;
+    for (uint32_t i = 0; i < heap_count; ++i)
+        if (heap_device_local[i] && (best == UINT32_MAX || heap_sizes[i] > heap_sizes[best]))
+            best = i;
+    return best;
+}
+
 uint64_t resolve_texture_cache_limit(bool have_override, uint64_t override_bytes,
                                      uint64_t policy_bytes) {
     if (have_override) return override_bytes;

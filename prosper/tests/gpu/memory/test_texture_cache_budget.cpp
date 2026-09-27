@@ -177,6 +177,32 @@ int main() {
     check(resolve_texture_cache_limit(false, 0, 0) == 1 * GiB,
           "no override, device not sized yet: the historical 1 GiB");
 
+    // --- heap selection: a recorded HOST heap must not be sized as discrete VRAM ---------------
+    {
+        // A discrete layout where the first image-compatible type sits on the 64 GiB system heap
+        // (heap 0, not device-local) and VRAM is heap 1 (16 GiB).
+        const uint64_t sizes[2] = {64 * GiB, 16 * GiB};
+        const bool local[2] = {false, true};
+        check(texture_cache_budget_heap(sizes, local, 2, 0) == 1,
+              "heap: a recorded host heap falls back to the largest device-local heap");
+        check(texture_cache_budget_heap(sizes, local, 2, 1) == 1,
+              "heap: a recorded device-local heap is used");
+        check(texture_cache_budget_heap(sizes, local, 2, UINT32_MAX) == 1,
+              "heap: nothing recorded yet -> the largest device-local heap");
+        check(texture_cache_budget_heap(sizes, local, 2, 7) == 1,
+              "heap: an out-of-range record -> the largest device-local heap");
+        // A small device-local BAR/carve-out heap recorded on purpose is honoured, not upsized.
+        const uint64_t apu[3] = {256 * MiB, 44 * GiB, 20 * GiB};
+        const bool apu_local[3] = {true, true, false};
+        check(texture_cache_budget_heap(apu, apu_local, 3, 0) == 0,
+              "heap: a recorded device-local heap is honoured even when it is not the largest");
+        check(texture_cache_budget_heap(apu, apu_local, 3, 2) == 1,
+              "heap: host heap on an APU layout -> the largest device-local heap");
+        const bool none[2] = {false, false};
+        check(texture_cache_budget_heap(sizes, none, 2, 0) == UINT32_MAX,
+              "heap: no device-local heap at all -> none (caller keeps the old rule)");
+    }
+
     // --- no overflow on absurd heaps -----------------------------------------------------------
     {
         const auto b = texture_cache_budget(discrete(UINT64_MAX, UINT64_MAX, 0, 0, 0));

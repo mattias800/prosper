@@ -3109,6 +3109,10 @@ inline VkDeviceSize persistent_color_target_limit() {
 // also sizes the colour-target residency budget (heap / 4), because that cache fills to its own
 // budget and is the largest non-texture consumer the texture budget yields to: leaving it at the
 // real heap's figure would simulate a card whose render targets may hold 4 GiB of an 8 GiB heap.
+inline bool texture_cache_budget_overridden() {
+    static const bool overridden = getenv("PROSPER_BACKEND_TEXTURE_CACHE_MB") != nullptr;
+    return overridden;
+}
 inline bool vram_budget_disabled() {
     static const bool disabled = getenv("PROSPER_NO_VRAM_BUDGET") != nullptr;
     return disabled;
@@ -3219,15 +3223,18 @@ inline void refresh_persistent_texture_cache_device_budget(const RenderVkCtx& ct
     vkGetPhysicalDeviceMemoryProperties2(ctx.phys, &props2);
     const VkPhysicalDeviceMemoryProperties& memp = props2.memoryProperties;
 
-    uint32_t heap = persistent_texture_heap_index().load(std::memory_order_relaxed);
-    if (heap >= memp.memoryHeapCount) {
-        heap = UINT32_MAX;
-        for (uint32_t i = 0; i < memp.memoryHeapCount; ++i)
-            if ((memp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) &&
-                (heap == UINT32_MAX || memp.memoryHeaps[i].size > memp.memoryHeaps[heap].size))
-                heap = i;
-        if (heap == UINT32_MAX) return;
+    // Only a DEVICE-LOCAL recorded heap is trusted; see texture_cache_budget_heap for why.
+    uint64_t heap_sizes[VK_MAX_MEMORY_HEAPS] = {};
+    bool heap_device_local[VK_MAX_MEMORY_HEAPS] = {};
+    const uint32_t heap_count = std::min<uint32_t>(memp.memoryHeapCount, VK_MAX_MEMORY_HEAPS);
+    for (uint32_t i = 0; i < heap_count; ++i) {
+        heap_sizes[i] = memp.memoryHeaps[i].size;
+        heap_device_local[i] = (memp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0;
     }
+    const uint32_t heap = prosper::gpu::texture_cache_budget_heap(
+        heap_sizes, heap_device_local, heap_count,
+        persistent_texture_heap_index().load(std::memory_order_relaxed));
+    if (heap == UINT32_MAX) return;
 
     prosper::gpu::TextureCacheBudgetInputs in;
     in.heap_size = memp.memoryHeaps[heap].size;
@@ -3235,6 +3242,9 @@ inline void refresh_persistent_texture_cache_device_budget(const RenderVkCtx& ct
     in.heap_budget = query_budget ? budget_props.heapBudget[heap] : 0;
     in.heap_usage = query_budget ? budget_props.heapUsage[heap] : 0;
     in.prosper_held = prosper::gpu::device_bytes_held(heap);
+    // A deferred eviction lowers texture_bytes at once while its memory stays in usage/held until
+    // the batch completes, so for up to one period it reads as non-texture usage and can shrink the
+    // next answer a little further. That errs conservative, and the hysteresis bounds it.
     in.texture_bytes = texture_bytes;
     in.unified = ctx.unified_memory;
     const uint64_t fake = fake_heap_budget_bytes();
@@ -3255,7 +3265,7 @@ inline void refresh_persistent_texture_cache_device_budget(const RenderVkCtx& ct
     std::fprintf(stderr,
                  "[vram-budget] texture cache budget %s %llu MiB (%s): heap %u size=%llu MiB "
                  "budget=%llu MiB usage=%llu MiB prosper=%llu MiB textures=%llu MiB "
-                 "non-texture=%llu MiB target=%llu MiB%s%s%s\n",
+                 "non-texture=%llu MiB target=%llu MiB%s%s%s%s\n",
                  first ? "=" : "->", (unsigned long long)(chosen.bytes / mib),
                  prosper::gpu::texture_cache_budget_source_name(chosen.source), heap,
                  (unsigned long long)(in.heap_size / mib),
@@ -3268,7 +3278,9 @@ inline void refresh_persistent_texture_cache_device_budget(const RenderVkCtx& ct
                  in.unified ? " unified" : " discrete",
                  query_budget ? "" : " (no VK_EXT_memory_budget)",
                  fake ? " [FAKED heap: PROSPER_FAKE_HEAP_BUDGET_MB]"
-                      : (vram_budget_disabled() ? " [PROSPER_NO_VRAM_BUDGET]" : ""));
+                      : (vram_budget_disabled() ? " [PROSPER_NO_VRAM_BUDGET]" : ""),
+                 texture_cache_budget_overridden()
+                     ? " -- OVERRIDDEN: PROSPER_BACKEND_TEXTURE_CACHE_MB is enforced instead" : "");
 }
 
 inline VkDeviceSize persistent_texture_cache_limit() {
