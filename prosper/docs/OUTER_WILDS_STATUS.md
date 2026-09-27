@@ -190,3 +190,23 @@ forming a performance hypothesis on this title — every row here cost a session
   steady state rises ~300 MiB and the peak falls ~500 MiB. The GTA V control moved 6.37/7.17 to
   6.92/7.96, which is inside that route's drift, so treat it as neutral. #3873.
   `PROSPER_NO_DEFERRED_TEXTURE_EVICTION=1` reproduces the old rule in the same binary.
+
+- **Uploading BCn textures natively (instead of CPU-decoding them to RGBA8) raises the frame rate
+  once #3876 keeps textures resident** — falsified 2026-09-27 (#3873, native-BC PR). One binary,
+  `PROSPER_NO_NATIVE_BC=1` as the off arm, interleaved off/on/off/on, last 18 `[app]` samples of
+  `reach-first-person.pad`: **9.30 / 8.72 / 9.77 / 9.42 fps** (sd 0.9-1.7). The path was live:
+  284 of 310 BC identities went native, nearly all with their guest mip chain, and the estimated
+  resident size of those textures fell from ~2.5 GiB (RGBA8 plus generated levels) to ~0.55 GiB.
+  It did not help because, with #3876, BC textures are persistent-cache hits in steady state, so
+  neither the decode nor the upload is on the frame path; the frontend decoded cache sat at its
+  4 GiB budget in both arms (other formats refill the space) and RSS did not fall. Backend
+  texture-upload time per F8 window rose from 126/139 ms to 192/211 ms in the native arms; that is
+  unexplained and unmeasured beyond these two pairs.
+  **Scope of this falsification:** measured on the dev box's unified-memory APU, where the texture
+  budget (device-local heap / 8, clamped 1-4 GiB) sits at its 4 GiB maximum and an upload is a memcpy.
+  It does not transfer to an 8-16 GB discrete GPU (budget 1-2 GiB, uploads over PCIe), where the
+  4-8x smaller resident size is the point; native BC was merged for that footprint, not for this box's
+  frame rate. Simulating an 8 GB card's budget on this box (`PROSPER_BACKEND_TEXTURE_CACHE_MB=1024`,
+  Outer Wilds, same binary, off/on/off/on) moved it to **6.67 / 9.97 / 7.62 / 10.58 fps**: backend
+  texture upload fell from 1188/1060 ms to 179/141 ms per F8 window, and persistent hit/miss went from
+  5177/1935 and 6396/2645 to 16337/98 and 16107/100 (#3883; the off1 arm exited by itself at 259 s).

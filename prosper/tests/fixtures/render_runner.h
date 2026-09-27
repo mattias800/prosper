@@ -220,6 +220,11 @@ struct FrameResource : FrameBufferResource {
     // behavior. >1 lets the backend generate a box-filtered chain — bounded by this declared count —
     // for plain-2D RGBA8 sampled textures, so minification stops point-sampling through dense art.
     uint32_t declared_mip_levels = 1;
+    // Levels ALREADY present in `tex_rgba`, concatenated level 0 first, each tightly packed at its
+    // own extent (backend_texture_bytes). 0/1 = level 0 only, the historical contract. A native BCn
+    // texture carries the guest's own chain this way (#3873) because a block format cannot be
+    // blit-generated; the backend then copies every level instead of running the blit cascade.
+    uint32_t uploaded_mip_levels = 0;
     uint32_t img_dim = 1;             // ShaderResource/MIMG dim (1=2D, 2=3D); depth-1 3D stays 3D
     // #325: the guest T# is one prosper treats as a layered array, as decided by
     // guest_texture_is_uploaded_array(). The view type keys on this IN ADDITION to
@@ -420,7 +425,29 @@ struct BackendMrtOutputs {
     std::array<std::vector<uint8_t>, prosper::gpu::kColorTargetCount> colors;
 };
 
+// Block-compressed sampled formats the backend carries natively: guest BCn blocks are copied
+// straight into the staging buffer instead of being decoded to RGBA8 on the CPU. These are
+// SAMPLED-texture formats only -- never a colour target, storage image or blit destination.
+// Returns the bytes of one 4x4 block, or 0 for every non-block format.
+inline uint32_t backend_block_compressed_bytes(VkFormat format) {
+    switch (format) {
+        case VK_FORMAT_BC1_RGBA_UNORM_BLOCK:
+        case VK_FORMAT_BC4_UNORM_BLOCK:
+            return 8u;
+        case VK_FORMAT_BC2_UNORM_BLOCK:
+        case VK_FORMAT_BC3_UNORM_BLOCK:
+        case VK_FORMAT_BC5_UNORM_BLOCK:
+        case VK_FORMAT_BC6H_UFLOAT_BLOCK:
+        case VK_FORMAT_BC7_UNORM_BLOCK:
+            return 16u;
+        default:
+            return 0u;
+    }
+}
+
 inline VkFormat backend_color_format(VkFormat format) {
+    if (backend_block_compressed_bytes(format) != 0u)
+        return format;
     if (format == VK_FORMAT_R16_SFLOAT ||
         format == VK_FORMAT_R16G16_SFLOAT ||
         format == VK_FORMAT_R16G16B16A16_SFLOAT ||
@@ -467,8 +494,12 @@ inline std::array<uint32_t, 4> backend_sampled_component_swizzle(
     return result;
 }
 
+// Bytes per TEXEL. A block-compressed format has no per-texel size, so it answers 0: every caller
+// that can see a BC texture must size it with backend_texture_bytes() instead, and a caller that
+// was missed fails closed (its `!bpp` guard) rather than over- or under-running a buffer.
 inline uint32_t backend_color_bytes_per_pixel(VkFormat format) {
     format = backend_color_format(format);
+    if (backend_block_compressed_bytes(format) != 0u) return 0u;
     if (format == VK_FORMAT_R32G32B32A32_UINT ||
         format == VK_FORMAT_R32G32B32A32_SFLOAT) return 16u;
     if (format == VK_FORMAT_R16G16B16A16_SFLOAT) return 8u;
@@ -479,8 +510,43 @@ inline uint32_t backend_color_bytes_per_pixel(VkFormat format) {
     return 4u;
 }
 
+// Bytes of a width x height x depth x layers texture at one mip level, block-granular for a BC
+// format (ceil(w/4) * ceil(h/4) blocks per slice) and texel-granular otherwise. This is exactly the
+// tightly packed buffer layout vkCmdCopyBufferToImage reads with bufferRowLength = 0 and
+// bufferImageHeight = 0. Saturates to UINT64_MAX on overflow so a caller's size check refuses it.
+inline uint64_t backend_texture_bytes(VkFormat format, uint32_t width, uint32_t height,
+                                      uint32_t depth = 1u, uint32_t layers = 1u) {
+    const uint32_t block = backend_block_compressed_bytes(backend_color_format(format));
+    uint64_t result = block ? block : backend_color_bytes_per_pixel(format);
+    const uint64_t factors[4] = {
+        block ? (uint64_t(width) + 3u) / 4u : uint64_t(width),
+        block ? (uint64_t(height) + 3u) / 4u : uint64_t(height),
+        std::max<uint64_t>(depth, 1u), std::max<uint64_t>(layers, 1u)};
+    for (const uint64_t factor : factors) {
+        if (factor && result > UINT64_MAX / factor) return UINT64_MAX;
+        result *= factor;
+    }
+    return result;
+}
+
+// Bytes of levels [0, levels) of a 2D chain, each level tightly packed at max(w>>L,1) x max(h>>L,1)
+// and concatenated level 0 first: the staging layout of FrameResource::uploaded_mip_levels.
+inline uint64_t backend_texture_chain_bytes(VkFormat format, uint32_t width, uint32_t height,
+                                            uint32_t levels) {
+    uint64_t total = 0;
+    for (uint32_t level = 0; level < std::max(levels, 1u); ++level) {
+        const uint64_t bytes = backend_texture_bytes(
+            format, std::max(width >> level, 1u), std::max(height >> level, 1u));
+        if (bytes == UINT64_MAX || total > UINT64_MAX - bytes) return UINT64_MAX;
+        total += bytes;
+    }
+    return total;
+}
+
 inline prosper::gpu::SpirvImageNumericClass backend_image_numeric_class(VkFormat format) {
     using NumericClass = prosper::gpu::SpirvImageNumericClass;
+    if (backend_block_compressed_bytes(backend_color_format(format)) != 0u)
+        return NumericClass::Float;
     switch (backend_color_format(format)) {
         case VK_FORMAT_R8_UINT:
         case VK_FORMAT_R8G8B8A8_UINT:
@@ -1504,6 +1570,10 @@ struct RenderVkCtx {
     // A 3D image's 2D-array attachment view is core on ordinary Vulkan 1.1+ devices, but
     // portability-subset implementations may decline this particular image-view operation.
     bool image_view_2d_on_3d = true;
+    // VkPhysicalDeviceFeatures::textureCompressionBC, enabled when advertised. Native BCn sampled
+    // uploads additionally require per-format optimal-tiling support; see
+    // backend_native_bc_sampled_supported().
+    bool texture_compression_bc = false;
     VkPhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_PROPERTIES_EXT};
     PFN_vkCmdDrawMeshTasksEXT cmd_draw_mesh_tasks = nullptr;
@@ -1798,6 +1868,9 @@ inline const RenderVkCtx& render_vk_ctx() {
         if (supported.independentBlend) feats.independentBlend = VK_TRUE;
         // Dynamic texel offsets on OpImageGather require ImageGatherExtended (#3417).
         feats.shaderImageGatherExtended = supported.shaderImageGatherExtended;
+        // Guest BCn textures upload natively when the device can sample them (lavapipe may not).
+        feats.textureCompressionBC = supported.textureCompressionBC;
+        r.texture_compression_bc = supported.textureCompressionBC;
         VkPhysicalDeviceProperties phys_props{}; vkGetPhysicalDeviceProperties(r.phys, &phys_props);
         r.max_compute_workgroup_size_x = phys_props.limits.maxComputeWorkGroupSize[0];
         r.max_compute_workgroup_invocations = phys_props.limits.maxComputeWorkGroupInvocations;
@@ -2202,6 +2275,37 @@ inline const RenderVkCtx& render_vk_ctx() {
     }();
     published_render_cache_context().store(&c, std::memory_order_release);
     return c;
+}
+
+// Can the render device sample `format` (a backend_block_compressed_bytes() format) as an
+// optimal-tiling image filled by a buffer copy, with linear filtering? Probed once per format and
+// cached. Desktop drivers advertise every BCn format; a software rasteriser may advertise none, and
+// then the caller keeps the CPU decoder. The feature bit is checked as well as the format bits:
+// using a BC format on a device that did not enable textureCompressionBC is not portable.
+inline bool backend_native_bc_sampled_supported(VkFormat format) {
+    if (backend_block_compressed_bytes(format) == 0u) return false;
+    static const std::array<std::pair<VkFormat, bool>, 7> support = [] {
+        std::array<std::pair<VkFormat, bool>, 7> table{{
+            {VK_FORMAT_BC1_RGBA_UNORM_BLOCK, false}, {VK_FORMAT_BC2_UNORM_BLOCK, false},
+            {VK_FORMAT_BC3_UNORM_BLOCK, false}, {VK_FORMAT_BC4_UNORM_BLOCK, false},
+            {VK_FORMAT_BC5_UNORM_BLOCK, false}, {VK_FORMAT_BC6H_UFLOAT_BLOCK, false},
+            {VK_FORMAT_BC7_UNORM_BLOCK, false}}};
+        const RenderVkCtx& ctx = render_vk_ctx();
+        if (!ctx.ok || !ctx.phys || !ctx.texture_compression_bc) return table;
+        constexpr VkFormatFeatureFlags required =
+            VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+            VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
+            VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+        for (auto& [candidate, supported] : table) {
+            VkFormatProperties properties{};
+            vkGetPhysicalDeviceFormatProperties(ctx.phys, candidate, &properties);
+            supported = (properties.optimalTilingFeatures & required) == required;
+        }
+        return table;
+    }();
+    for (const auto& [candidate, supported] : support)
+        if (candidate == format) return supported;
+    return false;
 }
 
 inline std::shared_ptr<GpuDetileUpload> prepare_render_gpu_detile(
@@ -8785,6 +8889,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         VkDeviceSize image_bytes = 0;
         bool persistent_hit = false;
         bool persistent_refresh = false;
+        // The staging buffer holds key.mip_levels guest levels (#3873): copy each, generate none.
+        bool guest_mip_levels = false;
         bool uniform_clear = false;
         VkClearColorValue uniform_color{};
         bool borrowed_target = false;
@@ -10766,6 +10872,35 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                         // (T# extents are rejected above 16384 -> <= 15 levels).
                         if (tex_mip_levels > 16u) tex_mip_levels = 16u;
                     }
+                    // #3873: a native BCn texture brings its own guest levels in tex_rgba; they are
+                    // copied, never generated (a block format is not a blit destination).
+                    // The frontend's level count is not trusted blindly: the chain must fit the
+                    // readable bytes it published (tex_byte_size), or the upload falls back to
+                    // level 0 rather than reading past the end of the pixel buffer (#3883 review).
+                    bool guest_mip_chain = !r.is_storage_image && r.img_dim == 1 &&
+                        r.td == 1 && r.sample_count == 1u && r.tex_rgba &&
+                        !r.persistent_render_target_id && !r.persistent_depth_target_id &&
+                        !r.gpu_detile && !r.has_uniform_color && r.uploaded_mip_levels > 1u;
+                    if (guest_mip_chain) {
+                        uint32_t full = 1;
+                        for (uint32_t m = r.tw > r.th ? r.tw : r.th; m > 1; m >>= 1) full++;
+                        const uint32_t levels = std::min({r.uploaded_mip_levels, full, 16u});
+                        if (r.tex_byte_size >= backend_texture_chain_bytes(
+                                                   r.texture_format, r.tw, r.th, levels)) {
+                            tex_mip_levels = levels;
+                        } else {
+                            guest_mip_chain = false;
+                            static std::atomic<uint32_t> refused{0};
+                            if (refused.fetch_add(1, std::memory_order_relaxed) < 16)
+                                std::fprintf(stderr,
+                                    "[texture-upload] guest mip chain refused: %u levels of "
+                                    "%ux%u need %llu bytes, %zu readable -- uploading level 0\n",
+                                    levels, r.tw, r.th,
+                                    (unsigned long long)backend_texture_chain_bytes(
+                                        r.texture_format, r.tw, r.th, levels),
+                                    r.tex_byte_size);
+                        }
+                    }
                     // A DS-bridged resource shares the id slot: both are guest plane addresses, and
                     // pixels stays null for either direct bind, so distinct surfaces cannot collide.
                     std::array<uint32_t, 4> uniform_color_bits{};
@@ -10993,7 +11128,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                             VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                                             (r.is_storage_image
                                                  ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT : 0u) |
-                                            (upload.key.mip_levels > 1
+                                            (upload.key.mip_levels > 1 && !guest_mip_chain
                                                  ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT : 0u);
                                 // #3045: the result used to be discarded here, so a device
                                 // rejecting the request (VK_ERROR_OUT_OF_DEVICE_MEMORY, or an
@@ -11068,10 +11203,15 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                           upload.uniform_color.float32);
                             } else if (!upload.feedback_snapshot &&
                                        !upload.assembled_target_mips && !upload.stacked_compute) {
-                                const VkDeviceSize tbytes =
-                                    static_cast<VkDeviceSize>(r.tw) * r.th * r.td *
-                                    r.sample_count *
-                                    backend_color_bytes_per_pixel(r.texture_format);
+                                // Block-granular for a native BCn texture: the frontend hands
+                                // over ceil(w/4)*ceil(h/4) blocks, which is also the tightly
+                                // packed layout the bufferRowLength=0 copy below reads.
+                                const VkDeviceSize tbytes = guest_mip_chain
+                                    ? backend_texture_chain_bytes(
+                                          r.texture_format, r.tw, r.th, tex_mip_levels)
+                                    : backend_texture_bytes(
+                                          r.texture_format, r.tw, r.th, r.td, r.sample_count);
+                                upload.guest_mip_levels = guest_mip_chain;
                                 VkBufferCreateInfo stci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
                                 stci.size = tbytes;
                                 stci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
@@ -11099,8 +11239,20 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                 } else if (r.tex_rgba) {
                                     const auto copy_begin = texture_path_census.active()
                                         ? TimingClock::now() : TimingClock::time_point{};
-                                    parallel_render_memcpy(sp, r.tex_rgba,
-                                                           static_cast<size_t>(tbytes));
+                                    // A native BC texture publishes its readable byte count; never
+                                    // read beyond it (zero-fill instead). Every other path keeps the
+                                    // historical implicit-span contract.
+                                    const size_t readable =
+                                        backend_block_compressed_bytes(
+                                            backend_color_format(r.texture_format)) &&
+                                                r.tex_byte_size
+                                            ? std::min<size_t>(static_cast<size_t>(tbytes),
+                                                               r.tex_byte_size)
+                                            : static_cast<size_t>(tbytes);
+                                    parallel_render_memcpy(sp, r.tex_rgba, readable);
+                                    if (readable < tbytes)
+                                        std::memset(static_cast<uint8_t*>(sp) + readable, 0,
+                                                    static_cast<size_t>(tbytes) - readable);
                                     census_cpu_copy_bytes = tbytes;
                                     if (texture_path_census.active())
                                         census_cpu_copy_ms = std::chrono::duration<double, std::milli>(
@@ -11144,15 +11296,11 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                 TimingClock::now() - census_prepare_begin).count();
                             row.cpu_copy_ms = census_cpu_copy_ms;
                             row.image_created = census_image_created;
-                            uint64_t logical = backend_color_bytes_per_pixel(r.texture_format);
-                            for (const uint64_t factor : {uint64_t(r.tw), uint64_t(r.th),
-                                                          uint64_t(r.td), uint64_t(r.sample_count)}) {
-                                if (factor && logical > UINT64_MAX / factor) {
-                                    row.extent_overflow = true;
-                                    logical = 0;
-                                    break;
-                                }
-                                logical *= factor;
+                            uint64_t logical = backend_texture_bytes(
+                                r.texture_format, r.tw, r.th, r.td, r.sample_count);
+                            if (logical == UINT64_MAX) {
+                                row.extent_overflow = true;
+                                logical = 0;
                             }
                             row.logical_extent = logical;
                             row.path = upload.persistent_hit ? "persistent_hit"
@@ -12087,9 +12235,11 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             ++texture_stats.gpu_detile_dispatches;
             texture_stats.gpu_detile_source_bytes += upload.gpu_detile->source_bytes;
         }
-        texture_stats.upload_bytes += static_cast<uint64_t>(upload.key.width) * upload.key.height *
-                                      upload.key.depth * upload.key.sample_count *
-                                      backend_color_bytes_per_pixel(upload.key.format);
+        texture_stats.upload_bytes += upload.guest_mip_levels
+            ? backend_texture_chain_bytes(upload.key.format, upload.key.width,
+                                          upload.key.height, upload.key.mip_levels)
+            : backend_texture_bytes(upload.key.format, upload.key.width, upload.key.height,
+                                    upload.key.depth, upload.key.sample_count);
     }
     texture_path_census.reached_resource_phase_end();
 
@@ -12491,6 +12641,24 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 0, upload.key.sample_count};
             vkCmdClearColorImage(cmd, upload.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                                  &upload.uniform_color, 1, &range);
+        } else if (upload.guest_mip_levels) {
+            // #3873: one region per guest level, tightly packed and concatenated in the staging
+            // buffer (backend_texture_chain_bytes). bufferRowLength = 0 reads each level at its
+            // own extent, block-rounded for a BC format.
+            std::array<VkBufferImageCopy, 16> regions{};
+            VkDeviceSize offset = 0;
+            const uint32_t levels = std::min(upload.key.mip_levels, 16u);
+            for (uint32_t level = 0; level < levels; ++level) {
+                const uint32_t lw = std::max(upload.key.width >> level, 1u);
+                const uint32_t lh = std::max(upload.key.height >> level, 1u);
+                VkBufferImageCopy& region = regions[level];
+                region.bufferOffset = offset;
+                region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, 0, 1};
+                region.imageExtent = {lw, lh, 1};
+                offset += backend_texture_bytes(upload.key.format, lw, lh);
+            }
+            vkCmdCopyBufferToImage(cmd, upload.staging, upload.image,
+                                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, levels, regions.data());
         } else if (!upload.assembled_target_mips) {
             VkBufferImageCopy tc{};
             tc.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0,
@@ -12573,7 +12741,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         // Each source level transitions DST->SRC before feeding the next; the final barrier below
         // then flips the whole chain to shader-read. RGBA8 linear-blit support is mandatory Vulkan.
         for (uint32_t l = 1; !upload.uniform_clear && !upload.assembled_target_mips &&
-             !upload.stacked_compute && !upload.feedback_snapshot &&
+             !upload.stacked_compute && !upload.feedback_snapshot && !upload.guest_mip_levels &&
              l < upload.key.mip_levels; l++) {
             VkImageMemoryBarrier bs{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
             bs.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
@@ -12601,7 +12769,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                            VK_FILTER_LINEAR);
         }
         if (!upload.uniform_clear && !upload.assembled_target_mips &&
-            !upload.stacked_compute && !upload.feedback_snapshot &&
+            !upload.stacked_compute && !upload.feedback_snapshot && !upload.guest_mip_levels &&
             upload.key.mip_levels > 1) {
             // Levels 0..N-2 sit in TRANSFER_SRC after feeding the cascade; return them to
             // TRANSFER_DST so the single final-layout barrier below covers the whole chain.

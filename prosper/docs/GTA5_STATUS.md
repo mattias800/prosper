@@ -5295,6 +5295,22 @@ One line per falsified hypothesis, the evidence that killed it, and where. **Rea
 a new one** — and note which entries are *solid* versus *void*, because a void result is not a
 falsification.
 
+- **Native BCn texture upload is a GTA V frame-rate lever** — falsified 2026-09-27 (#3873,
+  native-BC PR). Same binary, `PROSPER_NO_NATIVE_BC=1` as the off arm, interleaved on
+  `reach-performance-story.pad`, last 18 samples: **8.28 / 8.13 / 8.69 / 8.76 fps** (off, on, off,
+  on) — neutral. All 533 BC identities went native with their guest mip chains; their estimated
+  resident size fell ~6x (~0.89 GiB to ~0.15 GiB), but after #3876 they are persistent-cache hits in
+  steady state, so decode and upload are off the frame path. Solid, not void: the census proves the
+  lever moved.
+  **Scope of this falsification:** measured on the dev box's unified-memory APU, where the texture
+  budget (device-local heap / 8, clamped 1-4 GiB) sits at its 4 GiB maximum and an upload is a memcpy.
+  It does not transfer to an 8-16 GB discrete GPU (budget 1-2 GiB, uploads over PCIe), where the
+  4-8x smaller resident size is the point; native BC was merged for that footprint, not for this box's
+  frame rate. Simulating an 8 GB card's budget on this box (`PROSPER_BACKEND_TEXTURE_CACHE_MB=1024`,
+  Outer Wilds, same binary, off/on/off/on) moved it to **6.67 / 9.97 / 7.62 / 10.58 fps**: backend
+  texture upload fell from 1188/1060 ms to 179/141 ms per F8 window, and persistent hit/miss went from
+  5177/1935 and 6396/2645 to 16337/98 and 16107/100 (#3883; the off1 arm exited by itself at 259 s).
+
 - **"#3722 caused the September black-world regression" from a single-run bisect.** Withdrawn
   (#3727 / #3731): a repeat at #3722 rendered the world, and the later investigation found shared
   save state changed menu routing and graphics mode. That experiment cannot attribute a regression

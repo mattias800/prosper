@@ -47,6 +47,14 @@ struct MipChainPlan {
 // through the modelled GFX10 thin-2D placement.
 MipChainPlan shader_resource_mip_chain_plan(const ShaderResource& resource);
 
+// The same placement for a 4x4 BLOCK-COMPRESSED texture (`block_bytes` per block, 8 or 16): each
+// level is ceil(w/4) x ceil(h/4) blocks at its tiled offset, and `MipChainLevel::byte_size` is the
+// padded tiled element span. Power-of-two extents only (see the implementation). The graphics
+// renderer uses it to upload a BCn texture's own guest mip chain natively (#3873), where the
+// RGBA8 decoder path instead generates levels from level 0.
+MipChainPlan shader_resource_block_mip_chain_plan(const ShaderResource& resource,
+                                                  uint32_t block_bytes);
+
 // The number of mip levels the COMPUTE backend materializes for this resource. 1 means the
 // historical single-level image. Called by `live_compute`'s image creation and by the recompiler's
 // MIMG lowering; a divergence between the two would emit an explicit LOD against a level that does
