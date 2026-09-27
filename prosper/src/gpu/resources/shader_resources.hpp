@@ -31,9 +31,10 @@ enum class DataFormat : uint32_t {
     Float32, Uint32, Sint32,
     Float16, Unorm16, Snorm16, Uint16, Sint16,
     Unorm8,  Snorm8,  Uint8,  Sint8,
-    // Block-compressed texture formats (4x4-texel blocks). BC1/2/3/4/5/7 are decoded to RGBA8 on
-    // upload (bc_decode, #121/#290); BC6H (HDR) and the SNORM BC4/5 variants are recognized but
-    // still skipped (gen5_image_format flags them). data_format_bytes() returns 0 for these (a
+    // Block-compressed texture formats (4x4-texel blocks). A plain 2D sampled BC texture uploads
+    // natively where the device samples BC (#3873); other shapes decode to RGBA8 on upload
+    // (bc_decode, #121/#290). BC6H SF16 and the SNORM BC4/5 variants are recognized but still
+    // skipped (gen5_image_format flags them). data_format_bytes() returns 0 for these (a
     // per-COMPONENT byte size is meaningless for a block format; use
     // Gen5ImageFormatInfo::bytes_per_block).
     Bc1, Bc2, Bc3, Bc4, Bc5, Bc6, Bc7,

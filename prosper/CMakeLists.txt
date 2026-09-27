@@ -3501,15 +3501,27 @@ endif()
       add_executable(test_decoder_source_snapshot tests/shared/live/test_decoder_source_snapshot.cpp)
       target_include_directories(test_decoder_source_snapshot PRIVATE frontends src tests)
       target_link_libraries(test_decoder_source_snapshot PRIVATE prosper_core prosper_live_renderer Vulkan::Vulkan)
+      # This test's BC1 arm pins the CPU DECODER's source-snapshot contract, so it keeps the decoder
+      # even on a device that samples BCn natively (#3873; native BC is test_native_bc_upload's).
       add_test(NAME decoder_source_snapshot COMMAND test_decoder_source_snapshot)
+      set_tests_properties(decoder_source_snapshot PROPERTIES
+        ENVIRONMENT "PROSPER_NO_NATIVE_BC=1")
       add_test(NAME decoder_source_snapshot_control COMMAND test_decoder_source_snapshot --control)
       set_tests_properties(decoder_source_snapshot_control PROPERTIES
-        ENVIRONMENT "PROSPER_NO_DECODE_SOURCE_SNAPSHOT_REUSE=1")
+        ENVIRONMENT "PROSPER_NO_DECODE_SOURCE_SNAPSHOT_REUSE=1;PROSPER_NO_NATIVE_BC=1")
       if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         add_test(NAME decoder_source_snapshot_watch COMMAND test_decoder_source_snapshot --watch)
         set_tests_properties(decoder_source_snapshot_watch PROPERTIES
-          ENVIRONMENT "PROSPER_TEXTURE_WRITE_WATCH_MIN_KB=1")
+          ENVIRONMENT "PROSPER_TEXTURE_WRITE_WATCH_MIN_KB=1;PROSPER_NO_NATIVE_BC=1")
       endif()
+      # #3873: native BCn sampled upload against the CPU decoder, with the opt-out as control.
+      add_executable(test_native_bc_upload tests/shared/live/test_native_bc_upload.cpp)
+      target_include_directories(test_native_bc_upload PRIVATE frontends src tests)
+      target_link_libraries(test_native_bc_upload PRIVATE prosper_core prosper_live_renderer Vulkan::Vulkan)
+      add_test(NAME native_bc_upload COMMAND test_native_bc_upload)
+      add_test(NAME native_bc_upload_decoder_control COMMAND test_native_bc_upload --decoder)
+      set_tests_properties(native_bc_upload_decoder_control PROPERTIES
+        ENVIRONMENT "PROSPER_NO_NATIVE_BC=1")
       add_executable(test_texture_preparation tests/shared/live/test_texture_preparation.cpp)
       target_include_directories(test_texture_preparation PRIVATE frontends src tests)
       target_link_libraries(test_texture_preparation PRIVATE prosper_core prosper_live_renderer Vulkan::Vulkan)

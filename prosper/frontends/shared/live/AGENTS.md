@@ -97,6 +97,20 @@ the arena never enters submission cleanup callbacks. `PROSPER_NO_BUFFER_LOOKUP_A
 direct PMR heap allocation; unsupported PMR deployment targets retain ordinary standard maps.
 Allocation observations count upstream heap requests/bytes, not nodes or GPU buffer traffic.
 
+## Native BCn textures
+
+A plain 2D sampled BC texture reaches Vulkan as its detiled 4x4 blocks (`VK_FORMAT_BC*`) when the
+device samples BC, instead of being CPU-decoded to RGBA8 (#3873). A declared mip chain goes native
+only when `shader_resource_block_mip_chain_plan` can place every guest level (tiled, power-of-two,
+live guest memory); the backend then copies those levels rather than blit-generating them, and the
+persistent cache validates and watches the WHOLE chain allocation, which starts below the level-0
+address. Everything else -- cube, volume, array, an unmodelled chain, capture replay of a chain,
+compute -- keeps `bc_decode`. Because the decoded path is still the fallback, a native texture's
+bytes are blocks: diagnostics that read texels must go through `inspection_rgba8`, which decodes
+them. `PROSPER_NO_NATIVE_BC=1` restores the decoder everywhere; `PROSPER_NO_NATIVE_BC_MIP_CHAIN=1`
+only for chains. `PROSPER_NATIVE_BC_LOG=1` prints one coverage line per BC identity and
+`PROSPER_NATIVE_BC_CHAIN_AUDIT=1` checks that level 1 really is the 2x2 box of level 0.
+
 ## Encoded decoder snapshots
 
 Ordinary tight linear BC, Float32, Float16 and narrow sampled textures can decode directly from

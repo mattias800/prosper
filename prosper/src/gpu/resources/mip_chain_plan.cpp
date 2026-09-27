@@ -3,6 +3,7 @@
 #include "gpu/texture/tile.hpp"
 
 #include <algorithm>
+#include <bit>
 
 namespace prosper::gpu {
 
@@ -67,7 +68,27 @@ MipChainPlan compute_chain_plan(const ShaderResource& resource) {
 
 } // namespace
 
+namespace {
+MipChainPlan mip_chain_plan_impl(const ShaderResource& resource, uint32_t block_bytes);
+} // namespace
+
 MipChainPlan shader_resource_mip_chain_plan(const ShaderResource& resource) {
+    return mip_chain_plan_impl(resource, 0u);
+}
+
+MipChainPlan shader_resource_block_mip_chain_plan(const ShaderResource& resource,
+                                                  uint32_t block_bytes) {
+    if (!block_bytes) return {};
+    return mip_chain_plan_impl(resource, block_bytes);
+}
+
+namespace {
+// `block_bytes` 0: uncompressed, one element per texel. Nonzero: a 4x4 block-compressed format with
+// that many bytes per block, whose element grid is ceil(w/4) x ceil(h/4). Only power-of-two extents
+// are admitted for a block format: there, each level's element extent derived from its own texel
+// extent (ceil((w>>L)/4)) equals the level-zero element extent shifted (max((ew>>L),1)), so the
+// placement tiled_mip_level_layout computes and the blocks the caller detiles cannot disagree.
+MipChainPlan mip_chain_plan_impl(const ShaderResource& resource, uint32_t block_bytes) {
     MipChainPlan plan;
     if (resource.cls != ResourceClass::Texture) return plan;
     if (resource.declared_mip_levels < 2u || resource.sample_count != 1u) return plan;
@@ -97,9 +118,17 @@ MipChainPlan shader_resource_mip_chain_plan(const ShaderResource& resource) {
     // would need every offset rebased onto the selected level, and no measured title issues one
     // alongside a dynamic mip operand.
     if (resource.mip_chain_base_level != 0u) return plan;
-    // Uncompressed only: for a block format the element grid is smaller than the texel extent, and
-    // this equality is what proves the two agree.
-    if (element_width != resource.width || element_height != resource.height) return plan;
+    // For an uncompressed format this equality is what proves the element grid and the texel extent
+    // agree. A block format proves the same through its 4x4 grid (see the power-of-two note above).
+    if (block_bytes) {
+        if (bytes_per_block != block_bytes ||
+            element_width != (resource.width + 3u) / 4u ||
+            element_height != (resource.height + 3u) / 4u ||
+            !std::has_single_bit(resource.width) || !std::has_single_bit(resource.height))
+            return plan;
+    } else if (element_width != resource.width || element_height != resource.height) {
+        return plan;
+    }
     if (resource.declared_mip_levels > max_mip + 1u) return plan;
     // Linear chains place each level on a 256-byte-aligned pitch, which the per-level copy below
     // does not yet reproduce; every measured multi-level guest texture here is tiled.
@@ -133,8 +162,11 @@ MipChainPlan shader_resource_mip_chain_plan(const ShaderResource& resource) {
             out.tail_block_bytes = layout.tail_block_bytes;
         } else {
             out.byte_offset = layout.byte_offset;
-            out.byte_size = tiled_surface_bytes(
-                out.width, out.height, resource.tile_mode, 0, bytes_per_block);
+            out.byte_size = block_bytes
+                ? tiled_elements_bytes((out.width + 3u) / 4u, (out.height + 3u) / 4u,
+                                       bytes_per_block, resource.tile_mode)
+                : tiled_surface_bytes(out.width, out.height, resource.tile_mode, 0,
+                                      bytes_per_block);
             if (!out.byte_size) return {};
         }
         if (out.byte_offset > allocation_bytes ||
@@ -157,6 +189,7 @@ MipChainPlan shader_resource_mip_chain_plan(const ShaderResource& resource) {
     plan.allocation_bytes = allocation_bytes;
     return plan;
 }
+} // namespace
 
 bool shader_resource_host_data_covers_mip_chain(const ShaderResource& resource,
                                                 const MipChainPlan& plan) {

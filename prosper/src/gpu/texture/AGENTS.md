@@ -4,7 +4,9 @@ How pixels are actually laid out in guest memory, and how to get them into a lin
 
 - `tile` — the tiling/swizzle modes, including mip-tail handling.
 - `guest_texture_layout` — per-level offsets, pitches and sizes.
-- `bc_decode` — block-compressed format decode.
+- `bc_decode` — block-compressed format decode: the fallback for BC shapes the live renderer
+  does not upload natively (see `frontends/shared/live/AGENTS.md`, native BCn textures), and the
+  inspection decoder for those it does.
 
 The 64 KiB mip-tail walker hoists separable x/y swizzle contributions into a bounded stack table
 for views up to 256 columns. It retains global coordinates, partial backing checks and neighboring

@@ -41,6 +41,7 @@
 #include "gpu/texture/guest_texture_layout.hpp" // exact pitch for HLE-produced guest textures
 #include "gpu/texture/tile.hpp"                 // detile_surface / tiled_surface_bytes / detile_elements
 #include "gpu/texture/bc_decode.hpp"            // BC1/2/3 block decompression -> RGBA8 (#121)
+#include "gpu/resources/mip_chain_plan.hpp"      // native BCn guest mip chains (#3873)
 #include "gpu/resources/shader_resources.hpp"     // ShaderResourceTable / ResourceClass
 #include "gpu/recompiler/rdna2_to_spirv.hpp"       // recompile_fragment (diagnostic solid-color PS)
 #include "gpu/present/videoout_present.hpp"     // present_front_index (flip-anchored present selection)
@@ -781,6 +782,24 @@ VkFormat replay_color_format(prosper::gpu::GpuCaptureColorFormat format) {
 std::vector<uint8_t> inspection_rgba8(const std::vector<uint8_t>& pixels,
                                       uint32_t width, uint32_t height, VkFormat format) {
     const size_t texels = static_cast<size_t>(width) * height;
+    // A native BCn texture (#3873) holds blocks, not texels: decode a copy for inspection only.
+    if (const uint32_t block = prosper::test::backend_block_compressed_bytes(format)) {
+        using prosper::gpu::DataFormat;
+        const DataFormat source =
+            format == VK_FORMAT_BC1_RGBA_UNORM_BLOCK ? DataFormat::Bc1
+            : format == VK_FORMAT_BC2_UNORM_BLOCK ? DataFormat::Bc2
+            : format == VK_FORMAT_BC3_UNORM_BLOCK ? DataFormat::Bc3
+            : format == VK_FORMAT_BC4_UNORM_BLOCK ? DataFormat::Bc4
+            : format == VK_FORMAT_BC5_UNORM_BLOCK ? DataFormat::Bc5
+            : format == VK_FORMAT_BC6H_UFLOAT_BLOCK ? DataFormat::Bc6
+                                                    : DataFormat::Bc7;
+        std::vector<uint8_t> rgba(texels * 4, 0);
+        if (pixels.size() == prosper::test::backend_texture_bytes(format, width, height) &&
+            block == prosper::gpu::bc_block_bytes(source))
+            prosper::gpu::bc_decode_surface(rgba.data(), pixels.data(), pixels.size(),
+                                            width, height, source);
+        return rgba;
+    }
     if (format == VK_FORMAT_R8G8B8A8_UNORM && pixels.size() == texels * 4)
         return pixels;
     if (format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 && pixels.size() == texels * 4) {
@@ -1082,6 +1101,10 @@ struct DecodedTexture {
     // So every array served from cache arrived claiming zero readable bytes and was rejected.
     size_t pixels_bytes = 0;
     std::shared_ptr<prosper::test::GpuDetileUpload> gpu_detile;
+    // Mip levels packed into `pixels` (FrameResource::uploaded_mip_levels; 0 = level 0 only). A
+    // native BCn chain's byte count depends on the T#'s level count, which TextureDecodeKey does not
+    // hold, so reuse must match it exactly (native_bc_entry_matches) -- #3883 review.
+    uint32_t packed_mip_levels = 0;
 };
 
 // Always-on identity-scope accounting; see TextureDecodeScopeStats in the header.
@@ -1121,6 +1144,8 @@ struct PersistentDecodedTexture {
     uint64_t persistent_id = 0;
     uint64_t persistent_version = 0;
     VkFormat texture_format = VK_FORMAT_R8G8B8A8_UNORM;
+    // Levels packed into `pixels`; see DecodedTexture::packed_mip_levels.
+    uint32_t packed_mip_levels = 0;
     bool storage_image_contract_valid = true;
     prosper::gpu::GuestGpuWriteSnapshot validation_snapshot;
     prosper::host::GuestWriteWatch source_watch;
@@ -1205,6 +1230,55 @@ bool native_r11_sampled_upload_supported(const prosper::gpu::ShaderResource& res
     return resource.cls == ResourceClass::Texture && resource.img_dim == 1u &&
         resource.depth == 1u && resource.format == DataFormat::Float10_11_11 &&
         resource.num_components == 3u && !resource.compression_enabled && !resource.srgb;
+}
+
+uint32_t native_bc_sampled_format(const prosper::gpu::ShaderResource& resource,
+                                  bool allow_declared_mips) {
+    using prosper::gpu::DataFormat;
+    using prosper::gpu::ResourceClass;
+    if (resource.cls != ResourceClass::Texture || resource.compression_enabled) return 0u;
+    if (!(resource.img_dim == 1u || resource.img_dim == 5u) || resource.depth > 1u) return 0u;
+    if (!allow_declared_mips && resource.declared_mip_levels > 1u) return 0u;
+    switch (resource.format) {
+        case DataFormat::Bc1: return VK_FORMAT_BC1_RGBA_UNORM_BLOCK;
+        case DataFormat::Bc2: return VK_FORMAT_BC2_UNORM_BLOCK;
+        case DataFormat::Bc3: return VK_FORMAT_BC3_UNORM_BLOCK;
+        case DataFormat::Bc4: return VK_FORMAT_BC4_UNORM_BLOCK;
+        case DataFormat::Bc5: return VK_FORMAT_BC5_UNORM_BLOCK;
+        case DataFormat::Bc6: return VK_FORMAT_BC6H_UFLOAT_BLOCK;
+        case DataFormat::Bc7: return VK_FORMAT_BC7_UNORM_BLOCK;
+        default: return 0u;
+    }
+}
+
+// PROSPER_NO_NATIVE_BC=1 restores the CPU decoder for every BCn texture (the A/B switch).
+// PROSPER_TESTTEX writes RGBA8 texels over the decoded surface, so it also keeps the decoder.
+bool native_bc_sampled_enabled() {
+    static const bool enabled = PROSPER_ENV_VALUE("PROSPER_NO_NATIVE_BC") == nullptr &&
+        PROSPER_ENV_VALUE("PROSPER_TESTTEX") == nullptr;
+    return enabled;
+}
+
+// The guest mip chain a native BCn texture uploads (#3873), memoized on every descriptor field the
+// placement depends on: this runs once per texture REFERENCE (tens of thousands a second), while the
+// plan itself walks tiled_mip_level_layout once per level.
+const prosper::gpu::MipChainPlan& native_bc_mip_chain_plan(const prosper::gpu::ShaderResource& r,
+                                                            uint32_t block_bytes) {
+    using Key = std::array<uint64_t, 20>;
+    thread_local std::map<Key, prosper::gpu::MipChainPlan> memo;
+    const Key key{r.width, r.height, static_cast<uint64_t>(r.format), r.tile_mode,
+                  r.declared_mip_levels, r.mip_chain_element_width, r.mip_chain_element_height,
+                  r.mip_chain_bytes_per_block, r.mip_chain_max_level, r.mip_chain_base_level,
+                  r.in_mip_tail ? 1u : 0u, r.mip_tail_x, r.mip_tail_y, r.mip_tail_bytes,
+                  r.img_dim, r.depth, r.layer_stride_bytes, r.layer_mip_offset_bytes,
+                  (r.compression_enabled ? 1u : 0u) | (r.metadata_addr ? 2u : 0u) |
+                      (static_cast<uint64_t>(r.cls) << 2),
+                  (static_cast<uint64_t>(r.sample_count) << 8) | block_bytes};
+    auto found = memo.find(key);
+    if (found != memo.end()) return found->second;
+    if (memo.size() > 8192) memo.clear();
+    return memo.emplace(key, prosper::gpu::shader_resource_block_mip_chain_plan(r, block_bytes))
+        .first->second;
 }
 
 struct DiagnosticAddressSelector {
@@ -4806,6 +4880,57 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                              r.declared_mip_levels,
                                              native_r11_sampled ? 1u : 0u);
                         }
+                        // Native BCn (#3873): upload the guest's detiled 4x4 blocks as a Vulkan BC
+                        // image instead of decoding every texel to RGBA8 on the CPU -- 8x fewer
+                        // bytes to stage, upload and keep resident for BC1/BC4, 4x for the rest,
+                        // and no decode. The detiling is the one the decoder already uses, so only
+                        // the final step differs. Everything the renderer owns instead of guest
+                        // memory (RTT, depth bridge, compute image) keeps its own path.
+                        // A declared mip chain goes native only when its guest levels can be
+                        // placed exactly (tiled, power-of-two, live guest memory): the backend then
+                        // uploads those levels instead of generating them. Any other chain keeps the
+                        // decoder, whose RGBA8 level 0 the backend can still blit-generate from.
+                        // PROSPER_NO_NATIVE_BC_MIP_CHAIN=1 sends every chain back to the decoder.
+                        const uint32_t native_bc_block = prosper::gpu::bc_block_bytes(r.format);
+                        const prosper::gpu::MipChainPlan* native_bc_plan =
+                            native_bc_block && r.declared_mip_levels > 1u && !r.host_data &&
+                                    native_bc_sampled_enabled() &&
+                                    prosper::gpu::tile_mode_is_tiled(r.tile_mode) &&
+                                    !PROSPER_ENV_VALUE("PROSPER_NODETILE") &&
+                                    !PROSPER_ENV_ON("PROSPER_NO_NATIVE_BC_MIP_CHAIN")
+                                ? &native_bc_mip_chain_plan(r, native_bc_block) : nullptr;
+                        const bool native_bc_chain_modelled =
+                            native_bc_plan && native_bc_plan->valid &&
+                            native_bc_plan->level_count > 1u;
+                        const VkFormat native_bc_format = static_cast<VkFormat>(
+                            native_bc_sampled_format(r, native_bc_chain_modelled));
+                        const bool native_bc_sampled =
+                            native_bc_format != VK_FORMAT_UNDEFINED && native_bc_sampled_enabled() &&
+                            !fr.is_storage_image && !guest_array && !is_cube && !is_volume &&
+                            fr.sample_count <= 1u && !has_live_rtt_authority && !has_ds_live &&
+                            prosper::test::backend_native_bc_sampled_supported(native_bc_format);
+                        const bool native_bc_mip_chain = native_bc_sampled && native_bc_chain_modelled;
+                        const uint32_t native_bc_chain_levels =
+                            native_bc_mip_chain ? native_bc_plan->level_count : 0u;
+                        const uint64_t native_bc_chain_base = native_bc_mip_chain
+                            ? sampled_source_addr - native_bc_plan->levels[0].byte_offset : 0u;
+                        // PROSPER_NATIVE_BC_LOG=1: one line per BC texture identity, naming why it
+                        // did or did not take the native path, for a per-title coverage census.
+                        if (PROSPER_ENV_ON("PROSPER_NATIVE_BC_LOG") &&
+                            prosper::gpu::bc_block_bytes(r.format) != 0u) {
+                            static std::set<std::tuple<uint64_t, uint32_t, uint32_t, uint32_t>> seen;
+                            if (seen.size() < 200000 &&
+                                seen.emplace(r.gpu_addr, tw, th, static_cast<uint32_t>(r.format)).second)
+                                std::fprintf(stderr,
+                                    "[native-bc] addr=0x%llx fmt=%u %ux%u dim=%u depth=%u mips=%u "
+                                    "tile=%u native=%u shape=%u rtt=%u storage=%u chain=%u\n",
+                                    static_cast<unsigned long long>(r.gpu_addr),
+                                    static_cast<unsigned>(r.format), tw, th, r.img_dim, r.depth,
+                                    r.declared_mip_levels, r.tile_mode, native_bc_sampled ? 1u : 0u,
+                                    native_bc_format != VK_FORMAT_UNDEFINED ? 1u : 0u,
+                                    has_live_rtt_authority ? 1u : 0u,
+                                    fr.is_storage_image ? 1u : 0u, native_bc_chain_levels);
+                        }
                         // Storage-image atomics require a typed integer Vulkan view. Keep R32_UINT
                         // texels byte-exact through the existing 4-B read/detile path instead of
                         // silently normalizing the view to RGBA8_UNORM.
@@ -4880,10 +5005,17 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                : (native_r8_sampled ? VK_FORMAT_R8_UNORM
                                : (native_rg8_sampled ? VK_FORMAT_R8G8_UNORM
                                : (native_r11_sampled ? VK_FORMAT_B10G11R11_UFLOAT_PACK32
+                               : (native_bc_sampled ? native_bc_format
                                : (sampled_source_f32 ? VK_FORMAT_R16G16B16A16_SFLOAT
-                                                     : VK_FORMAT_R8G8B8A8_UNORM))))));
+                                                     : VK_FORMAT_R8G8B8A8_UNORM)))))));
+                        // A LINEAR, unpadded native BC surface is uploaded byte-for-byte as the guest
+                        // stores it, so the cached pixels are themselves the validation source.
+                        const bool native_bc_linear_copy = native_bc_sampled &&
+                            !persistent_source_is_tiled && !linear_padded_read && !r.in_mip_tail &&
+                            !(prosper::gpu::tile_mode_is_tiled(r.tile_mode) &&
+                              !PROSPER_ENV_VALUE("PROSPER_NODETILE"));
                         const bool persistent_source_matches_pixels =
-                            native_r8_sampled || native_rg8_sampled ||
+                            native_r8_sampled || native_rg8_sampled || native_bc_linear_copy ||
                             (persistent_unorm8_texture && r.num_components == 4 &&
                              !linear_padded_read &&
                              !prosper::gpu::tile_mode_is_tiled(r.tile_mode) &&
@@ -4994,10 +5126,18 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 persistent_dcc_clear_pixel, 1,
                                 sampled_dcc_metadata.data(), sampled_dcc_metadata.size(),
                                 r.num_components, r.alpha_is_on_msb);
+                        // A native BC chain's pixels depend on every level, so the cache validates
+                        // (and watches) the whole allocation, not level 0 alone.
+                        const bool persistent_chain_source =
+                            native_bc_mip_chain && persistent_base_source_size != 0;
                         const uint64_t persistent_source_addr = persistent_dcc_fast_clear
-                            ? r.metadata_addr : sampled_source_addr;
+                            ? r.metadata_addr
+                            : (persistent_chain_source ? native_bc_chain_base : sampled_source_addr);
                         const size_t persistent_source_size = persistent_dcc_fast_clear
-                            ? sampled_dcc_metadata.size() : persistent_base_source_size;
+                            ? sampled_dcc_metadata.size()
+                            : (persistent_chain_source
+                                   ? static_cast<size_t>(native_bc_plan->allocation_bytes)
+                                   : persistent_base_source_size);
                         resource_persistent_source_size = persistent_source_size;
                         resource_texture_source_bytes = persistent_source_size;
                         if (texref_census)
@@ -5098,10 +5238,13 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         const bool depth_cube_source_layout_valid =
                             retained_depth_cube_cache_candidate && depth_cube_source_layout.fits(
                                 persistent_source_addr, persistent_source_size);
+                        // The validation snapshot must cover the range validate_exact() compares:
+                        // persistent_source_addr, which is below sampled_source_addr for a native BC
+                        // mip chain (#3873) and equal to it for every other guest texture.
                         auto copy_persistent_source = [&](uint8_t* dst, size_t bytes) {
                             return persistent_dcc_fast_clear
                                 ? copy_dcc_metadata(dst, bytes)
-                                : copy_resource(dst, sampled_source_addr, bytes);
+                                : copy_resource(dst, persistent_source_addr, bytes);
                         };
                         const bool guest_persistent_cache_eligible =
                             persistent_texture_decode_cache_eligible(
@@ -5234,6 +5377,31 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 ++g_texture_decode_scope.invalidations;
                             }
                         }
+                        // A native BCn entry's bytes depend on the T#'s mip level count, which the
+                        // decode key does not hold: two descriptors at one address that differ only
+                        // in last_level share a key. Reusing a 1-level entry for a 10-level chain
+                        // would make the backend read the missing levels past the end of the buffer
+                        // (#3883 review). So a BC entry is reusable only when its format AND its
+                        // packed level count are exactly what this reference would produce.
+                        const uint32_t expected_packed_mip_levels =
+                            native_bc_mip_chain ? native_bc_chain_levels : 0u;
+                        auto native_bc_entry_matches = [&](VkFormat entry_format,
+                                                           uint32_t entry_levels) {
+                            if (!native_bc_sampled &&
+                                prosper::test::backend_block_compressed_bytes(entry_format) == 0u)
+                                return true;
+                            return entry_format == decoded_texture_format &&
+                                   entry_levels == expected_packed_mip_levels;
+                        };
+                        if (reused != decoded_textures.end() &&
+                            !native_bc_entry_matches(reused->second.texture_format,
+                                                     reused->second.packed_mip_levels)) {
+                            if (reused->second.texstore_slot < texstore_pinned.size())
+                                texstore_pinned[reused->second.texstore_slot] = false;
+                            decoded_textures.erase(reused);
+                            reused = decoded_textures.end();
+                            ++g_texture_decode_scope.invalidations;
+                        }
                         DecodedTexture persistent_reuse;
                         const DecodedTexture* decoded_reuse = reused != decoded_textures.end()
                             ? &reused->second : nullptr;
@@ -5254,6 +5422,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             if (cached != persistent_decoded_textures.end() &&
                                 cached->second.source_addr == persistent_source_addr &&
                                 cached->second.source_size == persistent_source_size &&
+                                native_bc_entry_matches(cached->second.texture_format,
+                                                        cached->second.packed_mip_levels) &&
                                 (!retained_depth_cube_cache_eligible ||
                                  (depth_cube_source_layout_valid && cached->second.depth_cube_source.active &&
                                   cached->second.depth_cube_source.renderer_mask ==
@@ -5504,6 +5674,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     persistent_reuse.storage_image_contract_valid =
                                         cached->second.storage_image_contract_valid;
                                     persistent_reuse.layers = cached->second.layers;
+                                    persistent_reuse.packed_mip_levels =
+                                        cached->second.packed_mip_levels;
                                     persistent_reuse.pixels_bytes = cached->second.pixels ? cached->second.pixels->size() : 0;
                                     decoded_reuse = &persistent_reuse;
                                     resource_persistent_hit = true;
@@ -5912,6 +6084,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             // mips across face/slice boundaries would bleed.
                             if (!is_volume && fr.th == th)
                                 fr.declared_mip_levels = r.declared_mip_levels;
+                            // native_bc_entry_matches proved the entry packs exactly this many levels;
+                            // the byte count lets the backend refuse anything it cannot read.
+                            if (prosper::test::backend_block_compressed_bytes(fr.texture_format)) {
+                                fr.uploaded_mip_levels = decoded_reuse->packed_mip_levels;
+                                fr.tex_byte_size = decoded_reuse->pixels_bytes;
+                            }
                             narrow_done = decoded_reuse->narrow;
                             fr.persistent_texture_id = decoded_reuse->persistent_id;
                             fr.persistent_texture_version = decoded_reuse->persistent_version;
@@ -5980,7 +6158,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     fr.tex_rgba_owner,
                                                    fr.texture_format,
                                                    fr.storage_image_contract_valid,
-                                                   fr.sample_count, fr.tex_byte_size, fr.gpu_detile});
+                                                   fr.sample_count, fr.tex_byte_size, fr.gpu_detile,
+                                                   fr.uploaded_mip_levels});
                             if (timing_enabled) pending_timing.texture_reuses++;
                         } else {
                         // PROSPER_DETILE_STATS: this branch is the texture-decode MISS path — the cache
@@ -6222,8 +6401,16 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         fr.texture_format = decoded_texture_format;
                         const uint32_t output_bpp =
                             prosper::test::backend_color_bytes_per_pixel(decoded_texture_format);
-                        size_t nb = volume_texels * output_bpp *
-                            (is_cube ? 6u : (is_array ? decoded_layers : 1u));
+                        // A native BC surface holds ceil(w/4) x ceil(h/4) blocks, not texels
+                        // (output_bpp is 0 for a block format by design).
+                        size_t nb = native_bc_sampled
+                            ? static_cast<size_t>(native_bc_mip_chain
+                                  ? prosper::test::backend_texture_chain_bytes(
+                                        decoded_texture_format, tw, th, native_bc_chain_levels)
+                                  : prosper::test::backend_texture_bytes(
+                                        decoded_texture_format, tw, th))
+                            : volume_texels * output_bpp *
+                                  (is_cube ? 6u : (is_array ? decoded_layers : 1u));
                         size_t linear_source_prefix_size = 0;
                         bool decoder_source_snapshot_ready = false;
                         size_t decoder_source_prefix_size = 0;
@@ -7359,6 +7546,77 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 fr.storage_image_contract_valid = false;
                                 std::fill(texture_pixels.begin(), texture_pixels.end(), 0);
                             }
+                        } else if (bcb && native_bc_mip_chain) {
+                            // Every guest level, block-detiled at its own placement and packed level
+                            // 0 first -- the layout backend_texture_chain_bytes describes. Levels in
+                            // the shared tail read the allocation's first block at their element
+                            // coordinates, exactly as a tail-selected single-level view does.
+                            const bool tiled_chain = !PROSPER_ENV_VALUE("PROSPER_NODETILE");
+                            size_t offset = 0;
+                            for (uint32_t level = 0; level < native_bc_chain_levels; ++level) {
+                                const prosper::gpu::MipChainLevel& L = native_bc_plan->levels[level];
+                                const uint32_t lbw = (L.width + 3u) / 4u;
+                                const uint32_t lbh = (L.height + 3u) / 4u;
+                                const size_t level_bytes = static_cast<size_t>(lbw) * lbh * bcb;
+                                if (!tiled_chain || offset + level_bytes > texture_pixels.size()) {
+                                    std::fill(texture_pixels.begin(), texture_pixels.end(), 0);
+                                    break;
+                                }
+                                uint8_t* dst = texture_pixels.data() + offset;
+                                std::fill(dst, dst + level_bytes, 0);
+                                const size_t span = L.in_tail ? L.tail_block_bytes : L.byte_size;
+                                prosper::frontend::DecodeScratchPool::Lease src =
+                                    prosper::frontend::decode_scratch_pool().take(span);
+                                src.zero_tail(copy_resource(
+                                    src.data(), native_bc_chain_base + L.byte_offset, span));
+                                if (L.in_tail)
+                                    prosper::gpu::detile_elements_level(
+                                        dst, src.data(), span, lbw, lbh, bcb, r.tile_mode,
+                                        L.tail_x, L.tail_y);
+                                else
+                                    prosper::gpu::detile_elements(
+                                        dst, src.data(), span, lbw, lbh, bcb, r.tile_mode);
+                                offset += level_bytes;
+                            }
+                            // PROSPER_NATIVE_BC_CHAIN_AUDIT=1: does the level-1 placement hold this
+                            // texture's own level 1? A real mip is close to the 2x2 box of level 0; a
+                            // foreign or unwritten region is not. Logged once per identity (bounded).
+                            if (PROSPER_ENV_ON("PROSPER_NATIVE_BC_CHAIN_AUDIT") &&
+                                native_bc_chain_levels > 1 && tw >= 8 && th >= 8) {
+                                static std::set<uint64_t> audited;
+                                if (audited.size() < 400 && audited.insert(r.gpu_addr).second) {
+                                    std::vector<uint8_t> l0(size_t(tw) * th * 4), l1(size_t(tw / 2) * (th / 2) * 4);
+                                    const size_t l0_bytes = size_t((tw + 3) / 4) * ((th + 3) / 4) * bcb;
+                                    prosper::gpu::bc_decode_surface(l0.data(), texture_pixels.data(), l0_bytes, tw, th, r.format);
+                                    prosper::gpu::bc_decode_surface(l1.data(), texture_pixels.data() + l0_bytes,
+                                        texture_pixels.size() - l0_bytes, tw / 2, th / 2, r.format);
+                                    double mad = 0, mad_shift = 0; size_t n = 0;
+                                    for (uint32_t y = 0; y < th / 2; ++y)
+                                        for (uint32_t x = 0; x < tw / 2; ++x)
+                                            for (uint32_t c = 0; c < 3; ++c) {
+                                                auto at = [&](uint32_t xx, uint32_t yy) { return int(l0[(size_t(yy) * tw + xx) * 4 + c]); };
+                                                const int box = (at(2*x,2*y) + at(2*x+1,2*y) + at(2*x,2*y+1) + at(2*x+1,2*y+1) + 2) / 4;
+                                                const int v = l1[(size_t(y) * (tw / 2) + x) * 4 + c];
+                                                const uint32_t sx = (x + tw / 4) % (tw / 2);
+                                                const int vs = l1[(size_t(y) * (tw / 2) + sx) * 4 + c];
+                                                mad += std::abs(v - box); mad_shift += std::abs(vs - box); ++n;
+                                            }
+                                    std::fprintf(stderr, "[native-bc-audit] addr=0x%llx fmt=%u %ux%u levels=%u tile=%u "
+                                                 "l1_vs_box0=%.2f shifted_control=%.2f\n",
+                                                 static_cast<unsigned long long>(r.gpu_addr),
+                                                 static_cast<unsigned>(r.format), tw, th, native_bc_chain_levels,
+                                                 r.tile_mode, n ? mad / n : 0.0, n ? mad_shift / n : 0.0);
+                                }
+                            }
+                        } else if (bcb && native_bc_linear_copy) {
+                            // Linear, unpadded native BC: one guarded copy of the guest blocks, which
+                            // also serves as the persistent cache's validation source.
+                            linear_source_prefix_size = copy_resource(
+                                texture_pixels.data(), sampled_source_addr,
+                                texture_pixels.size());
+                            if (linear_source_prefix_size < texture_pixels.size())
+                                std::fill(texture_pixels.begin() + linear_source_prefix_size,
+                                          texture_pixels.end(), 0);
                         } else if (bcb) {
                             uint32_t bw = (tw + 3) / 4, bh = (th + 3) / 4;
                             // Block-detile: tiled_elements_bytes/detile_elements now derive the 4KB
@@ -7398,7 +7656,18 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 lin.zero_tail(copy_resource(
                                     lin.data(), sampled_source_addr, comp_bytes));
                             }
-                            if (!prosper::gpu::bc_decode_surface(
+                            if (native_bc_sampled) {
+                                // Native upload: the detiled blocks ARE the texture. (A linear
+                                // unpadded surface never reaches here; see native_bc_linear_copy.)
+                                if (texture_pixels.size() == comp_bytes)
+                                    std::memcpy(texture_pixels.data(),
+                                                snapshot_source
+                                                    ? persistent_validation_scratch.data()
+                                                    : lin.data(),
+                                                comp_bytes);
+                                else
+                                    std::fill(texture_pixels.begin(), texture_pixels.end(), 0);
+                            } else if (!prosper::gpu::bc_decode_surface(
                                     texture_pixels.data(), snapshot_source ? persistent_validation_scratch.data()
                                                                           : lin.data(),
                                     comp_bytes, tw, th, r.format))
@@ -8033,6 +8302,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         // #1272: see the reuse path — plain 2D guest textures only.
                         if (!is_volume && !cube_done)
                             fr.declared_mip_levels = r.declared_mip_levels;
+                        if (native_bc_mip_chain && !rtt_hit && fr.texture_format == native_bc_format)
+                            fr.uploaded_mip_levels = native_bc_chain_levels;
+                        if (native_bc_sampled && !rtt_hit && fr.texture_format == native_bc_format)
+                            fr.tex_byte_size = texture_pixels.size();
                         // Failed/mismatched renderer readback must retry on the next use. Caching
                         // its guest fallback under the renderer generation would freeze that fallback.
                         const bool cube_cache_proven = !retained_depth_cube_cache_candidate ||
@@ -8191,6 +8464,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 cached.persistent_version = inherited_persistent_version + 1;
                                 if (!cached.persistent_version) cached.persistent_version = 1;
                                 cached.texture_format = fr.texture_format;
+                                cached.packed_mip_levels = fr.uploaded_mip_levels;
                                 cached.storage_image_contract_valid =
                                     fr.storage_image_contract_valid;
                                 cached.validation_snapshot =
@@ -8229,7 +8503,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                                           cross_span_source_size, pinned_slot,
                                                           fr.tex_rgba_owner, fr.texture_format,
                                                           fr.storage_image_contract_valid,
-                                                          fr.sample_count, fr.tex_byte_size, fr.gpu_detile});
+                                                          fr.sample_count, fr.tex_byte_size, fr.gpu_detile,
+                                                          fr.uploaded_mip_levels});
                         }
                         }
                         if (native_r32ui_storage && writable_storage_image) {
