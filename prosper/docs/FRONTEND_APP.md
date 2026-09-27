@@ -741,7 +741,7 @@ non-texture usage, within [1 GiB, 75% of the heap], and never above the old rule
 (unified-memory) device; without the extension, or with `PROSPER_NO_VRAM_BUDGET=1`, it is one eighth
 of the largest device-local heap clamped to 1-4 GiB (`src/gpu/memory/texture_cache_budget.hpp`,
 #3873). At most 1024 allocations. `PROSPER_FAKE_HEAP_BUDGET_MB=<MiB>` pretends the heap is a
-discrete card of that size (test-only). Set
+discrete card of that size, for this budget and the colour-target budget alike (test-only). Set
 `PROSPER_BACKEND_TEXTURE_CACHE_MB=<MiB>` to change the byte budget absolutely or
 `PROSPER_NO_BACKEND_PERSISTENT_TEXTURES=1` for a forced-upload A/B. When the budget is full, the
 least-recently-used image is evicted even while earlier command buffers of the same ordered batch

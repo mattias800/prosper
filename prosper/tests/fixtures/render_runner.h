@@ -3101,6 +3101,25 @@ inline VkDeviceSize persistent_color_target_limit() {
     return dev ? dev : static_cast<VkDeviceSize>(256ull * 1024ull * 1024ull);
 }
 
+// PROSPER_NO_VRAM_BUDGET=1 keeps the old heap/8 rule even where VK_EXT_memory_budget is available
+// (the A/B arm). PROSPER_FAKE_HEAP_BUDGET_MB=<n> is TEST-ONLY: it pretends the texture heap is a
+// DISCRETE heap of n MiB whose driver budget is also n MiB (usage stays the real figure), so a
+// discrete card's budget can be exercised on a machine without one. With both set, the old rule is
+// evaluated against the faked heap size -- which is what an n-MiB card got before #3873. The fake
+// also sizes the colour-target residency budget (heap / 4), because that cache fills to its own
+// budget and is the largest non-texture consumer the texture budget yields to: leaving it at the
+// real heap's figure would simulate a card whose render targets may hold 4 GiB of an 8 GiB heap.
+inline bool vram_budget_disabled() {
+    static const bool disabled = getenv("PROSPER_NO_VRAM_BUDGET") != nullptr;
+    return disabled;
+}
+inline uint64_t fake_heap_budget_bytes() {
+    static const uint64_t bytes = prosper::diag::env_u64_or_default_capped(
+        "PROSPER_FAKE_HEAP_BUDGET_MB", getenv("PROSPER_FAKE_HEAP_BUDGET_MB"), 0ull,
+        UINT64_MAX / (1024ull * 1024ull), "MiB") * 1024ull * 1024ull;
+    return bytes;
+}
+
 // Size the default residency budget to a quarter of the largest device-local heap, clamped to
 // [256 MiB, 4 GiB]. On an integrated GPU (shared system RAM, a very large heap) this lands at the 4 GiB
 // ceiling; on a small discrete GPU it stays proportional so we never claim more than ~25% of VRAM.
@@ -3113,6 +3132,7 @@ inline void init_persistent_color_target_device_budget(
     for (uint32_t i = 0; i < memp.memoryHeapCount; i++)
         if (memp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
             heap = std::max(heap, memp.memoryHeaps[i].size);
+    if (fake_heap_budget_bytes()) heap = fake_heap_budget_bytes();  // test-only (#3873)
     VkDeviceSize budget = heap / 4;
     budget = std::max<VkDeviceSize>(budget, 256ull * 1024ull * 1024ull);
     budget = std::min<VkDeviceSize>(budget, 4096ull * 1024ull * 1024ull);
@@ -3173,22 +3193,6 @@ inline void init_persistent_texture_cache_device_budget(
 inline std::atomic<uint32_t>& persistent_texture_heap_index() {
     static std::atomic<uint32_t> heap{UINT32_MAX};
     return heap;
-}
-
-// PROSPER_NO_VRAM_BUDGET=1 keeps the old heap/8 rule even where VK_EXT_memory_budget is available
-// (the A/B arm). PROSPER_FAKE_HEAP_BUDGET_MB=<n> is TEST-ONLY: it pretends the texture heap is a
-// DISCRETE heap of n MiB whose driver budget is also n MiB (usage stays the real figure), so a
-// discrete card's budget can be exercised on a machine without one. With both set, the old rule is
-// evaluated against the faked heap size -- which is what an n-MiB card got before #3873.
-inline bool vram_budget_disabled() {
-    static const bool disabled = getenv("PROSPER_NO_VRAM_BUDGET") != nullptr;
-    return disabled;
-}
-inline uint64_t fake_heap_budget_bytes() {
-    static const uint64_t bytes = prosper::diag::env_u64_or_default_capped(
-        "PROSPER_FAKE_HEAP_BUDGET_MB", getenv("PROSPER_FAKE_HEAP_BUDGET_MB"), 0ull,
-        UINT64_MAX / (1024ull * 1024ull), "MiB") * 1024ull * 1024ull;
-    return bytes;
 }
 
 // Re-derive the texture budget from the driver's live figures, at most every 250 ms (one
