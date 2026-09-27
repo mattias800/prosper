@@ -374,6 +374,24 @@ volume census was kept, because the volume is the input to any future batching q
   for an invalidation surface of the #611/#780 class. Do not build a resolution memo without first
   showing a chain stage that is both slow and repeat-invariant -- the census reports exactly that.
 
+**RULED OUT (2026-09-27): "after #3877 another single exact O(n)-per-draw hotspot remains on the
+GTA V render thread."** A source-line profile of the submitting thread (Release with `-g1` line
+tables, plain `perf record -F 499` on the whole process in a settled gameplay window, samples
+histogrammed by innermost *prosper* source line and by inlined call site; library leaves such as
+`memmove`/`malloc` attributed to their prosper caller through AMD LBR `-j any_call`) found no source
+region above ~1.3% of the thread outside the known architectural items (compute result write-back,
+`parallel_compute_texels`, buffer-range copies, readback snapshots). The largest remaining exact
+candidates are flat and small: `RegisterFile` lookups ~2-3% spread over every register read,
+`ShaderCompileKey` hash + compare ~2%, `std::set` node allocation for `srt_seen` in
+`build_stage_table` ~1%, the FNV hash over every SPIR-V word in
+`validate_spirv_descriptor_interface` ~1%. None is individually measurable against GTA's ~2-3%
+run-to-run spread. The one exact item above that line was per-dispatch compute program analysis
+(the native-multiwave probe, re-run on every compute dispatch), fixed by `compute_program_facts`
+(+3-6% Sonic Frontiers / GTA V, #3873). Outer Wilds' largest single site is the backend buffer-range
+copy (`parallel_render_memcpy_batch`, ~11% of user samples) -- § 3's "did this buffer change?"
+problem, not a missing index. On Sonic Frontiers (profiled before #3882) 4.3% of the thread was the
+retained depth-array float expansion loop, which #3882's GPU gather removes rather than speeds up.
+
 ## The frontier, found 2026-09-26: compute-item execution, not the renderer
 
 Everything above measures the render path. It was the wrong place to look, and the census that
