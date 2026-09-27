@@ -1,5 +1,11 @@
 // Retained depth arrays preserve Float32 contents and publish only complete, ordered snapshots.
+//
+// Every live-frontend arm runs against one of two routes: the CPU readback + re-upload bridge
+// (default arms, PROSPER_NO_GPU_DEPTH_ARRAY=1) or the GPU-resident copy (`--gpu`). Both must
+// produce the same sampled pixels on every check below; the representation checks count CPU
+// upload bytes on the CPU route and GPU-copied output bytes (with zero CPU upload) on the GPU one.
 #include "fixtures/render_runner.h"
+#include "fixtures/retained_depth_array_gpu.h"
 #include "gpu/execute/gpu_execute.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "hle/dispatch/dispatch.hpp"
@@ -59,18 +65,19 @@ template<class Action> static std::string capture_stderr(Action action) {
 }
 
 int main(int argc, char** argv) {
-    bool per_draw_control = false, expanded_control = false;
+    bool per_draw_control = false, expanded_control = false, gpu_route = false;
     bool texture_path_census_budget = false;
     bool texture_path_census_empty = false;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--per-draw-control") == 0) per_draw_control = true;
         else if (std::strcmp(argv[i], "--expanded-control") == 0) expanded_control = true;
+        else if (std::strcmp(argv[i], "--gpu") == 0) gpu_route = true;
         else if (std::strcmp(argv[i], "--texture-path-census-budget") == 0)
             texture_path_census_budget = true;
         else if (std::strcmp(argv[i], "--texture-path-census-empty") == 0)
             texture_path_census_empty = true;
         else {
-            std::fprintf(stderr, "usage: %s [--per-draw-control] [--expanded-control] "
+            std::fprintf(stderr, "usage: %s [--gpu] [--per-draw-control] [--expanded-control] "
                                  "[--texture-path-census-budget|"
                                  "--texture-path-census-empty]\n", argv[0]);
             return 2;
@@ -130,13 +137,18 @@ int main(int argc, char** argv) {
     _putenv_s("PROSPER_RENDER_TIMING", "1");
     if (per_draw_control) _putenv_s("PROSPER_NO_SUBMIT_DEPTH_ARRAY_SNAPSHOT_REUSE", "1");
     if (expanded_control) _putenv_s("PROSPER_NO_COMPACT_DEPTH_ARRAY_SNAPSHOT", "1");
+    if (!gpu_route) _putenv_s("PROSPER_NO_GPU_DEPTH_ARRAY", "1");
 #else
     setenv("PROSPER_DEPTH_ARRAY_SNAPSHOT_CENSUS", "1", 1);
     setenv("PROSPER_ARRAY_REJECT_LOG_ALL", "1", 1);
     setenv("PROSPER_RENDER_TIMING", "1", 1);
     if (per_draw_control) setenv("PROSPER_NO_SUBMIT_DEPTH_ARRAY_SNAPSHOT_REUSE", "1", 1);
     if (expanded_control) setenv("PROSPER_NO_COMPACT_DEPTH_ARRAY_SNAPSHOT", "1", 1);
+    if (!gpu_route) setenv("PROSPER_NO_GPU_DEPTH_ARRAY", "1", 1);
+    else unsetenv("PROSPER_NO_GPU_DEPTH_ARRAY");
 #endif
+    check(gpu_depth_array_snapshots_enabled() == gpu_route,
+          "the selected retained-array route is the one this arm asked for");
     constexpr uint32_t W = 8, H = 8, Layers = 4;
     // Numeric disjointness is not physical disjointness. Give the fixture's ordinary DS
     // identities tracked private backing so the invalidator can prove their independence.
@@ -210,6 +222,41 @@ int main(int argc, char** argv) {
     check(read_persistent_ds_depth_array(Base, W, H, 0, Layers, output, error) ==
               Status::Ready && exact(),
           "four retained layers preserve every Float32 bit, including values lost by half or RGBA8");
+    if (gpu_route) {
+        // GPU snapshot ownership (#3882 review). A snapshot is filled by a command buffer in ONE
+        // ordered batch: it may be served only to consumers recorded later into that same batch,
+        // and a failure of that batch after the copy was enqueued must revoke it.
+        const auto& ctx = render_vk_ctx();
+        auto copy_into = [&](BackendSubmissionBatch& batch) {
+            std::shared_ptr<PersistentDsDepthArrayGpuImage> snapshot;
+            std::string copy_error;
+            const auto result = copy_persistent_ds_depth_array_gpu(
+                Base, W, H, 0, Layers, VK_FORMAT_R32_SFLOAT, batch, snapshot, copy_error);
+            if (result != DepthArrayGpuResult::Ready)
+                std::fprintf(stderr, "gpu copy: %s\n", copy_error.c_str());
+            return result == DepthArrayGpuResult::Ready ? snapshot : nullptr;
+        };
+        BackendSubmissionBatch completed_batch, other_batch;
+        auto completed = copy_into(completed_batch);
+        check(completed && completed_batch.pending(),
+              "GPU snapshot copy is recorded into the caller's ordered batch, not submitted");
+        check(completed && completed->servable_to(&completed_batch),
+              "GPU snapshot serves a consumer in its own batch");
+        check(completed && !completed->servable_to(nullptr) &&
+                  !completed->servable_to(&other_batch),
+              "GPU snapshot refuses a direct submission or another batch that could run first");
+        const auto submitted = completed_batch.submit_and_wait(ctx.dev, ctx.queue, false);
+        check(submitted.submit_result == VK_SUCCESS && submitted.wait_result == VK_SUCCESS &&
+                  completed && completed->valid.load(),
+              "a completed owning batch leaves the snapshot valid (positive control)");
+        BackendSubmissionBatch failed_batch;
+        auto failed = copy_into(failed_batch);
+        check(failed && failed->servable_to(&failed_batch),
+              "second snapshot is servable before its batch fails");
+        failed_batch.discard();
+        check(failed && !failed->valid.load() && !failed->servable_to(&failed_batch),
+              "a batch failing AFTER the copy was enqueued revokes the snapshot");
+    }
     expected[2] = 0.6251068115234375f;
     if (!seed_layer(2, expected[2])) return 1;
     check(read_persistent_ds_depth_array(Base, W, H, 0, Layers, output, error) ==
@@ -352,6 +399,32 @@ int main(int argc, char** argv) {
             ? sizeof(float) : 4 * sizeof(float);
     };
     const uint64_t snapshot_bpp = payload_bpp(false);
+    // The sampled representation produced since mark_payload(): CPU route -> the last backend call's
+    // CPU upload; GPU route -> GPU-copied output bytes, and the CPU upload must be exactly zero (a
+    // silent fallback to the CPU route fails here even when the pixels are right).
+    uint64_t gpu_payload_mark = 0, gpu_copy_mark = 0;
+    const auto mark_payload = [&] {
+        gpu_payload_mark = depth_array_gpu_copy_stats().output_bytes;
+        gpu_copy_mark = depth_array_gpu_copy_stats().copies;
+    };
+    // Distinct materialized array images since mark_payload(): backend CPU uploads on the CPU
+    // route; GPU copies on the GPU route, whose borrowed images are not backend uploads at all.
+    const auto materialized_is = [&](size_t expected_images) {
+        const size_t cpu = backend_texture_upload_stats().unique_uploads;
+        if (!gpu_route) return cpu == expected_images;
+        return cpu == 0 &&
+               depth_array_gpu_copy_stats().copies - gpu_copy_mark == expected_images;
+    };
+    const auto payload_is = [&](uint64_t expected_bytes) {
+        const uint64_t cpu = backend_texture_upload_stats().upload_bytes;
+        if (!gpu_route) return cpu == expected_bytes;
+        const uint64_t gpu = depth_array_gpu_copy_stats().output_bytes - gpu_payload_mark;
+        if (cpu != 0 || gpu != expected_bytes)
+            std::printf("[snapshot-fixture] gpu route payload cpu=%llu gpu=%llu expected=%llu\n",
+                        (unsigned long long)cpu, (unsigned long long)gpu,
+                        (unsigned long long)expected_bytes);
+        return cpu == 0 && gpu == expected_bytes;
+    };
     std::printf("[snapshot-fixture] representation=%s expected_bpp=%llu R32features=0x%x\n",
                 expanded_control ? "expanded-control" : "compact-with-feature-fallback",
                 (unsigned long long)snapshot_bpp, compact_properties.optimalTilingFeatures);
@@ -437,8 +510,9 @@ int main(int argc, char** argv) {
     for (uint32_t channel = 0; channel < 4; ++channel) {
         component_shader(true, channel, 0.5f,
             {natural[channel], natural[channel], natural[channel], natural[channel]});
+        mark_payload();
         check(live_matches(), "array gather preserves precise R and substituted G/B/A components");
-        check(backend_texture_upload_stats().upload_bytes == Pixels * Layers * snapshot_bpp,
+        check(payload_is(Pixels * Layers * snapshot_bpp),
               "gather uses the expected compact or explicitly expanded payload size");
     }
     auto& component_resource = live_table->resources[0];
@@ -456,8 +530,9 @@ int main(int argc, char** argv) {
     if (expanded_properties.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) {
         component_resource.mag_filter = component_resource.min_filter = 1;
         component_shader(false, 0, 0.5f, natural);
+        mark_payload();
         check(live_matches(), "linear array sampler preserves exact uniform-layer components");
-        check(backend_texture_upload_stats().upload_bytes == Pixels * Layers * payload_bpp(true),
+        check(payload_is(Pixels * Layers * payload_bpp(true)),
               "R32 linear support is checked separately and otherwise retains expanded sampling");
         component_resource.mag_filter = component_resource.min_filter = 0;
     } else {
@@ -475,14 +550,16 @@ int main(int argc, char** argv) {
         check(live_matches(), "border sampler preserves expanded RGBA channel values outside the image");
         component_shader(true, border == 2 ? 1u : 3u, -4.0f,
             {border_value, border_value, border_value, border_value});
+        mark_payload();
         check(live_matches(), "out-of-range gather preserves transparent alpha and opaque-white green");
-        check(backend_texture_upload_stats().upload_bytes == Pixels * Layers * 4 * sizeof(float),
+        check(payload_is(Pixels * Layers * 4 * sizeof(float)),
               "border-sensitive retained array deliberately keeps the expanded representation");
     }
     component_resource.addr_uvw[0] = 0; component_resource.border_color_type = 0;
     component_shader(false, 0, 0.0f, {0.0f, 0.0f, 0.0f, 0.0f}, true);
+    mark_payload();
     check(live_matches(), "out-of-bounds array fetch preserves expanded robust zero including alpha");
-    check(backend_texture_upload_stats().upload_bytes == Pixels * Layers * 4 * sizeof(float),
+    check(payload_is(Pixels * Layers * 4 * sizeof(float)),
           "any image fetch keeps the expanded retained-array representation");
 
     expected[3] = 0.9376373291015625f;
@@ -789,6 +866,7 @@ int main(int argc, char** argv) {
     live_producer.color0_base = 0;
     repeated_shader({expected[0], expected[1], expected[2]});
     live_draw.color0_base = Base + 0x1200000;
+    mark_payload();
     const auto shared_pixels = render_submit_items({live_producer, live_draw}, W, H);
     const size_t shared_center = (W * (H / 2) + W / 2) * 4;
     bool shared_matches = shared_pixels.size() == Pixels * 4;
@@ -797,8 +875,8 @@ int main(int argc, char** argv) {
                           shared_pixels[shared_center + c] <= 128;
     check(shared_matches, "shared array payload preserves layers/samplers after pending producer flush");
     auto uploads = backend_texture_upload_stats();
-    check(uploads.references == 3 && uploads.unique_uploads == 1 &&
-              uploads.upload_bytes == Pixels * Layers * snapshot_bpp,
+    check(uploads.references == 3 && materialized_is(1) &&
+              payload_is(Pixels * Layers * snapshot_bpp),
           "three array bindings produce one actual backend image/staging upload");
     const auto valid_bindings = backend_resource_reuse_stats();
     const auto valid_timing = backend_render_timing_stats();
@@ -832,6 +910,7 @@ int main(int argc, char** argv) {
     // still yield six references, while the immutable pixel owner permits one actual upload. The
     // old draw-local memo makes two unique uploads here even when the final pixels happen to match.
     live_draw.color0_base += 0x10000;
+    mark_payload();
     const auto cross_draw_pixels = render_submit_items({live_draw, live_draw}, W, H);
     bool cross_draw_matches = cross_draw_pixels.size() == Pixels * 4;
     if (cross_draw_matches) for (size_t c = 0; c < 4; ++c)
@@ -848,9 +927,9 @@ int main(int argc, char** argv) {
     };
     report_uploads("same-target");
     check(uploads.references == 6, "two draws retain all six texture references");
-    check(uploads.unique_uploads == expected_uploads,
+    check(materialized_is(expected_uploads),
           "callback policy shares one upload; startup per-draw control requires two");
-    check(uploads.upload_bytes == expected_uploads * Pixels * Layers * snapshot_bpp,
+    check(payload_is(expected_uploads * Pixels * Layers * snapshot_bpp),
           "actual uploaded bytes agree with the independently expected policy count");
     const auto empty_pass = render_draw_pass_rgba(std::span<const BackendDraw>{}, W, H);
     check(empty_pass.empty(), "empty direct backend pass exits before any Vulkan work");
@@ -903,19 +982,21 @@ int main(int argc, char** argv) {
     repeated_table->resources[2].gpu_addr = Base;
     repeated_shader({expected[0], expected[1], different_value});
     live_draw.color0_base += 0x10000;
+    mark_payload();
     check(live_matches(), "different retained array bases keep independent sampled values");
     uploads = backend_texture_upload_stats();
-    check(uploads.references == 3 && uploads.unique_uploads == 2,
+    check(uploads.references == 3 && materialized_is(2),
           "different array base does not reuse the first snapshot/upload");
 
     repeated_table->resources[2].gpu_addr = shared_base;
     repeated_table->resources[2].depth = 2;
     repeated_shader({expected[0], expected[1], expected[1]});
     live_draw.color0_base += 0x10000;
+    mark_payload();
     check(live_matches(), "different array layer count retains the requested view");
     uploads = backend_texture_upload_stats();
-    check(uploads.references == 3 && uploads.unique_uploads == 2 &&
-              uploads.upload_bytes == Pixels * (Layers + 2) * snapshot_bpp,
+    check(uploads.references == 3 && materialized_is(2) &&
+              payload_is(Pixels * (Layers + 2) * snapshot_bpp),
           "different layer count owns a distinct correctly sized upload");
 
     repeated_table->resources[2].depth = Layers;
@@ -934,9 +1015,10 @@ int main(int argc, char** argv) {
     if (!seed_layer(2, expected[2])) return 1;
     repeated_shader({expected[0], expected[1], expected[2]});
     live_draw.color0_base += 0x10000;
+    mark_payload();
     check(live_matches(), "later draw observes renderer rewrite rather than a prior draw's shared snapshot");
     uploads = backend_texture_upload_stats();
-    check(uploads.references == 3 && uploads.unique_uploads == 1,
+    check(uploads.references == 3 && materialized_is(1),
           "new generation deduplicates only its own draw's bindings");
     // Real direct-memory aliases: A and B are VA-disjoint views of the same physical bytes;
     // C is another physical range. Warm an array through A before notifying a layer-2 write
@@ -1023,5 +1105,12 @@ int main(int argc, char** argv) {
     check(read_persistent_ds_depth_array(alias_a, W, H, 0, Layers, output, error) ==
               Status::Unavailable && output == before_unknown,
           "unknown mapping relation conservatively revokes retained array authority");
+    const auto gpu_stats = depth_array_gpu_copy_stats();
+    std::printf("[snapshot-fixture] route=%s gpu_copies=%llu gpu_layers=%llu pool_hits=%llu "
+                "pool_misses=%llu\n", gpu_route ? "gpu" : "cpu",
+                (unsigned long long)gpu_stats.copies, (unsigned long long)gpu_stats.layers,
+                (unsigned long long)gpu_stats.pool_hits, (unsigned long long)gpu_stats.pool_misses);
+    check(gpu_route ? gpu_stats.copies > 0 : gpu_stats.copies == 0,
+          "only the GPU arm records GPU copies; the CPU arms never touch the new route");
     return failures ? 1 : 0;
 }

@@ -56,6 +56,7 @@
 #include "gpu/diagnostics/diag_ratelimit.hpp"       // ordinal + sparse tail for capped diagnostics
 #include "host/memory/guest_write_watch.hpp"
 #include "fixtures/render_runner.h"              // offscreen Vulkan backend (render_draws_rgba) + dump_bmp
+#include "fixtures/retained_depth_array_gpu.h"   // GPU-resident retained depth-array snapshots
 
 #include <atomic>
 #include <cerrno>
@@ -3300,6 +3301,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 VkFormat format;
                 std::vector<DepthPlaneIdentity> planes;
                 std::shared_ptr<const std::vector<uint8_t>> pixels;
+                // GPU-resident alternative to `pixels` (exactly one is set). Its image is filled by
+                // a command buffer queued in this callback's ordered batch; see
+                // tests/fixtures/retained_depth_array_gpu.h.
+                std::shared_ptr<prosper::test::PersistentDsDepthArrayGpuImage> gpu;
             };
             struct DepthArraySnapshotCensus {
                 bool enabled;
@@ -3322,6 +3327,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 std::getenv("PROSPER_NO_SUBMIT_DEPTH_ARRAY_SNAPSHOT_REUSE") == nullptr;
             const bool compact_depth_array_snapshots =
                 std::getenv("PROSPER_NO_COMPACT_DEPTH_ARRAY_SNAPSHOT") == nullptr;
+            // PROSPER_NO_GPU_DEPTH_ARRAY=1 restores the CPU readback + re-upload bridge.
+            const bool gpu_depth_array_snapshots =
+                prosper::test::gpu_depth_array_snapshots_enabled();
             const auto clear_depth_array_snapshots = [&] {
                 depth_array_snapshots.clear();
                 depth_array_snapshot_bytes = 0;
@@ -4297,6 +4305,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             continue;
                         }
                         std::shared_ptr<const std::vector<uint8_t>> retained_depth_array;
+                        std::shared_ptr<prosper::test::PersistentDsDepthArrayGpuImage>
+                            retained_depth_array_gpu;
                         VkFormat retained_depth_array_format = VK_FORMAT_R32G32B32A32_SFLOAT;
                         if (float32_array && !resource_compute_image_hit) {
                             const auto& array_ctx = prosper::test::render_vk_ctx();
@@ -4429,7 +4439,11 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     prosper::test::note_ds_layer_stride_locked(
                                         r.gpu_addr, tw, th, r.layer_stride_bytes);
                                 }
-                                if (retained_exact && !depth_array_snapshots.empty() &&
+                                // The GPU route records its copy into this same ordered batch, so
+                                // the (speculatively published) source identity is already the one
+                                // its copy will observe; only the CPU snapshot needs completion.
+                                const bool gpu_route = gpu_depth_array_snapshots && producer_batch;
+                                if (!gpu_route && retained_exact && !depth_array_snapshots.empty() &&
                                     producer_batch && producer_batch->pending()) {
                                     // Complete earlier work before testing the source identity. An
                                     // unrelated color pass need not discard an unchanged DS snapshot;
@@ -4485,8 +4499,17 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     for (const auto& cached : depth_array_snapshots) {
                                         if (cached.base == r.gpu_addr && cached.stride == r.layer_stride_bytes &&
                                             cached.width == tw && cached.height == th && cached.layers == r.depth &&
-                                            cached.format == retained_depth_array_format && cached.planes == planes) {
+                                            cached.format == retained_depth_array_format && cached.planes == planes &&
+                                            // A GPU snapshot serves only consumers recorded into
+                                            // the batch that carries its copy (see servable_to).
+                                            // build_bds' unbatched diagnostic re-renders
+                                            // (PROSPER_TARGET_STEP_HASH_DIM, PROSPER_DUMP_DRAWSTEPS)
+                                            // currently also disable batching altogether, so this
+                                            // guards an invariant rather than a live path.
+                                            (!cached.gpu || cached.gpu->servable_to(
+                                                gpu_route ? producer_batch : nullptr))) {
                                             retained_depth_array = cached.pixels;
+                                            retained_depth_array_gpu = cached.gpu;
                                             if (depth_array_census.enabled) ++depth_array_census.reuses;
                                             break;
                                         }
@@ -4494,11 +4517,29 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 }
                                 std::vector<float> depth;
                                 std::string error;
+                                const bool snapshot_reused = retained_depth_array || retained_depth_array_gpu;
                                 const uint64_t census_read_start =
-                                    texref_census && !retained_depth_array ? TexCensus::aux_begin() : 0;
-                                const auto status = retained_depth_array
+                                    texref_census && !snapshot_reused ? TexCensus::aux_begin() : 0;
+                                auto status = snapshot_reused
                                     ? prosper::test::PersistentDsDepthArrayStatus::Ready
-                                    : prosper::test::read_persistent_ds_depth_array(
+                                    : prosper::test::PersistentDsDepthArrayStatus::NoIdentity;
+                                bool gpu_fallback = !gpu_route;
+                                if (!snapshot_reused && gpu_route) {
+                                    using GpuResult = prosper::test::DepthArrayGpuResult;
+                                    const GpuResult result =
+                                        prosper::test::copy_persistent_ds_depth_array_gpu(
+                                            r.gpu_addr, tw, th, 0u, r.depth,
+                                            retained_depth_array_format, *producer_batch,
+                                            retained_depth_array_gpu, error);
+                                    gpu_fallback = result == GpuResult::Fallback;
+                                    status = result == GpuResult::Ready
+                                        ? prosper::test::PersistentDsDepthArrayStatus::Ready
+                                        : result == GpuResult::Unavailable
+                                            ? prosper::test::PersistentDsDepthArrayStatus::Unavailable
+                                            : prosper::test::PersistentDsDepthArrayStatus::NoIdentity;
+                                }
+                                if (!snapshot_reused && gpu_fallback)
+                                    status = prosper::test::read_persistent_ds_depth_array(
                                         r.gpu_addr, tw, th, 0u, r.depth, depth, error, producer_batch);
                                 if (texref_census)
                                     texref_census->aux_end(TexCensus::kAuxDsRead, census_read_start);
@@ -4512,7 +4553,29 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     continue;
                                 }
                                 if (status == prosper::test::PersistentDsDepthArrayStatus::Ready &&
-                                    !retained_depth_array) {
+                                    retained_depth_array_gpu && !snapshot_reused) {
+                                    if (depth_array_census.enabled) {
+                                        ++depth_array_census.reads;
+                                        depth_array_census.payload_bytes +=
+                                            static_cast<uint64_t>(tw) * th * r.depth * sizeof(float) *
+                                            (retained_depth_array_format == VK_FORMAT_R32_SFLOAT ? 1u : 4u);
+                                    }
+                                    // Same admission rule as the CPU snapshot below, charging the
+                                    // snapshot's real device allocation against the byte budget.
+                                    const size_t gpu_bytes = static_cast<size_t>(
+                                        retained_depth_array_gpu->slot->bytes);
+                                    if (!planes.empty() && planes == source_identity() &&
+                                        depth_array_snapshots.size() < kDepthArraySnapshotEntries &&
+                                        gpu_bytes <= kDepthArraySnapshotBytes - depth_array_snapshot_bytes) {
+                                        depth_array_snapshot_bytes += gpu_bytes;
+                                        depth_array_snapshots.push_back({r.gpu_addr, r.layer_stride_bytes,
+                                            tw, th, r.depth, retained_depth_array_format,
+                                            std::move(planes), nullptr, retained_depth_array_gpu});
+                                        depth_array_snapshot_admitted = true;
+                                    }
+                                }
+                                if (status == prosper::test::PersistentDsDepthArrayStatus::Ready &&
+                                    !retained_depth_array && !retained_depth_array_gpu) {
                                     const bool compact = retained_depth_array_format == VK_FORMAT_R32_SFLOAT;
                                     auto pixels = std::make_shared<std::vector<uint8_t>>(
                                         depth.size() * (compact ? 1u : 4u) * sizeof(float));
@@ -4541,22 +4604,23 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                         depth_array_snapshot_bytes += retained_depth_array->size();
                                         depth_array_snapshots.push_back({r.gpu_addr, r.layer_stride_bytes,
                                             tw, th, r.depth, retained_depth_array_format,
-                                            std::move(planes), retained_depth_array});
+                                            std::move(planes), retained_depth_array, nullptr});
                                         depth_array_snapshot_admitted = true;
                                     }
                                 }
-                                if (retained_depth_array) {
+                                if (retained_depth_array || retained_depth_array_gpu) {
                                     resource_has_ds_live = true;
                                     if (PROSPER_ENV_ON("PROSPER_DSBRIDGE_LOG")) {
                                         static unsigned reports = 0;
                                         if (reports++ < 16u)
                                             std::fprintf(stderr,
-                                                "[dsbridge] array addr=0x%llx %ux%ux%u exact-f32\n",
-                                                (unsigned long long)r.gpu_addr, tw, th, r.depth);
+                                                "[dsbridge] array addr=0x%llx %ux%ux%u exact-f32%s\n",
+                                                (unsigned long long)r.gpu_addr, tw, th, r.depth,
+                                                retained_depth_array_gpu ? " gpu" : "");
                                     }
                                 }
                             }
-                            if (r.compression_enabled && !retained_depth_array) {
+                            if (r.compression_enabled && !retained_depth_array && !retained_depth_array_gpu) {
                                 static thread_local uint32_t array_reject_logged = 0;
                                 if (log_array_rejection(array_reject_logged, "compressed-no-depth"))
                                     std::fprintf(stderr,
@@ -4702,7 +4766,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             persistent_unorm16_texture && r.num_components == 1u &&
                             !r.compression_enabled;
                         const bool persistent_sampled_texture = texture_decode_cache_candidate(
-                            has_live_rtt_authority, has_ds_live || retained_depth_array != nullptr,
+                            has_live_rtt_authority,
+                            has_ds_live || retained_depth_array != nullptr ||
+                                retained_depth_array_gpu != nullptr,
                             r.host_data != nullptr, r.img_dim,
                             r.cls == RC::Texture, persistent_format_supported,
                             persistent_bc_block_bytes != 0, exact_unorm16_cube);
@@ -5693,6 +5759,25 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 ? 1u : compute_image_import.depth;
                             fr.img_dim = r.img_dim;
                             fr.texture_format = compute_image_format;
+                        } else if (retained_depth_array_gpu) {
+                            // GPU-resident snapshot of every requested layer, filled by a command
+                            // buffer queued earlier in this callback's ordered batch. The backend's
+                            // borrowed-image route binds it directly and holds the lease until its
+                            // submission completes; like the CPU snapshot below, it never enters a
+                            // guest-byte cache.
+                            fr.borrowed_compute_image = retained_depth_array_gpu->image();
+                            fr.borrowed_compute_device = prosper::test::render_vk_ctx().dev;
+                            fr.borrowed_compute_image_layout =
+                                static_cast<uint32_t>(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                            fr.borrowed_compute_image_lease = retained_depth_array_gpu;
+                            fr.texture_format = retained_depth_array_format;
+                            fr.tw = tw;
+                            fr.th = th;
+                            fr.td = 1;
+                            fr.img_dim = r.img_dim;
+                            fr.guest_array = true;
+                            fr.sample_count = r.depth;
+                            resource_rtt_hit = true;
                         } else if (retained_depth_array) {
                             // Owned CPU snapshot spans every requested layer; it is never entered
                             // into guest-byte caches, which cannot observe renderer-only rewrites.
