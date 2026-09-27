@@ -13,3 +13,10 @@ Keep the two apart so the instrument stays a pure observer.
 `texture_cache_budget` is the persistent texture-image cache's budget (#3873). Its header states the
 whole formula and why unified-memory devices are capped at the pre-#3873 rule; read it before
 changing a constant, and change the unit test's hand-computed expectations with it.
+
+`memory_type_select` is the other policy here: WHICH Vulkan memory type an allocation takes (#3888).
+Anything only the GPU touches (render targets, depth, sampled/storage images, GPU-only buffers)
+prefers a `DEVICE_LOCAL` type and falls back to any compatible one; memory the CPU maps keeps its
+explicit flags. Do not add another "first compatible type" loop beside a renderer allocation: that
+rule puts images in system memory on a driver that lists a host type first, silently. It is
+header-only because its inputs are Vulkan structs; it still makes no Vulkan call.

@@ -2304,6 +2304,13 @@ if(TARGET prosper_core)
   target_link_libraries(test_texture_cache_budget PRIVATE prosper_core)
   add_test(NAME texture_cache_budget COMMAND test_texture_cache_budget)
 
+  # #3888: GPU-only images/buffers prefer a DEVICE_LOCAL memory type (pure; Vulkan headers only).
+  if(TARGET Vulkan::Vulkan)
+    add_executable(test_memory_type_select tests/gpu/memory/test_memory_type_select.cpp)
+    target_link_libraries(test_memory_type_select PRIVATE prosper_core Vulkan::Vulkan)
+    add_test(NAME memory_type_select COMMAND test_memory_type_select)
+  endif()
+
   add_executable(test_rdna2_decode tests/gpu/recompiler/test_rdna2_decode.cpp)
   target_link_libraries(test_rdna2_decode PRIVATE prosper_core)
   add_test(NAME rdna2_decode_walk COMMAND test_rdna2_decode)

@@ -13,6 +13,7 @@
 #include <memory>
 #include <vector>
 #include "gpu/diagnostics/gpu_memory_budget_vk.hpp"  // #3533: count what we hold on each heap
+#include "gpu/diagnostics/memory_placement_log.hpp"  // #3888: GPU-only memory prefers VRAM
 
 namespace prosper::test {
 
@@ -217,18 +218,17 @@ inline std::shared_ptr<GpuDetileUpload> prepare_gpu_detile_upload(
     upload->output_bytes = count * program.output_texel_bytes();
     VkPhysicalDeviceMemoryProperties memory{};
     vkGetPhysicalDeviceMemoryProperties(phys, &memory);
-    auto buffer = [&](VkDeviceSize bytes, VkBufferUsageFlags usage,
-                      VkMemoryPropertyFlags flags, VkBuffer& buf, VkDeviceMemory& mem) {
+    // GPU-only: written by the detile dispatch, read by the texture copy (#3888: prefer VRAM).
+    auto gpu_only_buffer = [&](VkDeviceSize bytes, VkBufferUsageFlags usage, VkBuffer& buf,
+                               VkDeviceMemory& mem) {
         VkBufferCreateInfo ci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         ci.size = bytes; ci.usage = usage;
         if (vkCreateBuffer(program.device, &ci, nullptr, &buf) != VK_SUCCESS) return false;
         VkMemoryRequirements requirements{};
         vkGetBufferMemoryRequirements(program.device, buf, &requirements);
-        uint32_t type = 0;
-        while (type < memory.memoryTypeCount &&
-               (!(requirements.memoryTypeBits & (1u << type)) ||
-                (memory.memoryTypes[type].propertyFlags & flags) != flags)) ++type;
-        if (type == memory.memoryTypeCount) return false;
+        const uint32_t type = prosper::gpu::choose_gpu_only_memory_type(
+            prosper::gpu::GpuOnlyMemoryClass::DetileOutput, memory, requirements.memoryTypeBits);
+        if (type == UINT32_MAX) return false;
         VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         ai.allocationSize = requirements.size; ai.memoryTypeIndex = type;
         return prosper::gpu::allocate_device_memory(program.device, &ai, &mem) == VK_SUCCESS &&
@@ -247,9 +247,10 @@ inline std::shared_ptr<GpuDetileUpload> prepare_gpu_detile_upload(
     upload->input_memory = input.memory;
     upload->input_mapped = input.mapped;
     upload->input_lease = input.lease;
-    if (!input.mapped || !buffer(upload->output_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-                                      VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, upload->output, upload->output_memory))
+    if (!input.mapped || !gpu_only_buffer(upload->output_bytes,
+                                          VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                                              VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                                          upload->output, upload->output_memory))
         return {};
     if (writable) {
         upload->readback = acquire_mapped_staging(program.device, upload->output_bytes,
