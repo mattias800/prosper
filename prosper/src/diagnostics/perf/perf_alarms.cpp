@@ -101,9 +101,20 @@ std::vector<AlarmFiring> AlarmEngine::on_flip(uint64_t now_ns, Ledger& ledger,
 }
 
 std::vector<AlarmFiring> AlarmEngine::close_window(const WindowSample& w, double t_seconds) {
-    std::vector<AlarmFiring> fired = evaluate_rules(w, config_.thresholds);
+    std::vector<AlarmFiring> candidates = evaluate_rules(w, config_.thresholds);
     std::lock_guard<std::mutex> lock(mutex_);
     ++windows_;
+    std::vector<AlarmFiring> fired;
+    for (auto& [name, state] : rules_) {
+        bool held = false;
+        for (AlarmFiring& a : candidates)
+            if (std::strcmp(a.rule, name) == 0) {
+                held = true;
+                if (++state.streak >= sustain_windows(name)) fired.push_back(std::move(a));
+                break;
+            }
+        if (!held) state.streak = 0;
+    }
     for (const AlarmFiring& a : fired) {
         RuleState& s = state_for(a.rule);
         const uint64_t ordinal = ++s.fired;

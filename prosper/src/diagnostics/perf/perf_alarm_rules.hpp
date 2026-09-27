@@ -64,6 +64,16 @@ constexpr double kPresentMinPerSecond = 5.0;
 // and #3889 dropped every draw sampling its colour-grading LUT, silently, for three days.
 constexpr uint64_t kDroppedDrawsPerWindow = 1;
 
+// SUSTAIN: consecutive windows a rule's condition must hold before the engine reports it. A cost
+// that lasts one window is usually a load, and a steady-state alarm should not fire on it; a
+// correctness alarm fires on the first window.
+constexpr uint32_t kSustainWindows = 2;
+// texture-reference-cost needs three: GTA V on main spends the first 10-15 s of gameplay resolving
+// cold references at 6-7 us each (two consecutive windows at most) before settling at ~1 us, while
+// before #3877 it stayed at 5-8 us for the whole run.
+constexpr uint32_t kTextureReferenceSustainWindows = 3;
+constexpr uint32_t kCorrectnessSustainWindows = 1;
+
 // ---- evaluation ------------------------------------------------------------------------------
 
 // One window of ledger DELTAS (maxima are per window), plus the frame budget in force.
@@ -118,6 +128,9 @@ struct AlarmFiring {
 
 // Every rule name, in evaluation order. Stable kebab-case: these are grepped.
 const std::vector<const char*>& rule_names();
+
+// Consecutive windows `rule` must hold before it is reported (see kSustainWindows).
+uint32_t sustain_windows(const char* rule);
 
 std::vector<AlarmFiring> evaluate_rules(const WindowSample& w, const RuleThresholds& t);
 

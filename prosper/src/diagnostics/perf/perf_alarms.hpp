@@ -14,6 +14,9 @@
 //     skips the exit report -- still leaves its record. `"type":"alarm"` for every firing (no rate
 //     limit) and `"type":"window"` for every window with the raw quantities the rules read, so a
 //     quiet run still shows how close it came to each threshold.
+//   * a rule is reported only once its condition has held for sustain_windows() consecutive
+//     windows (two for performance rules, three for texture-reference-cost, one for correctness),
+//     so a one-window load spike does not read as a steady-state cost.
 //   * at exit (register_exit_report): one summary line per rule that fired (windows fired, worst
 //     value, when), or a line saying no rule fired in N evaluated windows. The second form exists so
 //     "nothing fired" cannot be confused with "the engine never ran": the latter prints nothing.
@@ -52,7 +55,8 @@ public:
     std::vector<AlarmFiring> on_flip(uint64_t now_ns, Ledger& ledger, uint32_t target_hz);
 
     // Evaluate and report one already-built window. `t_seconds` is its end, relative to the
-    // engine's first flip. Separate from on_flip so a test can drive it by hand.
+    // engine's first flip. Separate from on_flip so a test can drive it by hand. Returns what was
+    // REPORTED: a rule whose condition has not yet held for sustain_windows() is not.
     std::vector<AlarmFiring> close_window(const WindowSample& w, double t_seconds);
 
     // Prints the exit summary to `out`. Returns false (printing nothing) when no window was ever
@@ -64,6 +68,7 @@ public:
 
 private:
     struct RuleState {
+        uint32_t streak = 0;   // consecutive windows the condition has held, reported or not
         uint64_t fired = 0;
         double worst_value = 0;
         double worst_t = 0;

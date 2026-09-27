@@ -44,6 +44,13 @@ const std::vector<const char*>& rule_names() {
     return names;
 }
 
+uint32_t sustain_windows(const char* rule) {
+    const std::string r = rule ? rule : "";
+    if (r == "dropped-draws") return kCorrectnessSustainWindows;
+    if (r == "texture-reference-cost") return kTextureReferenceSustainWindows;
+    return kSustainWindows;
+}
+
 std::vector<AlarmFiring> evaluate_rules(const WindowSample& w, const RuleThresholds& t) {
     std::vector<AlarmFiring> out;
     if (w.seconds <= 0) return out;

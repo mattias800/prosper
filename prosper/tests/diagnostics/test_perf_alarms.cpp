@@ -285,6 +285,37 @@ void test_cost_scope_nesting() {
     check("a later sibling scope is a second event", l.cost_events[i].load() == events0 + 2);
 }
 
+void test_texture_reference_sample() {
+    std::puts("ledger TextureReferenceSample");
+    Ledger& l = ledger();
+    const size_t ts = static_cast<size_t>(Cost::TextureRefSample);
+    const size_t rb = static_cast<size_t>(Cost::SurfaceReadback);
+    const size_t refs = static_cast<size_t>(Counter::TextureReferences);
+    flush_thread_texture_references();
+    const uint64_t refs0 = l.counters[refs].load(), samples0 = l.cost_events[ts].load();
+    const uint64_t sample_ns0 = l.cost_ns[ts].load(), readback_ns0 = l.cost_ns[rb].load();
+    { TextureReferenceSample not_a_texture(false); not_a_texture.finish(); }
+    for (uint64_t i = 0; i < 2 * kTextureRefSamplePeriod; ++i) {
+        TextureReferenceSample ref(true);
+        {
+            // A depth readback nested inside the reference's resolution: 2 ms charged to readback.
+            CostScope readback(Cost::SurfaceReadback);
+            const uint64_t until = now_ns() + 2'000'000;
+            while (now_ns() < until) {}
+        }
+        ref.finish();
+    }
+    flush_thread_texture_references();
+    check("every texture reference is counted, non-textures are not",
+          l.counters[refs].load() - refs0 == 2 * kTextureRefSamplePeriod);
+    check("one reference in kTextureRefSamplePeriod is timed",
+          l.cost_events[ts].load() - samples0 == 2);
+    const double readback_ms = (l.cost_ns[rb].load() - readback_ns0) / 1e6;
+    const double sampled_ms = (l.cost_ns[ts].load() - sample_ns0) / 1e6;
+    check("the nested readback is charged to surface-readback", readback_ms >= 2.0 * 2 * kTextureRefSamplePeriod);
+    check("...and subtracted from the sampled reference (one cause, one alarm)", sampled_ms < 1.0);
+}
+
 std::string slurp(const std::string& path) {
     std::ifstream f(path);
     std::stringstream ss;
@@ -369,6 +400,32 @@ void test_engine() {
           summary.find("summary rule=dropped-draws fired in 10 of 12 windows") != std::string::npos);
     std::fclose(log);
 
+    // Sustain: texture-reference-cost must hold three consecutive windows; a quiet window resets.
+    {
+        EngineConfig config;
+        config.log = nullptr;
+        AlarmEngine engine(std::move(config));
+        WindowSample slow = healthy();
+        slow.flips = 35;
+        set_texrefs(slow, 150000, 7.0);
+        const bool first = engine.close_window(slow, 5).empty();
+        const bool second = engine.close_window(slow, 10).empty();
+        check("a slow-reference window is not reported until it has held for 3 windows",
+              first && second && fired(engine.close_window(slow, 15), "texture-reference-cost"));
+        engine.close_window(healthy(), 20);
+        check("a quiet window resets the streak",
+              engine.close_window(slow, 25).empty() && engine.close_window(slow, 30).empty() &&
+                  engine.times_fired("texture-reference-cost") == 1);
+        WindowSample readback = healthy();
+        set_cost(readback, Cost::SurfaceReadback, 3000.0, 100, 40.0);
+        check("a performance rule needs two windows",
+              engine.close_window(readback, 35).empty() &&
+                  fired(engine.close_window(readback, 40), "surface-readback"));
+        check("sustain_windows: correctness 1, texture-reference-cost 3, others 2",
+              sustain_windows("dropped-draws") == 1 && sustain_windows("texture-reference-cost") == 3 &&
+                  sustain_windows("hle-blocking-wait") == 2);
+    }
+
     // Summary forms: never evaluated prints nothing; evaluated and quiet says so.
     FILE* s = std::fopen(logp.c_str(), "w+");
     {
@@ -399,6 +456,7 @@ int main() {
     test_threshold_scaling();
     test_budget_follows_flip_rate();
     test_cost_scope_nesting();
+    test_texture_reference_sample();
     test_engine();
     check("rule_names lists the six phase-2 rules", rule_names().size() == 6);
     std::printf("%s: %d failure(s)\n", g_failures ? "FAILED" : "ok", g_failures);
