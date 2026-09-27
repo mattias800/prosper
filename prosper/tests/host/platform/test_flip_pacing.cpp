@@ -146,13 +146,21 @@ int main() {
         set_pace_env("2");
         const uint64_t period = prosper_vo_flip_pace_period_ns();
         CHECK(period == 500000000ull, "the lock arm paces at 2 fps (500 ms per flip)");
-        prosper_vo_flip_from_gpu((uint32_t)handle, -1, 1, 100);   // anchor the pacer
+        prosper_vo_flip_from_gpu((uint32_t)handle, -1, 1, 100);   // settle the pacer at 2 fps
         std::atomic<bool> flipped{false};
+        const uint64_t count_before = prosper_vo_flip_count();
         std::thread flipper([&] {
             prosper_vo_flip_from_gpu((uint32_t)handle, -1, 1, 101);   // sleeps ~500 ms
             flipped.store(true);
         });
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));   // let it reach the sleep
+        // Wait until the flipper has ADVANCED the flip (it is now past flip_advance and into the
+        // sleep) rather than guessing with a fixed head start: if the thread started late, a fixed
+        // delay would let the old code pass this arm too, having measured nothing.
+        const uint64_t wait_start = steady_ns();
+        while (prosper_vo_flip_count() == count_before && steady_ns() - wait_start < 2000000000ull)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        CHECK(prosper_vo_flip_count() == count_before + 1,
+              "the paced flip reached its sleep (flip advanced) before SetFlipRate is timed");
         const uint64_t t0 = steady_ns();
         const uint64_t rc = setrate(handle, 0, 0, 0, 0, 0);
         const uint64_t blocked = steady_ns() - t0;

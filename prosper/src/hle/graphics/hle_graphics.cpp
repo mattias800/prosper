@@ -311,9 +311,13 @@ uint64_t vblank_period_ns();   // defined with the vblank grid below -- one orig
 
 std::atomic<uint64_t> g_flip_pace_next_ns{0};
 
-// Serializes the two flip paths' PACING (SubmitFlip on a guest thread, the GPU flip on the submit
-// thread) with each other, exactly as holding g_vo_handle_mx across the sleep used to -- but without
-// blocking every OTHER VideoOut call behind a sleeping flipper. Held across flip_pace_wait() only.
+// Serializes whole FLIPS -- advance, pacing sleep, present, event -- across the flip paths
+// (SubmitFlip on a guest thread, the GPU flip on whichever thread folds the packet), which is what
+// holding g_vo_handle_mx through the entire flip used to provide: presents land in flip_advance
+// order and a second flipper is paced behind the first. Unlike the handle lock it is taken by flips
+// ONLY, so a sleeping flipper no longer blocks every other VideoOut call.
+// Lock order: g_flip_pace_mx -> g_vo_handle_mx -> g_flip_mx. Take it BEFORE the handle guard; taking
+// it after would invert the order against the second guard each flip takes after its sleep.
 std::mutex g_flip_pace_mx;
 
 // "Nobody named a rate -- derive it from the guest's own request." Distinct from 0, which is a
@@ -918,6 +922,7 @@ HLE(g_vo_set_flip_rate) {
     return 0;
 }
 HLE(g_vo_submitflip)  {
+    std::lock_guard<std::mutex> flip_serial(g_flip_pace_mx);   // first: see g_flip_pace_mx
     VideoOutHandleGuard handle(a0);
     if (!handle.valid()) return kVoErrorInvalidHandle;
     if (evlog()) fprintf(stderr, "[ev] SubmitFlip t=%.6f handle=0x%llx bufidx=%lld flipmode=0x%llx fl013arg=0x%llx\n",
@@ -930,12 +935,14 @@ HLE(g_vo_submitflip)  {
     // g_vo_handle_mx across a ~16 ms sleep serialized every other VideoOut call in the process behind
     // the flipper. Measured on The Messenger (2026-09-27): its main thread spent 85% of wall time
     // blocked in sceVideoOutSetFlipRate (avg 14.2 ms per call) waiting for exactly this (#3873).
+    // Flips stay serialized with each other through g_flip_pace_mx, held for the whole function.
     // The handle is re-validated after the sleep, so a Close that lands during it still retires the
-    // handle before anything is presented through it.
+    // handle before anything is presented through it. The flip status has already advanced by then,
+    // so the call reports success and simply presents nothing, matching its side effects.
     handle.release();
-    { std::lock_guard<std::mutex> pace(g_flip_pace_mx); flip_pace_wait(); }
+    flip_pace_wait();
     VideoOutHandleGuard presenting(a0);
-    if (!presenting.valid()) return kVoErrorInvalidHandle;
+    if (!presenting.valid()) return 0;
     gpu::present_flip(buffer_index, (int64_t)a3, source_flip_seq);
     prosper_eq_trigger_flip((int64_t)a3);   // flip completed (synchronous): fire the flip event
     return 0;
@@ -960,6 +967,7 @@ extern "C" void prosper_vo_set_flip_publish_hook(void (*fn)(uint64_t)) {
     g_flip_publish_hook.store(fn, std::memory_order_release);
 }
 extern "C" void prosper_vo_flip_from_gpu(uint32_t handle, int32_t bufidx, uint32_t flip_mode, int64_t flip_arg) {
+    std::lock_guard<std::mutex> flip_serial(g_flip_pace_mx);   // first: see g_flip_pace_mx
     VideoOutHandleGuard live_handle(handle);
     if (!live_handle.valid()) return;
     // t= leads the payload so the pacing report's existing anchor matches. The parser is
@@ -970,7 +978,7 @@ extern "C" void prosper_vo_flip_from_gpu(uint32_t handle, int32_t bufidx, uint32
     const uint64_t source_flip_seq = flip_advance(bufidx, flip_arg);
     // Pace outside the handle guard and re-validate after, for the reason given in g_vo_submitflip.
     live_handle.release();
-    { std::lock_guard<std::mutex> pace(g_flip_pace_mx); flip_pace_wait(); }
+    flip_pace_wait();
     VideoOutHandleGuard presenting(handle);
     if (!presenting.valid()) return;
     gpu::present_flip(bufidx, flip_arg, source_flip_seq);
