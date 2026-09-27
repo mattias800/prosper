@@ -133,39 +133,60 @@ void test_surface_readback() {
     check("3 readbacks in 5 s (under the 2/s floor) is quiet even at a large share",
           evaluate_rules(load, kDefault).empty());
 
+    // Many sub-millisecond readbacks at a low frame rate: GTA V on main, ~75 ms per 5 s over 40 flips
+    // is 11% of a 60 Hz budget. Real, second-order, below the quarter-budget alarm.
+    WindowSample second_order = bad;
+    second_order.target_hz = 60;
+    set_cost(second_order, Cost::SurfaceReadback, 75.0, 440, 1.0);
+    check("GTA-like 11%-of-budget readbacks are quiet", evaluate_rules(second_order, kDefault).empty());
+
     // Frequent but cheap: 100 readbacks at 0.1 ms each is 0.25 ms per flip, <1% of a 33 ms budget.
     WindowSample cheap = bad;
     set_cost(cheap, Cost::SurfaceReadback, 10.0, 100, 0.2);
     check("frequent cheap readbacks (<1% of budget) are quiet", evaluate_rules(cheap, kDefault).empty());
 }
 
-// #3877: GTA V, frontend build ~7 us per sampled texture reference, a large share of each frame.
+// Texture references: `refs` in the window, one in kTextureRefSamplePeriod timed at `mean_us`.
+void set_texrefs(WindowSample& w, uint64_t refs, double mean_us, uint64_t samples = 0) {
+    if (!samples) samples = refs / kTextureRefSamplePeriod;
+    set_count(w, Counter::TextureReferences, refs);
+    set_cost(w, Cost::TextureRefSample, static_cast<double>(samples) * mean_us / 1000.0, samples,
+             mean_us / 1000.0 * 3);
+}
+
+// #3877: GTA V walked the whole RTT cache per texture reference, ~7-8 us each over ~150k references
+// per 5 s at ~8 fps.
 void test_texture_reference_cost() {
     std::puts("texture-reference-cost");
     WindowSample bad = healthy();
-    bad.flips = 35;  // ~7 fps
-    set_count(bad, Counter::TextureReferences, 150000);
-    set_cost(bad, Cost::FrontendBuild, 150000 * 0.007, 2000, 5.0);  // 7 us/ref -> 1050 ms
+    bad.flips = 35;
+    set_texrefs(bad, 150000, 7.0);  // est 1050 ms = 90% of a 33 ms budget per flip
     const auto a = evaluate_rules(bad, kDefault);
     check("pre-#3877 window (7 us/ref, 90% of budget) fires texture-reference-cost alone",
           only(a, "texture-reference-cost"));
+    check("its cost is mean x references, not the sampled time alone",
+          !a.empty() && a[0].cost_ms > 1000 && a[0].cost_ms < 1100);
 
     WindowSample good = bad;
-    set_cost(good, Cost::FrontendBuild, 150000 * 0.0012, 2000, 1.0);  // 1.2 us/ref
+    set_texrefs(good, 150000, 1.2);
     check("post-#3877 window (1.2 us/ref) is quiet", evaluate_rules(good, kDefault).empty());
 
-    // A high ratio over a build that costs nothing: few references, tiny share.
+    // A slow mean over a population that costs nothing.
     WindowSample tiny = healthy();
-    set_count(tiny, Counter::TextureReferences, 6000);
-    set_cost(tiny, Cost::FrontendBuild, 6000 * 0.010, 300, 0.5);  // 10 us/ref, 60 ms total
-    check("a slow ratio over a cheap build (<25% of budget) is quiet",
+    set_texrefs(tiny, 6000, 10.0);  // est 60 ms over 150 flips: ~1% of budget
+    check("a slow mean over a cheap population (<25% of budget) is quiet",
           evaluate_rules(tiny, kDefault).empty());
 
-    // A heavy build that is fast per reference: the cost is volume, not resolution.
+    // A heavy population that is fast per reference: the cost is volume, not resolution.
     WindowSample heavy = bad;
-    set_count(heavy, Counter::TextureReferences, 900000);
-    set_cost(heavy, Cost::FrontendBuild, 1050.0, 2000, 5.0);  // 1.17 us/ref
-    check("a heavy build that is fast per reference is quiet", evaluate_rules(heavy, kDefault).empty());
+    set_texrefs(heavy, 900000, 1.17);
+    check("a heavy population that is fast per reference is quiet",
+          evaluate_rules(heavy, kDefault).empty());
+
+    // Too few samples for a mean: 50 in 5 s against a 20/s floor.
+    WindowSample sparse = bad;
+    set_texrefs(sparse, 150000, 7.0, 50);
+    check("a mean from 50 samples in 5 s (under 20/s) is quiet", evaluate_rules(sparse, kDefault).empty());
 }
 
 // #3879: The Messenger, main thread blocked 85% of wall time in sceVideoOutSetFlipRate, avg 14.2 ms.
@@ -241,13 +262,13 @@ void test_threshold_scaling() {
 
 void test_budget_follows_flip_rate() {
     std::puts("frame budget from SetFlipRate");
-    // 2.5 ms of readback per flip: 15% of a 60 Hz budget, 7.5% of 30 Hz, 5% of 20 Hz.
+    // 5 ms of readback per flip: 30% of a 60 Hz budget, 15% of 30 Hz, 10% of 20 Hz.
     WindowSample w = healthy();
-    set_cost(w, Cost::SurfaceReadback, 2.5 * 150, 150, 3.0);
+    set_cost(w, Cost::SurfaceReadback, 5.0 * 150, 150, 6.0);
     w.target_hz = 60;
-    check("2.5 ms/flip fires against a 60 Hz budget", fired(evaluate_rules(w, kDefault), "surface-readback"));
+    check("5 ms/flip fires against a 60 Hz budget", fired(evaluate_rules(w, kDefault), "surface-readback"));
     w.target_hz = 20;
-    check("the same 2.5 ms/flip is quiet against a 20 Hz budget", evaluate_rules(w, kDefault).empty());
+    check("the same 5 ms/flip is quiet against a 20 Hz budget", evaluate_rules(w, kDefault).empty());
 }
 
 void test_cost_scope_nesting() {

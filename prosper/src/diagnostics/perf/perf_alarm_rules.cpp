@@ -100,28 +100,31 @@ std::vector<AlarmFiring> evaluate_rules(const WindowSample& w, const RuleThresho
         }
     }
 
-    // texture-reference-cost (SHARE + per-reference RATIO).
+    // texture-reference-cost (per-reference MEAN from the 1-in-N sample, times the population, as a
+    // SHARE of the budget).
     {
         const uint64_t refs = w.count(Counter::TextureReferences);
-        const double build_ms = w.ms(Cost::FrontendBuild);
-        const double share = w.budget_share(Cost::FrontendBuild);
-        const double ns_per_ref = refs ? build_ms * 1e6 / static_cast<double>(refs) : 0.0;
-        if (refs && per_second(refs, w.seconds) >= t.texture_reference_min_per_s &&
-            share >= t.frontend_build_budget_share && ns_per_ref >= t.texture_reference_ns) {
+        const uint64_t samples = w.events(Cost::TextureRefSample);
+        const double mean_ns =
+            samples ? w.ms(Cost::TextureRefSample) * 1e6 / static_cast<double>(samples) : 0.0;
+        const double est_ms = mean_ns * static_cast<double>(refs) / 1e6;
+        const double share = w.flips ? est_ms / static_cast<double>(w.flips) / budget : 0.0;
+        if (samples && per_second(samples, w.seconds) >= t.texture_reference_min_per_s &&
+            share >= t.frontend_build_budget_share && mean_ns >= t.texture_reference_ns) {
             AlarmFiring a;
             a.rule = "texture-reference-cost";
-            a.value = ns_per_ref / 1000.0;
+            a.value = mean_ns / 1000.0;
             a.unit = "us/ref";
             a.threshold = t.texture_reference_ns / 1000.0;
-            a.cost_ms = build_ms;
-            a.detail = format("refs=%llu frontend-build=%.0fms (%.0f%% of budget per flip) "
-                              "flips=%llu budget=%.1fms(%uHz)",
-                              (unsigned long long)refs, build_ms, share * 100.0,
+            a.cost_ms = est_ms;
+            a.detail = format("refs=%llu sampled=%llu est=%.0fms (%.0f%% of budget per flip) "
+                              "frontend-build=%.0fms flips=%llu budget=%.1fms(%uHz)",
+                              (unsigned long long)refs, (unsigned long long)samples, est_ms,
+                              share * 100.0, w.ms(Cost::FrontendBuild),
                               (unsigned long long)w.flips, budget, w.target_hz);
-            a.hint = "frontend resource materialisation is slow per sampled texture reference "
-                     "(an upper bound: the build also covers buffers); next: "
-                     "PROSPER_TEXREF_CENSUS=1 (per-stage cost of the resolution chain), F8 "
-                     "frontend_texture_ms; cf. #3877";
+            a.hint = "resolving each sampled texture reference in the frontend is slow (readbacks "
+                     "excluded); next: PROSPER_TEXREF_CENSUS=1 (per-stage cost of the resolution "
+                     "chain), F8 frontend_texture_ms; cf. #3877";
             out.push_back(std::move(a));
         }
     }
@@ -175,19 +178,22 @@ std::vector<AlarmFiring> evaluate_rules(const WindowSample& w, const RuleThresho
     {
         const uint64_t backend = w.count(Counter::DroppedDrawsBackend);
         const uint64_t frontend = w.count(Counter::DroppedDrawsFrontend);
-        const uint64_t total = backend + frontend;
+        const uint64_t contract = w.count(Counter::DroppedDrawsContract);
+        const uint64_t total = backend + frontend + contract;
         if (total && total >= t.dropped_draws) {
             AlarmFiring a;
             a.rule = "dropped-draws";
             a.value = static_cast<double>(total);
             a.unit = "draws";
             a.threshold = static_cast<double>(t.dropped_draws);
-            a.detail = format("frontend-rejected=%llu backend-dropped=%llu",
-                              (unsigned long long)frontend, (unsigned long long)backend);
+            a.detail = format("frontend-unresolved=%llu frontend-contract=%llu backend-dropped=%llu",
+                              (unsigned long long)frontend, (unsigned long long)contract,
+                              (unsigned long long)backend);
             a.hint = "draws prosper wanted to issue were dropped: a run can look faster AND render "
                      "wrong; next: [draw-disposition] lines (PROSPER_DRAW_DISPOSITION_VERBOSE=1) "
-                     "for backend drops, [volume-sample-drop] and PROSPER_RENDER_TIMING "
-                     "build_rejected for frontend rejects; cf. #3889";
+                     "for backend drops; for frontend-unresolved, [volume-sample-drop] lines and "
+                     "PROSPER_RENDER_TIMING build_rejected; for frontend-contract, "
+                     "PROSPER_DESCRIPTOR_VALIDATE; cf. #3889";
             out.push_back(std::move(a));
         }
     }

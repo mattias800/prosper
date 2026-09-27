@@ -46,6 +46,10 @@ enum class Cost : uint8_t {
     PresentCpu,
     // Frontend resource materialisation (build_bds) per backend pass group.
     FrontendBuild,
+    // Resolution of ONE sampled texture reference in the frontend (1 in kTextureRefSamplePeriod),
+    // excluding any surface readback nested inside it -- that is charged to SurfaceReadback, so one
+    // cause does not raise two alarms.
+    TextureRefSample,
     Count
 };
 
@@ -57,7 +61,8 @@ enum class Counter : uint8_t {
     TextureCacheRefusedBytes,  // image bytes of those refusals: re-uploaded, then freed
     TextureCacheEvictions,     // resident images evicted to make room
     DroppedDrawsBackend,       // draws the backend wanted to issue and could not (draw_disposition)
-    DroppedDrawsFrontend,      // draws the frontend rejected: incomplete resources or contract
+    DroppedDrawsFrontend,      // draws the frontend rejected: a resource did not resolve
+    DroppedDrawsContract,      // draws the frontend rejected: descriptor contract validation failed
     DeviceAllocations,         // successful vkAllocateMemory calls
     Count
 };
@@ -132,6 +137,46 @@ inline void flush_thread_texture_references() {
     n = 0;
 }
 
+// Nanoseconds this thread has charged to each category through CostScope, so a span can subtract
+// the part of its time that a nested, separately-charged event already accounts for.
+inline uint64_t& thread_cost_ns(Cost c) {
+    static thread_local uint64_t ns[kCostCount] = {};
+    return ns[static_cast<size_t>(c)];
+}
+
+// One in this many texture references is timed. Per-reference clock reads on every reference are
+// exactly what PROSPER_RENDER_TIMING pays ~9% for; one in 32 costs a thirty-second of that and the
+// sampled mean is unbiased for a population of tens of thousands per window.
+constexpr uint64_t kTextureRefSamplePeriod = 32;
+
+// Counts one frontend texture reference and times it when it is the sampled one. finish() at the
+// end of resolution records it; a reference that leaves early (a dropped draw) is not recorded.
+class TextureReferenceSample {
+public:
+    explicit TextureReferenceSample(bool texture) {
+        if (!texture) return;
+        ++thread_texture_references();
+        static thread_local uint64_t phase = 0;
+        sampled_ = enabled() && ++phase % kTextureRefSamplePeriod == 0;
+        if (sampled_) {
+            nested_ns_ = thread_cost_ns(Cost::SurfaceReadback);
+            begin_ = now_ns();
+        }
+    }
+    void finish() {
+        if (!sampled_) return;
+        sampled_ = false;
+        const uint64_t elapsed = now_ns() - begin_;
+        const uint64_t nested = thread_cost_ns(Cost::SurfaceReadback) - nested_ns_;
+        add_cost(Cost::TextureRefSample, elapsed > nested ? elapsed - nested : 0);
+    }
+
+private:
+    bool sampled_ = false;
+    uint64_t begin_ = 0;
+    uint64_t nested_ns_ = 0;
+};
+
 // Times one coarse event into `c`. Nested scopes of the same category on one thread count only the
 // OUTERMOST, so a readback helper that calls another readback helper is one event, not two, and
 // its time is not charged twice.
@@ -145,7 +190,10 @@ public:
     ~CostScope() {
         if (!enabled()) return;
         --depth(cost_);
-        if (outer_) add_cost(cost_, now_ns() - begin_, 1, label_);
+        if (!outer_) return;
+        const uint64_t ns = now_ns() - begin_;
+        add_cost(cost_, ns, 1, label_);
+        thread_cost_ns(cost_) += ns;
     }
     CostScope(const CostScope&) = delete;
     CostScope& operator=(const CostScope&) = delete;

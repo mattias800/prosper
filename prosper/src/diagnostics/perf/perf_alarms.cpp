@@ -153,21 +153,24 @@ std::vector<AlarmFiring> AlarmEngine::close_window(const WindowSample& w, double
                      "\"hle_blocked_ms\":%.3f,\"hle_blocked_calls\":%llu,"
                      "\"present_cpu_ms\":%.3f,\"presents\":%llu,"
                      "\"frontend_build_ms\":%.3f,\"frontend_build_groups\":%llu,"
+                     "\"texref_sample_ms\":%.3f,\"texref_samples\":%llu,"
                      "\"texture_refs\":%llu,\"texture_misses\":%llu,\"texture_refusals\":%llu,"
                      "\"texture_evictions\":%llu,\"texture_cache_mib\":%.1f,"
                      "\"texture_limit_mib\":%.1f,\"dropped_frontend\":%llu,"
-                     "\"dropped_backend\":%llu,\"vk_allocs\":%llu}\n",
+                     "\"dropped_contract\":%llu,\"dropped_backend\":%llu,\"vk_allocs\":%llu}\n",
                      t_seconds, w.seconds, (unsigned long long)w.flips, w.target_hz, fired.size(),
                      ms(Cost::SurfaceReadback), ev(Cost::SurfaceReadback),
                      w.cost_max_ns[static_cast<size_t>(Cost::SurfaceReadback)] / 1e6,
                      ms(Cost::HleBlockingWait), ev(Cost::HleBlockingWait),
                      ms(Cost::PresentCpu), ev(Cost::PresentCpu),
                      ms(Cost::FrontendBuild), ev(Cost::FrontendBuild),
+                     ms(Cost::TextureRefSample), ev(Cost::TextureRefSample),
                      n(Counter::TextureReferences), n(Counter::TextureCacheMisses),
                      n(Counter::TextureCacheRefusals), n(Counter::TextureCacheEvictions),
                      w.gauge(Gauge::TextureCacheBytes) / (1024.0 * 1024.0),
                      w.gauge(Gauge::TextureCacheLimit) / (1024.0 * 1024.0),
-                     n(Counter::DroppedDrawsFrontend), n(Counter::DroppedDrawsBackend),
+                     n(Counter::DroppedDrawsFrontend), n(Counter::DroppedDrawsContract),
+                     n(Counter::DroppedDrawsBackend),
                      n(Counter::DeviceAllocations));
         std::fflush(jsonl_);
     }

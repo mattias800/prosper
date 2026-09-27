@@ -30,22 +30,22 @@ namespace prosper::diagnostics::perf {
 constexpr double kTextureRefusalsPerSecond = 50.0;
 
 // surface-readback: synchronous GPU->CPU surface copies (with their forced flush + wait) costing a
-// tenth of every frame's budget are worth a GPU path. Sonic Frontiers before #3882: ~65 per 5 s at
-// ~10 ms each.
-constexpr double kReadbackBudgetShare = 0.10;
+// quarter of every frame's budget are worth a GPU path. Sonic Frontiers before #3882 measured
+// 60-78% in gameplay; GTA V and Outer Wilds on main sit at 7-15% of a 60 Hz budget from many
+// sub-millisecond readbacks, a real but second-order cost that should not read as an alarm.
+constexpr double kReadbackBudgetShare = 0.25;
 // ...and not a handful of one-off readbacks during a load, which cost once and are not a pattern.
 constexpr double kReadbackMinPerSecond = 2.0;
 
-// texture-reference-cost: frontend resource materialisation per sampled texture reference. The
-// ratio is an upper bound on per-reference resolution cost (the denominator counts texture
-// references only; the numerator is the whole build). GTA V before #3877 walked the RTT cache per
-// reference; set between the measured pre- and post-fix values (see the PR for #3891).
-constexpr double kTextureReferenceNs = 3000.0;
-// ...and only when that build is a material share of the frame: a cheap build with few references
-// can have a high ratio and cost nothing.
+// texture-reference-cost: mean frontend resolution time of one sampled texture reference (1 in
+// kTextureRefSamplePeriod, readbacks nested inside excluded). GTA V before #3877 walked the whole
+// RTT cache per reference; set between the measured pre- and post-fix means (see the PR for #3891).
+constexpr double kTextureReferenceNs = 4000.0;
+// ...and only when mean x references is a material share of the frame: a slow mean over a handful
+// of references costs nothing.
 constexpr double kFrontendBuildBudgetShare = 0.25;
-// ...over enough references for the average to mean something.
-constexpr double kTextureReferenceMinPerSecond = 1000.0;
+// ...over enough samples for the mean to mean something (20/s is 100 per 5 s window).
+constexpr double kTextureReferenceMinPerSecond = 20.0;
 
 // hle-blocking-wait: a fifth of one thread's wall time spent blocked on a lock another thread holds.
 // The Messenger before #3879: its main thread blocked 85% of the time in sceVideoOutSetFlipRate

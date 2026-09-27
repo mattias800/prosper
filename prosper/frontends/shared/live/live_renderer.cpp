@@ -3575,8 +3575,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     if (!reflected_binding) continue;
                     const auto resource_timing_start = timing_enabled
                         ? RenderClock::now() : RenderClock::time_point{};
-                    if (r.cls == RC::Texture)   // #3891 ledger: a plain thread-local tally
-                        ++prosper::diagnostics::perf::thread_texture_references();
+                    // #3891 ledger: count every texture reference, time one in 32.
+                    prosper::diagnostics::perf::TextureReferenceSample perf_texref_sample(
+                        r.cls == RC::Texture);
                     // PROSPER_TEXREF_CENSUS: null unless the census is armed for this reference.
                     prosper::frontend::TextureReferenceCensus* const texref_census =
                         prosper::frontend::TextureReferenceCensus::enabled() &&
@@ -9117,6 +9118,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         mix(image.borrowed_compute_vertical_stack_layers);
                         texref_census->finish(g_this_submit, texref_census_key, o, klass);
                     }
+                    perf_texref_sample.finish();
                     if (timing_enabled) {
                         const double elapsed = std::chrono::duration<double, std::milli>(
                             RenderClock::now() - resource_timing_start).count();
@@ -9620,8 +9622,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     // partition exists to make visible.
                     if (!built_resources.complete || !contract_ok) {
                         // #3891: a dropped draw is a correctness alarm, not only a timing bucket.
-                        prosper::diagnostics::perf::add(
-                            prosper::diagnostics::perf::Counter::DroppedDrawsFrontend);
+                        prosper::diagnostics::perf::add(built_resources.complete
+                            ? prosper::diagnostics::perf::Counter::DroppedDrawsContract
+                            : prosper::diagnostics::perf::Counter::DroppedDrawsFrontend);
                         if (timing_enabled) ++pending_timing.build_rejected;
                         continue;
                     }
