@@ -1,6 +1,7 @@
 // tile.cpp — see tile.hpp. GFX10 SW_4KB_S de-swizzle, generalized over the element size (#119).
 // GFX10 SW_64KB_S / SW_64KB_R_X de-swizzle from the AMD addrlib swizzle-pattern tables (#288).
 #include "diagnostics/worker_spawn_census.hpp"
+#include "diagnostics/transfer_pressure.hpp"
 #include "gpu/texture/tile.hpp"
 #include <array>
 #include <cstring>
@@ -1450,6 +1451,8 @@ void tile_census_note(const char* op, uint32_t w, uint32_t h, uint32_t bpe, uint
 void detile_surface(uint8_t* dst, const uint8_t* src, uint32_t width, uint32_t height,
                     uint32_t tile_mode, uint32_t pitch, uint32_t bytes_per_texel) {
     tile_census_note("detile_surface", width, height, bytes_per_texel, tile_mode);
+    prosper::diagnostics::note_transfer(prosper::diagnostics::Transfer::Detile,
+                                        uint64_t(width) * height * bytes_per_texel);
     if (!tile_mode_is_tiled(tile_mode)) { warn_unhandled_tile_mode(tile_mode, width, height);
                                           std::memcpy(dst, src, (size_t)width * height * bytes_per_texel); return; }
     if (tile_mode == (uint32_t)TileMode::Sw256BS) {

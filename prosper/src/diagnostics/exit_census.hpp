@@ -35,8 +35,17 @@ namespace prosper::diagnostics {
 // `report` returns true if it printed. Returning false is the normal path for a run in which the
 // census counted nothing, and costs nothing.
 //
-// Safe to call during static initialisation and from any thread. The report must not read objects
-// with non-trivial destructors -- see exit_reports.hpp for why.
+// Safe to call from any thread. **Do NOT call it during static initialisation**, even though
+// nothing here will stop you: `register_exit_report` installs its `std::atexit` fallback on the
+// first registration in the process, and `atexit` is LIFO against `__cxa_atexit`, so the earliest
+// registration makes the flush the LATEST thing to run -- after the function-local statics that
+// other censuses read in THEIR reports. That is somebody else's crash, not yours. Register on
+// first use instead. (An earlier version of this comment said static initialisation was safe;
+// eleven tests disagreed -- instrument trap 289.)
+//
+// The other half, and the one that actually holds: any object a report reads must be
+// never-destroyed, because no registration site controls destruction order. Use the no-destroy
+// idiom `exit_reports.cpp` uses for its own registry. See exit_reports.hpp.
 void register_census(const char* disable_env, std::function<bool()> report);
 
 }  // namespace prosper::diagnostics

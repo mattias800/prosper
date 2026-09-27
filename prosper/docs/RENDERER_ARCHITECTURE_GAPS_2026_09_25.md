@@ -373,3 +373,302 @@ volume census was kept, because the volume is the input to any future batching q
   2.5 us/ref; the most a memo could still save is ~0.5 us x ~120k refs per 5 s, about 1% of wall,
   for an invalidation surface of the #611/#780 class. Do not build a resolution memo without first
   showing a chain stage that is both slow and repeat-invariant -- the census reports exactly that.
+
+## The frontier, found 2026-09-26: compute-item execution, not the renderer
+
+Everything above measures the render path. It was the wrong place to look, and the census that
+settled it is in this PR's own instrumentation.
+
+**Measured on the shipped windowed frontend, GPU present confirmed adopted:**
+
+| | compute-items | renderer (pass-cost) | rate |
+|---|---|---:|---|
+| Astro Bot | **74.9% of wall**, 66,028 calls, **1.917 ms/call** | 8.8% | ~5 fps |
+| The Messenger | 0.1% of wall, 20,055 calls, **0.005 ms/call** | 4.3% | ~59 fps |
+
+Comparable call counts, **383x the per-call cost**. The renderer is a single-digit share on both, and
+the *faster* title spends a smaller absolute share there. Two earlier instruments disagreed about
+the render path's share -- 58% from the per-submit report against 8.5% from pass-cost -- and the gap
+was this: compute items reach the backend through the **ACB submit path**, which the per-submit
+render report does not count. The largest consumer of the frame had no instrument at all.
+
+### What the 1.9 ms is
+
+A 39 s run that never leaves the static "Sony Interactive Entertainment" splash:
+
+```
+[compute-items] calls=15115 in-compute=29526ms (75.9% of span) mean=1.953ms/call
+[worker-spawn]  compute-texels ~9,712 calls at 20-35 MiB each; detile-rows 2,419 calls
+205 presented frames -> 5.3 fps
+```
+
+**About 240 GiB of CPU texel conversion in 39 seconds -- roughly 6 GiB/s -- on a screen that is not
+changing.** CPU detiling is only 0.7% of bytes moved; the conversion dominates. The path is
+`execute_item -> storage_unpack_range -> parallel_compute_texels`, which materialises storage-image
+texels into RGBA32 quads on the CPU before a dispatch.
+
+**The magnitude was already documented in the code** and nobody had connected it to a frame rate.
+`live_compute.cpp`'s comment above `storage_unpack_range` records **~56 ms per image-bearing
+dispatch against 0.39 ms of actual GPU dispatch** -- a ~143x ratio -- measured on a different title.
+
+### Why the GPU path is not taken, from the gate's own census
+
+`PROSPER_COMPUTE_STORAGE_GATE_CENSUS=1`, same splash, shows a mip/bloom pyramid evaluated hundreds
+of times per geometry:
+
+```
+  1x1   bpe=16  evaluated=219   persistent=0     CANDIDATE=0
+  7x4   bpe=4   evaluated=186   persistent=0     CANDIDATE=0
+ 15x8   bpe=4   evaluated=186   persistent=0     CANDIDATE=0
+ 30x16  bpe=4   evaluated=371   persistent=0     CANDIDATE=0
+240x135 bpe=8   evaluated=1027  persistent=1027  CANDIDATE=660
+```
+
+Every geometry with `persistent=0` is `CANDIDATE=0`: it can never take the GPU path and always
+materialises on the CPU. `dcc_safe`, `exact` and `write_only` are satisfied almost everywhere, so
+**persistence is the binding constraint**, not correctness of the shape.
+
+### Why this is the compounding target
+
+It is shared code with no title in it, and the cost is per-call rather than per-pixel -- which is
+exactly the shape the project owner reported from the keyboard: single-digit fps from the very
+first frame, identical on a static splash and on an FMV. Scene complexity does not behave that way;
+a per-call constant does.
+
+**The question to answer next is why these images are not persistent**, since that is the one gate
+term that fails. A secondary, independently useful item: `GpuRetilePipeline::bind` creates AND
+destroys a `VkDescriptorPool` per call (31,262 times on this route, ~43 per frame, each a kernel
+round trip), and the GPU retile census shows 1,606 of 4,818 images declining with
+`mip-tail-or-offset` and falling back to CPU detiling.
+
+**Do not read this as "fix Astro Bot".** The Messenger runs the same code at 0.005 ms/call. What
+differs is how much of its work lands on a path that materialises CPU-side, and that path is
+general.
+
+### Inside the 74.9%: two size thresholds tested, both NOT the cost
+
+The gate census named `persistent` as the one failing term, so the obvious reading is that a
+residency size threshold excludes the common case. Two such thresholds exist and **both were
+tested and neither is the cost.** Recorded because each looks compelling and each is wrong.
+
+**Storage images, 4 KiB threshold (`live_compute.hpp:56`) -- FALSIFIED on an interleaved A/B.**
+`persistent_compute_image_enabled` returns `bytes >= 4 KiB`, and the pyramid levels below that
+(1x1, 7x4, 15x8, 30x16) report `persistent=0 CANDIDATE=0`, so they can never take the GPU path.
+`PROSPER_COMPUTE_STORAGE_IMAGE_CACHE_MIN_KB=0` is a same-binary control. Three interleaved rounds:
+
+| arm | frames | compute-items share |
+|---|---|---|
+| default (4 KiB) | 321 / 313 / 305 | 76.1% / 75.7% / 76.3% |
+| MIN_KB=0 | 311 / 301 / 306 | 75.8% / 76.0% / 76.0% |
+
+**The lever demonstrably moved** -- `7x4` and `15x8` went `persistent=0 CANDIDATE=0` to
+`persistent=186 CANDIDATE=186`, verified by re-running the gate census under both arms -- and
+nothing changed. So candidacy is not what forces the CPU work, and those images are genuinely
+cheap. This is a negative result with a verified lever, not a void one.
+
+**Compute buffers, 1 MiB threshold (`live_compute.cpp:1139`) -- real, but an order of magnitude too
+small.** `persistent_compute_buffer_enabled` returns `bytes >= 1 MiB`, above a comment reading
+*"Small bindings are cheap and numerous."* Measured over ~45 s with
+`PROSPER_COMPUTE_BUFFER_TIMING=1`:
+
+```
+31,280 binding records, 89.6% below 1 MiB, median binding 192 B
+compared 2.12 GiB total, 1.10 GiB (51.7%) from sub-1MiB
+uploaded 0.73 GiB total, 0.42 GiB (57.6%) from sub-1MiB
+```
+
+Sub-threshold bindings really are the majority of compare traffic, and every one reports
+`cache=ineligible persistent=0 total-watch-chunks=0 upload-skipped=0` -- no write-watch, so a full
+compare and a full upload on every dispatch even when nothing changed. But **1.10 GiB over 45 s is
+24 MiB/s**, and the thing to explain is ~3 GiB/s. Worth fixing on its own terms; not the frontier.
+
+### So the cost is the unpacking itself
+
+What remains, and what the profile pointed at from the start, is
+`execute_item -> storage_unpack_range -> parallel_compute_texels`: **storage-image texels
+materialised into RGBA32 quads on the CPU before a dispatch.** The worker-spawn census puts that at
+roughly 240 GiB of `count x (src_stride + 16)` work in 39 s -- about 120 GiB of real texel data,
+~3 GiB/s, on a screen that is not changing.
+
+That is not a threshold to retune. It is the compute path binding storage images by materialising
+them host-side rather than as GPU storage images, and `live_compute.cpp`'s own comment prices it at
+**~56 ms per image-bearing dispatch against 0.39 ms of actual GPU dispatch**.
+
+**Next question, and it is the architectural one:** under what conditions does a compute dispatch
+take the native storage-image path rather than materialising, and what fraction of dispatches on a
+real title can take it? The gate census answers the first half already; nobody has asked the
+second.
+
+### The whole chain, measured end to end (2026-09-26)
+
+Every step below is a measurement on the shipped windowed frontend with GPU present confirmed
+adopted, not an inference from a profile leaf.
+
+```
+1. compute-item execution        74.9% of wall   (renderer: 8.8%)
+2. host-copy transfer pressure   2,058 MiB/s     (a title at 59 fps: 4 MiB/s)
+3. largest category              storage-materialize, 39.4 GiB in 49 s
+4. of those copies               8,993 copies from 84 DISTINCT SOURCES
+5. why the cache did not skip    not-persistent 6,430 (76%) / persistent-but-watch-dirty 1,984 (24%)
+```
+
+**~99% of the largest host-copy category is re-copying images that did not change.** 39.4 GiB of
+copying carries at most ~378 MiB of distinct data (84 sources averaging 4.5 MiB).
+
+**The machinery to avoid it already exists and is already respected.** `acquire_cached_image` holds
+a `GuestWriteWatch` and returns `upload_skipped`, and the copy site guards on
+`!(bi.persistent && bi.upload_skipped)`. So this is not a missing mechanism; it is a cache that is
+not admitting the working set. **76% of the copies are of images that are not persistent at all**,
+which is an admission question -- key, eligibility, or capacity -- and only 24% are images the
+cache holds but whose watch reports dirty or unknown.
+
+Those two terms have completely different fixes, which is why the split is the useful number and
+the aggregate was not.
+
+**What this is NOT.** It is not a residency *threshold* problem: the images here average 4.5 MiB,
+three orders of magnitude above the 4 KiB eligibility floor, and the A/B on that floor is recorded
+above as falsified with a verified lever. Do not start there.
+
+**The next question, and it is one measurement away:** for the 6,430 non-persistent copies, does
+admission fail on the cache key, on an eligibility predicate other than size, or on capacity and
+eviction? `acquire_cached_image`'s early `image_cache.end()` return distinguishes the first from
+the other two.
+
+**Why this generalises.** The same shape appears at three independent sites, which is what makes it
+architectural rather than a bug: `rtt-snapshot` (34.7 GiB, fixed for the exact-size case earlier
+today and still the second largest), `detile` (26.2 GiB), and compute buffer bindings, every one of
+which reports `cache=ineligible total-watch-chunks=0` -- no write-watch at all, so a full compare
+and a full upload on every dispatch. prosper copies guest data host-side without dirty tracking, in
+several places, and each site was found separately at full cost. That is the thing to fix once.
+
+### The bottom of the chain, 2026-09-26: a GPU→CPU→GPU round trip, and it is a LATCH
+
+The step above ended on a question about cache admission. That question was the wrong one, and the
+answer is better: **nothing here is a cache miss.** The copies are the CPU leg of a round trip
+between two compute dispatches that run on the same device.
+
+#### The mechanism, traced end to end
+
+At `live_compute.cpp:9079` the guest pointer `src` is set to `nullptr` whenever `renderer_owned`,
+and the copy at `:9249` reads `live_target.pixels` instead — the renderer's **CPU-side render-target
+snapshot**. That snapshot is published by `CpuRttSnapshotPool::copy` at `:12827` from
+`layout_source`, which is the **mapped staging buffer holding a compute dispatch's own result**,
+read off the GPU at `:12678`. So:
+
+```
+dispatch N    (GPU)  writes a storage image
+                     -> vkCmdCopyImageToBuffer into host-visible staging      GPU -> CPU
+                     -> map, pack/detile, tile into the guest mirror          (legitimate writeback)
+                     -> publish a CPU render-target snapshot                  [rtt-snapshot]
+dispatch N+1  (GPU)  binds the same address; renderer-owned, no GPU seed
+                     -> memcpy out of that CPU snapshot into staging          [storage-materialize]
+                     -> vkCmdCopyBufferToImage                                CPU -> GPU
+```
+
+The two largest host-copy categories are the two legs of that trip. The cache gate's
+`!renderer_owned` term is **correct** and should not be widened: the guest range is not the
+authority for these bytes, so neither the guest write-watch nor the submit journal can validate
+them.
+
+#### Why it never recovers
+
+Three gates, each measured at the site where it fires, on a 74 s Astro Bot run (shipped windowed
+frontend, GPU present confirmed adopted, idle box):
+
+```
+[gpu-seed-refused]         cpu-only-authority=28051.9MiB/7885c   view-ineligible=944.8MiB/1184c
+[rtt-destination]          candidates=11660 borrowed=3363 recorded=3363 published=3362 failed=0
+[rtt-destination-refused]  no-persistent-image=24291.1MiB/6103c  no-rtt-entry=4504.7MiB/750c
+                           extent-mismatch=481.2MiB/10c          format-mismatch=152.3MiB/6c
+```
+
+1. **`cpu-only-authority` — 87% of the renderer-owned copies, 97% of their bytes.** The GPU seed
+   import (`live_renderer.cpp:1948`) requires `live_rtt_gpu_importable`, which requires
+   `surface.gpu_valid`. These targets have a correctly-sized CPU snapshot and no valid GPU image.
+2. **`gpu_valid` is cleared by the publication itself.** `live_renderer.cpp:2100`: when a compute
+   result is published with `linear_pixels`, the notifier sets `published.gpu_valid = false`. Its
+   own comment says why — *"A linear snapshot means no device mirror received this result"*.
+3. **The only path back is refused.** The mirror-back that sets `gpu_valid = true` (`:2120`)
+   requires `bi.mirror_result_to_imported`, which is set only alongside `bi.seed_from_imported`
+   (`live_compute.cpp:8060`) — i.e. only if the dispatch imported the image in the first place,
+   which step 1 just refused. The destination borrow at `:11140` is the escape hatch, and it is
+   refused for **8,297 of 11,660 candidates**, overwhelmingly with `no-persistent-image`.
+
+**So it is a latch.** One transition to CPU-only authority is permanent for that target: no
+dispatch can import it, so no dispatch can mirror back, so it never regains GPU authority, and
+every subsequent dispatch pays a full round trip. That is consistent with Astro Bot running at
+~5 fps from the very first splash screen rather than degrading into it.
+
+#### The root, and it is one predicate
+
+`no-persistent-image` is `find_persistent_color_target(addr, w, h, format, /*require_valid=*/false)`
+returning null, or an entry whose layout is `VK_IMAGE_LAYOUT_UNDEFINED`. The cache
+(`tests/fixtures/render_runner.h:3070`) is keyed on the exact 5-tuple
+`{id, width, height, format, volume_depth}` and bounded by
+`persistent_color_target_limit()` — **4096 MiB on this machine** (heap/4, clamped;
+`[render] persistent color-target residency budget = 4096 MiB (device-local heap 44197 MiB)`).
+
+#### Every decline on this path used to be a bare `return false`
+
+This is the reason the chain took a day rather than an hour, and it is the generalisable part. The
+importer had twelve declines and the destination borrower six, all spelled `return false`, so a
+consumer could report only *"the renderer would not hand it over"* — while its fallback for any of
+them is a full CPU round trip of the image, per dispatch. The `[rtt-destination]` counters existed
+but printed only under an active F8 perf capture, every sixteenth candidate, and the census's
+`failed` counter read **0** while 8,297 candidates were being dropped by a `continue` placed before
+it. A zero that means "not counted" is indistinguishable from a zero that means "did not happen".
+
+Both paths now carry a `LiveTargetImageImport::Refusal` on the out-param they already fill, and
+both report at exit by default.
+
+#### It is not capacity — and the obvious A/B could not have told us
+
+The natural experiment is `PROSPER_BACKEND_TARGET_CACHE_MB`. It was run, interleaved, two rounds,
+and it is **VOID rather than negative**: the only line prosper prints about this budget comes from
+`init_persistent_color_target_device_budget`, which never consults the variable, so it read
+`4096 MiB` in both arms. The arms' numbers were also indistinguishable — `no-persistent-image` of
+5,758 / 5,585 / 5,499 / 5,344 in run order A, B, A, B, monotone in *time* and unmoved by *arm* —
+but with no way to show the lever moved, that is not evidence.
+
+Residency answers it directly, with no lever at all:
+
+```
+[persistent-targets] PEAK residency 97 of 256 entries, 1604.1 of 4096.0 MiB (39.2% of budget)
+                     eviction-attempts=0 evicted=0 (0.0 MiB)
+```
+
+**Peaked far below both bounds and evicted nothing.** Read the peaks, not the eviction counter:
+the admission paths skip the eviction loop entirely while a submission batch is pending
+(`avoid_cache_eviction` / `eviction_deferred`), so a target *can* be refused for capacity with
+every eviction counter still reading zero (#3872 review). And the gate has **two** bounds — a byte
+budget and a 256-entry count — either of which refuses a target on its own, so clearing one proves
+nothing. At a high-water mark of 39.2% of the byte budget and 97 of 256 entries, neither could
+have bound.
+
+So `no-persistent-image` means the entry for `{addr, width, height, format, volume_depth}` was
+**never created** — no graphics pass ever made a persistent device image at that key, and the
+compute path does not make one either.
+
+#### The fix this implies
+
+> When a compute dispatch publishes a result for a render-target address with no persistent device
+> image, **create one and write the result into it**, instead of publishing CPU pixels and latching
+> the target to CPU-only authority.
+
+That converts the publication at `live_renderer.cpp:2090` from the `linear_pixels` branch
+(`gpu_valid = false`) to the mirrored branch (`gpu_valid = true`), which unlatches the target: the
+next dispatch's seed import succeeds, it keeps the mirror-back obligation, and both legs of the
+round trip disappear for every later dispatch on that address. The budget and eviction policy it
+would allocate into already exist and are 62% idle.
+
+**Why it compounds.** Nothing above is title-specific — no format, no extent, no program hash, no
+title id. It is one predicate on the publication path that every title's compute stage crosses.
+The same architecture is already recorded independently on two other titles by two other lanes:
+#3683 measures the producer leg on *Sonic Frontiers* (6.5 s of `retile_copy` plus 8.0 s of
+write-watch on one route) and #3450 measures the consumer leg on *Grand Theft Auto V* (88.5% of
+per-dispatch GPU time in prosper's own storage copy, crossing PCIe on a discrete GPU). Neither had
+the middle of the chain, which is why each read as a separate cost.
+
+**Independent corroboration of #3157 from a third title**: the compute-items census reports
+`calls=30276 items=30276` — exactly one item per call over 30,276 calls, so the batching that
+issue's correction says does not happen, measurably does not happen here either.

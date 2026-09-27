@@ -4,6 +4,8 @@
 #include "shared/compute/compute_authority_live_census.hpp"
 #include "shared/compute/compute_image_borrow_census.hpp"
 #include "shared/compute/compute_timing_selector.hpp"
+#include "diagnostics/exit_census.hpp"
+#include "diagnostics/transfer_pressure.hpp"
 #include "shared/compute/compute_phase_attribution.hpp"
 #include "shared/compute/compute_buffer_timing.hpp"
 #include "shared/compute/compute_transfer_gate_census.hpp"
@@ -482,6 +484,69 @@ struct RttMirrorCounter {
     uint64_t add() { return count.fetch_add(1, std::memory_order_relaxed) + 1; }
     uint64_t value() const { return count.load(std::memory_order_relaxed); }
 };
+// WHY a path that could have stayed on the GPU refused, counted WHERE THE HOST COPY HAPPENS and
+// weighted by the bytes that copy moves.
+//
+// Two sites use this, and they answer two halves of one question: why a compute dispatch could not
+// SEED from the renderer's device image, and why its result could not go BACK into one. Both
+// already named the reason on a per-binding trace line, and neither had an aggregate -- which is
+// the difference between knowing a path is narrow and knowing WHICH of its conditions to widen.
+//
+// Weighted by bytes rather than by count on purpose: a reason that refuses many small bindings is
+// not the one to widen, and a count-only histogram cannot tell the two apart.
+struct RefusalCensus {
+    // Bounded so an unexpected flood of distinct reasons cannot turn a census into an unbounded
+    // allocation. Reasons come from a fixed set of string literals; the cap is a backstop.
+    static constexpr size_t kMaxReasons = 64;
+
+    std::mutex mutex;
+    std::map<std::string, std::pair<uint64_t, uint64_t>> rows;   // reason -> {copies, bytes}
+
+    void note(const char* reason, uint64_t bytes) {
+        const std::string key = reason ? reason : "null";
+        std::lock_guard<std::mutex> lock(mutex);
+        if (rows.size() >= kMaxReasons && rows.find(key) == rows.end()) return;
+        auto& row = rows[key];
+        row.first += 1;
+        row.second += bytes;
+    }
+
+    // Biggest first, because that is the order somebody acts in. Prints nothing when empty, so a
+    // run that never reached the path stays silent instead of reporting a zero.
+    void report(const char* headline) {
+        std::vector<std::pair<std::string, std::pair<uint64_t, uint64_t>>> snapshot;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            snapshot.assign(rows.begin(), rows.end());
+        }
+        if (snapshot.empty()) return;
+        std::sort(snapshot.begin(), snapshot.end(),
+                  [](const auto& a, const auto& b) { return a.second.second > b.second.second; });
+        std::fputs(headline, stderr);
+        for (const auto& row : snapshot)
+            std::fprintf(stderr, "  %s=%.1fMiB/%lluc", row.first.c_str(),
+                         row.second.second / (1024.0 * 1024.0),
+                         (unsigned long long)row.second.first);
+        std::fputc('\n', stderr);
+    }
+};
+
+// Never destroyed, deliberately, and this is a contract rather than a preference. `exit_census.hpp`
+// requires that a report not read an object with a non-trivial destructor: the flush runs from
+// `std::atexit`, which interleaves with `__cxa_atexit` static destruction in an order no
+// registration site controls. One `std::map` member is enough to register a destructor for the
+// whole object, and the report then reads a destroyed container. Leaking one fixed-size object per
+// process is the no-destroy idiom the exit-report registry itself uses.
+inline RefusalCensus& seed_refusal_census() {
+    static RefusalCensus* census = new RefusalCensus();
+    return *census;
+}
+
+inline RefusalCensus& destination_refusal_census() {
+    static RefusalCensus* census = new RefusalCensus();
+    return *census;
+}
+
 struct RttDestinationCensus {
     RttMirrorCounter candidates, borrowed, recorded, published, failed;
     RttMirrorCounter r11_source_seed_recorded, rgba16_source_seed_recorded;
@@ -493,6 +558,30 @@ struct RttDestinationCensus {
 };
 RttDestinationCensus& rtt_destination_census() {
     static constinit RttDestinationCensus census{};
+    // The destination borrow is the ONLY way a render target that has fallen to CPU-only authority
+    // regains GPU authority: the seed import requires `gpu_valid`, and the mirror-back that would
+    // set it requires the seed import, so without this path the state is a latch. Its counters
+    // existed already but printed only under an active F8 perf capture, every sixteenth candidate
+    // -- so on an ordinary run nothing could say whether the escape hatch was ever attempted.
+    static const bool once = [] {
+        prosper::diagnostics::register_census("PROSPER_NO_RTT_DESTINATION_CENSUS", [] {
+            const auto t = rtt_destination_census().snapshot();
+            if (!t.candidates) return false;
+            std::fprintf(stderr,
+                "[rtt-destination] RUN TOTAL candidates=%llu borrowed=%llu recorded=%llu "
+                "published=%llu failed=%llu\n",
+                (unsigned long long)t.candidates, (unsigned long long)t.borrowed,
+                (unsigned long long)t.recorded, (unsigned long long)t.published,
+                (unsigned long long)t.failed);
+            destination_refusal_census().report(
+                "[rtt-destination-refused] RUN TOTAL why a compute result could not go back "
+                "into the renderer's device image:");
+            std::fflush(stderr);
+            return true;
+        });
+        return true;
+    }();
+    (void)once;
     return census;
 }
 thread_local uint64_t g_perf_compute_gpu_timestamp_samples = 0;
@@ -4084,6 +4173,33 @@ void storage_unpack_texel(const uint8_t* src, prosper::gpu::DataFormat f, uint32
 // Every specialized path is bit-identical to storage_unpack_texel by construction; formats without a
 // specialization fall through to the per-texel helper, and PROSPER_VERIFY_UNPACK=1 checks the two
 // against each other at runtime.
+struct StorageMaterializeCounters {
+    std::atomic<uint64_t> exact_n{0}, exact_b{0}, unpack_n{0}, unpack_b{0}, seed_n{0}, seed_b{0};
+    // Bounded so a streaming title cannot turn a census into an unbounded allocation.
+    std::atomic<uint64_t> not_persistent{0}, persistent_not_skipped{0};
+    std::atomic<uint64_t> not_candidate{0}, candidate_refused{0}, not_candidate_owned{0};
+    std::mutex distinct_mutex;
+    std::set<std::pair<uint64_t, uint64_t>> distinct;
+};
+// Never destroyed, for the reason `exit_reports.hpp` states and this file's own report proves:
+// the `[storage-materialize]` report takes `distinct_mutex` and reads `distinct` at exit, and the
+// flush runs from `std::atexit`, which is LIFO against the `__cxa_atexit` entry this static
+// registers.
+//
+// It is the `std::set` specifically, not the whole struct: the atomics are trivially destructible
+// and `std::mutex`'s destructor is trivial too, so a struct holding only those registers no
+// destructor at all. One member with a non-trivial destructor registers one for the object, and
+// then the report reads a destroyed container. It survives today only because the report happens
+// to touch `size()` and libstdc++ leaves the node count intact -- which stops being true the
+// moment the report iterates, or the build defines `_GLIBCXX_ASSERTIONS`.
+//
+// Lazy registration alone does NOT fix this. It changes which report runs after which destructor,
+// and no registration site controls that ordering. (#3872 review.)
+inline StorageMaterializeCounters& storage_materialize_counters() {
+    static StorageMaterializeCounters* c = new StorageMaterializeCounters();
+    return *c;
+}
+
 void storage_unpack_range(const uint8_t* src, size_t src_stride, prosper::gpu::DataFormat f,
                           uint32_t ncomp, size_t count, uint32_t* out) {
     using DF = prosper::gpu::DataFormat;
@@ -8070,7 +8186,11 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         if (time_seed)
                             import_ms += std::chrono::duration<double, std::milli>(
                                 ComputeClock::now() - seed_start).count();
-                        bi.standalone_seed_decision = "import-unavailable";
+                        // Not a flat "the renderer said no": the importer now reports WHICH of its
+                        // declines fired, and the consumer's fallback for any of them is a full CPU
+                        // round trip of the image. A bare reason here cost a measurement pass.
+                        bi.standalone_seed_decision =
+                            prosper::gpu::live_target_import_refusal_name(source.refusal);
                         if (available) {
                             const char* reason = !source.valid() ? "invalid-import"
                                 : source.kind != LiveTargetImageImport::Kind::Color ? "not-color"
@@ -9302,6 +9422,140 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     unpack_source = src;
                 }
                 if (!bi.has_renderer_seed()) {
+                    // Which of the two host-side materialisation paths a storage binding takes,
+                    // and how many bytes each moves. The expensive one is the per-texel unpack to
+                    // RGBA32; the cheap one is a straight copy. live_compute.cpp already prices an
+                    // image-bearing dispatch at ~56 ms against 0.39 ms of actual GPU dispatch, and
+                    // compute-item execution is 74.9% of wall on a slow title -- but nothing said
+                    // how the population splits between the two, so "teach the cheap path more
+                    // formats" and "stop materialising at all" could not be ranked against each
+                    // other. The seed copy is counted separately because it is unconditional on
+                    // the write-mask path and nobody counts it at all.
+                    {
+                        static const bool once = [] {
+                            prosper::diagnostics::register_census(
+                                "PROSPER_NO_STORAGE_MATERIALIZE_CENSUS", [] {
+                                auto& c = storage_materialize_counters();
+                                const uint64_t en = c.exact_n.load(std::memory_order_relaxed);
+                                const uint64_t un = c.unpack_n.load(std::memory_order_relaxed);
+                                if (!(en + un)) return false;
+                                const double MiB = 1024.0 * 1024.0;
+                                std::fprintf(stderr,
+                                    "[storage-materialize] RUN TOTAL bindings=%llu "
+                                    "exact-copy=%llu (%.1f%%, %.1f MiB) "
+                                    "texel-unpack=%llu (%.1f%%, %.1f MiB) "
+                                    "seed-copy=%llu (%.1f MiB) distinct-sources=%llu "
+                                    "not-persistent=%llu (never-asked=%llu of which renderer-owned=%llu, "
+                                    "cache-refused=%llu) "
+                                    "persistent-not-skipped=%llu\n",
+                                    (unsigned long long)(en + un),
+                                    (unsigned long long)en, 100.0 * en / (en + un),
+                                    c.exact_b.load(std::memory_order_relaxed) / MiB,
+                                    (unsigned long long)un, 100.0 * un / (en + un),
+                                    c.unpack_b.load(std::memory_order_relaxed) / MiB,
+                                    (unsigned long long)c.seed_n.load(std::memory_order_relaxed),
+                                    c.seed_b.load(std::memory_order_relaxed) / MiB,
+                                    (unsigned long long)[&]{
+                                        std::lock_guard<std::mutex> lock(c.distinct_mutex);
+                                        return c.distinct.size();
+                                    }(),
+                                    (unsigned long long)c.not_persistent.load(std::memory_order_relaxed),
+                                    (unsigned long long)c.not_candidate.load(std::memory_order_relaxed),
+                                    (unsigned long long)c.not_candidate_owned.load(std::memory_order_relaxed),
+                                    (unsigned long long)c.candidate_refused.load(std::memory_order_relaxed),
+                                    (unsigned long long)c.persistent_not_skipped.load(
+                                        std::memory_order_relaxed));
+                                // Name WHY the GPU seed path refused, biggest first. This is the
+                                // actionable half: the line above says how much is copied, this
+                                // one says which condition to widen to stop copying it.
+                                seed_refusal_census().report(
+                                    "[gpu-seed-refused] RUN TOTAL why the renderer-owned bindings took a "
+                                    "CPU round trip:");
+                                std::fflush(stderr);
+                                return true;
+                            });
+                            return true;
+                        }();
+                        (void)once;
+                        auto& c = storage_materialize_counters();
+                        if (bi.storage_write_mask) {
+                            c.seed_n.fetch_add(1, std::memory_order_relaxed);
+                            c.seed_b.fetch_add(linear_guest_bytes, std::memory_order_relaxed);
+                        }
+                        prosper::diagnostics::note_transfer(
+                            prosper::diagnostics::Transfer::StorageMaterialize,
+                            static_cast<uint64_t>(texels) * guest_texel);
+                        // How much of this copying is REPEAT copying of the same source. The copy
+                        // is legitimate the first time a guest-owned image is materialised; every
+                        // later copy of an unchanged source is pure waste, and nothing here has a
+                        // write-watch to tell the difference (the buffer path reports
+                        // total-watch-chunks=0 on every binding). Distinct (address, size) pairs
+                        // against total copies sizes the headroom without paying for a hash.
+                        {
+                            auto& d = storage_materialize_counters();
+                            std::lock_guard<std::mutex> lock(d.distinct_mutex);
+                            if (d.distinct.size() < 200000)
+                                d.distinct.insert({r->gpu_addr,
+                                                   static_cast<uint64_t>(texels) * guest_texel});
+                        }
+                        // WHY the cache did not skip this copy. The guard above is
+                        // `!(bi.persistent && bi.upload_skipped)`, and those two terms have
+                        // completely different fixes: not-persistent is a cache-admission problem
+                        // (key, eligibility, capacity), while persistent-but-not-skipped is a
+                        // write-watch problem (the watch says dirty or unknown for data that has
+                        // not changed). 8,993 copies from 84 distinct sources means ~99% of this
+                        // traffic is repeat copying, so which of the two terms fails decides the
+                        // entire fix.
+                        {
+                            auto& d = storage_materialize_counters();
+                            if (!bi.persistent) {
+                                d.not_persistent.fetch_add(1, std::memory_order_relaxed);
+                                // Split the 76%: never asked (an eligibility predicate refused
+                                // before the cache was consulted) against asked-and-refused (the
+                                // cache did not hold it, or held it unusably). These have
+                                // different fixes -- widen a predicate, or raise capacity / fix a
+                                // key -- and the aggregate cannot tell them apart.
+                                if (!bi.cache_candidate) {
+                                    d.not_candidate.fetch_add(1, std::memory_order_relaxed);
+                                    // `!renderer_owned` is one of the candidate gate's six terms,
+                                    // and the gate census says it is the one that refuses most
+                                    // often. Counting it HERE, at the copy, is what turns that
+                                    // into a claim about the traffic: the gate census evaluates
+                                    // every binding, while only some of them reach a copy. This
+                                    // arm is reached from inside `!bi.has_renderer_seed()`, so a
+                                    // hit means the renderer owns the image and supplied no seed
+                                    // -- excluded from the compute cache on the assumption the
+                                    // renderer would provide it, then copied from guest memory
+                                    // anyway, every dispatch.
+                                    if (renderer_owned) {
+                                        d.not_candidate_owned.fetch_add(1, std::memory_order_relaxed);
+                                        // Name the condition. This arm is renderer-owned WITHOUT a
+                                        // renderer seed, so the bytes below came off a CPU render
+                                        // target snapshot and are about to be uploaded back to the
+                                        // same device they were read from. `standalone_seed_decision`
+                                        // says which term of the GPU seed path refused to keep them
+                                        // there.
+                                        seed_refusal_census().note(
+                                            bi.standalone_seed_decision,
+                                            static_cast<uint64_t>(texels) * guest_texel);
+                                    }
+                                } else {
+                                    d.candidate_refused.fetch_add(1, std::memory_order_relaxed);
+                                }
+                            } else {
+                                d.persistent_not_skipped.fetch_add(1, std::memory_order_relaxed);
+                            }
+                        }
+                        if (bi.exact_storage_bytes()) {
+                            c.exact_n.fetch_add(1, std::memory_order_relaxed);
+                            c.exact_b.fetch_add(static_cast<uint64_t>(texels) * guest_texel,
+                                                std::memory_order_relaxed);
+                        } else {
+                            c.unpack_n.fetch_add(1, std::memory_order_relaxed);
+                            c.unpack_b.fetch_add(static_cast<uint64_t>(texels) * guest_texel,
+                                                 std::memory_order_relaxed);
+                        }
+                    }
                     if (bi.storage_write_mask)
                         bi.untouched_seed.assign(unpack_source, unpack_source + linear_guest_bytes);
                     if (bi.exact_storage_bytes()) {
@@ -10930,8 +11184,15 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             const prosper::gpu::LiveTargetImageDestinationRequest request{
                 r->width, r->height, *format};
             prosper::gpu::LiveTargetImageImport destination;
-            if (!borrow_live_render_target_image_destination(r->gpu_addr, request, destination))
+            if (!borrow_live_render_target_image_destination(r->gpu_addr, request, destination)) {
+                // The census's `failed` counter never saw these: the old `continue` left before
+                // anything was recorded, so 8,268 of 11,621 candidates on one title vanished
+                // between "candidate" and "borrowed" with no reason and no count.
+                destination_refusal_census().note(
+                    prosper::gpu::live_target_import_refusal_name(destination.refusal),
+                    static_cast<uint64_t>(staging_bytes[i]));
                 continue;
+            }
             const VkFormat expected = live_target_pixel_format_vk(*format);
             // One dispatch may first seed its private writable image from the current renderer
             // target, then copy its completed result back into that SAME target. Keep two leases:
@@ -14021,7 +14282,76 @@ void sampled_float16_to_unorm8_range(const uint8_t* source, uint32_t components,
 // TripBoundWitnessScope lives in trip_bound_witness.hpp so its save/restore contract can be
 // exercised by a regression test rather than only by a routed run.
 
+// Wall time spent executing compute items, against wall time overall.
+//
+// This exists because the two instruments that already measure the render path DISAGREE about how
+// much of a run it accounts for, and the gap is this function. On a windowed Astro Bot run the
+// per-submit report gives backend=35.30 of total=35.36 ms -- about 58% of wall -- while the
+// pass-cost census puts time inside render_draw_pass_rgba at 8.5%. Both are right: roughly half
+// the run is in backend code that is not drawing, and compute-item execution is the candidate.
+// Nothing measured it, so the share was inferred from profile leaves (parallel_compute_texels,
+// half_to_float, the retile binds) rather than counted. This counts it.
+//
+// Reports wall time and call count at end of run, on by default, silent when no item ever ran.
+// `PROSPER_NO_COMPUTE_ITEMS_CENSUS=1` silences it.
+namespace {
+struct ComputeItemsCensus {
+    std::atomic<uint64_t> calls{0};
+    std::atomic<uint64_t> items{0};
+    std::atomic<uint64_t> nanoseconds{0};
+    std::atomic<uint64_t> first_ns{0};
+    std::atomic<uint64_t> last_ns{0};
+};
+ComputeItemsCensus& compute_items_census() {
+    static ComputeItemsCensus census;
+    static const bool once = [] {
+        prosper::diagnostics::register_census("PROSPER_NO_COMPUTE_ITEMS_CENSUS", [] {
+            auto& c = compute_items_census();
+            const uint64_t calls = c.calls.load(std::memory_order_relaxed);
+            if (!calls) return false;
+            const uint64_t first = c.first_ns.load(std::memory_order_relaxed);
+            const uint64_t last = c.last_ns.load(std::memory_order_relaxed);
+            const double busy_ms = c.nanoseconds.load(std::memory_order_relaxed) / 1e6;
+            const double span_ms = last > first ? (last - first) / 1e6 : 0.0;
+            std::fprintf(stderr,
+                         "[compute-items] RUN TOTAL calls=%llu items=%llu in-compute=%.1fms "
+                         "span=%.1fms (%.1f%% of span) mean=%.3fms/call\n",
+                         static_cast<unsigned long long>(calls),
+                         static_cast<unsigned long long>(c.items.load(std::memory_order_relaxed)),
+                         busy_ms, span_ms, span_ms > 0 ? 100.0 * busy_ms / span_ms : 0.0,
+                         busy_ms / static_cast<double>(calls));
+            std::fflush(stderr);
+            return true;
+        });
+        return true;
+    }();
+    (void)once;
+    return census;
+}
+uint64_t compute_items_now_ns() {
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+// Reports on every exit, including the fail-closed returns below.
+struct ComputeItemsScope {
+    uint64_t start = compute_items_now_ns();
+    size_t count = 0;
+    explicit ComputeItemsScope(size_t n) : count(n) {}
+    ~ComputeItemsScope() {
+        auto& c = compute_items_census();
+        const uint64_t end = compute_items_now_ns();
+        c.calls.fetch_add(1, std::memory_order_relaxed);
+        c.items.fetch_add(count, std::memory_order_relaxed);
+        c.nanoseconds.fetch_add(end - start, std::memory_order_relaxed);
+        uint64_t expected = 0;
+        c.first_ns.compare_exchange_strong(expected, start, std::memory_order_relaxed);
+        c.last_ns.store(end, std::memory_order_relaxed);
+    }
+};
+}  // namespace
+
 bool execute_live_compute_items(const std::vector<prosper::gpu::ComputeItem>& items) {
+    const ComputeItemsScope compute_items_scope(items.size());
     const prosper::gpu::TileCensusScope tile_census_scope("compute");
     auto fail_closed_items = [&]() {
         for (const auto& item : items)

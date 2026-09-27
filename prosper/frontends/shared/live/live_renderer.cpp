@@ -2009,7 +2009,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
         [invalidate_ds, direct_bind](uint64_t addr,
                                      const prosper::gpu::LiveTargetImageRequest& request,
                                      prosper::gpu::LiveTargetImageImport& import) {
-            if (!direct_bind) return false;
+            if (!direct_bind) { import.refusal = prosper::gpu::LiveTargetImageImport::Refusal::DirectBindDisabled; return false; }
             drain_guest_gpu_writes(g_rtt, invalidate_ds);
             // `allow_depth` is set only for a proven one-component Float32 sample or Uint32 raw-bit
             // view of an ordinary 2D descriptor. Prefer the matching DS plane before consulting the
@@ -2037,33 +2037,50 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 }
             }
             auto it = g_rtt.find(addr);
-            if (it == g_rtt.end()) return false;
+            if (it == g_rtt.end()) { import.refusal = prosper::gpu::LiveTargetImageImport::Refusal::NoRttEntry; return false; }
             RttSurf& surface = it->second;
-            if (!surface.w || !surface.h) return false;
-            if (surface.volume_depth) return false; // image import is a 2D contract
+            if (!surface.w || !surface.h) { import.refusal = prosper::gpu::LiveTargetImageImport::Refusal::ZeroExtent; return false; }
+            // image import is a 2D contract
+            if (surface.volume_depth) { import.refusal = prosper::gpu::LiveTargetImageImport::Refusal::VolumeDepth; return false; }
             const VkFormat format = prosper::test::backend_color_format(surface.format);
             // Map the backend format explicitly and fail closed. A direct bind hands the consumer a
             // real VkImage, so an unrecognized format must decline rather than be reported as rgba8:
             // the consumer would then build a mismatched view over the renderer's image.
             prosper::gpu::LiveTargetPixelFormat pixel_format;
-            if (!prosper::frontend::live_target_pixel_format_from_vk(format, pixel_format))
+            if (!prosper::frontend::live_target_pixel_format_from_vk(format, pixel_format)) {
+                import.refusal = prosper::gpu::LiveTargetImageImport::Refusal::UnmappedFormat;
                 return false;
+            }
             const uint32_t bytes_per_pixel = prosper::test::backend_color_bytes_per_pixel(format);
-            if (!bytes_per_pixel) return false;
+            if (!bytes_per_pixel) { import.refusal = prosper::gpu::LiveTargetImageImport::Refusal::UnmappedFormat; return false; }
             const uint64_t texels = static_cast<uint64_t>(surface.w) * surface.h;
-            if (texels > UINT64_MAX / bytes_per_pixel) return false;
+            if (texels > UINT64_MAX / bytes_per_pixel) {
+                import.refusal = prosper::gpu::LiveTargetImageImport::Refusal::TexelOverflow;
+                return false;
+            }
             const uint64_t expected = texels * bytes_per_pixel;
             const bool has_cpu_snapshot = surface.rgba && surface.rgba->size() == expected;
             if (!prosper::frontend::live_rtt_gpu_importable(surface.gpu_valid,
-                                                             has_cpu_snapshot))
+                                                             has_cpu_snapshot)) {
+                // Split by what the renderer DOES hold. "The pixels are on the CPU" and "the entry
+                // is an empty shell" have nothing in common: the first means a GPU-side handoff was
+                // possible and was lost, the second means there is nothing to hand over.
+                import.refusal = has_cpu_snapshot ? prosper::gpu::LiveTargetImageImport::Refusal::CpuOnlyAuthority
+                                                  : prosper::gpu::LiveTargetImageImport::Refusal::NoAuthority;
                 return false;
+            }
             const prosper::test::RenderVkCtx& ctx = prosper::test::render_vk_ctx();
-            if (!ctx.ok) return false;
+            if (!ctx.ok) { import.refusal = prosper::gpu::LiveTargetImageImport::Refusal::NoRenderContext; return false; }
             prosper::test::PersistentColorTargetImage* target =
                 prosper::test::find_persistent_color_target(addr, surface.w, surface.h, format);
-            if (!target || !target->image || target->layout == VK_IMAGE_LAYOUT_UNDEFINED) return false;
-            if (!prosper::test::pin_persistent_color_target(addr, surface.w, surface.h, format))
+            if (!target || !target->image || target->layout == VK_IMAGE_LAYOUT_UNDEFINED) {
+                import.refusal = prosper::gpu::LiveTargetImageImport::Refusal::NoPersistentImage;
                 return false;
+            }
+            if (!prosper::test::pin_persistent_color_target(addr, surface.w, surface.h, format)) {
+                import.refusal = prosper::gpu::LiveTargetImageImport::Refusal::PinRefused;
+                return false;
+            }
             target->last_use = ++prosper::test::persistent_color_target_generation();
             // The unpin key is {addr, w, h, format}. A repeat import that disagreed with the
             // recorded key would corrupt the outstanding pin's release, so decline instead.
@@ -2071,6 +2088,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             if (pin.count &&
                 (pin.width != surface.w || pin.height != surface.h || pin.format != format)) {
                 prosper::test::unpin_persistent_color_target(addr, surface.w, surface.h, format);
+                import.refusal = prosper::gpu::LiveTargetImageImport::Refusal::PinKeyMismatch;
                 return false;
             }
             pin = {surface.w, surface.h, format, pin.count + 1};
@@ -2096,29 +2114,43 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
         [invalidate_ds, direct_bind](uint64_t addr,
                         const prosper::gpu::LiveTargetImageDestinationRequest& request,
                         prosper::gpu::LiveTargetImageImport& destination) {
-            if (!direct_bind) return false;
+            if (!direct_bind) { destination.refusal = prosper::gpu::LiveTargetImageImport::Refusal::DirectBindDisabled; return false; }
             drain_guest_gpu_writes(g_rtt, invalidate_ds);
             auto it = g_rtt.find(addr);
-            if (it == g_rtt.end() || !request.width || !request.height ||
-                it->second.w != request.width || it->second.h != request.height)
+            if (it == g_rtt.end()) { destination.refusal = prosper::gpu::LiveTargetImageImport::Refusal::NoRttEntry; return false; }
+            if (!request.width || !request.height) {
+                destination.refusal = prosper::gpu::LiveTargetImageImport::Refusal::ZeroExtent;
                 return false;
+            }
+            if (it->second.w != request.width || it->second.h != request.height) {
+                destination.refusal = prosper::gpu::LiveTargetImageImport::Refusal::ExtentMismatch;
+                return false;
+            }
             const VkFormat format = prosper::frontend::live_target_pixel_format_vk(request.format);
             if (format == VK_FORMAT_UNDEFINED ||
-                prosper::test::backend_color_format(it->second.format) != format)
+                prosper::test::backend_color_format(it->second.format) != format) {
+                destination.refusal = prosper::gpu::LiveTargetImageImport::Refusal::FormatMismatch;
                 return false;
+            }
             const prosper::test::RenderVkCtx& ctx = prosper::test::render_vk_ctx();
-            if (!ctx.ok) return false;
+            if (!ctx.ok) { destination.refusal = prosper::gpu::LiveTargetImageImport::Refusal::NoRenderContext; return false; }
             auto* target = prosper::test::find_persistent_color_target(
                 addr, request.width, request.height, format, false);
-            if (!target || !target->image || target->layout == VK_IMAGE_LAYOUT_UNDEFINED ||
-                !prosper::test::pin_persistent_color_target_for_overwrite(
-                    addr, request.width, request.height, format))
+            if (!target || !target->image || target->layout == VK_IMAGE_LAYOUT_UNDEFINED) {
+                destination.refusal = prosper::gpu::LiveTargetImageImport::Refusal::NoPersistentImage;
                 return false;
+            }
+            if (!prosper::test::pin_persistent_color_target_for_overwrite(
+                    addr, request.width, request.height, format)) {
+                destination.refusal = prosper::gpu::LiveTargetImageImport::Refusal::PinRefused;
+                return false;
+            }
             PinnedImport& pin = pinned_imports[addr];
             if (pin.count && (pin.width != request.width || pin.height != request.height ||
                               pin.format != format)) {
                 prosper::test::unpin_persistent_color_target(addr, request.width,
                                                                request.height, format);
+                destination.refusal = prosper::gpu::LiveTargetImageImport::Refusal::PinKeyMismatch;
                 return false;
             }
             pin = {request.width, request.height, format, pin.count + 1};
