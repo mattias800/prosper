@@ -298,6 +298,24 @@ real (Astro Bot's passes hold a mean of 1.00 draws, 100% single-draw) and it is 
 frontier. Do not restart pass batching without first showing the renderer is a large share of the
 target title's wall clock.
 
+**RULED OUT (2026-09-27): recycling per-pass Vulkan objects to buy frame time.** Kernel buffer-object
+churn looked like ~9% of the GTA V render thread in sampled profiles, so descriptor pools (per render
+pass and per GPU-detile upload), per-batch fences and per-batch timestamp query pools were put on
+bounded free lists behind same-binary opt-outs. The mechanism moved exactly as intended: strace of
+the render thread over 10 s of gameplay showed `AMDGPU_GEM_CREATE` 13,649 → 7,396 (−46%),
+`SYNCOBJ_CREATE` 3,765 → 739 (−80%) and all ioctls −35%. The frame rate did not: interleaved pairs
+8.47/8.46, 8.45/8.21 and 7.97/7.89 fps (OFF/ON), with ON never ahead of its OFF neighbour. Halving
+BO churn is not a frame-time lever on RADV, whatever its sample share says. Branch
+`perf/descriptor-pool-reuse`, #3873. Instrument trap found on the way: `PROSPER_NO_DESCRIPTOR_POOL_REUSE`
+is already read by the compute context's own pool reuse (`live_compute.cpp`), so an A/B that reuses
+that name disables both; the contaminated A/B showed a phantom +3%.
+
+**RULED OUT (2026-09-27): an early exit in `index_buffer_is_unannounced_32bit`.** Exact (the verdict
+is a conjunction, so it can return at the first disqualifying word), but a GTA V render-thread
+profile showed no drop in the function's self share (below 0.36% before, 0.58% after, single 15 s
+windows). GTA's unannounced index buffers are most likely genuinely 32-bit, which need the full scan
+either way. Not shipped. #3873.
+
 **RULED OUT: replacing per-call worker-thread creation with a persistent pool.**
 `parallel_compute_texels` and `parallel_rows` each create a fresh set of `std::jthread`s per call
 and join them. Measured volume on Astro Bot: **19,738 calls creating 200,809 OS threads** in ~120 s,
@@ -343,6 +361,18 @@ volume census was kept, because the volume is the input to any future batching q
 - **"prosper is naive about dynamic state."** It is not: `render_runner.h:9979`–`9995` enables 16
   dynamic states including extended-dynamic-state depth/stencil/cull/topology. Pipeline-key
   explosion from baked dynamic state is not a live hypothesis here.
+- **"Per-reference texture resolution needs a memo" (#3873 plan item 2).** Not what the cost was.
+  `PROSPER_TEXREF_CENSUS=1` on GTA V gameplay: ~158k texture references per 5 s, ~158 per submit
+  against 41.6 distinct identities per submit (74% are exact in-submit repeats), and **no repeat
+  resolved to a different outcome** (0 of ~117k per 5 s window, in every window of the run) -- so a
+  memo would have looked safe. But the
+  census also timed the chain by stage, and 4.3 us of the 4.8 us an ordinary in-submit reuse cost
+  was ONE step: the volume-alias check walking the whole RTT cache (~850 entries, 1 volume) on every
+  reference once any volume target had existed. With that walk replaced by an exact candidate index
+  (`shared/rtt/volume_target_index.hpp`), an in-submit reuse costs 0.59 us and the chain averages
+  2.5 us/ref; the most a memo could still save is ~0.5 us x ~120k refs per 5 s, about 1% of wall,
+  for an invalidation surface of the #611/#780 class. Do not build a resolution memo without first
+  showing a chain stage that is both slow and repeat-invariant -- the census reports exactly that.
 
 ## The frontier, found 2026-09-26: compute-item execution, not the renderer
 

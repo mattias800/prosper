@@ -19,6 +19,14 @@ from the tracker issues, and still gated, because it is a projection of state ra
 > title's current state — for that, read the tracker. Nothing is ever removed when a title moves on,
 > because the point of a blog is that it records *when* things happened.
 
+## 2026-09-27
+
+### Outer Wilds runs twice as fast once its texture cache can let go
+
+No picture this time, just a measurement. The first-person forest went from about 5 to about 10 frames
+per second. The texture cache filled up during the load and was then never allowed to evict anything,
+so about sixty textures a frame were uploaded again into brand-new allocations. [#3873](https://github.com/mattias800/prosper/issues/3873)
+
 ## 2026-09-26
 
 ### The Messenger runs at 59.9 fps on the shipped path, and the renderer is 6.7% of it

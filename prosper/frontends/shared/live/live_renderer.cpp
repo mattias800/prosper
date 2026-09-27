@@ -48,6 +48,8 @@
 #include "shared/present/present_blit_policy.hpp"      // flip-anchored scanout publication policy
 #include "shared/present/present_extent.hpp"           // the publish extent contract with the caller (#1986)
 #include "shared/media/avplayer_plane_policy.hpp"    // which sampled resource is AvPlayer's NV12 chroma plane
+#include "shared/live/texture_reference_census.hpp"  // PROSPER_TEXREF_CENSUS (#3873)
+#include "shared/rtt/volume_target_index.hpp"        // volume-footprint candidates (#3873)
 #include "shared/present/guest_scanout_present.hpp"    // publishing the guest's own flipped buffer (#1968)
 #include "shared/diagnostics/diagnostic_window.hpp"        // census window by callback ordinal or by elapsed time
 #include "shared/diagnostics/persistent_readback_filter.hpp" // bounded retained-target readback
@@ -180,13 +182,18 @@ struct RttSurf {
 };
 // Keeps the per-resource overlap scan entirely off the ordinary 2D-only execution path.
 bool g_ever_volume_target = false;
+// Keys of RTT-cache entries that may carry a nonzero volume_guest_bytes. A superset: every write
+// that can make a footprint nonzero goes through retain_volume_guest_footprint() or notes the key
+// itself (the resolve copy below). See volume_target_index.hpp for why queries stay exact.
+prosper::frontend::VolumeTargetIndex g_volume_targets;
 
-void retain_volume_guest_footprint(RttSurf& surface, uint64_t bytes, bool proven) {
+void retain_volume_guest_footprint(uint64_t base, RttSurf& surface, uint64_t bytes, bool proven) {
     if (!surface.volume_guest_bytes)
         surface.volume_footprint_proven = proven;
     else
         surface.volume_footprint_proven &= proven;
     surface.volume_guest_bytes = std::max(surface.volume_guest_bytes, bytes);
+    if (surface.volume_guest_bytes) g_volume_targets.note(base);
 }
 
 bool unpublished_volume_may_overlap(uint64_t volume_base, uint64_t volume_bytes,
@@ -236,6 +243,42 @@ bool materialize_uniform_rtt(RttSurf& surface) {
 }
 
 using RttCache = std::unordered_map<uint64_t, RttSurf>;
+
+// "Does any renderer-only volume footprint satisfy `visit`?" -- asked per sampled texture
+// reference, per compute unpublished-volume query and per live byte-range read. The indexed walk
+// visits only volume candidates; PROSPER_NO_VOLUME_RTT_INDEX=1 restores the full cache walk on the
+// same binary. PROSPER_AUDIT_VOLUME_RTT_INDEX=1 additionally walks the whole cache on every query and
+// reports (loudly, unconditionally) any volume entry the index does not hold and any disagreement --
+// the superset invariant, checked directly rather than inferred from matching answers.
+template <class Visit>
+bool any_volume_target(RttCache& cache, Visit&& visit) {
+    static const bool indexed = PROSPER_ENV_VALUE("PROSPER_NO_VOLUME_RTT_INDEX") == nullptr;
+    static const bool audit = PROSPER_ENV_VALUE("PROSPER_AUDIT_VOLUME_RTT_INDEX") != nullptr;
+    if (!indexed) return prosper::frontend::any_volume_target_full_scan(cache, visit);
+    const bool answer = g_volume_targets.any_of(cache, visit);
+    if (audit) {
+        static uint64_t audits = 0, missing = 0, disagreements = 0;
+        ++audits;
+        for (const auto& [base, surface] : cache) {
+            if (surface.volume_guest_bytes && !g_volume_targets.contains(base)) {
+                if (++missing <= 16)
+                    fprintf(stderr, "[volume-index] *** AUDIT: volume entry 0x%llx (%llu bytes) "
+                                    "is not indexed\n", (unsigned long long)base,
+                            (unsigned long long)surface.volume_guest_bytes);
+            }
+        }
+        if (prosper::frontend::any_volume_target_full_scan(cache, visit) != answer &&
+            ++disagreements <= 16)
+            fprintf(stderr, "[volume-index] *** AUDIT: indexed answer %d disagrees with the full "
+                            "walk\n", answer ? 1 : 0);
+        if ((audits & (audits - 1)) == 0 && audits >= 1024)
+            fprintf(stderr, "[volume-index] audit: %llu queries, %llu unindexed volume entries, "
+                            "%llu disagreements, %zu candidates, cache=%zu\n",
+                    (unsigned long long)audits, (unsigned long long)missing,
+                    (unsigned long long)disagreements, g_volume_targets.candidates(), cache.size());
+    }
+    return answer;
+}
 
 // A failed array binding can recur on every draw. Bound routine diagnostics while preserving
 // the first rejection at each site; the opt-in full log remains available for investigation.
@@ -1824,12 +1867,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
     });
     prosper::gpu::set_unpublished_volume_query([invalidate_ds](uint64_t addr, uint64_t bytes) {
         drain_guest_gpu_writes(g_rtt, invalidate_ds);
-        for (const auto& [base, surface] : g_rtt)
-            if (surface.volume_guest_bytes &&
-                unpublished_volume_may_overlap(
-                    base, surface.volume_guest_bytes, addr, bytes))
-                return true;
-        return false;
+        return any_volume_target(g_rtt, [&](uint64_t base, const RttSurf& surface) {
+            return unpublished_volume_may_overlap(base, surface.volume_guest_bytes, addr, bytes);
+        });
     });
     prosper::gpu::set_live_target_reader(
         [invalidate_ds](uint64_t addr, prosper::gpu::LiveTargetSnapshot& snapshot) {
@@ -2140,13 +2180,11 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             // A retained 3D attachment has not been published in the guest's native tiled byte
             // order. Check its entire physical footprint first, including reads beginning just
             // before the base. Returning NotFound would make ordered DMA copy stale guest bytes.
-            for (const auto& [base, surface] : g_rtt) {
-                if (!surface.volume_guest_bytes) continue;
-                const uint64_t extent = cpu_rtt_guest_write_bytes(surface, nullptr);
-                if (unpublished_volume_may_overlap(
-                        base, extent, addr, bytes))
-                    return prosper::gpu::LiveTargetByteReadResult::InvalidRange;
-            }
+            if (any_volume_target(g_rtt, [&](uint64_t base, const RttSurf& surface) {
+                    return unpublished_volume_may_overlap(
+                        base, cpu_rtt_guest_write_bytes(surface, nullptr), addr, bytes);
+                }))
+                return prosper::gpu::LiveTargetByteReadResult::InvalidRange;
             for (auto& [base, surface] : g_rtt) {
                 if (addr < base) continue;
                 if (!surface.w || !surface.h) {
@@ -3440,6 +3478,13 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     if (!reflected_binding) continue;
                     const auto resource_timing_start = timing_enabled
                         ? RenderClock::now() : RenderClock::time_point{};
+                    // PROSPER_TEXREF_CENSUS: null unless the census is armed for this reference.
+                    prosper::frontend::TextureReferenceCensus* const texref_census =
+                        prosper::frontend::TextureReferenceCensus::enabled() &&
+                                (r.cls == RC::Texture || r.cls == RC::StorageImage)
+                            ? &prosper::frontend::texture_reference_census() : nullptr;
+                    uint64_t texref_census_key = 0;
+                    if (texref_census) texref_census->begin();
                     bool resource_rtt_hit = false;
                     bool resource_compute_image_hit = false;
                     bool resource_compute_image_candidate = false;
@@ -3731,6 +3776,30 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             reflected_binding->image_multisampled,
                             reflected_binding->writable,
                         };
+                        if (texref_census) {
+                            size_t h = TextureDecodeKeyHash{}(decode_key);
+                            auto mix = [&h](uint64_t v) {
+                                h ^= static_cast<size_t>(v) + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+                            };
+                            mix(r.mag_filter); mix(r.min_filter); mix(r.mip_filter);
+                            mix(r.addr_uvw[0]); mix(r.addr_uvw[1]); mix(r.addr_uvw[2]);
+                            mix(r.border_color_type); mix(r.max_aniso_ratio);
+                            uint32_t lod_bits[3];
+                            std::memcpy(&lod_bits[0], &r.min_lod, 4);
+                            std::memcpy(&lod_bits[1], &r.max_lod, 4);
+                            std::memcpy(&lod_bits[2], &r.lod_bias, 4);
+                            mix(lod_bits[0]); mix(lod_bits[1]); mix(lod_bits[2]);
+                            for (int k = 0; k < 4; ++k) mix(r.swizzle[k]);
+                            mix(r.declared_mip_levels); mix(r.srgb); mix(r.depth_compare);
+                            mix(static_cast<uint32_t>(reflected_binding->kind));
+                            mix(reflected_binding->normalized_sampling);
+                            mix(reflected_binding->texel_access);
+                            mix(reflected_binding->texel_fetch);
+                            mix(reflected_binding->image_depth);
+                            mix(reflected_binding->sampled_float);
+                            texref_census_key = h;
+                            texref_census->mark(prosper::frontend::TextureReferenceCensus::kSetupKey);
+                        }
                         if (r.img_dim == 6u) {
                             // GFX10 TYPE=2D_MSAA interleaves the sample coordinate into the tiled
                             // address. It is neither an ordinary 2D texture nor a native Vulkan
@@ -3978,17 +4047,13 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         if (g_ever_volume_target && sampled_source_addr) {
                             const uint64_t sampled_bytes = std::max<uint64_t>(
                                 1u, prosper::gpu::gpu_capture_resource_footprint(r));
-                            bool unpublished_interior_alias = false;
-                            for (const auto& [volume_base, surface] : g_rtt) {
-                                if (volume_base == sampled_source_addr ||
-                                    !surface.volume_guest_bytes) continue;
-                                if (unpublished_volume_may_overlap(
-                                        volume_base, surface.volume_guest_bytes,
-                                        sampled_source_addr, sampled_bytes)) {
-                                    unpublished_interior_alias = true;
-                                    break;
-                                }
-                            }
+                            const bool unpublished_interior_alias = any_volume_target(g_rtt,
+                                [&](uint64_t volume_base, const RttSurf& surface) {
+                                    return volume_base != sampled_source_addr &&
+                                        unpublished_volume_may_overlap(
+                                            volume_base, surface.volume_guest_bytes,
+                                            sampled_source_addr, sampled_bytes);
+                                });
                             if (unpublished_interior_alias) {
                                 built.complete = false;
                                 continue;
@@ -4177,6 +4242,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             (!fr.is_storage_image && r.img_dim == 5u && !r.in_mip_tail &&
                              live_rtt != g_rtt.end());
                         resource_has_live_rtt = has_live_rtt_authority;
+                        if (texref_census)
+                            texref_census->mark(prosper::frontend::TextureReferenceCensus::kRttProbe);
                         // Resolve renderer-owned depth before considering guest-byte texture
                         // decoding. A sampled depth attachment has no authoritative color payload
                         // in guest memory: the retained Vulkan image is the source of truth. The old
@@ -4303,6 +4370,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             bool retained_exact = false;
                             bool retained_subview = false;
                             bool retained_noncanonical = false;
+                            using TexCensus = prosper::frontend::TextureReferenceCensus;
+                            const uint64_t census_scan_start = texref_census ? TexCensus::aux_begin() : 0;
                             {
                                 const prosper::test::BackendPersistentResourceGuard guard;
                                 const auto& ds_cache = prosper::test::persistent_ds_cache();
@@ -4350,6 +4419,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     }
                                 }
                             }
+                            if (texref_census)
+                                texref_census->aux_end(TexCensus::kAuxDsScan, census_scan_start);
                             if (retained_noncanonical) {
                                 static thread_local uint32_t array_reject_logged = 0;
                                 if (log_array_rejection(array_reject_logged, "noncanonical-depth"))
@@ -4396,6 +4467,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     // unrelated color pass need not discard an unchanged DS snapshot;
                                     // a depth producer changes its generation and misses below.
                                     bool completed = false;
+                                    const uint64_t census_flush_start =
+                                        texref_census ? TexCensus::aux_begin() : 0;
                                     {
                                         const prosper::test::BackendPersistentResourceGuard guard;
                                         const auto& ctx = prosper::test::render_vk_ctx();
@@ -4406,6 +4479,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                                         result.wait_result == VK_SUCCESS;
                                         }
                                     }
+                                    if (texref_census)
+                                        texref_census->aux_end(TexCensus::kAuxDsFlush, census_flush_start);
                                     if (!completed) {
                                         clear_depth_array_snapshots();
                                         static thread_local uint32_t array_reject_logged = 0;
@@ -4433,7 +4508,11 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     }
                                     return planes;
                                 };
+                                const uint64_t census_identity_start =
+                                    texref_census ? TexCensus::aux_begin() : 0;
                                 auto planes = source_identity();
+                                if (texref_census)
+                                    texref_census->aux_end(TexCensus::kAuxDsIdentity, census_identity_start);
                                 if (!planes.empty()) {
                                     for (const auto& cached : depth_array_snapshots) {
                                         if (cached.base == r.gpu_addr && cached.stride == r.layer_stride_bytes &&
@@ -4447,10 +4526,14 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 }
                                 std::vector<float> depth;
                                 std::string error;
+                                const uint64_t census_read_start =
+                                    texref_census && !retained_depth_array ? TexCensus::aux_begin() : 0;
                                 const auto status = retained_depth_array
                                     ? prosper::test::PersistentDsDepthArrayStatus::Ready
                                     : prosper::test::read_persistent_ds_depth_array(
                                         r.gpu_addr, tw, th, 0u, r.depth, depth, error, producer_batch);
+                                if (texref_census)
+                                    texref_census->aux_end(TexCensus::kAuxDsRead, census_read_start);
                                 if (status == prosper::test::PersistentDsDepthArrayStatus::Unavailable) {
                                     static thread_local uint32_t array_reject_logged = 0;
                                     if (log_array_rejection(array_reject_logged, "depth-unavailable"))
@@ -4564,6 +4647,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     (static_cast<uint64_t>(retained_depth_cube.present_mask) << 56) |
                                     (retained_depth_cube.overlay_version & 0x00ffffffffffffffull);
                         }
+                        if (texref_census)
+                            texref_census->mark(prosper::frontend::TextureReferenceCensus::kDepthProbe);
                         const uint32_t persistent_pitch = PROSPER_ENV_VALUE("PROSPER_PITCH")
                             ? static_cast<uint32_t>(atoi(getenv("PROSPER_PITCH"))) : 0;
                         const uint32_t persistent_bc_block_bytes =
@@ -4947,6 +5032,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             ? sampled_dcc_metadata.size() : persistent_base_source_size;
                         resource_persistent_source_size = persistent_source_size;
                         resource_texture_source_bytes = persistent_source_size;
+                        if (texref_census)
+                            texref_census->mark(prosper::frontend::TextureReferenceCensus::kSourceSize);
                         // A successful typed-storage compute dispatch may still own this exact
                         // sampled image on the shared Vulkan device. Prefer that image only for the
                         // exact native formats the graphics backend preserves today. The compute cache
@@ -5030,6 +5117,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 resource_compute_image_hit = false;
                             }
                         }
+                        if (texref_census)
+                            texref_census->mark(prosper::frontend::TextureReferenceCensus::kComputeProbe);
                         DepthCubeSourceLayout depth_cube_source_layout;
                         if (retained_depth_cube_cache_candidate) {
                             const size_t face_bytes = persistent_source_is_tiled
@@ -5138,6 +5227,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         // to (R,0,0,1) and must retain the real descriptor swizzle, so the two facts differ.
                         bool narrow_done = false;
                         bool narrow_decode_done = false;
+                        if (texref_census)
+                            texref_census->mark(prosper::frontend::TextureReferenceCensus::kPreLookup);
                         auto reused = (has_live_rtt || resource_compute_image_hit)
                             ? decoded_textures.end() : decoded_textures.find(decode_key);
                         // A retained entry from an EARLIER span in this submit is usable only while
@@ -5467,6 +5558,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 }
                             }
                         }
+                        if (texref_census)
+                            texref_census->mark(prosper::frontend::TextureReferenceCensus::kLookup);
                         // PROSPER_BIND_LOG=<min-cb>: log every sampled-resource binding decision for
                         // 3 final callbacks (same ordinal as PROSPER_PASS_LOG) — which path serves
                         // each guest address, so a black consumer input can be attributed.
@@ -8605,6 +8698,43 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             }
                         }
                     }
+                    if (texref_census && full_resource) {
+                        using Census = prosper::frontend::TextureReferenceCensus;
+                        const auto& image = *full_resource;
+                        const int klass = resource_rtt_hit ? Census::kRtt
+                            : (resource_compute_image_hit || resource_compute_depth_hybrid) ? Census::kCompute
+                            : resource_persistent_submit_reuse ? Census::kPersistSubmit
+                            : resource_persistent_hit ? Census::kPersistHit
+                            : resource_persistent_miss ? Census::kPersistMiss
+                            : resource_persistent_invalidation ? Census::kPersistInvalid
+                            : resource_local_reuse ? Census::kLocal : Census::kOther;
+                        // The resolved identity only: what the backend would bind. The class is
+                        // deliberately excluded -- a persistent hit followed by a submit-local reuse
+                        // of the same pixels is the same answer reached two ways.
+                        uint64_t o = 1469598103934665603ull;
+                        auto mix = [&o](uint64_t v) { o ^= v; o *= 1099511628211ull; o ^= v >> 32; };
+                        mix(reinterpret_cast<uintptr_t>(image.tex_rgba));
+                        mix(reinterpret_cast<uintptr_t>(image.gpu_detile.get()));
+                        mix(image.tex_byte_size); mix(image.has_uniform_color);
+                        for (float f : image.uniform_color) { uint32_t b; std::memcpy(&b, &f, 4); mix(b); }
+                        mix(image.tw); mix(image.th); mix(image.td); mix(image.sample_count);
+                        mix(image.declared_mip_levels); mix(image.img_dim); mix(image.guest_array);
+                        mix(static_cast<uint64_t>(image.texture_format)); mix(image.is_storage_image);
+                        mix(image.storage_image_contract_valid);
+                        mix(static_cast<bool>(image.storage_image_writeback));
+                        mix(image.mag_filter); mix(image.min_filter); mix(image.mip_filter);
+                        for (uint32_t a : image.addr_uvw) mix(a);
+                        for (uint32_t w : image.swizzle) mix(w);
+                        mix(static_cast<uint64_t>(image.render_target_guest_format));
+                        mix(image.persistent_texture_id); mix(image.persistent_texture_version);
+                        mix(image.persistent_render_target_id);
+                        mix(image.persistent_render_target_mip_count);
+                        for (uint64_t id : image.persistent_render_target_mip_ids) mix(id);
+                        mix(image.persistent_depth_target_id);
+                        mix(reinterpret_cast<uintptr_t>(image.borrowed_compute_image));
+                        mix(image.borrowed_compute_vertical_stack_layers);
+                        texref_census->finish(g_this_submit, texref_census_key, o, klass);
+                    }
                     if (timing_enabled) {
                         const double elapsed = std::chrono::duration<double, std::milli>(
                             RenderClock::now() - resource_timing_start).count();
@@ -10098,6 +10228,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 }
                             }
                             g_rtt[rdst] = std::move(resolved);    // dest inherits src content/extent/format
+                            // The one whole-entry copy into the cache: it may carry a footprint.
+                            if (g_rtt[rdst].volume_guest_bytes) g_volume_targets.note(rdst);
                             if (batched_copy_recorded) {
                                 const VkFormat resolved_format = g_rtt[rdst].format;
                                 backend_submission.add_failure_cleanup(
@@ -10543,7 +10675,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             denied.w = gw; denied.h = gh;
                             denied.volume_depth = producer_volume_depth;
                             retain_volume_guest_footprint(
-                                denied, producer_volume_guard_bytes,
+                                base, denied, producer_volume_guard_bytes,
                                 producer_volume_footprint_proven);
                             denied.format = pass_format;
                             denied.rgba.reset();
@@ -10716,7 +10848,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             denied.w = gw; denied.h = gh;
                             denied.volume_depth = volume_view.selected_mip_depth;
                             retain_volume_guest_footprint(
-                                denied, producer_volume_guard_bytes,
+                                base, denied, producer_volume_guard_bytes,
                                 producer_volume_footprint_proven);
                             denied.format = pass_format;
                             denied.rgba.reset();
@@ -10852,7 +10984,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         denied.w = gw; denied.h = gh;
                         denied.volume_depth = backend_target.volume_depth;
                         retain_volume_guest_footprint(
-                            denied, producer_volume_guard_bytes,
+                            base, denied, producer_volume_guard_bytes,
                             producer_volume_footprint_proven);
                         denied.format = pass_format;
                         denied.rgba.reset();
@@ -10875,7 +11007,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         surface.volume_depth = backend_target.volume_depth;
                         if (backend_target.volume_depth)
                             retain_volume_guest_footprint(
-                                surface, producer_volume_guard_bytes,
+                                base, surface, producer_volume_guard_bytes,
                                 producer_volume_footprint_proven);
                         surface.format = pass_format;
                         surface.guest_format = pass.empty()
