@@ -1568,6 +1568,14 @@ inline const RenderVkCtx& render_vk_ctx() {
                 "VK_EXT_metal_surface", "VK_MVK_macos_surface",
 #else
                 "VK_KHR_xlib_surface", "VK_KHR_xcb_surface", "VK_KHR_wayland_surface",
+                // SDL's offscreen video driver (SDL_VIDEODRIVER=offscreen, what every headless agent
+                // run uses) creates its surface with this extension. Without it the app cannot make a
+                // surface on THIS instance, falls back to its own device, and never adopts GPU present,
+                // so every offscreen frame takes the CPU readback path: measured 2026-09-27 on Sonic
+                // Frontiers, ~6% fewer flips than a windowed run and an extra core of memmove on the
+                // main thread, and every offscreen F8 capture described the fallback, not the shipped
+                // renderer (#3873).
+                "VK_EXT_headless_surface",
 #endif
             };
             uint32_t nie = 0; vkEnumerateInstanceExtensionProperties(nullptr, &nie, nullptr);
