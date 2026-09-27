@@ -26,6 +26,8 @@
 #include <cstdio>
 #include <cstdlib>   // setenv / _putenv_s
 #include <cstring>
+#include <atomic>
+#include <thread>
 
 using namespace prosper;
 
@@ -131,6 +133,41 @@ int main() {
     set_pace_env(nullptr);
     CHECK(prosper_vo_flip_pace_period_ns() == vblank,
           "clearing the override returns to the guest-derived period");
+
+    // ---- the pacing sleep must not hold the VideoOut handle lock (#3873) ---------------------------
+    // Both flip paths used to sleep while holding g_vo_handle_mx, so EVERY other VideoOut call in the
+    // process waited behind a sleeping flipper: The Messenger's main thread spent 85% of wall time
+    // blocked in sceVideoOutSetFlipRate. Pace at 2 fps (500 ms per flip), start a flip that must
+    // sleep, and require SetFlipRate on this thread to return while that flip is still asleep.
+    // One-sided and generous: the old behaviour blocks for the rest of the ~500 ms sleep, the fixed
+    // one returns in microseconds, and the bound is half the period, so a loaded host cannot flip
+    // the verdict in the passing direction by accident.
+    {
+        set_pace_env("2");
+        const uint64_t period = prosper_vo_flip_pace_period_ns();
+        CHECK(period == 500000000ull, "the lock arm paces at 2 fps (500 ms per flip)");
+        prosper_vo_flip_from_gpu((uint32_t)handle, -1, 1, 100);   // anchor the pacer
+        std::atomic<bool> flipped{false};
+        std::thread flipper([&] {
+            prosper_vo_flip_from_gpu((uint32_t)handle, -1, 1, 101);   // sleeps ~500 ms
+            flipped.store(true);
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));   // let it reach the sleep
+        const uint64_t t0 = steady_ns();
+        const uint64_t rc = setrate(handle, 0, 0, 0, 0, 0);
+        const uint64_t blocked = steady_ns() - t0;
+        const bool flipper_still_sleeping = !flipped.load();
+        flipper.join();
+        CHECK(rc == 0, "SetFlipRate succeeds while another thread's flip is pacing");
+        CHECK(flipper_still_sleeping, "the flip really was still asleep when SetFlipRate returned "
+                                      "(otherwise this arm measured nothing)");
+        CHECK(blocked < period / 2,
+              "SetFlipRate is not serialized behind a sleeping flipper (the pacing sleep holds no "
+              "VideoOut handle lock)");
+        printf("  [info] SetFlipRate during a paced flip took %llu ns\n",
+               (unsigned long long)blocked);
+        set_pace_env(nullptr);
+    }
 
     // ---- the measurement harnesses' opt-out ----------------------------------------------------
     // tools/screenshot and tools/boot_trace install this: their pad routes are wall-clock anchored

@@ -97,6 +97,9 @@ namespace {
             : lock_(g_vo_handle_mx),
               valid_(g_vo_handles.find((int32_t)raw_handle) != g_vo_handles.end()) {}
         bool valid() const { return valid_; }
+        // Drop the pin early, before a long wait. Anything that must still act on the handle
+        // afterwards takes a fresh guard and re-validates.
+        void release() { if (lock_.owns_lock()) lock_.unlock(); }
 
     private:
         std::unique_lock<std::mutex> lock_;
@@ -307,6 +310,11 @@ namespace {
 uint64_t vblank_period_ns();   // defined with the vblank grid below -- one origin for both (#3017)
 
 std::atomic<uint64_t> g_flip_pace_next_ns{0};
+
+// Serializes the two flip paths' PACING (SubmitFlip on a guest thread, the GPU flip on the submit
+// thread) with each other, exactly as holding g_vo_handle_mx across the sleep used to -- but without
+// blocking every OTHER VideoOut call behind a sleeping flipper. Held across flip_pace_wait() only.
+std::mutex g_flip_pace_mx;
 
 // "Nobody named a rate -- derive it from the guest's own request." Distinct from 0, which is a
 // request to run free.
@@ -918,7 +926,16 @@ HLE(g_vo_submitflip)  {
     if (buffer_index < -1 || buffer_index > 15)
         return (uint64_t)(int64_t)(int32_t)0x8029000a;  // SCE_VIDEO_OUT_ERROR_INVALID_INDEX
     const uint64_t source_flip_seq = flip_advance(buffer_index, (int64_t)a3);
-    flip_pace_wait();                              // both halves pace: see flip_pace_wait
+    // The pacing sleep runs OUTSIDE the handle guard, as sceVideoOutWaitVblank's already does: holding
+    // g_vo_handle_mx across a ~16 ms sleep serialized every other VideoOut call in the process behind
+    // the flipper. Measured on The Messenger (2026-09-27): its main thread spent 85% of wall time
+    // blocked in sceVideoOutSetFlipRate (avg 14.2 ms per call) waiting for exactly this (#3873).
+    // The handle is re-validated after the sleep, so a Close that lands during it still retires the
+    // handle before anything is presented through it.
+    handle.release();
+    { std::lock_guard<std::mutex> pace(g_flip_pace_mx); flip_pace_wait(); }
+    VideoOutHandleGuard presenting(a0);
+    if (!presenting.valid()) return kVoErrorInvalidHandle;
     gpu::present_flip(buffer_index, (int64_t)a3, source_flip_seq);
     prosper_eq_trigger_flip((int64_t)a3);   // flip completed (synchronous): fire the flip event
     return 0;
@@ -951,7 +968,11 @@ extern "C" void prosper_vo_flip_from_gpu(uint32_t handle, int32_t bufidx, uint32
                          evlog_seconds(), handle, bufidx, flip_mode,
                          (unsigned long long)flip_arg);
     const uint64_t source_flip_seq = flip_advance(bufidx, flip_arg);
-    flip_pace_wait();                      // both halves pace: see flip_pace_wait
+    // Pace outside the handle guard and re-validate after, for the reason given in g_vo_submitflip.
+    live_handle.release();
+    { std::lock_guard<std::mutex> pace(g_flip_pace_mx); flip_pace_wait(); }
+    VideoOutHandleGuard presenting(handle);
+    if (!presenting.valid()) return;
     gpu::present_flip(bufidx, flip_arg, source_flip_seq);
     // A title that composites with COMPUTE and never draws produces no graphics span, and every
     // publish decision — including the guest-scanout fallback written for exactly that case — sits
