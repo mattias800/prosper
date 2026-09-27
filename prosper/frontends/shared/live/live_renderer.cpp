@@ -4500,7 +4500,14 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                         if (cached.base == r.gpu_addr && cached.stride == r.layer_stride_bytes &&
                                             cached.width == tw && cached.height == th && cached.layers == r.depth &&
                                             cached.format == retained_depth_array_format && cached.planes == planes &&
-                                            (!cached.gpu || cached.gpu->valid.load())) {
+                                            // A GPU snapshot serves only consumers recorded into
+                                            // the batch that carries its copy (see servable_to).
+                                            // build_bds' unbatched diagnostic re-renders
+                                            // (PROSPER_TARGET_STEP_HASH_DIM, PROSPER_DUMP_DRAWSTEPS)
+                                            // currently also disable batching altogether, so this
+                                            // guards an invariant rather than a live path.
+                                            (!cached.gpu || cached.gpu->servable_to(
+                                                gpu_route ? producer_batch : nullptr))) {
                                             retained_depth_array = cached.pixels;
                                             retained_depth_array_gpu = cached.gpu;
                                             if (depth_array_census.enabled) ++depth_array_census.reuses;
@@ -4553,9 +4560,14 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                             static_cast<uint64_t>(tw) * th * r.depth * sizeof(float) *
                                             (retained_depth_array_format == VK_FORMAT_R32_SFLOAT ? 1u : 4u);
                                     }
-                                    // Same admission rule as the CPU snapshot below.
+                                    // Same admission rule as the CPU snapshot below, charging the
+                                    // snapshot's real device allocation against the byte budget.
+                                    const size_t gpu_bytes = static_cast<size_t>(
+                                        retained_depth_array_gpu->slot->bytes);
                                     if (!planes.empty() && planes == source_identity() &&
-                                        depth_array_snapshots.size() < kDepthArraySnapshotEntries) {
+                                        depth_array_snapshots.size() < kDepthArraySnapshotEntries &&
+                                        gpu_bytes <= kDepthArraySnapshotBytes - depth_array_snapshot_bytes) {
+                                        depth_array_snapshot_bytes += gpu_bytes;
                                         depth_array_snapshots.push_back({r.gpu_addr, r.layer_stride_bytes,
                                             tw, th, r.depth, retained_depth_array_format,
                                             std::move(planes), nullptr, retained_depth_array_gpu});

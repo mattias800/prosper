@@ -91,15 +91,25 @@ struct DepthArrayGpuPool {
     static constexpr VkDeviceSize kMaxFreeBytes = 256ull << 20;
 };
 inline DepthArrayGpuPool& depth_array_gpu_pool() {
-    // Deliberately leaked: the device may already be gone at static destruction.
+    // Deliberately leaked: the device may already be gone at static destruction. Free slots are
+    // matched by VkDevice handle value; that is sound only because the renderer context is created
+    // once per process -- a recreated device could reuse a stale handle value.
     static auto* pool = new DepthArrayGpuPool;
     return *pool;
 }
 
-// One GPU snapshot. `valid` drops if the batch carrying its copy fails, so no memo can serve it.
+// One GPU snapshot. Its image holds meaningful texels only for command buffers recorded later in
+// `owner`, the ordered batch that carries the copy: a consumer submitted any other way (a direct
+// backend submission, another batch) may run before that copy, and would see an UNDEFINED image or
+// a recycled slot's previous depth. `valid` drops if the owning batch fails.
 struct PersistentDsDepthArrayGpuImage {
     std::unique_ptr<DepthArrayGpuSlot> slot;
     std::atomic<bool> valid{true};
+    const BackendSubmissionBatch* owner = nullptr;
+    // The only admission test a memo may use to serve this snapshot to a later consumer.
+    bool servable_to(const BackendSubmissionBatch* consumer_batch) const {
+        return consumer_batch && consumer_batch == owner && valid.load();
+    }
     VkImage image() const { return slot ? slot->image : VK_NULL_HANDLE; }
     VkFormat format() const { return slot ? slot->format : VK_FORMAT_UNDEFINED; }
     ~PersistentDsDepthArrayGpuImage() {
@@ -245,15 +255,21 @@ inline DepthArrayGpuResult copy_persistent_ds_depth_array_gpu(
         return DepthArrayGpuResult::Unavailable;
     }
 
+    // A Fallback from here on hands the attempt to the CPU reader, which must still see any
+    // injected failure this call consumed.
+    const auto fallback = [fail_after] {
+        depth_array_readback_failure_after_layers() = fail_after;
+        return DepthArrayGpuResult::Fallback;
+    };
     auto slot = depth_array_gpu_slot(ctx, output_format, width, height, layer_count);
-    if (!slot) return DepthArrayGpuResult::Fallback;
+    if (!slot) return fallback();
     const RenderCommandPoolLease lease = acquire_render_command_pool(ctx.dev, ctx.qfi);
-    if (!lease) return DepthArrayGpuResult::Fallback;
+    if (!lease) return fallback();
     VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     if (vkBeginCommandBuffer(lease.command, &begin) != VK_SUCCESS) {
         release_render_command_pool(ctx.dev, ctx.qfi, lease);
-        return DepthArrayGpuResult::Fallback;
+        return fallback();
     }
     const VkCommandBuffer command = lease.command;
     const bool expanded = output_format != VK_FORMAT_R32_SFLOAT;
@@ -348,21 +364,25 @@ inline DepthArrayGpuResult copy_persistent_ds_depth_array_gpu(
     const VkImageMemoryBarrier to_sampled = image_barrier(slot->image, VK_IMAGE_ASPECT_COLOR_BIT,
         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
         VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, layer_count);
+    // Every stage the backend may sample from, including the optional mesh stage when the device
+    // enabled it (the bit is invalid otherwise) -- the same set render_draw_pass_rgba uses.
     vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT,
                          VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
                              VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
-                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                             (ctx.mesh_shader_enabled ? VK_PIPELINE_STAGE_MESH_SHADER_BIT_EXT : 0u),
                          0, 0, nullptr, 0, nullptr, 1, &to_sampled);
     if (vkEndCommandBuffer(command) != VK_SUCCESS) {
         // Recorded but never enqueued: nothing can reference the slot, so it may be recycled.
         release_render_command_pool(ctx.dev, ctx.qfi, lease);
-        return DepthArrayGpuResult::Fallback;
+        return fallback();
     }
 
     auto snapshot = std::make_shared<PersistentDsDepthArrayGpuImage>();
     const VkDeviceSize output_bytes = static_cast<VkDeviceSize>(width) * height * layer_count *
         (expanded ? 4u : 1u) * sizeof(float);
     snapshot->slot = std::move(slot);
+    snapshot->owner = &batch;
     batch.enqueue(command);
     batch.add_cleanup([dev = ctx.dev, qfi = ctx.qfi, lease, snapshot]() {
         release_render_command_pool(dev, qfi, lease);

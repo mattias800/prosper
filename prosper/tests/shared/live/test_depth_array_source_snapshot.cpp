@@ -222,6 +222,41 @@ int main(int argc, char** argv) {
     check(read_persistent_ds_depth_array(Base, W, H, 0, Layers, output, error) ==
               Status::Ready && exact(),
           "four retained layers preserve every Float32 bit, including values lost by half or RGBA8");
+    if (gpu_route) {
+        // GPU snapshot ownership (#3882 review). A snapshot is filled by a command buffer in ONE
+        // ordered batch: it may be served only to consumers recorded later into that same batch,
+        // and a failure of that batch after the copy was enqueued must revoke it.
+        const auto& ctx = render_vk_ctx();
+        auto copy_into = [&](BackendSubmissionBatch& batch) {
+            std::shared_ptr<PersistentDsDepthArrayGpuImage> snapshot;
+            std::string copy_error;
+            const auto result = copy_persistent_ds_depth_array_gpu(
+                Base, W, H, 0, Layers, VK_FORMAT_R32_SFLOAT, batch, snapshot, copy_error);
+            if (result != DepthArrayGpuResult::Ready)
+                std::fprintf(stderr, "gpu copy: %s\n", copy_error.c_str());
+            return result == DepthArrayGpuResult::Ready ? snapshot : nullptr;
+        };
+        BackendSubmissionBatch completed_batch, other_batch;
+        auto completed = copy_into(completed_batch);
+        check(completed && completed_batch.pending(),
+              "GPU snapshot copy is recorded into the caller's ordered batch, not submitted");
+        check(completed && completed->servable_to(&completed_batch),
+              "GPU snapshot serves a consumer in its own batch");
+        check(completed && !completed->servable_to(nullptr) &&
+                  !completed->servable_to(&other_batch),
+              "GPU snapshot refuses a direct submission or another batch that could run first");
+        const auto submitted = completed_batch.submit_and_wait(ctx.dev, ctx.queue, false);
+        check(submitted.submit_result == VK_SUCCESS && submitted.wait_result == VK_SUCCESS &&
+                  completed && completed->valid.load(),
+              "a completed owning batch leaves the snapshot valid (positive control)");
+        BackendSubmissionBatch failed_batch;
+        auto failed = copy_into(failed_batch);
+        check(failed && failed->servable_to(&failed_batch),
+              "second snapshot is servable before its batch fails");
+        failed_batch.discard();
+        check(failed && !failed->valid.load() && !failed->servable_to(&failed_batch),
+              "a batch failing AFTER the copy was enqueued revokes the snapshot");
+    }
     expected[2] = 0.6251068115234375f;
     if (!seed_layer(2, expected[2])) return 1;
     check(read_persistent_ds_depth_array(Base, W, H, 0, Layers, output, error) ==
