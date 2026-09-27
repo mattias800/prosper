@@ -22,6 +22,7 @@
 #include "host/platform/precise_sleep.hpp"   // #1765: a vblank wait whose resolution is not the Win32 tick
 #include "hle/graphics/display_mode.hpp"      // #3017: the one derived answer for "which display is this?"
 #include "diagnostics/env_numeric.hpp"  // #3379: a typo must not silently unpace the guest
+#include "diagnostics/perf/perf_alarms.hpp"  // #3891: per-flip alarm window, blocked-lock ledger
 #include <cstdlib>
 #include <cstring>
 #include <cerrno>
@@ -91,10 +92,28 @@ namespace {
     // Keep a live handle pinned until the HLE operation finishes. This makes validation and close
     // atomic with respect to each other: a concurrent Close cannot retire a handle after a caller
     // validates it but before that caller mutates flip, event, or buffer-registration state.
+    // Takes g_vo_handle_mx, timing only the CONTENDED path into the perf ledger (#3891): an
+    // uncontended try_lock costs no clock read. A thread that waits here is blocked behind another
+    // VideoOut call -- before #3879 a flipper sleeping through its pacing wait with this lock held
+    // blocked The Messenger's main thread 85% of the time, and nothing said so.
+    std::unique_lock<std::mutex> lock_video_out_handles() {
+        std::unique_lock<std::mutex> lock(g_vo_handle_mx, std::try_to_lock);
+        if (lock.owns_lock() || !prosper::diagnostics::perf::enabled()) {
+            if (!lock.owns_lock()) lock.lock();
+            return lock;
+        }
+        const uint64_t begin = prosper::diagnostics::perf::now_ns();
+        lock.lock();
+        prosper::diagnostics::perf::add_cost(prosper::diagnostics::perf::Cost::HleBlockingWait,
+                                             prosper::diagnostics::perf::now_ns() - begin, 1,
+                                             "VideoOut handle lock");
+        return lock;
+    }
+
     class VideoOutHandleGuard {
     public:
         explicit VideoOutHandleGuard(uint64_t raw_handle)
-            : lock_(g_vo_handle_mx),
+            : lock_(lock_video_out_handles()),
               valid_(g_vo_handles.find((int32_t)raw_handle) != g_vo_handles.end()) {}
         bool valid() const { return valid_; }
         // Drop the pin early, before a long wait. Anything that must still act on the handle
@@ -919,9 +938,14 @@ HLE(g_vo_set_flip_rate) {
     if (evlog() && rate != g_flip_rate)
         fprintf(stderr, "[ev] SetFlipRate rate=%d (target %d Hz)\n", (int)rate, 60 / (rate + 1));
     g_flip_rate = rate;
+    prosper::diagnostics::perf::set_guest_flip_rate(rate);   // #3891: the alarms' frame budget
     return 0;
 }
 HLE(g_vo_submitflip)  {
+    // #3891: close the alarm window BEFORE any VideoOut lock. A window close evaluates rules and
+    // writes stderr/JSONL; under g_vo_handle_mx that would block every other VideoOut call (the
+    // #3879 class) and charge the engine's own I/O to hle-blocking-wait.
+    prosper::diagnostics::perf::on_guest_flip();
     std::lock_guard<std::mutex> flip_serial(g_flip_pace_mx);   // first: see g_flip_pace_mx
     VideoOutHandleGuard handle(a0);
     if (!handle.valid()) return kVoErrorInvalidHandle;
@@ -967,6 +991,7 @@ extern "C" void prosper_vo_set_flip_publish_hook(void (*fn)(uint64_t)) {
     g_flip_publish_hook.store(fn, std::memory_order_release);
 }
 extern "C" void prosper_vo_flip_from_gpu(uint32_t handle, int32_t bufidx, uint32_t flip_mode, int64_t flip_arg) {
+    prosper::diagnostics::perf::on_guest_flip();   // #3891: before any VideoOut lock (see SubmitFlip)
     std::lock_guard<std::mutex> flip_serial(g_flip_pace_mx);   // first: see g_flip_pace_mx
     VideoOutHandleGuard live_handle(handle);
     if (!live_handle.valid()) return;

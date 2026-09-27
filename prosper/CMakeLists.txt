@@ -1800,6 +1800,13 @@ if(TARGET prosper_core)
   target_link_libraries(test_exit_reports PRIVATE prosper_core)
   add_test(NAME exit_reports COMMAND test_exit_reports)
 
+  # [perf-alarm] rules and engine (#3891). Every rule gets a window built by hand from the numbers
+  # measured before the fix it was written against (fires) and after it (quiet), plus a boundary
+  # arm; the engine arms pin window closing, per-rule log de-duplication, JSONL and the summary.
+  add_executable(test_perf_alarms tests/diagnostics/test_perf_alarms.cpp)
+  target_link_libraries(test_perf_alarms PRIVATE prosper_core)
+  add_test(NAME perf_alarms COMMAND test_perf_alarms)
+
   # Diagnostics: disabled-path test — verifies stubs are zero-cost (always runs).
   add_executable(test_diagnostics_disabled tests/diagnostics/test_diagnostics_disabled.cpp)
   target_link_libraries(test_diagnostics_disabled PRIVATE prosper_core)

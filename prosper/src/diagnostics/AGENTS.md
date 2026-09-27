@@ -137,3 +137,19 @@ as a finding. `persistent_target_census` exists because a colour-target cache wi
 key looks identical whether it evicted one or never made one, and the env-var A/B that would
 separate them cannot show its own lever moved (instrument trap 288) — so it reports residency and
 evictions directly instead, and says in one clause which of the two states it is in.
+
+`perf/` is the always-on performance-alarm layer (#3891), and it answers a different question from
+everything above: not "what happened?" but "what is this run paying for, and is that a problem?".
+`perf_ledger.hpp` is the accumulation side and is **header-only on purpose** — render_runner.h is
+compiled straight into dozens of Vulkan tests that name their own translation units, so a ledger
+that needed a `.cpp` would need a CMake edit per test. Hooks feeding it must stay coarse: relaxed
+counters per event, clock reads only around a whole readback, lock wait, present or pass group —
+never per draw (PROSPER_RENDER_TIMING's per-draw clocks cost ~9% of the render thread, which is why
+that census is opt-in and this one is not). `perf_alarm_rules.{hpp,cpp}` is a pure function from one
+window of ledger deltas to the alarms it raises; every threshold is a named constant beside the
+measurement that set it, and every rule has a hand-built positive and negative window in
+`tests/diagnostics/test_perf_alarms.cpp`. `perf_alarms.{hpp,cpp}` is the engine: windowing per guest
+flip (the frame budget is the guest's own SetFlipRate), rate-limited `[perf-alarm]` lines, JSONL and
+the exit summary. A new rule belongs here only if it can name the next instrument to reach for in its
+hint and was validated against a run where the cost really existed; a rule that fires on a healthy
+run gets tuned or removed, because an alarm people learn to ignore is worse than none.

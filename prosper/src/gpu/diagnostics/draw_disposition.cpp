@@ -2,6 +2,7 @@
 
 #include "gpu/diagnostics/diag_ratelimit.hpp"
 #include "diagnostics/exit_census.hpp"
+#include "diagnostics/perf/perf_ledger.hpp"   // #3891: dropped-draws alarm
 
 #include <atomic>
 #include <chrono>
@@ -114,6 +115,7 @@ void DrawDispositionCensus::note_dropped(DrawDrop reason) {
     auto& s = state();
     s.dropped[i].fetch_add(1, std::memory_order_relaxed);
     s.pass_dropped[i].fetch_add(1, std::memory_order_relaxed);
+    prosper::diagnostics::perf::add(prosper::diagnostics::perf::Counter::DroppedDrawsBackend);
 }
 
 uint64_t DrawDispositionCensus::pass_seen_for_scope() const {
