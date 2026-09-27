@@ -30,6 +30,7 @@
 #include "gpu/diagnostics/vk_object_names.hpp"   // #3578
 #include "gpu/capture/gpu_capture.hpp"
 #include "gpu/diagnostics/gpu_memory_budget_vk.hpp"  // #3533: how much of the heap does prosper hold?
+#include "gpu/diagnostics/memory_placement_log.hpp"  // #3888: GPU-only images prefer VRAM
 #include "gpu/execute/gpu_execute.hpp"
 #include "gpu/execute/host_read_barrier.hpp"  // #3249: a host read of a dispatch result needs an availability op
 #include "gpu/execute/float_controls_probe.hpp"  // #3479: the device gate on SignedZeroInfNanPreserve
@@ -3848,14 +3849,8 @@ struct VulkanComputeContext {
     uint32_t host_memory_type(uint32_t bits) const {
         const VkMemoryPropertyFlags wanted = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                                              VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-        const VkMemoryPropertyFlags cached = wanted | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
-        for (uint32_t i = 0; i < memory.memoryTypeCount; i++)
-            if ((bits & (1u << i)) && (memory.memoryTypes[i].propertyFlags & cached) == cached)
-                return i;
-        for (uint32_t i = 0; i < memory.memoryTypeCount; i++)
-            if ((bits & (1u << i)) && (memory.memoryTypes[i].propertyFlags & wanted) == wanted)
-                return i;
-        return UINT32_MAX;
+        return prosper::gpu::select_memory_type(memory, bits, wanted,
+                                                VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
     }
 
 };
@@ -7522,15 +7517,6 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         // exact native-width paths are selected from reflected SPIR-V. Everything not provably correct
         // skips LOUDLY. ---
         bool images_ready = !ctx.device ? false : true;
-        auto device_memory_type = [&](uint32_t bits) -> uint32_t {
-            for (uint32_t i = 0; i < ctx.memory.memoryTypeCount; i++)
-                if ((bits & (1u << i)) &&
-                    (ctx.memory.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
-                    return i;
-            for (uint32_t i = 0; i < ctx.memory.memoryTypeCount; i++)
-                if (bits & (1u << i)) return i;
-            return UINT32_MAX;
-        };
         // The SHADER-declared side of every image decision below, reported alongside the guest
         // resource whenever a binding declines. Without it a decline prints only the resource --
         // and most accept conditions here are a conjunction of the two, so the message names one
@@ -10218,7 +10204,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 VkMemoryRequirements ireq{};
                 vkGetImageMemoryRequirements(ctx.device, bi.image, &ireq);
                 bi.allocation_bytes = ireq.size;
-                const uint32_t image_memory_type = device_memory_type(ireq.memoryTypeBits);
+                const uint32_t image_memory_type = prosper::gpu::choose_gpu_only_memory_type(
+                    prosper::gpu::GpuOnlyMemoryClass::ComputeImage, ctx.memory, ireq.memoryTypeBits);
                 bi.memory = ctx.allocate_memory(ireq.size, image_memory_type);
                 if (!vk_handle_ok(bi.memory, "image-memory") ||
                     !vk_ok(vkBindImageMemory(ctx.device, bi.image, bi.memory, 0), "image-bind")) {

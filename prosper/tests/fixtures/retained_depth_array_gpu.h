@@ -130,10 +130,8 @@ inline bool depth_array_gpu_allocate(const RenderVkCtx& ctx, VkMemoryRequirement
                                      VkDeviceMemory& memory) {
     VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     allocation.allocationSize = requirements.size;
-    allocation.memoryTypeIndex = render_memory_type(ctx.phys, requirements.memoryTypeBits,
-                                                    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    if (allocation.memoryTypeIndex == UINT32_MAX)
-        allocation.memoryTypeIndex = render_memory_type(ctx.phys, requirements.memoryTypeBits, 0);
+    allocation.memoryTypeIndex = render_gpu_only_memory_type(
+        ctx.phys, prosper::gpu::GpuOnlyMemoryClass::RetainedDepthArray, requirements.memoryTypeBits);
     if (allocation.memoryTypeIndex == UINT32_MAX) return false;
     if (prosper::gpu::allocate_device_memory(ctx.dev, &allocation, &memory) != VK_SUCCESS) {
         memory = VK_NULL_HANDLE;

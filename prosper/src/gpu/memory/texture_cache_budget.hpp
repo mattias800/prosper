@@ -94,9 +94,10 @@ const char* texture_cache_budget_source_name(TextureCacheBudgetSource source);
 
 // Which heap the budget is sized from. `recorded_heap` is the heap of the memory type the first
 // retained texture image actually got (UINT32_MAX before any). It is used only when it is a
-// DEVICE-LOCAL heap; otherwise -- not recorded yet, out of range, or a host heap because the
-// renderer took the first compatible memory type and a driver listed a system-memory type first --
-// the answer is the largest device-local heap, which is what the pre-#3873 rule always used. Sizing
+// DEVICE-LOCAL heap; otherwise -- not recorded yet, out of range, or a host heap because no
+// device-local type accepted the image (memory_type_select.hpp's fallback; before #3888 the
+// renderer took the first compatible type, which a driver may put on a system heap) -- the answer
+// is the largest device-local heap, which is what the pre-#3873 rule always used. Sizing
 // from a host heap as if it were discrete VRAM would hand the cache most of system RAM, exactly the
 // starvation the unified cap exists to prevent. UINT32_MAX when no heap is device-local.
 uint32_t texture_cache_budget_heap(const uint64_t* heap_sizes, const bool* heap_device_local,

@@ -45,6 +45,11 @@ switched on for the run that mattered (#3533). `PROSPER_GPU_MEM_LOG=0` silences 
   succeed. `VK_EXT_memory_budget` is the honest upgrade; since #3873 it is enabled when advertised
   and the texture-cache budget (`src/gpu/memory/`) reads it, but this instrument still counts only
   prosper's own allocations.
+- `memory_placement_log` — `choose_gpu_only_memory_type`, the call every GPU-only renderer
+  allocation makes: gpu/memory/memory_type_select's choice plus one default-on `[mem-placement]`
+  line per allocation class naming the type and heap it got and what the pre-#3888
+  first-compatible rule would have picked. The line is observation; the choice it wraps is not.
+  `NOT DEVICE_LOCAL` there is a discrete-GPU performance problem worth an issue.
 - `geometry_probe_arming` — whether `PROSPER_GEOM_PROBE` may answer at all: does the module the
   backend is about to hand Vulkan actually declare the transform-feedback capture? It is the
   worked example of the first standing caution below. Without it the probe armed on a shader it
