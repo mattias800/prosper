@@ -528,12 +528,18 @@ inline constexpr uint32_t kBackendMaxArrayLayers = 2048u;
 // is what stands between it and the upload (#325). Mip generation is already excluded for
 // `sample_count > 1`, which is what stops a generated chain bleeding across layer boundaries.
 inline bool backend_texture_array_span_valid(const FrameResource& resource) {
+    // A borrowed GPU image has no CPU span to overrun: its owner created it with exactly
+    // tw x th x sample_count layers (the retained depth-array snapshot,
+    // tests/fixtures/retained_depth_array_gpu.h) and keeps it alive through the lease.
+    const bool borrowed_array = !resource.tex_rgba && resource.borrowed_compute_image &&
+        resource.borrowed_compute_image_lease && !resource.borrowed_compute_vertical_stack_layers;
     if (resource.img_dim != 5u || resource.td != 1u || resource.is_storage_image ||
-        !resource.tex_rgba || !resource.tw || !resource.th || resource.sample_count < 2u ||
-        resource.sample_count > kBackendMaxArrayLayers)
+        (!resource.tex_rgba && !borrowed_array) || !resource.tw || !resource.th ||
+        resource.sample_count < 2u || resource.sample_count > kBackendMaxArrayLayers)
         return false;
     const uint32_t bpp = backend_color_bytes_per_pixel(resource.texture_format);
     if (!bpp) return false;
+    if (borrowed_array) return true;
     const size_t row_bytes = static_cast<size_t>(resource.tw) * bpp;
     if (row_bytes / bpp != resource.tw) return false;
     if (resource.th > SIZE_MAX / row_bytes) return false;
@@ -6782,20 +6788,19 @@ inline int& depth_array_readback_failure_after_layers() {
     return count;
 }
 
-// Gather a complete Float32 depth array without publishing a partial replacement. This bridge
-// deliberately declines incomplete retained identities; it does not yet combine retained layers
-// with guest-backed layers. A cache placeholder or guest-invalidated entry is not itself proof of
-// renderer authority. NoIdentity permits ordinary decoding when no retained identity is involved.
-// The caller must not already hold BackendPersistentResourceGuard (its mutex is not recursive).
-// Pass the ordered producer batch if it contains unsubmitted writes to these retained images.
-inline PersistentDsDepthArrayStatus read_persistent_ds_depth_array(
+// Selection half of the retained depth-array bridge, shared by the CPU snapshot below and the
+// GPU-resident copy (tests/fixtures/retained_depth_array_gpu.h) so the two can never disagree about
+// which retained images a binding names or when it must be refused. The caller holds
+// BackendPersistentResourceGuard. `flush_producer` completes a pending producer batch first: the CPU
+// snapshot reads mapped memory after a fence and needs it, while a GPU copy recorded into the same
+// ordered batch is already queue-ordered after that producer and must not wait.
+inline PersistentDsDepthArrayStatus select_persistent_ds_depth_array(
         uint64_t base, uint32_t width, uint32_t height, uint32_t first_layer,
-        uint32_t layer_count, std::vector<float>& output, std::string& error,
-        BackendSubmissionBatch* producer_batch = nullptr) {
-    const BackendPersistentResourceGuard guard;
+        uint32_t layer_count, std::vector<PersistentDsImage*>& selected, uint32_t& format,
+        std::string& error, BackendSubmissionBatch* producer_batch, bool flush_producer) {
     error.clear();
-    int fail_after = depth_array_readback_failure_after_layers();
-    depth_array_readback_failure_after_layers() = -1;
+    selected.clear();
+    format = VK_FORMAT_UNDEFINED;
     auto unavailable = [&](const char* reason) {
         error = reason;
         return PersistentDsDepthArrayStatus::Unavailable;
@@ -6823,15 +6828,14 @@ inline PersistentDsDepthArrayStatus read_persistent_ds_depth_array(
         return unavailable("retained depth array exceeds snapshot byte limit");
     if (backend_has_unproven_submission())
         return unavailable("Vulkan submission completion is unproven");
-    if (producer_batch) {
+    if (producer_batch && flush_producer) {
         const auto submitted = producer_batch->submit_and_wait(ctx.dev, ctx.queue, false);
         if (submitted.submit_result != VK_SUCCESS || submitted.wait_result != VK_SUCCESS)
             return unavailable("retained depth array producer did not complete");
     }
 
-    std::vector<PersistentDsImage*> selected(layer_count, nullptr);
+    selected.assign(layer_count, nullptr);
     std::vector<bool> ambiguous(layer_count, false);
-    uint32_t format = VK_FORMAT_UNDEFINED;
     for (auto& [key, image] : persistent_ds_cache()) {
         if ((key.dr != base && key.dw != base) || key.w != width || key.h != height ||
             key.slice < first_layer || key.slice - first_layer >= layer_count)
@@ -6860,6 +6864,32 @@ inline PersistentDsDepthArrayStatus read_persistent_ds_depth_array(
     for (const auto* image : selected)
         if (!image || !image->image || !image->layout_initialized || !image->depth_valid)
             return unavailable("retained depth array has missing or invalid layers");
+    return PersistentDsDepthArrayStatus::Ready;
+}
+
+// Gather a complete Float32 depth array without publishing a partial replacement. This bridge
+// deliberately declines incomplete retained identities; it does not yet combine retained layers
+// with guest-backed layers. A cache placeholder or guest-invalidated entry is not itself proof of
+// renderer authority. NoIdentity permits ordinary decoding when no retained identity is involved.
+// The caller must not already hold BackendPersistentResourceGuard (its mutex is not recursive).
+// Pass the ordered producer batch if it contains unsubmitted writes to these retained images.
+inline PersistentDsDepthArrayStatus read_persistent_ds_depth_array(
+        uint64_t base, uint32_t width, uint32_t height, uint32_t first_layer,
+        uint32_t layer_count, std::vector<float>& output, std::string& error,
+        BackendSubmissionBatch* producer_batch = nullptr) {
+    const BackendPersistentResourceGuard guard;
+    int fail_after = depth_array_readback_failure_after_layers();
+    depth_array_readback_failure_after_layers() = -1;
+    std::vector<PersistentDsImage*> selected;
+    uint32_t format = VK_FORMAT_UNDEFINED;
+    const PersistentDsDepthArrayStatus selection = select_persistent_ds_depth_array(
+        base, width, height, first_layer, layer_count, selected, format, error, producer_batch,
+        /*flush_producer=*/true);
+    if (selection != PersistentDsDepthArrayStatus::Ready) return selection;
+    auto unavailable = [&](const char* reason) {
+        error = reason;
+        return PersistentDsDepthArrayStatus::Unavailable;
+    };
 
     const size_t layer_values = static_cast<size_t>(width) * height;
     std::vector<float> snapshot(layer_values * layer_count);

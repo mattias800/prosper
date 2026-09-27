@@ -3476,6 +3476,15 @@ endif()
         COMMAND test_depth_array_source_snapshot --expanded-control)
       add_test(NAME depth_array_source_snapshot_expanded_per_draw_control
         COMMAND test_depth_array_source_snapshot --expanded-control --per-draw-control)
+      # The same checks through the GPU-resident retained-array copy (#3873): identical sampled
+      # pixels, zero CPU upload, and GPU-copied bytes matching the compact/expanded representation.
+      add_test(NAME depth_array_source_snapshot_gpu COMMAND test_depth_array_source_snapshot --gpu)
+      add_test(NAME depth_array_source_snapshot_gpu_per_draw_control
+        COMMAND test_depth_array_source_snapshot --gpu --per-draw-control)
+      add_test(NAME depth_array_source_snapshot_gpu_expanded_control
+        COMMAND test_depth_array_source_snapshot --gpu --expanded-control)
+      add_test(NAME depth_array_source_snapshot_gpu_expanded_per_draw_control
+        COMMAND test_depth_array_source_snapshot --gpu --expanded-control --per-draw-control)
       add_test(NAME backend_texture_path_census_budget
         COMMAND test_depth_array_source_snapshot --texture-path-census-budget)
       # Windows environment APIs erase a variable assigned the empty string, so this distinct
