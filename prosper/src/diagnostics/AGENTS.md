@@ -153,3 +153,26 @@ flip (the frame budget is the guest's own SetFlipRate), rate-limited `[perf-alar
 the exit summary. A new rule belongs here only if it can name the next instrument to reach for in its
 hint and was validated against a run where the cost really existed; a rule that fires on a healthy
 run gets tuned or removed, because an alarm people learn to ignore is worse than none.
+
+**Reading the alarms** — do this first on any run you did not expect to be slow or wrong. Every run
+log carries them without a flag: `[perf-alarm] #<ordinal> rule=<name> ... value=<v> <unit>
+threshold=<t> <detail> hint=<next instrument>`, rate-limited per rule (the ordinal, not the line
+count, says how many windows fired), then `[perf-alarm] summary` lines at exit: windows fired, the
+worst window, and for a correctness rule the per-reason breakdown summed over the run. A summary's
+`NO DATA` list names rules that could not have fired, which is not the same as quiet. A run killed
+with SIGTERM skips the summary, so `PROSPER_PERF_ALARM_LOG=<path>` (JSONL: every firing plus every
+window's raw quantities, flushed as written) is the record to keep for anything scripted. Under
+`prosper-app --fps` the HUD adds one `! alarm: <rules>` line while a rule is active in the latest
+window.
+
+**Correctness rules carry the SITE, not just a count.** `dropped-draws` names the drop site per
+window (`reasons=render-array-reject/depth-unavailable:276`) from `perf::DropReason`: one code per
+`built.reject(...)` site in the live renderer's resource builder, `contract-mismatch`, and
+`backend/*` mirroring `gpu::DrawDrop` (`draw_disposition.cpp` static_asserts the mirror).
+`skipped-dispatches` does the same with `perf::DispatchSkip`. A new drop site must pass a reason;
+one that sets `complete = false` directly shows up as `unattributed`, which is the instrument naming
+its own blind spot, not a finding about the title. Re-realizations that are not live execution (an
+F9 capture) wrap themselves in `SuppressDispatchSkipCounting` so that capturing a frame cannot raise
+the alarm being investigated. `host-copy-pressure` reads the `transfer_pressure` census's totals at
+window close rather than adding hooks of its own — reuse an existing always-on counter that way
+before adding a parallel one.

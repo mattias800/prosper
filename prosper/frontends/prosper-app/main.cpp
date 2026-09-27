@@ -19,6 +19,7 @@
 #include "gpu/execute/gpu_execute.hpp"         // shared_vulkan_context / gpu-present activation (#1270)
 #include "gpu/capture/gpu_capture.hpp"         // request_interactive_gpu_capture (F9 frame grab)
 #include "gpu/diagnostics/gpu_memory_budget_vk.hpp"  // #3533: count what we hold on each heap
+#include "diagnostics/perf/perf_alarms.hpp"  // #3891: --fps alarm marker
 #include "diagnostics/perf/perf_ledger.hpp"  // #3891: present-cpu-overhead alarm
 #include "gpu/timeline/gpu_timeline.hpp"        // request_interactive_capture_bundle (F9 whole-frame grab)
 #include "capture_schedule.hpp"        // exact host-frame screenshot calibration trigger
@@ -3223,6 +3224,13 @@ int main(int argc, char** argv) {
                     gpuPresentedW ? gpuPresentedW : gpu::present_frame_width(),
                     gpuPresentedH ? gpuPresentedH : gpu::present_frame_height(),
                     now);
+                // #3891: mark an active [perf-alarm] rule, so a slow or wrong-looking frame on
+                // screen points at the log line that explains it.
+                char alarms[160];
+                const size_t active =
+                    prosper::diagnostics::perf::active_alarm_summary(alarms, sizeof alarms);
+                const std::string alarm_line = prosper::frontend::fps_alarm_line(active, alarms);
+                if (!alarm_line.empty()) fpsLines.push_back(alarm_line);
             }
         }
         // Only a HUD that has something to say is passed down; an empty list leaves both present

@@ -78,4 +78,14 @@ inline std::vector<std::string> fps_hud_lines(const prosper::gpu::FrameRate& rat
     return lines;
 }
 
+// The alarm marker (#3891 phase 4): one short line when any `[perf-alarm]` rule was reported in
+// the most recently closed alarm window, naming the rules, e.g. "! alarm: dropped-draws". Empty when
+// none is active, so a healthy run's HUD is unchanged. Deliberately terse -- the HUD is for noticing,
+// the log line carries the numbers and the next instrument -- and it is the LAST line, so it never
+// displaces the headline rate a reader takes first.
+inline std::string fps_alarm_line(size_t active_rules, const char* rule_names) {
+    if (!active_rules || !rule_names || !*rule_names) return {};
+    return std::string("! alarm: ") + rule_names;
+}
+
 } // namespace prosper::frontend
