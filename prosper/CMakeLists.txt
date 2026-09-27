@@ -3857,6 +3857,18 @@ endif()
           --unset=PROSPER_BACKEND_TEXTURE_CACHE_MB
           PROSPER_RENDER_TIMING=1
           $<TARGET_FILE:test_texture_sample_render> --cache-pressure)
+      # #3873: a full resident-texture cache admits a new image while an ordered batch is pending,
+      # retiring the idle victim through the batch completion. The opt-out arm pins the old skip.
+      add_test(NAME backend_texture_deferred_eviction COMMAND ${CMAKE_COMMAND} -E env
+          --unset=PROSPER_BACKEND_TEXTURE_CACHE_MB
+          --unset=PROSPER_BACKEND_TEXTURE_PRESSURE_FLUSH
+          --unset=PROSPER_NO_DEFERRED_TEXTURE_EVICTION
+          $<TARGET_FILE:test_texture_sample_render> --deferred-eviction)
+      add_test(NAME backend_texture_deferred_eviction_optout COMMAND ${CMAKE_COMMAND} -E env
+          --unset=PROSPER_BACKEND_TEXTURE_CACHE_MB
+          --unset=PROSPER_BACKEND_TEXTURE_PRESSURE_FLUSH
+          PROSPER_NO_DEFERRED_TEXTURE_EVICTION=1
+          $<TARGET_FILE:test_texture_sample_render> --deferred-eviction)
 
       # Multi-draw backend: N draws composited into ONE cleared-once framebuffer (red opaque + green
       # additive -> yellow center proves accumulation into a single target).

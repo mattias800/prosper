@@ -702,6 +702,10 @@ struct BackendTextureUploadStats {
     size_t persistent_hits = 0;
     size_t persistent_misses = 0;
     uint64_t persistent_cached_bytes = 0;
+    // #3873: resident images evicted while earlier commands of the same ordered batch were still
+    // pending. Their Vulkan objects are destroyed by the batch's completion cleanup, not here.
+    size_t persistent_deferred_evictions = 0;
+    uint64_t persistent_deferred_eviction_bytes = 0;
 };
 
 // thread_local like every other per-call stats storage in this file (#2953). It was the one
@@ -3037,6 +3041,25 @@ inline VkDeviceSize persistent_texture_cache_limit() {
     if (have_env) return env_limit;
     const VkDeviceSize device_budget = persistent_texture_cache_device_budget();
     return device_budget ? device_budget : 1024ull * 1024ull * 1024ull;
+}
+
+// #3873: completion-gated eviction of the persistent texture-image cache while an ordered batch is
+// pending. Before this, eviction was skipped outright whenever an earlier command buffer of the
+// batch had not completed -- and in the live renderer's batched mode one nearly always has. Once
+// the budget filled (during a load, typically), nothing could ever leave the cache again: every
+// texture that was not already resident was uploaded into a fresh image + VkDeviceMemory + staging
+// block on EVERY frame, and freed at completion. Outer Wilds measured ~390 image allocations/s
+// that way, with a cache full of textures no longer drawn.
+//
+// The policy that replaces it: a victim must not have been used by ANY pass of the pending batch
+// (so nothing recorded so far references it), and its image, memory, views and samplers are still
+// handed to the batch's completion cleanup rather than destroyed immediately. The first half keeps
+// a working set that exceeds the budget from thrashing within one batch; the second half is
+// defence in depth for the lifetime rule. PROSPER_NO_DEFERRED_TEXTURE_EVICTION=1 restores the old
+// skip-while-pending behaviour for A/B. CONFIDENCE: HIGH (lifetime is the existing batch cleanup).
+inline bool persistent_texture_deferred_eviction_enabled() {
+    static const bool enabled = getenv("PROSPER_NO_DEFERRED_TEXTURE_EVICTION") == nullptr;
+    return enabled;
 }
 
 // Max number of distinct render targets kept GPU-resident (sampleable) at once. A target that would
@@ -8810,6 +8833,10 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     static uint64_t persistent_texture_generation = 0;
     constexpr size_t persistent_texture_max_entries = 1024;
     const uint64_t texture_generation = ++persistent_texture_generation;
+    // First generation recorded into the current ordered batch (#3873). Every resident image with
+    // last_use >= this floor may be referenced by a command buffer that has not completed yet.
+    static uint64_t persistent_texture_batch_floor = 0;
+    if (!active_submission.pending()) persistent_texture_batch_floor = texture_generation;
     const bool persistent_textures_enabled =
         getenv("PROSPER_NO_BACKEND_PERSISTENT_TEXTURES") == nullptr;
     const VkDeviceSize persistent_texture_limit = persistent_texture_cache_limit();
@@ -8883,6 +8910,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             if (pressure_batch_result.submit_result != VK_SUCCESS ||
                 pressure_batch_result.wait_result != VK_SUCCESS) return out;
             avoid_cache_eviction = false;
+            persistent_texture_batch_floor = texture_generation;
             static std::atomic<uint64_t> pressure_flushes{0};
             const uint64_t count = pressure_flushes.fetch_add(1) + 1;
             if (count <= 16 || std::has_single_bit(count))
@@ -13432,21 +13460,48 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     // Publish newly uploaded exact-version textures before a later command buffer in the same batch
     // is recorded. The image upload and every consumer remain ordered in the eventual queue submit.
     // Do not evict while an earlier command buffer is pending: it may still reference the candidate.
+    // #3873: with earlier commands of this batch still pending, evict only images no pass of the
+    // batch has used, and retire them through the batch's completion cleanup.
+    const bool defer_texture_eviction = avoid_cache_eviction &&
+        persistent_texture_deferred_eviction_enabled() && active_submission.pending() &&
+        !backend_has_unproven_submission();
+    const bool texture_eviction_allowed = !avoid_cache_eviction || defer_texture_eviction;
     auto evict_persistent_texture = [&]() {
+        const uint64_t protected_from = defer_texture_eviction
+            ? persistent_texture_batch_floor : texture_generation;
         auto victim = persistent_texture_images.end();
         for (auto it = persistent_texture_images.begin();
              it != persistent_texture_images.end(); ++it) {
-            if (it->second.last_use == texture_generation) continue;
+            if (it->second.last_use >= protected_from) continue;
             if (victim == persistent_texture_images.end() ||
                 it->second.last_use < victim->second.last_use) victim = it;
         }
         if (victim == persistent_texture_images.end()) return false;
-        for (const auto& [key, binding] : victim->second.bindings) {
-            if (binding.sampler) vkDestroySampler(dev, binding.sampler, nullptr);
-            if (binding.view) vkDestroyImageView(dev, binding.view, nullptr);
+        if (defer_texture_eviction) {
+            std::vector<std::pair<VkImageView, VkSampler>> retired_bindings;
+            retired_bindings.reserve(victim->second.bindings.size());
+            for (const auto& [key, binding] : victim->second.bindings)
+                retired_bindings.emplace_back(binding.view, binding.sampler);
+            active_submission.add_cleanup(
+                [dev, image = victim->second.image, memory = victim->second.memory,
+                 retired_bindings = std::move(retired_bindings)]() {
+                    for (const auto& [view, sampler] : retired_bindings) {
+                        if (sampler) vkDestroySampler(dev, sampler, nullptr);
+                        if (view) vkDestroyImageView(dev, view, nullptr);
+                    }
+                    vkDestroyImage(dev, image, nullptr);
+                    prosper::gpu::free_device_memory(dev, memory);
+                });
+            ++texture_stats.persistent_deferred_evictions;
+            texture_stats.persistent_deferred_eviction_bytes += victim->second.bytes;
+        } else {
+            for (const auto& [key, binding] : victim->second.bindings) {
+                if (binding.sampler) vkDestroySampler(dev, binding.sampler, nullptr);
+                if (binding.view) vkDestroyImageView(dev, binding.view, nullptr);
+            }
+            vkDestroyImage(dev, victim->second.image, nullptr);
+            prosper::gpu::free_device_memory(dev, victim->second.memory);
         }
-        vkDestroyImage(dev, victim->second.image, nullptr);
-        prosper::gpu::free_device_memory(dev, victim->second.memory);
         persistent_texture_bytes -= victim->second.bytes;
         persistent_texture_binding_entries -= victim->second.bindings.size();
         persistent_texture_images.erase(victim);
@@ -13461,7 +13516,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                        upload.key.depth, upload.key.img_dim,
                                        upload.key.sample_count, upload.key.mip_levels,
                                        upload.key.format};
-        while (!avoid_cache_eviction &&
+        while (texture_eviction_allowed &&
                (persistent_texture_images.size() >= persistent_texture_max_entries ||
                 (upload.image_bytes <= persistent_texture_limit &&
                  persistent_texture_bytes > persistent_texture_limit - upload.image_bytes)) &&
@@ -13492,7 +13547,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 persistent_texture_bytes > persistent_texture_limit - upload.image_bytes);
         }
     }
-    if (!avoid_cache_eviction)
+    if (texture_eviction_allowed)
         while (persistent_texture_bytes > persistent_texture_limit &&
                evict_persistent_texture()) {}
     texture_path_census.cache_after(persistent_texture_images.size(),

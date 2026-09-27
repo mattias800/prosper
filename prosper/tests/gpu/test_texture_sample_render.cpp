@@ -70,7 +70,9 @@ template<class Action> static std::string capture_stderr(Action action) {
 int main(int argc, char** argv) {
     const bool pressure_fixture = argc == 2 &&
         std::strcmp(argv[1], "--cache-pressure") == 0;
-    if (argc != 1 && !pressure_fixture) return 2;
+    const bool deferred_eviction_fixture = argc == 2 &&
+        std::strcmp(argv[1], "--deferred-eviction") == 0;
+    if (argc != 1 && !pressure_fixture && !deferred_eviction_fixture) return 2;
     printf("== test_texture_sample_render ==\n");
     {
         prosper::test::BackendDraw a, b;
@@ -88,7 +90,8 @@ int main(int argc, char** argv) {
                   std::span<const prosper::test::BackendDraw>(&a, 1)) == 0,
               "direct and replay draws have no live submit provenance");
     }
-    if (!pressure_fixture && std::getenv("PROSPER_BACKEND_TEXTURE_CACHE_MB")) {
+    if (!pressure_fixture && !deferred_eviction_fixture &&
+        std::getenv("PROSPER_BACKEND_TEXTURE_CACHE_MB")) {
         std::fprintf(stderr, "texture sample test requires PROSPER_BACKEND_TEXTURE_CACHE_MB absent\n");
         return 2;
     }
@@ -330,6 +333,125 @@ int main(int argc, char** argv) {
                   shared_final_target && shared_final_target->completed_producer.known() &&
                   shared_final_target->completed_producer.source_submit == 18,
               "same-target B keeps green pixels and its completed producer");
+        return fails ? 1 : 0;
+    }
+    if (deferred_eviction_fixture) {
+        // #3873. A full resident-texture cache and a pending ordered batch whose earlier pass did
+        // NOT use the resident image. The old policy skipped eviction outright while anything was
+        // pending, so B could never be admitted and was uploaded afresh on every later call --
+        // the per-frame image/memory/staging churn measured on Outer Wilds. The opt-out arm
+        // (PROSPER_NO_DEFERRED_TEXTURE_EVICTION=1) reproduces that behaviour in this binary. The
+        // complementary arm -- a resident image that an earlier pass of the SAME batch uses is
+        // never evicted -- is backend_texture_pressure_control, which this change leaves as it was.
+        const bool expect_deferred =
+            std::getenv("PROSPER_NO_DEFERRED_TEXTURE_EVICTION") == nullptr;
+        CHECK(!std::getenv("PROSPER_BACKEND_TEXTURE_CACHE_MB") &&
+                  !std::getenv("PROSPER_BACKEND_TEXTURE_PRESSURE_FLUSH"),
+              "deferred-eviction fixture owns the budget and runs without the pressure flush");
+        constexpr uint32_t TW = 768, TH = 512;
+        const auto& vk = prosper::test::render_vk_ctx();
+        CHECK(vk.ok, "deferred-eviction fixture has a Vulkan device");
+        if (!vk.ok) return 1;
+        VkImageCreateInfo image_info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        image_info.imageType = VK_IMAGE_TYPE_2D;
+        image_info.format = VK_FORMAT_R8G8B8A8_UNORM;
+        image_info.extent = {TW, TH, 1};
+        image_info.mipLevels = 1;
+        image_info.arrayLayers = 1;
+        image_info.samples = VK_SAMPLE_COUNT_1_BIT;
+        image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+        image_info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        VkImage budget_image = VK_NULL_HANDLE;
+        CHECK(vkCreateImage(vk.dev, &image_info, nullptr, &budget_image) == VK_SUCCESS &&
+                  budget_image, "fixture can query the actual sampled-image allocation");
+        if (!budget_image) return 1;
+        VkMemoryRequirements image_requirements{};
+        vkGetImageMemoryRequirements(vk.dev, budget_image, &image_requirements);
+        vkDestroyImage(vk.dev, budget_image, nullptr);
+        // Room for exactly one resident image of this shape.
+        prosper::test::persistent_texture_cache_device_budget() = image_requirements.size;
+        std::vector<uint8_t> red(size_t(TW) * TH * 4, 0), green(red.size(), 0),
+            blue(red.size(), 0);
+        for (size_t i = 0; i < red.size(); i += 4) {
+            red[i] = 255; green[i + 1] = 255; blue[i + 2] = 255;
+            red[i + 3] = green[i + 3] = blue[i + 3] = 255;
+        }
+        auto words = std::vector<uint32_t>(ps_template, ps_template + std::size(ps_template));
+        const auto frag = recompile_fragment(words.data(), words.size(), &rt);
+        CHECK(!frag.empty(), "deferred-eviction fixture fragment shader compiles");
+        prosper::test::FrameResource a;
+        a.binding = 4; a.set = 1; a.tw = TW; a.th = TH;
+        a.tex_rgba = red.data(); a.tex_byte_size = red.size();
+        a.persistent_texture_id = 0x7020000000000301ULL;
+        a.persistent_texture_version = 1;
+        auto b = a;
+        b.tex_rgba = green.data();
+        b.persistent_texture_id++;
+        auto c = a;                      // callback-local: never enters the resident cache
+        c.tex_rgba = blue.data();
+        c.persistent_texture_id = 0;
+        c.persistent_texture_version = 0;
+        auto make_draw = [&](const prosper::test::FrameResource& resource, uint64_t submit) {
+            prosper::test::BackendDraw draw;
+            draw.vs = vert; draw.fs = frag; draw.vcount = 3;
+            draw.source_submit = submit;
+            draw.R = {resource};
+            return draw;
+        };
+        const auto draw_a = make_draw(a, 31), draw_b = make_draw(b, 32), draw_c = make_draw(c, 33);
+        const size_t center = (size_t(H / 2) * W + W / 2) * 4;
+        const auto warm = prosper::test::render_draws_rgba({draw_a}, W, H);
+        const auto warm_stats = prosper::test::backend_texture_upload_stats();
+        CHECK(warm.size() == size_t(W) * H * 4 && warm[center] == 255 &&
+                  warm_stats.persistent_misses == 1 &&
+                  warm_stats.persistent_cached_bytes == image_requirements.size,
+              "A is rendered and fills the one-image resident budget");
+
+        prosper::test::BackendSubmissionBatch batch;
+        constexpr uint64_t target_id = 0x7020000000000401ULL;
+        prosper::test::BackendColorTarget target_c{target_id, false, false};
+        prosper::test::BackendColorTarget target_b{target_id + 1, false, true};
+        const auto pending_c = prosper::test::render_draws_rgba(
+            {draw_c}, W, H, nullptr, nullptr, false, &target_c,
+            nullptr, nullptr, nullptr, &batch, false);
+        CHECK(pending_c.empty() && batch.pending(),
+              "an earlier batched pass is pending and never touched resident A");
+        const auto batched_b = prosper::test::render_draws_rgba(
+            {draw_b}, W, H, nullptr, nullptr, false, &target_b,
+            nullptr, nullptr, nullptr, &batch, true);
+        const auto batched_stats = prosper::test::backend_texture_upload_stats();
+        CHECK(!batch.pending() && batched_b.size() == size_t(W) * H * 4 &&
+                  batched_b[center] == 0 && batched_b[center + 1] == 255,
+              "batched B samples green");
+        CHECK(batched_stats.persistent_misses == 1 && batched_stats.unique_uploads == 1,
+              "B is a genuine first upload inside the pending batch");
+        CHECK((batched_stats.persistent_deferred_evictions == 1 &&
+               batched_stats.persistent_deferred_eviction_bytes == image_requirements.size) ==
+                  expect_deferred &&
+                  (batched_stats.persistent_deferred_evictions == 0) != expect_deferred,
+              "idle A is evicted through the batch completion only when deferral is enabled");
+
+        const auto again_b = prosper::test::render_draws_rgba({draw_b}, W, H);
+        const auto again_stats = prosper::test::backend_texture_upload_stats();
+        CHECK(again_b.size() == size_t(W) * H * 4 && again_b[center] == 0 &&
+                  again_b[center + 1] == 255, "B stays green after the batch completed");
+        CHECK((again_stats.persistent_hits == 1 && again_stats.unique_uploads == 0) ==
+                  expect_deferred &&
+                  (again_stats.persistent_misses == 1 && again_stats.unique_uploads == 1) !=
+                  expect_deferred,
+              "B was admitted by the deferred eviction; the opt-out repeats its upload");
+
+        // Both arms have retired A by now: the deferred arm inside the batch, the opt-out arm on
+        // the synchronous call above, which admitted B the old way. A must render red again from
+        // a fresh image, and the resident budget must never be exceeded.
+        const auto again_a = prosper::test::render_draws_rgba({draw_a}, W, H);
+        const auto a_stats = prosper::test::backend_texture_upload_stats();
+        CHECK(again_a.size() == size_t(W) * H * 4 && again_a[center] == 255 &&
+                  again_a[center + 1] == 0,
+              "A renders red after its image was retired and re-created");
+        CHECK(a_stats.persistent_misses == 1 && a_stats.unique_uploads == 1 &&
+                  a_stats.persistent_cached_bytes <= image_requirements.size,
+              "the resident set never exceeds the one-image budget");
         return fails ? 1 : 0;
     }
     prosper::test::TexDesc td{ /*binding*/4, /*w*/2, /*h*/2, texels };
