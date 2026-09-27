@@ -7,6 +7,7 @@
 #include "gpu/resources/fold_control_plan.hpp"
 #include "gpu/capture/fold_capture.hpp"
 #include "gpu/execute/gpu_execute.hpp"
+#include "gpu/execute/compute_program_facts.hpp"
 #include "diagnostics/env_submit.hpp"
 #include "gpu/diagnostics/watch_list.hpp"   // strict 0x-only watch parsing (shared with the RTT watch)
 #include "gpu/diagnostics/diag_ratelimit.hpp"   // first-N-then-powers-of-two report throttling
@@ -8192,18 +8193,26 @@ std::vector<ComputeItem> realize_compute_dispatches(
         const RecompileDiagnosticContext recompile_diagnostic{
             RecompileDiagnosticStage::Compute, code_addr};
         {
-            std::vector<Rdna2Inst> decoded;
-            rdna2_walk(reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)),
-                       shader_dwords, decoded);
+            // Decode, the native-multiwave probe and the GDS scan depend only on the program's
+            // bytes; compute_program_facts memoizes them per exact program (see its header).
+            const std::shared_ptr<const ComputeProgramFacts> facts = compute_program_facts(
+                reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)),
+                shader_dwords, recompile_diagnostic);
             // Keep dispatch-scoped resource discovery and translation on the same specialized
             // instruction stream. A proven-null BVH can collapse only the exact no-hit exit and a
             // fully matched empty-stack traversal cycle; shader-byte constant folding may then
             // remove any remaining unreachable arm.
             // Drop only instruction-scoped resources whose consumers disappeared. Direct resources
             // (fetch_pc == UINT32_MAX) remain available to every surviving use of their SGPR/SRT key.
-            std::vector<Rdna2Inst> resource_paths = decoded;
-            const ComputeResourcePathSpecializationReport path_report =
-                specialize_compute_resource_paths(resource_paths, *table, compute_wave_size);
+            // Without a proven-null BVH or zero-record resource neither specializer can change the
+            // stream or the table, so the scratch copy is skipped.
+            ComputeResourcePathSpecializationReport path_report;
+            if (!compute_program_facts_cache_enabled() ||
+                compute_resource_paths_may_specialize(*table, compute_wave_size)) {
+                std::vector<Rdna2Inst> resource_paths = facts->decoded;
+                path_report =
+                    specialize_compute_resource_paths(resource_paths, *table, compute_wave_size);
+            }
             if (std::getenv("PROSPER_DBG") &&
                 (path_report.proven_null_exits || path_report.zero_record_execz_exits)) {
                 std::fprintf(stderr,
@@ -8219,13 +8228,8 @@ std::vector<ComputeItem> realize_compute_dispatches(
                                  path_report.removed_pcs[index]);
                 std::fprintf(stderr, "\n");
             }
-            native_multiwave_wave_work = compute_shader_prefers_native_multiwave(
-                decoded, reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)),
-                shader_dwords, recompile_diagnostic);
-            const bool uses_gds = std::any_of(decoded.begin(), decoded.end(), [](const auto& in) {
-                return in.fmt == Rdna2Format::DS && in.ds_gds &&
-                       (in.opcode == 0x0d || in.opcode == 0x3d || in.opcode == 0x3e);
-            });
+            native_multiwave_wave_work = facts->prefers_native_multiwave;
+            const bool uses_gds = facts->uses_gds;
             // A bounded dispatcher needs the internal GDS buffer as its witness destination even when
             // the guest program never touches GDS — see kComputeTripWitnessDword.
             //

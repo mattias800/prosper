@@ -43,6 +43,18 @@ void record_recompile_reject_reason_for_test(const RecompileDiagnosticContext& d
     log_recompile_diagnostic(diagnostic, tag, role, "%s", payload);
 }
 
+TerminalRejectCapture::TerminalRejectCapture() : previous_(g_terminal_reject_capture) {
+    g_terminal_reject_capture = &records_;
+}
+
+TerminalRejectCapture::~TerminalRejectCapture() { g_terminal_reject_capture = previous_; }
+
+void replay_terminal_reject_reasons(
+        uint64_t program_address, const std::vector<std::pair<std::string, std::string>>& records) {
+    for (const auto& [tag, payload] : records)
+        record_terminal_reject_reason(program_address, tag.c_str(), payload.c_str());
+}
+
 std::string last_terminal_reject_reason(uint64_t program_address) {
     std::lock_guard lock(terminal_reject_mutex());
     const auto& reasons = terminal_reject_reasons();
