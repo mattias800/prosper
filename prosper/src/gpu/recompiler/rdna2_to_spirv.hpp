@@ -13,6 +13,7 @@
 #pragma once
 #include <array>
 #include <string>
+#include <utility>
 #include <cstdint>
 #include <cstddef>
 #include <vector>
@@ -224,6 +225,25 @@ void log_compute_recompile_skip_diagnostic(const RecompileDiagnosticContext& dia
 // PROSPER_DBG is unusable on a routed run, which is why every skip has historically printed a bare
 // address that nobody could act on.
 std::string last_terminal_reject_reason(uint64_t program_address);
+
+// Records every terminal reject reason this thread records while the object is alive, in order,
+// as (tag, payload) pairs. Paired with replay_terminal_reject_reasons() it lets a memoized analysis
+// reproduce the diagnostic side effects of a fresh evaluation exactly (compute_program_facts.hpp).
+// A nested capture receives the records made while it is alive (the outer one does not see them)
+// and restores the outer capture when it ends.
+class TerminalRejectCapture {
+public:
+    TerminalRejectCapture();
+    ~TerminalRejectCapture();
+    TerminalRejectCapture(const TerminalRejectCapture&) = delete;
+    TerminalRejectCapture& operator=(const TerminalRejectCapture&) = delete;
+    std::vector<std::pair<std::string, std::string>> take() { return std::move(records_); }
+private:
+    std::vector<std::pair<std::string, std::string>> records_;
+    std::vector<std::pair<std::string, std::string>>* previous_ = nullptr;
+};
+void replay_terminal_reject_reasons(
+    uint64_t program_address, const std::vector<std::pair<std::string, std::string>>& records);
 
 // Test-only hook: record a reject reason exactly as a compile site would, so the skip line's
 // reason plumbing can be exercised without driving a full recompile to a specific internal reject.

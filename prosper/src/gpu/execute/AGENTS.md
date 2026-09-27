@@ -28,6 +28,13 @@ comparisons; `compute_witness_analyses` counts actual cache-entry-point parser i
   the falsifying A/B executable; see `docs/OUTER_WILDS_STATUS.md` § Ruled out before spending any
   time here. `PROSPER_INDEX_EXPAND_STATS=1` reports the index volume that would have to be large
   for any of this to matter.
+- `compute_program_facts` — what a compute dispatch needs to know about its PROGRAM (decoded
+  stream, native-multiwave preference, GDS use), memoized per exact program bytes so a program
+  dispatched thousands of times is analyzed once. Anything derived from the dispatch's resource
+  table or registers does not belong here: the cache key is the program alone. The probe's
+  reject-reason records are replayed on every hit, so adding a fact whose derivation has another
+  side effect means capturing and replaying that too. `PROSPER_NO_COMPUTE_PROGRAM_FACTS_CACHE=1`
+  restores per-dispatch derivation for A/B.
 - `gpu_dependency_graph` — ordering and dependencies between submitted work.
 - `host_read_barrier` — the availability half of a GPU→CPU readback: the `HOST_READ`/`HOST_BIT`
   dependency that a fence wait does **not** perform (#2944/#3249). Header-only and deliberately

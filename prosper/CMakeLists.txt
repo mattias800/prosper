@@ -2600,6 +2600,12 @@ endif()
   target_include_directories(test_index_expand PRIVATE src)
   add_test(NAME index_expand COMMAND test_index_expand)
 
+  # Per-program compute dispatch facts are memoized by exact bytes and replay the probe's diagnostic
+  # side effects; needs prosper_core but no Vulkan device.
+  add_executable(test_compute_program_facts tests/gpu/execute/test_compute_program_facts.cpp)
+  target_link_libraries(test_compute_program_facts PRIVATE prosper_core)
+  add_test(NAME compute_program_facts COMMAND test_compute_program_facts)
+
   # shader_histo: data-driven recompiler-coverage report over the game's real embedded RDNA2 shaders.
   add_executable(shader_histo tools/shader_histo/shader_histo.cpp)
   target_link_libraries(shader_histo PRIVATE prosper_core)
