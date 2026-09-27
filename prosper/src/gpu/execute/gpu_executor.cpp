@@ -9,6 +9,7 @@
 #include "gpu/execute/gpu_execute.hpp"
 #include "gpu/execute/compute_program_facts.hpp"
 #include "diagnostics/env_submit.hpp"
+#include "diagnostics/perf/perf_ledger.hpp"   // #3891: skipped-dispatches, shader-compile alarms
 #include "gpu/diagnostics/watch_list.hpp"   // strict 0x-only watch parsing (shared with the RTT watch)
 #include "gpu/diagnostics/diag_ratelimit.hpp"   // first-N-then-powers-of-two report throttling
 #include "diagnostics/env_numeric.hpp"   // #3267: a typo must not silently drop an operator-set cap
@@ -1670,6 +1671,12 @@ SharedShaderWords cache_compiled_graphics_shader(ShaderProgramStage stage, Shade
     const auto end = std::chrono::steady_clock::now();
     ++cache.stats.misses;
     cache.stats.compile_ms += std::chrono::duration<double, std::milli>(end - start).count();
+    // #3891 shader-compile: the same span, into the always-on ledger (the clock reads above
+    // already exist; this adds two relaxed atomics per recompile, and hits pay nothing).
+    prosper::diagnostics::perf::add_cost(
+        prosper::diagnostics::perf::Cost::ShaderCompile,
+        static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count()));
 
     scratch.prepare_for_cache();
     constexpr size_t max_entries = 4096;
@@ -2063,6 +2070,12 @@ std::vector<uint32_t> recompile_compute_shader_cached(
     const auto end = std::chrono::steady_clock::now();
     ++cache.stats.misses;
     cache.stats.compile_ms += std::chrono::duration<double, std::milli>(end - start).count();
+    // #3891 shader-compile: the same span, into the always-on ledger (the clock reads above
+    // already exist; this adds two relaxed atomics per recompile, and hits pay nothing).
+    prosper::diagnostics::perf::add_cost(
+        prosper::diagnostics::perf::Cost::ShaderCompile,
+        static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count()));
 
     scratch.prepare_for_cache();
     constexpr size_t max_entries = 4096;
@@ -7904,6 +7917,8 @@ std::vector<ComputeItem> realize_compute_dispatches(
             prosper_agc_shader_header_for_code(code_addr));
         if (!header || !code_addr || !guest_readable(code_addr, sizeof(uint32_t))) {
             record_failure(RealizationFailureReason::MissingProgram, {}, {});
+            prosper::diagnostics::perf::skip_dispatch(
+                prosper::diagnostics::perf::DispatchSkip::MissingProgram);
             static std::set<uint64_t> logged;
             if (logged.insert(code_addr).second)
                 std::fprintf(stderr, "[compute] skip unregistered/unreadable program 0x%llx\n",
@@ -8735,6 +8750,8 @@ std::vector<ComputeItem> realize_compute_dispatches(
             }
             note_compute_program_outcome(code_addr, false, launch.groups_x, launch.groups_y,
                                         launch.groups_z, launch.local_x, launch.local_y);
+            prosper::diagnostics::perf::skip_dispatch(
+                prosper::diagnostics::perf::DispatchSkip::ShaderRecompile);
             continue;
         }
         const DescriptorValidationReport report = validate_spirv_descriptor_interface(
@@ -8787,6 +8804,8 @@ std::vector<ComputeItem> realize_compute_dispatches(
             }
             note_compute_program_outcome(code_addr, false, launch.groups_x, launch.groups_y,
                                         launch.groups_z, launch.local_x, launch.local_y);
+            prosper::diagnostics::perf::skip_dispatch(
+                prosper::diagnostics::perf::DispatchSkip::DescriptorContract);
             report_compute_binding_watch(code_addr, item.resources.get(), ComputeBindOutcome::SkippedDescriptors);
             continue;
         }
@@ -9345,7 +9364,13 @@ OrderedSubmitResult execute_ordered_items_impl(const std::vector<SubmitOperation
             span.push_back(draws[operation.item]);
         } else if (operation.kind == ExecutableKind::Dispatch) {
             flush_span();
-            result.compute_executed |= compute && compute({computes[operation.item]});
+            if (compute) {
+                const bool executed = compute({computes[operation.item]});
+                if (!executed)
+                    prosper::diagnostics::perf::skip_dispatch(
+                        prosper::diagnostics::perf::DispatchSkip::BackendDeclined);
+                result.compute_executed |= executed;
+            }
         } else {
             flush_span(true);
             execute_dma(dma_copies[operation.item]);
@@ -11096,6 +11121,8 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                     notify_compute_authority_unknown(
                         ComputeAuthorityBoundaryKind::Compute,
                         submit_no, operation.command_order);
+                    prosper::diagnostics::perf::skip_dispatch(
+                        prosper::diagnostics::perf::DispatchSkip::IndirectDependencies);
                     if (capture_trace) {
                         capture_trace->failures.push_back({
                             SubmitOperationKind::Dispatch, operation.index,
@@ -11125,6 +11152,8 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                     notify_compute_authority_unknown(
                         ComputeAuthorityBoundaryKind::Compute,
                         submit_no, operation.command_order);
+                    prosper::diagnostics::perf::skip_dispatch(
+                        prosper::diagnostics::perf::DispatchSkip::IndirectArguments);
                     if (capture_trace) {
                         // A dispatch's indirect arguments fail exactly as a draw's do; recording it
                         // as Unknown was the documented gap in the reason enum, not a distinct case.
@@ -11355,6 +11384,9 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                                                        operation.command_order, tree_watch_touch);
                     const bool executed = capture_trace
                         ? compute({item}) : compute({std::move(item)});
+                    if (!executed)
+                        prosper::diagnostics::perf::skip_dispatch(
+                            prosper::diagnostics::perf::DispatchSkip::BackendDeclined);
                     log_compute_dispatch(tree_watch_program, submit_no, operation.index,
                                          operation.command_order,
                                          executed ? "executed" : "backend-declined",

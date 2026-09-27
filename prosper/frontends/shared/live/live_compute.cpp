@@ -1,4 +1,5 @@
 #include "shared/live/live_compute.hpp"
+#include "diagnostics/perf/perf_ledger.hpp"   // #3891: shader-compile alarm
 #include "shared/compute/storage_write_mask_spirv.hpp"
 #include "shared/diagnostics/trip_bound_witness.hpp"
 #include "shared/compute/compute_authority_live_census.hpp"
@@ -10913,6 +10914,10 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                               low_latency_compile ? "disabled-for-cold-latency" : "driver-default");
             VkResult pipeline_result = VK_SUCCESS;
             {
+                // #3891 shader-compile: one clock pair per compute pipeline built (a cached one
+                // never gets here) -- including when the cache is full and it is not retained.
+                const prosper::diagnostics::perf::CostScope perf_pipeline(
+                    prosper::diagnostics::perf::Cost::PipelineCreate);
                 std::lock_guard<std::timed_mutex> cache_lock(ctx.pipeline_cache_mutex);
                 pipeline_result = vkCreateComputePipelines(
                     ctx.device, ctx.pipeline_cache, 1, &cpci, nullptr, &pipeline);
