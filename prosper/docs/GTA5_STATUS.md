@@ -595,6 +595,12 @@ conclusion; it sharpens what "essentially all black" looks like.
   "M0 unsupported"; the exact rejecting path is not located. M0 accounts for 20 of the shader's
   instructions (6 reads, 14 writes); whether all 20 are among the 79 is **not** established.
 
+## Ruled out — serving the colour-grading LUT from a GPU volume image (2026-09-28)
+
+| dead hypothesis | evidence that killed it | ref |
+| --- | --- | --- |
+| GTA V's 32x32x32 colour-grading LUT (`0x2042fa0000` on the perf-story route) is rendered by uncleared raster draws, so after #3889 its GPU-rendered content is ignored and readers decode **stale** guest bytes; a whole-slice coverage proof (or a guest seed before the pass) would let the renderer serve the correct LUT | **Measured false on both halves.** A backend log of every volume pass over a 300 s run that reaches gameplay (landing menu at flip 1600, bank-heist gameplay at flip 5000) saw **one** raster pass on the LUT in the whole run: one 3-vertex draw, 32x32 viewport and scissor, blend off, write mask `0xf`, into a view of **slice 0 only (`0+1` of 32)**, CLEARed. So no raster proof can make the volume complete: 31 of 32 slices are never rendered. The LUT's real producer is compute program `0x2042f8f200`, which rewrote the whole 2 MiB allocation in guest memory **9 times** in the same run (guest-write invalidations of `0x2042fa0000+2097152`). Readers of guest memory therefore see the compute's current output, not stale bytes. Making the volume valid would also be harmful: a valid volume claims its footprint, and `live_compute.cpp` skips any dispatch that overlaps a claimed volume ("renderer volume has no complete guest publication"), so the compute that actually produces the LUT would stop running. | #3890 |
+
 ## Ruled out — HTILE byte-preserving suppression (2026-08-29)
 
 | dead hypothesis | evidence that killed it | ref |

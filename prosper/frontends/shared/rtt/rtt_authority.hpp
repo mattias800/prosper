@@ -99,11 +99,34 @@ constexpr bool live_rtt_complete_guest_overwrite(uint64_t target_address,
 // Whether a renderer-produced volume may claim authority over its guest footprint. Only a volume
 // the renderer can actually serve -- a retained image proven complete -- may; otherwise every sample
 // of that address would be refused (see live_rtt_unpublished_volume_blocks_sample) and its draw
-// dropped, with guest memory never allowed to stand in. GTA V's colour-grading LUT is rendered by
-// uncleared draws, never proves complete, and blacked out every GTA V menu when this was claimed
+// dropped, with guest memory never allowed to stand in. GTA V's 32x32x32 colour-grading LUT never
+// proves complete -- its only raster pass writes slice 0 of 32, and a compute program rewrites the
+// whole allocation in guest memory -- and blacked out every GTA V menu when this was claimed
 // unconditionally (#3842 regression). Without a servable image, guest memory stays authoritative.
 constexpr bool live_rtt_volume_claims_authority(bool volume_target, bool renderer_image_valid) {
     return volume_target && renderer_image_valid;
+}
+
+// The guest footprint a renderer-produced volume claims (see live_rtt_volume_claims_authority).
+struct LiveRttVolumeFootprint {
+    uint64_t bytes = 0;   // zero: no claim, guest memory is authoritative for the address
+    bool proven = false;  // the extent came from the producer's native tiled layout
+};
+
+// The claim a target holds after a pass, or a refusal, settles it. Every producer outcome -- a
+// completed pass, a declined producer, a refused view, a failed backend admission -- goes through
+// this ONE rule: a claim needs a valid renderer image, and one without it RELEASES any earlier claim,
+// because the image that claim rested on is gone. GTA V's menus stayed black under
+// PROSPER_GPU_CAPTURE and the PROSPER_DUMP_* diagnostics after #3889 because the decline and
+// invalid-view paths still claimed with no image (#3890). A claim merges with an earlier one: the
+// larger extent wins, and it stays proven only if both were.
+constexpr LiveRttVolumeFootprint live_rtt_settle_volume_footprint(
+    LiveRttVolumeFootprint current, bool volume_target, bool renderer_image_valid,
+    uint64_t claim_bytes, bool claim_proven) {
+    if (!live_rtt_volume_claims_authority(volume_target, renderer_image_valid))
+        return volume_target ? LiveRttVolumeFootprint{} : current;
+    return {current.bytes > claim_bytes ? current.bytes : claim_bytes,
+            current.bytes ? current.proven && claim_proven : claim_proven};
 }
 
 // A 2D alias can have valid current pixels while older renderer-produced volume slices remain

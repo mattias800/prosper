@@ -167,6 +167,34 @@ int main() {
     CHECK(!prosper::frontend::live_rtt_volume_claims_authority(true, false));
     CHECK(!prosper::frontend::live_rtt_volume_claims_authority(false, true));
     CHECK(!prosper::frontend::live_rtt_volume_claims_authority(false, false));
+    // #3890: every producer outcome settles the claim through one rule. A declined producer, a
+    // refused view or a failed admission holds no image, so it must RELEASE an earlier claim rather
+    // than keep or extend it -- GTA V's menus stayed black under PROSPER_GPU_CAPTURE and the
+    // PROSPER_DUMP_* diagnostics because those paths claimed anyway.
+    {
+        using prosper::frontend::LiveRttVolumeFootprint;
+        using prosper::frontend::live_rtt_settle_volume_footprint;
+        constexpr LiveRttVolumeFootprint none{};
+        constexpr LiveRttVolumeFootprint claimed{volume_bytes, true};
+        // Denied with no image: no claim is created, and an earlier one is released.
+        constexpr auto denied_fresh =
+            live_rtt_settle_volume_footprint(none, true, false, volume_bytes, true);
+        CHECK(denied_fresh.bytes == 0 && !denied_fresh.proven);
+        constexpr auto denied_after_claim =
+            live_rtt_settle_volume_footprint(claimed, true, false, volume_bytes, true);
+        CHECK(denied_after_claim.bytes == 0 && !denied_after_claim.proven);
+        // A valid image claims; a later claim merges (larger extent, proven only if both were).
+        constexpr auto first = live_rtt_settle_volume_footprint(none, true, true, 4096u, false);
+        CHECK(first.bytes == 4096u && !first.proven);
+        constexpr auto merged =
+            live_rtt_settle_volume_footprint(first, true, true, volume_bytes, true);
+        CHECK(merged.bytes == volume_bytes && !merged.proven);
+        constexpr auto kept = live_rtt_settle_volume_footprint(claimed, true, true, 4096u, true);
+        CHECK(kept.bytes == volume_bytes && kept.proven);
+        // A 2D target neither claims nor disturbs what it holds.
+        constexpr auto flat = live_rtt_settle_volume_footprint(claimed, false, true, 4096u, false);
+        CHECK(flat.bytes == volume_bytes && flat.proven);
+    }
     CHECK(!live_rtt_unpublished_volume_blocks_sample(volume_bytes, false, false, true));
     CHECK(live_rtt_unpublished_volume_blocks_sample(volume_bytes, false, false, false));
     CHECK(!live_rtt_unpublished_volume_blocks_sample(0, true, false, false));

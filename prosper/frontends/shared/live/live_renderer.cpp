@@ -186,17 +186,38 @@ struct RttSurf {
 // Keeps the per-resource overlap scan entirely off the ordinary 2D-only execution path.
 bool g_ever_volume_target = false;
 // Keys of RTT-cache entries that may carry a nonzero volume_guest_bytes. A superset: every write
-// that can make a footprint nonzero goes through retain_volume_guest_footprint() or notes the key
+// that can make a footprint nonzero goes through settle_volume_guest_footprint() or notes the key
 // itself (the resolve copy below). See volume_target_index.hpp for why queries stay exact.
 prosper::frontend::VolumeTargetIndex g_volume_targets;
 
-void retain_volume_guest_footprint(uint64_t base, RttSurf& surface, uint64_t bytes, bool proven) {
-    if (!surface.volume_guest_bytes)
-        surface.volume_footprint_proven = proven;
-    else
-        surface.volume_footprint_proven &= proven;
-    surface.volume_guest_bytes = std::max(surface.volume_guest_bytes, bytes);
+// The ONE place a renderer-produced volume's claim over its guest footprint is settled, by
+// live_rtt_settle_volume_footprint's rule: a claim needs a valid renderer image, and a pass or
+// refusal without one releases any earlier claim. Otherwise every later sample of the address is
+// refused and its draw dropped, with guest memory never allowed to stand in (#3842, #3889, #3890).
+void settle_volume_guest_footprint(uint64_t base, RttSurf& surface, bool renderer_image_valid,
+                                   uint64_t bytes, bool proven) {
+    const prosper::frontend::LiveRttVolumeFootprint settled =
+        prosper::frontend::live_rtt_settle_volume_footprint(
+            {surface.volume_guest_bytes, surface.volume_footprint_proven},
+            surface.volume_depth != 0, renderer_image_valid, bytes, proven);
+    surface.volume_guest_bytes = settled.bytes;
+    surface.volume_footprint_proven = settled.proven;
     if (surface.volume_guest_bytes) g_volume_targets.note(base);
+}
+
+// A volume producer pass the renderer declined, or whose view or backend admission it refused. The
+// renderer holds no image for the attempted version, so the entry records the shape only and guest
+// memory stays authoritative for the footprint (settle_volume_guest_footprint).
+void note_volume_producer_denied(uint64_t base, RttSurf& denied, uint32_t width, uint32_t height,
+                                 uint32_t volume_depth, VkFormat format) {
+    denied.w = width;
+    denied.h = height;
+    denied.volume_depth = volume_depth;
+    settle_volume_guest_footprint(base, denied, /*renderer_image_valid=*/false, 0, false);
+    denied.format = format;
+    denied.rgba.reset();
+    denied.has_uniform_color = false;
+    denied.gpu_valid = false;
 }
 
 bool unpublished_volume_may_overlap(uint64_t volume_base, uint64_t volume_bytes,
@@ -11055,21 +11076,17 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         (!producer_volume_footprint_proven || !live_gpu_targets ||
                          phase.authoritative_readback ||
                          cpu_needed_same_batch)) {
-                        // No 3D guest publication or same-pass feedback snapshot exists yet.
-                        // Decline the producer instead of handing a consumer stale guest bytes.
+                        // No 3D guest publication or same-pass feedback snapshot exists yet, so
+                        // the renderer cannot produce this volume in a form a consumer here can
+                        // read. Decline the producer. With no image, the volume claims nothing and
+                        // consumers read guest memory, which lacks this pass's writes. The
+                        // alternative was worse: claiming the footprint dropped every draw that
+                        // samples it, which kept GTA V's menus black whenever live GPU targets are
+                        // off (PROSPER_GPU_CAPTURE, PROSPER_DUMP_*, replay seeding; #3890).
                         prosper::test::invalidate_persistent_color_target(base);
-                        if (base) {
-                            RttSurf& denied = g_rtt[base];
-                            denied.w = gw; denied.h = gh;
-                            denied.volume_depth = producer_volume_depth;
-                            retain_volume_guest_footprint(
-                                base, denied, producer_volume_guard_bytes,
-                                producer_volume_footprint_proven);
-                            denied.format = pass_format;
-                            denied.rgba.reset();
-                            denied.has_uniform_color = false;
-                            denied.gpu_valid = false;
-                        }
+                        if (base)
+                            note_volume_producer_denied(base, g_rtt[base], gw, gh,
+                                                        producer_volume_depth, pass_format);
                         static std::atomic<uint32_t> volume_refusals{0};
                         if (volume_refusals.fetch_add(1, std::memory_order_relaxed) < 16u)
                             std::fprintf(stderr,
@@ -11234,16 +11251,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             // its view must also revoke the earlier version, including when
                             // no backend call is made.
                             prosper::test::invalidate_persistent_color_target(base);
-                            RttSurf& denied = g_rtt[base];
-                            denied.w = gw; denied.h = gh;
-                            denied.volume_depth = volume_view.selected_mip_depth;
-                            retain_volume_guest_footprint(
-                                base, denied, producer_volume_guard_bytes,
-                                producer_volume_footprint_proven);
-                            denied.format = pass_format;
-                            denied.rgba.reset();
-                            denied.has_uniform_color = false;
-                            denied.gpu_valid = false;
+                            note_volume_producer_denied(base, g_rtt[base], gw, gh,
+                                                        volume_view.selected_mip_depth,
+                                                        pass_format);
                             std::fprintf(stderr,
                                 "[render-volume] invalid slot0 view target=0x%llx\n",
                                 static_cast<unsigned long long>(base));
@@ -11374,20 +11384,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             ? std::max(1, atoi(getenv("PROSPER_DUMP_PASS_EVERY"))) : 60;
                     auto pass_pixels = std::make_shared<const std::vector<uint8_t>>(std::move(gpx));
                     if (base && backend_target.volume_depth && !color_target_call.writes) {
-                        // Backend admission failed before it could record a write.
-                        RttSurf& denied = g_rtt[base];
-                        denied.w = gw; denied.h = gh;
-                        denied.volume_depth = backend_target.volume_depth;
-                        // The backend refused the volume (e.g. a device without 2D-on-3D views), so
-                        // the renderer has no image to be authoritative with. Claiming the guest
-                        // footprint here would drop every later draw that samples it; leave guest
-                        // memory authoritative instead (see the write path below).
-                        denied.volume_guest_bytes = 0;
-                        denied.volume_footprint_proven = false;
-                        denied.format = pass_format;
-                        denied.rgba.reset();
-                        denied.has_uniform_color = false;
-                        denied.gpu_valid = false;
+                        // Backend admission failed before it could record a write (e.g. a device
+                        // without 2D-on-3D views), so the renderer has no image to serve.
+                        note_volume_producer_denied(base, g_rtt[base], gw, gh,
+                                                    backend_target.volume_depth, pass_format);
                     }
                     const auto* completed_target = base
                         ? prosper::test::find_persistent_color_target(
@@ -11415,23 +11415,16 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             backend_target.volume_depth) != nullptr;
                         // Claim renderer authority over the volume's guest footprint ONLY when the
                         // renderer now holds a valid image to serve it from. The backend marks a
-                        // retained volume valid only once every slice is proven written (a CLEAR, not
-                        // a raster draw alone), so a volume produced by uncleared draws -- GTA V's
-                        // 32x32x32 colour-grading LUT -- never becomes valid. Claiming authority
-                        // anyway made every later sample of that address drop its draw and made the
-                        // compute pass that also writes the LUT skip, which blacked out every GTA V
-                        // screen between the Rockstar intro and gameplay (regressed by #3842). With
-                        // no valid renderer image, guest memory remains the authority, as before
-                        // #3842; a proven-complete volume keeps its full protection.
-                        if (prosper::frontend::live_rtt_volume_claims_authority(
-                                backend_target.volume_depth != 0, surface.gpu_valid)) {
-                            retain_volume_guest_footprint(
-                                base, surface, producer_volume_guard_bytes,
-                                producer_volume_footprint_proven);
-                        } else if (backend_target.volume_depth) {
-                            surface.volume_guest_bytes = 0;
-                            surface.volume_footprint_proven = false;
-                        }
+                        // retained volume valid only once every slice is proven written, so a
+                        // volume whose slices are never proven keeps guest memory authoritative, as
+                        // before #3842; a proven-complete volume keeps its full protection. GTA V's
+                        // 32x32x32 colour-grading LUT is the worked case: its only raster pass
+                        // writes slice 0 of 32, and a compute program rewrites the whole allocation
+                        // in guest memory. Claiming it made that compute skip and every draw that
+                        // samples the LUT drop, blacking out the menus and HUD (#3842, #3889).
+                        settle_volume_guest_footprint(base, surface, surface.gpu_valid,
+                                                      producer_volume_guard_bytes,
+                                                      producer_volume_footprint_proven);
                         if (!pass_pixels->empty()) surface.rgba = pass_pixels;
                         else surface.rgba.reset();
                         // GTA V builds its packed-HDR bloom pyramid as separate CB_COLOR targets,
