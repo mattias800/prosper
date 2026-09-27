@@ -466,6 +466,10 @@ static const Site kSites[] = {
      mib_cap_new<256>, mib_cap_old<256>, "1gb", 256ull * kMiB, "128", 128ull * kMiB},
     {"render_runner.h PROSPER_BACKEND_TEXTURE_CACHE_MB", "PROSPER_BACKEND_TEXTURE_CACHE_MB",
      mib_cap_new<1024>, mib_cap_old<1024>, "eight", 1024ull * kMiB, "2048", 2048ull * kMiB},
+    // #3873: test-only fake discrete heap for the texture-cache budget. 0 means OFF, so a malformed
+    // value must keep it off rather than wrap to an effectively infinite fake heap.
+    {"render_runner.h PROSPER_FAKE_HEAP_BUDGET_MB", "PROSPER_FAKE_HEAP_BUDGET_MB",
+     mib_cap_new<0>, mib_cap_old<0>, "-1", 0ull, "8192", 8192ull * kMiB},
     {"render_runner.h PROSPER_MEMORY_POOL_MB", "PROSPER_MEMORY_POOL_MB",
      mib_cap_new<512>, mib_cap_old<512>, "-1", 512ull * kMiB, "256", 256ull * kMiB},
     // #3405: the mapped-staging cache's own budget, accounted separately from the transient pool

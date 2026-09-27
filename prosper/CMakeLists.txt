@@ -2281,6 +2281,11 @@ if(TARGET prosper_core)
   target_link_libraries(test_gpu_memory_budget PRIVATE prosper_core)
   add_test(NAME gpu_memory_budget COMMAND test_gpu_memory_budget)
 
+  # #3873: the persistent texture cache's budget from VK_EXT_memory_budget headroom (pure policy).
+  add_executable(test_texture_cache_budget tests/gpu/memory/test_texture_cache_budget.cpp)
+  target_link_libraries(test_texture_cache_budget PRIVATE prosper_core)
+  add_test(NAME texture_cache_budget COMMAND test_texture_cache_budget)
+
   add_executable(test_rdna2_decode tests/gpu/recompiler/test_rdna2_decode.cpp)
   target_link_libraries(test_rdna2_decode PRIVATE prosper_core)
   add_test(NAME rdna2_decode_walk COMMAND test_rdna2_decode)

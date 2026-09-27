@@ -42,7 +42,9 @@ switched on for the run that mattered (#3533). `PROSPER_GPU_MEM_LOG=0` silences 
   Read the header's caveat before quoting a number: it sees **prosper's own allocations only**, not
   other processes, the compositor, or driver overhead, so on an integrated GPU — where the desktop
   shares these heaps — "prosper holds far less than the heap" is not evidence that an allocation will
-  succeed. `VK_EXT_memory_budget` is the honest upgrade and is not enabled on the device today.
+  succeed. `VK_EXT_memory_budget` is the honest upgrade; since #3873 it is enabled when advertised
+  and the texture-cache budget (`src/gpu/memory/`) reads it, but this instrument still counts only
+  prosper's own allocations.
 - `geometry_probe_arming` — whether `PROSPER_GEOM_PROBE` may answer at all: does the module the
   backend is about to hand Vulkan actually declare the transform-feedback capture? It is the
   worked example of the first standing caution below. Without it the probe armed on a shader it
