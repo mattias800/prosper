@@ -343,3 +343,15 @@ volume census was kept, because the volume is the input to any future batching q
 - **"prosper is naive about dynamic state."** It is not: `render_runner.h:9979`–`9995` enables 16
   dynamic states including extended-dynamic-state depth/stencil/cull/topology. Pipeline-key
   explosion from baked dynamic state is not a live hypothesis here.
+- **"Per-reference texture resolution needs a memo" (#3873 plan item 2).** Not what the cost was.
+  `PROSPER_TEXREF_CENSUS=1` on GTA V gameplay: ~158k texture references per 5 s, ~158 per submit
+  against 41.6 distinct identities per submit (74% are exact in-submit repeats), and **no repeat
+  resolved to a different outcome** (0 of ~117k per 5 s window, in every window of the run) -- so a
+  memo would have looked safe. But the
+  census also timed the chain by stage, and 4.3 us of the 4.8 us an ordinary in-submit reuse cost
+  was ONE step: the volume-alias check walking the whole RTT cache (~850 entries, 1 volume) on every
+  reference once any volume target had existed. With that walk replaced by an exact candidate index
+  (`shared/rtt/volume_target_index.hpp`), an in-submit reuse costs 0.59 us and the chain averages
+  2.5 us/ref; the most a memo could still save is ~0.5 us x ~120k refs per 5 s, about 1% of wall,
+  for an invalidation surface of the #611/#780 class. Do not build a resolution memo without first
+  showing a chain stage that is both slow and repeat-invariant -- the census reports exactly that.

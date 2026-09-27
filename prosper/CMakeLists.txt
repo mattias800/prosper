@@ -1493,6 +1493,10 @@ if(TARGET prosper_core)
   target_include_directories(test_rtt_injection PRIVATE frontends)
   add_test(NAME rtt_injection COMMAND test_rtt_injection)
 
+  add_executable(test_volume_target_index frontends/shared/tests/test_volume_target_index.cpp)
+  target_include_directories(test_volume_target_index PRIVATE frontends)
+  add_test(NAME volume_target_index COMMAND test_volume_target_index)
+
   add_executable(test_buffer_range_plan frontends/shared/tests/test_buffer_range_plan.cpp)
   target_include_directories(test_buffer_range_plan PRIVATE tests)
   add_test(NAME buffer_range_plan COMMAND test_buffer_range_plan)
