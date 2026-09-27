@@ -3147,7 +3147,26 @@ bool map_image(const LoadedImage& img, std::string* err) {
 // The one place a slot's stub bytes are chosen. install_stubs and append_stubs (#639) must emit
 // byte-identical stubs for the same slot, or a runtime-loaded module's imports would take a
 // different path into the HLE than the pre-linked ones.
+bool hle_prof_enabled();
+void hle_prof_note_slot(uint32_t slot, const std::string& lib, const std::string& nid, const std::string& name,
+                        uint64_t hook, uint64_t hook_tramp);
+extern "C" void prosper_hle_prof_trampoline();
 static size_t emit_one_stub(uint8_t* slot, const ImportSlot& s, uint32_t idx, bool swap) {
+    if (swap && hle_prof_enabled() && Hle::lookup_address(s.nid)) {
+        const uint64_t target = (uint64_t)(uintptr_t)Hle::lookup_address(s.nid);
+        const uint64_t hook = (uint64_t)(uintptr_t)Hle::return_hook_of(s.nid);
+        std::string nm = g_nid_db ? g_nid_db->resolve(s.nid) : std::string();
+        if (nm.empty()) nm = Hle::name_of(s.nid);
+        hle_prof_note_slot(idx, s.lib, s.nid, nm, hook,
+                           (uint64_t)(uintptr_t)&prosper_hle_hook_host_trampoline);
+        uint8_t* p = slot;
+        *p++ = 0x49; *p++ = 0xBA; memcpy(p, &target, 8); p += 8;          // movabs r10, handler
+        *p++ = 0x41; *p++ = 0xBB; memcpy(p, &idx, 4); p += 4;             // mov r11d, idx
+        *p++ = 0xFF; *p++ = 0x25; uint32_t z = 0; memcpy(p, &z, 4); p += 4; // jmp [rip+0]
+        const uint64_t tr = (uint64_t)(uintptr_t)&prosper_hle_prof_trampoline;
+        memcpy(p, &tr, 8); p += 8;
+        return (size_t)(p - slot);
+    }
     // lookup_ADDRESS, not lookup (#3272): this value is only ever patched into the emitted stub as a
     // jump target, never invoked from here, so the calling convention of the handler behind it is
     // none of this function's business -- and `lookup` now refuses the guest-ABI handlers precisely

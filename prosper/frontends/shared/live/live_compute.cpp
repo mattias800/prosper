@@ -78,6 +78,14 @@
 #define PROSPER_HAVE_TARGET_F16C 1
 #endif
 #include "shared/compute/compute_buffer_bytes.hpp"
+#include <chrono>
+#ifndef FRESH3_PHASE_DEFINED
+#define FRESH3_PHASE_DEFINED
+extern "C" void hle_prof_phase(int idx, unsigned long long ns);
+namespace { struct Fresh3Phase { int i; std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+  explicit Fresh3Phase(int k) : i(k) {} ~Fresh3Phase() { hle_prof_phase(i, (unsigned long long)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count()); } }; }
+#endif
+
 
 namespace prosper::frontend {
 
@@ -11908,8 +11916,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         if (!vk_ok(compute_submit_rc, "queue-submit")) break;
         if (trace) std::fprintf(stderr, "[compute]   waiting for dispatch\n");
         const auto fence_wait_start = ComputeClock::now();
-        const VkResult wait_result = vkWaitForFences(
-            ctx.device, 1, &ctx.dispatch_fence, VK_TRUE, 30ull * 1000 * 1000 * 1000);
+        VkResult wait_result;
+        { Fresh3Phase f3(9); wait_result = vkWaitForFences(
+            ctx.device, 1, &ctx.dispatch_fence, VK_TRUE, 30ull * 1000 * 1000 * 1000); }
         // Report a LONG wait even when it succeeds.
         //
         // A zero timeout count was read as proof that no compute dispatch hangs. That inference has a

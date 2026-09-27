@@ -10,6 +10,14 @@
 #include <cstdio>
 #include <cstring>
 #include "gpu/diagnostics/gpu_memory_budget_vk.hpp"  // #3533: count what we hold on each heap
+#include <chrono>
+#ifndef FRESH3_PHASE_DEFINED
+#define FRESH3_PHASE_DEFINED
+extern "C" void hle_prof_phase(int idx, unsigned long long ns);
+namespace { struct Fresh3Phase { int i; std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+  explicit Fresh3Phase(int k) : i(k) {} ~Fresh3Phase() { hle_prof_phase(i, (unsigned long long)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count()); } }; }
+#endif
+
 
 namespace prosper::frontend {
 namespace {
@@ -231,8 +239,9 @@ bool present_blit_publish(VkImage src, VkImageLayout src_layout, VkFormat src_fo
     // cheaper than the GPU->CPU readback + CPU->GPU re-upload it replaces. Does not touch the queue, so it
     // is outside the submit mutex.
     const auto wait_begin = trace.now();
-    const VkResult wait_result =
-        vkWaitForFences(s.dev, 1, &s.blit_fence, VK_TRUE, 5ull * 1000 * 1000 * 1000);
+    VkResult wait_result;
+    { Fresh3Phase f3(10); wait_result =
+        vkWaitForFences(s.dev, 1, &s.blit_fence, VK_TRUE, 5ull * 1000 * 1000 * 1000); }
     trace.emit(prosper::perf::PresentHandoffEvent::PublishFence, static_cast<int>(wait_result), wait_begin);
     if (!present_blit_wait_completed(wait_result)) {
         // The command buffer and destination slot may still be in flight. Fail the GPU-present path

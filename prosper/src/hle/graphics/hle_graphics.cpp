@@ -36,6 +36,14 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
+#include <chrono>
+#ifndef FRESH3_PHASE_DEFINED
+#define FRESH3_PHASE_DEFINED
+extern "C" void hle_prof_phase(int idx, unsigned long long ns);
+namespace { struct Fresh3Phase { int i; std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+  explicit Fresh3Phase(int k) : i(k) {} ~Fresh3Phase() { hle_prof_phase(i, (unsigned long long)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count()); } }; }
+#endif
+
 
 namespace prosper {
 
@@ -950,9 +958,10 @@ extern "C" void prosper_vo_flip_from_gpu(uint32_t handle, int32_t bufidx, uint32
     if (evlog()) fprintf(stderr, "[ev] GpuFlip t=%.6f handle=0x%x bufidx=%d mode=0x%x fliparg=0x%llx\n",
                          evlog_seconds(), handle, bufidx, flip_mode,
                          (unsigned long long)flip_arg);
+    Fresh3Phase f3_flip(7);
     const uint64_t source_flip_seq = flip_advance(bufidx, flip_arg);
-    flip_pace_wait();                      // both halves pace: see flip_pace_wait
-    gpu::present_flip(bufidx, flip_arg, source_flip_seq);
+    { Fresh3Phase f3(8); flip_pace_wait(); }                      // both halves pace: see flip_pace_wait
+    { Fresh3Phase f3(14); gpu::present_flip(bufidx, flip_arg, source_flip_seq); }
     // A title that composites with COMPUTE and never draws produces no graphics span, and every
     // publish decision — including the guest-scanout fallback written for exactly that case — sits
     // behind one. Give the flip itself a chance to publish. Null until a frontend registers, so a

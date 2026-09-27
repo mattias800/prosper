@@ -5,6 +5,14 @@
 #pragma once
 #include <system_error>   // #3407: the catch in parallel_render_memcpy
 #include <thread>         // #3407: parallel_render_memcpy
+#include <chrono>
+#ifndef FRESH3_PHASE_DEFINED
+#define FRESH3_PHASE_DEFINED
+extern "C" void hle_prof_phase(int idx, unsigned long long ns);
+namespace { struct Fresh3Phase { int i; std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+  explicit Fresh3Phase(int k) : i(k) {} ~Fresh3Phase() { hle_prof_phase(i, (unsigned long long)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count()); } }; }
+#endif
+
 #include "host/memory/guest_write_watch.hpp"   // VA->phys for the #2932 target census
 #include "host/memory/guest_memory_map.hpp"    // mapping generation for opt-in range census
 #include "hle/memory/guest_memory_topology.hpp" // authoritative physical aliases for DS invalidation
@@ -2274,8 +2282,10 @@ inline VkResult render_locked_queue_submit(VkQueue q, uint32_t n, const VkSubmit
     prosper::gpu::report_device_memory_periodically();
     prosper::GpuSubmitRegion gate;
     if (!gate.admitted()) return VK_ERROR_DEVICE_LOST;
+    Fresh3Phase f3(5);
     if (prosper::gpu::shared_present_active()) {
-        std::lock_guard<std::mutex> lk(prosper::gpu::shared_present_submit_mutex());
+        std::unique_lock<std::mutex> lk(prosper::gpu::shared_present_submit_mutex(), std::defer_lock);
+        { Fresh3Phase f3m(12); lk.lock(); }
         return vkQueueSubmit(q, n, s, f);
     }
     return vkQueueSubmit(q, n, s, f);
@@ -2652,8 +2662,8 @@ public:
             std::fflush(stderr);
         }
         if (result.submit_result == VK_SUCCESS) {
-            result.wait_result = vkWaitForFences(
-                dev, 1, &fence, VK_TRUE, 5ull * 1000 * 1000 * 1000);
+            { Fresh3Phase f3(4); result.wait_result = vkWaitForFences(
+                dev, 1, &fence, VK_TRUE, 5ull * 1000 * 1000 * 1000); }
             result.fence_waits = 1;
             // Preserve lifetime safety even if the bounded diagnostic wait expires.
             if (result.wait_result != VK_SUCCESS)

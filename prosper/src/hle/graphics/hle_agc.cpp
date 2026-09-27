@@ -18,7 +18,16 @@
 #include "gpu/timeline/gpu_timeline.hpp"
 #include "gpu/present/videoout_present.hpp"
 #include "gpu/execute/mb3_freelist.hpp"   // #1226: per-submit POOLSHIFT window probe
-#include "hle/graphics/render_cadence.hpp"  // #2837: is a requested render cadence actually sparse?
+#include "hle/graphics/render_cadence.hpp"
+#include <chrono>
+// fresh3 lane diagnostic: phase timing accumulators (hle_prof.cpp).
+#ifndef FRESH3_PHASE_DEFINED
+#define FRESH3_PHASE_DEFINED
+extern "C" void hle_prof_phase(int idx, unsigned long long ns);
+namespace { struct Fresh3Phase { int i; std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+  explicit Fresh3Phase(int k) : i(k) {} ~Fresh3Phase() { hle_prof_phase(i, (unsigned long long)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count()); } }; }
+#endif
+  // #2837: is a requested render cadence actually sparse?
 #include "diagnostics/env_numeric.hpp"   // #2847: a mistyped cadence must not become 0
 #include <cstdint>
 #include <cstdio>
@@ -2962,7 +2971,9 @@ HLE(agc_driver_submit_dcb) {  // (const Packet* packet)
     FoldLedgerScope ledger("SubmitDcb");   // #1226 (arc7): entry stamp BEFORE the lock
     const SubmitCallStamp call_stamp = stamp_submit_call();   // BEFORE the lock: see the note above
     // unique_lock only for the SUBMIT_STALL_OUTSIDE discriminator — see submit_dcb_stream.
-    std::unique_lock<std::mutex> lk(g_agc_state_mu);   // serialize with submit_dcb_stream/w1KFAHVqpaU (#278)
+    Fresh3Phase f3_total(11);
+    std::unique_lock<std::mutex> lk(g_agc_state_mu, std::defer_lock);
+    { Fresh3Phase f3(0); lk.lock(); }   // serialize with submit_dcb_stream/w1KFAHVqpaU (#278)
     ledger.locked();
     gpu::prosper_gpu_set_fold_origin(1);   // #1226: this direct entry is the graphics SubmitDcb path
     // Reset the per-submit draw list BEFORE folding this Dcb. The folded GpuState is process-lifetime and
@@ -2983,14 +2994,16 @@ HLE(agc_driver_submit_dcb) {  // (const Packet* packet)
     agc_gpu_state().capture_dma_data_records =
         gpu::begin_gpu_timeline_submit(g_submit_count + 1);
     size_t consumed = 0;
-    size_t applied = gpu::run_command_buffer(p->addr, p->dw_num, agc_gpu_state(), &consumed);
+    size_t applied;
+    { Fresh3Phase f3(1); applied = gpu::run_command_buffer(p->addr, p->dw_num, agc_gpu_state(), &consumed); }
     g_submit_count++;
     report_short_fold("SubmitDcb", g_submit_count, p->addr, p->dw_num, consumed);
     report_submit_order("SubmitDcb", call_stamp, g_submit_count, p->addr, p->dw_num,
                         agc_gpu_state().draws.size());
     gpu::diagnose_compute_dispatches(agc_gpu_state(), g_submit_count);
     static unsigned draw_submits = 0;
-    execute_submit_work(agc_gpu_state(), g_submit_count, draw_submits);
+    { Fresh3Phase f3(2); execute_submit_work(agc_gpu_state(), g_submit_count, draw_submits); }
+    Fresh3Phase f3_tail(3);
     gpu::diagnose_resource_provenance(agc_gpu_state(), g_submit_count);
     // The submit has "completed" (synchronous fold): fire any registered GPU EOP events. Inert unless the
     // game called sceGnmAddEqEvent (b0xyllnVY-I); the RELEASE_MEM label write already happened in apply().

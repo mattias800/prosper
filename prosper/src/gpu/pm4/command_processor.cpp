@@ -35,6 +35,14 @@ namespace prosper { void prosper_eq_trigger_eop(); }
 #include <mutex>
 #include <unordered_set>
 #include <condition_variable>
+#include <chrono>
+#ifndef FRESH3_PHASE_DEFINED
+#define FRESH3_PHASE_DEFINED
+extern "C" void hle_prof_phase(int idx, unsigned long long ns);
+namespace { struct Fresh3Phase { int i; std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+  explicit Fresh3Phase(int k) : i(k) {} ~Fresh3Phase() { hle_prof_phase(i, (unsigned long long)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count()); } }; }
+#endif
+
 #include <thread>
 
 namespace prosper::gpu {
@@ -3068,7 +3076,7 @@ void pend_drain_locked(PendQueue& p, std::unique_lock<std::mutex>& lk) {
         // the raw memcpy — without it an unmapped label SIGSEGVs here, exactly the case the deferred-
         // stream path already survives (this pend path releases asynchronously too, so it needs it).
         pend_age_note(w.queued);
-        apply_deferred_effect(w.cmd);
+        { Fresh3Phase f3(13); apply_deferred_effect(w.cmd); }
         lk.lock();
         p.inflight--;
         p.cv.notify_all();               // wake both drain waiters and the pend worker
@@ -3178,7 +3186,7 @@ extern "C" void prosper_gpu_submit_scope_begin() {
         const bool retired = t_submit_scope_depth == 0 && p.active_submits == 0 && !p.q.empty();
         const auto start = std::chrono::steady_clock::now();
         p.admission_waiters++;
-        p.cv.wait(lk, can_enter);
+        { Fresh3Phase f3(6); p.cv.wait(lk, can_enter); }
         p.admission_waiters--;
         const uint64_t ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - start).count());
