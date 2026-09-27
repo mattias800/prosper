@@ -10,9 +10,10 @@
 //     <detail> hint=<...>`. De-duplicated per rule on diag_ratelimit's contract: the first three
 //     firings, then powers of two, each carrying its 1-based ordinal -- so the last ordinal is a
 //     lower bound on how many windows fired, and the line count never is.
-//   * PROSPER_PERF_ALARM_LOG=<path>: one JSON object per firing window (every window, no rate
-//     limit), flushed as written, so a run killed by SIGTERM -- which skips the exit report -- still
-//     leaves its record.
+//   * PROSPER_PERF_ALARM_LOG=<path>: JSONL, flushed as written, so a run killed by SIGTERM -- which
+//     skips the exit report -- still leaves its record. `"type":"alarm"` for every firing (no rate
+//     limit) and `"type":"window"` for every window with the raw quantities the rules read, so a
+//     quiet run still shows how close it came to each threshold.
 //   * at exit (register_exit_report): one summary line per rule that fired (windows fired, worst
 //     value, when), or a line saying no rule fired in N evaluated windows. The second form exists so
 //     "nothing fired" cannot be confused with "the engine never ran": the latter prints nothing.

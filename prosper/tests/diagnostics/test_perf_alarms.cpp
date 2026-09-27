@@ -335,8 +335,12 @@ void test_engine() {
     }
     std::fflush(log);
     const std::string j = slurp(jsonl);
-    check("JSONL keeps every firing window (10 objects, no rate limit)",
-          count_of(j, "{\"t\":") == 10 && count_of(j, "\"rule\":\"dropped-draws\"") == 10);
+    check("JSONL keeps every firing window (10 alarm objects, no rate limit)",
+          count_of(j, "{\"type\":\"alarm\"") == 10 &&
+              count_of(j, "\"rule\":\"dropped-draws\"") == 10);
+    check("JSONL records every evaluated window (12), fired or not",
+          count_of(j, "{\"type\":\"window\"") == 12 &&
+              j.find("\"dropped_frontend\":3,") != std::string::npos);
     check("JSONL records the ordinal and the target rate",
           j.find("\"ordinal\":10") != std::string::npos && j.find("\"target_hz\":60") != std::string::npos);
     const std::string summary = slurp(logp);

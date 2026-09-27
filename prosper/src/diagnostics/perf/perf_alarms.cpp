@@ -123,7 +123,7 @@ std::vector<AlarmFiring> AlarmEngine::close_window(const WindowSample& w, double
                          a.threshold, cost, a.detail.c_str(), a.hint);
         }
         if (jsonl_) {
-            std::fprintf(jsonl_, "{\"t\":%.3f,\"rule\":", t_seconds);
+            std::fprintf(jsonl_, "{\"type\":\"alarm\",\"t\":%.3f,\"rule\":", t_seconds);
             json_string(jsonl_, a.rule);
             std::fprintf(jsonl_, ",\"ordinal\":%llu,\"window_s\":%.3f,\"flips\":%llu,"
                                  "\"target_hz\":%u,\"value\":%.4f,\"unit\":",
@@ -140,7 +140,37 @@ std::vector<AlarmFiring> AlarmEngine::close_window(const WindowSample& w, double
             std::fputs("}\n", jsonl_);
         }
     }
-    if (jsonl_ && !fired.empty()) std::fflush(jsonl_);
+    if (jsonl_) {
+        // Every window, fired or not: the raw quantities the rules read, so a tool can see how close
+        // a quiet run came to a threshold and calibrate against a known answer.
+        const auto ms = [&](Cost c) { return w.ms(c); };
+        const auto ev = [&](Cost c) { return (unsigned long long)w.events(c); };
+        const auto n = [&](Counter c) { return (unsigned long long)w.count(c); };
+        std::fprintf(jsonl_,
+                     "{\"type\":\"window\",\"t\":%.3f,\"window_s\":%.3f,\"flips\":%llu,"
+                     "\"target_hz\":%u,\"alarms\":%zu,"
+                     "\"readback_ms\":%.3f,\"readbacks\":%llu,\"readback_max_ms\":%.3f,"
+                     "\"hle_blocked_ms\":%.3f,\"hle_blocked_calls\":%llu,"
+                     "\"present_cpu_ms\":%.3f,\"presents\":%llu,"
+                     "\"frontend_build_ms\":%.3f,\"frontend_build_groups\":%llu,"
+                     "\"texture_refs\":%llu,\"texture_misses\":%llu,\"texture_refusals\":%llu,"
+                     "\"texture_evictions\":%llu,\"texture_cache_mib\":%.1f,"
+                     "\"texture_limit_mib\":%.1f,\"dropped_frontend\":%llu,"
+                     "\"dropped_backend\":%llu,\"vk_allocs\":%llu}\n",
+                     t_seconds, w.seconds, (unsigned long long)w.flips, w.target_hz, fired.size(),
+                     ms(Cost::SurfaceReadback), ev(Cost::SurfaceReadback),
+                     w.cost_max_ns[static_cast<size_t>(Cost::SurfaceReadback)] / 1e6,
+                     ms(Cost::HleBlockingWait), ev(Cost::HleBlockingWait),
+                     ms(Cost::PresentCpu), ev(Cost::PresentCpu),
+                     ms(Cost::FrontendBuild), ev(Cost::FrontendBuild),
+                     n(Counter::TextureReferences), n(Counter::TextureCacheMisses),
+                     n(Counter::TextureCacheRefusals), n(Counter::TextureCacheEvictions),
+                     w.gauge(Gauge::TextureCacheBytes) / (1024.0 * 1024.0),
+                     w.gauge(Gauge::TextureCacheLimit) / (1024.0 * 1024.0),
+                     n(Counter::DroppedDrawsFrontend), n(Counter::DroppedDrawsBackend),
+                     n(Counter::DeviceAllocations));
+        std::fflush(jsonl_);
+    }
     return fired;
 }
 
