@@ -579,19 +579,23 @@ void test_pipeline_cache_thrash() {
 
 void test_texture_validation_churn() {
     std::puts("texture-validation-churn");
+    // The counter carries bytes the compare READ, not texture sizes. A source whose change sits
+    // near its end: 150 failures, each reading ~8 MiB before finding it -> 240 MiB/s.
     WindowSample bad = healthy();
-    // Sonic's movie planes: ~8 MiB compared and failed ~30 times a second.
     set_count(bad, Counter::TextureValidationFailures, 150);
     set_count(bad, Counter::TextureValidationFailedBytes, 150ull * 8 * 1024 * 1024);
     const auto a = evaluate_rules(bad, kDefault);
-    check("240 MiB/s of failed validations fires texture-validation-churn alone",
+    check("240 MiB/s of bytes read by failed validations fires texture-validation-churn alone",
           only(a, "texture-validation-churn"));
     check("...with the count and bytes", !a.empty() &&
               a[0].detail.find("failed-validations=150 validated=1200MiB") != std::string::npos);
-    WindowSample small = healthy();
-    set_count(small, Counter::TextureValidationFailures, 500);
-    set_count(small, Counter::TextureValidationFailedBytes, 500ull * 256 * 1024);   // 25 MiB/s
-    check("many small failed validations (25 MiB/s) are quiet", evaluate_rules(small, kDefault).empty());
+    // A movie plane rewritten wholesale every frame: 8 MiB textures, but each failed compare stops
+    // at its first 64 KiB chunk. 150 failures read ~9.4 MiB, not 1.2 GiB: quiet.
+    WindowSample movie = healthy();
+    set_count(movie, Counter::TextureValidationFailures, 150);
+    set_count(movie, Counter::TextureValidationFailedBytes, 150ull * 64 * 1024);
+    check("wholesale rewrites (each compare stops at its first chunk) are quiet",
+          evaluate_rules(movie, kDefault).empty());
 }
 
 void set_transfer(WindowSample& w, prosper::diagnostics::Transfer t, double mib_per_s) {

@@ -132,10 +132,16 @@ constexpr double kPresentFallbackMinPerSecond = 5.0;
 // 5/s is 25 per window, well above a scene change's one-off churn.
 constexpr double kPipelineCacheEvictionsPerSecond = 5.0;
 
-// texture-validation-churn: RATE. Guest bytes read by persistent decode-cache validations that
-// FAILED (the source had changed): the compare is certain to fail for a texture rewritten every
-// frame (a movie plane), and its cost is paid on top of the re-decode (#3900 proposal: Sonic's
-// ~8 MB movie planes). 128 MiB/s is a quarter of what one core compares in a second.
+// texture-validation-churn: RATE. Guest bytes actually read by persistent decode-cache validations
+// that FAILED (the source had changed). The compare reads 64 KiB chunks and stops at the first
+// difference, so a texture rewritten wholesale every frame costs ~64 KiB per failure and stays far
+// below this; what the rule catches is a source that changes only NEAR ITS END (a partially
+// streamed atlas, a plane whose tail is rewritten), where each failure reads most of the texture
+// before finding the change and the re-decode follows anyway. 128 MiB/s is ~1% of one core at
+// memcpy-class compare rates -- a cost worth naming, not noise. Measured 2026-09-28 with the true
+// byte count on GTA V's intro movie: ~340 failed validations per 5 s window reading at most 10.2 MiB
+// in a window (~2 MiB/s), so the rule is quiet there; the earlier source-size count read 283 MiB/s
+// for the same windows and was ~140x too high. (Sonic Frontiers not re-measured.)
 constexpr double kTextureValidationFailedMiBPerSecond = 128.0;
 
 // SUSTAIN: consecutive windows a rule's condition must hold before the engine reports it. A cost

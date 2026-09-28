@@ -272,6 +272,21 @@ std::vector<AlarmFiring> AlarmEngine::close_window(const WindowSample& w, double
                          n(Counter::GpuMemoryFallbacks));
             json_counts(jsonl_, ranked(w.gpu_memory_off_device, names, kGpuMemoryClassSlots));
         }
+        // #3891 queue rules' raw quantities.
+        std::fprintf(jsonl_,
+                     ",\"draws_unaccounted\":%llu,\"hle_unimplemented_calls\":%llu,"
+                     "\"hle_unimplemented_first\":%llu,\"present_cpu_fallbacks\":%llu,"
+                     "\"pipeline_evictions\":%llu,\"pipeline_layout_evictions\":%llu,"
+                     "\"descriptor_set_layout_evictions\":%llu,"
+                     "\"texture_validation_failures\":%llu,\"texture_validation_failed_mib\":%.2f,"
+                     "\"diagnostic_path_switches\":%llu",
+                     n(Counter::DrawsUnaccounted), n(Counter::HleUnimplementedCalls),
+                     n(Counter::HleUnimplementedFirst), n(Counter::PresentCpuFallbacks),
+                     n(Counter::PipelineEvictions), n(Counter::PipelineLayoutEvictions),
+                     n(Counter::DescriptorSetLayoutEvictions),
+                     n(Counter::TextureValidationFailures),
+                     n(Counter::TextureValidationFailedBytes) / (1024.0 * 1024.0),
+                     (unsigned long long)w.gauge(Gauge::DiagnosticPathSwitches));
         std::fputs(",\"host_copy_mib_by_site\":{", jsonl_);
         bool first = true;
         for (size_t i = 0; i < WindowSample::kTransferCount; ++i) {

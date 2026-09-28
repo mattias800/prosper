@@ -195,6 +195,8 @@ the first flip (boot-time ones are before the engine's baseline); `diagnostic-pa
 gauge the live renderer sets once, naming the switch that turned GPU-resident colour targets off;
 `present-path-fallback` compares prosper-app's CPU-fallback presents against the GPU presents
 `present-cpu-overhead` already counts; `pipeline-cache-thrash` counts evictions from the pipeline,
-pipeline-layout and descriptor-set-layout caches; `texture-validation-churn` counts guest bytes read
-by exact decode-cache validations that failed. Proposals needing a new expensive signal were
+pipeline-layout and descriptor-set-layout caches; `texture-validation-churn` counts the guest bytes
+exact decode-cache validations that FAILED actually read (the compare stops at the first differing
+chunk, so a texture rewritten every frame is cheap and quiet; a source changing only near its end is
+what it names). Proposals needing a new expensive signal were
 declined on the issue with a reason rather than approximated.

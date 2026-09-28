@@ -6051,13 +6051,14 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     if (timing_enabled)
                                         pending_timing.persistent_invalidations++;
                                     // #3891 texture-validation-churn: an exact validation that
-                                    // read the source and found it changed.
+                                    // found the source changed, charged the bytes it really read
+                                    // (the compare stops at the first differing 64 KiB chunk).
                                     if (resource_texture_exact_validation) {
                                         prosper::diagnostics::perf::add(
                                             prosper::diagnostics::perf::Counter::TextureValidationFailures);
                                         prosper::diagnostics::perf::add(
                                             prosper::diagnostics::perf::Counter::TextureValidationFailedBytes,
-                                            persistent_source_size);
+                                            resource_texture_validated_bytes);
                                     }
                                 }
                             } else {

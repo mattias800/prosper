@@ -90,7 +90,9 @@ enum class Counter : uint8_t {
     PipelineLayoutEvictions,   // pipeline layouts evicted from their full cache
     DescriptorSetLayoutEvictions,  // descriptor-set layouts evicted from their full cache
     TextureValidationFailures,     // persistent decode-cache entries whose exact compare failed
-    TextureValidationFailedBytes,  // guest bytes those failed validations read
+    TextureValidationFailedBytes,  // guest bytes those failed validations actually read (the
+                                   // compare stops at the first differing chunk, so this is the
+                                   // compare's cost, not the texture's size)
     Count
 };
 
