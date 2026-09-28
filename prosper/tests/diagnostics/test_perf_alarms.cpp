@@ -407,6 +407,55 @@ void test_skipped_dispatches() {
     check("every dispatch-skip reason has a name", named);
 }
 
+void test_gpu_memory_off_device() {
+    std::puts("gpu-memory-off-device");
+    // The ledger hook: counts, bytes and the named per-class slot move together.
+    Ledger& l = ledger();
+    const auto n = [&](Counter c) { return l.counters[static_cast<size_t>(c)].load(); };
+    const uint64_t off0 = n(Counter::GpuMemoryOffDevice), bytes0 = n(Counter::GpuMemoryOffDeviceBytes);
+    const uint64_t slot0 = l.gpu_memory_off_device[3].load();
+    note_gpu_memory_off_device(3, "depth-target", 4096);
+    check("note_gpu_memory_off_device counts the placement, its bytes and its class",
+          n(Counter::GpuMemoryOffDevice) - off0 == 1 &&
+              n(Counter::GpuMemoryOffDeviceBytes) - bytes0 == 4096 &&
+              l.gpu_memory_off_device[3].load() - slot0 == 1 &&
+              std::strcmp(l.gpu_memory_class_names[3].load(), "depth-target") == 0);
+    note_gpu_memory_off_device(kGpuMemoryClassSlots, "out-of-range", 1);
+    check("an out-of-range slot is ignored, not written past the array",
+          n(Counter::GpuMemoryOffDevice) - off0 == 1);
+
+    // An 8 GB card running out of VRAM mid-scene: 40 depth targets and 12 sampled textures retried
+    // on a host type in one window.
+    WindowSample bad = healthy();
+    set_count(bad, Counter::GpuMemoryOffDevice, 52);
+    set_count(bad, Counter::GpuMemoryOffDeviceBytes, 52ull * 8 * 1024 * 1024);
+    set_count(bad, Counter::GpuMemoryFallbacks, 52);
+    bad.gpu_memory_off_device[3] = 40;
+    bad.gpu_memory_class_names[3] = "depth-target";
+    bad.gpu_memory_off_device[6] = 12;
+    bad.gpu_memory_class_names[6] = "sampled-texture";
+    const auto a = evaluate_rules(bad, kDefault);
+    check("off-device placements fire gpu-memory-off-device alone", only(a, "gpu-memory-off-device"));
+    check("...naming the classes, largest first, the bytes and the fallbacks",
+          !a.empty() &&
+              a[0].detail.find("classes=depth-target:40,sampled-texture:12") != std::string::npos &&
+              a[0].detail.find("bytes=416.0MiB") != std::string::npos &&
+              a[0].detail.find("oom-fallbacks=52") != std::string::npos &&
+              a[0].breakdown.size() == 2);
+    WindowSample one = healthy();
+    set_count(one, Counter::GpuMemoryOffDevice, 1);
+    check("a single placement fires (any)", fired(evaluate_rules(one, kDefault), "gpu-memory-off-device"));
+    check("...even at a lowered sensitivity",
+          fired(evaluate_rules(one, RuleThresholds::scaled(1000)), "gpu-memory-off-device"));
+    WindowSample fallback_on_device = healthy();
+    set_count(fallback_on_device, Counter::GpuMemoryFallbacks, 5);
+    check("a fallback that stayed device-local is quiet (only off-device placements alarm)",
+          evaluate_rules(fallback_on_device, kDefault).empty());
+    check("no placements is quiet", evaluate_rules(healthy(), kDefault).empty());
+    check("it is a correctness-class rule: reported on the first window",
+          sustain_windows("gpu-memory-off-device") == 1);
+}
+
 void set_transfer(WindowSample& w, prosper::diagnostics::Transfer t, double mib_per_s) {
     w.transfer_bytes[static_cast<size_t>(t)] =
         static_cast<uint64_t>(mib_per_s * w.seconds * 1024.0 * 1024.0);
@@ -714,7 +763,7 @@ void test_engine() {
     const std::string quiet = slurp(logp);
     check("...saying no rule fired", quiet.find("no rule fired in 1 windows") != std::string::npos);
     check("...and listing the rules that had no data as NOT quiet",
-          quiet.find("7 of 9 rules had data") != std::string::npos &&
+          quiet.find("8 of 10 rules had data") != std::string::npos &&
               quiet.find("NO DATA (not measured in any window, so not quiet): "
                          "texture-reference-cost,present-cpu-overhead") != std::string::npos);
     std::fclose(s);
@@ -815,6 +864,7 @@ int main() {
     test_dropped_draws();
     test_drop_reasons();
     test_skipped_dispatches();
+    test_gpu_memory_off_device();
     test_host_copy_pressure();
     test_shader_compile();
     test_sampler_seed();
@@ -824,8 +874,9 @@ int main() {
     test_texture_reference_sample();
     test_engine();
     test_engine_breakdowns();
-    check("rule_names lists the six phase-2 rules and the three added with phase 3",
-          rule_names().size() == 9);
+    check("rule_names lists the six phase-2 rules, the three added with phase 3, and "
+          "gpu-memory-off-device (#3897)",
+          rule_names().size() == 10);
     std::printf("%s: %d failure(s)\n", g_failures ? "FAILED" : "ok", g_failures);
     return g_failures ? 1 : 0;
 }

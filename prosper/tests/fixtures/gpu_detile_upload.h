@@ -226,12 +226,11 @@ inline std::shared_ptr<GpuDetileUpload> prepare_gpu_detile_upload(
         if (vkCreateBuffer(program.device, &ci, nullptr, &buf) != VK_SUCCESS) return false;
         VkMemoryRequirements requirements{};
         vkGetBufferMemoryRequirements(program.device, buf, &requirements);
-        const uint32_t type = prosper::gpu::choose_gpu_only_memory_type(
-            prosper::gpu::GpuOnlyMemoryClass::DetileOutput, memory, requirements.memoryTypeBits);
-        if (type == UINT32_MAX) return false;
         VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-        ai.allocationSize = requirements.size; ai.memoryTypeIndex = type;
-        return prosper::gpu::allocate_device_memory(program.device, &ai, &mem) == VK_SUCCESS &&
+        ai.allocationSize = requirements.size;
+        return prosper::gpu::allocate_gpu_only_memory(
+                   program.device, prosper::gpu::GpuOnlyMemoryClass::DetileOutput, memory,
+                   requirements.memoryTypeBits, ai, &mem) == VK_SUCCESS &&
                vkBindBufferMemory(program.device, buf, mem, 0) == VK_SUCCESS;
     };
     const auto input = acquire_mapped_staging(program.device, upload->source_bytes,

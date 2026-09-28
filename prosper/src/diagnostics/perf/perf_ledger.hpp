@@ -77,6 +77,10 @@ enum class Counter : uint8_t {
     DroppedDrawsContract,      // draws the frontend rejected: descriptor contract validation failed
     DeviceAllocations,         // successful vkAllocateMemory calls
     SkippedDispatches,         // compute dispatches prosper wanted to run and did not (DispatchSkip)
+    // GPU-only renderer allocations (gpu/diagnostics/memory_placement_log.hpp, #3897):
+    GpuMemoryFallbacks,        // succeeded only after the preferred type ran out of device memory
+    GpuMemoryOffDevice,        // landed on a non-device-local type although the device has one
+    GpuMemoryOffDeviceBytes,   // bytes of those placements
     Count
 };
 
@@ -179,6 +183,12 @@ constexpr const char* kDispatchSkipNames[kDispatchSkipCount] = {
     "indirect-dependencies", "indirect-arguments", "backend-declined",
 };
 
+// Per-class breakdown of Counter::GpuMemoryOffDevice. The classes are the renderer's
+// prosper::gpu::GpuOnlyMemoryClass, which this header must not include (it has no Vulkan types);
+// the recorder passes each class's name as a string literal, stored by pointer like cost_label, and
+// memory_placement_log.hpp static_asserts that every class fits a slot.
+constexpr size_t kGpuMemoryClassSlots = 16;
+
 constexpr size_t kCostCount = static_cast<size_t>(Cost::Count);
 constexpr size_t kCounterCount = static_cast<size_t>(Counter::Count);
 constexpr size_t kGaugeCount = static_cast<size_t>(Gauge::Count);
@@ -192,6 +202,8 @@ struct Ledger {
     std::atomic<uint64_t> gauges[kGaugeCount] = {};
     std::atomic<uint64_t> drop_reasons[kDropReasonCount] = {};
     std::atomic<uint64_t> dispatch_skips[kDispatchSkipCount] = {};
+    std::atomic<uint64_t> gpu_memory_off_device[kGpuMemoryClassSlots] = {};
+    std::atomic<const char*> gpu_memory_class_names[kGpuMemoryClassSlots] = {};
     // The one attribution string a cost may carry: which HLE lock blocked, for instance. A pointer
     // to a string literal, stored without copying.
     std::atomic<const char*> cost_label[kCostCount] = {};
@@ -240,6 +252,18 @@ inline void drop_draw(DropReason reason) {
         : i >= static_cast<size_t>(kFirstBackendDropReason) ? Counter::DroppedDrawsBackend
                                                              : Counter::DroppedDrawsFrontend);
     ledger().drop_reasons[i].fetch_add(1, std::memory_order_relaxed);
+}
+
+// One GPU-only renderer allocation that landed off device-local memory while the device has some
+// (#3897): an out-of-memory fallback, or a resource whose memoryTypeBits allowed no device-local
+// type. `name` must be a string literal (stored by pointer).
+inline void note_gpu_memory_off_device(size_t slot, const char* name, uint64_t bytes) {
+    if (slot >= kGpuMemoryClassSlots) return;
+    Ledger& l = ledger();
+    l.gpu_memory_class_names[slot].store(name, std::memory_order_relaxed);
+    l.gpu_memory_off_device[slot].fetch_add(1, std::memory_order_relaxed);
+    add(Counter::GpuMemoryOffDevice);
+    add(Counter::GpuMemoryOffDeviceBytes, bytes);
 }
 
 // Re-realizations that are not live execution (an F9 capture re-realizing a submit's dispatches

@@ -12,7 +12,8 @@
 // Rule classes (the issue's vocabulary): SHARE of the title's frame budget, which comes from the
 // guest's own sceVideoOutSetFlipRate rather than an assumed 60 Hz; RATE per second; STATE (a cache
 // that cannot evict); CORRECTNESS (any dropped draw or skipped compute dispatch -- a drop can make a
-// run look FASTER, so it is an alarm and not just a counter, and it names the site that dropped).
+// run look FASTER, so it is an alarm and not just a counter, and it names the site that dropped --
+// and any GPU-only allocation placed off device-local memory, which no pixel test can see).
 
 #include "diagnostics/perf/perf_ledger.hpp"
 #include "diagnostics/transfer_pressure.hpp"
@@ -70,6 +71,14 @@ constexpr uint64_t kDroppedDrawsPerWindow = 1;
 // output unwritten (GTA V's missing world was one declined program, #2481).
 constexpr uint64_t kSkippedDispatchesPerWindow = 1;
 
+// gpu-memory-off-device: CORRECTNESS class (the frame is right, but on a discrete GPU every access
+// to the resource crosses the bus, and no pixel test can see it). Any GPU-only renderer allocation
+// placed in a non-device-local type while the device has device-local memory: either
+// vkAllocateMemory ran out of device memory and the #3897 fallback retried a host type, or the
+// resource's memoryTypeBits allowed no device-local type at all. On this project's APU neither
+// happens, so a firing here is news.
+constexpr uint64_t kGpuMemoryOffDevicePerWindow = 1;
+
 // host-copy-pressure: bytes this process copies host-side on the guest's behalf, per second -- the
 // sum over EVERY default-on [transfer-pressure] category (storage-materialize, buffer-upload,
 // buffer-compare, rtt-snapshot, detile), the same total that census's HIGH line uses. Its
@@ -121,6 +130,9 @@ struct WindowSample {
     // Per-reason breakdowns of DroppedDraws* and SkippedDispatches (#3891 phase 3).
     uint64_t drop_reasons[kDropReasonCount] = {};
     uint64_t dispatch_skips[kDispatchSkipCount] = {};
+    // Per-class breakdown of GpuMemoryOffDevice, and each slot's name (nullptr: never recorded).
+    uint64_t gpu_memory_off_device[kGpuMemoryClassSlots] = {};
+    const char* gpu_memory_class_names[kGpuMemoryClassSlots] = {};
     // Host-copy bytes per [transfer-pressure] category (diagnostics::Transfer).
     static constexpr size_t kTransferCount = static_cast<size_t>(Transfer::Count);
     uint64_t transfer_bytes[kTransferCount] = {};
@@ -149,6 +161,7 @@ struct RuleThresholds {
     double present_min_per_s = kPresentMinPerSecond;
     uint64_t dropped_draws = kDroppedDrawsPerWindow;
     uint64_t skipped_dispatches = kSkippedDispatchesPerWindow;
+    uint64_t gpu_memory_off_device = kGpuMemoryOffDevicePerWindow;
     double host_copy_mib_per_s = kHostCopyMiBPerSecond;
     double shader_compile_budget_share = kShaderCompileBudgetShare;
     double shader_compile_min_per_s = kShaderCompileMinPerSecond;

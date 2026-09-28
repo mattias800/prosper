@@ -64,8 +64,8 @@ RuleThresholds RuleThresholds::scaled(double percent) {
     t.host_copy_mib_per_s *= k;
     t.shader_compile_budget_share *= k;
     t.shader_compile_min_per_s *= k;
-    // dropped_draws and skipped_dispatches stay at "any": a correctness alarm has no sensitivity to
-    // lower.
+    // dropped_draws, skipped_dispatches and gpu_memory_off_device stay at "any": a correctness
+    // alarm has no sensitivity to lower.
     return t;
 }
 
@@ -74,6 +74,7 @@ const std::vector<const char*>& rule_names() {
         "texture-cache-thrash", "surface-readback", "texture-reference-cost",
         "hle-blocking-wait",    "present-cpu-overhead", "dropped-draws",
         "skipped-dispatches",   "host-copy-pressure",   "shader-compile",
+        "gpu-memory-off-device",
     };
     return names;
 }
@@ -89,7 +90,8 @@ bool rule_has_data(const char* rule, const WindowSample& w) {
 
 uint32_t sustain_windows(const char* rule) {
     const std::string r = rule ? rule : "";
-    if (r == "dropped-draws" || r == "skipped-dispatches") return kCorrectnessSustainWindows;
+    if (r == "dropped-draws" || r == "skipped-dispatches" || r == "gpu-memory-off-device")
+        return kCorrectnessSustainWindows;
     if (r == "shader-compile") return kShaderCompileSustainWindows;
     if (r == "texture-reference-cost") return kTextureReferenceSustainWindows;
     return kSustainWindows;
@@ -272,6 +274,34 @@ std::vector<AlarmFiring> evaluate_rules(const WindowSample& w, const RuleThresho
                      "render wrong; next: the once-per-program [compute] skip lines name the "
                      "program, PROSPER_COMPUTE_PROGRAM_CENSUS=1 gives executed/skipped per program, "
                      "PROSPER_COMPUTE_DESCRIPTOR_DETAIL=1 for descriptor-contract; cf. #2481";
+            out.push_back(std::move(a));
+        }
+    }
+
+    // gpu-memory-off-device (CORRECTNESS class, by allocation class).
+    {
+        const uint64_t n = w.count(Counter::GpuMemoryOffDevice);
+        if (n && n >= t.gpu_memory_off_device) {
+            AlarmFiring a;
+            a.rule = "gpu-memory-off-device";
+            a.value = static_cast<double>(n);
+            a.unit = "allocations";
+            a.threshold = static_cast<double>(t.gpu_memory_off_device);
+            const char* names[kGpuMemoryClassSlots];
+            for (size_t i = 0; i < kGpuMemoryClassSlots; ++i)
+                names[i] = w.gpu_memory_class_names[i] ? w.gpu_memory_class_names[i] : "?";
+            a.breakdown = ranked(w.gpu_memory_off_device, names, kGpuMemoryClassSlots);
+            a.detail = format("off-device=%llu bytes=%.1fMiB oom-fallbacks=%llu classes=%s",
+                              (unsigned long long)n,
+                              w.count(Counter::GpuMemoryOffDeviceBytes) / kMiB,
+                              (unsigned long long)w.count(Counter::GpuMemoryFallbacks),
+                              top_entries(a.breakdown).c_str());
+            a.hint = "resources only the GPU touches were placed in system memory although the "
+                     "device has device-local memory: correct pixels, but on a discrete GPU every "
+                     "access crosses the bus. oom-fallbacks>0 means VRAM ran out and the allocation "
+                     "was retried on a host type; otherwise the resource allowed no device-local "
+                     "type. next: the [mem-placement] lines (class, type, heap), [gpu-mem] for "
+                     "prosper's per-heap standing; cf. #3888, #3897";
             out.push_back(std::move(a));
         }
     }

@@ -2080,12 +2080,18 @@ struct VulkanComputeContext {
         return released;
     }
 
+    // `allocation_status`, when given, receives the ALLOCATION's result only (VK_SUCCESS for a pool
+    // hit) -- unlike `setup_status` it arms no test fault injection and ignores the mapping, so a
+    // caller can tell VK_ERROR_OUT_OF_DEVICE_MEMORY apart and retry another type (#3897).
     VkDeviceMemory allocate_memory(VkDeviceSize bytes, uint32_t memory_type,
                                    bool persistently_map = false,
-                                   VkResult* setup_status = nullptr) {
+                                   VkResult* setup_status = nullptr,
+                                   VkResult* allocation_status = nullptr) {
         if (setup_status) *setup_status = VK_SUCCESS;
+        if (allocation_status) *allocation_status = VK_SUCCESS;
         if (memory_type == UINT32_MAX) {
             if (setup_status) *setup_status = VK_ERROR_FEATURE_NOT_PRESENT;
+            if (allocation_status) *allocation_status = VK_ERROR_FEATURE_NOT_PRESENT;
             return VK_NULL_HANDLE;
         }
         // Fault controls are scoped to the caller requesting exact setup errors
@@ -2171,6 +2177,7 @@ struct VulkanComputeContext {
             }
         }
         if (setup_status) *setup_status = allocation_result;
+        if (allocation_status) *allocation_status = allocation_result;
         // The budget reports the failure from inside allocate_device_memory, which is the only
         // place that sees every one of them (#3533).
         if (allocation_result != VK_SUCCESS) return VK_NULL_HANDLE;
@@ -10208,9 +10215,19 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 VkMemoryRequirements ireq{};
                 vkGetImageMemoryRequirements(ctx.device, bi.image, &ireq);
                 bi.allocation_bytes = ireq.size;
-                const uint32_t image_memory_type = prosper::gpu::choose_gpu_only_memory_type(
-                    prosper::gpu::GpuOnlyMemoryClass::ComputeImage, ctx.memory, ireq.memoryTypeBits);
-                bi.memory = ctx.allocate_memory(ireq.size, image_memory_type);
+                // #3897: device-local first; on VK_ERROR_OUT_OF_DEVICE_MEMORY (after the pool has
+                // released its cached allocations) the next type the image allows.
+                VkDeviceMemory image_memory = VK_NULL_HANDLE;
+                prosper::gpu::allocate_gpu_only(
+                    prosper::gpu::GpuOnlyMemoryClass::ComputeImage, ctx.memory,
+                    ireq.memoryTypeBits, ireq.size,
+                    [&](uint32_t type) {
+                        VkResult status = VK_SUCCESS;
+                        image_memory = ctx.allocate_memory(ireq.size, type, false, nullptr, &status);
+                        return status;
+                    },
+                    prosper::gpu::force_gpu_only_oom(prosper::gpu::GpuOnlyMemoryClass::ComputeImage));
+                bi.memory = image_memory;
                 if (!vk_handle_ok(bi.memory, "image-memory") ||
                     !vk_ok(vkBindImageMemory(ctx.device, bi.image, bi.memory, 0), "image-bind")) {
                     images_ready = false; break; }
