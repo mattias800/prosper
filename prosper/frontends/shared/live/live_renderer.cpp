@@ -51,6 +51,7 @@
 #include "shared/media/avplayer_plane_policy.hpp"    // which sampled resource is AvPlayer's NV12 chroma plane
 #include "shared/live/texture_reference_census.hpp"  // PROSPER_TEXREF_CENSUS (#3873)
 #include "shared/live/submit_renderer/callback_types.hpp" // the callback's own types (#3892)
+#include "shared/live/submit_renderer/guest_reads.hpp"    // safe_span / safe_copy / safe_equal
 #include "shared/rtt/volume_target_index.hpp"        // volume-footprint candidates (#3873)
 #include "shared/present/guest_scanout_present.hpp"    // publishing the guest's own flipped buffer (#1968)
 #include "shared/diagnostics/diagnostic_window.hpp"        // census window by callback ordinal or by elapsed time
@@ -2996,16 +2997,6 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 if (FILE* f = fopen((d + "/frame_fs.spv").c_str(), "wb")) { fwrite(dump_fs.data(), 4, dump_fs.size(), f); fclose(f); }
                 fprintf(stderr, "[render] dumped SPIR-V vs=%zu fs=%zu dwords\n", dump_vs.size(), dump_fs.size()); fflush(stderr);
             }
-            // A declared resource can extend past its real committed guest mapping. The shared
-            // prefix helper checks exact mapping boundaries before a host read can lazy-commit a
-            // reservation; it also prepares Windows sparse direct pages within the proven extent.
-            // Callers keep their existing zero-filled short-read fallback.
-            auto safe_span = [](uint64_t a, size_t n) -> size_t {
-                return guest_source_readable_prefix(a, n, prosper::gpu::guest_readable);
-            };
-            auto safe_copy = [](uint8_t* dst, uint64_t a, size_t n) -> size_t {
-                return copy_guest_source(dst, a, n, prosper::gpu::guest_readable);
-            };
             // A uniform DCC clear is self-contained in metadata. If the ordered compute span dirtied
             // a retained target's metadata, materialize that clear now so the following graphics pass
             // loads the clear value rather than stale pixels (or an arbitrary fallback clear).
@@ -3107,11 +3098,6 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 pending_timing.dcc_materialize_surfaces += dcc_materialize_surfaces;
                 pending_timing.dcc_materialize_bytes += dcc_materialize_bytes;
             }
-            auto safe_equal = [](const uint8_t* expected, uint64_t a, size_t n,
-                                 size_t& compared) -> bool {
-                return equal_guest_source_prefix(
-                    expected, a, n, compared, prosper::gpu::guest_readable);
-            };
             // Keep decoded texture storage alive across callbacks. The old clear()+emplace(size, 0)
             // released and zero-filled tens of MiB every submit even though the decode paths overwrite
             // all pixels. Reusing same-sized slots avoids both costs; short guest reads explicitly clear
