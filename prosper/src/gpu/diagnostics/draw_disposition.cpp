@@ -28,6 +28,10 @@ constexpr std::array<const char*, kReasonCount> kNames{
 };
 static_assert(kNames.size() == kReasonCount,
               "every DrawDrop needs a stable name; logs are grepped by these strings");
+// The perf-alarm ledger mirrors DrawDrop as its backend/* drop reasons, in this order (#3891).
+static_assert(static_cast<size_t>(prosper::diagnostics::perf::kFirstBackendDropReason) +
+                      kReasonCount == prosper::diagnostics::perf::kDropReasonCount,
+              "perf::DropReason's backend range must mirror DrawDrop one-for-one");
 
 // Print EVERY pass, healthy or not. This exists because a silent instrument and an instrument
 // that was never reached are indistinguishable from outside -- the failure mode the charter's
@@ -115,7 +119,10 @@ void DrawDispositionCensus::note_dropped(DrawDrop reason) {
     auto& s = state();
     s.dropped[i].fetch_add(1, std::memory_order_relaxed);
     s.pass_dropped[i].fetch_add(1, std::memory_order_relaxed);
-    prosper::diagnostics::perf::add(prosper::diagnostics::perf::Counter::DroppedDrawsBackend);
+    // #3891: the same reason, in the alarm ledger's backend/* range.
+    namespace perf = prosper::diagnostics::perf;
+    perf::drop_draw(static_cast<perf::DropReason>(
+        static_cast<size_t>(perf::kFirstBackendDropReason) + i));
 }
 
 uint64_t DrawDispositionCensus::pass_seen_for_scope() const {

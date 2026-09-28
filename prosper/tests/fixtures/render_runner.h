@@ -12332,6 +12332,10 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             }
             VkResult pipeline_result;
             {
+                // #3891 shader-compile: one clock pair per pipeline-cache MISS (a hit never gets
+                // here), including the wait for the driver-cache lock, which is part of the stall.
+                const prosper::diagnostics::perf::CostScope perf_pipeline(
+                    prosper::diagnostics::perf::Cost::PipelineCreate);
                 std::lock_guard<std::timed_mutex> cache_lock(graphics_driver_cache_mutex());
                 pipeline_result = vkCreateGraphicsPipelines(
                     dev, ctx.driver_pipeline_cache, 1, &gp, nullptr, &v.pipe);

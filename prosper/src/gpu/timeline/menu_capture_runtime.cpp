@@ -1,4 +1,5 @@
 #include "gpu/timeline/menu_capture_runtime.hpp"
+#include "diagnostics/perf/perf_ledger.hpp"  // #3891: capture re-realization is not a skip
 
 #include "build_revision.hpp"
 #include "diagnostics/exit_reports.hpp"
@@ -262,6 +263,7 @@ void report_prior_effect_graph(const GpuState& state, GpuReplayFrame replay,
         return;
     }
     std::vector<OperationRealizationFailure> failures;
+    const prosper::diagnostics::perf::SuppressDispatchSkipCounting not_live;  // #3891: re-realization, not a skip
     replay.computes = realize_compute_dispatches(state, submit_no, &failures);
     std::unordered_set<uint64_t> draw_indices, compute_indices;
     for (const DrawItem& draw : replay.items) draw_indices.insert(draw.draw_index);

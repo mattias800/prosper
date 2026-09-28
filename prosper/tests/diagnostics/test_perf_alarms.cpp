@@ -14,6 +14,8 @@
 #include "diagnostics/perf/perf_alarm_rules.hpp"
 #include "diagnostics/perf/perf_alarms.hpp"
 #include "diagnostics/perf/perf_ledger.hpp"
+#include "diagnostics/transfer_pressure.hpp"
+#include "gpu/diagnostics/draw_disposition.hpp"
 
 #include <chrono>
 #include <cstdint>
@@ -21,6 +23,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <set>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -271,6 +274,226 @@ void test_dropped_draws() {
           fired(evaluate_rules(one, RuleThresholds::scaled(1000)), "dropped-draws"));
 }
 
+
+// ---- #3891 phase 3: per-site drop reasons ----------------------------------------------------
+
+size_t reason_index(DropReason r) { return static_cast<size_t>(r); }
+
+void test_drop_reasons() {
+    std::puts("dropped-draws reasons");
+    // The ledger hook: the reason AND the matching coarse counter, from one call, so the total the
+    // rule reads and the breakdown it prints cannot disagree.
+    Ledger& l = ledger();
+    const auto counter = [&](Counter c) { return l.counters[static_cast<size_t>(c)].load(); };
+    const auto reason = [&](DropReason r) { return l.drop_reasons[reason_index(r)].load(); };
+    const uint64_t f0 = counter(Counter::DroppedDrawsFrontend);
+    const uint64_t c0 = counter(Counter::DroppedDrawsContract);
+    const uint64_t b0 = counter(Counter::DroppedDrawsBackend);
+    const uint64_t v0 = reason(DropReason::VolumeNoRendererImage);
+    const uint64_t k0 = reason(DropReason::ContractMismatch);
+    const uint64_t s0 = reason(DropReason::BackendShaderRejected);
+    drop_draw(DropReason::VolumeNoRendererImage);
+    drop_draw(DropReason::VolumeNoRendererImage);
+    drop_draw(DropReason::ContractMismatch);
+    drop_draw(DropReason::BackendShaderRejected);
+    check("drop_draw(volume-no-renderer-image) x2 counts two frontend drops with that reason",
+          counter(Counter::DroppedDrawsFrontend) - f0 == 2 &&
+              reason(DropReason::VolumeNoRendererImage) - v0 == 2);
+    check("drop_draw(contract-mismatch) counts a CONTRACT drop, not a frontend-unresolved one",
+          counter(Counter::DroppedDrawsContract) - c0 == 1 &&
+              reason(DropReason::ContractMismatch) - k0 == 1);
+    check("drop_draw(backend/shader-rejected) counts a BACKEND drop",
+          counter(Counter::DroppedDrawsBackend) - b0 == 1 &&
+              reason(DropReason::BackendShaderRejected) - s0 == 1);
+
+    // Names: stable, unique, and the backend range mirrors draw_disposition's own names in order
+    // (draw_disposition.cpp static_asserts the COUNT; this pins the MEANING of each slot).
+    std::set<std::string> names;
+    bool all_named = true;
+    for (size_t i = 0; i < kDropReasonCount; ++i) {
+        all_named &= kDropReasonNames[i] && *kDropReasonNames[i];
+        if (kDropReasonNames[i]) names.insert(kDropReasonNames[i]);
+    }
+    check("every drop reason has a distinct non-empty name", all_named && names.size() == kDropReasonCount);
+    bool mirrored = true;
+    for (size_t i = 0; i < static_cast<size_t>(prosper::gpu::DrawDrop::Count); ++i)
+        mirrored &= std::string(kDropReasonNames[reason_index(kFirstBackendDropReason) + i]) ==
+                    std::string("backend/") +
+                        prosper::gpu::draw_drop_name(static_cast<prosper::gpu::DrawDrop>(i));
+    check("backend/* reasons are draw_disposition's reasons, slot for slot", mirrored);
+
+    // The rule names the top sites. #3893's shape: ~2 frontend drops per flip from one site, plus a
+    // rarer second site, so the ranking (not declaration order) is what the reader must see first.
+    WindowSample w = healthy();
+    set_count(w, Counter::DroppedDrawsFrontend, 270);
+    w.drop_reasons[reason_index(DropReason::ArrayDepthView)] = 10;
+    w.drop_reasons[reason_index(DropReason::VolumeNoRendererImage)] = 260;
+    const auto a = evaluate_rules(w, kDefault);
+    check("a window with reasons still fires dropped-draws alone", only(a, "dropped-draws"));
+    check("detail names the reasons, largest first",
+          !a.empty() && a[0].detail.find("reasons=volume-no-renderer-image:260,"
+                                         "render-array-reject/depth-view:10") != std::string::npos);
+    check("breakdown carries the same ranking for the JSONL",
+          !a.empty() && a[0].breakdown.size() == 2 &&
+              std::string(a[0].breakdown[0].first) == "volume-no-renderer-image" &&
+              a[0].breakdown[0].second == 260);
+    WindowSample none = healthy();
+    set_count(none, Counter::DroppedDrawsBackend, 1);
+    const auto b = evaluate_rules(none, kDefault);
+    check("a drop with no recorded reason still fires, and says reasons=none",
+          fired(b, "dropped-draws") && b[0].detail.find("reasons=none") != std::string::npos);
+
+    uint64_t counts[5] = {1, 9, 0, 5, 7};
+    const char* labels[5] = {"a", "b", "c", "d", "e"};
+    const auto r = ranked(counts, labels, 5);
+    check("ranked drops zeros and sorts by count", r.size() == 4 && r[0].second == 9 &&
+                                                      r[3].second == 1);
+    check("top_entries shows the top three and how many more",
+          top_entries(r) == "b:9,e:7,d:5(+1 more)");
+}
+
+// ---- new rules ------------------------------------------------------------------------------
+
+void test_skipped_dispatches() {
+    std::puts("skipped-dispatches");
+    Ledger& l = ledger();
+    const auto skips = [&] { return l.counters[static_cast<size_t>(Counter::SkippedDispatches)].load(); };
+    const auto reason = [&](DispatchSkip r) { return l.dispatch_skips[static_cast<size_t>(r)].load(); };
+    const uint64_t n0 = skips(), d0 = reason(DispatchSkip::DescriptorContract);
+    skip_dispatch(DispatchSkip::DescriptorContract);
+    check("skip_dispatch counts the skip and its reason",
+          skips() - n0 == 1 && reason(DispatchSkip::DescriptorContract) - d0 == 1);
+    {
+        const SuppressDispatchSkipCounting capture_re_realization;
+        skip_dispatch(DispatchSkip::DescriptorContract);
+    }
+    check("a capture's re-realization does not count again", skips() - n0 == 1);
+    skip_dispatch(DispatchSkip::MissingProgram);
+    check("...and counting resumes after it", skips() - n0 == 2);
+
+    // The backend outcome bracket: a refusal counts, a deliberate decline (the selector) does not.
+    {
+        const uint64_t before = skips(), declined = reason(DispatchSkip::BackendDeclined);
+        const BackendDispatchOutcome refused;
+        const bool refused_deliberate = refused.finish(false);
+        check("a backend refusal counts backend-declined",
+              !refused_deliberate && skips() - before == 1 &&
+                  reason(DispatchSkip::BackendDeclined) - declined == 1);
+        const BackendDispatchOutcome selector;
+        note_deliberate_dispatch_decline();
+        check("a deliberate decline inside the call is not counted, and is reported as deliberate",
+              selector.finish(false) && skips() - before == 1);
+        const BackendDispatchOutcome ran;
+        check("an executed dispatch is not counted", !ran.finish(true) && skips() - before == 1);
+    }
+
+    // GTA V's missing world (#2481) was one declined compute program per frame.
+    WindowSample bad = healthy();
+    set_count(bad, Counter::SkippedDispatches, 150);
+    bad.dispatch_skips[static_cast<size_t>(DispatchSkip::BackendDeclined)] = 150;
+    const auto a = evaluate_rules(bad, kDefault);
+    check("a window skipping one dispatch per flip fires skipped-dispatches alone",
+          only(a, "skipped-dispatches"));
+    check("...naming the reason", !a.empty() &&
+                                      a[0].detail.find("reasons=backend-declined:150") != std::string::npos);
+    WindowSample one = healthy();
+    set_count(one, Counter::SkippedDispatches, 1);
+    check("a single skip fires (correctness: any)", fired(evaluate_rules(one, kDefault), "skipped-dispatches"));
+    check("...even at a lowered sensitivity", fired(evaluate_rules(one, RuleThresholds::scaled(1000)),
+                                                    "skipped-dispatches"));
+    check("no skips is quiet", evaluate_rules(healthy(), kDefault).empty());
+    bool named = true;
+    for (size_t i = 0; i < kDispatchSkipCount; ++i) named &= kDispatchSkipNames[i] && *kDispatchSkipNames[i];
+    check("every dispatch-skip reason has a name", named);
+}
+
+void set_transfer(WindowSample& w, prosper::diagnostics::Transfer t, double mib_per_s) {
+    w.transfer_bytes[static_cast<size_t>(t)] =
+        static_cast<uint64_t>(mib_per_s * w.seconds * 1024.0 * 1024.0);
+}
+
+void test_host_copy_pressure() {
+    std::puts("host-copy-pressure");
+    using prosper::diagnostics::Transfer;
+    // Sonic Frontiers on main (a6b9ee3f6): 1,427 MiB/s over the whole route -- detile 376 GB and
+    // rtt-snapshot 77 GB in 318 s.
+    WindowSample sonic = healthy();
+    set_transfer(sonic, Transfer::Detile, 1183.0);
+    set_transfer(sonic, Transfer::RenderTargetSnapshot, 241.0);
+    set_transfer(sonic, Transfer::StorageMaterialize, 2.0);
+    const auto a = evaluate_rules(sonic, kDefault);
+    check("Sonic's 1,426 MiB/s host copy fires host-copy-pressure alone", only(a, "host-copy-pressure"));
+    check("...naming detile as the largest site", !a.empty() &&
+              a[0].detail.find("MiB-by-site=detile:") != std::string::npos &&
+              std::string(a[0].breakdown[0].first) == "detile");
+    // GTA V on main: ~80 MiB/s.
+    WindowSample gta = healthy();
+    set_transfer(gta, Transfer::StorageMaterialize, 32.0);
+    set_transfer(gta, Transfer::RenderTargetSnapshot, 21.0);
+    set_transfer(gta, Transfer::Detile, 27.0);
+    check("GTA V's 80 MiB/s is quiet", evaluate_rules(gta, kDefault).empty());
+    WindowSample under = healthy();
+    set_transfer(under, Transfer::Detile, kHostCopyMiBPerSecond - 1.0);
+    WindowSample over = healthy();
+    set_transfer(over, Transfer::Detile, kHostCopyMiBPerSecond + 1.0);
+    check("just under the threshold is quiet, just over fires",
+          evaluate_rules(under, kDefault).empty() &&
+              fired(evaluate_rules(over, kDefault), "host-copy-pressure"));
+    check("...and the investigation setting lowers it",
+          fired(evaluate_rules(gta, RuleThresholds::scaled(25)), "host-copy-pressure"));
+}
+
+void test_shader_compile() {
+    std::puts("shader-compile");
+    // A pipeline cache that never hits: 400 pipelines in 5 s at ~4 ms each while the title flips at
+    // 30 Hz against a 30 Hz budget -- 1.6 s of compile per 5 s, 32% of the budget per flip.
+    WindowSample thrash = healthy();
+    set_cost(thrash, Cost::PipelineCreate, 1600.0, 400, 9.0);
+    const auto a = evaluate_rules(thrash, kDefault);
+    check("a steadily compiling window fires shader-compile alone", only(a, "shader-compile"));
+    // Recompiles count toward the same budget.
+    WindowSample mixed = healthy();
+    set_cost(mixed, Cost::PipelineCreate, 800.0, 200, 9.0);
+    set_cost(mixed, Cost::ShaderCompile, 800.0, 100, 30.0);
+    check("recompiles and pipeline creation are summed",
+          fired(evaluate_rules(mixed, kDefault), "shader-compile"));
+    WindowSample mixed_half = healthy();
+    set_cost(mixed_half, Cost::PipelineCreate, 800.0, 200, 9.0);
+    check("...either half alone (16%) is quiet", evaluate_rules(mixed_half, kDefault).empty());
+    // One enormous shader: much time, too few compiles to be a pattern.
+    WindowSample one_big = healthy();
+    set_cost(one_big, Cost::ShaderCompile, 2000.0, 40, 400.0);   // 8/s
+    check("40 compiles in 5 s (below the 20/s floor) is quiet however long they take",
+          evaluate_rules(one_big, kDefault).empty());
+    // A healthy steady state compiles now and then.
+    WindowSample steady = healthy();
+    set_cost(steady, Cost::PipelineCreate, 60.0, 15, 8.0);
+    check("15 pipelines in 5 s costing 60 ms is quiet", evaluate_rules(steady, kDefault).empty());
+    // The tail of a cold-cache load: still expensive per flip (the title flips slowly while it
+    // streams) but the compile COUNT has decayed -- Outer Wilds on main, 71 compiles in the sixth
+    // window of its burst, 407 ms against 40 flips (61% of a 60 Hz budget).
+    WindowSample tail = healthy();
+    tail.flips = 40;
+    tail.target_hz = 60;
+    set_cost(tail, Cost::PipelineCreate, 393.0, 39, 19.0);
+    set_cost(tail, Cost::ShaderCompile, 14.0, 32, 1.0);
+    check("a decayed cold-cache tail (71 compiles, 61% of budget) is quiet on the count floor",
+          evaluate_rules(tail, kDefault).empty());
+    check("shader-compile needs eight sustained windows (cold-cache loads measured 3-5)",
+          sustain_windows("shader-compile") == 8);
+}
+
+void test_sampler_seed() {
+    std::puts("texture-reference sampler seed");
+    // The one address whose term cancels the constant exactly. Without `| 1` this seed is 0, and
+    // xorshift of 0 is 0 forever: every reference would be timed.
+    const uintptr_t cancelling = static_cast<uintptr_t>(0x9e3779b9u) << 4;
+    check("the seed is never zero, even when the address cancels the constant",
+          texture_sample_seed(cancelling) != 0);
+    check("...and still differs between threads' state addresses",
+          texture_sample_seed(0x1000) != texture_sample_seed(0x2000));
+}
+
 void test_threshold_scaling() {
     std::puts("PROSPER_PERF_ALARM_THRESHOLD_PCT");
     WindowSample w = healthy();
@@ -473,7 +696,8 @@ void test_engine() {
                   fired(engine.close_window(readback, 40), "surface-readback"));
         check("sustain_windows: correctness 1, texture-reference-cost 3, others 2",
               sustain_windows("dropped-draws") == 1 && sustain_windows("texture-reference-cost") == 3 &&
-                  sustain_windows("hle-blocking-wait") == 2);
+                  sustain_windows("hle-blocking-wait") == 2 &&
+                  sustain_windows("skipped-dispatches") == 1);
     }
 
     // Summary forms: never evaluated prints nothing; evaluated and quiet says so.
@@ -490,10 +714,91 @@ void test_engine() {
     const std::string quiet = slurp(logp);
     check("...saying no rule fired", quiet.find("no rule fired in 1 windows") != std::string::npos);
     check("...and listing the rules that had no data as NOT quiet",
-          quiet.find("4 of 6 rules had data") != std::string::npos &&
+          quiet.find("7 of 9 rules had data") != std::string::npos &&
               quiet.find("NO DATA (not measured in any window, so not quiet): "
                          "texture-reference-cost,present-cpu-overhead") != std::string::npos);
     std::fclose(s);
+    std::remove(jsonl.c_str());
+    std::remove(logp.c_str());
+}
+
+
+// The engine half of phase 3: per-window deltas of the reason arrays and of the external
+// transfer totals, the JSONL breakdowns, the run-total breakdown in the summary, and the active
+// set the --fps marker reads.
+void test_engine_breakdowns() {
+    std::puts("engine breakdowns");
+    const std::string dir = std::getenv("TMPDIR") ? std::getenv("TMPDIR") : ".";
+    const std::string tag = std::to_string(
+        std::chrono::steady_clock::now().time_since_epoch().count()) + "_b" +
+        std::to_string(reinterpret_cast<uintptr_t>(&dir) & 0xffffff);
+    const std::string jsonl = dir + "/test_perf_alarms_" + tag + ".jsonl";
+    const std::string logp = dir + "/test_perf_alarms_" + tag + ".log";
+    FILE* log = std::fopen(logp.c_str(), "w+");
+    {
+        EngineConfig config;
+        config.window_ns = 1'000'000'000ull;
+        config.jsonl_path = jsonl;
+        config.log = log;
+        AlarmEngine engine(std::move(config));
+        Ledger l;
+        AlarmEngine::ExternalTotals ext;
+        const size_t volume = static_cast<size_t>(DropReason::VolumeNoRendererImage);
+        const size_t detile = static_cast<size_t>(prosper::diagnostics::Transfer::Detile);
+        // Pre-baseline residue in both the reasons and the external totals.
+        l.drop_reasons[volume] = 500;
+        ext.transfer_bytes[detile] = 9ull << 30;
+        uint64_t t = 1'000'000'000ull;
+        engine.on_flip(t, l, 60, &ext);
+        // Window 1: 2 drops from one site, 1 from another; 600 MiB detiled (600 MiB/s: fires only
+        // after two windows).
+        l.counters[static_cast<size_t>(Counter::DroppedDrawsFrontend)] += 3;
+        l.drop_reasons[volume] += 2;
+        l.drop_reasons[static_cast<size_t>(DropReason::ArrayShortBacking)] += 1;
+        ext.transfer_bytes[detile] += 600ull << 20;
+        t += 1'000'000'000ull;
+        auto w1 = engine.on_flip(t, l, 60, &ext);
+        check("window 1 reports dropped-draws with the WINDOW's reasons (2+1), not the residue",
+              w1.size() == 1 && w1[0].breakdown.size() == 2 && w1[0].breakdown[0].second == 2);
+        check("the active set is the rules reported in the last window",
+              engine.active_rules().size() == 1 &&
+                  std::string(engine.active_rules()[0]) == "dropped-draws");
+        // Window 2: detile continues, no drops.
+        ext.transfer_bytes[detile] += 600ull << 20;
+        t += 1'000'000'000ull;
+        auto w2 = engine.on_flip(t, l, 60, &ext);
+        check("window 2: host-copy-pressure (sustained) fires from the external delta (600 MiB/s)",
+              w2.size() == 1 && std::string(w2[0].rule) == "host-copy-pressure" &&
+                  w2[0].value > 590 && w2[0].value < 610);
+        check("...and the active set follows it", engine.active_rules().size() == 1 &&
+                  std::string(engine.active_rules()[0]) == "host-copy-pressure");
+        // Window 3: quiet.
+        t += 1'000'000'000ull;
+        check("a quiet window empties the active set",
+              engine.on_flip(t, l, 60, &ext).empty() && engine.active_rules().empty());
+        // Window 4: the same site again, to check the run total sums across windows.
+        l.counters[static_cast<size_t>(Counter::DroppedDrawsFrontend)] += 4;
+        l.drop_reasons[volume] += 4;
+        t += 1'000'000'000ull;
+        engine.on_flip(t, l, 60, &ext);
+        std::rewind(log);
+        engine.write_summary(log);
+    }
+    std::fflush(log);
+    const std::string j = slurp(jsonl);
+    check("the JSONL alarm record carries the breakdown object",
+          j.find("\"breakdown\":{\"volume-no-renderer-image\":2,"
+                 "\"render-array-reject/short-backing\":1}") != std::string::npos);
+    check("every JSONL window carries drop_reasons, dispatch_skips and host copy by site",
+          count_of(j, "\"drop_reasons\":{") == 4 && count_of(j, "\"dispatch_skips\":{}") == 4 &&
+              j.find("\"host_copy_mib_by_site\":{\"detile\":600.0}") != std::string::npos &&
+              j.find("\"drop_reasons\":{}") != std::string::npos);
+    const std::string summary = slurp(logp);
+    check("the exit summary sums a rule's breakdown over every window it fired in (2+4)",
+          summary.find("summary rule=dropped-draws breakdown over fired windows: "
+                       "volume-no-renderer-image:6,render-array-reject/short-backing:1") !=
+              std::string::npos);
+    std::fclose(log);
     std::remove(jsonl.c_str());
     std::remove(logp.c_str());
 }
@@ -508,12 +813,19 @@ int main() {
     test_hle_blocking_wait();
     test_present_cpu_overhead();
     test_dropped_draws();
+    test_drop_reasons();
+    test_skipped_dispatches();
+    test_host_copy_pressure();
+    test_shader_compile();
+    test_sampler_seed();
     test_threshold_scaling();
     test_budget_follows_flip_rate();
     test_cost_scope_nesting();
     test_texture_reference_sample();
     test_engine();
-    check("rule_names lists the six phase-2 rules", rule_names().size() == 6);
+    test_engine_breakdowns();
+    check("rule_names lists the six phase-2 rules and the three added with phase 3",
+          rule_names().size() == 9);
     std::printf("%s: %d failure(s)\n", g_failures ? "FAILED" : "ok", g_failures);
     return g_failures ? 1 : 0;
 }

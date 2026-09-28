@@ -3,6 +3,7 @@
 // a caller-supplied Vulkan render -> present_write_frame -> present_readback. Proves the executor entry
 // point that agc_driver_submit_dcb will call, and the scanout round-trip, end to end on llvmpipe.
 #include "gpu/execute/gpu_execute.hpp"
+#include "diagnostics/perf/perf_ledger.hpp"
 #include "gpu/capture/gpu_capture.hpp"
 #include "gpu/present/videoout_present.hpp"
 #include "gpu/pm4/pm4_registers.hpp"
@@ -1672,6 +1673,75 @@ int main() {
         CHECK(!backendless_zero_executed && !backendless_zero_unknown &&
                   !backendless_one_executed && backendless_one_unknown,
               "indirect no-op classification precedes the compute-backend requirement");
+
+        // #3891 skipped-dispatches: each documented exclusion, with the positive control that
+        // shows the same submit IS counted once the excluded condition is removed.
+        {
+            namespace perf = prosper::diagnostics::perf;
+            const auto skips = [] {
+                return perf::ledger()
+                    .counters[static_cast<size_t>(perf::Counter::SkippedDispatches)].load();
+            };
+            const auto reason = [](perf::DispatchSkip r) {
+                return perf::ledger().dispatch_skips[static_cast<size_t>(r)].load();
+            };
+            // (1) No compute backend. A DMA copy keeps execute_nonrender_submit_work on the
+            // ordered path; an unreadable indirect dispatch is followed by a dependent one.
+            uint8_t dma_source = 0x5a, dma_target = 0;
+            GpuState stranded = nonrender;
+            stranded.dispatches.clear();
+            stranded.dma_copies.push_back({
+                (uint64_t)(uintptr_t)&dma_target, (uint64_t)(uintptr_t)&dma_source, 1, 0, 5, 0});
+            GpuState::Dispatch unreadable;
+            unreadable.indirect = true;
+            unreadable.indirect_args_addr = 0xdead00000000ull;
+            unreadable.command_order = 20;
+            GpuState::Dispatch dependent = indirect_one;
+            dependent.command_order = 30;
+            stranded.dispatches = {unreadable, dependent};
+            set_submit_compute({});
+            uint64_t before = skips();
+            (void)execute_nonrender_submit_work(stranded, 1451);
+            CHECK(skips() == before,
+                  "#3891: with no compute backend, indirect dispatches are not skipped-dispatches");
+            set_submit_compute([](const std::vector<ComputeItem>& items) { return !items.empty(); });
+            before = skips();
+            uint64_t args_before = reason(perf::DispatchSkip::IndirectArguments);
+            uint64_t deps_before = reason(perf::DispatchSkip::IndirectDependencies);
+            (void)execute_nonrender_submit_work(stranded, 1452);
+            set_submit_compute({});
+            CHECK(skips() - before == 2 &&
+                      reason(perf::DispatchSkip::IndirectArguments) - args_before == 1 &&
+                      reason(perf::DispatchSkip::IndirectDependencies) - deps_before == 1,
+                  "#3891: ...with a backend, the same submit counts indirect-arguments and the "
+                  "dependent indirect-dependencies");
+
+            // (2) A deliberate decline (what PROSPER_COMPUTE_SKIP_PROGRAM's selector does inside
+            // the live backend) and the indirect dispatch whose producer epoch it broke.
+            GpuState declined = one_direct;
+            GpuState::Dispatch stranded_after = indirect_one;
+            stranded_after.command_order = 40;
+            declined.dispatches.push_back(stranded_after);
+            set_submit_compute([](const std::vector<ComputeItem>&) {
+                perf::note_deliberate_dispatch_decline();
+                return false;
+            });
+            before = skips();
+            (void)execute_nonrender_submit_work(declined, 1453);
+            CHECK(skips() == before,
+                  "#3891: a deliberate backend decline, and the indirect dispatch it strands, are "
+                  "not skipped-dispatches");
+            set_submit_compute([](const std::vector<ComputeItem>&) { return false; });
+            before = skips();
+            const uint64_t declined_before = reason(perf::DispatchSkip::BackendDeclined);
+            deps_before = reason(perf::DispatchSkip::IndirectDependencies);
+            (void)execute_nonrender_submit_work(declined, 1454);
+            set_submit_compute({});
+            CHECK(skips() - before == 2 &&
+                      reason(perf::DispatchSkip::BackendDeclined) - declined_before == 1 &&
+                      reason(perf::DispatchSkip::IndirectDependencies) - deps_before == 1,
+                  "#3891: ...a genuine refusal counts backend-declined and the stranded dispatch");
+        }
 
         // The production capture below sees the same indirect argument address twice: first as a
         // zero-workgroup no-op, then after the ordered WRITE_DATA mutates X to one. This is the

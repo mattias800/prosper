@@ -5,6 +5,7 @@
 #endif
 
 #include "gpu/capture/gpu_capture.hpp"
+#include "diagnostics/perf/perf_ledger.hpp"  // #3891: capture re-realization is not a skip
 
 #include <mutex>
 #include "hle/fs/save_paths.hpp"   // the effective per-title /savedata0 dir (#2734)
@@ -210,6 +211,7 @@ bool capture_gpustate_submit(const GpuState& state, uint64_t submit_no,
         }
     }
     if (caplog) std::fprintf(stderr, "[cap] realize draws=%zu; realize_compute_dispatches...\n", draws.size());
+    const prosper::diagnostics::perf::SuppressDispatchSkipCounting not_live;  // #3891: re-realization, not a skip
     std::vector<ComputeItem> computes = realize_compute_dispatches(state, submit_no, &compute_failures);
     if (caplog) std::fprintf(stderr, "[cap] realize computes=%zu; plan_submit_operations...\n", computes.size());
     failures.insert(failures.end(), std::make_move_iterator(compute_failures.begin()),
@@ -1227,6 +1229,7 @@ bool materialize_pending_gpu_capture(PendingGpuCapture& pending,
         std::vector<OperationRealizationFailure> compute_failures;
         (void)realize_gpustate_draws(*semantic_state, 0x10000, 1.0f, 1.0f,
                                      &failures, false, false);
+        const prosper::diagnostics::perf::SuppressDispatchSkipCounting not_live;  // #3891: re-realization, not a skip
         (void)realize_compute_dispatches(*semantic_state, metadata.submit_index,
                                          &compute_failures);
         failures.insert(failures.end(),
@@ -1290,6 +1293,7 @@ bool materialize_pending_gpu_capture(PendingGpuCapture& pending,
             diagnostic_state.dispatches.clear();
             diagnostic_state.dispatches.push_back(dispatch);
             std::vector<OperationRealizationFailure> semantic_failures;
+            const prosper::diagnostics::perf::SuppressDispatchSkipCounting not_live;  // #3891: re-realization, not a skip
             std::vector<ComputeItem> semantic_items = realize_compute_dispatches(
                 diagnostic_state, metadata.submit_index, &semantic_failures);
             if (!semantic_items.empty()) {

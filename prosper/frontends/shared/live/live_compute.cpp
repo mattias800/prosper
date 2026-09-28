@@ -1,4 +1,5 @@
 #include "shared/live/live_compute.hpp"
+#include "diagnostics/perf/perf_ledger.hpp"   // #3891: shader-compile alarm
 #include "shared/compute/storage_write_mask_spirv.hpp"
 #include "shared/diagnostics/trip_bound_witness.hpp"
 #include "shared/compute/compute_authority_live_census.hpp"
@@ -6645,8 +6646,11 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     // the other instruments, so a run can answer "what would this program have been?" without also
     // running the dispatch that is under suspicion. That combination — dump the module, skip the
     // dispatch — is what lets a recompiler change be checked against a program that hangs the GPU.
-    if (!compute_skip_programs().empty() && compute_skip_programs().count(item.code_addr))
+    if (!compute_skip_programs().empty() && compute_skip_programs().count(item.code_addr)) {
+        // #3891: an experiment, not a refusal -- skipped-dispatches must not count it.
+        prosper::diagnostics::perf::note_deliberate_dispatch_decline();
         return decline("skipped-by-selector");
+    }
     if (item.required_subgroup_size &&
         (!ctx.borrowed || !ctx.native_subgroup_contract ||
          item.required_subgroup_size < ctx.min_native_subgroup_size ||
@@ -10900,6 +10904,10 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                               low_latency_compile ? "disabled-for-cold-latency" : "driver-default");
             VkResult pipeline_result = VK_SUCCESS;
             {
+                // #3891 shader-compile: one clock pair per compute pipeline built (a cached one
+                // never gets here) -- including when the cache is full and it is not retained.
+                const prosper::diagnostics::perf::CostScope perf_pipeline(
+                    prosper::diagnostics::perf::Cost::PipelineCreate);
                 std::lock_guard<std::timed_mutex> cache_lock(ctx.pipeline_cache_mutex);
                 pipeline_result = vkCreateComputePipelines(
                     ctx.device, ctx.pipeline_cache, 1, &cpci, nullptr, &pipeline);

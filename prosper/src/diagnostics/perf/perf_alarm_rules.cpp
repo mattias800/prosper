@@ -1,14 +1,21 @@
 #include "diagnostics/perf/perf_alarm_rules.hpp"
 
+#include <algorithm>
+#include <cstdarg>
 #include <cstdio>
 
 namespace prosper::diagnostics::perf {
 
 namespace {
 
-std::string format(const char* fmt, auto... args) {
+// printf-checked: a mismatched specifier in a rule's detail string is a compile-time warning, not
+// a garbled alarm line (or worse, a %s reading an integer) discovered in somebody's run log.
+[[gnu::format(printf, 1, 2)]] std::string format(const char* fmt, ...) {
     char buf[512];
-    std::snprintf(buf, sizeof buf, fmt, args...);
+    va_list args;
+    va_start(args, fmt);
+    std::vsnprintf(buf, sizeof buf, fmt, args);
+    va_end(args);
     return buf;
 }
 
@@ -19,6 +26,28 @@ double per_second(uint64_t n, double seconds) {
 constexpr double kMiB = 1024.0 * 1024.0;
 
 }  // namespace
+
+std::vector<std::pair<const char*, uint64_t>> ranked(const uint64_t* counts,
+                                                     const char* const* names, size_t n) {
+    std::vector<std::pair<const char*, uint64_t>> out;
+    for (size_t i = 0; i < n; ++i)
+        if (counts[i]) out.emplace_back(names[i], counts[i]);
+    std::stable_sort(out.begin(), out.end(),
+                     [](const auto& a, const auto& b) { return a.second > b.second; });
+    return out;
+}
+
+std::string top_entries(const std::vector<std::pair<const char*, uint64_t>>& breakdown,
+                        size_t top) {
+    std::string out;
+    for (size_t i = 0; i < breakdown.size() && i < top; ++i) {
+        if (!out.empty()) out += ',';
+        out += format("%s:%llu", breakdown[i].first, (unsigned long long)breakdown[i].second);
+    }
+    if (breakdown.size() > top) out += format("(+%llu more)",
+                                                      (unsigned long long)(breakdown.size() - top));
+    return out.empty() ? "none" : out;
+}
 
 RuleThresholds RuleThresholds::scaled(double percent) {
     RuleThresholds t;
@@ -32,7 +61,11 @@ RuleThresholds RuleThresholds::scaled(double percent) {
     t.hle_blocked_thread_share *= k;
     t.present_cpu_ms *= k;
     t.present_min_per_s *= k;
-    // dropped_draws stays at "any": a correctness alarm has no sensitivity to lower.
+    t.host_copy_mib_per_s *= k;
+    t.shader_compile_budget_share *= k;
+    t.shader_compile_min_per_s *= k;
+    // dropped_draws and skipped_dispatches stay at "any": a correctness alarm has no sensitivity to
+    // lower.
     return t;
 }
 
@@ -40,6 +73,7 @@ const std::vector<const char*>& rule_names() {
     static const std::vector<const char*> names = {
         "texture-cache-thrash", "surface-readback", "texture-reference-cost",
         "hle-blocking-wait",    "present-cpu-overhead", "dropped-draws",
+        "skipped-dispatches",   "host-copy-pressure",   "shader-compile",
     };
     return names;
 }
@@ -55,7 +89,8 @@ bool rule_has_data(const char* rule, const WindowSample& w) {
 
 uint32_t sustain_windows(const char* rule) {
     const std::string r = rule ? rule : "";
-    if (r == "dropped-draws") return kCorrectnessSustainWindows;
+    if (r == "dropped-draws" || r == "skipped-dispatches") return kCorrectnessSustainWindows;
+    if (r == "shader-compile") return kShaderCompileSustainWindows;
     if (r == "texture-reference-cost") return kTextureReferenceSustainWindows;
     return kSustainWindows;
 }
@@ -203,15 +238,100 @@ std::vector<AlarmFiring> evaluate_rules(const WindowSample& w, const RuleThresho
             a.value = static_cast<double>(total);
             a.unit = "draws";
             a.threshold = static_cast<double>(t.dropped_draws);
-            a.detail = format("frontend-unresolved=%llu frontend-contract=%llu backend-dropped=%llu",
+            a.breakdown = ranked(w.drop_reasons, kDropReasonNames, kDropReasonCount);
+            a.detail = format("frontend-unresolved=%llu frontend-contract=%llu backend-dropped=%llu "
+                              "flips=%llu reasons=%s",
                               (unsigned long long)frontend, (unsigned long long)contract,
-                              (unsigned long long)backend);
+                              (unsigned long long)backend, (unsigned long long)w.flips,
+                              top_entries(a.breakdown).c_str());
             a.hint = "draws prosper wanted to issue were dropped: a run can look faster AND render "
-                     "wrong; next: [draw-disposition] lines (PROSPER_DRAW_DISPOSITION_VERBOSE=1) "
-                     "for backend drops; for frontend-unresolved, [render-array-reject] and "
-                     "[volume-sample-drop] lines and "
-                     "PROSPER_RENDER_TIMING build_rejected; for frontend-contract, "
-                     "PROSPER_DESCRIPTOR_VALIDATE; cf. #3889";
+                     "wrong; `reasons` names the drop site (frontends/shared/live/live_renderer.cpp "
+                     "for volume-*/render-array-reject/*, perf::DropReason); next: for backend/*, "
+                     "[draw-disposition] lines (PROSPER_DRAW_DISPOSITION_VERBOSE=1); for "
+                     "render-array-reject/*, [render-array-reject] lines "
+                     "(PROSPER_ARRAY_REJECT_LOG_ALL=1); for volume-*, [volume-sample-drop] lines; "
+                     "for contract-mismatch, PROSPER_DESCRIPTOR_VALIDATE; cf. #3889";
+            out.push_back(std::move(a));
+        }
+    }
+
+    // skipped-dispatches (CORRECTNESS).
+    {
+        const uint64_t skipped = w.count(Counter::SkippedDispatches);
+        if (skipped && skipped >= t.skipped_dispatches) {
+            AlarmFiring a;
+            a.rule = "skipped-dispatches";
+            a.value = static_cast<double>(skipped);
+            a.unit = "dispatches";
+            a.threshold = static_cast<double>(t.skipped_dispatches);
+            a.breakdown = ranked(w.dispatch_skips, kDispatchSkipNames, kDispatchSkipCount);
+            a.detail = format("flips=%llu reasons=%s", (unsigned long long)w.flips,
+                              top_entries(a.breakdown).c_str());
+            a.hint = "compute dispatches prosper wanted to run did not run, so their outputs are "
+                     "stale or zero (a LUT, exposure, a light list): the frame can look faster AND "
+                     "render wrong; next: the once-per-program [compute] skip lines name the "
+                     "program, PROSPER_COMPUTE_PROGRAM_CENSUS=1 gives executed/skipped per program, "
+                     "PROSPER_COMPUTE_DESCRIPTOR_DETAIL=1 for descriptor-contract; cf. #2481";
+            out.push_back(std::move(a));
+        }
+    }
+
+    // host-copy-pressure (RATE).
+    {
+        uint64_t bytes = 0;
+        for (uint64_t b : w.transfer_bytes) bytes += b;
+        const double mib_per_s = per_second(bytes, w.seconds) / kMiB;
+        if (bytes && mib_per_s >= t.host_copy_mib_per_s) {
+            AlarmFiring a;
+            a.rule = "host-copy-pressure";
+            a.value = mib_per_s;
+            a.unit = "MiB/s";
+            a.threshold = t.host_copy_mib_per_s;
+            const char* names[WindowSample::kTransferCount];
+            uint64_t mib[WindowSample::kTransferCount];
+            for (size_t i = 0; i < WindowSample::kTransferCount; ++i) {
+                names[i] = transfer_name(static_cast<Transfer>(i));
+                mib[i] = static_cast<uint64_t>(w.transfer_bytes[i] / kMiB + 0.5);
+            }
+            a.breakdown = ranked(mib, names, WindowSample::kTransferCount);
+            a.detail = format("copied=%.0fMiB per-flip=%.1fMiB flips=%llu MiB-by-site=%s",
+                              bytes / kMiB, w.flips ? bytes / kMiB / static_cast<double>(w.flips) : 0.0,
+                              (unsigned long long)w.flips, top_entries(a.breakdown, 5).c_str());
+            a.hint = "the CPU is copying/detiling guest data at a rate that is usually a residency "
+                     "or dirty-tracking gap (re-detiling or re-snapshotting what did not change), "
+                     "not real work; next: the [transfer-pressure] exit line, [tile-census] for "
+                     "detile, [storage-materialize]/[gpu-seed-refused] for storage and snapshots; "
+                     "cf. #3407, #3871";
+            out.push_back(std::move(a));
+        }
+    }
+
+    // shader-compile (SHARE, with a rate floor and a long sustain).
+    {
+        const uint64_t n = w.events(Cost::ShaderCompile) + w.events(Cost::PipelineCreate);
+        const double ms = w.ms(Cost::ShaderCompile) + w.ms(Cost::PipelineCreate);
+        const double share = w.flips ? ms / static_cast<double>(w.flips) / budget : 0.0;
+        if (n && per_second(n, w.seconds) >= t.shader_compile_min_per_s &&
+            share >= t.shader_compile_budget_share) {
+            AlarmFiring a;
+            a.rule = "shader-compile";
+            a.value = share * 100.0;
+            a.unit = "%budget(thread-time)";
+            a.threshold = t.shader_compile_budget_share * 100.0;
+            a.cost_ms = ms;
+            a.detail = format("recompiles=%llu recompile=%.0fms max=%.1fms pipelines=%llu "
+                              "pipeline=%.0fms max=%.1fms flips=%llu budget=%.1fms(%uHz)",
+                              (unsigned long long)w.events(Cost::ShaderCompile),
+                              w.ms(Cost::ShaderCompile),
+                              w.cost_max_ns[static_cast<size_t>(Cost::ShaderCompile)] / 1e6,
+                              (unsigned long long)w.events(Cost::PipelineCreate),
+                              w.ms(Cost::PipelineCreate),
+                              w.cost_max_ns[static_cast<size_t>(Cost::PipelineCreate)] / 1e6,
+                              (unsigned long long)w.flips, budget, w.target_hz);
+            a.hint = "shaders or pipelines have been compiled steadily for 40 s, which is what a "
+                     "cache that never hits looks like (a key that changes every frame, or a cache "
+                     "evicting what it just built); next: PROSPER_RENDER_TIMING shader hit/miss "
+                     "and pipeline cache stats, F8 setup_pipeline_ms";
             out.push_back(std::move(a));
         }
     }

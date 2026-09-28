@@ -1806,6 +1806,14 @@ if(TARGET prosper_core)
   add_executable(test_perf_alarms tests/diagnostics/test_perf_alarms.cpp)
   target_link_libraries(test_perf_alarms PRIVATE prosper_core)
   add_test(NAME perf_alarms COMMAND test_perf_alarms)
+  # The rules' detail strings go through a printf-attributed format() helper; the attribute only
+  # checks anything under -Wformat, which prosper_core does not enable, so make a mismatch an ERROR
+  # for this one translation unit (the gpu_replay precedent below: GCC diagnoses this at plain
+  # -Wformat). Positive control: "%s" given an unsigned long long fails the build.
+  if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    set_source_files_properties(src/diagnostics/perf/perf_alarm_rules.cpp
+                                PROPERTIES COMPILE_OPTIONS "-Werror=format")
+  endif()
 
   # Diagnostics: disabled-path test — verifies stubs are zero-cost (always runs).
   add_executable(test_diagnostics_disabled tests/diagnostics/test_diagnostics_disabled.cpp)

@@ -870,6 +870,13 @@ to remember to update it. The last one did not (review of #2820).
   affects Sonic too. The owner confirms the world is visible with the fix, with shader failures
   still present; the earlier uncontrolled non-black percentages are not a comparable measurement
   ([#3731](https://github.com/mattias800/prosper/pull/3731)).
+- **"The ~2 draws per flip dropped on the title and menus (#3893) come from one of the volume-authority
+  sites #3889 instrumented."** False: with per-site drop reasons (#3891 phase 3), 6,864 of 6,864
+  drops on the `reach-gameplay.pad` route are `render-array-reject/depth-unavailable` — a Float32
+  depth array at `0x2048a00000` whose retained layers are "missing or invalid"
+  (`read_persistent_ds_depth_array`), exactly 2.00 per flip until gameplay starts. The 64
+  `[render-array-reject]` lines that say so print in the first seconds and are then suppressed,
+  which is why a run tail never showed them ([#3893](https://github.com/mattias800/prosper/issues/3893)).
 
 | Hypothesis | Verdict and evidence |
 | --- | --- |

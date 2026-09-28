@@ -15,8 +15,12 @@
 //     limit) and `"type":"window"` for every window with the raw quantities the rules read, so a
 //     quiet run still shows how close it came to each threshold.
 //   * a rule is reported only once its condition has held for sustain_windows() consecutive
-//     windows (two for performance rules, three for texture-reference-cost, one for correctness),
-//     so a one-window load spike does not read as a steady-state cost.
+//     windows (two for performance rules, three for texture-reference-cost, more for
+//     shader-compile, one for correctness), so a load spike does not read as a steady-state cost.
+//   * correctness rules (dropped-draws, skipped-dispatches) carry a per-reason breakdown: the log
+//     line's `reasons=` names the top sites, the JSONL alarm record has a `breakdown` object, every
+//     JSONL window has `drop_reasons` / `dispatch_skips` / `host_copy_mib_by_site`, and the exit
+//     summary adds the breakdown summed over every window the rule fired in.
 //   * at exit (register_exit_report): one summary line per rule that fired (windows fired, worst
 //     value, when), or a line saying no rule fired in N evaluated windows. The second form exists so
 //     "nothing fired" cannot be confused with "the engine never ran": the latter prints nothing.
@@ -52,9 +56,22 @@ public:
     AlarmEngine(const AlarmEngine&) = delete;
     AlarmEngine& operator=(const AlarmEngine&) = delete;
 
+    // Running totals kept OUTSIDE the ledger by existing default-on censuses. The process entry
+    // point fills it from transfer_pressure on every flip (five relaxed loads) and only a window
+    // close uses it; a test passes its own.
+    struct ExternalTotals {
+        uint64_t transfer_bytes[WindowSample::kTransferCount] = {};
+    };
+
     // One guest flip at `now_ns`. Closes the window when it is due: takes the deltas of `ledger`
-    // since the previous close, evaluates, reports. Returns what fired (empty when not due).
-    std::vector<AlarmFiring> on_flip(uint64_t now_ns, Ledger& ledger, uint32_t target_hz);
+    // (and of `external`, when given) since the previous close, evaluates, reports. Returns what
+    // fired (empty when not due).
+    std::vector<AlarmFiring> on_flip(uint64_t now_ns, Ledger& ledger, uint32_t target_hz,
+                                     const ExternalTotals* external = nullptr);
+
+    // The most recent window's firings, as rule names with the time they fired: what the --fps
+    // overlay marks. Rules that fired in the last window are "active".
+    std::vector<const char*> active_rules() const;
 
     // Evaluate and report one already-built window. `t_seconds` is its end, relative to the
     // engine's first flip. Separate from on_flip so a test can drive it by hand. Returns what was
@@ -77,6 +94,8 @@ private:
         double worst_t = 0;
         double first_t = 0;
         std::string worst_detail;
+        // Summed breakdown (AlarmFiring::breakdown) over every window this rule was reported in.
+        std::vector<std::pair<const char*, uint64_t>> breakdown_total;
     };
     RuleState& state_for(const char* rule);
 
@@ -91,6 +110,10 @@ private:
     uint64_t prev_cost_ns_[kCostCount] = {};
     uint64_t prev_cost_events_[kCostCount] = {};
     uint64_t prev_counters_[kCounterCount] = {};
+    uint64_t prev_drop_reasons_[kDropReasonCount] = {};
+    uint64_t prev_dispatch_skips_[kDispatchSkipCount] = {};
+    uint64_t prev_transfer_bytes_[WindowSample::kTransferCount] = {};
+    std::vector<const char*> active_;   // rules REPORTED in the most recent window
     std::vector<std::pair<const char*, RuleState>> rules_;
 };
 
@@ -102,5 +125,11 @@ void on_guest_flip();
 
 // The guest's sceVideoOutSetFlipRate argument (0=60, 1=30, 2=20 Hz): the frame budget's source.
 void set_guest_flip_rate(int32_t rate);
+
+// For a HUD (prosper-app --fps): the rules reported in the most recently closed window, joined
+// with ',' into `out` (NUL-terminated, truncated to `cap`). Returns how many rules are active; 0
+// when none fired, the engine has not closed a window, or alarms are off. Lock-free and cheap
+// enough to call once per presented frame: it reads a published snapshot, never the engine.
+size_t active_alarm_summary(char* out, size_t cap);
 
 }  // namespace prosper::diagnostics::perf

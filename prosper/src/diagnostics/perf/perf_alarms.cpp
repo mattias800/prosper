@@ -4,6 +4,9 @@
 #include "diagnostics/exit_reports.hpp"
 #include "gpu/diagnostics/diag_ratelimit.hpp"
 
+#include "diagnostics/transfer_pressure.hpp"
+
+#include <algorithm>
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
@@ -26,6 +29,22 @@ void json_string(FILE* f, const char* s) {
         else std::fputc(c, f);
     }
     std::fputc('"', f);
+}
+
+void json_counts(FILE* f, const std::vector<std::pair<const char*, uint64_t>>& counts) {
+    std::fputc('{', f);
+    for (size_t i = 0; i < counts.size(); ++i) {
+        if (i) std::fputc(',', f);
+        json_string(f, counts[i].first);
+        std::fprintf(f, ":%llu", (unsigned long long)counts[i].second);
+    }
+    std::fputc('}', f);
+}
+
+double host_copy_mib(const WindowSample& w) {
+    uint64_t bytes = 0;
+    for (uint64_t b : w.transfer_bytes) bytes += b;
+    return bytes / (1024.0 * 1024.0);
 }
 
 }  // namespace
@@ -53,7 +72,10 @@ AlarmEngine::RuleState& AlarmEngine::state_for(const char* rule) {
 }
 
 std::vector<AlarmFiring> AlarmEngine::on_flip(uint64_t now_ns, Ledger& ledger,
-                                              uint32_t target_hz) {
+                                              uint32_t target_hz,
+                                              const ExternalTotals* external) {
+    const ExternalTotals none{};
+    const ExternalTotals& ext = external ? *external : none;
     std::unique_lock<std::mutex> lock(mutex_);
     if (!started_) {
         // Baseline: everything accumulated before the first flip (boot, shader warm-up) is not
@@ -67,6 +89,12 @@ std::vector<AlarmFiring> AlarmEngine::on_flip(uint64_t now_ns, Ledger& ledger,
         }
         for (size_t i = 0; i < kCounterCount; ++i)
             prev_counters_[i] = ledger.counters[i].load(std::memory_order_relaxed);
+        for (size_t i = 0; i < kDropReasonCount; ++i)
+            prev_drop_reasons_[i] = ledger.drop_reasons[i].load(std::memory_order_relaxed);
+        for (size_t i = 0; i < kDispatchSkipCount; ++i)
+            prev_dispatch_skips_[i] = ledger.dispatch_skips[i].load(std::memory_order_relaxed);
+        for (size_t i = 0; i < WindowSample::kTransferCount; ++i)
+            prev_transfer_bytes_[i] = ext.transfer_bytes[i];
         return {};
     }
     ++flips_in_window_;
@@ -93,6 +121,22 @@ std::vector<AlarmFiring> AlarmEngine::on_flip(uint64_t now_ns, Ledger& ledger,
     }
     for (size_t i = 0; i < kGaugeCount; ++i)
         w.gauges[i] = ledger.gauges[i].load(std::memory_order_relaxed);
+    for (size_t i = 0; i < kDropReasonCount; ++i) {
+        const uint64_t v = ledger.drop_reasons[i].load(std::memory_order_relaxed);
+        w.drop_reasons[i] = v - prev_drop_reasons_[i];
+        prev_drop_reasons_[i] = v;
+    }
+    for (size_t i = 0; i < kDispatchSkipCount; ++i) {
+        const uint64_t v = ledger.dispatch_skips[i].load(std::memory_order_relaxed);
+        w.dispatch_skips[i] = v - prev_dispatch_skips_[i];
+        prev_dispatch_skips_[i] = v;
+    }
+    for (size_t i = 0; i < WindowSample::kTransferCount; ++i) {
+        // A total that went BACKWARDS (a test's fresh source) is a new baseline, not a huge delta.
+        const uint64_t v = ext.transfer_bytes[i];
+        w.transfer_bytes[i] = v >= prev_transfer_bytes_[i] ? v - prev_transfer_bytes_[i] : 0;
+        prev_transfer_bytes_[i] = v;
+    }
     window_start_ns_ = now_ns;
     flips_in_window_ = 0;
     const double t = static_cast<double>(now_ns - origin_ns_) / 1e9;
@@ -116,10 +160,18 @@ std::vector<AlarmFiring> AlarmEngine::close_window(const WindowSample& w, double
             }
         if (!held) state.streak = 0;
     }
+    active_.clear();
+    for (const AlarmFiring& a : fired) active_.push_back(a.rule);
     for (const AlarmFiring& a : fired) {
         RuleState& s = state_for(a.rule);
         const uint64_t ordinal = ++s.fired;
         if (ordinal == 1) s.first_t = t_seconds;
+        for (const auto& [name, count] : a.breakdown) {
+            auto it = std::find_if(s.breakdown_total.begin(), s.breakdown_total.end(),
+                                   [&](const auto& e) { return std::strcmp(e.first, name) == 0; });
+            if (it == s.breakdown_total.end()) s.breakdown_total.emplace_back(name, count);
+            else it->second += count;
+        }
         if (ordinal == 1 || a.value > s.worst_value) {
             s.worst_value = a.value;
             s.worst_t = t_seconds;
@@ -149,6 +201,10 @@ std::vector<AlarmFiring> AlarmEngine::close_window(const WindowSample& w, double
             json_string(jsonl_, a.detail.c_str());
             std::fputs(",\"hint\":", jsonl_);
             json_string(jsonl_, a.hint);
+            if (!a.breakdown.empty()) {
+                std::fputs(",\"breakdown\":", jsonl_);
+                json_counts(jsonl_, a.breakdown);
+            }
             std::fputs("}\n", jsonl_);
         }
     }
@@ -169,7 +225,11 @@ std::vector<AlarmFiring> AlarmEngine::close_window(const WindowSample& w, double
                      "\"texture_refs\":%llu,\"texture_misses\":%llu,\"texture_refusals\":%llu,"
                      "\"texture_evictions\":%llu,\"texture_cache_mib\":%.1f,"
                      "\"texture_limit_mib\":%.1f,\"dropped_frontend\":%llu,"
-                     "\"dropped_contract\":%llu,\"dropped_backend\":%llu,\"vk_allocs\":%llu}\n",
+                     "\"dropped_contract\":%llu,\"dropped_backend\":%llu,\"vk_allocs\":%llu,"
+                     "\"skipped_dispatches\":%llu,\"shader_compile_ms\":%.3f,"
+                     "\"shader_compiles\":%llu,\"shader_compile_max_ms\":%.3f,"
+                     "\"pipeline_create_ms\":%.3f,\"pipeline_creates\":%llu,"
+                     "\"pipeline_create_max_ms\":%.3f,\"host_copy_mib\":%.1f",
                      t_seconds, w.seconds, (unsigned long long)w.flips, w.target_hz, fired.size(),
                      ms(Cost::SurfaceReadback), ev(Cost::SurfaceReadback),
                      w.cost_max_ns[static_cast<size_t>(Cost::SurfaceReadback)] / 1e6,
@@ -183,7 +243,28 @@ std::vector<AlarmFiring> AlarmEngine::close_window(const WindowSample& w, double
                      w.gauge(Gauge::TextureCacheLimit) / (1024.0 * 1024.0),
                      n(Counter::DroppedDrawsFrontend), n(Counter::DroppedDrawsContract),
                      n(Counter::DroppedDrawsBackend),
-                     n(Counter::DeviceAllocations));
+                     n(Counter::DeviceAllocations),
+                     n(Counter::SkippedDispatches),
+                     ms(Cost::ShaderCompile), ev(Cost::ShaderCompile),
+                     w.cost_max_ns[static_cast<size_t>(Cost::ShaderCompile)] / 1e6,
+                     ms(Cost::PipelineCreate), ev(Cost::PipelineCreate),
+                     w.cost_max_ns[static_cast<size_t>(Cost::PipelineCreate)] / 1e6,
+                     host_copy_mib(w));
+        // Breakdowns: always present (possibly empty) so a reader need not special-case absence.
+        std::fputs(",\"drop_reasons\":", jsonl_);
+        json_counts(jsonl_, ranked(w.drop_reasons, kDropReasonNames, kDropReasonCount));
+        std::fputs(",\"dispatch_skips\":", jsonl_);
+        json_counts(jsonl_, ranked(w.dispatch_skips, kDispatchSkipNames, kDispatchSkipCount));
+        std::fputs(",\"host_copy_mib_by_site\":{", jsonl_);
+        bool first = true;
+        for (size_t i = 0; i < WindowSample::kTransferCount; ++i) {
+            if (!w.transfer_bytes[i]) continue;
+            if (!first) std::fputc(',', jsonl_);
+            first = false;
+            json_string(jsonl_, transfer_name(static_cast<Transfer>(i)));
+            std::fprintf(jsonl_, ":%.1f", w.transfer_bytes[i] / (1024.0 * 1024.0));
+        }
+        std::fputs("}}\n", jsonl_);
         std::fflush(jsonl_);
     }
     return fired;
@@ -200,6 +281,14 @@ bool AlarmEngine::write_summary(FILE* out) const {
                           "worst value=%.2f at t=%.0fs: %s\n",
                      name, (unsigned long long)s.fired, (unsigned long long)windows_, s.first_t,
                      s.worst_value, s.worst_t, s.worst_detail.c_str());
+        if (!s.breakdown_total.empty()) {
+            // Over every window the rule fired in: which site/reason it was, for the whole run.
+            auto total = s.breakdown_total;
+            std::stable_sort(total.begin(), total.end(),
+                             [](const auto& a, const auto& b) { return a.second > b.second; });
+            std::fprintf(out, "[perf-alarm] summary rule=%s breakdown over fired windows: %s\n",
+                         name, top_entries(total, 6).c_str());
+        }
     }
     std::string no_data;
     size_t with_data = 0;
@@ -223,6 +312,11 @@ uint64_t AlarmEngine::windows_evaluated() const {
     return windows_;
 }
 
+std::vector<const char*> AlarmEngine::active_rules() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return active_;
+}
+
 uint64_t AlarmEngine::times_fired(const char* rule) const {
     std::lock_guard<std::mutex> lock(mutex_);
     for (const auto& [name, s] : rules_)
@@ -235,6 +329,9 @@ uint64_t AlarmEngine::times_fired(const char* rule) const {
 namespace {
 
 std::atomic<uint32_t> g_target_hz{60};
+// Bit i set: rule_names()[i] was reported in the most recently closed window. Published by the
+// flip thread after each window, read by the HUD without touching the engine.
+std::atomic<uint32_t> g_active_mask{0};
 
 AlarmEngine& process_engine() {
     static AlarmEngine* const engine = [] {
@@ -260,7 +357,35 @@ AlarmEngine& process_engine() {
 
 void on_guest_flip() {
     if (!enabled()) return;
-    process_engine().on_flip(now_ns(), ledger(), g_target_hz.load(std::memory_order_relaxed));
+    AlarmEngine& engine = process_engine();
+    const uint64_t before = engine.windows_evaluated();
+    AlarmEngine::ExternalTotals external;
+    for (size_t i = 0; i < WindowSample::kTransferCount; ++i)
+        external.transfer_bytes[i] = transfer_bytes(static_cast<Transfer>(i));
+    engine.on_flip(now_ns(), ledger(), g_target_hz.load(std::memory_order_relaxed), &external);
+    if (engine.windows_evaluated() == before) return;   // no window closed on this flip
+    uint32_t mask = 0;
+    const auto& names = rule_names();
+    for (const char* active : engine.active_rules())
+        for (size_t i = 0; i < names.size() && i < 32; ++i)
+            if (std::strcmp(names[i], active) == 0) mask |= 1u << i;
+    g_active_mask.store(mask, std::memory_order_relaxed);
+}
+
+size_t active_alarm_summary(char* out, size_t cap) {
+    if (cap) out[0] = '\0';
+    if (!enabled()) return 0;
+    const uint32_t mask = g_active_mask.load(std::memory_order_relaxed);
+    size_t n = 0, used = 0;
+    const auto& names = rule_names();
+    for (size_t i = 0; i < names.size() && i < 32; ++i) {
+        if (!(mask & (1u << i))) continue;
+        ++n;
+        if (!cap) continue;
+        const int wrote = std::snprintf(out + used, cap - used, "%s%s", used ? "," : "", names[i]);
+        if (wrote > 0) used = std::min(cap - 1, used + static_cast<size_t>(wrote));
+    }
+    return n;
 }
 
 void set_guest_flip_rate(int32_t rate) {

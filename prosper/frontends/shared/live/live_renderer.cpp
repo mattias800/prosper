@@ -3393,8 +3393,16 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             const bool compact_buffer_resources =
                 getenv("PROSPER_NO_COMPACT_BUFFER_RESOURCES") == nullptr &&
                 (!descriptor_validate_mode || strcmp(descriptor_validate_mode, "poison") != 0);
+            using prosper::diagnostics::perf::DropReason;
             struct BuiltFrameResources {
                 bool complete = true;
+                // #3891 phase 3: which site rejected the draw. The FIRST site to reject names it
+                // (later bindings of the same draw can reject too, but the draw drops once).
+                DropReason drop_reason = DropReason::Unattributed;
+                void reject(DropReason why) {
+                    if (complete) drop_reason = why;
+                    complete = false;
+                }
                 std::vector<prosper::test::FrameResource> full;
                 std::vector<prosper::test::FrameBufferResource> buffers;
                 // High bit selects buffers; remaining bits index the selected vector. Present only
@@ -3752,7 +3760,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             std::fprintf(stderr,
                                 "[render-array-reject] binding=%u unsupported Float32 reflected image shape\n",
                                 r.binding);
-                            built.complete = false;
+                            built.reject(DropReason::ArrayFloat32Shape);
                             continue;
                         }
                         const bool float32_array = float32_layered_texture &&
@@ -4156,7 +4164,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 });
                             if (unpublished_interior_alias) {
                                 report_volume_sample_drop("interior-alias", sampled_source_addr, sampled_bytes);
-                                built.complete = false;
+                                built.reject(DropReason::VolumeInteriorAlias);
                                 continue;
                             }
                         }
@@ -4180,7 +4188,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             // this descriptor cannot consume its image.
                             report_volume_sample_drop("shape-mismatch", sampled_source_addr,
                                                       0);
-                            built.complete = false;
+                            built.reject(DropReason::VolumeShapeMismatch);
                             continue;
                         }
                         // A single retained color image proves only one layer. Never reinterpret its
@@ -4192,7 +4200,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 std::fprintf(stderr,
                                     "[render-array-reject] binding=%u Float32 array aliases a single color RTT addr=0x%llx\n",
                                     r.binding, (unsigned long long)r.gpu_addr);
-                            built.complete = false;
+                            built.reject(DropReason::ArraySingleColorRtt);
                             continue;
                         }
                         // Deferred RTT readback (#1284): a GPU-resident target consumed in a way the
@@ -4336,7 +4344,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 has_live_rtt)) {
                             report_volume_sample_drop("no-renderer-image", sampled_source_addr,
                                                       live_rtt->second.volume_guest_bytes);
-                            built.complete = false;
+                            built.reject(DropReason::VolumeNoRendererImage);
                             continue;
                         }
                         // A dim-5 base-slice view may need the CPU injection path rather than a direct
@@ -4430,7 +4438,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     unsigned(r.compression_enabled),
                                     (unsigned long long)array_footprint,
                                     (unsigned long long)array_budget_bytes, (unsigned long long)r.gpu_addr);
-                            built.complete = false;
+                            built.reject(DropReason::ArrayShapeBudget);
                             continue;
                         }
                         std::shared_ptr<const std::vector<uint8_t>> retained_depth_array;
@@ -4453,7 +4461,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     std::fprintf(stderr,
                                         "[render-array-reject] binding=%u RGBA32F sampling unsupported addr=0x%llx\n",
                                         r.binding, (unsigned long long)r.gpu_addr);
-                                built.complete = false;
+                                built.reject(DropReason::ArrayFormatSupport);
                                 continue;
                             }
                             const bool depth_array_shape = r.num_components == 1u &&
@@ -4534,7 +4542,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     std::fprintf(stderr,
                                         "[render-array-reject] binding=%u unproven retained depth write-base alias addr=0x%llx\n",
                                         r.binding, (unsigned long long)r.gpu_addr);
-                                built.complete = false;
+                                built.reject(DropReason::ArrayNoncanonicalDepth);
                                 continue;
                             }
                             if (retained_subview || (retained_exact && !depth_array_shape)) {
@@ -4543,7 +4551,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     std::fprintf(stderr,
                                         "[render-array-reject] binding=%u unsupported retained depth view addr=0x%llx\n",
                                         r.binding, (unsigned long long)r.gpu_addr);
-                                built.complete = false;
+                                built.reject(DropReason::ArrayDepthView);
                                 continue;
                             }
                             if (depth_array_shape) {
@@ -4562,7 +4570,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                             std::fprintf(stderr,
                                                 "[render-array-reject] binding=%u unproven retained depth stride addr=0x%llx\n",
                                                 r.binding, (unsigned long long)r.gpu_addr);
-                                        built.complete = false;
+                                        built.reject(DropReason::ArrayDepthStride);
                                         continue;
                                     }
                                     prosper::test::note_ds_layer_stride_locked(
@@ -4599,7 +4607,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                             std::fprintf(stderr,
                                                 "[render-array-reject] binding=%u retained depth producer did not complete addr=0x%llx\n",
                                                 r.binding, (unsigned long long)r.gpu_addr);
-                                        built.complete = false;
+                                        built.reject(DropReason::ArrayProducerCompletion);
                                         continue;
                                     }
                                     if (depth_array_census.enabled) ++depth_array_census.producer_flushes;
@@ -4678,7 +4686,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                         std::fprintf(stderr,
                                             "[render-array-reject] binding=%u retained depth: %s addr=0x%llx\n",
                                             r.binding, error.c_str(), (unsigned long long)r.gpu_addr);
-                                    built.complete = false;
+                                    built.reject(DropReason::ArrayDepthUnavailable);
                                     continue;
                                 }
                                 if (status == prosper::test::PersistentDsDepthArrayStatus::Ready &&
@@ -4755,7 +4763,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     std::fprintf(stderr,
                                         "[render-array-reject] binding=%u compressed Float32 array has no retained depth addr=0x%llx\n",
                                         r.binding, (unsigned long long)r.gpu_addr);
-                                built.complete = false;
+                                built.reject(DropReason::ArrayCompressedNoDepth);
                                 continue;
                             }
                         }
@@ -7299,7 +7307,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     std::fprintf(stderr,
                                         "[render-array-reject] binding=%u compressed Float32 guest backing addr=0x%llx\n",
                                         r.binding, (unsigned long long)r.gpu_addr);
-                                built.complete = false;
+                                built.reject(DropReason::ArrayCompressedGuest);
                                 continue;
                             }
                             const uint32_t cb = prosper::gpu::bc_block_bytes(r.format);
@@ -7515,7 +7523,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                         "[render-array-reject] binding=%u Float32 short backing: "
                                         "%u/%u slices, first=%u addr=0x%llx\n", r.binding, slice_short_count,
                                         slice_count, slice_short[0], (unsigned long long)r.gpu_addr);
-                                built.complete = false;
+                                built.reject(DropReason::ArrayShortBacking);
                                 continue;
                             }
                             // The loop above filled `slice_count` slices. A cube publishes them through
@@ -9621,10 +9629,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     // residual, where it reads as unattributed work -- the exact defect this
                     // partition exists to make visible.
                     if (!built_resources.complete || !contract_ok) {
-                        // #3891: a dropped draw is a correctness alarm, not only a timing bucket.
-                        prosper::diagnostics::perf::add(built_resources.complete
-                            ? prosper::diagnostics::perf::Counter::DroppedDrawsContract
-                            : prosper::diagnostics::perf::Counter::DroppedDrawsFrontend);
+                        // #3891: a dropped draw is a correctness alarm, not only a timing bucket,
+                        // and it carries the site that dropped it.
+                        prosper::diagnostics::perf::drop_draw(built_resources.complete
+                            ? DropReason::ContractMismatch : built_resources.drop_reason);
                         if (timing_enabled) ++pending_timing.build_rejected;
                         continue;
                     }
