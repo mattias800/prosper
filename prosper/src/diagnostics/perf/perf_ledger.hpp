@@ -81,6 +81,18 @@ enum class Counter : uint8_t {
     GpuMemoryFallbacks,        // succeeded only after the preferred type ran out of device memory
     GpuMemoryOffDevice,        // landed on a non-device-local type although the device has one
     GpuMemoryOffDeviceBytes,   // bytes of those placements
+    // #3891 queue (2026-09-28). Each is bumped on an EVENT path, never per accepted draw/reference:
+    DrawsUnaccounted,          // |seen - recorded - dropped| of a pass (draw_disposition blind spot)
+    HleUnimplementedCalls,     // calls into an unregistered NID (the dispatcher answers 0)
+    HleUnimplementedFirst,     // ...of which the FIRST call of a distinct import
+    PresentCpuFallbacks,       // GPU-present iterations that showed a CPU-read-back frame instead
+    PipelineEvictions,         // graphics pipelines evicted from the full pipeline cache
+    PipelineLayoutEvictions,   // pipeline layouts evicted from their full cache
+    DescriptorSetLayoutEvictions,  // descriptor-set layouts evicted from their full cache
+    TextureValidationFailures,     // persistent decode-cache entries whose exact compare failed
+    TextureValidationFailedBytes,  // guest bytes those failed validations actually read (the
+                                   // compare stops at the first differing chunk, so this is the
+                                   // compare's cost, not the texture's size)
     Count
 };
 
@@ -88,7 +100,26 @@ enum class Counter : uint8_t {
 enum class Gauge : uint8_t {
     TextureCacheBytes = 0,
     TextureCacheLimit,
+    // Bitmask of DiagnosticPathSwitch: the switches that turned the live renderer's production path
+    // (GPU-resident colour targets) off for this run. 0 = production path.
+    DiagnosticPathSwitches,
     Count
+};
+
+// Why live GPU colour targets are off (Gauge::DiagnosticPathSwitches bits).
+enum class DiagnosticPathSwitch : uint8_t {
+    NoLiveTargets = 0,     // PROSPER_NO_LIVE_PERSISTENT_COLOR_TARGETS
+    CaptureReadback,       // PROSPER_GPU_CAPTURE_READBACK
+    ReplayExport,          // PROSPER_GPU_REPLAY_EXPORT_RTT / PROSPER_GPU_REPLAY_RTT_SEEDS
+    PerPassPixelDump,      // PROSPER_DUMP_* / *_HASH_DIM / PROSPER_RTTLOG per-pass pixel diagnostics
+    Other,                 // off for a reason none of the above names
+    Count
+};
+constexpr size_t kDiagnosticPathSwitchCount = static_cast<size_t>(DiagnosticPathSwitch::Count);
+constexpr const char* kDiagnosticPathSwitchNames[kDiagnosticPathSwitchCount] = {
+    "PROSPER_NO_LIVE_PERSISTENT_COLOR_TARGETS", "PROSPER_GPU_CAPTURE_READBACK",
+    "PROSPER_GPU_REPLAY_EXPORT_RTT/RTT_SEEDS", "per-pass-pixel-dump(PROSPER_DUMP_*/HASH_DIM/RTTLOG)",
+    "other",
 };
 
 // WHY a draw was dropped: one stable code per drop SITE, so `[perf-alarm] rule=dropped-draws` can

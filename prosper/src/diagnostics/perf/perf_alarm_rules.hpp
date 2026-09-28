@@ -103,6 +103,47 @@ constexpr double kShaderCompileMinPerSecond = 20.0;
 // Eight windows is 40 s, three windows beyond the longest cold-cache burst measured.
 constexpr uint32_t kShaderCompileSustainWindows = 8;
 
+// unaccounted-draws: CORRECTNESS. A pass whose seen != recorded + dropped has a drop (or double
+// count) that names no reason: the draw_disposition census's own blind spot. Sonic Frontiers printed
+// `UNACCOUNTED=18` at exit on 2026-09-27 and no alarm said so.
+constexpr uint64_t kUnaccountedDrawsPerWindow = 1;
+
+// unimplemented-hle-calls: CORRECTNESS class ("news"). The FIRST call of an unregistered NID after
+// the first guest flip. The dispatcher answers 0, which reads as SCE_OK, and writes no
+// out-parameter -- #2951 (a glyph size read from untouched stack, then divided by) and #2023 (a
+// four-session black screen) were both one unregistered NID. Boot-time first calls are before the
+// engine's baseline and do not count; the `[prosper] unimplemented:` line names each one.
+constexpr uint64_t kUnimplementedFirstCallsPerWindow = 1;
+
+// diagnostic-path-active: STATE. The live renderer's production path (GPU-resident colour targets)
+// is off because a diagnostic switch asked for it, so every frame is read back and re-presented and
+// no measurement of this run describes what ships. Nothing on screen said so (#3909).
+
+// present-path-fallback: SHARE of presents. With GPU present active, more than half of a window's
+// presents showed a CPU-read-back frame instead of the GPU scanout: a full-frame readback plus a
+// re-upload per frame, and a sign live targets are off or the publish keeps missing. Startup
+// before the first GPU publish takes the fallback legitimately, hence the sustain and a floor.
+constexpr double kPresentFallbackShare = 0.5;
+constexpr double kPresentFallbackMinPerSecond = 5.0;
+
+// pipeline-cache-thrash: RATE. Evictions from the renderer's graphics-pipeline, pipeline-layout
+// and descriptor-set-layout caches. A cache that fits its working set evicts ~0 in a steady scene;
+// one that does not rebuilds (a pipeline is a driver compile) what it just threw away.
+// 5/s is 25 per window, well above a scene change's one-off churn.
+constexpr double kPipelineCacheEvictionsPerSecond = 5.0;
+
+// texture-validation-churn: RATE. Guest bytes actually read by persistent decode-cache validations
+// that FAILED (the source had changed). The compare reads 64 KiB chunks and stops at the first
+// difference, so a texture rewritten wholesale every frame costs ~64 KiB per failure and stays far
+// below this; what the rule catches is a source that changes only NEAR ITS END (a partially
+// streamed atlas, a plane whose tail is rewritten), where each failure reads most of the texture
+// before finding the change and the re-decode follows anyway. 128 MiB/s is ~1% of one core at
+// memcpy-class compare rates -- a cost worth naming, not noise. Measured 2026-09-28 with the true
+// byte count on GTA V's intro movie: ~340 failed validations per 5 s window reading at most 10.2 MiB
+// in a window (~2 MiB/s), so the rule is quiet there; the earlier source-size count read 283 MiB/s
+// for the same windows and was ~140x too high. (Sonic Frontiers not re-measured.)
+constexpr double kTextureValidationFailedMiBPerSecond = 128.0;
+
 // SUSTAIN: consecutive windows a rule's condition must hold before the engine reports it. A cost
 // that lasts one window is usually a load, and a steady-state alarm should not fire on it; a
 // correctness alarm fires on the first window.
@@ -165,6 +206,12 @@ struct RuleThresholds {
     double host_copy_mib_per_s = kHostCopyMiBPerSecond;
     double shader_compile_budget_share = kShaderCompileBudgetShare;
     double shader_compile_min_per_s = kShaderCompileMinPerSecond;
+    uint64_t unaccounted_draws = kUnaccountedDrawsPerWindow;
+    uint64_t unimplemented_first_calls = kUnimplementedFirstCallsPerWindow;
+    double present_fallback_share = kPresentFallbackShare;
+    double present_fallback_min_per_s = kPresentFallbackMinPerSecond;
+    double pipeline_cache_evictions_per_s = kPipelineCacheEvictionsPerSecond;
+    double texture_validation_failed_mib_per_s = kTextureValidationFailedMiBPerSecond;
 
     static RuleThresholds scaled(double percent);
 };

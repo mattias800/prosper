@@ -10388,6 +10388,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         vkDestroyPipelineLayout(dev, victim->second.handle, nullptr);
         persistent_pipeline_layouts.erase(victim);
         ++resource_reuse_stats.persistent_pipeline_layout_evictions;
+        prosper::diagnostics::perf::add(prosper::diagnostics::perf::Counter::PipelineLayoutEvictions);  // #3891
         return true;
     };
     const bool descriptor_set_layout_cache_enabled = share_backend_resources &&
@@ -10407,6 +10408,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         vkDestroyDescriptorSetLayout(dev, victim->second.handle, nullptr);
         persistent_descriptor_set_layouts.erase(victim);
         ++resource_reuse_stats.persistent_descriptor_set_layout_evictions;
+        prosper::diagnostics::perf::add(prosper::diagnostics::perf::Counter::DescriptorSetLayoutEvictions);  // #3891
         return true;
     };
     auto evict_pipeline = [&]() {
@@ -10420,6 +10422,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         vkDestroyPipeline(dev, victim->second.pipeline, nullptr);
         pipeline_cache.erase(victim);
         ++pipeline_stats.evictions;
+        prosper::diagnostics::perf::add(prosper::diagnostics::perf::Counter::PipelineEvictions);  // #3891
         return true;
     };
     uint64_t descriptor_sets = 0;

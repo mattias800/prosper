@@ -2441,7 +2441,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
     static const bool gpu_capture_requested = getenv("PROSPER_GPU_CAPTURE") != nullptr;
     static const bool legacy_capture_readback =
         gpu_capture_requested && PROSPER_ENV_VALUE("PROSPER_GPU_CAPTURE_READBACK") != nullptr;
-    static const bool live_gpu_targets = [&] {
+    static const prosper::frontend::LiveColorTargetResidencyInputs live_target_inputs = [&] {
         prosper::frontend::LiveColorTargetResidencyInputs in;
         in.per_target = pertarget;
         in.opted_out = PROSPER_ENV_VALUE("PROSPER_NO_LIVE_PERSISTENT_COLOR_TARGETS") != nullptr ||
@@ -2456,8 +2456,30 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             getenv("PROSPER_DUMP_RTGROUPS_RGBA") || PROSPER_ENV_VALUE("PROSPER_DUMP_DRAWSTEPS") ||
             PROSPER_ENV_VALUE("PROSPER_RESOURCE_HASH_DIM") ||
             PROSPER_ENV_VALUE("PROSPER_TARGET_STEP_HASH_DIM") || PROSPER_ENV_VALUE("PROSPER_RTTLOG");
-        return prosper::frontend::live_color_targets_enabled(in);
+        return in;
     }();
+    static const bool live_gpu_targets =
+        prosper::frontend::live_color_targets_enabled(live_target_inputs);
+    // #3891 diagnostic-path-active: name the switches that turned the production path off.
+    static const bool diagnostic_path_noted = [&] {
+        namespace perf = prosper::diagnostics::perf;
+        uint64_t mask = 0;
+        if (!live_gpu_targets) {
+            const auto& in = live_target_inputs;
+            auto bit = [&](perf::DiagnosticPathSwitch sw) {
+                mask |= 1ull << static_cast<unsigned>(sw);
+            };
+            if (legacy_capture_readback) bit(perf::DiagnosticPathSwitch::CaptureReadback);
+            else if (in.opted_out) bit(perf::DiagnosticPathSwitch::NoLiveTargets);
+            if (in.replay_export_rtt || (in.replay_rtt_seeds && !in.replay_live_targets))
+                bit(perf::DiagnosticPathSwitch::ReplayExport);
+            if (in.per_pass_pixel_diagnostic) bit(perf::DiagnosticPathSwitch::PerPassPixelDump);
+            if (!mask) bit(perf::DiagnosticPathSwitch::Other);   // RTT_SINGLE_TARGET, timeline
+        }
+        perf::set(perf::Gauge::DiagnosticPathSwitches, mask);
+        return true;
+    }();
+    (void)diagnostic_path_noted;
     if (gpu_capture_requested)
         fprintf(stderr, "[render] PROSPER_GPU_CAPTURE: %s\n",
                 live_gpu_targets ? "live targets retained; capture readback is on demand"
@@ -6048,6 +6070,16 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     resource_persistent_invalidation = true;
                                     if (timing_enabled)
                                         pending_timing.persistent_invalidations++;
+                                    // #3891 texture-validation-churn: an exact validation that
+                                    // found the source changed, charged the bytes it really read
+                                    // (the compare stops at the first differing 64 KiB chunk).
+                                    if (resource_texture_exact_validation) {
+                                        prosper::diagnostics::perf::add(
+                                            prosper::diagnostics::perf::Counter::TextureValidationFailures);
+                                        prosper::diagnostics::perf::add(
+                                            prosper::diagnostics::perf::Counter::TextureValidationFailedBytes,
+                                            resource_texture_validated_bytes);
+                                    }
                                 }
                             } else {
                                 // Establish the mutation boundary before the initial source read/decode.

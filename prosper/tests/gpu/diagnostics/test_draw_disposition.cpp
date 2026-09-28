@@ -14,6 +14,7 @@
 //     path and the report would keep printing plausible numbers.
 
 #include "gpu/diagnostics/draw_disposition.hpp"
+#include "diagnostics/perf/perf_ledger.hpp"
 
 #include <cstdio>
 #include <cstring>
@@ -59,6 +60,11 @@ int main() {
     }
     check(names_ok, "every DrawDrop has a stable non-placeholder name");
 
+    namespace perf = prosper::diagnostics::perf;
+    const auto unaccounted = [] {
+        return perf::ledger().counters[static_cast<size_t>(perf::Counter::DrawsUnaccounted)].load();
+    };
+    const uint64_t balanced_before = unaccounted();
     // --- a healthy pass is silent ---------------------------------------------------------
     c.note_seen(4);
     c.note_recorded(4);
@@ -83,6 +89,9 @@ int main() {
     // --- the self-validation arm ----------------------------------------------------------
     // Simulates exactly the future edit this instrument must survive: a draw leaves the pass
     // without being recorded AND without naming a reason. The census must say so.
+    // #3891: the two passes above add up, so they left the perf ledger's counter alone.
+    check(unaccounted() == balanced_before, "passes that add up leave DrawsUnaccounted alone");
+    const uint64_t unaccounted_before = unaccounted();
     c.note_seen(10);
     c.note_recorded(7);
     c.note_dropped(DrawDrop::ShaderRejected);
@@ -92,6 +101,9 @@ int main() {
         check(out.find("UNACCOUNTED=1") != std::string::npos,
               "an unnamed drop path is reported as UNACCOUNTED, not absorbed into the total");
     }
+    // #3891 unaccounted-draws: the same blind spot reaches the perf-alarm ledger.
+    check(unaccounted() - unaccounted_before == 1,
+          "the unaccounted draw is added to the perf ledger's DrawsUnaccounted counter");
 
     // --- double counting must be VISIBLE, not plausible ------------------------------------
     // The defect this guards shipped once: a seventh census site was added that was not disjoint
@@ -110,6 +122,8 @@ int main() {
         check(out.find("UNACCOUNTED=-1") != std::string::npos,
               "counting one drop under two reasons reports a negative unaccounted, not a total");
     }
+    check(unaccounted() - unaccounted_before == 2,
+          "an overcount (negative unaccounted) reaches the ledger as its magnitude");
 
     // --- a black pass is always reported --------------------------------------------------
     c.note_seen(5);
