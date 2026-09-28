@@ -3111,6 +3111,10 @@ endif()
                                                frontends/shared/live/submit_renderer/backend_draws.cpp
                                                frontends/shared/live/submit_renderer/backend_timing.cpp
                                                frontends/shared/live/submit_renderer/per_target_passes.cpp
+                                               frontends/shared/live/submit_renderer/resolve_pass.cpp
+                                               frontends/shared/live/submit_renderer/pass_diagnostics.cpp
+                                               frontends/shared/live/submit_renderer/callback_prelude.cpp
+                                               frontends/shared/live/submit_renderer/callback_diagnostics.cpp
                                                frontends/shared/live/live_compute.cpp
                                                frontends/shared/present/present_blit.cpp
                                                frontends/shared/present/compute_scanout.cpp)
@@ -3429,6 +3433,10 @@ endif()
                                                frontends/shared/live/submit_renderer/backend_draws.cpp
                                                frontends/shared/live/submit_renderer/backend_timing.cpp
                                                frontends/shared/live/submit_renderer/per_target_passes.cpp
+                                               frontends/shared/live/submit_renderer/resolve_pass.cpp
+                                               frontends/shared/live/submit_renderer/pass_diagnostics.cpp
+                                               frontends/shared/live/submit_renderer/callback_prelude.cpp
+                                               frontends/shared/live/submit_renderer/callback_diagnostics.cpp
                                                frontends/shared/live/live_compute.cpp
                                                frontends/shared/present/present_blit.cpp
                                                frontends/shared/present/compute_scanout.cpp)

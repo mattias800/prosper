@@ -58,6 +58,8 @@
 #include "shared/live/submit_renderer/backend_timing.hpp" // record_backend_timing_stats, print_rtt_timing (#3892)
 #include "shared/live/submit_renderer/backend_draws.hpp"  // build_backend_draws, clear_for (#3892)
 #include "shared/live/submit_renderer/per_target_passes.hpp" // render_per_target_passes (#3892)
+#include "shared/live/submit_renderer/callback_prelude.hpp" // load_shader_overrides, materialize_dirty_dcc_clears (#3892)
+#include "shared/live/submit_renderer/callback_diagnostics.hpp" // the callback's own diagnostics (#3892)
 #include "shared/rtt/volume_target_index.hpp"        // volume-footprint candidates (#3873)
 #include "shared/present/guest_scanout_present.hpp"    // publishing the guest's own flipped buffer (#1968)
 #include "shared/diagnostics/diagnostic_window.hpp"        // census window by callback ordinal or by elapsed time
@@ -131,33 +133,6 @@ bool flush_live_graphics_pipeline_cache() {
 // this the composite samples zeros and the frame is black. We cache each submit's rendered pixels under
 // its render-target base and inject them when a subsequent draw samples a texture at a matching base.
 namespace {
-bool parse_diagnostic_address(const char* spec, uint64_t& address) {
-    if (!spec) return true;
-    if (spec[0] != '0' || (spec[1] != 'x' && spec[1] != 'X') || !spec[2]) return false;
-    char* end = nullptr;
-    errno = 0;
-    const unsigned long long parsed = std::strtoull(spec, &end, 16);
-    if (errno || end == spec + 2 || *end || !parsed) return false;
-    address = parsed;
-    return true;
-}
-
-bool parse_diagnostic_extent(const char* spec, uint32_t& width, uint32_t& height) {
-    if (!spec) return true;
-    if (*spec < '0' || *spec > '9') return false;
-    char* separator = nullptr;
-    errno = 0;
-    const unsigned long w = std::strtoul(spec, &separator, 10);
-    if (errno || !separator || *separator != 'x' || !w || w > UINT32_MAX ||
-        separator[1] < '0' || separator[1] > '9') return false;
-    char* end = nullptr;
-    errno = 0;
-    const unsigned long h = std::strtoul(separator + 1, &end, 10);
-    if (errno || !end || *end || !h || h > UINT32_MAX) return false;
-    width = static_cast<uint32_t>(w);
-    height = static_cast<uint32_t>(h);
-    return true;
-}
 
 // Installed by the live-renderer registration below; called from the guest flip path through the
 // extern "C" entry at the bottom of this file, which that registration hands to core. Empty when
@@ -1666,48 +1641,16 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             BackendTimingContext backend_timing_ctx{
                 .pending_timing = pending_timing,
                 .timing_mode = timing_mode};
-            auto record_backend_timing = [&]
-                (const prosper::test::BackendRenderTimingStats& backend,
-                 const prosper::test::BackendTextureUploadStats& textures,
-                 const prosper::test::BackendPipelineCacheStats& pipelines,
-                 const prosper::test::BackendResourceReuseStats& reuse) {
-                return record_backend_timing_stats(backend_timing_ctx, backend, textures, pipelines, reuse);
-            };
-            // PROSPER_SUBMITLOG: print the GPU-submit index periodically (at native speed, before the slow
-            // render) so it can be correlated with guest-side log lines (e.g. a MsgDialog wait) to find the
-            // exact submit at which a scene appears — for aiming PROSPER_RENDER_FIRST at it.
-            if (phase.first_span && PROSPER_ENV_ON("PROSPER_SUBMITLOG") && (g_this_submit % 1000 == 0))
-                fprintf(stderr, "[submit] index=%d (%zu draw items)\n", g_this_submit, items.size());
-            if (const char* sd = PROSPER_ENV_VALUE("PROSPER_SUBMITLOG_DIM")) {
-                uint32_t sw = 0, sh = 0;
-                if (sscanf(sd, "%ux%u", &sw, &sh) == 2)
-                    for (const auto& it : items)
-                        if (it.color0_width == sw && it.color0_height == sh) {
-                            fprintf(stderr, "[submit] index=%d target=0x%llx extent=%ux%u (%zu draw items)\n",
-                                    g_this_submit, (unsigned long long)it.color0_base, sw, sh, items.size());
-                            break;
-                        }
-            }
+            SubmitLogContext log_submit_index_ctx{
+                .items = items,
+                .phase = phase,
+                .g_this_submit = g_this_submit};
+            log_submit_index(log_submit_index_ctx);
             bool force_target = false;
-            if (const char* td = PROSPER_ENV_VALUE("PROSPER_RENDER_TARGET_DIM")) {
-                uint32_t tw = 0, th = 0;
-                if (sscanf(td, "%ux%u", &tw, &th) == 2)
-                    for (const auto& it : items)
-                        if (it.color0_width == tw && it.color0_height == th) { force_target = true; break; }
-            }
-            if (const char* rd = PROSPER_ENV_VALUE("PROSPER_RENDER_RESOURCE_DIM")) {
-                uint32_t rw = 0, rh = 0;
-                if (sscanf(rd, "%ux%u", &rw, &rh) == 2)
-                    for (const auto& it : items) {
-                        auto has_dim = [&](const prosper::gpu::ShaderResourceTable* table) {
-                            if (!table) return false;
-                            for (const auto& r : table->resources)
-                                if (r.width == rw && r.height == rh) return true;
-                            return false;
-                        };
-                        if (has_dim(it.vrt.get()) || has_dim(it.prt.get())) { force_target = true; break; }
-                    }
-            }
+            DiagnosticTargetContext diagnostic_target_forces_render_ctx{
+                .items = items,
+                .force_target = force_target};
+            diagnostic_target_forces_render(diagnostic_target_forces_render_ctx);
             // Ordered submits can contain several graphics spans separated by compute work. Once a
             // diagnostic target selects one span, keep rendering the rest of that transaction so the
             // final span can recover and return the scanout assembled in the persistent RTT cache.
@@ -1725,115 +1668,15 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             }
             if ((g_this_submit < g_render_first || before_delay) && !g_force_this_submit) return {};
             // Dump the FIRST item's recompiled SPIR-V (diagnostic; survives a mid-render crash).
-            if (PROSPER_ENV_ON("PROSPER_SHADER_DUMP") && !items.empty()) {
-                std::string d = PROSPER_ENV_VALUE("PROSPER_SHADER_DUMP");
-                const auto& dump_vs = items[0].vs_words();
-                const auto& dump_fs = items[0].fs_words();
-                if (FILE* f = fopen((d + "/frame_vs.spv").c_str(), "wb")) { fwrite(dump_vs.data(), 4, dump_vs.size(), f); fclose(f); }
-                if (FILE* f = fopen((d + "/frame_fs.spv").c_str(), "wb")) { fwrite(dump_fs.data(), 4, dump_fs.size(), f); fclose(f); }
-                fprintf(stderr, "[render] dumped SPIR-V vs=%zu fs=%zu dwords\n", dump_vs.size(), dump_fs.size()); fflush(stderr);
-            }
-            // A uniform DCC clear is self-contained in metadata. If the ordered compute span dirtied
-            // a retained target's metadata, materialize that clear now so the following graphics pass
-            // loads the clear value rather than stale pixels (or an arbitrary fallback clear).
-            const auto dcc_materialize_start = timing_enabled
-                ? RenderClock::now() : RenderClock::time_point{};
-            uint64_t dcc_materialize_surfaces = 0;
-            uint64_t dcc_materialize_bytes = 0;
-            for (const auto& item : items) {
-                const prosper::gpu::ShaderResourceTable* tables[] = {
-                    item.vrt.get(), item.prt.get(),
-                };
-                for (const auto* table : tables) {
-                    if (!table) continue;
-                    for (const auto& resource : table->resources) {
-                        auto found = g_rtt.find(resource.gpu_addr);
-                        if (found == g_rtt.end() || !found->second.dcc_metadata_dirty ||
-                            !resource.compression_enabled ||
-                            resource.metadata_addr != found->second.dcc_metadata_addr ||
-                            resource.width != found->second.w ||
-                            resource.height != found->second.h)
-                            continue;
-                        const uint64_t metadata_bytes =
-                            prosper::gpu::gpu_capture_dcc_metadata_footprint(resource);
-                        if (!metadata_bytes || metadata_bytes > SIZE_MAX) continue;
-                        std::vector<uint8_t> metadata(static_cast<size_t>(metadata_bytes));
-                        size_t copied = 0;
-                        if (resource.dcc_metadata_host_data) {
-                            copied = static_cast<size_t>(std::min<uint64_t>(
-                                metadata.size(), resource.dcc_metadata_host_data_size));
-                            std::memcpy(metadata.data(), resource.dcc_metadata_host_data, copied);
-                        } else {
-                            copied = safe_copy(metadata.data(), resource.metadata_addr,
-                                               metadata.size());
-                        }
-                        const uint64_t texels = static_cast<uint64_t>(found->second.w) *
-                                                found->second.h;
-                        const VkFormat format = prosper::test::backend_color_format(
-                            found->second.format);
-                        const uint32_t bpp =
-                            prosper::test::backend_color_bytes_per_pixel(format);
-                        if (copied != metadata.size() || !bpp || texels > SIZE_MAX / bpp)
-                            continue;
-                        uint8_t clear_rgba[4]{};
-                        if (!prosper::gpu::gfx10_dcc_fast_clear_rgba8(
-                                clear_rgba, 1, metadata.data(), metadata.size(),
-                            resource.num_components, resource.alpha_is_on_msb))
-                            continue;
-                        if (format != VK_FORMAT_R8G8B8A8_UNORM &&
-                            format != VK_FORMAT_R16G16B16A16_SFLOAT &&
-                            format != VK_FORMAT_B10G11R11_UFLOAT_PACK32) {
-                            continue;
-                        }
-                        found->second.rgba.reset();
-                        found->second.has_uniform_color = true;
-                        for (uint32_t channel = 0; channel < 4; ++channel)
-                            found->second.uniform_color[channel] =
-                                clear_rgba[channel] ? 1.0f : 0.0f;
-                        // PROSPER_DCCLOG=1 -- diagnostic only, no behaviour change. A surface
-                        // materialised from a DCC fast-clear code becomes a UNIFORM colour for the
-                        // whole target, so if this decode is wrong the entire frame is one wrong
-                        // colour with no content -- which is exactly Little Nightmares III's
-                        // uniform-yellow presents (#2014). Deduped per (address, decoded colour) so a
-                        // run costs a handful of lines.
-                        if (const char* dcclog = PROSPER_ENV_VALUE("PROSPER_DCCLOG")) {
-                            if (dcclog[0] == '1' && dcclog[1] == '\0') {
-                                static std::mutex dcc_mutex;
-                                static std::set<std::pair<uint64_t, uint32_t>> dcc_seen;
-                                const uint32_t packed = (uint32_t)clear_rgba[0] |
-                                    ((uint32_t)clear_rgba[1] << 8) |
-                                    ((uint32_t)clear_rgba[2] << 16) |
-                                    ((uint32_t)clear_rgba[3] << 24);
-                                bool first = false;
-                                {
-                                    std::lock_guard<std::mutex> lock(dcc_mutex);
-                                    first = dcc_seen.emplace((uint64_t)found->first, packed).second;
-                                }
-                                if (first)
-                                    fprintf(stderr,
-                                            "[dcclog] addr=0x%llx %ux%u fmt=%d ncomp=%u "
-                                            "alpha_msb=%d clear_rgba=(%u,%u,%u,%u) -> uniform=(%.0f,%.0f,%.0f,%.0f)\n",
-                                            (unsigned long long)found->first,
-                                            found->second.w, found->second.h, (int)format,
-                                            resource.num_components, (int)resource.alpha_is_on_msb,
-                                            clear_rgba[0], clear_rgba[1], clear_rgba[2], clear_rgba[3],
-                                            found->second.uniform_color[0], found->second.uniform_color[1],
-                                            found->second.uniform_color[2], found->second.uniform_color[3]);
-                            }
-                        }
-                        found->second.dcc_metadata_dirty = false;
-                        ++dcc_materialize_surfaces;
-                        dcc_materialize_bytes += sizeof(found->second.uniform_color);
-                    }
-                }
-            }
-            if (timing_enabled) {
-                pending_timing.dcc_materialize_ms +=
-                    std::chrono::duration<double, std::milli>(
-                        RenderClock::now() - dcc_materialize_start).count();
-                pending_timing.dcc_materialize_surfaces += dcc_materialize_surfaces;
-                pending_timing.dcc_materialize_bytes += dcc_materialize_bytes;
-            }
+            ShaderDumpContext dump_first_item_spirv_ctx{
+                .items = items};
+            dump_first_item_spirv(dump_first_item_spirv_ctx);
+            DccClearContext materialize_dirty_dcc_clears_ctx{
+                .g_rtt = g_rtt,
+                .items = items,
+                .pending_timing = pending_timing,
+                .timing_enabled = timing_enabled};
+            materialize_dirty_dcc_clears(materialize_dirty_dcc_clears_ctx);
             // Keep decoded texture storage alive across callbacks. The old clear()+emplace(size, 0)
             // released and zero-filled tens of MiB every submit even though the decode paths overwrite
             // all pixels. Reusing same-sized slots avoids both costs; short guest reads explicitly clear
@@ -2059,130 +1902,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 .depth_array_guest_scan_epoch = depth_array_guest_scan_epoch,
                 .gpu_depth_cube_snapshots = gpu_depth_cube_snapshots,
                 .depth_cube_gpu_snapshots = depth_cube_gpu_snapshots};
-            // Diagnostic shader/state overrides (computed once, applied to EVERY draw item):
-            //   REFVS  -> a known-good fullscreen-triangle VS (isolates the game's real VS).
-            //   TESTPS -> a solid-magenta PS (isolates VS geometry from PS shading). The optional
-            //             TESTPS_MATCH file restricts it to one exact recompiled guest PS.
-            //   FS_SPV -> a caller-supplied PS SPIR-V (e.g. a UV visualizer).
-            //   NOPS   -> bypass the resolved pipeline state (default state).
-            #include "refvs.inc"
-            const bool refvs = PROSPER_ENV_VALUE("PROSPER_RENDER_REFVS");
-            std::vector<uint32_t> refvs_spv(kRefVs, kRefVs + sizeof(kRefVs) / 4);
-            std::vector<uint32_t> ps_override;
-            bool ps_override_is_file = false;   // true only for a valid PROSPER_FS_SPV *file* override
-            bool ps_override_is_test = false;
-            if (PROSPER_ENV_ON("PROSPER_RENDER_TESTPS")) {
-                static const uint32_t kMagentaPs[] = {   // v0=1.0(R) v1=0.0(G) v2=1.0(B) v3=1.0(A); exp mrt0; endpgm
-                    0x7E0002F2u, 0x7E020280u, 0x7E0402F2u, 0x7E0602F2u, 0xF800180Fu, 0x03020100u, 0xBF810000u };
-                ps_override = prosper::gpu::recompile_fragment(kMagentaPs, sizeof(kMagentaPs) / 4, nullptr);
-                ps_override_is_test = true;
-            }
-            // Validated SPIR-V file load: require a complete read of a word-aligned file >= 20 bytes
-            // (5 words: the minimum SPIR-V header). Validate size BEFORE allocating so a failed ftell
-            // (-1 -> huge size_t) cannot trigger a wild allocation, and reject non-word-aligned files
-            // rather than silently dropping trailing bytes. Returns false (out untouched) on any failure.
-            auto load_spv_file = [](const char* path, std::vector<uint32_t>& out) -> bool {
-                FILE* f = fopen(path, "rb");
-                if (!f) return false;
-                bool ok = false;
-                if (fseek(f, 0, SEEK_END) == 0) {
-                    long sz = ftell(f);
-                    if (sz >= 20 && (sz % 4) == 0 && fseek(f, 0, SEEK_SET) == 0) {
-                        std::vector<uint32_t> m(static_cast<size_t>(sz) / 4);
-                        if (fread(m.data(), 4, m.size(), f) == m.size()) { out = std::move(m); ok = true; }
-                    }
-                }
-                fclose(f);
-                return ok;
-            };
-            if (const char* fsp = PROSPER_ENV_VALUE("PROSPER_FS_SPV")) {
-                std::vector<uint32_t> m;
-                if (load_spv_file(fsp, m)) { ps_override = std::move(m); ps_override_is_file = true; }
-                else fprintf(stderr, "[fs-spv] PROSPER_FS_SPV='%s' invalid/unreadable -> no file override\n", fsp);
-            }
-            // PROSPER_FS_SPV_MATCH=<file>: restrict the PROSPER_FS_SPV *file* override to draws whose
-            // recompiled fragment SPIR-V EXACTLY equals this file (a per-draw A/B substitution that does
-            // not touch draws with a different descriptor contract). FAILS CLOSED: if requested but the
-            // file is missing/short/unaligned/unreadable, NO file override is applied — never a silent
-            // global fallback (that would recreate the exact hazard this gate exists to prevent). Does
-            // NOT gate PROSPER_RENDER_TESTPS, which stays global by design.
-            // mode: 0 = not requested (legacy global file override), 1 = loaded+valid (exact match only),
-            //       2 = requested but invalid (file override disabled).
-            int fs_match_mode = 0;
-            std::vector<uint32_t> fs_match;
-            if (const char* mp = PROSPER_ENV_VALUE("PROSPER_FS_SPV_MATCH")) {
-                fs_match_mode = load_spv_file(mp, fs_match) ? 1 : 2;
-                if (fs_match_mode == 2)
-                    fprintf(stderr, "[fs-match] PROSPER_FS_SPV_MATCH='%s' invalid/unreadable -> applying NO "
-                            "fragment file override (fail closed)\n", mp);
-            }
-            // Optional second selector for a live exact-program experiment. A matching SPIR-V
-            // module can be reused by unrelated draws, so a shader-only A/B is not necessarily
-            // an exact draw substitution. Invalid input fails closed.
-            const char* fs_guest_addr_text = PROSPER_ENV_VALUE("PROSPER_FS_SPV_GUEST_ADDR");
-            uint64_t fs_guest_addr = 0;
-            const bool fs_guest_addr_valid =
-                parse_diagnostic_address(fs_guest_addr_text, fs_guest_addr);
-            if (!fs_guest_addr_valid) {
-                static std::atomic_flag warned = ATOMIC_FLAG_INIT;
-                if (!warned.test_and_set())
-                    std::fprintf(stderr,
-                                 "[fs-match] PROSPER_FS_SPV_GUEST_ADDR invalid -> no file override\n");
-            }
-            const char* fs_target_addr_text = PROSPER_ENV_VALUE("PROSPER_FS_SPV_TARGET_ADDR");
-            uint64_t fs_target_addr = 0;
-            const bool fs_target_addr_valid =
-                parse_diagnostic_address(fs_target_addr_text, fs_target_addr);
-            if (!fs_target_addr_valid) {
-                static std::atomic_flag warned = ATOMIC_FLAG_INIT;
-                if (!warned.test_and_set())
-                    std::fprintf(stderr,
-                                 "[fs-match] PROSPER_FS_SPV_TARGET_ADDR invalid -> no file override\n");
-            }
-            const char* fs_target_dim_text = PROSPER_ENV_VALUE("PROSPER_FS_SPV_TARGET_DIM");
-            uint32_t fs_target_width = 0, fs_target_height = 0;
-            const bool fs_target_dim_valid =
-                parse_diagnostic_extent(fs_target_dim_text, fs_target_width, fs_target_height);
-            if (!fs_target_dim_valid) {
-                static std::atomic_flag warned = ATOMIC_FLAG_INIT;
-                if (!warned.test_and_set())
-                    std::fprintf(stderr,
-                                 "[fs-match] PROSPER_FS_SPV_TARGET_DIM invalid -> no file override\n");
-            }
-            // PROSPER_RENDER_TESTPS_MATCH=<file> is the geometry half of a per-shader A/B test: replace
-            // only that exact guest PS with the known solid output while retaining its real VS, indices,
-            // viewport, depth and raster state. As with FS_SPV_MATCH, a bad path fails closed.
-            int testps_match_mode = 0;
-            std::vector<uint32_t> testps_match;
-            if (const char* mp = PROSPER_ENV_VALUE("PROSPER_RENDER_TESTPS_MATCH")) {
-                testps_match_mode = load_spv_file(mp, testps_match) ? 1 : 2;
-                if (testps_match_mode == 2)
-                    fprintf(stderr, "[testps-match] PROSPER_RENDER_TESTPS_MATCH='%s' invalid/unreadable -> "
-                            "applying NO test fragment override (fail closed)\n", mp);
-            }
-            const bool nops = PROSPER_ENV_VALUE("PROSPER_RENDER_NOPS");
-            // Assemble backend draws for a subset of the submit's items — one BackendDraw per realized
-            // DrawItem with its own resources + fixed-function state (or the diagnostic overrides above).
-            // build_R reads the CURRENT g_rtt, so calling this AFTER an earlier target-group has been
-            // rendered+stored lets the later group sample that group's pixels (a HIT, not empty memory).
-            // PROSPER_SKIP_DRAW="N[,N...]" (diagnostic): drop these semantic draw_index values from
-            // every pass — isolate whether a specific draw (e.g. a suspected opaque UI backdrop that
-            // hides the composited world) is what corrupts the frame, without touching any state.
-            static const char* skip_draws_env = getenv("PROSPER_SKIP_DRAW");
-            // PROSPER_SKIP_DRAW_PROGRAM / PROSPER_DRAW_PROGRAM_CENSUS: decline draws by shader
-            // PROGRAM identity, and enumerate the programs a title draws with. Both are process
-            // singletons configured once from the environment (see draw_program_skip.hpp for the
-            // contract and the four limits a reader of a skipped run cannot see in the output).
-            // Hoisted here for the same reason descriptor_validate_mode is: the accessor is one
-            // function-local-static test, but calling it per draw on a 2,100-draw submit is a
-            // measurable cost for a variable nobody set.
-            auto& program_skip = prosper::gpu::draw_program_skip_selector();
-            const bool program_skip_armed = program_skip.armed();
-            const bool program_census = prosper::gpu::draw_program_census_enabled();
-            // PROSPER_DRAW_LINKSCAN: the graphics counterpart of PROSPER_COMPUTE_PARENTSCAN.
-            // Hoisted for the same reason as the two above -- disarmed it is one bool.
-            auto& link_scan = prosper::gpu::draw_link_scan_selector();
-            const bool link_scan_armed = prosper::gpu::draw_link_scan_enabled();
+            // Diagnostic shader/state overrides (REFVS, TESTPS, FS_SPV, NOPS, SKIP_DRAW, ...): see
+            // load_shader_overrides. Computed once per callback, applied to every draw item.
+            ShaderOverrides shader_overrides = load_shader_overrides();
             BackendDrawContext backend_draw_ctx{
                 .native_fragment_vote_width = native_fragment_vote_width,
                 .partial_wave_fragment = partial_wave_fragment,
@@ -2193,36 +1915,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 .use_direct_index_views = use_direct_index_views,
                 .descriptor_validate_mode = descriptor_validate_mode,
                 .draw_resource_ctx = draw_resource_ctx,
-                .refvs = refvs,
-                .refvs_spv = refvs_spv,
-                .ps_override = ps_override,
-                .ps_override_is_file = ps_override_is_file,
-                .ps_override_is_test = ps_override_is_test,
-                .fs_match_mode = fs_match_mode,
-                .fs_match = fs_match,
-                .fs_guest_addr_text = fs_guest_addr_text,
-                .fs_guest_addr = fs_guest_addr,
-                .fs_guest_addr_valid = fs_guest_addr_valid,
-                .fs_target_addr_text = fs_target_addr_text,
-                .fs_target_addr = fs_target_addr,
-                .fs_target_addr_valid = fs_target_addr_valid,
-                .fs_target_dim_text = fs_target_dim_text,
-                .fs_target_width = fs_target_width,
-                .fs_target_height = fs_target_height,
-                .fs_target_dim_valid = fs_target_dim_valid,
-                .testps_match_mode = testps_match_mode,
-                .testps_match = testps_match,
-                .nops = nops,
-                .skip_draws_env = skip_draws_env,
-                .program_skip = program_skip,
-                .program_skip_armed = program_skip_armed,
-                .program_census = program_census,
-                .link_scan = link_scan,
-                .link_scan_armed = link_scan_armed};
-            auto build_bds = [&](const std::vector<const prosper::gpu::DrawItem*>& group,
-                                 prosper::test::BackendSubmissionBatch* producer_batch = nullptr) {
-                return build_backend_draws(backend_draw_ctx, group, producer_batch);
-            };
+                .overrides = shader_overrides};
             // Declared beside pass_timing_start, not at the loop's end: the group loop lives in an
             // inner scope that closes before the pass span is accumulated, so a tail marker declared
             // there is out of scope where it is needed.
@@ -2371,7 +2064,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 const bool perf_build_clock = prosper::diagnostics::perf::enabled();   // #3891
                 const auto build_start = timing_enabled || perf_build_clock
                     ? RenderClock::now() : RenderClock::time_point{};
-                auto backend_draws = build_bds(all);
+                auto backend_draws = build_backend_draws(backend_draw_ctx, all, nullptr);
                 const auto build_done = timing_enabled || perf_build_clock
                     ? RenderClock::now() : RenderClock::time_point{};
                 if (perf_build_clock) {
@@ -2407,8 +2100,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         std::chrono::duration<double, std::milli>(build_done - build_start).count();
                     pending_timing.backend_ms +=
                         std::chrono::duration<double, std::milli>(backend_done - build_done).count();
-                    record_backend_timing(backend_call_timing, backend_texture_stats,
-                                          backend_pipeline_stats, backend_reuse_stats);
+                    record_backend_timing_stats(backend_timing_ctx, backend_call_timing,
+                                                backend_texture_stats, backend_pipeline_stats,
+                                                backend_reuse_stats);
                 }
                 // RTT (#167): cache these rendered pixels under this submit's render-target base, so a later
                 // composite pass that samples that address gets the scene we drew (not empty guest memory).
@@ -2977,34 +2671,15 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             static const std::vector<uint8_t> empty_pixels;
             const std::vector<uint8_t>& px = selected_pixels ? *selected_pixels : empty_pixels;
             int n = frame_no++;
-            // PROSPER_DUMP_CONTENT=<min-nonzero-bytes>: dump ONLY frames whose framebuffer has at least
-            // that many nonzero bytes — catches the intermittent content submits the periodic dump misses.
-            size_t content_thr = 0; if (const char* c = PROSPER_ENV_VALUE("PROSPER_DUMP_CONTENT")) content_thr = (size_t)atol(c);
-            // Sparse long-route captures can override the default first-60/every-10 cadence. This is
-            // particularly useful for 4K titles, where capturing itself would otherwise add gigabytes
-            // of readback I/O before the scene under investigation is reached. Zero disables a phase.
-            static const int dump_first = [] { const char* e = getenv("PROSPER_FRAME_DUMP_FIRST");
-                                                return e ? (int)atol(e) : 60; }();
-            static const int dump_every = [] { const char* e = getenv("PROSPER_FRAME_DUMP_EVERY");
-                                                return e ? (int)atol(e) : 10; }();
-            // PROSPER_PRESENT_NZLOG=N: log the presented frame's nonzero-byte count every N frames WITHOUT
-            // writing any image. A memory-safe content proxy for long progression runs — dumping BMPs to a
-            // tmpfs frame dir exhausts RAM, this does not. 0/unset disables.
-            static const int nzlog_every = [] { const char* e = getenv("PROSPER_PRESENT_NZLOG");
-                                                return e ? (int)atol(e) : 0; }();
-            size_t px_nz = 0;
-            if (dump_bmps || nzlog_every) for (uint8_t b : px) px_nz += (b != 0);
-            if (px.empty() && !published_gpu) {
-                fprintf(stderr, "[render] frame %d: Vulkan render FAILED (%ux%u)\n", n, w, h);
-            } else if (dump_bmps && ((content_thr && px_nz >= content_thr) ||
-                       (!content_thr && ((dump_first > 0 && n < dump_first) ||
-                                         (dump_every > 0 && n % dump_every == 0))))) {
-                char fn[512]; snprintf(fn, sizeof fn, "%s/frame_%04d.bmp", frame_dir.c_str(), n);
-                prosper::test::dump_bmp(fn, px, w, h);
-                fprintf(stderr, "[render] frame %d rendered (%ux%u) nz=%zu -> %s\n", n, w, h, px_nz, fn);
-            } else if (nzlog_every && !px.empty() && (n % nzlog_every == 0)) {
-                fprintf(stderr, "[render-nz] frame %d (%ux%u) nz=%zu\n", n, w, h, px_nz);
-            }
+            PresentedFrameDumpContext dump_presented_frame_ctx{
+                .frame_dir = frame_dir,
+                .dump_bmps = dump_bmps,
+                .w = w,
+                .h = h,
+                .published_gpu = published_gpu,
+                .px = px,
+                .n = n};
+            dump_presented_frame(dump_presented_frame_ctx);
             if (timing_enabled) {
                 pending_timing.callbacks++;
                 pending_timing.total_ms += std::chrono::duration<double, std::milli>(
@@ -3015,156 +2690,11 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 if (perf_capture_timing && phase.final_span &&
                     prosper::frontend::complete_renderer_span_belongs_to_capture(
                         pending_capture_generation, callback_capture_generation)) {
-                    prosper::perf::RendererTimingRecord record;
-                    record.span_start_monotonic_ns = pending_span_start_ns;
-                    record.capture_generation = pending_capture_generation;
-                    record.callbacks = pending_timing.callbacks;
-                    record.draws = pending_timing.backend_draws;
-                    record.texture_bytes = pending_timing.texture_bytes;
-                    record.buffer_bytes = pending_timing.buffer_bytes;
-                    record.total_ms = pending_timing.total_ms;
-                    record.prelude_ms = pending_timing.prelude_ms;
-                    record.pass_ms = pending_timing.pass_ms;
-                    record.build_resources_ms = pending_timing.build_resources_ms;
-                    record.backend_ms = pending_timing.backend_ms;
-                    record.output_copy_ms = pending_timing.output_copy_ms;
-                    record.pass_head_ms = pending_timing.pass_head_ms;
-                    record.pass_loop_ms = pending_timing.pass_loop_ms;
-                    record.pass_pre_ms = pending_timing.pass_pre_ms;
-                    record.pass_post_ms = pending_timing.pass_post_ms;
-                    record.post_stats_ms = pending_timing.post_stats_ms;
-                    record.post_slot0_ms = pending_timing.post_slot0_ms;
-                    record.post_mrt_ms = pending_timing.post_mrt_ms;
-                    record.post_rest_ms = pending_timing.post_rest_ms;
-                    record.pass_tail_ms = pending_timing.pass_tail_ms;
-                    record.resolve_stall_ms = pending_timing.resolve_stall_ms;
-                    record.resolve_read_ms = pending_timing.resolve_read_ms;
-                    record.resolve_copy_stall_ms = pending_timing.resolve_copy_stall_ms;
-                    record.resolve_copy_ms = pending_timing.resolve_copy_ms;
-                    record.resolve_count = pending_timing.resolve_n;
-                    record.resolve_read_count = pending_timing.resolve_read_n;
-                    record.resolve_bytes = pending_timing.resolve_bytes;
-                    record.gpu_wait_ms = pending_timing.backend_gpu_wait_ms;
-                    record.gpu_timestamp_samples =
-                        pending_timing.backend_gpu_timestamp_samples;
-                    record.gpu_device_ms = pending_timing.backend_gpu_device_ms;
-                    record.readback_ms = pending_timing.backend_readback_ms;
-                    record.backend_target_ms = pending_timing.backend_target_ms;
-                    record.backend_draw_setup_ms = pending_timing.backend_draw_setup_ms;
-                    record.backend_record_upload_ms = pending_timing.backend_record_upload_ms;
-                    record.backend_cleanup_ms = pending_timing.backend_cleanup_ms;
-                    record.backend_setup_shader_ms = pending_timing.backend_setup_shader_ms;
-                    record.backend_setup_fixed_ms = pending_timing.backend_setup_fixed_ms;
-                    record.setup_resources_ms = pending_timing.backend_setup_resources_ms;
-                    record.backend_setup_pipeline_ms =
-                        pending_timing.backend_setup_pipeline_ms;
-                    record.backend_pipeline_refs = pending_timing.backend_pipeline_refs;
-                    record.backend_pipeline_hits = pending_timing.backend_pipeline_hits;
-                    record.backend_pipeline_misses = pending_timing.backend_pipeline_misses;
-                    record.backend_pipeline_bypasses = pending_timing.backend_pipeline_bypasses;
-                    record.backend_pipeline_entries = pending_timing.backend_pipeline_entries;
-                    record.backend_pipeline_evictions = pending_timing.backend_pipeline_evictions;
-                    // Frontend and backend, kept apart by name. These two are build_resources' own
-                    // texture/buffer time and are NOT parts of setup_resources_ms above.
-                    record.frontend_texture_ms = pending_timing.texture_ms;
-                    record.frontend_buffer_ms = pending_timing.buffer_ms;
-                    record.frontend_buffer_tracked_cache_hits =
-                        pending_timing.buffer_source_gate.tracked_cache_hits;
-                    record.frontend_buffer_tracked_cache_fills =
-                        pending_timing.buffer_source_gate.tracked_cache_fills;
-                    record.frontend_buffer_tracked_untracked_misses =
-                        pending_timing.buffer_source_gate.tracked_untracked_misses;
-                    record.frontend_buffer_reserved_state_queries =
-                        pending_timing.buffer_source_gate.reserved_state_queries;
-                    record.frontend_buffer_compact_resources =
-                        pending_timing.compact_buffer_resources;
-                    record.frontend_buffer_full_resources =
-                        pending_timing.full_buffer_resources;
-                    record.frontend_tex_rtt_ms = pending_timing.tex_rtt_ms;
-                    record.frontend_tex_compute_ms = pending_timing.tex_compute_ms;
-                    record.frontend_tex_local_ms = pending_timing.tex_local_ms;
-                    record.frontend_tex_persist_hit_ms = pending_timing.tex_persist_hit_ms;
-                    record.frontend_tex_persist_reuse_ms = pending_timing.tex_persist_reuse_ms;
-                    record.frontend_tex_persist_miss_ms = pending_timing.tex_persist_miss_ms;
-                    record.frontend_tex_source_snapshot_handoff_ms = pending_timing.tex_source_snapshot_handoff_ms;
-                    record.frontend_tex_source_snapshot_copied_bytes = pending_timing.tex_source_snapshot_copied_bytes;
-                    record.frontend_tex_source_snapshot_transferred_bytes = pending_timing.tex_source_snapshot_transferred_bytes;
-                    record.frontend_tex_persist_invalid_ms = pending_timing.tex_persist_invalid_ms;
-                    record.frontend_tex_persist_invalid_n = pending_timing.tex_persist_invalid_n;
-                    record.frontend_tex_other_n = pending_timing.tex_other_n;
-                    record.frontend_tex_other_slowest_ms =
-                        pending_timing.tex_other_slowest_ms;
-                    record.frontend_tex_other_addr = pending_timing.tex_other_addr;
-                    record.frontend_tex_other_source_bytes =
-                        pending_timing.tex_other_source_bytes;
-                    record.frontend_tex_other_width = pending_timing.tex_other_width;
-                    record.frontend_tex_other_height = pending_timing.tex_other_height;
-                    record.frontend_tex_other_depth = pending_timing.tex_other_depth;
-                    record.frontend_tex_other_format = pending_timing.tex_other_format;
-                    record.frontend_tex_other_components = pending_timing.tex_other_components;
-                    record.frontend_tex_other_tile_mode = pending_timing.tex_other_tile_mode;
-                    record.frontend_tex_other_img_dim = pending_timing.tex_other_img_dim;
-                    record.frontend_tex_other_class = pending_timing.tex_other_class;
-                    record.frontend_tex_other_compute_candidate =
-                        pending_timing.tex_other_compute_candidate;
-                    record.frontend_tex_other_persistent_candidate =
-                        pending_timing.tex_other_persistent_candidate;
-                    record.frontend_tex_other_compressed =
-                        pending_timing.tex_other_compressed;
-                    record.frontend_tex_other_depth_compare =
-                        pending_timing.tex_other_depth_compare;
-                    record.frontend_tex_other_host_backed =
-                        pending_timing.tex_other_host_backed;
-                    record.frontend_build_draw_ms = pending_timing.build_r_ms;
-                    record.frontend_validate_ms = pending_timing.build_validate_ms;
-                    record.frontend_poison_ms = pending_timing.build_poison_ms;
-                    record.frontend_indices_ms = pending_timing.build_indices_ms;
-                    record.frontend_reflect_ms = pending_timing.build_reflect_ms;
-                    // These four DO decompose setup_resources_ms, so an offline report can attribute
-                    // the largest bucket in the capture instead of leaving a plausible residue.
-                    record.frontend_gpu_detile_preparations = pending_timing.gpu_detile_preparations;
-                    record.frontend_gpu_detile_2d_preparations = pending_timing.gpu_detile_2d_preparations;
-                    record.frontend_gpu_detile_source_bytes = pending_timing.gpu_detile_source_bytes;
-                    record.res_texture_ms = pending_timing.backend_res_texture_ms;
-                    record.res_texture_upload_ms = pending_timing.backend_res_texture_upload_ms;
-                    record.res_texture_bind_ms = pending_timing.backend_res_texture_bind_ms;
-                    record.backend_texture_refs = pending_timing.backend_texture_refs;
-                    record.backend_texture_uploads = pending_timing.backend_texture_uploads;
-                    record.backend_texture_upload_bytes = pending_timing.backend_texture_upload_bytes;
-                    record.backend_texture_persistent_hits =
-                        pending_timing.backend_texture_persistent_hits;
-                    record.backend_texture_persistent_misses =
-                        pending_timing.backend_texture_persistent_misses;
-                    record.backend_texture_binding_refs = pending_timing.backend_texture_binding_refs;
-                    record.backend_texture_binding_unique = pending_timing.backend_texture_binding_unique;
-                    record.backend_texture_binding_persistent_hits =
-                        pending_timing.backend_texture_binding_persistent_hits;
-                    record.backend_texture_binding_persistent_misses =
-                        pending_timing.backend_texture_binding_persistent_misses;
-                    record.res_buffer_ms = pending_timing.backend_res_buffer_ms;
-                    record.res_buffer_range_plan_ms = pending_timing.backend_res_buffer_range_plan_ms;
-                    record.res_buffer_copy_ms = pending_timing.backend_res_buffer_copy_ms;
-                    record.res_buffer_resident_ms = pending_timing.backend_res_buffer_resident_ms;
-                    record.res_buffer_watch_ms = pending_timing.backend_res_buffer_watch_ms;
-                    record.buffer_range_uploads = pending_timing.buffer_range_uploads;
-                    record.buffer_range_bindings = pending_timing.buffer_range_bindings;
-                    record.buffer_range_upload_bytes = pending_timing.buffer_range_upload_bytes;
-                    record.buffer_range_bound_bytes = pending_timing.buffer_range_bound_bytes;
-                    record.buffer_upload_bytes = pending_timing.buffer_upload_bytes;
-                    record.buffer_resident_hits = pending_timing.buffer_resident_hits;
-                    record.buffer_resident_compared_bytes = pending_timing.buffer_resident_compared_bytes;
-                    record.buffer_resident_reused_bytes = pending_timing.buffer_resident_reused_bytes;
-                    record.buffer_resident_admitted_bytes = pending_timing.buffer_resident_admitted_bytes;
-                    record.buffer_resident_refreshed_bytes = pending_timing.buffer_resident_refreshed_bytes;
-                    record.buffer_resident_watched_bytes = pending_timing.buffer_resident_watched_bytes;
-                    record.buffer_resident_declined_bytes = pending_timing.buffer_resident_declined_bytes;
-                    record.buffer_resident_ineligible_bytes = pending_timing.buffer_resident_ineligible_bytes;
-                    record.res_buffer_create_ms = pending_timing.backend_res_buffer_create_ms;
-                    record.res_buffer_index_find_ms = pending_timing.backend_res_buffer_index_find_ms;
-                    record.res_buffer_index_insert_ms = pending_timing.backend_res_buffer_index_insert_ms;
-                    record.res_buffer_hash_ms = pending_timing.backend_res_buffer_hash_ms;
-                    record.res_descriptor_ms = pending_timing.backend_res_descriptor_ms;
-                    prosper::perf::interactive_performance_capture().record_renderer(record);
+                    RendererTimingRecordContext publish_renderer_timing_record_ctx{
+                        .pending_timing = pending_timing,
+                        .pending_span_start_ns = pending_span_start_ns,
+                        .pending_capture_generation = pending_capture_generation};
+                    publish_renderer_timing_record(publish_renderer_timing_record_ctx);
                 }
                 if (!timing_mode.log) {
                     // F8 consumes the structured record above, then leaves without touching the

@@ -1163,4 +1163,33 @@ inline const DiagnosticAddressSelector& rtt_residency_trace_selector() {
     return selector;
 }
 
+// ---- appended by a later promotion out of the same source ----
+inline bool parse_diagnostic_address(const char* spec, uint64_t& address) {
+    if (!spec) return true;
+    if (spec[0] != '0' || (spec[1] != 'x' && spec[1] != 'X') || !spec[2]) return false;
+    char* end = nullptr;
+    errno = 0;
+    const unsigned long long parsed = std::strtoull(spec, &end, 16);
+    if (errno || end == spec + 2 || *end || !parsed) return false;
+    address = parsed;
+    return true;
+}
+
+inline bool parse_diagnostic_extent(const char* spec, uint32_t& width, uint32_t& height) {
+    if (!spec) return true;
+    if (*spec < '0' || *spec > '9') return false;
+    char* separator = nullptr;
+    errno = 0;
+    const unsigned long w = std::strtoul(spec, &separator, 10);
+    if (errno || !separator || *separator != 'x' || !w || w > UINT32_MAX ||
+        separator[1] < '0' || separator[1] > '9') return false;
+    char* end = nullptr;
+    errno = 0;
+    const unsigned long h = std::strtoul(separator + 1, &end, 10);
+    if (errno || !end || *end || !h || h > UINT32_MAX) return false;
+    width = static_cast<uint32_t>(w);
+    height = static_cast<uint32_t>(h);
+    return true;
+}
+
 }  // namespace prosper::frontend

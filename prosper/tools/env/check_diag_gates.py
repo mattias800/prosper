@@ -1090,7 +1090,10 @@ def split_call_findings(call_sites: dict[str, list[tuple[str, frozenset]]],
             continue
         if any(not g for _w, g in sites):
             continue
-        distinct = sorted({g for _w, g in sites}, key=lambda s: sorted(s))
+        # Ordered by the clauses' SORTED NAMES. `key=sorted` compared the clauses themselves,
+        # and frozensets order by subset -- a partial order -- so the pair, and with it the file in
+        # the baseline key, followed PYTHONHASHSEED once two sites sat in different files (#3892).
+        distinct = sorted({g for _w, g in sites}, key=lambda s: sorted(sorted(c) for c in s))
         if len(distinct) < 2:
             continue
         pair = None
@@ -1716,8 +1719,36 @@ def run_key_stability_test(verbose: bool = False) -> int:
     elif verbose:
         print("  [ok]   key discrimination: a changed conjunction moves the key")
 
+    # Arm 3: the same findings under different PYTHONHASHSEED values must carry the same keys. A
+    # SPLIT-CALL whose disagreeing sites sit in different files picks one of them for its key, and
+    # that pick used to follow set iteration order: #3892 part 3's moved pass-loop diagnostics
+    # made the baseline pass or fail on alternate runs. A subprocess per seed is the only way to
+    # vary the seed; three disjoint gates are the smallest input whose order the subset ordering
+    # cannot fix.
+    import os
+    import subprocess
+    probe = ("import importlib.util, sys; spec = importlib.util.spec_from_file_location('g', sys.argv[1]); "
+             "g = importlib.util.module_from_spec(spec); spec.loader.exec_module(g); F = frozenset; "
+             "sites = {'probe': [('src/b.cpp:1', F({F({'PROSPER_ZZ_B'})})), "
+             "('src/a.cpp:1', F({F({'PROSPER_ZZ_A'})})), "
+             "('src/c.cpp:1', F({F({'PROSPER_ZZ_B', 'PROSPER_ZZ_C'})}))]}; "
+             "print(sorted(f.key() for f in g.split_call_findings(sites, {'probe'})))")
+    runs = {}
+    for seed in range(16):
+        out = subprocess.run([sys.executable, "-c", probe, __file__], capture_output=True, text=True,
+                             env={**os.environ, "PYTHONHASHSEED": str(seed)})
+        runs[seed] = out.stdout.strip() if out.returncode == 0 else f"<rc={out.returncode}> {out.stderr.strip()[-200:]}"
+    if len(set(runs.values())) != 1 or "SPLIT-CALL" not in runs[0]:
+        bad += 1
+        print("  [FAIL] key stability: a SPLIT-CALL key changed with PYTHONHASHSEED (or the probe found none):")
+        for seed, keys in runs.items():
+            print(f"           seed {seed}: {keys}")
+    elif verbose:
+        print("  [ok]   key stability: SPLIT-CALL keys agree across 16 hash seeds")
+
     if not bad:
-        print("  [ok]   key stability: 2 arms (membership-insensitive, conjunction-sensitive)")
+        print("  [ok]   key stability: 3 arms (membership-insensitive, conjunction-sensitive, "
+              "hash-seed-independent)")
     return bad
 
 

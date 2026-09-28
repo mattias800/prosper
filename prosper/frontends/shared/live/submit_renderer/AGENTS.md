@@ -13,15 +13,31 @@ itself still lives in `live_renderer.cpp` and still owns all the state.
   backend frame resources (the texture- and buffer-reference resolution chain; the hottest code in
   the renderer). Formerly the `build_R` lambda.
 - `timing_report.{hpp,cpp}` — `report_render_timing_aggregates`: the `PROSPER_RENDER_TIMING`
-  lifetime/window summaries.
+  lifetime/window summaries; and `publish_renderer_timing_record`, the F8 capture's per-submit
+  `RendererTimingRecord`.
 - `backend_draws.{hpp,cpp}` — `build_backend_draws`: one `BackendDraw` per realized draw of a pass
   group (shaders or diagnostic overrides, `build_draw_frame_resources`, contract validation,
   poison mode, indices, per-draw census/skip diagnostics). Formerly `build_bds`. Also `clear_for`.
 - `backend_timing.{hpp,cpp}` — `record_backend_timing_stats` (folds one backend call's counters
   into the submit's `RenderTiming`) and the `PROSPER_RTT_TIMING` record formatters.
 - `per_target_passes.{hpp,cpp}` — `render_per_target_passes`: the `PROSPER_RTT` per-target pass
-  loop (resolves, MRT, RTT publication, and choosing the present candidate among its passes). The
-  scanout resolution and GPU scanout publish that follow it still live in the callback.
+  loop (pass grouping, MRT, RTT publication, and choosing the present candidate among its passes).
+  The scanout resolution and GPU scanout publish that follow it still live in the callback.
+- `resolve_pass.{hpp,cpp}` — `resolve_pass`: one `CB_COLOR_CONTROL.MODE=RESOLVE` pass, a copy of
+  colour0 into colour1's retained target. The pass loop's `continue` stays at the call site.
+- `pass_diagnostics.{hpp,cpp}` — the pass loop's `PROSPER_*` diagnostic blocks (readback reasons,
+  resource and draw-step hashes, pass/RT-group/persistent-target dumps, the pass logs).
+- `callback_prelude.{hpp,cpp}` — per-callback setup work: `load_shader_overrides` (the REFVS /
+  TESTPS / FS_SPV / SKIP_DRAW overrides, one `ShaderOverrides` value that `BackendDrawContext`
+  refers to) and `materialize_dirty_dcc_clears`.
+- `callback_diagnostics.{hpp,cpp}` — the callback's own diagnostics: submit-index logs, the
+  diagnostic render-window selectors, the SPIR-V dump and the presented-frame dumps.
+
+**Diagnostics keep their gate beside their report.** When a diagnostic block moves out, a gate
+that is a `PROSPER_*` test moves with it, so `tools/env/check_diag_gates.py` still sees the gate
+next to the report it arms (the scanner is per-file and lexical, and does not follow a gate across
+a call). A gate that is a value of the calling code (`rtt_log`, a hash extent) stays at the call
+site, so a false gate builds no context and makes no call.
 
 **How a piece talks to the callback.** Each extracted function takes a `*Context` struct of
 references, one per callback object it touches. The callback builds it once per callback, so the

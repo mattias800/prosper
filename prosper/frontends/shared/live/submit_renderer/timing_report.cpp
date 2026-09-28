@@ -1081,4 +1081,161 @@ void report_render_timing_aggregates(RenderTimingReportContext& ctx) {
     }
 }
 
+void publish_renderer_timing_record(RendererTimingRecordContext& ctx) {
+    // Every name the moved body used from the callback, bound once to the same object.
+    auto& pending_timing = ctx.pending_timing;
+    auto& pending_span_start_ns = ctx.pending_span_start_ns;
+    auto& pending_capture_generation = ctx.pending_capture_generation;
+    prosper::perf::RendererTimingRecord record;
+    record.span_start_monotonic_ns = pending_span_start_ns;
+    record.capture_generation = pending_capture_generation;
+    record.callbacks = pending_timing.callbacks;
+    record.draws = pending_timing.backend_draws;
+    record.texture_bytes = pending_timing.texture_bytes;
+    record.buffer_bytes = pending_timing.buffer_bytes;
+    record.total_ms = pending_timing.total_ms;
+    record.prelude_ms = pending_timing.prelude_ms;
+    record.pass_ms = pending_timing.pass_ms;
+    record.build_resources_ms = pending_timing.build_resources_ms;
+    record.backend_ms = pending_timing.backend_ms;
+    record.output_copy_ms = pending_timing.output_copy_ms;
+    record.pass_head_ms = pending_timing.pass_head_ms;
+    record.pass_loop_ms = pending_timing.pass_loop_ms;
+    record.pass_pre_ms = pending_timing.pass_pre_ms;
+    record.pass_post_ms = pending_timing.pass_post_ms;
+    record.post_stats_ms = pending_timing.post_stats_ms;
+    record.post_slot0_ms = pending_timing.post_slot0_ms;
+    record.post_mrt_ms = pending_timing.post_mrt_ms;
+    record.post_rest_ms = pending_timing.post_rest_ms;
+    record.pass_tail_ms = pending_timing.pass_tail_ms;
+    record.resolve_stall_ms = pending_timing.resolve_stall_ms;
+    record.resolve_read_ms = pending_timing.resolve_read_ms;
+    record.resolve_copy_stall_ms = pending_timing.resolve_copy_stall_ms;
+    record.resolve_copy_ms = pending_timing.resolve_copy_ms;
+    record.resolve_count = pending_timing.resolve_n;
+    record.resolve_read_count = pending_timing.resolve_read_n;
+    record.resolve_bytes = pending_timing.resolve_bytes;
+    record.gpu_wait_ms = pending_timing.backend_gpu_wait_ms;
+    record.gpu_timestamp_samples =
+        pending_timing.backend_gpu_timestamp_samples;
+    record.gpu_device_ms = pending_timing.backend_gpu_device_ms;
+    record.readback_ms = pending_timing.backend_readback_ms;
+    record.backend_target_ms = pending_timing.backend_target_ms;
+    record.backend_draw_setup_ms = pending_timing.backend_draw_setup_ms;
+    record.backend_record_upload_ms = pending_timing.backend_record_upload_ms;
+    record.backend_cleanup_ms = pending_timing.backend_cleanup_ms;
+    record.backend_setup_shader_ms = pending_timing.backend_setup_shader_ms;
+    record.backend_setup_fixed_ms = pending_timing.backend_setup_fixed_ms;
+    record.setup_resources_ms = pending_timing.backend_setup_resources_ms;
+    record.backend_setup_pipeline_ms =
+        pending_timing.backend_setup_pipeline_ms;
+    record.backend_pipeline_refs = pending_timing.backend_pipeline_refs;
+    record.backend_pipeline_hits = pending_timing.backend_pipeline_hits;
+    record.backend_pipeline_misses = pending_timing.backend_pipeline_misses;
+    record.backend_pipeline_bypasses = pending_timing.backend_pipeline_bypasses;
+    record.backend_pipeline_entries = pending_timing.backend_pipeline_entries;
+    record.backend_pipeline_evictions = pending_timing.backend_pipeline_evictions;
+    // Frontend and backend, kept apart by name. These two are build_resources' own
+    // texture/buffer time and are NOT parts of setup_resources_ms above.
+    record.frontend_texture_ms = pending_timing.texture_ms;
+    record.frontend_buffer_ms = pending_timing.buffer_ms;
+    record.frontend_buffer_tracked_cache_hits =
+        pending_timing.buffer_source_gate.tracked_cache_hits;
+    record.frontend_buffer_tracked_cache_fills =
+        pending_timing.buffer_source_gate.tracked_cache_fills;
+    record.frontend_buffer_tracked_untracked_misses =
+        pending_timing.buffer_source_gate.tracked_untracked_misses;
+    record.frontend_buffer_reserved_state_queries =
+        pending_timing.buffer_source_gate.reserved_state_queries;
+    record.frontend_buffer_compact_resources =
+        pending_timing.compact_buffer_resources;
+    record.frontend_buffer_full_resources =
+        pending_timing.full_buffer_resources;
+    record.frontend_tex_rtt_ms = pending_timing.tex_rtt_ms;
+    record.frontend_tex_compute_ms = pending_timing.tex_compute_ms;
+    record.frontend_tex_local_ms = pending_timing.tex_local_ms;
+    record.frontend_tex_persist_hit_ms = pending_timing.tex_persist_hit_ms;
+    record.frontend_tex_persist_reuse_ms = pending_timing.tex_persist_reuse_ms;
+    record.frontend_tex_persist_miss_ms = pending_timing.tex_persist_miss_ms;
+    record.frontend_tex_source_snapshot_handoff_ms = pending_timing.tex_source_snapshot_handoff_ms;
+    record.frontend_tex_source_snapshot_copied_bytes = pending_timing.tex_source_snapshot_copied_bytes;
+    record.frontend_tex_source_snapshot_transferred_bytes = pending_timing.tex_source_snapshot_transferred_bytes;
+    record.frontend_tex_persist_invalid_ms = pending_timing.tex_persist_invalid_ms;
+    record.frontend_tex_persist_invalid_n = pending_timing.tex_persist_invalid_n;
+    record.frontend_tex_other_n = pending_timing.tex_other_n;
+    record.frontend_tex_other_slowest_ms =
+        pending_timing.tex_other_slowest_ms;
+    record.frontend_tex_other_addr = pending_timing.tex_other_addr;
+    record.frontend_tex_other_source_bytes =
+        pending_timing.tex_other_source_bytes;
+    record.frontend_tex_other_width = pending_timing.tex_other_width;
+    record.frontend_tex_other_height = pending_timing.tex_other_height;
+    record.frontend_tex_other_depth = pending_timing.tex_other_depth;
+    record.frontend_tex_other_format = pending_timing.tex_other_format;
+    record.frontend_tex_other_components = pending_timing.tex_other_components;
+    record.frontend_tex_other_tile_mode = pending_timing.tex_other_tile_mode;
+    record.frontend_tex_other_img_dim = pending_timing.tex_other_img_dim;
+    record.frontend_tex_other_class = pending_timing.tex_other_class;
+    record.frontend_tex_other_compute_candidate =
+        pending_timing.tex_other_compute_candidate;
+    record.frontend_tex_other_persistent_candidate =
+        pending_timing.tex_other_persistent_candidate;
+    record.frontend_tex_other_compressed =
+        pending_timing.tex_other_compressed;
+    record.frontend_tex_other_depth_compare =
+        pending_timing.tex_other_depth_compare;
+    record.frontend_tex_other_host_backed =
+        pending_timing.tex_other_host_backed;
+    record.frontend_build_draw_ms = pending_timing.build_r_ms;
+    record.frontend_validate_ms = pending_timing.build_validate_ms;
+    record.frontend_poison_ms = pending_timing.build_poison_ms;
+    record.frontend_indices_ms = pending_timing.build_indices_ms;
+    record.frontend_reflect_ms = pending_timing.build_reflect_ms;
+    // These four DO decompose setup_resources_ms, so an offline report can attribute
+    // the largest bucket in the capture instead of leaving a plausible residue.
+    record.frontend_gpu_detile_preparations = pending_timing.gpu_detile_preparations;
+    record.frontend_gpu_detile_2d_preparations = pending_timing.gpu_detile_2d_preparations;
+    record.frontend_gpu_detile_source_bytes = pending_timing.gpu_detile_source_bytes;
+    record.res_texture_ms = pending_timing.backend_res_texture_ms;
+    record.res_texture_upload_ms = pending_timing.backend_res_texture_upload_ms;
+    record.res_texture_bind_ms = pending_timing.backend_res_texture_bind_ms;
+    record.backend_texture_refs = pending_timing.backend_texture_refs;
+    record.backend_texture_uploads = pending_timing.backend_texture_uploads;
+    record.backend_texture_upload_bytes = pending_timing.backend_texture_upload_bytes;
+    record.backend_texture_persistent_hits =
+        pending_timing.backend_texture_persistent_hits;
+    record.backend_texture_persistent_misses =
+        pending_timing.backend_texture_persistent_misses;
+    record.backend_texture_binding_refs = pending_timing.backend_texture_binding_refs;
+    record.backend_texture_binding_unique = pending_timing.backend_texture_binding_unique;
+    record.backend_texture_binding_persistent_hits =
+        pending_timing.backend_texture_binding_persistent_hits;
+    record.backend_texture_binding_persistent_misses =
+        pending_timing.backend_texture_binding_persistent_misses;
+    record.res_buffer_ms = pending_timing.backend_res_buffer_ms;
+    record.res_buffer_range_plan_ms = pending_timing.backend_res_buffer_range_plan_ms;
+    record.res_buffer_copy_ms = pending_timing.backend_res_buffer_copy_ms;
+    record.res_buffer_resident_ms = pending_timing.backend_res_buffer_resident_ms;
+    record.res_buffer_watch_ms = pending_timing.backend_res_buffer_watch_ms;
+    record.buffer_range_uploads = pending_timing.buffer_range_uploads;
+    record.buffer_range_bindings = pending_timing.buffer_range_bindings;
+    record.buffer_range_upload_bytes = pending_timing.buffer_range_upload_bytes;
+    record.buffer_range_bound_bytes = pending_timing.buffer_range_bound_bytes;
+    record.buffer_upload_bytes = pending_timing.buffer_upload_bytes;
+    record.buffer_resident_hits = pending_timing.buffer_resident_hits;
+    record.buffer_resident_compared_bytes = pending_timing.buffer_resident_compared_bytes;
+    record.buffer_resident_reused_bytes = pending_timing.buffer_resident_reused_bytes;
+    record.buffer_resident_admitted_bytes = pending_timing.buffer_resident_admitted_bytes;
+    record.buffer_resident_refreshed_bytes = pending_timing.buffer_resident_refreshed_bytes;
+    record.buffer_resident_watched_bytes = pending_timing.buffer_resident_watched_bytes;
+    record.buffer_resident_declined_bytes = pending_timing.buffer_resident_declined_bytes;
+    record.buffer_resident_ineligible_bytes = pending_timing.buffer_resident_ineligible_bytes;
+    record.res_buffer_create_ms = pending_timing.backend_res_buffer_create_ms;
+    record.res_buffer_index_find_ms = pending_timing.backend_res_buffer_index_find_ms;
+    record.res_buffer_index_insert_ms = pending_timing.backend_res_buffer_index_insert_ms;
+    record.res_buffer_hash_ms = pending_timing.backend_res_buffer_hash_ms;
+    record.res_descriptor_ms = pending_timing.backend_res_descriptor_ms;
+    prosper::perf::interactive_performance_capture().record_renderer(record);
+}
+
 } // namespace prosper::frontend::submit_renderer

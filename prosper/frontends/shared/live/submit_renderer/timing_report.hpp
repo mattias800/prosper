@@ -24,4 +24,16 @@ struct RenderTimingReportContext {
 
 void report_render_timing_aggregates(RenderTimingReportContext& ctx);
 
+// ---- F8 renderer timing record (#3892) ----------------------------------------------------------
+//
+// Copies one complete semantic submit's RenderTiming into the interactive performance capture's
+// RendererTimingRecord. Moved out of the submit callback verbatim; its gate stays at the call site.
+// The submit callback's state that publish_renderer_timing_record reads and writes, one reference per object.
+struct RendererTimingRecordContext {
+    RenderTiming& pending_timing;
+    uint64_t& pending_span_start_ns;
+    uint64_t& pending_capture_generation;
+};
+void publish_renderer_timing_record(RendererTimingRecordContext& ctx);
+
 } // namespace prosper::frontend::submit_renderer
