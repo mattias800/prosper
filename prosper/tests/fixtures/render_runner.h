@@ -5247,6 +5247,25 @@ inline bool consume_render_texture_create_failure_once() {
     return true;
 }
 
+// #3901: one-shot "every memory type failed" for the next sampled-texture or depth-target memory
+// allocation -- since #3897 a real one needs VRAM AND the host types exhausted, which no test can
+// arrange. The site frees what it got and proceeds as if nothing could be allocated. The
+// production path never arms it.
+enum class RenderMemoryFailureSite : uint8_t { Texture, DepthTarget, Count };
+inline bool& render_memory_failure_once_storage(RenderMemoryFailureSite site) {
+    static thread_local bool armed[static_cast<size_t>(RenderMemoryFailureSite::Count)] = {};
+    return armed[static_cast<size_t>(site)];
+}
+inline void inject_render_memory_failure_once(RenderMemoryFailureSite site) {
+    render_memory_failure_once_storage(site) = true;
+}
+inline bool consume_render_memory_failure_once(RenderMemoryFailureSite site) {
+    bool& armed = render_memory_failure_once_storage(site);
+    if (!armed) return false;
+    armed = false;
+    return true;
+}
+
 // #3180: the COLOR-TARGET vkCreateImage sites, the milder siblings of #3045's two.
 //
 // Each of the six already guarded the HANDLE before touching it further (`if (!img) return out;`),
@@ -9265,7 +9284,41 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         else dmem = allocate_transient_gpu_only_render_memory(
                  dev, prosper::gpu::GpuOnlyMemoryClass::DepthTarget, memp, dr.memoryTypeBits,
                  dai.allocationSize);
-        vkBindImageMemory(dev, dimg, dmem, 0);
+        // #3901: every allowed memory type failed, or the bind failed. Binding VK_NULL_HANDLE is
+        // invalid usage and the unbound image would reach the framebuffer; drop the pass and tear
+        // the half-created target down, as the #3210 view failure below does.
+        if (dmem && consume_render_memory_failure_once(RenderMemoryFailureSite::DepthTarget)) {
+            if (cached_ds) prosper::gpu::free_device_memory(dev, dmem);
+            else release_transient_render_memory(dev, dmem);
+            dmem = VK_NULL_HANDLE;
+        }
+        const VkResult ds_bind_result = dmem ? vkBindImageMemory(dev, dimg, dmem, 0)
+                                             : VK_ERROR_OUT_OF_DEVICE_MEMORY;
+        if (ds_bind_result != VK_SUCCESS) {
+            static std::atomic<uint32_t> ds_memory_failure_logs{0};
+            if (ds_memory_failure_logs.fetch_add(1, std::memory_order_relaxed) < 32)
+                std::fprintf(stderr,
+                    "[ds-create-failed] %s result=%d bytes=%llu extent=%ux%u fmt=%d -- "
+                    "dropping the pass\n",
+                    dmem ? "vkBindImageMemory" : "no memory type could hold the depth target",
+                    (int)ds_bind_result, (unsigned long long)dai.allocationSize, W, H, (int)DFMT);
+            // The pass's draws were never seen by the per-draw loop: count them seen and dropped
+            // together so the census's two routes still agree.
+            prosper::gpu::draw_disposition_census().note_seen(draws.size());
+            for (size_t i = 0; i < draws.size(); ++i)
+                prosper::gpu::draw_disposition_census().note_dropped(
+                    prosper::gpu::DrawDrop::TargetMemory);
+            vkDestroyImage(dev, dimg, nullptr);
+            dimg = VK_NULL_HANDLE;
+            if (cached_ds) {
+                if (dmem) prosper::gpu::free_device_memory(dev, dmem);
+                persistent_ds_cache().erase(ds_key);
+            } else if (dmem) {
+                release_transient_render_memory(dev, dmem);
+            }
+            dmem = VK_NULL_HANDLE;
+            return out;
+        }
         VkImageViewCreateInfo dvci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
         dvci.image = dimg; dvci.viewType = VK_IMAGE_VIEW_TYPE_2D; dvci.format = DFMT;
         dvci.subresourceRange = {DASPECT, 0, 1, 0, 1};
@@ -11871,6 +11924,10 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                             r.set, r.binding, (int)image_create_result,
                                             tci.extent.width, tci.extent.height, tci.extent.depth,
                                             tci.mipLevels, tci.arrayLayers, (int)tci.format);
+                                    // #3913 review: the upload is already in the pass's sharing
+                                    // index; a later draw of this pass sampling the same texture
+                                    // must retry, not reuse this dead entry.
+                                    if (share_texture_uploads) texture_upload_indices.erase(texture_key);
                                     buffer_resources_ready = false;
                                     break;
                                 }
@@ -11907,7 +11964,52 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                         dev, prosper::gpu::GpuOnlyMemoryClass::SampledTexture,
                                         memp, tr.memoryTypeBits, tai.allocationSize);
                                 }
-                                vkBindImageMemory(dev, upload.image, upload.memory, 0);
+                                // #3901: every allowed memory type failed (VRAM and, since
+                                // #3897, the host types too), or the bind itself failed. Binding
+                                // VK_NULL_HANDLE is invalid usage and the unbound image would reach
+                                // a descriptor; skip the draw like the vkCreateImage failure above.
+                                // The image is destroyed by the ordinary upload teardown.
+                                if (upload.memory && consume_render_memory_failure_once(
+                                        RenderMemoryFailureSite::Texture)) {
+                                    if (upload.direct_memory)
+                                        prosper::gpu::free_device_memory(dev, upload.memory);
+                                    else
+                                        release_transient_render_memory(dev, upload.memory);
+                                    upload.memory = VK_NULL_HANDLE;
+                                }
+                                const VkResult texture_bind_result = upload.memory
+                                    ? vkBindImageMemory(dev, upload.image, upload.memory, 0)
+                                    : VK_ERROR_OUT_OF_DEVICE_MEMORY;
+                                if (texture_bind_result != VK_SUCCESS) {
+                                    static std::atomic<uint32_t> texture_memory_failure_logs{0};
+                                    if (texture_memory_failure_logs.fetch_add(
+                                            1, std::memory_order_relaxed) < 32)
+                                        std::fprintf(
+                                            stderr,
+                                            "[texture-upload-failed] set=%u binding=%u %s "
+                                            "result=%d bytes=%llu extent=%ux%ux%u fmt=%d -- "
+                                            "skipping draw\n",
+                                            r.set, r.binding,
+                                            upload.memory ? "vkBindImageMemory"
+                                                          : "no memory type could hold the image",
+                                            (int)texture_bind_result,
+                                            (unsigned long long)tai.allocationSize,
+                                            tci.extent.width, tci.extent.height,
+                                            tci.extent.depth, (int)tci.format);
+                                    if (upload.memory) {
+                                        if (upload.direct_memory)
+                                            prosper::gpu::free_device_memory(dev, upload.memory);
+                                        else
+                                            release_transient_render_memory(dev, upload.memory);
+                                        upload.memory = VK_NULL_HANDLE;
+                                    }
+                                    upload.direct_memory = false;
+                                    upload.persistent_id = 0;
+                                    // Drop the dead upload from the pass's sharing index (above).
+                                    if (share_texture_uploads) texture_upload_indices.erase(texture_key);
+                                    buffer_resources_ready = false;
+                                    break;
+                                }
                             }
 
                             // #1272: staging carries level 0 only; levels 1..N-1 are produced on the

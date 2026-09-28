@@ -74,6 +74,7 @@ enum class DrawDrop : uint8_t {
     BufferResources,         // a draw's buffer resources did not resolve
     ShaderRejected,          // the recompiler produced no SPIR-V for a required stage
     PipelineCreation,        // vkCreateGraphicsPipelines declined the draw's pipeline
+    TargetMemory,            // no memory type could hold a pass attachment (#3901): whole pass
     Count
 };
 
