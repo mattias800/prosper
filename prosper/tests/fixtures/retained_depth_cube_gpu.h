@@ -376,7 +376,7 @@ inline DepthCubeGpuResult copy_persistent_ds_cube_depth_gpu(
     const VkDeviceSize plane_bytes = static_cast<VkDeviceSize>(width) * height * sizeof(float);
     for (uint32_t face = 0; face < 6u; ++face) {
         VkBufferImageCopy copy{};
-        copy.bufferOffset = plane_bytes * (5u - face);
+        copy.bufferOffset = plane_bytes * face;
         copy.imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
         copy.imageExtent = {width, height, 1};
         vkCmdCopyImageToBuffer(command, selected.faces[face]->image,
