@@ -326,4 +326,14 @@ struct DepthCubeGpuSnapshot {
 constexpr size_t kDepthCubeGpuSnapshotEntries = 8;
 
 constexpr uint32_t kNoPassFormat = UINT32_MAX;
+// What later passes of the same submit do with a pass's target (render_per_target_passes).
+struct LaterTargetConsumers {
+    bool sampled_exact = false;
+    bool feedback = false;
+    bool cpu_needed = false;
+    uint32_t storage_references = 0;
+    uint32_t dimension_mismatches = 0;
+    uint32_t extent_mismatches = 0;
+    uint32_t feedback_references = 0;
+};
 } // namespace prosper::frontend::submit_renderer

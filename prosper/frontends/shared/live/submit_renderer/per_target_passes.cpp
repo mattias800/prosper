@@ -1110,15 +1110,6 @@ void render_per_target_passes(PerTargetPassContext& ctx) {
                             sit->second.rgba ? sit->second.rgba->size() : (size_t)0,
                             gw, gh, (int)pass_format, pass_bytes);
             } }
-        struct LaterTargetConsumers {
-            bool sampled_exact = false;
-            bool feedback = false;
-            bool cpu_needed = false;
-            uint32_t storage_references = 0;
-            uint32_t dimension_mismatches = 0;
-            uint32_t extent_mismatches = 0;
-            uint32_t feedback_references = 0;
-        };
         // A later pass in THIS batch that reads the target's CPU bytes cannot be served
         // lazily: the producing commands are still unsubmitted when it binds, so a
         // mid-batch readback would return stale pixels. Only the direct GPU bind (2D
