@@ -1915,32 +1915,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 .use_direct_index_views = use_direct_index_views,
                 .descriptor_validate_mode = descriptor_validate_mode,
                 .draw_resource_ctx = draw_resource_ctx,
-                .refvs = shader_overrides.refvs,
-                .refvs_spv = shader_overrides.refvs_spv,
-                .ps_override = shader_overrides.ps_override,
-                .ps_override_is_file = shader_overrides.ps_override_is_file,
-                .ps_override_is_test = shader_overrides.ps_override_is_test,
-                .fs_match_mode = shader_overrides.fs_match_mode,
-                .fs_match = shader_overrides.fs_match,
-                .fs_guest_addr_text = shader_overrides.fs_guest_addr_text,
-                .fs_guest_addr = shader_overrides.fs_guest_addr,
-                .fs_guest_addr_valid = shader_overrides.fs_guest_addr_valid,
-                .fs_target_addr_text = shader_overrides.fs_target_addr_text,
-                .fs_target_addr = shader_overrides.fs_target_addr,
-                .fs_target_addr_valid = shader_overrides.fs_target_addr_valid,
-                .fs_target_dim_text = shader_overrides.fs_target_dim_text,
-                .fs_target_width = shader_overrides.fs_target_width,
-                .fs_target_height = shader_overrides.fs_target_height,
-                .fs_target_dim_valid = shader_overrides.fs_target_dim_valid,
-                .testps_match_mode = shader_overrides.testps_match_mode,
-                .testps_match = shader_overrides.testps_match,
-                .nops = shader_overrides.nops,
-                .skip_draws_env = shader_overrides.skip_draws_env,
-                .program_skip = shader_overrides.program_skip,
-                .program_skip_armed = shader_overrides.program_skip_armed,
-                .program_census = shader_overrides.program_census,
-                .link_scan = shader_overrides.link_scan,
-                .link_scan_armed = shader_overrides.link_scan_armed};
+                .overrides = shader_overrides};
             // Declared beside pass_timing_start, not at the loop's end: the group loop lives in an
             // inner scope that closes before the pass span is accumulated, so a tail marker declared
             // there is out of scope where it is needed.

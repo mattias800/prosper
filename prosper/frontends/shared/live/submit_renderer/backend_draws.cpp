@@ -17,36 +17,36 @@ std::vector<prosper::test::BackendDraw> build_backend_draws(BackendDrawContext& 
     auto& use_direct_index_views = ctx.use_direct_index_views;
     auto& descriptor_validate_mode = ctx.descriptor_validate_mode;
     auto& draw_resource_ctx = ctx.draw_resource_ctx;
-    auto& refvs = ctx.refvs;
-    auto& refvs_spv = ctx.refvs_spv;
-    auto& ps_override = ctx.ps_override;
-    auto& ps_override_is_file = ctx.ps_override_is_file;
-    auto& ps_override_is_test = ctx.ps_override_is_test;
-    auto& fs_match_mode = ctx.fs_match_mode;
-    auto& fs_match = ctx.fs_match;
-    auto& fs_guest_addr_text = ctx.fs_guest_addr_text;
-    auto& fs_guest_addr = ctx.fs_guest_addr;
-    auto& fs_guest_addr_valid = ctx.fs_guest_addr_valid;
-    auto& fs_target_addr_text = ctx.fs_target_addr_text;
-    auto& fs_target_addr = ctx.fs_target_addr;
-    auto& fs_target_addr_valid = ctx.fs_target_addr_valid;
-    auto& fs_target_dim_text = ctx.fs_target_dim_text;
-    auto& fs_target_width = ctx.fs_target_width;
-    auto& fs_target_height = ctx.fs_target_height;
-    auto& fs_target_dim_valid = ctx.fs_target_dim_valid;
-    auto& testps_match_mode = ctx.testps_match_mode;
-    auto& testps_match = ctx.testps_match;
-    auto& nops = ctx.nops;
-    auto& program_skip = ctx.program_skip;
-    auto& program_skip_armed = ctx.program_skip_armed;
-    auto& program_census = ctx.program_census;
-    auto& link_scan = ctx.link_scan;
-    auto& link_scan_armed = ctx.link_scan_armed;
+    auto& refvs = ctx.overrides.refvs;
+    auto& refvs_spv = ctx.overrides.refvs_spv;
+    auto& ps_override = ctx.overrides.ps_override;
+    auto& ps_override_is_file = ctx.overrides.ps_override_is_file;
+    auto& ps_override_is_test = ctx.overrides.ps_override_is_test;
+    auto& fs_match_mode = ctx.overrides.fs_match_mode;
+    auto& fs_match = ctx.overrides.fs_match;
+    auto& fs_guest_addr_text = ctx.overrides.fs_guest_addr_text;
+    auto& fs_guest_addr = ctx.overrides.fs_guest_addr;
+    auto& fs_guest_addr_valid = ctx.overrides.fs_guest_addr_valid;
+    auto& fs_target_addr_text = ctx.overrides.fs_target_addr_text;
+    auto& fs_target_addr = ctx.overrides.fs_target_addr;
+    auto& fs_target_addr_valid = ctx.overrides.fs_target_addr_valid;
+    auto& fs_target_dim_text = ctx.overrides.fs_target_dim_text;
+    auto& fs_target_width = ctx.overrides.fs_target_width;
+    auto& fs_target_height = ctx.overrides.fs_target_height;
+    auto& fs_target_dim_valid = ctx.overrides.fs_target_dim_valid;
+    auto& testps_match_mode = ctx.overrides.testps_match_mode;
+    auto& testps_match = ctx.overrides.testps_match;
+    auto& nops = ctx.overrides.nops;
+    auto& program_skip = ctx.overrides.program_skip;
+    auto& program_skip_armed = ctx.overrides.program_skip_armed;
+    auto& program_census = ctx.overrides.program_census;
+    auto& link_scan = ctx.overrides.link_scan;
+    auto& link_scan_armed = ctx.overrides.link_scan_armed;
     // The callback's process-lifetime skip_draws_env is named, uncaptured, by the captureless
     // draw_is_skipped lambda (a variable with static storage duration needs no capture). A
     // function-scope static reference binds once to that same object, so the lambda keeps
     // reaching it exactly as it did inside the callback.
-    static const char *& skip_draws_env = ctx.skip_draws_env;
+    static const char *& skip_draws_env = ctx.overrides.skip_draws_env;
     auto build_R = [&](const prosper::gpu::DrawItem& draw,
                        const prosper::gpu::ShaderResourceTable* vrt,
                        const prosper::gpu::ShaderResourceTable* prt,

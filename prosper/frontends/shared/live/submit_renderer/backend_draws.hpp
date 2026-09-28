@@ -4,6 +4,7 @@
 #include "shared/live/live_renderer_internal.hpp"        // RttCache, backend stats, render state types
 #include "shared/live/submit_renderer/callback_types.hpp" // the callback types this context names
 #include "shared/live/submit_renderer/draw_resources.hpp" // DrawResourceContext
+#include "shared/live/submit_renderer/callback_prelude.hpp" // ShaderOverrides
 
 namespace prosper::frontend::submit_renderer {
 
@@ -24,32 +25,7 @@ struct BackendDrawContext {
     const bool& use_direct_index_views;
     const char *const& descriptor_validate_mode;
     DrawResourceContext& draw_resource_ctx;
-    const bool& refvs;
-    std::vector<uint32_t>& refvs_spv;
-    std::vector<uint32_t>& ps_override;
-    bool& ps_override_is_file;
-    bool& ps_override_is_test;
-    int& fs_match_mode;
-    std::vector<uint32_t>& fs_match;
-    const char *& fs_guest_addr_text;
-    uint64_t& fs_guest_addr;
-    const bool& fs_guest_addr_valid;
-    const char *& fs_target_addr_text;
-    uint64_t& fs_target_addr;
-    const bool& fs_target_addr_valid;
-    const char *& fs_target_dim_text;
-    uint32_t& fs_target_width;
-    uint32_t& fs_target_height;
-    const bool& fs_target_dim_valid;
-    int& testps_match_mode;
-    std::vector<uint32_t>& testps_match;
-    const bool& nops;
-    const char *& skip_draws_env;
-    prosper::gpu::DrawProgramSkipSelector& program_skip;
-    const bool& program_skip_armed;
-    const bool& program_census;
-    prosper::gpu::DrawLinkScanSelector& link_scan;
-    const bool& link_scan_armed;
+    ShaderOverrides& overrides;   // the diagnostic shader/state overrides (load_shader_overrides)
 };
 
 std::vector<prosper::test::BackendDraw> build_backend_draws(BackendDrawContext& ctx,
