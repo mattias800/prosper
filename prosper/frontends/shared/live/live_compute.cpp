@@ -11174,6 +11174,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             }();
         static const bool read_alias_mirror_disabled =
             std::getenv("PROSPER_NO_COMPUTE_RTT_READ_ALIAS") != nullptr;
+        static const bool folded_read_alias_mirror_disabled =
+            std::getenv("PROSPER_NO_FOLDED_COMPUTE_RTT_READ_ALIAS") != nullptr;
         static const std::vector<uint64_t> destination_trace_targets = [] {
             std::vector<uint64_t> addresses;
             const char* spec = std::getenv("PROSPER_COMPUTE_DEST_TRACE_ADDR");
@@ -11293,9 +11295,10 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // target, then copy its completed result back into that SAME target. Keep two leases:
             // the source pin protects old pixels until the seed copy, and the destination pin
             // protects the allocation until guest writeback and final publication complete.
-            // Only exact native RGBA and packed R11 self-seeds are admitted here. A separate
-            // read-only sampled import can share the destination only if it names this same
-            // allocation and its access ends before the result copy below.
+            // Only exact native RGBA and packed R11 self-seeds are admitted here. Read-only
+            // sampled imports, including duplicate descriptors folded onto an earlier sampled
+            // import, can share the destination when they name this same allocation. Their
+            // reads end with the dispatch before the result copy below; each import owns a pin.
             const bool own_seed_destination =
                 (*format == LiveTargetPixelFormat::Rgba8Unorm ||
                  *format == LiveTargetPixelFormat::Rgba16Float ||
@@ -11313,10 +11316,17 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             for (size_t other_index = 0; other_index < images.size(); ++other_index) {
                 const BoundImage& other = images[other_index];
                 if (other.imported && other.image == static_cast<VkImage>(destination.image)) {
+                    const bool folded_read_only_import = other.alias_of == SIZE_MAX ||
+                        (other.alias_of < images.size() &&
+                         images[other.alias_of].imported &&
+                         !images[other.alias_of].storage &&
+                         images[other.alias_of].image == other.image);
                     const bool ordered_read_alias = !read_alias_mirror_disabled &&
                         own_seed_destination &&
                         !destination.fresh_uninitialized && other_index != i &&
-                        other.alias_of == SIZE_MAX && !other.storage && !other.imported_depth &&
+                        folded_read_only_import &&
+                        (!folded_read_alias_mirror_disabled || other.alias_of == SIZE_MAX) &&
+                        !other.storage && !other.imported_depth &&
                         other.imported_addr == r->gpu_addr &&
                         other.imported_width == destination.width &&
                         other.imported_height == destination.height &&
