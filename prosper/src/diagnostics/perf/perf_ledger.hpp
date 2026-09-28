@@ -128,6 +128,7 @@ enum class DropReason : uint8_t {
     BackendBufferResources,
     BackendShaderRejected,
     BackendPipelineCreation,
+    BackendTargetMemory,
     Count
 };
 constexpr DropReason kFirstBackendDropReason = DropReason::BackendGeometryCapability;
@@ -158,6 +159,7 @@ constexpr const char* kDropReasonNames[kDropReasonCount] = {
     "backend/buffer-resources",
     "backend/shader-rejected",
     "backend/pipeline-creation",
+    "backend/target-memory",
 };
 
 // WHY a compute dispatch prosper wanted to run did not run. A skipped dispatch leaves its output
