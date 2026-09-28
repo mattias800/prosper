@@ -6,6 +6,177 @@
 #include "shared/live/submit_renderer/mrt_slots.hpp"        // color_binding, active_format, active_color(_count) (#3892)
 
 namespace prosper::frontend::submit_renderer {
+// ---- PROSPER_MRT_CENSUS (#3892) ----------------------------------------------------------------
+namespace {
+// The pass loop's state that note_mrt_census reads, one reference per object.
+struct MrtCensusContext {
+    const std::vector<prosper::gpu::DrawItem> & items;
+    size_t& pass_i;
+};
+
+void note_mrt_census(MrtCensusContext& ctx) {
+    // Every name the moved body used from the pass loop, bound once to the same object.
+    auto& items = ctx.items;
+    auto& pass_i = ctx.pass_i;
+    // PROSPER_MRT_CENSUS=1 — per slot, why an attachment did or did not become
+    // active. A slot needs all three of base, a known format, and a non-zero write
+    // mask; if any is absent the attachment is dropped silently and the draws that
+    // wrote it produce nothing. On GTA V only c1 is ever published, while an exact
+    // draw census shows 122,028 of 131,072 draws binding a colour target at SLOT 4 --
+    // so one of these three is missing for that slot and nothing said which.
+    if (PROSPER_ENV_ON("PROSPER_MRT_CENSUS")) {
+        struct SlotCensus {
+            std::atomic<uint64_t> seen{0}, has_base{0}, has_format{0},
+                has_mask{0}, active{0};
+        };
+        static std::array<SlotCensus, prosper::gpu::kColorTargetCount> census;
+        static std::atomic<uint64_t> groups{0};
+        const auto& d = items[pass_i];
+        for (uint32_t slot = 0; slot < prosper::gpu::kColorTargetCount; ++slot) {
+            auto& c = census[slot];
+            c.seen.fetch_add(1, std::memory_order_relaxed);
+            if (color_binding(d, slot).base)
+                c.has_base.fetch_add(1, std::memory_order_relaxed);
+            if (active_format(d, slot) != VK_FORMAT_UNDEFINED)
+                c.has_format.fetch_add(1, std::memory_order_relaxed);
+            if (d.ps.color_targets[slot].write_mask ||
+                (slot == 0 && d.ps.color_write_mask) ||
+                (slot == 1 && d.ps.color1_write_mask))
+                c.has_mask.fetch_add(1, std::memory_order_relaxed);
+            // The per-slot mask the DrawItem CARRIES, against the one its own two
+            // mask registers IMPLY. render_state.cpp computes the first as
+            // (cb_target_mask & cb_shader_mask) >> (slot*4) & 0xf, so a disagreement
+            // means the per-slot array did not survive the path that built this
+            // DrawItem -- and the array is what decides whether the attachment
+            // exists at all.
+            {
+                const uint32_t implied =
+                    ((d.ps.cb_target_mask & d.ps.cb_shader_mask) >> (slot * 4u))
+                    & 0xfu;
+                const uint32_t carried = d.ps.color_targets[slot].write_mask;
+                if (implied != carried && color_binding(d, slot).base) {
+                    static std::mutex disagree_mutex;
+                    static std::map<std::tuple<uint32_t, uint32_t, uint32_t>,
+                                    uint64_t> disagree;
+                    std::lock_guard lock(disagree_mutex);
+                    if (disagree.size() < 48)
+                        ++disagree[{slot, implied, carried}];
+                    static uint64_t n = 0;
+                    if (++n % 8192 == 0) {
+                        fprintf(stderr,
+                                "[mrt-mask-disagree] per-slot write_mask carried by "
+                                "the DrawItem vs implied by its own registers:\n");
+                        for (const auto& e : disagree)
+                            fprintf(stderr,
+                                    "[mrt-mask-disagree]   c%u implied=0x%x "
+                                    "carried=0x%x  x%llu\n",
+                                    std::get<0>(e.first), std::get<1>(e.first),
+                                    std::get<2>(e.first),
+                                    (unsigned long long)e.second);
+                    }
+                }
+            }
+            if (active_color(d, slot))
+                c.active.fetch_add(1, std::memory_order_relaxed);
+        }
+        // WHICH of the two masks is narrow. The write mask is
+        // cb_target_mask & cb_shader_mask, and both default to 0xffffffff when the
+        // register was never seen -- so a zero nibble means a register really was
+        // programmed narrow, and the fix differs completely depending on which.
+        // Histogrammed only over groups where slot 4 HAS a base, i.e. exactly the
+        // population where the dropped attachment matters.
+        if (color_binding(d, 4).base) {
+            static std::mutex mask_mutex;
+            static std::map<std::pair<uint32_t, uint32_t>, uint64_t> masks;
+            std::lock_guard lock(mask_mutex);
+            if (masks.size() < 64)
+                ++masks[{d.ps.cb_target_mask, d.ps.cb_shader_mask}];
+            static uint64_t reported = 0;
+            if (++reported % 4096 == 0) {
+                fprintf(stderr, "[mrt-census] masks where c4 has a base:\n");
+                for (const auto& e : masks)
+                    fprintf(stderr,
+                            "[mrt-census]   cb_target_mask=0x%08x "
+                            "cb_shader_mask=0x%08x -> effective=0x%08x  x%llu\n",
+                            e.first.first, e.first.second,
+                            e.first.first & e.first.second,
+                            (unsigned long long)e.second);
+            }
+        }
+        // The SHAPE of each distinct pass: its eight slot bases next to the two
+        // mask registers. The aggregate above says how often a slot activates; it
+        // cannot say which surfaces a given pass meant to write, which is what
+        // "buffer X is sampled 23 times and never written" actually needs.
+        {
+            static std::mutex shape_mutex;
+            static std::map<std::array<uint64_t, 10>, uint64_t> shapes;
+            std::array<uint64_t, 10> shape{};
+            for (uint32_t slot = 0; slot < 8u; ++slot)
+                shape[slot] = color_binding(d, slot).base;
+            shape[8] = d.ps.cb_target_mask;
+            shape[9] = d.ps.cb_shader_mask;
+            // PROSPER_MRT_SHAPE_FOR=0xADDR[,...] restricts recording to passes
+            // whose slot-0 base is named. Without it the map fills with startup and
+            // scanout passes long before the gameplay G-buffer pass appears, and an
+            // unfiltered top-10 is then a list of the most FREQUENT shapes rather
+            // than the ones being asked about.
+            static const std::string shape_for =
+                PROSPER_ENV_VALUE("PROSPER_MRT_SHAPE_FOR")
+                    ? PROSPER_ENV_VALUE("PROSPER_MRT_SHAPE_FOR") : "";
+            bool shape_wanted = shape_for.empty();
+            if (!shape_wanted && shape[0]) {
+                char needle[24];
+                std::snprintf(needle, sizeof needle, "0x%llx",
+                              (unsigned long long)shape[0]);
+                shape_wanted = shape_for.find(needle) != std::string::npos;
+            }
+            if (!shape_wanted) goto shape_done;
+            {
+            std::lock_guard lock(shape_mutex);
+            if (shapes.size() < 96 || shapes.count(shape)) ++shapes[shape];
+            static uint64_t shape_reports = 0;
+            if (++shape_reports % (shape_for.empty() ? 8192 : 256) == 0) {
+                std::vector<std::pair<uint64_t, std::array<uint64_t, 10>>> ranked;
+                for (const auto& e : shapes) ranked.push_back({e.second, e.first});
+                std::sort(ranked.begin(), ranked.end(),
+                          [](const auto& a, const auto& b) {
+                              return a.first > b.first; });
+                fprintf(stderr, "[mrt-shape] %zu distinct pass shapes\n",
+                        shapes.size());
+                for (size_t i = 0; i < ranked.size() && i < 10; ++i) {
+                    fprintf(stderr, "[mrt-shape]   x%-6llu tmask=0x%08llx "
+                            "smask=0x%08llx bases:",
+                            (unsigned long long)ranked[i].first,
+                            (unsigned long long)ranked[i].second[8],
+                            (unsigned long long)ranked[i].second[9]);
+                    for (uint32_t slot = 0; slot < 8u; ++slot)
+                        if (ranked[i].second[slot])
+                            fprintf(stderr, " c%u=0x%llx", slot,
+                                    (unsigned long long)ranked[i].second[slot]);
+                    fprintf(stderr, "\n");
+                }
+            }
+            }
+            shape_done: ;
+        }
+        const uint64_t g = groups.fetch_add(1) + 1;
+        if ((g & (g - 1)) == 0 && g >= 4096) {
+            fprintf(stderr, "[mrt-census] pass groups=%llu\n",
+                    (unsigned long long)g);
+            for (uint32_t slot = 0; slot < prosper::gpu::kColorTargetCount; ++slot)
+                fprintf(stderr,
+                        "[mrt-census]   c%u base=%llu format=%llu mask=%llu "
+                        "ACTIVE=%llu\n",
+                        slot,
+                        (unsigned long long)census[slot].has_base.load(),
+                        (unsigned long long)census[slot].has_format.load(),
+                        (unsigned long long)census[slot].has_mask.load(),
+                        (unsigned long long)census[slot].active.load());
+        }
+    }
+}
+} // namespace
+
 
 void render_per_target_passes(PerTargetPassContext& ctx) {
     // Every name the moved body used from the callback, bound once to the same object.
@@ -238,162 +409,10 @@ void render_per_target_passes(PerTargetPassContext& ctx) {
         if (timing_enabled) ++pending_timing.pass_groups_seen;
         uint64_t base = items[pass_i].color0_base;
         const uint32_t requested_color_count = active_color_count(items[pass_i]);
-        // PROSPER_MRT_CENSUS=1 — per slot, why an attachment did or did not become
-        // active. A slot needs all three of base, a known format, and a non-zero write
-        // mask; if any is absent the attachment is dropped silently and the draws that
-        // wrote it produce nothing. On GTA V only c1 is ever published, while an exact
-        // draw census shows 122,028 of 131,072 draws binding a colour target at SLOT 4 --
-        // so one of these three is missing for that slot and nothing said which.
-        if (PROSPER_ENV_ON("PROSPER_MRT_CENSUS")) {
-            struct SlotCensus {
-                std::atomic<uint64_t> seen{0}, has_base{0}, has_format{0},
-                    has_mask{0}, active{0};
-            };
-            static std::array<SlotCensus, prosper::gpu::kColorTargetCount> census;
-            static std::atomic<uint64_t> groups{0};
-            const auto& d = items[pass_i];
-            for (uint32_t slot = 0; slot < prosper::gpu::kColorTargetCount; ++slot) {
-                auto& c = census[slot];
-                c.seen.fetch_add(1, std::memory_order_relaxed);
-                if (color_binding(d, slot).base)
-                    c.has_base.fetch_add(1, std::memory_order_relaxed);
-                if (active_format(d, slot) != VK_FORMAT_UNDEFINED)
-                    c.has_format.fetch_add(1, std::memory_order_relaxed);
-                if (d.ps.color_targets[slot].write_mask ||
-                    (slot == 0 && d.ps.color_write_mask) ||
-                    (slot == 1 && d.ps.color1_write_mask))
-                    c.has_mask.fetch_add(1, std::memory_order_relaxed);
-                // The per-slot mask the DrawItem CARRIES, against the one its own two
-                // mask registers IMPLY. render_state.cpp computes the first as
-                // (cb_target_mask & cb_shader_mask) >> (slot*4) & 0xf, so a disagreement
-                // means the per-slot array did not survive the path that built this
-                // DrawItem -- and the array is what decides whether the attachment
-                // exists at all.
-                {
-                    const uint32_t implied =
-                        ((d.ps.cb_target_mask & d.ps.cb_shader_mask) >> (slot * 4u))
-                        & 0xfu;
-                    const uint32_t carried = d.ps.color_targets[slot].write_mask;
-                    if (implied != carried && color_binding(d, slot).base) {
-                        static std::mutex disagree_mutex;
-                        static std::map<std::tuple<uint32_t, uint32_t, uint32_t>,
-                                        uint64_t> disagree;
-                        std::lock_guard lock(disagree_mutex);
-                        if (disagree.size() < 48)
-                            ++disagree[{slot, implied, carried}];
-                        static uint64_t n = 0;
-                        if (++n % 8192 == 0) {
-                            fprintf(stderr,
-                                    "[mrt-mask-disagree] per-slot write_mask carried by "
-                                    "the DrawItem vs implied by its own registers:\n");
-                            for (const auto& e : disagree)
-                                fprintf(stderr,
-                                        "[mrt-mask-disagree]   c%u implied=0x%x "
-                                        "carried=0x%x  x%llu\n",
-                                        std::get<0>(e.first), std::get<1>(e.first),
-                                        std::get<2>(e.first),
-                                        (unsigned long long)e.second);
-                        }
-                    }
-                }
-                if (active_color(d, slot))
-                    c.active.fetch_add(1, std::memory_order_relaxed);
-            }
-            // WHICH of the two masks is narrow. The write mask is
-            // cb_target_mask & cb_shader_mask, and both default to 0xffffffff when the
-            // register was never seen -- so a zero nibble means a register really was
-            // programmed narrow, and the fix differs completely depending on which.
-            // Histogrammed only over groups where slot 4 HAS a base, i.e. exactly the
-            // population where the dropped attachment matters.
-            if (color_binding(d, 4).base) {
-                static std::mutex mask_mutex;
-                static std::map<std::pair<uint32_t, uint32_t>, uint64_t> masks;
-                std::lock_guard lock(mask_mutex);
-                if (masks.size() < 64)
-                    ++masks[{d.ps.cb_target_mask, d.ps.cb_shader_mask}];
-                static uint64_t reported = 0;
-                if (++reported % 4096 == 0) {
-                    fprintf(stderr, "[mrt-census] masks where c4 has a base:\n");
-                    for (const auto& e : masks)
-                        fprintf(stderr,
-                                "[mrt-census]   cb_target_mask=0x%08x "
-                                "cb_shader_mask=0x%08x -> effective=0x%08x  x%llu\n",
-                                e.first.first, e.first.second,
-                                e.first.first & e.first.second,
-                                (unsigned long long)e.second);
-                }
-            }
-            // The SHAPE of each distinct pass: its eight slot bases next to the two
-            // mask registers. The aggregate above says how often a slot activates; it
-            // cannot say which surfaces a given pass meant to write, which is what
-            // "buffer X is sampled 23 times and never written" actually needs.
-            {
-                static std::mutex shape_mutex;
-                static std::map<std::array<uint64_t, 10>, uint64_t> shapes;
-                std::array<uint64_t, 10> shape{};
-                for (uint32_t slot = 0; slot < 8u; ++slot)
-                    shape[slot] = color_binding(d, slot).base;
-                shape[8] = d.ps.cb_target_mask;
-                shape[9] = d.ps.cb_shader_mask;
-                // PROSPER_MRT_SHAPE_FOR=0xADDR[,...] restricts recording to passes
-                // whose slot-0 base is named. Without it the map fills with startup and
-                // scanout passes long before the gameplay G-buffer pass appears, and an
-                // unfiltered top-10 is then a list of the most FREQUENT shapes rather
-                // than the ones being asked about.
-                static const std::string shape_for =
-                    PROSPER_ENV_VALUE("PROSPER_MRT_SHAPE_FOR")
-                        ? PROSPER_ENV_VALUE("PROSPER_MRT_SHAPE_FOR") : "";
-                bool shape_wanted = shape_for.empty();
-                if (!shape_wanted && shape[0]) {
-                    char needle[24];
-                    std::snprintf(needle, sizeof needle, "0x%llx",
-                                  (unsigned long long)shape[0]);
-                    shape_wanted = shape_for.find(needle) != std::string::npos;
-                }
-                if (!shape_wanted) goto shape_done;
-                {
-                std::lock_guard lock(shape_mutex);
-                if (shapes.size() < 96 || shapes.count(shape)) ++shapes[shape];
-                static uint64_t shape_reports = 0;
-                if (++shape_reports % (shape_for.empty() ? 8192 : 256) == 0) {
-                    std::vector<std::pair<uint64_t, std::array<uint64_t, 10>>> ranked;
-                    for (const auto& e : shapes) ranked.push_back({e.second, e.first});
-                    std::sort(ranked.begin(), ranked.end(),
-                              [](const auto& a, const auto& b) {
-                                  return a.first > b.first; });
-                    fprintf(stderr, "[mrt-shape] %zu distinct pass shapes\n",
-                            shapes.size());
-                    for (size_t i = 0; i < ranked.size() && i < 10; ++i) {
-                        fprintf(stderr, "[mrt-shape]   x%-6llu tmask=0x%08llx "
-                                "smask=0x%08llx bases:",
-                                (unsigned long long)ranked[i].first,
-                                (unsigned long long)ranked[i].second[8],
-                                (unsigned long long)ranked[i].second[9]);
-                        for (uint32_t slot = 0; slot < 8u; ++slot)
-                            if (ranked[i].second[slot])
-                                fprintf(stderr, " c%u=0x%llx", slot,
-                                        (unsigned long long)ranked[i].second[slot]);
-                        fprintf(stderr, "\n");
-                    }
-                }
-                }
-                shape_done: ;
-            }
-            const uint64_t g = groups.fetch_add(1) + 1;
-            if ((g & (g - 1)) == 0 && g >= 4096) {
-                fprintf(stderr, "[mrt-census] pass groups=%llu\n",
-                        (unsigned long long)g);
-                for (uint32_t slot = 0; slot < prosper::gpu::kColorTargetCount; ++slot)
-                    fprintf(stderr,
-                            "[mrt-census]   c%u base=%llu format=%llu mask=%llu "
-                            "ACTIVE=%llu\n",
-                            slot,
-                            (unsigned long long)census[slot].has_base.load(),
-                            (unsigned long long)census[slot].has_format.load(),
-                            (unsigned long long)census[slot].has_mask.load(),
-                            (unsigned long long)census[slot].active.load());
-            }
-        }
+        MrtCensusContext note_mrt_census_ctx{
+            .items = items,
+            .pass_i = pass_i};
+        note_mrt_census(note_mrt_census_ctx);
         std::array<uint64_t, prosper::gpu::kColorTargetCount> pass_bases{};
         std::array<VkFormat, prosper::gpu::kColorTargetCount> pass_formats{};
         for (uint32_t slot = 0; slot < requested_color_count; ++slot) {
