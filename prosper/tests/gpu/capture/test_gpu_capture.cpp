@@ -4618,9 +4618,10 @@ int main(int argc, char** argv) {
                 oracle_pending->capture.draws[0].ps.color_write_mask = 0;
                 oracle_pending->capture.draws[0].ps.color_targets[0].write_mask = 0;
             }
-            oracle_pending->capture.metadata.renderer_env.emplace_back(
-                kGpuReplayScanoutAddressEnv,
-                scanout_addr == 0x9000 ? "0x9000" : "0x7777");
+            if (scanout_addr)
+                oracle_pending->capture.metadata.renderer_env.emplace_back(
+                    kGpuReplayScanoutAddressEnv,
+                    scanout_addr == 0x9000 ? "0x9000" : "0x7777");
             std::string write_error;
             return finish_requested_gpu_capture(std::move(oracle_pending), pre, write_error) &&
                    read_gpu_capture(prosper_test::test_scratch_file(path), result, write_error);
@@ -4644,6 +4645,19 @@ int main(int argc, char** argv) {
                   scanout_oracle.expected_output_bytes == pre.size() &&
                   scanout_oracle.expected_output_hash == gpu_capture_hash(pre),
               "same submit retains its pixel oracle when the draw writes scanout");
+        GpuCaptureFile unknown_scanout_oracle;
+        CHECK(write_oracle_case(0, true, "prosper_unknown_scanout_oracle_3908.prgcap",
+                                unknown_scanout_oracle) &&
+                  !unknown_scanout_oracle.expected_output_valid &&
+                  unknown_scanout_oracle.expected_output_bytes == 0 &&
+                  unknown_scanout_oracle.expected_output_hash == 0 &&
+                  std::any_of(unknown_scanout_oracle.metadata.renderer_env.begin(),
+                              unknown_scanout_oracle.metadata.renderer_env.end(),
+                              [](const auto& entry) {
+                                  return entry.first == kGpuReplayNoScanoutDrawEnv &&
+                                         entry.second == "1";
+                              }),
+              "presented pixels without a registered scanout cannot prove a submit output");
         GpuCaptureFile masked_oracle;
         CHECK(write_oracle_case(0x9000, false, "prosper_masked_oracle_3908.prgcap",
                                 masked_oracle) && !masked_oracle.expected_output_valid,

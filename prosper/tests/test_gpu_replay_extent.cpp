@@ -181,9 +181,21 @@ int main() {
               "making the later draw a writer moves the selected offscreen output");
         offscreen_submit.items[0].ps.color_targets[0].write_mask = 0;
         offscreen_submit.items[1].ps.color_targets[0].write_mask = 0;
-        CHECK(replay_last_written_output_target(offscreen_submit).status ==
-                  OutputTargetAfterStatus::NotWrittenByOperation,
+        const auto depth_only_selection = replay_last_written_output_target(offscreen_submit);
+        CHECK(depth_only_selection.status == OutputTargetAfterStatus::NotWrittenByOperation,
               "a depth-only submit cannot invent a colour output target");
+        // A previous submit may have primed the renderer's presentation cache. The default
+        // depth-only replay must not hash or save those unrelated pixels as this submit's image.
+        std::vector<uint8_t> retained_pixels(640 * 360 * 4, 0x5a);
+        replay_discard_unproven_default_pixels(depth_only_selection.status, retained_pixels);
+        CHECK(retained_pixels.empty(),
+              "depth-only default replay discards a primed retained presentation frame");
+        offscreen_submit.items[0].ps.color_targets[0].write_mask = 0xf;
+        retained_pixels.assign(640 * 360 * 4, 0x5a);
+        replay_discard_unproven_default_pixels(
+            replay_last_written_output_target(offscreen_submit).status, retained_pixels);
+        CHECK(retained_pixels.size() == 640 * 360 * 4 && retained_pixels.front() == 0x5a,
+              "real colour writer keeps its selected output pixels");
     }
 
     // Exact post-operation target selection is a write proof, not an address/binding lookup. This

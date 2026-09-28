@@ -1845,13 +1845,13 @@ bool finish_requested_gpu_capture(std::unique_ptr<PendingGpuCapture> pending,
             }
             return false;
         });
-    // With no graphics draw writing the registered scanout, these presentation bytes do not prove
-    // the captured draws' output. A compute storage alias may still write scanout, but this capture
-    // path has no such proof; fail closed on the oracle until it does.
-    const bool no_scanout_draw = scanout && !writes_scanout;
-    if (no_scanout_draw)
+    // Presentation bytes are an oracle only when a graphics draw wrote a known scanout. A missing
+    // scanout identity proves no relationship either. A compute storage alias may also write it,
+    // but this capture path has no proof for that case; fail closed until it does.
+    const bool no_proven_scanout_draw = !writes_scanout;
+    if (!output.empty() && no_proven_scanout_draw)
         pending->capture.metadata.renderer_env.emplace_back(kGpuReplayNoScanoutDrawEnv, "1");
-    pending->capture.expected_output_valid = !output.empty() && !no_scanout_draw;
+    pending->capture.expected_output_valid = !output.empty() && !no_proven_scanout_draw;
     pending->capture.expected_output_bytes = pending->capture.expected_output_valid ? output.size() : 0;
     pending->capture.expected_output_hash = pending->capture.expected_output_valid
         ? gpu_capture_hash(output) : 0;
@@ -1859,7 +1859,9 @@ bool finish_requested_gpu_capture(std::unique_ptr<PendingGpuCapture> pending,
     if (!pending->capture.expected_output_valid) {
         std::fprintf(stderr, "[gpucap] wrote %s without output oracle%s\n",
                      pending->path.c_str(),
-                     no_scanout_draw ? " (no graphics draw wrote scanout)" : "");
+                     !output.empty() && !scanout ? " (scanout identity unavailable)" :
+                     !output.empty() && no_proven_scanout_draw
+                         ? " (no graphics draw wrote scanout)" : "");
     } else {
         std::fprintf(stderr, "[gpucap] wrote %s output_bytes=%zu hash=%016llx\n",
                      pending->path.c_str(), output.size(),

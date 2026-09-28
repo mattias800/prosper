@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <vector>
 
 namespace prosper::gpu::replay_tool {
 
@@ -84,6 +85,14 @@ struct BundleOutputTargetAfterSelection {
     bool applies_to_submit = false;
     OutputTargetAfterSelection selection;
 };
+
+// A tagged submit with no colour writer may still get pixels back from the renderer's retained
+// presentation image. Those pixels are not an output of this submit. Keep execution diagnostics,
+// but remove the unrelated image before hashing or writing a default replay BMP.
+inline void replay_discard_unproven_default_pixels(OutputTargetAfterStatus status,
+                                                   std::vector<uint8_t>& pixels) {
+    if (status != OutputTargetAfterStatus::Selected) pixels.clear();
+}
 
 inline DrawItem::ColorTargetBinding replay_color_binding(const DrawItem& draw, uint32_t slot) {
     auto binding = draw.color_targets[slot];
