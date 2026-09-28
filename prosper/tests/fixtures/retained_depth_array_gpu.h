@@ -71,6 +71,9 @@ struct DepthArrayGpuSlot {
     VkBuffer buffer = VK_NULL_HANDLE;         // depth-aspect copy target, one packed plane per layer
     VkDeviceMemory buffer_memory = VK_NULL_HANDLE;
     VkDeviceSize bytes = 0;                   // device allocation total, for the pool budget
+    // #3905: some allocation landed off device-local memory (the #3897 fallback). Such a slot is
+    // never recycled, so the next snapshot of this shape tries device-local memory again.
+    bool off_device = false;
 
     ~DepthArrayGpuSlot() {
         if (!device) return;
@@ -118,7 +121,7 @@ struct PersistentDsDepthArrayGpuImage {
         std::lock_guard lock(pool.mutex);
         // A snapshot whose batch failed has undefined contents and possibly an unknown layout;
         // the slot is reinitialised from UNDEFINED on reuse, so recycling it is still correct.
-        if (pool.free.size() < DepthArrayGpuPool::kMaxFreeSlots &&
+        if (!slot->off_device && pool.free.size() < DepthArrayGpuPool::kMaxFreeSlots &&
             slot->bytes <= DepthArrayGpuPool::kMaxFreeBytes - pool.free_bytes) {
             pool.free_bytes += slot->bytes;
             pool.free.push_back(std::move(slot));
@@ -127,7 +130,7 @@ struct PersistentDsDepthArrayGpuImage {
 };
 
 inline bool depth_array_gpu_allocate(const RenderVkCtx& ctx, VkMemoryRequirements requirements,
-                                     VkDeviceMemory& memory) {
+                                     VkDeviceMemory& memory, bool& off_device) {
     VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     allocation.allocationSize = requirements.size;
     if (render_allocate_gpu_only_memory(ctx.phys, ctx.dev,
@@ -137,6 +140,10 @@ inline bool depth_array_gpu_allocate(const RenderVkCtx& ctx, VkMemoryRequirement
         memory = VK_NULL_HANDLE;
         return false;
     }
+    VkPhysicalDeviceMemoryProperties props{};
+    vkGetPhysicalDeviceMemoryProperties(ctx.phys, &props);
+    if (!prosper::gpu::memory_type_is_device_local(props, allocation.memoryTypeIndex))
+        off_device = true;
     return true;
 }
 
@@ -182,7 +189,7 @@ inline std::unique_ptr<DepthArrayGpuSlot> depth_array_gpu_slot(
         }
         VkMemoryRequirements requirements{};
         vkGetImageMemoryRequirements(ctx.dev, image, &requirements);
-        if (!depth_array_gpu_allocate(ctx, requirements, memory)) return false;
+        if (!depth_array_gpu_allocate(ctx, requirements, memory, slot->off_device)) return false;
         slot->bytes += requirements.size;
         return vkBindImageMemory(ctx.dev, image, memory, 0) == VK_SUCCESS;
     };
@@ -204,7 +211,8 @@ inline std::unique_ptr<DepthArrayGpuSlot> depth_array_gpu_slot(
     }
     VkMemoryRequirements buffer_requirements{};
     vkGetBufferMemoryRequirements(ctx.dev, slot->buffer, &buffer_requirements);
-    if (!depth_array_gpu_allocate(ctx, buffer_requirements, slot->buffer_memory)) return nullptr;
+    if (!depth_array_gpu_allocate(ctx, buffer_requirements, slot->buffer_memory,
+                                  slot->off_device)) return nullptr;
     slot->bytes += buffer_requirements.size;
     if (vkBindBufferMemory(ctx.dev, slot->buffer, slot->buffer_memory, 0) != VK_SUCCESS)
         return nullptr;

@@ -16,6 +16,7 @@
 #include "gpu/capture/gpu_capture.hpp"
 #include "gpu/diagnostics/gpu_memory_budget_vk.hpp"  // #3533: count what we hold on each heap
 #include "gpu/memory/texture_cache_budget.hpp"  // #3873: texture budget from live headroom
+#include "gpu/memory/spill_recovery.hpp"        // #3905: rebuild spilled retained resources in VRAM
 #include "gpu/diagnostics/memory_placement_log.hpp"  // #3888: GPU-only memory prefers VRAM
 #include "gpu/execute/host_read_barrier.hpp"   // the availability half of a readback (#2944/#3249)
 #include "gpu/execute/float_controls_probe.hpp" // #3479: the device gate on SignedZeroInfNanPreserve
@@ -2956,6 +2957,8 @@ struct PersistentColorTargetImage {
     uint64_t last_use = 0;
     uint32_t pin_count = 0;
     bool valid = false;
+    // #3905: placed off device-local memory by the #3897 fallback; recovery evicts it.
+    bool off_device = false;
     // A partial volume pass establishes only the slices in its attachment view. Direct 3D
     // sampling requires every slice; an invalidated or discarded pass clears the whole proof.
     std::vector<uint8_t> valid_volume_slices;
@@ -3201,6 +3204,46 @@ inline void init_persistent_texture_cache_device_budget(
 inline std::atomic<uint32_t>& persistent_texture_heap_index() {
     static std::atomic<uint32_t> heap{UINT32_MAX};
     return heap;
+}
+
+// #3905: how many bytes of a retained cache's SPILLED entries (placed off device-local memory by the
+// #3897 fallback) may be evicted now, so their next use recreates them device-local. Policy in
+// gpu/memory/spill_recovery.hpp. Costs one compare per call while nothing is spilled; otherwise at
+// most one vkGetPhysicalDeviceMemoryProperties2 per interval.
+inline uint64_t render_spill_recovery_allowance(const RenderVkCtx& ctx,
+                                                prosper::gpu::SpillRecoveryState& state,
+                                                uint64_t spilled_bytes) {
+    const uint64_t now_ms = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+    if (!prosper::gpu::spill_recovery_due(state, now_ms, spilled_bytes)) return 0;
+    prosper::gpu::SpillRecoveryInputs in;
+    in.now_ms = now_ms;
+    in.spilled_bytes = spilled_bytes;
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT budget_props{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+    VkPhysicalDeviceMemoryProperties2 props2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};
+    if (ctx.memory_budget_enabled) props2.pNext = &budget_props;
+    vkGetPhysicalDeviceMemoryProperties2(ctx.phys, &props2);
+    const VkPhysicalDeviceMemoryProperties& memp = props2.memoryProperties;
+    // The heap device-local allocations use: the texture cache's recorded heap when it is
+    // device-local, else the largest device-local heap.
+    uint32_t heap = persistent_texture_heap_index().load(std::memory_order_relaxed);
+    if (heap >= memp.memoryHeapCount ||
+        !(memp.memoryHeaps[heap].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)) {
+        heap = UINT32_MAX;
+        for (uint32_t i = 0; i < memp.memoryHeapCount && i < VK_MAX_MEMORY_HEAPS; ++i)
+            if ((memp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) &&
+                (heap == UINT32_MAX || memp.memoryHeaps[i].size > memp.memoryHeaps[heap].size))
+                heap = i;
+    }
+    if (heap != UINT32_MAX && ctx.memory_budget_enabled && !vram_budget_disabled()) {
+        in.have_budget = true;
+        in.heap_budget = budget_props.heapBudget[heap];
+        in.heap_usage = budget_props.heapUsage[heap];
+        if (const uint64_t fake = fake_heap_budget_bytes()) in.heap_budget = fake;
+    }
+    return prosper::gpu::spill_recovery_allowance(in, state);
 }
 
 // Re-derive the texture budget from the driver's live figures, at most every 250 ms (one
@@ -3508,25 +3551,25 @@ persistent_color_target_evict_sink() {
     return sink;
 }
 
-inline bool evict_persistent_color_target(const RenderVkCtx& ctx, uint64_t current_generation) {
-    prosper::diagnostics::note_persistent_target_eviction_attempt();
-    if (backend_has_unproven_submission()) return false;
+// May this cached target be evicted now? Not the pass's own, not pinned, and not a valid volume.
+inline bool persistent_color_target_evictable(const PersistentColorTargetKey& key,
+                                              const PersistentColorTargetImage& image,
+                                              uint64_t current_generation) {
+    if (image.last_use == current_generation || image.pin_count) return false;
+    // A valid volume may be the only copy of slices never written to guest memory. The
+    // current CPU RTT eviction sink represents one 2D plane; dropping a volume through it
+    // would silently replace later 3D samples with stale guest bytes. Keep the bounded image
+    // resident until invalidation or explicit volume materialization is available.
+    if (key.volume_depth &&
+        std::any_of(image.valid_volume_slices.begin(), image.valid_volume_slices.end(),
+                    [](uint8_t slice) { return slice != 0; })) return false;
+    return true;
+}
+
+// Evict one entry: hand valid pixels to the sink, then destroy. Returns the next iterator.
+template <class It>
+inline It evict_persistent_color_target_entry(const RenderVkCtx& ctx, It victim) {
     auto& cache = persistent_color_target_cache();
-    auto victim = cache.end();
-    for (auto it = cache.begin(); it != cache.end(); ++it) {
-        if (it->second.last_use == current_generation || it->second.pin_count) continue;
-        // A valid volume may be the only copy of slices never written to guest memory. The
-        // current CPU RTT eviction sink represents one 2D plane; dropping a volume through it
-        // would silently replace later 3D samples with stale guest bytes. Keep the bounded image
-        // resident until invalidation or explicit volume materialization is available.
-        if (it->first.volume_depth &&
-            std::any_of(it->second.valid_volume_slices.begin(),
-                        it->second.valid_volume_slices.end(),
-                        [](uint8_t slice) { return slice != 0; })) continue;
-        if (victim == cache.end() || it->second.last_use < victim->second.last_use)
-            victim = it;
-    }
-    if (victim == cache.end()) return false;
     if (victim->second.valid) {
         auto& sink = persistent_color_target_evict_sink();
         if (sink) {
@@ -3542,8 +3585,86 @@ inline bool evict_persistent_color_target(const RenderVkCtx& ctx, uint64_t curre
     persistent_color_target_bytes() -= victim->second.bytes;
     prosper::diagnostics::note_persistent_target_evicted(victim->second.bytes);
     destroy_persistent_color_target(ctx, victim->second);
-    cache.erase(victim);
+    return cache.erase(victim);
+}
+
+inline bool evict_persistent_color_target(const RenderVkCtx& ctx, uint64_t current_generation) {
+    prosper::diagnostics::note_persistent_target_eviction_attempt();
+    if (backend_has_unproven_submission()) return false;
+    auto& cache = persistent_color_target_cache();
+    auto victim = cache.end();
+    for (auto it = cache.begin(); it != cache.end(); ++it) {
+        if (!persistent_color_target_evictable(it->first, it->second, current_generation))
+            continue;
+        if (victim == cache.end() || it->second.last_use < victim->second.last_use)
+            victim = it;
+    }
+    if (victim == cache.end()) return false;
+    evict_persistent_color_target_entry(ctx, victim);
     return true;
+}
+
+// #3905: set when a persistent colour target lands off device-local memory; cleared by recovery
+// once no cached target is off-device. Keeps recovery to one load per pass on a healthy run.
+inline bool& persistent_color_target_spill_seen() {
+    static bool seen = false;
+    return seen;
+}
+
+inline void note_persistent_color_target_placement(PersistentColorTargetImage& image,
+                                                   const VkPhysicalDeviceMemoryProperties& memp,
+                                                   uint32_t memory_type) {
+    image.off_device = !prosper::gpu::memory_type_is_device_local(memp, memory_type);
+    if (!image.off_device) return;
+    persistent_color_target_spill_seen() = true;
+    static std::atomic<uint32_t> logs{0};
+    if (logs.fetch_add(1, std::memory_order_relaxed) < 8)
+        std::fprintf(stderr,
+                     "[mem-placement] persistent colour target (%.1f MiB) retained off "
+                     "device-local memory; recovery re-creates it when VRAM has room (#3905)\n",
+                     image.bytes / (1024.0 * 1024.0));
+}
+
+// #3905: a spilled colour target stays in system memory for as long as it is cached. When the
+// device-local heap has room again, evict idle spilled targets through the ordinary eviction path
+// (their pixels go to the eviction sink exactly as a budget eviction's do), so the next use
+// re-creates them device-local.
+inline void recover_spilled_persistent_color_targets(const RenderVkCtx& ctx,
+                                                     uint64_t current_generation) {
+    if (!persistent_color_target_spill_seen() || backend_has_unproven_submission()) return;
+    static prosper::gpu::SpillRecoveryState state;
+    const uint64_t now_ms = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+    if (!prosper::gpu::spill_recovery_due(state, now_ms, 1)) return;
+    auto& cache = persistent_color_target_cache();
+    uint64_t spilled = 0;
+    for (const auto& [key, image] : cache)
+        if (image.off_device) spilled += image.bytes;
+    if (!spilled) { persistent_color_target_spill_seen() = false; return; }
+    uint64_t allowance = render_spill_recovery_allowance(ctx, state, spilled);
+    uint64_t reclaimed = 0, entries = 0;
+    for (auto it = cache.begin(); allowance && it != cache.end();) {
+        if (it->second.off_device && it->second.bytes <= allowance &&
+            persistent_color_target_evictable(it->first, it->second, current_generation)) {
+            allowance -= it->second.bytes;
+            reclaimed += it->second.bytes;
+            ++entries;
+            it = evict_persistent_color_target_entry(ctx, it);
+        } else {
+            ++it;
+        }
+    }
+    if (!entries) return;
+    static uint64_t recoveries = 0;
+    ++recoveries;
+    if (recoveries <= 8 || std::has_single_bit(recoveries))
+        std::fprintf(stderr,
+                     "[mem-placement] persistent colour targets: recovery #%llu evicted %llu "
+                     "spilled target(s), %.1f MiB, to be re-created device-local on next use "
+                     "(%.1f MiB still off-device)\n",
+                     (unsigned long long)recoveries, (unsigned long long)entries,
+                     reclaimed / (1024.0 * 1024.0), (spilled - reclaimed) / (1024.0 * 1024.0));
 }
 
 // Transient allocations return to this pool only after their call or explicit submission batch has
@@ -4060,6 +4181,25 @@ inline RenderCommandPoolStats render_command_pool_stats() {
                                   cache.available.size()};
 }
 
+// Free every idle cached allocation of the render transient pool (#3902); returns how many.
+inline size_t release_idle_render_memory(VkDevice device) {
+    RenderMemoryPool& pool = render_memory_pool();
+    std::lock_guard<std::mutex> lock(pool.mutex);
+    size_t released = 0;
+    for (auto& [key, allocations] : pool.available) {
+        (void)key;
+        for (VkDeviceMemory allocation : allocations) {
+            prosper::gpu::free_device_memory(device, allocation);
+            ++released;
+        }
+    }
+    pool.available.clear();
+    pool.cached_bytes = 0;
+    pool.cached_allocations = 0;
+    pool.discarded += released;
+    return released;
+}
+
 // Pooled device memory of exactly `memory_type`. Returns the driver's result (VK_SUCCESS for a pool
 // hit); `*out` is VK_NULL_HANDLE on any failure.
 inline VkResult allocate_transient_render_memory_status(VkDevice device, VkDeviceSize bytes,
@@ -4089,7 +4229,23 @@ inline VkResult allocate_transient_render_memory_status(VkDevice device, VkDevic
     allocation.allocationSize = bytes;
     allocation.memoryTypeIndex = memory_type;
     VkDeviceMemory memory = VK_NULL_HANDLE;
-    const VkResult status = prosper::gpu::allocate_device_memory(device, &allocation, &memory);
+    // #3902: under real heap pressure the pool's idle allocations are expendable -- release them
+    // and retry this same type once before the #3897 fallback moves on to system memory.
+    const VkResult status = prosper::gpu::allocate_releasing_pool_on_oom(
+        [&] { return prosper::gpu::allocate_device_memory(device, &allocation, &memory); },
+        [&]() -> size_t {
+            if (!render_memory_pool_enabled()) return 0;
+            const size_t released = release_idle_render_memory(device);
+            if (released) {
+                static std::atomic<uint32_t> logs{0};
+                if (logs.fetch_add(1, std::memory_order_relaxed) < 16)
+                    std::fprintf(stderr,
+                                 "[render] allocation of %llu bytes (type %u) ran out of device "
+                                 "memory; released %zu cached allocation(s) and retrying\n",
+                                 (unsigned long long)bytes, memory_type, released);
+            }
+            return released;
+        });
     if (status != VK_SUCCESS) return status;
     if (render_memory_pool_enabled()) {
         RenderMemoryPool& pool = render_memory_pool();
@@ -6807,6 +6963,11 @@ inline bool copy_persistent_color_target(uint64_t src_id, uint64_t dst_id, uint3
         dst->mutation = 0;
         dst->completed_producer = {};
         dst->bytes = ir.size;
+        {
+            VkPhysicalDeviceMemoryProperties memp{};
+            vkGetPhysicalDeviceMemoryProperties(ctx.phys, &memp);
+            note_persistent_color_target_placement(*dst, memp, iai.memoryTypeIndex);
+        }
         persistent_color_target_bytes() += ir.size;
         dst->layout = VK_IMAGE_LAYOUT_UNDEFINED;
         src = find_persistent_color_target(src_id, width, height, format);
@@ -8694,6 +8855,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                     dev, prosper::gpu::GpuOnlyMemoryClass::ColorTarget, memp, ir.memoryTypeBits,
                     iai, &imem) == VK_SUCCESS) {
                 cached_color->bytes = ir.size;
+                note_persistent_color_target_placement(*cached_color, memp, iai.memoryTypeIndex);
                 persistent_color_target_bytes() += ir.size;
             } else {
                 vkDestroyImage(dev, img, nullptr);
@@ -8853,6 +9015,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                     color1_requirements.memoryTypeBits, color1_allocation,
                     &imem1) == VK_SUCCESS) {
                 cached_color1->bytes = color1_requirements.size;
+                note_persistent_color_target_placement(*cached_color1, memp,
+                                                       color1_allocation.memoryTypeIndex);
                 persistent_color_target_bytes() += color1_requirements.size;
             } else {
                 vkDestroyImage(dev, img1, nullptr);
@@ -8970,6 +9134,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                     requirements.memoryTypeBits, allocation,
                     &extra_memories[slot]) == VK_SUCCESS) {
                 cached_extra[slot]->bytes = requirements.size;
+                note_persistent_color_target_placement(*cached_extra[slot], memp,
+                                                       allocation.memoryTypeIndex);
                 persistent_color_target_bytes() += requirements.size;
             } else {
                 // Over budget: drop back to a transient image for this slot, exactly as slot 1 does.
@@ -9442,6 +9608,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         bool borrowed_ds_feedback = false; // same image is this pass's read-only depth attachment
         VkFormat ds_format = VK_FORMAT_UNDEFINED;
         bool direct_memory = false;
+        bool off_device = false;   // #3905: the retained allocation landed off device-local memory
         std::vector<std::function<void(const uint8_t*, size_t)>> storage_writebacks;
         size_t last_binding_index = SIZE_MAX;
         TextureBindingKey last_binding_key{};
@@ -9478,12 +9645,18 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         uint64_t last_use = 0;
         uint64_t content_version = 0;
         bool content_valid = true;
+        // #3905: placed off device-local memory by the #3897 fallback; recovery evicts it.
+        bool off_device = false;
         std::unordered_map<TextureBindingKey, PersistentTextureBinding,
                            TextureBindingKeyHash> bindings;
     };
     static std::unordered_map<PersistentTextureKey, PersistentTextureImage,
                               PersistentTextureKeyHash> persistent_texture_images;
     static VkDeviceSize persistent_texture_bytes = 0;
+    // #3905: the subset of persistent_texture_bytes in NON-device-local memory. The budget refresh
+    // subtracts only the device-local share from the heap's usage, and recovery evicts these.
+    static VkDeviceSize persistent_texture_off_device_bytes = 0;
+    static prosper::gpu::SpillRecoveryState persistent_texture_spill_recovery;
     // Exact sum of each retained image's binding count. This domain is protected by the
     // BackendPersistentResourceGuard above; update on successful insertion/erasure, not on
     // content invalidation (which leaves the bindings resident until the image is retired).
@@ -9498,7 +9671,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     if (!active_submission.pending()) persistent_texture_batch_floor = texture_generation;
     const bool persistent_textures_enabled =
         getenv("PROSPER_NO_BACKEND_PERSISTENT_TEXTURES") == nullptr;
-    refresh_persistent_texture_cache_device_budget(ctx, persistent_texture_bytes);
+    refresh_persistent_texture_cache_device_budget(
+        ctx, persistent_texture_bytes - persistent_texture_off_device_bytes);
     const VkDeviceSize persistent_texture_limit = persistent_texture_cache_limit();
     texture_path_census.cache_before(persistent_texture_images.size(),
                                      persistent_texture_bytes, persistent_texture_limit);
@@ -11598,6 +11772,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                 if (cached->second.memory)
                                     prosper::gpu::free_device_memory(dev, cached->second.memory);
                                 persistent_texture_bytes -= cached->second.bytes;
+                                if (cached->second.off_device)
+                                    persistent_texture_off_device_bytes -= cached->second.bytes;
                                 persistent_texture_binding_entries -= cached->second.bindings.size();
                                 persistent_texture_images.erase(cached);
                                 cached = persistent_texture_images.end();
@@ -11699,6 +11875,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                         memp, tr.memoryTypeBits, tai, &upload.memory) ==
                                         VK_SUCCESS) {
                                     upload.direct_memory = true;
+                                    upload.off_device = !prosper::gpu::memory_type_is_device_local(
+                                        memp, tai.memoryTypeIndex);
                                     // #3873: the budget follows THIS heap from now on -- unless
                                     // the #3897 fallback put this one texture in system memory,
                                     // which says nothing about where the cache's textures live.
@@ -14205,18 +14383,10 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     const bool texture_eviction_allowed = !avoid_cache_eviction || defer_texture_eviction;
     // #3891 perf ledger: per-pass counts, flushed once after admission (texture-cache-thrash).
     uint64_t perf_texture_evictions = 0, perf_texture_refusals = 0, perf_texture_refused_bytes = 0;
-    auto evict_persistent_texture = [&]() {
-        const uint64_t protected_from = defer_texture_eviction
-            ? persistent_texture_batch_floor : texture_generation;
-        auto victim = persistent_texture_images.end();
-        for (auto it = persistent_texture_images.begin();
-             it != persistent_texture_images.end(); ++it) {
-            if (it->second.last_use >= protected_from) continue;
-            if (victim == persistent_texture_images.end() ||
-                it->second.last_use < victim->second.last_use) victim = it;
-        }
-        if (victim == persistent_texture_images.end()) return false;
-        if (defer_texture_eviction) {
+    const uint64_t texture_protected_from = defer_texture_eviction
+        ? persistent_texture_batch_floor : texture_generation;
+    auto evict_persistent_texture_entry = [&](auto victim, bool deferred) {
+        if (deferred) {
             std::vector<std::pair<VkImageView, VkSampler>> retired_bindings;
             retired_bindings.reserve(victim->second.bindings.size());
             for (const auto& [key, binding] : victim->second.bindings)
@@ -14242,10 +14412,22 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             prosper::gpu::free_device_memory(dev, victim->second.memory);
         }
         persistent_texture_bytes -= victim->second.bytes;
+        if (victim->second.off_device) persistent_texture_off_device_bytes -= victim->second.bytes;
         persistent_texture_binding_entries -= victim->second.bindings.size();
         persistent_texture_images.erase(victim);
         texture_path_census.evicted();
         ++perf_texture_evictions;
+    };
+    auto evict_persistent_texture = [&]() {
+        auto victim = persistent_texture_images.end();
+        for (auto it = persistent_texture_images.begin();
+             it != persistent_texture_images.end(); ++it) {
+            if (it->second.last_use >= texture_protected_from) continue;
+            if (victim == persistent_texture_images.end() ||
+                it->second.last_use < victim->second.last_use) victim = it;
+        }
+        if (victim == persistent_texture_images.end()) return false;
+        evict_persistent_texture_entry(victim, defer_texture_eviction);
         return true;
     };
     for (auto& upload : texture_uploads) {
@@ -14268,6 +14450,18 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 key, PersistentTextureImage{upload.image, upload.memory, upload.image_bytes,
                                             texture_generation, upload.persistent_version, true});
             if (inserted) {
+                cached->second.off_device = upload.off_device;
+                if (upload.off_device) {
+                    persistent_texture_off_device_bytes += upload.image_bytes;
+                    static std::atomic<uint32_t> spill_logs{0};
+                    if (spill_logs.fetch_add(1, std::memory_order_relaxed) < 8)
+                        std::fprintf(stderr,
+                                     "[mem-placement] sampled-texture: retained a %.1f MiB "
+                                     "texture off device-local memory (%.1f MiB spilled in the "
+                                     "cache); recovery re-creates it when VRAM has room (#3905)\n",
+                                     upload.image_bytes / (1024.0 * 1024.0),
+                                     persistent_texture_off_device_bytes / (1024.0 * 1024.0));
+                }
                 texture_path_census.retention_inserted();
                 active_submission.add_failure_cleanup([key]() {
                     auto found = persistent_texture_images.find(key);
@@ -14296,6 +14490,40 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     if (texture_eviction_allowed)
         while (persistent_texture_bytes > persistent_texture_limit &&
                evict_persistent_texture()) {}
+    // #3905: spilled textures do not move back to VRAM by themselves. When the device-local heap
+    // has room again, drop spilled ones from the cache so their next use re-uploads them
+    // device-local. A spilled texture is often a HOT one (used by every batch), which the LRU
+    // protection above would never release, so recovery ignores last_use and always retires the
+    // image through the batch's completion cleanup: this pass and earlier passes of the batch keep
+    // sampling the old image until the batch's fence, and nothing waits on the GPU.
+    if (persistent_texture_off_device_bytes && !backend_has_unproven_submission()) {
+        uint64_t allowance = render_spill_recovery_allowance(
+            ctx, persistent_texture_spill_recovery, persistent_texture_off_device_bytes);
+        uint64_t reclaimed = 0, reclaimed_entries = 0;
+        for (auto it = persistent_texture_images.begin();
+             allowance && it != persistent_texture_images.end();) {
+            auto next = std::next(it);
+            if (it->second.off_device && it->second.bytes <= allowance) {
+                allowance -= it->second.bytes;
+                reclaimed += it->second.bytes;
+                ++reclaimed_entries;
+                evict_persistent_texture_entry(it, true);
+            }
+            it = next;
+        }
+        if (reclaimed_entries) {
+            static std::atomic<uint64_t> recoveries{0};
+            const uint64_t n = recoveries.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (n <= 8 || std::has_single_bit(n))
+                std::fprintf(stderr,
+                             "[mem-placement] sampled-texture: recovery #%llu retired %llu spilled "
+                             "texture(s), %.1f MiB, to be re-created device-local on next use "
+                             "(%.1f MiB still off-device)\n",
+                             (unsigned long long)n, (unsigned long long)reclaimed_entries,
+                             reclaimed / (1024.0 * 1024.0),
+                             persistent_texture_off_device_bytes / (1024.0 * 1024.0));
+        }
+    }
     if (prosper::diagnostics::perf::enabled()) {
         namespace perf = prosper::diagnostics::perf;
         perf::add(perf::Counter::TextureCacheMisses, persistent_texture_misses);
@@ -14999,6 +15227,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                    (persistent_color_target_cache().size() > persistent_color_target_count_limit() ||
                     persistent_color_target_bytes() > persistent_color_target_limit()) &&
                    evict_persistent_color_target(*ctx_ptr, color_target_generation)) {}
+            recover_spilled_persistent_color_targets(*ctx_ptr, color_target_generation);
         });
     volume_attachment_view.release();
     if (flush_now) active_submission.complete();

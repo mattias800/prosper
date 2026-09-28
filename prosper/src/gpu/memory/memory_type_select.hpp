@@ -161,4 +161,19 @@ MemoryAllocationOutcome allocate_with_memory_type_fallback(
     return out;
 }
 
+// A pooled allocator's answer to the driver running out (#3902). `allocate()` asks the driver for
+// memory of ONE type; `release_cached()` frees the pool's idle cached allocations and returns how
+// many it freed. On VK_ERROR_OUT_OF_DEVICE_MEMORY the pool's own idle memory is released and the
+// SAME type retried once, before allocate_with_memory_type_fallback moves on to the next type --
+// otherwise a colour target can land in system memory while prosper itself holds up to
+// PROSPER_MEMORY_POOL_MB of free, cached VRAM. Other errors are returned as they are, and nothing is
+// retried when the pool had nothing to give back. Pure: all side effects are the callbacks'.
+template <class Allocate, class ReleaseCached>
+VkResult allocate_releasing_pool_on_oom(Allocate&& allocate, ReleaseCached&& release_cached) {
+    const VkResult first = allocate();
+    if (first != VK_ERROR_OUT_OF_DEVICE_MEMORY) return first;
+    if (release_cached() == 0) return first;
+    return allocate();
+}
+
 }  // namespace prosper::gpu
