@@ -1475,8 +1475,9 @@ std::vector<prosper::test::BackendDraw> build_backend_draws(BackendDrawContext& 
 // renders each pass into its own retained target (resolves, MRT slots, RTT publication and the
 // present-candidate bookkeeping included), and leaves the composite's pixels for the present
 // selection that follows. This was the body of the submit callback's `if (pertarget)` branch; it
-// moved here verbatim. The four lambdas the callback also uses outside this branch
-// arrive as template parameters, so each call is still a direct, inlinable call.
+// moved here verbatim. What it shares with the rest of the callback is named, not templated:
+// build_backend_draws and record_backend_timing_stats over the callback's contexts, plus the
+// clear_for / print_rtt_timing helpers.
 namespace {
 // The submit callback's state that render_per_target_passes reads and writes, one reference per object.
 struct PerTargetPassContext {
@@ -1533,14 +1534,11 @@ struct PerTargetPassContext {
     uint32_t& px_front_fmt;
     uint32_t& px_vo_fmt;
     uint32_t& px_last_fmt;
+    BackendDrawContext& backend_draw_ctx;
+    BackendTimingContext& backend_timing_ctx;
 };
 
-template <class BuildBds, class ClearFor, class RecordBackendTiming, class PrintRttTiming>
-void render_per_target_passes(PerTargetPassContext& ctx,
-                              BuildBds& build_bds,
-                              ClearFor& clear_for,
-                              RecordBackendTiming& record_backend_timing,
-                              PrintRttTiming& print_rtt_timing) {
+void render_per_target_passes(PerTargetPassContext& ctx) {
     // Every name the moved body used from the callback, bound once to the same object.
     auto& g_pass_log_submit = ctx.g_pass_log_submit;
     auto& g_pass_log_window = ctx.g_pass_log_window;
@@ -1599,6 +1597,18 @@ void render_per_target_passes(PerTargetPassContext& ctx,
     // cannot be captured). A function-scope static reference binds once to that same object,
     // so the lambda keeps reaching it exactly as it did inside the callback.
     static RttCache& g_rtt = ctx.g_rtt;
+    // build_bds and record_backend_timing, over the same contexts the callback's forwarders use:
+    // each call is still a direct call into build_backend_draws / record_backend_timing_stats.
+    auto build_bds = [&](const std::vector<const prosper::gpu::DrawItem*>& group,
+                         prosper::test::BackendSubmissionBatch* producer_batch = nullptr) {
+        return build_backend_draws(ctx.backend_draw_ctx, group, producer_batch);
+    };
+    auto record_backend_timing = [&](const prosper::test::BackendRenderTimingStats& backend,
+                                     const prosper::test::BackendTextureUploadStats& textures,
+                                     const prosper::test::BackendPipelineCacheStats& pipelines,
+                                     const prosper::test::BackendResourceReuseStats& reuse) {
+        return record_backend_timing_stats(ctx.backend_timing_ctx, backend, textures, pipelines, reuse);
+    };
     auto pin_renderer_mip_target = [&](uint64_t id, uint32_t width, uint32_t height,
                                        VkFormat format, bool gpu_valid) {
         if (!gpu_valid || !id || !width || !height ||
@@ -5664,8 +5674,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     .px_last_source_submit = px_last_source_submit,
                     .px_front_fmt = px_front_fmt,
                     .px_vo_fmt = px_vo_fmt,
-                    .px_last_fmt = px_last_fmt};
-                render_per_target_passes(per_target_ctx, build_bds, clear_for, record_backend_timing, print_rtt_timing);
+                    .px_last_fmt = px_last_fmt,
+                    .backend_draw_ctx = backend_draw_ctx,
+                    .backend_timing_ctx = backend_timing_ctx};
+                render_per_target_passes(per_target_ctx);
             } else {
                 // Single-framebuffer path: render_draws_rgba composites every draw into ONE framebuffer.
                 std::vector<const prosper::gpu::DrawItem*> all; all.reserve(items.size());
