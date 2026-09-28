@@ -81,12 +81,36 @@ constexpr uint64_t kGpuMemoryOffDevicePerWindow = 1;
 
 // host-copy-pressure: bytes this process copies host-side on the guest's behalf, per second -- the
 // sum over EVERY default-on [transfer-pressure] category (storage-materialize, buffer-upload,
-// buffer-compare, rtt-snapshot, detile), the same total that census's HIGH line uses. Its
+// buffer-compare, rtt-snapshot, detile, guest-scanout), the same total that census's HIGH line uses. Its
 // `breakdown` is in whole MiB per category, not a count like the correctness rules' breakdowns, so
 // its summary "breakdown over fired windows" is MiB too. 256 MiB/s is that census's own HIGH line, which healthy titles sit
 // far below (GTA V on main: ~80 MiB/s over a whole route) and every defect it was written against
 // far above (a static splash copying 770 MiB/s; Astro Bot's compute round trip at ~2 GiB/s, #3871).
+// Since host-copy-per-flip (below) it DEFERS to that rule in any window where the per-flip form
+// holds: it now reports only what the per-flip form cannot see -- too few flips to form a per-frame
+// figure (a stall, a load, a title under 2 fps), or a small per-frame copy at a high frame rate.
 constexpr double kHostCopyMiBPerSecond = 256.0;
+
+// host-copy-per-flip: the same bytes as host-copy-pressure, per GUEST FLIP instead of per second, so
+// the verdict does not move with the frame rate. Measured 2026-09-29 on main (cf226ac2c) with this
+// rule's JSONL, prosper-app GPU present, routed runs:
+//   * GTA V perf-story route, three runs, BOTH regimes caught (the second run was the heavy one):
+//     light regime 13.1-13.3 MiB/flip at 7-9 fps (storage-materialize ~1.0-1.2 MiB/call,
+//     rtt-snapshot ~1.2-1.8 MiB/call); heavy regime 27.1 MiB/flip at 7 fps with the SAME call
+//     counts and twice the bytes per call (2.23 / 3.52 MiB/call). The per-second form never fired
+//     in any of the three (max 236 MiB/s in steady gameplay, 264 in one transition window).
+//   * Sonic Frontiers gameplay: 63.4 MiB/flip, two 4K RGBA8 rtt-snapshots (31.64 MiB/call) per
+//     flip, at 3-7 fps -- the per-second form fired in 19 of 61 windows, this rule in 31.
+//   * Outer Wilds first-person route and The Messenger: under 0.25 MiB/flip in every window.
+// 20 sits between the regimes (sqrt(13.3 x 27.1) = 19): the issue's proposed 16 fired once on the
+// LIGHT regime's gameplay entry, where two consecutive windows read 55.8 then 17.1 MiB/flip before
+// settling at 13.3 (run 3), and light-regime windows reach 15.0 during their first 20 s.
+constexpr double kHostCopyMiBPerFlip = 20.0;
+// ...over enough flips for the mean to be a per-frame cost rather than one load hitch: 10 per
+// window, so the two-window sustain spans at least 20 flips. A window with fewer is left to
+// host-copy-pressure's rate form. Outer Wilds' load windows (3 and 8 flips at 52-64 MiB/flip) fall
+// below it; Sonic's 3-4 fps gameplay tail (14-18 flips per window at 63 MiB/flip) does not.
+constexpr uint64_t kHostCopyPerFlipMinFlips = 10;
 
 // shader-compile: RDNA2->SPIR-V recompiles plus Vulkan pipeline creations, summed over threads, as a
 // share of the title's frame budget per flip. Compiling is expected while new content streams in,
@@ -144,6 +168,24 @@ constexpr double kPipelineCacheEvictionsPerSecond = 5.0;
 // for the same windows and was ~140x too high. (Sonic Frontiers not re-measured.)
 constexpr double kTextureValidationFailedMiBPerSecond = 128.0;
 
+// present-slot-trouble: SHARE of guest flips. The renderer's GPU-present declines that mean the
+// scanout path itself failed rather than that the frame was ineligible: `publish-failed`
+// (present_blit_publish declined a publishable front image -- no free slot, a slot that never
+// retired) and `compute-scanout-unwatched` (a compute-written front with no write watch, so it can
+// never be proven current). Each such span's frame goes through the CPU fallback instead of GPU
+// present. The ledger counts declines but not the spans that published, so the denominator is the
+// guest flip (every flip has at least one final render span while GPU present is on); a flip whose
+// several spans all decline counts more than once, which makes this the stricter reading of the
+// proposed "10% of spans". Measured 2026-09-29: ZERO declines of either reason in every window of
+// the six runs above (GTA V x3, Sonic Frontiers -- 4,259 compute-scanout publishes -- Outer Wilds,
+// The Messenger), so any sustained share is news; 10% keeps an occasional slot miss quiet.
+constexpr double kPresentSlotTroubleShare = 0.10;
+// The decline names (GpuPresentOutcome, frontends/shared/present/present_blit_policy.hpp) this rule
+// counts. Matched by NAME because the ledger stores each slot's name and this layer must not
+// include the frontend header; test_present_blit_policy pins that these spellings still exist.
+constexpr const char* kPresentSlotTroubleReasons[] = {"publish-failed", "compute-scanout-unwatched"};
+constexpr uint64_t kPresentSlotTroubleMinFlips = 20;
+
 // SUSTAIN: consecutive windows a rule's condition must hold before the engine reports it. A cost
 // that lasts one window is usually a load, and a steady-state alarm should not fire on it; a
 // correctness alarm fires on the first window.
@@ -180,6 +222,8 @@ struct WindowSample {
     // Host-copy bytes per [transfer-pressure] category (diagnostics::Transfer).
     static constexpr size_t kTransferCount = static_cast<size_t>(Transfer::Count);
     uint64_t transfer_bytes[kTransferCount] = {};
+    // ...and the note_transfer calls that carried them, for bytes per call.
+    uint64_t transfer_calls[kTransferCount] = {};
 
     double budget_ms() const { return target_hz ? 1000.0 / target_hz : 1000.0 / 60.0; }
     double ms(Cost c) const { return cost_ns[static_cast<size_t>(c)] / 1e6; }
@@ -207,6 +251,10 @@ struct RuleThresholds {
     uint64_t skipped_dispatches = kSkippedDispatchesPerWindow;
     uint64_t gpu_memory_off_device = kGpuMemoryOffDevicePerWindow;
     double host_copy_mib_per_s = kHostCopyMiBPerSecond;
+    double host_copy_mib_per_flip = kHostCopyMiBPerFlip;
+    uint64_t host_copy_per_flip_min_flips = kHostCopyPerFlipMinFlips;
+    double present_slot_trouble_share = kPresentSlotTroubleShare;
+    uint64_t present_slot_trouble_min_flips = kPresentSlotTroubleMinFlips;
     double shader_compile_budget_share = kShaderCompileBudgetShare;
     double shader_compile_min_per_s = kShaderCompileMinPerSecond;
     uint64_t unaccounted_draws = kUnaccountedDrawsPerWindow;
@@ -249,6 +297,13 @@ bool rule_has_data(const char* rule, const WindowSample& w);
 
 // Consecutive windows `rule` must hold before it is reported (see kSustainWindows).
 uint32_t sustain_windows(const char* rule);
+
+// host-copy-per-flip's condition, exposed because host-copy-pressure defers to it: when a window
+// has enough flips to form a per-frame figure and that figure is over threshold, the per-second
+// form would only restate it (and is the one that moves with the frame rate).
+bool host_copy_per_flip_holds(const WindowSample& w, const RuleThresholds& t);
+// The window's `publish-failed` + `compute-scanout-unwatched` GPU-present declines.
+uint64_t present_slot_trouble_declines(const WindowSample& w);
 
 std::vector<AlarmFiring> evaluate_rules(const WindowSample& w, const RuleThresholds& t);
 

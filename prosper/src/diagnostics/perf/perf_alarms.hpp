@@ -57,10 +57,11 @@ public:
     AlarmEngine& operator=(const AlarmEngine&) = delete;
 
     // Running totals kept OUTSIDE the ledger by existing default-on censuses. The process entry
-    // point fills it from transfer_pressure on every flip (five relaxed loads) and only a window
+    // point fills it from transfer_pressure on every flip (two relaxed loads per category) and only a window
     // close uses it; a test passes its own.
     struct ExternalTotals {
         uint64_t transfer_bytes[WindowSample::kTransferCount] = {};
+        uint64_t transfer_calls[WindowSample::kTransferCount] = {};
     };
 
     // One guest flip at `now_ns`. Closes the window when it is due: takes the deltas of `ledger`
@@ -115,6 +116,7 @@ private:
     uint64_t prev_gpu_memory_off_device_[kGpuMemoryClassSlots] = {};
     uint64_t prev_present_declines_[kPresentDeclineSlots] = {};
     uint64_t prev_transfer_bytes_[WindowSample::kTransferCount] = {};
+    uint64_t prev_transfer_calls_[WindowSample::kTransferCount] = {};
     std::vector<const char*> active_;   // rules REPORTED in the most recent window
     std::vector<std::pair<const char*, RuleState>> rules_;
 };

@@ -634,11 +634,21 @@ void test_host_copy_pressure() {
     set_transfer(sonic, Transfer::Detile, 1183.0);
     set_transfer(sonic, Transfer::RenderTargetSnapshot, 241.0);
     set_transfer(sonic, Transfer::StorageMaterialize, 2.0);
+    // 47.5 MiB per flip at 30 fps: the per-flip form holds, so the per-second form defers to it
+    // (one cause, one line).
     const auto a = evaluate_rules(sonic, kDefault);
-    check("Sonic's 1,426 MiB/s host copy fires host-copy-pressure alone", only(a, "host-copy-pressure"));
-    check("...naming detile as the largest site", !a.empty() &&
-              a[0].detail.find("MiB-by-site=detile:") != std::string::npos &&
-              std::string(a[0].breakdown[0].first) == "detile");
+    check("Sonic's 1,426 MiB/s at 30 fps is reported by host-copy-per-flip alone (the rate form "
+          "defers)", only(a, "host-copy-per-flip"));
+    // The same bytes over too few flips to form a per-frame figure (a stall): the rate form is
+    // the only one that can see it, and it names the site.
+    WindowSample stalled = sonic;
+    stalled.flips = kHostCopyPerFlipMinFlips - 1;
+    const auto st = evaluate_rules(stalled, kDefault);
+    check("...but over fewer flips than the per-flip floor, host-copy-pressure fires alone",
+          only(st, "host-copy-pressure"));
+    check("...naming detile as the largest site", !st.empty() &&
+              st[0].detail.find("MiB-by-site=detile:") != std::string::npos &&
+              std::string(st[0].breakdown[0].first) == "detile");
     // GTA V on main: ~80 MiB/s.
     WindowSample gta = healthy();
     set_transfer(gta, Transfer::StorageMaterialize, 32.0);
@@ -654,6 +664,157 @@ void test_host_copy_pressure() {
               fired(evaluate_rules(over, kDefault), "host-copy-pressure"));
     check("...and the investigation setting lowers it",
           fired(evaluate_rules(gta, RuleThresholds::scaled(25)), "host-copy-pressure"));
+}
+
+void set_transfer_per_flip(WindowSample& w, prosper::diagnostics::Transfer t, double mib_per_flip,
+                           uint64_t calls) {
+    const size_t i = static_cast<size_t>(t);
+    w.transfer_bytes[i] = static_cast<uint64_t>(mib_per_flip * w.flips * 1024.0 * 1024.0);
+    w.transfer_calls[i] = calls;
+}
+
+// A window at `fps` over 5 s against a 30 Hz target.
+WindowSample at_fps(double fps) {
+    WindowSample w = healthy();
+    w.flips = static_cast<uint64_t>(fps * w.seconds);
+    return w;
+}
+
+void test_host_copy_per_flip() {
+    std::puts("host-copy-per-flip");
+    using prosper::diagnostics::Transfer;
+    // GTA V's heavy regime on unmodified code (#3926), as measured on main 2026-09-29 (run 2 of 3,
+    // t=151 s): 27.1 MiB per flip at 7 fps -- storage-materialize 2.23 MiB/call, rtt-snapshot 3.52,
+    // detile 0.23. 190 MiB/s: far UNDER host-copy-pressure's 256 MiB/s, which never fired on it.
+    WindowSample heavy = at_fps(7.0);                     // 35 flips
+    set_transfer_per_flip(heavy, Transfer::StorageMaterialize, 12.3, 193);
+    set_transfer_per_flip(heavy, Transfer::RenderTargetSnapshot, 10.5, 105);
+    set_transfer_per_flip(heavy, Transfer::Detile, 4.3, 648);
+    const auto a = evaluate_rules(heavy, kDefault);
+    check("GTA V's heavy regime (27.1 MiB/flip at 7 fps) fires host-copy-per-flip alone",
+          only(a, "host-copy-per-flip"));
+    check("...value is MiB per flip", !a.empty() && a[0].value > 27.0 && a[0].value < 27.2);
+    check("...naming the top sites with MiB/flip and MiB per call, largest first",
+          !a.empty() &&
+              a[0].detail.find("sites=storage-materialize:12.3MiB/flip@2.23MiB/call(193 calls),"
+                               "rtt-snapshot:10.5MiB/flip@3.50MiB/call(105 calls),"
+                               "detile:4.3MiB/flip@0.23MiB/call(648 calls)") != std::string::npos);
+    check("...and the per-second figure the rate form would have read", !a.empty() &&
+              a[0].detail.find("rate=190MiB/s") != std::string::npos);
+    // The light regime of the same route and binary (run 3, t=129 s): the same sites and similar
+    // call counts at half the bytes per call, 13.3 MiB/flip at 10.4 fps -- quiet.
+    WindowSample light = healthy();
+    light.flips = 52;
+    set_transfer_per_flip(light, Transfer::StorageMaterialize, 5.40, 288);
+    set_transfer_per_flip(light, Transfer::RenderTargetSnapshot, 3.64, 156);
+    set_transfer_per_flip(light, Transfer::Detile, 4.27, 964);
+    check("GTA V's light regime (13.3 MiB/flip) is quiet", evaluate_rules(light, kDefault).empty());
+    // Frame-rate independence -- the reason this rule exists: the SAME per-flip cost at four frame
+    // rates gets the same verdict, while the per-second figure crosses 256 MiB/s between them.
+    bool same_verdict = true;
+    for (double fps : {5.0, 9.0, 30.0, 60.0}) {
+        WindowSample w = at_fps(fps);
+        set_transfer_per_flip(w, Transfer::StorageMaterialize, 27.0, 100);
+        same_verdict &= only(evaluate_rules(w, kDefault), "host-copy-per-flip");
+    }
+    check("27 MiB/flip fires host-copy-per-flip alone at 5, 9, 30 and 60 fps", same_verdict);
+    bool quiet_everywhere = true;
+    for (double fps : {5.0, 9.0, 30.0, 60.0}) {
+        WindowSample w = at_fps(fps);
+        set_transfer_per_flip(w, Transfer::StorageMaterialize, 1.0, 100);
+        quiet_everywhere &= !fired(evaluate_rules(w, kDefault), "host-copy-per-flip");
+    }
+    check("1 MiB/flip is quiet at every frame rate", quiet_everywhere);
+    WindowSample under = at_fps(9.0);
+    set_transfer_per_flip(under, Transfer::RenderTargetSnapshot, kHostCopyMiBPerFlip * 0.98, 10);
+    WindowSample over = at_fps(9.0);
+    set_transfer_per_flip(over, Transfer::RenderTargetSnapshot, kHostCopyMiBPerFlip * 1.02, 10);
+    check("just under the per-flip threshold is quiet, just over fires",
+          evaluate_rules(under, kDefault).empty() &&
+              only(evaluate_rules(over, kDefault), "host-copy-per-flip"));
+    // The flip floor: a window with too few flips has no per-frame figure. It is NO DATA for this
+    // rule (the rate form covers it), not a quiet window.
+    WindowSample few = healthy();
+    few.flips = kHostCopyPerFlipMinFlips - 1;
+    set_transfer_per_flip(few, Transfer::StorageMaterialize, 40.0, 10);   // 72 MiB/s
+    check("below the flip floor: quiet, and no data",
+          !fired(evaluate_rules(few, kDefault), "host-copy-per-flip") &&
+              !rule_has_data("host-copy-per-flip", few));
+    // Sonic Frontiers' 3 fps gameplay tail (2026-09-29): 16 flips per window, two 4K rtt-snapshots
+    // per flip. Above the floor, so it fires -- and at 203 MiB/s the rate form would have missed it.
+    WindowSample tail = healthy();
+    tail.flips = 16;
+    set_transfer_per_flip(tail, Transfer::RenderTargetSnapshot, 63.3, 32);
+    const auto st = evaluate_rules(tail, kDefault);
+    check("Sonic's 3 fps tail (16 flips, 63 MiB/flip, 203 MiB/s) fires host-copy-per-flip alone",
+          only(st, "host-copy-per-flip") &&
+              st[0].detail.find("rtt-snapshot:63.3MiB/flip@31.65MiB/call(32 calls)") !=
+                  std::string::npos);
+    check("at the floor with nothing copied: data (the healthy answer)",
+          rule_has_data("host-copy-per-flip", at_fps(kHostCopyPerFlipMinFlips / 5.0)));
+    // A fast title copying a little per frame: the per-flip form is quiet and the rate form still
+    // reports the absolute cost (120 fps x 3 MiB = 360 MiB/s).
+    WindowSample fast = at_fps(120.0);
+    set_transfer_per_flip(fast, Transfer::Detile, 3.0, 600);
+    check("a small per-flip copy at a high frame rate is left to host-copy-pressure",
+          only(evaluate_rules(fast, kDefault), "host-copy-pressure"));
+    check("...host_copy_per_flip_holds agrees with the rule on each window",
+          host_copy_per_flip_holds(heavy, kDefault) && !host_copy_per_flip_holds(fast, kDefault) &&
+              !host_copy_per_flip_holds(few, kDefault) && !host_copy_per_flip_holds(under, kDefault));
+    check("the investigation setting lowers the per-flip threshold",
+          fired(evaluate_rules(under, RuleThresholds::scaled(50)), "host-copy-per-flip"));
+    check("performance sustain (2)", sustain_windows("host-copy-per-flip") == 2);
+}
+
+void test_present_slot_trouble() {
+    std::puts("present-slot-trouble");
+    // Slot indices are GpuPresentOutcome values (PublishFailed = 11, ComputeScanoutUnwatched = 13);
+    // the rule matches by NAME, so an index is only where the recorder happened to put it.
+    WindowSample bad = healthy();                        // 150 flips
+    set_cost(bad, Cost::PresentCpu, 10.0, 120, 0.2);
+    bad.present_declines[11] = 30; bad.present_decline_names[11] = "publish-failed";
+    bad.present_declines[6] = 5; bad.present_decline_names[6] = "no-render-target";
+    set_count(bad, Counter::PresentGpuDeclines, 35);
+    const auto a = evaluate_rules(bad, kDefault);
+    check("publish-failed on 20% of flips fires present-slot-trouble alone",
+          only(a, "present-slot-trouble"));
+    check("...counting only the slot reasons, and naming them",
+          !a.empty() && a[0].detail.find("slot-declines=30 flips=150 all-declines=35") !=
+                            std::string::npos &&
+              a[0].detail.find("reasons=publish-failed:30") != std::string::npos &&
+              a[0].breakdown.size() == 1);
+    WindowSample unwatched = healthy();
+    unwatched.present_declines[13] = 20;
+    unwatched.present_decline_names[13] = "compute-scanout-unwatched";
+    check("compute-scanout-unwatched on 13% of flips fires it too",
+          only(evaluate_rules(unwatched, kDefault), "present-slot-trouble"));
+    WindowSample both = healthy();
+    both.present_declines[11] = 9; both.present_decline_names[11] = "publish-failed";
+    both.present_declines[13] = 9; both.present_decline_names[13] = "compute-scanout-unwatched";
+    check("the two reasons add (6% + 6% = 12%)",
+          only(evaluate_rules(both, kDefault), "present-slot-trouble") &&
+              present_slot_trouble_declines(both) == 18);
+    WindowSample rare = healthy();
+    rare.present_declines[11] = 15; rare.present_decline_names[11] = "publish-failed";
+    check("exactly 10% of flips is quiet (the condition is strictly over)",
+          evaluate_rules(rare, kDefault).empty());
+    // A frame that is ineligible for GPU present is not slot trouble, however many there are.
+    WindowSample ineligible = healthy();
+    ineligible.present_declines[6] = 686; ineligible.present_decline_names[6] = "no-render-target";
+    ineligible.present_declines[12] = 90;
+    ineligible.present_decline_names[12] = "compute-scanout-stale";
+    check("other decline reasons (no-render-target, compute-scanout-stale) are quiet",
+          evaluate_rules(ineligible, kDefault).empty() &&
+              present_slot_trouble_declines(ineligible) == 0);
+    WindowSample few = healthy();
+    few.flips = kPresentSlotTroubleMinFlips - 1;
+    few.present_declines[11] = few.flips; few.present_decline_names[11] = "publish-failed";
+    check("below the flip floor is quiet", evaluate_rules(few, kDefault).empty());
+    WindowSample none = healthy();
+    check("no GPU presents and no declines: no data", !rule_has_data("present-slot-trouble", none));
+    set_count(none, Counter::PresentGpuDeclines, 1);
+    check("a decline is data", rule_has_data("present-slot-trouble", none));
+    check("performance sustain (2)", sustain_windows("present-slot-trouble") == 2);
 }
 
 void test_shader_compile() {
@@ -927,10 +1088,10 @@ void test_engine() {
     const std::string quiet = slurp(logp);
     check("...saying no rule fired", quiet.find("no rule fired in 1 windows") != std::string::npos);
     check("...and listing the rules that had no data as NOT quiet",
-          quiet.find("13 of 16 rules had data") != std::string::npos &&
+          quiet.find("14 of 18 rules had data") != std::string::npos &&
               quiet.find("NO DATA (not measured in any window, so not quiet): "
-                         "texture-reference-cost,present-cpu-overhead,present-path-fallback") !=
-                  std::string::npos);
+                         "texture-reference-cost,present-cpu-overhead,present-path-fallback,"
+                         "present-slot-trouble") != std::string::npos);
     std::fclose(s);
     std::remove(jsonl.c_str());
     std::remove(logp.c_str());
@@ -1017,6 +1178,61 @@ void test_engine_breakdowns() {
     std::remove(logp.c_str());
 }
 
+// host-copy-per-flip through the engine: the per-window deltas of the external CALL totals (bytes
+// per call must come from the window, not the process lifetime), the flip count as denominator,
+// and the JSONL fields that keep both denominators visible.
+void test_engine_host_copy_per_flip() {
+    std::puts("engine host-copy-per-flip");
+    const std::string dir = std::getenv("TMPDIR") ? std::getenv("TMPDIR") : ".";
+    const std::string tag = std::to_string(
+        std::chrono::steady_clock::now().time_since_epoch().count()) + "_f" +
+        std::to_string(reinterpret_cast<uintptr_t>(&dir) & 0xffffff);
+    const std::string jsonl = dir + "/test_perf_alarms_" + tag + ".jsonl";
+    std::vector<AlarmFiring> w1, w2;
+    {
+        EngineConfig config;
+        config.window_ns = 1'000'000'000ull;
+        config.jsonl_path = jsonl;
+        config.log = nullptr;
+        AlarmEngine engine(std::move(config));
+        Ledger l;
+        AlarmEngine::ExternalTotals ext;
+        const size_t storage = static_cast<size_t>(prosper::diagnostics::Transfer::StorageMaterialize);
+        // Pre-baseline residue: a huge lifetime total at a very different bytes/call.
+        ext.transfer_bytes[storage] = 50ull << 30;
+        ext.transfer_calls[storage] = 10;
+        uint64_t t = 1'000'000'000ull;
+        engine.on_flip(t, l, 30, &ext);
+        const uint64_t flip_ns = 1'000'000'000ull / 30;
+        const auto run_window = [&](std::vector<AlarmFiring>& out) {
+            // 30 flips in the window, each copying 24 MiB in 12 calls of 2 MiB (~720 MiB/s).
+            for (int f = 0; f < 30; ++f) {
+                ext.transfer_bytes[storage] += 24ull << 20;
+                ext.transfer_calls[storage] += 12;
+                t += flip_ns + 1;
+                auto fired_now = engine.on_flip(t, l, 30, &ext);
+                if (!fired_now.empty() || f == 29) out = std::move(fired_now);
+            }
+        };
+        run_window(w1);
+        run_window(w2);
+    }
+    check("window 1 holds the condition but is not reported (sustain 2)", w1.empty());
+    check("window 2 reports host-copy-per-flip alone -- host-copy-pressure (~720 MiB/s) defers",
+          w2.size() == 1 && std::string(w2[0].rule) == "host-copy-per-flip" &&
+              w2[0].value > 23.0 && w2[0].value < 25.0);
+    check("...with bytes per call from the WINDOW's calls (2 MiB), not the lifetime residue",
+          !w2.empty() && w2[0].detail.find("storage-materialize:") != std::string::npos &&
+              w2[0].detail.find("@2.00MiB/call") != std::string::npos);
+    const std::string j = slurp(jsonl);
+    check("every JSONL window carries the per-flip and per-second figures and calls by site",
+          count_of(j, "\"host_copy_mib_per_flip\":") == 2 &&
+              count_of(j, "\"host_copy_mib_per_s\":") == 2 &&
+              count_of(j, "\"host_copy_calls_by_site\":{\"storage-materialize\":") == 2 &&
+              count_of(j, "\"present_slot_trouble_declines\":0") == 2);
+    std::remove(jsonl.c_str());
+}
+
 }  // namespace
 
 int main() {
@@ -1037,6 +1253,8 @@ int main() {
     test_pipeline_cache_thrash();
     test_texture_validation_churn();
     test_host_copy_pressure();
+    test_host_copy_per_flip();
+    test_present_slot_trouble();
     test_shader_compile();
     test_sampler_seed();
     test_threshold_scaling();
@@ -1045,9 +1263,11 @@ int main() {
     test_texture_reference_sample();
     test_engine();
     test_engine_breakdowns();
+    test_engine_host_copy_per_flip();
     check("rule_names lists the six phase-2 rules, the three added with phase 3, "
-          "gpu-memory-off-device (#3897) and the six 2026-09-28 queue rules",
-          rule_names().size() == 16);
+          "gpu-memory-off-device (#3897), the six 2026-09-28 queue rules and the two "
+          "2026-09-29 ones (host-copy-per-flip, present-slot-trouble)",
+          rule_names().size() == 18);
     std::printf("%s: %d failure(s)\n", g_failures ? "FAILED" : "ok", g_failures);
     return g_failures ? 1 : 0;
 }
