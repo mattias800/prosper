@@ -4427,6 +4427,28 @@ int main(int argc, char** argv) {
     { DrawItem d; (void)begin_requested_gpu_capture({d}, {}, {}, 64, 64); }
     CHECK(!interactive_gpu_capture_armed(), "the re-armed grab is consumed by the next drawing invocation");
 
+    // #3895: a pending runtime capture asks the live renderer for a CPU copy of the captured submit's
+    // presented frame (its output oracle) for exactly as long as the pending capture lives, while a
+    // hand-built pending capture (tests, tools) never does. Counted relative to a baseline because
+    // pending captures created earlier in this function are still alive.
+    const uint32_t holds_before = gpu_capture_cpu_output_hold_count_for_test();
+    { PendingGpuCapture hand_built;
+      CHECK(gpu_capture_cpu_output_hold_count_for_test() == holds_before,
+            "a hand-built pending capture does not engage the hold"); }
+    request_interactive_gpu_capture(prosper_test::test_scratch_file("prosper_interactive_grab3.prgcap"));
+    {
+        DrawItem d;
+        auto held = begin_requested_gpu_capture({d}, {}, {}, 64, 64, nullptr, 0, UINT64_MAX,
+                                                nullptr, /*defer_materialization=*/true);
+        CHECK(held != nullptr, "a deferred interactive capture is pending");
+        CHECK(gpu_capture_cpu_output_hold_count_for_test() == holds_before + 1 &&
+                  gpu_capture_requires_cpu_output(),
+              "a pending runtime capture requires the captured submit's CPU output (#3895)");
+        held.reset();
+        CHECK(gpu_capture_cpu_output_hold_count_for_test() == holds_before,
+              "destroying the pending capture releases the hold");
+    }
+
     // --- PROSPER_CAPTURE_BLOB_MAX_MB parse/clamp rules (#2440) ------------------------------------
     // The per-resource ceiling is a runtime value because GTA V gameplay binds a 1,105,723,396-byte
     // buffer -- 1.0298x over the 1 GiB default -- and one resource over the line aborts the whole

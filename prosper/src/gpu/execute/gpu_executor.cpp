@@ -8310,7 +8310,7 @@ std::vector<ComputeItem> realize_compute_dispatches(
         const bool timeline_capture_bound = timeline_capture_requires_portable_compute(
             timeline_capture_requested, timeline_capture_after_compute_gated,
             timeline_capture_after_compute_armed);
-        const bool capture_bound = std::getenv("PROSPER_GPU_CAPTURE") ||
+        const bool capture_bound = env_gpu_capture_requires_portable_compute() ||
             timeline_capture_bound ||
             interactive_gpu_capture_armed() || interactive_capture_bundle_active();
         if (capture_bound)

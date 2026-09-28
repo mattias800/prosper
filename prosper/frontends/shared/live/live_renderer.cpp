@@ -2398,9 +2398,14 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
     static const bool timeline_capture_permits_live_targets =
         timeline_capture_allows_persistent_targets(
             timeline_capture_requested, timeline_capture_phase_gated);
-    // Retain intermediate color targets on the GPU by default. Captures and per-target pixel
-    // diagnostics require authoritative CPU pixels at every pass, so they retain the established
-    // readback path. The explicit opt-out keeps a direct A/B and a recovery switch for driver issues.
+    // Retain intermediate color targets on the GPU by default. Per-target pixel diagnostics require
+    // authoritative CPU pixels at every pass, so they retain the established readback path. The
+    // one-shot PROSPER_GPU_CAPTURE does not: it reads referenced targets back on demand for its one
+    // selected submit, so the run is the production path until the capture moment (#3895; the
+    // decision and its rationale live in capture_renderer_policy.hpp).
+    // PROSPER_GPU_CAPTURE_READBACK=1 restores the pre-#3895 behaviour (a capture run reads back from
+    // boot) as a same-binary A/B arm. The explicit opt-out keeps a direct A/B and a recovery switch
+    // for driver issues.
     // Bundle replay normally requests CPU-visible RTT checkpoints so its inspection/export modes can
     // observe every pass. That fallback cannot carry MRT2..7 between independent render groups (the
     // public CPU seed parameters historically cover only MRT0/MRT1), and therefore is not an oracle
@@ -2409,15 +2414,31 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
     // It is deliberately opt-in: export/readback diagnostics keep their established behaviour.
     static const bool replay_live_targets =
         PROSPER_ENV_VALUE("PROSPER_GPU_REPLAY_LIVE_TARGETS") != nullptr;
-    static const bool live_gpu_targets = pertarget &&
-        !PROSPER_ENV_VALUE("PROSPER_NO_LIVE_PERSISTENT_COLOR_TARGETS") && !getenv("PROSPER_GPU_CAPTURE") &&
-        timeline_capture_permits_live_targets && !PROSPER_ENV_VALUE("PROSPER_GPU_REPLAY_EXPORT_RTT") &&
-        (!getenv("PROSPER_GPU_REPLAY_RTT_SEEDS") || replay_live_targets) &&
-        !PROSPER_ENV_VALUE("PROSPER_DUMP_SAMPLED_RTT") &&
-        !PROSPER_ENV_VALUE("PROSPER_DUMP_RTGROUPS") && !getenv("PROSPER_DUMP_RTGROUPS_RGBA") &&
-        !PROSPER_ENV_VALUE("PROSPER_DUMP_DRAWSTEPS") &&
-        !PROSPER_ENV_VALUE("PROSPER_RESOURCE_HASH_DIM") && !PROSPER_ENV_VALUE("PROSPER_TARGET_STEP_HASH_DIM") &&
-        !PROSPER_ENV_VALUE("PROSPER_RTTLOG");
+    static const bool gpu_capture_requested = getenv("PROSPER_GPU_CAPTURE") != nullptr;
+    static const bool legacy_capture_readback =
+        gpu_capture_requested && PROSPER_ENV_VALUE("PROSPER_GPU_CAPTURE_READBACK") != nullptr;
+    static const bool live_gpu_targets = [&] {
+        prosper::frontend::LiveColorTargetResidencyInputs in;
+        in.per_target = pertarget;
+        in.opted_out = PROSPER_ENV_VALUE("PROSPER_NO_LIVE_PERSISTENT_COLOR_TARGETS") != nullptr ||
+                       legacy_capture_readback;
+        in.timeline_capture_permits = timeline_capture_permits_live_targets;
+        in.gpu_capture_requested = gpu_capture_requested;
+        in.replay_export_rtt = PROSPER_ENV_VALUE("PROSPER_GPU_REPLAY_EXPORT_RTT") != nullptr;
+        in.replay_rtt_seeds = getenv("PROSPER_GPU_REPLAY_RTT_SEEDS") != nullptr;
+        in.replay_live_targets = replay_live_targets;
+        in.per_pass_pixel_diagnostic =
+            PROSPER_ENV_VALUE("PROSPER_DUMP_SAMPLED_RTT") || PROSPER_ENV_VALUE("PROSPER_DUMP_RTGROUPS") ||
+            getenv("PROSPER_DUMP_RTGROUPS_RGBA") || PROSPER_ENV_VALUE("PROSPER_DUMP_DRAWSTEPS") ||
+            PROSPER_ENV_VALUE("PROSPER_RESOURCE_HASH_DIM") ||
+            PROSPER_ENV_VALUE("PROSPER_TARGET_STEP_HASH_DIM") || PROSPER_ENV_VALUE("PROSPER_RTTLOG");
+        return prosper::frontend::live_color_targets_enabled(in);
+    }();
+    if (gpu_capture_requested)
+        fprintf(stderr, "[render] PROSPER_GPU_CAPTURE: %s\n",
+                live_gpu_targets ? "live targets retained; capture readback is on demand"
+                : legacy_capture_readback ? "CPU readback path (PROSPER_GPU_CAPTURE_READBACK)"
+                                          : "CPU readback path (another diagnostic requires it)");
     if (timeline_capture_phase_gated)
         fprintf(stderr, "[render] phase-gated timeline capture retains live targets; "
                         "capture readback is on demand\n");
@@ -11195,7 +11216,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         // consumers read guest memory, which lacks this pass's writes. The
                         // alternative was worse: claiming the footprint dropped every draw that
                         // samples it, which kept GTA V's menus black whenever live GPU targets are
-                        // off (PROSPER_GPU_CAPTURE, PROSPER_DUMP_*, replay seeding; #3890).
+                        // off (PROSPER_DUMP_*, replay seeding, and PROSPER_GPU_CAPTURE before
+                        // #3895; #3890).
                         prosper::test::invalidate_persistent_color_target(base);
                         if (base)
                             note_volume_producer_denied(base, g_rtt[base], gw, gh,
@@ -11224,10 +11246,18 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     // final callback, where the cache is materialized on demand if no later scanout
                     // pass already requested CPU pixels. A same-submit DMA asks its producer span for
                     // authoritative readback, and compute consumers use the lazy target reader above.
+                    // A pending one-shot capture reads back every pass's colour0 for its one
+                    // submit, so the publish candidates (front / scanout / last) that become the
+                    // capsule's output oracle are exactly the readback path's (#3895).
+                    const bool capture_cpu_output = prosper::gpu::gpu_capture_requires_cpu_output();
                     const bool final_gpu_present = phase.final_span &&
-                        !phase.authoritative_readback && prosper::gpu::gpu_present_active();
+                        !phase.authoritative_readback &&
+                        prosper::frontend::gpu_present_allowed_during_capture(
+                            prosper::gpu::gpu_present_active(), capture_cpu_output);
                     const bool defer_readback = live_gpu_targets && vo_n > 0 && base &&
                         !phase.authoritative_readback &&
+                        prosper::frontend::pass_readback_deferral_allowed_during_capture(
+                            capture_cpu_output) &&
                         ((is_vo && can_defer_scanout_readback(
                                        phase.allows_deferred_scanout_readback(),
                                        final_gpu_present,
@@ -12492,13 +12522,19 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 // through to the CPU readback below, which still publishes a CPU frame; prosper-app
                 // presents that CPU frame when no GPU frame was published (main.cpp), so a miss degrades to
                 // the CPU present path rather than freezing the window.
-                if (front >= 0 && front_flip && prosper::gpu::gpu_present_active() && !new_gpu_flip) {
+                // A submit whose one-shot capture is pending presents through the CPU path below,
+                // which materializes the scanout on demand: the capsule needs that frame as its
+                // output oracle (#3895). Every other submit keeps GPU present.
+                const bool gpu_present_now = prosper::frontend::gpu_present_allowed_during_capture(
+                    prosper::gpu::gpu_present_active(),
+                    prosper::gpu::gpu_capture_requires_cpu_output());
+                if (front >= 0 && front_flip && gpu_present_now && !new_gpu_flip) {
                     // The previously published slot remains the correct scanout for this guest
                     // flip. Treat it as a successful GPU publication so intermediate render
                     // submissions do not fall through to the expensive CPU readback path.
                     published_gpu = true;
                     handoff_trace.emit(prosper::perf::PresentHandoffEvent::SameFlipSuppressed, 0, 0, last_gpu_publish_flip);
-                } else if (front >= 0 && front_flip && prosper::gpu::gpu_present_active()) {
+                } else if (front >= 0 && front_flip && gpu_present_now) {
                     const uint64_t front_va = front_snapshot.address;
                     auto rit = g_rtt.find(front_va);
                     if (rit != g_rtt.end() && !rit->second.volume_depth &&
