@@ -31,6 +31,21 @@ constexpr bool live_rtt_compute_authoritative(bool gpu_valid, bool has_cpu_snaps
     return live_rtt_authority(gpu_valid, has_cpu_snapshot) != LiveRttAuthority::none;
 }
 
+// A dim-5 (2D-array base-slice) view whose live RTT entry could not be served keeps renderer
+// authority over the guest-decode cache: while the renderer holds pixels the guest bytes do not
+// see (a valid image, a CPU snapshot, a uniform fast-clear colour), a retained guest decode must
+// not be revalidated against guest pages the renderer never writes. An entry holding NONE of those
+// is an identity-only shell -- left behind by an invalidation or a declined producer -- and the
+// reference is served by decoding guest bytes either way. Retaining that decode behind exact
+// guest-byte validation then returns the same pixels a fresh decode would, so the shell must not
+// force a full re-decode on every submit (Sonic Frontiers re-read a 64 MiB RGBA16F shell ~24x/s
+// on its title and menu screens, #3873).
+constexpr bool live_rtt_base_slice_blocks_decode_cache(bool gpu_valid, bool has_cpu_snapshot,
+                                                       bool has_uniform_color) {
+    return live_rtt_authority(gpu_valid, has_cpu_snapshot) != LiveRttAuthority::none ||
+        has_uniform_color;
+}
+
 // Pixel-inspection and mutation diagnostics operate on the renderer's owned CPU texture copy.
 // Uniform fast-clears normally bypass that copy, but the opt-in diagnostic contract takes
 // precedence so dumps and override probes observe the same pixels as ordinary RTT snapshots.

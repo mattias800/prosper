@@ -38,13 +38,18 @@ struct TextureReferenceCensus {
         kFill,             // FrameResource fill / decode on miss
         kStages
     };
+    // The three "other" classes are references decoded from guest bytes without the persistent
+    // decode cache: other_rttauth -- a live RTT entry kept renderer authority but could not serve
+    // the reference; other_nocand -- the shape/format is not a cache candidate at all (e.g. a
+    // non-BC cube); other -- a candidate the runtime gates refused (compression, budget, storage).
     enum Class : int {
         kRtt = 0, kCompute, kPersistSubmit, kPersistHit, kPersistMiss, kPersistInvalid, kLocal,
-        kOther, kClasses
+        kOtherRttAuthority, kOtherNotCandidate, kOther, kClasses
     };
     static const char* class_name(int c) {
         static const char* names[kClasses] = {"rtt", "compute", "persist_submit", "persist_hit",
-                                              "persist_miss", "persist_invalid", "local", "other"};
+                                              "persist_miss", "persist_invalid", "local",
+                                              "other_rttauth", "other_nocand", "other"};
         return names[c];
     }
 
