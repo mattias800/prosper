@@ -54,6 +54,36 @@ int main() {
     check(transfer_bytes(Transfer::StorageMaterialize) == 1500,
           "an out-of-range category does not land in another category's total");
 
+    // Calls are counted beside bytes (bytes per call separates "bigger copies" from "more copies",
+    // the difference between GTA V's two host-copy regimes, #3926).
+    const uint64_t calls_before = transfer_calls(Transfer::RenderTargetSnapshot);
+    note_transfer(Transfer::RenderTargetSnapshot, 64);
+    note_transfer(Transfer::RenderTargetSnapshot, 0);
+    note_transfer(Transfer::RenderTargetSnapshot, 64);
+    check(transfer_calls(Transfer::RenderTargetSnapshot) == calls_before + 2,
+          "calls count the transfers that carried bytes, not the zero-byte ones");
+
+    // A shared helper reports under its own generic category; a caller whose copy belongs to
+    // another reader re-attributes it for the scope, on this thread only, innermost scope winning.
+    const uint64_t detile0 = transfer_bytes(Transfer::Detile);
+    const uint64_t scanout0 = transfer_bytes(Transfer::GuestScanout);
+    const uint64_t upload0 = transfer_bytes(Transfer::BufferUpload);
+    {
+        const TransferAttributionScope outer(Transfer::GuestScanout);
+        note_transfer(Transfer::Detile, 100);
+        {
+            const TransferAttributionScope inner(Transfer::BufferUpload);
+            note_transfer(Transfer::Detile, 7);
+        }
+        note_transfer(Transfer::Detile, 1);
+    }
+    note_transfer(Transfer::Detile, 5);
+    check(transfer_bytes(Transfer::GuestScanout) == scanout0 + 101 &&
+              transfer_bytes(Transfer::BufferUpload) == upload0 + 7,
+          "an attribution scope charges the helper's bytes to the scope's category, innermost first");
+    check(transfer_bytes(Transfer::Detile) == detile0 + 5,
+          "...and the helper's own category sees only what ran outside every scope");
+
     std::printf("%s\n", failures ? "FAILURES" : "ALL PASS");
     return failures ? 1 : 0;
 }

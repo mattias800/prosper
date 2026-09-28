@@ -48,6 +48,10 @@ enum class Transfer : unsigned char {
     BufferCompare,           // bytes read only to decide whether something changed
     RenderTargetSnapshot,    // CPU copies of render targets for later sampling
     Detile,                  // CPU detiling of tiled guest surfaces
+    // The guest's front (scanout) buffer read back to the CPU: the copy out of guest memory plus
+    // its de-swizzle (videoout_read_front_linear). Its own site so a host-copy alarm on the CPU
+    // present fallback names the present path instead of reading as texture detiling (#3891).
+    GuestScanout,
     Count
 };
 
@@ -59,5 +63,23 @@ void note_transfer(Transfer category, uint64_t bytes);
 
 // Process-lifetime totals, for tests and tools.
 uint64_t transfer_bytes(Transfer category);
+// Process-lifetime count of note_transfer calls that carried bytes, per category: with
+// transfer_bytes it gives bytes per call, which separates "more copies" from "bigger copies".
+uint64_t transfer_calls(Transfer category);
+
+// While one of these is alive, every note_transfer on THIS thread is charged to `category`,
+// whatever category the reporting site passed. For a caller that reuses a shared helper which
+// reports under its own generic category (detile_surface reports Detile) but whose copy belongs to
+// a different reader: the guest-scanout read wraps its de-swizzle in one. Nests; the innermost wins.
+class TransferAttributionScope {
+public:
+    explicit TransferAttributionScope(Transfer category);
+    ~TransferAttributionScope();
+    TransferAttributionScope(const TransferAttributionScope&) = delete;
+    TransferAttributionScope& operator=(const TransferAttributionScope&) = delete;
+
+private:
+    Transfer previous_;
+};
 
 }  // namespace prosper::diagnostics

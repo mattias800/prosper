@@ -15,6 +15,7 @@ constexpr size_t kCount = static_cast<size_t>(Transfer::Count);
 
 constexpr std::array<const char*, kCount> kNames{
     "storage-materialize", "buffer-upload", "buffer-compare", "rtt-snapshot", "detile",
+    "guest-scanout",
 };
 static_assert(kNames.size() == kCount, "every Transfer needs a stable name; logs are grepped");
 
@@ -24,6 +25,9 @@ struct State {
     std::atomic<uint64_t> first_ns{0};
     std::atomic<uint64_t> last_ns{0};
 };
+
+// Transfer::Count: no override (the reporting site's own category stands).
+thread_local Transfer t_attribution = Transfer::Count;
 
 uint64_t now_ns() {
     return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -87,6 +91,7 @@ const char* transfer_name(Transfer category) {
 }
 
 void note_transfer(Transfer category, uint64_t bytes) {
+    if (t_attribution != Transfer::Count) category = t_attribution;
     const auto i = static_cast<size_t>(category);
     if (i >= kCount || !bytes) return;
     State& s = state();
@@ -102,5 +107,17 @@ uint64_t transfer_bytes(Transfer category) {
     const auto i = static_cast<size_t>(category);
     return i < kCount ? state().bytes[i].load(std::memory_order_relaxed) : 0;
 }
+
+uint64_t transfer_calls(Transfer category) {
+    const auto i = static_cast<size_t>(category);
+    return i < kCount ? state().calls[i].load(std::memory_order_relaxed) : 0;
+}
+
+TransferAttributionScope::TransferAttributionScope(Transfer category)
+    : previous_(t_attribution) {
+    t_attribution = category;
+}
+
+TransferAttributionScope::~TransferAttributionScope() { t_attribution = previous_; }
 
 }  // namespace prosper::diagnostics
