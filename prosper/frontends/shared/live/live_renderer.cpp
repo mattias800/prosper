@@ -2306,13 +2306,6 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             BackendTimingContext backend_timing_ctx{
                 .pending_timing = pending_timing,
                 .timing_mode = timing_mode};
-            auto record_backend_timing = [&]
-                (const prosper::test::BackendRenderTimingStats& backend,
-                 const prosper::test::BackendTextureUploadStats& textures,
-                 const prosper::test::BackendPipelineCacheStats& pipelines,
-                 const prosper::test::BackendResourceReuseStats& reuse) {
-                return record_backend_timing_stats(backend_timing_ctx, backend, textures, pipelines, reuse);
-            };
             SubmitLogContext log_submit_index_ctx{
                 .items = items,
                 .phase = phase,
@@ -2613,10 +2606,6 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 .program_census = shader_overrides.program_census,
                 .link_scan = shader_overrides.link_scan,
                 .link_scan_armed = shader_overrides.link_scan_armed};
-            auto build_bds = [&](const std::vector<const prosper::gpu::DrawItem*>& group,
-                                 prosper::test::BackendSubmissionBatch* producer_batch = nullptr) {
-                return build_backend_draws(backend_draw_ctx, group, producer_batch);
-            };
             // Declared beside pass_timing_start, not at the loop's end: the group loop lives in an
             // inner scope that closes before the pass span is accumulated, so a tail marker declared
             // there is out of scope where it is needed.
@@ -2765,7 +2754,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 const bool perf_build_clock = prosper::diagnostics::perf::enabled();   // #3891
                 const auto build_start = timing_enabled || perf_build_clock
                     ? RenderClock::now() : RenderClock::time_point{};
-                auto backend_draws = build_bds(all);
+                auto backend_draws = build_backend_draws(backend_draw_ctx, all, nullptr);
                 const auto build_done = timing_enabled || perf_build_clock
                     ? RenderClock::now() : RenderClock::time_point{};
                 if (perf_build_clock) {
@@ -2801,8 +2790,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         std::chrono::duration<double, std::milli>(build_done - build_start).count();
                     pending_timing.backend_ms +=
                         std::chrono::duration<double, std::milli>(backend_done - build_done).count();
-                    record_backend_timing(backend_call_timing, backend_texture_stats,
-                                          backend_pipeline_stats, backend_reuse_stats);
+                    record_backend_timing_stats(backend_timing_ctx, backend_call_timing,
+                                                backend_texture_stats, backend_pipeline_stats,
+                                                backend_reuse_stats);
                 }
                 // RTT (#167): cache these rendered pixels under this submit's render-target base, so a later
                 // composite pass that samples that address gets the scene we drew (not empty guest memory).
