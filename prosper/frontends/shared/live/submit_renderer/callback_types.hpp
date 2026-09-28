@@ -247,6 +247,17 @@ struct RenderTiming {
     uint64_t build_reflect_memo_mismatch = 0;
     std::unordered_set<uint64_t> build_reflect_identities;
 };
+struct RttTimingRecord {
+    int submit = 0;
+    uint64_t target = 0;
+    uint32_t width = 0, height = 0;
+    size_t draws = 0;
+    bool first_span = false, final_span = false;
+    bool authoritative_readback = false, deferred_readback = false;
+    double measured_ms = 0;
+    prosper::test::BackendRenderTimingStats timing;
+    prosper::test::BackendColorTargetStats color_target;
+};
 struct ValidationCensusLog {
     prosper::frontend::TextureValidationCensus data;
     unsigned long thread = 0;
@@ -314,4 +325,5 @@ struct DepthCubeGpuSnapshot {
 };
 constexpr size_t kDepthCubeGpuSnapshotEntries = 8;
 
+constexpr uint32_t kNoPassFormat = UINT32_MAX;
 } // namespace prosper::frontend::submit_renderer

@@ -9911,17 +9911,6 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             const bool rtt_log_in_range =
                 g_this_submit >= g_rttlog_min_submit && g_this_submit <= g_rttlog_max_submit;
             const bool rtt_log = PROSPER_ENV_VALUE("PROSPER_RTTLOG") && rtt_log_in_range;
-            struct RttTimingRecord {
-                int submit = 0;
-                uint64_t target = 0;
-                uint32_t width = 0, height = 0;
-                size_t draws = 0;
-                bool first_span = false, final_span = false;
-                bool authoritative_readback = false, deferred_readback = false;
-                double measured_ms = 0;
-                prosper::test::BackendRenderTimingStats timing;
-                prosper::test::BackendColorTargetStats color_target;
-            };
             static thread_local RenderTiming pending_timing;
             static thread_local std::vector<RttTimingRecord> pending_rtt_timing;
             static thread_local uint64_t pending_span_start_ns = 0;
@@ -11221,7 +11210,6 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             // deliberately not 0: 0 is CB_COLOR_INVALID, a real and meaningful value here, and the
             // whole question is how often it reaches the publish source. Absent and disabled must
             // not be the same number.
-            constexpr uint32_t kNoPassFormat = UINT32_MAX;
             uint32_t px_front_fmt = kNoPassFormat, px_vo_fmt = kNoPassFormat,
                      px_last_fmt = kNoPassFormat;
             // Fail-visible: a submit that renders yet offers no present-extent source is exactly the
