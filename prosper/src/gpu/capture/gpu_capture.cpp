@@ -23,8 +23,11 @@
 #include "gpu/texture/tile.hpp"
 #include "gpu/present/videoout_present.hpp"
 
+#include "gpu/capture/capture_compute_policy.hpp"
+
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <string>
 #include <bit>
 #include <cerrno>
@@ -804,6 +807,16 @@ namespace {
 std::mutex g_interactive_capture_mx;
 std::string g_interactive_capture_path;
 std::atomic<bool> g_output_capture_claimed{false};
+// Environment one-shot capture window state (#3895): the AFTER invocation counter, the AFTER_MS clock
+// origin (steady-clock ns; 0 = not started), and whether the one-shot has completed.
+std::atomic<uint64_t> g_env_capture_invocations{0};
+std::atomic<int64_t> g_env_capture_clock_start_ns{0};
+std::atomic<bool> g_env_capture_finished{false};
+int64_t steady_now_ns() {
+    const int64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    return ns ? ns : 1;
+}
 std::string take_interactive_gpu_capture() {
     std::lock_guard<std::mutex> lk(g_interactive_capture_mx);
     return std::exchange(g_interactive_capture_path, std::string());
@@ -1341,6 +1354,66 @@ bool materialize_pending_gpu_capture(PendingGpuCapture& pending,
 }
 }  // namespace
 
+namespace {
+std::atomic<uint32_t> g_capture_cpu_output_holds{0};
+}  // namespace
+
+GpuCaptureCpuOutputHold::~GpuCaptureCpuOutputHold() {
+    if (active_) g_capture_cpu_output_holds.fetch_sub(1, std::memory_order_acq_rel);
+}
+
+GpuCaptureCpuOutputHold& GpuCaptureCpuOutputHold::operator=(
+    GpuCaptureCpuOutputHold&& other) noexcept {
+    if (this != &other) {
+        if (active_) g_capture_cpu_output_holds.fetch_sub(1, std::memory_order_acq_rel);
+        active_ = other.active_;
+        other.active_ = false;
+    }
+    return *this;
+}
+
+void GpuCaptureCpuOutputHold::activate() {
+    if (active_) return;
+    active_ = true;
+    g_capture_cpu_output_holds.fetch_add(1, std::memory_order_acq_rel);
+}
+
+bool gpu_capture_requires_cpu_output() {
+    return g_capture_cpu_output_holds.load(std::memory_order_acquire) != 0;
+}
+
+uint32_t gpu_capture_cpu_output_hold_count_for_test() {
+    return g_capture_cpu_output_holds.load(std::memory_order_acquire);
+}
+
+bool env_gpu_capture_requires_portable_compute() {
+    static const bool requested = [] {
+        const char* path = std::getenv("PROSPER_GPU_CAPTURE");
+        return path && *path;
+    }();
+    if (!requested) return false;
+    static const bool legacy = std::getenv("PROSPER_GPU_CAPTURE_READBACK") != nullptr;
+    static const uint64_t after = [] {
+        const char* v = std::getenv("PROSPER_GPU_CAPTURE_AFTER");
+        return v ? std::strtoull(v, nullptr, 0) : 0ull;
+    }();
+    static const uint64_t after_ms = [] {
+        const char* v = std::getenv("PROSPER_GPU_CAPTURE_AFTER_MS");
+        return v ? std::strtoull(v, nullptr, 0) : 0ull;
+    }();
+    EnvCaptureWindow w;
+    w.requested = true;
+    w.legacy_readback = legacy;
+    w.invocations = g_env_capture_invocations.load(std::memory_order_acquire);
+    w.after = after;
+    const int64_t origin = g_env_capture_clock_start_ns.load(std::memory_order_acquire);
+    w.clock_started = origin != 0;
+    w.elapsed_ms = origin ? static_cast<uint64_t>((steady_now_ns() - origin) / 1000000) : 0;
+    w.after_ms = after_ms;
+    w.finished = g_env_capture_finished.load(std::memory_order_acquire);
+    return env_capture_requires_portable_compute(w);
+}
+
 void snapshot_pending_gpu_capture_compute_gds(PendingGpuCapture* pending,
                                               const uint8_t* data, size_t bytes) {
     if (!pending || pending->materialized || !data || !bytes) return;
@@ -1369,16 +1442,17 @@ std::unique_ptr<PendingGpuCapture> begin_requested_gpu_capture(
     if (output_triggered && g_output_capture_claimed.load(std::memory_order_acquire)) return {};
     uint64_t current = 0;
     if (!interactive) {
-        static std::atomic<uint64_t> invocation_sequence{0};
-        const uint64_t invocation = invocation_sequence.fetch_add(1);
+        const uint64_t invocation = g_env_capture_invocations.fetch_add(1);
         uint64_t after = 0;
         if (const char* v = std::getenv("PROSPER_GPU_CAPTURE_AFTER")) after = std::strtoull(v, nullptr, 0);
         if (invocation < after) return {};
-        static const auto capture_started = std::chrono::steady_clock::now();
+        // The AFTER_MS clock starts at the first invocation past AFTER.
+        int64_t expected_origin = 0;
+        g_env_capture_clock_start_ns.compare_exchange_strong(expected_origin, steady_now_ns());
         if (const char* v = std::getenv("PROSPER_GPU_CAPTURE_AFTER_MS")) {
             const uint64_t after_ms = std::strtoull(v, nullptr, 0);
-            const uint64_t elapsed_ms = static_cast<uint64_t>(std::chrono::duration_cast<
-                std::chrono::milliseconds>(std::chrono::steady_clock::now() - capture_started).count());
+            const uint64_t elapsed_ms = static_cast<uint64_t>(
+                (steady_now_ns() - g_env_capture_clock_start_ns.load()) / 1000000);
             if (elapsed_ms < after_ms) return {};
         }
         if (const char* value = std::getenv("PROSPER_GPU_CAPTURE_COMPUTE_ADDR")) {
@@ -1480,6 +1554,8 @@ std::unique_ptr<PendingGpuCapture> begin_requested_gpu_capture(
     }
     auto pending = std::make_unique<PendingGpuCapture>();
     pending->materialized = false;
+    pending->cpu_output_hold.activate();
+    pending->env_capture = !interactive;
     pending->path = interactive ? interactive_path : std::string(env_path);
     if (const char* selector = std::getenv(kGpuCaptureResourceProvenanceEnv);
         selector && *selector) {
@@ -1590,6 +1666,16 @@ bool finish_requested_gpu_capture(std::unique_ptr<PendingGpuCapture> pending,
                                   const GpuState* semantic_state,
                                   const std::vector<OperationRealizationFailure>* exact_failures) {
     if (!pending) return true;
+    // Close the environment capture window once its one-shot is settled, whichever way this returns:
+    // an AT/selector capture is claimed before begin returns, an output-triggered one only on a match.
+    struct EnvWindowCloser {
+        const PendingGpuCapture& pending;
+        ~EnvWindowCloser() {
+            if (pending.env_capture && (!pending.output_triggered ||
+                                        g_output_capture_claimed.load(std::memory_order_acquire)))
+                g_env_capture_finished.store(true, std::memory_order_release);
+        }
+    } env_window_closer{*pending};
     if (pending->output_triggered) {
         size_t nonzero = 0;
         if (!gpu_capture_output_nonzero_matches(output, pending->output_min_nonzero,

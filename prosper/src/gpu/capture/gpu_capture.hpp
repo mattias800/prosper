@@ -503,6 +503,33 @@ bool gpu_capture_output_nonzero_matches(const std::vector<uint8_t>& output, size
 const char* shader_program_stage_name(ShaderProgramStage stage);
 const char* realization_failure_reason_name(RealizationFailureReason reason);
 
+// While a runtime one-shot capture is pending (from begin_requested_gpu_capture until its
+// PendingGpuCapture is destroyed by finish_requested_gpu_capture), the submit being captured needs
+// its presented frame as CPU pixels: the capsule's output oracle, and the accept/reject input of an
+// output-triggered candidate. The live renderer keeps its targets GPU-resident regardless and only
+// routes that submit's present through the CPU path (#3895). Movable, not copyable; inert unless
+// activated, so hand-built pending captures in tests and tools do not engage it.
+class GpuCaptureCpuOutputHold {
+public:
+    GpuCaptureCpuOutputHold() = default;
+    ~GpuCaptureCpuOutputHold();
+    GpuCaptureCpuOutputHold(const GpuCaptureCpuOutputHold&) = delete;
+    GpuCaptureCpuOutputHold& operator=(const GpuCaptureCpuOutputHold&) = delete;
+    GpuCaptureCpuOutputHold(GpuCaptureCpuOutputHold&& other) noexcept : active_(other.active_) {
+        other.active_ = false;
+    }
+    GpuCaptureCpuOutputHold& operator=(GpuCaptureCpuOutputHold&& other) noexcept;
+    void activate();
+    bool active() const { return active_; }
+private:
+    bool active_ = false;
+};
+bool gpu_capture_requires_cpu_output();
+uint32_t gpu_capture_cpu_output_hold_count_for_test();
+// True while the PROSPER_GPU_CAPTURE window is open (see env_capture_requires_portable_compute):
+// capture-bound compute then compiles device-independent storage paths. False on a normal run.
+bool env_gpu_capture_requires_portable_compute();
+
 // Runtime hook used by execute_and_present. PROSPER_GPU_CAPTURE=<path> captures exactly one realized
 // submit. MIN_DRAWS/MAX_DRAWS, COMPUTE_ADDR, SHADER_ADDR, and TARGET_DIM select a candidate class;
 // PROSPER_GPU_CAPTURE_AT=N then selects the zero-based matching invocation (default first match).
@@ -531,6 +558,10 @@ struct PendingGpuCapture {
     std::string resource_provenance_error;
     GpuCaptureResourceProvenance resource_provenance;
     GpuCaptureBlob resource_provenance_realization_blob;
+    GpuCaptureCpuOutputHold cpu_output_hold;
+    // Created by the PROSPER_GPU_CAPTURE environment path (not an interactive grab or a hand-built
+    // pending capture); its completion closes the environment capture window.
+    bool env_capture = false;
 };
 bool parse_gpu_capture_resource_selector(std::string_view text,
                                          GpuCaptureResourceSelector& selector);
