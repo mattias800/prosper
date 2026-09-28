@@ -29,6 +29,7 @@
 
 #include "gpu/texture/bc_decode.hpp"
 #include "gpu/diagnostics/vk_object_names.hpp"   // #3578
+#include "gpu/diagnostics/watch_list.hpp"        // strict opt-in address trace
 #include "gpu/capture/gpu_capture.hpp"
 #include "gpu/diagnostics/gpu_memory_budget_vk.hpp"  // #3533: how much of the heap does prosper hold?
 #include "gpu/diagnostics/memory_placement_log.hpp"  // #3888: GPU-only images prefer VRAM
@@ -2937,18 +2938,30 @@ struct VulkanComputeContext {
     // was evicted or invalidated between writeback and here leaves the consumer with nothing to
     // borrow, and that is a different failure from an ineligible binding (#3307).
     bool authorize_cached_image_export(const ComputeImageCacheKey& key,
-                                       uint64_t producer_command_order) {
+                                       uint64_t producer_command_order,
+                                       double* watch_ms = nullptr,
+                                       bool* watch_had = nullptr,
+                                       bool* watch_rearmed = nullptr) {
         const auto found = image_cache.find(key);
         if (found == image_cache.end() || !found->second.content_valid || !found->second.image)
             return false;
         found->second.graphics_export_snapshot = prosper::gpu::guest_gpu_write_snapshot();
         found->second.graphics_export_command_order = producer_command_order;
         found->second.graphics_export_valid = true;
-        if (found->second.write_watch && !found->second.write_watch.rearm())
+        const auto watch_start = watch_ms ? std::chrono::steady_clock::now() :
+            std::chrono::steady_clock::time_point{};
+        const bool had_watch = static_cast<bool>(found->second.write_watch);
+        const bool rearmed = had_watch && found->second.write_watch.rearm();
+        if (had_watch && !rearmed)
             found->second.write_watch.reset();
         if (!found->second.write_watch)
             found->second.write_watch = prosper::host::GuestWriteWatch::create(
                 key.gpu_addr, key.guest_bytes);
+        if (watch_had) *watch_had = had_watch;
+        if (watch_rearmed) *watch_rearmed = rearmed;
+        if (watch_ms)
+            *watch_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - watch_start).count();
         return true;
     }
 
@@ -4056,6 +4069,9 @@ struct BoundImage {
     prosper::gpu::LiveTargetImageImport mirror_destination{};
     bool mirror_destination_revoked = false;
     bool mirror_destination_recorded = false;
+    // A read-only imported binding can sample the old image during this dispatch. The result copy
+    // then leaves that image in GENERAL for the import owner's ordinary layout restoration.
+    bool mirror_destination_shared_import = false;
     bool has_renderer_seed() const {
         return seed_from_imported != SIZE_MAX || standalone_seed.valid();
     }
@@ -7979,12 +7995,14 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     std::fprintf(stderr,
                                  "[compute]   direct RTT candidate binding=%u addr=0x%llx "
                                  "requested=f%u/c%u dim=%u extent=%ux%u available=%u "
+                                 "refusal=%s "
                                  "imported=%ux%u/%u kind=%s native=%u "
                                  "same-device=%u transfer-src=%u layout=%u "
                                  "code=0x%llx hash=0x%016llx\n",
                                  bi.binding, (unsigned long long)r->gpu_addr,
                                  (unsigned)r->format, r->num_components, r->img_dim,
                                  r->width, r->height, import_available ? 1u : 0u,
+                                 prosper::gpu::live_target_import_refusal_name(import.refusal),
                                  import.width, import.height, (unsigned)import.format,
                                  import.kind == LiveTargetImageImport::Kind::Depth
                                      ? "depth" : "color",
@@ -11141,9 +11159,23 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 const char* control = std::getenv("PROSPER_NO_COMPUTE_RTT_DEST_CREATE");
                 return !control || std::strcmp(control, "0") == 0;
             }();
+        static const bool read_alias_mirror_disabled =
+            std::getenv("PROSPER_NO_COMPUTE_RTT_READ_ALIAS") != nullptr;
+        static const std::vector<uint64_t> destination_trace_targets = [] {
+            std::vector<uint64_t> addresses;
+            const char* spec = std::getenv("PROSPER_COMPUTE_DEST_TRACE_ADDR");
+            if (spec && *spec && !prosper::gpu::parse_hex_watch_list(spec, addresses)) {
+                std::fprintf(stderr, "[compute-dest-target] malformed address selector\n");
+                addresses.clear();
+            }
+            return addresses;
+        }();
         if (!destination_mirror_disabled) for (size_t i = 0; i < images.size(); ++i) {
             BoundImage& bi = images[i];
             const ShaderResource* r = bi.resource;
+            const bool trace_destination = r &&
+                std::find(destination_trace_targets.begin(), destination_trace_targets.end(),
+                          r->gpu_addr) != destination_trace_targets.end();
             const bool basic_candidate = r && r->gpu_addr && !r->host_data &&
                 bi.storage_writeback &&
                 bi.alias_of == SIZE_MAX && bi.exact_storage_bytes() &&
@@ -11154,6 +11186,25 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 !r->in_mip_tail && !r->mip_chain_base_level && !r->layer_mip_offset_bytes &&
                 !r->linear_row_pitch_bytes && !r->layer_stride_bytes &&
                 r->width && r->height && staging[i];
+            if (trace_destination)
+                std::fprintf(stderr,
+                    "[compute-dest-target] code=0x%llx submit=%llu dispatch=%llu binding=%u "
+                    "addr=0x%llx basic=%u storage-writeback=%u host=%u alias=%u "
+                    "exact=%u mask=%u prior-conflict=%u final-conflict=%u "
+                    "format=%u comps=%u native-float=%u packed-r11=%u staging=%zu\n",
+                    (unsigned long long)item.code_addr,
+                    (unsigned long long)item.submit_no,
+                    (unsigned long long)item.dispatch_index, bi.binding,
+                    (unsigned long long)r->gpu_addr, basic_candidate ? 1u : 0u,
+                    bi.storage_writeback ? 1u : 0u, r->host_data ? 1u : 0u,
+                    bi.alias_of == SIZE_MAX ? 0u : 1u,
+                    bi.exact_storage_bytes() ? 1u : 0u,
+                    bi.storage_write_mask ? 1u : 0u,
+                    bi.prior_output_conflict ? 1u : 0u,
+                    bi.final_output_conflict ? 1u : 0u,
+                    static_cast<unsigned>(r->format), r->num_components,
+                    bi.native_float_storage ? 1u : 0u,
+                    bi.packed_r11_storage ? 1u : 0u, staging_bytes[i]);
             if (image_timing && perf_capture_timing && r && bi.storage_writeback)
                 std::fprintf(stderr,
                     "[compute-rtt-destination-check] code=0x%llx binding=%u "
@@ -11203,6 +11254,11 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 static_cast<void*>(ctx.device)};
             prosper::gpu::LiveTargetImageImport destination;
             if (!borrow_live_render_target_image_destination(r->gpu_addr, request, destination)) {
+                if (trace_destination)
+                    std::fprintf(stderr, "[compute-dest-target] binding=%u decline=%s\n",
+                                 bi.binding,
+                                 prosper::gpu::live_target_import_refusal_name(
+                                     destination.refusal));
                 // The census's `failed` counter never saw these: the old `continue` left before
                 // anything was recorded, so 8,268 of 11,621 candidates on one title vanished
                 // between "candidate" and "borrowed" with no reason and no count.
@@ -11216,8 +11272,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // target, then copy its completed result back into that SAME target. Keep two leases:
             // the source pin protects old pixels until the seed copy, and the destination pin
             // protects the allocation until guest writeback and final publication complete.
-            // Only exact native RGBA and packed R11 self-seeds are admitted here; unrelated
-            // sampled/imported aliases still cannot share a destination allocation.
+            // Only exact native RGBA and packed R11 self-seeds are admitted here. A separate
+            // read-only sampled import can share the destination only if it names this same
+            // allocation and its access ends before the result copy below.
             const bool own_seed_destination =
                 (*format == LiveTargetPixelFormat::Rgba8Unorm ||
                  *format == LiveTargetPixelFormat::Rgba16Float ||
@@ -11230,8 +11287,25 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 bi.standalone_seed.native_format == destination.native_format &&
                 bi.standalone_seed.layout == destination.layout;
             bool collides_with_source = false;
+            size_t colliding_index = SIZE_MAX;
+            bool shares_read_only_import = false;
             for (size_t other_index = 0; other_index < images.size(); ++other_index) {
                 const BoundImage& other = images[other_index];
+                if (other.imported && other.image == static_cast<VkImage>(destination.image)) {
+                    const bool ordered_read_alias = !read_alias_mirror_disabled &&
+                        own_seed_destination &&
+                        !destination.fresh_uninitialized && other_index != i &&
+                        other.alias_of == SIZE_MAX && !other.storage && !other.imported_depth &&
+                        other.imported_addr == r->gpu_addr &&
+                        other.imported_width == destination.width &&
+                        other.imported_height == destination.height &&
+                        other.imported_pixel_format == destination.format &&
+                        other.imported_saved_layout == destination.layout;
+                    if (ordered_read_alias) {
+                        shares_read_only_import = true;
+                        continue;
+                    }
+                }
                 if ((other.imported && other.image == static_cast<VkImage>(destination.image)) ||
                     (other.standalone_seed.valid() &&
                      other.standalone_seed.image == destination.image &&
@@ -11239,9 +11313,20 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     (other.mirror_destination.valid() &&
                      other.mirror_destination.image == destination.image)) {
                     collides_with_source = true;
+                    colliding_index = other_index;
                     break;
                 }
             }
+            if (trace_destination)
+                std::fprintf(stderr,
+                    "[compute-dest-target] binding=%u borrowed=1 own-seed=%u collision=%u "
+                    "other-binding=%u other-imported=%u other-seed=%u\n",
+                    bi.binding, own_seed_destination ? 1u : 0u,
+                    collides_with_source ? 1u : 0u,
+                    colliding_index == SIZE_MAX ? UINT32_MAX : images[colliding_index].binding,
+                    colliding_index != SIZE_MAX && images[colliding_index].imported ? 1u : 0u,
+                    colliding_index != SIZE_MAX &&
+                        images[colliding_index].standalone_seed.valid() ? 1u : 0u);
             if (image_timing && perf_capture_timing)
                 std::fprintf(stderr,
                     "[compute-rtt-destination-check] code=0x%llx binding=%u "
@@ -11260,6 +11345,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 continue;
             }
             bi.mirror_destination = destination;
+            bi.mirror_destination_shared_import = shares_read_only_import;
             mirror_census.borrowed.add();
         }
 
@@ -11893,7 +11979,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 to_dst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
                 to_dst.oldLayout = bi.mirror_destination.fresh_uninitialized
                     ? VK_IMAGE_LAYOUT_UNDEFINED
-                    : static_cast<VkImageLayout>(bi.mirror_destination.layout);
+                    : bi.mirror_destination_shared_import
+                        ? VK_IMAGE_LAYOUT_GENERAL
+                        : static_cast<VkImageLayout>(bi.mirror_destination.layout);
                 to_dst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
                 to_dst.srcQueueFamilyIndex = to_dst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
                 to_dst.image = static_cast<VkImage>(bi.mirror_destination.image);
@@ -11914,7 +12002,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 restore.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
                 restore.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
                 restore.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-                restore.newLayout = static_cast<VkImageLayout>(bi.mirror_destination.layout);
+                restore.newLayout = bi.mirror_destination_shared_import
+                    ? VK_IMAGE_LAYOUT_GENERAL
+                    : static_cast<VkImageLayout>(bi.mirror_destination.layout);
                 vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT,
                                      VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr,
                                      1, &restore);
@@ -13196,13 +13286,18 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         // also be exported directly to graphics. Raw interchange images are compatible with neither.
         for (const BoundImage& image : images) {
             if (!image.storage_writeback || image.final_output_conflict) continue;
+            const auto image_publish_start = image_timing ? ComputeClock::now() : ComputeClock::time_point{};
             const bool unique = image.alias_of == SIZE_MAX;
             const bool native_exact_storage = image.native_float_storage ||
                 image.native_uint_storage || image.packed_r11_storage;
             const bool publish_eligible = native_exact_storage && unique &&
                 image.cache_candidate && image.persistent;
+            const auto transfer_start = image_timing ? ComputeClock::now() : ComputeClock::time_point{};
             const bool authorized = publish_eligible &&
                 ctx.authorize_cached_image_compute_transfer(image.cache_key);
+            const double transfer_ms = image_timing
+                ? std::chrono::duration<double, std::milli>(ComputeClock::now() - transfer_start).count()
+                : 0.0;
             transfer_gate_census.record_storage_publish(
                 transfer_gate_observation.role, native_exact_storage, unique,
                 image.cache_candidate, image.persistent, authorized);
@@ -13218,9 +13313,20 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // every dispatch, exceeding the avoided conversion cost in the measured workload. Keep that path
             // disabled here: compute uses the existing journal (or Windows exact mirror), and
             // a borrower without current authority falls back to ordinary guest preparation.
+            const auto export_start = image_timing ? ComputeClock::now() : ComputeClock::time_point{};
+            double export_watch_ms = 0.0;
+            bool export_watch_had = false;
+            bool export_watch_rearmed = false;
             const bool graphics_export_authorized = publish_eligible &&
                 !image.renderer_seeded_result_candidate && image.graphics_sampled_usage &&
-                ctx.authorize_cached_image_export(image.cache_key, item.command_order);
+                ctx.authorize_cached_image_export(
+                    image.cache_key, item.command_order,
+                    image_timing ? &export_watch_ms : nullptr,
+                    image_timing ? &export_watch_had : nullptr,
+                    image_timing ? &export_watch_rearmed : nullptr);
+            const double export_ms = image_timing
+                ? std::chrono::duration<double, std::milli>(ComputeClock::now() - export_start).count()
+                : 0.0;
             // #3307: the producer half of the borrow partition. Without it, a consumer that finds
             // no cache entry cannot tell a producer that declined to publish from a producer that
             // published under a different key.
@@ -13233,6 +13339,22 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             publish_gates.export_authorized = graphics_export_authorized;
             g_image_borrow_census.record_publish(
                 prosper::frontend::classify_compute_image_publish(publish_gates));
+            if (image_timing && image.resource)
+                std::fprintf(stderr,
+                             "[compute-publish] code=0x%llx hash=0x%016llx binding=%u "
+                             "addr=0x%llx bytes=%zu eligible=%u transfer=%u export=%u "
+                             "transfer_ms=%.3f export_ms=%.3f export_watch_ms=%.3f "
+                             "watch-had=%u watch-rearmed=%u total_ms=%.3f\n",
+                             (unsigned long long)item.code_addr,
+                             (unsigned long long)timing_program_hash, image.binding,
+                             (unsigned long long)image.resource->gpu_addr, image.guest_bytes,
+                             publish_eligible ? 1u : 0u, authorized ? 1u : 0u,
+                             graphics_export_authorized ? 1u : 0u,
+                             transfer_ms, export_ms, export_watch_ms,
+                             export_watch_had ? 1u : 0u,
+                             export_watch_rearmed ? 1u : 0u,
+                             std::chrono::duration<double, std::milli>(
+                                 ComputeClock::now() - image_publish_start).count());
         }
         // Only completed architectural writebacks can authorize the destination image. This
         // includes exact GPU/CPU repeated-result branches: their guest bytes were already current,
@@ -13861,6 +13983,24 @@ bool import_live_compute_storage_image(const prosper::gpu::ShaderResource& sampl
                                        uint64_t guest_bytes,
                                        LiveComputeImageImport& import) {
     import = {};
+    static const std::vector<uint64_t> borrow_trace_targets = [] {
+        std::vector<uint64_t> addresses;
+        const char* spec = std::getenv("PROSPER_COMPUTE_BORROW_TARGET");
+        if (!spec || !*spec) return addresses;
+        if (!prosper::gpu::parse_hex_watch_list(spec, addresses)) {
+            std::fprintf(stderr,
+                         "[compute-borrow-target] malformed selector: expected nonzero "
+                         "0x-prefixed addresses; trace is NOT armed\n");
+            addresses.clear();
+        } else {
+            std::fprintf(stderr, "[compute-borrow-target] tracing %zu address(es)\n",
+                         addresses.size());
+        }
+        return addresses;
+    }();
+    const bool trace_borrow = !borrow_trace_targets.empty() &&
+        std::find(borrow_trace_targets.begin(), borrow_trace_targets.end(),
+                  sampled_resource.gpu_addr) != borrow_trace_targets.end();
     VulkanComputeContext* context = g_live_compute_context.load(std::memory_order_acquire);
     const bool ordinary_shape =
         ((sampled_resource.img_dim == 1 || sampled_resource.img_dim == 5) &&
@@ -13901,6 +14041,12 @@ bool import_live_compute_storage_image(const prosper::gpu::ShaderResource& sampl
     const prosper::frontend::ComputeImageImportDecline decline =
         prosper::frontend::classify_compute_image_import(gates);
     g_image_borrow_census.record_import(decline);
+    if (trace_borrow && decline != prosper::frontend::ComputeImageImportDecline::None)
+        std::fprintf(stderr,
+                     "[compute-borrow-target] addr=0x%llx bytes=%llu decline=%s\n",
+                     (unsigned long long)sampled_resource.gpu_addr,
+                     (unsigned long long)guest_bytes,
+                     prosper::frontend::compute_image_import_decline_name(decline));
     if (decline != prosper::frontend::ComputeImageImportDecline::None) return false;
     prosper::gpu::ShaderResource storage_identity = sampled_resource;
     if (cube_array_alias) storage_identity.img_dim = 5u; // exact producer DIM=2D_ARRAY identity
@@ -13966,6 +14112,18 @@ bool import_live_compute_storage_image(const prosper::gpu::ShaderResource& sampl
             key, sampled_resource, image, producer_command_order, &observation, /*scan_near_miss=*/false);
     }
     g_image_borrow_census.record_outcome(observation, guest_bytes);
+    if (trace_borrow)
+        std::fprintf(stderr,
+                     "[compute-borrow-target] addr=0x%llx bytes=%llu exact=%s final=%s "
+                     "borrowed=%u journal=%u submit-query=%u watch=%u watch-query=%u\n",
+                     (unsigned long long)sampled_resource.gpu_addr,
+                     (unsigned long long)guest_bytes,
+                     prosper::frontend::compute_image_borrow_outcome_name(
+                         exact_key_observation.outcome),
+                     prosper::frontend::compute_image_borrow_outcome_name(observation.outcome),
+                     borrowed ? 1u : 0u, observation.journal_armed ? 1u : 0u,
+                     observation.submit_query, observation.watch_present ? 1u : 0u,
+                     observation.watch_query);
     // Recorded after the retry, because whether the alias RESCUED this lookup decides whether its
     // fields belong in the census's field list at all. A rescued scan's mask necessarily names
     // `format` and `vk_format` -- that is the difference the retry exists to bridge -- so counting

@@ -727,3 +727,25 @@ the middle of the chain, which is why each read as a separate cost.
 **Independent corroboration of #3157 from a third title**: the compute-items census reports
 `calls=30276 items=30276` — exactly one item per call over 30,276 calls, so the batching that
 issue's correction says does not happen, measurably does not happen here either.
+
+#### After #3914: a read-only source alias still blocks publication
+
+#3914 implemented the compute-created destination described above. In Astro Bot's opening route,
+the remaining CPU RTT snapshots were counted by producer: 4,653 publications and 37.85 GiB of
+linear pixels over 82 seconds. One 3840×2160 RGBA16F producer accounted for 24.23 GiB, and a
+recurring 1920×1080 RGBA16F producer for 5.99 GiB. These are copied-byte counts, not elapsed
+critical-path time or an FPS estimate.
+
+The exact destination probe found the 4K and 1080p storage results eligible and their renderer
+images borrowable. Publication was then refused because each dispatch also had a read-only sampled
+binding to that same renderer image. Source pixels are sampled before the completed result copy,
+but the existing collision rule treats any other imported binding as a lifetime conflict. The
+sampled-first RGBA16F route already has a separate GPU mirror; the costly route prepares the
+storage output first, then imports the sampled binding. The narrow admission allows an exact
+read-only imported alias after an independently pinned self-seed. The fixture checks that the
+renderer receives *changed* output pixels in both binding orders, and focused strict synchronization
+validation reports no new hazard. Two same-binary opening-route pairs reduced CPU RTT snapshot
+volume per compute item from 1.183–1.195 MiB to 0.371 MiB. Selected dispatch timings varied in
+both directions, so that is a copied-byte result, not a supported latency or FPS gain.
+`PROSPER_COMPUTE_DEST_TRACE_ADDR` traces one or more `0x` guest addresses through this destination
+decision without enabling the RTT debug mode that disables GPU residency.

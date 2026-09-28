@@ -411,6 +411,12 @@ const DiagnosticAddressSelector& rtt_no_seed_target_selector() {
     return selector;
 }
 
+const DiagnosticAddressSelector& rtt_residency_trace_selector() {
+    static const DiagnosticAddressSelector selector =
+        parse_diagnostic_address_selector("PROSPER_RTT_RESIDENCY_TRACE");
+    return selector;
+}
+
 RendererMipChainLayout renderer_mip_chain_layout(uint64_t level_zero_address,
                                                  uint32_t width, uint32_t height,
                                                  uint32_t bytes_per_texel,
@@ -2406,6 +2412,39 @@ void render_per_target_passes(PerTargetPassContext& ctx,
             else
                 surface.rgba.reset();
         }
+        // A CPU-only RTT import can come from a producer that never retained an image,
+        // an invalidated image, or an evicted one. Trace only named addresses without
+        // enabling PROSPER_RTTLOG, which itself turns off the GPU-resident path.
+        const auto& residency_trace = rtt_residency_trace_selector();
+        if (residency_trace.configured && residency_trace.valid) {
+            for (uint32_t slot = 0; slot < mrt_count; ++slot) {
+                const uint64_t address = pass_bases[slot];
+                if (!address || !residency_trace.includes(address)) continue;
+                const auto found = g_rtt.find(address);
+                if (found == g_rtt.end()) continue;
+                const RttSurf& surface = found->second;
+                const auto* retained = prosper::test::find_persistent_color_target(
+                    address, surface.w, surface.h, pass_formats[slot], false,
+                    slot == 0 ? surface.volume_depth : 0);
+                std::fprintf(stderr,
+                    "[rtt-residency] submit=%llu pass=%zu slot=%u addr=0x%llx "
+                    "extent=%ux%u format=%u live=%u writes=%llu readbacks=%llu "
+                    "gpu-valid=%u cpu-bytes=%zu cached=%u cache-valid=%u "
+                    "cache-image=%u\n",
+                    (unsigned long long)g_pass_log_submit.load(
+                        std::memory_order_relaxed), pass_i, slot,
+                    (unsigned long long)address, surface.w, surface.h,
+                    static_cast<unsigned>(pass_formats[slot]),
+                    live_gpu_targets ? 1u : 0u,
+                    (unsigned long long)color_target_call.writes,
+                    (unsigned long long)color_target_call.readbacks,
+                    surface.gpu_valid ? 1u : 0u,
+                    surface.rgba ? surface.rgba->size() : 0u,
+                    retained ? 1u : 0u,
+                    retained && retained->valid ? 1u : 0u,
+                    retained && retained->image ? 1u : 0u);
+            }
+        }
         const auto post_mrt_done = timing_enabled
             ? RenderClock::now() : RenderClock::time_point{};
         const std::vector<uint8_t>& rendered_pixels = *pass_pixels;
@@ -3697,6 +3736,21 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
     prosper::gpu::set_live_target_image_written_notifier(
         [invalidate_ds](const prosper::gpu::LiveTargetImageWrite& write) {
             auto it = g_rtt.find(write.gpu_addr);
+            const auto& residency_trace = rtt_residency_trace_selector();
+            const bool trace_write = residency_trace.configured &&
+                residency_trace.includes(write.gpu_addr);
+            if (trace_write)
+                std::fprintf(stderr,
+                    "[rtt-residency] producer=compute addr=0x%llx extent=%ux%u "
+                    "format=%u linear-bytes=%zu mirrored=%u fresh=%u prior=%u "
+                    "prior-gpu-valid=%u\n",
+                    (unsigned long long)write.gpu_addr, write.width, write.height,
+                    static_cast<unsigned>(write.format),
+                    write.linear_pixels ? write.linear_pixels->size() : 0u,
+                    write.mirrored_image ? 1u : 0u,
+                    write.fresh_uninitialized ? 1u : 0u,
+                    it != g_rtt.end() ? 1u : 0u,
+                    it != g_rtt.end() && it->second.gpu_valid ? 1u : 0u);
             // A prior completion in this dispatch may have drained and erased this CPU registry
             // entry. An exact pinned destination image still proves which allocation was copied;
             // older address-only mirrors retain the stricter existing-entry requirement.
@@ -3746,6 +3800,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 published.format = format;
                 published.guest_format = format;
                 published.gpu_valid = false;
+                if (trace_write)
+                    std::fprintf(stderr,
+                                 "[rtt-residency] addr=0x%llx result=cpu-only\n",
+                                 (unsigned long long)write.gpu_addr);
                 return;
             }
             if (write.mirrored_image) {
@@ -3767,6 +3825,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             published.format = format;
             published.guest_format = format;
             published.gpu_valid = true;
+            if (trace_write)
+                std::fprintf(stderr,
+                             "[rtt-residency] addr=0x%llx result=gpu-valid\n",
+                             (unsigned long long)write.gpu_addr);
         });
     prosper::gpu::set_live_target_byte_range_reader(
         [invalidate_ds](uint64_t addr, uint32_t bytes, std::vector<uint8_t>& output) {
