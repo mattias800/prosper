@@ -371,6 +371,22 @@ void test_skipped_dispatches() {
     skip_dispatch(DispatchSkip::MissingProgram);
     check("...and counting resumes after it", skips() - n0 == 2);
 
+    // The backend outcome bracket: a refusal counts, a deliberate decline (the selector) does not.
+    {
+        const uint64_t before = skips(), declined = reason(DispatchSkip::BackendDeclined);
+        const BackendDispatchOutcome refused;
+        const bool refused_deliberate = refused.finish(false);
+        check("a backend refusal counts backend-declined",
+              !refused_deliberate && skips() - before == 1 &&
+                  reason(DispatchSkip::BackendDeclined) - declined == 1);
+        const BackendDispatchOutcome selector;
+        note_deliberate_dispatch_decline();
+        check("a deliberate decline inside the call is not counted, and is reported as deliberate",
+              selector.finish(false) && skips() - before == 1);
+        const BackendDispatchOutcome ran;
+        check("an executed dispatch is not counted", !ran.finish(true) && skips() - before == 1);
+    }
+
     // GTA V's missing world (#2481) was one declined compute program per frame.
     WindowSample bad = healthy();
     set_count(bad, Counter::SkippedDispatches, 150);

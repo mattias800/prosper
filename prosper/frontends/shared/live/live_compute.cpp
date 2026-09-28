@@ -6651,8 +6651,11 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     // the other instruments, so a run can answer "what would this program have been?" without also
     // running the dispatch that is under suspicion. That combination — dump the module, skip the
     // dispatch — is what lets a recompiler change be checked against a program that hangs the GPU.
-    if (!compute_skip_programs().empty() && compute_skip_programs().count(item.code_addr))
+    if (!compute_skip_programs().empty() && compute_skip_programs().count(item.code_addr)) {
+        // #3891: an experiment, not a refusal -- skipped-dispatches must not count it.
+        prosper::diagnostics::perf::note_deliberate_dispatch_decline();
         return decline("skipped-by-selector");
+    }
     if (item.required_subgroup_size &&
         (!ctx.borrowed || !ctx.native_subgroup_contract ||
          item.required_subgroup_size < ctx.min_native_subgroup_size ||

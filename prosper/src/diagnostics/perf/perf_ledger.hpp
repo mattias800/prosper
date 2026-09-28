@@ -57,8 +57,10 @@ enum class Cost : uint8_t {
     // One RDNA2 -> SPIR-V recompilation (a recompiler cache MISS; hits cost nothing here). Summed
     // over threads, like HleBlockingWait: parallel draw realization can compile on several.
     ShaderCompile,
-    // One Vulkan pipeline creation (graphics: shader modules + vkCreateGraphicsPipelines on a
-    // pipeline-cache miss; compute: vkCreateComputePipelines). The driver's own compile lives here.
+    // One Vulkan pipeline creation on a pipeline-cache miss: vkCreateGraphicsPipelines /
+    // vkCreateComputePipelines plus the wait for the driver-cache lock each takes (shader-module
+    // creation is NOT inside it). The driver's own compile lives here. Summed thread time, so
+    // threads queued on that lock each count their wait.
     PipelineCreate,
     Count
 };
@@ -156,8 +158,12 @@ constexpr const char* kDropReasonNames[kDropReasonCount] = {
 
 // WHY a compute dispatch prosper wanted to run did not run. A skipped dispatch leaves its output
 // stale or zero -- a LUT, an exposure value, a light list -- and, like a dropped draw, can make a
-// run look faster while rendering wrong. Deliberate declines (PROSPER_COMPUTE_SKIP_PROGRAM, the
-// parent-walk diagnostic) and a process with no compute backend at all are NOT counted.
+// run look faster while rendering wrong. NOT counted, each pinned by a test arm in
+// tests/gpu/execute/test_gpu_execute.cpp: deliberate declines (PROSPER_COMPUTE_SKIP_PROGRAM's
+// selector, reported through note_deliberate_dispatch_decline; the parent-walk diagnostic), every
+// indirect-dependency skip later in a submit that had a deliberate decline (the broken producer
+// epoch carries through parser stalls, so the causes cannot be separated there), and every
+// dispatch of a process with no compute backend at all.
 enum class DispatchSkip : uint8_t {
     MissingProgram = 0,     // no registered/readable shader at the program address
     ShaderRecompile,        // the recompiler produced no SPIR-V
@@ -258,6 +264,33 @@ inline void skip_dispatch(DispatchSkip reason) {
     add(Counter::SkippedDispatches);
     ledger().dispatch_skips[i].fetch_add(1, std::memory_order_relaxed);
 }
+
+// A DELIBERATE decline inside the compute backend (PROSPER_COMPUTE_SKIP_PROGRAM's selector) looks,
+// from the executor, exactly like a refusal: the backend returns false. The backend calls this on
+// the declining thread -- the executor calls the backend synchronously on its own thread -- and
+// BackendDispatchOutcome below tells the two apart by whether the count moved during the call.
+inline uint64_t& thread_deliberate_dispatch_declines() {
+    static thread_local uint64_t n = 0;
+    return n;
+}
+inline void note_deliberate_dispatch_decline() { ++thread_deliberate_dispatch_declines(); }
+
+// Brackets one call into the compute backend. finish(executed) counts a backend-declined skip only
+// for a refusal, and returns true when the dispatch was deliberately declined, so the caller can
+// also exempt what that decline caused (the later indirect dispatches whose producer epoch it
+// broke).
+class BackendDispatchOutcome {
+public:
+    BackendDispatchOutcome() : before_(thread_deliberate_dispatch_declines()) {}
+    bool finish(bool executed) const {
+        const bool deliberate = thread_deliberate_dispatch_declines() != before_;
+        if (!executed && !deliberate) skip_dispatch(DispatchSkip::BackendDeclined);
+        return deliberate;
+    }
+
+private:
+    uint64_t before_;
+};
 
 // Per-thread tally of texture references, for sites hot enough that even an uncontended atomic add
 // per reference is worth avoiding: increment here, flush with flush_thread_texture_references() at

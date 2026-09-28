@@ -70,9 +70,11 @@ constexpr uint64_t kDroppedDrawsPerWindow = 1;
 // output unwritten (GTA V's missing world was one declined program, #2481).
 constexpr uint64_t kSkippedDispatchesPerWindow = 1;
 
-// host-copy-pressure: bytes this process copies host-side on the guest's behalf (the default-on
-// [transfer-pressure] census's sites: CPU detile, render-target snapshots, storage-image
-// materialisation), per second. 256 MiB/s is that census's own HIGH line, which healthy titles sit
+// host-copy-pressure: bytes this process copies host-side on the guest's behalf, per second -- the
+// sum over EVERY default-on [transfer-pressure] category (storage-materialize, buffer-upload,
+// buffer-compare, rtt-snapshot, detile), the same total that census's HIGH line uses. Its
+// `breakdown` is in whole MiB per category, not a count like the correctness rules' breakdowns, so
+// its summary "breakdown over fired windows" is MiB too. 256 MiB/s is that census's own HIGH line, which healthy titles sit
 // far below (GTA V on main: ~80 MiB/s over a whole route) and every defect it was written against
 // far above (a static splash copying 770 MiB/s; Astro Bot's compute round trip at ~2 GiB/s, #3871).
 constexpr double kHostCopyMiBPerSecond = 256.0;

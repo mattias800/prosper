@@ -56,9 +56,9 @@ public:
     AlarmEngine(const AlarmEngine&) = delete;
     AlarmEngine& operator=(const AlarmEngine&) = delete;
 
-    // Running totals kept OUTSIDE the ledger by existing default-on censuses, read only when a
-    // window closes (so they cost the hot path nothing extra). The process entry point fills it from
-    // transfer_pressure; a test passes its own.
+    // Running totals kept OUTSIDE the ledger by existing default-on censuses. The process entry
+    // point fills it from transfer_pressure on every flip (five relaxed loads) and only a window
+    // close uses it; a test passes its own.
     struct ExternalTotals {
         uint64_t transfer_bytes[WindowSample::kTransferCount] = {};
     };

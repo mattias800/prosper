@@ -9365,10 +9365,9 @@ OrderedSubmitResult execute_ordered_items_impl(const std::vector<SubmitOperation
         } else if (operation.kind == ExecutableKind::Dispatch) {
             flush_span();
             if (compute) {
+                const prosper::diagnostics::perf::BackendDispatchOutcome outcome;
                 const bool executed = compute({computes[operation.item]});
-                if (!executed)
-                    prosper::diagnostics::perf::skip_dispatch(
-                        prosper::diagnostics::perf::DispatchSkip::BackendDeclined);
+                outcome.finish(executed);
                 result.compute_executed |= executed;
             }
         } else {
@@ -10770,6 +10769,9 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
     const float scale_y = full_height ? static_cast<float>(height) / full_height : 1.0f;
     OrderedSubmitResult result;
     bool producer_epoch_ok = true;
+    // #3891: set for the rest of the submit once a DELIBERATE decline (selector, parent walk) broke
+    // a producer epoch, so the indirect dispatches it strands are not counted as skipped-dispatches.
+    bool epoch_broken_deliberately = false;
     bool indirect_dependencies_ok = true;
     bool final_callback_sent = false;
     uint64_t previous_compute_code = 0;
@@ -11121,8 +11123,13 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                     notify_compute_authority_unknown(
                         ComputeAuthorityBoundaryKind::Compute,
                         submit_no, operation.command_order);
-                    prosper::diagnostics::perf::skip_dispatch(
-                        prosper::diagnostics::perf::DispatchSkip::IndirectDependencies);
+                    // #3891: not counted when there is no compute backend at all, nor after a
+                    // DELIBERATE decline earlier in this submit (the selector, the parent walk):
+                    // the poison carries through parser stalls, so from here the two causes cannot
+                    // be told apart, and an experiment must not raise a correctness alarm.
+                    if (compute && !epoch_broken_deliberately)
+                        prosper::diagnostics::perf::skip_dispatch(
+                            prosper::diagnostics::perf::DispatchSkip::IndirectDependencies);
                     if (capture_trace) {
                         capture_trace->failures.push_back({
                             SubmitOperationKind::Dispatch, operation.index,
@@ -11152,8 +11159,9 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                     notify_compute_authority_unknown(
                         ComputeAuthorityBoundaryKind::Compute,
                         submit_no, operation.command_order);
-                    prosper::diagnostics::perf::skip_dispatch(
-                        prosper::diagnostics::perf::DispatchSkip::IndirectArguments);
+                    if (compute)   // #3891: no backend, nothing prosper wanted to run
+                        prosper::diagnostics::perf::skip_dispatch(
+                            prosper::diagnostics::perf::DispatchSkip::IndirectArguments);
                     if (capture_trace) {
                         // A dispatch's indirect arguments fail exactly as a draw's do; recording it
                         // as Unknown was the documented gap in the reason enum, not a distinct case.
@@ -11316,6 +11324,7 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                                 RealizationFailureReason::SuspiciousDispatchSkipped});
                         }
                         producer_epoch_ok = false;
+                        epoch_broken_deliberately = true;
                         previous_compute_code = current_compute_code;
                         previous_compute_realized = true;
                         previous_compute_executed = false;
@@ -11382,11 +11391,10 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                     const std::vector<uint32_t> tree_watch_pre =
                         observe_compute_tree_watch_pre(item, submit_no, operation.index,
                                                        operation.command_order, tree_watch_touch);
+                    const prosper::diagnostics::perf::BackendDispatchOutcome outcome;
                     const bool executed = capture_trace
                         ? compute({item}) : compute({std::move(item)});
-                    if (!executed)
-                        prosper::diagnostics::perf::skip_dispatch(
-                            prosper::diagnostics::perf::DispatchSkip::BackendDeclined);
+                    epoch_broken_deliberately |= outcome.finish(executed);
                     log_compute_dispatch(tree_watch_program, submit_no, operation.index,
                                          operation.command_order,
                                          executed ? "executed" : "backend-declined",

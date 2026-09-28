@@ -44,7 +44,8 @@ std::string top_entries(const std::vector<std::pair<const char*, uint64_t>>& bre
         if (!out.empty()) out += ',';
         out += format("%s:%llu", breakdown[i].first, (unsigned long long)breakdown[i].second);
     }
-    if (breakdown.size() > top) out += format("(+%zu more)", breakdown.size() - top);
+    if (breakdown.size() > top) out += format("(+%llu more)",
+                                                      (unsigned long long)(breakdown.size() - top));
     return out.empty() ? "none" : out;
 }
 

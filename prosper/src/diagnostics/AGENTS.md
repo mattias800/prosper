@@ -169,7 +169,12 @@ window.
 window (`reasons=render-array-reject/depth-unavailable:276`) from `perf::DropReason`: one code per
 `built.reject(...)` site in the live renderer's resource builder, `contract-mismatch`, and
 `backend/*` mirroring `gpu::DrawDrop` (`draw_disposition.cpp` static_asserts the mirror).
-`skipped-dispatches` does the same with `perf::DispatchSkip`. A new drop site must pass a reason;
+`skipped-dispatches` does the same with `perf::DispatchSkip`, and its exclusions are code, not
+prose: a deliberate backend decline (the `PROSPER_COMPUTE_SKIP_PROGRAM` selector calls
+`note_deliberate_dispatch_decline()`, which `BackendDispatchOutcome` checks), the parent-walk
+diagnostic, indirect-dependency skips after either in the same submit, and every dispatch of a
+process with no compute backend are not counted — each pinned by an arm in `test_gpu_execute`.
+`host-copy-pressure`'s breakdown is whole MiB per `[transfer-pressure]` category, not a count. A new drop site must pass a reason;
 one that sets `complete = false` directly shows up as `unattributed`, which is the instrument naming
 its own blind spot, not a finding about the title. Re-realizations that are not live execution (an
 F9 capture) wrap themselves in `SuppressDispatchSkipCounting` so that capturing a frame cannot raise
