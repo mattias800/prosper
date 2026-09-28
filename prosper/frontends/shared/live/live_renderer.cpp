@@ -2185,14 +2185,30 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             }
             const prosper::test::RenderVkCtx& ctx = prosper::test::render_vk_ctx();
             if (!ctx.ok) { destination.refusal = prosper::gpu::LiveTargetImageImport::Refusal::NoRenderContext; return false; }
+            if (request.allow_create && request.device != static_cast<void*>(ctx.dev)) {
+                destination.refusal = prosper::gpu::LiveTargetImageImport::Refusal::DeviceMismatch;
+                return false;
+            }
             auto* target = prosper::test::find_persistent_color_target(
                 addr, request.width, request.height, format, false);
-            if (!target || !target->image || target->layout == VK_IMAGE_LAYOUT_UNDEFINED) {
+            if ((!target || !target->image) && request.allow_create) {
+                target = prosper::test::ensure_persistent_color_target_for_compute_overwrite(
+                    addr, request.width, request.height, format);
+                if (!target) {
+                    destination.refusal = prosper::gpu::LiveTargetImageImport::Refusal::
+                        DestinationCreationRefused;
+                    return false;
+                }
+            }
+            if (!target || !target->image ||
+                (target->layout == VK_IMAGE_LAYOUT_UNDEFINED &&
+                 (!request.allow_create || !target->compute_overwrite_uninitialized))) {
                 destination.refusal = prosper::gpu::LiveTargetImageImport::Refusal::NoPersistentImage;
                 return false;
             }
+            const bool fresh_uninitialized = target->layout == VK_IMAGE_LAYOUT_UNDEFINED;
             if (!prosper::test::pin_persistent_color_target_for_overwrite(
-                    addr, request.width, request.height, format)) {
+                    addr, request.width, request.height, format, fresh_uninitialized)) {
                 destination.refusal = prosper::gpu::LiveTargetImageImport::Refusal::PinRefused;
                 return false;
             }
@@ -2211,7 +2227,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             destination.native_format = static_cast<uint32_t>(format);
             destination.image = target->image;
             destination.device = ctx.dev;
-            destination.layout = static_cast<uint32_t>(target->layout);
+            destination.layout = static_cast<uint32_t>(fresh_uninitialized
+                ? VK_IMAGE_LAYOUT_GENERAL : target->layout);
+            destination.fresh_uninitialized = fresh_uninitialized;
             destination.transfer_dst = true; // persistent color images have TRANSFER_DST usage
             return true;
         },
@@ -2241,6 +2259,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             // whole Syberia black-3D-menu defect, and #773 in a different format.
             const VkFormat format = prosper::frontend::live_target_pixel_format_vk(write.format);
             if (format == VK_FORMAT_UNDEFINED) return;
+            if (write.fresh_uninitialized && !write.mirrored_image) return;
             if (it != g_rtt.end() && !write.linear_pixels &&
                 !prosper::frontend::live_rtt_mirror_identity_matches(
                     it->first, it->second.w, it->second.h,
@@ -2286,7 +2305,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 if (!target || target->image != write.mirrored_image) return;
             }
             if (!prosper::test::restore_persistent_color_target_after_mirrored_write(
-                    write.gpu_addr, write.width, write.height, format)) {
+                    write.gpu_addr, write.width, write.height, format,
+                    write.fresh_uninitialized)) {
                 return;
             }
             RttSurf& published = g_rtt[write.gpu_addr];

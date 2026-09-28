@@ -1294,6 +1294,8 @@ struct LiveTargetImageImport {
         // renderer's device image.
         ExtentMismatch,
         FormatMismatch,
+        DeviceMismatch, // a compute-only device cannot own a renderer allocation
+        DestinationCreationRefused, // no room or Vulkan allocation/setup failed; CPU path remains
         Count,
     };
     Refusal refusal = Refusal::None;
@@ -1305,7 +1307,10 @@ struct LiveTargetImageImport {
     uint32_t native_format = 0;
     void* image = nullptr;    // VkImage owned by the live renderer
     void* device = nullptr;   // VkDevice it belongs to; the caller must be running on that device
-    uint32_t layout = 0;      // VkImageLayout the renderer left it in -- restore it after the dispatch
+    uint32_t layout = 0;      // VkImageLayout to leave after the dispatch
+    // A destination-only borrow may allocate an image whose contents and layout are undefined.
+    // Its full overwrite starts from UNDEFINED and finishes in `layout`; it never grants a read.
+    bool fresh_uninitialized = false;
     // Explicit image-creation contract: a sampled import is not otherwise guaranteed to carry
     // VK_IMAGE_USAGE_TRANSFER_DST_BIT, which the compute-result mirror requires.
     bool transfer_dst = false;
@@ -1333,6 +1338,9 @@ constexpr const char* live_target_import_refusal_name(LiveTargetImageImport::Ref
         case LiveTargetImageImport::Refusal::ImporterReturnedInvalid: return "importer-invalid";
         case LiveTargetImageImport::Refusal::ExtentMismatch: return "extent-mismatch";
         case LiveTargetImageImport::Refusal::FormatMismatch: return "format-mismatch";
+        case LiveTargetImageImport::Refusal::DeviceMismatch: return "device-mismatch";
+        case LiveTargetImageImport::Refusal::DestinationCreationRefused:
+            return "destination-creation-refused";
         case LiveTargetImageImport::Refusal::Count: break;   // not a reason
     }
     return "unknown";
@@ -1352,6 +1360,10 @@ struct LiveTargetImageRequest {
 struct LiveTargetImageDestinationRequest {
     uint32_t width = 0, height = 0;
     LiveTargetPixelFormat format = LiveTargetPixelFormat::Rgba8Unorm;
+    // Only an exact, full-overwrite compute result may create a missing renderer allocation.
+    bool allow_create = false;
+    // The requesting compute VkDevice. A separate device must decline before allocating.
+    void* device = nullptr;
 };
 using LiveTargetImageImportFn = std::function<bool(
     uint64_t gpu_addr, const LiveTargetImageRequest& request, LiveTargetImageImport& import)>;
@@ -1369,6 +1381,9 @@ struct LiveTargetImageWrite {
     // An exact destination mirror names the actual pinned image. The renderer must not restore
     // authority to another allocation that reused the same address/shape before notification.
     void* mirrored_image = nullptr;
+    // Successful full overwrite of an image initially in UNDEFINED. The exact-image check in the
+    // renderer still applies before it grants the newly initialized image read authority.
+    bool fresh_uninitialized = false;
     bool valid() const { return gpu_addr && width && height; }
 };
 using LiveTargetImageWrittenFn = std::function<void(const LiveTargetImageWrite& write)>;
