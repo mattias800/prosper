@@ -11136,6 +11136,11 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         static const bool destination_mirror_disabled =
             std::getenv("PROSPER_NO_COMPUTE_RTT_DEST_MIRROR") != nullptr ||
             std::getenv("PROSPER_NO_STANDALONE_RTT_SEED") != nullptr;
+        static const bool destination_creation_enabled =
+            [] {
+                const char* control = std::getenv("PROSPER_NO_COMPUTE_RTT_DEST_CREATE");
+                return !control || std::strcmp(control, "0") == 0;
+            }();
         if (!destination_mirror_disabled) for (size_t i = 0; i < images.size(); ++i) {
             BoundImage& bi = images[i];
             const ShaderResource* r = bi.resource;
@@ -11194,7 +11199,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     (unsigned long long)totals.rgba16_source_seed_recorded);
             }
             const prosper::gpu::LiveTargetImageDestinationRequest request{
-                r->width, r->height, *format};
+                r->width, r->height, *format, destination_creation_enabled,
+                static_cast<void*>(ctx.device)};
             prosper::gpu::LiveTargetImageImport destination;
             if (!borrow_live_render_target_image_destination(r->gpu_addr, request, destination)) {
                 // The census's `failed` counter never saw these: the old `continue` left before
@@ -11882,14 +11888,20 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
                     VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &linear_ready, 0, nullptr);
                 VkImageMemoryBarrier to_dst{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-                to_dst.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+                to_dst.srcAccessMask = bi.mirror_destination.fresh_uninitialized
+                    ? 0u : VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
                 to_dst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-                to_dst.oldLayout = static_cast<VkImageLayout>(bi.mirror_destination.layout);
+                to_dst.oldLayout = bi.mirror_destination.fresh_uninitialized
+                    ? VK_IMAGE_LAYOUT_UNDEFINED
+                    : static_cast<VkImageLayout>(bi.mirror_destination.layout);
                 to_dst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
                 to_dst.srcQueueFamilyIndex = to_dst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
                 to_dst.image = static_cast<VkImage>(bi.mirror_destination.image);
                 to_dst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-                vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                vkCmdPipelineBarrier(command,
+                                     bi.mirror_destination.fresh_uninitialized
+                                         ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
+                                         : VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                                      VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr,
                                      1, &to_dst);
                 VkBufferImageCopy region{};
@@ -13238,7 +13250,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             notify_live_render_target_image_written({
                 r.gpu_addr, image.mirror_destination.width,
                 image.mirror_destination.height, image.mirror_destination.format, {},
-                image.mirror_destination.image});
+                image.mirror_destination.image,
+                image.mirror_destination.fresh_uninitialized});
             rtt_destination_census().published.add();
             if (trace)
                 std::fprintf(stderr,

@@ -2959,6 +2959,9 @@ struct PersistentColorTargetImage {
     bool valid = false;
     // #3905: placed off device-local memory by the #3897 fallback; recovery evicts it.
     bool off_device = false;
+    // Only the compute destination allocator may set this. An unrelated graphics allocation
+    // with UNDEFINED layout must never be mistaken for a completed full-overwrite candidate.
+    bool compute_overwrite_uninitialized = false;
     // A partial volume pass establishes only the slices in its attachment view. Direct 3D
     // sampling requires every slice; an invalidated or discarded pass clears the whole proof.
     std::vector<uint8_t> valid_volume_slices;
@@ -3437,10 +3440,12 @@ inline bool pin_persistent_color_target(uint64_t id, uint32_t width, uint32_t he
 // A full overwrite can use the exact old allocation even after guest-write invalidation. This
 // pin grants no read authority: callers must replace every texel before marking it valid again.
 inline bool pin_persistent_color_target_for_overwrite(
-    uint64_t id, uint32_t width, uint32_t height, VkFormat format) {
+    uint64_t id, uint32_t width, uint32_t height, VkFormat format,
+    bool allow_uninitialized = false) {
     PersistentColorTargetImage* target = find_persistent_color_target(
         id, width, height, backend_color_format(format), false);
-    if (!target || !target->image || target->layout == VK_IMAGE_LAYOUT_UNDEFINED ||
+    if (!target || !target->image ||
+        (!allow_uninitialized && target->layout == VK_IMAGE_LAYOUT_UNDEFINED) ||
         target->pin_count == UINT32_MAX) return false;
     ++target->pin_count;
     return true;
@@ -3515,11 +3520,21 @@ inline size_t invalidate_persistent_color_target_guest_write(uint64_t addr, uint
 // one borrowed renderer target. Normal guest-write invalidation runs first so every overlapping alias
 // becomes stale; only the image proven to have received that result may then regain authority.
 inline bool restore_persistent_color_target_after_mirrored_write(
-    uint64_t id, uint32_t width, uint32_t height, VkFormat format) {
+    uint64_t id, uint32_t width, uint32_t height, VkFormat format,
+    bool fresh_uninitialized = false) {
     invalidate_persistent_color_target_dimension_aliases(id, width, height, format, 0u);
     PersistentColorTargetImage* target = find_persistent_color_target(
         id, width, height, backend_color_format(format), false);
-    if (!target || !target->image || target->layout == VK_IMAGE_LAYOUT_UNDEFINED) return false;
+    if (!target || !target->image ||
+        (target->layout == VK_IMAGE_LAYOUT_UNDEFINED &&
+         (!fresh_uninitialized || !target->compute_overwrite_uninitialized))) return false;
+    // The caller reports this only after a completed full buffer-to-image copy and its final
+    // TRANSFER_DST -> GENERAL barrier. Before that point an allocated image has no read authority.
+    if (fresh_uninitialized) {
+        if (target->layout != VK_IMAGE_LAYOUT_UNDEFINED) return false;
+        target->layout = VK_IMAGE_LAYOUT_GENERAL;
+    }
+    target->compute_overwrite_uninitialized = false;
     target->valid = true;
     // A mirrored compute write has completed, but this path does not yet carry its own producer
     // identity. It must not inherit a renderer version from the overwritten allocation.
@@ -4333,6 +4348,98 @@ inline VkResult render_allocate_gpu_only_memory(VkPhysicalDevice phys, VkDevice 
     VkPhysicalDeviceMemoryProperties properties{};
     vkGetPhysicalDeviceMemoryProperties(phys, &properties);
     return prosper::gpu::allocate_gpu_only_memory(device, cls, properties, bits, info, out);
+}
+
+// Reserve a renderer-owned destination for a byte-exact compute overwrite. The old contents are
+// never read. Do not evict here: a graphics batch may still refer to an unpinned target, whereas
+// the ordinary render path knows whether its batch has completed. Budget or allocation refusal
+// simply leaves compute's existing CPU-snapshot path in charge of the pixels.
+inline PersistentColorTargetImage* ensure_persistent_color_target_for_compute_overwrite(
+        uint64_t id, uint32_t width, uint32_t height, VkFormat format) {
+    const BackendPersistentResourceGuard guard;
+    if (!id || !width || !height || backend_has_unproven_submission()) return nullptr;
+    const RenderVkCtx& ctx = render_vk_ctx();
+    if (!ctx.ok) return nullptr;
+    format = backend_color_format(format);
+    const PersistentColorTargetKey key{id, width, height, format};
+    auto& cache = persistent_color_target_cache();
+    auto [found, inserted] = cache.try_emplace(key);
+    PersistentColorTargetImage& target = found->second;
+    if (target.image) return &target;
+    const auto fail = [&]() -> PersistentColorTargetImage* {
+        if (inserted) cache.erase(key);
+        return nullptr;
+    };
+    if (target.pin_count || target.memory || target.view || target.bytes) return fail();
+
+    VkImageCreateInfo image_info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    image_info.imageType = VK_IMAGE_TYPE_2D;
+    image_info.format = format;
+    image_info.extent = {width, height, 1};
+    image_info.mipLevels = 1;
+    image_info.arrayLayers = 1;
+    image_info.samples = VK_SAMPLE_COUNT_1_BIT;
+    image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    image_info.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                       VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    VkImage image = VK_NULL_HANDLE;
+    if (vkCreateImage(ctx.dev, &image_info, nullptr, &image) != VK_SUCCESS || !image)
+        return fail();
+    VkMemoryRequirements requirements{};
+    vkGetImageMemoryRequirements(ctx.dev, image, &requirements);
+    const VkDeviceSize limit = persistent_color_target_limit();
+    if (requirements.size > limit ||
+        persistent_color_target_bytes() > limit - requirements.size ||
+        cache.size() > persistent_color_target_count_ceiling(false)) {
+        vkDestroyImage(ctx.dev, image, nullptr);
+        return fail();
+    }
+    VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    allocation.allocationSize = requirements.size;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    if (render_allocate_gpu_only_memory(
+            ctx.phys, ctx.dev, prosper::gpu::GpuOnlyMemoryClass::PersistentColorTarget,
+            requirements.memoryTypeBits, allocation, &memory) != VK_SUCCESS || !memory) {
+        vkDestroyImage(ctx.dev, image, nullptr);
+        return fail();
+    }
+    if (vkBindImageMemory(ctx.dev, image, memory, 0) != VK_SUCCESS) {
+        vkDestroyImage(ctx.dev, image, nullptr);
+        prosper::gpu::free_device_memory(ctx.dev, memory);
+        return fail();
+    }
+    VkImageViewCreateInfo view_info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    view_info.image = image;
+    view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    view_info.format = format;
+    view_info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    VkImageView view = VK_NULL_HANDLE;
+    if (vkCreateImageView(ctx.dev, &view_info, nullptr, &view) != VK_SUCCESS || !view) {
+        vkDestroyImage(ctx.dev, image, nullptr);
+        prosper::gpu::free_device_memory(ctx.dev, memory);
+        return fail();
+    }
+    target.image = image;
+    target.memory = memory;
+    target.view = view;
+    target.layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    target.valid = false;
+    target.compute_overwrite_uninitialized = true;
+    target.bytes = requirements.size;
+    VkPhysicalDeviceMemoryProperties properties{};
+    vkGetPhysicalDeviceMemoryProperties(ctx.phys, &properties);
+    note_persistent_color_target_placement(target, properties, allocation.memoryTypeIndex);
+    target.registration = prosper::frontend::next_producer_identity();
+    target.mutation = 0;
+    target.completed_producer = {};
+    target.planned_batch = nullptr;
+    target.planned_ticket = {};
+    target.planned_producer = {};
+    target.valid_volume_slices.clear();
+    target.volume_guest_bytes = 0;
+    target.last_use = ++persistent_color_target_generation();
+    persistent_color_target_bytes() += requirements.size;
+    return &target;
 }
 
 // Storage-buffer contents are rewritten for every synchronous render call, but their Vulkan object
@@ -7097,6 +7204,7 @@ inline bool copy_persistent_color_target(uint64_t src_id, uint64_t dst_id, uint3
         // or LOAD the result. Public producer lineage remains empty until completion proves the copy.
         dst->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         dst->valid = true;
+        dst->compute_overwrite_uninitialized = false;
         queue_color_producer_completion(
             *submission_batch, *dst, copy_ticket, copied_producer);
         submission_batch->add_failure_cleanup(
@@ -7153,6 +7261,7 @@ inline bool copy_persistent_color_target(uint64_t src_id, uint64_t dst_id, uint3
     cleanup();
     dst->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     dst->valid = true;
+    dst->compute_overwrite_uninitialized = false;
     if (color_producer_ticket_matches(*dst, copy_ticket))
         dst->completed_producer = copied_producer;
     return true;
@@ -8825,6 +8934,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         }
         auto [found, inserted] = persistent_color_target_cache().try_emplace(color_key);
         cached_color = &found->second;
+        cached_color->compute_overwrite_uninitialized = false;
         if (volume_color) {
             const uint64_t guest_bytes = color_target->volume_guest_bytes;
             if (cached_color->volume_guest_bytes && guest_bytes &&
@@ -9007,6 +9117,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         color_key1 = {color_target->persistent_id1, W, H, FMT1};
         auto [found, inserted] = persistent_color_target_cache().try_emplace(color_key1);
         cached_color1 = &found->second;
+        cached_color1->compute_overwrite_uninitialized = false;
         cached_color1->last_use = color_target_generation;
     }
 
@@ -9123,6 +9234,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             auto [found, inserted] = persistent_color_target_cache().try_emplace(extra_keys[slot]);
             (void)inserted;
             cached_extra[slot] = &found->second;
+            cached_extra[slot]->compute_overwrite_uninitialized = false;
             cached_extra[slot]->last_use = color_target_generation;
             extra_images[slot] = cached_extra[slot]->image;
             extra_memories[slot] = cached_extra[slot]->memory;

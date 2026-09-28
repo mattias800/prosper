@@ -959,6 +959,233 @@ static int run_destination_mirror_regression() {
               collision_target->layout == collision_layout &&
               collision_target->pin_count == collision_renderer_pins,
           "rejected R11 destination releases imports and preserves image layout");
+
+    // A compute-owned output can reach the renderer first as CPU pixels, without any graphics
+    // pass having allocated its image. A full overwrite must be able to create that destination;
+    // failure must leave it unreadable, and only completed guest writeback may publish it.
+    std::vector<uint8_t> cold_guest(W * H * 4, 0x39);
+    const uint64_t cold_address = reinterpret_cast<uint64_t>(cold_guest.data());
+    auto cold_cpu = std::make_shared<std::vector<uint8_t>>(cold_guest);
+    notify_live_render_target_image_written(
+        {cold_address, W, H, LiveTargetPixelFormat::Rgba8Unorm, std::move(cold_cpu)});
+    CHECK(!prosper::test::find_persistent_color_target(
+              cold_address, W, H, VK_FORMAT_R8G8B8A8_UNORM, false),
+          "CPU-only RTT has no renderer image before compute destination admission");
+    LiveTargetImageImport cold_borrow;
+    CHECK(!borrow_live_render_target_image_destination(
+              cold_address, {W, H, LiveTargetPixelFormat::Rgba8Unorm}, cold_borrow) &&
+              cold_borrow.refusal == LiveTargetImageImport::Refusal::NoPersistentImage,
+          "ordinary destination request cannot create an image implicitly");
+    ShaderResourceTable cold_table = table;
+    cold_table.resources[0].gpu_addr = cold_address;
+    ComputeItem cold_item = item;
+    cold_item.resources = std::make_shared<ShaderResourceTable>(cold_table);
+    cold_item.code_addr = 0x37310016u;
+    prosper::frontend::live_compute_fail_next_storage_readback_for_test();
+    const auto cold_failed_before =
+        prosper::frontend::live_compute_rtt_destination_mirror_counters();
+    CHECK(!prosper::frontend::execute_live_compute_items({cold_item}),
+          "newly allocated destination reports failed compute completion");
+    const auto cold_failed_after =
+        prosper::frontend::live_compute_rtt_destination_mirror_counters();
+    const auto* cold_target = prosper::test::find_persistent_color_target(
+        cold_address, W, H, VK_FORMAT_R8G8B8A8_UNORM, false);
+    CHECK(cold_failed_after.recorded == cold_failed_before.recorded + 1 &&
+              cold_failed_after.published == cold_failed_before.published &&
+              cold_target && cold_target->image && !cold_target->valid &&
+              cold_target->layout == VK_IMAGE_LAYOUT_UNDEFINED && !cold_target->pin_count &&
+              !import_live_render_target_image(cold_address, source_request, source_import),
+          "failed first overwrite retains no GPU read authority or lease");
+    CHECK(cold_target && cold_target->compute_overwrite_uninitialized,
+          "only the compute allocator tags its uninitialized destination for retry");
+    if (cold_target) {
+        auto* mutable_target = prosper::test::find_persistent_color_target(
+            cold_address, W, H, VK_FORMAT_R8G8B8A8_UNORM, false);
+        mutable_target->compute_overwrite_uninitialized = false;
+        LiveTargetImageImport unrelated_undefined;
+        CHECK(!borrow_live_render_target_image_destination(
+                  cold_address, {W, H, LiveTargetPixelFormat::Rgba8Unorm, true,
+                                 static_cast<void*>(prosper::test::render_vk_ctx().dev)},
+                  unrelated_undefined) &&
+                  unrelated_undefined.refusal ==
+                      LiveTargetImageImport::Refusal::NoPersistentImage,
+              "creation permission does not borrow an unrelated undefined-layout image");
+        mutable_target->compute_overwrite_uninitialized = true;
+    }
+    const VkImage cold_image = cold_target ? cold_target->image : VK_NULL_HANDLE;
+    const auto cold_before = prosper::frontend::live_compute_rtt_destination_mirror_counters();
+    CHECK(prosper::frontend::execute_live_compute_items({cold_item}),
+          "retry overwrites the reserved renderer image from UNDEFINED");
+    const auto cold_after = prosper::frontend::live_compute_rtt_destination_mirror_counters();
+    cold_target = prosper::test::find_persistent_color_target(
+        cold_address, W, H, VK_FORMAT_R8G8B8A8_UNORM, false);
+    CHECK(cold_after.recorded == cold_before.recorded + 1 &&
+              cold_after.published == cold_before.published + 1 &&
+              cold_target && cold_target->image == cold_image && cold_target->valid &&
+              cold_target->layout == VK_IMAGE_LAYOUT_GENERAL && !cold_target->pin_count &&
+              import_live_render_target_image(cold_address, source_request, source_import),
+          "completed first overwrite publishes the exact device image and releases its lease");
+    if (source_import.valid()) release_live_render_target_image(cold_address);
+    std::vector<uint8_t> cold_pixels;
+    std::string cold_error;
+    CHECK(prosper::test::readback_persistent_color_target(
+              cold_address, W, H, VK_FORMAT_R8G8B8A8_UNORM,
+              cold_pixels, cold_error) && cold_pixels == cold_guest,
+          "new renderer image has the same completed texels as guest writeback");
+
+    std::vector<uint8_t> budget_guest(W * H * 4, 0x62);
+    const uint64_t budget_address = reinterpret_cast<uint64_t>(budget_guest.data());
+    auto budget_cpu = std::make_shared<std::vector<uint8_t>>(budget_guest);
+    notify_live_render_target_image_written(
+        {budget_address, W, H, LiveTargetPixelFormat::Rgba8Unorm, std::move(budget_cpu)});
+    ShaderResourceTable budget_table = table;
+    budget_table.resources[0].gpu_addr = budget_address;
+    ComputeItem budget_item = item;
+    budget_item.resources = std::make_shared<ShaderResourceTable>(budget_table);
+    budget_item.code_addr = 0x37310017u;
+    LiveTargetImageImport wrong_device_borrow;
+    CHECK(!borrow_live_render_target_image_destination(
+              budget_address, {W, H, LiveTargetPixelFormat::Rgba8Unorm, true,
+                               reinterpret_cast<void*>(uintptr_t{1})},
+              wrong_device_borrow) &&
+              wrong_device_borrow.refusal == LiveTargetImageImport::Refusal::DeviceMismatch &&
+              !prosper::test::find_persistent_color_target(
+                  budget_address, W, H, VK_FORMAT_R8G8B8A8_UNORM, false),
+          "separate compute device refuses before allocating renderer residency");
+    VkDeviceSize& resident_bytes = prosper::test::persistent_color_target_bytes();
+    const VkDeviceSize actual_resident_bytes = resident_bytes;
+    resident_bytes = prosper::test::persistent_color_target_limit();
+    LiveTargetImageImport budget_borrow;
+    CHECK(!borrow_live_render_target_image_destination(
+              budget_address, {W, H, LiveTargetPixelFormat::Rgba8Unorm, true,
+                               static_cast<void*>(prosper::test::render_vk_ctx().dev)},
+              budget_borrow) &&
+              budget_borrow.refusal ==
+                  LiveTargetImageImport::Refusal::DestinationCreationRefused,
+          "budget refusal identifies image creation as the fallback gate");
+    const auto budget_before = prosper::frontend::live_compute_rtt_destination_mirror_counters();
+    const bool budget_completed = prosper::frontend::execute_live_compute_items({budget_item});
+    const auto budget_after = prosper::frontend::live_compute_rtt_destination_mirror_counters();
+    resident_bytes = actual_resident_bytes;
+    CHECK(budget_completed, "residency refusal retains successful compute execution");
+    CHECK(std::equal(budget_guest.begin(), budget_guest.begin() + W * 4,
+                     cold_guest.begin()) &&
+              std::all_of(budget_guest.begin() + W * 4, budget_guest.end(),
+                          [](uint8_t value) { return value == 0x62; }),
+          "residency refusal writes the covered row and preserves untouched guest rows");
+    CHECK(budget_after.candidates == budget_before.candidates + 1,
+          "residency refusal still reaches the destination admission check");
+    CHECK(budget_after.borrowed == budget_before.borrowed,
+          "residency refusal does not borrow a destination image");
+    CHECK(!prosper::test::find_persistent_color_target(
+              budget_address, W, H, VK_FORMAT_R8G8B8A8_UNORM, false),
+          "residency refusal leaves no renderer image");
+    LiveTargetSnapshot budget_snapshot;
+    CHECK(read_live_render_target(budget_address, budget_snapshot) &&
+              budget_snapshot.pixels &&
+              *budget_snapshot.pixels == budget_guest,
+          "residency refusal publishes the exact final guest bytes as a CPU RTT");
+
+    // Count admission is independent of the byte gauge. Occupy only this test's cache keys so
+    // reverting to deferred-graphics headroom would incorrectly admit the next compute image.
+    std::vector<uint8_t> count_guest(W * H * 4, 0x42);
+    const uint64_t count_address = reinterpret_cast<uint64_t>(count_guest.data());
+    notify_live_render_target_image_written(
+        {count_address, W, H, LiveTargetPixelFormat::Rgba8Unorm,
+         std::make_shared<std::vector<uint8_t>>(count_guest)});
+    auto& color_cache = prosper::test::persistent_color_target_cache();
+    std::vector<prosper::test::PersistentColorTargetKey> count_keys;
+    const size_t count_limit = prosper::test::persistent_color_target_count_limit();
+    CHECK(resident_bytes < prosper::test::persistent_color_target_limit() / 2,
+          "count refusal fixture has independent renderer byte-budget headroom");
+    CHECK(count_limit <= 4096, "focused count-bound fixture needs a bounded configured limit");
+    if (count_limit <= 4096) {
+        for (uint64_t i = 0; color_cache.size() < count_limit; ++i) {
+            const prosper::test::PersistentColorTargetKey key{
+                0xf000000000000000ull + i, W, H, VK_FORMAT_R8G8B8A8_UNORM};
+            if (color_cache.try_emplace(key).second) count_keys.push_back(key);
+        }
+        LiveTargetImageImport count_borrow;
+        CHECK(!borrow_live_render_target_image_destination(
+                  count_address, {W, H, LiveTargetPixelFormat::Rgba8Unorm, true,
+                                  static_cast<void*>(prosper::test::render_vk_ctx().dev)},
+                  count_borrow) &&
+                  count_borrow.refusal ==
+                      LiveTargetImageImport::Refusal::DestinationCreationRefused &&
+                  !prosper::test::find_persistent_color_target(
+                      count_address, W, H, VK_FORMAT_R8G8B8A8_UNORM, false),
+              "compute-only destination obeys the nominal image count without batch headroom");
+        for (const auto& key : count_keys) color_cache.erase(key);
+    }
+
+    if (!rgba16_mirror_disabled) {
+        // This is the 4K Outer Wilds format: a compute-written RGBA16F surface with no prior
+        // graphics allocation. The next partial dispatch must import the newly created image.
+        std::vector<uint16_t> cold16_words(W * H * 4, 0x5555u);
+        const uint64_t cold16_address = reinterpret_cast<uint64_t>(cold16_words.data());
+        auto cold16_cpu = std::make_shared<std::vector<uint8_t>>(
+            cold16_words.size() * sizeof(uint16_t), 0x55);
+        notify_live_render_target_image_written(
+            {cold16_address, W, H, LiveTargetPixelFormat::Rgba16Float,
+             std::move(cold16_cpu)});
+        ShaderResourceTable cold16_table = rgba16_table;
+        cold16_table.resources[0].gpu_addr = cold16_address;
+        ComputeItem cold16_full = rgba16_full;
+        cold16_full.spirv = recompile_compute(
+            store_red_r11, std::size(store_red_r11), &cold16_table, rgba16_config);
+        CHECK(!cold16_full.spirv.empty(), "nonuniform cold RGBA16F producer recompiles");
+        cold16_full.resources = std::make_shared<ShaderResourceTable>(cold16_table);
+        cold16_full.code_addr = 0x37310018u;
+        const auto cold16_before =
+            prosper::frontend::live_compute_rtt_destination_mirror_counters();
+        CHECK(prosper::frontend::execute_live_compute_items({cold16_full}),
+              "cold RGBA16F storage output completes");
+        const auto cold16_after =
+            prosper::frontend::live_compute_rtt_destination_mirror_counters();
+        const auto* cold16_target = prosper::test::find_persistent_color_target(
+            cold16_address, W, H, VK_FORMAT_R16G16B16A16_SFLOAT, false);
+        CHECK(cold16_after.recorded == cold16_before.recorded + 1 &&
+                  cold16_after.published == cold16_before.published + 1 &&
+                  cold16_target && cold16_target->valid &&
+                  cold16_target->layout == VK_IMAGE_LAYOUT_GENERAL &&
+                  import_live_render_target_image(
+                      cold16_address, source_request, rgba16_source),
+              "cold RGBA16F result becomes a readable exact renderer image");
+        if (rgba16_source.valid()) release_live_render_target_image(cold16_address);
+        std::vector<uint16_t> cold16_expected(W * H * 4);
+        for (size_t pixel = 0; pixel < W * H; ++pixel) {
+            cold16_expected[pixel * 4] = 0x3c00u; // red=1 from the complete first dispatch
+            cold16_expected[pixel * 4 + 3] = 0x3c00u;
+        }
+        CHECK(cold16_words == cold16_expected,
+              "cold RGBA16F first write establishes distinct untouched rows");
+        ComputeItem cold16_partial = cold16_full;
+        cold16_partial.spirv = rgba16_partial_spirv;
+        cold16_partial.launch.threads_y = cold16_partial.launch.local_y = 1;
+        cold16_partial.code_addr = 0x37310019u;
+        const auto cold16_seed_before =
+            prosper::frontend::live_compute_rtt_destination_mirror_counters();
+        CHECK(prosper::frontend::execute_live_compute_items({cold16_partial}),
+              "partial RGBA16F writer consumes the newly created renderer image");
+        const auto cold16_seed_after =
+            prosper::frontend::live_compute_rtt_destination_mirror_counters();
+        CHECK(cold16_seed_after.rgba16_source_seed_recorded ==
+                  cold16_seed_before.rgba16_source_seed_recorded + 1 &&
+                  cold16_seed_after.published == cold16_seed_before.published + 1,
+              "cold RGBA16F target completes the GPU seed and destination publication loop");
+        for (size_t x = 0; x < W; ++x) cold16_expected[x * 4] = 0;
+        CHECK(cold16_words == cold16_expected,
+              "cold RGBA16F partial write preserves the completed red rows below row zero");
+        std::vector<uint8_t> cold16_pixels;
+        std::string cold16_error;
+        CHECK(prosper::test::readback_persistent_color_target(
+                  cold16_address, W, H, VK_FORMAT_R16G16B16A16_SFLOAT,
+                  cold16_pixels, cold16_error) &&
+                  cold16_pixels.size() == cold16_expected.size() * sizeof(uint16_t) &&
+                  std::memcmp(cold16_pixels.data(), cold16_expected.data(),
+                              cold16_pixels.size()) == 0,
+              "cold RGBA16F renderer image retains the exact nonuniform partial result");
+    }
     return fails ? 1 : 0;
 }
 

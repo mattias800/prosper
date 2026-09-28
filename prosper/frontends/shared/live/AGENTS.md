@@ -362,6 +362,23 @@ destination still writes back guest bytes. Release every acquired pin, including
 only after completion is established. `PROSPER_NO_STANDALONE_RTT_SEED` selects the CPU control;
 F8-gated `compute-rtt-seed` rows distinguish admission from recorded copies.
 
+An exact 2D native RGBA8, RGBA16F or packed R11 storage result may also create a missing
+renderer-owned destination when a matching CPU RTT entry exists. The destination lease never
+authorizes reading old pixels: the private compute/staging path seeds partial writes as before,
+then copies the complete canonical image into the pinned allocation. Creation uses the renderer's
+bounded color-target budget without evicting a possibly pending graphics batch. Only images tagged
+for the same VkDevice may be created; a separate compute device declines before charging renderer
+residency. Compute-only creation obeys the nominal image-count limit, without the 64-entry
+headroom reserved for an open graphics batch. Only images tagged as compute reservations may enter
+from `UNDEFINED`; a completed copy restores `GENERAL`, and only
+successful ordinary guest writeback grants GPU read authority. Optional creation failure, budget
+refusal, alias collision and incompatible format/extent retain CPU publication; a failed dispatch
+revokes the lease without publishing. `PROSPER_NO_COMPUTE_RTT_DEST_CREATE=1`
+restores the no-creation policy; `=0` is the equal-length enabled arm for same-binary comparisons.
+The cold destination cases in
+`test_game_compute_rtt_mirror.cpp` cover first-write failure/retry, read authority, RGBA16F reseeding
+and budget fallback.
+
 A completed private renderer-seeded native RGBA8 image may be retained under the existing image
 budget for validated storage-to-sampled transfers. This new result does not authorize graphics
 export or create its page watch: Linux uses the ordered journal and declines outside its authority;
