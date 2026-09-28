@@ -887,9 +887,8 @@ static int run_destination_mirror_regression() {
               tiled_target->pin_count == tiled_renderer_pins,
           "tiled R11 destination retains image and layout and releases compute leases");
 
-    // A different binding importing the same renderer image must keep the destination lease
-    // collision closed. The storage binding's own packed seed is allowed, but this sampled import
-    // is a second reader whose ordering and layout cannot be justified by the self-seed exception.
+    // The sampled binding reads the old renderer image during the dispatch. The separate output
+    // lease may publish into that same image only after the shader and readback staging are done.
     std::vector<uint32_t> collision_words(W * H, 0xdeadbeefu);
     const uint64_t collision_address = reinterpret_cast<uint64_t>(collision_words.data());
     DrawItem collision_producer = r11_producer;
@@ -927,6 +926,7 @@ static int run_destination_mirror_regression() {
     static const uint32_t image_copy_r11[] = {
         0x7E080300u, 0x7E0A0280u, // v4=x, v5=0
         0xF0000F08u, 0x00000004u, 0xBF8C3F70u, // load sampled binding 4
+        0x100000FFu, 0x3F000000u, // red = sampled red * 0.5, unlike the old image
         0xF0200F08u, 0x00020004u, 0xBF810000u, // store binding 5
     };
     const auto collision_spirv = recompile_compute(
@@ -938,27 +938,205 @@ static int run_destination_mirror_regression() {
     collision_item.code_addr = 0x37310015u;
     const auto collision_before = prosper::frontend::live_compute_rtt_destination_mirror_counters();
     CHECK(!collision_spirv.empty() && prosper::frontend::execute_live_compute_items({collision_item}),
-          "packed R11 sampled/storage collision completes through fallback");
+          "packed R11 sampled/storage alias completes");
     const auto collision_after = prosper::frontend::live_compute_rtt_destination_mirror_counters();
+    const bool read_alias_disabled = std::getenv("PROSPER_NO_COMPUTE_RTT_READ_ALIAS") != nullptr;
     CHECK(collision_after.r11_source_seed_recorded ==
                   collision_before.r11_source_seed_recorded + 1 &&
               collision_after.candidates == collision_before.candidates + 1 &&
-              collision_after.borrowed == collision_before.borrowed &&
-              collision_after.recorded == collision_before.recorded &&
-              collision_after.published == collision_before.published,
-          "second imported R11 binding rejects an otherwise borrowable destination");
-    CHECK(collision_seed.size() == W * H * sizeof(uint32_t) &&
-              std::memcmp(collision_words.data(), collision_seed.data(),
-                          collision_seed.size()) == 0,
-          "sampled R11 binding uses renderer pixels while guest fallback writes exact words");
-    CHECK(!import_live_render_target_image(collision_address, source_request, r11_source),
-          "rejected R11 destination does not restore strict renderer authority");
+              collision_after.borrowed == collision_before.borrowed + !read_alias_disabled &&
+              collision_after.recorded == collision_before.recorded + !read_alias_disabled &&
+              collision_after.published == collision_before.published + !read_alias_disabled,
+          "read-only R11 alias mirrors after shader use; explicit control declines it");
+    std::vector<uint32_t> collision_expected(W * H);
+    if (collision_seed.size() == collision_expected.size() * sizeof(uint32_t))
+        std::memcpy(collision_expected.data(), collision_seed.data(), collision_seed.size());
+    CHECK(std::all_of(collision_expected.begin(), collision_expected.begin() + W,
+                      [](uint32_t word) { return (word & 0x7ffu) == 0x3c0u; }),
+          "R11 sampled seed has unit red before the shader halves it");
+    for (size_t x = 0; x < W; ++x)
+        collision_expected[x] = (collision_expected[x] & ~0x7ffu) | 0x380u;
+    CHECK(collision_words == collision_expected,
+          "R11 sampled old pixels produce a distinct exact guest result");
+    const bool collision_importable = import_live_render_target_image(
+        collision_address, source_request, r11_source);
+    CHECK(collision_importable == !read_alias_disabled,
+          "successful R11 alias publication restores strict renderer authority");
+    if (collision_importable) release_live_render_target_image(collision_address);
+    if (!read_alias_disabled) {
+        std::vector<uint8_t> mirrored;
+        CHECK(prosper::test::readback_persistent_color_target(
+                  collision_address, W, H, VK_FORMAT_B10G11R11_UFLOAT_PACK32,
+                  mirrored, r11_readback_error) &&
+                  mirrored.size() == collision_words.size() * sizeof(uint32_t) &&
+                  std::memcmp(mirrored.data(), collision_expected.data(), mirrored.size()) == 0,
+              "read-only R11 alias copies the changed completed result into the renderer image");
+    }
     collision_target = prosper::test::find_persistent_color_target(
         collision_address, W, H, VK_FORMAT_B10G11R11_UFLOAT_PACK32, false);
     CHECK(collision_target && collision_target->image == collision_image &&
               collision_target->layout == collision_layout &&
               collision_target->pin_count == collision_renderer_pins,
-          "rejected R11 destination releases imports and preserves image layout");
+          "R11 read alias releases all three leases and preserves the renderer layout");
+
+    // Astro's resource order is the opposite: the output's seed is prepared before the sampled
+    // alias transitions their shared renderer image. A fresh draw makes guest bytes stale again.
+    CHECK(!render(collision_producer).empty(),
+          "reverse-order R11 source is repainted independently of the prior guest result");
+    std::vector<uint8_t> reverse_seed;
+    CHECK(prosper::test::readback_persistent_color_target(
+              collision_address, W, H, VK_FORMAT_B10G11R11_UFLOAT_PACK32,
+              reverse_seed, r11_readback_error) && reverse_seed == collision_seed,
+          "reverse-order R11 arm starts from the same distinct old renderer pixels");
+    ShaderResourceTable reverse_table;
+    ShaderResource reverse_output = collision_output;
+    ShaderResource reverse_sampled = collision_sampled;
+    reverse_output.binding = 4;  // output is now the first reflected descriptor
+    reverse_sampled.binding = 5; // shader SGPR bases still address their original resources
+    reverse_table.resources = {reverse_output, reverse_sampled};
+    const auto reverse_spirv = recompile_compute(
+        image_copy_r11, std::size(image_copy_r11), &reverse_table, r11_config);
+    const auto reverse_reflection = validate_spirv_descriptor_interface(
+        reverse_spirv, &reverse_table, 0, SpirvShaderStage::Compute, false);
+    const auto* reverse_write = find_spirv_descriptor_binding(reverse_reflection, 0, 4);
+    const auto* reverse_read = find_spirv_descriptor_binding(reverse_reflection, 0, 5);
+    CHECK(!reverse_spirv.empty() && reverse_reflection.ok() && reverse_write &&
+              reverse_read && reverse_write->writable && !reverse_read->writable,
+          "reverse-order R11 fixture reflects output before sampled input");
+    ComputeItem reverse_item = collision_item;
+    reverse_item.spirv = reverse_spirv;
+    reverse_item.resources = std::make_shared<ShaderResourceTable>(reverse_table);
+    reverse_item.code_addr = 0x3731001bu;
+    const auto reverse_before = prosper::frontend::live_compute_rtt_destination_mirror_counters();
+    CHECK(!reverse_spirv.empty() &&
+              prosper::frontend::execute_live_compute_items({reverse_item}),
+          "reverse-order R11 alias dispatch completes");
+    const auto reverse_after = prosper::frontend::live_compute_rtt_destination_mirror_counters();
+    CHECK(reverse_after.r11_source_seed_recorded ==
+                  reverse_before.r11_source_seed_recorded + 1 &&
+              reverse_after.candidates == reverse_before.candidates + 1 &&
+              reverse_after.borrowed == reverse_before.borrowed + !read_alias_disabled &&
+              reverse_after.recorded == reverse_before.recorded + !read_alias_disabled &&
+              reverse_after.published == reverse_before.published + !read_alias_disabled,
+          "output-before-sampled R11 alias obeys the same controlled admission");
+    CHECK(collision_words == collision_expected,
+          "reverse-order alias reads repainted old pixels and writes the distinct expected result");
+    if (!read_alias_disabled) {
+        std::vector<uint8_t> mirrored;
+        CHECK(prosper::test::readback_persistent_color_target(
+                  collision_address, W, H, VK_FORMAT_B10G11R11_UFLOAT_PACK32,
+                  mirrored, r11_readback_error) &&
+                  mirrored.size() == collision_expected.size() * sizeof(uint32_t) &&
+                  std::memcmp(mirrored.data(), collision_expected.data(), mirrored.size()) == 0,
+              "reverse-order R11 mirror contains the changed output");
+    }
+    collision_target = prosper::test::find_persistent_color_target(
+        collision_address, W, H, VK_FORMAT_B10G11R11_UFLOAT_PACK32, false);
+    CHECK(collision_target && collision_target->image == collision_image &&
+              collision_target->layout == collision_layout &&
+              collision_target->pin_count == collision_renderer_pins,
+          "reverse-order R11 alias restores the original renderer ownership");
+
+    std::vector<uint16_t> alias16_words;
+    if (!rgba16_mirror_disabled) {
+        alias16_words.assign(W * H * 4, 0x7777u);
+        const uint64_t alias16_address = reinterpret_cast<uint64_t>(alias16_words.data());
+        DrawItem alias16_producer = rgba16_producer;
+        alias16_producer.color0_base = alias16_address;
+        CHECK(!render(alias16_producer).empty(),
+              "RGBA16F read-alias fixture creates a renderer source");
+        std::vector<uint8_t> alias16_seed;
+        std::string alias16_error;
+        CHECK(prosper::test::readback_persistent_color_target(
+                  alias16_address, W, H, VK_FORMAT_R16G16B16A16_SFLOAT,
+                  alias16_seed, alias16_error) &&
+                  alias16_seed.size() == alias16_words.size() * sizeof(uint16_t),
+              "RGBA16F read alias starts from known renderer pixels");
+        std::vector<uint16_t> alias16_expected(alias16_words.size());
+        if (alias16_seed.size() == alias16_expected.size() * sizeof(uint16_t))
+            std::memcpy(alias16_expected.data(), alias16_seed.data(), alias16_seed.size());
+        CHECK(std::all_of(alias16_expected.begin(), alias16_expected.begin() + W * 4,
+                          [channel = size_t{0}](uint16_t word) mutable {
+                              constexpr uint16_t expected[] = {0x4000u, 0xbc00u, 0x3800u, 0x3c00u};
+                              return word == expected[(channel++) % 4];
+                          }),
+              "RGBA16F sampled seed has the expected nonuniform channel values");
+        for (size_t x = 0; x < W; ++x) alias16_expected[x * 4] = 0x3c00u;
+        const auto* alias16_target = prosper::test::find_persistent_color_target(
+            alias16_address, W, H, VK_FORMAT_R16G16B16A16_SFLOAT);
+        const VkImage alias16_image = alias16_target ? alias16_target->image : VK_NULL_HANDLE;
+        const VkImageLayout alias16_layout = alias16_target
+            ? alias16_target->layout : VK_IMAGE_LAYOUT_UNDEFINED;
+        const uint32_t alias16_pins = alias16_target ? alias16_target->pin_count : 0;
+        ShaderResource alias16_sampled = rgba16_output;
+        alias16_sampled.cls = ResourceClass::Texture;
+        alias16_sampled.binding = 4;
+        alias16_sampled.sgpr_base = 0;
+        alias16_sampled.gpu_addr = alias16_address;
+        ShaderResource alias16_output = rgba16_output;
+        alias16_output.gpu_addr = alias16_address;
+        alias16_output.binding = 4;
+        alias16_sampled.binding = 5;
+        ShaderResourceTable alias16_table;
+        // Reflection sorts by descriptor binding, not resource-table insertion. Output-first is
+        // the missing path: sampled-first uses the older seed_from_imported mirror, whereas Astro
+        // prepares its standalone seed before importing the sampled binding.
+        alias16_table.resources = {alias16_output, alias16_sampled};
+        const auto alias16_spirv = recompile_compute(
+            image_copy_r11, std::size(image_copy_r11), &alias16_table, rgba16_config);
+        const auto alias16_reflection = validate_spirv_descriptor_interface(
+            alias16_spirv, &alias16_table, 0, SpirvShaderStage::Compute, false);
+        const auto* alias16_write = find_spirv_descriptor_binding(alias16_reflection, 0, 4);
+        const auto* alias16_read = find_spirv_descriptor_binding(alias16_reflection, 0, 5);
+        CHECK(!alias16_spirv.empty() && alias16_reflection.ok() && alias16_write &&
+                  alias16_read && alias16_write->writable && !alias16_read->writable,
+              "RGBA16F fixture reflects output before sampled input");
+        ComputeItem alias16_item = rgba16_full;
+        alias16_item.spirv = alias16_spirv;
+        alias16_item.resources = std::make_shared<ShaderResourceTable>(alias16_table);
+        alias16_item.launch.threads_y = alias16_item.launch.local_y = 1;
+        alias16_item.code_addr = 0x3731001au;
+        const auto alias16_before =
+            prosper::frontend::live_compute_rtt_destination_mirror_counters();
+        CHECK(!alias16_spirv.empty() &&
+                  prosper::frontend::execute_live_compute_items({alias16_item}),
+              "RGBA16F read alias executes with old sampled pixels and partial output");
+        const auto alias16_after =
+            prosper::frontend::live_compute_rtt_destination_mirror_counters();
+        CHECK(alias16_after.rgba16_source_seed_recorded ==
+                  alias16_before.rgba16_source_seed_recorded + 1 &&
+                  alias16_after.candidates == alias16_before.candidates + 1 &&
+                  alias16_after.borrowed == alias16_before.borrowed + !read_alias_disabled &&
+                  alias16_after.recorded == alias16_before.recorded + !read_alias_disabled &&
+                  alias16_after.published == alias16_before.published + !read_alias_disabled,
+              "RGBA16F read alias mirrors after shader use; control keeps CPU authority");
+        CHECK(alias16_words == alias16_expected,
+              "RGBA16F sampled old pixels produce a distinct exact guest result");
+        LiveTargetImageImport alias16_import;
+        const bool alias16_gpu_valid = import_live_render_target_image(
+            alias16_address, source_request, alias16_import);
+        CHECK(alias16_gpu_valid == !read_alias_disabled,
+              "RGBA16F read alias publishes strict GPU authority only when enabled");
+        if (alias16_gpu_valid) release_live_render_target_image(alias16_address);
+        if (!read_alias_disabled) {
+            std::vector<uint8_t> mirrored;
+            CHECK(prosper::test::readback_persistent_color_target(
+                      alias16_address, W, H, VK_FORMAT_R16G16B16A16_SFLOAT,
+                      mirrored, alias16_error) &&
+                      mirrored.size() == alias16_expected.size() * sizeof(uint16_t) &&
+                      std::memcmp(mirrored.data(), alias16_expected.data(), mirrored.size()) == 0,
+                  "RGBA16F mirror contains the changed sampled result");
+        }
+        alias16_target = prosper::test::find_persistent_color_target(
+            alias16_address, W, H, VK_FORMAT_R16G16B16A16_SFLOAT, false);
+        // This is the renderer owner's bookkeeping, not a query of VkImage's actual layout.
+        // The preceding readback is also exercised under strict Vulkan validation, which checks
+        // the compute submit's final GENERAL -> saved-layout transition before that readback.
+        CHECK(alias16_target && alias16_target->image == alias16_image &&
+                  alias16_target->layout == alias16_layout &&
+                  alias16_target->pin_count == alias16_pins,
+              "RGBA16F read alias retains renderer image ownership and layout bookkeeping");
+    }
 
     // A compute-owned output can reach the renderer first as CPU pixels, without any graphics
     // pass having allocated its image. A full overwrite must be able to create that destination;

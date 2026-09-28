@@ -218,6 +218,33 @@ def main():
           "image model does not match" not in out + err,
           out + err)
 
+    # The staging timer is outside prepare for sampled images but inside it for storage images.
+    # The old model counted both as siblings: this storage arm exceeds its own binding interval
+    # under that model, even though aggregation with the sampled arm can hide the negative residual.
+    log = (phase(setup_ms=20) +
+           image(image_class="storage", ms=10, query_ms=1, prepare_ms=8,
+                 cache_ms=3, staging_ms=2) +
+           image(image_class="sampled", ms=10, query_ms=1, prepare_ms=5,
+                 cache_ms=1, staging_ms=2))
+    code, out, err = run(log)
+    check("storage staging is nested and sampled staging is a sibling",
+          code == 0 and
+          image_row(out, "storage staging (included)")[0] == 2.0 and
+          image_row(out, "staging alloc (sampled)")[0] == 2.0 and
+          image_row(out, "prepare exclusive")[0] == 8.0 and
+          image_row(out, "unattributed")[0] == 2.0 and
+          "NOT TRUSTWORTHY" not in out and "image model does not match" not in err,
+          out + err)
+
+    # A storage binding cannot spend more measured time in disjoint nested cache and staging
+    # intervals than in their parent prepare interval, even if its root total is large.
+    code, out, err = run(
+        phase(setup_ms=10) +
+        image(image_class="storage", ms=10, prepare_ms=4, cache_ms=3, staging_ms=3))
+    check("storage children exceeding prepare warn",
+          "storage cache + staging intervals exceed prepare_ms" in err and
+          "NOT TRUSTWORTHY" in out, out + err)
+
     # Stable shader identity wins over the run-local code address. The two hash AA/code variants
     # aggregate while another stable hash remains a separate group.
     log = (phase(setup_ms=6) +
