@@ -482,10 +482,12 @@ QUARANTINE = {
     "src/gpu/execute/mb3_freelist.cpp": 4,
     "src/gpu/state/render_state.cpp": 1,
     "frontends/shared/live/live_compute.cpp": 2,
-    "frontends/shared/live/live_renderer.cpp": 5,
-    # #3892 moved one of live_renderer.cpp's six verbatim with build_draw_frame_resources; the
-    # total is unchanged and the refactor deliberately changes no output bytes.
+    "frontends/shared/live/live_renderer.cpp": 2,
+    # #3892 moved one of live_renderer.cpp's six verbatim with build_draw_frame_resources, and
+    # part 2 moved three more with render_per_target_passes; the total is unchanged and the
+    # refactor deliberately changes no output bytes.
     "frontends/shared/live/submit_renderer/draw_resources.cpp": 1,
+    "frontends/shared/live/submit_renderer/per_target_passes.cpp": 3,
     "tests/fixtures/render_runner.h": 2,
     "tests/gpu/test_descriptor_array_emit.cpp": 1,
     "tests/gpu/state/test_descriptor_array_render.cpp": 1,
