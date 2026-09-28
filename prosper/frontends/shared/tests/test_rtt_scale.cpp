@@ -18,6 +18,7 @@ using prosper::frontend::rtt_scaled_extent_compatible;
 using prosper::frontend::LiveRttAuthority;
 using prosper::frontend::live_rtt_authority;
 using prosper::frontend::live_rtt_compute_authoritative;
+using prosper::frontend::live_rtt_base_slice_blocks_decode_cache;
 using prosper::frontend::live_rtt_cpu_snapshot_matches;
 using prosper::frontend::live_rtt_gpu_importable;
 using prosper::frontend::live_rtt_uniform_uses_cpu_diagnostic_path;
@@ -102,6 +103,15 @@ int main() {
     CHECK(live_rtt_compute_authoritative(true, true));
     CHECK(live_rtt_compute_authoritative(false, true));
     CHECK(!live_rtt_compute_authoritative(false, false));
+    // A dim-5 base-slice view keeps the guest-decode cache closed while its live RTT entry holds
+    // pixels the guest bytes do not see; an identity-only shell (no image, no CPU snapshot, no
+    // uniform colour) is served from guest bytes anyway, so it must not force a per-submit
+    // re-decode (#3873: Sonic Frontiers re-decoded a 64 MiB shell ~24x/s on its menus).
+    CHECK(!live_rtt_base_slice_blocks_decode_cache(false, false, false));
+    CHECK(live_rtt_base_slice_blocks_decode_cache(true, false, false));
+    CHECK(live_rtt_base_slice_blocks_decode_cache(true, true, false));
+    CHECK(live_rtt_base_slice_blocks_decode_cache(false, true, false));
+    CHECK(live_rtt_base_slice_blocks_decode_cache(false, false, true));
     CHECK(live_rtt_uniform_uses_cpu_diagnostic_path(true, true));
     CHECK(!live_rtt_uniform_uses_cpu_diagnostic_path(true, false));
     CHECK(!live_rtt_uniform_uses_cpu_diagnostic_path(false, true));

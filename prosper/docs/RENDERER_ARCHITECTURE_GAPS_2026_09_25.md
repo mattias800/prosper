@@ -373,6 +373,23 @@ volume census was kept, because the volume is the input to any future batching q
   2.5 us/ref; the most a memo could still save is ~0.5 us x ~120k refs per 5 s, about 1% of wall,
   for an invalidation surface of the #611/#780 class. Do not build a resolution memo without first
   showing a chain stage that is both slow and repeat-invariant -- the census reports exactly that.
+- **"The expensive texture-reference classes from the first census are still there" (re-measured
+  2026-09-28, after #3877/#3882/#3883/#3886).** Two are gone, one was not what it looked like. Sonic
+  Frontiers' `rtt` class (73-117 us/ref, all in the `depth` stage) is now 0.8-1.0 us/ref: #3882's GPU
+  gather removed it. GTA V's `persist_submit` class no longer appears, and the whole GTA chain is
+  2.5-5.8 us/ref per class, with no stage above 4 us. What remained was Sonic's `other` class, ~250
+  refs per 5 s at 2.4 ms each (~12% of wall on the title and menu screens). It was ONE texture: a
+  3840x2160 RGBA16F dim-5 view whose live RTT entry was an identity-only shell (no valid image, no CPU
+  snapshot, no uniform colour), so renderer authority kept it out of the decode cache and it was
+  re-read and re-detiled on every submit. Retaining that shell's decode behind exact validation took
+  the menu chain from ~640 to ~33 ms per 5 s and the menu from 24-28 to 30 flips/s, the guest's own
+  cap (`live_rtt_base_slice_blocks_decode_cache`, #3873). **Two classes remain, neither of them a
+  resolution-chain defect.** (a) The opening movie's `persist_invalid` refs (~290 per 5 s at 4.4 ms)
+  are the video's Unorm8 planes, which really do change every frame. Their cost is the CPU detile plus
+  a full-size exact compare that is certain to fail. (b) Sonic gameplay's `other_nocand` refs (~300
+  per 5 s at 0.6-1.1 ms, 4-7% of wall) are non-BC Float16 cubes, deliberately excluded from retention
+  since the Plucky Squire regression (see `RENDERER_PERFORMANCE_2026_07.md`). Reopen (b) only with a
+  per-title A/B that shows that churn is absent.
 
 **RULED OUT (2026-09-27): "after #3877 another single exact O(n)-per-draw hotspot remains on the
 GTA V render thread."** A source-line profile of the submitting thread (Release with `-g1` line

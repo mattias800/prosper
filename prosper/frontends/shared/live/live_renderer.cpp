@@ -4378,6 +4378,18 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             (!fr.is_storage_image && r.img_dim == 5u && !r.in_mip_tail &&
                              live_rtt != g_rtt.end());
                         resource_has_live_rtt = has_live_rtt_authority;
+                        // The guest-decode cache honours that authority only while the entry holds
+                        // pixels of its own; an identity-only shell is served from guest bytes either
+                        // way (live_rtt_base_slice_blocks_decode_cache). PROSPER_NO_RTT_SHELL_DECODE_CACHE=1
+                        // restores the per-submit re-decode for A/B.
+                        static const bool rtt_shell_decode_cache =
+                            !PROSPER_ENV_ON("PROSPER_NO_RTT_SHELL_DECODE_CACHE");
+                        const bool rtt_blocks_decode_cache = has_live_rtt ||
+                            (has_live_rtt_authority &&
+                             (!rtt_shell_decode_cache ||
+                              prosper::frontend::live_rtt_base_slice_blocks_decode_cache(
+                                  live_rtt->second.gpu_valid, live_rtt->second.rgba != nullptr,
+                                  live_rtt->second.has_uniform_color)));
                         if (texref_census)
                             texref_census->mark(prosper::frontend::TextureReferenceCensus::kRttProbe);
                         // Resolve renderer-owned depth before considering guest-byte texture
@@ -4926,7 +4938,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             persistent_unorm16_texture && r.num_components == 1u &&
                             !r.compression_enabled;
                         const bool persistent_sampled_texture = texture_decode_cache_candidate(
-                            has_live_rtt_authority,
+                            rtt_blocks_decode_cache,
                             has_ds_live || retained_depth_array != nullptr ||
                                 retained_depth_array_gpu != nullptr,
                             r.host_data != nullptr, r.img_dim,
@@ -9121,7 +9133,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             : resource_persistent_hit ? Census::kPersistHit
                             : resource_persistent_miss ? Census::kPersistMiss
                             : resource_persistent_invalidation ? Census::kPersistInvalid
-                            : resource_local_reuse ? Census::kLocal : Census::kOther;
+                            : resource_local_reuse ? Census::kLocal
+                            : resource_has_live_rtt ? Census::kOtherRttAuthority
+                            : !resource_persistent_candidate ? Census::kOtherNotCandidate
+                            : Census::kOther;
                         // The resolved identity only: what the backend would bind. The class is
                         // deliberately excluded -- a persistent hit followed by a submit-local reuse
                         // of the same pixels is the same answer reached two ways.
