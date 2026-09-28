@@ -403,6 +403,54 @@ int main() {
         check(parse_force_oom_classes("bogus") == 0, "force-oom: an unknown name arms nothing");
     }
 
+    // ---- 15. #3902: a pool releases its idle cache and retries the SAME type once on OOM -------
+    {
+        int allocs = 0, releases = 0;
+        // Driver OOM first, success after the pool gave memory back.
+        VkResult r = allocate_releasing_pool_on_oom(
+            [&] { return ++allocs == 1 ? VK_ERROR_OUT_OF_DEVICE_MEMORY : VK_SUCCESS; },
+            [&] { ++releases; return size_t{3}; });
+        check(r == VK_SUCCESS && allocs == 2 && releases == 1,
+              "pool-oom: OOM -> release cache -> same type retried once -> success");
+        // Nothing cached: no pointless retry, the OOM goes on to the type fallback.
+        allocs = releases = 0;
+        r = allocate_releasing_pool_on_oom(
+            [&] { ++allocs; return VK_ERROR_OUT_OF_DEVICE_MEMORY; },
+            [&] { ++releases; return size_t{0}; });
+        check(r == VK_ERROR_OUT_OF_DEVICE_MEMORY && allocs == 1 && releases == 1,
+              "pool-oom: empty cache -> no retry, OOM returned");
+        // Still OOM after the release: retried exactly once, OOM returned (fallback continues).
+        allocs = releases = 0;
+        r = allocate_releasing_pool_on_oom(
+            [&] { ++allocs; return VK_ERROR_OUT_OF_DEVICE_MEMORY; },
+            [&] { ++releases; return size_t{5}; });
+        check(r == VK_ERROR_OUT_OF_DEVICE_MEMORY && allocs == 2 && releases == 1,
+              "pool-oom: still out after release -> exactly one retry");
+        // Other errors and success: the cache is left alone.
+        allocs = releases = 0;
+        r = allocate_releasing_pool_on_oom([&] { ++allocs; return VK_ERROR_OUT_OF_HOST_MEMORY; },
+                                           [&] { ++releases; return size_t{5}; });
+        check(r == VK_ERROR_OUT_OF_HOST_MEMORY && allocs == 1 && releases == 0,
+              "pool-oom: OUT_OF_HOST_MEMORY is returned at once, cache kept");
+        allocs = releases = 0;
+        r = allocate_releasing_pool_on_oom([&] { ++allocs; return VK_SUCCESS; },
+                                           [&] { ++releases; return size_t{5}; });
+        check(r == VK_SUCCESS && allocs == 1 && releases == 0, "pool-oom: success keeps the cache");
+        // Through the type fallback: device-local type 0 OOMs, the pool frees, type 0 is retried
+        // and succeeds -- the host type is never reached.
+        const auto nv = layout({{8 * GiB, true}, {32 * GiB, false}}, {{DL, 0}, {HV | HC, 1}});
+        int tried_host = 0, calls0 = 0, released = 0;
+        const MemoryAllocationOutcome o = allocate_with_memory_type_fallback(
+            nv, bits({0, 1}), 0, DL, [&](uint32_t type) {
+                if (type == 1) { ++tried_host; return VK_SUCCESS; }
+                return allocate_releasing_pool_on_oom(
+                    [&] { return ++calls0 == 1 ? VK_ERROR_OUT_OF_DEVICE_MEMORY : VK_SUCCESS; },
+                    [&] { ++released; return size_t{1}; });
+            });
+        check(o.ok() && o.type == 0 && !o.fell_back() && tried_host == 0 && released == 1,
+              "pool-oom: released VRAM is used before the fallback reaches system memory");
+    }
+
     std::printf("%s (%d failure%s)\n", fails ? "FAIL" : "PASS", fails, fails == 1 ? "" : "s");
     return fails ? 1 : 0;
 }

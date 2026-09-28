@@ -2312,6 +2312,11 @@ if(TARGET prosper_core)
   target_link_libraries(test_texture_cache_budget PRIVATE prosper_core)
   add_test(NAME texture_cache_budget COMMAND test_texture_cache_budget)
 
+  # #3905: when spilled retained resources may be evicted to be re-created device-local (pure).
+  add_executable(test_spill_recovery tests/gpu/memory/test_spill_recovery.cpp)
+  target_link_libraries(test_spill_recovery PRIVATE prosper_core)
+  add_test(NAME spill_recovery COMMAND test_spill_recovery)
+
   # #3888: GPU-only images/buffers prefer a DEVICE_LOCAL memory type (pure; Vulkan headers only).
   if(TARGET Vulkan::Vulkan)
     add_executable(test_memory_type_select tests/gpu/memory/test_memory_type_select.cpp)

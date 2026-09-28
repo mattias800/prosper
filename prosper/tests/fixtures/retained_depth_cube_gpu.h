@@ -148,6 +148,9 @@ struct DepthCubeGpuSlot {
     VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
     VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
     VkDeviceSize bytes = 0;
+    // #3905: some allocation landed off device-local memory; never recycled (see
+    // DepthArrayGpuSlot::off_device).
+    bool off_device = false;
 
     ~DepthCubeGpuSlot() {
         if (!device) return;
@@ -192,7 +195,7 @@ struct PersistentDsDepthCubeGpuImage {
             std::lock_guard lock(pool.mutex);
             // Contents are reinitialised from UNDEFINED on reuse, so even a failed batch's slot
             // is safe to recycle once its last owner (including the backend lease) has let go.
-            if (pool.free.size() < DepthCubeGpuPool::kMaxFreeSlots &&
+            if (!slot->off_device && pool.free.size() < DepthCubeGpuPool::kMaxFreeSlots &&
                 slot->bytes <= DepthCubeGpuPool::kMaxFreeBytes - pool.free_bytes) {
                 const size_t bytes = slot->bytes;
                 pool.free.push_back(std::move(slot));
@@ -243,7 +246,8 @@ inline std::unique_ptr<DepthCubeGpuSlot> depth_cube_gpu_slot(
     }
     VkMemoryRequirements image_requirements{};
     vkGetImageMemoryRequirements(ctx.dev, slot->image, &image_requirements);
-    if (!depth_array_gpu_allocate(ctx, image_requirements, slot->image_memory)) return nullptr;
+    if (!depth_array_gpu_allocate(ctx, image_requirements, slot->image_memory,
+                                  slot->off_device)) return nullptr;
     slot->bytes += image_requirements.size;
     if (vkBindImageMemory(ctx.dev, slot->image, slot->image_memory, 0) != VK_SUCCESS)
         return nullptr;
@@ -260,7 +264,8 @@ inline std::unique_ptr<DepthCubeGpuSlot> depth_cube_gpu_slot(
     }
     VkMemoryRequirements buffer_requirements{};
     vkGetBufferMemoryRequirements(ctx.dev, slot->buffer, &buffer_requirements);
-    if (!depth_array_gpu_allocate(ctx, buffer_requirements, slot->buffer_memory)) return nullptr;
+    if (!depth_array_gpu_allocate(ctx, buffer_requirements, slot->buffer_memory,
+                                  slot->off_device)) return nullptr;
     slot->bytes += buffer_requirements.size;
     if (vkBindBufferMemory(ctx.dev, slot->buffer, slot->buffer_memory, 0) != VK_SUCCESS)
         return nullptr;

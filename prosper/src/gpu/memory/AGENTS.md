@@ -23,3 +23,10 @@ allocation: that rule puts images in system memory on a driver that lists a host
 silently. It is header-only because its inputs are Vulkan structs; it still makes no Vulkan call —
 `allocate_with_memory_type_fallback` takes the allocator as a parameter, and the Vulkan binding,
 logging and alarm counting live in `../diagnostics/memory_placement_log.hpp`.
+
+`spill_recovery` is the counterpart for retained resources that the #3897 fallback placed in system
+memory (#3905): how many spilled bytes a cache may drop now so they are re-created device-local on
+next use — rate-limited, gated on live `VK_EXT_memory_budget` headroom, and backed off when what was
+dropped comes back spilled. `memory_type_select`'s `allocate_releasing_pool_on_oom` is the pool side
+of the same story (#3902): a pool frees its idle cache and retries the same type before the fallback
+moves on.
