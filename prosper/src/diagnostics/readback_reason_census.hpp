@@ -1,23 +1,17 @@
 #pragma once
-// WHY prosper copies a colour target back to the CPU, counted per reason.
+// WHY the backend requests a colour-target readback, counted per reason.
 //
-// Readback is the dominant cost inside a backend call -- measured 2026-09-26 on The Messenger,
-// 68.5% of `measured` on prosper-app and 78.5% under tools/screenshot -- and the synchronization
-// line shows one of every two flushes is forced BY it. That makes it the reason the submit blocks,
-// so it is upstream of the "adopt a timeline semaphore" idea rather than parallel to it: a wait
-// whose purpose is to deliver bytes the next draw reads cannot be removed by changing how the wait
-// is expressed.
-//
-// `readback_policy.hpp` already distinguishes three ways a slot arrives at "yes", and they have
-// nothing in common and nothing to do with each other:
+// The earlier claim that this dominates shipped rendering was withdrawn: the two harnesses used
+// for that comparison both lacked the app's active GPU-present path. See the correction in
+// docs/RENDERER_ARCHITECTURE_GAPS_2026_09_25.md. The reason census still distinguishes:
 //
 //   no-color-target        the caller passed no target object -- a caller-shape question
 //   explicit-request       something downstream asked for bytes -- a consumer question
-//   bound-non-persistent   a bound target whose pixels are not retained -- a RESIDENCY question
+//   bound-non-persistent   a bound target whose pixels are not retained -- a residency question
 //
-// Only the third is addressable by making more targets persistent, which is the obvious first
-// move; whether it is the right one depends entirely on which of the three dominates, and the
-// aggregate millisecond figure cannot say. This counts them.
+// The backend also has an independent caller gate. A depth-only pass may have no colour target
+// yet request no colour result. The census records the effective request after that gate, and
+// reports requested extent rather than claiming the copy completed.
 //
 // NOTE FOR A FUTURE READER: this is the fourth census in this tree with the same shape (atomic
 // per-reason counters plus a register_exit_report line) -- see draw_disposition, pass_break_census
@@ -43,9 +37,8 @@ enum class ReadbackReasonSlot : unsigned char {
     NotWanted = 0, NoColorTarget, ExplicitRequest, BoundNonPersistent, Count
 };
 
-// `bytes` is the slot's readback extent when known, 0 otherwise. Counting bytes as well as
-// occurrences matters: a rare reason covering a 4K target costs more than a frequent one covering
-// a 64x64 scratch surface, and an occurrence count alone would rank them backwards.
+// `bytes` is the slot's requested readback extent when known, 0 otherwise. This is counted before
+// submission, so it is not a completed-transfer measurement.
 void note_readback_reason(ReadbackReasonSlot slot, uint64_t bytes);
 
 // The call site casts prosper::frontend::ColorReadbackReason straight to ReadbackReasonSlot, which

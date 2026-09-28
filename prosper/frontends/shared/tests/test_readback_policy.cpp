@@ -6,6 +6,7 @@
 using prosper::frontend::can_defer_scanout_readback;
 using prosper::frontend::is_color_target_readback_wanted;
 using prosper::frontend::color_target_readback_reason;
+using prosper::frontend::effective_color_target_readback_reason;
 using prosper::frontend::ColorReadbackReason;
 
 static int failures = 0;
@@ -80,15 +81,34 @@ int main() {
     CHECK(color_target_readback_reason(true, 7, true, false) == ColorReadbackReason::NotWanted);
     CHECK(color_target_readback_reason(true, 0, false, false) == ColorReadbackReason::NotWanted);
 
+    // A depth-only live pass supplies neither a colour target nor a colour-result request. The
+    // raw policy says NoColorTarget, but the effective request must not bill its full extent.
+    CHECK(effective_color_target_readback_reason(false, false, 0, false, false) ==
+          ColorReadbackReason::NotWanted);
+    // An offscreen caller with the same missing target does consume returned pixels.
+    CHECK(effective_color_target_readback_reason(true, false, 0, false, false) ==
+          ColorReadbackReason::NoColorTarget);
+    CHECK(effective_color_target_readback_reason(false, true, 7, false, true) ==
+          ColorReadbackReason::NotWanted);
+    CHECK(effective_color_target_readback_reason(true, true, 7, false, true) ==
+          ColorReadbackReason::ExplicitRequest);
+
     // The verdict is DEFINED as "reason != NotWanted", so the two can never disagree. Asserted
     // over the whole input space rather than at samples: the point is the invariant, not cases.
     for (int has = 0; has < 2; has++)
         for (uint64_t id : {uint64_t{0}, uint64_t{7}})
             for (int persistent = 0; persistent < 2; persistent++)
-                for (int req = 0; req < 2; req++)
+                for (int req = 0; req < 2; req++) {
                     CHECK(is_color_target_readback_wanted(has, id, persistent, req) ==
                           (color_target_readback_reason(has, id, persistent, req) !=
                            ColorReadbackReason::NotWanted));
+                    for (int wants = 0; wants < 2; wants++)
+                        CHECK((effective_color_target_readback_reason(
+                                   wants, has, id, persistent, req) !=
+                               ColorReadbackReason::NotWanted) ==
+                              (wants && is_color_target_readback_wanted(
+                                   has, id, persistent, req)));
+                }
 
     return failures ? 1 : 0;
 }

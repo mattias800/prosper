@@ -20,15 +20,12 @@ constexpr bool can_defer_scanout_readback(bool phase_allows_defer,
 
 // WHY a color target slot wants a CPU readback -- the reason, not just the verdict.
 //
-// Readback is the dominant cost inside a backend call (measured 2026-09-26 on The Messenger:
-// 68.5% of `measured` on prosper-app, 78.5% under tools/screenshot) and it forces one of every two
-// flushes, so it is also what makes the submit blocking. Deciding what to do about that needs to
-// distinguish the three ways a slot arrives here, because they have nothing in common:
-// a missing target is a caller-shape question, an explicit request is somebody downstream needing
-// bytes, and a bound-but-non-persistent target is a residency question. A bare bool cannot say
-// which, and the aggregate cost cannot be attributed without it.
+// The reason describes the target policy. The backend's `want_color_readback` is a separate caller
+// gate: a depth-only pass may have no target object and still request no colour bytes at all. Do not
+// bill its target-policy reason as a copy. The old claim that readback dominated shipped rendering
+// was withdrawn after checking that the earlier harnesses did not activate GPU presentation.
 enum class ColorReadbackReason : unsigned char {
-    NotWanted = 0,        // the slot is GPU-resident and nothing needs its bytes on the CPU
+    NotWanted = 0,        // no CPU colour result requested; may also be a depth-only pass
     NoColorTarget,        // no color target object at all -- the caller passed none
     ExplicitRequest,      // the caller or a split carrier asked for it
     BoundNonPersistent,   // a bound target that is not persistent, so its pixels are not retained
@@ -47,6 +44,17 @@ constexpr ColorReadbackReason color_target_readback_reason(bool has_color_target
     if (target_readback) return ColorReadbackReason::ExplicitRequest;
     return persistent_id != 0 && !persistent_color ? ColorReadbackReason::BoundNonPersistent
                                                    : ColorReadbackReason::NotWanted;
+}
+
+// Classify the request that will actually reach the backend copy decision. A missing target only
+// requests bytes when the caller wants a colour result; depth-only live passes set this gate false.
+constexpr ColorReadbackReason effective_color_target_readback_reason(
+    bool want_color_readback, bool has_color_target, uint64_t persistent_id,
+    bool persistent_color, bool target_readback) {
+    return want_color_readback
+        ? color_target_readback_reason(has_color_target, persistent_id,
+                                       persistent_color, target_readback)
+        : ColorReadbackReason::NotWanted;
 }
 
 // The verdict, expressed in terms of the reason so the two can never disagree. This used to be the

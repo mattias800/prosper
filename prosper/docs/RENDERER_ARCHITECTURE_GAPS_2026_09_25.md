@@ -216,15 +216,35 @@ behaved the same way. It does not.
 
 **Measured on the real windowed path, GPU present confirmed adopted:**
 
-| title | readback slots | renderer share of wall clock | rate |
+| title | raw policy-positive slots (before caller gate) | renderer share of wall clock | rate |
 |---|---|---:|---|
 | The Messenger | **1 of 36,897** (100.0% not-wanted) | 6.7% | 59.9 fps, 8,880 frames |
-| Astro Bot | 293 of 19,233 (98.5% not-wanted), 8.9 GiB | 9.4% | single-digit |
+| Astro Bot | 293 of 19,233 (98.5% not-wanted), 8.9 GiB potential extent | 9.4% | single-digit |
 
 So readback is **not** the render path's dominant cost, the submit does **not** block because of it,
-and § 2's timeline-semaphore idea is neither blocked by it nor rescued by it. What remains true is
-narrower and still worth knowing: Astro Bot really does copy 8.9 GiB back under `no-color-target`,
-which is a caller-shape question, not a residency one.
+and § 2's timeline-semaphore idea is neither blocked by it nor rescued by it. The historical
+"Astro Bot copies 8.9 GiB under `no-color-target`" conclusion is also withdrawn: that census
+classified the raw target policy but did not apply the backend's independent
+`want_color_readback` gate. The 8.9 GiB was potential extent, not proven traffic.
+
+The missed gate was exposed on 2026-09-28 by the same-binary Outer Wilds pair for #3914: the old census
+reported 542,982.6 MiB "copied" under `no-color-target` while the live caller passes no target
+for depth-only passes and sets `want_color_readback=false`. The backend gates both allocation and
+`vkCmdCopyImageToBuffer` on that value. A split segment or a disabled live-target path can still
+request bytes with no target, so the corrected census must count the *effective* request rather
+than assume the whole historical bucket is zero. The historical figures alone did not establish
+actual readback volume; the corrected runs below resolve the sampled shipped paths.
+
+The corrected, GPU-present Outer Wilds route classified 206,786 slot-0 checks: 206,785
+`not-wanted`, zero `no-color-target`, and one explicit request for 31.6 MiB of planned
+extent. Its F8 window measured 0.2 ms of readback. These are not equal-scene before/after
+throughput measurements; they show that the old 542,982.6 MiB line was an instrument error,
+not an optimization target. The requested extent is still not a completed-transfer count.
+On the same corrected binary, Astro Bot's opening classified 7,483/7,483 slots as
+`not-wanted` and its F8 window measured 0.1 ms of readback. The historical 8.9 GiB
+bucket was likewise not a measured copy cost. Compute occupied 3,745.8 ms of that
+five-second F8 window's retained components; that is the next measured lane, with
+storage materialization, RTT snapshots and detile still separately substantial.
 
 **The general lesson is the expensive half.** A harness artifact was ruled out by comparing two
 harnesses, and both had the same artifact. *Agreement between instruments is not independence.*
@@ -236,11 +256,11 @@ windowed path and stands. Astro Bot performs **24,991** pool copies there at a *
 with 113 misses; before the capacity-matching change the same workload missed 61.5%. The pool is
 genuinely exercised on the shipped path, so that fix is real.
 
-### Which readbacks are avoidable — measured, and it is not the obvious one
+### Historical raw-policy readback investigation — conclusions withdrawn
 
-The readback finding above raises one question: which of `readback_policy.hpp`'s three reasons
-dominates. They have different fixes, and only a per-reason count can choose between them. Measured
-2026-09-26 on colour slot 0, ~120 s each:
+The following 2026-09-26 slot-0 census classified target policy before the caller gate.
+Its percentages cannot rank effective readbacks and the conclusions below are preserved only
+to show the path to the later corrections. They must not guide a new optimization:
 
 | title | not-wanted | explicit-request | bound-non-persistent |
 |---|---:|---:|---:|

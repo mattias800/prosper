@@ -13194,11 +13194,11 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     const auto timing_draws_ready = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
     // Each bound color slot has its own readback contract. The caller can decline all CPU
     // color results, including the transient color attachment used by a depth-only live pass.
-    // Slot 0 is the one worth attributing: it is the scanout/primary target, it is present on
-    // every pass, and readback is the dominant cost inside this call. The reason is taken from the
-    // same call the verdict comes from, so the census cannot drift from the decision.
-    const auto readback_color0_reason = prosper::frontend::color_target_readback_reason(
-        color_target != nullptr,
+    // Attribute slot 0's effective request, including the caller's colour-result gate. A depth-only
+    // pass has no target object but requests no colour pixels; billing its extent as a readback
+    // would turn a potential copy size into fictitious traffic.
+    const auto readback_color0_reason = prosper::frontend::effective_color_target_readback_reason(
+        want_color_readback, color_target != nullptr,
         color_target ? color_target->persistent_id : 0,
         persistent_color,
         color_target ? color_target->readback : false);
@@ -13232,7 +13232,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     // is wanted, retain commands and resources in the existing submission batch. Persistent
     // attachment state is published speculatively for later LOAD/sample commands in that batch;
     // its failure cleanups invalidate the state if submission fails or the batch is discarded.
-    const bool readback_color0 = want_color_readback && readback_color0_wanted;
+    const bool readback_color0 = readback_color0_wanted;
     const bool readback_color1 = want_color_readback && readback_color1_wanted;
     const bool readback_requested = readback_color0 || readback_color1 ||
                                     (want_color_readback && readback_extra_wanted);
