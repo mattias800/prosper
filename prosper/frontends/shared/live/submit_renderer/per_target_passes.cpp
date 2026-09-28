@@ -3,6 +3,7 @@
 #include "shared/live/submit_renderer/guest_reads.hpp"
 #include "shared/live/submit_renderer/resolve_pass.hpp"     // resolve_pass (#3892)
 #include "shared/live/submit_renderer/pass_diagnostics.hpp" // the pass-loop diagnostics (#3892)
+#include "shared/live/submit_renderer/mrt_slots.hpp"        // color_binding, active_format, active_color(_count) (#3892)
 
 namespace prosper::frontend::submit_renderer {
 
@@ -178,23 +179,6 @@ void render_per_target_passes(PerTargetPassContext& ctx) {
     const auto seed_target = [&](uint64_t target) {
         return seed_rtt && !(no_seed_targets.configured &&
             no_seed_targets.includes(target));
-    };
-    // Pass grouping and same-pass feedback detection must not disagree about what an
-    // active binding is, so both go through frontends/shared/rtt/mrt_binding.hpp. These
-    // were duplicated lambdas; a second, looser copy in the feedback path classified
-    // stale named state as a live binding (#2550 review).
-    auto color_binding = [](const prosper::gpu::DrawItem& draw, uint32_t slot) {
-        return prosper::frontend::mrt_color_binding(draw, slot);
-    };
-    auto active_format = [](const prosper::gpu::DrawItem& draw, uint32_t slot) {
-        return prosper::test::backend_color_format(static_cast<VkFormat>(
-            prosper::frontend::mrt_raw_format(draw, slot)));
-    };
-    auto active_color = [](const prosper::gpu::DrawItem& draw, uint32_t slot) {
-        return prosper::frontend::mrt_active_color(draw, slot, mrt_format_defined);
-    };
-    auto active_color_count = [](const prosper::gpu::DrawItem& draw) {
-        return prosper::frontend::mrt_active_color_count(draw, mrt_format_defined);
     };
     // #3026 -- the slot-0/1 alias mirror, checked HERE, at the consumer.
     //
