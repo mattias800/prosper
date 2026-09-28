@@ -14385,7 +14385,9 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     uint64_t perf_texture_evictions = 0, perf_texture_refusals = 0, perf_texture_refused_bytes = 0;
     const uint64_t texture_protected_from = defer_texture_eviction
         ? persistent_texture_batch_floor : texture_generation;
-    auto evict_persistent_texture_entry = [&](auto victim, bool deferred) {
+    // `recovery`: a #3905 spill-recovery retirement, not cache pressure -- kept out of the
+    // eviction counters the texture-cache-thrash alarm and census read.
+    auto evict_persistent_texture_entry = [&](auto victim, bool deferred, bool recovery = false) {
         if (deferred) {
             std::vector<std::pair<VkImageView, VkSampler>> retired_bindings;
             retired_bindings.reserve(victim->second.bindings.size());
@@ -14401,8 +14403,10 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                     vkDestroyImage(dev, image, nullptr);
                     prosper::gpu::free_device_memory(dev, memory);
                 });
-            ++texture_stats.persistent_deferred_evictions;
-            texture_stats.persistent_deferred_eviction_bytes += victim->second.bytes;
+            if (!recovery) {
+                ++texture_stats.persistent_deferred_evictions;
+                texture_stats.persistent_deferred_eviction_bytes += victim->second.bytes;
+            }
         } else {
             for (const auto& [key, binding] : victim->second.bindings) {
                 if (binding.sampler) vkDestroySampler(dev, binding.sampler, nullptr);
@@ -14415,6 +14419,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         if (victim->second.off_device) persistent_texture_off_device_bytes -= victim->second.bytes;
         persistent_texture_binding_entries -= victim->second.bindings.size();
         persistent_texture_images.erase(victim);
+        if (recovery) return;
         texture_path_census.evicted();
         ++perf_texture_evictions;
     };
@@ -14496,7 +14501,10 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     // protection above would never release, so recovery ignores last_use and always retires the
     // image through the batch's completion cleanup: this pass and earlier passes of the batch keep
     // sampling the old image until the batch's fence, and nothing waits on the GPU.
-    if (persistent_texture_off_device_bytes && !backend_has_unproven_submission()) {
+    // Recovery always retires through the completion cleanup, so it follows the same switch as
+    // deferred eviction (PROSPER_NO_DEFERRED_TEXTURE_EVICTION turns both off).
+    if (persistent_texture_off_device_bytes && !backend_has_unproven_submission() &&
+        persistent_texture_deferred_eviction_enabled()) {
         uint64_t allowance = render_spill_recovery_allowance(
             ctx, persistent_texture_spill_recovery, persistent_texture_off_device_bytes);
         uint64_t reclaimed = 0, reclaimed_entries = 0;
@@ -14507,7 +14515,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 allowance -= it->second.bytes;
                 reclaimed += it->second.bytes;
                 ++reclaimed_entries;
-                evict_persistent_texture_entry(it, true);
+                evict_persistent_texture_entry(it, true, true);
             }
             it = next;
         }
