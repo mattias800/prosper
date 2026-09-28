@@ -1,5 +1,6 @@
 #include "hle/dispatch/dispatch.hpp"
 #include "host/image/boot_program.hpp"   // #1659
+#include "diagnostics/perf/perf_ledger.hpp"   // #3891: unimplemented-hle-calls alarm
 #include <cstdlib>
 #include <unordered_map>
 #include <mutex>
@@ -235,6 +236,10 @@ extern "C" uint64_t prosper_on_unimpl(uint64_t import_index, uint64_t guest_retu
     std::lock_guard<std::mutex> lk(g_unimpl_mx);   // serialize concurrent worker-thread unimpl calls
     if (idx >= g_count.size()) return 0;           // out-of-range import index: ignore (no alloc, no fault)
     uint64_t c = ++g_count[idx];
+    // #3891 unimplemented-hle-calls: every call, and the first call of each distinct import.
+    prosper::diagnostics::perf::add(prosper::diagnostics::perf::Counter::HleUnimplementedCalls);
+    if (c == 1)
+        prosper::diagnostics::perf::add(prosper::diagnostics::perf::Counter::HleUnimplementedFirst);
     if (c == 1) {
         g_order.push_back(idx);
         if (g_progress) (*g_progress)++;

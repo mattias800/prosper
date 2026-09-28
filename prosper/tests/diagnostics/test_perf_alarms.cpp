@@ -16,6 +16,7 @@
 #include "diagnostics/perf/perf_ledger.hpp"
 #include "diagnostics/transfer_pressure.hpp"
 #include "gpu/diagnostics/draw_disposition.hpp"
+#include "hle/dispatch/dispatch.hpp"
 
 #include <chrono>
 #include <cstdint>
@@ -456,6 +457,143 @@ void test_gpu_memory_off_device() {
           sustain_windows("gpu-memory-off-device") == 1);
 }
 
+// ---- #3891 queue rules (2026-09-28) -----------------------------------------------------------
+
+void test_unaccounted_draws() {
+    std::puts("unaccounted-draws");
+    WindowSample bad = healthy();
+    set_count(bad, Counter::DrawsUnaccounted, 18);   // Sonic Frontiers' exit census, 2026-09-27
+    const auto a = evaluate_rules(bad, kDefault);
+    check("an unaccounted draw fires unaccounted-draws alone", only(a, "unaccounted-draws"));
+    check("...naming the count", !a.empty() && a[0].detail.find("unaccounted=18") != std::string::npos);
+    WindowSample one = healthy();
+    set_count(one, Counter::DrawsUnaccounted, 1);
+    check("one is enough (correctness), even at lowered sensitivity",
+          fired(evaluate_rules(one, RuleThresholds::scaled(1000)), "unaccounted-draws"));
+    WindowSample dropped = healthy();
+    set_count(dropped, Counter::DroppedDrawsBackend, 3);
+    check("named drops alone do not raise unaccounted-draws",
+          !fired(evaluate_rules(dropped, kDefault), "unaccounted-draws"));
+    check("correctness sustain", sustain_windows("unaccounted-draws") == 1);
+}
+
+void test_unimplemented_hle_calls() {
+    std::puts("unimplemented-hle-calls");
+    // The ledger hook, through the real dispatcher: two imports, three calls.
+    Ledger& l = ledger();
+    const auto n = [&](Counter c) { return l.counters[static_cast<size_t>(c)].load(); };
+    const uint64_t calls0 = n(Counter::HleUnimplementedCalls), first0 = n(Counter::HleUnimplementedFirst);
+    static const std::vector<prosper::ImportSlot> slots = {{"libSceTest", "AAAAAAAAAAA"},
+                                                            {"libSceTest", "BBBBBBBBBBB"}};
+    prosper::dispatch_init(&slots, nullptr);
+    prosper::prosper_on_unimpl(0);
+    prosper::prosper_on_unimpl(0);
+    prosper::prosper_on_unimpl(1);
+    check("prosper_on_unimpl counts every call and each import's first call",
+          n(Counter::HleUnimplementedCalls) - calls0 == 3 &&
+              n(Counter::HleUnimplementedFirst) - first0 == 2);
+    prosper::dispatch_init(nullptr, nullptr);
+
+    WindowSample bad = healthy();
+    set_count(bad, Counter::HleUnimplementedFirst, 1);
+    set_count(bad, Counter::HleUnimplementedCalls, 40);
+    const auto a = evaluate_rules(bad, kDefault);
+    check("a new unregistered NID after boot fires unimplemented-hle-calls alone",
+          only(a, "unimplemented-hle-calls"));
+    check("...with the new count and the window's calls",
+          !a.empty() && a[0].detail.find("new-unimplemented=1 calls=40") != std::string::npos);
+    WindowSample repeat = healthy();
+    set_count(repeat, Counter::HleUnimplementedCalls, 400);
+    check("repeated calls to an ALREADY-seen unregistered NID stay quiet (it was reported once)",
+          evaluate_rules(repeat, kDefault).empty());
+    check("correctness sustain", sustain_windows("unimplemented-hle-calls") == 1);
+}
+
+void test_diagnostic_path_active() {
+    std::puts("diagnostic-path-active");
+    WindowSample bad = healthy();
+    set_gauge(bad, Gauge::DiagnosticPathSwitches,
+              (1ull << static_cast<unsigned>(DiagnosticPathSwitch::NoLiveTargets)) |
+                  (1ull << static_cast<unsigned>(DiagnosticPathSwitch::PerPassPixelDump)));
+    const auto a = evaluate_rules(bad, kDefault);
+    check("a diagnostic switch that turned live targets off fires diagnostic-path-active alone",
+          only(a, "diagnostic-path-active"));
+    check("...naming every switch",
+          !a.empty() &&
+              a[0].detail.find("switches=PROSPER_NO_LIVE_PERSISTENT_COLOR_TARGETS,per-pass-pixel-dump") !=
+                  std::string::npos);
+    check("the production path (gauge 0) is quiet", evaluate_rules(healthy(), kDefault).empty());
+    check("state rule: first window", sustain_windows("diagnostic-path-active") == 1);
+}
+
+void test_present_path_fallback() {
+    std::puts("present-path-fallback");
+    WindowSample bad = healthy();
+    set_count(bad, Counter::PresentCpuFallbacks, 140);
+    set_cost(bad, Cost::PresentCpu, 1.0, 10, 0.2);   // 10 GPU scanouts, cheap
+    const auto a = evaluate_rules(bad, kDefault);
+    check("most presents from the CPU fallback fires present-path-fallback alone",
+          only(a, "present-path-fallback"));
+    check("...with both counts", !a.empty() &&
+              a[0].detail.find("cpu-fallback=140 gpu-scanout=10") != std::string::npos);
+    WindowSample startup = healthy();
+    set_count(startup, Counter::PresentCpuFallbacks, 40);    // 8/s, before the first GPU publish
+    set_cost(startup, Cost::PresentCpu, 10.0, 130, 0.2);
+    check("a minority of fallback presents (startup, 23%, above the rate floor) is quiet",
+          evaluate_rules(startup, kDefault).empty());
+    WindowSample few = healthy();
+    set_count(few, Counter::PresentCpuFallbacks, 20);         // 4/s, all fallback
+    check("below the 5/s floor is quiet", evaluate_rules(few, kDefault).empty());
+    WindowSample none = healthy();
+    check("no presents of either kind: no data", !rule_has_data("present-path-fallback", none));
+    set_count(none, Counter::PresentCpuFallbacks, 1);
+    check("a fallback present is data", rule_has_data("present-path-fallback", none));
+    check("performance sustain (2)", sustain_windows("present-path-fallback") == 2);
+}
+
+void test_pipeline_cache_thrash() {
+    std::puts("pipeline-cache-thrash");
+    WindowSample bad = healthy();
+    set_count(bad, Counter::PipelineEvictions, 60);
+    set_count(bad, Counter::DescriptorSetLayoutEvictions, 5);
+    const auto a = evaluate_rules(bad, kDefault);
+    check("13 evictions/s fires pipeline-cache-thrash alone", only(a, "pipeline-cache-thrash"));
+    check("...by cache, largest first",
+          !a.empty() && a[0].detail.find("by-cache=pipeline:60,descriptor-set-layout:5") !=
+                            std::string::npos);
+    WindowSample layouts = healthy();
+    set_count(layouts, Counter::DescriptorSetLayoutEvictions, 30);
+    set_count(layouts, Counter::PipelineLayoutEvictions, 30);
+    check("layout caches alone count too (12 evictions/s)",
+          fired(evaluate_rules(layouts, kDefault), "pipeline-cache-thrash"));
+    WindowSample dsl = healthy();
+    set_count(dsl, Counter::DescriptorSetLayoutEvictions, 40);
+    check("the descriptor-set-layout cache alone counts (8/s)",
+          fired(evaluate_rules(dsl, kDefault), "pipeline-cache-thrash"));
+    WindowSample churn = healthy();
+    set_count(churn, Counter::PipelineLayoutEvictions, 20);   // 4/s: a scene change
+    check("4 evictions/s is quiet", evaluate_rules(churn, kDefault).empty());
+    check("...but fires at a quarter of the threshold",
+          fired(evaluate_rules(churn, RuleThresholds::scaled(25)), "pipeline-cache-thrash"));
+}
+
+void test_texture_validation_churn() {
+    std::puts("texture-validation-churn");
+    WindowSample bad = healthy();
+    // Sonic's movie planes: ~8 MiB compared and failed ~30 times a second.
+    set_count(bad, Counter::TextureValidationFailures, 150);
+    set_count(bad, Counter::TextureValidationFailedBytes, 150ull * 8 * 1024 * 1024);
+    const auto a = evaluate_rules(bad, kDefault);
+    check("240 MiB/s of failed validations fires texture-validation-churn alone",
+          only(a, "texture-validation-churn"));
+    check("...with the count and bytes", !a.empty() &&
+              a[0].detail.find("failed-validations=150 validated=1200MiB") != std::string::npos);
+    WindowSample small = healthy();
+    set_count(small, Counter::TextureValidationFailures, 500);
+    set_count(small, Counter::TextureValidationFailedBytes, 500ull * 256 * 1024);   // 25 MiB/s
+    check("many small failed validations (25 MiB/s) are quiet", evaluate_rules(small, kDefault).empty());
+}
+
 void set_transfer(WindowSample& w, prosper::diagnostics::Transfer t, double mib_per_s) {
     w.transfer_bytes[static_cast<size_t>(t)] =
         static_cast<uint64_t>(mib_per_s * w.seconds * 1024.0 * 1024.0);
@@ -763,9 +901,10 @@ void test_engine() {
     const std::string quiet = slurp(logp);
     check("...saying no rule fired", quiet.find("no rule fired in 1 windows") != std::string::npos);
     check("...and listing the rules that had no data as NOT quiet",
-          quiet.find("8 of 10 rules had data") != std::string::npos &&
+          quiet.find("13 of 16 rules had data") != std::string::npos &&
               quiet.find("NO DATA (not measured in any window, so not quiet): "
-                         "texture-reference-cost,present-cpu-overhead") != std::string::npos);
+                         "texture-reference-cost,present-cpu-overhead,present-path-fallback") !=
+                  std::string::npos);
     std::fclose(s);
     std::remove(jsonl.c_str());
     std::remove(logp.c_str());
@@ -865,6 +1004,12 @@ int main() {
     test_drop_reasons();
     test_skipped_dispatches();
     test_gpu_memory_off_device();
+    test_unaccounted_draws();
+    test_unimplemented_hle_calls();
+    test_diagnostic_path_active();
+    test_present_path_fallback();
+    test_pipeline_cache_thrash();
+    test_texture_validation_churn();
     test_host_copy_pressure();
     test_shader_compile();
     test_sampler_seed();
@@ -874,9 +1019,9 @@ int main() {
     test_texture_reference_sample();
     test_engine();
     test_engine_breakdowns();
-    check("rule_names lists the six phase-2 rules, the three added with phase 3, and "
-          "gpu-memory-off-device (#3897)",
-          rule_names().size() == 10);
+    check("rule_names lists the six phase-2 rules, the three added with phase 3, "
+          "gpu-memory-off-device (#3897) and the six 2026-09-28 queue rules",
+          rule_names().size() == 16);
     std::printf("%s: %d failure(s)\n", g_failures ? "FAILED" : "ok", g_failures);
     return g_failures ? 1 : 0;
 }

@@ -155,6 +155,14 @@ void DrawDispositionCensus::report_pass() {
         pass_dropped[i] = s.pass_dropped[i].exchange(0, std::memory_order_relaxed);
         pass_dropped_total += pass_dropped[i];
     }
+    // #3891 unaccounted-draws: the census's blind spot as a perf-alarm counter, once per pass and
+    // independent of the report switch below.
+    if (pass_seen || pass_recorded || pass_dropped_total) {
+        const int64_t diff = static_cast<int64_t>(pass_seen) - static_cast<int64_t>(pass_recorded) -
+                             static_cast<int64_t>(pass_dropped_total);
+        if (diff) prosper::diagnostics::perf::add(prosper::diagnostics::perf::Counter::DrawsUnaccounted,
+                                                  static_cast<uint64_t>(diff < 0 ? -diff : diff));
+    }
     if (!reporting_enabled() || pass_seen == 0) return;
 
     // Two independent routes to the same quantity. A disagreement means a drop path exists that

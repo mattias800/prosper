@@ -64,8 +64,13 @@ RuleThresholds RuleThresholds::scaled(double percent) {
     t.host_copy_mib_per_s *= k;
     t.shader_compile_budget_share *= k;
     t.shader_compile_min_per_s *= k;
-    // dropped_draws, skipped_dispatches and gpu_memory_off_device stay at "any": a correctness
-    // alarm has no sensitivity to lower.
+    t.present_fallback_share *= k;
+    t.present_fallback_min_per_s *= k;
+    t.pipeline_cache_evictions_per_s *= k;
+    t.texture_validation_failed_mib_per_s *= k;
+    // dropped_draws, skipped_dispatches, gpu_memory_off_device, unaccounted_draws and
+    // unimplemented_first_calls stay at "any": a correctness alarm has no sensitivity to lower.
+    // diagnostic-path-active is a state and has no threshold.
     return t;
 }
 
@@ -74,7 +79,9 @@ const std::vector<const char*>& rule_names() {
         "texture-cache-thrash", "surface-readback", "texture-reference-cost",
         "hle-blocking-wait",    "present-cpu-overhead", "dropped-draws",
         "skipped-dispatches",   "host-copy-pressure",   "shader-compile",
-        "gpu-memory-off-device",
+        "gpu-memory-off-device", "unaccounted-draws",   "unimplemented-hle-calls",
+        "diagnostic-path-active", "present-path-fallback", "pipeline-cache-thrash",
+        "texture-validation-churn",
     };
     return names;
 }
@@ -83,6 +90,9 @@ bool rule_has_data(const char* rule, const WindowSample& w) {
     const std::string r = rule ? rule : "";
     if (r == "present-cpu-overhead") return w.events(Cost::PresentCpu) != 0;
     if (r == "texture-reference-cost") return w.events(Cost::TextureRefSample) != 0;
+    // Presents of either kind: a frontend without GPU present has no data for this rule.
+    if (r == "present-path-fallback")
+        return w.events(Cost::PresentCpu) != 0 || w.count(Counter::PresentCpuFallbacks) != 0;
     // The others measure events whose ABSENCE is the healthy answer: no readback, no contended
     // lock, no refusal, no dropped draw. Zero there is data.
     return true;
@@ -90,7 +100,9 @@ bool rule_has_data(const char* rule, const WindowSample& w) {
 
 uint32_t sustain_windows(const char* rule) {
     const std::string r = rule ? rule : "";
-    if (r == "dropped-draws" || r == "skipped-dispatches" || r == "gpu-memory-off-device")
+    if (r == "dropped-draws" || r == "skipped-dispatches" || r == "gpu-memory-off-device" ||
+        r == "unaccounted-draws" || r == "unimplemented-hle-calls" ||
+        r == "diagnostic-path-active")
         return kCorrectnessSustainWindows;
     if (r == "shader-compile") return kShaderCompileSustainWindows;
     if (r == "texture-reference-cost") return kTextureReferenceSustainWindows;
@@ -362,6 +374,144 @@ std::vector<AlarmFiring> evaluate_rules(const WindowSample& w, const RuleThresho
                      "cache that never hits looks like (a key that changes every frame, or a cache "
                      "evicting what it just built); next: PROSPER_RENDER_TIMING shader hit/miss "
                      "and pipeline cache stats, F8 setup_pipeline_ms";
+            out.push_back(std::move(a));
+        }
+    }
+    // unaccounted-draws (CORRECTNESS).
+    {
+        const uint64_t n = w.count(Counter::DrawsUnaccounted);
+        if (n && n >= t.unaccounted_draws) {
+            AlarmFiring a;
+            a.rule = "unaccounted-draws";
+            a.value = static_cast<double>(n);
+            a.unit = "draws";
+            a.threshold = static_cast<double>(t.unaccounted_draws);
+            a.detail = format("unaccounted=%llu flips=%llu (per pass |seen - recorded - dropped|)",
+                              (unsigned long long)n, (unsigned long long)w.flips);
+            a.hint = "some draws were neither recorded nor dropped with a reason: a skip site that "
+                     "does not call note_dropped (or a draw counted twice), so dropped-draws cannot "
+                     "see them; next: the [draw-disposition] ... UNACCOUNTED= lines, "
+                     "PROSPER_DRAW_DISPOSITION_VERBOSE=1 for every pass (gpu/diagnostics/"
+                     "draw_disposition.hpp); cf. #3891";
+            out.push_back(std::move(a));
+        }
+    }
+
+    // unimplemented-hle-calls (CORRECTNESS class: news).
+    {
+        const uint64_t first = w.count(Counter::HleUnimplementedFirst);
+        if (first && first >= t.unimplemented_first_calls) {
+            AlarmFiring a;
+            a.rule = "unimplemented-hle-calls";
+            a.value = static_cast<double>(first);
+            a.unit = "new-nids";
+            a.threshold = static_cast<double>(t.unimplemented_first_calls);
+            a.detail = format("new-unimplemented=%llu calls=%llu (all unimplemented calls this "
+                              "window) flips=%llu",
+                              (unsigned long long)first,
+                              (unsigned long long)w.count(Counter::HleUnimplementedCalls),
+                              (unsigned long long)w.flips);
+            a.hint = "the guest called a Sony function prosper has not registered, after boot: the "
+                     "dispatcher answered 0 (reads as SCE_OK) and wrote no out-parameter, so the "
+                     "guest may act on garbage; next: the [prosper] unimplemented: line names "
+                     "library::NID [name]; implement it or answer it honestly; cf. #2951, #2023";
+            out.push_back(std::move(a));
+        }
+    }
+
+    // diagnostic-path-active (STATE).
+    {
+        const uint64_t mask = w.gauge(Gauge::DiagnosticPathSwitches);
+        if (mask) {
+            AlarmFiring a;
+            a.rule = "diagnostic-path-active";
+            a.value = 1;
+            a.unit = "state";
+            a.threshold = 1;
+            std::string names;
+            for (size_t i = 0; i < kDiagnosticPathSwitchCount; ++i) {
+                if (!(mask & (1ull << i))) continue;
+                if (!names.empty()) names += ',';
+                names += kDiagnosticPathSwitchNames[i];
+            }
+            a.detail = format("switches=%s live-gpu-color-targets=off", names.c_str());
+            a.hint = "this run is NOT on the production render path: a diagnostic switch turned "
+                     "the GPU-resident colour targets off, so every frame is read back to the CPU "
+                     "and re-presented; no performance number from this run describes what ships; "
+                     "next: unset the named switch; cf. #3909";
+            out.push_back(std::move(a));
+        }
+    }
+
+    // present-path-fallback (SHARE of presents, with a floor).
+    {
+        const uint64_t fallback = w.count(Counter::PresentCpuFallbacks);
+        const uint64_t gpu = w.events(Cost::PresentCpu);
+        const double share = fallback + gpu
+            ? static_cast<double>(fallback) / static_cast<double>(fallback + gpu) : 0.0;
+        if (fallback && per_second(fallback, w.seconds) >= t.present_fallback_min_per_s &&
+            share > t.present_fallback_share) {
+            AlarmFiring a;
+            a.rule = "present-path-fallback";
+            a.value = share * 100.0;
+            a.unit = "%presents";
+            a.threshold = t.present_fallback_share * 100.0;
+            a.detail = format("cpu-fallback=%llu gpu-scanout=%llu flips=%llu",
+                              (unsigned long long)fallback, (unsigned long long)gpu,
+                              (unsigned long long)w.flips);
+            a.hint = "GPU present is on, but most frames were shown from a CPU readback (a full "
+                     "frame read back and re-uploaded each present): live colour targets are off "
+                     "or the GPU publish keeps missing; next: diagnostic-path-active, the [app] "
+                     "fps line's gpu-present cpu-fallback count, PROSPER_PRESENT_HANDOFF_TRACE=1; "
+                     "cf. #1270, #3895";
+            out.push_back(std::move(a));
+        }
+    }
+
+    // pipeline-cache-thrash (RATE, by cache).
+    {
+        uint64_t by_cache[3] = {w.count(Counter::PipelineEvictions),
+                                w.count(Counter::PipelineLayoutEvictions),
+                                w.count(Counter::DescriptorSetLayoutEvictions)};
+        static const char* const kCacheNames[3] = {"pipeline", "pipeline-layout",
+                                                   "descriptor-set-layout"};
+        const uint64_t n = by_cache[0] + by_cache[1] + by_cache[2];
+        const double rate = per_second(n, w.seconds);
+        if (n && rate >= t.pipeline_cache_evictions_per_s) {
+            AlarmFiring a;
+            a.rule = "pipeline-cache-thrash";
+            a.value = rate;
+            a.unit = "evictions/s";
+            a.threshold = t.pipeline_cache_evictions_per_s;
+            a.breakdown = ranked(by_cache, kCacheNames, 3);
+            a.detail = format("evictions=%llu by-cache=%s flips=%llu", (unsigned long long)n,
+                              top_entries(a.breakdown).c_str(), (unsigned long long)w.flips);
+            a.hint = "a renderer object cache is full and keeps evicting what the scene uses, so "
+                     "pipelines (a driver compile each) and layouts are rebuilt every frame; next: "
+                     "PROSPER_RENDER_TIMING pipeline/layout cache stats (entries, evictions), "
+                     "shader-compile alarm, F8 setup_pipeline_ms";
+            out.push_back(std::move(a));
+        }
+    }
+
+    // texture-validation-churn (RATE).
+    {
+        const uint64_t bytes = w.count(Counter::TextureValidationFailedBytes);
+        const double mib_per_s = per_second(bytes, w.seconds) / kMiB;
+        if (bytes && mib_per_s >= t.texture_validation_failed_mib_per_s) {
+            AlarmFiring a;
+            a.rule = "texture-validation-churn";
+            a.value = mib_per_s;
+            a.unit = "MiB/s";
+            a.threshold = t.texture_validation_failed_mib_per_s;
+            a.detail = format("failed-validations=%llu validated=%.0fMiB flips=%llu",
+                              (unsigned long long)w.count(Counter::TextureValidationFailures),
+                              bytes / kMiB, (unsigned long long)w.flips);
+            a.hint = "persistent decode-cache entries are compared byte-for-byte against guest "
+                     "memory and found changed every time (a movie plane, a streamed atlas): the "
+                     "compare is certain to fail and is paid on top of the re-decode; next: "
+                     "PROSPER_TEXREF_CENSUS=1 persist_invalid class, PROSPER_DETILE_STATS; treat "
+                     "such an entry as volatile and skip the compare; cf. #3900";
             out.push_back(std::move(a));
         }
     }

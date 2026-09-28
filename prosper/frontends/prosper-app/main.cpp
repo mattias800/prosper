@@ -3397,6 +3397,9 @@ int main(int argc, char** argv) {
                         lastFrameSeq = cf.frame_seq;
                         shown.record(
                             prosper::frontend::PresentedFrameSource::GpuCpuFallback, running);
+                        // #3891 present-path-fallback: GPU scanouts are counted by PresentCpu.
+                        prosper::diagnostics::perf::add(
+                            prosper::diagnostics::perf::Counter::PresentCpuFallbacks);
                         trace.emit(prosper::perf::PresentHandoffEvent::CpuShown);
                         // Present-rate log for this branch too. Without it a run whose every frame
                         // takes the CPU fallback -- any run with live GPU targets off, e.g.
