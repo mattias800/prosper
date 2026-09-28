@@ -190,10 +190,12 @@ bool g_ever_volume_target = false;
 // itself (the resolve copy below). See volume_target_index.hpp for why queries stay exact.
 prosper::frontend::VolumeTargetIndex g_volume_targets;
 
-// The ONE place a renderer-produced volume's claim over its guest footprint is settled, by
-// live_rtt_settle_volume_footprint's rule: a claim needs a valid renderer image, and a pass or
+// The one place a PRODUCER OUTCOME settles a renderer-produced volume's claim over its guest
+// footprint, by live_rtt_settle_volume_footprint's rule: a claim needs a valid renderer image, and a pass or
 // refusal without one releases any earlier claim. Otherwise every later sample of the address is
 // refused and its draw dropped, with guest memory never allowed to stand in (#3842, #3889, #3890).
+// Not a global invariant: a partial guest write, the pending-write overflow path and the MSAA-resolve
+// destination copy keep or copy a claim without an image on purpose (#3842's tombstone).
 void settle_volume_guest_footprint(uint64_t base, RttSurf& surface, bool renderer_image_valid,
                                    uint64_t bytes, bool proven) {
     const prosper::frontend::LiveRttVolumeFootprint settled =
@@ -11417,10 +11419,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         // renderer now holds a valid image to serve it from. The backend marks a
                         // retained volume valid only once every slice is proven written, so a
                         // volume whose slices are never proven keeps guest memory authoritative, as
-                        // before #3842; a proven-complete volume keeps its full protection. GTA V's
-                        // 32x32x32 colour-grading LUT is the worked case: its only raster pass
-                        // writes slice 0 of 32, and a compute program rewrites the whole allocation
-                        // in guest memory. Claiming it made that compute skip and every draw that
+                        // before #3842; a proven-complete volume keeps its protection while its
+                        // image survives. GTA V's 32x32x32 colour-grading LUT is the worked case:
+                        // its only raster pass writes slice 0 of 32, and a compute program writes
+                        // the LUT back to guest memory. Claiming it made that compute skip and every draw that
                         // samples the LUT drop, blacking out the menus and HUD (#3842, #3889).
                         settle_volume_guest_footprint(base, surface, surface.gpu_valid,
                                                       producer_volume_guard_bytes,

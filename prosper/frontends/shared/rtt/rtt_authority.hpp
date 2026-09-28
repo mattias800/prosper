@@ -100,8 +100,8 @@ constexpr bool live_rtt_complete_guest_overwrite(uint64_t target_address,
 // the renderer can actually serve -- a retained image proven complete -- may; otherwise every sample
 // of that address would be refused (see live_rtt_unpublished_volume_blocks_sample) and its draw
 // dropped, with guest memory never allowed to stand in. GTA V's 32x32x32 colour-grading LUT never
-// proves complete -- its only raster pass writes slice 0 of 32, and a compute program rewrites the
-// whole allocation in guest memory -- and blacked out every GTA V menu when this was claimed
+// proves complete -- its only raster pass writes slice 0 of 32, and a compute program writes the
+// LUT back to guest memory -- and blacked out every GTA V menu when this was claimed
 // unconditionally (#3842 regression). Without a servable image, guest memory stays authoritative.
 constexpr bool live_rtt_volume_claims_authority(bool volume_target, bool renderer_image_valid) {
     return volume_target && renderer_image_valid;
