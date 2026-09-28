@@ -168,6 +168,9 @@ struct RttSurf {
     std::array<float, 4> uniform_color{};
     uint32_t w = 0, h = 0;
     uint32_t volume_depth = 0; // zero is a 2D target; never infer volume from guest address
+    // Guest MSAA sample count (CB_COLORn_ATTRIB.NUM_SAMPLES); the renderer image is single-sample,
+    // but the guest surface is `samples` times larger (#3906 depth-layer overlap footprint).
+    uint32_t samples = 1;
     // Outstanding guest footprint of a renderer-produced volume. A later 2D alias may have
     // current 2D pixels, but cannot make the other volume slices valid guest bytes.
     uint64_t volume_guest_bytes = 0;
@@ -4724,9 +4727,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                             uint32_t bpp = prosper::test::backend_color_bytes_per_pixel(
                                                 surf.format);
                                             if (!bpp) bpp = 16u;
+                                            // An unresolved MSAA target stores every sample
+                                            // in guest memory (#3906).
                                             const uint64_t padded =
                                                 ((static_cast<uint64_t>(surf.w) + 255u) & ~255ull) *
-                                                ((static_cast<uint64_t>(surf.h) + 255u) & ~255ull) * bpp;
+                                                ((static_cast<uint64_t>(surf.h) + 255u) & ~255ull) * bpp *
+                                                std::max(surf.samples, 1u);
                                             const uint64_t span =
                                                 std::max<uint64_t>(padded, surf.volume_guest_bytes);
                                             if (color_base < addr + bytes &&
@@ -11635,6 +11641,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         RttSurf& surface = g_rtt[base];
                         surface.w = gw;
                         surface.h = gh;
+                        surface.samples = pass.empty()
+                            ? 1u : 1u << pass.front()->ps.color_targets[0].log2_samples;
                         surface.volume_depth = backend_target.volume_depth;
                         surface.format = pass_format;
                         surface.guest_format = pass.empty()
@@ -11760,6 +11768,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         RttSurf& surface = g_rtt[pass_bases[slot]];
                         surface.w = gw;
                         surface.h = gh;
+                        surface.samples = pass.empty()
+                            ? 1u : 1u << pass.front()->ps.color_targets[slot].log2_samples;
                         surface.volume_depth = 0;
                         surface.format = pass_formats[slot];
                         surface.guest_format = pass.empty()

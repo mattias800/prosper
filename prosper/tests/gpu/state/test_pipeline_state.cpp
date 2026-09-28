@@ -81,6 +81,13 @@ int main() {
     CHECK(!resolve_pipeline_state(logic).logic_op_enable,
           "non-normal CB mode does not become a Vulkan logic op");
 
+    // #3906: the MRT slot's guest MSAA sample count survives resolution (overlap footprints).
+    RenderState msaa;
+    msaa.color_targets[2].log2_samples = 2;
+    const ResolvedPipelineState msaa_ps = resolve_pipeline_state(msaa);
+    CHECK(msaa_ps.color_targets[2].log2_samples == 2 && msaa_ps.color_targets[0].log2_samples == 0,
+          "CB_COLORn_ATTRIB.NUM_SAMPLES resolves per MRT slot");
+
     // A default/empty RenderState resolves to a safe pipeline (point list, undefined format, no blend).
     ResolvedPipelineState def = resolve_pipeline_state(RenderState{});
     CHECK(def.topology == 0 && def.color0_format == 0 && !def.blend_enable && !def.depth_test_enable,
