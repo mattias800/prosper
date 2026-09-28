@@ -220,7 +220,8 @@ enum class DepthArrayGpuResult { NoIdentity, Ready, Unavailable, Fallback };
 inline DepthArrayGpuResult copy_persistent_ds_depth_array_gpu(
         uint64_t base, uint32_t width, uint32_t height, uint32_t first_layer,
         uint32_t layer_count, VkFormat output_format, BackendSubmissionBatch& batch,
-        std::shared_ptr<PersistentDsDepthArrayGpuImage>& output, std::string& error) {
+        std::shared_ptr<PersistentDsDepthArrayGpuImage>& output, std::string& error,
+        const DepthArrayGuestSource* guest_source = nullptr) {
     output.reset();
     if (batch.retains_pending_resources()) return DepthArrayGpuResult::Fallback;
     if (output_format != VK_FORMAT_R32_SFLOAT && output_format != VK_FORMAT_R32G32B32A32_SFLOAT)
@@ -242,10 +243,11 @@ inline DepthArrayGpuResult copy_persistent_ds_depth_array_gpu(
     int fail_after = depth_array_readback_failure_after_layers();
     depth_array_readback_failure_after_layers() = -1;
     std::vector<PersistentDsImage*> selected;
+    std::vector<DepthArrayGuestLayer> guest_layers;
     uint32_t source_format = VK_FORMAT_UNDEFINED;
     const PersistentDsDepthArrayStatus selection = select_persistent_ds_depth_array(
         base, width, height, first_layer, layer_count, selected, source_format, error, &batch,
-        /*flush_producer=*/false);
+        /*flush_producer=*/false, guest_source, &guest_layers);
     if (selection == PersistentDsDepthArrayStatus::NoIdentity) return DepthArrayGpuResult::NoIdentity;
     if (selection == PersistentDsDepthArrayStatus::Unavailable) return DepthArrayGpuResult::Unavailable;
     if (fail_after >= 0 && static_cast<uint32_t>(fail_after) < layer_count) {
@@ -259,6 +261,11 @@ inline DepthArrayGpuResult copy_persistent_ds_depth_array_gpu(
         depth_array_readback_failure_after_layers() = fail_after;
         return DepthArrayGpuResult::Fallback;
     };
+    // A guest-authoritative layer (#3893) is written into the packed plane buffer with
+    // vkCmdFillBuffer, which is exact only for a uniform layer -- the case the guest leaves when it
+    // never writes the layer, or clears it. Anything else needs a detile, which the CPU route does.
+    for (const DepthArrayGuestLayer& guest : guest_layers)
+        if (!guest.uniform) return fallback();
     auto slot = depth_array_gpu_slot(ctx, output_format, width, height, layer_count);
     if (!slot) return fallback();
     const RenderCommandPoolLease lease = acquire_render_command_pool(ctx.dev, ctx.qfi);
@@ -289,7 +296,7 @@ inline DepthArrayGpuResult copy_persistent_ds_depth_array_gpu(
     // DEPTH_STENCIL_ATTACHMENT_OPTIMAL between passes (the CPU readback relies on the same contract).
     std::vector<VkImage> sources;
     for (const PersistentDsImage* image : selected)
-        if (std::find(sources.begin(), sources.end(), image->image) == sources.end())
+        if (image && std::find(sources.begin(), sources.end(), image->image) == sources.end())
             sources.push_back(image->image);
     std::vector<VkImageMemoryBarrier> barriers;
     for (VkImage source : sources)
@@ -311,7 +318,10 @@ inline DepthArrayGpuResult copy_persistent_ds_depth_array_gpu(
         static_cast<uint32_t>(barriers.size()), barriers.data());
 
     const VkDeviceSize plane_bytes = static_cast<VkDeviceSize>(width) * height * sizeof(float);
+    for (const DepthArrayGuestLayer& guest : guest_layers)
+        vkCmdFillBuffer(command, slot->buffer, plane_bytes * guest.layer, plane_bytes, guest.word);
     for (uint32_t layer = 0; layer < layer_count; ++layer) {
+        if (!selected[layer]) continue;   // a guest layer, filled above
         VkBufferImageCopy copy{};
         copy.bufferOffset = plane_bytes * layer;
         copy.imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};

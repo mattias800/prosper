@@ -658,6 +658,13 @@ void register_cpu_rtt_dcc_metadata(
     }
 }
 
+// Bumped whenever a drain observes at least one queued guest GPU write (or an overflow), so a
+// callback-scoped cache of guest bytes can tell that memory it read may have changed (#3893).
+std::atomic<uint64_t>& guest_gpu_write_drain_epoch() {
+    static std::atomic<uint64_t> epoch{0};
+    return epoch;
+}
+
 void drain_guest_gpu_writes(RttCache& cache, bool invalidate_ds) {
     auto& pending = pending_guest_gpu_writes();
     std::vector<PendingGuestGpuWrite> ranges;
@@ -668,6 +675,8 @@ void drain_guest_gpu_writes(RttCache& cache, bool invalidate_ds) {
         overflowed = pending.overflowed;
         pending.overflowed = false;
     }
+    if (!ranges.empty() || overflowed)
+        guest_gpu_write_drain_epoch().fetch_add(1, std::memory_order_relaxed);
     auto* census = guest_write_drain_census();
     if (census) {
         ++census->calls;
@@ -3482,10 +3491,18 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             // PROSPER_NO_GPU_DEPTH_ARRAY=1 restores the CPU readback + re-upload bridge.
             const bool gpu_depth_array_snapshots =
                 prosper::test::gpu_depth_array_snapshots_enabled();
+            // PROSPER_NO_GUEST_DEPTH_LAYERS=1 restores the pre-#3893 refusal of a retained depth
+            // array with never-rendered layers (same-binary A/B).
+            static const bool disable_guest_depth_layers =
+                std::getenv("PROSPER_NO_GUEST_DEPTH_LAYERS") != nullptr;
             const auto clear_depth_array_snapshots = [&] {
                 depth_array_snapshots.clear();
                 depth_array_snapshot_bytes = 0;
             };
+            // Callback-scoped guest-layer scans (#3893), dropped when a guest GPU write drains.
+            prosper::test::DepthArrayGuestScanMemo depth_array_guest_scans;
+            uint64_t depth_array_guest_scan_epoch =
+                guest_gpu_write_drain_epoch().load(std::memory_order_relaxed);
             auto build_R = [&](const prosper::gpu::DrawItem& draw,
                                const prosper::gpu::ShaderResourceTable* vrt,
                                const prosper::gpu::ShaderResourceTable* prt,
@@ -4647,6 +4664,29 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     }
                                     if (depth_array_census.enabled) ++depth_array_census.producer_flushes;
                                 }
+                                // Layers no retained identity names are read from guest memory
+                                // (#3893). HTILE-compressed arrays keep the old all-retained rule:
+                                // their guest depth bytes are not the whole sampled value.
+                                const uint64_t scan_epoch =
+                                    guest_gpu_write_drain_epoch().load(std::memory_order_relaxed);
+                                if (scan_epoch != depth_array_guest_scan_epoch) {
+                                    depth_array_guest_scans.entries.clear();
+                                    depth_array_guest_scan_epoch = scan_epoch;
+                                }
+                                prosper::test::DepthArrayGuestSource guest_source_storage{
+                                    r.tile_mode, r.layer_stride_bytes, r.linear_row_pitch_bytes,
+                                    r.host_data, static_cast<size_t>(r.host_data_size),
+                                    &depth_array_guest_scans};
+                                // A layer whose address is a live COLOR target has renderer-owned
+                                // pixels its guest bytes do not show; keep the old refusal there.
+                                bool layer_is_color_target = false;
+                                for (uint32_t layer = 1; layer < r.depth && r.layer_stride_bytes; ++layer)
+                                    layer_is_color_target |= g_rtt.count(
+                                        r.gpu_addr + static_cast<uint64_t>(layer) * r.layer_stride_bytes) != 0;
+                                const prosper::test::DepthArrayGuestSource* guest_source =
+                                    retained_exact && !r.compression_enabled && r.layer_stride_bytes &&
+                                        !layer_is_color_target && !disable_guest_depth_layers
+                                        ? &guest_source_storage : nullptr;
                                 const auto source_identity = [&] {
                                     const prosper::test::BackendPersistentResourceGuard guard;
                                     std::vector<DepthPlaneIdentity> planes;
@@ -4659,6 +4699,20 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                             key.w, key.h, key.fmt, key.slice, image.image,
                                             image.last_depth_write, image.depth_valid,
                                             image.layout_initialized);
+                                    }
+                                    // A guest layer's CONTENT is part of the identity: the memo must
+                                    // not serve a snapshot taken before the guest rewrote it.
+                                    if (guest_source && !planes.empty()) {
+                                        std::vector<prosper::test::DepthArrayGuestLayer> guest;
+                                        std::string guest_error;
+                                        if (!prosper::test::collect_depth_array_guest_layers(
+                                                r.gpu_addr, tw, th, 0u, r.depth, *guest_source,
+                                                guest, guest_error))
+                                            return std::vector<DepthPlaneIdentity>{};
+                                        for (const auto& layer : guest)
+                                            planes.emplace_back(layer.addr, layer.fingerprint, 0, 0,
+                                                0, tw, th, layer.word, layer.layer, VK_NULL_HANDLE,
+                                                0, layer.uniform, false);
                                     }
                                     return planes;
                                 };
@@ -4702,7 +4756,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                         prosper::test::copy_persistent_ds_depth_array_gpu(
                                             r.gpu_addr, tw, th, 0u, r.depth,
                                             retained_depth_array_format, *producer_batch,
-                                            retained_depth_array_gpu, error);
+                                            retained_depth_array_gpu, error, guest_source);
                                     gpu_fallback = result == GpuResult::Fallback;
                                     status = result == GpuResult::Ready
                                         ? prosper::test::PersistentDsDepthArrayStatus::Ready
@@ -4712,15 +4766,28 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 }
                                 if (!snapshot_reused && gpu_fallback)
                                     status = prosper::test::read_persistent_ds_depth_array(
-                                        r.gpu_addr, tw, th, 0u, r.depth, depth, error, producer_batch);
+                                        r.gpu_addr, tw, th, 0u, r.depth, depth, error, producer_batch,
+                                        guest_source);
                                 if (texref_census)
                                     texref_census->aux_end(TexCensus::kAuxDsRead, census_read_start);
                                 if (status == prosper::test::PersistentDsDepthArrayStatus::Unavailable) {
                                     static thread_local uint32_t array_reject_logged = 0;
-                                    if (log_array_rejection(array_reject_logged, "depth-unavailable"))
+                                    if (log_array_rejection(array_reject_logged, "depth-unavailable")) {
+                                        // Name every retained identity at this base, whatever its
+                                        // shape, so a refusal says which layers are missing (#3893).
+                                        std::string layers;
+                                        {
+                                            const prosper::test::BackendPersistentResourceGuard guard;
+                                            layers = prosper::test::describe_persistent_ds_depth_array_layers(
+                                                r.gpu_addr, tw, th, r.depth, r.layer_stride_bytes);
+                                        }
                                         std::fprintf(stderr,
-                                            "[render-array-reject] binding=%u retained depth: %s addr=0x%llx\n",
-                                            r.binding, error.c_str(), (unsigned long long)r.gpu_addr);
+                                            "[render-array-reject] binding=%u retained depth: %s addr=0x%llx "
+                                            "compressed=%u stride=%llu %s\n",
+                                            r.binding, error.c_str(), (unsigned long long)r.gpu_addr,
+                                            unsigned(r.compression_enabled),
+                                            (unsigned long long)r.layer_stride_bytes, layers.c_str());
+                                    }
                                     built.reject(DropReason::ArrayDepthUnavailable);
                                     continue;
                                 }
@@ -4786,9 +4853,13 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                         static unsigned reports = 0;
                                         if (reports++ < 16u)
                                             std::fprintf(stderr,
-                                                "[dsbridge] array addr=0x%llx %ux%ux%u exact-f32%s\n",
+                                                "[dsbridge] array addr=0x%llx %ux%ux%u exact-f32%s guest-layers=%zu "
+                                                "binding=%u draw-color0=0x%llx %ux%u\n",
                                                 (unsigned long long)r.gpu_addr, tw, th, r.depth,
-                                                retained_depth_array_gpu ? " gpu" : "");
+                                                retained_depth_array_gpu ? " gpu" : "",
+                                                depth_array_guest_scans.entries.size(), r.binding,
+                                                (unsigned long long)draw.color0_base,
+                                                draw.color0_width, draw.color0_height);
                                     }
                                 }
                             }
