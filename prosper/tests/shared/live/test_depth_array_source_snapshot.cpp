@@ -1105,6 +1105,194 @@ int main(int argc, char** argv) {
     check(read_persistent_ds_depth_array(alias_a, W, H, 0, Layers, output, error) ==
               Status::Unavailable && output == before_unknown,
           "unknown mapping relation conservatively revokes retained array authority");
+    // #3893: a cascade array with only layer 0 ever rendered as depth. Sonic Frontiers' menus
+    // render cascade 0 of a four-layer D32 shadow array and sample all four; no DS pass names
+    // layers 1-3 at any extent, so their guest bytes are what the hardware samples. The bridge used
+    // to refuse the whole binding, dropping the draw.
+    {
+        const uint64_t guest_base = Base + 0x1c00000;
+        const uint64_t layer_bytes = Pixels * sizeof(float);
+        auto* guest_words = reinterpret_cast<float*>(guest_base);
+        // Layer 1 and 3 uniform (a cleared or never-written cascade), layer 2 a gradient, so both
+        // the uniform fast path and the ordinary linear copy are exercised. Layer 0's guest bytes
+        // disagree with its retained pixels and must never be used.
+        const float guest_uniform1 = 0.2813720703125f, guest_uniform3 = 0.0f;
+        for (size_t i = 0; i < Pixels; ++i) {
+            guest_words[i] = 0.9f;
+            guest_words[Pixels + i] = guest_uniform1;
+            guest_words[2 * Pixels + i] = 0.015625f * float(i);
+            guest_words[3 * Pixels + i] = guest_uniform3;
+        }
+        const size_t center_texel = W * (H / 2) + W / 2;
+        const std::array<float, Layers> guest_expected{0.3438720703125f, guest_uniform1,
+            0.015625f * float(center_texel), guest_uniform3};
+        seed_base = guest_base;
+        if (!seed_layer(0, guest_expected[0])) return 1;
+        const DepthArrayGuestSource source{0u, layer_bytes, W * sizeof(float)};
+        std::vector<float> partial{7.0f};
+        const auto untouched = partial;
+        check(read_persistent_ds_depth_array(guest_base, W, H, 0, Layers, partial, error) ==
+                  Status::Unavailable && partial == untouched &&
+                  error.find("missing or invalid layers") != std::string::npos,
+              "without a guest source a partially rendered array is still refused (pre-#3893)");
+        check(read_persistent_ds_depth_array(guest_base, W, H, 0, Layers, partial, error,
+                                             nullptr, &source) == Status::Ready,
+              "never-rendered layers are admitted from their guest bytes");
+        bool partial_exact = partial.size() == Pixels * Layers;
+        for (size_t i = 0; partial_exact && i < Pixels; ++i) {
+            partial_exact &= std::bit_cast<uint32_t>(partial[i]) ==
+                             std::bit_cast<uint32_t>(guest_expected[0]);
+            partial_exact &= partial[Pixels + i] == guest_uniform1;
+            partial_exact &= partial[2 * Pixels + i] == 0.015625f * float(i);
+            partial_exact &= partial[3 * Pixels + i] == guest_uniform3;
+        }
+        check(partial_exact,
+              "retained layer 0 keeps renderer pixels; layers 1-3 carry their exact guest values");
+        // A layer an identity names -- even at another extent -- is renderer-owned: its guest bytes
+        // are stale, so it must keep refusing rather than silently fall back.
+        PersistentDsKey other_extent{guest_base, guest_base, 0, 0, 0, W * 2, H,
+                                     VK_FORMAT_D32_SFLOAT, 2};
+        {
+            BackendPersistentResourceGuard guard;
+            persistent_ds_cache()[other_extent] = {};
+        }
+        check(read_persistent_ds_depth_array(guest_base, W, H, 0, Layers, partial, error,
+                                             nullptr, &source) == Status::Unavailable,
+              "a layer named by a retained identity at another extent is never read from guest bytes");
+        {
+            BackendPersistentResourceGuard guard;
+            persistent_ds_cache().erase(other_extent);
+            for (auto& [key, image] : persistent_ds_cache())
+                if (key.dr == guest_base && key.slice == 0) image.depth_valid = false;
+        }
+        check(read_persistent_ds_depth_array(guest_base, W, H, 0, Layers, partial, error,
+                                             nullptr, &source) == Status::Unavailable,
+              "an invalidated retained layer still refuses; guest bytes never replace it");
+        if (!seed_layer(0, guest_expected[0])) return 1;
+
+        // The production frontend, for every layer, on both routes.
+        live_table->resources[0] = texture;
+        live_table->resources[0].gpu_addr = guest_base;
+        live_table->resources[0].host_data = nullptr;
+        live_table->resources[0].host_data_size = 0;
+        live_table->resources[0].size = layer_bytes * Layers;
+        live_draw.prt = live_table;
+        live_draw.ps = sample_state;
+        live_draw.color0_base = Base + 0x1d00000;
+        const auto saved_expected = expected;
+        expected = guest_expected;
+        for (uint32_t layer = 0; layer < Layers; ++layer) {
+            live_shader(layer);
+            live_draw.color0_base += 0x10000;
+            mark_payload();
+            const auto diagnostic = capture_stderr([&] {
+                check(live_matches(), "frontend samples a partially rendered array at every layer");
+            });
+            check(diagnostic.find("[render-array-reject]") == std::string::npos,
+                  "a partially rendered array is not rejected by the frontend");
+            // Layer 2 is a gradient: the GPU route cannot fill it and must hand the whole array to
+            // the CPU route, never publish a partial GPU copy.
+            if (gpu_route)
+                check(depth_array_gpu_copy_stats().copies == gpu_copy_mark &&
+                          backend_texture_upload_stats().upload_bytes ==
+                              Pixels * Layers * snapshot_bpp,
+                      "a non-uniform guest layer takes the CPU route (no GPU copy)");
+        }
+        // The GPU route fills uniform guest layers on the GPU; a non-uniform one needs a detile,
+        // so it takes the CPU route. Make layer 2 uniform and require a GPU copy.
+        for (size_t i = 0; i < Pixels; ++i) guest_words[2 * Pixels + i] = 0.6563720703125f;
+        expected[2] = 0.6563720703125f;
+        live_shader(2);
+        live_draw.color0_base += 0x10000;
+        mark_payload();
+        check(live_matches(), "frontend observes a guest rewrite of a never-rendered layer");
+        if (gpu_route)
+            check(materialized_is(1) && payload_is(Pixels * Layers * snapshot_bpp),
+                  "uniform guest layers stay on the GPU route (fill, no CPU upload)");
+        expected = saved_expected;
+
+        // #3893 review (blocking): a DS view with SLICE_MAX > SLICE_START -- one clear over the
+        // whole shadow array, or layered rendering -- writes layers the key (SLICE_START only)
+        // never names. Through the production DS path, attach slice 0 with SLICE_MAX = 3: layers
+        // 1-3 were written by the renderer and their guest bytes are stale, so the array must keep
+        // refusing rather than read them from guest memory.
+        const uint64_t span_base = Base + 0x1e00000;
+        std::memset(reinterpret_cast<void*>(span_base), 0, layer_bytes * Layers);
+        ResolvedPipelineState span_state = producer_state;
+        span_state.depth_read_base = span_state.depth_write_base = span_base;
+        span_state.db_depth_view = 0u | (3u << 13);   // SLICE_START 0, SLICE_MAX 3
+        span_state.min_depth = span_state.max_depth = 0.75f;
+        BackendDraw span_producer = producer;
+        span_producer.ps = &span_state;
+        BackendSubmissionBatch span_batch;
+        (void)render_draws_rgba({span_producer}, W, H, nullptr, nullptr, true, nullptr,
+                                nullptr, nullptr, nullptr, &span_batch, false, nullptr, false);
+        {
+            BackendPersistentResourceGuard guard;
+            uint32_t recorded = 0;
+            for (const auto& [key, image] : persistent_ds_cache())
+                if (key.dr == span_base) recorded = image.programmed_slice_max;
+            check(recorded == 3, "a multi-slice DS view records its programmed SLICE_MAX");
+        }
+        const DepthArrayGuestSource span_source{0u, layer_bytes, W * sizeof(float)};
+        check(read_persistent_ds_depth_array(span_base, W, H, 0, Layers, partial, error,
+                                             &span_batch, &span_source) == Status::Unavailable,
+              "layers inside a multi-slice DS view's span are never read from guest bytes");
+
+        // Rebased planes name the layers their own slices and extents can touch. Layers 0 and 1
+        // are retained at the base; a plane rebased to layer 1 with its own slice 1 writes layer 2,
+        // and a plane rebased to layer 1 whose extent is two layers tall covers layer 2 too.
+        const uint64_t rebased_base = Base + 0x1e80000;
+        std::memset(reinterpret_cast<void*>(rebased_base), 0, layer_bytes * Layers);
+        seed_base = rebased_base;
+        if (!seed_layer(0, 0.25f) || !seed_layer(1, 0.5f)) return 1;
+        const DepthArrayGuestSource rebased_source{0u, layer_bytes, W * sizeof(float)};
+        check(read_persistent_ds_depth_array(rebased_base, W, H, 0, Layers, partial, error,
+                                             nullptr, &rebased_source) == Status::Ready,
+              "control: layers 2-3 of a two-layer retained array are admitted from guest bytes");
+        const uint64_t layer1 = rebased_base + layer_bytes;
+        const PersistentDsKey rebased_slice{layer1, layer1, 0, 0, 0, W, H,
+                                            VK_FORMAT_D32_SFLOAT, 1};
+        const PersistentDsKey rebased_tall{layer1, layer1, 0, 0, 0, W, H * 2,
+                                           VK_FORMAT_D32_SFLOAT, 0};
+        for (const auto& [plane, label] :
+             {std::pair{rebased_slice,
+                        "a rebased plane's own nonzero slice names the layer it actually writes"},
+              std::pair{rebased_tall,
+                        "a rebased plane taller than one layer names every layer it covers"}}) {
+            {
+                BackendPersistentResourceGuard guard;
+                persistent_ds_cache()[plane] = {};
+            }
+            check(read_persistent_ds_depth_array(rebased_base, W, H, 0, Layers, partial, error,
+                                                 nullptr, &rebased_source) ==
+                      Status::Unavailable, label);
+            {
+                BackendPersistentResourceGuard guard;
+                persistent_ds_cache().erase(plane);
+            }
+        }
+
+        // A guest layer whose bytes are a live COLOR target (renderer-owned pixels) is refused,
+        // including layer 0 and a target that starts inside a layer rather than at its start.
+        live_table->resources[0].gpu_addr = rebased_base;
+        live_shader(0);
+        live_draw.color0_base += 0x10000;
+        const auto admitted = capture_stderr([&] { (void)render_submit_items({live_draw}, W, H); });
+        check(admitted.find("[render-array-reject]") == std::string::npos,
+              "control: the two-layer retained array is admitted before any colour target");
+        DrawItem color_writer;
+        color_writer.vs = producer.vs; color_writer.fs = producer.fs;
+        color_writer.vertex_count = 3; color_writer.ps = sample_state;
+        color_writer.color0_base = rebased_base + 2 * layer_bytes + 64;
+        color_writer.color0_width = W; color_writer.color0_height = H;
+        (void)render_submit_items({color_writer}, W, H);
+        live_draw.color0_base += 0x10000;
+        const auto overlapped = capture_stderr([&] { (void)render_submit_items({live_draw}, W, H); });
+        check(overlapped.find("overlaps a live color target") != std::string::npos,
+              "a guest layer overlapping a live colour target keeps the refusal");
+    }
+
     const auto gpu_stats = depth_array_gpu_copy_stats();
     std::printf("[snapshot-fixture] route=%s gpu_copies=%llu gpu_layers=%llu pool_hits=%llu "
                 "pool_misses=%llu\n", gpu_route ? "gpu" : "cpu",

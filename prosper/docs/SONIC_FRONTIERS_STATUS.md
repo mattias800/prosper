@@ -864,6 +864,16 @@ being closed; the rest are this document's own. **Do not restate the row count i
 a stated total is stale as soon as the next lane appends, and every lane that adds a row would have
 to remember to update it. The last one did not (review of #2820).
 
+- **"The menus' two dropped draws per flip sample a depth layer that was rendered at another shape,
+  invalidated, or written by a pass that does not register it."** False (#3893). Every refusal of
+  the `0x2048a00000` 1024x1024x4 Float32 array now prints every retained DS identity at that base
+  (any extent or format, plus rebased planes inside the 4 x 4 MiB span): there is exactly **one**,
+  slice 0, D32, and nothing else for the whole title/menu phase. `PROSPER_DS_SLICE_CENSUS=1` agrees
+  (slice 0 only, every pass claims a valid depth write; the instrument keys by slice, so it could
+  have shown others). Cascades 1-3 are simply never attached by any DS pass, and their guest bytes
+  read all-zero on every sample over 90 s. The fix reads never-named layers from guest memory
+  instead of dropping the draw; the draw is a 3840x2160 pass (`color0=0x2017f20000`) binding the
+  array ~43 times, and no visible change was found in the menu frames.
 - **"#3731 leaves Sonic untouched because its compute target has no device image."** False:
   `render_draw_pass_rgba` creates a persistent target when the HUD blend pass renders to that base,
   so later publications encounter an existing image. The stale-image restoration defect therefore

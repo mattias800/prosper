@@ -5557,6 +5557,11 @@ struct PersistentDsImage {
     uint64_t last_depth_write = 0;   // sampled-bridge recency (#1275)
     uint64_t last_depth_command_order = 0;
     uint64_t last_depth_present = UINT64_MAX;
+    // Highest DB_DEPTH_VIEW slice any pass attaching this identity ever programmed (inclusive,
+    // never lowered). The key carries only SLICE_START and the Vulkan image is one layer, so a
+    // guest view with SLICE_MAX > SLICE_START (a whole-array clear, layered rendering) writes
+    // layers no key names; this records that they were written (#3893 review).
+    uint32_t programmed_slice_max = 0;
 };
 
 inline uint64_t& persistent_ds_write_generation() {
@@ -7088,6 +7093,223 @@ inline bool read_persistent_ds_depth(PersistentDsImage& image, uint32_t width, u
 
 enum class PersistentDsDepthArrayStatus { NoIdentity, Ready, Unavailable };
 
+// Guest-authoritative layers of a retained depth array (#3893).
+//
+// A guest shadow-cascade array can have only SOME of its layers rendered as depth. Sonic Frontiers'
+// title and menus render cascade 0 of a 4 x 1024x1024 D32 array every frame and never attach
+// cascades 1-3 (no DS pass of any extent or format names those layers), then sample all four. The
+// bridge used to refuse the whole binding, which dropped two draws per flip.
+//
+// A layer that no retained DS identity can have written -- no identity's programmed slice span
+// (DB_DEPTH_VIEW SLICE_START..SLICE_MAX, see PersistentDsImage::programmed_slice_max) at any extent
+// or format, from this base or a rebased plane, touches its bytes -- has never been written by the
+// depth block in this process. Identities are never evicted (only a failed first creation erases
+// one), so "ever named" is permanent. prosper never writes rendered depth back to guest memory, so
+// for such a layer the only writer the guest can have used is one that does reach guest memory
+// (CPU, DMA, a copy, a compute write-back), and its guest bytes are exactly what the hardware would
+// sample. That is the whole admission rule. A layer that HAS been named -- valid or not -- keeps
+// the old refusal, because its guest bytes are stale relative to renderer-owned pixels.
+// Compressed (HTILE) arrays are excluded by the caller: their guest depth bytes are not the whole
+// story. A layer overlapping a live colour target is refused too (DepthArrayGuestSource::
+// renderer_owned). CONFIDENCE: MED-HIGH -- the rule follows from prosper's own write model. It
+// can be wrong only for a DS pass prosper never executed at all (so it never keyed the identity),
+// which was already wrong before this (the whole draw was dropped). A multi-slice DS view is NOT
+// such a case: its span is recorded even though the backend attaches one layer of it.
+// Guest-layer scans already made in one renderer callback. A binding set can name the same array
+// dozens of times per draw (Sonic Frontiers: ~43 bindings), and every selection and identity check
+// otherwise rescans each 4 MiB layer. The owner clears it whenever queued guest GPU writes drain
+// and at the end of its callback, so an entry never outlives a write prosper has observed.
+struct DepthArrayGuestScanMemo {
+    struct Entry {
+        const uint8_t* bytes = nullptr;
+        size_t size = 0;
+        bool uniform = false;
+        uint32_t word = 0;
+        uint64_t fingerprint = 0;
+    };
+    std::vector<Entry> entries;
+    uint64_t hits = 0, scans = 0;
+};
+
+struct DepthArrayGuestSource {
+    uint32_t tile_mode = 0;
+    uint64_t layer_stride = 0;   // guest bytes between layers; 0 disables guest layers
+    uint32_t row_pitch_bytes = 0;         // linear layers only; 0 = GFX10 sampled row pitch
+    // Captured guest bytes of the whole array starting at its base (replay/fixtures). When set,
+    // they are the guest bytes; guest memory is not consulted.
+    const uint8_t* host_data = nullptr;
+    size_t host_size = 0;
+    DepthArrayGuestScanMemo* memo = nullptr;   // optional; see DepthArrayGuestScanMemo
+    // Optional: true when [addr, addr+bytes) overlaps renderer-owned pixels its guest bytes do not
+    // show (a live colour target). Such a layer is refused rather than read from guest memory.
+    const std::function<bool(uint64_t, size_t)>* renderer_owned = nullptr;
+};
+
+struct DepthArrayGuestLayer {
+    uint32_t layer = 0;          // index relative to first_layer
+    uint64_t addr = 0;           // guest address of the layer
+    const uint8_t* bytes_ptr = nullptr;   // where its guest bytes are read from
+    size_t bytes = 0;            // footprint read
+    bool uniform = false;        // every 32-bit word equals `word`
+    uint32_t word = 0;
+    uint64_t fingerprint = 0;    // content hash, part of the snapshot memo identity
+};
+
+// One pass over a guest layer: a 4-lane content hash plus a uniform-word test. `bytes` is a
+// multiple of 32 for every tiled Float32 footprint (whole 4 KiB micro-tiles) and of 4 otherwise.
+inline uint64_t scan_guest_depth_layer(const uint8_t* p, size_t bytes, bool& uniform,
+                                       uint32_t& word) {
+    uniform = bytes >= 4;
+    word = 0;
+    if (bytes < 4) return 0;
+    std::memcpy(&word, p, 4);
+    const uint64_t splat = (static_cast<uint64_t>(word) << 32) | word;
+    uint64_t h[4] = {0x9e3779b97f4a7c15ull, 0xc2b2ae3d27d4eb4full, 0x165667b19e3779f9ull,
+                     0x27d4eb2f165667c5ull};
+    uint64_t differ = 0;
+    size_t i = 0;
+    for (; i + 32 <= bytes; i += 32) {
+        uint64_t v[4];
+        std::memcpy(v, p + i, sizeof(v));
+        for (int lane = 0; lane < 4; ++lane) {
+            differ |= v[lane] ^ splat;
+            h[lane] = (h[lane] ^ v[lane]) * 0x100000001b3ull;
+        }
+    }
+    for (; i + 4 <= bytes; i += 4) {
+        uint32_t v;
+        std::memcpy(&v, p + i, 4);
+        differ |= v ^ word;
+        h[0] = (h[0] ^ v) * 0x100000001b3ull;
+    }
+    uniform = differ == 0;
+    return h[0] ^ (h[1] * 3) ^ (h[2] * 5) ^ (h[3] * 7) ^ bytes;
+}
+
+// Which requested layers are guest-authoritative, with their current content. A layer that some
+// retained identity names is never listed. Returns false, with `error` set, when a candidate
+// layer's guest bytes cannot be read. The caller holds BackendPersistentResourceGuard.
+inline bool collect_depth_array_guest_layers(uint64_t base, uint32_t width, uint32_t height,
+                                             uint32_t first_layer, uint32_t layer_count,
+                                             const DepthArrayGuestSource& source,
+                                             std::vector<DepthArrayGuestLayer>& out,
+                                             std::string& error) {
+    out.clear();
+    if (!source.layer_stride || !base || !width || !height || !layer_count) return true;
+    const bool tiled = prosper::gpu::tile_mode_is_tiled(source.tile_mode);
+    const size_t row_bytes = static_cast<size_t>(width) * sizeof(float);
+    const size_t pitch = tiled ? row_bytes
+        : (source.row_pitch_bytes ? source.row_pitch_bytes
+                                  : prosper::gpu::linear_sampled_row_pitch(width, sizeof(float)));
+    const size_t footprint = tiled
+        ? prosper::gpu::tiled_surface_bytes(width, height, source.tile_mode, 0, sizeof(float))
+        : pitch * (height - 1) + row_bytes;
+    // A layer is NAMED -- renderer-owned, never guest-sourced -- when any retained identity's
+    // programmed slice span can have written bytes inside it. Each identity plane P (read or
+    // write base) covers slices [key.slice, programmed_slice_max]; slice s occupies
+    // [P + s*stride, P + s*stride + w*h*4) with this array's stride, the only one known. For the
+    // array's own base that names exactly its programmed layers; a rebased plane, or one at another
+    // extent, names every layer its bytes can touch. Over-naming only keeps the old refusal.
+    std::vector<bool> named(layer_count, false);
+    const uint64_t first_addr = base + static_cast<uint64_t>(first_layer) * source.layer_stride;
+    const uint64_t end_addr = first_addr + static_cast<uint64_t>(layer_count) * source.layer_stride;
+    for (const auto& [key, image] : persistent_ds_cache()) {
+        const uint32_t last_slice = std::max(key.slice, image.programmed_slice_max);
+        const uint64_t plane_bytes = static_cast<uint64_t>(key.w) * key.h * sizeof(float);
+        for (const uint64_t plane : {key.dr, key.dw}) {
+            if (!plane) continue;
+            for (uint64_t slice = key.slice; slice <= last_slice; ++slice) {
+                const uint64_t lo = plane + slice * source.layer_stride;
+                const uint64_t hi = lo + std::max<uint64_t>(plane_bytes, 1);
+                if (hi <= first_addr) continue;
+                if (lo >= end_addr) break;
+                const uint64_t from = lo <= first_addr ? 0 : (lo - first_addr) / source.layer_stride;
+                const uint64_t to = std::min<uint64_t>(layer_count,
+                    (std::min(hi, end_addr) - first_addr + source.layer_stride - 1) /
+                        source.layer_stride);
+                for (uint64_t layer = from; layer < to; ++layer) named[layer] = true;
+            }
+        }
+    }
+    for (uint32_t layer = 0; layer < layer_count; ++layer) {
+        if (named[layer]) continue;
+        DepthArrayGuestLayer guest;
+        guest.layer = layer;
+        guest.addr = first_addr + static_cast<uint64_t>(layer) * source.layer_stride;
+        guest.bytes = footprint;
+        if (source.renderer_owned && (*source.renderer_owned)(guest.addr, source.layer_stride)) {
+            error = "retained depth array guest layer overlaps a live color target";
+            return false;
+        }
+        if (pitch < row_bytes || !footprint || footprint > source.layer_stride ||
+            footprint > UINT32_MAX) {
+            error = "retained depth array guest layer footprint exceeds its layer stride";
+            return false;
+        }
+        if (source.host_data) {
+            const uint64_t offset = guest.addr - base;
+            if (offset > source.host_size || footprint > source.host_size - offset) {
+                error = "retained depth array guest layer is outside its captured bytes";
+                return false;
+            }
+            guest.bytes_ptr = source.host_data + offset;
+        } else {
+            if (!prosper::gpu::guest_readable(guest.addr, static_cast<uint32_t>(footprint))) {
+                error = "retained depth array guest layer is unreadable";
+                return false;
+            }
+            guest.bytes_ptr = reinterpret_cast<const uint8_t*>(guest.addr);
+        }
+        const DepthArrayGuestScanMemo::Entry* known = nullptr;
+        if (source.memo)
+            for (const auto& entry : source.memo->entries)
+                if (entry.bytes == guest.bytes_ptr && entry.size == footprint) {
+                    known = &entry;
+                    break;
+                }
+        if (known) {
+            guest.uniform = known->uniform;
+            guest.word = known->word;
+            guest.fingerprint = known->fingerprint;
+            ++source.memo->hits;
+        } else {
+            guest.fingerprint = scan_guest_depth_layer(guest.bytes_ptr, footprint, guest.uniform,
+                                                       guest.word);
+            if (source.memo) {
+                ++source.memo->scans;
+                if (source.memo->entries.size() < 64)
+                    source.memo->entries.push_back({guest.bytes_ptr, footprint, guest.uniform,
+                                                    guest.word, guest.fingerprint});
+            }
+        }
+        out.push_back(guest);
+    }
+    return true;
+}
+
+// Linear Float32 values of one guest layer, `width * height` floats at `dst`.
+inline void decode_depth_array_guest_layer(const DepthArrayGuestLayer& guest, uint32_t width,
+                                           uint32_t height, const DepthArrayGuestSource& source,
+                                           float* dst) {
+    const size_t count = static_cast<size_t>(width) * height;
+    if (guest.uniform) {
+        float value;
+        std::memcpy(&value, &guest.word, sizeof(value));
+        std::fill(dst, dst + count, value);
+        return;
+    }
+    if (prosper::gpu::tile_mode_is_tiled(source.tile_mode)) {
+        prosper::gpu::detile_surface(reinterpret_cast<uint8_t*>(dst), guest.bytes_ptr, width,
+                                     height, source.tile_mode, 0, sizeof(float));
+        return;
+    }
+    const size_t row_bytes = static_cast<size_t>(width) * sizeof(float);
+    const size_t pitch = source.row_pitch_bytes
+        ? source.row_pitch_bytes : prosper::gpu::linear_sampled_row_pitch(width, sizeof(float));
+    for (uint32_t y = 0; y < height; ++y)
+        std::memcpy(dst + static_cast<size_t>(y) * width, guest.bytes_ptr + y * pitch, row_bytes);
+}
+
 // Failure injection after N successful layer reads. Consumed by one array attempt only.
 inline int& depth_array_readback_failure_after_layers() {
     static thread_local int count = -1;
@@ -7103,9 +7325,12 @@ inline int& depth_array_readback_failure_after_layers() {
 inline PersistentDsDepthArrayStatus select_persistent_ds_depth_array(
         uint64_t base, uint32_t width, uint32_t height, uint32_t first_layer,
         uint32_t layer_count, std::vector<PersistentDsImage*>& selected, uint32_t& format,
-        std::string& error, BackendSubmissionBatch* producer_batch, bool flush_producer) {
+        std::string& error, BackendSubmissionBatch* producer_batch, bool flush_producer,
+        const DepthArrayGuestSource* guest_source = nullptr,
+        std::vector<DepthArrayGuestLayer>* guest_layers = nullptr) {
     error.clear();
     selected.clear();
+    if (guest_layers) guest_layers->clear();
     format = VK_FORMAT_UNDEFINED;
     auto unavailable = [&](const char* reason) {
         error = reason;
@@ -7167,22 +7392,79 @@ inline PersistentDsDepthArrayStatus select_persistent_ds_depth_array(
     }
     for (bool conflict : ambiguous)
         if (conflict) return unavailable("retained depth array has ambiguous layer identities");
-    for (const auto* image : selected)
+    // Layers no retained identity names are served from their guest bytes (#3893); see
+    // DepthArrayGuestSource. Only a caller that supplies both the source and the output opts in.
+    std::vector<DepthArrayGuestLayer> guest;
+    if (guest_source && guest_layers &&
+        std::find(selected.begin(), selected.end(), nullptr) != selected.end() &&
+        !collect_depth_array_guest_layers(base, width, height, first_layer, layer_count,
+                                          *guest_source, guest, error))
+        return PersistentDsDepthArrayStatus::Unavailable;
+    size_t next_guest = 0;
+    for (uint32_t layer = 0; layer < layer_count; ++layer) {
+        const PersistentDsImage* image = selected[layer];
+        if (!image && next_guest < guest.size() && guest[next_guest].layer == layer) {
+            ++next_guest;
+            continue;
+        }
         if (!image || !image->image || !image->layout_initialized || !image->depth_valid)
             return unavailable("retained depth array has missing or invalid layers");
+    }
+    // A guest layer that some identity names cannot be listed (collect excludes it), so every
+    // listed layer is one whose selection is empty; keep exactly those.
+    if (guest_layers) {
+        for (const auto& layer : guest)
+            if (!selected[layer.layer]) guest_layers->push_back(layer);
+    }
     return PersistentDsDepthArrayStatus::Ready;
 }
 
+// Diagnostic: every retained DS identity naming `base`, whatever its shape, so a declined array
+// says which layers are missing and whether they exist at another extent/format. The caller holds
+// BackendPersistentResourceGuard.
+inline std::string describe_persistent_ds_depth_array_layers(uint64_t base, uint32_t width,
+                                                             uint32_t height,
+                                                             uint32_t layer_count,
+                                                             uint64_t layer_stride = 0) {
+    std::string out;
+    char line[256];
+    std::snprintf(line, sizeof(line), "want %ux%u x%u:", width, height, layer_count);
+    out += line;
+    std::vector<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t, bool, bool, bool, uint64_t,
+                           uint64_t, uint64_t>> rows;
+    const uint64_t span = layer_stride * layer_count;
+    for (const auto& [key, image] : persistent_ds_cache()) {
+        const bool named = key.dr == base || key.dw == base;
+        const bool inside = span && key.dr > base && key.dr < base + span;
+        if (!named && !inside) continue;
+        rows.emplace_back(key.slice, key.w, key.h, key.fmt, image.image != VK_NULL_HANDLE,
+                          image.layout_initialized, image.depth_valid, image.last_depth_write,
+                          key.dr, key.dw);
+    }
+    std::sort(rows.begin(), rows.end());
+    for (const auto& [slice, w, h, fmt, has_image, init, valid, gen, dr, dw] : rows) {
+        std::snprintf(line, sizeof(line),
+                      " [s%u %ux%u fmt=%u img=%d init=%d valid=%d gen=%llu dr=%+lld dw=%+lld]",
+                      slice, w, h, fmt, int(has_image), int(init), int(valid),
+                      (unsigned long long)gen, (long long)(dr - base), (long long)(dw - base));
+        out += line;
+    }
+    if (rows.empty()) out += " (none)";
+    return out;
+}
+
 // Gather a complete Float32 depth array without publishing a partial replacement. This bridge
-// deliberately declines incomplete retained identities; it does not yet combine retained layers
-// with guest-backed layers. A cache placeholder or guest-invalidated entry is not itself proof of
-// renderer authority. NoIdentity permits ordinary decoding when no retained identity is involved.
+// deliberately declines incomplete retained identities. With `guest_source`, a layer that NO
+// retained identity names is read from its guest bytes (see DepthArrayGuestSource, #3893); a named
+// layer is never. A cache placeholder or guest-invalidated entry is not itself proof of renderer
+// authority. NoIdentity permits ordinary decoding when no retained identity is involved.
 // The caller must not already hold BackendPersistentResourceGuard (its mutex is not recursive).
 // Pass the ordered producer batch if it contains unsubmitted writes to these retained images.
 inline PersistentDsDepthArrayStatus read_persistent_ds_depth_array(
         uint64_t base, uint32_t width, uint32_t height, uint32_t first_layer,
         uint32_t layer_count, std::vector<float>& output, std::string& error,
-        BackendSubmissionBatch* producer_batch = nullptr) {
+        BackendSubmissionBatch* producer_batch = nullptr,
+        const DepthArrayGuestSource* guest_source = nullptr) {
     const BackendPersistentResourceGuard guard;
     int fail_after = depth_array_readback_failure_after_layers();
     // #3891: a CPU readback of a GPU surface (outermost scope only; nested helpers are one event).
@@ -7190,10 +7472,11 @@ inline PersistentDsDepthArrayStatus read_persistent_ds_depth_array(
         prosper::diagnostics::perf::Cost::SurfaceReadback);
     depth_array_readback_failure_after_layers() = -1;
     std::vector<PersistentDsImage*> selected;
+    std::vector<DepthArrayGuestLayer> guest_layers;
     uint32_t format = VK_FORMAT_UNDEFINED;
     const PersistentDsDepthArrayStatus selection = select_persistent_ds_depth_array(
         base, width, height, first_layer, layer_count, selected, format, error, producer_batch,
-        /*flush_producer=*/true);
+        /*flush_producer=*/true, guest_source, &guest_layers);
     if (selection != PersistentDsDepthArrayStatus::Ready) return selection;
     auto unavailable = [&](const char* reason) {
         error = reason;
@@ -7202,9 +7485,17 @@ inline PersistentDsDepthArrayStatus read_persistent_ds_depth_array(
 
     const size_t layer_values = static_cast<size_t>(width) * height;
     std::vector<float> snapshot(layer_values * layer_count);
+    size_t next_guest = 0;
     for (uint32_t layer = 0; layer < layer_count; ++layer) {
         if (fail_after == 0)
             return unavailable("injected retained depth array readback failure");
+        if (!selected[layer]) {
+            // Selection guarantees an empty layer is exactly the next listed guest layer.
+            decode_depth_array_guest_layer(guest_layers[next_guest++], width, height,
+                                           *guest_source, snapshot.data() + layer * layer_values);
+            if (fail_after > 0) --fail_after;
+            continue;
+        }
         PersistentDsDepthReadback readback;
         if (!readback.acquire(*selected[layer], width, height, error))
             return PersistentDsDepthArrayStatus::Unavailable;
@@ -8175,6 +8466,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             htile_identity = identity->stencil_read_base - 0x10000;
         ds_key = persistent_ds_key_for(*identity, htile_identity, W, H, (uint32_t)DFMT);
         cached_ds = &persistent_ds_cache()[ds_key];
+        cached_ds->programmed_slice_max = std::max({cached_ds->programmed_slice_max, ds_key.slice,
+            ds_depth_view_slice_max(identity->db_depth_view)});
         // The key carries the PASS extent, so one guest depth surface reached through two passes of
         // different extent becomes two independent entries -- and the larger one's guest range is
         // sized from that extent, which is how a 512x512 shadow cascade acquires a 33 MB depth range
