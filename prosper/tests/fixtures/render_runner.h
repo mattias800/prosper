@@ -11396,8 +11396,11 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                         memp, tr.memoryTypeBits, tai, &upload.memory) ==
                                         VK_SUCCESS) {
                                     upload.direct_memory = true;
-                                    // #3873: the budget follows THIS heap from now on.
-                                    if (tai.memoryTypeIndex < memp.memoryTypeCount)
+                                    // #3873: the budget follows THIS heap from now on -- unless
+                                    // the #3897 fallback put this one texture in system memory,
+                                    // which says nothing about where the cache's textures live.
+                                    if (prosper::gpu::memory_type_is_device_local(
+                                            memp, tai.memoryTypeIndex))
                                         persistent_texture_heap_index().store(
                                             memp.memoryTypes[tai.memoryTypeIndex].heapIndex,
                                             std::memory_order_relaxed);
