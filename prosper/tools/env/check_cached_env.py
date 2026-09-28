@@ -150,7 +150,11 @@ HOT_SITES = {
         "PROSPER_DRAWMAP",
     ],
     "frontends/shared/live/live_renderer.cpp": [
-        "PROSPER_DCCLOG", "PROSPER_SLICESTRIDE", "PROSPER_UNIFORMLOG",
+        "PROSPER_DCCLOG", "PROSPER_UNIFORMLOG",
+    ],
+    # #3892 moved the per-resource path, and this read with it, out of live_renderer.cpp.
+    "frontends/shared/live/submit_renderer/draw_resources.cpp": [
+        "PROSPER_SLICESTRIDE",
     ],
 }
 
