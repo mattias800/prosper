@@ -3065,10 +3065,14 @@ int main(int argc, char** argv) {
             const auto* system_inputs = it.has_system_inputs ? &it.system_inputs : nullptr;
             std::vector<uint32_t> vs, fs, gs;
             bool requires_geometry = false;
+            bool strip_layer_chain = false;
+            prosper::gpu::FragmentInterpolationLayout interpolation{};
             if (it.vs_raw_shader_index < replay.raw_shader_versions.size()) {
                 const auto& raw = replay.raw_shader_versions[it.vs_raw_shader_index];
                 if (it.vs_chain_raw_shader_index < replay.raw_shader_versions.size()) {
                     const auto& main = replay.raw_shader_versions[it.vs_chain_raw_shader_index];
+                    strip_layer_chain = prosper::gpu::rdna2_proven_strip_layer_chain(
+                        raw.words.data(), raw.words.size(), main.words.data(), main.words.size());
                     vs = prosper::gpu::recompile_vertex_chain(
                         raw.words.data(), raw.words.size(), main.words.data(), main.words.size(),
                         it.vrt.get(), pixel_inputs, false, it.vertex_lds_dwords);
@@ -3080,7 +3084,7 @@ int main(int argc, char** argv) {
             } else ++vs_kept;
             if (it.fs_raw_shader_index < replay.raw_shader_versions.size()) {
                 const auto& raw = replay.raw_shader_versions[it.fs_raw_shader_index];
-                const auto interpolation = prosper::gpu::fragment_interpolation_layout(
+                interpolation = prosper::gpu::fragment_interpolation_layout(
                     raw.words.data(), raw.words.size(), system_inputs, pixel_inputs);
                 if (interpolation.valid) {
                     requires_geometry = interpolation.requires_geometry;
@@ -3092,6 +3096,42 @@ int main(int argc, char** argv) {
                         gs = prosper::gpu::recompile_interpolation_geometry(interpolation);
                 }
             } else ++fs_kept;
+            if (strip_layer_chain) {
+                const auto& target = it.color_targets[0];
+                prosper::gpu::StripLayerDrawState state;
+                state.vertex_count = it.raw_draw_count;
+                state.instance_count = it.instance_count;
+                state.topology = it.ps.topology;
+                state.indexed = it.raw_indexed;
+                state.modifier = it.raw_draw_modifier;
+                state.vertex_offset = it.vertex_offset;
+                state.target_width = target.width;
+                state.target_height = target.height;
+                state.volume_depth = target.selected_mip_depth;
+                state.first_slice = target.first_slice;
+                state.slice_count = target.slice_count;
+                state.slice_max = target.programmed_slice_max;
+                state.cull_mode = it.ps.cull_mode;
+                state.depth_test = it.ps.depth_test_enable;
+                state.depth_write = it.ps.depth_write_enable;
+                state.stencil = it.ps.stencil_enable;
+                state.other_geometry = interpolation.requires_geometry;
+                state.rect_synthesis = it.rect_list_synthesis;
+                state.attribute_mask = interpolation.attribute_mask;
+                state.flat_mask = interpolation.flat_mask;
+                state.passthrough_mask = interpolation.passthrough_mask;
+                state.pixel_valid_mask = it.has_pixel_inputs ? it.pixel_inputs.valid_mask : 0u;
+                state.pixel_control0 = it.has_pixel_inputs ? it.pixel_inputs.controls[0] : 0u;
+                state.ps_input_ena = it.has_system_inputs ? it.system_inputs.ena : 0u;
+                state.ps_input_addr = it.has_system_inputs ? it.system_inputs.addr : 0u;
+                if (interpolation.valid && prosper::gpu::strip_layer_draw_admitted(state)) {
+                    gs.assign(prosper::gpu::kStripLayerForwardSpv.begin(),
+                              prosper::gpu::kStripLayerForwardSpv.end());
+                    requires_geometry = true;
+                } else {
+                    vs.clear(); // no half-recompiled ES without its proved output stage
+                }
+            }
             if (!vs.empty() && !fs.empty() && (!requires_geometry || !gs.empty())) {
                 it.set_vs(std::move(vs));
                 it.set_fs(std::move(fs));

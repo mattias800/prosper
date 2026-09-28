@@ -4,6 +4,7 @@
 #include "fixtures/render_runner.h"
 #include "volume_target_spirv.h"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include "gpu/execute/layered_volume_target.hpp"
 #include <array>
 #include <cstdint>
 #include <cstdio>
@@ -401,6 +402,63 @@ int main() {
             }
         }
         std::puts("32-slice retained volume passed four eight-layer views");
+    }
+    // Synthesized layered volume pass: a 32-slice 3D volume target produced in a SINGLE pass
+    // using kLayeredVolumeVs and kLayeredVolumeGs with 32 instances, bypassing the 8-layer mesh shader limit.
+    if (supported_features.geometryShader) {
+        constexpr uint64_t layered_id = kTarget + 0xb00000u;
+        constexpr uint32_t depth32 = 32;
+        BackendDraw draw;
+        draw.mesh_draw = false;
+        draw.vcount = 3;
+        draw.instance_count = depth32;
+        draw.vs = std::vector<uint32_t>(std::begin(prosper::gpu::kLayeredVolumeVs),
+                                        std::end(prosper::gpu::kLayeredVolumeVs));
+        draw.gs = std::vector<uint32_t>(std::begin(prosper::gpu::kLayeredVolumeGs),
+                                        std::end(prosper::gpu::kLayeredVolumeGs));
+        draw.fs = red_shader;
+        BackendColorTarget target;
+        target.persistent_id = layered_id;
+        target.load_existing = false;
+        target.readback = false;
+        target.format = VK_FORMAT_R8G8B8A8_UNORM;
+        target.volume_depth = depth32;
+        target.volume_first_slice = 0;
+        target.volume_slice_count = depth32;
+        if (const auto cpu = render_draws_rgba({draw}, kWidth, kHeight, nullptr, nullptr,
+                                           false, &target);
+            !cpu.empty() || backend_color_target_stats().writes != 1) {
+            std::fprintf(stderr, "single-pass 32-slice layered volume producer failed to reach retained path\n");
+            return 1;
+        }
+        std::vector<uint8_t> layered_bytes;
+        if (std::string read_err;
+            !readback_persistent_color_target(layered_id, kWidth, kHeight,
+                                              VK_FORMAT_R8G8B8A8_UNORM, layered_bytes,
+                                              read_err, depth32) ||
+            layered_bytes.size() != static_cast<size_t>(kWidth) * kHeight * depth32 * 4) {
+            std::fprintf(stderr, "32-slice layered volume readback failed: %s\n", read_err.c_str());
+            return 1;
+        }
+        for (uint32_t z = 0; z < depth32; ++z) {
+            const size_t at = (static_cast<size_t>(z) * kWidth * kHeight +
+                               static_cast<size_t>(kHeight / 2) * kWidth + kWidth / 2) * 4;
+            const std::array<uint8_t, 4> texel{
+                layered_bytes[at], layered_bytes[at + 1],
+                layered_bytes[at + 2], layered_bytes[at + 3]};
+            if (!red(texel)) {
+                std::fprintf(stderr, "32-slice layered volume lost slice %u\n", z);
+                return 1;
+            }
+        }
+        if (const auto sampled = consume(layered_id, depth32);
+            backend_color_target_stats().sampled_hits != 1 ||
+            !red(pixel(sampled, 8)) || !red(pixel(sampled, 24)) ||
+            !red(pixel(sampled, 40)) || !red(pixel(sampled, 56))) {
+            std::fprintf(stderr, "32-slice layered volume was not sampled directly\n");
+            return 1;
+        }
+        std::puts("single-pass 32-slice layered geometry volume producer passed");
     }
     // The guest producer exports an interpolated PARAM as well as a primitive layer. Constant
     // fragment colors above cannot detect a lost or mislinked PARAM on the MeshEXT handoff.

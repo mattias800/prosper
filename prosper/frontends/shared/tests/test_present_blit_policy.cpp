@@ -6,6 +6,7 @@
 using prosper::frontend::present_blit_wait_completed;
 using prosper::frontend::present_blit_has_new_flip;
 using prosper::frontend::present_source_is_newer;
+using prosper::frontend::gpu_present_frame_is_newer;
 
 static int failures = 0;
 #define CHECK(cond) do { if (!(cond)) { \
@@ -33,6 +34,15 @@ int main() {
     CHECK(!present_source_is_newer(true, 7, 6));
     CHECK(!present_source_is_newer(true, 7, 7));
     CHECK(present_source_is_newer(true, 7, 8));
+
+    // A GPU scanout frame acquired from the ring buffer is a freshly completed publication.
+    // An update for the same guest flip (e.g. tonemapper -> UI composite) is displayable, while
+    // strictly older flips remain rejected as stale.
+    CHECK(gpu_present_frame_is_newer(false, 0, 0));
+    CHECK(gpu_present_frame_is_newer(false, 99, 3));
+    CHECK(!gpu_present_frame_is_newer(true, 7, 6));
+    CHECK(gpu_present_frame_is_newer(true, 7, 7));
+    CHECK(gpu_present_frame_is_newer(true, 7, 8));
 
     // #3915: every renderer outcome that sends a flip to the CPU fallback is a named decline, and
     // the three that do not (published, already published, no consumer) are not.

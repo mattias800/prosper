@@ -2158,7 +2158,11 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     if ((!surface.rgba || surface.rgba->size() != expected) &&
                         surface.has_uniform_color)
                         materialize_uniform_rtt(surface);
-                    if ((!surface.rgba || surface.rgba->size() != expected) && surface.gpu_valid) {
+                    const auto* tgt = surface.gpu_valid
+                        ? prosper::test::find_persistent_color_target(addr, w, h, surface.format)
+                        : nullptr;
+                    const bool mutation_changed = tgt && tgt->mutation != surface.gpu_mutation;
+                    if ((!surface.rgba || surface.rgba->size() != expected || mutation_changed) && surface.gpu_valid) {
                         std::vector<uint8_t> materialized;
                         std::string error;
                         if (prosper::test::readback_persistent_color_target(
@@ -2166,6 +2170,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             materialized.size() == expected) {
                             surface.rgba = std::make_shared<const std::vector<uint8_t>>(
                                 std::move(materialized));
+                            surface.gpu_mutation = tgt ? tgt->mutation : 0;
                         } else {
                             static std::atomic<int> warned{0};
                             if (warned.fetch_add(1) < 24)
@@ -2215,6 +2220,15 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 const RttSurf* decline_surf = nullptr;
                 VkFormat decline_fmt = VK_FORMAT_UNDEFINED;
                 bool decline_have_target = false;
+                const uint64_t front_va = front_snapshot.address;
+                auto rit = front_va ? g_rtt.find(front_va) : g_rtt.end();
+                if (rit != g_rtt.end()) decline_surf = &rit->second;
+                const bool renderer_owns_front = rit != g_rtt.end() && !rit->second.volume_depth &&
+                    rit->second.gpu_valid && rit->second.w && rit->second.h;
+                const bool submit_wrote_front = (px_front_base && px_front_base == front_va) ||
+                    std::any_of(pinned_scanouts.begin(), pinned_scanouts.end(),
+                                [&](const PinnedScanout& p) { return p.id == front_va; });
+
                 if (!prosper::gpu::gpu_present_active()) {
                     gpu_outcome = GpuPresentOutcome::Inactive;
                 } else if (!gpu_present_now) {
@@ -2223,24 +2237,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     gpu_outcome = GpuPresentOutcome::NoFront;
                 } else if (!front_flip) {
                     gpu_outcome = GpuPresentOutcome::NoFlipIdentity;
-                } else if (!new_gpu_flip) {
-                    // The previously published slot remains the correct scanout for this guest
-                    // flip. Treat it as a successful GPU publication so intermediate render
-                    // submissions do not fall through to the expensive CPU readback path.
-                    published_gpu = true;
-                    gpu_outcome = GpuPresentOutcome::SameFlip;
-                    handoff_trace.emit(prosper::perf::PresentHandoffEvent::SameFlipSuppressed, 0, 0, last_gpu_publish_flip);
-                } else {
-                    const uint64_t front_va = front_snapshot.address;
-                    auto rit = g_rtt.find(front_va);
-                    if (rit != g_rtt.end()) decline_surf = &rit->second;
-                    if (rit == g_rtt.end()) {
-                        gpu_outcome = GpuPresentOutcome::NoRenderTarget;
-                    } else if (rit->second.volume_depth) {
-                        gpu_outcome = GpuPresentOutcome::VolumeTarget;
-                    } else if (!rit->second.gpu_valid || !rit->second.w || !rit->second.h) {
-                        gpu_outcome = GpuPresentOutcome::NotGpuResident;
-                    } else {
+                } else if (renderer_owns_front) {
+                    if (submit_wrote_front) {
                         const VkFormat fmt = prosper::test::backend_color_format(rit->second.format);
                         decline_fmt = fmt;
                         // The cache key is only a lookup hint. Hold its resource-domain lock from
@@ -2262,10 +2260,39 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 front_flip,
                                 prosper::test::persistent_color_producer_source(*tgt),
                                 &front_snapshot);
-                            if (published_gpu) last_gpu_publish_flip = front_flip;
-                            else gpu_outcome = GpuPresentOutcome::PublishFailed;
+                            if (published_gpu) {
+                                last_gpu_publish_flip = front_flip;
+                                selected_pixels.reset();
+                            } else {
+                                gpu_outcome = GpuPresentOutcome::PublishFailed;
+                            }
                         }
+                    } else if (!new_gpu_flip) {
+                        // The previously published slot remains the correct scanout for this guest
+                        // flip. Treat it as a successful GPU publication so intermediate render
+                        // submissions do not fall through to the expensive CPU readback path.
+                        published_gpu = true;
+                        selected_pixels.reset();
+                        gpu_outcome = GpuPresentOutcome::SameFlip;
+                        handoff_trace.emit(prosper::perf::PresentHandoffEvent::SameFlipSuppressed, 0, 0, last_gpu_publish_flip);
+                    } else {
+                        // A new guest flip was queued, but this submit has not drawn to front_va yet.
+                        // Wait for the submit that renders to the front buffer; suppress premature CPU fallback.
+                        published_gpu = true;
+                        selected_pixels.reset();
+                        gpu_outcome = GpuPresentOutcome::SameFlip;
+                        handoff_trace.emit(prosper::perf::PresentHandoffEvent::SameFlipSuppressed, 0, 0, last_gpu_publish_flip);
                     }
+                } else if (!new_gpu_flip) {
+                    published_gpu = true;
+                    gpu_outcome = GpuPresentOutcome::SameFlip;
+                    handoff_trace.emit(prosper::perf::PresentHandoffEvent::SameFlipSuppressed, 0, 0, last_gpu_publish_flip);
+                } else if (rit == g_rtt.end()) {
+                    gpu_outcome = GpuPresentOutcome::NoRenderTarget;
+                } else if (rit->second.volume_depth) {
+                    gpu_outcome = GpuPresentOutcome::VolumeTarget;
+                } else if (!rit->second.gpu_valid || !rit->second.w || !rit->second.h) {
+                    gpu_outcome = GpuPresentOutcome::NotGpuResident;
                 }
                 // #3915: a display buffer written by a compute dispatch has no render target, but
                 // the compute backend may have left a GPU mirror of exactly its bytes. The mirror

@@ -1228,9 +1228,11 @@ void render_per_target_passes(PerTargetPassContext& ctx) {
                       prosper::frontend::mrt_raw_format(*pass.front(), 0));
             surface.has_uniform_color = false;
             surface.dcc_metadata_dirty = false;
-            surface.gpu_valid = prosper::test::find_persistent_color_target(
+            const auto* ct = prosper::test::find_persistent_color_target(
                 base, gw, gh, pass_format, true,
-                backend_target.volume_depth) != nullptr;
+                backend_target.volume_depth);
+            surface.gpu_valid = ct != nullptr;
+            surface.gpu_mutation = ct ? ct->mutation : 0;
             // Claim renderer authority over the volume's guest footprint ONLY when the
             // renderer now holds a valid image to serve it from. The backend marks a
             // retained volume valid only once every slice is proven written, so a
@@ -1358,9 +1360,10 @@ void render_per_target_passes(PerTargetPassContext& ctx) {
             // Any slot with a retained target is GPU-valid, not only slot 1. The
             // `slot == 1` clause dated from when slots above 1 had no persistent image
             // to be valid about.
-            surface.gpu_valid =
-                prosper::test::find_persistent_color_target(
-                    pass_bases[slot], gw, gh, pass_formats[slot]) != nullptr;
+            const auto* ct = prosper::test::find_persistent_color_target(
+                pass_bases[slot], gw, gh, pass_formats[slot]);
+            surface.gpu_valid = ct != nullptr;
+            surface.gpu_mutation = ct ? ct->mutation : 0;
             pin_renderer_mip_target(pass_bases[slot], gw, gh, pass_formats[slot],
                                     surface.gpu_valid);
             if (!pixels.empty())

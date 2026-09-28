@@ -146,6 +146,7 @@ struct RttSurf {
     // Consumers need this to compose their T# DST_SEL with the host image's component order.
     VkFormat guest_format = VK_FORMAT_UNDEFINED;
     bool gpu_valid = false;
+    uint64_t gpu_mutation = 0;
     // A color target can be cleared by a compute write to its DCC metadata rather than by a
     // color-plane write. Remember the sampled descriptor's metadata range so that write can
     // invalidate the retained CPU/GPU target just like a write to the color plane itself.
