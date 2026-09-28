@@ -146,6 +146,46 @@ int main() {
               "capture-extent fallback reports no target rather than a mismatched address");
     }
 
+    // A default replay of an offscreen submit must name a target this submit actually wrote.
+    // A later colour-disabled draw or dispatch cannot replace that output selection.
+    {
+        GpuReplayFrame offscreen_submit;
+        offscreen_submit.metadata.width = 3840;
+        offscreen_submit.metadata.height = 2160;
+        DrawItem writer;
+        writer.draw_index = 10;
+        writer.color_targets[0] = {0x100000, 640, 360};
+        writer.ps.color_targets[0].format = 37; // VK_FORMAT_R8G8B8A8_UNORM
+        writer.ps.color_targets[0].write_mask = 0xf;
+        DrawItem depth_only = writer;
+        depth_only.draw_index = 11;
+        depth_only.color_targets[0].base = 0x200000;
+        depth_only.ps.color_targets[0].write_mask = 0;
+        offscreen_submit.items = {writer, depth_only};
+        offscreen_submit.operations = {
+            {SubmitOperationKind::Draw, 10, 1, true},
+            {SubmitOperationKind::Draw, 11, 2, true},
+            {SubmitOperationKind::Dispatch, 4, 3, true},
+        };
+        auto selected = replay_last_written_output_target(offscreen_submit);
+        CHECK(selected.status == OutputTargetAfterStatus::Selected &&
+                  selected.target.guest_addr == 0x100000 &&
+                  selected.target.operation_index == prosper::tools::OperationIndex{0} &&
+                  selected.target.width == 640 && selected.target.height == 360,
+              "offscreen replay selects the last real colour writer, not the presented extent");
+        offscreen_submit.items[1].ps.color_targets[0].write_mask = 0xf;
+        selected = replay_last_written_output_target(offscreen_submit);
+        CHECK(selected.status == OutputTargetAfterStatus::Selected &&
+                  selected.target.guest_addr == 0x200000 &&
+                  selected.target.operation_index == prosper::tools::OperationIndex{1},
+              "making the later draw a writer moves the selected offscreen output");
+        offscreen_submit.items[0].ps.color_targets[0].write_mask = 0;
+        offscreen_submit.items[1].ps.color_targets[0].write_mask = 0;
+        CHECK(replay_last_written_output_target(offscreen_submit).status ==
+                  OutputTargetAfterStatus::NotWrittenByOperation,
+              "a depth-only submit cannot invent a colour output target");
+    }
+
     // Exact post-operation target selection is a write proof, not an address/binding lookup. This
     // is the CPU-only policy used by --output-target-after before it asks Vulkan for a readback.
     {

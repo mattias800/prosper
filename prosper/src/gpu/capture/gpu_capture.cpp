@@ -733,7 +733,9 @@ bool gpu_capture_ds_seed_snapshot_available() {
     return static_cast<bool>(g_ds_seed_snapshot_reader);
 }
 
-bool capture_referenced_gpu_ds_seeds(GpuCaptureFile& capture, std::string& error) {
+bool capture_referenced_gpu_ds_seeds(
+    GpuCaptureFile& capture, std::string& error,
+    const std::vector<GpuCaptureDsSeed>* pre_submit_seeds) {
     error.clear();
     if (!capture.ds_seeds.empty()) {
         error = "capture already contains DS checkpoints";
@@ -760,8 +762,11 @@ bool capture_referenced_gpu_ds_seeds(GpuCaptureFile& capture, std::string& error
     if (!references_ds) return true;
 
     std::vector<GpuCaptureDsSeed> live;
-    if (!read_all_gpu_capture_ds_seeds(live, error)) return false;
-    for (auto& seed : live) {
+    if (!pre_submit_seeds && !read_all_gpu_capture_ds_seeds(live, error)) {
+        return false;
+    }
+    const auto& candidates = pre_submit_seeds ? *pre_submit_seeds : live;
+    for (const auto& seed : candidates) {
         const bool referenced = std::any_of(
             capture.draws.begin(), capture.draws.end(), [&](const GpuCapturedDraw& draw) {
                 const auto& ps = draw.ps;
@@ -776,7 +781,7 @@ bool capture_referenced_gpu_ds_seeds(GpuCaptureFile& capture, std::string& error
                        ps.stencil_write_base == seed.stencil_write_base &&
                        ps.htile_data_base == seed.htile_data_base;
             });
-        if (referenced) capture.ds_seeds.push_back(std::move(seed));
+        if (referenced) capture.ds_seeds.push_back(seed);
     }
     return true;
 }
@@ -1362,6 +1367,13 @@ bool materialize_pending_gpu_capture(PendingGpuCapture& pending,
         pending.pre_submit_compute_gds.data(), pending.pre_submit_compute_gds.size());
     if (!captured) return false;
     pending.materialized = true;
+    if (!pending.pre_submit_ds_error.empty()) {
+        error = pending.pre_submit_ds_error;
+        return false;
+    }
+    if (pending.pre_submit_ds_seeds_taken)
+        return capture_referenced_gpu_ds_seeds(
+            pending.capture, error, &pending.pre_submit_ds_seeds);
     return !gpu_capture_ds_seed_snapshot_available() ||
            capture_referenced_gpu_ds_seeds(pending.capture, error);
 }
@@ -1688,6 +1700,21 @@ std::unique_ptr<PendingGpuCapture> begin_requested_gpu_capture(
                          "seeds will be read after the submit and may hold its own output (#3908)\n");
         }
     }
+    // The retained DS cache is read before this submit executes. The existing snapshot reader
+    // exports all layers; materialization later keeps only the planes its realized draws use.
+    // An empty pre-submit cache is meaningful: a new attachment must not be seeded with the
+    // contents it acquired during this submit.
+    if (defer_materialization && !output_triggered && semantic_state &&
+        !semantic_state->draws.empty() && gpu_capture_ds_seed_snapshot_available()) {
+        pending->pre_submit_ds_seeds_taken = read_all_gpu_capture_ds_seeds(
+            pending->pre_submit_ds_seeds, pending->pre_submit_ds_error);
+        if (!pending->pre_submit_ds_seeds_taken) {
+            if (pending->pre_submit_ds_error.empty())
+                pending->pre_submit_ds_error = "deferred pre-submit DS snapshot failed";
+            std::fprintf(stderr, "[gpucap] deferred pre-submit DS snapshot failed: %s\n",
+                         pending->pre_submit_ds_error.c_str());
+        }
+    }
     // Full output-candidate materialization remains deferred until its pixels match. The small
     // pre-submit snapshots above are the deliberate exception: known DMA endpoints cannot be
     // recovered after execution, while every unrelated guest resource and renderer cache remains
@@ -1791,12 +1818,48 @@ bool finish_requested_gpu_capture(std::unique_ptr<PendingGpuCapture> pending,
                      pending->capture.operations.size(),
                      pending->capture.failure_diagnostics.size(), pending->path.c_str());
     }
-    pending->capture.expected_output_valid = !output.empty();
-    pending->capture.expected_output_bytes = output.size();
-    pending->capture.expected_output_hash = output.empty() ? 0 : gpu_capture_hash(output);
+    const auto scanout_entry = std::find_if(
+        pending->capture.metadata.renderer_env.begin(),
+        pending->capture.metadata.renderer_env.end(), [](const auto& entry) {
+            return entry.first == kGpuReplayScanoutAddressEnv;
+        });
+    const uint64_t scanout = scanout_entry == pending->capture.metadata.renderer_env.end()
+        ? 0 : parse_gpu_replay_scanout_address(scanout_entry->second.c_str());
+    const bool writes_scanout = scanout && std::any_of(
+        pending->capture.draws.begin(), pending->capture.draws.end(),
+        [scanout](const GpuCapturedDraw& draw) {
+            if (draw.ps.cb_resolve)
+                return (draw.color_targets[1].base ? draw.color_targets[1].base :
+                        draw.color1_base) == scanout;
+            for (size_t slot = 0; slot < kColorTargetCount; ++slot) {
+                const auto& target = draw.color_targets[slot];
+                const uint64_t base = target.base ? target.base :
+                    (slot == 0 ? draw.color0_base : slot == 1 ? draw.color1_base : 0);
+                const auto& ps_target = draw.ps.color_targets[slot];
+                uint32_t mask = ps_target.write_mask;
+                if (!ps_target.format && !target.base && slot == 0)
+                    mask = draw.ps.color_write_mask;
+                else if (!ps_target.format && !target.base && slot == 1)
+                    mask = draw.ps.color1_write_mask;
+                if (base == scanout && mask) return true;
+            }
+            return false;
+        });
+    // With no graphics draw writing the registered scanout, these presentation bytes do not prove
+    // the captured draws' output. A compute storage alias may still write scanout, but this capture
+    // path has no such proof; fail closed on the oracle until it does.
+    const bool no_scanout_draw = scanout && !writes_scanout;
+    if (no_scanout_draw)
+        pending->capture.metadata.renderer_env.emplace_back(kGpuReplayNoScanoutDrawEnv, "1");
+    pending->capture.expected_output_valid = !output.empty() && !no_scanout_draw;
+    pending->capture.expected_output_bytes = pending->capture.expected_output_valid ? output.size() : 0;
+    pending->capture.expected_output_hash = pending->capture.expected_output_valid
+        ? gpu_capture_hash(output) : 0;
     if (!write_gpu_capture(pending->path, pending->capture, error)) return false;
-    if (output.empty()) {
-        std::fprintf(stderr, "[gpucap] wrote %s without output oracle\n", pending->path.c_str());
+    if (!pending->capture.expected_output_valid) {
+        std::fprintf(stderr, "[gpucap] wrote %s without output oracle%s\n",
+                     pending->path.c_str(),
+                     no_scanout_draw ? " (no graphics draw wrote scanout)" : "");
     } else {
         std::fprintf(stderr, "[gpucap] wrote %s output_bytes=%zu hash=%016llx\n",
                      pending->path.c_str(), output.size(),

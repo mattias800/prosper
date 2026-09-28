@@ -5301,6 +5301,14 @@ One line per falsified hypothesis, the evidence that killed it, and where. **Rea
 a new one** — and note which entries are *solid* versus *void*, because a void result is not a
 falsification.
 
+- **The 61-draw deferred capture at `PROSPER_GPU_CAPTURE_AT=286` can use its last colour target
+  as a pixel oracle.** False on submit 4237 of the 2026-09-28 `reach-performance-story.pad` run:
+  `gpu_replay --inspect-only` reports `cwm=0 cwm1=0` on **all 61 realized draws**, with one
+  interleaved compute dispatch; replay reports `no-color-target` and returns zero pixel bytes.
+  The post-submit presented frame cannot be attributed to these draws; a compute storage alias is
+  not ruled out. This capsule needs a depth/stencil output oracle or a different selected submit,
+  not a guessed colour target. #3908.
+
 - **Native BCn texture upload is a GTA V frame-rate lever** — falsified 2026-09-27 (#3873,
   native-BC PR). Same binary, `PROSPER_NO_NATIVE_BC=1` as the off arm, interleaved on
   `reach-performance-story.pad`, last 18 samples: **8.28 / 8.13 / 8.69 / 8.76 fps** (off, on, off,

@@ -334,6 +334,13 @@ Renderer-invocation captures record an expected byte count/hash and replay exits
 Timeline-selected captures occur before Vulkan and report `oracle=no`; they render normally but do not invent an
 expected hash. `--allow-mismatch` is for an intentional differential such as `--draw N:M`.
 
+A one-submit capture whose draws do not write the registered scanout also reports `oracle=no`:
+the pixels presented after that submit may belong to an earlier submit. If its draws wrote a colour
+target, default replay shows the last one after all captured operations execute and names it on the
+output line. Its hash is useful for repeatable comparisons, but it is not a presented-frame oracle.
+If every draw is depth-only, replay says that no pixel image is available; use the operation and
+depth diagnostics for that capsule. `--output-target-after` can select another colour target explicitly.
+
 ## Cross-title regression gate — `regress.py` (#1258)
 
 `tools/gpu_replay/regress.py` replays a whole **corpus** of `.prgcap` capsules and diffs each one's rendered

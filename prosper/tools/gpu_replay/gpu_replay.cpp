@@ -4086,11 +4086,33 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "[gpureplay] executing through mixed operation %d\n", through_operation);
     }
     prosper::gpu::replay_tool::OutputTargetAfterOperation exact_output_target;
+    bool automatic_intermediate_output = false;
     if (output_target_after_operation != SIZE_MAX) {
         if (!plan_exact_output_target(replay, output_target_after_operation,
                                       output_target_after_addr, exact_output_target))
             return 2;
         allow_mismatch = true;
+    } else if (!draw_selected && through_operation < 0 && selected_operation_limit == SIZE_MAX &&
+               !replay.expected_output_valid &&
+               std::any_of(replay.metadata.renderer_env.begin(), replay.metadata.renderer_env.end(),
+                           [](const auto& entry) {
+                               return entry.first == prosper::gpu::kGpuReplayNoScanoutDrawEnv &&
+                                      entry.second == "1";
+                           })) {
+        const auto selected =
+            prosper::gpu::replay_tool::replay_last_written_output_target(replay);
+        if (selected.status == prosper::gpu::replay_tool::OutputTargetAfterStatus::Selected) {
+            exact_output_target = selected.target;
+            automatic_intermediate_output = true;
+            std::fprintf(stderr,
+                         "[gpureplay] no scanout draw: showing last written target %016llx "
+                         "after the full submit; no presented-frame oracle\n",
+                         static_cast<unsigned long long>(exact_output_target.guest_addr));
+        } else {
+            std::fprintf(stderr,
+                         "[gpureplay] no scanout draw and no realized colour writer; "
+                         "no pixel image or presented-frame oracle is available\n");
+        }
     }
     const auto& m = replay.metadata;
     std::fprintf(stderr, "[gpureplay] rev=%s title=%s submit=%llu %ux%u draws=%zu computes=%zu "
@@ -4220,7 +4242,7 @@ int main(int argc, char** argv) {
         }
         return 0;
     }
-    const size_t operation_limit = exact_output_target
+    const size_t operation_limit = exact_output_target && !automatic_intermediate_output
         ? prosper::tools::raw(exact_output_target.operation_index) + 1
         : through_operation >= 0
             ? static_cast<size_t>(through_operation) + 1 : selected_operation_limit;

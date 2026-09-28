@@ -174,6 +174,29 @@ inline OutputTargetAfterSelection replay_output_target_after_operation(
     return {OutputTargetAfterStatus::Selected, target};
 }
 
+// A submit with no scanout-writing draw has no proven presented-frame oracle. For its default
+// replay image, choose the last exact colour target a realized draw wrote, then read that
+// renderer-owned target after the full submit. This does not call it the presented frame.
+inline OutputTargetAfterSelection replay_last_written_output_target(const GpuReplayFrame& replay) {
+    for (size_t next = replay.operations.size(); next > 0; --next) {
+        const size_t operation_index = next - 1;
+        const auto& operation = replay.operations[operation_index];
+        if (!operation.realized || operation.kind != SubmitOperationKind::Draw) continue;
+        const auto found_index = prosper::tools::replay_item_index_for_draw(
+            replay, prosper::tools::DrawIndex{operation.source_index});
+        if (found_index == prosper::tools::kNoItemIndex) continue;
+        const auto& draw = replay.items[prosper::tools::raw(found_index)];
+        for (uint32_t slot = 0; slot < kColorTargetCount; ++slot) {
+            const uint64_t base = replay_color_binding(draw, slot).base;
+            if (!base) continue;
+            const auto selected = replay_output_target_after_operation(
+                replay, prosper::tools::OperationIndex{operation_index}, base);
+            if (selected.status == OutputTargetAfterStatus::Selected) return selected;
+        }
+    }
+    return {OutputTargetAfterStatus::NotWrittenByOperation, {}};
+}
+
 // Bundle operation ordinals are submit-local. Apply an exact selector only to the final submit left
 // after the caller's tail/through-submit selection; an earlier retained predecessor must execute in
 // full even if it happens to contain the same operation/address pair.
