@@ -160,38 +160,6 @@ bool parse_diagnostic_extent(const char* spec, uint32_t& width, uint32_t& height
 // the live renderer is not registered.
 std::function<void(uint64_t)> g_flip_scanout_hook;
 
-// The one place a PRODUCER OUTCOME settles a renderer-produced volume's claim over its guest
-// footprint, by live_rtt_settle_volume_footprint's rule: a claim needs a valid renderer image, and a pass or
-// refusal without one releases any earlier claim. Otherwise every later sample of the address is
-// refused and its draw dropped, with guest memory never allowed to stand in (#3842, #3889, #3890).
-// Not a global invariant: a partial guest write, the pending-write overflow path and the MSAA-resolve
-// destination copy keep or copy a claim without an image on purpose (#3842's tombstone).
-void settle_volume_guest_footprint(uint64_t base, RttSurf& surface, bool renderer_image_valid,
-                                   uint64_t bytes, bool proven) {
-    const prosper::frontend::LiveRttVolumeFootprint settled =
-        prosper::frontend::live_rtt_settle_volume_footprint(
-            {surface.volume_guest_bytes, surface.volume_footprint_proven},
-            surface.volume_depth != 0, renderer_image_valid, bytes, proven);
-    surface.volume_guest_bytes = settled.bytes;
-    surface.volume_footprint_proven = settled.proven;
-    if (surface.volume_guest_bytes) g_volume_targets.note(base);
-}
-
-// A volume producer pass the renderer declined, or whose view or backend admission it refused. The
-// renderer holds no image for the attempted version, so the entry records the shape only and guest
-// memory stays authoritative for the footprint (settle_volume_guest_footprint).
-void note_volume_producer_denied(uint64_t base, RttSurf& denied, uint32_t width, uint32_t height,
-                                 uint32_t volume_depth, VkFormat format) {
-    denied.w = width;
-    denied.h = height;
-    denied.volume_depth = volume_depth;
-    settle_volume_guest_footprint(base, denied, /*renderer_image_valid=*/false, 0, false);
-    denied.format = format;
-    denied.rgba.reset();
-    denied.has_uniform_color = false;
-    denied.gpu_valid = false;
-}
-
 void queue_guest_gpu_write(uint64_t addr, uint64_t size, const char* origin) {
     auto& pending = pending_guest_gpu_writes();
     // The origin arrives AS DATA from the notifier. Reading the thread-local here instead would be
@@ -279,15 +247,6 @@ VkFormat replay_color_format(prosper::gpu::GpuCaptureColorFormat format) {
     return VK_FORMAT_R8G8B8A8_UNORM;
 }
 
-// #1330: gpu_replay sets PROSPER_PREFIX_INSPECT for its ordered-prefix modes (--draw N:M,
-// --draw-steps, --through-operation) before the first render, so a prefix ending on a non-RGBA8
-// color pass publishes that surface (inspection-converted) instead of a stale earlier RGBA8 pass.
-// Never set outside those diagnostic replays; cached once — the flag is process-lifetime.
-bool prefix_inspect_publish() {
-    static const bool enabled = getenv("PROSPER_PREFIX_INSPECT") != nullptr;
-    return enabled;
-}
-
 // ---- AvPlayer NV12 chroma-plane recognition diagnostic (#2005) --------------------------------
 //
 // The classification itself lives in avplayer_plane_policy.hpp (with its own unit test); this is
@@ -300,16 +259,6 @@ using prosper::frontend::AvpChromaReason;
 using prosper::frontend::AvpChromaVerdict;
 using prosper::frontend::avp_chroma_reason_name;
 using prosper::frontend::classify_avplayer_chroma_plane;
-
-// Milliseconds since the first ARMED census check of this run — the origin for the `ms:` form of
-// PROSPER_PASS_LOG / PROSPER_DUMP_PERSISTENT (diagnostic_window.hpp). Lazily started, so an
-// unarmed run never reads the clock and the origin is the same first-callback moment
-// PROSPER_GPU_CAPTURE_AFTER_MS uses, letting a capture and a census be aimed at one instant.
-static uint64_t diagnostic_elapsed_ms() {
-    static const auto start = std::chrono::steady_clock::now();
-    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::steady_clock::now() - start).count());
-}
 
 uint64_t host_physical_memory_bytes() {
 #ifdef _WIN32
@@ -403,18 +352,6 @@ uint32_t native_bc_sampled_format(const prosper::gpu::ShaderResource& resource,
         case DataFormat::Bc7: return VK_FORMAT_BC7_UNORM_BLOCK;
         default: return 0u;
     }
-}
-
-const DiagnosticAddressSelector& rtt_no_seed_target_selector() {
-    static const DiagnosticAddressSelector selector =
-        parse_diagnostic_address_selector("PROSPER_RTT_NOSEED_TARGET");
-    return selector;
-}
-
-const DiagnosticAddressSelector& rtt_residency_trace_selector() {
-    static const DiagnosticAddressSelector selector =
-        parse_diagnostic_address_selector("PROSPER_RTT_RESIDENCY_TRACE");
-    return selector;
 }
 
 RendererMipChainLayout renderer_mip_chain_layout(uint64_t level_zero_address,
