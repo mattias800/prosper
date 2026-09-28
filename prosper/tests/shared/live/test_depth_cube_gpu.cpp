@@ -5,8 +5,9 @@
 //      (read the six faces back, quantise with depth_cube_quantize.hpp) for every texel of a cube
 //      seeded with rounding-boundary depths (every (k+0.5)/255 and its float neighbours) and
 //      random depths.
-//   2. DOMAIN. The conversion alone matches the CPU quantiser for values no depth attachment can
-//      hold (NaN, infinities, negatives, > 1, subnormals, random bit patterns).
+//   2. DOMAIN. The conversion alone matches the CPU quantiser for finite out-of-range values,
+//      infinities and subnormals. NaN has a separate deterministic zero expectation because the
+//      CPU's NaN-to-uint8 cast is undefined.
 //   3. ROUTING. Through the live renderer, a fully renderer-owned cube is served by the GPU route
 //      (one gather per ordered batch, zero CPU decodes, same pixels), while a mixed cube, a forced
 //      fallback and the PROSPER_NO_GPU_DEPTH_CUBE control stay on the CPU bridge with identical output.
@@ -303,8 +304,19 @@ int main(int argc, char** argv) {
             wild.push_back(std::bit_cast<float>(bits_state));
         }
         std::vector<uint8_t> wild_expected(wild.size() * 4u);
-        quantize_depth_cube_rgba8_scalar(wild_expected.data(),
-                                         reinterpret_cast<const uint8_t*>(wild.data()), wild.size());
+        for (size_t i = 0; i < wild.size(); ++i) {
+            const uint32_t bits = std::bit_cast<uint32_t>(wild[i]);
+            const bool nan = (bits & 0x7f800000u) == 0x7f800000u &&
+                             (bits & 0x007fffffu) != 0;
+            if (nan) {
+                wild_expected[i * 4 + 0] = wild_expected[i * 4 + 1] =
+                    wild_expected[i * 4 + 2] = 0;
+                wild_expected[i * 4 + 3] = 255;
+            } else {
+                quantize_depth_cube_rgba8_scalar(wild_expected.data() + i * 4,
+                    reinterpret_cast<const uint8_t*>(&wild[i]), 1);
+            }
+        }
         HostBuffer staging;
         const VkDeviceSize wild_bytes = wild.size() * sizeof(float);
         const bool staged = slot && make_host_buffer(ctx, wild_bytes, staging);
@@ -348,8 +360,7 @@ int main(int argc, char** argv) {
             }
         }
         check(converted && wild_mismatches == 0,
-              "conversion matches the CPU quantiser for NaN, infinities, negatives, > 1 and "
-              "random bit patterns");
+              "finite conversion matches CPU; NaN uses the deterministic zero policy");
     }
 
     // ---- 3. ROUTING through the live renderer. ----

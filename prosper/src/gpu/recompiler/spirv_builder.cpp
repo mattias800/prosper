@@ -16,7 +16,9 @@ enum : uint32_t {
     Op_Load=61, Op_Store=62, Op_AccessChain=65, Op_Decorate=71, Op_MemberDecorate=72,
     Op_CompositeConstruct=80, Op_CompositeExtract=81, Op_ImageRead=98, Op_ConvertFToU=109,
     Op_Bitcast=124, Op_IsNan=156, Op_FOrdLessThan=184, Op_FOrdGreaterThan=186, Op_IAdd=128, Op_FAdd=129, Op_ISub=130, Op_IMul=132,
-    Op_FMul=133, Op_UDiv=134, Op_UMod=137, Op_Any=154, Op_LogicalAnd=167, Op_Select=169, Op_INotEqual=171,
+    Op_FMul=133, Op_UDiv=134, Op_UMod=137, Op_Any=154, Op_LogicalOr=166, Op_LogicalAnd=167,
+    Op_Select=169, Op_IEqual=170, Op_INotEqual=171, Op_UGreaterThan=172,
+    Op_UGreaterThanEqual=174,
     Op_ShiftRightLogical=194, Op_ShiftLeftLogical=196, Op_BitwiseOr=197,
     Op_BitwiseXor=198, Op_BitwiseAnd=199, Op_BitCount=205,
     Op_ULessThan=176, Op_AtomicExchange=229, Op_Phi=245, Op_SelectionMerge=247, Op_Label=248,
@@ -737,12 +739,11 @@ std::vector<uint32_t> build_compute_retile_words(RetileShaderKind kind,
 
 std::vector<uint32_t> build_compute_depth_to_rgba8() {
     Emitter e;
-    const auto void_t = e.id(), fn_t = e.id(), uint_t = e.id(), float_t = e.id(), bool_t = e.id();
+    const auto void_t = e.id(), fn_t = e.id(), uint_t = e.id(), bool_t = e.id();
     const auto vec_t = e.id(), input_ptr = e.id(), gid = e.id();
     const auto array_t = e.id(), block_t = e.id(), block_ptr = e.id(), word_ptr = e.id();
     const auto words = e.id(), push_t = e.id(), push_ptr = e.id(), push_word = e.id();
     const auto push = e.id(), main = e.id(), entry = e.id(), body = e.id(), done = e.id();
-    const auto scaled = e.id(), rounded = e.id();
     Emitter::put(e.caps, Op_Capability, {Cap_Shader});
     Emitter::put(e.mem, Op_MemoryModel, {Addr_Logical, Mem_GLSL450});
     std::vector<uint32_t> ep{Exec_GLCompute, main};
@@ -757,16 +758,9 @@ std::vector<uint32_t> build_compute_depth_to_rgba8() {
     }
     Emitter::put(e.deco, Op_Decorate, {words, Dec_DescriptorSet, 0});
     Emitter::put(e.deco, Op_Decorate, {words, Dec_Binding, 0});
-    // The CPU reference rounds the product before adding 0.5 (SSE mul then add, no FMA). Keep the
-    // GPU to the same two roundings. A search of every float within 64 ulps of each (k+0.5)/255
-    // found no input in [0, 1] where one fused rounding changes the truncated result, so this is
-    // defensive rather than load-bearing today; it keeps the contract literal if the math changes.
-    Emitter::put(e.deco, Op_Decorate, {scaled, Dec_NoContraction});
-    Emitter::put(e.deco, Op_Decorate, {rounded, Dec_NoContraction});
     Emitter::put(e.types, Op_TypeVoid, {void_t});
     Emitter::put(e.types, Op_TypeFunction, {fn_t, void_t});
     Emitter::put(e.types, Op_TypeInt, {uint_t, 32, 0});
-    Emitter::put(e.types, Op_TypeFloat, {float_t, 32});
     Emitter::put(e.types, Op_TypeBool, {bool_t});
     Emitter::put(e.types, Op_TypeVector, {vec_t, uint_t, 3});
     Emitter::put(e.types, Op_TypePointer, {input_ptr, SC_Input, vec_t});
@@ -781,7 +775,7 @@ std::vector<uint32_t> build_compute_depth_to_rgba8() {
     Emitter::put(e.types, Op_TypePointer, {push_word, SC_PushConstant, uint_t});
     Emitter::put(e.types, Op_Variable, {push_ptr, push, SC_PushConstant});
     // Constants must be unique per value and type.
-    std::vector<std::pair<uint32_t, uint32_t>> uints, floats;
+    std::vector<std::pair<uint32_t, uint32_t>> uints;
     auto constant = [&](uint32_t value) {
         for (auto [v, id] : uints) if (v == value) return id;
         const auto id = e.id();
@@ -789,17 +783,19 @@ std::vector<uint32_t> build_compute_depth_to_rgba8() {
         Emitter::put(e.types, Op_Constant, {uint_t, id, value});
         return id;
     };
-    auto fconstant = [&](float value) {
-        const uint32_t bits = fbits(value);
-        for (auto [v, id] : floats) if (v == bits) return id;
-        const auto id = e.id();
-        floats.emplace_back(bits, id);
-        Emitter::put(e.types, Op_Constant, {float_t, id, bits});
-        return id;
-    };
     auto binary = [&](uint32_t op, uint32_t a, uint32_t b) {
         auto id = e.id();
         Emitter::put(e.code, op, {uint_t, id, a, b});
+        return id;
+    };
+    auto predicate = [&](uint32_t op, uint32_t a, uint32_t b) {
+        const auto id = e.id();
+        Emitter::put(e.code, op, {bool_t, id, a, b});
+        return id;
+    };
+    auto select = [&](uint32_t condition, uint32_t yes, uint32_t no) {
+        const auto id = e.id();
+        Emitter::put(e.code, Op_Select, {uint_t, id, condition, yes, no});
         return id;
     };
     Emitter::put(e.code, Op_Function, {void_t, main, FC_None, fn_t});
@@ -813,23 +809,75 @@ std::vector<uint32_t> build_compute_depth_to_rgba8() {
     Emitter::put(e.code, Op_SelectionMerge, {done, 0});
     Emitter::put(e.code, Op_BranchConditional, {valid, body, done});
     Emitter::put(e.code, Op_Label, {body});
-    const auto texel_ptr = e.id(), bits = e.id(), depth = e.id();
+    const auto texel_ptr = e.id(), bits = e.id();
     Emitter::put(e.code, Op_AccessChain, {word_ptr, texel_ptr, words, constant(0), index});
     Emitter::put(e.code, Op_Load, {uint_t, bits, texel_ptr});
-    Emitter::put(e.code, Op_Bitcast, {float_t, depth, bits});
-    // depth < 0 ? 0 : (depth > 1 ? 1 : depth) -- the CPU spelling, ordered compares so NaN
-    // passes through both and is replaced below.
-    const auto below = e.id(), above = e.id(), upper = e.id(), clamped = e.id();
-    Emitter::put(e.code, Op_FOrdGreaterThan, {bool_t, above, depth, fconstant(1.0f)});
-    Emitter::put(e.code, Op_Select, {float_t, upper, above, fconstant(1.0f), depth});
-    Emitter::put(e.code, Op_FOrdLessThan, {bool_t, below, depth, fconstant(0.0f)});
-    Emitter::put(e.code, Op_Select, {float_t, clamped, below, fconstant(0.0f), upper});
-    Emitter::put(e.code, Op_FMul, {float_t, scaled, clamped, fconstant(255.0f)});
-    Emitter::put(e.code, Op_FAdd, {float_t, rounded, scaled, fconstant(0.5f)});
-    const auto truncated = e.id(), nan = e.id(), q = e.id();
-    Emitter::put(e.code, Op_ConvertFToU, {uint_t, truncated, rounded});
-    Emitter::put(e.code, Op_IsNan, {bool_t, nan, depth});
-    Emitter::put(e.code, Op_Select, {uint_t, q, nan, constant(0), truncated});
+    // The CPU bridge rounds d*255 to binary32, then separately rounds +0.5 before truncating.
+    // Vulkan permits an implementation-defined float rounding mode without the optional
+    // shaderRoundingModeRTEFloat32 property. Reproduce the two round-to-even steps with integer
+    // operations on the D32 bits, so this path has the same finite [0,1] result on every device.
+    // For d < 2^-9 the output is zero. Otherwise d = mantissa * 2^(exp-150), where mantissa is
+    // 24 bits and mantissa*255 fits in 32 bits. The product is rounded to a 24-bit significand;
+    // adding 0.5 then needs at most one more bit of rounding. Clamp out-of-range values separately.
+    const auto exponent = binary(Op_ShiftRightLogical, bits, constant(23));
+    const auto low_exp = predicate(Op_ULessThan, exponent, constant(118));
+    const auto high_exp = predicate(Op_UGreaterThan, exponent, constant(127));
+    const auto bounded_exp = select(low_exp, constant(118),
+                                    select(high_exp, constant(127), exponent));
+    const auto mantissa = binary(Op_BitwiseOr,
+        binary(Op_BitwiseAnd, bits, constant(0x7fffffu)), constant(0x800000u));
+    const auto product = binary(Op_IMul, mantissa, constant(255));
+    const auto wide = predicate(Op_UGreaterThanEqual, product, constant(0x80000000u));
+    const auto shift = select(wide, constant(8), constant(7));
+    const auto product_m = binary(Op_ShiftRightLogical, product, shift);
+    const auto remainder = binary(Op_BitwiseAnd, product,
+        binary(Op_ISub, binary(Op_ShiftLeftLogical, constant(1), shift), constant(1)));
+    const auto half = binary(Op_ShiftLeftLogical, constant(1),
+        binary(Op_ISub, shift, constant(1)));
+    const auto round_product = predicate(Op_LogicalOr,
+        predicate(Op_UGreaterThan, remainder, half),
+        predicate(Op_LogicalAnd, predicate(Op_IEqual, remainder, half),
+            predicate(Op_INotEqual,
+                binary(Op_BitwiseAnd, product_m, constant(1)), constant(0))));
+    const auto product_rounded = binary(Op_IAdd, product_m,
+                                        select(round_product, constant(1), constant(0)));
+    const auto product_carry = predicate(Op_IEqual, product_rounded, constant(1u << 24));
+    const auto product_normal = select(product_carry,
+        binary(Op_ShiftRightLogical, product_rounded, constant(1)), product_rounded);
+    // Use exponent+2 to keep the small negative exponents unsigned. The clamped input makes every
+    // dynamic shift below fall in [14,25], even when the final out-of-range select discards it.
+    const auto exp_plus_two = binary(Op_IAdd,
+        binary(Op_ISub, binary(Op_IAdd, bounded_exp, shift), constant(125)),
+        select(product_carry, constant(1), constant(0)));
+    const auto added = binary(Op_IAdd, product_normal,
+        binary(Op_ShiftLeftLogical, constant(1),
+            binary(Op_ISub, constant(24), exp_plus_two)));
+    const auto add_carry = predicate(Op_UGreaterThanEqual, added, constant(1u << 24));
+    const auto added_half = binary(Op_ShiftRightLogical, added, constant(1));
+    const auto round_add = predicate(Op_LogicalAnd,
+        predicate(Op_INotEqual, binary(Op_BitwiseAnd, added, constant(1)), constant(0)),
+        predicate(Op_INotEqual, binary(Op_BitwiseAnd, added_half, constant(1)), constant(0)));
+    const auto added_m = select(add_carry,
+        binary(Op_IAdd, added_half, select(round_add, constant(1), constant(0))), added);
+    const auto added_exp = binary(Op_IAdd, exp_plus_two,
+        select(add_carry, constant(1), constant(0)));
+    const auto second_carry = predicate(Op_IEqual, added_m, constant(1u << 24));
+    const auto final_m = select(second_carry,
+        binary(Op_ShiftRightLogical, added_m, constant(1)), added_m);
+    const auto final_exp = binary(Op_IAdd, added_exp,
+        select(second_carry, constant(1), constant(0)));
+    const auto finite_q = binary(Op_ShiftRightLogical, final_m,
+        binary(Op_ISub, constant(25), final_exp));
+    const auto at_least_one = predicate(Op_UGreaterThanEqual, bits, constant(0x3f800000u));
+    const auto nan = predicate(Op_LogicalAnd,
+        predicate(Op_IEqual, binary(Op_BitwiseAnd, bits, constant(0x7f800000u)),
+                  constant(0x7f800000u)),
+        predicate(Op_INotEqual, binary(Op_BitwiseAnd, bits, constant(0x007fffffu)),
+                  constant(0)));
+    const auto negative = predicate(Op_INotEqual,
+        binary(Op_BitwiseAnd, bits, constant(0x80000000u)), constant(0));
+    const auto q = select(predicate(Op_LogicalOr, negative, nan), constant(0),
+        select(at_least_one, constant(255), select(low_exp, constant(0), finite_q)));
     const auto packed = binary(Op_BitwiseOr, binary(Op_IMul, q, constant(0x010101u)),
                                constant(0xff000000u));
     Emitter::put(e.code, Op_Store, {texel_ptr, packed});

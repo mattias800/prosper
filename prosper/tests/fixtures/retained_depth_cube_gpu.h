@@ -13,16 +13,15 @@
 //   1. copy each face's depth aspect into one device-local buffer, one packed plane per face, in
 //      face order -- exactly the byte layout of the CPU's stacked payload before conversion;
 //   2. a compute pass converts every float in place to `q | q<<8 | q<<16 | 0xff000000` with
-//      q = trunc(clamp(d, 0, 1) * 255 + 0.5), multiply and add rounded separately
-//      (spirv_builder.hpp: build_compute_depth_to_rgba8), bit-identical to the CPU quantiser;
+//      q = trunc(clamp(d, 0, 1) * 255 + 0.5), reproducing the CPU's separate round-to-even
+//      float32 multiply and add using integer operations (build_compute_depth_to_rgba8);
 //   3. copy the buffer into an R8G8B8A8_UNORM `w x 6h` image that rests in
 //      SHADER_READ_ONLY_OPTIMAL, bound by the backend's borrowed-image route.
-// CONFIDENCE: HIGH that the values match the CPU path: step 1 is a bit copy of the stored float,
-// step 2 uses only correctly rounded IEEE operations (Vulkan requires x*y and x+y to be correctly
-// rounded; NoContraction keeps them separate like the CPU's SSE code) and an exact truncating
-// conversion, and tests/shared/live/test_depth_cube_gpu.cpp compares every texel of boundary and
-// random depths -- and the conversion alone on NaN/infinite/out-of-range bit patterns -- against
-// the CPU quantiser.
+// CONFIDENCE: HIGH for finite depth: step 1 copies stored float bits and step 2 implements the
+// CPU's two float32 rounding steps without depending on Vulkan's optional rounding-mode property.
+// tests/shared/live/test_depth_cube_gpu.cpp compares every texel near quantisation boundaries and
+// random depths. NaN maps to zero by an explicit GPU policy; the CPU's NaN-to-uint8 cast is
+// undefined and is not used as an oracle.
 //
 // Scope is deliberately the fully renderer-owned cube (all six faces retained). A mixed cube
 // (missing faces decoded from guest bytes) and the compute/DS hybrid keep the CPU path unchanged,
