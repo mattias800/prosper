@@ -11734,6 +11734,10 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                             r.set, r.binding, (int)image_create_result,
                                             tci.extent.width, tci.extent.height, tci.extent.depth,
                                             tci.mipLevels, tci.arrayLayers, (int)tci.format);
+                                    // #3913 review: the upload is already in the pass's sharing
+                                    // index; a later draw of this pass sampling the same texture
+                                    // must retry, not reuse this dead entry.
+                                    if (share_texture_uploads) texture_upload_indices.erase(texture_key);
                                     buffer_resources_ready = false;
                                     break;
                                 }
@@ -11809,6 +11813,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                     }
                                     upload.direct_memory = false;
                                     upload.persistent_id = 0;
+                                    // Drop the dead upload from the pass's sharing index (above).
+                                    if (share_texture_uploads) texture_upload_indices.erase(texture_key);
                                     buffer_resources_ready = false;
                                     break;
                                 }

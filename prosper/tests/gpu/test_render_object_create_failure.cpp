@@ -620,6 +620,35 @@ int main() {
               "texture memory: the failure names the missing memory and the VkResult");
         CHECK(tex_px.size() == static_cast<size_t>(W) * H * 4 && center_red(tex_px) < 0x20,
               "texture memory: the draw is skipped instead of binding null memory");
+
+        // #3913 review: the failed upload was already in the pass's texture-sharing index. A SECOND
+        // draw of the same pass sampling the same texture must retry the upload (and render), not
+        // reuse the dead entry -- an image with no memory bound. Both upload failure paths.
+        for (const bool create_failure : {false, true}) {
+            std::vector<uint8_t> shared_px;
+            const std::string shared_log = capture_stderr(
+                create_failure ? "test_render_object_create_failure_texshare_create.log"
+                               : "test_render_object_create_failure_texshare_mem.log",
+                [&] {
+                    prosper::test::FrameResource r;
+                    r.binding = 4; r.set = 1; r.tex_rgba = texels; r.tw = 2; r.th = 2;
+                    prosper::test::BackendDraw d;
+                    d.vs = vert; d.fs = tex_fs; d.ps = &opaque; d.R = {r}; d.vcount = 3;
+                    if (create_failure)
+                        prosper::test::inject_render_texture_create_failure_once();
+                    else
+                        prosper::test::inject_render_memory_failure_once(
+                            RenderMemoryFailureSite::Texture);
+                    shared_px = prosper::test::render_draws_rgba({d, d}, W, H, nullptr, black);
+                });
+            CHECK(has(shared_log, "[texture-upload-failed]"),
+                  create_failure ? "shared texture (vkCreateImage): the first draw's upload failed"
+                                 : "shared texture (memory): the first draw's upload failed");
+            CHECK(shared_px.size() == static_cast<size_t>(W) * H * 4 && center_red(shared_px) > 0xC0,
+                  create_failure
+                      ? "shared texture (vkCreateImage): the second draw retries the upload and renders"
+                      : "shared texture (memory): the second draw retries the upload and renders");
+        }
     }
 
     printf(fails ? "FAILED (%d)\n" : "PASSED\n", fails);
