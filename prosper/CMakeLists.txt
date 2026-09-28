@@ -3108,6 +3108,9 @@ endif()
       add_library(prosper_live_renderer STATIC frontends/shared/live/live_renderer.cpp
                                                frontends/shared/live/submit_renderer/draw_resources.cpp
                                                frontends/shared/live/submit_renderer/timing_report.cpp
+                                               frontends/shared/live/submit_renderer/backend_draws.cpp
+                                               frontends/shared/live/submit_renderer/backend_timing.cpp
+                                               frontends/shared/live/submit_renderer/per_target_passes.cpp
                                                frontends/shared/live/live_compute.cpp
                                                frontends/shared/present/present_blit.cpp)
       target_include_directories(prosper_live_renderer PRIVATE src tests tools/boot_trace)
@@ -3422,6 +3425,9 @@ endif()
       add_library(prosper_live_renderer STATIC frontends/shared/live/live_renderer.cpp
                                                frontends/shared/live/submit_renderer/draw_resources.cpp
                                                frontends/shared/live/submit_renderer/timing_report.cpp
+                                               frontends/shared/live/submit_renderer/backend_draws.cpp
+                                               frontends/shared/live/submit_renderer/backend_timing.cpp
+                                               frontends/shared/live/submit_renderer/per_target_passes.cpp
                                                frontends/shared/live/live_compute.cpp
                                                frontends/shared/present/present_blit.cpp)
       target_include_directories(prosper_live_renderer PRIVATE src tests tools/boot_trace)
