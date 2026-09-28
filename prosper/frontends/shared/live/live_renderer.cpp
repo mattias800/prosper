@@ -131,33 +131,6 @@ bool flush_live_graphics_pipeline_cache() {
 // this the composite samples zeros and the frame is black. We cache each submit's rendered pixels under
 // its render-target base and inject them when a subsequent draw samples a texture at a matching base.
 namespace {
-bool parse_diagnostic_address(const char* spec, uint64_t& address) {
-    if (!spec) return true;
-    if (spec[0] != '0' || (spec[1] != 'x' && spec[1] != 'X') || !spec[2]) return false;
-    char* end = nullptr;
-    errno = 0;
-    const unsigned long long parsed = std::strtoull(spec, &end, 16);
-    if (errno || end == spec + 2 || *end || !parsed) return false;
-    address = parsed;
-    return true;
-}
-
-bool parse_diagnostic_extent(const char* spec, uint32_t& width, uint32_t& height) {
-    if (!spec) return true;
-    if (*spec < '0' || *spec > '9') return false;
-    char* separator = nullptr;
-    errno = 0;
-    const unsigned long w = std::strtoul(spec, &separator, 10);
-    if (errno || !separator || *separator != 'x' || !w || w > UINT32_MAX ||
-        separator[1] < '0' || separator[1] > '9') return false;
-    char* end = nullptr;
-    errno = 0;
-    const unsigned long h = std::strtoul(separator + 1, &end, 10);
-    if (errno || !end || *end || !h || h > UINT32_MAX) return false;
-    width = static_cast<uint32_t>(w);
-    height = static_cast<uint32_t>(h);
-    return true;
-}
 
 // Installed by the live-renderer registration below; called from the guest flip path through the
 // extern "C" entry at the bottom of this file, which that registration hands to core. Empty when
