@@ -86,6 +86,8 @@ enum class Counter : uint8_t {
     HleUnimplementedCalls,     // calls into an unregistered NID (the dispatcher answers 0)
     HleUnimplementedFirst,     // ...of which the FIRST call of a distinct import
     PresentCpuFallbacks,       // GPU-present iterations that showed a CPU-read-back frame instead
+    PresentGpuDeclines,        // final render spans that declined to publish the front to GPU
+                               // present, by reason in Ledger::present_declines (#3915)
     PipelineEvictions,         // graphics pipelines evicted from the full pipeline cache
     PipelineLayoutEvictions,   // pipeline layouts evicted from their full cache
     DescriptorSetLayoutEvictions,  // descriptor-set layouts evicted from their full cache
@@ -222,6 +224,12 @@ constexpr const char* kDispatchSkipNames[kDispatchSkipCount] = {
 // memory_placement_log.hpp static_asserts that every class fits a slot.
 constexpr size_t kGpuMemoryClassSlots = 16;
 
+// Per-reason breakdown of the renderer's GPU-present declines (#3915), counted per final render
+// SPAN that did NOT hand the front buffer to GPU present. A flip can end several spans, so these
+// counts are not fallback presents (Counter::PresentCpuFallbacks counts those). The reasons are the frontend's prosper::frontend::GpuPresentOutcome, which this header
+// must not include; the recorder passes each reason's name as a string literal, stored by pointer.
+constexpr size_t kPresentDeclineSlots = 24;
+
 constexpr size_t kCostCount = static_cast<size_t>(Cost::Count);
 constexpr size_t kCounterCount = static_cast<size_t>(Counter::Count);
 constexpr size_t kGaugeCount = static_cast<size_t>(Gauge::Count);
@@ -237,6 +245,8 @@ struct Ledger {
     std::atomic<uint64_t> dispatch_skips[kDispatchSkipCount] = {};
     std::atomic<uint64_t> gpu_memory_off_device[kGpuMemoryClassSlots] = {};
     std::atomic<const char*> gpu_memory_class_names[kGpuMemoryClassSlots] = {};
+    std::atomic<uint64_t> present_declines[kPresentDeclineSlots] = {};
+    std::atomic<const char*> present_decline_names[kPresentDeclineSlots] = {};
     // The one attribution string a cost may carry: which HLE lock blocked, for instance. A pointer
     // to a string literal, stored without copying.
     std::atomic<const char*> cost_label[kCostCount] = {};
@@ -297,6 +307,16 @@ inline void note_gpu_memory_off_device(size_t slot, const char* name, uint64_t b
     l.gpu_memory_off_device[slot].fetch_add(1, std::memory_order_relaxed);
     add(Counter::GpuMemoryOffDevice);
     add(Counter::GpuMemoryOffDeviceBytes, bytes);
+}
+
+// One GPU-present decline with its reason (#3915). `name` must be a string literal. Bumps
+// Counter::PresentGpuDeclines too, so the total and the breakdown can never disagree.
+inline void note_present_decline(size_t slot, const char* name) {
+    if (slot >= kPresentDeclineSlots) return;
+    Ledger& l = ledger();
+    l.present_decline_names[slot].store(name, std::memory_order_relaxed);
+    l.present_declines[slot].fetch_add(1, std::memory_order_relaxed);
+    add(Counter::PresentGpuDeclines);
 }
 
 // Re-realizations that are not live execution (an F9 capture re-realizing a submit's dispatches

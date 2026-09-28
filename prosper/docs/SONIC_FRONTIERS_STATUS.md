@@ -864,6 +864,15 @@ being closed; the rest are this document's own. **Do not restate the row count i
 a stated total is stale as soon as the next lane appends, and every lane that adds a row would have
 to remember to update it. The last one did not (review of #2820).
 
+- **"Every flip goes through the GPU-present CPU fallback because of the 4K scanout's format, its
+  HDR/buffer attributes, or a flip-source mismatch."** False (#3915). The renderer's decline reason,
+  now named, was `no-render-target` on every flip: the renderer holds no target at either display
+  buffer, because program `0x20002fe800` writes both (`0x200a160000`, `0x200c140000`) as tile-27
+  RGBA8_UINT **compute storage images**, not as colour targets (`PROSPER_GUEST_WRITE_WATCH` names
+  `compute-writeback(image-guest-bytes)` as their only writer). The fix mirrors that dispatch's own
+  result into a GPU image and presents it (`frontends/shared/present/compute_scanout.hpp`);
+  `PROSPER_COMPUTE_SCANOUT_VERIFY=1` compared 91 sampled flips across menus and gameplay against the
+  CPU fallback's frame and all were byte-identical.
 - **"The menus' two dropped draws per flip sample a depth layer that was rendered at another shape,
   invalidated, or written by a pass that does not register it."** False (#3893). Every refusal of
   the `0x2048a00000` 1024x1024x4 Float32 array now prints every retained DS identity at that base

@@ -96,6 +96,8 @@ std::vector<AlarmFiring> AlarmEngine::on_flip(uint64_t now_ns, Ledger& ledger,
         for (size_t i = 0; i < kGpuMemoryClassSlots; ++i)
             prev_gpu_memory_off_device_[i] =
                 ledger.gpu_memory_off_device[i].load(std::memory_order_relaxed);
+        for (size_t i = 0; i < kPresentDeclineSlots; ++i)
+            prev_present_declines_[i] = ledger.present_declines[i].load(std::memory_order_relaxed);
         for (size_t i = 0; i < WindowSample::kTransferCount; ++i)
             prev_transfer_bytes_[i] = ext.transfer_bytes[i];
         return {};
@@ -139,6 +141,12 @@ std::vector<AlarmFiring> AlarmEngine::on_flip(uint64_t now_ns, Ledger& ledger,
         w.gpu_memory_off_device[i] = v - prev_gpu_memory_off_device_[i];
         prev_gpu_memory_off_device_[i] = v;
         w.gpu_memory_class_names[i] = ledger.gpu_memory_class_names[i].load(std::memory_order_relaxed);
+    }
+    for (size_t i = 0; i < kPresentDeclineSlots; ++i) {
+        const uint64_t v = ledger.present_declines[i].load(std::memory_order_relaxed);
+        w.present_declines[i] = v - prev_present_declines_[i];
+        prev_present_declines_[i] = v;
+        w.present_decline_names[i] = ledger.present_decline_names[i].load(std::memory_order_relaxed);
     }
     for (size_t i = 0; i < WindowSample::kTransferCount; ++i) {
         // A total that went BACKWARDS (a test's fresh source) is a new baseline, not a huge delta.
@@ -271,6 +279,13 @@ std::vector<AlarmFiring> AlarmEngine::close_window(const WindowSample& w, double
             std::fprintf(jsonl_, ",\"gpu_memory_fallbacks\":%llu,\"gpu_memory_off_device\":",
                          n(Counter::GpuMemoryFallbacks));
             json_counts(jsonl_, ranked(w.gpu_memory_off_device, names, kGpuMemoryClassSlots));
+        }
+        {
+            const char* names[kPresentDeclineSlots];
+            for (size_t i = 0; i < kPresentDeclineSlots; ++i)
+                names[i] = w.present_decline_names[i] ? w.present_decline_names[i] : "?";
+            std::fputs(",\"present_gpu_declines\":", jsonl_);
+            json_counts(jsonl_, ranked(w.present_declines, names, kPresentDeclineSlots));
         }
         // #3891 queue rules' raw quantities.
         std::fprintf(jsonl_,

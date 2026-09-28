@@ -113,6 +113,7 @@ private:
     uint64_t prev_drop_reasons_[kDropReasonCount] = {};
     uint64_t prev_dispatch_skips_[kDispatchSkipCount] = {};
     uint64_t prev_gpu_memory_off_device_[kGpuMemoryClassSlots] = {};
+    uint64_t prev_present_declines_[kPresentDeclineSlots] = {};
     uint64_t prev_transfer_bytes_[WindowSample::kTransferCount] = {};
     std::vector<const char*> active_;   // rules REPORTED in the most recent window
     std::vector<std::pair<const char*, RuleState>> rules_;

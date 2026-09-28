@@ -47,6 +47,7 @@
 #include "gpu/present/videoout_present.hpp"     // present_front_index (flip-anchored present selection)
 #include "shared/present/present_blit.hpp"             // GPU scanout handoff (#1270 unified-device present)
 #include "shared/present/present_blit_policy.hpp"      // flip-anchored scanout publication policy
+#include "shared/present/compute_scanout.hpp"          // #3915: GPU present of a compute-written scanout
 #include "shared/present/present_extent.hpp"           // the publish extent contract with the caller (#1986)
 #include "shared/media/avplayer_plane_policy.hpp"    // which sampled resource is AvPlayer's NV12 chroma plane
 #include "shared/live/texture_reference_census.hpp"  // PROSPER_TEXREF_CENSUS (#3873)
@@ -2513,18 +2514,41 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 const bool gpu_present_now = prosper::frontend::gpu_present_allowed_during_capture(
                     prosper::gpu::gpu_present_active(),
                     prosper::gpu::gpu_capture_requires_cpu_output());
-                if (front >= 0 && front_flip && gpu_present_now && !new_gpu_flip) {
+                using prosper::frontend::GpuPresentOutcome;
+                GpuPresentOutcome gpu_outcome = GpuPresentOutcome::Published;
+                // Diagnostic context for a decline line; filled as far as the checks get.
+                uint64_t decline_va = front_snapshot.address;
+                const RttSurf* decline_surf = nullptr;
+                VkFormat decline_fmt = VK_FORMAT_UNDEFINED;
+                bool decline_have_target = false;
+                if (!prosper::gpu::gpu_present_active()) {
+                    gpu_outcome = GpuPresentOutcome::Inactive;
+                } else if (!gpu_present_now) {
+                    gpu_outcome = GpuPresentOutcome::CaptureNeedsCpu;
+                } else if (front < 0) {
+                    gpu_outcome = GpuPresentOutcome::NoFront;
+                } else if (!front_flip) {
+                    gpu_outcome = GpuPresentOutcome::NoFlipIdentity;
+                } else if (!new_gpu_flip) {
                     // The previously published slot remains the correct scanout for this guest
                     // flip. Treat it as a successful GPU publication so intermediate render
                     // submissions do not fall through to the expensive CPU readback path.
                     published_gpu = true;
+                    gpu_outcome = GpuPresentOutcome::SameFlip;
                     handoff_trace.emit(prosper::perf::PresentHandoffEvent::SameFlipSuppressed, 0, 0, last_gpu_publish_flip);
-                } else if (front >= 0 && front_flip && gpu_present_now) {
+                } else {
                     const uint64_t front_va = front_snapshot.address;
                     auto rit = g_rtt.find(front_va);
-                    if (rit != g_rtt.end() && !rit->second.volume_depth &&
-                        rit->second.gpu_valid && rit->second.w && rit->second.h) {
+                    if (rit != g_rtt.end()) decline_surf = &rit->second;
+                    if (rit == g_rtt.end()) {
+                        gpu_outcome = GpuPresentOutcome::NoRenderTarget;
+                    } else if (rit->second.volume_depth) {
+                        gpu_outcome = GpuPresentOutcome::VolumeTarget;
+                    } else if (!rit->second.gpu_valid || !rit->second.w || !rit->second.h) {
+                        gpu_outcome = GpuPresentOutcome::NotGpuResident;
+                    } else {
                         const VkFormat fmt = prosper::test::backend_color_format(rit->second.format);
+                        decline_fmt = fmt;
                         // The cache key is only a lookup hint. Hold its resource-domain lock from
                         // the exact image/provenance snapshot through the synchronous scanout copy;
                         // eviction or allocation reuse must not substitute another image mid-handoff.
@@ -2533,15 +2557,105 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         prosper::test::PersistentColorTargetImage* tgt =
                             prosper::test::find_persistent_color_target(
                                 front_va, rit->second.w, rit->second.h, fmt);
-                        if (tgt && tgt->image && tgt->layout != VK_IMAGE_LAYOUT_UNDEFINED) {
+                        decline_have_target = tgt != nullptr;
+                        if (!tgt || !tgt->image) {
+                            gpu_outcome = GpuPresentOutcome::NoPersistentImage;
+                        } else if (tgt->layout == VK_IMAGE_LAYOUT_UNDEFINED) {
+                            gpu_outcome = GpuPresentOutcome::UndefinedLayout;
+                        } else {
                             published_gpu = prosper::frontend::present_blit_publish(
                                 tgt->image, tgt->layout, fmt, rit->second.w, rit->second.h,
                                 front_flip,
                                 prosper::test::persistent_color_producer_source(*tgt),
                                 &front_snapshot);
                             if (published_gpu) last_gpu_publish_flip = front_flip;
+                            else gpu_outcome = GpuPresentOutcome::PublishFailed;
                         }
                     }
+                }
+                // #3915: a display buffer written by a compute dispatch has no render target, but
+                // the compute backend may have left a GPU mirror of exactly its bytes. The mirror
+                // stands in only where the CPU fallback would itself present the guest buffer: no
+                // renderer entry at the front address at all. Any entry, a pixel-less tombstone
+                // included, makes the CPU path keep the previous frame, so the decision declines it
+                // (RendererOwnsTarget) and the renderer's own reason stands.
+                if (gpu_outcome == GpuPresentOutcome::NoRenderTarget ||
+                    gpu_outcome == GpuPresentOutcome::NotGpuResident) {
+                    // The CPU path's own priority (cached_scanout below): a render target at ANY
+                    // registered buffer that it could serve beats the guest buffer.
+                    const size_t scanout_bytes = static_cast<size_t>(w) * h * 4;
+                    bool renderer_scanout = false;
+                    for (int i = 0; i < prosper_vo_buffer_count() && !renderer_scanout; ++i) {
+                        auto it = g_rtt.find(prosper_vo_buffer_addr(i));
+                        renderer_scanout = it != g_rtt.end() && it->second.w == w &&
+                            it->second.h == h && it->second.format == VK_FORMAT_R8G8B8A8_UNORM &&
+                            !it->second.volume_depth &&
+                            ((it->second.rgba && it->second.rgba->size() == scanout_bytes) ||
+                             it->second.has_uniform_color || it->second.gpu_valid);
+                    }
+                    prosper::frontend::ComputeScanoutPresentInputs renderer_inputs;
+                    renderer_inputs.have_selected_pixels = static_cast<bool>(selected_pixels);
+                    renderer_inputs.renderer_scanout = renderer_scanout;
+                    renderer_inputs.renderer_owns_front = decline_surf != nullptr;
+                    renderer_inputs.present_extent_bytes = present_extent_bytes;
+                    renderer_inputs.display_bytes =
+                        static_cast<uint64_t>(prosper::gpu::present_width()) *
+                        prosper::gpu::present_height() * 4u;
+                    const auto compute = prosper::frontend::compute_scanout_publish(
+                        front_snapshot, front_flip, renderer_inputs);
+                    using prosper::frontend::ComputeScanoutPresent;
+                    switch (compute.decision) {
+                    case ComputeScanoutPresent::Publish:
+                        gpu_outcome = compute.published ? GpuPresentOutcome::Published
+                                                        : GpuPresentOutcome::PublishFailed;
+                        break;
+                    case ComputeScanoutPresent::Absent:               // keep the renderer's reason
+                    case ComputeScanoutPresent::RendererOwnsTarget: break;
+                    case ComputeScanoutPresent::Stale:
+                        gpu_outcome = GpuPresentOutcome::ComputeScanoutStale; break;
+                    case ComputeScanoutPresent::Unwatched:
+                        gpu_outcome = GpuPresentOutcome::ComputeScanoutUnwatched; break;
+                    case ComputeScanoutPresent::ExtentMismatch:
+                        gpu_outcome = GpuPresentOutcome::ComputeScanoutExtentMismatch; break;
+                    case ComputeScanoutPresent::TileMismatch:
+                        gpu_outcome = GpuPresentOutcome::ComputeScanoutTileMismatch; break;
+                    case ComputeScanoutPresent::RendererSource:
+                        gpu_outcome = GpuPresentOutcome::ComputeScanoutRendererSource; break;
+                    case ComputeScanoutPresent::ScaledPresent:
+                        gpu_outcome = GpuPresentOutcome::ComputeScanoutScaled; break;
+                    }
+                    if (compute.published) {
+                        published_gpu = true;
+                        last_gpu_publish_flip = front_flip;
+                    }
+                }
+                if (prosper::frontend::gpu_present_outcome_is_decline(gpu_outcome)) {
+                    prosper::diagnostics::perf::note_present_decline(
+                        static_cast<size_t>(gpu_outcome),
+                        prosper::frontend::gpu_present_outcome_name(gpu_outcome));
+                    static_assert(static_cast<size_t>(GpuPresentOutcome::Count) <=
+                                      prosper::diagnostics::perf::kPresentDeclineSlots,
+                                  "every GPU-present outcome needs a perf-ledger decline slot");
+                    // Budgeted per reason, so one noisy reason cannot hide the first of another.
+                    // Counted per final render SPAN; a flip can end several, so this is not a
+                    // count of fallback presents (that is the fps line's cpu-fallback count).
+                    static std::atomic<uint64_t> decline_reports[(size_t)GpuPresentOutcome::Count]{};
+                    const uint64_t ord = decline_reports[(size_t)gpu_outcome].fetch_add(1) + 1;
+                    if (prosper::diag_should_print(ord))
+                        fprintf(stderr,
+                                "[present] GPU PRESENT DECLINED #%llu: %s -- front=%d flip=%llu "
+                                "va=0x%llx rtt=%s%ux%u fmt=%d gpu_valid=%d uniform=%d cpu_px=%d "
+                                "persistent=%d display=%ux%u; this span's frame goes to the CPU fallback\n",
+                                (unsigned long long)ord,
+                                prosper::frontend::gpu_present_outcome_name(gpu_outcome), front,
+                                (unsigned long long)front_flip, (unsigned long long)decline_va,
+                                decline_surf ? "" : "none:", decline_surf ? decline_surf->w : 0,
+                                decline_surf ? decline_surf->h : 0,
+                                decline_surf ? (int)decline_surf->format : (int)decline_fmt,
+                                decline_surf ? (int)decline_surf->gpu_valid : 0,
+                                decline_surf ? (int)decline_surf->has_uniform_color : 0,
+                                decline_surf && decline_surf->rgba ? 1 : 0,
+                                (int)decline_have_target, w, h);
                 }
                 if (!published_gpu) handoff_trace.emit(prosper::perf::PresentHandoffEvent::CpuFallbackNeeded);
                 const RttSurf* scanout = (!published_gpu && front >= 0)

@@ -16,6 +16,7 @@
 #include "shared/live/live_target_format.hpp"
 #include "shared/live/packed_rtt_conversion.hpp"
 #include "shared/live/gpu_retile.hpp"
+#include "shared/present/compute_scanout.hpp"   // #3915: GPU-present mirror of a compute-written display buffer
 #include "shared/rtt/rtt_scale.hpp"
 #include "shared/rtt/rtt_authority.hpp"
 #include "shared/device/pipeline_cache_file.hpp"  // #3425: one checked envelope for both stages
@@ -30,6 +31,7 @@
 #include "gpu/texture/bc_decode.hpp"
 #include "gpu/diagnostics/vk_object_names.hpp"   // #3578
 #include "gpu/diagnostics/watch_list.hpp"        // strict opt-in address trace
+#include "gpu/diagnostics/diag_ratelimit.hpp"
 #include "gpu/capture/gpu_capture.hpp"
 #include "gpu/diagnostics/gpu_memory_budget_vk.hpp"  // #3533: how much of the heap does prosper hold?
 #include "gpu/diagnostics/memory_placement_log.hpp"  // #3888: GPU-only images prefer VRAM
@@ -83,6 +85,11 @@
 #define PROSPER_HAVE_TARGET_F16C 1
 #endif
 #include "shared/compute/compute_buffer_bytes.hpp"
+
+
+// The VideoOut buffer registry (hle_graphics.cpp). #3915 asks whether a storage result is a display buffer.
+extern "C" int prosper_vo_buffer_count();
+extern "C" uint64_t prosper_vo_buffer_addr(int i);
 
 namespace prosper::frontend {
 
@@ -4072,6 +4079,10 @@ struct BoundImage {
     // A read-only imported binding can sample the old image during this dispatch. The result copy
     // then leaves that image in GENERAL for the import owner's ordinary layout restoration.
     bool mirror_destination_shared_import = false;
+    // #3915: GPU-present mirror of a complete display-buffer result (compute_scanout.hpp).
+    prosper::frontend::ComputeScanoutTarget scanout_mirror{};
+    bool scanout_mirror_recorded = false;
+    bool scanout_mirror_committed = false;
     bool has_renderer_seed() const {
         return seed_from_imported != SIZE_MAX || standalone_seed.valid();
     }
@@ -7131,6 +7142,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             if (buffer.memory) ctx.release_memory(buffer.memory);
         }
         for (size_t i = 0; i < images.size(); i++) {
+            if (images[i].scanout_mirror.valid() && !images[i].scanout_mirror_committed)
+                prosper::frontend::compute_scanout_abort(images[i].scanout_mirror);
             // A pin is taken per successful import, so it is released per import -- including for a
             // binding that a later alias check folded into an earlier one (#1095).
             if (images[i].mirror_destination.valid()) {
@@ -11170,13 +11183,13 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             }
             return addresses;
         }();
-        if (!destination_mirror_disabled) for (size_t i = 0; i < images.size(); ++i) {
-            BoundImage& bi = images[i];
+        // The whole, exact, single-level 2D result of this dispatch for one guest address: the
+        // shape proof both the renderer destination mirror and the GPU-present scanout mirror
+        // (#3915) need before a staging result may stand in for the guest bytes.
+        const auto exact_full_result = [&](size_t i) {
+            const BoundImage& bi = images[i];
             const ShaderResource* r = bi.resource;
-            const bool trace_destination = r &&
-                std::find(destination_trace_targets.begin(), destination_trace_targets.end(),
-                          r->gpu_addr) != destination_trace_targets.end();
-            const bool basic_candidate = r && r->gpu_addr && !r->host_data &&
+            return r && r->gpu_addr && !r->host_data &&
                 bi.storage_writeback &&
                 bi.alias_of == SIZE_MAX && bi.exact_storage_bytes() &&
                 !bi.storage_write_mask && !bi.mirror_result_to_imported &&
@@ -11186,6 +11199,14 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 !r->in_mip_tail && !r->mip_chain_base_level && !r->layer_mip_offset_bytes &&
                 !r->linear_row_pitch_bytes && !r->layer_stride_bytes &&
                 r->width && r->height && staging[i];
+        };
+        if (!destination_mirror_disabled) for (size_t i = 0; i < images.size(); ++i) {
+            BoundImage& bi = images[i];
+            const ShaderResource* r = bi.resource;
+            const bool trace_destination = r &&
+                std::find(destination_trace_targets.begin(), destination_trace_targets.end(),
+                          r->gpu_addr) != destination_trace_targets.end();
+            const bool basic_candidate = exact_full_result(i);
             if (trace_destination)
                 std::fprintf(stderr,
                     "[compute-dest-target] code=0x%llx submit=%llu dispatch=%llu binding=%u "
@@ -11347,6 +11368,55 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             bi.mirror_destination = destination;
             bi.mirror_destination_shared_import = shares_read_only_import;
             mirror_census.borrowed.add();
+        }
+
+        // #3915: a complete result for a registered VideoOut buffer also goes to a GPU-present
+        // mirror, so its flip can be presented without reading the buffer back out of guest memory.
+        // Inert unless prosper-app's GPU present is active.
+        if (prosper::gpu::gpu_present_active() && prosper::frontend::compute_scanout_enabled() &&
+            std::any_of(images.begin(), images.end(),
+                        [](const BoundImage& image) { return image.storage_writeback; })) {
+            // One registry snapshot per dispatch (each accessor takes the VideoOut mutex).
+            uint64_t vo_bases[16];
+            size_t vo_count = 0;
+            const int registered_count = prosper_vo_buffer_count();
+            for (int vo = 0; vo < registered_count && vo_count < 16; ++vo)
+                if (const uint64_t base = prosper_vo_buffer_addr(vo)) vo_bases[vo_count++] = base;
+            prosper::frontend::compute_scanout_retain_registered(vo_bases, vo_count);
+            for (size_t i = 0; i < images.size(); ++i) {
+                BoundImage& bi = images[i];
+                const ShaderResource* r = bi.resource;
+                if (!r || !r->gpu_addr || !bi.storage_writeback || bi.imported) continue;
+                if (std::find(vo_bases, vo_bases + vo_count, r->gpu_addr) == vo_bases + vo_count)
+                    continue;
+                prosper::frontend::ComputeScanoutCandidate candidate;
+                candidate.gpu_present_active = true;
+                candidate.registered_scanout = true;
+                candidate.exact_full_result = exact_full_result(i);
+                candidate.width = r->width;
+                candidate.height = r->height;
+                candidate.linear_bytes = staging_bytes[i];
+                candidate.shared_device = prosper::frontend::compute_scanout_device_shared(ctx.device);
+                const auto eligibility = prosper::frontend::compute_scanout_eligible(candidate);
+                if (eligibility != prosper::frontend::ComputeScanoutEligibility::Eligible) {
+                    // A dispatch replacing a display buffer's bytes that cannot carry a mirror still
+                    // retires any older one (its guest writeback would also dirty the watch).
+                    prosper::frontend::compute_scanout_begin(VK_NULL_HANDLE, r->gpu_addr, 0, 0);
+                    static std::atomic<uint64_t> declines[8]{};
+                    const size_t slot = static_cast<size_t>(eligibility) & 7u;
+                    if (prosper::diag_should_print(declines[slot].fetch_add(1) + 1))
+                        std::fprintf(stderr,
+                            "[compute-scanout] no GPU-present mirror for display buffer 0x%llx: %s "
+                            "(program 0x%llx binding=%u %ux%u linear=%zu)\n",
+                            (unsigned long long)r->gpu_addr,
+                            prosper::frontend::compute_scanout_eligibility_name(eligibility),
+                            (unsigned long long)item.code_addr, bi.binding, r->width, r->height,
+                            (size_t)staging_bytes[i]);
+                    continue;
+                }
+                bi.scanout_mirror = prosper::frontend::compute_scanout_begin(
+                    ctx.device, r->gpu_addr, r->width, r->height);
+            }
         }
 
         if (!ctx.prepare_dispatch_commands()) {
@@ -12010,6 +12080,13 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                      1, &restore);
                 bi.mirror_destination_recorded = true;
                 rtt_destination_census().recorded.add();
+            }
+            if (bi.scanout_mirror.valid()) {
+                // staging[i] holds the canonical row-major result, the same bytes the writeback
+                // below retiles into guest memory (#3915).
+                prosper::frontend::compute_scanout_record_copy(command, staging[i],
+                                                               bi.scanout_mirror);
+                bi.scanout_mirror_recorded = true;
             }
             // Promotion is decided after host writeback, but a possible retained result must
             // already have the GENERAL layout promised to both compute and graphics consumers.
@@ -13382,6 +13459,23 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                              image.binding, (unsigned long long)r.gpu_addr,
                              image.mirror_destination.width, image.mirror_destination.height,
                              static_cast<unsigned>(image.mirror_destination.format));
+        }
+        // #3915: the guest writeback is complete, so the display-buffer mirror now holds exactly
+        // the bytes in guest memory. Same compressed-metadata rule as the destination mirror above:
+        // a buffer whose DCC metadata still says compressed does not hold these linear bytes.
+        for (BoundImage& image : images) {
+            if (!image.scanout_mirror_recorded || image.final_output_conflict || !image.resource)
+                continue;
+            const ShaderResource& r = *image.resource;
+            if (r.compression_enabled &&
+                (!image.dcc_metadata || !image.dcc_metadata_bytes ||
+                 !std::all_of(image.dcc_metadata,
+                              image.dcc_metadata + image.dcc_metadata_bytes,
+                              [](uint8_t value) { return value == 0xff; })))
+                continue;
+            prosper::frontend::compute_scanout_commit(image.scanout_mirror, image.guest_bytes,
+                                                      r.tile_mode, item.submit_no);
+            image.scanout_mirror_committed = true;
         }
         writeback_publish_ms = std::chrono::duration<double, std::milli>(
             ComputeClock::now() - writeback_publish_start).count();
