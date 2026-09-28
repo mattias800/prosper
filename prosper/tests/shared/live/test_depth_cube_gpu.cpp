@@ -265,6 +265,15 @@ int main(int argc, char** argv) {
         check(copied && mismatches == 0,
               "every GPU texel equals the CPU bridge's quantised stack, face-major");
         batch.complete();
+        // A later depth write to any one face changes the identity a memo must match.
+        {
+            BackendPersistentResourceGuard guard;
+            for (auto& [key, image] : persistent_ds_cache())
+                if (key.dr == guest && key.slice == 3 && image.depth_valid)
+                    note_persistent_ds_depth_write(image, true, true);
+        }
+        check(snapshot && !persistent_ds_cube_identity_matches(guest, W, H, *snapshot),
+              "a newer depth write to one face invalidates the snapshot's identity");
 
         // A batch failing after the gather was enqueued revokes the snapshot.
         BackendSubmissionBatch failed_batch;
